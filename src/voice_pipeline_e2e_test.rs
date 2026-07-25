@@ -762,8 +762,39 @@ fn vad_segment_and_enroll(
         enrollment_variants.len() + augmented_variants.len(),
     );
 
-    // ── Compute VAD decision + utterances via shared helper ──
-    let (_vad_decisions, utterances) = compute_vad_segments(&combined_audio);
+    // ── Apply AGC to match production pipeline (mahbot-856) ──
+    // In production, enrollment audio passes through AudioPreprocessor (AGC +
+    // noise suppression) before reaching handle_enrollment_sample for embedding
+    // extraction.  The benchmark must apply the same preprocessing so the
+    // training embeddings match the inference distribution — otherwise the
+    // classifier learns to recognise raw (non-AGC'd) embeddings but receives
+    // AGC'd embeddings during detection, causing a systematic mismatch that
+    // depresses detection rates (especially for quiet volume-reduced variants
+    // where AGC applies meaningful amplification that changes the signal).
+    //
+    // We process the combined audio in FRAME_LENGTH chunks (matching the
+    // production mic capture size) so the AGC's EMA running_rms evolves
+    // realistically across utterances.
+    use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
+    let mut preprocessor = AudioPreprocessor::new(PreprocessorConfig::default());
+    let chunk_size = super::FRAME_LENGTH;
+    let mut processed_audio: Vec<f32> = Vec::with_capacity(combined_audio.len());
+    for chunk in combined_audio.chunks(chunk_size) {
+        let padded = if chunk.len() < chunk_size {
+            let mut p: Vec<f32> = chunk.to_vec();
+            p.resize(chunk_size, 0.0);
+            p
+        } else {
+            chunk.to_vec()
+        };
+        processed_audio.extend(preprocessor.process(padded));
+    }
+    // Note: processed_audio may be slightly shorter than combined_audio due to
+    // noise suppression frame alignment buffering.  This is fine — the silence
+    // gaps provide ample margin for VAD segmentation.
+
+    // ── Compute VAD decision + utterances on AGC-processed audio ──
+    let (_vad_decisions, utterances) = compute_vad_segments(&processed_audio);
 
     info!(
         "VAD segmentation: {} utterances from {} concatenated variants",
@@ -858,7 +889,11 @@ fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> Det
     // during THIS call, not because a prior call already set the field.
     let before = ctx.last_wake_word_detection;
 
-    // Feed audio in FRAME_LENGTH chunks
+    // Feed audio in FRAME_LENGTH chunks, processing each through the
+    // audio preprocessor (AGC + noise suppression) to match the production
+    // pipeline (mahbot-856).  Without AGC, quiet variants like
+    // M3.json_aug4_volume (-6dB reduction) are too faint for VAD to trigger,
+    // producing false 0.00 detection scores.
     for chunk in samples.chunks(chunk_size) {
         let padded = if chunk.len() < chunk_size {
             let mut p: Vec<f32> = chunk.to_vec();
@@ -867,7 +902,8 @@ fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> Det
         } else {
             chunk.to_vec()
         };
-        super::handle_wake_word_detection(&padded, ctx);
+        let processed = ctx.audio_preprocessor.process(padded);
+        super::handle_wake_word_detection(&processed, ctx);
         if ctx.last_wake_word_detection != before {
             let latency = feed_start.elapsed().as_secs_f64() * 1000.0;
             return DetectionResult {
@@ -880,6 +916,7 @@ fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> Det
     // Feed silence frames to flush any remaining voice_batch.
     // The first silence frame after speech triggers flush_voice_batch via
     // the VAD-negative branch in handle_wake_word_detection.
+    // Also process through audio_preprocessor for consistency with production.
     for _ in 0..3 {
         if ctx.last_wake_word_detection != before {
             let latency = feed_start.elapsed().as_secs_f64() * 1000.0;
@@ -889,7 +926,8 @@ fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> Det
             };
         }
         let silence = vec![0.0f32; chunk_size];
-        super::handle_wake_word_detection(&silence, ctx);
+        let processed = ctx.audio_preprocessor.process(silence);
+        super::handle_wake_word_detection(&processed, ctx);
     }
 
     DetectionResult {
@@ -1412,7 +1450,7 @@ pub(crate) fn run_internal() {
         all_positive_embeddings,
         all_utterance_buffers,
         all_streaming_embeddings,
-        _streaming_utterance_buffers,
+        streaming_enrollment_buffer,
     ) = vad_segment_and_enroll(&enrollment_variants, &augmented_variants);
     assert!(
         !all_utterance_buffers.is_empty(),
@@ -1496,42 +1534,97 @@ pub(crate) fn run_internal() {
         ),
     );
     let mut negative_embeddings: Vec<Vec<f32>> = Vec::new();
+    // Extract both old-style (dense, more informative) and streaming
+    // (distribution-matched) negatives for classifier training (mahbot-856).
+    // Applies AGC preprocessing to match the production pipeline where
+    // negative audio chunks come from AGC-processed frames (mahbot-856).
+    let mut old_negatives: Vec<Vec<f32>> = Vec::new();
+    let mut streaming_negatives: Vec<Vec<f32>> = Vec::new();
+
+    // Helper: process a slice of (audio, label) through AGC in FRAME_LENGTH
+    // chunks, matching vad_segment_and_enroll's production-path mirroring.
+    use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
+    let agc_chunk_size = super::FRAME_LENGTH;
+    let agc_process = |variants: &[(Vec<f32>, String)]| -> Vec<(Vec<f32>, String)> {
+        variants
+            .iter()
+            .map(|(samples, label)| {
+                let mut pre = AudioPreprocessor::new(PreprocessorConfig::default());
+                let mut processed: Vec<f32> = Vec::with_capacity(samples.len());
+                for chunk in samples.chunks(agc_chunk_size) {
+                    let padded = if chunk.len() < agc_chunk_size {
+                        let mut p = chunk.to_vec();
+                        p.resize(agc_chunk_size, 0.0);
+                        p
+                    } else {
+                        chunk.to_vec()
+                    };
+                    processed.extend(pre.process(padded));
+                }
+                (processed, label.clone())
+            })
+            .collect()
+    };
+
+    // AGC-process all negative sets once, reusing the results for both
+    // the classifier (old-style + streaming) and verifier (streaming-only)
+    // extraction loops (mahbot-856).
+    let agc_unrelated_1 = agc_process(&neg_unrelated_1);
+    let agc_unrelated_2 = agc_process(&neg_unrelated_2);
+    let agc_unrelated_3 = agc_process(&neg_unrelated_3);
+    let agc_confusable_1 = agc_process(&neg_confusable_1);
+    let agc_confusable_2 = agc_process(&neg_confusable_2);
+    let agc_confusable_3 = agc_process(&neg_confusable_3);
+
     for neg_set in [
-        &neg_unrelated_1,
-        &neg_unrelated_2,
-        &neg_unrelated_3,
-        &neg_confusable_1,
-        &neg_confusable_2,
-        &neg_confusable_3,
+        &agc_unrelated_1,
+        &agc_unrelated_2,
+        &agc_unrelated_3,
+        &agc_confusable_1,
+        &agc_confusable_2,
+        &agc_confusable_3,
     ] {
-        let (embs, _, _) = process_variants_with(neg_set, |s| super::process_enrollment_sample(s));
-        negative_embeddings.extend(embs);
+        let (embs, _, _) =
+            process_variants_with(neg_set, |s| super::process_streaming_enrollment_sample(s));
+        streaming_negatives.extend(embs);
+        let (old_embs, _, _) =
+            process_variants_with(neg_set, |s| super::process_enrollment_sample(s));
+        old_negatives.extend(old_embs);
     }
+    // Combine old-style + streaming for classifier training.
+    let old_neg_count = old_negatives.len();
+    let stream_neg_count = streaming_negatives.len();
+    negative_embeddings.extend(old_negatives);
+    negative_embeddings.extend(streaming_negatives);
     info!(
-        "Extracted {} real negative embeddings from {} unrelated (3 seeds) + {} confusable phrases \
+        "Extracted {} old-style + {} streaming negative embeddings from {} unrelated (3 seeds) + {} confusable phrases \
          (across 3 seed variations)",
-        negative_embeddings.len(),
+        old_neg_count,
+        stream_neg_count,
         neg_unrelated_1.len() + neg_unrelated_2.len() + neg_unrelated_3.len(),
         neg_confusable_1.len() + neg_confusable_2.len() + neg_confusable_3.len(),
     );
 
     // Supplement with distribution-matched synthetic negatives (mahbot-846).
-    // Uses the positive embedding statistics so the synthetic negatives
+    // Uses the streaming positive embedding statistics so the synthetic negatives
     // overlap with real speech rather than pure N(0,1) noise which is
-    // trivially separable.
+    // trivially separable.  Uses streaming statistics to match the classifier
+    // training distribution (mahbot-856).
     negative_embeddings.extend(generate_synthetic_negatives_from_positives(
         SYNTHETIC_NEGATIVES_COUNT,
-        &all_positive_embeddings,
+        &all_streaming_embeddings,
         1.5,
     ));
 
     // Build a SEPARATE negative set for the verifier that EXCLUDES confusable
     // and uses STREAMING pipeline embeddings to match inference distribution
-    // (mahbot-855).
+    // (mahbot-855).  Reuses the pre-computed AGC'd unrelated sets from above
+    // (mahbot-856), avoiding redundant AGC processing.
     let mut verifier_negatives: Vec<Vec<f32>> = Vec::new();
-    for unrelated in [&neg_unrelated_1, &neg_unrelated_2, &neg_unrelated_3] {
-        let (embs, _, _) =
-            process_variants_with(unrelated, |s| super::process_streaming_enrollment_sample(s));
+    for agc_unrelated in [&agc_unrelated_1, &agc_unrelated_2, &agc_unrelated_3] {
+        let (embs, _, _) = process_variants_with(agc_unrelated, |s| {
+            super::process_streaming_enrollment_sample(s)
+        });
         verifier_negatives.extend(embs);
     }
     verifier_negatives.extend(generate_synthetic_negatives_from_positives(
@@ -1543,10 +1636,21 @@ pub(crate) fn run_internal() {
 
     // ── Phase 4: finalize_enrollment (consistency check + classifier training) ──
     phase_start!("Phase 4: finalize_enrollment");
+    // Uses COMBINED old-style + streaming embeddings for classifier training.
+    // The old-style dense-stride embeddings provide a strong learning signal
+    // (many windows), while the streaming embeddings match the inference
+    // distribution.  Combined training gives the Conv1D more positive examples
+    // and better score separation than streaming-only (mahbot-856).
+    // Both positives and negatives use combined old-style + streaming embeddings
+    // to keep the training distribution symmetric.
+    // The `streaming_enrollment_buffer` provides per-utterance grouping for the
+    // consistency check (distribution-matched to inference).
+    let mut combined_pos = all_positive_embeddings; // moved (not used after)
+    combined_pos.extend(all_streaming_embeddings.clone()); // cloned for verifier Phase 5
     let training_result = super::finalize_enrollment(
-        &all_positive_embeddings,
+        &combined_pos,
         &negative_embeddings,
-        &all_utterance_buffers,
+        &streaming_enrollment_buffer,
     )
     .expect("finalize_enrollment must succeed — consistency check + classifier training");
 
@@ -1615,7 +1719,7 @@ pub(crate) fn run_internal() {
     };
 
     // -- Informational self-test --
-    match super::run_enrollment_self_test(&all_utterance_buffers, &classifier) {
+    match super::run_enrollment_self_test(&streaming_enrollment_buffer, &classifier) {
         Ok(()) => info!("Detection self-test (informational): passed"),
         Err(e) => info!("Detection self-test (informational, non-gating): {e}"),
     }

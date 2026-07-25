@@ -128,15 +128,20 @@ pub struct AudioPreprocessor {
     config: PreprocessorConfig,
     /// Running RMS level estimate for asymmetric EMA-based AGC.
     ///
-    /// Initialised to [`TARGET_RMS`] so the first gain is 1.0× (neutral).
-    /// Updated on every processed chunk using asymmetric EMA:
+    /// Initialised to 0.0 (mahbot-856).  On the first non-zero chunk,
+    /// [`apply_agc()`] sets this directly to the chunk RMS so the gain
+    /// immediately reflects the actual audio level.  Lazy init eliminates
+    /// the ~3.6s convergence delay that occurred with [`TARGET_RMS`]
+    /// initialisation during quiet audio (e.g. volume-reduced variants at
+    /// -6dB where RMS ≈ 0.025).  Updated via asymmetric EMA:
     /// - Fast attack (0.20) when chunk RMS exceeds running estimate
     /// - Slow release (0.02) when chunk RMS is below running estimate
     ///
-    /// Reset to [`TARGET_RMS`] on [`clear_buffer()`] and [`reset()`] to
-    /// prevent stale gain history (e.g. from a loud enrollment) from
-    /// persisting into a different pipeline phase (e.g. live detection
-    /// in a quieter environment).
+    /// Reset to 0.0 on [`clear_buffer()`] and [`reset()`] so the AGC
+    /// lazily initialises on the next speech frame (mahbot-856).
+    /// Without this reset, stale gain history from a different acoustic
+    /// environment (e.g. enrollment) could produce incorrect gain during
+    /// live detection in a quieter/louder setting.
     running_rms: f32,
 }
 
@@ -155,7 +160,15 @@ impl AudioPreprocessor {
             ns_buffer: Vec::new(),
             read_pos: 0,
             config,
-            running_rms: TARGET_RMS,
+            // Initialise to 0.0 so the AGC lazily initialises on the first
+            // non-zero frame (mahbot-856).  Initialising to TARGET_RMS caused
+            // the gain to start at 1.0× for quiet audio (e.g. volume-reduced
+            // variants at -6dB) and take ~114 frames (~3.6s) to converge to
+            // the correct level via slow release — the utterance was already
+            // over before meaningful amplification kicked in.  With lazy
+            // initialisation the AGC immediately sets running_rms to the
+            // actual frame level and applies the correct gain from frame 1.
+            running_rms: 0.0,
         }
     }
 
@@ -200,29 +213,27 @@ impl AudioPreprocessor {
     /// to flush stale samples without discarding the noise floor estimate
     /// the suppressor has built up over time.
     ///
-    /// Also resets the EMA running RMS to [`TARGET_RMS`] so the AGC gain
-    /// re-starts from 1.0× in the new pipeline phase.  Without this reset,
+    /// Also resets the EMA running RMS to 0.0 so the AGC lazily initialises
+    /// on the next non-zero speech frame (mahbot-856).  Without this reset,
     /// stale gain history from a different acoustic environment (e.g.
     /// enrollment) could produce incorrect gain during live detection.
     ///
     /// # Convergence cost
-    /// Resetting forces EMA re-adaptation from neutral (1.0× gain).
-    /// Convergence time depends on the audio content of the new phase:
-    /// - **Loud audio** (input RMS >> TARGET_RMS) converges in ~10 chunks
-    ///   (~320ms at 32ms/chunk) via attack α=0.20.
-    /// - **Quiet audio** (input RMS << TARGET_RMS) converges in ~114 chunks
-    ///   (~3.6s) via release α=0.02.
-    ///
-    /// Pipeline state transitions via `PipelineCtx::reset_pipeline_state()`
-    /// (Soft/Cancel → clear_buffer, Full → reset) typically settle within 320ms because the new phase
-    /// (listening, recording, enrollment) receives speech-level audio whose
-    /// RMS is near TARGET_RMS.  The slow release case (~3.6s) only matters
-    /// in the rare scenario where the new phase produces consistently quiet
-    /// audio far below TARGET_RMS.
+    /// Resets the running RMS to 0.0 so the AGC lazily initialises on the
+    /// next non-zero speech frame (mahbot-856).  Convergence is instantaneous
+    /// — the gain on the first speech frame directly reflects TARGET_RMS /
+    /// chunk_rms.  Unlike the old TARGET_RMS initialisation which required
+    /// ~114 chunks (~3.6s) to converge from TARGET_RMS down to quiet audio,
+    /// the lazy init approach converges in 1 frame regardless of loudness.
     pub fn clear_buffer(&mut self) {
         self.ns_buffer.clear();
         self.read_pos = 0;
-        self.running_rms = TARGET_RMS;
+        // Reset to 0.0 (lazy initialisation on next speech frame) instead of
+        // TARGET_RMS, matching the constructor (mahbot-856).  Without this,
+        // a pipeline reset after loud enrollment would leave running_rms at
+        // TARGET_RMS while the next speech is quiet (or vice versa), causing
+        // the same slow-convergence issue as the original TARGET_RMS init.
+        self.running_rms = 0.0;
     }
 
     /// Full reset: discard the sample buffer, the noise suppressor's adapted
@@ -235,7 +246,7 @@ impl AudioPreprocessor {
     pub fn reset(&mut self) {
         self.ns_buffer.clear();
         self.read_pos = 0;
-        self.running_rms = TARGET_RMS;
+        self.running_rms = 0.0;
         self.suppressor = if self.config.noise_suppression {
             Some(NoiseSuppressor::with_level(SuppressionLevel::K12dB))
         } else {
@@ -300,15 +311,10 @@ impl AudioPreprocessor {
     /// chunk RMS, so natural speech amplitude variations (e.g., syllable
     /// stress) do not cause per-chunk gain oscillation.
     ///
-    /// Unlike the previous stateless per-chunk AGC which computed gain
-    /// independently for each mic chunk (causing chunk-to-chunk gain
-    /// inconsistency — "gain pumping" — where natural speech amplitude
-    /// variations across syllables produced audible loudness wobbles),
-    /// this streaming version maintains a running RMS estimate that
-    /// smooths out short-term fluctuations.  Both enrollment and detection
-    /// already received identical stateless AGC processing (same `apply_agc`
-    /// call on same-size mic chunks), so the improvement here is purely
-    /// temporal smoothing rather than fixing a mode-specific asymmetry.
+    /// This avoids the "gain pumping" problem that would occur with a
+    /// per-chunk AGC (where natural speech amplitude variations across
+    /// syllables produce audible loudness wobbles) because the running
+    /// RMS estimate smooths out short-term fluctuations.
     #[allow(clippy::cast_precision_loss)]
     fn apply_agc(&mut self, samples: Vec<f32>) -> Vec<f32> {
         if samples.is_empty() {
@@ -327,22 +333,31 @@ impl AudioPreprocessor {
             //    Resuming speech would briefly clip before fast attack corrects
             //    it, amplifying the noise floor audibly.
             //
-            // 2. Loud-after-quiet: If running_rms decayed to near zero during
-            //    extended silence, the first loud chunk would receive MAX_GAIN
-            //    (~4× amplification) because gain = TARGET_RMS / near-zero.
-            //    Fast attack (α=0.20) would fix it within ~5 chunks, but the
-            //    single over-amplified chunk could still clip.  Freezing at
-            //    the pre-silence level avoids this transient entirely.
+            // 2. Loud-after-quiet: If running_rms was 0.0 (lazy init) and a pure
+            //    silence chunk arrived before any speech, the gain calc below
+            //    would divide by zero.  Early-return prevents this.
             return samples;
         }
 
-        // Asymmetric EMA: fast attack on speech onset, slow release on offset
-        let alpha = if chunk_rms > self.running_rms {
-            EMA_ATTACK_ALPHA
+        // Lazy initialisation: on the first non-zero chunk (pure silence
+        // returns above), set running_rms directly to the chunk RMS so the
+        // gain immediately reflects the actual audio level (mahbot-856).
+        // Without this, a fresh AGC starting at 0.0 would need the EMA to
+        // converge from zero upward — fast attack (0.20) reaches 90% in ~10
+        // frames, which is acceptable but still introduces a momentary gain
+        // ramp.  Direct initialisation is cleaner and avoids the ramp
+        // entirely.
+        if self.running_rms == 0.0 {
+            self.running_rms = chunk_rms;
         } else {
-            EMA_RELEASE_ALPHA
-        };
-        self.running_rms = alpha * chunk_rms + (1.0 - alpha) * self.running_rms;
+            // Asymmetric EMA: fast attack on speech onset, slow release on offset
+            let alpha = if chunk_rms > self.running_rms {
+                EMA_ATTACK_ALPHA
+            } else {
+                EMA_RELEASE_ALPHA
+            };
+            self.running_rms = alpha * chunk_rms + (1.0 - alpha) * self.running_rms;
+        }
 
         let gain = (TARGET_RMS / self.running_rms).clamp(MIN_GAIN, MAX_GAIN);
         samples.iter().map(|&s| s * gain).collect()
@@ -421,9 +436,12 @@ mod tests {
 
     /// Test that EMA-based AGC normalises volume across multiple chunks.
     ///
-    /// The asymmetric EMA adapts over time — a single chunk does not receive
-    /// the full gain.  This test feeds many consecutive chunks and verifies
-    /// that after convergence the output RMS approaches TARGET_RMS.
+    /// With lazy initialisation (running_rms = 0.0, mahbot-856), the first
+    /// non-zero chunk immediately sets running_rms to the chunk RMS, giving
+    /// full gain from frame 1.  This test feeds 200 quiet chunks followed by
+    /// 30 loud chunks (each with a fresh AGC state) and verifies that after
+    /// many EMA iterations the output RMS approaches TARGET_RMS — the same
+    /// steady-state that the old TARGET_RMS init produced, reached faster.
     ///
     /// Also verifies that the gain clamp prevents amplifying pure silence.
     #[test]
@@ -440,8 +458,12 @@ mod tests {
         let chunk_len = NS_FRAME_SIZE * 3; // 480 samples — typical mic chunk size
 
         // ── 0.25× target RMS (quiet speech) ──
-        // Feed 200 chunks; with release α=0.02, running_rms should converge
-        // to ~0.26 × TARGET_RMS, producing gain ~3.8× and output ≈ 0.95 × target.
+        // With lazy init, running_rms is set to chunk_rms on the first
+        // non-zero chunk, giving gain = TARGET_RMS / 0.25*TARGET_RMS = 4.0×
+        // from frame 1.  After 200 EMA iterations at the same level, the
+        // running_rms stabilises at 0.25 × TARGET_RMS.  This produces the
+        // same steady-state output as the old TARGET_RMS init but without
+        // the ~3.6s convergence ramp (mahbot-856).
         let amp_quiet = target_rms * 0.25 * sqrt2;
         for _ in 0..200 {
             let chunk = sine_tone(amp_quiet, chunk_len, 16_000);
@@ -457,8 +479,12 @@ mod tests {
         );
 
         // ── 4.0× target RMS (loud speech) ──
-        // Reset preprocessor and feed 30 chunks; with attack α=0.20, running_rms
-        // converges to ~4.0 × TARGET_RMS, gain clamped to 0.25 → output ≈ target.
+        // With lazy init, a fresh AGC sets running_rms to chunk_rms = 4.0 ×
+        // TARGET_RMS on the first chunk, giving gain = 0.05/0.2 = 0.25×
+        // (MIN_GAIN) from frame 1.  After 30 EMA iterations the running_rms
+        // stays at ~4.0 × TARGET_RMS, maintaining gain at 0.25× and output
+        // ≈ TARGET_RMS — converged from frame 1 rather than ramping over 30
+        // chunks as with the old TARGET_RMS init (mahbot-856).
         let mut pre = AudioPreprocessor::new(PreprocessorConfig {
             noise_suppression: false,
             agc: true,
@@ -490,9 +516,17 @@ mod tests {
     /// Test that EMA AGC produces smooth gain transitions across chunk boundaries
     /// (no gain pumping).
     ///
-    /// Feeds a quiet-quiet-loud-loud-quiet sequence and verifies that gain
+    /// Feeds a quiet-loud-quiet sequence and verifies that gain
     /// changes monotonically within each segment and the output RMS does not
     /// oscillate between extremes.
+    ///
+    /// Phase 1 (quiet) starts with lazy init (mahbot-856): running_rms = 0.0,
+    /// set to chunk_rms = 0.25 × TARGET_RMS on the first non-zero frame,
+    /// giving gain = 4.0× immediately.  This validates that lazy init produces
+    /// a stable plateau without overshoot.  Phases 2→3 exercise the EMA release
+    /// path (quiet-after-loud) which is the same as with the old TARGET_RMS init
+    /// — the running_rms decays slowly from ~4.0 × TARGET_RMS toward 0.25 ×
+    /// TARGET_RMS via release α=0.02.
     #[test]
     fn test_agc_ema_stability() {
         let mut pre = AudioPreprocessor::new(PreprocessorConfig {
@@ -505,10 +539,26 @@ mod tests {
         let chunk_len = NS_FRAME_SIZE * 3; // 480 samples
 
         // Phase 1: 15 chunks of quiet audio (0.25× target RMS).
-        // With EMA release α=0.02, running_rms drops slowly, gain rises slowly.
+        // With lazy init, running_rms is set to chunk_rms on the very first
+        // non-zero chunk, so gain jumps to ~4.0× immediately.  After that the
+        // running_rms stays at 0.25 × TARGET_RMS (same input level), so gain
+        // stays at ~4.0× — no further increase is possible since we're already
+        // at MAX_GAIN.  This phase validates that lazy init reaches a stable
+        // plateau without overshoot or pumping.
+        // Note: prev_gain is initialised from the first chunk's actual gain
+        // (which may be slightly below 4.0 due to sine/FFT boundary effects),
+        // then verified to stay stable for the remaining 14 chunks.
         let amp_quiet = target_rms * 0.25 * sqrt2;
-        let mut prev_gain = 1.0; // initial gain = 1.0 (running_rms = TARGET_RMS)
-        for _ in 0..15 {
+        let first_chunk = sine_tone(amp_quiet, chunk_len, 16_000);
+        let first_processed = pre.process(first_chunk);
+        let first_rms = compute_rms(&first_processed);
+        let input_rms = target_rms * 0.25;
+        let mut prev_gain = if input_rms > 0.0 {
+            first_rms / input_rms
+        } else {
+            0.0
+        };
+        for _ in 1..15 {
             let chunk = sine_tone(amp_quiet, chunk_len, 16_000);
             let processed = pre.process(chunk);
             let rms = compute_rms(&processed);
@@ -519,7 +569,7 @@ mod tests {
             } else {
                 0.0
             };
-            // Gain should increase monotonically (never decrease) during quiet
+            // Gain stays at MAX_GAIN (cannot exceed 4.0, and same input level prevents decrease)
             assert!(
                 gain >= prev_gain - 1e-6,
                 "gain should not decrease during quiet phase: {gain:.6} < {prev_gain:.6}"
@@ -590,7 +640,10 @@ mod tests {
     /// output with normalised RMS.
     ///
     /// Uses higher-amplitude noise (0.20) so the input RMS after NS is near
-    /// TARGET_RMS, reducing the convergence time needed for the EMA-based AGC.
+    /// TARGET_RMS, keeping the output within the 0.5–1.5× range despite the
+    /// EMA attack dynamics.  With lazy init (mahbot-856), AGC converges in a
+    /// single frame, so the test margin is more than sufficient even during
+    /// the first few NS-adaptation chunks.
     #[test]
     fn test_agc_and_ns_compose() {
         let mut pre = AudioPreprocessor::new(PreprocessorConfig {
@@ -650,5 +703,102 @@ mod tests {
         }
         let sum_sq: f32 = samples.iter().map(|&s| s * s).sum();
         (sum_sq / samples.len() as f32).sqrt()
+    }
+
+    /// Test that the silence-first guard prevents division by zero when the
+    /// very first chunk is pure silence (mahbot-856 lazy init).
+    ///
+    /// With running_rms = 0.0 and a zero-RMS first chunk, the lazy-init
+    /// branch is NOT entered (running_rms stays 0.0 after the early return
+    /// for chunk_rms == 0.0).  The next non-zero chunk should then trigger
+    /// lazy init and apply the correct gain immediately.
+    #[test]
+    fn test_lazy_init_silence_first() {
+        let mut pre = AudioPreprocessor::new(PreprocessorConfig {
+            noise_suppression: false,
+            agc: true,
+        });
+
+        // Feed pure silence first — should not crash or divide by zero.
+        let silence = vec![0.0f32; NS_FRAME_SIZE * 3]; // 480 samples
+        let out = pre.process(silence);
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "silence should pass through unchanged"
+        );
+
+        // Now feed a speech-level chunk.  running_rms is still 0.0 (lazy init
+        // was not triggered by the zero-RMS silence), so the lazy-init branch
+        // fires and sets running_rms = chunk RMS, giving immediate gain.
+        let target_rms = TARGET_RMS;
+        let sqrt2 = std::f32::consts::SQRT_2;
+        let chunk_len = NS_FRAME_SIZE * 3;
+        let amp_quiet = target_rms * 0.25 * sqrt2;
+        let speech = sine_tone(amp_quiet, chunk_len, 16_000);
+        let processed = pre.process(speech);
+        let rms = compute_rms(&processed);
+        let rel_err = (rms - target_rms).abs() / target_rms;
+        assert!(
+            rel_err < 0.15,
+            "speech after silence: rms={rms:.6} target={target_rms} rel_err={rel_err:.4} (expected <0.15)"
+        );
+    }
+
+    /// Helper: exercises the lazy-init path after `cleanup` resets `running_rms` to 0.0.
+    ///
+    /// Phase 1: feed a quiet chunk to establish non-zero `running_rms`, then
+    /// apply `cleanup` (which resets `running_rms` to 0.0 via [`clear_buffer`]
+    /// or [`reset`]).  Phase 3: feed another quiet chunk — lazy init should
+    /// fire and apply [`MAX_GAIN`] immediately.  With noise suppression
+    /// disabled both cleanup paths are functionally equivalent (mahbot-856).
+    fn run_lazy_init_after_cleanup_test(cleanup: fn(&mut AudioPreprocessor)) {
+        let mut pre = AudioPreprocessor::new(PreprocessorConfig {
+            noise_suppression: false,
+            agc: true,
+        });
+
+        let target_rms = TARGET_RMS;
+        let sqrt2 = std::f32::consts::SQRT_2;
+        let chunk_len = NS_FRAME_SIZE * 3;
+
+        // Phase 1: feed a quiet chunk to establish non-zero running_rms.
+        let amp_quiet = target_rms * 0.25 * sqrt2;
+        let chunk1 = sine_tone(amp_quiet, chunk_len, 16_000);
+        let processed1 = pre.process(chunk1);
+        let rms1 = compute_rms(&processed1);
+        let rel_err1 = (rms1 - target_rms).abs() / target_rms;
+        assert!(
+            rel_err1 < 0.15,
+            "Phase 1: rms={rms1:.6} target={target_rms} rel_err={rel_err1:.4}"
+        );
+
+        // Phase 2: apply the cleanup method.
+        cleanup(&mut pre);
+
+        // Phase 3: feed another quiet chunk.  With running_rms = 0.0, lazy
+        // init fires and applies MAX_GAIN immediately.
+        let chunk2 = sine_tone(amp_quiet, chunk_len, 16_000);
+        let processed2 = pre.process(chunk2);
+        let rms2 = compute_rms(&processed2);
+        let rel_err2 = (rms2 - target_rms).abs() / target_rms;
+        assert!(
+            rel_err2 < 0.15,
+            "Phase 3 after cleanup: rms={rms2:.6} target={target_rms} rel_err={rel_err2:.4}"
+        );
+    }
+
+    /// Test that clear_buffer() resets running_rms to 0.0 so the next speech
+    /// chunk triggers lazy init (mahbot-856).
+    #[test]
+    fn test_lazy_init_after_clear_buffer() {
+        run_lazy_init_after_cleanup_test(|pre| pre.clear_buffer());
+    }
+
+    /// Test that reset() resets running_rms to 0.0 so the next speech chunk
+    /// triggers lazy init (mahbot-856).  reset() also reinitialises the noise
+    /// suppressor's internal state (not relevant when NS is disabled).
+    #[test]
+    fn test_lazy_init_after_reset() {
+        run_lazy_init_after_cleanup_test(|pre| pre.reset());
     }
 }
