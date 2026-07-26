@@ -174,9 +174,17 @@ pub(crate) const VERIFIER_INPUT_DIM: usize = EMBEDDING_DIM * VERIFIER_WINDOW_SIZ
 ///
 /// Set to 4 so the verifier has at least 2 stride-1 windows (embedding pairs
 /// [0,1,2] and [1,2,3]) rather than a single onset window.  This is a tunable
-/// heuristic — higher values give the verifier more temporal context but also
-/// widen the unprotected window where only the classifier gates against false
-/// accepts.
+/// heuristic — higher values delay the first verifier evaluation but also give
+/// more temporal context when it does evaluate.
+///
+/// ## Warm-up suppression (mahbot-893)
+///
+/// Detections during the warm-up period (ring.len() < this constant with a
+/// trained verifier) are **unconditionally suppressed** — no detection is ever
+/// reported, regardless of classifier score, threshold, or rolling sum.  The
+/// rolling score window still accumulates during suppression, preserving
+/// post-warm-up detection timing.  This replaces the previous raised-threshold
+/// approach (mahbot-892) and structurally eliminates warm-up false accepts.
 ///
 /// ## Calibration note
 ///

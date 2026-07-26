@@ -999,54 +999,6 @@ fn match_threshold() -> f32 {
     (ROLLING_WINDOW_N as f32) * MATCH_THRESHOLD_FACTOR
 }
 
-/// Classifier threshold override during verifier warm-up (mahbot-892).
-///
-/// During the first [`VERIFIER_WARMUP_EMBEDDINGS`] embeddings, the verifier
-/// is unavailable to gate detections (the verifier gate is skipped), so the
-/// Conv1D classifier threshold is temporarily raised to eliminate false
-/// accepts from confusable and unrelated phrases that slip through during
-/// this unprotected window.
-///
-/// Raised from `match_threshold()` (= 3 × 0.45 = 1.35) to **1.55** based on
-/// per-frame analysis of HARD-tier benchmark data:
-///
-/// | Metric | Score |
-/// |--------|-------|
-/// | Max genuine warm-up rolling sum (all 13 positive variants) | 1.31 |
-/// | Min warm-up false accept score | 1.36 |
-/// | **Proposed warm-up threshold** | **1.55** |
-///
-/// The threshold sits cleanly between the max genuine warm-up score (1.31)
-/// and the lowest warm-up FA score (1.36), providing a 0.24 safety margin
-/// above the max genuine score. All positive variants cross the classifier
-/// threshold at frame 6 or later — well past the 4-frame warm-up window.
-///
-/// ## Interaction with adaptive threshold
-///
-/// The warm-up threshold acts as a **floor**: if the adaptive threshold
-/// (post-bootstrap) is already above 1.55, the adaptive value takes
-/// precedence. This prevents regression in high-noise environments where
-/// the adaptive threshold has already risen above the warm-up value
-/// (analyst_2, mahbot-892).
-///
-/// ## Safety
-///
-/// Raising the warm-up threshold to 1.55 introduces **zero risk** to
-/// detection rate: genuine wake word variants cross the classifier
-/// threshold at frame 6+ (well after the 4-frame warm-up window), and
-/// warm-up applies only when a trained verifier exists and the ring
-/// has fewer than `VERIFIER_WARMUP_EMBEDDINGS` embeddings.
-///
-/// ## Recalibration
-///
-/// This value is empirically chosen from a single HARD-tier benchmark run.
-/// If the classifier output distribution shifts (model retraining, new
-/// enrollment variants, new TTS voices), re-run the per-frame analysis
-/// and adjust accordingly. Run:
-/// `MAHBOT_VOICE_DEBUG=1 cargo bench --bench voice_pipeline_e2e` and
-/// inspect `per_frame_scores` for warm-up frame region.
-const WARMUP_CLASSIFIER_THRESHOLD: f32 = 1.55;
-
 // ── Adaptive threshold (mahbot-845) ──────────────────────────────────────
 
 /// Number of recent per-frame scores to track for adaptive threshold
@@ -1189,10 +1141,11 @@ fn voice_debug_enabled() -> bool {
 ///
 /// The `effective_threshold` is either the adaptive threshold (post-bootstrap)
 /// or the static [`match_threshold()`] (during bootstrap or when no adaptive
-/// state is configured).  It differs from [`match_threshold()`] only when the
-/// adaptive state is active and post-bootstrap; otherwise it equals
-/// [`match_threshold()`].  Recorded in [`DetectionInstrumentation`] for
-/// miss-classification analysis (mahbot-891).
+/// state is configured).  During the verifier warm-up period
+/// (< `VERIFIER_WARMUP_EMBEDDINGS` with a trained verifier) the threshold is
+/// NOT modified — all detections are unconditionally suppressed before the
+/// rolling window comparison is ever reported (mahbot-893).  Recorded in
+/// [`DetectionInstrumentation`] for miss-classification analysis (mahbot-891).
 ///
 /// # Parameters
 /// - `embedding` — one 96-dim embedding vector to process.
@@ -1212,6 +1165,7 @@ fn voice_debug_enabled() -> bool {
 ///   frame and shared between the gate and this accumulator, avoiding redundant
 ///   `predict` calls.
 #[expect(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 pub(crate) fn score_single_embedding(
     embedding: &[f32],
     embedding_ring: &mut Vec<Vec<f32>>,
@@ -1271,26 +1225,25 @@ pub(crate) fn score_single_embedding(
     });
 
     // ── Compute effective threshold for instrumentation (mahbot-891) ──
-    // The base threshold is the adaptive override (when available,
+    // The effective threshold is the adaptive override (when available,
     // post-bootstrap) or the static match_threshold().  During verifier
     // warm-up (< VERIFIER_WARMUP_EMBEDDINGS with trained verifier) the
-    // threshold is raised to WARMUP_CLASSIFIER_THRESHOLD as a floor —
-    // the verifier gate is inactive during this window (mahbot-892).
-    let base_threshold = adaptive_override.unwrap_or_else(match_threshold);
+    // threshold is no longer raised — all detections are structurally
+    // suppressed instead (mahbot-893, see below).
+    // ── Verifier warm-up detection (mahbot-887) ──────────────────────
+    // Track whether we are in the verifier warm-up period (ring buffer
+    // too small for the verifier's 3-frame stride-1 windows to be
+    // temporally representative).  During this window all wake word
+    // detections are unconditionally suppressed (mahbot-893).
+    let effective_threshold = adaptive_override.unwrap_or_else(match_threshold);
     let is_warmup_period = match verifier {
         Some(v) => v.is_trained() && embedding_ring.len() < VERIFIER_WARMUP_EMBEDDINGS,
         None => false,
     };
-    let (effective_threshold, rolling_override) = if is_warmup_period {
-        let t = base_threshold.max(WARMUP_CLASSIFIER_THRESHOLD);
-        (t, Some(t))
-    } else {
-        (base_threshold, adaptive_override)
-    };
 
     // ── Rolling window gate (mahbot-773) ─────────────────────────────
-    let (detected, rolling_sum) =
-        process_wake_word_score(total_score, score_window, rolling_override);
+    let (mut detected, rolling_sum) =
+        process_wake_word_score(total_score, score_window, adaptive_override);
 
     // ── Voice debug logging (mahbot-850) ─────────────────────────────
     // When the `voice-debug` feature is enabled and `MAHBOT_VOICE_DEBUG=1`
@@ -1371,6 +1324,36 @@ pub(crate) fn score_single_embedding(
         **peak = max_verifier_score;
     }
 
+    // ── Warm-up suppression (mahbot-893) ─────────────────────────────
+    // Completely suppress all wake word detections during the verifier
+    // warm-up period (embedding_ring.len() < VERIFIER_WARMUP_EMBEDDINGS
+    // with a trained verifier).  No detection is ever reported during
+    // warm-up, regardless of classifier score, threshold, or rolling
+    // sum.  The rolling score window still accumulates (preserving
+    // post-warm-up detection timing), and the verifier peak score is
+    // still tracked (so the verifier gate can block immediately when
+    // warm-up ends).
+    //
+    // Safety (mahbot-893): Per-frame benchmark analysis shows that no
+    // genuine wake word variant crosses the classifier threshold during
+    // the first 4 embeddings.  All 11-13 detected variants cross at
+    // frame 6 or later.  Suppressing warm-up detections has zero impact
+    // on detection rate in the current benchmark.  If the classifier
+    // output distribution shifts (model retraining, new enrollment
+    // variants, new TTS voices), the `warn!` log below provides
+    // production observability into suppressed warm-up frames.
+    let was_warmup_suppressed = is_warmup_period && detected;
+    if was_warmup_suppressed {
+        warn!(
+            "Wake word detection suppressed during verifier warm-up: \
+             rolling_sum={rolling_sum:.4} total_score={total_score:.4} ring_len={}",
+            embedding_ring.len(),
+        );
+    }
+    if is_warmup_period {
+        detected = false;
+    }
+
     if detected {
         // ── Verifier gate (mahbot-777, mahbot-788, mahbot-870, mahbot-887) ─
         // After the rolling window check passes, run the second-stage
@@ -1384,16 +1367,15 @@ pub(crate) fn score_single_embedding(
         // decision until enough embeddings exist, without weakening the
         // gate for sustained confusable phrases.
         //
-        // WARM-UP (mahbot-887): During the first `VERIFIER_WARMUP_EMBEDDINGS`
-        // embeddings, the verifier gate is skipped entirely, letting the
-        // Conv1D classifier threshold serve as the sole gate.  The
+        // NOTE (mahbot-893): The warm-up logic has been replaced — during
+        // the first `VERIFIER_WARMUP_EMBEDDINGS` embeddings, detection is
+        // unconditionally suppressed BEFORE reaching this gate (see warm-up
+        // suppression block above).  The gate still uses the
         // `embedding_ring.len() >= VERIFIER_WARMUP_EMBEDDINGS` condition
-        // below ensures this.  During the onset the verifier only has access
-        // to a single 3-frame window whose mel frames are padded for the
-        // silence-to-speech transition — producing unreliable low scores
-        // that false-reject valid detections.  By frame 4+ the verifier
-        // has at least 2 stride-1 windows, one of which ([1,2,3]) typically
-        // has enough temporal context for a reliable decision.
+        // for its own verifier score computation (which was originally the
+        // warm-up skip, mahbot-887), but this now serves as the natural
+        // "verifier has enough context" guard rather than a warm-up
+        // exemption for detection.
         let effective_verifier_score = peak_verifier_score.map_or(max_verifier_score, |p| *p);
         if let Some(v) = verifier
             && v.is_trained()
@@ -8054,15 +8036,14 @@ mod tests {
 
     // ── Verifier warm-up gate tests (mahbot-887) ─────────────────────────
     //
-    // Tests that the verifier gate is skipped during the warm-up period
-    // (< VERIFIER_WARMUP_EMBEDDINGS embeddings) and activated afterwards.
+    // Tests that warm-up detections are unconditionally suppressed
+    // (< VERIFIER_WARMUP_EMBEDDINGS embeddings), and that the verifier
+    // gate activates correctly afterwards.
     //
     // These tests construct a verifier that always rejects (b3 = -2.0 →
     // sigmoid(-2.0) ≈ 0.12 < DEFAULT_VERIFIER_THRESHOLD = 0.50) and a
     // classifier that always scores 0.55, so the rolling sum reaches the
-    // warm-up detection threshold (1.55) at the 3rd embedding (1.65 ≥ 1.55)
-    // — sufficient to test the verifier gate interaction without exceeding
-    // the normal post-warmup threshold (1.35) by too much (mahbot-892).
+    // detection threshold (1.35) at the 3rd embedding (1.65 ≥ 1.35).
 
     /// Build a verifier that always produces a score below the rejection
     /// threshold.  All MLP weights are zeroed; b3 = -2.0 gives
@@ -8085,18 +8066,21 @@ mod tests {
     }
 
     #[test]
-    fn verifier_warmup_skips_gate_at_3_embeddings() {
-        // With only 3 embeddings (ring.len() < VERIFIER_WARMUP_EMBEDDINGS),
-        // the verifier gate should be skipped and detection should pass
-        // based solely on the raised Conv1D classifier threshold (1.55).
-        let classifier = classifier_always_score(0.55); // 3×0.55 = 1.65 ≥ 1.55
+    fn verifier_warmup_suppresses_all_detections() {
+        // With 1-3 embeddings (ring.len() < VERIFIER_WARMUP_EMBEDDINGS=4),
+        // all wake word detections are unconditionally suppressed — even
+        // when the classifier consistently scores high enough for the
+        // rolling sum to cross the detection threshold (mahbot-893).
+        // The rolling sum IS computed and the score window IS updated,
+        // but detection is never reported during the warm-up period.
+        let classifier = classifier_always_score(0.55); // 3×0.55 = 1.65 ≥ 1.35
         let verifier = verifier_always_reject();
         let emb = vec![0.5; EMBEDDING_DIM];
         let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
         let mut score_window = Vec::new();
 
-        // First 2 embeddings: rolling sum below detection threshold.
-        for i in 0..2 {
+        // Push 3 embeddings: none should trigger detection (all suppressed).
+        for i in 0..3 {
             let (detected, rolling_sum, _, _) = score_single_embedding(
                 &emb,
                 &mut ring,
@@ -8109,93 +8093,23 @@ mod tests {
             );
             assert!(
                 !detected,
-                "no detection at embedding {} (rolling_sum={rolling_sum:.4})",
+                "warm-up should suppress all detections at embedding {} \
+                 (ring.len={}, rolling_sum={rolling_sum:.4})",
                 i + 1,
+                ring.len(),
             );
         }
 
-        // 3rd embedding: rolling sum reaches warm-up threshold (1.65 ≥ 1.55).
-        // Verifier should be SKIPPED during warm-up (< VERIFIER_WARMUP_EMBEDDINGS=4)
-        // even though the verifier would block if evaluated.
-        let ring_len_before = ring.len();
-        let (detected, rolling_sum, _, effective_threshold) = score_single_embedding(
-            &emb,
-            &mut ring,
-            Some(&classifier),
-            Some(&verifier),
-            &mut score_window,
-            None,
-            ADAPTIVE_K_DEFAULT,
-            None,
-        );
+        // Rolling sum and ring should still have accumulated normally.
+        assert_eq!(ring.len(), 3, "ring should have 3 embeddings after 3 feeds",);
+        let rolling_sum_after_3: f32 = score_window.iter().sum();
         assert!(
-            detected,
-            "warm-up should skip verifier gate at {ring_len_before} embeddings (< VERIFIER_WARMUP_EMBEDDINGS); \
-             detection should pass despite verifier_always_reject()",
+            (rolling_sum_after_3 - 1.65).abs() < 0.01,
+            "rolling sum should be 1.65 (3 × 0.55) after 3 embeddings, got {rolling_sum_after_3:.4}",
         );
-        assert!(
-            rolling_sum >= match_threshold(),
-            "rolling_sum ({rolling_sum:.4}) should be >= match_threshold ({:.4}) at detection",
-            match_threshold(),
-        );
-        assert!(
-            rolling_sum >= WARMUP_CLASSIFIER_THRESHOLD,
-            "rolling_sum ({rolling_sum:.4}) should be >= warm-up classifier threshold \
-             ({WARMUP_CLASSIFIER_THRESHOLD}) during warm-up",
-        );
-        assert_eq!(
-            (effective_threshold - WARMUP_CLASSIFIER_THRESHOLD).abs() < 0.01,
-            true,
-            "effective_threshold ({effective_threshold:.4}) should equal \
-             WARMUP_CLASSIFIER_THRESHOLD ({WARMUP_CLASSIFIER_THRESHOLD}) during warm-up",
-        );
-        assert_eq!(
-            ring.len(),
-            3,
-            "ring should have exactly 3 embeddings at this point",
-        );
-    }
 
-    #[test]
-    fn verifier_gate_blocks_after_warmup() {
-        // With 4+ embeddings (ring.len() >= VERIFIER_WARMUP_EMBEDDINGS),
-        // the verifier gate should be active and block the detection.
-        // Uses classifier that produces 0.55/frame so the warm-up threshold
-        // (1.55) is crossed at the 3rd embedding (1.65 ≥ 1.55), then the
-        // normal threshold (1.35) applies post-warm-up for the 4th (mahbot-892).
-        let classifier = classifier_always_score(0.55);
-        let verifier = verifier_always_reject();
-        let emb = vec![0.5; EMBEDDING_DIM];
-        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
-        let mut score_window = Vec::new();
-
-        // Push first 3 embeddings — detection passes at 3rd (warm-up skip).
-        // Then push a 4th embedding where the gate should be active.
-        for i in 0..3 {
-            let (detected, _, _, _) = score_single_embedding(
-                &emb,
-                &mut ring,
-                Some(&classifier),
-                Some(&verifier),
-                &mut score_window,
-                None,
-                ADAPTIVE_K_DEFAULT,
-                None,
-            );
-            if i < 2 {
-                assert!(!detected, "no detection before 3rd embedding");
-            } else {
-                assert!(
-                    detected,
-                    "3rd embedding should pass (warm-up skip): ring.len={}",
-                    ring.len(),
-                );
-            }
-        }
-
-        // 4th embedding: ring.len() = 4 >= VERIFIER_WARMUP_EMBEDDINGS.
-        // The verifier should compute and block (score ~0.12 < 0.50).
-        let ring_len_before = ring.len();
+        // 4th embedding: warm-up is over (ring.len() >= 4).  Detection
+        // should be attempted, but the verifier (always_reject) blocks it.
         let (detected, rolling_sum, _, _) = score_single_embedding(
             &emb,
             &mut ring,
@@ -8208,8 +8122,7 @@ mod tests {
         );
         assert!(
             !detected,
-            "verifier gate should block at {ring_len_before} embeddings (>= VERIFIER_WARMUP_EMBEDDINGS=4); \
-             rolling_sum={rolling_sum:.4}",
+            "4th embedding should be blocked by verifier gate; rolling_sum={rolling_sum:.4}",
         );
     }
 
