@@ -1093,7 +1093,7 @@ fn test_detection_samples(
         if let Some(ref mut state) = adaptive_state {
             **state = ctx.adaptive_threshold.clone();
         }
-        let peak = ctx.peak_score;
+        let peak = ctx.instrumentation.peak_score;
         if result.detected {
             if let Some(lat) = result.latency_ms {
                 metrics.latencies.push(lat);
@@ -1338,7 +1338,7 @@ fn run_noise_overlap_test(
                 // Persist the updated adaptive state for the next variant.
                 shared_adaptive = ctx.adaptive_threshold.clone();
 
-                let peak = ctx.peak_score;
+                let peak = ctx.instrumentation.peak_score;
                 if result.detected {
                     if let Some(lat) = result.latency_ms {
                         metrics.latencies.push(lat);
