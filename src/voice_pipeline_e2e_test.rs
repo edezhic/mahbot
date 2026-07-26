@@ -987,8 +987,10 @@ struct PerVariantResult {
     agc_converged: Option<bool>,
     /// Count of VAD-positive 512-sample frames during streaming detection.
     vad_speech_frames: usize,
-    /// Per-frame `[total_score, rolling_sum]` pairs from classifier scoring.
-    per_frame_scores: Vec<[f32; 2]>,
+    /// Per-frame `[total_score, rolling_sum, threshold]` triples from classifier
+    /// scoring (mahbot-891).  The third element is the effective threshold used
+    /// for the rolling window comparison this frame.
+    per_frame_scores: Vec<[f32; 3]>,
 }
 
 /// Track per-variant detection results for reporting.
@@ -2616,8 +2618,19 @@ pub(crate) fn run_internal() {
             "detected": pos_metrics.detected,
             "total_positive": pos_metrics.total,
             "miss_classification": {
-                "classifier": pos_metrics.per_variant.iter().filter(|pv| !pv.detected && pv.peak_score < MIN_CLASSIFIER_THRESHOLD).count(),
-                "verifier": pos_metrics.per_variant.iter().filter(|pv| !pv.detected && pv.peak_score >= MIN_CLASSIFIER_THRESHOLD).count(),
+                "classifier": pos_metrics.per_variant.iter().filter(|pv| {
+                    !pv.detected && pv.peak_score < MIN_CLASSIFIER_THRESHOLD
+                }).count(),
+                "adaptive_threshold": pos_metrics.per_variant.iter().filter(|pv| {
+                    !pv.detected
+                        && pv.peak_score >= MIN_CLASSIFIER_THRESHOLD
+                        && !pv.per_frame_scores.iter().any(|s| s[1] >= s[2])
+                }).count(),
+                "verifier": pos_metrics.per_variant.iter().filter(|pv| {
+                    !pv.detected
+                        && pv.peak_score >= MIN_CLASSIFIER_THRESHOLD
+                        && pv.per_frame_scores.iter().any(|s| s[1] >= s[2])
+                }).count(),
                 "total_misses": pos_metrics.total - pos_metrics.detected,
             },
             "false_accepts": {
@@ -2634,8 +2647,10 @@ pub(crate) fn run_internal() {
                     None
                 } else if pv.peak_score < MIN_CLASSIFIER_THRESHOLD {
                     Some("classifier")
-                } else {
+                } else if pv.per_frame_scores.iter().any(|s| s[1] >= s[2]) {
                     Some("verifier")
+                } else {
+                    Some("adaptive_threshold")
                 };
                 serde_json::json!({
                     "variant": pv.variant,

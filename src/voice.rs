@@ -909,6 +909,15 @@ const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(5);
 /// `refractory_sec=2.0`, openWakeWord uses patience counters.
 const WAKE_WORD_COOLDOWN: Duration = Duration::from_secs(3);
 
+/// Mean of the negative (non-wake-word) per-frame soft score distribution,
+/// measured during the mahbot-859 benchmark on confusable and unrelated
+/// speech.  Used as the seed value for [`AdaptiveThresholdState::warmed()`]
+/// (mahbot-891).  The safe harbor clamp (1.35) means the precise value is
+/// unimportant as long as it is well below 1.35; this constant documents
+/// the measured value for future reference.
+#[cfg(any(test, feature = "voice-tests"))]
+const NEGATIVE_DISTRIBUTION_MEAN: f32 = 0.033;
+
 /// Minimum per-frame soft score below which the rolling window is reset
 /// entirely (mahbot-773, mahbot-829, mahbot-852).  Set to 0.20 so that
 /// more frames contribute to the rolling sum during detection.  With the
@@ -917,7 +926,7 @@ const WAKE_WORD_COOLDOWN: Duration = Duration::from_secs(3);
 /// allows accumulation from borderline frames, increasing peak scores.
 /// False accepts remain low because the detection threshold (1.35, lowered
 /// from 1.65 in mahbot-860) is still far above the negative distribution
-/// mean (0.033).
+/// mean (NEGATIVE_DISTRIBUTION_MEAN = 0.033).
 const NO_MATCH_RESET_THRESHOLD: f32 = 0.20;
 
 /// Number of recent per-frame scores to keep in the rolling sum window
@@ -975,9 +984,10 @@ const _: () = assert!(
 /// detection to fire.  Lowered from 0.55 in mahbot-860 to capture borderline
 /// wake word variants that scored between 1.36 and 1.596 (below the old 1.65
 /// threshold) in the mahbot-859 benchmark.  The negative distribution mean
-/// (0.033) is still far below 1.35, maintaining a large safety margin against
-/// noise.  Combined with the verifier at 0.40 (mahbot-853), this maintains
-/// low false accepts while achieving ≥85% wake word detection.
+/// (NEGATIVE_DISTRIBUTION_MEAN = 0.033) is still far below 1.35, maintaining
+/// a large safety margin against noise.  Combined with the verifier at 0.40
+/// (mahbot-853), this maintains low false accepts while achieving ≥85% wake
+/// word detection.
 const MATCH_THRESHOLD_FACTOR: f32 = 0.45;
 
 /// Detection threshold for the rolling sum of soft scores (mahbot-773, mahbot-860).
@@ -1117,16 +1127,24 @@ fn voice_debug_enabled() -> bool {
 /// the second-stage logistic regression verifier gate.
 ///
 /// # Returns
-/// - `(true, rolling_sum)` — the embedding triggered wake word detection.
-/// - `(false, _)` — continue feeding more embeddings.
+/// - `(true, rolling_sum, total_score, effective_threshold)` — the embedding
+///   triggered wake word detection (all gates passed).
+/// - `(false, _, total_score, effective_threshold)` — continue feeding more
+///   embeddings (the ring buffer and score window are updated for the next
+///   call).
 ///
-/// The `rolling_sum` is the current rolling window sum at the time of
-/// evaluation (0.0 if the window was reset due to low score).
+/// - `rolling_sum` — the rolling window sum at the time of evaluation
+///   (0.0 if the window was reset due to low score).
+/// - `total_score` — the raw soft score from the Conv1D MLP classifier.
+/// - `effective_threshold` — the threshold value used for the rolling window
+///   comparison this frame (see below).
 ///
-/// # Parameters
-/// - `true` — the embedding triggered wake word detection (all gates passed).
-/// - `false` — continue feeding more embeddings (the ring buffer and score
-///   window are updated for the next call).
+/// The `effective_threshold` is either the adaptive threshold (post-bootstrap)
+/// or the static [`match_threshold()`] (during bootstrap or when no adaptive
+/// state is configured).  It differs from [`match_threshold()`] only when the
+/// adaptive state is active and post-bootstrap; otherwise it equals
+/// [`match_threshold()`].  Recorded in [`DetectionInstrumentation`] for
+/// miss-classification analysis (mahbot-891).
 ///
 /// # Parameters
 /// - `embedding` — one 96-dim embedding vector to process.
@@ -1136,6 +1154,10 @@ fn voice_debug_enabled() -> bool {
 /// - `verifier` — trained logistic regression verifier (`None` skips the
 ///   second-stage gate, matching enrollment self-test behaviour).
 /// - `score_window` — persistent rolling window of recent confidence scores.
+/// - `adaptive_state` — optional adaptive threshold state (`None` disables
+///   adaptive threshold adjustment).
+/// - `adaptive_k` — multiplier for the adaptive threshold's standard-deviation
+///   term (passed to [`AdaptiveThresholdState::next_threshold`]).
 /// - `peak_verifier_score` — optional accumulator for the running max verifier
 ///   prediction across frames (mahbot-859).  Pass `Some(&mut field)` to track
 ///   the peak; pass `None` to skip.  The verifier max is computed once per
@@ -1151,7 +1173,7 @@ pub(crate) fn score_single_embedding(
     mut adaptive_state: Option<&mut AdaptiveThresholdState>,
     adaptive_k: f32,
     mut peak_verifier_score: Option<&mut f32>,
-) -> (bool, f32, f32) {
+) -> (bool, f32, f32, f32) {
     // ── Ring buffer ───────────────────────────────────────────────────
     embedding_ring.push(embedding.to_vec());
     while embedding_ring.len() > EMBEDDING_RING_MAX {
@@ -1199,6 +1221,13 @@ pub(crate) fn score_single_embedding(
             state.peek(adaptive_k)
         }
     });
+
+    // ── Compute effective threshold for instrumentation (mahbot-891) ──
+    // The threshold used by process_wake_word_score is the adaptive override
+    // (when available, post-bootstrap) or the static match_threshold().
+    // Recorded in per_frame_scores so the benchmark can distinguish
+    // adaptive-threshold blocks from verifier blocks.
+    let effective_threshold = adaptive_override.unwrap_or_else(match_threshold);
 
     // ── Rolling window gate (mahbot-773) ─────────────────────────────
     let (detected, rolling_sum) =
@@ -1344,11 +1373,11 @@ pub(crate) fn score_single_embedding(
             // before this point, so the next time the rolling sum reaches
             // threshold the same peak (or higher, if more embeddings have
             // arrived) will be rechecked (mahbot-870).
-            return (false, rolling_sum, total_score);
+            return (false, rolling_sum, total_score, effective_threshold);
         }
-        return (true, rolling_sum, total_score);
+        return (true, rolling_sum, total_score, effective_threshold);
     }
-    (false, rolling_sum, total_score)
+    (false, rolling_sum, total_score, effective_threshold)
 }
 
 // Higher VAD threshold for enrollment: only clear, close-mic speech should
@@ -3303,7 +3332,7 @@ fn run_enrollment_self_test(
         let mut detected = false;
 
         for embedding in utterance {
-            let (detected_this, _, _) = score_single_embedding(
+            let (detected_this, _, _, _) = score_single_embedding(
                 embedding,
                 &mut embedding_ring,
                 Some(classifier),
@@ -4048,13 +4077,17 @@ impl AdaptiveThresholdState {
     }
 
     /// Create a pre-warmed state that has exited the bootstrap phase,
-    /// initialized with neutral scores.  Used by the E2E benchmark so the
-    /// adaptive threshold is active from the start of detection testing.
+    /// initialized with negative-distribution-mean scores.  Used by the E2E
+    /// benchmark so the adaptive threshold is active from the start of
+    /// detection testing.  The seed value (NEGATIVE_DISTRIBUTION_MEAN = 0.033)
+    /// ensures the threshold immediately clamps to the safe harbor (1.35),
+    /// matching production behavior where real audio starts from silence
+    /// (mahbot-891).
     #[cfg(any(test, feature = "voice-tests"))]
     pub(crate) fn warmed() -> Self {
         let mut state = Self::new();
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            state.feed(0.5, ADAPTIVE_K_DEFAULT);
+            state.feed(NEGATIVE_DISTRIBUTION_MEAN, ADAPTIVE_K_DEFAULT);
         }
         state
     }
@@ -4075,9 +4108,14 @@ impl AdaptiveThresholdState {
 #[cfg(feature = "voice-tests")]
 #[derive(Debug, Clone)]
 pub(crate) struct DetectionInstrumentation {
-    /// All per-frame `[total_score, rolling_sum]` pairs encountered during
-    /// detection of a single variant.
-    pub per_frame_scores: Vec<[f32; 2]>,
+    /// All per-frame `[total_score, rolling_sum, threshold]` triples
+    /// encountered during detection of a single variant.  The third element
+    /// is the effective threshold used for the rolling window comparison
+    /// (adaptive threshold post-bootstrap, or static match_threshold()
+    /// during bootstrap / when no adaptive state is configured).  Used by
+    /// the benchmark's miss-classification logic to distinguish
+    /// adaptive-threshold blocks from verifier blocks (mahbot-891).
+    pub per_frame_scores: Vec<[f32; 3]>,
     /// Count of frames where `total_score < NO_MATCH_RESET_THRESHOLD` (0.20).
     pub n_frames_below_reset: usize,
     /// Count of VAD-positive 512-sample frames during streaming detection.
@@ -6245,7 +6283,7 @@ fn try_match_wake_word_and_push_embedding(
     let classifier: Option<&WakeWordClassifier> = state.classifier.as_ref();
     let verifier = get_verifier();
     #[allow(unused_variables)]
-    let (detected, rolling_sum, total_score) = score_single_embedding(
+    let (detected, rolling_sum, total_score, effective_threshold) = score_single_embedding(
         &embedding,
         &mut ctx.embedding_ring,
         classifier,
@@ -6269,7 +6307,7 @@ fn try_match_wake_word_and_push_embedding(
     {
         ctx.instrumentation
             .per_frame_scores
-            .push([total_score, rolling_sum]);
+            .push([total_score, rolling_sum, effective_threshold]);
         if total_score < NO_MATCH_RESET_THRESHOLD {
             ctx.instrumentation.n_frames_below_reset += 1;
         }
@@ -6722,6 +6760,27 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_warmed_clamps_to_safe_harbor() {
+        // warmed() initializes with NEGATIVE_DISTRIBUTION_MEAN (~0.033).
+        // The computed adaptive threshold (0.033 + 2.5 × 0.0) × 3 = 0.099
+        // should be clamped to the safe harbor (1.35), matching production
+        // where the threshold is fed real silence/background scores.
+        // Regression test for mahbot-891.
+        let mut state = AdaptiveThresholdState::warmed();
+        let threshold = state
+            .feed(NEGATIVE_DISTRIBUTION_MEAN, ADAPTIVE_K_DEFAULT)
+            .expect("warmed() should exit bootstrap");
+        assert!(
+            (threshold - ADAPTIVE_SAFE_HARBOR).abs() < 0.01,
+            "warmed() threshold {threshold} should equal safe harbor {}",
+            ADAPTIVE_SAFE_HARBOR,
+        );
+        // Verify that all bootstrap frames were fed NEGATIVE_DISTRIBUTION_MEAN
+        // and not 0.5 (which would produce threshold ~1.5 instead of 1.35).
+        assert_eq!(state.len(), ADAPTIVE_BOOTSTRAP_FRAMES + 1);
+    }
+
+    #[test]
     fn adaptive_window_eviction_correctness() {
         // After filling the window and cycling scores, verify the sum/sum_sq
         // statistics produce the correct mean.
@@ -6959,7 +7018,7 @@ mod tests {
         let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
         let mut score_window = Vec::new();
 
-        let (detected, _, _) = score_single_embedding(
+        let (detected, _, _, _) = score_single_embedding(
             &embedding,
             &mut ring,
             Some(&classifier),
@@ -6999,7 +7058,7 @@ mod tests {
         let mut score_window = Vec::new();
 
         // First embedding: ring = [a], tiled to [a, a, a] → score ~0.5.
-        let (_detected, _, _) = score_single_embedding(
+        let (_detected, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
@@ -7021,7 +7080,7 @@ mod tests {
 
         // Second embedding: ring = [a, b], tiled to [a, b, b] → score ~0.5.
         score_window.clear();
-        let (detected, _, _) = score_single_embedding(
+        let (detected, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
@@ -7141,7 +7200,7 @@ mod tests {
 
         // Send enough embeddings to complete the bootstrap.
         for i in 0..ADAPTIVE_BOOTSTRAP_FRAMES + 1 {
-            let (detected, _, _) = score_single_embedding(
+            let (detected, _, _, _) = score_single_embedding(
                 &embedding,
                 &mut ring,
                 Some(&classifier),
@@ -7977,7 +8036,7 @@ mod tests {
 
         // First 2 embeddings: rolling sum below detection threshold.
         for i in 0..2 {
-            let (detected, rolling_sum, _) = score_single_embedding(
+            let (detected, rolling_sum, _, _) = score_single_embedding(
                 &emb,
                 &mut ring,
                 Some(&classifier),
@@ -7998,7 +8057,7 @@ mod tests {
         // Verifier should be SKIPPED during warm-up (< VERIFIER_WARMUP_EMBEDDINGS=4)
         // even though the verifier would block if evaluated.
         let ring_len_before = ring.len();
-        let (detected, rolling_sum, _) = score_single_embedding(
+        let (detected, rolling_sum, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
@@ -8038,7 +8097,7 @@ mod tests {
         // Push first 3 embeddings — detection passes at 3rd (warm-up skip).
         // Then push a 4th embedding where the gate should be active.
         for i in 0..3 {
-            let (detected, _, _) = score_single_embedding(
+            let (detected, _, _, _) = score_single_embedding(
                 &emb,
                 &mut ring,
                 Some(&classifier),
@@ -8062,7 +8121,7 @@ mod tests {
         // 4th embedding: ring.len() = 4 >= VERIFIER_WARMUP_EMBEDDINGS.
         // The verifier should compute and block (score ~0.12 < 0.50).
         let ring_len_before = ring.len();
-        let (detected, rolling_sum, _) = score_single_embedding(
+        let (detected, rolling_sum, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
@@ -8092,7 +8151,7 @@ mod tests {
 
         // Push 3 embeddings — detection should pass.
         for i in 0..3 {
-            let (detected, _, _) = score_single_embedding(
+            let (detected, _, _, _) = score_single_embedding(
                 &emb,
                 &mut ring,
                 Some(&classifier),
@@ -8115,7 +8174,7 @@ mod tests {
 
         // 4th embedding — should also pass (untrained verifier never blocks).
         let ring_len_before = ring.len();
-        let (detected, _, _) = score_single_embedding(
+        let (detected, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
