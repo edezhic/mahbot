@@ -116,10 +116,10 @@ const ADAM_EPS: f32 = 1e-8;
 pub(crate) const MAX_ITER: usize = 5000;
 
 /// MLP hidden layer 1 size (288 → 96).
-const MLP_HIDDEN_1: usize = 96;
+pub(crate) const MLP_HIDDEN_1: usize = 96;
 
 /// MLP hidden layer 2 size (96 → 48).
-const MLP_HIDDEN_2: usize = 48;
+pub(crate) const MLP_HIDDEN_2: usize = 48;
 
 /// Maximum iterations for MLP verifier training.
 ///
@@ -160,6 +160,40 @@ pub(crate) const VERIFIER_WINDOW_SIZE: usize = 3;
 
 /// Input dimension for the verifier MLP: 3 × 96 = 288.
 pub(crate) const VERIFIER_INPUT_DIM: usize = EMBEDDING_DIM * VERIFIER_WINDOW_SIZE;
+
+/// Minimum number of classifier embeddings required before the verifier gate
+/// is evaluated (mahbot-887).
+///
+/// During warm-up (ring buffer length < this value), detections pass with only
+/// the Conv1D classifier threshold protection.  This prevents the verifier from
+/// false-rejecting wake word detections that occur when only 3 embeddings
+/// exist — at that point the verifier only has a single 3-frame window (the
+/// onset window with padded mel frames) that produces unreliable low scores.
+/// By the time sufficient embeddings accumulate for a temporally representative
+/// verifier window (frame ~5+), the classifier's rolling sum has often already
+/// decayed below the detection threshold.
+///
+/// Set to 4 so the verifier has at least 2 stride-1 windows (embedding pairs
+/// [0,1,2] and [1,2,3]) rather than a single onset window.  This is a tunable
+/// heuristic — higher values give the verifier more temporal context but also
+/// widen the unprotected window where only the classifier gates against false
+/// accepts.
+///
+/// ## Calibration note
+///
+/// This value was selected heuristically (Analyst #3, mahbot-886/mahbot-887).
+/// Re-run the HARD-tier E2E calibration sweep before adjusting:
+/// `cargo bench --bench voice_pipeline_e2e`.  The threshold sweep environmental
+/// variable is `MAHBOT_VERIFIER_THRESHOLD`; there is currently no separate env
+/// variable for this constant — adjust in source and re-benchmark.
+///
+/// ## Interaction with other constants
+///
+/// - Must be ≥ `VERIFIER_WINDOW_SIZE` (3) so the verifier has at least one
+///   3-frame window when it does evaluate.
+/// - Must be ≤ `EMBEDDING_RING_MAX` so the warm-up period is bounded by the
+///   ring buffer capacity.
+pub(crate) const VERIFIER_WARMUP_EMBEDDINGS: usize = 4;
 
 /// Number of synthetic negative examples to generate for bootstrapping
 /// when no real calibration data is available.

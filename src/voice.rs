@@ -34,7 +34,9 @@ use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
 use crate::util::hex_string;
 use crate::vector::cosine_similarity;
-use crate::voice_verifier::{EMBEDDING_DIM, VERIFIER_WINDOW_SIZE, VoiceVerifier};
+use crate::voice_verifier::{
+    EMBEDDING_DIM, VERIFIER_WARMUP_EMBEDDINGS, VERIFIER_WINDOW_SIZE, VoiceVerifier,
+};
 use crate::wake_word_classifier::{self, ClassifierWeights, WakeWordClassifier};
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -1236,14 +1238,21 @@ pub(crate) fn score_single_embedding(
     // build temporally representative 3-frame windows — the rolling sum
     // can peak at frame ~3 while the verifier needs frame ~5+.
     //
-    // NOTE (mahbot-860): The verifier condition uses embedding_ring.len() >= 3
-    // instead of ROLLING_WINDOW_N because the rolling sum can reach its
-    // threshold with only 2 high-scoring frames (each >0.675 with the 1.35
-    // threshold).  The verifier needs at least 3 embeddings to form a single
-    // 3-frame window; with fewer than 3 we skip the verifier gate.
+    // WARM-UP (mahbot-887): During the first `VERIFIER_WARMUP_EMBEDDINGS`
+    // embeddings, the verifier score computation is skipped entirely
+    // (max_verifier_score stays 0.0).  At the onset, the verifier only
+    // sees a single 3-frame window formed from the first few mel frames,
+    // which contain the silence-to-speech transient and produce unreliable
+    // low scores.  The rolling sum often decays before enough embeddings
+    // (≥5) accumulate for a temporally representative window.  By skipping
+    // the verifier entirely during warm-up, the Conv1D classifier alone
+    // gates the detection — which matches its design as the primary scorer.
+    // The complementary gate condition below also checks this threshold so
+    // that the verifier does not block on the warm-up frames even if
+    // `peak_verifier_score` is 0.0.
     let max_verifier_score: f32 = if let Some(v) = verifier
         && v.is_trained()
-        && embedding_ring.len() >= VERIFIER_WINDOW_SIZE
+        && embedding_ring.len() >= VERIFIER_WARMUP_EMBEDDINGS
     {
         let start = embedding_ring
             .len()
@@ -1275,7 +1284,7 @@ pub(crate) fn score_single_embedding(
     }
 
     if detected {
-        // ── Verifier gate (mahbot-777, mahbot-788, mahbot-870) ──────────
+        // ── Verifier gate (mahbot-777, mahbot-788, mahbot-870, mahbot-887) ─
         // After the rolling window check passes, run the second-stage
         // MLP verifier to catch false positives that survived the MLP
         // classifier.  Uses the PEAK verifier score across all frames
@@ -1286,9 +1295,21 @@ pub(crate) fn score_single_embedding(
         // (mahbot-870).  Using the accumulated peak delays the blocking
         // decision until enough embeddings exist, without weakening the
         // gate for sustained confusable phrases.
+        //
+        // WARM-UP (mahbot-887): During the first `VERIFIER_WARMUP_EMBEDDINGS`
+        // embeddings, the verifier gate is skipped entirely, letting the
+        // Conv1D classifier threshold serve as the sole gate.  The
+        // `embedding_ring.len() >= VERIFIER_WARMUP_EMBEDDINGS` condition
+        // below ensures this.  During the onset the verifier only has access
+        // to a single 3-frame window whose mel frames are padded for the
+        // silence-to-speech transition — producing unreliable low scores
+        // that false-reject valid detections.  By frame 4+ the verifier
+        // has at least 2 stride-1 windows, one of which ([1,2,3]) typically
+        // has enough temporal context for a reliable decision.
         let effective_verifier_score = peak_verifier_score.map_or(max_verifier_score, |p| *p);
         if let Some(v) = verifier
             && v.is_trained()
+            && embedding_ring.len() >= VERIFIER_WARMUP_EMBEDDINGS
             && effective_verifier_score < v.threshold
         {
             // ── Voice debug logging (mahbot-853) ────────────────────
@@ -6262,6 +6283,9 @@ fn try_match_wake_word_and_push_embedding(
 mod tests {
     use super::*;
     use crate::util::{add_noise, apply_gain, generate_pink_noise};
+    use crate::voice_verifier::{
+        DEFAULT_VERIFIER_THRESHOLD, MLP_HIDDEN_1, MLP_HIDDEN_2, VERIFIER_INPUT_DIM,
+    };
     use rand::SeedableRng;
     use std::time::{Duration, Instant};
 
@@ -7893,6 +7917,203 @@ mod tests {
         assert!(
             state.enrolled_utterance_count >= 10,
             "utterance count 10 reaches NUM_ENROLLMENT_SAMPLES threshold"
+        );
+    }
+
+    // ── Verifier warm-up gate tests (mahbot-887) ─────────────────────────
+    //
+    // Tests that the verifier gate is skipped during the warm-up period
+    // (< VERIFIER_WARMUP_EMBEDDINGS embeddings) and activated afterwards.
+    //
+    // These tests construct a verifier that always rejects (b3 = -2.0 →
+    // sigmoid(-2.0) ≈ 0.12 < DEFAULT_VERIFIER_THRESHOLD = 0.50) and a
+    // classifier that always scores 0.5, so the rolling sum reaches the
+    // detection threshold (1.35) at the 3rd embedding.
+
+    /// Build a verifier that always produces a score below the rejection
+    /// threshold.  All MLP weights are zeroed; b3 = -2.0 gives
+    /// sigmoid(-2.0) ≈ 0.12 < 0.50.
+    fn verifier_always_reject() -> VoiceVerifier {
+        VoiceVerifier {
+            trained: true,
+            threshold: DEFAULT_VERIFIER_THRESHOLD,
+            w1: vec![0.0; VERIFIER_INPUT_DIM * MLP_HIDDEN_1],
+            b1: vec![0.0; MLP_HIDDEN_1],
+            w2: vec![0.0; MLP_HIDDEN_1 * MLP_HIDDEN_2],
+            b2: vec![0.0; MLP_HIDDEN_2],
+            w3: vec![0.0; MLP_HIDDEN_2],
+            b3: -2.0, // sigmoid(-2.0) ≈ 0.12
+            weights: Vec::new(),
+            bias: 0.0,
+            scaler_mean: Vec::new(),
+            scaler_std: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn verifier_warmup_skips_gate_at_3_embeddings() {
+        // With only 3 embeddings (ring.len() < VERIFIER_WARMUP_EMBEDDINGS),
+        // the verifier gate should be skipped and detection should pass
+        // based solely on the Conv1D classifier threshold.
+        let classifier = classifier_always_half(); // ~0.5 per frame
+        let verifier = verifier_always_reject();
+        let emb = vec![0.5; EMBEDDING_DIM];
+        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
+        let mut score_window = Vec::new();
+
+        // First 2 embeddings: rolling sum below detection threshold.
+        for i in 0..2 {
+            let (detected, rolling_sum, _) = score_single_embedding(
+                &emb,
+                &mut ring,
+                Some(&classifier),
+                Some(&verifier),
+                &mut score_window,
+                None,
+                ADAPTIVE_K_DEFAULT,
+                None,
+            );
+            assert!(
+                !detected,
+                "no detection at embedding {} (rolling_sum={rolling_sum:.4})",
+                i + 1,
+            );
+        }
+
+        // 3rd embedding: rolling sum reaches threshold (1.5 >= 1.35).
+        // Verifier should be SKIPPED during warm-up (< VERIFIER_WARMUP_EMBEDDINGS=4)
+        // even though the verifier would block if evaluated.
+        let ring_len_before = ring.len();
+        let (detected, rolling_sum, _) = score_single_embedding(
+            &emb,
+            &mut ring,
+            Some(&classifier),
+            Some(&verifier),
+            &mut score_window,
+            None,
+            ADAPTIVE_K_DEFAULT,
+            None,
+        );
+        assert!(
+            detected,
+            "warm-up should skip verifier gate at {ring_len_before} embeddings (< VERIFIER_WARMUP_EMBEDDINGS); \
+             detection should pass despite verifier_always_reject()",
+        );
+        assert!(
+            rolling_sum >= match_threshold(),
+            "rolling_sum ({rolling_sum:.4}) should be >= match_threshold ({:.4}) at detection",
+            match_threshold(),
+        );
+        assert_eq!(
+            ring.len(),
+            3,
+            "ring should have exactly 3 embeddings at this point",
+        );
+    }
+
+    #[test]
+    fn verifier_gate_blocks_after_warmup() {
+        // With 4+ embeddings (ring.len() >= VERIFIER_WARMUP_EMBEDDINGS),
+        // the verifier gate should be active and block the detection.
+        let classifier = classifier_always_half();
+        let verifier = verifier_always_reject();
+        let emb = vec![0.5; EMBEDDING_DIM];
+        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
+        let mut score_window = Vec::new();
+
+        // Push first 3 embeddings — detection passes at 3rd (warm-up skip).
+        // Then push a 4th embedding where the gate should be active.
+        for i in 0..3 {
+            let (detected, _, _) = score_single_embedding(
+                &emb,
+                &mut ring,
+                Some(&classifier),
+                Some(&verifier),
+                &mut score_window,
+                None,
+                ADAPTIVE_K_DEFAULT,
+                None,
+            );
+            if i < 2 {
+                assert!(!detected, "no detection before 3rd embedding");
+            } else {
+                assert!(
+                    detected,
+                    "3rd embedding should pass (warm-up skip): ring.len={}",
+                    ring.len(),
+                );
+            }
+        }
+
+        // 4th embedding: ring.len() = 4 >= VERIFIER_WARMUP_EMBEDDINGS.
+        // The verifier should compute and block (score ~0.12 < 0.50).
+        let ring_len_before = ring.len();
+        let (detected, rolling_sum, _) = score_single_embedding(
+            &emb,
+            &mut ring,
+            Some(&classifier),
+            Some(&verifier),
+            &mut score_window,
+            None,
+            ADAPTIVE_K_DEFAULT,
+            None,
+        );
+        assert!(
+            !detected,
+            "verifier gate should block at {ring_len_before} embeddings (>= VERIFIER_WARMUP_EMBEDDINGS=4); \
+             rolling_sum={rolling_sum:.4}",
+        );
+    }
+
+    #[test]
+    fn verifier_gate_without_warmup_skips_with_untrained_verifier() {
+        // When the verifier is untrained, `is_trained()` returns false and
+        // the gate is skipped regardless of embedding count.  This ensures
+        // the warm-up condition does not interfere with the untrained path.
+        let classifier = classifier_always_half();
+        let verifier = VoiceVerifier::untrained(); // always passes (predict returns 1.0)
+        let emb = vec![0.5; EMBEDDING_DIM];
+        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
+        let mut score_window = Vec::new();
+
+        // Push 3 embeddings — detection should pass.
+        for i in 0..3 {
+            let (detected, _, _) = score_single_embedding(
+                &emb,
+                &mut ring,
+                Some(&classifier),
+                Some(&verifier),
+                &mut score_window,
+                None,
+                ADAPTIVE_K_DEFAULT,
+                None,
+            );
+            if i < 2 {
+                assert!(!detected, "no detection before 3rd embedding");
+            } else {
+                assert!(
+                    detected,
+                    "3rd embedding should pass with untrained verifier: ring.len={}",
+                    ring.len(),
+                );
+            }
+        }
+
+        // 4th embedding — should also pass (untrained verifier never blocks).
+        let ring_len_before = ring.len();
+        let (detected, _, _) = score_single_embedding(
+            &emb,
+            &mut ring,
+            Some(&classifier),
+            Some(&verifier),
+            &mut score_window,
+            None,
+            ADAPTIVE_K_DEFAULT,
+            None,
+        );
+        assert!(
+            detected,
+            "untrained verifier should never block, even at {ring_len_before} embeddings",
         );
     }
 }
