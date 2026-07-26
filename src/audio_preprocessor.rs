@@ -29,6 +29,8 @@
 
 use sonora_ns::config::{NS_FRAME_SIZE, SuppressionLevel};
 use sonora_ns::noise_suppressor::NoiseSuppressor;
+#[cfg(feature = "voice-tests")]
+use std::collections::VecDeque;
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -142,7 +144,20 @@ pub struct AudioPreprocessor {
     /// Without this reset, stale gain history from a different acoustic
     /// environment (e.g. enrollment) could produce incorrect gain during
     /// live detection in a quieter/louder setting.
-    running_rms: f32,
+    pub(crate) running_rms: f32,
+
+    /// History of `running_rms` values for AGC convergence detection
+    /// (mahbot-886).  Bounded to the last 10 AGC-active frames.  Only
+    /// compiled in `voice-tests` builds — zero production overhead.
+    #[cfg(feature = "voice-tests")]
+    running_rms_history: VecDeque<f32>,
+
+    /// Count of AGC-active frames processed (frames where `apply_agc` ran
+    /// on a non-silent chunk and actually updated `running_rms`).  Used by
+    /// `agc_converged()` to determine whether enough audio was processed
+    /// for the AGC to have reached steady state.
+    #[cfg(feature = "voice-tests")]
+    agc_active_frame_count: usize,
 }
 
 impl AudioPreprocessor {
@@ -169,6 +184,13 @@ impl AudioPreprocessor {
             // initialisation the AGC immediately sets running_rms to the
             // actual frame level and applies the correct gain from frame 1.
             running_rms: 0.0,
+
+            // Instrumentation fields for AGC convergence tracking (mahbot-886).
+            // Feature-gated — zero runtime overhead in production builds.
+            #[cfg(feature = "voice-tests")]
+            running_rms_history: VecDeque::with_capacity(10),
+            #[cfg(feature = "voice-tests")]
+            agc_active_frame_count: 0,
         }
     }
 
@@ -339,6 +361,14 @@ impl AudioPreprocessor {
             return samples;
         }
 
+        // Count AGC-active frames (mahbot-886).  Placed after the silence
+        // guard so only non-silent chunks (where the AGC state actually
+        // evolves) are counted.  Feature-gated — zero overhead in production.
+        #[cfg(feature = "voice-tests")]
+        {
+            self.agc_active_frame_count += 1;
+        }
+
         // Lazy initialisation: on the first non-zero chunk (pure silence
         // returns above), set running_rms directly to the chunk RMS so the
         // gain immediately reflects the actual audio level (mahbot-856).
@@ -359,8 +389,78 @@ impl AudioPreprocessor {
             self.running_rms = alpha * chunk_rms + (1.0 - alpha) * self.running_rms;
         }
 
+        // Record running_rms for AGC convergence detection (mahbot-886).
+        // Feature-gated — zero overhead in production.
+        #[cfg(feature = "voice-tests")]
+        {
+            self.running_rms_history.push_back(self.running_rms);
+            if self.running_rms_history.len() > 10 {
+                self.running_rms_history.pop_front();
+            }
+        }
+
         let gain = (TARGET_RMS / self.running_rms).clamp(MIN_GAIN, MAX_GAIN);
         samples.iter().map(|&s| s * gain).collect()
+    }
+
+    /// Determine whether the AGC has converged to a stable gain level.
+    ///
+    /// Convergence is defined as the final frame's `running_rms` being within
+    /// 5% of the running average of the last 10 AGC-active frames.
+    ///
+    /// Returns:
+    /// - `Some(true)` if converged (enough AGC-active frames and stable RMS).
+    /// - `Some(false)` if not converged (enough frames but RMS still moving).
+    /// - `None` if insufficient data (< 20 AGC-active frames).
+    ///
+    /// Only available in `voice-tests` builds — zero production overhead.
+    ///
+    /// # Frame definition
+    ///
+    /// "AGC-active frame" means a call to [`apply_agc()`] on a non-silent chunk
+    /// (where `chunk_rms > 0.0`).  Silence frames do not update `running_rms`
+    /// and are excluded from the count.  At 32 ms per chunk, 20 AGC-active
+    /// frames ≈ 640 ms of speech — the ASR EMA has proven time to reach 90%
+    /// of steady state (~10 active frames for attack, ~114 for release) so
+    /// 20 frames is a conservative minimum for evaluating convergence.
+    /// Returns converged status: `Some(true)` if the AGC running_rms stabilized
+    /// by utterance end (final frame's running_rms within 5% of the running
+    /// average of the last 10 AGC-active frames), `Some(false)` if it did not,
+    /// `None` if fewer than 20 AGC-active frames (insufficient data to
+    /// determine convergence).
+    ///
+    /// An "AGC-active frame" is a non-silent chunk processed by `apply_agc`
+    /// (i.e., `chunk_rms > 0.0`).  Silence frames are excluded from the count
+    /// because they don't update `running_rms`.
+    ///
+    /// Used by the benchmark (mahbot-886) to correlate detection misses with
+    /// convergence state.
+    #[cfg(feature = "voice-tests")]
+    #[allow(clippy::cast_precision_loss)]
+    pub(crate) fn agc_converged(&self) -> Option<bool> {
+        if self.agc_active_frame_count < 20 {
+            // Fewer than 20 AGC-active frames = insufficient data to determine
+            // convergence.  This includes very short variants or audio clips
+            // where the AGC hasn't had time to reach steady state.
+            return None;
+        }
+        if self.running_rms_history.len() < 10 {
+            // Shouldn't happen if agc_active_frame_count >= 20 (history fills
+            // after 10 AGC-active frames, and with 20+ frames we're guaranteed
+            // a full history), but guard defensively.
+            return None;
+        }
+        let final_rms = *self.running_rms_history.back().unwrap();
+        let avg_10: f32 = self.running_rms_history.iter().copied().sum::<f32>()
+            / self.running_rms_history.len() as f32;
+        // avg_10 > 0.0 is guaranteed because every entry in the history comes
+        // from an AGC-active frame (non-silent chunk), and running_rms is only
+        // updated when chunk_rms > 0.0.
+        debug_assert!(
+            avg_10 > 0.0,
+            "avg_10 should be > 0.0 since AGC only runs on non-silent chunks"
+        );
+        Some((final_rms - avg_10).abs() / avg_10 <= 0.05)
     }
 }
 

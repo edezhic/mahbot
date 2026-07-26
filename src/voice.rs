@@ -1149,7 +1149,7 @@ pub(crate) fn score_single_embedding(
     mut adaptive_state: Option<&mut AdaptiveThresholdState>,
     adaptive_k: f32,
     mut peak_verifier_score: Option<&mut f32>,
-) -> (bool, f32) {
+) -> (bool, f32, f32) {
     // ── Ring buffer ───────────────────────────────────────────────────
     embedding_ring.push(embedding.to_vec());
     while embedding_ring.len() > EMBEDDING_RING_MAX {
@@ -1323,11 +1323,11 @@ pub(crate) fn score_single_embedding(
             // before this point, so the next time the rolling sum reaches
             // threshold the same peak (or higher, if more embeddings have
             // arrived) will be rechecked (mahbot-870).
-            return (false, rolling_sum);
+            return (false, rolling_sum, total_score);
         }
-        return (true, rolling_sum);
+        return (true, rolling_sum, total_score);
     }
-    (false, rolling_sum)
+    (false, rolling_sum, total_score)
 }
 
 // Higher VAD threshold for enrollment: only clear, close-mic speech should
@@ -3282,7 +3282,7 @@ fn run_enrollment_self_test(
         let mut detected = false;
 
         for embedding in utterance {
-            let (detected_this, _) = score_single_embedding(
+            let (detected_this, _, _) = score_single_embedding(
                 embedding,
                 &mut embedding_ring,
                 Some(classifier),
@@ -4049,6 +4049,31 @@ impl AdaptiveThresholdState {
 // Pipeline context
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Per-variant instrumentation collected by the wake word detection benchmark
+/// (mahbot-886).  Feature-gated behind `voice-tests` — zero production overhead.
+#[cfg(feature = "voice-tests")]
+#[derive(Debug, Clone)]
+pub(crate) struct DetectionInstrumentation {
+    /// All per-frame `[total_score, rolling_sum]` pairs encountered during
+    /// detection of a single variant.
+    pub per_frame_scores: Vec<[f32; 2]>,
+    /// Count of frames where `total_score < NO_MATCH_RESET_THRESHOLD` (0.20).
+    pub n_frames_below_reset: usize,
+    /// Count of VAD-positive 512-sample frames during streaming detection.
+    pub vad_speech_frames: usize,
+}
+
+#[cfg(feature = "voice-tests")]
+impl DetectionInstrumentation {
+    pub fn new() -> Self {
+        Self {
+            per_frame_scores: Vec::new(),
+            n_frames_below_reset: 0,
+            vad_speech_frames: 0,
+        }
+    }
+}
+
 /// Runtime state for the voice pipeline main loop.
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct PipelineCtx {
@@ -4175,6 +4200,14 @@ pub(crate) struct PipelineCtx {
     /// Soft because stale verifier scores from a previous detection session
     /// would otherwise block subsequent detections (mahbot-870).
     peak_verifier_score: f32,
+
+    /// Instrumentation accumulators for wake word detection benchmarking
+    /// (mahbot-886).  Feature-gated behind `voice-tests` — zero production
+    /// overhead.  Populated by `try_match_wake_word_and_push_embedding` and
+    /// `handle_wake_word_detection`, read by the E2E benchmark after
+    /// `run_streaming_detection` returns.
+    #[cfg(feature = "voice-tests")]
+    pub(crate) instrumentation: DetectionInstrumentation,
 }
 
 /// Reset granularity for [`PipelineCtx::reset_pipeline_state`].
@@ -4250,6 +4283,8 @@ impl PipelineCtx {
             },
             peak_score: 0.0,
             peak_verifier_score: 0.0,
+            #[cfg(feature = "voice-tests")]
+            instrumentation: DetectionInstrumentation::new(),
         }
     }
 
@@ -5808,14 +5843,42 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     let mut audio_buf = std::mem::take(&mut ctx.audio_buffer);
     let mut voice_batch = std::mem::take(&mut ctx.voice_batch);
     let mut mel_frame_buffer = std::mem::take(&mut ctx.mel_frame_buffer);
+
+    // VAD counting for instrumentation (mahbot-886).  Uses an `AtomicUsize`
+    // captured by shared reference in the closure to avoid a borrow conflict
+    // with `on_flush` (which captures `ctx` by `&mut`).  `AtomicUsize::fetch_add`
+    // takes `&self`, so the closure captures `&AtomicUsize` — no `&mut` needed.
+    // Feature-gated — zero overhead in production.
+    #[cfg(feature = "voice-tests")]
+    let vad_count = std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(not(feature = "voice-tests"))]
+    let is_speech_fn = is_speech;
+
+    #[cfg(feature = "voice-tests")]
+    let is_speech_fn = |frame: &[f32]| -> bool {
+        let result = is_speech(frame);
+        if result {
+            vad_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    };
+
     let consumed = process_streaming_frames_inner(
         &audio_buf,
         &mut voice_batch,
         &mut mel_frame_buffer,
-        is_speech,
+        is_speech_fn,
         false, // no trailing flush — audio_buffer accumulates across calls
         |mel_frames| try_match_wake_word_and_push_embedding(ctx, mel_frames),
     );
+
+    // Transfer VAD count into instrumentation (mahbot-886).
+    #[cfg(feature = "voice-tests")]
+    {
+        ctx.instrumentation.vad_speech_frames =
+            vad_count.load(std::sync::atomic::Ordering::Relaxed);
+    }
     // Drain consumed audio, write back batch and audio buffers.
     if consumed > 0 {
         audio_buf.drain(..consumed);
@@ -6152,7 +6215,8 @@ fn try_match_wake_word_and_push_embedding(
     let state = voice_state().read().unwrap_poison();
     let classifier: Option<&WakeWordClassifier> = state.classifier.as_ref();
     let verifier = get_verifier();
-    let (detected, rolling_sum) = score_single_embedding(
+    #[allow(unused_variables)]
+    let (detected, rolling_sum, total_score) = score_single_embedding(
         &embedding,
         &mut ctx.embedding_ring,
         classifier,
@@ -6165,6 +6229,21 @@ fn try_match_wake_word_and_push_embedding(
     // Track peak rolling-sum for diagnostics/benchmarking (mahbot-845).
     if rolling_sum > ctx.peak_score {
         ctx.peak_score = rolling_sum;
+    }
+
+    // ── Per-variant instrumentation (mahbot-886) ──────────────────────────
+    // Collected only in `voice-tests` builds (benchmark/testing).  Records
+    // per-frame scores, rolling sums, and threshold crossings for later
+    // analysis in PerVariantResult.  Feature-gated — zero overhead in
+    // production.
+    #[cfg(feature = "voice-tests")]
+    {
+        ctx.instrumentation
+            .per_frame_scores
+            .push([total_score, rolling_sum]);
+        if total_score < NO_MATCH_RESET_THRESHOLD {
+            ctx.instrumentation.n_frames_below_reset += 1;
+        }
     }
     if detected {
         // Wake word detected — transition to recording mode.
@@ -6842,7 +6921,7 @@ mod tests {
         let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
         let mut score_window = Vec::new();
 
-        let (detected, _) = score_single_embedding(
+        let (detected, _, _) = score_single_embedding(
             &embedding,
             &mut ring,
             Some(&classifier),
@@ -6882,7 +6961,7 @@ mod tests {
         let mut score_window = Vec::new();
 
         // First embedding: ring = [a], tiled to [a, a, a] → score ~0.5.
-        let (_detected, _) = score_single_embedding(
+        let (_detected, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
@@ -6904,7 +6983,7 @@ mod tests {
 
         // Second embedding: ring = [a, b], tiled to [a, b, b] → score ~0.5.
         score_window.clear();
-        let (detected, _) = score_single_embedding(
+        let (detected, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
@@ -7024,7 +7103,7 @@ mod tests {
 
         // Send enough embeddings to complete the bootstrap.
         for i in 0..ADAPTIVE_BOOTSTRAP_FRAMES + 1 {
-            let (detected, _) = score_single_embedding(
+            let (detected, _, _) = score_single_embedding(
                 &embedding,
                 &mut ring,
                 Some(&classifier),

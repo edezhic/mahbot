@@ -760,61 +760,68 @@ fn vad_segment_and_enroll(
     Vec<Vec<f32>>,
     Vec<Vec<Vec<f32>>>,
 ) {
-    // ── Concatenate all variants with 2.0s silence gaps ──
+    // ── Per-variant AGC (mahbot-886) ──
+    // Each variant is processed individually through a fresh AudioPreprocessor
+    // (both AGC and noise suppressor).  This matches the production detection
+    // path where each PipelineCtx::new() creates a fresh AudioPreprocessor
+    // with running_rms=0.0.  The previous shared-AGC approach (concatenating
+    // all variants first then applying AGC) created a different AGC distribution
+    // — the running_rms converged across variants during training, but detection
+    // always starts fresh, causing a 46% miss rate on TTS variants (mahbot-886).
+    //
+    // A shared noise suppressor across variants would also create a training-
+    // inference mismatch: the NS converges over N variants during training, but
+    // detection always starts fresh.  Per-variant fresh NS matches the detection
+    // path behavior.
+    use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
+    let chunk_size = super::FRAME_LENGTH;
+
+    let all_variants: Vec<&(Vec<f32>, String)> = enrollment_variants
+        .iter()
+        .chain(augmented_variants.iter())
+        .collect();
+
+    let mut per_variant_agc: Vec<Vec<f32>> = Vec::with_capacity(all_variants.len());
+    for (samples, _label) in &all_variants {
+        let mut pre = AudioPreprocessor::new(PreprocessorConfig::default());
+        let mut processed: Vec<f32> = Vec::with_capacity(samples.len());
+        for chunk in samples.chunks(chunk_size) {
+            let padded = if chunk.len() < chunk_size {
+                let mut p: Vec<f32> = chunk.to_vec();
+                p.resize(chunk_size, 0.0);
+                p
+            } else {
+                chunk.to_vec()
+            };
+            processed.extend(pre.process(padded));
+        }
+        per_variant_agc.push(processed);
+    }
+
+    // ── Concatenate AGC-processed variants with 2.0s silence gaps ──
     // 2.0s well exceeds SILENCE_THRESHOLD_SAMPLES (1.5s) for clean boundaries.
     let silence_gap_samples = (2.0 * f64::from(super::SAMPLE_RATE)) as usize;
     let silence: Vec<f32> = vec![0.0f32; silence_gap_samples];
 
     let mut combined_audio: Vec<f32> = Vec::new();
-    for (samples, _label) in enrollment_variants.iter().chain(augmented_variants) {
+    for processed in &per_variant_agc {
         if !combined_audio.is_empty() {
             combined_audio.extend_from_slice(&silence);
         }
-        combined_audio.extend_from_slice(samples);
+        combined_audio.extend_from_slice(processed);
     }
     // Trailing silence for the last utterance
     combined_audio.extend_from_slice(&silence);
 
     info!(
-        "VAD concatenation: {} total samples ({:.1}s) from {} variants",
+        "VAD concatenation: {} total samples ({:.1}s) from {} variants (per-variant AGC)",
         combined_audio.len(),
         combined_audio.len() as f64 / f64::from(super::SAMPLE_RATE),
-        enrollment_variants.len() + augmented_variants.len(),
+        all_variants.len(),
     );
 
-    // ── Apply AGC to match production pipeline (mahbot-856) ──
-    // In production, enrollment audio passes through AudioPreprocessor (AGC +
-    // noise suppression) before reaching handle_enrollment_sample for embedding
-    // extraction.  The benchmark must apply the same preprocessing so the
-    // training embeddings match the inference distribution — otherwise the
-    // classifier learns to recognise raw (non-AGC'd) embeddings but receives
-    // AGC'd embeddings during detection, causing a systematic mismatch that
-    // depresses detection rates (especially for quiet volume-reduced variants
-    // where AGC applies meaningful amplification that changes the signal).
-    //
-    // We process the combined audio in FRAME_LENGTH chunks (matching the
-    // production mic capture size) so the AGC's EMA running_rms evolves
-    // realistically across utterances.
-    use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
-    let mut preprocessor = AudioPreprocessor::new(PreprocessorConfig::default());
-    let chunk_size = super::FRAME_LENGTH;
-    let mut processed_audio: Vec<f32> = Vec::with_capacity(combined_audio.len());
-    for chunk in combined_audio.chunks(chunk_size) {
-        let padded = if chunk.len() < chunk_size {
-            let mut p: Vec<f32> = chunk.to_vec();
-            p.resize(chunk_size, 0.0);
-            p
-        } else {
-            chunk.to_vec()
-        };
-        processed_audio.extend(preprocessor.process(padded));
-    }
-    // Note: processed_audio may be slightly shorter than combined_audio due to
-    // noise suppression frame alignment buffering.  This is fine — the silence
-    // gaps provide ample margin for VAD segmentation.
-
     // ── Compute VAD decision + utterances on AGC-processed audio ──
-    let (_vad_decisions, utterances) = compute_vad_segments(&processed_audio);
+    let (_vad_decisions, utterances) = compute_vad_segments(&combined_audio);
 
     info!(
         "VAD segmentation: {} utterances from {} concatenated variants",
@@ -970,6 +977,18 @@ struct PerVariantResult {
     /// Peak verifier prediction score achieved during processing
     /// (0.0 if verifier is untrained or no embeddings passed the threshold).
     verifier_score: f32,
+    /// Number of embeddings produced during streaming detection (mahbot-886).
+    n_embeddings: usize,
+    /// Number of frames where total_score < NO_MATCH_RESET_THRESHOLD (0.20).
+    n_frames_below_reset: usize,
+    /// Whether the AGC converged to a stable gain level by utterance end.
+    /// `Some(true)` if converged, `Some(false)` if not, `None` if insufficient
+    /// data (< 20 AGC-active frames).
+    agc_converged: Option<bool>,
+    /// Count of VAD-positive 512-sample frames during streaming detection.
+    vad_speech_frames: usize,
+    /// Per-frame `[total_score, rolling_sum]` pairs from classifier scoring.
+    per_frame_scores: Vec<[f32; 2]>,
 }
 
 /// Track per-variant detection results for reporting.
@@ -1079,12 +1098,18 @@ fn test_detection_samples(
             }
             on_detection(metrics, label);
         }
-        // Record per-variant result (mahbot-845) with verifier score (mahbot-859).
+        // Record per-variant result (mahbot-845) with verifier score (mahbot-859)
+        // and per-variant instrumentation (mahbot-886).
         metrics.per_variant.push(PerVariantResult {
             variant: label.clone(),
             detected: result.detected,
             peak_score: peak,
             verifier_score: ctx.peak_verifier_score,
+            n_embeddings: ctx.instrumentation.per_frame_scores.len(),
+            n_frames_below_reset: ctx.instrumentation.n_frames_below_reset,
+            agc_converged: ctx.audio_preprocessor.agc_converged(),
+            vad_speech_frames: ctx.instrumentation.vad_speech_frames,
+            per_frame_scores: ctx.instrumentation.per_frame_scores.clone(),
         });
     }
 }
@@ -1323,6 +1348,11 @@ fn run_noise_overlap_test(
                     detected: result.detected,
                     peak_score: peak,
                     verifier_score: ctx.peak_verifier_score,
+                    n_embeddings: ctx.instrumentation.per_frame_scores.len(),
+                    n_frames_below_reset: ctx.instrumentation.n_frames_below_reset,
+                    agc_converged: ctx.audio_preprocessor.agc_converged(),
+                    vad_speech_frames: ctx.instrumentation.vad_speech_frames,
+                    per_frame_scores: ctx.instrumentation.per_frame_scores.clone(),
                 });
             }
 
@@ -2613,6 +2643,11 @@ pub(crate) fn run_internal() {
                     "peak_score": pv.peak_score,
                     "verifier_score": pv.verifier_score,
                     "miss_reason": miss_reason,
+                    "n_embeddings": pv.n_embeddings,
+                    "n_frames_below_reset": pv.n_frames_below_reset,
+                    "agc_converged": pv.agc_converged,
+                    "vad_speech_frames": pv.vad_speech_frames,
+                    "per_frame_scores": pv.per_frame_scores,
                 })
             }).collect()
         ),
