@@ -722,8 +722,15 @@ fn compute_vad_segments(audio: &[f32]) -> (Vec<bool>, Vec<Vec<f32>>) {
         let start = i * super::HOP_LENGTH;
         let end = (start + super::FRAME_LENGTH).min(audio.len());
         let frame = &audio[start..end];
+        // Feed only the NEW HOP_LENGTH samples to avoid double-feeding
+        // overlapping audio to earshot.  Each frame (at HOP_LENGTH stride)
+        // overlaps the previous by 50% — feeding the full 512-sample frame
+        // would duplicate 256 samples, corrupting earshot's ring buffer.
+        // This must match the production VAD call pattern in both
+        // process_streaming_frames_inner and handle_enrollment_audio
+        // to maintain train-inference consistency (mahbot-900).
         vad_decisions.push(super::is_speech_with_detector(
-            frame,
+            &frame[..super::HOP_LENGTH],
             &mut detector,
             super::ENROLLMENT_VAD_THRESHOLD,
         ));

@@ -2397,7 +2397,15 @@ fn process_streaming_frames_inner(
         let frame = &samples[consumed..consumed + FRAME_LENGTH];
 
         // VAD gate — skip silence to avoid wasted ONNX compute.
-        if is_speech_fn(frame) {
+        //
+        // Feed only the NEW HOP_LENGTH samples (not the full 512-sample
+        // frame) to keep earshot's internal ring buffer contiguous.
+        // Each frame overlaps the previous by 50% (= HOP_LENGTH = 256), so
+        // feeding the full frame would duplicate the second half of the
+        // previous frame's 256 samples — corrupting earshot's ring buffer,
+        // pre-emphasis filter, and 3-frame feature context with duplicated
+        // data (mahbot-900).
+        if is_speech_fn(&frame[..HOP_LENGTH]) {
             // Add only the NEW samples (HOP_LENGTH per frame) to avoid
             // duplicating overlapping audio.  Each frame overlaps the previous
             // by 50% (HOP_LENGTH = FRAME_LENGTH/2), so appending the full
@@ -6344,7 +6352,16 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
         let frame = &ctx.audio_buffer[consumed..consumed + FRAME_LENGTH];
 
         // ── Accumulate VAD decision for extracted function ──
-        let is_speech = is_speech_with_threshold(frame, ctx.vad_threshold);
+        //
+        // Feed only the NEW HOP_LENGTH samples (not the full 512-sample
+        // frame) to avoid double-feeding overlapping audio to earshot's
+        // VAD detector.  Each frame overlaps the previous by 50%
+        // (= HOP_LENGTH), so feeding the full frame duplicates 256 samples,
+        // corrupting earshot's internal ring buffer, pre-emphasis filter,
+        // and feature context (mahbot-900).  This must match the VAD call
+        // pattern in process_streaming_frames_inner to maintain train-
+        // inference consistency across the detection and enrollment paths.
+        let is_speech = is_speech_with_threshold(&frame[..HOP_LENGTH], ctx.vad_threshold);
         ctx.frame_vad.push(is_speech);
 
         if is_speech {
