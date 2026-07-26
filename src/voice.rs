@@ -945,6 +945,64 @@ const NEGATIVE_DISTRIBUTION_MEAN: f32 = 0.033;
 /// mean (NEGATIVE_DISTRIBUTION_MEAN = 0.033).
 const NO_MATCH_RESET_THRESHOLD: f32 = 0.20;
 
+/// Maximum number of embeddings a classifier candidate can accumulate
+/// verifier evidence from before being discarded (mahbot-895).
+///
+/// A candidate is created when the classifier's rolling sum first crosses
+/// the threshold (post-warm-up).  It accumulates verifier peak scores from
+/// each subsequent embedding for at most this many embeddings.  If the peak
+/// reaches the verifier's threshold within this window, the candidate
+/// triggers detection.  Otherwise, the candidate expires and is discarded.
+///
+/// At ~128 ms per embedding (embedding stride = 8 mel frames at 10 ms/frame),
+/// 4 embeddings ≈ 512 ms — the ~500 ms window mentioned in mahbot-895.
+/// This gives the verifier enough temporal context while preventing
+/// unbounded accumulation across long utterances.
+const CANDIDATE_MAX_EMBEDDINGS: usize = 4;
+
+/// A bounded detection candidate created when the classifier's rolling sum
+/// first crosses the threshold (mahbot-895).
+///
+/// Replaces the session-lifetime `peak_verifier_score` with a per-candidate
+/// accumulator.  A candidate is created on the first threshold crossing
+/// post-warm-up, accumulates verifier evidence from a bounded window of
+/// subsequent embeddings, then either triggers (verifier confirms) or is
+/// discarded (verifier rejects or maximum window exceeded).  Each candidate's
+/// verifier evidence is independent and bounded, eliminating cross-candidate
+/// contamination.
+#[derive(Debug, Clone)]
+pub(crate) struct ClassifierCandidate {
+    /// Number of embeddings accumulated since candidate creation, including
+    /// the first threshold-crossing embedding.  When this reaches
+    /// [`CANDIDATE_MAX_EMBEDDINGS`], the candidate expires if the verifier
+    /// peak is still below threshold.
+    embedding_count: usize,
+    /// Peak verifier score across all embeddings in this candidate's window.
+    /// Only updated from `max_verifier_score` values computed during this
+    /// candidate's lifetime — no cross-candidate contamination.
+    peak_verifier_score: f32,
+}
+
+impl ClassifierCandidate {
+    fn new(initial_verifier_score: f32) -> Self {
+        Self {
+            embedding_count: 1,
+            peak_verifier_score: initial_verifier_score,
+        }
+    }
+
+    /// Update this candidate's verifier peak and increment the embedding
+    /// counter.  Returns `true` if the candidate has reached its maximum
+    /// window and should be expired.
+    fn update(&mut self, verifier_score: f32) -> bool {
+        self.embedding_count += 1;
+        if verifier_score > self.peak_verifier_score {
+            self.peak_verifier_score = verifier_score;
+        }
+        self.embedding_count >= CANDIDATE_MAX_EMBEDDINGS
+    }
+}
+
 /// Number of recent per-frame scores to keep in the rolling sum window
 /// (mahbot-773).  Each frame represents ~128ms of voiced audio, so N=3
 /// covers ~384ms — matching the original temporal window but using
@@ -1140,7 +1198,7 @@ fn voice_debug_enabled() -> bool {
 /// (tiling available embeddings to fill the 3-embedding window when the ring
 /// has fewer than 3 entries — see [`score_single_embedding`] implementation),
 /// applies rolling window scoring via [`process_wake_word_score`], and checks
-/// the second-stage logistic regression verifier gate.
+/// the second-stage MLP verifier gate via a bounded classifier candidate.
 ///
 /// # Returns
 /// - `(true, rolling_sum, total_score, effective_threshold)` — the embedding
@@ -1163,6 +1221,17 @@ fn voice_debug_enabled() -> bool {
 /// rolling window comparison is ever reported (mahbot-893).  Recorded in
 /// [`DetectionInstrumentation`] for miss-classification analysis (mahbot-891).
 ///
+/// # Bounded classifier candidate (mahbot-895)
+///
+/// The [`peak_verifier_score`] session-lifetime accumulator has been replaced
+/// by a per-candidate bounded [`ClassifierCandidate`].  When the rolling sum
+/// first crosses the threshold (post-warm-up), a candidate is created.  It
+/// accumulates verifier evidence from subsequent embeddings (up to
+/// [`CANDIDATE_MAX_EMBEDDINGS`] ≈ 512 ms of additional context).  If the
+/// candidate's verifier peak reaches the verifier's threshold, detection is
+/// confirmed.  If the candidate expires without confirmation (max window or
+/// score reset), it is discarded — no cross-candidate contamination.
+///
 /// # Parameters
 /// - `embedding` — one 96-dim embedding vector to process.
 /// - `embedding_ring` — persistent ring buffer (shared across frames in the
@@ -1175,11 +1244,10 @@ fn voice_debug_enabled() -> bool {
 ///   adaptive threshold adjustment).
 /// - `adaptive_k` — multiplier for the adaptive threshold's standard-deviation
 ///   term (passed to [`AdaptiveThresholdState::next_threshold`]).
-/// - `peak_verifier_score` — optional accumulator for the running max verifier
-///   prediction across frames (mahbot-859).  Pass `Some(&mut field)` to track
-///   the peak; pass `None` to skip.  The verifier max is computed once per
-///   frame and shared between the gate and this accumulator, avoiding redundant
-///   `predict` calls.
+/// - `candidate` — optional bounded classifier candidate (mahbot-895).
+///   Pass `Some(&mut candidate_field)` to create/update/expire a candidate
+///   across frames; pass `None` to skip candidate tracking (e.g. enrollment
+///   self-test when no verifier is active).
 #[expect(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 pub(crate) fn score_single_embedding(
@@ -1190,7 +1258,7 @@ pub(crate) fn score_single_embedding(
     score_window: &mut Vec<f32>,
     mut adaptive_state: Option<&mut AdaptiveThresholdState>,
     adaptive_k: f32,
-    mut peak_verifier_score: Option<&mut f32>,
+    mut candidate: Option<&mut Option<ClassifierCandidate>>,
 ) -> (bool, f32, f32, f32) {
     // ── Ring buffer ───────────────────────────────────────────────────
     embedding_ring.push(embedding.to_vec());
@@ -1330,15 +1398,14 @@ pub(crate) fn score_single_embedding(
         0.0
     };
 
-    // ── Verifier peak tracking + gate (mahbot-870) ──────────────────
-    // Track the peak verifier score across all frames and use it for
-    // the gate decision.  Use `ref` to borrow the Option without moving
-    // it — the peak is needed below for the gate after tracking.
-    if let Some(ref mut peak) = peak_verifier_score
-        && max_verifier_score > **peak
-    {
-        **peak = max_verifier_score;
-    }
+    // ── Bounded classifier candidate (mahbot-895) ─────────────────────
+    // Replaces the session-lifetime `peak_verifier_score` accumulator.
+    // A candidate is created when the rolling sum first crosses threshold
+    // (post-warm-up).  It accumulates the verifier peak from subsequent
+    // embeddings (up to CANDIDATE_MAX_EMBEDDINGS).  If the peak reaches
+    // the verifier's threshold, detection triggers.  If the candidate
+    // expires without confirming, it is discarded — each candidate is
+    // fully independent with no cross-candidate contamination.
 
     // ── Warm-up suppression (mahbot-893) ─────────────────────────────
     // Completely suppress all wake word detections during the verifier
@@ -1346,9 +1413,9 @@ pub(crate) fn score_single_embedding(
     // with a trained verifier).  No detection is ever reported during
     // warm-up, regardless of classifier score, threshold, or rolling
     // sum.  The rolling score window still accumulates (preserving
-    // post-warm-up detection timing), and the verifier peak score is
-    // still tracked (so the verifier gate can block immediately when
-    // warm-up ends).
+    // post-warm-up detection timing), and no candidate is created during
+    // warm-up — candidates only start after warm-up ends, ensuring the
+    // verifier has enough context from the start.
     //
     // Safety (mahbot-893): Per-frame benchmark analysis shows that no
     // genuine wake word variant crosses the classifier threshold during
@@ -1370,70 +1437,83 @@ pub(crate) fn score_single_embedding(
         detected = false;
     }
 
+    // ── Candidate lifecycle ───────────────────────────────────────────
     if detected {
-        // ── Verifier gate (mahbot-777, mahbot-788, mahbot-870, mahbot-887) ─
-        // After the rolling window check passes, run the second-stage
-        // MLP verifier to catch false positives that survived the MLP
-        // classifier.  Uses the PEAK verifier score across all frames
-        // (not just the current frame's window max), because the rolling
-        // sum can peak at frame ~3 (3 consecutive high classifier scores)
-        // while the verifier's 3-frame stride-1 windows need more
-        // embeddings (frame ~5+) before they are temporally representative
-        // (mahbot-870).  Using the accumulated peak delays the blocking
-        // decision until enough embeddings exist, without weakening the
-        // gate for sustained confusable phrases.
-        //
-        // NOTE (mahbot-893): The warm-up logic has been replaced — during
-        // the first `VERIFIER_WARMUP_EMBEDDINGS` embeddings, detection is
-        // unconditionally suppressed BEFORE reaching this gate (see warm-up
-        // suppression block above).  The gate still uses the
-        // `embedding_ring.len() >= VERIFIER_WARMUP_EMBEDDINGS` condition
-        // for its own verifier score computation (which was originally the
-        // warm-up skip, mahbot-887), but this now serves as the natural
-        // "verifier has enough context" guard rather than a warm-up
-        // exemption for detection.
-        let effective_verifier_score = peak_verifier_score.map_or(max_verifier_score, |p| *p);
-        if let Some(v) = verifier
-            && v.is_trained()
-            && embedding_ring.len() >= VERIFIER_WARMUP_EMBEDDINGS
-            && effective_verifier_score < v.threshold
-        {
-            // ── Voice debug logging (mahbot-853) ────────────────────
-            // When the `voice-debug` feature is enabled and
-            // `MAHBOT_VOICE_DEBUG=1` is set, log the verifier's score
-            // and threshold when it blocks a detection.  This provides
-            // observability into verifier behaviour without requiring
-            // recompilation when the feature is already enabled.
-            #[cfg(feature = "voice-debug")]
-            if voice_debug_enabled() {
-                info!(
-                    "VOICE_DEBUG: verifier blocked — frame_max={max_verifier_score:.4} peak={effective_verifier_score:.4} threshold={:.4} rolling_sum={rolling_sum:.4}",
-                    v.threshold,
-                );
+        // Match on a mut ref to avoid moving `candidate`
+        if let Some(opt) = &mut candidate {
+            // opt: &mut &mut Option<ClassifierCandidate>
+            // **opt is the caller's Option<ClassifierCandidate> field
+
+            if let Some(c) = opt.as_mut() {
+                // c: &mut ClassifierCandidate
+                let expired = c.update(max_verifier_score);
+
+                if let Some(v) = verifier
+                    && v.is_trained()
+                    && c.peak_verifier_score >= v.threshold
+                {
+                    // Candidate confirmed — detection fires!
+                    return (true, rolling_sum, total_score, effective_threshold);
+                }
+
+                if expired {
+                    // Candidate expired — max window exceeded without
+                    // verifier confirmation.  Discard the candidate.
+                    #[cfg(feature = "voice-debug")]
+                    if voice_debug_enabled() {
+                        if let Some(v) = verifier {
+                            info!(
+                                "VOICE_DEBUG: verifier blocked (candidate expired) — \
+                                 peak={:.4} threshold={:.4} rolling_sum={rolling_sum:.4}",
+                                c.peak_verifier_score, v.threshold,
+                            );
+                        }
+                    }
+                    **opt = None;
+                    return (false, rolling_sum, total_score, effective_threshold);
+                }
+
+                // Candidate still alive — verifier hasn't confirmed yet
+                // but the window hasn't expired either.
+                return (false, rolling_sum, total_score, effective_threshold);
             }
 
-            // ⚠ DO NOT clear the rolling window on verifier block (mahbot-878).
-            // Previously the score window was cleared here, but this destroyed
-            // the classifier's rolling sum accumulation.  By the time the
-            // verifier had enough embeddings (≥3) for a temporally representative
-            // 3-frame window, the utterance had ended — causing 46.2% detection
-            // (Failure Mode B in mahbot-878).
-            //
-            // The rolling sum persists across frames.  If the sum again reaches
-            // threshold on a subsequent frame (with more temporal context), the
-            // verifier re-checks with a more representative window.  The
-            // NO_MATCH_RESET_THRESHOLD (0.20) in `process_wake_word_score`
-            // independently clears the window when any frame scores below 0.20,
-            // preventing noise accumulation on non-matching speech.
-            //
-            // The peak verifier score (across all frames) is accumulated
-            // before this point, so the next time the rolling sum reaches
-            // threshold the same peak (or higher, if more embeddings have
-            // arrived) will be rechecked (mahbot-870).
+            // No active candidate — this is the first threshold crossing.
+            **opt = Some(ClassifierCandidate::new(max_verifier_score));
+
+            // Check threshold immediately on creation
+            if let Some(v) = verifier
+                && v.is_trained()
+                && max_verifier_score >= v.threshold
+            {
+                return (true, rolling_sum, total_score, effective_threshold);
+            }
+
+            return (false, rolling_sum, total_score, effective_threshold);
+        }
+
+        // No candidate tracking requested (e.g., enrollment self-test
+        // with no active verifier).  Fall back to raw verifier check
+        // on the current frame's score.
+        if let Some(v) = verifier
+            && v.is_trained()
+            && max_verifier_score < v.threshold
+        {
             return (false, rolling_sum, total_score, effective_threshold);
         }
         return (true, rolling_sum, total_score, effective_threshold);
     }
+
+    // ── Score window was reset (or never reached threshold) ─────────────
+    // If total_score < NO_MATCH_RESET_THRESHOLD, the rolling window was
+    // cleared.  Expire any active candidate.
+    if total_score < NO_MATCH_RESET_THRESHOLD
+        && let Some(opt) = candidate.as_mut()
+        && opt.is_some()
+    {
+        **opt = None;
+    }
+
     (false, rolling_sum, total_score, effective_threshold)
 }
 
@@ -4187,12 +4267,16 @@ pub(crate) struct DetectionInstrumentation {
     /// maximum peak across all segments so the E2E benchmark reports an
     /// accurate value.
     pub peak_score: f32,
-    /// Peak verifier score across all frames (mahbot-890).  Captured before
-    /// `transition_to_recording()` resets `ctx.peak_verifier_score` to 0.0,
-    /// so the benchmark can read the actual peak that triggered (or was
-    /// blocked by) the verifier gate.  For non-detected variants this is the
-    /// same as `ctx.peak_verifier_score` at end-of-stream; for detected
-    /// variants it preserves the pre-reset value.
+    /// Peak verifier score across all candidates (mahbot-895).
+    ///
+    /// Max-tracked from all bounded [`ClassifierCandidate`] instances that were
+    /// created during this detection session.  When a candidate expires or is
+    /// cleared, its peak is flushed here.  For non-detected variants this is
+    /// the highest verifier peak achieved by any candidate in the session; for
+    /// detected variants it preserves the pre-reset value from the candidate
+    /// that triggered.  The bounded candidate model (mahbot-895) ensures each
+    /// candidate's peak reflects only its own temporal window — no cross-candidate
+    /// contamination.
     pub peak_verifier_score: f32,
 }
 
@@ -4327,14 +4411,19 @@ pub(crate) struct PipelineCtx {
     /// session.  Reset on each detection attempt.  Used by the E2E
     /// benchmark for per-variant peak score reporting.
     peak_score: f32,
-    /// Peak verifier score achieved during the current detection session
-    /// (mahbot-859).  Updated to track the highest verifier prediction
-    /// across all embeddings in the window.  Reset on Full, Soft (mahbot-870),
-    /// and Cancel.  Unlike `peak_score` (which is intentionally preserved on
-    /// Soft to maintain acoustic context), `peak_verifier_score` is reset on
-    /// Soft because stale verifier scores from a previous detection session
-    /// would otherwise block subsequent detections (mahbot-870).
-    peak_verifier_score: f32,
+    /// Active bounded classifier candidate (mahbot-895).
+    ///
+    /// When `Some`, the classifier's rolling sum has crossed the threshold
+    /// and this candidate is accumulating verifier evidence from subsequent
+    /// embeddings.  The candidate either triggers detection (verifier peak
+    /// reaches threshold), expires (max window exceeded without trigger or
+    /// score drops below [`NO_MATCH_RESET_THRESHOLD`]), or is cleared on
+    /// pipeline resets (Full, Soft, Cancel) and segment boundaries.
+    ///
+    /// Replaces the previous session-lifetime `peak_verifier_score` field.
+    /// Each candidate's verifier peak is bounded to its own temporal window,
+    /// eliminating cross-candidate contamination (mahbot-895).
+    candidate: Option<ClassifierCandidate>,
 
     /// Consecutive VAD-negative frame hops since the last VAD-positive frame,
     /// accumulated across calls to [`handle_wake_word_detection`] (mahbot-894).
@@ -4427,7 +4516,7 @@ impl PipelineCtx {
                     .clamp(ADAPTIVE_K_MIN, ADAPTIVE_K_MAX)
             },
             peak_score: 0.0,
-            peak_verifier_score: 0.0,
+            candidate: None,
             segment_silence_hops: 0,
             #[cfg(feature = "voice-tests")]
             instrumentation: DetectionInstrumentation::new(),
@@ -4483,7 +4572,7 @@ impl PipelineCtx {
                 reset_vad();
                 self.adaptive_threshold.reset();
                 self.peak_score = 0.0;
-                self.peak_verifier_score = 0.0;
+                self.candidate = None;
 
                 // Full does NOT clear global enrollment accumulators — those
                 // survive mic stop/start cycles so mid-enrollment progress is
@@ -4496,13 +4585,13 @@ impl PipelineCtx {
                 // vad_threshold, last_wake_word_detection cooldown,
                 // auto_start_pending, is_recording, and global enrollment accumulators.
                 self.audio_preprocessor.clear_buffer();
-                // Reset peak verifier score (mahbot-870).  The accumulated peak
-                // from the previous detection session would otherwise carry stale
-                // verifier scores across Soft pipeline resets (which occur during
-                // transition_to_recording's handoff).  Without this reset, a high
-                // verifier peak from an earlier detection session could block
-                // subsequent detections even after the classifier un-triggers.
-                self.peak_verifier_score = 0.0;
+                // Clear any active candidate (mahbot-895).  A stale candidate
+                // from the previous detection session would carry cross-candidate
+                // verifier contamination across Soft pipeline resets (which occur
+                // during transition_to_recording's handoff).  The candidate will
+                // be re-created naturally when the rolling sum next crosses the
+                // threshold.
+                self.candidate = None;
             }
             ResetLevel::Cancel => {
                 self.vad_threshold = VAD_THRESHOLD;
@@ -4510,7 +4599,7 @@ impl PipelineCtx {
                 self.audio_preprocessor.clear_buffer();
                 self.adaptive_threshold.reset();
                 self.peak_score = 0.0;
-                self.peak_verifier_score = 0.0;
+                self.candidate = None;
 
                 // Cancel also clears global enrollment accumulators.
                 voice_state().write().unwrap_poison().reset_enrollment();
@@ -4534,7 +4623,7 @@ impl PipelineCtx {
     /// | `score_window` | Yes | **Critical**: rolling scores must not accumulate across utterances — this is the primary false-trigger mechanism this function fixes |
     /// | `adaptive_threshold` | Yes | Noise floor estimate is per-segment; the 5-call bootstrap (~640 ms of voiced frames at ~128 ms/embedding) is brief and acceptable |
     /// | `peak_score` | Yes | Diagnostic peak for the current segment; captured to `instrumentation` before clearing |
-    /// | `peak_verifier_score` | Yes | Stale verifier scores from previous utterance would block new detections |
+    /// | `candidate` | Yes | Stale candidate from previous utterance would carry cross-candidate verifier contamination (mahbot-895) |
     /// | `segment_silence_hops` | Yes | Reset the silence counter so the next segment starts fresh |
     ///
     /// **Preserved**: `voice_batch`, `mel_frame_buffer` (caller-managed, see above),
@@ -4549,6 +4638,11 @@ impl PipelineCtx {
     /// so the E2E benchmark (which reads instrumentation after
     /// `run_streaming_detection` returns) captures the true cross-segment maxima
     /// even when a segment boundary fires during silence-flush post-processing.
+    /// ### Bounded candidate flush (mahbot-895)
+    /// Before clearing, the active candidate's `peak_verifier_score` is flushed
+    /// to `self.instrumentation` so the E2E benchmark captures the candidate's
+    /// peak verifier evidence.  This replaces the previous session-lifetime
+    /// `peak_verifier_score` accumulator.
     /// See also [`try_match_wake_word_and_push_embedding`] which applies the
     /// same max-tracking at every frame.
     fn reset_detection_segment(&mut self) {
@@ -4563,8 +4657,14 @@ impl PipelineCtx {
             if self.peak_score > self.instrumentation.peak_score {
                 self.instrumentation.peak_score = self.peak_score;
             }
-            if self.peak_verifier_score > self.instrumentation.peak_verifier_score {
-                self.instrumentation.peak_verifier_score = self.peak_verifier_score;
+            // Flush the active candidate's verifier peak before clearing
+            // (mahbot-895).  The candidate is bounded to a single utterance's
+            // temporal window, so its peak is the correct evidence for this
+            // segment.
+            if let Some(c) = &self.candidate {
+                if c.peak_verifier_score > self.instrumentation.peak_verifier_score {
+                    self.instrumentation.peak_verifier_score = c.peak_verifier_score;
+                }
             }
         }
 
@@ -4576,7 +4676,9 @@ impl PipelineCtx {
         // ── Reset threshold/scores ──
         self.adaptive_threshold.reset();
         self.peak_score = 0.0;
-        self.peak_verifier_score = 0.0;
+        // Clear active candidate (mahbot-895): each segment gets its own
+        // independent candidate, bounded to its temporal window.
+        self.candidate = None;
 
         // ── Reset silence counter ──
         self.segment_silence_hops = 0;
@@ -6473,14 +6575,19 @@ fn try_match_wake_word_and_push_embedding(
     // ── Shared detection scoring (mahbot-811) ────────────────────────
     // Uses `score_single_embedding` which encapsulates the ring buffer,
     // MLP classifier forward pass, rolling window scoring, and verifier
-    // gate — the same logic exercised by `run_enrollment_self_test` and
-    // the E2E integration test.  Any change to detection heuristics is
-    // automatically validated by the integration test.  The function also
-    // tracks the peak verifier score in `ctx.peak_verifier_score` (mahbot-859),
-    // avoiding a redundant predict loop at the call site.
+    // gate via the bounded classifier candidate (mahbot-895) — the same
+    // logic exercised by `run_enrollment_self_test` and the E2E integration
+    // test.  The bounded candidate replaces the previous session-lifetime
+    // `peak_verifier_score` accumulator, ensuring no cross-candidate
+    // verifier contamination.
     let state = voice_state().read().unwrap_poison();
     let classifier: Option<&WakeWordClassifier> = state.classifier.as_ref();
     let verifier = get_verifier();
+    // Capture candidate peak before the call — if the candidate expires
+    // inside `score_single_embedding`, we still have the previous peak
+    // value for instrumentation (voice-tests only).
+    #[cfg(feature = "voice-tests")]
+    let candidate_peak_before = ctx.candidate.as_ref().map(|c| c.peak_verifier_score);
     #[allow(unused_variables)]
     let (detected, rolling_sum, total_score, effective_threshold) = score_single_embedding(
         &embedding,
@@ -6490,7 +6597,22 @@ fn try_match_wake_word_and_push_embedding(
         &mut ctx.score_window,
         Some(&mut ctx.adaptive_threshold),
         ctx.adaptive_k,
-        Some(&mut ctx.peak_verifier_score),
+        // Pass candidate tracking ONLY when the verifier is trained.
+        // When the verifier is untrained (e.g., during initial enrollment
+        // or after a reset), candidates are never created — the fallback
+        // path in `score_single_embedding` checks the raw verifier score
+        // directly, which correctly fires detection when the rolling-sum
+        // threshold is crossed (since `is_trained()` is false, the verifier
+        // gate is skipped).  Without this guard, an untrained verifier
+        // creates an endless create-expire-recreate loop: the candidate
+        // never confirms because `is_trained()` is always false, and after
+        // `CANDIDATE_MAX_EMBEDDINGS` frames it expires only to be recreated
+        // on the next threshold crossing — detection is permanently blocked.
+        if verifier.is_trained() {
+            Some(&mut ctx.candidate)
+        } else {
+            None
+        },
     );
     // Track peak rolling-sum for diagnostics/benchmarking (mahbot-845).
     if rolling_sum > ctx.peak_score {
@@ -6510,11 +6632,18 @@ fn try_match_wake_word_and_push_embedding(
         if total_score < NO_MATCH_RESET_THRESHOLD {
             ctx.instrumentation.n_frames_below_reset += 1;
         }
-        // Save the running peak verifier score (mahbot-890).  Uses max-tracking
-        // so a subsequent segment's lower scores cannot overwrite the true
-        // cross-segment peak from earlier in the session (mahbot-894).
-        if ctx.peak_verifier_score > ctx.instrumentation.peak_verifier_score {
-            ctx.instrumentation.peak_verifier_score = ctx.peak_verifier_score;
+        // Save the peak verifier score from the bounded candidate (mahbot-895).
+        // If the candidate was just expired inside score_single_embedding,
+        // use the pre-call snapshot.  Otherwise read the current candidate.
+        let verifier_peak = ctx
+            .candidate
+            .as_ref()
+            .map(|c| c.peak_verifier_score)
+            .or(candidate_peak_before);
+        if let Some(p) = verifier_peak {
+            if p > ctx.instrumentation.peak_verifier_score {
+                ctx.instrumentation.peak_verifier_score = p;
+            }
         }
         // Save the running peak rolling-sum score (mahbot-894).  Uses
         // max-tracking so the true cross-segment peak survives segment-end
@@ -7574,7 +7703,7 @@ mod tests {
         ctx.auto_start_pending = true;
         ctx.is_recording = true;
         ctx.peak_score = 0.75;
-        ctx.peak_verifier_score = 0.75;
+        ctx.candidate = Some(ClassifierCandidate::new(0.75));
         ctx
     }
 
@@ -7635,9 +7764,9 @@ mod tests {
         assert!(!ctx.auto_start_pending);
         assert!(!ctx.is_recording);
         assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset on Full");
-        assert_eq!(
-            ctx.peak_verifier_score, 0.0,
-            "peak_verifier_score must be reset on Full",
+        assert!(
+            ctx.candidate.is_none(),
+            "candidate must be None on Full (peak_verifier_score cleared, mahbot-895)",
         );
 
         // Global enrollment accumulators PRESERVED by Full — they survive
@@ -7694,12 +7823,11 @@ mod tests {
         assert_eq!(ctx.last_wake_word_detection, saved_cooldown);
         assert_eq!(ctx.auto_start_pending, saved_auto_start);
         assert_eq!(ctx.is_recording, saved_recording);
-        // Soft resets peak_verifier_score (mahbot-870) but preserves peak_score
+        // Soft resets candidate (mahbot-895) but preserves peak_score
         // (which is only reset on Full/Cancel alongside the wider acoustic state).
-        assert_eq!(
-            ctx.peak_verifier_score, 0.0,
-            "peak_verifier_score must be reset on Soft"
-        );
+        // The candidate will be re-created naturally when the rolling sum next
+        // crosses the threshold.
+        assert!(ctx.candidate.is_none(), "candidate must be None on Soft");
         assert_eq!(ctx.peak_score, saved_peak_score);
 
         // Global enrollment accumulators preserved.
@@ -7735,12 +7863,9 @@ mod tests {
         // Cancel preserves handler-managed flags (unlike Full).
         assert_eq!(ctx.auto_start_pending, saved_auto_start);
         assert_eq!(ctx.is_recording, saved_recording);
-        // Cancel resets both peak scores.
+        // Cancel resets peak_score and candidate.
         assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset on Cancel");
-        assert_eq!(
-            ctx.peak_verifier_score, 0.0,
-            "peak_verifier_score must be reset on Cancel",
-        );
+        assert!(ctx.candidate.is_none(), "candidate must be None on Cancel",);
 
         // Global enrollment accumulators cleared (unlike Soft).
         let state = voice_state().read().unwrap_poison();
@@ -7785,7 +7910,7 @@ mod tests {
         {
             let mut ctx = PipelineCtx::new();
             ctx.peak_score = 0.85;
-            ctx.peak_verifier_score = 0.70;
+            ctx.candidate = Some(ClassifierCandidate::new(0.70));
 
             // Pre-seed instrumentation with lower values to verify max-tracking
             ctx.instrumentation.peak_score = 0.10;
@@ -7798,10 +7923,10 @@ mod tests {
                 ctx.instrumentation.peak_score >= 0.85 - f32::EPSILON,
                 "instrumentation.peak_score should capture pre-reset peak_score"
             );
-            // Instrumentation should have captured the higher peak_verifier_score value
+            // Instrumentation should have captured the candidate's peak_verifier_score
             assert!(
                 ctx.instrumentation.peak_verifier_score >= 0.70 - f32::EPSILON,
-                "instrumentation.peak_verifier_score should capture pre-reset peak_verifier_score"
+                "instrumentation.peak_verifier_score should capture pre-reset candidate peak"
             );
         }
     }
@@ -7817,7 +7942,7 @@ mod tests {
         ctx.embedding_ring = vec![vec![0.5; 96]; 3];
         ctx.score_window = vec![0.5; 5];
         ctx.peak_score = 0.75;
-        ctx.peak_verifier_score = 0.50;
+        ctx.candidate = Some(ClassifierCandidate::new(0.50));
         ctx.segment_silence_hops = 10;
 
         // Complete adaptive threshold bootstrap so the reset-to-bootstrapping
@@ -7852,10 +7977,7 @@ mod tests {
         );
         assert!(ctx.score_window.is_empty(), "score_window must be cleared");
         assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset");
-        assert_eq!(
-            ctx.peak_verifier_score, 0.0,
-            "peak_verifier_score must be reset"
-        );
+        assert!(ctx.candidate.is_none(), "candidate must be reset (None)");
         assert_eq!(
             ctx.segment_silence_hops, 0,
             "segment_silence_hops must be reset"
@@ -7939,7 +8061,7 @@ mod tests {
         ctx.embedding_ring = vec![vec![0.5; 96]; 3];
         ctx.score_window = vec![0.5; 5];
         ctx.peak_score = 0.75;
-        ctx.peak_verifier_score = 0.50;
+        ctx.candidate = Some(ClassifierCandidate::new(0.50));
         ctx.segment_silence_hops = SEGMENT_TIMEOUT_HOPS - 5; // 14, just below threshold
 
         // Pre-populate ctx-level copies to verify caller-managed invariant.
@@ -8026,9 +8148,9 @@ mod tests {
             "score_window must be cleared after boundary"
         );
         assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset");
-        assert_eq!(
-            ctx.peak_verifier_score, 0.0,
-            "peak_verifier_score must be reset"
+        assert!(
+            ctx.candidate.is_none(),
+            "candidate must be None after boundary"
         );
         assert!(
             voice_batch.is_empty(),
@@ -8080,7 +8202,7 @@ mod tests {
         ctx.embedding_ring = vec![vec![0.5; 96]; 3];
         ctx.score_window = vec![0.5; 5];
         ctx.peak_score = 0.75;
-        ctx.peak_verifier_score = 0.50;
+        ctx.candidate = Some(ClassifierCandidate::new(0.50));
 
         let mut voice_batch = Vec::new();
         let mut mel_frame_buffer = Vec::new();
@@ -8148,9 +8270,9 @@ mod tests {
             "score_window must be cleared after boundary"
         );
         assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset");
-        assert_eq!(
-            ctx.peak_verifier_score, 0.0,
-            "peak_verifier_score must be reset"
+        assert!(
+            ctx.candidate.is_none(),
+            "candidate must be None after boundary"
         );
         assert!(
             voice_batch.is_empty(),
@@ -8730,6 +8852,26 @@ mod tests {
         }
     }
 
+    /// Build a verifier that always produces a score above the confirmation
+    /// threshold.  All MLP weights are zeroed; b3 = 2.0 gives
+    /// sigmoid(2.0) ≈ 0.88 > 0.60 = DEFAULT_VERIFIER_THRESHOLD.
+    fn verifier_always_accept() -> VoiceVerifier {
+        VoiceVerifier {
+            trained: true,
+            threshold: DEFAULT_VERIFIER_THRESHOLD,
+            w1: vec![0.0; VERIFIER_INPUT_DIM * MLP_HIDDEN_1],
+            b1: vec![0.0; MLP_HIDDEN_1],
+            w2: vec![0.0; MLP_HIDDEN_1 * MLP_HIDDEN_2],
+            b2: vec![0.0; MLP_HIDDEN_2],
+            w3: vec![0.0; MLP_HIDDEN_2],
+            b3: 2.0, // sigmoid(2.0) ≈ 0.88
+            weights: Vec::new(),
+            bias: 0.0,
+            scaler_mean: Vec::new(),
+            scaler_std: Vec::new(),
+        }
+    }
+
     #[test]
     fn verifier_warmup_suppresses_all_detections() {
         // With 1-3 embeddings (ring.len() < VERIFIER_WARMUP_EMBEDDINGS=4),
@@ -8840,6 +8982,213 @@ mod tests {
         assert!(
             detected,
             "untrained verifier should never block, even at {ring_len_before} embeddings",
+        );
+    }
+
+    #[test]
+    fn bounded_candidate_expiry_cycle() {
+        // Verifies the full bounded-candidate lifecycle when the verifier
+        // never confirms: creation on first threshold crossing, accumulation
+        // across frames, expiry after CANDIDATE_MAX_EMBEDDINGS, and
+        // re-creation after expiry.  No cross-candidate contamination —
+        // each cycle starts with a fresh peak_verifier_score.
+        //
+        // The classifier always returns 0.50 (above NO_MATCH_RESET_THRESHOLD),
+        // so the rolling sum crosses the detection threshold after 3 embeddings.
+        // The verifier always rejects (peak ~0.12 < 0.60 threshold).
+        // Candidate tracking is enabled throughout.
+        let classifier = classifier_always_half();
+        let verifier = verifier_always_reject();
+        let emb = vec![0.5; EMBEDDING_DIM];
+        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
+        let mut score_window = Vec::new();
+        let mut candidate: Option<ClassifierCandidate> = None;
+
+        // ── Embeddings 1-3: warm-up period ──────────────────────────
+        // During warm-up (ring.len() < VERIFIER_WARMUP_EMBEDDINGS = 4),
+        // all detections are suppressed and no candidate is created.
+        for i in 0..VERIFIER_WARMUP_EMBEDDINGS - 1 {
+            let (detected, _, _, _) = score_single_embedding(
+                &emb,
+                &mut ring,
+                Some(&classifier),
+                Some(&verifier),
+                &mut score_window,
+                None,
+                ADAPTIVE_K_DEFAULT,
+                Some(&mut candidate),
+            );
+            assert!(!detected, "warm-up should suppress detection at {i}");
+            assert!(
+                candidate.is_none(),
+                "no candidate should exist during warm-up at {i}"
+            );
+        }
+        assert_eq!(
+            ring.len(),
+            3,
+            "ring should have 3 embeddings after warm-up feeds"
+        );
+
+        // ── Embedding 4: post-warm-up, first threshold crossing ────
+        // Rolling sum (4 × 0.50 = 2.00 > 1.35) triggers detection,
+        // candidate is created with verifier peak ~0.12 (reject).
+        let (detected, _, _, _) = score_single_embedding(
+            &emb,
+            &mut ring,
+            Some(&classifier),
+            Some(&verifier),
+            &mut score_window,
+            None,
+            ADAPTIVE_K_DEFAULT,
+            Some(&mut candidate),
+        );
+        assert!(
+            !detected,
+            "verifier should block detection (peak ~0.12 < 0.60)"
+        );
+        let c = candidate
+            .as_ref()
+            .expect("candidate should exist after first threshold crossing");
+        assert_eq!(
+            c.embedding_count, 1,
+            "candidate should have count=1 on creation"
+        );
+        assert!(
+            c.peak_verifier_score < DEFAULT_VERIFIER_THRESHOLD,
+            "verifier peak should be below threshold (reject verifier)"
+        );
+
+        // ── Embeddings 5-7: candidate accumulation ─────────────────
+        // Each frame updates peak and increments count.  Verifier never
+        // confirms (peak stays below threshold).
+        for _ in 0..CANDIDATE_MAX_EMBEDDINGS - 2 {
+            let (detected, _, _, _) = score_single_embedding(
+                &emb,
+                &mut ring,
+                Some(&classifier),
+                Some(&verifier),
+                &mut score_window,
+                None,
+                ADAPTIVE_K_DEFAULT,
+                Some(&mut candidate),
+            );
+            assert!(!detected, "verifier should still block during accumulation");
+            let c = candidate
+                .as_ref()
+                .expect("candidate should still be accumulating");
+            assert!(
+                c.peak_verifier_score < DEFAULT_VERIFIER_THRESHOLD,
+                "peak should stay below threshold during accumulation"
+            );
+        }
+
+        // ── Embedding (3 + CANDIDATE_MAX_EMBEDDINGS): expiry ───────
+        // The (CANDIDATE_MAX_EMBEDDINGS)th update returns expired=true,
+        // clearing the candidate.
+        let count_before_expiry = candidate.as_ref().map(|c| c.embedding_count);
+        let (detected, _, _, _) = score_single_embedding(
+            &emb,
+            &mut ring,
+            Some(&classifier),
+            Some(&verifier),
+            &mut score_window,
+            None,
+            ADAPTIVE_K_DEFAULT,
+            Some(&mut candidate),
+        );
+        assert!(!detected, "detection should not fire on expiry frame");
+        assert!(
+            candidate.is_none(),
+            "candidate should be cleared after expiry (count={:?} -> CANDIDATE_MAX_EMBEDDINGS={})",
+            count_before_expiry,
+            CANDIDATE_MAX_EMBEDDINGS,
+        );
+
+        // ── Embedding after expiry: new candidate created ──────────
+        // The rolling sum is still above threshold (scores persist in
+        // the window), so a new candidate is created on the next frame.
+        let (detected, _, _, _) = score_single_embedding(
+            &emb,
+            &mut ring,
+            Some(&classifier),
+            Some(&verifier),
+            &mut score_window,
+            None,
+            ADAPTIVE_K_DEFAULT,
+            Some(&mut candidate),
+        );
+        assert!(!detected, "new candidate should also be blocked");
+        let c = candidate
+            .as_ref()
+            .expect("new candidate should be created after expiry");
+        assert_eq!(
+            c.embedding_count, 1,
+            "new candidate should start with count=1 (no cross-candidate contamination)"
+        );
+        assert!(
+            c.peak_verifier_score < DEFAULT_VERIFIER_THRESHOLD,
+            "new candidate's peak should be independent of previous cycle"
+        );
+    }
+
+    #[test]
+    fn bounded_candidate_confirms_detection() {
+        // Verifies that the bounded candidate model correctly fires
+        // detection when the verifier score exceeds the threshold.
+        // With verifier_always_accept (~0.88 > 0.60), the candidate
+        // should confirm immediately on creation at embedding 4
+        // (post-warm-up, first threshold crossing).
+        let classifier = classifier_always_half();
+        let verifier = verifier_always_accept();
+        let emb = vec![0.5; EMBEDDING_DIM];
+        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
+        let mut score_window = Vec::new();
+        let mut candidate: Option<ClassifierCandidate> = None;
+
+        // ── Embeddings 1-3: warm-up ────────────────────────────────
+        for i in 0..VERIFIER_WARMUP_EMBEDDINGS - 1 {
+            let (detected, _, _, _) = score_single_embedding(
+                &emb,
+                &mut ring,
+                Some(&classifier),
+                Some(&verifier),
+                &mut score_window,
+                None,
+                ADAPTIVE_K_DEFAULT,
+                Some(&mut candidate),
+            );
+            assert!(!detected, "warm-up should suppress detection at {i}");
+            assert!(candidate.is_none(), "no candidate during warm-up at {i}");
+        }
+
+        // ── Embedding 4: detection should fire ─────────────────────
+        let (detected, _, _, _) = score_single_embedding(
+            &emb,
+            &mut ring,
+            Some(&classifier),
+            Some(&verifier),
+            &mut score_window,
+            None,
+            ADAPTIVE_K_DEFAULT,
+            Some(&mut candidate),
+        );
+        assert!(
+            detected,
+            "bounded candidate should confirm when verifier peak >= threshold"
+        );
+        // Candidate should still be populated (the lifecycle returns
+        // (true, ...) without clearing the candidate, so the caller
+        // can inspect instrumentation.
+        assert!(
+            candidate.is_some(),
+            "candidate should still exist after confirmed detection"
+        );
+        let c = candidate.unwrap();
+        assert!(
+            c.peak_verifier_score >= DEFAULT_VERIFIER_THRESHOLD,
+            "confirmed candidate's peak should be at or above threshold (got {})",
+            c.peak_verifier_score,
         );
     }
 }
