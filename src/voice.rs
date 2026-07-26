@@ -5288,8 +5288,8 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
         };
         let verifier = tokio::task::spawn_blocking(move || {
                     use crate::voice_verifier::{
-                        CONFUSABLE_UPWEIGHT, DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA, LEARNING_RATE,
-                        MLP_MAX_ITER, UNRELATED_UPWEIGHT, VoiceVerifier,
+                        assert_weight_tier, CONFUSABLE_UPWEIGHT, DEFAULT_VERIFIER_THRESHOLD,
+                        L2_LAMBDA, LEARNING_RATE, MLP_MAX_ITER, UNRELATED_UPWEIGHT, VoiceVerifier,
                     };
 
                     if pos_for_verifier.is_empty() {
@@ -5320,18 +5320,21 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                         // order (ambient → unrelated → confusable).  Prevents silent
                         // misalignment if either the concatenation or weight code is
                         // refactored (mahbot-872 reviewer feedback).
-                        let check_tier = |offset: usize, count: usize, expected: f32, label: &str| {
-                            for (j, w) in per_neg_weights[offset..offset + count].iter().enumerate() {
-                                let i = offset + j;
-                                assert!(
-                                    (w - expected).abs() <= f32::EPSILON,
-                                    "Weight tier mismatch: {label} weight at position {i} should be {expected}, got {w}",
-                                );
-                            }
-                        };
-                        check_tier(0, n_ambient, 1.0, "ambient");
-                        check_tier(n_ambient, n_unrelated, UNRELATED_UPWEIGHT, "unrelated");
-                        check_tier(n_ambient + n_unrelated, n_confusable, CONFUSABLE_UPWEIGHT, "confusable");
+                        assert_weight_tier(&per_neg_weights, 0, n_ambient, 1.0, "ambient");
+                        assert_weight_tier(
+                            &per_neg_weights,
+                            n_ambient,
+                            n_unrelated,
+                            UNRELATED_UPWEIGHT,
+                            "unrelated",
+                        );
+                        assert_weight_tier(
+                            &per_neg_weights,
+                            n_ambient + n_unrelated,
+                            n_confusable,
+                            CONFUSABLE_UPWEIGHT,
+                            "confusable",
+                        );
 
                         let v = VoiceVerifier::train(
                             &pos_for_verifier,

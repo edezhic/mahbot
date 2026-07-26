@@ -32,26 +32,54 @@
 
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use tracing::{info, warn};
 
-/// Default decision threshold for the verifier (standard logistic regression
-/// decision boundary).
+/// Default decision threshold for the verifier (MLP decision boundary).
 ///
-/// Set to 0.4 (mahbot-853) — streaming-inference embeddings produce different
-/// feature statistics than training extraction (VAD-gated chunks, alignment
-/// padding artifacts), so the original 0.6 threshold rejected all streaming
-/// detections even for the enrolled speaker.  The classifier already provides
-/// strong discrimination (pos_scores_mean ~0.93 vs neg_scores_mean ~0.04), so
-/// the verifier can be more permissive.  Previously at 0.6 (mahbot-829), 0.5
-/// (mahbot-797), and 0.3 (mahbot-788).
+/// Calibrated empirically via threshold sweep (mahbot-881).  The sweep ran
+/// HARD-tier benchmarks at 0.05 increments from 0.2 to 0.7 on the legacy TTS
+/// negative path (`MAHBOT_BENCH_LEGACY_NEGATIVES=1`), with the top candidate
+/// thresholds (0.25, 0.45, 0.50) replicated 2-4 times to estimate variance
+/// from stochastic training.  The selected threshold maximises the mean
+/// detection rate while satisfying all HARD-tier false-accept constraints
+/// (confusable ≤1, noise ≤1, total ≤2), with MEDIUM and EASY tiers verified
+/// at the calibrated value.
 ///
-/// ⚠ **Windowed scoring recalibration needed.** This threshold was tuned for
-/// single-frame 96-dim scores and has not been recalibrated for the 3-frame
-/// windowed architecture (mahbot-870).  The acceptance criteria targets
-/// (confusable 95th pct ≤ 0.35, median positive ≥ 0.6) imply a threshold in
-/// the ~0.35–0.6 range, but the exact value should be empirically tuned after
-/// the windowing change.
-pub(crate) const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.4;
+/// ## Sweep results
+///
+/// | Threshold | Runs | Detection rate (range) | HARD FA | HARD limits satisfied |
+/// |-----------|------|----------------------|---------|----------------------|
+/// | 0.20      | 1    | 53.8%                | 3       | ✗ (unrelated=2, total=3) |
+/// | 0.25      | 2    | 46.2–61.5%           | 0       | ✓ |
+/// | 0.30      | 1    | 53.8%                | 0       | ✓ |
+/// | 0.35      | 1    | 53.8%                | 1       | ✗ (unrelated=1) |
+/// | 0.40      | 1    | 53.8%                | 1       | ✓ |
+/// | 0.45      | 3    | 38.5–69.2%           | 0       | ✓ |
+/// | **0.50**  | 4    | **38.5–69.2%**       | 0       | ✓ |
+/// | 0.55      | 1    | 38.5%                | 1       | ✓ |
+/// | 0.60      | 1    | 46.2%                | 0       | ✓ |
+/// | 0.65      | 1    | 46.2%                | 0       | ✓ |
+/// | 0.70      | 1    | 46.2%                | 0       | ✓ |
+///
+/// **Selected: 0.50.**  Highest mean detection rate (57.7%) with zero false
+/// accepts across all HARD runs.  MEDIUM tier: 30.8% (4/13), 0 FA (limits ✓).
+/// EASY tier: 46.2% (6/13), 0 FA (limits ✓).  All false-accept limits
+/// satisfied at all three tiers.
+///
+/// ⚠ **Note: 85% detection target not reached.**  The best threshold achieves
+/// ~58% mean detection rate — the verifier training has high stochasticity
+/// (20-30% variance between runs at the same threshold), and the underlying
+/// classifier/verifier architecture may require further work (separate from
+/// calibration) to hit the 85% target.
+///
+/// ⚠ **If changing this constant**, re-run the HARD-tier calibration sweep
+/// first: `MAHBOT_VERIFIER_THRESHOLD=<val> cargo bench --bench voice_pipeline_e2e`.
+/// Then verify MEDIUM and EASY tiers at the new value.
+///
+/// Previously at 0.4 (mahbot-853), 0.6 (mahbot-829), 0.5 (mahbot-797), and
+/// 0.3 (mahbot-788).
+pub(crate) const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.50;
 
 /// L2 regularization strength (lambda).
 ///
@@ -322,13 +350,47 @@ impl VoiceVerifier {
         self.b3.is_finite()
     }
 
-    /// Production decision threshold.
+    /// Threshold for verifier decision-making.
     ///
-    /// Returns the value of [`DEFAULT_VERIFIER_THRESHOLD`] — the threshold
-    /// used by all production enrollment paths.  Tests should reference this
-    /// method instead of hardcoding a literal threshold value.
+    /// Returns the value of [`DEFAULT_VERIFIER_THRESHOLD`] by default.
+    /// Benchmarks and tests should reference this method instead of hardcoding
+    /// a literal threshold value, because it respects the
+    /// `MAHBOT_VERIFIER_THRESHOLD` env-var override.
+    ///
+    /// **Production code** should use [`DEFAULT_VERIFIER_THRESHOLD`] directly;
+    /// the env-var override in this method exists solely for benchmark
+    /// calibration sweeps (mahbot-880) and should not be relied upon in
+    /// production paths.
     #[must_use]
-    pub fn default_threshold() -> f32 {
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
+    pub(crate) fn default_threshold() -> f32 {
+        // Allow env-var override for threshold calibration sweeps (mahbot-880).
+        // Parsed once and cached to avoid repeated env var lookups.
+        // NOTE: This uses OnceLock caching (reads once per process), unlike
+        // MAHBOT_BENCH_LEGACY_NEGATIVES which is read on-demand in the benchmark.
+        // The caching is intentional — the threshold is set once at process start and
+        // should not change mid-run.  Use separate process invocations for per-test
+        // overrides (or set env before test init).
+        static CACHED_THRESHOLD: OnceLock<Option<f32>> = OnceLock::new();
+        if let Some(threshold) =
+            *CACHED_THRESHOLD.get_or_init(|| match std::env::var("MAHBOT_VERIFIER_THRESHOLD") {
+                Ok(val) => {
+                    if let Ok(t) = val.parse::<f32>() {
+                        Some(t)
+                    } else {
+                        warn!(
+                            "MAHBOT_VERIFIER_THRESHOLD='{val}' is not a valid f32 — \
+                             using DEFAULT_VERIFIER_THRESHOLD ({})",
+                            DEFAULT_VERIFIER_THRESHOLD,
+                        );
+                        None
+                    }
+                }
+                Err(_) => None,
+            })
+        {
+            return threshold;
+        }
         DEFAULT_VERIFIER_THRESHOLD
     }
 
@@ -1168,19 +1230,16 @@ fn train_mlp(
 
         // ── Adam parameter update (mahbot-878) ──
         adam_t += 1;
-        let adam_lr = learning_rate;
-        let adam_b1 = ADAM_BETA1;
-        let adam_b2 = ADAM_BETA2;
         // Bias-corrected learning rate: lr * sqrt(1 - b2^t) / (1 - b1^t)
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let lr_t = adam_lr * (1.0 - adam_b2.powi(adam_t as i32)).sqrt()
-            / (1.0 - adam_b1.powi(adam_t as i32));
+        let lr_t = learning_rate * (1.0 - ADAM_BETA2.powi(adam_t as i32)).sqrt()
+            / (1.0 - ADAM_BETA1.powi(adam_t as i32));
 
         // Helper closure for Adam update on a parameter slice.
         let adam_update = |p: &mut [f32], g: &[f32], m: &mut [f32], v: &mut [f32], lr_t: f32| {
             for i in 0..p.len() {
-                m[i] = adam_b1 * m[i] + (1.0 - adam_b1) * g[i];
-                v[i] = adam_b2 * v[i] + (1.0 - adam_b2) * g[i] * g[i];
+                m[i] = ADAM_BETA1 * m[i] + (1.0 - ADAM_BETA1) * g[i];
+                v[i] = ADAM_BETA2 * v[i] + (1.0 - ADAM_BETA2) * g[i] * g[i];
                 p[i] -= lr_t * m[i] / (v[i].sqrt() + ADAM_EPS);
             }
         };
@@ -1192,8 +1251,8 @@ fn train_mlp(
         adam_update(&mut w3, &dw3, &mut adam_mmt_w3, &mut adam_vel_w3, lr_t);
         // b3 is a scalar — use single-element slices
         let b3_grad = db3;
-        adam_mmt_b3 = adam_b1 * adam_mmt_b3 + (1.0 - adam_b1) * b3_grad;
-        adam_vel_b3 = adam_b2 * adam_vel_b3 + (1.0 - adam_b2) * b3_grad * b3_grad;
+        adam_mmt_b3 = ADAM_BETA1 * adam_mmt_b3 + (1.0 - ADAM_BETA1) * b3_grad;
+        adam_vel_b3 = ADAM_BETA2 * adam_vel_b3 + (1.0 - ADAM_BETA2) * b3_grad * b3_grad;
         b3 -= lr_t * adam_mmt_b3 / (adam_vel_b3.sqrt() + ADAM_EPS);
     }
 
@@ -1369,6 +1428,40 @@ pub fn mean_pool_embeddings(embeddings: &[Vec<f32>]) -> Vec<f32> {
     mean
 }
 
+/// Verify that a contiguous range of negative-embedding weights all equal the
+/// expected value.
+///
+/// This is a structural guard that detects silent misalignment between
+/// negative embedding concatenation order and per-negative weight tier
+/// assignment.  Each tier corresponds to a specific category of negative
+/// embeddings (ambient, unrelated, confusable, synthetic, etc.) and all
+/// weights in that tier should be identical.
+///
+/// Used by production [`finalize_enrollment`](crate::voice::finalize_enrollment)
+/// and both paths in the E2E benchmark to ensure weight tiers stay aligned with
+/// embedding concatenation order across refactors.
+///
+/// # Panics
+///
+/// Panics if any weight in `weights[offset..offset + count]` differs from
+/// `expected` by more than [`f32::EPSILON`].
+#[inline]
+pub(crate) fn assert_weight_tier(
+    weights: &[f32],
+    offset: usize,
+    count: usize,
+    expected: f32,
+    label: &str,
+) {
+    for (j, &w) in weights[offset..offset + count].iter().enumerate() {
+        let i = offset + j;
+        assert!(
+            (w - expected).abs() <= f32::EPSILON,
+            "Weight tier mismatch: {label} weight at position {i} should be {expected}, got {w}",
+        );
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1476,6 +1569,47 @@ mod tests {
             })
             .collect()
     }
+
+    // ── assert_weight_tier tests (mahbot-880 reviewer feedback) ────────
+
+    #[test]
+    fn assert_weight_tier_all_match() {
+        // Normal case: all weights match expected value
+        let weights = vec![1.0, 1.0, 1.0, 2.0, 2.0, 3.0];
+        assert_weight_tier(&weights, 0, 3, 1.0, "first");
+        assert_weight_tier(&weights, 3, 2, 2.0, "second");
+        assert_weight_tier(&weights, 5, 1, 3.0, "third");
+    }
+
+    #[test]
+    fn assert_weight_tier_empty_tier() {
+        // Edge case: count=0 should not panic at any offset
+        let weights: Vec<f32> = vec![1.0, 2.0, 3.0];
+        assert_weight_tier(&weights, 0, 0, 1.0, "empty-at-start");
+        assert_weight_tier(&weights, 1, 0, 0.0, "empty-at-middle");
+        assert_weight_tier(&weights, 3, 0, 0.0, "empty-at-end");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Weight tier mismatch: first weight at position 2 should be 1, got 2"
+    )]
+    fn assert_weight_tier_mismatch_panics() {
+        // Mismatch: should panic with descriptive message
+        let weights = vec![1.0, 1.0, 2.0];
+        assert_weight_tier(&weights, 0, 3, 1.0, "first");
+    }
+
+    #[test]
+    fn assert_weight_tier_values_within_epsilon_pass() {
+        // Values within f32::EPSILON (inclusive) of expected should NOT panic.
+        // This exercises the floating-point equality boundary: the function
+        // uses `<= f32::EPSILON`, so a value exactly EPSILON away should pass.
+        let weights = vec![1.0f32 + f32::EPSILON, 1.0f32 - f32::EPSILON];
+        assert_weight_tier(&weights, 0, 2, 1.0, "epsilon-boundary");
+    }
+
+    // ── Required tests (from ticket mahbot-777) ─────────────────────
 
     #[test]
     fn test_verifier_accepts_positive_rejects_negative() {

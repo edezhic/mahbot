@@ -23,6 +23,15 @@
 //! # Environment variables
 //!
 //! * `MAHBOT_TEST_CACHE_BUST=1` — force full TTS cache regeneration
+//! * `MAHBOT_VERIFIER_THRESHOLD=<float>` — override the verifier decision threshold
+//!   (default: `0.50`).  Used for threshold calibration sweeps (mahbot-880).
+//!   ⚠ This is parsed once per process and cached (via `OnceLock`), unlike
+//!   `MAHBOT_BENCH_LEGACY_NEGATIVES` which is read once per benchmark invocation.  The caching is
+//!   intentional — threshold is set once at process start; if you need per-test-run
+//!   overrides, use a separate process invocation (or set before test init).
+//! * `MAHBOT_BENCH_LEGACY_NEGATIVES=1` — bypass the production negative embedding
+//!   cache and use the original inline TTS synthesis for baseline/sweep comparisons
+//!   (mahbot-880).
 //!
 //! # Requirements
 //!
@@ -1547,184 +1556,386 @@ pub(crate) fn run_internal() {
 
     // ── Phase 3: Generate negative training data ─────────────────────────
     phase_start!("Phase 3: Generating negative training data");
-    info!("Generating negative training audio from unrelated + confusable phrases...");
-    let unrelated_batch = generate_phrase_variants_batch(
-        UNRELATED_PHRASES,
-        &available_styles,
-        SeedConfig {
-            base_seed: super::UNRELATED_SEED_BASE,
-            num_variants: super::UNRELATED_SEEDS_PER_PHRASE,
-            seed_variant: 0,
-        },
-        "neg_train",
-        &model_version_hash,
-        &cache_dir_path,
-        cache_bust,
-    );
-    let confusable_batch = generate_phrase_variants_batch(
-        CONFUSABLE_PHRASES,
-        &available_styles,
-        SeedConfig {
-            base_seed: super::CONFUSABLE_SEED_BASE,
-            num_variants: super::CONFUSABLE_SEEDS_PER_PHRASE,
-            seed_variant: 0,
-        },
-        "neg_conf_train",
-        &model_version_hash,
-        &cache_dir_path,
-        cache_bust,
-    );
-    let [neg_unrelated_1, neg_unrelated_2, neg_unrelated_3] = unrelated_batch.try_into().unwrap();
-    let [
-        neg_confusable_1,
-        neg_confusable_2,
-        neg_confusable_3,
-        neg_confusable_4,
-        neg_confusable_5,
-    ] = confusable_batch.try_into().unwrap();
-    let mut negative_embeddings: Vec<Vec<f32>> = Vec::new();
-    // Extract both old-style (dense, more informative) and streaming
-    // (distribution-matched) negatives for classifier training (mahbot-856).
-    // Applies AGC preprocessing to match the production pipeline where
-    // negative audio chunks come from AGC-processed frames (mahbot-856).
-    let mut old_negatives: Vec<Vec<f32>> = Vec::new();
-    let mut streaming_negatives: Vec<Vec<f32>> = Vec::new();
 
-    // Helper: process a slice of (audio, label) through AGC in FRAME_LENGTH
-    // chunks, matching vad_segment_and_enroll's production-path mirroring.
-    use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
-    let agc_chunk_size = super::FRAME_LENGTH;
-    let agc_process = |variants: &[(Vec<f32>, String)]| -> Vec<(Vec<f32>, String)> {
-        variants
-            .iter()
-            .map(|(samples, label)| {
-                let mut pre = AudioPreprocessor::new(PreprocessorConfig::default());
-                let mut processed: Vec<f32> = Vec::with_capacity(samples.len());
-                for chunk in samples.chunks(agc_chunk_size) {
-                    let padded = if chunk.len() < agc_chunk_size {
-                        let mut p = chunk.to_vec();
-                        p.resize(agc_chunk_size, 0.0);
-                        p
-                    } else {
-                        chunk.to_vec()
-                    };
-                    processed.extend(pre.process(padded));
-                }
-                (processed, label.clone())
-            })
-            .collect()
-    };
+    // Allow forcing legacy inline TTS synthesis for baseline/sweep comparisons
+    // via env var (mahbot-880).  Set MAHBOT_BENCH_LEGACY_NEGATIVES=1 to bypass
+    // the production cache path and use the original inline embedding generation.
+    // Check this BEFORE the prewarm runtime to avoid wasted work when legacy
+    // mode is requested (mahbot-880 reviewer feedback).
+    let use_legacy = std::env::var("MAHBOT_BENCH_LEGACY_NEGATIVES").as_deref() == Ok("1");
 
-    // AGC-process all negative sets once, reusing the results for both
-    // the classifier (old-style + streaming) and verifier (streaming-only)
-    // extraction loops (mahbot-856).
-    let agc_unrelated_1 = agc_process(&neg_unrelated_1);
-    let agc_unrelated_2 = agc_process(&neg_unrelated_2);
-    let agc_unrelated_3 = agc_process(&neg_unrelated_3);
-    let agc_confusable_1 = agc_process(&neg_confusable_1);
-    let agc_confusable_2 = agc_process(&neg_confusable_2);
-    let agc_confusable_3 = agc_process(&neg_confusable_3);
-    let agc_confusable_4 = agc_process(&neg_confusable_4);
-    let agc_confusable_5 = agc_process(&neg_confusable_5);
-
-    for neg_set in [
-        &agc_unrelated_1,
-        &agc_unrelated_2,
-        &agc_unrelated_3,
-        &agc_confusable_1,
-        &agc_confusable_2,
-        &agc_confusable_3,
-        &agc_confusable_4,
-        &agc_confusable_5,
-    ] {
-        let (embs, _, _) =
-            process_variants_with(neg_set, |s| super::process_streaming_enrollment_sample(s));
-        streaming_negatives.extend(embs);
-        let (old_embs, _, _) =
-            process_variants_with(neg_set, |s| super::process_enrollment_sample(s));
-        old_negatives.extend(old_embs);
+    // Pre-warm production caches for confusable and unrelated embeddings
+    // (mahbot-880).  These are populated by `prewarm_*` during normal app
+    // startup, but the benchmark runs synchronously and never calls prewarm.
+    // We call it here so the benchmark uses the same cached embeddings as
+    // production, ensuring benchmark results reflect real behavior.
+    if !use_legacy {
+        info!("Pre-warming production negative embedding caches (mahbot-880)...");
+        {
+            let rt =
+                tokio::runtime::Runtime::new().expect("Failed to create tokio runtime for prewarm");
+            rt.block_on(super::prewarm_confusable_embeddings());
+            rt.block_on(super::prewarm_unrelated_embeddings());
+        }
     }
-    // Combine old-style + streaming for classifier training.
-    let old_neg_count = old_negatives.len();
-    let stream_neg_count = streaming_negatives.len();
-    negative_embeddings.extend(old_negatives);
-    negative_embeddings.extend(streaming_negatives);
-    info!(
-        "Extracted {} old-style + {} streaming negative embeddings from {} unrelated (3 seeds) + {} confusable phrases \
-         (across 5 seed variations, mahbot-872)",
-        old_neg_count,
-        stream_neg_count,
-        neg_unrelated_1.len() + neg_unrelated_2.len() + neg_unrelated_3.len(),
-        neg_confusable_1.len()
-            + neg_confusable_2.len()
-            + neg_confusable_3.len()
-            + neg_confusable_4.len()
-            + neg_confusable_5.len(),
-    );
 
-    // Supplement with distribution-matched synthetic negatives (mahbot-846).
-    // Uses the streaming positive embedding statistics so the synthetic negatives
-    // overlap with real speech rather than pure N(0,1) noise which is
-    // trivially separable.  Uses streaming statistics to match the classifier
-    // training distribution (mahbot-856).
-    negative_embeddings.extend(generate_synthetic_negatives_from_positives(
-        SYNTHETIC_NEGATIVES_COUNT,
-        &all_streaming_embeddings,
-        1.5,
-    ));
+    // Check if production caches are populated.
+    let confusable_dense_cache = super::confusable_dense_embeddings();
+    let unrelated_dense_cache = super::unrelated_dense_embeddings();
+    let confusable_streaming_cache = super::confusable_negative_embeddings();
+    let unrelated_streaming_cache = super::unrelated_negative_embeddings();
 
-    // Build a SEPARATE negative set for the verifier that uses STREAMING
-    // pipeline embeddings to match inference distribution (mahbot-855) and
-    // INCLUDES confusable + unrelated phrase embeddings for confusable rejection
-    // training (mahbot-859, mahbot-872).  Reuses the pre-computed AGC'd unrelated
-    // and confusable sets from above, avoiding redundant AGC processing.
-    let mut verifier_negatives: Vec<Vec<f32>> = Vec::new();
-    // Unrelated speech phrases (3 seeds) — weight: UNRELATED_UPWEIGHT× (mahbot-872)
-    for agc_unrelated in [&agc_unrelated_1, &agc_unrelated_2, &agc_unrelated_3] {
-        let (embs, _, _) = process_variants_with(agc_unrelated, |s| {
-            super::process_streaming_enrollment_sample(s)
-        });
-        verifier_negatives.extend(embs);
+    let caches_ready = !use_legacy
+        && !confusable_dense_cache.is_empty()
+        && !unrelated_dense_cache.is_empty()
+        && !confusable_streaming_cache.is_empty()
+        && !unrelated_streaming_cache.is_empty();
+
+    let (negative_embeddings, verifier_negatives, per_neg_weights);
+
+    if caches_ready {
+        // ── Production cache path (mahbot-880) ─────────────────────────────
+        // Use the shared OnceLock caches populated by the prewarm functions
+        // above.  These match what production uses during real enrollment.
+        info!(
+            "Using production pre-warmed caches: {} confusable + {} unrelated dense, \
+             {} confusable + {} unrelated streaming (mahbot-880)",
+            confusable_dense_cache.len(),
+            unrelated_dense_cache.len(),
+            confusable_streaming_cache.len(),
+            unrelated_streaming_cache.len(),
+        );
+
+        // Classifier (Conv1D) uses dense (old-style) embeddings from the cache.
+        // These are the pre-computed dense-stride embeddings that provide a rich
+        // learning signal (many windows per utterance), matching the embedding
+        // *type* production uses for the classifier — dense-stride (old-style)
+        // embeddings, not the stride-1 streaming embeddings used for the verifier
+        // (mahbot-878, mahbot-880).
+        //
+        // NOTE — Composition differs from production finalize_enrollment:
+        //   Production: ambient (old+streaming) → confusable_dense → unrelated_dense
+        //   Benchmark:  confusable_dense → unrelated_dense → synthetic
+        // The benchmark has no ambient negatives and supplements with synthetic
+        // negatives (mahbot-846).  The ordering within common categories (confusable,
+        // unrelated) matches production for weight-tier alignment.
+        let mut neg_for_classifier: Vec<Vec<f32>> = Vec::with_capacity(
+            confusable_dense_cache.len() + unrelated_dense_cache.len() + SYNTHETIC_NEGATIVES_COUNT,
+        );
+        neg_for_classifier.extend_from_slice(confusable_dense_cache);
+        neg_for_classifier.extend_from_slice(unrelated_dense_cache);
+
+        // Supplement with distribution-matched synthetic negatives (mahbot-846).
+        neg_for_classifier.extend(generate_synthetic_negatives_from_positives(
+            SYNTHETIC_NEGATIVES_COUNT,
+            &all_streaming_embeddings,
+            1.5,
+        ));
+
+        let n_dense_total = neg_for_classifier.len();
+        negative_embeddings = neg_for_classifier;
+
+        // Verifier (MLP) uses streaming embeddings from the cache, matching
+        // production's inference distribution (mahbot-880).
+        let n_unrelated_streaming = unrelated_streaming_cache.len();
+        let n_confusable_streaming = confusable_streaming_cache.len();
+        let n_synthetic = SYNTHETIC_NEGATIVES_COUNT;
+
+        let mut neg_for_verifier: Vec<Vec<f32>> =
+            Vec::with_capacity(n_unrelated_streaming + n_confusable_streaming + n_synthetic);
+        // Concatenation order: unrelated → confusable → synthetic, matching
+        // production's ambient→unrelated→confusable (no ambient in benchmark).
+        neg_for_verifier.extend_from_slice(unrelated_streaming_cache);
+        neg_for_verifier.extend_from_slice(confusable_streaming_cache);
+        neg_for_verifier.extend(generate_synthetic_negatives_from_positives(
+            SYNTHETIC_NEGATIVES_COUNT,
+            &all_streaming_embeddings,
+            1.5,
+        ));
+        verifier_negatives = neg_for_verifier;
+
+        // Build per-negative weights with three tiers matching production
+        // (mahbot-872, mahbot-880): unrelated = UNRELATED_UPWEIGHT×,
+        // confusable = CONFUSABLE_UPWEIGHT×, synthetic = 1.0×.
+        let n_neg_total = n_unrelated_streaming + n_confusable_streaming + n_synthetic;
+        let mut pw: Vec<f32> = Vec::with_capacity(n_neg_total);
+        pw.extend(std::iter::repeat_n(
+            crate::voice_verifier::UNRELATED_UPWEIGHT,
+            n_unrelated_streaming,
+        ));
+        pw.extend(std::iter::repeat_n(
+            crate::voice_verifier::CONFUSABLE_UPWEIGHT,
+            n_confusable_streaming,
+        ));
+        pw.extend(std::iter::repeat_n(1.0, n_synthetic));
+        per_neg_weights = pw;
+
+        // Structural guard: verify weight tier boundaries align with embedding
+        // counts (mahbot-880).  Uses the shared canonical assert_weight_tier
+        // (mahbot-880 reviewer feedback).
+        crate::voice_verifier::assert_weight_tier(
+            &per_neg_weights,
+            0,
+            n_unrelated_streaming,
+            crate::voice_verifier::UNRELATED_UPWEIGHT,
+            "unrelated",
+        );
+        crate::voice_verifier::assert_weight_tier(
+            &per_neg_weights,
+            n_unrelated_streaming,
+            n_confusable_streaming,
+            crate::voice_verifier::CONFUSABLE_UPWEIGHT,
+            "confusable",
+        );
+        crate::voice_verifier::assert_weight_tier(
+            &per_neg_weights,
+            n_unrelated_streaming + n_confusable_streaming,
+            n_synthetic,
+            1.0,
+            "synthetic",
+        );
+        assert_eq!(per_neg_weights.len(), n_neg_total);
+
+        info!(
+            "Built {} verifier negatives ({} unrelated@{}× + {} confusable@{}× + {} synthetic) \
+             and {} classifier negatives (mahbot-880)",
+            n_neg_total,
+            n_unrelated_streaming,
+            crate::voice_verifier::UNRELATED_UPWEIGHT,
+            n_confusable_streaming,
+            crate::voice_verifier::CONFUSABLE_UPWEIGHT,
+            n_synthetic,
+            n_dense_total,
+        );
+    } else {
+        // ── Fallback: inline TTS synthesis (mahbot-880) ────────────────────
+        // Production caches are empty (prewarm failed or models unavailable).
+        // Log a warning and fall back to the original inline TTS synthesis +
+        // embedding extraction path.
+        warn!(
+            "Production negative embedding caches not available — \
+             falling back to inline TTS synthesis (mahbot-880)"
+        );
+        info!("Generating negative training audio from unrelated + confusable phrases...");
+        let unrelated_batch = generate_phrase_variants_batch(
+            UNRELATED_PHRASES,
+            &available_styles,
+            SeedConfig {
+                base_seed: super::UNRELATED_SEED_BASE,
+                num_variants: super::UNRELATED_SEEDS_PER_PHRASE,
+                seed_variant: 0,
+            },
+            "neg_train",
+            &model_version_hash,
+            &cache_dir_path,
+            cache_bust,
+        );
+        let confusable_batch = generate_phrase_variants_batch(
+            CONFUSABLE_PHRASES,
+            &available_styles,
+            SeedConfig {
+                base_seed: super::CONFUSABLE_SEED_BASE,
+                num_variants: super::CONFUSABLE_SEEDS_PER_PHRASE,
+                seed_variant: 0,
+            },
+            "neg_conf_train",
+            &model_version_hash,
+            &cache_dir_path,
+            cache_bust,
+        );
+        let [neg_unrelated_1, neg_unrelated_2, neg_unrelated_3] =
+            unrelated_batch.try_into().unwrap();
+        let [
+            neg_confusable_1,
+            neg_confusable_2,
+            neg_confusable_3,
+            neg_confusable_4,
+            neg_confusable_5,
+        ] = confusable_batch.try_into().unwrap();
+        let mut neg_emb: Vec<Vec<f32>> = Vec::new();
+        let mut old_negatives: Vec<Vec<f32>> = Vec::new();
+        let mut streaming_negatives: Vec<Vec<f32>> = Vec::new();
+
+        // Helper: process a slice of (audio, label) through AGC in FRAME_LENGTH
+        // chunks, matching vad_segment_and_enroll's production-path mirroring.
+        use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
+        let agc_chunk_size = super::FRAME_LENGTH;
+        let agc_process = |variants: &[(Vec<f32>, String)]| -> Vec<(Vec<f32>, String)> {
+            variants
+                .iter()
+                .map(|(samples, label)| {
+                    let mut pre = AudioPreprocessor::new(PreprocessorConfig::default());
+                    let mut processed: Vec<f32> = Vec::with_capacity(samples.len());
+                    for chunk in samples.chunks(agc_chunk_size) {
+                        let padded = if chunk.len() < agc_chunk_size {
+                            let mut p = chunk.to_vec();
+                            p.resize(agc_chunk_size, 0.0);
+                            p
+                        } else {
+                            chunk.to_vec()
+                        };
+                        processed.extend(pre.process(padded));
+                    }
+                    (processed, label.clone())
+                })
+                .collect()
+        };
+
+        // AGC-process all negative sets once, reusing the results for both
+        // the classifier (old-style + streaming) and verifier (streaming-only)
+        // extraction loops (mahbot-856).
+        let agc_unrelated_1 = agc_process(&neg_unrelated_1);
+        let agc_unrelated_2 = agc_process(&neg_unrelated_2);
+        let agc_unrelated_3 = agc_process(&neg_unrelated_3);
+        let agc_confusable_1 = agc_process(&neg_confusable_1);
+        let agc_confusable_2 = agc_process(&neg_confusable_2);
+        let agc_confusable_3 = agc_process(&neg_confusable_3);
+        let agc_confusable_4 = agc_process(&neg_confusable_4);
+        let agc_confusable_5 = agc_process(&neg_confusable_5);
+
+        // Process confusable sets first, then unrelated, matching the cache
+        // path's classifier ordering (confusable→unrelated→synthetic, mahbot-880
+        // reviewer feedback).  This ensures negative-set ordering is consistent
+        // between both paths for easier debugging of per-epoch behavior differences.
+        for neg_set in [
+            &agc_confusable_1,
+            &agc_confusable_2,
+            &agc_confusable_3,
+            &agc_confusable_4,
+            &agc_confusable_5,
+            &agc_unrelated_1,
+            &agc_unrelated_2,
+            &agc_unrelated_3,
+        ] {
+            let (embs, _, _) =
+                process_variants_with(neg_set, |s| super::process_streaming_enrollment_sample(s));
+            streaming_negatives.extend(embs);
+            let (old_embs, _, _) =
+                process_variants_with(neg_set, |s| super::process_enrollment_sample(s));
+            old_negatives.extend(old_embs);
+        }
+
+        // Combine old-style + streaming for classifier training.
+        //
+        // ╔══════════════════════════════════════════════════════════════════╗
+        // ║  CONFOUND WARNING — classifier training data composition       ║
+        // ║  differs between cache and legacy paths:                      ║
+        // ║                                                              ║
+        // ║  Cache path  (production): ~N dense embeddings only           ║
+        // ║  Legacy path (this branch): ~2N old-style + streaming         ║
+        // ║                                                              ║
+        // ║  When comparing Step 0 (baseline, legacy) vs post-Item-2      ║
+        // ║  (cache) results, score distribution shifts may be caused     ║
+        // ║  by training data composition changes, not just threshold     ║
+        // ║  recalibration.  This divergence is a pre-existing             ║
+        // ║  limitation scoped out of mahbot-880 (see ticket Item 2).     ║
+        // ╚══════════════════════════════════════════════════════════════════╝
+        let old_neg_count = old_negatives.len();
+        let stream_neg_count = streaming_negatives.len();
+        neg_emb.extend(old_negatives);
+        neg_emb.extend(streaming_negatives);
+        info!(
+            "Extracted {} old-style + {} streaming negative embeddings from {} unrelated (3 seeds) + {} confusable phrases \
+             (across 5 seed variations, mahbot-872)",
+            old_neg_count,
+            stream_neg_count,
+            neg_unrelated_1.len() + neg_unrelated_2.len() + neg_unrelated_3.len(),
+            neg_confusable_1.len()
+                + neg_confusable_2.len()
+                + neg_confusable_3.len()
+                + neg_confusable_4.len()
+                + neg_confusable_5.len(),
+        );
+
+        // Supplement with distribution-matched synthetic negatives (mahbot-846).
+        neg_emb.extend(generate_synthetic_negatives_from_positives(
+            SYNTHETIC_NEGATIVES_COUNT,
+            &all_streaming_embeddings,
+            1.5,
+        ));
+
+        negative_embeddings = neg_emb;
+
+        // Build a SEPARATE negative set for the verifier that uses STREAMING
+        // pipeline embeddings to match inference distribution (mahbot-855) and
+        // INCLUDES confusable + unrelated phrase embeddings for confusable rejection
+        // training (mahbot-859, mahbot-872).  Reuses the pre-computed AGC'd unrelated
+        // and confusable sets from above, avoiding redundant AGC processing.
+        let mut ver_neg: Vec<Vec<f32>> = Vec::new();
+        // Unrelated speech phrases (3 seeds) — weight: UNRELATED_UPWEIGHT× (mahbot-872)
+        for agc_unrelated in [&agc_unrelated_1, &agc_unrelated_2, &agc_unrelated_3] {
+            let (embs, _, _) = process_variants_with(agc_unrelated, |s| {
+                super::process_streaming_enrollment_sample(s)
+            });
+            ver_neg.extend(embs);
+        }
+        let n_unrelated_verifier = ver_neg.len();
+        // Confusable phrase streaming embeddings (5 seeds, mahbot-872) — weight: CONFUSABLE_UPWEIGHT×
+        for agc_confusable in [
+            &agc_confusable_1,
+            &agc_confusable_2,
+            &agc_confusable_3,
+            &agc_confusable_4,
+            &agc_confusable_5,
+        ] {
+            let (embs, _, _) = process_variants_with(agc_confusable, |s| {
+                super::process_streaming_enrollment_sample(s)
+            });
+            ver_neg.extend(embs);
+        }
+        let n_confusable_verifier = ver_neg.len() - n_unrelated_verifier;
+        ver_neg.extend(generate_synthetic_negatives_from_positives(
+            SYNTHETIC_NEGATIVES_COUNT,
+            &all_streaming_embeddings,
+            1.5,
+        ));
+        let n_synthetic_verifier = SYNTHETIC_NEGATIVES_COUNT;
+        verifier_negatives = ver_neg;
+
+        // Build per-negative weights with three tiers matching production
+        // (mahbot-872): unrelated speech = UNRELATED_UPWEIGHT×, confusable =
+        // CONFUSABLE_UPWEIGHT× (reduced from 100× as mahbot-872 fallback),
+        // synthetic = 1.0× (ambient-equivalent since the bench has no actual
+        // ambient noise).
+        let n_neg_total = verifier_negatives.len();
+        let mut pw: Vec<f32> = Vec::with_capacity(n_neg_total);
+        pw.extend(std::iter::repeat_n(
+            crate::voice_verifier::UNRELATED_UPWEIGHT,
+            n_unrelated_verifier,
+        ));
+        pw.extend(std::iter::repeat_n(
+            crate::voice_verifier::CONFUSABLE_UPWEIGHT,
+            n_confusable_verifier,
+        ));
+        pw.extend(std::iter::repeat_n(1.0, n_synthetic_verifier));
+        per_neg_weights = pw;
+
+        // Structural guard: verify weight tier boundaries align with embedding
+        // counts (mahbot-880).  Uses the shared canonical assert_weight_tier
+        // (mahbot-880 reviewer feedback), matching the cache-path guard above.
+        crate::voice_verifier::assert_weight_tier(
+            &per_neg_weights,
+            0,
+            n_unrelated_verifier,
+            crate::voice_verifier::UNRELATED_UPWEIGHT,
+            "unrelated",
+        );
+        crate::voice_verifier::assert_weight_tier(
+            &per_neg_weights,
+            n_unrelated_verifier,
+            n_confusable_verifier,
+            crate::voice_verifier::CONFUSABLE_UPWEIGHT,
+            "confusable",
+        );
+        crate::voice_verifier::assert_weight_tier(
+            &per_neg_weights,
+            n_unrelated_verifier + n_confusable_verifier,
+            n_synthetic_verifier,
+            1.0,
+            "synthetic",
+        );
+        assert_eq!(per_neg_weights.len(), n_neg_total);
     }
-    let n_unrelated_verifier = verifier_negatives.len();
-    // Confusable phrase streaming embeddings (5 seeds, mahbot-872) — weight: CONFUSABLE_UPWEIGHT×
-    for agc_confusable in [
-        &agc_confusable_1,
-        &agc_confusable_2,
-        &agc_confusable_3,
-        &agc_confusable_4,
-        &agc_confusable_5,
-    ] {
-        let (embs, _, _) = process_variants_with(agc_confusable, |s| {
-            super::process_streaming_enrollment_sample(s)
-        });
-        verifier_negatives.extend(embs);
-    }
-    let n_confusable_verifier = verifier_negatives.len() - n_unrelated_verifier;
-    verifier_negatives.extend(generate_synthetic_negatives_from_positives(
-        SYNTHETIC_NEGATIVES_COUNT,
-        &all_streaming_embeddings,
-        1.5,
-    ));
-    let n_synthetic_verifier = SYNTHETIC_NEGATIVES_COUNT;
-
-    // Build per-negative weights with three tiers matching production
-    // (mahbot-872): unrelated speech = UNRELATED_UPWEIGHT×, confusable =
-    // CONFUSABLE_UPWEIGHT× (reduced from 100× as mahbot-872 fallback),
-    // synthetic = 1.0× (ambient-equivalent since the bench has no actual
-    // ambient noise).
-    let n_neg_total = verifier_negatives.len();
-    let mut per_neg_weights: Vec<f32> = Vec::with_capacity(n_neg_total);
-    per_neg_weights.extend(std::iter::repeat_n(
-        crate::voice_verifier::UNRELATED_UPWEIGHT,
-        n_unrelated_verifier,
-    ));
-    per_neg_weights.extend(std::iter::repeat_n(
-        crate::voice_verifier::CONFUSABLE_UPWEIGHT,
-        n_confusable_verifier,
-    ));
-    per_neg_weights.extend(std::iter::repeat_n(1.0, n_synthetic_verifier));
-    assert_eq!(per_neg_weights.len(), n_neg_total);
 
     phase_times[P_NEG_TRAINING_DATA] = phase_end_ms!();
 
