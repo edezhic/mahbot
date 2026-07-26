@@ -61,6 +61,13 @@ use std::time::Instant;
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
+/// Minimum effective threshold for the Conv1D ensemble's rolling sum.
+///
+/// The classifier rolling sum must reach at least this value for the
+/// classifier to have fired.  Below this threshold, misses are attributed
+/// to the classifier (mahbot-882).
+const MIN_CLASSIFIER_THRESHOLD: f32 = 1.35;
+
 /// Default wake word for the test.
 const WAKE_WORD: &str = "hey mahbot";
 
@@ -1630,6 +1637,7 @@ pub(crate) fn run_internal() {
             SYNTHETIC_NEGATIVES_COUNT,
             &all_streaming_embeddings,
             1.5,
+            Some(42), // fixed seed for deterministic benchmark (mahbot-882)
         ));
 
         let n_dense_total = neg_for_classifier.len();
@@ -1651,6 +1659,7 @@ pub(crate) fn run_internal() {
             SYNTHETIC_NEGATIVES_COUNT,
             &all_streaming_embeddings,
             1.5,
+            Some(42), // fixed seed for deterministic benchmark (mahbot-882)
         ));
         verifier_negatives = neg_for_verifier;
 
@@ -1852,6 +1861,7 @@ pub(crate) fn run_internal() {
             SYNTHETIC_NEGATIVES_COUNT,
             &all_streaming_embeddings,
             1.5,
+            Some(42), // fixed seed for deterministic benchmark (mahbot-882)
         ));
 
         negative_embeddings = neg_emb;
@@ -1888,6 +1898,7 @@ pub(crate) fn run_internal() {
             SYNTHETIC_NEGATIVES_COUNT,
             &all_streaming_embeddings,
             1.5,
+            Some(42), // fixed seed for deterministic benchmark (mahbot-882)
         ));
         let n_synthetic_verifier = SYNTHETIC_NEGATIVES_COUNT;
         verifier_negatives = ver_neg;
@@ -2040,6 +2051,7 @@ pub(crate) fn run_internal() {
         L2_LAMBDA,     // mahbot-854: 0.01
         LEARNING_RATE, // mahbot-878: 0.001 (Adam)
         MLP_MAX_ITER,  // mahbot-861: 2000 (MLP converges faster)
+        Some(42),      // fixed seed for deterministic benchmark (mahbot-882)
     );
 
     if verifier.is_trained() {
@@ -2573,6 +2585,11 @@ pub(crate) fn run_internal() {
             "detection_rate": pos_metrics.detection_rate(),
             "detected": pos_metrics.detected,
             "total_positive": pos_metrics.total,
+            "miss_classification": {
+                "classifier": pos_metrics.per_variant.iter().filter(|pv| !pv.detected && pv.peak_score < MIN_CLASSIFIER_THRESHOLD).count(),
+                "verifier": pos_metrics.per_variant.iter().filter(|pv| !pv.detected && pv.peak_score >= MIN_CLASSIFIER_THRESHOLD).count(),
+                "total_misses": pos_metrics.total - pos_metrics.detected,
+            },
             "false_accepts": {
                 "confusable": selected_conf_fa.len(),
                 "unrelated": unrelated_metrics.false_accepts.len(),
@@ -2583,11 +2600,19 @@ pub(crate) fn run_internal() {
         },
         "per_variant_results": serde_json::Value::Array(
             pos_metrics.per_variant.iter().map(|pv| {
+                let miss_reason = if pv.detected {
+                    None
+                } else if pv.peak_score < MIN_CLASSIFIER_THRESHOLD {
+                    Some("classifier")
+                } else {
+                    Some("verifier")
+                };
                 serde_json::json!({
                     "variant": pv.variant,
                     "detected": pv.detected,
                     "peak_score": pv.peak_score,
                     "verifier_score": pv.verifier_score,
+                    "miss_reason": miss_reason,
                 })
             }).collect()
         ),

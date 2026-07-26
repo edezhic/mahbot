@@ -5304,7 +5304,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                         // Build per-negative weights with three tiers (mahbot-872):
                         //   ambient (silence/environment noise)  → 1.0×
                         //   unrelated speech                     → UNRELATED_UPWEIGHT×
-                        //   confusable near-miss phrases         → CONFUSABLE_UPWEIGHT× (reduced from 100× as mahbot-872 fallback)
+                        //   confusable near-miss phrases         → CONFUSABLE_UPWEIGHT× (reduced from 100× in mahbot-872, further to 15× in mahbot-882)
                         let mut per_neg_weights: Vec<f32> = Vec::with_capacity(n_neg);
                         per_neg_weights.extend(std::iter::repeat_n(1.0, n_ambient));
                         per_neg_weights.extend(std::iter::repeat_n(UNRELATED_UPWEIGHT, n_unrelated));
@@ -5344,6 +5344,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                             L2_LAMBDA,       // 0.01
                             LEARNING_RATE,   // 0.001 (Adam, mahbot-878)
                             MLP_MAX_ITER,    // 2000 — MLP converges faster than linear (mahbot-861)
+                            None,            // rng_seed — production uses entropy-based RNG
                         );
                         info!(
                             "Verifier trained from {} streaming positive + {n_neg} real \
@@ -5355,6 +5356,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                         let v = VoiceVerifier::train_with_synthetic_negatives(
                             &pos_for_verifier,
                             DEFAULT_VERIFIER_THRESHOLD,
+                            None, // rng_seed — production uses entropy-based RNG
                         );
                         info!(
                             "Verifier trained from {} streaming positive \

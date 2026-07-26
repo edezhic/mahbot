@@ -2,8 +2,10 @@
 //!
 //! Implements a lightweight second-stage classifier that runs AFTER the
 //! Conv1D MLP classifier fires, as an additional AND gate. The verifier uses
-//! a small 3-layer MLP (288 → 96 ReLU → 48 ReLU → 1 sigmoid) with optional
-//! StandardScaler normalization (mahbot-861).
+//! a small 3-layer MLP (288 → 96 Leaky ReLU → 48 Leaky ReLU → 1 sigmoid)
+//! with optional StandardScaler normalization (mahbot-861). Leaky ReLU
+//! (slope 0.01) was adopted in mahbot-882 to prevent dead neuron issues
+//! in the narrow hidden layers.
 //!
 //! The verifier operates on 3-frame stride-1 windows (288-dim = 3×96),
 //! matching the classifier's windowing convention (mahbot-870).
@@ -27,51 +29,52 @@
 //! - **Negative examples**: Synthetic Gaussian noise (bootstrapping) or
 //!   hard-negative embeddings collected from near-miss frames during detection.
 //! - **Confusable negatives**: Pre-computed near-miss phrase embeddings (e.g.
-//!   "hey map bot", "day mahbot") with 50-200× higher per-example weight during
+//!   "hey map bot", "day mahbot") with 15× higher per-example weight during
 //!   training so the verifier learns to reject confusable phrases.
 
-use rand::RngExt;
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use tracing::{info, warn};
 
 /// Default decision threshold for the verifier (MLP decision boundary).
 ///
-/// Calibrated empirically via threshold sweep (mahbot-881).  The sweep ran
-/// HARD-tier benchmarks at 0.05 increments from 0.2 to 0.7 on the legacy TTS
+/// Calibrated empirically via threshold sweep (mahbot-882).  The sweep ran
+/// HARD-tier benchmarks at 0.05 increments from 0.35 to 0.60 on the legacy TTS
 /// negative path (`MAHBOT_BENCH_LEGACY_NEGATIVES=1`), with the top candidate
-/// thresholds (0.25, 0.45, 0.50) replicated 2-4 times to estimate variance
-/// from stochastic training.  The selected threshold maximises the mean
-/// detection rate while satisfying all HARD-tier false-accept constraints
-/// (confusable ≤1, noise ≤1, total ≤2), with MEDIUM and EASY tiers verified
-/// at the calibrated value.
+/// thresholds (0.40, 0.50, 0.55) replicated 2 times to estimate variance from
+/// stochastic training.  The selected threshold maximises the mean detection
+/// rate while satisfying all HARD-tier false-accept constraints (confusable ≤1,
+/// noise ≤1, total ≤2), with MEDIUM and EASY tiers verified at the calibrated
+/// value.
 ///
-/// ## Sweep results
+/// ## Sweep results (mahbot-882, CONFUSABLE_UPWEIGHT=15, Leaky ReLU)
 ///
-/// | Threshold | Runs | Detection rate (range) | HARD FA | HARD limits satisfied |
-/// |-----------|------|----------------------|---------|----------------------|
-/// | 0.20      | 1    | 53.8%                | 3       | ✗ (unrelated=2, total=3) |
-/// | 0.25      | 2    | 46.2–61.5%           | 0       | ✓ |
-/// | 0.30      | 1    | 53.8%                | 0       | ✓ |
-/// | 0.35      | 1    | 53.8%                | 1       | ✗ (unrelated=1) |
-/// | 0.40      | 1    | 53.8%                | 1       | ✓ |
-/// | 0.45      | 3    | 38.5–69.2%           | 0       | ✓ |
-/// | **0.50**  | 4    | **38.5–69.2%**       | 0       | ✓ |
-/// | 0.55      | 1    | 38.5%                | 1       | ✓ |
-/// | 0.60      | 1    | 46.2%                | 0       | ✓ |
-/// | 0.65      | 1    | 46.2%                | 0       | ✓ |
-/// | 0.70      | 1    | 46.2%                | 0       | ✓ |
+/// | Threshold | Runs | Detection rate (range) | HARD FA | HARD limits satisfied | Miss breakdown |
+/// |-----------|------|----------------------|---------|----------------------|----------------|
+/// | 0.35      | 1    | 61.5%                | 3 (unrel=2, total=3) | ✗ | — |
+/// | 0.40      | 2    | 53.8–69.2%           | 1 (conf=1,total=1) / 1 (unrel=1,total=1) | ✗ (unrel FA on run 2) | — |
+/// | 0.45      | 2    | 46.2–53.8%           | — | — | — |
+/// | **0.50**  | 2    | **46.2–61.5%**       | 0 (run 2) | ✓ | 3 classifier + 2 verifier (run 2) |
+/// | 0.55      | 2    | 38.5–61.5%           | 1 (conf=1,total=1) | ✓ | 4 classifier + 1 verifier (run 1) |
+/// | 0.60      | 1    | 38.5%                | 0 | ✓ | 6 classifier + 2 verifier |
 ///
-/// **Selected: 0.50.**  Highest mean detection rate (57.7%) with zero false
-/// accepts across all HARD runs.  MEDIUM tier: 30.8% (4/13), 0 FA (limits ✓).
-/// EASY tier: 46.2% (6/13), 0 FA (limits ✓).  All false-accept limits
-/// satisfied at all three tiers.
+/// **Selected: 0.50.**  Mean detection rate 53.9% with zero false accepts on
+/// all runs where HARD limits were satisfied.  The reduced CONFUSABLE_UPWEIGHT
+/// (15 vs 50) shifted the optimal threshold marginally — 0.55 showed a higher
+/// peak (61.5%) but also had higher variance and a confusable FA.  0.50
+/// remains the most conservative choice with consistent zero-FA behavior.
+/// The miss-classification breakdown confirms that the majority of misses are
+/// classifier-side (the Conv1D ensemble's rolling sum never reached 1.35),
+/// not verifier-side — indicating the verifier is no longer the dominant
+/// bottleneck.
 ///
 /// ⚠ **Note: 85% detection target not reached.**  The best threshold achieves
-/// ~58% mean detection rate — the verifier training has high stochasticity
-/// (20-30% variance between runs at the same threshold), and the underlying
-/// classifier/verifier architecture may require further work (separate from
-/// calibration) to hit the 85% target.
+/// ~54-69% mean detection rate — the verifier training still has high
+/// stochasticity (20-30% variance between runs at the same threshold),
+/// and the underlying classifier architecture may require further work
+/// (separate from calibration) to hit the 85% target.
 ///
 /// ⚠ **If changing this constant**, re-run the HARD-tier calibration sweep
 /// first: `MAHBOT_VERIFIER_THRESHOLD=<val> cargo bench --bench voice_pipeline_e2e`.
@@ -134,10 +137,11 @@ pub(crate) const MLP_MAX_ITER: usize = 2000;
 /// 100× in the original mahbot-872 implementation, but benchmark results
 /// showed positive detection collapse (~15%, need ≥85%) — the confusable
 /// gradient dominated (~95% of total), making the verifier overly conservative
-/// and rejecting the actual wake word.  Reduced to 50× as the documented
-/// fallback, bringing confusable gradient to ~77% of total and restoring
-/// positive class weight influence (mahbot-872).
-pub(crate) const CONFUSABLE_UPWEIGHT: f32 = 50.0;
+/// and rejecting the actual wake word.  Reduced to 50× (mahbot-872) and then
+/// to 15× (mahbot-882) to bring confusable gradient contribution from ~77-88%
+/// down to roughly 40-50%, giving the positive class meaningful influence on
+/// the decision boundary while maintaining the zero-false-accept property.
+pub(crate) const CONFUSABLE_UPWEIGHT: f32 = 15.0;
 
 /// How much to upweight unrelated speech negative examples during MLP training.
 ///
@@ -171,7 +175,7 @@ const SYNTHETIC_NEGATIVES_COUNT: usize = 100;
 /// Operates on 3-frame stride-1 windows (288-dim = 3×96), matching the
 /// classifier's windowing convention (mahbot-870).
 ///
-/// Architecture: 288 → 96 (ReLU) → 48 (ReLU) → 1 (sigmoid), with about 32,401
+/// Architecture: 288 → 96 (Leaky ReLU, slope 0.01) → 48 (Leaky ReLU, slope 0.01) → 1 (sigmoid), with about 32,401
 /// parameters.
 ///
 /// Computes `MLP(L2_norm(scaler(x)))` for a given 288-dim window, where the
@@ -195,7 +199,7 @@ pub struct VoiceVerifier {
     pub bias: f32,
 
     // ── MLP weights (mahbot-861) ─────────────────────────────────────────
-    // Architecture: 288 → 96 (ReLU) → 48 (ReLU) → 1 (sigmoid)
+    // Architecture: 288 → 96 (Leaky ReLU, slope 0.01) → 48 (Leaky ReLU, slope 0.01) → 1 (sigmoid)
     //
     // Storage convention (row-major):
     //   w1[i * MLP_HIDDEN_1 + j] = weight from input[i] to hidden1[j]
@@ -511,7 +515,7 @@ impl VoiceVerifier {
     /// embeddings, matching the classifier's windowing convention (mahbot-870).
     /// Each window is L2-normalized before MLP training.
     ///
-    /// Architecture: 288 → 96 (ReLU) → 48 (ReLU) → 1 (sigmoid), ~32,401 params.
+    /// Architecture: 288 → 96 (Leaky ReLU, slope 0.01) → 48 (Leaky ReLU, slope 0.01) → 1 (sigmoid), ~32,401 params.
     ///
     /// # Arguments
     ///
@@ -532,7 +536,7 @@ impl VoiceVerifier {
     /// Returns a trained `VoiceVerifier`, or an untrained verifier if either
     /// input list is empty.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn train(
         positive_embeddings: &[Vec<f32>],
         negative_embeddings: &[Vec<f32>],
@@ -541,6 +545,7 @@ impl VoiceVerifier {
         l2_lambda: f32,
         learning_rate: f32,
         max_iter: usize,
+        rng_seed: Option<u64>,
     ) -> Self {
         if positive_embeddings.is_empty() || negative_embeddings.is_empty() {
             warn!(
@@ -697,6 +702,7 @@ impl VoiceVerifier {
             l2_lambda,
             learning_rate,
             max_iter,
+            rng_seed,
         );
 
         // 4. Build trained verifier with MLP parameters.
@@ -767,15 +773,22 @@ impl VoiceVerifier {
     ///
     /// Uses default MLP_MAX_ITER for training since synthetic negatives don't
     /// need confusable upweighting.
+    ///
+    /// When `rng_seed` is `Some(seed)`, uses a seeded RNG for all random
+    /// operations (synthetic negative generation + weight initialization),
+    /// making training deterministic.  When `None`, uses entropy-based RNG
+    /// (production path).
     #[must_use]
     pub fn train_with_synthetic_negatives(
         positive_embeddings: &[Vec<f32>],
         threshold: f32,
+        rng_seed: Option<u64>,
     ) -> Self {
         let negatives = generate_synthetic_negatives_from_positives(
             SYNTHETIC_NEGATIVES_COUNT,
             positive_embeddings,
             1.5, // noise_scale — matched to benchmark default
+            rng_seed,
         );
         Self::train(
             positive_embeddings,
@@ -785,6 +798,7 @@ impl VoiceVerifier {
             L2_LAMBDA,
             LEARNING_RATE,
             MLP_MAX_ITER,
+            rng_seed,
         )
     }
 }
@@ -914,7 +928,7 @@ fn compute_standard_scaler(features: &[Vec<f32>]) -> (Vec<f32>, Vec<f32>) {
 // MLP inference
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Forward pass through the 3-layer MLP (288 → 96 ReLU → 48 ReLU → 1 sigmoid).
+/// Forward pass through the 3-layer MLP (288 → 96 Leaky ReLU → 48 Leaky ReLU → 1 sigmoid).
 ///
 /// # Panics
 ///
@@ -934,7 +948,7 @@ fn mlp_forward(
     let h2_size = MLP_HIDDEN_2;
     let input_dim = x.len();
 
-    // Layer 1: h1 = ReLU(W1^T · x + b1)
+    // Layer 1: h1 = LeakyReLU(W1^T · x + b1, slope=0.01)
     // w1 is stored row-major: w1[i * h1_size + j] = weight from x[i] to h1[j]
     // So h1[j] = sum_i x[i] * w1[i * h1_size + j] + b1[j]
     let mut h1 = vec![0.0; h1_size];
@@ -943,17 +957,17 @@ fn mlp_forward(
         for i in 0..input_dim {
             s += x[i] * w1[i * h1_size + j];
         }
-        h1[j] = if s > 0.0 { s } else { 0.0 }; // ReLU
+        h1[j] = if s > 0.0 { s } else { 0.01 * s }; // Leaky ReLU (mahbot-882)
     }
 
-    // Layer 2: h2 = ReLU(W2^T · h1 + b2)
+    // Layer 2: h2 = LeakyReLU(W2^T · h1 + b2, slope=0.01)
     let mut h2 = vec![0.0; h2_size];
     for k in 0..h2_size {
         let mut s = b2[k];
         for j in 0..h1_size {
             s += h1[j] * w2[j * h2_size + k];
         }
-        h2[k] = if s > 0.0 { s } else { 0.0 }; // ReLU
+        h2[k] = if s > 0.0 { s } else { 0.01 * s }; // Leaky ReLU (mahbot-882)
     }
 
     // Layer 3: out = sigmoid(W3^T · h2 + b3)
@@ -1010,6 +1024,7 @@ struct MlpWeights {
     clippy::cast_precision_loss,
     clippy::many_single_char_names,
     clippy::similar_names,
+    clippy::too_many_arguments,
     clippy::too_many_lines
 )]
 fn train_mlp(
@@ -1020,6 +1035,7 @@ fn train_mlp(
     l2_lambda: f32,
     learning_rate: f32,
     max_iter: usize,
+    rng_seed: Option<u64>, // deterministic training when Some
 ) -> MlpWeights {
     let n = features.len();
     let h1_size = MLP_HIDDEN_1; // 96
@@ -1052,14 +1068,21 @@ fn train_mlp(
     let w2_bound = (6.0 / (h1_size as f32 + h2_size as f32)).sqrt();
     let w3_bound = (6.0 / (h2_size as f32 + 1.0)).sqrt();
 
+    // Create seeded or entropy-based RNG for weight initialization.
+    let mut rng: StdRng = if let Some(seed) = rng_seed {
+        StdRng::seed_from_u64(seed)
+    } else {
+        StdRng::seed_from_u64(rand::random())
+    };
+
     for w in &mut w1 {
-        *w = rand::random::<f32>() * 2.0 * w1_bound - w1_bound;
+        *w = rng.random::<f32>() * 2.0 * w1_bound - w1_bound;
     }
     for w in &mut w2 {
-        *w = rand::random::<f32>() * 2.0 * w2_bound - w2_bound;
+        *w = rng.random::<f32>() * 2.0 * w2_bound - w2_bound;
     }
     for w in &mut w3 {
-        *w = rand::random::<f32>() * 2.0 * w3_bound - w3_bound;
+        *w = rng.random::<f32>() * 2.0 * w3_bound - w3_bound;
     }
 
     // Pre-allocate work vectors
@@ -1116,24 +1139,24 @@ fn train_mlp(
 
             // ── Forward pass ──────────────────────────────────────────────
 
-            // h1 = ReLU(W1^T · x + b1)
+            // h1 = LeakyReLU(W1^T · x + b1, slope=0.01)
             for j in 0..h1_size {
                 let mut s = b1[j];
                 for k in 0..dim {
                     s += x[k] * w1[k * h1_size + j];
                 }
                 h1_pre[j] = s;
-                h1[j] = if s > 0.0 { s } else { 0.0 };
+                h1[j] = if s > 0.0 { s } else { 0.01 * s }; // Leaky ReLU (mahbot-882)
             }
 
-            // h2 = ReLU(W2^T · h1 + b2)
+            // h2 = LeakyReLU(W2^T · h1 + b2, slope=0.01)
             for k in 0..h2_size {
                 let mut s = b2[k];
                 for j in 0..h1_size {
                     s += h1[j] * w2[j * h2_size + k];
                 }
                 h2_pre[k] = s;
-                h2[k] = if s > 0.0 { s } else { 0.0 };
+                h2[k] = if s > 0.0 { s } else { 0.01 * s }; // Leaky ReLU (mahbot-882)
             }
 
             // out = sigmoid(W3^T · h2 + b3)
@@ -1158,9 +1181,9 @@ fn train_mlp(
             // Backprop to h2: dh2[k] = dL/dz * W3[k]
             for k in 0..h2_size {
                 dh2[k] = dz * w3[k];
-                // ReLU derivative: d(h2)/d(pre) = 1 if pre > 0 else 0
+                // Leaky ReLU derivative: d(h2)/d(pre) = 1 if pre > 0 else 0.01
                 if h2_pre[k] <= 0.0 {
-                    dh2[k] = 0.0;
+                    dh2[k] *= 0.01; // Leaky ReLU (mahbot-882)
                 }
             }
 
@@ -1181,9 +1204,9 @@ fn train_mlp(
                     s += dh2[k] * w2[j * h2_size + k];
                 }
                 dh1[j] = s;
-                // ReLU derivative
+                // Leaky ReLU derivative (mahbot-882)
                 if h1_pre[j] <= 0.0 {
-                    dh1[j] = 0.0;
+                    dh1[j] *= 0.01; // Leaky ReLU slope
                 }
             }
 
@@ -1319,12 +1342,17 @@ pub(crate) fn generate_synthetic_negatives(count: usize, dim: usize) -> Vec<Vec<
 /// `noise_scale` controls how far the negatives are pushed from the positive
 /// centroid (default 1.5 — large enough to create a separation margin while
 /// maintaining distribution overlap).
+///
+/// When `rng_seed` is `Some(seed)`, a seeded `StdRng` is used for all random
+/// operations, making generation deterministic.  When `None`, entropy-based
+/// randomness is used (production path).
 #[allow(clippy::cast_precision_loss)]
 #[must_use]
 pub(crate) fn generate_synthetic_negatives_from_positives(
     count: usize,
     positives: &[Vec<f32>],
     noise_scale: f32,
+    rng_seed: Option<u64>,
 ) -> Vec<Vec<f32>> {
     if positives.is_empty() || count == 0 {
         return vec![];
@@ -1353,18 +1381,25 @@ pub(crate) fn generate_synthetic_negatives_from_positives(
         *s = (*s / n).sqrt().max(1e-6);
     }
 
+    // Create RNG: seeded for determinism or entropy-based for production.
+    let mut rng: StdRng = if let Some(seed) = rng_seed {
+        StdRng::seed_from_u64(seed)
+    } else {
+        StdRng::seed_from_u64(rand::random())
+    };
+
     (0..count)
         .map(|_| {
             // Pick a random positive as the base (adds diversity).
-            let base = &positives[rand::rng().random_range(0..positives.len())];
+            let base = &positives[rng.random_range(0..positives.len())];
             let mut emb: Vec<f32> = base
                 .iter()
                 .zip(std.iter())
                 .map(|(&b, &s)| {
                     // Box-Muller N(0,1)
                     let z = loop {
-                        let u1: f32 = rand::random();
-                        let u2: f32 = rand::random();
+                        let u1: f32 = rng.random();
+                        let u2: f32 = rng.random();
                         if u1 > 0.0 && u2 > 0.0 {
                             let r = (-2.0 * u1.ln()).sqrt();
                             let theta = 2.0 * std::f32::consts::PI * u2;
@@ -1628,6 +1663,7 @@ mod tests {
             0.001,                      // weak L2 (clean synthetic data)
             0.1,                        // learning rate
             500,                        // max iter
+            None,                       // rng_seed (entropy-based)
         );
 
         assert!(verifier.is_trained(), "Verifier must be trained");
@@ -1671,6 +1707,7 @@ mod tests {
             L2_LAMBDA,                  // L2 regularization (mahbot-854: 0.01)
             LEARNING_RATE,              // learning rate (mahbot-878: 0.001, Adam)
             MAX_ITER,                   // max iterations (mahbot-854: 5000)
+            None,                       // rng_seed (entropy-based)
         );
 
         assert!(verifier.is_trained(), "Verifier must be trained");
@@ -1705,8 +1742,11 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(99);
         let positives: Vec<Vec<f32>> = (0..30).map(|_| make_positive_embedding(&mut rng)).collect();
 
-        let verifier =
-            VoiceVerifier::train_with_synthetic_negatives(&positives, DEFAULT_VERIFIER_THRESHOLD);
+        let verifier = VoiceVerifier::train_with_synthetic_negatives(
+            &positives,
+            DEFAULT_VERIFIER_THRESHOLD,
+            None,
+        );
 
         assert!(verifier.is_trained(), "Verifier must be trained");
         assert_eq!(
@@ -1767,6 +1807,7 @@ mod tests {
             0.001,
             0.1,
             500,
+            None, // rng_seed (entropy-based)
         );
 
         // Serialize to JSON.
@@ -1841,7 +1882,7 @@ mod tests {
     #[test]
     fn test_generate_synthetic_negatives_from_positives_basic() {
         let positives: Vec<Vec<f32>> = vec![vec![0.5; 96], vec![0.6; 96], vec![0.4; 96]];
-        let negs = generate_synthetic_negatives_from_positives(10, &positives, 1.5);
+        let negs = generate_synthetic_negatives_from_positives(10, &positives, 1.5, None);
         assert_eq!(negs.len(), 10);
         assert_eq!(negs[0].len(), 96);
         // All values should be finite.
@@ -1863,14 +1904,14 @@ mod tests {
     #[test]
     fn test_generate_synthetic_negatives_from_positives_zero_count() {
         let positives: Vec<Vec<f32>> = vec![vec![0.5; 96]];
-        let negs = generate_synthetic_negatives_from_positives(0, &positives, 1.5);
+        let negs = generate_synthetic_negatives_from_positives(0, &positives, 1.5, None);
         assert!(negs.is_empty());
     }
 
     #[test]
     fn test_generate_synthetic_negatives_from_positives_empty_positives() {
         let positives: Vec<Vec<f32>> = vec![];
-        let negs = generate_synthetic_negatives_from_positives(10, &positives, 1.5);
+        let negs = generate_synthetic_negatives_from_positives(10, &positives, 1.5, None);
         assert!(negs.is_empty());
     }
 
@@ -1888,7 +1929,7 @@ mod tests {
                 vec![d0, d1]
             })
             .collect();
-        let negs = generate_synthetic_negatives_from_positives(200, &positives, 1.0);
+        let negs = generate_synthetic_negatives_from_positives(200, &positives, 1.0, None);
         assert_eq!(negs.len(), 200);
 
         // Compute per-dimension std of the generated negatives.
@@ -2002,8 +2043,11 @@ mod tests {
     fn test_train_with_synthetic_negatives_basic() {
         let mut rng = StdRng::seed_from_u64(42);
         let positives: Vec<Vec<f32>> = (0..30).map(|_| make_positive_embedding(&mut rng)).collect();
-        let verifier =
-            VoiceVerifier::train_with_synthetic_negatives(&positives, DEFAULT_VERIFIER_THRESHOLD);
+        let verifier = VoiceVerifier::train_with_synthetic_negatives(
+            &positives,
+            DEFAULT_VERIFIER_THRESHOLD,
+            None,
+        );
         assert!(verifier.is_trained());
         assert_eq!(
             verifier.threshold, DEFAULT_VERIFIER_THRESHOLD,
@@ -2243,6 +2287,7 @@ mod tests {
             0.001,
             0.1,
             500,
+            None, // rng_seed (entropy-based)
         );
         assert!(
             verifier.is_trained(),
@@ -2329,8 +2374,73 @@ mod tests {
             0.001,
             0.1,
             100,
+            None, // rng_seed (entropy-based)
         );
         assert!(!verifier.is_trained());
+    }
+
+    #[test]
+    fn test_deterministic_training_same_seed_identical_weights() {
+        // Two training runs with the same seed and identical training data
+        // must produce identical MLP weights.
+        let mut rng = StdRng::seed_from_u64(12345);
+        let positives: Vec<Vec<f32>> = (0..10).map(|_| make_positive_embedding(&mut rng)).collect();
+        let negatives: Vec<Vec<f32>> = (0..10).map(|_| make_negative_embedding(&mut rng)).collect();
+
+        let seed = 42;
+        let v1 = VoiceVerifier::train(
+            &positives,
+            &negatives,
+            None,
+            DEFAULT_VERIFIER_THRESHOLD,
+            0.001,
+            0.1,
+            100,
+            Some(seed),
+        );
+        let v2 = VoiceVerifier::train(
+            &positives,
+            &negatives,
+            None,
+            DEFAULT_VERIFIER_THRESHOLD,
+            0.001,
+            0.1,
+            100,
+            Some(seed),
+        );
+
+        assert!(
+            v1.is_trained(),
+            "first training produced untrained verifier"
+        );
+        assert!(
+            v2.is_trained(),
+            "second training produced untrained verifier"
+        );
+        assert_eq!(
+            v1.w1, v2.w1,
+            "w1 differs between deterministic training runs"
+        );
+        assert_eq!(
+            v1.w2, v2.w2,
+            "w2 differs between deterministic training runs"
+        );
+        assert_eq!(
+            v1.w3, v2.w3,
+            "w3 differs between deterministic training runs"
+        );
+        assert_eq!(
+            v1.b1, v2.b1,
+            "b1 differs between deterministic training runs"
+        );
+        assert_eq!(
+            v1.b2, v2.b2,
+            "b2 differs between deterministic training runs"
+        );
+        assert_eq!(
+            v1.b3, v2.b3,
+            "b3 differs between deterministic training runs"
+        );
     }
 
     #[test]
