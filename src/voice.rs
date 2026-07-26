@@ -4082,6 +4082,13 @@ pub(crate) struct DetectionInstrumentation {
     pub n_frames_below_reset: usize,
     /// Count of VAD-positive 512-sample frames during streaming detection.
     pub vad_speech_frames: usize,
+    /// Peak verifier score across all frames (mahbot-890).  Captured before
+    /// `transition_to_recording()` resets `ctx.peak_verifier_score` to 0.0,
+    /// so the benchmark can read the actual peak that triggered (or was
+    /// blocked by) the verifier gate.  For non-detected variants this is the
+    /// same as `ctx.peak_verifier_score` at end-of-stream; for detected
+    /// variants it preserves the pre-reset value.
+    pub peak_verifier_score: f32,
 }
 
 #[cfg(feature = "voice-tests")]
@@ -4091,6 +4098,7 @@ impl DetectionInstrumentation {
             per_frame_scores: Vec::new(),
             n_frames_below_reset: 0,
             vad_speech_frames: 0,
+            peak_verifier_score: 0.0,
         }
     }
 }
@@ -6265,6 +6273,12 @@ fn try_match_wake_word_and_push_embedding(
         if total_score < NO_MATCH_RESET_THRESHOLD {
             ctx.instrumentation.n_frames_below_reset += 1;
         }
+        // Save the running peak verifier score (mahbot-890).  This is
+        // updated every frame so that the final value (for detected variants,
+        // captured before transition_to_recording resets ctx.peak_verifier_score)
+        // reflects the true peak.  For non-detected variants the value is
+        // identical to ctx.peak_verifier_score at end-of-stream.
+        ctx.instrumentation.peak_verifier_score = ctx.peak_verifier_score;
     }
     if detected {
         // Wake word detected — transition to recording mode.

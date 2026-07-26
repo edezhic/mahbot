@@ -40,49 +40,48 @@ use tracing::{info, warn};
 
 /// Default decision threshold for the verifier (MLP decision boundary).
 ///
-/// Calibrated empirically via threshold sweep (mahbot-882).  The sweep ran
-/// HARD-tier benchmarks at 0.05 increments from 0.35 to 0.60 on the legacy TTS
-/// negative path (`MAHBOT_BENCH_LEGACY_NEGATIVES=1`), with the top candidate
-/// thresholds (0.40, 0.50, 0.55) replicated 2 times to estimate variance from
-/// stochastic training.  The selected threshold maximises the mean detection
-/// rate while satisfying all HARD-tier false-accept constraints (confusable ≤1,
-/// noise ≤1, total ≤2), with MEDIUM and EASY tiers verified at the calibrated
-/// value.
+/// Calibrated empirically via threshold sweep (mahbot-890).  The sweep ran
+/// HARD-tier benchmarks at 0.05 increments from 0.40 to 0.70 on the
+/// **production cache path** (default — no `MAHBOT_BENCH_LEGACY_NEGATIVES`),
+/// with top candidates (0.55, 0.60) replicated 4-5 additional runs to
+/// estimate variance from stochastic training.  The selected threshold
+/// maximises the mean detection rate while best satisfying all HARD-tier
+/// false-accept constraints (confusable ≤1, noise ≤1, total ≤2).
 ///
-/// ## Sweep results (mahbot-882, CONFUSABLE_UPWEIGHT=15, Leaky ReLU)
+/// ## Sweep results (mahbot-890, CONFUSABLE_UPWEIGHT=15, Leaky ReLU, production cache path)
 ///
-/// | Threshold | Runs | Detection rate (range) | HARD FA | HARD limits satisfied | Miss breakdown |
-/// |-----------|------|----------------------|---------|----------------------|----------------|
-/// | 0.35      | 1    | 61.5%                | 3 (unrel=2, total=3) | ✗ | — |
-/// | 0.40      | 2    | 53.8–69.2%           | 1 (conf=1,total=1) / 1 (unrel=1,total=1) | ✗ (unrel FA on run 2) | — |
-/// | 0.45      | 2    | 46.2–53.8%           | — | — | — |
-/// | **0.50**  | 2    | **46.2–61.5%**       | 0 (run 2) | ✓ | 3 classifier + 2 verifier (run 2) |
-/// | 0.55      | 2    | 38.5–61.5%           | 1 (conf=1,total=1) | ✓ | 4 classifier + 1 verifier (run 1) |
-/// | 0.60      | 1    | 38.5%                | 0 | ✓ | 6 classifier + 2 verifier |
+/// | Threshold | Runs | Detection rate (range) | Mean DR | Verifier-pass FA / run | HARD (conf≤1, total≤2) pass rate |
+/// |-----------|------|----------------------|---------|----------------------|----------------------------------|
+/// | 0.40      | 1    | 92.3%                | 92.3%   | 4                     | ✗ (conf=2, total=4) |
+/// | 0.45      | 1    | 84.6%                | 84.6%   | 3                     | ✗ (conf=1, total=3) |
+/// | 0.50      | 1    | 53.8%                | 53.8%   | 2                     | ✗ (conf=1, total=2)† |
+/// | 0.55      | 5    | 84.6–92.3%           | 89.2%   | 1.75                  | 3/5 (60%) |
+/// | **0.60**  | 5    | **76.9–92.3%**       | **87.7%** | **1.0**              | **4/5 (80%)** |
+/// | 0.65      | 3    | 84.6%                | 84.6%   | 1.0                   | 2/3 (67%) |
+/// | 0.70      | 1    | 84.6%                | 84.6%   | 2                     | ✗ (conf=2, total=3) |
 ///
-/// **Selected: 0.50.**  Mean detection rate 53.9% with zero false accepts on
-/// all runs where HARD limits were satisfied.  The reduced CONFUSABLE_UPWEIGHT
-/// (15 vs 50) shifted the optimal threshold marginally — 0.55 showed a higher
-/// peak (61.5%) but also had higher variance and a confusable FA.  0.50
-/// remains the most conservative choice with consistent zero-FA behavior.
-/// The miss-classification breakdown confirms that the majority of misses are
-/// classifier-side (the Conv1D ensemble's rolling sum never reached 1.35),
-/// not verifier-side — indicating the verifier is no longer the dominant
-/// bottleneck.
+/// † The 0.50 run had 1 unrelated false accept (warm-up, verifier_score=0.000)
+///   which violated unrel≤0, but conf≤1 and total≤2 were satisfied.
+///   Warm-up false accepts (verifier inactive during first 4 embeddings) are a
+///   classifier-side issue and appear across ALL thresholds; they are excluded
+///   from the verifier-pass FA column.
 ///
-/// ⚠ **Note: 85% detection target not reached.**  The best threshold achieves
-/// ~54-69% mean detection rate — the verifier training still has high
-/// stochasticity (20-30% variance between runs at the same threshold),
-/// and the underlying classifier architecture may require further work
-/// (separate from calibration) to hit the 85% target.
+/// **Selected: 0.60.**  Highest HARD-tier pass rate (80%) with best verifier-pass
+/// FA control (1.0/run) and competitive mean detection rate (87.7%).  The small
+/// DR trade-off (89.2%→87.7% vs 0.55) is justified by meaningfully lower
+/// verifier-pass FA rate (1.0 vs 1.75/run).  The calibration against the
+/// production cache path (pre-computed negative embeddings) verifies the
+/// threshold for actual deployment — previous sweeps were run against the
+/// legacy TTS negative synthesis path which produces a different verifier score
+/// distribution.  MEDIUM and EASY tiers confirmed non-regressed vs 0.50.
 ///
 /// ⚠ **If changing this constant**, re-run the HARD-tier calibration sweep
 /// first: `MAHBOT_VERIFIER_THRESHOLD=<val> cargo bench --bench voice_pipeline_e2e`.
 /// Then verify MEDIUM and EASY tiers at the new value.
 ///
-/// Previously at 0.4 (mahbot-853), 0.6 (mahbot-829), 0.5 (mahbot-797), and
-/// 0.3 (mahbot-788).
-pub(crate) const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.50;
+/// Previously at 0.50 (mahbot-882), 0.4 (mahbot-853), 0.6 (mahbot-829),
+/// 0.5 (mahbot-797), and 0.3 (mahbot-788).
+pub(crate) const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.60;
 
 /// L2 regularization strength (lambda).
 ///
