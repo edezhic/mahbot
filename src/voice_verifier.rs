@@ -44,6 +44,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use tracing::{info, warn};
 
+use crate::embedding_sequence::EmbeddingSequence;
+
 /// Verifier architecture version: legacy auto-detect (MLP or linear).
 pub(crate) const VERIFIER_VERSION_LEGACY: u8 = 0;
 
@@ -626,28 +628,35 @@ impl VoiceVerifier {
         }
     }
 
-    /// Train a new verifier from positive and negative 96-dim embedding
-    /// examples.  Trains a 3-layer MLP (default) or logistic regression
+    /// Train a new verifier from positive and negative
+    /// [`EmbeddingSequence`](crate::embedding_sequence::EmbeddingSequence)
+    /// inputs.  Trains a 3-layer MLP (default) or logistic regression
     /// (when `MAHBOT_USE_LOGISTIC_VERIFIER=1`) with L2 regularization.
     ///
-    /// Internally forms 3-frame stride-1 windows from the per-frame
-    /// embeddings.  The MLP path concatenates to 288-dim windows; the logistic
-    /// path mean-pools to 96-dim windows (mahbot-901).  Each window is
-    /// L2-normalized before training (mahbot-870).
+    /// Windows are formed **within** each sequence independently (never across
+    /// sequences), preventing the cross-utterance window contamination that
+    /// existed when training operated on flat `&[Vec<f32>]` lists (mahbot-902).
+    /// The MLP path concatenates 3-frame stride-1 windows to 288-dim; the
+    /// logistic path mean-pools to 96-dim windows (mahbot-901).  Each window
+    /// is L2-normalized before training (mahbot-870).
     ///
     /// MLP architecture: 288 → 96 (Leaky ReLU, slope 0.01) → 48 (Leaky ReLU, slope 0.01) → 1 (sigmoid), ~32,401 params.
     /// Logistic architecture: 97-param L2-regularized logistic regression on mean-pooled 96-dim embeddings.
     ///
     /// # Arguments
     ///
-    /// * `positive_embeddings` — Per-frame embeddings from enrollment
-    ///   utterances (label = 1). Each element is a single 96-dim vector.
-    /// * `negative_embeddings` — Embeddings from non-wake-word audio
-    ///   (label = 0). Each element is a single 96-dim vector.
-    /// * `per_negative_weights` — Optional per-example weights for *negative*
-    ///   samples only (used to upweight confusable near-miss phrases).  When
-    ///   `Some(weights)`, `weights.len()` must equal `negative_embeddings.len()`.
-    ///   Positives are weighted by the automatic `n_neg / n_pos` class_weight.
+    /// * `positive_sequences` — [`EmbeddingSequence`] values from enrollment
+    ///   utterances (label = `Positive`).  Each sequence's embeddings form
+    ///   windows independently; no windows cross between sequences.
+    /// * `negative_sequences` — [`EmbeddingSequence`] values from non-wake-word
+    ///   audio (label = `Negative`), e.g., confusable phrases, unrelated speech,
+    ///   ambient noise, or synthetic negatives.
+    /// * `per_negative_sequence_weights` — Optional per-sequence weights
+    ///   for negative sequences only (used to upweight confusable near-miss
+    ///   phrases).  When `Some(weights)`, `weights.len()` must equal
+    ///   `negative_sequences.len()`.  Positives are weighted by the automatic
+    ///   `n_neg_windows / n_pos_windows` class weight, computed from window
+    ///   counts rather than the old flat-list frame counts (mahbot-902).
     /// * `threshold` — Decision threshold (defaults to
     ///   [`DEFAULT_VERIFIER_THRESHOLD`] in production).
     /// * `l2_lambda` — L2 regularisation strength.
@@ -655,13 +664,14 @@ impl VoiceVerifier {
     /// * `max_iter` — Maximum gradient descent iterations.
     ///
     /// Returns a trained `VoiceVerifier`, or an untrained verifier if either
-    /// input list is empty.
+    /// input list is empty or no windows can be formed (all sequences shorter
+    /// than [`VERIFIER_WINDOW_SIZE`] frames).
     #[must_use]
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn train(
-        positive_embeddings: &[Vec<f32>],
-        negative_embeddings: &[Vec<f32>],
-        per_negative_weights: Option<&[f32]>,
+        positive_sequences: &[EmbeddingSequence],
+        negative_sequences: &[EmbeddingSequence],
+        per_negative_sequence_weights: Option<&[f32]>,
         threshold: f32,
         l2_lambda: f32,
         learning_rate: f32,
@@ -678,9 +688,9 @@ impl VoiceVerifier {
             (learning_rate, max_iter)
         };
         Self::train_inner(
-            positive_embeddings,
-            negative_embeddings,
-            per_negative_weights,
+            positive_sequences,
+            negative_sequences,
+            per_negative_sequence_weights,
             threshold,
             l2_lambda,
             learning_rate,
@@ -701,11 +711,16 @@ impl VoiceVerifier {
     /// (hyperparameter-aware) delegate here with an explicit `use_logistic` flag,
     /// eliminating the coupling risk of independently checking the env var.
     #[must_use]
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::similar_names,
+        clippy::cast_precision_loss
+    )]
     fn train_inner(
-        positive_embeddings: &[Vec<f32>],
-        negative_embeddings: &[Vec<f32>],
-        per_negative_weights: Option<&[f32]>,
+        positive_sequences: &[EmbeddingSequence],
+        negative_sequences: &[EmbeddingSequence],
+        per_negative_sequence_weights: Option<&[f32]>,
         threshold: f32,
         l2_lambda: f32,
         learning_rate: f32,
@@ -713,177 +728,129 @@ impl VoiceVerifier {
         rng_seed: Option<u64>,
         use_logistic: bool,
     ) -> Self {
-        if positive_embeddings.is_empty() || negative_embeddings.is_empty() {
+        // Early exit if either side has zero frames to avoid training on empty data.
+        // Both positive and negative examples are required (mahbot-902).
+        let total_pos_frames: usize = positive_sequences.iter().map(|s| s.embeddings.len()).sum();
+        let total_neg_frames: usize = negative_sequences.iter().map(|s| s.embeddings.len()).sum();
+        if total_pos_frames == 0 || total_neg_frames == 0 {
             warn!(
-                "Cannot train verifier: need both positive ({}) and negative ({}) examples",
-                positive_embeddings.len(),
-                negative_embeddings.len(),
+                "Cannot train verifier: need both positive ({total_pos_frames}) and negative ({total_neg_frames}) frames",
             );
             return Self::untrained();
         }
 
-        // Validate per-negative weights length and fall through to None on
-        // mismatch so the caller gets an unambiguous error (silently wrong
-        // weights would silently produce a wrong model, mahbot-861).
-        let weights_to_use = match per_negative_weights {
-            Some(w) if w.len() == negative_embeddings.len() => Some(w),
+        // Validate per-negative-sequence weights length.
+        let weights_to_use = match per_negative_sequence_weights {
+            Some(w) if w.len() == negative_sequences.len() => Some(w),
             Some(w) => {
                 warn!(
-                    "per_negative_weights length ({}) does not match negative_embeddings length ({}); \
+                    "per_negative_sequence_weights length ({}) does not match negative_sequences length ({}); \
                      falling back to uniform (1.0) negative weights",
                     w.len(),
-                    negative_embeddings.len(),
+                    negative_sequences.len(),
                 );
                 None
             }
             None => None,
         };
 
-        let dim = positive_embeddings[0].len();
-        if dim == 0 {
+        // ── Form windows per-sequence (no cross-sequence windows) ──
+        // Supports two input modes:
+        // 1. Per-frame 96-dim input: form stride-1 windows via windowing functions.
+        // 2. Pre-windowed 288-dim input (e.g., test data): use directly.
+
+        let mut windows: Vec<Vec<f32>> = Vec::new();
+        let mut window_labels: Vec<f32> = Vec::new();
+        let mut window_weights: Vec<f32> = Vec::new();
+
+        // Positive sequences
+        for seq in positive_sequences {
+            let seq_windows = form_sequence_windows(&seq.embeddings, use_logistic);
+            for w in seq_windows {
+                windows.push(w);
+                window_labels.push(1.0);
+                window_weights.push(0.0); // placeholder — set to class_weight below
+            }
+        }
+        let n_pos_windows = windows.len();
+
+        // Negative sequences
+        for (i, seq) in negative_sequences.iter().enumerate() {
+            let seq_windows = form_sequence_windows(&seq.embeddings, use_logistic);
+            let seq_weight = weights_to_use.map_or(1.0, |pw| pw[i]);
+            for w in seq_windows {
+                windows.push(w);
+                window_labels.push(0.0);
+                window_weights.push(seq_weight);
+            }
+        }
+        let n_neg_windows = window_labels.len() - n_pos_windows;
+
+        if windows.is_empty() {
+            warn!(
+                "Cannot form windows: need at least {VERIFIER_WINDOW_SIZE} per-frame embeddings per sequence",
+            );
             return Self::untrained();
         }
 
-        let n_pos = positive_embeddings.len();
-        let n_neg = negative_embeddings.len();
-
-        // Compute class weight to compensate for imbalance: amplify
-        // positive-sample gradients so the model is penalised equally for
-        // misclassifying positives and negatives.
+        // Class weight from window counts (not embedding-frame counts).
+        //
+        // The old flat-list approach windowed the combined positive+negative
+        // embedding list and used n_neg_frames / n_pos_frames.  Here each
+        // sequence is windowed independently, so sequences shorter than
+        // VERIFIER_WINDOW_SIZE produce zero windows.  Window counts and
+        // frame counts therefore diverge for short sequences.  Using window
+        // counts is correct — each window is one training example whose class
+        // weight represents the inverse prevalence of its label (mahbot-902).
         let class_weight = {
-            #[allow(clippy::cast_precision_loss)]
-            let n_pos_f = n_pos as f32;
-            #[allow(clippy::cast_precision_loss)]
-            let n_neg_f = n_neg as f32;
-            if n_pos_f > 0.0 {
-                n_neg_f / n_pos_f
-            } else {
-                1.0
-            }
+            let n_pw_f = n_pos_windows as f32;
+            let n_nw_f = n_neg_windows as f32;
+            if n_pw_f > 0.0 { n_nw_f / n_pw_f } else { 1.0 }
         };
-
-        // Combine positive (label = 1.0) and negative (label = 0.0) examples
-        let mut features: Vec<Vec<f32>> = Vec::with_capacity(n_pos + n_neg);
-        let mut labels: Vec<f32> = Vec::with_capacity(n_pos + n_neg);
-
-        for emb in positive_embeddings {
-            features.push(emb.clone());
-            labels.push(1.0);
-        }
-        for emb in negative_embeddings {
-            features.push(emb.clone());
-            labels.push(0.0);
+        for w in &mut window_weights[0..n_pos_windows] {
+            *w = class_weight;
         }
 
-        // ── Form 3-frame stride-1 windows ──
-        // Convert the flat list of 96-dim per-frame embeddings into either
-        // 288-dim concatenated windows (MLP) or 96-dim mean-pooled windows
-        // (logistic), depending on the `use_logistic` parameter.
-        // If input features are already at VERIFIER_INPUT_DIM (e.g., caller
-        // has pre-windowed them), skip concatenation and just L2-normalize.
-        // `use_logistic` is passed by the caller — controlled by
-        // [`use_logistic_verifier()`] for the public [`train`] path, or by
-        // explicit dispatch in [`train_with_synthetic_negatives`].
-        let (windowed_features, windowed_labels, windowed_sample_weights, n_pos_w, n_neg_w) =
-            if !features.is_empty() && features[0].len() == EMBEDDING_DIM {
-                // Per-frame input: form stride-1 windows.
-                let windows = if use_logistic {
-                    form_stride1_pooled_windows(&features)
-                } else {
-                    form_stride1_windows(&features)
-                };
-                if windows.is_empty() {
-                    warn!(
-                        "Cannot form windows: need at least {} per-frame embeddings, got {}",
-                        VERIFIER_WINDOW_SIZE,
-                        features.len(),
-                    );
-                    return Self::untrained();
-                }
+        // L2-normalize
+        for w in &mut windows {
+            let norm = w.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
+            for v in w.iter_mut() {
+                *v /= norm;
+            }
+        }
 
-                // Assign labels based on the center frame (index 1) of each window.
-                // For stride-1 windows, window k has center at features[k + 1].
-                // This conservatively labels boundary-crossing windows: at most
-                // 2 windows at the pos/neg boundary get a potentially mixed label,
-                // which is negligible for training.
-                let w_labels: Vec<f32> = (0..windows.len()).map(|i| labels[i + 1]).collect();
-
-                // Build per-sample weights for windows (use center frame weight).
-                let n_pos_frames = positive_embeddings.len();
-                let sample_weights =
-                    build_sample_weights(n_pos_frames, n_neg, class_weight, weights_to_use);
-                let w_weights: Vec<f32> =
-                    (0..windows.len()).map(|i| sample_weights[i + 1]).collect();
-
-                // Count positive/negative windows (center-frame label).
-                let n_pw = w_labels.iter().filter(|&&l| l > 0.5).count();
-                let n_neg_w = w_labels.len() - n_pw;
-
-                (windows, w_labels, w_weights, n_pw, n_neg_w)
-            } else {
-                // Already windowed (e.g., test data at VERIFIER_INPUT_DIM).
-                // Just L2-normalize each feature vector.
-                let normalized: Vec<Vec<f32>> = features
-                    .iter()
-                    .map(|f| {
-                        let norm = f.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
-                        f.iter().map(|v| v / norm).collect()
-                    })
-                    .collect();
-
-                let sample_weights =
-                    build_sample_weights(n_pos, n_neg, class_weight, weights_to_use);
-
-                (normalized, labels, sample_weights, n_pos, n_neg)
-            };
-
-        // Logistic mode requires 96-dim features.  If features are pre-windowed
-        // at 288-dim (e.g., test data), silently fall back to MLP training.
         let mut use_logistic = use_logistic;
-        if use_logistic && windowed_features[0].len() != EMBEDDING_DIM {
+        if use_logistic && windows[0].len() != EMBEDDING_DIM {
             warn!(
-                "Logistic verifier mode enabled but received {}-dim pre-windowed data; \
-                 falling back to MLP training",
-                windowed_features[0].len(),
+                "Logistic mode but {}-dim features; falling back to MLP",
+                windows[0].len()
             );
             use_logistic = false;
         }
 
-        // 1. Compute StandardScaler (per-dimension mean and std) on windowed features.
-        let (scaler_mean, scaler_std) = compute_standard_scaler(&windowed_features);
+        let (scaler_mean, scaler_std) = compute_standard_scaler(&windows);
+        let mut scaled = windows.clone();
+        for w in &mut scaled {
+            for (j, v) in w.iter_mut().enumerate() {
+                let std = scaler_std[j].max(1e-10);
+                *v = (*v - scaler_mean[j]) / std;
+            }
+        }
+        let input_dim = scaled[0].len();
 
-        // 2. Apply scaling to all training features.
-        let scaled_features: Vec<Vec<f32>> = windowed_features
-            .iter()
-            .map(|f| {
-                f.iter()
-                    .enumerate()
-                    .map(|(j, &val)| {
-                        if scaler_std[j] > 0.0 {
-                            (val - scaler_mean[j]) / scaler_std[j]
-                        } else {
-                            val
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let input_dim = windowed_features[0].len();
         let verifier = if use_logistic {
-            // 3a. Train logistic regression on scaled 96-dim features.
             let (weights, bias) = train_logistic_sgd(
-                &scaled_features,
-                &windowed_labels,
-                &windowed_sample_weights,
+                &scaled,
+                &window_labels,
+                &window_weights,
                 l2_lambda,
                 learning_rate,
                 max_iter,
                 rng_seed,
             );
-
-            // 4a. Build trained verifier with logistic parameters.
             Self {
+                trained: true,
+                verifier_version: VERIFIER_VERSION_LOGISTIC,
                 weights,
                 bias,
                 w1: Vec::new(),
@@ -895,11 +862,8 @@ impl VoiceVerifier {
                 scaler_mean,
                 scaler_std,
                 threshold,
-                trained: true,
-                verifier_version: VERIFIER_VERSION_LOGISTIC,
             }
         } else {
-            // 3b. Train MLP on scaled windowed features.
             let MlpWeights {
                 w1,
                 b1,
@@ -908,19 +872,19 @@ impl VoiceVerifier {
                 w3,
                 b3,
             } = train_mlp(
-                &scaled_features,
-                &windowed_labels,
+                &scaled,
+                &window_labels,
                 input_dim,
-                &windowed_sample_weights,
+                &window_weights,
                 l2_lambda,
                 learning_rate,
                 max_iter,
                 rng_seed,
             );
-
-            // 4b. Build trained verifier with MLP parameters.
             Self {
-                weights: Vec::new(), // MLP format — leave legacy fields empty
+                trained: true,
+                verifier_version: VERIFIER_VERSION_LEGACY,
+                weights: Vec::new(),
                 bias: 0.0,
                 w1,
                 b1,
@@ -931,19 +895,14 @@ impl VoiceVerifier {
                 scaler_mean,
                 scaler_std,
                 threshold,
-                trained: true,
-                verifier_version: VERIFIER_VERSION_LEGACY,
             }
         };
 
-        // 5. Training diagnostics: compute scores on windowed training examples
-        //    so we can verify the model actually discriminates (mahbot-854).
+        // Diagnostics
         {
-            // Use windowed features for diagnostics since predict() now expects
-            // 288-dim windows.
-            let mut pos_scores = Vec::with_capacity(n_pos_w);
-            let mut neg_scores = Vec::with_capacity(n_neg_w);
-            for (emb, &lbl) in windowed_features.iter().zip(windowed_labels.iter()) {
+            let mut pos_scores = Vec::with_capacity(n_pos_windows);
+            let mut neg_scores = Vec::with_capacity(n_neg_windows);
+            for (emb, &lbl) in windows.iter().zip(window_labels.iter()) {
                 let score = verifier.predict(emb);
                 if lbl > 0.5 {
                     pos_scores.push(score);
@@ -951,30 +910,22 @@ impl VoiceVerifier {
                     neg_scores.push(score);
                 }
             }
-
-            #[allow(clippy::cast_precision_loss)]
             let pos_mean = if pos_scores.is_empty() {
                 0.0
             } else {
-                pos_scores.iter().sum::<f32>() / n_pos_w as f32
+                pos_scores.iter().sum::<f32>() / n_pos_windows as f32
             };
-            #[allow(clippy::cast_precision_loss)]
             let neg_mean = if neg_scores.is_empty() {
                 0.0
             } else {
-                neg_scores.iter().sum::<f32>() / n_neg_w as f32
+                neg_scores.iter().sum::<f32>() / n_neg_windows as f32
             };
             let pos_min = pos_scores.iter().copied().fold(f32::INFINITY, f32::min);
             let pos_max = pos_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let neg_min = neg_scores.iter().copied().fold(f32::INFINITY, f32::min);
             let neg_max = neg_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-
             info!(
-                "Verifier training diagnostics: {n_pos_w} pos + {n_neg_w} neg windows, \
-                 class_weight={class_weight:.2}, L2={l2_lambda}, LR={learning_rate}, \
-                 max_iter={max_iter} | \
-                 pos scores: mean={pos_mean:.4} [{pos_min:.4}, {pos_max:.4}] | \
-                 neg scores: mean={neg_mean:.4} [{neg_min:.4}, {neg_max:.4}]",
+                "Verifier training: {n_pos_windows} pos + {n_neg_windows} neg windows, class_weight={class_weight:.2}, L2={l2_lambda} | pos: mean={pos_mean:.4} [{pos_min:.4},{pos_max:.4}] neg: mean={neg_mean:.4} [{neg_min:.4},{neg_max:.4}]"
             );
         }
 
@@ -996,7 +947,7 @@ impl VoiceVerifier {
     /// (production path).
     #[must_use]
     pub fn train_with_synthetic_negatives(
-        positive_embeddings: &[Vec<f32>],
+        positive_sequences: &[EmbeddingSequence],
         threshold: f32,
         rng_seed: Option<u64>,
     ) -> Self {
@@ -1006,15 +957,29 @@ impl VoiceVerifier {
         } else {
             (MLP_MAX_ITER, LEARNING_RATE)
         };
+        // Extract flat embeddings from all positive sequences for the helper.
+        let flat_positives: Vec<Vec<f32>> = positive_sequences
+            .iter()
+            .flat_map(|s| s.embeddings.iter().cloned())
+            .collect();
         let negatives = generate_synthetic_negatives_from_positives(
             SYNTHETIC_NEGATIVES_COUNT,
-            positive_embeddings,
+            &flat_positives,
             1.5, // noise_scale — matched to benchmark default
             rng_seed,
         );
+        let synth_seq = EmbeddingSequence::negative(
+            crate::embedding_sequence::UtteranceId {
+                sequence_index: 0,
+                variant_index: 0,
+            },
+            crate::embedding_sequence::Source::Synthetic,
+            None,
+            negatives,
+        );
         Self::train_inner(
-            positive_embeddings,
-            &negatives,
+            positive_sequences,
+            &[synth_seq],
             None, // no per-negative weights for synthetic negatives
             threshold,
             L2_LAMBDA,
@@ -1030,25 +995,32 @@ impl VoiceVerifier {
 // Window helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Build the per-sample weights array for MLP training.
+/// Form windows from a per-frame embedding list, dispatching to either
+/// stride-1 concatenated windows (MLP) or mean-pooled windows (logistic).
 ///
-/// - Positives: all get `class_weight` (auto imbalance compensation).
-/// - Negatives: use `per_negative_weights[i]` if provided, else 1.0.
-fn build_sample_weights(
-    n_pos: usize,
-    n_neg: usize,
-    class_weight: f32,
-    per_negative_weights: Option<&[f32]>,
-) -> Vec<f32> {
-    let mut w = Vec::with_capacity(n_pos + n_neg);
-    for _ in 0..n_pos {
-        w.push(class_weight);
+/// Input can be either per-frame 96-dim embeddings (which get windowed)
+/// or pre-windowed 288-dim data (which is L2-normalized and used directly).
+fn form_sequence_windows(embeddings: &[Vec<f32>], use_logistic: bool) -> Vec<Vec<f32>> {
+    if embeddings.is_empty() {
+        return Vec::new();
     }
-    match per_negative_weights {
-        Some(pnw) => w.extend_from_slice(pnw),
-        None => w.extend(std::iter::repeat_n(1.0, n_neg)),
+    if embeddings[0].len() == EMBEDDING_DIM {
+        // Per-frame: form stride-1 windows.
+        if use_logistic {
+            form_stride1_pooled_windows(embeddings)
+        } else {
+            form_stride1_windows(embeddings)
+        }
+    } else {
+        // Pre-windowed: L2-normalize and use directly.
+        embeddings
+            .iter()
+            .map(|f| {
+                let norm = f.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
+                f.iter().map(|v| v / norm).collect()
+            })
+            .collect()
     }
-    w
 }
 
 /// Fill a mutable output slice with `VERIFIER_WINDOW_SIZE` consecutive
@@ -2014,6 +1986,23 @@ mod tests {
         )
     }
 
+    /// Helper: wrap flat embeddings into a single EmbeddingSequence for testing.
+    fn make_seq(
+        embs: Vec<Vec<f32>>,
+        label: crate::embedding_sequence::LabelStratum,
+    ) -> EmbeddingSequence {
+        EmbeddingSequence {
+            id: crate::embedding_sequence::UtteranceId {
+                sequence_index: 0,
+                variant_index: 0,
+            },
+            source: crate::embedding_sequence::Source::Enrollment,
+            augmentation_family: None,
+            label_stratum: label,
+            embeddings: embs,
+        }
+    }
+
     /// Generate a synthetic 288-dim "positive" window with values clustered
     /// around +0.5 (simulating a wake-word embedding window).
     fn make_positive_embedding(rng: &mut impl Rng) -> Vec<f32> {
@@ -2130,10 +2119,12 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let positives: Vec<Vec<f32>> = (0..20).map(|_| make_positive_embedding(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..30).map(|_| make_negative_embedding(&mut rng)).collect();
+        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
+        let neg_seq = make_seq(negatives, crate::embedding_sequence::LabelStratum::Negative);
 
         let verifier = VoiceVerifier::train(
-            &positives,
-            &negatives,
+            &[pos_seq],
+            &[neg_seq],
             None,                       // no per-negative weights
             DEFAULT_VERIFIER_THRESHOLD, // threshold
             0.001,                      // weak L2 (clean synthetic data)
@@ -2174,10 +2165,12 @@ mod tests {
         let negatives: Vec<Vec<f32>> = (0..30)
             .map(|_| make_non_wake_speech_embedding(&mut rng))
             .collect();
+        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
+        let neg_seq = make_seq(negatives, crate::embedding_sequence::LabelStratum::Negative);
 
         let verifier = VoiceVerifier::train(
-            &positives,
-            &negatives,
+            &[pos_seq],
+            &[neg_seq],
             None,                       // no per-negative weights
             DEFAULT_VERIFIER_THRESHOLD, // mahbot-853: lowered from 0.6 for streaming inference.
             L2_LAMBDA,                  // L2 regularization (mahbot-854: 0.01)
@@ -2217,9 +2210,10 @@ mod tests {
         // accept any speech because it was trained only on N(0,1) noise).
         let mut rng = StdRng::seed_from_u64(99);
         let positives: Vec<Vec<f32>> = (0..30).map(|_| make_positive_embedding(&mut rng)).collect();
+        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
 
         let verifier = VoiceVerifier::train_with_synthetic_negatives(
-            &positives,
+            &[pos_seq],
             DEFAULT_VERIFIER_THRESHOLD,
             None,
         );
@@ -2274,10 +2268,12 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let positives: Vec<Vec<f32>> = (0..10).map(|_| make_positive_embedding(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..10).map(|_| make_negative_embedding(&mut rng)).collect();
+        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
+        let neg_seq = make_seq(negatives, crate::embedding_sequence::LabelStratum::Negative);
 
         let verifier = VoiceVerifier::train(
-            &positives,
-            &negatives,
+            &[pos_seq],
+            &[neg_seq],
             None, // no per-negative weights
             DEFAULT_VERIFIER_THRESHOLD,
             0.001,
@@ -2425,10 +2421,12 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let positives: Vec<Vec<f32>> = (0..30).map(|_| make_positive_frame(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..50).map(|_| make_negative_frame(&mut rng)).collect();
+        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
+        let neg_seq = make_seq(negatives, crate::embedding_sequence::LabelStratum::Negative);
 
         let verifier = VoiceVerifier::train_inner(
-            &positives,
-            &negatives,
+            &[pos_seq],
+            &[neg_seq],
             None,
             DEFAULT_VERIFIER_THRESHOLD,
             L2_LAMBDA,
@@ -2681,8 +2679,9 @@ mod tests {
     fn test_train_with_synthetic_negatives_basic() {
         let mut rng = StdRng::seed_from_u64(42);
         let positives: Vec<Vec<f32>> = (0..30).map(|_| make_positive_embedding(&mut rng)).collect();
+        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
         let verifier = VoiceVerifier::train_with_synthetic_negatives(
-            &positives,
+            &[pos_seq],
             DEFAULT_VERIFIER_THRESHOLD,
             None,
         );
@@ -2927,10 +2926,12 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let positives: Vec<Vec<f32>> = (0..20).map(|_| make_positive_embedding(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..30).map(|_| make_negative_embedding(&mut rng)).collect();
+        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
+        let neg_seq = make_seq(negatives, crate::embedding_sequence::LabelStratum::Negative);
 
         let verifier = VoiceVerifier::train(
-            &positives,
-            &negatives,
+            &[pos_seq],
+            &[neg_seq],
             None,
             DEFAULT_VERIFIER_THRESHOLD,
             0.001,
@@ -3015,9 +3016,11 @@ mod tests {
     #[test]
     fn test_verifier_empty_training_returns_untrained() {
         // No positive examples → should return untrained.
+        let neg_embs = vec![vec![0.0; VERIFIER_INPUT_DIM]];
+        let neg_seq = make_seq(neg_embs, crate::embedding_sequence::LabelStratum::Negative);
         let verifier = VoiceVerifier::train(
             &[],
-            &[vec![0.0; VERIFIER_INPUT_DIM]],
+            &[neg_seq],
             None,
             DEFAULT_VERIFIER_THRESHOLD,
             0.001,
@@ -3035,11 +3038,13 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(12345);
         let positives: Vec<Vec<f32>> = (0..10).map(|_| make_positive_embedding(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..10).map(|_| make_negative_embedding(&mut rng)).collect();
+        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
+        let neg_seq = make_seq(negatives, crate::embedding_sequence::LabelStratum::Negative);
 
         let seed = 42;
         let v1 = VoiceVerifier::train(
-            &positives,
-            &negatives,
+            &[pos_seq.clone()],
+            &[neg_seq.clone()],
             None,
             DEFAULT_VERIFIER_THRESHOLD,
             0.001,
@@ -3048,8 +3053,8 @@ mod tests {
             Some(seed),
         );
         let v2 = VoiceVerifier::train(
-            &positives,
-            &negatives,
+            &[pos_seq],
+            &[neg_seq],
             None,
             DEFAULT_VERIFIER_THRESHOLD,
             0.001,
@@ -3278,5 +3283,146 @@ mod tests {
                 pooled[i],
             );
         }
+    }
+
+    // ── EmbeddingSequence cross-boundary tests (mahbot-902) ────────────────
+    // These verify that training operates on per-sequence windows only, never
+    // combining frames from different sequences.
+
+    #[test]
+    fn test_verifier_no_cross_utterance_windows() {
+        // Two sequences (positive + negative) each shorter than
+        // VERIFIER_WINDOW_SIZE (3) → 0 windows from each, but they're in
+        // the same training call.  No cross-sequence window should exist
+        // (the old combined-flat-list approach would create one window
+        // spanning the boundary between them).
+        let embs1: Vec<Vec<f32>> = (0..2)
+            .map(|i| vec![0.5 + i as f32; EMBEDDING_DIM])
+            .collect();
+        let embs2: Vec<Vec<f32>> = (0..2)
+            .map(|i| vec![-0.5 - i as f32; EMBEDDING_DIM])
+            .collect();
+        let pos_seq = make_seq(embs1, crate::embedding_sequence::LabelStratum::Positive);
+        let neg_seq = make_seq(embs2, crate::embedding_sequence::LabelStratum::Negative);
+
+        // With per-sequence windowing, each sequence has 2 frames < 3 → 0 windows each
+        // → train_inner gets 0 positive windows + 0 negative windows → untrained.
+        let verifier = VoiceVerifier::train(
+            &[pos_seq],
+            &[neg_seq],
+            None,
+            DEFAULT_VERIFIER_THRESHOLD,
+            L2_LAMBDA,
+            LEARNING_RATE,
+            MAX_ITER,
+            Some(42),
+        );
+        assert!(
+            !verifier.is_trained(),
+            "Cross-sequence boundary window eliminated — each sequence < WINDOW_SIZE"
+        );
+    }
+
+    #[test]
+    fn test_verifier_train_sequences() {
+        // Two positive sequences + two negative sequences each with enough
+        // frames to form windows → trained verifier accepts positives and
+        // rejects negatives.
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // Positive sequence 1: 5 frames → 3 stride-1 windows
+        let pos1: Vec<Vec<f32>> = (0..5).map(|_| make_positive_embedding(&mut rng)).collect();
+        // Positive sequence 2: 5 frames → 3 stride-1 windows
+        let pos2: Vec<Vec<f32>> = (0..5).map(|_| make_positive_embedding(&mut rng)).collect();
+        // Negative sequence 1: 5 frames → 3 stride-1 windows
+        let neg1: Vec<Vec<f32>> = (0..5).map(|_| make_negative_embedding(&mut rng)).collect();
+        // Negative sequence 2: 5 frames → 3 stride-1 windows
+        let neg2: Vec<Vec<f32>> = (0..5).map(|_| make_negative_embedding(&mut rng)).collect();
+
+        let pos_seqs = [
+            make_seq(pos1, crate::embedding_sequence::LabelStratum::Positive),
+            make_seq(pos2, crate::embedding_sequence::LabelStratum::Positive),
+        ];
+        let neg_seqs = [
+            make_seq(neg1, crate::embedding_sequence::LabelStratum::Negative),
+            make_seq(neg2, crate::embedding_sequence::LabelStratum::Negative),
+        ];
+
+        let verifier = VoiceVerifier::train(
+            &pos_seqs,
+            &neg_seqs,
+            None, // no per-negative weights
+            DEFAULT_VERIFIER_THRESHOLD,
+            L2_LAMBDA,
+            LEARNING_RATE,
+            MAX_ITER,
+            Some(42),
+        );
+
+        assert!(
+            verifier.is_trained(),
+            "Multi-sequence verifier must be trained"
+        );
+
+        // Verify held-out positive and negative.
+        let held_out_pos = make_positive_embedding(&mut rng);
+        let score_pos = verifier.predict(&held_out_pos);
+        assert!(
+            score_pos >= 0.5,
+            "Verifier should accept positive embedding (score >= 0.5), got score={score_pos:.4}",
+        );
+
+        let held_out_neg = make_negative_embedding(&mut rng);
+        let score_neg = verifier.predict(&held_out_neg);
+        assert!(
+            score_neg < 0.5,
+            "Verifier should reject negative embedding (score < 0.5), got score={score_neg:.4}",
+        );
+    }
+
+    #[test]
+    fn test_verifier_train_with_cache_sequences() {
+        // Simulates production cache path: confusable + unrelated + synthetic
+        // negatives as separate sequences with per-sequence weight tiers.
+        let mut rng = StdRng::seed_from_u64(42);
+        let positives: Vec<Vec<f32>> = (0..20).map(|_| make_positive_embedding(&mut rng)).collect();
+        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
+
+        // Three negative sequences simulating confusable, unrelated, synthetic
+        let neg_confusable: Vec<Vec<f32>> =
+            (0..10).map(|_| make_negative_embedding(&mut rng)).collect();
+        let neg_unrelated: Vec<Vec<f32>> =
+            (0..10).map(|_| make_negative_embedding(&mut rng)).collect();
+        let neg_synthetic: Vec<Vec<f32>> =
+            (0..10).map(|_| make_negative_embedding(&mut rng)).collect();
+
+        let conf_seq = make_seq(
+            neg_confusable,
+            crate::embedding_sequence::LabelStratum::Negative,
+        );
+        let unrel_seq = make_seq(
+            neg_unrelated,
+            crate::embedding_sequence::LabelStratum::Negative,
+        );
+        let synth_seq = make_seq(
+            neg_synthetic,
+            crate::embedding_sequence::LabelStratum::Negative,
+        );
+
+        // Per-sequence weights: confusable=3.0, unrelated=2.0, synthetic=1.0
+        let per_neg_weights = vec![3.0, 2.0, 1.0];
+
+        let verifier = VoiceVerifier::train(
+            &[pos_seq],
+            &[conf_seq, unrel_seq, synth_seq],
+            Some(&per_neg_weights),
+            DEFAULT_VERIFIER_THRESHOLD,
+            L2_LAMBDA,
+            LEARNING_RATE,
+            MAX_ITER,
+            Some(42),
+        );
+
+        assert!(verifier.is_trained());
     }
 }

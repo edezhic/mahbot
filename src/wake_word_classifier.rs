@@ -29,6 +29,10 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use crate::embedding_sequence::EmbeddingSequence;
+
+#[cfg(test)]
+use crate::embedding_sequence::LabelStratum;
 use crate::voice_verifier::EMBEDDING_DIM;
 
 // ── Constants ────────────────────────────────────────────────────────────
@@ -672,19 +676,21 @@ impl Default for TrainingConfig {
     }
 }
 
-fn build_windows(embs: &[Vec<f32>]) -> Vec<Vec<f32>> {
-    if embs.len() < WINDOW_SIZE {
-        return vec![];
-    }
-    (0..=(embs.len() - WINDOW_SIZE))
-        .map(|i| {
+fn build_windows(sequences: &[EmbeddingSequence]) -> Vec<Vec<f32>> {
+    let mut windows = Vec::new();
+    for seq in sequences {
+        if seq.embeddings.len() < WINDOW_SIZE {
+            continue;
+        }
+        for i in 0..=(seq.embeddings.len() - WINDOW_SIZE) {
             let mut w = Vec::with_capacity(INPUT_DIM);
             for j in 0..WINDOW_SIZE {
-                w.extend_from_slice(&embs[i + j]);
+                w.extend_from_slice(&seq.embeddings[i + j]);
             }
-            w
-        })
-        .collect()
+            windows.push(w);
+        }
+    }
+    windows
 }
 
 struct AdamState {
@@ -715,12 +721,12 @@ impl AdamState {
 
 /// Train the classifier using pure-Rust backprop + Adam.
 pub fn train_classifier(
-    pos: &[Vec<f32>],
-    neg: &[Vec<f32>],
+    pos_sequences: &[EmbeddingSequence],
+    neg_sequences: &[EmbeddingSequence],
     cfg: &TrainingConfig,
 ) -> Result<ClassifierTrainingResult> {
-    let pos_w = build_windows(pos);
-    let neg_w = build_windows(neg);
+    let pos_w = build_windows(pos_sequences);
+    let neg_w = build_windows(neg_sequences);
     anyhow::ensure!(pos_w.len() + neg_w.len() >= 2, "Need ≥2 training windows");
 
     // Class-balanced weights
@@ -1340,10 +1346,24 @@ mod tests {
         assert!((score - 0.5).abs() < 1e-4, "Expected 0.5, got {score}");
     }
 
+    fn make_seq(embs: Vec<Vec<f32>>, label: LabelStratum) -> EmbeddingSequence {
+        EmbeddingSequence {
+            id: crate::embedding_sequence::UtteranceId {
+                sequence_index: 0,
+                variant_index: 0,
+            },
+            source: crate::embedding_sequence::Source::Enrollment,
+            augmentation_family: None,
+            label_stratum: label,
+            embeddings: embs,
+        }
+    }
+
     #[test]
     fn test_build_windows_basic() {
         let embs: Vec<Vec<f32>> = (0..5).map(|i| vec![i as f32; EMBEDDING_DIM]).collect();
-        assert_eq!(build_windows(&embs).len(), 3);
+        let seq = make_seq(embs, LabelStratum::Positive);
+        assert_eq!(build_windows(&[seq]).len(), 3);
     }
     #[test]
     fn test_build_windows_empty() {
@@ -1352,7 +1372,62 @@ mod tests {
     #[test]
     fn test_build_windows_short() {
         let embs: Vec<Vec<f32>> = (0..2).map(|i| vec![i as f32; EMBEDDING_DIM]).collect();
-        assert!(build_windows(&embs).is_empty());
+        let seq = make_seq(embs, LabelStratum::Positive);
+        assert!(build_windows(&[seq]).is_empty());
+    }
+
+    #[test]
+    fn test_build_windows_sequences_no_cross() {
+        // Two sequences each shorter than WINDOW_SIZE → 0 windows
+        // (no cross-sequence combination allowed).
+        let embs1: Vec<Vec<f32>> = (0..2).map(|i| vec![i as f32; EMBEDDING_DIM]).collect();
+        let embs2: Vec<Vec<f32>> = (0..2)
+            .map(|i| vec![(i + 10) as f32; EMBEDDING_DIM])
+            .collect();
+        let seqs = [
+            make_seq(embs1, LabelStratum::Positive),
+            make_seq(embs2, LabelStratum::Positive),
+        ];
+        assert!(build_windows(&seqs).is_empty());
+    }
+
+    #[test]
+    fn test_build_windows_two_sequences() {
+        // Two sequences each exactly WINDOW_SIZE → 2 windows (1 per sequence).
+        let embs1: Vec<Vec<f32>> = (0..WINDOW_SIZE)
+            .map(|i| vec![i as f32; EMBEDDING_DIM])
+            .collect();
+        let embs2: Vec<Vec<f32>> = (0..WINDOW_SIZE)
+            .map(|i| vec![(i + 100) as f32; EMBEDDING_DIM])
+            .collect();
+        let seqs = [
+            make_seq(embs1, LabelStratum::Positive),
+            make_seq(embs2, LabelStratum::Positive),
+        ];
+        assert_eq!(build_windows(&seqs).len(), 2);
+    }
+
+    #[test]
+    fn test_embedding_sequence_metadata_preserved() {
+        let embs: Vec<Vec<f32>> = (0..5).map(|i| vec![i as f32; EMBEDDING_DIM]).collect();
+        let seq = EmbeddingSequence {
+            id: crate::embedding_sequence::UtteranceId {
+                sequence_index: 1,
+                variant_index: 2,
+            },
+            source: crate::embedding_sequence::Source::Augmentation,
+            augmentation_family: Some(crate::embedding_sequence::AugmentationFamily::Noise),
+            label_stratum: LabelStratum::Positive,
+            embeddings: embs,
+        };
+        assert_eq!(seq.id.sequence_index, 1);
+        assert_eq!(seq.id.variant_index, 2);
+        assert_eq!(seq.source, crate::embedding_sequence::Source::Augmentation);
+        assert_eq!(
+            seq.augmentation_family,
+            Some(crate::embedding_sequence::AugmentationFamily::Noise)
+        );
+        assert_eq!(seq.label_stratum, LabelStratum::Positive);
     }
 
     #[test]
@@ -1451,18 +1526,21 @@ mod tests {
         // 100 windows each = 300 embeddings (WINDOW_SIZE per window).
         let n_wins = 100;
         let n_embs = n_wins * WINDOW_SIZE;
-        let pos: Vec<Vec<f32>> = (0..n_embs).map(|_| make_emb(0.3, 0.4)).collect();
-        let neg: Vec<Vec<f32>> = (0..n_embs).map(|_| make_emb(-0.3, 0.4)).collect();
+        let pos_embs: Vec<Vec<f32>> = (0..n_embs).map(|_| make_emb(0.3, 0.4)).collect();
+        let neg_embs: Vec<Vec<f32>> = (0..n_embs).map(|_| make_emb(-0.3, 0.4)).collect();
+        // Each set is a single sequence to keep the window count the same.
+        let pos_seqs = [make_seq(pos_embs, LabelStratum::Positive)];
+        let neg_seqs = [make_seq(neg_embs, LabelStratum::Negative)];
 
         let cfg = TrainingConfig {
             max_epochs: 50,
             ..Default::default()
         };
-        let result = train_classifier(&pos, &neg, &cfg).unwrap();
+        let result = train_classifier(&pos_seqs, &neg_seqs, &cfg).unwrap();
         let classifier = WakeWordClassifier::new_ensemble(result.weights);
         // Evaluate on the windows produced by build_windows — same path
         // that train_classifier uses internally.
-        for win in build_windows(&pos) {
+        for win in build_windows(&pos_seqs) {
             let embs: Vec<Vec<f32>> = (0..WINDOW_SIZE)
                 .map(|t| {
                     let start = t * EMBEDDING_DIM;
@@ -1475,7 +1553,7 @@ mod tests {
                 "Positive window should score >0.8, got {score}"
             );
         }
-        for win in build_windows(&neg) {
+        for win in build_windows(&neg_seqs) {
             let embs: Vec<Vec<f32>> = (0..WINDOW_SIZE)
                 .map(|t| {
                     let start = t * EMBEDDING_DIM;

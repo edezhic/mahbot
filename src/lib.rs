@@ -21,6 +21,7 @@ pub mod config_db;
 pub mod debug;
 pub(crate) mod diff_parse;
 pub(crate) mod embedder;
+pub(crate) mod embedding_sequence;
 pub(crate) mod extraction;
 pub(crate) mod git_commands;
 pub mod gui;
