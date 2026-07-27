@@ -190,6 +190,55 @@ const MAX_DOWNLOAD_RETRIES: u32 = 10;
 /// for [`PersistedModel::phrase`] via [`default_phrase`].
 pub(crate) const DEFAULT_WAKE_WORD_PHRASE: &str = "mahbot";
 
+/// Returns `true` if `phrase` (already normalized via [`normalize_phrase`]) is
+/// the Mahbot wake word or its "hey" variant.
+///
+/// Only these two exact forms trigger Mahbot-specific confusable inclusion
+/// (mahbot-909).  Unnormalized input, diacritics ("mähbot"), partial-word
+/// matches ("mahbotics"), or other variants return `false`.
+///
+/// # Quality implications for non-Mahbot wake words
+///
+/// When the enrolled wake word is not "mahbot" or "hey mahbot", the
+/// Mahbot-specific confusable phrases ([`CONFUSABLE_PHRASES`]) are excluded
+/// from both classifier and verifier training. The model trains on ambient
+/// negatives and general-purpose unrelated speech ([`UNRELATED_PHRASES`])
+/// only.
+///
+/// This is a **known quality regression** for non-Mahbot phrases — ambient-only
+/// negatives do not teach the model to reject phonetic near-misses (e.g., "pay
+/// mabot" sounds similar to "hey mahbot"). The verifier will likely false-accept
+/// more wake-word-like sounds until a general-purpose phonetic near-miss generator
+/// is implemented (future work, mahbot-909 scope note).
+///
+/// Additionally, the ~2-minute TTS prewarm of confusable embeddings runs on every
+/// startup regardless of the enrolled phrase (accepted technical debt — see
+/// [`prewarm_confusable_embeddings`]). A future deferred-generation approach could
+/// eliminate this waste by generating confusables on demand at enrollment time.
+///
+/// # Normalization contract
+///
+/// The caller MUST pass a phrase already processed by [`normalize_phrase`].
+/// Passing unnormalized input (mixed case, extra whitespace) produces `false`
+/// even when the semantic intent matches:
+///
+/// ```ignore
+/// // These pass (normalized input):
+/// assert!(is_mahbot_wake_word("mahbot"));
+/// assert!(is_mahbot_wake_word("hey mahbot"));
+/// // These would be false because they are not normalized:
+/// assert!(!is_mahbot_wake_word("Mahbot"));       // different case
+/// assert!(!is_mahbot_wake_word("HEY MAHBOT"));   // different case
+/// ```
+///
+/// In practice this contract is always satisfied because the only production
+/// call site reads from `enrolling_phrase`, which is normalized at enrollment
+/// start (see [`PipelineCtx::handle_start_enrollment`], line ~5153).
+#[must_use]
+fn is_mahbot_wake_word(phrase: &str) -> bool {
+    phrase == DEFAULT_WAKE_WORD_PHRASE || phrase == "hey mahbot"
+}
+
 /// Expected SHA256 hashes for model files.
 const MEL_MODEL_SHA256: &str = "ba2b0e0f8b7b875369a2c89cb13360ff53bac436f2895cced9f479fa65eb176f";
 const EMBED_MODEL_SHA256: &str = "70d164290c1d095d1d4ee149bc5e00543250a7316b59f31d056cff7bd3075c1f";
@@ -5886,6 +5935,26 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                 .negative_audio_chunks
                 .clear();
         }
+
+        // ── Read wake word phrase for confusable gating (mahbot-909) ──
+        // Read once and reuse across both classifier and verifier paths.
+        // The phrase was normalized at enrollment start (see
+        // PipelineCtx::handle_start_enrollment, line ~5153).
+        let enrolled_phrase = voice_state()
+            .read()
+            .unwrap_poison()
+            .enrolling_phrase
+            .clone()
+            .unwrap_or_else(|| DEFAULT_WAKE_WORD_PHRASE.to_string());
+        let use_mahbot_confusables = is_mahbot_wake_word(&enrolled_phrase);
+        if !use_mahbot_confusables {
+            info!(
+                "Skipping Mahbot-specific confusable phrases for wake word \
+                 '{enrolled_phrase}' (mahbot-909); see is_mahbot_wake_word() \
+                 docs for quality implications",
+            );
+        }
+
         // ── Build positive sequences for classifier training ──
         // Combines BOTH old-style dense-stride (rich learning signal) and
         // streaming-pipeline (inference distribution match) embeddings,
@@ -5916,9 +5985,10 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
             );
             neg_sequences.extend(streaming_negative_sequences.clone()); // clone — used again for verifier
         }
-        if !confusable_dense.is_empty() {
+        if use_mahbot_confusables && !confusable_dense.is_empty() {
             info!(
-                "Adding {} confusable dense sequences to classifier negative set (mahbot-878)",
+                "Adding {} confusable dense sequences to classifier negative set \
+                 for Mahbot wake word '{enrolled_phrase}' (mahbot-909)",
                 confusable_dense.len(),
             );
             neg_sequences.extend_from_slice(confusable_dense);
@@ -5948,13 +6018,8 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                     .weights
                     .first()
                     .map_or(0, ClassifierWeights::param_count);
-                // Read the phrase that was set at enrollment start
-                let enrolled_phrase = voice_state()
-                    .read()
-                    .unwrap_poison()
-                    .enrolling_phrase
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_WAKE_WORD_PHRASE.to_string());
+                // enrolled_phrase and use_mahbot_confusables are already
+                // in scope from the confusable gating block above (mahbot-909).
                 info!(
                     "Enrollment complete: wake word '{}' (ensemble of {} models, \
                                  {} params each, {} epochs, best val loss={:.4})",
@@ -5990,7 +6055,11 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
         // unrelated speech embeddings for verifier training (mahbot-859, mahbot-872).
         let confusable_embs = confusable_negative_embeddings();
         let unrelated_embs = unrelated_negative_embeddings();
-        let n_confusable_pre = confusable_embs.len();
+        let n_confusable_pre = if use_mahbot_confusables {
+            confusable_embs.len()
+        } else {
+            0
+        };
         let n_unrelated_pre = unrelated_embs.len();
         let n_ambient_pre = streaming_negative_sequences.len();
         // Build negative sequences: ambient (per-chunk) → unrelated → confusable.
@@ -6012,10 +6081,11 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                 );
                 neg.extend_from_slice(unrelated_embs);
             }
-            if !confusable_embs.is_empty() {
+            if use_mahbot_confusables && !confusable_embs.is_empty() {
                 info!(
                     "Adding {} pre-computed confusable phrase streaming \
-                             sequences to verifier negative set (mahbot-859)",
+                             sequences to verifier negative set for Mahbot wake word \
+                             '{enrolled_phrase}' (mahbot-909)",
                     confusable_embs.len(),
                 );
                 neg.extend_from_slice(confusable_embs);
@@ -10772,6 +10842,32 @@ mod tests {
         assert_eq!(normalize_phrase(""), DEFAULT_WAKE_WORD_PHRASE);
         assert_eq!(normalize_phrase("   "), DEFAULT_WAKE_WORD_PHRASE);
         assert_eq!(normalize_phrase("\t\n"), DEFAULT_WAKE_WORD_PHRASE);
+    }
+
+    // ── Mahbot wake word detection tests (mahbot-909) ─────────────────
+
+    #[test]
+    fn is_mahbot_wake_word_accepts_exact_matches() {
+        // Normalized forms that match the Mahbot wake word.
+        assert!(is_mahbot_wake_word("mahbot"));
+        assert!(is_mahbot_wake_word("hey mahbot"));
+
+        // Non-Mahbot wake words (normalized).
+        assert!(!is_mahbot_wake_word("hey jarvis"));
+        assert!(!is_mahbot_wake_word("ok computer"));
+        assert!(!is_mahbot_wake_word("alexa"));
+        assert!(!is_mahbot_wake_word(""));
+
+        // Diacritics, partial-word matches, and other edge cases.
+        // Note: these are already-normalized inputs. The caller must
+        // normalize via normalize_phrase() first, which lowercases and
+        // trims — so "Mahbot" would never reach this function.
+        // These assertions document the intentional boundaries:
+        assert!(!is_mahbot_wake_word("mähbot")); // diacritic
+        assert!(!is_mahbot_wake_word("mahbotics")); // partial-word match
+        assert!(!is_mahbot_wake_word("mah-bot")); // hyphenated
+        assert!(!is_mahbot_wake_word("ma hbot")); // whitespace variant
+        assert!(!is_mahbot_wake_word("hey mah")); // truncated
     }
 
     // ── Wake word phrase state machine tests ──────────────────────────────
