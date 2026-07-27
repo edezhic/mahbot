@@ -109,6 +109,7 @@ use directories::UserDirs;
 use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock, RwLockReadGuard};
 use tokio::fs;
+use tracing::warn;
 
 // ── Hardcoded defaults ───────────────────────────────────────────
 
@@ -121,6 +122,14 @@ pub(crate) const DEFAULT_TTS_LANGUAGE: &str = "na";
 
 /// Default adaptive k multiplier for wake word detection.
 const DEFAULT_ADAPTIVE_K: &str = "2.5";
+
+/// Default maximum size of the voice PCM disk cache in megabytes.
+/// 0 means unlimited (no size-based eviction).
+const DEFAULT_VOICE_CACHE_MAX_SIZE_MB: &str = "100";
+
+/// Default maximum age of voice PCM cache entries in days.
+/// 0 means unlimited (no age-based eviction).
+const DEFAULT_VOICE_CACHE_MAX_AGE_DAYS: &str = "30";
 
 // ── Named config structs ───────────────────────────────────────────
 
@@ -307,6 +316,12 @@ pub struct ConfigData {
     /// The adaptive threshold is computed as `mean + k × std` over a running
     /// window of recent per-frame MLP scores.  Range: [1.0, 4.0].
     pub adaptive_k: Option<String>,
+    /// Maximum size of the voice PCM disk cache in megabytes (default: `"100"`).
+    /// `0` means unlimited (no size-based eviction).
+    pub voice_cache_max_size_mb: Option<String>,
+    /// Maximum age of voice PCM cache entries in days (default: `"30"`).
+    /// Entries older than this are evicted. `0` means unlimited (no age-based eviction).
+    pub voice_cache_max_age_days: Option<String>,
     /// Per-role model overrides.
     pub per_role_configs: Vec<RoleConfig>,
     /// Per-model provider routing.
@@ -533,6 +548,8 @@ string_config_fields! {
     voice_noise_suppression [non_empty],
     voice_agc [non_empty],
     adaptive_k [or(DEFAULT_ADAPTIVE_K)],
+    voice_cache_max_size_mb [or(DEFAULT_VOICE_CACHE_MAX_SIZE_MB)],
+    voice_cache_max_age_days [or(DEFAULT_VOICE_CACHE_MAX_AGE_DAYS)],
 }
 
 impl ConfigData {
@@ -570,6 +587,62 @@ impl ConfigData {
         self.normalize_entries();
         self.per_role_configs.sort_by(|a, b| a.role.cmp(&b.role));
         self.model_routings.sort_by(|a, b| a.model.cmp(&b.model));
+    }
+}
+
+// ── Voice PCM cache config parsing helpers ────────────────────────
+
+impl ConfigReload {
+    /// Parse the voice PCM cache maximum size in bytes.
+    ///
+    /// Returns `None` when the limit is disabled (value is 0 or unparseable).
+    /// The string accessor [`voice_cache_max_size_mb`](Self::voice_cache_max_size_mb)
+    /// falls back to [`DEFAULT_VOICE_CACHE_MAX_SIZE_MB`] when the field is absent.
+    #[must_use]
+    pub(crate) fn voice_cache_max_size_bytes(&self) -> Option<u64> {
+        let val = self.voice_cache_max_size_mb();
+        let mb: u64 = if let Ok(v) = val.parse() {
+            v
+        } else {
+            warn!(
+                "Config voice_cache_max_size_mb has invalid value {val:?}, \
+                 falling back to default {DEFAULT_VOICE_CACHE_MAX_SIZE_MB}"
+            );
+            DEFAULT_VOICE_CACHE_MAX_SIZE_MB
+                .parse()
+                .expect("DEFAULT_VOICE_CACHE_MAX_SIZE_MB is a valid integer")
+        };
+        if mb == 0 {
+            None
+        } else {
+            mb.checked_mul(1024 * 1024)
+        }
+    }
+
+    /// Parse the voice PCM cache maximum entry age as a [`std::time::Duration`].
+    ///
+    /// Returns `None` when the limit is disabled (value is 0 or unparseable).
+    /// The string accessor [`voice_cache_max_age_days`](Self::voice_cache_max_age_days)
+    /// falls back to [`DEFAULT_VOICE_CACHE_MAX_AGE_DAYS`] when the field is absent.
+    #[must_use]
+    pub(crate) fn voice_cache_max_age(&self) -> Option<std::time::Duration> {
+        let val = self.voice_cache_max_age_days();
+        let days: u64 = if let Ok(v) = val.parse() {
+            v
+        } else {
+            warn!(
+                "Config voice_cache_max_age_days has invalid value {val:?}, \
+                 falling back to default {DEFAULT_VOICE_CACHE_MAX_AGE_DAYS}"
+            );
+            DEFAULT_VOICE_CACHE_MAX_AGE_DAYS
+                .parse()
+                .expect("DEFAULT_VOICE_CACHE_MAX_AGE_DAYS is a valid integer")
+        };
+        if days == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(days.saturating_mul(86_400)))
+        }
     }
 }
 

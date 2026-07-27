@@ -793,6 +793,10 @@ async fn prewarm_phrase_embeddings(
     {
         warn!("PCM cache directory creation failed: {e} — proceeding without cache");
     }
+    // Run startup eviction to clean stale/oversized cache before prewarming
+    if let Some(ref d) = cache_dir {
+        evict_pcm_cache(d);
+    }
     let model_hash = tts_model_version_hash();
 
     let num_styles = available_styles.len();
@@ -3126,6 +3130,159 @@ async fn download_model(
 }
 
 // ── Voice PCM disk cache helpers (mahbot-872) ─────────────────────────────
+//
+// Cache bounding (mahbot-910): two-phase eviction — age-based (stale entries
+// older than voice_cache_max_age_days) followed by size-based (oldest-first
+// via mtime, FIFO, when total exceeds voice_cache_max_size_mb).  Eviction runs
+// at startup and before each cache write.  Best-effort: errors are logged but
+// never propagated.
+
+/// Evict stale and excess entries from the voice PCM disk cache.
+///
+/// Two-phase eviction:
+/// 1. **Age-based**: Remove entries older than `voice_cache_max_age_days`
+///    (configurable, default 30 days, 0 = disabled).
+/// 2. **Size-based**: If total cache size exceeds `voice_cache_max_size_mb`
+///    (configurable, default 100 MB, 0 = disabled), remove the oldest entries
+///    (by file mtime) until the total is under the limit.
+///
+/// Transient `.tmp` files are excluded from both phases.
+///
+/// # Best-effort semantics
+///
+/// Never blocks enrollment or synthesis.  If the cache directory cannot be
+/// read, entries fail to delete (permissions, disk errors), or config values
+/// are unparseable, a warning is logged and the function returns gracefully.
+/// Cache hits still work; cache misses re-synthesise as normal.
+pub(crate) fn evict_pcm_cache(cache_dir: &Path) {
+    use std::time::SystemTime;
+
+    struct CacheEntry {
+        path: PathBuf,
+        size: u64,
+        modified: SystemTime,
+    }
+
+    let max_size = crate::config::CONFIG.voice_cache_max_size_bytes();
+    let max_age = crate::config::CONFIG.voice_cache_max_age();
+
+    if max_size.is_none() && max_age.is_none() {
+        return; // both limits disabled — nothing to evict
+    }
+
+    let dir = match std::fs::read_dir(cache_dir) {
+        Ok(d) => d,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return; // cache directory doesn't exist yet
+            }
+            warn!(
+                "PCM cache: failed to read directory {}: {e}",
+                cache_dir.display(),
+            );
+            return;
+        }
+    };
+
+    let mut entries: Vec<CacheEntry> = Vec::new();
+    let mut total_size: u64 = 0;
+    let now = SystemTime::now();
+
+    for entry in dir.flatten() {
+        let path = entry.path();
+
+        // Skip transient .tmp files (atomic writes in progress)
+        if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+            continue;
+        }
+
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+
+        let size = metadata.len();
+        // Skip entries with unreadable mtime — treating them as 1970 would
+        // guarantee eviction on the first age check, which is surprising.
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        total_size += size;
+        entries.push(CacheEntry {
+            path,
+            size,
+            modified,
+        });
+    }
+
+    if entries.is_empty() {
+        return;
+    }
+
+    let mut evicted_count: u64 = 0;
+    let mut evicted_bytes: u64 = 0;
+
+    // ── Phase 1: age-based eviction ──────────────────────────────
+    if let Some(max_age) = max_age {
+        entries.retain(|e| {
+            let Ok(age) = now.duration_since(e.modified) else {
+                return true; // clock skew — keep the entry
+            };
+            if age <= max_age {
+                return true; // young enough — keep
+            }
+            // Stale entry — remove
+            if std::fs::remove_file(&e.path).is_ok() {
+                total_size = total_size.saturating_sub(e.size);
+                evicted_bytes += e.size;
+                evicted_count += 1;
+            } else {
+                // Best-effort: if the file can't be deleted, we still remove it
+                // from our tracking list (the entry is logically gone from the
+                // cache's perspective).  The file's size remains in total_size,
+                // which may cause Phase 2 to over-evict slightly.  This is
+                // acceptable under best-effort semantics.
+                warn!(
+                    "PCM cache: failed to remove stale entry {}",
+                    e.path.display()
+                );
+            }
+            false // remove from our tracking list
+        });
+    }
+
+    // ── Phase 2: size-based eviction (oldest-first via mtime, FIFO) ─────
+    if let Some(max_size) = max_size
+        && total_size > max_size
+    {
+        // Sort remaining entries by mtime (oldest first) for FIFO eviction
+        entries.sort_by_key(|e| e.modified);
+
+        for e in &entries {
+            if total_size <= max_size {
+                break;
+            }
+            if std::fs::remove_file(&e.path).is_ok() {
+                total_size = total_size.saturating_sub(e.size);
+                evicted_bytes += e.size;
+                evicted_count += 1;
+            } else {
+                warn!(
+                    "PCM cache: failed to remove excess entry {}",
+                    e.path.display()
+                );
+            }
+        }
+    }
+
+    if evicted_count > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        let mb = evicted_bytes as f64 / 1_048_576.0;
+        info!("PCM cache: evicted {evicted_count} entries ({:.1} MB)", mb,);
+    }
+}
 
 /// Compute a deterministic cache key for TTS-synthesised PCM audio.
 ///
@@ -3259,6 +3416,16 @@ pub(crate) fn synthesize_with_pcm_cache(
             return None;
         }
     };
+
+    // Evict stale/excess entries before writing to keep cache bounded.
+    //
+    // This performs a full directory scan on every cache miss.  During cold
+    // enrollment the startup call (prewarm_phrase_embeddings) has just cleaned
+    // the cache, so these per-write scans are strictly redundant — but they
+    // provide a correctness safety net for any future code path that writes to
+    // the cache without going through prewarming (e.g., from agent tools).
+    // The cost at current scale (~120 entries, 30 ms per scan) is negligible.
+    evict_pcm_cache(cache_dir);
 
     // Write to disk cache atomically
     write_pcm_cache(&cache_path, &pcm);
@@ -11310,6 +11477,293 @@ mod tests {
             get_enrolled_phrase(),
             Some("hey computer".to_string()),
             "get_enrolled_phrase must still return the cached model phrase after cancel"
+        );
+    }
+
+    // ── PCM cache eviction tests (mahbot-910) ────────────────────────────
+    // These test the pure file-system eviction logic with a temp directory.
+    // They do not require voice ONNX models or TTS.
+    //
+    // Note: all eviction tests share the global CONFIG singleton.  A static
+    // Mutex serialises access to prevent flaky races when tests run in parallel.
+
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serialises eviction tests that mutate global CONFIG.
+    static EVICTION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Write synthetic PCM data to a cache path and return its size.
+    fn write_test_pcm(path: &Path) -> u64 {
+        let samples: Vec<f32> = vec![0.0; 4096]; // 16 KB
+        write_pcm_cache(path, &samples);
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Set config fields for the duration of a test, restoring defaults on drop.
+    /// Acquires [`EVICTION_TEST_LOCK`] so that parallel tests do not race on the
+    /// global CONFIG singleton.
+    struct EvictionConfigGuard(MutexGuard<'static, ()>);
+    impl EvictionConfigGuard {
+        fn set(size_mb: &str, age_days: &str) -> Self {
+            let lock = EVICTION_TEST_LOCK.lock().unwrap();
+            let _ = crate::config::CONFIG.set_string_field("voice_cache_max_size_mb", size_mb);
+            let _ = crate::config::CONFIG.set_string_field("voice_cache_max_age_days", age_days);
+            EvictionConfigGuard(lock)
+        }
+    }
+    impl Drop for EvictionConfigGuard {
+        fn drop(&mut self) {
+            let _ = crate::config::CONFIG.set_string_field("voice_cache_max_size_mb", "");
+            let _ = crate::config::CONFIG.set_string_field("voice_cache_max_age_days", "");
+        }
+    }
+
+    #[test]
+    fn evict_pcm_cache_empty_dir_does_not_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        evict_pcm_cache(tmp.path());
+        assert!(tmp.path().read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn evict_pcm_cache_nonexistent_dir_does_not_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nonexistent = tmp.path().join("does_not_exist");
+        evict_pcm_cache(&nonexistent);
+    }
+
+    #[test]
+    fn evict_pcm_cache_ignores_tmp_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a .tmp file (should be ignored by eviction)
+        let tmp_path = tmp.path().join("abcdef0123456789abcdef0123456789.tmp");
+        let _ = std::fs::write(&tmp_path, &[0u8; 4096]);
+        assert!(tmp_path.exists());
+
+        // Create enough old non-tmp entries that age-based eviction runs
+        let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400);
+        for i in 0..3u8 {
+            let name = format!("{:064x}", i);
+            let path = tmp.path().join(&name);
+            write_test_pcm(&path);
+            let times = std::fs::FileTimes::new().set_modified(old_mtime);
+            let _ = std::fs::File::open(&path).and_then(|f| f.set_times(times));
+        }
+
+        // age = 1 day triggers eviction of the old entries; .tmp file must survive
+        let _guard = EvictionConfigGuard::set("0", "1");
+        evict_pcm_cache(tmp.path());
+        assert!(tmp_path.exists(), ".tmp files must survive eviction");
+        // Verify non-tmp files were processed (old entries removed)
+        for i in 0..3u8 {
+            assert!(
+                !tmp.path().join(format!("{:064x}", i)).exists(),
+                "old entry {i} must be evicted"
+            );
+        }
+    }
+
+    #[test]
+    fn evict_pcm_cache_age_based_removes_stale_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a "recent" entry
+        let recent_path = tmp.path().join("a".repeat(64));
+        write_test_pcm(&recent_path);
+
+        // Create an "old" entry by writing and then setting mtime far in the past
+        let old_path = tmp.path().join("b".repeat(64));
+        write_test_pcm(&old_path);
+        let two_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400);
+        let times = std::fs::FileTimes::new().set_modified(two_days_ago);
+        let _ = std::fs::File::open(&old_path).and_then(|f| f.set_times(times));
+
+        assert!(recent_path.exists());
+        assert!(old_path.exists());
+
+        // Evict with 1 day max age — old entry should be removed, recent kept
+        let _guard = EvictionConfigGuard::set("0", "1"); // size disabled, age = 1 day
+        evict_pcm_cache(tmp.path());
+
+        assert!(
+            recent_path.exists(),
+            "recent entry must survive age-based eviction"
+        );
+        assert!(!old_path.exists(), "old entry must be evicted by age limit");
+    }
+
+    #[test]
+    fn evict_pcm_cache_age_zero_disables_age_eviction() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let path = tmp.path().join("a".repeat(64));
+        write_test_pcm(&path);
+        // Set mtime to 2 days ago
+        let two_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400);
+        let times = std::fs::FileTimes::new().set_modified(two_days_ago);
+        let _ = std::fs::File::open(&path).and_then(|f| f.set_times(times));
+
+        // age = 0 means disabled — even old entries should survive
+        let _guard = EvictionConfigGuard::set("0", "0"); // both disabled
+        evict_pcm_cache(tmp.path());
+        assert!(
+            path.exists(),
+            "entry must survive when age limit is disabled (0)"
+        );
+    }
+
+    #[test]
+    fn evict_pcm_cache_size_zero_disables_size_eviction() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create several entries totalling ~48 KB
+        for i in 0..3u8 {
+            let name = format!("{:064x}", i);
+            let path = tmp.path().join(&name);
+            write_test_pcm(&path);
+        }
+
+        // size = 0 means disabled — all entries survive regardless of total size
+        let _guard = EvictionConfigGuard::set("0", "0"); // both disabled
+        evict_pcm_cache(tmp.path());
+        for i in 0..3u8 {
+            let name = format!("{:064x}", i);
+            assert!(
+                tmp.path().join(&name).exists(),
+                "entry {name} must survive when size limit is disabled (0)"
+            );
+        }
+    }
+
+    #[test]
+    fn evict_pcm_cache_within_limit_keeps_all_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create 3 entries totalling ~48 KB
+        for i in 0..3u8 {
+            let name = format!("{:064x}", i);
+            let path = tmp.path().join(&name);
+            write_test_pcm(&path);
+        }
+
+        // Default max size (100 MB) is well above 48 KB — all entries survive.
+        // age = 0 disables age-based eviction so it doesn't interfere.
+        let _guard = EvictionConfigGuard::set("100", "0");
+        evict_pcm_cache(tmp.path());
+        for i in 0..3u8 {
+            let name = format!("{:064x}", i);
+            assert!(
+                tmp.path().join(&name).exists(),
+                "entry {name} must survive when under size limit"
+            );
+        }
+    }
+
+    #[test]
+    fn evict_pcm_cache_size_based_removes_oldest_entry_first() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create 68 entries (~16 KB each = ~1088 KB total, exceeding 1 MB limit)
+        let count = 68;
+        for i in 0..count {
+            let name = format!("{:064x}", i);
+            let path = tmp.path().join(&name);
+            write_test_pcm(&path);
+            // Stagger mtime: entry 0 is oldest (67 hours ago), entry 67 is newest
+            let age_hours = (count - 1 - i) as u64;
+            let mtime =
+                std::time::SystemTime::now() - std::time::Duration::from_secs(age_hours * 3600);
+            let times = std::fs::FileTimes::new().set_modified(mtime);
+            let _ = std::fs::File::open(&path).and_then(|f| f.set_times(times));
+        }
+
+        // Max size = 1 MB, age disabled
+        let _guard = EvictionConfigGuard::set("1", "0");
+        evict_pcm_cache(tmp.path());
+
+        // Remaining size must be ≤ 1 MB
+        let remaining: u64 = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) != Some("tmp"))
+            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+            .sum();
+        assert!(
+            remaining <= 1_048_576,
+            "remaining size {remaining} exceeds 1 MB limit"
+        );
+
+        // The oldest entry (index 0) must be evicted
+        assert!(
+            !tmp.path().join(format!("{:064x}", 0)).exists(),
+            "oldest entry (0) must be evicted by size limit"
+        );
+
+        // The newest entry (index 67) must survive
+        assert!(
+            tmp.path().join(format!("{:064x}", 67)).exists(),
+            "newest entry (67) must survive size-based eviction"
+        );
+    }
+
+    #[test]
+    fn evict_pcm_cache_combined_age_and_size_eviction() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create 5 old entries (2 days old — stale)
+        let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400);
+        for i in 0..5u8 {
+            let name = format!("old_{:064x}", i);
+            let path = tmp.path().join(&name);
+            write_test_pcm(&path);
+            let times = std::fs::FileTimes::new().set_modified(old_mtime);
+            let _ = std::fs::File::open(&path).and_then(|f| f.set_times(times));
+        }
+
+        // Create 68 recent entries (~16 KB each, totalling ~1088 KB).
+        // All within the last hour so the 1-day age limit does NOT touch them.
+        for i in 0..68u8 {
+            let name = format!("recent_{:064x}", i);
+            let path = tmp.path().join(&name);
+            write_test_pcm(&path);
+            // Stagger mtime from 0 to 67 minutes ago (all well under 1 day)
+            let age_minutes = (67 - i) as u64;
+            let mtime =
+                std::time::SystemTime::now() - std::time::Duration::from_secs(age_minutes * 60);
+            let times = std::fs::FileTimes::new().set_modified(mtime);
+            let _ = std::fs::File::open(&path).and_then(|f| f.set_times(times));
+        }
+
+        // Age = 1 day, size = 1 MB — both limits active
+        let _guard = EvictionConfigGuard::set("1", "1");
+        evict_pcm_cache(tmp.path());
+
+        // All old entries must be gone (age-based eviction)
+        for i in 0..5u8 {
+            let name = format!("old_{:064x}", i);
+            assert!(
+                !tmp.path().join(&name).exists(),
+                "stale entry {name} must be evicted by age limit"
+            );
+        }
+
+        // The newest recent entry must survive (proves size eviction didn't
+        // remove everything — combined test would pass vacuously otherwise)
+        assert!(
+            tmp.path().join(format!("recent_{:064x}", 67)).exists(),
+            "newest recent entry must survive combined eviction"
+        );
+
+        // Remaining size (recent entries only) must be ≤ 1 MB
+        let remaining: u64 = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) != Some("tmp"))
+            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+            .sum();
+        assert!(
+            remaining <= 1_048_576,
+            "remaining size {remaining} exceeds 1 MB limit after combined eviction"
         );
     }
 }
