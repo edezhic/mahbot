@@ -31,6 +31,7 @@
 
 use crate::ChatDirection;
 use crate::config::CONFIG;
+use crate::turso;
 use crate::util::UnwrapPoison;
 use crate::util::hex_string;
 use crate::vector::cosine_similarity;
@@ -269,7 +270,7 @@ pub(crate) const ENROLLMENT_QUALITY_DURATION_MIN_MS: u64 = 400;
 pub(crate) const ENROLLMENT_QUALITY_DURATION_MAX_MS: u64 = 2000;
 
 /// Fraction of enrollment utterances that must trigger detection in the
-/// informational self-test (non-gating, diagnostic only).
+/// blocking self-test (mahbot-898) — rejects model deployment on failure.
 const ENROLLMENT_QUALITY_SELF_TEST_MIN_FRACTION: f32 = 0.8;
 
 /// Minimum cosine similarity between an utterance's mean embedding and the
@@ -5224,47 +5225,83 @@ pub async fn run_voice_pipeline() {
 
     // Load persisted wake word classifier weights from config on startup
     if let Some(json) = CONFIG.wake_word_templates() {
-        // NOTE: The config key remains "wake_word_templates" for backward
-        // compatibility.  Tries new format first, falls back to old format.
-        // Old format: just ClassifierWeights (or single-object in PersistedModel)
-        // New format: { classifier: Vec<ClassifierWeights>, verifier: VoiceVerifier }
+        // Try PersistedModel format (handles both new versioned and legacy
+        // single-object classifier via custom deserializer, mahbot-898).
+        let loaded = if let Ok(mut model) = serde_json::from_str::<PersistedModel>(&json) {
+            // ── Legacy migration (schema_version == 0) ──────────────
+            // If the loaded model has no schema_version (pre-v1 format),
+            // migrate it in-memory.  Persist is deferred until after the
+            // compatibility check (test-before-commit principle).
+            let was_migrated = model.schema_version == 0 && model.classifier.is_some();
+            if was_migrated {
+                migrate_legacy_model(&mut model);
+            }
 
-        // Try combined model format (ensemble or legacy single wrapped in vec)
-        let loaded = if let Ok(model) = serde_json::from_str::<PersistedModel>(&json) {
-            let all_valid = model
-                .classifier
-                .as_ref()
-                .is_some_and(|members| members.iter().all(|w| w.validate().is_ok()));
-            if all_valid {
-                if let Some(ref members) = model.classifier {
-                    if let Some(ref vl) = model.val_losses {
-                        set_classifier_weighted(members.clone(), vl.clone());
-                    } else {
-                        set_classifier_weights(members.clone());
-                    }
-                }
-                if let Some(ref v) = model.verifier {
-                    set_verifier(v.clone());
-                }
-                let n = model.classifier.as_ref().map_or(0, Vec::len);
-                info!("Loaded wake word model from config ({n} ensemble members + verifier)");
-                true
-            } else {
-                warn!("Stored classifier weights are invalid — re-enrollment required");
+            // ── Compatibility check (runs for all models, including migrated) ──
+            if let Err(e) = check_model_compatibility(&model) {
+                warn!("Stored wake word model is incompatible: {e}. Clear and re-enroll.");
                 false
+            } else {
+                // Write back the migrated model now (compatibility passed).
+                if was_migrated && persist_wake_word_model(&model).await {
+                    info!(
+                        "Migrated legacy wake word model to v{}",
+                        MODEL_SCHEMA_VERSION
+                    );
+                }
+
+                // ── Hash verification (warning only, non-gating) ────
+                if !model.model_hash.is_empty()
+                    && let Err(e) = verify_model_hash(&model)
+                {
+                    warn!(
+                        "Wake word model hash mismatch (data may be corrupted): {e}. \
+                             Re-training will fix this."
+                    );
+                }
+
+                // ── Load model data ─────────────────────────────────
+                let all_valid = model
+                    .classifier
+                    .as_ref()
+                    .is_some_and(|members| members.iter().all(|w| w.validate().is_ok()));
+                if all_valid {
+                    if let Some(ref members) = model.classifier {
+                        if let Some(ref vl) = model.val_losses {
+                            set_classifier_weighted(members.clone(), vl.clone());
+                        } else {
+                            set_classifier_weights(members.clone());
+                        }
+                    }
+                    if let Some(ref v) = model.verifier {
+                        set_verifier(v.clone());
+                    }
+                    let n = model.classifier.as_ref().map_or(0, Vec::len);
+                    info!(
+                        "Loaded wake word model from config \
+                         (v{}, {} ensemble members + verifier, phrase={})",
+                        model.schema_version, n, model.phrase,
+                    );
+                    true
+                } else {
+                    warn!("Stored classifier weights are invalid — re-enrollment required");
+                    false
+                }
             }
         } else {
             false
         };
 
-        // Fall back to old format (just ClassifierWeights)
+        // Fall back to bare ClassifierWeights (pre-PersistedModel legacy format)
         if !loaded {
             if let Ok(weights) = serde_json::from_str::<ClassifierWeights>(&json) {
                 if let Err(e) = weights.validate() {
                     warn!("Stored classifier weights are invalid — re-enrollment required: {e}");
                 } else {
                     set_classifier_weights(vec![weights]);
-                    info!("Loaded wake word classifier weights from config (legacy format)");
+                    info!(
+                        "Loaded wake word classifier weights from config (pre-PersistedModel format)"
+                    );
                 }
             } else {
                 warn!(
@@ -6012,13 +6049,22 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                     crate::voice_verifier::VoiceVerifier::untrained()
                 });
 
-        // ── Informational self-test (non-gating, diagnostic only) ──
+        // ── Blocking self-test (mahbot-898) ──
+        // The self-test replays the enrollment utterances through the newly
+        // trained classifier and requires at least
+        // ENROLLMENT_QUALITY_SELF_TEST_MIN_FRACTION of them to trigger
+        // detection.  If this fails, the model is NOT deployed — the
+        // enrollment is treated as failed and the user must re-enroll.
         let classifier =
             WakeWordClassifier::new_ensemble_weighted(weights.clone(), val_losses.clone());
-        match run_enrollment_self_test(&streaming_enrollment_buffer, &classifier) {
-            Ok(()) => debug!("Detection self-test (informational): passed"),
-            Err(e) => debug!("Detection self-test (informational, non-gating): {e}"),
+        if let Err(e) = run_enrollment_self_test(&streaming_enrollment_buffer, &classifier) {
+            warn!("Enrollment self-test failed — model rejected: {e}.  Re-enrollment required.");
+            set_status(VoiceStatus::Error(format!(
+                "Enrollment validation failed: {e}.  Please try again with clearer speech."
+            )));
+            return;
         }
+        info!("Enrollment self-test: passed — deploying model");
 
         // ── Store classifier + verifier in global state ──
         set_classifier_weighted(weights.clone(), val_losses);
@@ -6053,64 +6099,282 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     }
 }
 
-/// Serialisable form of the wake word model (classifier + verifier).
-/// `verifier` and `val_losses` are optional for backward compatibility.
-#[derive(serde::Serialize)]
+/// Current schema version for `PersistedModel`. Increment when the serialized
+/// format changes incompatibly (e.g., adding required fields, changing
+/// dimensions).
+pub(crate) const MODEL_SCHEMA_VERSION: u32 = 1;
+
+/// Normalized wake word phrase stored in the model.
+/// Lowercased, trimmed form of the spoken wake word.
+const MODEL_PHRASE: &str = "mahbot";
+
+/// Serialisable form of the wake word model (classifier + verifier + versioning).
+///
+/// # Versioning & Compatibility
+///
+/// `schema_version` identifies the serialization format. On load, the model
+/// is rejected (with a clear error) if:
+/// - `schema_version` is not a recognized version (currently only 1).
+/// - `embedding_dim` does not match the runtime `EMBEDDING_DIM` (96).
+/// - `window_size` does not match the runtime `WINDOW_SIZE` (3).
+/// - `model_hash` is non-empty and does not match a recomputed hash of the
+///   other fields (data integrity check).
+///
+/// # Legacy Migration (mahbot-898)
+///
+/// Models without `schema_version` (pre-v1, `schema_version` default 0 via
+/// `#[serde(default)]`) are migrated to v1 on first successful load. The
+/// migrated model is written back to the config DB (best-effort).
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct PersistedModel {
-    /// Ensemble of classifier weight sets (NEW format, mahbot-839).
-    /// When loaded, if this is a single-element vec it's treated as a
-    /// single-model classifier for backward compatibility.
+    // ── Versioning & Compatibility (checked at load time) ──────────
+    /// Schema version for format discrimination. 0 = legacy (pre-v1),
+    /// 1 = current version.
+    #[serde(default)]
+    schema_version: u32,
+    /// Normalized wake word phrase (lowercased, trimmed).
+    #[serde(default = "default_phrase")]
+    phrase: String,
+    /// Expected embedding dimension for compatibility (runtime: 96).
+    #[serde(default = "default_embedding_dim")]
+    embedding_dim: u32,
+    /// Expected window size for compatibility (runtime: 3).
+    #[serde(default = "default_window_size")]
+    window_size: u32,
+
+    // ── Training Metadata (diagnostic only, NOT used for compatibility) ──
+    /// Deterministic RNG seeds used during classifier ensemble training.
+    /// Empty = unknown (legacy).
+    #[serde(default)]
+    training_seeds: Vec<u64>,
+    /// RFC 3339 timestamp of initial model creation (never updated).
+    #[serde(default)]
+    created_at: String,
+    /// RFC 3339 timestamp of most recent training/persist operation.
+    #[serde(default)]
+    trained_at: String,
+
+    // ── Integrity ─────────────────────────────────────────────────
+    /// SHA-256 hex digest of the canonical JSON representation of all
+    /// other fields (computed at persist time, verified at load time).
+    /// Empty string = hash not computed (legacy or migration in progress).
+    #[serde(default)]
+    model_hash: String,
+
+    // ── Model Data ────────────────────────────────────────────────
+    /// Ensemble of classifier weight sets. In legacy format the single
+    /// weight set is wrapped in a vec during migration.
+    #[serde(default, deserialize_with = "deserialize_classifier_opt")]
     classifier: Option<Vec<ClassifierWeights>>,
-    /// Per-member validation losses for softmax-weighted averaging (mahbot-847).
+    /// Per-member validation losses for softmax-weighted averaging.
     /// Optional for backward compatibility — when missing, falls back to
     /// uniform averaging.
     #[serde(skip_serializing_if = "Option::is_none")]
     val_losses: Option<Vec<f32>>,
+    /// Second-stage verifier (MLP or legacy logistic regression).
+    #[serde(default)]
     verifier: Option<VoiceVerifier>,
 }
 
-/// Custom deserialization for `PersistedModel` that supports both:
+// ── Default helpers for serde ────────────────────────────────────────
+
+fn default_phrase() -> String {
+    MODEL_PHRASE.to_string()
+}
+
+fn default_embedding_dim() -> u32 {
+    u32::try_from(EMBEDDING_DIM).unwrap()
+}
+
+fn default_window_size() -> u32 {
+    u32::try_from(wake_word_classifier::WINDOW_SIZE).unwrap()
+}
+
+/// Deserialize `classifier` as `Option<Vec<ClassifierWeights>>`, handling:
 /// - New format: `classifier` is an array of weight sets (ensemble).
-/// - Old format: `classifier` is a single weight set object.
-impl<'de> serde::Deserialize<'de> for PersistedModel {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(serde::Deserialize)]
-        struct PersistedModelHelper {
-            #[serde(default)]
-            classifier: Option<serde_json::Value>,
-            #[serde(default)]
-            val_losses: Option<Vec<f32>>,
-            #[serde(default)]
-            verifier: Option<VoiceVerifier>,
-        }
-
-        let helper = PersistedModelHelper::deserialize(deserializer)?;
-
-        let classifier = match helper.classifier {
-            Some(val) => {
-                // Try as Vec<ClassifierWeights> (new ensemble format)
-                if let Ok(members) = serde_json::from_value::<Vec<ClassifierWeights>>(val.clone()) {
-                    Some(members)
-                }
-                // Try as single ClassifierWeights (old format)
-                else if let Ok(single) = serde_json::from_value::<ClassifierWeights>(val) {
-                    Some(vec![single])
-                } else {
-                    None
-                }
+/// - Legacy format: `classifier` is a single weight set object → wrapped in vec.
+/// - Missing / null → `None`.
+pub(crate) fn deserialize_classifier_opt<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<ClassifierWeights>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val: Option<serde_json::Value> = serde::Deserialize::deserialize(deserializer)?;
+    match val {
+        None => Ok(None),
+        Some(v) => {
+            // Try as Vec<ClassifierWeights> (new ensemble format)
+            if let Ok(members) = serde_json::from_value::<Vec<ClassifierWeights>>(v.clone()) {
+                return Ok(Some(members));
             }
-            None => None,
-        };
-
-        Ok(PersistedModel {
-            classifier,
-            val_losses: helper.val_losses,
-            verifier: helper.verifier,
-        })
+            // Try as single ClassifierWeights (legacy format)
+            if let Ok(single) = serde_json::from_value::<ClassifierWeights>(v) {
+                return Ok(Some(vec![single]));
+            }
+            Err(serde::de::Error::custom(
+                "classifier must be an array of weight sets or a single weight set object",
+            ))
+        }
     }
+}
+
+/// Compute the SHA-256 hash of the model's canonical JSON representation,
+/// excluding the `model_hash` field itself.
+///
+/// The canonical form is: serialize to `serde_json::Value`, remove the
+/// `model_hash` key, re-serialize to string, hash.
+fn compute_model_hash(model: &PersistedModel) -> String {
+    let mut canonical =
+        serde_json::to_value(model).expect("PersistedModel serialization must not fail");
+    if let Some(obj) = canonical.as_object_mut() {
+        obj.remove("model_hash");
+    }
+    let json = serde_json::to_string(&canonical).expect("JSON value serialization must not fail");
+    let mut hasher = Sha256::new();
+    hasher.update(json.as_bytes());
+    hex_string(&hasher.finalize())
+}
+
+/// Check that a loaded model is compatible with the running system.
+///
+/// Fails with a descriptive message if:
+/// - `schema_version` is unknown (not 0 or 1).
+/// - `embedding_dim` does not match the runtime embedding dimension (96).
+/// - `window_size` does not match the runtime window size (3).
+///
+/// `schema_version == 0` (legacy pre-v1) is allowed — callers should migrate
+/// before using the model.
+fn check_model_compatibility(model: &PersistedModel) -> Result<()> {
+    // schema_version 0 (legacy) is allowed; 1 is current; anything else is unknown.
+    if model.schema_version > MODEL_SCHEMA_VERSION {
+        anyhow::bail!(
+            "Model schema version {} is newer than runtime version {} — \
+             upgrade mahbot to use this model",
+            model.schema_version,
+            MODEL_SCHEMA_VERSION,
+        );
+    }
+    if model.embedding_dim != 0 && model.embedding_dim != u32::try_from(EMBEDDING_DIM).unwrap() {
+        anyhow::bail!(
+            "Model embedding dimension {} does not match runtime embedding dimension {}",
+            model.embedding_dim,
+            EMBEDDING_DIM,
+        );
+    }
+    let runtime_window_size = u32::try_from(wake_word_classifier::WINDOW_SIZE).unwrap();
+    if model.window_size != 0 && model.window_size != runtime_window_size {
+        anyhow::bail!(
+            "Model window size {} does not match runtime window size {}",
+            model.window_size,
+            runtime_window_size,
+        );
+    }
+    Ok(())
+}
+
+/// Verify the model hash if present. Returns `Ok(())` when hash is empty
+/// (legacy model without hash) or when the hash matches.
+fn verify_model_hash(model: &PersistedModel) -> Result<()> {
+    if model.model_hash.is_empty() {
+        return Ok(());
+    }
+    let computed = compute_model_hash(model);
+    anyhow::ensure!(
+        computed == model.model_hash,
+        "Model hash mismatch: stored={stored}, computed={computed}",
+        stored = model.model_hash,
+    );
+    Ok(())
+}
+
+/// Migrate a legacy (v0) model to the current schema version in-place.
+///
+/// Fills in default values for fields that the legacy format did not store
+/// (phrase, embedding_dim, window_size, created_at, trained_at, model_hash).
+/// After migration, `model.schema_version` is `MODEL_SCHEMA_VERSION` and
+/// `model.model_hash` is computed from the migrated fields.
+///
+/// Returns early (no-op) if the model is not legacy (schema_version != 0) or
+/// if the model has no classifier data — the latter prevents accidental
+/// migration of a bare `ClassifierWeights` or old `WakeWordTemplates` JSON
+/// that happens to deserialize as a `PersistedModel` with null classifier.
+fn migrate_legacy_model(model: &mut PersistedModel) {
+    if model.schema_version != 0 {
+        return; // Already migrated or not a legacy model
+    }
+    if model.classifier.is_none() {
+        // No classifier data — this isn't a real legacy PersistedModel, it's
+        // a bare ClassifierWeights or old format that deserialized by accident
+        // (all fields are #[serde(default)]). Don't migrate or write back.
+        return;
+    }
+    let now = turso::now();
+    model.schema_version = MODEL_SCHEMA_VERSION;
+    if model.phrase.is_empty() {
+        model.phrase = MODEL_PHRASE.to_string();
+    }
+    if model.embedding_dim == 0 {
+        model.embedding_dim = u32::try_from(EMBEDDING_DIM).unwrap();
+    }
+    if model.window_size == 0 {
+        model.window_size = u32::try_from(wake_word_classifier::WINDOW_SIZE).unwrap();
+    }
+    if model.created_at.is_empty() {
+        model.created_at.clone_from(&now);
+    }
+    model.trained_at = now;
+    model.model_hash = compute_model_hash(model);
+}
+
+impl Default for PersistedModel {
+    fn default() -> Self {
+        Self {
+            schema_version: MODEL_SCHEMA_VERSION,
+            phrase: MODEL_PHRASE.to_string(),
+            embedding_dim: u32::try_from(EMBEDDING_DIM).unwrap(),
+            window_size: u32::try_from(wake_word_classifier::WINDOW_SIZE).unwrap(),
+            training_seeds: Vec::new(),
+            created_at: String::new(),
+            trained_at: String::new(),
+            model_hash: String::new(),
+            classifier: None,
+            val_losses: None,
+            verifier: None,
+        }
+    }
+}
+
+/// Persist a wake word model to the config DB and update the in-memory CONFIG.
+///
+/// The CONFIG update ensures GUI snapshot readers / pipeline restart see the
+/// latest model.  `save_and_reload` skips `wake_word_templates` (it's excluded
+/// from the write loop), so this update is about cross-session visibility, not
+/// deletion prevention.
+///
+/// Warnings are logged on failure. Returns `true` if both the DB write and the
+/// CONFIG update succeeded. Callers use the return value to gate their own
+/// success logging.
+/// Used by both [`persist_model_state`] (post-training) and the migration
+/// write-back path (legacy migration, mahbot-898).
+async fn persist_wake_word_model(model: &PersistedModel) -> bool {
+    let Ok(json) = serde_json::to_string(model) else {
+        warn!("Failed to serialize wake word model for persistence");
+        return false;
+    };
+    let store = crate::config_db::store();
+    if let Err(e) = store.set_kv("wake_word_templates", &json).await {
+        warn!("Failed to persist wake word model: {e}");
+        return false;
+    }
+    if !CONFIG.set_string_field("wake_word_templates", &json) {
+        warn!(
+            "Failed to update CONFIG with wake word model (key not recognized by \
+             set_string_field — it may have drifted from the `stringify!` arms)"
+        );
+        return false;
+    }
+    true
 }
 
 /// Persist current classifier weights and verifier to the config database.
@@ -6125,29 +6389,47 @@ async fn persist_model_state() {
             Some(state.classifier_val_losses.clone())
         }
     };
-    let model = PersistedModel {
+
+    // Load existing model to preserve `created_at` (set once on first persist).
+    // If this is a fresh enrollment with no prior model, created_at will be empty
+    // and we set it to now.
+    let existing_created_at = CONFIG
+        .wake_word_templates()
+        .and_then(|json| {
+            serde_json::from_str::<PersistedModel>(&json)
+                .ok()
+                .map(|m| m.created_at)
+        })
+        .unwrap_or_default();
+
+    let now = turso::now();
+
+    let mut model = PersistedModel {
+        schema_version: MODEL_SCHEMA_VERSION,
+        phrase: MODEL_PHRASE.to_string(),
+        embedding_dim: u32::try_from(EMBEDDING_DIM).unwrap(),
+        window_size: u32::try_from(wake_word_classifier::WINDOW_SIZE).unwrap(),
+        training_seeds: (0..wake_word_classifier::NUM_ENSEMBLE_MEMBERS)
+            .map(|s| s as u64) // safe widening: usize → u64 on 64-bit targets
+            .collect(),
+        created_at: if existing_created_at.is_empty() {
+            now.clone()
+        } else {
+            existing_created_at
+        },
+        trained_at: now,
+        model_hash: String::new(), // computed below
         classifier: weights,
         val_losses,
         verifier: Some(verifier),
     };
-    if let Ok(json) = serde_json::to_string(&model) {
-        let store = crate::config_db::store();
-        if let Err(e) = store.set_kv("wake_word_templates", &json).await {
-            warn!("Failed to persist wake word model: {e}");
-        } else {
-            // Update CONFIG in-memory so that GUI snapshot readers / pipeline
-            // restart see the latest model.  `save_and_reload` no longer
-            // touches `wake_word_templates` (it's skipped in the write loop),
-            // so this update is about cross-session visibility, not deletion
-            // prevention.
-            if !CONFIG.set_string_field("wake_word_templates", &json) {
-                warn!(
-                    "Failed to update CONFIG with wake word model (key not recognized by \
-                     set_string_field — it may have drifted from the `stringify!` arms)"
-                );
-            }
-            info!("Wake word model persisted to config");
-        }
+    model.model_hash = compute_model_hash(&model);
+
+    if persist_wake_word_model(&model).await {
+        info!(
+            "Wake word model persisted to config (v{})",
+            MODEL_SCHEMA_VERSION
+        );
     }
 }
 
@@ -9920,6 +10202,359 @@ mod tests {
         assert!(
             any_with_id,
             "at least one trace entry should have a candidate_id after threshold crossing",
+        );
+    }
+
+    // ── PersistedModel versioning & compatibility tests (mahbot-898) ──────
+
+    /// Create a deterministic test model with all hash-relevant fields populated.
+    fn test_model() -> PersistedModel {
+        PersistedModel {
+            created_at: "2026-07-26T12:00:00+00:00".to_string(),
+            trained_at: "2026-07-26T12:00:00+00:00".to_string(),
+            model_hash: String::new(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn model_hash_is_deterministic() {
+        let a = test_model();
+        let b = test_model();
+        let hash1 = compute_model_hash(&a);
+        let hash2 = compute_model_hash(&b);
+        assert_eq!(hash1, hash2, "hash must be deterministic");
+        assert!(!hash1.is_empty(), "hash must not be empty");
+        assert_eq!(hash1.len(), 64, "SHA-256 hex must be 64 chars");
+    }
+
+    #[test]
+    fn model_hash_excludes_itself() {
+        // The hash should be the same whether model_hash is empty or set,
+        // because compute_model_hash removes it from the canonical form.
+        let hash_empty = compute_model_hash(&test_model());
+
+        let model_with_hash = PersistedModel {
+            model_hash: "abc123".to_string(),
+            ..test_model()
+        };
+        let hash_with_value = compute_model_hash(&model_with_hash);
+
+        assert_eq!(
+            hash_empty, hash_with_value,
+            "hash must be independent of model_hash field value"
+        );
+    }
+
+    #[test]
+    fn model_hash_changes_when_phrase_changes() {
+        let hash_base = compute_model_hash(&test_model());
+        assert_ne!(
+            compute_model_hash(&PersistedModel {
+                phrase: "hey mahbot".to_string(),
+                ..test_model()
+            }),
+            hash_base,
+            "phrase change must affect hash"
+        );
+    }
+
+    #[test]
+    fn model_hash_changes_when_training_seeds_changes() {
+        let hash_base = compute_model_hash(&test_model());
+        assert_ne!(
+            compute_model_hash(&PersistedModel {
+                training_seeds: vec![0, 1, 2],
+                ..test_model()
+            }),
+            hash_base,
+            "training_seeds change must affect hash"
+        );
+    }
+
+    #[test]
+    fn model_hash_changes_when_embedding_dim_changes() {
+        let hash_base = compute_model_hash(&test_model());
+        assert_ne!(
+            compute_model_hash(&PersistedModel {
+                embedding_dim: 128,
+                ..test_model()
+            }),
+            hash_base,
+            "embedding_dim change must affect hash"
+        );
+    }
+
+    #[test]
+    fn check_compatibility_accepts_current_version() {
+        let model = PersistedModel {
+            schema_version: MODEL_SCHEMA_VERSION,
+            ..Default::default()
+        };
+        assert!(check_model_compatibility(&model).is_ok());
+    }
+
+    #[test]
+    fn check_compatibility_accepts_legacy_version() {
+        // schema_version == 0 is legacy — allowed but callers should migrate.
+        let model = PersistedModel {
+            schema_version: 0,
+            ..Default::default()
+        };
+        assert!(
+            check_model_compatibility(&model).is_ok(),
+            "legacy version 0 must be accepted"
+        );
+    }
+
+    #[test]
+    fn check_compatibility_rejects_unknown_version() {
+        let model = PersistedModel {
+            schema_version: 999,
+            ..Default::default()
+        };
+        assert!(
+            check_model_compatibility(&model).is_err(),
+            "unknown schema version must be rejected"
+        );
+    }
+
+    #[test]
+    fn check_compatibility_rejects_wrong_embedding_dim() {
+        let model = PersistedModel {
+            schema_version: 1,
+            embedding_dim: 42, // wrong!
+            ..Default::default()
+        };
+        let err = check_model_compatibility(&model).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("embedding dimension"),
+            "error must mention embedding dimension, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_compatibility_rejects_wrong_window_size() {
+        let model = PersistedModel {
+            schema_version: 1,
+            window_size: 5, // wrong!
+            ..Default::default()
+        };
+        let err = check_model_compatibility(&model).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("window size"),
+            "error must mention window size, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_hash_passes_when_hash_is_empty() {
+        let model = PersistedModel {
+            model_hash: String::new(),
+            ..Default::default()
+        };
+        assert!(
+            verify_model_hash(&model).is_ok(),
+            "empty hash must pass verification (legacy compat)"
+        );
+    }
+
+    #[test]
+    fn verify_hash_passes_when_hash_matches() {
+        let mut model = PersistedModel {
+            created_at: "t1".to_string(),
+            trained_at: "t2".to_string(),
+            ..Default::default()
+        };
+        let correct_hash = compute_model_hash(&model);
+        model.model_hash = correct_hash;
+        assert!(verify_model_hash(&model).is_ok(), "matching hash must pass");
+    }
+
+    #[test]
+    fn verify_hash_fails_when_hash_does_not_match() {
+        let model = PersistedModel {
+            created_at: "t1".to_string(),
+            trained_at: "t2".to_string(),
+            model_hash: "deadbeef".to_string(), // clearly wrong
+            ..Default::default()
+        };
+        assert!(verify_model_hash(&model).is_err(), "wrong hash must fail");
+    }
+
+    #[test]
+    fn deserialize_classifier_opt_handles_array() {
+        // Round-trip through serde_json to test the full deserialization path
+        let json = r#"{
+            "classifier": [
+                {"conv1_weight": [1.0], "conv1_bias": [0.0],
+                 "bn1_gamma": [1.0], "bn1_beta": [0.0],
+                 "conv2_weight": [1.0], "conv2_bias": [0.0],
+                 "bn2_gamma": [1.0], "bn2_beta": [0.0],
+                 "fc_weight": [1.0], "fc_bias": [0.0],
+                 "bn_eps": 1e-5}
+            ]
+        }"#;
+        let model: PersistedModel =
+            serde_json::from_str(json).expect("array format must deserialize");
+        assert!(model.classifier.is_some());
+        assert_eq!(model.classifier.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deserialize_classifier_opt_handles_single_object() {
+        // Legacy format: classifier is a single object, not an array
+        let json = r#"{
+            "classifier": {"conv1_weight": [1.0], "conv1_bias": [0.0],
+             "bn1_gamma": [1.0], "bn1_beta": [0.0],
+             "conv2_weight": [1.0], "conv2_bias": [0.0],
+             "bn2_gamma": [1.0], "bn2_beta": [0.0],
+             "fc_weight": [1.0], "fc_bias": [0.0],
+             "bn_eps": 1e-5}
+        }"#;
+        let model: PersistedModel =
+            serde_json::from_str(json).expect("single object format must deserialize");
+        assert!(model.classifier.is_some());
+        assert_eq!(
+            model.classifier.as_ref().unwrap().len(),
+            1,
+            "single object must be wrapped in vec"
+        );
+    }
+
+    #[test]
+    fn deserialize_classifier_opt_handles_missing() {
+        let json = r#"{"schema_version": 1, "phrase": "test"}"#;
+        let model: PersistedModel =
+            serde_json::from_str(json).expect("missing classifier must deserialize");
+        assert!(model.classifier.is_none());
+    }
+
+    #[test]
+    fn migrate_legacy_model_upgrades_to_current_version() {
+        // Simulate a legacy model that was just loaded from JSON (all fields
+        // at their zero/default values except schema_version which
+        // deserializes to 0).  Must include classifier data to avoid the
+        // classifier.is_none() early return in migrate_legacy_model.
+        let mut model = PersistedModel {
+            schema_version: 0,
+            phrase: String::new(),
+            embedding_dim: 0,
+            window_size: 0,
+            training_seeds: Vec::new(),
+            created_at: String::new(),
+            trained_at: String::new(),
+            model_hash: String::new(),
+            classifier: Some(vec![ClassifierWeights::default()]),
+            val_losses: None,
+            verifier: None,
+        };
+
+        migrate_legacy_model(&mut model);
+
+        assert_eq!(
+            model.schema_version, 1,
+            "schema_version must be upgraded to current"
+        );
+        assert_eq!(model.phrase, "mahbot", "phrase must be set");
+        assert_eq!(
+            model.embedding_dim,
+            u32::try_from(EMBEDDING_DIM).unwrap(),
+            "embedding_dim must be set"
+        );
+        assert_eq!(
+            model.window_size,
+            u32::try_from(wake_word_classifier::WINDOW_SIZE).unwrap(),
+            "window_size must be set"
+        );
+        assert!(
+            !model.created_at.is_empty(),
+            "created_at must be filled during migration"
+        );
+        assert!(
+            !model.trained_at.is_empty(),
+            "trained_at must be filled during migration"
+        );
+        assert!(
+            !model.model_hash.is_empty(),
+            "model_hash must be computed during migration"
+        );
+
+        // Verify the hash is valid
+        assert_eq!(
+            compute_model_hash(&model),
+            model.model_hash,
+            "stored hash must be correct after migration"
+        );
+
+        // Run a second migration — should be idempotent (fields already set)
+        migrate_legacy_model(&mut model);
+        assert_eq!(
+            compute_model_hash(&model),
+            model.model_hash,
+            "hash must still be valid after second migration"
+        );
+        // Fields should be unchanged (idempotent: schema_version != 0 so migration
+        // returns early; phrase, embedding_dim, window_size, created_at,
+        // trained_at, and model_hash all retain their first-migration values).
+        assert!(
+            !model.phrase.is_empty() && model.embedding_dim > 0 && model.window_size > 0,
+            "fields must survive idempotent re-migration"
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_model_noop_when_classifier_none() {
+        // A bare-minimum v0 model without classifier data must NOT be migrated
+        // (the classifier.is_none() guard prevents accidental migration of bare
+        // ClassifierWeights or old WakeWordTemplates that deserialize as
+        // PersistedModel with null classifier, which would overwrite the
+        // original data in the DB — mahbot-898 data-loss bug).
+        let mut model = PersistedModel {
+            schema_version: 0,
+            classifier: None,
+            ..Default::default()
+        };
+
+        migrate_legacy_model(&mut model);
+
+        // The model should remain a v0 model — no fields touched
+        assert_eq!(model.schema_version, 0, "must not upgrade schema_version");
+        assert_eq!(
+            model.phrase, MODEL_PHRASE,
+            "phrase must retain default (unchanged)"
+        );
+        assert_eq!(
+            model.embedding_dim,
+            u32::try_from(EMBEDDING_DIM).unwrap(),
+            "embedding_dim must retain default (unchanged)"
+        );
+        assert!(
+            model.model_hash.is_empty(),
+            "model_hash must not be computed for null-classifier model"
+        );
+    }
+
+    #[test]
+    fn legacy_model_defaults_to_version_0() {
+        // Ensure old-format JSON (no schema_version) gets version 0
+        let json = r#"{"classifier": null}"#;
+        let model: PersistedModel =
+            serde_json::from_str(json).expect("legacy format must deserialize");
+        assert_eq!(
+            model.schema_version, 0,
+            "legacy model without schema_version must default to 0"
+        );
+        assert_eq!(
+            model.phrase, MODEL_PHRASE,
+            "legacy model must get default phrase"
+        );
+        assert_eq!(
+            model.embedding_dim,
+            u32::try_from(EMBEDDING_DIM).unwrap(),
+            "legacy model must get default embedding_dim"
         );
     }
 }
