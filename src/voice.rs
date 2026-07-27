@@ -36,10 +36,9 @@ use crate::turso;
 use crate::util::UnwrapPoison;
 use crate::util::hex_string;
 use crate::vector::cosine_similarity;
-use crate::voice_verifier::{
-    EMBEDDING_DIM, VERIFIER_WARMUP_EMBEDDINGS, VERIFIER_WINDOW_SIZE, VoiceVerifier,
-};
+use crate::voice_verifier::{VERIFIER_WARMUP_EMBEDDINGS, VoiceVerifier};
 use crate::wake_word_classifier::{self, ClassifierWeights, WakeWordClassifier};
+use crate::{EMBEDDING_DIM, VERIFIER_WINDOW_SIZE};
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sha2::{Digest, Sha256};
@@ -1546,7 +1545,7 @@ pub(crate) fn score_single_embedding(
         // Score all stride-1 windows in the range [start, end - VERIFIER_WINDOW_SIZE].
         // Use a fixed-size stack array (no heap allocation) for real-time safety
         // on the streaming inference path (mahbot-870).
-        let mut window = [0.0f32; crate::voice_verifier::VERIFIER_INPUT_DIM];
+        let mut window = [0.0f32; crate::VERIFIER_INPUT_DIM];
         for i in start..=end.saturating_sub(VERIFIER_WINDOW_SIZE) {
             crate::voice_verifier::fill_verifier_window(embedding_ring, i, &mut window);
             let score = v.predict(&window);
@@ -6056,10 +6055,19 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
             }
             neg
         };
+        // Clone weights and val_losses for the verifier training closure
+        // (they're also used later for the self-test classifier, mahbot-905).
+        let verifier_weights = weights.clone();
+        let verifier_val_losses = val_losses.clone();
         let verifier = tokio::task::spawn_blocking(move || {
                     use crate::voice_verifier::{
-                        assert_weight_tier, CONFUSABLE_UPWEIGHT, DEFAULT_VERIFIER_THRESHOLD,
-                        L2_LAMBDA, LEARNING_RATE, MLP_MAX_ITER, UNRELATED_UPWEIGHT, VoiceVerifier,
+                        assert_weight_tier, mine_hard_negatives, CONFUSABLE_UPWEIGHT,
+                        DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA, LEARNING_RATE, MLP_MAX_ITER,
+                        UNRELATED_UPWEIGHT, VoiceVerifier,
+                    };
+                    use crate::wake_word_classifier::WakeWordClassifier;
+                    use crate::{
+                        MAX_NEGATIVE_WINDOWS_PER_SEQUENCE, VERIFIER_WINDOW_SIZE,
                     };
 
                     if pos_for_ver_seqs.is_empty() {
@@ -6074,55 +6082,101 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                         debug_assert_eq!(n_ambient, n_ambient_from_total,
                             "ambient sequence count mismatch: expected {n_ambient}, total neg sequences {n_neg} - confusable {n_confusable} - unrelated {n_unrelated} = {n_ambient_from_total}");
 
-                        // Build per-negative-sequence weights with three tiers (mahbot-872):
-                        //   ambient (silence/environment noise)  → 1.0×
-                        //   unrelated speech                     → UNRELATED_UPWEIGHT×
-                        //   confusable near-miss phrases         → CONFUSABLE_UPWEIGHT×
-                        let mut per_neg_weights: Vec<f32> = Vec::with_capacity(n_neg);
-                        per_neg_weights.extend(std::iter::repeat_n(1.0, n_ambient));
-                        per_neg_weights.extend(std::iter::repeat_n(UNRELATED_UPWEIGHT, n_unrelated));
-                        per_neg_weights.extend(std::iter::repeat_n(CONFUSABLE_UPWEIGHT, n_confusable));
-                        info!(
-                            "Building per-sequence weights: {n_ambient} ambient (1.0) + \
-                             {n_unrelated} unrelated ({UNRELATED_UPWEIGHT}×) + \
-                             {n_confusable} confusable ({CONFUSABLE_UPWEIGHT}×) for \
-                             {n_neg} total negative sequences (mahbot-872)",
-                        );
+                        // ── Determine negative sequences and weights ─────────────────
+                        // Hard-negative mining (mahbot-905): when enabled, attempt to select
+                        // ≤2 non-overlapping highest-scoring windows per source sequence using
+                        // the trained classifier.  If mining succeeds (≥ MIN_MINED_NEGATIVES_FALLBACK
+                        // windows), use uniform weights.  Otherwise, fall through to the original
+                        // all-windows approach with tiered per-sequence weights.
+                        let use_mining = crate::voice_verifier::use_hard_negative_mining();
+                        let (neg_to_use, per_neg_weights_opt) = 'decide: {
+                            if use_mining {
+                                let classifier = WakeWordClassifier::new_ensemble_weighted(
+                                    verifier_weights,
+                                    verifier_val_losses,
+                                );
+                                let mined = mine_hard_negatives(
+                                    &classifier,
+                                    &neg_for_verifier_seqs,
+                                    MAX_NEGATIVE_WINDOWS_PER_SEQUENCE, // max_per_sequence
+                                    VERIFIER_WINDOW_SIZE, // min_separation (non-overlapping)
+                                );
+                                if mined.sequences.len()
+                                    >= crate::voice_verifier::MIN_MINED_NEGATIVES_FALLBACK
+                                {
+                                    info!(
+                                        "Hard-negative mining (mahbot-905): selected {} windows \
+                                         from {}/{n_neg} source sequences for verifier training; \
+                                         using uniform weights (mining replaces tiered weights)",
+                                        mined.sequences.len(),
+                                        mined.source_sequences_represented,
+                                    );
+                                    break 'decide (mined.sequences, None);
+                                }
+                                warn!(
+                                    "Hard-negative mining produced only {} windows (< {}); \
+                                     falling back to all-windows training (mahbot-905)",
+                                    mined.sequences.len(),
+                                    crate::voice_verifier::MIN_MINED_NEGATIVES_FALLBACK,
+                                );
+                            }
 
-                        // Structural guard: verify weight ordering matches concatenation
-                        // order (ambient → unrelated → confusable).  Prevents silent
-                        // misalignment if either the concatenation or weight code is
-                        // refactored (mahbot-872 reviewer feedback).
-                        assert_weight_tier(&per_neg_weights, 0, n_ambient, 1.0, "ambient");
-                        assert_weight_tier(
-                            &per_neg_weights,
-                            n_ambient,
-                            n_unrelated,
-                            UNRELATED_UPWEIGHT,
-                            "unrelated",
-                        );
-                        assert_weight_tier(
-                            &per_neg_weights,
-                            n_ambient + n_unrelated,
-                            n_confusable,
-                            CONFUSABLE_UPWEIGHT,
-                            "confusable",
-                        );
+                            // ── Original all-windows path (mahbot-872) ─────────────────
+                            // Also reached by mining fallback.  Build per-sequence weights
+                            // with three tiers:
+                            //   ambient (silence/environment noise)  → 1.0×
+                            //   unrelated speech                     → UNRELATED_UPWEIGHT×
+                            //   confusable near-miss phrases         → CONFUSABLE_UPWEIGHT×
+                            let mut per_neg_weights: Vec<f32> = Vec::with_capacity(n_neg);
+                            per_neg_weights.extend(std::iter::repeat_n(1.0, n_ambient));
+                            per_neg_weights.extend(std::iter::repeat_n(
+                                UNRELATED_UPWEIGHT, n_unrelated));
+                            per_neg_weights.extend(std::iter::repeat_n(
+                                CONFUSABLE_UPWEIGHT, n_confusable));
+                            info!(
+                                "Building per-sequence weights: {n_ambient} ambient (1.0) + \
+                                 {n_unrelated} unrelated ({UNRELATED_UPWEIGHT}×) + \
+                                 {n_confusable} confusable ({CONFUSABLE_UPWEIGHT}×) for \
+                                 {n_neg} total negative sequences (mahbot-872)",
+                            );
+                            // Structural guard: verify weight ordering matches concatenation
+                            // order (ambient → unrelated → confusable).  Prevents silent
+                            // misalignment if either the concatenation or weight code is
+                            // refactored (mahbot-872 reviewer feedback).
+                            assert_weight_tier(&per_neg_weights, 0, n_ambient, 1.0, "ambient");
+                            assert_weight_tier(
+                                &per_neg_weights,
+                                n_ambient,
+                                n_unrelated,
+                                UNRELATED_UPWEIGHT,
+                                "unrelated",
+                            );
+                            assert_weight_tier(
+                                &per_neg_weights,
+                                n_ambient + n_unrelated,
+                                n_confusable,
+                                CONFUSABLE_UPWEIGHT,
+                                "confusable",
+                            );
+                            (neg_for_verifier_seqs, Some(per_neg_weights))
+                        };
 
                         let v = VoiceVerifier::train(
                             &pos_for_ver_seqs,
-                            &neg_for_verifier_seqs,
-                            Some(&per_neg_weights),
+                            &neg_to_use,
+                            per_neg_weights_opt.as_deref(),
                             DEFAULT_VERIFIER_THRESHOLD,
-                            L2_LAMBDA,       // 0.01
-                            LEARNING_RATE,   // 0.001 (Adam, mahbot-878)
-                            MLP_MAX_ITER,    // 2000 — MLP converges faster than linear (mahbot-861)
-                            None,            // rng_seed — production uses entropy-based RNG
+                            L2_LAMBDA,
+                            LEARNING_RATE,
+                            MLP_MAX_ITER,
+                            None, // rng_seed — production uses entropy-based RNG
                         );
                         info!(
-                            "Verifier trained from {} streaming positive + {n_neg} real \
-                             streaming negative sequence(s) (ambient + unrelated + confusable, mahbot-872)",
+                            "Verifier trained from {} streaming positive + {} real \
+                             streaming negative sequence(s) (ambient + unrelated + \
+                             confusable, mahbot-872)",
                             pos_for_ver_seqs.len(),
+                            if per_neg_weights_opt.is_some() { n_neg } else { neg_to_use.len() },
                         );
                         v
                     } else {
@@ -7450,10 +7504,9 @@ fn export_activation_trace(trace: &ActivationTraceBuffer, reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::VERIFIER_INPUT_DIM;
     use crate::util::{add_noise, apply_gain, generate_pink_noise};
-    use crate::voice_verifier::{
-        DEFAULT_VERIFIER_THRESHOLD, MLP_HIDDEN_1, MLP_HIDDEN_2, VERIFIER_INPUT_DIM,
-    };
+    use crate::voice_verifier::{DEFAULT_VERIFIER_THRESHOLD, MLP_HIDDEN_1, MLP_HIDDEN_2};
     use rand::SeedableRng;
     use std::time::{Duration, Instant};
 

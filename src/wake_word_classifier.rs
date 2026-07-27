@@ -31,9 +31,9 @@ use tracing::info;
 
 use crate::embedding_sequence::EmbeddingSequence;
 
+use crate::EMBEDDING_DIM;
 #[cfg(test)]
 use crate::embedding_sequence::LabelStratum;
-use crate::voice_verifier::EMBEDDING_DIM;
 
 // ── Constants ────────────────────────────────────────────────────────────
 

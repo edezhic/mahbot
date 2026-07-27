@@ -45,6 +45,8 @@ use std::sync::OnceLock;
 use tracing::{info, warn};
 
 use crate::embedding_sequence::EmbeddingSequence;
+use crate::wake_word_classifier::WakeWordClassifier;
+use crate::{EMBEDDING_DIM, VERIFIER_INPUT_DIM, VERIFIER_WINDOW_SIZE};
 
 /// Verifier architecture version: legacy auto-detect (MLP or linear).
 pub(crate) const VERIFIER_VERSION_LEGACY: u8 = 0;
@@ -52,24 +54,36 @@ pub(crate) const VERIFIER_VERSION_LEGACY: u8 = 0;
 /// Verifier architecture version: logistic regression on mean-pooled 96-dim embeddings (mahbot-901).
 pub(crate) const VERIFIER_VERSION_LOGISTIC: u8 = 1;
 
-/// Check whether logistic verifier mode is enabled.
+/// Define a cached env-var flag check function.
 ///
-/// Checks the `MAHBOT_USE_LOGISTIC_VERIFIER` env var (once, then cached).
-/// Values `"1"` or `"true"` (case-insensitive) enable logistic regression.
-/// All other values (including unset) use the legacy MLP path.
+/// Generates a `$vis fn $name() -> bool` that checks `$env_var` once (then
+/// caches the result in a `OnceLock<bool>`).  Values `"1"` or `"true"`
+/// (case-insensitive) return `true`; all other values (including unset) return
+/// `false`.
 ///
-/// This is the single source of truth — no config DB dependency, safe in tests
-/// where the config store may not be initialized.
-fn use_logistic_verifier() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| match std::env::var("MAHBOT_USE_LOGISTIC_VERIFIER") {
-        Ok(val) => {
-            let v = val.trim().to_lowercase();
-            v == "1" || v == "true"
+/// # Example
+///
+/// ```ignore
+/// define_env_flag!(use_foo, "MAHBOT_USE_FOO");
+/// define_env_flag!(pub(crate) use_bar, "MAHBOT_USE_BAR");
+/// assert!(!use_foo());
+/// ```
+macro_rules! define_env_flag {
+    ($vis:vis $name:ident, $env_var:expr) => {
+        $vis fn $name() -> bool {
+            static CACHED: OnceLock<bool> = OnceLock::new();
+            *CACHED.get_or_init(|| match std::env::var($env_var) {
+                Ok(val) => {
+                    let v = val.trim().to_lowercase();
+                    v == "1" || v == "true"
+                }
+                Err(_) => false,
+            })
         }
-        Err(_) => false,
-    })
+    };
 }
+
+define_env_flag!(use_logistic_verifier, "MAHBOT_USE_LOGISTIC_VERIFIER");
 
 /// Default decision threshold for the verifier (MLP decision boundary).
 ///
@@ -199,14 +213,6 @@ pub(crate) const CONFUSABLE_UPWEIGHT: f32 = 15.0;
 pub(crate) const UNRELATED_UPWEIGHT: f32 = 10.0;
 
 /// Embedding dimensionality (used by both verifier and voice pipeline).
-pub(crate) const EMBEDDING_DIM: usize = 96;
-
-/// Number of consecutive frames in a verifier window (matching classifier).
-pub(crate) const VERIFIER_WINDOW_SIZE: usize = 3;
-
-/// Input dimension for the verifier MLP: 3 × 96 = 288.
-pub(crate) const VERIFIER_INPUT_DIM: usize = EMBEDDING_DIM * VERIFIER_WINDOW_SIZE;
-
 /// Minimum number of classifier embeddings required before the verifier gate
 /// is evaluated (mahbot-887).
 ///
@@ -253,9 +259,153 @@ pub(crate) const VERIFIER_WARMUP_EMBEDDINGS: usize = 4;
 /// when no real calibration data is available.
 const SYNTHETIC_NEGATIVES_COUNT: usize = 100;
 
-// ═══════════════════════════════════════════════════════════════════════════
-// VoiceVerifier
-// ═══════════════════════════════════════════════════════════════════════════
+/// Minimum number of mined negative windows required to use mining results
+/// instead of falling back to all-windows training (mahbot-905).
+///
+/// If hard-negative mining produces fewer than this many total windows across
+/// all source sequences, the miner falls back to the original all-windows
+/// approach.  This prevents an untrained verifier when all negative utterances
+/// produce near-zero classifier scores (e.g., silent or toy environments).
+pub(crate) const MIN_MINED_NEGATIVES_FALLBACK: usize = 3;
+
+define_env_flag!(pub(crate) use_hard_negative_mining, "MAHBOT_USE_HARD_NEGATIVE_MINING");
+
+/// Result from hard-negative mining (mahbot-905).
+///
+/// Contains the mined [`EmbeddingSequence`] values (one per selected window)
+/// and a summary count for diagnostics.
+#[derive(Debug, Clone)]
+pub(crate) struct MinedNegatives {
+    /// Mined [`EmbeddingSequence`] values, one per selected window.
+    ///
+    /// Each sequence contains exactly [`VERIFIER_WINDOW_SIZE`] per-frame 96-dim
+    /// embeddings, so `train_inner` forms exactly one stride-1 window from it.
+    pub sequences: Vec<EmbeddingSequence>,
+    /// Number of source sequences that contributed at least one mined window.
+    pub source_sequences_represented: usize,
+}
+
+/// Mine hard-negative windows from negative [`EmbeddingSequence`] values using
+/// a trained [`WakeWordClassifier`] (mahbot-905).
+///
+/// For each negative sequence, slides the classifier over all stride-1
+/// 3-frame windows, records scores, and selects at most `max_per_sequence`
+/// non-overlapping highest-scoring windows.  Windows are guaranteed to
+/// share no embedding frames (separation ≥ `min_separation`).
+///
+/// This replaces the "all windows from all negatives" approach that dilutes
+/// verifier training signal with hundreds of easy, non-discriminative windows.
+///
+/// # Algorithm
+///
+/// 1. For each [`EmbeddingSequence`], form all stride-1 windows.
+/// 2. Score each window using `classifier.forward()`.
+/// 3. Sort windows by score descending.
+/// 4. Greedily select non-overlapping windows (minimum separation enforced),
+///    at most `max_per_sequence` per source sequence.
+/// 5. Package each selected window as a new [`EmbeddingSequence`] with exactly
+///    [`VERIFIER_WINDOW_SIZE`] per-frame 96-dim embeddings.
+///
+/// # Returns
+///
+/// [`MinedNegatives`] — the mined sequences and a count of source sequences
+/// that contributed.  Returns an empty `MinedNegatives` when all source
+/// sequences are shorter than [`VERIFIER_WINDOW_SIZE`] frames.
+///
+/// # Panics
+///
+/// Panics if `min_separation < VERIFIER_WINDOW_SIZE`, because windows closer
+/// than `VERIFIER_WINDOW_SIZE` frames share embeddings and would produce
+/// overlapping training examples.
+///
+/// # Weight semantics
+///
+/// Mined negatives should be used with **uniform weights** (1.0) because the
+/// mining process itself selects the hardest examples — the original tiered
+/// per-sequence weights (ambient=1×, unrelated=10×, confusable=15×) were
+/// designed to compensate for dilution by easy negatives.  With dilution
+/// eliminated by mining, uniform weighting is appropriate and avoids the
+/// pathological gradient concentration that would occur if each mined window
+/// from a confusable sequence inherited the full 15× weight.
+pub(crate) fn mine_hard_negatives(
+    classifier: &WakeWordClassifier,
+    negative_sequences: &[EmbeddingSequence],
+    max_per_sequence: usize,
+    min_separation: usize,
+) -> MinedNegatives {
+    assert!(
+        min_separation >= VERIFIER_WINDOW_SIZE,
+        "mine_hard_negatives: min_separation ({min_separation}) must be >= \
+         VERIFIER_WINDOW_SIZE ({VERIFIER_WINDOW_SIZE})",
+    );
+
+    let mut sequences: Vec<EmbeddingSequence> = Vec::new();
+    let mut source_sequences_represented: usize = 0;
+
+    for seq in negative_sequences {
+        let embeddings = &seq.embeddings;
+        let n_frames = embeddings.len();
+
+        // Need at least VERIFIER_WINDOW_SIZE frames to form any window.
+        if n_frames < VERIFIER_WINDOW_SIZE {
+            continue;
+        }
+
+        let n_windows = n_frames - VERIFIER_WINDOW_SIZE + 1;
+
+        // Score each stride-1 window with the classifier.
+        // The classifier.forward() takes &[Vec<f32>] of exactly
+        // VERIFIER_WINDOW_SIZE per-frame 96-dim embeddings.
+        let mut scored_windows: Vec<(f32, usize)> = Vec::with_capacity(n_windows);
+        for i in 0..n_windows {
+            let window_frames = &embeddings[i..i + VERIFIER_WINDOW_SIZE];
+            let score = classifier.forward(window_frames);
+            scored_windows.push((score, i));
+        }
+
+        // Sort by score descending.  Use partial_cmp with an Ordering fallback
+        // to handle NaN scores gracefully (NaN is treated as equal to anything).
+        scored_windows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Greedily select non-overlapping windows.
+        let mut selected_indices: Vec<usize> = Vec::with_capacity(max_per_sequence);
+        for &(_score, idx) in &scored_windows {
+            if selected_indices.len() >= max_per_sequence {
+                break;
+            }
+            // Check minimum separation from already-selected windows.
+            let too_close = selected_indices.iter().any(|&sel_idx| {
+                let dist = idx.abs_diff(sel_idx);
+                dist < min_separation
+            });
+            if !too_close {
+                selected_indices.push(idx);
+            }
+        }
+
+        if !selected_indices.is_empty() {
+            source_sequences_represented += 1;
+        }
+
+        // Build an EmbeddingSequence for each selected window.
+        // Each sequence gets exactly VERIFIER_WINDOW_SIZE per-frame 96-dim
+        // embeddings so that train_inner forms exactly one stride-1 window.
+        for &idx in &selected_indices {
+            let window_embs: Vec<Vec<f32>> = embeddings[idx..idx + VERIFIER_WINDOW_SIZE].to_vec();
+            sequences.push(EmbeddingSequence::negative(
+                seq.id.clone(),
+                seq.source,
+                seq.augmentation_family,
+                window_embs,
+            ));
+        }
+    }
+
+    MinedNegatives {
+        sequences,
+        source_sequences_represented,
+    }
+}
 
 /// Verifier for wake word false-trigger suppression (second-stage AND gate).
 ///
@@ -3424,5 +3574,261 @@ mod tests {
         );
 
         assert!(verifier.is_trained());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Hard-negative mining tests (mahbot-905)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Helper: create an EmbeddingSequence from 96-dim per-frame embeddings
+    /// with a specific Source for provenance tracking.
+    fn make_seq_with_source(
+        embs: Vec<Vec<f32>>,
+        source: crate::embedding_sequence::Source,
+    ) -> EmbeddingSequence {
+        EmbeddingSequence {
+            id: crate::embedding_sequence::UtteranceId {
+                sequence_index: 0,
+                variant_index: 0,
+            },
+            source,
+            augmentation_family: None,
+            label_stratum: crate::embedding_sequence::LabelStratum::Negative,
+            embeddings: embs,
+        }
+    }
+
+    /// Create a deterministic classifier for mining tests using a seeded RNG.
+    fn test_classifier() -> WakeWordClassifier {
+        use crate::wake_word_classifier::{ArchConfig, ClassifierWeights};
+        let weights =
+            ClassifierWeights::from_rng(&mut StdRng::seed_from_u64(42), &ArchConfig::default());
+        WakeWordClassifier::new(weights)
+    }
+
+    #[test]
+    fn test_mine_hard_negatives_empty_input() {
+        // Empty input slice → empty MinedNegatives.
+        let classifier = test_classifier();
+        let mined = mine_hard_negatives(&classifier, &[], 2, VERIFIER_WINDOW_SIZE);
+        assert!(
+            mined.sequences.is_empty(),
+            "Empty input must produce empty mined sequences",
+        );
+        assert_eq!(
+            mined.source_sequences_represented, 0,
+            "Empty input must have zero source_sequences_represented",
+        );
+    }
+
+    #[test]
+    fn test_mine_hard_negatives_short_sequences() {
+        // All sequences shorter than VERIFIER_WINDOW_SIZE → empty result.
+        let classifier = test_classifier();
+        let seq1 = make_seq_with_source(
+            (0..2)
+                .map(|_| make_positive_frame(&mut StdRng::seed_from_u64(10)))
+                .collect(),
+            crate::embedding_sequence::Source::Confusable,
+        );
+        let mined = mine_hard_negatives(&classifier, &[seq1], 2, VERIFIER_WINDOW_SIZE);
+        assert!(
+            mined.sequences.is_empty(),
+            "Sequences shorter than window size must produce no mined windows",
+        );
+    }
+
+    #[test]
+    fn test_mine_hard_negatives_basic() {
+        // Normal sequences → returns sequences with correct properties.
+        let classifier = test_classifier();
+        let mut rng = StdRng::seed_from_u64(100);
+
+        // Three sequences with varying frame counts (all ≥ VERIFIER_WINDOW_SIZE).
+        let seq1 = make_seq_with_source(
+            (0..10).map(|_| make_positive_frame(&mut rng)).collect(),
+            crate::embedding_sequence::Source::Confusable,
+        );
+        let seq2 = make_seq_with_source(
+            (0..8).map(|_| make_positive_frame(&mut rng)).collect(),
+            crate::embedding_sequence::Source::Unrelated,
+        );
+        let seq3 = make_seq_with_source(
+            (0..6).map(|_| make_positive_frame(&mut rng)).collect(),
+            crate::embedding_sequence::Source::Ambient,
+        );
+
+        let mined = mine_hard_negatives(
+            &classifier,
+            &[seq1, seq2, seq3],
+            2, // max_per_sequence
+            VERIFIER_WINDOW_SIZE,
+        );
+
+        // At most 2 per sequence × 3 sequences = 6 windows.
+        assert!(
+            mined.sequences.len() <= 6,
+            "At most 2 per sequence × 3 sequences = 6 windows, got {}",
+            mined.sequences.len(),
+        );
+        assert!(
+            mined.source_sequences_represented <= 3,
+            "At most 3 source sequences represented",
+        );
+
+        // Each mined sequence must have exactly VERIFIER_WINDOW_SIZE
+        // per-frame 96-dim embeddings.
+        for seq in &mined.sequences {
+            assert_eq!(
+                seq.embeddings.len(),
+                VERIFIER_WINDOW_SIZE,
+                "Each mined sequence must have exactly {VERIFIER_WINDOW_SIZE} embeddings",
+            );
+            for emb in &seq.embeddings {
+                assert_eq!(
+                    emb.len(),
+                    EMBEDDING_DIM,
+                    "Each embedding must be {EMBEDDING_DIM}-dim",
+                );
+            }
+            // Provenance must be preserved.
+            assert_eq!(
+                seq.label_stratum,
+                crate::embedding_sequence::LabelStratum::Negative,
+                "Mined sequences must remain negative",
+            );
+        }
+    }
+
+    #[test]
+    fn test_mine_hard_negatives_max_per_sequence_enforced() {
+        // Verify that at most max_per_sequence windows are selected
+        // from each source sequence.
+        let classifier = test_classifier();
+        let mut rng = StdRng::seed_from_u64(200);
+
+        // A single long sequence with many frames.
+        let seq = make_seq_with_source(
+            (0..50).map(|_| make_positive_frame(&mut rng)).collect(),
+            crate::embedding_sequence::Source::Confusable,
+        );
+
+        let mined = mine_hard_negatives(
+            &classifier,
+            &[seq],
+            2, // max_per_sequence
+            VERIFIER_WINDOW_SIZE,
+        );
+
+        // At most 2 windows from a single sequence.
+        assert!(
+            mined.sequences.len() <= 2,
+            "At most 2 windows per sequence, got {}",
+            mined.sequences.len(),
+        );
+        assert_eq!(
+            mined.source_sequences_represented, 1,
+            "One source sequence should be represented",
+        );
+    }
+
+    #[test]
+    fn test_mine_hard_negatives_non_overlapping() {
+        // Verify that selected windows from the same source sequence
+        // are non-overlapping (separation ≥ VERIFIER_WINDOW_SIZE).
+        let classifier = test_classifier();
+
+        // Create embeddings where each frame has a unique value pattern:
+        // frame i has all 96 values = i (as f32).  This lets us identify
+        // which frame index a window's embeddings come from by examining any
+        // single element (e.g., the first element of each 96-dim embedding).
+        let n_frames = 30;
+        let embs: Vec<Vec<f32>> = (0..n_frames)
+            .map(|i| vec![i as f32; EMBEDDING_DIM])
+            .collect();
+        let seq = make_seq_with_source(embs, crate::embedding_sequence::Source::Confusable);
+
+        let mined = mine_hard_negatives(
+            &classifier,
+            &[seq],
+            4, // max_per_sequence = 4 to test with more windows
+            VERIFIER_WINDOW_SIZE,
+        );
+
+        // Each mined window is a 3-frame EmbeddingSequence.  Extract the
+        // frame indices from each window (via the first element of each of
+        // its 3 embeddings, which equals the original frame index).
+        let window_frames: Vec<Vec<usize>> = mined
+            .sequences
+            .iter()
+            .map(|s| {
+                s.embeddings
+                    .iter()
+                    .map(|e| e.first().copied().unwrap_or(0.0) as usize)
+                    .collect()
+            })
+            .collect();
+
+        // Verify pairwise non-overlap: any two windows from the same source
+        // must not share any frame index.
+        for (i, a_frames) in window_frames.iter().enumerate() {
+            for (j, b_frames) in window_frames.iter().enumerate() {
+                if i >= j {
+                    continue;
+                }
+                // Two windows overlap iff they share any frame index.
+                let any_shared = a_frames.iter().any(|af| b_frames.contains(af));
+                assert!(
+                    !any_shared,
+                    "Mined windows {i} (frames {a_frames:?}) and {j} \
+                     (frames {b_frames:?}) overlap — they share at least \
+                     one frame index but must have separation ≥ \
+                     {VERIFIER_WINDOW_SIZE}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mine_hard_negatives_constant_scores() {
+        // Verify that mine_hard_negatives handles a classifier with
+        // uniform (all-constant) scoring gracefully — every window
+        // scores the same, so the first N in sorted order should be
+        // selected (deterministic by position).
+        use crate::wake_word_classifier::ClassifierWeights;
+        let mut weights = ClassifierWeights::default();
+        // Zero out all trainable weights to make output constant.
+        weights.conv1_weight.fill(0.0);
+        weights.conv1_bias.fill(0.0);
+        weights.conv2_weight.fill(0.0);
+        weights.conv2_bias.fill(0.0);
+        weights.fc_weight.fill(0.0);
+        // fc_bias = logit(0.9) so sigmoid(logit) ≈ 0.9
+        let target = 0.9f32;
+        weights.fc_bias[0] = (target / (1.0 - target)).ln();
+        let classifier = WakeWordClassifier::new(weights);
+
+        let mut rng = StdRng::seed_from_u64(400);
+        let seq = make_seq_with_source(
+            (0..20).map(|_| make_positive_frame(&mut rng)).collect(),
+            crate::embedding_sequence::Source::Confusable,
+        );
+
+        let mined = mine_hard_negatives(
+            &classifier,
+            &[seq],
+            2, // max_per_sequence
+            VERIFIER_WINDOW_SIZE,
+        );
+
+        // Even with constant scores, should produce at most 2 windows.
+        assert!(
+            mined.sequences.len() <= 2,
+            "Constant classifier should still produce at most 2 windows per sequence",
+        );
+        assert_eq!(
+            mined.source_sequences_represented, 1,
+            "Source sequence should be represented",
+        );
     }
 }

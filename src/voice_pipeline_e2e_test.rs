@@ -2164,16 +2164,67 @@ pub(crate) fn run_internal() {
 
     // ── Phase 5: Train the VoiceVerifier (mahbot-855, mahbot-861) ─────────
     phase_start!("Phase 5: Training VoiceVerifier");
-    let verifier = VoiceVerifier::train(
-        &verifier_pos_streaming_sequences,
-        &verifier_neg_sequences,
-        Some(&per_negative_sequence_weights), // per-sequence weights matching production (mahbot-870 Fix 3)
-        VoiceVerifier::default_threshold(),
-        L2_LAMBDA,     // mahbot-854: 0.01
-        LEARNING_RATE, // mahbot-878: 0.001 (Adam)
-        MLP_MAX_ITER,  // mahbot-861: 2000 (MLP converges faster)
-        Some(42),      // fixed seed for deterministic benchmark (mahbot-882)
-    );
+
+    // Check whether hard-negative mining is enabled (mahbot-905).
+    // Uses the same env var as production for consistent A/B comparison.
+    let use_mining = crate::voice_verifier::use_hard_negative_mining();
+
+    let verifier = 'decide: {
+        if use_mining {
+            // ── Hard-negative mining path (mahbot-905) ─────────────────────────
+            // Use the trained classifier (from Phase 4) to mine hard negatives
+            // from verifier negative sequences, replacing tiered-weight all-windows.
+            let classifier = WakeWordClassifier::new_ensemble_weighted(
+                weights.clone(),
+                training_result.val_losses.clone(),
+            );
+            let mined = crate::voice_verifier::mine_hard_negatives(
+                &classifier,
+                &verifier_neg_sequences,
+                crate::MAX_NEGATIVE_WINDOWS_PER_SEQUENCE, // max_per_sequence
+                crate::VERIFIER_WINDOW_SIZE,              // min_separation
+            );
+
+            if mined.sequences.len() >= crate::voice_verifier::MIN_MINED_NEGATIVES_FALLBACK {
+                info!(
+                    "Hard-negative mining (mahbot-905): selected {} windows from {}/{} source \
+                     sequences for verifier training; using uniform weights",
+                    mined.sequences.len(),
+                    mined.source_sequences_represented,
+                    verifier_neg_sequences.len(),
+                );
+                break 'decide VoiceVerifier::train(
+                    &verifier_pos_streaming_sequences,
+                    &mined.sequences,
+                    None, // uniform weights — mining replaces tiered weights
+                    VoiceVerifier::default_threshold(),
+                    L2_LAMBDA,     // mahbot-854: 0.01
+                    LEARNING_RATE, // mahbot-878: 0.001 (Adam)
+                    MLP_MAX_ITER,  // mahbot-861: 2000 (MLP converges faster)
+                    Some(42),      // fixed seed for deterministic benchmark (mahbot-882)
+                );
+            }
+            warn!(
+                "Hard-negative mining produced only {} windows (< {}); \
+                 falling back to all-windows training (mahbot-905)",
+                mined.sequences.len(),
+                crate::voice_verifier::MIN_MINED_NEGATIVES_FALLBACK,
+            );
+        }
+
+        // ── Original all-windows path (mahbot-872) ─────────────────────────
+        // Also reached by mining fallback.
+        VoiceVerifier::train(
+            &verifier_pos_streaming_sequences,
+            &verifier_neg_sequences,
+            Some(&per_negative_sequence_weights), // per-sequence weights matching production (mahbot-870 Fix 3)
+            VoiceVerifier::default_threshold(),
+            L2_LAMBDA,     // mahbot-854: 0.01
+            LEARNING_RATE, // mahbot-878: 0.001 (Adam)
+            MLP_MAX_ITER,  // mahbot-861: 2000 (MLP converges faster)
+            Some(42),      // fixed seed for deterministic benchmark (mahbot-882)
+        )
+    };
 
     if verifier.is_trained() {
         info!(
