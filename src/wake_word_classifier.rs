@@ -338,15 +338,8 @@ impl ClassifierWeights {
 pub struct WakeWordClassifier {
     /// Ensemble member weight sets.  In single-model mode this contains one
     /// entry; in ensemble mode (mahbot-839) it contains `NUM_ENSEMBLE_MEMBERS`
-    /// entries and `forward()` averages their post-sigmoid scores.
+    /// entries and `forward()` averages their post-sigmoid scores uniformly.
     members: Vec<ClassifierWeights>,
-    /// Per-member validation losses for softmax-weighted averaging (mahbot-847).
-    /// When empty (backward compat / legacy single-model path), falls back
-    /// to uniform averaging.
-    member_val_losses: Vec<f32>,
-    /// Pre-computed softmax weights cached at construction time (mahbot-847).
-    /// Avoids recomputing on every inference frame.
-    cached_weights: Vec<f32>,
 }
 
 // ── Unified forward pass ─────────────────────────────────────────────
@@ -404,8 +397,6 @@ impl WakeWordClassifier {
     pub fn new(weights: ClassifierWeights) -> Self {
         Self {
             members: vec![weights],
-            member_val_losses: vec![],
-            cached_weights: vec![1.0],
         }
     }
 
@@ -415,14 +406,7 @@ impl WakeWordClassifier {
         &self.members
     }
 
-    /// Return a reference to the per-member validation losses (empty if
-    /// unavailable, e.g. backward compat / uniform-averaging mode).
-    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
-    pub fn val_losses_ref(&self) -> &[f32] {
-        &self.member_val_losses
-    }
-
-    /// Create a multi-member ensemble classifier.
+    /// Create a multi-member ensemble classifier with uniform averaging.
     ///
     /// # Panics
     /// Panics if `members` is empty — an ensemble must have at least one model.
@@ -431,73 +415,14 @@ impl WakeWordClassifier {
             !members.is_empty(),
             "Ensemble must have at least one member"
         );
-        let n = members.len();
-        Self {
-            members,
-            member_val_losses: vec![],
-            cached_weights: vec![1.0 / n as f32; n],
-        }
-    }
-
-    /// Create a multi-member ensemble classifier with per-member validation
-    /// losses for softmax-weighted averaging (mahbot-847).
-    ///
-    /// When `val_losses` has the wrong length or is empty, falls back to
-    /// uniform averaging (backward compatibility).
-    ///
-    /// # Panics
-    /// Panics if `members` is empty — an ensemble must have at least one model.
-    pub fn new_ensemble_weighted(members: Vec<ClassifierWeights>, val_losses: Vec<f32>) -> Self {
-        assert!(
-            !members.is_empty(),
-            "Ensemble must have at least one member"
-        );
-        let n = members.len();
-        let (member_val_losses, cached_weights) = if val_losses.len() == n {
-            let weights = Self::compute_softmax_weights(&val_losses, n);
-            (val_losses, weights)
-        } else {
-            (vec![], vec![1.0 / n as f32; n])
-        };
-        Self {
-            members,
-            member_val_losses,
-            cached_weights,
-        }
-    }
-
-    /// Compute softmax weights from member validation losses.
-    /// Uses `exp(-(loss - min_loss))` for numerical stability, ensuring the
-    /// best model (lowest loss) always gets the highest weight.
-    /// Falls back to uniform weights when validation losses are unavailable.
-    fn compute_softmax_weights(val_losses: &[f32], n: usize) -> Vec<f32> {
-        // Caller (new_ensemble_weighted) ensures len matches and n > 0.
-        debug_assert!(val_losses.len() == n && n > 0);
-        // Guard against NaN in validation losses — if any entry is NaN the
-        // softmax computation produces all-NaN weights, corrupting inference.
-        if val_losses.iter().any(|v| v.is_nan()) {
-            return vec![1.0 / n as f32; n];
-        }
-        let min_loss = val_losses.iter().copied().fold(f32::INFINITY, f32::min);
-        let mut exps = Vec::with_capacity(n);
-        let mut sum = 0.0;
-        for &loss in val_losses {
-            let e = (-(loss - min_loss)).exp();
-            exps.push(e);
-            sum += e;
-        }
-        // sum is always > 0 for finite inputs, but guard defensively.
-        debug_assert!(sum > 0.0, "Sum of exponentials must be positive");
-        exps.iter().map(|e| e / sum).collect()
+        Self { members }
     }
 
     /// Run the forward pass through all ensemble members and return the
-    /// softmax-weighted average post-sigmoid score (mahbot-847).
+    /// uniformly-averaged post-sigmoid score (mahbot-904).
     ///
     /// For a single-model classifier this is equivalent to the original
     /// single-member forward pass.
-    /// For an unweighted ensemble (no val_losses available), falls back to
-    /// uniform averaging.
     pub fn forward(&self, embeddings: &[Vec<f32>]) -> f32 {
         debug_assert_eq!(embeddings.len(), WINDOW_SIZE);
         // Flatten 3 embeddings into a 288-dim window, then L2-normalize
@@ -517,15 +442,12 @@ impl WakeWordClassifier {
         // Convert from samples-first to channels-first layout for Conv1D.
         let cf = to_channels_first(&x, EMBEDDING_DIM, WINDOW_SIZE);
 
-        // Softmax-weighted average of post-sigmoid scores across all
-        // ensemble members (mahbot-847).  Models with lower validation
-        // loss contribute more to the final detection score.
-        // Weights are pre-computed at construction time to avoid recomputation
-        // on every inference frame.
-        debug_assert_eq!(self.cached_weights.len(), self.members.len());
+        // Uniform average of post-sigmoid scores across all ensemble members
+        // (mahbot-904).  All members contribute equally.
+        let n = self.members.len() as f32;
         let mut total = 0.0;
-        for (i, w) in self.members.iter().enumerate() {
-            total += self.cached_weights[i] * forward_pass(&cf, w);
+        for w in &self.members {
+            total += forward_pass(&cf, w) / n;
         }
         total
     }
@@ -617,10 +539,6 @@ pub struct ClassifierTrainingResult {
     pub epochs_trained: usize,
     /// Best validation loss achieved during training.
     pub best_val_loss: f32,
-    /// Per-member validation losses for softmax-weighted averaging (mahbot-847).
-    /// One entry per member in `weights`.  When empty, the caller should fall
-    /// back to uniform averaging.
-    pub val_losses: Vec<f32>,
     /// Mean positive class score after training.
     #[allow(dead_code)]
     pub pos_scores_mean: f32,
@@ -956,7 +874,6 @@ pub fn train_classifier(
         weights: vec![weights],
         epochs_trained,
         best_val_loss: best_loss,
-        val_losses: vec![best_loss],
         pos_scores_mean,
         pos_scores_min,
         pos_scores_max,
@@ -1569,94 +1486,62 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_softmax_weights_basic() {
-        let losses = vec![1.0, 2.0, 3.0];
-        let weights = WakeWordClassifier::compute_softmax_weights(&losses, 3);
-        assert_eq!(weights.len(), 3);
-        // Best model (lowest loss) gets highest weight
-        assert!(
-            weights[0] > weights[1] && weights[1] > weights[2],
-            "Weights should be strictly decreasing with increasing loss: {weights:?}",
-        );
-        // Weights sum to 1.0
-        let wsum: f32 = weights.iter().sum();
-        assert!(
-            (wsum - 1.0).abs() < 1e-6,
-            "Weights should sum to 1.0, got {wsum}",
-        );
-    }
-
-    #[test]
-    fn test_ensemble_weighted_length_mismatch() {
-        // When val_losses length doesn't match member count,
-        // new_ensemble_weighted falls back to uniform averaging.
+    fn test_classifier_deterministic_training() {
+        // Two training runs with the same seed and identical training data
+        // must produce identical weights (mahbot-904 AC #3).
         let mut rng = rand::rng();
-        let mut make_weights = || -> ClassifierWeights {
-            let mut w = ClassifierWeights::default();
-            w.fc_bias[0] = rng.random::<f32>() * 2.0 - 1.0;
-            w
+        let mut make_emb = |center: f32, noise: f32| -> Vec<f32> {
+            (0..EMBEDDING_DIM)
+                .map(|_| center + (rng.random::<f32>() - 0.5) * noise)
+                .collect()
         };
-        let members = vec![make_weights(), make_weights(), make_weights()];
-        let losses = vec![1.0, 2.0]; // 2 losses for 3 members
-        let classifier = WakeWordClassifier::new_ensemble_weighted(members, losses);
-        // Cached weights should be uniform (1/3).
-        assert_eq!(classifier.cached_weights.len(), 3);
-        let expected = 1.0 / 3.0;
-        for &w in &classifier.cached_weights {
-            assert!(
-                (w - expected).abs() < 1e-6,
-                "Uniform fallback expected {expected}, got {w}",
-            );
-        }
-        assert!(
-            classifier.member_val_losses.is_empty(),
-            "Should store no val_losses on length mismatch",
-        );
-    }
 
-    #[test]
-    fn test_compute_softmax_weights_nan_guard() {
-        // NaN in val_losses should produce uniform fallback.
-        let losses = vec![1.0, f32::NAN, 3.0];
-        let weights = WakeWordClassifier::compute_softmax_weights(&losses, 3);
-        assert_eq!(weights.len(), 3);
-        let expected = 1.0 / 3.0;
-        for &w in &weights {
-            assert!(
-                (w - expected).abs() < 1e-6,
-                "NaN guard should fall back to uniform, got {w}",
-            );
-        }
-        // All weights must be finite (not NaN).
-        assert!(
-            weights.iter().all(|w| w.is_finite()),
-            "All weights must be finite: {weights:?}",
-        );
-    }
+        // 30 windows each = 90 embeddings (WINDOW_SIZE per window).
+        let n_wins = 30;
+        let n_embs = n_wins * WINDOW_SIZE;
+        let pos_embs: Vec<Vec<f32>> = (0..n_embs).map(|_| make_emb(0.3, 0.4)).collect();
+        let neg_embs: Vec<Vec<f32>> = (0..n_embs).map(|_| make_emb(-0.3, 0.4)).collect();
 
-    #[test]
-    fn test_ensemble_weighted_vs_uniform() {
-        // A 3-member ensemble where members produce different scores.
-        // Weighted averaging should give different result from uniform.
-        let mut rng = rand::rng();
-        let make_weights = |bias: f32| -> ClassifierWeights {
-            let mut w = ClassifierWeights::default();
-            // Set fc_bias to produce different post-sigmoid scores.
-            w.fc_bias[0] = bias;
-            w
+        let pos_seq = make_seq(pos_embs, LabelStratum::Positive);
+        let neg_seq = make_seq(neg_embs, LabelStratum::Negative);
+
+        let cfg1 = TrainingConfig {
+            rng_seed: Some(42),
+            ..Default::default()
         };
-        let members = vec![make_weights(0.5), make_weights(0.0), make_weights(-0.5)];
-        let embs: Vec<Vec<f32>> = (0..WINDOW_SIZE).map(|_| vec![0.3; EMBEDDING_DIM]).collect();
+        let cfg2 = TrainingConfig {
+            rng_seed: Some(42),
+            ..Default::default()
+        };
 
-        let uniform = WakeWordClassifier::new_ensemble(members.clone());
-        let unweighted = uniform.forward(&embs);
+        let result1 = train_classifier(&[pos_seq.clone()], &[neg_seq.clone()], &cfg1).unwrap();
+        let result2 = train_classifier(&[pos_seq], &[neg_seq], &cfg2).unwrap();
 
-        let weighted = WakeWordClassifier::new_ensemble_weighted(members, vec![1.0, 2.0, 3.0]);
-        let weighted_score = weighted.forward(&embs);
-
-        assert!(
-            (weighted_score - unweighted).abs() > 0.001,
-            "Weighted and uniform scores should differ: weighted={weighted_score} uniform={unweighted}",
+        assert_eq!(
+            result1.weights.len(),
+            result2.weights.len(),
+            "Ensemble member count must match"
         );
+        for (i, (w1, w2)) in result1
+            .weights
+            .iter()
+            .zip(result2.weights.iter())
+            .enumerate()
+        {
+            // Compare all weight slices element-by-element.
+            let all_slices_1 = w1.all_weight_slices();
+            let all_slices_2 = w2.all_weight_slices();
+            assert_eq!(
+                all_slices_1.len(),
+                all_slices_2.len(),
+                "Weight slice count mismatch for member {i}",
+            );
+            for (j, (s1, s2)) in all_slices_1.iter().zip(all_slices_2.iter()).enumerate() {
+                assert_eq!(
+                    s1, s2,
+                    "Weight slice {j} differs between deterministic training runs for member {i}",
+                );
+            }
+        }
     }
 }

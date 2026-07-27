@@ -1092,10 +1092,7 @@ fn test_detection_samples(
 ) {
     // Set classifier + verifier in global state for the streaming pipeline.
     // try_match_wake_word_and_push_embedding reads these from voice_state().
-    super::set_classifier_weighted(
-        classifier.weights_ref().to_vec(),
-        classifier.val_losses_ref().to_vec(),
-    );
+    super::set_classifier_weights(classifier.weights_ref().to_vec());
     super::set_verifier(verifier.clone());
 
     for (samples, label) in variants {
@@ -1324,10 +1321,7 @@ fn run_noise_overlap_test(
 ) -> Vec<(String, f64)> {
     // Set classifier + verifier in global state (test_detection_samples does
     // this too but we inline the loop to share adaptive state across variants).
-    super::set_classifier_weighted(
-        classifier.weights_ref().to_vec(),
-        classifier.val_losses_ref().to_vec(),
-    );
+    super::set_classifier_weights(classifier.weights_ref().to_vec());
     super::set_verifier(verifier.clone());
 
     // Pre-warm a shared adaptive threshold state so the benchmark actually
@@ -2101,10 +2095,7 @@ pub(crate) fn run_internal() {
     let neg_scores_min = training_result.neg_scores_min;
     let neg_scores_max = training_result.neg_scores_max;
 
-    let classifier = WakeWordClassifier::new_ensemble_weighted(
-        weights.clone(),
-        training_result.val_losses.clone(),
-    );
+    let classifier = WakeWordClassifier::new_ensemble(weights.clone());
     let first_params = weights.first().map_or(
         0,
         crate::wake_word_classifier::ClassifierWeights::param_count,
@@ -2174,10 +2165,7 @@ pub(crate) fn run_internal() {
             // ── Hard-negative mining path (mahbot-905) ─────────────────────────
             // Use the trained classifier (from Phase 4) to mine hard negatives
             // from verifier negative sequences, replacing tiered-weight all-windows.
-            let classifier = WakeWordClassifier::new_ensemble_weighted(
-                weights.clone(),
-                training_result.val_losses.clone(),
-            );
+            let classifier = WakeWordClassifier::new_ensemble(weights.clone());
             let mined = crate::voice_verifier::mine_hard_negatives(
                 &classifier,
                 &verifier_neg_sequences,
@@ -2240,7 +2228,7 @@ pub(crate) fn run_internal() {
 
     // ── Phase 6: Set global state for streaming detection ────────────────
     phase_start!("Phase 6: Setting global state");
-    super::set_classifier_weighted(weights.clone(), training_result.val_losses.clone());
+    super::set_classifier_weights(weights.clone());
     super::set_verifier(verifier.clone());
     phase_times[P_GLOBAL_STATE] = phase_end_ms!();
 

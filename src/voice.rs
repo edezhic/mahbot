@@ -1980,10 +1980,6 @@ struct VoicePipelineState {
     /// In ensemble mode (mahbot-839) this contains all `NUM_ENSEMBLE_MEMBERS`
     /// weight sets; in legacy mode it contains a single entry.
     classifier_weights: Option<Vec<ClassifierWeights>>,
-    /// Per-member validation losses for softmax-weighted averaging (mahbot-847).
-    /// Used by [`set_classifier_weights`] to create a weighted ensemble.
-    /// Empty vec means uniform averaging (backward compat).
-    classifier_val_losses: Vec<f32>,
     /// Cached classifier for inference (avoids per-frame clone of weights).
     /// Recreated when [`classifier_weights`] changes.
     classifier: Option<WakeWordClassifier>,
@@ -2078,7 +2074,6 @@ pub fn init_global() -> Result<()> {
             enabled: false,
             status: VoiceStatus::Disabled,
             classifier_weights: None,
-            classifier_val_losses: vec![],
             classifier: None,
             verifier: VoiceVerifier::untrained(),
             enrollment_buffer: Vec::new(),
@@ -2129,27 +2124,7 @@ pub fn set_classifier_weights(weights: Vec<ClassifierWeights>) {
     let mut state = voice_state().write().unwrap_poison();
     debug_assert!(!weights.is_empty(), "Classifier weights must not be empty");
     state.classifier_weights = Some(weights.clone());
-    // Reset val_losses to prevent stale losses from a prior weighted session
-    // silently contaminating a caller who only has weights (mahbot-847).
-    state.classifier_val_losses.clear();
     state.classifier = Some(WakeWordClassifier::new_ensemble(weights));
-}
-
-/// Atomically set both classifier weights and validation losses in a single
-/// lock acquisition (mahbot-847).  Avoids the two-step pattern where a
-/// concurrent inference frame could observe uniform averaging before the
-/// weighted-averaging constructor replaces the classifier.
-pub fn set_classifier_weighted(weights: Vec<ClassifierWeights>, val_losses: Vec<f32>) {
-    let n = weights.len();
-    let classifier = WakeWordClassifier::new_ensemble_weighted(weights.clone(), val_losses.clone());
-    let mut state = voice_state().write().unwrap_poison();
-    state.classifier_weights = Some(weights);
-    state.classifier_val_losses = if val_losses.len() == n {
-        val_losses
-    } else {
-        vec![]
-    };
-    state.classifier = Some(classifier);
 }
 
 #[must_use]
@@ -4010,7 +3985,6 @@ pub(crate) fn finalize_enrollment(
         });
 
     let mut all_weights = Vec::with_capacity(wake_word_classifier::NUM_ENSEMBLE_MEMBERS);
-    let mut all_val_losses = Vec::with_capacity(wake_word_classifier::NUM_ENSEMBLE_MEMBERS);
     // Track stats from seed-0 model for reporting (informational only)
     let mut epochs_trained = 0;
     let mut best_val_loss = f32::INFINITY;
@@ -4025,7 +3999,6 @@ pub(crate) fn finalize_enrollment(
         let r = result?;
         // Each result already validated its weights internally
         all_weights.extend(r.weights);
-        all_val_losses.push(r.best_val_loss);
         if i == 0 {
             epochs_trained = r.epochs_trained;
             best_val_loss = r.best_val_loss;
@@ -4042,7 +4015,6 @@ pub(crate) fn finalize_enrollment(
         weights: all_weights,
         epochs_trained,
         best_val_loss,
-        val_losses: all_val_losses,
         pos_scores_mean,
         pos_scores_min,
         pos_scores_max,
@@ -5306,11 +5278,7 @@ pub async fn run_voice_pipeline() {
                     .is_some_and(|members| members.iter().all(|w| w.validate().is_ok()));
                 if all_valid {
                     if let Some(ref members) = model.classifier {
-                        if let Some(ref vl) = model.val_losses {
-                            set_classifier_weighted(members.clone(), vl.clone());
-                        } else {
-                            set_classifier_weights(members.clone());
-                        }
+                        set_classifier_weights(members.clone());
                     }
                     if let Some(ref v) = model.verifier {
                         set_verifier(v.clone());
@@ -5973,7 +5941,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
         .await
         .unwrap_or_else(|e| Err(anyhow!("Classifier training task panicked: {e}")));
 
-        let (weights, val_losses) = match classifier_result {
+        let weights = match classifier_result {
             Ok(result) => {
                 // First model's weights for reporting (all are identical architecture)
                 let first_params = result
@@ -5996,8 +5964,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                     result.epochs_trained,
                     result.best_val_loss,
                 );
-                let vl = result.val_losses.clone();
-                (result.weights, vl)
+                result.weights
             }
             Err(e) => {
                 warn!("Enrollment finalization failed: {e}");
@@ -6055,10 +6022,9 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
             }
             neg
         };
-        // Clone weights and val_losses for the verifier training closure
+        // Clone weights for the verifier training closure
         // (they're also used later for the self-test classifier, mahbot-905).
         let verifier_weights = weights.clone();
-        let verifier_val_losses = val_losses.clone();
         let verifier = tokio::task::spawn_blocking(move || {
                     use crate::voice_verifier::{
                         assert_weight_tier, mine_hard_negatives, CONFUSABLE_UPWEIGHT,
@@ -6091,9 +6057,8 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                         let use_mining = crate::voice_verifier::use_hard_negative_mining();
                         let (neg_to_use, per_neg_weights_opt) = 'decide: {
                             if use_mining {
-                                let classifier = WakeWordClassifier::new_ensemble_weighted(
+                                let classifier = WakeWordClassifier::new_ensemble(
                                     verifier_weights,
-                                    verifier_val_losses,
                                 );
                                 let mined = mine_hard_negatives(
                                     &classifier,
@@ -6206,8 +6171,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
         // ENROLLMENT_QUALITY_SELF_TEST_MIN_FRACTION of them to trigger
         // detection.  If this fails, the model is NOT deployed — the
         // enrollment is treated as failed and the user must re-enroll.
-        let classifier =
-            WakeWordClassifier::new_ensemble_weighted(weights.clone(), val_losses.clone());
+        let classifier = WakeWordClassifier::new_ensemble(weights.clone());
         if let Err(e) = run_enrollment_self_test(&self_test_seqs, &classifier) {
             warn!("Enrollment self-test failed — model rejected: {e}.  Re-enrollment required.");
             set_status(VoiceStatus::Error(format!(
@@ -6218,7 +6182,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
         info!("Enrollment self-test: passed — deploying model");
 
         // ── Store classifier + verifier in global state ──
-        set_classifier_weighted(weights.clone(), val_losses);
+        set_classifier_weights(weights);
         set_verifier(verifier);
 
         // ── Persist to config DB ──
@@ -6313,9 +6277,9 @@ struct PersistedModel {
     /// weight set is wrapped in a vec during migration.
     #[serde(default, deserialize_with = "deserialize_classifier_opt")]
     classifier: Option<Vec<ClassifierWeights>>,
-    /// Per-member validation losses for softmax-weighted averaging.
-    /// Optional for backward compatibility — when missing, falls back to
-    /// uniform averaging.
+    /// Per-member validation losses from pre-mahbot-904 persisted models.
+    /// Kept for backward compatible deserialization only — always None in
+    /// newly persisted models and never read on load (uniform averaging).
     #[serde(skip_serializing_if = "Option::is_none")]
     val_losses: Option<Vec<f32>>,
     /// Second-stage verifier (MLP or legacy logistic regression).
@@ -6556,14 +6520,6 @@ async fn persist_wake_word_model(model: &PersistedModel) -> bool {
 async fn persist_model_state() {
     let weights = get_classifier_weights();
     let verifier = get_verifier();
-    let val_losses = {
-        let state = voice_state().read().unwrap_poison();
-        if state.classifier_val_losses.is_empty() {
-            None
-        } else {
-            Some(state.classifier_val_losses.clone())
-        }
-    };
 
     // Read the enrolling phrase (set at enrollment start) and clear it
     // so re-enrollment starts fresh.
@@ -6604,7 +6560,7 @@ async fn persist_model_state() {
         trained_at: now,
         model_hash: String::new(), // computed below
         classifier: weights,
-        val_losses,
+        val_losses: None, // mahbot-904: no longer stored (uniform averaging)
         verifier: Some(verifier),
     };
     model.model_hash = compute_model_hash(&model);
@@ -9614,7 +9570,6 @@ mod tests {
             enabled: false,
             status: VoiceStatus::Disabled,
             classifier_weights: None,
-            classifier_val_losses: vec![],
             classifier: None,
             verifier: crate::voice_verifier::VoiceVerifier::untrained(),
             enrollment_buffer: Vec::new(),
