@@ -1003,7 +1003,105 @@ impl ClassifierCandidate {
     }
 }
 
-/// Number of recent per-frame scores to keep in the rolling sum window
+/// Maximum number of embedding decisions retained in the activation trace
+/// circular buffer (mahbot-897).  Covers ~3 seconds of streaming audio at
+/// ~128 ms/embedding, giving enough pre-trigger context for false-trigger
+/// diagnostics.
+const ACTIVATION_TRACE_CAPACITY: usize = 24;
+
+/// A single embedding decision recorded in the activation trace (mahbot-897).
+///
+/// Every embedding processed by [`score_single_embedding`] produces one entry.
+/// The circular buffer keeps the last [`ACTIVATION_TRACE_CAPACITY`] entries.
+/// Exported on wake word activation, near-miss detection, or user feedback.
+///
+/// # Memory
+/// - In-memory only — no audio recording or persistence to disk
+/// - Bounded to [`ACTIVATION_TRACE_CAPACITY`] entries (~24 × 4×f32 + Option<u64> ≈ 1 KB)
+#[derive(Debug)]
+pub(crate) struct ActivationTraceEntry {
+    /// Raw Conv1D MLP classifier score for this embedding
+    pub classifier_score: f32,
+    /// Rolling window sum at the time of evaluation
+    pub rolling_sum: f32,
+    /// Effective threshold used for the rolling window comparison
+    /// (adaptive threshold post-bootstrap, or static match_threshold()
+    /// during bootstrap / when no adaptive state is configured).
+    pub threshold: f32,
+    /// Per-embedding max verifier score across all stride-1 3-frame
+    /// windows (0.0 if verifier not computed, e.g. during warm-up).
+    pub verifier_score: f32,
+    /// Monotonically increasing identifier for the active classifier
+    /// candidate, or `None` if no candidate was active during this
+    /// embedding.  Each time a new candidate is created (rolling sum
+    /// first crosses threshold post-warm-up), this counter increments.
+    pub candidate_id: Option<u64>,
+}
+
+/// Bounded activation trace buffer backed by a `VecDeque` (mahbot-897).
+///
+/// Always-on — every embedding produces an entry.  The buffer is NEVER
+/// cleared by pipeline resets ([`ResetLevel::Full`], [`ResetLevel::Soft`],
+/// [`ResetLevel::Cancel`]) so that pre-trigger evidence is preserved across
+/// detection→recording handoffs and cooldown periods.
+///
+/// # Export triggers (controlled by the caller)
+/// - **Activation** (`detected == true`) — exported before
+///   [`PipelineCtx::transition_to_recording`] clears detection buffers.
+/// - **Near-miss** (classifier confident but verifier blocked) — see
+///   [`crate::voice::try_match_wake_word_and_push_embedding`].
+/// - **User feedback** — not yet implemented (mahbot-897 deferral).
+#[derive(Debug)]
+pub(crate) struct ActivationTraceBuffer {
+    entries: VecDeque<ActivationTraceEntry>,
+}
+
+impl ActivationTraceBuffer {
+    pub fn new() -> Self {
+        Self {
+            entries: VecDeque::with_capacity(ACTIVATION_TRACE_CAPACITY),
+        }
+    }
+
+    /// Push a new entry, evicting the oldest if at capacity.
+    pub fn push(&mut self, entry: ActivationTraceEntry) {
+        if self.entries.len() >= ACTIVATION_TRACE_CAPACITY {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
+    }
+
+    /// Number of entries currently in the buffer.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Iterate over entries from oldest to newest.
+    pub fn iter(&self) -> impl Iterator<Item = &ActivationTraceEntry> + '_ {
+        self.entries.iter()
+    }
+}
+
+impl Default for ActivationTraceBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Near-miss threshold fraction (mahbot-897).
+///
+/// When the rolling sum reaches at least this fraction of the effective
+/// threshold but detection does not fire, a near-miss is declared and the
+/// activation trace is exported.  A value of 0.75 means "rolling sum >= 75%
+/// of the detection threshold constitutes a near-miss".
+const NEAR_MISS_ROLLING_SUM_FRACTION: f32 = 0.75;
+
+/// Minimum interval (in seconds) between near-miss trace exports (mahbot-897).
+/// Prevents log flooding during sustained high-scoring audio (background TV,
+/// music, etc.) where the rolling sum stays above 75 % of threshold on every
+/// embedding frame (~8 Hz).  At most ~25 log lines per second with this limit.
+const NEAR_MISS_EXPORT_COOLDOWN: Duration = Duration::from_secs(1);
+
 /// (mahbot-773).  Each frame represents ~128ms of voiced audio, so N=3
 /// covers ~384ms — matching the original temporal window but using
 /// accumulated weight instead of a strict consecutive binary counter.
@@ -1201,9 +1299,9 @@ fn voice_debug_enabled() -> bool {
 /// the second-stage MLP verifier gate via a bounded classifier candidate.
 ///
 /// # Returns
-/// - `(true, rolling_sum, total_score, effective_threshold)` — the embedding
+/// - `(true, rolling_sum, total_score, effective_threshold, max_verifier_score)` — the embedding
 ///   triggered wake word detection (all gates passed).
-/// - `(false, _, total_score, effective_threshold)` — continue feeding more
+/// - `(false, _, total_score, effective_threshold, max_verifier_score)` — continue feeding more
 ///   embeddings (the ring buffer and score window are updated for the next
 ///   call).
 ///
@@ -1212,6 +1310,10 @@ fn voice_debug_enabled() -> bool {
 /// - `total_score` — the raw soft score from the Conv1D MLP classifier.
 /// - `effective_threshold` — the threshold value used for the rolling window
 ///   comparison this frame (see below).
+/// - `max_verifier_score` — the maximum verifier score across all stride-1
+///   3-frame windows in the ring buffer for this embedding (0.0 if the verifier
+///   was not computed, e.g. during warm-up or when no verifier is configured).
+///   Used by the activation trace (mahbot-897) and available for diagnostics.
 ///
 /// The `effective_threshold` is either the adaptive threshold (post-bootstrap)
 /// or the static [`match_threshold()`] (during bootstrap or when no adaptive
@@ -1259,7 +1361,13 @@ pub(crate) fn score_single_embedding(
     mut adaptive_state: Option<&mut AdaptiveThresholdState>,
     adaptive_k: f32,
     mut candidate: Option<&mut Option<ClassifierCandidate>>,
-) -> (bool, f32, f32, f32) {
+) -> (bool, f32, f32, f32, f32, bool) {
+    // Track whether a new ClassifierCandidate was created during this call
+    // (mahbot-897).  Used by the caller to increment the candidate ID counter
+    // without temporal coupling (the old pattern was a pre-call capture +
+    // post-call comparison that silently degrades if code is inserted between).
+    let mut candidate_was_created = false;
+
     // ── Ring buffer ───────────────────────────────────────────────────
     embedding_ring.push(embedding.to_vec());
     while embedding_ring.len() > EMBEDDING_RING_MAX {
@@ -1487,7 +1595,14 @@ pub(crate) fn score_single_embedding(
                     && c.peak_verifier_score >= v.threshold
                 {
                     // Candidate confirmed — detection fires!
-                    return (true, rolling_sum, total_score, effective_threshold);
+                    return (
+                        true,
+                        rolling_sum,
+                        total_score,
+                        effective_threshold,
+                        max_verifier_score,
+                        candidate_was_created,
+                    );
                 }
 
                 if expired {
@@ -1504,26 +1619,55 @@ pub(crate) fn score_single_embedding(
                         }
                     }
                     **opt = None;
-                    return (false, rolling_sum, total_score, effective_threshold);
+                    return (
+                        false,
+                        rolling_sum,
+                        total_score,
+                        effective_threshold,
+                        max_verifier_score,
+                        candidate_was_created,
+                    );
                 }
 
                 // Candidate still alive — verifier hasn't confirmed yet
                 // but the window hasn't expired either.
-                return (false, rolling_sum, total_score, effective_threshold);
+                return (
+                    false,
+                    rolling_sum,
+                    total_score,
+                    effective_threshold,
+                    max_verifier_score,
+                    candidate_was_created,
+                );
             }
 
             // No active candidate — this is the first threshold crossing.
             **opt = Some(ClassifierCandidate::new(max_verifier_score));
+            candidate_was_created = true;
 
             // Check threshold immediately on creation
             if let Some(v) = verifier
                 && v.is_trained()
                 && max_verifier_score >= v.threshold
             {
-                return (true, rolling_sum, total_score, effective_threshold);
+                return (
+                    true,
+                    rolling_sum,
+                    total_score,
+                    effective_threshold,
+                    max_verifier_score,
+                    candidate_was_created,
+                );
             }
 
-            return (false, rolling_sum, total_score, effective_threshold);
+            return (
+                false,
+                rolling_sum,
+                total_score,
+                effective_threshold,
+                max_verifier_score,
+                candidate_was_created,
+            );
         }
 
         // No candidate tracking requested (e.g., enrollment self-test
@@ -1533,9 +1677,23 @@ pub(crate) fn score_single_embedding(
             && v.is_trained()
             && max_verifier_score < v.threshold
         {
-            return (false, rolling_sum, total_score, effective_threshold);
+            return (
+                false,
+                rolling_sum,
+                total_score,
+                effective_threshold,
+                max_verifier_score,
+                candidate_was_created,
+            );
         }
-        return (true, rolling_sum, total_score, effective_threshold);
+        return (
+            true,
+            rolling_sum,
+            total_score,
+            effective_threshold,
+            max_verifier_score,
+            candidate_was_created,
+        );
     }
 
     // ── Score window was reset (or never reached threshold) ─────────────
@@ -1548,7 +1706,14 @@ pub(crate) fn score_single_embedding(
         **opt = None;
     }
 
-    (false, rolling_sum, total_score, effective_threshold)
+    (
+        false,
+        rolling_sum,
+        total_score,
+        effective_threshold,
+        max_verifier_score,
+        candidate_was_created,
+    )
 }
 
 // Higher VAD threshold for enrollment: only clear, close-mic speech should
@@ -3511,7 +3676,7 @@ fn run_enrollment_self_test(
         let mut detected = false;
 
         for embedding in utterance {
-            let (detected_this, _, _, _) = score_single_embedding(
+            let (detected_this, _, _, _, _, _) = score_single_embedding(
                 embedding,
                 &mut embedding_ring,
                 Some(classifier),
@@ -4477,6 +4642,28 @@ pub(crate) struct PipelineCtx {
     /// accumulation.
     segment_silence_hops: usize,
 
+    /// Monotonically increasing counter for classifier candidate IDs
+    /// (mahbot-897).  Incremented each time a new
+    /// [`ClassifierCandidate`] is created (rolling sum first crosses
+    /// threshold post-warm-up).  Used as the [`candidate_id`] field in
+    /// activation trace entries.  Preserved across all pipeline resets
+    /// so that candidate identity is unambiguous across segments.
+    candidate_id_counter: u64,
+
+    /// Bounded circular buffer of recent embedding decision entries
+    /// (mahbot-897).  Preserved across all pipeline resets — never
+    /// cleared by [`reset_pipeline_state`] or
+    /// [`reset_detection_segment`].  Exported on activation, near-miss,
+    /// or user feedback.
+    activation_trace: ActivationTraceBuffer,
+
+    /// Timestamp of the last near-miss trace export (mahbot-897).
+    /// Used to rate-limit near-miss exports to at most once per
+    /// [`NEAR_MISS_EXPORT_COOLDOWN`] to prevent log flooding during
+    /// sustained high-scoring audio (background TV, music, etc.).
+    /// Preserved across all pipeline resets.
+    last_near_miss_export: Option<Instant>,
+
     /// Instrumentation accumulators for wake word detection benchmarking
     /// (mahbot-886).  Feature-gated behind `voice-tests` — zero production
     /// overhead.  Populated by `try_match_wake_word_and_push_embedding` and
@@ -4560,6 +4747,9 @@ impl PipelineCtx {
             peak_score: 0.0,
             candidate: None,
             segment_silence_hops: 0,
+            candidate_id_counter: 0,
+            activation_trace: ActivationTraceBuffer::new(),
+            last_near_miss_export: None,
             #[cfg(feature = "voice-tests")]
             instrumentation: DetectionInstrumentation::new(),
         }
@@ -4580,6 +4770,7 @@ impl PipelineCtx {
     /// | VAD (`reset_vad()`) | called | NOT called | NOT called |
     /// | Global `enrollment_buffer`, `negative_audio_chunks` | preserved | preserved | cleared |
     /// | `refractory_until`, `last_error_message_time`, `last_model_retry`, `mic_rx`, `mic_stream`, `is_listening`, `enrollment_mode` | NOT touched | NOT touched | NOT touched |
+    /// | `candidate_id_counter`, `activation_trace`, `last_near_miss_export` (mahbot-897) | preserved | preserved | preserved |
     fn reset_pipeline_state(&mut self, level: ResetLevel) {
         // ── Audio accumulators (cleared by all levels) ──
         self.voice_batch.clear();
@@ -6600,6 +6791,7 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
 ///   a local variable taken from `ctx` to avoid conflicting borrows).
 ///
 /// Returns `true` if wake word was detected (caller should clear state and return).
+#[allow(clippy::too_many_lines)]
 fn try_match_wake_word_and_push_embedding(
     ctx: &mut PipelineCtx,
     mel_frame_buffer: &[Vec<f32>],
@@ -6656,8 +6848,14 @@ fn try_match_wake_word_and_push_embedding(
     // value for instrumentation (voice-tests only).
     #[cfg(feature = "voice-tests")]
     let candidate_peak_before = ctx.candidate.as_ref().map(|c| c.peak_verifier_score);
-    #[allow(unused_variables)]
-    let (detected, rolling_sum, total_score, effective_threshold) = score_single_embedding(
+    let (
+        detected,
+        rolling_sum,
+        total_score,
+        effective_threshold,
+        max_verifier_score,
+        candidate_was_created,
+    ) = score_single_embedding(
         &embedding,
         &mut ctx.embedding_ring,
         classifier,
@@ -6685,6 +6883,57 @@ fn try_match_wake_word_and_push_embedding(
     // Track peak rolling-sum for diagnostics/benchmarking (mahbot-845).
     if rolling_sum > ctx.peak_score {
         ctx.peak_score = rolling_sum;
+    }
+
+    // ── Candidate ID management (mahbot-897) ──────────────────────────────
+    // When a new classifier candidate was just created inside
+    // `score_single_embedding` (rolling sum first crossed threshold
+    // post-warm-up), increment the monotonic counter so each candidate
+    // has a unique ID for trace correlation.  The `candidate_was_created`
+    // bool is returned directly from `score_single_embedding`, eliminating
+    // the temporal coupling of a pre-call capture + post-call comparison.
+    if candidate_was_created {
+        ctx.candidate_id_counter += 1;
+    }
+
+    // ── Activation trace push (mahbot-897) ────────────────────────────────
+    // Every embedding produces an entry in the circular trace buffer.
+    let candidate_id = if ctx.candidate.is_some() {
+        Some(ctx.candidate_id_counter)
+    } else {
+        None
+    };
+    ctx.activation_trace.push(ActivationTraceEntry {
+        classifier_score: total_score,
+        rolling_sum,
+        threshold: effective_threshold,
+        verifier_score: max_verifier_score,
+        candidate_id,
+    });
+
+    // ── Near-miss detection and export (mahbot-897) ──────────────────────
+    // A near-miss occurs when the classifier was confident (rolling sum
+    // reached at least NEAR_MISS_ROLLING_SUM_FRACTION of the threshold)
+    // but detection did not fire.  This catches:
+    //   - Candidate expired (verifier blocked after creating a candidate)
+    //   - Score reset while candidate was active
+    //   - Warm-up suppression (detection structurally suppressed)
+    //   - Raw verifier gate block (no candidate tracking)
+    if !detected && rolling_sum >= effective_threshold * NEAR_MISS_ROLLING_SUM_FRACTION {
+        // Rate-limit: at most one near-miss export per cooldown period to
+        // prevent log flooding during sustained high-scoring audio.
+        let cooldown_ok = ctx
+            .last_near_miss_export
+            .is_none_or(|t| t.elapsed() >= NEAR_MISS_EXPORT_COOLDOWN);
+        if cooldown_ok {
+            ctx.last_near_miss_export = Some(std::time::Instant::now());
+            info!(
+                target: "mahbot::voice::activation_trace",
+                "NEAR-MISS: rolling_sum={rolling_sum:.4} threshold={effective_threshold:.4} \
+                 total_score={total_score:.4} verifier_score={max_verifier_score:.4}",
+            );
+            export_activation_trace(&ctx.activation_trace, "near-miss");
+        }
     }
 
     // ── Per-variant instrumentation (mahbot-886) ──────────────────────────
@@ -6723,6 +6972,19 @@ fn try_match_wake_word_and_push_embedding(
         }
     }
     if detected {
+        // ── Activation trace export (mahbot-897) ─────────────────────────
+        // Export the trace BEFORE transition_to_recording() clears
+        // detection buffers via reset_pipeline_state(Soft).  This ensures
+        // the last ~24 embedding decisions are captured while still in
+        // detection context.
+        info!(
+            target: "mahbot::voice::activation_trace",
+            "WAKE WORD ACTIVATION: rolling_sum={rolling_sum:.4} \
+             threshold={effective_threshold:.4} total_score={total_score:.4} \
+             verifier_score={max_verifier_score:.4}",
+        );
+        export_activation_trace(&ctx.activation_trace, "activation");
+
         // Wake word detected — transition to recording mode.
         // See [`PipelineCtx::transition_to_recording`] for the exact
         // handoff sequence (mahbot-802).
@@ -6732,6 +6994,41 @@ fn try_match_wake_word_and_push_embedding(
         true
     } else {
         false
+    }
+}
+
+/// Export the activation trace to the logs (mahbot-897).
+///
+/// Logs each trace entry as a formatted key=value line under the
+/// `mahbot::voice::activation_trace` target for easy filtering in
+/// production log analysis.
+///
+/// # Parameters
+/// - `trace`: The activation trace buffer to export.
+/// - `reason`: The trigger reason (`"activation"`, `"near-miss"`,
+///   or `"user-feedback"`).
+fn export_activation_trace(trace: &ActivationTraceBuffer, reason: &str) {
+    info!(
+        target: "mahbot::voice::activation_trace",
+        "Activation trace exported (reason={reason}, n_entries={})",
+        trace.len(),
+    );
+    for (i, entry) in trace.iter().enumerate() {
+        let candidate_id_str = match entry.candidate_id {
+            Some(id) => id.to_string(),
+            None => "-".to_string(),
+        };
+        info!(
+            target: "mahbot::voice::activation_trace",
+            "  [{i}] score={score:.4} rolling_sum={rolling_sum:.4} \
+             threshold={threshold:.4} verifier={verifier:.4} candidate_id={candidate_id}",
+            i = i,
+            score = entry.classifier_score,
+            rolling_sum = entry.rolling_sum,
+            threshold = entry.threshold,
+            verifier = entry.verifier_score,
+            candidate_id = candidate_id_str,
+        );
     }
 }
 
@@ -7422,7 +7719,7 @@ mod tests {
         let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
         let mut score_window = Vec::new();
 
-        let (detected, _, _, _) = score_single_embedding(
+        let (detected, _, _, _, _, _) = score_single_embedding(
             &embedding,
             &mut ring,
             Some(&classifier),
@@ -7462,7 +7759,7 @@ mod tests {
         let mut score_window = Vec::new();
 
         // First embedding: ring = [a], tiled to [a, a, a] → score ~0.5.
-        let (_detected, _, _, _) = score_single_embedding(
+        let (_detected, _, _, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
@@ -7484,7 +7781,7 @@ mod tests {
 
         // Second embedding: ring = [a, b], tiled to [a, b, b] → score ~0.5.
         score_window.clear();
-        let (detected, _, _, _) = score_single_embedding(
+        let (detected, _, _, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
@@ -7604,7 +7901,7 @@ mod tests {
 
         // Send enough embeddings to complete the bootstrap.
         for i in 0..ADAPTIVE_BOOTSTRAP_FRAMES + 1 {
-            let (detected, _, _, _) = score_single_embedding(
+            let (detected, _, _, _, _, _) = score_single_embedding(
                 &embedding,
                 &mut ring,
                 Some(&classifier),
@@ -8956,7 +9253,7 @@ mod tests {
 
         // Push 3 embeddings: none should trigger detection (all suppressed).
         for i in 0..3 {
-            let (detected, rolling_sum, _, _) = score_single_embedding(
+            let (detected, rolling_sum, _, _, _, _) = score_single_embedding(
                 &emb,
                 &mut ring,
                 Some(&classifier),
@@ -8988,7 +9285,7 @@ mod tests {
         // during warm-up, so the rolling sum (0.55) is below the detection
         // threshold (1.35) — detection is blocked by low rolling sum, not
         // the verifier gate.
-        let (detected, rolling_sum, _, _) = score_single_embedding(
+        let (detected, rolling_sum, _, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
@@ -9033,7 +9330,7 @@ mod tests {
         // ── Embeddings 1-3: warm-up period ──────────────────────────
         // Scores accumulate normally during warm-up.
         for i in 0..VERIFIER_WARMUP_EMBEDDINGS - 1 {
-            let (detected, _, _, _) = score_single_embedding(
+            let (detected, _, _, _, _, _) = score_single_embedding(
                 &emb,
                 &mut ring,
                 Some(&classifier),
@@ -9058,7 +9355,7 @@ mod tests {
         // ── Embedding 4: warm-up→active transition ──────────────────
         // Score window should be reset (cleared) then receive the
         // current frame's score.
-        let (detected, _, _, _) = score_single_embedding(
+        let (detected, _, _, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
@@ -9087,7 +9384,7 @@ mod tests {
         // ── Embedding 5: fully active (no more resets) ──────────────
         // The window should grow normally with only verifier-evaluated
         // frames — no warm-up scores leak through.
-        let (detected, _, _, _) = score_single_embedding(
+        let (detected, _, _, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
@@ -9127,7 +9424,7 @@ mod tests {
 
         // Push 3 embeddings — detection should pass.
         for i in 0..3 {
-            let (detected, _, _, _) = score_single_embedding(
+            let (detected, _, _, _, _, _) = score_single_embedding(
                 &emb,
                 &mut ring,
                 Some(&classifier),
@@ -9150,7 +9447,7 @@ mod tests {
 
         // 4th embedding — should also pass (untrained verifier never blocks).
         let ring_len_before = ring.len();
-        let (detected, _, _, _) = score_single_embedding(
+        let (detected, _, _, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
@@ -9189,7 +9486,7 @@ mod tests {
         // During warm-up (ring.len() < VERIFIER_WARMUP_EMBEDDINGS = 4),
         // all detections are suppressed and no candidate is created.
         for i in 0..VERIFIER_WARMUP_EMBEDDINGS - 1 {
-            let (detected, _, _, _) = score_single_embedding(
+            let (detected, _, _, _, _, _) = score_single_embedding(
                 &emb,
                 &mut ring,
                 Some(&classifier),
@@ -9216,7 +9513,7 @@ mod tests {
         // (mahbot-899), so the first 2 post-warm-up frames do not yet
         // cross the threshold (0.50 + 0.50 = 1.00 < 1.35).
         for i in 0..2 {
-            let (detected, _, _, _) = score_single_embedding(
+            let (detected, _, _, _, _, _) = score_single_embedding(
                 &emb,
                 &mut ring,
                 Some(&classifier),
@@ -9242,7 +9539,7 @@ mod tests {
         // Rolling sum (3 × 0.50 = 1.50 >= 1.35) triggers the first
         // detection after warm-up.  Candidate is created with verifier
         // peak ~0.12 (reject).
-        let (detected, _, _, _) = score_single_embedding(
+        let (detected, _, _, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
@@ -9272,7 +9569,7 @@ mod tests {
         // Each frame updates peak and increments count.  Verifier never
         // confirms (peak stays below threshold).
         for _ in 0..CANDIDATE_MAX_EMBEDDINGS - 2 {
-            let (detected, _, _, _) = score_single_embedding(
+            let (detected, _, _, _, _, _) = score_single_embedding(
                 &emb,
                 &mut ring,
                 Some(&classifier),
@@ -9296,7 +9593,7 @@ mod tests {
         // The (CANDIDATE_MAX_EMBEDDINGS)th update returns expired=true,
         // clearing the candidate.
         let count_before_expiry = candidate.as_ref().map(|c| c.embedding_count);
-        let (detected, _, _, _) = score_single_embedding(
+        let (detected, _, _, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
@@ -9317,7 +9614,7 @@ mod tests {
         // ── Embedding after expiry: new candidate created ──────────
         // The rolling sum is still above threshold (scores persist in
         // the window), so a new candidate is created on the next frame.
-        let (detected, _, _, _) = score_single_embedding(
+        let (detected, _, _, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
@@ -9357,7 +9654,7 @@ mod tests {
 
         // ── Embeddings 1-3: warm-up ────────────────────────────────
         for i in 0..VERIFIER_WARMUP_EMBEDDINGS - 1 {
-            let (detected, _, _, _) = score_single_embedding(
+            let (detected, _, _, _, _, _) = score_single_embedding(
                 &emb,
                 &mut ring,
                 Some(&classifier),
@@ -9376,7 +9673,7 @@ mod tests {
         // so the first 2 post-warm-up frames don't have enough rolling
         // sum to cross the threshold.
         for i in 0..2 {
-            let (detected, _, _, _) = score_single_embedding(
+            let (detected, _, _, _, _, _) = score_single_embedding(
                 &emb,
                 &mut ring,
                 Some(&classifier),
@@ -9399,7 +9696,7 @@ mod tests {
         }
 
         // ── Embedding 6: detection should fire ────────────────────
-        let (detected, _, _, _) = score_single_embedding(
+        let (detected, _, _, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
@@ -9425,6 +9722,204 @@ mod tests {
             c.peak_verifier_score >= DEFAULT_VERIFIER_THRESHOLD,
             "confirmed candidate's peak should be at or above threshold (got {})",
             c.peak_verifier_score,
+        );
+    }
+
+    // ── Activation trace buffer tests (mahbot-897) ──────────────────────────
+    // These test the pure ActivationTraceBuffer FIFO eviction, iteration,
+    // and candidate ID logic without any pipeline state.
+
+    #[test]
+    fn activation_trace_buffer_default_is_empty() {
+        let buf = ActivationTraceBuffer::default();
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.iter().count(), 0);
+    }
+
+    #[test]
+    fn activation_trace_buffer_push_and_iter() {
+        let mut buf = ActivationTraceBuffer::new();
+        for i in 0..10 {
+            buf.push(ActivationTraceEntry {
+                classifier_score: i as f32,
+                rolling_sum: (i * 2) as f32,
+                threshold: 1.0,
+                verifier_score: 0.5,
+                candidate_id: None,
+            });
+        }
+        assert_eq!(buf.len(), 10);
+        let scores: Vec<f32> = buf.iter().map(|e| e.classifier_score).collect();
+        assert_eq!(scores, (0..10).map(|i| i as f32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn activation_trace_buffer_iter_order() {
+        let mut buf = ActivationTraceBuffer::new();
+        for i in 0..5 {
+            buf.push(ActivationTraceEntry {
+                classifier_score: i as f32,
+                rolling_sum: 0.0,
+                threshold: 1.0,
+                verifier_score: 0.0,
+                candidate_id: Some(i),
+            });
+        }
+        // Verify iteration order is FIFO (oldest first)
+        let ids: Vec<Option<u64>> = buf.iter().map(|e| e.candidate_id).collect();
+        assert_eq!(ids, vec![Some(0), Some(1), Some(2), Some(3), Some(4)]);
+    }
+
+    #[test]
+    fn activation_trace_buffer_eviction_preserves_fifo_order() {
+        // Push 3x capacity, verify the last capacity entries are correct
+        let mut buf = ActivationTraceBuffer::new();
+        let total = ACTIVATION_TRACE_CAPACITY * 3;
+        for i in 0..total {
+            buf.push(ActivationTraceEntry {
+                classifier_score: i as f32,
+                rolling_sum: 0.0,
+                threshold: 1.0,
+                verifier_score: 0.0,
+                candidate_id: None,
+            });
+        }
+        assert_eq!(buf.len(), ACTIVATION_TRACE_CAPACITY);
+        // All entries should be the most recent ones (oldest evicted)
+        let scores: Vec<f32> = buf.iter().map(|e| e.classifier_score).collect();
+        let expected: Vec<f32> = (total - ACTIVATION_TRACE_CAPACITY..total)
+            .map(|i| i as f32)
+            .collect();
+        assert_eq!(scores, expected);
+    }
+
+    #[test]
+    fn activation_trace_integration_score_and_push() {
+        // Integration test verifying that the activation trace is correctly
+        // populated when following the same pattern as
+        // `try_match_wake_word_and_push_embedding`: call
+        // `score_single_embedding`, then push the returned values to the
+        // trace buffer, tracking candidate IDs via the returned
+        // `candidate_was_created` bool (mahbot-897, reviewer_2).
+        //
+        // Uses a trained verifier to exercise the candidate lifecycle,
+        // verifying that:
+        // - The trace accumulates entries for each embedding
+        // - The rolling sum monotonically increases (with identical scores)
+        // - The candidate ID counter is incremented when a new candidate
+        //   is created
+        // - The candidate ID is correctly assigned to trace entries
+        let classifier = classifier_always_score(0.55);
+        let verifier = verifier_always_accept();
+        let emb = vec![0.5; EMBEDDING_DIM];
+        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
+        let mut score_window = Vec::new();
+        let mut candidate: Option<ClassifierCandidate> = None;
+        let mut trace = ActivationTraceBuffer::new();
+        let mut candidate_id_counter: u64 = 0;
+
+        // Push embeddings.
+        // With verifier_always_accept() (trained, threshold=0.50):
+        //   - Embeddings 1-3: warm-up period (ring<4), detected forced to false.
+        //   - Embedding 4: score_window cleared, rolling_sum=0.55, not detected.
+        //   - Embedding 5: rolling_sum=1.10, not detected.
+        //   - Embedding 6: rolling_sum=1.65 >= threshold(1.35), detected=true.
+        //     Candidate created and immediately confirmed (verifier ~0.88 >= 0.50).
+        const N_EMBEDDINGS: usize = 6;
+        for _ in 0..N_EMBEDDINGS {
+            let (
+                _detected,
+                rolling_sum,
+                total_score,
+                effective_threshold,
+                max_verifier_score,
+                candidate_was_created,
+            ) = score_single_embedding(
+                &emb,
+                &mut ring,
+                Some(&classifier),
+                Some(&verifier),
+                &mut score_window,
+                None,
+                ADAPTIVE_K_DEFAULT,
+                Some(&mut candidate),
+            );
+
+            if candidate_was_created {
+                candidate_id_counter += 1;
+            }
+
+            let candidate_id = if candidate.is_some() {
+                Some(candidate_id_counter)
+            } else {
+                None
+            };
+
+            trace.push(ActivationTraceEntry {
+                classifier_score: total_score,
+                rolling_sum,
+                threshold: effective_threshold,
+                verifier_score: max_verifier_score,
+                candidate_id,
+            });
+        }
+
+        // ── Assertions ─────────────────────────────────────────────────
+        // Trace should have exactly N_EMBEDDINGS entries
+        assert_eq!(
+            trace.len(),
+            N_EMBEDDINGS,
+            "trace should have {N_EMBEDDINGS} entries after {N_EMBEDDINGS} embeddings",
+        );
+
+        // Rolling sums should follow two accumulation cycles due to the
+        // warm-up→active transition at embedding 4 (score window cleared):
+        // [0.55, 1.10, 1.65, 0.55, 1.10, 1.65]
+        let sums: Vec<f32> = trace.iter().map(|e| e.rolling_sum).collect();
+        let expected_sums: Vec<f32> = vec![0.55, 1.10, 1.65, 0.55, 1.10, 1.65];
+        assert_eq!(
+            sums.len(),
+            expected_sums.len(),
+            "rolling sum count mismatch",
+        );
+        for (i, (actual, expected)) in sums.iter().zip(expected_sums.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() < 0.01,
+                "rolling_sum[{i}]: expected {expected:.4}, got {actual:.4}: sums={sums:?}",
+            );
+        }
+
+        // Classifier score should be ~0.55 for all entries
+        for (i, entry) in trace.iter().enumerate() {
+            assert!(
+                (entry.classifier_score - 0.55).abs() < 0.01,
+                "entry[{i}] classifier_score should be ~0.55, got {:.4}",
+                entry.classifier_score,
+            );
+        }
+
+        // Threshold should be ~1.35 (match_threshold) for all entries
+        // (no adaptive state was provided).
+        for (i, entry) in trace.iter().enumerate() {
+            assert!(
+                (entry.threshold - 1.35).abs() < 0.01,
+                "entry[{i}] threshold should be ~1.35, got {:.4}",
+                entry.threshold,
+            );
+        }
+
+        // Candidate ID tracking: a candidate should have been created by
+        // the end (embedding 6 crosses the threshold).
+        assert!(
+            candidate_id_counter >= 1,
+            "candidate_id_counter should be >= 1 after {N_EMBEDDINGS} embeddings, got {candidate_id_counter}",
+        );
+
+        // At least one trace entry should have a candidate_id assigned.
+        let any_with_id = trace.iter().any(|e| e.candidate_id.is_some());
+        assert!(
+            any_with_id,
+            "at least one trace entry should have a candidate_id after threshold crossing",
         );
     }
 }
