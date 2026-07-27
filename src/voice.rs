@@ -46,7 +46,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -1075,6 +1075,160 @@ impl ClassifierCandidate {
 /// ~128 ms/embedding, giving enough pre-trigger context for false-trigger
 /// diagnostics.
 const ACTIVATION_TRACE_CAPACITY: usize = 24;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Voice pipeline metrics — always-on atomic counters (mahbot-912)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Total audio chunks received from the microphone channel by the pipeline
+/// loop (incremented after each successful `rx.recv()`).
+pub(crate) static CHUNKS_RECEIVED: AtomicU64 = AtomicU64::new(0);
+
+/// Audio chunks dropped at the mic channel boundary (`try_send` failure).
+/// These chunks were discarded because the pipeline was not consuming fast
+/// enough and the bounded channel (`MIC_CHANNEL_CAPACITY` = 32 chunks) was
+/// full.  This is the primary indicator of the pipeline falling behind
+/// real-time audio.
+pub(crate) static DROPPED_CHUNKS: AtomicU64 = AtomicU64::new(0);
+
+/// Total embeddings computed during wake word processing.  Each embedding
+/// corresponds to one window of 76 mel frames (~760 ms of audio).  Monotonically
+/// increasing — never reset.
+pub(crate) static EMBEDDINGS_COMPUTED: AtomicU64 = AtomicU64::new(0);
+
+/// Total wall-clock time spent computing embeddings (nanoseconds).
+/// Divide by [`EMBEDDINGS_COMPUTED`] for the lifetime average per-embedding
+/// latency.  Tracked via `Instant::now()` around [`compute_embedding`].
+pub(crate) static TOTAL_EMBEDDING_TIME_NS: AtomicU64 = AtomicU64::new(0);
+
+// ── Rolling average ring buffer for embedding latency ────────────────────
+//
+// The ticket requested "rolling average (last N frames)" for AC2 (processing
+// latency).  Rather than an exponential moving average (which is an
+// approximation) or a lifetime cumulative average (which becomes diagnostically
+// inert as embeddings accumulate), we use a lock-free ring buffer of the most
+// recent 100 embedding computation times.  N=100 covers ~3.2 seconds of audio
+// at ~32 ms per embedding — large enough to smooth noise, small enough for
+// O(100) reads on the diagnostic path.
+//
+// This deviates from the original implementation which used a lifetime
+// cumulative total/count approach.  The ring buffer provides a true "last N
+// frames" window that can detect recent performance changes, which the
+// lifetime average cannot.
+//
+// Lock-free: single writer (pipeline task) stores to the ring with an atomic
+// head index; readers sum O(N) entries on the diagnostic/debug path only.
+// No mutex is involved on any path.
+
+/// Number of recent embedding latencies tracked in the rolling average ring
+/// buffer.  100 entries ≈ 3.2 s of audio at ~32 ms per embedding.
+const EMBEDDING_LATENCY_RING_SIZE: usize = 100;
+
+/// Lock-free ring buffer of the most recent [`EMBEDDING_LATENCY_RING_SIZE`]
+/// embedding computation times (nanoseconds).  Written by the pipeline task
+/// (single writer), read by diagnostic/logging code.  Never cleared — wraps
+/// around on overflow.
+static EMBEDDING_LATENCY_RING: [AtomicU64; EMBEDDING_LATENCY_RING_SIZE] =
+    [const { AtomicU64::new(0) }; EMBEDDING_LATENCY_RING_SIZE];
+
+/// Total number of writes to [`EMBEDDING_LATENCY_RING`].  Monotonically
+/// increasing — the number of valid entries in the ring is
+/// `min(writes, EMBEDDING_LATENCY_RING_SIZE)`.
+static EMBEDDING_LATENCY_RING_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of voice pipeline metrics for diagnostics and logging (mahbot-912).
+///
+/// Returned by [`get_voice_metrics()`].  All fields are atomically-sampled
+/// Relaxed reads — not guaranteed to be mutually consistent across fields in
+/// the presence of concurrent increments, but good enough for diagnostic use.
+///
+/// The `avg_embedding_latency_ns` field is computed from the lock-free ring
+/// buffer of the last [`EMBEDDING_LATENCY_RING_SIZE`] embeddings, providing a
+/// true rolling average that reflects recent pipeline performance.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VoiceMetricsSnapshot {
+    /// Total audio chunks received from the mic channel.
+    pub chunks_received: u64,
+    /// Chunks dropped at the mic channel boundary (try_send full).
+    pub dropped_chunks: u64,
+    /// Total embeddings computed.
+    pub embeddings_computed: u64,
+    /// Cumulative embedding computation time (nanoseconds) — for lifetime
+    /// average via [`Self::lifetime_avg_embedding_latency_ns`].
+    pub total_embedding_time_ns: u64,
+    /// Rolling average embedding latency in nanoseconds (last 100 frames).
+    /// Prefer this over the lifetime average for detecting recent performance
+    /// changes — the lifetime average becomes diagnostically inert as the
+    /// pipeline accumulates millions of embeddings.
+    pub avg_embedding_latency_ns: u64,
+}
+
+impl VoiceMetricsSnapshot {
+    /// Lifetime average embedding latency in nanoseconds (total ÷ count).
+    ///
+    /// Useful for overall diagnostic ("has the model gotten slower since
+    /// startup?"), but becomes insensitive to recent changes after many
+    /// embeddings.  Use the rolling average
+    /// [`avg_embedding_latency_ns`](Self::avg_embedding_latency_ns) for
+    /// detecting recent performance shifts.
+    ///
+    /// Returns 0 when no embeddings have been computed.
+    #[must_use]
+    pub fn lifetime_avg_embedding_latency_ns(&self) -> u64 {
+        self.total_embedding_time_ns
+            .checked_div(self.embeddings_computed)
+            .unwrap_or(0)
+    }
+
+    /// Fraction of chunks dropped at the mic channel boundary (0.0 – 1.0).
+    /// Returns 0.0 when no chunks have been received.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn drop_rate(&self) -> f64 {
+        let total = self.chunks_received + self.dropped_chunks;
+        if total == 0 {
+            0.0
+        } else {
+            self.dropped_chunks as f64 / total as f64
+        }
+    }
+}
+
+/// Read a consistent snapshot of all voice pipeline metrics.
+///
+/// The `avg_embedding_latency_ns` field is computed by summing the lock-free
+/// ring buffer entries — O(100) relaxed atomic loads, negligible for any
+/// diagnostic path.
+pub(crate) fn get_voice_metrics() -> VoiceMetricsSnapshot {
+    // Compute the rolling average from the lock-free ring buffer.
+    // Both truncation sites (u64 → usize for indexing, usize → u64 for
+    // division) are safe: the ring is 100 entries, and writes won't overflow
+    // usize on any target within the pipeline's lifetime.
+    #[allow(clippy::cast_possible_truncation)]
+    let valid = usize::try_from(EMBEDDING_LATENCY_RING_WRITES.load(Ordering::Relaxed))
+        .map_or(0, |w| w.min(EMBEDDING_LATENCY_RING_SIZE));
+    let avg_ns = if valid > 0 {
+        #[allow(clippy::needless_range_loop)]
+        let sum: u64 = EMBEDDING_LATENCY_RING[..valid]
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .sum();
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            sum / valid as u64
+        }
+    } else {
+        0
+    };
+
+    VoiceMetricsSnapshot {
+        chunks_received: CHUNKS_RECEIVED.load(Ordering::Relaxed),
+        dropped_chunks: DROPPED_CHUNKS.load(Ordering::Relaxed),
+        embeddings_computed: EMBEDDINGS_COMPUTED.load(Ordering::Relaxed),
+        total_embedding_time_ns: TOTAL_EMBEDDING_TIME_NS.load(Ordering::Relaxed),
+        avg_embedding_latency_ns: avg_ns,
+    }
+}
 
 /// A single embedding decision recorded in the activation trace (mahbot-897).
 ///
@@ -3312,6 +3466,7 @@ fn convert_and_send_audio_to_pipeline<T, F>(
             crate::util::resample_audio(&mono, sample_rate, SAMPLE_RATE)
         };
         if let Err(e) = tx.try_send(resampled) {
+            DROPPED_CHUNKS.fetch_add(1, Ordering::Relaxed);
             debug!("Mic audio chunk dropped (1ch fast-path): {e}");
         }
         return;
@@ -3337,6 +3492,7 @@ fn convert_and_send_audio_to_pipeline<T, F>(
         crate::util::resample_audio(&mono, sample_rate, SAMPLE_RATE)
     };
     if let Err(e) = tx.try_send(resampled) {
+        DROPPED_CHUNKS.fetch_add(1, Ordering::Relaxed);
         debug!("Mic audio chunk dropped: {e}");
     }
 }
@@ -5386,6 +5542,12 @@ pub async fn run_voice_pipeline() {
     // for the select! timeout on the first iteration).
     ctx.check_auto_start();
 
+    // Periodic metrics log via tokio::time::Interval (mahbot-912).  Fires
+    // every 60 seconds on wall-clock time regardless of audio activity.
+    // Replaces the earlier ad-hoc tick counter which only fired when audio
+    // chunks arrived and used non-standard block-scoped statics.
+    let mut metrics_interval = tokio::time::interval(Duration::from_mins(1));
+
     loop {
         tokio::select! {
             () = shutdown_token.cancelled() => {
@@ -5427,6 +5589,8 @@ pub async fn run_voice_pipeline() {
                     ctx.handle_stop_listening();
                     continue;
                 };
+
+                CHUNKS_RECEIVED.fetch_add(1, Ordering::Relaxed);
 
                 // ── TTS playback gate (mahbot-896) ──
                 // If TTS audio is actively playing through the speakers, skip ALL
@@ -5488,6 +5652,28 @@ pub async fn run_voice_pipeline() {
             // the initial select! entry.  check_auto_start runs in the
             // post-select section below so we don't duplicate it here.
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
+
+            // Periodic metrics log every ~60 seconds (mahbot-912).  This
+            // branch fires on wall-clock time regardless of audio activity,
+            // unlike the earlier ad-hoc tick counter which only incremented
+            // when audio chunks arrived.
+            _ = metrics_interval.tick() => {
+                let m = get_voice_metrics();
+                let roll_avg = m.avg_embedding_latency_ns;
+                let life_avg = m.lifetime_avg_embedding_latency_ns();
+                info!(
+                    target: "mahbot::voice::metrics",
+                    "Pipeline metrics: chunks_received={0} dropped_chunks={1} ({2:.2}%) \
+                     embeddings_computed={3} rolling_avg_latency={4}ns \
+                     lifetime_avg_latency={5}ns",
+                    m.chunks_received,
+                    m.dropped_chunks,
+                    m.drop_rate() * 100.0,
+                    m.embeddings_computed,
+                    roll_avg,
+                    life_avg,
+                );
+            }
         }
 
         // Periodic auto-recovery: if models are in Failed state, attempt to
@@ -7311,13 +7497,29 @@ fn try_match_wake_word_and_push_embedding(
         &mel_frame_buffer[mel_frame_buffer.len() - EMBEDDING_WINDOW_FRAMES..]
     };
 
+    let embed_start = Instant::now();
     let embedding =
         match crate::util::with_block_in_place(|| compute_embedding(models, embed_input)) {
             Ok(emb) => {
+                let elapsed = embed_start.elapsed();
+                let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+                // u64::MAX nanoseconds ≈ 584 years — safe truncation for embedding
+                // latency (typically 10–100 ms).
+                TOTAL_EMBEDDING_TIME_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
+                EMBEDDINGS_COMPUTED.fetch_add(1, Ordering::Relaxed);
+
+                // Write to the lock-free rolling-average ring buffer
+                // (mahbot-912).  The atomic head index advances monotonically;
+                // wrapping is handled by modular indexing in the reader.
+                #[allow(clippy::cast_possible_truncation)]
+                let head = EMBEDDING_LATENCY_RING_WRITES.fetch_add(1, Ordering::Relaxed) as usize
+                    % EMBEDDING_LATENCY_RING_SIZE;
+                EMBEDDING_LATENCY_RING[head].store(elapsed_ns, Ordering::Relaxed);
                 debug!(
-                    "Embedding computed: {} dims (ring size before push: {})",
+                    "Embedding computed: {} dims (ring size before push: {}, took {}µs)",
                     emb.len(),
                     ctx.embedding_ring.len(),
+                    elapsed.as_micros(),
                 );
                 emb
             }
@@ -7503,10 +7705,22 @@ fn try_match_wake_word_and_push_embedding(
 /// - `reason`: The trigger reason (`"activation"`, `"near-miss"`,
 ///   or `"user-feedback"`).
 fn export_activation_trace(trace: &ActivationTraceBuffer, reason: &str) {
+    let metrics = get_voice_metrics();
+    // Use the rolling average (preferred for recent performance) over the
+    // lifetime average — the activation trace is about the current detection
+    // event, not the full pipeline history.
+    let avg_ns = metrics.avg_embedding_latency_ns;
+    let drop_pct = metrics.drop_rate() * 100.0;
     info!(
         target: "mahbot::voice::activation_trace",
-        "Activation trace exported (reason={reason}, n_entries={})",
+        "Activation trace exported (reason={reason}, n_entries={0}) \
+         [metrics: chunks={1} dropped={2} ({3:.2}%) embeddings={4} avg_latency={5}ns]",
         trace.len(),
+        metrics.chunks_received,
+        metrics.dropped_chunks,
+        drop_pct,
+        metrics.embeddings_computed,
+        avg_ns,
     );
     for (i, entry) in trace.iter().enumerate() {
         let candidate_id_str = match entry.candidate_id {
@@ -10361,6 +10575,85 @@ mod tests {
             4.0,
             "stride-1 window at index 2 uses ring[4][0] = 4.0"
         );
+    }
+
+    // ── Voice metrics snapshot tests (mahbot-912) ────────────────────────────
+    // These test the atomic counters, rolling average computation, and edge
+    // cases (division by zero on empty snapshots).  The statics are preserved
+    // between tests within a single process, so order-dependent tests must
+    // record baseline values rather than asserting exact zero.
+
+    #[test]
+    fn voice_metrics_empty_snapshot_has_zero_average() {
+        // Snapshot with zero embeddings should report 0ns average and 0%
+        // drop rate, not NaN or a panic from division by zero.
+        let snap = VoiceMetricsSnapshot {
+            chunks_received: 0,
+            dropped_chunks: 0,
+            embeddings_computed: 0,
+            total_embedding_time_ns: 0,
+            avg_embedding_latency_ns: 0,
+        };
+        assert_eq!(snap.lifetime_avg_embedding_latency_ns(), 0);
+        assert_eq!(snap.avg_embedding_latency_ns, 0);
+        assert_eq!(snap.drop_rate(), 0.0);
+    }
+
+    #[test]
+    fn voice_metrics_drop_rate_saturates() {
+        // With no chunks received and 0 dropped, drop_rate should be 0.0,
+        // not NaN or panic.
+        let snap = VoiceMetricsSnapshot {
+            chunks_received: 0,
+            dropped_chunks: 0,
+            embeddings_computed: 0,
+            total_embedding_time_ns: 0,
+            avg_embedding_latency_ns: 0,
+        };
+        assert_eq!(snap.drop_rate(), 0.0);
+
+        // All chunks dropped → drop_rate = 1.0
+        let snap = VoiceMetricsSnapshot {
+            chunks_received: 0,
+            dropped_chunks: 42,
+            ..snap
+        };
+        assert!((snap.drop_rate() - 1.0).abs() < f64::EPSILON);
+
+        // Half dropped → drop_rate = 0.5
+        let snap = VoiceMetricsSnapshot {
+            chunks_received: 50,
+            dropped_chunks: 50,
+            ..snap
+        };
+        assert!((snap.drop_rate() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn voice_metrics_lifetime_average_computation() {
+        let snap = VoiceMetricsSnapshot {
+            chunks_received: 0,
+            dropped_chunks: 0,
+            embeddings_computed: 10,
+            total_embedding_time_ns: 1_000_000, // 1ms total for 10 embeddings
+            avg_embedding_latency_ns: 0,
+        };
+        assert_eq!(snap.lifetime_avg_embedding_latency_ns(), 100_000); // 100µs each
+
+        // Truncation: 1_000_001 / 10 = 100_000 (integer division)
+        let snap = VoiceMetricsSnapshot {
+            total_embedding_time_ns: 1_000_001,
+            ..snap
+        };
+        assert_eq!(snap.lifetime_avg_embedding_latency_ns(), 100_000);
+    }
+
+    #[test]
+    fn voice_metrics_get_metrics_does_not_panic() {
+        // get_voice_metrics() accesses global statics.  It should never panic
+        // regardless of the state of those statics — this test just verifies
+        // the function call succeeds.
+        let _snap = get_voice_metrics();
     }
 
     // ── Activation trace buffer tests (mahbot-897) ──────────────────────────
