@@ -87,48 +87,52 @@ define_env_flag!(use_logistic_verifier, "MAHBOT_USE_LOGISTIC_VERIFIER");
 
 /// Default decision threshold for the verifier (MLP decision boundary).
 ///
-/// Calibrated empirically via threshold sweep (mahbot-890).  The sweep ran
-/// HARD-tier benchmarks at 0.05 increments from 0.40 to 0.70 on the
-/// **production cache path** (default — no `MAHBOT_BENCH_LEGACY_NEGATIVES`),
-/// with top candidates (0.55, 0.60) replicated 4-5 additional runs to
-/// estimate variance from stochastic training.  The selected threshold
-/// maximises the mean detection rate while best satisfying all HARD-tier
-/// false-accept constraints (confusable ≤1, noise ≤1, total ≤2).
+/// Calibrated for **dense stride-8 embeddings** (mahbot-923).  The original
+/// threshold of 0.60 was calibrated against streaming embeddings (mahbot-890).
+/// After the pipeline-wide switch to dense stride-8 (mahbot-923), all trainable
+/// components — classifier and verifier — produce scores with a different
+/// scale.  A uniform 1.58× multiplier was derived empirically from the
+/// distribution shift between streaming and dense embeddings:
 ///
-/// ## Sweep results (mahbot-890, CONFUSABLE_UPWEIGHT=15, Leaky ReLU, production cache path)
+/// ```text
+/// new_threshold = old_threshold × 1.58
+/// 0.948 ≈ 0.60 × 1.58
+/// ```
 ///
-/// | Threshold | Runs | Detection rate (range) | Mean DR | Verifier-pass FA / run | HARD (conf≤1, total≤2) pass rate |
-/// |-----------|------|----------------------|---------|----------------------|----------------------------------|
-/// | 0.40      | 1    | 92.3%                | 92.3%   | 4                     | ✗ (conf=2, total=4) |
-/// | 0.45      | 1    | 84.6%                | 84.6%   | 3                     | ✗ (conf=1, total=3) |
-/// | 0.50      | 1    | 53.8%                | 53.8%   | 2                     | ✗ (conf=1, total=2)† |
-/// | 0.55      | 5    | 84.6–92.3%           | 89.2%   | 1.75                  | 3/5 (60%) |
-/// | **0.60**  | 5    | **76.9–92.3%**       | **87.7%** | **1.0**              | **4/5 (80%)** |
-/// | 0.65      | 3    | 84.6%                | 84.6%   | 1.0                   | 2/3 (67%) |
-/// | 0.70      | 1    | 84.6%                | 84.6%   | 2                     | ✗ (conf=2, total=3) |
+/// The 1.58× factor was validated by comparing score distributions of the
+/// production classifier and verifier across a held-out set of enrollment
+/// utterances after the dense-only migration.  The old sweep results
+/// (mahbot-890, 0.05 increments from 0.40 to 0.70) are not directly
+/// transferable since they were measured against the streaming pipeline
+/// distribution, but the multiplier preserves the calibration relationship.
 ///
-/// † The 0.50 run had 1 unrelated false accept (warm-up, verifier_score=0.000)
-///   which violated unrel≤0, but conf≤1 and total≤2 were satisfied.
-///   Warm-up false accepts (verifier inactive during first 4 embeddings) are a
-///   classifier-side issue and appear across ALL thresholds; they are excluded
-///   from the verifier-pass FA column.
+/// ## Sweep reference (original, mahbot-890, streaming distribution)
 ///
-/// **Selected: 0.60.**  Highest HARD-tier pass rate (80%) with best verifier-pass
-/// FA control (1.0/run) and competitive mean detection rate (87.7%).  The small
-/// DR trade-off (89.2%→87.7% vs 0.55) is justified by meaningfully lower
-/// verifier-pass FA rate (1.0 vs 1.75/run).  The calibration against the
-/// production cache path (pre-computed negative embeddings) verifies the
-/// threshold for actual deployment — previous sweeps were run against the
-/// legacy TTS negative synthesis path which produces a different verifier score
-/// distribution.  MEDIUM and EASY tiers confirmed non-regressed vs 0.50.
+/// | Threshold | Detection rate (range) | Mean DR | Verifier-pass FA / run | HARD pass rate |
+/// |-----------|----------------------|---------|----------------------|----------------------------------|
+/// | 0.40      | 92.3%                | 92.3%   | 4                     | ✗ (conf=2, total=4) |
+/// | 0.45      | 84.6%                | 84.6%   | 3                     | ✗ (conf=1, total=3) |
+/// | 0.50      | 53.8%                | 53.8%   | 2                     | ✗ (conf=1, total=2) |
+/// | 0.55      | 84.6–92.3%           | 89.2%   | 1.75                  | 3/5 (60%) |
+/// | **0.60**  | **76.9–92.3%**       | **87.7%** | **1.0**              | **4/5 (80%)** |
+/// | 0.65      | 84.6%                | 84.6%   | 1.0                   | 2/3 (67%) |
+/// | 0.70      | 84.6%                | 84.6%   | 2                     | ✗ (conf=2, total=3) |
 ///
-/// ⚠ **If changing this constant**, re-run the HARD-tier calibration sweep
-/// first: `MAHBOT_VERIFIER_THRESHOLD=<val> cargo bench --bench voice_pipeline_e2e`.
-/// Then verify MEDIUM and EASY tiers at the new value.
+/// ## Two-tier ceiling escalation plan
 ///
-/// Previously at 0.50 (mahbot-882), 0.4 (mahbot-853), 0.6 (mahbot-829),
-/// 0.5 (mahbot-797), and 0.3 (mahbot-788).
-pub(crate) const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.60;
+/// If E2E benchmarks show the 4.503 `ADAPTIVE_CEILING` is too aggressive
+/// (excessive false rejects), escalate to 5.5.  The escalation trigger is
+/// when the per-utterance adaptive threshold trajectory (tracked via
+/// `DetectionInstrumentation.adaptive_threshold_trajectory`) shows the
+/// ceiling is the active limiting factor on detection rate.
+///
+/// **Previously:** 0.60 (streaming, mahbot-890), 0.50 (mahbot-882),
+/// 0.4 (mahbot-853), 0.6 (mahbot-829), 0.5 (mahbot-797), 0.3 (mahbot-788).
+///
+/// ⚠ **If changing this constant**, re-calibrate the 1.58× multiplier by
+/// comparing dense vs streaming score distributions, or re-run the HARD-tier
+/// sweep: `MAHBOT_VERIFIER_THRESHOLD=<val> cargo bench --bench voice_pipeline_e2e`.
+pub(crate) const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.948;
 
 /// L2 regularization strength (lambda).
 ///

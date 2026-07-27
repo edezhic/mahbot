@@ -50,7 +50,7 @@
 )]
 
 use super::*; // voice module items (process_enrollment_sample, etc.)
-use crate::embedding_sequence::{AugmentationFamily, EmbeddingSequence, Source, UtteranceId};
+use crate::embedding_sequence::{EmbeddingSequence, Source, UtteranceId};
 use crate::tts;
 use crate::voice_verifier::VoiceVerifier;
 use crate::voice_verifier::generate_synthetic_negatives_from_positives;
@@ -67,7 +67,10 @@ use std::time::Instant;
 /// The classifier rolling sum must reach at least this value for the
 /// classifier to have fired.  Below this threshold, misses are attributed
 /// to the classifier (mahbot-882).
-const MIN_CLASSIFIER_THRESHOLD: f32 = 1.35;
+///
+/// Updated for mahbot-923's unified dense stride-8 embeddings (1.58× multiplier
+/// vs the old mixed old-style + streaming distribution): 2.13 = 1.35 * 1.58.
+const MIN_CLASSIFIER_THRESHOLD: f32 = 2.13;
 
 /// Default wake word for the test.
 const WAKE_WORD: &str = "hey mahbot";
@@ -91,8 +94,8 @@ const NUM_AUGMENTATION_VARIANTS: usize = 8;
 /// test set where each miss costs 20 percentage points.
 const MIN_DETECTION_RATE: f64 = 0.60;
 
-/// Per-category false accept limits are now dynamic by tier — see
-/// [`tier_limits`] and [`BenchTier`] (mahbot-871).
+// Per-category false accept limits are now dynamic by tier — see
+// [`tier_limits`] and [`BenchTier`] (mahbot-871).
 
 /// Confusable near-miss phrases for negative detection testing (mahbot-834).
 ///
@@ -303,18 +306,18 @@ const VOLUME_SWEEP_LEVELS: &[(&str, f32, bool)] = &[
 
 // ── TTS audio cache (mahbot-844 Part 1) ─────────────────────────────────────
 
-/// Compute a deterministic model version hash from TTS compile-time SHA-256
-/// constants (mahbot-844 Part 1).
-///
-/// Hashes the concatenation of all TTS model SHA-256 digests and the voice
-/// style directory hash.  These constants are updated in `tts.rs` whenever
-/// model files change, so the cache key automatically tracks model version
-/// without disk I/O.
-///
-/// Returns a hex string (always succeeds since the hashes are compile-time).
-///
-/// Delegates to [`super::tts_model_version_hash`] which is the canonical
-/// implementation from `voice.rs`.
+// Compute a deterministic model version hash from TTS compile-time SHA-256
+// constants (mahbot-844 Part 1).
+//
+// Hashes the concatenation of all TTS model SHA-256 digests and the voice
+// style directory hash.  These constants are updated in `tts.rs` whenever
+// model files change, so the cache key automatically tracks model version
+// without disk I/O.
+//
+// Returns a hex string (always succeeds since the hashes are compile-time).
+//
+// Delegates to [`super::tts_model_version_hash`] which is the canonical
+// implementation from `voice.rs`.
 
 /// Get the cache directory path.
 fn cache_dir() -> std::path::PathBuf {
@@ -680,9 +683,10 @@ fn ensure_tts_ready() -> Result<(), String> {
 ///   Process audio variants through a given embedding extraction function.
 ///
 /// Shared helper that eliminates the duplicated per-variant loop
-/// (mahbot-855 review).  Callers supply the extraction function — either
-/// [`super::process_enrollment_sample`] for old-style (classifier) or
-/// [`super::process_streaming_enrollment_sample`] for streaming (verifier).
+/// (mahbot-855 review).  Callers supply the extraction function — typically
+/// [`super::process_enrollment_sample`] for dense stride-8 embeddings.
+/// The old streaming path was removed in mahbot-923; the benchmark now uses
+/// dense-only embeddings throughout.
 ///
 /// Each variant becomes one [`EmbeddingSequence`] with the given `source`.
 fn process_variants_with(
@@ -785,13 +789,13 @@ fn compute_vad_segments(audio: &[f32]) -> (Vec<bool>, Vec<Vec<f32>>) {
 /// [`segment_utterances_by_vad`] can complete utterance boundary detection,
 /// matching the production enrollment pipeline's behavior.
 ///
-/// Returns a 2-tuple of old-style EmbeddingSequence followed by streaming
-/// EmbeddingSequence (for classifier and verifier training respectively).
+/// Returns dense-only EmbeddingSequences (stride-8) for classifier and
+/// verifier training.  The old streaming path was removed in mahbot-923.
 #[allow(clippy::too_many_lines)]
 fn vad_segment_and_enroll(
     enrollment_variants: &[(Vec<f32>, String)],
     augmented_variants: &[(Vec<f32>, String)],
-) -> (Vec<EmbeddingSequence>, Vec<EmbeddingSequence>) {
+) -> Vec<EmbeddingSequence> {
     // ── Per-variant AGC (mahbot-886) ──
     // Each variant processed through a fresh AudioPreprocessor (both AGC and
     // noise suppressor), matching the production detection path.  Shared-AGC
@@ -854,8 +858,7 @@ fn vad_segment_and_enroll(
     );
 
     // ── Process each utterance through enrollment ──
-    let mut old_style_sequences: Vec<EmbeddingSequence> = Vec::new();
-    let mut streaming_sequences: Vec<EmbeddingSequence> = Vec::new();
+    let mut dense_sequences: Vec<EmbeddingSequence> = Vec::new();
 
     for (i, utterance) in utterances.iter().enumerate() {
         match super::process_enrollment_sample(utterance) {
@@ -866,7 +869,7 @@ fn vad_segment_and_enroll(
                     utterance.len() as f64 / f64::from(super::SAMPLE_RATE),
                     embeddings.len(),
                 );
-                old_style_sequences.push(EmbeddingSequence::positive(
+                dense_sequences.push(EmbeddingSequence::positive(
                     UtteranceId {
                         sequence_index: i,
                         variant_index: 0,
@@ -879,42 +882,19 @@ fn vad_segment_and_enroll(
             Ok(_) => warn!("Utterance {i}: no embeddings extracted"),
             Err(e) => warn!("Utterance {i}: embedding extraction failed: {e}"),
         }
-        // Also extract streaming embeddings from the same utterance for
-        // verifier training (mahbot-855).
-        match super::process_streaming_enrollment_sample(utterance) {
-            Ok(streaming_embs) if !streaming_embs.is_empty() => {
-                info!(
-                    "Utterance {i}: {} streaming embeddings (mahbot-855)",
-                    streaming_embs.len(),
-                );
-                streaming_sequences.push(EmbeddingSequence::positive(
-                    UtteranceId {
-                        sequence_index: i,
-                        variant_index: 0,
-                    },
-                    Source::Enrollment,
-                    None,
-                    streaming_embs,
-                ));
-            }
-            Ok(_) => warn!("Utterance {i}: no streaming embeddings extracted"),
-            Err(e) => warn!("Utterance {i}: streaming embedding extraction failed: {e}"),
-        }
     }
 
     let expected_utterances = enrollment_variants.len() + augmented_variants.len();
-    let flat_streaming_count: usize = streaming_sequences.iter().map(|s| s.embeddings.len()).sum();
     info!(
-        "VAD-gated enrollment: {} old-style + {} streaming embeddings from {} utterances (expected ~{expected_utterances})",
-        old_style_sequences
+        "VAD-gated enrollment: {} dense embeddings from {} utterances (expected ~{expected_utterances})",
+        dense_sequences
             .iter()
             .map(|s| s.embeddings.len())
             .sum::<usize>(),
-        flat_streaming_count,
-        old_style_sequences.len(),
+        dense_sequences.len(),
     );
 
-    (old_style_sequences, streaming_sequences)
+    dense_sequences
 }
 
 // ── Streaming detection ─────────────────────────────
@@ -931,7 +911,7 @@ struct DetectionResult {
 ///
 /// Feeds audio through [`handle_wake_word_detection`] in FRAME_LENGTH chunks,
 /// exercising the full streaming chain: VAD gating, batch accumulation,
-/// [`flush_voice_batch`], [`try_match_wake_word_and_push_embedding`],
+/// [`flush_voice_batch`], [`score_stride8_window`],
 /// [`score_single_embedding`], and cooldown logic.
 ///
 /// After all audio is fed, a silence frame is sent to flush any remaining
@@ -1099,7 +1079,7 @@ fn test_detection_samples(
     mut adaptive_state: Option<&mut super::AdaptiveThresholdState>,
 ) {
     // Set classifier + verifier in global state for the streaming pipeline.
-    // try_match_wake_word_and_push_embedding reads these from voice_state().
+    // score_stride8_window reads these from voice_state().
     super::set_classifier_weights(classifier.weights_ref().to_vec());
     super::set_verifier(verifier.clone());
 
@@ -1562,112 +1542,23 @@ pub(crate) fn run_internal() {
     let n_test = enrollment_variants.len() + augmented_variants.len();
     info!("Train/test split: {n_train} training variants, {n_test} test variants (mahbot-911)",);
 
-    let (old_style_pos_sequences, streaming_pos_sequences) =
-        vad_segment_and_enroll(&train_enrollment, &train_augmented);
+    let pos_sequences = vad_segment_and_enroll(&train_enrollment, &train_augmented);
     assert!(
-        !old_style_pos_sequences.is_empty(),
+        !pos_sequences.is_empty(),
         "VAD-gated enrollment produced no utterances from {} enrollment + {} augmented variants",
         train_enrollment.len(),
         train_augmented.len(),
     );
-    let flat_streaming_embeddings_count: usize = streaming_pos_sequences
-        .iter()
-        .map(|s| s.embeddings.len())
-        .sum();
     info!(
-        "VAD-gated enrollment: {} old-style + {} streaming embeddings from {} utterances",
-        old_style_pos_sequences
+        "VAD-gated enrollment: {} dense embeddings from {} utterances",
+        pos_sequences
             .iter()
             .map(|s| s.embeddings.len())
             .sum::<usize>(),
-        flat_streaming_embeddings_count,
-        old_style_pos_sequences.len(),
+        pos_sequences.len(),
     );
 
     phase_times[P_VAD_ENROLLMENT] = phase_end_ms!();
-
-    // ── Phase 2b: Individual-variant streaming embeddings for verifier ─────
-    // The verifier's positive training data must match the detection distribution
-    // (single variants processed through AGC), not the VAD-segmented utterance
-    // distribution (concatenated multi-variant utterances).  Extract streaming
-    // embeddings from each individual enrollment variant through AGC +
-    // process_streaming_enrollment_sample, matching how Phase 8 processes each
-    // variant individually (mahbot-872 fix).  Uses a shared earshot VAD detector
-    // (matching the global VAD_DETECTOR in the inference pipeline) so the VAD
-    // state persists across variants and the embedding distribution matches
-    // detection (mahbot-872).
-    phase_start!("Phase 2b: Verifier positive streaming embeddings");
-    let agc_variants = {
-        use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
-        let agc_chunk_size = super::FRAME_LENGTH;
-        let enroll_all: Vec<(Vec<f32>, String)> = train_enrollment
-            .iter()
-            .chain(train_augmented.iter())
-            .cloned()
-            .collect();
-        enroll_all
-            .iter()
-            .map(|(samples, label)| {
-                let mut pre = AudioPreprocessor::new(PreprocessorConfig::default());
-                let mut processed: Vec<f32> = Vec::with_capacity(samples.len());
-                for chunk in samples.chunks(agc_chunk_size) {
-                    let padded = if chunk.len() < agc_chunk_size {
-                        let mut p = chunk.to_vec();
-                        p.resize(agc_chunk_size, 0.0);
-                        p
-                    } else {
-                        chunk.to_vec()
-                    };
-                    processed.extend(pre.process(padded));
-                }
-                (processed, label.clone())
-            })
-            .collect::<Vec<_>>()
-    };
-    // Use a shared VAD detector across all variants, matching the inference
-    // pipeline's persistent VAD state (global VAD_DETECTOR).  This ensures the
-    // embedding distribution from training matches detection (mahbot-872).
-    let mut shared_vad = earshot::Detector::default();
-    let mut verifier_pos_streaming_sequences: Vec<EmbeddingSequence> = Vec::new();
-    let n_enrollment_variants = train_enrollment.len();
-    for (variant_idx, (samples, _label)) in agc_variants.iter().enumerate() {
-        match super::process_streaming_with_shared_vad(samples, &mut shared_vad) {
-            Ok(embs) => {
-                let (source, aug_family) = if variant_idx < n_enrollment_variants {
-                    (Source::Enrollment, None)
-                } else {
-                    // Augmented variants cycle: speed, volume, noise (mahbot-902).
-                    let rel_idx = variant_idx - n_enrollment_variants;
-                    let family = match rel_idx % 3 {
-                        0 => AugmentationFamily::SpeedUp,
-                        1 => AugmentationFamily::Volume,
-                        _ => AugmentationFamily::Noise,
-                    };
-                    (Source::Augmentation, Some(family))
-                };
-                let seq = EmbeddingSequence::positive(
-                    UtteranceId {
-                        sequence_index: variant_idx,
-                        variant_index: variant_idx,
-                    },
-                    source,
-                    aug_family,
-                    embs,
-                );
-                verifier_pos_streaming_sequences.push(seq);
-            }
-            Err(e) => warn!("Verifier positive embedding extraction failed for variant: {e}"),
-        }
-    }
-    let verifier_pos_streaming_count: usize = verifier_pos_streaming_sequences
-        .iter()
-        .map(|s| s.embeddings.len())
-        .sum();
-    info!(
-        "Verifier positive: {} individual-variant streaming embeddings (match detection distribution, shared VAD)",
-        verifier_pos_streaming_count,
-    );
-    phase_times[P_VAD_ENROLLMENT] = phase_end_ms!(); // reuse timer slot (timing is informational)
 
     // ── Phase 3: Generate negative training data ─────────────────────────
     phase_start!("Phase 3: Generating negative training data");
@@ -1694,48 +1585,37 @@ pub(crate) fn run_internal() {
         }
     }
 
-    // Check if production caches are populated.
+    // Check if production caches are populated.  After mahbot-923 the pipeline
+    // uses dense stride-8 embeddings throughout — no streaming cache needed.
     let confusable_dense_cache = super::confusable_dense_embeddings();
     let unrelated_dense_cache = super::unrelated_dense_embeddings();
-    let confusable_streaming_cache = super::confusable_negative_embeddings();
-    let unrelated_streaming_cache = super::unrelated_negative_embeddings();
 
-    let caches_ready = !use_legacy
-        && !confusable_dense_cache.is_empty()
-        && !unrelated_dense_cache.is_empty()
-        && !confusable_streaming_cache.is_empty()
-        && !unrelated_streaming_cache.is_empty();
+    let caches_ready =
+        !use_legacy && !confusable_dense_cache.is_empty() && !unrelated_dense_cache.is_empty();
 
     let (classifier_neg_sequences, verifier_neg_sequences, per_negative_sequence_weights);
 
-    // Flatten streaming positive embeddings for synthetic negative generation
-    let flat_streaming_embeddings: Vec<Vec<f32>> = streaming_pos_sequences
+    // Flatten dense positive embeddings for synthetic negative generation
+    let flat_dense_embeddings: Vec<Vec<f32>> = pos_sequences
         .iter()
         .flat_map(|s| s.embeddings.iter().cloned())
         .collect();
 
     if caches_ready {
-        // ── Production cache path (mahbot-880) ─────────────────────────────
+        // ── Production cache path (mahbot-880, mahbot-923) ──────────────────
         // Use the shared OnceLock caches populated by the prewarm functions
-        // above.  These match what production uses during real enrollment.
+        // above.  After mahbot-923 the pipeline uses dense stride-8 embeddings
+        // throughout — both classifier and verifier use the same dense caches.
         info!(
-            "Using production pre-warmed caches: {} confusable + {} unrelated dense, \
-             {} confusable + {} unrelated streaming (mahbot-880)",
+            "Using production pre-warmed caches: {} confusable + {} unrelated dense (mahbot-880, mahbot-923)",
             confusable_dense_cache.len(),
             unrelated_dense_cache.len(),
-            confusable_streaming_cache.len(),
-            unrelated_streaming_cache.len(),
         );
 
-        // Classifier (Conv1D) uses dense (old-style) embeddings from the cache.
-        // These are the pre-computed dense-stride embeddings that provide a rich
-        // learning signal (many windows per utterance), matching the embedding
-        // *type* production uses for the classifier — dense-stride (old-style)
-        // embeddings, not the stride-1 streaming embeddings used for the verifier
-        // (mahbot-878, mahbot-880).
+        // Both classifier and verifier use dense embeddings from the cache.
         //
         // NOTE — Composition differs from production finalize_enrollment:
-        //   Production: ambient (old+streaming) → confusable_dense → unrelated_dense
+        //   Production: ambient → confusable_dense → unrelated_dense
         //   Benchmark:  confusable_dense → unrelated_dense → synthetic
         // The benchmark has no ambient negatives and supplements with synthetic
         // negatives (mahbot-846).  The ordering within common categories (confusable,
@@ -1749,7 +1629,7 @@ pub(crate) fn run_internal() {
         // Supplement with distribution-matched synthetic negatives (mahbot-846).
         let synthetic_embs = generate_synthetic_negatives_from_positives(
             SYNTHETIC_NEGATIVES_COUNT,
-            &flat_streaming_embeddings,
+            &flat_dense_embeddings,
             1.5,
             Some(42), // fixed seed for deterministic benchmark (mahbot-882)
         );
@@ -1767,21 +1647,21 @@ pub(crate) fn run_internal() {
         let n_dense_total = classifier_neg_seqs.len();
         classifier_neg_sequences = classifier_neg_seqs;
 
-        // Verifier (MLP) uses streaming embeddings from the cache, matching
-        // production's inference distribution (mahbot-880).
-        let n_unrelated_streaming = unrelated_streaming_cache.len();
-        let n_confusable_streaming = confusable_streaming_cache.len();
+        // Verifier uses the same dense cache embeddings as the classifier
+        // (mahbot-923).  No separate streaming caches needed.
+        let n_unrelated = unrelated_dense_cache.len();
+        let n_confusable = confusable_dense_cache.len();
         let n_synthetic = 1; // one synthetic EmbeddingSequence
 
         let mut verifier_neg_seqs: Vec<EmbeddingSequence> =
-            Vec::with_capacity(n_unrelated_streaming + n_confusable_streaming + n_synthetic);
+            Vec::with_capacity(n_unrelated + n_confusable + n_synthetic);
         // Concatenation order: unrelated → confusable → synthetic, matching
         // production's ambient→unrelated→confusable (no ambient in benchmark).
-        verifier_neg_seqs.extend_from_slice(unrelated_streaming_cache);
-        verifier_neg_seqs.extend_from_slice(confusable_streaming_cache);
+        verifier_neg_seqs.extend_from_slice(unrelated_dense_cache);
+        verifier_neg_seqs.extend_from_slice(confusable_dense_cache);
         let synthetic_embs_ver = generate_synthetic_negatives_from_positives(
             SYNTHETIC_NEGATIVES_COUNT,
-            &flat_streaming_embeddings,
+            &flat_dense_embeddings,
             1.5,
             Some(42), // fixed seed for deterministic benchmark (mahbot-882)
         );
@@ -1800,15 +1680,15 @@ pub(crate) fn run_internal() {
         // Build per-sequence weights with three tiers matching production
         // (mahbot-872, mahbot-880): unrelated = UNRELATED_UPWEIGHT×,
         // confusable = CONFUSABLE_UPWEIGHT×, synthetic = 1.0×.
-        let n_seq_total = n_unrelated_streaming + n_confusable_streaming + n_synthetic;
+        let n_seq_total = n_unrelated + n_confusable + n_synthetic;
         let mut pw: Vec<f32> = Vec::with_capacity(n_seq_total);
         pw.extend(std::iter::repeat_n(
             crate::voice_verifier::UNRELATED_UPWEIGHT,
-            n_unrelated_streaming,
+            n_unrelated,
         ));
         pw.extend(std::iter::repeat_n(
             crate::voice_verifier::CONFUSABLE_UPWEIGHT,
-            n_confusable_streaming,
+            n_confusable,
         ));
         pw.extend(std::iter::repeat_n(1.0, n_synthetic));
         per_negative_sequence_weights = pw;
@@ -1819,20 +1699,20 @@ pub(crate) fn run_internal() {
         crate::voice_verifier::assert_weight_tier(
             &per_negative_sequence_weights,
             0,
-            n_unrelated_streaming,
+            n_unrelated,
             crate::voice_verifier::UNRELATED_UPWEIGHT,
             "unrelated",
         );
         crate::voice_verifier::assert_weight_tier(
             &per_negative_sequence_weights,
-            n_unrelated_streaming,
-            n_confusable_streaming,
+            n_unrelated,
+            n_confusable,
             crate::voice_verifier::CONFUSABLE_UPWEIGHT,
             "confusable",
         );
         crate::voice_verifier::assert_weight_tier(
             &per_negative_sequence_weights,
-            n_unrelated_streaming + n_confusable_streaming,
+            n_unrelated + n_confusable,
             n_synthetic,
             1.0,
             "synthetic",
@@ -1841,11 +1721,11 @@ pub(crate) fn run_internal() {
 
         info!(
             "Built {} verifier neg sequences ({} unrelated@{}× + {} confusable@{}× + {} synthetic) \
-             and {} classifier neg sequences (mahbot-880)",
+             and {} classifier neg sequences (mahbot-880, mahbot-923)",
             n_seq_total,
-            n_unrelated_streaming,
+            n_unrelated,
             crate::voice_verifier::UNRELATED_UPWEIGHT,
-            n_confusable_streaming,
+            n_confusable,
             crate::voice_verifier::CONFUSABLE_UPWEIGHT,
             n_synthetic,
             n_dense_total,
@@ -1855,6 +1735,7 @@ pub(crate) fn run_internal() {
         // Production caches are empty (prewarm failed or models unavailable).
         // Log a warning and fall back to the original inline TTS synthesis +
         // embedding extraction path.
+        use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
         warn!(
             "Production negative embedding caches not available — \
              falling back to inline TTS synthesis (mahbot-880)"
@@ -1897,10 +1778,6 @@ pub(crate) fn run_internal() {
         ] = confusable_batch.try_into().unwrap();
         let mut classifier_neg_seqs: Vec<EmbeddingSequence> = Vec::new();
         let mut verifier_neg_seqs: Vec<EmbeddingSequence> = Vec::new();
-
-        // Helper: process a slice of (audio, label) through AGC in FRAME_LENGTH
-        // chunks, matching vad_segment_and_enroll's production-path mirroring.
-        use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
         let agc_chunk_size = super::FRAME_LENGTH;
         let agc_process = |variants: &[(Vec<f32>, String)]| -> Vec<(Vec<f32>, String)> {
             variants
@@ -1924,8 +1801,9 @@ pub(crate) fn run_internal() {
         };
 
         // AGC-process all negative sets once, reusing the results for both
-        // the classifier (old-style + streaming) and verifier (streaming-only)
-        // extraction loops (mahbot-856).
+        // classifier and verifier extraction loops (mahbot-856, mahbot-923).
+        // After mahbot-923, both use dense stride-8 embeddings — no separate
+        // streaming path.
         let agc_unrelated_1 = agc_process(&neg_unrelated_1);
         let agc_unrelated_2 = agc_process(&neg_unrelated_2);
         let agc_unrelated_3 = agc_process(&neg_unrelated_3);
@@ -1940,9 +1818,7 @@ pub(crate) fn run_internal() {
         // reviewer feedback).  This ensures negative-set ordering is consistent
         // between both paths for easier debugging of per-epoch behavior differences.
         //
-        // For the verifier: collect streaming-only sequences (matching inference
-        // distribution). For the classifier: append both old-style (dense) and
-        // streaming sequences so the Conv1D has a rich learning signal.
+        // After mahbot-923, both classifier and verifier use dense-only embeddings.
         for agc_confusable in [
             &agc_confusable_1,
             &agc_confusable_2,
@@ -1950,37 +1826,23 @@ pub(crate) fn run_internal() {
             &agc_confusable_4,
             &agc_confusable_5,
         ] {
-            let (stream_seqs, _) = process_variants_with(
+            let (dense_seqs, _) = process_variants_with(
                 agc_confusable,
-                |s| super::process_streaming_enrollment_sample(s),
+                super::process_enrollment_sample,
                 Source::Confusable,
             );
-            verifier_neg_seqs.extend(stream_seqs.iter().cloned());
-            // Classifier: old-style (dense) embeddings
-            let (old_seqs, _) = process_variants_with(
-                agc_confusable,
-                |s| super::process_enrollment_sample(s),
-                Source::Confusable,
-            );
-            classifier_neg_seqs.extend(old_seqs);
-            // Classifier also gets streaming sequences (combined training)
-            classifier_neg_seqs.extend(stream_seqs);
+            classifier_neg_seqs.extend(dense_seqs.iter().cloned());
+            verifier_neg_seqs.extend(dense_seqs);
         }
 
         for agc_unrelated in [&agc_unrelated_1, &agc_unrelated_2, &agc_unrelated_3] {
-            let (stream_seqs, _) = process_variants_with(
+            let (dense_seqs, _) = process_variants_with(
                 agc_unrelated,
-                |s| super::process_streaming_enrollment_sample(s),
+                super::process_enrollment_sample,
                 Source::Unrelated,
             );
-            verifier_neg_seqs.extend(stream_seqs.iter().cloned());
-            let (old_seqs, _) = process_variants_with(
-                agc_unrelated,
-                |s| super::process_enrollment_sample(s),
-                Source::Unrelated,
-            );
-            classifier_neg_seqs.extend(old_seqs);
-            classifier_neg_seqs.extend(stream_seqs);
+            classifier_neg_seqs.extend(dense_seqs.iter().cloned());
+            verifier_neg_seqs.extend(dense_seqs);
         }
 
         info!(
@@ -1999,7 +1861,7 @@ pub(crate) fn run_internal() {
         // Supplement with distribution-matched synthetic negatives (mahbot-846).
         let synthetic_embs = generate_synthetic_negatives_from_positives(
             SYNTHETIC_NEGATIVES_COUNT,
-            &flat_streaming_embeddings,
+            &flat_dense_embeddings,
             1.5,
             Some(42), // fixed seed for deterministic benchmark (mahbot-882)
         );
@@ -2016,11 +1878,9 @@ pub(crate) fn run_internal() {
 
         classifier_neg_sequences = classifier_neg_seqs;
 
-        // Build a SEPARATE negative set for the verifier that uses STREAMING
-        // pipeline embeddings to match inference distribution (mahbot-855) and
-        // INCLUDES confusable + unrelated phrase embeddings for confusable rejection
-        // training (mahbot-859, mahbot-872).  Reuses the pre-computed AGC'd unrelated
-        // and confusable sets from above, avoiding redundant AGC processing.
+        // Build a SEPARATE negative set for the verifier that uses dense
+        // embeddings matching the classifier (mahbot-923).  Both use the same
+        // AGC-processed dense embeddings now that the streaming path is removed.
         let n_unrelated_verifier_seqs = 3; // 3 unrelated seed sets
         let n_confusable_verifier_seqs = 5; // 5 confusable seed sets
         // Note: each seed set produces a single EmbeddingSequence from process_variants_with,
@@ -2029,7 +1889,7 @@ pub(crate) fn run_internal() {
         // Synthetic for verifier
         let synthetic_embs_ver = generate_synthetic_negatives_from_positives(
             SYNTHETIC_NEGATIVES_COUNT,
-            &flat_streaming_embeddings,
+            &flat_dense_embeddings,
             1.5,
             Some(42), // fixed seed for deterministic benchmark (mahbot-882)
         );
@@ -2102,15 +1962,9 @@ pub(crate) fn run_internal() {
 
     // ── Phase 4: finalize_enrollment (consistency check + classifier training) ──
     phase_start!("Phase 4: finalize_enrollment");
-    // Uses COMBINED old-style + streaming embeddings for classifier training.
-    // The old-style dense-stride embeddings provide a strong learning signal
-    // (many windows), while the streaming embeddings match the inference
-    // distribution.  Combined training gives the Conv1D more positive examples
-    // and better score separation than streaming-only (mahbot-856).
-    // Both positives and negatives use combined old-style + streaming EmbeddingSequence
-    // to keep the training distribution symmetric.
-    let mut pos_sequences = old_style_pos_sequences; // moved (not used after)
-    pos_sequences.extend(streaming_pos_sequences.clone()); // cloned for verifier Phase 5
+    // After mahbot-923, pos_sequences contains dense stride-8 embeddings
+    // from vad_segment_and_enroll (no streaming separate path).
+    // Both positives and negatives use dense-only EmbeddingSequence.
     let training_result = super::finalize_enrollment(&pos_sequences, &classifier_neg_sequences)
         .expect("finalize_enrollment must succeed — consistency check + classifier training");
 
@@ -2176,7 +2030,7 @@ pub(crate) fn run_internal() {
     };
 
     // -- Informational self-test --
-    match super::run_enrollment_self_test(&streaming_pos_sequences, &classifier) {
+    match super::run_enrollment_self_test(&pos_sequences, &classifier) {
         Ok(()) => info!("Detection self-test (informational): passed"),
         Err(e) => info!("Detection self-test (informational, non-gating): {e}"),
     }
@@ -2211,7 +2065,7 @@ pub(crate) fn run_internal() {
                     verifier_neg_sequences.len(),
                 );
                 break 'decide VoiceVerifier::train(
-                    &verifier_pos_streaming_sequences,
+                    &pos_sequences,
                     &mined.sequences,
                     None, // uniform weights — mining replaces tiered weights
                     VoiceVerifier::default_threshold(),
@@ -2232,7 +2086,7 @@ pub(crate) fn run_internal() {
         // ── Original all-windows path (mahbot-872) ─────────────────────────
         // Also reached by mining fallback.
         VoiceVerifier::train(
-            &verifier_pos_streaming_sequences,
+            &pos_sequences,
             &verifier_neg_sequences,
             Some(&per_negative_sequence_weights), // per-sequence weights matching production (mahbot-870 Fix 3)
             VoiceVerifier::default_threshold(),
@@ -2245,9 +2099,9 @@ pub(crate) fn run_internal() {
 
     if verifier.is_trained() {
         info!(
-            "VoiceVerifier trained successfully with {} streaming positive + {} negative sequences \
-             (streaming pipeline, individual variants, unrelated + confusable + synthetic, mahbot-872)",
-            verifier_pos_streaming_sequences.len(),
+            "VoiceVerifier trained successfully with {} dense positive + {} negative sequences \
+             (dense embeddings, unrelated + confusable + synthetic, mahbot-923)",
+            pos_sequences.len(),
             verifier_neg_sequences.len()
         );
     } else {
@@ -2897,11 +2751,11 @@ pub(crate) fn run_internal() {
     if !conf_fa_by_tier[0].is_empty() {
         eprintln!("               Triggers: {:?}", conf_fa_by_tier[0]);
     }
-    eprintln!("             Medium:  {fa_medium}",);
+    eprintln!("             Medium:  {fa_medium}");
     if !conf_fa_by_tier[1].is_empty() {
         eprintln!("               Triggers: {:?}", conf_fa_by_tier[1]);
     }
-    eprintln!("             Hard:    {fa_hard}",);
+    eprintln!("             Hard:    {fa_hard}");
     if !conf_fa_by_tier[2].is_empty() {
         eprintln!("               Triggers: {:?}", conf_fa_by_tier[2]);
     }
