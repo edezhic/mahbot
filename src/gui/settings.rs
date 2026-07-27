@@ -306,6 +306,8 @@ pub enum SettingsMessage {
     CancelVoiceEnrollment,
     /// Retry loading voice models after a [`VoiceStatus::ModelError`].
     RetryVoiceModels,
+    /// User typed in the wake word phrase text input.
+    WakeWordPhraseInput(String),
     // ── TTS messages ─────────────────────────────────────
     /// Toggle TTS on/off (persisted to config DB).
     TtsToggle(bool),
@@ -364,6 +366,9 @@ pub struct SettingsState {
     /// passed through to `VoiceToggleResult` so stale results from
     /// earlier toggles are detected and ignored.
     voice_toggle_gen: u64,
+    /// Transient text input for the wake word phrase.
+    /// Not persisted — passed to [`VoiceCommand::StartEnrollment`] on click.
+    wake_word_phrase_input: String,
 
     // ── TTS state ─────────────────────────────────────────
     /// Generation counter for TTS toggle operations.
@@ -405,6 +410,7 @@ impl SettingsState {
             add_user_adding: false,
             model_picker_inputs: [const { String::new() }; ModelPickerTarget::COUNT],
             voice_toggle_gen: 0,
+            wake_word_phrase_input: String::new(),
             tts_toggle_gen: 0,
         }
     }
@@ -658,7 +664,12 @@ impl SettingsState {
                 Task::none()
             }
             SettingsMessage::StartVoiceEnrollment => {
-                crate::voice::send_command(crate::voice::VoiceCommand::StartEnrollment);
+                let phrase = self.wake_word_phrase_input.clone();
+                crate::voice::send_command(crate::voice::VoiceCommand::StartEnrollment(phrase));
+                Task::none()
+            }
+            SettingsMessage::WakeWordPhraseInput(v) => {
+                self.wake_word_phrase_input = v;
                 Task::none()
             }
             SettingsMessage::CancelVoiceEnrollment => {
@@ -2266,8 +2277,42 @@ impl SettingsState {
             container(Text::new("")).into()
         };
 
-        let wake_word_row = if voice_enabled && has_templates {
-            field_row("Wake Word", Text::new("custom").size(13).into(), None)
+        let wake_word_row = if voice_enabled {
+            if let Some(phrase) = crate::voice::get_enrolled_phrase() {
+                field_row("Wake Word", Text::new(phrase).size(13).into(), None)
+            } else if has_templates {
+                // Legacy model loaded (pre-PersistedModel format) — no phrase known
+                field_row(
+                    "Wake Word",
+                    Text::new("Legacy model (phrase unknown)").size(13).into(),
+                    Some("Re-enroll to set a custom wake word phrase"),
+                )
+            } else {
+                field_row(
+                    "Wake Word",
+                    Text::new("Enroll a wake word to get started")
+                        .size(13)
+                        .into(),
+                    None,
+                )
+            }
+        } else {
+            iced::widget::Space::new().height(0).into()
+        };
+
+        // Text input for the wake word phrase (before enrollment).
+        let is_enrolling = matches!(
+            status,
+            crate::voice::VoiceStatus::Enrolling { .. }
+                | crate::voice::VoiceStatus::ListeningDuringEnrollment { .. }
+                | crate::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
+        );
+        let phrase_input = if voice_enabled && !is_enrolling {
+            let input = text_input("mahbot", &self.wake_word_phrase_input)
+                .on_input(SettingsMessage::WakeWordPhraseInput)
+                .style(super::widgets::text_input_style)
+                .width(Length::Fixed(250.0));
+            field_row("Wake Word Phrase", input.into(), None)
         } else {
             iced::widget::Space::new().height(0).into()
         };
@@ -2283,6 +2328,7 @@ impl SettingsState {
             .push(iced::widget::Space::new().height(8))
             .push(field_row("Status", status_text, None))
             .push(wake_word_row)
+            .push(phrase_input)
             .push(enroll_btn);
 
         // Adaptive threshold k slider (mahbot-845)
