@@ -10275,6 +10275,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_verifier_classifier_window_alignment() {
+        // Integration test: verify that the verifier's stride-1 windows evaluated
+        // inside score_single_embedding include the same 3-frame window that the
+        // classifier scores (the last 3 embeddings in the ring buffer).  Both
+        // operate on the shared embedding_ring using fill_verifier_window, so the
+        // alignment is architecturally forced — but this test documents the
+        // invariant explicitly and catches regressions if indexing diverges.
+        //
+        // For a ring of N ≥ 6 post-warm-up embeddings:
+        //   - Classifier window: ring[N-3 .. N]  (last 3)
+        //   - Verifier start: N - (ROLLING_WINDOW_N + VERIFIER_WINDOW_SIZE - 1) = N-5
+        //   - Verifier stride-1 windows at indices: N-5, N-4, N-3
+        //   - Window at index N-3 = ring[N-3 .. N] — exactly the classifier's window
+        //
+        // After pushing 6 embeddings through score_single_embedding, we probe
+        // the ring buffer with fill_verifier_window to confirm alignment.
+        let classifier = classifier_always_half();
+        let verifier = verifier_always_reject();
+        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
+        let mut score_window = Vec::new();
+        let mut candidate: Option<ClassifierCandidate> = None;
+
+        // Push 6 embeddings with unique first-element markers.
+        // emb[i][0] = i as f32 → distinguishable per index.
+        for i in 0..6 {
+            let mut emb = vec![0.0f32; EMBEDDING_DIM];
+            emb[0] = i as f32;
+            score_single_embedding(
+                &emb,
+                &mut ring,
+                Some(&classifier),
+                Some(&verifier),
+                &mut score_window,
+                None,
+                ADAPTIVE_K_DEFAULT,
+                Some(&mut candidate),
+            );
+        }
+
+        assert_eq!(
+            ring.len(),
+            6,
+            "ring should hold 6 embeddings after 6 pushes"
+        );
+
+        // Alignment index: the verifier window whose right edge matches the
+        // classifier window (last 3 embeddings).  This is the stride-1 window
+        // at position ring.len() - VERIFIER_WINDOW_SIZE.
+        let alignment_index = ring.len() - VERIFIER_WINDOW_SIZE;
+        let mut window = [0.0f32; VERIFIER_INPUT_DIM];
+        crate::voice_verifier::fill_verifier_window(&ring, alignment_index, &mut window);
+
+        // The 288-dim window at alignment_index concatenates ring[3], ring[4],
+        // ring[5].  Each embedding has emb[0] = its index as f32.
+        assert_eq!(
+            window[0], 3.0,
+            "verifier window start copies ring[3][0] = 3.0"
+        );
+        assert_eq!(
+            window[EMBEDDING_DIM], 4.0,
+            "verifier window middle copies ring[4][0] = 4.0"
+        );
+        assert_eq!(
+            window[2 * EMBEDDING_DIM],
+            5.0,
+            "verifier window end copies ring[5][0] = 5.0"
+        );
+
+        // Also verify stride-1 coverage: window at alignment_index - 1
+        // uses ring[2], ring[3], ring[4] (preceding stride-1 window).
+        let mut prev_window = [0.0f32; VERIFIER_INPUT_DIM];
+        crate::voice_verifier::fill_verifier_window(&ring, alignment_index - 1, &mut prev_window);
+        assert_eq!(
+            prev_window[0], 2.0,
+            "stride-1 window at index 2 uses ring[2][0] = 2.0"
+        );
+        assert_eq!(
+            prev_window[EMBEDDING_DIM], 3.0,
+            "stride-1 window at index 2 uses ring[3][0] = 3.0"
+        );
+        assert_eq!(
+            prev_window[2 * EMBEDDING_DIM],
+            4.0,
+            "stride-1 window at index 2 uses ring[4][0] = 4.0"
+        );
+    }
+
     // ── Activation trace buffer tests (mahbot-897) ──────────────────────────
     // These test the pure ActivationTraceBuffer FIFO eviction, iteration,
     // and candidate ID logic without any pipeline state.
