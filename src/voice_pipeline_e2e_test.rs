@@ -418,14 +418,22 @@ fn generate_augmented_variants(
                 crate::tts_data_gen::speed_perturbation(&base_pcm, TARGET_SAMPLE_RATE, factor)
             }
             1 => {
+                // Deterministic seed per variant for reproducible augmentation
+                let aug_seed = base_seed + i as u64;
                 let max_gain_db = 6.0;
-                crate::tts_data_gen::randomize_volume(&base_pcm, max_gain_db)
+                crate::tts_data_gen::randomize_volume(&base_pcm, max_gain_db, Some(aug_seed))
             }
-            _ => crate::tts_data_gen::add_noise(
-                &base_pcm,
-                20.0,
-                crate::tts_data_gen::NoiseType::Pink,
-            ),
+            2 => {
+                // Deterministic seed per variant for reproducible augmentation
+                let aug_seed = base_seed + i as u64;
+                crate::tts_data_gen::add_noise(
+                    &base_pcm,
+                    20.0,
+                    crate::tts_data_gen::NoiseType::Pink,
+                    Some(aug_seed),
+                )
+            }
+            _ => unreachable!("i % 3 is always 0, 1, or 2"),
         };
 
         let desc = format!(

@@ -7,6 +7,19 @@
 //! 96-dim embedding vectors via the voice pipeline's mel spectrogram +
 //! embedding models.
 //!
+//! # Reproducibility scope (mahbot-906)
+//!
+//! The benchmark path ([`generate_augmented_variants`] in
+//! `voice_pipeline_e2e_test.rs`) uses seeded RNG via the `rng_seed:
+//! Option<u64>` parameter on [`randomize_volume`] and [`add_noise`]
+//! for deterministic augmentation. The production path
+//! ([`augment_audio`], [`generate_training_data`]) passes `None` and
+//! remains non-deterministic — this is intentional, as production batch
+//! offline training data generation does not require reproducibility.
+//! Only the benchmark's `randomize_volume` and `add_noise` calls were
+//! modified; the 8 internal `rand::*` calls in `augment_audio` and 5
+//! in `generate_training_data` are unchanged.
+//!
 //! # Pipeline
 //!
 //! 1. Synthesize audio directly at 16 kHz via [`crate::tts::synthesize()`]
@@ -21,6 +34,8 @@
 
 use crate::voice;
 use anyhow::{Context, Result};
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -48,34 +63,54 @@ const TRAINING_DIR: &str = "training";
 
 /// Mix white or pink noise into audio at a given SNR (dB).
 ///
+/// When `rng_seed` is `Some(seed)`, uses a deterministic seeded RNG for
+/// reproducible output. When `None`, uses an entropy-seeded RNG (current
+/// non-deterministic behavior). The deterministic path is used by the
+/// benchmark to ensure stable training data across re-runs (mahbot-906).
+///
 /// # Arguments
 ///
 /// * `samples` — Clean audio PCM f32 in [-1.0, 1.0].
 /// * `snr_db` — Desired signal-to-noise ratio in dB (typical: 10-25).
 ///   Lower values = more noise. Must be finite.
 /// * `noise_type` — [`NoiseType::White`] or [`NoiseType::Pink`].
+/// * `rng_seed` — Optional seed for deterministic RNG. `Some(seed)` produces
+///   reproducible noise; `None` uses entropy-based seeding.
 ///
 /// # Returns
 ///
 /// Noisy audio PCM f32 in [-1.0, 1.0] (clamped).
 #[must_use]
-pub fn add_noise(samples: &[f32], snr_db: f32, noise_type: NoiseType) -> Vec<f32> {
+pub fn add_noise(
+    samples: &[f32],
+    snr_db: f32,
+    noise_type: NoiseType,
+    rng_seed: Option<u64>,
+) -> Vec<f32> {
     if samples.is_empty() || !snr_db.is_finite() {
         return samples.to_vec();
     }
 
-    // Generate noise
+    // Create a seeded or entropy-based RNG, matching the canonical
+    // Option<u64> → StdRng pattern (voice_verifier.rs, mahbot-906).
+    // When None, we seed from rand::random() rather than using the
+    // thread-local generator directly, isolating RNG state.
+    let mut rng: StdRng = match rng_seed {
+        Some(seed) => StdRng::seed_from_u64(seed),
+        None => StdRng::seed_from_u64(rand::random()),
+    };
+
+    // Generate noise using the single RNG for both white and pink branches.
     let noise: Vec<f32> = match noise_type {
         NoiseType::White => {
             // Uniform white noise in [-1.0, 1.0]
             (0..samples.len())
-                .map(|_| rand::random::<f32>() * 2.0 - 1.0)
+                .map(|_| rng.random::<f32>() * 2.0 - 1.0)
                 .collect()
         }
         NoiseType::Pink => {
-            // Voss-McCartney pink noise algorithm (simplified)
-            // Uses 16 octave-spaced noise generators
-            generate_pink_noise(samples.len())
+            // Voss-McCartney pink noise via the canonical seeded implementation
+            crate::util::generate_pink_noise(samples.len(), &mut rng)
         }
     };
 
@@ -99,16 +134,6 @@ pub fn add_noise(samples: &[f32], snr_db: f32, noise_type: NoiseType) -> Vec<f32
     result
 }
 
-/// Generate pink noise using the canonical Voss-McCartney algorithm.
-///
-/// Delegates to [`crate::util::generate_pink_noise`] with a fresh global RNG,
-/// matching the original behavior of using [`rand::random`] indirectly through
-/// the global thread-local generator.
-#[allow(clippy::cast_precision_loss)]
-fn generate_pink_noise(len: usize) -> Vec<f32> {
-    crate::util::generate_pink_noise(len, rand::rng())
-}
-
 /// Compute the RMS (root mean square) of audio samples.
 #[allow(clippy::cast_precision_loss)]
 fn compute_rms(samples: &[f32]) -> f32 {
@@ -121,6 +146,11 @@ fn compute_rms(samples: &[f32]) -> f32 {
 
 /// Apply a random volume gain within ±`max_gain_db` dB.
 ///
+/// When `rng_seed` is `Some(seed)`, uses a deterministic seeded RNG for
+/// reproducible gain values. When `None`, uses an entropy-seeded RNG (current
+/// non-deterministic behavior). The deterministic path is used by the
+/// benchmark to ensure stable training data across re-runs (mahbot-906).
+///
 /// Each call produces a different random gain in the range
 /// `[-max_gain_db, +max_gain_db]` dB, applied uniformly to all samples.
 ///
@@ -128,17 +158,27 @@ fn compute_rms(samples: &[f32]) -> f32 {
 ///
 /// * `samples` — Audio PCM f32 in [-1.0, 1.0].
 /// * `max_gain_db` — Maximum absolute gain in dB (e.g., 6.0 for ±6 dB).
+/// * `rng_seed` — Optional seed for deterministic RNG. `Some(seed)` produces
+///   reproducible gain; `None` uses entropy-based seeding.
 ///
 /// # Returns
 ///
 /// Gain-adjusted audio PCM f32 in [-1.0, 1.0] (clamped).
 #[must_use]
-pub fn randomize_volume(samples: &[f32], max_gain_db: f32) -> Vec<f32> {
+pub fn randomize_volume(samples: &[f32], max_gain_db: f32, rng_seed: Option<u64>) -> Vec<f32> {
     if samples.is_empty() || max_gain_db <= 0.0 {
         return samples.to_vec();
     }
+
+    // Create a seeded or entropy-based RNG, matching the canonical
+    // Option<u64> → StdRng pattern (voice_verifier.rs, mahbot-906).
+    let mut rng: StdRng = match rng_seed {
+        Some(seed) => StdRng::seed_from_u64(seed),
+        None => StdRng::seed_from_u64(rand::random()),
+    };
+
     // Random gain in [-max_gain_db, max_gain_db] dB
-    let gain_db: f32 = (rand::random::<f32>() * 2.0 - 1.0) * max_gain_db;
+    let gain_db: f32 = (rng.random::<f32>() * 2.0 - 1.0) * max_gain_db;
     let linear_gain = 10.0_f32.powf(gain_db / 20.0);
 
     samples
@@ -507,6 +547,11 @@ fn augment_audio(samples: &[f32], sample_rate: u32, snr_db_range: (f32, f32)) ->
     let mut audio = samples.to_vec();
 
     // 1. Noise injection (50% probability)
+    // Note: the internal RNG calls in this function (noise type, speed
+    // perturbation probability, SNR) remain unseeded because this is
+    // production batch code where reproducibility is not critical. Only
+    // the benchmark path (generate_augmented_variants) uses seeded RNG
+    // (mahbot-906).
     if rand::random_bool(0.5) {
         let snr_db: f32 =
             snr_db_range.0 + rand::random::<f32>() * (snr_db_range.1 - snr_db_range.0);
@@ -515,11 +560,11 @@ fn augment_audio(samples: &[f32], sample_rate: u32, snr_db_range: (f32, f32)) ->
         } else {
             NoiseType::Pink
         };
-        audio = add_noise(&audio, snr_db, noise_type);
+        audio = add_noise(&audio, snr_db, noise_type, None);
     }
 
     // 2. Volume randomization (always applied with ±6 dB max)
-    audio = randomize_volume(&audio, 6.0);
+    audio = randomize_volume(&audio, 6.0, None);
 
     // 3. Speed perturbation (40% probability, ±10-20%)
     if rand::random_bool(0.4) {
@@ -634,6 +679,8 @@ pub fn training_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     #[test]
     fn test_resample_identity() {
@@ -664,7 +711,7 @@ mod tests {
     fn test_add_white_noise() {
         // Flat signal at 0.5 — noise should produce measurable deviation
         let samples = vec![0.5f32; 1000];
-        let noisy = add_noise(&samples, 10.0, NoiseType::White);
+        let noisy = add_noise(&samples, 10.0, NoiseType::White, None);
         assert_eq!(noisy.len(), samples.len());
         // All samples should still be in range
         for &s in &noisy {
@@ -694,7 +741,7 @@ mod tests {
     fn test_add_pink_noise() {
         // Flat signal at 0.25 — pink noise should produce measurable deviation
         let samples = vec![0.25f32; 1000];
-        let noisy = add_noise(&samples, 10.0, NoiseType::Pink);
+        let noisy = add_noise(&samples, 10.0, NoiseType::Pink, None);
         assert_eq!(noisy.len(), samples.len());
         for &s in &noisy {
             assert!((-1.0..=1.0).contains(&s));
@@ -722,14 +769,14 @@ mod tests {
     #[test]
     fn test_randomize_volume_zero_gain() {
         let samples = vec![0.5f32; 100];
-        let result = randomize_volume(&samples, 0.0);
+        let result = randomize_volume(&samples, 0.0, None);
         assert_eq!(result, samples);
     }
 
     #[test]
     fn test_randomize_volume_range() {
         let samples = vec![0.5f32; 100];
-        let result = randomize_volume(&samples, 6.0);
+        let result = randomize_volume(&samples, 6.0, None);
         assert_eq!(result.len(), samples.len());
         for &s in &result {
             assert!((-1.0..=1.0).contains(&s));
@@ -823,7 +870,9 @@ mod tests {
 
     #[test]
     fn test_generate_pink_noise() {
-        let noise = generate_pink_noise(1000);
+        // The former generate_pink_noise wrapper was inlined into add_noise
+        // (mahbot-906). Test util::generate_pink_noise directly instead.
+        let noise = crate::util::generate_pink_noise(1000, &mut StdRng::seed_from_u64(42));
         assert_eq!(noise.len(), 1000);
         // The canonical implementation normalizes to unit RMS (not
         // per-sample clamping).  This is the correct behavior for
@@ -838,5 +887,26 @@ mod tests {
             (rms - 1.0).abs() < 0.1,
             "Pink noise RMS should be near 1.0 (unit normalization), got {rms}"
         );
+    }
+
+    #[test]
+    fn test_randomize_volume_determinism() {
+        let samples = vec![0.5f32; 100];
+        let a = randomize_volume(&samples, 6.0, Some(42));
+        let b = randomize_volume(&samples, 6.0, Some(42));
+        assert_eq!(a, b, "same seed must produce identical output");
+        let c = randomize_volume(&samples, 6.0, Some(99));
+        assert_ne!(a, c, "different seed must produce different output");
+    }
+
+    #[test]
+    fn test_add_noise_determinism() {
+        let samples = vec![0.5f32; 100];
+        let a = add_noise(&samples, 10.0, NoiseType::White, Some(42));
+        let b = add_noise(&samples, 10.0, NoiseType::White, Some(42));
+        assert_eq!(a, b, "same seed must produce identical white noise output");
+        let c = add_noise(&samples, 10.0, NoiseType::Pink, Some(42));
+        let d = add_noise(&samples, 10.0, NoiseType::Pink, Some(42));
+        assert_eq!(c, d, "same seed must produce identical pink noise output");
     }
 }
