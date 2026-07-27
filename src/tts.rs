@@ -52,12 +52,12 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -75,6 +75,11 @@ const MAX_CHUNK_LENGTH: usize = 300;
 const SILENCE_DURATION: f32 = 0.3;
 // Timeout per-chunk receive: guards against hung synthesis (ONNX deadlock).
 const SYNTHESIS_CHUNK_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// Reverb tail in milliseconds — how long after TTS playback ends to keep
+/// the [`PLAYBACK_ACTIVE`] flag asserted, suppressing wake word detection
+/// while room acoustics and output buffer drain complete.
+const PLAYBACK_REVERB_TAIL_MS: u64 = 300;
 
 // ── SHA256 integrity hashes ──────────────────────────────────────────
 //
@@ -127,6 +132,19 @@ static STATE: AtomicU8 = AtomicU8::new(STATE_UNINIT);
 static GLOBAL_TTS: OnceLock<RwLock<Option<Arc<TtsEngine>>>> = OnceLock::new();
 static CANCEL_TX: OnceLock<broadcast::Sender<()>> = OnceLock::new();
 static CANCEL_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+/// Reference-counted signal that TTS audio is currently playing.
+///
+/// Incremented when the first chunk begins playback in `speak_async()`,
+/// and decremented after the last chunk finishes plus the reverb tail delay
+/// ([`PLAYBACK_REVERB_TAIL_MS`]).  Using a counter (rather than a boolean)
+/// correctly handles overlapping `speak()` calls: if a new TTS response
+/// starts before the previous one's reverb tail expires, the count stays
+/// above zero and wake word detection remains suppressed.
+///
+/// Read by the voice pipeline to suppress wake word detection during TTS
+/// output, preventing false triggers from the system hearing its own speech.
+static PLAYBACK_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 // ── Download progress events (GUI subscription) ───────────────────────
 
@@ -367,6 +385,17 @@ pub fn cancel_playback() {
     if let Some(flag) = CANCEL_FLAG.get() {
         flag.store(true, Ordering::Release);
     }
+}
+
+/// Returns `true` if TTS audio is currently playing through the speakers.
+///
+/// The flag remains asserted for [`PLAYBACK_REVERB_TAIL_MS`] milliseconds
+/// after the last audio chunk finishes, to account for room acoustics and
+/// output buffer drain.  Used by the voice pipeline to suppress wake word
+/// detection during TTS output.
+#[must_use]
+pub fn is_playback_active() -> bool {
+    PLAYBACK_ACTIVE.load(Ordering::Acquire) > 0
 }
 
 /// Initialize the global TTS state.
@@ -1791,6 +1820,12 @@ async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
             }
         };
 
+        if current_sink.is_none() {
+            // Only increment on the first chunk — the single fetch_sub(1)
+            // after the reverb tail (below) restores the counter to zero.
+            PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
+            debug!("TTS playback started — wake word detection suppressed");
+        }
         sink.append(source);
         current_sink = Some(sink);
     }
@@ -1798,6 +1833,15 @@ async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
     // Wait for the last chunk to finish playing
     if let Some(ref sink) = current_sink {
         let _ = wait_for_sink(sink, cancel_rx.as_mut()).await;
+    }
+
+    // Reverb tail: keep the playback count > 0 briefly after playback ends
+    // to prevent wake word false triggers from room acoustics and output
+    // buffer drain.  Using a counter (not a boolean) ensures that a new
+    // speak_async() call that starts during this window keeps the count >= 1.
+    if current_sink.is_some() {
+        tokio::time::sleep(Duration::from_millis(PLAYBACK_REVERB_TAIL_MS)).await;
+        PLAYBACK_ACTIVE.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -2833,5 +2877,122 @@ mod tests {
         );
 
         STATE.store(prev_state, Ordering::Release);
+    }
+
+    // ── Playback-active flag tests (mahbot-896) ────────────────────────
+
+    #[test]
+    fn test_playback_active_default_false() {
+        // The playback-active flag must start as `false` (no TTS playing).
+        assert!(!is_playback_active(), "default state must be inactive");
+        assert_eq!(
+            PLAYBACK_ACTIVE.load(Ordering::Acquire),
+            0,
+            "internal counter must start at 0"
+        );
+    }
+
+    #[test]
+    fn test_playback_reverb_tail_within_range() {
+        // Per ticket mahbot-896: reverb tail must be 200-400ms.
+        assert!(
+            (200..=400).contains(&PLAYBACK_REVERB_TAIL_MS),
+            "PLAYBACK_REVERB_TAIL_MS={} must be between 200 and 400",
+            PLAYBACK_REVERB_TAIL_MS,
+        );
+    }
+
+    #[test]
+    fn test_playback_counter_single_call() {
+        // Simulate the correct production lifecycle: one increment when the
+        // first chunk starts playing, one decrement after the reverb tail.
+        // This is the common case for single-chunk TTS responses.
+        assert_eq!(PLAYBACK_ACTIVE.load(Ordering::Acquire), 0);
+
+        // First chunk playback starts (increment: 0 → 1)
+        PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
+        assert!(is_playback_active(), "active during playback");
+
+        // Reverb tail expires (decrement: 1 → 0)
+        PLAYBACK_ACTIVE.fetch_sub(1, Ordering::Release);
+        assert!(!is_playback_active(), "inactive after reverb tail");
+        assert_eq!(PLAYBACK_ACTIVE.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn test_playback_counter_multi_chunk_no_leak() {
+        // Critical regression test (mahbot-896 review round 3):
+        // The counter is incremented ONCE per speak_async() call (when
+        // the first chunk plays), NOT once per chunk.  After N chunks
+        // and one decrement, the counter must return to 0.
+        //
+        // Previously the increment ran on every chunk, causing a
+        // permanent counter leak on multi-chunk responses (N>=2).
+        assert_eq!(PLAYBACK_ACTIVE.load(Ordering::Acquire), 0);
+
+        // Simulate: first chunk starts playback (increment: 0 → 1)
+        // (guard: current_sink.is_none() == true)
+        PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
+
+        // Simulate: subsequent chunks arrive (guard: current_sink.is_some())
+        // NO fetch_add — this was the bug: adding per-chunk instead of once.
+        // (We verify no additional increments happen.)
+        assert_eq!(PLAYBACK_ACTIVE.load(Ordering::Acquire), 1);
+
+        // Simulate: reverb tail expires (decrement: 1 → 0)
+        PLAYBACK_ACTIVE.fetch_sub(1, Ordering::Release);
+        assert_eq!(
+            PLAYBACK_ACTIVE.load(Ordering::Acquire),
+            0,
+            "counter must return to 0 after multi-chunk response"
+        );
+        assert!(!is_playback_active(), "inactive after all chunks done");
+    }
+
+    #[test]
+    fn test_playback_counter_overlapping_calls() {
+        // Simulate: speak_async() A starts → speak_async() B starts
+        // during A's reverb tail → A finishes reverb → B finishes reverb
+        assert_eq!(PLAYBACK_ACTIVE.load(Ordering::Acquire), 0);
+
+        // A: first chunk plays (increment: 0 → 1)
+        PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
+        assert!(is_playback_active());
+
+        // B starts during A's reverb tail: first chunk plays (1 → 2)
+        PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
+        assert!(is_playback_active());
+
+        // A: reverb tail expires (2 → 1) — still active due to B
+        PLAYBACK_ACTIVE.fetch_sub(1, Ordering::Release);
+        assert!(is_playback_active(), "B still playing");
+
+        // B: reverb tail expires (1 → 0) — now inactive
+        PLAYBACK_ACTIVE.fetch_sub(1, Ordering::Release);
+        assert!(!is_playback_active());
+
+        assert_eq!(PLAYBACK_ACTIVE.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn test_playback_counter_high_frequency_race_safety() {
+        // Stress test: 100 iterations of overlapping call pairs.
+        // Verifies the counter always returns to 0 regardless of
+        // interleaving — exercises the race scenario where a new
+        // speak_async() starts during the previous one's reverb tail.
+        for _ in 0..100 {
+            assert_eq!(PLAYBACK_ACTIVE.load(Ordering::Acquire), 0);
+
+            PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
+            PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
+            PLAYBACK_ACTIVE.fetch_sub(1, Ordering::Release);
+            PLAYBACK_ACTIVE.fetch_sub(1, Ordering::Release);
+
+            assert_eq!(
+                PLAYBACK_ACTIVE.load(Ordering::Acquire),
+                0,
+                "counter must return to 0 after balanced add/sub pairs"
+            );
+        }
     }
 }

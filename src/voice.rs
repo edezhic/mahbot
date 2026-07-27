@@ -5139,6 +5139,23 @@ pub async fn run_voice_pipeline() {
                     continue;
                 };
 
+                // ── TTS playback gate (mahbot-896) ──
+                // If TTS audio is actively playing through the speakers, skip ALL
+                // audio processing for this chunk, including the pre-AGC ring buffer,
+                // noise suppressor, AGC, VAD, mel extraction, wake word detection,
+                // enrollment, and recording.  This prevents TTS echo from
+                // contaminating:
+                //   - noise suppressor / AGC internal state
+                //   - earshot VAD ring buffer and noise floor estimate
+                //   - wake word classifier embeddings and verifier scores
+                //   - enrollment noise RMS estimates (pre-AGC ring buffer)
+                //
+                // The gate stays active for a reverb tail period after playback
+                // ends (see crate::tts::PLAYBACK_REVERB_TAIL_MS).
+                if crate::tts::is_playback_active() {
+                    continue;
+                }
+
                 // ── Pre-AGC ring buffer (mahbot-785) ──
                 // Capture raw audio before AGC processing for noise RMS
                 // estimation.  AGC amplifies silence (up to 4×) more than
