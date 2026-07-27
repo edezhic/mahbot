@@ -9491,6 +9491,7 @@ mod tests {
             w2: vec![0.0; MLP_HIDDEN_1 * MLP_HIDDEN_2],
             b2: vec![0.0; MLP_HIDDEN_2],
             w3: vec![0.0; MLP_HIDDEN_2],
+            verifier_version: crate::voice_verifier::VERIFIER_VERSION_LEGACY,
             b3: -2.0, // sigmoid(-2.0) ≈ 0.12
             weights: Vec::new(),
             bias: 0.0,
@@ -9511,6 +9512,7 @@ mod tests {
             w2: vec![0.0; MLP_HIDDEN_1 * MLP_HIDDEN_2],
             b2: vec![0.0; MLP_HIDDEN_2],
             w3: vec![0.0; MLP_HIDDEN_2],
+            verifier_version: crate::voice_verifier::VERIFIER_VERSION_LEGACY,
             b3: 2.0, // sigmoid(2.0) ≈ 0.88
             weights: Vec::new(),
             bias: 0.0,
