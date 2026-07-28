@@ -2224,20 +2224,35 @@ impl Dashboard {
             .into()
     }
 
-    /// Render a compact voice status indicator in the footer bar (mahbot-812).
+    /// Render a compact voice status indicator in the footer bar (mahbot-812,
+    /// mahbot-921).
     ///
-    /// Shows one of four states: "🔊 Listening", "🔊 Recording…",
-    /// "🔊 Transcribing…", or "🔊 Error: transcription failed".
-    /// All other [`VoiceStatus`] variants (disabled, enrolling, etc.) are
-    /// only relevant on the Settings page and do not render anything here.
+    /// Shows a compact indicator for every [`VoiceStatus`] variant except
+    /// [`VoiceStatus::Disabled`] (which is hidden — voice is off).
+    /// [`VoiceStatus::Error`] displays the actual error string rather than
+    /// a hardcoded message.
     fn render_voice_status() -> Element<'static, Message> {
-        let label = match crate::voice::get_status() {
-            VoiceStatus::Listening => "🔊 Listening",
-            VoiceStatus::Recording => "🔊 Recording…",
-            VoiceStatus::Transcribing => "🔊 Transcribing…",
-            VoiceStatus::Error(_) => "🔊 Error: transcription failed",
-            // Disabled, loading, enrolling, etc. — not shown in the footer.
-            _ => return Space::new().width(0).into(),
+        let label: String = match crate::voice::get_status() {
+            // Hidden when voice is disabled.
+            VoiceStatus::Disabled => return Space::new().width(0).into(),
+            VoiceStatus::LoadingModels => "🔊 Loading…".into(),
+            VoiceStatus::ModelError => "🔊 ⚠ Model error".into(),
+            VoiceStatus::Listening => "🔊 Listening".into(),
+            VoiceStatus::Recording => "🔊 Recording…".into(),
+            VoiceStatus::Transcribing => "🔊 Transcribing…".into(),
+            VoiceStatus::MicPermissionDenied => "🔊 No mic access".into(),
+            VoiceStatus::MicDisconnected => "🔊 Mic disconnected".into(),
+            VoiceStatus::Enrolling { sample, total, .. } => {
+                format!("🔊 Enrolling {sample}/{total}")
+            }
+            VoiceStatus::ListeningDuringEnrollment { sample, total } => {
+                format!("🔊 Listen… {sample}/{total}")
+            }
+            VoiceStatus::WaitingForSilenceDuringEnrollment { sample, total } => {
+                format!("🔊 Wait… {sample}/{total}")
+            }
+            VoiceStatus::Enrolled => "🔊 ✅ Enrolled".into(),
+            VoiceStatus::Error(msg) => format!("🔊 Error: {msg}"),
         };
         container(text(label).size(12).color(theme::TEXT_MUTED))
             .padding(iced::Padding {
