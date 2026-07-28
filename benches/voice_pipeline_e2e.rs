@@ -6,20 +6,9 @@
 ///
 /// # Lock mechanism
 ///
-/// The lock functions here mirror the pattern in `src/self_update.rs` (private
-/// `try_flock` / `open_lock_file`).  That module is the canonical implementation;
-/// this file duplicates ~15 lines rather than extracting a shared helper for a
-/// single consumer.
-///
-/// # Self-test mode
-///
-/// This binary has `harness = false` (see Cargo.toml), so `#[test]` functions
-/// compile but are never discovered by libtest.  Set `MAHBOT_BENCH_SELF_TEST=1`
-/// to run the internal [`run_self_tests()`] function instead of the benchmark.
-///
-/// ```text
-/// MAHBOT_BENCH_SELF_TEST=1 cargo bench --bench voice_pipeline_e2e --features voice-tests
-/// ```
+/// Uses [`mahbot::lock_utils::try_flock`] for the underlying file lock and a
+/// lock file at `~/.mahbot/voice_pipeline_e2e.lock`.  The `lock_utils` module
+/// is the canonical implementation shared with [`mahbot::self_update`].
 ///
 /// # Lock release guarantee
 ///
@@ -28,8 +17,8 @@
 /// teardown — this happens on normal `Drop`, on `process::exit` (Rust
 /// destructors do NOT run, but the kernel closes all fds), and on SIGKILL.
 /// There is no stale-lock scenario.
+use mahbot::lock_utils::try_flock;
 use std::fs::{self, File, OpenOptions};
-use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -101,76 +90,9 @@ fn acquire_bench_lock() -> File {
     }
 }
 
-/// Mirrors `src/self_update.rs::try_flock` — see that module for the
-/// canonical implementation and test coverage (including
-/// `test_lock_acquire_and_release_with_temp_dir`).
-#[cfg(unix)]
-fn try_flock(file: &File) -> io::Result<bool> {
-    use std::os::unix::io::AsRawFd;
-    let fd = file.as_raw_fd();
-    // SAFETY: `flock` operates on a valid fd opened with read+write.
-    // `LOCK_NB` makes it non-blocking; `EAGAIN` means lock held.
-    let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if result == 0 {
-        Ok(true)
-    } else {
-        let err = io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::EAGAIN) => Ok(false),
-            _ => Err(err),
-        }
-    }
-}
-
-/// Mirrors `src/self_update.rs::try_flock` — see that module for the
-/// canonical implementation (including `const LOCK_VIOLATION` pattern).
-#[cfg(windows)]
-fn try_flock(file: &File) -> io::Result<bool> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
-    };
-
-    let handle = file.as_raw_handle() as HANDLE;
-
-    // Matches self_update.rs canonical pattern: const LOCK_VIOLATION.
-    const LOCK_VIOLATION: i32 = ERROR_LOCK_VIOLATION as i32;
-
-    let mut overlapped =
-        unsafe { std::mem::zeroed::<windows_sys::Win32::System::IO::OVERLAPPED>() };
-    let locked = unsafe {
-        LockFileEx(
-            handle,
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-            0,
-            0,
-            0,
-            &mut overlapped,
-        )
-    };
-    if locked != 0 {
-        Ok(true)
-    } else {
-        let err = io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(LOCK_VIOLATION) => Ok(false),
-            _ => Err(err),
-        }
-    }
-}
-
 // ── Main ──────────────────────────────────────────────────────────────────
 
 fn main() {
-    // Self-test mode: run internal tests and exit.
-    // This is the standard approach for harness=false bench binaries that
-    // cannot use #[test] functions.
-    if std::env::var("MAHBOT_BENCH_SELF_TEST").as_deref() == Ok("1") {
-        run_self_tests();
-        return;
-    }
-
     // 1. Acquire single-instance lock.
     //    Prevents concurrent benchmark runs that cause Metal GPU deadlock.
     let _lock = acquire_bench_lock();
@@ -210,71 +132,4 @@ fn main() {
             std::process::exit(1);
         }
     }
-}
-
-// ── Self-tests (for harness=false binaries) ────────────────────────────────
-
-/// Run internal self-tests for the lock functions.
-///
-/// The bench binary has `harness = false` (see Cargo.toml), so `#[test]`
-/// functions compile but are never discovered by libtest.  This self-test
-/// entry point is invoked by setting `MAHBOT_BENCH_SELF_TEST=1`.
-///
-/// Panics on failure — the panic message identifies the failing test.
-fn run_self_tests() {
-    let dir = std::env::temp_dir().join("mahbot_bench_self_test");
-    let _ = fs::remove_dir_all(&dir); // clean slate
-    fs::create_dir_all(&dir).expect("failed to create self-test temp dir");
-
-    let lock_path = dir.join("test_bench.lock");
-
-    // ── Test 1: try_flock acquires and releases ───────────────────────
-    let file1 = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .expect("Test 1: failed to open lock file");
-
-    assert!(
-        try_flock(&file1).expect("Test 1: try_flock should not error"),
-        "Test 1: first lock should succeed",
-    );
-
-    // ── Test 2: second fd on same file is rejected ────────────────────
-    let file2 = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .expect("Test 2: failed to open lock file");
-
-    assert!(
-        !try_flock(&file2).expect("Test 2: try_flock should not error"),
-        "Test 2: second lock on same file should fail",
-    );
-
-    // ── Test 3: lock is reusable after release ────────────────────────
-    drop(file1); // releases flock
-
-    assert!(
-        try_flock(&file2).expect("Test 3: try_flock should not error"),
-        "Test 3: lock should succeed after first holder releases",
-    );
-
-    // ── Test 4: lock file path ───────────────────────────────────────
-    let path = lock_file_path();
-    assert!(
-        path.ends_with("voice_pipeline_e2e.lock"),
-        "Test 4: lock file path must end with voice_pipeline_e2e.lock, got: {}",
-        path.display(),
-    );
-
-    // Clean up.
-    drop(file2);
-    let _ = fs::remove_dir_all(&dir);
-
-    eprintln!("✅ All bench lock self-tests passed");
 }

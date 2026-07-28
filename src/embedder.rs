@@ -1057,11 +1057,18 @@ fn last_token_pool_and_l2_normalize(
 mod tests {
     use super::*;
     use crate::vector::cosine_similarity;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    /// Global mutex to serialize embedder tests that manipulate the
+    /// global [`STATE`] machine. Without it, parallel test execution
+    /// can race on `reset_global_state()`, `ensure_embedder()`, and
+    /// direct `STATE` stores, producing non-deterministic failures.
+    static TEST_GLOBAL_STATE_MUTEX: Mutex<()> = Mutex::new(());
 
     /// Initialize config storage root for tests using a temp directory.
     /// Returns the temp dir path (used as storage root).
     fn init_test_config() -> std::path::PathBuf {
-        use std::sync::OnceLock;
         static CONFIG_INIT: OnceLock<tempfile::TempDir> = OnceLock::new();
         let tmp = CONFIG_INIT
             .get_or_init(|| tempfile::TempDir::new().expect("failed to create test temp dir"));
@@ -1070,15 +1077,9 @@ mod tests {
         root
     }
 
-    /// Set up a storage root pointing to `~/.mahbot` for model-dependent tests.
-    /// Uses `try_set_storage_root` so it's a no-op if another test already set it.
-    /// Helper to get an embedder for tests.
-    ///
-    /// Looks for model files in CONFIG storage root first, then falls back to
-    /// `$HOME/.mahbot/models`. This ensures model-dependent tests work regardless
-    /// of whether the graceful degradation test (which uses a temp dir) ran first.
-    /// Returns `None` and skips test if the model files aren't available.
-    fn test_embedder() -> Option<&'static Embedder> {
+    /// Gets a test Embedder, panicking with a clear message if model
+    /// files are not cached on disk.
+    fn test_embedder() -> &'static Embedder {
         use std::sync::OnceLock;
 
         // Share a single model load across all tests via OnceLock.
@@ -1088,11 +1089,6 @@ mod tests {
 
         TEST_EMBEDDER
             .get_or_init(|| {
-                // Skip if env var is set
-                if std::env::var("MAHBOT_SKIP_EMBEDDER_TESTS").is_ok() {
-                    return None;
-                }
-
                 // Collect all candidate models directories (deduplicated).
                 let mut candidates = Vec::new();
 
@@ -1130,13 +1126,17 @@ mod tests {
                 // No model files found in any candidate directory.
                 let last_candidate = candidates.last().map(|p| p.display().to_string());
                 eprintln!(
-                    "WARNING: Model files not found. Looked in: {}. \
-                 Set MAHBOT_SKIP_EMBEDDER_TESTS=1 to suppress this warning.",
+                    "Embedder model files not found. Looked in: {}. \
+                     Run the application first to download embedding models (~150 MB).",
                     last_candidate.as_deref().unwrap_or("<none>")
                 );
                 None
             })
             .as_ref()
+            .expect(
+                "Embedder model files are required for tests. \
+                 Run the application first to download embedding models (~150 MB).",
+            )
     }
 
     /// Reset global embedder state for hermetic testing.
@@ -1147,6 +1147,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_embedder_graceful_degradation() {
+        let _lock = TEST_GLOBAL_STATE_MUTEX.lock().unwrap();
         // Use a temp dir as storage root — no model files there.
         let _root = init_test_config();
         reset_global_state();
@@ -1165,6 +1166,7 @@ mod tests {
 
     #[test]
     fn test_ensure_embedder_terminally_failed() {
+        let _lock = TEST_GLOBAL_STATE_MUTEX.lock().unwrap();
         // Regression test: when STATE is FAILED, ensure_embedder() should return
         // false immediately (without attempting re-initialization).
         let _root = init_test_config();
@@ -1204,6 +1206,7 @@ mod tests {
     /// [`STATE_FAILED`], preventing a permanent wedge.
     #[test]
     fn test_ensure_embedder_no_runtime() {
+        let _lock = TEST_GLOBAL_STATE_MUTEX.lock().unwrap();
         let _root = init_test_config();
         reset_global_state();
 
@@ -1270,9 +1273,7 @@ mod tests {
 
     #[test]
     fn test_embedding_produces_unit_vectors() {
-        let Some(emb) = test_embedder() else {
-            return; // Skip if no model available
-        };
+        let emb = test_embedder();
 
         // embed_documents with single input
         let v = emb.embed_documents(&["hello world"]).unwrap();
@@ -1312,7 +1313,7 @@ mod tests {
 
     #[test]
     fn test_similar_embeddings_are_similar() {
-        let Some(emb) = test_embedder() else { return };
+        let emb = test_embedder();
         let v = emb
             .embed_documents(&[
                 "rust programming language",
@@ -1330,7 +1331,7 @@ mod tests {
 
     #[test]
     fn test_empty_input_fails() {
-        let Some(emb) = test_embedder() else { return };
+        let emb = test_embedder();
         let result = emb.embed_documents(&[]);
         assert!(result.is_err(), "empty input should produce an error");
     }

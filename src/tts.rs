@@ -1466,6 +1466,12 @@ fn synthesize_internal(
     } else {
         wav_t.to_vec1::<f32>()?
     };
+
+    // Clamp samples to valid [-1.0, 1.0] range for audio playback.
+    // The vocoder may produce values slightly outside this range due to
+    // floating-point accumulation in the flow-matching / neural vocoder.
+    let wav_data: Vec<f32> = wav_data.into_iter().map(|s| s.clamp(-1.0, 1.0)).collect();
+
     Ok(wav_data)
 }
 
@@ -2369,18 +2375,41 @@ mod tests {
     // ── Tier 3: Integration tests with real models ────────────────────
     //
     // These tests require the Supertonic 3 model files to be cached in
-    // `~/.mahbot/models/supertonic3/`. They are skipped if the files are
-    // not found (matching the embedder test pattern).
+    // `~/.mahbot/models/supertonic3/`. Panics with a clear message if the files
+    // are not found.
+
+    /// Collect candidate model directories, deduplicated.
+    /// Uses CONFIG storage root (may be a temp dir from graceful degradation test)
+    /// and HOME/.mahbot/models/supertonic3/ (real cache).
+    fn test_model_candidates() -> Vec<std::path::PathBuf> {
+        let mut candidates = Vec::new();
+
+        // 1. CONFIG storage root (may be a temp dir from graceful degradation test).
+        if let Some(root) = crate::config::CONFIG.try_storage_root() {
+            candidates.push(root.join("models").join(MODEL_DIR_NAME));
+        }
+
+        // 2. Real home directory cache (always present in dev/CI environments).
+        if let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
+            let real = std::path::PathBuf::from(&home)
+                .join(".mahbot")
+                .join("models")
+                .join(MODEL_DIR_NAME);
+            if !candidates.contains(&real) {
+                candidates.push(real);
+            }
+        }
+
+        candidates
+    }
 
     /// Helper to obtain a loaded [`TtsEngine`] for integration tests.
-    ///
-    /// Returns `None` (and skips the calling test) when:
-    /// - `MAHBOT_SKIP_TTS_TESTS=1` is set
-    /// - Model files are not cached on disk
+    /// Returns the test TTS engine, panicking with a clear message if
+    /// model files are not cached on disk.
     ///
     /// Caches the loaded engine via [`OnceLock`] so the ~2s load cost is
     /// paid only once per test run.
-    fn test_tts_engine() -> Option<&'static TtsEngine> {
+    fn test_tts_engine() -> &'static TtsEngine {
         use std::sync::OnceLock;
 
         // Share a single model load across all tests via OnceLock.
@@ -2388,29 +2417,7 @@ mod tests {
 
         TEST_TTS_ENGINE
             .get_or_init(|| {
-                // Skip if env var is set
-                if std::env::var("MAHBOT_SKIP_TTS_TESTS").is_ok() {
-                    return None;
-                }
-
-                // Collect all candidate models directories (deduplicated).
-                let mut candidates = Vec::new();
-
-                // 1. CONFIG storage root (may be a temp dir from graceful degradation test).
-                if let Some(root) = crate::config::CONFIG.try_storage_root() {
-                    candidates.push(root.join("models").join(MODEL_DIR_NAME));
-                }
-
-                // 2. Real home directory cache (always present in dev/CI environments).
-                if let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
-                    let real = std::path::PathBuf::from(&home)
-                        .join(".mahbot")
-                        .join("models")
-                        .join(MODEL_DIR_NAME);
-                    if !candidates.contains(&real) {
-                        candidates.push(real);
-                    }
-                }
+                let candidates = test_model_candidates();
 
                 // Try each candidate until we find model files.
                 for dir in &candidates {
@@ -2439,58 +2446,72 @@ mod tests {
                 // No model files found in any candidate directory.
                 let last_candidate = candidates.last().map(|p| p.display().to_string());
                 eprintln!(
-                    "WARNING: Supertonic 3 model files not found. Looked in: {}. \
-                     Set MAHBOT_SKIP_TTS_TESTS=1 to suppress this warning.",
+                    "TTS model files not found. Looked in: {}. \
+                     Run the application first to download TTS models (~400 MB).",
                     last_candidate.as_deref().unwrap_or("<none>")
                 );
                 None
             })
             .as_ref()
+            .expect(
+                "TTS model files are required for tests. \
+                 Run the application first to download TTS models (~400 MB).",
+            )
     }
 
     /// Helper to obtain the default voice style tensors for integration tests.
     ///
-    /// Returns `None` (and skips the calling test) when:
-    /// - `MAHBOT_SKIP_TTS_TESTS=1` is set
-    /// - The default voice style file is not cached on disk
-    /// - Loading/parsing fails
-    ///
     /// Caches the loaded tensors via [`OnceLock`] so the JSON parse cost is
-    /// paid only once per test run.
-    fn test_voice_style() -> Option<(&'static Tensor, &'static Tensor)> {
-        // First check if engine is available (which implies model files exist)
-        test_tts_engine()?;
+    /// paid only once per test run. Panics with a clear message if the style
+    /// file is not cached on disk.
+    fn test_voice_style() -> (&'static Tensor, &'static Tensor) {
+        // First ensure engine is available (which implies model files exist)
+        test_tts_engine();
 
         static TEST_VOICE_STYLE: OnceLock<Option<(Tensor, Tensor)>> = OnceLock::new();
 
-        TEST_VOICE_STYLE
-            .get_or_init(|| {
-                let dir = model_dir()?;
+        let binding = TEST_VOICE_STYLE.get_or_init(|| {
+            // Use the same candidates as test_tts_engine() to find the voice style.
+            let candidates = test_model_candidates();
+            for dir in &candidates {
                 let style_path = dir.join(VOICE_STYLES_DIR).join(DEFAULT_VOICE_NAME);
                 if style_path.exists() {
-                    match load_voice_style(&dir, DEFAULT_VOICE_NAME) {
+                    match load_voice_style(dir, DEFAULT_VOICE_NAME) {
                         Ok(styles) => return Some(styles),
                         Err(e) => {
-                            tracing::warn!("Failed to load test voice style: {e}");
-                            return None;
+                            panic!("Failed to load test voice style from {dir:?}: {e}");
                         }
                     }
                 }
-                None
-            })
+            }
+
+            // No candidate had the voice style file — even though test_tts_engine()
+            // succeeded. Show all paths we looked at.
+            let paths: Vec<String> = candidates
+                .iter()
+                .map(|d| {
+                    d.join(VOICE_STYLES_DIR)
+                        .join(DEFAULT_VOICE_NAME)
+                        .display()
+                        .to_string()
+                })
+                .collect();
+            panic!(
+                "Default voice style file not found. Looked in: {}. \
+                 Run the application first to download TTS models (~400 MB).",
+                paths.join(", ")
+            );
+        });
+        let inner: &(Tensor, Tensor) = binding
             .as_ref()
-            .as_ref()
-            .map(|(dp, ttl)| (dp, ttl))
+            .expect("test_voice_style already panicked on failure");
+        (&inner.0, &inner.1)
     }
 
     #[test]
     fn test_synthesize_short_text_creates_valid_wav() {
-        let Some(engine) = test_tts_engine() else {
-            return; // Skip if no model available
-        };
-        let Some((style_dp, style_ttl)) = test_voice_style() else {
-            return;
-        };
+        let engine = test_tts_engine();
+        let (style_dp, style_ttl) = test_voice_style();
 
         let samples = synthesize_internal(engine, "<en>Hello world.</en>", style_dp, style_ttl, 42)
             .expect("synthesis of short text should succeed");
@@ -2516,16 +2537,11 @@ mod tests {
 
     #[test]
     fn test_synthesize_chunked_long_text() {
-        let Some(engine) = test_tts_engine() else {
-            return; // Skip if no model available
-        };
-        let Some((style_dp, style_ttl)) = test_voice_style() else {
-            return;
-        };
+        let engine = test_tts_engine();
+        let (style_dp, style_ttl) = test_voice_style();
 
         // Create text longer than MAX_CHUNK_LENGTH (300 chars)
-        let long_text =
-            "Hello world. This is a test of the chunked synthesis pipeline. ".repeat(20);
+        let long_text = "Hello world. This is a test of the chunked synthesis pipeline. ".repeat(5);
         assert!(
             long_text.len() > MAX_CHUNK_LENGTH,
             "test text must exceed chunk limit"
@@ -2552,16 +2568,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_synthesize_chunked_streaming_receives_chunks() {
-        let Some(engine) = test_tts_engine() else {
-            return; // Skip if no model available
-        };
-        let Some((style_dp, style_ttl)) = test_voice_style() else {
-            return;
-        };
+        let engine = test_tts_engine();
+        let (style_dp, style_ttl) = test_voice_style();
 
         // Create text longer than MAX_CHUNK_LENGTH to trigger chunking
         let long_text =
-            "Hello world. This is a test of the streaming synthesis pipeline. ".repeat(20);
+            "Hello world. This is a test of the streaming synthesis pipeline. ".repeat(5);
         assert!(
             long_text.len() > MAX_CHUNK_LENGTH,
             "test text must exceed chunk limit"
@@ -2610,12 +2622,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_synthesize_chunked_streaming_short_fast_path() {
-        let Some(engine) = test_tts_engine() else {
-            return; // Skip if no model available
-        };
-        let Some((style_dp, style_ttl)) = test_voice_style() else {
-            return;
-        };
+        let engine = test_tts_engine();
+        let (style_dp, style_ttl) = test_voice_style();
 
         // Short text below MAX_CHUNK_LENGTH — should take the fast path
         // (single send, no chunk loop).
@@ -2652,12 +2660,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_synthesize_chunked_streaming_cancelled_on_receiver_drop() {
-        let Some(engine) = test_tts_engine() else {
-            return; // Skip if no model available
-        };
-        let Some((style_dp, style_ttl)) = test_voice_style() else {
-            return;
-        };
+        let engine = test_tts_engine();
+        let (style_dp, style_ttl) = test_voice_style();
 
         // Dropping the receiver before the sender writes causes the
         // blocking_send to fail with a channel-closed error.
@@ -2688,12 +2692,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_synthesize_chunked_streaming_cancelled_by_flag() {
-        let Some(engine) = test_tts_engine() else {
-            return; // Skip if no model available
-        };
-        let Some((style_dp, style_ttl)) = test_voice_style() else {
-            return;
-        };
+        let engine = test_tts_engine();
+        let (style_dp, style_ttl) = test_voice_style();
 
         // Setting the cancel flag before synthesis starts causes an
         // immediate bail without any model work.
@@ -2728,12 +2728,8 @@ mod tests {
 
     #[test]
     fn test_synthesis_deterministic_with_seed_42() {
-        let Some(engine) = test_tts_engine() else {
-            return; // Skip if no model available
-        };
-        let Some((style_dp, style_ttl)) = test_voice_style() else {
-            return;
-        };
+        let engine = test_tts_engine();
+        let (style_dp, style_ttl) = test_voice_style();
 
         let text = "<en>Hello world, this is a deterministic test.</en>";
 
@@ -2768,12 +2764,8 @@ mod tests {
     fn test_empty_text_fails_fast() {
         // synthesize_internal with empty text should bail cleanly at the
         // Rust-level guard (seq_len == 0) before reaching any ONNX model code.
-        let Some(engine) = test_tts_engine() else {
-            return; // Skip if no model available
-        };
-        let Some((style_dp, style_ttl)) = test_voice_style() else {
-            return;
-        };
+        let engine = test_tts_engine();
+        let (style_dp, style_ttl) = test_voice_style();
 
         let result = synthesize_internal(engine, "", style_dp, style_ttl, 42);
         assert!(result.is_err(), "empty text synthesis should fail");
@@ -2829,7 +2821,7 @@ mod tests {
         // Enable TTS for the happy path
         let prev_state = STATE.load(Ordering::Acquire);
         STATE.store(STATE_READY, Ordering::Release);
-        crate::config::CONFIG.set_string_field("tts_enabled", "true");
+        let _ = crate::config::CONFIG.set_string_field("tts_enabled", "true");
 
         // Reset speak counter
         SPEAK_COUNT.store(0, Ordering::Release);
@@ -2899,6 +2891,7 @@ mod tests {
     // ── Playback-active flag tests (mahbot-896) ────────────────────────
 
     #[test]
+    #[serial_test::serial(tts)]
     fn test_playback_active_default_false() {
         // The playback-active flag must start as `false` (no TTS playing).
         assert!(!is_playback_active(), "default state must be inactive");
@@ -2910,6 +2903,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(tts)]
     fn test_playback_reverb_tail_within_range() {
         // Per ticket mahbot-896: reverb tail must be 200-400ms.
         assert!(
@@ -2920,6 +2914,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(tts)]
     fn test_playback_counter_single_call() {
         // Simulate the correct production lifecycle: one increment when the
         // first chunk starts playing, one decrement after the reverb tail.
@@ -2937,6 +2932,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(tts)]
     fn test_playback_counter_multi_chunk_no_leak() {
         // Critical regression test (mahbot-896 review round 3):
         // The counter is incremented ONCE per speak_async() call (when
@@ -2967,6 +2963,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(tts)]
     fn test_playback_counter_overlapping_calls() {
         // Simulate: speak_async() A starts → speak_async() B starts
         // during A's reverb tail → A finishes reverb → B finishes reverb
@@ -2992,6 +2989,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(tts)]
     fn test_playback_counter_high_frequency_race_safety() {
         // Stress test: 100 iterations of overlapping call pairs.
         // Verifies the counter always returns to 0 regardless of

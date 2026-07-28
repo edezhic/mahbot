@@ -20,19 +20,6 @@
 //! for maximum performance.  First run populates the TTS audio cache
 //! (~14-17 min); subsequent runs complete in ~2-3 min.
 //!
-//! # Environment variables
-//!
-//! * `MAHBOT_TEST_CACHE_BUST=1` — force full TTS cache regeneration
-//! * `MAHBOT_VERIFIER_THRESHOLD=<float>` — override the verifier decision threshold
-//!   (default: `0.50`).  Used for threshold calibration sweeps (mahbot-880).
-//!   ⚠ This is parsed once per process and cached (via `OnceLock`), unlike
-//!   `MAHBOT_BENCH_LEGACY_NEGATIVES` which is read once per benchmark invocation.  The caching is
-//!   intentional — threshold is set once at process start; if you need per-test-run
-//!   overrides, use a separate process invocation (or set before test init).
-//! * `MAHBOT_BENCH_LEGACY_NEGATIVES=1` — bypass the production negative embedding
-//!   cache and use the original inline TTS synthesis for baseline/sweep comparisons
-//!   (mahbot-880).
-//!
 //! # Requirements
 //!
 //! * TTS models must be downloaded and cached (run the app once).
@@ -52,8 +39,7 @@
 use super::*; // voice module items (process_enrollment_sample, etc.)
 use crate::embedding_sequence::{EmbeddingSequence, Source, UtteranceId};
 use crate::tts;
-use crate::voice_verifier::L2_LAMBDA;
-use crate::voice_verifier::VoiceVerifier;
+use crate::voice_verifier::{DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA, VoiceVerifier};
 use crate::wake_word_classifier::WakeWordClassifier;
 use earshot::Detector;
 use rand::{RngExt, SeedableRng};
@@ -249,28 +235,8 @@ impl BenchTier {
 #[derive(Debug, Clone, Copy)]
 struct TierLimits {
     confusable: usize,
-    unrelated: usize,
-    silence: usize,
     noise: usize,
     total: usize,
-}
-
-/// Resolve the benchmark tier from `MAHBOT_BENCH_TIER` env var.
-/// Defaults to `Hard` when unset or set to an unrecognized value.
-fn resolve_bench_tier() -> BenchTier {
-    match std::env::var("MAHBOT_BENCH_TIER") {
-        Ok(val) => match val.to_lowercase().as_str() {
-            "easy" => BenchTier::Easy,
-            "medium" => BenchTier::Medium,
-            "hard" => BenchTier::Hard,
-            other => {
-                warn!("Unknown MAHBOT_BENCH_TIER value '{other}'. Falling back to 'hard'.");
-                eprintln!("⚠ Unknown MAHBOT_BENCH_TIER value '{other}' — falling back to 'hard'.");
-                BenchTier::Hard
-            }
-        },
-        Err(_) => BenchTier::Hard,
-    }
 }
 
 /// Return the per-category false-accept limits for the given tier.
@@ -278,22 +244,16 @@ const fn tier_limits(tier: BenchTier) -> TierLimits {
     match tier {
         BenchTier::Easy => TierLimits {
             confusable: 0,
-            unrelated: 0,
-            silence: 0,
             noise: 0,
             total: 0,
         },
         BenchTier::Medium => TierLimits {
             confusable: 1,
-            unrelated: 0,
-            silence: 0,
             noise: 1,
             total: 1, // combined confusable+noise cap (tighter than sum of individual limits)
         },
         BenchTier::Hard => TierLimits {
             confusable: 1,
-            unrelated: 0,
-            silence: 0,
             noise: 1,
             total: 2,
         },
@@ -377,8 +337,7 @@ fn cache_dir() -> std::path::PathBuf {
 
 /// Synthesize wake word variant audio with TTS caching support.
 ///
-/// If cache_bust is true, deletes any cached audio first to force
-/// re-synthesis. Delegates to the production implementation.
+/// Delegates to the production implementation.
 fn synthesize_wake_word_variant_cached(
     text: &str,
     style: &str,
@@ -386,15 +345,7 @@ fn synthesize_wake_word_variant_cached(
     sample_rate: u32,
     model_hash: &str,
     cache_dir: &std::path::Path,
-    cache_bust: bool,
 ) -> Option<Vec<f32>> {
-    if cache_bust {
-        // Force re-synthesis by deleting any cached audio
-        let key = super::pcm_cache_key(text, style, seed, sample_rate, model_hash);
-        let cache_path = cache_dir.join(&key);
-        let _ = std::fs::remove_file(&cache_path);
-    }
-    // Delegate to the production implementation
     super::synthesize_with_pcm_cache(text, style, seed, sample_rate, model_hash, cache_dir)
 }
 
@@ -406,7 +357,6 @@ fn generate_enrollment_variants_cached(
     available_styles: &[String],
     model_hash: &str,
     cache_dir: &std::path::Path,
-    cache_bust: bool,
 ) -> Vec<(Vec<f32>, String)> {
     let mut variants = Vec::new();
     let num_styles = available_styles.len();
@@ -420,7 +370,6 @@ fn generate_enrollment_variants_cached(
                 TARGET_SAMPLE_RATE,
                 model_hash,
                 cache_dir,
-                cache_bust,
             ) {
                 variants.push((pcm, format!("default_style_var{i}")));
             }
@@ -436,7 +385,6 @@ fn generate_enrollment_variants_cached(
                 TARGET_SAMPLE_RATE,
                 model_hash,
                 cache_dir,
-                cache_bust,
             ) {
                 variants.push((pcm, format!("{style}_enroll{i}")));
             }
@@ -470,7 +418,6 @@ fn generate_phrase_variants_cached(
     prefix: &str,
     model_hash: &str,
     cache_dir: &std::path::Path,
-    cache_bust: bool,
 ) -> Vec<(Vec<f32>, String)> {
     let mut variants = Vec::new();
     let num_styles = available_styles.len().max(1);
@@ -497,7 +444,6 @@ fn generate_phrase_variants_cached(
             TARGET_SAMPLE_RATE,
             model_hash,
             cache_dir,
-            cache_bust,
         ) {
             variants.push((pcm, format!("{prefix}_{phrase}_s{i}")));
         }
@@ -507,33 +453,6 @@ fn generate_phrase_variants_cached(
 }
 
 /// Generate all seed variants for a phrase list in a single batch.
-fn generate_phrase_variants_batch(
-    phrases: &[&str],
-    available_styles: &[String],
-    seed: SeedConfig,
-    prefix: &str,
-    model_hash: &str,
-    cache_dir: &std::path::Path,
-    cache_bust: bool,
-) -> Vec<Vec<(Vec<f32>, String)>> {
-    (0..seed.num_variants)
-        .map(|i| {
-            generate_phrase_variants_cached(
-                phrases,
-                available_styles,
-                SeedConfig {
-                    seed_variant: i,
-                    ..seed
-                },
-                prefix,
-                model_hash,
-                cache_dir,
-                cache_bust,
-            )
-        })
-        .collect()
-}
-
 /// Generate white uniform noise in [-1.0, 1.0].
 fn generate_white_uniform_noise() -> Vec<f32> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
@@ -906,7 +825,6 @@ fn generate_owner_negative_sequences(
     available_styles: &[String],
     model_hash: &str,
     cache_dir: &std::path::Path,
-    _cache_bust: bool,
 ) -> Vec<EmbeddingSequence> {
     let num_styles = available_styles.len().max(1);
     let mut sequences = Vec::new();
@@ -1001,58 +919,6 @@ fn generate_ambient_noise_sequences() -> Vec<EmbeddingSequence> {
 /// dense-only embeddings throughout.
 ///
 /// Each variant becomes one [`EmbeddingSequence`] with the given `source`.
-fn process_variants_with(
-    variants: &[(Vec<f32>, String)],
-    extract_fn: impl Fn(&[f32]) -> Result<Vec<Vec<f32>>>,
-    source: Source,
-) -> (Vec<EmbeddingSequence>, usize) {
-    let mut sequences: Vec<EmbeddingSequence> = Vec::new();
-    let mut failed = 0usize;
-
-    for (variant_idx, (samples, label)) in variants.iter().enumerate() {
-        match extract_fn(samples) {
-            Ok(embeddings) => {
-                if embeddings.is_empty() {
-                    warn!("No embeddings extracted from '{label}'");
-                    failed += 1;
-                    continue;
-                }
-                let seq = match source {
-                    Source::Enrollment | Source::Augmentation => EmbeddingSequence::positive(
-                        UtteranceId {
-                            sequence_index: variant_idx,
-                            variant_index: variant_idx,
-                        },
-                        source,
-                        None,
-                        embeddings,
-                    ),
-                    _ => EmbeddingSequence::negative(
-                        UtteranceId {
-                            sequence_index: variant_idx,
-                            variant_index: variant_idx,
-                        },
-                        source,
-                        None,
-                        embeddings,
-                    ),
-                };
-                sequences.push(seq);
-                info!(
-                    "Processed enrollment variant '{label}': {} embeddings",
-                    sequences.last().unwrap().embeddings.len()
-                );
-            }
-            Err(e) => {
-                warn!("Embedding extraction failed for '{label}': {e}");
-                failed += 1;
-            }
-        }
-    }
-
-    (sequences, failed)
-}
-
 /// Compute VAD frame decisions and segment audio into utterances at the
 /// enrollment VAD threshold.  Shared by the VAD-gated enrollment pipeline
 /// and the VAD segmentation validation test to eliminate duplication.
@@ -1758,14 +1624,7 @@ pub(crate) fn run_internal() {
 
     info!("═══ Voice Pipeline E2E Benchmark ═══");
 
-    // Resolve benchmark tier and limits (mahbot-871).
-    let selected_tier = resolve_bench_tier();
-    let limits = tier_limits(selected_tier);
-    let selected_tier_str = selected_tier.as_str();
-    info!(
-        "Benchmark tier: {selected_tier_str} (confusable FA ≤{}, total FA ≤{})",
-        limits.confusable, limits.total
-    );
+    info!("Benchmark tier: all three tiers tested (Easy FA≤0, Medium FA≤1, Hard FA≤2)");
 
     // ── 0. Initialize global state ─────────────────────────────────────
     // Set CONFIG storage root so model paths resolve.
@@ -1777,7 +1636,6 @@ pub(crate) fn run_internal() {
     }
 
     // Determine cache settings
-    let cache_bust = std::env::var("MAHBOT_TEST_CACHE_BUST").as_deref() == Ok("1");
     let cache_dir_path = cache_dir();
     if let Err(e) = std::fs::create_dir_all(&cache_dir_path) {
         eprintln!(
@@ -1818,7 +1676,6 @@ pub(crate) fn run_internal() {
         &available_styles,
         &model_version_hash,
         &cache_dir_path,
-        cache_bust,
     );
     assert!(
         !enrollment_variants.is_empty(),
@@ -1879,26 +1736,17 @@ pub(crate) fn run_internal() {
     // ── Phase 3: Generate negative training data ─────────────────────────
     phase_start!("Phase 3: Generating negative training data");
 
-    // Allow forcing legacy inline TTS synthesis for baseline/sweep comparisons
-    // via env var (mahbot-880).  Set MAHBOT_BENCH_LEGACY_NEGATIVES=1 to bypass
-    // the production cache path and use the original inline embedding generation.
-    // Check this BEFORE the prewarm runtime to avoid wasted work when legacy
-    // mode is requested (mahbot-880 reviewer feedback).
-    let use_legacy = std::env::var("MAHBOT_BENCH_LEGACY_NEGATIVES").as_deref() == Ok("1");
-
     // Pre-warm production caches for confusable and unrelated embeddings
     // (mahbot-880).  These are populated by `prewarm_*` during normal app
     // startup, but the benchmark runs synchronously and never calls prewarm.
     // We call it here so the benchmark uses the same cached embeddings as
     // production, ensuring benchmark results reflect real behavior.
-    if !use_legacy {
-        info!("Pre-warming production negative embedding caches (mahbot-880)...");
-        {
-            let rt =
-                tokio::runtime::Runtime::new().expect("Failed to create tokio runtime for prewarm");
-            rt.block_on(super::prewarm_confusable_embeddings());
-            rt.block_on(super::prewarm_unrelated_embeddings());
-        }
+    info!("Pre-warming production negative embedding caches (mahbot-880)...");
+    {
+        let rt =
+            tokio::runtime::Runtime::new().expect("Failed to create tokio runtime for prewarm");
+        rt.block_on(super::prewarm_confusable_embeddings());
+        rt.block_on(super::prewarm_unrelated_embeddings());
     }
 
     // Check if production caches are populated.  After mahbot-923 the pipeline
@@ -1906,8 +1754,17 @@ pub(crate) fn run_internal() {
     let confusable_dense_cache = super::confusable_dense_embeddings();
     let unrelated_dense_cache = super::unrelated_dense_embeddings();
 
-    let caches_ready =
-        !use_legacy && !confusable_dense_cache.is_empty() && !unrelated_dense_cache.is_empty();
+    // Post-prewarm assertion: production caches must be non-empty.
+    assert!(
+        !confusable_dense_cache.is_empty(),
+        "Confusable dense embeddings cache is empty after prewarm. \
+         voice::prewarm_confusable_embeddings() did not populate the cache."
+    );
+    assert!(
+        !unrelated_dense_cache.is_empty(),
+        "Unrelated dense embeddings cache is empty after prewarm. \
+         voice::prewarm_unrelated_embeddings() did not populate the cache."
+    );
 
     let (classifier_neg_sequences, verifier_neg_sequences, per_negative_sequence_weights);
 
@@ -1919,349 +1776,121 @@ pub(crate) fn run_internal() {
         NOISE_PROFILES.len(),
     );
 
-    if caches_ready {
-        // ── Production cache path (mahbot-880, mahbot-923) ──────────────────
-        // Use the shared OnceLock caches populated by the prewarm functions
-        // above.  After mahbot-923 the pipeline uses dense stride-8 embeddings
-        // throughout — both classifier and verifier use the same dense caches.
-        // Ambient + owner-negative replace the old synthetic negatives (mahbot-932).
-        info!(
-            "Using production pre-warmed caches: {} confusable + {} unrelated dense (mahbot-880, mahbot-923)",
-            confusable_dense_cache.len(),
-            unrelated_dense_cache.len(),
-        );
+    // ── Production cache path (mahbot-880, mahbot-923) ──────────────────
+    // Use the shared OnceLock caches populated by the prewarm functions
+    // above.  After mahbot-923 the pipeline uses dense stride-8 embeddings
+    // throughout — both classifier and verifier use the same dense caches.
+    // Ambient + owner-negative replace the old synthetic negatives (mahbot-932).
+    info!(
+        "Using production pre-warmed caches: {} confusable + {} unrelated dense (mahbot-880, mahbot-923)",
+        confusable_dense_cache.len(),
+        unrelated_dense_cache.len(),
+    );
 
-        // Build classifier negative sequences: ambient → owner → confusable → unrelated
-        // (mahbot-932 Fix 7, Fix 8).  No synthetic negatives — production uses zero
-        // synthetic embedding-space negatives.
-        let mut classifier_neg_seqs: Vec<EmbeddingSequence> = Vec::new();
-        classifier_neg_seqs.extend(ambient_sequences.clone());
+    // Build classifier negative sequences: ambient → owner → confusable → unrelated
+    // (mahbot-932 Fix 7, Fix 8).  No synthetic negatives — production uses zero
+    // synthetic embedding-space negatives.
+    let mut classifier_neg_seqs: Vec<EmbeddingSequence> = Vec::new();
+    classifier_neg_seqs.extend(ambient_sequences.clone());
 
-        // Owner-negative sequences
-        let owner_seqs = generate_owner_negative_sequences(
-            &available_styles,
-            &model_version_hash,
-            &cache_dir_path,
-            cache_bust,
-        );
-        info!(
-            "Generated {} owner-negative sequences (mahbot-932 Fix 6)",
-            owner_seqs.len(),
-        );
-        classifier_neg_seqs.extend(owner_seqs.clone());
-        classifier_neg_seqs.extend_from_slice(confusable_dense_cache);
-        classifier_neg_seqs.extend_from_slice(unrelated_dense_cache);
+    // Owner-negative sequences
+    let owner_seqs =
+        generate_owner_negative_sequences(&available_styles, &model_version_hash, &cache_dir_path);
+    info!(
+        "Generated {} owner-negative sequences (mahbot-932 Fix 6)",
+        owner_seqs.len(),
+    );
+    classifier_neg_seqs.extend(owner_seqs.clone());
+    classifier_neg_seqs.extend_from_slice(confusable_dense_cache);
+    classifier_neg_seqs.extend_from_slice(unrelated_dense_cache);
 
-        let n_dense_total = classifier_neg_seqs.len();
-        classifier_neg_sequences = classifier_neg_seqs;
+    let n_dense_total = classifier_neg_seqs.len();
+    classifier_neg_sequences = classifier_neg_seqs;
 
-        // Verifier uses the same dense cache embeddings as the classifier.
-        // Build verifier negative sequences in 4-tier order: ambient → owner → unrelated → confusable
-        let mut verifier_neg_seqs: Vec<EmbeddingSequence> = Vec::new();
-        verifier_neg_seqs.extend(ambient_sequences);
-        verifier_neg_seqs.extend(owner_seqs);
-        verifier_neg_seqs.extend_from_slice(unrelated_dense_cache);
-        verifier_neg_seqs.extend_from_slice(confusable_dense_cache);
-        verifier_neg_sequences = verifier_neg_seqs;
+    // Verifier uses the same dense cache embeddings as the classifier.
+    // Build verifier negative sequences in 4-tier order: ambient → owner → unrelated → confusable
+    let mut verifier_neg_seqs: Vec<EmbeddingSequence> = Vec::new();
+    verifier_neg_seqs.extend(ambient_sequences);
+    verifier_neg_seqs.extend(owner_seqs);
+    verifier_neg_seqs.extend_from_slice(unrelated_dense_cache);
+    verifier_neg_seqs.extend_from_slice(confusable_dense_cache);
+    verifier_neg_sequences = verifier_neg_seqs;
 
-        // Build per-sequence 4-tier weights matching production (mahbot-932 Fix 8):
-        // ambient (1.0×) → owner-negative (OWNER_NEGATIVE_UPWEIGHT×)
-        // → unrelated (UNRELATED_UPWEIGHT×) → confusable (CONFUSABLE_UPWEIGHT×).
-        let n_ambient = classifier_neg_sequences
-            .iter()
-            .filter(|s| s.source == Source::Ambient)
-            .count();
-        let n_owner = classifier_neg_sequences
-            .iter()
-            .filter(|s| s.source == Source::Owner)
-            .count();
-        let n_confusable = confusable_dense_cache.len();
-        let n_unrelated = unrelated_dense_cache.len();
-        let n_seq_total = n_ambient + n_owner + n_confusable + n_unrelated;
+    // Build per-sequence 4-tier weights matching production (mahbot-932 Fix 8):
+    // ambient (1.0×) → owner-negative (OWNER_NEGATIVE_UPWEIGHT×)
+    // → unrelated (UNRELATED_UPWEIGHT×) → confusable (CONFUSABLE_UPWEIGHT×).
+    let n_ambient = classifier_neg_sequences
+        .iter()
+        .filter(|s| s.source == Source::Ambient)
+        .count();
+    let n_owner = classifier_neg_sequences
+        .iter()
+        .filter(|s| s.source == Source::Owner)
+        .count();
+    let n_confusable = confusable_dense_cache.len();
+    let n_unrelated = unrelated_dense_cache.len();
+    let n_seq_total = n_ambient + n_owner + n_confusable + n_unrelated;
 
-        let mut pw: Vec<f32> = Vec::with_capacity(n_seq_total);
-        pw.extend(std::iter::repeat_n(1.0, n_ambient));
-        pw.extend(std::iter::repeat_n(
-            crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
-            n_owner,
-        ));
-        pw.extend(std::iter::repeat_n(
-            crate::voice_verifier::UNRELATED_UPWEIGHT,
-            n_unrelated,
-        ));
-        pw.extend(std::iter::repeat_n(
-            crate::voice_verifier::CONFUSABLE_UPWEIGHT,
-            n_confusable,
-        ));
-        per_negative_sequence_weights = pw;
+    let mut pw: Vec<f32> = Vec::with_capacity(n_seq_total);
+    pw.extend(std::iter::repeat_n(1.0, n_ambient));
+    pw.extend(std::iter::repeat_n(
+        crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
+        n_owner,
+    ));
+    pw.extend(std::iter::repeat_n(
+        crate::voice_verifier::UNRELATED_UPWEIGHT,
+        n_unrelated,
+    ));
+    pw.extend(std::iter::repeat_n(
+        crate::voice_verifier::CONFUSABLE_UPWEIGHT,
+        n_confusable,
+    ));
+    per_negative_sequence_weights = pw;
 
-        // Structural guard: verify weight tier boundaries (mahbot-880).
-        crate::voice_verifier::assert_weight_tier(
-            &per_negative_sequence_weights,
-            0,
-            n_ambient,
-            1.0,
-            "ambient",
-        );
-        crate::voice_verifier::assert_weight_tier(
-            &per_negative_sequence_weights,
-            n_ambient,
-            n_owner,
-            crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
-            "owner-negative",
-        );
-        crate::voice_verifier::assert_weight_tier(
-            &per_negative_sequence_weights,
-            n_ambient + n_owner,
-            n_unrelated,
-            crate::voice_verifier::UNRELATED_UPWEIGHT,
-            "unrelated",
-        );
-        crate::voice_verifier::assert_weight_tier(
-            &per_negative_sequence_weights,
-            n_ambient + n_owner + n_unrelated,
-            n_confusable,
-            crate::voice_verifier::CONFUSABLE_UPWEIGHT,
-            "confusable",
-        );
-        assert_eq!(per_negative_sequence_weights.len(), n_seq_total);
+    // Structural guard: verify weight tier boundaries (mahbot-880).
+    crate::voice_verifier::assert_weight_tier(
+        &per_negative_sequence_weights,
+        0,
+        n_ambient,
+        1.0,
+        "ambient",
+    );
+    crate::voice_verifier::assert_weight_tier(
+        &per_negative_sequence_weights,
+        n_ambient,
+        n_owner,
+        crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
+        "owner-negative",
+    );
+    crate::voice_verifier::assert_weight_tier(
+        &per_negative_sequence_weights,
+        n_ambient + n_owner,
+        n_unrelated,
+        crate::voice_verifier::UNRELATED_UPWEIGHT,
+        "unrelated",
+    );
+    crate::voice_verifier::assert_weight_tier(
+        &per_negative_sequence_weights,
+        n_ambient + n_owner + n_unrelated,
+        n_confusable,
+        crate::voice_verifier::CONFUSABLE_UPWEIGHT,
+        "confusable",
+    );
+    assert_eq!(per_negative_sequence_weights.len(), n_seq_total);
 
-        info!(
-            "Built {} verifier neg sequences ({} ambient@1.0× + {} owner@{}× + {} unrelated@{}× + {} confusable@{}×) \
-             and {} classifier neg sequences (mahbot-932 Fix 8)",
-            n_seq_total,
-            n_ambient,
-            n_owner,
-            crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
-            n_unrelated,
-            crate::voice_verifier::UNRELATED_UPWEIGHT,
-            n_confusable,
-            crate::voice_verifier::CONFUSABLE_UPWEIGHT,
-            n_dense_total,
-        );
-    } else {
-        // ── Fallback: inline TTS synthesis (mahbot-880) ────────────────────
-        // Production caches are empty (prewarm failed or models unavailable).
-        // Log a warning and fall back to the original inline TTS synthesis +
-        // embedding extraction path.  Ambient + owner-negative are still generated
-        // locally (mahbot-932).
-        use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
-        warn!(
-            "Production negative embedding caches not available — \
-             falling back to inline TTS synthesis (mahbot-880)"
-        );
-        info!("Generating negative training audio from unrelated + confusable phrases...");
-        let unrelated_batch = generate_phrase_variants_batch(
-            UNRELATED_PHRASES,
-            &available_styles,
-            SeedConfig {
-                base_seed: super::UNRELATED_SEED_BASE,
-                num_variants: super::UNRELATED_SEEDS_PER_PHRASE,
-                seed_variant: 0,
-            },
-            "neg_train",
-            &model_version_hash,
-            &cache_dir_path,
-            cache_bust,
-        );
-        let confusable_batch = generate_phrase_variants_batch(
-            CONFUSABLE_PHRASES,
-            &available_styles,
-            SeedConfig {
-                base_seed: super::CONFUSABLE_SEED_BASE,
-                num_variants: super::CONFUSABLE_SEEDS_PER_PHRASE,
-                seed_variant: 0,
-            },
-            "neg_conf_train",
-            &model_version_hash,
-            &cache_dir_path,
-            cache_bust,
-        );
-        let [neg_unrelated_1, neg_unrelated_2, neg_unrelated_3] =
-            unrelated_batch.try_into().unwrap();
-        let [
-            neg_confusable_1,
-            neg_confusable_2,
-            neg_confusable_3,
-            neg_confusable_4,
-            neg_confusable_5,
-        ] = confusable_batch.try_into().unwrap();
-        let mut classifier_neg_seqs: Vec<EmbeddingSequence> = Vec::new();
-        let mut verifier_neg_seqs: Vec<EmbeddingSequence> = Vec::new();
-        let agc_chunk_size = super::FRAME_LENGTH;
-        let agc_process = |variants: &[(Vec<f32>, String)]| -> Vec<(Vec<f32>, String)> {
-            variants
-                .iter()
-                .map(|(samples, label)| {
-                    let mut pre = AudioPreprocessor::new(PreprocessorConfig::default());
-                    let mut processed: Vec<f32> = Vec::with_capacity(samples.len());
-                    for chunk in samples.chunks(agc_chunk_size) {
-                        let padded = if chunk.len() < agc_chunk_size {
-                            let mut p = chunk.to_vec();
-                            p.resize(agc_chunk_size, 0.0);
-                            p
-                        } else {
-                            chunk.to_vec()
-                        };
-                        processed.extend(pre.process(padded));
-                    }
-                    (processed, label.clone())
-                })
-                .collect()
-        };
-
-        // AGC-process all negative sets once, reusing the results for both
-        // classifier and verifier extraction loops (mahbot-856, mahbot-923).
-        let agc_unrelated_1 = agc_process(&neg_unrelated_1);
-        let agc_unrelated_2 = agc_process(&neg_unrelated_2);
-        let agc_unrelated_3 = agc_process(&neg_unrelated_3);
-        let agc_confusable_1 = agc_process(&neg_confusable_1);
-        let agc_confusable_2 = agc_process(&neg_confusable_2);
-        let agc_confusable_3 = agc_process(&neg_confusable_3);
-        let agc_confusable_4 = agc_process(&neg_confusable_4);
-        let agc_confusable_5 = agc_process(&neg_confusable_5);
-
-        // Add ambient noise sequences (mahbot-932 Fix 7).
-        info!(
-            "Adding {} ambient noise sequences to classifier negative set (mahbot-932)",
-            ambient_sequences.len(),
-        );
-        classifier_neg_seqs.extend(ambient_sequences.clone());
-        verifier_neg_seqs.extend(ambient_sequences);
-
-        // Add owner-negative sequences (mahbot-932 Fix 6).
-        let owner_seqs = generate_owner_negative_sequences(
-            &available_styles,
-            &model_version_hash,
-            &cache_dir_path,
-            cache_bust,
-        );
-        info!(
-            "Adding {} owner-negative sequences to negative sets (mahbot-932 Fix 6)",
-            owner_seqs.len(),
-        );
-        classifier_neg_seqs.extend(owner_seqs.clone());
-        verifier_neg_seqs.extend(owner_seqs);
-
-        // Process unrelated sets first, then confusable, matching production verifier order
-        // (ambient → owner → unrelated → confusable).  Both go to classifier and verifier
-        // sequences; classifier order doesn't matter (class-balanced weights).
-        for agc_unrelated in [&agc_unrelated_1, &agc_unrelated_2, &agc_unrelated_3] {
-            let (dense_seqs, _) = process_variants_with(
-                agc_unrelated,
-                super::process_enrollment_sample,
-                Source::Unrelated,
-            );
-            classifier_neg_seqs.extend(dense_seqs.iter().cloned());
-            verifier_neg_seqs.extend(dense_seqs);
-        }
-
-        for agc_confusable in [
-            &agc_confusable_1,
-            &agc_confusable_2,
-            &agc_confusable_3,
-            &agc_confusable_4,
-            &agc_confusable_5,
-        ] {
-            let (dense_seqs, _) = process_variants_with(
-                agc_confusable,
-                super::process_enrollment_sample,
-                Source::Confusable,
-            );
-            classifier_neg_seqs.extend(dense_seqs.iter().cloned());
-            verifier_neg_seqs.extend(dense_seqs);
-        }
-
-        // No synthetic negatives — replaced by ambient + owner-negative (mahbot-932 Fix 7).
-
-        classifier_neg_sequences = classifier_neg_seqs;
-
-        // Count sequences by Source type for dynamic weight array sizing
-        // (mahbot-932 Fix 4, Fix 8).  4-tier: ambient → owner → unrelated → confusable.
-        let n_ambient_verifier = verifier_neg_seqs
-            .iter()
-            .filter(|s| s.source == Source::Ambient)
-            .count();
-        let n_owner_verifier = verifier_neg_seqs
-            .iter()
-            .filter(|s| s.source == Source::Owner)
-            .count();
-        let n_confusable_verifier = verifier_neg_seqs
-            .iter()
-            .filter(|s| s.source == Source::Confusable)
-            .count();
-        let n_unrelated_verifier = verifier_neg_seqs
-            .iter()
-            .filter(|s| s.source == Source::Unrelated)
-            .count();
-        verifier_neg_sequences = verifier_neg_seqs;
-
-        // Build per-sequence 4-tier weights matching production (mahbot-932 Fix 8):
-        // ambient (1.0×) → owner-negative (OWNER_NEGATIVE_UPWEIGHT×)
-        // → unrelated (UNRELATED_UPWEIGHT×) → confusable (CONFUSABLE_UPWEIGHT×).
-        let n_seq_total =
-            n_ambient_verifier + n_owner_verifier + n_confusable_verifier + n_unrelated_verifier;
-        let mut pw: Vec<f32> = Vec::with_capacity(n_seq_total);
-        pw.extend(std::iter::repeat_n(1.0, n_ambient_verifier));
-        pw.extend(std::iter::repeat_n(
-            crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
-            n_owner_verifier,
-        ));
-        pw.extend(std::iter::repeat_n(
-            crate::voice_verifier::UNRELATED_UPWEIGHT,
-            n_unrelated_verifier,
-        ));
-        pw.extend(std::iter::repeat_n(
-            crate::voice_verifier::CONFUSABLE_UPWEIGHT,
-            n_confusable_verifier,
-        ));
-        per_negative_sequence_weights = pw;
-
-        // Structural guard: verify weight tier boundaries.
-        crate::voice_verifier::assert_weight_tier(
-            &per_negative_sequence_weights,
-            0,
-            n_ambient_verifier,
-            1.0,
-            "ambient",
-        );
-        crate::voice_verifier::assert_weight_tier(
-            &per_negative_sequence_weights,
-            n_ambient_verifier,
-            n_owner_verifier,
-            crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
-            "owner-negative",
-        );
-        crate::voice_verifier::assert_weight_tier(
-            &per_negative_sequence_weights,
-            n_ambient_verifier + n_owner_verifier,
-            n_unrelated_verifier,
-            crate::voice_verifier::UNRELATED_UPWEIGHT,
-            "unrelated",
-        );
-        crate::voice_verifier::assert_weight_tier(
-            &per_negative_sequence_weights,
-            n_ambient_verifier + n_owner_verifier + n_unrelated_verifier,
-            n_confusable_verifier,
-            crate::voice_verifier::CONFUSABLE_UPWEIGHT,
-            "confusable",
-        );
-        assert_eq!(per_negative_sequence_weights.len(), n_seq_total);
-
-        info!(
-            "Built {} verifier neg sequences ({} ambient@1.0× + {} owner@{}× + {} unrelated@{}× + {} confusable@{}×) \
-             and {} classifier neg sequences (mahbot-932, fallback path)",
-            n_seq_total,
-            n_ambient_verifier,
-            n_owner_verifier,
-            crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
-            n_unrelated_verifier,
-            crate::voice_verifier::UNRELATED_UPWEIGHT,
-            n_confusable_verifier,
-            crate::voice_verifier::CONFUSABLE_UPWEIGHT,
-            classifier_neg_sequences.len(),
-        );
-    }
+    info!(
+        "Built {} verifier neg sequences ({} ambient@1.0× + {} owner@{}× + {} unrelated@{}× + {} confusable@{}×) \
+         and {} classifier neg sequences (mahbot-932 Fix 8)",
+        n_seq_total,
+        n_ambient,
+        n_owner,
+        crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
+        n_unrelated,
+        crate::voice_verifier::UNRELATED_UPWEIGHT,
+        n_confusable,
+        crate::voice_verifier::CONFUSABLE_UPWEIGHT,
+        n_dense_total,
+    );
 
     // ── Regression assertions (mahbot-932) ──
     assert!(
@@ -2358,7 +1987,7 @@ pub(crate) fn run_internal() {
         &pos_sequences,
         &verifier_neg_sequences,
         Some(&per_negative_sequence_weights), // per-sequence weights matching production (mahbot-870 Fix 3)
-        VoiceVerifier::default_threshold(),
+        DEFAULT_VERIFIER_THRESHOLD,
         L2_LAMBDA, // mahbot-854: 0.01
         Some(42),  // fixed seed for deterministic benchmark (mahbot-882)
     );
@@ -2466,7 +2095,6 @@ pub(crate) fn run_internal() {
             "confusable",
             &model_version_hash,
             &cache_dir_path,
-            cache_bust,
         );
         info!(
             "Generated {} confusable phrase variants",
@@ -2514,7 +2142,6 @@ pub(crate) fn run_internal() {
             "unrelated",
             &model_version_hash,
             &cache_dir_path,
-            cache_bust,
         );
         info!(
             "Generated {} unrelated phrase variants",
@@ -2692,11 +2319,33 @@ pub(crate) fn run_internal() {
     // ── Phase 15 timing ─────────────────────────────────
     phase_start!("Phase 15: Teardown");
 
-    let selected_conf_fa = &conf_fa_by_tier[selected_tier.index()];
-    let total_false_accepts = selected_conf_fa.len()
-        + unrelated_metrics.false_accepts.len()
+    let tier_limit_sets = [
+        tier_limits(BenchTier::Easy),
+        tier_limits(BenchTier::Medium),
+        tier_limits(BenchTier::Hard),
+    ];
+
+    // Compute total false accepts across all categories
+    let shared_fa_count = unrelated_metrics.false_accepts.len()
         + silence_metric.false_accepts.len()
         + noise_false_accepts.len();
+
+    // Per-tier confusable FA counts
+    let conf_fa_counts = [
+        conf_fa_by_tier[0].len(),
+        conf_fa_by_tier[1].len(),
+        conf_fa_by_tier[2].len(),
+    ];
+
+    // Per-tier total FAs (confusable + shared)
+    let tier_total_fas: [usize; 3] = [
+        conf_fa_counts[0] + shared_fa_count,
+        conf_fa_counts[1] + shared_fa_count,
+        conf_fa_counts[2] + shared_fa_count,
+    ];
+
+    // Total false accept (across all tiers and categories)
+    let total_false_accepts = conf_fa_counts.iter().sum::<usize>() + shared_fa_count;
 
     info!("══════════════════════════════════════════════");
     info!("      Voice Pipeline E2E Benchmark Results");
@@ -2713,25 +2362,30 @@ pub(crate) fn run_internal() {
         MIN_DETECTION_RATE * 100.0,
     );
     info!(
-        "Confusable false accepts: {} / {} (tier={selected_tier_str}, selected limit ≤{})",
-        selected_conf_fa.len(),
-        conf_metrics.total,
-        limits.confusable,
+        "Confusable false accepts: easy={} (limit ≤{}), medium={} (limit ≤{}), hard={} (limit ≤{})",
+        conf_fa_counts[0],
+        tier_limit_sets[0].confusable,
+        conf_fa_counts[1],
+        tier_limit_sets[1].confusable,
+        conf_fa_counts[2],
+        tier_limit_sets[2].confusable,
     );
     if !conf_metrics.false_accepts.is_empty() {
         info!(
             "  All confusable false triggers: {:?}",
             conf_metrics.false_accepts
         );
-        if !selected_conf_fa.is_empty() {
-            info!("  Selected-tier triggers: {:?}", selected_conf_fa);
+        for (i, tier_name) in [(0, "easy"), (1, "medium"), (2, "hard")] {
+            if !conf_fa_by_tier[i].is_empty() {
+                info!("  {tier_name}-tier triggers: {:?}", conf_fa_by_tier[i]);
+            }
         }
     }
     info!(
         "Unrelated false accepts: {} / {} (limit ≤{})",
         unrelated_metrics.false_accepts.len(),
         unrelated_metrics.total,
-        limits.unrelated,
+        0, // all tiers have unrelated limit = 0
     );
     if !unrelated_metrics.false_accepts.is_empty() {
         info!("  False triggers: {:?}", unrelated_metrics.false_accepts);
@@ -2739,24 +2393,31 @@ pub(crate) fn run_internal() {
     info!(
         "Silence false accepts: {} / 1 (limit ≤{})",
         silence_metric.false_accepts.len(),
-        limits.silence,
+        0, // all tiers have silence limit = 0
     );
     info!(
-        "Noise false accepts: {} / {} ({} profiles, limit ≤{})",
+        "Noise false accepts: {} / {} ({} profiles, limit ≤{}–{} across tiers)",
         noise_false_accepts.len(),
         NOISE_PROFILES.len(),
         NOISE_PROFILES.len(),
-        limits.noise,
+        tier_limit_sets[0].noise,
+        tier_limit_sets[2].noise,
     );
     if !noise_false_accepts.is_empty() {
         info!("  False triggers: {:?}", noise_false_accepts);
     }
 
     info!("──────────────────────────────────────────────");
-    info!(
-        "Total false accepts: {total_false_accepts} — tier limit ≤{}",
-        limits.total
-    );
+    for (i, name) in [(0, "easy"), (1, "medium"), (2, "hard")] {
+        info!(
+            "Tier {name}: confusable FA={} (limit ≤{}), total FA={} (limit ≤{})",
+            conf_fa_counts[i],
+            tier_limit_sets[i].confusable,
+            tier_total_fas[i],
+            tier_limit_sets[i].total,
+        );
+    }
+    info!("Total false accepts across all tiers: {total_false_accepts}");
     info!("Enrollment consistency: validated by finalize_enrollment (Phase 4)");
     info!("══════════════════════════════════════════════");
 
@@ -2783,25 +2444,30 @@ pub(crate) fn run_internal() {
         }
     }
 
+    // Per-tier pass/fail (mahbot-871)
+    let easy_pass = conf_fa_counts[0] <= tier_limit_sets[0].confusable
+        && tier_total_fas[0] <= tier_limit_sets[0].total;
+    let medium_pass = conf_fa_counts[1] <= tier_limit_sets[1].confusable
+        && tier_total_fas[1] <= tier_limit_sets[1].total;
+    let hard_pass = conf_fa_counts[2] <= tier_limit_sets[2].confusable
+        && tier_total_fas[2] <= tier_limit_sets[2].total;
+
     let passed = {
         // Detection rate assertion
         let dr_ok = pos_metrics.detection_rate() >= MIN_DETECTION_RATE;
 
-        // Per-category false accept assertions (tiered, mahbot-871)
-        let conf_fa_ok = selected_conf_fa.len() <= limits.confusable;
-        let unrel_fa_ok = unrelated_metrics.false_accepts.len() <= limits.unrelated;
-        let silence_fa_ok = silence_metric.false_accepts.len() <= limits.silence;
-        let noise_fa_ok = noise_false_accepts.len() <= limits.noise;
-
-        // Aggregate assertion (tier-specific, mahbot-871)
-        let total_fa_ok = total_false_accepts <= limits.total;
+        // Per-category false accept assertions (non-tiered categories)
+        let unrel_fa_ok = unrelated_metrics.false_accepts.is_empty();
+        let silence_fa_ok = silence_metric.false_accepts.is_empty();
+        let noise_fa_ok = noise_false_accepts.len() <= tier_limit_sets[2].noise;
 
         dr_ok
-            && conf_fa_ok
+            && easy_pass
+            && medium_pass
+            && hard_pass
             && unrel_fa_ok
             && silence_fa_ok
             && noise_fa_ok
-            && total_fa_ok
             && noise_overlap_10db_ok
     };
 
@@ -2823,17 +2489,12 @@ pub(crate) fn run_internal() {
     }
 
     // Build per-variant negative diagnostics with verifier scores (mahbot-859).
-    // Confusable variants get tier-qualified categories (mahbot-871):
-    // selected-tier → "confusable", non-selected → "confusable_{tier}".
+    // Confusable variants are always tier-qualified (mahbot-871).
     let mut negative_pv: Vec<serde_json::Value> = Vec::new();
     for pv in &conf_metrics.per_variant {
         let phrase = phrase_from_label(&pv.variant, "confusable");
         let variant_tier = tier_for_phrase(phrase);
-        let category = if variant_tier == selected_tier {
-            "confusable".to_string()
-        } else {
-            format!("confusable_{}", variant_tier.as_str())
-        };
+        let category = format!("confusable_{}", variant_tier.as_str());
         negative_pv.push(serde_json::json!({
             "variant": pv.variant,
             "detected": pv.detected,
@@ -2872,36 +2533,34 @@ pub(crate) fn run_internal() {
         }
     }
 
+    // Build per-tier results dict
+    let mut results_map = serde_json::Map::new();
+    for &(i, tier_name, bench_tier) in &[
+        (0, "easy", BenchTier::Easy),
+        (1, "medium", BenchTier::Medium),
+        (2, "hard", BenchTier::Hard),
+    ] {
+        let limits = tier_limits(bench_tier);
+        results_map.insert(
+            tier_name.to_string(),
+            serde_json::json!({
+                "confusable_false_accepts": conf_fa_counts[i],
+                "total_false_accepts": tier_total_fas[i],
+                "limits": {
+                    "confusable": limits.confusable,
+                    "total": limits.total,
+                },
+            }),
+        );
+    }
+
     let json = serde_json::json!({
         "benchmark": "voice_pipeline_e2e",
         "passed": passed,
-        "tier": selected_tier_str,
-        "effective_limits": {
-            "confusable": limits.confusable,
-            "unrelated": limits.unrelated,
-            "silence": limits.silence,
-            "noise": limits.noise,
-            "total": limits.total,
-        },
-        "phases": {
-            "phase_1_enrollment_audio_ms": phase_times[P_ENROLLMENT_AUDIO],
-            "phase_2_vad_enrollment_ms": phase_times[P_VAD_ENROLLMENT],
-            "phase_3_negative_training_data_ms": phase_times[P_NEG_TRAINING_DATA],
-            "phase_4_classifier_training_ms": phase_times[P_CLASSIFIER_TRAINING],
-            "phase_5_voice_verifier_training_ms": phase_times[P_VERIFIER_TRAINING],
-            "phase_6_global_state_setup_ms": phase_times[P_GLOBAL_STATE],
-            "phase_7_streaming_detection_setup_ms": phase_times[P_STREAMING_SETUP],
-            "phase_8_positive_variants_ms": phase_times[P_POSITIVE_VARIANTS],
-            "phase_9_confusable_negatives_ms": phase_times[P_CONFUSABLE_NEGATIVES],
-            "phase_10_unrelated_negatives_ms": phase_times[P_UNRELATED_NEGATIVES],
-            "phase_11_silence_negatives_ms": phase_times[P_SILENCE_NEGATIVES],
-            "phase_12_noise_profiles_ms": phase_times[P_NOISE_PROFILES],
-            "phase_13_cooldown_ms": phase_times[P_COOLDOWN],
-            "phase_14_noise_overlap_ms": phase_times[P_NOISE_OVERLAP],
-            "phase_15_teardown_ms": phase_times[P_TEARDOWN],
-        },
-        "results": {
-            "detection_rate": pos_metrics.detection_rate(),
+        "total_false_accepts": total_false_accepts,
+        "results": results_map,
+        "detection": {
+            "rate": pos_metrics.detection_rate(),
             "detected": pos_metrics.detected,
             "total_positive": pos_metrics.total,
             "miss_classification": {
@@ -2920,13 +2579,32 @@ pub(crate) fn run_internal() {
                 }).count(),
                 "total_misses": pos_metrics.total - pos_metrics.detected,
             },
-            "false_accepts": {
-                "confusable": selected_conf_fa.len(),
-                "unrelated": unrelated_metrics.false_accepts.len(),
-                "silence": silence_metric.false_accepts.len(),
-                "noise": noise_false_accepts.len(),
-                "total": total_false_accepts,
-            }
+        },
+        "false_accepts": {
+            "confusable_easy": conf_fa_counts[0],
+            "confusable_medium": conf_fa_counts[1],
+            "confusable_hard": conf_fa_counts[2],
+            "unrelated": unrelated_metrics.false_accepts.len(),
+            "silence": silence_metric.false_accepts.len(),
+            "noise": noise_false_accepts.len(),
+            "total": total_false_accepts,
+        },
+        "phases": {
+            "phase_1_enrollment_audio_ms": phase_times[P_ENROLLMENT_AUDIO],
+            "phase_2_vad_enrollment_ms": phase_times[P_VAD_ENROLLMENT],
+            "phase_3_negative_training_data_ms": phase_times[P_NEG_TRAINING_DATA],
+            "phase_4_classifier_training_ms": phase_times[P_CLASSIFIER_TRAINING],
+            "phase_5_voice_verifier_training_ms": phase_times[P_VERIFIER_TRAINING],
+            "phase_6_global_state_setup_ms": phase_times[P_GLOBAL_STATE],
+            "phase_7_streaming_detection_setup_ms": phase_times[P_STREAMING_SETUP],
+            "phase_8_positive_variants_ms": phase_times[P_POSITIVE_VARIANTS],
+            "phase_9_confusable_negatives_ms": phase_times[P_CONFUSABLE_NEGATIVES],
+            "phase_10_unrelated_negatives_ms": phase_times[P_UNRELATED_NEGATIVES],
+            "phase_11_silence_negatives_ms": phase_times[P_SILENCE_NEGATIVES],
+            "phase_12_noise_profiles_ms": phase_times[P_NOISE_PROFILES],
+            "phase_13_cooldown_ms": phase_times[P_COOLDOWN],
+            "phase_14_noise_overlap_ms": phase_times[P_NOISE_OVERLAP],
+            "phase_15_teardown_ms": phase_times[P_TEARDOWN],
         },
         "per_variant_results": serde_json::Value::Array(
             pos_metrics.per_variant.iter().map(|pv| {
@@ -3011,7 +2689,7 @@ pub(crate) fn run_internal() {
                  Voice Pipeline E2E Benchmark Report\n\
          ═══════════════════════════════════════════════════════════\n\
          Date/Time:      {timestamp}\n\
-         Tier:           {selected_tier_str}\n\
+         Tier:           Easy/Medium/Hard (per-tier assertions)\n\
          Detection rate: {dr:.1}% ({detected}/{total})  {dr_pass} (target ≥{MIN_DETECTION_RATE:.0}%)\n\
          False accepts:\n\
            Confusable:\n\
@@ -3030,33 +2708,43 @@ pub(crate) fn run_internal() {
     if !conf_fa_by_tier[2].is_empty() {
         eprintln!("               Triggers: {:?}", conf_fa_by_tier[2]);
     }
-    let unrelated_count = unrelated_metrics.false_accepts.len();
-    let unrelated_ok = unrelated_count <= limits.unrelated;
-    let silence_count = silence_metric.false_accepts.len();
-    let silence_ok = silence_count <= limits.silence;
-    let noise_count = noise_false_accepts.len();
-    let noise_ok = noise_count <= limits.noise;
-    let total_ok = total_false_accepts <= limits.total;
+    let unrelated_ok = unrelated_metrics.false_accepts.is_empty();
+    let silence_ok = silence_metric.false_accepts.is_empty();
+    let noise_ok = noise_false_accepts.len() <= tier_limits(BenchTier::Hard).noise;
+    let easy_ok = conf_fa_counts[0] <= tier_limits(BenchTier::Easy).confusable;
+    let medium_ok = conf_fa_counts[1] <= tier_limits(BenchTier::Medium).confusable;
+    let hard_ok = conf_fa_counts[2] <= tier_limits(BenchTier::Hard).confusable;
     eprintln!(
-        "           Unrelated:  {unrelated_count}  {unrel_pass_char} (limit ≤{})",
-        limits.unrelated,
+        "           Unrelated:  {unrelated_count}  {unrel_pass_char} (limit ≤0)",
+        unrelated_count = unrelated_metrics.false_accepts.len(),
         unrel_pass_char = if unrelated_ok { '✓' } else { '✗' },
     );
     eprintln!(
-        "           Silence:    {silence_count}  {sil_pass_char} (limit ≤{})",
-        limits.silence,
+        "           Silence:    {silence_count}  {sil_pass_char} (limit ≤0)",
+        silence_count = silence_metric.false_accepts.len(),
         sil_pass_char = if silence_ok { '✓' } else { '✗' },
     );
     eprintln!(
-        "           Noise:      {noise_count}  {noise_pass_char} (limit ≤{})",
-        limits.noise,
+        "           Noise:      {noise_count}  {noise_pass_char} (limit ≤{noise_limit})",
+        noise_count = noise_false_accepts.len(),
+        noise_limit = tier_limits(BenchTier::Hard).noise,
         noise_pass_char = if noise_ok { '✓' } else { '✗' },
     );
     eprintln!(
         "           ───────────────────────────────────────\n\
-         \x20          Total:      {total_false_accepts}  {total_pass_char} (limit ≤{})",
-        limits.total,
-        total_pass_char = if total_ok { '✓' } else { '✗' },
+         \x20          | Easy  total: {easy_total}  {easy_pass_char} (limit ≤{easy_limit}) |\n\
+         \x20          | Medium total: {medium_total}  {med_pass_char} (limit ≤{med_limit}) |\n\
+         \x20          | Hard  total: {hard_total}  {hard_pass_char} (limit ≤{hard_limit}) |\n\
+         \x20          ───────────────────────────────────────",
+        easy_total = tier_total_fas[0],
+        easy_limit = tier_limits(BenchTier::Easy).total,
+        easy_pass_char = if easy_ok { '✓' } else { '✗' },
+        medium_total = tier_total_fas[1],
+        med_limit = tier_limits(BenchTier::Medium).total,
+        med_pass_char = if medium_ok { '✓' } else { '✗' },
+        hard_total = tier_total_fas[2],
+        hard_limit = tier_limits(BenchTier::Hard).total,
+        hard_pass_char = if hard_ok { '✓' } else { '✗' },
     );
     eprintln!(
         "         ═══════════════════════════════════════════════════════════\n\
@@ -3089,37 +2777,43 @@ pub(crate) fn run_internal() {
         );
     }
 
-    // Aggregate false accept limit (tier-specific, mahbot-871)
-    assert!(
-        total_false_accepts <= limits.total,
-        "Too many false accepts: {total_false_accepts} — tier={selected_tier_str} limit ≤{total}",
-        total = limits.total,
-    );
+    // Per-tier confusable false-accept assertions (mahbot-871)
+    for (i, tier_name, bench_tier) in &[
+        (0, "easy", BenchTier::Easy),
+        (1, "medium", BenchTier::Medium),
+        (2, "hard", BenchTier::Hard),
+    ] {
+        let limits = tier_limits(*bench_tier);
+        assert!(
+            conf_fa_counts[*i] <= limits.confusable,
+            "Too many confusable false accepts in tier '{tier_name}': {} — need ≤{}",
+            conf_fa_counts[*i],
+            limits.confusable,
+        );
+        assert!(
+            tier_total_fas[*i] <= limits.total,
+            "Too many total false accepts in tier '{tier_name}': {} — need ≤{}",
+            tier_total_fas[*i],
+            limits.total,
+        );
+    }
 
-    // Per-category false accept limits (tier-specific, mahbot-871)
+    // Per-category false accept limits (non-tiered categories)
     assert!(
-        selected_conf_fa.len() <= limits.confusable,
-        "Too many confusable false accepts in tier '{selected_tier_str}': {} — need ≤{}",
-        selected_conf_fa.len(),
-        limits.confusable,
-    );
-    assert!(
-        unrelated_metrics.false_accepts.len() <= limits.unrelated,
-        "Too many unrelated false accepts: {} — need ≤{}",
+        unrelated_metrics.false_accepts.is_empty(),
+        "Too many unrelated false accepts: {} — need ≤0",
         unrelated_metrics.false_accepts.len(),
-        limits.unrelated,
     );
     assert!(
-        silence_metric.false_accepts.len() <= limits.silence,
-        "Too many silence false accepts: {} — need ≤{}",
+        silence_metric.false_accepts.is_empty(),
+        "Too many silence false accepts: {} — need ≤0",
         silence_metric.false_accepts.len(),
-        limits.silence,
     );
     assert!(
-        noise_false_accepts.len() <= limits.noise,
-        "Too many noise false accepts: {} — need ≤{}",
+        noise_false_accepts.len() <= tier_limits(BenchTier::Hard).noise,
+        "Too many noise false accepts: {} — need ≤{} (Hard-tier noise limit)",
         noise_false_accepts.len(),
-        limits.noise,
+        tier_limits(BenchTier::Hard).noise,
     );
 
     assert!(

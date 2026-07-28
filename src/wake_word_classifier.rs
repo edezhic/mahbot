@@ -1358,6 +1358,7 @@ mod tests {
 
         let cfg = TrainingConfig {
             max_epochs: 80, // increased for smaller model (mahbot-931)
+            rng_seed: Some(42),
             ..Default::default()
         };
         let result = train_classifier(&pos_seqs, &neg_seqs, &cfg).unwrap();

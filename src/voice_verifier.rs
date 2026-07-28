@@ -28,7 +28,6 @@
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
 use tracing::{info, warn};
 
 use crate::embedding_sequence::EmbeddingSequence;
@@ -79,8 +78,6 @@ use crate::{EMBEDDING_DIM, VERIFIER_INPUT_DIM, VERIFIER_WINDOW_SIZE};
 /// 0.4 (mahbot-853), 0.6 (mahbot-829), 0.5 (mahbot-797), 0.3 (mahbot-788).
 ///
 /// ⚠ **If changing this constant**, re-calibrate the 1.58× multiplier by
-/// comparing dense vs streaming score distributions, or re-run the HARD-tier
-/// sweep: `MAHBOT_VERIFIER_THRESHOLD=<val> cargo bench --bench voice_pipeline_e2e`.
 pub(crate) const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.948;
 
 /// L2 regularization strength (lambda).
@@ -171,9 +168,8 @@ pub(crate) const OWNER_NEGATIVE_UPWEIGHT: f32 = 3.0;
 ///
 /// This value was selected heuristically (Analyst #3, mahbot-886/mahbot-887).
 /// Re-run the HARD-tier E2E calibration sweep before adjusting:
-/// `cargo bench --bench voice_pipeline_e2e`.  The threshold sweep environmental
-/// variable is `MAHBOT_VERIFIER_THRESHOLD`; there is currently no separate env
-/// variable for this constant — adjust in source and re-benchmark.
+/// `cargo bench --bench voice_pipeline_e2e`.  Adjust in source and
+/// re-benchmark.
 ///
 /// ## Interaction with other constants
 ///
@@ -271,50 +267,6 @@ impl VoiceVerifier {
         }
         // Bias must be finite.
         self.bias.is_finite()
-    }
-
-    /// Threshold for verifier decision-making.
-    ///
-    /// Returns the value of [`DEFAULT_VERIFIER_THRESHOLD`] by default.
-    /// Benchmarks and tests should reference this method instead of hardcoding
-    /// a literal threshold value, because it respects the
-    /// `MAHBOT_VERIFIER_THRESHOLD` env-var override.
-    ///
-    /// **Production code** should use [`DEFAULT_VERIFIER_THRESHOLD`] directly;
-    /// the env-var override in this method exists solely for benchmark
-    /// calibration sweeps (mahbot-880) and should not be relied upon in
-    /// production paths.
-    #[must_use]
-    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
-    pub(crate) fn default_threshold() -> f32 {
-        // Allow env-var override for threshold calibration sweeps (mahbot-880).
-        // Parsed once and cached to avoid repeated env var lookups.
-        // NOTE: This uses OnceLock caching (reads once per process), unlike
-        // MAHBOT_BENCH_LEGACY_NEGATIVES which is read on-demand in the benchmark.
-        // The caching is intentional — the threshold is set once at process start and
-        // should not change mid-run.  Use separate process invocations for per-test
-        // overrides (or set env before test init).
-        static CACHED_THRESHOLD: OnceLock<Option<f32>> = OnceLock::new();
-        if let Some(threshold) =
-            *CACHED_THRESHOLD.get_or_init(|| match std::env::var("MAHBOT_VERIFIER_THRESHOLD") {
-                Ok(val) => {
-                    if let Ok(t) = val.parse::<f32>() {
-                        Some(t)
-                    } else {
-                        warn!(
-                            "MAHBOT_VERIFIER_THRESHOLD='{val}' is not a valid f32 — \
-                             using DEFAULT_VERIFIER_THRESHOLD ({})",
-                            DEFAULT_VERIFIER_THRESHOLD,
-                        );
-                        None
-                    }
-                }
-                Err(_) => None,
-            })
-        {
-            return threshold;
-        }
-        DEFAULT_VERIFIER_THRESHOLD
     }
 
     /// Predict the probability that the given window is a genuine wake word.
@@ -1444,7 +1396,7 @@ mod tests {
         let verifier = VoiceVerifier::train_with_synthetic_negatives(
             &[pos_seq],
             DEFAULT_VERIFIER_THRESHOLD,
-            None,
+            Some(99),
         );
 
         assert!(verifier.is_trained(), "Verifier must be trained");
@@ -1831,7 +1783,7 @@ mod tests {
         let verifier = VoiceVerifier::train_with_synthetic_negatives(
             &[pos_seq],
             DEFAULT_VERIFIER_THRESHOLD,
-            None,
+            Some(42),
         );
         assert!(verifier.is_trained());
         assert_eq!(

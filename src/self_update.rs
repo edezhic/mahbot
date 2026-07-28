@@ -55,7 +55,7 @@ use tracing::{error, info, warn};
 ///
 /// Panics if called more than once (only called from `main()` at startup).
 pub fn acquire_lock(storage_root: &Path) -> Result<()> {
-    let lock_path = lock_file_path(storage_root);
+    let lock_path = crate::lock_utils::lock_file_path(storage_root);
 
     // Ensure parent directory exists.
     if let Some(parent) = lock_path.parent() {
@@ -115,7 +115,9 @@ fn try_acquire_lock(path: &Path) -> Result<Option<File>> {
     let file = open_lock_file(path)
         .with_context(|| format!("failed to open lock file {}", path.display()))?;
 
-    if try_flock(&file)? {
+    if crate::lock_utils::try_flock(&file)
+        .with_context(|| format!("flock failed on lock file {}", path.display()))?
+    {
         Ok(Some(file))
     } else {
         Ok(None)
@@ -133,64 +135,6 @@ fn open_lock_file(path: &Path) -> std::io::Result<File> {
         .create(true)
         .truncate(false)
         .open(path)
-}
-
-/// Path to the global lock file under the given storage root.
-fn lock_file_path(storage_root: &Path) -> PathBuf {
-    storage_root.join("mahbot.lock")
-}
-
-#[cfg(unix)]
-fn try_flock(file: &File) -> Result<bool> {
-    use std::os::unix::io::AsRawFd;
-    let fd = file.as_raw_fd();
-
-    let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if result == 0 {
-        Ok(true)
-    } else {
-        let err = std::io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::EAGAIN) => Ok(false), // EAGAIN == EWOULDBLOCK on most platforms
-            _ => Err(anyhow::Error::from(err).context("flock failed on lock file")),
-        }
-    }
-}
-
-#[cfg(windows)]
-fn try_flock(file: &File) -> Result<bool> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
-    };
-
-    let handle = file.as_raw_handle() as HANDLE;
-
-    const LOCK_VIOLATION: i32 = ERROR_LOCK_VIOLATION as i32;
-
-    let mut overlapped =
-        unsafe { std::mem::zeroed::<windows_sys::Win32::System::IO::OVERLAPPED>() };
-    let locked = unsafe {
-        LockFileEx(
-            handle,
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-            0,
-            0,
-            0,
-            &mut overlapped,
-        )
-    };
-
-    if locked != 0 {
-        Ok(true)
-    } else {
-        let err = std::io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(LOCK_VIOLATION) => Ok(false),
-            _ => Err(anyhow::Error::from(err).context("LockFileEx failed on lock file")),
-        }
-    }
 }
 
 // ── FlockGuard: releasable instance lock ─────────────────────────────────
@@ -853,6 +797,7 @@ fn truncate_to_last_64k(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_utils::{lock_file_path, try_flock};
 
     /// Make a file executable (0o755) on Unix; no-op on other platforms.
     fn make_executable(path: &Path) {
@@ -919,17 +864,25 @@ mod tests {
         assert!(try_flock(&holder).unwrap(), "First flock should succeed");
 
         // While the lock is held, try_acquire_lock should return None.
-        let result = try_acquire_lock(&lock_path).unwrap();
-        assert!(result.is_none(), "Should return None when lock is held");
-
-        // Release the lock.
-        drop(holder);
-
-        // After release, try_acquire_lock should succeed.
-        let result = try_acquire_lock(&lock_path).unwrap();
         assert!(
-            result.is_some(),
-            "Should acquire lock after previous holder releases"
+            try_acquire_lock(&lock_path).unwrap().is_none(),
+            "Should return None when lock is held"
+        );
+
+        // After releasing the holder, try_acquire_lock should succeed.
+        drop(holder);
+        let result = try_acquire_lock(&lock_path).unwrap();
+        assert!(result.is_some(), "After release, lock should be acquirable");
+    }
+
+    #[test]
+    fn test_lock_file_path_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lock_file_path(dir.path());
+        assert!(
+            path.ends_with("mahbot.lock"),
+            "Lock file path must end with mahbot.lock, got: {}",
+            path.display(),
         );
     }
 
