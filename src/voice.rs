@@ -5819,43 +5819,7 @@ pub async fn run_voice_pipeline() {
                         set_classifier_weights(members[0].clone());
                     }
                     if let Some(ref v) = model.verifier {
-                        // Backward compatibility check for MLP-era models
-                        // (mahbot-861 through mahbot-900).  The old
-                        // `VoiceVerifier` stored weights as 3-layer MLP
-                        // matrices (w1/b1/w2/b2/w3/b3) and a
-                        // `verifier_version` field.  These fields were
-                        // removed in the logistic-regression verifier
-                        // refactoring (mahbot-901+).  Old persisted
-                        // models deserialize with `trained: true` but
-                        // empty `weights`/`bias` (their serde defaults),
-                        // making `is_trained()` return false and the
-                        // verifier silently accept all frames (no-op).
-                        if v.trained && v.weights.is_empty() && v.bias == 0.0 {
-                            warn!(
-                                "Loaded verifier model was trained with an old mahbot \
-                                 version (legacy MLP architecture).  The verifier now \
-                                 uses logistic regression — re-enrollment is required."
-                            );
-                        }
-
                         set_verifier(v.clone());
-
-                        // Check for old 288-dim verifier weights (legacy MLP
-                        // from prior mahbot versions) (logistic regression
-                        // expects 96-dim weights).  This only fires for models
-                        // that survived is_trained() — i.e., models that
-                        // somehow have 96+ dim weights and trained=true but
-                        // don't match expected dim.
-                        if v.is_trained() {
-                            let w_dim = v.weights.len();
-                            if w_dim != 96 {
-                                warn!(
-                                    "Loaded verifier with {w_dim}-dim weights (expected 96). \
-                                     This model was trained with a previous mahbot version. \
-                                     Re-enrollment is recommended for optimal performance."
-                                );
-                            }
-                        }
                     }
                     let n = model.classifier.as_ref().map_or(0, Vec::len);
                     info!(
