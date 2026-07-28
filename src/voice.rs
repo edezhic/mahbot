@@ -306,6 +306,25 @@ const MIN_NEGATIVE_AUDIO_LEN: usize = SAMPLE_RATE as usize / 2;
 /// pipeline state (mahbot-800).
 const MAX_NEGATIVE_AUDIO_CHUNKS: usize = 100;
 
+// ── Phase 3 (owner-negative) enrollment constants (mahbot-913) ────────────
+
+/// Target VAD-positive speech duration for owner-negative Phase 3 collection.
+/// ~60 seconds of VAD-positive general speech from the user, used alongside
+/// ambient/cache negatives to train a better verifier.
+const NEGATIVES_TARGET_SECONDS: usize = 60;
+
+/// Maximum owner-negative audio samples to retain (90s cap, 1.5× the target).
+/// This prevents unbounded memory growth if the user speaks continuously.
+const MAX_OWNER_NEGATIVE_SAMPLES: usize = SAMPLE_RATE as usize * NEGATIVES_TARGET_SECONDS * 3 / 2;
+
+/// Upweight for owner-negative sequences during verifier training.
+const OWNER_NEGATIVE_UPWEIGHT: f32 = crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT;
+
+/// Wall-clock timeout for Phase 3 owner-negative collection (120 seconds).
+/// If the user stays silent or provides very little speech, the pipeline
+/// finalizes with whatever was collected rather than stalling indefinitely.
+const PHASE3_TIMEOUT_SECS: u64 = 120;
+
 /// Threshold for detecting clipping: samples at or above this absolute
 /// value are considered clipped (near i16::MAX = 32767 in f32 [-1, 1]).
 const ENROLLMENT_QUALITY_CLIPPING_THRESHOLD: f32 = 0.999;
@@ -1926,6 +1945,16 @@ pub enum VoiceStatus {
         sample: usize,
         total: usize,
     },
+    /// Collecting owner-general speech as negative verifier examples
+    /// (Phase 3 enrollment, mahbot-913).  `accumulated_secs` is the
+    /// VAD-positive speech time collected so far, `target_secs` is the
+    /// target (typically 60), `wall_clock_elapsed` is the wall-clock
+    /// seconds since Phase 3 started.
+    EnrollingNegatives {
+        accumulated_secs: usize,
+        target_secs: usize,
+        wall_clock_elapsed: u64,
+    },
     Enrolled,
     Error(String),
 }
@@ -2053,6 +2082,18 @@ struct VoicePipelineState {
     /// processed through the ONNX embedding model at verifier training time to
     /// produce real (non-synthetic) negative examples for the verifier (mahbot-797).
     negative_audio_chunks: Vec<Vec<f32>>,
+    /// Owner-negative audio chunks collected during Phase 3 enrollment
+    /// (mahbot-913).  ~60 seconds of VAD-positive general speech from the user,
+    /// stored as audio chunks for embedding extraction at verifier training time.
+    /// Preserved across Full/Soft pipeline resets (same as `negative_audio_chunks`)
+    /// but cleared on Cancel (via `reset_enrollment`).
+    owner_negative_chunks: Vec<Vec<f32>>,
+    /// Whether the user has completed all 10 enrollment utterances (Phase 2
+    /// done).  Set by `handle_enrollment_sample` when
+    /// `enrolled_utterance_count >= NUM_ENROLLMENT_SAMPLES`.  The main loop
+    /// reads this flag to initiate the Phase 2→3 transition
+    /// (`transition_to_phase3`).  Cleared on Cancel (via `reset_enrollment`).
+    utterances_collected: bool,
     /// Number of user utterances enrolled so far (mahbot-878).
     ///
     /// Unlike [`enrollment_buffer`] which may contain 5× entries due to PCM
@@ -2088,7 +2129,9 @@ impl VoicePipelineState {
     fn reset_enrollment(&mut self) {
         self.enrollment_buffer.clear();
         self.negative_audio_chunks.clear();
+        self.owner_negative_chunks.clear();
         self.enrolled_utterance_count = 0;
+        self.utterances_collected = false;
         self.enrolling_phrase = None;
     }
 }
@@ -2130,7 +2173,9 @@ pub fn init_global() -> Result<()> {
             verifier: VoiceVerifier::untrained(),
             enrollment_buffer: Vec::new(),
             negative_audio_chunks: Vec::new(),
+            owner_negative_chunks: Vec::new(),
             enrolled_utterance_count: 0,
+            utterances_collected: false,
             model_phrase: None,
             enrolling_phrase: None,
             cmd_tx: None,
@@ -4623,6 +4668,26 @@ pub(crate) struct PipelineCtx {
     /// Reset to `None` after the utterance is consumed by
     /// [`handle_enrollment_sample`].
     noise_rms_estimate: Option<f32>,
+    // ── Phase 3 (owner-negative) enrollment state (mahbot-913) ────────────
+    /// Whether the pipeline is actively collecting owner-negative general speech
+    /// during Phase 3 enrollment.  Set by `transition_to_phase3()` when the
+    /// user has completed all 10 wake word utterances.
+    collecting_negatives: bool,
+    /// Independent audio buffer for Phase 3 VAD frame processing.  NOT shared
+    /// with `audio_buffer` (used by enrollment Phase 2) to avoid interference.
+    phase3_audio_buf: Vec<f32>,
+    /// Silence tracking for Phase 3 chunk boundary detection.  Uses
+    /// [`SILENCE_THRESHOLD_SAMPLES`] (same constant as utterance end in Phase 2)
+    /// to detect chunk boundaries — see the constant definition for coupling docs.
+    phase3_silence_samples: usize,
+    /// Accumulated VAD-positive speech samples collected during Phase 3.
+    /// When `negatives_speech_samples >= SAMPLE_RATE * NEGATIVES_TARGET_SECONDS`,
+    /// Phase 3 is complete and the pipeline transitions to finalization.
+    negatives_speech_samples: usize,
+    /// Wall-clock start time of Phase 3 owner-negative collection.  Used for
+    /// timeout — if [`PHASE3_TIMEOUT_SECS`] elapses, finalize with whatever
+    /// was collected.
+    phase3_start_time: Option<Instant>,
     /// Rolling window of per-frame confidence scores from the Conv1D MLP
     /// classifier (mahbot-810).  Each element is the MLP confidence (0.0–1.0)
     /// for one 3-embedding window (~384ms of speech).  Detection fires when
@@ -4748,6 +4813,11 @@ impl PipelineCtx {
             last_wake_word_detection: None,
             score_window: Vec::new(),
             noise_rms_estimate: None,
+            collecting_negatives: false,
+            phase3_audio_buf: Vec::new(),
+            phase3_silence_samples: 0,
+            negatives_speech_samples: 0,
+            phase3_start_time: None,
             vad_threshold: VAD_THRESHOLD,
             pre_agc_ring: Vec::new(),
             audio_preprocessor: {
@@ -4823,6 +4893,13 @@ impl PipelineCtx {
         self.frame_vad.clear();
         self.frame_raw_audio.clear();
         self.emitted_utterances = 0;
+
+        // ── Phase 3 owner-negative state (cleared by all levels) ──
+        self.collecting_negatives = false;
+        self.phase3_audio_buf.clear();
+        self.phase3_silence_samples = 0;
+        self.negatives_speech_samples = 0;
+        self.phase3_start_time = None;
 
         match level {
             ResetLevel::Full => {
@@ -5169,6 +5246,48 @@ impl PipelineCtx {
         info!("Voice pipeline: enrollment cancelled");
     }
 
+    /// Transition the pipeline from Phase 2 (wake word utterance collection)
+    /// to Phase 3 (owner-negative general speech collection, mahbot-913).
+    ///
+    /// Called by the main loop when `utterances_collected` is true and
+    /// `collecting_negatives` is false.  Switches VAD threshold to the more
+    /// inclusive [`VAD_THRESHOLD`], drains any stale enrollment pending queue,
+    /// clears the negative audio buffer and silence counters, and sets the
+    /// Phase 3 state flags.
+    fn transition_to_phase3(&mut self) {
+        // Switch VAD threshold to more inclusive detection (0.50 vs 0.60).
+        self.vad_threshold = VAD_THRESHOLD;
+
+        // Drain any stale enrollment_pending queue (should be empty, but be safe).
+        if !self.enrollment_pending.is_empty() {
+            warn!(
+                "transition_to_phase3: draining {} stale enrollment pending utterances",
+                self.enrollment_pending.len(),
+            );
+            self.enrollment_pending.clear();
+        }
+
+        // Clear inter-utterance state that may carry over from Phase 2.
+        self.negative_audio_buf.clear();
+        self.utterance_silence_samples = 0;
+        self.utterance_had_speech = false;
+        self.vad_positives_in_a_row = 0;
+
+        // Set Phase 3 state.
+        self.collecting_negatives = true;
+        self.phase3_start_time = Some(Instant::now());
+
+        set_status(VoiceStatus::EnrollingNegatives {
+            accumulated_secs: 0,
+            target_secs: NEGATIVES_TARGET_SECONDS,
+            wall_clock_elapsed: 0,
+        });
+        info!(
+            "Voice pipeline: transitioning to Phase 3 owner-negative \
+             collection (target {NEGATIVES_TARGET_SECONDS}s of VAD-positive speech)",
+        );
+    }
+
     fn handle_shutdown(&mut self) {
         drop(self.mic_stream.take());
     }
@@ -5209,6 +5328,480 @@ impl PipelineCtx {
             send_command(VoiceCommand::StartListening);
         }
     }
+}
+
+/// Schedule a transition back to [`VoiceStatus::Listening`] after enrollment
+/// finalization completes successfully.
+///
+/// Extracted from the existing cleanup at lines ~5616-5636 of the main loop
+/// (mahbot-913).  Runs [`reset_pipeline_state(Cancel)`](PipelineCtx::reset_pipeline_state),
+/// sets `enrollment_mode = false`, and spawns a 1.5-second delayed task that
+/// transitions to [`VoiceStatus::Listening`] (respecting the global shutdown
+/// token so it does not write stale state after pipeline exit).
+///
+/// Called from both:
+/// - The Phase 2→4 direct finalization path (existing behavior)
+/// - The Phase 3→4 path (new owner-negative collection path, mahbot-913)
+fn schedule_listening_transition(ctx: &mut PipelineCtx) {
+    // Clear all audio buffers BEFORE resetting enrollment_mode to prevent
+    // stale audio from leaking into detection mode during the ~1.5s delay.
+    // Cancel level: clears audio buffers, enrollment accumulators, restores
+    // vad_threshold to VAD_THRESHOLD, but preserves VAD/NS continuity.
+    // Does NOT call reset_vad() — the earshot noise floor estimate from the
+    // enrollment phase is deliberately carried through to detection mode.
+    ctx.reset_pipeline_state(ResetLevel::Cancel);
+    ctx.enrollment_mode = false;
+    // Schedule transition to Listening after showing "Enrolled" for 1.5s.
+    tokio::spawn(async {
+        let shutdown_token = crate::shutdown::shutdown_token();
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_millis(1500)) => {
+                if matches!(get_status(), VoiceStatus::Enrolled) {
+                    set_status(VoiceStatus::Listening);
+                }
+            }
+            () = shutdown_token.cancelled() => {
+                // Pipeline is shutting down — do not touch state.
+            }
+        }
+    });
+}
+
+/// Finalize the enrollment pipeline: train classifier + verifier with 4-tier
+/// negative weights (ambient → owner-negative → unrelated → confusable).
+///
+/// Extracted from the original training block in `handle_enrollment_sample`
+/// and extended with owner-negative embedding extraction and 4-tier weight
+/// construction (mahbot-913).
+///
+/// Called by the main loop after Phase 3 (owner-negative collection) completes
+/// or times out.  Returns `true` on success (model trained and persisted),
+/// `false` on failure (the pipeline stays in its current state for retry).
+///
+/// # Cancel guard
+///
+/// Before `persist_model_state()`, checks the global cancellation token.  If
+/// cancelled during async training, returns `false` early without persisting
+/// stale state.
+#[allow(clippy::too_many_lines)]
+async fn finalize_enrollment_pipeline() -> bool {
+    if !models_ready() {
+        warn!("finalize_enrollment_pipeline: models not ready");
+        return false;
+    }
+
+    // ── Clone positive embeddings (dense-only after mahbot-923) ──
+    let enrollment_buffer = {
+        let state = voice_state().read().unwrap_poison();
+        state.enrollment_buffer.clone()
+    };
+
+    // ── Clone negative audio chunks (ambient + owner-negative) ──
+    let (negative_audio_chunks, used_real_negatives) = {
+        let state = voice_state().read().unwrap_poison();
+        let chunks = state.negative_audio_chunks.clone();
+        let should_use = chunks.len() >= 2 && ONNX_MODELS.get().is_some();
+        (chunks, should_use)
+    };
+    let owner_negative_chunks = {
+        let state = voice_state().read().unwrap_poison();
+        state.owner_negative_chunks.clone()
+    };
+
+    // ── Extract ambient negatives (per-chunk EmbeddingSequences) ──
+    let negative_sequences: Vec<EmbeddingSequence> = if used_real_negatives {
+        tokio::task::spawn_blocking(move || {
+            let _models = ONNX_MODELS.get().expect("ONNX_MODELS checked above");
+            let mut neg_seqs: Vec<EmbeddingSequence> = Vec::new();
+            for (ci, chunk) in negative_audio_chunks.iter().enumerate() {
+                let chunk_id = UtteranceId {
+                    sequence_index: ci,
+                    variant_index: 0,
+                };
+                match process_enrollment_sample(chunk) {
+                    Ok(embs) => {
+                        neg_seqs.push(EmbeddingSequence::negative(
+                            chunk_id,
+                            Source::Ambient,
+                            None,
+                            embs,
+                        ));
+                    }
+                    Err(e) => warn!(
+                        "Failed to extract dense negative embedding \
+                         from ambient audio chunk ({} samples): {e}",
+                        chunk.len(),
+                    ),
+                }
+            }
+            neg_seqs
+        })
+        .await
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // ── Extract owner-negative embeddings ──
+    let use_owner_negatives = !owner_negative_chunks.is_empty() && ONNX_MODELS.get().is_some();
+    let owner_negative_sequences: Vec<EmbeddingSequence> = if use_owner_negatives {
+        tokio::task::spawn_blocking(move || {
+            let _models = ONNX_MODELS.get().expect("ONNX_MODELS checked above");
+            let mut owner_seqs: Vec<EmbeddingSequence> = Vec::new();
+            for (ci, chunk) in owner_negative_chunks.iter().enumerate() {
+                let chunk_id = UtteranceId {
+                    sequence_index: ci,
+                    variant_index: 0,
+                };
+                match process_enrollment_sample(chunk) {
+                    Ok(embs) => {
+                        owner_seqs.push(EmbeddingSequence::negative(
+                            chunk_id,
+                            Source::Owner,
+                            None,
+                            embs,
+                        ));
+                    }
+                    Err(e) => warn!(
+                        "Failed to extract dense owner-negative embedding \
+                         from Phase 3 chunk ({} samples): {e}",
+                        chunk.len(),
+                    ),
+                }
+            }
+            owner_seqs
+        })
+        .await
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // ── Clear chunk buffers from global state ──
+    {
+        let mut state = voice_state().write().unwrap_poison();
+        if used_real_negatives {
+            state.negative_audio_chunks.clear();
+        }
+        state.owner_negative_chunks.clear();
+    }
+
+    // ── Read wake word phrase for confusable gating (mahbot-909) ──
+    let enrolled_phrase = voice_state()
+        .read()
+        .unwrap_poison()
+        .enrolling_phrase
+        .clone()
+        .unwrap_or_else(|| DEFAULT_WAKE_WORD_PHRASE.to_string());
+    let use_mahbot_confusables = is_mahbot_wake_word(&enrolled_phrase);
+    if !use_mahbot_confusables {
+        info!(
+            "Skipping Mahbot-specific confusable phrases for wake word \
+             '{enrolled_phrase}' (mahbot-909); see is_mahbot_wake_word() \
+             docs for quality implications",
+        );
+    }
+
+    // ── Build positive sequences for training (dense-only after mahbot-923) ──
+    let mut pos_sequences: Vec<EmbeddingSequence> = Vec::with_capacity(enrollment_buffer.len());
+    pos_sequences.extend(enrollment_buffer.clone()); // .clone() — verifier needs this too
+
+    // ── Build negative sequences for classifier training ──
+    let confusable_dense = confusable_dense_embeddings();
+    let unrelated_dense = unrelated_dense_embeddings();
+    let mut neg_sequences: Vec<EmbeddingSequence> = Vec::new();
+    let n_ambient_classifier = negative_sequences.len();
+    if n_ambient_classifier > 0 {
+        info!(
+            "Adding {n_ambient_classifier} dense ambient negative \
+             sequences to classifier negative set (mahbot-923)",
+        );
+        neg_sequences.extend(negative_sequences.clone()); // clone — used again for verifier
+    }
+    if use_mahbot_confusables && !confusable_dense.is_empty() {
+        info!(
+            "Adding {} confusable dense sequences to classifier negative set \
+             for Mahbot wake word '{enrolled_phrase}' (mahbot-909)",
+            confusable_dense.len(),
+        );
+        neg_sequences.extend_from_slice(confusable_dense);
+    }
+    if !unrelated_dense.is_empty() {
+        info!(
+            "Adding {} unrelated dense sequences to classifier negative set (mahbot-878)",
+            unrelated_dense.len(),
+        );
+        neg_sequences.extend_from_slice(unrelated_dense);
+    }
+
+    // ── Classifier training via finalize_enrollment ──
+    let classifier_result = tokio::task::spawn_blocking({
+        let pos_seqs = pos_sequences.clone();
+        let neg_seqs = neg_sequences.clone();
+        move || finalize_enrollment(&pos_seqs, &neg_seqs)
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow!("Classifier training task panicked: {e}")));
+
+    let weights = match classifier_result {
+        Ok(result) => {
+            let first_params = result
+                .weights
+                .first()
+                .map_or(0, ClassifierWeights::param_count);
+            info!(
+                "Enrollment complete: wake word '{}' (ensemble of {} models, \
+                             {} params each, {} epochs, best val loss={:.4})",
+                enrolled_phrase,
+                result.weights.len(),
+                first_params,
+                result.epochs_trained,
+                result.best_val_loss,
+            );
+            result.weights
+        }
+        Err(e) => {
+            warn!("Enrollment finalization failed: {e}");
+            set_status(VoiceStatus::Error("Enrollment failed".to_string()));
+            return false;
+        }
+    };
+
+    // ── Train verifier in spawn_blocking (CPU-bound MLP) ──
+    let pos_for_ver_seqs = enrollment_buffer; // moved — cloned above for classifier
+    let self_test_seqs = pos_for_ver_seqs.clone();
+    let confusable_embs = confusable_dense_embeddings();
+    let unrelated_embs = unrelated_dense_embeddings();
+    let n_confusable_pre = if use_mahbot_confusables {
+        confusable_embs.len()
+    } else {
+        0
+    };
+    let n_unrelated_pre = unrelated_embs.len();
+    let n_ambient_pre = negative_sequences.len();
+    let n_owner_pre = owner_negative_sequences.len();
+
+    // Build negative sequences: ambient → owner-negative → unrelated → confusable.
+    let neg_for_verifier_seqs = {
+        let mut neg: Vec<EmbeddingSequence> = Vec::new();
+        // Ambient first (per-chunk sequences, each weight 1.0)
+        if n_ambient_pre > 0 {
+            info!(
+                "Adding {n_ambient_pre} dense ambient negative \
+                 sequences to verifier negative set (mahbot-923)",
+            );
+            neg.extend(negative_sequences); // moved — per-chunk EmbeddingSequences
+        }
+        // Owner-negative second (Phase 3 speech chunks)
+        if n_owner_pre > 0 {
+            info!(
+                "Adding {n_owner_pre} owner-negative dense \
+                 sequences to verifier negative set (mahbot-913)",
+            );
+            neg.extend(owner_negative_sequences); // moved
+        }
+        // Unrelated speech next
+        if !unrelated_embs.is_empty() {
+            info!(
+                "Adding {} pre-computed unrelated speech dense \
+                         sequences to verifier negative set (mahbot-923)",
+                unrelated_embs.len(),
+            );
+            neg.extend_from_slice(unrelated_embs);
+        }
+        // Confusable last
+        if use_mahbot_confusables && !confusable_embs.is_empty() {
+            info!(
+                "Adding {} pre-computed confusable phrase dense \
+                         sequences to verifier negative set for Mahbot wake word \
+                         '{enrolled_phrase}' (mahbot-923)",
+                confusable_embs.len(),
+            );
+            neg.extend_from_slice(confusable_embs);
+        }
+        neg
+    };
+
+    // Clone weights for the verifier training closure.
+    let verifier_weights = weights.clone();
+    let verifier = tokio::task::spawn_blocking(move || {
+        use crate::voice_verifier::{
+            assert_weight_tier, mine_hard_negatives, CONFUSABLE_UPWEIGHT,
+            DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA, LEARNING_RATE, MLP_MAX_ITER,
+            UNRELATED_UPWEIGHT, VoiceVerifier,
+        };
+        use crate::wake_word_classifier::WakeWordClassifier;
+        use crate::{
+            MAX_NEGATIVE_WINDOWS_PER_SEQUENCE, VERIFIER_WINDOW_SIZE,
+        };
+
+        if pos_for_ver_seqs.is_empty() {
+            warn!("Could not train verifier: no valid positive sequences");
+            VoiceVerifier::untrained()
+        } else if !neg_for_verifier_seqs.is_empty() {
+            let n_neg = neg_for_verifier_seqs.len();
+            let n_confusable = n_confusable_pre;
+            let n_unrelated = n_unrelated_pre;
+            let n_ambient = n_ambient_pre;
+            let n_owner = n_owner_pre;
+            let n_ambient_from_total = n_neg.saturating_sub(n_owner + n_confusable + n_unrelated);
+            debug_assert_eq!(n_ambient, n_ambient_from_total,
+                "ambient sequence count mismatch: expected {n_ambient}, total neg sequences {n_neg} - owner {n_owner} - confusable {n_confusable} - unrelated {n_unrelated} = {n_ambient_from_total}");
+
+            let use_mining = crate::voice_verifier::use_hard_negative_mining();
+            let (neg_to_use, per_neg_weights_opt) = 'decide: {
+                if use_mining {
+                    let classifier = WakeWordClassifier::new_ensemble(verifier_weights);
+                    let mined = mine_hard_negatives(
+                        &classifier,
+                        &neg_for_verifier_seqs,
+                        MAX_NEGATIVE_WINDOWS_PER_SEQUENCE,
+                        VERIFIER_WINDOW_SIZE,
+                    );
+                    if mined.sequences.len()
+                        >= crate::voice_verifier::MIN_MINED_NEGATIVES_FALLBACK
+                    {
+                        info!(
+                            "Hard-negative mining (mahbot-905): selected {} windows \
+                             from {}/{n_neg} source sequences for verifier training; \
+                             using uniform weights (mining replaces tiered weights)",
+                            mined.sequences.len(),
+                            mined.source_sequences_represented,
+                        );
+                        break 'decide (mined.sequences, None);
+                    }
+                    warn!(
+                        "Hard-negative mining produced only {} windows (< {}); \
+                         falling back to all-windows training (mahbot-905)",
+                        mined.sequences.len(),
+                        crate::voice_verifier::MIN_MINED_NEGATIVES_FALLBACK,
+                    );
+                }
+
+                // ── 4-tier weight construction (mahbot-913) ──
+                // Order: ambient (1.0×) → owner-negative (OWNER_NEGATIVE_UPWEIGHT×)
+                //        → unrelated (UNRELATED_UPWEIGHT×) → confusable (CONFUSABLE_UPWEIGHT×)
+                let mut per_neg_weights: Vec<f32> = Vec::with_capacity(n_neg);
+                per_neg_weights.extend(std::iter::repeat_n(1.0, n_ambient));
+                if n_owner > 0 {
+                    per_neg_weights.extend(std::iter::repeat_n(
+                        OWNER_NEGATIVE_UPWEIGHT, n_owner));
+                }
+                per_neg_weights.extend(std::iter::repeat_n(
+                    UNRELATED_UPWEIGHT, n_unrelated));
+                per_neg_weights.extend(std::iter::repeat_n(
+                    CONFUSABLE_UPWEIGHT, n_confusable));
+                info!(
+                    "Building per-sequence weights: {n_ambient} ambient (1.0) + \
+                     {n_owner} owner-negative ({OWNER_NEGATIVE_UPWEIGHT}×) + \
+                     {n_unrelated} unrelated ({UNRELATED_UPWEIGHT}×) + \
+                     {n_confusable} confusable ({CONFUSABLE_UPWEIGHT}×) for \
+                     {n_neg} total negative sequences (mahbot-913)",
+                );
+                // Structural guard: verify weight ordering matches concatenation
+                // order (ambient → owner-negative → unrelated → confusable).
+                assert_weight_tier(&per_neg_weights, 0, n_ambient, 1.0, "ambient");
+                if n_owner > 0 {
+                    assert_weight_tier(
+                        &per_neg_weights,
+                        n_ambient,
+                        n_owner,
+                        OWNER_NEGATIVE_UPWEIGHT,
+                        "owner-negative",
+                    );
+                }
+                assert_weight_tier(
+                    &per_neg_weights,
+                    n_ambient + n_owner,
+                    n_unrelated,
+                    UNRELATED_UPWEIGHT,
+                    "unrelated",
+                );
+                assert_weight_tier(
+                    &per_neg_weights,
+                    n_ambient + n_owner + n_unrelated,
+                    n_confusable,
+                    CONFUSABLE_UPWEIGHT,
+                    "confusable",
+                );
+                (neg_for_verifier_seqs, Some(per_neg_weights))
+            };
+
+            let v = VoiceVerifier::train(
+                &pos_for_ver_seqs,
+                &neg_to_use,
+                per_neg_weights_opt.as_deref(),
+                DEFAULT_VERIFIER_THRESHOLD,
+                L2_LAMBDA,
+                LEARNING_RATE,
+                MLP_MAX_ITER,
+                None,
+            );
+            info!(
+                "Verifier trained from {} positive + {} \
+                 negative sequence(s) (ambient + owner-negative + unrelated + \
+                 confusable, mahbot-913)",
+                pos_for_ver_seqs.len(),
+                if per_neg_weights_opt.is_some() { n_neg } else { neg_to_use.len() },
+            );
+            v
+        } else {
+            let v = VoiceVerifier::train_with_synthetic_negatives(
+                &pos_for_ver_seqs,
+                DEFAULT_VERIFIER_THRESHOLD,
+                None,
+            );
+            info!(
+                "Verifier trained from {} positive \
+                 sequence(s) + synthetic negatives (no real or confusable \
+                 negatives available, mahbot-859)",
+                pos_for_ver_seqs.len(),
+            );
+            v
+        }
+    })
+    .await
+    .unwrap_or_else(|e| {
+        warn!("Verifier training task panicked: {e}");
+        crate::voice_verifier::VoiceVerifier::untrained()
+    });
+
+    // ── Cancel guard: check before persisting (mahbot-913) ──
+    if crate::shutdown::shutdown_token().is_cancelled() {
+        warn!(
+            "finalize_enrollment_pipeline: cancelled during async training, \
+               not persisting model state"
+        );
+        return false;
+    }
+
+    // ── Blocking self-test (mahbot-898) ──
+    let classifier = WakeWordClassifier::new_ensemble(weights.clone());
+    if let Err(e) = run_enrollment_self_test(&self_test_seqs, &classifier) {
+        warn!("Enrollment self-test failed — model rejected: {e}.  Re-enrollment required.");
+        set_status(VoiceStatus::Error(format!(
+            "Enrollment validation failed: {e}.  Please try again with clearer speech."
+        )));
+        return false;
+    }
+    info!("Enrollment self-test: passed — deploying model");
+
+    // ── Store classifier + verifier in global state ──
+    set_classifier_weights(weights);
+    set_verifier(verifier);
+
+    // ── Persist to config DB ──
+    persist_model_state().await;
+
+    // ── Clear enrollment accumulators ──
+    {
+        let mut state = voice_state().write().unwrap_poison();
+        state.enrollment_buffer.clear();
+        state.enrolled_utterance_count = 0;
+        state.utterances_collected = false;
+    }
+
+    true
 }
 
 /// Run the voice pipeline background task.
@@ -5402,7 +5995,7 @@ pub async fn run_voice_pipeline() {
                 // during enrollment where noise RMS is needed — the ring would
                 // be stale/irrelevant during live detection since it's reset
                 // when enrollment completes.
-                if ctx.enrollment_mode {
+                if ctx.enrollment_mode || ctx.collecting_negatives {
                     ctx.pre_agc_ring.extend_from_slice(&samples);
                     if ctx.pre_agc_ring.len() > RAW_RING_MAX {
                         let excess = ctx.pre_agc_ring.len() - RAW_RING_MAX;
@@ -5414,7 +6007,9 @@ pub async fn run_voice_pipeline() {
                 // the audio reaches VAD / mel extraction / enrollment.
                 let samples = ctx.audio_preprocessor.process(samples);
 
-                if ctx.enrollment_mode {
+                if ctx.collecting_negatives {
+                    handle_negative_collection_audio(&samples, &mut ctx);
+                } else if ctx.enrollment_mode {
                     let (sample, total) = {
                         let state = voice_state().read().unwrap_poison();
                         // Use enrolled_utterance_count (not enrollment_buffer.len())
@@ -5469,53 +6064,99 @@ pub async fn run_voice_pipeline() {
             ctx.try_retry_models();
         }
 
+        // ── Phase 2→3 transition (mahbot-913) ──
+        // After all 10 enrollment utterances are collected, automatically
+        // transition to owner-negative speech collection (Phase 3).
+        let utterances_collected = voice_state().read().unwrap_poison().utterances_collected;
+        if utterances_collected && !ctx.collecting_negatives {
+            ctx.transition_to_phase3();
+        }
+
+        // ── Phase 3→4 transition (mahbot-913) ──
+        // When the target VAD-positive speech time is reached (or wall-clock
+        // timeout), finalize residual audio, train the model, and clean up.
+        if ctx.collecting_negatives {
+            let target_samples = SAMPLE_RATE as usize * NEGATIVES_TARGET_SECONDS;
+            let target_met = ctx.negatives_speech_samples >= target_samples;
+            let timed_out = ctx
+                .phase3_start_time
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(PHASE3_TIMEOUT_SECS));
+
+            if target_met || timed_out {
+                // Finalize any residual audio in phase3_audio_buf.
+                if !ctx.phase3_audio_buf.is_empty() {
+                    let chunk = std::mem::take(&mut ctx.phase3_audio_buf);
+                    let mut state = voice_state().write().unwrap_poison();
+                    let total_samples: usize = state
+                        .owner_negative_chunks
+                        .iter()
+                        .map(std::vec::Vec::len)
+                        .sum();
+                    if total_samples + chunk.len() <= MAX_OWNER_NEGATIVE_SAMPLES {
+                        state.owner_negative_chunks.push(chunk);
+                    } else {
+                        warn!(
+                            "owner_negative_chunks at capacity ({} samples): \
+                             dropping residual chunk of {} samples (mahbot-913)",
+                            MAX_OWNER_NEGATIVE_SAMPLES,
+                            chunk.len(),
+                        );
+                    }
+                    drop(state);
+                }
+
+                // Cap is ~1.4M at 16kHz, well within f64 mantissa precision.
+                let collected_secs = {
+                    #[allow(clippy::cast_precision_loss)]
+                    {
+                        (ctx.negatives_speech_samples as f64) / f64::from(SAMPLE_RATE)
+                    }
+                };
+
+                info!(
+                    "Phase 3 complete: {:.1}s VAD-positive speech collected \
+                     (target {}s){}",
+                    collected_secs,
+                    NEGATIVES_TARGET_SECONDS,
+                    if timed_out {
+                        " (wall-clock timeout)"
+                    } else {
+                        ""
+                    },
+                );
+
+                // Train and persist the model.
+                let success = finalize_enrollment_pipeline().await;
+
+                if success {
+                    set_status(VoiceStatus::Enrolled);
+                    schedule_listening_transition(&mut ctx);
+                }
+                // On failure, the error status is already set by
+                // finalize_enrollment_pipeline.  The user can retry by
+                // re-initiating enrollment.
+            } else {
+                // Update status with current progress.
+                let accumulated_secs = ctx.negatives_speech_samples / SAMPLE_RATE as usize;
+                let wall_clock_elapsed = ctx.phase3_start_time.map_or(0, |t| t.elapsed().as_secs());
+                set_status(VoiceStatus::EnrollingNegatives {
+                    accumulated_secs,
+                    target_secs: NEGATIVES_TARGET_SECONDS,
+                    wall_clock_elapsed,
+                });
+            }
+        }
+
         // Process any pending enrollment utterances (accumulated inline to avoid
         // race conditions with the command channel).  Using a VecDeque so all
         // completed utterances are preserved even if multiple complete within a
         // single mic frame — each is popped one per tick (mahbot-823).
         // ONNX inference inside handle_enrollment_sample uses spawn_blocking
-        // so it doesn't block.
-        if let Some(samples) = ctx.enrollment_pending.pop_front() {
+        // so it doesn't block.  Only processes during Phase 2 (before
+        // utterances_collected), since Phase 3 handles audio independently.
+        if !utterances_collected && let Some(samples) = ctx.enrollment_pending.pop_front() {
             let noise_rms = ctx.noise_rms_estimate.take();
             handle_enrollment_sample(samples, noise_rms).await;
-            // Reset enrollment_mode only on successful completion, not on
-            // failure — if finalize_enrollment failed, the user can retry
-            // by speaking the wake word again without re-initiating enrollment.
-            if matches!(
-                voice_state().read().unwrap_poison().status,
-                VoiceStatus::Enrolled
-            ) {
-                // Clear all audio buffers BEFORE resetting enrollment_mode
-                // to prevent stale audio from leaking into detection mode
-                // during the ~1.5s status delay (mahbot-765 Race condition fix).
-                // Cancel level: clears audio buffers, enrollment accumulators,
-                // restores vad_threshold to VAD_THRESHOLD, but preserves VAD/NS
-                // continuity (same mic stream, same acoustic environment).
-                // Does NOT call reset_vad() — the earshot noise floor estimate
-                // from the enrollment phase is deliberately carried through to
-                // detection mode (mahbot-805).
-                ctx.reset_pipeline_state(ResetLevel::Cancel);
-                ctx.enrollment_mode = false;
-                // Schedule transition to Listening after showing "Enrolled"
-                // for 1.5 seconds, so the user gets visual confirmation that
-                // enrollment completed successfully before the pipeline
-                // resumes active wake word listening (mahbot-755 Fix 3).
-                // The spawned task respects the global shutdown token so it
-                // does not write stale state after pipeline exit.
-                tokio::spawn(async {
-                    let shutdown_token = crate::shutdown::shutdown_token();
-                    tokio::select! {
-                        () = tokio::time::sleep(Duration::from_millis(1500)) => {
-                            if matches!(get_status(), VoiceStatus::Enrolled) {
-                                set_status(VoiceStatus::Listening);
-                            }
-                        }
-                        () = shutdown_token.cancelled() => {
-                            // Pipeline is shutting down — do not touch state.
-                        }
-                    }
-                });
-            }
         }
 
         // Transition from Error to Listening after the refractory period
@@ -5791,406 +6432,14 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     );
 
     if utterance_count >= NUM_ENROLLMENT_SAMPLES {
-        // ── Collect positive embeddings (dense-only after mahbot-923) ──
-        // After the dense-stride-8 alignment, both classifier and verifier
-        // train on the same dense embedding distribution — the streaming
-        // buffer was removed.  The enrollment buffer provides the unified
-        // positive training data.
-        let enrollment_buffer = {
-            let state = voice_state().read().unwrap_poison();
-            state.enrollment_buffer.clone()
-        };
-
-        // ── Clone negative audio chunks once for extraction ──
-        let (negative_audio_chunks, used_real_negatives) = {
-            let state = voice_state().read().unwrap_poison();
-            let chunks = state.negative_audio_chunks.clone();
-            let should_use = chunks.len() >= 2 && ONNX_MODELS.get().is_some();
-            (chunks, should_use)
-        };
-
-        // ── Extract dense negatives (per-chunk EmbeddingSequences) ──
-        // Each ambient audio chunk becomes its own EmbeddingSequence so that
-        // windows never cross chunk boundaries during training (mahbot-902).
-        // After mahbot-923, dense stride-8 extraction replaces streaming.
-        let negative_sequences: Vec<EmbeddingSequence> = if used_real_negatives {
-            tokio::task::spawn_blocking(move || {
-                let _models = ONNX_MODELS.get().expect("ONNX_MODELS checked above");
-                let mut neg_seqs: Vec<EmbeddingSequence> = Vec::new();
-                for (ci, chunk) in negative_audio_chunks.iter().enumerate() {
-                    let chunk_id = UtteranceId {
-                        sequence_index: ci,
-                        variant_index: 0,
-                    };
-                    // Extract dense negatives for distribution match with inference
-                    // (mahbot-923: streaming extraction removed, use dense stride-8).
-                    match process_enrollment_sample(chunk) {
-                        Ok(embs) => {
-                            neg_seqs.push(EmbeddingSequence::negative(
-                                chunk_id,
-                                Source::Ambient,
-                                None,
-                                embs,
-                            ));
-                        }
-                        Err(e) => warn!(
-                            "Failed to extract dense negative embedding \
-                             from ambient audio chunk ({} samples): {e}",
-                            chunk.len(),
-                        ),
-                    }
-                }
-                neg_seqs
-            })
-            .await
-            .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        // Conditionally clear negative_audio_chunks
-        if used_real_negatives {
-            voice_state()
-                .write()
-                .unwrap_poison()
-                .negative_audio_chunks
-                .clear();
-        }
-
-        // ── Read wake word phrase for confusable gating (mahbot-909) ──
-        // Read once and reuse across both classifier and verifier paths.
-        // The phrase was normalized at enrollment start (see
-        // PipelineCtx::handle_start_enrollment, line ~5153).
-        let enrolled_phrase = voice_state()
-            .read()
-            .unwrap_poison()
-            .enrolling_phrase
-            .clone()
-            .unwrap_or_else(|| DEFAULT_WAKE_WORD_PHRASE.to_string());
-        let use_mahbot_confusables = is_mahbot_wake_word(&enrolled_phrase);
-        if !use_mahbot_confusables {
-            info!(
-                "Skipping Mahbot-specific confusable phrases for wake word \
-                 '{enrolled_phrase}' (mahbot-909); see is_mahbot_wake_word() \
-                 docs for quality implications",
-            );
-        }
-
-        // ── Build positive sequences for training (dense-only after mahbot-923) ──
-        // After the dense-stride-8 alignment, both classifier and verifier train
-        // on the same dense embedding distribution — the streaming buffer was
-        // removed.  Each entry carries correct provenance metadata (source,
-        // augmentation_family, variant_index) set by `push_variant!` at push time
-        // (mahbot-902).
-        //
-        // NOTE: `.clone()` at the extend site is critical — the original
-        // `enrollment_buffer` is moved here, and the verifier training below
-        // needs the same data.  The streaming split (mahbot-855) no longer
-        // exists; both models use the same dense embeddings.
-        let mut pos_sequences: Vec<EmbeddingSequence> = Vec::with_capacity(enrollment_buffer.len());
-        pos_sequences.extend(enrollment_buffer.clone()); // .clone() — verifier needs this too
-
-        // ── Build negative sequences for classifier training ──
-        // Uses dense ambient negatives (per-chunk, no cross-chunk windows) +
-        // pre-computed dense-stride confusable/unrelated.
-        let confusable_dense = confusable_dense_embeddings();
-        let unrelated_dense = unrelated_dense_embeddings();
-        let n_ambient_classifier = negative_sequences.len();
-
-        let mut neg_sequences: Vec<EmbeddingSequence> = Vec::new();
-        if n_ambient_classifier > 0 {
-            info!(
-                "Adding {n_ambient_classifier} dense ambient negative \
-                 sequences to classifier negative set (mahbot-923)",
-            );
-            neg_sequences.extend(negative_sequences.clone()); // clone — used again for verifier
-        }
-        if use_mahbot_confusables && !confusable_dense.is_empty() {
-            info!(
-                "Adding {} confusable dense sequences to classifier negative set \
-                 for Mahbot wake word '{enrolled_phrase}' (mahbot-909)",
-                confusable_dense.len(),
-            );
-            neg_sequences.extend_from_slice(confusable_dense);
-        }
-        if !unrelated_dense.is_empty() {
-            info!(
-                "Adding {} unrelated dense sequences to classifier negative set (mahbot-878)",
-                unrelated_dense.len(),
-            );
-            neg_sequences.extend_from_slice(unrelated_dense);
-        }
-
-        // ── Classifier training via finalize_enrollment ──
-        // Clone sequences for the blocking task.
-        let classifier_result = tokio::task::spawn_blocking({
-            let pos_seqs = pos_sequences.clone();
-            let neg_seqs = neg_sequences.clone();
-            move || finalize_enrollment(&pos_seqs, &neg_seqs)
-        })
-        .await
-        .unwrap_or_else(|e| Err(anyhow!("Classifier training task panicked: {e}")));
-
-        let weights = match classifier_result {
-            Ok(result) => {
-                // First model's weights for reporting (all are identical architecture)
-                let first_params = result
-                    .weights
-                    .first()
-                    .map_or(0, ClassifierWeights::param_count);
-                // enrolled_phrase and use_mahbot_confusables are already
-                // in scope from the confusable gating block above (mahbot-909).
-                info!(
-                    "Enrollment complete: wake word '{}' (ensemble of {} models, \
-                                 {} params each, {} epochs, best val loss={:.4})",
-                    enrolled_phrase,
-                    result.weights.len(),
-                    first_params,
-                    result.epochs_trained,
-                    result.best_val_loss,
-                );
-                result.weights
-            }
-            Err(e) => {
-                warn!("Enrollment finalization failed: {e}");
-                set_status(VoiceStatus::Error("Enrollment failed".to_string()));
-                return;
-            }
-        };
-
-        // ── Train verifier in spawn_blocking (CPU-bound MLP with ──────
-        // up to 2000 iterations — must not block the
-        // async runtime during enrollment finalization, mahbot-855).
-        //
-        // After mahbot-923, the verifier uses DENSE stride-8 embeddings
-        // (from enrollment_buffer, cloned above via pos_sequences) matching
-        // the same distribution as the classifier and inference.  The old
-        // streaming-specific path (mahbot-855) has been removed — both models
-        // now train on the same dense embedding distribution.
-        let pos_for_ver_seqs = enrollment_buffer; // moved — cloned above for classifier
-        let self_test_seqs = pos_for_ver_seqs.clone();
-        // Combine ambient negatives (per-chunk) with pre-computed confusable and
-        // unrelated speech dense embeddings for verifier training (mahbot-923).
-        let confusable_embs = confusable_dense_embeddings();
-        let unrelated_embs = unrelated_dense_embeddings();
-        let n_confusable_pre = if use_mahbot_confusables {
-            confusable_embs.len()
-        } else {
-            0
-        };
-        let n_unrelated_pre = unrelated_embs.len();
-        let n_ambient_pre = negative_sequences.len();
-        // Build negative sequences: ambient (per-chunk) → unrelated → confusable.
-        let neg_for_verifier_seqs = {
-            let mut neg: Vec<EmbeddingSequence> = Vec::new();
-            // Ambient first (per-chunk sequences, each weight 1.0)
-            if n_ambient_pre > 0 {
-                info!(
-                    "Adding {n_ambient_pre} dense ambient negative \
-                     sequences to verifier negative set (mahbot-923)",
-                );
-                neg.extend(negative_sequences); // moved — per-chunk EmbeddingSequences
-            }
-            if !unrelated_embs.is_empty() {
-                info!(
-                    "Adding {} pre-computed unrelated speech dense \
-                             sequences to verifier negative set (mahbot-923)",
-                    unrelated_embs.len(),
-                );
-                neg.extend_from_slice(unrelated_embs);
-            }
-            if use_mahbot_confusables && !confusable_embs.is_empty() {
-                info!(
-                    "Adding {} pre-computed confusable phrase dense \
-                             sequences to verifier negative set for Mahbot wake word \
-                             '{enrolled_phrase}' (mahbot-923)",
-                    confusable_embs.len(),
-                );
-                neg.extend_from_slice(confusable_embs);
-            }
-            neg
-        };
-        // Clone weights for the verifier training closure
-        // (they're also used later for the self-test classifier, mahbot-905).
-        let verifier_weights = weights.clone();
-        let verifier = tokio::task::spawn_blocking(move || {
-                    use crate::voice_verifier::{
-                        assert_weight_tier, mine_hard_negatives, CONFUSABLE_UPWEIGHT,
-                        DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA, LEARNING_RATE, MLP_MAX_ITER,
-                        UNRELATED_UPWEIGHT, VoiceVerifier,
-                    };
-                    use crate::wake_word_classifier::WakeWordClassifier;
-                    use crate::{
-                        MAX_NEGATIVE_WINDOWS_PER_SEQUENCE, VERIFIER_WINDOW_SIZE,
-                    };
-
-                    if pos_for_ver_seqs.is_empty() {
-                        warn!("Could not train verifier: no valid positive sequences");
-                        VoiceVerifier::untrained()
-                    } else if !neg_for_verifier_seqs.is_empty() {
-                        let n_neg = neg_for_verifier_seqs.len();
-                        let n_confusable = n_confusable_pre; // captured before spawn boundary
-                        let n_unrelated = n_unrelated_pre;   // captured before spawn boundary
-                        let n_ambient = n_ambient_pre;       // captured before spawn boundary
-                        let n_ambient_from_total = n_neg.saturating_sub(n_confusable + n_unrelated);
-                        debug_assert_eq!(n_ambient, n_ambient_from_total,
-                            "ambient sequence count mismatch: expected {n_ambient}, total neg sequences {n_neg} - confusable {n_confusable} - unrelated {n_unrelated} = {n_ambient_from_total}");
-
-                        // ── Determine negative sequences and weights ─────────────────
-                        // Hard-negative mining (mahbot-905): when enabled, attempt to select
-                        // ≤2 non-overlapping highest-scoring windows per source sequence using
-                        // the trained classifier.  If mining succeeds (≥ MIN_MINED_NEGATIVES_FALLBACK
-                        // windows), use uniform weights.  Otherwise, fall through to the original
-                        // all-windows approach with tiered per-sequence weights.
-                        let use_mining = crate::voice_verifier::use_hard_negative_mining();
-                        let (neg_to_use, per_neg_weights_opt) = 'decide: {
-                            if use_mining {
-                                let classifier = WakeWordClassifier::new_ensemble(
-                                    verifier_weights,
-                                );
-                                let mined = mine_hard_negatives(
-                                    &classifier,
-                                    &neg_for_verifier_seqs,
-                                    MAX_NEGATIVE_WINDOWS_PER_SEQUENCE, // max_per_sequence
-                                    VERIFIER_WINDOW_SIZE, // min_separation (non-overlapping)
-                                );
-                                if mined.sequences.len()
-                                    >= crate::voice_verifier::MIN_MINED_NEGATIVES_FALLBACK
-                                {
-                                    info!(
-                                        "Hard-negative mining (mahbot-905): selected {} windows \
-                                         from {}/{n_neg} source sequences for verifier training; \
-                                         using uniform weights (mining replaces tiered weights)",
-                                        mined.sequences.len(),
-                                        mined.source_sequences_represented,
-                                    );
-                                    break 'decide (mined.sequences, None);
-                                }
-                                warn!(
-                                    "Hard-negative mining produced only {} windows (< {}); \
-                                     falling back to all-windows training (mahbot-905)",
-                                    mined.sequences.len(),
-                                    crate::voice_verifier::MIN_MINED_NEGATIVES_FALLBACK,
-                                );
-                            }
-
-                            // ── Original all-windows path (mahbot-872) ─────────────────
-                            // Also reached by mining fallback.  Build per-sequence weights
-                            // with three tiers:
-                            //   ambient (silence/environment noise)  → 1.0×
-                            //   unrelated speech                     → UNRELATED_UPWEIGHT×
-                            //   confusable near-miss phrases         → CONFUSABLE_UPWEIGHT×
-                            let mut per_neg_weights: Vec<f32> = Vec::with_capacity(n_neg);
-                            per_neg_weights.extend(std::iter::repeat_n(1.0, n_ambient));
-                            per_neg_weights.extend(std::iter::repeat_n(
-                                UNRELATED_UPWEIGHT, n_unrelated));
-                            per_neg_weights.extend(std::iter::repeat_n(
-                                CONFUSABLE_UPWEIGHT, n_confusable));
-                            info!(
-                                "Building per-sequence weights: {n_ambient} ambient (1.0) + \
-                                 {n_unrelated} unrelated ({UNRELATED_UPWEIGHT}×) + \
-                                 {n_confusable} confusable ({CONFUSABLE_UPWEIGHT}×) for \
-                                 {n_neg} total negative sequences (mahbot-872)",
-                            );
-                            // Structural guard: verify weight ordering matches concatenation
-                            // order (ambient → unrelated → confusable).  Prevents silent
-                            // misalignment if either the concatenation or weight code is
-                            // refactored (mahbot-872 reviewer feedback).
-                            assert_weight_tier(&per_neg_weights, 0, n_ambient, 1.0, "ambient");
-                            assert_weight_tier(
-                                &per_neg_weights,
-                                n_ambient,
-                                n_unrelated,
-                                UNRELATED_UPWEIGHT,
-                                "unrelated",
-                            );
-                            assert_weight_tier(
-                                &per_neg_weights,
-                                n_ambient + n_unrelated,
-                                n_confusable,
-                                CONFUSABLE_UPWEIGHT,
-                                "confusable",
-                            );
-                            (neg_for_verifier_seqs, Some(per_neg_weights))
-                        };
-
-                        let v = VoiceVerifier::train(
-                            &pos_for_ver_seqs,
-                            &neg_to_use,
-                            per_neg_weights_opt.as_deref(),
-                            DEFAULT_VERIFIER_THRESHOLD,
-                            L2_LAMBDA,
-                            LEARNING_RATE,
-                            MLP_MAX_ITER,
-                            None, // rng_seed — production uses entropy-based RNG
-                        );
-                        info!(
-                            "Verifier trained from {} positive + {} \
-                             negative sequence(s) (ambient + unrelated + \
-                             confusable, mahbot-872)",
-                            pos_for_ver_seqs.len(),
-                            if per_neg_weights_opt.is_some() { n_neg } else { neg_to_use.len() },
-                        );
-                        v
-                    } else {
-                        let v = VoiceVerifier::train_with_synthetic_negatives(
-                            &pos_for_ver_seqs,
-                            DEFAULT_VERIFIER_THRESHOLD,
-                            None, // rng_seed — production uses entropy-based RNG
-                        );
-                        info!(
-                            "Verifier trained from {} positive \
-                             sequence(s) + synthetic negatives (no real or confusable \
-                             negatives available, mahbot-859)",
-                            pos_for_ver_seqs.len(),
-                        );
-                        v
-                    }
-                })
-                .await
-                .unwrap_or_else(|e| {
-                    warn!("Verifier training task panicked: {e}");
-                    crate::voice_verifier::VoiceVerifier::untrained()
-                });
-
-        // ── Blocking self-test (mahbot-898) ──
-        // The self-test replays the enrollment utterances through the newly
-        // trained classifier and requires at least
-        // ENROLLMENT_QUALITY_SELF_TEST_MIN_FRACTION of them to trigger
-        // detection.  If this fails, the model is NOT deployed — the
-        // enrollment is treated as failed and the user must re-enroll.
-        let classifier = WakeWordClassifier::new_ensemble(weights.clone());
-        if let Err(e) = run_enrollment_self_test(&self_test_seqs, &classifier) {
-            warn!("Enrollment self-test failed — model rejected: {e}.  Re-enrollment required.");
-            set_status(VoiceStatus::Error(format!(
-                "Enrollment validation failed: {e}.  Please try again with clearer speech."
-            )));
-            return;
-        }
-        info!("Enrollment self-test: passed — deploying model");
-
-        // ── Store classifier + verifier in global state ──
-        set_classifier_weights(weights);
-        set_verifier(verifier);
-
-        // ── Persist to config DB ──
-        persist_model_state().await;
-
-        // ── Clear enrollment accumulators ──
-        // After successful finalization, the live enrollment buffers and
-        // utterance counter are no longer needed.  Without this clearing,
-        // a subsequent Enroll click would see stale buffer entries (50+
-        // for 10 utterances with augmentation) and either resume into
-        // nonsensical UI counts or re-train with stale + new data
-        // (mahbot-878 fix).
-        {
-            let mut state = voice_state().write().unwrap_poison();
-            state.enrollment_buffer.clear();
-            state.enrolled_utterance_count = 0;
-        }
-
-        // Clear enrollment mode
-        set_status(VoiceStatus::Enrolled);
+        // All 10 utterances collected.  Signal that Phase 2 is complete and
+        // the pipeline should transition to Phase 3 (owner-negative collection)
+        // or proceed directly to finalization.
+        // The training block is deferred to `finalize_enrollment_pipeline()`
+        // which is called after Phase 3 completes or on timeout (mahbot-913).
+        voice_state().write().unwrap_poison().utterances_collected = true;
+        // Keep the current Enrolling status until transition_to_phase3 fires.
+        // The status will be updated to EnrollingNegatives by the main loop.
     } else {
         set_status(VoiceStatus::Enrolling {
             sample: utterance_count,
@@ -7356,6 +7605,95 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 3 owner-negative audio processing (mahbot-913)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Process incoming audio for Phase 3 owner-negative collection.
+///
+/// Duplicates the VAD frame iteration pattern from [`handle_enrollment_audio`]
+/// (~12 lines, tagged with `SHARED-VAD-LOOP-BEGIN`/`SHARED-VAD-LOOP-END`).
+/// A closure-based helper is not used because the borrow-checker overhead
+/// outweighs deduplication benefit for two consumers. If a third consumer
+/// emerges, extract into a shared helper.
+///
+/// Uses independent buffers (`phase3_audio_buf`, `phase3_silence_samples`)
+/// that are NOT shared with `negative_audio_buf` or `utterance_silence_samples`.
+/// Does NOT accumulate `frame_raw_audio` or `frame_vad` (dead code — only
+/// consumed by `segment_utterances_by_vad`).  Does NOT reset
+/// `enrollment_no_speech_frame_count` (no-speech warnings suppressed during
+/// Phase 3).
+///
+/// Uses [`SILENCE_THRESHOLD_SAMPLES`] for chunk boundary detection — same
+/// constant as utterance end in Phase 2 (see coupling doc at the constant).
+///
+/// Audio chunks are finalized into `voice_state().owner_negative_chunks` (not
+/// `PipelineCtx` — matches ambient negative pattern and survives mic resets).
+/// Memory cap is enforced: chunks that would exceed [`MAX_OWNER_NEGATIVE_SAMPLES`]
+/// are dropped.
+///
+/// Updates `negatives_speech_samples` counter with the VAD-positive frames
+/// detected this call.
+fn handle_negative_collection_audio(samples: &[f32], ctx: &mut PipelineCtx) {
+    // ── SHARED-VAD-LOOP-BEGIN: VAD frame iteration (duplicated from handle_enrollment_audio) ──
+    ctx.phase3_audio_buf.extend_from_slice(samples);
+    let len = ctx.phase3_audio_buf.len();
+    let mut consumed = 0;
+    // Track the start of the current speech segment within phase3_audio_buf.
+    // When silence is detected, we finalize the speech portion as a chunk.
+    let mut segment_start: usize = 0;
+    while consumed + FRAME_LENGTH <= len {
+        let frame = &ctx.phase3_audio_buf[consumed..consumed + FRAME_LENGTH];
+        let is_speech = is_speech_with_threshold(&frame[..HOP_LENGTH], ctx.vad_threshold);
+        // ── SHARED-VAD-LOOP-END ──
+
+        if is_speech {
+            // Accumulate VAD-positive speech samples for the target counter.
+            ctx.negatives_speech_samples += HOP_LENGTH;
+            // Reset silence counter on any VAD-positive frame.
+            ctx.phase3_silence_samples = 0;
+        } else {
+            ctx.phase3_silence_samples += HOP_LENGTH;
+            // Check for chunk boundary: when silence exceeds SILENCE_THRESHOLD_SAMPLES
+            // after sustained speech, finalize the current segment as a chunk.
+            if ctx.phase3_silence_samples >= SILENCE_THRESHOLD_SAMPLES {
+                let chunk_end = consumed.saturating_sub(ctx.phase3_silence_samples);
+                if chunk_end > segment_start {
+                    let chunk = ctx.phase3_audio_buf[segment_start..chunk_end].to_vec();
+                    let mut state = voice_state().write().unwrap_poison();
+                    // Memory cap: drop chunks that would exceed MAX_OWNER_NEGATIVE_SAMPLES.
+                    let total_samples: usize = state
+                        .owner_negative_chunks
+                        .iter()
+                        .map(std::vec::Vec::len)
+                        .sum();
+                    if total_samples + chunk.len() <= MAX_OWNER_NEGATIVE_SAMPLES {
+                        state.owner_negative_chunks.push(chunk);
+                    } else {
+                        warn!(
+                            "owner_negative_chunks at capacity ({} samples): dropping chunk \
+                             of {} samples (mahbot-913)",
+                            MAX_OWNER_NEGATIVE_SAMPLES,
+                            chunk.len(),
+                        );
+                    }
+                    drop(state);
+                }
+                // Advance segment_start past the silence boundary so the next
+                // segment starts after this silence region.
+                segment_start = consumed;
+            }
+        }
+
+        consumed += HOP_LENGTH;
+    }
+    // Drain fully processed frames (everything before segment_start) from the
+    // audio buffer, preserving any partial trailing speech segment or silence.
+    if segment_start > 0 {
+        ctx.phase3_audio_buf.drain(..segment_start);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8389,6 +8727,11 @@ mod tests {
         ctx.vad_positives_in_a_row = 5;
         ctx.enrollment_pending.push_back(vec![0.5; 50]);
         ctx.noise_rms_estimate = Some(0.1);
+        ctx.collecting_negatives = true;
+        ctx.phase3_audio_buf = vec![0.5; 100];
+        ctx.phase3_silence_samples = 500;
+        ctx.negatives_speech_samples = 1000;
+        ctx.phase3_start_time = Some(Instant::now() - Duration::from_secs(10));
         ctx.vad_threshold = 0.75;
         ctx.last_wake_word_detection = Some(Instant::now() - Duration::from_secs(5));
         ctx.auto_start_pending = true;
@@ -8429,6 +8772,28 @@ mod tests {
         assert_eq!(
             ctx.segment_silence_hops, 0,
             "segment_silence_hops must be cleared by all reset levels"
+        );
+
+        // Phase 3 owner-negative state (mahbot-913).
+        assert!(
+            !ctx.collecting_negatives,
+            "collecting_negatives must be false after reset"
+        );
+        assert!(
+            ctx.phase3_audio_buf.is_empty(),
+            "phase3_audio_buf must be cleared by all reset levels"
+        );
+        assert_eq!(
+            ctx.phase3_silence_samples, 0,
+            "phase3_silence_samples must be cleared by all reset levels"
+        );
+        assert_eq!(
+            ctx.negatives_speech_samples, 0,
+            "negatives_speech_samples must be cleared by all reset levels"
+        );
+        assert!(
+            ctx.phase3_start_time.is_none(),
+            "phase3_start_time must be None after reset"
         );
     }
 
@@ -9468,7 +9833,9 @@ mod tests {
             verifier: crate::voice_verifier::VoiceVerifier::untrained(),
             enrollment_buffer: Vec::new(),
             negative_audio_chunks: Vec::new(),
+            owner_negative_chunks: Vec::new(),
             enrolled_utterance_count: 0,
+            utterances_collected: false,
             model_phrase: None,
             enrolling_phrase: None,
             cmd_tx: None,

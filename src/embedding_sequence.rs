@@ -31,6 +31,10 @@ pub enum Source {
     Synthetic,
     /// Ambient noise / non-speech environmental audio chunk.
     Ambient,
+    /// Owner-general speech collected during Phase 3 enrollment (non-wake-word
+    /// speech from the user, used as additional negative examples for the
+    /// verifier).
+    Owner,
 }
 
 /// Augmentation family for [`Source::Augmentation`].

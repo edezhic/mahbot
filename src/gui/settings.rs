@@ -2239,6 +2239,20 @@ impl SettingsState {
             crate::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. } => {
                 Text::new("Keep silent to confirm…").into()
             }
+            crate::voice::VoiceStatus::EnrollingNegatives {
+                accumulated_secs,
+                target_secs,
+                wall_clock_elapsed,
+            } => {
+                let pct = (accumulated_secs * 100)
+                    .checked_div(target_secs)
+                    .unwrap_or(0);
+                Text::new(format!(
+                    "Collecting negative samples… {accumulated_secs}s/{target_secs}s \
+                     ({pct}%) elapsed {wall_clock_elapsed}s"
+                ))
+                .into()
+            }
             crate::voice::VoiceStatus::Enrolled => Text::new("Enrolled").into(),
             crate::voice::VoiceStatus::Error(msg) => Text::new(msg).into(),
         };
@@ -2247,7 +2261,8 @@ impl SettingsState {
         let enrollment_ui: Option<Element<'_, SettingsMessage>> = match status {
             crate::voice::VoiceStatus::Enrolling { .. }
             | crate::voice::VoiceStatus::ListeningDuringEnrollment { .. }
-            | crate::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. } => {
+            | crate::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
+            | crate::voice::VoiceStatus::EnrollingNegatives { .. } => {
                 let cancel_btn: Element<'_, SettingsMessage> = container(
                     button(Text::new("Cancel").size(13))
                         .on_press(SettingsMessage::CancelVoiceEnrollment)
@@ -2306,6 +2321,7 @@ impl SettingsState {
             crate::voice::VoiceStatus::Enrolling { .. }
                 | crate::voice::VoiceStatus::ListeningDuringEnrollment { .. }
                 | crate::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
+                | crate::voice::VoiceStatus::EnrollingNegatives { .. }
         );
         let phrase_input = if voice_enabled && !is_enrolling {
             let input = text_input("mahbot", &self.wake_word_phrase_input)

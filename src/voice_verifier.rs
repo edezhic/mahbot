@@ -216,6 +216,17 @@ pub(crate) const CONFUSABLE_UPWEIGHT: f32 = 15.0;
 /// confusable phrases as the primary negative signal.
 pub(crate) const UNRELATED_UPWEIGHT: f32 = 10.0;
 
+/// How much to upweight owner-negative speech examples during verifier training
+/// (Phase 3 enrollment).
+///
+/// Owner-negative audio is the user's own general speech (non-wake-word phrases)
+/// collected after the 10 enrollment utterances.  These are the most realistic
+/// false-trigger examples since they come from the same speaker, same mic, same
+/// room as the positive class.  3.0× gives them meaningful weight (~3× ambient)
+/// while keeping them below unrelated speech (10×) and confusable near-misses
+/// (15×), reflecting the tier: ambient → owner-negative → unrelated → confusable.
+pub(crate) const OWNER_NEGATIVE_UPWEIGHT: f32 = 3.0;
+
 /// Embedding dimensionality (used by both verifier and voice pipeline).
 /// Minimum number of classifier embeddings required before the verifier gate
 /// is evaluated (mahbot-887).

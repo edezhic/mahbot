@@ -2251,6 +2251,13 @@ impl Dashboard {
             VoiceStatus::WaitingForSilenceDuringEnrollment { sample, total } => {
                 format!("🔊 Wait… {sample}/{total}")
             }
+            VoiceStatus::EnrollingNegatives {
+                accumulated_secs,
+                target_secs,
+                ..
+            } => {
+                format!("🔊 Collecting negatives {accumulated_secs}s/{target_secs}s")
+            }
             VoiceStatus::Enrolled => "🔊 ✅ Enrolled".into(),
             VoiceStatus::Error(msg) => format!("🔊 Error: {msg}"),
         };
