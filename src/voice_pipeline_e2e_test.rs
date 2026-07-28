@@ -72,6 +72,26 @@ use std::time::Instant;
 /// vs the old mixed old-style + streaming distribution): 2.13 = 1.35 * 1.58.
 const MIN_CLASSIFIER_THRESHOLD: f32 = 2.13;
 
+/// Number of samples to prepend for verifier warm-up (mahbot-922).
+///
+/// ~512ms of noise at 16 kHz, consumed by the verifier warm-up period
+/// (4 embeddings, see [`VERIFIER_WARMUP_EMBEDDINGS`](crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS))
+/// so the actual test utterance arrives with a fully active verifier — matching
+/// production behaviour where the warm-up is consumed during background
+/// silence/noise before anyone speaks.
+///
+/// ## Derivation
+///
+/// Each embedding spans N mel frames, which in turn span N × stride frames of
+/// audio.  Benchmark-empirical calibration shows the first — `VERIFIER_WARMUP_EMBEDDINGS`
+/// embeddings occupy ~512 ms of audio.  If the verifier window size changes in
+/// `voice_verifier.rs`, this constant should be updated proportionally to the
+/// warm-up embedding count × ~128 ms/embedding.
+const WARMUP_PREPEND_SAMPLES: usize = 8192; // 512ms × 16 kHz
+
+/// Cached warm-up noise signal, generated once on first access (mahbot-922).
+static WARMUP_NOISE_CACHE: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+
 /// Default wake word for the test.
 const WAKE_WORD: &str = "hey mahbot";
 
@@ -623,6 +643,133 @@ fn generate_mixed_speech_noise() -> Vec<f32> {
     samples
 }
 
+/// Returns ~512ms of speech-like noise that triggers Earshot VAD to produce
+/// ≥ [`VERIFIER_WARMUP_EMBEDDINGS`](crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS)
+/// embeddings while producing near-zero wake-word classifier scores (mahbot-922).
+///
+/// ## Invariants (must not break)
+///
+/// 1. **VAD triggering**: must produce ≥ 4 embeddings in ~512 ms (the verifier
+///    warm-up period).  Achieved by pink noise (1/f, 0.20 amplitude) for
+///    speech-like spectral shape + 200 Hz tone (0.10 amplitude) for a
+///    fundamental-frequency peak in the lowest mel bands.  Combined RMS ~0.18.
+/// 2. **No false detection**: classifier scores must be near-zero (pink noise +
+///    200 Hz tone does not resemble the "hey mahbot" wake word embedding).
+/// 3. **Deterministic**: RNG seed 922 (= ticket number).
+/// 4. **Cached**: generated once into [`WARMUP_NOISE_CACHE`].
+///
+/// The AGC gain settles below 1.0 (attenuation) because RMS exceeds the AGC
+/// target (0.05).  This is fine — the VAD operates on normalised mel features,
+/// where spectral shape (not level) determines the output.
+fn generate_warmup_noise() -> &'static [f32] {
+    WARMUP_NOISE_CACHE.get_or_init(|| {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(922);
+
+        // Pink noise normalised to unit RMS at ~0.20 amplitude (≈ -14 dB).
+        let pink = crate::util::generate_pink_noise(WARMUP_PREPEND_SAMPLES, &mut rng);
+        let pink_gain = 0.20;
+
+        // 200 Hz tonal component at ~0.10 amplitude (≈ -20 dB).
+        let mut samples = Vec::with_capacity(WARMUP_PREPEND_SAMPLES);
+        for (i, &p) in pink.iter().enumerate() {
+            let t = i as f32 / TARGET_SAMPLE_RATE as f32;
+            let tone = (2.0 * core::f32::consts::PI * 200.0 * t).sin() * 0.10;
+            samples.push(p * pink_gain + tone);
+        }
+
+        samples
+    })
+}
+
+/// Process a single frame of audio through the pipeline (AGC →
+/// [`super::handle_wake_word_detection`]), matching the per-frame processing in
+/// [`run_streaming_detection`].
+///
+/// If `samples` is shorter than [`FRAME_LENGTH`](super::FRAME_LENGTH), it is
+/// zero-padded to match the production pipeline's behaviour when the mic
+/// delivers a partial final frame.
+///
+/// Extracted as a shared helper to eliminate the structural near-duplicate
+/// between `feed_audio` and `run_streaming_detection` (mahbot-922, reviewer
+/// feedback).
+fn process_frame(samples: &[f32], ctx: &mut super::PipelineCtx) {
+    let chunk_size = super::FRAME_LENGTH;
+    let padded = if samples.len() < chunk_size {
+        let mut p = samples.to_vec();
+        p.resize(chunk_size, 0.0);
+        p
+    } else {
+        samples.to_vec()
+    };
+    let processed = ctx.audio_preprocessor.process(padded);
+    super::handle_wake_word_detection(&processed, ctx);
+}
+
+/// Feed audio through the production pipeline (AGC → [`super::handle_wake_word_detection`])
+/// in [`FRAME_LENGTH`](super::FRAME_LENGTH) chunks, then send silence frames to flush any
+/// remaining voice batch — matching the processing pattern in [`run_streaming_detection`].
+///
+/// This is used to pre-warm the pipeline (verifier, AGC) before the actual test utterance,
+/// without contaminating latency measurements (mahbot-922).
+fn feed_audio(samples: &[f32], ctx: &mut super::PipelineCtx) {
+    for chunk in samples.chunks(super::FRAME_LENGTH) {
+        process_frame(chunk, ctx);
+    }
+    // Feed silence frames to flush any remaining voice batch (matches the
+    // post-audio flush in run_streaming_detection).
+    for _ in 0..3 {
+        process_frame(&[], ctx);
+    }
+}
+
+/// Consume the verifier warm-up period by feeding [`generate_warmup_noise`] through
+/// [`feed_audio`].  After this call the verifier is active and the latency timer in
+/// [`run_streaming_detection`] reflects only the test utterance (mahbot-922).
+///
+/// ## Diagnostics
+///
+/// - If VAD didn't trigger (fewer than [`VERIFIER_WARMUP_EMBEDDINGS`] embeddings
+///   produced), a `warn!()` is emitted so maintainers know the warm-up wasn't
+///   fully consumed.  Detection on very short utterances (<1 s) may be impacted.
+/// - If the warm-up noise triggered a false detection (extremely unlikely), a
+///   `warn!()` is emitted and the detection state is restored to prevent cooldown
+///   from corrupting subsequent benchmark measurements.
+fn consume_warmup(ctx: &mut super::PipelineCtx) {
+    let before_embeddings = ctx.embedding_ring.len();
+    let before_detection = ctx.last_wake_word_detection;
+    let noise = generate_warmup_noise();
+    feed_audio(noise, ctx);
+
+    // Diagnostic: validate that the warm-up noise produced enough embeddings
+    // to consume the verifier warm-up period (mahbot-922, reviewer feedback).
+    let produced = ctx.embedding_ring.len().saturating_sub(before_embeddings);
+    if produced < crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS {
+        warn!(
+            "Warm-up noise produced only {} embedding(s) (need >= {} for full \
+             verifier warm-up).  If VAD is not triggering, consider increasing \
+             the pink noise amplitude or adding more tonal components.  Detection \
+             on very short utterances (<1s) may be disadvantaged.",
+            produced,
+            crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS,
+        );
+    }
+
+    // Guard: warm-up noise should not trigger a false detection.  If it does,
+    // restore the pre-warm-up state so cooldown doesn't suppress all subsequent
+    // benchmark measurements (reviewer feedback, mahbot-922).  We must also
+    // reset `is_recording` because detection sets it to `true`, which would
+    // suppress stride-8 scoring for the entire benchmark variant.
+    if ctx.last_wake_word_detection != before_detection {
+        warn!(
+            "Warm-up noise triggered a false detection — restoring detection \
+             state to prevent cooldown corruption.  Consider reducing the noise \
+             amplitude or adjusting the tonal component.",
+        );
+        ctx.last_wake_word_detection = before_detection;
+        ctx.is_recording = false;
+    }
+}
+
 // ── Prerequisite check ─────────────────────────────────────────────────────
 
 /// Ensure voice ONNX models are loaded.  Returns an error if the model
@@ -921,7 +1068,6 @@ struct DetectionResult {
 /// Returns a [`DetectionResult`] with a flag and optional latency measurement.
 fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> DetectionResult {
     let feed_start = Instant::now();
-    let chunk_size = super::FRAME_LENGTH;
     // Save pre-existing timestamp — we only return true if detection fires
     // during THIS call, not because a prior call already set the field.
     let before = ctx.last_wake_word_detection;
@@ -931,16 +1077,8 @@ fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> Det
     // pipeline (mahbot-856).  Without AGC, quiet variants like
     // M3.json_aug4_volume (-6dB reduction) are too faint for VAD to trigger,
     // producing false 0.00 detection scores.
-    for chunk in samples.chunks(chunk_size) {
-        let padded = if chunk.len() < chunk_size {
-            let mut p: Vec<f32> = chunk.to_vec();
-            p.resize(chunk_size, 0.0);
-            p
-        } else {
-            chunk.to_vec()
-        };
-        let processed = ctx.audio_preprocessor.process(padded);
-        super::handle_wake_word_detection(&processed, ctx);
+    for chunk in samples.chunks(super::FRAME_LENGTH) {
+        process_frame(chunk, ctx);
         if ctx.last_wake_word_detection != before {
             let latency = feed_start.elapsed().as_secs_f64() * 1000.0;
             return DetectionResult {
@@ -962,9 +1100,7 @@ fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> Det
                 latency_ms: Some(latency),
             };
         }
-        let silence = vec![0.0f32; chunk_size];
-        let processed = ctx.audio_preprocessor.process(silence);
-        super::handle_wake_word_detection(&processed, ctx);
+        process_frame(&[], ctx);
     }
 
     DetectionResult {
@@ -988,6 +1124,9 @@ struct PerVariantResult {
     /// (0.0 if verifier is untrained or no embeddings passed the threshold).
     verifier_score: f32,
     /// Number of embeddings produced during streaming detection (mahbot-886).
+    /// This is the length of the verifier's embedding ring buffer after
+    /// processing, which directly reflects how many mel frames passed through
+    /// the embedding model (mahbot-922).
     n_embeddings: usize,
     /// Number of frames where total_score < NO_MATCH_RESET_THRESHOLD (0.20).
     n_frames_below_reset: usize,
@@ -1095,6 +1234,9 @@ fn test_detection_samples(
         if let Some(ref mut state) = adaptive_state {
             ctx.adaptive_threshold = state.clone();
         }
+        // Consume verifier warm-up before the test utterance so the latency
+        // timer measures only the wake word (mahbot-922, reviewer feedback).
+        consume_warmup(&mut ctx);
         let result = run_streaming_detection(samples, &mut ctx);
         // Propagate the updated adaptive state for the next variant.
         if let Some(ref mut state) = adaptive_state {
@@ -1114,7 +1256,7 @@ fn test_detection_samples(
             detected: result.detected,
             peak_score: peak,
             verifier_score: ctx.instrumentation.peak_verifier_score,
-            n_embeddings: ctx.instrumentation.per_frame_scores.len(),
+            n_embeddings: ctx.embedding_ring.len(),
             n_frames_below_reset: ctx.instrumentation.n_frames_below_reset,
             agc_converged: ctx.audio_preprocessor.agc_converged(),
             vad_speech_frames: ctx.instrumentation.vad_speech_frames,
@@ -1203,6 +1345,7 @@ fn run_mid_utterance_test(
         let mut spliced = conf_pcm.clone();
         spliced.extend_from_slice(wake_pcm);
         let mut ctx = super::PipelineCtx::new();
+        consume_warmup(&mut ctx);
         let result = run_streaming_detection(&spliced, &mut ctx);
         let detected = result.detected;
         info!("Mid-utterance 'immediate_transition': detected={detected}");
@@ -1217,6 +1360,7 @@ fn run_mid_utterance_test(
         spliced.extend_from_slice(&gap_silence(0.05));
         spliced.extend_from_slice(wake_pcm);
         let mut ctx = super::PipelineCtx::new();
+        consume_warmup(&mut ctx);
         let result = run_streaming_detection(&spliced, &mut ctx);
         let detected = result.detected;
         info!("Mid-utterance 'brief_gap_50ms': detected={detected}");
@@ -1231,6 +1375,7 @@ fn run_mid_utterance_test(
         spliced.extend_from_slice(&gap_silence(0.05));
         spliced.extend_from_slice(wake_pcm);
         let mut ctx = super::PipelineCtx::new();
+        consume_warmup(&mut ctx);
         let result = run_streaming_detection(&spliced, &mut ctx);
         let detected = result.detected;
         info!("Mid-utterance 'long_prelude_6s': detected={detected}");
@@ -1247,6 +1392,7 @@ fn run_mid_utterance_test(
         spliced.extend_from_slice(&gap_silence(0.05));
         spliced.extend_from_slice(wake_pcm);
         let mut ctx = super::PipelineCtx::new();
+        consume_warmup(&mut ctx);
         let result = run_streaming_detection(&spliced, &mut ctx);
         let detected = result.detected;
         info!("Mid-utterance 'confusable_prelude': detected={detected}");
@@ -1337,6 +1483,9 @@ fn run_noise_overlap_test(
                 ctx.adaptive_threshold = shared_adaptive.clone();
                 // adaptive_k is already set by PipelineCtx::new() from config.
 
+                // Consume verifier warm-up so the latency timer starts at the
+                // noise-overlapped utterance (mahbot-922).
+                consume_warmup(&mut ctx);
                 let result = run_streaming_detection(&mixed_pcm, &mut ctx);
 
                 // Persist the updated adaptive state for the next variant.
@@ -1354,7 +1503,7 @@ fn run_noise_overlap_test(
                     detected: result.detected,
                     peak_score: peak,
                     verifier_score: ctx.instrumentation.peak_verifier_score,
-                    n_embeddings: ctx.instrumentation.per_frame_scores.len(),
+                    n_embeddings: ctx.embedding_ring.len(),
                     n_frames_below_reset: ctx.instrumentation.n_frames_below_reset,
                     agc_converged: ctx.audio_preprocessor.agc_converged(),
                     vad_speech_frames: ctx.instrumentation.vad_speech_frames,
@@ -2307,6 +2456,14 @@ pub(crate) fn run_internal() {
 
         // ── Phase 13: Cooldown verification ──────────────────────────────
         // The ~3.1s sleep is EXCLUDED from the timing measurement.
+        //
+        // Only Detection 1 receives warm-up prepend (mahbot-922): Detection 2
+        // reuses the same ctx with cooldown active (processing hits the cooldown
+        // gate and calls reset_detection_segment(), which clears the embedding
+        // ring).  After cooldown expiry, Detection 3 starts with an empty ring
+        // and survives warm-up naturally because the wake word utterance is well
+        // over 512ms long — the first ~512ms is consumed by the built-in warm-up
+        // suppression, and the remaining audio is long enough to fire detection.
         info!("─── {}. Cooldown verification ───", P_COOLDOWN + 1);
         let mut cooldown_detection_time_ms = 0.0f64;
         if let Some((first_pos, _label)) = pos_test_variants.first() {
@@ -2315,7 +2472,9 @@ pub(crate) fn run_internal() {
             // so the adaptive code path is active during cooldown testing too.
             ctx.adaptive_threshold = shared_adaptive.clone();
 
-            // Detection 1: should fire
+            // Detection 1: should fire (consume warm-up first so the verifier
+            // is active and latency measures only the wake word — mahbot-922).
+            consume_warmup(&mut ctx);
             let t0 = Instant::now();
             let detected = run_streaming_detection(first_pos, &mut ctx);
             cooldown_detection_time_ms += t0.elapsed().as_secs_f64() * 1000.0;
@@ -2875,6 +3034,50 @@ pub(crate) fn run_internal() {
     } else {
         info!("═══ E2E Voice Pipeline benchmark completed — see report above for failures ═══");
     }
+}
+
+// ── Standalone warm-up validation test (mahbot-922) ──────────────────────
+
+/// Validate that [`generate_warmup_noise`] produces enough embeddings to consume
+/// the verifier warm-up period without triggering a false detection.
+///
+/// This is a standalone unit test (runs as part of `cargo test --features voice-tests`).
+/// It requires voice model files to be present in the cache (from a prior app launch
+/// or benchmark run that downloaded the models).
+#[test]
+fn warmup_noise_produces_embeddings() {
+    // Ensure the global voice state is initialized before calling into the
+    // detection pipeline, which reads classifier/verifier state from
+    // `voice_state()` (mahbot-922, reviewer feedback).
+    let _ = super::init_global();
+
+    // Skip if voice model files aren't available (requires a prior app launch
+    // or benchmark run that cached the models).
+    if !super::models_ready() {
+        if let Err(e) = ensure_voice_models_loaded() {
+            eprintln!("Skipping warmup_noise_produces_embeddings: {e}");
+            eprintln!("Run the app or E2E benchmark first to cache voice models.");
+            return;
+        }
+    }
+
+    let mut ctx = super::PipelineCtx::new();
+    consume_warmup(&mut ctx);
+
+    assert!(
+        ctx.embedding_ring.len() >= crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS,
+        "Warm-up noise should produce at least {} embeddings to consume the \
+         verifier warm-up period, but only produced {}",
+        crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS,
+        ctx.embedding_ring.len(),
+    );
+
+    assert!(
+        ctx.last_wake_word_detection.is_none(),
+        "Warm-up noise triggered a false detection (last_wake_word_detection = {:?}) — \
+         the noise signal should not resemble the wake word",
+        ctx.last_wake_word_detection,
+    );
 }
 
 // ── Non-cached generation helpers (fallback when cache unavailable) ──────
