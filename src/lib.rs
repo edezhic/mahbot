@@ -981,23 +981,14 @@ pub(crate) const DEFAULT_MAX_TOKENS: u32 = 32_000;
 
 // ── Voice pipeline shared constants ─────────────────────────────────────────
 // These live in lib.rs (not voice_verifier.rs) to avoid a circular module
-// dependency: wake_word_classifier.rs needs EMBEDDING_DIM, and voice_verifier.rs
-// (post-mahbot-905) imports WakeWordClassifier.  Placing them here keeps the
-// dependency graph acyclic.  (mahbot-905 reviewer feedback)
+// dependency: wake_word_classifier.rs needs EMBEDDING_DIM.  Placing them here
+// keeps the dependency graph acyclic.
 
 /// Dimensionality of the per-frame embedding vectors (96-dim).
 pub(crate) const EMBEDDING_DIM: usize = 96;
 
 /// Number of consecutive frames in a verifier window (matching classifier).
 pub(crate) const VERIFIER_WINDOW_SIZE: usize = 3;
-
-/// Maximum number of non-overlapping windows to select per source sequence
-/// during hard-negative mining (mahbot-905).
-///
-/// At most 2 windows are selected per utterance — high enough to capture
-/// multiple near-miss articulations, low enough to avoid diluting the
-/// verifier gradient with duplicate signal from the same utterance.
-pub(crate) const MAX_NEGATIVE_WINDOWS_PER_SEQUENCE: usize = 2;
 
 /// Input dimension for the verifier: 3 × 96 = 288.
 pub(crate) const VERIFIER_INPUT_DIM: usize = EMBEDDING_DIM * VERIFIER_WINDOW_SIZE;

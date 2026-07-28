@@ -5579,17 +5579,11 @@ async fn finalize_enrollment_pipeline() -> bool {
         neg
     };
 
-    // Clone weights for the verifier training closure.
-    let verifier_weights = weights.clone();
     let verifier = tokio::task::spawn_blocking(move || {
         use crate::voice_verifier::{
-            assert_weight_tier, mine_hard_negatives, CONFUSABLE_UPWEIGHT,
+            assert_weight_tier, CONFUSABLE_UPWEIGHT,
             DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA,
             UNRELATED_UPWEIGHT, VoiceVerifier,
-        };
-        use crate::wake_word_classifier::WakeWordClassifier;
-        use crate::{
-            MAX_NEGATIVE_WINDOWS_PER_SEQUENCE, VERIFIER_WINDOW_SIZE,
         };
 
         if pos_for_ver_seqs.is_empty() {
@@ -5605,89 +5599,57 @@ async fn finalize_enrollment_pipeline() -> bool {
             debug_assert_eq!(n_ambient, n_ambient_from_total,
                 "ambient sequence count mismatch: expected {n_ambient}, total neg sequences {n_neg} - owner {n_owner} - confusable {n_confusable} - unrelated {n_unrelated} = {n_ambient_from_total}");
 
-            let use_mining = crate::voice_verifier::use_hard_negative_mining();
-            let (neg_to_use, per_neg_weights_opt) = 'decide: {
-                if use_mining {
-                    let classifier = WakeWordClassifier::new(verifier_weights.clone());
-                    let mined = mine_hard_negatives(
-                        &classifier,
-                        &neg_for_verifier_seqs,
-                        MAX_NEGATIVE_WINDOWS_PER_SEQUENCE,
-                        VERIFIER_WINDOW_SIZE,
-                    );
-                    if mined.sequences.len()
-                        >= crate::voice_verifier::MIN_MINED_NEGATIVES_FALLBACK
-                    {
-                        info!(
-                            "Hard-negative mining (mahbot-905): selected {} windows \
-                             from {}/{n_neg} source sequences for verifier training; \
-                             using uniform weights (mining replaces tiered weights)",
-                            mined.sequences.len(),
-                            mined.source_sequences_represented,
-                        );
-                        break 'decide (mined.sequences, None);
-                    }
-                    warn!(
-                        "Hard-negative mining produced only {} windows (< {}); \
-                         falling back to all-windows training (mahbot-905)",
-                        mined.sequences.len(),
-                        crate::voice_verifier::MIN_MINED_NEGATIVES_FALLBACK,
-                    );
-                }
-
-                // ── 4-tier weight construction (mahbot-913) ──
-                // Order: ambient (1.0×) → owner-negative (OWNER_NEGATIVE_UPWEIGHT×)
-                //        → unrelated (UNRELATED_UPWEIGHT×) → confusable (CONFUSABLE_UPWEIGHT×)
-                let mut per_neg_weights: Vec<f32> = Vec::with_capacity(n_neg);
-                per_neg_weights.extend(std::iter::repeat_n(1.0, n_ambient));
-                if n_owner > 0 {
-                    per_neg_weights.extend(std::iter::repeat_n(
-                        OWNER_NEGATIVE_UPWEIGHT, n_owner));
-                }
+            // ── 4-tier weight construction (mahbot-913) ──
+            // Order: ambient (1.0×) → owner-negative (OWNER_NEGATIVE_UPWEIGHT×)
+            //        → unrelated (UNRELATED_UPWEIGHT×) → confusable (CONFUSABLE_UPWEIGHT×)
+            let mut per_neg_weights: Vec<f32> = Vec::with_capacity(n_neg);
+            per_neg_weights.extend(std::iter::repeat_n(1.0, n_ambient));
+            if n_owner > 0 {
                 per_neg_weights.extend(std::iter::repeat_n(
-                    UNRELATED_UPWEIGHT, n_unrelated));
-                per_neg_weights.extend(std::iter::repeat_n(
-                    CONFUSABLE_UPWEIGHT, n_confusable));
-                info!(
-                    "Building per-sequence weights: {n_ambient} ambient (1.0) + \
-                     {n_owner} owner-negative ({OWNER_NEGATIVE_UPWEIGHT}×) + \
-                     {n_unrelated} unrelated ({UNRELATED_UPWEIGHT}×) + \
-                     {n_confusable} confusable ({CONFUSABLE_UPWEIGHT}×) for \
-                     {n_neg} total negative sequences (mahbot-913)",
-                );
-                // Structural guard: verify weight ordering matches concatenation
-                // order (ambient → owner-negative → unrelated → confusable).
-                assert_weight_tier(&per_neg_weights, 0, n_ambient, 1.0, "ambient");
-                if n_owner > 0 {
-                    assert_weight_tier(
-                        &per_neg_weights,
-                        n_ambient,
-                        n_owner,
-                        OWNER_NEGATIVE_UPWEIGHT,
-                        "owner-negative",
-                    );
-                }
+                    OWNER_NEGATIVE_UPWEIGHT, n_owner));
+            }
+            per_neg_weights.extend(std::iter::repeat_n(
+                UNRELATED_UPWEIGHT, n_unrelated));
+            per_neg_weights.extend(std::iter::repeat_n(
+                CONFUSABLE_UPWEIGHT, n_confusable));
+            info!(
+                "Building per-sequence weights: {n_ambient} ambient (1.0) + \
+                 {n_owner} owner-negative ({OWNER_NEGATIVE_UPWEIGHT}×) + \
+                 {n_unrelated} unrelated ({UNRELATED_UPWEIGHT}×) + \
+                 {n_confusable} confusable ({CONFUSABLE_UPWEIGHT}×) for \
+                 {n_neg} total negative sequences (mahbot-913)",
+            );
+            // Structural guard: verify weight ordering matches concatenation
+            // order (ambient → owner-negative → unrelated → confusable).
+            assert_weight_tier(&per_neg_weights, 0, n_ambient, 1.0, "ambient");
+            if n_owner > 0 {
                 assert_weight_tier(
                     &per_neg_weights,
-                    n_ambient + n_owner,
-                    n_unrelated,
-                    UNRELATED_UPWEIGHT,
-                    "unrelated",
+                    n_ambient,
+                    n_owner,
+                    OWNER_NEGATIVE_UPWEIGHT,
+                    "owner-negative",
                 );
-                assert_weight_tier(
-                    &per_neg_weights,
-                    n_ambient + n_owner + n_unrelated,
-                    n_confusable,
-                    CONFUSABLE_UPWEIGHT,
-                    "confusable",
-                );
-                (neg_for_verifier_seqs, Some(per_neg_weights))
-            };
+            }
+            assert_weight_tier(
+                &per_neg_weights,
+                n_ambient + n_owner,
+                n_unrelated,
+                UNRELATED_UPWEIGHT,
+                "unrelated",
+            );
+            assert_weight_tier(
+                &per_neg_weights,
+                n_ambient + n_owner + n_unrelated,
+                n_confusable,
+                CONFUSABLE_UPWEIGHT,
+                "confusable",
+            );
 
             let v = VoiceVerifier::train(
                 &pos_for_ver_seqs,
-                &neg_to_use,
-                per_neg_weights_opt.as_deref(),
+                &neg_for_verifier_seqs,
+                Some(&per_neg_weights),
                 DEFAULT_VERIFIER_THRESHOLD,
                 L2_LAMBDA,
                 None,
@@ -5697,7 +5659,7 @@ async fn finalize_enrollment_pipeline() -> bool {
                  negative sequence(s) (ambient + owner-negative + unrelated + \
                  confusable, mahbot-913)",
                 pos_for_ver_seqs.len(),
-                if per_neg_weights_opt.is_some() { n_neg } else { neg_to_use.len() },
+                n_neg,
             );
             v
         } else {
