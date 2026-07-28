@@ -2628,4 +2628,85 @@ mod tests {
             "Source sequence should be represented",
         );
     }
+
+    #[test]
+    fn test_backward_compat_mlp_era_detection() {
+        // Verify the heuristic that detects MLP-era persisted models
+        // (mahbot-861 through mahbot-900).  Old models stored weights
+        // as 3-layer MLP matrices (w1/b1/w2/b2/w3/b3) and a
+        // `verifier_version` field.  These fields were removed in the
+        // logistic-regression refactoring (mahbot-901+).  Old models
+        // deserialize with `trained: true` but empty `weights` (the
+        // serde default) and `bias: 0.0`, causing `is_trained()` to
+        // return false and the verifier to silently accept all frames.
+        //
+        // The heuristic `v.trained && v.weights.is_empty() && v.bias == 0.0`
+        // is used in the config loading code (voice.rs) to detect this
+        // case and warn the user that re-enrollment is required.
+        let legacy_model = VoiceVerifier {
+            trained: true,
+            weights: Vec::new(),
+            bias: 0.0,
+            ..Default::default()
+        };
+
+        // Heuristic must fire: trained=true + empty weights + bias=0.0
+        assert!(
+            legacy_model.trained && legacy_model.weights.is_empty() && legacy_model.bias == 0.0,
+            "Heuristic must detect MLP-era model: trained={}, weights_empty={}, bias={}",
+            legacy_model.trained,
+            legacy_model.weights.is_empty(),
+            legacy_model.bias,
+        );
+
+        // The model must NOT be considered trained (empty weights).
+        assert!(
+            !legacy_model.is_trained(),
+            "MLP-era model must not report as trained (empty weights)"
+        );
+
+        // predict() on an MLP-era model should return 1.0 (no-op fallback)
+        // since is_trained() returns false.
+        let score = legacy_model.predict(&vec![0.5; VERIFIER_INPUT_DIM]);
+        assert!(
+            (score - 1.0).abs() < f32::EPSILON,
+            "MLP-era model must return 1.0 from predict() (untrained fallback), got {score}",
+        );
+
+        // A legitimately untrained model should NOT trigger the heuristic.
+        let untrained_model = VoiceVerifier::untrained();
+        assert!(
+            !untrained_model.trained,
+            "Untrained model must have trained=false"
+        );
+        // The heuristic requires trained=true, so it won't fire for untrained.
+        assert!(
+            !(untrained_model.trained
+                && untrained_model.weights.is_empty()
+                && untrained_model.bias == 0.0),
+            "Heuristic must not fire for legitimately untrained model"
+        );
+
+        // A well-formed trained model should NOT trigger the heuristic.
+        let mut rng = StdRng::seed_from_u64(42);
+        let positives: Vec<Vec<f32>> = (0..20).map(|_| make_positive_embedding(&mut rng)).collect();
+        let negatives: Vec<Vec<f32>> = (0..30).map(|_| make_negative_embedding(&mut rng)).collect();
+        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
+        let neg_seq = make_seq(negatives, crate::embedding_sequence::LabelStratum::Negative);
+        let trained_model = VoiceVerifier::train(
+            &[pos_seq],
+            &[neg_seq],
+            None,
+            DEFAULT_VERIFIER_THRESHOLD,
+            0.001,
+            None,
+        );
+        assert!(trained_model.is_trained(), "Trained model must be trained");
+        assert!(
+            !(trained_model.trained
+                && trained_model.weights.is_empty()
+                && trained_model.bias == 0.0),
+            "Heuristic must not fire for well-formed trained model"
+        );
+    }
 }
