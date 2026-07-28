@@ -1253,7 +1253,12 @@ fn test_detection_samples(
     super::set_classifier_weights(classifier.weights_ref().clone());
     super::set_verifier(verifier.clone());
 
-    for (samples, label) in variants {
+    for (i, (samples, label)) in variants.iter().enumerate() {
+        info!(
+            "  Variant {}/{}: {label} — processing",
+            i + 1,
+            variants.len()
+        );
         metrics.total += 1;
         let mut ctx = super::PipelineCtx::new();
         // Clone the shared adaptive state into this variant's ctx so the
@@ -1293,6 +1298,17 @@ fn test_detection_samples(
             vad_speech_frames: ctx.instrumentation.vad_speech_frames,
             per_frame_scores: ctx.instrumentation.per_frame_scores.clone(),
         });
+        info!(
+            "  Variant {}/{}: {label} — {} (peak_score={:.4})",
+            i + 1,
+            variants.len(),
+            if result.detected {
+                "DETECTED"
+            } else {
+                "passed"
+            },
+            peak,
+        );
     }
 }
 

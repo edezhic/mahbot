@@ -6984,24 +6984,32 @@ fn score_stride8_window(
         }
     };
 
-    let state = voice_state().read().unwrap_poison();
-    let classifier: Option<&WakeWordClassifier> = state.classifier.as_ref();
-
-    // Destructured values used only in voice-tests instrumentation.
-    // #[allow(unused_variables)] scoped to the function covers these locals;
-    // the function parameters (mel_window, models, ctx) are always used.
+    // ── Scope the read lock so it drops before set_status() ───────────
+    // score_single_embedding needs classifier + verifier from the global
+    // voice state.  We acquire a read lock, call the function (which only
+    // borrows the data temporarily), then let the guard drop at the end of
+    // this block.  This avoids a read→write upgrade deadlock: the caller
+    // below (line 7043) calls set_status() which acquires a write lock,
+    // and holding a read lock across that call would deadlock on
+    // std::sync::RwLock (which does not support read→write upgrades).
+    //
+    // Historical context: commit da06926 fixed a double-read-lock in this
+    // same function but missed this read→write upgrade path (mahbot-946).
+    // Do NOT rely on NLL early-drop — always scope the guard explicitly.
     #[cfg_attr(not(feature = "voice-tests"), allow(unused_variables))]
-    let (detected, rolling_sum, total_score, effective_threshold, _max_verifier_score, _) =
+    let (detected, rolling_sum, total_score, effective_threshold, _max_verifier_score, _) = {
+        let state = voice_state().read().unwrap_poison();
         score_single_embedding(
             &embedding,
             &mut ctx.embedding_ring,
-            classifier,
+            state.classifier.as_ref(),
             Some(&state.verifier),
             &mut ctx.score_window,
             Some(&mut ctx.adaptive_threshold),
             ctx.adaptive_k,
             Some(&mut ctx.candidate),
-        );
+        )
+    }; // <── read guard dropped here, before any write-lock acquisition
 
     // ── Instrumentation (voice-tests only) ──
     #[cfg(feature = "voice-tests")]
