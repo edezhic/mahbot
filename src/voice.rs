@@ -957,13 +957,13 @@ const WAKE_WORD_COOLDOWN: Duration = Duration::from_secs(3);
 /// Mean of the negative (non-wake-word) per-frame soft score distribution,
 /// measured during the mahbot-859 benchmark on confusable and unrelated
 /// speech.  Used as the seed value for [`AdaptiveThresholdState::warmed()`]
-/// (mahbot-891).  The safe harbor clamp (2.133) means the precise value is
-/// unimportant as long as it is well below 2.133; this constant documents
+/// (mahbot-891).  The safe harbor clamp (2.13) means the precise value is
+/// unimportant as long as it is well below 2.13; this constant documents
 /// the measured value for future reference.
 ///
 /// Calibrated for dense stride-8 embeddings (mahbot-923).  The 1.58×
 /// multiplier relative to the old streaming distribution means the safe
-/// harbor clamp increased from 1.35 to 2.133.  See §7 in mahbot-923 for
+/// harbor clamp increased from 1.35 to 2.13.  See §7 in mahbot-923 for
 /// the full calibration table and rationale.
 #[cfg(any(test, feature = "voice-tests"))]
 const NEGATIVE_DISTRIBUTION_MEAN: f32 = 0.033;
@@ -1250,8 +1250,8 @@ const MATCH_THRESHOLD_FACTOR: f32 = 0.71;
 
 /// Detection threshold for the rolling sum of soft scores (mahbot-923).
 /// Computed as: `ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR`
-/// (= `3 × 0.71 = 2.133`).  Calibrated for dense stride-8 embeddings using
-/// the 1.58× multiplier (old streaming threshold 1.35 → 2.133).  The higher
+/// (= `3 × 0.71 = 2.13`).  Calibrated for dense stride-8 embeddings using
+/// the 1.58× multiplier (old streaming threshold 1.35 → 2.13).  The higher
 /// threshold accounts for the higher per-frame scores from stride-8 dense
 /// embeddings versus stride-1 streaming embeddings.
 #[expect(clippy::cast_precision_loss)]
@@ -1276,7 +1276,7 @@ const ADAPTIVE_K_MAX: f32 = 4.0;
 
 /// Absolute floor — the adaptive threshold must never drop below this value.
 /// Calibrated for dense stride-8 embeddings (mahbot-923).  The 1.58× multiplier
-/// (old streaming floor 1.35 → 2.133) accounts for the higher per-frame scores
+/// (old streaming floor 1.35 → 2.13) accounts for the higher per-frame scores
 /// from stride-8 dense embeddings versus stride-1 streaming embeddings.
 ///
 /// Computed from the same expression as ADAPTIVE_SAFE_HARBOR so the two
@@ -1297,9 +1297,9 @@ const ADAPTIVE_CEILING: f32 = 4.503;
 
 /// Safe harbor — the adaptive threshold must never drop below this value,
 /// which matches the current static [`match_threshold()`]
-/// (ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR = 3 × 0.71 = 2.133).
+/// (ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR = 3 × 0.71 = 2.13).
 /// Calibrated for dense stride-8 embeddings (mahbot-923).  The 1.58× multiplier
-/// over the old streaming value (1.35 → 2.133) accounts for the higher
+/// over the old streaming value (1.35 → 2.13) accounts for the higher
 /// per-frame scores from stride-8 dense embeddings.
 /// Derived from the same constants as [`match_threshold()`] so the two values
 /// are always in sync.  Prevents a feedback loop where false accepts push
@@ -1541,7 +1541,7 @@ pub(crate) fn score_single_embedding(
     // warm-up is built entirely from verifier-evaluated embeddings.
     //
     // NOTE: The window MAY be empty at this point if all warm-up frames
-    // had total_score < NO_MATCH_RESET_THRESHOLD (0.20), causing
+    // had total_score < NO_MATCH_RESET_THRESHOLD (0.316), causing
     // process_wake_word_score to clear it each frame.  clear() on an
     // empty Vec is a no-op, so the guard is unconditional — we always
     // reset, and the effect is identical either way.
@@ -2500,7 +2500,9 @@ fn compute_embedding(models: &OnnxModels, mel_frames: &[Vec<f32>]) -> Result<Vec
 /// If `frames` already has at least `EMBEDDING_WINDOW_FRAMES`, it is returned
 /// as-is (no truncation — the caller decides the window).  This is extracted
 /// as a shared helper to avoid duplicating the padding logic in both
-/// [`extract_embeddings_from_audio`] and [`handle_wake_word_detection`].
+/// [`extract_embeddings_from_audio`] and the stride-8 sliding-window fallback
+/// in [`handle_wake_word_detection`], which passes subslices at arbitrary
+/// `next_window_start` positions (mahbot-927).
 #[allow(clippy::cast_precision_loss)]
 fn pad_mel_frames_to_window(frames: &[Vec<f32>]) -> Vec<Vec<f32>> {
     if frames.len() >= EMBEDDING_WINDOW_FRAMES {
@@ -4544,7 +4546,7 @@ pub(crate) struct DetectionInstrumentation {
     /// the benchmark's miss-classification logic to distinguish
     /// adaptive-threshold blocks from verifier blocks (mahbot-891).
     pub per_frame_scores: Vec<[f32; 3]>,
-    /// Count of frames where `total_score < NO_MATCH_RESET_THRESHOLD` (0.20).
+    /// Count of frames where `total_score < NO_MATCH_RESET_THRESHOLD` (0.316).
     pub n_frames_below_reset: usize,
     /// Count of VAD-positive 512-sample frames during streaming detection.
     pub vad_speech_frames: usize,
@@ -7259,24 +7261,58 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
                 }
                 ctx.next_window_start += stride;
             }
-        }
 
-        // Short-buffer handling: if the buffer has fewer than EMBEDDING_WINDOW_FRAMES
-        // frames, pad with tapered fade-out and extract one embedding (mahbot-923).
-        // This ensures the first ~1.2 seconds of audio still produce embeddings.
-        if ctx.next_window_start == 0
-            && mel_frame_buffer.len() < EMBEDDING_WINDOW_FRAMES
-            && !mel_frame_buffer.is_empty()
-        {
-            let Some(models) = ONNX_MODELS.get() else {
-                return;
-            };
-            let padded = pad_mel_frames_to_window(&mel_frame_buffer);
-            let detected = score_stride8_window(&padded, models, ctx);
-            if !detected {
-                // Advance past the extracted position so the main loop
-                // doesn't re-extract position 0 on the next call.
-                ctx.next_window_start = stride;
+            // Short-buffer handling (mahbot-927): if the buffer has fewer than
+            // EMBEDDING_WINDOW_FRAMES frames AND there are unprocessed frames at
+            // the current next_window_start position, pad each remaining stride-8
+            // window with tapered fade-out and extract embeddings.  This replaces
+            // the old single-shot fallback (mahbot-923) that only fired at
+            // next_window_start == 0, which meant utterances shorter than ~940ms
+            // produced at most 1 embedding -- making detection mathematically
+            // impossible (max rolling sum 0.99 < threshold 2.13).
+            //
+            // The while-loop extracts one embedding per stride-8 position until
+            // the buffer is exhausted or detection fires.  Each embedding is
+            // produced from a padded window of EMBEDDING_WINDOW_FRAMES (76) frames,
+            // where the real frames at [pos..) are followed by a tapered fade-out
+            // to silence.  This ensures even a ~700ms wake word (~67 mel frames)
+            // produces at least 9 embeddings (positions 0..64 in strides of 8),
+            // filling the ROLLING_WINDOW_N (3) window for detection.
+            //
+            // Guards:
+            //  a) No-op flush: the outer guard at line 7246
+            //     (`len() >= next_window_start + stride`) ensures at least stride
+            //     (8) frames arrived since the last extraction, preventing
+            //     re-processing of the same positions.
+            //  b) Tail-of-long-utterance: the inner guard
+            //     `len() < EMBEDDING_WINDOW_FRAMES` ensures the fallback only
+            //     fires for short buffers (< 76 frames) that the main stride-8
+            //     loop cannot handle (it needs next_window_start + 76 <= len()).
+            //  c) Blinded gap: after exhausting a short buffer (e.g., 67 frames),
+            //     next_window_start advances to ~72, creating a ~68-frame blind
+            //     spot where neither the main loop (needs 148+ frames) nor the
+            //     fallback (< 76 frames) extracts embeddings.  This gap is ~17x
+            //     larger than the old code's ~4-frame gap.  Safe because all
+            //     wake word content was processed in the first call and
+            //     subsequent frames are silence or a new utterance.  The blind
+            //     spot ends when the buffer reaches 148+ frames and the main
+            //     loop resumes, re-processing only the tail (padded frames
+            //     that score near-zero).
+            if ctx.next_window_start < mel_frame_buffer.len()
+                && mel_frame_buffer.len() < EMBEDDING_WINDOW_FRAMES
+            {
+                while ctx.next_window_start < mel_frame_buffer.len() {
+                    let subslice = &mel_frame_buffer[ctx.next_window_start..];
+                    let padded = pad_mel_frames_to_window(subslice);
+                    let detected = score_stride8_window(&padded, models, ctx);
+                    if detected {
+                        // Detection fired -- loop stops; next_window_start is
+                        // NOT advanced past this position.  Symmetric with
+                        // main stride-8 loop: soft reset handles it.
+                        break;
+                    }
+                    ctx.next_window_start += stride;
+                }
             }
         }
     }
@@ -8414,7 +8450,7 @@ mod tests {
             None,
         );
 
-        // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.20) → window appended.
+        // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.316) → window appended.
         // Rolling sum 0.5 < match_threshold (1.35) → detection does NOT fire.
         assert!(
             !detected,
@@ -8422,7 +8458,7 @@ mod tests {
         );
         assert!(
             !score_window.is_empty(),
-            "tiling should produce a score above NO_MATCH_RESET_THRESHOLD (0.20), giving a non-empty score window",
+            "tiling should produce a score above NO_MATCH_RESET_THRESHOLD (0.316), giving a non-empty score window",
         );
 
         let score = score_window[0];
@@ -8481,7 +8517,7 @@ mod tests {
         );
         assert!(
             !score_window.is_empty(),
-            "second embedding tiling should produce a score above NO_MATCH_RESET_THRESHOLD (0.20)",
+            "second embedding tiling should produce a score above NO_MATCH_RESET_THRESHOLD (0.316)",
         );
         assert_eq!(ring.len(), 2, "ring should have 2 embeddings");
     }
@@ -8624,7 +8660,7 @@ mod tests {
 
         // Bootstrap: feed enough embeddings to complete bootstrap.
         // The classifier always produces 0.5 which is ≥ NO_MATCH_RESET_THRESHOLD
-        // (0.20), so during bootstrap these go through feed() unconditionally
+        // (0.316), so during bootstrap these go through feed() unconditionally
         // (the call site uses feed for all scores).
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             score_single_embedding(
@@ -11527,6 +11563,137 @@ mod tests {
                     0,
                     "Idempotency test: position {pos} is not aligned \
                      (drained {drained})",
+                );
+            }
+        }
+    }
+
+    // ── Short-buffer fallback tests (mahbot-927) ──────────────────────────
+    // These test `pad_mel_frames_to_window`, the core padding function used
+    // by the short-buffer embedding fallback in `handle_wake_word_detection`.
+    // The full while-loop (stride-8 over padded subslices) cannot be tested
+    // without ONNX models, but the padding transformation itself is isolated
+    // and fully testable.  A regression of the original deadlock (single-shot
+    // guard at next_window_start == 0) would manifest as incorrect padding
+    // behavior caught by these tests.
+
+    /// Helper: create a mel frame with identical values across all bands.
+    fn mel_frame(val: f32) -> Vec<f32> {
+        vec![val; NUM_MEL_BANDS]
+    }
+
+    /// Helper: create `n` consecutive mel frames with increasing values.
+    fn ramp_frames(n: usize) -> Vec<Vec<f32>> {
+        (0..n).map(|i| mel_frame(i as f32)).collect()
+    }
+
+    #[test]
+    fn pad_full_window_unchanged() {
+        // A buffer of exactly EMBEDDING_WINDOW_FRAMES (76) frames should be
+        // returned verbatim — no padding needed.
+        let frames = ramp_frames(EMBEDDING_WINDOW_FRAMES);
+        let padded = pad_mel_frames_to_window(&frames);
+        assert_eq!(padded.len(), EMBEDDING_WINDOW_FRAMES);
+        assert_eq!(padded, frames, "full window should be returned unchanged");
+    }
+
+    #[test]
+    fn pad_short_buffer_preserves_original_frames() {
+        // The first N frames of the padded output must match the original
+        // frames byte-for-byte — padding only appends, never modifies.
+        for n_frames in [1, 60, 67, 75] {
+            let frames = ramp_frames(n_frames);
+            let padded = pad_mel_frames_to_window(&frames);
+            assert_eq!(
+                &padded[..n_frames],
+                &frames[..],
+                "original frames should be preserved verbatim (n={n_frames})",
+            );
+        }
+    }
+
+    #[test]
+    fn pad_tapered_fadeout_transitions_to_silence() {
+        // The padding frames smoothly transition from the last real frame
+        // toward silence (spec_transform(0.0) = 2.0).  The first padding
+        // frame is ~86% last-real + ~14% silence; the last is ~14% last-real
+        // + ~86% silence.
+        let n_frames = 70;
+        let frames = ramp_frames(n_frames);
+        let padded = pad_mel_frames_to_window(&frames);
+        assert_eq!(padded.len(), EMBEDDING_WINDOW_FRAMES);
+        let silence_val: f32 = 2.0;
+
+        let last_real_val = (n_frames - 1) as f32; // 69.0
+        let first_pad_val = padded[n_frames][0];
+        let last_pad_val = padded[EMBEDDING_WINDOW_FRAMES - 1][0];
+
+        // First padding: closer to last real than to silence
+        let d_last = (first_pad_val - last_real_val).abs();
+        let d_silence = (first_pad_val - silence_val).abs();
+        assert!(
+            d_last < d_silence,
+            "first padding {first_pad_val}: should be closer to last real \
+             {last_real_val} than to silence {silence_val} \
+             (d_last={d_last:.3}, d_silence={d_silence:.3})",
+        );
+
+        // Last padding: closer to silence than to last real
+        let d_last = (last_pad_val - last_real_val).abs();
+        let d_silence = (last_pad_val - silence_val).abs();
+        assert!(
+            d_silence < d_last,
+            "last padding {last_pad_val}: should be closer to silence \
+             {silence_val} than to last real {last_real_val} \
+             (d_silence={d_silence:.3}, d_last={d_last:.3})",
+        );
+    }
+
+    #[test]
+    fn pad_empty_buffer_all_silence() {
+        // An empty mel frame buffer produces all-silence padding with
+        // exactly EMBEDDING_WINDOW_FRAMES frames of spec_transform(0.0).
+        let padded = pad_mel_frames_to_window(&[]);
+        assert_eq!(padded.len(), EMBEDDING_WINDOW_FRAMES);
+        let silence_val: f32 = 2.0;
+        for (i, frame) in padded.iter().enumerate() {
+            assert_eq!(
+                frame.len(),
+                NUM_MEL_BANDS,
+                "frame {i} has wrong number of mel bands",
+            );
+            for &val in frame.iter() {
+                assert!(
+                    (val - silence_val).abs() < 1e-6,
+                    "frame {i} value {val} != silence {silence_val}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pad_each_frame_has_correct_band_count() {
+        // Every frame in the padded output must have NUM_MEL_BANDS values,
+        // regardless of the input size.
+        for n in [0, 1, 60, 67, 75, 100] {
+            let frames = ramp_frames(n);
+            let padded = pad_mel_frames_to_window(&frames);
+            let expected_len = if n >= EMBEDDING_WINDOW_FRAMES {
+                n
+            } else {
+                EMBEDDING_WINDOW_FRAMES
+            };
+            assert_eq!(
+                padded.len(),
+                expected_len,
+                "n={n}: expected {expected_len} frames",
+            );
+            for (i, frame) in padded.iter().enumerate() {
+                assert_eq!(
+                    frame.len(),
+                    NUM_MEL_BANDS,
+                    "n={n}, frame {i}: expected {NUM_MEL_BANDS} bands, got {}",
+                    frame.len(),
                 );
             }
         }

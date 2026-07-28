@@ -1162,7 +1162,7 @@ struct PerVariantResult {
     /// processing, which directly reflects how many mel frames passed through
     /// the embedding model (mahbot-922).
     n_embeddings: usize,
-    /// Number of frames where total_score < NO_MATCH_RESET_THRESHOLD (0.20).
+    /// Number of frames where total_score < NO_MATCH_RESET_THRESHOLD (0.316).
     n_frames_below_reset: usize,
     /// Whether the AGC converged to a stable gain level by utterance end.
     /// `Some(true)` if converged, `Some(false)` if not, `None` if insufficient
