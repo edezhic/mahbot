@@ -126,12 +126,26 @@ pub(crate) fn apply_safe_env(cmd: &mut tokio::process::Command) {
 ///
 /// **Note:** `$USER`/`$USERNAME` is an intentional exception — read from the
 /// parent process (usernames are not secrets).
+///
+/// On Unix the child is made a process group leader (via
+/// [`process_group(0)`](tokio::process::Command::process_group)), so that the
+/// timeout handler in [`run_command_with_timeout`] can kill the entire
+/// subprocess tree (child + grandchildren) with a single PGID signal.
+/// Grandchildren (e.g., `cargo test` or long-running `sleep`) inherit the new
+/// PGID from `sh`, preventing orphaned CPU-consuming process trees when a
+/// shell command times out.
 fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::Command {
     // Platform-specific shell selection and arguments.
     #[cfg(not(target_os = "windows"))]
     let mut process = {
         let mut p = tokio::process::Command::new("sh");
         p.arg("-c").arg(command);
+        // Make this child a process group leader so grandchildren inherit the
+        // PGID and can be killed together on timeout (see run_command_with_timeout).
+        #[cfg(unix)]
+        {
+            p.process_group(0);
+        }
         p
     };
 
@@ -293,8 +307,52 @@ async fn run_command_with_timeout(
         }
         Ok(Err(e)) => ShellRunResult::SpawnFailed(e),
         Err(_) => {
-            // Kill the child process and signal readers to return what they have.
-            let _ = child.kill().await;
+            // Kill the entire process tree (child + grandchildren) on timeout.
+            //
+            // Strategy (Unix only): send SIGKILL to the direct child without
+            // waiting (start_kill), then kill the process group via
+            // libc::kill(-pgid, SIGKILL) to terminate any grandchildren
+            // (e.g. `cargo test` or `sleep` inherited the child's PGID from
+            // process_group(0) in build_shell_command), then reap the child.
+            //
+            // This ordering avoids a PID-reuse race: if child.kill().await
+            // (which includes wait()) were called before the PGID kill, the
+            // child's PID could be reused before we can signal its group.
+            //
+            // On non-Unix platforms the simpler child.kill() suffices.
+            #[cfg(unix)]
+            {
+                // PID must be available — child.id() returns Some after spawn.
+                let pid = pid.expect("PID is available after successful spawn");
+                // Fire-and-forget SIGKILL to the direct child.
+                let _ = child.start_kill();
+                // Kill the entire process group.
+                // pgid == pid because build_shell_command calls
+                // process_group(0), making the child a PG leader.
+                let pid_signed: libc::pid_t = pid.try_into().expect("PID fits in pid_t");
+                // SAFETY: kill(-pgid, SIGKILL) is the standard POSIX way to
+                // terminate an entire process group. The target PGID is our
+                // own child's PID (which is also its PGID after
+                // process_group(0) in build_shell_command), so we have
+                // ownership over every process in the group. The unsafe is
+                // required by the libc crate's FFI interface.
+                let ret = unsafe { libc::kill(-pid_signed, libc::SIGKILL) };
+                if ret != 0 {
+                    let err = std::io::Error::last_os_error();
+                    tracing::warn!(
+                        pid = pid,
+                        err = %err,
+                        "kill(-pgid, SIGKILL) on timeout failed — \
+                         grandchildren may survive"
+                    );
+                }
+                // Reap the child (now dead from one or both kills).
+                let _ = child.wait().await;
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill().await;
+            }
             cancel.cancel();
 
             // Give readers a grace window to notice cancellation and return
@@ -2367,6 +2425,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_command_with_timeout_kills_long_sleep() {
         let mut cmd = tokio::process::Command::new("sh");
@@ -2383,6 +2442,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_command_with_timeout_captures_partial_stdout() {
         let mut cmd = tokio::process::Command::new("sh");
@@ -2400,6 +2460,11 @@ mod tests {
         }
     }
 
+    /// Tests that timeout error messages include partial output (stdout and stderr
+    /// tails) and ANSI stripping works.
+    ///
+    /// The `sleep 30` grandchild is now terminated by the PGID kill, not orphaned.
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_timeout_error_includes_diagnostics() {
         let tmp = TempDir::new().expect("tempdir");
@@ -2448,6 +2513,59 @@ mod tests {
         assert!(
             ansi_msg.contains("BOLD STUFF"),
             "ANSI text content should survive stripping: {ansi_msg}"
+        );
+    }
+
+    /// Verify that grandchildren are killed when the shell command times out.
+    ///
+    /// After [`build_shell_command`] applies `process_group(0)`, background
+    /// processes spawned by `sh` inherit the same PGID. When the timeout fires,
+    /// [`run_command_with_timeout`] sends SIGKILL to the entire process group
+    /// via `libc::kill(-pgid, SIGKILL)`, which terminates grandchildren
+    /// (e.g. the `sleep` in this test) in addition to the direct `sh` child.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_group_kills_grandchildren_on_timeout() {
+        // Create a script that launches a long-running background grandchild,
+        // records its PID so we can verify it's dead after the timeout.
+        let dir = TempDir::new().expect("tempdir");
+        let pid_path = dir.path().join("grandchild.pid");
+        let pid_path_str = pid_path.to_str().expect("valid utf-8 path");
+
+        // Command: start sleep in background, capture its PID, then wait.
+        // The grandchild inherits the process group from sh (set by
+        // build_shell_command → process_group(0)).
+        let cmd_str = format!("sleep 999 & echo $! > {pid_path_str}; wait");
+        let mut cmd = build_shell_command(&cmd_str, dir.path());
+
+        let result = run_command_with_timeout(&mut cmd, Duration::from_secs(2)).await;
+        assert!(
+            matches!(result, ShellRunResult::TimedOut { .. }),
+            "expected TimedOut, got {result:?}"
+        );
+
+        // Give the kernel time to deliver SIGKILL and reap the processes.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Read the grandchild PID from the file the script wrote.
+        // The background `echo $!` runs immediately after the `sleep 999 &`
+        // fork, so the file must exist after a 2-second timeout + 500ms grace.
+        let pid_content = std::fs::read_to_string(&pid_path)
+            .expect("grandchild PID file must exist — grandchild was launched");
+        let pid: i32 = pid_content.trim().parse().expect("valid PID from file");
+
+        // Verify the grandchild is no longer alive.
+        // kill(pid, 0) checks existence without sending a real signal.
+        let ret = unsafe { libc::kill(pid, 0) };
+        let err = std::io::Error::last_os_error();
+        assert_eq!(
+            ret, -1,
+            "grandchild (pid={pid}) should be dead after PGID kill, err: {err:?}"
+        );
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ESRCH),
+            "expected ESRCH (no such process) for grandchild pid={pid}, got: {err:?}"
         );
     }
 
