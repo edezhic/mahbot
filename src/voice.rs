@@ -4851,7 +4851,7 @@ impl PipelineCtx {
                 // Clear any active candidate (mahbot-895).  A stale candidate
                 // from the previous detection session would carry cross-candidate
                 // verifier contamination across Soft pipeline resets (which occur
-                // during transition_to_recording's handoff).  The candidate will
+                // during the detection→recording handoff).  The candidate will
                 // be re-created naturally when the rolling sum next crosses the
                 // threshold.
                 self.candidate = None;
@@ -4992,46 +4992,6 @@ impl PipelineCtx {
         } else {
             self.segment_silence_hops = hop_count;
         }
-    }
-
-    /// Transition from wake-word-detection to recording mode (mahbot-802).
-    ///
-    /// Performs the detection→recording handoff in the correct sequence:
-    /// 1. Sets `is_recording = true` to route subsequent audio to recording
-    /// 2. Clears `command_buffer` to start a fresh recording
-    /// 3. Forwards the entire `audio_buffer` (processed wake-word tail +
-    ///    unprocessed command-start) into `command_buffer` so ASR receives
-    ///    the transition audio — ASR tolerates the extra wake-word overlap
-    /// 4. Resets silence tracking for the recording phase
-    /// 5. Clears intermediate detection buffers (mel, embedding, voice_batch,
-    ///    score_window) to prevent stale data from contaminating the recording
-    /// 6. Clears the noise-suppression frame-alignment buffer (mahbot-800 C2)
-    /// 7. Records the detection timestamp for cooldown tracking
-    /// 8. Does NOT reset VAD state or `vad_threshold` — the noise floor estimate
-    ///    from the detection phase is deliberately carried through to recording
-    ///    mode so Earshot does not need to re-establish the floor from scratch,
-    ///    which would cause transient misclassification of the first few
-    ///    recording frames (mahbot-802).
-    ///
-    /// Must be paired with `set_status(VoiceStatus::Recording)` by the caller
-    /// because the status update is a side effect on global voice state, not
-    /// on `PipelineCtx`.
-    fn transition_to_recording(&mut self) {
-        self.is_recording = true;
-        // Save the wake-word tail + unprocessed command-start before the Soft
-        // reset clears audio_buffer.  ASR tolerates the extra wake-word overlap
-        // at the start (mahbot-802).
-        let audio = std::mem::take(&mut self.audio_buffer);
-        // Soft reset: clears detection buffers (mel, embedding, voice_batch,
-        // score_window, pre_agc_ring,
-        // negative_audio_buf, audio_preprocessor frame buffer) while
-        // preserving VAD state, noise-suppressor noise profile, and
-        // vad_threshold (mahbot-802).  command_buffer and silence_sample_count
-        // are cleared by the reset — we re-populate command_buffer from the
-        // saved audio.
-        self.reset_pipeline_state(ResetLevel::Soft);
-        self.command_buffer.extend_from_slice(&audio);
-        self.last_wake_word_detection = Some(Instant::now());
     }
 
     /// Check whether the refractory period has elapsed and transition back
@@ -6868,7 +6828,8 @@ fn score_stride8_window(
     }
 
     if detected {
-        ctx.transition_to_recording();
+        ctx.is_recording = true;
+        ctx.last_wake_word_detection = Some(Instant::now());
         set_status(VoiceStatus::Recording);
         true
     } else {
@@ -6918,13 +6879,13 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
         // recording mode (mahbot-802 deviation from ticket §2).
         //
         // Invariant: audio_buffer is empty or within COOLDOWN_ACCUMULATION_CAP at
-        // cooldown entry.  Caller sequencing (transition_to_recording() clears it at
-        // the detection→recording handoff) ensures this invariant holds — this
-        // assertion guards against future refactors that bypass that path.
+        // cooldown entry.  The handoff block in this function clears it at the
+        // detection→recording transition — this assertion guards against future
+        // refactors that bypass that path.
         debug_assert!(
             ctx.audio_buffer.len() <= COOLDOWN_ACCUMULATION_CAP,
             "audio_buffer (len={}) exceeds COOLDOWN_ACCUMULATION_CAP ({}) at cooldown entry; \
-             transition_to_recording() should have cleared it at detection→recording handoff",
+             handle_wake_word_detection's handoff should have cleared it at detection→recording transition",
             ctx.audio_buffer.len(),
             COOLDOWN_ACCUMULATION_CAP
         );
@@ -6952,10 +6913,14 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     // This ensures ALL accumulated mel frames are scored with dense stride-8
     // embeddings, matching the enrollment training distribution.
     //
-    // `voice_batch` and `mel_frame_buffer` are taken from `ctx` into local
-    // variables so the closure (which borrows `*ctx` for wake word detection)
-    // does not conflict with the inner function's mutable access to the
-    // batch buffers.
+    // `audio_buffer`, `voice_batch` and `mel_frame_buffer` are taken from `ctx`
+    // into local variables so the closure (which borrows `*ctx` for wake word
+    // detection) does not conflict with the inner function's mutable access to
+    // the batch buffers.
+    //
+    // When detection fires during the stride-8 loop, score_stride8_window
+    // sets is_recording = true but defers the full transition to this
+    // function — see the handoff block below (mahbot-919).
     // ═══════════════════════════════════════════════════════════════════════
     let mut audio_buf = std::mem::take(&mut ctx.audio_buffer);
     let mut voice_batch = std::mem::take(&mut ctx.voice_batch);
@@ -6986,7 +6951,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
         result
     };
 
-    let consumed = process_streaming_frames_inner(
+    let mut consumed = process_streaming_frames_inner(
         &audio_buf,
         &mut voice_batch,
         &mut mel_frame_buffer,
@@ -7068,6 +7033,37 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     if !ctx.is_recording {
         let hop_count = segment_silence_hops.load(std::sync::atomic::Ordering::Relaxed);
         ctx.handle_segment_boundary(hop_count, &mut voice_batch, &mut mel_frame_buffer);
+    }
+
+    // ── Detection→recording handoff (mahbot-919) ──────────────────────────
+    // When detection fires, score_stride8_window sets is_recording = true.
+    // We complete the transition here where all state (audio_buf, voice_batch,
+    // mel_frame_buffer) is available as local variables (moved out of ctx at
+    // lines 6960-6962 to avoid borrow conflicts with the VAD closure).
+    //
+    // The transition sequence (matching mahbot-802 design):
+    //   1. Take ALL of audio_buf (processed wake-word tail + unprocessed
+    //      command-start) — the consumed/unconsumed distinction is irrelevant
+    //      because ASR tolerates the extra wake-word overlap
+    //   2. Reset pipeline state (Soft): clears command_buffer, detection buffers
+    //      (embedding_ring, score_window, candidate, next_window_start, etc.)
+    //   3. Re-populate command_buffer with the saved audio
+    //   4. Clear stale local copies (voice_batch, mel_frame_buffer) so the
+    //      write-back below (lines 7125-7127) restores empty Vecs
+    //   5. Set consumed = 0 to prevent drain panic on the now-empty audio_buf
+    //
+    // Previously score_stride8_window called transition_to_recording()
+    // directly, but its take of ctx.audio_buffer returned empty because the
+    // buffer was already moved.  Consolidating the transition here eliminates
+    // the split responsibility and ensures all state changes happen together
+    // with the actual data.
+    if ctx.is_recording {
+        let audio = std::mem::take(&mut audio_buf);
+        ctx.reset_pipeline_state(ResetLevel::Soft);
+        ctx.command_buffer.extend_from_slice(&audio);
+        voice_batch.clear();
+        mel_frame_buffer.clear();
+        consumed = 0; // Prevent drain panic on now-empty audio_buf
     }
 
     // ── Mel frame buffer trim (moved from flush_voice_batch, mahbot-923) ──
