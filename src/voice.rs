@@ -6783,7 +6783,6 @@ fn score_stride8_window(
 
     let state = voice_state().read().unwrap_poison();
     let classifier: Option<&WakeWordClassifier> = state.classifier.as_ref();
-    let verifier = get_verifier();
 
     // Destructured values used only in voice-tests instrumentation.
     // #[allow(unused_variables)] scoped to the function covers these locals;
@@ -6794,7 +6793,7 @@ fn score_stride8_window(
             &embedding,
             &mut ctx.embedding_ring,
             classifier,
-            Some(&verifier),
+            Some(&state.verifier),
             &mut ctx.score_window,
             Some(&mut ctx.adaptive_threshold),
             ctx.adaptive_k,
