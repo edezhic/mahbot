@@ -314,7 +314,7 @@ pub struct ConfigData {
     pub voice_agc: Option<String>,
     /// Adaptive threshold k multiplier for wake word detection (default: `"2.5"`).
     /// The adaptive threshold is computed as `mean + k × std` over a running
-    /// window of recent per-frame MLP scores.  Range: [1.0, 4.0].
+    /// window of recent per-frame classifier scores.  Range: [1.0, 4.0].
     pub adaptive_k: Option<String>,
     /// Maximum size of the voice PCM disk cache in megabytes (default: `"100"`).
     /// `0` means unlimited (no size-based eviction).

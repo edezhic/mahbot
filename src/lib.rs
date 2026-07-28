@@ -999,7 +999,7 @@ pub(crate) const VERIFIER_WINDOW_SIZE: usize = 3;
 /// verifier gradient with duplicate signal from the same utterance.
 pub(crate) const MAX_NEGATIVE_WINDOWS_PER_SEQUENCE: usize = 2;
 
-/// Input dimension for the verifier MLP: 3 × 96 = 288.
+/// Input dimension for the verifier: 3 × 96 = 288.
 pub(crate) const VERIFIER_INPUT_DIM: usize = EMBEDDING_DIM * VERIFIER_WINDOW_SIZE;
 
 #[derive(Debug, Clone)]

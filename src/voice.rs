@@ -9,7 +9,7 @@
 //! 2. **Voice activity detection** — energy-based VAD to gate processing
 //! 3. **Mel spectrogram extraction** — via `melspectrogram.onnx` (candle-onnx)
 //! 4. **Neural embedding** — via `embedding_model.onnx` (candle-onnx), 96-dim vectors
-//! 5. **Wake word matching** — Conv1D/MLP classifier on a 3-embedding sliding window,
+//! 5. **Wake word matching** — Conv1D classifier on a 3-embedding sliding window,
 //!    followed by a logistic regression verifier (AND gate).
 //! 6. **Command recording** — record speech until silence or 30s cap
 //! 7. **Transcription** — via existing Qwen3-ASR local transcriber
@@ -1212,7 +1212,7 @@ const ROLLING_WINDOW_N: usize = 3;
 const _: () = assert!(
     EMBEDDING_RING_MAX >= ROLLING_WINDOW_N,
     "EMBEDDING_RING_MAX must be >= ROLLING_WINDOW_N to hold enough embeddings \
-     for the Conv1D MLP classifier"
+     for the Conv1D classifier"
 );
 
 /// Compile-time invariant: EMBEDDING_RING_MAX must be at least
@@ -1400,11 +1400,11 @@ fn voice_debug_enabled() -> bool {
 /// ([`handle_wake_word_detection`]), enrollment self-test
 /// ([`run_enrollment_self_test`]), and integration tests.
 ///
-/// It manages the ring buffer, runs the Conv1D MLP classifier forward pass
+/// It manages the ring buffer, runs the Conv1D classifier forward pass
 /// (tiling available embeddings to fill the 3-embedding window when the ring
 /// has fewer than 3 entries — see [`score_single_embedding`] implementation),
 /// applies rolling window scoring via [`process_wake_word_score`], and checks
-/// the second-stage MLP verifier gate via a bounded classifier candidate.
+/// the second-stage verifier (logistic regression) gate via a bounded classifier candidate.
 ///
 /// # Returns
 /// - `(true, rolling_sum, total_score, effective_threshold, max_verifier_score)` — the embedding
@@ -1415,7 +1415,7 @@ fn voice_debug_enabled() -> bool {
 ///
 /// - `rolling_sum` — the rolling window sum at the time of evaluation
 ///   (0.0 if the window was reset due to low score).
-/// - `total_score` — the raw soft score from the Conv1D MLP classifier.
+/// - `total_score` — the raw soft score from the Conv1D classifier.
 /// - `effective_threshold` — the threshold value used for the rolling window
 ///   comparison this frame (see below).
 /// - `max_verifier_score` — the maximum verifier score across all stride-1
@@ -1446,7 +1446,7 @@ fn voice_debug_enabled() -> bool {
 /// - `embedding` — one 96-dim embedding vector to process.
 /// - `embedding_ring` — persistent ring buffer (shared across frames in the
 ///   live pipeline; fresh per utterance in tests).
-/// - `classifier` — trained Conv1D MLP classifier (`None` skips classification).
+/// - `classifier` — trained Conv1D classifier (`None` skips classification).
 /// - `verifier` — trained logistic regression verifier (`None` skips the
 ///   second-stage gate, matching enrollment self-test behaviour).
 /// - `score_window` — persistent rolling window of recent confidence scores.
@@ -1482,10 +1482,10 @@ pub(crate) fn score_single_embedding(
         embedding_ring.remove(0);
     }
 
-    // ── MLP classifier forward pass ───────────────────────────────────
+    // ── Conv1D classifier forward pass ───────────────────────────────────
     // Scores a window of 3 consecutive embeddings via Conv1D + sigmoid.
     // Falls back to repeat-last tiling when fewer than 3 embeddings are
-    // available.  The MLP is the primary scorer; the verifier below acts
+    // available.  The Conv1D classifier is the primary scorer; the verifier below acts
     // as a light second-stage gate.
     let total_score = if let Some(c) = classifier {
         if embedding_ring.len() >= wake_word_classifier::WINDOW_SIZE {
@@ -2077,9 +2077,8 @@ struct VoicePipelineState {
     enabled: bool,
     status: VoiceStatus,
     /// Trained Conv1D classifier weights (None before enrollment).
-    /// In ensemble mode (mahbot-839) this contains all `NUM_ENSEMBLE_MEMBERS`
-    /// weight sets; in legacy mode it contains a single entry.
-    classifier_weights: Option<Vec<ClassifierWeights>>,
+    /// Contains a single weight set (mahbot-931, removing the 5-member ensemble).
+    classifier_weights: Option<ClassifierWeights>,
     /// Cached classifier for inference (avoids per-frame clone of weights).
     /// Recreated when [`classifier_weights`] changes.
     classifier: Option<WakeWordClassifier>,
@@ -2221,7 +2220,7 @@ pub fn set_status(status: VoiceStatus) {
 }
 
 #[must_use]
-pub fn get_classifier_weights() -> Option<Vec<ClassifierWeights>> {
+pub fn get_classifier_weights() -> Option<ClassifierWeights> {
     voice_state()
         .read()
         .unwrap_poison()
@@ -2229,11 +2228,10 @@ pub fn get_classifier_weights() -> Option<Vec<ClassifierWeights>> {
         .clone()
 }
 
-pub fn set_classifier_weights(weights: Vec<ClassifierWeights>) {
+pub fn set_classifier_weights(weights: ClassifierWeights) {
     let mut state = voice_state().write().unwrap_poison();
-    debug_assert!(!weights.is_empty(), "Classifier weights must not be empty");
     state.classifier_weights = Some(weights.clone());
-    state.classifier = Some(WakeWordClassifier::new_ensemble(weights));
+    state.classifier = Some(WakeWordClassifier::new(weights));
 }
 
 #[must_use]
@@ -3608,7 +3606,7 @@ pub fn process_enrollment_sample(samples: &[f32]) -> Result<Vec<Vec<f32>>> {
 ///   `Some`, uses the real pre-speech noise floor captured from the raw audio
 ///   ring during enrollment; otherwise falls back to an energy-based heuristic.
 ///
-/// MLP classifier confidence is computed separately during enrollment
+/// Conv1D classifier confidence is computed separately during enrollment
 /// finalization (when the Conv1D classifier is trained on all utterances).
 ///
 /// # Parameters
@@ -3645,7 +3643,7 @@ fn compute_utterance_quality(samples: &[f32], noise_rms: Option<f32>) -> Utteran
 
     // ── Composite score (basic metrics only, no DTW) ──────────────────
     // During enrollment collection, quality is based on duration, clipping,
-    // and SNR.  MLP confidence is computed at enrollment finalization after
+    // and SNR.  Conv1D classifier confidence is computed at enrollment finalization after
     // the classifier is trained on all utterances.
     //
     // Duration score: 0.0 if too short or too long, ramping up in range.
@@ -3741,7 +3739,7 @@ fn estimate_snr_energy(samples: &[f32]) -> f32 {
 /// Run a self-test of the trained classifier against the enrollment buffer.
 ///
 /// Simulates the live detection pipeline for each enrollment utterance: feeds
-/// embeddings one by one through the embedding ring, runs the Conv1D MLP
+/// embeddings one by one through the embedding ring, runs the Conv1D
 /// classifier (`forward_pass`) on each 3-embedding window, and passes the
 /// score through [`process_wake_word_score`] with a rolling window.
 ///
@@ -3768,7 +3766,7 @@ fn run_enrollment_self_test(
     for seq in enrollment_sequences {
         // Fresh simulation for each utterance: no cross-utterance state.
         // Uses `score_single_embedding` (mahbot-811) which encapsulates the
-        // same ring-buffer + MLP classifier + rolling window logic as the
+        // same ring-buffer + Conv1D classifier + rolling window logic as the
         // live detection pipeline and the E2E integration test.
         let mut embedding_ring: Vec<Vec<f32>> = Vec::with_capacity(EMBEDDING_RING_MAX);
         let mut score_window = Vec::new();
@@ -4041,76 +4039,16 @@ pub(crate) fn finalize_enrollment(
     // Step 1: Consistency check — gates on utterance quality before training
     validate_enrollment_consistency(positive_sequences)?;
 
-    // Step 2: Train the ensemble of Conv1D classifiers (mahbot-839).
-    // Train NUM_ENSEMBLE_MEMBERS independent models with different seeds
-    // and architectures (mahbot-848) for deterministic, diverse weight
-    // initializations, shuffles, and feature representations.
-    // Each model trains on a random 80/20 validation split (k-fold and data
-    // augmentation removed in mahbot-851 — they prevented learning on the
-    // tiny ~99-window enrollment dataset).
-    let base_config = wake_word_classifier::TrainingConfig::default();
-    let ensemble_results: Vec<Result<wake_word_classifier::ClassifierTrainingResult>> =
-        std::thread::scope(|s| {
-            let handles: Vec<_> = (0..wake_word_classifier::NUM_ENSEMBLE_MEMBERS)
-                .map(|seed| {
-                    let arch = wake_word_classifier::ENSEMBLE_ARCHS[seed];
-                    let config = wake_word_classifier::TrainingConfig {
-                        rng_seed: Some(seed as u64),
-                        arch,
-                        ..base_config.clone()
-                    };
-                    s.spawn(move || {
-                        wake_word_classifier::train_classifier(
-                            positive_sequences,
-                            negative_sequences,
-                            &config,
-                        )
-                    })
-                })
-                .collect();
-
-            // Join all threads — they run in parallel.
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-
-    let mut all_weights = Vec::with_capacity(wake_word_classifier::NUM_ENSEMBLE_MEMBERS);
-    // Track stats from seed-0 model for reporting (informational only)
-    let mut epochs_trained = 0;
-    let mut best_val_loss = f32::INFINITY;
-    let mut pos_scores_mean = 0.0;
-    let mut pos_scores_min = 0.0;
-    let mut pos_scores_max = 0.0;
-    let mut neg_scores_mean = 0.0;
-    let mut neg_scores_min = 0.0;
-    let mut neg_scores_max = 0.0;
-
-    for (i, result) in ensemble_results.into_iter().enumerate() {
-        let r = result?;
-        // Each result already validated its weights internally
-        all_weights.extend(r.weights);
-        if i == 0 {
-            epochs_trained = r.epochs_trained;
-            best_val_loss = r.best_val_loss;
-            pos_scores_mean = r.pos_scores_mean;
-            pos_scores_min = r.pos_scores_min;
-            pos_scores_max = r.pos_scores_max;
-            neg_scores_mean = r.neg_scores_mean;
-            neg_scores_min = r.neg_scores_min;
-            neg_scores_max = r.neg_scores_max;
-        }
-    }
-
-    Ok(wake_word_classifier::ClassifierTrainingResult {
-        weights: all_weights,
-        epochs_trained,
-        best_val_loss,
-        pos_scores_mean,
-        pos_scores_min,
-        pos_scores_max,
-        neg_scores_mean,
-        neg_scores_min,
-        neg_scores_max,
-    })
+    // Step 2: Train a single Conv1D classifier (mahbot-931).
+    // The 5-member ensemble was removed — a single small Conv1D (~1.2K params)
+    // captures temporal convolution patterns without ensemble overhead.
+    let config = wake_word_classifier::TrainingConfig {
+        rng_seed: Some(0), // deterministic seed for reproducibility
+        ..Default::default()
+    };
+    let result =
+        wake_word_classifier::train_classifier(positive_sequences, negative_sequences, &config)?;
+    Ok(result)
 }
 
 /// Validate enrollment utterance quality via centroid cosine similarity.
@@ -4365,7 +4303,7 @@ unsafe impl Send for SendMicStream {}
 // Adaptive threshold state (mahbot-845)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Tracks running mean and standard deviation of recent per-frame MLP scores
+/// Tracks running mean and standard deviation of recent per-frame classifier scores
 /// for adaptive threshold computation.
 ///
 /// Maintains O(1) sum/sum_sq statistics over a rolling window of the last
@@ -4411,7 +4349,7 @@ impl AdaptiveThresholdState {
         }
     }
 
-    /// Feed a new per-frame MLP score and return the adaptive threshold.
+    /// Feed a new per-frame classifier score and return the adaptive threshold.
     ///
     /// The threshold is computed from per-frame scores (range [0,1]), then
     /// scaled by [`ROLLING_WINDOW_N`] to match the rolling-sum space [0,3]
@@ -4703,8 +4641,8 @@ pub(crate) struct PipelineCtx {
     /// timeout — if [`PHASE3_TIMEOUT_SECS`] elapses, finalize with whatever
     /// was collected.
     phase3_start_time: Option<Instant>,
-    /// Rolling window of per-frame confidence scores from the Conv1D MLP
-    /// classifier (mahbot-810).  Each element is the MLP confidence (0.0–1.0)
+    /// Rolling window of per-frame confidence scores from the Conv1D
+    /// classifier (mahbot-810).  Each element is the classifier confidence (0.0–1.0)
     /// for one 3-embedding window (~384ms of speech).  Detection fires when
     /// the sum over this window reaches [`match_threshold`].  Cleared entirely
     /// when a frame's score drops below [`NO_MATCH_RESET_THRESHOLD`] to
@@ -4735,7 +4673,7 @@ pub(crate) struct PipelineCtx {
     /// At most one error message per 10-second window.
     last_error_message_time: Option<Instant>,
     /// Adaptive threshold tracker (mahbot-845).
-    /// Maintains running mean/std of recent per-frame MLP scores for
+    /// Maintains running mean/std of recent per-frame classifier scores for
     /// dynamic threshold computation.
     adaptive_threshold: AdaptiveThresholdState,
     /// The k multiplier for adaptive threshold cached from config at
@@ -5571,18 +5509,11 @@ async fn finalize_enrollment_pipeline() -> bool {
 
     let weights = match classifier_result {
         Ok(result) => {
-            let first_params = result
-                .weights
-                .first()
-                .map_or(0, ClassifierWeights::param_count);
+            let param_count = result.weights.param_count();
             info!(
-                "Enrollment complete: wake word '{}' (ensemble of {} models, \
-                             {} params each, {} epochs, best val loss={:.4})",
-                enrolled_phrase,
-                result.weights.len(),
-                first_params,
-                result.epochs_trained,
-                result.best_val_loss,
+                "Enrollment complete: wake word '{}' (Conv1D classifier \
+                             {} params, {} epochs, best val loss={:.4})",
+                enrolled_phrase, param_count, result.epochs_trained, result.best_val_loss,
             );
             result.weights
         }
@@ -5593,7 +5524,7 @@ async fn finalize_enrollment_pipeline() -> bool {
         }
     };
 
-    // ── Train verifier in spawn_blocking (CPU-bound MLP) ──
+    // ── Train verifier in spawn_blocking (CPU-bound logistic regression) ──
     let pos_for_ver_seqs = enrollment_buffer; // moved — cloned above for classifier
     let self_test_seqs = pos_for_ver_seqs.clone();
     let confusable_embs = confusable_dense_embeddings();
@@ -5653,7 +5584,7 @@ async fn finalize_enrollment_pipeline() -> bool {
     let verifier = tokio::task::spawn_blocking(move || {
         use crate::voice_verifier::{
             assert_weight_tier, mine_hard_negatives, CONFUSABLE_UPWEIGHT,
-            DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA, LEARNING_RATE, MLP_MAX_ITER,
+            DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA,
             UNRELATED_UPWEIGHT, VoiceVerifier,
         };
         use crate::wake_word_classifier::WakeWordClassifier;
@@ -5677,7 +5608,7 @@ async fn finalize_enrollment_pipeline() -> bool {
             let use_mining = crate::voice_verifier::use_hard_negative_mining();
             let (neg_to_use, per_neg_weights_opt) = 'decide: {
                 if use_mining {
-                    let classifier = WakeWordClassifier::new_ensemble(verifier_weights);
+                    let classifier = WakeWordClassifier::new(verifier_weights.clone());
                     let mined = mine_hard_negatives(
                         &classifier,
                         &neg_for_verifier_seqs,
@@ -5759,8 +5690,6 @@ async fn finalize_enrollment_pipeline() -> bool {
                 per_neg_weights_opt.as_deref(),
                 DEFAULT_VERIFIER_THRESHOLD,
                 L2_LAMBDA,
-                LEARNING_RATE,
-                MLP_MAX_ITER,
                 None,
             );
             info!(
@@ -5802,7 +5731,7 @@ async fn finalize_enrollment_pipeline() -> bool {
     }
 
     // ── Blocking self-test (mahbot-898) ──
-    let classifier = WakeWordClassifier::new_ensemble(weights.clone());
+    let classifier = WakeWordClassifier::new(weights.clone());
     if let Err(e) = run_enrollment_self_test(&self_test_seqs, &classifier) {
         warn!("Enrollment self-test failed — model rejected: {e}.  Re-enrollment required.");
         set_status(VoiceStatus::Error(format!(
@@ -5887,15 +5816,27 @@ pub async fn run_voice_pipeline() {
                     .is_some_and(|members| members.iter().all(|w| w.validate().is_ok()));
                 if all_valid {
                     if let Some(ref members) = model.classifier {
-                        set_classifier_weights(members.clone());
+                        set_classifier_weights(members[0].clone());
                     }
                     if let Some(ref v) = model.verifier {
                         set_verifier(v.clone());
+                        // Check for old 288-dim verifier weights (legacy MLP from prior mahbot versions)
+                        // (logistic regression expects 96-dim weights).
+                        if v.is_trained() {
+                            let w_dim = v.weights.len();
+                            if w_dim != 96 {
+                                warn!(
+                                    "Loaded verifier with {w_dim}-dim weights (expected 96). \
+                                     This model was trained with a previous mahbot version. \
+                                     Re-enrollment is recommended for optimal performance."
+                                );
+                            }
+                        }
                     }
                     let n = model.classifier.as_ref().map_or(0, Vec::len);
                     info!(
                         "Loaded wake word model from config \
-                         (v{}, {} ensemble members + verifier, phrase={})",
+                         (v{}, {} classifier weight set(s) + verifier, phrase={})",
                         model.schema_version, n, model.phrase,
                     );
                     // Cache the phrase from the loaded model so
@@ -5917,7 +5858,7 @@ pub async fn run_voice_pipeline() {
                 if let Err(e) = weights.validate() {
                     warn!("Stored classifier weights are invalid — re-enrollment required: {e}");
                 } else {
-                    set_classifier_weights(vec![weights]);
+                    set_classifier_weights(weights);
                     info!(
                         "Loaded wake word classifier weights from config (pre-PersistedModel format)"
                     );
@@ -6516,7 +6457,7 @@ struct PersistedModel {
     window_size: u32,
 
     // ── Training Metadata (diagnostic only, NOT used for compatibility) ──
-    /// Deterministic RNG seeds used during classifier ensemble training.
+    /// Deterministic RNG seeds used during classifier training.
     /// Empty = unknown (legacy).
     #[serde(default)]
     training_seeds: Vec<u64>,
@@ -6535,8 +6476,8 @@ struct PersistedModel {
     model_hash: String,
 
     // ── Model Data ────────────────────────────────────────────────
-    /// Ensemble of classifier weight sets. In legacy format the single
-    /// weight set is wrapped in a vec during migration.
+    /// Single classifier weight set, stored as Vec for backward compat with
+    /// persisted models.
     #[serde(default, deserialize_with = "deserialize_classifier_opt")]
     classifier: Option<Vec<ClassifierWeights>>,
     /// Per-member validation losses from pre-mahbot-904 persisted models.
@@ -6544,7 +6485,7 @@ struct PersistedModel {
     /// newly persisted models and never read on load (uniform averaging).
     #[serde(skip_serializing_if = "Option::is_none")]
     val_losses: Option<Vec<f32>>,
-    /// Second-stage verifier (MLP or legacy logistic regression).
+    /// Second-stage logistic regression verifier.
     #[serde(default)]
     verifier: Option<VoiceVerifier>,
 }
@@ -6592,7 +6533,7 @@ fn default_window_size() -> u32 {
 }
 
 /// Deserialize `classifier` as `Option<Vec<ClassifierWeights>>`, handling:
-/// - New format: `classifier` is an array of weight sets (ensemble).
+/// - New format: `classifier` is an array of weight sets.
 /// - Legacy format: `classifier` is a single weight set object → wrapped in vec.
 /// - Missing / null → `None`.
 pub(crate) fn deserialize_classifier_opt<'de, D>(
@@ -6605,7 +6546,7 @@ where
     match val {
         None => Ok(None),
         Some(v) => {
-            // Try as Vec<ClassifierWeights> (new ensemble format)
+            // Try as Vec<ClassifierWeights> (new array format)
             if let Ok(members) = serde_json::from_value::<Vec<ClassifierWeights>>(v.clone()) {
                 return Ok(Some(members));
             }
@@ -6811,7 +6752,7 @@ async fn persist_model_state() {
         phrase,
         embedding_dim: u32::try_from(EMBEDDING_DIM).unwrap(),
         window_size: u32::try_from(wake_word_classifier::WINDOW_SIZE).unwrap(),
-        training_seeds: (0..wake_word_classifier::NUM_ENSEMBLE_MEMBERS)
+        training_seeds: (0usize..1)
             .map(|s| s as u64) // safe widening: usize → u64 on 64-bit targets
             .collect(),
         created_at: if existing_created_at.is_empty() {
@@ -6821,7 +6762,7 @@ async fn persist_model_state() {
         },
         trained_at: now,
         model_hash: String::new(), // computed below
-        classifier: weights,
+        classifier: weights.map(|w| vec![w]),
         val_losses: None, // mahbot-904: no longer stored (uniform averaging)
         verifier: Some(verifier),
     };
@@ -7127,14 +7068,14 @@ fn score_stride8_window(
     }
 }
 
-/// Handle wake word detection: process audio frames through mel/embedding/Conv1D MLP classifier.
+/// Handle wake word detection: process audio frames through mel/embedding/Conv1D classifier.
 ///
 /// Audio arrives in small chunks (~256 samples at 16kHz). This function:
 /// 1. Accumulates audio in a sliding window for VAD
 /// 2. Collects voiced frames into a batch buffer
 /// 3. Processes the batch through mel ONNX when enough audio is accumulated (~128ms)
-/// 4. Produces embeddings and runs the Conv1D MLP classifier on 3-embedding windows
-/// 5. Passes MLP confidence scores through the rolling window accumulator
+/// 4. Produces embeddings and runs the Conv1D classifier on 3-embedding windows
+/// 5. Passes classifier confidence scores through the rolling window accumulator
 ///
 /// Batching reduces ONNX inference calls from ~62/sec (per-frame) to ~8/sec.
 ///
@@ -7775,7 +7716,7 @@ mod tests {
     use super::*;
     use crate::VERIFIER_INPUT_DIM;
     use crate::util::{add_noise, apply_gain, generate_pink_noise};
-    use crate::voice_verifier::{DEFAULT_VERIFIER_THRESHOLD, MLP_HIDDEN_1, MLP_HIDDEN_2};
+    use crate::voice_verifier::DEFAULT_VERIFIER_THRESHOLD;
     use rand::SeedableRng;
     use std::time::{Duration, Instant};
 
@@ -10003,42 +9944,26 @@ mod tests {
     // detection threshold (1.35) at the 3rd embedding (1.65 ≥ 1.35).
 
     /// Build a verifier that always produces a score below the rejection
-    /// threshold.  All MLP weights are zeroed; b3 = -2.0 gives
-    /// sigmoid(-2.0) ≈ 0.12 < 0.50.
+    /// threshold.  Logistic bias = -2.0 gives sigmoid(-2.0) ≈ 0.12 < 0.948.
     fn verifier_always_reject() -> VoiceVerifier {
         VoiceVerifier {
             trained: true,
             threshold: DEFAULT_VERIFIER_THRESHOLD,
-            w1: vec![0.0; VERIFIER_INPUT_DIM * MLP_HIDDEN_1],
-            b1: vec![0.0; MLP_HIDDEN_1],
-            w2: vec![0.0; MLP_HIDDEN_1 * MLP_HIDDEN_2],
-            b2: vec![0.0; MLP_HIDDEN_2],
-            w3: vec![0.0; MLP_HIDDEN_2],
-            verifier_version: crate::voice_verifier::VERIFIER_VERSION_LEGACY,
-            b3: -2.0, // sigmoid(-2.0) ≈ 0.12
-            weights: Vec::new(),
-            bias: 0.0,
+            weights: vec![0.0; EMBEDDING_DIM],
+            bias: -2.0, // sigmoid(-2.0) ≈ 0.12
             scaler_mean: Vec::new(),
             scaler_std: Vec::new(),
         }
     }
 
     /// Build a verifier that always produces a score above the confirmation
-    /// threshold.  All MLP weights are zeroed; b3 = 3.0 gives
-    /// sigmoid(3.0) ≈ 0.95 > 0.948 = DEFAULT_VERIFIER_THRESHOLD.
+    /// threshold.  Logistic bias = 3.0 gives sigmoid(3.0) ≈ 0.95 > 0.948.
     fn verifier_always_accept() -> VoiceVerifier {
         VoiceVerifier {
             trained: true,
             threshold: DEFAULT_VERIFIER_THRESHOLD,
-            w1: vec![0.0; VERIFIER_INPUT_DIM * MLP_HIDDEN_1],
-            b1: vec![0.0; MLP_HIDDEN_1],
-            w2: vec![0.0; MLP_HIDDEN_1 * MLP_HIDDEN_2],
-            b2: vec![0.0; MLP_HIDDEN_2],
-            w3: vec![0.0; MLP_HIDDEN_2],
-            verifier_version: crate::voice_verifier::VERIFIER_VERSION_LEGACY,
-            b3: 3.0, // sigmoid(3.0) ≈ 0.95
-            weights: Vec::new(),
-            bias: 0.0,
+            weights: vec![0.0; EMBEDDING_DIM],
+            bias: 3.0, // sigmoid(3.0) ≈ 0.95
             scaler_mean: Vec::new(),
             scaler_std: Vec::new(),
         }

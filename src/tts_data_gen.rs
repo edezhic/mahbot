@@ -1,7 +1,7 @@
 //! Training data generation for wake word classifier.
 //!
 //! This module provides utilities for generating synthetic training data
-//! for the MLP wake word classifier (mahbot-810). It uses the TTS engine
+//! for the wake word classifier (mahbot-810). It uses the TTS engine
 //! to synthesize wake word utterances with diverse voice styles, then
 //! applies audio augmentation (noise, volume, speed) before extracting
 //! 96-dim embedding vectors via the voice pipeline's mel spectrogram +
@@ -314,7 +314,7 @@ fn prepare_training_env() -> Result<PathBuf> {
 ///
 /// # Integration with mahbot-810
 ///
-/// This function is designed to be called from the MLP classifier training
+/// This function is designed to be called from the classifier training
 /// pipeline. The output directory (`~/.mahbot/training/`) contains:
 /// - `positive_embeddings.bin` — serialized `Vec<Vec<f32>>` (rows = 96-dim vectors)
 /// - `negative_embeddings.bin` — serialized `Vec<Vec<f32>>`

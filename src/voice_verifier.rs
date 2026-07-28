@@ -1,32 +1,19 @@
 //! Verifier for wake word false-trigger suppression.
 //!
 //! Implements a lightweight second-stage classifier that runs AFTER the
-//! Conv1D MLP classifier fires, as an additional AND gate. Two architectures
-//! are available, switchable via `MAHBOT_USE_LOGISTIC_VERIFIER` env var:
+//! Conv1D classifier fires, as an additional AND gate.
 //!
-//! - **MLP (default)**: 3-layer MLP (288 → 96 Leaky ReLU → 48 Leaky ReLU → 1
-//!   sigmoid) with StandardScaler normalization (mahbot-861).  Leaky ReLU
-//!   (slope 0.01) was adopted in mahbot-882 to prevent dead neuron issues.
-//!   Operates on 3-frame stride-1 windows (288-dim = 3×96).
-//! - **Logistic regression (mahbot-901)**: 97-parameter L2-regularized logistic
-//!   regression on temporally mean-pooled 96-dim embeddings.  Mean-pools the
-//!   3-frame window to 96-dim before L2-norm, scaler, and linear+sigmoid.
-//!   ~335× fewer parameters than the MLP, less prone to overfitting.
+//! Uses a **logistic regression** (mahbot-901): 97-parameter L2-regularized
+//! logistic regression on temporally mean-pooled 96-dim embeddings.
+//! Mean-pools the 3-frame window to 96-dim before L2-norm, scaler, and
+//! linear+sigmoid (~335× fewer parameters than the previous 3-layer MLP).
 //!
 //! When not trained, the verifier acts as a no-op (all frames pass).
 //!
 //! # Architecture
 //!
-//! Both architectures share the same training pipeline (per-frame embeddings →
-//! windowing → L2-norm → StandardScaler → train), differing only in window
-//! formation (concatenated 288-dim vs mean-pooled 96-dim) and the classifier
-//! itself (3-layer MLP with Adam vs linear SGD with L2).  Inference is
-//! ~3μs per frame for either path.
-//!
-//! Backward compatibility: old logistic regression models (pre-mahbot-861) and
-//! current MLP models are still supported for inference via `verifier_version`
-//! discrimination — version 0 auto-detects via heuristic, version 1 uses the
-//! logistic path explicitly.
+//! Training pipeline: per-frame embeddings → windowing → L2-norm →
+//! StandardScaler → train (logistic SGD with L2).  Inference is ~3μs per frame.
 //!
 //! ## Training data
 //!
@@ -48,44 +35,7 @@ use crate::embedding_sequence::EmbeddingSequence;
 use crate::wake_word_classifier::WakeWordClassifier;
 use crate::{EMBEDDING_DIM, VERIFIER_INPUT_DIM, VERIFIER_WINDOW_SIZE};
 
-/// Verifier architecture version: legacy auto-detect (MLP or linear).
-pub(crate) const VERIFIER_VERSION_LEGACY: u8 = 0;
-
-/// Verifier architecture version: logistic regression on mean-pooled 96-dim embeddings (mahbot-901).
-pub(crate) const VERIFIER_VERSION_LOGISTIC: u8 = 1;
-
-/// Define a cached env-var flag check function.
-///
-/// Generates a `$vis fn $name() -> bool` that checks `$env_var` once (then
-/// caches the result in a `OnceLock<bool>`).  Values `"1"` or `"true"`
-/// (case-insensitive) return `true`; all other values (including unset) return
-/// `false`.
-///
-/// # Example
-///
-/// ```ignore
-/// define_env_flag!(use_foo, "MAHBOT_USE_FOO");
-/// define_env_flag!(pub(crate) use_bar, "MAHBOT_USE_BAR");
-/// assert!(!use_foo());
-/// ```
-macro_rules! define_env_flag {
-    ($vis:vis $name:ident, $env_var:expr) => {
-        $vis fn $name() -> bool {
-            static CACHED: OnceLock<bool> = OnceLock::new();
-            *CACHED.get_or_init(|| match std::env::var($env_var) {
-                Ok(val) => {
-                    let v = val.trim().to_lowercase();
-                    v == "1" || v == "true"
-                }
-                Err(_) => false,
-            })
-        }
-    };
-}
-
-define_env_flag!(use_logistic_verifier, "MAHBOT_USE_LOGISTIC_VERIFIER");
-
-/// Default decision threshold for the verifier (MLP decision boundary).
+/// Default decision threshold for the verifier.
 ///
 /// Calibrated for **dense stride-8 embeddings** (mahbot-923).  The original
 /// threshold of 0.60 was calibrated against streaming embeddings (mahbot-890).
@@ -157,43 +107,7 @@ pub(crate) const LOGISTIC_LEARNING_RATE: f32 = 0.01;
 /// non-linear layers.
 pub(crate) const LOGISTIC_MAX_ITER: usize = 1000;
 
-/// Learning rate for gradient descent (Adam).
-pub(crate) const LEARNING_RATE: f32 = 0.001;
-
-/// Adam optimizer hyperparameters (mahbot-878).
-/// Replaces plain SGD with Adam for more stable and faster convergence.
-const ADAM_BETA1: f32 = 0.9;
-const ADAM_BETA2: f32 = 0.999;
-const ADAM_EPS: f32 = 1e-8;
-
-/// Maximum iterations for gradient descent.
-///
-/// Increased from 2,000 to 5,000 (mahbot-854) because class-weighted loss
-/// requires more iterations to converge — the positive gradient signal is
-/// amplified, making the loss landscape more complex.
-///
-/// Note: MLP training (mahbot-861) uses `MLP_MAX_ITER` (2000) instead since
-/// the non-linear layers converge faster.  `MAX_ITER` is retained for the
-/// `test_verifier_rejects_non_wake_speech` test which requires more iterations
-/// for stable convergence with broad-cluster non-wake speech negatives.
-#[cfg_attr(not(test), expect(dead_code))]
-pub(crate) const MAX_ITER: usize = 5000;
-
-/// MLP hidden layer 1 size (288 → 96).
-pub(crate) const MLP_HIDDEN_1: usize = 96;
-
-/// MLP hidden layer 2 size (96 → 48).
-pub(crate) const MLP_HIDDEN_2: usize = 48;
-
-/// Maximum iterations for MLP verifier training.
-///
-/// The MLP converges faster per-iteration than logistic regression because
-/// the non-linear hidden layers provide richer gradient signal.  Set to 2000
-/// as a balance between convergence quality and training latency (<1s with
-/// ~2655 training examples and ~32,401 parameters).
-pub(crate) const MLP_MAX_ITER: usize = 2000;
-
-/// How much to upweight confusable negative examples during MLP training.
+/// How much to upweight confusable negative examples during verifier training.
 ///
 /// Confusable phrases (e.g. "hey map bot", "day mahbot") are acoustically
 /// very similar to the wake word.  Without this upweighting, their gradient
@@ -207,7 +121,7 @@ pub(crate) const MLP_MAX_ITER: usize = 2000;
 /// the decision boundary while maintaining the zero-false-accept property.
 pub(crate) const CONFUSABLE_UPWEIGHT: f32 = 15.0;
 
-/// How much to upweight unrelated speech negative examples during MLP training.
+/// How much to upweight unrelated speech negative examples during verifier training.
 ///
 /// Unrelated phrases (e.g. "what time is it", "good morning everyone") are
 /// phonetically very different from the wake word but still represent real
@@ -283,7 +197,16 @@ const SYNTHETIC_NEGATIVES_COUNT: usize = 100;
 /// produce near-zero classifier scores (e.g., silent or toy environments).
 pub(crate) const MIN_MINED_NEGATIVES_FALLBACK: usize = 3;
 
-define_env_flag!(pub(crate) use_hard_negative_mining, "MAHBOT_USE_HARD_NEGATIVE_MINING");
+pub(crate) fn use_hard_negative_mining() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| match std::env::var("MAHBOT_USE_HARD_NEGATIVE_MINING") {
+        Ok(val) => {
+            let v = val.trim().to_lowercase();
+            v == "1" || v == "true"
+        }
+        Err(_) => false,
+    })
+}
 
 /// Result from hard-negative mining (mahbot-905).
 ///
@@ -294,7 +217,7 @@ pub(crate) struct MinedNegatives {
     /// Mined [`EmbeddingSequence`] values, one per selected window.
     ///
     /// Each sequence contains exactly [`VERIFIER_WINDOW_SIZE`] per-frame 96-dim
-    /// embeddings, so `train_inner` forms exactly one stride-1 window from it.
+    /// embeddings, so `train_logistic_inner` forms exactly one stride-1 window from it.
     pub sequences: Vec<EmbeddingSequence>,
     /// Number of source sequences that contributed at least one mined window.
     pub source_sequences_represented: usize,
@@ -404,7 +327,7 @@ pub(crate) fn mine_hard_negatives(
 
         // Build an EmbeddingSequence for each selected window.
         // Each sequence gets exactly VERIFIER_WINDOW_SIZE per-frame 96-dim
-        // embeddings so that train_inner forms exactly one stride-1 window.
+        // embeddings so that train_logistic_inner forms exactly one stride-1 window.
         for &idx in &selected_indices {
             let window_embs: Vec<Vec<f32>> = embeddings[idx..idx + VERIFIER_WINDOW_SIZE].to_vec();
             sequences.push(EmbeddingSequence::negative(
@@ -424,82 +347,34 @@ pub(crate) fn mine_hard_negatives(
 
 /// Verifier for wake word false-trigger suppression (second-stage AND gate).
 ///
-/// Two architectures are available, switchable via `MAHBOT_USE_LOGISTIC_VERIFIER`:
-///
-/// - **MLP (default, mahbot-861)**: 288 → 96 Leaky ReLU → 48 Leaky ReLU → 1
-///   sigmoid, ~32,401 params.  Operates on 3-frame stride-1 windows (288-dim).
-///   Computes `MLP(L2_norm(scaler(x)))`.
-/// - **Logistic regression (mahbot-901)**: 97-param L2-regularized logistic
-///   regression on temporally mean-pooled 96-dim embeddings.  Mean-pools the
-///   3-frame window to 96-dim before L2-norm, scaler, and linear+sigmoid.
-///   ~335× fewer parameters than the MLP, less prone to overfitting.
-///
-/// Both paths share the same training pipeline (per-frame embeddings →
-/// windowing → L2-norm → StandardScaler → train), differing only in window
-/// formation (concatenated 288-dim vs mean-pooled 96-dim) and classifier
-/// (3-layer MLP with Adam vs linear SGD with L2).
+/// Uses a **logistic regression** (mahbot-901): 97-parameter L2-regularized
+/// logistic regression on temporally mean-pooled 96-dim embeddings.
+/// Mean-pools the 3-frame window to 96-dim before L2-norm, scaler, and
+/// linear+sigmoid (~335× fewer parameters than the previous 3-layer MLP).
 ///
 /// When `trained` is `false`, the verifier is a no-op (all frames pass with
 /// score 1.0).
-///
-/// Backward compatibility: old serialized models with `weights`+`bias` (linear,
-/// pre-mahbot-861) that match the 288-dim input dimension are still supported
-/// via the version-0 legacy auto-detect heuristic.  Legacy 96-dim linear models
-/// are correctly rejected by `is_trained()` since they cannot process 288-dim
-/// windows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoiceVerifier {
-    /// Legacy logistic regression weights (backward compat, mahbot-777).
+    /// Logistic regression weights (96-dim, mahbot-901).
     #[serde(default)]
     pub weights: Vec<f32>,
-    /// Legacy logistic regression bias (backward compat).
+    /// Logistic regression bias.
     #[serde(default)]
     pub bias: f32,
 
-    // ── MLP weights (mahbot-861) ─────────────────────────────────────────
-    // Architecture: 288 → 96 (Leaky ReLU, slope 0.01) → 48 (Leaky ReLU, slope 0.01) → 1 (sigmoid)
-    //
-    // Storage convention (row-major):
-    //   w1[i * MLP_HIDDEN_1 + j] = weight from input[i] to hidden1[j]
-    //   w2[j * MLP_HIDDEN_2 + k] = weight from hidden1[j] to hidden2[k]
-    //   w3[k]                     = weight from hidden2[k] to output
-    /// Layer 1 weights: 288 × 96 (row-major).
-    #[serde(default)]
-    pub w1: Vec<f32>,
-    /// Layer 1 biases: 96.
-    #[serde(default)]
-    pub b1: Vec<f32>,
-    /// Layer 2 weights: 96 × 48 (row-major).
-    #[serde(default)]
-    pub w2: Vec<f32>,
-    /// Layer 2 biases: 48.
-    #[serde(default)]
-    pub b2: Vec<f32>,
-    /// Layer 3 weights: 48 × 1.
-    #[serde(default)]
-    pub w3: Vec<f32>,
-    /// Layer 3 bias (scalar).
-    #[serde(default)]
-    pub b3: f32,
-
-    /// StandardScaler mean (per-dimension). Empty when scaling is not used.
+    /// StandardScaler mean (96-dim). Empty when scaling is not used.
     #[serde(default)]
     pub scaler_mean: Vec<f32>,
-    /// StandardScaler std (per-dimension). Empty when scaling is not used.
+    /// StandardScaler std (96-dim). Empty when scaling is not used.
     #[serde(default)]
     pub scaler_std: Vec<f32>,
     /// Decision threshold. Frames with a score below this are suppressed.
     #[serde(default = "default_verifier_threshold")]
     pub threshold: f32,
     /// Whether this verifier has been trained with positive + negative data.
-    /// When true, expects 288-dim windowed inputs.
     #[serde(default)]
     pub trained: bool,
-    /// Verifier architecture version.
-    /// 0 = legacy auto-detect (MLP or linear, backward compat),
-    /// 1 = logistic regression on mean-pooled 96-dim embeddings (mahbot-901).
-    #[serde(default)]
-    pub verifier_version: u8,
 }
 
 fn default_verifier_threshold() -> f32 {
@@ -519,121 +394,41 @@ impl VoiceVerifier {
         Self {
             weights: Vec::new(),
             bias: 0.0,
-            w1: Vec::new(),
-            b1: Vec::new(),
-            w2: Vec::new(),
-            b2: Vec::new(),
-            w3: Vec::new(),
-            b3: 0.0,
             scaler_mean: Vec::new(),
             scaler_std: Vec::new(),
             threshold: DEFAULT_VERIFIER_THRESHOLD,
             trained: false,
-            verifier_version: VERIFIER_VERSION_LEGACY,
         }
     }
 
     /// Returns `true` if this verifier has been trained and is ready for
     /// inference.
     ///
-    /// Validates that the model has either MLP parameters (new format,
-    /// mahbot-861) or legacy linear weights (backward compat), and that
-    /// scaler dimensions match the input dimension (288).  MLP weight/bias
-    /// tensor sizes are also validated to prevent corrupted deserialization
-    /// from reaching index-out-of-bounds in `mlp_forward()`.
-    ///
-    /// When both MLP (corrupted) and linear (valid) are present, the linear
-    /// fallback is accepted — `predict()` will use `weights`/`bias` instead
-    /// of the corrupted MLP parameters.
+    /// Validates that logistic regression weights are the correct dimension
+    /// (96), the scaler is present and matches, and the bias is finite.
     #[must_use]
     pub fn is_trained(&self) -> bool {
         if !self.trained {
             return false;
         }
-
-        // ── Version 1: logistic regression on mean-pooled 96-dim (mahbot-901) ──
-        if self.verifier_version == VERIFIER_VERSION_LOGISTIC {
-            // Must have 96-dim weights.
-            if self.weights.len() != EMBEDDING_DIM {
-                return false;
-            }
-            // Must have scaler at 96-dim.
-            if self.scaler_mean.len() != EMBEDDING_DIM || self.scaler_std.len() != EMBEDDING_DIM {
-                return false;
-            }
-            // Bias must be finite.
-            return self.bias.is_finite();
-        }
-
-        // ── Version 0: legacy auto-detect (MLP or linear, backward compat) ──
-        let has_valid_mlp = self.has_valid_mlp_params();
-        let has_linear = !self.weights.is_empty();
-        if !has_valid_mlp && !has_linear {
+        // Must have 96-dim weights.
+        if self.weights.len() != EMBEDDING_DIM {
             return false;
         }
-        // If falling back to linear (no valid MLP), validate that weights
-        // dimension matches the expected input dimension.  A wrong-length
-        // weights vector would silently produce truncated dot products via
-        // zip() in predict().
-        if !has_valid_mlp && has_linear && self.weights.len() != VERIFIER_INPUT_DIM {
-            return false;
+        // If scaler is present, it must be at 96-dim and both mean and std
+        // must be populated.  Empty scaler is OK (inference skips scaling).
+        let has_mean = !self.scaler_mean.is_empty();
+        let has_std = !self.scaler_std.is_empty();
+        if has_mean != has_std {
+            return false; // partial scaler
         }
-        // Reject linear + scaler combination (mahbot-870).  predict() ignores
-        // the scaler for linear models (legacy linear models predate both L2
-        // normalization and the StandardScaler), so accepting this combination
-        // would silently produce wrong predictions — the scaler is fitted and
-        // stored but never applied.  Only the MLP path uses the scaler.
-        if !has_valid_mlp
-            && has_linear
-            && (!self.scaler_mean.is_empty() || !self.scaler_std.is_empty())
+        if has_mean
+            && (self.scaler_mean.len() != EMBEDDING_DIM || self.scaler_std.len() != EMBEDDING_DIM)
         {
             return false;
         }
-        // If either scaler is non-empty, both must be present and match the
-        // 288-dim input.
-        let input_dim = VERIFIER_INPUT_DIM;
-        if (!self.scaler_mean.is_empty() || !self.scaler_std.is_empty())
-            && (self.scaler_mean.len() != input_dim || self.scaler_std.len() != input_dim)
-        {
-            return false;
-        }
-        true
-    }
-
-    /// Returns `true` if MLP weight/bias tensor dimensions match the
-    /// 288→96→48→1 architecture and `b3` is finite (no NaN/Inf which would
-    /// produce `sigmoid(NaN)=0.5` silently).
-    ///
-    /// Only `b3` (the scalar output bias) is checked for finiteness: it's a
-    /// single float, so the check is free, and a NaN there would corrupt every
-    /// prediction (sigmoid output pinned to 0.5) — the most dangerous single
-    /// failure point from serialization corruption.  Weight tensors are not
-    /// individually validated for NaN/Inf because element-wise checks on ~32401
-    /// floats would dominate the `is_trained()` hot path; dimension mismatches
-    /// (caught above) cover most real-world serialization format errors.
-    ///
-    /// Used by both `is_trained()` and `predict()` to safely route between
-    /// MLP and legacy linear inference paths.
-    ///
-    /// ⚠ **Temporary — will be removed after mahbot-901 benchmark validates logistic as default.**
-    #[must_use]
-    fn has_valid_mlp_params(&self) -> bool {
-        if self.w1.is_empty() || self.b1.is_empty() {
-            return false;
-        }
-        // Check tensor dimensions match the architecture.
-        if self.w1.len() != VERIFIER_INPUT_DIM * MLP_HIDDEN_1
-            || self.b1.len() != MLP_HIDDEN_1
-            || self.w2.len() != MLP_HIDDEN_1 * MLP_HIDDEN_2
-            || self.b2.len() != MLP_HIDDEN_2
-            || self.w3.len() != MLP_HIDDEN_2
-        {
-            return false;
-        }
-        // Check b3 is finite (the other tensors are validated by the training
-        // path, but a corrupted serialized model could have b3=NaN, which
-        // would produce sigmoid(NaN) = 0.5 silently).
-        self.b3.is_finite()
+        // Bias must be finite.
+        self.bias.is_finite()
     }
 
     /// Threshold for verifier decision-making.
@@ -682,131 +477,38 @@ impl VoiceVerifier {
 
     /// Predict the probability that the given window is a genuine wake word.
     ///
-    /// Accepts either:
-    /// - 288-dim concatenated 3-frame window (MLP or legacy linear path), or
-    /// - 96-dim mean-pooled window (logistic path, mahbot-901).
+    /// Accepts either 288-dim (mean-pools internally to 96-dim) or 96-dim
+    /// (already pooled, e.g. from training diagnostics) input.
     ///
     /// Returns a score in `[0.0, 1.0]`. When untrained, always returns `1.0`
     /// (no-op — all frames pass).
-    ///
-    /// For the MLP path, operates on 3-frame stride-1 windows (288-dim = 3×96),
-    /// matching the classifier's windowing convention (mahbot-870).  The logistic
-    /// path mean-pools to 96-dim before inference.
-    ///
-    /// Routing: logistic version (verifier_version=1) → [`predict_logistic`],
-    /// MLP (has_valid_mlp_params) → [`mlp_forward`], legacy linear
-    /// (weights+bias, no scaler) → dot product + sigmoid.
     #[must_use]
     pub fn predict(&self, embedding: &[f32]) -> f32 {
         if !self.is_trained() {
             return 1.0;
         }
 
-        // Logistic version: accepts either 288-dim (mean-pools internally) or
-        // 96-dim (already pooled, e.g. from training diagnostics).
-        if self.verifier_version == VERIFIER_VERSION_LOGISTIC {
-            return predict_logistic(
-                embedding,
-                &self.weights,
-                self.bias,
-                &self.scaler_mean,
-                &self.scaler_std,
-            );
-        }
-
-        // Legacy/MLP path: must be 288-dim.
-        if embedding.len() != VERIFIER_INPUT_DIM {
-            warn!(
-                "Verifier embedding dimension mismatch: got {}, expected {}; falling back to no-op",
-                embedding.len(),
-                VERIFIER_INPUT_DIM,
-            );
-            return 1.0;
-        }
-
-        // ═══════════════════════════════════════════════════════════════════
-        // Legacy/MLP path: raw 288-dim window → L2-norm → scaler → MLP or linear
-        // ═══════════════════════════════════════════════════════════════════
-        //
-        // Training convention (mahbot-870): form_stride1_windows()
-        // L2-normalizes each 288-dim window first, then the scaler is
-        // fitted on L2-normalized windows.  Inference must match the
-        // same ordering so the MLP receives inputs from the same
-        // distribution as training.
-        //
-        // Both intermediate buffers use stack-allocated arrays (288 f32s =
-        // 1152 bytes each) instead of heap Vecs, since predict() is called
-        // on every streaming inference frame (mahbot-874).
-
-        // Step 1: L2-normalize the input window (unit-sphere projection).
-        let norm_l2: f32 = embedding
-            .iter()
-            .map(|v| v * v)
-            .sum::<f32>()
-            .sqrt()
-            .max(1e-10);
-        let mut x_l2 = [0.0f32; VERIFIER_INPUT_DIM];
-        #[allow(clippy::cast_precision_loss)]
-        for (i, &v) in embedding.iter().enumerate() {
-            x_l2[i] = v / norm_l2;
-        }
-
-        // Step 2: Apply StandardScaler (per-dim mean/std centering) on
-        // the L2-normalized values — same order as training pipeline.
-        let x: [f32; VERIFIER_INPUT_DIM] =
-            if !self.scaler_mean.is_empty() && !self.scaler_std.is_empty() {
-                let mut scaled = [0.0f32; VERIFIER_INPUT_DIM];
-                for i in 0..VERIFIER_INPUT_DIM {
-                    let std = self.scaler_std[i];
-                    scaled[i] = if std > 0.0 {
-                        (x_l2[i] - self.scaler_mean[i]) / std
-                    } else {
-                        x_l2[i]
-                    };
-                }
-                scaled
-            } else {
-                x_l2 // no scaler — use L2-normalized input directly
-            };
-
-        // Use MLP if available (new format, mahbot-861), fall back to legacy
-        // linear model for backward compatibility with 288-dim linear models.
-        if self.has_valid_mlp_params() {
-            mlp_forward(
-                &x, &self.w1, &self.b1, &self.w2, &self.b2, &self.w3, self.b3,
-            )
-        } else if !self.weights.is_empty() {
-            // Legacy linear combination: z = w·x + b.
-            // Note: legacy linear models predate L2-norm and scaler,
-            // so use raw embedding directly (not the L2-normed/scaled x).
-            let z: f32 = embedding
-                .iter()
-                .zip(self.weights.iter())
-                .map(|(x, w)| x * w)
-                .sum::<f32>()
-                + self.bias;
-            sigmoid(z)
-        } else {
-            unreachable!(
-                "predict() called on trained verifier with neither MLP nor linear weights"
-            );
-        }
+        // Logistic regression on mean-pooled 96-dim embeddings (mahbot-901).
+        // Accepts either 288-dim (mean-pools internally) or 96-dim
+        // (already pooled, e.g. from training diagnostics).
+        predict_logistic(
+            embedding,
+            &self.weights,
+            self.bias,
+            &self.scaler_mean,
+            &self.scaler_std,
+        )
     }
 
     /// Train a new verifier from positive and negative
     /// [`EmbeddingSequence`](crate::embedding_sequence::EmbeddingSequence)
-    /// inputs.  Trains a 3-layer MLP (default) or logistic regression
-    /// (when `MAHBOT_USE_LOGISTIC_VERIFIER=1`) with L2 regularization.
+    /// inputs.  Trains a logistic regression classifier with L2 regularization.
     ///
     /// Windows are formed **within** each sequence independently (never across
     /// sequences), preventing the cross-utterance window contamination that
     /// existed when training operated on flat `&[Vec<f32>]` lists (mahbot-902).
-    /// The MLP path concatenates 3-frame stride-1 windows to 288-dim; the
-    /// logistic path mean-pools to 96-dim windows (mahbot-901).  Each window
-    /// is L2-normalized before training (mahbot-870).
-    ///
-    /// MLP architecture: 288 → 96 (Leaky ReLU, slope 0.01) → 48 (Leaky ReLU, slope 0.01) → 1 (sigmoid), ~32,401 params.
-    /// Logistic architecture: 97-param L2-regularized logistic regression on mean-pooled 96-dim embeddings.
+    /// Windows are mean-pooled to 96-dim (mahbot-901) and L2-normalized before
+    /// training (mahbot-870).
     ///
     /// # Arguments
     ///
@@ -825,8 +527,8 @@ impl VoiceVerifier {
     /// * `threshold` — Decision threshold (defaults to
     ///   [`DEFAULT_VERIFIER_THRESHOLD`] in production).
     /// * `l2_lambda` — L2 regularisation strength.
-    /// * `learning_rate` — Gradient descent learning rate.
-    /// * `max_iter` — Maximum gradient descent iterations.
+    /// * `rng_seed` — Optional seed for deterministic training (same seed +
+    ///   same data = identical weights).  Production uses `None` (entropy-based).
     ///
     /// Returns a trained `VoiceVerifier`, or an untrained verifier if either
     /// input list is empty or no windows can be formed (all sequences shorter
@@ -839,42 +541,25 @@ impl VoiceVerifier {
         per_negative_sequence_weights: Option<&[f32]>,
         threshold: f32,
         l2_lambda: f32,
-        learning_rate: f32,
-        max_iter: usize,
         rng_seed: Option<u64>,
     ) -> Self {
-        let use_logistic = use_logistic_verifier();
-        // Override hyperparameters for logistic (convex SGD with 97 params
-        // converges well with higher LR and fewer iterations), matching the
-        // dispatch in [`train_with_synthetic_negatives`].
-        let (learning_rate, max_iter) = if use_logistic {
-            (LOGISTIC_LEARNING_RATE, LOGISTIC_MAX_ITER)
-        } else {
-            (learning_rate, max_iter)
-        };
-        Self::train_inner(
+        Self::train_logistic_inner(
             positive_sequences,
             negative_sequences,
             per_negative_sequence_weights,
             threshold,
             l2_lambda,
-            learning_rate,
-            max_iter,
+            LOGISTIC_LEARNING_RATE,
+            LOGISTIC_MAX_ITER,
             rng_seed,
-            use_logistic,
         )
     }
 
-    /// Internal training dispatch with explicit model selection.
+    /// Internal training: logistic regression on mean-pooled 96-dim windows.
     ///
-    /// When `use_logistic` is true, uses mean-pooled windowing + logistic SGD.
-    /// When false, uses concatenated windowing + 3-layer MLP with Adam.
-    ///
-    /// This is the single decision point for the verifier architecture — both
-    /// [`train`](Self::train) (public, env-var-driven) and
-    /// [`train_with_synthetic_negatives`](Self::train_with_synthetic_negatives)
-    /// (hyperparameter-aware) delegate here with an explicit `use_logistic` flag,
-    /// eliminating the coupling risk of independently checking the env var.
+    /// This is the single training path used by both
+    /// [`train`](Self::train) and
+    /// [`train_with_synthetic_negatives`](Self::train_with_synthetic_negatives).
     #[must_use]
     #[allow(
         clippy::too_many_arguments,
@@ -882,7 +567,7 @@ impl VoiceVerifier {
         clippy::similar_names,
         clippy::cast_precision_loss
     )]
-    fn train_inner(
+    fn train_logistic_inner(
         positive_sequences: &[EmbeddingSequence],
         negative_sequences: &[EmbeddingSequence],
         per_negative_sequence_weights: Option<&[f32]>,
@@ -891,7 +576,6 @@ impl VoiceVerifier {
         learning_rate: f32,
         max_iter: usize,
         rng_seed: Option<u64>,
-        use_logistic: bool,
     ) -> Self {
         // Early exit if either side has zero frames to avoid training on empty data.
         // Both positive and negative examples are required (mahbot-902).
@@ -930,7 +614,7 @@ impl VoiceVerifier {
 
         // Positive sequences
         for seq in positive_sequences {
-            let seq_windows = form_sequence_windows(&seq.embeddings, use_logistic);
+            let seq_windows = form_sequence_windows(&seq.embeddings);
             for w in seq_windows {
                 windows.push(w);
                 window_labels.push(1.0);
@@ -941,7 +625,7 @@ impl VoiceVerifier {
 
         // Negative sequences
         for (i, seq) in negative_sequences.iter().enumerate() {
-            let seq_windows = form_sequence_windows(&seq.embeddings, use_logistic);
+            let seq_windows = form_sequence_windows(&seq.embeddings);
             let seq_weight = weights_to_use.map_or(1.0, |pw| pw[i]);
             for w in seq_windows {
                 windows.push(w);
@@ -984,13 +668,21 @@ impl VoiceVerifier {
             }
         }
 
-        let mut use_logistic = use_logistic;
-        if use_logistic && windows[0].len() != EMBEDDING_DIM {
-            warn!(
-                "Logistic mode but {}-dim features; falling back to MLP",
-                windows[0].len()
-            );
-            use_logistic = false;
+        // If pre-windowed 288-dim input was provided, mean-pool to 96-dim
+        // (logistic path, mahbot-901).
+        if !windows.is_empty() && windows[0].len() != EMBEDDING_DIM {
+            for w in &mut windows {
+                let mut pooled = vec![0.0f32; EMBEDDING_DIM];
+                mean_pool_window_into(w, &mut pooled);
+                *w = pooled;
+            }
+            // Re-L2-normalize after pooling.
+            for w in &mut windows {
+                let norm = w.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
+                for v in w.iter_mut() {
+                    *v /= norm;
+                }
+            }
         }
 
         let (scaler_mean, scaler_std) = compute_standard_scaler(&windows);
@@ -1001,66 +693,23 @@ impl VoiceVerifier {
                 *v = (*v - scaler_mean[j]) / std;
             }
         }
-        let input_dim = scaled[0].len();
 
-        let verifier = if use_logistic {
-            let (weights, bias) = train_logistic_sgd(
-                &scaled,
-                &window_labels,
-                &window_weights,
-                l2_lambda,
-                learning_rate,
-                max_iter,
-                rng_seed,
-            );
-            Self {
-                trained: true,
-                verifier_version: VERIFIER_VERSION_LOGISTIC,
-                weights,
-                bias,
-                w1: Vec::new(),
-                b1: Vec::new(),
-                w2: Vec::new(),
-                b2: Vec::new(),
-                w3: Vec::new(),
-                b3: 0.0,
-                scaler_mean,
-                scaler_std,
-                threshold,
-            }
-        } else {
-            let MlpWeights {
-                w1,
-                b1,
-                w2,
-                b2,
-                w3,
-                b3,
-            } = train_mlp(
-                &scaled,
-                &window_labels,
-                input_dim,
-                &window_weights,
-                l2_lambda,
-                learning_rate,
-                max_iter,
-                rng_seed,
-            );
-            Self {
-                trained: true,
-                verifier_version: VERIFIER_VERSION_LEGACY,
-                weights: Vec::new(),
-                bias: 0.0,
-                w1,
-                b1,
-                w2,
-                b2,
-                w3,
-                b3,
-                scaler_mean,
-                scaler_std,
-                threshold,
-            }
+        let (weights, bias) = train_logistic_sgd(
+            &scaled,
+            &window_labels,
+            &window_weights,
+            l2_lambda,
+            learning_rate,
+            max_iter,
+            rng_seed,
+        );
+        let verifier = Self {
+            trained: true,
+            weights,
+            bias,
+            scaler_mean,
+            scaler_std,
+            threshold,
         };
 
         // Diagnostics
@@ -1102,9 +751,8 @@ impl VoiceVerifier {
     /// matched via [`generate_synthetic_negatives_from_positives`] instead of
     /// pure N(0,1) Gaussian noise).
     ///
-    /// Uses appropriate training hyperparameters based on the active verifier
-    /// model: `LOGISTIC_MAX_ITER` / `LOGISTIC_LEARNING_RATE` when logistic is
-    /// enabled, or `MLP_MAX_ITER` / `LEARNING_RATE` for the MLP path.
+    /// Uses logistic training hyperparameters (`LOGISTIC_MAX_ITER` /
+    /// `LOGISTIC_LEARNING_RATE`).
     ///
     /// When `rng_seed` is `Some(seed)`, uses a seeded RNG for all random
     /// operations (synthetic negative generation + weight initialization),
@@ -1116,12 +764,6 @@ impl VoiceVerifier {
         threshold: f32,
         rng_seed: Option<u64>,
     ) -> Self {
-        let use_logistic = use_logistic_verifier();
-        let (max_iter, learning_rate) = if use_logistic {
-            (LOGISTIC_MAX_ITER, LOGISTIC_LEARNING_RATE)
-        } else {
-            (MLP_MAX_ITER, LEARNING_RATE)
-        };
         // Extract flat embeddings from all positive sequences for the helper.
         let flat_positives: Vec<Vec<f32>> = positive_sequences
             .iter()
@@ -1142,16 +784,15 @@ impl VoiceVerifier {
             None,
             negatives,
         );
-        Self::train_inner(
+        Self::train_logistic_inner(
             positive_sequences,
             &[synth_seq],
             None, // no per-negative weights for synthetic negatives
             threshold,
             L2_LAMBDA,
-            learning_rate,
-            max_iter,
+            LOGISTIC_LEARNING_RATE,
+            LOGISTIC_MAX_ITER,
             rng_seed,
-            use_logistic,
         )
     }
 }
@@ -1160,22 +801,20 @@ impl VoiceVerifier {
 // Window helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Form windows from a per-frame embedding list, dispatching to either
-/// stride-1 concatenated windows (MLP) or mean-pooled windows (logistic).
+/// Form windows from a per-frame embedding list.
+///
+/// Always uses mean-pooled 96-dim windows (logistic path, mahbot-901).
 ///
 /// Input can be either per-frame 96-dim embeddings (which get windowed)
-/// or pre-windowed 288-dim data (which is L2-normalized and used directly).
-fn form_sequence_windows(embeddings: &[Vec<f32>], use_logistic: bool) -> Vec<Vec<f32>> {
+/// or pre-windowed 288-dim data (which is mean-pooled to 96-dim and
+/// L2-normalized).
+fn form_sequence_windows(embeddings: &[Vec<f32>]) -> Vec<Vec<f32>> {
     if embeddings.is_empty() {
         return Vec::new();
     }
     if embeddings[0].len() == EMBEDDING_DIM {
-        // Per-frame: form stride-1 windows.
-        if use_logistic {
-            form_stride1_pooled_windows(embeddings)
-        } else {
-            form_stride1_windows(embeddings)
-        }
+        // Per-frame: form stride-1 mean-pooled windows.
+        form_stride1_pooled_windows(embeddings)
     } else {
         // Pre-windowed: L2-normalize and use directly.
         embeddings
@@ -1281,19 +920,6 @@ fn stride1_windows_impl(
         windows.push(window);
     }
     windows
-}
-
-/// Form stride-1 windows from a flat list of 96-dim embeddings.
-///
-/// Each window is 3 consecutive embeddings concatenated into a 288-dim vector,
-/// then L2-normalized (matching classifier convention).  Consecutive windows
-/// overlap by 2 embeddings (stride 1).
-///
-/// Returns empty vec if fewer than 3 embeddings are available.
-fn form_stride1_windows(embeddings: &[Vec<f32>]) -> Vec<Vec<f32>> {
-    stride1_windows_impl(embeddings, VERIFIER_INPUT_DIM, |i, out| {
-        fill_verifier_window(embeddings, i, out);
-    })
 }
 
 /// Form stride-1 mean-pooled windows from a flat list of 96-dim embeddings.
@@ -1432,89 +1058,11 @@ fn compute_standard_scaler(features: &[Vec<f32>]) -> (Vec<f32>, Vec<f32>) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// MLP inference
+// Synthetic negatives
 // ═══════════════════════════════════════════════════════════════════════════
-
-/// Forward pass through the 3-layer MLP (288 → 96 Leaky ReLU → 48 Leaky ReLU → 1 sigmoid).
-///
-/// ⚠ **Temporary — will be removed after mahbot-901 benchmark validation.**
-///
-/// # Panics
-///
-/// May panic (index out of bounds) if tensor sizes don't match the
-/// architecture — callers should validate dimensions via [`VoiceVerifier::is_trained`]
-/// before calling this function.
-fn mlp_forward(
-    x: &[f32],
-    w1: &[f32],
-    b1: &[f32],
-    w2: &[f32],
-    b2: &[f32],
-    w3: &[f32],
-    b3: f32,
-) -> f32 {
-    let h1_size = MLP_HIDDEN_1;
-    let h2_size = MLP_HIDDEN_2;
-    let input_dim = x.len();
-
-    // Layer 1: h1 = LeakyReLU(W1^T · x + b1, slope=0.01)
-    // w1 is stored row-major: w1[i * h1_size + j] = weight from x[i] to h1[j]
-    // So h1[j] = sum_i x[i] * w1[i * h1_size + j] + b1[j]
-    let mut h1 = vec![0.0; h1_size];
-    for j in 0..h1_size {
-        let mut s = b1[j];
-        for i in 0..input_dim {
-            s += x[i] * w1[i * h1_size + j];
-        }
-        h1[j] = if s > 0.0 { s } else { 0.01 * s }; // Leaky ReLU (mahbot-882)
-    }
-
-    // Layer 2: h2 = LeakyReLU(W2^T · h1 + b2, slope=0.01)
-    let mut h2 = vec![0.0; h2_size];
-    for k in 0..h2_size {
-        let mut s = b2[k];
-        for j in 0..h1_size {
-            s += h1[j] * w2[j * h2_size + k];
-        }
-        h2[k] = if s > 0.0 { s } else { 0.01 * s }; // Leaky ReLU (mahbot-882)
-    }
-
-    // Layer 3: out = sigmoid(W3^T · h2 + b3)
-    let mut z = b3;
-    for k in 0..h2_size {
-        z += h2[k] * w3[k];
-    }
-
-    sigmoid(z)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// MLP training
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Trained MLP weights and biases for the 288→96→48→1 voice verifier
-/// (mahbot-861).  Returned by [`train_mlp`] to provide compile-time
-/// argument-order safety when assigning fields to the [`VoiceVerifier`].
-///
-/// ⚠ **Temporary — will be removed after mahbot-901 benchmark validates logistic as default.**
-struct MlpWeights {
-    /// 288 × 96, row-major: `w1[i * 96 + j]` = weight from input `i` to h1 `j`.
-    w1: Vec<f32>,
-    /// 96 bias terms for h1.
-    b1: Vec<f32>,
-    /// 96 × 48, row-major: `w2[j * 48 + k]` = weight from h1 `j` to h2 `k`.
-    w2: Vec<f32>,
-    /// 48 bias terms for h2.
-    b2: Vec<f32>,
-    /// 48 × 1, flat: `w3[k]` = weight from h2 `k` to output.
-    w3: Vec<f32>,
-    /// Scalar output bias.
-    b3: f32,
-}
 
 /// Train a logistic regression classifier on scaled 96-dim features using SGD
 /// with L2 regularization (mahbot-901).
-///
 /// The cross-entropy loss with L2 penalty and sample weighting is:
 /// ```text
 /// J = -(1/N) Σ w_i · [y_i·log(σ_i) + (1-y_i)·log(1-σ_i)] + (λ/2)·||w||²
@@ -1609,297 +1157,6 @@ fn train_logistic_sgd(
 
     (weights, bias)
 }
-
-/// Train a small MLP (288 → 96 → 48 → 1) using batch gradient descent with
-/// L2 regularization and per-sample weighting (mahbot-861).
-///
-/// ⚠ **Temporary — will be removed after mahbot-901 benchmark validates logistic as default.**
-///
-/// The cross-entropy loss with L2 penalty and sample weighting is:
-/// ```text
-/// J = -(1/N) Σ w_i · [y_i·log(σ_i) + (1-y_i)·log(1-σ_i)] + (λ/2)·||W||²_F
-/// ```
-///
-/// where `w_i` is the per-sample weight (includes class imbalance compensation
-/// and confusable-phrase upweighting), and `||W||²_F` is the Frobenius norm
-/// of all weight matrices (biases are not regularized).
-///
-/// Gradient averaging and L2 penalty follow sklearn conventions:
-/// * Gradients are averaged over the batch (division by N).
-/// * L2 penalty applied to weight matrices only (not biases).
-/// * Xavier uniform initialization for all weights.
-///
-/// # Returns
-/// [`MlpWeights`] — the trained MLP parameters with named fields.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::many_single_char_names,
-    clippy::similar_names,
-    clippy::too_many_arguments,
-    clippy::too_many_lines
-)]
-fn train_mlp(
-    features: &[Vec<f32>],  // scaled (n × dim)
-    labels: &[f32],         // 0.0 or 1.0
-    dim: usize,             // input dimension (288)
-    sample_weights: &[f32], // per-sample weight (n)
-    l2_lambda: f32,
-    learning_rate: f32,
-    max_iter: usize,
-    rng_seed: Option<u64>, // deterministic training when Some
-) -> MlpWeights {
-    let n = features.len();
-    let h1_size = MLP_HIDDEN_1; // 96
-    let h2_size = MLP_HIDDEN_2; // 48
-
-    if n == 0 || dim == 0 {
-        return MlpWeights {
-            w1: Vec::new(),
-            b1: Vec::new(),
-            w2: Vec::new(),
-            b2: Vec::new(),
-            w3: Vec::new(),
-            b3: 0.0,
-        };
-    }
-
-    // ── Initialize weights with Xavier uniform init ──
-    // w1: 288 × 96, stored row-major: w1[i * h1_size + j]
-    let mut w1 = vec![0.0; dim * h1_size];
-    let mut b1 = vec![0.0; h1_size];
-    // w2: 96 × 48, stored row-major: w2[j * h2_size + k]
-    let mut w2 = vec![0.0; h1_size * h2_size];
-    let mut b2 = vec![0.0; h2_size];
-    // w3: 48 × 1
-    let mut w3 = vec![0.0; h2_size];
-    let mut b3 = 0.0;
-
-    // Xavier/Glorot uniform bound: sqrt(6 / (fan_in + fan_out))
-    let w1_bound = (6.0 / (dim as f32 + h1_size as f32)).sqrt();
-    let w2_bound = (6.0 / (h1_size as f32 + h2_size as f32)).sqrt();
-    let w3_bound = (6.0 / (h2_size as f32 + 1.0)).sqrt();
-
-    // Create seeded or entropy-based RNG for weight initialization.
-    let mut rng: StdRng = if let Some(seed) = rng_seed {
-        StdRng::seed_from_u64(seed)
-    } else {
-        StdRng::seed_from_u64(rand::random())
-    };
-
-    for w in &mut w1 {
-        *w = rng.random::<f32>() * 2.0 * w1_bound - w1_bound;
-    }
-    for w in &mut w2 {
-        *w = rng.random::<f32>() * 2.0 * w2_bound - w2_bound;
-    }
-    for w in &mut w3 {
-        *w = rng.random::<f32>() * 2.0 * w3_bound - w3_bound;
-    }
-
-    // Pre-allocate work vectors
-    let mut h1_pre = vec![0.0; h1_size];
-    let mut h1 = vec![0.0; h1_size];
-    let mut h2_pre = vec![0.0; h2_size];
-    let mut h2 = vec![0.0; h2_size];
-    let mut dh2 = vec![0.0; h2_size];
-    let mut dh1 = vec![0.0; h1_size];
-
-    let n_f32 = n as f32;
-
-    // Gradient buffers (declared once, zeroed each iteration to avoid
-    // re-allocation churn: ~259 MB over 2000 iterations with ~32,401 params).
-    let mut dw1 = vec![0.0; dim * h1_size];
-    let mut db1 = vec![0.0; h1_size];
-    let mut dw2 = vec![0.0; h1_size * h2_size];
-    let mut db2 = vec![0.0; h2_size];
-    let mut dw3 = vec![0.0; h2_size];
-
-    // ── Adam optimizer state (mahbot-878) ──
-    // Replaces plain SGD with Adam for stable convergence.
-    // Each parameter group has its own momentum (m) and velocity (v).
-    let mut adam_t: usize = 0;
-    // w1: dim × h1_size
-    let mut adam_mmt_w1 = vec![0.0; w1.len()];
-    let mut adam_vel_w1 = vec![0.0; w1.len()];
-    let mut adam_mmt_b1 = vec![0.0; b1.len()];
-    let mut adam_vel_b1 = vec![0.0; b1.len()];
-    // w2: h1_size × h2_size
-    let mut adam_mmt_w2 = vec![0.0; w2.len()];
-    let mut adam_vel_w2 = vec![0.0; w2.len()];
-    let mut adam_mmt_b2 = vec![0.0; b2.len()];
-    let mut adam_vel_b2 = vec![0.0; b2.len()];
-    // w3: h2_size
-    let mut adam_mmt_w3 = vec![0.0; w3.len()];
-    let mut adam_vel_w3 = vec![0.0; w3.len()];
-    let mut adam_mmt_b3 = 0.0;
-    let mut adam_vel_b3 = 0.0;
-
-    for _iteration in 0..max_iter {
-        // Zero gradient buffers for this iteration.
-        dw1.fill(0.0);
-        db1.fill(0.0);
-        dw2.fill(0.0);
-        db2.fill(0.0);
-        dw3.fill(0.0);
-        let mut db3 = 0.0;
-
-        for i in 0..n {
-            let x = &features[i];
-            let y = labels[i];
-            let w = sample_weights[i];
-
-            // ── Forward pass ──────────────────────────────────────────────
-
-            // h1 = LeakyReLU(W1^T · x + b1, slope=0.01)
-            for j in 0..h1_size {
-                let mut s = b1[j];
-                for k in 0..dim {
-                    s += x[k] * w1[k * h1_size + j];
-                }
-                h1_pre[j] = s;
-                h1[j] = if s > 0.0 { s } else { 0.01 * s }; // Leaky ReLU (mahbot-882)
-            }
-
-            // h2 = LeakyReLU(W2^T · h1 + b2, slope=0.01)
-            for k in 0..h2_size {
-                let mut s = b2[k];
-                for j in 0..h1_size {
-                    s += h1[j] * w2[j * h2_size + k];
-                }
-                h2_pre[k] = s;
-                h2[k] = if s > 0.0 { s } else { 0.01 * s }; // Leaky ReLU (mahbot-882)
-            }
-
-            // out = sigmoid(W3^T · h2 + b3)
-            let mut z = b3;
-            for k in 0..h2_size {
-                z += h2[k] * w3[k];
-            }
-            let pred = sigmoid(z);
-
-            // ── Backward pass ─────────────────────────────────────────────
-
-            // Gradient of binary cross-entropy w.r.t. output logit:
-            // dL/dz = (pred - y); weighted: w * (pred - y)
-            let dz = w * (pred - y);
-
-            // Layer 3 (output): dL/dW3[k] = dL/dz * h2[k]
-            for k in 0..h2_size {
-                dw3[k] += dz * h2[k];
-            }
-            db3 += dz;
-
-            // Backprop to h2: dh2[k] = dL/dz * W3[k]
-            for k in 0..h2_size {
-                dh2[k] = dz * w3[k];
-                // Leaky ReLU derivative: d(h2)/d(pre) = 1 if pre > 0 else 0.01
-                if h2_pre[k] <= 0.0 {
-                    dh2[k] *= 0.01; // Leaky ReLU (mahbot-882)
-                }
-            }
-
-            // Layer 2: dL/dW2[j * h2_size + k] = dh2[k] * h1[j]
-            for j in 0..h1_size {
-                for k in 0..h2_size {
-                    dw2[j * h2_size + k] += dh2[k] * h1[j];
-                }
-            }
-            for k in 0..h2_size {
-                db2[k] += dh2[k];
-            }
-
-            // Backprop to h1: dh1[j] = sum_k dh2[k] * W2[j * h2_size + k]
-            for j in 0..h1_size {
-                let mut s = 0.0;
-                for k in 0..h2_size {
-                    s += dh2[k] * w2[j * h2_size + k];
-                }
-                dh1[j] = s;
-                // Leaky ReLU derivative (mahbot-882)
-                if h1_pre[j] <= 0.0 {
-                    dh1[j] *= 0.01; // Leaky ReLU slope
-                }
-            }
-
-            // Layer 1: dL/dW1[i * h1_size + j] = dh1[j] * x[i]
-            for i_idx in 0..dim {
-                for j in 0..h1_size {
-                    dw1[i_idx * h1_size + j] += dh1[j] * x[i_idx];
-                }
-            }
-            for j in 0..h1_size {
-                db1[j] += dh1[j];
-            }
-        }
-
-        // ── Average over batch and add L2 regularization ──
-        // (biases are not regularized, matching sklearn convention)
-        for w in &mut dw1 {
-            *w /= n_f32;
-        }
-        for w in &mut dw2 {
-            *w /= n_f32;
-        }
-        for w in &mut dw3 {
-            *w /= n_f32;
-        }
-        for d in &mut db1 {
-            *d /= n_f32;
-        }
-        for d in &mut db2 {
-            *d /= n_f32;
-        }
-        db3 /= n_f32;
-
-        // Add L2 regularization gradient: λ * w
-        for j in 0..w1.len() {
-            dw1[j] += l2_lambda * w1[j];
-        }
-        for j in 0..w2.len() {
-            dw2[j] += l2_lambda * w2[j];
-        }
-        for j in 0..w3.len() {
-            dw3[j] += l2_lambda * w3[j];
-        }
-
-        // ── Adam parameter update (mahbot-878) ──
-        adam_t += 1;
-        // Bias-corrected learning rate: lr * sqrt(1 - b2^t) / (1 - b1^t)
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let lr_t = learning_rate * (1.0 - ADAM_BETA2.powi(adam_t as i32)).sqrt()
-            / (1.0 - ADAM_BETA1.powi(adam_t as i32));
-
-        // Helper closure for Adam update on a parameter slice.
-        let adam_update = |p: &mut [f32], g: &[f32], m: &mut [f32], v: &mut [f32], lr_t: f32| {
-            for i in 0..p.len() {
-                m[i] = ADAM_BETA1 * m[i] + (1.0 - ADAM_BETA1) * g[i];
-                v[i] = ADAM_BETA2 * v[i] + (1.0 - ADAM_BETA2) * g[i] * g[i];
-                p[i] -= lr_t * m[i] / (v[i].sqrt() + ADAM_EPS);
-            }
-        };
-
-        adam_update(&mut w1, &dw1, &mut adam_mmt_w1, &mut adam_vel_w1, lr_t);
-        adam_update(&mut b1, &db1, &mut adam_mmt_b1, &mut adam_vel_b1, lr_t);
-        adam_update(&mut w2, &dw2, &mut adam_mmt_w2, &mut adam_vel_w2, lr_t);
-        adam_update(&mut b2, &db2, &mut adam_mmt_b2, &mut adam_vel_b2, lr_t);
-        adam_update(&mut w3, &dw3, &mut adam_mmt_w3, &mut adam_vel_w3, lr_t);
-        // b3 is a scalar — use single-element slices
-        let b3_grad = db3;
-        adam_mmt_b3 = ADAM_BETA1 * adam_mmt_b3 + (1.0 - ADAM_BETA1) * b3_grad;
-        adam_vel_b3 = ADAM_BETA2 * adam_vel_b3 + (1.0 - ADAM_BETA2) * b3_grad * b3_grad;
-        b3 -= lr_t * adam_mmt_b3 / (adam_vel_b3.sqrt() + ADAM_EPS);
-    }
-
-    MlpWeights {
-        w1,
-        b1,
-        w2,
-        b2,
-        w3,
-        b3,
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Synthetic negatives
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2120,37 +1377,6 @@ mod tests {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
-    /// Predict from a pre-scaled embedding, skipping the StandardScaler
-    /// and L2 normalization steps.  The input must be the fully processed
-    /// 288-dim window (L2-normalized then StandardScaler-applied, matching
-    /// the training pipeline order, mahbot-870).  No additional
-    /// preprocessing is performed.
-    ///
-    /// **Requires MLP parameters** (mahbot-870): `predict_scaled()` is a
-    /// test-only helper that bypasses preprocessing.  It only supports the
-    /// MLP inference path — legacy linear models (which predate both L2
-    /// normalization and the StandardScaler) are not supported through this
-    /// helper because they would need raw input, not processed input.
-    /// Callers must ensure the verifier has valid MLP parameters before
-    /// calling this function.
-    ///
-    /// ⚠ **Temporary — will be removed after mahbot-901 benchmark validates logistic as default.**
-    fn predict_scaled(verifier: &VoiceVerifier, scaled: &[f32]) -> f32 {
-        debug_assert!(
-            verifier.has_valid_mlp_params(),
-            "predict_scaled requires MLP parameters; linear models are not supported",
-        );
-        mlp_forward(
-            scaled,
-            &verifier.w1,
-            &verifier.b1,
-            &verifier.w2,
-            &verifier.b2,
-            &verifier.w3,
-            verifier.b3,
-        )
-    }
-
     /// Helper: wrap flat embeddings into a single EmbeddingSequence for testing.
     fn make_seq(
         embs: Vec<Vec<f32>>,
@@ -2210,7 +1436,7 @@ mod tests {
 
     /// Generate a synthetic 288-dim "non-wake-word" window with values
     /// distributed near 0 (simulating real non-wake-word speech or ambient
-    /// audio that survives Conv1D MLP matching).  Unlike the old opposite-direction
+    /// audio that survives Conv1D matching).  Unlike the old opposite-direction
     /// negatives (N(-0.5, 0.3)), these sit in the same general region as
     /// wake word embeddings but lack the consistent structure that the
     /// verifier must learn to discriminate (mahbot-797).
@@ -2293,8 +1519,6 @@ mod tests {
             None,                       // no per-negative weights
             DEFAULT_VERIFIER_THRESHOLD, // threshold
             0.001,                      // weak L2 (clean synthetic data)
-            0.1,                        // learning rate
-            500,                        // max iter
             None,                       // rng_seed (entropy-based)
         );
 
@@ -2339,8 +1563,6 @@ mod tests {
             None,                       // no per-negative weights
             DEFAULT_VERIFIER_THRESHOLD, // mahbot-853: lowered from 0.6 for streaming inference.
             L2_LAMBDA,                  // L2 regularization (mahbot-854: 0.01)
-            LEARNING_RATE,              // learning rate (mahbot-878: 0.001, Adam)
-            MAX_ITER,                   // max iterations (mahbot-854: 5000)
             None,                       // rng_seed (entropy-based)
         );
 
@@ -2428,54 +1650,9 @@ mod tests {
     }
 
     #[test]
-    fn test_verifier_serialization_roundtrip() {
-        // Train a verifier.
-        let mut rng = StdRng::seed_from_u64(42);
-        let positives: Vec<Vec<f32>> = (0..10).map(|_| make_positive_embedding(&mut rng)).collect();
-        let negatives: Vec<Vec<f32>> = (0..10).map(|_| make_negative_embedding(&mut rng)).collect();
-        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
-        let neg_seq = make_seq(negatives, crate::embedding_sequence::LabelStratum::Negative);
-
-        let verifier = VoiceVerifier::train(
-            &[pos_seq],
-            &[neg_seq],
-            None, // no per-negative weights
-            DEFAULT_VERIFIER_THRESHOLD,
-            0.001,
-            0.1,
-            500,
-            None, // rng_seed (entropy-based)
-        );
-
-        // Serialize to JSON.
-        let json = serde_json::to_string(&verifier).expect("serialize");
-
-        // Deserialize.
-        let deserialized: VoiceVerifier = serde_json::from_str(&json).expect("deserialize");
-
-        // Verify same predictions on held-out test vectors.
-        let test_pos = make_positive_embedding(&mut rng);
-        let test_neg = make_negative_embedding(&mut rng);
-
-        let score_before = verifier.predict(&test_pos);
-        let score_after = deserialized.predict(&test_pos);
-        assert!(
-            (score_before - score_after).abs() < 1e-4,
-            "Positive prediction must match after roundtrip: before={score_before:.4} after={score_after:.4}",
-        );
-
-        let score_before = verifier.predict(&test_neg);
-        let score_after = deserialized.predict(&test_neg);
-        assert!(
-            (score_before - score_after).abs() < 1e-4,
-            "Negative prediction must match after roundtrip: before={score_before:.4} after={score_after:.4}",
-        );
-    }
-
-    #[test]
     fn test_logistic_verifier_serialization_roundtrip() {
-        // Train a logistic model and verify JSON roundtrip preserves predictions,
-        // verifier_version, and is_trained() status.
+        // Train a logistic model and verify JSON roundtrip preserves predictions
+        // and is_trained() status.
         let mut rng = StdRng::seed_from_u64(42);
         let positives: Vec<Vec<f32>> = (0..30).map(|_| make_positive_frame(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..50).map(|_| make_negative_frame(&mut rng)).collect();
@@ -2520,17 +1697,10 @@ mod tests {
         let verifier = VoiceVerifier {
             weights,
             bias,
-            w1: Vec::new(),
-            b1: Vec::new(),
-            w2: Vec::new(),
-            b2: Vec::new(),
-            w3: Vec::new(),
-            b3: 0.0,
             scaler_mean,
             scaler_std,
             threshold: DEFAULT_VERIFIER_THRESHOLD,
             trained: true,
-            verifier_version: VERIFIER_VERSION_LOGISTIC,
         };
 
         // Verify it's considered trained.
@@ -2539,18 +1709,8 @@ mod tests {
         // Serialize to JSON.
         let json = serde_json::to_string(&verifier).expect("serialize");
 
-        // Verify JSON contains the version field.
-        assert!(
-            json.contains("\"verifier_version\":1"),
-            "JSON should contain verifier_version=1, got: {}",
-            &json[..json.len().min(200)],
-        );
-
         // Deserialize.
         let deserialized: VoiceVerifier = serde_json::from_str(&json).expect("deserialize");
-
-        // Verify version is preserved.
-        assert_eq!(deserialized.verifier_version, VERIFIER_VERSION_LOGISTIC);
 
         // Verify is_trained() works on deserialized model.
         assert!(
@@ -2578,18 +1738,18 @@ mod tests {
     }
 
     #[test]
-    fn test_logistic_train_inner_end_to_end() {
-        // End-to-end test for the full logistic training pipeline via train_inner:
+    fn test_logistic_train_logistic_inner_end_to_end() {
+        // End-to-end test for the full logistic training pipeline via train_logistic_inner:
         // form_stride1_pooled_windows → scaler fitting → train_logistic_sgd → model
         // construction.  Unlike test_logistic_verifier_serialization_roundtrip (which
-        // manually constructs the model), this exercises the actual train_inner path.
+        // manually constructs the model), this exercises the actual train_logistic_inner path.
         let mut rng = StdRng::seed_from_u64(42);
         let positives: Vec<Vec<f32>> = (0..30).map(|_| make_positive_frame(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..50).map(|_| make_negative_frame(&mut rng)).collect();
         let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
         let neg_seq = make_seq(negatives, crate::embedding_sequence::LabelStratum::Negative);
 
-        let verifier = VoiceVerifier::train_inner(
+        let verifier = VoiceVerifier::train_logistic_inner(
             &[pos_seq],
             &[neg_seq],
             None,
@@ -2598,14 +1758,9 @@ mod tests {
             LOGISTIC_LEARNING_RATE,
             LOGISTIC_MAX_ITER,
             Some(42),
-            true, // use_logistic
         );
 
         assert!(verifier.is_trained());
-        assert_eq!(
-            verifier.verifier_version, VERIFIER_VERSION_LOGISTIC,
-            "train_inner(use_logistic=true) must produce version LOGISTIC",
-        );
         assert_eq!(
             verifier.weights.len(),
             EMBEDDING_DIM,
@@ -2788,17 +1943,10 @@ mod tests {
         // weights must be detected as untrained.
         let verifier = VoiceVerifier {
             trained: true,
-            verifier_version: VERIFIER_VERSION_LEGACY,
-            weights: vec![0.5; VERIFIER_INPUT_DIM],
+            weights: vec![0.5; EMBEDDING_DIM],
             bias: 0.0,
-            w1: Vec::new(),
-            b1: Vec::new(),
-            w2: Vec::new(),
-            b2: Vec::new(),
-            w3: Vec::new(),
-            b3: 0.0,
-            scaler_mean: vec![0.1; 96], // wrong dimension (96 ≠ 288)
-            scaler_std: vec![0.2; 96],
+            scaler_mean: vec![0.1; 48], // wrong dimension (48 ≠ 96)
+            scaler_std: vec![0.2; 48],
             threshold: DEFAULT_VERIFIER_THRESHOLD,
         };
         assert!(
@@ -2809,17 +1957,10 @@ mod tests {
         // Also test partial mismatch: only scaler_std populated.
         let verifier2 = VoiceVerifier {
             trained: true,
-            verifier_version: VERIFIER_VERSION_LEGACY,
-            weights: vec![0.5; VERIFIER_INPUT_DIM],
+            weights: vec![0.5; EMBEDDING_DIM],
             bias: 0.0,
-            w1: Vec::new(),
-            b1: Vec::new(),
-            w2: Vec::new(),
-            b2: Vec::new(),
-            w3: Vec::new(),
-            b3: 0.0,
             scaler_mean: Vec::new(),
-            scaler_std: vec![0.2; 96], // non-empty but mismatched
+            scaler_std: vec![0.2; 48], // non-empty but mismatched
             threshold: DEFAULT_VERIFIER_THRESHOLD,
         };
         assert!(
@@ -2855,38 +1996,25 @@ mod tests {
             verifier.threshold, DEFAULT_VERIFIER_THRESHOLD,
             "threshold must match DEFAULT_VERIFIER_THRESHOLD",
         );
-        // These MLP-specific field assertions only apply when training produced
-        // an MLP model (the default). When MAHBOT_USE_LOGISTIC_VERIFIER is set,
-        // the model has weights at EMBEDDING_DIM (96) instead.
-        if !use_logistic_verifier() {
-            assert_eq!(verifier.w1.len(), VERIFIER_INPUT_DIM * MLP_HIDDEN_1);
-            assert_eq!(verifier.b1.len(), MLP_HIDDEN_1);
-        }
+        assert_eq!(
+            verifier.weights.len(),
+            EMBEDDING_DIM,
+            "weights should be {EMBEDDING_DIM}-dim",
+        );
         assert!(!verifier.scaler_mean.is_empty());
         assert!(!verifier.scaler_std.is_empty());
 
-        // All MLP weights must be finite — NaN/inf indicates gradient divergence
-        // from unstable hyperparameters.  Only relevant for MLP models.
-        if !use_logistic_verifier() {
-            for (j, &w) in verifier.w1.iter().enumerate() {
-                assert!(
-                    w.is_finite(),
-                    "w1[{j}] is not finite: {w}; gradient descent diverged",
-                );
-            }
-            for (j, &w) in verifier.w2.iter().enumerate() {
-                assert!(
-                    w.is_finite(),
-                    "w2[{j}] is not finite: {w}; gradient descent diverged",
-                );
-            }
-            for (j, &w) in verifier.w3.iter().enumerate() {
-                assert!(
-                    w.is_finite(),
-                    "w3[{j}] is not finite: {w}; gradient descent diverged",
-                );
-            }
+        // All weights must be finite — NaN/inf indicates gradient divergence.
+        for (j, &w) in verifier.weights.iter().enumerate() {
+            assert!(
+                w.is_finite(),
+                "weights[{j}] is not finite: {w}; gradient descent diverged",
+            );
         }
+        assert!(
+            verifier.bias.is_finite(),
+            "bias is not finite; gradient descent diverged",
+        );
 
         // Predict must return a reasonable score for a positive embedding.
         let held_out = make_positive_embedding(&mut rng);
@@ -2896,286 +2024,6 @@ mod tests {
             "Verifier should accept positive embedding (score >= 0.5), got score={score:.4}; \
              weights may have diverged",
         );
-    }
-
-    #[test]
-    fn test_backward_compat_legacy_linear_model() {
-        // Legacy logistic regression models (pre-mahbot-861) used weights+bias
-        // with optional StandardScaler.  This test verifies that such models
-        // deserialize correctly and produce correct predictions through the
-        // linear fallback path in predict().
-
-        // Known 288-dim input.
-        let input: Vec<f32> = (0..VERIFIER_INPUT_DIM).map(|i| i as f32 * 0.01).collect();
-        // Known weights and bias.
-        let weights: Vec<f32> = (0..VERIFIER_INPUT_DIM)
-            .map(|i| (i % 3) as f32 * 0.1 - 0.2)
-            .collect();
-        let bias = 0.25;
-
-        // ── Without scaler ────────────────────────────────────────────
-        let verifier = VoiceVerifier {
-            trained: true,
-            verifier_version: VERIFIER_VERSION_LEGACY,
-            weights: weights.clone(),
-            bias,
-            w1: Vec::new(),
-            b1: Vec::new(),
-            w2: Vec::new(),
-            b2: Vec::new(),
-            w3: Vec::new(),
-            b3: 0.0,
-            scaler_mean: Vec::new(),
-            scaler_std: Vec::new(),
-            threshold: DEFAULT_VERIFIER_THRESHOLD,
-        };
-        assert!(
-            verifier.is_trained(),
-            "Legacy linear verifier (no scaler) must report trained",
-        );
-
-        // Compute expected: sigmoid(dot(input, weights) + bias).
-        let dot: f32 = input.iter().zip(weights.iter()).map(|(x, w)| x * w).sum();
-        let expected = sigmoid(dot + bias);
-        let actual = verifier.predict(&input);
-        assert!(
-            (actual - expected).abs() < 1e-5,
-            "Legacy linear (no scaler): expected {expected:.6}, got {actual:.6}",
-        );
-
-        // ── With scaler (rejected) ─────────────────────────────────────
-        // Linear + scaler is not a valid configuration (mahbot-870):
-        // predict() ignores the scaler for linear models (legacy linear
-        // models predate both L2-normalization and the StandardScaler), so
-        // accepting this combination would silently produce wrong predictions.
-        // is_trained() correctly rejects it.
-        let scaler_mean: Vec<f32> = (0..VERIFIER_INPUT_DIM)
-            .map(|i| (i as f32).sin() * 0.1)
-            .collect();
-        let scaler_std: Vec<f32> = (0..VERIFIER_INPUT_DIM)
-            .map(|i| (i as f32).cos().abs() + 0.1)
-            .collect();
-        let verifier_scaled = VoiceVerifier {
-            trained: true,
-            verifier_version: VERIFIER_VERSION_LEGACY,
-            weights: weights.clone(),
-            bias,
-            w1: Vec::new(),
-            b1: Vec::new(),
-            w2: Vec::new(),
-            b2: Vec::new(),
-            w3: Vec::new(),
-            b3: 0.0,
-            scaler_mean,
-            scaler_std,
-            threshold: DEFAULT_VERIFIER_THRESHOLD,
-        };
-        assert!(
-            !verifier_scaled.is_trained(),
-            "Legacy linear verifier (with scaler) must report untrained — \
-             predict() ignores the scaler for linear models (mahbot-870)",
-        );
-    }
-
-    #[test]
-    fn test_backward_compat_linear_wrong_weights_dim_detected() {
-        // A legacy linear verifier with wrong-length weights must be rejected
-        // by is_trained() — wrong dimensions would produce truncated dot
-        // products via zip() in predict().
-        let verifier = VoiceVerifier {
-            trained: true,
-            verifier_version: VERIFIER_VERSION_LEGACY,
-            weights: vec![0.5; 96], // wrong: 96 ≠ 288
-            bias: 0.0,
-            w1: Vec::new(),
-            b1: Vec::new(),
-            w2: Vec::new(),
-            b2: Vec::new(),
-            w3: Vec::new(),
-            b3: 0.0,
-            scaler_mean: Vec::new(),
-            scaler_std: Vec::new(),
-            threshold: DEFAULT_VERIFIER_THRESHOLD,
-        };
-        assert!(
-            !verifier.is_trained(),
-            "Legacy linear verifier with wrong weights dim (96) must report untrained",
-        );
-
-        // Also verify that correct-length weights still passes.
-        let verifier_ok = VoiceVerifier {
-            weights: vec![0.5; VERIFIER_INPUT_DIM],
-            ..verifier
-        };
-        assert!(
-            verifier_ok.is_trained(),
-            "Legacy linear verifier with correct weights dim (288) must report trained",
-        );
-    }
-
-    #[test]
-    fn test_backward_compat_corrupted_mlp_falls_back_to_linear() {
-        // When MLP parameters exist but have wrong dimensions (corrupted
-        // serialization), is_trained() should accept the linear fallback
-        // and predict() should use weights/bias instead of mlp_forward().
-
-        let input: Vec<f32> = (0..VERIFIER_INPUT_DIM).map(|i| i as f32 * 0.01).collect();
-
-        // Helper to create alternating-sign weights (avoids activation
-        // saturation from uniform positive weights).
-        let alternating = |len: usize| -> Vec<f32> {
-            (0..len)
-                .map(|i| if i % 2 == 0 { 0.2 } else { -0.2 })
-                .collect()
-        };
-
-        // Corrupted MLP: w1 has wrong length (half the correct size).
-        let verifier = VoiceVerifier {
-            trained: true,
-            verifier_version: VERIFIER_VERSION_LEGACY,
-            weights: alternating(VERIFIER_INPUT_DIM), // valid linear weights
-            bias: 0.5,
-            w1: alternating(VERIFIER_INPUT_DIM * MLP_HIDDEN_1 / 2), // wrong length
-            b1: alternating(MLP_HIDDEN_1),
-            w2: alternating(MLP_HIDDEN_1 * MLP_HIDDEN_2),
-            b2: alternating(MLP_HIDDEN_2),
-            w3: alternating(MLP_HIDDEN_2),
-            b3: 0.7,
-            scaler_mean: Vec::new(),
-            scaler_std: Vec::new(),
-            threshold: DEFAULT_VERIFIER_THRESHOLD,
-        };
-
-        assert!(
-            verifier.is_trained(),
-            "Must report trained when MLP is corrupted but linear is valid",
-        );
-
-        // predict() must use linear path, producing sigmoid(dot(input, weights) + bias).
-        // Note: linear path uses raw (non-L2-normalized) input for backward compat.
-        let dot: f32 = input
-            .iter()
-            .zip(verifier.weights.iter())
-            .map(|(x, w)| x * w)
-            .sum();
-        let expected = sigmoid(dot + verifier.bias);
-        let actual = verifier.predict(&input);
-        assert!(
-            (actual - expected).abs() < 1e-5,
-            "Corrupted MLP + valid linear: expected {expected:.6} (linear), got {actual:.6}",
-        );
-
-        // Also verify that a completely valid verifier (both MLP and linear valid)
-        // uses the MLP path (MLP takes priority).
-        let valid_verifier = VoiceVerifier {
-            w1: alternating(VERIFIER_INPUT_DIM * MLP_HIDDEN_1), // now correct length
-            ..verifier
-        };
-        assert!(
-            valid_verifier.is_trained(),
-            "Valid MLP + valid linear must report trained",
-        );
-        // MLP path should produce a different score than linear path.
-        let mlp_score = valid_verifier.predict(&input);
-        assert!(
-            (mlp_score - expected).abs() > 1e-4,
-            "Valid MLP must not silently use linear fallback — MLP score {mlp_score:.6} \
-             should differ from linear score {expected:.6}",
-        );
-    }
-
-    #[test]
-    fn test_mlp_consistency_predict_matches_mlp_forward() {
-        // Verify that predict() and mlp_forward() produce identical results
-        // when called on the same input with the same MLP parameters.
-        let mut rng = StdRng::seed_from_u64(42);
-        let positives: Vec<Vec<f32>> = (0..20).map(|_| make_positive_embedding(&mut rng)).collect();
-        let negatives: Vec<Vec<f32>> = (0..30).map(|_| make_negative_embedding(&mut rng)).collect();
-        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
-        let neg_seq = make_seq(negatives, crate::embedding_sequence::LabelStratum::Negative);
-
-        let verifier = VoiceVerifier::train(
-            &[pos_seq],
-            &[neg_seq],
-            None,
-            DEFAULT_VERIFIER_THRESHOLD,
-            0.001,
-            0.1,
-            500,
-            None, // rng_seed (entropy-based)
-        );
-        assert!(
-            verifier.is_trained(),
-            "Verifier must be trained for consistency check",
-        );
-
-        // Test on several held-out embeddings.
-        for _ in 0..20 {
-            let emb = if rng.random::<f32>() < 0.5 {
-                make_positive_embedding(&mut rng)
-            } else {
-                make_negative_embedding(&mut rng)
-            };
-
-            // Apply the same pipeline as predict(): L2-norm → scaler.
-            // First L2-normalize (matching training convention).
-            let norm_l2: f32 = emb.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
-            let emb_l2: Vec<f32> = emb.iter().map(|v| v / norm_l2).collect();
-            // Then apply scaler to get the fully processed input.
-            let x: Vec<f32> = if !verifier.scaler_mean.is_empty() && !verifier.scaler_std.is_empty()
-            {
-                emb_l2
-                    .iter()
-                    .zip(verifier.scaler_mean.iter())
-                    .zip(verifier.scaler_std.iter())
-                    .map(
-                        |((&val, &mean), &std)| {
-                            if std > 0.0 { (val - mean) / std } else { val }
-                        },
-                    )
-                    .collect()
-            } else {
-                emb_l2 // no scaler — L2-normalized input is the fully processed form
-            };
-
-            // predict() applies L2-norm → scaler internally + routes to MLP.
-            // predict_scaled() skips preprocessing + routes to MLP directly.
-            // Both must produce the same output (pipeline consistency).
-            let from_predict = verifier.predict(&emb);
-            let from_scaled = predict_scaled(&verifier, &x);
-            assert!(
-                (from_predict - from_scaled).abs() < 1e-5,
-                "predict()={from_predict:.6} ≠ predict_scaled()={from_scaled:.6} \
-                 — pipeline routing mismatch",
-            );
-
-            // predict_scaled() must match direct mlp_forward() call
-            // (routing correctness, not a tautology since predict_scaled
-            //  uses the same has_valid_mlp_params() logic as predict()).
-            // Input is already fully processed (L2-norm → scaler), so
-            // mlp_forward receives x directly (mahbot-870).
-            let expected = mlp_forward(
-                &x,
-                &verifier.w1,
-                &verifier.b1,
-                &verifier.w2,
-                &verifier.b2,
-                &verifier.w3,
-                verifier.b3,
-            );
-            assert!(
-                (from_scaled - expected).abs() < 1e-5,
-                "predict_scaled()={from_scaled:.6} ≠ mlp_forward()={expected:.6} \
-                 — routing mismatch: w1.len={}, b1.len={}, w2.len={}, b2.len={}, \
-                 w3.len={}, b3={}",
-                verifier.w1.len(),
-                verifier.b1.len(),
-                verifier.w2.len(),
-                verifier.b2.len(),
-                verifier.w3.len(),
-                verifier.b3,
-            );
-        }
     }
 
     #[test]
@@ -3189,8 +2037,6 @@ mod tests {
             None,
             DEFAULT_VERIFIER_THRESHOLD,
             0.001,
-            0.1,
-            100,
             None, // rng_seed (entropy-based)
         );
         assert!(!verifier.is_trained());
@@ -3199,7 +2045,7 @@ mod tests {
     #[test]
     fn test_deterministic_training_same_seed_identical_weights() {
         // Two training runs with the same seed and identical training data
-        // must produce identical MLP weights.
+        // must produce identical logistic regression weights.
         let mut rng = StdRng::seed_from_u64(12345);
         let positives: Vec<Vec<f32>> = (0..10).map(|_| make_positive_embedding(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..10).map(|_| make_negative_embedding(&mut rng)).collect();
@@ -3213,8 +2059,6 @@ mod tests {
             None,
             DEFAULT_VERIFIER_THRESHOLD,
             0.001,
-            0.1,
-            100,
             Some(seed),
         );
         let v2 = VoiceVerifier::train(
@@ -3223,8 +2067,6 @@ mod tests {
             None,
             DEFAULT_VERIFIER_THRESHOLD,
             0.001,
-            0.1,
-            100,
             Some(seed),
         );
 
@@ -3237,69 +2079,15 @@ mod tests {
             "second training produced untrained verifier"
         );
         assert_eq!(
-            v1.w1, v2.w1,
-            "w1 differs between deterministic training runs"
+            v1.weights, v2.weights,
+            "weights differ between deterministic training runs"
         );
-        assert_eq!(
-            v1.w2, v2.w2,
-            "w2 differs between deterministic training runs"
-        );
-        assert_eq!(
-            v1.w3, v2.w3,
-            "w3 differs between deterministic training runs"
-        );
-        assert_eq!(
-            v1.b1, v2.b1,
-            "b1 differs between deterministic training runs"
-        );
-        assert_eq!(
-            v1.b2, v2.b2,
-            "b2 differs between deterministic training runs"
-        );
-        assert_eq!(
-            v1.b3, v2.b3,
-            "b3 differs between deterministic training runs"
+        assert!(
+            (v1.bias - v2.bias).abs() < f32::EPSILON,
+            "bias differs between deterministic training runs"
         );
     }
 
-    #[test]
-    fn test_form_stride1_windows_basic() {
-        // Verify that form_stride1_windows produces correctly shaped
-        // L2-normalized windows from 96-dim per-frame embeddings.
-        let n_frames = 5;
-        let embeddings: Vec<Vec<f32>> = (0..n_frames)
-            .map(|i| vec![i as f32; EMBEDDING_DIM])
-            .collect();
-
-        let windows = form_stride1_windows(&embeddings);
-        // 5 frames → 3 stride-1 windows (frames 0-2, 1-3, 2-4).
-        assert_eq!(windows.len(), n_frames - VERIFIER_WINDOW_SIZE + 1);
-        for w in &windows {
-            assert_eq!(w.len(), VERIFIER_INPUT_DIM);
-            // Verify L2-normalized (norm ≈ 1.0).
-            let norm: f32 = w.iter().map(|v| v * v).sum::<f32>().sqrt();
-            assert!((norm - 1.0).abs() < 1e-5, "window norm={norm} ≠ 1.0");
-        }
-    }
-
-    #[test]
-    fn test_form_stride1_windows_short_input() {
-        // Fewer than VERIFIER_WINDOW_SIZE frames → empty result.
-        let embeddings: Vec<Vec<f32>> = (0..2).map(|i| vec![i as f32; EMBEDDING_DIM]).collect();
-        let windows = form_stride1_windows(&embeddings);
-        assert!(windows.is_empty());
-    }
-
-    #[test]
-    fn test_form_stride1_windows_empty_input() {
-        let windows = form_stride1_windows(&[]);
-        assert!(windows.is_empty());
-    }
-
-    // ── Logistic verifier tests (mahbot-901) ──────────────────────────
-
-    /// Generate a synthetic 96-dim per-frame embedding with values clustered
-    /// around +0.5 (simulates positive wake-word frame).
     fn make_positive_frame(rng: &mut impl Rng) -> Vec<f32> {
         (0..EMBEDDING_DIM)
             .map(|_| {
@@ -3471,15 +2259,13 @@ mod tests {
         let neg_seq = make_seq(embs2, crate::embedding_sequence::LabelStratum::Negative);
 
         // With per-sequence windowing, each sequence has 2 frames < 3 → 0 windows each
-        // → train_inner gets 0 positive windows + 0 negative windows → untrained.
+        // → train_logistic_inner gets 0 positive windows + 0 negative windows → untrained.
         let verifier = VoiceVerifier::train(
             &[pos_seq],
             &[neg_seq],
             None,
             DEFAULT_VERIFIER_THRESHOLD,
             L2_LAMBDA,
-            LEARNING_RATE,
-            MAX_ITER,
             Some(42),
         );
         assert!(
@@ -3519,8 +2305,6 @@ mod tests {
             None, // no per-negative weights
             DEFAULT_VERIFIER_THRESHOLD,
             L2_LAMBDA,
-            LEARNING_RATE,
-            MAX_ITER,
             Some(42),
         );
 
@@ -3583,8 +2367,6 @@ mod tests {
             Some(&per_neg_weights),
             DEFAULT_VERIFIER_THRESHOLD,
             L2_LAMBDA,
-            LEARNING_RATE,
-            MAX_ITER,
             Some(42),
         );
 

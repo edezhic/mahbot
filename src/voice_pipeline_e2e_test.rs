@@ -3,7 +3,7 @@
 //! This test exercises the **enrollment-to-detection cycle with realistic
 //! TTS-generated speech audio**.  It uses the TTS engine to synthesize wake
 //! word variants, feeds them through the enrollment pipeline, trains the
-//! MLP classifier and VoiceVerifier, then runs detection on:
+//! Conv1D classifier and VoiceVerifier, then runs detection on:
 //!
 //! * Positive cases (wake word variants)
 //! * Negative — confusable near-miss phrases
@@ -52,8 +52,8 @@
 use super::*; // voice module items (process_enrollment_sample, etc.)
 use crate::embedding_sequence::{EmbeddingSequence, Source, UtteranceId};
 use crate::tts;
+use crate::voice_verifier::L2_LAMBDA;
 use crate::voice_verifier::VoiceVerifier;
-use crate::voice_verifier::{L2_LAMBDA, LEARNING_RATE, MLP_MAX_ITER};
 use crate::wake_word_classifier::WakeWordClassifier;
 use earshot::Detector;
 use rand::{RngExt, SeedableRng};
@@ -61,7 +61,7 @@ use std::time::Instant;
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-/// Minimum effective threshold for the Conv1D ensemble's rolling sum.
+/// Minimum effective threshold for the Conv1D classifier's rolling sum.
 ///
 /// The classifier rolling sum must reach at least this value for the
 /// classifier to have fired.  Below this threshold, misses are attributed
@@ -927,7 +927,7 @@ fn generate_owner_negative_sequences(
                     Ok(embs) if !embs.is_empty() => {
                         sequences.push(EmbeddingSequence::negative(
                             UtteranceId {
-                                sequence_index: i * 3 + seed as usize,
+                                sequence_index: i * 3 + seed,
                                 variant_index: 0,
                             },
                             Source::Owner,
@@ -1283,7 +1283,7 @@ struct PerVariantResult {
     variant: String,
     /// Whether the variant triggered wake word detection.
     detected: bool,
-    /// Peak ensemble rolling-sum score achieved during processing.
+    /// Peak rolling-sum score achieved during processing.
     peak_score: f32,
     /// Peak verifier prediction score achieved during processing
     /// (0.0 if verifier is untrained or no embeddings passed the threshold).
@@ -1384,7 +1384,7 @@ fn test_detection_samples(
 ) {
     // Set classifier + verifier in global state for the streaming pipeline.
     // score_stride8_window reads these from voice_state().
-    super::set_classifier_weights(classifier.weights_ref().to_vec());
+    super::set_classifier_weights(classifier.weights_ref().clone());
     super::set_verifier(verifier.clone());
 
     for (samples, label) in variants {
@@ -1620,7 +1620,7 @@ fn run_noise_overlap_test(
 ) -> Vec<(String, f64)> {
     // Set classifier + verifier in global state (test_detection_samples does
     // this too but we inline the loop to share adaptive state across variants).
-    super::set_classifier_weights(classifier.weights_ref().to_vec());
+    super::set_classifier_weights(classifier.weights_ref().clone());
     super::set_verifier(verifier.clone());
 
     // Pre-warm a shared adaptive threshold state so the benchmark actually
@@ -2303,16 +2303,11 @@ pub(crate) fn run_internal() {
     let neg_scores_min = training_result.neg_scores_min;
     let neg_scores_max = training_result.neg_scores_max;
 
-    let classifier = WakeWordClassifier::new_ensemble(weights.clone());
-    let first_params = weights.first().map_or(
-        0,
-        crate::wake_word_classifier::ClassifierWeights::param_count,
-    );
+    let classifier = WakeWordClassifier::new(weights.clone());
+    let first_params = weights.param_count();
     info!(
-        "Ensemble of {} models trained successfully: {} params each, {} epochs, best val loss={best_val_loss:.4}",
-        weights.len(),
-        first_params,
-        epochs_trained,
+        "Conv1D classifier trained successfully: {} params, {} epochs, best val loss={best_val_loss:.4}",
+        first_params, epochs_trained,
     );
     info!(
         "Classifier scores: pos mean={pos_scores_mean:.4} [{pos_scores_min:.4}, {pos_scores_max:.4}] \
@@ -2320,37 +2315,32 @@ pub(crate) fn run_internal() {
     );
 
     // ── Degenerate solution detection (mahbot-844) ──
-    // Check if ANY ensemble member has all near-zero weights, indicating a
-    // degenerate all-zero solution.  Ensemble averaging mitigates a single
-    // degenerate member, but flag it for diagnostics.
+    // Check if the classifier has all near-zero weights, indicating a
+    // degenerate all-zero solution.
     let (degenerate, near_zero_frac) = {
-        let mut worst_frac = 0.0_f64;
-        for member in &weights {
-            let all_w = member.all_trainable_slices();
-            let total_params: usize = all_w.iter().map(|s| s.len()).sum();
-            let near_zero_count = all_w
-                .iter()
-                .flat_map(|s| s.iter())
-                .filter(|v| v.abs() < 1e-6)
-                .count();
-            let frac = near_zero_count as f64 / total_params as f64;
-            worst_frac = worst_frac.max(frac);
-        }
-        // Degenerate if >99% of weights in ANY member are within ±1e-6 of zero
-        if worst_frac > 0.99 {
+        let all_w = weights.all_trainable_slices();
+        let total_params: usize = all_w.iter().map(|s| s.len()).sum();
+        let near_zero_count = all_w
+            .iter()
+            .flat_map(|s| s.iter())
+            .filter(|v| v.abs() < 1e-6)
+            .count();
+        let frac = near_zero_count as f64 / total_params as f64;
+        // Degenerate if >99% of weights are within ±1e-6 of zero
+        if frac > 0.99 {
             warn!(
-                "Ensemble member produced degenerate all-zero solution — training had issues. \
-                 {:.1}% of weights near zero in worst member (threshold=1%). \
+                "Classifier produced degenerate all-zero solution — training had issues. \
+                 {:.1}% of weights near zero (threshold=1%). \
                  Skipping all detection phases.",
-                worst_frac * 100.0,
+                frac * 100.0,
             );
-            (true, worst_frac)
+            (true, frac)
         } else {
             info!(
-                "Classifier degenerate check: {:.1}% weights near zero in worst member — OK",
-                worst_frac * 100.0
+                "Classifier degenerate check: {:.1}% weights near zero — OK",
+                frac * 100.0
             );
-            (false, worst_frac)
+            (false, frac)
         }
     };
 
@@ -2373,7 +2363,7 @@ pub(crate) fn run_internal() {
             // ── Hard-negative mining path (mahbot-905) ─────────────────────────
             // Use the trained classifier (from Phase 4) to mine hard negatives
             // from verifier negative sequences, replacing tiered-weight all-windows.
-            let classifier = WakeWordClassifier::new_ensemble(weights.clone());
+            let classifier = WakeWordClassifier::new(weights.clone());
             let mined = crate::voice_verifier::mine_hard_negatives(
                 &classifier,
                 &verifier_neg_sequences,
@@ -2394,10 +2384,8 @@ pub(crate) fn run_internal() {
                     &mined.sequences,
                     None, // uniform weights — mining replaces tiered weights
                     VoiceVerifier::default_threshold(),
-                    L2_LAMBDA,     // mahbot-854: 0.01
-                    LEARNING_RATE, // mahbot-878: 0.001 (Adam)
-                    MLP_MAX_ITER,  // mahbot-861: 2000 (MLP converges faster)
-                    Some(42),      // fixed seed for deterministic benchmark (mahbot-882)
+                    L2_LAMBDA, // mahbot-854: 0.01
+                    Some(42),  // fixed seed for deterministic benchmark (mahbot-882)
                 );
             }
             warn!(
@@ -2415,10 +2403,8 @@ pub(crate) fn run_internal() {
             &verifier_neg_sequences,
             Some(&per_negative_sequence_weights), // per-sequence weights matching production (mahbot-870 Fix 3)
             VoiceVerifier::default_threshold(),
-            L2_LAMBDA,     // mahbot-854: 0.01
-            LEARNING_RATE, // mahbot-878: 0.001 (Adam)
-            MLP_MAX_ITER,  // mahbot-861: 2000 (MLP converges faster)
-            Some(42),      // fixed seed for deterministic benchmark (mahbot-882)
+            L2_LAMBDA, // mahbot-854: 0.01
+            Some(42),  // fixed seed for deterministic benchmark (mahbot-882)
         )
     };
 
@@ -3033,7 +3019,7 @@ pub(crate) fn run_internal() {
             "neg_scores_max": neg_scores_max,
             "epochs_trained": epochs_trained,
             "best_val_loss": best_val_loss,
-            "total_params": weights.first().map_or(0, crate::wake_word_classifier::ClassifierWeights::param_count),
+            "total_params": weights.param_count(),
             "degenerate": degenerate,
         },
         "volume_sweep": serde_json::Value::Object(volume_sweep_map),
