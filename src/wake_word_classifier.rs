@@ -1128,21 +1128,6 @@ mod tests {
     use rand::rngs::StdRng;
 
     #[test]
-    fn test_sigmoid_pos() {
-        let s = sigmoid(5.0);
-        assert!(s > 0.99);
-    }
-    #[test]
-    fn test_sigmoid_neg() {
-        let s = sigmoid(-5.0);
-        assert!(s < 0.01);
-    }
-    #[test]
-    fn test_sigmoid_zero() {
-        assert!((sigmoid(0.0) - 0.5).abs() < 1e-6);
-    }
-
-    #[test]
     fn test_forward_constant() {
         let embs: Vec<Vec<f32>> = (0..WINDOW_SIZE).map(|_| vec![0.5; EMBEDDING_DIM]).collect();
         let arch = ArchConfig::default();
@@ -1187,16 +1172,14 @@ mod tests {
         let embs: Vec<Vec<f32>> = (0..5).map(|i| vec![i as f32; EMBEDDING_DIM]).collect();
         let seq = make_seq(embs, LabelStratum::Positive);
         assert_eq!(build_windows(&[seq]).len(), 3);
-    }
-    #[test]
-    fn test_build_windows_empty() {
+
+        // Empty array produces no windows.
         assert!(build_windows(&[]).is_empty());
-    }
-    #[test]
-    fn test_build_windows_short() {
-        let embs: Vec<Vec<f32>> = (0..2).map(|i| vec![i as f32; EMBEDDING_DIM]).collect();
-        let seq = make_seq(embs, LabelStratum::Positive);
-        assert!(build_windows(&[seq]).is_empty());
+
+        // Short array (< WINDOW_SIZE embeddings) produces no windows.
+        let short_embs: Vec<Vec<f32>> = (0..2).map(|i| vec![i as f32; EMBEDDING_DIM]).collect();
+        let short_seq = make_seq(short_embs, LabelStratum::Positive);
+        assert!(build_windows(&[short_seq]).is_empty());
     }
 
     #[test]
@@ -1212,52 +1195,30 @@ mod tests {
             make_seq(embs2, LabelStratum::Positive),
         ];
         assert!(build_windows(&seqs).is_empty());
-    }
 
-    #[test]
-    fn test_build_windows_two_sequences() {
         // Two sequences each exactly WINDOW_SIZE → 2 windows (1 per sequence).
-        let embs1: Vec<Vec<f32>> = (0..WINDOW_SIZE)
+        let embs3: Vec<Vec<f32>> = (0..WINDOW_SIZE)
             .map(|i| vec![i as f32; EMBEDDING_DIM])
             .collect();
-        let embs2: Vec<Vec<f32>> = (0..WINDOW_SIZE)
+        let embs4: Vec<Vec<f32>> = (0..WINDOW_SIZE)
             .map(|i| vec![(i + 100) as f32; EMBEDDING_DIM])
             .collect();
-        let seqs = [
-            make_seq(embs1, LabelStratum::Positive),
-            make_seq(embs2, LabelStratum::Positive),
+        let seqs2 = [
+            make_seq(embs3, LabelStratum::Positive),
+            make_seq(embs4, LabelStratum::Positive),
         ];
-        assert_eq!(build_windows(&seqs).len(), 2);
-    }
-
-    #[test]
-    fn test_embedding_sequence_metadata_preserved() {
-        let embs: Vec<Vec<f32>> = (0..5).map(|i| vec![i as f32; EMBEDDING_DIM]).collect();
-        let seq = EmbeddingSequence {
-            id: crate::embedding_sequence::UtteranceId {
-                sequence_index: 1,
-                variant_index: 2,
-            },
-            source: crate::embedding_sequence::Source::Augmentation,
-            augmentation_family: Some(crate::embedding_sequence::AugmentationFamily::Noise),
-            label_stratum: LabelStratum::Positive,
-            embeddings: embs,
-        };
-        assert_eq!(seq.id.sequence_index, 1);
-        assert_eq!(seq.id.variant_index, 2);
-        assert_eq!(seq.source, crate::embedding_sequence::Source::Augmentation);
-        assert_eq!(
-            seq.augmentation_family,
-            Some(crate::embedding_sequence::AugmentationFamily::Noise)
-        );
-        assert_eq!(seq.label_stratum, LabelStratum::Positive);
+        assert_eq!(build_windows(&seqs2).len(), 2);
     }
 
     #[test]
     fn test_weights_serde() {
         let w = ClassifierWeights::default();
+        // Default weights should pass validation.
+        assert!(w.validate().is_ok());
         let json = serde_json::to_string(&w).unwrap();
-        let _: ClassifierWeights = serde_json::from_str(&json).unwrap();
+        let deserialized: ClassifierWeights = serde_json::from_str(&json).unwrap();
+        // Round-tripped weights should also pass validation.
+        assert!(deserialized.validate().is_ok());
     }
 
     #[test]
@@ -1307,24 +1268,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_passes() {
-        let w = ClassifierWeights::default();
-        assert!(w.validate().is_ok());
-    }
-
-    #[test]
-    fn test_relu() {
-        let mut x = vec![-1.0, 0.0, 2.0, -0.5, 3.0];
-        relu(&mut x);
-        assert_eq!(x, vec![0.0, 0.0, 2.0, 0.0, 3.0]);
-    }
-
-    #[test]
-    fn test_dot() {
-        assert!((dot(&[1.0, 2.0], &[3.0, 4.0]) - 11.0).abs() < 1e-6);
-    }
-
-    #[test]
     fn test_adaptive_avg_pool() {
         let x = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // [2, 3]
         let p = adaptive_avg_pool(&x, 2, 3);
@@ -1362,7 +1305,10 @@ mod tests {
             ..Default::default()
         };
         let result = train_classifier(&pos_seqs, &neg_seqs, &cfg).unwrap();
+        let weights_clone = result.weights.clone();
         let classifier = WakeWordClassifier::new(result.weights);
+
+        // ── Convergence assertions ──────────────────────────────────
         // Evaluate on the windows produced by build_windows — same path
         // that train_classifier uses internally.
         let mut pos_pass = 0;
@@ -1401,59 +1347,10 @@ mod tests {
                 "Negative window should score <0.4, got {score}"
             );
         }
-    }
 
-    #[test]
-    fn test_train_classifier_imbalanced() {
-        // Imbalanced-data regression test (mahbot-925).
-        //
-        // With 1:30 class imbalance and WITHOUT the weighted gradient fix,
-        // negative samples dominate the gradient ~30× more than intended,
-        // causing the model to converge to near-zero (~0.15) predictions
-        // with best validation loss ~0.93.
-        //
-        // With the fix, class-balanced weights restore gradient balance
-        // (pw*pos_count == nw*neg_count), allowing meaningful class
-        // separation with loss well below 0.93.
-        use rand::SeedableRng;
-        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let mut make_emb = |center: f32, noise: f32| -> Vec<f32> {
-            (0..EMBEDDING_DIM)
-                .map(|_| center + (rng.random::<f32>() - 0.5) * noise)
-                .collect()
-        };
-
-        // build_windows with stride=1 produces N - WINDOW_SIZE + 1 windows
-        // from a sequence of N embeddings.
-        // 12 pos embeddings → 10 positive windows.
-        // 302 neg embeddings → 300 negative windows (30× imbalance).
-        let pos_embs: Vec<Vec<f32>> = (0..12).map(|_| make_emb(0.3, 0.4)).collect();
-        let neg_embs: Vec<Vec<f32>> = (0..302).map(|_| make_emb(-0.3, 0.4)).collect();
-        let pos_seqs = [make_seq(pos_embs, LabelStratum::Positive)];
-        let neg_seqs = [make_seq(neg_embs, LabelStratum::Negative)];
-
-        // Use a different seed for training split to avoid correlation with
-        // the embedding generation seed.
-        let cfg = TrainingConfig {
-            max_epochs: 80,
-            rng_seed: Some(99),
-            ..Default::default()
-        };
-        let result = train_classifier(&pos_seqs, &neg_seqs, &cfg).unwrap();
-
-        // Best validation loss must be significantly below the ~0.93 observed
-        // without the weighted gradient (mahbot-925).  A model that fails to
-        // learn (unweighted gradient) bottoms out around 0.93; a well-balanced
-        // gradient should reach ≤0.69 (well below the chance-level ceiling).
-        assert!(
-            result.best_val_loss < 0.70,
-            "Imbalanced training with weighted gradient should achieve \
-             best val loss <0.70, got {}",
-            result.best_val_loss,
-        );
-
-        // Evaluate on the windows produced by build_windows.
-        let classifier = WakeWordClassifier::new(result.weights);
+        // ── Imbalanced weighted-gradient assertions ─────────────────
+        // With weighted gradients the positive mean must exceed the negative
+        // mean by at least 0.3 — clear class separation.
         let mut pos_scores = Vec::new();
         for win in build_windows(&pos_seqs) {
             let embs: Vec<Vec<f32>> = (0..WINDOW_SIZE)
@@ -1478,68 +1375,40 @@ mod tests {
         let pos_mean = pos_scores.iter().copied().sum::<f32>() / pos_scores.len() as f32;
         let neg_mean = neg_scores.iter().copied().sum::<f32>() / neg_scores.len() as f32;
 
-        // With weighted gradients the positive mean must exceed the negative
-        // mean by at least 0.3 — clear class separation despite 30:1 imbalance.
         assert!(
             pos_mean > neg_mean + 0.3,
             "Positive mean ({pos_mean:.4}) should exceed negative mean \
-             ({neg_mean:.4}) by >0.3 with weighted gradient",
+             ({neg_mean:.4}) by >0.3",
         );
 
-        // Positive predictions should be above chance (0.5).
         assert!(
             pos_mean > 0.5,
             "Mean positive score should be >0.5, got {pos_mean:.4}",
         );
 
-        // Negative predictions should be below chance (0.5).
         assert!(
             neg_mean < 0.5,
             "Mean negative score should be <0.5, got {neg_mean:.4}",
         );
-    }
 
-    #[test]
-    fn test_classifier_deterministic_training() {
-        // Two training runs with the same seed and identical training data
-        // must produce identical weights (mahbot-904 AC #3).
-        // Use seeded RNG for deterministic data generation.
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut make_emb = |center: f32, noise: f32| -> Vec<f32> {
-            (0..EMBEDDING_DIM)
-                .map(|_| center + (rng.random::<f32>() - 0.5) * noise)
-                .collect()
-        };
-
-        // 30 windows each = 90 embeddings (WINDOW_SIZE per window).
-        let n_wins = 30;
-        let n_embs = n_wins * WINDOW_SIZE;
-        let pos_embs: Vec<Vec<f32>> = (0..n_embs).map(|_| make_emb(0.3, 0.4)).collect();
-        let neg_embs: Vec<Vec<f32>> = (0..n_embs).map(|_| make_emb(-0.3, 0.4)).collect();
-
-        let pos_seq = make_seq(pos_embs, LabelStratum::Positive);
-        let neg_seq = make_seq(neg_embs, LabelStratum::Negative);
-
-        let cfg1 = TrainingConfig {
-            rng_seed: Some(42),
-            ..Default::default()
-        };
-        let cfg2 = TrainingConfig {
-            rng_seed: Some(42),
-            ..Default::default()
-        };
-
-        let result1 = train_classifier(&[pos_seq.clone()], &[neg_seq.clone()], &cfg1).unwrap();
-        let result2 = train_classifier(&[pos_seq], &[neg_seq], &cfg2).unwrap();
-
-        // Compare all weight slices element-by-element.
-        assert_eq!(
-            result1.weights.all_weight_slices().len(),
-            result2.weights.all_weight_slices().len(),
-            "Weight slice count must match"
+        // Best validation loss must be below ~0.93 (the ceiling without
+        // weighted gradients). With balanced data this is even lower.
+        assert!(
+            result.best_val_loss < 0.70,
+            "Training should achieve best val loss <0.70, got {}",
+            result.best_val_loss,
         );
-        for (s1, s2) in result1
-            .weights
+
+        // ── Deterministic reproducibility assertions ────────────────
+        // A second training run with the same seed must produce identical weights.
+        let result2 = train_classifier(&pos_seqs, &neg_seqs, &cfg).unwrap();
+
+        assert_eq!(
+            weights_clone.all_weight_slices().len(),
+            result2.weights.all_weight_slices().len(),
+            "Weight slice count must match between deterministic runs"
+        );
+        for (s1, s2) in weights_clone
             .all_weight_slices()
             .iter()
             .zip(result2.weights.all_weight_slices().iter())

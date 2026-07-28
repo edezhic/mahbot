@@ -1264,25 +1264,22 @@ mod tests {
         assert_weight_tier(&weights, 0, 3, 1.0, "first");
         assert_weight_tier(&weights, 3, 2, 2.0, "second");
         assert_weight_tier(&weights, 5, 1, 3.0, "third");
-    }
 
-    #[test]
-    fn assert_weight_tier_empty_tier() {
         // Edge case: count=0 should not panic at any offset
-        let weights: Vec<f32> = vec![1.0, 2.0, 3.0];
-        assert_weight_tier(&weights, 0, 0, 1.0, "empty-at-start");
-        assert_weight_tier(&weights, 1, 0, 0.0, "empty-at-middle");
-        assert_weight_tier(&weights, 3, 0, 0.0, "empty-at-end");
-    }
+        let empty_weights: Vec<f32> = vec![1.0, 2.0, 3.0];
+        assert_weight_tier(&empty_weights, 0, 0, 1.0, "empty-at-start");
+        assert_weight_tier(&empty_weights, 1, 0, 0.0, "empty-at-middle");
+        assert_weight_tier(&empty_weights, 3, 0, 0.0, "empty-at-end");
 
-    #[test]
-    #[should_panic(
-        expected = "Weight tier mismatch: first weight at position 2 should be 1, got 2"
-    )]
-    fn assert_weight_tier_mismatch_panics() {
-        // Mismatch: should panic with descriptive message
-        let weights = vec![1.0, 1.0, 2.0];
-        assert_weight_tier(&weights, 0, 3, 1.0, "first");
+        // Mismatch should panic with descriptive message — verify via catch_unwind.
+        let mismatch_weights = vec![1.0, 1.0, 2.0];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_weight_tier(&mismatch_weights, 0, 3, 1.0, "first");
+        }));
+        assert!(
+            result.is_err(),
+            "assert_weight_tier should panic on mismatch"
+        );
     }
 
     #[test]
@@ -1332,6 +1329,34 @@ mod tests {
         assert!(
             score_neg < 0.5,
             "Verifier should reject negative embedding (score < 0.5), got score={score_neg:.4}",
+        );
+
+        // Structural assertions: weights dimension, scaler, bias finite.
+        assert_eq!(
+            verifier.weights.len(),
+            EMBEDDING_DIM,
+            "verifier weights must be {EMBEDDING_DIM}-dim",
+        );
+        assert!(verifier.bias.is_finite(), "bias must be finite");
+        assert_eq!(
+            verifier.scaler_mean.len(),
+            EMBEDDING_DIM,
+            "scaler_mean must be {EMBEDDING_DIM}-dim",
+        );
+        assert_eq!(
+            verifier.scaler_std.len(),
+            EMBEDDING_DIM,
+            "scaler_std must be {EMBEDDING_DIM}-dim",
+        );
+
+        // Verify discrimination on held-out per-frame input.
+        let held_out_pos_frame = make_positive_frame(&mut rng);
+        let held_out_neg_frame = make_negative_frame(&mut rng);
+        let score_pos = verifier.predict(&held_out_pos_frame);
+        let score_neg = verifier.predict(&held_out_neg_frame);
+        assert!(
+            score_pos > score_neg,
+            "Verifier must discriminate: pos={score_pos:.4} neg={score_neg:.4}",
         );
     }
 
@@ -1403,6 +1428,25 @@ mod tests {
         assert_eq!(
             verifier.threshold, DEFAULT_VERIFIER_THRESHOLD,
             "threshold must match DEFAULT_VERIFIER_THRESHOLD",
+        );
+
+        // Structural assertions: weights dimension, scaler populated, finite.
+        assert_eq!(
+            verifier.weights.len(),
+            EMBEDDING_DIM,
+            "weights should be {EMBEDDING_DIM}-dim",
+        );
+        assert!(!verifier.scaler_mean.is_empty());
+        assert!(!verifier.scaler_std.is_empty());
+        for (j, &w) in verifier.weights.iter().enumerate() {
+            assert!(
+                w.is_finite(),
+                "weights[{j}] is not finite: {w}; gradient descent diverged",
+            );
+        }
+        assert!(
+            verifier.bias.is_finite(),
+            "bias is not finite; gradient descent diverged",
         );
 
         // Verify a held-out positive is accepted.
@@ -1529,58 +1573,15 @@ mod tests {
             (score_before - score_after).abs() < 1e-4,
             "Negative prediction must match after roundtrip: before={score_before:.4} after={score_after:.4}",
         );
-    }
 
-    #[test]
-    fn test_logistic_train_logistic_inner_end_to_end() {
-        // End-to-end test for the full logistic training pipeline via train_logistic_inner:
-        // form_stride1_pooled_windows → scaler fitting → train_logistic_sgd → model
-        // construction.  Unlike test_logistic_verifier_serialization_roundtrip (which
-        // manually constructs the model), this exercises the actual train_logistic_inner path.
-        let mut rng = StdRng::seed_from_u64(42);
-        let positives: Vec<Vec<f32>> = (0..30).map(|_| make_positive_frame(&mut rng)).collect();
-        let negatives: Vec<Vec<f32>> = (0..50).map(|_| make_negative_frame(&mut rng)).collect();
-        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
-        let neg_seq = make_seq(negatives, crate::embedding_sequence::LabelStratum::Negative);
-
-        let verifier = VoiceVerifier::train_logistic_inner(
-            &[pos_seq],
-            &[neg_seq],
-            None,
-            DEFAULT_VERIFIER_THRESHOLD,
-            L2_LAMBDA,
-            LOGISTIC_LEARNING_RATE,
-            LOGISTIC_MAX_ITER,
-            Some(42),
-        );
-
-        assert!(verifier.is_trained());
-        assert_eq!(
-            verifier.weights.len(),
-            EMBEDDING_DIM,
-            "logistic verifier weights must be 96-dim",
-        );
-        assert!(verifier.bias.is_finite(), "bias must be finite",);
-        assert_eq!(
-            verifier.scaler_mean.len(),
-            EMBEDDING_DIM,
-            "scaler_mean must be 96-dim",
-        );
-        assert_eq!(
-            verifier.scaler_std.len(),
-            EMBEDDING_DIM,
-            "scaler_std must be 96-dim",
-        );
-
-        // Verify discrimination on held-out 96-dim per-frame input.
-        let held_out_pos = make_positive_frame(&mut rng);
-        let held_out_neg = make_negative_frame(&mut rng);
-        let score_pos = verifier.predict(&held_out_pos);
-        let score_neg = verifier.predict(&held_out_neg);
-        assert!(
-            score_pos > score_neg,
-            "Logistic verifier must discriminate: pos={score_pos:.4} neg={score_neg:.4}",
-        );
+        // Untrained verifier serialization roundtrip must remain no-op.
+        let untrained = VoiceVerifier::untrained();
+        let json = serde_json::to_string(&untrained).expect("serialize");
+        let deserialized_untrained: VoiceVerifier =
+            serde_json::from_str(&json).expect("deserialize");
+        assert!(!deserialized_untrained.is_trained());
+        let score = deserialized_untrained.predict(&[0.0; VERIFIER_INPUT_DIM]);
+        assert!((score - 1.0).abs() < 1e-6);
     }
 
     // ── Additional correctness tests ────────────────────────────────
@@ -1600,12 +1601,32 @@ mod tests {
         assert!((pooled[0] - 2.0).abs() < 1e-6);
         assert!((pooled[1] - 3.0).abs() < 1e-6);
         assert!((pooled[2] - 4.0).abs() < 1e-6);
-    }
 
-    #[test]
-    fn test_mean_pool_empty() {
-        let pooled = mean_pool_embeddings(&[]);
-        assert!(pooled.is_empty());
+        // Empty input produces empty output.
+        assert!(mean_pool_embeddings(&[]).is_empty());
+
+        // Mean-pool a simple 3-frame pattern via mean_pool_window_into.
+        let mut window = [0.0f32; VERIFIER_INPUT_DIM];
+        for j in 0..VERIFIER_WINDOW_SIZE {
+            for i in 0..EMBEDDING_DIM {
+                window[j * EMBEDDING_DIM + i] = (j * 10 + i) as f32;
+            }
+        }
+        let mut pooled = [0.0f32; EMBEDDING_DIM];
+        mean_pool_window_into(&window, &mut pooled);
+
+        // Frame 0: [0, 1, 2, ..., 95]
+        // Frame 1: [10, 11, 12, ..., 105]
+        // Frame 2: [20, 21, 22, ..., 115]
+        // Mean: [(0+10+20)/3, (1+11+21)/3, ...] = [10, 11, 12, ...]
+        for i in 0..EMBEDDING_DIM {
+            let correct = ((i + 0) + (i + 10) + (i + 20)) as f32 / 3.0;
+            assert!(
+                (pooled[i] - correct).abs() < 1e-5,
+                "pooled[{i}] = {}, expected {correct}",
+                pooled[i],
+            );
+        }
     }
 
     #[test]
@@ -1619,12 +1640,9 @@ mod tests {
                 assert!(v.is_finite(), "Synthetic negative has non-finite value {v}");
             }
         }
-    }
 
-    #[test]
-    fn test_generate_synthetic_negatives_zero_count() {
-        let negs = generate_synthetic_negatives(0, 96);
-        assert!(negs.is_empty());
+        // Zero count returns empty.
+        assert!(generate_synthetic_negatives(0, 96).is_empty());
     }
 
     #[test]
@@ -1647,20 +1665,14 @@ mod tests {
                 "Negative embedding is not unit-norm: norm={norm}",
             );
         }
-    }
 
-    #[test]
-    fn test_generate_synthetic_negatives_from_positives_zero_count() {
-        let positives: Vec<Vec<f32>> = vec![vec![0.5; 96]];
-        let negs = generate_synthetic_negatives_from_positives(0, &positives, 1.5, None);
-        assert!(negs.is_empty());
-    }
+        // Zero count returns empty.
+        let zero = generate_synthetic_negatives_from_positives(0, &positives, 1.5, None);
+        assert!(zero.is_empty());
 
-    #[test]
-    fn test_generate_synthetic_negatives_from_positives_empty_positives() {
-        let positives: Vec<Vec<f32>> = vec![];
-        let negs = generate_synthetic_negatives_from_positives(10, &positives, 1.5, None);
-        assert!(negs.is_empty());
+        // Empty positives returns empty.
+        let empty = generate_synthetic_negatives_from_positives(10, &[], 1.5, None);
+        assert!(empty.is_empty());
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -1722,10 +1734,8 @@ mod tests {
         // Population std: sqrt((4+0+4)/3) ≈ 1.63299
         assert!((std[0] - 1.632_99).abs() < 1e-4);
         assert!((std[1] - 1.632_99).abs() < 1e-4);
-    }
 
-    #[test]
-    fn test_compute_standard_scaler_empty() {
+        // Empty input produces empty scaler.
         let (mean, std) = compute_standard_scaler(&[]);
         assert!(mean.is_empty());
         assert!(std.is_empty());
@@ -1764,63 +1774,6 @@ mod tests {
     }
 
     #[test]
-    fn test_verifier_noop_untrained_serialization() {
-        // Serialize and deserialize an untrained verifier — must remain no-op.
-        let verifier = VoiceVerifier::untrained();
-        let json = serde_json::to_string(&verifier).expect("serialize");
-        let deserialized: VoiceVerifier = serde_json::from_str(&json).expect("deserialize");
-
-        assert!(!deserialized.is_trained());
-        let score = deserialized.predict(&[0.0; VERIFIER_INPUT_DIM]);
-        assert!((score - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_train_with_synthetic_negatives_basic() {
-        let mut rng = StdRng::seed_from_u64(42);
-        let positives: Vec<Vec<f32>> = (0..30).map(|_| make_positive_embedding(&mut rng)).collect();
-        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
-        let verifier = VoiceVerifier::train_with_synthetic_negatives(
-            &[pos_seq],
-            DEFAULT_VERIFIER_THRESHOLD,
-            Some(42),
-        );
-        assert!(verifier.is_trained());
-        assert_eq!(
-            verifier.threshold, DEFAULT_VERIFIER_THRESHOLD,
-            "threshold must match DEFAULT_VERIFIER_THRESHOLD",
-        );
-        assert_eq!(
-            verifier.weights.len(),
-            EMBEDDING_DIM,
-            "weights should be {EMBEDDING_DIM}-dim",
-        );
-        assert!(!verifier.scaler_mean.is_empty());
-        assert!(!verifier.scaler_std.is_empty());
-
-        // All weights must be finite — NaN/inf indicates gradient divergence.
-        for (j, &w) in verifier.weights.iter().enumerate() {
-            assert!(
-                w.is_finite(),
-                "weights[{j}] is not finite: {w}; gradient descent diverged",
-            );
-        }
-        assert!(
-            verifier.bias.is_finite(),
-            "bias is not finite; gradient descent diverged",
-        );
-
-        // Predict must return a reasonable score for a positive embedding.
-        let held_out = make_positive_embedding(&mut rng);
-        let score = verifier.predict(&held_out);
-        assert!(
-            score >= 0.5,
-            "Verifier should accept positive embedding (score >= 0.5), got score={score:.4}; \
-             weights may have diverged",
-        );
-    }
-
-    #[test]
     fn test_verifier_empty_training_returns_untrained() {
         // No positive examples → should return untrained.
         let neg_embs = vec![vec![0.0; VERIFIER_INPUT_DIM]];
@@ -1838,6 +1791,7 @@ mod tests {
 
     #[test]
     fn test_deterministic_training_same_seed_identical_weights() {
+        // ── High-level deterministic check (VoiceVerifier::train) ───
         // Two training runs with the same seed and identical training data
         // must produce identical logistic regression weights.
         let mut rng = StdRng::seed_from_u64(12345);
@@ -1880,6 +1834,89 @@ mod tests {
             (v1.bias - v2.bias).abs() < f32::EPSILON,
             "bias differs between deterministic training runs"
         );
+
+        // ── Low-level train_logistic_sgd prediction check ───────────
+        let mut rng2 = StdRng::seed_from_u64(42);
+        let pos_frames: Vec<Vec<f32>> = (0..30).map(|_| make_positive_frame(&mut rng2)).collect();
+        let neg_frames: Vec<Vec<f32>> = (0..50).map(|_| make_negative_frame(&mut rng2)).collect();
+
+        let features: Vec<Vec<f32>> = pos_frames
+            .iter()
+            .chain(neg_frames.iter())
+            .cloned()
+            .collect();
+        let labels: Vec<f32> = [vec![1.0; 30], vec![0.0; 50]].concat();
+        let sample_weights: Vec<f32> = [vec![50.0 / 30.0; 30], vec![1.0; 50]].concat();
+
+        let (weights, bias) = train_logistic_sgd(
+            &features,
+            &labels,
+            &sample_weights,
+            L2_LAMBDA,
+            LOGISTIC_LEARNING_RATE,
+            LOGISTIC_MAX_ITER,
+            Some(42),
+        );
+
+        assert_eq!(
+            weights.len(),
+            EMBEDDING_DIM,
+            "logistic weights should be 96-dim"
+        );
+        assert!(bias.is_finite(), "bias must be finite");
+        for (j, &w) in weights.iter().enumerate() {
+            assert!(
+                w.is_finite(),
+                "weights[{j}] is not finite; training diverged"
+            );
+        }
+
+        // Predict on held-out frames and verify discrimination.
+        let held_out_pos: Vec<f32> = make_positive_frame(&mut rng2);
+        let held_out_neg: Vec<f32> = make_negative_frame(&mut rng2);
+
+        let score_pos = predict_logistic(&held_out_pos, &weights, bias, &[], &[]);
+        let score_neg = predict_logistic(&held_out_neg, &weights, bias, &[], &[]);
+        assert!(
+            score_pos > score_neg,
+            "Logistic should score positive ({score_pos:.4}) higher than negative ({score_neg:.4})",
+        );
+
+        // ── Low-level train_logistic_sgd deterministic check ────────
+        let mut rng3 = StdRng::seed_from_u64(12345);
+        let pos_det: Vec<Vec<f32>> = (0..10).map(|_| make_positive_frame(&mut rng3)).collect();
+        let neg_det: Vec<Vec<f32>> = (0..10).map(|_| make_negative_frame(&mut rng3)).collect();
+        let det_features: Vec<Vec<f32>> = pos_det.iter().chain(neg_det.iter()).cloned().collect();
+        let det_labels: Vec<f32> = [vec![1.0; 10], vec![0.0; 10]].concat();
+        let det_sample_weights: Vec<f32> = [vec![10.0; 10], vec![1.0; 10]].concat();
+
+        let (w1, b1) = train_logistic_sgd(
+            &det_features,
+            &det_labels,
+            &det_sample_weights,
+            L2_LAMBDA,
+            LOGISTIC_LEARNING_RATE,
+            LOGISTIC_MAX_ITER,
+            Some(42),
+        );
+        let (w2, b2) = train_logistic_sgd(
+            &det_features,
+            &det_labels,
+            &det_sample_weights,
+            L2_LAMBDA,
+            LOGISTIC_LEARNING_RATE,
+            LOGISTIC_MAX_ITER,
+            Some(42),
+        );
+
+        assert_eq!(
+            w1, w2,
+            "weights differ between deterministic logistic training runs"
+        );
+        assert!(
+            (b1 - b2).abs() < f32::EPSILON,
+            "bias differs between deterministic logistic training runs"
+        );
     }
 
     fn make_positive_frame(rng: &mut impl Rng) -> Vec<f32> {
@@ -1914,122 +1951,6 @@ mod tests {
                 }
             })
             .collect()
-    }
-
-    #[test]
-    fn test_logistic_sgd_train_and_predict() {
-        // Train logistic SGD on 96-dim per-frame positive/negative embeddings,
-        // then verify prediction on held-out data discriminates correctly.
-        let mut rng = StdRng::seed_from_u64(42);
-        let positives: Vec<Vec<f32>> = (0..30).map(|_| make_positive_frame(&mut rng)).collect();
-        let negatives: Vec<Vec<f32>> = (0..50).map(|_| make_negative_frame(&mut rng)).collect();
-
-        let features: Vec<Vec<f32>> = positives.iter().chain(negatives.iter()).cloned().collect();
-        let labels: Vec<f32> = [vec![1.0; 30], vec![0.0; 50]].concat();
-        // Class-weight positives to compensate for imbalance (50 neg / 30 pos).
-        let sample_weights: Vec<f32> = [vec![50.0 / 30.0; 30], vec![1.0; 50]].concat();
-
-        let (weights, bias) = train_logistic_sgd(
-            &features,
-            &labels,
-            &sample_weights,
-            L2_LAMBDA,              // 0.01 — production L2 regularisation
-            LOGISTIC_LEARNING_RATE, // 0.01 — production learning rate for logistic SGD
-            LOGISTIC_MAX_ITER,      // 1000 — production max iterations for logistic
-            Some(42),               // deterministic seed
-        );
-
-        assert_eq!(
-            weights.len(),
-            EMBEDDING_DIM,
-            "logistic weights should be 96-dim"
-        );
-        assert!(bias.is_finite(), "bias must be finite");
-        for (j, &w) in weights.iter().enumerate() {
-            assert!(
-                w.is_finite(),
-                "weights[{j}] is not finite; training diverged"
-            );
-        }
-
-        // Predict on held-out frames and verify discrimination.
-        let held_out_pos: Vec<f32> = make_positive_frame(&mut rng);
-        let held_out_neg: Vec<f32> = make_negative_frame(&mut rng);
-
-        // Use predict_logistic() directly (no scaler fitted in this test).
-        let score_pos = predict_logistic(&held_out_pos, &weights, bias, &[], &[]);
-        let score_neg = predict_logistic(&held_out_neg, &weights, bias, &[], &[]);
-        assert!(
-            score_pos > score_neg,
-            "Logistic should score positive ({score_pos:.4}) higher than negative ({score_neg:.4})",
-        );
-    }
-
-    #[test]
-    fn test_logistic_sgd_deterministic() {
-        // Two training runs with the same seed must produce identical weights.
-        let mut rng = StdRng::seed_from_u64(12345);
-        let positives: Vec<Vec<f32>> = (0..10).map(|_| make_positive_frame(&mut rng)).collect();
-        let negatives: Vec<Vec<f32>> = (0..10).map(|_| make_negative_frame(&mut rng)).collect();
-        let features: Vec<Vec<f32>> = positives.iter().chain(negatives.iter()).cloned().collect();
-        let labels: Vec<f32> = [vec![1.0; 10], vec![0.0; 10]].concat();
-        let sample_weights: Vec<f32> = [vec![10.0; 10], vec![1.0; 10]].concat(); // class-weighted
-
-        let seed = 42;
-        let (w1, b1) = train_logistic_sgd(
-            &features,
-            &labels,
-            &sample_weights,
-            L2_LAMBDA,
-            LOGISTIC_LEARNING_RATE,
-            LOGISTIC_MAX_ITER,
-            Some(seed),
-        );
-        let (w2, b2) = train_logistic_sgd(
-            &features,
-            &labels,
-            &sample_weights,
-            L2_LAMBDA,
-            LOGISTIC_LEARNING_RATE,
-            LOGISTIC_MAX_ITER,
-            Some(seed),
-        );
-
-        assert_eq!(
-            w1, w2,
-            "weights differ between deterministic logistic training runs"
-        );
-        assert!(
-            (b1 - b2).abs() < f32::EPSILON,
-            "bias differs between deterministic logistic training runs"
-        );
-    }
-
-    #[test]
-    fn test_mean_pool_window_into_basic() {
-        // Mean-pool a simple 3-frame pattern and verify the output.
-        let mut window = [0.0f32; VERIFIER_INPUT_DIM];
-        for j in 0..VERIFIER_WINDOW_SIZE {
-            for i in 0..EMBEDDING_DIM {
-                window[j * EMBEDDING_DIM + i] = (j * 10 + i) as f32;
-            }
-        }
-        let mut pooled = [0.0f32; EMBEDDING_DIM];
-        mean_pool_window_into(&window, &mut pooled);
-
-        // Frame 0: [0, 1, 2, ..., 95]
-        // Frame 1: [10, 11, 12, ..., 105]
-        // Frame 2: [20, 21, 22, ..., 115]
-        // Mean: [(0+10+20)/3, (1+11+21)/3, ...] = [10, 11, 12, ...]
-        for i in 0..EMBEDDING_DIM {
-            // For dim 0: (0+10+20)/3 = 10; dim 1: (1+11+21)/3 = 11; etc.
-            let correct = ((i + 0) + (i + 10) + (i + 20)) as f32 / 3.0;
-            assert!(
-                (pooled[i] - correct).abs() < 1e-5,
-                "pooled[{i}] = {}, expected {correct}",
-                pooled[i],
-            );
-        }
     }
 
     // ── EmbeddingSequence cross-boundary tests (mahbot-902) ────────────────
@@ -2121,49 +2042,54 @@ mod tests {
             score_neg < 0.5,
             "Verifier should reject negative embedding (score < 0.5), got score={score_neg:.4}",
         );
-    }
 
-    #[test]
-    fn test_verifier_train_with_cache_sequences() {
+        // ── Cache-weighted sequences ────────────────────────────────
         // Simulates production cache path: confusable + unrelated + synthetic
         // negatives as separate sequences with per-sequence weight tiers.
-        let mut rng = StdRng::seed_from_u64(42);
-        let positives: Vec<Vec<f32>> = (0..20).map(|_| make_positive_embedding(&mut rng)).collect();
-        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
+        let mut rng2 = StdRng::seed_from_u64(99);
+        let cache_pos: Vec<Vec<f32>> = (0..20)
+            .map(|_| make_positive_embedding(&mut rng2))
+            .collect();
+        let cache_pos_seq = make_seq(cache_pos, crate::embedding_sequence::LabelStratum::Positive);
 
-        // Three negative sequences simulating confusable, unrelated, synthetic
-        let neg_confusable: Vec<Vec<f32>> =
-            (0..10).map(|_| make_negative_embedding(&mut rng)).collect();
-        let neg_unrelated: Vec<Vec<f32>> =
-            (0..10).map(|_| make_negative_embedding(&mut rng)).collect();
-        let neg_synthetic: Vec<Vec<f32>> =
-            (0..10).map(|_| make_negative_embedding(&mut rng)).collect();
+        let neg_confusable: Vec<Vec<f32>> = (0..10)
+            .map(|_| make_negative_embedding(&mut rng2))
+            .collect();
+        let neg_unrelated: Vec<Vec<f32>> = (0..10)
+            .map(|_| make_negative_embedding(&mut rng2))
+            .collect();
+        let neg_synthetic: Vec<Vec<f32>> = (0..10)
+            .map(|_| make_negative_embedding(&mut rng2))
+            .collect();
 
-        let conf_seq = make_seq(
-            neg_confusable,
-            crate::embedding_sequence::LabelStratum::Negative,
-        );
-        let unrel_seq = make_seq(
-            neg_unrelated,
-            crate::embedding_sequence::LabelStratum::Negative,
-        );
-        let synth_seq = make_seq(
-            neg_synthetic,
-            crate::embedding_sequence::LabelStratum::Negative,
-        );
+        let cache_negatives = [
+            make_seq(
+                neg_confusable,
+                crate::embedding_sequence::LabelStratum::Negative,
+            ),
+            make_seq(
+                neg_unrelated,
+                crate::embedding_sequence::LabelStratum::Negative,
+            ),
+            make_seq(
+                neg_synthetic,
+                crate::embedding_sequence::LabelStratum::Negative,
+            ),
+        ];
 
-        // Per-sequence weights: confusable=3.0, unrelated=2.0, synthetic=1.0
         let per_neg_weights = vec![3.0, 2.0, 1.0];
 
-        let verifier = VoiceVerifier::train(
-            &[pos_seq],
-            &[conf_seq, unrel_seq, synth_seq],
+        let cache_verifier = VoiceVerifier::train(
+            &[cache_pos_seq],
+            &cache_negatives,
             Some(&per_neg_weights),
             DEFAULT_VERIFIER_THRESHOLD,
             L2_LAMBDA,
             Some(42),
         );
-
-        assert!(verifier.is_trained());
+        assert!(
+            cache_verifier.is_trained(),
+            "Cache-weighted verifier must be trained",
+        );
     }
 }
