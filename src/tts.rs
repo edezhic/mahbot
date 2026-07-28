@@ -360,6 +360,25 @@ pub(crate) fn test_set_state(state: u8) {
     STATE.store(state, Ordering::Release);
 }
 
+/// Reset [`STATE`] from [`STATE_LOADING`] back to [`STATE_UNINIT`] if the
+/// download retry loop was orphaned (e.g. the runtime dropped the task before
+/// it was ever polled).  Returns `true` if the state was actually reset.
+///
+/// This is a recovery mechanism for `wait_for_tts_styles()` in the voice
+/// pipeline: when [`STATE`] is stuck in [`STATE_LOADING`] with no download
+/// task making progress, resetting allows the next caller to retry.
+#[must_use]
+pub(crate) fn try_reset_loading_state() -> bool {
+    STATE
+        .compare_exchange(
+            STATE_LOADING,
+            STATE_UNINIT,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
 /// Speak `text` with the default voice (M1).
 ///
 /// Spawns a background task that synthesizes audio, plays it via rodio
@@ -601,8 +620,12 @@ pub fn synthesize(
 /// Try to load TTS models from cache at startup.
 /// Returns `true` if loaded, `false` if not (download will happen async).
 pub fn try_load_cached() -> bool {
-    if STATE.load(Ordering::Acquire) != STATE_UNINIT {
-        return STATE.load(Ordering::Acquire) == STATE_READY;
+    // Fast path: models already loaded.
+    // Also accept LOADING/FAILED states — loading from disk is safe regardless
+    // of the async download state, and is the primary recovery mechanism when
+    // the download task is orphaned (STATE stuck in LOADING).
+    if STATE.load(Ordering::Acquire) == STATE_READY {
+        return true;
     }
 
     let Some(dir) = model_dir() else {
@@ -1871,28 +1894,42 @@ async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
 /// Wait for a rodio sink to finish playback, polling for completion
 /// with optional cancellation support.
 ///
-/// Returns `true` if playback completed normally, `false` if cancelled.
+/// Returns `true` if playback completed normally, `false` if cancelled
+/// or if the sink didn't drain within [`SINK_WAIT_TIMEOUT`].
 async fn wait_for_sink(sink: &Sink, cancel_rx: Option<&mut broadcast::Receiver<()>>) -> bool {
-    if let Some(rx) = cancel_rx {
-        loop {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+    /// Maximum time to wait for the sink to drain before giving up.
+    const SINK_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-            if sink.empty() {
-                return true;
-            }
+    let poll_loop = async {
+        if let Some(rx) = cancel_rx {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
 
-            if rx.try_recv().is_ok() {
-                info!("TTS playback cancelled");
-                sink.stop();
-                return false;
+                if sink.empty() {
+                    return true;
+                }
+
+                if rx.try_recv().is_ok() {
+                    info!("TTS playback cancelled");
+                    sink.stop();
+                    return false;
+                }
             }
+        } else {
+            // No cancellation receiver — just wait until playback finishes.
+            while !sink.empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            true
         }
+    };
+
+    if let Ok(result) = tokio::time::timeout(SINK_WAIT_TIMEOUT, poll_loop).await {
+        result
     } else {
-        // No cancellation receiver — just wait until playback finishes.
-        while !sink.empty() {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        true
+        warn!("TTS sink wait timed out after 30s");
+        sink.stop();
+        false
     }
 }
 
@@ -2581,9 +2618,11 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<Vec<f32>>(4);
 
-        // Spawn the streaming synthesis on a blocking thread (as in production)
+        // Spawn the streaming synthesis on a blocking thread (as in production).
+        // Store the JoinHandle so we can drain the channel BEFORE awaiting it,
+        // preventing a deadlock if chunk count exceeds channel capacity.
         let text_for_task = long_text.clone();
-        tokio::task::spawn_blocking(move || {
+        let handle = tokio::task::spawn_blocking(move || {
             synthesize_chunked_streaming(
                 engine,
                 &text_for_task,
@@ -2594,11 +2633,12 @@ mod tests {
                 42,
             )
             .expect("streaming synthesis should succeed");
-        })
-        .await
-        .expect("blocking task should not panic");
+        });
 
-        // Collect all chunks from the channel
+        // Drain the channel first — this avoids deadlock: the blocking task
+        // calls tx.blocking_send() which blocks when the channel is full, but
+        // the JoinHandle won't complete until all sends finish. By draining
+        // concurrently, we keep the channel flowing.
         let mut chunk_count = 0;
         let mut total_samples = 0usize;
         while let Some(samples) = rx.recv().await {
@@ -2609,6 +2649,10 @@ mod tests {
             total_samples += samples.len();
             chunk_count += 1;
         }
+
+        // Now it's safe to await the JoinHandle — the channel is fully drained
+        // and the blocking task has completed (tx was dropped, closing channel).
+        handle.await.expect("blocking task should not panic");
 
         assert!(
             chunk_count > 1,
@@ -2632,7 +2676,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Vec<f32>>(4);
 
         let text_for_task = short_text.to_string();
-        tokio::task::spawn_blocking(move || {
+        let handle = tokio::task::spawn_blocking(move || {
             synthesize_chunked_streaming(
                 engine,
                 &text_for_task,
@@ -2643,11 +2687,10 @@ mod tests {
                 42,
             )
             .expect("streaming synthesis of short text should succeed");
-        })
-        .await
-        .expect("blocking task should not panic");
+        });
 
-        // Should receive exactly one chunk, then channel closes
+        // Drain the channel first (see test_synthesize_chunked_streaming_receives_chunks
+        // for the rationale — prevents deadlock if chunk count changes).
         let first = rx.recv().await;
         assert!(first.is_some(), "short text must send one chunk");
         let samples = first.unwrap();
@@ -2656,6 +2699,8 @@ mod tests {
             rx.recv().await.is_none(),
             "short text must send exactly one chunk"
         );
+
+        handle.await.expect("blocking task should not panic");
     }
 
     #[tokio::test]

@@ -609,11 +609,21 @@ pub(crate) fn unrelated_dense_embeddings() -> &'static [EmbeddingSequence] {
 /// Returns `Some(styles)` when styles are available, or `None` if:
 /// - TTS download permanently failed
 /// - Shutdown was requested
+///
+/// Maximum number of 30-second polling iterations before giving up on TTS
+/// voice styles (10 × 30s = 5 minutes). Generously covers even slow
+/// downloads while preventing infinite hangs when STATE is permanently
+/// stuck in LOADING (e.g., the download task was orphaned by runtime drop).
+const MAX_TTS_STYLE_POLLS: u32 = 10;
+
 async fn wait_for_tts_styles() -> Option<Vec<String>> {
     // Trigger TTS model download if not already available (decoupled from
     // the playback toggle — mahbot-932).  This ensures confusable/unrelated
     // phrase embeddings are generated for classifier and verifier training
     // regardless of whether audio playback is enabled.
+    //
+    // Note: try_load_cached() now attempts disk loading even when STATE is
+    // LOADING (Fix 4, mahbot-939), recovering from orphaned download tasks.
     if !crate::tts::models_ready() && !crate::tts::try_load_cached() {
         info!(
             "TTS models not cached — triggering download on demand (~400 MB) \
@@ -633,7 +643,7 @@ async fn wait_for_tts_styles() -> Option<Vec<String>> {
     );
 
     let shutdown = crate::shutdown::shutdown_token();
-    loop {
+    for _ in 0..MAX_TTS_STYLE_POLLS {
         tokio::select! {
             () = tokio::time::sleep(Duration::from_secs(30)) => {
                 styles = crate::tts::list_voice_styles();
@@ -659,6 +669,31 @@ async fn wait_for_tts_styles() -> Option<Vec<String>> {
             }
         }
     }
+
+    // Exceeded MAX_TTS_STYLE_POLLS with no styles and no FAILED state.
+    // This usually means the download task was orphaned (STATE stuck in
+    // LOADING).  Try one final disk load (safe even in LOADING with Fix 4),
+    // then reset STATE so future callers can retry.
+    warn!(
+        "TTS voice styles not available after {} polls (~{}s) — \
+         giving up and resetting loading state",
+        MAX_TTS_STYLE_POLLS,
+        MAX_TTS_STYLE_POLLS * 30,
+    );
+
+    if crate::tts::try_load_cached() {
+        let styles = crate::tts::list_voice_styles();
+        if !styles.is_empty() {
+            return Some(styles);
+        }
+    }
+
+    // Reset STATE from LOADING to UNINIT so the next caller triggers a
+    // fresh download attempt instead of silently returning None forever.
+    if crate::tts::try_reset_loading_state() {
+        info!("Reset TTS state from LOADING to UNINIT — next caller will retry");
+    }
+    None
 }
 
 /// Pre-warm the confusable phrase embedding cache (mahbot-859, mahbot-872).
