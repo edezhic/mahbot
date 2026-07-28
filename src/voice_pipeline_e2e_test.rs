@@ -72,22 +72,41 @@ use std::time::Instant;
 /// vs the old mixed old-style + streaming distribution): 2.13 = 1.35 * 1.58.
 const MIN_CLASSIFIER_THRESHOLD: f32 = 2.13;
 
-/// Number of samples to prepend for verifier warm-up (mahbot-922).
+/// Number of samples to prepend for verifier warm-up (mahbot-922, mahbot-926).
 ///
-/// ~512ms of noise at 16 kHz, consumed by the verifier warm-up period
+/// ~1.28 s of noise at 16 kHz, consumed by the verifier warm-up period
 /// (4 embeddings, see [`VERIFIER_WARMUP_EMBEDDINGS`](crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS))
 /// so the actual test utterance arrives with a fully active verifier — matching
 /// production behaviour where the warm-up is consumed during background
 /// silence/noise before anyone speaks.
 ///
-/// ## Derivation
+/// ## Derivation (mahbot-926, stride-8 alignment)
 ///
-/// Each embedding spans N mel frames, which in turn span N × stride frames of
-/// audio.  Benchmark-empirical calibration shows the first — `VERIFIER_WARMUP_EMBEDDINGS`
-/// embeddings occupy ~512 ms of audio.  If the verifier window size changes in
-/// `voice_verifier.rs`, this constant should be updated proportionally to the
-/// warm-up embedding count × ~128 ms/embedding.
-const WARMUP_PREPEND_SAMPLES: usize = 8192; // 512ms × 16 kHz
+/// After mahbot-923 switched to stride-8 sliding-window embedding extraction,
+/// each embedding requires [`EMBEDDING_WINDOW_FRAMES`] (76) consecutive mel
+/// frames.  Mel frames are produced by the ONNX `melspectrogram` model at
+/// 10 ms intervals (hop = 160 samples at 16 kHz).
+///
+/// The number of mel frames from N audio samples:
+/// ```text
+/// mel_frames = max(0, (N - 512) / 160 + 1)
+/// ```
+/// where 512 is the STFT window size and 160 is the hop length.
+///
+/// The stride-8 sliding window produces one embedding every 8 mel frames
+/// (80 ms).  To get `N` embeddings we need at least `76 + (N-1) × 8` mel
+/// frames.  For `N = VERIFIER_WARMUP_EMBEDDINGS = 4`:
+/// ```text
+/// mel_frames_needed = 76 + 3 × 8 = 100
+/// samples_needed   ≈ (100 - 1) × 160 + 512 = 16352
+/// ```
+///
+/// 20480 samples (~1.28 s, ~125 mel frames) produces 7 stride-8 embeddings,
+/// safely above the minimum of 4.  The excess margin (~3 extra embeddings)
+/// provides robustness against pipeline changes (stride, window size, VAD
+/// sensitivity).  If the embedding window or stride changes in `voice.rs`,
+/// this constant should be recalculated to maintain ≥ 4 embeddings.
+const WARMUP_PREPEND_SAMPLES: usize = 20480; // 1.28s × 16 kHz
 
 /// Cached warm-up noise signal, generated once on first access (mahbot-922).
 static WARMUP_NOISE_CACHE: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
@@ -643,13 +662,13 @@ fn generate_mixed_speech_noise() -> Vec<f32> {
     samples
 }
 
-/// Returns ~512ms of speech-like noise that triggers Earshot VAD to produce
+/// Returns ~1.28 s of speech-like noise that triggers Earshot VAD to produce
 /// ≥ [`VERIFIER_WARMUP_EMBEDDINGS`](crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS)
 /// embeddings while producing near-zero wake-word classifier scores (mahbot-922).
 ///
 /// ## Invariants (must not break)
 ///
-/// 1. **VAD triggering**: must produce ≥ 4 embeddings in ~512 ms (the verifier
+/// 1. **VAD triggering**: must produce ≥ 4 embeddings in ~1.28 s (the verifier
 ///    warm-up period).  Achieved by pink noise (1/f, 0.20 amplitude) for
 ///    speech-like spectral shape + 200 Hz tone (0.10 amplitude) for a
 ///    fundamental-frequency peak in the lowest mel bands.  Combined RMS ~0.18.
@@ -724,13 +743,21 @@ fn feed_audio(samples: &[f32], ctx: &mut super::PipelineCtx) {
 
 /// Consume the verifier warm-up period by feeding [`generate_warmup_noise`] through
 /// [`feed_audio`].  After this call the verifier is active and the latency timer in
-/// [`run_streaming_detection`] reflects only the test utterance (mahbot-922).
+/// [`run_streaming_detection`] reflects only the test utterance (mahbot-922, mahbot-926).
+///
+/// ## Stride-8 warm-up (mahbot-926)
+///
+/// The stride-8 sliding-window embedding extraction (mahbot-923) requires at least
+/// [`EMBEDDING_WINDOW_FRAMES`](super::EMBEDDING_WINDOW_FRAMES) mel frames (76) to
+/// produce even one embedding.  With [`WARMUP_PREPEND_SAMPLES`] = 20480, the warm-up
+/// noise produces ~125 mel frames → 7 stride-8 embeddings, safely exceeding the
+/// verifier's [`VERIFIER_WARMUP_EMBEDDINGS`] = 4 requirement.
 ///
 /// ## Diagnostics
 ///
 /// - If VAD didn't trigger (fewer than [`VERIFIER_WARMUP_EMBEDDINGS`] embeddings
-///   produced), a `warn!()` is emitted so maintainers know the warm-up wasn't
-///   fully consumed.  Detection on very short utterances (<1 s) may be impacted.
+///   produced), a `warn!()` is emitted so maintainers know the warm-up wasn't fully
+///   consumed.  Detection on very short utterances (<1 s) may be impacted.
 /// - If the warm-up noise triggered a false detection (extremely unlikely), a
 ///   `warn!()` is emitted and the detection state is restored to prevent cooldown
 ///   from corrupting subsequent benchmark measurements.
@@ -738,17 +765,24 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
     let before_embeddings = ctx.embedding_ring.len();
     let before_detection = ctx.last_wake_word_detection;
     let noise = generate_warmup_noise();
+
+    // ── Feed warm-up noise (single pass) ────────────────────────────────────
+    // The stride-8 pipeline needs enough mel frames to produce ≥4 embeddings.
+    // With WARMUP_PREPEND_SAMPLES = 20480 (~1.28s), we get ~125 mel frames →
+    // 7 stride-8 embeddings, safely exceeding the requirement.  A single pass
+    // suffices — re-feeding identical noise through an already-adapted AGC cannot
+    // increase VAD triggering (mahbot-926, reviewer feedback).
     feed_audio(noise, ctx);
+    let produced = ctx.embedding_ring.len().saturating_sub(before_embeddings);
 
     // Diagnostic: validate that the warm-up noise produced enough embeddings
-    // to consume the verifier warm-up period (mahbot-922, reviewer feedback).
-    let produced = ctx.embedding_ring.len().saturating_sub(before_embeddings);
+    // to consume the verifier warm-up period (mahbot-922, mahbot-926).
     if produced < crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS {
         warn!(
-            "Warm-up noise produced only {} embedding(s) (need >= {} for full \
-             verifier warm-up).  If VAD is not triggering, consider increasing \
-             the pink noise amplitude or adding more tonal components.  Detection \
-             on very short utterances (<1s) may be disadvantaged.",
+            "Warm-up noise produced only {} embedding(s) (need >= {}) — \
+             detection on very short utterances (<1 s) may be disadvantaged. \
+             Consider adjusting WARMUP_PREPEND_SAMPLES if pipeline constants \
+             have changed (mahbot-926).",
             produced,
             crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS,
         );

@@ -984,10 +984,14 @@ const NO_MATCH_RESET_THRESHOLD: f32 = 0.316;
 /// reaches the verifier's threshold within this window, the candidate
 /// triggers detection.  Otherwise, the candidate expires and is discarded.
 ///
-/// At ~128 ms per embedding (embedding stride = 8 mel frames at 10 ms/frame),
-/// 4 embeddings ≈ 512 ms — the ~500 ms window mentioned in mahbot-895.
-/// This gives the verifier enough temporal context while preventing
-/// unbounded accumulation across long utterances.
+/// At ~80 ms per stride-8 embedding step (stride = 8 mel frames at
+/// 10 ms/frame), 4 stride-8 embeddings span frames 0..100 = ~1000 ms of
+/// audio — giving the verifier enough temporal context while preventing
+/// unbounded accumulation across long utterances.  (The old pre-stride-8
+/// streaming pipeline produced one embedding per ~128 ms batch flush;
+/// with stride-8 each successive embedding advances by 8 mel frames.)
+/// The temporal span of 4 embeddings was ~512 ms before mahbot-923
+/// (one embedding per 2048-sample flush), and ~1000 ms after stride-8.
 const CANDIDATE_MAX_EMBEDDINGS: usize = 4;
 
 /// A bounded detection candidate created when the classifier's rolling sum
