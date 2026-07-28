@@ -1591,6 +1591,18 @@ pub(crate) fn run_internal() {
     const P_TEARDOWN: usize = 14;
     const NUM_PHASES: usize = 15;
 
+    // ── Heartbeat drop guard (mahbot-944) ──────────────────────────────
+    // Defined as an item (before any statements) so it satisfies Clippy's
+    // items_after_statements requirement.  Used by the heartbeat thread to
+    // ensure the stop flag is set even on panic unwind.
+    struct HeartbeatGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for HeartbeatGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     // Initialize a tracing subscriber so progress info!() messages appear
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -1606,6 +1618,10 @@ pub(crate) fn run_internal() {
     let mut phase_starts: Vec<(&str, Instant)> = Vec::new();
     macro_rules! phase_start {
         ($name:literal) => {{
+            // Both stderr (for live visibility) and info! (for tracing/logs.db).
+            // Stderr ensures output is visible even if the tracing subscriber is
+            // not initialized or buffers messages (mahbot-944).
+            eprintln!("─── {}. {} ───", phase_starts.len() + 1, $name);
             info!("─── {}. {} ───", phase_starts.len() + 1, $name);
             phase_starts.push(($name, Instant::now()));
         }};
@@ -1614,6 +1630,7 @@ pub(crate) fn run_internal() {
         () => {{
             let (name, start) = phase_starts.last().unwrap();
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("  → {} completed in {:.0}ms", name, elapsed);
             info!("  → {} completed in {:.0}ms", name, elapsed);
             elapsed as u64
         }};
@@ -1625,6 +1642,46 @@ pub(crate) fn run_internal() {
     info!("═══ Voice Pipeline E2E Benchmark ═══");
 
     info!("Benchmark tier: all three tiers tested (Easy FA≤0, Medium FA≤1, Hard FA≤2)");
+
+    // ── Heartbeat thread (mahbot-944) ──────────────────────────────────
+    // Prints a pulse every 60 s so the operator can confirm the benchmark
+    // is alive and making progress (vs. parked threads from nested runtime
+    // hangs).
+    //
+    // Uses 1 s sleep intervals so the thread responds to the stop flag
+    // within 1 s (join latency).  A counter gates the print cadence — the
+    // first pulse prints immediately so a hang in the first 60 s is still
+    // detectable.
+    //
+    // A drop guard (`_heartbeat_guard`) sets the stop flag on panic unwind,
+    // ensuring the heartbeat thread exits promptly even when the function
+    // panics before the explicit stop-then-join at the end.
+    let heartbeat_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _heartbeat_guard = HeartbeatGuard(heartbeat_stop.clone());
+    let heartbeat_handle = {
+        let stop = heartbeat_stop.clone();
+        let start = overall_start;
+        std::thread::spawn(move || {
+            let mut counter: u64 = 0;
+            loop {
+                // Print immediately on first iteration (counter=0, 0 % 60 = 0),
+                // then every 60 ticks (~60 s with 1 s sleep between ticks).
+                if counter.is_multiple_of(60) {
+                    let elapsed = start.elapsed();
+                    eprintln!(
+                        "[heartbeat] benchmark still running — elapsed: {}m{:02}s",
+                        elapsed.as_secs() / 60,
+                        elapsed.as_secs() % 60,
+                    );
+                }
+                std::thread::sleep(Duration::from_secs(1));
+                counter += 1;
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+            }
+        })
+    };
 
     // ── 0. Initialize global state ─────────────────────────────────────
     // Set CONFIG storage root so model paths resolve.
@@ -1743,10 +1800,16 @@ pub(crate) fn run_internal() {
     // production, ensuring benchmark results reflect real behavior.
     info!("Pre-warming production negative embedding caches (mahbot-880)...");
     {
-        let rt =
-            tokio::runtime::Runtime::new().expect("Failed to create tokio runtime for prewarm");
-        rt.block_on(super::prewarm_confusable_embeddings());
-        rt.block_on(super::prewarm_unrelated_embeddings());
+        // Use the outer runtime's handle instead of creating a nested runtime
+        // (mahbot-944).  Creating a second tokio runtime inside spawn_blocking
+        // causes BlockingPool::shutdown to hang when the inner runtime drops,
+        // because the oneshot stop signal races with blocking thread idle
+        // timeouts.  Handle::current().block_on() runs the prewarm futures on
+        // the outer runtime's timer and blocking pool, avoiding the nested
+        // runtime entirely.
+        let handle = tokio::runtime::Handle::current();
+        handle.block_on(super::prewarm_confusable_embeddings());
+        handle.block_on(super::prewarm_unrelated_embeddings());
     }
 
     // Check if production caches are populated.  After mahbot-923 the pipeline
@@ -2840,6 +2903,10 @@ pub(crate) fn run_internal() {
     } else {
         info!("═══ E2E Voice Pipeline benchmark completed — see report above for failures ═══");
     }
+
+    // Stop heartbeat thread and wait for it to exit.
+    heartbeat_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = heartbeat_handle.join();
 }
 
 // ── Standalone warm-up validation test (mahbot-922) ──────────────────────
