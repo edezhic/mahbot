@@ -743,7 +743,7 @@ pub fn train_classifier(
                 let loss =
                     -sw * (target * (pred + eps).ln() + (1.0 - target) * (1.0 - pred + eps).ln());
                 batch_loss += loss;
-                backward(&x_cf, target, &weights, &mut g);
+                backward(&x_cf, target, sw, &weights, &mut g);
             }
             // Average gradients
             let nf = chunk.len() as f32;
@@ -1005,12 +1005,18 @@ impl AdamStateGroup {
 /// Manual backward pass using frozen BN running statistics (mean=0, var=1).
 /// Accumulates gradients into `g`.
 ///
+/// The gradient of binary cross-entropy w.r.t. the output logit is:
+/// `d_logit = sw * (pred - target)`, where `sw` is the per-sample weight
+/// (class-balanced by default).  Without the weight, negative samples in
+/// an imbalanced dataset dominate the gradient — preventing the classifier
+/// from learning meaningful class separation.
+///
 /// No per-sample batch statistics are used — BN running stats are always
 /// the frozen identity (mean=0, var=1) that act as a learned per-channel
 /// affine transform.  No dropout is applied (the network has only 3 temporal
 /// positions, making dropout destructively aggressive).
 #[allow(clippy::cast_precision_loss)]
-fn backward(x: &[f32], target: f32, w: &ClassifierWeights, g: &mut GradientBuffer) {
+fn backward(x: &[f32], target: f32, sw: f32, w: &ClassifierWeights, g: &mut GradientBuffer) {
     let cin = EMBEDDING_DIM;
     let lin = WINDOW_SIZE;
     let c1 = w.arch.conv1_out;
@@ -1115,7 +1121,7 @@ fn backward(x: &[f32], target: f32, w: &ClassifierWeights, g: &mut GradientBuffe
 
     let logit = dot(&pooled, &w.fc_weight) + w.fc_bias[0];
     let pred = sigmoid(logit);
-    let d_logit = pred - target;
+    let d_logit = sw * (pred - target);
 
     // FC grads
     for j in 0..c2 {
@@ -1483,6 +1489,102 @@ mod tests {
                 "Negative window should score <0.2, got {score}"
             );
         }
+    }
+
+    #[test]
+    fn test_train_classifier_imbalanced() {
+        // Imbalanced-data regression test (mahbot-925).
+        //
+        // With 1:30 class imbalance and WITHOUT the weighted gradient fix,
+        // negative samples dominate the gradient ~30× more than intended,
+        // causing the model to converge to near-zero (~0.15) predictions
+        // with best validation loss ~0.93.
+        //
+        // With the fix, class-balanced weights restore gradient balance
+        // (pw*pos_count == nw*neg_count), allowing meaningful class
+        // separation with loss well below 0.93.
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut make_emb = |center: f32, noise: f32| -> Vec<f32> {
+            (0..EMBEDDING_DIM)
+                .map(|_| center + (rng.random::<f32>() - 0.5) * noise)
+                .collect()
+        };
+
+        // build_windows with stride=1 produces N - WINDOW_SIZE + 1 windows
+        // from a sequence of N embeddings.
+        // 12 pos embeddings → 10 positive windows.
+        // 302 neg embeddings → 300 negative windows (30× imbalance).
+        let pos_embs: Vec<Vec<f32>> = (0..12).map(|_| make_emb(0.3, 0.4)).collect();
+        let neg_embs: Vec<Vec<f32>> = (0..302).map(|_| make_emb(-0.3, 0.4)).collect();
+        let pos_seqs = [make_seq(pos_embs, LabelStratum::Positive)];
+        let neg_seqs = [make_seq(neg_embs, LabelStratum::Negative)];
+
+        // Use a different seed for training split to avoid correlation with
+        // the embedding generation seed.
+        let cfg = TrainingConfig {
+            max_epochs: 80,
+            rng_seed: Some(99),
+            ..Default::default()
+        };
+        let result = train_classifier(&pos_seqs, &neg_seqs, &cfg).unwrap();
+
+        // Best validation loss must be significantly below the ~0.93 observed
+        // without the weighted gradient (mahbot-925).  A model that fails to
+        // learn (unweighted gradient) bottoms out around 0.93; a well-balanced
+        // gradient should reach ≤0.69 (well below the chance-level ceiling).
+        assert!(
+            result.best_val_loss < 0.70,
+            "Imbalanced training with weighted gradient should achieve \
+             best val loss <0.70, got {}",
+            result.best_val_loss,
+        );
+
+        // Evaluate on the windows produced by build_windows.
+        let classifier = WakeWordClassifier::new_ensemble(result.weights);
+        let mut pos_scores = Vec::new();
+        for win in build_windows(&pos_seqs) {
+            let embs: Vec<Vec<f32>> = (0..WINDOW_SIZE)
+                .map(|t| {
+                    let start = t * EMBEDDING_DIM;
+                    win[start..start + EMBEDDING_DIM].to_vec()
+                })
+                .collect();
+            pos_scores.push(classifier.forward(&embs));
+        }
+        let mut neg_scores = Vec::new();
+        for win in build_windows(&neg_seqs) {
+            let embs: Vec<Vec<f32>> = (0..WINDOW_SIZE)
+                .map(|t| {
+                    let start = t * EMBEDDING_DIM;
+                    win[start..start + EMBEDDING_DIM].to_vec()
+                })
+                .collect();
+            neg_scores.push(classifier.forward(&embs));
+        }
+
+        let pos_mean = pos_scores.iter().copied().sum::<f32>() / pos_scores.len() as f32;
+        let neg_mean = neg_scores.iter().copied().sum::<f32>() / neg_scores.len() as f32;
+
+        // With weighted gradients the positive mean must exceed the negative
+        // mean by at least 0.3 — clear class separation despite 30:1 imbalance.
+        assert!(
+            pos_mean > neg_mean + 0.3,
+            "Positive mean ({pos_mean:.4}) should exceed negative mean \
+             ({neg_mean:.4}) by >0.3 with weighted gradient",
+        );
+
+        // Positive predictions should be above chance (0.5).
+        assert!(
+            pos_mean > 0.5,
+            "Mean positive score should be >0.5, got {pos_mean:.4}",
+        );
+
+        // Negative predictions should be below chance (0.5).
+        assert!(
+            neg_mean < 0.5,
+            "Mean negative score should be <0.5, got {neg_mean:.4}",
+        );
     }
 
     #[test]
