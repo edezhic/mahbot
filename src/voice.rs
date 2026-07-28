@@ -6920,13 +6920,26 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
     }
 }
 
-/// Retain only the last [`VOICE_BATCH_OVERLAP`] samples in `voice_batch`
-/// as overlap context for the next mel spectrogram batch.
+/// Retain an aligned overlap in `voice_batch` for the next mel spectrogram
+/// batch.
+///
+/// Retains at least [`VOICE_BATCH_OVERLAP`] samples, rounding the drain
+/// position **down** to the nearest [`MEL_STRIDE`] boundary so the retained
+/// overlap starts on the mel frame grid.  Without this alignment,
+/// [`HOP_LENGTH`] (256) not being a multiple of [`MEL_STRIDE`] (160) would
+/// cause ~80 % of batch boundaries to land off-grid, producing mel frames
+/// that the classifier never sees during training (mahbot-924).
+///
+/// The actual retained overlap may be up to [`MEL_STRIDE`] − 1 samples larger
+/// than [`VOICE_BATCH_OVERLAP`].  This is harmless — the extra samples merely
+/// produce duplicate mel frames at the batch boundary which the stride‑8
+/// sliding window skips naturally.
 ///
 /// This function is extracted from [`flush_voice_batch`] so the overlap
 /// trimming logic can be tested in isolation (the ONNX inference inside
 /// `flush_voice_batch` requires model files and cannot run in unit tests).
-/// See [`test_mel_stride_overlap_alignment`] for the behavioral test.
+/// See [`test_mel_stride_overlap_alignment`] for the unit test that validates
+/// the alignment property.
 ///
 /// # Caution
 /// [`flush_voice_batch`] **must** call this function after each successful
@@ -6939,7 +6952,10 @@ fn trim_voice_batch(voice_batch: &mut Vec<f32>) {
     let keep = VOICE_BATCH_OVERLAP;
     if voice_batch.len() > keep {
         let drain_to = voice_batch.len() - keep;
-        voice_batch.drain(..drain_to);
+        // Align drain_to down to MEL_STRIDE boundary so the retained overlap
+        // starts at a sample position that is a multiple of MEL_STRIDE.
+        let drain_to_aligned = drain_to - (drain_to % MEL_STRIDE);
+        voice_batch.drain(..drain_to_aligned);
     }
 }
 
@@ -11371,5 +11387,144 @@ mod tests {
             remaining <= 1_048_576,
             "remaining size {remaining} exceeds 1 MB limit after combined eviction"
         );
+    }
+
+    // ── Mel stride alignment test (mahbot-924) ────────────────────────────
+    // Validates that trim_voice_batch drains to a MEL_STRIDE-aligned boundary,
+    // ensuring mel frame grid consistency between enrollment and inference.
+
+    #[test]
+    fn test_mel_stride_overlap_alignment() {
+        // The core invariant: after trim_voice_batch, the drained amount
+        // must be a multiple of MEL_STRIDE so the retained overlap starts
+        // at a position aligned to the mel frame grid.
+        //
+        // Without this alignment, HOP_LENGTH (256) not being a multiple of
+        // MEL_STRIDE (160) causes ~80% of batch boundaries to land off-grid.
+
+        // ── Exhaustive check: every batch length from FRAME_LENGTH to
+        //    VOICE_BATCH_SIZE + 2*MEL_STRIDE ─────────────────────────────
+        // This proves the invariant for all possible batch sizes that can
+        // reach trim_voice_batch (FRAME_LENGTH is the minimum gate in
+        // flush_voice_batch; VOICE_BATCH_SIZE is the normal flush point;
+        // the extra 2×MEL_STRIDE covers the maximum possible retained
+        // overlap after alignment rounding).
+        let max_len = VOICE_BATCH_SIZE + 2 * MEL_STRIDE;
+        for len in FRAME_LENGTH..=max_len {
+            let mut batch = vec![0.0f32; len];
+            let old_len = batch.len();
+
+            trim_voice_batch(&mut batch);
+
+            let drained = old_len - batch.len();
+
+            // Drained amount must be MEL_STRIDE-aligned
+            assert_eq!(
+                drained % MEL_STRIDE,
+                0,
+                "len={len}: drained={drained} is not a multiple of {MEL_STRIDE} \
+                 (remainder={})",
+                drained % MEL_STRIDE,
+            );
+
+            // Must retain at least VOICE_BATCH_OVERLAP samples
+            assert!(
+                batch.len() >= VOICE_BATCH_OVERLAP,
+                "len={len}: retained {} < {VOICE_BATCH_OVERLAP}",
+                batch.len(),
+            );
+
+            // Must retain at most VOICE_BATCH_OVERLAP + MEL_STRIDE - 1
+            // (alignment rounding can add up to MEL_STRIDE - 1 extra)
+            assert!(
+                batch.len() <= VOICE_BATCH_OVERLAP + MEL_STRIDE - 1,
+                "len={len}: retained {} > {}",
+                batch.len(),
+                VOICE_BATCH_OVERLAP + MEL_STRIDE - 1,
+            );
+        }
+
+        // ── Streaming simulation: VAD-frame accumulation ─────────────────
+        // Simulates the real pipeline: HOP_LENGTH chunks accumulate until
+        // voice_batch crosses VOICE_BATCH_SIZE, then trim_voice_batch is
+        // called.  Repeats for many iterations to catch cumulative issues.
+        let mut batch: Vec<f32> = Vec::new();
+        let mut pos = 0usize;
+
+        for iteration in 0..200 {
+            // Add a varying number of HOP_LENGTH chunks per iteration
+            // to simulate real VAD accumulation patterns.
+            let n_chunks = 5 + (iteration * 3) % 11; // cycles 5..15
+            for _ in 0..n_chunks {
+                batch.extend_from_slice(&[0.0; HOP_LENGTH]);
+            }
+
+            // Flush when batch is large enough (matches production logic:
+            // flush_voice_batch requires >= FRAME_LENGTH, and we only trim
+            // when batch > VOICE_BATCH_OVERLAP).
+            if batch.len() > VOICE_BATCH_OVERLAP && batch.len() >= FRAME_LENGTH {
+                let old_len = batch.len();
+                trim_voice_batch(&mut batch);
+                let drained = old_len - batch.len();
+                pos += drained;
+
+                // The start position of the retained batch must be aligned
+                assert_eq!(
+                    pos % MEL_STRIDE,
+                    0,
+                    "Iteration {iteration}: cumulative position {pos} is not \
+                     aligned to {MEL_STRIDE} (remainder {})",
+                    pos % MEL_STRIDE,
+                );
+
+                // Each trim individually must be aligned
+                assert_eq!(
+                    drained % MEL_STRIDE,
+                    0,
+                    "Iteration {iteration}: drained {drained} is not a \
+                     multiple of {MEL_STRIDE} (remainder {})",
+                    drained % MEL_STRIDE,
+                );
+            }
+        }
+
+        // ── Edge case: silence-triggered flush with minimal batch ────────
+        let mut batch = vec![0.0f32; FRAME_LENGTH];
+        let mut pos = 0usize;
+
+        let old_len = batch.len();
+        trim_voice_batch(&mut batch);
+        let drained = old_len - batch.len();
+        pos += drained;
+        assert_eq!(
+            pos % MEL_STRIDE,
+            0,
+            "Minimum batch (FRAME_LENGTH={FRAME_LENGTH}): position {pos} \
+             is not aligned",
+        );
+
+        // ── Idempotency: calling trim_voice_batch on an already-trimmed
+        //    batch should not break alignment ─────────────────────────────
+        for iteration in 0..10 {
+            // Use iteration index for deterministic chunk count
+            let n_chunks = 2 + (iteration * 7 + 3) % 4;
+            for _ in 0..n_chunks {
+                batch.extend_from_slice(&[0.0; HOP_LENGTH]);
+            }
+
+            if batch.len() > VOICE_BATCH_OVERLAP && batch.len() >= FRAME_LENGTH {
+                let old_len = batch.len();
+                trim_voice_batch(&mut batch);
+                let drained = old_len - batch.len();
+                pos += drained;
+
+                assert_eq!(
+                    pos % MEL_STRIDE,
+                    0,
+                    "Idempotency test: position {pos} is not aligned \
+                     (drained {drained})",
+                );
+            }
+        }
     }
 }
