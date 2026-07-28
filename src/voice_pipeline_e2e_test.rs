@@ -53,7 +53,6 @@ use super::*; // voice module items (process_enrollment_sample, etc.)
 use crate::embedding_sequence::{EmbeddingSequence, Source, UtteranceId};
 use crate::tts;
 use crate::voice_verifier::VoiceVerifier;
-use crate::voice_verifier::generate_synthetic_negatives_from_positives;
 use crate::voice_verifier::{L2_LAMBDA, LEARNING_RATE, MLP_MAX_ITER};
 use crate::wake_word_classifier::WakeWordClassifier;
 use earshot::Detector;
@@ -114,13 +113,27 @@ static WARMUP_NOISE_CACHE: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::
 /// Default wake word for the test.
 const WAKE_WORD: &str = "hey mahbot";
 
-/// Number of enrollment variants to generate (fewer than real enrollment
-/// since each TTS call takes ~3-5 sec).
-const NUM_ENROLLMENT_VARIANTS: usize = 5;
+/// Number of enrollment variants to generate (mahbot-932 Fix 5).
+///
+/// Production generates ~45-50 positive training sequences from 10 utterances
+/// × 5 PCM variants (minus SpeedUp skip for short utterances).  We target
+/// ~10 TTS enrollment variants to match this.
+const NUM_ENROLLMENT_VARIANTS: usize = 10;
 
-/// Number of synthetic-augmentation variants (additional wake word variants
-/// with speed/noise/volume perturbation).
-const NUM_AUGMENTATION_VARIANTS: usize = 8;
+/// Owner-negative (non-wake-word) phrases for verifier/classifier training
+/// (mahbot-932 Fix 6).
+///
+/// These are generated via TTS, tagged as `Source::Owner`, and used to help
+/// the models reject general speech from the enrolled user.  Documented
+/// limitation: TTS speech cannot match the distribution of real human Phase 3
+/// speech collected during production enrollment.
+const OWNER_NEGATIVE_PHRASES: &[&str] = &[
+    "hello",
+    "good morning",
+    "turn on the lights",
+    "what time is it",
+    "thank you",
+];
 
 /// Minimum detection rate for positive (wake word) variants required to pass.
 ///
@@ -167,16 +180,12 @@ const NOISE_PROFILES: &[(&str, NoiseGenerator)] = &[
     ("pink noise", generate_pink_noise),
     ("brown noise", generate_brown_noise),
     ("mixed speech+noise", generate_mixed_speech_noise),
+    ("blue noise", generate_blue_noise),
+    ("violet noise", generate_violet_noise),
+    ("low-frequency rumble", generate_low_freq_rumble),
+    ("modulated noise", generate_modulated_noise),
+    ("high-frequency hiss", generate_high_freq_hiss),
 ];
-
-/// Number of synthetic negative embeddings to generate for classifier training.
-/// This is supplemented with real negative examples from unrelated phrases
-/// (see Phase 4) to provide a diverse negative training set.
-///
-/// Equal to [`crate::voice_verifier::SYNTHETIC_NEGATIVES_COUNT`] for consistency —
-/// both produce the same number of synthetic negatives so the test configuration
-/// is representative of production's fallback path.
-const SYNTHETIC_NEGATIVES_COUNT: usize = 100;
 
 /// TTS target sample rate (voice pipeline rate).
 const TARGET_SAMPLE_RATE: u32 = 16_000;
@@ -436,71 +445,6 @@ fn generate_enrollment_variants_cached(
     variants
 }
 
-/// Generate augmented wake word variants with speed, noise, and volume
-/// perturbation. These are not cached since they apply perturbations to
-/// existing synthesis results.
-fn generate_augmented_variants(
-    available_styles: &[String],
-    base_seed: u64,
-) -> Vec<(Vec<f32>, String)> {
-    let mut variants = Vec::new();
-    let num_styles = available_styles.len().max(1);
-
-    for i in 0..NUM_AUGMENTATION_VARIANTS {
-        let style_idx = (i + 3) % num_styles;
-        let style = if available_styles.is_empty() {
-            DEFAULT_TTS_STYLE
-        } else {
-            &available_styles[style_idx]
-        };
-        let seed = base_seed + i as u64 + 1000;
-
-        let base_pcm = match tts::synthesize(WAKE_WORD, style, seed, TARGET_SAMPLE_RATE) {
-            Ok(pcm) => pcm,
-            Err(e) => {
-                warn!("Augmentation synthesis failed: {e}");
-                continue;
-            }
-        };
-
-        let augmented = match i % 3 {
-            0 => {
-                let factor = 1.0 + ((i as f64 * 0.05).sin() * 0.15) as f32;
-                crate::tts_data_gen::speed_perturbation(&base_pcm, TARGET_SAMPLE_RATE, factor)
-            }
-            1 => {
-                // Deterministic seed per variant for reproducible augmentation
-                let aug_seed = base_seed + i as u64;
-                let max_gain_db = 6.0;
-                crate::tts_data_gen::randomize_volume(&base_pcm, max_gain_db, Some(aug_seed))
-            }
-            2 => {
-                // Deterministic seed per variant for reproducible augmentation
-                let aug_seed = base_seed + i as u64;
-                crate::tts_data_gen::add_noise(
-                    &base_pcm,
-                    20.0,
-                    crate::tts_data_gen::NoiseType::Pink,
-                    Some(aug_seed),
-                )
-            }
-            _ => unreachable!("i % 3 is always 0, 1, or 2"),
-        };
-
-        let desc = format!(
-            "{style}_aug{i}_{}",
-            match i % 3 {
-                0 => "speed",
-                1 => "volume",
-                _ => "noise",
-            }
-        );
-        variants.push((augmented, desc));
-    }
-
-    variants
-}
-
 /// Seed configuration for TTS phrase variant generation.
 ///
 /// Encapsulates the three related seed parameters that control deterministic
@@ -660,6 +604,80 @@ fn generate_mixed_speech_noise() -> Vec<f32> {
         samples.push((tone + noise * 0.85).clamp(-1.0, 1.0));
     }
     samples
+}
+
+/// Generate blue noise (spectral density increases 3dB/octave).
+fn generate_blue_noise() -> Vec<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(47);
+    let mut prev: f32 = 0.0;
+    (0..NOISE_LEN)
+        .map(|_| {
+            let white = rng.random::<f32>() * 2.0 - 1.0;
+            // First-order difference approximates blue noise
+            let blue = (white - prev) * 0.5;
+            prev = white;
+            blue.clamp(-1.0, 1.0)
+        })
+        .collect()
+}
+
+/// Generate violet noise (spectral density increases 6dB/octave).
+fn generate_violet_noise() -> Vec<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(48);
+    let mut prev1 = 0.0f32;
+    let mut prev2 = 0.0f32;
+    (0..NOISE_LEN)
+        .map(|_| {
+            let white = rng.random::<f32>() * 2.0 - 1.0;
+            // Second-order difference approximates violet noise
+            let violet = (white - 2.0 * prev1 + prev2) * 0.25;
+            prev2 = prev1;
+            prev1 = white;
+            violet.clamp(-1.0, 1.0)
+        })
+        .collect()
+}
+
+/// Generate low-frequency rumble (pink noise low-passed at ~300Hz).
+fn generate_low_freq_rumble() -> Vec<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(49);
+    let mut low: f32 = 0.0;
+    let alpha = 0.95; // strong low-pass
+    (0..NOISE_LEN)
+        .map(|_| {
+            let white = rng.random::<f32>() * 2.0 - 1.0;
+            low = low * alpha + white * (1.0 - alpha);
+            low.clamp(-1.0, 1.0)
+        })
+        .collect()
+}
+
+/// Generate amplitude-modulated noise (tremolo effect).
+fn generate_modulated_noise() -> Vec<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(50);
+    let mut samples = Vec::with_capacity(NOISE_LEN);
+    for i in 0..NOISE_LEN {
+        let t = i as f32 / TARGET_SAMPLE_RATE as f32;
+        let modulator = (2.0 * core::f32::consts::PI * 4.0 * t).sin() * 0.5 + 0.5; // 4Hz tremolo
+        let noise: f32 = rng.random::<f32>() * 2.0 - 1.0;
+        samples.push((noise * modulator).clamp(-1.0, 1.0));
+    }
+    samples
+}
+
+/// Generate high-frequency hiss (high-pass filtered above ~4kHz).
+fn generate_high_freq_hiss() -> Vec<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(51);
+    let mut prev: f32 = 0.0;
+    (0..NOISE_LEN)
+        .map(|_| {
+            let white = rng.random::<f32>() * 2.0 - 1.0;
+            // Simple high-pass: y[n] = 0.9 * (x[n] - x[n-1]) + 0.8 * y[n-1]
+            let hiss = 0.9 * (white - prev) + 0.8 * prev;
+            prev = white;
+            hiss.clamp(-1.0, 1.0)
+        })
+        .collect()
 }
 
 /// Returns ~1.28 s of speech-like noise that triggers Earshot VAD to produce
@@ -844,15 +862,128 @@ fn ensure_voice_models_loaded() -> Result<(), String> {
     Ok(())
 }
 
-/// Try to load the TTS engine from cache if not already loaded.
-fn ensure_tts_ready() -> Result<(), String> {
-    if tts::models_ready() {
-        return Ok(());
+/// Apply PCM transforms to enrollment variants (mahbot-932 Fix 5).
+///
+/// For each raw TTS enrollment variant, produces up to 5 sequences:
+/// original, speed-down (0.95×), speed-up (1.05×, conditional on ≥500ms),
+/// volume-down (-3dB), and pink noise (25dB SNR).  Matches the production
+/// pipeline in [`prewarm_phrase_embeddings`](super::prewarm_phrase_embeddings).
+fn pcm_augment_enrollment_variants(variants: &[(Vec<f32>, String)]) -> Vec<(Vec<f32>, String)> {
+    let mut all = Vec::new();
+    for (i, (pcm, label)) in variants.iter().enumerate() {
+        // 1. Original (AGC'd, unmodified)
+        all.push((pcm.clone(), format!("{label}_original")));
+
+        // 2. Speed-down (0.95×)
+        let speed_down = crate::tts_data_gen::speed_perturbation(pcm, TARGET_SAMPLE_RATE, 0.95);
+        all.push((speed_down, format!("{label}_speed_down")));
+
+        // 3. Speed-up (1.05×, conditional — skip if too short)
+        let pre_pad_samples = pcm.len().saturating_sub(2 * super::CONTEXT_PADDING_SAMPLES);
+        let pre_pad_ms = (pre_pad_samples as u64 * 1000) / u64::from(TARGET_SAMPLE_RATE);
+        if pre_pad_ms >= 500 {
+            let speed_up = crate::tts_data_gen::speed_perturbation(pcm, TARGET_SAMPLE_RATE, 1.05);
+            all.push((speed_up, format!("{label}_speed_up")));
+        }
+
+        // 4. Volume-down (-3dB)
+        let vol_down = crate::util::apply_gain(pcm, -3.0);
+        all.push((vol_down, format!("{label}_vol_down")));
+
+        // 5. Pink noise (SNR 25dB)
+        let noise = crate::util::add_noise(pcm, 25.0, i as u64);
+        all.push((noise, format!("{label}_noise")));
     }
-    if tts::try_load_cached() {
-        return Ok(());
+    all
+}
+
+/// Generate owner-negative sequences (non-wake-word TTS phrases, mahbot-932 Fix 6).
+///
+/// These are TTS-synthesised phrases tagged as `Source::Owner` for use in
+/// classifier and verifier training.  Documented limitation: TTS speech
+/// cannot match the distribution of real human Phase 3 speech.
+fn generate_owner_negative_sequences(
+    available_styles: &[String],
+    model_hash: &str,
+    cache_dir: &std::path::Path,
+    _cache_bust: bool,
+) -> Vec<EmbeddingSequence> {
+    let num_styles = available_styles.len().max(1);
+    let mut sequences = Vec::new();
+
+    for (i, &phrase) in OWNER_NEGATIVE_PHRASES.iter().enumerate() {
+        for seed in 0..3 {
+            let style = &available_styles[(i * 3 + seed) % num_styles];
+            let seed_val = 1000 + i as u64 * 3 + seed as u64;
+            if let Some(pcm) = super::synthesize_with_pcm_cache(
+                phrase,
+                style,
+                seed_val,
+                TARGET_SAMPLE_RATE,
+                model_hash,
+                cache_dir,
+            ) {
+                match super::process_enrollment_sample(&pcm) {
+                    Ok(embs) if !embs.is_empty() => {
+                        sequences.push(EmbeddingSequence::negative(
+                            UtteranceId {
+                                sequence_index: i * 3 + seed as usize,
+                                variant_index: 0,
+                            },
+                            Source::Owner,
+                            None,
+                            embs,
+                        ));
+                    }
+                    _ => warn!("Owner-negative '{phrase}' seed {seed}: no embeddings"),
+                }
+            }
+        }
     }
-    Err("TTS models not available. Run the app once to download them.".to_string())
+    sequences
+}
+
+/// Generate ambient noise sequences for negative training (mahbot-932 Fix 7).
+///
+/// Produces `EmbeddingSequence` values tagged as [`Source::Ambient`] from noise
+/// profiles at 2 SNR levels each.
+fn generate_ambient_noise_sequences() -> Vec<EmbeddingSequence> {
+    let mut sequences = Vec::new();
+    for (seq_idx, (label, noise_fn)) in NOISE_PROFILES.iter().enumerate() {
+        let raw = noise_fn();
+        // Level 1: full amplitude
+        match super::process_enrollment_sample(&raw) {
+            Ok(embs) if !embs.is_empty() => {
+                sequences.push(EmbeddingSequence::negative(
+                    UtteranceId {
+                        sequence_index: seq_idx * 2,
+                        variant_index: 0,
+                    },
+                    Source::Ambient,
+                    None,
+                    embs,
+                ));
+            }
+            _ => warn!("Ambient '{label}' level-0: no embeddings"),
+        }
+        // Level 2: reduced amplitude (-6dB)
+        let attenuated = crate::util::apply_gain(&raw, -6.0);
+        match super::process_enrollment_sample(&attenuated) {
+            Ok(embs) if !embs.is_empty() => {
+                sequences.push(EmbeddingSequence::negative(
+                    UtteranceId {
+                        sequence_index: seq_idx * 2 + 1,
+                        variant_index: 0,
+                    },
+                    Source::Ambient,
+                    None,
+                    embs,
+                ));
+            }
+            _ => warn!("Ambient '{label}' level-1: no embeddings"),
+        }
+    }
+    sequences
 }
 
 // ── Enrollment ────────────────────────────────────────────────────────────
@@ -1666,7 +1797,7 @@ pub(crate) fn run_internal() {
     super::init_global().unwrap_or_else(|e| warn!("voice::init_global() already called: {e}"));
 
     // ── Prerequisites ───────────────────────────────────────────────
-    if let Err(msg) = ensure_tts_ready() {
+    if let Err(msg) = crate::tts::ensure_ready() {
         panic!("{msg}\nRun the application first to download TTS models (~400 MB).");
     }
 
@@ -1683,7 +1814,7 @@ pub(crate) fn run_internal() {
 
     // ── Phase 1: Generate enrollment audio ───────────────────────────────
     phase_start!("Phase 1: Generating enrollment audio");
-    let mut enrollment_variants = generate_enrollment_variants_cached(
+    let enrollment_variants = generate_enrollment_variants_cached(
         &available_styles,
         &model_version_hash,
         &cache_dir_path,
@@ -1697,40 +1828,42 @@ pub(crate) fn run_internal() {
         "Generated {} enrollment variants",
         enrollment_variants.len()
     );
+
+    // Apply PCM transforms to match production: original, speed-down, speed-up
+    // (conditional), volume-down, noise (mahbot-932 Fix 5).
+    let all_variants = pcm_augment_enrollment_variants(&enrollment_variants);
+    info!(
+        "PCM augmentation: {} -> {} total variants (original + speed-down + \
+         speed-up + vol-down + noise per enrollment)",
+        enrollment_variants.len(),
+        all_variants.len(),
+    );
     phase_times[P_ENROLLMENT_AUDIO] = phase_end_ms!();
 
     // ── Phase 2: VAD-gated enrollment ────────────────────────────────────
     phase_start!("Phase 2: VAD-gated enrollment");
-    let mut augmented_variants = generate_augmented_variants(&available_styles, 200);
-    info!("Generated {} augmented variants", augmented_variants.len());
 
-    // ── Train/test split for disjoint positive evaluation (mahbot-911) ──
-    // Split the generated variants into disjoint training and test sets.
-    // The first N variants are used ONLY for classifier/verifier training.
-    // The remaining variants are held out for detection testing ONLY.
-    // This fixes positive train/test reuse — previously ALL 13 variants
-    // were used for both training (Phases 2-5) and detection (Phase 8).
-    //
-    // Split: 3 of 5 enrollment + 5 of 8 augmented = 8 training variants.
-    //        2 of 5 enrollment + 3 of 8 augmented = 5 test variants.
-    //
-    // Uses Vec::drain() to move items without cloning audio buffers.
-    // After drain(), the original vectors hold only the test variants,
-    // so Phase 8's `into_iter()` automatically uses the test set.
-    let n_train_enroll = 3;
-    let n_train_aug = 5;
-    let train_enrollment: Vec<_> = enrollment_variants.drain(..n_train_enroll).collect();
-    let train_augmented: Vec<_> = augmented_variants.drain(..n_train_aug).collect();
-    let n_train = n_train_enroll + n_train_aug;
-    let n_test = enrollment_variants.len() + augmented_variants.len();
-    info!("Train/test split: {n_train} training variants, {n_test} test variants (mahbot-911)",);
+    // ── Train/test split AFTER PCM augmentation (mahbot-932 Fix 5) ──
+    // Split the PCM-augmented variants into disjoint training and test sets.
+    // Production generates ~45-50 sequences (10 utterances × 5 PCM variants,
+    // minus SpeedUp skip for short ones).  We use a 2/3 : 1/3 split so the
+    // test set has enough samples for meaningful detection metrics.
+    let n_train = (all_variants.len() * 2 / 3).max(1);
+    let mut all_variants_mut = all_variants;
+    let test_variants: Vec<(Vec<f32>, String)> = all_variants_mut.split_off(n_train);
+    let train_variants = all_variants_mut;
+    let n_test = test_variants.len();
+    info!(
+        "Train/test split: {} training, {} test variants (mahbot-932)",
+        train_variants.len(),
+        n_test
+    );
 
-    let pos_sequences = vad_segment_and_enroll(&train_enrollment, &train_augmented);
+    let pos_sequences = vad_segment_and_enroll(&train_variants, &[]);
     assert!(
         !pos_sequences.is_empty(),
-        "VAD-gated enrollment produced no utterances from {} enrollment + {} augmented variants",
-        train_enrollment.len(),
-        train_augmented.len(),
+        "VAD-gated enrollment produced no utterances from {} training variants",
+        train_variants.len(),
     );
     info!(
         "VAD-gated enrollment: {} dense embeddings from {} utterances",
@@ -1778,93 +1911,80 @@ pub(crate) fn run_internal() {
 
     let (classifier_neg_sequences, verifier_neg_sequences, per_negative_sequence_weights);
 
-    // Flatten dense positive embeddings for synthetic negative generation
-    let flat_dense_embeddings: Vec<Vec<f32>> = pos_sequences
-        .iter()
-        .flat_map(|s| s.embeddings.iter().cloned())
-        .collect();
+    // Generate ambient noise sequences (mahbot-932 Fix 7) — replaces synthetic negatives.
+    let ambient_sequences = generate_ambient_noise_sequences();
+    info!(
+        "Generated {} ambient noise sequences from {} noise profiles × 2 SNR levels (mahbot-932)",
+        ambient_sequences.len(),
+        NOISE_PROFILES.len(),
+    );
 
     if caches_ready {
         // ── Production cache path (mahbot-880, mahbot-923) ──────────────────
         // Use the shared OnceLock caches populated by the prewarm functions
         // above.  After mahbot-923 the pipeline uses dense stride-8 embeddings
         // throughout — both classifier and verifier use the same dense caches.
+        // Ambient + owner-negative replace the old synthetic negatives (mahbot-932).
         info!(
             "Using production pre-warmed caches: {} confusable + {} unrelated dense (mahbot-880, mahbot-923)",
             confusable_dense_cache.len(),
             unrelated_dense_cache.len(),
         );
 
-        // Both classifier and verifier use dense embeddings from the cache.
-        //
-        // NOTE — Composition differs from production finalize_enrollment:
-        //   Production: ambient → confusable_dense → unrelated_dense
-        //   Benchmark:  confusable_dense → unrelated_dense → synthetic
-        // The benchmark has no ambient negatives and supplements with synthetic
-        // negatives (mahbot-846).  The ordering within common categories (confusable,
-        // unrelated) matches production for weight-tier alignment.
-        let mut classifier_neg_seqs: Vec<EmbeddingSequence> = Vec::with_capacity(
-            confusable_dense_cache.len() + unrelated_dense_cache.len() + 1, // +1 for synthetic sequence
+        // Build classifier negative sequences: ambient → owner → confusable → unrelated
+        // (mahbot-932 Fix 7, Fix 8).  No synthetic negatives — production uses zero
+        // synthetic embedding-space negatives.
+        let mut classifier_neg_seqs: Vec<EmbeddingSequence> = Vec::new();
+        classifier_neg_seqs.extend(ambient_sequences.clone());
+
+        // Owner-negative sequences
+        let owner_seqs = generate_owner_negative_sequences(
+            &available_styles,
+            &model_version_hash,
+            &cache_dir_path,
+            cache_bust,
         );
+        info!(
+            "Generated {} owner-negative sequences (mahbot-932 Fix 6)",
+            owner_seqs.len(),
+        );
+        classifier_neg_seqs.extend(owner_seqs.clone());
         classifier_neg_seqs.extend_from_slice(confusable_dense_cache);
         classifier_neg_seqs.extend_from_slice(unrelated_dense_cache);
-
-        // Supplement with distribution-matched synthetic negatives (mahbot-846).
-        let synthetic_embs = generate_synthetic_negatives_from_positives(
-            SYNTHETIC_NEGATIVES_COUNT,
-            &flat_dense_embeddings,
-            1.5,
-            Some(42), // fixed seed for deterministic benchmark (mahbot-882)
-        );
-        let synthetic_seq_classifier = EmbeddingSequence::negative(
-            UtteranceId {
-                sequence_index: 0,
-                variant_index: 0,
-            },
-            Source::Synthetic,
-            None,
-            synthetic_embs,
-        );
-        classifier_neg_seqs.push(synthetic_seq_classifier);
 
         let n_dense_total = classifier_neg_seqs.len();
         classifier_neg_sequences = classifier_neg_seqs;
 
-        // Verifier uses the same dense cache embeddings as the classifier
-        // (mahbot-923).  No separate streaming caches needed.
-        let n_unrelated = unrelated_dense_cache.len();
-        let n_confusable = confusable_dense_cache.len();
-        let n_synthetic = 1; // one synthetic EmbeddingSequence
-
-        let mut verifier_neg_seqs: Vec<EmbeddingSequence> =
-            Vec::with_capacity(n_unrelated + n_confusable + n_synthetic);
-        // Concatenation order: unrelated → confusable → synthetic, matching
-        // production's ambient→unrelated→confusable (no ambient in benchmark).
+        // Verifier uses the same dense cache embeddings as the classifier.
+        // Build verifier negative sequences in 4-tier order: ambient → owner → unrelated → confusable
+        let mut verifier_neg_seqs: Vec<EmbeddingSequence> = Vec::new();
+        verifier_neg_seqs.extend(ambient_sequences);
+        verifier_neg_seqs.extend(owner_seqs);
         verifier_neg_seqs.extend_from_slice(unrelated_dense_cache);
         verifier_neg_seqs.extend_from_slice(confusable_dense_cache);
-        let synthetic_embs_ver = generate_synthetic_negatives_from_positives(
-            SYNTHETIC_NEGATIVES_COUNT,
-            &flat_dense_embeddings,
-            1.5,
-            Some(42), // fixed seed for deterministic benchmark (mahbot-882)
-        );
-        let synthetic_seq_verifier = EmbeddingSequence::negative(
-            UtteranceId {
-                sequence_index: 0,
-                variant_index: 0,
-            },
-            Source::Synthetic,
-            None,
-            synthetic_embs_ver,
-        );
-        verifier_neg_seqs.push(synthetic_seq_verifier);
         verifier_neg_sequences = verifier_neg_seqs;
 
-        // Build per-sequence weights with three tiers matching production
-        // (mahbot-872, mahbot-880): unrelated = UNRELATED_UPWEIGHT×,
-        // confusable = CONFUSABLE_UPWEIGHT×, synthetic = 1.0×.
-        let n_seq_total = n_unrelated + n_confusable + n_synthetic;
+        // Build per-sequence 4-tier weights matching production (mahbot-932 Fix 8):
+        // ambient (1.0×) → owner-negative (OWNER_NEGATIVE_UPWEIGHT×)
+        // → unrelated (UNRELATED_UPWEIGHT×) → confusable (CONFUSABLE_UPWEIGHT×).
+        let n_ambient = classifier_neg_sequences
+            .iter()
+            .filter(|s| s.source == Source::Ambient)
+            .count();
+        let n_owner = classifier_neg_sequences
+            .iter()
+            .filter(|s| s.source == Source::Owner)
+            .count();
+        let n_confusable = confusable_dense_cache.len();
+        let n_unrelated = unrelated_dense_cache.len();
+        let n_seq_total = n_ambient + n_owner + n_confusable + n_unrelated;
+
         let mut pw: Vec<f32> = Vec::with_capacity(n_seq_total);
+        pw.extend(std::iter::repeat_n(1.0, n_ambient));
+        pw.extend(std::iter::repeat_n(
+            crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
+            n_owner,
+        ));
         pw.extend(std::iter::repeat_n(
             crate::voice_verifier::UNRELATED_UPWEIGHT,
             n_unrelated,
@@ -1873,51 +1993,58 @@ pub(crate) fn run_internal() {
             crate::voice_verifier::CONFUSABLE_UPWEIGHT,
             n_confusable,
         ));
-        pw.extend(std::iter::repeat_n(1.0, n_synthetic));
         per_negative_sequence_weights = pw;
 
-        // Structural guard: verify weight tier boundaries align with sequence
-        // counts (mahbot-880).  Uses the shared canonical assert_weight_tier
-        // (mahbot-880 reviewer feedback).
+        // Structural guard: verify weight tier boundaries (mahbot-880).
         crate::voice_verifier::assert_weight_tier(
             &per_negative_sequence_weights,
             0,
+            n_ambient,
+            1.0,
+            "ambient",
+        );
+        crate::voice_verifier::assert_weight_tier(
+            &per_negative_sequence_weights,
+            n_ambient,
+            n_owner,
+            crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
+            "owner-negative",
+        );
+        crate::voice_verifier::assert_weight_tier(
+            &per_negative_sequence_weights,
+            n_ambient + n_owner,
             n_unrelated,
             crate::voice_verifier::UNRELATED_UPWEIGHT,
             "unrelated",
         );
         crate::voice_verifier::assert_weight_tier(
             &per_negative_sequence_weights,
-            n_unrelated,
+            n_ambient + n_owner + n_unrelated,
             n_confusable,
             crate::voice_verifier::CONFUSABLE_UPWEIGHT,
             "confusable",
         );
-        crate::voice_verifier::assert_weight_tier(
-            &per_negative_sequence_weights,
-            n_unrelated + n_confusable,
-            n_synthetic,
-            1.0,
-            "synthetic",
-        );
         assert_eq!(per_negative_sequence_weights.len(), n_seq_total);
 
         info!(
-            "Built {} verifier neg sequences ({} unrelated@{}× + {} confusable@{}× + {} synthetic) \
-             and {} classifier neg sequences (mahbot-880, mahbot-923)",
+            "Built {} verifier neg sequences ({} ambient@1.0× + {} owner@{}× + {} unrelated@{}× + {} confusable@{}×) \
+             and {} classifier neg sequences (mahbot-932 Fix 8)",
             n_seq_total,
+            n_ambient,
+            n_owner,
+            crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
             n_unrelated,
             crate::voice_verifier::UNRELATED_UPWEIGHT,
             n_confusable,
             crate::voice_verifier::CONFUSABLE_UPWEIGHT,
-            n_synthetic,
             n_dense_total,
         );
     } else {
         // ── Fallback: inline TTS synthesis (mahbot-880) ────────────────────
         // Production caches are empty (prewarm failed or models unavailable).
         // Log a warning and fall back to the original inline TTS synthesis +
-        // embedding extraction path.
+        // embedding extraction path.  Ambient + owner-negative are still generated
+        // locally (mahbot-932).
         use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
         warn!(
             "Production negative embedding caches not available — \
@@ -1985,8 +2112,6 @@ pub(crate) fn run_internal() {
 
         // AGC-process all negative sets once, reusing the results for both
         // classifier and verifier extraction loops (mahbot-856, mahbot-923).
-        // After mahbot-923, both use dense stride-8 embeddings — no separate
-        // streaming path.
         let agc_unrelated_1 = agc_process(&neg_unrelated_1);
         let agc_unrelated_2 = agc_process(&neg_unrelated_2);
         let agc_unrelated_3 = agc_process(&neg_unrelated_3);
@@ -1996,12 +2121,41 @@ pub(crate) fn run_internal() {
         let agc_confusable_4 = agc_process(&neg_confusable_4);
         let agc_confusable_5 = agc_process(&neg_confusable_5);
 
-        // Process confusable sets first, then unrelated, matching the cache
-        // path's classifier ordering (confusable→unrelated→synthetic, mahbot-880
-        // reviewer feedback).  This ensures negative-set ordering is consistent
-        // between both paths for easier debugging of per-epoch behavior differences.
-        //
-        // After mahbot-923, both classifier and verifier use dense-only embeddings.
+        // Add ambient noise sequences (mahbot-932 Fix 7).
+        info!(
+            "Adding {} ambient noise sequences to classifier negative set (mahbot-932)",
+            ambient_sequences.len(),
+        );
+        classifier_neg_seqs.extend(ambient_sequences.clone());
+        verifier_neg_seqs.extend(ambient_sequences);
+
+        // Add owner-negative sequences (mahbot-932 Fix 6).
+        let owner_seqs = generate_owner_negative_sequences(
+            &available_styles,
+            &model_version_hash,
+            &cache_dir_path,
+            cache_bust,
+        );
+        info!(
+            "Adding {} owner-negative sequences to negative sets (mahbot-932 Fix 6)",
+            owner_seqs.len(),
+        );
+        classifier_neg_seqs.extend(owner_seqs.clone());
+        verifier_neg_seqs.extend(owner_seqs);
+
+        // Process unrelated sets first, then confusable, matching production verifier order
+        // (ambient → owner → unrelated → confusable).  Both go to classifier and verifier
+        // sequences; classifier order doesn't matter (class-balanced weights).
+        for agc_unrelated in [&agc_unrelated_1, &agc_unrelated_2, &agc_unrelated_3] {
+            let (dense_seqs, _) = process_variants_with(
+                agc_unrelated,
+                super::process_enrollment_sample,
+                Source::Unrelated,
+            );
+            classifier_neg_seqs.extend(dense_seqs.iter().cloned());
+            verifier_neg_seqs.extend(dense_seqs);
+        }
+
         for agc_confusable in [
             &agc_confusable_1,
             &agc_confusable_2,
@@ -2018,128 +2172,116 @@ pub(crate) fn run_internal() {
             verifier_neg_seqs.extend(dense_seqs);
         }
 
-        for agc_unrelated in [&agc_unrelated_1, &agc_unrelated_2, &agc_unrelated_3] {
-            let (dense_seqs, _) = process_variants_with(
-                agc_unrelated,
-                super::process_enrollment_sample,
-                Source::Unrelated,
-            );
-            classifier_neg_seqs.extend(dense_seqs.iter().cloned());
-            verifier_neg_seqs.extend(dense_seqs);
-        }
-
-        info!(
-            "Extracted {} classifier + {} verifier negative sequences from {} unrelated (3 seeds) + {} confusable phrases \
-             (across 5 seed variations, mahbot-872)",
-            classifier_neg_seqs.len(),
-            verifier_neg_seqs.len(),
-            neg_unrelated_1.len() + neg_unrelated_2.len() + neg_unrelated_3.len(),
-            neg_confusable_1.len()
-                + neg_confusable_2.len()
-                + neg_confusable_3.len()
-                + neg_confusable_4.len()
-                + neg_confusable_5.len(),
-        );
-
-        // Supplement with distribution-matched synthetic negatives (mahbot-846).
-        let synthetic_embs = generate_synthetic_negatives_from_positives(
-            SYNTHETIC_NEGATIVES_COUNT,
-            &flat_dense_embeddings,
-            1.5,
-            Some(42), // fixed seed for deterministic benchmark (mahbot-882)
-        );
-        let synthetic_seq = EmbeddingSequence::negative(
-            UtteranceId {
-                sequence_index: 0,
-                variant_index: 0,
-            },
-            Source::Synthetic,
-            None,
-            synthetic_embs,
-        );
-        classifier_neg_seqs.push(synthetic_seq.clone());
+        // No synthetic negatives — replaced by ambient + owner-negative (mahbot-932 Fix 7).
 
         classifier_neg_sequences = classifier_neg_seqs;
 
-        // Build a SEPARATE negative set for the verifier that uses dense
-        // embeddings matching the classifier (mahbot-923).  Both use the same
-        // AGC-processed dense embeddings now that the streaming path is removed.
-        let n_unrelated_verifier_seqs = 3; // 3 unrelated seed sets
-        let n_confusable_verifier_seqs = 5; // 5 confusable seed sets
-        // Note: each seed set produces a single EmbeddingSequence from process_variants_with,
-        // so the count of sequences equals the number of sets.
-
-        // Synthetic for verifier
-        let synthetic_embs_ver = generate_synthetic_negatives_from_positives(
-            SYNTHETIC_NEGATIVES_COUNT,
-            &flat_dense_embeddings,
-            1.5,
-            Some(42), // fixed seed for deterministic benchmark (mahbot-882)
-        );
-        let synthetic_seq_verifier = EmbeddingSequence::negative(
-            UtteranceId {
-                sequence_index: 0,
-                variant_index: 0,
-            },
-            Source::Synthetic,
-            None,
-            synthetic_embs_ver,
-        );
-        verifier_neg_seqs.push(synthetic_seq_verifier);
-
-        // Track sequence counts per tier for weight calculation.
-        // Each seed set produces one sequence per call to process_variants_with.
-        // Unrelated: 3 seed sets → 3 sequences (all already in verifier_neg_seqs)
-        // Confusable: 5 seed sets → 5 sequences (all already in verifier_neg_seqs)
-        // Synthetic: 1 sequence (just appended)
-        let n_synthetic_verifier_seqs = 1;
+        // Count sequences by Source type for dynamic weight array sizing
+        // (mahbot-932 Fix 4, Fix 8).  4-tier: ambient → owner → unrelated → confusable.
+        let n_ambient_verifier = verifier_neg_seqs
+            .iter()
+            .filter(|s| s.source == Source::Ambient)
+            .count();
+        let n_owner_verifier = verifier_neg_seqs
+            .iter()
+            .filter(|s| s.source == Source::Owner)
+            .count();
+        let n_confusable_verifier = verifier_neg_seqs
+            .iter()
+            .filter(|s| s.source == Source::Confusable)
+            .count();
+        let n_unrelated_verifier = verifier_neg_seqs
+            .iter()
+            .filter(|s| s.source == Source::Unrelated)
+            .count();
         verifier_neg_sequences = verifier_neg_seqs;
 
-        // Build per-sequence weights with three tiers matching production
-        // (mahbot-872): unrelated speech = UNRELATED_UPWEIGHT×, confusable =
-        // CONFUSABLE_UPWEIGHT× (reduced from 100× as mahbot-872 fallback),
-        // synthetic = 1.0× (ambient-equivalent since the bench has no actual
-        // ambient noise).
+        // Build per-sequence 4-tier weights matching production (mahbot-932 Fix 8):
+        // ambient (1.0×) → owner-negative (OWNER_NEGATIVE_UPWEIGHT×)
+        // → unrelated (UNRELATED_UPWEIGHT×) → confusable (CONFUSABLE_UPWEIGHT×).
         let n_seq_total =
-            n_unrelated_verifier_seqs + n_confusable_verifier_seqs + n_synthetic_verifier_seqs;
+            n_ambient_verifier + n_owner_verifier + n_confusable_verifier + n_unrelated_verifier;
         let mut pw: Vec<f32> = Vec::with_capacity(n_seq_total);
+        pw.extend(std::iter::repeat_n(1.0, n_ambient_verifier));
+        pw.extend(std::iter::repeat_n(
+            crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
+            n_owner_verifier,
+        ));
         pw.extend(std::iter::repeat_n(
             crate::voice_verifier::UNRELATED_UPWEIGHT,
-            n_unrelated_verifier_seqs,
+            n_unrelated_verifier,
         ));
         pw.extend(std::iter::repeat_n(
             crate::voice_verifier::CONFUSABLE_UPWEIGHT,
-            n_confusable_verifier_seqs,
+            n_confusable_verifier,
         ));
-        pw.extend(std::iter::repeat_n(1.0, n_synthetic_verifier_seqs));
         per_negative_sequence_weights = pw;
 
-        // Structural guard: verify weight tier boundaries align with sequence
-        // counts (mahbot-880).  Uses the shared canonical assert_weight_tier
-        // (mahbot-880 reviewer feedback), matching the cache-path guard above.
+        // Structural guard: verify weight tier boundaries.
         crate::voice_verifier::assert_weight_tier(
             &per_negative_sequence_weights,
             0,
-            n_unrelated_verifier_seqs,
+            n_ambient_verifier,
+            1.0,
+            "ambient",
+        );
+        crate::voice_verifier::assert_weight_tier(
+            &per_negative_sequence_weights,
+            n_ambient_verifier,
+            n_owner_verifier,
+            crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
+            "owner-negative",
+        );
+        crate::voice_verifier::assert_weight_tier(
+            &per_negative_sequence_weights,
+            n_ambient_verifier + n_owner_verifier,
+            n_unrelated_verifier,
             crate::voice_verifier::UNRELATED_UPWEIGHT,
             "unrelated",
         );
         crate::voice_verifier::assert_weight_tier(
             &per_negative_sequence_weights,
-            n_unrelated_verifier_seqs,
-            n_confusable_verifier_seqs,
+            n_ambient_verifier + n_owner_verifier + n_unrelated_verifier,
+            n_confusable_verifier,
             crate::voice_verifier::CONFUSABLE_UPWEIGHT,
             "confusable",
         );
-        crate::voice_verifier::assert_weight_tier(
-            &per_negative_sequence_weights,
-            n_unrelated_verifier_seqs + n_confusable_verifier_seqs,
-            n_synthetic_verifier_seqs,
-            1.0,
-            "synthetic",
-        );
         assert_eq!(per_negative_sequence_weights.len(), n_seq_total);
+
+        info!(
+            "Built {} verifier neg sequences ({} ambient@1.0× + {} owner@{}× + {} unrelated@{}× + {} confusable@{}×) \
+             and {} classifier neg sequences (mahbot-932, fallback path)",
+            n_seq_total,
+            n_ambient_verifier,
+            n_owner_verifier,
+            crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
+            n_unrelated_verifier,
+            crate::voice_verifier::UNRELATED_UPWEIGHT,
+            n_confusable_verifier,
+            crate::voice_verifier::CONFUSABLE_UPWEIGHT,
+            classifier_neg_sequences.len(),
+        );
     }
+
+    // ── Regression assertions (mahbot-932) ──
+    assert!(
+        classifier_neg_sequences
+            .iter()
+            .any(|s| s.source == Source::Ambient),
+        "Phase 3 must produce ambient negative sequences (mahbot-932 Fix 7)",
+    );
+    assert!(
+        classifier_neg_sequences
+            .iter()
+            .any(|s| s.source == Source::Owner),
+        "Phase 3 must produce owner-negative sequences (mahbot-932 Fix 6)",
+    );
+    assert!(
+        !classifier_neg_sequences
+            .iter()
+            .any(|s| s.source == Source::Synthetic),
+        "Phase 3 must NOT produce synthetic negatives (mahbot-932 Fix 7)",
+    );
 
     phase_times[P_NEG_TRAINING_DATA] = phase_end_ms!();
 
@@ -2283,7 +2425,7 @@ pub(crate) fn run_internal() {
     if verifier.is_trained() {
         info!(
             "VoiceVerifier trained successfully with {} dense positive + {} negative sequences \
-             (dense embeddings, unrelated + confusable + synthetic, mahbot-923)",
+             (ambient + owner-negative + confusable + unrelated, mahbot-932)",
             pos_sequences.len(),
             verifier_neg_sequences.len()
         );
@@ -2305,14 +2447,9 @@ pub(crate) fn run_internal() {
     phase_times[P_STREAMING_SETUP] = phase_end_ms!();
 
     // Collect held-out positive wake variants for detection testing (mahbot-911).
-    // These are the remaining variants after the train/test split — only
-    // 5 of the original 13, NOT the variants used for classifier/verifier
-    // training.  The name `pos_test_variants` reflects that these are
-    // positive (wake word) samples reserved for the test set only.
-    let pos_test_variants: Vec<(Vec<f32>, String)> = enrollment_variants
-        .into_iter()
-        .chain(augmented_variants)
-        .collect();
+    // These are the remaining variants after the PCM-augmented train/test split
+    // (mahbot-932 Fix 5), NOT the variants used for classifier/verifier training.
+    let pos_test_variants = test_variants;
 
     // ── Detection phases (skipped entirely if classifier is degenerate) ─
     //

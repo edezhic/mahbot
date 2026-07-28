@@ -600,17 +600,26 @@ pub(crate) fn unrelated_dense_embeddings() -> &'static [EmbeddingSequence] {
 /// racing against the global shutdown token, so the prewarm succeeds on
 /// first startup even on slow connections.
 ///
+/// Starting from mahbot-932, this function is decoupled from the TTS playback
+/// toggle (`tts_enabled` config) — confusable/unrelated phrase embeddings are
+/// needed for classifier and verifier training regardless of whether audio
+/// playback is enabled.  If TTS models are not yet loaded, a download is
+/// triggered on demand (~400 MB on first voice init).
+///
 /// Returns `Some(styles)` when styles are available, or `None` if:
-/// - TTS is not config-enabled (styles will never become available)
 /// - TTS download permanently failed
 /// - Shutdown was requested
 async fn wait_for_tts_styles() -> Option<Vec<String>> {
-    if !crate::tts::is_config_enabled() {
+    // Trigger TTS model download if not already available (decoupled from
+    // the playback toggle — mahbot-932).  This ensures confusable/unrelated
+    // phrase embeddings are generated for classifier and verifier training
+    // regardless of whether audio playback is enabled.
+    if !crate::tts::models_ready() && !crate::tts::try_load_cached() {
         info!(
-            "TTS is disabled in config — confusable dense embeddings \
-             pre-warm skipped (models train on ambient negatives only)"
+            "TTS models not cached — triggering download on demand (~400 MB) \
+                 for confusable/unrelated embedding pre-warm (mahbot-932)"
         );
-        return None;
+        crate::tts::spawn_or_retry_download();
     }
 
     let mut styles = crate::tts::list_voice_styles();
@@ -5524,6 +5533,14 @@ async fn finalize_enrollment_pipeline() -> bool {
         );
         neg_sequences.extend(negative_sequences.clone()); // clone — used again for verifier
     }
+    let n_owner_classifier = owner_negative_sequences.len();
+    if n_owner_classifier > 0 {
+        info!(
+            "Adding {n_owner_classifier} owner-negative dense sequences \
+             to classifier negative set (mahbot-932)",
+        );
+        neg_sequences.extend(owner_negative_sequences.clone()); // clone — used again for verifier
+    }
     if use_mahbot_confusables && !confusable_dense.is_empty() {
         info!(
             "Adding {} confusable dense sequences to classifier negative set \
@@ -5539,6 +5556,9 @@ async fn finalize_enrollment_pipeline() -> bool {
         );
         neg_sequences.extend_from_slice(unrelated_dense);
     }
+
+    // Note: class-balanced weights (not per-tier weights like the verifier)
+    // — this is an intentional design difference (mahbot-932).
 
     // ── Classifier training via finalize_enrollment ──
     let classifier_result = tokio::task::spawn_blocking({

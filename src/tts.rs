@@ -311,6 +311,23 @@ pub fn download_failed() -> bool {
     STATE.load(Ordering::Acquire) == STATE_FAILED
 }
 
+/// Try to load TTS engine from cache — returns `Ok(())` if models are
+/// ready after the call, or an error message explaining how to resolve.
+///
+/// This is the shared utility for both production and benchmark code
+/// (mahbot-932).  It checks [`models_ready()`] first (fast path), then
+/// [`try_load_cached()`] (loads from disk if available), and only fails
+/// if neither succeeds.
+pub fn ensure_ready() -> Result<(), String> {
+    if models_ready() {
+        return Ok(());
+    }
+    if try_load_cached() {
+        return Ok(());
+    }
+    Err("TTS models not available. Run the app once to download them.".to_string())
+}
+
 /// Retry model download after a previous failure.
 ///
 /// Atomically transitions [`STATE`] from [`STATE_FAILED`] → [`STATE_UNINIT`]
