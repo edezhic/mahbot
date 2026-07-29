@@ -1,0 +1,1 @@
+{{sanitation_failed_marker}} — garbage files: {{count}}

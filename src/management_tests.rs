@@ -1,4 +1,5 @@
 use super::*;
+use crate::prompt::{load_prompt, substitute};
 use crate::util::test::make_ticket;
 use crate::util::test::{
     create_test_workspace, expect_ticket, expect_ticket_phase, init_management_test_stores,
@@ -48,8 +49,8 @@ fn all_non_total_comments_circuit_breakers_trip_before_total_comments() {
 ///
 /// | Variant | Role filter | Content filter |
 /// |---------|-------------|----------------|
-/// | **Sanitation** | `SYSTEM_ROLE` ≠ `SANITATION_ROLE` ✅ | content does **not** contain `SANITATION_FAILED_MARKER` ✅ |
-/// | **Diagnostics** | `SYSTEM_ROLE` ≠ `DIAGNOSTICS_ROLE` ✅ | content does **not** contain `DIAGNOSTICS_FAILED_MARKER` ✅ |
+/// | **Sanitation** | `SYSTEM_ROLE` ≠ `SANITATION_ROLE` ✅ | content does **not** contain [`SANITATION_FAILED_MARKER`] ✅ |
+/// | **Diagnostics** | `SYSTEM_ROLE` ≠ `DIAGNOSTICS_ROLE` ✅ | content does **not** contain [`DIAGNOSTICS_FAILED_MARKER`] ✅ |
 /// | **TotalComments** | — | — (terminal `Failed` phase prevents re-evaluation) |
 ///
 /// Both Sanitation and Diagnostics breakers now have role-based protection:
@@ -88,12 +89,12 @@ fn circuit_breaker_self_counting_prevention() {
     {
         let msg = CircuitBreakerKind::Diagnostics.trip_message(99, 4);
 
-        // The trip message must NOT contain DIAGNOSTICS_FAILED_MARKER.
+        // The trip message must NOT contain the DIAGNOSTICS_FAILED_MARKER string.
         assert!(
             !msg.contains(DIAGNOSTICS_FAILED_MARKER),
-            "Diagnostics trip message must not contain DIAGNOSTICS_FAILED_MARKER \
-             ({DIAGNOSTICS_FAILED_MARKER:?}), otherwise self-counting would occur \
-             on re-evaluation. Trip message: {msg:?}",
+            "Diagnostics trip message must not contain the DIAGNOSTICS_FAILED_MARKER string \
+             ({:?}), otherwise self-counting would occur on re-evaluation. Trip message: {msg:?}",
+            DIAGNOSTICS_FAILED_MARKER,
         );
 
         // Full should_trip verification: a comment with SYSTEM_ROLE (the role actually
@@ -590,18 +591,28 @@ fn no_verdict() -> ParallelVerdict {
 /// comment format used for the given breaker variant.
 ///
 /// For [`CircuitBreakerKind::Sanitation`], adds a [`SANITATION_ROLE`] comment
-/// with [`SANITATION_FAILED_MARKER`]. For [`CircuitBreakerKind::Diagnostics`],
-/// adds a [`DIAGNOSTICS_ROLE`] comment with [`DIAGNOSTICS_COMMENT_PREFIX`]
-/// and [`DIAGNOSTICS_FAILED_MARKER`].
+/// composed from `sanitation_circuit_breaker_comment.md` using [`SANITATION_FAILED_MARKER`].
+/// For [`CircuitBreakerKind::Diagnostics`], adds a [`DIAGNOSTICS_ROLE`] comment with
+/// [`DIAGNOSTICS_COMMENT_PREFIX`] and [`DIAGNOSTICS_FAILED_MARKER`] with
+/// `{{failed_at}}` = `"test_step"`.
 async fn add_breaker_failure(kind: CircuitBreakerKind, ticket_id: &str) {
     let (role, comment) = match kind {
         CircuitBreakerKind::Sanitation => (
             SANITATION_ROLE,
-            format!("{SANITATION_FAILED_MARKER} — garbage files: 1"),
+            substitute(
+                &load_prompt("sanitation_circuit_breaker_comment.md"),
+                &[
+                    ("{{sanitation_failed_marker}}", SANITATION_FAILED_MARKER),
+                    ("{{count}}", "1"),
+                ],
+            ),
         ),
         CircuitBreakerKind::Diagnostics => (
             DIAGNOSTICS_ROLE,
-            format!("{DIAGNOSTICS_COMMENT_PREFIX}\n\n---\n{DIAGNOSTICS_FAILED_MARKER} test_step"),
+            format!(
+                "{DIAGNOSTICS_COMMENT_PREFIX}\n\n---\n{} test_step",
+                DIAGNOSTICS_FAILED_MARKER
+            ),
         ),
         CircuitBreakerKind::TotalComments => (
             "user",
