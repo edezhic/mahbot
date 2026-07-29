@@ -43,7 +43,7 @@ use iced::window;
 use iced::{Alignment, Color, Element, Length, Task};
 
 use crate::Role;
-use crate::voice::VoiceStatus;
+use crate::audio::voice::VoiceStatus;
 
 use self::context_menu::ContextMenu;
 
@@ -281,7 +281,7 @@ pub enum Message {
     /// Set the selected user's role for the role switcher indicator.
     SetSelectedRole(Option<Role>),
     /// TTS model download progress event.
-    TtsDownloadEvent(crate::tts::TtsDownloadEvent),
+    TtsDownloadEvent(crate::audio::tts::TtsDownloadEvent),
 }
 
 // ── Message introspection helpers ────────────────────────────────
@@ -603,7 +603,7 @@ impl Dashboard {
         // a previous user was saved.
         if let Some(ref user_name) = self.selected_user_name {
             self.home_state.selected_user = Some(user_name.clone());
-            crate::voice::set_active_user_name(user_name);
+            crate::audio::voice::set_active_user_name(user_name);
         }
         // Load the selected user's role for the role switcher indicator.
         let role_task = self
@@ -957,7 +957,7 @@ impl Dashboard {
                 if let home::HomeMessage::UserSelected(ref user) = msg {
                     self.selected_user_name = Some(user.clone());
                     self.selected_user_role = None; // reset until loaded
-                    crate::voice::set_active_user_name(user);
+                    crate::audio::voice::set_active_user_name(user);
                     self.persist_window_state();
                     let user = user.clone();
                     let role_task = Task::perform(
@@ -1115,13 +1115,16 @@ impl Dashboard {
 
     /// Handle a TTS download progress event.
     #[allow(clippy::cast_precision_loss)]
-    fn handle_tts_download_event(&mut self, event: crate::tts::TtsDownloadEvent) -> Task<Message> {
+    fn handle_tts_download_event(
+        &mut self,
+        event: crate::audio::tts::TtsDownloadEvent,
+    ) -> Task<Message> {
         match event {
-            crate::tts::TtsDownloadEvent::FileStarted { name, .. } => {
+            crate::audio::tts::TtsDownloadEvent::FileStarted { name, .. } => {
                 self.tts_download_progress = Some((name, 0.0));
                 Task::none()
             }
-            crate::tts::TtsDownloadEvent::FileProgress {
+            crate::audio::tts::TtsDownloadEvent::FileProgress {
                 name,
                 bytes_downloaded,
                 total_bytes,
@@ -1134,13 +1137,13 @@ impl Dashboard {
                 self.tts_download_progress = Some((name, progress));
                 Task::none()
             }
-            crate::tts::TtsDownloadEvent::FileCompleted { name } => {
+            crate::audio::tts::TtsDownloadEvent::FileCompleted { name } => {
                 // Mark the file as fully done; next FileStarted will show the next file.
                 self.tts_download_progress = Some((name, 1.0));
                 Task::none()
             }
-            crate::tts::TtsDownloadEvent::Complete
-            | crate::tts::TtsDownloadEvent::Failed { .. } => {
+            crate::audio::tts::TtsDownloadEvent::Complete
+            | crate::audio::tts::TtsDownloadEvent::Failed { .. } => {
                 self.tts_download_progress = None;
                 Task::none()
             }
@@ -1254,7 +1257,7 @@ impl Dashboard {
 
         // Update voice assistant's active workspace so transcribed commands
         // are routed to the correct context.
-        crate::voice::set_active_workspace_name(name);
+        crate::audio::voice::set_active_workspace_name(name);
 
         Task::batch([
             board_refresh,
@@ -1732,14 +1735,15 @@ fn shutdown_subscription() -> impl futures_util::Stream<Item = Message> {
     })
 }
 
-/// Subscription that emits [`crate::tts::TtsDownloadEvent`]s from the global
+/// Subscription that emits [`crate::audio::tts::TtsDownloadEvent`]s from the global
 /// TTS download broadcast channel, forwarded as [`Message::TtsDownloadEvent`].
-fn tts_download_subscription() -> impl futures_util::Stream<Item = crate::tts::TtsDownloadEvent> {
+fn tts_download_subscription()
+-> impl futures_util::Stream<Item = crate::audio::tts::TtsDownloadEvent> {
     use iced::futures::channel::mpsc;
     iced::stream::channel(
         1,
-        |mut output: mpsc::Sender<crate::tts::TtsDownloadEvent>| async move {
-            let mut rx = crate::tts::subscribe_download_events();
+        |mut output: mpsc::Sender<crate::audio::tts::TtsDownloadEvent>| async move {
+            let mut rx = crate::audio::tts::subscribe_download_events();
             loop {
                 match rx.recv().await {
                     Ok(event) => {
@@ -2236,7 +2240,7 @@ impl Dashboard {
     /// [`VoiceStatus::Error`] displays the actual error string rather than
     /// a hardcoded message.
     fn render_voice_status() -> Element<'static, Message> {
-        let label: String = match crate::voice::get_status() {
+        let label: String = match crate::audio::voice::get_status() {
             // Hidden when voice is disabled.
             VoiceStatus::Disabled => return Space::new().width(0).into(),
             VoiceStatus::LoadingModels => "🔊 Loading…".into(),

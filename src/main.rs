@@ -118,8 +118,8 @@ async fn bootstrap_mahbot() -> Result<()> {
     mahbot::search_engine::init_global(); // sync — no I/O
     mahbot::ticket_buffer::init_global(); // sync — no I/O
     mahbot::message_router::init_global()?;
-    mahbot::voice::init_global()?;
-    mahbot::tts::init_global()?;
+    mahbot::audio::voice::init_global()?;
+    mahbot::audio::tts::init_global()?;
 
     mahbot::turso::init_all_stores().await?;
 
@@ -130,8 +130,8 @@ async fn bootstrap_mahbot() -> Result<()> {
 
     // Try to load TTS models from cache; if not available, spawn background download.
     // Only run when TTS is enabled in config to avoid unnecessary ~400 MB download.
-    if mahbot::tts::is_config_enabled() && !mahbot::tts::try_load_cached() {
-        mahbot::tts::spawn_download();
+    if mahbot::audio::tts::is_config_enabled() && !mahbot::audio::tts::try_load_cached() {
+        mahbot::audio::tts::spawn_download();
     }
 
     BOOT_LOG_STORE
@@ -250,7 +250,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         &mut tasks,
         &shutdown_token,
         "voice-pipeline",
-        mahbot::voice::run_voice_pipeline(),
+        mahbot::audio::voice::run_voice_pipeline(),
     );
 
     let rx = init_message_pipeline(&mut tasks, &shutdown_token);
@@ -344,7 +344,7 @@ fn init_message_pipeline(
 
     // Spawn the TTS listener which subscribes to CHAT_BROADCAST and triggers
     // audio playback for matching agent responses.
-    mahbot::tts::init_listener();
+    mahbot::audio::tts::init_listener();
 
     // Initialize the channel registry (empty — channels register below).
     let _ = mahbot::CHANNEL_REGISTRY.set(mahbot::ChannelRegistry::default());

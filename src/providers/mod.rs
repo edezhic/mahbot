@@ -5,7 +5,6 @@
 //! are supported, wrapped with automatic retry logic.
 
 pub(crate) mod compatible;
-pub(crate) mod local_transcriber;
 pub(crate) mod reasoning;
 pub(crate) mod reasoning_roundtrip;
 pub(crate) mod reliable;
@@ -209,7 +208,7 @@ pub async fn init_global() -> anyhow::Result<()> {
     // If files are missing, a background download is spawned automatically.
     if config.audio_transcription_use_local.as_deref() == Some("false") {
         tracing::debug!("Local audio transcription is disabled by config");
-    } else if local_transcriber::try_init_from_cache().await {
+    } else if crate::audio::local_transcriber::try_init_from_cache().await {
         tracing::info!("Local Qwen3-ASR transcriber loaded from cache");
     } else {
         tracing::info!("Local Qwen3-ASR transcriber will be downloaded in background");
@@ -255,8 +254,8 @@ pub(crate) async fn recreate_all(config: &crate::config::ConfigData) -> anyhow::
 
     // Re-init local transcriber if config enables it and it's not already ready.
     let use_local = config.audio_transcription_use_local.as_deref() != Some("false");
-    if use_local && !local_transcriber::is_loaded() {
-        if local_transcriber::try_init_from_cache().await {
+    if use_local && !crate::audio::local_transcriber::is_loaded() {
+        if crate::audio::local_transcriber::try_init_from_cache().await {
             tracing::info!("Local Qwen3-ASR transcriber loaded from cache after config reload");
         } else {
             tracing::info!(

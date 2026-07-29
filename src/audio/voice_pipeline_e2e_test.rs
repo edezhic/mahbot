@@ -37,10 +37,10 @@
 )]
 
 use super::*; // voice module items (process_enrollment_sample, etc.)
-use crate::embedding_sequence::{EmbeddingSequence, Source, UtteranceId};
-use crate::tts;
-use crate::voice_verifier::{DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA, VoiceVerifier};
-use crate::wake_word_classifier::WakeWordClassifier;
+use crate::audio::embedding_sequence::{EmbeddingSequence, Source, UtteranceId};
+use crate::audio::tts;
+use crate::audio::voice_verifier::{DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA, VoiceVerifier};
+use crate::audio::wake_word_classifier::WakeWordClassifier;
 use earshot::Detector;
 use rand::{RngExt, SeedableRng};
 use std::borrow::Cow;
@@ -66,7 +66,7 @@ const MIN_CLASSIFIER_THRESHOLD: f32 = 2.13;
 /// Number of samples to prepend for verifier warm-up (mahbot-922, mahbot-926).
 ///
 /// ~1.28 s of noise at 16 kHz, consumed by the verifier warm-up period
-/// (4 embeddings, see [`VERIFIER_WARMUP_EMBEDDINGS`](crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS))
+/// (4 embeddings, see [`VERIFIER_WARMUP_EMBEDDINGS`](crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS))
 /// so the actual test utterance arrives with a fully active verifier — matching
 /// production behaviour where the warm-up is consumed during background
 /// silence/noise before anyone speaks.
@@ -672,7 +672,7 @@ fn generate_warmup_noise() -> Cow<'static, [f32]> {
 /// caller to fall back to pink noise.  Logs an `info!` on success with the
 /// output duration so maintainers can verify the warm-up length.
 fn try_warmup_tts() -> Option<Vec<f32>> {
-    let pcm = match crate::tts::synthesize(
+    let pcm = match crate::audio::tts::synthesize(
         WARMUP_TTS_PHRASE,
         DEFAULT_TTS_STYLE,
         947, // seed = ticket number for determinism
@@ -813,7 +813,7 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
     // indicates the verifier will NOT be active — every variant's first 4
     // embeddings will be consumed by warm-up suppression instead of scoring,
     // making detection impossible for short utterances (<1 s).
-    if produced < crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS {
+    if produced < crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS {
         warn!(
             "Warm-up produced only {} embedding(s) (need >= {}) — \
              verifier will NOT be active for this variant.  \
@@ -821,7 +821,7 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
              Every variant's first 4 embeddings will be consumed by warm-up suppression. \
              Detection on short utterances (<1 s) will be disadvantaged.",
             produced,
-            crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS,
+            crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS,
         );
     }
 
@@ -893,14 +893,16 @@ fn pcm_augment_enrollment_variants(variants: &[(Vec<f32>, String)]) -> Vec<(Vec<
         all.push((pcm.clone(), format!("{label}_original")));
 
         // 2. Speed-down (0.95×)
-        let speed_down = crate::tts_data_gen::speed_perturbation(pcm, TARGET_SAMPLE_RATE, 0.95);
+        let speed_down =
+            crate::audio::tts_data_gen::speed_perturbation(pcm, TARGET_SAMPLE_RATE, 0.95);
         all.push((speed_down, format!("{label}_speed_down")));
 
         // 3. Speed-up (1.05×, conditional — skip if too short)
         let pre_pad_samples = pcm.len().saturating_sub(2 * super::CONTEXT_PADDING_SAMPLES);
         let pre_pad_ms = (pre_pad_samples as u64 * 1000) / u64::from(TARGET_SAMPLE_RATE);
         if pre_pad_ms >= 500 {
-            let speed_up = crate::tts_data_gen::speed_perturbation(pcm, TARGET_SAMPLE_RATE, 1.05);
+            let speed_up =
+                crate::audio::tts_data_gen::speed_perturbation(pcm, TARGET_SAMPLE_RATE, 1.05);
             all.push((speed_up, format!("{label}_speed_up")));
         }
 
@@ -1080,7 +1082,7 @@ fn vad_segment_and_enroll(
     // distribution — running_rms converged during training but detection starts
     // fresh, causing 46% miss rate on TTS variants.  Per-variant fresh NS
     // avoids the same training-inference mismatch.
-    use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
+    use crate::audio::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
     let chunk_size = super::FRAME_LENGTH;
 
     let all_variants: Vec<&(Vec<f32>, String)> = enrollment_variants
@@ -1278,7 +1280,7 @@ struct PerVariantResult {
     per_frame_scores: Vec<[f32; 3]>,
     /// Whether the verifier warm-up was completed before this variant's test
     /// utterance was processed (embedding_ring had ≥
-    /// [`VERIFIER_WARMUP_EMBEDDINGS`](crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS)
+    /// [`VERIFIER_WARMUP_EMBEDDINGS`](crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS)
     /// entries after `consume_warmup`).  When `false`, the verifier will NOT be
     /// active, and the first 4 embeddings from the test utterance are consumed
     /// by warm-up suppression (mahbot-947).
@@ -1492,7 +1494,7 @@ fn test_detection_samples(
         consume_warmup(&mut ctx);
         let warmup_n_embeddings = ctx.embedding_ring.len();
         let warmup_completed =
-            warmup_n_embeddings >= crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS;
+            warmup_n_embeddings >= crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS;
         info!(
             "  Variant {}/{}: {label} — warm-up {} ({} embeddings)",
             i + 1,
@@ -1770,7 +1772,7 @@ fn run_noise_overlap_test(
                 consume_warmup(&mut ctx);
                 let warmup_n_embeddings = ctx.embedding_ring.len();
                 let warmup_completed =
-                    warmup_n_embeddings >= crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS;
+                    warmup_n_embeddings >= crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS;
                 let result = run_streaming_detection(&mixed_pcm, &mut ctx);
 
                 // Persist the updated adaptive state for the next variant.
@@ -1964,13 +1966,14 @@ pub(crate) fn run_internal() {
     info!("TTS model version hash: {}", &model_version_hash[..16]);
 
     // Initialize TTS module
-    crate::tts::init_global().unwrap_or_else(|e| warn!("tts::init_global() already called: {e}"));
+    crate::audio::tts::init_global()
+        .unwrap_or_else(|e| warn!("tts::init_global() already called: {e}"));
 
     // Ensure voice pipeline state is initialized
     super::init_global().unwrap_or_else(|e| warn!("voice::init_global() already called: {e}"));
 
     // ── Prerequisites ───────────────────────────────────────────────
-    if let Err(msg) = crate::tts::ensure_ready() {
+    if let Err(msg) = crate::audio::tts::ensure_ready() {
         panic!("{msg}\nRun the application first to download TTS models (~400 MB).");
     }
 
@@ -2166,46 +2169,46 @@ pub(crate) fn run_internal() {
     let mut pw: Vec<f32> = Vec::with_capacity(n_seq_total);
     pw.extend(std::iter::repeat_n(1.0, n_ambient));
     pw.extend(std::iter::repeat_n(
-        crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
+        crate::audio::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
         n_owner,
     ));
     pw.extend(std::iter::repeat_n(
-        crate::voice_verifier::UNRELATED_UPWEIGHT,
+        crate::audio::voice_verifier::UNRELATED_UPWEIGHT,
         n_unrelated,
     ));
     pw.extend(std::iter::repeat_n(
-        crate::voice_verifier::CONFUSABLE_UPWEIGHT,
+        crate::audio::voice_verifier::CONFUSABLE_UPWEIGHT,
         n_confusable,
     ));
     per_negative_sequence_weights = pw;
 
     // Structural guard: verify weight tier boundaries (mahbot-880).
-    crate::voice_verifier::assert_weight_tier(
+    crate::audio::voice_verifier::assert_weight_tier(
         &per_negative_sequence_weights,
         0,
         n_ambient,
         1.0,
         "ambient",
     );
-    crate::voice_verifier::assert_weight_tier(
+    crate::audio::voice_verifier::assert_weight_tier(
         &per_negative_sequence_weights,
         n_ambient,
         n_owner,
-        crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
+        crate::audio::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
         "owner-negative",
     );
-    crate::voice_verifier::assert_weight_tier(
+    crate::audio::voice_verifier::assert_weight_tier(
         &per_negative_sequence_weights,
         n_ambient + n_owner,
         n_unrelated,
-        crate::voice_verifier::UNRELATED_UPWEIGHT,
+        crate::audio::voice_verifier::UNRELATED_UPWEIGHT,
         "unrelated",
     );
-    crate::voice_verifier::assert_weight_tier(
+    crate::audio::voice_verifier::assert_weight_tier(
         &per_negative_sequence_weights,
         n_ambient + n_owner + n_unrelated,
         n_confusable,
-        crate::voice_verifier::CONFUSABLE_UPWEIGHT,
+        crate::audio::voice_verifier::CONFUSABLE_UPWEIGHT,
         "confusable",
     );
     assert_eq!(per_negative_sequence_weights.len(), n_seq_total);
@@ -2216,11 +2219,11 @@ pub(crate) fn run_internal() {
         n_seq_total,
         n_ambient,
         n_owner,
-        crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
+        crate::audio::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
         n_unrelated,
-        crate::voice_verifier::UNRELATED_UPWEIGHT,
+        crate::audio::voice_verifier::UNRELATED_UPWEIGHT,
         n_confusable,
-        crate::voice_verifier::CONFUSABLE_UPWEIGHT,
+        crate::audio::voice_verifier::CONFUSABLE_UPWEIGHT,
         n_dense_total,
     );
 
@@ -3319,7 +3322,7 @@ fn warmup_noise_produces_embeddings() {
 
     // Initialise TTS so warm-up can use TTS audio (models may or may not
     // be cached yet — we check readiness after voice model loading below).
-    let _ = crate::tts::init_global();
+    let _ = crate::audio::tts::init_global();
 
     // Skip if voice model files aren't available (requires a prior app launch
     // or benchmark run that cached the models).
@@ -3336,7 +3339,7 @@ fn warmup_noise_produces_embeddings() {
     // the assertion below.  We check *after* voice model loading so that a
     // future refactor that loads TTS models alongside voice models is handled
     // correctly (mahbot-947, reviewer feedback).
-    if let Err(e) = crate::tts::ensure_ready() {
+    if let Err(e) = crate::audio::tts::ensure_ready() {
         eprintln!("Skipping warmup_noise_produces_embeddings: TTS not ready — {e}");
         eprintln!("Run the app or E2E benchmark first to cache TTS models.");
         return;
@@ -3346,10 +3349,10 @@ fn warmup_noise_produces_embeddings() {
     consume_warmup(&mut ctx);
 
     assert!(
-        ctx.embedding_ring.len() >= crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS,
+        ctx.embedding_ring.len() >= crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS,
         "Warm-up noise should produce at least {} embeddings to consume the \
          verifier warm-up period, but only produced {}",
-        crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS,
+        crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS,
         ctx.embedding_ring.len(),
     );
 

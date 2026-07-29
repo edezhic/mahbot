@@ -31,7 +31,7 @@ use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::embedding_sequence::EmbeddingSequence;
+use crate::audio::embedding_sequence::EmbeddingSequence;
 use crate::{EMBEDDING_DIM, VERIFIER_INPUT_DIM, VERIFIER_WINDOW_SIZE};
 
 /// Default decision threshold for the verifier.
@@ -313,7 +313,7 @@ impl VoiceVerifier {
     }
 
     /// Train a new verifier from positive and negative
-    /// [`EmbeddingSequence`](crate::embedding_sequence::EmbeddingSequence)
+    /// [`EmbeddingSequence`](crate::audio::embedding_sequence::EmbeddingSequence)
     /// inputs.  Trains a logistic regression classifier with L2 regularization.
     ///
     /// Windows are formed **within** each sequence independently (never across
@@ -396,7 +396,7 @@ impl VoiceVerifier {
             start: usize,
             count: usize,
             is_positive: bool,
-            source: crate::embedding_sequence::Source,
+            source: crate::audio::embedding_sequence::Source,
         }
 
         // Early exit if either side has zero frames to avoid training on empty data.
@@ -540,7 +540,7 @@ impl VoiceVerifier {
         // Group sequence indices by class and source tier.
         let mut pos_indices: Vec<usize> = Vec::new();
         let mut neg_sources: std::collections::HashMap<
-            crate::embedding_sequence::Source,
+            crate::audio::embedding_sequence::Source,
             Vec<usize>,
         > = std::collections::HashMap::new();
         for (i, info) in seq_infos.iter().enumerate() {
@@ -854,11 +854,11 @@ impl VoiceVerifier {
             rng_seed,
         );
         let synth_seq = EmbeddingSequence::negative(
-            crate::embedding_sequence::UtteranceId {
+            crate::audio::embedding_sequence::UtteranceId {
                 sequence_index: 0,
                 variant_index: 0,
             },
-            crate::embedding_sequence::Source::Synthetic,
+            crate::audio::embedding_sequence::Source::Synthetic,
             None,
             negatives,
         );
@@ -1613,7 +1613,7 @@ pub(crate) fn generate_synthetic_negatives_from_positives(
 ///
 /// Note: As of mahbot-788 Fix 3, the verifier training uses per-frame
 /// embeddings directly instead of mean-pooled vectors. This function is
-/// now used by [`validate_enrollment_consistency`](crate::voice::validate_enrollment_consistency)
+/// now used by [`validate_enrollment_consistency`](crate::audio::voice::validate_enrollment_consistency)
 /// to compute per-utterance means for centroid cosine-similarity analysis.
 /// It remains available for any other use that needs utterance-level pooling.
 #[must_use]
@@ -1648,7 +1648,7 @@ pub fn mean_pool_embeddings(embeddings: &[Vec<f32>]) -> Vec<f32> {
 /// embeddings (ambient, unrelated, confusable, synthetic, etc.) and all
 /// weights in that tier should be identical.
 ///
-/// Used by production [`finalize_enrollment`](crate::voice::finalize_enrollment)
+/// Used by production [`finalize_enrollment`](crate::audio::voice::finalize_enrollment)
 /// and both paths in the E2E benchmark to ensure weight tiers stay aligned with
 /// embedding concatenation order across refactors.
 ///
@@ -1688,14 +1688,14 @@ mod tests {
     /// Helper: wrap flat embeddings into a single EmbeddingSequence for testing.
     fn make_seq(
         embs: Vec<Vec<f32>>,
-        label: crate::embedding_sequence::LabelStratum,
+        label: crate::audio::embedding_sequence::LabelStratum,
     ) -> EmbeddingSequence {
         EmbeddingSequence {
-            id: crate::embedding_sequence::UtteranceId {
+            id: crate::audio::embedding_sequence::UtteranceId {
                 sequence_index: 0,
                 variant_index: 0,
             },
-            source: crate::embedding_sequence::Source::Enrollment,
+            source: crate::audio::embedding_sequence::Source::Enrollment,
             augmentation_family: None,
             label_stratum: label,
             embeddings: embs,
@@ -1815,8 +1815,14 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let positives: Vec<Vec<f32>> = (0..20).map(|_| make_positive_embedding(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..30).map(|_| make_negative_embedding(&mut rng)).collect();
-        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
-        let neg_seq = make_seq(negatives, crate::embedding_sequence::LabelStratum::Negative);
+        let pos_seq = make_seq(
+            positives,
+            crate::audio::embedding_sequence::LabelStratum::Positive,
+        );
+        let neg_seq = make_seq(
+            negatives,
+            crate::audio::embedding_sequence::LabelStratum::Negative,
+        );
 
         let verifier = VoiceVerifier::train(
             &[pos_seq],
@@ -1887,8 +1893,14 @@ mod tests {
         let negatives: Vec<Vec<f32>> = (0..30)
             .map(|_| make_non_wake_speech_embedding(&mut rng))
             .collect();
-        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
-        let neg_seq = make_seq(negatives, crate::embedding_sequence::LabelStratum::Negative);
+        let pos_seq = make_seq(
+            positives,
+            crate::audio::embedding_sequence::LabelStratum::Positive,
+        );
+        let neg_seq = make_seq(
+            negatives,
+            crate::audio::embedding_sequence::LabelStratum::Negative,
+        );
 
         let verifier = VoiceVerifier::train(
             &[pos_seq],
@@ -1930,7 +1942,10 @@ mod tests {
         // accept any speech because it was trained only on N(0,1) noise).
         let mut rng = StdRng::seed_from_u64(99);
         let positives: Vec<Vec<f32>> = (0..30).map(|_| make_positive_embedding(&mut rng)).collect();
-        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
+        let pos_seq = make_seq(
+            positives,
+            crate::audio::embedding_sequence::LabelStratum::Positive,
+        );
 
         let verifier = VoiceVerifier::train_with_synthetic_negatives(
             &[pos_seq],
@@ -2303,7 +2318,10 @@ mod tests {
     fn test_verifier_empty_training_returns_untrained() {
         // No positive examples → should return untrained.
         let neg_embs = vec![vec![0.0; VERIFIER_INPUT_DIM]];
-        let neg_seq = make_seq(neg_embs, crate::embedding_sequence::LabelStratum::Negative);
+        let neg_seq = make_seq(
+            neg_embs,
+            crate::audio::embedding_sequence::LabelStratum::Negative,
+        );
         let verifier = VoiceVerifier::train(
             &[],
             &[neg_seq],
@@ -2323,8 +2341,14 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(12345);
         let positives: Vec<Vec<f32>> = (0..10).map(|_| make_positive_embedding(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..10).map(|_| make_negative_embedding(&mut rng)).collect();
-        let pos_seq = make_seq(positives, crate::embedding_sequence::LabelStratum::Positive);
-        let neg_seq = make_seq(negatives, crate::embedding_sequence::LabelStratum::Negative);
+        let pos_seq = make_seq(
+            positives,
+            crate::audio::embedding_sequence::LabelStratum::Positive,
+        );
+        let neg_seq = make_seq(
+            negatives,
+            crate::audio::embedding_sequence::LabelStratum::Negative,
+        );
 
         let seed = 42;
         let v1 = VoiceVerifier::train(
@@ -2496,8 +2520,14 @@ mod tests {
         let embs2: Vec<Vec<f32>> = (0..2)
             .map(|i| vec![-0.5 - i as f32; EMBEDDING_DIM])
             .collect();
-        let pos_seq = make_seq(embs1, crate::embedding_sequence::LabelStratum::Positive);
-        let neg_seq = make_seq(embs2, crate::embedding_sequence::LabelStratum::Negative);
+        let pos_seq = make_seq(
+            embs1,
+            crate::audio::embedding_sequence::LabelStratum::Positive,
+        );
+        let neg_seq = make_seq(
+            embs2,
+            crate::audio::embedding_sequence::LabelStratum::Negative,
+        );
 
         // With per-sequence windowing, each sequence has 2 frames < 3 → 0 windows each
         // → train_logistic_inner gets 0 positive windows + 0 negative windows → untrained.
@@ -2532,12 +2562,24 @@ mod tests {
         let neg2: Vec<Vec<f32>> = (0..5).map(|_| make_negative_embedding(&mut rng)).collect();
 
         let pos_seqs = [
-            make_seq(pos1, crate::embedding_sequence::LabelStratum::Positive),
-            make_seq(pos2, crate::embedding_sequence::LabelStratum::Positive),
+            make_seq(
+                pos1,
+                crate::audio::embedding_sequence::LabelStratum::Positive,
+            ),
+            make_seq(
+                pos2,
+                crate::audio::embedding_sequence::LabelStratum::Positive,
+            ),
         ];
         let neg_seqs = [
-            make_seq(neg1, crate::embedding_sequence::LabelStratum::Negative),
-            make_seq(neg2, crate::embedding_sequence::LabelStratum::Negative),
+            make_seq(
+                neg1,
+                crate::audio::embedding_sequence::LabelStratum::Negative,
+            ),
+            make_seq(
+                neg2,
+                crate::audio::embedding_sequence::LabelStratum::Negative,
+            ),
         ];
 
         let verifier = VoiceVerifier::train(
@@ -2576,7 +2618,10 @@ mod tests {
         let cache_pos: Vec<Vec<f32>> = (0..20)
             .map(|_| make_positive_embedding(&mut rng2))
             .collect();
-        let cache_pos_seq = make_seq(cache_pos, crate::embedding_sequence::LabelStratum::Positive);
+        let cache_pos_seq = make_seq(
+            cache_pos,
+            crate::audio::embedding_sequence::LabelStratum::Positive,
+        );
 
         let neg_confusable: Vec<Vec<f32>> = (0..10)
             .map(|_| make_negative_embedding(&mut rng2))
@@ -2591,15 +2636,15 @@ mod tests {
         let cache_negatives = [
             make_seq(
                 neg_confusable,
-                crate::embedding_sequence::LabelStratum::Negative,
+                crate::audio::embedding_sequence::LabelStratum::Negative,
             ),
             make_seq(
                 neg_unrelated,
-                crate::embedding_sequence::LabelStratum::Negative,
+                crate::audio::embedding_sequence::LabelStratum::Negative,
             ),
             make_seq(
                 neg_synthetic,
-                crate::embedding_sequence::LabelStratum::Negative,
+                crate::audio::embedding_sequence::LabelStratum::Negative,
             ),
         ];
 

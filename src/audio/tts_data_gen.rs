@@ -22,7 +22,7 @@
 //!
 //! # Pipeline
 //!
-//! 1. Synthesize audio directly at 16 kHz via [`crate::tts::synthesize()`]
+//! 1. Synthesize audio directly at 16 kHz via [`crate::audio::tts::synthesize()`]
 //! 2. Apply augmentation: noise, volume, speed perturbation
 //! 3. Run through mel spectrogram → embedding model → 96-dim vectors
 //! 4. Save labeled vectors to `~/.mahbot/training/`
@@ -32,7 +32,7 @@
 //! Each synthesis takes ~3-5 seconds on CPU. 1000 samples ≈ 50-80 minutes.
 //! This is a batch offline process — not real-time.
 
-use crate::voice;
+use crate::audio::voice;
 use anyhow::{Context, Result};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -53,8 +53,8 @@ pub enum NoiseType {
 /// Confusable phrases — phonetic near-misses of the default wake word.
 /// These are used to generate negative training examples.
 ///
-/// Uses the canonical list from [`crate::voice::CONFUSABLE_PHRASES`] (mahbot-859).
-const CONFUSABLE_PHRASES: &[&str] = crate::voice::CONFUSABLE_PHRASES;
+/// Uses the canonical list from [`crate::audio::voice::CONFUSABLE_PHRASES`] (mahbot-859).
+const CONFUSABLE_PHRASES: &[&str] = crate::audio::voice::CONFUSABLE_PHRASES;
 
 /// Training data directory name under storage root.
 const TRAINING_DIR: &str = "training";
@@ -245,7 +245,7 @@ fn synthesize_and_extract(
     max_count: usize,
     results: &mut Vec<Vec<f32>>,
 ) {
-    let pcm = match crate::tts::synthesize(text, style, seed, TRAINING_SAMPLE_RATE) {
+    let pcm = match crate::audio::tts::synthesize(text, style, seed, TRAINING_SAMPLE_RATE) {
         Ok(pcm) => pcm,
         Err(e) => {
             tracing::warn!("Synthesis failed for '{text}' with {style}: {e}");
@@ -272,7 +272,7 @@ fn synthesize_and_extract(
 
 /// Verify models are ready and return the training directory path.
 fn prepare_training_env() -> Result<PathBuf> {
-    if !crate::tts::models_ready() {
+    if !crate::audio::tts::models_ready() {
         anyhow::bail!("TTS engine not ready — models must be loaded first");
     }
     if !voice::models_ready() {
@@ -339,7 +339,7 @@ pub fn generate_training_data(
     snr_db_range: (f32, f32),
 ) -> Result<(usize, usize, PathBuf)> {
     let training_dir = prepare_training_env()?;
-    let available_styles = crate::tts::list_voice_styles();
+    let available_styles = crate::audio::tts::list_voice_styles();
     if available_styles.is_empty() {
         anyhow::bail!("No voice styles available — TTS models may not be fully downloaded");
     }

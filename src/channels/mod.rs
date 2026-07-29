@@ -84,7 +84,7 @@ impl BroadcastPersistEntry {
 /// ([`send_channel_reply`]) and the per-agent consumer loop
 /// in [`crate::message_router`].
 ///
-/// TTS audio playback is handled separately by [`crate::tts::init_listener()`],
+/// TTS audio playback is handled separately by [`crate::audio::tts::init_listener()`],
 /// which subscribes to [`CHAT_BROADCAST`](crate::CHAT_BROADCAST) and triggers
 /// speech for matching agent messages.  This function does not itself invoke
 /// any TTS logic.

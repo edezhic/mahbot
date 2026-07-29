@@ -11,7 +11,7 @@
 )]
 
 pub(crate) mod agent;
-pub(crate) mod audio_preprocessor;
+pub mod audio;
 pub mod board;
 pub mod channels;
 pub(crate) mod chat_history;
@@ -21,7 +21,6 @@ pub mod config_db;
 pub mod debug;
 pub(crate) mod diff_parse;
 pub(crate) mod embedder;
-pub(crate) mod embedding_sequence;
 pub(crate) mod extraction;
 pub(crate) mod git_commands;
 pub mod gui;
@@ -47,12 +46,6 @@ pub mod users;
 pub mod util;
 pub(crate) mod vector;
 pub mod workspace;
-
-pub mod tts;
-pub mod tts_data_gen;
-pub mod voice;
-pub(crate) mod voice_verifier;
-pub(crate) mod wake_word_classifier;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

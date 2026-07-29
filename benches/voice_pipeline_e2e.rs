@@ -111,7 +111,7 @@ fn main() {
         tokio::time::timeout(
             Duration::from_mins(30),
             tokio::task::spawn_blocking(|| {
-                mahbot::voice::run_voice_pipeline_benchmark();
+                mahbot::audio::voice::run_voice_pipeline_benchmark();
             }),
         )
         .await

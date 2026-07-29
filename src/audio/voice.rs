@@ -30,14 +30,16 @@
 //! Stored in `~/.mahbot/models/openwakeword/`.
 
 use crate::ChatDirection;
+use crate::audio::embedding_sequence::{
+    AugmentationFamily, EmbeddingSequence, Source, UtteranceId,
+};
+use crate::audio::voice_verifier::{VERIFIER_WARMUP_EMBEDDINGS, VoiceVerifier};
+use crate::audio::wake_word_classifier::{self, ClassifierWeights, WakeWordClassifier};
 use crate::config::CONFIG;
-use crate::embedding_sequence::{AugmentationFamily, EmbeddingSequence, Source, UtteranceId};
 use crate::turso;
 use crate::util::UnwrapPoison;
 use crate::util::hex_string;
 use crate::vector::cosine_similarity;
-use crate::voice_verifier::{VERIFIER_WARMUP_EMBEDDINGS, VoiceVerifier};
-use crate::wake_word_classifier::{self, ClassifierWeights, WakeWordClassifier};
 use crate::{EMBEDDING_DIM, VERIFIER_WINDOW_SIZE};
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -318,7 +320,7 @@ const NEGATIVES_TARGET_SECONDS: usize = 60;
 const MAX_OWNER_NEGATIVE_SAMPLES: usize = SAMPLE_RATE as usize * NEGATIVES_TARGET_SECONDS * 3 / 2;
 
 /// Upweight for owner-negative sequences during verifier training.
-const OWNER_NEGATIVE_UPWEIGHT: f32 = crate::voice_verifier::OWNER_NEGATIVE_UPWEIGHT;
+const OWNER_NEGATIVE_UPWEIGHT: f32 = crate::audio::voice_verifier::OWNER_NEGATIVE_UPWEIGHT;
 
 /// Wall-clock timeout for Phase 3 owner-negative collection (120 seconds).
 /// If the user stays silent or provides very little speech, the pipeline
@@ -624,15 +626,15 @@ async fn wait_for_tts_styles() -> Option<Vec<String>> {
     //
     // Note: try_load_cached() now attempts disk loading even when STATE is
     // LOADING (Fix 4, mahbot-939), recovering from orphaned download tasks.
-    if !crate::tts::models_ready() && !crate::tts::try_load_cached() {
+    if !crate::audio::tts::models_ready() && !crate::audio::tts::try_load_cached() {
         info!(
             "TTS models not cached — triggering download on demand (~400 MB) \
                  for confusable/unrelated embedding pre-warm (mahbot-932)"
         );
-        crate::tts::spawn_or_retry_download();
+        crate::audio::tts::spawn_or_retry_download();
     }
 
-    let mut styles = crate::tts::list_voice_styles();
+    let mut styles = crate::audio::tts::list_voice_styles();
     if !styles.is_empty() {
         return Some(styles);
     }
@@ -646,12 +648,12 @@ async fn wait_for_tts_styles() -> Option<Vec<String>> {
     for _ in 0..MAX_TTS_STYLE_POLLS {
         tokio::select! {
             () = tokio::time::sleep(Duration::from_secs(30)) => {
-                styles = crate::tts::list_voice_styles();
+                styles = crate::audio::tts::list_voice_styles();
                 if !styles.is_empty() {
                     info!("TTS voice styles now available — proceeding with pre-warm");
                     return Some(styles);
                 }
-                if crate::tts::download_failed() {
+                if crate::audio::tts::download_failed() {
                     info!(
                         "TTS model download permanently failed — confusable negative \
                          embeddings pre-warm skipped (verifier trains on \
@@ -681,8 +683,8 @@ async fn wait_for_tts_styles() -> Option<Vec<String>> {
         MAX_TTS_STYLE_POLLS * 30,
     );
 
-    if crate::tts::try_load_cached() {
-        let styles = crate::tts::list_voice_styles();
+    if crate::audio::tts::try_load_cached() {
+        let styles = crate::audio::tts::list_voice_styles();
         if !styles.is_empty() {
             return Some(styles);
         }
@@ -690,7 +692,7 @@ async fn wait_for_tts_styles() -> Option<Vec<String>> {
 
     // Reset STATE from LOADING to UNINIT so the next caller triggers a
     // fresh download attempt instead of silently returning None forever.
-    if crate::tts::try_reset_loading_state() {
+    if crate::audio::tts::try_reset_loading_state() {
         info!("Reset TTS state from LOADING to UNINIT — next caller will retry");
     }
     None
@@ -820,7 +822,7 @@ async fn prewarm_phrase_embeddings(
     // Runs TTS synthesis (with PCM caching), AGC, and ONNX embedding
     // extraction in a blocking thread to avoid starving the async runtime.
     tokio::task::spawn_blocking(move || {
-        use crate::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
+        use crate::audio::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
 
         let Some(models) = ONNX_MODELS.get() else {
             return Vec::new();
@@ -853,7 +855,7 @@ async fn prewarm_phrase_embeddings(
                         cache_dir,
                     )
                 } else {
-                    match crate::tts::synthesize(phrase, style, seed, SAMPLE_RATE) {
+                    match crate::audio::tts::synthesize(phrase, style, seed, SAMPLE_RATE) {
                         Ok(p) => Some(p),
                         Err(e) => {
                             warn!("TTS synthesis failed for {phrase_type} phrase '{phrase}': {e}");
@@ -1658,7 +1660,7 @@ pub(crate) fn score_single_embedding(
         // on the streaming inference path (mahbot-870).
         let mut window = [0.0f32; crate::VERIFIER_INPUT_DIM];
         for i in start..=end.saturating_sub(VERIFIER_WINDOW_SIZE) {
-            crate::voice_verifier::fill_verifier_window(embedding_ring, i, &mut window);
+            crate::audio::voice_verifier::fill_verifier_window(embedding_ring, i, &mut window);
             let score = v.predict(&window);
             max_score = max_score.max(score);
         }
@@ -3106,13 +3108,13 @@ pub(crate) fn pcm_cache_key(
 /// changes the PCM cache key and triggers re-synthesis on first run.
 pub(crate) fn tts_model_version_hash() -> String {
     let mut hasher = Sha256::new();
-    hasher.update(crate::tts::DP_MODEL_SHA256.as_bytes());
-    hasher.update(crate::tts::TEXT_ENC_MODEL_SHA256.as_bytes());
-    hasher.update(crate::tts::VECTOR_EST_MODEL_SHA256.as_bytes());
-    hasher.update(crate::tts::VOCODER_MODEL_SHA256.as_bytes());
-    hasher.update(crate::tts::TTS_JSON_SHA256.as_bytes());
-    hasher.update(crate::tts::UNICODE_INDEXER_SHA256.as_bytes());
-    hasher.update(crate::tts::VOICE_STYLE_SHA256.as_bytes());
+    hasher.update(crate::audio::tts::DP_MODEL_SHA256.as_bytes());
+    hasher.update(crate::audio::tts::TEXT_ENC_MODEL_SHA256.as_bytes());
+    hasher.update(crate::audio::tts::VECTOR_EST_MODEL_SHA256.as_bytes());
+    hasher.update(crate::audio::tts::VOCODER_MODEL_SHA256.as_bytes());
+    hasher.update(crate::audio::tts::TTS_JSON_SHA256.as_bytes());
+    hasher.update(crate::audio::tts::UNICODE_INDEXER_SHA256.as_bytes());
+    hasher.update(crate::audio::tts::VOICE_STYLE_SHA256.as_bytes());
     hex_string(&hasher.finalize())
 }
 
@@ -3180,7 +3182,7 @@ pub(crate) fn read_pcm_cache(path: &Path) -> Option<Vec<f32>> {
 /// Checks the voice PCM disk cache first (keyed by text + style + seed +
 /// sample rate + TTS model hash).  On cache hit, returns cached PCM
 /// directly without calling TTS.  On cache miss, calls
-/// [`crate::tts::synthesize`], writes the result to the cache, and returns
+/// [`crate::audio::tts::synthesize`], writes the result to the cache, and returns
 /// the PCM.
 ///
 /// Returns `None` if TTS synthesis fails or the cache directory cannot
@@ -3202,7 +3204,7 @@ pub(crate) fn synthesize_with_pcm_cache(
     }
 
     // Cache miss — synthesise via TTS
-    let pcm = match crate::tts::synthesize(text, style, seed, sample_rate) {
+    let pcm = match crate::audio::tts::synthesize(text, style, seed, sample_rate) {
         Ok(p) => p,
         Err(e) => {
             warn!(
@@ -3581,11 +3583,9 @@ async fn transcribe_audio(samples: &[f32]) -> Result<String> {
     let tmp_path = tmp_dir.join(format!("cmd_{}.wav", crate::generate_id()));
     tokio::fs::write(&tmp_path, &wav_bytes).await?;
 
-    let result = crate::providers::local_transcriber::transcribe_file_async(
-        &tmp_path,
-        Duration::from_secs(30),
-    )
-    .await;
+    let result =
+        crate::audio::local_transcriber::transcribe_file_async(&tmp_path, Duration::from_secs(30))
+            .await;
 
     // Remove the specific temp file.
     if let Err(e) = tokio::fs::remove_file(&tmp_path).await {
@@ -4101,7 +4101,7 @@ pub(crate) fn validate_enrollment_consistency(sequences: &[EmbeddingSequence]) -
     let qualified: Vec<Vec<f32>> = sequences
         .iter()
         .filter(|seq| seq.embeddings.len() >= 3)
-        .map(|seq| crate::voice_verifier::mean_pool_embeddings(&seq.embeddings))
+        .map(|seq| crate::audio::voice_verifier::mean_pool_embeddings(&seq.embeddings))
         .collect();
 
     let total = qualified.len();
@@ -4111,7 +4111,7 @@ pub(crate) fn validate_enrollment_consistency(sequences: &[EmbeddingSequence]) -
          Speak clearly and close to the microphone.",
     );
 
-    let centroid = crate::voice_verifier::mean_pool_embeddings(&qualified);
+    let centroid = crate::audio::voice_verifier::mean_pool_embeddings(&qualified);
 
     // Count utterances that pass the similarity threshold
     let passed = qualified
@@ -4678,7 +4678,7 @@ pub(crate) struct PipelineCtx {
     pre_agc_ring: Vec<f32>,
     /// Audio pre-processor for noise suppression and AGC.
     /// Applied to every incoming audio chunk before VAD / mel extraction.
-    audio_preprocessor: crate::audio_preprocessor::AudioPreprocessor,
+    audio_preprocessor: crate::audio::audio_preprocessor::AudioPreprocessor,
     /// Accumulates non-VAD audio frames during enrollment for use as negative
     /// training examples (mahbot-797).  Collected between utterances (pre-enrollment
     /// ambient noise, inter-utterance silence/background) and saved as chunks
@@ -4795,7 +4795,7 @@ impl PipelineCtx {
             vad_threshold: VAD_THRESHOLD,
             pre_agc_ring: Vec::new(),
             audio_preprocessor: {
-                use crate::audio_preprocessor::PreprocessorConfig;
+                use crate::audio::audio_preprocessor::PreprocessorConfig;
                 let ns = CONFIG
                     .voice_noise_suppression()
                     .as_deref()
@@ -4804,7 +4804,7 @@ impl PipelineCtx {
                     .voice_agc()
                     .as_deref()
                     .is_none_or(|v| !v.eq_ignore_ascii_case("false"));
-                crate::audio_preprocessor::AudioPreprocessor::new(PreprocessorConfig {
+                crate::audio::audio_preprocessor::AudioPreprocessor::new(PreprocessorConfig {
                     noise_suppression: ns,
                     agc,
                 })
@@ -5601,7 +5601,7 @@ async fn finalize_enrollment_pipeline() -> bool {
     };
 
     let verifier = tokio::task::spawn_blocking(move || {
-        use crate::voice_verifier::{
+        use crate::audio::voice_verifier::{
             assert_weight_tier, CONFUSABLE_UPWEIGHT,
             DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA,
             UNRELATED_UPWEIGHT, VoiceVerifier,
@@ -5701,7 +5701,7 @@ async fn finalize_enrollment_pipeline() -> bool {
     .await
     .unwrap_or_else(|e| {
         warn!("Verifier training task panicked: {e}");
-        crate::voice_verifier::VoiceVerifier::untrained()
+        crate::audio::voice_verifier::VoiceVerifier::untrained()
     });
 
     // ── Cancel guard: check before persisting (mahbot-913) ──
@@ -5920,8 +5920,8 @@ pub async fn run_voice_pipeline() {
                 //   - enrollment noise RMS estimates (pre-AGC ring buffer)
                 //
                 // The gate stays active for a reverb tail period after playback
-                // ends (see crate::tts::PLAYBACK_REVERB_TAIL_MS).
-                if crate::tts::is_playback_active() {
+                // ends (see crate::audio::tts::PLAYBACK_REVERB_TAIL_MS).
+                if crate::audio::tts::is_playback_active() {
                     continue;
                 }
 
@@ -7694,8 +7694,8 @@ fn handle_negative_collection_audio(samples: &[f32], ctx: &mut PipelineCtx) {
 mod tests {
     use super::*;
     use crate::VERIFIER_INPUT_DIM;
+    use crate::audio::voice_verifier::DEFAULT_VERIFIER_THRESHOLD;
     use crate::util::{add_noise, apply_gain, generate_pink_noise};
-    use crate::voice_verifier::DEFAULT_VERIFIER_THRESHOLD;
     use rand::SeedableRng;
     use std::time::{Duration, Instant};
 
@@ -9826,7 +9826,7 @@ mod tests {
             status: VoiceStatus::Disabled,
             classifier_weights: None,
             classifier: None,
-            verifier: crate::voice_verifier::VoiceVerifier::untrained(),
+            verifier: crate::audio::voice_verifier::VoiceVerifier::untrained(),
             enrollment_buffer: Vec::new(),
             negative_audio_chunks: Vec::new(),
             owner_negative_chunks: Vec::new(),
@@ -10487,7 +10487,7 @@ mod tests {
         // at position ring.len() - VERIFIER_WINDOW_SIZE.
         let alignment_index = ring.len() - VERIFIER_WINDOW_SIZE;
         let mut window = [0.0f32; VERIFIER_INPUT_DIM];
-        crate::voice_verifier::fill_verifier_window(&ring, alignment_index, &mut window);
+        crate::audio::voice_verifier::fill_verifier_window(&ring, alignment_index, &mut window);
 
         // The 288-dim window at alignment_index concatenates ring[3], ring[4],
         // ring[5].  Each embedding has emb[0] = its index as f32.
@@ -10508,7 +10508,11 @@ mod tests {
         // Also verify stride-1 coverage: window at alignment_index - 1
         // uses ring[2], ring[3], ring[4] (preceding stride-1 window).
         let mut prev_window = [0.0f32; VERIFIER_INPUT_DIM];
-        crate::voice_verifier::fill_verifier_window(&ring, alignment_index - 1, &mut prev_window);
+        crate::audio::voice_verifier::fill_verifier_window(
+            &ring,
+            alignment_index - 1,
+            &mut prev_window,
+        );
         assert_eq!(
             prev_window[0], 2.0,
             "stride-1 window at index 2 uses ring[2][0] = 2.0"

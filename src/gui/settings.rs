@@ -383,11 +383,11 @@ pub struct SettingsState {
 /// (after a full Save where the config may have changed).
 fn sync_voice_state(enabled: bool) {
     if enabled {
-        crate::voice::set_enabled(true);
-        crate::voice::send_command(crate::voice::VoiceCommand::StartListening);
+        crate::audio::voice::set_enabled(true);
+        crate::audio::voice::send_command(crate::audio::voice::VoiceCommand::StartListening);
     } else {
-        crate::voice::set_enabled(false);
-        crate::voice::send_command(crate::voice::VoiceCommand::StopListening);
+        crate::audio::voice::set_enabled(false);
+        crate::audio::voice::send_command(crate::audio::voice::VoiceCommand::StopListening);
     }
 }
 
@@ -608,8 +608,8 @@ impl SettingsState {
                 // Uses spawn_or_retry_download to handle both STATE_UNINIT
                 // (initial download) and STATE_FAILED (retry after previous
                 // permanent failure), matching voice's auto-retry behaviour.
-                if enabled && !crate::tts::try_load_cached() {
-                    crate::tts::spawn_or_retry_download();
+                if enabled && !crate::audio::tts::try_load_cached() {
+                    crate::audio::tts::spawn_or_retry_download();
                 }
 
                 // Persist to DB asynchronously, reporting errors via TtsToggleResult.
@@ -660,12 +660,14 @@ impl SettingsState {
                 }
             }
             SettingsMessage::TtsRetryModels => {
-                let _ = crate::tts::retry_download();
+                let _ = crate::audio::tts::retry_download();
                 Task::none()
             }
             SettingsMessage::StartVoiceEnrollment => {
                 let phrase = self.wake_word_phrase_input.clone();
-                crate::voice::send_command(crate::voice::VoiceCommand::StartEnrollment(phrase));
+                crate::audio::voice::send_command(
+                    crate::audio::voice::VoiceCommand::StartEnrollment(phrase),
+                );
                 Task::none()
             }
             SettingsMessage::WakeWordPhraseInput(v) => {
@@ -673,11 +675,15 @@ impl SettingsState {
                 Task::none()
             }
             SettingsMessage::CancelVoiceEnrollment => {
-                crate::voice::send_command(crate::voice::VoiceCommand::CancelEnrollment);
+                crate::audio::voice::send_command(
+                    crate::audio::voice::VoiceCommand::CancelEnrollment,
+                );
                 Task::none()
             }
             SettingsMessage::RetryVoiceModels => {
-                crate::voice::send_command(crate::voice::VoiceCommand::RetryModelLoading);
+                crate::audio::voice::send_command(
+                    crate::audio::voice::VoiceCommand::RetryModelLoading,
+                );
                 Task::none()
             }
 
@@ -2122,14 +2128,14 @@ impl SettingsState {
         use iced::widget::Text;
 
         let voice_enabled = self.config.voice_enabled.as_deref() == Some("true");
-        let status = crate::voice::get_status();
-        let templates = crate::voice::get_classifier_weights();
+        let status = crate::audio::voice::get_status();
+        let templates = crate::audio::voice::get_classifier_weights();
         let has_templates = templates.is_some();
 
         let status_text: Element<'_, SettingsMessage> = match status.clone() {
-            crate::voice::VoiceStatus::Disabled => Text::new("Disabled").into(),
-            crate::voice::VoiceStatus::LoadingModels => Text::new("Loading models…").into(),
-            crate::voice::VoiceStatus::ModelError => {
+            crate::audio::voice::VoiceStatus::Disabled => Text::new("Disabled").into(),
+            crate::audio::voice::VoiceStatus::LoadingModels => Text::new("Loading models…").into(),
+            crate::audio::voice::VoiceStatus::ModelError => {
                 // Show retry button inline so the user can trigger recovery
                 // without toggling voice off/on (ticket mahbot-757).
                 let retry_btn = iced::widget::button(Text::new("   Retry   ").size(13))
@@ -2144,16 +2150,18 @@ impl SettingsState {
                 .align_y(iced::Alignment::Center)
                 .into()
             }
-            crate::voice::VoiceStatus::Listening => Text::new("Listening for wake word").into(),
-            crate::voice::VoiceStatus::Recording => Text::new("Recording command").into(),
-            crate::voice::VoiceStatus::Transcribing => Text::new("Transcribing…").into(),
-            crate::voice::VoiceStatus::MicPermissionDenied => {
+            crate::audio::voice::VoiceStatus::Listening => {
+                Text::new("Listening for wake word").into()
+            }
+            crate::audio::voice::VoiceStatus::Recording => Text::new("Recording command").into(),
+            crate::audio::voice::VoiceStatus::Transcribing => Text::new("Transcribing…").into(),
+            crate::audio::voice::VoiceStatus::MicPermissionDenied => {
                 Text::new("Microphone permission denied").into()
             }
-            crate::voice::VoiceStatus::MicDisconnected => {
+            crate::audio::voice::VoiceStatus::MicDisconnected => {
                 Text::new("Microphone disconnected").into()
             }
-            crate::voice::VoiceStatus::Enrolling {
+            crate::audio::voice::VoiceStatus::Enrolling {
                 sample,
                 total,
                 duration_ms,
@@ -2164,13 +2172,14 @@ impl SettingsState {
 
                 // Main status line with sample count and duration hint
                 let duration_hint = if duration_ms > 0 {
-                    if duration_ms >= crate::voice::ENROLLMENT_QUALITY_DURATION_MAX_MS {
+                    if duration_ms >= crate::audio::voice::ENROLLMENT_QUALITY_DURATION_MAX_MS {
                         format!(
                             " — captured {}.{}s ✅",
                             duration_ms / 1000,
                             (duration_ms % 1000) / 100
                         )
-                    } else if duration_ms >= crate::voice::ENROLLMENT_QUALITY_DURATION_MIN_MS {
+                    } else if duration_ms >= crate::audio::voice::ENROLLMENT_QUALITY_DURATION_MIN_MS
+                    {
                         format!(
                             " — captured {}.{}s 📝",
                             duration_ms / 1000,
@@ -2204,7 +2213,7 @@ impl SettingsState {
                     if sample < total {
                         // `sample` is the count of completed samples; the prompt for
                         // the NEXT utterance is at index `sample` (0-based).
-                        let prompt = crate::voice::enrollment_prompt_for_sample(sample);
+                        let prompt = crate::audio::voice::enrollment_prompt_for_sample(sample);
                         lines.push(format!("📢 {prompt}"));
                     }
 
@@ -2233,13 +2242,13 @@ impl SettingsState {
                 let text = lines.join("\n");
                 Text::new(text).into()
             }
-            crate::voice::VoiceStatus::ListeningDuringEnrollment { .. } => {
+            crate::audio::voice::VoiceStatus::ListeningDuringEnrollment { .. } => {
                 Text::new("Listening…").into()
             }
-            crate::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. } => {
+            crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. } => {
                 Text::new("Keep silent to confirm…").into()
             }
-            crate::voice::VoiceStatus::EnrollingNegatives {
+            crate::audio::voice::VoiceStatus::EnrollingNegatives {
                 accumulated_secs,
                 target_secs,
                 wall_clock_elapsed,
@@ -2253,16 +2262,16 @@ impl SettingsState {
                 ))
                 .into()
             }
-            crate::voice::VoiceStatus::Enrolled => Text::new("Enrolled").into(),
-            crate::voice::VoiceStatus::Error(msg) => Text::new(msg).into(),
+            crate::audio::voice::VoiceStatus::Enrolled => Text::new("Enrolled").into(),
+            crate::audio::voice::VoiceStatus::Error(msg) => Text::new(msg).into(),
         };
 
         // Enrollment progress UI (shown during active enrollment)
         let enrollment_ui: Option<Element<'_, SettingsMessage>> = match status {
-            crate::voice::VoiceStatus::Enrolling { .. }
-            | crate::voice::VoiceStatus::ListeningDuringEnrollment { .. }
-            | crate::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
-            | crate::voice::VoiceStatus::EnrollingNegatives { .. } => {
+            crate::audio::voice::VoiceStatus::Enrolling { .. }
+            | crate::audio::voice::VoiceStatus::ListeningDuringEnrollment { .. }
+            | crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
+            | crate::audio::voice::VoiceStatus::EnrollingNegatives { .. } => {
                 let cancel_btn: Element<'_, SettingsMessage> = container(
                     button(Text::new("Cancel").size(13))
                         .on_press(SettingsMessage::CancelVoiceEnrollment)
@@ -2293,7 +2302,7 @@ impl SettingsState {
         };
 
         let wake_word_row = if voice_enabled {
-            if let Some(phrase) = crate::voice::get_enrolled_phrase() {
+            if let Some(phrase) = crate::audio::voice::get_enrolled_phrase() {
                 field_row("Wake Word", Text::new(phrase).size(13).into(), None)
             } else if has_templates {
                 // Legacy model loaded (pre-PersistedModel format) — no phrase known
@@ -2318,10 +2327,10 @@ impl SettingsState {
         // Text input for the wake word phrase (before enrollment).
         let is_enrolling = matches!(
             status,
-            crate::voice::VoiceStatus::Enrolling { .. }
-                | crate::voice::VoiceStatus::ListeningDuringEnrollment { .. }
-                | crate::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
-                | crate::voice::VoiceStatus::EnrollingNegatives { .. }
+            crate::audio::voice::VoiceStatus::Enrolling { .. }
+                | crate::audio::voice::VoiceStatus::ListeningDuringEnrollment { .. }
+                | crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
+                | crate::audio::voice::VoiceStatus::EnrollingNegatives { .. }
         );
         let phrase_input = if voice_enabled && !is_enrolling {
             let input = text_input("mahbot", &self.wake_word_phrase_input)
@@ -2388,8 +2397,8 @@ impl SettingsState {
         use iced::widget::Text;
 
         let tts_enabled = self.config.tts_enabled.as_deref() == Some("true");
-        let ready = crate::tts::models_ready();
-        let failed = crate::tts::download_failed();
+        let ready = crate::audio::tts::models_ready();
+        let failed = crate::audio::tts::download_failed();
 
         let status_text: Element<'_, SettingsMessage> = if !tts_enabled {
             Text::new("Disabled").into()
@@ -3109,8 +3118,12 @@ mod tests {
             SettingsMessage::VoiceToggleResult,
             |c| &c.voice_enabled,
             |s| s.voice_toggle_gen,
-            |_s| {
-                let _ = crate::voice::init_global();
+            |s| {
+                // Clear any pre-existing voice_enabled from the snapshot to avoid
+                // test isolation issues (other tests may have set it in global CONFIG).
+                let _ = s.config.set_string_field("voice_enabled", "");
+                s.config.normalize();
+                let _ = crate::audio::voice::init_global();
             },
         );
     }
@@ -3126,7 +3139,13 @@ mod tests {
             SettingsMessage::TtsToggleResult,
             |c| &c.tts_enabled,
             |s| s.tts_toggle_gen,
-            |_s| crate::tts::test_set_state(2), // STATE_READY
+            |s| {
+                // Clear any pre-existing tts_enabled from the snapshot to avoid
+                // test isolation issues (other tests may have set it in global CONFIG).
+                let _ = s.config.set_string_field("tts_enabled", "");
+                s.config.normalize();
+                crate::audio::tts::test_set_state(2); // STATE_READY
+            },
         );
     }
 }

@@ -287,7 +287,7 @@ struct VoiceStyleFile {
 ///
 /// TTS is opt-in (disabled by default) — the user must explicitly set
 /// `tts_enabled` to `"true"` in config to activate it. This matches the
-/// convention used by the voice assistant ([`crate::voice`]).
+/// convention used by the voice assistant ([`crate::audio::voice`]).
 #[must_use]
 pub fn is_config_enabled() -> bool {
     let enabled = CONFIG.tts_enabled();

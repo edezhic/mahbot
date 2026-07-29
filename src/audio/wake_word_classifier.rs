@@ -33,11 +33,11 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::embedding_sequence::EmbeddingSequence;
+use crate::audio::embedding_sequence::EmbeddingSequence;
 
 use crate::EMBEDDING_DIM;
 #[cfg(test)]
-use crate::embedding_sequence::LabelStratum;
+use crate::audio::embedding_sequence::LabelStratum;
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -1156,11 +1156,11 @@ mod tests {
 
     fn make_seq(embs: Vec<Vec<f32>>, label: LabelStratum) -> EmbeddingSequence {
         EmbeddingSequence {
-            id: crate::embedding_sequence::UtteranceId {
+            id: crate::audio::embedding_sequence::UtteranceId {
                 sequence_index: 0,
                 variant_index: 0,
             },
-            source: crate::embedding_sequence::Source::Enrollment,
+            source: crate::audio::embedding_sequence::Source::Enrollment,
             augmentation_family: None,
             label_stratum: label,
             embeddings: embs,

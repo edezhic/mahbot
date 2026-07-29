@@ -96,7 +96,7 @@ const MERGES_SHA256: &str = "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74
 /// permanently occupying a tokio blocking thread.
 ///
 /// The voice pipeline uses a shorter 30-second timeout (see
-/// [`crate::voice::transcribe_audio`]).
+/// [`crate::audio::voice::transcribe_audio`]).
 pub(crate) const INFERENCE_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// Download timeout for the 1.88 GB model file (30 minutes).
