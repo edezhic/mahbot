@@ -2231,6 +2231,102 @@ async fn test_search_archived_by_fts_punctuation_only() {
     );
 }
 
+// ── search_active_by_fts ──────────────────────────────────────────
+
+#[tokio::test]
+async fn test_search_active_by_fts_finds_matching_title() {
+    let (store, _tmp) = open_test_store().await;
+    let ws = test_ws("ws_active");
+    let id = make_ticket(
+        &store,
+        &ws,
+        "Fix network timeout bug",
+        crate::board::TicketPhase::Backlog,
+    )
+    .await;
+
+    let results = store
+        .search_active_by_fts("network timeout", 10, Some("ws_active"))
+        .await
+        .expect("FTS search");
+    assert!(!results.is_empty(), "should find the ticket");
+    let ids: Vec<&str> = results.iter().map(|t| t.id.as_str()).collect();
+    assert!(
+        ids.contains(&id.as_str()),
+        "result should contain our ticket"
+    );
+}
+
+#[tokio::test]
+async fn test_search_active_by_fts_excludes_archived() {
+    let (store, _tmp) = open_test_store().await;
+    let ws = test_ws("ws_active2");
+    // Create an archived ticket — should not appear in active search
+    create_archived_ticket(&store, "Still searching", "ws_active2").await;
+
+    let results = store
+        .search_active_by_fts("searching", 10, Some("ws_active2"))
+        .await
+        .expect("FTS search");
+    assert!(results.is_empty(), "archived ticket should not appear");
+}
+
+#[tokio::test]
+async fn test_search_active_by_fts_scoped_to_workspace() {
+    let (store, _tmp) = open_test_store().await;
+    // Use test_ws (same as passing test_search_active_by_fts_finds_matching_title)
+    let ws_a = test_ws("ws_scope_a");
+    let id_a = make_ticket(
+        &store,
+        &ws_a,
+        "Fix network timeout bug",
+        crate::board::TicketPhase::Backlog,
+    )
+    .await;
+    let ws_b = test_ws("ws_scope_b");
+    make_ticket(
+        &store,
+        &ws_b,
+        "Database connection pool error",
+        crate::board::TicketPhase::Backlog,
+    )
+    .await;
+
+    // Search in ws_scope_a should only find ws_scope_a's ticket
+    let results = store
+        .search_active_by_fts("network timeout", 10, Some("ws_scope_a"))
+        .await
+        .expect("FTS search scoped to ws_scope_a");
+    assert_eq!(results.len(), 1, "should find only ws_scope_a ticket");
+    assert_eq!(
+        results[0].workspace_name, "ws_scope_a",
+        "ticket belongs to ws_scope_a"
+    );
+}
+
+#[tokio::test]
+async fn test_search_active_by_fts_punctuation_only() {
+    let (store, _tmp) = open_test_store().await;
+    let results = store
+        .search_active_by_fts("!@#$%", 10, Some("ws"))
+        .await
+        .expect("FTS search");
+    assert!(
+        results.is_empty(),
+        "query with only punctuation should produce no matches"
+    );
+}
+
+#[tokio::test]
+async fn test_search_active_by_fts_empty_query_returns_empty() {
+    let (store, _tmp) = open_test_store().await;
+    let results = store
+        .search_active_by_fts("", 10, Some("ws"))
+        .await
+        .expect("FTS search");
+    assert!(results.is_empty(), "empty query should return no results");
+}
+
 /// Basic field layout of `detailed_display`: fields present, negative
 /// assertions for absent fields, and "(no comments)" when empty.
 #[tokio::test]

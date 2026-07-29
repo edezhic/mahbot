@@ -172,6 +172,15 @@ pub enum BoardMessage {
     Undo,
     /// Redo a previously undone text edit in the comment input.
     Redo,
+
+    // ── Ticket search (sidebar) ──────────────────────────────────
+    /// Search query text changed (user typing in the sidebar search input).
+    SearchInputChanged(String),
+    /// Search results returned from async FTS query.
+    /// Carries a generation counter for stale-callback detection.
+    SearchResults(Vec<Ticket>, u64),
+    /// Clear the active search and restore the normal ticket list.
+    SearchCleared,
 }
 
 pub struct BoardState {
@@ -220,6 +229,15 @@ pub struct BoardState {
     modifiers: keyboard::Modifiers,
     /// Undo/redo stack for the comment input text editor.
     undo_stack: UndoStack,
+
+    // ── Ticket search (sidebar) ──────────────────────────────────
+    /// Current search query (empty = no search active).
+    pub(crate) search_query: String,
+    /// Search results, populated when `search_query` is non-empty.
+    pub(crate) search_results: Vec<Ticket>,
+    /// Incremented on each new search; stale callbacks check this before
+    /// applying results. Follows the same pattern as `commit_stats_generation`.
+    pub(crate) search_generation: u64,
 }
 
 impl BoardState {
@@ -246,6 +264,9 @@ impl BoardState {
             comment_generation: 0,
             modifiers: keyboard::Modifiers::empty(),
             undo_stack: UndoStack::new(),
+            search_query: String::new(),
+            search_results: Vec::new(),
+            search_generation: 0,
         }
     }
 
@@ -849,6 +870,59 @@ impl BoardState {
                         self.commit_stats = None;
                     }
                 }
+                Task::none()
+            }
+
+            // ── Ticket search (sidebar) ──────────────────────────────
+            BoardMessage::SearchInputChanged(query) => {
+                self.search_query.clone_from(&query);
+                self.search_generation += 1;
+
+                if query.is_empty() {
+                    self.search_results.clear();
+                    return Task::none();
+                }
+
+                let generation = self.search_generation;
+                let ws = self.workspace_name.clone();
+                Task::perform(
+                    async move {
+                        // Debounce: wait 300ms before executing the FTS query
+                        // so rapid typing doesn't trigger per-keystroke DB hits.
+                        //
+                        // Effective latency is 300–1300ms depending on Tick
+                        // timing (the 1-second Iced Tick that drives view
+                        // updates acts as the lower bound for the next render
+                        // after results arrive). In-flight tasks from earlier
+                        // keystrokes are NOT cancelled — they run to completion
+                        // and their results are discarded by the generation
+                        // counter guard below. For typical typing speeds this
+                        // creates at most a handful of short-lived sleep-only
+                        // tasks, which is acceptably cheap.
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        let board = crate::board::store();
+                        board
+                            .search_active_by_fts(&query, 20, ws.as_deref())
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    move |res| match res {
+                        Ok(tickets) => BoardMessage::SearchResults(tickets, generation),
+                        Err(_) => BoardMessage::SearchResults(vec![], generation),
+                    },
+                )
+            }
+            BoardMessage::SearchResults(tickets, generation) => {
+                if generation == self.search_generation {
+                    // Apply only if still the latest generation (stale callback guard)
+                    self.search_results = tickets;
+                }
+                Task::none()
+            }
+            BoardMessage::SearchCleared => {
+                self.search_query.clear();
+                self.search_results.clear();
+                self.search_generation += 1;
                 Task::none()
             }
         }
@@ -2095,5 +2169,163 @@ mod tests {
             !state.sending_comment,
             "sending_comment should be reset in stale callback"
         );
+    }
+
+    // ── Ticket search (sidebar) ──────────────────────────────────
+
+    #[test]
+    fn test_search_empty_input_clears_results() {
+        let mut state = make_board_state();
+        state.search_query = "old".into();
+        state.search_results = vec![Ticket {
+            id: "T-1".into(),
+            title: "Old result".into(),
+            description: String::new(),
+            phase: TicketPhase::Backlog,
+            assigned_to: None,
+            workspace_name: "test_ws".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            comments: Vec::new(),
+            prerequisites: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            commit_hash: None,
+            lines_added: None,
+            lines_removed: None,
+            reporter: "test".into(),
+            is_archived: false,
+            pipeline_reservation: false,
+            priority: 0,
+        }];
+        state.search_generation = 5;
+
+        let _task = state.update(BoardMessage::SearchInputChanged(String::new()));
+
+        assert!(state.search_query.is_empty());
+        assert!(state.search_results.is_empty());
+        // Generation bumped even on empty — invalidates any in-flight tasks
+        assert_eq!(state.search_generation, 6);
+    }
+
+    #[test]
+    fn test_search_non_empty_stores_query_and_bumps_generation() {
+        let mut state = make_board_state();
+        state.search_generation = 3;
+
+        let _task = state.update(BoardMessage::SearchInputChanged("network".into()));
+
+        assert_eq!(state.search_query, "network");
+        // Generation bumped so stale callbacks are discarded
+        assert!(
+            state.search_generation > 3,
+            "generation should be incremented"
+        );
+    }
+
+    #[test]
+    fn test_search_results_stale_callback_discarded() {
+        let mut state = make_board_state();
+        state.search_generation = 99;
+
+        // A stale result (generation 50 < current 99) should be ignored
+        let _task = state.update(BoardMessage::SearchResults(
+            vec![Ticket {
+                id: "T-stale".into(),
+                title: "Stale".into(),
+                description: String::new(),
+                phase: TicketPhase::Backlog,
+                assigned_to: None,
+                workspace_name: "test_ws".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+                comments: Vec::new(),
+                prerequisites: Vec::new(),
+                supersedes: None,
+                superseded_by: None,
+                commit_hash: None,
+                lines_added: None,
+                lines_removed: None,
+                reporter: "test".into(),
+                is_archived: false,
+                pipeline_reservation: false,
+                priority: 0,
+            }],
+            50,
+        ));
+
+        assert!(
+            state.search_results.is_empty(),
+            "stale callback should not populate results"
+        );
+    }
+
+    #[test]
+    fn test_search_results_current_generation_accepted() {
+        let mut state = make_board_state();
+        state.search_query = "network".into();
+        state.search_generation = 42;
+
+        let _task = state.update(BoardMessage::SearchResults(
+            vec![Ticket {
+                id: "T-fresh".into(),
+                title: "Fresh result".into(),
+                description: String::new(),
+                phase: TicketPhase::Backlog,
+                assigned_to: None,
+                workspace_name: "test_ws".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+                comments: Vec::new(),
+                prerequisites: Vec::new(),
+                supersedes: None,
+                superseded_by: None,
+                commit_hash: None,
+                lines_added: None,
+                lines_removed: None,
+                reporter: "test".into(),
+                is_archived: false,
+                pipeline_reservation: false,
+                priority: 0,
+            }],
+            42,
+        ));
+
+        assert_eq!(state.search_results.len(), 1);
+        assert_eq!(state.search_results[0].id, "T-fresh");
+    }
+
+    #[test]
+    fn test_search_cleared_resets_query_and_results() {
+        let mut state = make_board_state();
+        state.search_query = "something".into();
+        state.search_results = vec![Ticket {
+            id: "T-1".into(),
+            title: "Result".into(),
+            description: String::new(),
+            phase: TicketPhase::Backlog,
+            assigned_to: None,
+            workspace_name: "test_ws".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            comments: Vec::new(),
+            prerequisites: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            commit_hash: None,
+            lines_added: None,
+            lines_removed: None,
+            reporter: "test".into(),
+            is_archived: false,
+            pipeline_reservation: false,
+            priority: 0,
+        }];
+        state.search_generation = 7;
+
+        let _task = state.update(BoardMessage::SearchCleared);
+
+        assert!(state.search_query.is_empty());
+        assert!(state.search_results.is_empty());
+        assert_eq!(state.search_generation, 8);
     }
 }

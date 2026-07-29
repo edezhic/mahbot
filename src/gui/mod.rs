@@ -36,9 +36,9 @@ use crate::board::{Ticket, TicketPhase};
 use crate::logs::LogStore;
 
 use iced::keyboard;
-use iced::widget::Space;
-use iced::widget::rule;
-use iced::widget::{Column, Row, button, column, container, row, scrollable, text, tooltip};
+use iced::widget::{
+    Column, Row, Space, button, column, container, row, rule, scrollable, text, text_input, tooltip,
+};
 use iced::window;
 use iced::{Alignment, Color, Element, Length, Task};
 
@@ -740,7 +740,10 @@ impl Dashboard {
         };
 
         let page_task = match self.page {
-            Page::Home if !self.board_state.load_state.loading() => {
+            Page::Home
+                if !self.board_state.load_state.loading()
+                    && self.board_state.search_query.is_empty() =>
+            {
                 self.board_state.load_state.start_loading();
                 self.board_state.refresh().map(Message::Board)
             }
@@ -1204,8 +1207,13 @@ impl Dashboard {
     fn propagate_workspace_selection(&mut self, name: &str) -> Task<Message> {
         let ws_path = self.workspaces.get(name).map(|w| w.path.clone());
 
-        // Set board's workspace filter directly, then refresh
+        // Set board's workspace filter directly, then refresh.
+        // Clear any active search when switching workspaces so stale results
+        // from the previous workspace don't persist.
         self.board_state.workspace_name = Some(name.to_string());
+        self.board_state.search_query.clear();
+        self.board_state.search_results.clear();
+        self.board_state.search_generation += 1;
         let board_refresh = self.board_state.refresh().map(Message::Board);
 
         // Resolve the personal workspace path when name is empty (Personal)
@@ -1565,11 +1573,50 @@ fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
 /// Displays all non-archived tickets grouped by phase. A right-click
 /// context menu on this panel offers "Archive done & cancelled".
 fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
+    let search_active = !board_state.search_query.is_empty();
+
+    // ── Search input row ───────────────────────────────────────────
+    let search_input = text_input("Search tickets…", &board_state.search_query)
+        .on_input(|q| Message::Board(board::BoardMessage::SearchInputChanged(q)))
+        .style(widgets::text_input_style)
+        .size(13)
+        .padding([4, 8]);
+    let clear_btn = button(text("×").size(14))
+        .on_press(Message::Board(board::BoardMessage::SearchCleared))
+        .style(theme::button_text)
+        .padding(4);
+    let search_row = row![search_input, clear_btn]
+        .spacing(4)
+        .align_y(Alignment::Center);
+
+    // ── Body: search results or normal ticket groups ────────────────
+    let body: Element<'_, Message> = if search_active {
+        render_search_results(board_state)
+    } else {
+        render_normal_ticket_list(board_state)
+    };
+
+    let content = column![
+        Space::new().height(8),
+        search_row,
+        Space::new().height(8),
+        body,
+    ]
+    .spacing(0);
+
+    container(content)
+        .padding([8, 12])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(theme::surface_container_style)
+        .into()
+}
+
+/// Render the normal ticket list partitioned into groups (In Progress,
+/// Ready, Pending, Completed).
+fn render_normal_ticket_list(board_state: &board::BoardState) -> Element<'_, Message> {
     let (pending, pipeline, completed) = board::BoardState::partition_tickets(&board_state.tickets);
 
-    // Split pipeline into "pinned" (actively working) and "ready"
-    // (ReadyForDevelopment only). partition_tickets lumps them together,
-    // but the sidebar separates them visually.
     let pinned: Vec<&Ticket> = pipeline
         .iter()
         .filter(|t| t.phase != TicketPhase::ReadyForDevelopment)
@@ -1583,8 +1630,7 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
 
     let is_empty = pending.is_empty() && pipeline.is_empty() && completed.is_empty();
 
-    // Body: loading, empty, or ticket groups
-    let body: Element<'_, Message> = if !board_state.load_state.has_loaded() {
+    if !board_state.load_state.has_loaded() {
         column![
             Space::new().height(8),
             text("Loading…").size(12).color(theme::TEXT_MUTED),
@@ -1619,16 +1665,32 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
             .direction(theme::vertical_scrollbar())
             .style(theme::scrollbar_style)
             .into()
-    };
+    }
+}
 
-    let content = column![Space::new().height(8), body].spacing(0);
-
-    container(content)
-        .padding([8, 12])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(theme::surface_container_style)
+/// Render FTS search results as ticket cards in a scrollable list.
+fn render_search_results(board_state: &board::BoardState) -> Element<'_, Message> {
+    if board_state.search_results.is_empty() {
+        column![
+            Space::new().height(8),
+            text("No matching tickets")
+                .size(12)
+                .color(theme::TEXT_MUTED),
+        ]
+        .spacing(4)
+        .padding([8, 0])
         .into()
+    } else {
+        let mut cards = Column::new().spacing(2);
+        for ticket in &board_state.search_results {
+            cards = cards.push(board_state.render_ticket_card(ticket).map(Message::Board));
+        }
+        scrollable(cards)
+            .height(Length::Fill)
+            .direction(theme::vertical_scrollbar())
+            .style(theme::scrollbar_style)
+            .into()
+    }
 }
 
 /// Render a group of tickets with a header label.

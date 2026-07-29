@@ -1989,6 +1989,69 @@ impl BoardStore {
         }
     }
 
+    /// Search active (non-archived) tickets by FTS keyword match, scoped to an
+    /// optional workspace.
+    ///
+    /// Sanitizes the input query (strips non-alphanumeric characters) before
+    /// matching against the `ngram`-tokenized FTS index on `title`.
+    ///
+    /// Returns full [`Ticket`] objects (without comments) ordered by FTS
+    /// relevance (`fts_score DESC`), up to `limit` results.
+    /// On SQL error, logs a warning and returns an empty vec.
+    pub async fn search_active_by_fts(
+        &self,
+        query: &str,
+        limit: usize,
+        workspace_name: Option<&str>,
+    ) -> Result<Vec<Ticket>> {
+        let sanitized = crate::turso::sanitize_fts_query(query);
+        if sanitized.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Use an explicit `FROM tickets t` alias so `fts_score(t.title, ?2)`
+        // resolves correctly — the `select_tickets` helper does not support
+        // table aliases in FTS scoring expressions.
+        let sql = format!(
+            "SELECT {TICKET_COLUMNS} \
+             FROM tickets t \
+             WHERE t.is_archived = 0 \
+               AND (?1 IS NULL OR t.workspace_name = ?1) \
+               AND t.title MATCH ?2 \
+             ORDER BY fts_score(t.title, ?2) DESC \
+             LIMIT {limit}"
+        );
+        match self
+            .conn
+            .query(&sql, turso::params![workspace_name, sanitized.clone()])
+            .await
+        {
+            Ok(rows) => {
+                let mut tickets = Vec::with_capacity(rows.len());
+                for row in rows {
+                    match self.ticket_from_row(&row, LoadComments::No).await {
+                        Ok(t) => tickets.push(t),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "Failed to parse ticket row from FTS search"
+                            );
+                        }
+                    }
+                }
+                Ok(tickets)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    query = %sanitized,
+                    error = %e,
+                    "FTS search for active tickets failed"
+                );
+                Ok(Vec::new())
+            }
+        }
+    }
+
     /// List archived tickets with non-NULL embeddings, deserialized.
     ///
     /// Returns `(id, embedding)` pairs for all archived tickets that have
