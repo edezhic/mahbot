@@ -1,7 +1,6 @@
 /// Voice pipeline E2E benchmark with single-instance lock and 30-minute timeout.
 ///
-/// The lock prevents concurrent benchmark runs (which cause Metal GPU deadlocks
-/// via competing Metal device submissions).  A 30-minute timeout aborts hung
+/// The lock prevents concurrent benchmark runs.  A 30-minute timeout aborts hung
 /// runs via [`std::process::exit`].
 ///
 /// # Lock mechanism
@@ -94,7 +93,7 @@ fn acquire_bench_lock() -> File {
 
 fn main() {
     // 1. Acquire single-instance lock.
-    //    Prevents concurrent benchmark runs that cause Metal GPU deadlock.
+    //    Prevents concurrent benchmark runs.
     let _lock = acquire_bench_lock();
     // Kernel releases `flock` on process death (Drop, process::exit, SIGKILL).
 
@@ -105,10 +104,9 @@ fn main() {
     // 3. Run benchmark with 30-minute timeout.
     // NOTE: spawn_blocking tasks are NOT cancelable at the Rust level.
     // When the timeout fires, tokio returns Err(Elapsed) but the kernel
-    // threads (Metal GPU work, ONNX) continue executing.  We call
+    // threads (ONNX evaluations) continue executing.  We call
     // process::exit(1) to terminate the process, which kills all threads
-    // and the kernel releases the flock.  This is accepted per the
-    // non-goals (no GPU-level timeout guards).
+    // and the kernel releases the flock.
     let result = runtime.block_on(async {
         tokio::time::timeout(
             Duration::from_mins(30),
