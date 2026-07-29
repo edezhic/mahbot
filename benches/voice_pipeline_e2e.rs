@@ -119,7 +119,7 @@ fn main() {
 
     match result {
         Ok(Ok(())) => {
-            // Normal completion — benchmark handled pass/fail internally.
+            // Normal completion — benchmark is report-only (no pass/fail gating).
         }
         Ok(Err(join_err)) => {
             eprintln!("BENCHMARK PANICKED: {join_err}");
