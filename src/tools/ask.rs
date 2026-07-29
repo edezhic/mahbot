@@ -6,12 +6,16 @@
 //! in a background task and the result is injected back to the caller's
 //! agent channel via [`crate::message_router::route`].
 
+use crate::agent::run_agent;
+use crate::config::CONFIG;
 use crate::message_router::{self, AgentJob, JobKind};
+use crate::prompt::{load_prompt, substitute};
 use crate::session::{ask_agent_id, direct_agent_id, manager_agent_id};
 use crate::tools::Tool;
-use crate::{Agent, Role, Workspace};
+use crate::{Agent, ChatMessage, ChatRequest, DEFAULT_MAX_TOKENS, Role, Workspace};
 use anyhow::Result;
 use async_trait::async_trait;
+use futures_util::future::join_all;
 use serde_json::json;
 
 /// Controls sub-agent dispatch behaviour.
@@ -173,7 +177,16 @@ impl Tool for AskTool {
 
 /// Shared sub-agent runner — creates and executes a sub-agent for the given
 /// role and ask. Used by both sync and async paths of [`AskTool::execute`].
+///
+/// For [`Role::Analyst`], spawns 3 parallel analysts and consolidates their
+/// responses via a single LLM synthesis call. For all other roles, dispatches a
+/// single agent (existing behaviour).
 async fn run_sub_agent(ws: &Workspace, role: Role, ask: &str) -> Result<String> {
+    if role == Role::Analyst {
+        return run_parallel_analysts_and_consolidate(ws, ask).await;
+    }
+
+    // Existing single-agent path for non-Analyst roles
     let agent_id = ask_agent_id(&ws.name, role.as_str());
 
     let mut agent = Agent::new(agent_id, role, ws, None, String::new(), String::new());
@@ -190,6 +203,124 @@ async fn run_sub_agent(ws: &Workspace, role: Role, ask: &str) -> Result<String> 
     };
 
     Ok(response)
+}
+
+/// Spawn 3 parallel analyst agents, then consolidate their responses into a
+/// single comprehensive answer.
+async fn run_parallel_analysts_and_consolidate(ws: &Workspace, ask: &str) -> Result<String> {
+    const PARALLEL_ANALYST_COUNT: usize = 3;
+
+    let responses = run_parallel_analysts(ws, ask, PARALLEL_ANALYST_COUNT).await;
+    consolidate_analyst_responses(ask, responses).await
+}
+
+/// Run `count` parallel analyst agents, returning their responses.
+/// Failed / cancelled agents produce `None`.
+async fn run_parallel_analysts(ws: &Workspace, ask: &str, count: usize) -> Vec<Option<String>> {
+    let suffix = crate::generate_suffix();
+    let futures: Vec<_> = (0..count)
+        .map(|i| {
+            let ask = ask.to_string();
+            let ws = ws.clone();
+            let suffix = suffix.clone();
+            let agent_id = format!("ask_{}_{}_{}_analyst", ws.name, suffix, i);
+            async move {
+                let (_, response) = run_agent(
+                    agent_id,
+                    Role::Analyst,
+                    &ws,
+                    None,
+                    &ask,
+                    String::new(),
+                    String::new(),
+                )
+                .await;
+                response
+            }
+        })
+        .collect();
+    join_all(futures).await
+}
+
+/// Consolidate parallel analyst responses via a single LLM synthesis call.
+///
+/// Message structure (per manager refinement):
+/// - System message: synthesis instructions + original question (from prompt template)
+/// - User message: only the analyst reports (programmatically built)
+///
+/// Graceful degradation:
+/// - 0 valid responses → error
+/// - 1 valid response → returned directly (no consolidation call)
+/// - 2–3 valid responses → consolidated via [`crate::providers::chat`]
+async fn consolidate_analyst_responses(
+    ask: &str,
+    responses: Vec<Option<String>>,
+) -> Result<String> {
+    // Filter out empty / failed responses
+    let valid: Vec<String> = responses
+        .into_iter()
+        .flatten()
+        .filter(|r| !r.trim().is_empty())
+        .collect();
+
+    match valid.len() {
+        0 => {
+            anyhow::bail!("All parallel analysts failed to produce a response");
+        }
+        1 => {
+            // Only one analyst responded — return directly, no consolidation call
+            Ok(valid.into_iter().next().expect("just checked len == 1"))
+        }
+        _n => {
+            // 2 or 3 responses — consolidate via a single LLM call.
+            // System message: instructions + original question
+            // User message: reports only (no duplicate instructions)
+            let model = CONFIG.role_model(Role::Analyst);
+            let routing = CONFIG.model_routing(&model);
+            let prompt_template = load_prompt("consolidate/analyst.md");
+
+            // Escape triple-backtick code fences in analyst responses to prevent
+            // accidental markdown-structure corruption in the input text.
+            let escaped: Vec<String> = valid
+                .iter()
+                .map(|r| r.replace("```", "\\`\\`\\`"))
+                .collect();
+
+            // System message = filled template (instructions + original_ask only)
+            let system_content = substitute(&prompt_template, &[("{{original_ask}}", ask)]);
+
+            // User message = reports section only, built for the exact count
+            // of responding analysts (no empty headers for missing analysts).
+            let mut user_parts = vec!["## Analyst Reports".to_string()];
+            for (i, report) in escaped.iter().enumerate() {
+                user_parts.push(format!("### Report from Analyst {}", i + 1));
+                user_parts.push(report.clone());
+            }
+            let user_content = user_parts.join("\n\n");
+
+            let request = ChatRequest {
+                messages: vec![
+                    ChatMessage::system(&system_content),
+                    ChatMessage::user(&user_content),
+                ],
+                tools: None,
+                model,
+                allow_image_parts: false,
+                temperature: 0.05,
+                max_tokens: Some(DEFAULT_MAX_TOKENS),
+                reasoning_effort: None,
+                provider_order: routing.provider_order,
+                provider_allow_fallbacks: routing.allow_fallbacks,
+            };
+
+            let response = crate::providers::chat(request).await?;
+            let text = response.text_or_empty().to_string();
+            if text.is_empty() {
+                anyhow::bail!("Consolidation LLM returned empty response");
+            }
+            Ok(text)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -304,5 +435,58 @@ mod tests {
                 c.role
             );
         }
+    }
+
+    // ── Consolidation edge-case tests (no LLM provider needed) ──
+
+    #[tokio::test]
+    async fn test_consolidate_zero_responses_returns_error() {
+        let result = consolidate_analyst_responses("test question", vec![None, None, None]).await;
+        assert!(result.is_err(), "0 responses should error");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("All parallel analysts failed"),
+            "Error should mention analyst failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_consolidate_one_response_returned_directly() {
+        let result = consolidate_analyst_responses(
+            "test question",
+            vec![Some("only answer".to_string()), None, None],
+        )
+        .await;
+        assert!(result.is_ok(), "1 response should succeed");
+        assert_eq!(
+            result.unwrap(),
+            "only answer",
+            "Should return the single response directly without consolidation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_consolidate_empty_responses_filtered() {
+        // Empty/whitespace-only strings should be filtered the same as None
+        let result = consolidate_analyst_responses(
+            "test question",
+            vec![
+                Some("valid".to_string()),
+                Some("".to_string()),
+                Some("   ".to_string()),
+            ],
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "1 valid after filtering empty should succeed"
+        );
+        assert_eq!(
+            result.unwrap(),
+            "valid",
+            "Should return the only non-empty response"
+        );
     }
 }
