@@ -912,20 +912,18 @@ impl Dashboard {
             }
             Message::Shutdown | Message::CloseRequested(_) => self.save_and_exit(),
             Message::CheckpointAndExit => iced::exit(),
-            Message::WindowEvent(id, event) => {
-                match event {
-                    window::Event::Resized(new_size) => {
-                        self.last_size = new_size;
-                        Task::none()
-                    }
-                    window::Event::Moved(new_pos) => {
-                        self.last_position = new_pos;
-                        Task::none()
-                    }
-                    window::Event::Opened { .. } => disable_macos_text_services(id),
-                    _ => Task::none(),
+            Message::WindowEvent(id, event) => match event {
+                window::Event::Resized(new_size) => {
+                    self.last_size = new_size;
+                    Task::none()
                 }
-            }
+                window::Event::Moved(new_pos) => {
+                    self.last_position = new_pos;
+                    Task::none()
+                }
+                window::Event::Opened { .. } => disable_macos_text_services(id),
+                _ => Task::none(),
+            },
             Message::CloseDiffModal => {
                 self.show_diff_modal = false;
                 Task::done(Message::DiffModal(diff::DiffMessage::ClearCommitState))
@@ -2533,23 +2531,17 @@ fn disable_macos_text_services(window_id: window::Id) -> Task<Message> {
                     use objc2::msg_send;
                     use objc2_app_kit::NSTextInputTraitType;
 
-                    let () =
-                        msg_send![ns_view, setAutocorrectionType: NSTextInputTraitType::No];
+                    let () = msg_send![ns_view, setAutocorrectionType: NSTextInputTraitType::No];
                     let () = msg_send![ns_view, setSpellCheckingType: NSTextInputTraitType::No];
-                    let () =
-                        msg_send![ns_view, setGrammarCheckingType: NSTextInputTraitType::No];
+                    let () = msg_send![ns_view, setGrammarCheckingType: NSTextInputTraitType::No];
                     let () = msg_send![ns_view, setSmartQuotesType: NSTextInputTraitType::No];
                     let () = msg_send![ns_view, setSmartDashesType: NSTextInputTraitType::No];
-                    let () =
-                        msg_send![ns_view, setSmartInsertDeleteType: NSTextInputTraitType::No];
-                    let () =
-                        msg_send![ns_view, setTextReplacementType: NSTextInputTraitType::No];
+                    let () = msg_send![ns_view, setSmartInsertDeleteType: NSTextInputTraitType::No];
+                    let () = msg_send![ns_view, setTextReplacementType: NSTextInputTraitType::No];
                     let () = msg_send![ns_view, setDataDetectionType: NSTextInputTraitType::No];
                     let () = msg_send![ns_view, setLinkDetectionType: NSTextInputTraitType::No];
-                    let () =
-                        msg_send![ns_view, setTextCompletionType: NSTextInputTraitType::No];
-                    let () =
-                        msg_send![ns_view, setInlinePredictionType: NSTextInputTraitType::No];
+                    let () = msg_send![ns_view, setTextCompletionType: NSTextInputTraitType::No];
+                    let () = msg_send![ns_view, setInlinePredictionType: NSTextInputTraitType::No];
                 }
             }
         }

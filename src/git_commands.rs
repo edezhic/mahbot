@@ -31,6 +31,14 @@ impl CommitInfo {
     }
 }
 
+/// Maximum size (1 MiB) for reading untracked files in [`run_git_diff_stats`].
+///
+/// Files larger than this are silently skipped to avoid UI lag since the
+/// function is called every ~5 seconds for the footer bar stats display.
+///
+/// Named to match the same-purpose constant in [`crate::gui::diff`].
+const MAX_UNTRACKED_SIZE: u64 = 1024 * 1024;
+
 /// Whether to discard changes in a single file or an entire directory tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscardTarget {
@@ -439,9 +447,62 @@ pub async fn run_git_behind_ahead(repo_path: &Path) -> anyhow::Result<(usize, us
 
 /// Run `git diff --numstat HEAD` and return the total added/removed lines.
 ///
-/// Delegates to `parse_numstat`.
+/// Also counts lines from untracked (new) files, since `git diff HEAD` only
+/// considers tracked files. Untracked files larger than
+/// [`MAX_UNTRACKED_SIZE`] or detected as binary are silently skipped to
+/// avoid UI lag (this function is called every ~5 seconds for the footer bar
+/// stats).
+///
+/// Delegates to `parse_numstat` for tracked file diffs and
+/// `parse_untracked_from_porcelain` for untracked file enumeration.
 pub async fn run_git_diff_stats(repo_path: &Path) -> anyhow::Result<(i64, i64)> {
-    parse_numstat(repo_path, &["diff", "--numstat", "HEAD"]).await
+    let (mut added, removed) = parse_numstat(repo_path, &["diff", "--numstat", "HEAD"]).await?;
+
+    // Enumerate untracked files and count their lines.
+    // `git diff HEAD` only considers tracked files, so new/untracked files are
+    // invisible to the numstat above. We read them from disk and count their
+    // lines — all lines in an untracked file are "added".
+    let status_output = match run_git_status(repo_path).await {
+        Ok(output) => output,
+        Err(e) => {
+            warn!("Failed to run git status for untracked file counting: {e}");
+            return Ok((added, removed));
+        }
+    };
+
+    let untracked = parse_untracked_from_porcelain(&status_output);
+
+    for path in &untracked {
+        let full = repo_path.join(path);
+        if !full.is_file() {
+            continue;
+        }
+        let Ok(meta) = tokio::fs::metadata(&full).await else {
+            continue;
+        };
+        // Skip files larger than MAX_UNTRACKED_SIZE to avoid UI lag
+        // (footer refreshes every ~5s).
+        if meta.len() > MAX_UNTRACKED_SIZE {
+            continue;
+        }
+        let Ok(content) = tokio::fs::read(&full).await else {
+            continue;
+        };
+        // Skip binary files (null byte check + UTF-8 check), matching the
+        // approach used in add_untracked_files (gui/diff.rs).
+        if content.contains(&0) {
+            continue;
+        }
+        let Ok(text) = String::from_utf8(content) else {
+            continue;
+        };
+        // All lines in an untracked file count as added lines
+        #[allow(clippy::cast_possible_wrap)]
+        let line_count = text.lines().count() as i64;
+        added += line_count;
+    }
+
+    Ok((added, removed))
 }
 
 /// Sync with remote: `git pull --ff-only` then `git push`.
@@ -689,6 +750,72 @@ mod tests {
         let (added, removed) = run_git_diff_stats(&repo_path).await.expect("diff stats");
         assert_eq!(added, 2, "two lines added (modified + new line)");
         assert_eq!(removed, 1, "one line removed (line2)");
+    }
+
+    #[tokio::test]
+    async fn test_run_git_diff_stats_with_untracked() {
+        let (_dir, repo_path) = init_temp_repo();
+
+        // Create an untracked file — not staged, not tracked by git.
+        std::fs::write(
+            repo_path.join("new_file.rs"),
+            b"fn foo() {\n    bar();\n}\n",
+        )
+        .expect("write untracked file");
+
+        let (added, removed) = run_git_diff_stats(&repo_path).await.expect("diff stats");
+        // The untracked file has 3 lines; unmodified tracked file contributes 0.
+        assert_eq!(added, 3, "should count lines from untracked file");
+        assert_eq!(removed, 0, "no removed lines");
+    }
+
+    #[tokio::test]
+    async fn test_run_git_diff_stats_skips_binary_untracked() {
+        let (_dir, repo_path) = init_temp_repo();
+
+        // Create an untracked file containing a null byte (binary).
+        std::fs::write(repo_path.join("binary.bin"), b"line1\nline2\x00\n")
+            .expect("write binary file");
+
+        let (added, removed) = run_git_diff_stats(&repo_path).await.expect("diff stats");
+        assert_eq!(
+            added, 0,
+            "binary untracked file should not be counted as added"
+        );
+        assert_eq!(removed, 0, "no removed lines");
+    }
+
+    #[tokio::test]
+    async fn test_run_git_diff_stats_skips_large_untracked() {
+        let (_dir, repo_path) = init_temp_repo();
+
+        // Create an untracked file larger than MAX_UNTRACKED_SIZE (1 MiB).
+        let size = MAX_UNTRACKED_SIZE as usize + 1;
+        let mut content = Vec::with_capacity(size);
+        content.resize(size, b'a');
+        std::fs::write(repo_path.join("large.bin"), &content).expect("write large file");
+
+        let (added, removed) = run_git_diff_stats(&repo_path).await.expect("diff stats");
+        assert_eq!(
+            added, 0,
+            "large untracked file should not be counted as added"
+        );
+        assert_eq!(removed, 0, "no removed lines");
+    }
+
+    #[tokio::test]
+    async fn test_run_git_diff_stats_skips_directory_untracked() {
+        let (_dir, repo_path) = init_temp_repo();
+
+        // Create an untracked directory (not a regular file).
+        std::fs::create_dir(repo_path.join("new_dir")).expect("create directory");
+
+        let (added, removed) = run_git_diff_stats(&repo_path).await.expect("diff stats");
+        assert_eq!(
+            added, 0,
+            "untracked directory should not be counted as added"
+        );
+        assert_eq!(removed, 0, "no removed lines");
     }
 
     #[tokio::test]
