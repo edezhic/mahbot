@@ -136,7 +136,11 @@ fn push_truncated(out: &mut String, text: &str) {
         out.push_str(&text[..idx]);
         let _ = writeln!(
             out,
-            "\n\n[... truncated at {MAX_WORKSPACE_FILE_CHARS} chars — use `read` for full file]\n"
+            "\n\n{}\n",
+            substitute(
+                &load_prompt("truncation_notice.md"),
+                &[("{{max_chars}}", &MAX_WORKSPACE_FILE_CHARS.to_string())],
+            ),
         );
     } else {
         out.push_str(text);

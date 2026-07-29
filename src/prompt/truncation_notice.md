@@ -1,0 +1,1 @@
+[... truncated at {{max_chars}} chars — use `read` for full file]
