@@ -43,6 +43,7 @@ use crate::voice_verifier::{DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA, VoiceVerifier
 use crate::wake_word_classifier::WakeWordClassifier;
 use earshot::Detector;
 use rand::{RngExt, SeedableRng};
+use std::borrow::Cow;
 use std::time::Instant;
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -93,8 +94,23 @@ const MIN_CLASSIFIER_THRESHOLD: f32 = 2.13;
 /// this constant should be recalculated to maintain ≥ 4 embeddings.
 const WARMUP_PREPEND_SAMPLES: usize = 20480; // 1.28s × 16 kHz
 
-/// Cached warm-up noise signal, generated once on first access (mahbot-922).
-static WARMUP_NOISE_CACHE: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+/// TTS phrase for verifier warm-up audio (mahbot-947).
+///
+/// A short non-wake-word phrase synthesised via the already-loaded TTS engine.
+/// Speech-like harmonics guarantee the Earshot neural VAD triggers, producing
+/// enough embeddings to consume the verifier warm-up period before the actual
+/// test utterance is processed.
+///
+/// Must NOT contain the wake word ("hey mahbot") or phonetically similar
+/// phrases that could trigger the Conv1D classifier.
+const WARMUP_TTS_PHRASE: &str = "testing one two three";
+
+/// Cached TTS warm-up audio, populated on first successful synthesis.
+/// Unlike the original `WARMUP_NOISE_CACHE`, this caches ONLY the TTS
+/// result — if TTS is unavailable on the first call, a fresh pink-noise
+/// fallback is returned (no caching), so TTS is re-evaluated on subsequent
+/// calls (mahbot-947, reviewer feedback on cache poisoning).
+static WARMUP_TTS_CACHE: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
 
 /// Default wake word for the test.
 const WAKE_WORD: &str = "hey mahbot";
@@ -599,42 +615,117 @@ fn generate_high_freq_hiss() -> Vec<f32> {
         .collect()
 }
 
-/// Returns ~1.28 s of speech-like noise that triggers Earshot VAD to produce
-/// ≥ [`VERIFIER_WARMUP_EMBEDDINGS`](crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS)
-/// embeddings while producing near-zero wake-word classifier scores (mahbot-922).
+/// Generate warm-up audio that reliably triggers the Earshot neural VAD.
 ///
-/// ## Invariants (must not break)
+/// Attempts TTS synthesis first (guaranteed speech-like harmonics), falling
+/// back to pink noise + 200 Hz tone if TTS is unavailable (mahbot-947).
 ///
-/// 1. **VAD triggering**: must produce ≥ 4 embeddings in ~1.28 s (the verifier
-///    warm-up period).  Achieved by pink noise (1/f, 0.20 amplitude) for
-///    speech-like spectral shape + 200 Hz tone (0.10 amplitude) for a
-///    fundamental-frequency peak in the lowest mel bands.  Combined RMS ~0.18.
-/// 2. **No false detection**: classifier scores must be near-zero (pink noise +
-///    200 Hz tone does not resemble the "hey mahbot" wake word embedding).
-/// 3. **Deterministic**: RNG seed 922 (= ticket number).
-/// 4. **Cached**: generated once into [`WARMUP_NOISE_CACHE`].
+/// Returns a [`Cow`] that either borrows from the TTS cache (once populated)
+/// or owns freshly-generated pink noise (not cached, so TTS is re-evaluated
+/// on the next call if it becomes available — mahbot-947, reviewer feedback).
 ///
-/// The AGC gain settles below 1.0 (attenuation) because RMS exceeds the AGC
-/// target (0.05).  This is fine — the VAD operates on normalised mel features,
-/// where spectral shape (not level) determines the output.
-fn generate_warmup_noise() -> &'static [f32] {
-    WARMUP_NOISE_CACHE.get_or_init(|| {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(922);
+/// ## Determinism
+/// TTS synthesis uses a fixed seed (947 = ticket number), producing the same
+/// PCM output on every call (barring TTS model changes).  The result is cached
+/// in [`WARMUP_TTS_CACHE`] so subsequent calls are zero-cost.
+///
+/// ## Fallback rationale
+/// The pink noise + 200 Hz tone was the original warm-up signal (mahbot-922/926),
+/// but its lack of speech-like harmonic structure causes the Earshot neural VAD
+/// to reject it as non-speech, producing 0 embeddings and leaving the verifier
+/// cold.  This was the root cause of Phase 8's 0% detection rate (mahbot-947).
+fn generate_warmup_noise() -> Cow<'static, [f32]> {
+    // TTS cache hit — fast path, no synthesis needed.
+    if let Some(cached) = WARMUP_TTS_CACHE.get() {
+        return Cow::Borrowed(cached);
+    }
 
-        // Pink noise normalised to unit RMS at ~0.20 amplitude (≈ -14 dB).
-        let pink = crate::util::generate_pink_noise(WARMUP_PREPEND_SAMPLES, &mut rng);
-        let pink_gain = 0.20;
+    // First call (or cache not yet populated): try TTS synthesis.
+    // Speech-like harmonics guarantee Earshot VAD triggers, producing
+    // enough mel frames for ≥7 stride-8 embeddings.
+    if let Some(pcm) = try_warmup_tts() {
+        let cached = WARMUP_TTS_CACHE.get_or_init(|| pcm);
+        // Safety: we just verified get() returns None above; no race
+        // because get_or_init is idempotent and returns the same &Vec.
+        return Cow::Borrowed(cached);
+    }
 
-        // 200 Hz tonal component at ~0.10 amplitude (≈ -20 dB).
-        let mut samples = Vec::with_capacity(WARMUP_PREPEND_SAMPLES);
-        for (i, &p) in pink.iter().enumerate() {
-            let t = i as f32 / TARGET_SAMPLE_RATE as f32;
-            let tone = (2.0 * core::f32::consts::PI * 200.0 * t).sin() * 0.10;
-            samples.push(p * pink_gain + tone);
+    // TTS unavailable — return fresh fallback (not cached, so we retry
+    // TTS on future calls if models become available).
+    warn!(
+        "TTS warm-up synthesis failed — falling back to pink noise + tone. \
+         This may not trigger Earshot VAD, causing 0 warm-up embeddings. \
+         Ensure TTS models are cached (~/.mahbot/models/tts/)."
+    );
+    Cow::Owned(generate_warmup_noise_fallback())
+}
+
+/// Attempt TTS synthesis of the warm-up phrase.
+///
+/// Returns `None` if TTS is not initialised or synthesis fails, allowing the
+/// caller to fall back to pink noise.  Logs an `info!` on success with the
+/// output duration so maintainers can verify the warm-up length.
+fn try_warmup_tts() -> Option<Vec<f32>> {
+    let pcm = match crate::tts::synthesize(
+        WARMUP_TTS_PHRASE,
+        DEFAULT_TTS_STYLE,
+        947, // seed = ticket number for determinism
+        TARGET_SAMPLE_RATE,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("TTS warm-up synthesis failed: {e}");
+            return None;
         }
+    };
 
-        samples
-    })
+    if pcm.len() > WARMUP_PREPEND_SAMPLES {
+        warn!(
+            "Warm-up TTS output ({} samples = {:.2}s) exceeds \
+             WARMUP_PREPEND_SAMPLES ({}) — truncating to {}",
+            pcm.len(),
+            pcm.len() as f64 / f64::from(TARGET_SAMPLE_RATE),
+            WARMUP_PREPEND_SAMPLES,
+            WARMUP_PREPEND_SAMPLES,
+        );
+        Some(pcm[..WARMUP_PREPEND_SAMPLES].to_vec())
+    } else {
+        info!(
+            "Warm-up audio: TTS phrase '{}' ({:.2}s = {} samples) — VAD will trigger",
+            WARMUP_TTS_PHRASE,
+            pcm.len() as f64 / f64::from(TARGET_SAMPLE_RATE),
+            pcm.len(),
+        );
+        Some(pcm)
+    }
+}
+
+/// Generate the original pink noise + 200 Hz tone warm-up signal (mahbot-922).
+///
+/// Retained as a fallback when TTS models are not cached.  Properties:
+/// 1. **VAD-inactive**: low probability of triggering the Earshot neural VAD
+///    (no speech harmonics), which is the whole reason we now prefer TTS.
+/// 2. **No false detection**: classifier scores are near-zero because pink
+///    noise + 200 Hz tone does not resemble the "hey mahbot" embedding.
+/// 3. **Deterministic**: RNG seed 922 (= original ticket number).
+/// 4. **Aperiodic noise floor**: pink noise avoids periodic artefacts that
+///    could bias the AGC steady state.
+fn generate_warmup_noise_fallback() -> Vec<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(922);
+
+    // Pink noise normalised to unit RMS at ~0.20 amplitude (≈ -14 dB).
+    let pink = crate::util::generate_pink_noise(WARMUP_PREPEND_SAMPLES, &mut rng);
+    let pink_gain = 0.20;
+
+    // 200 Hz tonal component at ~0.10 amplitude (≈ -20 dB).
+    let mut samples = Vec::with_capacity(WARMUP_PREPEND_SAMPLES);
+    for (i, &p) in pink.iter().enumerate() {
+        let t = i as f32 / TARGET_SAMPLE_RATE as f32;
+        let tone = (2.0 * core::f32::consts::PI * 200.0 * t).sin() * 0.10;
+        samples.push(p * pink_gain + tone);
+    }
+
+    samples
 }
 
 /// Process a single frame of audio through the pipeline (AGC →
@@ -694,32 +785,35 @@ fn feed_audio(samples: &[f32], ctx: &mut super::PipelineCtx) {
 ///
 /// - If VAD didn't trigger (fewer than [`VERIFIER_WARMUP_EMBEDDINGS`] embeddings
 ///   produced), a `warn!()` is emitted so maintainers know the warm-up wasn't fully
-///   consumed.  Detection on very short utterances (<1 s) may be impacted.
-/// - If the warm-up noise triggered a false detection (extremely unlikely), a
-///   `warn!()` is emitted and the detection state is restored to prevent cooldown
-///   from corrupting subsequent benchmark measurements.
+///   consumed.  Detection on short utterances (<1 s) will be disadvantaged.
+/// - If the warm-up noise triggered a false detection, a `warn!()` is emitted and
+///   the detection state is restored to prevent cooldown from corrupting subsequent
+///   benchmark measurements (mahbot-922).
 fn consume_warmup(ctx: &mut super::PipelineCtx) {
     let before_embeddings = ctx.embedding_ring.len();
     let before_detection = ctx.last_wake_word_detection;
     let noise = generate_warmup_noise();
 
-    // ── Feed warm-up noise (single pass) ────────────────────────────────────
-    // The stride-8 pipeline needs enough mel frames to produce ≥4 embeddings.
-    // With WARMUP_PREPEND_SAMPLES = 20480 (~1.28s), we get ~125 mel frames →
-    // 7 stride-8 embeddings, safely exceeding the requirement.  A single pass
-    // suffices — re-feeding identical noise through an already-adapted AGC cannot
-    // increase VAD triggering (mahbot-926, reviewer feedback).
-    feed_audio(noise, ctx);
+    // ── Feed warm-up audio (single pass) ───────────────────────────────────
+    // With TTS-generated speech, VAD triggers on almost every frame, producing
+    // enough mel frames for ≥7 stride-8 embeddings.  A single pass suffices —
+    // re-feeding identical audio through an already-adapted AGC cannot increase
+    // VAD triggering (mahbot-926, reviewer feedback).
+    feed_audio(&noise, ctx);
     let produced = ctx.embedding_ring.len().saturating_sub(before_embeddings);
 
-    // Diagnostic: validate that the warm-up noise produced enough embeddings
-    // to consume the verifier warm-up period (mahbot-922, mahbot-926).
+    // Diagnostic: validate warm-up produced enough embeddings (mahbot-922/926).
+    // When warm-up fails (TTS not available, pink noise used), this warning
+    // indicates the verifier will NOT be active — every variant's first 4
+    // embeddings will be consumed by warm-up suppression instead of scoring,
+    // making detection impossible for short utterances (<1 s).
     if produced < crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS {
         warn!(
-            "Warm-up noise produced only {} embedding(s) (need >= {}) — \
-             detection on very short utterances (<1 s) may be disadvantaged. \
-             Consider adjusting WARMUP_PREPEND_SAMPLES if pipeline constants \
-             have changed (mahbot-926).",
+            "Warm-up produced only {} embedding(s) (need >= {}) — \
+             verifier will NOT be active for this variant.  \
+             This is expected when using the pink-noise fallback (TTS not available). \
+             Every variant's first 4 embeddings will be consumed by warm-up suppression. \
+             Detection on short utterances (<1 s) will be disadvantaged.",
             produced,
             crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS,
         );
@@ -732,9 +826,8 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
     // suppress stride-8 scoring for the entire benchmark variant.
     if ctx.last_wake_word_detection != before_detection {
         warn!(
-            "Warm-up noise triggered a false detection — restoring detection \
-             state to prevent cooldown corruption.  Consider reducing the noise \
-             amplitude or adjusting the tonal component.",
+            "Warm-up triggered a false detection — restoring detection \
+             state to prevent cooldown corruption.",
         );
         ctx.last_wake_word_detection = before_detection;
         ctx.is_recording = false;
@@ -1171,6 +1264,16 @@ struct PerVariantResult {
     /// scoring (mahbot-891).  The third element is the effective threshold used
     /// for the rolling window comparison this frame.
     per_frame_scores: Vec<[f32; 3]>,
+    /// Whether the verifier warm-up was completed before this variant's test
+    /// utterance was processed (embedding_ring had ≥
+    /// [`VERIFIER_WARMUP_EMBEDDINGS`](crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS)
+    /// entries after `consume_warmup`).  When `false`, the verifier will NOT be
+    /// active, and the first 4 embeddings from the test utterance are consumed
+    /// by warm-up suppression (mahbot-947).
+    warmup_completed: bool,
+    /// Number of embeddings in the ring buffer after warm-up consumption,
+    /// before processing the test utterance (mahbot-947).
+    warmup_n_embeddings: usize,
 }
 
 /// Track per-variant detection results for reporting.
@@ -1273,6 +1376,20 @@ fn test_detection_samples(
         // Consume verifier warm-up before the test utterance so the latency
         // timer measures only the wake word (mahbot-922, reviewer feedback).
         consume_warmup(&mut ctx);
+        let warmup_n_embeddings = ctx.embedding_ring.len();
+        let warmup_completed =
+            warmup_n_embeddings >= crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS;
+        info!(
+            "  Variant {}/{}: {label} — warm-up {} ({} embeddings)",
+            i + 1,
+            variants.len(),
+            if warmup_completed {
+                "completed ✓"
+            } else {
+                "FAILED ✗"
+            },
+            warmup_n_embeddings,
+        );
         let result = run_streaming_detection(samples, &mut ctx);
         // Propagate the updated adaptive state for the next variant.
         if let Some(ref mut state) = adaptive_state {
@@ -1297,6 +1414,8 @@ fn test_detection_samples(
             agc_converged: ctx.audio_preprocessor.agc_converged(),
             vad_speech_frames: ctx.instrumentation.vad_speech_frames,
             per_frame_scores: ctx.instrumentation.per_frame_scores.clone(),
+            warmup_completed,
+            warmup_n_embeddings,
         });
         info!(
             "  Variant {}/{}: {label} — {} (peak_score={:.4})",
@@ -1533,6 +1652,9 @@ fn run_noise_overlap_test(
                 // Consume verifier warm-up so the latency timer starts at the
                 // noise-overlapped utterance (mahbot-922).
                 consume_warmup(&mut ctx);
+                let warmup_n_embeddings = ctx.embedding_ring.len();
+                let warmup_completed =
+                    warmup_n_embeddings >= crate::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS;
                 let result = run_streaming_detection(&mixed_pcm, &mut ctx);
 
                 // Persist the updated adaptive state for the next variant.
@@ -1555,6 +1677,8 @@ fn run_noise_overlap_test(
                     agc_converged: ctx.audio_preprocessor.agc_converged(),
                     vad_speech_frames: ctx.instrumentation.vad_speech_frames,
                     per_frame_scores: ctx.instrumentation.per_frame_scores.clone(),
+                    warmup_completed,
+                    warmup_n_embeddings,
                 });
             }
 
@@ -2580,6 +2704,8 @@ pub(crate) fn run_internal() {
             "peak_score": pv.peak_score,
             "verifier_score": pv.verifier_score,
             "category": category,
+            "warmup_completed": pv.warmup_completed,
+            "warmup_n_embeddings": pv.warmup_n_embeddings,
         }));
     }
     for pv in &unrelated_metrics.per_variant {
@@ -2589,6 +2715,8 @@ pub(crate) fn run_internal() {
             "peak_score": pv.peak_score,
             "verifier_score": pv.verifier_score,
             "category": "unrelated",
+            "warmup_completed": pv.warmup_completed,
+            "warmup_n_embeddings": pv.warmup_n_embeddings,
         }));
     }
     for pv in &silence_metric.per_variant {
@@ -2598,6 +2726,8 @@ pub(crate) fn run_internal() {
             "peak_score": pv.peak_score,
             "verifier_score": pv.verifier_score,
             "category": "silence",
+            "warmup_completed": pv.warmup_completed,
+            "warmup_n_embeddings": pv.warmup_n_embeddings,
         }));
     }
     for metric in &noise_metrics {
@@ -2608,6 +2738,8 @@ pub(crate) fn run_internal() {
                 "peak_score": pv.peak_score,
                 "verifier_score": pv.verifier_score,
                 "category": "noise",
+                "warmup_completed": pv.warmup_completed,
+                "warmup_n_embeddings": pv.warmup_n_embeddings,
             }));
         }
     }
@@ -2707,6 +2839,8 @@ pub(crate) fn run_internal() {
                     "agc_converged": pv.agc_converged,
                     "vad_speech_frames": pv.vad_speech_frames,
                     "per_frame_scores": pv.per_frame_scores,
+                    "warmup_completed": pv.warmup_completed,
+                    "warmup_n_embeddings": pv.warmup_n_embeddings,
                 })
             }).collect()
         ),
@@ -2931,14 +3065,31 @@ pub(crate) fn run_internal() {
 /// the verifier warm-up period without triggering a false detection.
 ///
 /// This is a standalone unit test (runs as part of `cargo test --features voice-tests`).
-/// It requires voice model files to be present in the cache (from a prior app launch
-/// or benchmark run that downloaded the models).
+/// It requires voice model files AND TTS model files to be present in the cache
+/// (from a prior app launch or benchmark run that downloaded the models).
+///
+/// ## Storage root setup
+/// The test sets [`CONFIG.storage_root`](crate::config::ConfigReload::set_storage_root)
+/// to `~/.mahbot/` so that model directories resolve correctly.  Without this, the
+/// test silently skips (mahbot-947, analyst feedback).
 #[test]
 fn warmup_noise_produces_embeddings() {
+    // Set CONFIG storage root so model paths resolve (mahbot-947).
+    if crate::config::CONFIG.try_storage_root().is_none() {
+        let mahbot_dir = crate::config::default_config_dir()
+            .expect("Cannot resolve home directory for ~/.mahbot");
+        crate::config::CONFIG.set_storage_root(mahbot_dir.clone());
+        eprintln!("CONFIG storage root set to: {}", mahbot_dir.display());
+    }
+
     // Ensure the global voice state is initialized before calling into the
     // detection pipeline, which reads classifier/verifier state from
     // `voice_state()` (mahbot-922, reviewer feedback).
     let _ = super::init_global();
+
+    // Initialise TTS so warm-up can use TTS audio (models may or may not
+    // be cached yet — we check readiness after voice model loading below).
+    let _ = crate::tts::init_global();
 
     // Skip if voice model files aren't available (requires a prior app launch
     // or benchmark run that cached the models).
@@ -2948,6 +3099,17 @@ fn warmup_noise_produces_embeddings() {
             eprintln!("Run the app or E2E benchmark first to cache voice models.");
             return;
         }
+    }
+
+    // Also skip if TTS is not ready — the primary warm-up path is TTS, and
+    // the pink-noise fallback does not produce enough embeddings to satisfy
+    // the assertion below.  We check *after* voice model loading so that a
+    // future refactor that loads TTS models alongside voice models is handled
+    // correctly (mahbot-947, reviewer feedback).
+    if let Err(e) = crate::tts::ensure_ready() {
+        eprintln!("Skipping warmup_noise_produces_embeddings: TTS not ready — {e}");
+        eprintln!("Run the app or E2E benchmark first to cache TTS models.");
+        return;
     }
 
     let mut ctx = super::PipelineCtx::new();
