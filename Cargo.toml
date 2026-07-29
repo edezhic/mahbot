@@ -96,7 +96,6 @@ strum = { version = "0.27", features = ["derive"] }
 # Embeddings
 tokenizers = "0.22"
 candle-core = "0.10.2"
-candle-nn = { version = "0.10.2", features = ["accelerate"] }
 candle-onnx = "0.10.2"
 
 # Neural voice activity detection (replaces RMS-based VAD)
@@ -104,12 +103,6 @@ earshot = "1.1"
 
 # Audio capture for voice assistant
 cpal = "0.15"
-
-# Local audio transcription with Qwen3-ASR
-# NOTE: `vdsp` is macOS-only (Accelerate framework for BLAS operations).
-#       For Linux builds, replace with `blas` only, or use a pure-Rust BLAS
-#       backend if the crate adds one.
-qwen-asr = { version = "0.9.0", default-features = false, features = ["blas", "vdsp"] }
 
 # Audio decoding for local transcriber input (OGG/Opus → raw PCM)
 ogg = "0.9"
@@ -143,6 +136,14 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_IO"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-nn = { version = "0.10.2", features = ["accelerate"] }
+qwen-asr = { version = "0.9.0", default-features = false, features = ["blas", "vdsp"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+candle-nn = "0.10.2"
+qwen-asr = { version = "0.9.0", default-features = false }
 
 [dev-dependencies]
 http = "1.4"
