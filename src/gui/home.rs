@@ -21,7 +21,7 @@ use super::theme;
 use super::widgets::PickOption;
 
 /// Maximum characters allowed in pasted/large text input.
-const MAX_INPUT_CHARS: usize = 4000;
+const MAX_INPUT_CHARS: usize = 100_000;
 
 /// Maximum number of message IDs to keep in the dedup set before pruning.
 const DEDUP_PRUNE_THRESHOLD: usize = 500;
@@ -1305,18 +1305,17 @@ impl HomeState {
             return Task::none();
         }
 
-        // Truncate large pastes.
-        let content = if trimmed.chars().count() > MAX_INPUT_CHARS {
-            let truncated: String = trimmed.chars().take(MAX_INPUT_CHARS).collect();
-            tracing::warn!(
-                chars = trimmed.chars().count(),
-                limit = MAX_INPUT_CHARS,
-                "Home: truncating large input"
-            );
-            truncated
-        } else {
-            trimmed.to_string()
-        };
+        // Reject messages that exceed the maximum character limit instead of
+        // silently truncating. The editor content is preserved so the user
+        // can edit it down.
+        if trimmed.chars().count() > MAX_INPUT_CHARS {
+            let count = trimmed.chars().count();
+            return Task::done(HomeMessage::Toast(ToastMessage::Warning(format!(
+                "Message too long: {count} characters (maximum {MAX_INPUT_CHARS}). Please shorten your message and try again."
+            ))));
+        }
+
+        let content = trimmed.to_string();
 
         let sender = match &self.selected_user {
             Some(s) => s.clone(),
@@ -1859,5 +1858,82 @@ mod tests {
              got selection={:?}",
             cursor_after.selection
         );
+    }
+
+    // ------------------------------------------------------------------
+    // send_message
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_send_message_empty_is_noop() {
+        let mut state = make_home_state("alice", "ws1");
+        // Empty content — should return Task::none() and not change state.
+        state.editor_content = text_editor::Content::new();
+        let _task = state.send_message();
+        assert!(!state.sending);
+        assert!(state.editor_content.text().is_empty());
+
+        // Whitespace-only content should also be treated as empty.
+        state.editor_content = text_editor::Content::with_text("   ");
+        let _task = state.send_message();
+        assert!(!state.sending);
+    }
+
+    #[test]
+    fn test_send_message_within_limit_clears_editor() {
+        let mut state = make_home_state("alice", "ws1");
+        state.editor_content = text_editor::Content::with_text("hello world");
+        let _task = state.send_message();
+        // Editor must be cleared before the GUI_MESSAGE_TX send attempt.
+        assert!(
+            state.editor_content.text().is_empty(),
+            "editor should be cleared after accepting a within-limit message"
+        );
+    }
+
+    #[test]
+    fn test_send_message_at_limit_sends() {
+        let mut state = make_home_state("alice", "ws1");
+        let text = "a".repeat(MAX_INPUT_CHARS);
+        state.editor_content = text_editor::Content::with_text(&text);
+        let _task = state.send_message();
+        // Exactly at the limit: message should be accepted (editor cleared).
+        assert!(
+            state.editor_content.text().is_empty(),
+            "editor should be cleared when message is exactly at the limit"
+        );
+    }
+
+    #[test]
+    fn test_send_message_exceeds_limit_preserves_content() {
+        let mut state = make_home_state("alice", "ws1");
+        let long_text = "a".repeat(MAX_INPUT_CHARS + 1);
+        state.editor_content = text_editor::Content::with_text(&long_text);
+        let _task = state.send_message();
+        // Editor content must be preserved — user needs to edit it down.
+        assert_eq!(
+            state.editor_content.text(),
+            long_text,
+            "editor content must be preserved when message exceeds character limit"
+        );
+        // sending must remain false — the message was not sent.
+        assert!(
+            !state.sending,
+            "sending should remain false after rejected message"
+        );
+    }
+
+    #[test]
+    fn test_send_message_double_send_guard() {
+        let mut state = make_home_state("alice", "ws1");
+        state.sending = true;
+        state.editor_content = text_editor::Content::with_text("hello");
+        let _task = state.send_message();
+        // When sending is true, the message should not be processed at all.
+        assert!(
+            !state.editor_content.text().is_empty(),
+            "editor should not be cleared when double-send guard prevents sending"
+        );
+        assert!(state.sending, "sending should remain true (unchanged)");
     }
 }
