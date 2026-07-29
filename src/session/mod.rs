@@ -8,8 +8,6 @@ use crate::{ChatMessage, ChatRole, Reasoning, ToolCall, ToolResultPayload};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 
-// ── Summarization constants ──────────────────────────────────
-//
 // The summarization LLM call lives in `crate::Agent::summarize` so that all
 // parameters (model, temperature, reasoning_effort, tools, provider routing)
 // are byte-identical to the agent's work loop.  This section keeps only the
@@ -18,29 +16,24 @@ use chrono::{DateTime, Utc};
 /// History-length threshold (in estimated tokens) that triggers summarization.
 ///
 /// This is a conservative default chosen to work across models with varying
-/// context window sizes (128K–1M).  The value of **100,000** estimated tokens
-/// translates to roughly 400K characters of message content under the rough
+/// context window sizes (250K–1M). The value of **200,000** estimated tokens
+/// translates to roughly 800K characters of message content under the rough
 /// `estimate_tokens` formula (~4 chars/token + 4 tokens per-message overhead).
 ///
-/// ## Why 100K?
+/// ## Why 200K?
 ///
-/// The actual token consumption at request time is higher than `estimate_tokens`
+/// The actual token consumption at request time can be higher than `estimate_tokens`
 /// suggests for several reasons:
 ///
 /// * **Tokenization ratio** — Code- and JSON-heavy agent conversations (tool
 ///   calls, structured outputs) can tokenize at ~2.5 chars/token rather than
-///   the estimate's 4 chars/token, making the real token count ~1.6× higher.
+///   the estimate's 4 chars/token.
 /// * **Tool schemas** — The tool definitions injected by `build_chat_request`
 ///   consume ~10–20K actual tokens that are **not** counted by `estimate_tokens`
 ///   (they live in the `tools` field of the request, not in `messages`).
-/// * **System prompt overhead** — The role instruction + workspace context +
-///   ticket context are part of `history` and *are* counted, but for large
-///   workspaces they add non-trivial context consumption.
-/// * **Intra-turn growth** — After summarization the agent loop can add several
-///   more tool-call rounds (each adding assistant + tool-result messages) before
-///   the next threshold check at the start of the following turn.
-///
-pub(crate) const SUMMARIZATION_THRESHOLD: usize = 100_000;
+/// 
+/// Every modern model (as of 2026) supports 250K+ context windows making 200K safe.
+pub(crate) const SUMMARIZATION_THRESHOLD: usize = 200_000;
 
 /// Rough token count for history (~4 chars/token + 4 tokens per-message overhead)
 #[must_use]

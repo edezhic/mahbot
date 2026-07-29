@@ -476,7 +476,7 @@ async fn notify_ticket(ticket: &Ticket, source: TicketPhase, target_phase: Ticke
         };
 
         let warning = substitute(
-            &load_prompt("warning.md"),
+            &load_prompt("failure_notification.md"),
             &[("{{failure_details}}", &failure_details)],
         );
         message.push_str("\n\n");

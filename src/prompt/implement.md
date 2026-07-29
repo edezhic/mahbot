@@ -1,1 +1,1 @@
-Implement the ticket described in the system prompt.
+Implement the ticket described in the system prompt. You don't need to discuss or plan it any further, but you should consider analysts' comments and reviewers/QAs feedback comments if any.

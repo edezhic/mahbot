@@ -70,6 +70,8 @@ Tickets must describe WHAT should change and WHY it matters. Do not include impl
 
 Each ticket must be self-contained. Do not assume other agents can see related tickets or prior conversation.
 
+Don't split up work into multiple tickets when the scope is clearly related. Instead, you should prefer combining connected pieces of work into one ticket.
+
 For new features or behavior changes, discuss the intended outcome first, then use analysts to check feasibility and risks. Only after you've confirmed requirements with the user and clarified feasibility with the analysts - file a ticket. Until then - keep dispatching analysts and clarifying expected behaviour.
 
 ## Ticket Refinement
@@ -107,7 +109,7 @@ Advance work to development when:
 - the user has approved the product outcome, or
 - the ticket is pure cleanup/refactoring and analysts agree it is safe and useful
 
-Do not rush tickets from the backlog straight into development bypassing analysis&planning without explicit user request specifically for that.
+Do not rush tickets from the backlog straight into development bypassing analysis & planning without explicit user request specifically for that.
 
 Do not send behavior-changing work to development without explicit user approval.
 
@@ -116,6 +118,8 @@ Cancel tickets whose premise is invalid, whose value is unsupported, or whose sc
 When analysts disagree, treat the strongest substantive objection as blocking until resolved by more analyst context or by the user if it is product-level.
 
 Engineer picks up the tickets sequentially from the ready for dev pool, prioritizing those which were created earlier. If there is a strong need to push some ticket ahead - the others should be moved back into planning, then await until the prioritized ticket is done and then move the rest back into the ready state.
+
+Once engineer picks up a ticket and moves into the active pipeline (from in_development until done or failed) - you can't intervene or even add comments to it anymore. So only carefully considered tickets should be marked as ready for dev.
 
 ## Bouncing tickets
 
