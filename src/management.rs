@@ -34,7 +34,7 @@ use crate::git_commands::{
     list_new_or_untracked_files, parse_new_files_from_porcelain, run_git_status,
 };
 use crate::message_router;
-use crate::prompt::{load_prompt, substitute};
+use crate::prompt::{load_prompt, load_prompt_static, substitute};
 use crate::role::{DIAGNOSTICS_ROLE, SANITATION_ROLE, SYSTEM_ROLE};
 use crate::session::{manager_agent_id, ticket_agent_id};
 use crate::ticket_buffer;
@@ -56,17 +56,12 @@ const ANALYST_PASS_THRESHOLD: u8 = 7;
 /// Minimum acceptable verification score (0-10) for review and QA phases.
 const REVIEW_QA_THRESHOLD: u8 = 9;
 
-/// Marker appended to auto-diagnostics comments when all checks pass.
-/// Used for circuit-breaker substring matching — must match what
-/// [`CircuitBreakerKind::Diagnostics`]'s trip comment **excludes**.
-const DIAGNOSTICS_PASSED_MARKER: &str = "✅ All diagnostics passed";
-/// Marker appended when diagnostics fail — used for circuit-breaker
-/// substring matching.
-const DIAGNOSTICS_FAILED_MARKER: &str = "❌ Diagnostics failed at";
-/// Marker for sanitation failure comments — [`CircuitBreakerKind::Sanitation`]'s
-/// [`should_trip`](CircuitBreakerKind::should_trip) depends on substring matching
-/// this value, so it must not drift from comment text.
-const SANITATION_FAILED_MARKER: &str = "Sanitation failed";
+// Marker strings loaded from src/prompt/*.md — these are the single source
+// of truth:
+//   - DIAGNOSTICS_PASSED_MARKER   → load_prompt_static("diagnostics_passed.md")
+//   - DIAGNOSTICS_FAILED_MARKER   → load_prompt_static("diagnostics_failed.md")
+//   - SANITATION_FAILED_MARKER    → load_prompt_static("sanitation_failed.md")
+// Do not inline these strings as Rust constants; always use load_prompt_static().
 
 /// Returns the global [`BoardStore`] singleton.
 #[inline]
@@ -138,12 +133,16 @@ impl CircuitBreakerKind {
         let max_count = self.max_count();
         let count = match self {
             Self::TotalComments => comments.len(),
-            Self::Sanitation => {
-                count_matching_comments(comments, SANITATION_ROLE, SANITATION_FAILED_MARKER)
-            }
-            Self::Diagnostics => {
-                count_matching_comments(comments, DIAGNOSTICS_ROLE, DIAGNOSTICS_FAILED_MARKER)
-            }
+            Self::Sanitation => count_matching_comments(
+                comments,
+                SANITATION_ROLE,
+                load_prompt_static("sanitation_failed.md"),
+            ),
+            Self::Diagnostics => count_matching_comments(
+                comments,
+                DIAGNOSTICS_ROLE,
+                load_prompt_static("diagnostics_failed.md"),
+            ),
         };
 
         if count <= max_count {
@@ -1445,7 +1444,7 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
 /// Record a sanitation failure: add a [`SANITATION_ROLE`] comment for the circuit breaker
 /// and clear assigned_to so the ticket can be re-dispatched.
 async fn record_sanitation_failure(ticket_id: &str, reason: impl std::fmt::Display) {
-    let reason_str = format!("{SANITATION_FAILED_MARKER} — {reason}");
+    let reason_str = format!("{} — {reason}", load_prompt_static("sanitation_failed.md"));
     if let Err(e) = crate::turso::with_tx(
         &board().conn,
         ticket_id,
@@ -1624,7 +1623,10 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
         let sys_comment = substitute(
             &load_prompt("sanitation_circuit_breaker_comment.md"),
             &[
-                ("{{sanitation_failed_marker}}", SANITATION_FAILED_MARKER),
+                (
+                    "{{sanitation_failed_marker}}",
+                    load_prompt_static("sanitation_failed.md"),
+                ),
                 ("{{count}}", &count_str),
             ],
         );
@@ -1721,9 +1723,13 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 
     if all_passed {
         comment.push_str("\n\n---\n");
-        comment.push_str(DIAGNOSTICS_PASSED_MARKER);
+        comment.push_str(load_prompt_static("diagnostics_passed.md"));
     } else {
-        let _ = write!(comment, "\n\n---\n{DIAGNOSTICS_FAILED_MARKER} {failed_at}");
+        let _ = write!(
+            comment,
+            "\n\n---\n{} {failed_at}",
+            load_prompt_static("diagnostics_failed.md"),
+        );
     }
 
     (comment, all_passed)
@@ -2298,11 +2304,11 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 ///   re-dispatch by transitioning to the terminal `Failed` phase before the
 ///   breaker could re-read the same trip comment.
 /// * **Sanitation breaker** — filters comments by role `"sanitation_admin"` and content
-///   containing [`SANITATION_FAILED_MARKER`];
+///   containing the value of `load_prompt_static("sanitation_failed.md")`;
 ///   trip comments always use role `SYSTEM_ROLE` (set by this function), so they
 ///   are never counted.
 /// * **Diagnostics breaker** — filters comments by role `"diagnostics"` and content
-///   containing [`DIAGNOSTICS_FAILED_MARKER`];
+///   containing the value of `load_prompt_static("diagnostics_failed.md")`;
 ///   trip comments always use role `SYSTEM_ROLE` (set by this function), so they
 ///   are never counted.
 ///
