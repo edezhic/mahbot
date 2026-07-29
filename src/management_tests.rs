@@ -1,5 +1,5 @@
 use super::*;
-use crate::prompt::{load_prompt, load_prompt_static, substitute};
+use crate::prompt::{load_prompt, substitute};
 use crate::util::test::make_ticket;
 use crate::util::test::{
     create_test_workspace, expect_ticket, expect_ticket_phase, init_management_test_stores,
@@ -49,8 +49,8 @@ fn all_non_total_comments_circuit_breakers_trip_before_total_comments() {
 ///
 /// | Variant | Role filter | Content filter |
 /// |---------|-------------|----------------|
-/// | **Sanitation** | `SYSTEM_ROLE` ≠ `SANITATION_ROLE` ✅ | content does **not** contain `load_prompt_static("sanitation_failed.md")` ✅ |
-/// | **Diagnostics** | `SYSTEM_ROLE` ≠ `DIAGNOSTICS_ROLE` ✅ | content does **not** contain `load_prompt_static("diagnostics_failed.md")` ✅ |
+/// | **Sanitation** | `SYSTEM_ROLE` ≠ `SANITATION_ROLE` ✅ | content does **not** contain `sanitation_failed.md` ✅ |
+/// | **Diagnostics** | `SYSTEM_ROLE` ≠ `DIAGNOSTICS_ROLE` ✅ | content does **not** contain `diagnostics_failed.md` ✅ |
 /// | **TotalComments** | — | — (terminal `Failed` phase prevents re-evaluation) |
 ///
 /// Both Sanitation and Diagnostics breakers now have role-based protection:
@@ -90,9 +90,9 @@ fn circuit_breaker_self_counting_prevention() {
         let msg = CircuitBreakerKind::Diagnostics.trip_message(99, 4);
 
         // The trip message must NOT contain the diagnostics_failed.md marker string.
-        let failed_marker = load_prompt_static("diagnostics_failed.md");
+        let failed_marker = load_prompt("diagnostics_failed.md");
         assert!(
-            !msg.contains(failed_marker),
+            !msg.contains(failed_marker.as_str()),
             "Diagnostics trip message must not contain the diagnostics_failed.md marker string \
              ({:?}), otherwise self-counting would occur on re-evaluation. Trip message: {msg:?}",
             failed_marker,
@@ -592,9 +592,9 @@ fn no_verdict() -> ParallelVerdict {
 /// comment format used for the given breaker variant.
 ///
 /// For [`CircuitBreakerKind::Sanitation`], adds a [`SANITATION_ROLE`] comment
-/// composed from `sanitation_circuit_breaker_comment.md` using `load_prompt_static("sanitation_failed.md")`.
+/// composed from `sanitation_circuit_breaker_comment.md` using `sanitation_failed.md`.
 /// For [`CircuitBreakerKind::Diagnostics`], adds a [`DIAGNOSTICS_ROLE`] comment with
-/// [`DIAGNOSTICS_COMMENT_PREFIX`] and `load_prompt_static("diagnostics_failed.md")` with
+/// [`DIAGNOSTICS_COMMENT_PREFIX`] and `diagnostics_failed.md` with
 /// `{{failed_at}}` = `"test_step"`.
 async fn add_breaker_failure(kind: CircuitBreakerKind, ticket_id: &str) {
     let (role, comment) = match kind {
@@ -605,7 +605,7 @@ async fn add_breaker_failure(kind: CircuitBreakerKind, ticket_id: &str) {
                 &[
                     (
                         "{{sanitation_failed_marker}}",
-                        load_prompt_static("sanitation_failed.md"),
+                        load_prompt("sanitation_failed.md").as_str(),
                     ),
                     ("{{count}}", "1"),
                 ],
@@ -615,7 +615,7 @@ async fn add_breaker_failure(kind: CircuitBreakerKind, ticket_id: &str) {
             DIAGNOSTICS_ROLE,
             format!(
                 "{DIAGNOSTICS_COMMENT_PREFIX}\n\n---\n{} test_step",
-                load_prompt_static("diagnostics_failed.md"),
+                load_prompt("diagnostics_failed.md"),
             ),
         ),
         CircuitBreakerKind::TotalComments => (
@@ -989,10 +989,14 @@ async fn process_sanitation_verdict_cases() {
         sanit_markers: &'static [&'static str],
         /// Substrings required in a [`SANITATION_ROLE`] comment (the marker
         /// comment written when sanitation fails). `None` = no marker comment.
-        sys_markers: Option<Vec<&'static str>>,
+        sys_markers: Option<&'static [&'static str]>,
     }
 
     init_management_test_stores().await;
+
+    let sanitation_failed_marker: &'static str = load_prompt("sanitation_failed.md").leak();
+    let sys_markers_val: &'static [&'static str] =
+        Box::leak(vec![sanitation_failed_marker].into_boxed_slice());
 
     let clean = crate::SanitationVerdict {
         pass: true,
@@ -1027,7 +1031,7 @@ async fn process_sanitation_verdict_cases() {
             expected_phase: TicketPhase::ReadyForDevelopment,
             expected_pipeline_reservation: true,
             sanit_markers: &["node_modules/"],
-            sys_markers: Some(vec![load_prompt_static("sanitation_failed.md")]),
+            sys_markers: Some(sys_markers_val),
         },
         Case {
             name: "pass=true with reviewed files → SanitationPassed (files reviewed)",
@@ -1101,8 +1105,8 @@ async fn process_sanitation_verdict_cases() {
 /// | Scenario | Commands | Expected Phase | Pipeline Reservation | Comment Contains |
 /// |---|---|---|---|---|
 /// | No diagnostics commands | None (unset) | DiagnosticsDone | false | "No diagnostics commands are configured" |
-/// | Diagnostics failure | `false` | ReadyForDevelopment | true | `DIAGNOSTICS_COMMENT_PREFIX` + `load_prompt_static("diagnostics_failed.md")` |
-/// | Diagnostics pass | `true`, ... | DiagnosticsDone | false | `DIAGNOSTICS_COMMENT_PREFIX` + `load_prompt_static("diagnostics_passed.md")` |
+/// | Diagnostics failure | `false` | ReadyForDevelopment | true | `DIAGNOSTICS_COMMENT_PREFIX` + `diagnostics_failed.md` |
+/// | Diagnostics pass | `true`, ... | DiagnosticsDone | false | `DIAGNOSTICS_COMMENT_PREFIX` + `diagnostics_passed.md` |
 /// | DB error (corrupt JSON) | N/A (corrupt) | DiagnosticsDone | false | "database error" |
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
@@ -1120,10 +1124,21 @@ async fn dispatch_diagnostics_cases() {
         expected_phase: TicketPhase,
         expected_pipeline_reservation: bool,
         /// Substrings that must all be present in a DIAGNOSTICS_ROLE comment.
-        expected_comment_contains: Vec<&'static str>,
+        expected_comment_contains: &'static [&'static str],
     }
 
     init_management_test_stores().await;
+
+    let diagnostics_failed_marker: &'static str = load_prompt("diagnostics_failed.md").leak();
+    let diagnostics_passed_marker: &'static str = load_prompt("diagnostics_passed.md").leak();
+
+    const NO_DIAG_CMDS: &[&str] = &["No diagnostics commands are configured"];
+    const DB_ERR: &[&str] = &["database error"];
+
+    let fail_comment_contains: &'static [&'static str] =
+        Box::leak(vec![DIAGNOSTICS_COMMENT_PREFIX, diagnostics_failed_marker].into_boxed_slice());
+    let pass_comment_contains: &'static [&'static str] =
+        Box::leak(vec![DIAGNOSTICS_COMMENT_PREFIX, diagnostics_passed_marker].into_boxed_slice());
 
     let fail_cmds = DiagnosticsCommands {
         format: Some("false".to_string()),
@@ -1145,7 +1160,7 @@ async fn dispatch_diagnostics_cases() {
             needs_tempdir: false,
             expected_phase: TicketPhase::DiagnosticsDone,
             expected_pipeline_reservation: false,
-            expected_comment_contains: vec!["No diagnostics commands are configured"],
+            expected_comment_contains: NO_DIAG_CMDS,
         },
         Case {
             name: "diagnostics failure",
@@ -1156,10 +1171,7 @@ async fn dispatch_diagnostics_cases() {
             needs_tempdir: true,
             expected_phase: TicketPhase::ReadyForDevelopment,
             expected_pipeline_reservation: true,
-            expected_comment_contains: vec![
-                DIAGNOSTICS_COMMENT_PREFIX,
-                load_prompt_static("diagnostics_failed.md"),
-            ],
+            expected_comment_contains: fail_comment_contains,
         },
         Case {
             name: "diagnostics all pass",
@@ -1170,10 +1182,7 @@ async fn dispatch_diagnostics_cases() {
             needs_tempdir: true,
             expected_phase: TicketPhase::DiagnosticsDone,
             expected_pipeline_reservation: false,
-            expected_comment_contains: vec![
-                DIAGNOSTICS_COMMENT_PREFIX,
-                load_prompt_static("diagnostics_passed.md"),
-            ],
+            expected_comment_contains: pass_comment_contains,
         },
         Case {
             name: "diagnostics DB error",
@@ -1184,7 +1193,7 @@ async fn dispatch_diagnostics_cases() {
             needs_tempdir: false,
             expected_phase: TicketPhase::DiagnosticsDone,
             expected_pipeline_reservation: false,
-            expected_comment_contains: vec!["database error"],
+            expected_comment_contains: DB_ERR,
         },
     ];
 

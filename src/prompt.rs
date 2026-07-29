@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
@@ -37,50 +36,6 @@ pub(crate) fn load_prompt(asset_key: &str) -> String {
              Create the file at src/prompt/{asset_key} and rebuild."
         );
         format!("[PROMPT MISSING: src/prompt/{asset_key}]")
-    }
-}
-
-/// Load a prompt asset as a `&'static str`, panicking on missing files.
-///
-/// Use this for programmatic marker strings where:
-/// - Zero-allocation `&'static str` is required (unlike [`load_prompt`] which
-///   allocates a `String`)
-/// - Silent fallback is unacceptable — deletion of the file should cause a
-///   clear compile-time-equivalent panic rather than a silent placeholder
-///
-/// In release mode the embedded `&'static [u8]` is returned directly (zero
-/// allocation). In debug mode the file is read from disk — a one-time leak
-/// per unique key (~60 bytes total for the 3 marker keys) is accepted.
-///
-/// # Panics
-///
-/// Panics if the asset key is not found in the embedded index.
-#[must_use]
-pub(crate) fn load_prompt_static(asset_key: &str) -> &'static str {
-    match PromptAssets::get(asset_key) {
-        Some(file) => match file.data {
-            Cow::Borrowed(bytes) => {
-                // Release mode / debug-embed: file data is embedded directly
-                // as &'static [u8] — zero allocation conversion.
-                std::str::from_utf8(bytes).expect("embedded prompt must be valid UTF-8")
-            }
-            Cow::Owned(vec) => {
-                // Debug mode (without debug-embed): file is read from disk.
-                // Leak once to get &'static str (~20 bytes per unique key,
-                // reclaimed by OS on process exit).
-                Box::leak(
-                    String::from_utf8(vec)
-                        .expect("embedded prompt must be valid UTF-8")
-                        .into_boxed_str(),
-                )
-            }
-        },
-        None => {
-            panic!(
-                "Required prompt asset '{asset_key}' not found. \
-                 Create src/prompt/{asset_key} and rebuild."
-            );
-        }
     }
 }
 
@@ -513,40 +468,5 @@ mod tests {
             result,
             "[PROMPT MISSING: src/prompt/this_file_does_not_exist.md]",
         );
-    }
-
-    #[test]
-    fn load_prompt_static_returns_static_str() {
-        // load_prompt_static must return a valid &'static str for real assets.
-        let s: &'static str = load_prompt_static("diagnostics_failed.md");
-        assert_eq!(s, "❌ Diagnostics failed at");
-    }
-
-    #[test]
-    fn required_marker_prompt_files_exist() {
-        // Manifest guard: these three marker files are the single source of truth
-        // for circuit-breaker substring matching. Deleting any of them would
-        // silently break circuit-breaker logic without a compile error, only
-        // surfacing as a runtime panic when the circuit-breaker code path
-        // executes. This test verifies their existence by loading each one.
-        for key in &[
-            "diagnostics_failed.md",
-            "diagnostics_passed.md",
-            "sanitation_failed.md",
-        ] {
-            let content = load_prompt_static(key);
-            assert!(
-                !content.is_empty(),
-                "Required marker prompt '{key}' is empty. \
-                 If you deleted this file, circuit-breaker substring matching \
-                 will silently break — recreate the file.",
-            );
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "Required prompt asset")]
-    fn load_prompt_static_panics_on_missing() {
-        let _ = load_prompt_static("this_file_does_not_exist.md");
     }
 }
