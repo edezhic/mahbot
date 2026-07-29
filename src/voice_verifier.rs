@@ -26,6 +26,7 @@
 //!   training so the verifier learns to reject confusable phrases.
 
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -82,12 +83,13 @@ pub(crate) const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.948;
 
 /// L2 regularization strength (lambda).
 ///
-/// Reduced from 1.0 to 0.01 (mahbot-854) because the previous strong
-/// regularization combined with extreme class imbalance (17:1 negatives-to-
-/// positives) caused the model to learn constant near-zero outputs.  With
-/// class-weighted loss now compensating for imbalance, weaker regularization
-/// allows the model to develop discriminative weights.
-pub(crate) const L2_LAMBDA: f32 = 0.01;
+/// Reduced from 0.01 to 0.001 (mahbot-949) because the previous 0.01
+/// regularization pulled weights to zero, overpowering the weak discriminative
+/// signal in the homogeneous 96-dim embedding space.  The class-weighted loss
+/// already provides regularization, and the 97-parameter model on ~200 training
+/// examples does not overfit meaningfully.  The early stopping mechanism
+/// (patience=100) provides additional protection against overfitting.
+pub(crate) const L2_LAMBDA: f32 = 0.001;
 
 /// Learning rate for logistic regression SGD training (mahbot-901).
 ///
@@ -102,6 +104,22 @@ pub(crate) const LOGISTIC_LEARNING_RATE: f32 = 0.01;
 /// so 1000 iterations suffice.  The MLP needs 2000 iterations due to the deeper
 /// non-linear layers.
 pub(crate) const LOGISTIC_MAX_ITER: usize = 1000;
+
+/// Fraction of sequences held out for validation (80/20 train/val split).
+///
+/// Split is per-sequence (avoiding data leakage from overlapping windows) with
+/// stratification preserving both pos:neg ratio AND negative tier proportions
+/// (confusable/unrelated/ambient/owner).  Falls back to per-window random split
+/// when per-sequence split produces insufficient validation data.
+pub(crate) const VALIDATION_SPLIT: f32 = 0.2;
+
+/// Early stopping patience: stop if validation loss hasn't improved for this
+/// many iterations.  Set to 100 (10% of the 1000-iteration budget), matching
+/// the Conv1D classifier's relative patience ratio (15% of 100 epochs).
+pub(crate) const EARLY_STOP_PATIENCE: usize = 100;
+
+/// Log training and validation loss every N iterations.
+const LOG_LOSS_INTERVAL: usize = 50;
 
 /// How much to upweight confusable negative examples during verifier training.
 ///
@@ -359,7 +377,9 @@ impl VoiceVerifier {
         clippy::too_many_arguments,
         clippy::too_many_lines,
         clippy::similar_names,
-        clippy::cast_precision_loss
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
     )]
     fn train_logistic_inner(
         positive_sequences: &[EmbeddingSequence],
@@ -371,6 +391,14 @@ impl VoiceVerifier {
         max_iter: usize,
         rng_seed: Option<u64>,
     ) -> Self {
+        // Per-sequence metadata for stratified train/val split (mahbot-949).
+        struct SeqInfo {
+            start: usize,
+            count: usize,
+            is_positive: bool,
+            source: crate::embedding_sequence::Source,
+        }
+
         // Early exit if either side has zero frames to avoid training on empty data.
         // Both positive and negative examples are required (mahbot-902).
         let total_pos_frames: usize = positive_sequences.iter().map(|s| s.embeddings.len()).sum();
@@ -401,7 +429,9 @@ impl VoiceVerifier {
         // Supports two input modes:
         // 1. Per-frame 96-dim input: form stride-1 windows via windowing functions.
         // 2. Pre-windowed 288-dim input (e.g., test data): use directly.
-
+        //
+        // Track per-sequence metadata for stratified train/val split.
+        let mut seq_infos: Vec<SeqInfo> = Vec::new();
         let mut windows: Vec<Vec<f32>> = Vec::new();
         let mut window_labels: Vec<f32> = Vec::new();
         let mut window_weights: Vec<f32> = Vec::new();
@@ -409,22 +439,40 @@ impl VoiceVerifier {
         // Positive sequences
         for seq in positive_sequences {
             let seq_windows = form_sequence_windows(&seq.embeddings);
+            let start = windows.len();
             for w in seq_windows {
                 windows.push(w);
                 window_labels.push(1.0);
                 window_weights.push(0.0); // placeholder — set to class_weight below
             }
+            if windows.len() > start {
+                seq_infos.push(SeqInfo {
+                    start,
+                    count: windows.len() - start,
+                    is_positive: true,
+                    source: seq.source,
+                });
+            }
         }
-        let n_pos_windows = windows.len();
+        let n_pos_windows = window_labels.iter().filter(|&&l| l > 0.5).count();
 
         // Negative sequences
         for (i, seq) in negative_sequences.iter().enumerate() {
             let seq_windows = form_sequence_windows(&seq.embeddings);
             let seq_weight = weights_to_use.map_or(1.0, |pw| pw[i]);
+            let start = windows.len();
             for w in seq_windows {
                 windows.push(w);
                 window_labels.push(0.0);
                 window_weights.push(seq_weight);
+            }
+            if windows.len() > start {
+                seq_infos.push(SeqInfo {
+                    start,
+                    count: windows.len() - start,
+                    is_positive: false,
+                    source: seq.source,
+                });
             }
         }
         let n_neg_windows = window_labels.len() - n_pos_windows;
@@ -479,22 +527,187 @@ impl VoiceVerifier {
             }
         }
 
-        let (scaler_mean, scaler_std) = compute_standard_scaler(&windows);
-        let mut scaled = windows.clone();
-        for w in &mut scaled {
-            for (j, v) in w.iter_mut().enumerate() {
-                let std = scaler_std[j].max(1e-10);
-                *v = (*v - scaler_mean[j]) / std;
+        // ── Train/validation split ──
+        // Per-sequence stratified split: preserve pos:neg ratio AND negative
+        // tier proportions.  Falls back to per-window random split if
+        // per-sequence split produces insufficient validation data.
+        let mut rng: StdRng = if let Some(seed) = rng_seed {
+            StdRng::seed_from_u64(seed)
+        } else {
+            StdRng::seed_from_u64(rand::random())
+        };
+
+        // Group sequence indices by class and source tier.
+        let mut pos_indices: Vec<usize> = Vec::new();
+        let mut neg_sources: std::collections::HashMap<
+            crate::embedding_sequence::Source,
+            Vec<usize>,
+        > = std::collections::HashMap::new();
+        for (i, info) in seq_infos.iter().enumerate() {
+            if info.is_positive {
+                pos_indices.push(i);
+            } else {
+                neg_sources.entry(info.source).or_default().push(i);
             }
         }
 
-        let (weights, bias) = train_logistic_sgd(
-            &scaled,
-            &window_labels,
-            &window_weights,
+        // Shuffle and assign to train/val, stratified by group.
+        let mut tr_seq_idx: Vec<usize> = Vec::new();
+        let mut val_seq_idx: Vec<usize> = Vec::new();
+
+        pos_indices.shuffle(&mut rng);
+        let n_pos_train = ((pos_indices.len() as f32) * (1.0 - VALIDATION_SPLIT)).ceil() as usize;
+        for (j, &idx) in pos_indices.iter().enumerate() {
+            if j < n_pos_train {
+                tr_seq_idx.push(idx);
+            } else {
+                val_seq_idx.push(idx);
+            }
+        }
+
+        for indices in neg_sources.values() {
+            let mut shuffled = indices.clone();
+            shuffled.shuffle(&mut rng);
+            let n_train = ((shuffled.len() as f32) * (1.0 - VALIDATION_SPLIT)).ceil() as usize;
+            for (j, &idx) in shuffled.iter().enumerate() {
+                if j < n_train {
+                    tr_seq_idx.push(idx);
+                } else {
+                    val_seq_idx.push(idx);
+                }
+            }
+        }
+
+        // Build train/val arrays from the split sequence indices.
+        let mut tr_windows: Vec<Vec<f32>> = Vec::new();
+        let mut tr_labels: Vec<f32> = Vec::new();
+        let mut tr_weights: Vec<f32> = Vec::new();
+        let mut val_windows: Vec<Vec<f32>> = Vec::new();
+        let mut val_labels: Vec<f32> = Vec::new();
+        let mut val_weights: Vec<f32> = Vec::new();
+
+        for &idx in &tr_seq_idx {
+            let info = &seq_infos[idx];
+            for i in info.start..info.start + info.count {
+                tr_windows.push(windows[i].clone());
+                tr_labels.push(window_labels[i]);
+                tr_weights.push(window_weights[i]);
+            }
+        }
+        for &idx in &val_seq_idx {
+            let info = &seq_infos[idx];
+            for i in info.start..info.start + info.count {
+                val_windows.push(windows[i].clone());
+                val_labels.push(window_labels[i]);
+                val_weights.push(window_weights[i]);
+            }
+        }
+
+        // If per-sequence split produced insufficient validation data, fall
+        // back to per-window random split (matching Conv1D classifier behavior).
+        let (
+            tr_windows,
+            tr_labels,
+            tr_weights,
+            val_windows,
+            val_labels,
+            val_weights,
+            used_sequence_split,
+        ) = if val_windows.is_empty() || tr_windows.len() < 2 {
+            // Per-window fallback: random shuffle + 80/20 split
+            let total = windows.len();
+            let n_val = ((total as f32) * VALIDATION_SPLIT).ceil() as usize;
+            let n_val = n_val.max(1).min(total - 1);
+            let mut idx: Vec<usize> = (0..total).collect();
+            idx.shuffle(&mut rng);
+            let mut tr_f: Vec<Vec<f32>> = Vec::with_capacity(total - n_val);
+            let mut tr_l: Vec<f32> = Vec::with_capacity(total - n_val);
+            let mut tr_w: Vec<f32> = Vec::with_capacity(total - n_val);
+            let mut va_f: Vec<Vec<f32>> = Vec::with_capacity(n_val);
+            let mut va_l: Vec<f32> = Vec::with_capacity(n_val);
+            let mut va_w: Vec<f32> = Vec::with_capacity(n_val);
+            for (j, &i) in idx.iter().enumerate() {
+                if j < n_val {
+                    va_f.push(windows[i].clone());
+                    va_l.push(window_labels[i]);
+                    va_w.push(window_weights[i]);
+                } else {
+                    tr_f.push(windows[i].clone());
+                    tr_l.push(window_labels[i]);
+                    tr_w.push(window_weights[i]);
+                }
+            }
+            (tr_f, tr_l, tr_w, va_f, va_l, va_w, false)
+        } else {
+            (
+                tr_windows,
+                tr_labels,
+                tr_weights,
+                val_windows,
+                val_labels,
+                val_weights,
+                true,
+            )
+        };
+
+        // ── Fit StandardScaler on positive training windows only ──
+        // (mahbot-949 Fix 3: avoids mixing class distributions and reducing
+        // inter-class separation before the logistic regression sees the data).
+        let pos_tr_indices: Vec<usize> = tr_labels
+            .iter()
+            .enumerate()
+            .filter(|&(_, &l)| l > 0.5)
+            .map(|(i, _)| i)
+            .collect();
+        let pos_tr_windows: Vec<Vec<f32>> = pos_tr_indices
+            .iter()
+            .map(|&i| tr_windows[i].clone())
+            .collect();
+        let (scaler_mean, scaler_std) = if pos_tr_windows.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            compute_standard_scaler(&pos_tr_windows)
+        };
+
+        // Apply the scaler (fitted on positive training only) to ALL windows.
+        // Matches inference: only scale dimensions with positive std; leave
+        // zero-variance dimensions unchanged (mahbot-949).
+        let apply_scaler = |fw: &[Vec<f32>]| -> Vec<Vec<f32>> {
+            let use_scaler = !scaler_mean.is_empty() && !scaler_std.is_empty();
+            fw.iter()
+                .map(|f| {
+                    let mut scaled = f.clone();
+                    if use_scaler {
+                        for (j, v) in scaled.iter_mut().enumerate() {
+                            if scaler_std[j] > 0.0 {
+                                *v = (*v - scaler_mean[j]) / scaler_std[j];
+                            }
+                        }
+                    }
+                    scaled
+                })
+                .collect()
+        };
+
+        let tr_scaled = apply_scaler(&tr_windows);
+        let val_scaled = if val_windows.is_empty() {
+            Vec::new()
+        } else {
+            apply_scaler(&val_windows)
+        };
+
+        // ── Train with validation, early stopping, and LR schedule ──
+        let (weights, bias) = train_logistic_sgd_with_val(
+            &tr_scaled,
+            &tr_labels,
+            &tr_weights,
+            &val_scaled,
+            &val_labels,
+            &val_weights,
             l2_lambda,
             learning_rate,
             max_iter,
+            EARLY_STOP_PATIENCE,
             rng_seed,
         );
         let verifier = Self {
@@ -506,38 +719,109 @@ impl VoiceVerifier {
             threshold,
         };
 
-        // Diagnostics
-        {
-            let mut pos_scores = Vec::with_capacity(n_pos_windows);
-            let mut neg_scores = Vec::with_capacity(n_neg_windows);
-            for (emb, &lbl) in windows.iter().zip(window_labels.iter()) {
-                let score = verifier.predict(emb);
-                if lbl > 0.5 {
-                    pos_scores.push(score);
-                } else {
-                    neg_scores.push(score);
-                }
-            }
-            let pos_mean = if pos_scores.is_empty() {
-                0.0
-            } else {
-                pos_scores.iter().sum::<f32>() / n_pos_windows as f32
-            };
-            let neg_mean = if neg_scores.is_empty() {
-                0.0
-            } else {
-                neg_scores.iter().sum::<f32>() / n_neg_windows as f32
-            };
-            let pos_min = pos_scores.iter().copied().fold(f32::INFINITY, f32::min);
-            let pos_max = pos_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let neg_min = neg_scores.iter().copied().fold(f32::INFINITY, f32::min);
-            let neg_max = neg_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            info!(
-                "Verifier training: {n_pos_windows} pos + {n_neg_windows} neg windows, class_weight={class_weight:.2}, L2={l2_lambda} | pos: mean={pos_mean:.4} [{pos_min:.4},{pos_max:.4}] neg: mean={neg_mean:.4} [{neg_min:.4},{neg_max:.4}]"
-            );
-        }
+        // Diagnostics: log training statistics and check discrimination.
+        Self::log_training_diagnostics(
+            &verifier,
+            &tr_windows,
+            &tr_labels,
+            &val_windows,
+            &val_labels,
+            used_sequence_split,
+            class_weight,
+            l2_lambda,
+        );
 
         verifier
+    }
+
+    /// Log post-training diagnostics and check for discrimination collapse.
+    ///
+    /// Computes per-class mean scores on train and validation sets, emits an
+    /// `info!` log, and warns if the validation pos/neg score ratio is below
+    /// 1.1 (indicating a near-constant predictor — mahbot-949 Fix 6).
+    #[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+    fn log_training_diagnostics(
+        verifier: &Self,
+        tr_windows: &[Vec<f32>],
+        tr_labels: &[f32],
+        val_windows: &[Vec<f32>],
+        val_labels: &[f32],
+        used_sequence_split: bool,
+        class_weight: f32,
+        l2_lambda: f32,
+    ) {
+        let n_tr_pos = tr_labels.iter().filter(|&&l| l > 0.5).count();
+        let n_tr_neg = tr_labels.len() - n_tr_pos;
+        let n_val_pos = val_labels.iter().filter(|&&l| l > 0.5).count();
+        let n_val_neg = val_labels.len().saturating_sub(n_val_pos);
+
+        let mut pos_scores_tr = Vec::new();
+        let mut neg_scores_tr = Vec::new();
+        for (emb, &lbl) in tr_windows.iter().zip(tr_labels.iter()) {
+            let score = verifier.predict(emb);
+            if lbl > 0.5 {
+                pos_scores_tr.push(score);
+            } else {
+                neg_scores_tr.push(score);
+            }
+        }
+        let pos_mean_tr = if pos_scores_tr.is_empty() {
+            0.0
+        } else {
+            pos_scores_tr.iter().sum::<f32>() / pos_scores_tr.len() as f32
+        };
+        let neg_mean_tr = if neg_scores_tr.is_empty() {
+            0.0
+        } else {
+            neg_scores_tr.iter().sum::<f32>() / neg_scores_tr.len() as f32
+        };
+
+        // Validation scores (if val data exists)
+        let mut pos_scores_val = Vec::new();
+        let mut neg_scores_val = Vec::new();
+        for (emb, &lbl) in val_windows.iter().zip(val_labels.iter()) {
+            let score = verifier.predict(emb);
+            if lbl > 0.5 {
+                pos_scores_val.push(score);
+            } else {
+                neg_scores_val.push(score);
+            }
+        }
+        let pos_mean_val = if pos_scores_val.is_empty() {
+            0.0
+        } else {
+            pos_scores_val.iter().sum::<f32>() / pos_scores_val.len() as f32
+        };
+        let neg_mean_val = if neg_scores_val.is_empty() {
+            0.0
+        } else {
+            neg_scores_val.iter().sum::<f32>() / neg_scores_val.len() as f32
+        };
+
+        let split_method = if used_sequence_split {
+            "per-sequence"
+        } else {
+            "per-window"
+        };
+        info!(
+            "Verifier training ({split_method} split): \
+             train={n_tr_pos}+{n_tr_neg} val={n_val_pos}+{n_val_neg} windows, \
+             class_weight={class_weight:.2}, L2={l2_lambda} | \
+             train pos: mean={pos_mean_tr:.4} neg: mean={neg_mean_tr:.4} | \
+             val pos: mean={pos_mean_val:.4} neg: mean={neg_mean_val:.4}"
+        );
+
+        // Discrimination check (mahbot-949 Fix 6): warn if val pos/neg
+        // ratio is too low (indicating collapsed predictor).
+        if !pos_scores_val.is_empty() && !neg_scores_val.is_empty() {
+            let ratio = pos_mean_val / neg_mean_val.max(1e-10);
+            if ratio < 1.1 {
+                warn!(
+                    "Verifier discrimination low: mean_pos_val/mean_neg_val={ratio:.4} (< 1.1). \
+                     The verifier may have collapsed to a near-constant predictor."
+                );
+            }
+        }
     }
 
     /// Convenience: train a verifier using the given positive embeddings and
@@ -852,7 +1136,228 @@ fn compute_standard_scaler(features: &[Vec<f32>]) -> (Vec<f32>, Vec<f32>) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Synthetic negatives
+// Logistic regression SGD with validation + early stopping
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Train a logistic regression classifier with validation-based early stopping
+/// and LR step decay (mahbot-949).
+///
+/// Same architecture as [`train_logistic_sgd`] but accepts separate validation
+/// data and implements:
+/// - Early stopping: stops if validation loss hasn't improved for `patience` steps
+/// - Loss logging: logs train and val loss every `LOG_LOSS_INTERVAL` iterations
+/// - LR step decay: halves the learning rate unconditionally every 200 iterations
+///
+/// When `val_features` is empty, runs without early stopping (full `max_iter`
+/// iterations), matching the original `train_logistic_sgd` behavior.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+fn train_logistic_sgd_with_val(
+    features: &[Vec<f32>],     // scaled training features (n × 96)
+    labels: &[f32],            // training labels: 0.0 or 1.0
+    sample_weights: &[f32],    // per-sample weight (n)
+    val_features: &[Vec<f32>], // scaled validation features (may be empty)
+    val_labels: &[f32],        // validation labels
+    val_weights: &[f32],       // validation per-sample weights
+    l2_lambda: f32,
+    learning_rate: f32,
+    max_iter: usize,
+    patience: usize,
+    rng_seed: Option<u64>,
+) -> (Vec<f32>, f32) {
+    let n = features.len();
+    if n == 0 {
+        return (Vec::new(), 0.0);
+    }
+    let dim = features[0].len();
+    if dim == 0 {
+        return (Vec::new(), 0.0);
+    }
+
+    let n_f32 = n as f32;
+    let use_val = !val_features.is_empty() && !val_labels.is_empty();
+
+    // ── Initialize weights to small random values (bias starts at 0) ──
+    let mut rng: StdRng = if let Some(seed) = rng_seed {
+        StdRng::seed_from_u64(seed)
+    } else {
+        StdRng::seed_from_u64(rand::random())
+    };
+
+    // Xavier-like init for logistic: sqrt(1/dim) scale (Glorot for fan-in only).
+    let init_scale = (1.0 / dim as f32).sqrt();
+    let mut weights = vec![0.0; dim];
+    for w in &mut weights {
+        *w = rng.random::<f32>() * 2.0 * init_scale - init_scale;
+    }
+    let mut bias = 0.0;
+
+    // ── Early stopping state ──
+    let mut best_weights = weights.clone();
+    let mut best_bias = bias;
+    let mut best_loss = f32::INFINITY;
+    let mut stall_count = 0;
+    let mut current_lr = learning_rate;
+
+    // ── SGD training loop ──
+    for iter in 0..max_iter {
+        // LR step decay: halve every 200 iterations (mahbot-949 Fix 5).
+        if iter > 0 && iter % 200 == 0 {
+            current_lr *= 0.5;
+        }
+
+        let mut dw = vec![0.0; dim];
+        let mut db = 0.0;
+
+        for i in 0..n {
+            // Forward: z = w·x + b → sigmoid
+            let mut z = bias;
+            for d in 0..dim {
+                z += weights[d] * features[i][d];
+            }
+            let pred = sigmoid(z);
+            let y = labels[i];
+            let w_i = sample_weights[i];
+
+            // Gradient of binary cross-entropy (weighted):
+            // dL/dz = w_i * (pred - y)
+            let dz = w_i * (pred - y);
+
+            // dL/dw_d = dz * x_d
+            for d in 0..dim {
+                dw[d] += dz * features[i][d];
+            }
+            db += dz;
+        }
+
+        // Average gradients over batch.
+        for d in &mut dw {
+            *d /= n_f32;
+        }
+        db /= n_f32;
+
+        // Add L2 regularization gradient: λ * w (bias not regularized).
+        for d in 0..dim {
+            dw[d] += l2_lambda * weights[d];
+        }
+
+        for d in 0..dim {
+            weights[d] -= current_lr * dw[d];
+        }
+        bias -= current_lr * db;
+
+        // ── Validation loss + early stopping ──
+        if use_val {
+            let val_loss = compute_weighted_bce_loss(
+                val_features,
+                val_labels,
+                val_weights,
+                &weights,
+                bias,
+                l2_lambda,
+                false, // validation loss excludes L2 term (mahbot-949)
+            );
+            let train_loss = compute_weighted_bce_loss(
+                features,
+                labels,
+                sample_weights,
+                &weights,
+                bias,
+                l2_lambda,
+                true, // training loss includes L2 for monitoring consistency
+            );
+
+            if iter % LOG_LOSS_INTERVAL == 0 {
+                info!(
+                    "Verifier SGD: iter={iter} train_loss={train_loss:.6} val_loss={val_loss:.6} lr={current_lr:.6}",
+                );
+            }
+
+            if val_loss < best_loss - 1e-8 {
+                best_loss = val_loss;
+                best_weights.clone_from(&weights);
+                best_bias = bias;
+                stall_count = 0;
+            } else {
+                stall_count += 1;
+                if stall_count >= patience {
+                    info!(
+                        "Verifier SGD early stop at iter={iter}: best_val_loss={best_loss:.6} (patience={patience})",
+                    );
+                    weights.copy_from_slice(&best_weights);
+                    bias = best_bias;
+                    break;
+                }
+            }
+        } else if iter % LOG_LOSS_INTERVAL == 0 {
+            let train_loss = compute_weighted_bce_loss(
+                features,
+                labels,
+                sample_weights,
+                &weights,
+                bias,
+                l2_lambda,
+                true, // training loss includes L2 for monitoring consistency
+            );
+            info!("Verifier SGD: iter={iter} train_loss={train_loss:.6} lr={current_lr:.6}",);
+        }
+    }
+
+    // If early stopping never triggered and we used validation, restore best.
+    if use_val && stall_count < patience {
+        weights.copy_from_slice(&best_weights);
+        bias = best_bias;
+    }
+
+    (weights, bias)
+}
+
+/// Compute the weighted binary cross-entropy loss.
+///
+/// When `use_l2` is true, includes the L2 regularization term `(λ/2)·||w||²`.
+/// Validation loss should NOT include the L2 term, since the regularization
+/// penalty shrinks as weights decay and would artificially lower the validation
+/// loss, biasing early stopping decisions (mahbot-949).
+#[allow(clippy::cast_precision_loss)]
+fn compute_weighted_bce_loss(
+    features: &[Vec<f32>],
+    labels: &[f32],
+    sample_weights: &[f32],
+    weights: &[f32],
+    bias: f32,
+    l2_lambda: f32,
+    use_l2: bool,
+) -> f32 {
+    let n = features.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let mut total = 0.0f32;
+    for i in 0..n {
+        let mut z = bias;
+        for d in 0..weights.len() {
+            z += weights[d] * features[i][d];
+        }
+        let pred = sigmoid(z);
+        let eps = 1e-10;
+        total += sample_weights[i]
+            * (labels[i] * (pred + eps).ln() + (1.0 - labels[i]) * (1.0 - pred + eps).ln());
+    }
+    let bce = -total / n as f32;
+    if use_l2 {
+        // Add L2 regularization term: (λ/2) * ||w||²
+        let l2_term = 0.5 * l2_lambda * weights.iter().map(|w| w * w).sum::<f32>();
+        bce + l2_term
+    } else {
+        bce
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Logistic regression SGD (original, no validation)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Train a logistic regression classifier on scaled 96-dim features using SGD
@@ -870,7 +1375,12 @@ fn compute_standard_scaler(features: &[Vec<f32>]) -> (Vec<f32>, Vec<f32>) {
 ///
 /// # Returns
 /// `(weights, bias)` — the trained logistic regression parameters.
-#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+#[cfg_attr(not(test), expect(dead_code))]
 fn train_logistic_sgd(
     features: &[Vec<f32>],  // scaled (n × 96)
     labels: &[f32],         // 0.0 or 1.0
@@ -951,6 +1461,10 @@ fn train_logistic_sgd(
 
     (weights, bias)
 }
+// ═══════════════════════════════════════════════════════════════════════════
+// Synthetic negatives
+// ═══════════════════════════════════════════════════════════════════════════
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Synthetic negatives
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1381,7 +1895,7 @@ mod tests {
             &[neg_seq],
             None,                       // no per-negative weights
             DEFAULT_VERIFIER_THRESHOLD, // mahbot-853: lowered from 0.6 for streaming inference.
-            L2_LAMBDA,                  // L2 regularization (mahbot-854: 0.01)
+            L2_LAMBDA,                  // L2 regularization (mahbot-949: reduced to 0.001)
             None,                       // rng_seed (entropy-based)
         );
 
@@ -1495,41 +2009,53 @@ mod tests {
         let positives: Vec<Vec<f32>> = (0..30).map(|_| make_positive_frame(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..50).map(|_| make_negative_frame(&mut rng)).collect();
 
-        // L2-normalize the training features (matching training pipeline ordering).
-        let features: Vec<Vec<f32>> = positives.iter().chain(negatives.iter()).cloned().collect();
-        let normalized: Vec<Vec<f32>> = features
-            .iter()
-            .map(|f| {
-                let norm = f.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
-                f.iter().map(|v| v / norm).collect()
-            })
-            .collect();
+        // L2-normalize positives and negatives separately.
+        let l2_normalize = |v: &[f32]| -> Vec<f32> {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
+            v.iter().map(|x| x / norm).collect()
+        };
+        let pos_norm: Vec<Vec<f32>> = positives.iter().map(|f| l2_normalize(f)).collect();
+        let neg_norm: Vec<Vec<f32>> = negatives.iter().map(|f| l2_normalize(f)).collect();
 
-        // Compute StandardScaler on L2-normalized features.
-        let (scaler_mean, scaler_std) = compute_standard_scaler(&normalized);
+        // Compute StandardScaler on POSITIVE L2-normalized features only
+        // (mahbot-949 Fix 3: matching the updated training pipeline).
+        let (scaler_mean, scaler_std) = compute_standard_scaler(&pos_norm);
 
-        // Scale the L2-normalized features for training.
-        let scaled: Vec<Vec<f32>> = normalized
-            .iter()
-            .map(|f| {
-                f.iter()
-                    .enumerate()
-                    .map(|(j, &val)| {
-                        if scaler_std[j] > 0.0 {
-                            (val - scaler_mean[j]) / scaler_std[j]
-                        } else {
-                            val
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
+        // Scale both positive and negative features.
+        let scale_features = |fw: &[Vec<f32>]| -> Vec<Vec<f32>> {
+            fw.iter()
+                .map(|f| {
+                    f.iter()
+                        .enumerate()
+                        .map(|(j, &val)| {
+                            if !scaler_std.is_empty() && scaler_std[j] > 0.0 {
+                                (val - scaler_mean[j]) / scaler_std[j]
+                            } else {
+                                val
+                            }
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let pos_scaled = scale_features(&pos_norm);
+        let neg_scaled = scale_features(&neg_norm);
+
+        let mut scaled = pos_scaled;
+        scaled.extend(neg_scaled);
 
         let labels: Vec<f32> = [vec![1.0; 30], vec![0.0; 50]].concat();
         let sample_weights: Vec<f32> = [vec![3.0; 30], vec![1.0; 50]].concat();
 
-        let (weights, bias) =
-            train_logistic_sgd(&scaled, &labels, &sample_weights, 0.01, 0.01, 500, Some(42));
+        let (weights, bias) = train_logistic_sgd(
+            &scaled,
+            &labels,
+            &sample_weights,
+            L2_LAMBDA,
+            0.01,
+            500,
+            Some(42),
+        );
 
         // Build a logistic verifier as train() would.
         let verifier = VoiceVerifier {
@@ -1806,7 +2332,7 @@ mod tests {
             &[neg_seq.clone()],
             None,
             DEFAULT_VERIFIER_THRESHOLD,
-            0.001,
+            L2_LAMBDA,
             Some(seed),
         );
         let v2 = VoiceVerifier::train(
@@ -1814,7 +2340,7 @@ mod tests {
             &[neg_seq],
             None,
             DEFAULT_VERIFIER_THRESHOLD,
-            0.001,
+            L2_LAMBDA,
             Some(seed),
         );
 

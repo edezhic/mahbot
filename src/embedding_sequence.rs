@@ -17,7 +17,7 @@ pub struct UtteranceId {
 }
 
 /// Provenance of an embedding sequence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Source {
     /// Original wake-word utterance (unmodified PCM).
     Enrollment,
