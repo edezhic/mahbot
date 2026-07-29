@@ -2,8 +2,9 @@
 
 Mahbot is an agentic development environment built for **reliability**. It treats software work as a managed pipeline, not a chat session: you talk to a **Manager** about product intent and scope; specialist agents implement, validate, and review; every change is analyzed before edits and checked again afterward. Reliability comes from **orchestration and process**, not from betting that the current frontier model will do everything right. It also includes a background maintenance process to clean up usual videcoding bloat and other code quality issues.
 
-Mahbot packages the best practices into one system: role separation, subagents, persistent state, deterministic diagnostics, independent review and QA, and automatic dev loops when validation fails. It is designed to make inexpensive open-weight and API models useful through structure. Just a few months ago that would've been X times more expensive than subscription-based services, but thanks to the release of DeepSeek v4 mahbot now works on it's own codebase 24/7, spawns >1000 agents every day and this costs only about 10$/day.
+Mahbot packages the best practices into one system: subagents, persistent state, deterministic diagnostics, adversarial review and QA, fix & maintenance loops. It is designed to make inexpensive open-weight and API models useful through structure. Just a few months ago that would've been magnitudes times more expensive than subscription-based services, but thanks to the release of DeepSeek v4 mahbot now works on it's own codebase 24/7, spawns >1000 agents every day and this costs only about 10$/day.
 
+Includes a smooth native GUI that lets you easily inspect the agents, diffs, code, as well as basic editor capabilities and a built-in shell. Also packs a fully-local speech-to-text & text-to-speech voice control. Passive wake-word detection is unstable yet but it is the current development focus.
 
 ## Getting Started
 
@@ -26,6 +27,8 @@ cargo run --release
 ```
 
 Then run `mahbot` to start the dashboard and configure your OpenRouter key in **Settings**. OpenRouter API key and the [`chrome-use`](https://github.com/leeguooooo/chrome-use) CLI (browser tool and link enrichment) are needed for full functionality — see [Prerequisites](#prerequisites) below. Also, the same binary can be run with `mahbot debug ...` to execute arbitrary SQL queries over the service's DBs, which is particularly useful for agents working on mahbot itself.
+
+As of now mahbot is only regularly tested on macos, so it might have unexpected bugs on other platforms. However, all the core components are cross-platform so it should work just fine on windows & linux in the future.
 
 ## Why not just Claude Code, Codex, Pi or Cursor?
 

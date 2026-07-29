@@ -1072,7 +1072,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         .collect();
 
     let message = if feedback.is_empty() {
-        "Implement the ticket described in the system prompt.".to_string()
+        load_prompt("implement.md")
     } else {
         format!("New feedback to address:\n{}", feedback.join("\n---\n"))
     };
