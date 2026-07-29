@@ -1830,7 +1830,7 @@ mod tests {
             None,                       // no per-negative weights
             DEFAULT_VERIFIER_THRESHOLD, // threshold
             0.001,                      // weak L2 (clean synthetic data)
-            Some(42),                       // deterministic seed for reproducibility
+            Some(42),                   // deterministic seed for reproducibility
         );
 
         assert!(verifier.is_trained(), "Verifier must be trained");
@@ -1908,7 +1908,7 @@ mod tests {
             None,                       // no per-negative weights
             DEFAULT_VERIFIER_THRESHOLD, // mahbot-853: lowered from 0.6 for streaming inference.
             L2_LAMBDA,                  // L2 regularization (mahbot-949: reduced to 0.001)
-            Some(42),                       // deterministic seed for reproducibility
+            Some(42),                   // deterministic seed for reproducibility
         );
 
         assert!(verifier.is_trained(), "Verifier must be trained");
