@@ -9,11 +9,15 @@ use crate::board::{Ticket, TicketPhase};
 use crate::git_commands::{parse_numstat_lines, run_git_output};
 
 use iced::widget::{
-    Column, Row, Space, button, column, container, markdown, row, scrollable, text, tooltip,
+    Column, Row, Space, button, column, container, markdown, row, scrollable, stack, text,
+    text_editor, tooltip,
 };
-use iced::{Alignment, Element, Length, Task};
+use iced::{Alignment, Element, Length, Task, keyboard};
 
 use iced_fonts::lucide;
+
+/// Maximum characters allowed in a comment.
+const MAX_INPUT_CHARS: usize = 100_000;
 
 use super::theme;
 use super::widget_helpers;
@@ -31,6 +35,80 @@ pub struct FileStat {
 #[derive(Debug, Clone)]
 pub struct CommitStats {
     files: Vec<FileStat>,
+}
+
+// ── Comment Input Undo/Redo ──────────────────────────────────────────
+
+/// Snapshot-based undo/redo stack for the comment input text editor.
+///
+/// Stores `(String, Cursor)` pairs because [`text_editor::Content`] does not
+/// implement `Clone` in a way that preserves cursor position.  Restoration
+/// reconstructs via [`text_editor::Content::with_text`] +
+/// [`text_editor::Content::move_to`].
+#[derive(Debug, Clone)]
+struct UndoStack {
+    /// Previous states, newest last.
+    undo: Vec<UndoSnapshot>,
+    /// Undone states, cleared on new edit.
+    redo: Vec<UndoSnapshot>,
+}
+
+/// A single undo snapshot for the comment input.
+#[derive(Debug, Clone)]
+struct UndoSnapshot {
+    text: String,
+    cursor: text_editor::Cursor,
+}
+
+impl UndoStack {
+    const MAX_UNDO_DEPTH: usize = 100;
+
+    const fn new() -> Self {
+        Self {
+            undo: Vec::new(),
+            redo: Vec::new(),
+        }
+    }
+
+    /// Take a snapshot before an edit is performed.
+    fn snap_before_edit(&mut self, content: &text_editor::Content) {
+        self.redo.clear();
+        self.undo.push(UndoSnapshot {
+            text: content.text(),
+            cursor: content.cursor(),
+        });
+        if self.undo.len() > Self::MAX_UNDO_DEPTH {
+            self.undo.remove(0);
+        }
+    }
+
+    fn push_and_pop(
+        dst: &mut Vec<UndoSnapshot>,
+        src: &mut Vec<UndoSnapshot>,
+        content: &text_editor::Content,
+    ) -> Option<UndoSnapshot> {
+        dst.push(UndoSnapshot {
+            text: content.text(),
+            cursor: content.cursor(),
+        });
+        src.pop()
+    }
+
+    /// Pop the most recent snapshot, saving current state to the redo stack.
+    fn undo(&mut self, content: &text_editor::Content) -> Option<UndoSnapshot> {
+        Self::push_and_pop(&mut self.redo, &mut self.undo, content)
+    }
+
+    /// Pop the most recent undone snapshot, saving current state to the undo stack.
+    fn redo(&mut self, content: &text_editor::Content) -> Option<UndoSnapshot> {
+        Self::push_and_pop(&mut self.undo, &mut self.redo, content)
+    }
+
+    /// Reset the stack (e.g. after sending a comment or switching tickets).
+    fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +157,21 @@ pub enum BoardMessage {
 
     /// Toggle expansion of a diagnostics comment.
     ToggleCommentExpand(usize),
+
+    /// Comment text input changed in the ticket detail modal.
+    CommentInputChanged(text_editor::Action),
+    /// Send a comment on the current ticket.
+    SendComment,
+    /// Result of adding a comment via the backend. Carries the generation
+    /// counter captured at send-time for stale-callback detection.
+    CommentSent(u64, Result<(), String>),
+    /// Keyboard modifier state change (Shift, Ctrl, Cmd) — tracked for
+    /// Shift+Click→Drag conversion in the comment input.
+    CommentModifiersChanged(keyboard::Modifiers),
+    /// Undo the last text edit in the comment input.
+    Undo,
+    /// Redo a previously undone text edit in the comment input.
+    Redo,
 }
 
 pub struct BoardState {
@@ -103,6 +196,30 @@ pub struct BoardState {
     expanded_comments: HashSet<usize>,
     /// Stores the last detail-load error message for display in the modal.
     detail_error: Option<String>,
+
+    /// Comment text input state for the ticket detail modal.
+    comment_input: text_editor::Content,
+    /// Whether a comment is currently being sent (prevents double-send).
+    sending_comment: bool,
+    /// Whether the comment input is focused (for Escape-key blur behavior).
+    ///
+    /// Note: tracking is imperfect — clicking elsewhere (natural focus loss)
+    /// won't clear this flag, so the first Escape after a natural blur still
+    /// acts as "blur" instead of "close". A second Escape always closes the
+    /// modal, which is acceptable UX for Iced 0.14's widget focus API limits.
+    comment_focused: bool,
+    /// Current user name used for comment attribution (`"user:{name}"`).
+    pub(crate) current_user_name: Option<String>,
+    /// Monotonic counter incremented when the modal context changes
+    /// (modal close via `reset_modal()`, or ticket switch via
+    /// `TicketDetails`). Captured in `SendComment` and verified in
+    /// `CommentSent` to detect stale async callbacks.
+    comment_generation: u64,
+    /// Latest keyboard modifiers, tracked for Shift+Click→Drag conversion
+    /// in the comment input (matching the Home chat input pattern).
+    modifiers: keyboard::Modifiers,
+    /// Undo/redo stack for the comment input text editor.
+    undo_stack: UndoStack,
 }
 
 impl BoardState {
@@ -122,6 +239,13 @@ impl BoardState {
             commit_stats_generation: 0,
             expanded_comments: HashSet::new(),
             detail_error: None,
+            comment_input: text_editor::Content::new(),
+            sending_comment: false,
+            comment_focused: false,
+            current_user_name: None,
+            comment_generation: 0,
+            modifiers: keyboard::Modifiers::empty(),
+            undo_stack: UndoStack::new(),
         }
     }
 
@@ -136,6 +260,11 @@ impl BoardState {
         self.commit_stats = None;
         self.commit_stats_loading = false;
         self.commit_stats_generation += 1;
+        self.comment_input = text_editor::Content::new();
+        self.sending_comment = false;
+        self.comment_focused = false;
+        self.comment_generation += 1;
+        self.undo_stack.clear();
     }
 
     pub fn refresh(&self) -> Task<BoardMessage> {
@@ -157,7 +286,32 @@ impl BoardState {
 
     #[allow(clippy::unused_self)]
     pub fn subscription(&self) -> iced::Subscription<BoardMessage> {
-        iced::Subscription::none()
+        // Track keyboard modifiers for Shift+Click→Drag conversion in the
+        // comment input, and handle Cmd+Z / Cmd+Shift+Z for undo/redo,
+        // mirroring the Home chat input pattern.
+        use iced::keyboard;
+        keyboard::listen().filter_map(|event| match event {
+            keyboard::Event::ModifiersChanged(modifiers) => {
+                Some(BoardMessage::CommentModifiersChanged(modifiers))
+            }
+            keyboard::Event::KeyPressed {
+                key,
+                modifiers,
+                physical_key,
+                ..
+            } => {
+                let km = super::detect_keyboard_mods(modifiers);
+                // Cmd+Z / Ctrl+Z → undo.  Check shift first so Cmd+Shift+Z → redo.
+                if km.is_shortcut_platform_mod() && key.to_latin(physical_key) == Some('z') {
+                    if modifiers.shift() {
+                        return Some(BoardMessage::Redo);
+                    }
+                    return Some(BoardMessage::Undo);
+                }
+                None
+            }
+            keyboard::Event::KeyReleased { .. } => None,
+        })
     }
 
     /// Phase transition actions (ported from Board.tsx `availableActions`)
@@ -340,11 +494,26 @@ impl BoardState {
             BoardMessage::OpenModal(id) => {
                 self.selected_loading = true;
                 self.detail_error = None;
+                // Bump generation to invalidate any in-flight comment
+                // callbacks for the previous ticket before the fetch
+                // even completes.
+                self.comment_generation += 1;
                 Self::fetch_ticket(id)
             }
-            BoardMessage::CloseModal | BoardMessage::Escape => {
+            BoardMessage::CloseModal => {
                 self.reset_modal();
                 Task::none()
+            }
+            BoardMessage::Escape => {
+                if self.comment_focused {
+                    // On first Escape, blur the comment input (clear focus flag)
+                    // so a second Escape closes the modal.
+                    self.comment_focused = false;
+                    Task::none()
+                } else {
+                    self.reset_modal();
+                    Task::none()
+                }
             }
             BoardMessage::TicketDetails(ticket) => {
                 let ticket = *ticket;
@@ -364,6 +533,16 @@ impl BoardState {
                     .collect();
                 self.selected_ticket = Some(ticket);
                 self.selected_loading = false;
+                // Bump generation to invalidate any in-flight comment
+                // callbacks for the previous ticket.
+                self.comment_generation += 1;
+                // Clear comment input state when switching to a new ticket
+                // to prevent a draft from the previous ticket being
+                // accidentally sent to the new one.
+                self.comment_input = text_editor::Content::new();
+                self.sending_comment = false;
+                self.comment_focused = false;
+                self.undo_stack.clear();
 
                 // Trigger commit stats fetch if commit_hash is set
                 if self
@@ -425,6 +604,157 @@ impl BoardState {
                     self.expanded_comments.insert(i);
                 }
                 Task::none()
+            }
+            BoardMessage::CommentInputChanged(action) => {
+                // Any interaction means the input is focused.
+                self.comment_focused = true;
+                // When Shift is held and the user clicks, convert to a Drag
+                // action which extends the selection anchored at the current
+                // cursor position (Shift+Click selection semantics).
+                // Matches the Home chat input pattern (home.rs:966-974).
+                let action = match action {
+                    text_editor::Action::Click(pos) if self.modifiers.shift() => {
+                        text_editor::Action::Drag(pos)
+                    }
+                    other => other,
+                };
+                // Snapshot before edit actions for undo/redo.
+                if action.is_edit() {
+                    self.undo_stack.snap_before_edit(&self.comment_input);
+                }
+                // perform() must be called unconditionally for every action
+                // (cursor movement, click positioning, edit). The Iced
+                // text_editor widget does not call perform() itself — it
+                // relies entirely on the application to do so.
+                self.comment_input.perform(action);
+                Task::none()
+            }
+            BoardMessage::Undo => {
+                if let Some(snapshot) = self.undo_stack.undo(&self.comment_input) {
+                    self.comment_input = text_editor::Content::with_text(&snapshot.text);
+                    self.comment_input.move_to(snapshot.cursor);
+                }
+                Task::none()
+            }
+            BoardMessage::Redo => {
+                if let Some(snapshot) = self.undo_stack.redo(&self.comment_input) {
+                    self.comment_input = text_editor::Content::with_text(&snapshot.text);
+                    self.comment_input.move_to(snapshot.cursor);
+                }
+                Task::none()
+            }
+            BoardMessage::CommentModifiersChanged(modifiers) => {
+                self.modifiers = modifiers;
+                Task::none()
+            }
+            BoardMessage::SendComment => {
+                let text = self.comment_input.text();
+                let trimmed = text.trim().to_string();
+
+                if trimmed.is_empty() {
+                    return Task::none();
+                }
+
+                // Reject messages that exceed the maximum character limit.
+                if trimmed.chars().count() > MAX_INPUT_CHARS {
+                    let count = trimmed.chars().count();
+                    return Task::done(BoardMessage::Toast(super::ToastMessage::Warning(format!(
+                        "Comment too long: {count} characters (maximum {MAX_INPUT_CHARS}). \
+                             Please shorten your comment."
+                    ))));
+                }
+
+                // Guard against double-send (Enter key bypasses the button's
+                // on_press_maybe guard).
+                if self.sending_comment {
+                    return Task::none();
+                }
+
+                let Some(ref user_name) = self.current_user_name else {
+                    return Task::done(BoardMessage::Toast(super::ToastMessage::Warning(
+                        "No user selected — cannot add comment.".into(),
+                    )));
+                };
+
+                let Some(ticket_id) = self.selected_ticket.as_ref().map(|t| t.id.clone()) else {
+                    return Task::none();
+                };
+
+                let role = format!("user:{user_name}");
+                let now = crate::turso::now();
+                let content = trimmed;
+
+                // Optimistically add the comment to local state so it appears
+                // immediately in the comments list.
+                if let Some(ref mut ticket) = self.selected_ticket {
+                    ticket.comments.push(crate::board::TicketComment {
+                        role: role.clone(),
+                        content: content.clone(),
+                        created_at: now,
+                    });
+                    // Rebuild cached markdown for all comments.
+                    self.comments_md = ticket
+                        .comments
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| (i, markdown::parse(&c.content).collect()))
+                        .collect();
+                }
+
+                self.sending_comment = true;
+                self.comment_input = text_editor::Content::new();
+                self.undo_stack.clear();
+                let generation = self.comment_generation;
+
+                Task::perform(
+                    async move {
+                        let board = crate::board::store();
+                        let result = board
+                            .add_comment(&ticket_id, &role, &content)
+                            .await
+                            .map_err(|e| e.to_string());
+                        (generation, result)
+                    },
+                    |(g, result)| BoardMessage::CommentSent(g, result),
+                )
+            }
+            BoardMessage::CommentSent(generation, Ok(())) => {
+                // Stale callback guard: if the modal closed or the user switched
+                // tickets since this async was dispatched, drop the result.
+                if generation != self.comment_generation {
+                    self.sending_comment = false;
+                    return Task::none();
+                }
+                self.sending_comment = false;
+                // Refresh ticket detail from DB for consistency.
+                if let Some(ref ticket) = self.selected_ticket {
+                    let refresh = Self::fetch_ticket(ticket.id.clone());
+                    let toast = Task::done(BoardMessage::Toast(super::ToastMessage::SuccessMsg(
+                        "Comment added.".into(),
+                    )));
+                    Task::batch([refresh, toast])
+                } else {
+                    Task::none()
+                }
+            }
+            BoardMessage::CommentSent(generation, Err(e)) => {
+                // Stale callback guard
+                if generation != self.comment_generation {
+                    self.sending_comment = false;
+                    return Task::none();
+                }
+                self.sending_comment = false;
+                tracing::warn!(error = %e, "Board: failed to add comment");
+                // Remove the optimistic comment by refetching from DB.
+                let refetch = if let Some(ref ticket) = self.selected_ticket {
+                    Self::fetch_ticket(ticket.id.clone())
+                } else {
+                    Task::none()
+                };
+                let toast = Task::done(BoardMessage::Toast(super::ToastMessage::Error(format!(
+                    "Failed to add comment: {e}"
+                ))));
+                Task::batch([refetch, toast])
             }
             BoardMessage::LinkClicked(_)
             | BoardMessage::Toast(_)
@@ -877,11 +1207,20 @@ impl BoardState {
             sections.push(el);
         }
 
-        scrollable(Column::from_vec(sections).spacing(4).width(Length::Fill))
+        // ── Scrollable content area ──────────────────────────────
+        let scrollable_content =
+            scrollable(Column::from_vec(sections).spacing(4).width(Length::Fill))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .direction(theme::vertical_scrollbar())
+                .style(theme::scrollbar_style);
+
+        // ── Comment input area (pinned at the bottom) ────────────
+        let input_area = self.render_comment_input();
+
+        column![scrollable_content.width(Length::Fill), input_area,]
             .width(Length::Fill)
             .height(Length::Fill)
-            .direction(theme::vertical_scrollbar())
-            .style(theme::scrollbar_style)
             .into()
     }
 
@@ -1132,6 +1471,108 @@ impl BoardState {
         })
     }
 
+    /// Render the comment input widget (text editor + send button) pinned at
+    /// the bottom of the ticket detail modal.
+    fn render_comment_input(&self) -> Element<'_, BoardMessage> {
+        let input_editor = text_editor(&self.comment_input)
+            .on_action(BoardMessage::CommentInputChanged)
+            .placeholder("Add a comment… (Enter to send, Shift+Enter for newline)")
+            .min_height(44.0_f32)
+            .max_height(132.0_f32)
+            .style(|_theme: &iced::Theme, status| {
+                let is_focused = matches!(status, text_editor::Status::Focused { .. });
+                text_editor::Style {
+                    background: iced::Background::Color(theme::BG_ELEVATED),
+                    border: iced::Border {
+                        radius: 8.0.into(),
+                        width: if is_focused { 1.0 } else { 0.0 },
+                        color: if is_focused {
+                            theme::ACCENT
+                        } else {
+                            iced::Color::TRANSPARENT
+                        },
+                    },
+                    placeholder: theme::TEXT_MUTED,
+                    value: theme::TEXT_PRIMARY,
+                    selection: theme::ACCENT_DIM,
+                }
+            })
+            .key_binding(|key_press| {
+                // Return None for Cmd+Z / Cmd+Shift+Z so the key event is
+                // NOT consumed by the text_editor's default handler (which
+                // would treat 'z' as an Insert character). The keyboard
+                // subscription in subscription() catches the event and
+                // emits BoardMessage::Undo / BoardMessage::Redo.
+                let km = super::detect_keyboard_mods(key_press.modifiers);
+                let is_intercept_z = km.is_shortcut_platform_mod();
+                if is_intercept_z {
+                    if matches!(
+                        &key_press.key,
+                        keyboard::Key::Character(c) if c == "z"
+                    ) {
+                        return None;
+                    }
+                }
+                if key_press.key == keyboard::Key::Named(keyboard::key::Named::Enter)
+                    && !key_press.modifiers.shift()
+                {
+                    Some(text_editor::Binding::Custom(BoardMessage::SendComment))
+                } else {
+                    text_editor::Binding::from_key_press(key_press)
+                }
+            });
+
+        let send_btn = button(
+            lucide::send::<iced::Theme, iced::Renderer>()
+                .size(14)
+                .color(if self.sending_comment {
+                    theme::TEXT_MUTED
+                } else {
+                    theme::ACCENT
+                }),
+        )
+        .style(move |_t: &iced::Theme, status| {
+            use iced::widget::button;
+            let bg = match status {
+                button::Status::Hovered => theme::HOVER_STRONG,
+                button::Status::Pressed => theme::ACCENT_DIM,
+                _ => iced::Color::TRANSPARENT,
+            };
+            button::Style {
+                background: Some(iced::Background::Color(bg)),
+                border: iced::Border {
+                    radius: 6.0.into(),
+                    width: 0.0,
+                    color: iced::Color::TRANSPARENT,
+                },
+                ..button::Style::default()
+            }
+        })
+        .on_press_maybe(if self.sending_comment {
+            None
+        } else {
+            Some(BoardMessage::SendComment)
+        })
+        .padding(4);
+
+        container(
+            container(stack([
+                input_editor.into(),
+                container(send_btn)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(Alignment::End)
+                    .align_y(Alignment::End)
+                    .padding(iced::Padding::default().right(8.0).bottom(8.0))
+                    .into(),
+            ]))
+            .padding(8)
+            .style(theme::base_container_style),
+        )
+        .width(Length::Fill)
+        .into()
+    }
+
     /// Render the comments list: per-comment role badge, timestamp, content,
     /// and diagnostics expand/collapse toggle.
     /// Returns `None` when the ticket has no comments.
@@ -1233,5 +1674,426 @@ impl BoardState {
         }
 
         Some(cmt_col.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::Point;
+
+    fn make_board_state() -> BoardState {
+        let mut state = BoardState::new();
+        state.current_user_name = Some("admin".into());
+        state.selected_ticket = Some(Ticket {
+            id: "T-1".into(),
+            title: "Test ticket".into(),
+            description: String::new(),
+            phase: TicketPhase::Backlog,
+            assigned_to: None,
+            workspace_name: "test_ws".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            comments: Vec::new(),
+            prerequisites: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            commit_hash: None,
+            lines_added: None,
+            lines_removed: None,
+            reporter: "test".into(),
+            is_archived: false,
+            pipeline_reservation: false,
+            priority: 0,
+        });
+        state
+    }
+
+    // ── SendComment: empty rejection ──────────────────────────────
+
+    #[test]
+    fn test_comment_empty_is_noop() {
+        let mut state = make_board_state();
+        // Empty content
+        state.comment_input = text_editor::Content::new();
+        let _task = state.update(BoardMessage::SendComment);
+        assert!(!state.sending_comment);
+        assert!(state.comment_input.text().is_empty());
+
+        // Whitespace-only should also be treated as empty.
+        state.comment_input = text_editor::Content::with_text("   ");
+        let _task = state.update(BoardMessage::SendComment);
+        assert!(!state.sending_comment);
+    }
+
+    // ── SendComment: character limit ──────────────────────────────
+
+    #[test]
+    fn test_comment_within_limit_clears_input() {
+        let mut state = make_board_state();
+        state.comment_input = text_editor::Content::with_text("hello world");
+        let _task = state.update(BoardMessage::SendComment);
+        // Editor must be cleared on accepted message
+        assert!(
+            state.comment_input.text().is_empty(),
+            "input should be cleared after accepting a within-limit comment"
+        );
+    }
+
+    #[test]
+    fn test_comment_at_limit_sends() {
+        let mut state = make_board_state();
+        let text = "a".repeat(MAX_INPUT_CHARS);
+        state.comment_input = text_editor::Content::with_text(&text);
+        let _task = state.update(BoardMessage::SendComment);
+        // Exactly at the limit: should be accepted (editor cleared).
+        assert!(
+            state.comment_input.text().is_empty(),
+            "input should be cleared when comment is exactly at the limit"
+        );
+    }
+
+    #[test]
+    fn test_comment_exceeds_limit_preserves_content() {
+        let mut state = make_board_state();
+        let long_text = "a".repeat(MAX_INPUT_CHARS + 1);
+        state.comment_input = text_editor::Content::with_text(&long_text);
+        let _task = state.update(BoardMessage::SendComment);
+        // Editor content must be preserved — user needs to edit it down.
+        assert_eq!(
+            state.comment_input.text(),
+            long_text,
+            "input must be preserved when comment exceeds character limit"
+        );
+        assert!(
+            !state.sending_comment,
+            "sending_comment should remain false after rejected comment"
+        );
+    }
+
+    // ── SendComment: double-send guard ────────────────────────────
+
+    #[test]
+    fn test_comment_double_send_guard() {
+        let mut state = make_board_state();
+        state.sending_comment = true;
+        state.comment_input = text_editor::Content::with_text("hello");
+        let _task = state.update(BoardMessage::SendComment);
+        // When sending_comment is true, the message should not be processed.
+        assert!(
+            !state.comment_input.text().is_empty(),
+            "input should not be cleared when double-send guard prevents sending"
+        );
+        assert!(
+            state.sending_comment,
+            "sending_comment should remain true when guard was active"
+        );
+    }
+
+    // ── SendComment: missing user ─────────────────────────────────
+
+    #[test]
+    fn test_comment_no_user_returns_warning() {
+        let mut state = make_board_state();
+        state.current_user_name = None;
+        state.comment_input = text_editor::Content::with_text("hello");
+        let _task = state.update(BoardMessage::SendComment);
+
+        // Editor should NOT be cleared — message was rejected.
+        assert_eq!(state.comment_input.text(), "hello");
+        assert!(!state.sending_comment);
+    }
+
+    // ── SendComment: no ticket selected ───────────────────────────
+
+    #[test]
+    fn test_comment_no_ticket_is_noop() {
+        let mut state = make_board_state();
+        state.selected_ticket = None;
+        state.comment_input = text_editor::Content::with_text("hello");
+        let _task = state.update(BoardMessage::SendComment);
+        assert!(!state.sending_comment);
+        assert_eq!(
+            state.comment_input.text(),
+            "hello",
+            "input should not be cleared when no ticket is selected"
+        );
+    }
+
+    // ── CommentInputChanged: cursor actions pass through ──────────
+
+    #[test]
+    fn test_comment_input_changed_non_edit_passes_through() {
+        let mut state = make_board_state();
+        state.comment_input = text_editor::Content::with_text("hello world");
+
+        // Cursor movement (non-edit action) must be passed to perform().
+        // After a Click, the cursor position should reflect the click.
+        state.update(BoardMessage::CommentInputChanged(
+            text_editor::Action::Click(Point { x: 0.0, y: 0.0 }),
+        ));
+        // perform() was called — the editor state accepted the action
+        // (no crash, content unchanged).
+        assert_eq!(state.comment_input.text(), "hello world");
+        assert!(
+            state.comment_focused,
+            "comment_focused should be set to true on any input action"
+        );
+    }
+
+    // ── CommentInputChanged: Shift+Click → Drag conversion ───────
+
+    #[test]
+    fn test_comment_shift_click_converts_to_drag() {
+        let mut state = make_board_state();
+        state.comment_input = text_editor::Content::with_text("hello world");
+        // Set Shift modifier
+        state.modifiers = keyboard::Modifiers::SHIFT;
+
+        // Click at position should be converted to Drag (which extends selection).
+        // This is a behavioral contract — we can't easily assert the internal
+        // conversion happened, but we can verify no crash and that the editor
+        // state was updated.
+        state.update(BoardMessage::CommentInputChanged(
+            text_editor::Action::Click(Point { x: 0.0, y: 0.0 }),
+        ));
+        assert!(
+            state.comment_focused,
+            "comment_focused should be true after Click with Shift"
+        );
+    }
+
+    // ── CommentInputChanged: without Shift, Click stays Click ─────
+
+    #[test]
+    fn test_comment_click_without_shift_stays_click() {
+        let mut state = make_board_state();
+        state.comment_input = text_editor::Content::with_text("hello world");
+        // No modifier — Click should remain as Click
+        state.modifiers = keyboard::Modifiers::empty();
+
+        state.update(BoardMessage::CommentInputChanged(
+            text_editor::Action::Click(Point { x: 0.0, y: 0.0 }),
+        ));
+        // No crash — content unchanged.
+        assert_eq!(state.comment_input.text(), "hello world");
+    }
+
+    // ── CommentModifiersChanged: updates state ────────────────────
+
+    #[test]
+    fn test_comment_modifiers_changed_updates_state() {
+        let mut state = make_board_state();
+        assert_eq!(state.modifiers, keyboard::Modifiers::empty());
+
+        state.update(BoardMessage::CommentModifiersChanged(
+            keyboard::Modifiers::SHIFT,
+        ));
+        assert_eq!(state.modifiers, keyboard::Modifiers::SHIFT);
+
+        state.update(BoardMessage::CommentModifiersChanged(
+            keyboard::Modifiers::CTRL,
+        ));
+        assert_eq!(state.modifiers, keyboard::Modifiers::CTRL);
+    }
+
+    // ── OpenModal bumps generation ────────────────────────────────
+
+    #[test]
+    fn test_open_modal_bumps_comment_generation() {
+        let mut state = make_board_state();
+        let gen_before = state.comment_generation;
+        let _task = state.update(BoardMessage::OpenModal("T-2".into()));
+        assert!(
+            state.comment_generation > gen_before,
+            "comment_generation should be bumped on OpenModal"
+        );
+    }
+
+    // ── TicketDetails bumps generation and clears input ───────────
+
+    #[test]
+    fn test_ticket_details_clears_comment_input() {
+        let mut state = make_board_state();
+        state.comment_input = text_editor::Content::with_text("draft comment");
+        state.sending_comment = true;
+        state.comment_focused = true;
+
+        let gen_before = state.comment_generation;
+        let ticket = Ticket {
+            id: "T-2".into(),
+            title: "New ticket".into(),
+            description: String::new(),
+            phase: TicketPhase::Backlog,
+            assigned_to: None,
+            workspace_name: "test_ws".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            comments: Vec::new(),
+            prerequisites: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            commit_hash: None,
+            lines_added: None,
+            lines_removed: None,
+            reporter: "test".into(),
+            is_archived: false,
+            pipeline_reservation: false,
+            priority: 0,
+        };
+        let _task = state.update(BoardMessage::TicketDetails(Box::new(ticket)));
+
+        assert!(
+            state.comment_input.text().is_empty(),
+            "comment input should be cleared when switching tickets"
+        );
+        assert!(
+            !state.sending_comment,
+            "sending_comment should be reset when switching tickets"
+        );
+        assert!(
+            !state.comment_focused,
+            "comment_focused should be reset when switching tickets"
+        );
+        assert!(
+            state.comment_generation > gen_before,
+            "comment_generation should be bumped on ticket switch"
+        );
+    }
+
+    // ── Escape: first blurs, second closes ────────────────────────
+
+    #[test]
+    fn test_escape_first_blurs_then_closes() {
+        let mut state = make_board_state();
+        state.comment_focused = true;
+        state.selected_ticket = Some(Ticket {
+            id: "T-1".into(),
+            title: "Test".into(),
+            description: String::new(),
+            phase: TicketPhase::Backlog,
+            assigned_to: None,
+            workspace_name: "test_ws".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            comments: Vec::new(),
+            prerequisites: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            commit_hash: None,
+            lines_added: None,
+            lines_removed: None,
+            reporter: "test".into(),
+            is_archived: false,
+            pipeline_reservation: false,
+            priority: 0,
+        });
+
+        // First Escape: focused → blur (clear flag), modal stays open
+        let _task = state.update(BoardMessage::Escape);
+        assert!(
+            !state.comment_focused,
+            "comment_focused should be cleared on first Escape"
+        );
+        assert!(
+            state.selected_ticket.is_some(),
+            "modal should remain open on first Escape"
+        );
+
+        // Second Escape: not focused → close modal
+        let _task = state.update(BoardMessage::Escape);
+        assert!(
+            state.selected_ticket.is_none(),
+            "modal should close on second Escape"
+        );
+    }
+
+    // ── Undo / Redo for comment input ────────────────────────────
+
+    #[test]
+    fn test_comment_undo_restores_content() {
+        let mut state = make_board_state();
+        // Simulate typing "abc" by performing edit actions.
+        for ch in &['a', 'b', 'c'] {
+            let _task = state.update(BoardMessage::CommentInputChanged(
+                text_editor::Action::Edit(text_editor::Edit::Insert(*ch)),
+            ));
+        }
+        let text_before = state.comment_input.text();
+        assert_eq!(text_before, "abc", "input should have typed text");
+
+        // Undo restores previous state.
+        let _task = state.update(BoardMessage::Undo);
+        let text_after_undo = state.comment_input.text();
+        assert_ne!(
+            text_before, text_after_undo,
+            "undo should change the content"
+        );
+        // Redo restores the undone state.
+        let _task = state.update(BoardMessage::Redo);
+        assert_eq!(
+            state.comment_input.text(),
+            text_before,
+            "redo should restore undone content"
+        );
+    }
+
+    #[test]
+    fn test_comment_redo_no_undo_is_noop() {
+        let mut state = make_board_state();
+        let text = state.comment_input.text();
+        let _task = state.update(BoardMessage::Redo);
+        assert_eq!(
+            state.comment_input.text(),
+            text,
+            "redo with no undo history should be a no-op"
+        );
+    }
+
+    #[test]
+    fn test_comment_undo_cleared_on_reset_modal() {
+        let mut state = make_board_state();
+        // Build some history
+        let _task = state.update(BoardMessage::CommentInputChanged(
+            text_editor::Action::Edit(text_editor::Edit::Insert('h')),
+        ));
+        // Simulate more typing to build real undo history
+        let _task = state.update(BoardMessage::CommentInputChanged(
+            text_editor::Action::Edit(text_editor::Edit::Insert('e')),
+        ));
+        let _task = state.update(BoardMessage::CommentInputChanged(
+            text_editor::Action::Edit(text_editor::Edit::Insert('l')),
+        ));
+        state.reset_modal();
+        // After reset, undo should be a no-op.
+        let text = state.comment_input.text();
+        let _task = state.update(BoardMessage::Undo);
+        assert_eq!(
+            state.comment_input.text(),
+            text,
+            "undo should be no-op after modal reset"
+        );
+    }
+
+    // ── CommentSent: stale callback guard ─────────────────────────
+    //
+    // Note: there is only a single stale-callback test because the
+    // generation guard fires *before* the Result branch (Ok vs Err),
+    // so both variants exercise identical code. A single Ok test
+    // covers both.
+
+    #[test]
+    fn test_comment_sent_stale_callback() {
+        let mut state = make_board_state();
+        state.sending_comment = true;
+        state.comment_generation = 42;
+
+        // Callback with wrong generation should be dropped gracefully
+        // regardless of Ok/Err (the stale check fires before the branch).
+        let _task = state.update(BoardMessage::CommentSent(0, Ok(())));
+        assert!(
+            !state.sending_comment,
+            "sending_comment should be reset in stale callback"
+        );
     }
 }

@@ -528,6 +528,7 @@ impl Dashboard {
                 self.log_store = Some(log_store);
                 let prev = read_window_state();
                 self.selected_user_name = prev.selected_user;
+                self.board_state.current_user_name = self.selected_user_name.clone();
                 let boot_workspaces = Task::perform(
                     load_workspace_options(prev.selected_workspace),
                     std::convert::identity,
@@ -956,6 +957,7 @@ impl Dashboard {
                 // selected_user_name and persist to window state.
                 if let home::HomeMessage::UserSelected(ref user) = msg {
                     self.selected_user_name = Some(user.clone());
+                    self.board_state.current_user_name = Some(user.clone());
                     self.selected_user_role = None; // reset until loaded
                     crate::audio::voice::set_active_user_name(user);
                     self.persist_window_state();
