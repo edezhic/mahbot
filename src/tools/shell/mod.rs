@@ -1055,7 +1055,11 @@ fn select_profile(segments: &[String], is_chained: bool) -> &'static Profile {
 /// On success (exit 0) with `keep_stderr` patterns: only stderr lines
 /// matching those patterns are appended. On success without patterns
 /// (or when no stderr lines match), stderr is silently dropped.
-/// On failure (non-zero exit): all stderr is appended unconditionally.
+/// On failure (non-zero exit) with `keep_stderr` patterns: the same
+/// filtering is applied to avoid dumping command progress noise
+/// (e.g. `Checking mahbot ...` from cargo). When no lines match,
+/// the stderr section is omitted entirely. On failure without
+/// patterns, all stderr is appended unconditionally.
 fn combine_output(
     stdout: &str,
     stderr: &str,
@@ -1063,27 +1067,41 @@ fn combine_output(
     keep_stderr: Option<&RegexSet>,
 ) -> String {
     let stderr_trimmed = stderr.trim();
-    let exit_ok = exit_code == 0;
     if stderr_trimmed.is_empty() {
         return stdout.to_string();
     }
-    if exit_ok {
-        // Keep only warning/error lines from stderr on success
-        if let Some(patterns) = keep_stderr {
-            let relevant: Vec<&str> = stderr.lines().filter(|l| patterns.is_match(l)).collect();
-            if !relevant.is_empty() {
-                if stdout.is_empty() {
-                    return format!("stderr:\n{}", relevant.join("\n"));
-                }
-                return format!("{stdout}\nstderr:\n{}", relevant.join("\n"));
+    // Apply keep_stderr filtering on both success and failure paths.
+    let filtered = keep_stderr.and_then(|patterns| filter_keep_stderr(stderr, patterns));
+    match (exit_code == 0, filtered) {
+        // Matching lines found — append them as a stderr section.
+        (_, Some(relevant)) => {
+            if stdout.is_empty() {
+                format!("stderr:\n{relevant}")
+            } else {
+                format!("{stdout}\nstderr:\n{relevant}")
             }
         }
-        return stdout.to_string();
+        // Failure without keep_stderr: dump all stderr unconditionally.
+        (false, None) if keep_stderr.is_none() => {
+            if stdout.is_empty() {
+                format!("stderr:\n{stderr_trimmed}")
+            } else {
+                format!("{stdout}\nstderr:\n{stderr_trimmed}")
+            }
+        }
+        // Success or failure with keep_stderr but no matching lines: omit stderr section.
+        _ => stdout.to_string(),
     }
-    if stdout.is_empty() {
-        return format!("stderr:\n{stderr_trimmed}");
+}
+
+/// Filter stderr lines through `keep_stderr` patterns and join matching lines.
+/// Returns `None` when no lines match.
+fn filter_keep_stderr<'a>(stderr: &'a str, patterns: &RegexSet) -> Option<String> {
+    let relevant: Vec<&'a str> = stderr.lines().filter(|l| patterns.is_match(l)).collect();
+    if relevant.is_empty() {
+        return None;
     }
-    format!("{stdout}\nstderr:\n{stderr_trimmed}")
+    Some(relevant.join("\n"))
 }
 
 /// Shared tail: append elapsed timing (if ≥1s), then spill to file.
@@ -1629,6 +1647,15 @@ fn apply_profile_pipeline(
     if processed.trim().is_empty()
         && let Some(msg) = profile.on_empty
     {
+        // When on_fail_msg is set, use it (fully replacing the message
+        // including the "(failed)" suffix) to avoid contradictory output
+        // like "[cargo clippy: ok] (failed)".
+        if exit_code != 0
+            && let Some(fail_msg) = profile.on_fail_msg
+        {
+            let secs = elapsed.as_secs_f64();
+            return combine(&format!("{fail_msg} ({secs:.1}s)"));
+        }
         let exit_note = if exit_code == 0 { "" } else { " (failed)" };
         let secs = elapsed.as_secs_f64();
         return combine(&format!("{msg}{exit_note} ({secs:.1}s)"));
@@ -2303,6 +2330,45 @@ mod tests {
                 contains: &["warning:"],
                 ..Default::default()
             },
+            // ── on_fail_msg tests ────────────────────────────────────
+            ShellOutputCase {
+                name: "cargo clippy failure shows on_fail_msg (no (failed) suffix)",
+                command: "cargo clippy",
+                exit_code: 1,
+                eq: Some("[cargo clippy: failed] (0.0s)"),
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "cargo clippy failure filters progress lines from stderr",
+                command: "cargo clippy",
+                stderr: "    Checking mahbot v0.1.0 (/Users/user/mahbot)\nwarning: unused import: `std::fs`\n  --> src/main.rs:1:5\n",
+                exit_code: 1,
+                contains: &["warning:", "[cargo clippy: failed]"],
+                not_contains: &["Checking mahbot"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "cargo clippy failure omits stderr when no keep_stderr match",
+                command: "cargo clippy",
+                stderr: "    Checking mahbot v0.1.0\n    Finished dev [unoptimized]\n",
+                exit_code: 1,
+                eq: Some("[cargo clippy: failed] (0.0s)"),
+                not_contains: &["Checking", "stderr:"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "cargo build failure shows on_fail_msg (no (failed) suffix)",
+                command: "cargo build",
+                exit_code: 1,
+                eq: Some("[cargo: failed] (0.0s)"),
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "cargo build success still shows ok (backward compat)",
+                command: "cargo build",
+                eq: Some("[cargo: ok] (0.0s)"),
+                ..Default::default()
+            },
         ];
         check_shell_output(cases);
     }
@@ -2586,10 +2652,12 @@ mod tests {
                 ..Default::default()
             },
             ShellOutputCase {
-                // Stage 5 (on-empty): credentials from stderr are scrubbed
+                // Stage 5 (on-empty): credentials from stderr are scrubbed.
+                // Uses a `warning:` prefix so the line passes through the
+                // keep_stderr filter even on the failure path.
                 name: "on-empty scrubs credentials in stderr",
                 command: "tsc --noEmit",
-                stderr: "api_key=abcdefghijklmnop12345678",
+                stderr: "warning: api_key=abcdefghijklmnop12345678",
                 exit_code: 1,
                 not_contains: &["api_key=abcdefghijklmnop12345678"],
                 contains: &["api_key=abcd*[REDACTED]", "[tsc: ok]"],

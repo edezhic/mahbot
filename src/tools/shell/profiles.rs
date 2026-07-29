@@ -19,6 +19,15 @@ pub(super) struct Profile {
     pub(super) tail_lines: Option<usize>,
     pub(super) max_lines: Option<usize>,
     pub(super) on_empty: Option<&'static str>,
+    /// Message used instead of `on_empty` when the exit code is non-zero.
+    /// Self-contained (replaces both the `on_empty` message and the `(failed)`
+    /// suffix), so output like `[cargo clippy: ok] (failed)` is avoided.
+    /// When `None` (the default), the existing `on_empty` + `(failed)` suffix
+    /// behavior is preserved for backward compatibility.
+    ///
+    /// **Note:** This is only used when `on_empty` is also set — it is an
+    /// alternative message for the `on_empty` pathway, not an independent one.
+    pub(super) on_fail_msg: Option<&'static str>,
     /// Optional transform that replaces the pipeline output after line-level
     /// processing but before `combine_output` and `finish_shell_output`.
     /// Receives the processed output and exit code, returns the transformed output.
@@ -44,6 +53,7 @@ impl Profile {
             tail_lines: None,
             max_lines: None,
             on_empty: None,
+            on_fail_msg: None,
             output_transform: None,
             standalone_only: false,
         }
@@ -94,6 +104,18 @@ impl Profile {
 
     const fn on_empty(mut self, msg: &'static str) -> Self {
         self.on_empty = Some(msg);
+        self
+    }
+
+    /// Set the message shown when all output is stripped and the exit code is
+    /// non-zero. Self-contained — replaces both the `on_empty` message and
+    /// the `(failed)` suffix. When `None` (the default), the existing behavior
+    /// (`on_empty` + `(failed)` suffix) is preserved.
+    ///
+    /// **Note:** This is only effective when `on_empty` is also set — it is an
+    /// alternative message for the `on_empty` pathway, not an independent one.
+    const fn on_fail(mut self, msg: &'static str) -> Self {
+        self.on_fail_msg = Some(msg);
         self
     }
 
@@ -168,14 +190,25 @@ fn small_util(matcher: &str, max_lines: usize) -> Profile {
         .max(max_lines)
 }
 
-/// Build a cargo subcommand profile (build/check). Strips compilation noise,
+/// Build a cargo subcommand profile (build/check/clippy). Strips compilation noise,
 /// keeps stderr warnings/errors, signals clean success via on_empty.
-fn cargo_tool(matcher: &str, max_lines: usize, ok_msg: &'static str) -> Profile {
-    Profile::new(matcher)
+/// `fail_msg` is used when all output is stripped and the exit code is non-zero —
+/// pass `Some("[cargo clippy: failed]")` to avoid the contradictory `[cargo clippy: ok] (failed)`.
+fn cargo_tool(
+    matcher: &str,
+    max_lines: usize,
+    ok_msg: &'static str,
+    fail_msg: Option<&'static str>,
+) -> Profile {
+    let mut p = Profile::new(matcher)
         .strip_set(&CARGO_COMPILE_STRIP)
         .keep_stderr(CARGO_COMPILE_KEEP_STDERR)
         .max(max_lines)
-        .on_empty(ok_msg)
+        .on_empty(ok_msg);
+    if let Some(msg) = fail_msg {
+        p = p.on_fail(msg);
+    }
+    p
 }
 
 /// Build a "lint tool" profile: strips blank lines, keeps stderr
@@ -258,8 +291,18 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
             .max(50),
         Profile::new(r"^git\s+diff\b").on_empty("[git diff: no changes]"),
         // ── Rust toolchain ────────────────────────────────────────────────
-        cargo_tool(r"^cargo\s+(build|check)\b", 50, "[cargo: ok]"),
-        cargo_tool(r"^cargo\s+clippy\b", 50, "[cargo clippy: ok]"),
+        cargo_tool(
+            r"^cargo\s+(build|check)\b",
+            50,
+            "[cargo: ok]",
+            Some("[cargo: failed]"),
+        ),
+        cargo_tool(
+            r"^cargo\s+clippy\b",
+            50,
+            "[cargo clippy: ok]",
+            Some("[cargo clippy: failed]"),
+        ),
         Profile::new(r"^cargo\s+fmt\b")
             .max(50)
             .on_empty("[cargo fmt: ok]"),
