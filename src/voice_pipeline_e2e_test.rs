@@ -1355,6 +1355,96 @@ impl DetectionMetrics {
     }
 }
 
+// ── Classifier trigger metrics (mahbot-952) ─────────────────────────────────
+
+/// Classifier-only trigger metrics for a set of negative variants.
+///
+/// These metrics track the classifier stage independently from the
+/// verifier, allowing separate monitoring of classifier behavior and
+/// verifier filtering effectiveness run over run.
+///
+/// The four counters decompose what happens when the classifier triggers:
+///
+/// | Condition | Counter |
+/// |-----------|---------|
+/// | `max_rolling_sum < MIN_CLASSIFIER_THRESHOLD` | not counted |
+/// | Triggered + `warmup_completed == false` | `warmup_suppressed` |
+/// | Triggered + warmup completed + `detected == false` | `verifier_caught` |
+/// | Triggered + `detected == true` | `full_pipeline_fa` |
+#[derive(Debug, Default, Clone, Copy)]
+struct ClassifierTriggerMetrics {
+    /// Total variants tested in this group.
+    total_variants: usize,
+    /// Number of variants where max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD.
+    classifier_triggers: usize,
+    /// Number where classifier triggered but warmup was not completed,
+    /// so the verifier never evaluated these frames.
+    warmup_suppressed: usize,
+    /// Number where classifier triggered, warmup completed, but
+    /// detected == false (verifier successfully rejected).
+    verifier_caught: usize,
+    /// Number where detected == true (full pipeline false accept).
+    full_pipeline_fa: usize,
+}
+
+impl ClassifierTriggerMetrics {
+    /// Compute metrics from a slice of per-variant results.
+    fn compute(per_variant: &[PerVariantResult]) -> Self {
+        let mut m = Self::default();
+        for pv in per_variant {
+            m.accumulate(pv);
+        }
+        m
+    }
+
+    /// The overall prevention rate: fraction of classifier triggers that did
+    /// NOT become full-pipeline false accepts (i.e. were caught by either
+    /// warm-up suppression or the verifier).
+    ///
+    /// Returns `None` when there are no classifier triggers (division by zero).
+    fn prevention_rate(&self) -> Option<f64> {
+        if self.classifier_triggers == 0 {
+            None
+        } else {
+            Some(
+                (self.classifier_triggers - self.full_pipeline_fa) as f64
+                    / self.classifier_triggers as f64,
+            )
+        }
+    }
+
+    /// Accumulate a single per-variant result into this metrics struct.
+    ///
+    /// This shares the classification branching logic with [`compute`] so that
+    /// callers who cannot collect a flat slice (e.g. per-tier partitioning) can
+    /// reuse the same counting rules without duplication.
+    fn accumulate(&mut self, pv: &PerVariantResult) {
+        self.total_variants += 1;
+        if pv.max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD {
+            self.classifier_triggers += 1;
+            if !pv.warmup_completed {
+                self.warmup_suppressed += 1;
+            } else if !pv.detected {
+                self.verifier_caught += 1;
+            } else {
+                self.full_pipeline_fa += 1;
+            }
+        }
+    }
+}
+
+/// Convert classifier trigger metrics to a JSON object for the benchmark report.
+fn ct_to_json(ct: &ClassifierTriggerMetrics) -> serde_json::Value {
+    serde_json::json!({
+        "total_variants": ct.total_variants,
+        "classifier_triggers": ct.classifier_triggers,
+        "warmup_suppressed": ct.warmup_suppressed,
+        "verifier_caught": ct.verifier_caught,
+        "full_pipeline_fa": ct.full_pipeline_fa,
+        "prevention_rate": ct.prevention_rate(),
+    })
+}
+
 /// Process a list of audio clips through the detection pipeline, recording
 /// results in `metrics`.  Shared helper for positive and negative detection
 /// test blocks, eliminating the repetitive match-and-track boilerplate.
@@ -2578,6 +2668,46 @@ pub(crate) fn run_internal() {
     // Total false accept (across all tiers and categories)
     let total_false_accepts = conf_fa_counts.iter().sum::<usize>() + shared_fa_count;
 
+    // ── Classifier trigger metrics for negative phases (mahbot-952) ────────
+    let conf_classifier = ClassifierTriggerMetrics::compute(&conf_metrics.per_variant);
+    let unrel_classifier = ClassifierTriggerMetrics::compute(&unrelated_metrics.per_variant);
+    let silence_classifier = ClassifierTriggerMetrics::compute(&silence_metric.per_variant);
+
+    // Per-tier confusable classifier trigger metrics
+    let mut conf_classifier_by_tier: [ClassifierTriggerMetrics; 3] = Default::default();
+    for pv in &conf_metrics.per_variant {
+        let phrase = phrase_from_label(&pv.variant, "confusable");
+        conf_classifier_by_tier[tier_for_phrase(phrase).index()].accumulate(pv);
+    }
+
+    // Noise: per-profile + aggregate classifier trigger metrics.
+    // When the classifier is degenerate, noise_metrics is empty because
+    // all detection phases are skipped.  In that case produce default
+    // (all-zero) metrics so downstream output paths (JSON, info!(),
+    // eprintln) always have consistent data without conditional guards.
+    let noise_classifier_per_profile: Vec<ClassifierTriggerMetrics> = if noise_metrics.is_empty() {
+        NOISE_PROFILES
+            .iter()
+            .map(|_| ClassifierTriggerMetrics::default())
+            .collect()
+    } else {
+        noise_metrics
+            .iter()
+            .map(|m| ClassifierTriggerMetrics::compute(&m.per_variant))
+            .collect()
+    };
+    let noise_classifier_aggregate = noise_classifier_per_profile.iter().copied().fold(
+        ClassifierTriggerMetrics::default(),
+        |mut acc, m| {
+            acc.total_variants += m.total_variants;
+            acc.classifier_triggers += m.classifier_triggers;
+            acc.warmup_suppressed += m.warmup_suppressed;
+            acc.verifier_caught += m.verifier_caught;
+            acc.full_pipeline_fa += m.full_pipeline_fa;
+            acc
+        },
+    );
+
     info!("══════════════════════════════════════════════");
     info!("      Voice Pipeline E2E Benchmark Results");
     info!("══════════════════════════════════════════════");
@@ -2636,6 +2766,48 @@ pub(crate) fn run_internal() {
     );
     if !noise_false_accepts.is_empty() {
         info!("  False triggers: {:?}", noise_false_accepts);
+    }
+
+    // ── Classifier trigger report (mahbot-952) ──────────────────────────
+    info!("──────────────────────────────────────────────");
+    info!("  Classifier trigger metrics (negative phases):");
+
+    let pr = |ct: &ClassifierTriggerMetrics| -> String {
+        match ct.prevention_rate() {
+            Some(r) => format!("{:.0}%", r * 100.0),
+            None => "N/A".to_string(),
+        }
+    };
+    let ct_line = |name: &str, ct: &ClassifierTriggerMetrics| -> String {
+        format!(
+            "    {name}: {tr}/{tot} triggers, warmup_suppressed={ws}, verifier_caught={vc}, fa={fa}, prevention={pr}",
+            tr = ct.classifier_triggers,
+            tot = ct.total_variants,
+            ws = ct.warmup_suppressed,
+            vc = ct.verifier_caught,
+            fa = ct.full_pipeline_fa,
+            pr = pr(ct),
+        )
+    };
+    info!("{}", ct_line("Confusable", &conf_classifier));
+    for (i, tier_name) in [(0, "easy"), (1, "medium"), (2, "hard")] {
+        info!(
+            "    └─ {}",
+            ct_line(tier_name, &conf_classifier_by_tier[i]).trim_start()
+        );
+    }
+    info!("{}", ct_line("Unrelated", &unrel_classifier));
+    info!("{}", ct_line("Silence", &silence_classifier));
+    info!(
+        "{}",
+        ct_line("Noise (aggregate)", &noise_classifier_aggregate)
+    );
+    for i in 0..NOISE_PROFILES.len() {
+        let profile_ct = &noise_classifier_per_profile[i];
+        info!(
+            "    └─ {}",
+            ct_line(NOISE_PROFILES[i].0, profile_ct).trim_start()
+        );
     }
 
     info!("──────────────────────────────────────────────");
@@ -2833,6 +3005,24 @@ pub(crate) fn run_internal() {
             "noise": noise_false_accepts.len(),
             "total": total_false_accepts,
         },
+        "classifier_trigger_metrics": {
+            "confusable": ct_to_json(&conf_classifier),
+            "confusable_by_tier": {
+                "easy": ct_to_json(&conf_classifier_by_tier[0]),
+                "medium": ct_to_json(&conf_classifier_by_tier[1]),
+                "hard": ct_to_json(&conf_classifier_by_tier[2]),
+            },
+            "unrelated": ct_to_json(&unrel_classifier),
+            "silence": ct_to_json(&silence_classifier),
+            "noise": {
+                "aggregate": ct_to_json(&noise_classifier_aggregate),
+                "per_profile": serde_json::Value::Object(
+                    NOISE_PROFILES.iter().enumerate().map(|(i, (label, _))| {
+                        (label.to_string(), ct_to_json(&noise_classifier_per_profile[i]))
+                    }).collect()
+                ),
+            },
+        },
         "phases": {
             "phase_1_enrollment_audio_ms": phase_times[P_ENROLLMENT_AUDIO],
             "phase_2_vad_enrollment_ms": phase_times[P_VAD_ENROLLMENT],
@@ -2979,10 +3169,10 @@ pub(crate) fn run_internal() {
     );
     eprintln!(
         "           ───────────────────────────────────────\n\
-         \x20          | Easy  total: {easy_total}  {easy_pass_char} (limit ≤{easy_limit}) |\n\
-         \x20          | Medium total: {medium_total}  {med_pass_char} (limit ≤{med_limit}) |\n\
-         \x20          | Hard  total: {hard_total}  {hard_pass_char} (limit ≤{hard_limit}) |\n\
-         \x20          ───────────────────────────────────────",
+           | Easy  total: {easy_total}  {easy_pass_char} (limit ≤{easy_limit}) |\n\
+           | Medium total: {medium_total}  {med_pass_char} (limit ≤{med_limit}) |\n\
+           | Hard  total: {hard_total}  {hard_pass_char} (limit ≤{hard_limit}) |\n\
+           ───────────────────────────────────────",
         easy_total = tier_total_fas[0],
         easy_limit = tier_limits(BenchTier::Easy).total,
         easy_pass_char = if easy_ok { '✓' } else { '✗' },
@@ -2993,6 +3183,40 @@ pub(crate) fn run_internal() {
         hard_limit = tier_limits(BenchTier::Hard).total,
         hard_pass_char = if hard_ok { '✓' } else { '✗' },
     );
+
+    // ── Classifier trigger summary (mahbot-952) ────────────────────────
+    let ct_stderr = |ct: &ClassifierTriggerMetrics| -> String {
+        match ct.prevention_rate() {
+            Some(r) => format!(
+                "{}/{} triggers, ws={}, vc={}, fa={}, prevention={:.0}%",
+                ct.classifier_triggers,
+                ct.total_variants,
+                ct.warmup_suppressed,
+                ct.verifier_caught,
+                ct.full_pipeline_fa,
+                r * 100.0,
+            ),
+            None => format!("{}/{} triggers", ct.classifier_triggers, ct.total_variants),
+        }
+    };
+    eprintln!(
+        "         Classifier triggers:\
+         \n           Confusable: {conf}\
+         \n             Easy:     {easy}\
+         \n             Medium:   {med}\
+         \n             Hard:     {hard}\
+         \n           Unrelated:  {unrel}\
+         \n           Silence:    {sil}\
+         \n           Noise:      {noise}",
+        conf = ct_stderr(&conf_classifier),
+        easy = ct_stderr(&conf_classifier_by_tier[0]),
+        med = ct_stderr(&conf_classifier_by_tier[1]),
+        hard = ct_stderr(&conf_classifier_by_tier[2]),
+        unrel = ct_stderr(&unrel_classifier),
+        sil = ct_stderr(&silence_classifier),
+        noise = ct_stderr(&noise_classifier_aggregate),
+    );
+
     eprintln!(
         "         ═══════════════════════════════════════════════════════════\n\
                    RESULT: {overall_pass} {}\n\
