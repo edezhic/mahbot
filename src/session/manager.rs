@@ -16,7 +16,7 @@ use anyhow::Result;
 
 use crate::board::BOARD;
 use crate::prompt::{build_workspace_context, format_ticket_block, load_prompt, substitute};
-use crate::session::PREVIOUS_CONVERSATION_SUMMARY_PREFIX;
+
 use crate::skills;
 use crate::{ChatMessage, ChatRole, Role, Workspace};
 
@@ -141,9 +141,8 @@ impl Session {
         let mut compacted = Self::build_context_messages(ws, role, ticket).await;
 
         // Append conversation summary + current user request
-        compacted.push(ChatMessage::system(format!(
-            "{PREVIOUS_CONVERSATION_SUMMARY_PREFIX}{summary_text}"
-        )));
+        let prefix = load_prompt("summary_prefix.md");
+        compacted.push(ChatMessage::system(format!("{prefix}{summary_text}")));
         compacted.push(user_msg_with_datetime(msg));
 
         // Persist compacted history (system prompt + summary only).

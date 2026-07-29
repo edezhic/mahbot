@@ -42,10 +42,6 @@ use chrono::{DateTime, Utc};
 ///
 pub(crate) const SUMMARIZATION_THRESHOLD: usize = 100_000;
 
-/// Stored session rows and second `history` entry after compaction use this prefix so channel
-/// orchestration can re-inject the summary on later turns (baseline `system` rows stay excluded).
-pub(crate) const PREVIOUS_CONVERSATION_SUMMARY_PREFIX: &str = "Previous conversation summary:\n\n";
-
 /// Rough token count for history (~4 chars/token + 4 tokens per-message overhead)
 #[must_use]
 pub(crate) fn estimate_tokens(messages: &[ChatMessage]) -> usize {
