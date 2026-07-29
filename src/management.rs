@@ -31,7 +31,8 @@ use futures_util::future::join_all;
 use crate::agent::run_agent;
 use crate::board::{BOARD, BoardStore, PipelineCheck, Ticket, TicketComment, TicketPhase};
 use crate::git_commands::{
-    list_new_or_untracked_files, parse_new_files_from_porcelain, run_git_status,
+    has_unstaged_changes, list_new_or_untracked_files, parse_new_files_from_porcelain,
+    run_git_add_all, run_git_status,
 };
 use crate::message_router;
 use crate::prompt::{load_prompt, substitute};
@@ -2492,6 +2493,50 @@ async fn process_verifier_verdicts(
 /// structural reasons apply here (parallel agents via [`run_parallel_agents`],
 /// `assigned_to` set to `NULL` during the [`claim_ticket_in_workspace`] claim).
 async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo) {
+    // ── Skip-review check for Reviewers ──────────────────────────────
+    // If no unstaged changes exist, all code was already reviewed in a
+    // previous round — transition directly to Reviewed without spawning agents.
+    let is_reviewer = vi.role == Role::Reviewer;
+    let repo_path = ws.as_path();
+    let git_available = is_reviewer
+        && crate::git_commands::git_is_installed().await
+        && crate::git_commands::is_git_repo(repo_path);
+
+    if git_available {
+        match run_git_status(repo_path).await {
+            Ok(porcelain) => {
+                if !has_unstaged_changes(&porcelain) {
+                    info!(
+                        ticket = %ticket.id,
+                        "No unstaged changes — skipping reviewer dispatch",
+                    );
+                    let _ = comment_and_transition(
+                        TransitionCtx {
+                            ticket: &ticket,
+                            source: vi.active_phase,
+                            target: TicketPhase::Reviewed,
+                            notify: NotifyPolicy::Buffer,
+                            log_label: vi.log_label,
+                        },
+                        SYSTEM_ROLE,
+                        "No unstaged changes detected — all code was already reviewed in a \
+                             previous round. Skipping reviewer dispatch.",
+                    )
+                    .await;
+                    return;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    ticket = %ticket.id,
+                    error = %e,
+                    "Git status check failed for skip-review — proceeding with normal review",
+                );
+            }
+        }
+    }
+
+    // ── Normal verifier dispatch ─────────────────────────────────────
     let engineer_response = ticket
         .comments
         .iter()
@@ -2512,6 +2557,24 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
     }
 
     process_verifier_verdicts(&ticket, &results, vi).await;
+
+    // ── Auto-stage after review ──────────────────────────────────────
+    // Stage all working tree changes so they are marked as "already reviewed"
+    // for the next pipeline round. This runs regardless of pass/fail outcome.
+    if git_available {
+        if let Err(e) = run_git_add_all(repo_path).await {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to stage changes after review — continuing",
+            );
+        } else {
+            debug!(
+                ticket = %ticket.id,
+                "Staged all changes after review",
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -249,13 +249,59 @@ pub async fn run_git_check_ignore(
     Ok(ignored)
 }
 
+/// Check if `git status --porcelain` output contains any unstaged changes.
+///
+/// Looks for any line where the worktree status column (second character) is
+/// non-space — this indicates an unstaged modification, deletion, or untracked
+/// file (`??` has `?` in the worktree column, `!!` ignored lines also have `!`
+/// but are excluded here since default `--porcelain` doesn't show ignored files).
+/// Fully-staged-only entries (`M `, `A `) are ignored.
+///
+/// This is a pure parsing function with no I/O — callers run `git status`
+/// themselves and pass the captured stdout here.
+///
+/// # Example
+///
+/// ```ignore
+/// assert!(!has_unstaged_changes(""));
+/// assert!(!has_unstaged_changes("M  Cargo.toml\nA  src/lib.rs\n"));
+/// assert!(has_unstaged_changes(" M src/lib.rs"));
+/// assert!(has_unstaged_changes("?? new_file.txt"));
+/// assert!(has_unstaged_changes("MM src/lib.rs"));
+/// ```
+#[must_use]
+pub fn has_unstaged_changes(porcelain: &str) -> bool {
+    porcelain.lines().any(|line| {
+        let line = line.trim_end();
+        if line.is_empty() {
+            return false;
+        }
+        // Check the worktree status column (byte index 1).
+        // For `??` (untracked) lines, both columns are `?` — the second is non-space.
+        // For ` M`, `MM`, ` D`, etc., the second column is non-space.
+        // For `M `, `A `, etc., the second column is space (fully staged).
+        line.as_bytes().get(1).is_some_and(|&b| b != b' ')
+    })
+}
+
+/// Stage all changes in the working tree via `git add -A`.
+///
+/// This stages tracked modifications, untracked files, and file deletions.
+/// Unlike [`run_git_commit`], this does NOT commit — it only stages changes
+/// into the index.
+///
+/// Returns the stdout of the git command on success.
+pub async fn run_git_add_all(repo_path: &Path) -> anyhow::Result<String> {
+    run_git_command(repo_path, &["add", "-A"]).await
+}
+
 /// Stage all changes and commit with the given message.
 /// Runs `git add -A` followed by `git commit -m "<msg>"`,
 /// then captures the full SHA via `git rev-parse HEAD` and
 /// line stats via `git diff --numstat`.
 pub async fn run_git_commit(repo_path: &Path, message: &str) -> anyhow::Result<CommitInfo> {
     // Stage all changes (tracked, untracked, removed) in the worktree.
-    run_git_command(repo_path, &["add", "-A"]).await?;
+    run_git_add_all(repo_path).await?;
 
     run_git_command(repo_path, &["commit", "-m", message])
         .await
@@ -1322,5 +1368,65 @@ AM staged_then_modified.js
 
         let result = run_git_discard(&repo_path, "test.txt", DiscardTarget::File).await;
         assert!(result.is_ok(), "discarding a clean file should succeed");
+    }
+
+    // ── has_unstaged_changes ─────────────────────────────────────────
+
+    /// Empty porcelain has no unstaged changes.
+    #[test]
+    fn has_unstaged_changes_empty() {
+        assert!(!has_unstaged_changes(""));
+        assert!(!has_unstaged_changes("\n\n"));
+    }
+
+    /// Fully-staged-only entries are not unstaged.
+    #[test]
+    fn has_unstaged_changes_fully_staged() {
+        assert!(!has_unstaged_changes("M  Cargo.toml\n"));
+        assert!(!has_unstaged_changes("A  src/lib.rs\n"));
+        assert!(!has_unstaged_changes(
+            "M  Cargo.toml\nA  src/lib.rs\nD  old.rs\n"
+        ));
+    }
+
+    /// Unstaged modifications (space in index column) are detected.
+    #[test]
+    fn has_unstaged_changes_unstaged_modifications() {
+        assert!(has_unstaged_changes(" M src/lib.rs\n"));
+        assert!(has_unstaged_changes(" D src/old.rs\n"));
+    }
+
+    /// Dual-status entries (staged + unstaged) are detected.
+    #[test]
+    fn has_unstaged_changes_dual_status() {
+        assert!(has_unstaged_changes("MM src/lib.rs\n"));
+        assert!(has_unstaged_changes("AM src/new.rs\n"));
+        assert!(has_unstaged_changes("MD src/old.rs\n"));
+    }
+
+    /// Untracked files (??) are detected.
+    #[test]
+    fn has_unstaged_changes_untracked() {
+        assert!(has_unstaged_changes("?? new_file.rs\n"));
+        assert!(has_unstaged_changes("?? dir/untracked.txt\n"));
+    }
+
+    /// Mixed porcelain output is parsed correctly.
+    #[test]
+    fn has_unstaged_changes_mixed() {
+        // Only staged — no unstaged.
+        assert!(!has_unstaged_changes("M  Cargo.toml\nA  src/main.rs\n"));
+
+        // Staged + unstaged — has unstaged.
+        assert!(has_unstaged_changes(
+            "M  Cargo.toml\n M src/main.rs\n?? new.rs\n"
+        ));
+    }
+
+    /// Whitespace trimming — trailing newline handled.
+    #[test]
+    fn has_unstaged_changes_trailing_newline() {
+        assert!(has_unstaged_changes(" M file.rs\n"));
+        assert!(!has_unstaged_changes("M  file.rs\n"));
     }
 }

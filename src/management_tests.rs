@@ -1274,3 +1274,51 @@ async fn dispatch_diagnostics_cases() {
         );
     }
 }
+
+// ── dispatch_verifiers skip-review ──────────────────────────────
+
+/// When a ticket is in InReview and the working tree has no unstaged changes,
+/// dispatch_verifiers should skip spawning reviewers and transition directly
+/// to Reviewed with a system comment explaining the skip.
+#[tokio::test]
+async fn dispatch_verifiers_skip_review_when_no_unstaged_changes() {
+    if !crate::git_commands::git_is_installed().await {
+        eprintln!("git not installed — skipping git-dependent test");
+        return;
+    }
+
+    let (_dir, repo_path) = crate::util::test::init_temp_repo();
+    let repo_str = repo_path.to_str().expect("temp path is valid UTF-8");
+
+    let (ws, ticket_id) = setup_ticket(
+        repo_str,
+        "skip_review_test",
+        "Skip Review Test",
+        TicketPhase::InReview,
+    )
+    .await;
+
+    let ticket = Arc::new(expect_ticket(board(), &ticket_id).await);
+
+    dispatch_verifiers(ticket, ws, REVIEWER_VI).await;
+
+    // Verify the ticket was transitioned to Reviewed.
+    let phase = expect_ticket_phase(board(), &ticket_id).await;
+    assert_eq!(
+        phase,
+        TicketPhase::Reviewed,
+        "Ticket with no unstaged changes should skip review and go directly to Reviewed"
+    );
+
+    // Verify a SYSTEM_ROLE comment was written explaining the skip.
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get_comments");
+    assert!(
+        comments
+            .iter()
+            .any(|c| { c.role == SYSTEM_ROLE && c.content.contains("No unstaged changes") }),
+        "Expected a SYSTEM_ROLE comment explaining the skip-review reason"
+    );
+}
