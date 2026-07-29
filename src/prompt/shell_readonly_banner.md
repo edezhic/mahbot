@@ -1,0 +1,1 @@
+⚠️ READ-ONLY MODE: You are not permitted to modify the workspace. Commands that write files, delete files, or mutate git state will be rejected before execution. Writing to the OS temp directory is allowed. Use this tool only for inspection: reading files, listing directories, running cargo check/test/clippy, git status/log/diff, searching, etc.

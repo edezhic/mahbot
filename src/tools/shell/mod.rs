@@ -718,13 +718,9 @@ impl Tool for ShellTool {
     fn description(&self) -> String {
         match self.mode {
             ShellMode::ReadOnly => {
-                const RESTRICTION: &str = "\
-⚠️ READ-ONLY MODE: You are not permitted to modify the workspace. \
-Commands that write files, delete files, or mutate git state will be rejected before execution. \
-Writing to the OS temp directory is allowed. \
-Use this tool only for inspection: reading files, listing directories, running cargo check/test/clippy, git status/log/diff, searching, etc.\n\n";
+                let banner = crate::prompt::load_prompt("shell_readonly_banner.md");
                 let base = crate::prompt::load_prompt(&format!("tool/{}.md", self.name()));
-                format!("{RESTRICTION}{base}")
+                format!("{banner}\n\n{base}")
             }
             ShellMode::Full => crate::prompt::load_prompt(&format!("tool/{}.md", self.name())),
         }
