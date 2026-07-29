@@ -912,13 +912,19 @@ impl Dashboard {
             }
             Message::Shutdown | Message::CloseRequested(_) => self.save_and_exit(),
             Message::CheckpointAndExit => iced::exit(),
-            Message::WindowEvent(_id, event) => {
+            Message::WindowEvent(id, event) => {
                 match event {
-                    window::Event::Resized(new_size) => self.last_size = new_size,
-                    window::Event::Moved(new_pos) => self.last_position = new_pos,
-                    _ => {}
+                    window::Event::Resized(new_size) => {
+                        self.last_size = new_size;
+                        Task::none()
+                    }
+                    window::Event::Moved(new_pos) => {
+                        self.last_position = new_pos;
+                        Task::none()
+                    }
+                    window::Event::Opened { .. } => disable_macos_text_services(id),
+                    _ => Task::none(),
                 }
-                Task::none()
             }
             Message::CloseDiffModal => {
                 self.show_diff_modal = false;
@@ -2501,4 +2507,58 @@ fn resolve_dashboard_workspace_path(
         );
         (String::new(), None)
     }
+}
+
+/// Disable unwanted macOS text services (autocorrect, AutoFill, smart quotes,
+/// etc.) on the winit view.  No-op on non-macOS platforms.
+///
+/// Uses [`iced::window::run`] to get the native `NSView` handle and sets all
+/// `NSTextInputTraits` properties to `NSTextInputTraitType::No`.
+///
+/// This does **not** disable IME (CJK / emoji input) — only the text-services
+/// layer that `NSTextInputClient` enables automatically.
+#[cfg(target_os = "macos")]
+fn disable_macos_text_services(window_id: window::Id) -> Task<Message> {
+    use raw_window_handle::RawWindowHandle;
+
+    window::run(window_id, |handle| {
+        // SAFETY: `HasWindowHandle::window_handle` is implemented for the
+        // window; the returned handle is valid.
+        if let Ok(handle) = handle.window_handle() {
+            if let RawWindowHandle::AppKit(appkit) = handle.as_raw() {
+                let ns_view = appkit.ns_view.as_ptr().cast::<objc2::runtime::NSObject>();
+                // SAFETY: The NSView is alive (the window just opened) and
+                // responds to all NSTextInputTraits selectors on modern macOS.
+                unsafe {
+                    use objc2::msg_send;
+                    use objc2_app_kit::NSTextInputTraitType;
+
+                    let () =
+                        msg_send![ns_view, setAutocorrectionType: NSTextInputTraitType::No];
+                    let () = msg_send![ns_view, setSpellCheckingType: NSTextInputTraitType::No];
+                    let () =
+                        msg_send![ns_view, setGrammarCheckingType: NSTextInputTraitType::No];
+                    let () = msg_send![ns_view, setSmartQuotesType: NSTextInputTraitType::No];
+                    let () = msg_send![ns_view, setSmartDashesType: NSTextInputTraitType::No];
+                    let () =
+                        msg_send![ns_view, setSmartInsertDeleteType: NSTextInputTraitType::No];
+                    let () =
+                        msg_send![ns_view, setTextReplacementType: NSTextInputTraitType::No];
+                    let () = msg_send![ns_view, setDataDetectionType: NSTextInputTraitType::No];
+                    let () = msg_send![ns_view, setLinkDetectionType: NSTextInputTraitType::No];
+                    let () =
+                        msg_send![ns_view, setTextCompletionType: NSTextInputTraitType::No];
+                    let () =
+                        msg_send![ns_view, setInlinePredictionType: NSTextInputTraitType::No];
+                }
+            }
+        }
+    })
+    .map(|()| Message::Nop)
+}
+
+/// No-op on non-macOS platforms.
+#[cfg(not(target_os = "macos"))]
+fn disable_macos_text_services(_window_id: window::Id) -> Task<Message> {
+    Task::none()
 }
