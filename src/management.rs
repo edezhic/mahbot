@@ -1074,7 +1074,10 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     let message = if feedback.is_empty() {
         load_prompt("implement.md")
     } else {
-        format!("New feedback to address:\n{}", feedback.join("\n---\n"))
+        substitute(
+            &load_prompt("bounce_feedback.md"),
+            &[("{{feedback}}", &feedback.join("\n---\n"))],
+        )
     };
 
     if let Err(e) = board().set_assigned_to(&ticket.id, Some(&agent_id)).await {
@@ -1103,6 +1106,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
 
     // Diagnostics are dispatched by the poll loop as a separate
     // PollPhase::DiagnosticsCheck — see poll_round().
+    let engineer_failed = load_prompt("engineer_failed.md");
     let (comment_text, target_phase, notify) = if let Some(ref text) = response {
         (
             text.as_str(),
@@ -1110,7 +1114,11 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
             NotifyPolicy::Buffer,
         )
     } else {
-        ("Agent failed", TicketPhase::Failed, NotifyPolicy::Notify)
+        (
+            engineer_failed.as_str(),
+            TicketPhase::Failed,
+            NotifyPolicy::Notify,
+        )
     };
 
     if !comment_and_transition(
@@ -1981,19 +1989,24 @@ fn format_verdict_comment(
             }
             let comment = format_verdict_body(v);
             if comment.is_empty() {
-                return Some(format!(
-                    "{} agent scored {}/10 with no specific critique provided.",
-                    comment_role, v.score
+                let score_str = v.score.to_string();
+                return Some(substitute(
+                    &load_prompt("verdict_empty.md"),
+                    &[
+                        ("{{comment_role}}", comment_role),
+                        ("{{score}}", &score_str),
+                    ],
                 ));
             }
             Some(comment)
         }
-        ParallelVerdict::ParseFailed => Some(format!(
-            "{comment_role} produced a response but verdict extraction failed — \
-             treating as a failure."
+        ParallelVerdict::ParseFailed => Some(substitute(
+            &load_prompt("verdict_parse_failed.md"),
+            &[("{{comment_role}}", comment_role)],
         )),
-        ParallelVerdict::NoResponse => Some(format!(
-            "{comment_role} agent failed to produce a response — counting as a failure."
+        ParallelVerdict::NoResponse => Some(substitute(
+            &load_prompt("verdict_no_response.md"),
+            &[("{{comment_role}}", comment_role)],
         )),
     }
 }
