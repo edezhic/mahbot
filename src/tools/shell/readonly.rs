@@ -29,12 +29,7 @@ pub enum ShellMode {
 /// in favor of not breaking legitimate read-only usage.
 const MUTATING_COMMANDS: &[&str] = &[
     // ── File mutation ──
-    "rm",
-    "rmdir",
-    "unlink",
     "shred",
-    "cp",
-    "mv",
     "mkfifo",
     "mknod",
     "ln",
@@ -52,7 +47,6 @@ const MUTATING_COMMANDS: &[&str] = &[
     "chflags",
     "setfacl",
     "rsync",
-    "zip",
     "unzip",
     "vim",
     "vi",
@@ -73,12 +67,6 @@ const MUTATING_COMMANDS: &[&str] = &[
     "poweroff",
     "make",
     "cmake",
-    "wget",
-    "gzip",
-    "gunzip",
-    "bzip2",
-    "xz",
-    "zstd",
     // ── Package managers ──
     "npm",
     "yarn",
@@ -425,6 +413,15 @@ fn reject(cmd: &str, why: &str, suggestion: &str) -> Result<(), String> {
 /// Scratch-file mutators allowed when all explicit path args are under temp.
 const SCRATCH_MUTATORS: &[&str] = &["tee", "touch", "mkdir"];
 
+/// Temp-directory mutators allowed when all explicit path args are under temp.
+///
+/// These are commands that modify files on disk but are allowed in read-only mode
+/// when all path arguments target temp directories (/tmp, /var/tmp, or the OS temp
+/// directory). The prompt tells agents: "Writing to the OS temp directory is allowed."
+const TEMP_MUTATORS: &[&str] = &[
+    "cp", "mv", "rm", "rmdir", "unlink", "gzip", "gunzip", "bzip2", "xz", "zstd", "zip",
+];
+
 /// A flag-dependent command check: if the command's first word matches `verb`
 /// and the `predicate` returns true, the command is rejected with the given message.
 struct FlagCheck {
@@ -439,9 +436,9 @@ struct FlagCheck {
 const FLAG_CHECKS: &[FlagCheck] = &[
     FlagCheck {
         verb: "sed",
-        predicate: sed_has_flag_i,
-        rejection: "`sed -i` is not allowed — it modifies files in-place.",
-        suggestion: "use `sed` without `-i` to output to stdout, e.g. `sed 's/a/b/' file`.",
+        predicate: has_sed_mutation,
+        rejection: "`sed -i` is not allowed outside temp directories — it modifies files in-place.",
+        suggestion: "use `sed` without `-i` to output to stdout, e.g. `sed 's/a/b/' file`, or use `-i` with a path under /tmp.",
     },
     FlagCheck {
         verb: "awk",
@@ -451,15 +448,15 @@ const FLAG_CHECKS: &[FlagCheck] = &[
     },
     FlagCheck {
         verb: "dd",
-        predicate: has_dd_of,
-        rejection: "`dd of=...` is not allowed — it writes to a file.",
-        suggestion: "use `dd` without `of=` to output to stdout.",
+        predicate: has_dd_mutation,
+        rejection: "`dd of=...` is not allowed outside temp directories — it writes to a file.",
+        suggestion: "use `dd` without `of=` to output to stdout, or use `of=/tmp/...` to write to temp.",
     },
     FlagCheck {
         verb: "curl",
-        predicate: has_curl_output_flag,
-        rejection: "`curl` with output flags (`-o`, `--output`, `-O`, `--remote-name`) is not allowed.",
-        suggestion: "use `curl` without output flags to display content in stdout.",
+        predicate: has_curl_mutation,
+        rejection: "`curl` with output flags is not allowed outside temp directories.",
+        suggestion: "use `curl` without output flags to display content in stdout, or use `-o /tmp/...` to save to temp.",
     },
     // Note: `is_tar_mutating` uses negative detection (see its doc comment).
     // Unlike the five entries above, the predicate returns `true` for
@@ -472,9 +469,15 @@ const FLAG_CHECKS: &[FlagCheck] = &[
     },
     FlagCheck {
         verb: "base64",
-        predicate: has_base64_decode_output,
-        rejection: "`base64 -d` with `-o` is not allowed — it writes decoded output to a file.",
-        suggestion: "use `base64 -d` without `-o` to output to stdout.",
+        predicate: has_base64_mutation,
+        rejection: "`base64 -d` with `-o` is not allowed outside temp directories — it writes decoded output to a file.",
+        suggestion: "use `base64 -d` without `-o` to output to stdout, or use `-o /tmp/...` to write to temp.",
+    },
+    FlagCheck {
+        verb: "wget",
+        predicate: has_wget_mutation,
+        rejection: "`wget` with output flags is not allowed outside temp directories.",
+        suggestion: "use `curl` without output flags to display content in stdout, or use `wget -O /tmp/...` to save to temp.",
     },
 ];
 
@@ -704,6 +707,22 @@ fn check_segment(segment: &str) -> Result<(), String> {
                 "`{first_word}` is not allowed outside temp directories — it modifies the workspace."
             ),
             "use read-only alternatives to inspect files, e.g. `cat`, `head`, `tail`, `ls`, `file`, `stat`.",
+        );
+    }
+
+    // Temp mutators (cp, mv, rm, gzip, etc.) are allowed when all explicit
+    // path arguments target temp directories. The prompt tells agents that
+    // writing to the OS temp directory is allowed.
+    if TEMP_MUTATORS.contains(&first_word) {
+        if scratch_paths_under_temp(trimmed) {
+            return Ok(());
+        }
+        return reject(
+            trimmed,
+            &format!(
+                "`{first_word}` is not allowed outside temp directories — it modifies files outside /tmp."
+            ),
+            "use paths under /tmp, /var/tmp, or the OS temp directory, or use read-only alternatives like `cat`, `head`, `tail`, `ls`, `file`, `stat`.",
         );
     }
 
@@ -1118,9 +1137,77 @@ fn has_any_flag(command: &str, flags: &[&str]) -> bool {
     command.split_whitespace().any(|part| flags.contains(&part))
 }
 
-/// Check if a `sed` command has the `-i` flag (in-place edit).
-fn sed_has_flag_i(command: &str) -> bool {
-    has_flag(command, "i")
+/// Return the value of a flag that takes a separate word as its argument.
+/// e.g., for `curl -o /tmp/file URL`, calling `flag_value(parts, "-o")` returns `Some("/tmp/file")`.
+/// Returns `None` when the flag is not found, is the last token, or its value starts with `-`.
+fn flag_value<'a>(parts: &'a [&'a str], flag: &str) -> Option<&'a str> {
+    parts.windows(2).find_map(|w| {
+        if w[0] == flag {
+            let val = w[1];
+            // If the value starts with `-`, it's likely another flag, not a value.
+            if val.starts_with('-') && val != "-" {
+                None
+            } else {
+                Some(val)
+            }
+        } else {
+            None
+        }
+    })
+}
+
+/// Return the value of a flag using `=` syntax (e.g., `--output=/tmp/file`, `of=/tmp/out`).
+fn flag_value_equals<'a>(parts: &'a [&'a str], prefix: &str) -> Option<&'a str> {
+    parts.iter().find_map(|p| p.strip_prefix(prefix))
+}
+
+/// Check if `sed` has `-i` in a way that mutates files outside temp.
+/// When all file operands after `-i` are under temp, returns `false` (allow).
+fn has_sed_mutation(command: &str) -> bool {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    // Find the -i flag position (including -i.bak, -iSUFFIX)
+    let i_pos = parts
+        .iter()
+        .position(|p| *p == "-i" || p.starts_with("-i."));
+    let Some(i_pos) = i_pos else {
+        return false; // no -i flag → not a sed mutation
+    };
+
+    // Collect file operands after -i.
+    // Skip flags (-n, -e, etc.), sed expressions, and backup-extension tokens.
+    // Sed expressions and backup extensions are non-absolute tokens before the
+    // first absolute-path file operand. Once we've seen a file operand, all
+    // subsequent non-flag tokens are treated as file operands (multi-file).
+    let mut file_operands: Vec<&str> = Vec::new();
+    let mut seen_file_operand = false;
+
+    for part in &parts[i_pos + 1..] {
+        if part.starts_with('-') {
+            continue; // skip flags like -n, -e, -e 'expr'
+        }
+        if seen_file_operand {
+            // Already past the sed expression — this is a file operand
+            file_operands.push(part);
+            continue;
+        }
+        // Before the first file operand: skip non-absolute tokens (sed expression
+        // like 's/a/b/' or backup extension like .bak for `-i .bak`).
+        let p = Path::new(part);
+        if p.is_absolute() {
+            seen_file_operand = true;
+            file_operands.push(part);
+        }
+        // Non-absolute tokens are sed expressions or backup extensions — skip
+    }
+
+    if file_operands.is_empty() {
+        return true; // `sed -i` without file operand → reject (conservative)
+    }
+
+    !file_operands.iter().all(|p| {
+        let path = Path::new(p);
+        path.is_absolute() && crate::tools::path::is_path_under_allowed_temp(path)
+    })
 }
 
 /// Check if `awk -i inplace` is present.
@@ -1129,14 +1216,77 @@ fn has_inplace(command: &str) -> bool {
     parts.windows(2).any(|w| w[0] == "-i" && w[1] == "inplace")
 }
 
-/// Check if `dd of=...` is present.
-fn has_dd_of(command: &str) -> bool {
-    command.split_whitespace().any(|p| p.starts_with("of="))
+/// Check if `dd of=...` writes outside temp.
+/// When `of=` points to a temp path, returns `false` (allow).
+fn has_dd_mutation(command: &str) -> bool {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    if let Some(of_val) = flag_value_equals(&parts, "of=") {
+        let path = Path::new(of_val);
+        return !path.is_absolute() || !crate::tools::path::is_path_under_allowed_temp(path);
+    }
+    false
 }
 
-/// Check if curl has output flags.
-fn has_curl_output_flag(command: &str) -> bool {
-    has_any_flag(command, &["-o", "--output", "-O", "--remote-name"])
+/// Check if curl has output flags that write outside temp.
+/// `-o <path>` / `--output <path>` is allowed when path is under temp.
+/// `-O` / `--remote-name` is always blocked (writes to CWD with URL filename).
+fn has_curl_mutation(command: &str) -> bool {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+
+    // -O/--remote-name are always blocked (writes to CWD with URL filename)
+    if has_any_flag(command, &["-O", "--remote-name"]) {
+        return true;
+    }
+
+    // -o/--output: blocked unless output path is under temp
+    for flag in &["-o", "--output"] {
+        if let Some(path) = flag_value(&parts, flag) {
+            let p = Path::new(path);
+            return !p.is_absolute() || !crate::tools::path::is_path_under_allowed_temp(p);
+        }
+    }
+
+    // --output=path syntax
+    if let Some(path) = flag_value_equals(&parts, "--output=") {
+        let p = Path::new(path);
+        return !p.is_absolute() || !crate::tools::path::is_path_under_allowed_temp(p);
+    }
+
+    false
+}
+
+/// Check if `wget` output flags write outside temp.
+/// `-O <path>` / `--output-document <path>` / `-P <path>` / `--directory-prefix <path>`
+/// are allowed when the path is under temp.
+/// Without output flags, wget writes to CWD → always blocked.
+fn has_wget_mutation(command: &str) -> bool {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+
+    // -O/--output-document: specify output file path
+    if let Some(path) = flag_value(&parts, "-O").or_else(|| flag_value(&parts, "--output-document"))
+    {
+        let p = Path::new(path);
+        return !p.is_absolute() || !crate::tools::path::is_path_under_allowed_temp(p);
+    }
+    if let Some(path) = flag_value_equals(&parts, "--output-document=") {
+        let p = Path::new(path);
+        return !p.is_absolute() || !crate::tools::path::is_path_under_allowed_temp(p);
+    }
+
+    // -P/--directory-prefix: specify download directory
+    if let Some(path) =
+        flag_value(&parts, "-P").or_else(|| flag_value(&parts, "--directory-prefix"))
+    {
+        let p = Path::new(path);
+        return !p.is_absolute() || !crate::tools::path::is_path_under_allowed_temp(p);
+    }
+    if let Some(path) = flag_value_equals(&parts, "--directory-prefix=") {
+        let p = Path::new(path);
+        return !p.is_absolute() || !crate::tools::path::is_path_under_allowed_temp(p);
+    }
+
+    // No known output flag → wget would write to CWD with URL's filename
+    true
 }
 
 /// Characters that are non-operation tar flags (format/output modifiers).
@@ -1209,10 +1359,25 @@ fn is_tar_mutating(command: &str) -> bool {
     !is_tar_list_only(command)
 }
 
-/// Check if `base64` has both decode flag (`-d`/`--decode`) and output flag
-/// (`-o`/`--output`), which would write decoded data to a file.
-fn has_base64_decode_output(command: &str) -> bool {
-    has_any_flag(command, &["-d", "--decode"]) && has_any_flag(command, &["-o", "--output"])
+/// Check if `base64 -d -o` writes outside temp.
+/// When `-o`/`--output` points to a temp path, returns `false` (allow).
+fn has_base64_mutation(command: &str) -> bool {
+    if !has_any_flag(command, &["-d", "--decode"]) {
+        return false; // not decoding → not a mutation
+    }
+
+    let parts: Vec<&str> = command.split_whitespace().collect();
+
+    // Check -o/--output flag values
+    for flag in &["-o", "--output"] {
+        if let Some(path) = flag_value(&parts, flag) {
+            let p = Path::new(path);
+            return !p.is_absolute() || !crate::tools::path::is_path_under_allowed_temp(p);
+        }
+    }
+
+    // No -o/--output flag → output to stdout, not mutating
+    false
 }
 
 /// Check if `cargo clippy` has `--fix` before `--`.
@@ -1435,7 +1600,9 @@ mod tests {
     /// when entries are added or removed.
     #[test]
     fn all_mutating_commands_rejected() {
-        assert_all_rejected(MUTATING_COMMANDS, |cmd| format!("{cmd} arg"));
+        // Use an absolute non-temp path to prevent accidental test drift
+        // if items are later moved to TEMP_MUTATORS.
+        assert_all_rejected(MUTATING_COMMANDS, |cmd| format!("{cmd} /etc/blocked_test"));
     }
 
     /// Tests that all git branch mutation flags are rejected via
@@ -1934,7 +2101,69 @@ mod tests {
             ("touch /tmp/scratch.txt", true),
             ("mkdir -p /tmp/scratch_dir", true),
             ("tee output.log", false),
-            ("rm /tmp/scratch.txt", false),
+            ("rm /tmp/scratch.txt", true),
+            // ── TEMP_MUTATORS (cp, mv, rm, gzip, etc.) ──
+            ("cp /tmp/a /tmp/b", true),
+            ("mv /tmp/a /tmp/b", true),
+            ("cp /tmp/a /etc/passwd", false),
+            ("mv /tmp/a /etc/passwd", false),
+            ("rm /etc/passwd", false),
+            ("rmdir /tmp/scratch_dir", true),
+            ("gzip /tmp/file.txt", true),
+            ("gunzip /tmp/file.txt.gz", true),
+            ("bzip2 /tmp/file.txt", true),
+            ("xz /tmp/file.txt", true),
+            ("zstd /tmp/file.txt", true),
+            ("zip /tmp/out.zip /tmp/file1 /tmp/file2", true),
+            ("cp /etc/passwd /tmp/out", false), // source outside temp
+            // ── Flag-based temp-aware checks ──
+            // curl -o to temp → allowed
+            ("curl -o /tmp/file URL", true),
+            ("curl --output /tmp/file URL", true),
+            ("curl -o /etc/passwd URL", false),
+            ("curl --output /etc/passwd URL", false),
+            // curl -O/--remote-name always blocked (writes to CWD)
+            ("curl -O URL", false),
+            ("curl --remote-name URL", false),
+            // curl -o with a mix: -o OK but -O still blocked
+            ("curl -o /tmp/file -O URL", false), // -O always blocks
+            // wget -O to temp → allowed
+            ("wget -O /tmp/file URL", true),
+            ("wget --output-document /tmp/file URL", true),
+            ("wget -O /etc/passwd URL", false),
+            ("wget --output-document /etc/passwd URL", false),
+            ("wget -P /tmp/dir URL", true),
+            ("wget --directory-prefix /tmp/dir URL", true),
+            ("wget -P /etc/dir URL", false),
+            // wget without output flags → always blocked
+            ("wget URL", false),
+            // sed -i to temp → allowed
+            ("sed -i 's/a/b/' /tmp/file", true),
+            ("sed -i.bak 's/a/b/' /tmp/file", true),
+            ("sed -i 's/a/b/' /tmp/file1 /tmp/file2", true),
+            ("sed -i 's/a/b/' /etc/passwd", false),
+            ("sed -i 's/a/b/' /tmp/file /etc/passwd", false), // mixed
+            ("sed -i '' /tmp/file", true),                    // empty backup ext
+            // sed -i with -e flag
+            ("sed -i -e 's/a/b/' /tmp/file", true),
+            ("sed -i -e 's/a/b/' /etc/passwd", false),
+            // sed -i with separate backup extension
+            ("sed -i .bak 's/a/b/' /tmp/file", true),
+            ("sed -i .bak 's/a/b/' /etc/passwd", false),
+            // dd of= to temp → allowed
+            ("dd if=/dev/zero of=/tmp/out bs=1024 count=1", true),
+            ("dd of=/tmp/out", true),
+            ("dd if=/dev/zero of=/etc/passwd bs=1024 count=1", false),
+            ("dd of=/etc/passwd", false),
+            // base64 -d -o to temp → allowed
+            ("base64 -d -o /tmp/out input.txt", true),
+            ("base64 -d --output /tmp/out input.txt", true),
+            ("base64 -d -o /etc/passwd input.txt", false),
+            ("base64 -d --output /etc/passwd input.txt", false),
+            // base64 -d without -o → stdout, always allowed
+            ("base64 -d input.txt", true),
+            // base64 with -o but without -d → no mutation
+            ("base64 -o /tmp/out input.txt", true),
             // ── Multiple path arguments (security bypass) ──
             // Multiple path args under temp → should be allowed
             ("tee /tmp/scratch.log /tmp/out.txt", true),
@@ -1975,5 +2204,40 @@ mod tests {
         ];
 
         run_cases(&cases);
+    }
+
+    /// Tests that ALL entries in [`TEMP_MUTATORS`] are allowed with temp paths
+    /// and rejected with non-temp paths, preventing coverage drift.
+    #[test]
+    fn all_temp_mutators_allowed_with_temp_paths() {
+        // cp, mv, rm, rmdir, unlink: basic file ops
+        let temp_ops: &[(&str, &str)] = &[
+            ("cp", "/tmp/a /tmp/b"),
+            ("mv", "/tmp/a /tmp/b"),
+            ("rm", "/tmp/scratch.txt"),
+            ("rmdir", "/tmp/scratch_dir"),
+            ("unlink", "/tmp/link"),
+            ("gzip", "/tmp/file.txt"),
+            ("gunzip", "/tmp/file.txt.gz"),
+            ("bzip2", "/tmp/file.txt"),
+            ("xz", "/tmp/file.txt"),
+            ("zstd", "/tmp/file.txt"),
+            ("zip", "/tmp/out.zip /tmp/file1"),
+        ];
+        for &(cmd, args) in temp_ops {
+            ok(&format!("{cmd} {args}"));
+        }
+    }
+
+    /// Tests that ALL entries in [`TEMP_MUTATORS`] are rejected when used
+    /// with a non-temp absolute path, preventing accidental test drift.
+    #[test]
+    fn all_temp_mutators_rejected_with_non_temp() {
+        let temp_ops: &[&str] = &[
+            "cp", "mv", "rm", "rmdir", "unlink", "gzip", "gunzip", "bzip2", "xz", "zstd", "zip",
+        ];
+        for &cmd in temp_ops {
+            assert_rejected(&format!("{cmd} /etc/blocked_test"));
+        }
     }
 }
