@@ -161,8 +161,11 @@ required-features = ["voice-tests"]
 [profile.dev]
 incremental = true
 opt-level = 0
-debug = 0
+debug = "line-tables-only"
 codegen-units = 256
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.dev.package.qwen-asr]
 opt-level = 3
@@ -183,7 +186,7 @@ panic = "unwind"
 
 [profile.test]
 inherits = "dev"
-debug = 0
+debug = "line-tables-only"
 codegen-units = 256
 
 [profile.bench]
