@@ -31,7 +31,7 @@ use chrono::{DateTime, Utc};
 /// * **Tool schemas** — The tool definitions injected by `build_chat_request`
 ///   consume ~10–20K actual tokens that are **not** counted by `estimate_tokens`
 ///   (they live in the `tools` field of the request, not in `messages`).
-/// 
+///
 /// Every modern model (as of 2026) supports 250K+ context windows making 200K safe.
 pub(crate) const SUMMARIZATION_THRESHOLD: usize = 200_000;
 
