@@ -48,6 +48,11 @@ use std::time::Instant;
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
+/// Index of the rolling sum field in per_frame_scores `[total_score, rolling_sum, threshold]` triples.
+const ROLLING_SUM_IDX: usize = 1;
+/// Index of the effective threshold field in per_frame_scores `[total_score, rolling_sum, threshold]` triples.
+const THRESHOLD_IDX: usize = 2;
+
 /// Minimum effective threshold for the Conv1D classifier's rolling sum.
 ///
 /// The classifier rolling sum must reach at least this value for the
@@ -144,8 +149,9 @@ const OWNER_NEGATIVE_PHRASES: &[&str] = &[
 /// value (0.85) was calibrated on contaminated data where the same variants
 /// were used for both training and testing. After the train/test split fix,
 /// this constant MUST be recalibrated by running the benchmark 3× and updating
-/// to `floor(mean_rate / 0.2) * 0.2`. The 0.2 granularity reflects the 5-variant
-/// test set where each miss costs 20 percentage points.
+/// to `floor(mean_rate / 0.2) * 0.2`. The 0.2 granularity reflects the ~17-variant
+/// test set (after PCM augmentation × 10 enrollment variants, split 2/3:1/3)
+/// where each miss costs roughly 6 percentage points.
 const MIN_DETECTION_RATE: f64 = 0.60;
 
 // Per-category false accept limits are now dynamic by tier — see
@@ -1242,8 +1248,14 @@ struct PerVariantResult {
     variant: String,
     /// Whether the variant triggered wake word detection.
     detected: bool,
-    /// Peak rolling-sum score achieved during processing.
+    /// Peak per-frame total_score (classifier sigmoid output, range [0,1])
+    /// achieved during processing. This is NOT the rolling sum — it's the
+    /// maximum single-frame score. For rolling sum analysis, use the
+    /// `per_frame_scores` field or `max_rolling_sum`.
     peak_score: f32,
+    /// Maximum rolling sum (sum of 3 consecutive total_scores with decay)
+    /// achieved during processing. Derived from per_frame_scores.
+    max_rolling_sum: f32,
     /// Peak verifier prediction score achieved during processing
     /// (0.0 if verifier is untrained or no embeddings passed the threshold).
     verifier_score: f32,
@@ -1261,8 +1273,8 @@ struct PerVariantResult {
     /// Count of VAD-positive 512-sample frames during streaming detection.
     vad_speech_frames: usize,
     /// Per-frame `[total_score, rolling_sum, threshold]` triples from classifier
-    /// scoring (mahbot-891).  The third element is the effective threshold used
-    /// for the rolling window comparison this frame.
+    /// scoring (mahbot-891).  Use `ROLLING_SUM_IDX` / `THRESHOLD_IDX` for named
+    /// access to the rolling sum and effective threshold fields respectively.
     per_frame_scores: Vec<[f32; 3]>,
     /// Whether the verifier warm-up was completed before this variant's test
     /// utterance was processed (embedding_ring had ≥
@@ -1274,6 +1286,18 @@ struct PerVariantResult {
     /// Number of embeddings in the ring buffer after warm-up consumption,
     /// before processing the test utterance (mahbot-947).
     warmup_n_embeddings: usize,
+}
+
+/// Extract the maximum rolling sum from per-frame score triples.
+///
+/// The rolling sum (`ROLLING_SUM_IDX`) is the accumulated classifier score with
+/// decay over consecutive speech frames — the value that the adaptive threshold
+/// ultimately gates.
+fn max_rolling_sum(scores: &[[f32; 3]]) -> f32 {
+    scores
+        .iter()
+        .map(|s| s[ROLLING_SUM_IDX])
+        .fold(0.0_f32, f32::max)
 }
 
 /// Track per-variant detection results for reporting.
@@ -1396,6 +1420,7 @@ fn test_detection_samples(
             **state = ctx.adaptive_threshold.clone();
         }
         let peak = ctx.instrumentation.peak_score;
+        let max_rs = max_rolling_sum(&ctx.instrumentation.per_frame_scores);
         if result.detected {
             if let Some(lat) = result.latency_ms {
                 metrics.latencies.push(lat);
@@ -1408,6 +1433,7 @@ fn test_detection_samples(
             variant: label.clone(),
             detected: result.detected,
             peak_score: peak,
+            max_rolling_sum: max_rs,
             verifier_score: ctx.instrumentation.peak_verifier_score,
             n_embeddings: ctx.embedding_ring.len(),
             n_frames_below_reset: ctx.instrumentation.n_frames_below_reset,
@@ -1661,6 +1687,7 @@ fn run_noise_overlap_test(
                 shared_adaptive = ctx.adaptive_threshold.clone();
 
                 let peak = ctx.instrumentation.peak_score;
+                let max_rs = max_rolling_sum(&ctx.instrumentation.per_frame_scores);
                 if result.detected {
                     if let Some(lat) = result.latency_ms {
                         metrics.latencies.push(lat);
@@ -1671,6 +1698,7 @@ fn run_noise_overlap_test(
                     variant: label.clone(),
                     detected: result.detected,
                     peak_score: peak,
+                    max_rolling_sum: max_rs,
                     verifier_score: ctx.instrumentation.peak_verifier_score,
                     n_embeddings: ctx.embedding_ring.len(),
                     n_frames_below_reset: ctx.instrumentation.n_frames_below_reset,
@@ -2702,6 +2730,7 @@ pub(crate) fn run_internal() {
             "variant": pv.variant,
             "detected": pv.detected,
             "peak_score": pv.peak_score,
+            "max_rolling_sum": pv.max_rolling_sum,
             "verifier_score": pv.verifier_score,
             "category": category,
             "warmup_completed": pv.warmup_completed,
@@ -2713,6 +2742,7 @@ pub(crate) fn run_internal() {
             "variant": pv.variant,
             "detected": pv.detected,
             "peak_score": pv.peak_score,
+            "max_rolling_sum": pv.max_rolling_sum,
             "verifier_score": pv.verifier_score,
             "category": "unrelated",
             "warmup_completed": pv.warmup_completed,
@@ -2724,6 +2754,7 @@ pub(crate) fn run_internal() {
             "variant": pv.variant,
             "detected": pv.detected,
             "peak_score": pv.peak_score,
+            "max_rolling_sum": pv.max_rolling_sum,
             "verifier_score": pv.verifier_score,
             "category": "silence",
             "warmup_completed": pv.warmup_completed,
@@ -2736,6 +2767,7 @@ pub(crate) fn run_internal() {
                 "variant": pv.variant,
                 "detected": pv.detected,
                 "peak_score": pv.peak_score,
+                "max_rolling_sum": pv.max_rolling_sum,
                 "verifier_score": pv.verifier_score,
                 "category": "noise",
                 "warmup_completed": pv.warmup_completed,
@@ -2776,17 +2808,18 @@ pub(crate) fn run_internal() {
             "total_positive": pos_metrics.total,
             "miss_classification": {
                 "classifier": pos_metrics.per_variant.iter().filter(|pv| {
-                    !pv.detected && pv.peak_score < MIN_CLASSIFIER_THRESHOLD
+                    !pv.detected
+                        && !pv.per_frame_scores.iter().any(|s| s[ROLLING_SUM_IDX] >= MIN_CLASSIFIER_THRESHOLD)
                 }).count(),
                 "adaptive_threshold": pos_metrics.per_variant.iter().filter(|pv| {
                     !pv.detected
-                        && pv.peak_score >= MIN_CLASSIFIER_THRESHOLD
-                        && !pv.per_frame_scores.iter().any(|s| s[1] >= s[2])
+                        && pv.per_frame_scores.iter().any(|s| s[ROLLING_SUM_IDX] >= MIN_CLASSIFIER_THRESHOLD)
+                        && !pv.per_frame_scores.iter().any(|s| s[ROLLING_SUM_IDX] >= s[THRESHOLD_IDX])
                 }).count(),
                 "verifier": pos_metrics.per_variant.iter().filter(|pv| {
                     !pv.detected
-                        && pv.peak_score >= MIN_CLASSIFIER_THRESHOLD
-                        && pv.per_frame_scores.iter().any(|s| s[1] >= s[2])
+                        && pv.per_frame_scores.iter().any(|s| s[ROLLING_SUM_IDX] >= MIN_CLASSIFIER_THRESHOLD)
+                        && pv.per_frame_scores.iter().any(|s| s[ROLLING_SUM_IDX] >= s[THRESHOLD_IDX])
                 }).count(),
                 "total_misses": pos_metrics.total - pos_metrics.detected,
             },
@@ -2821,9 +2854,9 @@ pub(crate) fn run_internal() {
             pos_metrics.per_variant.iter().map(|pv| {
                 let miss_reason = if pv.detected {
                     None
-                } else if pv.peak_score < MIN_CLASSIFIER_THRESHOLD {
+                } else if !pv.per_frame_scores.iter().any(|s| s[ROLLING_SUM_IDX] >= MIN_CLASSIFIER_THRESHOLD) {
                     Some("classifier")
-                } else if pv.per_frame_scores.iter().any(|s| s[1] >= s[2]) {
+                } else if pv.per_frame_scores.iter().any(|s| s[ROLLING_SUM_IDX] >= s[THRESHOLD_IDX]) {
                     Some("verifier")
                 } else {
                     Some("adaptive_threshold")
@@ -2832,6 +2865,7 @@ pub(crate) fn run_internal() {
                     "variant": pv.variant,
                     "detected": pv.detected,
                     "peak_score": pv.peak_score,
+                    "max_rolling_sum": pv.max_rolling_sum,
                     "verifier_score": pv.verifier_score,
                     "miss_reason": miss_reason,
                     "n_embeddings": pv.n_embeddings,
