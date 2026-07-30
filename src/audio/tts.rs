@@ -580,9 +580,9 @@ pub fn list_voice_styles() -> Vec<String> {
 ///   Use `42` for deterministic output matching the default playback behavior
 ///   (same as [`speak_async`]).
 /// * `target_sample_rate` — Desired output sample rate in Hz. The Supertonic 3
-///   model natively outputs 24 kHz; passing a different rate triggers
-///   resampling. Common values: `44100` (CD quality), `16000` (voice pipeline),
-///   `24000` (native, no resampling).
+///   model natively outputs 44100 Hz; passing a different rate triggers
+///   resampling. Common values: `44100` (native, no resampling), `16000` (voice
+///   pipeline), `24000` (upsampled).
 ///
 /// # Errors
 ///
@@ -591,10 +591,10 @@ pub fn list_voice_styles() -> Vec<String> {
 ///
 /// # Sample rate
 ///
-/// The Supertonic 3 model natively outputs 24 kHz audio. The function
+/// The Supertonic 3 model natively outputs 44100 Hz audio. The function
 /// resamples to `target_sample_rate` for compatibility. For training data
 /// generation targeting the voice pipeline (which expects 16 kHz), pass
-/// `target_sample_rate = 16000` to avoid an intermediate 44.1 kHz step.
+/// `target_sample_rate = 16000` to avoid an intermediate resampling step.
 ///
 /// # Example
 ///
@@ -1454,16 +1454,36 @@ fn synthesize_internal(
     let latent_len = wav_len.div_ceil(chunk_size);
     let latent_dim = engine.latent_dim * engine.chunk_compress_factor;
 
-    // 5. Sample noise
+    // 5. Sample noise (Box-Muller transform, seeded xorshift for determinism)
     let mut rng = seed;
-    let noise: Vec<f32> = (0..latent_dim * latent_len)
-        .map(|_| {
+    let noise: Vec<f32> = {
+        let n = latent_dim * latent_len;
+        let mut result = Vec::with_capacity(n);
+        let mut i = 0;
+        while i < n {
+            // Advance xorshift twice to get two uniform (0,1] samples.
             rng ^= rng << 13;
             rng ^= rng >> 17;
             rng ^= rng << 5;
-            (rng as f32) / (u64::MAX as f32) * 2.0 - 1.0
-        })
-        .collect();
+            let u1 = (rng as f64) / (u64::MAX as f64);
+
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            let u2 = (rng as f64) / (u64::MAX as f64);
+
+            // Box-Muller: two independent N(0,1) samples from two uniforms.
+            let r = (-2.0 * u1.clamp(f64::MIN_POSITIVE, 1.0).ln()).sqrt();
+            let theta = (2.0 * std::f64::consts::PI) * u2;
+            result.push((r * theta.cos()) as f32);
+            i += 1;
+            if i < n {
+                result.push((r * theta.sin()) as f32);
+                i += 1;
+            }
+        }
+        result
+    };
     let mut xt = Tensor::from_slice(&noise, (1, latent_dim, latent_len), dev)?;
 
     // Latent mask
@@ -1486,9 +1506,12 @@ fn synthesize_internal(
             ]),
         )
         .with_context(|| format!("Vector estimator step {step} failed"))?;
-        let velocity = extract_output(ve_out, &engine.vector_est_model, "ve")?;
-        let dt = 1.0 / DEFAULT_TOTAL_STEPS as f64;
-        xt = xt.broadcast_add(&(velocity * dt)?)?;
+        // The Supertonic 3 vector estimator uses x₀-prediction (its output is
+        // `denoised_latent`, not a velocity field).  At each flow-matching step
+        // the model predicts the clean latent directly — we replace xt, not
+        // accumulate a velocity-field integral.
+        let denoised_latent = extract_output(ve_out, &engine.vector_est_model, "ve")?;
+        xt = denoised_latent;
     }
 
     // 7. Vocoder
@@ -3000,7 +3023,7 @@ mod tests {
 
         // Wrap in the default language tag for synthesis.
         let text_with_lang = format!("<en>{processed}</en>");
-        let native_rate = engine.sample_rate; // 24 kHz (Supertonic 3)
+        let native_rate = engine.sample_rate; // 44100 Hz (Supertonic 3)
 
         // Synthesise audio samples (f32 PCM).
         let samples = synthesize_internal(engine, &text_with_lang, style_dp, style_ttl, 42)
@@ -3015,7 +3038,7 @@ mod tests {
 
         // ── Resample to 16 kHz (ASR native rate) ──────────────────────
         //
-        // The Supertonic 3 model natively outputs 24 kHz. Qwen3-ASR
+        // The Supertonic 3 model natively outputs 44100 Hz. Qwen3-ASR
         // expects 16 kHz input, so we resample here.
 
         const ASR_SAMPLE_RATE: u32 = 16_000;
