@@ -309,7 +309,7 @@ async fn consolidate_analyst_responses(
                 allow_image_parts: false,
                 temperature: 0.05,
                 max_tokens: Some(DEFAULT_MAX_TOKENS),
-                reasoning_effort: "xhigh",
+                reasoning_effort: Some("xhigh".to_owned()),
                 provider_order: routing.provider_order,
                 provider_allow_fallbacks: routing.allow_fallbacks,
             };
