@@ -28,15 +28,40 @@ impl ErrorClass {
     }
 }
 
+/// Body-text hints that indicate the error is retryable even when other
+/// signals (like `NON_RETRYABLE_HINTS` or 4xx status codes) suggest otherwise.
+///
+/// These overrides handle cases where upstream proxy providers (e.g. OpenRouter)
+/// forward error metadata from transient upstream rate limits that coincidentally
+/// contain keywords like `insufficient_quota` in non-permanent contexts
+/// (e.g. `metadata.provider_error_code` forwarded from Alibaba).
+///
+/// Priority: retryable overrides are checked first, then non-retryable hints,
+/// then status-code defaults. If ANY retryable override matches, the error
+/// is classified as Retryable regardless of other indicators.
+const RETRYABLE_OVERRIDES: &[&str] = &[
+    // Upstream provider reports a transient rate limit in its raw error
+    // text (e.g. Alibaba/Qwen forwarded by OpenRouter).
+    "temporarily rate-limited",
+    // Upstream provider shared pool exhausted — transient, not account-level.
+    "upstream_provider_shared_pool",
+];
+
 /// Body-text hints that indicate permanent (non-retryable) errors when the
 /// HTTP status-code check is ambiguous — specifically, HTTP 429 Too Many
 /// Requests is excluded from the status-based classification (rate limits
 /// are transient), so these billing/quota hints override 429 to prevent
 /// endless retries on exhausted accounts.
 ///
+/// These hints are checked **after** [`RETRYABLE_OVERRIDES`], so any body
+/// that matches both a retryable override and a non-retryable hint will be
+/// correctly classified as retryable — preventing false positives when
+/// upstream proxy providers embed billing error codes in transient rate-limit
+/// metadata.
+///
 /// All other non-retryable errors (context window exceeded, tool schema
 /// validation, auth failures) are reliably caught by the HTTP 4xx status-code
-/// check (step 2 in [`classify_err`]) and do NOT need entries here.  That
+/// check (step 1 in [`classify_err`]) and do NOT need entries here.  That
 /// also fixes a latent bug: 5xx responses whose body happens to contain a
 /// hint-like substring are now correctly classified as retryable.
 const NON_RETRYABLE_HINTS: &[&str] = &[
@@ -50,29 +75,46 @@ const NON_RETRYABLE_HINTS: &[&str] = &[
 /// Classify an error into one of the [`ErrorClass`] variants.
 ///
 /// The classification cascade is:
-/// 1. **Billing/quota body-text hints** — The [`NON_RETRYABLE_HINTS`] entries
-///    override the default Retryable classification for HTTP 429 responses
-///    (quota exhaustion is permanent, not transient).
-/// 2. **4xx status codes** (except 408 Request Timeout and 429 Too Many Requests)
-///    — structured [`HttpError`] downcast.
+/// 1. **4xx status codes** (except 408 Request Timeout and 429 Too Many Requests)
+///    — structured [`HttpError`] downcast.  Clear client errors that never
+///    self-heal.
+/// 2. **HTTP 429 — body-text disambiguation**: first checks
+///    [`RETRYABLE_OVERRIDES`] (upstream transient rate-limit signals take
+///    priority), then [`NON_RETRYABLE_HINTS`] (billing/quota exhaustion).
 /// 3. Default to [`Retryable`](ErrorClass::Retryable).
 pub(crate) fn classify_err(err: &anyhow::Error) -> ErrorClass {
     // ── Typed path: use structured fields from HttpError directly ──
     if let Some(http_err) = err.downcast_ref::<HttpError>() {
-        // Body-text hints indicate permanent errors — only relevant when
-        // the status code is ambiguous (HTTP 429 is normally retryable,
-        // but billing/quota exhaustion is permanent).
-        if http_err.status == 429 {
-            let body_lower = http_err.body.to_lowercase();
-            if NON_RETRYABLE_HINTS.iter().any(|h| body_lower.contains(h)) {
-                return ErrorClass::NonRetryable;
-            }
-        }
-        // 4xx codes (except 408 Request Timeout and 429 Too Many Requests)
+        let body_lower = http_err.body.to_lowercase();
+
+        // ── Step 1: 4xx status codes (except 408 Request Timeout and
+        //    429 Too Many Requests) ──
+        // These are clear client errors (auth, invalid model, context
+        // window, tool schema validation, etc.) and are never retryable.
         if (400..500).contains(&http_err.status) && http_err.status != 408 && http_err.status != 429
         {
             return ErrorClass::NonRetryable;
         }
+
+        // ── Step 2: HTTP 429 — ambiguous; delegate to body-text hints ──
+        if http_err.status == 429 {
+            // 2a. Retryable overrides take priority. Upstream providers
+            //     sometimes embed rate-limit info in metadata that happens
+            //     to contain billing keywords (e.g. `insufficient_quota` in
+            //     OpenRouter's `metadata.provider_error_code`).  Override
+            //     signals (e.g. "temporarily rate-limited") indicate the
+            //     failure is a transient upstream rate limit, not account
+            //     exhaustion.
+            if RETRYABLE_OVERRIDES.iter().any(|h| body_lower.contains(h)) {
+                return ErrorClass::Retryable;
+            }
+            // 2b. Billing/quota body-text hints — permanent account
+            //     exhaustion, not transient rate limiting.
+            if NON_RETRYABLE_HINTS.iter().any(|h| body_lower.contains(h)) {
+                return ErrorClass::NonRetryable;
+            }
+        }
+
         return ErrorClass::Retryable;
     }
     ErrorClass::Retryable
@@ -259,7 +301,8 @@ mod tests {
     }
 
     /// Unified test mock. Covers all failure modes: simple retry gating,
-    /// model-specific failures, context overflow, and native tool calls.
+    /// model-specific failures, context overflow, upstream rate limits with
+    /// embedded billing codes, and native tool calls.
     struct TestProvider {
         calls: Arc<AtomicUsize>,
         fail_until_attempt: usize,
@@ -267,6 +310,12 @@ mod tests {
         error: &'static str,
         context_overflow: bool,
         tool_schema_error: bool,
+        /// When true, returns an HTTP 429 whose body mimics an OpenRouter proxy
+        /// forwarding a transient upstream rate limit — the body contains both
+        /// a retryable override signal ("temporarily rate-limited") and a
+        /// non-retryable hint ("insufficient_quota") in metadata, which
+        /// exercises the RETRYABLE_OVERRIDES classifier logic.
+        upstream_rate_limit: bool,
         tool_calls: Vec<crate::ToolCall>,
         warmup_fails: bool,
     }
@@ -280,6 +329,7 @@ mod tests {
                 error: "mock error",
                 context_overflow: false,
                 tool_schema_error: false,
+                upstream_rate_limit: false,
                 tool_calls: Vec::new(),
                 warmup_fails: false,
             }
@@ -303,6 +353,12 @@ mod tests {
             self
         }
 
+        fn with_upstream_rate_limit(mut self, fail_until: usize) -> Self {
+            self.upstream_rate_limit = true;
+            self.fail_until_attempt = fail_until;
+            self
+        }
+
         fn with_calls(mut self, calls: Arc<AtomicUsize>) -> Self {
             self.calls = calls;
             self
@@ -318,6 +374,12 @@ mod tests {
                 "request (8968 tokens) exceeds the available context size (8448 tokens), try increasing it".to_string()
             } else if self.tool_schema_error {
                 "tool call validation failed: attempted to call tool 'recall' which was not in request".to_string()
+            } else if self.upstream_rate_limit {
+                // Simulate OpenRouter forwarding a transient upstream rate limit.
+                // The body contains both a retryable override signal
+                // ("temporarily rate-limited") and a non-retryable billing hint
+                // ("insufficient_quota" in metadata.provider_error_code).
+                r#"{"error":{"code":429,"message":"Provider returned error","metadata":{"provider_name":"Qwen","provider_error_code":"insufficient_quota","raw":"upstream error: temporarily rate-limited upstream, please retry"}}}"#.to_string()
             } else {
                 self.error.to_string()
             }
@@ -336,12 +398,17 @@ mod tests {
             if self.check_fail(call + 1) {
                 // Context-overflow and tool-schema errors reach classify_err
                 // via HttpError with status 400, so they are correctly classified
-                // as NonRetryable by the status-code check (step 2).
+                // as NonRetryable by the status-code check (step 3).
                 if self.context_overflow {
                     return Err(test_err(400, &self.make_error()));
                 }
                 if self.tool_schema_error {
                     return Err(test_err(400, &self.make_error()));
+                }
+                // Upstream rate-limit errors reach classify_err via HttpError
+                // with status 429, exercising the RETRYABLE_OVERRIDES logic.
+                if self.upstream_rate_limit {
+                    return Err(test_err(429, &self.make_error()));
                 }
                 anyhow::bail!("{}", self.make_error());
             }
@@ -634,6 +701,99 @@ mod tests {
                 "502 with hint '{hint}' should remain Retryable"
             );
         }
+    }
+
+    #[test]
+    fn upstream_rate_limit_overrides_quota_hint() {
+        // Regression: OpenRouter forwards upstream provider rate limits with
+        // "insufficient_quota" in metadata.provider_error_code but "temporarily
+        // rate-limited" in the raw upstream error text.  The retryable override
+        // must take priority over the non-retryable billing hint so the agent
+        // retries instead of aborting.
+        let body = concat!(
+            r#"{"error":{"code":429,"message":"Provider returned error","metadata":"#,
+            r#"{"provider_name":"Qwen","provider_error_code":"insufficient_quota","#,
+            r#""raw":"upstream error: temporarily rate-limited upstream, please retry"}}}"#,
+        );
+        let err = test_err(429, body);
+        assert!(
+            matches!(classify_err(&err), ErrorClass::Retryable),
+            "429 with 'temporarily rate-limited' in metadata.raw should be Retryable \
+             despite also containing 'insufficient_quota'"
+        );
+    }
+
+    #[test]
+    fn upstream_shared_pool_overrides_quota_hint() {
+        // Similar to the above but with "upstream_provider_shared_pool" as the
+        // retryable override signal (another variant of upstream exhaustion).
+        let body = concat!(
+            r#"{"error":{"code":429,"message":"Provider returned error","metadata":"#,
+            r#"{"provider_name":"Alibaba","provider_error_code":"insufficient_quota","#,
+            r#""limit_source":"upstream_provider_shared_pool"}}}"#,
+        );
+        let err = test_err(429, body);
+        assert!(
+            matches!(classify_err(&err), ErrorClass::Retryable),
+            "429 with 'upstream_provider_shared_pool' should be Retryable \
+             despite also containing 'insufficient_quota'"
+        );
+    }
+
+    #[test]
+    fn genuine_quota_exhaustion_still_non_retryable() {
+        // Verify that a genuine quota-exhaustion 429 (no retryable override
+        // signal) remains NonRetryable — the fix must not break existing
+        // billing detection.
+        let body = r#"{"error":{"code":429,"message":"You have exceeded your quota. insufficient_quota"}}"#;
+        let err = test_err(429, body);
+        assert!(
+            matches!(classify_err(&err), ErrorClass::NonRetryable),
+            "genuine quota exhaustion 429 without override should remain NonRetryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_upstream_rate_limit_is_retried() {
+        // Integration test: a provider returning HTTP 429 with both
+        // "insufficient_quota" (in metadata) and "temporarily rate-limited"
+        // (in raw upstream text) must be retried, not aborted at attempt 1.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            "primary".into(),
+            Box::new(
+                TestProvider::new("ok after upstream rate limit")
+                    .with_upstream_rate_limit(1)
+                    .with_calls(calls.clone()),
+            ) as Box<dyn Provider>,
+            2,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("test")];
+        let result = provider.chat(test_request(messages.clone(), None)).await;
+        assert!(
+            result.is_ok(),
+            "upstream rate-limit 429 with retryable override should recover after retry"
+        );
+        assert_eq!(
+            result.unwrap().text.as_deref(),
+            Some("ok after upstream rate limit"),
+        );
+        // Should have failed once (upstream rate limit) then recovered
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn retryable_overrides_do_not_affect_non_429() {
+        // Retryable override signals in non-429/5xx contexts must not change
+        // classification — e.g., a 400 with "temporarily rate-limited" in body
+        // is still a client error (NonRetryable via status code).
+        let err = test_err(400, "Bad Request: temporarily rate-limited");
+        assert!(
+            matches!(classify_err(&err), ErrorClass::NonRetryable),
+            "400 with override text should still be NonRetryable"
+        );
     }
 
     #[tokio::test]
