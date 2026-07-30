@@ -52,16 +52,16 @@ use tracing::{debug, info, warn};
 const MODEL_REPO: &str = "Qwen/Qwen3-ASR-0.6B";
 
 /// Local subdirectory under `~/.mahbot/models/` where the model is stored.
-const MODEL_DIR_NAME: &str = "qwen3-asr-0.6b";
+pub(crate) const MODEL_DIR_NAME: &str = "qwen3-asr-0.6b";
 
 /// Filenames required by `qwen-asr`.
 ///
 /// The qwen-asr crate's `QwenCtx::load()` expects `model*.safetensors` and
 /// `vocab.json` in the model directory. We also download `merges.txt` for the
 /// BPE tokenizer.
-const MODEL_FILENAME: &str = "model.safetensors";
-const VOCAB_FILENAME: &str = "vocab.json";
-const MERGES_FILENAME: &str = "merges.txt";
+pub(crate) const MODEL_FILENAME: &str = "model.safetensors";
+pub(crate) const VOCAB_FILENAME: &str = "vocab.json";
+pub(crate) const MERGES_FILENAME: &str = "merges.txt";
 
 /// SHA256 checksums for download integrity verification.
 ///
@@ -168,17 +168,14 @@ pub struct QwenLocalTranscriber {
 }
 
 impl QwenLocalTranscriber {
-    /// Load the model from the local cache directory.
+    /// Load the model from an explicit directory path.
     ///
-    /// Returns `None` if the model directory is missing or the model fails to
-    /// load (corrupted files, version mismatch, etc.).
-    fn try_load() -> Option<Self> {
-        let dir = model_dir()?;
+    /// Unlike [`try_init_from_cache`](super::try_init_from_cache), this does
+    /// not resolve the directory via [`model_dir`] and therefore does not
+    /// depend on the CONFIG storage root being set.
+    fn try_load_from(dir: &Path) -> Option<Self> {
         let dir_str = dir.to_string_lossy().to_string();
         let mut ctx = qwen_asr::context::QwenCtx::load(&dir_str)?;
-        // Enable automatic language detection so the model transcribes audio
-        // in its natural language (Russian → Russian, English → English, etc.)
-        // instead of defaulting to English-only output.
         ctx.want_language_detection = true;
         Some(Self {
             ctx: Arc::new(Mutex::new(ctx)),
@@ -682,10 +679,13 @@ async fn download_retry_loop() {
             // All files downloaded and verified. Load the model on a blocking
             // thread (reads model weights from disk).
             info!("Local transcriber: all model files downloaded, loading...");
-            let loaded = tokio::task::spawn_blocking(QwenLocalTranscriber::try_load)
-                .await
-                .ok()
-                .flatten();
+            let dir_for_load = dir.clone();
+            let loaded = tokio::task::spawn_blocking(move || {
+                QwenLocalTranscriber::try_load_from(&dir_for_load)
+            })
+            .await
+            .ok()
+            .flatten();
             if let Some(tc) = loaded {
                 info!("Local transcriber: Qwen3-ASR model loaded successfully");
                 set_transcriber_ready(tc);
@@ -748,43 +748,11 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
 
 // ── Public API ────────────────────────────────────────────────────────
 
-/// Try to initialise the local transcriber from cached model files.
-///
-/// Returns `true` if the model was loaded successfully, `false` if files are
-/// missing (background download will be spawned). This is called during
-/// bootstrap so the model starts loading eagerly rather than waiting for the
-/// first voice message.
-///
-/// # Async I/O
-///
-/// SHA256 checksum verification (reads the full 1.88 GB model file) is
-/// offloaded to a blocking thread via [`tokio::task::spawn_blocking`] so the
-/// async runtime is not stalled during startup.
-pub async fn try_init_from_cache() -> bool {
-    match STATE.load(Ordering::Acquire) {
-        STATE_READY => return true,
-        STATE_UNINIT => {}
-        _ => return false,
-    }
-
-    // Atomic CAS to become the initializer.
-    if STATE
-        .compare_exchange(
-            STATE_UNINIT,
-            STATE_LOADING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
-        return false;
-    }
-
-    let Some(dir) = model_dir() else {
-        STATE.store(STATE_FAILED, Ordering::Release);
-        return false;
-    };
-
+/// Shared initialization logic — checks files, verifies checksums, loads the
+/// model from `dir`, and stores it into [`GLOBAL_TRANSCRIBER`].  The caller
+/// (either [`try_init_from_cache`] or [`try_init_from_dir`]) is responsible
+/// for the STATE atomic guard.
+async fn try_init_inner(dir: PathBuf) -> bool {
     let model_path = dir.join(MODEL_FILENAME);
     let vocab_path = dir.join(VOCAB_FILENAME);
     let merges_path = dir.join(MERGES_FILENAME);
@@ -804,11 +772,13 @@ pub async fn try_init_from_cache() -> bool {
         });
 
         if checksums_ok {
-            // Load the model (also file I/O, on a blocking thread).
-            let loaded = tokio::task::spawn_blocking(QwenLocalTranscriber::try_load)
-                .await
-                .ok()
-                .flatten();
+            // Load the model using the already-resolved directory
+            // (moved into the blocking closure — no longer needed after this).
+            let loaded =
+                tokio::task::spawn_blocking(move || QwenLocalTranscriber::try_load_from(&dir))
+                    .await
+                    .ok()
+                    .flatten();
             if let Some(tc) = loaded {
                 info!("Local transcriber: loaded from cache");
                 set_transcriber_ready(tc);
@@ -830,6 +800,68 @@ pub async fn try_init_from_cache() -> bool {
     info!("Local transcriber: model not cached, spawning background download");
     tokio::spawn(download_retry_loop());
     false
+}
+
+/// Try to shortcut or acquire the initialisation lock.
+///
+/// Returns `None` if the caller acquired the lock and should proceed.
+/// Returns `Some(true)` if already initialised (STATE_READY) — caller
+/// should return success.
+/// Returns `Some(false)` if another thread is loading or a previous
+/// attempt failed — caller should return failure.
+fn try_lock_init() -> Option<bool> {
+    match STATE.load(Ordering::Acquire) {
+        STATE_READY => return Some(true),
+        STATE_UNINIT => {}
+        _ => return Some(false),
+    }
+
+    if STATE
+        .compare_exchange(
+            STATE_UNINIT,
+            STATE_LOADING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return Some(false);
+    }
+
+    None
+}
+
+/// Initialise the local transcriber from the default cache directory
+/// (resolved via [`model_dir`], which depends on the CONFIG storage root).
+///
+/// This is the main entry point used by the production pipeline
+/// (`bootstrap` and audio enrichment).
+pub async fn try_init_from_cache() -> bool {
+    if let Some(result) = try_lock_init() {
+        return result;
+    }
+
+    let Some(dir) = model_dir() else {
+        STATE.store(STATE_FAILED, Ordering::Release);
+        return false;
+    };
+
+    try_init_inner(dir).await
+}
+
+/// Initialise the local transcriber from an explicit model directory.
+///
+/// This is the same as [`try_init_from_cache`] but uses the provided
+/// `dir` instead of resolving via `model_dir()`.  Useful when the
+/// caller knows the exact cache path and cannot rely on the CONFIG
+/// storage root (e.g. in tests).
+#[allow(dead_code)]
+pub(crate) async fn try_init_from_dir(dir: &Path) -> bool {
+    if let Some(result) = try_lock_init() {
+        return result;
+    }
+
+    try_init_inner(dir.to_owned()).await
 }
 
 /// True if the local transcriber is loaded and ready for use.

@@ -2404,6 +2404,24 @@ mod tests {
         candidates
     }
 
+    /// Return the list of essential TTS model file paths for a given model
+    /// directory, used to verify that the model is fully cached on disk.
+    ///
+    /// Shared between [`tts_models_cached`] (side-effect-free check) and
+    /// [`test_tts_engine`] (model loader) so the file set stays in sync.
+    fn essential_tts_paths(dir: &std::path::Path) -> [std::path::PathBuf; 7] {
+        let onnx_dir = dir.join(ONNX_DIR);
+        [
+            onnx_dir.join(DP_ONNX_NAME),
+            onnx_dir.join(TEXT_ENC_ONNX_NAME),
+            onnx_dir.join(VECTOR_EST_ONNX_NAME),
+            onnx_dir.join(VOCODER_ONNX_NAME),
+            onnx_dir.join(TTS_JSON_NAME),
+            onnx_dir.join(UNICODE_INDEXER_NAME),
+            dir.join(VOICE_STYLES_DIR).join(DEFAULT_VOICE_NAME),
+        ]
+    }
+
     /// Helper to obtain a loaded [`TtsEngine`] for integration tests.
     /// Returns the test TTS engine, panicking with a clear message if
     /// model files are not cached on disk.
@@ -2422,17 +2440,7 @@ mod tests {
 
                 // Try each candidate until we find model files.
                 for dir in &candidates {
-                    let onnx_dir = dir.join(ONNX_DIR);
-                    // Check essential files: one ONNX model, config, indexer, and voice style
-                    let essential_files = [
-                        onnx_dir.join(DP_ONNX_NAME),
-                        onnx_dir.join(TEXT_ENC_ONNX_NAME),
-                        onnx_dir.join(VECTOR_EST_ONNX_NAME),
-                        onnx_dir.join(VOCODER_ONNX_NAME),
-                        onnx_dir.join(TTS_JSON_NAME),
-                        onnx_dir.join(UNICODE_INDEXER_NAME),
-                        dir.join(VOICE_STYLES_DIR).join(DEFAULT_VOICE_NAME),
-                    ];
+                    let essential_files = essential_tts_paths(dir);
                     if essential_files.iter().all(|p| p.exists()) {
                         match load_engine(dir) {
                             Ok(engine) => return Some(engine),
@@ -2866,5 +2874,244 @@ mod tests {
                 "counter must return to 0 after balanced add/sub pairs"
             );
         }
+    }
+
+    // ── E2E TTS→ASR roundtrip test (ignored by default) ─────────────────
+
+    /// Check if all required TTS model files exist on disk without
+    /// loading the ONNX models into memory.
+    ///
+    /// Uses the shared [`essential_tts_paths`] helper so the file set
+    /// stays in sync with [`test_tts_engine`].
+    fn tts_models_cached() -> bool {
+        let candidates = test_model_candidates();
+        for dir in &candidates {
+            if essential_tts_paths(dir).iter().all(|p| p.exists()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// End-to-end TTS→ASR roundtrip test.
+    ///
+    /// Synthesizes a short English phrase with the Supertonic 3 TTS model,
+    /// then transcribes the resulting audio back to text using the Qwen3-ASR
+    /// model, and asserts that the transcribed words substantially match
+    /// the original input (case-insensitive, punctuation-tolerant).
+    ///
+    /// This test is `#[ignore]` by default because it requires ~2.5 GB of
+    /// downloaded model files (TTS ~400 MB + ASR ~1.88 GB) and several
+    /// seconds of ONNX inference. Run it explicitly with:
+    ///
+    /// ```sh
+    /// cargo test test_tts_e2e -- --ignored --nocapture
+    /// ```
+    ///
+    /// If either model is not cached on disk, the test prints a clear skip
+    /// message and returns early (no panic, no test failure).
+    #[ignore]
+    #[tokio::test]
+    #[serial_test::serial(tts)]
+    async fn test_tts_e2e() {
+        // ── Pre-flight checks ─────────────────────────────────────────
+        //
+        // Check both TTS and ASR model file existence BEFORE calling any
+        // loading function that might panic or spawn side-effectful tasks.
+
+        if !tts_models_cached() {
+            eprintln!(
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+                 SKIP: TTS model files not cached.\n\n\
+                 Required directory:  ~/.mahbot/models/supertonic3/\n\
+                 Required files:      onnx/*.onnx, onnx/tts.json, onnx/unicode_indexer.json,\n\
+                                      voice_styles/M1.json\n\n\
+                 Run the application first to download TTS models (~400 MB).\n\
+                 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            );
+            return;
+        }
+
+        // ── Compute ASR model directory ────────────────────────────
+        //
+        // Resolve the expected cache path once, then use it for both the
+        // side-effect-free pre-flight check and the actual model load.
+        // This keeps the two paths perfectly in sync.
+
+        let Some(home_dir) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) else {
+            eprintln!(
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n                 SKIP: $HOME not set, cannot determine ASR model path.\n                 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            );
+            return;
+        };
+
+        let asr_dir = std::path::PathBuf::from(&home_dir)
+            .join(".mahbot")
+            .join("models")
+            .join(crate::audio::local_transcriber::MODEL_DIR_NAME);
+
+        // Side-effect-free pre-flight check — same path as the load below.
+        if !asr_dir
+            .join(crate::audio::local_transcriber::MODEL_FILENAME)
+            .exists()
+            || !asr_dir
+                .join(crate::audio::local_transcriber::VOCAB_FILENAME)
+                .exists()
+            || !asr_dir
+                .join(crate::audio::local_transcriber::MERGES_FILENAME)
+                .exists()
+        {
+            eprintln!(
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n                 SKIP: ASR model files not cached.\n\n                 Required directory:  {}\n                 Required files:      {}, {}, {}\n\n                 Run the application first to download ASR models (~1.88 GB).\n                 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                asr_dir.display(),
+                crate::audio::local_transcriber::MODEL_FILENAME,
+                crate::audio::local_transcriber::VOCAB_FILENAME,
+                crate::audio::local_transcriber::MERGES_FILENAME,
+            );
+            return;
+        }
+
+        // ── Load ASR model ────────────────────────────────────────────
+
+        if !crate::audio::local_transcriber::try_init_from_dir(&asr_dir).await {
+            eprintln!(
+                "SKIP: ASR model files present but could not be loaded \
+                 (checksum mismatch or corrupted files).\
+                 \n  Directory: {}",
+                asr_dir.display(),
+            );
+            return;
+        }
+
+        // ── Load TTS engine ───────────────────────────────────────────
+        //
+        // Cached via OnceLock (~2 s on first call).
+        let engine = test_tts_engine();
+        let (style_dp, style_ttl) = test_voice_style();
+
+        // ── Synthesis ──────────────────────────────────────────────────
+        //
+        // Use a longer phrase (11 words) for reliable ASR recognition.
+        let input = "Hello world this is a test of the speech synthesis engine";
+
+        // Preprocess text exactly as the production synthesis path does.
+        let processed = preprocess_text(input);
+        assert!(!processed.is_empty(), "preprocessed text must not be empty");
+
+        // Wrap in the default language tag for synthesis.
+        let text_with_lang = format!("<en>{processed}</en>");
+        let native_rate = engine.sample_rate; // 24 kHz (Supertonic 3)
+
+        // Synthesise audio samples (f32 PCM).
+        let samples = synthesize_internal(engine, &text_with_lang, style_dp, style_ttl, 42)
+            .expect("TTS synthesis of short phrase should succeed");
+
+        assert!(!samples.is_empty(), "synthesised audio must not be empty");
+        assert!(
+            samples.len() > 1000,
+            "short phrase should produce at least 1000 samples (got {})",
+            samples.len()
+        );
+
+        // ── Resample to 16 kHz (ASR native rate) ──────────────────────
+        //
+        // The Supertonic 3 model natively outputs 24 kHz. Qwen3-ASR
+        // expects 16 kHz input, so we resample here.
+
+        const ASR_SAMPLE_RATE: u32 = 16_000;
+
+        let resampled = if native_rate == ASR_SAMPLE_RATE {
+            samples
+        } else {
+            crate::util::resample_audio(&samples, native_rate, ASR_SAMPLE_RATE)
+        };
+
+        // ── Render WAV ────────────────────────────────────────────────
+        //
+        // Write the resampled PCM data to a WAV file at 16 kHz, 16-bit mono.
+
+        let wav_bytes =
+            render_wav(&resampled, ASR_SAMPLE_RATE).expect("WAV rendering should succeed");
+
+        assert!(wav_bytes.starts_with(b"RIFF"), "WAV should start with RIFF");
+        assert!(wav_bytes.len() > 44, "WAV should have header + data");
+
+        // ── Write temp file ───────────────────────────────────────────
+        let tmp_dir = std::env::temp_dir();
+        let wav_path = tmp_dir.join("test_tts_e2e.wav");
+        std::fs::write(&wav_path, &wav_bytes)
+            .unwrap_or_else(|e| panic!("Failed to write temp WAV file: {e}"));
+
+        // ── Transcribe with ASR ───────────────────────────────────────
+        //
+        // Use a reasonable 60-second timeout for the ONNX inference.
+
+        let transcription = crate::audio::local_transcriber::transcribe_file_async(
+            &wav_path,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            // Clean up temp file before panicking.
+            let _ = std::fs::remove_file(&wav_path);
+            panic!("ASR transcription failed: {e}");
+        });
+
+        // ── Clean up temp file ────────────────────────────────────────
+        let _ = std::fs::remove_file(&wav_path);
+
+        // ── Word comparison ───────────────────────────────────────────
+        //
+        // Strip punctuation from each word and convert to lowercase.
+        // Compare using set membership: count how many unique input
+        // words appear anywhere in the transcription.  This is robust
+        // against ASR insertions, deletions, and word-order variation
+        // while still reliably catching garbled audio (which produces
+        // < 30 % word overlap).
+        //
+        // Punctuation differences are acceptable (e.g. "engine." vs
+        // "engine").
+
+        fn normalize_word(word: &str) -> String {
+            // Strip ASCII punctuation (Unicode punctuation like em-dashes or
+            // curly quotes is not stripped, but these rarely appear in the
+            // simple English phrases used by this test).
+            word.trim_matches(|c: char| c.is_ascii_punctuation())
+                .to_lowercase()
+        }
+
+        let input_words: std::collections::HashSet<String> = input
+            .split_whitespace()
+            .map(normalize_word)
+            .filter(|w| !w.is_empty())
+            .collect();
+
+        let transcribed_words: std::collections::HashSet<String> = transcription
+            .split_whitespace()
+            .map(normalize_word)
+            .filter(|w| !w.is_empty())
+            .collect();
+
+        let total_input = input_words.len();
+        assert!(
+            total_input > 0,
+            "No input words to compare. Input: '{input}'"
+        );
+
+        let matched = input_words.intersection(&transcribed_words).count();
+
+        // At least 70 % of unique input words must appear in the
+        // transcription.  Proper ceil division: (n * 70 + 99) / 100.
+        let threshold = (total_input * 70 + 99) / 100;
+        assert!(
+            matched >= threshold,
+            "E2E TTS→ASR roundtrip: only {matched}/{total_input} unique \
+             input words found in transcription (threshold {threshold}).\n\
+             Input:        {input}\n\
+             Preprocessed: {processed}\n\
+             Transcribed:  {transcription}\n\
+             Input words:  {input_words:#?}\n\
+             ASR words:    {transcribed_words:#?}"
+        );
     }
 }
