@@ -3203,11 +3203,10 @@ pub(crate) fn synthesize_with_pcm_cache(
     let cache_bust = std::env::var("MAHBOT_TEST_CACHE_BUST").as_deref() == Ok("1");
 
     // Fast path: cache hit (skipped entirely when busting)
-    if !cache_bust
-        && let Some(pcm) = read_pcm_cache(&cache_path) {
-            debug!("PCM cache HIT for key {key} ({text}, style={style}, seed={seed})");
-            return Some(pcm);
-        }
+    if !cache_bust && let Some(pcm) = read_pcm_cache(&cache_path) {
+        debug!("PCM cache HIT for key {key} ({text}, style={style}, seed={seed})");
+        return Some(pcm);
+    }
 
     if cache_bust {
         debug!(
@@ -7709,6 +7708,7 @@ mod tests {
     use super::*;
     use crate::VERIFIER_INPUT_DIM;
     use crate::audio::voice_verifier::DEFAULT_VERIFIER_THRESHOLD;
+    use crate::audio::voice_verifier::VerifierArch;
     use crate::util::test::set_env_var;
     use crate::util::{add_noise, apply_gain, generate_pink_noise};
     use rand::SeedableRng;
@@ -9941,12 +9941,17 @@ mod tests {
     /// threshold.  Logistic bias = -2.0 gives sigmoid(-2.0) ≈ 0.12 < 0.948.
     fn verifier_always_reject() -> VoiceVerifier {
         VoiceVerifier {
+            arch: VerifierArch::Logistic,
             trained: true,
             threshold: DEFAULT_VERIFIER_THRESHOLD,
             weights: vec![0.0; EMBEDDING_DIM],
             bias: -2.0, // sigmoid(-2.0) ≈ 0.12
             scaler_mean: Vec::new(),
             scaler_std: Vec::new(),
+            conv_weight: Vec::new(),
+            conv_bias: Vec::new(),
+            fc_weight: Vec::new(),
+            fc_bias: Vec::new(),
         }
     }
 
@@ -9954,12 +9959,17 @@ mod tests {
     /// threshold.  Logistic bias = 3.0 gives sigmoid(3.0) ≈ 0.95 > 0.948.
     fn verifier_always_accept() -> VoiceVerifier {
         VoiceVerifier {
+            arch: VerifierArch::Logistic,
             trained: true,
             threshold: DEFAULT_VERIFIER_THRESHOLD,
             weights: vec![0.0; EMBEDDING_DIM],
             bias: 3.0, // sigmoid(3.0) ≈ 0.95
             scaler_mean: Vec::new(),
             scaler_std: Vec::new(),
+            conv_weight: Vec::new(),
+            conv_bias: Vec::new(),
+            fc_weight: Vec::new(),
+            fc_bias: Vec::new(),
         }
     }
 

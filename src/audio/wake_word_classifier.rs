@@ -374,7 +374,7 @@ impl WakeWordClassifier {
 
 // ── Forward primitives ──────────────────────────────────────────────────
 
-fn conv1d(
+pub(crate) fn conv1d(
     inp: &[f32],
     cin: usize,
     l: usize,
@@ -421,13 +421,13 @@ fn batch_norm(
     }
 }
 
-fn relu(x: &mut [f32]) {
+pub(crate) fn relu(x: &mut [f32]) {
     for v in x {
         *v = v.max(0.0);
     }
 }
 
-fn adaptive_avg_pool(x: &[f32], c: usize, l: usize) -> Vec<f32> {
+pub(crate) fn adaptive_avg_pool(x: &[f32], c: usize, l: usize) -> Vec<f32> {
     let mut out = vec![0.0; c];
     for ci in 0..c {
         let mut s = 0.0;
@@ -529,20 +529,20 @@ fn build_windows(sequences: &[EmbeddingSequence]) -> Vec<Vec<f32>> {
     windows
 }
 
-struct AdamState {
+pub(crate) struct AdamState {
     m: Vec<f32>,
     v: Vec<f32>,
     t: usize,
 }
 impl AdamState {
-    fn new(n: usize) -> Self {
+    pub(crate) fn new(n: usize) -> Self {
         Self {
             m: vec![0.0; n],
             v: vec![0.0; n],
             t: 0,
         }
     }
-    fn update(&mut self, p: &mut [f32], g: &[f32], lr: f32) {
+    pub(crate) fn update(&mut self, p: &mut [f32], g: &[f32], lr: f32) {
         self.t += 1;
         let b1 = ADAM_BETA1;
         let b2 = ADAM_BETA2;
@@ -795,7 +795,7 @@ fn gather<T: Clone>(data: &[T], idx: &[usize]) -> Vec<T> {
     idx.iter().map(|&i| data[i].clone()).collect()
 }
 
-fn to_channels_first(x: &[f32], cin: usize, lin: usize) -> Vec<f32> {
+pub(crate) fn to_channels_first(x: &[f32], cin: usize, lin: usize) -> Vec<f32> {
     let mut out = vec![0.0; cin * lin];
     for (t, chunk) in x.chunks(cin).enumerate() {
         for (c, &v) in chunk.iter().enumerate() {

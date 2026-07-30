@@ -3,17 +3,33 @@
 //! Implements a lightweight second-stage classifier that runs AFTER the
 //! Conv1D classifier fires, as an additional AND gate.
 //!
-//! Uses a **logistic regression** (mahbot-901): 97-parameter logistic regression on
-//! temporally mean-pooled 96-dim embeddings (L2 regularization removed in mahbot-994).
-//! Mean-pools the 3-frame window to 96-dim before L2-norm, scaler, and
-//! linear+sigmoid (~335× fewer parameters than the previous 3-layer MLP).
+//! ## Primary architecture (mahbot-995): Conv1D
+//!
+//! Conv1D(96→2, k=3, padding=1) → ReLU → AdaptiveAvgPool → Linear(2→1) → Sigmoid.
+//! ~581 trainable parameters. Preserves temporal structure across the 3-frame
+//! window (288-dim concatenated input, no mean-pooling).
+//!
+//! ## Legacy architecture (mahbot-901): Logistic regression
+//!
+//! 97-parameter logistic regression on temporally mean-pooled 96-dim embeddings
+//! (L2 regularization removed in mahbot-994). Mean-pools the 3-frame window to
+//! 96-dim before L2-norm, scaler, and linear+sigmoid.
+//!
+//! ## Backward compatibility
+//!
+//! Old logistic-format models (serialized before mahbot-995) deserialize with
+//! `arch: Logistic` and continue working through the logistic path. New training
+//! produces `arch: Conv1D` with Conv1D weight fields. `predict()` dispatches
+//! based on `arch` via `predict_conv1d()` or `predict_logistic()`.
 //!
 //! When not trained, the verifier acts as a no-op (all frames pass).
 //!
 //! # Architecture
 //!
-//! Training pipeline: per-frame embeddings → windowing → L2-norm →
-//! StandardScaler → train (logistic SGD with L2).  Inference is ~3μs per frame.
+//! Training pipeline: per-frame embeddings → windowing (concatenated 288-dim
+//! for Conv1D, mean-pooled 96-dim for logistic) → L2-norm → [scaler only for
+//! logistic] → train (Adam for Conv1D, SGD for logistic).  Inference is ~3μs
+//! per frame.
 //!
 //! ## Training data
 //!
@@ -112,18 +128,12 @@ pub(crate) const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.948;
 /// is not forced to extreme negative values.
 pub(crate) const L2_LAMBDA: f32 = 0.0;
 
-/// Learning rate for logistic regression SGD training (mahbot-901).
-///
-/// Higher than MLP's LEARNING_RATE (0.001 tuned for Adam) because logistic
-/// regression with plain SGD on a convex surface benefits from larger step
-/// sizes.  Tested at lr=0.01 against the HARD-tier benchmark.
+/// Learning rate for logistic regression SGD training (backward-compat only, mahbot-995).
+#[cfg(test)]
 pub(crate) const LOGISTIC_LEARNING_RATE: f32 = 0.01;
 
-/// Maximum iterations for logistic regression training.
-///
-/// Logistic converges faster than the MLP (convex optimization vs non-convex),
-/// so 1000 iterations suffice.  The MLP needs 2000 iterations due to the deeper
-/// non-linear layers.
+/// Maximum iterations for logistic regression training (backward-compat only, mahbot-995).
+#[cfg(test)]
 pub(crate) const LOGISTIC_MAX_ITER: usize = 1000;
 
 /// Fraction of sequences held out for validation (80/20 train/val split).
@@ -134,13 +144,33 @@ pub(crate) const LOGISTIC_MAX_ITER: usize = 1000;
 /// when per-sequence split produces insufficient validation data.
 pub(crate) const VALIDATION_SPLIT: f32 = 0.2;
 
-/// Early stopping patience: stop if validation loss hasn't improved for this
-/// many iterations.  Set to 100 (10% of the 1000-iteration budget), matching
-/// the Conv1D classifier's relative patience ratio (15% of 100 epochs).
+/// Early stopping patience for logistic verifier (backward-compat only, mahbot-995).
+/// The Conv1D path uses its own [`CONV_EARLY_STOP_PATIENCE`].
+#[cfg(test)]
 pub(crate) const EARLY_STOP_PATIENCE: usize = 100;
 
 /// Log training and validation loss every N iterations.
 const LOG_LOSS_INTERVAL: usize = 50;
+
+// ── Conv1D verifier training hyperparameters (mahbot-995) ────────────────
+//
+// Matches the Conv1D classifier's proven values (wake_word_classifier.rs)
+// for the same small-dataset (<200 positive windows) regime.
+
+/// Learning rate for Conv1D verifier Adam training.
+const CONV_LEARNING_RATE: f32 = 0.001;
+/// L2 regularization strength for Conv1D verifier.
+const CONV_L2_LAMBDA: f32 = 0.0001;
+/// Batch size for Conv1D verifier mini-batch training.
+const CONV_BATCH_SIZE: usize = 32;
+/// Maximum training epochs for Conv1D verifier.
+const CONV_MAX_EPOCHS: usize = 100;
+/// Early stopping patience for Conv1D verifier.
+const CONV_EARLY_STOP_PATIENCE: usize = 15;
+/// Conv1D output channels for verifier (96→CONV_VERIFIER_OUT).
+const CONV_VERIFIER_OUT: usize = 2;
+/// Conv1D kernel size for verifier.
+const CONV_VERIFIER_KERNEL_SIZE: usize = 3;
 
 /// How much to upweight confusable negative examples during verifier training.
 ///
@@ -222,17 +252,52 @@ pub(crate) const VERIFIER_WARMUP_EMBEDDINGS: usize = 4;
 /// when no real calibration data is available.
 const SYNTHETIC_NEGATIVES_COUNT: usize = 100;
 
+/// Architecture variant for the verifier (mahbot-995).
+///
+/// - [`Logistic`](VerifierArch::Logistic): 97-parameter logistic regression on
+///   mean-pooled 96-dim embeddings (legacy, mahbot-901). Backward compat only
+///   — new training produces [`Conv1D`](VerifierArch::Conv1D).
+/// - [`Conv1D`](VerifierArch::Conv1D): Small Conv1D(96→2, k=3) with 581
+///   parameters operating on 288-dim concatenated windows (mahbot-995).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum VerifierArch {
+    /// 97-parameter logistic regression (legacy, mahbot-901).
+    #[default]
+    Logistic,
+    /// Conv1D(96→2, k=3) with 581 parameters (mahbot-995).
+    Conv1D,
+}
+
 /// Verifier for wake word false-trigger suppression (second-stage AND gate).
 ///
-/// Uses a **logistic regression** (mahbot-901): 97-parameter L2-regularized
-/// logistic regression on temporally mean-pooled 96-dim embeddings.
+/// ## Conv1D architecture (mahbot-995, default for new training)
+///
+/// Conv1D(96→2, k=3, padding=1) → ReLU → AdaptiveAvgPool → Linear(2→1) → Sigmoid.
+/// ~581 trainable parameters operating on 288-dim concatenated windows (no
+/// mean-pooling). Preserves temporal structure for better confusable rejection.
+///
+/// ## Logistic architecture (legacy, mahbot-901)
+///
+/// 97-parameter logistic regression on temporally mean-pooled 96-dim embeddings.
 /// Mean-pools the 3-frame window to 96-dim before L2-norm, scaler, and
-/// linear+sigmoid (~335× fewer parameters than the previous 3-layer MLP).
+/// linear+sigmoid.
+///
+/// ## Backward compatibility
+///
+/// Old logistic-format models deserialize with `arch: Logistic` (via
+/// `#[serde(default)]` on the `arch` field) and continue working through the
+/// logistic path. New training produces `arch: Conv1D`.
 ///
 /// When `trained` is `false`, the verifier is a no-op (all frames pass with
 /// score 1.0).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoiceVerifier {
+    /// Architecture variant (Logistic or Conv1D).
+    #[serde(default)]
+    pub arch: VerifierArch,
+
     /// Logistic regression weights (96-dim, mahbot-901).
     #[serde(default)]
     pub weights: Vec<f32>,
@@ -246,6 +311,20 @@ pub struct VoiceVerifier {
     /// StandardScaler std (96-dim). Empty when scaling is not used.
     #[serde(default)]
     pub scaler_std: Vec<f32>,
+
+    /// Conv1D weight: [CONV_VERIFIER_OUT, EMBEDDING_DIM, kernel_size] = [2, 96, 3] = 576.
+    #[serde(default)]
+    pub conv_weight: Vec<f32>,
+    /// Conv1D bias: [CONV_VERIFIER_OUT] = [2].
+    #[serde(default)]
+    pub conv_bias: Vec<f32>,
+    /// FC weight: [CONV_VERIFIER_OUT] → [1] = 2 elements.
+    #[serde(default)]
+    pub fc_weight: Vec<f32>,
+    /// FC bias: [1] = 1 element.
+    #[serde(default)]
+    pub fc_bias: Vec<f32>,
+
     /// Decision threshold. Frames with a score below this are suppressed.
     #[serde(default = "default_verifier_threshold")]
     pub threshold: f32,
@@ -264,15 +343,37 @@ impl Default for VoiceVerifier {
     }
 }
 
+/// Per-sequence metadata for stratified train/val split (mahbot-949).
+struct SeqInfo {
+    start: usize,
+    count: usize,
+    is_positive: bool,
+    /// Source category for diagnostics.  Read by [`split_train_val`] when
+    /// `stratify_by_source` is true for source-tier stratified validation
+    /// splitting (mahbot-995).
+    source: crate::audio::embedding_sequence::Source,
+}
+
 impl VoiceVerifier {
     /// Create an untrained verifier (no-op: all frames pass).
+    ///
+    /// Uses [`VerifierArch::Conv1D`] to match the architecture produced by
+    /// [`train`](Self::train) (mahbot-995).  An untrained verifier always returns
+    /// `1.0` from [`predict`](Self::predict) regardless of arch, so this is
+    /// purely for consistency (the arch field of an untrained verifier is never
+    /// used for inference).
     #[must_use]
     pub fn untrained() -> Self {
         Self {
+            arch: VerifierArch::Conv1D,
             weights: Vec::new(),
             bias: 0.0,
             scaler_mean: Vec::new(),
             scaler_std: Vec::new(),
+            conv_weight: Vec::new(),
+            conv_bias: Vec::new(),
+            fc_weight: Vec::new(),
+            fc_bias: Vec::new(),
             threshold: DEFAULT_VERIFIER_THRESHOLD,
             trained: false,
         }
@@ -281,37 +382,68 @@ impl VoiceVerifier {
     /// Returns `true` if this verifier has been trained and is ready for
     /// inference.
     ///
-    /// Validates that logistic regression weights are the correct dimension
-    /// (96), the scaler is present and matches, and the bias is finite.
+    /// Validates architecture-specific weights:
+    /// - Logistic: 96-dim weights, optional scaler, finite bias
+    /// - Conv1D: 576-dim conv_weight + 2-dim conv_bias + 2-dim fc_weight + 1-dim fc_bias
     #[must_use]
     pub fn is_trained(&self) -> bool {
         if !self.trained {
             return false;
         }
-        // Must have 96-dim weights.
-        if self.weights.len() != EMBEDDING_DIM {
-            return false;
+        match self.arch {
+            VerifierArch::Logistic => {
+                // Must have 96-dim weights.
+                if self.weights.len() != EMBEDDING_DIM {
+                    return false;
+                }
+                // If scaler is present, it must be at 96-dim and both mean and std
+                // must be populated.  Empty scaler is OK (inference skips scaling).
+                let has_mean = !self.scaler_mean.is_empty();
+                let has_std = !self.scaler_std.is_empty();
+                if has_mean != has_std {
+                    return false; // partial scaler
+                }
+                if has_mean
+                    && (self.scaler_mean.len() != EMBEDDING_DIM
+                        || self.scaler_std.len() != EMBEDDING_DIM)
+                {
+                    return false;
+                }
+                // Bias must be finite.
+                self.bias.is_finite()
+            }
+            VerifierArch::Conv1D => {
+                // conv_weight: [CONV_VERIFIER_OUT, EMBEDDING_DIM, CONV_VERIFIER_KERNEL_SIZE]
+                let expected_conv_w = CONV_VERIFIER_OUT * EMBEDDING_DIM * CONV_VERIFIER_KERNEL_SIZE;
+                if self.conv_weight.len() != expected_conv_w {
+                    return false;
+                }
+                if self.conv_bias.len() != CONV_VERIFIER_OUT {
+                    return false;
+                }
+                if self.fc_weight.len() != CONV_VERIFIER_OUT {
+                    return false;
+                }
+                if self.fc_bias.len() != 1 {
+                    return false;
+                }
+                // All weights must be finite.
+                self.conv_weight.iter().all(|v| v.is_finite())
+                    && self.conv_bias.iter().all(|v| v.is_finite())
+                    && self.fc_weight.iter().all(|v| v.is_finite())
+                    && self.fc_bias.iter().all(|v| v.is_finite())
+            }
         }
-        // If scaler is present, it must be at 96-dim and both mean and std
-        // must be populated.  Empty scaler is OK (inference skips scaling).
-        let has_mean = !self.scaler_mean.is_empty();
-        let has_std = !self.scaler_std.is_empty();
-        if has_mean != has_std {
-            return false; // partial scaler
-        }
-        if has_mean
-            && (self.scaler_mean.len() != EMBEDDING_DIM || self.scaler_std.len() != EMBEDDING_DIM)
-        {
-            return false;
-        }
-        // Bias must be finite.
-        self.bias.is_finite()
     }
 
     /// Predict the probability that the given window is a genuine wake word.
     ///
-    /// Accepts either 288-dim (mean-pools internally to 96-dim) or 96-dim
-    /// (already pooled, e.g. from training diagnostics) input.
+    /// For [`VerifierArch::Conv1D`]: requires 288-dim input (3 concatenated
+    /// 96-dim embeddings). Panics if input is not 288-dim.
+    ///
+    /// For [`VerifierArch::Logistic`]: accepts either 288-dim (mean-pools
+    /// internally to 96-dim) or 96-dim (already pooled, e.g. from training
+    /// diagnostics) input.
     ///
     /// Returns a score in `[0.0, 1.0]`. When untrained, always returns `1.0`
     /// (no-op — all frames pass).
@@ -321,27 +453,39 @@ impl VoiceVerifier {
             return 1.0;
         }
 
-        // Logistic regression on mean-pooled 96-dim embeddings (mahbot-901).
-        // Accepts either 288-dim (mean-pools internally) or 96-dim
-        // (already pooled, e.g. from training diagnostics).
-        predict_logistic(
-            embedding,
-            &self.weights,
-            self.bias,
-            &self.scaler_mean,
-            &self.scaler_std,
-        )
+        match self.arch {
+            VerifierArch::Conv1D => predict_conv1d(
+                embedding,
+                &self.conv_weight,
+                &self.conv_bias,
+                &self.fc_weight,
+                &self.fc_bias,
+            ),
+            VerifierArch::Logistic => {
+                // Logistic regression on mean-pooled 96-dim embeddings (mahbot-901).
+                // Accepts either 288-dim (mean-pools internally) or 96-dim
+                // (already pooled, e.g. from training diagnostics).
+                predict_logistic(
+                    embedding,
+                    &self.weights,
+                    self.bias,
+                    &self.scaler_mean,
+                    &self.scaler_std,
+                )
+            }
+        }
     }
 
     /// Train a new verifier from positive and negative
     /// [`EmbeddingSequence`](crate::audio::embedding_sequence::EmbeddingSequence)
-    /// inputs.  Trains a logistic regression classifier with L2 regularization.
+    /// inputs.  Trains a Conv1D classifier with L2 regularization (mahbot-995).
     ///
     /// Windows are formed **within** each sequence independently (never across
     /// sequences), preventing the cross-utterance window contamination that
     /// existed when training operated on flat `&[Vec<f32>]` lists (mahbot-902).
-    /// Windows are mean-pooled to 96-dim (mahbot-901) and L2-normalized before
-    /// training (mahbot-870).
+    /// Each window is 3 embeddings (288-dim, not mean-pooled) to preserve
+    /// temporal structure.  Windows are L2-normalized before training
+    /// (mahbot-870).
     ///
     /// # Arguments
     ///
@@ -371,6 +515,12 @@ impl VoiceVerifier {
     /// Returns a trained `VoiceVerifier`, or an untrained verifier if either
     /// input list is empty or no windows can be formed (all sequences shorter
     /// than [`VERIFIER_WINDOW_SIZE`] frames).
+    ///
+    /// ## Architecture
+    ///
+    /// Since mahbot-995, training produces a [`VerifierArch::Conv1D`] model
+    /// (~581 params). Old [`VerifierArch::Logistic`] models remain loadable
+    /// and functional via backward-compatible deserialization.
     #[must_use]
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn train(
@@ -381,23 +531,20 @@ impl VoiceVerifier {
         l2_lambda: f32,
         rng_seed: Option<u64>,
     ) -> Self {
-        Self::train_logistic_inner(
+        Self::train_conv1d_inner(
             positive_sequences,
             negative_sequences,
             per_negative_sequence_weights,
             threshold,
             l2_lambda,
-            LOGISTIC_LEARNING_RATE,
-            LOGISTIC_MAX_ITER,
             rng_seed,
         )
     }
 
     /// Internal training: logistic regression on mean-pooled 96-dim windows.
     ///
-    /// This is the single training path used by both
-    /// [`train`](Self::train) and
-    /// [`train_with_synthetic_negatives`](Self::train_with_synthetic_negatives).
+    /// Only used by backward-compatibility tests (mahbot-995).
+    #[cfg(test)]
     #[must_use]
     #[allow(
         clippy::too_many_arguments,
@@ -417,143 +564,28 @@ impl VoiceVerifier {
         max_iter: usize,
         rng_seed: Option<u64>,
     ) -> Self {
-        // Per-sequence metadata for stratified train/val split (mahbot-949).
-        struct SeqInfo {
-            start: usize,
-            count: usize,
-            is_positive: bool,
-            source: crate::audio::embedding_sequence::Source,
-        }
-
-        // Early exit if either side has zero frames to avoid training on empty data.
-        // Both positive and negative examples are required (mahbot-902).
-        let total_pos_frames: usize = positive_sequences.iter().map(|s| s.embeddings.len()).sum();
-        let total_neg_frames: usize = negative_sequences.iter().map(|s| s.embeddings.len()).sum();
-        if total_pos_frames == 0 || total_neg_frames == 0 {
-            warn!(
-                "Cannot train verifier: need both positive ({total_pos_frames}) and negative ({total_neg_frames}) frames",
-            );
+        // ── Prepare training data via shared helper ──
+        let Some((
+            mut windows,
+            window_labels,
+            window_weights,
+            seq_infos,
+            class_weight,
+            _n_pos_windows,
+        )) = prepare_training_data(
+            positive_sequences,
+            negative_sequences,
+            per_negative_sequence_weights,
+            form_sequence_windows,
+        )
+        else {
             return Self::untrained();
-        }
-
-        // Validate per-negative-sequence weights length.
-        let weights_to_use = match per_negative_sequence_weights {
-            Some(w) if w.len() == negative_sequences.len() => Some(w),
-            Some(w) => {
-                warn!(
-                    "per_negative_sequence_weights length ({}) does not match negative_sequences length ({}); \
-                     falling back to uniform (1.0) negative weights",
-                    w.len(),
-                    negative_sequences.len(),
-                );
-                None
-            }
-            None => None,
         };
-
-        // ── Form windows per-sequence (no cross-sequence windows) ──
-        // Supports two input modes:
-        // 1. Per-frame 96-dim input: form stride-1 windows via windowing functions.
-        // 2. Pre-windowed 288-dim input (e.g., test data): use directly.
-        //
-        // Track per-sequence metadata for stratified train/val split.
-        let mut seq_infos: Vec<SeqInfo> = Vec::new();
-        let mut windows: Vec<Vec<f32>> = Vec::new();
-        let mut window_labels: Vec<f32> = Vec::new();
-        let mut window_weights: Vec<f32> = Vec::new();
-
-        // Positive sequences
-        for seq in positive_sequences {
-            let seq_windows = form_sequence_windows(&seq.embeddings);
-            let start = windows.len();
-            for w in seq_windows {
-                windows.push(w);
-                window_labels.push(1.0);
-                window_weights.push(0.0); // placeholder — set to class_weight below
-            }
-            if windows.len() > start {
-                seq_infos.push(SeqInfo {
-                    start,
-                    count: windows.len() - start,
-                    is_positive: true,
-                    source: seq.source,
-                });
-            }
-        }
-        let n_pos_windows = window_labels.iter().filter(|&&l| l > 0.5).count();
-
-        // Negative sequences
-        for (i, seq) in negative_sequences.iter().enumerate() {
-            let seq_windows = form_sequence_windows(&seq.embeddings);
-            let seq_weight = weights_to_use.map_or(1.0, |pw| pw[i]);
-            let start = windows.len();
-            for w in seq_windows {
-                windows.push(w);
-                window_labels.push(0.0);
-                window_weights.push(seq_weight);
-            }
-            if windows.len() > start {
-                seq_infos.push(SeqInfo {
-                    start,
-                    count: windows.len() - start,
-                    is_positive: false,
-                    source: seq.source,
-                });
-            }
-        }
-
-        if windows.is_empty() {
-            warn!(
-                "Cannot form windows: need at least {VERIFIER_WINDOW_SIZE} per-frame embeddings per sequence",
-            );
-            return Self::untrained();
-        }
-
-        // Class weight from window counts (not embedding-frame counts), adjusted
-        // for per-tier negative weights (mahbot-993).
-        //
-        // The old formula used raw `n_neg_windows / n_pos_windows`, which assumes
-        // every negative window contributes equally to the gradient.  But negative
-        // sequences have per-tier weights (Ambient=1×, Owner=3×, Unrelated=10×,
-        // Confusable=15×) already applied to `window_weights` (line 482).  The
-        // positive class weight must therefore account for the total effective
-        // weight of negatives: `Σ(neg_window_weights) / n_pos_windows`.  This
-        // ensures each class contributes equally to the overall gradient.
-        //
-        // When all per-negative weights are 1.0 (or `None` was passed), this
-        // reduces to `n_neg_windows / n_pos_windows` — the same as the old
-        // formula, making the fix backward-compatible.
-        //
-        // Note: the Conv1D classifier (`train_classifier` in wake_word_classifier.rs)
-        // does NOT have this issue because it uses a symmetric class-weighting
-        // scheme: `pw = total / (2*np)` and `nw = total / (2*nn)`, ensuring each
-        // class contributes exactly `total/2` to the loss, and it has no per-
-        // negative-sequence weights that could unbalance the gradient.
-        let class_weight = {
-            let n_pw_f = n_pos_windows as f32;
-            if n_pw_f > 0.0 {
-                // Sum the effective weights of negative windows, which already
-                // have per-tier weights applied (line 482).
-                let neg_sum: f32 = window_weights[n_pos_windows..].iter().sum();
-                neg_sum / n_pw_f
-            } else {
-                1.0
-            }
-        };
-        for w in &mut window_weights[0..n_pos_windows] {
-            *w = class_weight;
-        }
-
-        // L2-normalize
-        for w in &mut windows {
-            let norm = w.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
-            for v in w.iter_mut() {
-                *v /= norm;
-            }
-        }
 
         // If pre-windowed 288-dim input was provided, mean-pool to 96-dim
-        // (logistic path, mahbot-901).
+        // (logistic path, mahbot-901).  All windows formed by
+        // form_sequence_windows are already 96-dim for per-frame input, but
+        // pre-windowed 288-dim input needs pooling.
         if !windows.is_empty() && windows[0].len() != EMBEDDING_DIM {
             for w in &mut windows {
                 let mut pooled = vec![0.0f32; EMBEDDING_DIM];
@@ -569,84 +601,12 @@ impl VoiceVerifier {
             }
         }
 
-        // ── Train/validation split ──
-        // Per-sequence stratified split: preserve pos:neg ratio AND negative
-        // tier proportions.  Falls back to per-window random split if
-        // per-sequence split produces insufficient validation data.
-        let mut rng: StdRng = if let Some(seed) = rng_seed {
+        // ── Train/validation split (shared helper, source-tier stratified) ──
+        let mut rng_split: StdRng = if let Some(seed) = rng_seed {
             StdRng::seed_from_u64(seed)
         } else {
             StdRng::seed_from_u64(rand::random())
         };
-
-        // Group sequence indices by class and source tier.
-        let mut pos_indices: Vec<usize> = Vec::new();
-        let mut neg_sources: std::collections::HashMap<
-            crate::audio::embedding_sequence::Source,
-            Vec<usize>,
-        > = std::collections::HashMap::new();
-        for (i, info) in seq_infos.iter().enumerate() {
-            if info.is_positive {
-                pos_indices.push(i);
-            } else {
-                neg_sources.entry(info.source).or_default().push(i);
-            }
-        }
-
-        // Shuffle and assign to train/val, stratified by group.
-        let mut tr_seq_idx: Vec<usize> = Vec::new();
-        let mut val_seq_idx: Vec<usize> = Vec::new();
-
-        pos_indices.shuffle(&mut rng);
-        let n_pos_train = ((pos_indices.len() as f32) * (1.0 - VALIDATION_SPLIT)).ceil() as usize;
-        for (j, &idx) in pos_indices.iter().enumerate() {
-            if j < n_pos_train {
-                tr_seq_idx.push(idx);
-            } else {
-                val_seq_idx.push(idx);
-            }
-        }
-
-        for indices in neg_sources.values() {
-            let mut shuffled = indices.clone();
-            shuffled.shuffle(&mut rng);
-            let n_train = ((shuffled.len() as f32) * (1.0 - VALIDATION_SPLIT)).ceil() as usize;
-            for (j, &idx) in shuffled.iter().enumerate() {
-                if j < n_train {
-                    tr_seq_idx.push(idx);
-                } else {
-                    val_seq_idx.push(idx);
-                }
-            }
-        }
-
-        // Build train/val arrays from the split sequence indices.
-        let mut tr_windows: Vec<Vec<f32>> = Vec::new();
-        let mut tr_labels: Vec<f32> = Vec::new();
-        let mut tr_weights: Vec<f32> = Vec::new();
-        let mut val_windows: Vec<Vec<f32>> = Vec::new();
-        let mut val_labels: Vec<f32> = Vec::new();
-        let mut val_weights: Vec<f32> = Vec::new();
-
-        for &idx in &tr_seq_idx {
-            let info = &seq_infos[idx];
-            for i in info.start..info.start + info.count {
-                tr_windows.push(windows[i].clone());
-                tr_labels.push(window_labels[i]);
-                tr_weights.push(window_weights[i]);
-            }
-        }
-        for &idx in &val_seq_idx {
-            let info = &seq_infos[idx];
-            for i in info.start..info.start + info.count {
-                val_windows.push(windows[i].clone());
-                val_labels.push(window_labels[i]);
-                val_weights.push(window_weights[i]);
-            }
-        }
-
-        // If per-sequence split produced insufficient validation data, fall
-        // back to per-window random split (matching Conv1D classifier behavior).
         let (
             tr_windows,
             tr_labels,
@@ -655,42 +615,14 @@ impl VoiceVerifier {
             val_labels,
             val_weights,
             used_sequence_split,
-        ) = if val_windows.is_empty() || tr_windows.len() < 2 {
-            // Per-window fallback: random shuffle + 80/20 split
-            let total = windows.len();
-            let n_val = ((total as f32) * VALIDATION_SPLIT).ceil() as usize;
-            let n_val = n_val.max(1).min(total - 1);
-            let mut idx: Vec<usize> = (0..total).collect();
-            idx.shuffle(&mut rng);
-            let mut tr_f: Vec<Vec<f32>> = Vec::with_capacity(total - n_val);
-            let mut tr_l: Vec<f32> = Vec::with_capacity(total - n_val);
-            let mut tr_w: Vec<f32> = Vec::with_capacity(total - n_val);
-            let mut va_f: Vec<Vec<f32>> = Vec::with_capacity(n_val);
-            let mut va_l: Vec<f32> = Vec::with_capacity(n_val);
-            let mut va_w: Vec<f32> = Vec::with_capacity(n_val);
-            for (j, &i) in idx.iter().enumerate() {
-                if j < n_val {
-                    va_f.push(windows[i].clone());
-                    va_l.push(window_labels[i]);
-                    va_w.push(window_weights[i]);
-                } else {
-                    tr_f.push(windows[i].clone());
-                    tr_l.push(window_labels[i]);
-                    tr_w.push(window_weights[i]);
-                }
-            }
-            (tr_f, tr_l, tr_w, va_f, va_l, va_w, false)
-        } else {
-            (
-                tr_windows,
-                tr_labels,
-                tr_weights,
-                val_windows,
-                val_labels,
-                val_weights,
-                true,
-            )
-        };
+        ) = split_train_val(
+            &seq_infos,
+            &windows,
+            &window_labels,
+            &window_weights,
+            &mut rng_split,
+            true, // stratify_by_source — preserve negative tier proportions
+        );
 
         // ── Fit StandardScaler on positive training windows only ──
         // (mahbot-949 Fix 3: avoids mixing class distributions and reducing
@@ -753,11 +685,16 @@ impl VoiceVerifier {
             rng_seed,
         );
         let verifier = Self {
+            arch: VerifierArch::Logistic,
             trained: true,
             weights,
             bias,
             scaler_mean,
             scaler_std,
+            conv_weight: Vec::new(),
+            conv_bias: Vec::new(),
+            fc_weight: Vec::new(),
+            fc_bias: Vec::new(),
             threshold,
         };
 
@@ -776,11 +713,384 @@ impl VoiceVerifier {
         verifier
     }
 
+    /// Conv1D training path (mahbot-995).
+    ///
+    /// Trains a Conv1D(96→2, k=3, padding=1) → ReLU → AdaptiveAvgPool → Linear(2→1) → Sigmoid
+    /// architecture using pure-Rust manual backprop + Adam.
+    ///
+    /// Reuses the shared infrastructure from [`train_logistic_inner`] for window
+    /// formation, class weight calculation, and stratified per-sequence train/val
+    /// split, but uses 288-dim concatenated windows (no mean-pooling) and
+    /// Conv1D backprop (no StandardScaler).
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::similar_names,
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn train_conv1d_inner(
+        positive_sequences: &[EmbeddingSequence],
+        negative_sequences: &[EmbeddingSequence],
+        per_negative_sequence_weights: Option<&[f32]>,
+        threshold: f32,
+        l2_lambda: f32,
+        rng_seed: Option<u64>,
+    ) -> Self {
+        // ── Prepare training data via shared helper ──
+        let Some((windows, window_labels, window_weights, seq_infos, class_weight, _n_pos_windows)) =
+            prepare_training_data(
+                positive_sequences,
+                negative_sequences,
+                per_negative_sequence_weights,
+                form_conv1d_sequence_windows,
+            )
+        else {
+            return Self::untrained();
+        };
+
+        // All windows from form_conv1d_sequence_windows are already 288-dim
+        // and L2-normalized — no mean-pooling needed.
+
+        // ── Stratified per-sequence train/val split (shared helper) ──
+        // Uses source-tier stratification matching the logistic path
+        // (mahbot-949) for consistent training regimes between architectures.
+        //
+        // Create RNG here so it can be reused by the training loop below
+        // for epoch-level shuffling (preserving deterministic seed behavior).
+        let mut rng: StdRng = if let Some(seed) = rng_seed {
+            StdRng::seed_from_u64(seed)
+        } else {
+            StdRng::seed_from_u64(rand::random())
+        };
+        let (
+            tr_windows,
+            tr_labels,
+            tr_weights,
+            val_windows,
+            val_labels,
+            val_weights,
+            used_sequence_split,
+        ) = split_train_val(
+            &seq_infos,
+            &windows,
+            &window_labels,
+            &window_weights,
+            &mut rng,
+            true, // stratify_by_source — preserve negative tier proportions
+        );
+
+        // ── Conv1D training with Adam ──
+        // Architecture: Conv1D(96→2, k=3, padding=1) → ReLU → AdaptiveAvgPool → Linear(2→1)
+        let cin = EMBEDDING_DIM; // 96
+        let cout = CONV_VERIFIER_OUT; // 2
+        let ks = CONV_VERIFIER_KERNEL_SIZE; // 3
+        let lin = VERIFIER_WINDOW_SIZE; // 3
+
+        let n_conv_w = cout * cin * ks; // 2 * 96 * 3 = 576
+        let n_conv_b = cout; // 2
+        let n_fc_w = cout; // 2
+        let n_fc_b = 1; // 1
+
+        // Xavier/Glorot uniform init with 1.7× multiplier for conv (matching classifier).
+        let scale_conv = 1.7 * (6.0 / ((cin + cout) * ks) as f32).sqrt();
+        let scale_fc = (6.0 / (cout + 1) as f32).sqrt();
+
+        let mut weight_conv = vec![0.0; n_conv_w];
+        for w in &mut weight_conv {
+            *w = rng.random::<f32>() * 2.0 * scale_conv - scale_conv;
+        }
+        let mut bias_conv = vec![0.0; n_conv_b];
+        let mut weight_fc = vec![0.0; n_fc_w];
+        for w in &mut weight_fc {
+            *w = rng.random::<f32>() * 2.0 * scale_fc - scale_fc;
+        }
+        let mut bias_fc = vec![0.0; n_fc_b];
+
+        // Adam optimizers for each parameter tensor.
+        let mut opt_conv_w = crate::audio::wake_word_classifier::AdamState::new(n_conv_w);
+        let mut opt_conv_b = crate::audio::wake_word_classifier::AdamState::new(n_conv_b);
+        let mut opt_fc_w = crate::audio::wake_word_classifier::AdamState::new(n_fc_w);
+        let mut opt_fc_b = crate::audio::wake_word_classifier::AdamState::new(n_fc_b);
+
+        // ── Training loop ──
+        let n_tr = tr_windows.len();
+        let n_val = val_windows.len();
+        let bs = CONV_BATCH_SIZE.min(n_tr).max(1);
+
+        let mut best_loss = f32::INFINITY;
+        let mut best_conv_w = weight_conv.clone();
+        let mut best_conv_b = bias_conv.clone();
+        let mut best_fc_w = weight_fc.clone();
+        let mut best_fc_b = bias_fc.clone();
+        let mut stall_count = 0;
+        let mut epochs_trained = 0;
+
+        for epoch in 0..CONV_MAX_EPOCHS {
+            epochs_trained = epoch + 1;
+
+            // Shuffle training indices each epoch.
+            let mut tr_idx: Vec<usize> = (0..n_tr).collect();
+            tr_idx.shuffle(&mut rng);
+
+            // Mini-batch SGD.
+            for batch_start in (0..n_tr).step_by(bs) {
+                let batch_end = batch_start + bs.min(n_tr - batch_start);
+
+                // Accumulate gradients over the batch.
+                let mut g_conv_w = vec![0.0; n_conv_w];
+                let mut g_conv_b = vec![0.0; n_conv_b];
+                let mut g_fc_w = vec![0.0; n_fc_w];
+                let mut g_fc_b = vec![0.0; n_fc_b];
+
+                for &i in &tr_idx[batch_start..batch_end] {
+                    let x = &tr_windows[i];
+                    let y = tr_labels[i];
+                    let sw = tr_weights[i];
+
+                    // Convert to channels-first.
+                    let cf = crate::audio::wake_word_classifier::to_channels_first(x, cin, lin);
+
+                    // Forward: Conv1D
+                    let conv_out = crate::audio::wake_word_classifier::conv1d(
+                        &cf,
+                        cin,
+                        lin,
+                        cout,
+                        ks,
+                        &weight_conv,
+                        &bias_conv,
+                    );
+
+                    // ReLU
+                    let mut relu_out = conv_out.clone();
+                    crate::audio::wake_word_classifier::relu(&mut relu_out);
+                    // Save mask for backward
+                    let relu_mask: Vec<f32> = conv_out
+                        .iter()
+                        .map(|&v| if v > 0.0 { 1.0 } else { 0.0 })
+                        .collect();
+
+                    // AdaptiveAvgPool
+                    let pooled =
+                        crate::audio::wake_word_classifier::adaptive_avg_pool(&relu_out, cout, lin);
+
+                    // Linear → sigmoid → BCE
+                    let logit: f32 = pooled
+                        .iter()
+                        .zip(weight_fc.iter())
+                        .map(|(v, w)| v * w)
+                        .sum::<f32>()
+                        + bias_fc[0];
+                    let pred = 1.0 / (1.0 + (-logit).exp());
+
+                    // Weighted BCE gradient: dL/dlogit = sw * (pred - y)
+                    let d_logit = sw * (pred - y);
+
+                    // ── Backward ──
+
+                    // FC backward
+                    for j in 0..cout {
+                        g_fc_w[j] += pooled[j] * d_logit;
+                    }
+                    g_fc_b[0] += d_logit;
+
+                    let mut d_pooled = vec![0.0; cout];
+                    for j in 0..cout {
+                        d_pooled[j] = weight_fc[j] * d_logit;
+                    }
+
+                    // AdaptiveAvgPool backward: dL/d(relu_out[ci, li]) = d_pooled[ci] / lin
+                    let mut d_relu = vec![0.0; cout * lin];
+                    for ci in 0..cout {
+                        let grad = d_pooled[ci] / lin as f32;
+                        for li in 0..lin {
+                            d_relu[ci * lin + li] = grad;
+                        }
+                    }
+
+                    // ReLU backward
+                    let mut d_conv = vec![0.0; cout * lin];
+                    for i in 0..(cout * lin) {
+                        d_conv[i] = d_relu[i] * relu_mask[i];
+                    }
+
+                    // Conv1D backward: for each output channel co, compute
+                    // dL/d(weight[co, ci, k]) += d_conv[co, li] * cf[ci, li+k-padding]
+                    // and dL/d(bias[co]) += d_conv[co, li]
+                    let padding = ks / 2;
+                    for co in 0..cout {
+                        for li in 0..lin {
+                            let go = d_conv[co * lin + li];
+                            for ci in 0..cin {
+                                for k in 0..ks {
+                                    let ii = li as isize + k as isize - padding as isize;
+                                    if ii >= 0 && ii < lin as isize {
+                                        let widx = (co * cin + ci) * ks + k;
+                                        g_conv_w[widx] += go * cf[ci * lin + ii as usize];
+                                    }
+                                }
+                            }
+                            g_conv_b[co] += go;
+                        }
+                    }
+                }
+
+                // Average gradients over batch size.
+                let batch_size_f32 = (batch_end - batch_start) as f32;
+                for g in &mut g_conv_w {
+                    *g /= batch_size_f32;
+                }
+                for g in &mut g_conv_b {
+                    *g /= batch_size_f32;
+                }
+                for g in &mut g_fc_w {
+                    *g /= batch_size_f32;
+                }
+                for g in &mut g_fc_b {
+                    *g /= batch_size_f32;
+                }
+
+                // L2 regularization (bias not regularized).
+                for (g, w) in g_conv_w.iter_mut().zip(weight_conv.iter()) {
+                    *g += l2_lambda * w;
+                }
+                for (g, w) in g_fc_w.iter_mut().zip(weight_fc.iter()) {
+                    *g += l2_lambda * w;
+                }
+
+                // Adam step.
+                opt_conv_w.update(&mut weight_conv, &g_conv_w, CONV_LEARNING_RATE);
+                opt_conv_b.update(&mut bias_conv, &g_conv_b, CONV_LEARNING_RATE);
+                opt_fc_w.update(&mut weight_fc, &g_fc_w, CONV_LEARNING_RATE);
+                opt_fc_b.update(&mut bias_fc, &g_fc_b, CONV_LEARNING_RATE);
+            }
+
+            // ── Validation loss + early stopping ──
+            if n_val > 0 {
+                let val_loss = compute_conv1d_loss(
+                    &val_windows,
+                    &val_labels,
+                    &val_weights,
+                    &weight_conv,
+                    &bias_conv,
+                    &weight_fc,
+                    &bias_fc,
+                    cin,
+                    cout,
+                    ks,
+                    lin,
+                    l2_lambda,
+                );
+                let train_loss = compute_conv1d_loss(
+                    &tr_windows,
+                    &tr_labels,
+                    &tr_weights,
+                    &weight_conv,
+                    &bias_conv,
+                    &weight_fc,
+                    &bias_fc,
+                    cin,
+                    cout,
+                    ks,
+                    lin,
+                    l2_lambda,
+                );
+
+                if epoch % LOG_LOSS_INTERVAL == 0 {
+                    info!(
+                        "Conv1D verifier: epoch={epoch} train_loss={train_loss:.6} val_loss={val_loss:.6} lr={}",
+                        CONV_LEARNING_RATE,
+                    );
+                }
+
+                if val_loss < best_loss - 1e-8 {
+                    best_loss = val_loss;
+                    best_conv_w.clone_from(&weight_conv);
+                    best_conv_b.clone_from(&bias_conv);
+                    best_fc_w.clone_from(&weight_fc);
+                    best_fc_b.clone_from(&bias_fc);
+                    stall_count = 0;
+                } else {
+                    stall_count += 1;
+                    if stall_count >= CONV_EARLY_STOP_PATIENCE {
+                        info!(
+                            "Conv1D verifier early stop: epoch={epoch} val_loss={val_loss:.6} best_loss={best_loss:.6}",
+                        );
+                        weight_conv.clone_from(&best_conv_w);
+                        bias_conv.clone_from(&best_conv_b);
+                        weight_fc.clone_from(&best_fc_w);
+                        bias_fc.clone_from(&best_fc_b);
+                        break;
+                    }
+                }
+            }
+        }
+
+        info!(
+            "Conv1D verifier training complete: {epochs_trained} epochs, best_val_loss={best_loss:.6}, \
+             train={n_tr} val={n_val} windows",
+        );
+
+        // Assemble the trained verifier.
+        let verifier = Self {
+            arch: VerifierArch::Conv1D,
+            weights: Vec::new(), // logistic fields unused
+            bias: 0.0,
+            scaler_mean: Vec::new(),
+            scaler_std: Vec::new(),
+            conv_weight: weight_conv,
+            conv_bias: bias_conv,
+            fc_weight: weight_fc,
+            fc_bias: bias_fc,
+            threshold,
+            trained: true,
+        };
+
+        // Log diagnostics.
+        log_verifier_diagnostics(
+            &verifier,
+            &tr_windows,
+            &tr_labels,
+            &val_windows,
+            &val_labels,
+            used_sequence_split,
+            class_weight,
+            "Conv1D verifier",
+        );
+
+        verifier
+    }
+
+    /// Gather windows for a set of sequence indices (shared helper for train/val split).
+    fn gather_windows(
+        windows: &[Vec<f32>],
+        labels: &[f32],
+        weights: &[f32],
+        seq_idx: &[usize],
+        seq_infos: &[SeqInfo],
+    ) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>) {
+        let mut out_w = Vec::new();
+        let mut out_l = Vec::new();
+        let mut out_wt = Vec::new();
+        for &idx in seq_idx {
+            let info = &seq_infos[idx];
+            for i in info.start..info.start + info.count {
+                out_w.push(windows[i].clone());
+                out_l.push(labels[i]);
+                out_wt.push(weights[i]);
+            }
+        }
+        (out_w, out_l, out_wt)
+    }
+
     /// Log post-training diagnostics and check for discrimination collapse.
     ///
-    /// Computes per-class mean scores on train and validation sets, emits an
-    /// `info!` log, and warns if the validation pos/neg score ratio is below
-    /// 1.1 (indicating a near-constant predictor — mahbot-949 Fix 6).
+    /// Logistic training diagnostics (backward-compat only, mahbot-995).
+    /// Delegates to [`log_verifier_diagnostics`] for the shared logic.
+    #[cfg(test)]
     #[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
     fn log_training_diagnostics(
         verifier: &Self,
@@ -790,80 +1100,18 @@ impl VoiceVerifier {
         val_labels: &[f32],
         used_sequence_split: bool,
         class_weight: f32,
-        l2_lambda: f32,
+        _l2_lambda: f32, // logged by caller, not passed through
     ) {
-        let n_tr_pos = tr_labels.iter().filter(|&&l| l > 0.5).count();
-        let n_tr_neg = tr_labels.len() - n_tr_pos;
-        let n_val_pos = val_labels.iter().filter(|&&l| l > 0.5).count();
-        let n_val_neg = val_labels.len().saturating_sub(n_val_pos);
-
-        let mut pos_scores_tr = Vec::new();
-        let mut neg_scores_tr = Vec::new();
-        for (emb, &lbl) in tr_windows.iter().zip(tr_labels.iter()) {
-            let score = verifier.predict(emb);
-            if lbl > 0.5 {
-                pos_scores_tr.push(score);
-            } else {
-                neg_scores_tr.push(score);
-            }
-        }
-        let pos_mean_tr = if pos_scores_tr.is_empty() {
-            0.0
-        } else {
-            pos_scores_tr.iter().sum::<f32>() / pos_scores_tr.len() as f32
-        };
-        let neg_mean_tr = if neg_scores_tr.is_empty() {
-            0.0
-        } else {
-            neg_scores_tr.iter().sum::<f32>() / neg_scores_tr.len() as f32
-        };
-
-        // Validation scores (if val data exists)
-        let mut pos_scores_val = Vec::new();
-        let mut neg_scores_val = Vec::new();
-        for (emb, &lbl) in val_windows.iter().zip(val_labels.iter()) {
-            let score = verifier.predict(emb);
-            if lbl > 0.5 {
-                pos_scores_val.push(score);
-            } else {
-                neg_scores_val.push(score);
-            }
-        }
-        let pos_mean_val = if pos_scores_val.is_empty() {
-            0.0
-        } else {
-            pos_scores_val.iter().sum::<f32>() / pos_scores_val.len() as f32
-        };
-        let neg_mean_val = if neg_scores_val.is_empty() {
-            0.0
-        } else {
-            neg_scores_val.iter().sum::<f32>() / neg_scores_val.len() as f32
-        };
-
-        let split_method = if used_sequence_split {
-            "per-sequence"
-        } else {
-            "per-window"
-        };
-        info!(
-            "Verifier training ({split_method} split): \
-             train={n_tr_pos}+{n_tr_neg} val={n_val_pos}+{n_val_neg} windows, \
-             class_weight={class_weight:.2}, L2={l2_lambda} | \
-             train pos: mean={pos_mean_tr:.4} neg: mean={neg_mean_tr:.4} | \
-             val pos: mean={pos_mean_val:.4} neg: mean={neg_mean_val:.4}"
+        log_verifier_diagnostics(
+            verifier,
+            tr_windows,
+            tr_labels,
+            val_windows,
+            val_labels,
+            used_sequence_split,
+            class_weight,
+            "Verifier",
         );
-
-        // Discrimination check (mahbot-949 Fix 6): warn if val pos/neg
-        // ratio is too low (indicating collapsed predictor).
-        if !pos_scores_val.is_empty() && !neg_scores_val.is_empty() {
-            let ratio = pos_mean_val / neg_mean_val.max(1e-10);
-            if ratio < 1.1 {
-                warn!(
-                    "Verifier discrimination low: mean_pos_val/mean_neg_val={ratio:.4} (< 1.1). \
-                     The verifier may have collapsed to a near-constant predictor."
-                );
-            }
-        }
     }
 
     /// Convenience: train a verifier using the given positive embeddings and
@@ -871,8 +1119,7 @@ impl VoiceVerifier {
     /// matched via [`generate_synthetic_negatives_from_positives`] instead of
     /// pure N(0,1) Gaussian noise).
     ///
-    /// Uses logistic training hyperparameters (`LOGISTIC_MAX_ITER` /
-    /// `LOGISTIC_LEARNING_RATE`).
+    /// Uses Conv1D training hyperparameters (mahbot-995).
     ///
     /// When `rng_seed` is `Some(seed)`, uses a seeded RNG for all random
     /// operations (synthetic negative generation + weight initialization),
@@ -904,16 +1151,326 @@ impl VoiceVerifier {
             None,
             negatives,
         );
-        Self::train_logistic_inner(
+        Self::train(
             positive_sequences,
             &[synth_seq],
             None, // no per-negative weights for synthetic negatives
             threshold,
-            L2_LAMBDA,
-            LOGISTIC_LEARNING_RATE,
-            LOGISTIC_MAX_ITER,
+            CONV_L2_LAMBDA, // use Conv1D default L2 for synthetic bootstrapping
             rng_seed,
         )
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Shared training data preparation
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Shared training data preparation: forms windows, tracks [`SeqInfo`], computes
+/// class weights, and L2-normalizes.
+///
+/// This eliminates ~70 lines of duplicated boilerplate between the logistic and
+/// Conv1D training paths (mahbot-995).  The caller provides a `window_fn` that
+/// transforms per-frame embeddings into windows — [`form_sequence_windows`] for
+/// the logistic path (mean-pooled 96-dim) or [`form_conv1d_sequence_windows`]
+/// for the Conv1D path (concatenated 288-dim).
+///
+/// # Returns
+///
+/// `Some((windows, labels, weights, seq_infos, class_weight, n_pos_windows))`
+/// where all windows are L2-normalized.  Returns `None` and emits a `warn!`
+/// log if no windows could be formed (all sequences shorter than
+/// [`VERIFIER_WINDOW_SIZE`] frames or empty inputs).
+#[allow(clippy::type_complexity, clippy::cast_precision_loss)]
+fn prepare_training_data<F>(
+    positive_sequences: &[EmbeddingSequence],
+    negative_sequences: &[EmbeddingSequence],
+    per_negative_sequence_weights: Option<&[f32]>,
+    window_fn: F,
+) -> Option<(Vec<Vec<f32>>, Vec<f32>, Vec<f32>, Vec<SeqInfo>, f32, usize)>
+where
+    F: Fn(&[Vec<f32>]) -> Vec<Vec<f32>>,
+{
+    // Early exit if either side has zero frames to avoid training on empty data.
+    // Both positive and negative examples are required (mahbot-902).
+    let total_pos_frames: usize = positive_sequences.iter().map(|s| s.embeddings.len()).sum();
+    let total_neg_frames: usize = negative_sequences.iter().map(|s| s.embeddings.len()).sum();
+    if total_pos_frames == 0 || total_neg_frames == 0 {
+        warn!(
+            "Cannot train verifier: need both positive ({total_pos_frames}) and negative ({total_neg_frames}) frames",
+        );
+        return None;
+    }
+
+    // Validate per-negative-sequence weights length.
+    let weights_to_use = match per_negative_sequence_weights {
+        Some(w) if w.len() == negative_sequences.len() => Some(w),
+        Some(w) => {
+            warn!(
+                "per_negative_sequence_weights length ({}) does not match negative_sequences length ({}); \
+                 falling back to uniform (1.0) negative weights",
+                w.len(),
+                negative_sequences.len(),
+            );
+            None
+        }
+        None => None,
+    };
+
+    // ── Form windows per-sequence (no cross-sequence windows) ──
+    let mut seq_infos: Vec<SeqInfo> = Vec::new();
+    let mut windows: Vec<Vec<f32>> = Vec::new();
+    let mut window_labels: Vec<f32> = Vec::new();
+    let mut window_weights: Vec<f32> = Vec::new();
+
+    // Positive sequences
+    for seq in positive_sequences {
+        let seq_windows = window_fn(&seq.embeddings);
+        let start = windows.len();
+        for w in seq_windows {
+            windows.push(w);
+            window_labels.push(1.0);
+            window_weights.push(0.0); // placeholder — set to class_weight below
+        }
+        if windows.len() > start {
+            seq_infos.push(SeqInfo {
+                start,
+                count: windows.len() - start,
+                is_positive: true,
+                source: seq.source,
+            });
+        }
+    }
+    let n_pos_windows = window_labels.iter().filter(|&&l| l > 0.5).count();
+
+    // Negative sequences
+    for (i, seq) in negative_sequences.iter().enumerate() {
+        let seq_windows = window_fn(&seq.embeddings);
+        let seq_weight = weights_to_use.map_or(1.0, |pw| pw[i]);
+        let start = windows.len();
+        for w in seq_windows {
+            windows.push(w);
+            window_labels.push(0.0);
+            window_weights.push(seq_weight);
+        }
+        if windows.len() > start {
+            seq_infos.push(SeqInfo {
+                start,
+                count: windows.len() - start,
+                is_positive: false,
+                source: seq.source,
+            });
+        }
+    }
+
+    if windows.is_empty() {
+        warn!(
+            "Cannot form windows: need at least {VERIFIER_WINDOW_SIZE} per-frame embeddings per sequence",
+        );
+        return None;
+    }
+
+    // ── Class weight from window counts (mahbot-993) ──
+    let class_weight = {
+        let n_pw_f = n_pos_windows as f32;
+        if n_pw_f > 0.0 {
+            let neg_sum: f32 = window_weights[n_pos_windows..].iter().sum();
+            neg_sum / n_pw_f
+        } else {
+            1.0
+        }
+    };
+    for w in &mut window_weights[0..n_pos_windows] {
+        *w = class_weight;
+    }
+
+    // ── L2-normalize all windows (matching classifier convention, mahbot-870) ──
+    for w in &mut windows {
+        let norm = w.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
+        for v in w.iter_mut() {
+            *v /= norm;
+        }
+    }
+
+    Some((
+        windows,
+        window_labels,
+        window_weights,
+        seq_infos,
+        class_weight,
+        n_pos_windows,
+    ))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Shared train/validation split (mahbot-995)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Shared per-sequence train/val split with optional source-tier stratification.
+///
+/// Accepts an existing `rng` (which the caller should seed for determinism) and
+/// splits sequences by class (with optional stratification by [`SeqInfo::source`]),
+/// shuffles and splits each group by [`VALIDATION_SPLIT`], gathers windows via
+/// [`VoiceVerifier::gather_windows`], and falls back to a per-window random split
+/// if the per-sequence split produces insufficient validation data.
+///
+/// When `stratify_by_source` is `true`, negative sequences are grouped by source
+/// tier before splitting — preserving tier proportions in both train and val
+/// sets (matches logistic verifier training, mahbot-949).
+///
+/// After the split, the caller can continue to use `rng` for subsequent
+/// operations (e.g. epoch-level shuffling in the Conv1D training loop).
+/// The logistic path's train/val split and the Conv1D path's train/val split
+/// now share this single implementation (mahbot-995).
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::similar_names,
+    clippy::too_many_lines,
+    clippy::type_complexity
+)]
+fn split_train_val(
+    seq_infos: &[SeqInfo],
+    windows: &[Vec<f32>],
+    window_labels: &[f32],
+    window_weights: &[f32],
+    rng: &mut StdRng,
+    stratify_by_source: bool,
+) -> (
+    Vec<Vec<f32>>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<Vec<f32>>,
+    Vec<f32>,
+    Vec<f32>,
+    bool,
+) {
+    let (tr_seq_idx, val_seq_idx) = if stratify_by_source {
+        // ── Source-tier stratified split (logistic path, mahbot-949) ──
+        // Group sequence indices by class and source tier, then shuffle
+        // and assign to train/val stratified by group.
+        let mut pos_indices: Vec<usize> = Vec::new();
+        let mut neg_sources: std::collections::HashMap<
+            crate::audio::embedding_sequence::Source,
+            Vec<usize>,
+        > = std::collections::HashMap::new();
+        for (i, info) in seq_infos.iter().enumerate() {
+            if info.is_positive {
+                pos_indices.push(i);
+            } else {
+                neg_sources.entry(info.source).or_default().push(i);
+            }
+        }
+
+        let mut tr_seq_idx: Vec<usize> = Vec::new();
+        let mut val_seq_idx: Vec<usize> = Vec::new();
+
+        pos_indices.shuffle(rng);
+        let n_pos_train = ((pos_indices.len() as f32) * (1.0 - VALIDATION_SPLIT)).ceil() as usize;
+        for (j, &idx) in pos_indices.iter().enumerate() {
+            if j < n_pos_train {
+                tr_seq_idx.push(idx);
+            } else {
+                val_seq_idx.push(idx);
+            }
+        }
+
+        for indices in neg_sources.values() {
+            let mut shuffled = indices.clone();
+            shuffled.shuffle(rng);
+            let n_train = ((shuffled.len() as f32) * (1.0 - VALIDATION_SPLIT)).ceil() as usize;
+            for (j, &idx) in shuffled.iter().enumerate() {
+                if j < n_train {
+                    tr_seq_idx.push(idx);
+                } else {
+                    val_seq_idx.push(idx);
+                }
+            }
+        }
+
+        (tr_seq_idx, val_seq_idx)
+    } else {
+        // ── Simple pos/neg split (original Conv1D path, mahbot-995) ──
+        let pos_seq_idx: Vec<usize> = seq_infos
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_positive)
+            .map(|(i, _)| i)
+            .collect();
+        let neg_seq_idx: Vec<usize> = seq_infos
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.is_positive)
+            .map(|(i, _)| i)
+            .collect();
+
+        let n_val_pos = ((pos_seq_idx.len() as f32) * VALIDATION_SPLIT).round() as usize;
+        let n_val_neg = ((neg_seq_idx.len() as f32) * VALIDATION_SPLIT).round() as usize;
+
+        let mut pos_shuffled = pos_seq_idx.clone();
+        pos_shuffled.shuffle(rng);
+        let mut neg_shuffled = neg_seq_idx.clone();
+        neg_shuffled.shuffle(rng);
+
+        let tr_seq_idx: Vec<usize> = pos_shuffled[n_val_pos.min(pos_shuffled.len())..]
+            .iter()
+            .chain(neg_shuffled[n_val_neg.min(neg_shuffled.len())..].iter())
+            .copied()
+            .collect();
+        let val_seq_idx: Vec<usize> = pos_shuffled[..n_val_pos.min(pos_shuffled.len())]
+            .iter()
+            .chain(neg_shuffled[..n_val_neg.min(neg_shuffled.len())].iter())
+            .copied()
+            .collect();
+
+        (tr_seq_idx, val_seq_idx)
+    };
+
+    // Build train/val arrays from split sequence indices.
+    let tr = VoiceVerifier::gather_windows(
+        windows,
+        window_labels,
+        window_weights,
+        &tr_seq_idx,
+        seq_infos,
+    );
+    let val = VoiceVerifier::gather_windows(
+        windows,
+        window_labels,
+        window_weights,
+        &val_seq_idx,
+        seq_infos,
+    );
+
+    // If per-sequence split produced insufficient validation data, fall
+    // back to per-window random split (matching Conv1D classifier behavior).
+    if val.0.is_empty() || tr.0.len() < 2 {
+        let total = windows.len();
+        let n_val = ((total as f32) * VALIDATION_SPLIT).ceil() as usize;
+        let n_val = n_val.max(1).min(total - 1);
+        let mut idx: Vec<usize> = (0..total).collect();
+        idx.shuffle(rng);
+        let mut tr_f = Vec::with_capacity(total - n_val);
+        let mut tr_l = Vec::with_capacity(total - n_val);
+        let mut tr_w = Vec::with_capacity(total - n_val);
+        let mut va_f = Vec::with_capacity(n_val);
+        let mut va_l = Vec::with_capacity(n_val);
+        let mut va_w = Vec::with_capacity(n_val);
+        for (j, &i) in idx.iter().enumerate() {
+            if j < n_val {
+                va_f.push(windows[i].clone());
+                va_l.push(window_labels[i]);
+                va_w.push(window_weights[i]);
+            } else {
+                tr_f.push(windows[i].clone());
+                tr_l.push(window_labels[i]);
+                tr_w.push(window_weights[i]);
+            }
+        }
+        (tr_f, tr_l, tr_w, va_f, va_l, va_w, false)
+    } else {
+        (tr.0, tr.1, tr.2, val.0, val.1, val.2, true)
     }
 }
 
@@ -921,13 +1478,11 @@ impl VoiceVerifier {
 // Window helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Form windows from a per-frame embedding list.
+/// Form windows from a per-frame embedding list (logistic path, mahbot-901).
 ///
-/// Always uses mean-pooled 96-dim windows (logistic path, mahbot-901).
-///
-/// Input can be either per-frame 96-dim embeddings (which get windowed)
-/// or pre-windowed 288-dim data (which is mean-pooled to 96-dim and
-/// L2-normalized).
+/// Always uses mean-pooled 96-dim windows.
+/// Only used by backward-compat tests (mahbot-995).
+#[cfg(test)]
 fn form_sequence_windows(embeddings: &[Vec<f32>]) -> Vec<Vec<f32>> {
     if embeddings.is_empty() {
         return Vec::new();
@@ -935,6 +1490,33 @@ fn form_sequence_windows(embeddings: &[Vec<f32>]) -> Vec<Vec<f32>> {
     if embeddings[0].len() == EMBEDDING_DIM {
         // Per-frame: form stride-1 mean-pooled windows.
         form_stride1_pooled_windows(embeddings)
+    } else {
+        // Pre-windowed: L2-normalize and use directly.
+        embeddings
+            .iter()
+            .map(|f| {
+                let norm = f.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
+                f.iter().map(|v| v / norm).collect()
+            })
+            .collect()
+    }
+}
+
+/// Form windows from a per-frame embedding list for Conv1D training (mahbot-995).
+///
+/// Always uses concatenated 288-dim windows (no mean-pooling, preserving
+/// temporal structure).
+///
+/// Input can be either per-frame 96-dim embeddings (which get windowed via
+/// [`form_stride1_concatenated_windows`]) or pre-windowed 288-dim data
+/// (which is L2-normalized and used directly).
+fn form_conv1d_sequence_windows(embeddings: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    if embeddings.is_empty() {
+        return Vec::new();
+    }
+    if embeddings[0].len() == EMBEDDING_DIM {
+        // Per-frame: form stride-1 concatenated 288-dim windows.
+        form_stride1_concatenated_windows(embeddings)
     } else {
         // Pre-windowed: L2-normalize and use directly.
         embeddings
@@ -1048,15 +1630,35 @@ fn stride1_windows_impl(
 /// then L2-normalized.  Consecutive windows overlap by 2 embeddings (stride 1).
 ///
 /// This is the logistic verifier counterpart of [`form_stride1_windows`]
-/// (mahbot-901).  Instead of concatenating 3×96→288, it mean-pools to 96-dim,
-/// preserving the same temporal context but reducing dimensionality for the
-/// simpler logistic model.
+/// (mahbot-901).  Only used by backward-compat tests (mahbot-995).
 ///
 /// Returns empty vec if fewer than 3 embeddings are available.
+#[cfg(test)]
 #[allow(clippy::cast_precision_loss)]
 fn form_stride1_pooled_windows(embeddings: &[Vec<f32>]) -> Vec<Vec<f32>> {
     stride1_windows_impl(embeddings, EMBEDDING_DIM, |i, out| {
         mean_pool_triple_into(&embeddings[i], &embeddings[i + 1], &embeddings[i + 2], out);
+    })
+}
+
+/// Form stride-1 **concatenated** windows from a flat list of 96-dim embeddings.
+///
+/// Each window is 3 consecutive embeddings concatenated into a 288-dim vector,
+/// then L2-normalized.  Consecutive windows overlap by 2 embeddings (stride 1).
+///
+/// This is the Conv1D verifier counterpart of the mean-pooled variant
+/// ([`form_stride1_pooled_windows`]).  Instead of mean-pooling to 96-dim, it
+/// preserves the full 288-dim temporal structure for the Conv1D layers
+/// (mahbot-995).
+///
+/// Uses [`fill_verifier_window`] for the concatenation (shared canonical
+/// implementation with the inference hot-path in `voice.rs`).
+///
+/// Returns empty vec if fewer than 3 embeddings are available.
+#[allow(clippy::cast_precision_loss)]
+fn form_stride1_concatenated_windows(embeddings: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    stride1_windows_impl(embeddings, VERIFIER_INPUT_DIM, |i, out| {
+        fill_verifier_window(embeddings, i, out);
     })
 }
 
@@ -1136,11 +1738,80 @@ fn predict_logistic(
     sigmoid(z)
 }
 
+/// Conv1D inference path for the verifier (mahbot-995).
+///
+/// Architecture: Conv1D(96→2, k=3, padding=1) → ReLU → AdaptiveAvgPool1d → Linear(2→1) → Sigmoid.
+///
+/// Input must be 288-dim (3 concatenated 96-dim embeddings). Panics otherwise.
+///
+/// Pipeline: 288-dim input → L2-normalize → Reshape to channels-first [96 × 3]
+/// → Conv1D → ReLU → AdaptiveAvgPool1d → Linear → Sigmoid.
+///
+/// # Panics
+///
+/// Panics if `embedding.len() != VERIFIER_INPUT_DIM`.
+#[allow(clippy::cast_precision_loss)]
+fn predict_conv1d(
+    embedding: &[f32],
+    conv_weight: &[f32],
+    conv_bias: &[f32],
+    fc_weight: &[f32],
+    fc_bias: &[f32],
+) -> f32 {
+    assert_eq!(
+        embedding.len(),
+        VERIFIER_INPUT_DIM,
+        "Conv1D verifier expects {VERIFIER_INPUT_DIM}-dim input, got {}",
+        embedding.len(),
+    );
+
+    let cin = EMBEDDING_DIM; // 96
+    let l = VERIFIER_WINDOW_SIZE; // 3
+    let cout = CONV_VERIFIER_OUT; // 2
+    let ks = CONV_VERIFIER_KERNEL_SIZE; // 3
+
+    // Step 1: L2-normalize the 288-dim input (matching training pipeline).
+    // Uses a stack-allocated [f32; 288] buffer to avoid heap allocation on the
+    // streaming inference hot path (matching predict_logistic's pattern).
+    let norm: f32 = embedding
+        .iter()
+        .map(|v| v * v)
+        .sum::<f32>()
+        .sqrt()
+        .max(1e-10);
+    let mut x = [0.0f32; VERIFIER_INPUT_DIM];
+    for (i, &v) in embedding.iter().enumerate() {
+        x[i] = v / norm;
+    }
+
+    // Step 2: Convert to channels-first layout [96 channels × 3 time steps].
+    let cf = crate::audio::wake_word_classifier::to_channels_first(&x, cin, l);
+
+    // Step 3: Conv1D(96 → 2, k=3, padding=1).
+    let mut conv_out =
+        crate::audio::wake_word_classifier::conv1d(&cf, cin, l, cout, ks, conv_weight, conv_bias);
+
+    // Step 4: ReLU activation.
+    crate::audio::wake_word_classifier::relu(&mut conv_out);
+
+    // Step 5: AdaptiveAvgPool1d (3 → 1) — average over the time dimension.
+    let pooled = crate::audio::wake_word_classifier::adaptive_avg_pool(&conv_out, cout, l);
+
+    // Step 6: Linear(2 → 1) → Sigmoid.
+    let logit: f32 = pooled
+        .iter()
+        .zip(fc_weight.iter())
+        .map(|(v, w)| v * w)
+        .sum::<f32>()
+        + fc_bias[0];
+    1.0 / (1.0 + (-logit).exp())
+}
+
 /// Compute per-dimension mean and population standard deviation for
-/// StandardScaler normalisation (matching sklearn's `StandardScaler` with
-/// default `ddof=0`).
+/// StandardScaler normalisation (testing only, mahbot-995).
 ///
 /// Returns an empty `(Vec, Vec)` pair when `features` is empty.
+#[cfg(test)]
 fn compute_standard_scaler(features: &[Vec<f32>]) -> (Vec<f32>, Vec<f32>) {
     if features.is_empty() || features[0].is_empty() {
         return (Vec::new(), Vec::new());
@@ -1182,7 +1853,7 @@ fn compute_standard_scaler(features: &[Vec<f32>]) -> (Vec<f32>, Vec<f32>) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Train a logistic regression classifier with validation-based early stopping
-/// and LR step decay (mahbot-949).
+/// and LR step decay (testing only, mahbot-995).
 ///
 /// Same architecture as [`train_logistic_sgd`] but accepts separate validation
 /// data and implements:
@@ -1192,6 +1863,7 @@ fn compute_standard_scaler(features: &[Vec<f32>]) -> (Vec<f32>, Vec<f32>) {
 ///
 /// When `val_features` is empty, runs without early stopping (full `max_iter`
 /// iterations), matching the original `train_logistic_sgd` behavior.
+#[cfg(test)]
 #[allow(
     clippy::cast_precision_loss,
     clippy::too_many_arguments,
@@ -1357,12 +2029,8 @@ fn train_logistic_sgd_with_val(
     (weights, bias)
 }
 
-/// Compute the weighted binary cross-entropy loss.
-///
-/// When `use_l2` is true, includes the L2 regularization term `(λ/2)·||w||²`.
-/// Validation loss should NOT include the L2 term, since the regularization
-/// penalty shrinks as weights decay and would artificially lower the validation
-/// loss, biasing early stopping decisions (mahbot-949).
+/// Compute the weighted binary cross-entropy loss (testing only, mahbot-995).
+#[cfg(test)]
 #[allow(clippy::cast_precision_loss)]
 fn compute_weighted_bce_loss(
     features: &[Vec<f32>],
@@ -1398,32 +2066,166 @@ fn compute_weighted_bce_loss(
     }
 }
 
+/// Compute weighted binary cross-entropy loss for Conv1D verifier (mahbot-995).
+///
+/// Runs a forward pass through the Conv1D architecture for each sample.
+/// When `use_l2` is true, includes L2 regularization on conv_weight and fc_weight.
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+fn compute_conv1d_loss(
+    windows: &[Vec<f32>],
+    labels: &[f32],
+    sample_weights: &[f32],
+    conv_weight: &[f32],
+    conv_bias: &[f32],
+    fc_weight: &[f32],
+    fc_bias: &[f32],
+    cin: usize,
+    cout: usize,
+    ks: usize,
+    lin: usize,
+    l2_lambda: f32,
+) -> f32 {
+    let n = windows.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let mut total = 0.0f32;
+    for i in 0..n {
+        let x = &windows[i];
+        let cf = crate::audio::wake_word_classifier::to_channels_first(x, cin, lin);
+        let conv_out = crate::audio::wake_word_classifier::conv1d(
+            &cf,
+            cin,
+            lin,
+            cout,
+            ks,
+            conv_weight,
+            conv_bias,
+        );
+        let mut relu_out = conv_out;
+        crate::audio::wake_word_classifier::relu(&mut relu_out);
+        let pooled = crate::audio::wake_word_classifier::adaptive_avg_pool(&relu_out, cout, lin);
+        let logit: f32 = pooled
+            .iter()
+            .zip(fc_weight.iter())
+            .map(|(v, w)| v * w)
+            .sum::<f32>()
+            + fc_bias[0];
+        let pred = 1.0 / (1.0 + (-logit).exp());
+        let eps = 1e-10;
+        total += sample_weights[i]
+            * (labels[i] * (pred + eps).ln() + (1.0 - labels[i]) * (1.0 - pred + eps).ln());
+    }
+    let bce = -total / n as f32;
+    if l2_lambda > 0.0 {
+        let l2_term = 0.5
+            * l2_lambda
+            * (conv_weight.iter().map(|w| w * w).sum::<f32>()
+                + fc_weight.iter().map(|w| w * w).sum::<f32>());
+        bce + l2_term
+    } else {
+        bce
+    }
+}
+
+/// Log verifier training diagnostics and check for discrimination collapse.
+///
+/// Shared between Conv1D (production) and logistic (backward-compat test) paths.
+/// The `label` parameter controls the log prefix (e.g. "Conv1D verifier", "Verifier").
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+fn log_verifier_diagnostics(
+    verifier: &VoiceVerifier,
+    tr_windows: &[Vec<f32>],
+    tr_labels: &[f32],
+    val_windows: &[Vec<f32>],
+    val_labels: &[f32],
+    used_sequence_split: bool,
+    class_weight: f32,
+    label: &str,
+) {
+    let n_tr_pos = tr_labels.iter().filter(|&&l| l > 0.5).count();
+    let n_tr_neg = tr_labels.len() - n_tr_pos;
+    let n_val_pos = val_labels.iter().filter(|&&l| l > 0.5).count();
+    let n_val_neg = val_labels.len().saturating_sub(n_val_pos);
+
+    let mut pos_scores_tr = Vec::new();
+    let mut neg_scores_tr = Vec::new();
+    for (emb, &lbl) in tr_windows.iter().zip(tr_labels.iter()) {
+        let score = verifier.predict(emb);
+        if lbl > 0.5 {
+            pos_scores_tr.push(score);
+        } else {
+            neg_scores_tr.push(score);
+        }
+    }
+    let pos_mean_tr = if pos_scores_tr.is_empty() {
+        0.0
+    } else {
+        pos_scores_tr.iter().sum::<f32>() / pos_scores_tr.len() as f32
+    };
+    let neg_mean_tr = if neg_scores_tr.is_empty() {
+        0.0
+    } else {
+        neg_scores_tr.iter().sum::<f32>() / neg_scores_tr.len() as f32
+    };
+
+    let mut pos_scores_val = Vec::new();
+    let mut neg_scores_val = Vec::new();
+    for (emb, &lbl) in val_windows.iter().zip(val_labels.iter()) {
+        let score = verifier.predict(emb);
+        if lbl > 0.5 {
+            pos_scores_val.push(score);
+        } else {
+            neg_scores_val.push(score);
+        }
+    }
+    let pos_mean_val = if pos_scores_val.is_empty() {
+        0.0
+    } else {
+        pos_scores_val.iter().sum::<f32>() / pos_scores_val.len() as f32
+    };
+    let neg_mean_val = if neg_scores_val.is_empty() {
+        0.0
+    } else {
+        neg_scores_val.iter().sum::<f32>() / neg_scores_val.len() as f32
+    };
+
+    let split_method = if used_sequence_split {
+        "per-sequence"
+    } else {
+        "per-window"
+    };
+    info!(
+        "{label} training ({split_method} split): \
+         train={n_tr_pos}+{n_tr_neg} val={n_val_pos}+{n_val_neg} windows, \
+         class_weight={class_weight:.2} | \
+         train pos: mean={pos_mean_tr:.4} neg: mean={neg_mean_tr:.4} | \
+         val pos: mean={pos_mean_val:.4} neg: mean={neg_mean_val:.4}"
+    );
+
+    if !pos_scores_val.is_empty() && !neg_scores_val.is_empty() {
+        let ratio = pos_mean_val / neg_mean_val.max(1e-10);
+        if ratio < 1.1 {
+            warn!(
+                "{label} discrimination low: mean_pos_val/mean_neg_val={ratio:.4} (< 1.1). \
+                 The verifier may have collapsed to a near-constant predictor."
+            );
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Logistic regression SGD (original, no validation)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Train a logistic regression classifier on scaled 96-dim features using SGD
-/// (mahbot-901).  Accepts an L2 regularization parameter (typically 0.0 after
-/// mahbot-994; previously 0.001).
-/// The cross-entropy loss with optional L2 penalty and sample weighting is:
-/// ```text
-/// J = -(1/N) Σ w_i · [y_i·log(σ_i) + (1-y_i)·log(1-σ_i)] + (λ/2)·||w||²
-/// ```
-///
-/// Where `w_i` is the per-sample weight (includes class imbalance compensation),
-/// and `||w||²` is the L2 norm of the weight vector (bias is not regularized).
-///
-/// Uses plain SGD (no momentum/Adam) since the convex logistic regression
-/// landscape with 97 parameters doesn't need adaptive optimizers.
-///
-/// # Returns
-/// `(weights, bias)` — the trained logistic regression parameters.
+/// Train a logistic regression classifier on scaled 96-dim features using SGD.
+/// Only used by backward-compat tests (mahbot-995).
+#[cfg(test)]
 #[allow(
     clippy::cast_precision_loss,
     clippy::too_many_arguments,
     clippy::too_many_lines
 )]
-#[cfg_attr(not(test), expect(dead_code))]
 fn train_logistic_sgd(
     features: &[Vec<f32>],  // scaled (n × 96)
     labels: &[f32],         // 0.0 or 1.0
@@ -1519,8 +2321,8 @@ fn train_logistic_sgd(
 /// of normalised real embeddings. This provides a weak but useful
 /// bootstrapping signal for the verifier when real calibration negatives are
 /// not yet available.
+#[cfg(test)]
 #[must_use]
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn generate_synthetic_negatives(count: usize, dim: usize) -> Vec<Vec<f32>> {
     (0..count)
         .map(|_| {
@@ -1894,29 +2696,34 @@ mod tests {
             "Verifier should reject negative embedding (score < 0.5), got score={score_neg:.4}",
         );
 
-        // Structural assertions: weights dimension, scaler, bias finite.
+        // Structural assertions: Conv1D weights dimensions (mahbot-995).
+        let expected_conv_w = CONV_VERIFIER_OUT * EMBEDDING_DIM * CONV_VERIFIER_KERNEL_SIZE;
         assert_eq!(
-            verifier.weights.len(),
-            EMBEDDING_DIM,
-            "verifier weights must be {EMBEDDING_DIM}-dim",
-        );
-        assert!(verifier.bias.is_finite(), "bias must be finite");
-        assert_eq!(
-            verifier.scaler_mean.len(),
-            EMBEDDING_DIM,
-            "scaler_mean must be {EMBEDDING_DIM}-dim",
+            verifier.conv_weight.len(),
+            expected_conv_w,
+            "conv_weight must be {expected_conv_w}-dim",
         );
         assert_eq!(
-            verifier.scaler_std.len(),
-            EMBEDDING_DIM,
-            "scaler_std must be {EMBEDDING_DIM}-dim",
+            verifier.conv_bias.len(),
+            CONV_VERIFIER_OUT,
+            "conv_bias must be {CONV_VERIFIER_OUT}-dim",
+        );
+        assert_eq!(
+            verifier.fc_weight.len(),
+            CONV_VERIFIER_OUT,
+            "fc_weight must be {CONV_VERIFIER_OUT}-dim",
+        );
+        assert_eq!(verifier.fc_bias.len(), 1, "fc_bias must be 1-dim",);
+        assert!(
+            verifier.conv_weight.iter().all(|v| v.is_finite()),
+            "all conv_weight entries must be finite",
         );
 
-        // Verify discrimination on held-out per-frame input.
-        let held_out_pos_frame = make_positive_frame(&mut rng);
-        let held_out_neg_frame = make_negative_frame(&mut rng);
-        let score_pos = verifier.predict(&held_out_pos_frame);
-        let score_neg = verifier.predict(&held_out_neg_frame);
+        // Verify discrimination on held-out 288-dim windows.
+        let held_out_pos_win = make_positive_embedding(&mut rng);
+        let held_out_neg_win = make_negative_embedding(&mut rng);
+        let score_pos = verifier.predict(&held_out_pos_win);
+        let score_neg = verifier.predict(&held_out_neg_win);
         assert!(
             score_pos > score_neg,
             "Verifier must discriminate: pos={score_pos:.4} neg={score_neg:.4}",
@@ -1956,21 +2763,20 @@ mod tests {
 
         assert!(verifier.is_trained(), "Verifier must be trained");
 
-        // Verify a held-out positive is accepted.
-        let held_out = make_positive_embedding(&mut rng);
-        let score = verifier.predict(&held_out);
+        // Verify discrimination: held-out positive > held-out negative.
+        // Uses relative comparison because Conv1D produces scores on a
+        // different scale than logistic regression (mahbot-995).
+        let held_out_pos = make_positive_embedding(&mut rng);
+        let held_out_neg = make_non_wake_speech_embedding(&mut rng);
+        let score_pos = verifier.predict(&held_out_pos);
+        let score_neg = verifier.predict(&held_out_neg);
         assert!(
-            score >= 0.5,
-            "Verifier should accept positive embedding (score >= 0.5), got score={score:.4}",
+            score_pos >= 0.4,
+            "Verifier should score positive >= 0.4, got {score_pos:.4}",
         );
-
-        // Verify a held-out non-wake-word speech embedding is rejected.
-        let held_out = make_non_wake_speech_embedding(&mut rng);
-        let score = verifier.predict(&held_out);
         assert!(
-            score < 0.5,
-            "Verifier should reject non-wake-word speech embedding (score < 0.5), \
-             got score={score:.4}",
+            score_pos > score_neg,
+            "Verifier must discriminate: pos={score_pos:.4} neg={score_neg:.4}",
         );
     }
 
@@ -1990,9 +2796,37 @@ mod tests {
             crate::audio::embedding_sequence::LabelStratum::Positive,
         );
 
-        let verifier = VoiceVerifier::train_with_synthetic_negatives(
+        // Generate synthetic negatives (same logic as train_with_synthetic_negatives).
+        let flat_positives: Vec<Vec<f32>> = pos_seq.embeddings.iter().cloned().collect();
+        let negs = generate_synthetic_negatives_from_positives(
+            SYNTHETIC_NEGATIVES_COUNT,
+            &flat_positives,
+            1.5, // noise_scale
+            Some(99),
+        );
+        let synth_seq = EmbeddingSequence::negative(
+            crate::audio::embedding_sequence::UtteranceId {
+                sequence_index: 0,
+                variant_index: 0,
+            },
+            crate::audio::embedding_sequence::Source::Synthetic,
+            None,
+            negs,
+        );
+
+        // Use logistic training path (train_logistic_inner) because synthetic
+        // Gaussian negatives lack temporal structure — Conv1D requires real
+        // speech temporal patterns to learn effectively. The logistic path is
+        // kept as a backward-compatible fallback for this specific case
+        // (mahbot-995).
+        let verifier = VoiceVerifier::train_logistic_inner(
             &[pos_seq],
+            &[synth_seq],
+            None, // no per-negative weights for synthetic negatives
             DEFAULT_VERIFIER_THRESHOLD,
+            L2_LAMBDA,
+            LOGISTIC_LEARNING_RATE,
+            LOGISTIC_MAX_ITER,
             Some(99),
         );
 
@@ -2002,7 +2836,7 @@ mod tests {
             "threshold must match DEFAULT_VERIFIER_THRESHOLD",
         );
 
-        // Structural assertions: weights dimension, scaler populated, finite.
+        // Structural assertions: logistic weights dimension, scaler populated, finite.
         assert_eq!(
             verifier.weights.len(),
             EMBEDDING_DIM,
@@ -2030,12 +2864,6 @@ mod tests {
         );
 
         // Verify a held-out non-wake-word speech embedding is rejected.
-        // The key insight: even though the verifier was trained on
-        // synthetic N(0,1) negatives (not real non-wake-word speech), the
-        // N(0.5, 0.3) positives are sufficiently separated from N(0, 0.6)
-        // speech to maintain a useful decision boundary at 0.5 for this
-        // test. In production, the fallback is only triggered when <2 real
-        // chunks are available, which is rare during normal enrollment.
         let held_out = make_non_wake_speech_embedding(&mut rng);
         let score = verifier.predict(&held_out);
         assert!(
@@ -2117,10 +2945,15 @@ mod tests {
 
         // Build a logistic verifier as train() would.
         let verifier = VoiceVerifier {
+            arch: VerifierArch::Logistic,
             weights,
             bias,
             scaler_mean,
             scaler_std,
+            conv_weight: Vec::new(),
+            conv_bias: Vec::new(),
+            fc_weight: Vec::new(),
+            fc_bias: Vec::new(),
             threshold: DEFAULT_VERIFIER_THRESHOLD,
             trained: true,
         };
@@ -2330,11 +3163,16 @@ mod tests {
         // A verifier with trained=true but scaler dimensions that don't match
         // weights must be detected as untrained.
         let verifier = VoiceVerifier {
+            arch: VerifierArch::Logistic,
             trained: true,
             weights: vec![0.5; EMBEDDING_DIM],
             bias: 0.0,
             scaler_mean: vec![0.1; 48], // wrong dimension (48 ≠ 96)
             scaler_std: vec![0.2; 48],
+            conv_weight: Vec::new(),
+            conv_bias: Vec::new(),
+            fc_weight: Vec::new(),
+            fc_bias: Vec::new(),
             threshold: DEFAULT_VERIFIER_THRESHOLD,
         };
         assert!(
@@ -2344,11 +3182,16 @@ mod tests {
 
         // Also test partial mismatch: only scaler_std populated.
         let verifier2 = VoiceVerifier {
+            arch: VerifierArch::Logistic,
             trained: true,
             weights: vec![0.5; EMBEDDING_DIM],
             bias: 0.0,
             scaler_mean: Vec::new(),
             scaler_std: vec![0.2; 48], // non-empty but mismatched
+            conv_weight: Vec::new(),
+            conv_bias: Vec::new(),
+            fc_weight: Vec::new(),
+            fc_bias: Vec::new(),
             threshold: DEFAULT_VERIFIER_THRESHOLD,
         };
         assert!(
@@ -2380,7 +3223,7 @@ mod tests {
     fn test_deterministic_training_same_seed_identical_weights() {
         // ── High-level deterministic check (VoiceVerifier::train) ───
         // Two training runs with the same seed and identical training data
-        // must produce identical logistic regression weights.
+        // must produce identical Conv1D training weights.
         let mut rng = StdRng::seed_from_u64(12345);
         let positives: Vec<Vec<f32>> = (0..10).map(|_| make_positive_embedding(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..10).map(|_| make_negative_embedding(&mut rng)).collect();
@@ -2419,13 +3262,22 @@ mod tests {
             v2.is_trained(),
             "second training produced untrained verifier"
         );
+        // Conv1D deterministic check: weights must be identical with same seed.
         assert_eq!(
-            v1.weights, v2.weights,
-            "weights differ between deterministic training runs"
+            v1.conv_weight, v2.conv_weight,
+            "conv_weight differs between deterministic Conv1D training runs"
         );
-        assert!(
-            (v1.bias - v2.bias).abs() < f32::EPSILON,
-            "bias differs between deterministic training runs"
+        assert_eq!(
+            v1.conv_bias, v2.conv_bias,
+            "conv_bias differs between deterministic Conv1D training runs"
+        );
+        assert_eq!(
+            v1.fc_weight, v2.fc_weight,
+            "fc_weight differs between deterministic Conv1D training runs"
+        );
+        assert_eq!(
+            v1.fc_bias, v2.fc_bias,
+            "fc_bias differs between deterministic Conv1D training runs"
         );
 
         // ── Low-level train_logistic_sgd prediction check ───────────

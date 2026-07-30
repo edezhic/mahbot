@@ -9,5 +9,6 @@ pub(crate) mod local_transcriber;
 pub mod tts;
 pub mod tts_data_gen;
 pub mod voice;
+#[cfg_attr(not(test), allow(clippy::cast_possible_wrap))]
 pub(crate) mod voice_verifier;
 pub(crate) mod wake_word_classifier;
