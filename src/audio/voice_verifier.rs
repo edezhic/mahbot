@@ -96,6 +96,16 @@ pub(crate) const L2_LAMBDA: f32 = 0.001;
 /// Higher than MLP's LEARNING_RATE (0.001 tuned for Adam) because logistic
 /// regression with plain SGD on a convex surface benefits from larger step
 /// sizes.  Tested at lr=0.01 against the HARD-tier benchmark.
+///
+/// ## Interaction with class_weight (mahbot-993)
+///
+/// The dynamic class_weight formula (`Σ(neg_window_weights) / n_pos_windows`)
+/// increases positive-sample gradient magnitude by ~13× vs the old raw-count
+/// ratio when per-tier weights are active.  This approximately doubles the
+/// total gradient per batch (~1.86×).  If the benchmark shows training
+/// oscillation, reduce LR proportionally to ~0.005.  Conversely, the L2
+/// regularisation (L2_LAMBDA=0.001) becomes relatively ~1.86× weaker vs the
+/// data term — if scores saturate near 0 or 1, increase L2 slightly.
 pub(crate) const LOGISTIC_LEARNING_RATE: f32 = 0.01;
 
 /// Maximum iterations for logistic regression training.
@@ -333,9 +343,14 @@ impl VoiceVerifier {
     /// * `per_negative_sequence_weights` — Optional per-sequence weights
     ///   for negative sequences only (used to upweight confusable near-miss
     ///   phrases).  When `Some(weights)`, `weights.len()` must equal
-    ///   `negative_sequences.len()`.  Positives are weighted by the automatic
-    ///   `n_neg_windows / n_pos_windows` class weight, computed from window
-    ///   counts rather than the old flat-list frame counts (mahbot-902).
+    ///   `negative_sequences.len()`.  Positives are weighted by an automatic
+    ///   class weight that balances the **total effective gradient** from both
+    ///   classes: `Σ(per_neg_weight_i × window_count_i) / n_pos_windows`.  When
+    ///   all per-negative weights are 1.0 (or `None`), this reduces to the raw
+    ///   `n_neg_windows / n_pos_windows` ratio (mahbot-902).  The dynamic
+    ///   formula (mahbot-993) prevents gradient imbalance when per-tier weights
+    ///   (Ambient=1×, Owner=3×, Unrelated=10×, Confusable=15×) would otherwise
+    ///   drown out the positive signal by ~13×.
     /// * `threshold` — Decision threshold (defaults to
     ///   [`DEFAULT_VERIFIER_THRESHOLD`] in production).
     /// * `l2_lambda` — L2 regularisation strength.
@@ -475,7 +490,6 @@ impl VoiceVerifier {
                 });
             }
         }
-        let n_neg_windows = window_labels.len() - n_pos_windows;
 
         if windows.is_empty() {
             warn!(
@@ -484,19 +498,36 @@ impl VoiceVerifier {
             return Self::untrained();
         }
 
-        // Class weight from window counts (not embedding-frame counts).
+        // Class weight from window counts (not embedding-frame counts), adjusted
+        // for per-tier negative weights (mahbot-993).
         //
-        // The old flat-list approach windowed the combined positive+negative
-        // embedding list and used n_neg_frames / n_pos_frames.  Here each
-        // sequence is windowed independently, so sequences shorter than
-        // VERIFIER_WINDOW_SIZE produce zero windows.  Window counts and
-        // frame counts therefore diverge for short sequences.  Using window
-        // counts is correct — each window is one training example whose class
-        // weight represents the inverse prevalence of its label (mahbot-902).
+        // The old formula used raw `n_neg_windows / n_pos_windows`, which assumes
+        // every negative window contributes equally to the gradient.  But negative
+        // sequences have per-tier weights (Ambient=1×, Owner=3×, Unrelated=10×,
+        // Confusable=15×) already applied to `window_weights` (line 482).  The
+        // positive class weight must therefore account for the total effective
+        // weight of negatives: `Σ(neg_window_weights) / n_pos_windows`.  This
+        // ensures each class contributes equally to the overall gradient.
+        //
+        // When all per-negative weights are 1.0 (or `None` was passed), this
+        // reduces to `n_neg_windows / n_pos_windows` — the same as the old
+        // formula, making the fix backward-compatible.
+        //
+        // Note: the Conv1D classifier (`train_classifier` in wake_word_classifier.rs)
+        // does NOT have this issue because it uses a symmetric class-weighting
+        // scheme: `pw = total / (2*np)` and `nw = total / (2*nn)`, ensuring each
+        // class contributes exactly `total/2` to the loss, and it has no per-
+        // negative-sequence weights that could unbalance the gradient.
         let class_weight = {
             let n_pw_f = n_pos_windows as f32;
-            let n_nw_f = n_neg_windows as f32;
-            if n_pw_f > 0.0 { n_nw_f / n_pw_f } else { 1.0 }
+            if n_pw_f > 0.0 {
+                // Sum the effective weights of negative windows, which already
+                // have per-tier weights applied (line 482).
+                let neg_sum: f32 = window_weights[n_pos_windows..].iter().sum();
+                neg_sum / n_pw_f
+            } else {
+                1.0
+            }
         };
         for w in &mut window_weights[0..n_pos_windows] {
             *w = class_weight;
@@ -2612,8 +2643,11 @@ mod tests {
         );
 
         // ── Cache-weighted sequences ────────────────────────────────
-        // Simulates production cache path: confusable + unrelated + synthetic
-        // negatives as separate sequences with per-sequence weight tiers.
+        // Simulates production cache path: 4-tier per-sequence weights
+        // (confusable=15×, unrelated=10×, ambient=1×) to validate the
+        // dynamic class_weight formula (mahbot-993).  The non-uniform weights
+        // mean the class_weight should be meaningfully higher than the raw
+        // n_neg/n_pos ratio; the verifier must still discriminate.
         let mut rng2 = StdRng::seed_from_u64(99);
         let cache_pos: Vec<Vec<f32>> = (0..20)
             .map(|_| make_positive_embedding(&mut rng2))
@@ -2629,7 +2663,7 @@ mod tests {
         let neg_unrelated: Vec<Vec<f32>> = (0..10)
             .map(|_| make_negative_embedding(&mut rng2))
             .collect();
-        let neg_synthetic: Vec<Vec<f32>> = (0..10)
+        let neg_ambient: Vec<Vec<f32>> = (0..10)
             .map(|_| make_negative_embedding(&mut rng2))
             .collect();
 
@@ -2643,12 +2677,16 @@ mod tests {
                 crate::audio::embedding_sequence::LabelStratum::Negative,
             ),
             make_seq(
-                neg_synthetic,
+                neg_ambient,
                 crate::audio::embedding_sequence::LabelStratum::Negative,
             ),
         ];
 
-        let per_neg_weights = vec![3.0, 2.0, 1.0];
+        let per_neg_weights = vec![
+            CONFUSABLE_UPWEIGHT, // 15.0 — confusable tier
+            UNRELATED_UPWEIGHT,  // 10.0 — unrelated tier
+            1.0,                 //       — ambient tier
+        ];
 
         let cache_verifier = VoiceVerifier::train(
             &[cache_pos_seq],
@@ -2661,6 +2699,24 @@ mod tests {
         assert!(
             cache_verifier.is_trained(),
             "Cache-weighted verifier must be trained",
+        );
+
+        // Verify discrimination with per-negative-weights (mahbot-993).
+        // For this distribution (20 pos windows, 30 neg windows with weights
+        // [15.0, 10.0, 1.0] applied at line 482), the dynamic formula gives
+        // class_weight ≈ (10×15 + 10×10 + 10×1)/20 = 13.0 (vs raw ratio 1.5).
+        // The model must still produce positive scores above negative scores.
+        let held_out_pos = make_positive_embedding(&mut rng2);
+        let held_out_neg = make_negative_embedding(&mut rng2);
+        let score_pos = cache_verifier.predict(&held_out_pos);
+        let score_neg = cache_verifier.predict(&held_out_neg);
+        assert!(
+            score_pos > score_neg,
+            "Weighted verifier must discriminate: pos={score_pos:.4} neg={score_neg:.4}",
+        );
+        assert!(
+            score_pos >= 0.5,
+            "Weighted verifier should accept positive (score >= 0.5), got {score_pos:.4}",
         );
     }
 }

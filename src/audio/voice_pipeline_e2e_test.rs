@@ -2323,7 +2323,7 @@ pub(crate) fn run_internal() {
         &verifier_neg_sequences,
         Some(&per_negative_sequence_weights), // per-sequence weights matching production (mahbot-870 Fix 3)
         DEFAULT_VERIFIER_THRESHOLD,
-        L2_LAMBDA, // mahbot-854: 0.01
+        L2_LAMBDA, // mahbot-949: reduced to 0.001
         Some(42),  // fixed seed for deterministic benchmark (mahbot-882)
     );
 
