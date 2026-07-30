@@ -3198,9 +3198,23 @@ pub(crate) fn synthesize_with_pcm_cache(
     let key = pcm_cache_key(text, style, seed, sample_rate, model_hash);
     let cache_path = cache_dir.join(&key);
 
-    // Fast path: cache hit
-    if let Some(pcm) = read_pcm_cache(&cache_path) {
-        return Some(pcm);
+    // Allow manual cache invalidation without deleting files (mahbot-999).
+    // When set, every read is treated as a miss, forcing re-synthesis.
+    let cache_bust = std::env::var("MAHBOT_TEST_CACHE_BUST").as_deref() == Ok("1");
+
+    // Fast path: cache hit (skipped entirely when busting)
+    if !cache_bust
+        && let Some(pcm) = read_pcm_cache(&cache_path) {
+            debug!("PCM cache HIT for key {key} ({text}, style={style}, seed={seed})");
+            return Some(pcm);
+        }
+
+    if cache_bust {
+        debug!(
+            "PCM cache BYPASSED by MAHBOT_TEST_CACHE_BUST=1 ({text}, style={style}, seed={seed}) — synthesising"
+        );
+    } else {
+        debug!("PCM cache MISS for key {key} ({text}, style={style}, seed={seed}) — synthesising");
     }
 
     // Cache miss — synthesise via TTS
@@ -7695,6 +7709,7 @@ mod tests {
     use super::*;
     use crate::VERIFIER_INPUT_DIM;
     use crate::audio::voice_verifier::DEFAULT_VERIFIER_THRESHOLD;
+    use crate::util::test::set_env_var;
     use crate::util::{add_noise, apply_gain, generate_pink_noise};
     use rand::SeedableRng;
     use std::time::{Duration, Instant};
@@ -11625,5 +11640,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── PCM cache invalidation tests ──────────────────────────────────────
+
+    /// Helper: write valid PCM to the cache path that
+    /// `synthesize_with_pcm_cache` would look up for the given parameters.
+    fn seed_pcm_cache(cache_dir: &Path, text: &str, style: &str, seed: u64) {
+        let key = pcm_cache_key(text, style, seed, SAMPLE_RATE, "hash");
+        let path = cache_dir.join(&key);
+        write_pcm_cache(&path, &[0.0f32; 4096]); // valid PCM, 16 KB
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn pcm_cache_read_normal_returns_some() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a".repeat(64));
+        write_test_pcm(&path);
+        assert!(path.exists());
+
+        let result = read_pcm_cache(&path);
+        assert!(result.is_some(), "normal read should return cached PCM");
+    }
+
+    #[test]
+    fn pcm_cache_bust_skips_cache_and_returns_none_when_tts_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_pcm_cache(tmp.path(), "hello", "style", 42);
+
+        // With bust=1: skip cache, attempt TTS (fails→None)
+        let _guard = set_env_var("MAHBOT_TEST_CACHE_BUST", Some("1"));
+        let result =
+            synthesize_with_pcm_cache("hello", "style", 42, SAMPLE_RATE, "hash", tmp.path());
+        assert!(
+            result.is_none(),
+            "bust=1 should bypass cache and attempt TTS (which fails without models)"
+        );
+        drop(_guard);
+
+        // Without bust: cache hit → Some
+        let result =
+            synthesize_with_pcm_cache("hello", "style", 42, SAMPLE_RATE, "hash", tmp.path());
+        assert!(
+            result.is_some(),
+            "without bust, cached PCM should be returned directly"
+        );
+    }
+
+    #[test]
+    fn pcm_cache_bust_requires_exact_value_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_pcm_cache(tmp.path(), "world", "style", 99);
+
+        // Setting to "true" should NOT bypass the cache
+        let _guard = set_env_var("MAHBOT_TEST_CACHE_BUST", Some("true"));
+        let result =
+            synthesize_with_pcm_cache("world", "style", 99, SAMPLE_RATE, "hash", tmp.path());
+        assert!(
+            result.is_some(),
+            "MAHBOT_TEST_CACHE_BUST=true should NOT bypass cache"
+        );
     }
 }
