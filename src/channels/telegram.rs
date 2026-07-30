@@ -15,6 +15,11 @@ const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 /// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
 const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 
+/// Description for the `/clear` command — used in `setMyCommands` API and `/start` welcome message.
+pub const CLEAR_COMMAND_DESC: &str = "Reset your session";
+/// Description for the `/models` command — used in `setMyCommands` API and `/start` welcome message.
+pub const MODELS_COMMAND_DESC: &str = "Select generation models";
+
 // ── Telegram callback/action button decoding ─────────────────────────
 
 /// Callback data prefix for dynamic option buttons.
@@ -892,6 +897,49 @@ impl TelegramChannel {
     /// the global shutdown token or other channels.
     pub fn cancel_own(&self) {
         self.cancel.cancel();
+    }
+
+    /// Register the bot's commands via Telegram's `setMyCommands` API.
+    ///
+    /// This populates the `/` command menu in Telegram clients so users can
+    /// discover available commands. The call is idempotent — calling it
+    /// multiple times just re-registers the same commands.
+    ///
+    /// Failure is logged as a warning and does not block the caller.
+    pub async fn set_my_commands(&self) {
+        let commands = serde_json::json!({
+            "commands": [
+                {"command": "clear", "description": CLEAR_COMMAND_DESC},
+                {"command": "models", "description": MODELS_COMMAND_DESC},
+            ]
+        });
+
+        match self
+            .http_client()
+            .post(self.api_url("setMyCommands"))
+            .json(&commands)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!("Telegram bot commands registered successfully");
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                tracing::warn!(
+                    status = %status,
+                    body = %body,
+                    "Telegram setMyCommands returned unsuccessful status"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to call Telegram setMyCommands"
+                );
+            }
+        }
     }
 
     /// Validate a Telegram bot token by calling the `getMe` endpoint.
@@ -1781,14 +1829,23 @@ pub async fn restart_telegram_listener(new_token: Option<&str>) -> anyhow::Resul
             .map(|tc| std::sync::Arc::clone(&tc.offset));
 
         // Create the new channel with the inherited offset.
-        let new_channel: std::sync::Arc<dyn Channel> = if let Some(inherited_offset) = offset {
-            std::sync::Arc::new(TelegramChannel::with_offset(
-                token.to_string(),
-                inherited_offset,
-            ))
+        let telegram_channel = if let Some(inherited_offset) = offset {
+            TelegramChannel::with_offset(token.to_string(), inherited_offset)
         } else {
-            std::sync::Arc::new(TelegramChannel::new(token.to_string()))
+            TelegramChannel::new(token.to_string())
         };
+
+        let telegram_arc = std::sync::Arc::new(telegram_channel);
+
+        // Register commands with Telegram API (fire-and-forget, non-blocking).
+        tokio::spawn({
+            let tc = std::sync::Arc::clone(&telegram_arc);
+            async move {
+                tc.set_my_commands().await;
+            }
+        });
+
+        let new_channel: std::sync::Arc<dyn Channel> = telegram_arc;
 
         // Atomically replace in the registry — no gap where
         // "telegram" returns None.

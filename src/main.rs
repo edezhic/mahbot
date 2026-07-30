@@ -13,7 +13,9 @@ use std::borrow::Cow;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use mahbot::channels::telegram::{decode_action, decode_callback};
+use mahbot::channels::telegram::{
+    CLEAR_COMMAND_DESC, MODELS_COMMAND_DESC, decode_action, decode_callback,
+};
 use mahbot::channels::{broadcast_incoming_message, persist_incoming_message, send_channel_reply};
 use mahbot::config::CONFIG;
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
@@ -352,7 +354,16 @@ fn init_message_pipeline(
     // Only create and start the Telegram channel if a bot token is configured.
     if let Some(token) = CONFIG.telegram_bot_token() {
         use mahbot::channels::telegram::TelegramChannel;
-        let channel: Arc<dyn Channel> = Arc::new(TelegramChannel::new(token));
+        let channel: std::sync::Arc<TelegramChannel> =
+            std::sync::Arc::new(TelegramChannel::new(token));
+        // Register bot commands with Telegram API (fire-and-forget, non-blocking).
+        tokio::spawn({
+            let tc = std::sync::Arc::clone(&channel);
+            async move {
+                tc.set_my_commands().await;
+            }
+        });
+        let channel: Arc<dyn Channel> = channel;
         mahbot::channel_registry().register(Arc::clone(&channel));
         spawn_cancellable(tasks, cancel, "telegram-listener", {
             let channel = Arc::clone(&channel);
@@ -568,12 +579,13 @@ async fn handle_bot_command(msg: &ChannelMessage) -> bool {
 /// listing available commands (no inline keyboard).
 async fn handle_start_command(msg: &ChannelMessage) {
     let reply = mahbot::SendMessage {
-        content: "\u{1F916} Welcome to MahBot!\n\n\
-                  Available commands:\n\
-                  /start — Show this message\n\
-                  /clear — Reset your session\n\
-                  /models — Select generation models"
-            .to_string(),
+        content: format!(
+            "\u{1F916} Welcome to MahBot!\n\n\
+             Available commands:\n\
+             /start — Show this message\n\
+             /clear — {CLEAR_COMMAND_DESC}\n\
+             /models — {MODELS_COMMAND_DESC}"
+        ),
         recipient: msg.reply_target.clone(),
         reply_markup: None,
     };
