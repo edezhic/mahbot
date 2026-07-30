@@ -27,9 +27,11 @@
 //! # Architecture
 //!
 //! Training pipeline: per-frame embeddings → windowing (concatenated 288-dim
-//! for Conv1D, mean-pooled 96-dim for logistic) → L2-norm → [scaler only for
-//! logistic] → train (Adam for Conv1D, SGD for logistic).  Inference is ~3μs
-//! per frame.
+//! for Conv1D, mean-pooled 96-dim for logistic) → L2-norm → train (Adam for
+//! Conv1D, SGD for logistic).  Inference is ~3μs per frame.  The StandardScaler
+//! formerly used in the logistic path was removed in mahbot-996 (it is
+//! mathematically redundant on L2-normalized embeddings and caused OOD
+//! score-underflow vulnerability).
 //!
 //! ## Training data
 //!
@@ -112,8 +114,7 @@ pub(crate) const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.948;
 ///   needing additional penalties.
 /// - **Tier-based example weighting** (Ambient=1×, Unrelated=10×,
 ///   Confusable=15×) provides per-example importance without global shrinkage.
-/// - **L2-normalized input features** and **StandardScaler conditioning**
-///   bound the feature magnitudes, limiting weight growth indirectly.
+/// - **L2-normalized input features** bound the feature magnitudes on the
 ///
 /// Previously set to 0.001 (mahbot-949) after the original 0.01 was found
 /// to collapse weights to zero.  However, at convergence the BCE gradient
@@ -252,6 +253,27 @@ pub(crate) const VERIFIER_WARMUP_EMBEDDINGS: usize = 4;
 /// when no real calibration data is available.
 const SYNTHETIC_NEGATIVES_COUNT: usize = 100;
 
+/// Minimum standard deviation when computing StandardScaler (mahbot-996).
+///
+/// Prevents division by (near) zero for dimensions with near-zero variance in
+/// the training data.  When applied to out-of-distribution voice families,
+/// unscaled near-zero std dimensions can produce extreme z-scores that cause
+/// sigmoid underflow to exactly 0.0.
+///
+/// The value 1e-3 is more conservative than the 1e-6 used in
+/// [`generate_synthetic_negatives_from_positives`] because scaler division
+/// (z-scoring) is more sensitive to near-zero values than noise addition.
+/// With L2-normalized embeddings on the unit sphere (dim values in [-1, 1]),
+/// a std floor of 1e-3 bounds the z-score to at most ±2000 per dimension,
+/// which prevents the worst-case logit explosions when weights are bounded.
+///
+/// ## Precedent
+///
+/// The same `.max(N)` pattern is used in [`generate_synthetic_negatives_from_positives`]
+/// (`.max(1e-6)`) and throughout the wake word pipeline for numerical stability.
+#[cfg(test)]
+const SCALER_STD_MIN: f32 = 1e-3;
+
 /// Architecture variant for the verifier (mahbot-995).
 ///
 /// - [`Logistic`](VerifierArch::Logistic): 97-parameter logistic regression on
@@ -281,8 +303,17 @@ pub enum VerifierArch {
 /// ## Logistic architecture (legacy, mahbot-901)
 ///
 /// 97-parameter logistic regression on temporally mean-pooled 96-dim embeddings.
-/// Mean-pools the 3-frame window to 96-dim before L2-norm, scaler, and
-/// linear+sigmoid.
+/// Mean-pools the 3-frame window to 96-dim before L2-norm and linear+sigmoid.
+///
+/// As of mahbot-996, the StandardScaler is no longer fitted during training.
+/// It is mathematically redundant on L2-normalized embeddings — the affine
+/// transform can be absorbed into the weights and bias. Removing it eliminates
+/// the OOD score-underflow vulnerability where near-zero std dimensions
+/// produce extreme z-scores.
+///
+/// Old persisted models with scaler data continue to be applied during
+/// inference for backward compatibility. Re-enrollment after this fix
+/// produces scaler-free models that are immune to the underflow issue.
 ///
 /// ## Backward compatibility
 ///
@@ -624,58 +655,19 @@ impl VoiceVerifier {
             true, // stratify_by_source — preserve negative tier proportions
         );
 
-        // ── Fit StandardScaler on positive training windows only ──
-        // (mahbot-949 Fix 3: avoids mixing class distributions and reducing
-        // inter-class separation before the logistic regression sees the data).
-        let pos_tr_indices: Vec<usize> = tr_labels
-            .iter()
-            .enumerate()
-            .filter(|&(_, &l)| l > 0.5)
-            .map(|(i, _)| i)
-            .collect();
-        let pos_tr_windows: Vec<Vec<f32>> = pos_tr_indices
-            .iter()
-            .map(|&i| tr_windows[i].clone())
-            .collect();
-        let (scaler_mean, scaler_std) = if pos_tr_windows.is_empty() {
-            (Vec::new(), Vec::new())
-        } else {
-            compute_standard_scaler(&pos_tr_windows)
-        };
-
-        // Apply the scaler (fitted on positive training only) to ALL windows.
-        // Matches inference: only scale dimensions with positive std; leave
-        // zero-variance dimensions unchanged (mahbot-949).
-        let apply_scaler = |fw: &[Vec<f32>]| -> Vec<Vec<f32>> {
-            let use_scaler = !scaler_mean.is_empty() && !scaler_std.is_empty();
-            fw.iter()
-                .map(|f| {
-                    let mut scaled = f.clone();
-                    if use_scaler {
-                        for (j, v) in scaled.iter_mut().enumerate() {
-                            if scaler_std[j] > 0.0 {
-                                *v = (*v - scaler_mean[j]) / scaler_std[j];
-                            }
-                        }
-                    }
-                    scaled
-                })
-                .collect()
-        };
-
-        let tr_scaled = apply_scaler(&tr_windows);
-        let val_scaled = if val_windows.is_empty() {
-            Vec::new()
-        } else {
-            apply_scaler(&val_windows)
-        };
-
         // ── Train with validation, early stopping, and LR schedule ──
+        // No StandardScaler (mahbot-996): the scaler is mathematically redundant
+        // on L2-normalized embeddings. Logistic regression σ(w·x + b) can
+        // represent any decision boundary that σ(w·(x-μ)/σ + b) can represent
+        // because the affine transform (μ, σ) can be absorbed into the weights
+        // and bias. Removing the scaler eliminates the OOD score-underflow
+        // vulnerability where near-zero std dimensions produce extreme z-scores
+        // that cause sigmoid underflow to exactly 0.0.
         let (weights, bias) = train_logistic_sgd_with_val(
-            &tr_scaled,
+            &tr_windows,
             &tr_labels,
             &tr_weights,
-            &val_scaled,
+            &val_windows,
             &val_labels,
             &val_weights,
             l2_lambda,
@@ -689,8 +681,8 @@ impl VoiceVerifier {
             trained: true,
             weights,
             bias,
-            scaler_mean,
-            scaler_std,
+            scaler_mean: Vec::new(),
+            scaler_std: Vec::new(),
             conv_weight: Vec::new(),
             conv_bias: Vec::new(),
             fc_weight: Vec::new(),
@@ -1841,8 +1833,7 @@ fn compute_standard_scaler(features: &[Vec<f32>]) -> (Vec<f32>, Vec<f32>) {
         }
     }
     for s in &mut std {
-        *s = (*s / n).sqrt();
-        // Leave zero-variance dimensions at 0.0 — scaler will pass through
+        *s = (*s / n).sqrt().max(SCALER_STD_MIN);
     }
 
     (mean, std)
@@ -2836,14 +2827,20 @@ mod tests {
             "threshold must match DEFAULT_VERIFIER_THRESHOLD",
         );
 
-        // Structural assertions: logistic weights dimension, scaler populated, finite.
+        // Structural assertions: logistic weights dimension, scaler empty, finite.
         assert_eq!(
             verifier.weights.len(),
             EMBEDDING_DIM,
             "weights should be {EMBEDDING_DIM}-dim",
         );
-        assert!(!verifier.scaler_mean.is_empty());
-        assert!(!verifier.scaler_std.is_empty());
+        assert!(
+            verifier.scaler_mean.is_empty(),
+            "scaler_mean should be empty (mahbot-996: scaler removed from training)"
+        );
+        assert!(
+            verifier.scaler_std.is_empty(),
+            "scaler_std should be empty (mahbot-996: scaler removed from training)"
+        );
         for (j, &w) in verifier.weights.iter().enumerate() {
             assert!(
                 w.is_finite(),
@@ -2903,38 +2900,17 @@ mod tests {
         let pos_norm: Vec<Vec<f32>> = positives.iter().map(|f| l2_normalize(f)).collect();
         let neg_norm: Vec<Vec<f32>> = negatives.iter().map(|f| l2_normalize(f)).collect();
 
-        // Compute StandardScaler on POSITIVE L2-normalized features only
-        // (mahbot-949 Fix 3: matching the updated training pipeline).
-        let (scaler_mean, scaler_std) = compute_standard_scaler(&pos_norm);
-
-        // Scale both positive and negative features.
-        let scale_features = |fw: &[Vec<f32>]| -> Vec<Vec<f32>> {
-            fw.iter()
-                .map(|f| {
-                    f.iter()
-                        .enumerate()
-                        .map(|(j, &val)| {
-                            if !scaler_std.is_empty() && scaler_std[j] > 0.0 {
-                                (val - scaler_mean[j]) / scaler_std[j]
-                            } else {
-                                val
-                            }
-                        })
-                        .collect()
-                })
-                .collect()
-        };
-        let pos_scaled = scale_features(&pos_norm);
-        let neg_scaled = scale_features(&neg_norm);
-
-        let mut scaled = pos_scaled;
-        scaled.extend(neg_scaled);
+        // Train logistic SGD directly on L2-normalized features (no StandardScaler,
+        // mahbot-996). The scaler is mathematically redundant on L2-normalized
+        // embeddings — removing it eliminates the OOD score-underflow vulnerability.
+        let mut all_norm = pos_norm;
+        all_norm.extend(neg_norm);
 
         let labels: Vec<f32> = [vec![1.0; 30], vec![0.0; 50]].concat();
         let sample_weights: Vec<f32> = [vec![3.0; 30], vec![1.0; 50]].concat();
 
         let (weights, bias) = train_logistic_sgd(
-            &scaled,
+            &all_norm,
             &labels,
             &sample_weights,
             L2_LAMBDA,
@@ -2943,13 +2919,13 @@ mod tests {
             Some(42),
         );
 
-        // Build a logistic verifier as train() would.
+        // Build a logistic verifier with empty scaler (mahbot-996).
         let verifier = VoiceVerifier {
             arch: VerifierArch::Logistic,
             weights,
             bias,
-            scaler_mean,
-            scaler_std,
+            scaler_mean: Vec::new(),
+            scaler_std: Vec::new(),
             conv_weight: Vec::new(),
             conv_bias: Vec::new(),
             fc_weight: Vec::new(),
@@ -3156,6 +3132,18 @@ mod tests {
         let (mean, std) = compute_standard_scaler(&[]);
         assert!(mean.is_empty());
         assert!(std.is_empty());
+
+        // Zero-variance input: all values identical → std would be 0.0 without
+        // clamping → must be clamped to SCALER_STD_MIN (mahbot-996).
+        let constant = vec![vec![5.0; 96]; 10];
+        let (mean, std) = compute_standard_scaler(&constant);
+        assert!((mean[0] - 5.0).abs() < 1e-6);
+        for &s in &std {
+            assert!(
+                (s - 1e-3).abs() < 1e-7,
+                "Zero-variance dimension must be clamped to 1e-3, got {s}",
+            );
+        }
     }
 
     #[test]
