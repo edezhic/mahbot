@@ -298,11 +298,14 @@ async fn attempt_recovery(agent_id: &str) -> anyhow::Result<()> {
         )
     })?;
 
-    // System-level continuation message telling the agent to retry.
-    let recovery_msg = "[System: Your previous response was interrupted or failed. \
-         Please review the conversation history above and provide a complete \
-         response. If you were in the middle of a multi-step task, continue \
-         from where you left off.]"
+    // Continuation message telling the agent to retry its last turn.
+    // Routed as a `UserMessage` (not a system-level injection) so the
+    // agent processes this as a normal conversational turn — it sees the
+    // full history and is asked to continue.
+    let recovery_msg = "I'm retrying the last request because the previous \
+         response was interrupted or failed. Please review the conversation \
+         history above and provide a complete response. If you were in the \
+         middle of a multi-step task, continue from where you left off."
         .to_string();
 
     let job = AgentJob {

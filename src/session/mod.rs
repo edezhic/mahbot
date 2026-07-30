@@ -121,11 +121,24 @@ pub(crate) struct SessionMetadata {
 /// Populated when a user initiates a direct agent session so the dead-session
 /// recovery poller can reconstruct an [`AgentJob`](crate::message_router::AgentJob)
 /// without parsing the agent ID string.
+///
+/// # Column naming note
+///
+/// The `role` field is persisted in the `session_metadata.role` column, which
+/// stores the **agent role** (e.g. `"engineer"`, `"analyst"`, `"reviewer"`).
+/// This is semantically distinct from the `sessions.role` column, which stores
+/// the **message role** (`"user"`, `"assistant"`, `"tool"`, `"system"`) — even
+/// though both columns happen to share the name `role` in different tables.
 #[derive(Debug, Clone)]
 pub(crate) struct SessionContext {
     pub channel: String,
     pub user_name: String,
     pub workspace_name: String,
+    /// Agent role (e.g. `"engineer"`, `"analyst"`, `"reviewer"`).
+    ///
+    /// Contrast with `sessions.role` which stores the message role
+    /// (`"user"`, `"assistant"`, `"tool"`, `"system"`).  The two are
+    /// semantically unrelated despite sharing a column name.
     pub role: String,
 }
 
@@ -829,6 +842,131 @@ mod tests {
         store().append(&k, &ChatMessage::user("a")).await.unwrap();
         assert!(store().delete(&k).await.unwrap());
         assert!(!store().delete(&k).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn session_context_roundtrip() {
+        crate::util::test::init_test_stores().await;
+        let agent_id = unique_key();
+
+        // Initially, no context should exist.
+        assert!(store().get_session_context(&agent_id).await.is_none());
+
+        // Store context.
+        store()
+            .set_session_context(&agent_id, "gui", "alice", "work", "engineer")
+            .await
+            .unwrap();
+
+        // Retrieve and verify.
+        let ctx = store()
+            .get_session_context(&agent_id)
+            .await
+            .expect("should have context after set");
+        assert_eq!(ctx.channel, "gui");
+        assert_eq!(ctx.user_name, "alice");
+        assert_eq!(ctx.workspace_name, "work");
+        assert_eq!(ctx.role, "engineer");
+
+        // Overwrite with different values.
+        store()
+            .set_session_context(&agent_id, "telegram", "bob", "project-x", "analyst")
+            .await
+            .unwrap();
+
+        let ctx = store()
+            .get_session_context(&agent_id)
+            .await
+            .expect("should have updated context");
+        assert_eq!(ctx.channel, "telegram");
+        assert_eq!(ctx.user_name, "bob");
+        assert_eq!(ctx.workspace_name, "project-x");
+        assert_eq!(ctx.role, "analyst");
+    }
+
+    #[tokio::test]
+    async fn session_get_last_message_role() {
+        crate::util::test::init_test_stores().await;
+        let agent_id = unique_key();
+
+        // Empty session → None.
+        assert!(store().get_last_message_role(&agent_id).await.is_none());
+
+        // Append a user message → User.
+        store()
+            .append(&agent_id, &ChatMessage::user("hello"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store().get_last_message_role(&agent_id).await,
+            Some(ChatRole::User)
+        );
+
+        // Append an assistant message → Assistant.
+        store()
+            .append(&agent_id, &ChatMessage::assistant("world"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store().get_last_message_role(&agent_id).await,
+            Some(ChatRole::Assistant)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_list_excluding_prefixes() {
+        crate::util::test::init_test_stores().await;
+
+        // Create sessions with different agent ID patterns.
+        let direct_id = unique_key();
+        let manager_id = format!("manager_{}", unique_key());
+        let ticket_id = format!("ticket_{}", unique_key());
+        let ask_id = format!("ask_{}", unique_key());
+        let maintainer_id = format!("maintainer_{}", unique_key());
+
+        for id in &[&direct_id, &manager_id, &ticket_id, &ask_id, &maintainer_id] {
+            store().append(id, &ChatMessage::user("msg")).await.unwrap();
+            // list_sessions_with_metadata joins with session_metadata, so we
+            // need metadata rows too (append doesn't create them).
+            store()
+                .set_session_context(id, "test_channel", "test_user", "test_ws", "engineer")
+                .await
+                .unwrap();
+        }
+
+        // Without exclusions, all 5 sessions should be listed.
+        let all = store().list_sessions_with_metadata().await;
+        let all_ids: Vec<&str> = all.iter().map(|s| s.agent_id.as_str()).collect();
+        assert!(
+            all_ids.contains(&direct_id.as_str()),
+            "direct session should be in full list"
+        );
+
+        // Exclude manager_ + transient prefixes → only the direct session remains.
+        let excluded = store()
+            .list_sessions_with_metadata_excluding(&["manager_", "ticket_", "ask_", "maintainer_"])
+            .await;
+        let excluded_ids: Vec<&str> = excluded.iter().map(|s| s.agent_id.as_str()).collect();
+        assert!(
+            excluded_ids.contains(&direct_id.as_str()),
+            "direct session should survive exclusion"
+        );
+        assert!(
+            !excluded_ids.contains(&manager_id.as_str()),
+            "manager_ prefix should be excluded"
+        );
+        assert!(
+            !excluded_ids.contains(&ticket_id.as_str()),
+            "ticket_ prefix should be excluded"
+        );
+        assert!(
+            !excluded_ids.contains(&ask_id.as_str()),
+            "ask_ prefix should be excluded"
+        );
+        assert!(
+            !excluded_ids.contains(&maintainer_id.as_str()),
+            "maintainer_ prefix should be excluded"
+        );
     }
 }
 
