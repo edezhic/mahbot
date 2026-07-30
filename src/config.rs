@@ -1639,7 +1639,7 @@ mod tests {
         let reload = ConfigReload::const_new();
 
         // Simulate: templates were enrolled (persist_model_state updated CONFIG).
-        let template_json = r#"{"classifier":null,"verifier":{"is_trained":false,"weights":[],"threshold":0.0,"scaler_mean":null,"scaler_std":null}}"#;
+        let template_json = r#"{"classifier":null,"verifier":{"is_trained":false,"threshold":0.0,"conv_weight":[],"conv_bias":[],"fc_weight":[],"fc_bias":[]}}"#;
         let mut enrolled = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(enrolled.set_string_field("wake_word_templates", template_json));
         reload.swap(enrolled);

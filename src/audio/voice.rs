@@ -10,7 +10,7 @@
 //! 3. **Mel spectrogram extraction** — via `melspectrogram.onnx` (candle-onnx)
 //! 4. **Neural embedding** — via `embedding_model.onnx` (candle-onnx), 96-dim vectors
 //! 5. **Wake word matching** — Conv1D classifier on a 3-embedding sliding window,
-//!    followed by a logistic regression verifier (AND gate).
+//!    followed by a Conv1D verifier (AND gate).
 //! 6. **Command recording** — record speech until silence or 30s cap
 //! 7. **Transcription** — via existing Qwen3-ASR local transcriber
 //! 8. **Routing** — transcribed text is routed to the user's active role via
@@ -1429,7 +1429,7 @@ fn process_wake_word_score(
 /// (tiling available embeddings to fill the 3-embedding window when the ring
 /// has fewer than 3 entries — see [`score_single_embedding`] implementation),
 /// applies rolling window scoring via [`process_wake_word_score`], and checks
-/// the second-stage verifier (logistic regression) gate via a bounded classifier candidate.
+/// the second-stage verifier (Conv1D) gate via a bounded classifier candidate.
 ///
 /// # Returns
 /// - `(true, rolling_sum, total_score, effective_threshold, max_verifier_score)` — the embedding
@@ -1472,7 +1472,7 @@ fn process_wake_word_score(
 /// - `embedding_ring` — persistent ring buffer (shared across frames in the
 ///   live pipeline; fresh per utterance in tests).
 /// - `classifier` — trained Conv1D classifier (`None` skips classification).
-/// - `verifier` — trained logistic regression verifier (`None` skips the
+/// - `verifier` — trained Conv1D verifier (`None` skips the
 ///   second-stage gate, matching enrollment self-test behaviour).
 /// - `score_window` — persistent rolling window of recent confidence scores.
 /// - `adaptive_state` — optional adaptive threshold state (`None` disables
@@ -2105,7 +2105,7 @@ struct VoicePipelineState {
     /// Cached classifier for inference (avoids per-frame clone of weights).
     /// Recreated when [`classifier_weights`] changes.
     classifier: Option<WakeWordClassifier>,
-    /// Second-stage logistic regression verifier.
+    /// Second-stage Conv1D verifier.
     verifier: VoiceVerifier,
     /// Per-utterance embeddings extracted via the full-utterance mel pipeline
     /// with dense stride-8 sliding window (used for both Conv1D classifier and
@@ -5558,7 +5558,7 @@ async fn finalize_enrollment_pipeline() -> bool {
         }
     };
 
-    // ── Train verifier in spawn_blocking (CPU-bound logistic regression) ──
+    // ── Train verifier in spawn_blocking (CPU-bound Conv1D) ──
     let pos_for_ver_seqs = enrollment_buffer; // moved — cloned above for classifier
     let self_test_seqs = pos_for_ver_seqs.clone();
     let confusable_embs = confusable_dense_embeddings();
@@ -5616,7 +5616,7 @@ async fn finalize_enrollment_pipeline() -> bool {
     let verifier = tokio::task::spawn_blocking(move || {
         use crate::audio::voice_verifier::{
             assert_weight_tier, CONFUSABLE_UPWEIGHT,
-            DEFAULT_VERIFIER_THRESHOLD, L2_LAMBDA,
+            CONV_L2_LAMBDA, DEFAULT_VERIFIER_THRESHOLD,
             UNRELATED_UPWEIGHT, VoiceVerifier,
         };
 
@@ -5685,7 +5685,7 @@ async fn finalize_enrollment_pipeline() -> bool {
                 &neg_for_verifier_seqs,
                 Some(&per_neg_weights),
                 DEFAULT_VERIFIER_THRESHOLD,
-                L2_LAMBDA,
+                CONV_L2_LAMBDA,
                 None,
             );
             info!(
@@ -6469,7 +6469,7 @@ struct PersistedModel {
     /// newly persisted models and never read on load (uniform averaging).
     #[serde(skip_serializing_if = "Option::is_none")]
     val_losses: Option<Vec<f32>>,
-    /// Second-stage logistic regression verifier.
+    /// Second-stage Conv1D verifier.
     #[serde(default)]
     verifier: Option<VoiceVerifier>,
 }
@@ -7706,9 +7706,11 @@ fn handle_negative_collection_audio(samples: &[f32], ctx: &mut PipelineCtx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EMBEDDING_DIM;
     use crate::VERIFIER_INPUT_DIM;
-    use crate::audio::voice_verifier::DEFAULT_VERIFIER_THRESHOLD;
-    use crate::audio::voice_verifier::VerifierArch;
+    use crate::audio::voice_verifier::{
+        CONV_VERIFIER_KERNEL_SIZE, CONV_VERIFIER_OUT, DEFAULT_VERIFIER_THRESHOLD,
+    };
     use crate::util::test::set_env_var;
     use crate::util::{add_noise, apply_gain, generate_pink_noise};
     use rand::SeedableRng;
@@ -9938,38 +9940,28 @@ mod tests {
     // detection threshold (1.35) at the 3rd embedding (1.65 ≥ 1.35).
 
     /// Build a verifier that always produces a score below the rejection
-    /// threshold.  Logistic bias = -2.0 gives sigmoid(-2.0) ≈ 0.12 < 0.948.
+    /// threshold.  Conv1D fc_bias = -2.0 gives sigmoid(-2.0) ≈ 0.12 < 0.948.
     fn verifier_always_reject() -> VoiceVerifier {
         VoiceVerifier {
-            arch: VerifierArch::Logistic,
             trained: true,
             threshold: DEFAULT_VERIFIER_THRESHOLD,
-            weights: vec![0.0; EMBEDDING_DIM],
-            bias: -2.0, // sigmoid(-2.0) ≈ 0.12
-            scaler_mean: Vec::new(),
-            scaler_std: Vec::new(),
-            conv_weight: Vec::new(),
-            conv_bias: Vec::new(),
-            fc_weight: Vec::new(),
-            fc_bias: Vec::new(),
+            conv_weight: vec![0.0; CONV_VERIFIER_OUT * EMBEDDING_DIM * CONV_VERIFIER_KERNEL_SIZE],
+            conv_bias: vec![0.0; CONV_VERIFIER_OUT],
+            fc_weight: vec![0.0; CONV_VERIFIER_OUT],
+            fc_bias: vec![-2.0], // sigmoid(-2.0) ≈ 0.12
         }
     }
 
     /// Build a verifier that always produces a score above the confirmation
-    /// threshold.  Logistic bias = 3.0 gives sigmoid(3.0) ≈ 0.95 > 0.948.
+    /// threshold.  Conv1D fc_bias = 3.0 gives sigmoid(3.0) ≈ 0.95 > 0.948.
     fn verifier_always_accept() -> VoiceVerifier {
         VoiceVerifier {
-            arch: VerifierArch::Logistic,
             trained: true,
             threshold: DEFAULT_VERIFIER_THRESHOLD,
-            weights: vec![0.0; EMBEDDING_DIM],
-            bias: 3.0, // sigmoid(3.0) ≈ 0.95
-            scaler_mean: Vec::new(),
-            scaler_std: Vec::new(),
-            conv_weight: Vec::new(),
-            conv_bias: Vec::new(),
-            fc_weight: Vec::new(),
-            fc_bias: Vec::new(),
+            conv_weight: vec![0.0; CONV_VERIFIER_OUT * EMBEDDING_DIM * CONV_VERIFIER_KERNEL_SIZE],
+            conv_bias: vec![0.0; CONV_VERIFIER_OUT],
+            fc_weight: vec![0.0; CONV_VERIFIER_OUT],
+            fc_bias: vec![3.0], // sigmoid(3.0) ≈ 0.95
         }
     }
 
