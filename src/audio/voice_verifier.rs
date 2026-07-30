@@ -34,10 +34,20 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::audio::embedding_sequence::EmbeddingSequence;
+use crate::audio::embedding_sequence::Source;
 use crate::{EMBEDDING_DIM, VERIFIER_INPUT_DIM, VERIFIER_WINDOW_SIZE};
 
 /// Default decision threshold for the verifier.
 ///
+/// **Since mahbot-997:** This constant now serves as the **fallback threshold**
+/// used when auto-calibration is skipped (e.g. training with only synthetic
+/// negatives, or insufficient validation data).  When the verifier is trained
+/// with real (non-synthetic) negative sequences, [`train`](VoiceVerifier::train)
+/// automatically calibrates a data-driven threshold via
+/// [`calibrate_verifier_threshold`] — see Constrained Weighted Youden's J
+/// (mahbot-997) for details.
+///
+/// The pre-mahbot-997 calibration is preserved for reference:
 /// Calibrated for **dense stride-8 embeddings** (mahbot-923).  The original
 /// threshold of 0.60 was calibrated against streaming embeddings (mahbot-890).
 /// After the pipeline-wide switch to dense stride-8 (mahbot-923), all trainable
@@ -69,18 +79,8 @@ use crate::{EMBEDDING_DIM, VERIFIER_INPUT_DIM, VERIFIER_WINDOW_SIZE};
 /// | 0.65      | 84.6%                | 84.6%   | 1.0                   | 2/3 (67%) |
 /// | 0.70      | 84.6%                | 84.6%   | 2                     | ✗ (conf=2, total=3) |
 ///
-/// ## Two-tier ceiling escalation plan
-///
-/// If E2E benchmarks show the 4.503 `ADAPTIVE_CEILING` is too aggressive
-/// (excessive false rejects), escalate to 5.5.  The escalation trigger is
-/// when the per-utterance adaptive threshold trajectory (tracked via
-/// `DetectionInstrumentation.adaptive_threshold_trajectory`) shows the
-/// ceiling is the active limiting factor on detection rate.
-///
 /// **Previously:** 0.60 (streaming, mahbot-890), 0.50 (mahbot-882),
 /// 0.4 (mahbot-853), 0.6 (mahbot-829), 0.5 (mahbot-797), 0.3 (mahbot-788).
-///
-/// ⚠ **If changing this constant**, re-calibrate the 1.58× multiplier by
 pub(crate) const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.948;
 
 /// Fraction of sequences held out for validation (80/20 train/val split).
@@ -638,7 +638,7 @@ impl VoiceVerifier {
         );
 
         // Assemble the trained verifier.
-        let verifier = Self {
+        let mut verifier = Self {
             conv_weight: weight_conv,
             conv_bias: bias_conv,
             fc_weight: weight_fc,
@@ -658,6 +658,39 @@ impl VoiceVerifier {
             class_weight,
             "Conv1D verifier",
         );
+
+        // ── Auto-calibrate threshold on validation data (mahbot-997) ──
+        // Only calibrate when the training data includes real (non-synthetic)
+        // negative sequences — synthetic negatives do not represent realistic
+        // false-accept distributions.
+        let has_real_negatives = seq_infos
+            .iter()
+            .any(|s| !s.is_positive && s.source != Source::Synthetic);
+        if has_real_negatives && n_val > 0 {
+            // Compute validation scores for calibration.
+            let mut val_pos_scores: Vec<f32> = Vec::new();
+            let mut val_neg_scores: Vec<f32> = Vec::new();
+            for (emb, &lbl) in val_windows.iter().zip(val_labels.iter()) {
+                let score = verifier.predict(emb);
+                if lbl > 0.5 {
+                    val_pos_scores.push(score);
+                } else {
+                    val_neg_scores.push(score);
+                }
+            }
+
+            let calibrated = calibrate_verifier_threshold(
+                &val_pos_scores,
+                &val_neg_scores,
+                threshold, // caller-supplied fallback
+            );
+            verifier.threshold = calibrated;
+        } else if !has_real_negatives {
+            info!(
+                "Verifier threshold calibration skipped: all negative sequences are synthetic.  \
+                 Using caller-supplied threshold={threshold:.4}."
+            );
+        }
 
         verifier
     }
@@ -1394,6 +1427,116 @@ fn log_verifier_diagnostics(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Threshold auto-calibration (mahbot-997)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// λ value for Constrained Weighted Youden's J during threshold calibration.
+///
+/// Weighting false accepts (FPR) twice as heavily as false rejects (1-TPR):
+/// maximize TPR - λ×FPR subject to TPR ≥ 0.90.
+/// See mahbot-997 for the calibration protocol.
+pub(crate) const CALIBRATION_LAMBDA: f32 = 2.0;
+
+/// Minimum number of positive or negative validation samples required for
+/// threshold calibration.  Below this threshold, fall back to the caller-supplied
+/// value and emit a warning.
+const CALIBRATION_MIN_SAMPLES: usize = 5;
+
+/// Step size for threshold sweep during auto-calibration.
+///
+/// 0.01 → 101 candidates in [0.0, 1.0], balancing precision (~0.01 resolution)
+/// with computational cost (trivial for small validation sets).
+pub(crate) const CALIBRATION_SWEEP_STEP: f32 = 0.01;
+
+/// Auto-calibrate the verifier decision threshold using Constrained Weighted
+/// Youden's J on held-out validation scores.
+///
+/// Sweeps candidate thresholds from 0.0 to 1.0 in [`CALIBRATION_SWEEP_STEP`]
+/// increments, computing:
+///
+/// ```text
+/// Youden(T) = TPR(T) - λ × FPR(T)
+/// ```
+///
+/// subject to `TPR(T) ≥ 0.90`.  The threshold with the maximum Youden index
+/// is selected.  λ = [`CALIBRATION_LAMBDA`] (2.0) weights false accepts twice
+/// as heavily as false rejects.
+///
+/// # Fallback
+///
+/// If either `pos_scores` or `neg_scores` has fewer than
+/// [`CALIBRATION_MIN_SAMPLES`] (5) entries, emits a `warn!` and returns
+/// `default_threshold` unchanged.
+///
+/// # Returns
+///
+/// The calibrated threshold in `(0.0, 1.0]`, or `default_threshold` if the
+/// validation set is too sparse for meaningful calibration.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn calibrate_verifier_threshold(
+    pos_scores: &[f32],
+    neg_scores: &[f32],
+    default_threshold: f32,
+) -> f32 {
+    if pos_scores.len() < CALIBRATION_MIN_SAMPLES || neg_scores.len() < CALIBRATION_MIN_SAMPLES {
+        warn!(
+            "Verifier threshold calibration skipped: pos={}, neg={} validation samples \
+             (need ≥{} each).  Using caller-supplied threshold={:.4}.",
+            pos_scores.len(),
+            neg_scores.len(),
+            CALIBRATION_MIN_SAMPLES,
+            default_threshold,
+        );
+        return default_threshold;
+    }
+
+    let n_pos = pos_scores.len() as f32;
+    let n_neg = neg_scores.len() as f32;
+
+    // Sweep thresholds from 0.0 to 1.0 in CALIBRATION_SWEEP_STEP increments.
+    let n_steps = (1.0 / CALIBRATION_SWEEP_STEP).round() as usize + 1;
+    let mut best_youden = f32::NEG_INFINITY;
+    let mut best_threshold = default_threshold;
+
+    for step in 0..n_steps {
+        let t = (step as f32) * CALIBRATION_SWEEP_STEP;
+
+        // TPR: fraction of positives with score >= threshold.
+        let tp = pos_scores.iter().filter(|&&s| s >= t).count() as f32;
+        let tpr = tp / n_pos;
+
+        // FPR: fraction of negatives with score >= threshold.
+        let fp = neg_scores.iter().filter(|&&s| s >= t).count() as f32;
+        let fpr = fp / n_neg;
+
+        // Constrained Weighted Youden's J.
+        // Use `>=` to prefer higher thresholds for the same Youden value
+        // (higher threshold = fewer false accepts).
+        // Note: at t=0.0, TPR is always 1.0 (sigmoid outputs are in [0, 1]),
+        // so at least one threshold always satisfies TPR ≥ 0.90.
+        if tpr >= 0.90 {
+            let youden = tpr - CALIBRATION_LAMBDA * fpr;
+            if youden >= best_youden {
+                best_youden = youden;
+                best_threshold = t;
+            }
+        }
+    }
+
+    info!(
+        "Verifier threshold calibration: selected threshold={best_threshold:.4} \
+         (Youden={best_youden:.4}, λ={CALIBRATION_LAMBDA:.1}), \
+         pos={pos} neg={neg} validation samples",
+        pos = pos_scores.len(),
+        neg = neg_scores.len(),
+    );
+    best_threshold
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Synthetic negatives
@@ -2382,6 +2525,168 @@ mod tests {
         assert!(
             score_pos >= 0.5,
             "Weighted verifier should accept positive (score >= 0.5), got {score_pos:.4}",
+        );
+    }
+
+    // ── calibrate_verifier_threshold tests (mahbot-997) ─────────────────
+
+    #[test]
+    fn test_calibrate_threshold_basic_youden_selection() {
+        // Positives cluster at 0.9, negatives cluster at 0.3.
+        // With λ=2.0, the optimal threshold should be between 0.3 and 0.9.
+        let pos = vec![0.91, 0.92, 0.89, 0.93, 0.90, 0.88, 0.91, 0.90];
+        let neg = vec![0.31, 0.29, 0.32, 0.28, 0.30, 0.27, 0.33, 0.29];
+        let result = calibrate_verifier_threshold(&pos, &neg, 0.5);
+
+        // Optimal threshold should be >= 0.33 (all neg < 0.33) and <= 0.88
+        // (all pos >= 0.88), i.e., somewhere in (0.33, 0.88).
+        assert!(
+            result > 0.33 && result <= 0.88,
+            "Optimal threshold should separate pos ({:.2}..{:.2}) from neg ({:.2}..{:.2}), got {result:.4}",
+            pos.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap(),
+            pos.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap(),
+            neg.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap(),
+            neg.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_calibrate_threshold_tpr_constraint_enforced() {
+        // All negatives at 0.1, positives at three levels:
+        // 0.95 (4 samples), 0.85 (4 samples), 0.50 (4 samples).
+        let pos = vec![
+            0.95, 0.96, 0.94, 0.95, // high cluster
+            0.85, 0.86, 0.84, 0.85, // mid cluster
+            0.50, 0.51, 0.49, 0.50, // low cluster
+        ];
+        let neg = vec![0.10, 0.11, 0.09, 0.10, 0.12, 0.08, 0.10, 0.11];
+        let result = calibrate_verifier_threshold(&pos, &neg, 0.5);
+
+        // At threshold 0.52: TPR = 12/12 = 1.0, FPR = 0/8 = 0.0, Youden = 1.0.
+        // At threshold 0.87: TPR = 4/12 = 0.33 < 0.90 → rejected.
+        // With `>=`, the algorithm prefers the highest threshold with maximal
+        // Youden, which is 0.98 (last threshold with TPR=1.0, FPR=0.0 before
+        // the first positive at 0.49 drops out at 0.50).
+        // At threshold 0.50: TPR = 8/12 = 0.667 < 0.90 → rejected.
+        // The optimal is 0.49 (last threshold at which all 12 positives ≥ T).
+        // Since we iterate in 0.01 steps, this is 0.49.
+        assert!(
+            (result - 0.49).abs() < 0.02,
+            "Expected threshold ~0.49 (highest with TPR=1.0, FPR=0.0), got {result:.4}",
+        );
+    }
+
+    #[test]
+    fn test_calibrate_threshold_sparse_positives_falls_back() {
+        // Fewer than CALIBRATION_MIN_SAMPLES (5) positives.
+        let pos = vec![0.9, 0.8, 0.7, 0.6];
+        let neg = vec![0.3, 0.2, 0.1, 0.3, 0.2, 0.1];
+        let result = calibrate_verifier_threshold(&pos, &neg, 0.75);
+        assert!(
+            (result - 0.75).abs() < 1e-6,
+            "Sparse positives should fall back to default 0.75, got {result:.4}",
+        );
+    }
+
+    #[test]
+    fn test_calibrate_threshold_sparse_negatives_falls_back() {
+        // Fewer than CALIBRATION_MIN_SAMPLES (5) negatives.
+        let pos = vec![0.9, 0.8, 0.7, 0.6, 0.5, 0.4];
+        let neg = vec![0.3, 0.2, 0.1, 0.3];
+        let result = calibrate_verifier_threshold(&pos, &neg, 0.60);
+        assert!(
+            (result - 0.60).abs() < 1e-6,
+            "Sparse negatives should fall back to default 0.60, got {result:.4}",
+        );
+    }
+
+    #[test]
+    fn test_calibrate_threshold_lambda_penalizes_false_accepts() {
+        // Score distribution where a mid-range threshold gives the same
+        // TPR as a low threshold but lower FPR.
+        let pos = vec![
+            0.95, 0.94, 0.93, 0.92, 0.91, // 5 high pos
+            0.70, 0.69, 0.68, 0.67, 0.66, // 5 low pos
+        ];
+        let neg = vec![
+            0.75, 0.74, 0.73, 0.72, 0.71, // 5 high neg
+            0.10, 0.09, 0.08, 0.07, 0.06, // 5 low neg
+        ];
+
+        // At threshold 0.71: TPR = 5/10 = 0.5 < 0.90 → rejected.
+        // At threshold 0.66: TPR = 10/10 = 1.0, FPR = 5/10 = 0.5, Youden = 1.0 - 2*0.5 = 0.0.
+        // At threshold 0.76: TPR = 0/10 = 0.0 < 0.90 → rejected.
+        // Among valid thresholds (0.0..0.66), Youden increases as FPR drops.
+        // At threshold 0.66: Youden = 0.0.
+        // At threshold 0.11: FPR = 5/10 = 0.5, Youden = 0.0.
+        // With `>=`, the highest threshold with Youden=0.0 is 0.66 (the last
+        // at which TPR=1.0 before low-pos at 0.66 drops out).
+        let result = calibrate_verifier_threshold(&pos, &neg, 0.5);
+        assert!(
+            (result - 0.66).abs() < 0.02,
+            "Expected threshold ~0.66 (highest with TPR=1.0), got {result:.4}",
+        );
+    }
+
+    #[test]
+    fn test_calibrate_threshold_all_same_scores_prefers_highest() {
+        // All scores identical (0.5). At any threshold ≤ 0.5, TPR=1.0, FPR=1.0,
+        // Youden = -1.0. At threshold > 0.5, TPR=0.0 < 0.90 → rejected.
+        // With `>=`, the algorithm prefers the highest threshold with equal
+        // Youden, which is 0.50.
+        let pos = vec![0.5; 8];
+        let neg = vec![0.5; 8];
+        let result = calibrate_verifier_threshold(&pos, &neg, 0.6);
+
+        assert!(
+            (result - 0.50).abs() < 1e-6,
+            "All identical scores should give threshold 0.50 (last with TPR=1.0), got {result:.4}",
+        );
+    }
+
+    #[test]
+    fn test_calibrate_threshold_perfect_separation() {
+        // Perfectly separated: all positives at 0.99, all negatives at 0.01.
+        let pos = vec![0.99; 10];
+        let neg = vec![0.01; 10];
+        let result = calibrate_verifier_threshold(&pos, &neg, 0.5);
+
+        // Any threshold in (0.01, 0.99) gives TPR = 1.0, FPR = 0.0, Youden = 1.0.
+        // With `>=`, the algorithm picks the last threshold with maximal Youden.
+        // At threshold 0.98: TPR = 1.0, FPR = 0.0, Youden = 1.0.
+        // At threshold 0.99: TPR = 1.0 (all >= 0.99), FPR = 0.0, Youden = 1.0.
+        // At threshold 1.00: TPR = 0/10 = 0.0 < 0.90 → rejected.
+        // So the highest valid threshold is 0.99.
+        assert!(
+            (result - 0.99).abs() < 1e-6,
+            "Perfect separation should give threshold 0.99 (highest with TPR=1.0, FPR=0.0), got {result:.4}",
+        );
+    }
+
+    #[test]
+    fn test_calibrate_threshold_overlapping_distributions() {
+        // Positives and negatives overlap fully — all thresholds have TPR = FPR,
+        // so Youden = TPR - 2×FPR = -TPR is constant for all valid thresholds.
+        // This exercises the tiebreaker (preferring higher thresholds for equal
+        // Youden) rather than the Youden optimization itself.
+        let pos = vec![0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1];
+        let neg = vec![0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2];
+
+        // At threshold 0.10: TPR = 8/8 = 1.0, FPR = 8/8 = 1.0, Youden = -1.0
+        // At threshold 0.20: TPR = 7/8 = 0.875 < 0.90 → rejected? Wait...
+        //   pos >= 0.20: [0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2] = 7/8 = 0.875 < 0.90 → rejected.
+        // At threshold 0.10: TPR = 8/8 = 1.0, FPR = 8/8 = 1.0, Youden = -1.0
+        // At threshold 0.11: same, all >= 0.11.
+        // At threshold 0.20: The pos element at 0.1 is < 0.20, so TPR = 0.875 < 0.9 → rejected.
+        // So only thresholds ≤ 0.10 are valid.
+        // At threshold 0.0: TPR = 1.0, FPR = 1.0, Youden = -1.0.
+        // At threshold 0.10: TPR = 1.0, FPR = 1.0, Youden = -1.0.
+        // The algorithm picks the highest valid threshold = 0.10.
+        let result = calibrate_verifier_threshold(&pos, &neg, 0.7);
+
+        assert!(
+            (result - 0.10).abs() < 0.02,
+            "Overlapping distributions: expected threshold ~0.10, got {result:.4}",
         );
     }
 }
