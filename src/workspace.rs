@@ -193,6 +193,7 @@ async fn run_workspace_discovery(
         &prompt,
         String::new(),
         String::new(),
+        None,
     )
     .await;
     let response =
@@ -250,6 +251,7 @@ async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) 
         &prompt,
         String::new(),
         String::new(),
+        None,
     )
     .await;
     response.context("Diagnostics discovery agent returned no response (cancelled or failed)")?;

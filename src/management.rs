@@ -1054,6 +1054,9 @@ async fn run_claim_pipeline(ws: &Workspace) {
 async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     let agent_id = ticket_agent_id(&ticket.id, Role::Engineer.as_str());
 
+    // Register in the message router so comments can be delivered mid-work.
+    let incoming_rx = message_router::register_agent(&agent_id);
+
     let last_eng_pos = ticket
         .comments
         .iter()
@@ -1082,6 +1085,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         );
     }
 
+    let agent_id_for_unregister = agent_id.clone();
     let (_agent, response) = run_agent(
         agent_id,
         Role::Engineer,
@@ -1090,8 +1094,12 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         &message,
         String::new(),
         String::new(),
+        Some(incoming_rx),
     )
     .await;
+
+    // Unregister from the message router — agent is done.
+    message_router::unregister_agent(&agent_id_for_unregister);
 
     // Post-run check still needed for race conditions during agent execution.
     if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InDevelopment).await {
@@ -1474,6 +1482,9 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         crate::generate_suffix()
     );
 
+    // Register in the message router so comments can be delivered mid-work.
+    let incoming_rx = message_router::register_agent(&agent_id);
+
     //
     // Unlike handle_qa_passed (which fails closed on git errors — returning early
     // to stay in QaPassed for retry), dispatch_sanitation takes a fail-open approach:
@@ -1513,6 +1524,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         ],
     );
 
+    let agent_id_for_unregister = agent_id.clone();
     let (agent, response) = run_agent(
         agent_id,
         Role::Sanitation,
@@ -1521,8 +1533,12 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         &prompt,
         String::new(),
         String::new(),
+        Some(incoming_rx),
     )
     .await;
+
+    // Unregister from the message router — agent is done.
+    message_router::unregister_agent(&agent_id_for_unregister);
 
     // Post-run phase check — bail if ticket was moved externally.
     if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InSanitation).await {
@@ -1896,46 +1912,93 @@ async fn run_parallel_agents(
     extraction_prompt: &str,
 ) -> Vec<ParallelVerdict> {
     let suffix = crate::generate_suffix();
-    let futures: Vec<_> = (0..PARALLEL_AGENT_COUNT)
-        .map(move |i| {
-            let ticket = Arc::clone(ticket);
-            let prompt = prompt.to_string();
-            let ws = ws.clone();
-            let suffix = suffix.clone();
-            let agent_id = format!("ticket_{}_{}_{}_{}", ticket.id, i, suffix, role.as_str());
-            let extraction_prompt = extraction_prompt.to_string();
-            async move {
-                let (agent, response) = run_agent(
-                    agent_id,
-                    role,
-                    &ws,
-                    Some(&ticket),
-                    &prompt,
-                    String::new(),
-                    String::new(),
-                )
-                .await;
-                let response = response.unwrap_or_default();
-                if response.is_empty() {
-                    return ParallelVerdict::NoResponse;
-                }
-                // KV cache preservation: `agent.extract_structured` uses the
-                // agent's own parameters (model, temperature, reasoning_effort,
-                // tools, provider routing) so the extraction call is byte-identical
-                // to the original verifier agent call — the provider can reuse the
-                // cached prefix.
-                let verdict = agent
-                    .extract_structured::<crate::Verdict>(&extraction_prompt, 5)
-                    .await
-                    .ok();
-                match verdict {
-                    Some(v) => ParallelVerdict::Verdict(v),
-                    None => ParallelVerdict::ParseFailed,
-                }
-            }
-        })
+    let count = PARALLEL_AGENT_COUNT;
+
+    // ── Register all agents in the message router BEFORE spawning ──────
+    // This allows the board's comment-routing to deliver mid-work comments
+    // to any of these agents.
+    let agent_ids: Vec<String> = (0..count)
+        .map(|i| format!("ticket_{}_{}_{}_{}", ticket.id, i, suffix, role.as_str()))
         .collect();
-    join_all(futures).await
+
+    let receivers: Vec<_> = agent_ids
+        .iter()
+        .map(|agent_id| message_router::register_agent(agent_id))
+        .collect();
+
+    // Set assigned_to to comma-separated agent IDs (no cancellation —
+    // agents are already registered and running would be cancelled).
+    let assigned_to_str = agent_ids.join(",");
+    if let Err(e) = board()
+        .set_assigned_to_no_cancel(&ticket.id, Some(&assigned_to_str))
+        .await
+    {
+        warn!(
+            ticket = %ticket.id,
+            error = %e,
+            "Failed to set assigned_to for parallel agents",
+        );
+    }
+
+    // ── Spawn and run all agents concurrently ──────────────────────────
+    let results: Vec<ParallelVerdict> = {
+        let futures: Vec<_> = agent_ids
+            .into_iter()
+            .zip(receivers)
+            .map(|(agent_id, rx)| {
+                let ticket = Arc::clone(ticket);
+                let prompt = prompt.to_string();
+                let ws = ws.clone();
+                let extraction_prompt = extraction_prompt.to_string();
+                async move {
+                    let (agent, response) = run_agent(
+                        agent_id.clone(),
+                        role,
+                        &ws,
+                        Some(&ticket),
+                        &prompt,
+                        String::new(),
+                        String::new(),
+                        Some(rx),
+                    )
+                    .await;
+
+                    // Unregister from message router — agent is done.
+                    message_router::unregister_agent(&agent_id);
+
+                    let response = response.unwrap_or_default();
+                    if response.is_empty() {
+                        return ParallelVerdict::NoResponse;
+                    }
+                    // KV cache preservation: `agent.extract_structured` uses the
+                    // agent's own parameters (model, temperature, reasoning_effort,
+                    // tools, provider routing) so the extraction call is byte-identical
+                    // to the original verifier agent call — the provider can reuse the
+                    // cached prefix.
+                    let verdict = agent
+                        .extract_structured::<crate::Verdict>(&extraction_prompt, 5)
+                        .await
+                        .ok();
+                    match verdict {
+                        Some(v) => ParallelVerdict::Verdict(v),
+                        None => ParallelVerdict::ParseFailed,
+                    }
+                }
+            })
+            .collect();
+        join_all(futures).await
+    };
+
+    // ── Cleanup: clear assigned_to (no cancel, agents already done) ────
+    if let Err(e) = board().clear_assigned_to_no_cancel(&ticket.id).await {
+        warn!(
+            ticket = %ticket.id,
+            error = %e,
+            "Failed to clear assigned_to after parallel agents",
+        );
+    }
+
+    results
 }
 
 /// Check whether a review or QA verdict passes (score at or above
@@ -2053,17 +2116,19 @@ async fn record_verdict_comments_tx(
 /// this function does **not** call [`clear_assigned_to_no_cancel`] when the post-run phase check
 /// fails (the ticket moved externally during analysis). This is intentional:
 ///
-/// * **`assigned_to` is already `NULL`** — [`claim_ticket_in_workspace`] sets
-///   `assigned_to = NULL` during the Backlog → InAnalysis claim
-///   (see [board.rs:906-912]). There is no assigned user to clear.
+/// * **`assigned_to` is already managed** — [`run_parallel_agents`] sets `assigned_to`
+///   to the comma-separated agent IDs for mid-work comment routing, and clears it
+///   after all agents finish. If the phase check fails (ticket moved externally),
+///   the parallel agents are already done and unregistered — `assigned_to` was already
+///   cleared or is about to be overwritten by the external transition.
 /// * **Ephemeral agent IDs** — [`run_parallel_agents`] generates unique agent
-///   IDs (`{base}_{i}_{suffix}`) that are never written to the ticket's `assigned_to`
-///   field. The agent registry entries for these parallel agents have already finished
-///   or been cancelled by the pre-flight [`AGENT_REGISTRY.cancel_by_ticket_id`] call
-///   in [`spawn_dispatch`].
+///   IDs (`{base}_{i}_{suffix}`) that are written to the ticket's `assigned_to`
+///   field for comment routing and then cleared after the agents finish.
+///   The agent registry entries are already cleaned up.
 /// * **TOCTOU race** — calling [`clear_assigned_to_no_cancel`] would unnecessarily risk
 ///   overwriting an assignee that a concurrent claim set between the phase check and
-///   the clear. Since `assigned_to` is already `NULL`, there is nothing to gain.
+///   the clear. Since [`run_parallel_agents`] already clears `assigned_to` internally,
+///   there is nothing to gain.
 async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
     let prompt_key = if ticket.reporter == Role::Maintainer.as_str() {
         "analyze/maintainer_ticket.md"

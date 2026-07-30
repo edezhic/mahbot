@@ -2746,3 +2746,121 @@ async fn test_status_to_phase_migration() {
     let version2: i64 = ver_rows2[0].get(0).expect("get version");
     assert_eq!(version2, 2, "user_version should remain 2 after re-open");
 }
+
+// ── route_comment_to_agents tests ─────────────────────────────────────
+
+/// route_comment_to_agents dispatches a comment to a registered agent
+/// via the message router.
+#[tokio::test]
+async fn test_route_comment_to_agents_delivers_to_registered_agent() {
+    crate::util::test::init_management_test_stores().await;
+    let store = crate::board::store();
+    let ws = crate::workspace::test_ws("/tmp/test_route_comment");
+
+    // Create a ticket with assigned_to set
+    let ticket_id = crate::util::test::make_ticket(
+        store,
+        &ws,
+        "route-comment-test",
+        crate::board::TicketPhase::InDevelopment,
+    )
+    .await;
+
+    // Set assigned_to to a known agent ID
+    let agent_id = "_test_route_comment_agent";
+    store
+        .set_assigned_to_no_cancel(&ticket_id, Some(agent_id))
+        .await
+        .expect("set assigned_to");
+
+    // Register an agent in the router
+    let mut rx = crate::message_router::register_agent(agent_id);
+
+    // Add a comment — this should route to the registered agent
+    store
+        .add_comment(&ticket_id, "manager", "Hello from test")
+        .await
+        .expect("add_comment should succeed");
+
+    // The agent should receive the comment
+    let received = rx.try_recv().expect("should receive the routed comment");
+    assert_eq!(received.content, "Hello from test");
+    assert_eq!(received.kind, crate::message_router::JobKind::TicketComment,);
+    assert_eq!(received.user_name, "manager");
+    assert_eq!(
+        received.role,
+        crate::Role::Manager,
+        "role should be the commenter's role (manager)",
+    );
+
+    // No more messages
+    assert!(
+        rx.try_recv().is_err(),
+        "should not have additional messages",
+    );
+
+    crate::message_router::unregister_agent(agent_id);
+}
+
+/// route_comment_to_agents silently skips when no agents are assigned.
+#[tokio::test]
+async fn test_route_comment_to_agents_no_assignment() {
+    crate::util::test::init_management_test_stores().await;
+    let store = crate::board::store();
+    let ws = crate::workspace::test_ws("/tmp/test_route_comment_no_assign");
+
+    // Create a ticket WITHOUT assigned_to
+    let ticket_id = crate::util::test::make_ticket(
+        store,
+        &ws,
+        "no-assign-test",
+        crate::board::TicketPhase::Backlog,
+    )
+    .await;
+
+    // Add a comment — should succeed without routing (no assigned agents)
+    store
+        .add_comment(&ticket_id, "manager", "No one should get this")
+        .await
+        .expect("add_comment should succeed");
+}
+
+/// route_comment_to_agents uses the commenter's role in the AgentJob.
+#[tokio::test]
+async fn test_route_comment_to_agents_uses_commenter_role() {
+    crate::util::test::init_management_test_stores().await;
+    let store = crate::board::store();
+    let ws = crate::workspace::test_ws("/tmp/test_route_comment_role");
+
+    let ticket_id = crate::util::test::make_ticket(
+        store,
+        &ws,
+        "role-test",
+        crate::board::TicketPhase::InDevelopment,
+    )
+    .await;
+
+    let agent_id = "_test_route_comment_role_agent";
+    store
+        .set_assigned_to_no_cancel(&ticket_id, Some(agent_id))
+        .await
+        .expect("set assigned_to");
+
+    let mut rx = crate::message_router::register_agent(agent_id);
+
+    // Add a comment as "engineer" role
+    store
+        .add_comment(&ticket_id, "engineer", "Code review feedback")
+        .await
+        .expect("add_comment should succeed");
+
+    let received = rx.try_recv().expect("should receive the routed comment");
+    assert_eq!(
+        received.role,
+        crate::Role::Engineer,
+        "role should be engineer (not Manager)",
+    );
+    assert_eq!(received.user_name, "engineer");
+
+    crate::message_router::unregister_agent(agent_id);
+}

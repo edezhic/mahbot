@@ -650,6 +650,11 @@ pub struct Agent {
     pub(crate) user_name: String,
     /// The channel origin (gui, telegram, voice) of the triggering message.
     pub(crate) channel: String,
+    /// Optional receiver for mid-work messages (e.g., ticket comments).
+    /// When set, the `llm_loop` drains this channel before each LLM call
+    /// and injects received messages into the session history.
+    pub(crate) incoming_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>>,
 }
 
 // ── Verdict type ─────────────────────────────────────────────────

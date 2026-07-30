@@ -384,9 +384,6 @@ impl Tool for AddCommentTool {
 
         let store = board_store();
 
-        // Guard: refuse to comment on a ticket that is in a pipeline-blocking phase.
-        guard_not_pipeline_blocking(store, ticket_id).await?;
-
         store
             .add_comment(ticket_id, Role::Manager.as_str(), content)
             .await?;
@@ -803,17 +800,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_add_comment_blocked_by_pipeline() {
+    async fn test_add_comment_allowed_on_pipeline_blocking() {
         let id = create_blocking_ticket().await;
         let result = AddCommentTool
             .execute(
                 &test_ws("/tmp"),
-                json!({"ticket_id": id, "content": "This should be blocked"}),
+                json!({"ticket_id": id, "content": "This should be allowed now"}),
             )
             .await;
         assert!(
-            result.is_err(),
-            "Pipeline-blocking ticket should reject comments"
+            result.is_ok(),
+            "Comments should be allowed on pipeline-blocking tickets"
         );
     }
 }

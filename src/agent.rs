@@ -160,6 +160,7 @@ impl Agent {
             tool_stats: std::sync::Mutex::new(Vec::new()),
             user_name,
             channel,
+            incoming_rx: None,
         }
     }
 }
@@ -277,6 +278,12 @@ impl Agent {
                          — model may be stuck in a tool-calling loop"
                     );
                 }
+
+                // Drain incoming messages (e.g., ticket comments from the Manager
+                // or comment tool). Messages are injected as user messages with a
+                // descriptive prefix so the agent understands the source.
+                self.drain_incoming_messages().await?;
+
                 let PreparedAssistantTurn {
                     mut display_text,
                     tool_calls,
@@ -616,6 +623,77 @@ impl Agent {
         Ok(())
     }
 
+    /// Drain any incoming messages from the router (e.g., ticket comments)
+    /// and inject them into the session history.
+    ///
+    /// Called at the start of each LLM loop iteration, before the LLM call.
+    /// Messages are persisted to the session DB AND pushed to in-memory
+    /// history so they survive crashes and are visible to the model.
+    ///
+    /// This is a no-op when no receiver is configured (e.g., chat agents
+    /// that use the consumer_loop instead).
+    async fn drain_incoming_messages(&mut self) -> anyhow::Result<()> {
+        let Some(rx) = &mut self.incoming_rx else {
+            return Ok(());
+        };
+
+        let mut messages = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(job) => {
+                    let content = match job.kind {
+                        crate::message_router::JobKind::TicketComment => {
+                            format!(
+                                "[Comment from {} on ticket]: {}",
+                                job.user_name, job.content
+                            )
+                        }
+                        _ => job.content,
+                    };
+                    let now = chrono::Local::now();
+                    messages.push(crate::ChatMessage::user(format!(
+                        "<timestamp>{} ({})</timestamp>\n\n{}",
+                        now.format("%Y-%m-%d %H:%M:%S"),
+                        now.format("%Z"),
+                        content,
+                    )));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    // Channel closed — no more messages will arrive.
+                    // Drop the receiver so we don't try again.
+                    self.incoming_rx = None;
+                    break;
+                }
+            }
+        }
+
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        // Persist to session DB — best-effort. The comment is already saved in
+        // the board DB, so losing the session copy is recoverable. Log and
+        // continue rather than aborting the LLM iteration.
+        if let Err(e) = crate::session::store()
+            .batch_append(&self.agent_id, &messages)
+            .await
+        {
+            tracing::warn!(
+                agent_id = %self.agent_id,
+                error = %e,
+                "Failed to persist incoming messages to session DB — continuing without persistence",
+            );
+            // Still push to in-memory history so the model sees the messages
+            // this iteration, even if they won't survive a crash.
+        }
+
+        // Push to in-memory history
+        self.session.push_messages(&messages);
+
+        Ok(())
+    }
+
     /// Build a [`ChatRequest`] from the given messages and image-parts flag,
     /// using the agent's current model, tools, temperature, reasoning-effort,
     /// and provider-routing settings.
@@ -799,6 +877,7 @@ fn prepare_assistant_turn(response: ChatResponse) -> PreparedAssistantTurn {
 ///
 /// Returns `(agent, Some(response))` on success.
 /// Returns `(agent, None)` on cancellation (discard result) or error (already logged).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agent(
     agent_id: String,
     role: crate::Role,
@@ -807,9 +886,10 @@ pub(crate) async fn run_agent(
     message: &str,
     user_name: String,
     channel: String,
+    incoming_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>>,
 ) -> (Agent, Option<String>) {
     let mut agent = Agent::new(agent_id, role, ws, ticket.cloned(), user_name, channel);
-
+    agent.incoming_rx = incoming_rx;
     let result = agent.work(message).await;
 
     // Cancellation safety: if the token fired after work() completed but
@@ -909,6 +989,7 @@ mod tests {
             tool_stats: std::sync::Mutex::new(Vec::new()),
             user_name: String::new(),
             channel: String::new(),
+            incoming_rx: None,
         }
     }
 
@@ -1275,6 +1356,111 @@ mod tests {
             outcomes[0].output.contains("channel=gui"),
             "should propagate channel: {}",
             outcomes[0].output
+        );
+    }
+
+    // ── drain_incoming_messages tests ─────────────────────────────────
+
+    /// drain_incoming_messages injects TicketComment messages into the session
+    /// as user messages with the correct prefix.
+    #[tokio::test]
+    async fn test_drain_incoming_messages_injects_ticket_comment() {
+        crate::util::test::init_management_test_stores().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut agent = make_agent(vec![]);
+        agent.incoming_rx = Some(rx);
+        agent.agent_id = "_test_drain_ticket_comment".into();
+
+        // Send a TicketComment job
+        let job = crate::message_router::AgentJob {
+            content: "Please fix the formatting".to_string(),
+            workspace_name: "test_ws".to_string(),
+            user_name: "manager".to_string(),
+            channel: String::new(),
+            kind: crate::message_router::JobKind::TicketComment,
+            role: crate::Role::Manager,
+            reply_target: None,
+        };
+        let _ = tx.send(job);
+
+        agent
+            .drain_incoming_messages()
+            .await
+            .expect("drain should succeed");
+
+        let history = agent.session.history();
+        assert!(!history.is_empty(), "should have at least one message");
+        let last = history.last().unwrap();
+        assert_eq!(last.role, crate::ChatRole::User, "should be a user message");
+        assert!(
+            last.content.contains("Please fix the formatting"),
+            "should contain the comment content: {}",
+            last.content,
+        );
+        assert!(
+            last.content.contains("[Comment from manager on ticket]"),
+            "should include comment prefix: {}",
+            last.content,
+        );
+    }
+
+    /// drain_incoming_messages handles unregistered job kinds by passing
+    /// content through without prefix formatting.
+    #[tokio::test]
+    async fn test_drain_incoming_messages_non_comment() {
+        crate::util::test::init_management_test_stores().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut agent = make_agent(vec![]);
+        agent.incoming_rx = Some(rx);
+        agent.agent_id = "_test_drain_non_comment".into();
+
+        // Send a plain UserMessage job
+        let job = crate::message_router::AgentJob {
+            content: "Hello agent".to_string(),
+            workspace_name: "test_ws".to_string(),
+            user_name: "user".to_string(),
+            channel: String::new(),
+            kind: crate::message_router::JobKind::UserMessage,
+            role: crate::Role::Assistant,
+            reply_target: None,
+        };
+        let _ = tx.send(job);
+
+        agent
+            .drain_incoming_messages()
+            .await
+            .expect("drain should succeed");
+
+        let history = agent.session.history();
+        assert!(!history.is_empty(), "should have at least one message");
+        let last = history.last().unwrap();
+        assert!(
+            last.content.contains("Hello agent"),
+            "should contain the raw content: {}",
+            last.content,
+        );
+    }
+
+    /// drain_incoming_messages handles a closed receiver gracefully
+    /// (sets incoming_rx to None, returns Ok without error).
+    #[tokio::test]
+    async fn test_drain_incoming_messages_disconnected() {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::message_router::AgentJob>();
+        let mut agent = make_agent(vec![]);
+        agent.incoming_rx = Some(rx);
+        agent.agent_id = "_test_drain_disconnected".into();
+
+        // Drop the sender so the channel is disconnected
+        drop(_tx);
+
+        // Should not panic or error
+        agent
+            .drain_incoming_messages()
+            .await
+            .expect("drain should succeed on disconnected channel");
+        assert!(
+            agent.incoming_rx.is_none(),
+            "incoming_rx should be set to None after disconnect",
         );
     }
 }

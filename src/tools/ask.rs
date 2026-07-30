@@ -233,6 +233,7 @@ async fn run_parallel_analysts(ws: &Workspace, ask: &str, count: usize) -> Vec<O
                     &ask,
                     String::new(),
                     String::new(),
+                    None,
                 )
                 .await;
                 response

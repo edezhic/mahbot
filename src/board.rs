@@ -1340,6 +1340,24 @@ impl BoardStore {
         prepared.execute_no_cancel(&self.conn).await
     }
 
+    /// Set the assignee for a ticket **without** cancelling any running agent.
+    ///
+    /// This is the safe choice for parallel agent phases (analysis, review, QA)
+    /// where multiple agents are registered and should NOT be cancelled by the
+    /// assignment update.
+    pub async fn set_assigned_to_no_cancel(
+        &self,
+        ticket_id: &str,
+        assigned_to: Option<&str>,
+    ) -> Result<()> {
+        let prepared = Self::build_ticket_update_with_updated_at(
+            "assigned_to = ?",
+            vec![Value::from(assigned_to)],
+            ticket_id,
+        );
+        prepared.execute_no_cancel(&self.conn).await
+    }
+
     /// Transactional variant of [`set_assigned_to`](Self::set_assigned_to) —
     /// uses an existing transaction instead of opening its own.
     /// Does NOT cancel registered agents — the caller is responsible
@@ -1699,11 +1717,78 @@ impl BoardStore {
     }
 
     /// Add a comment to a ticket (append-only).
+    ///
+    /// After persisting the comment, routes it to any running agents assigned
+    /// to this ticket via the message router. If no agent is registered
+    /// (the agent finished before the comment arrived), the comment stays in
+    /// the DB and will be picked up by the next dispatch.
     pub async fn add_comment(&self, ticket_id: &str, role: &str, content: &str) -> Result<()> {
         crate::turso::with_tx(&self.conn, ticket_id, "add comment", async |tx| {
             Self::add_comment_tx(tx, ticket_id, role, content).await
         })
-        .await
+        .await?;
+
+        // Route the comment to any running agents assigned to this ticket.
+        self.route_comment_to_agents(ticket_id, role, content).await;
+
+        Ok(())
+    }
+
+    /// Route a newly-persisted comment to any running agents assigned to the ticket.
+    ///
+    /// Looks up the ticket's `assigned_to` field. If agents are assigned and
+    /// registered in the message router, the comment is delivered to each one.
+    /// This is best-effort — failures are logged but not propagated.
+    async fn route_comment_to_agents(&self, ticket_id: &str, role: &str, content: &str) {
+        // Fetch the ticket's assigned_to and workspace_name
+        let ticket = match self.get_ticket(ticket_id).await {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                warn!(ticket = %ticket_id, "Comment routing: ticket not found");
+                return;
+            }
+            Err(e) => {
+                warn!(ticket = %ticket_id, error = %e, "Comment routing: failed to fetch ticket");
+                return;
+            }
+        };
+
+        let Some(assigned_to) = ticket.assigned_to.as_ref() else {
+            return; // No agents assigned
+        };
+
+        for agent_id in assigned_to.split(',') {
+            let agent_id = agent_id.trim();
+            if agent_id.is_empty() {
+                continue;
+            }
+
+            // Use the commenter's role. If it doesn't parse as a standard Role
+            // (e.g. "engineer_1" from parallel-agent verdict comments), fall
+            // back to Manager. This fallback is safe: pipeline agents receive
+            // comments via try_route() → direct inbox delivery, NOT via the
+            // consumer loop. AgentJob.role is only used for response delivery
+            // in the consumer loop path, which pipeline agents never enter.
+            let commenter_role = role.parse::<crate::Role>().unwrap_or(crate::Role::Manager);
+
+            let job = crate::message_router::AgentJob {
+                content: content.to_string(),
+                workspace_name: ticket.workspace_name.clone(),
+                user_name: role.to_string(),
+                channel: String::new(),
+                kind: crate::message_router::JobKind::TicketComment,
+                role: commenter_role,
+                reply_target: None,
+            };
+
+            if crate::message_router::try_route(agent_id, job) {
+                debug!(
+                    ticket = %ticket_id,
+                    agent = %agent_id,
+                    "Routed comment to running agent",
+                );
+            }
+        }
     }
 
     /// Transactional variant of [`add_comment`](Self::add_comment) —
@@ -1711,6 +1796,14 @@ impl BoardStore {
     /// Does NOT commit or rollback; the caller controls outer transaction lifecycle.
     ///
     /// Inserts the comment record AND updates the ticket's `updated_at` timestamp.
+    ///
+    /// NOTE: Unlike [`add_comment`](Self::add_comment), this method does NOT route
+    /// the comment to running agents via the message router. All current callers
+    /// (verdict recording, system comments, failure reports) are post-agent phases
+    /// where no running agent exists to receive the comment. If adding a new caller
+    /// that runs mid-execution, use [`add_comment`](Self::add_comment) instead, or
+    /// call [`route_comment_to_agents`](Self::route_comment_to_agents) manually
+    /// after the transaction commits.
     pub(crate) async fn add_comment_tx(
         tx: &TxGuard<'_>,
         ticket_id: &str,

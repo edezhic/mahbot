@@ -53,6 +53,9 @@ pub enum JobKind {
     /// Result from an async AskTool sub-agent, injected back into the caller's
     /// agent session.
     AskToolResult,
+    /// Comment added to a ticket while an agent is working on it.
+    /// Delivered mid-work via the agent's inbox (not a consumer loop).
+    TicketComment,
 }
 
 /// A single unit of work for an agent consumer.
@@ -183,6 +186,57 @@ pub fn route(agent_id: &str, job: AgentJob) {
     guard.insert(agent_id.to_string(), tx);
 }
 
+/// Register an agent in the router table without spawning a consumer loop.
+///
+/// Returns a receiver that the caller (typically the agent's `llm_loop`)
+/// drains manually via `try_recv()`. The sender is stored in the router
+/// table so that [`try_route`] can deliver messages (e.g., ticket comments)
+/// to this agent mid-work.
+///
+/// Call [`unregister_agent`] when the agent's work finishes to remove the
+/// entry.
+pub fn register_agent(agent_id: &str) -> mpsc::UnboundedReceiver<AgentJob> {
+    let (tx, rx) = mpsc::unbounded_channel::<AgentJob>();
+    let map = ROUTER
+        .get()
+        .expect("ROUTER not initialised — call init_global() first");
+    let mut guard = map.write().unwrap_poison();
+    guard.insert(agent_id.to_string(), tx);
+    rx
+}
+
+/// Unregister an agent from the router table.
+///
+/// After this call, [`try_route`] returns `false` for this agent ID.
+/// Must be called when the agent's work loop finishes to remove the
+/// router entry. Safe to call even if the agent was never registered.
+pub fn unregister_agent(agent_id: &str) {
+    let Some(map) = ROUTER.get() else { return };
+    let mut guard = map.write().unwrap_poison();
+    guard.remove(agent_id);
+}
+
+/// Try to route a job to a previously registered agent.
+///
+/// Returns `true` if the agent was found and the job was delivered.
+/// Returns `false` if the agent is not registered — the caller can
+/// fall back to persisting the job in the DB for the next dispatch.
+///
+/// This does NOT spawn a consumer loop — it only sends to already-
+/// registered agents. This is the fast path for mid-work message
+/// delivery (e.g., ticket comments to running pipeline agents).
+pub fn try_route(agent_id: &str, job: AgentJob) -> bool {
+    let Some(map) = ROUTER.get() else {
+        return false;
+    };
+    let guard = map.read().unwrap_poison();
+    if let Some(tx) = guard.get(agent_id) {
+        tx.send(job).is_ok()
+    } else {
+        false
+    }
+}
+
 // ── Workspace resolution ───────────────────────────────────────────────────
 
 /// Resolve a workspace by name, with personal workspace fallback.
@@ -301,6 +355,10 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         broadcast_typing(&users, &job.workspace_name, true);
 
         // ── Ticket buffer drain (Manager only) ────────────────────────
+        // TicketComment jobs should NEVER reach the consumer loop — they are
+        // delivered directly via try_route() to agents that drain them in
+        // llm_loop. If one arrives here, someone used route() instead of
+        // try_route(), or the agent's receiver was dropped.
         let message = match (role, job.kind) {
             (Role::Manager, JobKind::UserMessage) => {
                 let drained = crate::ticket_buffer::drain(&job.workspace_name);
@@ -309,6 +367,13 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
                 } else {
                     format!("{drained}\n{content}", content = job.content)
                 }
+            }
+            (_, JobKind::TicketComment) => {
+                warn!(
+                    agent_id = %agent_id,
+                    "Consumer loop received TicketComment — was try_route() used instead of route()? Discarding",
+                );
+                continue;
             }
             _ => job.content.clone(),
         };
@@ -322,6 +387,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             &message,
             job.user_name.clone(),
             job.channel.clone(),
+            None,
         )
         .await;
 
@@ -1045,5 +1111,111 @@ mod tests {
         };
 
         deliver_manager_response("manager response", &[user], &job).await;
+    }
+
+    // ── register_agent / unregister_agent / try_route tests ────────────
+
+    /// `register_agent` creates a router entry that `try_route` can find.
+    #[tokio::test]
+    async fn test_register_agent_try_route_found() {
+        let _ = init_global();
+        let agent_id = "_test_register_agent_found";
+
+        let _rx = register_agent(agent_id);
+        let job = make_job(Role::Assistant, "hello", "user", "gui");
+        assert!(
+            try_route(agent_id, job),
+            "try_route should return true for a registered agent",
+        );
+
+        unregister_agent(agent_id);
+    }
+
+    /// `try_route` returns `false` when the agent is not registered.
+    #[tokio::test]
+    async fn test_try_route_agent_not_found() {
+        let _ = init_global();
+        let agent_id = "_test_try_route_not_found";
+
+        let job = make_job(Role::Assistant, "hello", "user", "gui");
+        assert!(
+            !try_route(agent_id, job),
+            "try_route should return false for an unregistered agent",
+        );
+    }
+
+    /// `try_route` returns `false` when the receiver has been dropped
+    /// (sender channel is closed).
+    #[tokio::test]
+    async fn test_try_route_receiver_dropped() {
+        let _ = init_global();
+        let agent_id = "_test_try_route_dropped";
+
+        // Register, create the receiver but immediately drop it.
+        let rx = register_agent(agent_id);
+        drop(rx);
+
+        let job = make_job(Role::Assistant, "hello", "user", "gui");
+        assert!(
+            !try_route(agent_id, job),
+            "try_route should return false when receiver is dropped",
+        );
+
+        unregister_agent(agent_id);
+    }
+
+    /// `unregister_agent` removes the entry so `try_route` returns `false`.
+    #[tokio::test]
+    async fn test_unregister_agent_removes_entry() {
+        let _ = init_global();
+        let agent_id = "_test_unregister_agent_removes";
+
+        let _rx = register_agent(agent_id);
+        unregister_agent(agent_id);
+
+        let job = make_job(Role::Assistant, "hello", "user", "gui");
+        assert!(
+            !try_route(agent_id, job),
+            "try_route should return false after unregister_agent",
+        );
+    }
+
+    /// Multiple agents can be registered simultaneously.
+    #[tokio::test]
+    async fn test_register_agent_multiple_agents() {
+        let _ = init_global();
+        let id_a = "_test_multi_a";
+        let id_b = "_test_multi_b";
+
+        let _rx_a = register_agent(id_a);
+        let _rx_b = register_agent(id_b);
+
+        assert!(try_route(id_a, make_job(Role::Assistant, "a", "u", "g")));
+        assert!(try_route(id_b, make_job(Role::Engineer, "b", "u", "g")));
+
+        unregister_agent(id_a);
+        unregister_agent(id_b);
+    }
+
+    /// `register_agent` replaces a stale entry without panicking.
+    #[tokio::test]
+    async fn test_register_agent_replaces_stale_entry() {
+        let _ = init_global();
+        let agent_id = "_test_replace_stale";
+
+        // First registration — drop receiver so it's stale.
+        let rx = register_agent(agent_id);
+        drop(rx);
+
+        // Second registration — should replace the stale sender.
+        let _rx2 = register_agent(agent_id);
+
+        let job = make_job(Role::Assistant, "hello", "user", "gui");
+        assert!(
+            try_route(agent_id, job),
+            "try_route should succeed after replacing stale entry",
+        );
+
+        unregister_agent(agent_id);
     }
 }
