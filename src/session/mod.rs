@@ -1044,9 +1044,43 @@ mod tests {
             "maintainer_ prefix should be excluded"
         );
     }
+
+    /// Empty messages are not appended by [`Session::init`].  Recovery retries
+    /// pass an empty message so the agent re-runs against the existing session
+    /// history without adding a new user turn.
+    #[tokio::test]
+    async fn session_init_empty_message_no_append() {
+        crate::util::test::init_test_stores().await;
+        let agent_id = unique_key();
+        let ws = crate::workspace::test_ws_named("/_test_empty_session_init", "empty_test");
+        let role = crate::Role::Assistant;
+
+        // First turn: init with a real message creates the session.
+        let mut session = Session::default();
+        session
+            .init(&agent_id, "hello", &ws, &role, None, "gui", "tester")
+            .await
+            .unwrap();
+        let len_after_real = session.history().len();
+        assert!(
+            len_after_real >= 2,
+            "real message should produce system prompt + user message (got {len_after_real})"
+        );
+
+        // Second turn: init with empty message should NOT append.
+        let mut session = Session::default();
+        session
+            .init(&agent_id, "", &ws, &role, None, "gui", "tester")
+            .await
+            .unwrap();
+        assert_eq!(
+            session.history().len(),
+            len_after_real,
+            "empty message must not append to session history",
+        );
+    }
 }
 
-/// Validate that the `session_key` → `agent_id` column rename migration works correctly:
 ///   1. Creates a database with the old schema (`session_key` columns)
 ///   2. Inserts sample rows via raw SQL
 ///   3. Opens via [`SessionStore`], which triggers migration in `after_open`

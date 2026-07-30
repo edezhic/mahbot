@@ -71,41 +71,47 @@ impl Session {
     ) -> Result<()> {
         // Load existing history from DB
         let mut history = crate::session::store().load(agent_id).await;
-        let is_new = history.is_empty();
 
-        if is_new {
-            let msgs = Self::build_turn_messages(msg, ws, role, ticket).await;
+        // Empty messages carry no semantic content — skip append in all paths.
+        // Recovery retries pass an empty message to re-trigger the agent
+        // against the existing session history without adding a new turn.
+        if !msg.is_empty() {
+            let is_new = history.is_empty();
 
-            // Batch-write all messages + session context atomically.
-            crate::session::store()
-                .batch_append_with_context(
-                    agent_id,
-                    &msgs,
-                    channel,
-                    user_name,
-                    &ws.name,
-                    role.as_str(),
-                )
-                .await?;
-            history.extend(msgs);
-        } else {
-            // Caching: system prompt is NOT rebuilt on subsequent turns
-            // (see doc comment above). The session DB caches the full
-            // first-turn message set. The only rebuild path is
-            // `apply_summary` below.
-            let user_msg = user_msg_with_datetime(msg);
-            // Append the user message and update session context atomically.
-            crate::session::store()
-                .append_with_context(
-                    agent_id,
-                    &user_msg,
-                    channel,
-                    user_name,
-                    &ws.name,
-                    role.as_str(),
-                )
-                .await?;
-            history.push(user_msg);
+            if is_new {
+                let msgs = Self::build_turn_messages(msg, ws, role, ticket).await;
+
+                // Batch-write all messages + session context atomically.
+                crate::session::store()
+                    .batch_append_with_context(
+                        agent_id,
+                        &msgs,
+                        channel,
+                        user_name,
+                        &ws.name,
+                        role.as_str(),
+                    )
+                    .await?;
+                history.extend(msgs);
+            } else {
+                // Caching: system prompt is NOT rebuilt on subsequent turns
+                // (see doc comment above). The session DB caches the full
+                // first-turn message set. The only rebuild path is
+                // `apply_summary` below.
+                let user_msg = user_msg_with_datetime(msg);
+                // Append the user message and update session context atomically.
+                crate::session::store()
+                    .append_with_context(
+                        agent_id,
+                        &user_msg,
+                        channel,
+                        user_name,
+                        &ws.name,
+                        role.as_str(),
+                    )
+                    .await?;
+                history.push(user_msg);
+            }
         }
         self.history = history;
 
@@ -167,7 +173,9 @@ impl Session {
         // Append conversation summary + current user request
         let prefix = load_prompt("summary_prefix.md");
         compacted.push(ChatMessage::system(format!("{prefix}{summary_text}")));
-        compacted.push(user_msg_with_datetime(msg));
+        if !msg.is_empty() {
+            compacted.push(user_msg_with_datetime(msg));
+        }
 
         // Persist compacted history (system prompt + summary only).
         // On success, update in-memory history to match. On failure, keep the

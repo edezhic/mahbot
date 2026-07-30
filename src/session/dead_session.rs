@@ -311,22 +311,17 @@ fn is_excluded_agent_id(agent_id: &str) -> bool {
 /// and validated that the role can be parsed.  The routing is fire-and-forget
 /// (sends on an mpsc channel).
 fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) {
-    // Continuation message telling the agent to retry its last turn.
-    // Routed as a `UserMessage` (not a system-level injection) so the
-    // agent processes this as a normal conversational turn — it sees the
-    // full history and is asked to continue.
-    let recovery_msg = "I'm retrying the last request because the previous \
-         response was interrupted or failed. Please review the conversation \
-         history above and provide a complete response. If you were in the \
-         middle of a multi-step task, continue from where you left off."
-        .to_string();
-
+    // Recovery retry: uses `RecoveryRetry` kind with empty content so the
+    // agent runs against the EXISTING session history (which already contains
+    // the user's original message).  No boilerplate message is injected, and
+    // no emoji error feedback is sent on retry failures — the emoji fires
+    // only once on the original failure.
     let job = AgentJob {
-        content: recovery_msg,
+        content: String::new(),
         workspace_name: ctx.workspace_name.clone(),
         user_name: ctx.user_name.clone(),
         channel: ctx.channel.clone(),
-        kind: JobKind::UserMessage,
+        kind: JobKind::RecoveryRetry,
         role,
         // reply_target is not available from session metadata — the recovery
         // response will be persisted to chat_history and broadcast via the

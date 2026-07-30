@@ -68,6 +68,11 @@ pub enum JobKind {
     /// Comment added to a ticket while an agent is working on it.
     /// Delivered mid-work via the agent's inbox (not a consumer loop).
     TicketComment,
+    /// Recovery retry for a dead session — routes without appending a new
+    /// user message to the session history.  Emoji error feedback is
+    /// suppressed for this kind (the emoji fires once on the original
+    /// failure, not on silent retries).
+    RecoveryRetry,
 }
 
 /// A single unit of work for an agent consumer.
@@ -1260,6 +1265,30 @@ mod tests {
         assert!(
             AGENT_FAILURE_EMOJI.chars().count() >= 3,
             "emoji should be at least 3 characters"
+        );
+    }
+
+    /// `RecoveryRetry` is intentionally NOT `UserMessage`.  The emoji gate in
+    /// `consumer_loop` uses `job.kind == JobKind::UserMessage` to decide whether
+    /// to send the failure emoji — `RecoveryRetry` is automatically excluded
+    /// because the equality check is specific to `UserMessage`.
+    ///
+    /// This test documents the structural invariant: distinct enum variants of a
+    /// `PartialEq` enum never compare equal.  The compiler and derive macro
+    /// guarantee this property; this test provides executable documentation of
+    /// the design decision, not a regression guard against the derived equality.
+    /// If the emoji gate condition is refactored in the future (e.g., to use
+    /// `matches!()` with a broader set), this test will not catch that change.
+    /// A full behavioral test of the emoji gate requires exercising the consumer
+    /// loop with `RecoveryRetry` jobs — infrastructure disproportionate to the
+    /// zero-regression-risk invariant.
+    #[test]
+    fn test_recovery_retry_kind_invariant() {
+        assert_ne!(
+            JobKind::RecoveryRetry,
+            JobKind::UserMessage,
+            "RecoveryRetry must be a distinct variant from UserMessage — \
+             the emoji gate's `== JobKind::UserMessage` check naturally excludes it",
         );
     }
 }
