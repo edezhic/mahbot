@@ -76,9 +76,16 @@ impl Session {
         if is_new {
             let msgs = Self::build_turn_messages(msg, ws, role, ticket).await;
 
-            // Batch-write all messages + metadata and use the same messages for in-memory history
+            // Batch-write all messages + session context atomically.
             crate::session::store()
-                .batch_append(agent_id, &msgs)
+                .batch_append_with_context(
+                    agent_id,
+                    &msgs,
+                    channel,
+                    user_name,
+                    &ws.name,
+                    role.as_str(),
+                )
                 .await?;
             history.extend(msgs);
         } else {
@@ -87,24 +94,24 @@ impl Session {
             // first-turn message set. The only rebuild path is
             // `apply_summary` below.
             let user_msg = user_msg_with_datetime(msg);
-            crate::session::store().append(agent_id, &user_msg).await?;
+            // Append the user message and update session context atomically.
+            crate::session::store()
+                .append_with_context(
+                    agent_id,
+                    &user_msg,
+                    channel,
+                    user_name,
+                    &ws.name,
+                    role.as_str(),
+                )
+                .await?;
             history.push(user_msg);
         }
         self.history = history;
 
-        // Store session context for dead-session recovery detection.
-        // On subsequent turns the same values are written — a harmless
-        // no-op because channel/user_name/workspace/role never change
-        // for a given agent_id.
-        //
-        // Note: this is a separate write after the message transaction
-        // above.  If the process crashes (self-update, OOM, SIGKILL) in
-        // between, the session has messages but no context — the
-        // dead-session poller cannot recover it.  This is a rare edge
-        // case accepted for simplicity (see `set_session_context` docs).
-        crate::session::store()
-            .set_session_context(agent_id, channel, user_name, &ws.name, role.as_str())
-            .await?;
+        // Session context (channel, user_name, workspace_name, role) was
+        // already persisted atomically alongside the messages above —
+        // no separate write needed.
 
         Ok(())
     }

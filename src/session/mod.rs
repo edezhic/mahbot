@@ -169,10 +169,16 @@ fn session_metadata_from_row(agent_id: &str, activity_str: &str, count: i64) -> 
 
 /// Insert messages into `sessions` and upsert `session_metadata` within an existing transaction.
 /// Shared helper used by [`SessionStore::append_messages`].
+///
+/// When `context` is `Some((channel, user_name, workspace_name, role))`, the context columns
+/// are set atomically alongside the messages — closing the atomicity gap described in
+/// [`SessionStore::set_session_context`].  This is the preferred path for new sessions
+/// and subsequent turns.
 async fn insert_messages_in_transaction(
     tx: &TxGuard<'_>,
     agent_id: &str,
     messages: &[ChatMessage],
+    context: Option<(&str, &str, &str, &str)>,
 ) -> Result<()> {
     let now = turso::now();
     for msg in messages {
@@ -187,14 +193,41 @@ async fn insert_messages_in_transaction(
         )
         .await?;
     }
-    tx.execute(
-        "INSERT INTO session_metadata (agent_id, created_at, last_activity) \
-         VALUES (?1, ?2, ?3) \
-         ON CONFLICT(agent_id) DO UPDATE SET \
-         last_activity = excluded.last_activity",
-        params![agent_id, now.clone(), now],
-    )
-    .await?;
+    match context {
+        Some((channel, user_name, workspace_name, role)) => {
+            tx.execute(
+                "INSERT INTO session_metadata (agent_id, created_at, last_activity, \
+                 channel, user_name, workspace_name, role) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(agent_id) DO UPDATE SET \
+                 last_activity = excluded.last_activity, \
+                 channel = excluded.channel, \
+                 user_name = excluded.user_name, \
+                 workspace_name = excluded.workspace_name, \
+                 role = excluded.role",
+                params![
+                    agent_id,
+                    now.clone(),
+                    now,
+                    channel,
+                    user_name,
+                    workspace_name,
+                    role,
+                ],
+            )
+            .await?;
+        }
+        None => {
+            tx.execute(
+                "INSERT INTO session_metadata (agent_id, created_at, last_activity) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(agent_id) DO UPDATE SET \
+                 last_activity = excluded.last_activity",
+                params![agent_id, now.clone(), now],
+            )
+            .await?;
+        }
+    }
     Ok(())
 }
 
@@ -268,6 +301,7 @@ impl SessionStore {
         agent_id: &str,
         messages: &[ChatMessage],
         replace: bool,
+        context: Option<(&str, &str, &str, &str)>,
     ) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
         if replace {
@@ -277,7 +311,7 @@ impl SessionStore {
             )
             .await?;
         }
-        insert_messages_in_transaction(&tx, agent_id, messages).await?;
+        insert_messages_in_transaction(&tx, agent_id, messages, context).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -287,7 +321,50 @@ impl SessionStore {
         agent_id: &str,
         messages: &[ChatMessage],
     ) -> Result<()> {
-        self.append_messages(agent_id, messages, false).await
+        self.append_messages(agent_id, messages, false, None).await
+    }
+
+    /// Like [`batch_append`], but also sets session context (`channel`,
+    /// `user_name`, `workspace_name`, `role`) in the same transaction as
+    /// the message insert, eliminating the atomicity gap between message
+    /// persistence and context persistence.
+    pub(crate) async fn batch_append_with_context(
+        &self,
+        agent_id: &str,
+        messages: &[ChatMessage],
+        channel: &str,
+        user_name: &str,
+        workspace_name: &str,
+        role: &str,
+    ) -> Result<()> {
+        self.append_messages(
+            agent_id,
+            messages,
+            false,
+            Some((channel, user_name, workspace_name, role)),
+        )
+        .await
+    }
+
+    /// Like [`append`], but also sets session context in the same transaction.
+    pub(crate) async fn append_with_context(
+        &self,
+        agent_id: &str,
+        message: &ChatMessage,
+        channel: &str,
+        user_name: &str,
+        workspace_name: &str,
+        role: &str,
+    ) -> Result<()> {
+        self.batch_append_with_context(
+            agent_id,
+            std::slice::from_ref(message),
+            channel,
+            user_name,
+            workspace_name,
+            role,
+        )
+        .await
     }
 
     pub(crate) async fn replace_messages(
@@ -295,7 +372,7 @@ impl SessionStore {
         agent_id: &str,
         messages: &[ChatMessage],
     ) -> Result<()> {
-        self.append_messages(agent_id, messages, true).await
+        self.append_messages(agent_id, messages, true, None).await
     }
 
     pub(crate) async fn delete(&self, agent_id: &str) -> Result<bool> {
@@ -411,22 +488,21 @@ impl SessionStore {
     /// poller.
     ///
     /// Uses an upsert so it works regardless of whether a metadata row already
-    /// exists — the context write is intentionally decoupled from the message
-    /// persistence path to avoid threading extra parameters through
-    /// `batch_append`/`append`.
-    ///
-    /// On subsequent calls (re-turns of the same session), the same values
-    /// are written again — functionally a no-op because the inputs are
-    /// unchanged.
+    /// exists.
     ///
     /// # Atomicity note
     ///
-    /// This runs as a separate query after the message-batch transaction in
-    /// `Session::init`.  If the process crashes (self-update, OOM, SIGKILL)
-    /// or the write fails after messages were committed, the session becomes
-    /// unrecoverable (messages exist but `get_session_context` returns
-    /// `None`).  This is accepted as a rare edge case — the window between
-    /// the two writes is extremely narrow.
+    /// Prefer [`batch_append_with_context`](SessionStore::batch_append_with_context)
+    /// or [`append_with_context`](SessionStore::append_with_context) when
+    /// setting context alongside message persistence — they write both in a
+    /// single transaction.  This standalone method is retained for external
+    /// callers that may need to set context independently of message insertion.
+    ///
+    /// When called separately from message persistence, a crash between the
+    /// message write and this method leaves the session with messages but no
+    /// context (unrecoverable by the dead-session poller).  This is a narrow
+    /// window and accepted for callers that cannot batch the write.
+    #[allow(dead_code)]
     pub(crate) async fn set_session_context(
         &self,
         agent_id: &str,

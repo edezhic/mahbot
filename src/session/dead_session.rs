@@ -35,6 +35,7 @@ use chrono::{DateTime, Utc};
 
 use crate::message_router::{AgentJob, JobKind};
 use crate::registry::AGENT_REGISTRY;
+use crate::session::SessionContext;
 use crate::session::TRANSIENT_AGENT_ID_PREFIXES;
 use crate::{ChatRole, Role};
 
@@ -243,25 +244,44 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
         }
 
         // ── Recover! ───────────────────────────────────────────────────
-        match attempt_recovery(agent_id).await {
-            Ok(()) => {
-                tracing::info!(
-                    agent_id = %agent_id,
-                    "Dead session recovery: recovery job routed"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    agent_id = %agent_id,
-                    error = %e,
-                    "Dead session recovery: attempt failed"
-                );
-            }
-        }
+        //
+        // Phase 1: retrieve session context and validate it.  Permanent
+        // data issues (missing context, invalid role) are non-recoverable —
+        // clean up the tracker entry and move on without consuming the
+        // retry budget.
+        let Some(ctx) = crate::session::store().get_session_context(agent_id).await else {
+            DEAD_SESSION_TRACKER.cleanup(agent_id);
+            tracing::warn!(
+                agent_id = %agent_id,
+                "Dead session recovery: no context found \
+                 (pre-migration session or corrupted data) — \
+                 skipping permanently"
+            );
+            continue;
+        };
 
-        // Every attempt counts toward the retry cap (regardless of outcome).
-        // Routing success ≠ recovery success — the agent executes
-        // asynchronously and may still fail (rate limits, API errors, etc.).
+        let Ok(role) = ctx.role.parse::<Role>() else {
+            DEAD_SESSION_TRACKER.cleanup(agent_id);
+            tracing::warn!(
+                agent_id = %agent_id,
+                role = %ctx.role,
+                "Dead session recovery: invalid role in session context — \
+                 skipping permanently"
+            );
+            continue;
+        };
+
+        // Phase 2: route the recovery job.  This is fire-and-forget
+        // (sends on an mpsc channel) — routing success ≠ recovery
+        // success.  The agent executes asynchronously and may still
+        // fail (rate limits, API errors, etc.), so we count every
+        // routed attempt against the retry cap.
+        //
+        // Failures in Phase 1 (missing context, invalid role) are NOT
+        // counted — they are permanent data issues that will never
+        // resolve with retries.
+        attempt_recovery(agent_id, &ctx, role);
+
         DEAD_SESSION_TRACKER.record_attempt(agent_id);
     }
 
@@ -283,21 +303,14 @@ fn is_excluded_agent_id(agent_id: &str) -> bool {
         .any(|p| agent_id.starts_with(p))
 }
 
-/// Construct and route a recovery job for a single dead session.
-async fn attempt_recovery(agent_id: &str) -> anyhow::Result<()> {
-    // Retrieve session context from the metadata table.
-    let ctx = crate::session::store()
-        .get_session_context(agent_id)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("No session context for {agent_id}"))?;
-
-    let role: Role = ctx.role.parse().map_err(|_| {
-        anyhow::anyhow!(
-            "Invalid role '{}' in session context for {agent_id}",
-            ctx.role
-        )
-    })?;
-
+/// Route a recovery job for a dead session with validated context.
+///
+/// # Preconditions
+///
+/// Caller must have already called [`get_session_context`](crate::session::SessionStore::get_session_context)
+/// and validated that the role can be parsed.  The routing is fire-and-forget
+/// (sends on an mpsc channel).
+fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) {
     // Continuation message telling the agent to retry its last turn.
     // Routed as a `UserMessage` (not a system-level injection) so the
     // agent processes this as a normal conversational turn — it sees the
@@ -332,8 +345,6 @@ async fn attempt_recovery(agent_id: &str) -> anyhow::Result<()> {
     );
 
     crate::message_router::route(agent_id, job);
-
-    Ok(())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
