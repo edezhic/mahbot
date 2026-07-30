@@ -3,8 +3,8 @@
 //! Implements a lightweight second-stage classifier that runs AFTER the
 //! Conv1D classifier fires, as an additional AND gate.
 //!
-//! Uses a **logistic regression** (mahbot-901): 97-parameter L2-regularized
-//! logistic regression on temporally mean-pooled 96-dim embeddings.
+//! Uses a **logistic regression** (mahbot-901): 97-parameter logistic regression on
+//! temporally mean-pooled 96-dim embeddings (L2 regularization removed in mahbot-994).
 //! Mean-pools the 3-frame window to 96-dim before L2-norm, scaler, and
 //! linear+sigmoid (~335× fewer parameters than the previous 3-layer MLP).
 //!
@@ -83,29 +83,40 @@ pub(crate) const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.948;
 
 /// L2 regularization strength (lambda).
 ///
-/// Reduced from 0.01 to 0.001 (mahbot-949) because the previous 0.01
-/// regularization pulled weights to zero, overpowering the weak discriminative
-/// signal in the homogeneous 96-dim embedding space.  The class-weighted loss
-/// already provides regularization, and the 97-parameter model on ~200 training
-/// examples does not overfit meaningfully.  The early stopping mechanism
-/// (patience=100) provides additional protection against overfitting.
-pub(crate) const L2_LAMBDA: f32 = 0.001;
+/// Set to 0.0 (disabled) as of mahbot-994.
+///
+/// ## Rationale
+///
+/// The convex logistic regression with 97 parameters is trained on thousands of
+/// examples with multiple orthogonal forms of regularization:
+///
+/// - **Early stopping** (patience=100 on validation loss) stops training before
+///   overfitting can occur.
+/// - **Class weighting** (mahbot-993) ensures balanced gradient signal without
+///   needing additional penalties.
+/// - **Tier-based example weighting** (Ambient=1×, Unrelated=10×,
+///   Confusable=15×) provides per-example importance without global shrinkage.
+/// - **L2-normalized input features** and **StandardScaler conditioning**
+///   bound the feature magnitudes, limiting weight growth indirectly.
+///
+/// Previously set to 0.001 (mahbot-949) after the original 0.01 was found
+/// to collapse weights to zero.  However, at convergence the BCE gradient
+/// approaches zero while the L2 gradient (λ·w) is always present, continuing to
+/// shrink weights post-convergence even with λ=0.001.  With plain SGD (no
+/// adaptive optimizer), L2 is significantly stronger than the same λ with
+/// Adam (used by the Conv1D classifier at λ=0.0001).
+///
+/// Empirical testing confirmed that removing L2 entirely (λ=0) allows the
+/// corrected gradient signals from the dynamic class_weight formula to operate
+/// without competing weight decay, producing non-zero weights and a bias that
+/// is not forced to extreme negative values.
+pub(crate) const L2_LAMBDA: f32 = 0.0;
 
 /// Learning rate for logistic regression SGD training (mahbot-901).
 ///
 /// Higher than MLP's LEARNING_RATE (0.001 tuned for Adam) because logistic
 /// regression with plain SGD on a convex surface benefits from larger step
 /// sizes.  Tested at lr=0.01 against the HARD-tier benchmark.
-///
-/// ## Interaction with class_weight (mahbot-993)
-///
-/// The dynamic class_weight formula (`Σ(neg_window_weights) / n_pos_windows`)
-/// increases positive-sample gradient magnitude by ~13× vs the old raw-count
-/// ratio when per-tier weights are active.  This approximately doubles the
-/// total gradient per batch (~1.86×).  If the benchmark shows training
-/// oscillation, reduce LR proportionally to ~0.005.  Conversely, the L2
-/// regularisation (L2_LAMBDA=0.001) becomes relatively ~1.86× weaker vs the
-/// data term — if scores saturate near 0 or 1, increase L2 slightly.
 pub(crate) const LOGISTIC_LEARNING_RATE: f32 = 0.01;
 
 /// Maximum iterations for logistic regression training.
@@ -1392,8 +1403,9 @@ fn compute_weighted_bce_loss(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Train a logistic regression classifier on scaled 96-dim features using SGD
-/// with L2 regularization (mahbot-901).
-/// The cross-entropy loss with L2 penalty and sample weighting is:
+/// (mahbot-901).  Accepts an L2 regularization parameter (typically 0.0 after
+/// mahbot-994; previously 0.001).
+/// The cross-entropy loss with optional L2 penalty and sample weighting is:
 /// ```text
 /// J = -(1/N) Σ w_i · [y_i·log(σ_i) + (1-y_i)·log(1-σ_i)] + (λ/2)·||w||²
 /// ```
@@ -1938,7 +1950,7 @@ mod tests {
             &[neg_seq],
             None,                       // no per-negative weights
             DEFAULT_VERIFIER_THRESHOLD, // mahbot-853: lowered from 0.6 for streaming inference.
-            L2_LAMBDA,                  // L2 regularization (mahbot-949: reduced to 0.001)
+            L2_LAMBDA,                  // L2 regularization (disabled: λ=0.0 since mahbot-994)
             Some(42),                   // deterministic seed for reproducibility
         );
 
@@ -2451,6 +2463,19 @@ mod tests {
                 "weights[{j}] is not finite; training diverged"
             );
         }
+
+        // With L2_LAMBDA=0.0 and easily separable synthetic data, weights must
+        // stay within reasonable magnitudes (no divergence from unregularized SGD).
+        for (j, &w) in weights.iter().enumerate() {
+            assert!(
+                w.abs() < 100.0,
+                "weights[{j}] magnitude {w:.2} exceeds 100; unregularized SGD diverged",
+            );
+        }
+        assert!(
+            bias.abs() < 100.0,
+            "bias magnitude {bias:.2} exceeds 100; unregularized SGD diverged",
+        );
 
         // Predict on held-out frames and verify discrimination.
         let held_out_pos: Vec<f32> = make_positive_frame(&mut rng2);
