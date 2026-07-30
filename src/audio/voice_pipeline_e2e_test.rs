@@ -801,6 +801,26 @@ fn feed_audio(samples: &[f32], ctx: &mut super::PipelineCtx) {
 /// - If the warm-up noise triggered a false detection, a `warn!()` is emitted and
 ///   the detection state is restored to prevent cooldown from corrupting subsequent
 ///   benchmark measurements (mahbot-922).
+///
+/// ## Residue clearing (mahbot-1003)
+///
+/// After feeding warm-up audio, this function clears warm-up residues that would
+/// otherwise contaminate the subsequent test utterance's detection pipeline:
+///
+/// - **`mel_frame_buffer`** — cleared so the first stride-8 windows contain only
+///   test utterance mel frames, not warm-up remnants + test audio mixed together.
+/// - **`next_window_start`** — reset to 0 so embedding extraction starts from the
+///   first test-utterance mel frame.
+/// - **`score_window`** — cleared so warm-up classifier scores cannot create a
+///   premature candidate on the first test embedding.
+/// - **`candidate`** — cleared to discard any bounded classifier candidate that
+///   may have formed after the warm-up embeddings exceeded
+///   [`VERIFIER_WARMUP_EMBEDDINGS`].
+///
+/// **Preserved**: `embedding_ring` (keeps warm-up embeddings so
+/// [`is_warmup_period`](crate::audio::voice_verifier::VoiceVerifier) returns
+/// `false` and detections are not suppressed), `adaptive_threshold` (preserves
+/// warm-up-adapted state), `audio_preprocessor` (AGC remains warmed up).
 fn consume_warmup(ctx: &mut super::PipelineCtx) {
     let before_embeddings = ctx.embedding_ring.len();
     let before_detection = ctx.last_wake_word_detection;
@@ -844,6 +864,33 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
         ctx.last_wake_word_detection = before_detection;
         ctx.is_recording = false;
     }
+
+    // ── Clear warm-up residues before test utterance processing (mahbot-1003) ──
+    // Warm-up audio produces mel frames, classifier scores, and may create a
+    // bounded classifier candidate.  These residues must be cleared so the
+    // test utterance starts with a clean detection slate.  Specifically:
+    //
+    // 1. Mel frame contamination — the first stride-8 windows would span
+    //    warm-up remnants + test audio, producing mixed-content embeddings
+    //    that score poorly and fall below NO_MATCH_RESET_THRESHOLD, clearing
+    //    the score window before clean test embeddings arrive.
+    //
+    // 2. Premature candidate — preserved warm-up classifier scores may create
+    //    a candidate on the first test embedding, consuming test frames without
+    //    verifier confirmation, then expiring before enough clean frames
+    //    remain to re-trigger.
+    //
+    // 3. Candidate from warm-up — a candidate may have formed after the
+    //    warm-up embeddings exceeded VERIFIER_WARMUP_EMBEDDINGS.  Without
+    //    clearing it, the candidate would consume test utterance frames
+    //    during its update lifecycle.
+    //
+    // embedding_ring is preserved so is_warmup_period returns false for test
+    // utterances — the verifier has context and detections are NOT suppressed.
+    ctx.mel_frame_buffer.clear();
+    ctx.next_window_start = 0;
+    ctx.score_window.clear();
+    ctx.candidate = None;
 }
 
 // ── Prerequisite check ─────────────────────────────────────────────────────
