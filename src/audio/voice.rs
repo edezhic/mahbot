@@ -1586,38 +1586,6 @@ pub(crate) fn score_single_embedding(
         None => false,
     };
 
-    // ── Score window reset at warm-up→active transition (mahbot-899) ──
-    // When the verifier transitions from warm-up to active (embedding
-    // ring just reached VERIFIER_WARMUP_EMBEDDINGS), clear the score
-    // window so that no classifier scores from the warm-up period
-    // (where the verifier was not consulted) carry into the first
-    // verifier-gated candidate.  This ensures the first candidate after
-    // warm-up is built entirely from verifier-evaluated embeddings.
-    //
-    // NOTE: The window MAY be empty at this point if all warm-up frames
-    // had total_score < NO_MATCH_RESET_THRESHOLD (0.316), causing
-    // process_wake_word_score to clear it each frame.  clear() on an
-    // empty Vec is a no-op, so the guard is unconditional — we always
-    // reset, and the effect is identical either way.
-    //
-    // DESIGN — Verifier/classifier asymmetry: The verifier evaluates
-    // stride-1 windows across the ring buffer, which still contains the
-    // warm-up embeddings.  This is intentional — the verifier measures
-    // acoustic similarity independently of classifier scores, so it can
-    // meaningfully evaluate all embeddings in the ring.  Only the
-    // classifier's score window is cleared, preventing unverified
-    // classifier scores from accelerating the rolling sum.
-    if let Some(v) = verifier
-        && v.is_trained()
-        && embedding_ring.len() == VERIFIER_WARMUP_EMBEDDINGS
-    {
-        debug!(
-            "Reset score_window at verifier warm-up transition: had {} scores",
-            score_window.len(),
-        );
-        score_window.clear();
-    }
-
     // ── Rolling window gate (mahbot-773) ─────────────────────────────
     let (mut detected, rolling_sum) =
         process_wake_word_score(total_score, score_window, adaptive_override);
@@ -1703,12 +1671,13 @@ pub(crate) fn score_single_embedding(
     // warm-up period (embedding_ring.len() < VERIFIER_WARMUP_EMBEDDINGS
     // with a trained verifier).  No detection is ever reported during
     // warm-up, regardless of classifier score, threshold, or rolling
-    // sum.  The rolling score window accumulates warm-up scores, but is
-    // cleared at the warm-up→active transition (mahbot-899) so that
-    // the first candidate after warm-up starts with a clean window
-    // built entirely from verifier-evaluated embeddings.  No candidate
-    // is created during warm-up — candidates only start after warm-up
-    // ends, ensuring the verifier has enough context from the start.
+    // sum.  With mahbot-1002, warm-up scores are preserved through the
+    // warm-up→active transition (the old mahbot-899 clear was removed),
+    // giving the rolling sum a head start from warm-up accumulation.
+    // This enables earlier detection on short utterances without
+    // compromising the verifier gate.  No candidate is created during
+    // warm-up — candidates only start after warm-up ends, ensuring the
+    // verifier has enough context from the start.
     //
     // Safety (mahbot-893): Per-frame benchmark analysis shows that no
     // genuine wake word variant crosses the classifier threshold during
@@ -7282,6 +7251,22 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
             let Some(models) = ONNX_MODELS.get() else {
                 return;
             };
+
+            // ── Blinded gap recovery (mahbot-1002) ──
+            // After warm-up or any pipeline action that advances next_window_start
+            // past the leading edge of real audio, the main stride-8 loop may be
+            // unable to fire because next_window_start + EMBEDDING_WINDOW_FRAMES
+            // > buffer_len.  When the buffer has enough frames, reset
+            // next_window_start to the leading edge so extraction from the new
+            // utterance can proceed immediately, eliminating the ~68-frame blind
+            // spot that previously caused 0% detection on test utterances
+            // following warm-up.
+            if ctx.next_window_start + EMBEDDING_WINDOW_FRAMES > mel_frame_buffer.len()
+                && mel_frame_buffer.len() >= EMBEDDING_WINDOW_FRAMES
+            {
+                ctx.next_window_start = mel_frame_buffer.len() - EMBEDDING_WINDOW_FRAMES;
+            }
+
             // Iterate from next_window_start with stride 8.
             while ctx.next_window_start + EMBEDDING_WINDOW_FRAMES <= mel_frame_buffer.len() {
                 let window = &mel_frame_buffer
@@ -7324,13 +7309,11 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
             //  c) Blinded gap: after exhausting a short buffer (e.g., 67 frames),
             //     next_window_start advances to ~72, creating a ~68-frame blind
             //     spot where neither the main loop (needs 148+ frames) nor the
-            //     fallback (< 76 frames) extracts embeddings.  This gap is ~17x
-            //     larger than the old code's ~4-frame gap.  Safe because all
-            //     wake word content was processed in the first call and
-            //     subsequent frames are silence or a new utterance.  The blind
-            //     spot ends when the buffer reaches 148+ frames and the main
-            //     loop resumes, re-processing only the tail (padded frames
-            //     that score near-zero).
+            //     fallback (< 76 frames) extracts embeddings.  This is resolved
+            //     by mahbot-1002's blinded gap recovery (inserted before the main
+            //     stride-8 loop) which resets next_window_start to the leading
+            //     edge when the buffer has >= EMBEDDING_WINDOW_FRAMES frames but
+            //     next_window_start is too far ahead.
             if ctx.next_window_start < mel_frame_buffer.len()
                 && mel_frame_buffer.len() < EMBEDDING_WINDOW_FRAMES
             {
@@ -10089,10 +10072,11 @@ mod tests {
         );
 
         // 4th embedding: warm-up is over (ring.len() >= 4).  The score
-        // window was just reset (mahbot-899) to clear scores accumulated
-        // during warm-up, so the rolling sum (0.80) is below the detection
-        // threshold (2.13) — detection is blocked by low rolling sum, not
-        // the verifier gate.
+        // window accumulates all warm-up scores (mahbot-1002 removed the
+        // old mahbot-899 clear), so the rolling sum (3 × 0.80 = 2.40 after
+        // ROLLING_WINDOW_N=3 trimming) is above threshold — detection is
+        // blocked by the verifier gate (verifier_always_reject), not the
+        // rolling sum.
         let (detected, rolling_sum, _, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
@@ -10105,30 +10089,30 @@ mod tests {
         );
         assert!(
             !detected,
-            "4th embedding should have rolling sum too low after warm-up reset; \
+            "4th embedding should be blocked by verifier, not rolling sum; \
              rolling_sum={rolling_sum:.4}",
         );
-        // Verify the score window was cleared at the transition: only the
-        // current frame's score should be present (mahbot-899).
+        // The score window was NOT cleared at the warm-up→active transition
+        // (mahbot-1002), and is capped at ROLLING_WINDOW_N=3.  After 4
+        // embeddings the oldest score was evicted, keeping the 3 most recent.
         assert_eq!(
             score_window.len(),
-            1,
-            "score window should have been reset and now contain only the 4th embedding's score",
+            3,
+            "score window should have 3 scores (capped at ROLLING_WINDOW_N)",
         );
-        let reset_rolling_sum: f32 = score_window.iter().sum();
+        let post_warmup_rolling_sum: f32 = score_window.iter().sum();
         assert!(
-            (reset_rolling_sum - 0.80).abs() < 0.01,
-            "rolling sum after reset should be ~0.80 (current frame only), got {reset_rolling_sum:.4}",
+            (post_warmup_rolling_sum - 2.40).abs() < 0.01,
+            "rolling sum should be ~2.40 (3 × 0.80), got {post_warmup_rolling_sum:.4}",
         );
     }
 
     #[test]
-    fn score_window_reset_at_warmup_transition() {
-        // Verify that the score window is cleared at the verifier
-        // warm-up→active transition (embedding_ring.len() ==
-        // VERIFIER_WARMUP_EMBEDDINGS with a trained verifier), and
-        // that only verifier-evaluated frames contribute to the
-        // rolling sum after the reset (mahbot-899).
+    fn score_window_preserved_across_warmup_transition() {
+        // Verify that the score window is NOT cleared at the verifier
+        // warm-up→active transition (mahbot-1002 removed the old mahbot-899
+        // clear).  Warm-up classifier scores accumulate normally through
+        // the transition, giving the rolling sum a head start.
         let classifier = classifier_always_score(0.55);
         let verifier = verifier_always_reject();
         let emb = vec![0.5; EMBEDDING_DIM];
@@ -10149,7 +10133,6 @@ mod tests {
                 None,
             );
             assert!(!detected, "warm-up should suppress detection at {i}");
-            // After the 3rd warm-up embedding, window should have 3 scores.
             if i == 2 {
                 assert_eq!(score_window.len(), 3, "warm-up window should have 3 scores");
             }
@@ -10161,8 +10144,8 @@ mod tests {
         );
 
         // ── Embedding 4: warm-up→active transition ──────────────────
-        // Score window should be reset (cleared) then receive the
-        // current frame's score.
+        // Score window should NOT be cleared (mahbot-1002).  All 4 scores
+        // should remain: the 3 warm-up scores plus the current frame.
         let (detected, _, _, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
@@ -10175,23 +10158,22 @@ mod tests {
         );
         assert!(
             !detected,
-            "no detection at transition (rolling sum too low)"
+            "no detection at transition (blocked by verifier)"
         );
         assert_eq!(
             score_window.len(),
-            1,
-            "score window should be reset to 1 score at transition",
+            3,
+            "score window should have 3 scores (capped at ROLLING_WINDOW_N=3)",
         );
         let transition_rolling_sum: f32 = score_window.iter().sum();
         assert!(
-            (transition_rolling_sum - 0.55).abs() < 0.01,
-            "rolling sum after transition reset should be ~0.55 (current frame only), \
+            (transition_rolling_sum - 1.65).abs() < 0.01,
+            "rolling sum after transition should be ~1.65 (3 × 0.55), \
              got {transition_rolling_sum:.4}",
         );
 
         // ── Embedding 5: fully active (no more resets) ──────────────
-        // The window should grow normally with only verifier-evaluated
-        // frames — no warm-up scores leak through.
+        // The window should remain at ROLLING_WINDOW_N=3, no clearing.
         let (detected, _, _, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
@@ -10204,18 +10186,18 @@ mod tests {
         );
         assert!(
             !detected,
-            "no detection at embedding 5 (rolling sum still too low)"
+            "no detection at embedding 5 (blocked by verifier)"
         );
         assert_eq!(
             score_window.len(),
-            2,
-            "score window should have 2 verifier-evaluated scores",
+            3,
+            "score window should still have 3 scores (capped at ROLLING_WINDOW_N)",
         );
-        let post_reset_sum: f32 = score_window.iter().sum();
+        let post_transition_sum: f32 = score_window.iter().sum();
         assert!(
-            (post_reset_sum - 1.10).abs() < 0.01,
-            "rolling sum after reset should be 1.10 (2 × 0.55, no warm-up leakage), \
-             got {post_reset_sum:.4}",
+            (post_transition_sum - 1.65).abs() < 0.01,
+            "rolling sum after embedding 5 should be 1.65 (3 × 0.55), \
+             got {post_transition_sum:.4}",
         );
     }
 
@@ -10316,37 +10298,10 @@ mod tests {
             "ring should have 3 embeddings after warm-up feeds"
         );
 
-        // ── Embeddings 4-5: post-warm-up score accumulation ────────
-        // The score window was reset at the warm-up→active transition
-        // (mahbot-899), so the first 2 post-warm-up frames do not yet
-        // cross the threshold (0.80 + 0.80 = 1.60 < 2.13).
-        for i in 0..2 {
-            let (detected, _, _, _, _, _) = score_single_embedding(
-                &emb,
-                &mut ring,
-                Some(&classifier),
-                Some(&verifier),
-                &mut score_window,
-                None,
-                ADAPTIVE_K_DEFAULT,
-                Some(&mut candidate),
-            );
-            assert!(
-                !detected,
-                "no detection at embedding {} (score still building)",
-                4 + i
-            );
-            assert!(
-                candidate.is_none(),
-                "no candidate should exist while rolling sum below threshold at embedding {}",
-                4 + i,
-            );
-        }
-
-        // ── Embedding 6: first threshold crossing, candidate creation ──
-        // Rolling sum (3 × 0.50 = 1.50 >= 1.35) triggers the first
-        // detection after warm-up.  Candidate is created with verifier
-        // peak ~0.12 (reject).
+        // ── Embedding 4: warm-up→active transition, threshold crossing ──
+        // With warm-up scores preserved (mahbot-1002), the rolling sum is
+        // 4 × 0.80 = 3.20 >= 2.13, so the threshold is crossed immediately
+        // after warm-up.  Candidate is created with verifier peak ~0.12 (reject).
         let (detected, _, _, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
@@ -10363,7 +10318,7 @@ mod tests {
         );
         let c = candidate
             .as_ref()
-            .expect("candidate should exist after first threshold crossing");
+            .expect("candidate should exist after first threshold crossing at embedding 4");
         assert_eq!(
             c.embedding_count, 1,
             "candidate should have count=1 on creation"
@@ -10373,7 +10328,7 @@ mod tests {
             "verifier peak should be below threshold (reject verifier)"
         );
 
-        // ── Embeddings 7-8: candidate accumulation ─────────────────
+        // ── Embeddings 5-6: candidate accumulation ─────────────────
         // Each frame updates peak and increments count.  Verifier never
         // confirms (peak stays below threshold).
         for _ in 0..CANDIDATE_MAX_EMBEDDINGS - 2 {
@@ -10397,7 +10352,7 @@ mod tests {
             );
         }
 
-        // ── Embedding 9: expiry ─────────────────────────────────
+        // ── Embedding 7: expiry ─────────────────────────────────
         // The (CANDIDATE_MAX_EMBEDDINGS)th update returns expired=true,
         // clearing the candidate.
         let count_before_expiry = candidate.as_ref().map(|c| c.embedding_count);
@@ -10450,9 +10405,9 @@ mod tests {
     fn bounded_candidate_confirms_detection() {
         // Verifies that the bounded candidate model correctly fires
         // detection when the verifier score exceeds the threshold.
-        // With verifier_always_accept (~0.88 > 0.948), the candidate
-        // should confirm on creation at embedding 6 (post-warm-up,
-        // after score window reset rebuilds the rolling sum).
+        // With warm-up scores preserved (mahbot-1002), the rolling sum
+        // crosses the threshold at the warm-up→active transition on
+        // embedding 4, so the candidate confirms immediately.
         let classifier = classifier_always_score(0.8);
         let verifier = verifier_always_accept();
         let emb = vec![0.5; EMBEDDING_DIM];
@@ -10476,34 +10431,9 @@ mod tests {
             assert!(candidate.is_none(), "no candidate during warm-up at {i}");
         }
 
-        // ── Embeddings 4-5: score accumulation after reset ────────
-        // The score window was reset at the warm-up→active transition,
-        // so the first 2 post-warm-up frames don't have enough rolling
-        // sum to cross the threshold.
-        for i in 0..2 {
-            let (detected, _, _, _, _, _) = score_single_embedding(
-                &emb,
-                &mut ring,
-                Some(&classifier),
-                Some(&verifier),
-                &mut score_window,
-                None,
-                ADAPTIVE_K_DEFAULT,
-                Some(&mut candidate),
-            );
-            assert!(
-                !detected,
-                "no detection at embedding {} (score still building)",
-                4 + i
-            );
-            assert!(
-                candidate.is_none(),
-                "no candidate at embedding {} (below threshold)",
-                4 + i,
-            );
-        }
-
-        // ── Embedding 6: detection should fire ────────────────────
+        // ── Embedding 4: threshold crossing → detection ────────────
+        // Warm-up scores (3 × 0.80) plus current frame = rolling sum 3.20
+        // >= 2.13.  Verifier accepts, so detection fires immediately.
         let (detected, _, _, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
@@ -10516,7 +10446,7 @@ mod tests {
         );
         assert!(
             detected,
-            "bounded candidate should confirm when verifier peak >= threshold (embedding 6)"
+            "bounded candidate should confirm at embedding 4 (warm-up scores preserved)"
         );
         // Candidate should still be populated (the lifecycle returns
         // (true, ...) without clearing the candidate, so the caller
