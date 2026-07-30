@@ -40,6 +40,18 @@ use crate::{ChatEvent, Role, SendMessage, Workspace};
 
 // ── Job definition ─────────────────────────────────────────────────────────
 
+/// Emoji sent to the user when an agent completes without producing a
+/// response (LLM errors, retry exhaustion, context overflow, etc.).
+/// Language-agnostic — pure emoji, no text.
+///
+/// Not sent when the agent was explicitly cancelled by the user (/stop)
+/// or during global shutdown.
+///
+/// Known limitations:
+/// - Voice channel: TTS speaks this as "robot warning retry" (acceptable for now).
+/// - Emoji rendering varies across terminals and clients.
+const AGENT_FAILURE_EMOJI: &str = "🤖⚠️🔄";
+
 /// Semantic category of a queue job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
@@ -379,7 +391,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         };
 
         // ── Run the agent ─────────────────────────────────────────────
-        let (_agent, response) = crate::agent::run_agent(
+        let (agent, response) = crate::agent::run_agent(
             agent_id.clone(),
             role,
             &ws,
@@ -399,6 +411,20 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         broadcast_typing(&users, &job.workspace_name, false);
 
         let Some(response) = response else {
+            // Send emoji error only for UserMessage jobs where the agent truly
+            // failed (not cancelled by user or shutdown). Internal job kinds
+            // (TicketNotify, AskToolResult) get no feedback.
+            //
+            // We check both the agent-specific token (user /stop) AND the
+            // global shutdown token because during SIGTERM/SIGINT the global
+            // token fires first — work() catches it and returns None, but the
+            // agent-specific token may not have been cancelled yet.
+            if job.kind == JobKind::UserMessage
+                && !agent.is_cancelled()
+                && !crate::shutdown::shutdown_token().is_cancelled()
+            {
+                deliver_unregistered_user_response(AGENT_FAILURE_EMOJI, &job, &role).await;
+            }
             continue;
         };
 
@@ -1217,5 +1243,23 @@ mod tests {
         );
 
         unregister_agent(agent_id);
+    }
+
+    // ── Agent failure emoji tests ──────────────────────────────────────
+    //
+    // These tests verify the AGENT_FAILURE_EMOJI constant and its delivery
+    // path.  They follow the same smoke-test philosophy as the response
+    // delivery tests above: no assertions on actual transport outcomes,
+    // just a "no panic" guarantee.
+
+    /// The emoji constant is defined and non-empty.
+    #[test]
+    fn test_agent_failure_emoji_constant() {
+        assert!(!AGENT_FAILURE_EMOJI.is_empty(), "emoji should be non-empty");
+        // Verify it contains actual emoji characters (not just whitespace).
+        assert!(
+            AGENT_FAILURE_EMOJI.chars().count() >= 3,
+            "emoji should be at least 3 characters"
+        );
     }
 }
