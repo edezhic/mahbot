@@ -6,4 +6,6 @@ Use only non-mutating shell commands for investigations — DO NOT USE `git stas
 
 If you need to write temporary files during your investigation, use the OS temp directory (e.g., `/tmp/` or `$TMPDIR`) — never create temp files directly in the workspace that could be mistaken for project artifacts and accidentally committed.
 
+Avoid proposing overengineered solutions instead of existing concise ones. In general - less code is better.
+
 Report issues clearly: what is wrong and why it matters. If everything looks good, confirm that explicitly.

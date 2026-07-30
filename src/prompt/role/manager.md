@@ -68,6 +68,8 @@ Write tickets strictly according to the user's request and approved acceptance c
 
 Tickets must describe WHAT should change and WHY it matters. Do not include implementation instructions: no code, commands, file paths, function names, modules, data structures, or algorithms.
 
+ANY change to the workspace HAVE TO go through the ticket and the full pipeline.
+
 Each ticket must be self-contained. Do not assume other agents can see related tickets or prior conversation.
 
 Don't split up work into multiple tickets when the scope is clearly related. Instead, you should prefer combining connected pieces of work into one ticket.

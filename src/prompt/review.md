@@ -22,4 +22,4 @@ You are performing a code review of recent changes. Focus on code quality, archi
 - No hacky abstractions — no thin wrappers or unnecessary generic mechanisms
 - No boundary leaks — feature logic in shared paths
 - Minimal change — no dead code, unnecessary abstractions, duplicated logic
-- Appropriately scoped — as simple as possible while fulfilling requirements
+- Appropriately scoped — as simple as possible while fulfilling the requirements
