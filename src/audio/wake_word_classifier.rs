@@ -515,15 +515,45 @@ impl Default for TrainingConfig {
 fn build_windows(sequences: &[EmbeddingSequence]) -> Vec<Vec<f32>> {
     let mut windows = Vec::new();
     for seq in sequences {
-        if seq.embeddings.len() < WINDOW_SIZE {
+        if seq.embeddings.is_empty() {
             continue;
         }
-        for i in 0..=(seq.embeddings.len() - WINDOW_SIZE) {
-            let mut w = Vec::with_capacity(INPUT_DIM);
-            for j in 0..WINDOW_SIZE {
-                w.extend_from_slice(&seq.embeddings[i + j]);
+        if seq.embeddings.len() >= WINDOW_SIZE {
+            // Normal sliding windows over consecutive embeddings.
+            for i in 0..=(seq.embeddings.len() - WINDOW_SIZE) {
+                let mut w = Vec::with_capacity(INPUT_DIM);
+                for j in 0..WINDOW_SIZE {
+                    w.extend_from_slice(&seq.embeddings[i + j]);
+                }
+                windows.push(w);
             }
-            windows.push(w);
+        } else {
+            // Short sequence (< WINDOW_SIZE embeddings): simulate the
+            // streaming cold-start ring-buffer accumulation (mahbot-1001 Fix 4).
+            //
+            // Streaming inference in score_single_embedding builds the classifier
+            // window by tiling the current ring buffer with repeat-last:
+            //   window[j] = ring[min(j, ring.len() - 1)]
+            //
+            // As each new embedding arrives, the ring grows from [e0] to [e0, e1]
+            // and produces windows that are never seen during normal sliding-window
+            // training.  Without matching these in training, the Conv1D classifier
+            // receives out-of-distribution windows at cold-start and correctly
+            // rejects them with near-zero sigmoid scores.
+            //
+            // For a sequence of N embeddings (N < WINDOW_SIZE), simulate the
+            // ring state after each step k (0 ≤ k < N):
+            //   ring = embeddings[0..=k]  (k+1 entries piled up)
+            //   last = k
+            //   window[j] = embeddings[min(j, k)]
+            for k in 0..seq.embeddings.len() {
+                let mut w = Vec::with_capacity(INPUT_DIM);
+                for j in 0..WINDOW_SIZE {
+                    let src_idx = j.min(k);
+                    w.extend_from_slice(&seq.embeddings[src_idx]);
+                }
+                windows.push(w);
+            }
         }
     }
     windows
@@ -1176,16 +1206,19 @@ mod tests {
         // Empty array produces no windows.
         assert!(build_windows(&[]).is_empty());
 
-        // Short array (< WINDOW_SIZE embeddings) produces no windows.
+        // Short array (< WINDOW_SIZE embeddings) produces tiled windows
+        // matching streaming inference behavior (mahbot-1001 Fix 4).
+        // 2 embeddings → 2 tiled windows: [e0, e0, e0] and [e0, e1, e1]
         let short_embs: Vec<Vec<f32>> = (0..2).map(|i| vec![i as f32; EMBEDDING_DIM]).collect();
         let short_seq = make_seq(short_embs, LabelStratum::Positive);
-        assert!(build_windows(&[short_seq]).is_empty());
+        assert_eq!(build_windows(&[short_seq]).len(), 2);
     }
 
     #[test]
     fn test_build_windows_sequences_no_cross() {
-        // Two sequences each shorter than WINDOW_SIZE → 0 windows
-        // (no cross-sequence combination allowed).
+        // Two sequences each shorter than WINDOW_SIZE → each produces
+        // tiled windows (no cross-sequence combination).  2 embeddings
+        // each → 2 + 2 = 4 tiled windows.
         let embs1: Vec<Vec<f32>> = (0..2).map(|i| vec![i as f32; EMBEDDING_DIM]).collect();
         let embs2: Vec<Vec<f32>> = (0..2)
             .map(|i| vec![(i + 10) as f32; EMBEDDING_DIM])
@@ -1194,7 +1227,10 @@ mod tests {
             make_seq(embs1, LabelStratum::Positive),
             make_seq(embs2, LabelStratum::Positive),
         ];
-        assert!(build_windows(&seqs).is_empty());
+        assert!(
+            !build_windows(&seqs).is_empty(),
+            "short sequences now produce tiled windows (mahbot-1001)"
+        );
 
         // Two sequences each exactly WINDOW_SIZE → 2 windows (1 per sequence).
         let embs3: Vec<Vec<f32>> = (0..WINDOW_SIZE)

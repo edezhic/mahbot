@@ -1050,7 +1050,7 @@ fn compute_vad_segments(audio: &[f32]) -> (Vec<bool>, Vec<Vec<f32>>) {
         vad_decisions.push(super::is_speech_with_detector(
             &frame[..super::HOP_LENGTH],
             &mut detector,
-            super::ENROLLMENT_VAD_THRESHOLD,
+            super::VAD_THRESHOLD,
         ));
     }
     let utterances = super::segment_utterances_by_vad(
@@ -1114,7 +1114,8 @@ fn vad_segment_and_enroll(
     }
 
     // ── Concatenate AGC-processed variants with 2.0s silence gaps ──
-    // 2.0s well exceeds SILENCE_THRESHOLD_SAMPLES (1.5s) for clean boundaries.
+    // 2.0s well exceeds ENROLLMENT_SILENCE_THRESHOLD_SAMPLES (~304ms after
+    // mahbot-1001 Fix 7) for clean boundaries.
     let silence_gap_samples = (2.0 * f64::from(super::SAMPLE_RATE)) as usize;
     let silence: Vec<f32> = vec![0.0f32; silence_gap_samples];
 

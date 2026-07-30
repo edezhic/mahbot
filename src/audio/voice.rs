@@ -125,6 +125,19 @@ pub(crate) const SILENCE_DURATION: Duration = Duration::from_millis(1500);
 pub(crate) const SILENCE_THRESHOLD_SAMPLES: usize =
     (SILENCE_DURATION.as_millis() as usize * SAMPLE_RATE as usize) / 1000;
 
+/// Enrollment/segmentation silence threshold (~304ms = 19 hops × 256 samples).
+/// Aligned to streaming detection's [`SEGMENT_TIMEOUT_HOPS`] so that utterance
+/// boundaries are detected consistently between training and inference
+/// (mahbot-1001 Fix 7).  Previously used [`SILENCE_THRESHOLD_SAMPLES`] (~1.5s),
+/// which meant utterances with pauses were segmented differently between
+/// enrollment training and streaming inference, contributing to out-of-
+/// distribution classifier inputs.
+///
+/// The longer [`SILENCE_THRESHOLD_SAMPLES`] is preserved for command recording
+/// (`handle_recording_audio`) where 1.5s is appropriate for natural command
+/// phrasing pauses.
+pub(crate) const ENROLLMENT_SILENCE_THRESHOLD_SAMPLES: usize = SEGMENT_TIMEOUT_HOPS * HOP_LENGTH;
+
 /// Silence threshold (200ms) before showing "Keep silent to confirm…" UI hint.
 /// Intentionally wider than a single frame (16ms) so the UI reliably transitions
 /// even under scheduling jitter.
@@ -376,11 +389,18 @@ const ENROLLMENT_PROMPTS: &[(&str, usize)] = &[
 /// phonemes that the enrollment VAD threshold excludes.
 pub(crate) const RAW_RING_MAX: usize = SAMPLE_RATE as usize / 5;
 
-/// Context padding duration in milliseconds for VAD asymmetry mitigation
-/// (mahbot-775 Fix 3).  Used to prepend ~100ms of pre-VAD-trigger context
-/// and append ~100ms of post-speech context to enrollment utterances, so
-/// the template includes the onset/offset phonemes that enrollment
-/// VAD excludes but live detection (VAD=0.5) includes.
+/// Context padding duration in milliseconds (~100ms at 16 kHz).
+///
+/// Used for PCM augmentation duration estimation in speed-perturbation
+/// decisions (e.g., `pre_pad_samples = samples.len() - 2 * CONTEXT_PADDING_SAMPLES`
+/// in [`handle_enrollment_sample`] and [`prewarm_phrase_embeddings`]).
+///
+/// ⚠ Context padding is no longer used for VAD utterance segmentation
+/// (mahbot-1001 Fix 3).  The VAD threshold is now unified to 0.5 for both
+/// enrollment and streaming, so the asymmetry that context padding was
+/// designed to mitigate (0.60 enrollment threshold vs 0.50 detection
+/// threshold) no longer exists.  The [`DEFAULT_VAD_SEGMENTATION_CONFIG`]
+/// sets `context_padding_samples: 0`.
 const CONTEXT_PADDING_MS: usize = 100;
 
 /// Context padding in audio samples at 16 kHz, derived from
@@ -1847,16 +1867,22 @@ pub(crate) fn score_single_embedding(
     )
 }
 
-// Higher VAD threshold for enrollment: only clear, close-mic speech should
-/// pass during enrollment to prevent ambient noise (traffic, wind) from
-/// contaminating the template (mahbot-772).  The detection VAD threshold
-/// stays at 0.5 for responsiveness.
-pub(crate) const ENROLLMENT_VAD_THRESHOLD: f32 = 0.60;
+/// VAD threshold: scores >= this are considered speech.
+/// Unified to 0.5 for both enrollment and streaming detection (mahbot-1001).
+/// Previously enrollment used `ENROLLMENT_VAD_THRESHOLD = 0.60`, causing a
+/// systematic training/inference mismatch: frames scoring 0.50–0.59 were
+/// included in streaming but never seen during enrollment training.
+/// The Conv1D classifier had no representation of these acoustic patterns,
+/// resulting in a 0.0% detection rate during streaming (mahbot-1001 Fix 1).
+const VAD_THRESHOLD: f32 = 0.5;
 
 /// Minimum consecutive VAD-positive frames before setting utterance_had_speech
-/// during enrollment (~48ms at 16ms/frame).  Prevents a single noise spike
-/// from starting utterance accumulation (mahbot-772).
-pub(crate) const ENROLLMENT_VAD_CONSECUTIVE_REQUIRED: usize = 3;
+/// during enrollment (~0ms at 16ms/frame).  Set to 1 to match streaming
+/// detection behavior, which starts accumulating at the first VAD-positive
+/// frame (mahbot-1001 Fix 2).  Previously was 3, which meant enrollment
+/// consumed VAD decisions differently from streaming, producing misaligned
+/// utterance boundaries and embedding window positions.
+pub(crate) const ENROLLMENT_VAD_CONSECUTIVE_REQUIRED: usize = 1;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Neural VAD (Earshot) — replaces RMS-based `is_speech`
@@ -1869,10 +1895,7 @@ pub(crate) const ENROLLMENT_VAD_CONSECUTIVE_REQUIRED: usize = 3;
 /// Created once in [`init_global`].
 static VAD_DETECTOR: OnceLock<std::sync::Mutex<earshot::Detector>> = OnceLock::new();
 
-/// Earshot VAD threshold: scores >= this are considered speech.
-/// The default (0.5) works well across environments.
-const VAD_THRESHOLD: f32 = 0.5;
-
+// VAD_THRESHOLD is defined above with a unified doc comment (mahbot-1001).
 // ═══════════════════════════════════════════════════════════════════════════
 // Model loading state machine
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3870,13 +3893,15 @@ pub(crate) struct VadSegmentationConfig {
     /// Frame stride in samples (typically [`HOP_LENGTH`] = 256).
     hop_length: usize,
     /// Min consecutive VAD-positive frames to confirm sustained speech
-    /// (typically [`ENROLLMENT_VAD_CONSECUTIVE_REQUIRED`] = 3).
+    /// (typically [`ENROLLMENT_VAD_CONSECUTIVE_REQUIRED`] = 1 after mahbot-1001).
     consecutive_required: usize,
     /// Silence duration in samples before utterance ends
-    /// (typically [`SILENCE_THRESHOLD_SAMPLES`] = 24 000 ≈ 1.5 s).
+    /// (typically [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] = 4 864 ≈ 304 ms
+    /// after mahbot-1001 Fix 7, aligned to streaming's segment timeout).
     silence_threshold_samples: usize,
     /// Samples of pre/post speech context to include
-    /// (typically [`CONTEXT_PADDING_SAMPLES`] = 1 600 ≈ 100 ms).
+    /// (0 after mahbot-1001 — enrollment now matches streaming detection
+    /// by not adding context padding).
     context_padding_samples: usize,
     /// Max samples in the internal raw-audio ring buffer
     /// (typically [`RAW_RING_MAX`] = 3 200 ≈ 200 ms).
@@ -3885,12 +3910,22 @@ pub(crate) struct VadSegmentationConfig {
 
 /// Module-level default config for [`segment_utterances_by_vad`] using the
 /// standard voice-pipeline constants.
+///
+/// Context padding is intentionally 0 to match the streaming detection path,
+/// which does not add context padding (mahbot-1001 Fix 3).  Previously the
+/// padding (~100ms) caused the embedding windows during enrollment training
+/// to include ambient audio before the VAD onset, creating a temporal
+/// misalignment with streaming inference where embeddings start at the first
+/// VAD-positive frame without prepended context.
+///
+/// Silence threshold uses [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] (~304ms)
+/// aligned to streaming detection's [`SEGMENT_TIMEOUT_HOPS`] (mahbot-1001 Fix 7).
 pub(crate) const DEFAULT_VAD_SEGMENTATION_CONFIG: VadSegmentationConfig = VadSegmentationConfig {
     frame_length: FRAME_LENGTH,
     hop_length: HOP_LENGTH,
     consecutive_required: ENROLLMENT_VAD_CONSECUTIVE_REQUIRED,
-    silence_threshold_samples: SILENCE_THRESHOLD_SAMPLES,
-    context_padding_samples: CONTEXT_PADDING_SAMPLES,
+    silence_threshold_samples: ENROLLMENT_SILENCE_THRESHOLD_SAMPLES,
+    context_padding_samples: 0,
     raw_ring_max: RAW_RING_MAX,
 };
 
@@ -3907,13 +3942,16 @@ pub(crate) const DEFAULT_VAD_SEGMENTATION_CONFIG: VadSegmentationConfig = VadSeg
 /// 1. For each frame (stride = `config.hop_length`), check the VAD decision.
 /// 2. VAD-positive frames accumulate into the current utterance.
 /// 3. `config.consecutive_required` consecutive VAD-positive frames confirm
-///    **sustained speech**.  On this transition the function prepends
-///    pre-speech context (~100 ms) from the raw-audio ring buffer to capture
-///    onset phonemes excluded by a strict VAD threshold.
+///    **sustained speech**.  On this transition the function may prepend
+///    pre-speech context from the raw-audio ring buffer (if
+///    `config.context_padding_samples > 0`) to capture onset phonemes
+///    excluded by a strict VAD threshold.  Post-mahbot-1001 the default
+///    config sets `context_padding_samples: 0` so both enrollment and
+///    streaming start at VAD onset with matching temporal alignment.
 /// 4. After speech, `config.silence_threshold_samples` of consecutive
-///    VAD-negative audio ends the utterance.  Post-speech context (~100 ms)
-///    is appended from the raw-audio ring (captured at the first silence
-///    frame).
+///    VAD-negative audio ends the utterance.  Post-speech context (if
+///    `config.context_padding_samples > 0`) is optionally appended from
+///    the raw-audio ring (captured at the first silence frame).
 /// 5. The complete utterance is emitted and internal state resets for the
 ///    next utterance.
 ///
@@ -3931,7 +3969,8 @@ pub(crate) const DEFAULT_VAD_SEGMENTATION_CONFIG: VadSegmentationConfig = VadSeg
 ///
 /// A list of utterance segments (raw audio samples, **not** VAD-subsampled),
 /// in order of detection.  Each segment includes pre- and post-speech context
-/// padding.  Empty if no utterances were detected.
+/// padding (if `config.context_padding_samples > 0`).  Empty if no utterances
+/// were detected.
 ///
 /// # Panics
 ///
@@ -4614,15 +4653,30 @@ pub(crate) struct PipelineCtx {
     /// and show a "speak louder" warning (mahbot-765).
     enrollment_no_speech_frame_count: usize,
     /// Consecutive VAD-positive frame counter for enrollment sustained-speech
-    /// confirmation (mahbot-772).  Accumulation only starts after this reaches
-    /// [`ENROLLMENT_VAD_CONSECUTIVE_REQUIRED`] to reject single noise spikes.
+    /// confirmation (mahbot-772).  After mahbot-1001, accumulation starts on
+    /// the first VAD-positive frame ([`ENROLLMENT_VAD_CONSECUTIVE_REQUIRED`] = 1),
+    /// matching streaming detection's first-positive behavior.
     vad_positives_in_a_row: usize,
-    /// VAD threshold for the current mode.  Set to [`VAD_THRESHOLD`] for
-    /// detection/recording and [`ENROLLMENT_VAD_THRESHOLD`] for enrollment
-    /// (mahbot-772).  Stored in the context so tests can use [`VAD_THRESHOLD`]
-    /// without needing the synthetic test signal to score above the
-    /// enrollment VAD threshold.
+    /// VAD threshold for the current mode.  Unified to [`VAD_THRESHOLD`] for
+    /// both detection and enrollment (mahbot-1001).  Previously used separate
+    /// thresholds (0.60 for enrollment, 0.50 for detection), which caused the
+    /// Conv1D classifier to receive out-of-distribution inputs during
+    /// streaming inference (frames scoring 0.50–0.59 were included during
+    /// detection but never seen during enrollment training).
     vad_threshold: f32,
+    /// Separate Earshot VAD detector instance for enrollment mode (mahbot-1001 Fix 6).
+    ///
+    /// The streaming detection path uses the global [`VAD_DETECTOR`] singleton
+    /// to maintain continuous noise-floor and ring-buffer state across the
+    /// live microphone stream.  Enrollment mode uses its own detector instance
+    /// to prevent mode-transition state contamination: when enrollment ends and
+    /// streaming resumes, the global detector's state remains uncontaminated by
+    /// enrollment's VAD decisions (which previously used a different threshold).
+    ///
+    /// Initialised to `None` outside enrollment.  Set to
+    /// `Some(earshot::Detector::default())` when enrollment starts and cleared
+    /// to `None` when enrollment ends or is cancelled.
+    enrollment_vad: Option<earshot::Detector>,
     audio_buffer: Vec<f32>,
     mel_frame_buffer: Vec<Vec<f32>>,
     embedding_ring: Vec<Vec<f32>>,
@@ -4664,7 +4718,8 @@ pub(crate) struct PipelineCtx {
     /// with `audio_buffer` (used by enrollment Phase 2) to avoid interference.
     phase3_audio_buf: Vec<f32>,
     /// Silence tracking for Phase 3 chunk boundary detection.  Uses
-    /// [`SILENCE_THRESHOLD_SAMPLES`] (same constant as utterance end in Phase 2)
+    /// [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] (same constant as enrollment
+    /// utterance end, aligned to streaming's segment timeout — mahbot-1001 Fix 7)
     /// to detect chunk boundaries — see the constant definition for coupling docs.
     phase3_silence_samples: usize,
     /// Accumulated VAD-positive speech samples collected during Phase 3.
@@ -4806,6 +4861,7 @@ impl PipelineCtx {
             negatives_speech_samples: 0,
             phase3_start_time: None,
             vad_threshold: VAD_THRESHOLD,
+            enrollment_vad: None,
             pre_agc_ring: Vec::new(),
             audio_preprocessor: {
                 use crate::audio::audio_preprocessor::PreprocessorConfig;
@@ -4850,6 +4906,7 @@ impl PipelineCtx {
     /// | `silence_sample_count`, `segment_silence_hops` | = 0 | = 0 | = 0 |
     /// | `utterance_had_speech`, `utterance_silence_samples`, `enrollment_no_speech_frame_count`, `vad_positives_in_a_row`, `emitted_utterances`, `enrollment_pending`, `noise_rms_estimate` | cleared | cleared | cleared |
     /// | `vad_threshold` | `VAD_THRESHOLD` | preserved | `VAD_THRESHOLD` |
+    /// | `enrollment_vad` | `None` | `None` | `None` |
     /// | `last_wake_word_detection` | `None` | preserved | `None` |
     /// | `auto_start_pending` | `false` | preserved | preserved |
     /// | `is_recording` | `false` | preserved | preserved |
@@ -4887,6 +4944,11 @@ impl PipelineCtx {
         self.phase3_silence_samples = 0;
         self.negatives_speech_samples = 0;
         self.phase3_start_time = None;
+
+        // ── Enrollment VAD detector (cleared by all levels) ──
+        // Separate VAD instance prevents state contamination between
+        // enrollment and streaming modes (mahbot-1001 Fix 6).
+        self.enrollment_vad = None;
 
         match level {
             ResetLevel::Full => {
@@ -5015,6 +5077,18 @@ impl PipelineCtx {
         // ── Reset stride-8 window position so the next utterance ──
         // starts from the first mel frame (mahbot-923).
         self.next_window_start = 0;
+
+        // ── Reset AGC state (mahbot-1001 Fix 5) ──
+        // Reset the AudioPreprocessor so that each detection segment starts with
+        // a fresh AGC state, matching the training distribution (confusable/
+        // unrelated embeddings are also processed through fresh AudioPreprocessor
+        // instances in prewarm_phrase_embeddings).  Without this reset, the
+        // Conv1D classifier could exploit AGC adaptation state as a spurious
+        // feature: enrollment positives use the room-adapted persistent AGC
+        // while confusable negatives use a fresh TTS-adapted AGC, creating a
+        // distribution shift that produces near-zero sigmoid scores during
+        // streaming inference.
+        self.audio_preprocessor.reset();
     }
 
     /// Handle the segment boundary check at the end of a detection call
@@ -5188,11 +5262,9 @@ impl PipelineCtx {
             .enrolled_utterance_count;
 
         if existing_utterances == 0 {
-            // Cancel-level reset: clears all audio buffers, enrollment
-            // accumulators, global enrollment state, and resets the
-            // utterance counter, but preserves VAD/NS continuity (same
-            // mic stream, same acoustic environment).
-            // vad_threshold will be set to ENROLLMENT_VAD_THRESHOLD below.
+            // vad_threshold stays at VAD_THRESHOLD after unification
+            // (mahbot-1001 Fix 1).  Previously set to ENROLLMENT_VAD_THRESHOLD
+            // here, but that created a training/inference mismatch.
             self.reset_pipeline_state(ResetLevel::Cancel);
         } else {
             info!(
@@ -5208,7 +5280,15 @@ impl PipelineCtx {
         voice_state().write().unwrap_poison().enrolling_phrase = Some(normalized);
 
         self.enrollment_mode = true;
-        self.vad_threshold = ENROLLMENT_VAD_THRESHOLD;
+        // Initialize a separate VAD detector for this enrollment session
+        // to prevent state contamination between enrollment and streaming
+        // modes (mahbot-1001 Fix 6).
+        self.enrollment_vad = Some(earshot::Detector::default());
+        // vad_threshold is intentionally NOT changed here — it stays at
+        // VAD_THRESHOLD (0.5) for both enrollment and streaming detection
+        // (mahbot-1001 Fix 1).  Previously used ENROLLMENT_VAD_THRESHOLD
+        // (0.60), which caused frames scoring 0.50-0.59 to be included in
+        // streaming but never seen during enrollment training.
         set_status(VoiceStatus::Enrolling {
             sample: existing_utterances,
             total: NUM_ENROLLMENT_SAMPLES,
@@ -5237,13 +5317,13 @@ impl PipelineCtx {
     /// to Phase 3 (owner-negative general speech collection, mahbot-913).
     ///
     /// Called by the main loop when `utterances_collected` is true and
-    /// `collecting_negatives` is false.  Switches VAD threshold to the more
-    /// inclusive [`VAD_THRESHOLD`], drains any stale enrollment pending queue,
-    /// clears the negative audio buffer and silence counters, and sets the
-    /// Phase 3 state flags.
+    /// `collecting_negatives` is false.  VAD threshold is already unified to
+    /// [`VAD_THRESHOLD`] (mahbot-1001 Fix 1), so no threshold switch occurs.
+    /// Drains any stale enrollment pending queue, clears the negative audio
+    /// buffer and silence counters, and sets the Phase 3 state flags.
     fn transition_to_phase3(&mut self) {
-        // Switch VAD threshold to more inclusive detection (0.50 vs 0.60).
-        self.vad_threshold = VAD_THRESHOLD;
+        // VAD threshold is already unified to VAD_THRESHOLD (0.5) — no longer
+        // toggled between enrollment and detection (mahbot-1001 Fix 1).
 
         // Drain any stale enrollment_pending queue (should be empty, but be safe).
         if !self.enrollment_pending.is_empty() {
@@ -7376,8 +7456,9 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
 /// by the extracted function into utterances, mirroring the detection pipeline
 /// ([`handle_wake_word_detection`]). This eliminates the asymmetry where
 /// enrollment built templates on audio that the detector never processes.
-/// Utterance end is detected after [`SILENCE_THRESHOLD_SAMPLES`] consecutive
-/// non-VAD-positive frames, matching the detection-side behavior.
+/// Utterance end is detected after [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`]
+/// consecutive non-VAD-positive frames (~304ms), matching the detection-side
+/// segment timeout (mahbot-1001 Fix 7).
 ///
 /// If no speech has been detected for a prolonged period (~5s), a warning
 /// status is set to prompt the user to speak louder or move closer to the mic.
@@ -7413,7 +7494,15 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
         // and feature context (mahbot-900).  This must match the VAD call
         // pattern in process_streaming_frames_inner to maintain train-
         // inference consistency across the detection and enrollment paths.
-        let is_speech = is_speech_with_threshold(&frame[..HOP_LENGTH], ctx.vad_threshold);
+        //
+        // Uses the context-specific enrollment VAD detector (mahbot-1001 Fix 6)
+        // to prevent mode-transition state contamination.  Falls back to the
+        // global detector if the enrollment VAD is not initialized (defensive).
+        let is_speech = if let Some(ref mut det) = ctx.enrollment_vad {
+            is_speech_with_detector(&frame[..HOP_LENGTH], det, ctx.vad_threshold)
+        } else {
+            is_speech_with_threshold(&frame[..HOP_LENGTH], ctx.vad_threshold)
+        };
         ctx.frame_vad.push(is_speech);
 
         if is_speech {
@@ -7522,7 +7611,7 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                 // for silence" status for one frame (mahbot-823).
                 let silence_ui_check = ctx.utterance_silence_samples;
 
-                if ctx.utterance_silence_samples >= SILENCE_THRESHOLD_SAMPLES {
+                if ctx.utterance_silence_samples >= ENROLLMENT_SILENCE_THRESHOLD_SAMPLES {
                     ctx.utterance_had_speech = false;
                     ctx.utterance_silence_samples = 0;
                     ctx.enrollment_no_speech_frame_count = 0;
@@ -7633,8 +7722,9 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
 /// `enrollment_no_speech_frame_count` (no-speech warnings suppressed during
 /// Phase 3).
 ///
-/// Uses [`SILENCE_THRESHOLD_SAMPLES`] for chunk boundary detection — same
-/// constant as utterance end in Phase 2 (see coupling doc at the constant).
+/// Uses [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] for chunk boundary detection —
+/// aligned to streaming's segment timeout (mahbot-1001 Fix 7), same constant
+/// as enrollment utterance end.
 ///
 /// Audio chunks are finalized into `voice_state().owner_negative_chunks` (not
 /// `PipelineCtx` — matches ambient negative pattern and survives mic resets).
@@ -7653,7 +7743,11 @@ fn handle_negative_collection_audio(samples: &[f32], ctx: &mut PipelineCtx) {
     let mut segment_start: usize = 0;
     while consumed + FRAME_LENGTH <= len {
         let frame = &ctx.phase3_audio_buf[consumed..consumed + FRAME_LENGTH];
-        let is_speech = is_speech_with_threshold(&frame[..HOP_LENGTH], ctx.vad_threshold);
+        let is_speech = if let Some(ref mut det) = ctx.enrollment_vad {
+            is_speech_with_detector(&frame[..HOP_LENGTH], det, ctx.vad_threshold)
+        } else {
+            is_speech_with_threshold(&frame[..HOP_LENGTH], ctx.vad_threshold)
+        };
         // ── SHARED-VAD-LOOP-END ──
 
         if is_speech {
@@ -7663,9 +7757,10 @@ fn handle_negative_collection_audio(samples: &[f32], ctx: &mut PipelineCtx) {
             ctx.phase3_silence_samples = 0;
         } else {
             ctx.phase3_silence_samples += HOP_LENGTH;
-            // Check for chunk boundary: when silence exceeds SILENCE_THRESHOLD_SAMPLES
-            // after sustained speech, finalize the current segment as a chunk.
-            if ctx.phase3_silence_samples >= SILENCE_THRESHOLD_SAMPLES {
+            // Check for chunk boundary: when silence exceeds ENROLLMENT_SILENCE_THRESHOLD_SAMPLES
+            // (aligned to streaming's ~304ms, mahbot-1001 Fix 7) after sustained speech,
+            // finalize the current segment as a chunk.
+            if ctx.phase3_silence_samples >= ENROLLMENT_SILENCE_THRESHOLD_SAMPLES {
                 let chunk_end = consumed.saturating_sub(ctx.phase3_silence_samples);
                 if chunk_end > segment_start {
                     let chunk = ctx.phase3_audio_buf[segment_start..chunk_end].to_vec();
@@ -7722,13 +7817,15 @@ mod tests {
 
     /// Test config with a shorter silence threshold (10 frames ≈ 2560 samples
     /// instead of the default 94 frames ≈ 24000 samples) so tests don't need
-    /// prohibitively long audio buffers.
+    /// prohibitively long audio buffers.  Context padding is 0 per mahbot-1001
+    /// Fix 3 — matches streaming detection which does not prepend/append
+    /// context padding.
     const TEST_VAD_CONFIG: VadSegmentationConfig = VadSegmentationConfig {
         frame_length: FRAME_LENGTH,
         hop_length: HOP_LENGTH,
         consecutive_required: ENROLLMENT_VAD_CONSECUTIVE_REQUIRED,
         silence_threshold_samples: HOP_LENGTH * 10, // 2560 samples ≈ 10 frames
-        context_padding_samples: CONTEXT_PADDING_SAMPLES,
+        context_padding_samples: 0,
         raw_ring_max: RAW_RING_MAX,
     };
 
@@ -7751,7 +7848,7 @@ mod tests {
 
     #[test]
     fn segment_single_utterance_detected() {
-        // 4 speech frames (≥3 consecutive → sustained) + 10 silence frames (≥10 → threshold).
+        // 4 speech frames (≥1 consecutive → sustained immediately) + 10 silence frames (≥10 → threshold).
         let audio = audio_for_frames(14);
         let mut vad = vec![true; 4];
         vad.extend(vec![false; 10]);
@@ -7762,8 +7859,8 @@ mod tests {
             "sustained speech + silence → 1 utterance"
         );
         assert!(
-            utterances[0].len() >= CONTEXT_PADDING_SAMPLES,
-            "utterance should include pre-speech context padding"
+            utterances[0].len() > 0,
+            "utterance should contain audio samples"
         );
     }
 
@@ -7779,25 +7876,8 @@ mod tests {
         let utterances = segment_utterances_by_vad(&audio, &vad, &TEST_VAD_CONFIG);
         assert_eq!(utterances.len(), 2, "two speech segments → two utterances");
         for (i, utt) in utterances.iter().enumerate() {
-            assert!(
-                utt.len() >= CONTEXT_PADDING_SAMPLES,
-                "utterance {i} should include context padding"
-            );
+            assert!(utt.len() > 0, "utterance {i} should contain audio samples");
         }
-    }
-
-    #[test]
-    fn segment_short_burst_not_sustained() {
-        // 2 speech frames (fewer than consecutive_required = 3) → no sustained speech.
-        let n_frames = 10;
-        let audio = audio_for_frames(n_frames);
-        let mut vad = vec![true; 2];
-        vad.extend(vec![false; 8]);
-        let utterances = segment_utterances_by_vad(&audio, &vad, &TEST_VAD_CONFIG);
-        assert!(
-            utterances.is_empty(),
-            "short burst below consecutive_required → no utterance",
-        );
     }
 
     #[test]
