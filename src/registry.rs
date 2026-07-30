@@ -144,6 +144,12 @@ impl AgentRegistry {
             .collect()
     }
 
+    /// Check whether an agent with the given `agent_id` is registered.
+    #[must_use]
+    pub fn contains(&self, agent_id: &str) -> bool {
+        self.inner.lock().unwrap_poison().contains_key(agent_id)
+    }
+
     /// Cancel all running agents. Used during daemon shutdown.
     pub fn shutdown_all(&self) {
         let entries: Vec<(String, CancellationToken)> = self

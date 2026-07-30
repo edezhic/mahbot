@@ -1,5 +1,6 @@
 //! Session persistence — Turso-backed store + native history decoding.
 
+pub mod dead_session;
 pub mod manager;
 pub use manager::Session;
 
@@ -64,7 +65,11 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS session_metadata (
     agent_id      TEXT PRIMARY KEY,
     created_at    TEXT NOT NULL,
-    last_activity TEXT NOT NULL
+    last_activity TEXT NOT NULL,
+    channel       TEXT,
+    user_name     TEXT,
+    workspace_name TEXT,
+    role          TEXT
 );";
 
 // ── Column index constants ──────────────────────────────────
@@ -109,6 +114,19 @@ pub(crate) struct SessionMetadata {
     pub agent_id: String,
     pub last_activity: DateTime<Utc>,
     pub message_count: usize,
+}
+
+/// Context data stored alongside a session for recovery purposes.
+///
+/// Populated when a user initiates a direct agent session so the dead-session
+/// recovery poller can reconstruct an [`AgentJob`](crate::message_router::AgentJob)
+/// without parsing the agent ID string.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionContext {
+    pub channel: String,
+    pub user_name: String,
+    pub workspace_name: String,
+    pub role: String,
 }
 
 /// Parse an RFC 3339 timestamp string, falling back to `Utc::now()` on failure.
@@ -307,6 +325,145 @@ impl SessionStore {
         )
         .await
     }
+
+    /// Like [`list_sessions_with_metadata`], but excludes sessions whose
+    /// `agent_id` starts with any of the given prefixes by adding a `WHERE`
+    /// clause (e.g., `"manager_"`, `"ticket_"`).
+    ///
+    /// Uses parameterised `NOT LIKE ?N` placeholders with the prefix patterns
+    /// passed as query parameters — no string interpolation into SQL.
+    pub(crate) async fn list_sessions_with_metadata_excluding(
+        &self,
+        exclude_prefixes: &[&str],
+    ) -> Vec<SessionMetadata> {
+        if exclude_prefixes.is_empty() {
+            return self.list_sessions_with_metadata().await;
+        }
+
+        let where_clause = exclude_prefixes
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("sm.agent_id NOT LIKE ?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+
+        let params: Vec<turso::Value> = exclude_prefixes
+            .iter()
+            .map(|p| turso::Value::Text(format!("{p}%")))
+            .collect();
+
+        query_map_collect(
+            &self.conn,
+            &format!(
+                "SELECT {SESSION_LIST_COLUMNS} \
+                 FROM session_metadata sm \
+                 LEFT JOIN sessions s ON s.agent_id = sm.agent_id \
+                 WHERE {where_clause} \
+                 GROUP BY sm.agent_id \
+                 ORDER BY sm.last_activity DESC",
+            ),
+            params,
+            |row| {
+                Ok::<_, anyhow::Error>(session_metadata_from_row(
+                    &row.get::<String>(COL_SL_AGENT_ID)?,
+                    &row.get::<String>(COL_SL_LAST_ACTIVITY)?,
+                    row.get::<i64>(COL_SL_MESSAGE_COUNT)?,
+                ))
+            },
+            "list sessions (excluding prefixes)",
+            None,
+        )
+        .await
+    }
+
+    /// Lightweight query: get the role of the last message in a session.
+    /// Returns `None` if the session has no messages.
+    pub(crate) async fn get_last_message_role(&self, agent_id: &str) -> Option<ChatRole> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT role FROM sessions WHERE agent_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![agent_id],
+            )
+            .await
+            .ok()?;
+        rows.first().and_then(|row| {
+            let role_str: String = row.get(0).ok()?;
+            role_str.parse::<ChatRole>().ok()
+        })
+    }
+
+    /// Store session context (channel, user_name, workspace_name, role)
+    /// alongside the session metadata for use by the dead-session recovery
+    /// poller.
+    ///
+    /// Uses an upsert so it works regardless of whether a metadata row already
+    /// exists — the context write is intentionally decoupled from the message
+    /// persistence path to avoid threading extra parameters through
+    /// `batch_append`/`append`.
+    ///
+    /// On subsequent calls (re-turns of the same session), the same values
+    /// are written again — functionally a no-op because the inputs are
+    /// unchanged.
+    ///
+    /// # Atomicity note
+    ///
+    /// This runs as a separate query after the message-batch transaction in
+    /// `Session::init`.  If the process crashes (self-update, OOM, SIGKILL)
+    /// or the write fails after messages were committed, the session becomes
+    /// unrecoverable (messages exist but `get_session_context` returns
+    /// `None`).  This is accepted as a rare edge case — the window between
+    /// the two writes is extremely narrow.
+    pub(crate) async fn set_session_context(
+        &self,
+        agent_id: &str,
+        channel: &str,
+        user_name: &str,
+        workspace_name: &str,
+        role: &str,
+    ) -> Result<()> {
+        let now = turso::now();
+        self.conn
+            .execute(
+                "INSERT INTO session_metadata (agent_id, created_at, last_activity, channel, user_name, workspace_name, role)
+                 VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(agent_id) DO UPDATE SET
+                 channel = excluded.channel,
+                 user_name = excluded.user_name,
+                 workspace_name = excluded.workspace_name,
+                 role = excluded.role",
+                params![agent_id, now, channel, user_name, workspace_name, role],
+            )
+            .await
+            .context("Failed to set session context")?;
+        Ok(())
+    }
+
+    /// Retrieve stored session context for a given agent ID.
+    /// Returns `None` if the session has no metadata or the context columns
+    /// are null (pre-migration sessions).
+    pub(crate) async fn get_session_context(&self, agent_id: &str) -> Option<SessionContext> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT channel, user_name, workspace_name, role FROM session_metadata WHERE agent_id = ?1",
+                params![agent_id],
+            )
+            .await
+            .ok()?;
+        rows.first().and_then(|row| {
+            let channel: Option<String> = row.get(0).ok();
+            let user_name: Option<String> = row.get(1).ok();
+            let workspace_name: Option<String> = row.get(2).ok();
+            let role: Option<String> = row.get(3).ok();
+            Some(SessionContext {
+                channel: channel?,
+                user_name: user_name?,
+                workspace_name: workspace_name?,
+                role: role?,
+            })
+        })
+    }
 }
 
 // ── Schema migration (rename session_key to agent_id) ─────────────
@@ -331,6 +488,8 @@ impl SessionStore {
 ///
 /// Uses `PRAGMA user_version` for versioning (following the board.rs pattern).
 /// Migration v1: rename `session_key` column to `agent_id` in both tables.
+/// Migration v2: add context columns (`channel`, `user_name`, `workspace_name`, `role`).
+#[allow(clippy::too_many_lines)]
 async fn run_session_migrations(conn: &turso::Connection) -> anyhow::Result<()> {
     let version_rows = conn
         .query("PRAGMA user_version", ())
@@ -401,6 +560,70 @@ async fn run_session_migrations(conn: &turso::Connection) -> anyhow::Result<()> 
         if has_session_key || meta_has_session_key {
             tracing::info!(
                 "Schema migration complete: renamed session_key to agent_id (version 1)"
+            );
+        }
+    }
+
+    if current_version < 2 {
+        tracing::info!("Schema migration: adding context columns to session_metadata (version 2)");
+
+        // Add columns for session context (channel, user_name, workspace_name, role).
+        // Each ADD COLUMN is auto-committed in SQLite.
+        let table_info = conn
+            .query("PRAGMA table_info('session_metadata')", ())
+            .await
+            .context("Failed to read PRAGMA table_info for session_metadata migration")?;
+
+        let existing: std::collections::HashSet<String> = table_info
+            .iter()
+            .filter_map(|row| row.get::<String>(1).ok())
+            .collect();
+
+        for col in &["channel", "user_name", "workspace_name", "role"] {
+            if !existing.contains(*col) {
+                conn.execute(
+                    &format!("ALTER TABLE session_metadata ADD COLUMN {col} TEXT"),
+                    (),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Schema migration failed: unable to add column {col} to session_metadata"
+                    )
+                })?;
+            }
+        }
+
+        conn.execute("PRAGMA user_version = 2", ())
+            .await
+            .context("Schema migration failed: unable to set PRAGMA user_version to 2")?;
+
+        conn.checkpoint().await.context(
+            "Schema migration failed: unable to checkpoint after adding context columns",
+        )?;
+
+        tracing::info!(
+            "Schema migration complete: added context columns to session_metadata (version 2)"
+        );
+
+        // Warn about pre-migration sessions that will be unrecoverable
+        // by the dead-session recovery poller (NULL context columns).
+        let null_count: i64 = conn
+            .query(
+                "SELECT COUNT(*) FROM session_metadata WHERE channel IS NULL",
+                (),
+            )
+            .await
+            .context("Failed to count pre-migration sessions")?
+            .first()
+            .and_then(|row| row.get::<i64>(0).ok())
+            .unwrap_or(0);
+        if null_count > 0 {
+            tracing::warn!(
+                count = null_count,
+                "Pre-migration sessions have NULL context columns and will \
+                 not be recovered by the dead-session recovery poller. \
+                 These sessions have no stored channel/user_name/workspace/role."
             );
         }
     }
@@ -615,8 +838,10 @@ mod tests {
 ///   3. Opens via [`SessionStore`], which triggers migration in `after_open`
 ///   4. Verifies data survived intact
 ///   5. Verifies columns are now named `agent_id`
-///   6. Verifies `PRAGMA user_version = 1`
-///   7. Re-opens to verify idempotency
+///   6. Verifies `PRAGMA user_version = 2` (v1 + v2 migrations)
+///   7. Verifies v2 context columns were added: `channel`, `user_name`,
+///      `workspace_name`, `role`
+///   8. Re-opens to verify idempotency
 #[cfg(test)]
 mod migration_tests {
     use super::*;
@@ -773,16 +998,37 @@ CREATE TABLE IF NOT EXISTS session_metadata (
              found: {meta_col_names:?}",
         );
 
-        // ── 6. Verify PRAGMA user_version = 1 ──────────────────────────────
+        // ── 6. Verify PRAGMA user_version = 2 ──────────────────────────────
         let ver_rows = store
             .conn
             .query("PRAGMA user_version", ())
             .await
             .expect("query user_version after migration");
         let version: i64 = ver_rows[0].get(0).expect("get user_version value");
-        assert_eq!(version, 1, "user_version should be 1 after migration");
+        assert_eq!(
+            version, 2,
+            "user_version should be 2 after migration (v1 + v2)"
+        );
 
-        // ── 7. Re-open to verify idempotency ──────────────────────────────
+        // ── 7. Verify v2 context columns exist ──────────────────────────────
+        let v2_info = store
+            .conn
+            .query("PRAGMA table_info('session_metadata')", ())
+            .await
+            .expect("query table_info for session_metadata v2 check");
+        let v2_col_names: Vec<String> = v2_info
+            .iter()
+            .filter_map(|r| r.get::<String>(1).ok())
+            .collect();
+        for col in &["channel", "user_name", "workspace_name", "role"] {
+            assert!(
+                v2_col_names.iter().any(|n| n == col),
+                "v2 column '{col}' should exist in session_metadata after migration; \
+                 found: {v2_col_names:?}",
+            );
+        }
+
+        // ── 8. Re-open to verify idempotency ──────────────────────────────
         drop(store);
         let store2 = SessionStore::open(tmp.path())
             .await
@@ -799,14 +1045,14 @@ CREATE TABLE IF NOT EXISTS session_metadata (
             .expect("query sessions after re-open");
         assert_eq!(rows2.len(), 2, "should still have 2 sessions after re-open");
 
-        // user_version still 1
+        // user_version still 2
         let ver_rows2 = store2
             .conn
             .query("PRAGMA user_version", ())
             .await
             .expect("query user_version after re-open");
         let version2: i64 = ver_rows2[0].get(0).expect("get user_version value");
-        assert_eq!(version2, 1, "user_version should remain 1 after re-open");
+        assert_eq!(version2, 2, "user_version should remain 2 after re-open");
     }
 }
 

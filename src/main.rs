@@ -189,6 +189,7 @@ fn spawn_cancellable<F>(
     });
 }
 
+#[allow(clippy::too_many_lines)]
 fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
     let mut tasks = JoinSet::<()>::new();
     let shutdown_token = mahbot::shutdown::shutdown_token();
@@ -227,6 +228,16 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         &shutdown_token,
         "archive-cancelled",
         mahbot::board::run_archive_cancelled_loop(),
+    );
+
+    // Dead-session recovery: detects user-agent sessions that failed silently
+    // (user sent a message, no agent responded, no agent is running) and
+    // automatically re-triggers the agent.
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "dead-session-recovery",
+        mahbot::session::dead_session::run_dead_session_recovery_loop(),
     );
 
     // Nightly workspace re-analysis: checks for new git commits and

@@ -5,7 +5,7 @@
 //!
 //! ## Usage
 //! 1. `Session::default()` at turn start
-//! 2. `session.init(agent_id, msg, ws, role, ticket)` — loads history, builds prompt
+//! 2. `session.init(agent_id, msg, ws, role, ticket, channel, user_name)` — loads history, builds prompt
 //!    for new sessions, persists user message, stores history internally
 //! 3. Agent loop calls `session.push_assistant()`, `session.push_messages()`, etc. during tool rounds
 //! 4. `session.finalize(agent_id)` on success — persists the final assistant response
@@ -58,6 +58,7 @@ impl Session {
     /// Summarization is **not** handled here. It is run separately by
     /// `Agent::work` when the conversation exceeds the token budget.
     /// See [`crate::session`] for the summarization constants and helpers.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn init(
         &mut self,
         agent_id: &str,
@@ -65,6 +66,8 @@ impl Session {
         ws: &Workspace,
         role: &Role,
         ticket: Option<&crate::board::Ticket>,
+        channel: &str,
+        user_name: &str,
     ) -> Result<()> {
         // Load existing history from DB
         let mut history = crate::session::store().load(agent_id).await;
@@ -88,6 +91,20 @@ impl Session {
             history.push(user_msg);
         }
         self.history = history;
+
+        // Store session context for dead-session recovery detection.
+        // On subsequent turns the same values are written — a harmless
+        // no-op because channel/user_name/workspace/role never change
+        // for a given agent_id.
+        //
+        // Note: this is a separate write after the message transaction
+        // above.  If the process crashes (self-update, OOM, SIGKILL) in
+        // between, the session has messages but no context — the
+        // dead-session poller cannot recover it.  This is a rare edge
+        // case accepted for simplicity (see `set_session_context` docs).
+        crate::session::store()
+            .set_session_context(agent_id, channel, user_name, &ws.name, role.as_str())
+            .await?;
 
         Ok(())
     }

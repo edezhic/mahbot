@@ -240,6 +240,8 @@ impl Agent {
                 &self.workspace,
                 &self.role,
                 self.ticket.as_ref(),
+                &self.channel,
+                &self.user_name,
             )
             .await?;
 
