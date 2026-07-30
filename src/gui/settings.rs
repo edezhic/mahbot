@@ -318,6 +318,10 @@ pub enum SettingsMessage {
     TtsToggleResult(u64, Result<(), String>),
     /// Retry TTS model download after a permanent failure.
     TtsRetryModels,
+    /// Test TTS by speaking a test phrase aloud.
+    TtsTest,
+    /// Request a toast notification from the dashboard.
+    Toast(super::ToastMessage),
 }
 
 // ── State ────────────────────────────────────────────────────────
@@ -663,6 +667,15 @@ impl SettingsState {
                 let _ = crate::audio::tts::retry_download();
                 Task::none()
             }
+            SettingsMessage::TtsTest => {
+                if !crate::audio::tts::audio_output_ready() {
+                    return Task::done(SettingsMessage::Toast(super::ToastMessage::Warning(
+                        "Audio output device not available".to_string(),
+                    )));
+                }
+                crate::audio::tts::speak("This is a test of the text to speech system.");
+                Task::none()
+            }
             SettingsMessage::StartVoiceEnrollment => {
                 let phrase = self.wake_word_phrase_input.clone();
                 crate::audio::voice::send_command(
@@ -824,6 +837,12 @@ impl SettingsState {
                     Task::none()
                 }
             },
+
+            SettingsMessage::Toast(_) => {
+                // Toast messages are intercepted by Dashboard::as_toast()
+                // before dispatch — this arm should never be reached.
+                Task::none()
+            }
 
             SettingsMessage::Escape => {
                 if self.show_add_workspace_modal {
@@ -2399,11 +2418,18 @@ impl SettingsState {
         let tts_enabled = self.config.tts_enabled.as_deref() == Some("true");
         let ready = crate::audio::tts::models_ready();
         let failed = crate::audio::tts::download_failed();
+        let audio_ok = crate::audio::tts::audio_output_ready();
 
         let status_text: Element<'_, SettingsMessage> = if !tts_enabled {
             Text::new("Disabled").into()
         } else if ready {
-            Text::new("Ready").into()
+            if audio_ok {
+                Text::new("Ready").into()
+            } else {
+                Text::new("No audio output device")
+                    .color(theme::STATUS_ERROR)
+                    .into()
+            }
         } else if failed {
             // Show retry button inline so the user can trigger recovery
             // without toggling TTS off/on.
@@ -2422,6 +2448,19 @@ impl SettingsState {
             Text::new("Downloading models…").into()
         };
 
+        // Test button: enabled only when TTS is enabled and models loaded.
+        // On click, audio output readiness is checked separately and shown
+        // as a toast if unavailable — the button itself stays clickable so
+        // the user gets immediate feedback about the problem.
+        let test_btn = iced::widget::button(Text::new("   Test TTS   ").size(13))
+            .style(theme::button_primary)
+            .padding(4)
+            .on_press_maybe(if tts_enabled && ready {
+                Some(SettingsMessage::TtsTest)
+            } else {
+                None
+            });
+
         let column = Column::new()
             .push(field_row(
                 "Enable TTS",
@@ -2431,7 +2470,9 @@ impl SettingsState {
                 Some("Text-to-speech for agent responses"),
             ))
             .push(iced::widget::Space::new().height(8))
-            .push(field_row("Status", status_text, None));
+            .push(field_row("Status", status_text, None))
+            .push(iced::widget::Space::new().height(8))
+            .push(field_row("", test_btn.into(), None));
 
         section("TTS", column)
     }

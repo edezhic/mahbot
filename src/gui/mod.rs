@@ -300,7 +300,8 @@ impl Message {
             | Message::Git(git::GitMessage::Toast(tm))
             | Message::Editor(editor::EditorMessage::Toast(tm))
             | Message::Settings(
-                settings::SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::Toast(tm))
+                settings::SettingsMessage::Toast(tm)
+                | settings::SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::Toast(tm))
                 | settings::SettingsMessage::UserMsg(users::UsersMessage::Toast(tm)),
             ) => Some(tm),
             _ => None,

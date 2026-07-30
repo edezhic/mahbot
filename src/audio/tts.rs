@@ -304,6 +304,20 @@ pub fn models_ready() -> bool {
     STATE.load(Ordering::Acquire) == STATE_READY
 }
 
+/// Returns `true` if the audio output device was successfully initialized.
+///
+/// This checks whether `rodio::OutputStream::try_default()` succeeded during
+/// [`init_global()`]. Models may be loaded ([`models_ready()`]) but audio
+/// output may still be unavailable (e.g., headless system, no speakers,
+/// CoreAudio initialization failure).
+///
+/// The check is performed once at startup — runtime device disconnection
+/// after initialization is not reflected.
+#[must_use]
+pub fn audio_output_ready() -> bool {
+    AUDIO_OUTPUT.get().is_some()
+}
+
 /// Returns `true` if model download has permanently failed
 /// (retries exhausted or model directory unresolvable).
 #[must_use]
@@ -483,9 +497,8 @@ pub fn init_global() -> Result<()> {
 ///
 /// The listener checks:
 /// 1. The event is an agent message (`direction == Agent`)
-/// 2. The message was delivered via the GUI dashboard (`channel == "gui"`)
-/// 3. TTS is globally enabled and models are loaded
-/// 4. The agent's role matches the user's currently-active GUI role
+/// 2. TTS is globally enabled and models are loaded
+/// 3. The agent's role matches the user's currently-active GUI role
 ///
 /// Must be called **after** [`crate::CHAT_BROADCAST`] has been initialized
 /// (i.e. after [`init_message_pipeline`]).
@@ -503,12 +516,12 @@ pub fn init_listener() {
             match rx.recv().await {
                 Ok(ChatEvent::Message {
                     direction: ChatDirection::Agent,
-                    channel,
+                    channel: _,
                     user_name,
                     agent_role: Some(ref role_name),
                     content,
                     ..
-                }) if channel == "gui" && is_enabled() => {
+                }) if is_enabled() => {
                     let active_role = crate::users::resolve_active_role(&user_name).await;
                     if active_role.as_str() == role_name.as_str() {
                         speak(&content);
