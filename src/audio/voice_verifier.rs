@@ -224,6 +224,42 @@ fn default_verifier_threshold() -> f32 {
     DEFAULT_VERIFIER_THRESHOLD
 }
 
+/// Training diagnostics surfaced by [`VoiceVerifier::train_with_metrics`]
+/// (mahbot-1005 §5).  Report-only — never persisted inside [`VoiceVerifier`],
+/// so the model's `Serialize`/`Deserialize` layout is unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct VerifierTrainingMetrics {
+    /// Number of epochs actually trained (may be less than `CONV_MAX_EPOCHS`
+    /// due to early stopping).
+    pub epochs_trained: usize,
+    /// Per-epoch training loss, one entry per epoch actually trained.
+    pub per_epoch_train_loss: Vec<f32>,
+    /// Per-epoch validation loss, one entry per epoch actually trained.
+    pub per_epoch_val_loss: Vec<f32>,
+    /// Mean validation score of positive windows at the selected threshold.
+    pub val_pos_score_mean: f32,
+    /// Mean validation score of negative windows at the selected threshold.
+    pub val_neg_score_mean: f32,
+    /// Constrained Weighted Youden's J (`TPR - CALIBRATION_LAMBDA * FPR`) at
+    /// the selected threshold.  `None` when no validation data was available.
+    pub youden_index: Option<f32>,
+    /// True-positive rate at the selected threshold.  `None` when no validation
+    /// positives existed.
+    pub tpr: Option<f32>,
+    /// False-positive rate at the selected threshold.  `None` when no validation
+    /// negatives existed.
+    pub fpr: Option<f32>,
+    /// Number of positive validation windows.
+    pub n_val_pos: usize,
+    /// Number of negative validation windows.
+    pub n_val_neg: usize,
+    /// Whether threshold calibration ran (real non-synthetic negatives present).
+    pub threshold_calibrated: bool,
+    /// Whether the returned threshold is the caller-supplied fallback (i.e.
+    /// calibration was skipped).
+    pub threshold_is_fallback: bool,
+}
+
 impl Default for VoiceVerifier {
     fn default() -> Self {
         Self::untrained()
@@ -342,6 +378,36 @@ impl VoiceVerifier {
         l2_lambda: f32,
         rng_seed: Option<u64>,
     ) -> Self {
+        Self::train_with_metrics(
+            positive_sequences,
+            negative_sequences,
+            per_negative_sequence_weights,
+            threshold,
+            l2_lambda,
+            rng_seed,
+        )
+        .0
+    }
+
+    /// Like [`Self::train`], but also returns training diagnostics for
+    /// benchmark reporting (mahbot-1005 §5).  Production callers keep using
+    /// [`Self::train`]; the benchmark uses this variant so per-epoch losses,
+    /// Youden index, TPR/FPR, and validation-split composition are visible in
+    /// the JSON report.  The returned [`VerifierTrainingMetrics`] is
+    /// report-only — it is never persisted inside the model.
+    #[expect(
+        clippy::too_many_lines,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    pub fn train_with_metrics(
+        positive_sequences: &[EmbeddingSequence],
+        negative_sequences: &[EmbeddingSequence],
+        per_negative_sequence_weights: Option<&[f32]>,
+        threshold: f32,
+        l2_lambda: f32,
+        rng_seed: Option<u64>,
+    ) -> (Self, VerifierTrainingMetrics) {
         // ── Prepare training data via shared helper ──
         let Some((windows, window_labels, window_weights, seq_infos, class_weight, _n_pos_windows)) =
             prepare_training_data(
@@ -351,7 +417,7 @@ impl VoiceVerifier {
                 form_conv1d_sequence_windows,
             )
         else {
-            return Self::untrained();
+            return (Self::untrained(), VerifierTrainingMetrics::default());
         };
 
         // All windows from form_conv1d_sequence_windows are already 288-dim
@@ -430,6 +496,10 @@ impl VoiceVerifier {
         let mut best_fc_b = bias_fc.clone();
         let mut stall_count = 0;
         let mut epochs_trained = 0;
+
+        // Per-epoch diagnostics (mahbot-1005 §5) — previously computed and
+        // logged but discarded.  Vectors cap at CONV_MAX_EPOCHS (100) entries.
+        let mut metrics = VerifierTrainingMetrics::default();
 
         for epoch in 0..CONV_MAX_EPOCHS {
             epochs_trained = epoch + 1;
@@ -602,6 +672,10 @@ impl VoiceVerifier {
                     l2_lambda,
                 );
 
+                // Per-epoch diagnostics (mahbot-1005 §5).
+                metrics.per_epoch_train_loss.push(train_loss);
+                metrics.per_epoch_val_loss.push(val_loss);
+
                 if epoch % LOG_LOSS_INTERVAL == 0 {
                     info!(
                         "Conv1D verifier: epoch={epoch} train_loss={train_loss:.6} val_loss={val_loss:.6} lr={}",
@@ -666,10 +740,15 @@ impl VoiceVerifier {
         let has_real_negatives = seq_infos
             .iter()
             .any(|s| !s.is_positive && s.source != Source::Synthetic);
-        if has_real_negatives && n_val > 0 {
-            // Compute validation scores for calibration.
-            let mut val_pos_scores: Vec<f32> = Vec::new();
-            let mut val_neg_scores: Vec<f32> = Vec::new();
+
+        // ── Validation scores + split composition (mahbot-1005 §5) ──
+        // Computed for every trained verifier (not just the calibrating path)
+        // so the benchmark can report TPR/FPR/Youden even when calibration is
+        // skipped (all-synthetic negatives or insufficient validation data).
+        let mut val_pos_scores: Vec<f32> = Vec::new();
+        let mut val_neg_scores: Vec<f32> = Vec::new();
+        metrics.epochs_trained = epochs_trained;
+        if n_val > 0 {
             for (emb, &lbl) in val_windows.iter().zip(val_labels.iter()) {
                 let score = verifier.predict(emb);
                 if lbl > 0.5 {
@@ -678,21 +757,68 @@ impl VoiceVerifier {
                     val_neg_scores.push(score);
                 }
             }
+            metrics.n_val_pos = val_pos_scores.len();
+            metrics.n_val_neg = val_neg_scores.len();
+            metrics.val_pos_score_mean = if val_pos_scores.is_empty() {
+                0.0
+            } else {
+                val_pos_scores.iter().copied().sum::<f32>() / val_pos_scores.len() as f32
+            };
+            metrics.val_neg_score_mean = if val_neg_scores.is_empty() {
+                0.0
+            } else {
+                val_neg_scores.iter().copied().sum::<f32>() / val_neg_scores.len() as f32
+            };
+        }
 
+        if has_real_negatives && n_val > 0 {
             let calibrated = calibrate_verifier_threshold(
                 &val_pos_scores,
                 &val_neg_scores,
                 threshold, // caller-supplied fallback
             );
             verifier.threshold = calibrated;
-        } else if !has_real_negatives {
-            info!(
-                "Verifier threshold calibration skipped: all negative sequences are synthetic.  \
-                 Using caller-supplied threshold={threshold:.4}."
-            );
+            metrics.threshold_calibrated = true;
+        } else {
+            metrics.threshold_is_fallback = true;
+            if !has_real_negatives {
+                info!(
+                    "Verifier threshold calibration skipped: all negative sequences are synthetic.  \
+                     Using caller-supplied threshold={threshold:.4}."
+                );
+            }
         }
 
-        verifier
+        // ── Youden index + TPR/FPR at the selected threshold (mahbot-1005 §5) ──
+        // Evaluated against the FINAL threshold (calibrated or fallback).
+        if !val_pos_scores.is_empty() || !val_neg_scores.is_empty() {
+            let tp = val_pos_scores
+                .iter()
+                .filter(|&&s| s >= verifier.threshold)
+                .count();
+            let fp = val_neg_scores
+                .iter()
+                .filter(|&&s| s >= verifier.threshold)
+                .count();
+            let tpr = if val_pos_scores.is_empty() {
+                None
+            } else {
+                Some(tp as f32 / val_pos_scores.len() as f32)
+            };
+            let fpr = if val_neg_scores.is_empty() {
+                None
+            } else {
+                Some(fp as f32 / val_neg_scores.len() as f32)
+            };
+            metrics.tpr = tpr;
+            metrics.fpr = fpr;
+            metrics.youden_index = match (tpr, fpr) {
+                (Some(t), Some(f)) => Some(t - CALIBRATION_LAMBDA * f),
+                _ => None,
+            };
+        }
+
+        (verifier, metrics)
     }
 
     /// Gather windows for a set of sequence indices (shared helper for train/val split).

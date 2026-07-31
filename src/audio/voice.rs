@@ -4570,6 +4570,43 @@ pub(crate) struct DetectionInstrumentation {
     /// When this is non-zero AND detection rate is below target, the ceiling
     /// is the likely limiting factor and escalation should be considered.
     pub ceiling_limited_frames: usize,
+    /// Per-frame peak verifier score (mahbot-1005 §4).  One entry per embedding
+    /// frame, parallel to [`per_frame_scores`](Self::per_frame_scores).  A value
+    /// of 0.0 means the verifier was not evaluated on that frame (verifier
+    /// warm-up period, or untrained verifier) — it is NOT a rejection with zero
+    /// confidence.  Previously `max_verifier_score` was computed and discarded
+    /// at the [`score_stride8_window`] call site.
+    pub per_frame_verifier_scores: Vec<f32>,
+    /// Number of frames where the classifier triggered (rolling sum reached the
+    /// effective threshold) but detection was suppressed by verifier warm-up
+    /// (embedding ring below [`VERIFIER_WARMUP_EMBEDDINGS`] with a trained
+    /// verifier).  Feed for the benchmark's `warmup_suppression` verdict
+    /// (mahbot-1005 §2).
+    pub n_warmup_suppressed_frames: usize,
+    /// Number of bounded classifier candidates created during this session
+    /// (mahbot-1005 §4).
+    pub candidates_created: usize,
+    /// Number of candidates that reached verifier confirmation (detection fired
+    /// via the candidate path).
+    pub candidates_confirmed: usize,
+    /// Number of candidates cleared without confirmation — either expired via
+    /// [`CANDIDATE_MAX_EMBEDDINGS`] or reset by a below-`NO_MATCH_RESET_THRESHOLD`
+    /// score frame.  The two paths are distinguished at report time via the
+    /// frame's `total_score` (reset-rejection iff the clearing frame scored
+    /// below `NO_MATCH_RESET_THRESHOLD`).
+    pub candidates_expired: usize,
+    /// Index into [`per_frame_scores`](Self::per_frame_scores) of the first
+    /// frame where the rolling sum reached the effective threshold (classifier
+    /// trigger).  `None` if the classifier never triggered on test-utterance
+    /// frames (mahbot-1005 §2 evidence).
+    pub first_trigger_frame_idx: Option<usize>,
+    /// Maximum rolling sum achieved by warm-up audio only (mahbot-1005 §1).
+    /// Captured at the [`consume_warmup`](crate::audio::voice_pipeline_e2e_test::consume_warmup)
+    /// instrumentation reset so the warm-up "head start" remains observable
+    /// instead of being silently discarded.
+    pub warmup_max_rolling_sum: f32,
+    /// Peak verifier score achieved by warm-up audio only (mahbot-1005 §1).
+    pub warmup_peak_verifier_score: f32,
 }
 
 #[cfg(feature = "voice-tests")]
@@ -4583,6 +4620,14 @@ impl DetectionInstrumentation {
             peak_verifier_score: 0.0,
             adaptive_threshold_trajectory: Vec::new(),
             ceiling_limited_frames: 0,
+            per_frame_verifier_scores: Vec::new(),
+            n_warmup_suppressed_frames: 0,
+            candidates_created: 0,
+            candidates_confirmed: 0,
+            candidates_expired: 0,
+            first_trigger_frame_idx: None,
+            warmup_max_rolling_sum: 0.0,
+            warmup_peak_verifier_score: 0.0,
         }
     }
 }
@@ -7021,6 +7066,11 @@ fn flush_voice_batch(voice_batch: &mut Vec<f32>, mel_frame_buffer: &mut Vec<Vec<
 ///
 /// # Returns
 /// `true` if wake word was detected (caller should stop processing and return).
+// Clippy: the instrumentation block (mahbot-1005) plus the read-lock scoping
+// pushes this past 100 lines in both feature configurations (104 default,
+// 141 voice-tests); the body is a single linear pipeline and not worth
+// splitting.
+#[expect(clippy::too_many_lines)]
 fn score_stride8_window(
     mel_window: &[Vec<f32>],
     models: &OnnxModels,
@@ -7058,8 +7108,29 @@ fn score_stride8_window(
     // Historical context: commit da06926 fixed a double-read-lock in this
     // same function but missed this read→write upgrade path (mahbot-946).
     // Do NOT rely on NLL early-drop — always scope the guard explicitly.
+    // ── Capture pre-call state for candidate-lifecycle and warm-up suppression
+    //    instrumentation (mahbot-1005 §2/§4).  The candidate may be created,
+    //    confirmed, expired, or reset inside score_single_embedding; comparing
+    //    state before/after lets us count lifecycle events without changing
+    //    score_single_embedding's return contract.
+    #[cfg(feature = "voice-tests")]
+    let (candidate_active_before, ring_len_before, verifier_trained) = {
+        let state = voice_state().read().unwrap_poison();
+        (
+            ctx.candidate.is_some(),
+            ctx.embedding_ring.len(),
+            state.verifier.is_trained(),
+        )
+    };
     #[cfg_attr(not(feature = "voice-tests"), allow(unused_variables))]
-    let (detected, rolling_sum, total_score, effective_threshold, _max_verifier_score, _) = {
+    let (
+        detected,
+        rolling_sum,
+        total_score,
+        effective_threshold,
+        max_verifier_score,
+        candidate_was_created,
+    ) = {
         let state = voice_state().read().unwrap_poison();
         score_single_embedding(
             &embedding,
@@ -7096,6 +7167,42 @@ fn score_stride8_window(
             && p > ctx.instrumentation.peak_verifier_score
         {
             ctx.instrumentation.peak_verifier_score = p;
+        }
+        // ── mahbot-1005: per-frame verifier scores, candidate lifecycle, and
+        //    warm-up suppression evidence ─────────────────────────────────
+        ctx.instrumentation
+            .per_frame_verifier_scores
+            .push(max_verifier_score);
+        if candidate_was_created {
+            ctx.instrumentation.candidates_created += 1;
+        }
+        if detected {
+            ctx.instrumentation.candidates_confirmed += 1;
+        }
+        // A candidate cleared between frames without confirmation is either an
+        // expiry (CANDIDATE_MAX_EMBEDDINGS exceeded) or a below-reset rejection.
+        if candidate_active_before && ctx.candidate.is_none() && !detected {
+            ctx.instrumentation.candidates_expired += 1;
+        }
+        // First classifier-trigger frame index.  `rolling_sum >= effective_threshold`
+        // mirrors the pre-suppression `detected` computed by process_wake_word_score
+        // inside score_single_embedding (the adaptive override is exactly
+        // `effective_threshold`), so this is the frame the classifier fired on.
+        if ctx.instrumentation.first_trigger_frame_idx.is_none()
+            && rolling_sum >= effective_threshold
+        {
+            ctx.instrumentation.first_trigger_frame_idx =
+                Some(ctx.instrumentation.per_frame_scores.len() - 1);
+        }
+        // Warm-up suppression counter.  score_single_embedding suppresses any
+        // detection while the ring (post-push) is below VERIFIER_WARMUP_EMBEDDINGS
+        // with a trained verifier.  The ring is pushed once per call, so
+        // `ring_len_before + 1` is the post-push length (warm-up lengths are
+        // always well below EMBEDDING_RING_MAX, so the cap never interferes).
+        let is_warmup_frame = verifier_trained
+            && ring_len_before + 1 < crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS;
+        if is_warmup_frame && rolling_sum >= effective_threshold {
+            ctx.instrumentation.n_warmup_suppressed_frames += 1;
         }
     }
 
@@ -7334,9 +7441,13 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     }
 
     // Transfer VAD count into instrumentation (mahbot-886).
+    // Accumulate (`+=`) instead of overwriting (`=`): handle_wake_word_detection
+    // is called once per audio chunk, and the VAD count is per-call.  The old
+    // overwrite kept only the LAST call's count (~0 after the silence flush),
+    // making the benchmark's vad_speech_frames evidence unreliable (mahbot-1005).
     #[cfg(feature = "voice-tests")]
     {
-        ctx.instrumentation.vad_speech_frames =
+        ctx.instrumentation.vad_speech_frames +=
             vad_count.load(std::sync::atomic::Ordering::Relaxed);
     }
     // ── Bounded detection segment check (mahbot-894) ───────────────────────

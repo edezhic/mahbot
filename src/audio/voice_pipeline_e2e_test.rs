@@ -891,6 +891,36 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
     ctx.next_window_start = 0;
     ctx.score_window.clear();
     ctx.candidate = None;
+
+    // ── Reset instrumentation (mahbot-1005 §1) ─────────────────────────────
+    // Warm-up audio passes through the full scoring pipeline and records into
+    // ctx.instrumentation: per_frame_scores, peak_score, peak_verifier_score,
+    // candidate lifecycle counters, VAD counts, and the adaptive threshold
+    // trajectory.  Without a reset, warm-up-only scores contaminate the test
+    // utterance's per-variant metrics:
+    //
+    //   - Silence/noise negatives report "classifier triggers" from warm-up
+    //     speech (the fake "Silence: 1/1 trigger").
+    //   - Inflated trigger counts across all categories.
+    //   - Miss-classification buckets polluted by warm-up frames (a genuine
+    //     classifier miss rebucketed as "verifier miss").
+    //   - peak_verifier_score non-zero even for silence variants.
+    //
+    // The warm-up "head start" (mahbot-1002) remains observable via the two
+    // warmup_* fields captured below — the values are preserved, not hidden.
+    //
+    // ctx.peak_score is also reset: although the streaming path never writes it
+    // today, reset_detection_segment() flushes it into instrumentation, so any
+    // future writer would re-contaminate the fresh instrumentation at the next
+    // segment boundary (analyst feedback, mahbot-1005).
+    let warmup_max_rolling_sum = max_rolling_sum(&ctx.instrumentation.per_frame_scores);
+    let warmup_peak_verifier_score = ctx.instrumentation.peak_verifier_score;
+    ctx.instrumentation = super::DetectionInstrumentation {
+        warmup_max_rolling_sum,
+        warmup_peak_verifier_score,
+        ..super::DetectionInstrumentation::new()
+    };
+    ctx.peak_score = 0.0;
 }
 
 // ── Prerequisite check ─────────────────────────────────────────────────────
@@ -1342,6 +1372,218 @@ struct PerVariantResult {
     /// Number of embeddings in the ring buffer after warm-up consumption,
     /// before processing the test utterance (mahbot-947).
     warmup_n_embeddings: usize,
+    /// Per-frame peak verifier score, parallel to `per_frame_scores`
+    /// (mahbot-1005 §4).  0.0 per-frame means the verifier was not evaluated on
+    /// that frame (warm-up period / untrained verifier), not a zero-confidence
+    /// rejection.
+    verifier_score_trajectory: Vec<f32>,
+    /// Number of classifier candidates created during this session (mahbot-1005 §4).
+    candidates_created: usize,
+    /// Number of candidates confirmed (detection fired via the verifier gate).
+    candidates_confirmed: usize,
+    /// Number of candidates cleared without confirmation (expired via
+    /// CANDIDATE_MAX_EMBEDDINGS or reset by a below-reset score frame).
+    candidates_expired: usize,
+    /// Index of the first classifier-trigger frame within `per_frame_scores`.
+    /// `None` when the classifier never triggered on test-utterance frames.
+    first_trigger_frame_idx: Option<usize>,
+    /// Max rolling sum achieved by warm-up audio only (mahbot-1005 §1).
+    warmup_max_rolling_sum: f32,
+    /// Peak verifier score achieved by warm-up audio only (mahbot-1005 §1).
+    warmup_peak_verifier_score: f32,
+    /// Number of frames where the classifier triggered but detection was
+    /// suppressed by verifier warm-up during the test run.
+    n_warmup_suppressed_frames: usize,
+    /// Number of embeddings attributed to the test utterance — the length of
+    /// `per_frame_scores` (one entry per scored embedding after the warm-up
+    /// instrumentation reset).  Unlike `n_embeddings` (ring length at end,
+    /// which includes the intentionally preserved warm-up embeddings and can be
+    /// cleared by a segment boundary), this counts only test-utterance frames.
+    n_test_embeddings: usize,
+    /// Verifier decision threshold in effect during this variant's processing.
+    /// Used as the `threshold_at_peak` evidence for miss classification.
+    verifier_threshold: f32,
+    /// Whether the verifier was trained (and therefore the second-stage gate
+    /// was active) during this variant's processing.  When `false`, the
+    /// verifier is a no-op and a miss after crossing the effective threshold
+    /// is a candidate lifecycle/timing issue, not a verifier rejection.
+    verifier_trained: bool,
+    /// Per-frame adaptive threshold trajectory (parallel to `per_frame_scores`,
+    /// mahbot-1005 §8).  Previously collected in `DetectionInstrumentation`
+    /// but never emitted in the benchmark report.
+    adaptive_threshold_trajectory: Vec<f32>,
+    /// Count of frames where the effective threshold hit ADAPTIVE_CEILING
+    /// (mahbot-1005 §8).
+    ceiling_limited_frames: usize,
+    /// Detection latency in ms for this variant (only meaningful when
+    /// `detected` is true; `None` otherwise).  Emitted per-variant so latency
+    /// outliers can be root-caused (mahbot-1005 §8).
+    latency_ms: Option<f64>,
+}
+
+/// Build a [`PerVariantResult`] from a completed [`run_streaming_detection`]
+/// session.  Shared by `test_detection_samples` and `run_noise_overlap_test`
+/// so the instrumentation-derived fields are populated identically everywhere
+/// (mahbot-1005 §9: negatives must carry the same detail as positives).
+fn build_per_variant_result(
+    label: &str,
+    result: &DetectionResult,
+    ctx: &super::PipelineCtx,
+    warmup_completed: bool,
+    warmup_n_embeddings: usize,
+    verifier: &VoiceVerifier,
+) -> PerVariantResult {
+    let peak = ctx.instrumentation.peak_score;
+    let max_rs = max_rolling_sum(&ctx.instrumentation.per_frame_scores);
+    // Test-utterance embedding count.  `per_frame_scores` is reset at the end
+    // of consume_warmup (mahbot-1005 §1) and grows one entry per scored
+    // embedding, so its length IS the test-utterance embedding count.  The
+    // alternative (ring length minus warm-up) is unreliable because a segment
+    // boundary during/after the test clears the embedding ring.
+    let n_test_embeddings = ctx.instrumentation.per_frame_scores.len();
+    PerVariantResult {
+        variant: label.to_string(),
+        detected: result.detected,
+        peak_score: peak,
+        max_rolling_sum: max_rs,
+        verifier_score: ctx.instrumentation.peak_verifier_score,
+        n_embeddings: ctx.embedding_ring.len(),
+        n_frames_below_reset: ctx.instrumentation.n_frames_below_reset,
+        agc_converged: ctx.audio_preprocessor.agc_converged(),
+        vad_speech_frames: ctx.instrumentation.vad_speech_frames,
+        per_frame_scores: ctx.instrumentation.per_frame_scores.clone(),
+        warmup_completed,
+        warmup_n_embeddings,
+        verifier_score_trajectory: ctx.instrumentation.per_frame_verifier_scores.clone(),
+        candidates_created: ctx.instrumentation.candidates_created,
+        candidates_confirmed: ctx.instrumentation.candidates_confirmed,
+        candidates_expired: ctx.instrumentation.candidates_expired,
+        first_trigger_frame_idx: ctx.instrumentation.first_trigger_frame_idx,
+        warmup_max_rolling_sum: ctx.instrumentation.warmup_max_rolling_sum,
+        warmup_peak_verifier_score: ctx.instrumentation.warmup_peak_verifier_score,
+        n_warmup_suppressed_frames: ctx.instrumentation.n_warmup_suppressed_frames,
+        n_test_embeddings,
+        verifier_threshold: verifier.threshold,
+        verifier_trained: verifier.is_trained(),
+        adaptive_threshold_trajectory: ctx.instrumentation.adaptive_threshold_trajectory.clone(),
+        ceiling_limited_frames: ctx.instrumentation.ceiling_limited_frames,
+        latency_ms: result.latency_ms,
+    }
+}
+
+// ── Exhaustive per-variant miss verdicts (mahbot-1005 §2) ─────────────────
+
+/// Exhaustive per-variant verdict for positive (wake word) test variants.
+///
+/// Replaces the old 3-way bucket (classifier / adaptive_threshold / verifier)
+/// which collapsed at least four distinct failure modes into a single
+/// "verifier" label and mis-bucketed zero-embedding misses (VAD never fired)
+/// as "classifier".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissVerdict {
+    /// Wake word detected on this variant.
+    Detected,
+    /// VAD produced no speech frames (or the test utterance produced zero
+    /// embeddings) — the classifier never saw test audio.
+    VadFailure,
+    /// Rolling sum never reached [`MIN_CLASSIFIER_THRESHOLD`] (2.13) on
+    /// test-utterance frames only.
+    ClassifierNoTrigger,
+    /// Crossed the hard floor ([`MIN_CLASSIFIER_THRESHOLD`] = 2.13) but never
+    /// crossed the effective adaptive threshold.
+    AdaptiveThresholdBlocked,
+    /// Crossed the effective threshold; a candidate existed but the verifier
+    /// peak stayed below the verifier decision threshold.
+    VerifierRejected,
+    /// Crossed the effective threshold and the verifier peak reached the
+    /// verifier threshold, yet detection did not fire — the candidate expired
+    /// ([`CANDIDATE_MAX_EMBEDDINGS`] exceeded) or the audio ended before
+    /// confirmation.  Also covers an untrained (no-op) verifier, where no
+    /// second-stage gate exists to reject.
+    VerifierTiming,
+    /// Warm-up was incomplete when the classifier triggered; the trigger was
+    /// suppressed by verifier warm-up ([`VERIFIER_WARMUP_EMBEDDINGS`]).
+    WarmupSuppression,
+    /// AGC explicitly reported non-convergence (`Some(false)`).
+    AgcFailure,
+}
+
+impl MissVerdict {
+    /// Stable snake_case label for JSON output.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Detected => "detected",
+            Self::VadFailure => "vad_failure",
+            Self::ClassifierNoTrigger => "classifier_no_trigger",
+            Self::AdaptiveThresholdBlocked => "adaptive_threshold_blocked",
+            Self::VerifierRejected => "verifier_rejected",
+            Self::VerifierTiming => "verifier_timing",
+            Self::WarmupSuppression => "warmup_suppression",
+            Self::AgcFailure => "agc_failure",
+        }
+    }
+}
+
+/// Classify a positive variant into an exhaustive verdict (mahbot-1005 §2).
+///
+/// ## Decision procedure (precedence, highest first)
+///
+/// 1. `detected` — no miss.
+/// 2. `vad_failure` — VAD never fired (zero speech frames) OR no embeddings
+///    were scored during the test utterance (`per_frame_scores` is empty after
+///    the warm-up instrumentation reset).  Score-based verdicts are meaningless
+///    when the classifier never saw test audio.  This fixes the old
+///    mis-bucketing where a zero-embedding miss was labeled "classifier".
+/// 3. `warmup_suppression` — warm-up incomplete AND the classifier triggered.
+///    The trigger was structurally suppressed before scoring, which is a more
+///    fundamental explanation than any score/AGC issue.
+/// 4. `agc_failure` — AGC explicitly reported `Some(false)`.  `None`
+///    (insufficient AGC-active frames) is NOT `agc_failure` — short utterances
+///    fall through to the score-based verdicts.
+/// 5. `classifier_no_trigger` — never reached [`MIN_CLASSIFIER_THRESHOLD`]
+///    (2.13) on test-utterance frames.
+/// 6. `adaptive_threshold_blocked` — reached the hard floor (2.13) but never
+///    reached the per-frame effective adaptive threshold.  "Hard floor" here is
+///    [`MIN_CLASSIFIER_THRESHOLD`] (the classifier-trigger condition), NOT
+///    [`ADAPTIVE_FLOOR`](super::ADAPTIVE_FLOOR) (the adaptive threshold's own
+///    clamp floor, which is an internal detail of the adaptive state).
+/// 7. `verifier_timing` / `verifier_rejected` — crossed the effective
+///    threshold; split by whether the verifier peak reached the verifier
+///    threshold (lifecycle/timing failure) or not (genuine rejection).
+fn classify_miss(pv: &PerVariantResult) -> MissVerdict {
+    if pv.detected {
+        return MissVerdict::Detected;
+    }
+    if pv.vad_speech_frames == 0 || pv.per_frame_scores.is_empty() {
+        return MissVerdict::VadFailure;
+    }
+    let triggered = pv.max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD;
+    if triggered && !pv.warmup_completed {
+        return MissVerdict::WarmupSuppression;
+    }
+    if pv.agc_converged == Some(false) {
+        return MissVerdict::AgcFailure;
+    }
+    if !triggered {
+        return MissVerdict::ClassifierNoTrigger;
+    }
+    let crossed_effective = pv
+        .per_frame_scores
+        .iter()
+        .any(|s| s[ROLLING_SUM_IDX] >= s[THRESHOLD_IDX]);
+    if !crossed_effective {
+        return MissVerdict::AdaptiveThresholdBlocked;
+    }
+    if !pv.verifier_trained {
+        // No second-stage gate: a miss after crossing the effective threshold
+        // is a candidate lifecycle/timing issue (expired or audio ended).
+        return MissVerdict::VerifierTiming;
+    }
+    if pv.verifier_score >= pv.verifier_threshold {
+        MissVerdict::VerifierTiming
+    } else {
+        MissVerdict::VerifierRejected
+    }
 }
 
 /// Extract the maximum rolling sum from per-frame score triples.
@@ -1453,19 +1695,33 @@ impl ClassifierTriggerMetrics {
         m
     }
 
-    /// The overall prevention rate: fraction of classifier triggers that did
-    /// NOT become full-pipeline false accepts (i.e. were caught by either
-    /// warm-up suppression or the verifier).
+    /// The verifier's prevention effectiveness: fraction of classifier triggers
+    /// that reached a fully-active verifier AND were rejected by it (i.e. did
+    /// NOT become full-pipeline false accepts).  Warm-up suppression is EXCLUDED
+    /// (mahbot-1005 §7): it is a pipeline-timing artefact, not verifier
+    /// discrimination, and mixing it in inflated the old metric.
     ///
-    /// Returns `None` when there are no classifier triggers (division by zero).
+    /// Returns `None` when there are no verifier-evaluated triggers
+    /// (division by zero).
     fn prevention_rate(&self) -> Option<f64> {
+        let prevented = self.verifier_caught;
+        let evaluated = self.verifier_caught + self.full_pipeline_fa;
+        if evaluated == 0 {
+            None
+        } else {
+            Some(prevented as f64 / evaluated as f64)
+        }
+    }
+
+    /// Fraction of classifier triggers suppressed because the verifier warm-up
+    /// was incomplete (mahbot-1005 §7).  Reported separately from
+    /// [`prevention_rate`](Self::prevention_rate) so warm-up suppression is
+    /// observable without being attributed to the verifier.
+    fn warmup_suppression_rate(&self) -> Option<f64> {
         if self.classifier_triggers == 0 {
             None
         } else {
-            Some(
-                (self.classifier_triggers - self.full_pipeline_fa) as f64
-                    / self.classifier_triggers as f64,
-            )
+            Some(self.warmup_suppressed as f64 / self.classifier_triggers as f64)
         }
     }
 
@@ -1498,7 +1754,266 @@ fn ct_to_json(ct: &ClassifierTriggerMetrics) -> serde_json::Value {
         "verifier_caught": ct.verifier_caught,
         "full_pipeline_fa": ct.full_pipeline_fa,
         "prevention_rate": ct.prevention_rate(),
+        "warmup_suppression_rate": ct.warmup_suppression_rate(),
     })
+}
+
+/// Full per-variant diagnostics for BOTH positive and negative variants
+/// (mahbot-1005 §9).  Negatives historically omitted per-frame scores, verifier
+/// trajectories, VAD/AGC detail and trigger-frame info — false-accept
+/// root-causing was impossible without them.  For positives (`category: None`)
+/// the exhaustive miss verdict and rejection-margin evidence are added.
+// Clippy: this is a pure JSON serialization shim — one insert per field; the
+// line count is inherent to the schema, not control flow worth splitting.
+#[expect(clippy::too_many_lines)]
+fn pv_to_json(pv: &PerVariantResult, category: Option<&str>) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("variant".to_string(), serde_json::json!(pv.variant));
+    if let Some(cat) = category {
+        obj.insert("category".to_string(), serde_json::json!(cat));
+    }
+    obj.insert("detected".to_string(), serde_json::json!(pv.detected));
+    obj.insert("peak_score".to_string(), serde_json::json!(pv.peak_score));
+    obj.insert(
+        "max_rolling_sum".to_string(),
+        serde_json::json!(pv.max_rolling_sum),
+    );
+    obj.insert(
+        "verifier_score".to_string(),
+        serde_json::json!(pv.verifier_score),
+    );
+    obj.insert(
+        "n_embeddings".to_string(),
+        serde_json::json!(pv.n_embeddings),
+    );
+    obj.insert(
+        "n_test_embeddings".to_string(),
+        serde_json::json!(pv.n_test_embeddings),
+    );
+    obj.insert(
+        "n_frames_below_reset".to_string(),
+        serde_json::json!(pv.n_frames_below_reset),
+    );
+    obj.insert(
+        "agc_converged".to_string(),
+        serde_json::json!(pv.agc_converged),
+    );
+    obj.insert(
+        "vad_speech_frames".to_string(),
+        serde_json::json!(pv.vad_speech_frames),
+    );
+    obj.insert(
+        "per_frame_scores".to_string(),
+        serde_json::json!(pv.per_frame_scores),
+    );
+    obj.insert(
+        "verifier_score_trajectory".to_string(),
+        serde_json::json!(pv.verifier_score_trajectory),
+    );
+    obj.insert(
+        "warmup_completed".to_string(),
+        serde_json::json!(pv.warmup_completed),
+    );
+    obj.insert(
+        "warmup_n_embeddings".to_string(),
+        serde_json::json!(pv.warmup_n_embeddings),
+    );
+    obj.insert(
+        "warmup_max_rolling_sum".to_string(),
+        serde_json::json!(pv.warmup_max_rolling_sum),
+    );
+    obj.insert(
+        "warmup_peak_verifier_score".to_string(),
+        serde_json::json!(pv.warmup_peak_verifier_score),
+    );
+    obj.insert(
+        "n_warmup_suppressed_frames".to_string(),
+        serde_json::json!(pv.n_warmup_suppressed_frames),
+    );
+    obj.insert(
+        "candidates_created".to_string(),
+        serde_json::json!(pv.candidates_created),
+    );
+    obj.insert(
+        "candidates_confirmed".to_string(),
+        serde_json::json!(pv.candidates_confirmed),
+    );
+    obj.insert(
+        "candidates_expired".to_string(),
+        serde_json::json!(pv.candidates_expired),
+    );
+    obj.insert(
+        "first_trigger_frame_idx".to_string(),
+        serde_json::json!(pv.first_trigger_frame_idx),
+    );
+    obj.insert(
+        "verifier_threshold".to_string(),
+        serde_json::json!(pv.verifier_threshold),
+    );
+    obj.insert(
+        "verifier_trained".to_string(),
+        serde_json::json!(pv.verifier_trained),
+    );
+    obj.insert("latency_ms".to_string(), serde_json::json!(pv.latency_ms));
+    // Positive-only miss evidence (mahbot-1005 §2/§3/§4).
+    if category.is_none() {
+        let verdict = classify_miss(pv);
+        obj.insert("verdict".to_string(), serde_json::json!(verdict.as_str()));
+        if pv.verifier_trained && !pv.detected {
+            obj.insert(
+                "verifier_rejection_margin".to_string(),
+                serde_json::json!((pv.verifier_threshold - pv.verifier_score).max(0.0)),
+            );
+        }
+        // Trigger-point evidence (mahbot-1005 §3): the classifier's score at the
+        // first trigger frame and where in the utterance it occurred.  VAD is
+        // binary (is_speech), so "noise burst" vs "silence" at the trigger
+        // cannot be distinguished by VAD alone — the frame's total_score vs
+        // NO_MATCH_RESET_THRESHOLD is the closest signal and is reported raw.
+        if let Some(idx) = pv.first_trigger_frame_idx
+            && let Some(frame) = pv.per_frame_scores.get(idx)
+        {
+            let frac = if pv.per_frame_scores.is_empty() {
+                0.0
+            } else {
+                idx as f64 / pv.per_frame_scores.len() as f64
+            };
+            obj.insert(
+                "trigger_frame_total_score".to_string(),
+                serde_json::json!(frame[0]),
+            );
+            obj.insert(
+                "trigger_frame_rolling_sum".to_string(),
+                serde_json::json!(frame[ROLLING_SUM_IDX]),
+            );
+            obj.insert(
+                "trigger_frame_effective_threshold".to_string(),
+                serde_json::json!(frame[THRESHOLD_IDX]),
+            );
+            obj.insert("trigger_position_frac".to_string(), serde_json::json!(frac));
+            obj.insert(
+                "trigger_frame_kind".to_string(),
+                serde_json::json!(if frac <= 0.25 {
+                    "speech_onset"
+                } else {
+                    "sustained_speech"
+                }),
+            );
+        }
+        // "never evaluated" vs "rejected with zero confidence" (mahbot-1005 §4):
+        // a verifier_score of 0.0 means the verifier was never evaluated when
+        // the warm-up was incomplete or the verifier is untrained; otherwise it
+        // is a genuine zero-confidence evaluation.
+        if pv.verifier_score == 0.0 {
+            let meaning =
+                if pv.verifier_trained && pv.warmup_completed && !pv.per_frame_scores.is_empty() {
+                    "evaluated_zero_confidence"
+                } else {
+                    "never_evaluated"
+                };
+            obj.insert(
+                "verifier_score_meaning".to_string(),
+                serde_json::json!(meaning),
+            );
+        }
+    }
+    serde_json::Value::Object(obj)
+}
+
+// ── Distribution helpers (mahbot-1005 §3/§4) ──────────────────────────────
+
+/// Decile boundaries of a score distribution (10 values, min→max inclusive of
+/// each 10% quantile).  Returns `None` for empty input (mahbot-1005 §3).
+fn deciles(scores: &[f32]) -> Option<[f32; 10]> {
+    if scores.is_empty() {
+        return None;
+    }
+    let mut sorted = scores.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out = [0.0_f32; 10];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let idx = ((sorted.len() - 1) as f32 * (i as f32 + 0.5) / 10.0).round() as usize;
+        *slot = sorted[idx.min(sorted.len() - 1)];
+    }
+    Some(out)
+}
+
+/// Fixed-range histogram with `n_buckets` buckets over `[lo, hi]`.  Values
+/// below `lo` fall into bucket 0, values above `hi` into the last bucket.
+fn histogram_buckets(scores: &[f32], n_buckets: usize, lo: f32, hi: f32) -> Vec<usize> {
+    let mut buckets = vec![0usize; n_buckets.max(1)];
+    if scores.is_empty() || n_buckets == 0 {
+        return buckets;
+    }
+    let span = (hi - lo).max(f32::EPSILON);
+    for &s in scores {
+        let t = ((s - lo) / span * n_buckets as f32).clamp(0.0, n_buckets as f32 - 1.0);
+        buckets[t as usize] += 1;
+    }
+    buckets
+}
+
+/// Identify the PCM augmentation type from a variant label (mahbot-1005 §6).
+/// Labels are produced by [`pcm_augment_enrollment_variants`] with one of five
+/// suffixes: `_original`, `_speed_down`, `_speed_up`, `_vol_down`, `_noise`.
+fn augmentation_type(label: &str) -> &'static str {
+    if label.ends_with("_speed_down") {
+        "speed_down"
+    } else if label.ends_with("_speed_up") {
+        "speed_up"
+    } else if label.ends_with("_vol_down") {
+        "vol_down"
+    } else if label.ends_with("_noise") {
+        "noise"
+    } else if label.ends_with("_original") {
+        "original"
+    } else {
+        "other"
+    }
+}
+
+/// L2-normalized mean embedding (centroid) of the given sequences' embeddings.
+/// Returns `None` when no embeddings exist (mahbot-1005 §6).
+fn embedding_centroid(
+    sequences: &[crate::audio::embedding_sequence::EmbeddingSequence],
+) -> Option<Vec<f32>> {
+    let mut n = 0usize;
+    let mut sum: Option<Vec<f32>> = None;
+    for seq in sequences {
+        for emb in &seq.embeddings {
+            match &mut sum {
+                Some(s) => {
+                    debug_assert_eq!(s.len(), emb.len());
+                    for (a, b) in s.iter_mut().zip(emb) {
+                        *a += b;
+                    }
+                }
+                None => sum = Some(emb.clone()),
+            }
+            n += 1;
+        }
+    }
+    let mut centroid = sum?;
+    for v in &mut centroid {
+        *v /= n as f32;
+    }
+    let norm = centroid
+        .iter()
+        .map(|v| v * v)
+        .sum::<f32>()
+        .sqrt()
+        .max(1e-10);
+    for v in &mut centroid {
+        *v /= norm;
+    }
+    Some(centroid)
+}
+
+/// Cosine similarity between two equal-length vectors (L2-normalizes on the fly).
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let na = a.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
+    let nb = b.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
+    a.iter().zip(b).map(|(x, y)| x * y / (na * nb)).sum::<f32>()
 }
 
 /// Process a list of audio clips through the detection pipeline, recording
@@ -1566,7 +2081,6 @@ fn test_detection_samples(
             **state = ctx.adaptive_threshold.clone();
         }
         let peak = ctx.instrumentation.peak_score;
-        let max_rs = max_rolling_sum(&ctx.instrumentation.per_frame_scores);
         if result.detected {
             if let Some(lat) = result.latency_ms {
                 metrics.latencies.push(lat);
@@ -1574,21 +2088,15 @@ fn test_detection_samples(
             on_detection(metrics, label);
         }
         // Record per-variant result (mahbot-845) with verifier score (mahbot-859)
-        // and per-variant instrumentation (mahbot-886).
-        metrics.per_variant.push(PerVariantResult {
-            variant: label.clone(),
-            detected: result.detected,
-            peak_score: peak,
-            max_rolling_sum: max_rs,
-            verifier_score: ctx.instrumentation.peak_verifier_score,
-            n_embeddings: ctx.embedding_ring.len(),
-            n_frames_below_reset: ctx.instrumentation.n_frames_below_reset,
-            agc_converged: ctx.audio_preprocessor.agc_converged(),
-            vad_speech_frames: ctx.instrumentation.vad_speech_frames,
-            per_frame_scores: ctx.instrumentation.per_frame_scores.clone(),
+        // and per-variant instrumentation (mahbot-886, mahbot-1005).
+        metrics.per_variant.push(build_per_variant_result(
+            label,
+            &result,
+            &ctx,
             warmup_completed,
             warmup_n_embeddings,
-        });
+            verifier,
+        ));
         info!(
             "  Variant {}/{}: {label} — {} (peak_score={:.4})",
             i + 1,
@@ -1620,13 +2128,14 @@ fn apply_gain(samples: &[f32], gain_db: f32, hard_clip: bool) -> Vec<f32> {
 
 /// Run an informational volume sweep on positive detection variants.
 ///
-/// Reports detection rate per level.  Not gated — results are reported in
-/// the JSON output for analysis.
+/// Reports detection rate per level plus per-variant peak-score distributions
+/// so the sweep shows not just pass/fail but HOW scores degrade with volume
+/// (mahbot-1005 §8).  Not gated — results are reported in the JSON output.
 fn run_volume_sweep(
     positive_variants: &[(Vec<f32>, String)],
     classifier: &WakeWordClassifier,
     verifier: &VoiceVerifier,
-) -> Vec<(&'static str, f64)> {
+) -> Vec<(&'static str, f64, Vec<f32>, Vec<f32>)> {
     let mut results = Vec::new();
     for (label, gain_db, hard_clip) in VOLUME_SWEEP_LEVELS {
         let mut metrics = DetectionMetrics::default();
@@ -1648,8 +2157,14 @@ fn run_volume_sweep(
             None,
         );
         let rate = metrics.detection_rate();
+        let peak_scores: Vec<f32> = metrics.per_variant.iter().map(|pv| pv.peak_score).collect();
+        let rolling_sums: Vec<f32> = metrics
+            .per_variant
+            .iter()
+            .map(|pv| pv.max_rolling_sum)
+            .collect();
         info!("Volume sweep {label} ({gain_db}dB): {:.1}%", rate * 100.0);
-        results.push((*label, rate));
+        results.push((*label, rate, peak_scores, rolling_sums));
     }
     results
 }
@@ -1785,12 +2300,14 @@ fn mix_at_snr(speech: &[f32], noise: &[f32], snr_db: f32) -> Vec<f32> {
 /// Run noise-overlapped detection tests.
 ///
 /// For each combination of SNR level and noise type, mix the wake word
-/// variants with the noise and test detection.
+/// variants with the noise and test detection.  Returns `(key, rate,
+/// per_variant_detail)` per combination so per-variant peak scores and verifier
+/// evidence are available for false-reject root-causing (mahbot-1005 §8).
 fn run_noise_overlap_test(
     positive_variants: &[(Vec<f32>, String)],
     classifier: &WakeWordClassifier,
     verifier: &VoiceVerifier,
-) -> Vec<(String, f64)> {
+) -> Vec<(String, f64, Vec<serde_json::Value>)> {
     // Set classifier + verifier in global state (test_detection_samples does
     // this too but we inline the loop to share adaptive state across variants).
     super::set_classifier_weights(classifier.weights_ref().clone());
@@ -1832,39 +2349,36 @@ fn run_noise_overlap_test(
                 // Persist the updated adaptive state for the next variant.
                 shared_adaptive = ctx.adaptive_threshold.clone();
 
-                let peak = ctx.instrumentation.peak_score;
-                let max_rs = max_rolling_sum(&ctx.instrumentation.per_frame_scores);
                 if result.detected {
                     if let Some(lat) = result.latency_ms {
                         metrics.latencies.push(lat);
                     }
                     metrics.detected += 1;
                 }
-                metrics.per_variant.push(PerVariantResult {
-                    variant: label.clone(),
-                    detected: result.detected,
-                    peak_score: peak,
-                    max_rolling_sum: max_rs,
-                    verifier_score: ctx.instrumentation.peak_verifier_score,
-                    n_embeddings: ctx.embedding_ring.len(),
-                    n_frames_below_reset: ctx.instrumentation.n_frames_below_reset,
-                    agc_converged: ctx.audio_preprocessor.agc_converged(),
-                    vad_speech_frames: ctx.instrumentation.vad_speech_frames,
-                    per_frame_scores: ctx.instrumentation.per_frame_scores.clone(),
+                metrics.per_variant.push(build_per_variant_result(
+                    label,
+                    &result,
+                    &ctx,
                     warmup_completed,
                     warmup_n_embeddings,
-                });
+                    verifier,
+                ));
             }
 
             let rate = metrics.detection_rate();
             let key = format!("{snr_label}_{noise_label}");
+            let detail: Vec<serde_json::Value> = metrics
+                .per_variant
+                .iter()
+                .map(|pv| pv_to_json(pv, Some("noise_overlap")))
+                .collect();
             info!(
                 "Noise overlap {snr_label} / {noise_label}: {:.1}% detection ({}/{})",
                 rate * 100.0,
                 metrics.detected,
                 metrics.total,
             );
-            results.push((key, rate));
+            results.push((key, rate, detail));
         }
     }
 
@@ -2372,7 +2886,7 @@ pub(crate) fn run_internal() {
     // ── Phase 5: Train the VoiceVerifier (mahbot-855, mahbot-861) ─────────
     phase_start!("Phase 5: Training VoiceVerifier");
 
-    let verifier = VoiceVerifier::train(
+    let (verifier, verifier_metrics) = VoiceVerifier::train_with_metrics(
         &pos_sequences,
         &verifier_neg_sequences,
         Some(&per_negative_sequence_weights), // per-sequence weights matching production (mahbot-870 Fix 3)
@@ -2424,9 +2938,9 @@ pub(crate) fn run_internal() {
     let mut unrelated_metrics = DetectionMetrics::default();
     let mut silence_metric = DetectionMetrics::default();
     let mut noise_false_accepts: Vec<String> = Vec::new();
-    let mut volume_sweep_results: Vec<(&str, f64)> = Vec::new();
+    let mut volume_sweep_results: Vec<(&'static str, f64, Vec<f32>, Vec<f32>)> = Vec::new();
     let mut mid_utterance_results: Vec<(&str, bool)> = Vec::new();
-    let mut noise_overlap_results: Vec<(String, f64)> = Vec::new();
+    let mut noise_overlap_results: Vec<(String, f64, Vec<serde_json::Value>)> = Vec::new();
     // Per-tier confusable fa tracking (mahbot-871). Populated after Phase 9.
     let mut conf_fa_by_tier: [Vec<String>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let conf_fa_hard_variants: Vec<(Vec<f32>, String)>;
@@ -2435,6 +2949,16 @@ pub(crate) fn run_internal() {
     // detection block (or remain at defaults when degenerate).
     let (mut lat_mean, mut lat_median, mut lat_p95) = (0.0_f64, 0.0_f64, 0.0_f64);
     let mut latency_samples = 0usize;
+
+    // Cooldown-phase detection time — hoisted from the detection block so the
+    // JSON report can emit it even when the classifier is degenerate
+    // (mahbot-1005 §8).
+    let mut cooldown_detection_time_ms = 0.0f64;
+    // Cooldown test outcomes (None = test skipped).  Emitted in the JSON
+    // report so cooldown behaviour is observable (mahbot-1005 §8).
+    let mut cooldown_first_detected: Option<bool> = None;
+    let mut cooldown_suppressed: Option<bool> = None;
+    let mut cooldown_after_recovered: Option<bool> = None;
 
     // Per-variant metrics for noise profiles (collected across all profiles).
     let mut noise_metrics: Vec<DetectionMetrics> = Vec::new();
@@ -2596,7 +3120,6 @@ pub(crate) fn run_internal() {
         // over 512ms long — the first ~512ms is consumed by the built-in warm-up
         // suppression, and the remaining audio is long enough to fire detection.
         info!("─── {}. Cooldown verification ───", P_COOLDOWN + 1);
-        let mut cooldown_detection_time_ms = 0.0f64;
         if let Some((first_pos, _label)) = pos_test_variants.first() {
             let mut ctx = super::PipelineCtx::new();
             // Propagate the shared adaptive state accumulated across phases 8-12
@@ -2610,6 +3133,7 @@ pub(crate) fn run_internal() {
             let detected = run_streaming_detection(first_pos, &mut ctx);
             cooldown_detection_time_ms += t0.elapsed().as_secs_f64() * 1000.0;
             if !detected.detected {
+                cooldown_first_detected = Some(false);
                 warn!(
                     "Cooldown test: first detection should fire but didn't (detection rate is 0/{} — skipping cooldown)",
                     pos_test_variants.len()
@@ -2617,6 +3141,7 @@ pub(crate) fn run_internal() {
                 // Skip remaining cooldown assertions since detection didn't fire.
                 // The test will still exercise noise overlap and other phases.
             } else {
+                cooldown_first_detected = Some(true);
                 info!("Cooldown test: first detection fired ✓");
 
                 // Detection 2: should NOT fire during cooldown
@@ -2625,8 +3150,10 @@ pub(crate) fn run_internal() {
                 let silenced = run_streaming_detection(first_pos, &mut ctx);
                 cooldown_detection_time_ms += t1.elapsed().as_secs_f64() * 1000.0;
                 if silenced.detected {
+                    cooldown_suppressed = Some(false);
                     warn!("Cooldown test: detection fired during cooldown — unexpected");
                 } else {
+                    cooldown_suppressed = Some(true);
                     info!("Cooldown test: cooldown prevented re-detection ✓");
                 }
                 if ctx.last_wake_word_detection != before_cooldown {
@@ -2648,8 +3175,10 @@ pub(crate) fn run_internal() {
                 let after_cooldown = run_streaming_detection(first_pos, &mut ctx);
                 cooldown_detection_time_ms += t2.elapsed().as_secs_f64() * 1000.0;
                 if !after_cooldown.detected {
+                    cooldown_after_recovered = Some(false);
                     warn!("Cooldown test: detection should fire after cooldown expires but didn't");
                 } else {
+                    cooldown_after_recovered = Some(true);
                     info!("Cooldown test: detection fired after cooldown ✓");
                 }
             } // close the if detected.detected/else block
@@ -2916,29 +3445,62 @@ pub(crate) fn run_internal() {
         0.0
     };
 
-    // Post-hoc sweep: find the maximum verifier threshold that achieves ≥ the
-    // benchmark's actual detection rate.  This gives the highest threshold at
-    // which the pipeline could operate without losing any detected variants.
-    let mut post_hoc_optimal = verifier_training_threshold;
+    // Collect negative verifier scores across ALL negative categories so the
+    // threshold sweep accounts for false-accept impact (mahbot-1005 §7).  The
+    // old sweep optimised positives only, which is blind to false accepts.
+    let mut neg_verifier_scores: Vec<f32> = Vec::new();
+    for pv in &conf_metrics.per_variant {
+        neg_verifier_scores.push(pv.verifier_score);
+    }
+    for pv in &unrelated_metrics.per_variant {
+        neg_verifier_scores.push(pv.verifier_score);
+    }
+    for pv in &silence_metric.per_variant {
+        neg_verifier_scores.push(pv.verifier_score);
+    }
+    for metric in &noise_metrics {
+        for pv in &metric.per_variant {
+            neg_verifier_scores.push(pv.verifier_score);
+        }
+    }
+    let n_neg_total = neg_verifier_scores.len();
+
+    // ── Dual sweep (mahbot-1005 §7) ────────────────────────────────────────
+    // Sweep BOTH positives and negatives, mirroring the training calibration:
+    // maximise TPR - λ×FPR subject to TPR ≥ 0.90, preferring higher thresholds
+    // on ties (fewer false accepts).  This replaces the positives-only sweep
+    // that ignored false-accept impact entirely.
+    let sweep_steps = (1.0 / CALIBRATION_SWEEP_STEP).round() as usize + 1;
+    let mut benchmark_dual_threshold = verifier_training_threshold;
+    let mut dual_sweep_dr = benchmark_detection_rate;
+    let mut dual_sweep_far = if n_neg_total > 0 { 1.0 } else { 0.0 };
     if n_pos_total > 0 {
-        // Full sweep to find the best operating point.
-        // Sweep all thresholds and find the one that maximizes DR while
-        // being as high as possible (conservative — favors fewer false accepts).
-        // Uses CALIBRATION_SWEEP_STEP to stay in sync with training calibration.
-        let sweep_steps = (1.0 / CALIBRATION_SWEEP_STEP).round() as usize + 1;
-        let mut best_threshold = verifier_training_threshold;
-        let mut best_dr = 0.0f64;
+        let mut best_youden = f64::NEG_INFINITY;
         for step in 0..sweep_steps {
             let t = step as f32 * CALIBRATION_SWEEP_STEP;
-            let detected = pos_verifier_scores.iter().filter(|&&s| s >= t).count();
-            let dr = detected as f64 / n_pos_total as f64;
-            // Prefer higher threshold for same DR (fewer false accepts).
-            if dr > best_dr || (dr == best_dr && t > best_threshold) {
-                best_dr = dr;
-                best_threshold = t;
+            let tp = pos_verifier_scores.iter().filter(|&&s| s >= t).count();
+            let fp = neg_verifier_scores.iter().filter(|&&s| s >= t).count();
+            let tpr = tp as f64 / n_pos_total as f64;
+            let fpr = if n_neg_total > 0 {
+                fp as f64 / n_neg_total as f64
+            } else {
+                0.0
+            };
+            let youden = tpr - f64::from(CALIBRATION_LAMBDA) * fpr;
+            let feasible = tpr >= 0.90;
+            // Lexicographic maximisation over (Youden, threshold): prefer the
+            // higher Youden, breaking ties toward the higher threshold (fewer
+            // false accepts).  Tuple comparison avoids clippy::float_cmp on
+            // the original `youden == best_youden` tie-break.
+            let candidate = (youden, f64::from(t));
+            let best = (best_youden, f64::from(benchmark_dual_threshold));
+            if feasible && candidate > best {
+                best_youden = youden;
+                benchmark_dual_threshold = t;
+                dual_sweep_dr = tpr;
+                dual_sweep_far = fpr;
             }
         }
-        post_hoc_optimal = best_threshold;
     }
 
     // Compute the suggested MIN_DETECTION_RATE constant.
@@ -2954,12 +3516,12 @@ pub(crate) fn run_internal() {
         0.0
     };
 
-    let threshold_divergence = (post_hoc_optimal - verifier_training_threshold).abs();
+    let threshold_divergence = (benchmark_dual_threshold - verifier_training_threshold).abs();
 
     info!(
         "Verifier threshold analysis (mahbot-997): \
          training_threshold={verifier_training_threshold:.4}, \
-         benchmark-optimal threshold (post-hoc)={post_hoc_optimal:.4}, \
+         benchmark-optimal threshold (post-hoc dual sweep)={benchmark_dual_threshold:.4}, \
          divergence={threshold_divergence:.4}",
     );
     info!(
@@ -2973,10 +3535,10 @@ pub(crate) fn run_internal() {
     // suggest λ adjustment in Stage 1 calibration.
     if verifier.is_trained() && threshold_divergence > 0.05 {
         let suggested_lambda =
-            CALIBRATION_LAMBDA * (post_hoc_optimal / verifier_training_threshold);
+            CALIBRATION_LAMBDA * (benchmark_dual_threshold / verifier_training_threshold);
         warn!(
             "Verifier threshold divergence > 0.05: training={verifier_training_threshold:.4} vs \
-             benchmark={post_hoc_optimal:.4} (Δ={threshold_divergence:.4}).  \
+             benchmark={benchmark_dual_threshold:.4} (Δ={threshold_divergence:.4}).  \
              Consider adjusting Stage 1 λ from {CALIBRATION_LAMBDA:.1} to ~{suggested_lambda:.1} \
              (λ_new = λ_old × benchmark_threshold / training_threshold).  \
              Re-run benchmark to validate.",
@@ -2989,7 +3551,7 @@ pub(crate) fn run_internal() {
 
     // Noise-overlap: at 10 dB SNR, flag any entry whose rate falls below 0.75
     // (mahbot-845 acceptance criteria).  Warnings only — report-only (mahbot-953).
-    for (key, rate) in &noise_overlap_results {
+    for (key, rate, _detail) in &noise_overlap_results {
         if key.starts_with("10dB") && *rate < 0.75 {
             warn!(
                 "Noise-overlap 10dB assertion FAILED: {key} rate={:.1}% (<75%)",
@@ -3006,10 +3568,18 @@ pub(crate) fn run_internal() {
 
     // Build the JSON output
     let mut volume_sweep_map = serde_json::Map::new();
-    for (label, rate) in &volume_sweep_results {
+    for (label, rate, peak_scores, rolling_sums) in &volume_sweep_results {
         volume_sweep_map.insert(
             format!("{}_rate", label.replace('-', "_")),
             serde_json::json!(rate),
+        );
+        volume_sweep_map.insert(
+            format!("{}_peak_scores", label.replace('-', "_")),
+            serde_json::json!(peak_scores),
+        );
+        volume_sweep_map.insert(
+            format!("{}_rolling_sums", label.replace('-', "_")),
+            serde_json::json!(rolling_sums),
         );
     }
 
@@ -3021,62 +3591,31 @@ pub(crate) fn run_internal() {
         );
     }
 
-    // Build per-variant negative diagnostics with verifier scores (mahbot-859).
-    // Confusable variants are always tier-qualified (mahbot-871).
-    let mut negative_pv: Vec<serde_json::Value> = Vec::new();
+    // Build per-variant negative diagnostics with FULL per-variant detail
+    // (mahbot-1005 §9).  Confusable variants are always tier-qualified
+    // (mahbot-871).  The flat list is reused for score distributions,
+    // verifier histograms, and rejection margins below.
+    let mut all_neg_pv: Vec<(&PerVariantResult, String)> = Vec::new();
     for pv in &conf_metrics.per_variant {
         let phrase = phrase_from_label(&pv.variant, "confusable");
         let variant_tier = tier_for_phrase(phrase);
-        let category = format!("confusable_{}", variant_tier.as_str());
-        negative_pv.push(serde_json::json!({
-            "variant": pv.variant,
-            "detected": pv.detected,
-            "peak_score": pv.peak_score,
-            "max_rolling_sum": pv.max_rolling_sum,
-            "verifier_score": pv.verifier_score,
-            "category": category,
-            "warmup_completed": pv.warmup_completed,
-            "warmup_n_embeddings": pv.warmup_n_embeddings,
-        }));
+        all_neg_pv.push((pv, format!("confusable_{}", variant_tier.as_str())));
     }
     for pv in &unrelated_metrics.per_variant {
-        negative_pv.push(serde_json::json!({
-            "variant": pv.variant,
-            "detected": pv.detected,
-            "peak_score": pv.peak_score,
-            "max_rolling_sum": pv.max_rolling_sum,
-            "verifier_score": pv.verifier_score,
-            "category": "unrelated",
-            "warmup_completed": pv.warmup_completed,
-            "warmup_n_embeddings": pv.warmup_n_embeddings,
-        }));
+        all_neg_pv.push((pv, "unrelated".to_string()));
     }
     for pv in &silence_metric.per_variant {
-        negative_pv.push(serde_json::json!({
-            "variant": pv.variant,
-            "detected": pv.detected,
-            "peak_score": pv.peak_score,
-            "max_rolling_sum": pv.max_rolling_sum,
-            "verifier_score": pv.verifier_score,
-            "category": "silence",
-            "warmup_completed": pv.warmup_completed,
-            "warmup_n_embeddings": pv.warmup_n_embeddings,
-        }));
+        all_neg_pv.push((pv, "silence".to_string()));
     }
     for metric in &noise_metrics {
         for pv in &metric.per_variant {
-            negative_pv.push(serde_json::json!({
-                "variant": pv.variant,
-                "detected": pv.detected,
-                "peak_score": pv.peak_score,
-                "max_rolling_sum": pv.max_rolling_sum,
-                "verifier_score": pv.verifier_score,
-                "category": "noise",
-                "warmup_completed": pv.warmup_completed,
-                "warmup_n_embeddings": pv.warmup_n_embeddings,
-            }));
+            all_neg_pv.push((pv, "noise".to_string()));
         }
     }
+    let negative_pv: Vec<serde_json::Value> = all_neg_pv
+        .iter()
+        .map(|(pv, cat)| pv_to_json(pv, Some(cat)))
+        .collect();
 
     // Build per-tier results dict
     let mut results_map = serde_json::Map::new();
@@ -3099,33 +3638,262 @@ pub(crate) fn run_internal() {
         );
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // mahbot-1005 diagnostics: verdicts, distributions, verifier evidence,
+    // train/test alignment, and reproducibility metadata
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ── Exhaustive per-variant verdicts for positives (§2) ──
+    let mut verdict_counts: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    for pv in &pos_metrics.per_variant {
+        *verdict_counts
+            .entry(classify_miss(pv).as_str())
+            .or_insert(0) += 1;
+    }
+
+    // ── Classifier discrimination evidence (§3) ──
+    // Peak-score distributions (warm-up excluded after the §1 instrumentation
+    // reset) plus per-frame threshold crossing fractions.
+    let pos_peak_scores: Vec<f32> = pos_metrics
+        .per_variant
+        .iter()
+        .map(|pv| pv.peak_score)
+        .collect();
+    let neg_peak_scores: Vec<f32> = all_neg_pv.iter().map(|(pv, _)| pv.peak_score).collect();
+
+    let pos_frame_crossing = {
+        let total_frames: usize = pos_metrics
+            .per_variant
+            .iter()
+            .map(|pv| pv.per_frame_scores.len())
+            .sum();
+        let below_threshold: usize = pos_metrics
+            .per_variant
+            .iter()
+            .flat_map(|pv| &pv.per_frame_scores)
+            .filter(|s| s[ROLLING_SUM_IDX] < MIN_CLASSIFIER_THRESHOLD)
+            .count();
+        (total_frames, below_threshold)
+    };
+    let neg_frame_crossing = {
+        let total_frames: usize = all_neg_pv
+            .iter()
+            .map(|(pv, _)| pv.per_frame_scores.len())
+            .sum();
+        let above_threshold: usize = all_neg_pv
+            .iter()
+            .flat_map(|(pv, _)| &pv.per_frame_scores)
+            .filter(|s| s[ROLLING_SUM_IDX] >= MIN_CLASSIFIER_THRESHOLD)
+            .count();
+        (total_frames, above_threshold)
+    };
+
+    // ── Verifier evidence (§4) ──
+    // Per-category verifier peak-score histograms over [0,1] with 20 buckets.
+    let verifier_hist_buckets = 20usize;
+    let mut verifier_hist: std::collections::BTreeMap<String, serde_json::Value> =
+        std::collections::BTreeMap::new();
+    let pos_vscores: Vec<f32> = pos_metrics
+        .per_variant
+        .iter()
+        .map(|pv| pv.verifier_score)
+        .collect();
+    verifier_hist.insert(
+        "positive".to_string(),
+        serde_json::json!({
+            "histogram": histogram_buckets(&pos_vscores, verifier_hist_buckets, 0.0, 1.0),
+            "deciles": deciles(&pos_vscores),
+            "n": pos_vscores.len(),
+        }),
+    );
+    for cat in [
+        "confusable_easy",
+        "confusable_medium",
+        "confusable_hard",
+        "unrelated",
+        "silence",
+        "noise",
+    ] {
+        let scores: Vec<f32> = all_neg_pv
+            .iter()
+            .filter(|(_, c)| c == cat)
+            .map(|(pv, _)| pv.verifier_score)
+            .collect();
+        verifier_hist.insert(
+            cat.to_string(),
+            serde_json::json!({
+                "histogram": histogram_buckets(&scores, verifier_hist_buckets, 0.0, 1.0),
+                "deciles": deciles(&scores),
+                "n": scores.len(),
+            }),
+        );
+    }
+
+    // Candidate lifecycle totals across all positive + negative variants.
+    let candidate_lifecycle = {
+        let mut created = 0usize;
+        let mut confirmed = 0usize;
+        let mut expired = 0usize;
+        for pv in pos_metrics
+            .per_variant
+            .iter()
+            .chain(all_neg_pv.iter().map(|(pv, _)| *pv))
+        {
+            created += pv.candidates_created;
+            confirmed += pv.candidates_confirmed;
+            expired += pv.candidates_expired;
+        }
+        serde_json::json!({ "created": created, "confirmed": confirmed, "expired": expired })
+    };
+
+    // Rejection margins (threshold − verifier_peak) for variants that were
+    // evaluated by a trained verifier and rejected (peak below threshold).
+    let rejection_margins: Vec<serde_json::Value> = pos_metrics
+        .per_variant
+        .iter()
+        .chain(all_neg_pv.iter().map(|(pv, _)| *pv))
+        .filter(|pv| {
+            pv.verifier_trained
+                && !pv.detected
+                && pv.verifier_score < pv.verifier_threshold
+                && pv.verifier_score > 0.0
+        })
+        .map(|pv| {
+            serde_json::json!({
+                "variant": pv.variant,
+                "verifier_peak": pv.verifier_score,
+                "threshold": pv.verifier_threshold,
+                "margin": pv.verifier_threshold - pv.verifier_score,
+            })
+        })
+        .collect();
+
+    // ── Per-augmentation detection rates (§6) ──
+    // Discloses whether the tail-of-list 2/3-1/3 split (by list order) biases
+    // specific augmentation types.  Labels carry `_original/_speed_down/...`
+    // suffixes from pcm_augment_enrollment_variants.
+    let mut aug_counts: std::collections::BTreeMap<&'static str, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    for pv in &pos_metrics.per_variant {
+        let aug = augmentation_type(&pv.variant);
+        let e = aug_counts.entry(aug).or_insert((0, 0));
+        e.1 += 1;
+        if pv.detected {
+            e.0 += 1;
+        }
+    }
+    let per_augmentation: serde_json::Value = serde_json::Value::Object(
+        aug_counts
+            .iter()
+            .map(|(aug, (detected, total))| {
+                (
+                    (*aug).to_string(),
+                    serde_json::json!({
+                        "detected": detected,
+                        "total": total,
+                        "rate": if *total > 0 { *detected as f64 / *total as f64 } else { 0.0 },
+                    }),
+                )
+            })
+            .collect(),
+    );
+
+    // ── Train/test alignment (§6) ──
+    // Embedding cosine similarity between held-out test variants and the
+    // training centroid.  The centroid is the L2-normalised mean of all
+    // training embeddings (pos_sequences); each test variant's embeddings are
+    // recomputed via the same extraction path used for training
+    // (process_enrollment_sample), so the comparison is apples-to-apples.
+    let train_centroid = embedding_centroid(&pos_sequences);
+    let mut test_centroid_sims: Vec<(String, f32)> = Vec::new();
+    if !degenerate && let Some(centroid) = &train_centroid {
+        for (pcm, label) in &pos_test_variants {
+            if let Ok(embs) = super::process_enrollment_sample(pcm)
+                && !embs.is_empty()
+            {
+                let mut mean = vec![0.0_f32; embs[0].len()];
+                for e in &embs {
+                    debug_assert_eq!(mean.len(), e.len());
+                    for (a, b) in mean.iter_mut().zip(e) {
+                        *a += b;
+                    }
+                }
+                for v in &mut mean {
+                    *v /= embs.len() as f32;
+                }
+                test_centroid_sims.push((label.clone(), cosine_similarity(&mean, centroid)));
+            }
+        }
+    }
+    let test_centroid_sim_stats = {
+        let sims: Vec<f32> = test_centroid_sims.iter().map(|(_, s)| *s).collect();
+        serde_json::json!({
+            "n": sims.len(),
+            "min": deciles(&sims).map(|d| d[0]),
+            "mean": if sims.is_empty() { None } else {
+                Some(sims.iter().copied().sum::<f32>() / sims.len() as f32)
+            },
+            "max": deciles(&sims).map(|d| d[9]),
+            "per_variant": test_centroid_sims.iter().map(|(l, s)| {
+                serde_json::json!({ "variant": l, "cosine_similarity": s })
+            }).collect::<Vec<_>>(),
+        })
+    };
+
+    // ── Reproducibility metadata (§10) ──
+    let warmup_source = if WARMUP_TTS_CACHE.get().is_some() {
+        "tts"
+    } else {
+        "pink_noise_fallback"
+    };
+    let reproducibility = serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "seeds": {
+            // Classifier seed is fixed inside finalize_enrollment (voice.rs).
+            "classifier": 0,
+            "verifier": 42,
+            "tts_warmup": 947,
+        },
+        "model_hashes": {
+            "tts_model_version_hash": model_version_hash,
+            "mel_model_sha256": super::MEL_MODEL_SHA256,
+            "embed_model_sha256": super::EMBED_MODEL_SHA256,
+        },
+        "cache_state": {
+            "warmup_tts_cached": WARMUP_TTS_CACHE.get().is_some(),
+            "cache_dir": cache_dir_path.display().to_string(),
+        },
+        "warmup_source": warmup_source,
+        "train_test_split": {
+            "n_train": train_variants.len(),
+            "n_test": pos_test_variants.len(),
+            "split": "2/3 : 1/3 by enrollment-list order (tail = test); \
+                      per-augmentation rates are structurally biased toward \
+                      later list positions and are disclosed, not corrected",
+            "train_variants": train_variants.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>(),
+            "test_variants": pos_test_variants.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>(),
+        },
+    });
+
     let json = serde_json::json!({
         "benchmark": "voice_pipeline_e2e",
-        "passed": true,
-        "_note": "deprecated — benchmark is report-only, no pass/fail gating",
+        "_note": "Report-only benchmark — no pass/fail gating (mahbot-953). \
+                  'passed' was removed in mahbot-1005: it was hardcoded true and \
+                  misleading.  Compare against the limits in 'results' instead.",
         "total_false_accepts": total_false_accepts,
         "results": results_map,
         "detection": {
-            "rate": pos_metrics.detection_rate(),
+            "rate": if pos_metrics.total > 0 {
+                serde_json::Value::from(pos_metrics.detection_rate())
+            } else {
+                serde_json::Value::Null
+            },
             "detected": pos_metrics.detected,
             "total_positive": pos_metrics.total,
-            "miss_classification": {
-                "classifier": pos_metrics.per_variant.iter().filter(|pv| {
-                    !pv.detected
-                        && !pv.per_frame_scores.iter().any(|s| s[ROLLING_SUM_IDX] >= MIN_CLASSIFIER_THRESHOLD)
-                }).count(),
-                "adaptive_threshold": pos_metrics.per_variant.iter().filter(|pv| {
-                    !pv.detected
-                        && pv.per_frame_scores.iter().any(|s| s[ROLLING_SUM_IDX] >= MIN_CLASSIFIER_THRESHOLD)
-                        && !pv.per_frame_scores.iter().any(|s| s[ROLLING_SUM_IDX] >= s[THRESHOLD_IDX])
-                }).count(),
-                "verifier": pos_metrics.per_variant.iter().filter(|pv| {
-                    !pv.detected
-                        && pv.per_frame_scores.iter().any(|s| s[ROLLING_SUM_IDX] >= MIN_CLASSIFIER_THRESHOLD)
-                        && pv.per_frame_scores.iter().any(|s| s[ROLLING_SUM_IDX] >= s[THRESHOLD_IDX])
-                }).count(),
-                "total_misses": pos_metrics.total - pos_metrics.detected,
-            },
+            "no_tests_ran": pos_metrics.total == 0,
+            "miss_verdicts": verdict_counts,
+            "total_misses": pos_metrics.total - pos_metrics.detected,
         },
         "false_accepts": {
             "confusable_easy": conf_fa_counts[0],
@@ -3172,43 +3940,33 @@ pub(crate) fn run_internal() {
             "phase_15_teardown_ms": phase_times[P_TEARDOWN],
         },
         "per_variant_results": serde_json::Value::Array(
-            pos_metrics.per_variant.iter().map(|pv| {
-                let miss_reason = if pv.detected {
-                    None
-                } else if !pv.per_frame_scores.iter().any(|s| s[ROLLING_SUM_IDX] >= MIN_CLASSIFIER_THRESHOLD) {
-                    Some("classifier")
-                } else if pv.per_frame_scores.iter().any(|s| s[ROLLING_SUM_IDX] >= s[THRESHOLD_IDX]) {
-                    Some("verifier")
-                } else {
-                    Some("adaptive_threshold")
-                };
-                serde_json::json!({
-                    "variant": pv.variant,
-                    "detected": pv.detected,
-                    "peak_score": pv.peak_score,
-                    "max_rolling_sum": pv.max_rolling_sum,
-                    "verifier_score": pv.verifier_score,
-                    "miss_reason": miss_reason,
-                    "n_embeddings": pv.n_embeddings,
-                    "n_frames_below_reset": pv.n_frames_below_reset,
-                    "agc_converged": pv.agc_converged,
-                    "vad_speech_frames": pv.vad_speech_frames,
-                    "per_frame_scores": pv.per_frame_scores,
-                    "warmup_completed": pv.warmup_completed,
-                    "warmup_n_embeddings": pv.warmup_n_embeddings,
-                })
-            }).collect()
+            pos_metrics.per_variant.iter().map(|pv| pv_to_json(pv, None)).collect()
         ),
         "per_variant_negatives": serde_json::Value::Array(negative_pv),
         "noise_overlap": serde_json::Value::Object(
-            noise_overlap_results.iter().map(|(key, rate)| {
-                (key.clone(), serde_json::json!(rate))
+            noise_overlap_results.iter().map(|(key, rate, detail)| {
+                (key.clone(), serde_json::json!({
+                    "detection_rate": rate,
+                    "per_variant": detail,
+                }))
             }).collect()
         ),
         "latency": {
-            "mean_ms": lat_mean,
-            "median_ms": lat_median,
-            "p95_ms": lat_p95,
+            "mean_ms": if latency_samples > 0 {
+                serde_json::Value::from(lat_mean)
+            } else {
+                serde_json::Value::Null
+            },
+            "median_ms": if latency_samples > 0 {
+                serde_json::Value::from(lat_median)
+            } else {
+                serde_json::Value::Null
+            },
+            "p95_ms": if latency_samples > 0 {
+                serde_json::Value::from(lat_p95)
+            } else {
+                serde_json::Value::Null
+            },
             "samples": latency_samples,
         },
         "classifier_diagnostics": {
@@ -3220,20 +3978,97 @@ pub(crate) fn run_internal() {
             "neg_scores_max": neg_scores_max,
             "epochs_trained": epochs_trained,
             "best_val_loss": best_val_loss,
+            "early_stop_reason": training_result.early_stop_reason,
+            "n_train_windows": training_result.n_train_windows,
+            "n_val_windows": training_result.n_val_windows,
+            "per_epoch_train_loss": training_result.per_epoch_train_loss,
+            "per_epoch_val_loss": training_result.per_epoch_val_loss,
+            "per_epoch_val_accuracy": training_result.per_epoch_val_accuracy,
+            "pos_scores_deciles": training_result.pos_scores_deciles,
+            "neg_scores_deciles": training_result.neg_scores_deciles,
             "total_params": weights.param_count(),
             "degenerate": degenerate,
+            "near_zero_frac": near_zero_frac,
+            "adaptive_threshold_trajectory": serde_json::Value::Object(
+                pos_metrics.per_variant.iter().enumerate().map(|(i, pv)| {
+                    (format!("variant_{i}"), serde_json::json!({
+                        "variant": pv.variant,
+                        "trajectory": pv.adaptive_threshold_trajectory.clone(),
+                        "ceiling_limited_frames": pv.ceiling_limited_frames,
+                    }))
+                }).collect()
+            ),
+            "discrimination": {
+                "pos_peak_scores": {
+                    "deciles": deciles(&pos_peak_scores),
+                    "n": pos_peak_scores.len(),
+                },
+                "neg_peak_scores": {
+                    "deciles": deciles(&neg_peak_scores),
+                    "n": neg_peak_scores.len(),
+                },
+                "pos_frames_below_min_threshold_frac": if pos_frame_crossing.0 > 0 {
+                    pos_frame_crossing.1 as f64 / pos_frame_crossing.0 as f64
+                } else {
+                    0.0
+                },
+                "neg_frames_above_min_threshold_frac": if neg_frame_crossing.0 > 0 {
+                    neg_frame_crossing.1 as f64 / neg_frame_crossing.0 as f64
+                } else {
+                    0.0
+                },
+                "pos_total_frames": pos_frame_crossing.0,
+                "neg_total_frames": neg_frame_crossing.0,
+            },
+        },
+        "verifier_diagnostics": {
+            "trained": verifier.is_trained(),
+            "threshold": verifier_training_threshold,
+            "score_histograms": verifier_hist,
+            "candidate_lifecycle": candidate_lifecycle,
+            "rejection_margins": rejection_margins,
+            "training": {
+                "epochs_trained": verifier_metrics.epochs_trained,
+                "per_epoch_train_loss": verifier_metrics.per_epoch_train_loss,
+                "per_epoch_val_loss": verifier_metrics.per_epoch_val_loss,
+                "val_pos_score_mean": verifier_metrics.val_pos_score_mean,
+                "val_neg_score_mean": verifier_metrics.val_neg_score_mean,
+                "youden_index": verifier_metrics.youden_index,
+                "tpr_at_threshold": verifier_metrics.tpr,
+                "fpr_at_threshold": verifier_metrics.fpr,
+                "n_val_pos": verifier_metrics.n_val_pos,
+                "n_val_neg": verifier_metrics.n_val_neg,
+                "threshold_calibrated": verifier_metrics.threshold_calibrated,
+                "threshold_is_fallback": verifier_metrics.threshold_is_fallback,
+            },
         },
         "volume_sweep": serde_json::Value::Object(volume_sweep_map),
         "mid_utterance": serde_json::Value::Object(mid_utterance_map),
         "threshold_calibration": {
             "verifier_trained": verifier.is_trained(),
             "training_threshold": verifier_training_threshold,
-            "benchmark_optimal_threshold": post_hoc_optimal,
+            "benchmark_optimal_threshold_dual": benchmark_dual_threshold,
+            "dual_sweep_detection_rate_at_optimal": dual_sweep_dr,
+            "dual_sweep_false_accept_rate_at_optimal": dual_sweep_far,
             "threshold_divergence": threshold_divergence,
             "computed_min_detection_rate_suggestion": computed_min_dr,
             "current_min_detection_rate_constant": MIN_DETECTION_RATE,
             "benchmark_detection_rate": benchmark_detection_rate,
         },
+        "per_augmentation_detection": per_augmentation,
+        "train_test_alignment": {
+            "test_vs_train_centroid_cosine": test_centroid_sim_stats,
+            "note": "2/3-1/3 split is by enrollment-list order; per-augmentation \
+                     rates and cosine similarities are disclosed to surface any \
+                     structural distribution shift between train and test.",
+        },
+        "cooldown": {
+            "detection_time_ms": cooldown_detection_time_ms,
+            "first_detection_fired": cooldown_first_detected,
+            "cooldown_suppressed_redetection": cooldown_suppressed,
+            "detection_recovered_after_cooldown": cooldown_after_recovered,
+        },
+        "reproducibility": reproducibility,
         "config": {
             "num_enrollment_variants": NUM_ENROLLMENT_VARIANTS,
             "min_detection_rate": MIN_DETECTION_RATE,
@@ -3251,8 +4086,18 @@ pub(crate) fn run_internal() {
     // ── Human-readable report (stderr, mahbot-871) ────────────────────────
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     let dr = pos_metrics.detection_rate();
-    // NOTE: checkmarks are informational only — benchmark is report-only, no pass/fail gating.
-    let dr_pass = '✓';
+    // NOTE: checkmarks are informational only — benchmark is report-only, no
+    // pass/fail gating (mahbot-953).  The marks now reflect the ACTUAL limits
+    // instead of being unconditional ✓ (mahbot-1005 §7).
+    let mk = |pass: bool| if pass { '✓' } else { '✗' };
+    let dr_pass = if pos_metrics.total > 0 && dr >= MIN_DETECTION_RATE {
+        '✓'
+    } else {
+        '✗'
+    };
+    let unrelated_ok = unrelated_metrics.false_accepts.is_empty();
+    let silence_ok = silence_metric.false_accepts.is_empty();
+    let noise_ok = noise_false_accepts.len() <= tier_limits(BenchTier::Hard).noise;
 
     // Per-tier counts for report
     let fa_easy = conf_fa_by_tier[0].len();
@@ -3268,7 +4113,7 @@ pub(crate) fn run_internal() {
          Tier:           Easy/Medium/Hard (per-tier limits)\n\
          Detection rate: {dr:.1}% ({detected}/{total})  {dr_pass}\n\
          MIN_DR target:  ≥{MIN_DETECTION_RATE:.0}% (suggestion: {computed_min_dr:.0}%)\n\
-         Threshold:      training={verifier_training_threshold:.4}, post-hoc-optimal={post_hoc_optimal:.4}\n\
+         Threshold:      training={verifier_training_threshold:.4}, dual-sweep-optimal={benchmark_dual_threshold:.4}\n\
          False accepts:\n\
            Confusable:\n\
              Easy:    {fa_easy}",
@@ -3287,29 +4132,35 @@ pub(crate) fn run_internal() {
         eprintln!("               Triggers: {:?}", conf_fa_by_tier[2]);
     }
     eprintln!(
-        "           Unrelated:  {unrelated_count}  ✓ (limit ≤0)",
+        "           Unrelated:  {unrelated_count}  {mark} (limit ≤0)",
         unrelated_count = unrelated_metrics.false_accepts.len(),
+        mark = mk(unrelated_ok),
     );
     eprintln!(
-        "           Silence:    {silence_count}  ✓ (limit ≤0)",
+        "           Silence:    {silence_count}  {mark} (limit ≤0)",
         silence_count = silence_metric.false_accepts.len(),
+        mark = mk(silence_ok),
     );
     eprintln!(
-        "           Noise:      {noise_count}  ✓ (limit ≤{noise_limit})",
+        "           Noise:      {noise_count}  {mark} (limit ≤{noise_limit})",
         noise_count = noise_false_accepts.len(),
+        mark = mk(noise_ok),
         noise_limit = tier_limits(BenchTier::Hard).noise,
     );
     eprintln!(
         "           ───────────────────────────────────────\n\
-            | Easy  total: {easy_total}  ✓ (limit ≤{easy_limit}) |\n\
-            | Medium total: {medium_total}  ✓ (limit ≤{med_limit}) |\n\
-            | Hard  total: {hard_total}  ✓ (limit ≤{hard_limit}) |\n\
+            | Easy  total: {easy_total}  {easy_mark} (limit ≤{easy_limit}) |\n\
+            | Medium total: {medium_total}  {med_mark} (limit ≤{med_limit}) |\n\
+            | Hard  total: {hard_total}  {hard_mark} (limit ≤{hard_limit}) |\n\
             ───────────────────────────────────────",
         easy_total = tier_total_fas[0],
+        easy_mark = mk(tier_total_fas[0] <= tier_limits(BenchTier::Easy).total),
         easy_limit = tier_limits(BenchTier::Easy).total,
         medium_total = tier_total_fas[1],
+        med_mark = mk(tier_total_fas[1] <= tier_limits(BenchTier::Medium).total),
         med_limit = tier_limits(BenchTier::Medium).total,
         hard_total = tier_total_fas[2],
+        hard_mark = mk(tier_total_fas[2] <= tier_limits(BenchTier::Hard).total),
         hard_limit = tier_limits(BenchTier::Hard).total,
     );
 
@@ -3368,13 +4219,13 @@ pub(crate) fn run_internal() {
     // Calibrated threshold check (mahbot-997).
     // The verifier threshold is now auto-calibrated during training.  This
     // informational section displays the benchmark-optimal threshold and the
-    // computed MIN_DETECTION_RATE suggestion (see post-hoc analysis above).
+    // computed MIN_DETECTION_RATE suggestion (see dual-sweep analysis above).
     let actual_dr = pos_metrics.detection_rate();
     if n_pos_total > 0 {
         info!(
             "Verifier threshold status: trained={} auto-calibrated={:.4}, \
              benchmark detection rate={:.1}% ({}/{}), \
-             benchmark-optimal (post-hoc)={post_hoc_optimal:.4}, \
+             benchmark-optimal (dual sweep)={benchmark_dual_threshold:.4}, \
              computed MIN_DETECTION_RATE suggestion={computed_min_dr:.3}",
             verifier.is_trained(),
             verifier_training_threshold,
@@ -3466,6 +4317,10 @@ pub(crate) fn run_internal() {
 /// to `~/.mahbot/` so that model directories resolve correctly.  Without this, the
 /// test silently skips (mahbot-947, analyst feedback).
 #[test]
+// Reset assertions below compare floats with exact equality on purpose: a
+// fresh DetectionInstrumentation (Default) starts at exactly 0.0, so any
+// nonzero peak is warm-up contamination, not rounding error.
+#[expect(clippy::float_cmp)]
 fn warmup_noise_produces_embeddings() {
     // Set CONFIG storage root so model paths resolve (mahbot-947).
     if crate::config::CONFIG.try_storage_root().is_none() {
@@ -3486,12 +4341,12 @@ fn warmup_noise_produces_embeddings() {
 
     // Skip if voice model files aren't available (requires a prior app launch
     // or benchmark run that cached the models).
-    if !super::models_ready() {
-        if let Err(e) = ensure_voice_models_loaded() {
-            eprintln!("Skipping warmup_noise_produces_embeddings: {e}");
-            eprintln!("Run the app or E2E benchmark first to cache voice models.");
-            return;
-        }
+    if !super::models_ready()
+        && let Err(e) = ensure_voice_models_loaded()
+    {
+        eprintln!("Skipping warmup_noise_produces_embeddings: {e}");
+        eprintln!("Run the app or E2E benchmark first to cache voice models.");
+        return;
     }
 
     // Also skip if TTS is not ready — the primary warm-up path is TTS, and
@@ -3521,6 +4376,234 @@ fn warmup_noise_produces_embeddings() {
         "Warm-up noise triggered a false detection (last_wake_word_detection = {:?}) — \
          the noise signal should not resemble the wake word",
         ctx.last_wake_word_detection,
+    );
+
+    // ── mahbot-1005 §1: warm-up instrumentation must be reset ─────────────
+    // Warm-up audio passes through the full scoring pipeline and would
+    // otherwise record per-frame scores, peaks, and candidate lifecycle
+    // counters into ctx.instrumentation — contaminating the test utterance's
+    // per-variant metrics (the fake "Silence: 1/1 trigger").  consume_warmup
+    // must leave a fresh DetectionInstrumentation with only the warmup_*
+    // evidence preserved.
+    let instr = &ctx.instrumentation;
+    assert!(
+        instr.per_frame_scores.is_empty(),
+        "Instrumentation must be reset after warm-up: per_frame_scores has {} warm-up frames",
+        instr.per_frame_scores.len(),
+    );
+    assert!(
+        instr.per_frame_verifier_scores.is_empty(),
+        "Instrumentation must be reset after warm-up: per_frame_verifier_scores has {} entries",
+        instr.per_frame_verifier_scores.len(),
+    );
+    assert_eq!(
+        instr.peak_score, 0.0,
+        "Instrumentation peak_score must be reset after warm-up (was {})",
+        instr.peak_score,
+    );
+    assert_eq!(
+        instr.peak_verifier_score, 0.0,
+        "Instrumentation peak_verifier_score must be reset after warm-up (was {})",
+        instr.peak_verifier_score,
+    );
+    assert_eq!(
+        instr.candidates_created, 0,
+        "Instrumentation candidates_created must be reset after warm-up"
+    );
+    assert_eq!(
+        instr.vad_speech_frames, 0,
+        "Instrumentation vad_speech_frames must be reset after warm-up"
+    );
+    assert!(
+        instr.first_trigger_frame_idx.is_none(),
+        "Instrumentation first_trigger_frame_idx must be reset after warm-up"
+    );
+    // The warm-up "head start" remains observable via the preserved fields.
+    assert!(
+        instr.warmup_max_rolling_sum >= 0.0,
+        "warmup_max_rolling_sum must be a valid (>= 0) captured value"
+    );
+}
+
+// ── classify_miss unit tests (mahbot-1005 §2) ─────────────────────────────
+
+/// Build a `PerVariantResult` with only the fields relevant to
+/// [`classify_miss`] set (defaults elsewhere).
+///
+/// Test-only helper: only compiled in `cargo test` builds (the `#[test]`
+/// functions in this module are the sole callers), so it is `#[cfg(test)]`
+/// to avoid dead-code warnings when the file is compiled as a bench/lib
+/// target.  The lint expectations cover the parameter-heavy test shim.
+#[cfg(test)]
+#[expect(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+fn verdict_test_pv(
+    detected: bool,
+    vad_speech_frames: usize,
+    n_test_embeddings: usize,
+    warmup_completed: bool,
+    agc_converged: Option<bool>,
+    max_rolling_sum: f32,
+    crossed_effective: bool,
+    verifier_score: f32,
+    verifier_trained: bool,
+    verifier_threshold: f32,
+) -> PerVariantResult {
+    // n_test_embeddings is per_frame_scores.len() (mahbot-1005 §2): keep them
+    // consistent so the verdict logic sees a realistic variant.
+    let per_frame_scores = if n_test_embeddings == 0 {
+        Vec::new()
+    } else {
+        // One frame: rolling_sum above MIN_CLASSIFIER_THRESHOLD; the effective
+        // threshold either blocks (5.0 > rolling_sum) or is crossed (2.0).
+        vec![[0.9, 2.2, if crossed_effective { 2.0 } else { 5.0 }]]
+    };
+    PerVariantResult {
+        variant: "test".to_string(),
+        detected,
+        peak_score: max_rolling_sum,
+        max_rolling_sum,
+        verifier_score,
+        n_embeddings: n_test_embeddings + 7, // preserved warm-up ring
+        n_frames_below_reset: 0,
+        agc_converged,
+        vad_speech_frames,
+        per_frame_scores,
+        warmup_completed,
+        warmup_n_embeddings: 7,
+        verifier_score_trajectory: vec![verifier_score],
+        candidates_created: 0,
+        candidates_confirmed: 0,
+        candidates_expired: 0,
+        first_trigger_frame_idx: if crossed_effective { Some(0) } else { None },
+        warmup_max_rolling_sum: 0.0,
+        warmup_peak_verifier_score: 0.0,
+        n_warmup_suppressed_frames: 0,
+        n_test_embeddings,
+        verifier_threshold,
+        verifier_trained,
+        adaptive_threshold_trajectory: Vec::new(),
+        ceiling_limited_frames: 0,
+        latency_ms: None,
+    }
+}
+
+/// The 8-way exhaustive verdict must cover every combination reachable by the
+/// benchmark (mahbot-1005 §2).  Also guards the fixed mis-bucketing: a miss
+/// with zero VAD frames is `vad_failure`, NOT `classifier`.
+#[test]
+fn classify_miss_covers_all_verdicts() {
+    use MissVerdict as V;
+
+    // 1. Detected.
+    assert_eq!(
+        classify_miss(&verdict_test_pv(
+            true,
+            10,
+            5,
+            true,
+            Some(true),
+            2.5,
+            true,
+            0.9,
+            true,
+            0.6
+        )),
+        V::Detected,
+    );
+    // 2. VAD never fired → vad_failure (previously mis-bucketed as classifier).
+    assert_eq!(
+        classify_miss(&verdict_test_pv(
+            false, 0, 0, true, None, 1.0, false, 0.0, true, 0.6
+        )),
+        V::VadFailure,
+    );
+    // 3. Zero test embeddings → vad_failure (utterance too short for 76 mel
+    //    frames after the warm-up reset).
+    assert_eq!(
+        classify_miss(&verdict_test_pv(
+            false, 3, 0, true, None, 1.0, false, 0.0, true, 0.6
+        )),
+        V::VadFailure,
+    );
+    // 4. Warm-up incomplete + classifier triggered → warmup_suppression.
+    assert_eq!(
+        classify_miss(&verdict_test_pv(
+            false, 10, 5, false, None, 2.5, true, 0.0, true, 0.6
+        )),
+        V::WarmupSuppression,
+    );
+    // 5. AGC explicitly non-converged → agc_failure.
+    assert_eq!(
+        classify_miss(&verdict_test_pv(
+            false,
+            10,
+            5,
+            true,
+            Some(false),
+            2.5,
+            true,
+            0.0,
+            true,
+            0.6
+        )),
+        V::AgcFailure,
+    );
+    // 6. Never reached MIN_CLASSIFIER_THRESHOLD → classifier_no_trigger.
+    assert_eq!(
+        classify_miss(&verdict_test_pv(
+            false, 10, 5, true, None, 1.5, false, 0.0, true, 0.6
+        )),
+        V::ClassifierNoTrigger,
+    );
+    // 7. Crossed hard floor but not the effective threshold → adaptive_threshold_blocked.
+    assert_eq!(
+        classify_miss(&verdict_test_pv(
+            false, 10, 5, true, None, 2.5, false, 0.0, true, 0.6
+        )),
+        V::AdaptiveThresholdBlocked,
+    );
+    // 8. Crossed effective threshold with an untrained (no-op) verifier →
+    //    verifier_timing (nothing rejected the trigger; the candidate expired).
+    assert_eq!(
+        classify_miss(&verdict_test_pv(
+            false, 10, 5, true, None, 2.5, true, 0.0, false, 0.6
+        )),
+        V::VerifierTiming,
+    );
+    // 9. Verifier peak crossed the threshold but detection didn't fire →
+    //    verifier_timing (candidate expired or audio ended first).
+    assert_eq!(
+        classify_miss(&verdict_test_pv(
+            false, 10, 5, true, None, 2.5, true, 0.7, true, 0.6
+        )),
+        V::VerifierTiming,
+    );
+    // 10. Verifier peak below threshold → verifier_rejected.
+    assert_eq!(
+        classify_miss(&verdict_test_pv(
+            false, 10, 5, true, None, 2.5, true, 0.3, true, 0.6
+        )),
+        V::VerifierRejected,
+    );
+}
+
+/// `agc_converged == None` (insufficient AGC-active frames) must NOT be
+/// classified as `agc_failure` — short utterances fall through to the
+/// score-based verdicts (analyst feedback, mahbot-1005).
+#[test]
+fn classify_miss_agc_none_is_not_agc_failure() {
+    use MissVerdict as V;
+    assert_eq!(
+        classify_miss(&verdict_test_pv(
+            false, 10, 5, true, None, 2.5, true, 0.3, true, 0.6
+        )),
+        V::VerifierRejected,
+    );
+    assert_ne!(
+        classify_miss(&verdict_test_pv(
+            false, 10, 5, true, None, 1.5, false, 0.0, true, 0.6
+        )),
+        V::AgcFailure,
     );
 }
 

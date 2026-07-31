@@ -475,6 +475,34 @@ pub struct ClassifierTrainingResult {
     /// Maximum negative class score after training.
     #[allow(dead_code)]
     pub neg_scores_max: f32,
+    /// Per-epoch training loss (cross-entropy over the training split),
+    /// one entry per epoch actually trained (mahbot-1005 §5).
+    #[allow(dead_code)]
+    pub per_epoch_train_loss: Vec<f32>,
+    /// Per-epoch validation loss, one entry per epoch actually trained.
+    #[allow(dead_code)]
+    pub per_epoch_val_loss: Vec<f32>,
+    /// Per-epoch validation accuracy (pred > 0.5 matches the label),
+    /// one entry per epoch actually trained.
+    #[allow(dead_code)]
+    pub per_epoch_val_accuracy: Vec<f32>,
+    /// Why training stopped: `"max_epochs"` or `"early_stopping"`.
+    #[allow(dead_code)]
+    pub early_stop_reason: String,
+    /// Number of training windows (after the random train/val split).
+    #[allow(dead_code)]
+    pub n_train_windows: usize,
+    /// Number of validation windows (after the random train/val split).
+    #[allow(dead_code)]
+    pub n_val_windows: usize,
+    /// Decile boundaries of the training-set positive-window scores
+    /// (mahbot-1005 §3).  `None` when no positive windows existed.
+    #[allow(dead_code)]
+    pub pos_scores_deciles: Option<[f32; 10]>,
+    /// Decile boundaries of the training-set negative-window scores
+    /// (mahbot-1005 §3).
+    #[allow(dead_code)]
+    pub neg_scores_deciles: Option<[f32; 10]>,
 }
 
 // ── Training ────────────────────────────────────────────────────────────
@@ -663,6 +691,12 @@ pub fn train_classifier(
 
     let mut opt = AdamStateGroup::new(&weights);
     let mut epochs_trained = 0;
+    // Per-epoch diagnostics (mahbot-1005 §5) — previously computed and logged
+    // but discarded.  The vectors cap at `cfg.max_epochs` (100) entries.
+    let mut per_epoch_train_loss: Vec<f32> = Vec::new();
+    let mut per_epoch_val_loss: Vec<f32> = Vec::new();
+    let mut per_epoch_val_accuracy: Vec<f32> = Vec::new();
+    let mut early_stop_reason = "max_epochs".to_string();
 
     for epoch in 0..cfg.max_epochs {
         epochs_trained = epoch + 1;
@@ -743,12 +777,32 @@ pub fn train_classifier(
                         + weights.fc_weight.iter().map(|x| x * x).sum::<f32>())
         };
 
+        // Validation accuracy: fraction of val windows where pred > 0.5
+        // matches the label (mahbot-1005 §5).
+        let val_accuracy = if va_x.is_empty() {
+            0.0
+        } else {
+            let mut correct = 0usize;
+            for i in 0..va_x.len() {
+                let x_cf = to_channels_first(&va_x[i], cin, lin);
+                let pred = forward_pass(&x_cf, &weights);
+                if (pred > 0.5) == (va_y[i] > 0.5) {
+                    correct += 1;
+                }
+            }
+            correct as f32 / va_x.len() as f32
+        };
+        per_epoch_train_loss.push(epoch_loss / n_batches as f32);
+        per_epoch_val_loss.push(val_loss);
+        per_epoch_val_accuracy.push(val_accuracy);
+
         info!(
-            "Epoch {}/{}: loss={:.6} val={:.6}",
+            "Epoch {}/{}: loss={:.6} val={:.6} val_acc={:.3}",
             epoch + 1,
             cfg.max_epochs,
             epoch_loss / n_batches as f32,
-            val_loss
+            val_loss,
+            val_accuracy,
         );
         if val_loss < best_loss - 1e-6 {
             best_loss = val_loss;
@@ -763,6 +817,7 @@ pub fn train_classifier(
                     best_loss
                 );
                 weights = best;
+                early_stop_reason = "early_stopping".to_string();
                 break;
             }
         }
@@ -808,6 +863,14 @@ pub fn train_classifier(
         neg_scores_mean,
         neg_scores_min,
         neg_scores_max,
+        per_epoch_train_loss,
+        per_epoch_val_loss,
+        per_epoch_val_accuracy,
+        early_stop_reason,
+        n_train_windows: n_tr,
+        n_val_windows: n_val,
+        pos_scores_deciles: score_deciles(&pos_scores),
+        neg_scores_deciles: score_deciles(&neg_scores),
     })
 }
 
@@ -819,6 +882,22 @@ fn compute_score_stats(scores: &[f32]) -> (f32, f32, f32) {
     let min = scores.iter().copied().fold(f32::INFINITY, f32::min);
     let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     (mean, min, max)
+}
+
+/// Decile boundaries of a score distribution (`None` for empty input).
+/// Added for benchmark training-score diagnostics (mahbot-1005 §3).
+fn score_deciles(scores: &[f32]) -> Option<[f32; 10]> {
+    if scores.is_empty() {
+        return None;
+    }
+    let mut sorted = scores.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out = [0.0_f32; 10];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let idx = ((sorted.len() - 1) as f32 * (i as f32 + 0.5) / 10.0).round() as usize;
+        *slot = sorted[idx.min(sorted.len() - 1)];
+    }
+    Some(out)
 }
 
 fn gather<T: Clone>(data: &[T], idx: &[usize]) -> Vec<T> {
