@@ -42,7 +42,7 @@ pub enum Source {
 /// Direction is preserved (`SpeedDown` vs `SpeedUp`) so training diagnostics
 /// can identify which augmentation type produces the most useful learning
 /// signal, without relying on the brittle positional `variant_index` mapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AugmentationFamily {
     SpeedDown,
     SpeedUp,

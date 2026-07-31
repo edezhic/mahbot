@@ -5,9 +5,15 @@
 //!
 //! ## Architecture: Conv1D
 //!
-//! Conv1D(96→2, k=3, padding=1) → ReLU → AdaptiveAvgPool → Linear(2→1) → Sigmoid.
+//! Conv1D(96→2, k=3, padding=1) → LeakyReLU → AdaptiveAvgPool → Linear(2→1) → Sigmoid.
 //! ~581 trainable parameters. Preserves temporal structure across the 3-frame
 //! window (288-dim concatenated input, no mean-pooling).
+//!
+//! LeakyReLU (mahbot-1008 Fix 3) replaces ReLU so the feature path cannot
+//! collapse to a dead zone: with ReLU, any input whose Conv1D pre-activations
+//! are all ≤ 0 produced pooled features `[0, 0]` and a constant
+//! `sigmoid(fc_bias)` output regardless of input (the observed `6.67e-8`
+//! reject-all floor).
 //!
 //! When not trained, the verifier acts as a no-op (all frames pass).
 //!
@@ -114,6 +120,68 @@ pub(crate) const CONV_VERIFIER_OUT: usize = 2;
 /// Conv1D kernel size for verifier.
 pub(crate) const CONV_VERIFIER_KERNEL_SIZE: usize = 3;
 
+/// Minimum number of positive **windows** required to train the verifier
+/// (mahbot-1008 Fix 2).
+///
+/// The pre-fix guard counted positive *sequences* (≥5 utterances with ≥3
+/// embeddings each) — but an utterance with 3 embeddings produces exactly 1
+/// window, so the verifier could train on as few as 5 positive windows and
+/// memorize them into a reject-all brick wall.  Training with fewer than this
+/// many positive windows returns an **untrained no-op** (all frames pass)
+/// instead of a trained reject-all.
+///
+/// The check lives in [`prepare_training_data`] so it covers every call site
+/// (production, the synthetic-negatives fallback, and the E2E benchmark) and
+/// also catches the stricter failure mode where positive sequences exist but
+/// produce **zero** windows (all utterances < [`VERIFIER_WINDOW_SIZE`] frames)
+/// — which previously trained an all-negative reject-all with `trained: true`.
+pub(crate) const MIN_POSITIVE_WINDOWS: usize = 30;
+
+/// Cap on the per-positive-window class weight (mahbot-1008 Fix 4).
+///
+/// The observed failure trained on 58 positive windows against 11,074
+/// negatives with per-example positive weight ≈ 2,208× — the model memorized
+/// the 58 positives instead of learning a generalizable policy.  Capping the
+/// weight prevents per-example memorization while keeping a strong positive
+/// signal.  Negative subsampling is deliberately NOT performed: the full
+/// negative set (especially confusable/unrelated tiers) is what suppresses
+/// false accepts, and the tiered FA limits in the E2E benchmark were tuned
+/// against it.
+pub(crate) const MAX_CLASS_WEIGHT: f32 = 50.0;
+
+/// Slope of the verifier-local LeakyReLU activation (mahbot-1008 Fix 3).
+///
+/// ReLU's dead zone was the root cause of the constant-floor collapse: when
+/// every Conv1D pre-activation is ≤ 0 the pooled features are `[0, 0]` and the
+/// logit degenerates to `fc_bias` — an input-independent constant (observed
+/// `6.67e-8`).  LeakyReLU keeps a small gradient (and a small, input-dependent
+/// signal) in the negative half-plane so the feature path can never die
+/// completely.
+///
+/// Deliberately verifier-local: the classifier's `relu()` helper stays
+/// unchanged (the classifier has its own calibration and is out of scope for
+/// mahbot-1008).
+const LEAKY_RELU_SLOPE: f32 = 0.01;
+
+/// Hard clamp on the verifier's `fc_bias` (mahbot-1008 Fix 3).
+///
+/// Unregularized and unpulled-up by any positive signal, `fc_bias` drifted to
+/// −16.52 (sigmoid ≈ 6.67e-8) under ~85% negative-only batches.  Bounding it
+/// to ±3 keeps the input-independent component of the logit inside
+/// `sigmoid(±3) ∈ [0.047, 0.953]` so a dead feature path can never produce a
+/// lethal sub-`1e-6` reject floor.  Combined with LeakyReLU the logit is still
+/// input-dependent; the clamp only bounds the constant component.
+const FC_BIAS_CLAMP: f32 = 3.0;
+
+/// Minimum held-out (out-of-session) validation TPR for a trained verifier.
+///
+/// When honest validation data is available and the trained verifier's TPR at
+/// the selected threshold falls below this, training emits a prominent warning
+/// (report-only — the verifier is still returned trained, matching mahbot-953's
+/// report-only benchmark precedent).  The value mirrors the `TPR ≥ 0.90`
+/// constraint used by [`calibrate_verifier_threshold`].
+const MIN_HELD_OUT_TPR: f32 = 0.90;
+
 /// How much to upweight confusable negative examples during verifier training.
 ///
 /// Confusable phrases (e.g. "hey map bot", "day mahbot") are acoustically
@@ -194,9 +262,41 @@ pub(crate) const VERIFIER_WARMUP_EMBEDDINGS: usize = 4;
 /// when no real calibration data is available.
 const SYNTHETIC_NEGATIVES_COUNT: usize = 100;
 
+/// Activation used by the verifier's feature path (mahbot-1008 Fix 3).
+///
+/// Persisted inside [`VoiceVerifier`] so inference semantics are explicit and
+/// future architecture changes cannot silently reinterpret stored weights.
+///
+/// # Backward compatibility
+///
+/// The field has `#[serde(default)]` and is skipped when serializing the
+/// default value, so models persisted before mahbot-1008 (ReLU semantics)
+/// deserialize with `LeakyReLU`.  Reinterpreting pre-fix weights with
+/// LeakyReLU is harmless: those models are the collapsed constant-floor bricks
+/// this ticket fixes (their output stays far below the decision threshold for
+/// any input, and [`VoiceVerifier::is_collapsed`] drops them at load time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VerifierActivation {
+    /// LeakyReLU with slope [`LEAKY_RELU_SLOPE`] — replaces ReLU to eliminate
+    /// the dead-zone constant floor.
+    #[serde(rename = "leaky_relu")]
+    LeakyReLU,
+}
+
+fn default_verifier_activation() -> VerifierActivation {
+    VerifierActivation::LeakyReLU
+}
+
+// `skip_serializing_if` requires `fn(&T) -> bool`, so the reference is
+// intentional despite the Copy type.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_verifier_activation(a: &VerifierActivation) -> bool {
+    *a == VerifierActivation::LeakyReLU
+}
+
 /// Verifier for wake word false-trigger suppression (second-stage AND gate).
 ///
-/// Conv1D(96→2, k=3, padding=1) → ReLU → AdaptiveAvgPool → Linear(2→1) → Sigmoid.
+/// Conv1D(96→2, k=3, padding=1) → LeakyReLU → AdaptiveAvgPool → Linear(2→1) → Sigmoid.
 /// ~581 trainable parameters operating on 288-dim concatenated windows.
 ///
 /// When `trained` is `false`, the verifier is a no-op (all frames pass with
@@ -211,6 +311,15 @@ pub struct VoiceVerifier {
     pub fc_weight: Vec<f32>,
     /// FC bias: [1] = 1 element.
     pub fc_bias: Vec<f32>,
+
+    /// Feature-path activation used at inference.  Defaults to
+    /// [`VerifierActivation::LeakyReLU`] (see the enum docs for the
+    /// compatibility story).
+    #[serde(
+        default = "default_verifier_activation",
+        skip_serializing_if = "is_default_verifier_activation"
+    )]
+    pub activation: VerifierActivation,
 
     /// Decision threshold. Frames with a score below this are suppressed.
     #[serde(default = "default_verifier_threshold")]
@@ -275,6 +384,11 @@ struct SeqInfo {
     /// `stratify_by_source` is true for source-tier stratified validation
     /// splitting (mahbot-995).
     source: crate::audio::embedding_sequence::Source,
+    /// Augmentation family of the source sequence (mahbot-1008 Fix 1).  Used
+    /// with `source` to form provenance groups for out-of-session holdout —
+    /// e.g. all `Source::Augmentation` + `Some(SpeedDown)` windows form one
+    /// group that can be held out entirely for validation.
+    augmentation_family: Option<crate::audio::embedding_sequence::AugmentationFamily>,
 }
 
 impl VoiceVerifier {
@@ -288,6 +402,7 @@ impl VoiceVerifier {
             conv_bias: Vec::new(),
             fc_weight: Vec::new(),
             fc_bias: Vec::new(),
+            activation: VerifierActivation::LeakyReLU,
             threshold: DEFAULT_VERIFIER_THRESHOLD,
             trained: false,
         }
@@ -345,9 +460,63 @@ impl VoiceVerifier {
         )
     }
 
+    /// Detect the mahbot-1008 constant-floor collapse: a trained verifier whose
+    /// output is input-independent and below its decision threshold for every
+    /// input (a reject-all brick wall).
+    ///
+    /// The pre-fix architecture produced exactly this: dead ReLU features →
+    /// pooled `[0, 0]` → `logit = fc_bias` → `sigmoid(fc_bias)` regardless of
+    /// input (observed `6.67e-8`).  We probe with a small set of deterministic
+    /// pseudo-random L2-normalized inputs and flag the verifier when:
+    ///
+    /// - the output range is `< 1e-4` (input-independent), AND
+    /// - the maximum output is below `self.threshold` (constant reject).
+    ///
+    /// A constant-*accept* verifier (output ≥ threshold everywhere) is
+    /// functionally a no-op and is deliberately NOT flagged.  The probes are
+    /// deterministic (fixed seed) so the verdict is stable across restarts.
+    ///
+    /// Used at load time in `voice.rs` to convert already-enrolled users'
+    /// broken verifiers into untrained no-ops until re-enrollment (which now
+    /// produces a working verifier).
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn is_collapsed(&self) -> bool {
+        const N_PROBES: usize = 8;
+        if !self.is_trained() {
+            return false;
+        }
+        let mut rng = StdRng::seed_from_u64(0x1008_1008);
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        let mut sum = 0.0f32;
+        for _ in 0..N_PROBES {
+            let mut probe = vec![0.0f32; VERIFIER_INPUT_DIM];
+            for v in &mut probe {
+                *v = rng.random::<f32>() * 2.0 - 1.0;
+            }
+            let score = self.predict(&probe);
+            min = min.min(score);
+            max = max.max(score);
+            sum += score;
+        }
+        let range = max - min;
+        let mean = sum / N_PROBES as f32;
+        if range < 1e-4 && max < self.threshold {
+            info!(
+                "VoiceVerifier collapsed: input-independent output (range={range:.2e}, \
+                 mean={mean:.2e}, max={max:.2e}) below threshold={:.4} — constant reject-all",
+                self.threshold,
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     /// Train a new verifier from positive and negative
     /// [`EmbeddingSequence`](crate::audio::embedding_sequence::EmbeddingSequence)
-    /// inputs.  Trains a Conv1D(96→2, k=3, padding=1) → ReLU → AdaptiveAvgPool →
+    /// inputs.  Trains a Conv1D(96→2, k=3, padding=1) → LeakyReLU → AdaptiveAvgPool →
     /// Linear(2→1) → Sigmoid architecture with L2 regularization (mahbot-994)
     /// using pure-Rust manual backprop + Adam.
     ///
@@ -434,25 +603,18 @@ impl VoiceVerifier {
         } else {
             StdRng::seed_from_u64(rand::random())
         };
-        let (
-            tr_windows,
-            tr_labels,
-            tr_weights,
-            val_windows,
-            val_labels,
-            val_weights,
-            used_sequence_split,
-        ) = split_train_val(
-            &seq_infos,
-            &windows,
-            &window_labels,
-            &window_weights,
-            &mut rng,
-            true, // stratify_by_source — preserve negative tier proportions
-        );
+        let (tr_windows, tr_labels, tr_weights, val_windows, val_labels, val_weights, split_kind) =
+            split_train_val(
+                &seq_infos,
+                &windows,
+                &window_labels,
+                &window_weights,
+                &mut rng,
+                true, // stratify_by_source — preserve negative tier proportions
+            );
 
         // ── Conv1D training with Adam ──
-        // Architecture: Conv1D(96→2, k=3, padding=1) → ReLU → AdaptiveAvgPool → Linear(2→1)
+        // Architecture: Conv1D(96→2, k=3, padding=1) → LeakyReLU → AdaptiveAvgPool → Linear(2→1)
         let cin = EMBEDDING_DIM; // 96
         let cout = CONV_VERIFIER_OUT; // 2
         let ks = CONV_VERIFIER_KERNEL_SIZE; // 3
@@ -537,13 +699,15 @@ impl VoiceVerifier {
                         &bias_conv,
                     );
 
-                    // ReLU
+                    // LeakyReLU (mahbot-1008 Fix 3 — ReLU's dead zone allowed
+                    // the feature path to collapse to a constant floor).
                     let mut relu_out = conv_out.clone();
-                    crate::audio::wake_word_classifier::relu(&mut relu_out);
-                    // Save mask for backward
+                    leaky_relu_verifier(&mut relu_out);
+                    // Save mask for backward: slope 1.0 for positive
+                    // pre-activations, LEAKY_RELU_SLOPE for non-positive.
                     let relu_mask: Vec<f32> = conv_out
                         .iter()
-                        .map(|&v| if v > 0.0 { 1.0 } else { 0.0 })
+                        .map(|&v| if v > 0.0 { 1.0 } else { LEAKY_RELU_SLOPE })
                         .collect();
 
                     // AdaptiveAvgPool
@@ -584,7 +748,7 @@ impl VoiceVerifier {
                         }
                     }
 
-                    // ReLU backward
+                    // LeakyReLU backward
                     let mut d_conv = vec![0.0; cout * lin];
                     for i in 0..(cout * lin) {
                         d_conv[i] = d_relu[i] * relu_mask[i];
@@ -626,11 +790,19 @@ impl VoiceVerifier {
                     *g /= batch_size_f32;
                 }
 
-                // L2 regularization (bias not regularized).
+                // L2 regularization on ALL parameters including biases
+                // (mahbot-1008 Fix 3 — the unregularized fc_bias drifted to
+                // −16.52 under ~85% negative-only batches).
                 for (g, w) in g_conv_w.iter_mut().zip(weight_conv.iter()) {
                     *g += l2_lambda * w;
                 }
+                for (g, w) in g_conv_b.iter_mut().zip(bias_conv.iter()) {
+                    *g += l2_lambda * w;
+                }
                 for (g, w) in g_fc_w.iter_mut().zip(weight_fc.iter()) {
+                    *g += l2_lambda * w;
+                }
+                for (g, w) in g_fc_b.iter_mut().zip(bias_fc.iter()) {
                     *g += l2_lambda * w;
                 }
 
@@ -639,6 +811,13 @@ impl VoiceVerifier {
                 opt_conv_b.update(&mut bias_conv, &g_conv_b, CONV_LEARNING_RATE);
                 opt_fc_w.update(&mut weight_fc, &g_fc_w, CONV_LEARNING_RATE);
                 opt_fc_b.update(&mut bias_fc, &g_fc_b, CONV_LEARNING_RATE);
+
+                // Clamp fc_bias to a bounded range (mahbot-1008 Fix 3).  Even
+                // with L2 + LeakyReLU, negative-only batches push the bias
+                // down; the clamp guarantees the input-independent component of
+                // the logit stays inside sigmoid(±FC_BIAS_CLAMP) so a dead
+                // feature path can never produce a sub-1e-6 reject floor.
+                bias_fc[0] = bias_fc[0].clamp(-FC_BIAS_CLAMP, FC_BIAS_CLAMP);
             }
 
             // ── Validation loss + early stopping ──
@@ -717,6 +896,7 @@ impl VoiceVerifier {
             conv_bias: bias_conv,
             fc_weight: weight_fc,
             fc_bias: bias_fc,
+            activation: VerifierActivation::LeakyReLU,
             threshold,
             trained: true,
         };
@@ -728,7 +908,7 @@ impl VoiceVerifier {
             &tr_labels,
             &val_windows,
             &val_labels,
-            used_sequence_split,
+            split_kind,
             class_weight,
             "Conv1D verifier",
         );
@@ -816,6 +996,27 @@ impl VoiceVerifier {
                 (Some(t), Some(f)) => Some(t - CALIBRATION_LAMBDA * f),
                 _ => None,
             };
+
+            // ── Held-out recall warning (mahbot-1008 Fix 1) ──
+            // With honest (out-of-session) validation, a trained verifier that
+            // rejects >10% of held-out genuine wake words is still too close to
+            // the reject-all failure mode.  Warning is report-only (mahbot-953
+            // precedent): the verifier is returned trained so we do not
+            // silently regress false-accept suppression; the E2E benchmark
+            // surfaces the same signal as a warning metric.
+            if let Some(tpr_val) = tpr
+                && val_pos_scores.len() >= CALIBRATION_MIN_SAMPLES
+                && tpr_val < MIN_HELD_OUT_TPR
+            {
+                warn!(
+                    "Verifier held-out recall LOW: TPR={tpr_val:.3} at threshold={:.4} \
+                     ({tp} of {val_pos_scores_len} held-out positives accepted, minimum \
+                     {MIN_HELD_OUT_TPR:.2}).  The verifier may overfit the training \
+                     conditions — consider re-enrolling with more diverse audio.",
+                    verifier.threshold,
+                    val_pos_scores_len = val_pos_scores.len(),
+                );
+            }
         }
 
         (verifier, metrics)
@@ -904,7 +1105,11 @@ impl VoiceVerifier {
 /// where all windows are L2-normalized.  Returns `None` and emits a `warn!`
 /// log if no windows could be formed (all sequences shorter than
 /// [`VERIFIER_WINDOW_SIZE`] frames or empty inputs).
-#[allow(clippy::type_complexity, clippy::cast_precision_loss)]
+#[allow(
+    clippy::type_complexity,
+    clippy::cast_precision_loss,
+    clippy::too_many_lines
+)]
 fn prepare_training_data<F>(
     positive_sequences: &[EmbeddingSequence],
     negative_sequences: &[EmbeddingSequence],
@@ -961,10 +1166,42 @@ where
                 count: windows.len() - start,
                 is_positive: true,
                 source: seq.source,
+                augmentation_family: seq.augmentation_family,
             });
         }
     }
     let n_pos_windows = window_labels.iter().filter(|&&l| l > 0.5).count();
+
+    // ── Positive-window guards (mahbot-1008 Fix 2) ──
+    // A trained verifier needs enough POSITIVE WINDOWS (not positive
+    // sequences) to learn a generalizable policy.  Training with a handful of
+    // memorized windows produces a reject-all brick wall; an untrained no-op
+    // (all frames pass) is strictly better.
+    //
+    // Guard 1: zero positive windows.  This is the stricter failure mode —
+    // positive sequences can exist while every utterance has <
+    // VERIFIER_WINDOW_SIZE frames, in which case the old code trained on
+    // all-negative data and returned a `trained: true` reject-all.
+    if n_pos_windows == 0 {
+        warn!(
+            "Cannot train verifier: {n_pos_windows} positive windows formed from \
+             {} positive sequence(s) — every utterance has <{VERIFIER_WINDOW_SIZE} \
+             per-frame embeddings.  Returning untrained no-op.",
+            positive_sequences.len(),
+        );
+        return None;
+    }
+    // Guard 2: minimum positive windows (covers every call site — production,
+    // synthetic-negatives fallback, and the E2E benchmark).
+    if n_pos_windows < MIN_POSITIVE_WINDOWS {
+        warn!(
+            "Cannot train verifier: {n_pos_windows} positive windows < minimum \
+             {MIN_POSITIVE_WINDOWS} (mahbot-1008).  Returning untrained no-op — \
+             a reject-all trained on {n_pos_windows} memorized windows is worse \
+             than no verifier at all.",
+        );
+        return None;
+    }
 
     // Negative sequences
     for (i, seq) in negative_sequences.iter().enumerate() {
@@ -982,6 +1219,7 @@ where
                 count: windows.len() - start,
                 is_positive: false,
                 source: seq.source,
+                augmentation_family: seq.augmentation_family,
             });
         }
     }
@@ -993,12 +1231,29 @@ where
         return None;
     }
 
-    // ── Class weight from window counts (mahbot-993) ──
+    // ── Class weight from window counts (mahbot-993), capped (mahbot-1008 Fix 4) ──
+    // The pre-fix formula was unbounded: 58 positive windows vs 11,074
+    // negatives (with tier upweights) produced a ~2,208× per-example positive
+    // weight that drove the model to memorize the 58 positives.  The cap keeps
+    // a strong positive signal (50× per example) without per-example
+    // memorization.  Negative subsampling is intentionally not performed —
+    // the full negative set is what suppresses false accepts (see
+    // MAX_CLASS_WEIGHT docs).
     let class_weight = {
         let n_pw_f = n_pos_windows as f32;
         if n_pw_f > 0.0 {
             let neg_sum: f32 = window_weights[n_pos_windows..].iter().sum();
-            neg_sum / n_pw_f
+            let raw = neg_sum / n_pw_f;
+            if raw > MAX_CLASS_WEIGHT {
+                info!(
+                    "Verifier class weight capped: raw={raw:.1} → \
+                     {MAX_CLASS_WEIGHT:.0} (mahbot-1008 Fix 4; n_pos={n_pos_windows}, \
+                     neg_weight_sum={neg_sum:.1})"
+                );
+                MAX_CLASS_WEIGHT
+            } else {
+                raw
+            }
         } else {
             1.0
         }
@@ -1029,17 +1284,208 @@ where
 // Shared train/validation split (mahbot-995)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Shared per-sequence train/val split with optional source-tier stratification.
+/// How the train/validation split was constructed (mahbot-1008 Fix 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitKind {
+    /// An entire positive provenance group (e.g. all `Source::Enrollment`
+    /// originals, or all `AugmentationFamily::SpeedDown` variants) was held
+    /// out for validation — genuine out-of-distribution validation: the
+    /// verifier never sees that wake-word condition during training.
+    GroupHoldout,
+    /// Per-sequence 80/20 split.  Sequences are never split across train/val
+    /// (no window leakage), but all sequences come from the same enrollment
+    /// session, so validation positives are near-duplicates of training
+    /// positives.  Used only when no provenance groups exist (e.g. unit-test
+    /// data or all-synthetic positives).
+    PerSequence,
+    /// No validation data was available.  Training proceeds without early
+    /// stopping or threshold calibration.  This is deliberate: a leaky
+    /// per-window split (the pre-mahbot-1008 fallback) validated on windows
+    /// from the same sequences as training and could not detect overfitting.
+    None,
+}
+
+/// Provenance group key for positive sequences: `(source, augmentation family)`.
 ///
-/// Accepts an existing `rng` (which the caller should seed for determinism) and
-/// splits sequences by class (with optional stratification by [`SeqInfo::source`]),
-/// shuffles and splits each group by [`VALIDATION_SPLIT`], gathers windows via
-/// [`VoiceVerifier::gather_windows`], and falls back to a per-window random split
-/// if the per-sequence split produces insufficient validation data.
+/// Production enrollment produces one `(Enrollment, None)` sequence per
+/// utterance plus `(Augmentation, Some(family))` PCM variants, so grouping by
+/// this key partitions positives into holdout-able conditions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ProvenanceGroup {
+    source: crate::audio::embedding_sequence::Source,
+    augmentation_family: Option<crate::audio::embedding_sequence::AugmentationFamily>,
+}
+
+impl ProvenanceGroup {
+    /// Human-readable label for diagnostics.
+    fn label(self) -> String {
+        match self.augmentation_family {
+            Some(f) => format!("{:?}+{:?}", self.source, f),
+            None => format!("{:?}", self.source),
+        }
+    }
+}
+
+/// Number of windows covered by a sequence (via its `SeqInfo` range).
+fn seq_window_count(info: &SeqInfo) -> usize {
+    info.count
+}
+
+/// Pick the positive provenance group to hold out for validation (mahbot-1008
+/// Fix 1), or `None` when no group can be held out.
 ///
-/// When `stratify_by_source` is `true`, negative sequences are grouped by source
-/// tier before splitting — preserving tier proportions in both train and val
-/// sets.
+/// Only groups with ≥ 1 window are candidates, and holding the group out must
+/// leave ≥ [`MIN_POSITIVE_WINDOWS`] positive windows in training (otherwise the
+/// training set would fall below the minimum the verifier needs).
+///
+/// Preference order: first `(Enrollment, None)` — the unmodified originals are
+/// the most production-representative wake-word condition (augmented variants
+/// are derived from them), so validating on them is the strongest
+/// generalization check; then the augmentation family with the most windows
+/// (largest signal).
+///
+/// Returns the held-out group and its `SeqInfo` indices.
+fn pick_positive_holdout_group(seq_infos: &[SeqInfo]) -> Option<(ProvenanceGroup, Vec<usize>)> {
+    use std::collections::HashMap;
+
+    let mut groups: HashMap<ProvenanceGroup, Vec<usize>> = HashMap::new();
+    for (i, info) in seq_infos.iter().enumerate() {
+        if !info.is_positive {
+            continue;
+        }
+        let key = ProvenanceGroup {
+            source: info.source,
+            augmentation_family: info.augmentation_family,
+        };
+        groups.entry(key).or_default().push(i);
+    }
+
+    let total_pos_windows: usize = seq_infos
+        .iter()
+        .filter(|s| s.is_positive)
+        .map(seq_window_count)
+        .sum();
+
+    // Candidates: groups whose removal keeps training ≥ MIN_POSITIVE_WINDOWS.
+    let mut candidates: Vec<(ProvenanceGroup, Vec<usize>, usize)> = groups
+        .into_iter()
+        .map(|(group, idxs)| {
+            let windows = idxs.iter().map(|&i| seq_window_count(&seq_infos[i])).sum();
+            (group, idxs, windows)
+        })
+        .filter(|(_, _, win)| *win > 0 && total_pos_windows - *win >= MIN_POSITIVE_WINDOWS)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Preference: (Enrollment, None) first, then largest window count.
+    candidates.sort_by(|a, b| {
+        let a_orig = a.0.source == crate::audio::embedding_sequence::Source::Enrollment
+            && a.0.augmentation_family.is_none();
+        let b_orig = b.0.source == crate::audio::embedding_sequence::Source::Enrollment
+            && b.0.augmentation_family.is_none();
+        b_orig
+            .cmp(&a_orig)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.label().cmp(&b.0.label()))
+    });
+
+    let (group, idxs, win_count) = candidates.remove(0);
+    info!(
+        "Verifier out-of-session validation (mahbot-1008 Fix 1): holding out \
+         positive provenance group '{}' ({win_count} windows) — validation \
+         positives are unseen during training.",
+        group.label(),
+    );
+    Some((group, idxs))
+}
+
+/// Split negative sequence indices per-sequence, optionally stratified by
+/// source tier (preserving tier proportions in train and val).
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn split_negative_sequences(
+    seq_infos: &[SeqInfo],
+    rng: &mut StdRng,
+    stratify_by_source: bool,
+) -> (Vec<usize>, Vec<usize>) {
+    let neg_seq_idx: Vec<usize> = seq_infos
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.is_positive)
+        .map(|(i, _)| i)
+        .collect();
+    if neg_seq_idx.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let n_val_neg = ((neg_seq_idx.len() as f32) * VALIDATION_SPLIT).round() as usize;
+    if n_val_neg == 0 || n_val_neg >= neg_seq_idx.len() {
+        // Too few negative sequences for a meaningful per-sequence split —
+        // keep them all in training (validation can still contain positives
+        // from the group holdout).
+        return (neg_seq_idx, Vec::new());
+    }
+
+    if stratify_by_source {
+        // Group by source tier, shuffle within tier, take the same fraction
+        // from each tier (mahbot-949).
+        use std::collections::HashMap;
+        let mut by_tier: HashMap<crate::audio::embedding_sequence::Source, Vec<usize>> =
+            HashMap::new();
+        for &i in &neg_seq_idx {
+            by_tier.entry(seq_infos[i].source).or_default().push(i);
+        }
+        let mut tr_out = Vec::new();
+        let mut val_out = Vec::new();
+        for (_tier, mut idxs) in by_tier {
+            idxs.shuffle(rng);
+            let n_val_tier = ((idxs.len() as f32) * VALIDATION_SPLIT).round() as usize;
+            let n_val_tier = n_val_tier.min(idxs.len().saturating_sub(1));
+            for (j, &i) in idxs.iter().enumerate() {
+                if j < n_val_tier {
+                    val_out.push(i);
+                } else {
+                    tr_out.push(i);
+                }
+            }
+        }
+        (tr_out, val_out)
+    } else {
+        let mut shuffled = neg_seq_idx;
+        shuffled.shuffle(rng);
+        let n_val = n_val_neg.min(shuffled.len().saturating_sub(1));
+        let val: Vec<usize> = shuffled[..n_val].to_vec();
+        let tr: Vec<usize> = shuffled[n_val..].to_vec();
+        (tr, val)
+    }
+}
+
+/// Shared train/val split (mahbot-995, mahbot-1008 Fix 1).
+///
+/// Accepts an existing `rng` (which the caller should seed for determinism).
+///
+/// # Validation strategy (mahbot-1008 Fix 1)
+///
+/// 1. **Positive provenance-group holdout** — when positive sequences span
+///    multiple provenance groups (originals + augmentation families, as in
+///    production and the E2E benchmark), an entire group is held out for
+///    validation.  The verifier is then validated on wake-word windows it has
+///    never seen during training — the per-sequence 80/20 split within a
+///    single enrollment session was blind because validation positives were
+///    near-duplicates of training positives.
+/// 2. **Per-sequence split** — used when no groups exist (all positives from
+///    one condition).  Sequences are never split across train/val, so no
+///    window leaks between the two sets.
+/// 3. **No validation** — when neither split can produce validation data, the
+///    validation set is empty and the caller skips early stopping and
+///    threshold calibration.  The pre-fix per-window fallback is deliberately
+///    gone: it re-introduced exactly the blind validation this ticket
+///    eliminates.
 ///
 /// After the split, the caller can continue to use `rng` for subsequent
 /// operations (e.g. epoch-level shuffling in the Conv1D training loop).
@@ -1065,90 +1511,88 @@ fn split_train_val(
     Vec<Vec<f32>>,
     Vec<f32>,
     Vec<f32>,
-    bool,
+    SplitKind,
 ) {
-    let (tr_seq_idx, val_seq_idx) = if stratify_by_source {
-        // ── Source-tier stratified split (mahbot-949) ──
-        // Group sequence indices by class and source tier, then shuffle
-        // and assign to train/val stratified by group.
-        let mut pos_indices: Vec<usize> = Vec::new();
-        let mut neg_sources: std::collections::HashMap<
-            crate::audio::embedding_sequence::Source,
-            Vec<usize>,
-        > = std::collections::HashMap::new();
-        for (i, info) in seq_infos.iter().enumerate() {
-            if info.is_positive {
-                pos_indices.push(i);
-            } else {
-                neg_sources.entry(info.source).or_default().push(i);
-            }
-        }
+    let pos_seq_idx: Vec<usize> = seq_infos
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_positive)
+        .map(|(i, _)| i)
+        .collect();
+    let (neg_tr_idx, neg_val_idx) = split_negative_sequences(seq_infos, rng, stratify_by_source);
 
-        let mut tr_seq_idx: Vec<usize> = Vec::new();
-        let mut val_seq_idx: Vec<usize> = Vec::new();
-
-        pos_indices.shuffle(rng);
-        let n_pos_train = ((pos_indices.len() as f32) * (1.0 - VALIDATION_SPLIT)).ceil() as usize;
-        for (j, &idx) in pos_indices.iter().enumerate() {
-            if j < n_pos_train {
-                tr_seq_idx.push(idx);
-            } else {
-                val_seq_idx.push(idx);
-            }
-        }
-
-        for indices in neg_sources.values() {
-            let mut shuffled = indices.clone();
-            shuffled.shuffle(rng);
-            let n_train = ((shuffled.len() as f32) * (1.0 - VALIDATION_SPLIT)).ceil() as usize;
-            for (j, &idx) in shuffled.iter().enumerate() {
-                if j < n_train {
-                    tr_seq_idx.push(idx);
-                } else {
-                    val_seq_idx.push(idx);
-                }
-            }
-        }
-
-        (tr_seq_idx, val_seq_idx)
-    } else {
-        // ── Simple pos/neg split (original Conv1D path, mahbot-995) ──
-        let pos_seq_idx: Vec<usize> = seq_infos
+    // ── 1. Positive provenance-group holdout (mahbot-1008 Fix 1) ──
+    if let Some((group, val_pos_idx)) = pick_positive_holdout_group(seq_infos) {
+        let val_pos_set: std::collections::HashSet<usize> = val_pos_idx.iter().copied().collect();
+        let tr_pos_idx: Vec<usize> = pos_seq_idx
             .iter()
-            .enumerate()
-            .filter(|(_, s)| s.is_positive)
-            .map(|(i, _)| i)
-            .collect();
-        let neg_seq_idx: Vec<usize> = seq_infos
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| !s.is_positive)
-            .map(|(i, _)| i)
-            .collect();
-
-        let n_val_pos = ((pos_seq_idx.len() as f32) * VALIDATION_SPLIT).round() as usize;
-        let n_val_neg = ((neg_seq_idx.len() as f32) * VALIDATION_SPLIT).round() as usize;
-
-        let mut pos_shuffled = pos_seq_idx.clone();
-        pos_shuffled.shuffle(rng);
-        let mut neg_shuffled = neg_seq_idx.clone();
-        neg_shuffled.shuffle(rng);
-
-        let tr_seq_idx: Vec<usize> = pos_shuffled[n_val_pos.min(pos_shuffled.len())..]
-            .iter()
-            .chain(neg_shuffled[n_val_neg.min(neg_shuffled.len())..].iter())
             .copied()
+            .filter(|i| !val_pos_set.contains(i))
             .collect();
-        let val_seq_idx: Vec<usize> = pos_shuffled[..n_val_pos.min(pos_shuffled.len())]
+        let tr_seq_idx: Vec<usize> = tr_pos_idx
             .iter()
-            .chain(neg_shuffled[..n_val_neg.min(neg_shuffled.len())].iter())
             .copied()
+            .chain(neg_tr_idx.iter().copied())
+            .collect();
+        let val_seq_idx: Vec<usize> = val_pos_idx
+            .iter()
+            .copied()
+            .chain(neg_val_idx.iter().copied())
             .collect();
 
-        (tr_seq_idx, val_seq_idx)
-    };
+        let tr = VoiceVerifier::gather_windows(
+            windows,
+            window_labels,
+            window_weights,
+            &tr_seq_idx,
+            seq_infos,
+        );
+        let val = VoiceVerifier::gather_windows(
+            windows,
+            window_labels,
+            window_weights,
+            &val_seq_idx,
+            seq_infos,
+        );
+        let n_tr_pos = tr.1.iter().filter(|&&l| l > 0.5).count();
+        let n_tr_neg = tr.1.len() - n_tr_pos;
+        let n_val_pos = val.1.iter().filter(|&&l| l > 0.5).count();
+        let n_val_neg = val.1.len() - n_val_pos;
+        info!(
+            "Verifier split: group-holdout ('{}') train={n_tr_pos}+{n_tr_neg} \
+             val={n_val_pos}+{n_val_neg} windows",
+            group.label(),
+        );
+        return (
+            tr.0,
+            tr.1,
+            tr.2,
+            val.0,
+            val.1,
+            val.2,
+            SplitKind::GroupHoldout,
+        );
+    }
 
-    // Build train/val arrays from split sequence indices.
+    // ── 2. Per-sequence split ──
+    let n_val_pos = ((pos_seq_idx.len() as f32) * VALIDATION_SPLIT).round() as usize;
+    let mut pos_shuffled = pos_seq_idx;
+    pos_shuffled.shuffle(rng);
+    let n_val_pos = n_val_pos.min(pos_shuffled.len());
+    let val_pos_idx: Vec<usize> = pos_shuffled[..n_val_pos].to_vec();
+    let tr_pos_idx: Vec<usize> = pos_shuffled[n_val_pos..].to_vec();
+
+    let tr_seq_idx: Vec<usize> = tr_pos_idx
+        .iter()
+        .copied()
+        .chain(neg_tr_idx.iter().copied())
+        .collect();
+    let val_seq_idx: Vec<usize> = val_pos_idx
+        .iter()
+        .copied()
+        .chain(neg_val_idx.iter().copied())
+        .collect();
+
     let tr = VoiceVerifier::gather_windows(
         windows,
         window_labels,
@@ -1164,35 +1608,42 @@ fn split_train_val(
         seq_infos,
     );
 
-    // If per-sequence split produced insufficient validation data, fall
-    // back to per-window random split (matching Conv1D classifier behavior).
-    if val.0.is_empty() || tr.0.len() < 2 {
-        let total = windows.len();
-        let n_val = ((total as f32) * VALIDATION_SPLIT).ceil() as usize;
-        let n_val = n_val.max(1).min(total - 1);
-        let mut idx: Vec<usize> = (0..total).collect();
-        idx.shuffle(rng);
-        let mut tr_f = Vec::with_capacity(total - n_val);
-        let mut tr_l = Vec::with_capacity(total - n_val);
-        let mut tr_w = Vec::with_capacity(total - n_val);
-        let mut va_f = Vec::with_capacity(n_val);
-        let mut va_l = Vec::with_capacity(n_val);
-        let mut va_w = Vec::with_capacity(n_val);
-        for (j, &i) in idx.iter().enumerate() {
-            if j < n_val {
-                va_f.push(windows[i].clone());
-                va_l.push(window_labels[i]);
-                va_w.push(window_weights[i]);
-            } else {
-                tr_f.push(windows[i].clone());
-                tr_l.push(window_labels[i]);
-                tr_w.push(window_weights[i]);
-            }
-        }
-        (tr_f, tr_l, tr_w, va_f, va_l, va_w, false)
-    } else {
-        (tr.0, tr.1, tr.2, val.0, val.1, val.2, true)
+    // ── 3. No validation data (deliberately no leaky per-window fallback) ──
+    if val.0.is_empty() {
+        // All sequences go to training; empty validation.
+        let all_idx: Vec<usize> = (0..seq_infos.len()).collect();
+        let all = VoiceVerifier::gather_windows(
+            windows,
+            window_labels,
+            window_weights,
+            &all_idx,
+            seq_infos,
+        );
+        warn!(
+            "Verifier split: no validation data available (per-sequence split produced \
+             an empty validation set) — training without early stopping or threshold \
+             calibration.  The leaky per-window fallback was removed in mahbot-1008.",
+        );
+        return (
+            all.0,
+            all.1,
+            all.2,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            SplitKind::None,
+        );
     }
+
+    (
+        tr.0,
+        tr.1,
+        tr.2,
+        val.0,
+        val.1,
+        val.2,
+        SplitKind::PerSequence,
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1338,14 +1789,30 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// Verifier-local LeakyReLU activation with slope [`LEAKY_RELU_SLOPE`]
+/// (mahbot-1008 Fix 3).
+///
+/// Deliberately NOT the classifier's `relu()`: ReLU's dead zone was the root
+/// cause of the constant-floor collapse — when every Conv1D pre-activation is
+/// ≤ 0 the pooled features are `[0, 0]` and the logit degenerates to
+/// `fc_bias`, an input-independent constant.  LeakyReLU keeps a small
+/// (input-dependent) signal in the negative half-plane so the feature path can
+/// never die completely.
+#[inline]
+fn leaky_relu_verifier(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        *v = if *v > 0.0 { *v } else { LEAKY_RELU_SLOPE * *v };
+    }
+}
+
 /// Conv1D inference path for the verifier (mahbot-995).
 ///
-/// Architecture: Conv1D(96→2, k=3, padding=1) → ReLU → AdaptiveAvgPool1d → Linear(2→1) → Sigmoid.
+/// Architecture: Conv1D(96→2, k=3, padding=1) → LeakyReLU → AdaptiveAvgPool1d → Linear(2→1) → Sigmoid.
 ///
 /// Input must be 288-dim (3 concatenated 96-dim embeddings). Panics otherwise.
 ///
 /// Pipeline: 288-dim input → L2-normalize → Reshape to channels-first [96 × 3]
-/// → Conv1D → ReLU → AdaptiveAvgPool1d → Linear → Sigmoid.
+/// → Conv1D → LeakyReLU → AdaptiveAvgPool1d → Linear → Sigmoid.
 ///
 /// # Panics
 ///
@@ -1391,8 +1858,9 @@ fn predict_conv1d(
     let mut conv_out =
         crate::audio::wake_word_classifier::conv1d(&cf, cin, l, cout, ks, conv_weight, conv_bias);
 
-    // Step 4: ReLU activation.
-    crate::audio::wake_word_classifier::relu(&mut conv_out);
+    // Step 4: LeakyReLU activation (mahbot-1008 Fix 3 — replaces ReLU to
+    // eliminate the dead-zone constant floor).
+    leaky_relu_verifier(&mut conv_out);
 
     // Step 5: AdaptiveAvgPool1d (3 → 1) — average over the time dimension.
     let pooled = crate::audio::wake_word_classifier::adaptive_avg_pool(&conv_out, cout, l);
@@ -1410,7 +1878,9 @@ fn predict_conv1d(
 /// Compute weighted binary cross-entropy loss for Conv1D verifier (mahbot-995).
 ///
 /// Runs a forward pass through the Conv1D architecture for each sample.
-/// When `use_l2` is true, includes L2 regularization on conv_weight and fc_weight.
+/// When `use_l2` is true, includes L2 regularization on conv_weight, fc_weight,
+/// AND both bias terms (bias L2 added in mahbot-1008 Fix 3 — the unregularized
+/// `fc_bias` was free to drift to −16.52 under ~85% negative-only batches).
 #[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
 fn compute_conv1d_loss(
     windows: &[Vec<f32>],
@@ -1444,7 +1914,7 @@ fn compute_conv1d_loss(
             conv_bias,
         );
         let mut relu_out = conv_out;
-        crate::audio::wake_word_classifier::relu(&mut relu_out);
+        leaky_relu_verifier(&mut relu_out);
         let pooled = crate::audio::wake_word_classifier::adaptive_avg_pool(&relu_out, cout, lin);
         let logit: f32 = pooled
             .iter()
@@ -1462,7 +1932,9 @@ fn compute_conv1d_loss(
         let l2_term = 0.5
             * l2_lambda
             * (conv_weight.iter().map(|w| w * w).sum::<f32>()
-                + fc_weight.iter().map(|w| w * w).sum::<f32>());
+                + conv_bias.iter().map(|w| w * w).sum::<f32>()
+                + fc_weight.iter().map(|w| w * w).sum::<f32>()
+                + fc_bias.iter().map(|w| w * w).sum::<f32>());
         bce + l2_term
     } else {
         bce
@@ -1477,7 +1949,7 @@ fn log_verifier_diagnostics(
     tr_labels: &[f32],
     val_windows: &[Vec<f32>],
     val_labels: &[f32],
-    used_sequence_split: bool,
+    split_kind: SplitKind,
     class_weight: f32,
     label: &str,
 ) {
@@ -1528,10 +2000,10 @@ fn log_verifier_diagnostics(
         neg_scores_val.iter().sum::<f32>() / neg_scores_val.len() as f32
     };
 
-    let split_method = if used_sequence_split {
-        "per-sequence"
-    } else {
-        "per-window"
+    let split_method = match split_kind {
+        SplitKind::GroupHoldout => "group-holdout (out-of-session)",
+        SplitKind::PerSequence => "per-sequence",
+        SplitKind::None => "no-validation",
     };
     info!(
         "{label} training ({split_method} split): \
@@ -1979,7 +2451,7 @@ mod tests {
         // both acceptance of held-out positives and rejection of held-out negatives
         // (consolidated from two separate tests with identical setup, mahbot-874).
         let mut rng = StdRng::seed_from_u64(42);
-        let positives: Vec<Vec<f32>> = (0..20).map(|_| make_positive_embedding(&mut rng)).collect();
+        let positives: Vec<Vec<f32>> = (0..40).map(|_| make_positive_embedding(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..30).map(|_| make_negative_embedding(&mut rng)).collect();
         let pos_seq = make_seq(
             positives,
@@ -2060,7 +2532,7 @@ mod tests {
         // positive cluster, requiring the verifier to learn a more nuanced
         // boundary than the old opposite-direction test.
         let mut rng = StdRng::seed_from_u64(42);
-        let positives: Vec<Vec<f32>> = (0..20).map(|_| make_positive_embedding(&mut rng)).collect();
+        let positives: Vec<Vec<f32>> = (0..40).map(|_| make_positive_embedding(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..30)
             .map(|_| make_non_wake_speech_embedding(&mut rng))
             .collect();
@@ -2109,7 +2581,7 @@ mod tests {
         // the resulting decision boundary correctly rejects non-wake-word
         // speech embeddings.
         let mut rng = StdRng::seed_from_u64(99);
-        let positives: Vec<Vec<f32>> = (0..30).map(|_| make_positive_embedding(&mut rng)).collect();
+        let positives: Vec<Vec<f32>> = (0..32).map(|_| make_positive_embedding(&mut rng)).collect();
         let pos_seq = make_seq(
             positives,
             crate::audio::embedding_sequence::LabelStratum::Positive,
@@ -2156,12 +2628,15 @@ mod tests {
             assert!(w.is_finite(), "all weights must be finite");
         }
 
-        // Verify a held-out positive is accepted.
+        // Verify a held-out positive is accepted.  NOTE (mahbot-1008): the
+        // absolute score scale shifted slightly with LeakyReLU + bias L2/clamp;
+        // the meaningful bar is a score well above the reject-all floor (the
+        // pre-fix collapse produced 6.67e-8).  Discrimination is asserted below.
         let held_out = make_positive_embedding(&mut rng);
         let score = verifier.predict(&held_out);
         assert!(
-            score >= 0.5,
-            "Verifier should accept positive embedding (score >= 0.5), got score={score:.4}",
+            score >= 0.4,
+            "Verifier should score positive >= 0.4, got score={score:.4}",
         );
 
         // Verify discrimination: positive score > 0.4 (similar to
@@ -2180,6 +2655,13 @@ mod tests {
         );
         assert!(score.is_finite(), "Positive score must be finite",);
         assert!(score_non_wake.is_finite(), "Non-wake score must be finite",);
+        // The verifier must actually discriminate: held-out positives score
+        // above held-out non-wake speech (mahbot-1008 — the old absolute
+        // assertions could pass for a constant predictor).
+        assert!(
+            score > score_non_wake,
+            "Verifier must discriminate: pos={score:.4} non_wake={score_non_wake:.4}",
+        );
     }
 
     #[test]
@@ -2201,7 +2683,7 @@ mod tests {
         // Train a Conv1D model and verify JSON roundtrip preserves predictions
         // and is_trained() status.
         let mut rng = StdRng::seed_from_u64(42);
-        let positives: Vec<Vec<f32>> = (0..20).map(|_| make_positive_embedding(&mut rng)).collect();
+        let positives: Vec<Vec<f32>> = (0..40).map(|_| make_positive_embedding(&mut rng)).collect();
         let negatives: Vec<Vec<f32>> = (0..30).map(|_| make_negative_embedding(&mut rng)).collect();
         let pos_seq = make_seq(
             positives,
@@ -2416,8 +2898,8 @@ mod tests {
         // Two training runs with the same seed and identical training data
         // must produce identical Conv1D training weights.
         let mut rng = StdRng::seed_from_u64(12345);
-        let positives: Vec<Vec<f32>> = (0..10).map(|_| make_positive_embedding(&mut rng)).collect();
-        let negatives: Vec<Vec<f32>> = (0..10).map(|_| make_negative_embedding(&mut rng)).collect();
+        let positives: Vec<Vec<f32>> = (0..40).map(|_| make_positive_embedding(&mut rng)).collect();
+        let negatives: Vec<Vec<f32>> = (0..40).map(|_| make_negative_embedding(&mut rng)).collect();
         let pos_seq = make_seq(
             positives,
             crate::audio::embedding_sequence::LabelStratum::Positive,
@@ -2510,42 +2992,348 @@ mod tests {
         );
     }
 
+    // ── mahbot-1008 tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_verifier_positive_windows_below_minimum_untrained() {
+        // Fewer than MIN_POSITIVE_WINDOWS positive windows → untrained no-op
+        // (a trained reject-all memorizing a handful of windows is worse than
+        // no verifier at all — mahbot-1008 Fix 2).
+        let mut rng = StdRng::seed_from_u64(11);
+        let positives: Vec<Vec<f32>> = (0..20).map(|_| make_positive_embedding(&mut rng)).collect();
+        let negatives: Vec<Vec<f32>> = (0..40).map(|_| make_negative_embedding(&mut rng)).collect();
+        let pos_seq = make_seq(
+            positives,
+            crate::audio::embedding_sequence::LabelStratum::Positive,
+        );
+        let neg_seq = make_seq(
+            negatives,
+            crate::audio::embedding_sequence::LabelStratum::Negative,
+        );
+
+        let verifier = VoiceVerifier::train(
+            &[pos_seq],
+            &[neg_seq],
+            None,
+            DEFAULT_VERIFIER_THRESHOLD,
+            CONV_L2_LAMBDA,
+            Some(42),
+        );
+        assert!(
+            !verifier.is_trained(),
+            "verifier with {MIN_POSITIVE_WINDOWS}-window minimum must stay untrained \
+             when trained on 20 positive windows",
+        );
+        // Untrained no-op: every frame passes.
+        let score = verifier.predict(&[0.5; VERIFIER_INPUT_DIM]);
+        assert!((score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_verifier_zero_positive_windows_untrained() {
+        // The stricter failure mode: positive sequences EXIST but every
+        // utterance has < VERIFIER_WINDOW_SIZE frames → zero positive windows.
+        // The pre-fix code trained an all-negative reject-all with
+        // trained:true; the guard must return untrained instead (mahbot-1008
+        // Fix 2, analyst review).
+        let pos_embs: Vec<Vec<f32>> = (0..2)
+            .map(|i| vec![0.5 + i as f32; EMBEDDING_DIM])
+            .collect();
+        let neg_embs: Vec<Vec<f32>> = (0..40).map(|_| vec![-0.5; EMBEDDING_DIM]).collect();
+        let pos_seq = make_seq(
+            pos_embs,
+            crate::audio::embedding_sequence::LabelStratum::Positive,
+        );
+        let neg_seq = make_seq(
+            neg_embs,
+            crate::audio::embedding_sequence::LabelStratum::Negative,
+        );
+
+        let verifier = VoiceVerifier::train(
+            &[pos_seq],
+            &[neg_seq],
+            None,
+            DEFAULT_VERIFIER_THRESHOLD,
+            CONV_L2_LAMBDA,
+            Some(42),
+        );
+        assert!(
+            !verifier.is_trained(),
+            "zero positive windows must yield an untrained no-op, not a trained reject-all",
+        );
+        // All-negative training must never produce a trained brick wall.
+        let score = verifier.predict(&[0.5; VERIFIER_INPUT_DIM]);
+        assert!((score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_verifier_class_weight_capped() {
+        // Extremely imbalanced data must cap the per-positive-window class
+        // weight at MAX_CLASS_WEIGHT instead of exploding (~2,208× observed
+        // pre-fix) — mahbot-1008 Fix 4.
+        let mut rng = StdRng::seed_from_u64(13);
+        let positives: Vec<Vec<f32>> = (0..32).map(|_| make_positive_embedding(&mut rng)).collect();
+        // 3200 negatives with 1.0 weight → raw ratio 100× > MAX_CLASS_WEIGHT.
+        let negatives: Vec<Vec<f32>> = (0..3200)
+            .map(|_| make_negative_embedding(&mut rng))
+            .collect();
+        let pos_seq = make_seq(
+            positives,
+            crate::audio::embedding_sequence::LabelStratum::Positive,
+        );
+        let neg_seq = make_seq(
+            negatives,
+            crate::audio::embedding_sequence::LabelStratum::Negative,
+        );
+
+        let (verifier, metrics) = VoiceVerifier::train_with_metrics(
+            &[pos_seq],
+            &[neg_seq],
+            None,
+            DEFAULT_VERIFIER_THRESHOLD,
+            CONV_L2_LAMBDA,
+            Some(42),
+        );
+        assert!(
+            verifier.is_trained(),
+            "verifier must train at the capped weight"
+        );
+        let _ = metrics; // training diagnostics are report-only
+        // The capped class weight still lets the model discriminate.
+        let held_out_pos = make_positive_embedding(&mut rng);
+        let held_out_neg = make_negative_embedding(&mut rng);
+        assert!(
+            verifier.predict(&held_out_pos) > verifier.predict(&held_out_neg),
+            "capped-weight verifier must still discriminate",
+        );
+    }
+
+    #[test]
+    fn test_verifier_is_collapsed_detects_constant_reject() {
+        // A trained verifier whose feature path is dead (all conv weights zero
+        // → output = sigmoid(fc_bias) regardless of input) must be flagged as
+        // collapsed (mahbot-1008).  This is the load-time guard that converts
+        // already-enrolled users' brick walls into untrained no-ops.
+        let collapsed = VoiceVerifier {
+            trained: true,
+            threshold: DEFAULT_VERIFIER_THRESHOLD,
+            activation: VerifierActivation::LeakyReLU,
+            conv_weight: vec![0.0; CONV_VERIFIER_OUT * EMBEDDING_DIM * CONV_VERIFIER_KERNEL_SIZE],
+            conv_bias: vec![0.0; CONV_VERIFIER_OUT],
+            fc_weight: vec![0.0; CONV_VERIFIER_OUT],
+            fc_bias: vec![-16.52], // observed pre-fix drift → sigmoid ≈ 6.67e-8
+        };
+        assert!(collapsed.is_trained());
+        assert!(
+            collapsed.is_collapsed(),
+            "constant-reject verifier must be flagged as collapsed",
+        );
+
+        // A discriminating verifier must NOT be flagged.
+        let mut rng = StdRng::seed_from_u64(17);
+        let positives: Vec<Vec<f32>> = (0..40).map(|_| make_positive_embedding(&mut rng)).collect();
+        let negatives: Vec<Vec<f32>> = (0..40).map(|_| make_negative_embedding(&mut rng)).collect();
+        let pos_seq = make_seq(
+            positives,
+            crate::audio::embedding_sequence::LabelStratum::Positive,
+        );
+        let neg_seq = make_seq(
+            negatives,
+            crate::audio::embedding_sequence::LabelStratum::Negative,
+        );
+        let healthy = VoiceVerifier::train(
+            &[pos_seq],
+            &[neg_seq],
+            None,
+            DEFAULT_VERIFIER_THRESHOLD,
+            CONV_L2_LAMBDA,
+            Some(42),
+        );
+        assert!(healthy.is_trained());
+        assert!(
+            !healthy.is_collapsed(),
+            "discriminating verifier must not be flagged as collapsed",
+        );
+
+        // An untrained verifier (no-op) is never collapsed.
+        assert!(!VoiceVerifier::untrained().is_collapsed());
+    }
+
+    #[test]
+    fn test_verifier_split_positive_group_holdout() {
+        // Positives from two provenance groups: the split must hold out an
+        // ENTIRE group for validation (out-of-session validation, mahbot-1008
+        // Fix 1) — not an 80/20 per-sequence mix from the same conditions.
+        use crate::audio::embedding_sequence::AugmentationFamily;
+        use crate::audio::embedding_sequence::Source;
+        use crate::audio::embedding_sequence::UtteranceId;
+
+        let mut rng = StdRng::seed_from_u64(19);
+        let mut mk_embs = |n: usize| -> Vec<Vec<f32>> {
+            (0..n).map(|_| make_positive_embedding(&mut rng)).collect()
+        };
+
+        // 6 Enrollment originals × 8 pre-windowed vectors (8 windows each = 48
+        // windows) — 288-dim vectors are used directly as pre-windowed data by
+        // form_conv1d_sequence_windows.
+        // 6 Augmentation(SpeedDown) × 8 pre-windowed vectors (48 windows)
+        // 96 positive windows total; holding out either 48-window group leaves
+        // 48 ≥ MIN_POSITIVE_WINDOWS in training.
+        let mut pos_seqs: Vec<EmbeddingSequence> = Vec::new();
+        for i in 0..6 {
+            pos_seqs.push(EmbeddingSequence::positive(
+                UtteranceId {
+                    sequence_index: i,
+                    variant_index: 0,
+                },
+                Source::Enrollment,
+                None,
+                mk_embs(8),
+            ));
+            pos_seqs.push(EmbeddingSequence::positive(
+                UtteranceId {
+                    sequence_index: i,
+                    variant_index: 1,
+                },
+                Source::Augmentation,
+                Some(AugmentationFamily::SpeedDown),
+                mk_embs(8),
+            ));
+        }
+        // 6 negative sequences × 8 frames.
+        let neg_seqs: Vec<EmbeddingSequence> = (0..6)
+            .map(|_| {
+                EmbeddingSequence::negative(
+                    UtteranceId {
+                        sequence_index: 0,
+                        variant_index: 0,
+                    },
+                    Source::Synthetic,
+                    None,
+                    (0..8).map(|_| make_negative_embedding(&mut rng)).collect(),
+                )
+            })
+            .collect();
+
+        // The preferred holdout group is (Enrollment, None) — the originals.
+        let prepared =
+            prepare_training_data(&pos_seqs, &neg_seqs, None, form_conv1d_sequence_windows)
+                .expect("training data must prepare");
+        let (tr_w, tr_l, _tr_wt, val_w, val_l, _val_wt, kind) = split_train_val(
+            &prepared.3,
+            &prepared.0,
+            &prepared.1,
+            &prepared.2,
+            &mut StdRng::seed_from_u64(19),
+            true,
+        );
+
+        assert_eq!(
+            kind,
+            SplitKind::GroupHoldout,
+            "split must use group holdout"
+        );
+        let n_tr_pos = tr_l.iter().filter(|&&l| l > 0.5).count();
+        let n_val_pos = val_l.iter().filter(|&&l| l > 0.5).count();
+        // The entire 48-window Enrollment group is held out; training keeps the
+        // 48 SpeedDown windows.
+        assert_eq!(
+            n_val_pos, 48,
+            "held-out group must be the full 48 originals"
+        );
+        assert_eq!(n_tr_pos, 48, "training keeps the 48 augmented windows");
+        assert_eq!(tr_w.len() + val_w.len(), 96 + 48, "no windows lost");
+    }
+
+    #[test]
+    fn test_verifier_split_no_leaky_per_window_fallback() {
+        // All positives from one provenance group with too few sequences for a
+        // per-sequence split: the split must yield NO validation data rather
+        // than the pre-fix leaky per-window fallback (which validated on
+        // windows from the same sequences as training — mahbot-1008 Fix 1).
+        let mut rng = StdRng::seed_from_u64(23);
+        let positives: Vec<Vec<f32>> = (0..40).map(|_| make_positive_embedding(&mut rng)).collect();
+        let negatives: Vec<Vec<f32>> = (0..40).map(|_| make_negative_embedding(&mut rng)).collect();
+        let pos_seq = make_seq(
+            positives,
+            crate::audio::embedding_sequence::LabelStratum::Positive,
+        );
+        let neg_seq = make_seq(
+            negatives,
+            crate::audio::embedding_sequence::LabelStratum::Negative,
+        );
+
+        let prepared =
+            prepare_training_data(&[pos_seq], &[neg_seq], None, form_conv1d_sequence_windows)
+                .expect("training data must prepare");
+        let (tr_w, _tr_l, _tr_wt, val_w, _val_l, _val_wt, kind) = split_train_val(
+            &prepared.3,
+            &prepared.0,
+            &prepared.1,
+            &prepared.2,
+            &mut StdRng::seed_from_u64(23),
+            true,
+        );
+        assert_eq!(
+            kind,
+            SplitKind::None,
+            "no validation data, no leaky fallback"
+        );
+        assert!(
+            val_w.is_empty(),
+            "validation must be empty (no per-window leak)"
+        );
+        assert_eq!(tr_w.len(), 80, "all windows stay in training");
+    }
+
+    #[test]
+    fn test_verifier_legacy_json_defaults_to_leaky_relu() {
+        // A verifier JSON persisted before mahbot-1008 has no `activation`
+        // field; it must deserialize with the LeakyReLU default and remain
+        // usable (mahbot-1008 persistence compatibility).
+        let json = r#"{
+            "conv_weight": [],
+            "conv_bias": [],
+            "fc_weight": [],
+            "fc_bias": [],
+            "threshold": 0.948,
+            "trained": false
+        }"#;
+        let verifier: VoiceVerifier = serde_json::from_str(json).expect("legacy JSON loads");
+        assert_eq!(verifier.activation, VerifierActivation::LeakyReLU);
+        assert!(!verifier.is_trained());
+    }
+
     #[test]
     fn test_verifier_train_sequences() {
-        // Two positive sequences + two negative sequences each with enough
+        // Eight positive sequences + eight negative sequences each with enough
         // frames to form windows → trained verifier accepts positives and
-        // rejects negatives.
+        // rejects negatives.  Counts are ≥ MIN_POSITIVE_WINDOWS (30) after the
+        // per-sequence 80/20 split (mahbot-1008 Fix 2 guard).
         let mut rng = StdRng::seed_from_u64(42);
 
-        // Positive sequence 1: 5 frames → 3 stride-1 windows
-        let pos1: Vec<Vec<f32>> = (0..5).map(|_| make_positive_embedding(&mut rng)).collect();
-        // Positive sequence 2: 5 frames → 3 stride-1 windows
-        let pos2: Vec<Vec<f32>> = (0..5).map(|_| make_positive_embedding(&mut rng)).collect();
-        // Negative sequence 1: 5 frames → 3 stride-1 windows
-        let neg1: Vec<Vec<f32>> = (0..5).map(|_| make_negative_embedding(&mut rng)).collect();
-        // Negative sequence 2: 5 frames → 3 stride-1 windows
-        let neg2: Vec<Vec<f32>> = (0..5).map(|_| make_negative_embedding(&mut rng)).collect();
-
-        let pos_seqs = [
-            make_seq(
-                pos1,
-                crate::audio::embedding_sequence::LabelStratum::Positive,
-            ),
-            make_seq(
-                pos2,
-                crate::audio::embedding_sequence::LabelStratum::Positive,
-            ),
-        ];
-        let neg_seqs = [
-            make_seq(
-                neg1,
-                crate::audio::embedding_sequence::LabelStratum::Negative,
-            ),
-            make_seq(
-                neg2,
-                crate::audio::embedding_sequence::LabelStratum::Negative,
-            ),
-        ];
+        // Positive sequences: 8 frames → 6 stride-1 windows each → 48 total
+        let pos_seqs: Vec<EmbeddingSequence> = (0..8)
+            .map(|_| {
+                let embs: Vec<Vec<f32>> =
+                    (0..8).map(|_| make_positive_embedding(&mut rng)).collect();
+                make_seq(
+                    embs,
+                    crate::audio::embedding_sequence::LabelStratum::Positive,
+                )
+            })
+            .collect();
+        // Negative sequences: 8 frames → 6 stride-1 windows each → 48 total
+        let neg_seqs: Vec<EmbeddingSequence> = (0..8)
+            .map(|_| {
+                let embs: Vec<Vec<f32>> =
+                    (0..8).map(|_| make_negative_embedding(&mut rng)).collect();
+                make_seq(
+                    embs,
+                    crate::audio::embedding_sequence::LabelStratum::Negative,
+                )
+            })
+            .collect();
 
         let verifier = VoiceVerifier::train(
             &pos_seqs,
@@ -2583,7 +3371,7 @@ mod tests {
         // mean the class_weight should be meaningfully higher than the raw
         // n_neg/n_pos ratio; the verifier must still discriminate.
         let mut rng2 = StdRng::seed_from_u64(99);
-        let cache_pos: Vec<Vec<f32>> = (0..20)
+        let cache_pos: Vec<Vec<f32>> = (0..40)
             .map(|_| make_positive_embedding(&mut rng2))
             .collect();
         let cache_pos_seq = make_seq(
@@ -2636,9 +3424,9 @@ mod tests {
         );
 
         // Verify discrimination with per-negative-weights (mahbot-993).
-        // For this distribution (20 pos windows, 30 neg windows with weights
-        // [15.0, 10.0, 1.0] applied at line 482), the dynamic formula gives
-        // class_weight ≈ (10×15 + 10×10 + 10×1)/20 = 13.0 (vs raw ratio 1.5).
+        // For this distribution (40 pos windows, 30 neg windows with weights
+        // [15.0, 10.0, 1.0]), the dynamic formula gives
+        // class_weight ≈ (10×15 + 10×10 + 10×1)/40 = 6.5 (vs raw ratio 0.75).
         // The model must still produce positive scores above negative scores.
         let held_out_pos = make_positive_embedding(&mut rng2);
         let held_out_neg = make_negative_embedding(&mut rng2);

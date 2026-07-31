@@ -5898,7 +5898,7 @@ async fn finalize_enrollment_pipeline() -> bool {
     let verifier = tokio::task::spawn_blocking(move || {
         use crate::audio::voice_verifier::{
             assert_weight_tier, CONFUSABLE_UPWEIGHT,
-            CONV_L2_LAMBDA, DEFAULT_VERIFIER_THRESHOLD,
+            CONV_L2_LAMBDA, DEFAULT_VERIFIER_THRESHOLD, MIN_POSITIVE_WINDOWS,
             UNRELATED_UPWEIGHT, VoiceVerifier,
         };
 
@@ -5970,13 +5970,23 @@ async fn finalize_enrollment_pipeline() -> bool {
                 CONV_L2_LAMBDA,
                 None,
             );
-            info!(
-                "Verifier trained from {} positive + {} \
-                 negative sequence(s) (ambient + owner-negative + unrelated + \
-                 confusable, mahbot-913)",
-                pos_for_ver_seqs.len(),
-                n_neg,
-            );
+            if v.is_trained() {
+                info!(
+                    "Verifier trained from {} positive + {} \
+                     negative sequence(s) (ambient + owner-negative + unrelated + \
+                     confusable, mahbot-913)",
+                    pos_for_ver_seqs.len(),
+                    n_neg,
+                );
+            } else {
+                warn!(
+                    "Verifier left UNTRAINED (no-op): {} positive sequences produced \
+                     fewer than the {MIN_POSITIVE_WINDOWS}-window minimum \
+                     (mahbot-1008 Fix 2).  A reject-all brick wall is worse than \
+                     no verifier — wake words will pass with classifier-only gating.",
+                    pos_for_ver_seqs.len(),
+                );
+            }
             v
         } else {
             let v = VoiceVerifier::train_with_synthetic_negatives(
@@ -5984,12 +5994,22 @@ async fn finalize_enrollment_pipeline() -> bool {
                 DEFAULT_VERIFIER_THRESHOLD,
                 None,
             );
-            info!(
-                "Verifier trained from {} positive \
-                 sequence(s) + synthetic negatives (no real or confusable \
-                 negatives available, mahbot-859)",
-                pos_for_ver_seqs.len(),
-            );
+            if v.is_trained() {
+                info!(
+                    "Verifier trained from {} positive \
+                     sequence(s) + synthetic negatives (no real or confusable \
+                     negatives available, mahbot-859)",
+                    pos_for_ver_seqs.len(),
+                );
+            } else {
+                warn!(
+                    "Verifier left UNTRAINED (no-op): {} positive sequences produced \
+                     fewer than the {MIN_POSITIVE_WINDOWS}-window minimum \
+                     (mahbot-1008 Fix 2).  Wake words will pass with \
+                     classifier-only gating.",
+                    pos_for_ver_seqs.len(),
+                );
+            }
             v
         }
     })
@@ -6096,8 +6116,25 @@ pub async fn run_voice_pipeline() {
                     if let Some(ref members) = model.classifier {
                         set_classifier_weights(members[0].clone());
                     }
+                    // ── Verifier load guard (mahbot-1008) ──
+                    // Already-enrolled users may have persisted a collapsed
+                    // reject-all verifier (constant input-independent output,
+                    // e.g. sigmoid(fc_bias) = 6.67e-8).  Detecting it here and
+                    // dropping to an untrained no-op restores wake-word
+                    // detection immediately; re-enrollment trains a fixed
+                    // verifier.  Keeping a constant-reject brick would block
+                    // every wake word until the user re-enrolls.
                     if let Some(ref v) = model.verifier {
-                        set_verifier(v.clone());
+                        if v.is_collapsed() {
+                            warn!(
+                                "Loaded verifier is collapsed (constant input-independent \
+                                 reject) — treating as untrained no-op (mahbot-1008).  \
+                                 Re-enrollment will train a fixed verifier."
+                            );
+                            set_verifier(crate::audio::voice_verifier::VoiceVerifier::untrained());
+                        } else {
+                            set_verifier(v.clone());
+                        }
                     }
                     let n = model.classifier.as_ref().map_or(0, Vec::len);
                     info!(
@@ -8087,6 +8124,7 @@ mod tests {
     use crate::VERIFIER_INPUT_DIM;
     use crate::audio::voice_verifier::{
         CONV_VERIFIER_KERNEL_SIZE, CONV_VERIFIER_OUT, DEFAULT_VERIFIER_THRESHOLD,
+        VerifierActivation,
     };
     use crate::util::test::set_env_var;
     use crate::util::{add_noise, apply_gain, generate_pink_noise};
@@ -10400,6 +10438,7 @@ mod tests {
         VoiceVerifier {
             trained: true,
             threshold: DEFAULT_VERIFIER_THRESHOLD,
+            activation: VerifierActivation::LeakyReLU,
             conv_weight: vec![0.0; CONV_VERIFIER_OUT * EMBEDDING_DIM * CONV_VERIFIER_KERNEL_SIZE],
             conv_bias: vec![0.0; CONV_VERIFIER_OUT],
             fc_weight: vec![0.0; CONV_VERIFIER_OUT],
@@ -10413,6 +10452,7 @@ mod tests {
         VoiceVerifier {
             trained: true,
             threshold: DEFAULT_VERIFIER_THRESHOLD,
+            activation: VerifierActivation::LeakyReLU,
             conv_weight: vec![0.0; CONV_VERIFIER_OUT * EMBEDDING_DIM * CONV_VERIFIER_KERNEL_SIZE],
             conv_bias: vec![0.0; CONV_VERIFIER_OUT],
             fc_weight: vec![0.0; CONV_VERIFIER_OUT],

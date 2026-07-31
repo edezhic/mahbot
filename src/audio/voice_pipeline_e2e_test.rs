@@ -160,6 +160,27 @@ const OWNER_NEGATIVE_PHRASES: &[&str] = &[
 /// costs roughly 6 percentage points.
 const MIN_DETECTION_RATE: f64 = 0.60;
 
+/// Minimum verifier recall on positive (wake-word) test variants (mahbot-1008
+/// Fix 6).
+///
+/// The verifier must accept at least this fraction of genuine wake-word
+/// variants that it actually evaluates (verifier trained + warm-up complete +
+/// classifier crossed the effective threshold).  The pre-fix verifier scored
+/// `6.67e-8` on every out-of-distribution input — a 0% accept rate — while the
+/// benchmark reported "0% detection" as a success because it had no
+/// verifier-recall metric.
+///
+/// ## Report-only semantics (mahbot-953 precedent)
+///
+/// This constant gates a prominent WARNING, not a hard assert: mahbot-953
+/// deliberately removed all benchmark pass/fail gating, and the mahbot-997
+/// auto-suggestion protocol can ratchet `MIN_DETECTION_RATE` toward 0.0 on
+/// failing runs (see the detection-rate hint below, which now refuses to
+/// endorse lowering the constant on a failing run).  A hard gate can be
+/// re-introduced in a follow-up ticket once fixes #1-#5 have been validated
+/// across benchmark runs.
+const VERIFIER_RECALL_MIN: f64 = 0.90;
+
 // Per-category false accept limits are now dynamic by tier — see
 // [`tier_limits`] and [`BenchTier`] (mahbot-871).
 
@@ -2049,6 +2070,44 @@ impl ClassifierTriggerMetrics {
     }
 }
 
+/// Verifier recall on positive (wake-word) test variants (mahbot-1008 Fix 6).
+///
+/// The fraction of genuine wake-word variants the verifier ACCEPTED among
+/// those it actually evaluated: verifier trained + warm-up complete + the
+/// classifier crossed the effective adaptive threshold (so a candidate existed
+/// and the verifier gate was the deciding factor).  A variant counts as
+/// accepted when its peak verifier score reached the verifier decision
+/// threshold.
+///
+/// Returns `None` when the verifier was untrained or no variant reached the
+/// verifier gate (division by zero).  Otherwise returns `(accepted,
+/// evaluated)`.
+fn verifier_recall(per_variant: &[PerVariantResult]) -> Option<(usize, usize)> {
+    let mut evaluated = 0usize;
+    let mut accepted = 0usize;
+    for pv in per_variant {
+        if !pv.verifier_trained || !pv.warmup_completed {
+            continue;
+        }
+        let crossed_effective = pv
+            .per_frame_scores
+            .iter()
+            .any(|s| s[ROLLING_SUM_IDX] >= s[THRESHOLD_IDX]);
+        if !crossed_effective {
+            continue;
+        }
+        evaluated += 1;
+        if pv.verifier_score >= pv.verifier_threshold {
+            accepted += 1;
+        }
+    }
+    if evaluated == 0 {
+        None
+    } else {
+        Some((accepted, evaluated))
+    }
+}
+
 /// Convert classifier trigger metrics to a JSON object for the benchmark report.
 fn ct_to_json(ct: &ClassifierTriggerMetrics) -> serde_json::Value {
     serde_json::json!({
@@ -3732,6 +3791,14 @@ pub(crate) fn run_internal() {
         },
     );
 
+    // ── Verifier recall on wake-word variants (mahbot-1008 Fix 6) ──
+    // The pre-fix verifier accepted 0/17 positive variants (constant 6.67e-8
+    // reject-all) while the benchmark reported the 0% detection rate without a
+    // verifier-recall signal.  Compute the accept rate over variants the
+    // verifier actually evaluated.  Computed before the report so both the
+    // human-readable report and the JSON output use the same value.
+    let verifier_recall_rate = verifier_recall(&pos_metrics.per_variant);
+
     info!("══════════════════════════════════════════════");
     info!("      Voice Pipeline E2E Benchmark Results");
     info!("══════════════════════════════════════════════");
@@ -3746,6 +3813,37 @@ pub(crate) fn run_internal() {
         pos_metrics.total,
         MIN_DETECTION_RATE * 100.0,
     );
+    // ── Verifier recall report (mahbot-1008 Fix 6) ──
+    // Report-only warning (mahbot-953 precedent): a verifier that rejects most
+    // genuine wake words it evaluates is a brick wall regardless of the
+    // overall detection rate.  An untrained (no-op) verifier reports N/A —
+    // there is no gate to measure.
+    match verifier_recall_rate {
+        Some((accepted, evaluated)) => {
+            let r = accepted as f64 / evaluated as f64;
+            info!(
+                "Verifier recall: {:.1}% ({accepted}/{evaluated}) — minimum ≥{:.0}% \
+                 (over variants the verifier actually evaluated)",
+                r * 100.0,
+                VERIFIER_RECALL_MIN * 100.0,
+            );
+            if r < VERIFIER_RECALL_MIN {
+                warn!(
+                    "Verifier recall BELOW minimum: {:.1}% < {:.0}% (mahbot-1008 Fix 6). \
+                     The verifier rejects too many genuine wake words — check the \
+                     verifier_diagnostics.training block for held-out TPR.",
+                    r * 100.0,
+                    VERIFIER_RECALL_MIN * 100.0,
+                );
+            }
+        }
+        None => {
+            info!(
+                "Verifier recall: N/A (verifier untrained or no variant reached the \
+                 verifier gate) — no second-stage gate was active for these variants."
+            );
+        }
+    }
     info!(
         "Confusable false accepts: easy={} (limit ≤{}), medium={} (limit ≤{}), hard={} (limit ≤{})",
         conf_fa_counts[0],
@@ -3954,6 +4052,19 @@ pub(crate) fn run_internal() {
          Update MIN_DETECTION_RATE constant if this run is representative.",
         benchmark_detection_rate,
     );
+    // ── Ratchet guard (mahbot-1008) ──
+    // The mahbot-997 auto-suggestion formula floors to 0.0 on failing runs,
+    // which would endorse 0% detection as passing by ratcheting the constant
+    // toward zero.  A failing run must never lower the bar.
+    if benchmark_detection_rate < MIN_DETECTION_RATE {
+        warn!(
+            "Detection rate {:.1}% is BELOW the current MIN_DETECTION_RATE constant \
+             ({:.0}%) — do NOT lower MIN_DETECTION_RATE based on this failing run \
+             (mahbot-1008 ratchet guard).",
+            benchmark_detection_rate * 100.0,
+            MIN_DETECTION_RATE * 100.0,
+        );
+    }
 
     // If training-optimal and benchmark-optimal thresholds diverge by >0.05,
     // suggest λ adjustment in Stage 1 calibration.
@@ -4519,6 +4630,23 @@ pub(crate) fn run_internal() {
         "verifier_diagnostics": {
             "trained": verifier.is_trained(),
             "threshold": verifier_training_threshold,
+            "recall": match verifier_recall_rate {
+                Some((accepted, evaluated)) => serde_json::json!({
+                    "accepted": accepted,
+                    "evaluated": evaluated,
+                    "rate": accepted as f64 / evaluated as f64,
+                    "minimum": VERIFIER_RECALL_MIN,
+                    "passes": (accepted as f64 / evaluated as f64) >= VERIFIER_RECALL_MIN,
+                }),
+                None => serde_json::json!({
+                    "accepted": 0,
+                    "evaluated": 0,
+                    "rate": null,
+                    "minimum": VERIFIER_RECALL_MIN,
+                    "passes": null,
+                    "note": "verifier untrained or no variant reached the verifier gate",
+                }),
+            },
             "score_histograms": verifier_hist,
             "candidate_lifecycle": candidate_lifecycle,
             "rejection_margins": rejection_margins,
@@ -4567,6 +4695,7 @@ pub(crate) fn run_internal() {
         "config": {
             "num_enrollment_variants": NUM_ENROLLMENT_VARIANTS,
             "min_detection_rate": MIN_DETECTION_RATE,
+            "verifier_recall_min": VERIFIER_RECALL_MIN,
         }
     });
 
@@ -5095,6 +5224,41 @@ fn classify_miss_covers_all_verdicts() {
         )),
         V::VerifierRejected,
     );
+}
+
+/// `verifier_recall` must count only variants the verifier actually evaluated
+/// (trained + warm-up complete + effective threshold crossed), and report the
+/// accept rate among them (mahbot-1008 Fix 6).  An untrained verifier yields
+/// `None` — there is no gate to measure.
+#[test]
+fn verifier_recall_counts_evaluated_accepts_only() {
+    // Accepted: trained, warm-up done, crossed effective, peak ≥ threshold.
+    let accepted = verdict_test_pv(true, 10, 5, true, None, 2.5, true, 0.9, true, 0.6);
+    // Rejected: same context but peak below threshold.
+    let rejected = verdict_test_pv(false, 10, 5, true, None, 2.5, true, 0.3, true, 0.6);
+    // Never reached the verifier gate (effective threshold not crossed).
+    let blocked = verdict_test_pv(false, 10, 5, true, None, 2.5, false, 0.0, true, 0.6);
+    // Untrained verifier — not evaluated.
+    let untrained = verdict_test_pv(false, 10, 5, true, None, 2.5, true, 0.9, false, 0.6);
+    // Warm-up incomplete — not evaluated.
+    let warmup = verdict_test_pv(false, 10, 5, false, None, 2.5, true, 0.9, true, 0.6);
+
+    let all = vec![
+        accepted.clone(),
+        rejected.clone(),
+        blocked.clone(),
+        untrained.clone(),
+        warmup.clone(),
+    ];
+    let (acc, ev) = verifier_recall(&all).expect("evaluated variants exist");
+    assert_eq!((acc, ev), (1, 2), "only accepted+rejected are evaluated");
+
+    // Only accepted → 100%.
+    assert_eq!(verifier_recall(&[accepted]), Some((1, 1)));
+    // Only rejected → 0%.
+    assert_eq!(verifier_recall(&[rejected]), Some((0, 1)));
+    // Nothing evaluated → None.
+    assert_eq!(verifier_recall(&[blocked, untrained, warmup]), None);
 }
 
 /// `agc_converged == None` (insufficient AGC-active frames) must NOT be
