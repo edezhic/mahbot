@@ -725,9 +725,15 @@ async fn wait_for_tts_styles() -> Option<Vec<String>> {
 ///
 /// 1. Checks the PCM disk cache — on hit, loads cached audio without
 ///    re-synthesis; on miss, synthesises via TTS and writes to cache.
-/// 2. Applies AGC preprocessing via [`AudioPreprocessor`] in FRAME_LENGTH
-///    chunks to match the production inference distribution
-/// 3. Extracts dense stride-8 embeddings via the ONNX pipeline
+/// 2. Applies AGC preprocessing via a **fresh** [`AudioPreprocessor`] per
+///    phrase × seed in FRAME_LENGTH chunks (no zero-padding) to match the
+///    production inference distribution (mahbot-1009).
+/// 3. VAD-gates the AGC'd audio through a dedicated earshot detector,
+///    producing the exact streaming mel layout (silence discarded, windows
+///    anchored at speech onset — mahbot-1009).
+/// 4. Derives the 4 PCM augmentation variants from the VAD-gated speech-only
+///    audio (AGC → VAD → augment ordering, matching enrollment).
+/// 5. Extracts dense stride-8 embeddings via the ONNX pipeline.
 ///
 /// The PCM disk cache is keyed by (text + style + seed + sample rate + TTS
 /// model hash), so TTS model updates automatically invalidate stale cached
@@ -776,10 +782,32 @@ pub(crate) async fn prewarm_confusable_embeddings() {
 
 /// Shared pre-warm logic for phrase-based negative embeddings (mahbot-872, mahbot-923).
 ///
-/// Runs TTS synthesis (with PCM caching), AGC preprocessing, and ONNX dense
-/// embedding extraction for each phrase × seed combination.  Used by both
-/// [`prewarm_confusable_embeddings`] and [`prewarm_unrelated_embeddings`] to
-/// avoid code duplication.
+/// Runs TTS synthesis (with PCM caching), AGC preprocessing, VAD gating, PCM
+/// augmentation, and ONNX dense embedding extraction for each phrase × seed
+/// combination.  Used by both [`prewarm_confusable_embeddings`] and
+/// [`prewarm_unrelated_embeddings`] to avoid code duplication.
+///
+/// ## Streaming-pipeline alignment (mahbot-1009)
+///
+/// The negative training cache must be representative of what the classifier
+/// sees during streaming inference, so each phrase × seed is processed with
+/// the same representation choices as the live detection path:
+///
+/// 1. **Fresh [`AudioPreprocessor`]** per phrase × seed — matching the
+///    per-segment AGC reset (`PipelineCtx::reset_detection_segment`).  A
+///    shared preprocessor would adapt AGC across N phrases, an artifact
+///    streaming never produces.
+/// 2. **VAD-gated mel frames** via [`vad_gate_streaming_mel`] (a dedicated
+///    earshot detector per phrase × seed, never the global [`VAD_DETECTOR`])
+///    — only VAD-positive hops produce mel frames; leading/trailing silence
+///    and intra-phrase pauses are discarded, exactly like
+///    [`process_streaming_frames_inner`].
+/// 3. **Speech-onset anchoring** — the original variant's embedding windows
+///    start at the first speech frame (mel frame 0), not at TTS sample 0 with
+///    its ~100 ms silence preamble.
+/// 4. **Augment after VAD gating** — the 4 PCM variants (speed-down,
+///    speed-up, volume-down, noise) are derived from the speech-only audio,
+///    matching enrollment's `AGC → VAD → augment` ordering.
 ///
 /// After the dense-stride-8 alignment (mahbot-923), only dense embeddings are
 /// produced — streaming extraction was removed.
@@ -839,16 +867,29 @@ async fn prewarm_phrase_embeddings(
 
     let num_styles = available_styles.len();
 
-    // Runs TTS synthesis (with PCM caching), AGC, and ONNX embedding
-    // extraction in a blocking thread to avoid starving the async runtime.
+    // Runs TTS synthesis (with PCM caching), AGC, VAD gating, augmentation,
+    // and ONNX embedding extraction in a blocking thread to avoid starving the
+    // async runtime.
+    //
+    // Pipeline (mahbot-1009): raw TTS PCM → fresh AGC per phrase × seed →
+    // VAD-gate (streaming mel layout) → augment speech-only audio → embeddings.
+    // This matches the streaming detection path (fresh per-segment AGC, VAD-
+    // gated mel frames, windows anchored at speech onset) so the negative
+    // training distribution is representative of what the classifier sees
+    // during live inference.
     tokio::task::spawn_blocking(move || {
-        use crate::audio::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
+        use crate::audio::audio_preprocessor::AudioPreprocessor;
 
         let Some(models) = ONNX_MODELS.get() else {
             return Vec::new();
         };
 
-        let mut pre = AudioPreprocessor::new(PreprocessorConfig::default());
+        // Preprocessor config from the same CONFIG flags the live-mic
+        // streaming pipeline uses (`preprocessor_config_from_config`, the
+        // config `PipelineCtx::new()` builds — mahbot-1006 L).  The negative
+        // embeddings must match the streaming inference distribution, which is
+        // governed by the deployment's NS/AGC toggles.
+        let pre_config = preprocessor_config_from_config();
         let mut dense_sequences: Vec<EmbeddingSequence> = Vec::new();
 
         for (i, &phrase) in phrases.iter().enumerate() {
@@ -888,34 +929,50 @@ async fn prewarm_phrase_embeddings(
                     continue;
                 };
 
-                // Apply AGC in FRAME_LENGTH chunks to match production inference
-                // distribution (mahbot-859 Fix 2).
+                // ── 1. Fresh AGC per phrase × seed (mahbot-1009) ──
+                // The streaming pipeline starts each detection segment with a
+                // fresh AudioPreprocessor (`reset_detection_segment`,
+                // mahbot-1001 Fix 5).  A shared preprocessor would process the
+                // Nth phrase with AGC adapted to N−1 prior phrases — an
+                // artifact streaming never produces.  Chunks are fed as-is (no
+                // zero-padding), matching the mic stream (mahbot-1006 G): the
+                // NS stage buffers incomplete frames internally and the next
+                // chunk completes them.
+                let mut pre = AudioPreprocessor::new(pre_config);
                 let mut agc_audio: Vec<f32> = Vec::with_capacity(pcm.len());
                 for chunk in pcm.chunks(FRAME_LENGTH) {
-                    let mut padded = chunk.to_vec();
-                    padded.resize(FRAME_LENGTH, 0.0);
-                    agc_audio.extend(pre.process(padded));
+                    agc_audio.extend(pre.process(chunk.to_vec()));
                 }
 
-                // ── Symmetric PCM augmentation (mahbot-878) ──
-                // Each PCM variant becomes its own EmbeddingSequence.
-                // This prevents cross-variant windows (original→speed-down
-                // boundary) that would re-introduce the same cross-sequence
-                // contamination this fix is designed to eliminate.
-                let pre_pad_samples = agc_audio.len().saturating_sub(2 * CONTEXT_PADDING_SAMPLES);
-                let pre_pad_ms = (pre_pad_samples as u64 * 1000) / u64::from(SAMPLE_RATE);
-                let speed_up_opt = if pre_pad_ms >= 500 {
-                    Some(speed_perturbation(&agc_audio, SAMPLE_RATE, 1.05))
-                } else {
-                    None
-                };
-                let noise_pcm = crate::util::add_noise(&agc_audio, 25.0, seed);
+                // ── 2. VAD-gate (mahbot-1009) ──
+                // Fresh earshot detector per phrase × seed: the prewarm must
+                // not reuse the global VAD_DETECTOR (would contaminate the
+                // live pipeline's noise-floor state) and must not carry VAD
+                // state across phrases (the same shared-state artifact as the
+                // shared AGC).  Produces the exact streaming mel layout
+                // (VAD-gated, speech-onset-anchored) plus the speech-only
+                // audio used for augmentation below.
+                let mut detector = earshot::Detector::default();
+                let (mel_frames, speech_audio) = vad_gate_streaming_mel(&agc_audio, |hop| {
+                    is_speech_with_detector(hop, &mut detector, VAD_THRESHOLD)
+                });
 
-                // Helper: construct dense sequence from a PCM variant.
-                let mut make_variant_seq = |variant_pcm: &[f32], vi: usize| {
-                    let dense_embs =
-                        extract_embeddings_from_audio(models, variant_pcm).unwrap_or_default();
-                    if !dense_embs.is_empty() {
+                if mel_frames.is_empty() {
+                    // Matches streaming: no VAD-positive speech ⇒ no mel frames
+                    // ⇒ no embeddings.  A phrase with zero VAD-positive audio is
+                    // dropped from the negative set rather than trained on
+                    // silence-laden audio the streaming path never produces.
+                    warn!(
+                        "{phrase_type} phrase '{phrase}' (seed {seed}) produced no \
+                         VAD-positive speech — skipping (matches streaming: no \
+                         speech ⇒ no embeddings)"
+                    );
+                    continue;
+                }
+
+                // Helper: push one dense embedding sequence.
+                let mut push_seq = |embs: Vec<Vec<f32>>, vi: usize| {
+                    if !embs.is_empty() {
                         dense_sequences.push(EmbeddingSequence::negative(
                             UtteranceId {
                                 sequence_index: phrase_index_for_id,
@@ -923,29 +980,74 @@ async fn prewarm_phrase_embeddings(
                             },
                             source,
                             None,
-                            dense_embs,
+                            embs,
                         ));
                     }
                 };
 
-                // 1. Original (AGC'd, unmodified) — variant_index 0
-                make_variant_seq(&agc_audio, 0);
+                // ── 3. Original — embeddings from the streaming mel frames ──
+                // (mahbot-1009) Windows are anchored at the first speech frame
+                // (mel frame 0 = first VAD-positive hop), not at TTS sample 0
+                // with its silence preamble.
+                let dense_embs =
+                    embeddings_from_mel_frames(models, &mel_frames).unwrap_or_default();
+                push_seq(dense_embs, 0);
+
+                // ── 4. Augment AFTER VAD gating (mahbot-1009) ──
+                // Variants are derived from the speech-only audio (no silence
+                // preamble), matching enrollment's AGC → VAD → augment ordering.
+                // No variant is re-gated by VAD (only the original was).  The
+                // only conditional variant is speed-up, dropped when the
+                // speech-only duration is too short (< 500 ms pre-pad) to stay
+                // intelligible — the same gate enrollment applies to its
+                // VAD-segmented utterance.  Note that this gate now evaluates
+                // the VAD-gated speech duration (not the full TTS audio), so
+                // short phrases drop the speed-up variant more often than the
+                // pre-fix pipeline did — a direct consequence of the alignment.
+                //
+                // Layout note: variants 1–4 are embedded via
+                // `extract_embeddings_from_audio` (whole-audio mel over the raw
+                // hop-concatenated speech_audio), so their mel layout lacks the
+                // batch-flush boundary handling (`trim_voice_batch` overlap at
+                // VOICE_BATCH_SIZE boundaries) that variant 0's streaming mel
+                // matches exactly.  This is acceptable for perturbations and
+                // matches how enrollment derives its own augmented variants
+                // (`process_enrollment_sample` → whole-audio mel): the speech
+                // content is identical VAD-gated audio; only the batch-boundary
+                // framing differs slightly.
+                let pre_pad_samples = speech_audio
+                    .len()
+                    .saturating_sub(2 * CONTEXT_PADDING_SAMPLES);
+                let pre_pad_ms = (pre_pad_samples as u64 * 1000) / u64::from(SAMPLE_RATE);
+                let speed_up_opt = if pre_pad_ms >= 500 {
+                    Some(speed_perturbation(&speech_audio, SAMPLE_RATE, 1.05))
+                } else {
+                    None
+                };
+                let noise_pcm = crate::util::add_noise(&speech_audio, 25.0, seed);
 
                 // 2. Speed-down (0.95×) — variant_index 1
-                let speed_down_pcm = speed_perturbation(&agc_audio, SAMPLE_RATE, 0.95);
-                make_variant_seq(&speed_down_pcm, 1);
+                let speed_down_pcm = speed_perturbation(&speech_audio, SAMPLE_RATE, 0.95);
+                let dense_embs =
+                    extract_embeddings_from_audio(models, &speed_down_pcm).unwrap_or_default();
+                push_seq(dense_embs, 1);
 
                 // 3. Speed-up (1.05×, conditional) — variant_index 2
                 if let Some(ref sp) = speed_up_opt {
-                    make_variant_seq(sp, 2);
+                    let dense_embs = extract_embeddings_from_audio(models, sp).unwrap_or_default();
+                    push_seq(dense_embs, 2);
                 }
 
                 // 4. Volume-down (-3dB) — variant_index 3
-                let volume_down_pcm = crate::util::apply_gain(&agc_audio, -3.0);
-                make_variant_seq(&volume_down_pcm, 3);
+                let volume_down_pcm = crate::util::apply_gain(&speech_audio, -3.0);
+                let dense_embs =
+                    extract_embeddings_from_audio(models, &volume_down_pcm).unwrap_or_default();
+                push_seq(dense_embs, 3);
 
                 // 5. Pink noise (SNR 25dB) — variant_index 4
-                make_variant_seq(&noise_pcm, 4);
+                let dense_embs =
+                    extract_embeddings_from_audio(models, &noise_pcm).unwrap_or_default();
+                push_seq(dense_embs, 4);
             }
         }
 
@@ -2565,13 +2667,26 @@ fn pad_mel_frames_to_window(frames: &[Vec<f32>]) -> Vec<Vec<f32>> {
 /// Extract a sequence of embeddings from raw audio by processing sliding windows.
 fn extract_embeddings_from_audio(models: &OnnxModels, samples: &[f32]) -> Result<Vec<Vec<f32>>> {
     let mel_frames = compute_mel_spectrogram(models, samples)?;
+    embeddings_from_mel_frames(models, &mel_frames)
+}
 
+/// Extract stride-8 dense embeddings from a pre-computed mel frame buffer.
+///
+/// Shared by [`extract_embeddings_from_audio`] (whole-audio mel) and the
+/// prewarm negative path ([`vad_gate_streaming_mel`] + this function,
+/// mahbot-1009) so both produce the identical stride-8 windowing over mel
+/// frames.
+///
+/// If the buffer has fewer than [`EMBEDDING_WINDOW_FRAMES`] frames, pads with
+/// tapered fade-out frames so at least one embedding can be computed.  Without
+/// this, short wake words (e.g. 0.5s) would be silently discarded during
+/// enrollment, making enrollment impossible for brief utterances.
+fn embeddings_from_mel_frames(
+    models: &OnnxModels,
+    mel_frames: &[Vec<f32>],
+) -> Result<Vec<Vec<f32>>> {
     if mel_frames.len() < EMBEDDING_WINDOW_FRAMES {
-        // Audio too short for a full 76-frame window — pad with tapered
-        // fade-out frames so at least one embedding can be computed.  Without
-        // this, short wake words (e.g. 0.5s) would be silently discarded during
-        // enrollment, making enrollment impossible for brief utterances.
-        let padded = pad_mel_frames_to_window(&mel_frames);
+        let padded = pad_mel_frames_to_window(mel_frames);
         let embedding = compute_embedding(models, &padded)?;
         return Ok(vec![embedding]);
     }
@@ -2590,7 +2705,7 @@ fn extract_embeddings_from_audio(models: &OnnxModels, samples: &[f32]) -> Result
     }
 
     if embeddings.is_empty() {
-        anyhow::bail!("No embeddings could be extracted from audio");
+        anyhow::bail!("No embeddings could be extracted from mel frames");
     }
 
     Ok(embeddings)
@@ -2611,11 +2726,14 @@ fn extract_embeddings_from_audio(models: &OnnxModels, samples: &[f32]) -> Result
 /// the current frame's [`HOP_LENGTH`], matching the original early-return
 /// behaviour in [`handle_wake_word_detection`].
 ///
-/// After mahbot-923, this function is used ONLY for VAD-gated mel frame
-/// accumulation in the live detection pipeline — streaming embedding extraction
-/// (which previously used this via `on_flush`) was removed.  The `on_flush`
-/// callback still exists but is used only to detect early exit (wake word
-/// detection during stride-8 scoring, which now happens after this loop).
+/// After mahbot-923, the live detection pipeline uses this function only for
+/// VAD-gated mel frame accumulation — streaming embedding extraction (which
+/// previously used this via `on_flush`) was removed.  The `on_flush` callback
+/// still exists but is used only to detect early exit (wake word detection
+/// during stride-8 scoring, which now happens after this loop).
+/// [`vad_gate_streaming_mel`] (mahbot-1009) additionally wraps this function
+/// for the offline negative-prewarm path, so the training mel layout is
+/// produced by the same loop as live inference.
 ///
 /// # Parameters
 ///
@@ -2697,6 +2815,65 @@ fn process_streaming_frames_inner(
         on_flush(mel_frame_buffer);
     }
     consumed
+}
+
+/// VAD-gate audio into streaming-layout mel frames + speech-only audio (mahbot-1009).
+///
+/// Thin wrapper over the canonical streaming loop
+/// [`process_streaming_frames_inner`]: it delegates the entire VAD-gating /
+/// batch-accumulation loop — feeding only each frame's NEW [`HOP_LENGTH`]
+/// samples to the VAD decision function (mahbot-900), flushing the voice batch
+/// to mel frames at [`VOICE_BATCH_SIZE`] / silence transitions via
+/// [`flush_voice_batch`], and flushing any trailing batch (`trailing_flush =
+/// true`, since offline extraction always receives the full phrase) — so the
+/// produced mel frame buffer has exactly the layout the streaming detection
+/// pipeline produces: silence discarded, windows anchored at speech onset.
+///
+/// The only additional behaviour lives in the `is_speech_fn` wrapper closure:
+/// every VAD-positive hop is also accumulated into the returned `speech_audio`
+/// so callers can derive augmentation variants from speech-only audio,
+/// matching enrollment's `AGC → VAD → augment` ordering.  Because the loop
+/// itself is the canonical one, the prewarm path cannot drift from streaming
+/// inference — the train/inference divergence class this ticket exists to fix.
+///
+/// # VAD decision ownership
+///
+/// The `is_speech_fn` closure owns the VAD decision state.  Prewarm callers
+/// MUST pass a closure over a fresh `earshot::Detector` per phrase (never the
+/// global [`VAD_DETECTOR`]) so prewarm VAD decisions cannot contaminate the
+/// live pipeline's noise-floor state, and so no VAD state carries across
+/// phrases (the same shared-state artifact as a shared AGC).
+fn vad_gate_streaming_mel(
+    audio: &[f32],
+    mut is_speech_fn: impl FnMut(&[f32]) -> bool,
+) -> (Vec<Vec<f32>>, Vec<f32>) {
+    let mut voice_batch: Vec<f32> = Vec::new();
+    let mut mel_frame_buffer: Vec<Vec<f32>> = Vec::new();
+    let mut speech_audio: Vec<f32> = Vec::with_capacity(audio.len());
+
+    // Accumulate VAD-positive hops into speech_audio inside the decision
+    // closure: the loop logic (hop feeding, batching, flushing) then exists in
+    // exactly one place — process_streaming_frames_inner — so the prewarm mel
+    // layout cannot drift from the streaming path (mahbot-900 hop-feeding
+    // included).
+    let mut gated = |hop: &[f32]| {
+        let is_speech = is_speech_fn(hop);
+        if is_speech {
+            speech_audio.extend_from_slice(hop);
+        }
+        is_speech
+    };
+
+    process_streaming_frames_inner(
+        audio,
+        &mut voice_batch,
+        &mut mel_frame_buffer,
+        &mut gated,
+        true,      // trailing_flush — offline extraction receives the full phrase
+        |_| false, // no early exit — collect the entire phrase
+    );
+
+    (mel_frame_buffer, speech_audio)
 }
 
 fn is_speech(samples: &[f32]) -> bool {
@@ -5103,14 +5280,14 @@ impl PipelineCtx {
         // starts from the first mel frame (mahbot-923).
         self.next_window_start = 0;
 
-        // ── Reset AGC state (mahbot-1001 Fix 5) ──
+        // ── Reset AGC state (mahbot-1001 Fix 5, mahbot-1009) ──
         // Reset the AudioPreprocessor so that each detection segment starts with
         // a fresh AGC state, matching the training distribution (confusable/
-        // unrelated embeddings are also processed through fresh AudioPreprocessor
-        // instances in prewarm_phrase_embeddings).  Without this reset, the
-        // Conv1D classifier could exploit AGC adaptation state as a spurious
-        // feature: enrollment positives use the room-adapted persistent AGC
-        // while confusable negatives use a fresh TTS-adapted AGC, creating a
+        // unrelated embeddings are processed through a fresh AudioPreprocessor
+        // per phrase × seed in prewarm_phrase_embeddings — mahbot-1009).  Without
+        // this reset, the Conv1D classifier could exploit AGC adaptation state as
+        // a spurious feature: enrollment positives use the room-adapted persistent
+        // AGC while confusable negatives use a fresh TTS-adapted AGC, creating a
         // distribution shift that produces near-zero sigmoid scores during
         // streaming inference.
         self.audio_preprocessor.reset();
@@ -7998,6 +8175,99 @@ mod tests {
             utterances.is_empty(),
             "speech at end without trailing silence → no utterance",
         );
+    }
+
+    // ── VAD-gated streaming mel extraction tests (mahbot-1009) ───────────
+    // These test [`vad_gate_streaming_mel`] with deterministic VAD decisions.
+    // The mel-frame half requires ONNX models (unavailable in unit tests —
+    // `flush_voice_batch` returns early when `ONNX_MODELS` is unset), so these
+    // tests focus on the `speech_audio` accumulation — the part that decides
+    // which audio reaches augmentation and that must match the streaming
+    // path's VAD gating exactly.
+
+    /// Build an audio buffer sized for `speech_mask.len()` hops at
+    /// [`HOP_LENGTH`] stride with a [`FRAME_LENGTH`] window, where hop `h`
+    /// (256 samples) carries a 220 Hz tone when `speech_mask[h]` is true and
+    /// digital silence otherwise.
+    fn audio_with_hop_mask(speech_mask: &[bool]) -> Vec<f32> {
+        let n_hops = speech_mask.len();
+        let len = (n_hops - 1) * HOP_LENGTH + FRAME_LENGTH;
+        let mut audio = vec![0.0f32; len];
+        for (h, &speech) in speech_mask.iter().enumerate() {
+            if speech {
+                let start = h * HOP_LENGTH;
+                for (k, s) in audio[start..start + HOP_LENGTH].iter_mut().enumerate() {
+                    *s = 0.3
+                        * (2.0 * std::f32::consts::PI * 220.0 * (start + k) as f32
+                            / SAMPLE_RATE as f32)
+                            .sin();
+                }
+            }
+        }
+        audio
+    }
+
+    #[test]
+    fn vad_gate_streaming_mel_keeps_only_speech_hops() {
+        // 3 silence hops, 3 speech, 1 silence (intra-phrase pause), 2 speech,
+        // 4 trailing silence.  The 220 Hz tone is present only in the speech
+        // hops; everything else is digital silence.
+        let mask = [
+            false, false, false, true, true, true, false, true, true, false, false, false, false,
+        ];
+        let audio = audio_with_hop_mask(&mask);
+        let n_frames = (audio.len() - FRAME_LENGTH) / HOP_LENGTH + 1;
+        assert_eq!(n_frames, mask.len(), "one VAD call per hop");
+
+        let mut hop_idx = 0usize;
+        let (mel_frames, speech_audio) = vad_gate_streaming_mel(&audio, |hop| {
+            assert_eq!(
+                hop.len(),
+                HOP_LENGTH,
+                "each VAD call receives exactly one new hop"
+            );
+            let is_speech = mask[hop_idx];
+            hop_idx += 1;
+            is_speech
+        });
+
+        assert_eq!(
+            hop_idx, n_frames,
+            "the VAD loop must feed one hop per frame at HOP_LENGTH stride, \
+             exactly like process_streaming_frames_inner"
+        );
+
+        // speech_audio must be exactly the concatenation of the VAD-positive
+        // hops (3,4,5,7,8): no leading/trailing silence, and the intra-phrase
+        // pause (hop 6) discarded — matching how the streaming path feeds only
+        // VAD-positive hops into the voice batch.
+        let mut expected: Vec<f32> = Vec::new();
+        for h in [3usize, 4, 5, 7, 8] {
+            let start = h * HOP_LENGTH;
+            expected.extend_from_slice(&audio[start..start + HOP_LENGTH]);
+        }
+        assert_eq!(
+            speech_audio, expected,
+            "speech_audio must be the concatenation of VAD-positive hops only"
+        );
+        assert_eq!(speech_audio.len(), 5 * HOP_LENGTH);
+
+        // Without ONNX models (unit tests) flush_voice_batch is a no-op, so
+        // mel frames stay empty — documented here so a future test that does
+        // have models available can assert on the mel half instead.
+        assert!(
+            mel_frames.is_empty(),
+            "mel frames require ONNX models (available in E2E only)"
+        );
+    }
+
+    #[test]
+    fn vad_gate_streaming_mel_no_speech_returns_empty() {
+        let mask = [false; 8];
+        let audio = audio_with_hop_mask(&mask);
+        let (mel_frames, speech_audio) = vad_gate_streaming_mel(&audio, |_| false);
+        assert!(speech_audio.is_empty(), "no speech → no speech audio");
+        assert!(mel_frames.is_empty(), "no speech → no mel frames");
     }
 
     // ── Refractory period state-machine tests ────────────────────────────

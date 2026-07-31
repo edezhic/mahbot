@@ -1054,19 +1054,35 @@ fn pcm_augment_enrollment_variants(variants: &[(Vec<f32>, String)]) -> Vec<(Vec<
 /// classifier and verifier training.  Documented limitation: TTS speech
 /// cannot match the distribution of real human Phase 3 speech.
 ///
-/// ## Preprocessing alignment (mahbot-1006 C/L)
+/// ## Preprocessing alignment (mahbot-1006 C/L, mahbot-1009)
 ///
 /// Production captures owner negatives as real post-AGC/post-NS mic audio
 /// (Phase 3 collection).  The benchmark's TTS surrogates are therefore routed
-/// through an [`AudioPreprocessor`] before embedding extraction, so the
-/// classifier/verifier do not train on a raw-TTS distribution that production
-/// never produces.  The preprocessor is **shared** across all phrases and fed
-/// in [`FRAME_LENGTH`](super::FRAME_LENGTH) chunks, structurally identical to
-/// production's `prewarm_phrase_embeddings` TTS-negative path (one persistent
-/// preprocessor, zero-padded final chunks).  One deliberate divergence: the
-/// config comes from CONFIG (mahbot-1006 L) rather than
-/// `PreprocessorConfig::default()` — identical under default settings, differs
-/// only when a deployment disables NS/AGC.
+/// through the same pipeline as production's `prewarm_phrase_embeddings`
+/// TTS-negative path so the classifier/verifier do not train on a raw-TTS
+/// distribution that production never produces:
+///
+/// 1. **Fresh [`AudioPreprocessor`] per phrase × seed** (mahbot-1009) — fed in
+///    [`FRAME_LENGTH`](super::FRAME_LENGTH) chunks as-is (no zero-padding),
+///    matching the per-segment fresh-AGC distribution of the streaming path.
+/// 2. **VAD gating** through a dedicated earshot detector per clip (never the
+///    global `VAD_DETECTOR`) via [`super::vad_gate_streaming_mel`], so only
+///    VAD-positive hops produce mel frames and windows anchor at speech onset.
+/// 3. Dense stride-8 embeddings from the streaming-layout mel frames.
+///
+/// Divergence from production's `prewarm_phrase_embeddings`: this emits only
+/// **variant 0** — production additionally derives 4 augmented PCM variants
+/// (speed-down, speed-up, volume-down, noise) from the speech-only audio and
+/// embeds each.  The benchmark deliberately omits them: owner negatives stand
+/// in for real Phase 3 mic captures (raw, not TTS-augmented), so the single
+/// VAD-gated original keeps the surrogate representative without inventing
+/// augmented data production never collects.  The shared variant-0 path is
+/// structurally identical (same preprocessor, same `vad_gate_streaming_mel`
+/// wrapper over `process_streaming_frames_inner`, same embeddings helper).
+///
+/// The config comes from CONFIG (mahbot-1006 L) — identical to
+/// `PreprocessorConfig::default()` under default settings, differs only when
+/// a deployment disables NS/AGC.
 fn generate_owner_negative_sequences(
     available_styles: &[String],
     model_hash: &str,
@@ -1075,7 +1091,7 @@ fn generate_owner_negative_sequences(
     use crate::audio::audio_preprocessor::AudioPreprocessor;
     let num_styles = available_styles.len().max(1);
     let mut sequences = Vec::new();
-    let mut pre = AudioPreprocessor::new(enrollment_preprocessor_config());
+    let config = enrollment_preprocessor_config();
     let chunk_size = super::FRAME_LENGTH;
 
     for (i, &phrase) in OWNER_NEGATIVE_PHRASES.iter().enumerate() {
@@ -1090,15 +1106,41 @@ fn generate_owner_negative_sequences(
                 model_hash,
                 cache_dir,
             ) {
-                // AGC/NS the TTS PCM (shared preprocessor, zero-padded chunks —
-                // matches prewarm_phrase_embeddings) before embedding.
+                // AGC/NS the TTS PCM through a fresh per-clip preprocessor,
+                // fed in FRAME_LENGTH chunks as-is (matches
+                // prewarm_phrase_embeddings, mahbot-1009).
+                let mut pre = AudioPreprocessor::new(config);
                 let mut agc_audio: Vec<f32> = Vec::with_capacity(pcm.len());
                 for chunk in pcm.chunks(chunk_size) {
-                    let mut padded = chunk.to_vec();
-                    padded.resize(chunk_size, 0.0);
-                    agc_audio.extend(pre.process(padded));
+                    agc_audio.extend(pre.process(chunk.to_vec()));
                 }
-                match super::process_enrollment_sample(&agc_audio) {
+                // VAD-gate with a dedicated detector (never the global
+                // VAD_DETECTOR) — only VAD-positive hops produce mel frames,
+                // windows anchor at speech onset (matches the streaming path,
+                // mahbot-1009).
+                let mut detector = Detector::default();
+                let (mel_frames, _speech_audio) =
+                    super::vad_gate_streaming_mel(&agc_audio, |hop| {
+                        super::is_speech_with_detector(hop, &mut detector, super::VAD_THRESHOLD)
+                    });
+                if mel_frames.is_empty() {
+                    // Same guard as production prewarm_phrase_embeddings: no
+                    // VAD-positive speech ⇒ no mel frames ⇒ skip the clip
+                    // rather than train on a degenerate constant-silence
+                    // embedding (pad_mel_frames_to_window's empty fallback).
+                    warn!(
+                        "Owner-negative '{phrase}' seed {seed}: no VAD-positive \
+                         speech — skipping (matches production prewarm)"
+                    );
+                    continue;
+                }
+                let embs = super::embeddings_from_mel_frames(
+                    super::ONNX_MODELS
+                        .get()
+                        .expect("ONNX models must be loaded by the benchmark"),
+                    &mel_frames,
+                );
+                match embs {
                     Ok(embs) if !embs.is_empty() => {
                         sequences.push(EmbeddingSequence::negative(
                             UtteranceId {
