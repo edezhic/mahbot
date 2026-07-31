@@ -6057,6 +6057,25 @@ async fn finalize_enrollment_pipeline() -> bool {
     true
 }
 
+/// Apply the mahbot-1008 load-time guard to a persisted verifier.
+///
+/// A collapsed (constant input-independent reject) verifier — e.g. the pre-fix
+/// `sigmoid(fc_bias) = 6.67e-8` brick wall — is replaced with an untrained
+/// no-op so already-enrolled users are not blocked from wake-word detection
+/// until they re-enroll.  Any other verifier passes through unchanged.
+fn resolve_loaded_verifier(v: &VoiceVerifier) -> VoiceVerifier {
+    if v.is_collapsed() {
+        warn!(
+            "Loaded verifier is collapsed (constant input-independent \
+             reject) — treating as untrained no-op (mahbot-1008).  \
+             Re-enrollment will train a fixed verifier."
+        );
+        VoiceVerifier::untrained()
+    } else {
+        v.clone()
+    }
+}
+
 /// Run the voice pipeline background task.
 #[allow(clippy::too_many_lines)]
 pub async fn run_voice_pipeline() {
@@ -6125,16 +6144,7 @@ pub async fn run_voice_pipeline() {
                     // verifier.  Keeping a constant-reject brick would block
                     // every wake word until the user re-enrolls.
                     if let Some(ref v) = model.verifier {
-                        if v.is_collapsed() {
-                            warn!(
-                                "Loaded verifier is collapsed (constant input-independent \
-                                 reject) — treating as untrained no-op (mahbot-1008).  \
-                                 Re-enrollment will train a fixed verifier."
-                            );
-                            set_verifier(crate::audio::voice_verifier::VoiceVerifier::untrained());
-                        } else {
-                            set_verifier(v.clone());
-                        }
+                        set_verifier(resolve_loaded_verifier(v));
                     }
                     let n = model.classifier.as_ref().map_or(0, Vec::len);
                     info!(
@@ -10458,6 +10468,50 @@ mod tests {
             fc_weight: vec![0.0; CONV_VERIFIER_OUT],
             fc_bias: vec![3.0], // sigmoid(3.0) ≈ 0.95
         }
+    }
+
+    #[test]
+    fn loaded_collapsed_verifier_drops_to_untrained_noop() {
+        // mahbot-1008: a persisted collapsed (constant-reject) verifier must be
+        // replaced by an untrained no-op at load time, so already-enrolled
+        // users aren't bricked until re-enrollment.  Exercises the exact
+        // production branch used by run_voice_pipeline's load guard.
+        let collapsed = VoiceVerifier {
+            trained: true,
+            threshold: DEFAULT_VERIFIER_THRESHOLD,
+            activation: VerifierActivation::LeakyReLU,
+            conv_weight: vec![0.0; CONV_VERIFIER_OUT * EMBEDDING_DIM * CONV_VERIFIER_KERNEL_SIZE],
+            conv_bias: vec![0.0; CONV_VERIFIER_OUT],
+            fc_weight: vec![0.0; CONV_VERIFIER_OUT],
+            fc_bias: vec![-16.52], // pre-fix drift → sigmoid ≈ 6.67e-8
+        };
+        assert!(
+            collapsed.is_collapsed(),
+            "precondition: constant reject-all must be flagged collapsed"
+        );
+        let resolved = resolve_loaded_verifier(&collapsed);
+        assert!(
+            !resolved.is_trained(),
+            "collapsed verifier must be dropped to untrained no-op"
+        );
+        // The no-op passes every frame (classifier-only gating).
+        let score = resolved.predict(&[0.5; VERIFIER_INPUT_DIM]);
+        assert!(
+            (score - 1.0).abs() < 1e-6,
+            "untrained no-op must pass every frame (score={score})"
+        );
+
+        // A healthy (non-collapsed) verifier passes through unchanged.
+        let healthy = verifier_always_accept();
+        assert!(
+            !healthy.is_collapsed(),
+            "precondition: constant-accept above threshold is not collapsed"
+        );
+        let resolved = resolve_loaded_verifier(&healthy);
+        assert!(
+            resolved.is_trained(),
+            "healthy verifier must pass through the load guard unchanged"
+        );
     }
 
     #[test]

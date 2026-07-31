@@ -93,8 +93,12 @@ pub(crate) const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.948;
 ///
 /// Split is per-sequence (avoiding data leakage from overlapping windows) with
 /// stratification preserving both pos:neg ratio AND negative tier proportions
-/// (confusable/unrelated/ambient/owner).  Falls back to per-window random split
-/// when per-sequence split produces insufficient validation data.
+/// (confusable/unrelated/ambient/owner).  Positive sequences prefer the
+/// provenance-group holdout (mahbot-1008 Fix 1); when no group can be held
+/// out the per-sequence split applies.  If the split would leave fewer than
+/// [`MIN_POSITIVE_WINDOWS`] positive windows in training — or produce no
+/// validation data at all — training runs on ALL sequences with empty
+/// validation (no leaky per-window fallback, mahbot-1008/mahbot-1011).
 pub(crate) const VALIDATION_SPLIT: f32 = 0.2;
 
 /// Log training and validation loss every N iterations.
@@ -1609,7 +1613,27 @@ fn split_train_val(
     );
 
     // ── 3. No validation data (deliberately no leaky per-window fallback) ──
-    if val.0.is_empty() {
+    // Two triggers: (a) the per-sequence split produced an empty validation
+    // set, or (b) the split would leave fewer than MIN_POSITIVE_WINDOWS
+    // positive windows in training (mahbot-1011) — prepare_training_data's
+    // guard checks the TOTAL before splitting, but the split can carve
+    // training below the minimum, recreating the under-powered
+    // positive-training regime the guard exists to prevent.  In both cases
+    // ALL sequences go to training with empty validation — never a leaky
+    // per-window fallback.
+    let n_tr_pos = tr.1.iter().filter(|&&l| l > 0.5).count();
+    if val.0.is_empty() || n_tr_pos < MIN_POSITIVE_WINDOWS {
+        let reason = if val.0.is_empty() {
+            "the per-sequence split produced an empty validation set"
+        } else {
+            "the per-sequence split would leave fewer than the \
+             MIN_POSITIVE_WINDOWS positive training windows"
+        };
+        warn!(
+            "Verifier split: {reason} — training on all sequences with no \
+             early stopping or threshold calibration.  The leaky per-window \
+             fallback was removed in mahbot-1008.",
+        );
         // All sequences go to training; empty validation.
         let all_idx: Vec<usize> = (0..seq_infos.len()).collect();
         let all = VoiceVerifier::gather_windows(
@@ -1618,11 +1642,6 @@ fn split_train_val(
             window_weights,
             &all_idx,
             seq_infos,
-        );
-        warn!(
-            "Verifier split: no validation data available (per-sequence split produced \
-             an empty validation set) — training without early stopping or threshold \
-             calibration.  The leaky per-window fallback was removed in mahbot-1008.",
         );
         return (
             all.0,
@@ -2506,7 +2525,7 @@ mod tests {
             CONV_VERIFIER_OUT,
             "fc_weight must be {CONV_VERIFIER_OUT}-dim",
         );
-        assert_eq!(verifier.fc_bias.len(), 1, "fc_bias must be 1-dim",);
+        assert_eq!(verifier.fc_bias.len(), 1, "fc_bias must be 1-dim");
         assert!(
             verifier.conv_weight.iter().all(|v| v.is_finite()),
             "all conv_weight entries must be finite",
@@ -2653,8 +2672,8 @@ mod tests {
             score >= 0.4,
             "Verifier should score positive >= 0.4, got {score:.4}",
         );
-        assert!(score.is_finite(), "Positive score must be finite",);
-        assert!(score_non_wake.is_finite(), "Non-wake score must be finite",);
+        assert!(score.is_finite(), "Positive score must be finite");
+        assert!(score_non_wake.is_finite(), "Non-wake score must be finite");
         // The verifier must actually discriminate: held-out positives score
         // above held-out non-wake speech (mahbot-1008 — the old absolute
         // assertions could pass for a constant predictor).
@@ -2753,8 +2772,8 @@ mod tests {
     #[test]
     fn test_sigmoid_symmetry() {
         assert!((sigmoid(0.0) - 0.5).abs() < 1e-6, "sigmoid(0) != 0.5");
-        assert!((sigmoid(10.0) - 1.0).abs() < 1e-4, "sigmoid(10) != ~1.0",);
-        assert!((sigmoid(-10.0) - 0.0).abs() < 1e-4, "sigmoid(-10) != ~0.0",);
+        assert!((sigmoid(10.0) - 1.0).abs() < 1e-4, "sigmoid(10) != ~1.0");
+        assert!((sigmoid(-10.0) - 0.0).abs() < 1e-4, "sigmoid(-10) != ~0.0");
     }
 
     #[test]
@@ -3036,9 +3055,9 @@ mod tests {
         // The pre-fix code trained an all-negative reject-all with
         // trained:true; the guard must return untrained instead (mahbot-1008
         // Fix 2, analyst review).
-        let pos_embs: Vec<Vec<f32>> = (0..2)
-            .map(|i| vec![0.5 + i as f32; EMBEDDING_DIM])
-            .collect();
+        // Two short positive sequences (2 frames each → 0 windows, since
+        // VERIFIER_WINDOW_SIZE = 3) — the zero-positive-windows failure mode.
+        let pos_embs: Vec<Vec<f32>> = vec![vec![0.5; EMBEDDING_DIM], vec![1.5; EMBEDDING_DIM]];
         let neg_embs: Vec<Vec<f32>> = (0..40).map(|_| vec![-0.5; EMBEDDING_DIM]).collect();
         let pos_seq = make_seq(
             pos_embs,
@@ -3287,6 +3306,61 @@ mod tests {
     }
 
     #[test]
+    fn test_verifier_split_per_sequence_below_minimum_uses_all_data() {
+        // When the per-sequence split would leave fewer than
+        // MIN_POSITIVE_WINDOWS positive windows in training, ALL positives
+        // must stay in training with empty validation — the
+        // prepare_training_data guard checks the pre-split TOTAL, but the
+        // split can carve training below the minimum (mahbot-1011).
+        let mut rng = StdRng::seed_from_u64(31);
+        // 5 positive sequences × 6 windows = 30 total positive windows —
+        // passes the pre-split MIN_POSITIVE_WINDOWS guard, but all from one
+        // provenance group (Enrollment, None), so no group holdout is
+        // possible.  A 20% per-sequence split would send 1 sequence (6
+        // windows) to validation, leaving 24 < MIN_POSITIVE_WINDOWS in
+        // training.
+        let pos_seqs: Vec<EmbeddingSequence> = (0..5)
+            .map(|_| {
+                make_seq(
+                    (0..6).map(|_| make_positive_embedding(&mut rng)).collect(),
+                    crate::audio::embedding_sequence::LabelStratum::Positive,
+                )
+            })
+            .collect();
+        // 4 negative sequences × 8 windows = 32 negative windows.
+        let neg_seqs: Vec<EmbeddingSequence> = (0..4)
+            .map(|_| {
+                make_seq(
+                    (0..8).map(|_| make_negative_embedding(&mut rng)).collect(),
+                    crate::audio::embedding_sequence::LabelStratum::Negative,
+                )
+            })
+            .collect();
+
+        let prepared =
+            prepare_training_data(&pos_seqs, &neg_seqs, None, form_conv1d_sequence_windows)
+                .expect("training data must prepare");
+        let (tr_w, tr_l, _tr_wt, val_w, _val_l, _val_wt, kind) = split_train_val(
+            &prepared.3,
+            &prepared.0,
+            &prepared.1,
+            &prepared.2,
+            &mut StdRng::seed_from_u64(31),
+            true,
+        );
+        assert_eq!(
+            kind,
+            SplitKind::None,
+            "split below the positive-window minimum must fall back to all-data \
+             training (no validation, no leaky fallback)"
+        );
+        assert!(val_w.is_empty(), "validation must be empty");
+        let n_tr_pos = tr_l.iter().filter(|&&l| l > 0.5).count();
+        assert_eq!(n_tr_pos, 30, "all 30 positive windows stay in training");
+        assert_eq!(tr_w.len(), 62, "all 30 positive + 32 negative windows kept");
+    }
+
+    #[test]
     fn test_verifier_legacy_json_defaults_to_leaky_relu() {
         // A verifier JSON persisted before mahbot-1008 has no `activation`
         // field; it must deserialize with the LeakyReLU default and remain
@@ -3305,6 +3379,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_verifier_train_sequences() {
         // Eight positive sequences + eight negative sequences each with enough
         // frames to form windows → trained verifier accepts positives and
