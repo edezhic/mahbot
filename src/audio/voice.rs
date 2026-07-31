@@ -4696,6 +4696,219 @@ impl AdaptiveThresholdState {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// mahbot-1012: per-frame scoring geometry / adaptive-mode / candidate-state
+// instrumentation for the training-vs-streaming same-audio comparison
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Geometry class of a single scored embedding window (mahbot-1012 §1).
+///
+/// Every scored window is classified into exactly one of four classes so the
+/// benchmark can attribute score deficits to the known structural divergences
+/// between the training/enrollment path and the streaming detection path:
+///
+/// - [`ColdStartTiled`](WindowGeometry::ColdStartTiled): the Conv1D classifier
+///   window was repeat-last tiled because fewer than `WINDOW_SIZE` embeddings
+///   were in the ring (the first 1-2 windows of every utterance after silence).
+/// - [`WarmMixed`](WindowGeometry::WarmMixed): the Conv1D window spans preserved
+///   warm-up ring entries + test-utterance entries (warm pass only).
+/// - [`PaddedFallback`](WindowGeometry::PaddedFallback): the mel window came
+///   from the short-buffer padded fallback (real frames + a tapered fade-out
+///   tail — a family of inputs largely absent from training).
+/// - [`TrueSliding`](WindowGeometry::TrueSliding): full 76-frame mel window
+///   from the main stride-8 loop with a clean classifier ring.
+///
+/// Precedence when computing (highest first): `ColdStartTiled` > `WarmMixed` >
+/// `PaddedFallback` > `TrueSliding`.  The classes are mutually exclusive in
+/// practice: `ColdStartTiled` needs a ring below `WINDOW_SIZE`, which cannot
+/// co-occur with a preserved warm-up ring (`WarmMixed`); `WarmMixed` needs a
+/// preserved warm-up ring, which the cold pass never has.
+#[cfg(feature = "voice-tests")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowGeometry {
+    ColdStartTiled,
+    WarmMixed,
+    PaddedFallback,
+    TrueSliding,
+}
+
+#[cfg(feature = "voice-tests")]
+impl WindowGeometry {
+    /// Stable snake_case label for JSON output (mahbot-1012).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ColdStartTiled => "cold_start_tiled",
+            Self::WarmMixed => "warm_mixed",
+            Self::PaddedFallback => "padded_fallback",
+            Self::TrueSliding => "true_sliding",
+        }
+    }
+}
+
+/// Classify the geometry of one scored window (mahbot-1012 §1).
+///
+/// Pure function so the classification is unit-testable without pipeline
+/// state.  The four classes are decided in precedence order:
+///
+/// 1. **ColdStartTiled** — the Conv1D window is repeat-last tiled because the
+///    POST-push embedding ring has fewer than [`WINDOW_SIZE`] entries
+///    (mirrors the tiling condition inside [`score_single_embedding`]).
+/// 2. **WarmMixed** — the window spans warm-up embeddings AND test
+///    embeddings.  The Conv1D window covers the last `WINDOW_SIZE` pushed
+///    embeddings; a warm-up embedding occupies push-order index `< tsrl`, so
+///    the window is mixed iff fewer than `WINDOW_SIZE - 1` test-pass frames
+///    were scored before this one.  `frames_scored_before` counts scored
+///    frames since the pass's instrumentation reset (`per_frame_scores.len()`
+///    pre-push), which is NOT reset by mid-pass segment boundaries, so
+///    post-boundary windows (whose ring was cleared) never classify WarmMixed.
+///    `test_start_ring_len == 0` (cold pass) means no warm-up embeddings
+///    exist at all.
+/// 3. **PaddedFallback** — the window came from the short-buffer padded
+///    fallback (real frames + synthetic fade-out tail).
+/// 4. **TrueSliding** — a genuine stride-8 sliding window.
+///
+/// # Ring-capacity correctness (mahbot-1012 reviewer)
+///
+/// The tiled check uses the PRE-push ring length exactly as
+/// [`score_single_embedding`] sees it (post-push `len() >= WINDOW_SIZE`
+/// after the `EMBEDDING_RING_MAX` trim — the trim never drops below
+/// `WINDOW_SIZE`, so `ring_len_before + 1` overstates the post-push length
+/// only when the ring is already at capacity, where the tiled branch is
+/// unreachable anyway).  The WarmMixed check deliberately uses push-order
+/// counting instead of ring coordinates: once the ring wraps past
+/// [`EMBEDDING_RING_MAX`] (front-eviction), the ring-relative window start
+/// `ring_len_before + 1 - WINDOW_SIZE` pins at `EMBEDDING_RING_MAX -
+/// WINDOW_SIZE` and never advances, which would mislabel every later window
+/// as WarmMixed when `test_start_ring_len` is near the cap.
+#[cfg(feature = "voice-tests")]
+pub(crate) fn classify_window_geometry(
+    ring_len_before: usize,
+    frames_scored_before: usize,
+    test_start_ring_len: usize,
+    padded_window: bool,
+) -> WindowGeometry {
+    if ring_len_before + 1 < wake_word_classifier::WINDOW_SIZE {
+        WindowGeometry::ColdStartTiled
+    } else if test_start_ring_len > 0
+        && frames_scored_before + 1 < wake_word_classifier::WINDOW_SIZE
+    {
+        WindowGeometry::WarmMixed
+    } else if padded_window {
+        WindowGeometry::PaddedFallback
+    } else {
+        WindowGeometry::TrueSliding
+    }
+}
+
+/// Per-frame adaptive-threshold mode (mahbot-1012 §1).  Mirrors the
+/// feed/peek/bootstrap decision inside [`score_single_embedding`]: during
+/// bootstrap the state always `feed`s (static threshold in effect); after
+/// bootstrap, scores below `NO_MATCH_RESET_THRESHOLD` `feed` the background
+/// statistics while wake-word-like scores only `peek` (mahbot-852).
+#[cfg(feature = "voice-tests")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdaptiveFrameMode {
+    /// Adaptive state still in its bootstrap window — `feed()` called, static
+    /// threshold in effect (`None` returned).
+    Bootstrap,
+    /// Post-bootstrap `feed()` — the frame updated the background statistics.
+    Feed,
+    /// Post-bootstrap `peek()` — the frame did not update the statistics.
+    Peek,
+}
+
+#[cfg(feature = "voice-tests")]
+impl AdaptiveFrameMode {
+    /// Stable snake_case label for JSON output (mahbot-1012).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Bootstrap => "bootstrap",
+            Self::Feed => "feed",
+            Self::Peek => "peek",
+        }
+    }
+}
+
+/// Per-frame classifier-candidate lifecycle state (mahbot-1012 §1).  Parallel
+/// to the aggregate `candidates_created/confirmed/expired` counters, but
+/// per-frame so the report can trace the exact candidate trajectory.
+#[cfg(feature = "voice-tests")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CandidateFrameState {
+    /// No candidate was active and none was created this frame.
+    None,
+    /// A new candidate was created this frame (first threshold crossing).
+    Created,
+    /// A candidate was already active and remains active.
+    Active,
+    /// Detection fired — the candidate was confirmed (or the no-candidate
+    /// fallback verifier gate passed).
+    Confirmed,
+    /// A previously-active candidate was cleared this frame without
+    /// confirmation (expired via [`CANDIDATE_MAX_EMBEDDINGS`] or reset by a
+    /// below-`NO_MATCH_RESET_THRESHOLD` score).
+    Expired,
+}
+
+#[cfg(feature = "voice-tests")]
+impl CandidateFrameState {
+    /// Stable snake_case label for JSON output (mahbot-1012).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Created => "created",
+            Self::Active => "active",
+            Self::Confirmed => "confirmed",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+/// Deterministic 64-bit hash of an embedding for cross-path comparison
+/// (mahbot-1012 §1).
+///
+/// FNV-1a over the f32 bit patterns with `-0.0` canonicalised to `+0.0` and
+/// NaN payloads canonicalised to a single quiet NaN, so the hash is stable
+/// across runs and platforms for the same embedding values.  The embedding
+/// model is stateless and deterministic, so two paths that feed bit-identical
+/// mel windows produce bit-identical embeddings and therefore identical
+/// hashes — a hash mismatch at a matched window position is direct evidence
+/// that the mel values (or window content) differed between the paths.
+#[cfg(feature = "voice-tests")]
+fn embedding_hash(embedding: &[f32]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for &v in embedding {
+        let bits = if v == 0.0 {
+            // Canonicalise -0.0 == +0.0 (equal values must hash equal).
+            0.0f32.to_bits()
+        } else {
+            let b = v.to_bits();
+            // Canonicalise NaN payloads (they compare unequal but are not
+            // distinguishable acoustic values).
+            if b & 0x7fff_ffff > 0x7f80_0000 {
+                0x7fc0_0000
+            } else {
+                b
+            }
+        };
+        for byte in bits.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    hash
+}
+
+/// L2 norm of an embedding (mahbot-1012 §1).  Reported alongside the hash so
+/// the dual-path comparison can quantify embedding drift (the manager's lead
+/// measured L2 deltas of 15-30% of the vector norm between paths).
+#[cfg(feature = "voice-tests")]
+fn embedding_l2_norm(embedding: &[f32]) -> f32 {
+    embedding.iter().map(|v| v * v).sum::<f32>().sqrt()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Pipeline context
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -4784,6 +4997,49 @@ pub(crate) struct DetectionInstrumentation {
     pub warmup_max_rolling_sum: f32,
     /// Peak verifier score achieved by warm-up audio only (mahbot-1005 §1).
     pub warmup_peak_verifier_score: f32,
+
+    // ── mahbot-1012 per-frame scoring geometry ────────────────────────────
+    // All `per_frame_*` arrays below are parallel to
+    // [`per_frame_scores`](Self::per_frame_scores): entry `i` describes the
+    // embedding scored at frame `i`.
+    /// Per-frame stable hash of each scored embedding (FNV-1a, see
+    /// [`embedding_hash`]).  Used by the dual-path same-audio comparison to
+    /// detect mel-value divergence between the training/enrollment path and
+    /// the streaming path.
+    pub per_frame_embedding_hashes: Vec<u64>,
+    /// Per-frame L2 norm of each scored embedding.  Enables L2-delta analysis
+    /// between the two paths without storing full embeddings.
+    pub per_frame_embedding_l2_norms: Vec<f32>,
+    /// Per-frame raw embedding vectors.  Retained only under `voice-tests` so
+    /// the dual-path harness can compute cosine / L2 deltas between the
+    /// training and streaming embeddings at matched positions.
+    pub per_frame_embeddings: Vec<Vec<f32>>,
+    /// Mel-frame position (index into the mel frame buffer) where each scored
+    /// window started.  The training path anchors windows at multiples of 8
+    /// from mel frame 0 (speech onset); the streaming path's
+    /// `next_window_start` drifts via buffer trims and blinded-gap
+    /// re-anchoring — this field exposes that drift directly.
+    pub per_frame_window_start: Vec<usize>,
+    /// Mel frame buffer length at each scoring step.
+    pub per_frame_mel_buffer_len: Vec<usize>,
+    /// Geometry class of each scored window.  See [`WindowGeometry`].
+    pub per_frame_geometry: Vec<WindowGeometry>,
+    /// Adaptive-threshold mode (bootstrap / feed / peek) of each scored frame.
+    /// See [`AdaptiveFrameMode`].
+    pub per_frame_adaptive_mode: Vec<AdaptiveFrameMode>,
+    /// Candidate lifecycle state after each scored frame.  See
+    /// [`CandidateFrameState`].
+    pub per_frame_candidate_state: Vec<CandidateFrameState>,
+    /// Number of preserved warm-up embeddings at the start of the test
+    /// utterance (set by the benchmark's `consume_warmup` after the
+    /// instrumentation reset).  Used to classify the first test windows as
+    /// [`WindowGeometry::WarmMixed`].  Zero for the cold pass.
+    pub test_start_ring_len: usize,
+    /// Per-hop VAD decisions during streaming detection, in order — one entry
+    /// per VAD decision (each 512-sample frame processed, feeding its new
+    /// 256-sample half to the VAD).  Correlates with mel-frame positions via
+    /// the ~1.6-hop-per-mel-frame ratio (mel stride 160 samples at 16 kHz).
+    pub per_hop_vad: Vec<bool>,
 }
 
 #[cfg(feature = "voice-tests")]
@@ -4805,6 +5061,16 @@ impl DetectionInstrumentation {
             first_trigger_frame_idx: None,
             warmup_max_rolling_sum: 0.0,
             warmup_peak_verifier_score: 0.0,
+            per_frame_embedding_hashes: Vec::new(),
+            per_frame_embedding_l2_norms: Vec::new(),
+            per_frame_embeddings: Vec::new(),
+            per_frame_window_start: Vec::new(),
+            per_frame_mel_buffer_len: Vec::new(),
+            per_frame_geometry: Vec::new(),
+            per_frame_adaptive_mode: Vec::new(),
+            per_frame_candidate_state: Vec::new(),
+            test_start_ring_len: 0,
+            per_hop_vad: Vec::new(),
         }
     }
 }
@@ -7306,10 +7572,20 @@ fn flush_voice_batch(voice_batch: &mut Vec<f32>, mel_frame_buffer: &mut Vec<Vec<
 // 141 voice-tests); the body is a single linear pipeline and not worth
 // splitting.
 #[expect(clippy::too_many_lines)]
+#[cfg_attr(not(feature = "voice-tests"), allow(unused_variables))]
 fn score_stride8_window(
     mel_window: &[Vec<f32>],
     models: &OnnxModels,
     ctx: &mut PipelineCtx,
+    // mahbot-1012: whether this window came from the short-buffer padded
+    // fallback (real frames + tapered fade-out tail) rather than the main
+    // stride-8 loop.  Only read under `voice-tests` (geometry reporting);
+    // the two call sites in [`handle_wake_word_detection`] always pass a
+    // value so production builds see a constant.
+    padded_window: bool,
+    // mahbot-1012: mel frame buffer length at this scoring step.  Only read
+    // under `voice-tests`; the value is a pure observation of pipeline state.
+    mel_buffer_len: usize,
 ) -> bool {
     let embed_start = Instant::now();
     let embedding = match crate::util::with_block_in_place(|| compute_embedding(models, mel_window))
@@ -7357,6 +7633,11 @@ fn score_stride8_window(
             state.verifier.is_trained(),
         )
     };
+    // mahbot-1012: capture the adaptive bootstrap state BEFORE the call —
+    // `feed()` advances the bootstrap counter, so post-call `is_bootstrapping()`
+    // cannot distinguish the last bootstrap frame from a post-bootstrap frame.
+    #[cfg(feature = "voice-tests")]
+    let adaptive_bootstrapping_before = ctx.adaptive_threshold.is_bootstrapping();
     #[cfg_attr(not(feature = "voice-tests"), allow(unused_variables))]
     let (
         detected,
@@ -7382,6 +7663,15 @@ fn score_stride8_window(
     // ── Instrumentation (voice-tests only) ──
     #[cfg(feature = "voice-tests")]
     {
+        // mahbot-1012: number of test-pass frames scored before this window
+        // (pre-push — the push below appends this window's score).  Used by
+        // classify_window_geometry's WarmMixed test: the Conv1D window spans
+        // the last WINDOW_SIZE pushed embeddings, so it contains a warm-up
+        // embedding iff fewer than WINDOW_SIZE-1 test frames precede it.
+        // per_frame_scores is NOT reset by mid-pass segment boundaries, which
+        // is exactly what we want — post-boundary windows (ring cleared) must
+        // never classify WarmMixed.
+        let frames_scored_before = ctx.instrumentation.per_frame_scores.len();
         if total_score > ctx.instrumentation.peak_score {
             ctx.instrumentation.peak_score = total_score;
         }
@@ -7439,6 +7729,66 @@ fn score_stride8_window(
         if is_warmup_frame && rolling_sum >= effective_threshold {
             ctx.instrumentation.n_warmup_suppressed_frames += 1;
         }
+
+        // ── mahbot-1012: per-frame scoring geometry (parallel to
+        //    per_frame_scores) ─────────────────────────────────────────────
+        // The caller-provided mel-window geometry (padded fallback vs main
+        // stride-8 loop) is combined with the classifier-ring-derived geometry
+        // by the pure classify_window_geometry (see its doc comment for the
+        // precedence order and the ring-capacity correctness argument).
+        let geometry = classify_window_geometry(
+            ring_len_before,
+            frames_scored_before,
+            ctx.instrumentation.test_start_ring_len,
+            padded_window,
+        );
+        // Mirror of the feed/peek decision inside score_single_embedding
+        // (voice.rs, adaptive_override): bootstrap always feeds; post-bootstrap,
+        // below-reset scores feed the background statistics and wake-word-like
+        // scores only peek.  `adaptive_bootstrapping_before` is captured
+        // pre-call so the last bootstrap frame is not mislabeled (feed()
+        // advances the counter).  This is deliberately a mirror, not a shared
+        // helper: score_single_embedding is production code and must not carry
+        // feature-gated instrumentation.  If the feed/peek rule in
+        // score_single_embedding changes, update this block to match.
+        let adaptive_mode = if adaptive_bootstrapping_before {
+            AdaptiveFrameMode::Bootstrap
+        } else if total_score < NO_MATCH_RESET_THRESHOLD {
+            AdaptiveFrameMode::Feed
+        } else {
+            AdaptiveFrameMode::Peek
+        };
+        let candidate_state = if detected {
+            CandidateFrameState::Confirmed
+        } else if candidate_was_created {
+            CandidateFrameState::Created
+        } else if candidate_active_before && ctx.candidate.is_some() {
+            CandidateFrameState::Active
+        } else if candidate_active_before {
+            CandidateFrameState::Expired
+        } else {
+            CandidateFrameState::None
+        };
+        ctx.instrumentation
+            .per_frame_embedding_hashes
+            .push(embedding_hash(&embedding));
+        ctx.instrumentation
+            .per_frame_embedding_l2_norms
+            .push(embedding_l2_norm(&embedding));
+        ctx.instrumentation.per_frame_embeddings.push(embedding);
+        ctx.instrumentation
+            .per_frame_window_start
+            .push(ctx.next_window_start);
+        ctx.instrumentation
+            .per_frame_mel_buffer_len
+            .push(mel_buffer_len);
+        ctx.instrumentation.per_frame_geometry.push(geometry);
+        ctx.instrumentation
+            .per_frame_adaptive_mode
+            .push(adaptive_mode);
+        ctx.instrumentation
+            .per_frame_candidate_state
+            .push(candidate_state);
     }
 
     if detected {
@@ -7548,6 +7898,12 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     #[cfg(feature = "voice-tests")]
     let vad_count = std::sync::atomic::AtomicUsize::new(0);
 
+    // mahbot-1012: per-hop VAD decision sequence.  Captured by the closure
+    // (moved into `process_streaming_frames_inner` by value, then transferred
+    // into instrumentation after the loop — same pattern as `vad_count`).
+    #[cfg(feature = "voice-tests")]
+    let mut per_hop_vad: Vec<bool> = Vec::new();
+
     // Side-channel for consecutive VAD-negative hop tracking (mahbot-894).
     // Seeded with the accumulated count from previous calls so the counter
     // is continuous across `process_streaming_frames_inner` invocations.
@@ -7562,6 +7918,8 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
         } else {
             segment_silence_hops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        #[cfg(feature = "voice-tests")]
+        per_hop_vad.push(result);
         result
     };
 
@@ -7613,7 +7971,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
             while ctx.next_window_start + EMBEDDING_WINDOW_FRAMES <= mel_frame_buffer.len() {
                 let window = &mel_frame_buffer
                     [ctx.next_window_start..ctx.next_window_start + EMBEDDING_WINDOW_FRAMES];
-                if score_stride8_window(window, models, ctx) {
+                if score_stride8_window(window, models, ctx, false, mel_frame_buffer.len()) {
                     // Detection fired — loop will be restarted on next call
                     // via fresh stride-8 iteration.  next_window_start is reset
                     // by reset_pipeline_state(Soft).
@@ -7662,7 +8020,8 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
                 while ctx.next_window_start < mel_frame_buffer.len() {
                     let subslice = &mel_frame_buffer[ctx.next_window_start..];
                     let padded = pad_mel_frames_to_window(subslice);
-                    let detected = score_stride8_window(&padded, models, ctx);
+                    let detected =
+                        score_stride8_window(&padded, models, ctx, true, mel_frame_buffer.len());
                     if detected {
                         // Detection fired -- loop stops; next_window_start is
                         // NOT advanced past this position.  Symmetric with
@@ -7684,6 +8043,9 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     {
         ctx.instrumentation.vad_speech_frames +=
             vad_count.load(std::sync::atomic::Ordering::Relaxed);
+        // mahbot-1012: per-hop VAD decision sequence (one entry per VAD
+        // decision in processing order).
+        ctx.instrumentation.per_hop_vad.extend(per_hop_vad);
     }
     // ── Bounded detection segment check (mahbot-894) ───────────────────────
     // If we've accumulated enough consecutive VAD-negative hops since the
@@ -12007,6 +12369,158 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── mahbot-1012: embedding hash + L2 norm tests ───────────────────────
+    // The dual-path same-audio comparison relies on the embedding hash being
+    // deterministic and canonicalising floating-point edge cases: equal values
+    // must hash equal (-0.0 == +0.0, NaN payloads collapse to one quiet NaN).
+    #[cfg(feature = "voice-tests")]
+    #[test]
+    fn embedding_hash_is_deterministic_and_canonicalises_float_edges() {
+        let a = vec![0.1_f32, -0.5, 2.0, 3.25];
+        let b = a.clone();
+        // Deterministic: same values → same hash.
+        assert_eq!(embedding_hash(&a), embedding_hash(&b));
+        // -0.0 and +0.0 are equal values → must hash equal.
+        let neg_zero = vec![0.0_f32, -0.0, 1.0];
+        let pos_zero = vec![0.0_f32, 0.0, 1.0];
+        assert_eq!(embedding_hash(&neg_zero), embedding_hash(&pos_zero));
+        // NaN payloads (not distinguishable acoustic values) collapse to one.
+        let nan1 = vec![f32::NAN, 1.0];
+        let nan2 = vec![f32::from_bits(0x7fc0_1234), 1.0];
+        assert_eq!(embedding_hash(&nan1), embedding_hash(&nan2));
+        // Different values hash differently (collision probability ~2^-64).
+        let c = vec![0.1_f32, -0.5, 2.0, 3.250_001];
+        assert_ne!(embedding_hash(&a), embedding_hash(&c));
+    }
+
+    #[cfg(feature = "voice-tests")]
+    #[test]
+    fn embedding_l2_norm_is_sqrt_of_sum_of_squares() {
+        let v = vec![3.0_f32, 4.0];
+        assert!((embedding_l2_norm(&v) - 5.0).abs() < 1e-6);
+        assert_eq!(embedding_l2_norm(&[]), 0.0);
+    }
+
+    // ── mahbot-1012: window geometry classification ─────────────────────────
+    // classify_window_geometry is a pure function; these tests pin the
+    // precedence order and the ring-capacity (front-eviction) correctness that
+    // the old inline WarmMixed proxy got wrong.
+
+    #[cfg(feature = "voice-tests")]
+    #[test]
+    fn geometry_cold_start_tiled_precedes_all() {
+        // Post-push ring below WINDOW_SIZE (3) → tiled regardless of warm-up
+        // state, padded flag, or frame index.  ring_len_before ∈ {0, 1} gives
+        // post-push lengths {1, 2} < 3; ring_len_before = 2 already yields a
+        // full window and must NOT tile.
+        for ring_len_before in 0..wake_word_classifier::WINDOW_SIZE - 1 {
+            for tsrl in [0usize, 19] {
+                for padded in [false, true] {
+                    assert_eq!(
+                        classify_window_geometry(ring_len_before, 0, tsrl, padded),
+                        WindowGeometry::ColdStartTiled,
+                        "ring_len_before={ring_len_before} tsrl={tsrl} padded={padded}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "voice-tests")]
+    #[test]
+    fn geometry_ring_wrap_warm_mixed_only_first_two_test_frames() {
+        // Regression for the mahbot-1012 reviewer finding: with the ring at
+        // capacity (EMBEDDING_RING_MAX = 19) the OLD proxy
+        // `ring_len_before + 1 - WINDOW_SIZE < test_start_ring_len` pinned at
+        // 17 < 19 forever, mislabeling EVERY later window as WarmMixed.  The
+        // Conv1D window covers the last 3 pushed embeddings, so it contains a
+        // warm-up embedding only while fewer than 2 test frames precede it.
+        let tsrl = EMBEDDING_RING_MAX; // warm-up filled the ring to capacity
+        for (frames_before, expected) in [
+            (0usize, WindowGeometry::WarmMixed),
+            (1, WindowGeometry::WarmMixed),
+            (2, WindowGeometry::TrueSliding),
+            (3, WindowGeometry::TrueSliding),
+            (100, WindowGeometry::TrueSliding),
+        ] {
+            // ring_len_before = 19 (at capacity) on every frame — the exact
+            // case that used to pin the proxy.
+            assert_eq!(
+                classify_window_geometry(EMBEDDING_RING_MAX, frames_before, tsrl, false),
+                expected,
+                "frames_before={frames_before}",
+            );
+        }
+        // Padded windows past the mixing window classify PaddedFallback, not
+        // WarmMixed — the warm pass's padded-window count must match the cold
+        // pass's once the ring-wrap shadowing is removed.
+        assert_eq!(
+            classify_window_geometry(EMBEDDING_RING_MAX, 5, tsrl, true),
+            WindowGeometry::PaddedFallback,
+        );
+    }
+
+    #[cfg(feature = "voice-tests")]
+    #[test]
+    fn geometry_small_warmup_also_mixes_only_first_two_test_frames() {
+        // Warm-up producing ~7 embeddings (the documented WARMUP_PREPEND
+        // expectation): the first two test windows mix warm-up + test content,
+        // the third is already pure test.
+        let tsrl = 7usize;
+        for frames_before in [0usize, 1] {
+            assert_eq!(
+                classify_window_geometry(tsrl + frames_before, frames_before, tsrl, false),
+                WindowGeometry::WarmMixed,
+                "frames_before={frames_before}",
+            );
+        }
+        assert_eq!(
+            classify_window_geometry(9, 2, tsrl, false),
+            WindowGeometry::TrueSliding,
+        );
+    }
+
+    #[cfg(feature = "voice-tests")]
+    #[test]
+    fn geometry_cold_pass_never_warm_mixed() {
+        // Cold pass: test_start_ring_len == 0 — no warm-up embeddings exist,
+        // so even the first frames classify by their window construction.
+        assert_eq!(
+            classify_window_geometry(2, 0, 0, false),
+            WindowGeometry::TrueSliding,
+        );
+        assert_eq!(
+            classify_window_geometry(2, 0, 0, true),
+            WindowGeometry::PaddedFallback,
+        );
+    }
+
+    #[cfg(feature = "voice-tests")]
+    #[test]
+    fn geometry_post_segment_boundary_never_warm_mixed() {
+        // Mid-pass segment boundary clears the ring; per_frame_scores is NOT
+        // reset, so frames_scored_before is large.  The first two post-clear
+        // windows are tiled (ring below WINDOW_SIZE), the rest classify by
+        // construction — none can be WarmMixed.
+        let tsrl = 19usize;
+        assert_eq!(
+            classify_window_geometry(0, 40, tsrl, false),
+            WindowGeometry::ColdStartTiled,
+        );
+        assert_eq!(
+            classify_window_geometry(1, 41, tsrl, false),
+            WindowGeometry::ColdStartTiled,
+        );
+        assert_eq!(
+            classify_window_geometry(2, 42, tsrl, false),
+            WindowGeometry::TrueSliding,
+        );
+        assert_eq!(
+            classify_window_geometry(2, 42, tsrl, true),
+            WindowGeometry::PaddedFallback,
+        );
     }
 
     // ── Short-buffer fallback tests (mahbot-927) ──────────────────────────
