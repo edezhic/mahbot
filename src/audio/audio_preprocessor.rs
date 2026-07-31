@@ -265,6 +265,13 @@ impl AudioPreprocessor {
     /// acoustic environment changes significantly, as the old noise profile
     /// may no longer be representative and the old gain envelope would
     /// mis-adapt to the new room acoustics.
+    ///
+    /// Also clears the voice-tests AGC instrumentation (running RMS history and
+    /// AGC-active frame count) so [`agc_converged`](Self::agc_converged)
+    /// reflects only the post-reset audio — `reset()` is used at production
+    /// segment boundaries and by the E2E benchmark between warm-up and test
+    /// utterance (mahbot-1006 A); carrying the pre-reset history into the
+    /// convergence report would mix two acoustic states.
     pub fn reset(&mut self) {
         self.ns_buffer.clear();
         self.read_pos = 0;
@@ -274,6 +281,11 @@ impl AudioPreprocessor {
         } else {
             None
         };
+        #[cfg(feature = "voice-tests")]
+        {
+            self.running_rms_history.clear();
+            self.agc_active_frame_count = 0;
+        }
     }
 
     // ── Private helpers ───────────────────────────────────────────

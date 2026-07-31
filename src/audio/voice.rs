@@ -4842,6 +4842,29 @@ enum ResetLevel {
     Cancel,
 }
 
+/// Build the audio preprocessor configuration from the live-mic CONFIG flags
+/// (noise suppression + AGC, both defaulting to enabled when unset).
+///
+/// Shared by [`PipelineCtx::new()`] and the voice-tests E2E benchmark so the
+/// benchmark's enrollment/training preprocessing cannot silently diverge from
+/// production when a deployment disables either stage (mahbot-1006 L).
+pub(crate) fn preprocessor_config_from_config()
+-> crate::audio::audio_preprocessor::PreprocessorConfig {
+    use crate::audio::audio_preprocessor::PreprocessorConfig;
+    let ns = CONFIG
+        .voice_noise_suppression()
+        .as_deref()
+        .is_none_or(|v| !v.eq_ignore_ascii_case("false"));
+    let agc = CONFIG
+        .voice_agc()
+        .as_deref()
+        .is_none_or(|v| !v.eq_ignore_ascii_case("false"));
+    PreprocessorConfig {
+        noise_suppression: ns,
+        agc,
+    }
+}
+
 impl PipelineCtx {
     pub(crate) fn new() -> Self {
         Self {
@@ -4877,21 +4900,9 @@ impl PipelineCtx {
             vad_threshold: VAD_THRESHOLD,
             enrollment_vad: None,
             pre_agc_ring: Vec::new(),
-            audio_preprocessor: {
-                use crate::audio::audio_preprocessor::PreprocessorConfig;
-                let ns = CONFIG
-                    .voice_noise_suppression()
-                    .as_deref()
-                    .is_none_or(|v| !v.eq_ignore_ascii_case("false"));
-                let agc = CONFIG
-                    .voice_agc()
-                    .as_deref()
-                    .is_none_or(|v| !v.eq_ignore_ascii_case("false"));
-                crate::audio::audio_preprocessor::AudioPreprocessor::new(PreprocessorConfig {
-                    noise_suppression: ns,
-                    agc,
-                })
-            },
+            audio_preprocessor: crate::audio::audio_preprocessor::AudioPreprocessor::new(
+                preprocessor_config_from_config(),
+            ),
             negative_audio_buf: Vec::new(),
             refractory_until: None,
             last_error_message_time: None,

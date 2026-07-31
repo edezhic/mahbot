@@ -150,8 +150,8 @@ const OWNER_NEGATIVE_PHRASES: &[&str] = &[
 /// NOTE (mahbot-997): The benchmark now auto-computes a suggested value for
 /// this constant via the post-hoc verifier threshold analysis.  To update:
 ///
-/// 1. Run the benchmark 3× with different seeds: `Some(42)`, `Some(43)`,
-///    `Some(44)` by editing the seed in Phase 5 (line ~2328).
+/// 1. Run the benchmark 3× to observe verifier variance — the verifier seed is
+///    `None` (entropy-based RNG) since mahbot-1006 K, matching production.
 /// 2. Take the mean of the three `computed_min_dr` values from the report.
 /// 3. Update this constant to `floor(mean / 0.2) * 0.2`.
 ///
@@ -744,23 +744,24 @@ fn generate_warmup_noise_fallback() -> Vec<f32> {
 /// [`super::handle_wake_word_detection`]), matching the per-frame processing in
 /// [`run_streaming_detection`].
 ///
-/// If `samples` is shorter than [`FRAME_LENGTH`](super::FRAME_LENGTH), it is
-/// zero-padded to match the production pipeline's behaviour when the mic
-/// delivers a partial final frame.
+/// Partial chunks are passed through **without zero-padding** (mahbot-1006 G):
+/// production feeds raw mic chunks as-is, and both the NS stage (which buffers
+/// incomplete 160-sample frames internally) and `handle_wake_word_detection`
+/// (which accumulates partial tails in `ctx.audio_buffer` until the next real
+/// chunk completes a [`FRAME_LENGTH`](super::FRAME_LENGTH) frame) carry the
+/// tail forward.  Zero-padding instead made the AGC adaptation cadence at
+/// utterance boundaries differ from production.
+///
+/// Empty slices are a no-op (the preprocessor buffers nothing new and the
+/// detection frame loop needs a complete frame) — silence must be fed as
+/// actual [`FRAME_LENGTH`](super::FRAME_LENGTH) digital-silence chunks, which
+/// is what production's mic delivers.
 ///
 /// Extracted as a shared helper to eliminate the structural near-duplicate
 /// between `feed_audio` and `run_streaming_detection` (mahbot-922, reviewer
 /// feedback).
 fn process_frame(samples: &[f32], ctx: &mut super::PipelineCtx) {
-    let chunk_size = super::FRAME_LENGTH;
-    let padded = if samples.len() < chunk_size {
-        let mut p = samples.to_vec();
-        p.resize(chunk_size, 0.0);
-        p
-    } else {
-        samples.to_vec()
-    };
-    let processed = ctx.audio_preprocessor.process(padded);
+    let processed = ctx.audio_preprocessor.process(samples.to_vec());
     super::handle_wake_word_detection(&processed, ctx);
 }
 
@@ -774,10 +775,14 @@ fn feed_audio(samples: &[f32], ctx: &mut super::PipelineCtx) {
     for chunk in samples.chunks(super::FRAME_LENGTH) {
         process_frame(chunk, ctx);
     }
-    // Feed silence frames to flush any remaining voice batch (matches the
-    // post-audio flush in run_streaming_detection).
+    // Feed digital-silence frames to flush any remaining voice batch (matches
+    // the post-audio flush in run_streaming_detection).  Real zeros in
+    // FRAME_LENGTH chunks, NOT empty Vecs: production's mic keeps delivering
+    // 512-sample chunks of silence after speech, and the NS stage buffers
+    // incomplete frames internally — an empty chunk would never produce a
+    // complete frame for the detection loop (mahbot-1006 G).
     for _ in 0..3 {
-        process_frame(&[], ctx);
+        process_frame(&vec![0.0; super::FRAME_LENGTH], ctx);
     }
 }
 
@@ -802,7 +807,7 @@ fn feed_audio(samples: &[f32], ctx: &mut super::PipelineCtx) {
 ///   the detection state is restored to prevent cooldown from corrupting subsequent
 ///   benchmark measurements (mahbot-922).
 ///
-/// ## Residue clearing (mahbot-1003)
+/// ## Residue clearing (mahbot-1003, mahbot-1006)
 ///
 /// After feeding warm-up audio, this function clears warm-up residues that would
 /// otherwise contaminate the subsequent test utterance's detection pipeline:
@@ -816,11 +821,30 @@ fn feed_audio(samples: &[f32], ctx: &mut super::PipelineCtx) {
 /// - **`candidate`** — cleared to discard any bounded classifier candidate that
 ///   may have formed after the warm-up embeddings exceeded
 ///   [`VERIFIER_WARMUP_EMBEDDINGS`].
+/// - **`segment_silence_hops`** — reset to 0 so the test utterance starts a fresh
+///   segment (the warm-up flush's VAD-negative hops must not shorten the test
+///   utterance's trailing-silence window, mahbot-1006 H).
+/// - **`audio_preprocessor`** — `reset()` (mahbot-1006 A): the warm-up drives the
+///   AGC to a speech-adapted gain and the NS to a speech-adapted profile; both
+///   must be fresh for the test utterance, matching training's lazy-init AGC and
+///   production's `reset_detection_segment()` at segment boundaries.
 ///
 /// **Preserved**: `embedding_ring` (keeps warm-up embeddings so
 /// [`is_warmup_period`](crate::audio::voice_verifier::VoiceVerifier) returns
 /// `false` and detections are not suppressed), `adaptive_threshold` (preserves
-/// warm-up-adapted state), `audio_preprocessor` (AGC remains warmed up).
+/// warm-up-adapted state — see mahbot-1006 F; the cold-start pass instead uses
+/// a fresh [`AdaptiveThresholdState::new`]).
+///
+/// ## Warm-up ring-content divergence (mahbot-1006 E)
+///
+/// The preserved warm-up embeddings in `embedding_ring` are TTS speech
+/// embeddings, whereas production's ring at a segment start contains ambient
+/// noise/silence embeddings.  This is an accepted divergence for the warm pass:
+/// the warm-up must produce embeddings at all (only VAD-triggering speech does
+/// so reliably), and the classifier's first test windows are pure test content
+/// because `mel_frame_buffer` is cleared.  The cold-start pass (mahbot-1006 D)
+/// measures the empty-ring case instead, which is production's exact post-
+/// silence state.
 fn consume_warmup(ctx: &mut super::PipelineCtx) {
     let before_embeddings = ctx.embedding_ring.len();
     let before_detection = ctx.last_wake_word_detection;
@@ -891,6 +915,7 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
     ctx.next_window_start = 0;
     ctx.score_window.clear();
     ctx.candidate = None;
+    ctx.segment_silence_hops = 0;
 
     // ── Reset instrumentation (mahbot-1005 §1) ─────────────────────────────
     // Warm-up audio passes through the full scoring pipeline and records into
@@ -921,6 +946,29 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
         ..super::DetectionInstrumentation::new()
     };
     ctx.peak_score = 0.0;
+
+    // ── Fresh AGC/NS state for the test utterance (mahbot-1006 A) ─────────
+    // The warm-up audio drives the AGC's asymmetric EMA to a speech-adapted
+    // gain (~1× for ~1.28 s of TTS speech).  Production starts each detection
+    // segment from a fresh AGC (reset_detection_segment calls
+    // audio_preprocessor.reset()), and training uses fresh per-variant AGC, so
+    // the benchmark must NOT let the warm-up-adapted gain carry into the test
+    // utterance — a volume-down variant would otherwise be under-amplified for
+    // the first few seconds (AGC release α=0.02, ~3.6 s to converge), biasing
+    // exactly the volume-robustness variants this benchmark probes.
+    //
+    // reset() (not clear_buffer()): the critique on mahbot-1006 noted the two
+    // differ in NS-profile preservation, and production segment boundaries use
+    // reset() — the warm-up TTS speech should not seed the noise suppressor's
+    // adapted profile for the test utterance either.
+    //
+    // Note (warm-up source reporting): when TTS warm-up is unavailable and the
+    // pink-noise fallback fires, the fallback drives the AGC toward MIN_GAIN
+    // (0.25×).  Without this reset that would guarantee VAD misses on short
+    // utterances; with it the test utterance starts from lazy init like
+    // training and production's digital-silence case.  The warm-up source is
+    // reported in the JSON reproducibility block.
+    ctx.audio_preprocessor.reset();
 }
 
 // ── Prerequisite check ─────────────────────────────────────────────────────
@@ -1005,13 +1053,30 @@ fn pcm_augment_enrollment_variants(variants: &[(Vec<f32>, String)]) -> Vec<(Vec<
 /// These are TTS-synthesised phrases tagged as `Source::Owner` for use in
 /// classifier and verifier training.  Documented limitation: TTS speech
 /// cannot match the distribution of real human Phase 3 speech.
+///
+/// ## Preprocessing alignment (mahbot-1006 C/L)
+///
+/// Production captures owner negatives as real post-AGC/post-NS mic audio
+/// (Phase 3 collection).  The benchmark's TTS surrogates are therefore routed
+/// through an [`AudioPreprocessor`] before embedding extraction, so the
+/// classifier/verifier do not train on a raw-TTS distribution that production
+/// never produces.  The preprocessor is **shared** across all phrases and fed
+/// in [`FRAME_LENGTH`](super::FRAME_LENGTH) chunks, structurally identical to
+/// production's `prewarm_phrase_embeddings` TTS-negative path (one persistent
+/// preprocessor, zero-padded final chunks).  One deliberate divergence: the
+/// config comes from CONFIG (mahbot-1006 L) rather than
+/// `PreprocessorConfig::default()` — identical under default settings, differs
+/// only when a deployment disables NS/AGC.
 fn generate_owner_negative_sequences(
     available_styles: &[String],
     model_hash: &str,
     cache_dir: &std::path::Path,
 ) -> Vec<EmbeddingSequence> {
+    use crate::audio::audio_preprocessor::AudioPreprocessor;
     let num_styles = available_styles.len().max(1);
     let mut sequences = Vec::new();
+    let mut pre = AudioPreprocessor::new(enrollment_preprocessor_config());
+    let chunk_size = super::FRAME_LENGTH;
 
     for (i, &phrase) in OWNER_NEGATIVE_PHRASES.iter().enumerate() {
         for seed in 0..3 {
@@ -1025,7 +1090,15 @@ fn generate_owner_negative_sequences(
                 model_hash,
                 cache_dir,
             ) {
-                match super::process_enrollment_sample(&pcm) {
+                // AGC/NS the TTS PCM (shared preprocessor, zero-padded chunks —
+                // matches prewarm_phrase_embeddings) before embedding.
+                let mut agc_audio: Vec<f32> = Vec::with_capacity(pcm.len());
+                for chunk in pcm.chunks(chunk_size) {
+                    let mut padded = chunk.to_vec();
+                    padded.resize(chunk_size, 0.0);
+                    agc_audio.extend(pre.process(padded));
+                }
+                match super::process_enrollment_sample(&agc_audio) {
                     Ok(embs) if !embs.is_empty() => {
                         sequences.push(EmbeddingSequence::negative(
                             UtteranceId {
@@ -1049,12 +1122,38 @@ fn generate_owner_negative_sequences(
 ///
 /// Produces `EmbeddingSequence` values tagged as [`Source::Ambient`] from noise
 /// profiles at 2 SNR levels each.
+///
+/// ## Preprocessing alignment (mahbot-1006 C/L)
+///
+/// Production captures real ambient negatives as post-AGC/post-NS mic audio
+/// collected during Phase 3.  The benchmark's synthetic noise profiles are
+/// therefore routed through a **shared** [`AudioPreprocessor`] (matching the
+/// persistent live-mic preprocessor) before embedding extraction, so the
+/// classifier/verifier do not train on a raw-noise distribution production
+/// never produces.  Documented limitation: synthetic noise through a fresh
+/// noise suppressor is more aggressively attenuated than production's
+/// room-adapted NS; this is a surrogate for real ambient capture.
 fn generate_ambient_noise_sequences() -> Vec<EmbeddingSequence> {
+    use crate::audio::audio_preprocessor::AudioPreprocessor;
     let mut sequences = Vec::new();
+    let mut pre = AudioPreprocessor::new(enrollment_preprocessor_config());
+    let chunk_size = super::FRAME_LENGTH;
+
     for (seq_idx, (label, noise_fn)) in NOISE_PROFILES.iter().enumerate() {
         let raw = noise_fn();
+        // AGC/NS the raw noise (shared preprocessor, zero-padded chunks).
+        let mut process_agc = |pcm: &[f32]| -> Vec<f32> {
+            let mut agc_audio: Vec<f32> = Vec::with_capacity(pcm.len());
+            for chunk in pcm.chunks(chunk_size) {
+                let mut padded = chunk.to_vec();
+                padded.resize(chunk_size, 0.0);
+                agc_audio.extend(pre.process(padded));
+            }
+            agc_audio
+        };
         // Level 1: full amplitude
-        match super::process_enrollment_sample(&raw) {
+        let agc_raw = process_agc(&raw);
+        match super::process_enrollment_sample(&agc_raw) {
             Ok(embs) if !embs.is_empty() => {
                 sequences.push(EmbeddingSequence::negative(
                     UtteranceId {
@@ -1070,7 +1169,8 @@ fn generate_ambient_noise_sequences() -> Vec<EmbeddingSequence> {
         }
         // Level 2: reduced amplitude (-6dB)
         let attenuated = crate::util::apply_gain(&raw, -6.0);
-        match super::process_enrollment_sample(&attenuated) {
+        let agc_attenuated = process_agc(&attenuated);
+        match super::process_enrollment_sample(&agc_attenuated) {
             Ok(embs) if !embs.is_empty() => {
                 sequences.push(EmbeddingSequence::negative(
                     UtteranceId {
@@ -1138,66 +1238,92 @@ fn compute_vad_segments(audio: &[f32]) -> (Vec<bool>, Vec<Vec<f32>>) {
     (vad_decisions, utterances)
 }
 
-/// Process enrollment variants through VAD-gated utterance segmentation.
+/// Build the audio preprocessor configuration from the same CONFIG flags that
+/// production uses (mahbot-1006 L).
 ///
-/// Concatenates all variants with trailing silence gaps, computes VAD decisions
-/// at the enrollment threshold, segments by [`segment_utterances_by_vad`], then
-/// extracts embeddings from each utterance via [`process_enrollment_sample`].
+/// `PipelineCtx::new()` constructs the live-mic preprocessor from
+/// `CONFIG.voice_noise_suppression()` / `CONFIG.voice_agc()` (both default to
+/// enabled when unset).  The benchmark's enrollment/training path previously
+/// hardcoded `PreprocessorConfig::default()` (NS+AGC always on), which silently
+/// diverged whenever a deployment disables either stage.
 ///
-/// This exercises the same production path as [`handle_enrollment_audio`]:
-/// audio → VAD frame-by-frame → segment by VAD → per-utterance embeddings.
+/// Delegates to [`super::preprocessor_config_from_config()`] — the same helper
+/// `PipelineCtx::new()` uses — so the parsing semantics cannot drift between
+/// the benchmark and production.
+fn enrollment_preprocessor_config() -> crate::audio::audio_preprocessor::PreprocessorConfig {
+    super::preprocessor_config_from_config()
+}
+
+/// Process enrollment clips through VAD-gated utterance segmentation with the
+/// **production ordering** (mahbot-1006 B/I/L).
 ///
-/// The trailing silence (≥1.5s) between clips ensures that
-/// [`segment_utterances_by_vad`] can complete utterance boundary detection,
-/// matching the production enrollment pipeline's behavior.
+/// Production's enrollment path (live mic loop → `handle_enrollment_audio` →
+/// `handle_enrollment_sample`) is:
+///
+/// ```text
+/// raw mic audio → AGC/NS → VAD segment → augment after segmentation → embeddings
+/// ```
+///
+/// The old benchmark path applied augmentation to the raw TTS PCM **before**
+/// AGC (`raw → augment → AGC → VAD`), so:
+/// - AGC partially normalized away the volume-down variant (re-amplifying it
+///   back toward target) and NS partially removed the noise variant's added
+///   noise, making those variants less challenging than production's
+///   equivalents (mahbot-1006 B);
+/// - VAD segmentation ran on the concatenated *augmented* variants, so a
+///   variant could be silently dropped when VAD didn't fire on it, whereas
+///   production runs VAD only on the original mic utterance and always includes
+///   the augmented variants (mahbot-1006 I).
+///
+/// This function instead:
+/// 1. Applies AGC/NS to each raw TTS clip through a **fresh**
+///    [`AudioPreprocessor`] built from the CONFIG-driven
+///    [`enrollment_preprocessor_config`] — per-clip fresh state matches
+///    production's `reset_detection_segment()` fresh-AGC distribution
+///    (mahbot-886 rationale, kept).
+/// 2. Concatenates the AGC'd **originals** with 2.0 s silence gaps and
+///    VAD-segments them (only originals, matching `handle_enrollment_audio`).
+/// 3. Derives the 4 augmented variants (speed-down, speed-up conditional,
+///    volume-down, noise) from each **AGC'd** utterance audio — exactly the
+///    `handle_enrollment_sample` variant set (mahbot-878) — then extracts
+///    embeddings from the original and all 4 variants.
 ///
 /// Returns dense-only EmbeddingSequences (stride-8) for classifier and
 /// verifier training.  The old streaming path was removed in mahbot-923.
 #[allow(clippy::too_many_lines)]
-fn vad_segment_and_enroll(
-    enrollment_variants: &[(Vec<f32>, String)],
-    augmented_variants: &[(Vec<f32>, String)],
-) -> Vec<EmbeddingSequence> {
-    // ── Per-variant AGC (mahbot-886) ──
-    // Each variant processed through a fresh AudioPreprocessor (both AGC and
+fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<EmbeddingSequence> {
+    use crate::audio::audio_preprocessor::AudioPreprocessor;
+    let chunk_size = super::FRAME_LENGTH;
+    let config = enrollment_preprocessor_config();
+
+    // ── Per-clip AGC (mahbot-886, mahbot-1006 B) ──
+    // Each clip processed through a fresh AudioPreprocessor (both AGC and
     // noise suppressor), matching the production detection path.  Shared-AGC
     // approach (concatenating variants then applying AGC) created a different
     // distribution — running_rms converged during training but detection starts
-    // fresh, causing 46% miss rate on TTS variants.  Per-variant fresh NS
-    // avoids the same training-inference mismatch.
-    use crate::audio::audio_preprocessor::{AudioPreprocessor, PreprocessorConfig};
-    let chunk_size = super::FRAME_LENGTH;
-
-    let all_variants: Vec<&(Vec<f32>, String)> = enrollment_variants
-        .iter()
-        .chain(augmented_variants.iter())
-        .collect();
-
-    let mut per_variant_agc: Vec<Vec<f32>> = Vec::with_capacity(all_variants.len());
-    for (samples, _label) in &all_variants {
-        let mut pre = AudioPreprocessor::new(PreprocessorConfig::default());
+    // fresh, causing 46% miss rate on TTS variants.  Per-clip fresh NS avoids
+    // the same training-inference mismatch.  Chunks are fed as-is (no
+    // zero-padding): the NS buffers incomplete frames internally and the next
+    // chunk (or the silence gap) completes them, matching production's tail
+    // accumulation (mahbot-1006 G).
+    let mut per_clip_agc: Vec<Vec<f32>> = Vec::with_capacity(enrollment_variants.len());
+    for (samples, _label) in enrollment_variants {
+        let mut pre = AudioPreprocessor::new(config);
         let mut processed: Vec<f32> = Vec::with_capacity(samples.len());
         for chunk in samples.chunks(chunk_size) {
-            let padded = if chunk.len() < chunk_size {
-                let mut p: Vec<f32> = chunk.to_vec();
-                p.resize(chunk_size, 0.0);
-                p
-            } else {
-                chunk.to_vec()
-            };
-            processed.extend(pre.process(padded));
+            processed.extend(pre.process(chunk.to_vec()));
         }
-        per_variant_agc.push(processed);
+        per_clip_agc.push(processed);
     }
 
-    // ── Concatenate AGC-processed variants with 2.0s silence gaps ──
+    // ── Concatenate AGC'd originals with 2.0s silence gaps ──
     // 2.0s well exceeds ENROLLMENT_SILENCE_THRESHOLD_SAMPLES (~304ms after
     // mahbot-1001 Fix 7) for clean boundaries.
     let silence_gap_samples = (2.0 * f64::from(super::SAMPLE_RATE)) as usize;
     let silence: Vec<f32> = vec![0.0f32; silence_gap_samples];
 
     let mut combined_audio: Vec<f32> = Vec::new();
-    for processed in &per_variant_agc {
+    for processed in &per_clip_agc {
         if !combined_audio.is_empty() {
             combined_audio.extend_from_slice(&silence);
         }
@@ -1207,54 +1333,130 @@ fn vad_segment_and_enroll(
     combined_audio.extend_from_slice(&silence);
 
     info!(
-        "VAD concatenation: {} total samples ({:.1}s) from {} variants (per-variant AGC)",
+        "VAD concatenation: {} total samples ({:.1}s) from {} originals (per-clip AGC, mahbot-1006 B)",
         combined_audio.len(),
         combined_audio.len() as f64 / f64::from(super::SAMPLE_RATE),
-        all_variants.len(),
+        enrollment_variants.len(),
     );
 
+    // ── VAD segmentation on the ORIGINALS only (mahbot-1006 I) ──
     let (_vad_decisions, utterances) = compute_vad_segments(&combined_audio);
     info!(
-        "VAD segmentation: {} utterances from {} concatenated variants",
+        "VAD segmentation: {} utterances from {} concatenated originals",
         utterances.len(),
-        enrollment_variants.len() + augmented_variants.len(),
+        enrollment_variants.len(),
     );
 
-    // ── Process each utterance through enrollment ──
+    // ── Augment AFTER segmentation, then extract embeddings (mahbot-1006 B) ──
+    // Each VAD utterance is treated like production's `handle_enrollment_sample`
+    // input: the 4 augmented PCM variants are derived from the AGC'd utterance
+    // audio, and all 5 variants are embedded.  Every variant is always included
+    // — none can be silently dropped by VAD (which only gated the original).
     let mut dense_sequences: Vec<EmbeddingSequence> = Vec::new();
 
     for (i, utterance) in utterances.iter().enumerate() {
-        match super::process_enrollment_sample(utterance) {
-            Ok(embeddings) if !embeddings.is_empty() => {
-                info!(
-                    "Utterance {i}: {} samples ({:.2}s), {} embeddings",
-                    utterance.len(),
-                    utterance.len() as f64 / f64::from(super::SAMPLE_RATE),
-                    embeddings.len(),
-                );
-                dense_sequences.push(EmbeddingSequence::positive(
-                    UtteranceId {
-                        sequence_index: i,
-                        variant_index: 0,
-                    },
-                    Source::Enrollment,
-                    None,
-                    embeddings,
-                ));
+        let speed_down =
+            crate::audio::tts_data_gen::speed_perturbation(utterance, TARGET_SAMPLE_RATE, 0.95);
+        // Speed-up is conditional on ≥500 ms unpadded duration (matches
+        // handle_enrollment_sample's skip_speed_up).
+        let pre_pad_duration_samples = utterance
+            .len()
+            .saturating_sub(2 * super::CONTEXT_PADDING_SAMPLES);
+        let pre_pad_duration_ms =
+            (pre_pad_duration_samples as u64 * 1000) / u64::from(TARGET_SAMPLE_RATE);
+        let speed_up = if pre_pad_duration_ms >= 500 {
+            Some(crate::audio::tts_data_gen::speed_perturbation(
+                utterance,
+                TARGET_SAMPLE_RATE,
+                1.05,
+            ))
+        } else {
+            None
+        };
+        let volume_down = crate::util::apply_gain(utterance, -3.0);
+        let noise = crate::util::add_noise(utterance, 25.0, i as u64);
+
+        info!(
+            "Utterance {i}: {} samples ({:.2}s) → original + speed_down + {} + vol_down + noise",
+            utterance.len(),
+            utterance.len() as f64 / f64::from(super::SAMPLE_RATE),
+            if speed_up.is_some() {
+                "speed_up".to_string()
+            } else {
+                "speed_up(skipped,<500ms)".to_string()
+            },
+        );
+
+        // Helper closure: push one variant's embeddings (mahbot-878 naming:
+        // variant 0 = original, 1 = speed-down, 2 = speed-up, 3 = volume-down,
+        // 4 = noise).
+        let push_variant = |variant_index: usize,
+                            source: Source,
+                            aug_family: Option<AugmentationFamily>,
+                            pcm: &[f32],
+                            sequences: &mut Vec<EmbeddingSequence>| {
+            match super::process_enrollment_sample(pcm) {
+                Ok(embeddings) if !embeddings.is_empty() => {
+                    sequences.push(EmbeddingSequence::positive(
+                        UtteranceId {
+                            sequence_index: i,
+                            variant_index,
+                        },
+                        source,
+                        aug_family,
+                        embeddings,
+                    ));
+                }
+                Ok(_) => warn!("Utterance {i} variant {variant_index}: no embeddings extracted"),
+                Err(e) => {
+                    warn!(
+                        "Utterance {i} variant {variant_index}: embedding extraction failed: {e}"
+                    );
+                }
             }
-            Ok(_) => warn!("Utterance {i}: no embeddings extracted"),
-            Err(e) => warn!("Utterance {i}: embedding extraction failed: {e}"),
+        };
+
+        push_variant(0, Source::Enrollment, None, utterance, &mut dense_sequences);
+        push_variant(
+            1,
+            Source::Augmentation,
+            Some(AugmentationFamily::SpeedDown),
+            &speed_down,
+            &mut dense_sequences,
+        );
+        if let Some(ref spd_up) = speed_up {
+            push_variant(
+                2,
+                Source::Augmentation,
+                Some(AugmentationFamily::SpeedUp),
+                spd_up,
+                &mut dense_sequences,
+            );
         }
+        push_variant(
+            3,
+            Source::Augmentation,
+            Some(AugmentationFamily::Volume),
+            &volume_down,
+            &mut dense_sequences,
+        );
+        push_variant(
+            4,
+            Source::Augmentation,
+            Some(AugmentationFamily::Noise),
+            &noise,
+            &mut dense_sequences,
+        );
     }
 
-    let expected_utterances = enrollment_variants.len() + augmented_variants.len();
     info!(
-        "VAD-gated enrollment: {} dense embeddings from {} utterances (expected ~{expected_utterances})",
+        "VAD-gated enrollment (mahbot-1006 B): {} dense embeddings from {} sequences ({} utterances × ~5 variants)",
         dense_sequences
             .iter()
             .map(|s| s.embeddings.len())
             .sum::<usize>(),
         dense_sequences.len(),
+        utterances.len(),
     );
 
     dense_sequences
@@ -1268,6 +1470,20 @@ struct DetectionResult {
     /// Latency in milliseconds from feed start to detection (only meaningful
     /// when `detected` is true).
     latency_ms: Option<f64>,
+    /// AGC convergence state captured at the end of the test utterance (before
+    /// the trailing silence flush).  `None` when insufficient AGC-active
+    /// frames.  Captured pre-flush so a segment boundary fired during the
+    /// trailing silence cannot erase the utterance's convergence evidence
+    /// (mahbot-1006 A/H).
+    agc_converged: Option<bool>,
+    /// Adaptive threshold state captured at the end of the test utterance
+    /// (before the trailing silence flush).  A segment boundary fired during
+    /// the flush calls `reset_detection_segment`, which resets
+    /// `ctx.adaptive_threshold` to bootstrap; carrying this pre-flush snapshot
+    /// forward lets the benchmark's shared-state design (mahbot-845) preserve
+    /// the adaptation accumulated from the utterance's frames instead of
+    /// re-bootstrapping per variant (mahbot-1006 F).
+    adaptive_state_pre_flush: super::AdaptiveThresholdState,
 }
 
 /// Run the production streaming wake word detection pipeline on audio samples.
@@ -1300,28 +1516,71 @@ fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> Det
             return DetectionResult {
                 detected: true,
                 latency_ms: Some(latency),
+                agc_converged: ctx.audio_preprocessor.agc_converged(),
+                // No flush ran on this path, so the pre-flush snapshot is the
+                // current state; the boundary-fire branch in the callers is
+                // unreachable when `detected` is true anyway.
+                adaptive_state_pre_flush: ctx.adaptive_threshold.clone(),
             };
         }
     }
 
-    // Feed silence frames to flush any remaining voice_batch.
-    // The first silence frame after speech triggers flush_voice_batch via
-    // the VAD-negative branch in handle_wake_word_detection.
-    // Also process through audio_preprocessor for consistency with production.
-    for _ in 0..3 {
+    // ── Trailing silence flush (mahbot-1006 H) ───────────────────────────
+    // Production continues on natural silence after the utterance and
+    // detection can still fire for up to SEGMENT_TIMEOUT_HOPS (19) VAD-negative
+    // hops before the segment-boundary reset clears the ring and per-segment
+    // state.  The old flush fed exactly 3×512 zero frames (~96 ms), which
+    // missed wake words whose rolling sum crossed threshold during the longer
+    // production window (~304 ms).
+    //
+    // The AGC convergence evidence is captured BEFORE the flush: a segment
+    // boundary fired during the flush resets the preprocessor (mahbot-1006 A)
+    // and its voice-tests instrumentation, which would otherwise erase the
+    // utterance's convergence history from `agc_converged()`.  The adaptive
+    // threshold state is captured for the same reason — the boundary resets it
+    // to bootstrap, and the benchmark's shared-state design (mahbot-845) wants
+    // the adapted state to survive the boundary rather than re-bootstrapping
+    // per variant (mahbot-1006 F).
+    let agc_converged = ctx.audio_preprocessor.agc_converged();
+    let adaptive_state_pre_flush = ctx.adaptive_threshold.clone();
+    //
+    // Feed FRAME_LENGTH digital-silence chunks (production's mic delivers real
+    // zeros, not empty Vecs — see process_frame) until:
+    //   1. detection fires, or
+    //   2. the segment boundary fires, or
+    //   3. we exceed the production window (SEGMENT_TIMEOUT_HOPS hops plus a
+    //      small allowance for any remaining VAD-positive utterance tail).
+    //
+    // The boundary is detected via the embedding ring: reset_detection_segment
+    // clears it (and no other non-detection path does within a variant), so a
+    // non-empty→empty transition means the segment ended and further silence
+    // cannot produce a detection.
+    let mut silence_chunks = 0usize;
+    while silence_chunks < super::SEGMENT_TIMEOUT_HOPS + 4 {
         if ctx.last_wake_word_detection != before {
             let latency = feed_start.elapsed().as_secs_f64() * 1000.0;
             return DetectionResult {
                 detected: true,
                 latency_ms: Some(latency),
+                agc_converged,
+                adaptive_state_pre_flush,
             };
         }
-        process_frame(&[], ctx);
+        let ring_was_nonempty = !ctx.embedding_ring.is_empty();
+        process_frame(&vec![0.0; super::FRAME_LENGTH], ctx);
+        silence_chunks += 1;
+        // Segment boundary fired: the ring was cleared — further silence
+        // cannot produce a detection, so stop feeding.
+        if ring_was_nonempty && ctx.embedding_ring.is_empty() {
+            break;
+        }
     }
 
     DetectionResult {
         detected: ctx.last_wake_word_detection != before,
         latency_ms: None,
+        agc_converged,
+        adaptive_state_pre_flush,
     }
 }
 
@@ -1449,7 +1708,10 @@ fn build_per_variant_result(
         verifier_score: ctx.instrumentation.peak_verifier_score,
         n_embeddings: ctx.embedding_ring.len(),
         n_frames_below_reset: ctx.instrumentation.n_frames_below_reset,
-        agc_converged: ctx.audio_preprocessor.agc_converged(),
+        // Captured pre-flush in run_streaming_detection (mahbot-1006 A/H) —
+        // reading ctx.audio_preprocessor.agc_converged() here could report
+        // None for a miss whose segment boundary reset the preprocessor.
+        agc_converged: result.agc_converged,
         vad_speech_frames: ctx.instrumentation.vad_speech_frames,
         per_frame_scores: ctx.instrumentation.per_frame_scores.clone(),
         warmup_completed,
@@ -2035,6 +2297,7 @@ fn test_detection_samples(
     metrics: &mut DetectionMetrics,
     on_detection: impl Fn(&mut DetectionMetrics, &str),
     mut adaptive_state: Option<&mut super::AdaptiveThresholdState>,
+    cold_start: bool,
 ) {
     // Set classifier + verifier in global state for the streaming pipeline.
     // score_stride8_window reads these from voice_state().
@@ -2043,9 +2306,10 @@ fn test_detection_samples(
 
     for (i, (samples, label)) in variants.iter().enumerate() {
         info!(
-            "  Variant {}/{}: {label} — processing",
+            "  Variant {}/{}: {label} — processing ({})",
             i + 1,
-            variants.len()
+            variants.len(),
+            if cold_start { "cold start" } else { "warm" }
         );
         metrics.total += 1;
         let mut ctx = super::PipelineCtx::new();
@@ -2055,30 +2319,65 @@ fn test_detection_samples(
         // adaptive state never exits its 5-frame bootstrap because each
         // variant gets a fresh ctx, keeping all benchmark metrics measured
         // against the static threshold.
-        if let Some(ref mut state) = adaptive_state {
+        //
+        // Cold start (mahbot-1006 D/F): production bootstraps the adaptive
+        // threshold from the first 5 real per-frame scores of actual background
+        // audio after each segment boundary.  The cold pass therefore uses a
+        // fresh AdaptiveThresholdState::new() per variant (no shared-state
+        // propagation) so the threshold trajectory matches production exactly.
+        if !cold_start && let Some(ref mut state) = adaptive_state {
             ctx.adaptive_threshold = state.clone();
         }
         // Consume verifier warm-up before the test utterance so the latency
         // timer measures only the wake word (mahbot-922, reviewer feedback).
-        consume_warmup(&mut ctx);
-        let warmup_n_embeddings = ctx.embedding_ring.len();
-        let warmup_completed =
-            warmup_n_embeddings >= crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS;
-        info!(
-            "  Variant {}/{}: {label} — warm-up {} ({} embeddings)",
-            i + 1,
-            variants.len(),
-            if warmup_completed {
-                "completed ✓"
-            } else {
-                "FAILED ✗"
-            },
-            warmup_n_embeddings,
-        );
+        //
+        // Cold start (mahbot-1006 D): production has no warm-up — the first
+        // VERIFIER_WARMUP_EMBEDDINGS embeddings of every utterance after
+        // silence are suppressed during verifier warm-up.  The cold pass skips
+        // consume_warmup so the test utterance itself consumes the warm-up
+        // period, exactly like production's post-silence start.
+        let (warmup_n_embeddings, warmup_completed) = if cold_start {
+            (0, false)
+        } else {
+            consume_warmup(&mut ctx);
+            let n = ctx.embedding_ring.len();
+            let completed = n >= crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS;
+            info!(
+                "  Variant {}/{}: {label} — warm-up {} ({} embeddings)",
+                i + 1,
+                variants.len(),
+                if completed {
+                    "completed ✓"
+                } else {
+                    "FAILED ✗"
+                },
+                n,
+            );
+            (n, completed)
+        };
         let result = run_streaming_detection(samples, &mut ctx);
-        // Propagate the updated adaptive state for the next variant.
-        if let Some(ref mut state) = adaptive_state {
-            **state = ctx.adaptive_threshold.clone();
+        // Propagate the updated adaptive state for the next variant (warm pass
+        // only — the cold pass keeps each variant's bootstrap independent).
+        //
+        // When the trailing silence fires a segment boundary (`!detected` AND
+        // the ring was cleared — reset_detection_segment is the only
+        // non-detection path that empties the warm pass's ring), the boundary
+        // resets ctx.adaptive_threshold back to bootstrap.  Propagating that
+        // bootstrap state would defeat the shared-state design (mahbot-845)
+        // which keeps the adaptive code path active across variants to avoid
+        // measuring everything against the static threshold — and with item
+        // H's extended flush every non-detecting variant fires the boundary.
+        // Instead, carry the pre-flush snapshot captured at the end of the
+        // utterance so the shared state keeps adapting to each variant's
+        // frames.  The cold pass measures the bootstrap behavior separately
+        // (mahbot-1006 F).
+        if !cold_start && let Some(ref mut state) = adaptive_state {
+            let boundary_fired = !result.detected && ctx.embedding_ring.is_empty();
+            if boundary_fired {
+                **state = result.adaptive_state_pre_flush.clone();
+            } else {
+                **state = ctx.adaptive_threshold.clone();
+            }
         }
         let peak = ctx.instrumentation.peak_score;
         if result.detected {
@@ -2155,6 +2454,7 @@ fn run_volume_sweep(
                 m.detected += 1;
             },
             None,
+            false, // volume sweep uses the warm pass only (informational phase)
         );
         let rate = metrics.detection_rate();
         let peak_scores: Vec<f32> = metrics.per_variant.iter().map(|pv| pv.peak_score).collect();
@@ -2346,8 +2646,24 @@ fn run_noise_overlap_test(
                     warmup_n_embeddings >= crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS;
                 let result = run_streaming_detection(&mixed_pcm, &mut ctx);
 
-                // Persist the updated adaptive state for the next variant.
-                shared_adaptive = ctx.adaptive_threshold.clone();
+                // Persist the updated adaptive state for the next variant,
+                // with the same boundary-fire guard as test_detection_samples
+                // (mahbot-1006 F): when the trailing silence fired a segment
+                // boundary (`!detected` AND the ring was cleared), the
+                // boundary reset ctx.adaptive_threshold to bootstrap.
+                // Propagating that bootstrap state would defeat the
+                // shared-state design (mahbot-845) — and with item H's
+                // extended flush every non-detecting variant fires the
+                // boundary, so the phase would otherwise re-bootstrap per
+                // variant and measure mostly against the static threshold.
+                // Carry the pre-flush snapshot instead so the shared state
+                // keeps adapting to each variant's frames.
+                let boundary_fired = !result.detected && ctx.embedding_ring.is_empty();
+                shared_adaptive = if boundary_fired {
+                    result.adaptive_state_pre_flush.clone()
+                } else {
+                    ctx.adaptive_threshold.clone()
+                };
 
                 if result.detected {
                     if let Some(lat) = result.latency_ms {
@@ -2577,50 +2893,58 @@ pub(crate) fn run_internal() {
         enrollment_variants.len()
     );
 
-    // Apply PCM transforms to match production: original, speed-down, speed-up
-    // (conditional), volume-down, noise (mahbot-932 Fix 5).
-    let all_variants = pcm_augment_enrollment_variants(&enrollment_variants);
+    // ── Train/test split at the CLIP level (mahbot-932 Fix 5, mahbot-1006 B/I) ──
+    // The split strategy is unchanged (2/3 : 1/3 by enrollment-list order,
+    // tail = test).  It now happens on the raw enrollment clips BEFORE AGC/VAD/
+    // augmentation because the augmentation itself moved inside the per-clip
+    // processing (production order: AGC → VAD → augment; mahbot-1006 B/I).
+    // Splitting the clips (rather than the 5× augmented list) also removes the
+    // previous leakage where augmented variants of the same raw clip spanned
+    // the train/test boundary.
+    //
+    // - Train clips → vad_segment_and_enroll (AGC → VAD → augment → embeddings).
+    // - Test clips → raw-level PCM augmentation (original + speed/volume/noise
+    //   applied to the raw TTS audio), fed through the streaming detection path
+    //   which applies AGC exactly like production's live mic loop.
+    let n_train_clips = (enrollment_variants.len() * 2 / 3).max(1);
+    let mut all_clips = enrollment_variants;
+    let test_clips = all_clips.split_off(n_train_clips);
+    let train_clips = all_clips;
+
+    // Test-set raw-level PCM augmentation (mahbot-932 Fix 5 semantics kept:
+    // the detection test covers all 5 augmentation types at the raw level).
+    let test_variants = pcm_augment_enrollment_variants(&test_clips);
     info!(
-        "PCM augmentation: {} -> {} total variants (original + speed-down + \
-         speed-up + vol-down + noise per enrollment)",
-        enrollment_variants.len(),
-        all_variants.len(),
+        "PCM augmentation (test clips): {} clips -> {} raw-level test variants (original + \
+         speed-down + speed-up + vol-down + noise per clip)",
+        test_clips.len(),
+        test_variants.len(),
     );
     phase_times[P_ENROLLMENT_AUDIO] = phase_end_ms!();
 
-    // ── Phase 2: VAD-gated enrollment ────────────────────────────────────
+    // ── Phase 2: VAD-gated enrollment (train clips) ─────────────────────
     phase_start!("Phase 2: VAD-gated enrollment");
 
-    // ── Train/test split AFTER PCM augmentation (mahbot-932 Fix 5) ──
-    // Split the PCM-augmented variants into disjoint training and test sets.
-    // Production generates ~45-50 sequences (10 utterances × 5 PCM variants,
-    // minus SpeedUp skip for short ones).  We use a 2/3 : 1/3 split so the
-    // test set has enough samples for meaningful detection metrics.
-    let n_train = (all_variants.len() * 2 / 3).max(1);
-    let mut all_variants_mut = all_variants;
-    let test_variants: Vec<(Vec<f32>, String)> = all_variants_mut.split_off(n_train);
-    let train_variants = all_variants_mut;
-    let n_test = test_variants.len();
     info!(
-        "Train/test split: {} training, {} test variants (mahbot-932)",
-        train_variants.len(),
-        n_test
+        "Train/test split (clip level): {} train clips, {} test clips (mahbot-932)",
+        train_clips.len(),
+        test_clips.len()
     );
 
-    let pos_sequences = vad_segment_and_enroll(&train_variants, &[]);
+    let pos_sequences = vad_segment_and_enroll(&train_clips);
     if pos_sequences.is_empty() {
         warn!(
-            "VAD-gated enrollment produced no utterances from {} training variants",
-            train_variants.len(),
+            "VAD-gated enrollment produced no utterances from {} training clips",
+            train_clips.len(),
         );
         eprintln!(
-            "FATAL: VAD-gated enrollment produced no utterances from {} training variants",
-            train_variants.len(),
+            "FATAL: VAD-gated enrollment produced no utterances from {} training clips",
+            train_clips.len(),
         );
         return;
     }
     info!(
-        "VAD-gated enrollment: {} dense embeddings from {} utterances",
+        "VAD-gated enrollment: {} dense embeddings from {} sequences",
         pos_sequences
             .iter()
             .map(|s| s.embeddings.len())
@@ -2876,10 +3200,18 @@ pub(crate) fn run_internal() {
         }
     };
 
-    // -- Informational self-test --
-    match super::run_enrollment_self_test(&pos_sequences, &classifier) {
-        Ok(()) => info!("Detection self-test (informational): passed"),
-        Err(e) => info!("Detection self-test (informational, non-gating): {e}"),
+    // ── Informational self-test (mahbot-1006 J) ──
+    // Production treats the self-test as GATING: if it fails, the model is
+    // rejected and enrollment fails.  The benchmark is report-only (mahbot-953),
+    // so it does not abort — but a failure is surfaced as a prominent warning
+    // AND recorded in the JSON so consumers know the reported detection/FA
+    // numbers come from a model production would refuse to deploy.
+    let self_test_result = super::run_enrollment_self_test(&pos_sequences, &classifier);
+    match &self_test_result {
+        Ok(()) => info!("Detection self-test: passed"),
+        Err(e) => warn!(
+            "Detection self-test FAILED — production would reject this model (report-only, mahbot-953): {e}"
+        ),
     }
     phase_times[P_CLASSIFIER_TRAINING] = phase_end_ms!();
 
@@ -2892,7 +3224,12 @@ pub(crate) fn run_internal() {
         Some(&per_negative_sequence_weights), // per-sequence weights matching production (mahbot-870 Fix 3)
         DEFAULT_VERIFIER_THRESHOLD,
         CONV_L2_LAMBDA, // Conv1D L2 regularization
-        Some(42),       // fixed seed for deterministic benchmark (mahbot-882)
+        // mahbot-1006 K: match production's seed policy.  Production passes
+        // None (entropy-based RNG) — the fixed Some(42) made the benchmark
+        // deterministic but unrepresentative of the outcome distribution
+        // production users actually see.  The classifier seed stays fixed
+        // (Some(0) inside finalize_enrollment, identical in both paths).
+        None,
     );
 
     if verifier.is_trained() {
@@ -2934,6 +3271,9 @@ pub(crate) fn run_internal() {
     // to 0 directly, while `phase_start!`/`phase_end_ms!` are only called
     // for executed phases.
     let mut pos_metrics = DetectionMetrics::default();
+    // Cold-start detection metrics (mahbot-1006 D) — populated in Phase 8
+    // alongside the warm pass.  Stays default when degenerate.
+    let mut cold_metrics = DetectionMetrics::default();
     let mut conf_metrics = DetectionMetrics::default();
     let mut unrelated_metrics = DetectionMetrics::default();
     let mut silence_metric = DetectionMetrics::default();
@@ -2982,6 +3322,10 @@ pub(crate) fn run_internal() {
 
         // ── Phase 8: Detection — Positive cases ───────────────────────────
         phase_start!("Phase 8: Positive (wake word) variants");
+        // Warm pass (existing behavior): consume_warmup + shared pre-warmed
+        // adaptive state.  Measures the optimistic production scenario where
+        // the verifier is active before the utterance (background audio has
+        // already filled the ring).
         test_detection_samples(
             &pos_test_variants,
             &classifier,
@@ -2989,12 +3333,46 @@ pub(crate) fn run_internal() {
             &mut pos_metrics,
             |m, _| m.detected += 1,
             Some(&mut shared_adaptive),
+            false, // warm pass
         );
         info!(
-            "Positive detection: {}/{} ({:.1}%)",
+            "Positive detection (warm): {}/{} ({:.1}%)",
             pos_metrics.detected,
             pos_metrics.total,
             pos_metrics.detection_rate() * 100.0,
+        );
+
+        // ── Cold-start pass (mahbot-1006 D) ─────────────────────────────
+        // Production has no warm-up: after ≥SEGMENT_TIMEOUT_HOPS of silence the
+        // segment boundary resets the ring, and the first
+        // VERIFIER_WARMUP_EMBEDDINGS embeddings of the next utterance are
+        // suppressed during verifier warm-up.  A short wake word therefore has
+        // only a few scorable embeddings.  The warm pass cannot measure this —
+        // it pre-warms the verifier, the AGC, and the classifier window.
+        //
+        // The cold pass re-runs the positive variants with a fresh PipelineCtx
+        // per variant, no consume_warmup, and a fresh AdaptiveThresholdState
+        // that bootstraps from the first real frames (mahbot-1006 F).  Scoped
+        // to positive variants only: the negative phases measure false accepts
+        // (which the cold start does not materially change) and doubling every
+        // phase would roughly double benchmark runtime for marginal benefit.
+        // NOTE: reuses the outer `cold_metrics` (declared with pos_metrics
+        // above) — a shadowing `let` here would leave the JSON report reading
+        // the empty outer binding (analyst review, mahbot-1006).
+        test_detection_samples(
+            &pos_test_variants,
+            &classifier,
+            &verifier,
+            &mut cold_metrics,
+            |m, _| m.detected += 1,
+            None, // fresh adaptive state per variant (item F)
+            true, // cold start
+        );
+        info!(
+            "Positive detection (cold): {}/{} ({:.1}%)",
+            cold_metrics.detected,
+            cold_metrics.total,
+            cold_metrics.detection_rate() * 100.0,
         );
         phase_times[P_POSITIVE_VARIANTS] = phase_end_ms!();
 
@@ -3023,6 +3401,7 @@ pub(crate) fn run_internal() {
             &mut conf_metrics,
             |m, l| m.false_accepts.push(l.to_string()),
             Some(&mut shared_adaptive),
+            false, // warm pass only (negative phase)
         );
         // Split false accepts by tier for per-tier tracking (mahbot-871).
         for label in &conf_metrics.false_accepts {
@@ -3070,6 +3449,7 @@ pub(crate) fn run_internal() {
             &mut unrelated_metrics,
             |m, l| m.false_accepts.push(l.to_string()),
             Some(&mut shared_adaptive),
+            false, // warm pass only (negative phase)
         );
         phase_times[P_UNRELATED_NEGATIVES] = phase_end_ms!();
 
@@ -3082,6 +3462,7 @@ pub(crate) fn run_internal() {
             &mut silence_metric,
             |m, l| m.false_accepts.push(l.to_string()),
             Some(&mut shared_adaptive),
+            false, // warm pass only (negative phase)
         );
         phase_times[P_SILENCE_NEGATIVES] = phase_end_ms!();
 
@@ -3098,6 +3479,7 @@ pub(crate) fn run_internal() {
                 &mut metric,
                 |m, l| m.false_accepts.push(l.to_string()),
                 Some(&mut shared_adaptive),
+                false, // warm pass only (negative phase)
             );
             if metric.false_accepts.is_empty() {
                 info!("    → no false accepts ✓");
@@ -3803,13 +4185,23 @@ pub(crate) fn run_internal() {
     // Embedding cosine similarity between held-out test variants and the
     // training centroid.  The centroid is the L2-normalised mean of all
     // training embeddings (pos_sequences); each test variant's embeddings are
-    // recomputed via the same extraction path used for training
-    // (process_enrollment_sample), so the comparison is apples-to-apples.
+    // recomputed through the SAME processing the training path applies — a
+    // fresh CONFIG-driven AudioPreprocessor (mahbot-1006 B/L) followed by
+    // process_enrollment_sample — so the comparison is apples-to-apples.
+    // (The detection path itself applies AGC via process_frame; this check
+    // mirrors the training AGC for an embedding-space comparison.)
     let train_centroid = embedding_centroid(&pos_sequences);
     let mut test_centroid_sims: Vec<(String, f32)> = Vec::new();
     if !degenerate && let Some(centroid) = &train_centroid {
+        use crate::audio::audio_preprocessor::AudioPreprocessor;
+        let chunk_size = super::FRAME_LENGTH;
         for (pcm, label) in &pos_test_variants {
-            if let Ok(embs) = super::process_enrollment_sample(pcm)
+            let mut pre = AudioPreprocessor::new(enrollment_preprocessor_config());
+            let mut agc_audio: Vec<f32> = Vec::with_capacity(pcm.len());
+            for chunk in pcm.chunks(chunk_size) {
+                agc_audio.extend(pre.process(chunk.to_vec()));
+            }
+            if let Ok(embs) = super::process_enrollment_sample(&agc_audio)
                 && !embs.is_empty()
             {
                 let mut mean = vec![0.0_f32; embs[0].len()];
@@ -3852,7 +4244,12 @@ pub(crate) fn run_internal() {
         "seeds": {
             // Classifier seed is fixed inside finalize_enrollment (voice.rs).
             "classifier": 0,
-            "verifier": 42,
+            // mahbot-1006 K: verifier seed is now null (entropy-based RNG),
+            // matching production's VoiceVerifier::train(None).  The old
+            // fixed Some(42) was deterministic but unrepresentative of the
+            // distribution of outcomes production users see.  Run the
+            // benchmark multiple times to observe verifier variance.
+            "verifier": null,
             "tts_warmup": 947,
         },
         "model_hashes": {
@@ -3866,35 +4263,160 @@ pub(crate) fn run_internal() {
         },
         "warmup_source": warmup_source,
         "train_test_split": {
-            "n_train": train_variants.len(),
+            "n_train_clips": train_clips.len(),
+            "n_test_clips": test_clips.len(),
+            "n_train": pos_sequences.len(),
             "n_test": pos_test_variants.len(),
-            "split": "2/3 : 1/3 by enrollment-list order (tail = test); \
+            "split": "2/3 : 1/3 by enrollment-clip list order (tail = test); \
+                      clips are split BEFORE AGC/VAD/augmentation (mahbot-1006 B/I), \
+                      so no augmented variant of a training clip leaks into the test set; \
                       per-augmentation rates are structurally biased toward \
                       later list positions and are disclosed, not corrected",
-            "train_variants": train_variants.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>(),
+            "train_clips": train_clips.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>(),
+            "test_clips": test_clips.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>(),
             "test_variants": pos_test_variants.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>(),
         },
     });
+
+    // ── JSON sub-objects (built separately to stay under serde_json's json!
+    // macro recursion limit — the main report object nests several levels) ──
+
+    // Detection summary: warm (pos_metrics) + cold-start (cold_metrics, mahbot-1006 D).
+    let detection_json = serde_json::json!({
+        "rate": if pos_metrics.total > 0 {
+            serde_json::Value::from(pos_metrics.detection_rate())
+        } else {
+            serde_json::Value::Null
+        },
+        "detected": pos_metrics.detected,
+        "total_positive": pos_metrics.total,
+        "no_tests_ran": pos_metrics.total == 0,
+        "miss_verdicts": verdict_counts,
+        "total_misses": pos_metrics.total - pos_metrics.detected,
+        // mahbot-1006 D: cold-start pass — fresh PipelineCtx per variant,
+        // no consume_warmup, fresh AdaptiveThresholdState::new() bootstrap.
+        // Measures production's post-silence start where the first
+        // VERIFIER_WARMUP_EMBEDDINGS embeddings are suppressed.
+        "cold_rate": if cold_metrics.total > 0 {
+            serde_json::Value::from(cold_metrics.detection_rate())
+        } else {
+            serde_json::Value::Null
+        },
+        "cold_detected": cold_metrics.detected,
+        "cold_total_positive": cold_metrics.total,
+        "cold_no_tests_ran": cold_metrics.total == 0,
+    });
+
+    // mahbot-1006 J: production gates enrollment on this self-test; the
+    // benchmark is report-only (mahbot-953) so it records the outcome
+    // instead.  When "passed" is false, the reported detection/FA numbers
+    // come from a model production would refuse to deploy.
+    let self_test_json = serde_json::json!({
+        "passed": self_test_result.is_ok(),
+        "error": self_test_result.as_ref().err().map(ToString::to_string),
+    });
+
+    let classifier_trigger_json = serde_json::json!({
+        "confusable": ct_to_json(&conf_classifier),
+        "confusable_by_tier": {
+            "easy": ct_to_json(&conf_classifier_by_tier[0]),
+            "medium": ct_to_json(&conf_classifier_by_tier[1]),
+            "hard": ct_to_json(&conf_classifier_by_tier[2]),
+        },
+        "unrelated": ct_to_json(&unrel_classifier),
+        "silence": ct_to_json(&silence_classifier),
+        "noise": {
+            "aggregate": ct_to_json(&noise_classifier_aggregate),
+            "per_profile": serde_json::Value::Object(
+                NOISE_PROFILES.iter().enumerate().map(|(i, (label, _))| {
+                    (label.to_string(), ct_to_json(&noise_classifier_per_profile[i]))
+                }).collect()
+            ),
+        },
+    });
+
+    let classifier_diagnostics_json = serde_json::json!({
+        "pos_scores_mean": pos_scores_mean,
+        "pos_scores_min": pos_scores_min,
+        "pos_scores_max": pos_scores_max,
+        "neg_scores_mean": neg_scores_mean,
+        "neg_scores_min": neg_scores_min,
+        "neg_scores_max": neg_scores_max,
+        "epochs_trained": epochs_trained,
+        "best_val_loss": best_val_loss,
+        "early_stop_reason": training_result.early_stop_reason,
+        "n_train_windows": training_result.n_train_windows,
+        "n_val_windows": training_result.n_val_windows,
+        "per_epoch_train_loss": training_result.per_epoch_train_loss,
+        "per_epoch_val_loss": training_result.per_epoch_val_loss,
+        "per_epoch_val_accuracy": training_result.per_epoch_val_accuracy,
+        "pos_scores_deciles": training_result.pos_scores_deciles,
+        "neg_scores_deciles": training_result.neg_scores_deciles,
+        "total_params": weights.param_count(),
+        "degenerate": degenerate,
+        "near_zero_frac": near_zero_frac,
+        "adaptive_threshold_trajectory": serde_json::Value::Object(
+            pos_metrics.per_variant.iter().enumerate().map(|(i, pv)| {
+                (format!("variant_{i}"), serde_json::json!({
+                    "variant": pv.variant,
+                    "trajectory": pv.adaptive_threshold_trajectory.clone(),
+                    "ceiling_limited_frames": pv.ceiling_limited_frames,
+                }))
+            }).collect()
+        ),
+        "discrimination": {
+            "pos_peak_scores": {
+                "deciles": deciles(&pos_peak_scores),
+                "n": pos_peak_scores.len(),
+            },
+            "neg_peak_scores": {
+                "deciles": deciles(&neg_peak_scores),
+                "n": neg_peak_scores.len(),
+            },
+            "pos_frames_below_min_threshold_frac": if pos_frame_crossing.0 > 0 {
+                pos_frame_crossing.1 as f64 / pos_frame_crossing.0 as f64
+            } else {
+                0.0
+            },
+            "neg_frames_above_min_threshold_frac": if neg_frame_crossing.0 > 0 {
+                neg_frame_crossing.1 as f64 / neg_frame_crossing.0 as f64
+            } else {
+                0.0
+            },
+            "pos_total_frames": pos_frame_crossing.0,
+            "neg_total_frames": neg_frame_crossing.0,
+        },
+    });
+
+    let noise_overlap_json = serde_json::Value::Object(
+        noise_overlap_results
+            .iter()
+            .map(|(key, rate, detail)| {
+                (
+                    key.clone(),
+                    serde_json::json!({
+                        "detection_rate": rate,
+                        "per_variant": detail,
+                    }),
+                )
+            })
+            .collect(),
+    );
 
     let json = serde_json::json!({
         "benchmark": "voice_pipeline_e2e",
         "_note": "Report-only benchmark — no pass/fail gating (mahbot-953). \
                   'passed' was removed in mahbot-1005: it was hardcoded true and \
-                  misleading.  Compare against the limits in 'results' instead.",
+                  misleading.  Compare against the limits in 'results' instead. \
+                  mahbot-1006 aligned the benchmark's training/inference \
+                  processing with production (AGC→augment ordering, cold-start \
+                  pass, CONFIG-driven preprocessor, preprocessed negatives, \
+                  verifier seed None) — detection/FA numbers are NOT directly \
+                  comparable to the mahbot-1004/948 baselines.",
         "total_false_accepts": total_false_accepts,
         "results": results_map,
-        "detection": {
-            "rate": if pos_metrics.total > 0 {
-                serde_json::Value::from(pos_metrics.detection_rate())
-            } else {
-                serde_json::Value::Null
-            },
-            "detected": pos_metrics.detected,
-            "total_positive": pos_metrics.total,
-            "no_tests_ran": pos_metrics.total == 0,
-            "miss_verdicts": verdict_counts,
-            "total_misses": pos_metrics.total - pos_metrics.detected,
-        },
+        "detection": detection_json,
+        "self_test": self_test_json,
         "false_accepts": {
             "confusable_easy": conf_fa_counts[0],
             "confusable_medium": conf_fa_counts[1],
@@ -3904,24 +4426,7 @@ pub(crate) fn run_internal() {
             "noise": noise_false_accepts.len(),
             "total": total_false_accepts,
         },
-        "classifier_trigger_metrics": {
-            "confusable": ct_to_json(&conf_classifier),
-            "confusable_by_tier": {
-                "easy": ct_to_json(&conf_classifier_by_tier[0]),
-                "medium": ct_to_json(&conf_classifier_by_tier[1]),
-                "hard": ct_to_json(&conf_classifier_by_tier[2]),
-            },
-            "unrelated": ct_to_json(&unrel_classifier),
-            "silence": ct_to_json(&silence_classifier),
-            "noise": {
-                "aggregate": ct_to_json(&noise_classifier_aggregate),
-                "per_profile": serde_json::Value::Object(
-                    NOISE_PROFILES.iter().enumerate().map(|(i, (label, _))| {
-                        (label.to_string(), ct_to_json(&noise_classifier_per_profile[i]))
-                    }).collect()
-                ),
-            },
-        },
+        "classifier_trigger_metrics": classifier_trigger_json,
         "phases": {
             "phase_1_enrollment_audio_ms": phase_times[P_ENROLLMENT_AUDIO],
             "phase_2_vad_enrollment_ms": phase_times[P_VAD_ENROLLMENT],
@@ -3942,15 +4447,14 @@ pub(crate) fn run_internal() {
         "per_variant_results": serde_json::Value::Array(
             pos_metrics.per_variant.iter().map(|pv| pv_to_json(pv, None)).collect()
         ),
-        "per_variant_negatives": serde_json::Value::Array(negative_pv),
-        "noise_overlap": serde_json::Value::Object(
-            noise_overlap_results.iter().map(|(key, rate, detail)| {
-                (key.clone(), serde_json::json!({
-                    "detection_rate": rate,
-                    "per_variant": detail,
-                }))
-            }).collect()
+        // mahbot-1006 D: cold-start pass per-variant detail (same schema as
+        // per_variant_results, but measured without consume_warmup / fresh
+        // adaptive bootstrap).  Empty when the classifier is degenerate.
+        "per_variant_results_cold": serde_json::Value::Array(
+            cold_metrics.per_variant.iter().map(|pv| pv_to_json(pv, None)).collect()
         ),
+        "per_variant_negatives": serde_json::Value::Array(negative_pv),
+        "noise_overlap": noise_overlap_json,
         "latency": {
             "mean_ms": if latency_samples > 0 {
                 serde_json::Value::from(lat_mean)
@@ -3969,58 +4473,7 @@ pub(crate) fn run_internal() {
             },
             "samples": latency_samples,
         },
-        "classifier_diagnostics": {
-            "pos_scores_mean": pos_scores_mean,
-            "pos_scores_min": pos_scores_min,
-            "pos_scores_max": pos_scores_max,
-            "neg_scores_mean": neg_scores_mean,
-            "neg_scores_min": neg_scores_min,
-            "neg_scores_max": neg_scores_max,
-            "epochs_trained": epochs_trained,
-            "best_val_loss": best_val_loss,
-            "early_stop_reason": training_result.early_stop_reason,
-            "n_train_windows": training_result.n_train_windows,
-            "n_val_windows": training_result.n_val_windows,
-            "per_epoch_train_loss": training_result.per_epoch_train_loss,
-            "per_epoch_val_loss": training_result.per_epoch_val_loss,
-            "per_epoch_val_accuracy": training_result.per_epoch_val_accuracy,
-            "pos_scores_deciles": training_result.pos_scores_deciles,
-            "neg_scores_deciles": training_result.neg_scores_deciles,
-            "total_params": weights.param_count(),
-            "degenerate": degenerate,
-            "near_zero_frac": near_zero_frac,
-            "adaptive_threshold_trajectory": serde_json::Value::Object(
-                pos_metrics.per_variant.iter().enumerate().map(|(i, pv)| {
-                    (format!("variant_{i}"), serde_json::json!({
-                        "variant": pv.variant,
-                        "trajectory": pv.adaptive_threshold_trajectory.clone(),
-                        "ceiling_limited_frames": pv.ceiling_limited_frames,
-                    }))
-                }).collect()
-            ),
-            "discrimination": {
-                "pos_peak_scores": {
-                    "deciles": deciles(&pos_peak_scores),
-                    "n": pos_peak_scores.len(),
-                },
-                "neg_peak_scores": {
-                    "deciles": deciles(&neg_peak_scores),
-                    "n": neg_peak_scores.len(),
-                },
-                "pos_frames_below_min_threshold_frac": if pos_frame_crossing.0 > 0 {
-                    pos_frame_crossing.1 as f64 / pos_frame_crossing.0 as f64
-                } else {
-                    0.0
-                },
-                "neg_frames_above_min_threshold_frac": if neg_frame_crossing.0 > 0 {
-                    neg_frame_crossing.1 as f64 / neg_frame_crossing.0 as f64
-                } else {
-                    0.0
-                },
-                "pos_total_frames": pos_frame_crossing.0,
-                "neg_total_frames": neg_frame_crossing.0,
-            },
-        },
+        "classifier_diagnostics": classifier_diagnostics_json,
         "verifier_diagnostics": {
             "trained": verifier.is_trained(),
             "threshold": verifier_training_threshold,
@@ -4369,6 +4822,21 @@ fn warmup_noise_produces_embeddings() {
          verifier warm-up period, but only produced {}",
         crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS,
         ctx.embedding_ring.len(),
+    );
+
+    // ── mahbot-1006 A: the audio preprocessor must be reset after warm-up ──
+    // The warm-up drives the AGC to a speech-adapted gain; the test utterance
+    // must start from lazy-init AGC state (matching training and production's
+    // reset_detection_segment).  A fresh preprocessor has fewer than 20
+    // AGC-active frames, so agc_converged() returns None.  (If the assertion
+    // below fails after a future change to the AGC convergence window, the
+    // preprocessor may still be fresh — check agc_active_frame_count instead.)
+    assert!(
+        ctx.audio_preprocessor.agc_converged().is_none(),
+        "AudioPreprocessor must be reset after warm-up (mahbot-1006 A): \
+         the warm-up-adapted AGC state must not carry into the test utterance. \
+         agc_converged() = {:?}",
+        ctx.audio_preprocessor.agc_converged(),
     );
 
     assert!(
