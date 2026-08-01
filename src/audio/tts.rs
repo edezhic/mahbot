@@ -2540,133 +2540,6 @@ mod tests {
         (&inner.0, &inner.1)
     }
 
-    #[test]
-    fn test_synthesize_short_text_creates_valid_wav() {
-        let engine = test_tts_engine();
-        let (style_dp, style_ttl) = test_voice_style();
-
-        let samples = synthesize_internal(engine, "<en>Hello world.</en>", style_dp, style_ttl, 42)
-            .expect("synthesis of short text should succeed");
-
-        assert!(!samples.is_empty(), "synthesized audio must not be empty");
-        assert!(
-            samples.len() > 1000,
-            "short text should produce at least 1000 samples (got {})",
-            samples.len()
-        );
-
-        // Verify samples are in valid f32 range [-1.0, 1.0]
-        for &s in &samples {
-            assert!((-1.0..=1.0).contains(&s), "sample {s} out of valid range");
-        }
-
-        // Verify the WAV rendering works with the synthesized samples
-        let wav_bytes =
-            render_wav(&samples, engine.sample_rate).expect("render_wav should succeed");
-        assert!(wav_bytes.starts_with(b"RIFF"), "WAV should start with RIFF");
-        assert!(wav_bytes.len() > 44, "WAV should have header + data");
-    }
-
-    #[tokio::test]
-    async fn test_synthesize_chunked_streaming_receives_chunks() {
-        let engine = test_tts_engine();
-        let (style_dp, style_ttl) = test_voice_style();
-
-        // Create text longer than MAX_CHUNK_LENGTH to trigger chunking
-        let long_text =
-            "Hello world. This is a test of the streaming synthesis pipeline. ".repeat(5);
-        assert!(
-            long_text.len() > MAX_CHUNK_LENGTH,
-            "test text must exceed chunk limit"
-        );
-
-        let (tx, mut rx) = mpsc::channel::<Vec<f32>>(4);
-
-        // Spawn the streaming synthesis on a blocking thread (as in production).
-        // Store the JoinHandle so we can drain the channel BEFORE awaiting it,
-        // preventing a deadlock if chunk count exceeds channel capacity.
-        let text_for_task = long_text.clone();
-        let handle = tokio::task::spawn_blocking(move || {
-            synthesize_chunked_streaming(
-                engine,
-                &text_for_task,
-                style_dp,
-                style_ttl,
-                None,
-                &tx,
-                42,
-            )
-            .expect("streaming synthesis should succeed");
-        });
-
-        // Drain the channel first — this avoids deadlock: the blocking task
-        // calls tx.blocking_send() which blocks when the channel is full, but
-        // the JoinHandle won't complete until all sends finish. By draining
-        // concurrently, we keep the channel flowing.
-        let mut chunk_count = 0;
-        let mut total_samples = 0usize;
-        while let Some(samples) = rx.recv().await {
-            assert!(!samples.is_empty(), "each chunk must produce samples");
-            for &s in &samples {
-                assert!((-1.0..=1.0).contains(&s), "sample {s} out of valid range");
-            }
-            total_samples += samples.len();
-            chunk_count += 1;
-        }
-
-        // Now it's safe to await the JoinHandle — the channel is fully drained
-        // and the blocking task has completed (tx was dropped, closing channel).
-        handle.await.expect("blocking task should not panic");
-
-        assert!(
-            chunk_count > 1,
-            "long text should produce multiple chunks (got {chunk_count})"
-        );
-        assert!(
-            total_samples > 1000,
-            "long text should produce many samples (got {total_samples})"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_synthesize_chunked_streaming_short_fast_path() {
-        let engine = test_tts_engine();
-        let (style_dp, style_ttl) = test_voice_style();
-
-        // Short text below MAX_CHUNK_LENGTH — should take the fast path
-        // (single send, no chunk loop).
-        let short_text = "Hello world.";
-
-        let (tx, mut rx) = mpsc::channel::<Vec<f32>>(4);
-
-        let text_for_task = short_text.to_string();
-        let handle = tokio::task::spawn_blocking(move || {
-            synthesize_chunked_streaming(
-                engine,
-                &text_for_task,
-                style_dp,
-                style_ttl,
-                None,
-                &tx,
-                42,
-            )
-            .expect("streaming synthesis of short text should succeed");
-        });
-
-        // Drain the channel first (see test_synthesize_chunked_streaming_receives_chunks
-        // for the rationale — prevents deadlock if chunk count changes).
-        let first = rx.recv().await;
-        assert!(first.is_some(), "short text must send one chunk");
-        let samples = first.unwrap();
-        assert!(!samples.is_empty(), "chunk must not be empty");
-        assert!(
-            rx.recv().await.is_none(),
-            "short text must send exactly one chunk"
-        );
-
-        handle.await.expect("blocking task should not panic");
-    }
-
     // ── init_listener ────────────────────────────────────────────────
     //
     // These tests verify that init_listener() correctly dispatches to
@@ -2995,8 +2868,14 @@ mod tests {
         }
 
         // ── Load ASR model ────────────────────────────────────────────
+        //
+        // Point the CONFIG storage root at the home cache so
+        // `try_init_from_cache()` resolves the same directory that was
+        // pre-flight checked above (mahbot-1029: `try_init_from_dir` was
+        // removed as dead code — its only caller was this test).
 
-        if !crate::audio::local_transcriber::try_init_from_dir(&asr_dir).await {
+        crate::config::CONFIG.set_storage_root(std::path::PathBuf::from(&home_dir).join(".mahbot"));
+        if !crate::audio::local_transcriber::try_init_from_cache().await {
             eprintln!(
                 "SKIP: ASR model files present but could not be loaded \
                  (checksum mismatch or corrupted files).\

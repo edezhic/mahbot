@@ -316,16 +316,17 @@ impl AudioPreprocessor {
             ns.process(&mut frame);
 
             output.extend_from_slice(&frame);
-        }
-
-        // Trim consumed samples when the buffer grows large enough.
+        } // Trim consumed samples when the buffer grows large enough.
         if self.read_pos >= NS_FRAME_SIZE * 32 {
             self.ns_buffer.drain(..self.read_pos);
             self.read_pos = 0;
         }
-
-        // Scale back to [-1.0, 1.0].
-        output.iter().map(|&s| s / 32768.0).collect()
+        // Scale back to [-1.0, 1.0] in place (mahbot-1029 D6 — avoids a
+        // second allocation on every chunk; identical float division).
+        for s in &mut output {
+            *s /= 32768.0;
+        }
+        output
     }
 
     /// Apply streaming EMA-based AGC to a chunk of audio.
@@ -583,7 +584,7 @@ mod tests {
         }
         let final_chunk = sine_tone(amp_quiet, chunk_len * 3, 16_000);
         let processed_quiet = pre.process(final_chunk);
-        let rms_quiet = compute_rms(&processed_quiet);
+        let rms_quiet = crate::util::compute_rms(&processed_quiet);
         let rel_err_quiet = (rms_quiet - target_rms).abs() / target_rms;
         assert!(
             rel_err_quiet < 0.15,
@@ -608,7 +609,7 @@ mod tests {
         }
         let final_loud = sine_tone(amp_loud, chunk_len * 3, 16_000);
         let processed_loud = pre.process(final_loud);
-        let rms_loud = compute_rms(&processed_loud);
+        let rms_loud = crate::util::compute_rms(&processed_loud);
         let rel_err_loud = (rms_loud - target_rms).abs() / target_rms;
         assert!(
             rel_err_loud < 0.15,
@@ -618,7 +619,7 @@ mod tests {
         // ── Silence should not be amplified ──
         let silence = vec![0.0f32; chunk_len * 2];
         let processed_silence = pre.process(silence);
-        let rms_silence = compute_rms(&processed_silence);
+        let rms_silence = crate::util::compute_rms(&processed_silence);
         assert!(
             rms_silence < 0.001,
             "silence should not be amplified: rms={rms_silence:.8}"
@@ -663,7 +664,7 @@ mod tests {
         let amp_quiet = target_rms * 0.25 * sqrt2;
         let first_chunk = sine_tone(amp_quiet, chunk_len, 16_000);
         let first_processed = pre.process(first_chunk);
-        let first_rms = compute_rms(&first_processed);
+        let first_rms = crate::util::compute_rms(&first_processed);
         let input_rms = target_rms * 0.25;
         let mut prev_gain = if input_rms > 0.0 {
             first_rms / input_rms
@@ -673,7 +674,7 @@ mod tests {
         for _ in 1..15 {
             let chunk = sine_tone(amp_quiet, chunk_len, 16_000);
             let processed = pre.process(chunk);
-            let rms = compute_rms(&processed);
+            let rms = crate::util::compute_rms(&processed);
             // Gain is output_rms / input_rms. Input RMS ≈ amp_quiet / sqrt2 = 0.25 * target_rms.
             let input_rms = target_rms * 0.25;
             let gain = if input_rms > 0.0 {
@@ -695,7 +696,7 @@ mod tests {
         for _ in 0..15 {
             let chunk = sine_tone(amp_loud, chunk_len, 16_000);
             let processed = pre.process(chunk);
-            let rms = compute_rms(&processed);
+            let rms = crate::util::compute_rms(&processed);
             let input_rms = target_rms * 4.0;
             let gain = if input_rms > 0.0 {
                 rms / input_rms
@@ -719,7 +720,7 @@ mod tests {
         for _ in 0..40 {
             let chunk = sine_tone(amp_quiet, chunk_len, 16_000);
             let processed = pre.process(chunk);
-            let rms = compute_rms(&processed);
+            let rms = crate::util::compute_rms(&processed);
             let input_rms = target_rms * 0.25;
             let gain = if input_rms > 0.0 {
                 rms / input_rms
@@ -777,7 +778,7 @@ mod tests {
         for _ in 0..60 {
             let noise = white_noise(0.20, chunk_size);
             let processed = pre.process(noise);
-            all_output_rms += compute_rms(&processed);
+            all_output_rms += crate::util::compute_rms(&processed);
             num_chunks += 1;
         }
 
@@ -808,14 +809,7 @@ mod tests {
     }
 
     // ── Helpers ──────────────────────────────────────────────────
-
-    fn compute_rms(samples: &[f32]) -> f32 {
-        if samples.is_empty() {
-            return 0.0;
-        }
-        let sum_sq: f32 = samples.iter().map(|&s| s * s).sum();
-        (sum_sq / samples.len() as f32).sqrt()
-    }
+    // (`compute_rms` shared via `crate::util::compute_rms` — mahbot-1029.)
 
     /// Test that the silence-first guard prevents division by zero when the
     /// very first chunk is pure silence (mahbot-856 lazy init).
@@ -848,7 +842,7 @@ mod tests {
         let amp_quiet = target_rms * 0.25 * sqrt2;
         let speech = sine_tone(amp_quiet, chunk_len, 16_000);
         let processed = pre.process(speech);
-        let rms = compute_rms(&processed);
+        let rms = crate::util::compute_rms(&processed);
         let rel_err = (rms - target_rms).abs() / target_rms;
         assert!(
             rel_err < 0.15,
@@ -877,7 +871,7 @@ mod tests {
         let amp_quiet = target_rms * 0.25 * sqrt2;
         let chunk1 = sine_tone(amp_quiet, chunk_len, 16_000);
         let processed1 = pre.process(chunk1);
-        let rms1 = compute_rms(&processed1);
+        let rms1 = crate::util::compute_rms(&processed1);
         let rel_err1 = (rms1 - target_rms).abs() / target_rms;
         assert!(
             rel_err1 < 0.15,
@@ -891,7 +885,7 @@ mod tests {
         // init fires and applies MAX_GAIN immediately.
         let chunk2 = sine_tone(amp_quiet, chunk_len, 16_000);
         let processed2 = pre.process(chunk2);
-        let rms2 = compute_rms(&processed2);
+        let rms2 = crate::util::compute_rms(&processed2);
         let rel_err2 = (rms2 - target_rms).abs() / target_rms;
         assert!(
             rel_err2 < 0.15,

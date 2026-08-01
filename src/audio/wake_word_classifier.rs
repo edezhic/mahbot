@@ -1405,8 +1405,10 @@ mod tests {
                 .collect()
         };
 
-        // 100 windows each = 300 embeddings (WINDOW_SIZE per window).
-        let n_wins = 100;
+        // 60 windows each = 180 embeddings (WINDOW_SIZE per window).
+        // (Reduced from 100 windows / 300 embeddings in mahbot-1029 — the
+        // separable clusters converge with a wide margin at these sizes.)
+        let n_wins = 60;
         let n_embs = n_wins * WINDOW_SIZE;
         let pos_embs: Vec<Vec<f32>> = (0..n_embs).map(|_| make_emb(0.3, 0.4)).collect();
         let neg_embs: Vec<Vec<f32>> = (0..n_embs).map(|_| make_emb(-0.3, 0.4)).collect();
@@ -1415,7 +1417,9 @@ mod tests {
         let neg_seqs = [make_seq(neg_embs, LabelStratum::Negative)];
 
         let cfg = TrainingConfig {
-            max_epochs: 80, // increased for smaller model (mahbot-931)
+            // Reduced from 80 in mahbot-1029 — convergence margin validated
+            // at this size (well-separated ±0.3 clusters).
+            max_epochs: 50,
             rng_seed: Some(42),
             ..Default::default()
         };

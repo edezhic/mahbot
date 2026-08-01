@@ -750,8 +750,7 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
 
 /// Shared initialization logic — checks files, verifies checksums, loads the
 /// model from `dir`, and stores it into [`GLOBAL_TRANSCRIBER`].  The caller
-/// (either [`try_init_from_cache`] or [`try_init_from_dir`]) is responsible
-/// for the STATE atomic guard.
+/// ([`try_init_from_cache`]) is responsible for the STATE atomic guard.
 async fn try_init_inner(dir: PathBuf) -> bool {
     let model_path = dir.join(MODEL_FILENAME);
     let vocab_path = dir.join(VOCAB_FILENAME);
@@ -847,21 +846,6 @@ pub async fn try_init_from_cache() -> bool {
     };
 
     try_init_inner(dir).await
-}
-
-/// Initialise the local transcriber from an explicit model directory.
-///
-/// This is the same as [`try_init_from_cache`] but uses the provided
-/// `dir` instead of resolving via `model_dir()`.  Useful when the
-/// caller knows the exact cache path and cannot rely on the CONFIG
-/// storage root (e.g. in tests).
-#[allow(dead_code)]
-pub(crate) async fn try_init_from_dir(dir: &Path) -> bool {
-    if let Some(result) = try_lock_init() {
-        return result;
-    }
-
-    try_init_inner(dir.to_owned()).await
 }
 
 /// True if the local transcriber is loaded and ready for use.

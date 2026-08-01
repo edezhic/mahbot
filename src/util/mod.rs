@@ -985,6 +985,143 @@ pub(crate) fn apply_gain(pcm: &[f32], gain_db: f32) -> Vec<f32> {
     pcm.iter().map(|&s| s * amp).collect()
 }
 
+/// Available noise types for augmentation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg(feature = "voice-tests")]
+pub(crate) enum NoiseType {
+    /// White noise (uniform spectral density).
+    White,
+    /// Pink noise (1/f spectral density — more natural).
+    Pink,
+}
+
+/// Compute the RMS (root mean square) of audio samples.
+#[allow(clippy::cast_precision_loss)]
+#[cfg(any(test, feature = "voice-tests"))]
+pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f32 = samples.iter().map(|&s| s * s).sum();
+    (sum_sq / samples.len() as f32).sqrt()
+}
+
+/// Mix white or pink noise into audio at a given SNR (dB).
+///
+/// When `rng_seed` is `Some(seed)`, uses a deterministic seeded RNG for
+/// reproducible output. When `None`, uses an entropy-seeded RNG (current
+/// non-deterministic behavior). The deterministic path is used by the
+/// benchmark to ensure stable training data across re-runs (mahbot-906).
+///
+/// # Arguments
+///
+/// * `samples` — Clean audio PCM f32 in [-1.0, 1.0].
+/// * `snr_db` — Desired signal-to-noise ratio in dB (typical: 10-25).
+///   Lower values = more noise. Must be finite.
+/// * `noise_type` — [`NoiseType::White`] or [`NoiseType::Pink`].
+/// * `rng_seed` — Optional seed for deterministic RNG. `Some(seed)` produces
+///   reproducible noise; `None` uses entropy-based seeding.
+///
+/// # Returns
+///
+/// Noisy audio PCM f32 in [-1.0, 1.0] (clamped).
+///
+/// # Note (mahbot-1029)
+///
+/// This is the former `tts_data_gen::add_noise` (4-arg) relocated unchanged.
+/// It is a DIFFERENT implementation from the 3-arg [`add_noise`] above
+/// (different RNG consumption and degenerate-signal behavior); both feed
+/// the bench's seeded cross-speaker negative embeddings, so they must
+/// never be merged.
+#[must_use]
+#[cfg(feature = "voice-tests")]
+pub(crate) fn add_noise_white_pink(
+    samples: &[f32],
+    snr_db: f32,
+    noise_type: NoiseType,
+    rng_seed: Option<u64>,
+) -> Vec<f32> {
+    if samples.is_empty() || !snr_db.is_finite() {
+        return samples.to_vec();
+    }
+
+    // Create a seeded or entropy-based RNG, matching the canonical
+    // Option<u64> → StdRng pattern (voice_verifier.rs, mahbot-906).
+    // When None, we seed from rand::random() rather than using the
+    // thread-local generator directly, isolating RNG state.
+    let mut rng: rand::rngs::StdRng = match rng_seed {
+        Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
+        None => rand::rngs::StdRng::seed_from_u64(rand::random()),
+    };
+
+    // Generate noise using the single RNG for both white and pink branches.
+    let noise: Vec<f32> = match noise_type {
+        NoiseType::White => {
+            // Uniform white noise in [-1.0, 1.0]
+            (0..samples.len())
+                .map(|_| rng.random::<f32>() * 2.0 - 1.0)
+                .collect()
+        }
+        NoiseType::Pink => {
+            // Voss-McCartney pink noise via the canonical seeded implementation
+            generate_pink_noise(samples.len(), &mut rng)
+        }
+    };
+
+    // Compute RMS of signal and noise
+    let signal_rms = compute_rms(samples);
+    let noise_rms = compute_rms(&noise);
+
+    if signal_rms <= 1e-10 || noise_rms <= 1e-10 {
+        return samples.to_vec(); // Degenerate case — no scaling
+    }
+
+    // SNR = 20 * log10(signal_rms / noise_rms * scale)
+    // scale = signal_rms / noise_rms * 10^(-SNR/20)
+    let scale = (signal_rms / noise_rms) * 10.0_f32.powf(-snr_db / 20.0);
+
+    // Mix
+    let mut result = Vec::with_capacity(samples.len());
+    for (&s, &n) in samples.iter().zip(noise.iter()) {
+        result.push((s + n * scale).clamp(-1.0, 1.0));
+    }
+    result
+}
+
+/// Apply speed perturbation by resampling.
+///
+/// Changes both speed and pitch (time-domain resampling). For wake word
+/// training data diversity, this is acceptable and does not require
+/// pitch-preserving time-stretching.
+///
+/// # Arguments
+///
+/// * `samples` — Audio PCM f32 at `sample_rate`.
+/// * `sample_rate` — Original sample rate in Hz.
+/// * `factor` — Speed factor: >1.0 = faster (fewer samples), <1.0 = slower
+///   (more samples). Typical range: 0.8-1.2 (±20%).
+///
+/// # Returns
+///
+/// Speed-adjusted audio at the original `sample_rate`.
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+pub(crate) fn speed_perturbation(samples: &[f32], sample_rate: u32, factor: f32) -> Vec<f32> {
+    if samples.is_empty() || (factor - 1.0).abs() < 1e-6 {
+        return samples.to_vec();
+    }
+    // Speed perturbation via resampling: change the effective rate
+    // new_rate = sample_rate * factor
+    let effective_rate = (sample_rate as f32 * factor) as u32;
+    // Resample from effective_rate back to sample_rate
+    // This produces the same duration as original but with shifted pitch
+    resample_audio(samples, effective_rate, sample_rate)
+}
+
 #[cfg(test)]
 mod strip_ansi_escapes_tests {
     use super::strip_ansi_escapes;

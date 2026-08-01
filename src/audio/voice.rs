@@ -50,7 +50,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -938,6 +938,40 @@ async fn prewarm_phrase_embeddings(
                     _ => Source::Unrelated,
                 };
 
+                // ── Embedding-level cache (mahbot-1029 D1) ──
+                // The per-utterance dense embeddings are deterministic, so a
+                // warm run can skip AGC + VAD + ONNX entirely.  The cached
+                // variants are pushed through the same helper the miss path
+                // uses, guaranteeing byte-identical sequences.
+                let cache_key =
+                    embedding_cache_key(phrase_type, phrase, style, seed, &model_hash, pre_config);
+                let emb_cache_dir = embedding_cache_dir();
+                let mut utterance_variants: Vec<(u8, Vec<Vec<f32>>)> = Vec::new();
+                let mut push_seq = |embs: Vec<Vec<f32>>, vi: usize| {
+                    if !embs.is_empty() {
+                        dense_sequences.push(EmbeddingSequence::negative(
+                            UtteranceId {
+                                sequence_index: phrase_index_for_id,
+                                variant_index: vi,
+                            },
+                            source,
+                            None,
+                            embs.clone(),
+                        ));
+                        // Variant indices are 0..=4 by construction.
+                        utterance_variants
+                            .push((u8::try_from(vi).expect("variant index fits in u8"), embs));
+                    }
+                };
+                if let (Some(dir), Some(key)) = (&emb_cache_dir, &cache_key)
+                    && let Some(variants) = read_embedding_cache(dir, key)
+                {
+                    for (vi, embs) in variants {
+                        push_seq(embs, usize::from(vi));
+                    }
+                    continue;
+                }
+
                 // Load PCM — from disk cache (preferred) or synthesise fresh.
                 let pcm = if let Some(ref cache_dir) = cache_dir {
                     synthesize_with_pcm_cache(
@@ -1003,21 +1037,6 @@ async fn prewarm_phrase_embeddings(
                     continue;
                 }
 
-                // Helper: push one dense embedding sequence.
-                let mut push_seq = |embs: Vec<Vec<f32>>, vi: usize| {
-                    if !embs.is_empty() {
-                        dense_sequences.push(EmbeddingSequence::negative(
-                            UtteranceId {
-                                sequence_index: phrase_index_for_id,
-                                variant_index: vi,
-                            },
-                            source,
-                            None,
-                            embs,
-                        ));
-                    }
-                };
-
                 // ── 3. Original — embeddings from the streaming mel frames ──
                 // (mahbot-1009) Windows are anchored at the first speech frame
                 // (mel frame 0 = first VAD-positive hop), not at TTS sample 0
@@ -1053,14 +1072,19 @@ async fn prewarm_phrase_embeddings(
                     .saturating_sub(2 * CONTEXT_PADDING_SAMPLES);
                 let pre_pad_ms = (pre_pad_samples as u64 * 1000) / u64::from(SAMPLE_RATE);
                 let speed_up_opt = if pre_pad_ms >= 500 {
-                    Some(speed_perturbation(&speech_audio, SAMPLE_RATE, 1.05))
+                    Some(crate::util::speed_perturbation(
+                        &speech_audio,
+                        SAMPLE_RATE,
+                        1.05,
+                    ))
                 } else {
                     None
                 };
                 let noise_pcm = crate::util::add_noise(&speech_audio, 25.0, seed);
 
                 // 2. Speed-down (0.95×) — variant_index 1
-                let speed_down_pcm = speed_perturbation(&speech_audio, SAMPLE_RATE, 0.95);
+                let speed_down_pcm =
+                    crate::util::speed_perturbation(&speech_audio, SAMPLE_RATE, 0.95);
                 let dense_embs =
                     extract_embeddings_from_audio(models, &speed_down_pcm).unwrap_or_default();
                 push_seq(dense_embs, 1);
@@ -1081,6 +1105,17 @@ async fn prewarm_phrase_embeddings(
                 let dense_embs =
                     extract_embeddings_from_audio(models, &noise_pcm).unwrap_or_default();
                 push_seq(dense_embs, 4);
+
+                // ── Persist the per-utterance embedding cache (mahbot-1029 D1) ──
+                // Best-effort: a write failure only costs a recompute on the
+                // next run.  Nothing is written when no variant produced
+                // embeddings (e.g. no VAD-positive speech) — the miss path
+                // would reproduce the same empty result.
+                if !utterance_variants.is_empty()
+                    && let (Some(dir), Some(key)) = (&emb_cache_dir, &cache_key)
+                {
+                    write_embedding_cache(dir, key, &utterance_variants);
+                }
             }
         }
 
@@ -3029,30 +3064,6 @@ fn is_mic_permission_error(err: &anyhow::Error) -> bool {
         || msg.to_lowercase().contains("access denied")
 }
 
-/// Convert multi-channel audio to mono by averaging channels.
-/// Kept for test use; production uses the fused [`convert_and_send_audio_to_pipeline`].
-#[cfg(test)]
-fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
-    if channels == 1 {
-        return samples.to_vec();
-    }
-    let ch = channels as usize;
-    let frames = samples.len() / ch;
-    let remainder = samples.len() % ch;
-    if remainder != 0 {
-        warn!(
-            "to_mono: discarding {remainder} sample(s) from non-aligned audio (channels={channels})",
-        );
-    }
-    let mut mono = Vec::with_capacity(frames);
-    for f in 0..frames {
-        let start = f * ch;
-        let sum: f32 = samples[start..start + ch].iter().sum();
-        mono.push(sum / f32::from(channels));
-    }
-    mono
-}
-
 #[allow(clippy::cast_possible_truncation)]
 fn samples_to_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     let header_size = 44;
@@ -3342,6 +3353,125 @@ pub(crate) fn voice_cache_dir() -> Option<PathBuf> {
     Some(root.join(VOICE_CACHE_DIR))
 }
 
+// ── Embedding-level cache for the deterministic prewarm path (mahbot-1029 D1) ──
+//
+// The per-utterance (phrase × style × seed) dense embeddings produced by
+// `prewarm_phrase_embeddings` are deterministic: fixed TTS seeds, cached
+// PCM, deterministic earshot VAD + ONNX inference.  Yet every cold process
+// recomputes them (~200 utterances × 5 variants of ONNX work, the dominant
+// bench Phase 3 cost).  This disk cache stores the per-utterance variant
+// embeddings so warm runs (and warm app starts) skip the ONNX extraction.
+//
+// Key correctness requirement: the key MUST include BOTH ONNX model file
+// hashes (mel + embed) plus the preprocessor toggles plus the PCM key
+// inputs (phrase/style/seed).  A key with only the TTS model hash would
+// silently reuse stale embeddings after a voice ONNX model swap.
+
+const EMBEDDING_CACHE_SUBDIR: &str = "embeddings_cache";
+
+/// Sub-directory of the voice cache used for the embedding cache.
+fn embedding_cache_dir() -> Option<PathBuf> {
+    Some(voice_cache_dir()?.join(EMBEDDING_CACHE_SUBDIR))
+}
+
+/// SHA-256 hex of the mel + embedding ONNX model files (once per process).
+static ONNX_MODELS_HASH: OnceLock<Option<String>> = OnceLock::new();
+
+fn onnx_models_hash() -> Option<&'static str> {
+    ONNX_MODELS_HASH
+        .get_or_init(|| {
+            let dir = model_dir()?;
+            let mel = std::fs::read(dir.join(MEL_MODEL_FILENAME)).ok()?;
+            let embed = std::fs::read(dir.join(EMBED_MODEL_FILENAME)).ok()?;
+            let mut hasher = Sha256::new();
+            hasher.update(&mel);
+            hasher.update(&embed);
+            Some(hex_string(&hasher.finalize()))
+        })
+        .as_deref()
+}
+
+/// Deterministic cache key for one prewarm utterance.
+///
+/// Covers: the existing PCM cache key (phrase + style + seed + sample rate +
+/// TTS model hash), the preprocessor NS/AGC toggles, and SHA-256 of both
+/// ONNX model files.  A key missing the ONNX hashes would silently reuse
+/// stale embeddings after a voice ONNX model swap; a key missing the TTS
+/// model hash would reuse stale embeddings after a TTS model swap.
+fn embedding_cache_key(
+    phrase_type: &str,
+    phrase: &str,
+    style: &str,
+    seed: u64,
+    model_hash: &str,
+    pre_config: crate::audio::audio_preprocessor::PreprocessorConfig,
+) -> Option<String> {
+    let onnx_hash = onnx_models_hash()?;
+    let pcm_key = pcm_cache_key(phrase, style, seed, SAMPLE_RATE, model_hash);
+    let mut hasher = Sha256::new();
+    hasher.update(phrase_type.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(pcm_key.as_bytes());
+    hasher.update([0u8]);
+    hasher.update([u8::from(pre_config.noise_suppression)]);
+    hasher.update([u8::from(pre_config.agc)]);
+    hasher.update(onnx_hash.as_bytes());
+    Some(hex_string(&hasher.finalize()))
+}
+
+/// Read a cached per-utterance variant list: `(variant_index, embeddings)`.
+fn read_embedding_cache(dir: &Path, key: &str) -> Option<Vec<(u8, Vec<Vec<f32>>)>> {
+    let data = std::fs::read(dir.join(key)).ok()?;
+    let mut cur = 0usize;
+    let n_variants = u32::from_le_bytes(data.get(cur..cur + 4)?.try_into().ok()?) as usize;
+    cur += 4;
+    let mut variants: Vec<(u8, Vec<Vec<f32>>)> = Vec::with_capacity(n_variants);
+    for _ in 0..n_variants {
+        let vi = *data.get(cur)?;
+        cur += 1;
+        let n_embs = u32::from_le_bytes(data.get(cur..cur + 4)?.try_into().ok()?) as usize;
+        cur += 4;
+        let mut embs = Vec::with_capacity(n_embs);
+        for _ in 0..n_embs {
+            let n_floats = u32::from_le_bytes(data.get(cur..cur + 4)?.try_into().ok()?) as usize;
+            cur += 4;
+            let mut emb = Vec::with_capacity(n_floats);
+            for _ in 0..n_floats {
+                let bytes: [u8; 4] = data.get(cur..cur + 4)?.try_into().ok()?;
+                cur += 4;
+                emb.push(f32::from_le_bytes(bytes));
+            }
+            embs.push(emb);
+        }
+        variants.push((vi, embs));
+    }
+    Some(variants)
+}
+
+/// Write a per-utterance variant list to the embedding cache (best-effort).
+#[allow(clippy::cast_possible_truncation)]
+fn write_embedding_cache(dir: &Path, key: &str, variants: &[(u8, Vec<Vec<f32>>)]) {
+    let _ = std::fs::create_dir_all(dir);
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(&(variants.len() as u32).to_le_bytes());
+    for (vi, embs) in variants {
+        data.push(*vi);
+        data.extend_from_slice(&(embs.len() as u32).to_le_bytes());
+        for emb in embs {
+            data.extend_from_slice(&(emb.len() as u32).to_le_bytes());
+            for &v in emb {
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    // Atomic write (tmp + rename) matching the PCM cache pattern.
+    let path = dir.join(key);
+    let tmp_path = path.with_extension("tmp");
+    if std::fs::write(&tmp_path, &data).is_ok() {
+        let _ = std::fs::rename(&tmp_path, &path);
+    }
+}
+
 /// Write PCM f32 samples to the disk cache atomically.
 ///
 /// Writes to a `.tmp` file first, then atomically renames to the final path,
@@ -3450,16 +3580,27 @@ pub(crate) fn synthesize_with_pcm_cache(
     //
     // This performs a full directory scan on every cache miss.  During cold
     // enrollment the startup call (prewarm_phrase_embeddings) has just cleaned
-    // the cache, so these per-write scans are strictly redundant — but they
-    // provide a correctness safety net for any future code path that writes to
-    // the cache without going through prewarming (e.g., from agent tools).
-    // The cost at current scale (~120 entries, 30 ms per scan) is negligible.
-    evict_pcm_cache(cache_dir);
+    // the cache, so these per-write scans are strictly redundant — they provide
+    // a correctness safety net for any future code path that writes to the
+    // cache without going through prewarming (e.g., from agent tools).
+    // The scan is gated to run ONCE per process (mahbot-1029): the prewarm
+    // pass already bounds the cache, and per-miss scans only add ~30 ms × N
+    // of directory I/O to the enrollment/benchmark burst.  The first miss in
+    // each process still evicts, preserving the safety net.
+    if !PCM_EVICTION_RAN.swap(true, Ordering::Relaxed) {
+        evict_pcm_cache(cache_dir);
+    }
 
     // Write to disk cache atomically
     write_pcm_cache(&cache_path, &pcm);
     Some(pcm)
 }
+
+/// One-shot guard for the per-miss [`evict_pcm_cache`] scan in
+/// [`synthesize_with_pcm_cache`] (mahbot-1029 D6).  See the comment at the
+/// call site — the scan is strictly redundant after prewarming, so it runs
+/// at most once per process.
+static PCM_EVICTION_RAN: AtomicBool = AtomicBool::new(false);
 
 /// Verify a file's SHA256 hash matches the expected value.
 fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
@@ -7059,29 +7200,14 @@ fn check_enrollment_utterance_length(
 // PCM augmentation (mahbot-878)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Apply speed perturbation via resampling (anti-alias safe).
+/// Speed perturbation via [`crate::util::speed_perturbation`] (anti-alias safe).
 ///
 /// Delegates to [`crate::util::resample_audio`] for proper anti-aliasing
 /// filtering and f64-precision interpolation (mahbot-878).  A `rate` of 1.0
 /// returns the original unchanged.  `rate < 1.0` slows down (adds samples),
 /// `rate > 1.0` speeds up (removes samples).  The ticket uses 0.95 (slow down)
 /// and 1.05 (speed up).
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss
-)]
-fn speed_perturbation(pcm: &[f32], sample_rate: u32, rate: f32) -> Vec<f32> {
-    if pcm.is_empty() || (rate - 1.0).abs() < 1e-6 {
-        return pcm.to_vec();
-    }
-    // Speed perturbation via resampling: change the effective rate
-    // new_rate = sample_rate * rate, then resample back to sample_rate.
-    // This produces the same duration but with shifted pitch.
-    let effective_rate = (sample_rate as f32 * rate) as u32;
-    crate::util::resample_audio(pcm, effective_rate, sample_rate)
-}
-
+///
 // ═══════════════════════════════════════════════════════════════════════════
 // Implementation note: `apply_gain`, `generate_pink_noise`, and `add_noise`
 // are defined in `crate::util` (mahbot-878 canonical implementations).
@@ -7130,11 +7256,11 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     // Generate variants — all deterministic, no RNG dependency except the
     // seeded noise generator.
     let original = samples.clone();
-    let speed_down = speed_perturbation(&samples, SAMPLE_RATE, 0.95);
+    let speed_down = crate::util::speed_perturbation(&samples, SAMPLE_RATE, 0.95);
     let speed_up = if skip_speed_up {
         None
     } else {
-        Some(speed_perturbation(&samples, SAMPLE_RATE, 1.05))
+        Some(crate::util::speed_perturbation(&samples, SAMPLE_RATE, 1.05))
     };
     let volume_down = crate::util::apply_gain(&samples, -3.0);
     let noise = crate::util::add_noise(&samples, 25.0, noise_seed);
@@ -11161,6 +11287,71 @@ mod tests {
         assert_eq!(a, b, "same inputs must produce same cache key");
     }
 
+    // ── Embedding cache roundtrip (mahbot-1029 D1) ─────────────────────────
+
+    #[test]
+    fn embedding_cache_roundtrip_preserves_embeddings_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "test_key_roundtrip";
+        let variants: Vec<(u8, Vec<Vec<f32>>)> = vec![
+            (0, vec![vec![1.5f32; 96], vec![-2.25f32; 96]]),
+            (3, vec![vec![0.0f32; 96]]),
+            (4, Vec::new()),
+        ];
+        write_embedding_cache(dir.path(), key, &variants);
+        let loaded = read_embedding_cache(dir.path(), key).expect("cache must be readable");
+        assert_eq!(loaded, variants, "roundtrip must be byte-exact");
+        // A missing key returns None (no panic).
+        assert!(read_embedding_cache(dir.path(), "no_such_key").is_none());
+    }
+
+    #[test]
+    fn embedding_cache_key_changes_with_preprocessor_and_pcm_key() {
+        // Graceful-skip when the ONNX models are absent (fresh machine).
+        if onnx_models_hash().is_none() {
+            eprintln!("SKIP: voice ONNX models not cached — skipping key-sensitivity test");
+            return;
+        }
+        let cfg_a = crate::audio::audio_preprocessor::PreprocessorConfig {
+            noise_suppression: true,
+            agc: true,
+        };
+        let cfg_b = crate::audio::audio_preprocessor::PreprocessorConfig {
+            noise_suppression: false,
+            agc: true,
+        };
+        let k1 = embedding_cache_key("confusable", "hey mahbot", "M1.json", 42, "tts_hash", cfg_a)
+            .expect("models present");
+        let k2 = embedding_cache_key("confusable", "hey mahbot", "M1.json", 42, "tts_hash", cfg_a)
+            .expect("models present");
+        assert_eq!(k1, k2, "same inputs must produce the same key");
+        assert_ne!(
+            k1,
+            embedding_cache_key("confusable", "hey mahbot", "M1.json", 42, "tts_hash", cfg_b)
+                .expect("models present"),
+            "NS/AGC toggles must change the key"
+        );
+        assert_ne!(
+            k1,
+            embedding_cache_key(
+                "confusable",
+                "hey mahbot",
+                "M1.json",
+                42,
+                "other_tts_hash",
+                cfg_a
+            )
+            .expect("models present"),
+            "TTS model hash must change the key"
+        );
+        assert_ne!(
+            k1,
+            embedding_cache_key("confusable", "hey mahbot", "M1.json", 43, "tts_hash", cfg_a)
+                .expect("models present"),
+            "TTS seed must change the key"
+        );
+    }
+
     #[test]
     fn test_pcm_cache_key_sensitivity_to_text() {
         let h = |text| pcm_cache_key(text, "default", 42, 16000, "test_hash");
@@ -11204,7 +11395,7 @@ mod tests {
     fn test_speed_perturbation_identity() {
         // rate=1.0 should return approximately the original
         let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
-        let result = speed_perturbation(&pcm, 16000, 1.0);
+        let result = crate::util::speed_perturbation(&pcm, 16000, 1.0);
         assert_eq!(result.len(), pcm.len(), "identity should preserve length");
         for (a, b) in pcm.iter().zip(result.iter()) {
             assert!((a - b).abs() < 1e-5, "identity should preserve values");
@@ -11215,13 +11406,13 @@ mod tests {
     fn test_speed_perturbation_rates() {
         // Slow down: rate=0.5 should produce more samples
         let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
-        let slowed = speed_perturbation(&pcm, 16000, 0.5);
+        let slowed = crate::util::speed_perturbation(&pcm, 16000, 0.5);
         assert!(
             slowed.len() > pcm.len(),
             "rate < 1 should increase sample count"
         );
         // Speed up: rate=2.0 should produce fewer samples
-        let sped_up = speed_perturbation(&pcm, 16000, 2.0);
+        let sped_up = crate::util::speed_perturbation(&pcm, 16000, 2.0);
         assert!(
             sped_up.len() < pcm.len(),
             "rate > 1 should decrease sample count"
@@ -11232,8 +11423,8 @@ mod tests {
     fn test_speed_perturbation_determinism() {
         // Same input + same rate → same output
         let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
-        let a = speed_perturbation(&pcm, 16000, 0.95);
-        let b = speed_perturbation(&pcm, 16000, 0.95);
+        let a = crate::util::speed_perturbation(&pcm, 16000, 0.95);
+        let b = crate::util::speed_perturbation(&pcm, 16000, 0.95);
         assert_eq!(a, b, "deterministic speed perturbation");
     }
 
@@ -11333,8 +11524,8 @@ mod tests {
     fn test_augmentation_variants_are_different() {
         // Verify that the 4 augmentation strategies produce different results
         let pcm: Vec<f32> = (0..500).map(|i| (i as f32 - 250.0) / 250.0).collect();
-        let speed_down = speed_perturbation(&pcm, 16000, 0.95);
-        let speed_up = speed_perturbation(&pcm, 16000, 1.05);
+        let speed_down = crate::util::speed_perturbation(&pcm, 16000, 0.95);
+        let speed_up = crate::util::speed_perturbation(&pcm, 16000, 1.05);
         let volume_down = apply_gain(&pcm, -3.0);
         let noise = add_noise(&pcm, 25.0, 42);
 
@@ -12158,14 +12349,6 @@ mod tests {
         assert_eq!(snap.lifetime_avg_embedding_latency_ns(), 100_000);
     }
 
-    #[test]
-    fn voice_metrics_get_metrics_does_not_panic() {
-        // get_voice_metrics() accesses global statics.  It should never panic
-        // regardless of the state of those statics — this test just verifies
-        // the function call succeeds.
-        let _snap = get_voice_metrics();
-    }
-
     // ── Activation trace buffer tests (mahbot-897) ──────────────────────────
     // These test the pure ActivationTraceBuffer FIFO eviction, iteration,
     // and candidate ID logic without any pipeline state.
@@ -12212,7 +12395,9 @@ mod tests {
     }
 
     #[test]
-    fn model_hash_changes_when_phrase_changes() {
+    fn model_hash_changes_when_any_field_changes() {
+        // (Consolidated from three per-field tests in mahbot-1029 — the
+        // hash must change when ANY canonical field changes.)
         let hash_base = compute_model_hash(&test_model());
         assert_ne!(
             compute_model_hash(&PersistedModel {
@@ -12222,11 +12407,6 @@ mod tests {
             hash_base,
             "phrase change must affect hash"
         );
-    }
-
-    #[test]
-    fn model_hash_changes_when_training_seeds_changes() {
-        let hash_base = compute_model_hash(&test_model());
         assert_ne!(
             compute_model_hash(&PersistedModel {
                 training_seeds: vec![0, 1, 2],
@@ -12235,11 +12415,6 @@ mod tests {
             hash_base,
             "training_seeds change must affect hash"
         );
-    }
-
-    #[test]
-    fn model_hash_changes_when_embedding_dim_changes() {
-        let hash_base = compute_model_hash(&test_model());
         assert_ne!(
             compute_model_hash(&PersistedModel {
                 embedding_dim: 128,
@@ -12665,13 +12840,6 @@ mod tests {
             let _ = crate::config::CONFIG.set_string_field("voice_cache_max_size_mb", "");
             let _ = crate::config::CONFIG.set_string_field("voice_cache_max_age_days", "");
         }
-    }
-
-    #[test]
-    fn evict_pcm_cache_empty_dir_does_not_panic() {
-        let tmp = tempfile::tempdir().unwrap();
-        evict_pcm_cache(tmp.path());
-        assert!(tmp.path().read_dir().unwrap().next().is_none());
     }
 
     #[test]

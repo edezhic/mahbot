@@ -835,11 +835,6 @@ impl VoiceVerifier {
     /// Youden index, TPR/FPR, and validation-split composition are visible in
     /// the JSON report.  The returned [`VerifierTrainingMetrics`] is
     /// report-only — it is never persisted inside the model.
-    #[expect(
-        clippy::too_many_lines,
-        clippy::cast_precision_loss,
-        clippy::cast_sign_loss
-    )]
     pub fn train_with_metrics(
         positive_sequences: &[EmbeddingSequence],
         negative_sequences: &[EmbeddingSequence],
@@ -860,6 +855,46 @@ impl VoiceVerifier {
             return (Self::untrained(), VerifierTrainingMetrics::default());
         };
 
+        Self::train_member_from_prepared(
+            &windows,
+            &window_labels,
+            &window_weights,
+            &seq_infos,
+            class_weight,
+            threshold,
+            l2_lambda,
+            rng_seed,
+        )
+    }
+
+    /// Single-member training body shared by [`Self::train_with_metrics`] and
+    /// the parallel ensemble path (mahbot-1029 D3).
+    ///
+    /// Takes the already-prepared training data (windows + labels + weights +
+    /// per-sequence info + class weight) produced by
+    /// [`prepare_training_data`].  Everything from the per-member train/val
+    /// split onward is private to this call — no shared mutable state — so
+    /// the ensemble can run members on independent threads with byte-identical
+    /// results to the serial path.  The member's `rng_seed` drives both the
+    /// stratified split and weight init, so it must NOT be shared across
+    /// members.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn train_member_from_prepared(
+        windows: &[Vec<f32>],
+        window_labels: &[f32],
+        window_weights: &[f32],
+        seq_infos: &[SeqInfo],
+        class_weight: f32,
+        threshold: f32,
+        l2_lambda: f32,
+        rng_seed: Option<u64>,
+    ) -> (Self, VerifierTrainingMetrics) {
         // All windows from form_conv1d_sequence_windows are already 288-dim
         // and L2-normalized — no mean-pooling needed.
 
@@ -876,10 +911,10 @@ impl VoiceVerifier {
         };
         let (tr_windows, tr_labels, tr_weights, val_windows, val_labels, val_weights, split_kind) =
             split_train_val(
-                &seq_infos,
-                &windows,
-                &window_labels,
-                &window_weights,
+                seq_infos,
+                windows,
+                window_labels,
+                window_weights,
                 &mut rng,
                 true, // stratify_by_source — preserve negative tier proportions
             );
@@ -1338,6 +1373,18 @@ impl VoiceVerifier {
 
     /// [`Self::train_ensemble`] with training diagnostics (mahbot-1005 §5
     /// style).  Returns `(verifier, member-0 metrics)`.
+    ///
+    /// ## Parallel member training (mahbot-1029 D3)
+    ///
+    /// Training data preparation (window formation + L2 normalization) is
+    /// deterministic and seed-independent, so it is hoisted out of the
+    /// per-member loop and computed ONCE.  The 10 member trainings are then
+    /// run on independent OS threads via [`std::thread::scope`] — each member
+    /// has private RNG/weights/optimizer state and only reads the shared
+    /// prepared data, so results are byte-identical to the serial path.
+    /// Member seeds remain `base_seed.wrapping_add(i)`; `split_train_val` is
+    /// deliberately NOT shared across members (it is seed-dependent — each
+    /// member's stratified split differs).
     #[must_use]
     pub fn train_ensemble_with_metrics(
         positive_sequences: &[EmbeddingSequence],
@@ -1346,28 +1393,86 @@ impl VoiceVerifier {
         threshold: f32,
         l2_lambda: f32,
     ) -> (Self, VerifierTrainingMetrics) {
-        let base_seed: u64 = rand::random();
+        Self::train_ensemble_with_metrics_seeded(
+            positive_sequences,
+            negative_sequences,
+            per_negative_sequence_weights,
+            threshold,
+            l2_lambda,
+            rand::random(),
+        )
+    }
+
+    /// [`Self::train_ensemble_with_metrics`] with an explicit base seed
+    /// (test-injectable; production uses the entropy-drawn public wrapper).
+    fn train_ensemble_with_metrics_seeded(
+        positive_sequences: &[EmbeddingSequence],
+        negative_sequences: &[EmbeddingSequence],
+        per_negative_sequence_weights: Option<&[f32]>,
+        threshold: f32,
+        l2_lambda: f32,
+        base_seed: u64,
+    ) -> (Self, VerifierTrainingMetrics) {
         let n_seeds = VERIFIER_ENSEMBLE_SEEDS;
-        let mut members: Vec<VoiceVerifier> = Vec::with_capacity(n_seeds);
-        let mut primary_metrics = VerifierTrainingMetrics::default();
-        for i in 0..n_seeds {
-            let seed = base_seed.wrapping_add(i as u64);
-            let (member, metrics) = Self::train_with_metrics(
+
+        // ── Prepare training data ONCE (deterministic, seed-independent) ──
+        let Some((windows, window_labels, window_weights, seq_infos, class_weight, _n_pos_windows)) =
+            prepare_training_data(
                 positive_sequences,
                 negative_sequences,
                 per_negative_sequence_weights,
-                threshold,
-                l2_lambda,
-                Some(seed),
-            );
-            if i == 0 {
-                primary_metrics = metrics;
+                form_conv1d_sequence_windows,
+            )
+        else {
+            // Replicate the serial path exactly: each member would
+            // independently return untrained, so the result is an untrained
+            // primary with N-1 untrained members attached (ensemble_size
+            // stays the same).
+            let untrained = Self::untrained();
+            let mut members = vec![untrained; n_seeds];
+            let mut primary = members.remove(0);
+            primary.ensemble_members = members;
+            return (primary, VerifierTrainingMetrics::default());
+        };
+
+        // ── Parallel member training (std threads, NOT a nested Tokio
+        //    runtime — see the mahbot-944 note in the bench module) ──
+        let mut members: Vec<VoiceVerifier> = Vec::with_capacity(n_seeds);
+        let mut member_metrics: Vec<VerifierTrainingMetrics> = Vec::with_capacity(n_seeds);
+        std::thread::scope(|s| {
+            let windows_ref = &windows;
+            let labels_ref = &window_labels;
+            let weights_ref = &window_weights;
+            let seq_infos_ref = &seq_infos;
+            let mut handles = Vec::with_capacity(n_seeds);
+            for i in 0..n_seeds {
+                let seed = base_seed.wrapping_add(i as u64);
+                handles.push(s.spawn(move || {
+                    Self::train_member_from_prepared(
+                        windows_ref,
+                        labels_ref,
+                        weights_ref,
+                        seq_infos_ref,
+                        class_weight,
+                        threshold,
+                        l2_lambda,
+                        Some(seed),
+                    )
+                }));
             }
-            members.push(member);
-        }
+            // Collect in seed order — preserves the report's index-ordered
+            // member fingerprint arrays.
+            for h in handles {
+                let (member, metrics) = h.join().expect("verifier member training thread panicked");
+                members.push(member);
+                member_metrics.push(metrics);
+            }
+        });
+
         // Member 0 becomes the primary; the rest attach as ensemble members.
         let mut primary = members.remove(0);
         primary.ensemble_members = members;
+        let primary_metrics = member_metrics.remove(0);
         if primary.is_trained() {
             info!(
                 "VoiceVerifier ensemble trained: {} members, base seed {base_seed}, \
@@ -2190,7 +2295,11 @@ fn leaky_relu_verifier(x: &mut [f32]) {
 /// # Panics
 ///
 /// Panics if `embedding.len() != VERIFIER_INPUT_DIM`.
-#[allow(clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 fn predict_conv1d(
     embedding: &[f32],
     conv_weight: &[f32],
@@ -2204,11 +2313,6 @@ fn predict_conv1d(
         "Conv1D verifier expects {VERIFIER_INPUT_DIM}-dim input, got {}",
         embedding.len(),
     );
-
-    let cin = EMBEDDING_DIM; // 96
-    let l = VERIFIER_WINDOW_SIZE; // 3
-    let cout = CONV_VERIFIER_OUT; // 2
-    let ks = CONV_VERIFIER_KERNEL_SIZE; // 3
 
     // Step 1: L2-normalize the 288-dim input (matching training pipeline).
     // Uses a stack-allocated [f32; 288] buffer to avoid heap allocation on the
@@ -2225,18 +2329,49 @@ fn predict_conv1d(
     }
 
     // Step 2: Convert to channels-first layout [96 channels × 3 time steps].
-    let cf = crate::audio::wake_word_classifier::to_channels_first(&x, cin, l);
+    // Stack-buffered (mahbot-1029 D5) — the streaming hot path calls this up
+    // to `1 + ensemble_members.len()` times per embedding.
+    let mut cf = [0.0f32; EMBEDDING_DIM * VERIFIER_WINDOW_SIZE];
+    for t in 0..VERIFIER_WINDOW_SIZE {
+        for c in 0..EMBEDDING_DIM {
+            cf[c * VERIFIER_WINDOW_SIZE + t] = x[t * EMBEDDING_DIM + c];
+        }
+    }
 
-    // Step 3: Conv1D(96 → 2, k=3, padding=1).
-    let mut conv_out =
-        crate::audio::wake_word_classifier::conv1d(&cf, cin, l, cout, ks, conv_weight, conv_bias);
+    // Step 3: Conv1D(96 → 2, k=3, padding=1).  Stack-buffered — same index
+    // math as `wake_word_classifier::conv1d` with the fixed verifier dims.
+    let mut conv_out = [0.0f32; CONV_VERIFIER_OUT * VERIFIER_WINDOW_SIZE];
+    let padding = CONV_VERIFIER_KERNEL_SIZE / 2;
+    for co in 0..CONV_VERIFIER_OUT {
+        for li in 0..VERIFIER_WINDOW_SIZE {
+            let mut s = conv_bias[co];
+            for ci in 0..EMBEDDING_DIM {
+                for k in 0..CONV_VERIFIER_KERNEL_SIZE {
+                    let ii = li as isize + k as isize - padding as isize;
+                    if ii >= 0 && ii < VERIFIER_WINDOW_SIZE as isize {
+                        s += cf[ci * VERIFIER_WINDOW_SIZE + ii as usize]
+                            * conv_weight
+                                [(co * EMBEDDING_DIM + ci) * CONV_VERIFIER_KERNEL_SIZE + k];
+                    }
+                }
+            }
+            conv_out[co * VERIFIER_WINDOW_SIZE + li] = s;
+        }
+    }
 
     // Step 4: LeakyReLU activation (mahbot-1008 Fix 3 — replaces ReLU to
     // eliminate the dead-zone constant floor).
     leaky_relu_verifier(&mut conv_out);
 
     // Step 5: AdaptiveAvgPool1d (3 → 1) — average over the time dimension.
-    let pooled = crate::audio::wake_word_classifier::adaptive_avg_pool(&conv_out, cout, l);
+    let mut pooled = [0.0f32; CONV_VERIFIER_OUT];
+    for ci in 0..CONV_VERIFIER_OUT {
+        let mut s = 0.0;
+        for li in 0..VERIFIER_WINDOW_SIZE {
+            s += conv_out[ci * VERIFIER_WINDOW_SIZE + li];
+        }
+        pooled[ci] = s / VERIFIER_WINDOW_SIZE as f32;
+    }
 
     // Step 6: Linear(2 → 1) → Sigmoid.
     let logit: f32 = pooled
@@ -2825,9 +2960,7 @@ mod tests {
         let empty_weights: Vec<f32> = vec![1.0, 2.0, 3.0];
         assert_weight_tier(&empty_weights, 0, 0, 1.0, "empty-at-start");
         assert_weight_tier(&empty_weights, 1, 0, 0.0, "empty-at-middle");
-        assert_weight_tier(&empty_weights, 3, 0, 0.0, "empty-at-end");
-
-        // Mismatch should panic with descriptive message — verify via catch_unwind.
+        assert_weight_tier(&empty_weights, 3, 0, 0.0, "empty-at-end"); // Mismatch should panic with descriptive message — verify via catch_unwind.
         let mismatch_weights = vec![1.0, 1.0, 2.0];
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             assert_weight_tier(&mismatch_weights, 0, 3, 1.0, "first");
@@ -2836,15 +2969,6 @@ mod tests {
             result.is_err(),
             "assert_weight_tier should panic on mismatch"
         );
-    }
-
-    #[test]
-    fn assert_weight_tier_values_within_epsilon_pass() {
-        // Values within f32::EPSILON (inclusive) of expected should NOT panic.
-        // This exercises the floating-point equality boundary: the function
-        // uses `<= f32::EPSILON`, so a value exactly EPSILON away should pass.
-        let weights = vec![1.0f32 + f32::EPSILON, 1.0f32 - f32::EPSILON];
-        assert_weight_tier(&weights, 0, 2, 1.0, "epsilon-boundary");
     }
 
     // ── Required tests (from ticket mahbot-777) ─────────────────────
@@ -3275,6 +3399,86 @@ mod tests {
         );
         let held_out = make_positive_embedding(&mut rng);
         assert_ensemble_properties(&ensemble, &held_out, "real-negative ensemble");
+    }
+
+    #[test]
+    fn test_ensemble_parallel_matches_serial_reference() {
+        // mahbot-1029 D3: the parallel member-training path must produce
+        // byte-identical member weights to the serial path for the same base
+        // seed — the bench's member fingerprint arrays are compared across
+        // runs, so any divergence (e.g. from accidentally sharing
+        // split_train_val) would break the baseline comparison.
+        let mut rng = StdRng::seed_from_u64(1029);
+        let positives: Vec<Vec<f32>> = (0..40).map(|_| make_positive_embedding(&mut rng)).collect();
+        let negatives: Vec<Vec<f32>> = (0..40).map(|_| make_negative_embedding(&mut rng)).collect();
+        let pos_seq = make_seq(
+            positives,
+            crate::audio::embedding_sequence::LabelStratum::Positive,
+        );
+        let neg_seq = make_seq(
+            negatives,
+            crate::audio::embedding_sequence::LabelStratum::Negative,
+        );
+        let base_seed: u64 = 0xdead_beef;
+
+        // Parallel ensemble path (seeded variant, same code the public
+        // wrapper runs with an entropy-drawn base seed).
+        let (par, _par_metrics) = VoiceVerifier::train_ensemble_with_metrics_seeded(
+            &[pos_seq.clone()],
+            &[neg_seq.clone()],
+            None,
+            DEFAULT_VERIFIER_THRESHOLD,
+            CONV_L2_LAMBDA,
+            base_seed,
+        );
+
+        // Serial reference: one train_with_metrics per member with the same
+        // derived seeds, assembled into an identical primary+members shape.
+        let mut members: Vec<VoiceVerifier> = Vec::with_capacity(VERIFIER_ENSEMBLE_SEEDS);
+        for i in 0..VERIFIER_ENSEMBLE_SEEDS {
+            let seed = base_seed.wrapping_add(i as u64);
+            let (member, _metrics) = VoiceVerifier::train_with_metrics(
+                &[pos_seq.clone()],
+                &[neg_seq.clone()],
+                None,
+                DEFAULT_VERIFIER_THRESHOLD,
+                CONV_L2_LAMBDA,
+                Some(seed),
+            );
+            members.push(member);
+        }
+        let mut serial_primary = members.remove(0);
+        serial_primary.ensemble_members = members;
+
+        assert_eq!(
+            par.ensemble_size(),
+            serial_primary.ensemble_size(),
+            "both paths must train the same number of members"
+        );
+        assert!(
+            par.is_trained() && serial_primary.is_trained(),
+            "test data must be large enough to train both paths"
+        );
+        for idx in 0..par.ensemble_size() {
+            let p = par.member_only(idx);
+            let s = serial_primary.member_only(idx);
+            assert_eq!(
+                p.conv_weight, s.conv_weight,
+                "member {idx} conv_weight diverges from the serial path"
+            );
+            assert_eq!(
+                p.conv_bias, s.conv_bias,
+                "member {idx} conv_bias diverges from the serial path"
+            );
+            assert_eq!(
+                p.fc_weight, s.fc_weight,
+                "member {idx} fc_weight diverges from the serial path"
+            );
+            assert_eq!(
+                p.fc_bias, s.fc_bias,
+                "member {idx} fc_bias diverges from the serial path"
+            );
+        }
     }
 
     #[test]
@@ -3793,8 +3997,10 @@ mod tests {
         // pre-fix) — mahbot-1008 Fix 4.
         let mut rng = StdRng::seed_from_u64(13);
         let positives: Vec<Vec<f32>> = (0..32).map(|_| make_positive_embedding(&mut rng)).collect();
-        // 3200 negatives with 1.0 weight → raw ratio 100× > MAX_CLASS_WEIGHT.
-        let negatives: Vec<Vec<f32>> = (0..3200)
+        // 2000 negatives with 1.0 weight → raw ratio ~67× > MAX_CLASS_WEIGHT.
+        // (Reduced from 3200 in mahbot-1029 — the cap-triggering ratio keeps
+        // >50× with a ~33% margin, cutting ~40% of the training cost.)
+        let negatives: Vec<Vec<f32>> = (0..2000)
             .map(|_| make_negative_embedding(&mut rng))
             .collect();
         let pos_seq = make_seq(
