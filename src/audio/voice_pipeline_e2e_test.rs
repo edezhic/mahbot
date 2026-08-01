@@ -591,10 +591,9 @@ fn generate_white_gaussian_noise() -> Vec<f32> {
     let mut samples = Vec::with_capacity(NOISE_LEN);
     let mut i = 0;
     while i < NOISE_LEN {
-        let u1: f32 = rng.random::<f32>().max(f32::EPSILON);
-        let u2: f32 = rng.random::<f32>().max(f32::EPSILON);
-        let z1 = (-2.0 * u1.ln()).sqrt() * (2.0 * core::f32::consts::PI * u2).cos();
-        let z2 = (-2.0 * u1.ln()).sqrt() * (2.0 * core::f32::consts::PI * u2).sin();
+        // Shared EPSILON-clamp pair sampler (mahbot-1043) — preserves the
+        // bench's exact draw sequence (2 draws per 2 samples, cos+sin).
+        let (z1, z2) = crate::util::sample_gaussian_pair_clamped(&mut rng);
         // Clamp to [-1.0, 1.0] — Gaussian has tails beyond [-3, 3] but
         // scaling by 0.333 keeps ~99.7% within [-1, 1].
         samples.push((z1 * 0.333).clamp(-1.0, 1.0));
@@ -4331,15 +4330,6 @@ fn run_mid_utterance_test(
 
 // ── Noise-overlapped detection test (mahbot-845) ─────────────────────────
 
-/// Compute RMS (root mean square) of a PCM audio buffer.
-fn rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let sum_sq: f32 = samples.iter().map(|&s| s * s).sum();
-    (sum_sq / samples.len() as f32).sqrt()
-}
-
 /// Mix speech and noise at a given SNR (in dB).
 ///
 /// `speech` and `noise` should be the same length.  The noise is scaled so
@@ -4349,8 +4339,11 @@ fn mix_at_snr(speech: &[f32], noise: &[f32], snr_db: f32) -> Vec<f32> {
     if !snr_db.is_finite() {
         return speech.to_vec();
     }
-    let speech_rms = rms(speech);
-    let noise_rms = rms(noise);
+    // Shared RMS helper (mahbot-1043) — the bench's former byte-identical
+    // `rms` copy was deleted; the 1e-10 degenerate-signal guard stays here
+    // as an early return (it is NOT part of compute_rms).
+    let speech_rms = crate::util::compute_rms(speech);
+    let noise_rms = crate::util::compute_rms(noise);
     if noise_rms < 1e-10 || speech_rms < 1e-10 {
         return speech.to_vec();
     }

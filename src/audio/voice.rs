@@ -48,7 +48,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -2119,11 +2119,6 @@ pub fn models_ready() -> bool {
     MODELS_STATE.load(Ordering::Acquire) == ModelState::Ready
 }
 
-/// Check whether voice models are currently loading.
-pub fn models_loading() -> bool {
-    MODELS_STATE.load(Ordering::Acquire) == ModelState::Loading
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Voice pipeline status (shared between pipeline task and GUI)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3142,7 +3137,7 @@ async fn download_model(
     // .tmp file remains (it will be overwritten on retry) rather than leaving
     // a corrupt file at the final path that passes the exists() check.
     if !expected_hash.is_empty() {
-        verify_sha256(&tmp_path, expected_hash)
+        crate::util::verify_sha256(&tmp_path, expected_hash)
             .with_context(|| format!("SHA256 verification failed for {}", path.display()))?;
     }
 
@@ -3602,33 +3597,6 @@ pub(crate) fn synthesize_with_pcm_cache(
 /// at most once per process.
 static PCM_EVICTION_RAN: AtomicBool = AtomicBool::new(false);
 
-/// Verify a file's SHA256 hash matches the expected value.
-fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
-    if expected.is_empty() {
-        return Ok(()); // no hash configured — skip verification
-    }
-
-    let mut hasher = Sha256::new();
-    let mut file = File::open(path)
-        .with_context(|| format!("Failed to open {} for SHA256 verification", path.display()))?;
-    let mut buf = vec![0u8; 65536];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let actual = hex_string(&hasher.finalize());
-    if actual != expected {
-        anyhow::bail!(
-            "SHA256 mismatch for {}: expected {expected}, got {actual}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
 async fn ensure_models_downloaded() -> Result<PathBuf> {
     let dir = model_dir()
         .ok_or_else(|| anyhow!("Cannot resolve model directory (storage root not set)"))?;
@@ -3637,7 +3605,7 @@ async fn ensure_models_downloaded() -> Result<PathBuf> {
 
     let mel_path = dir.join(MEL_MODEL_FILENAME);
     if mel_path.exists()
-        && let Err(e) = verify_sha256(&mel_path, MEL_MODEL_SHA256)
+        && let Err(e) = crate::util::verify_sha256(&mel_path, MEL_MODEL_SHA256)
     {
         warn!("Mel spectrogram model corrupt, re-downloading: {e}");
         tokio::fs::remove_file(&mel_path).await?;
@@ -3649,7 +3617,7 @@ async fn ensure_models_downloaded() -> Result<PathBuf> {
 
     let embed_path = dir.join(EMBED_MODEL_FILENAME);
     if embed_path.exists()
-        && let Err(e) = verify_sha256(&embed_path, EMBED_MODEL_SHA256)
+        && let Err(e) = crate::util::verify_sha256(&embed_path, EMBED_MODEL_SHA256)
     {
         warn!("Embedding model corrupt, re-downloading: {e}");
         tokio::fs::remove_file(&embed_path).await?;
@@ -4023,8 +3991,10 @@ fn compute_utterance_quality(samples: &[f32], noise_rms: Option<f32>) -> Utteran
     // heuristic (estimate_snr_energy) which measures speech dynamic range
     // rather than true SNR (mahbot-782).
     let snr_db = if let Some(noise_rms) = noise_rms {
-        let sum_sq: f32 = samples.iter().map(|&s| s * s).sum();
-        let speech_rms = (sum_sq / samples.len() as f32).sqrt();
+        // Shared RMS helper (mahbot-1043).  Empty-input NaN → 0.0 via
+        // compute_rms is branch-equivalent to the old inline formula (the
+        // `speech_rms > noise_rms` guard yields 0.0 in both cases).
+        let speech_rms = crate::util::compute_rms(samples);
         if noise_rms > 1e-10 && speech_rms > noise_rms {
             20.0 * (speech_rms / noise_rms).log10()
         } else {
@@ -4096,9 +4066,10 @@ fn estimate_snr_energy(samples: &[f32]) -> f32 {
         if chunk.len() < FRAME_LENGTH / 2 {
             continue; // Skip partial trailing frames
         }
-        let len = chunk.len().min(FRAME_LENGTH) as f32;
-        let sum_sq: f32 = chunk.iter().map(|&s| s * s).sum();
-        frame_rms.push((sum_sq / len).sqrt());
+        // Shared RMS helper (mahbot-1043).  `chunk.len().min(FRAME_LENGTH)`
+        // was always `chunk.len()` here (chunks ≤ FRAME_LENGTH and the
+        // half-frame skip above), so this is bit-identical.
+        frame_rms.push(crate::util::compute_rms(chunk));
     }
 
     if frame_rms.len() < 3 {
@@ -8815,12 +8786,10 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                     let speech_boundary = ENROLLMENT_VAD_CONSECUTIVE_REQUIRED * HOP_LENGTH;
                     let pre_speech_end = ctx.pre_agc_ring.len().saturating_sub(speech_boundary);
                     if pre_speech_end > 0 {
-                        let sum_sq: f32 = ctx.pre_agc_ring[..pre_speech_end]
-                            .iter()
-                            .map(|&s| s * s)
-                            .sum();
-                        #[expect(clippy::cast_precision_loss)]
-                        let rms = (sum_sq / pre_speech_end as f32).sqrt();
+                        // Shared RMS helper (mahbot-1043); the statement-level
+                        // #[expect(clippy::cast_precision_loss)] was removed
+                        // because compute_rms carries its own allow.
+                        let rms = crate::util::compute_rms(&ctx.pre_agc_ring[..pre_speech_end]);
                         ctx.noise_rms_estimate = Some(rms);
                     }
                 }
@@ -9065,8 +9034,6 @@ mod tests {
         VerifierActivation,
     };
     use crate::util::test::set_env_var;
-    use crate::util::{add_noise, apply_gain, generate_pink_noise};
-    use rand::SeedableRng;
     use std::time::{Duration, Instant};
 
     // ── VAD-gated utterance segmentation tests ────────────────────────────
@@ -11387,164 +11354,6 @@ mod tests {
         let hash = tts_model_version_hash();
         assert!(!hash.is_empty(), "TTS model version hash must not be empty");
         assert_eq!(hash.len(), 64, "SHA-256 hex string must be 64 chars");
-    }
-
-    // ── PCM augmentation tests (mahbot-878) ────────────────────────────────
-
-    #[test]
-    fn test_speed_perturbation_identity() {
-        // rate=1.0 should return approximately the original
-        let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
-        let result = crate::util::speed_perturbation(&pcm, 16000, 1.0);
-        assert_eq!(result.len(), pcm.len(), "identity should preserve length");
-        for (a, b) in pcm.iter().zip(result.iter()) {
-            assert!((a - b).abs() < 1e-5, "identity should preserve values");
-        }
-    }
-
-    #[test]
-    fn test_speed_perturbation_rates() {
-        // Slow down: rate=0.5 should produce more samples
-        let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
-        let slowed = crate::util::speed_perturbation(&pcm, 16000, 0.5);
-        assert!(
-            slowed.len() > pcm.len(),
-            "rate < 1 should increase sample count"
-        );
-        // Speed up: rate=2.0 should produce fewer samples
-        let sped_up = crate::util::speed_perturbation(&pcm, 16000, 2.0);
-        assert!(
-            sped_up.len() < pcm.len(),
-            "rate > 1 should decrease sample count"
-        );
-    }
-
-    #[test]
-    fn test_speed_perturbation_determinism() {
-        // Same input + same rate → same output
-        let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
-        let a = crate::util::speed_perturbation(&pcm, 16000, 0.95);
-        let b = crate::util::speed_perturbation(&pcm, 16000, 0.95);
-        assert_eq!(a, b, "deterministic speed perturbation");
-    }
-
-    #[test]
-    fn test_apply_gain_determinism() {
-        // apply_gain must be deterministic: same PCM + same gain_db → same output
-        let pcm: Vec<f32> = (0..50).map(|i| (i as f32 - 25.0) / 25.0).collect();
-        let a = apply_gain(&pcm, -3.0);
-        let b = apply_gain(&pcm, -3.0);
-        assert_eq!(a, b, "apply_gain must be deterministic");
-    }
-
-    #[test]
-    fn test_apply_gain_db_conversion() {
-        // 0 dB → unity gain (output == input)
-        let pcm: Vec<f32> = vec![0.5, -0.3, 0.1, -0.7, 0.9];
-        let unity = apply_gain(&pcm, 0.0);
-        for (a, b) in pcm.iter().zip(unity.iter()) {
-            assert!((a - b).abs() < 1e-6, "0 dB gain should be unity");
-        }
-        // -6 dB → amplitude halved (10^(-6/20) ≈ 0.5)
-        let attenuated = apply_gain(&pcm, -6.0);
-        let expected_amp = 10.0_f32.powf(-6.0 / 20.0);
-        for (orig, atten) in pcm.iter().zip(attenuated.iter()) {
-            assert!(
-                (atten - orig * expected_amp).abs() < 1e-6,
-                "-6 dB gain should multiply by {expected_amp}"
-            );
-        }
-        // +6 dB → amplitude doubled (10^(6/20) ≈ 2.0)
-        let amplified = apply_gain(&pcm, 6.0);
-        let expected_amp2 = 10.0_f32.powf(6.0 / 20.0);
-        for (orig, amp) in pcm.iter().zip(amplified.iter()) {
-            assert!(
-                (amp - orig * expected_amp2).abs() < 1e-6,
-                "+6 dB gain should multiply by {expected_amp2}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_add_noise_determinism() {
-        // Same PCM + same SNR + same seed → same output
-        let pcm: Vec<f32> = (0..200).map(|i| (i as f32 - 100.0) / 100.0).collect();
-        let a = add_noise(&pcm, 25.0, 42);
-        let b = add_noise(&pcm, 25.0, 42);
-        assert_eq!(a.len(), b.len(), "add_noise output length should match");
-        assert_eq!(a, b, "add_noise with same seed must be deterministic");
-    }
-
-    #[test]
-    fn test_add_noise_seed_variation() {
-        // Different seed → different output
-        let pcm: Vec<f32> = (0..200).map(|i| (i as f32 - 100.0) / 100.0).collect();
-        let a = add_noise(&pcm, 25.0, 42);
-        let b = add_noise(&pcm, 25.0, 99);
-        assert_ne!(a, b, "different seeds should produce different output");
-    }
-
-    #[test]
-    fn test_add_noise_snr_approximation() {
-        // At very high SNR (100 dB), the output should be very close to input
-        let pcm: Vec<f32> = (0..1000).map(|i| (i as f32 - 500.0) / 500.0).collect();
-        let noisy = add_noise(&pcm, 100.0, 42);
-        // Compute actual SNR of output vs input
-        let signal_power: f32 = pcm.iter().map(|&s| s * s).sum();
-        let noise_power: f32 = pcm
-            .iter()
-            .zip(noisy.iter())
-            .map(|(&s, &n)| (n - s) * (n - s))
-            .sum();
-        let actual_snr_db = 10.0 * (signal_power / noise_power.max(1e-10)).log10();
-        assert!(
-            actual_snr_db > 80.0,
-            "at 100 dB target, actual SNR should be high (was {actual_snr_db:.1} dB)"
-        );
-    }
-
-    #[test]
-    fn test_generate_pink_noise_properties() {
-        // Pink noise should have positive and negative values
-        let noise = generate_pink_noise(1000, rand::rngs::StdRng::seed_from_u64(42));
-        assert_eq!(noise.len(), 1000);
-        let has_positive = noise.iter().any(|&s| s > 0.0);
-        let has_negative = noise.iter().any(|&s| s < 0.0);
-        assert!(has_positive, "pink noise should have positive values");
-        assert!(has_negative, "pink noise should have negative values");
-        // RMS should be near 1.0 (normalized)
-        let rms = (noise.iter().map(|&s| s * s).sum::<f32>() / 1000.0_f32).sqrt();
-        assert!(
-            (rms - 1.0).abs() < 0.1,
-            "pink noise RMS should be near 1.0 (was {rms})"
-        );
-    }
-
-    #[test]
-    fn test_augmentation_variants_are_different() {
-        // Verify that the 4 augmentation strategies produce different results
-        let pcm: Vec<f32> = (0..500).map(|i| (i as f32 - 250.0) / 250.0).collect();
-        let speed_down = crate::util::speed_perturbation(&pcm, 16000, 0.95);
-        let speed_up = crate::util::speed_perturbation(&pcm, 16000, 1.05);
-        let volume_down = apply_gain(&pcm, -3.0);
-        let noise = add_noise(&pcm, 25.0, 42);
-
-        // Each variant should differ from original AND each other
-        assert_ne!(speed_down, pcm, "speed-down should differ from original");
-        assert_ne!(speed_up, pcm, "speed-up should differ from original");
-        assert_ne!(volume_down, pcm, "volume-down should differ from original");
-        assert_ne!(noise, pcm, "noise should differ from original");
-
-        // Verify they also differ from each other (different transforms)
-        assert_ne!(
-            speed_down, speed_up,
-            "speed-down and speed-up should differ"
-        );
-        assert_ne!(
-            speed_down, volume_down,
-            "speed-down and volume-down should differ"
-        );
-        assert_ne!(speed_down, noise, "speed-down and noise should differ");
     }
 
     #[test]

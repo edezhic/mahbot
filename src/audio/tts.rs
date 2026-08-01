@@ -39,6 +39,7 @@
 
 use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
+use crate::util::model_state::{AtomicModelState, ModelState};
 use anyhow::{Context, Result, anyhow};
 use candle_core::{Device, Tensor};
 use candle_onnx::simple_eval;
@@ -47,12 +48,11 @@ use rodio::{OutputStream, OutputStreamHandle, Sink};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -123,12 +123,12 @@ const ALL_VOICE_STYLE_NAMES: &[&str] = &[
 
 // ── State machine ─────────────────────────────────────────────────────
 
-const STATE_UNINIT: u8 = 0;
-const STATE_LOADING: u8 = 1;
-const STATE_READY: u8 = 2;
-const STATE_FAILED: u8 = 3;
-
-static STATE: AtomicU8 = AtomicU8::new(STATE_UNINIT);
+/// Atomic model-loading state (Uninit → Loading → Ready / Failed).
+///
+/// Shared wrapper extracted in mahbot-1043:
+/// [`crate::util::model_state::ModelState`] — the guard/retry paths below
+/// (`TtsGuard`, [`spawn_download`], [`retry_download`]) are unchanged.
+static STATE: AtomicModelState = AtomicModelState::new(ModelState::Uninit);
 static GLOBAL_TTS: OnceLock<RwLock<Option<Arc<TtsEngine>>>> = OnceLock::new();
 static CANCEL_TX: OnceLock<broadcast::Sender<()>> = OnceLock::new();
 static CANCEL_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
@@ -296,12 +296,12 @@ pub fn is_config_enabled() -> bool {
 
 #[must_use]
 pub fn is_enabled() -> bool {
-    is_config_enabled() && STATE.load(Ordering::Acquire) == STATE_READY
+    is_config_enabled() && STATE.load(Ordering::Acquire) == ModelState::Ready
 }
 
 #[must_use]
 pub fn models_ready() -> bool {
-    STATE.load(Ordering::Acquire) == STATE_READY
+    STATE.load(Ordering::Acquire) == ModelState::Ready
 }
 
 /// Returns `true` if the audio output device was successfully initialized.
@@ -322,7 +322,7 @@ pub fn audio_output_ready() -> bool {
 /// (retries exhausted or model directory unresolvable).
 #[must_use]
 pub fn download_failed() -> bool {
-    STATE.load(Ordering::Acquire) == STATE_FAILED
+    STATE.load(Ordering::Acquire) == ModelState::Failed
 }
 
 /// Try to load TTS engine from cache — returns `Ok(())` if models are
@@ -344,19 +344,19 @@ pub fn ensure_ready() -> Result<(), String> {
 
 /// Retry model download after a previous failure.
 ///
-/// Atomically transitions [`STATE`] from [`STATE_FAILED`] → [`STATE_UNINIT`]
-/// and calls [`spawn_download()`]. If the state is not [`STATE_FAILED`],
+/// Atomically transitions [`STATE`] from [`ModelState::Failed`] → [`ModelState::Uninit`]
+/// and calls [`spawn_download()`]. If the state is not [`ModelState::Failed`],
 /// this is a no-op and returns `false`.
 ///
 /// This is the GUI-facing counterpart of [`spawn_download()`] which only
-/// transitions from [`STATE_UNINIT`] — the two functions together handle
+/// transitions from [`ModelState::Uninit`] — the two functions together handle
 /// the initial download and retry-after-failure paths.
 #[must_use]
 pub fn retry_download() -> bool {
     if STATE
         .compare_exchange(
-            STATE_FAILED,
-            STATE_UNINIT,
+            ModelState::Failed,
+            ModelState::Uninit,
             Ordering::AcqRel,
             Ordering::Acquire,
         )
@@ -371,22 +371,22 @@ pub fn retry_download() -> bool {
 /// Test-only: set TTS state to a known value for deterministic testing.
 #[cfg(test)]
 pub(crate) fn test_set_state(state: u8) {
-    STATE.store(state, Ordering::Release);
+    STATE.store(ModelState::from_u8(state), Ordering::Release);
 }
 
-/// Reset [`STATE`] from [`STATE_LOADING`] back to [`STATE_UNINIT`] if the
+/// Reset [`STATE`] from [`ModelState::Loading`] back to [`ModelState::Uninit`] if the
 /// download retry loop was orphaned (e.g. the runtime dropped the task before
 /// it was ever polled).  Returns `true` if the state was actually reset.
 ///
 /// This is a recovery mechanism for `wait_for_tts_styles()` in the voice
-/// pipeline: when [`STATE`] is stuck in [`STATE_LOADING`] with no download
+/// pipeline: when [`STATE`] is stuck in [`ModelState::Loading`] with no download
 /// task making progress, resetting allows the next caller to retry.
 #[must_use]
 pub(crate) fn try_reset_loading_state() -> bool {
     STATE
         .compare_exchange(
-            STATE_LOADING,
-            STATE_UNINIT,
+            ModelState::Loading,
+            ModelState::Uninit,
             Ordering::AcqRel,
             Ordering::Acquire,
         )
@@ -401,7 +401,7 @@ pub(crate) fn try_reset_loading_state() -> bool {
 ///
 /// **Note:** This does NOT trigger model initialization. Models must be loaded
 /// beforehand by [`init_global()`] + [`try_load_cached()`] / [`spawn_download()`].
-/// If models are not in `STATE_READY` this call is a silent no-op.
+/// If models are not in `ModelState::Ready` this call is a silent no-op.
 pub fn speak(text: &str) {
     #[cfg(test)]
     SPEAK_COUNT.fetch_add(1, Ordering::Release);
@@ -637,7 +637,7 @@ pub fn try_load_cached() -> bool {
     // Also accept LOADING/FAILED states — loading from disk is safe regardless
     // of the async download state, and is the primary recovery mechanism when
     // the download task is orphaned (STATE stuck in LOADING).
-    if STATE.load(Ordering::Acquire) == STATE_READY {
+    if STATE.load(Ordering::Acquire) == ModelState::Ready {
         return true;
     }
 
@@ -680,8 +680,8 @@ pub fn spawn_download() {
     // CAS failure means another task already set LOADING or READY — avoid race.
     if STATE
         .compare_exchange(
-            STATE_UNINIT,
-            STATE_LOADING,
+            ModelState::Uninit,
+            ModelState::Loading,
             Ordering::AcqRel,
             Ordering::Acquire,
         )
@@ -694,16 +694,16 @@ pub fn spawn_download() {
 
 /// Spawn model download, retrying after a previous failure if needed.
 ///
-/// Unlike [`spawn_download()`] which only transitions from [`STATE_UNINIT`],
-/// this also handles [`STATE_FAILED`] by resetting to [`STATE_UNINIT`] first,
+/// Unlike [`spawn_download()`] which only transitions from [`ModelState::Uninit`],
+/// this also handles [`ModelState::Failed`] by resetting to [`ModelState::Uninit`] first,
 /// making it suitable for the GUI toggle which may be activated after a
 /// permanent download failure.
 pub fn spawn_or_retry_download() {
     // Fast path: UNINIT → LOADING
     if STATE
         .compare_exchange(
-            STATE_UNINIT,
-            STATE_LOADING,
+            ModelState::Uninit,
+            ModelState::Loading,
             Ordering::AcqRel,
             Ordering::Acquire,
         )
@@ -715,8 +715,8 @@ pub fn spawn_or_retry_download() {
     // Slow path: FAILED → UNINIT, then spawn_download handles UNINIT → LOADING
     if STATE
         .compare_exchange(
-            STATE_FAILED,
-            STATE_UNINIT,
+            ModelState::Failed,
+            ModelState::Uninit,
             Ordering::AcqRel,
             Ordering::Acquire,
         )
@@ -742,7 +742,7 @@ fn set_engine_ready(engine: TtsEngine) {
     if let Some(global) = GLOBAL_TTS.get() {
         *global.write().unwrap_poison() = Some(Arc::new(engine));
     }
-    STATE.store(STATE_READY, Ordering::Release);
+    STATE.store(ModelState::Ready, Ordering::Release);
 }
 
 /// Clone the engine [`Arc`] cheaply, then drop the read lock.
@@ -856,8 +856,8 @@ impl Drop for TtsGuard {
     fn drop(&mut self) {
         STATE
             .compare_exchange(
-                STATE_LOADING,
-                STATE_FAILED,
+                ModelState::Loading,
+                ModelState::Failed,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -869,7 +869,7 @@ async fn download_retry_loop() {
     let _guard = TtsGuard;
     let Some(dir) = model_dir() else {
         warn!("TTS: cannot resolve model directory");
-        STATE.store(STATE_FAILED, Ordering::Release);
+        STATE.store(ModelState::Failed, Ordering::Release);
         return;
     };
 
@@ -877,7 +877,7 @@ async fn download_retry_loop() {
     let mut retry_count = 0u32;
 
     loop {
-        if STATE.load(Ordering::Acquire) == STATE_READY {
+        if STATE.load(Ordering::Acquire) == ModelState::Ready {
             return;
         }
         retry_count += 1;
@@ -885,7 +885,7 @@ async fn download_retry_loop() {
             let msg = format!("TTS download failed after {MAX_DOWNLOAD_RETRIES} retries");
             warn!("{msg}");
             emit_download_event(TtsDownloadEvent::Failed { error: msg });
-            STATE.store(STATE_FAILED, Ordering::Release);
+            STATE.store(ModelState::Failed, Ordering::Release);
             return;
         }
 
@@ -903,7 +903,7 @@ async fn download_retry_loop() {
             Err(_) => warn!("TTS download timed out (will retry)"),
         }
 
-        if STATE.load(Ordering::Acquire) == STATE_FAILED {
+        if STATE.load(Ordering::Acquire) == ModelState::Failed {
             return;
         }
         tokio::time::sleep(retry_delay).await;
@@ -1010,7 +1010,7 @@ async fn ensure_file(f: &TtsFile) -> Result<()> {
             );
             tokio::fs::remove_file(&f.path).await?;
         } else {
-            match verify_sha256(&f.path, f.sha256) {
+            match crate::util::verify_sha256(&f.path, f.sha256) {
                 Ok(()) => return Ok(()), // file is intact
                 Err(e) => {
                     warn!("TTS file corrupt, re-downloading {}: {e}", f.path.display());
@@ -1135,34 +1135,6 @@ async fn download_file(url: &str, dest: &Path, expected_hash: &str) -> Result<()
     );
 
     emit_download_event(TtsDownloadEvent::FileCompleted { name: file_name });
-    Ok(())
-}
-
-/// Verify a file's SHA256 hash matches the expected hex string.
-/// If `expected` is empty, verification is skipped (returns Ok).
-fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
-    if expected.is_empty() {
-        return Ok(()); // no hash configured — skip verification
-    }
-
-    let mut hasher = Sha256::new();
-    let mut file = File::open(path)
-        .with_context(|| format!("Failed to open {} for SHA256 verification", path.display()))?;
-    let mut buf = vec![0u8; 65536];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let actual = crate::util::hex_string(&hasher.finalize());
-    if actual != expected {
-        anyhow::bail!(
-            "SHA256 mismatch for {}: expected {expected}, got {actual}",
-            path.display()
-        );
-    }
     Ok(())
 }
 
@@ -2018,31 +1990,6 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_sha256() {
-        let tmp = std::env::temp_dir().join("test_tts_sha256.txt");
-        let content = b"hello tts test content";
-        std::fs::write(&tmp, content).unwrap();
-
-        let mut hasher = Sha256::new();
-        hasher.update(content);
-        let correct_hash = crate::util::hex_string(&hasher.finalize());
-
-        // Matching hash passes
-        assert!(verify_sha256(&tmp, &correct_hash).is_ok());
-
-        // Non-matching hash fails
-        assert!(
-            verify_sha256(
-                &tmp,
-                "0000000000000000000000000000000000000000000000000000000000000000"
-            )
-            .is_err()
-        );
-
-        std::fs::remove_file(&tmp).ok();
-    }
-
-    #[test]
     fn test_render_wav() {
         let sample_rate = 44100u32;
         let samples = vec![0.0f32, 0.5, -0.5, 1.0, -1.0, 0.0];
@@ -2090,18 +2037,6 @@ mod tests {
         let data_start = 44;
         let last_sample_bytes = &wav_bytes[data_start + 10..data_start + 12];
         assert_eq!(last_sample_bytes, &[0x00, 0x00], "last sample should be 0");
-    }
-
-    #[test]
-    fn test_verify_sha256_empty_hash() {
-        // Empty expected hash skips verification (returns Ok) — same pattern as voice.rs
-        let tmp = std::env::temp_dir().join("test_tts_empty_sha256.txt");
-        std::fs::write(&tmp, b"content").unwrap();
-        assert!(
-            verify_sha256(&tmp, "").is_ok(),
-            "empty SHA256 expected hash should skip verification"
-        );
-        std::fs::remove_file(&tmp).ok();
     }
 
     // ── Tier 1: Preprocessing helpers (always-run unit tests) ─────────
@@ -2581,7 +2516,7 @@ mod tests {
 
         // Enable TTS for the happy path
         let prev_state = STATE.load(Ordering::Acquire);
-        STATE.store(STATE_READY, Ordering::Release);
+        STATE.store(ModelState::Ready, Ordering::Release);
         let _ = crate::config::CONFIG.set_string_field("tts_enabled", "true");
 
         // Reset speak counter
@@ -2618,9 +2553,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(tts)]
     async fn test_init_listener_skips_when_disabled() {
-        // Ensure TTS is disabled (default state: STATE_UNINIT)
+        // Ensure TTS is disabled (default state: ModelState::Uninit)
         let prev_state = STATE.load(Ordering::Acquire);
-        STATE.store(STATE_UNINIT, Ordering::Release);
+        STATE.store(ModelState::Uninit, Ordering::Release);
 
         crate::util::test::init_test_stores().await;
 

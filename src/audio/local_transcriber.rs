@@ -38,10 +38,11 @@
 //! `[Audio: filename attached]` placeholder — there is no API fallback.
 
 use crate::util::UnwrapPoison;
+use crate::util::model_state::{AtomicModelState, ModelState};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -115,32 +116,22 @@ const MAX_DOWNLOAD_RETRIES: u32 = 12;
 
 // ── State machine ─────────────────────────────────────────────────────
 
-/// Transcriber is not loaded yet.
-const STATE_UNINIT: u8 = 0;
-
-/// Initialization in progress (sync cache load or background download).
-const STATE_LOADING: u8 = 1;
-
-/// A usable [`QwenLocalTranscriber`] instance is available.
-const STATE_READY: u8 = 2;
-
-/// Transcriber initialization has failed terminally.
-///
-/// Once in this state, a restart is required to retry. The
-/// [`transcribe_file_async`] will return an error and the enrichment pipeline
-/// returns a `[Audio: filename attached]` placeholder.
-const STATE_FAILED: u8 = 3;
-
 /// Global singleton handle — `None` until loaded.
 static GLOBAL_TRANSCRIBER: Mutex<Option<QwenLocalTranscriber>> = Mutex::new(None);
 
 /// Atomic state tracker to coordinate lazy initialization.
-static STATE: AtomicU8 = AtomicU8::new(STATE_UNINIT);
+///
+/// Model-loading lifecycle for the transcriber (Uninit → Loading → Ready /
+/// Failed).  Shared wrapper extracted in mahbot-1043:
+/// [`crate::util::model_state::ModelState`].  Failed is terminal — a restart
+/// is required to retry (the [`transcribe_file_async`] error path returns an
+/// `[Audio: filename attached]` placeholder).
+static STATE: AtomicModelState = AtomicModelState::new(ModelState::Uninit);
 
-/// Atomically store a ready transcriber and transition state to [`STATE_READY`].
+/// Atomically store a ready transcriber and transition state to [`ModelState::Ready`].
 fn set_transcriber_ready(tc: QwenLocalTranscriber) {
     *GLOBAL_TRANSCRIBER.lock().unwrap_poison() = Some(tc);
-    STATE.store(STATE_READY, Ordering::Release);
+    STATE.store(ModelState::Ready, Ordering::Release);
 }
 
 // ── Model directory resolution ────────────────────────────────────────
@@ -599,12 +590,12 @@ fn download_client() -> Result<reqwest::Client> {
 ///
 /// Downloads all model files sequentially. On failure, sleeps with exponential
 /// backoff and retries up to [`MAX_DOWNLOAD_RETRIES`] times. On success,
-/// loads the model and transitions to [`STATE_READY`]. On terminal failure,
-/// transitions to [`STATE_FAILED`].
+/// loads the model and transitions to [`ModelState::Ready`]. On terminal failure,
+/// transitions to [`ModelState::Failed`].
 async fn download_retry_loop() {
     let Some(dir) = model_dir() else {
         warn!("Local transcriber: cannot resolve model directory (storage root not set)");
-        STATE.store(STATE_FAILED, Ordering::Release);
+        STATE.store(ModelState::Failed, Ordering::Release);
         return;
     };
 
@@ -612,7 +603,7 @@ async fn download_retry_loop() {
         Ok(c) => c,
         Err(e) => {
             warn!("Local transcriber: failed to create HTTP client: {e}");
-            STATE.store(STATE_FAILED, Ordering::Release);
+            STATE.store(ModelState::Failed, Ordering::Release);
             return;
         }
     };
@@ -634,7 +625,7 @@ async fn download_retry_loop() {
                 let dest_clone = dest.clone();
                 let expected = file.expected_sha256.to_string();
                 let checksum_ok = tokio::task::spawn_blocking(move || {
-                    verify_sha256(&dest_clone, &expected).is_ok()
+                    crate::util::verify_sha256(&dest_clone, &expected).is_ok()
                 })
                 .await
                 .unwrap_or_else(|join_err| {
@@ -705,7 +696,7 @@ async fn download_retry_loop() {
 
         if attempt >= MAX_DOWNLOAD_RETRIES {
             warn!("Local transcriber: max retries ({MAX_DOWNLOAD_RETRIES}) reached, giving up");
-            STATE.store(STATE_FAILED, Ordering::Release);
+            STATE.store(ModelState::Failed, Ordering::Release);
             return;
         }
 
@@ -717,33 +708,6 @@ async fn download_retry_loop() {
         );
         tokio::time::sleep(sleep_dur).await;
     }
-}
-
-/// Verify a file's SHA256 checksum against an expected value.
-///
-/// Uses streaming SHA256 via [`Sha256::update`] to avoid loading the
-/// entire file into memory (model files can be 1.88 GB).
-fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let mut hasher = Sha256::new();
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("Failed to open {} for SHA256 verification", path.display()))?;
-    let mut buf = vec![0u8; 65536]; // 64 KB heap buffer
-    loop {
-        let n = file.read(&mut buf).with_context(|| {
-            format!("Failed to read {} for SHA256 verification", path.display())
-        })?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let actual = crate::util::hex_string(&hasher.finalize());
-    if actual != expected {
-        anyhow::bail!("SHA256 mismatch: expected {expected}, got {actual}");
-    }
-    Ok(())
 }
 
 // ── Public API ────────────────────────────────────────────────────────
@@ -760,9 +724,9 @@ async fn try_init_inner(dir: PathBuf) -> bool {
         // Verify checksums on a blocking thread (large file I/O).
         let paths = (model_path.clone(), vocab_path.clone(), merges_path.clone());
         let checksums_ok = tokio::task::spawn_blocking(move || {
-            verify_sha256(&paths.0, MODEL_SHA256).is_ok()
-                && verify_sha256(&paths.1, VOCAB_SHA256).is_ok()
-                && verify_sha256(&paths.2, MERGES_SHA256).is_ok()
+            crate::util::verify_sha256(&paths.0, MODEL_SHA256).is_ok()
+                && crate::util::verify_sha256(&paths.1, VOCAB_SHA256).is_ok()
+                && crate::util::verify_sha256(&paths.2, MERGES_SHA256).is_ok()
         })
         .await
         .unwrap_or_else(|join_err| {
@@ -792,7 +756,7 @@ async fn try_init_inner(dir: PathBuf) -> bool {
     // Spawn background download.
     if tokio::runtime::Handle::try_current().is_err() {
         warn!("Local transcriber: no tokio runtime available");
-        STATE.store(STATE_FAILED, Ordering::Release);
+        STATE.store(ModelState::Failed, Ordering::Release);
         return false;
     }
 
@@ -804,21 +768,21 @@ async fn try_init_inner(dir: PathBuf) -> bool {
 /// Try to shortcut or acquire the initialisation lock.
 ///
 /// Returns `None` if the caller acquired the lock and should proceed.
-/// Returns `Some(true)` if already initialised (STATE_READY) — caller
+/// Returns `Some(true)` if already initialised (ModelState::Ready) — caller
 /// should return success.
 /// Returns `Some(false)` if another thread is loading or a previous
 /// attempt failed — caller should return failure.
 fn try_lock_init() -> Option<bool> {
     match STATE.load(Ordering::Acquire) {
-        STATE_READY => return Some(true),
-        STATE_UNINIT => {}
+        ModelState::Ready => return Some(true),
+        ModelState::Uninit => {}
         _ => return Some(false),
     }
 
     if STATE
         .compare_exchange(
-            STATE_UNINIT,
-            STATE_LOADING,
+            ModelState::Uninit,
+            ModelState::Loading,
             Ordering::AcqRel,
             Ordering::Acquire,
         )
@@ -841,7 +805,7 @@ pub async fn try_init_from_cache() -> bool {
     }
 
     let Some(dir) = model_dir() else {
-        STATE.store(STATE_FAILED, Ordering::Release);
+        STATE.store(ModelState::Failed, Ordering::Release);
         return false;
     };
 
@@ -850,7 +814,7 @@ pub async fn try_init_from_cache() -> bool {
 
 /// True if the local transcriber is loaded and ready for use.
 pub fn is_loaded() -> bool {
-    STATE.load(Ordering::Acquire) == STATE_READY
+    STATE.load(Ordering::Acquire) == ModelState::Ready
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -873,33 +837,6 @@ mod tests {
         assert_eq!(hex.len(), 512);
         assert!(hex.starts_with("00010203"));
         assert!(hex.ends_with("fcfdfeff"));
-    }
-
-    // ── verify_sha256 ───────────────────────────────────────────────────
-
-    #[test]
-    fn test_verify_sha256_match() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.bin");
-        std::fs::write(&path, b"test data").unwrap();
-        let hash = "916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9";
-        assert!(verify_sha256(&path, hash).is_ok());
-    }
-
-    #[test]
-    fn test_verify_sha256_mismatch() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.bin");
-        std::fs::write(&path, b"different data").unwrap();
-        let hash = "916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9";
-        assert!(verify_sha256(&path, hash).is_err());
-    }
-
-    #[test]
-    fn test_verify_sha256_file_not_found() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nonexistent.bin");
-        assert!(verify_sha256(&path, "").is_err());
     }
 
     // ── decode_audio_to_mono_f32 — synthetic WAV ────────────────────────

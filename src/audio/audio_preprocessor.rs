@@ -356,8 +356,8 @@ impl AudioPreprocessor {
             return samples;
         }
 
-        let sum_sq: f32 = samples.iter().map(|&s| s * s).sum();
-        let chunk_rms = (sum_sq / samples.len() as f32).sqrt();
+        // Shared RMS helper (mahbot-1043); empty input already returned above.
+        let chunk_rms = crate::util::compute_rms(&samples);
 
         if chunk_rms == 0.0 {
             // Pure silence — freeze EMA state instead of decaying running_rms

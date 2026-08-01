@@ -28,6 +28,7 @@
 //! or dead code.
 
 use crate::util::UnwrapPoison;
+use crate::util::model_state::{AtomicModelState, ModelState};
 use anyhow::{Context, Result, anyhow};
 use candle_core::quantized::{QMatMul, gguf_file};
 use candle_core::{DType, Device, Tensor};
@@ -38,7 +39,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
@@ -86,7 +87,13 @@ const TOKENIZER_FILENAME: &str = "embed_tokenizer.json";
 
 // ── Global state ─────────────────────────────────────────────────────
 
-/// Embedder state machine.
+/// Global embedder singleton, wrapped in an Option for graceful degradation.
+static GLOBAL_EMBEDDER: RwLock<Option<Embedder>> = RwLock::new(None);
+
+/// Atomic state tracker to coordinate lazy initialization.
+///
+/// Embedder state machine (shared wrapper extracted in mahbot-1043:
+/// [`crate::util::model_state::ModelState`]).
 ///
 /// # States
 ///
@@ -114,47 +121,33 @@ const TOKENIZER_FILENAME: &str = "embed_tokenizer.json";
 /// |            |            | SHA256-verified files fail to load (bug            |
 /// |            |            | in [`Embedder::load()`]).                           |
 /// |            |            | [`download_retry_loop()`] transitions state to      |
-/// |            |            | [`STATE_FAILED`] and returns.                       |
+/// |            |            | [`ModelState::Failed`] and returns.                       |
 /// | `LOADING`  | `FAILED`   | **HTTP client build failure:** reqwest client      |
 /// |            |            | construction fails in [`download_retry_loop()`]     |
 /// |            |            | (e.g. TLS backend unavailable).                     |
 /// |            |            | [`download_retry_loop()`] transitions state to      |
-/// |            |            | [`STATE_FAILED`] and returns.                       |
+/// |            |            | [`ModelState::Failed`] and returns.                       |
 /// | `LOADING`  | `FAILED`   | **Background task panic:** [`EmbedderGuard`]'s      |
-/// |            |            | [`Drop`] guard transitions state to [`STATE_FAILED`]|
+/// |            |            | [`Drop`] guard transitions state to [`ModelState::Failed`]|
 /// |            |            | when [`download_retry_loop()`] is dropped without   |
 /// |            |            | reaching a terminal state (e.g. a panic in Candle   |
 /// |            |            | or tokenizers).                                      |
 /// | `LOADING`  | `FAILED`   | **No tokio runtime:** [`ensure_embedder()`] checks   |
 /// |            |            | [`tokio::runtime::Handle::try_current()`] and        |
-/// |            |            | transitions to [`STATE_FAILED`] if no tokio runtime  |
+/// |            |            | transitions to [`ModelState::Failed`] if no tokio runtime  |
 /// |            |            | is available (cannot spawn background download).      |
 ///
 /// Once STATE reaches `READY` or `FAILED` it stays there for the lifetime of the process.
-const STATE_UNINIT: u8 = 0;
-const STATE_LOADING: u8 = 1;
-const STATE_READY: u8 = 2;
+static STATE: AtomicModelState = AtomicModelState::new(ModelState::Uninit);
 
-/// Embedder initialization failed terminally.
-///
-/// Once STATE reaches `FAILED` it stays there for the lifetime of the process.
-/// A restart is required to re-attempt initialization.
-const STATE_FAILED: u8 = 3;
-
-/// Global embedder singleton, wrapped in an Option for graceful degradation.
-static GLOBAL_EMBEDDER: RwLock<Option<Embedder>> = RwLock::new(None);
-
-/// Atomic state tracker to coordinate lazy initialization.
-static STATE: AtomicU8 = AtomicU8::new(STATE_UNINIT);
-
-/// Atomically store a ready [`Embedder`] and transition state to [`STATE_READY`].
+/// Atomically store a ready [`Embedder`] and transition state to [`ModelState::Ready`].
 ///
 /// This bundles the two operations (RwLock write + state transition) into a single
 /// call so no future code path can do one without the other.
 #[inline]
 fn set_embedder_ready(emb: Embedder) {
     *GLOBAL_EMBEDDER.write().unwrap_poison() = Some(emb);
-    STATE.store(STATE_READY, Ordering::Release);
+    STATE.store(ModelState::Ready, Ordering::Release);
 }
 
 /// Try to initialize the embedder (sync load from cache or spawn background download).
@@ -165,22 +158,22 @@ fn set_embedder_ready(emb: Embedder) {
 /// # Graceful degradation
 ///
 /// The sync cache-load path runs synchronously. If no tokio runtime is available to
-/// spawn the background download task, [`STATE`] transitions from [`STATE_LOADING`] to
-/// [`STATE_FAILED`] so subsequent calls return `false` immediately. Panics during sync
+/// spawn the background download task, [`STATE`] transitions from [`ModelState::Loading`] to
+/// [`ModelState::Failed`] so subsequent calls return `false` immediately. Panics during sync
 /// load (e.g., Candle-internal bugs or OOM) propagate to the caller — OOM aborts the
 /// process regardless, and Candle panics are code bugs that should fail loud and fast.
 fn ensure_embedder() -> bool {
     match STATE.load(Ordering::Acquire) {
-        STATE_READY => return true,
-        STATE_UNINIT => {} // proceed to initialize
-        _ => return false, // STATE_LOADING, STATE_FAILED, or unexpected state
+        ModelState::Ready => return true,
+        ModelState::Uninit => {} // proceed to initialize
+        _ => return false,       // ModelState::Loading, ModelState::Failed, or unexpected state
     }
 
     // Try to become the initializer (atomic CAS to prevent races)
     if STATE
         .compare_exchange(
-            STATE_UNINIT,
-            STATE_LOADING,
+            ModelState::Uninit,
+            ModelState::Loading,
             Ordering::AcqRel,
             Ordering::Acquire,
         )
@@ -218,7 +211,7 @@ fn ensure_embedder() -> bool {
     // return false immediately.
     if tokio::runtime::Handle::try_current().is_err() {
         warn!("Embedder: no tokio runtime available — transitioning to FAILED");
-        STATE.store(STATE_FAILED, Ordering::Release);
+        STATE.store(ModelState::Failed, Ordering::Release);
         return false;
     }
     tokio::spawn(download_retry_loop());
@@ -262,30 +255,30 @@ where
 
 // ── Background download with retry ────────────────────────────────────
 
-/// Guard that transitions [`STATE`] from [`STATE_LOADING`] to [`STATE_FAILED`] on drop.
+/// Guard that transitions [`STATE`] from [`ModelState::Loading`] to [`ModelState::Failed`] on drop.
 ///
 /// If the background download task panics (e.g., a future dependency bug in Candle or
 /// tokenizers), Tokio catches the panic and swallows it. Without this guard, [`STATE`]
-/// would remain permanently stuck in [`STATE_LOADING`], causing every subsequent call
+/// would remain permanently stuck in [`ModelState::Loading`], causing every subsequent call
 /// to [`ensure_embedder()`] to return `false` immediately, silently disabling semantic
 /// search until the process is restarted.
 ///
 /// # Invariants
 ///
-/// * **Normal success:** [`set_embedder_ready()`] sets [`STATE`] to [`STATE_READY`]; the
+/// * **Normal success:** [`set_embedder_ready()`] sets [`STATE`] to [`ModelState::Ready`]; the
 ///   guard's CAS is a no-op (wrong expected value).
-/// * **Explicit terminal failure:** The function stores [`STATE_FAILED`] before returning;
+/// * **Explicit terminal failure:** The function stores [`ModelState::Failed`] before returning;
 ///   the guard's CAS is a no-op (wrong expected value).
-/// * **Panic / early drop:** [`STATE`] is still [`STATE_LOADING`]; the CAS succeeds and
-///   transitions to [`STATE_FAILED`].
+/// * **Panic / early drop:** [`STATE`] is still [`ModelState::Loading`]; the CAS succeeds and
+///   transitions to [`ModelState::Failed`].
 struct EmbedderGuard;
 
 impl Drop for EmbedderGuard {
     fn drop(&mut self) {
         STATE
             .compare_exchange(
-                STATE_LOADING,
-                STATE_FAILED,
+                ModelState::Loading,
+                ModelState::Failed,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -338,7 +331,7 @@ async fn download_retry_loop() {
         .build()
     else {
         warn!("Embedder: failed to build HTTP client — background download cancelled");
-        STATE.store(STATE_FAILED, Ordering::Release);
+        STATE.store(ModelState::Failed, Ordering::Release);
         return;
     };
 
@@ -398,7 +391,7 @@ async fn download_retry_loop() {
                  failed to load. This indicates a code-level issue with Embedder::load(). \
                  The model will remain unavailable for this session (FTS-only fallback)."
             );
-            STATE.store(STATE_FAILED, Ordering::Release);
+            STATE.store(ModelState::Failed, Ordering::Release);
             return;
         }
 
@@ -1139,7 +1132,7 @@ mod tests {
     /// Reset global embedder state for hermetic testing.
     fn reset_global_state() {
         *GLOBAL_EMBEDDER.write().unwrap_poison() = None;
-        STATE.store(STATE_UNINIT, Ordering::Release);
+        STATE.store(ModelState::Uninit, Ordering::Release);
     }
 
     #[tokio::test]
@@ -1171,14 +1164,17 @@ mod tests {
 
         // Manually set STATE to FAILED (simulates the terminal condition from
         // download_retry_loop after freshly-downloaded files fail to load).
-        STATE.store(STATE_FAILED, Ordering::Release);
+        STATE.store(ModelState::Failed, Ordering::Release);
 
         // First call: should return false immediately
         let r1 = ensure_embedder();
-        assert!(!r1, "ensure_embedder should return false in STATE_FAILED");
+        assert!(
+            !r1,
+            "ensure_embedder should return false in ModelState::Failed"
+        );
         assert_eq!(
             STATE.load(Ordering::Acquire),
-            STATE_FAILED,
+            ModelState::Failed,
             "STATE should remain FAILED after ensure_embedder()"
         );
 
@@ -1187,7 +1183,7 @@ mod tests {
         assert!(!r2, "ensure_embedder should still return false");
         assert_eq!(
             STATE.load(Ordering::Acquire),
-            STATE_FAILED,
+            ModelState::Failed,
             "STATE should remain FAILED after second call"
         );
         // Clean up state for subsequent tests
@@ -1195,12 +1191,12 @@ mod tests {
     }
 
     /// Test that [`ensure_embedder()`] handles the absence of a tokio runtime
-    /// gracefully by transitioning [`STATE`] to [`STATE_FAILED`].
+    /// gracefully by transitioning [`STATE`] to [`ModelState::Failed`].
     ///
     /// This is a regular `#[test]`, not `#[tokio::test]`, so there is no tokio
     /// runtime active. When `ensure_embedder()` reaches the runtime check via
     /// [`tokio::runtime::Handle::try_current()`], it detects the absence and sets
-    /// [`STATE_FAILED`], preventing a permanent wedge.
+    /// [`ModelState::Failed`], preventing a permanent wedge.
     #[test]
     fn test_ensure_embedder_no_runtime() {
         let _lock = TEST_GLOBAL_STATE_MUTEX.lock().unwrap();
@@ -1218,7 +1214,7 @@ mod tests {
         );
         assert_eq!(
             STATE.load(Ordering::Acquire),
-            STATE_FAILED,
+            ModelState::Failed,
             "STATE should be FAILED after detecting no tokio runtime"
         );
 
@@ -1227,7 +1223,7 @@ mod tests {
         assert!(!r2, "ensure_embedder should still return false");
         assert_eq!(
             STATE.load(Ordering::Acquire),
-            STATE_FAILED,
+            ModelState::Failed,
             "STATE should remain FAILED"
         );
 

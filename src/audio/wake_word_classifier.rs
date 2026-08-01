@@ -458,50 +458,50 @@ pub struct ClassifierTrainingResult {
     /// Best validation loss achieved during training.
     pub best_val_loss: f32,
     /// Mean positive class score after training.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub pos_scores_mean: f32,
     /// Minimum positive class score after training.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub pos_scores_min: f32,
     /// Maximum positive class score after training.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub pos_scores_max: f32,
     /// Mean negative class score after training.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub neg_scores_mean: f32,
     /// Minimum negative class score after training.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub neg_scores_min: f32,
     /// Maximum negative class score after training.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub neg_scores_max: f32,
     /// Per-epoch training loss (cross-entropy over the training split),
     /// one entry per epoch actually trained (mahbot-1005 §5).
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub per_epoch_train_loss: Vec<f32>,
     /// Per-epoch validation loss, one entry per epoch actually trained.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub per_epoch_val_loss: Vec<f32>,
     /// Per-epoch validation accuracy (pred > 0.5 matches the label),
     /// one entry per epoch actually trained.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub per_epoch_val_accuracy: Vec<f32>,
     /// Why training stopped: `"max_epochs"` or `"early_stopping"`.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub early_stop_reason: String,
     /// Number of training windows (after the random train/val split).
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub n_train_windows: usize,
     /// Number of validation windows (after the random train/val split).
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub n_val_windows: usize,
     /// Decile boundaries of the training-set positive-window scores
     /// (mahbot-1005 §3).  `None` when no positive windows existed.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub pos_scores_deciles: Option<[f32; 10]>,
     /// Decile boundaries of the training-set negative-window scores
     /// (mahbot-1005 §3).
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub neg_scores_deciles: Option<[f32; 10]>,
 }
 
@@ -1235,7 +1235,9 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
-
+    // Shared test fixture (mahbot-1043): single authoritative make_seq body
+    // lives next to the EmbeddingSequence type; local builders drifted once.
+    use crate::audio::embedding_sequence::make_test_sequence as make_seq;
     #[test]
     fn test_forward_constant() {
         let embs: Vec<Vec<f32>> = (0..WINDOW_SIZE).map(|_| vec![0.5; EMBEDDING_DIM]).collect();
@@ -1261,19 +1263,6 @@ mod tests {
         let c = WakeWordClassifier::new(w);
         let score = c.forward(&embs);
         assert!((score - 0.5).abs() < 1e-4, "Expected 0.5, got {score}");
-    }
-
-    fn make_seq(embs: Vec<Vec<f32>>, label: LabelStratum) -> EmbeddingSequence {
-        EmbeddingSequence {
-            id: crate::audio::embedding_sequence::UtteranceId {
-                sequence_index: 0,
-                variant_index: 0,
-            },
-            source: crate::audio::embedding_sequence::Source::Enrollment,
-            augmentation_family: None,
-            label_stratum: label,
-            embeddings: embs,
-        }
     }
 
     #[test]

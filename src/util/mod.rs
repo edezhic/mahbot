@@ -5,6 +5,7 @@ pub(crate) mod html;
 pub(crate) mod http;
 pub(crate) mod json;
 pub(crate) mod macros;
+pub(crate) mod model_state;
 #[cfg(test)]
 pub(crate) mod test;
 pub(crate) mod tree_sitter;
@@ -12,11 +13,15 @@ pub(crate) mod tree_sitter;
 use directories::UserDirs;
 use regex::Regex;
 use regex::RegexBuilder;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+use anyhow::{Context as _, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rand::{RngExt, SeedableRng};
+use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::Read;
 
 /// Extension trait to unwrap poisoned lock results, replacing
 /// `.unwrap_or_else(std::sync::PoisonError::into_inner)` with `.unwrap_poison()`.
@@ -121,6 +126,48 @@ pub(crate) fn hex_string(bytes: &[u8]) -> String {
             let _ = write!(acc, "{b:02x}");
             acc
         })
+}
+
+/// Verify a file's SHA256 hash matches the expected hex string (mahbot-1043).
+///
+/// Shared model-integrity verifier extracted from the three near-identical
+/// private streaming copies in `audio::tts`, `audio::local_transcriber`, and
+/// `audio::voice` (whose empty-`expected` skip semantics and error wording had
+/// drifted).  Model-download integrity is security-adjacent, so the copies are
+/// consolidated here.
+///
+/// * If `expected` is empty, verification is skipped (returns `Ok`) — the
+///   canonical "no hash configured" semantics that won the reconciliation.
+/// * Uses streaming SHA256 via [`Sha256::update`] to avoid loading the entire
+///   file into memory (model files can be multiple GB).
+///
+/// Note: unifying the error wording changes user-facing log text at the former
+/// voice.rs call sites (e.g. `"Mel spectrogram model corrupt, re-downloading:
+/// {e}"` now shows the path-qualified mismatch message).
+pub(crate) fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
+    if expected.is_empty() {
+        return Ok(()); // no hash configured — skip verification
+    }
+
+    let mut hasher = Sha256::new();
+    let mut file = File::open(path)
+        .with_context(|| format!("Failed to open {} for SHA256 verification", path.display()))?;
+    let mut buf = vec![0u8; 65536]; // 64 KB heap buffer
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let actual = hex_string(&hasher.finalize());
+    if actual != expected {
+        anyhow::bail!(
+            "SHA256 mismatch for {}: expected {expected}, got {actual}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Expand a leading tilde (`~`) to the user's home directory.
@@ -928,9 +975,7 @@ pub(crate) fn generate_pink_noise(len: usize, mut rng: impl rand::Rng) -> Vec<f3
     }
 
     // Normalize to unit RMS
-    let rms = (noise.iter().map(|&s| s * s).sum::<f32>() / noise.len() as f32)
-        .sqrt()
-        .max(1e-10);
+    let rms = compute_rms(&noise).max(1e-10);
     for s in &mut noise {
         *s /= rms;
     }
@@ -947,18 +992,14 @@ pub(crate) fn add_noise(pcm: &[f32], snr_db: f32, seed: u64) -> Vec<f32> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
     // Compute signal RMS
-    let signal_rms = (pcm.iter().map(|&s| s * s).sum::<f32>() / pcm.len() as f32)
-        .sqrt()
-        .max(1e-10);
+    let signal_rms = compute_rms(pcm).max(1e-10);
 
     // Generate pink noise
     let mut noise = generate_pink_noise(pcm.len(), &mut rng);
 
     // Scale noise to desired SNR: noise_rms = signal_rms * 10^(-snr_db/20)
     let noise_rms_target = signal_rms * 10.0_f32.powf(-snr_db / 20.0);
-    let noise_rms_current = (noise.iter().map(|&s| s * s).sum::<f32>() / noise.len() as f32)
-        .sqrt()
-        .max(1e-10);
+    let noise_rms_current = compute_rms(&noise).max(1e-10);
     let scale = noise_rms_target / noise_rms_current;
     for s in &mut noise {
         *s *= scale;
@@ -996,14 +1037,86 @@ pub(crate) enum NoiseType {
 }
 
 /// Compute the RMS (root mean square) of audio samples.
+///
+/// Returns `0.0` for empty input.  Ungated in mahbot-1043 so production hot
+/// paths (AGC, noise generation, utterance quality) share one implementation
+/// instead of hand-rolling `sum(x²)/n → sqrt`.  Callers that need a
+/// divide-by-zero floor for degenerate all-zero input apply `.max(1e-10)` at
+/// the call site — it is deliberately NOT part of this function.
 #[allow(clippy::cast_precision_loss)]
-#[cfg(any(test, feature = "voice-tests"))]
 pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
     let sum_sq: f32 = samples.iter().map(|&s| s * s).sum();
     (sum_sq / samples.len() as f32).sqrt()
+}
+
+/// Compute both Box-Muller branches from two uniform draws in `(0, 1]`
+/// (mahbot-1043).
+///
+/// `z1 = sqrt(-2 ln u1) cos(2π u2)`, `z2 = sqrt(-2 ln u1) sin(2π u2)`.
+/// This is the shared math behind the five former duplicate samplers; the
+/// draw policy (zero-rejection vs EPSILON-clamp) lives in the two wrappers
+/// below so each site's exact RNG draw sequence is preserved.
+#[must_use]
+#[inline]
+pub(crate) fn gaussian_pair_from_uniforms(u1: f32, u2: f32) -> (f32, f32) {
+    let r = (-2.0 * u1.ln()).sqrt();
+    let theta = 2.0 * core::f32::consts::PI * u2;
+    (r * theta.cos(), r * theta.sin())
+}
+
+/// Draw a standard-normal pair via Box-Muller with zero-rejection semantics
+/// (2 draws per sample; callers needing one sample use `.0` and discard the
+/// sin branch, preserving the verifier family's historical draw rate).
+///
+/// Draws are re-rolled while either uniform is `0.0` (rejection loop), exactly
+/// matching the former `voice_verifier` copies.  `tts.rs`'s deliberately
+/// custom xorshift generator is a separate concern and is NOT routed through
+/// this helper.
+pub(crate) fn sample_gaussian_pair(rng: &mut impl rand::Rng) -> (f32, f32) {
+    loop {
+        let u1: f32 = rng.random();
+        let u2: f32 = rng.random();
+        if u1 > 0.0 && u2 > 0.0 {
+            return gaussian_pair_from_uniforms(u1, u2);
+        }
+    }
+}
+
+/// Draw a single standard-normal value with the verifier-family zero-rejection
+/// loop, folding a scale factor into the cos branch in the exact historical
+/// operation order (`scale * r * cos(theta)` evaluates as `(scale * r) *
+/// cos(theta)`, matching the pre-extraction test helpers byte-for-byte).
+///
+/// The sin branch is discarded.  This is the "per-family thin wrapper over
+/// shared math" the mahbot-1043 manager pin allowed — the draw sequence is
+/// identical to [`sample_gaussian_pair`], only the returned expression shape
+/// differs.  Only the verifier test helpers use it, so it is test-gated.
+#[cfg(test)]
+pub(crate) fn sample_gaussian_scaled(rng: &mut impl rand::Rng, scale: f32) -> f32 {
+    loop {
+        let u1: f32 = rng.random();
+        let u2: f32 = rng.random();
+        if u1 > 0.0 && u2 > 0.0 {
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = 2.0 * core::f32::consts::PI * u2;
+            return scale * r * theta.cos();
+        }
+    }
+}
+
+/// Draw a standard-normal pair via Box-Muller with EPSILON-clamped draws
+/// (2 draws per 2 samples).  Preserves the bench's draw sequence and
+/// degenerate-input semantics (`u1`/`u2` floored at [`f32::EPSILON`] rather
+/// than re-rolled).  Used by the `voice-tests` bench and the seeded-sequence
+/// equivalence test.
+#[cfg_attr(not(any(feature = "voice-tests", test)), allow(dead_code))]
+pub(crate) fn sample_gaussian_pair_clamped(rng: &mut impl rand::Rng) -> (f32, f32) {
+    let u1: f32 = rng.random::<f32>().max(f32::EPSILON);
+    let u2: f32 = rng.random::<f32>().max(f32::EPSILON);
+    gaussian_pair_from_uniforms(u1, u2)
 }
 
 /// Mix white or pink noise into audio at a given SNR (dB).
@@ -1137,6 +1250,341 @@ mod strip_ansi_escapes_tests {
         ];
         for (input, expected) in cases {
             assert_eq!(strip_ansi_escapes(input), *expected, "input: {input:?}");
+        }
+    }
+}
+
+// ── Shared model-integrity verifier (mahbot-1043) ─────────────────────────
+// Tests consolidated from the three former private copies (tts,
+// local_transcriber, voice).  The file-not-found error path is covered with a
+// NON-empty expected hash because the shared empty-hash skip returns Ok before
+// opening the file (sanctioned reconciliation of the transcriber's original
+// `verify_sha256(path, "").is_err()` assertion).
+
+#[cfg(test)]
+mod verify_sha256_tests {
+    use super::verify_sha256;
+
+    fn sha256_hex(data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        super::hex_string(&hasher.finalize())
+    }
+
+    #[test]
+    fn matching_hash_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        std::fs::write(&path, b"test data").unwrap();
+        let hash = sha256_hex(b"test data");
+        assert!(verify_sha256(&path, &hash).is_ok());
+    }
+
+    #[test]
+    fn mismatching_hash_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        std::fs::write(&path, b"different data").unwrap();
+        let hash = sha256_hex(b"test data");
+        assert!(verify_sha256(&path, &hash).is_err());
+    }
+
+    #[test]
+    fn empty_hash_skips_verification() {
+        // Empty expected hash → Ok without opening the file (skip semantics).
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nonexistent.bin");
+        assert!(
+            verify_sha256(&missing, "").is_ok(),
+            "empty SHA256 expected hash should skip verification"
+        );
+    }
+
+    #[test]
+    fn file_not_found_with_non_empty_hash_fails() {
+        // The file-not-found error path: requires a non-empty expected hash
+        // (the empty-hash skip above returns Ok before any file I/O).
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nonexistent.bin");
+        let hash = sha256_hex(b"anything");
+        assert!(verify_sha256(&missing, &hash).is_err());
+    }
+}
+
+// ── Audio utility regression tests (mahbot-1043) ──────────────────────────
+// Moved verbatim from voice.rs (post-1029 stranded util tests) so the util
+// module has an in-place regression net for speed perturbation, gain, noise,
+// and pink noise.
+
+#[cfg(test)]
+mod audio_util_tests {
+    use super::{add_noise, apply_gain, generate_pink_noise, speed_perturbation};
+    use rand::SeedableRng;
+
+    #[test]
+    fn test_speed_perturbation_identity() {
+        // rate=1.0 should return approximately the original
+        let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
+        let result = speed_perturbation(&pcm, 16000, 1.0);
+        assert_eq!(result.len(), pcm.len(), "identity should preserve length");
+        for (a, b) in pcm.iter().zip(result.iter()) {
+            assert!((a - b).abs() < 1e-5, "identity should preserve values");
+        }
+    }
+
+    #[test]
+    fn test_speed_perturbation_rates() {
+        // Slow down: rate=0.5 should produce more samples
+        let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
+        let slowed = speed_perturbation(&pcm, 16000, 0.5);
+        assert!(
+            slowed.len() > pcm.len(),
+            "rate < 1 should increase sample count"
+        );
+        // Speed up: rate=2.0 should produce fewer samples
+        let sped_up = speed_perturbation(&pcm, 16000, 2.0);
+        assert!(
+            sped_up.len() < pcm.len(),
+            "rate > 1 should decrease sample count"
+        );
+    }
+
+    #[test]
+    fn test_speed_perturbation_determinism() {
+        // Same input + same rate → same output
+        let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
+        let a = speed_perturbation(&pcm, 16000, 0.95);
+        let b = speed_perturbation(&pcm, 16000, 0.95);
+        assert_eq!(a, b, "deterministic speed perturbation");
+    }
+
+    #[test]
+    fn test_apply_gain_determinism() {
+        // apply_gain must be deterministic: same PCM + same gain_db → same output
+        let pcm: Vec<f32> = (0..50).map(|i| (i as f32 - 25.0) / 25.0).collect();
+        let a = apply_gain(&pcm, -3.0);
+        let b = apply_gain(&pcm, -3.0);
+        assert_eq!(a, b, "apply_gain must be deterministic");
+    }
+
+    #[test]
+    fn test_apply_gain_db_conversion() {
+        // 0 dB → unity gain (output == input)
+        let pcm: Vec<f32> = vec![0.5, -0.3, 0.1, -0.7, 0.9];
+        let unity = apply_gain(&pcm, 0.0);
+        for (a, b) in pcm.iter().zip(unity.iter()) {
+            assert!((a - b).abs() < 1e-6, "0 dB gain should be unity");
+        }
+        // -6 dB → amplitude halved (10^(-6/20) ≈ 0.5)
+        let attenuated = apply_gain(&pcm, -6.0);
+        let expected_amp = 10.0_f32.powf(-6.0 / 20.0);
+        for (orig, atten) in pcm.iter().zip(attenuated.iter()) {
+            assert!(
+                (atten - orig * expected_amp).abs() < 1e-6,
+                "-6 dB gain should multiply by {expected_amp}"
+            );
+        }
+        // +6 dB → amplitude doubled (10^(6/20) ≈ 2.0)
+        let amplified = apply_gain(&pcm, 6.0);
+        let expected_amp2 = 10.0_f32.powf(6.0 / 20.0);
+        for (orig, amp) in pcm.iter().zip(amplified.iter()) {
+            assert!(
+                (amp - orig * expected_amp2).abs() < 1e-6,
+                "+6 dB gain should multiply by {expected_amp2}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_add_noise_determinism() {
+        // Same PCM + same SNR + same seed → same output
+        let pcm: Vec<f32> = (0..200).map(|i| (i as f32 - 100.0) / 100.0).collect();
+        let a = add_noise(&pcm, 25.0, 42);
+        let b = add_noise(&pcm, 25.0, 42);
+        assert_eq!(a.len(), b.len(), "add_noise output length should match");
+        assert_eq!(a, b, "add_noise with same seed must be deterministic");
+    }
+
+    #[test]
+    fn test_add_noise_seed_variation() {
+        // Different seed → different output
+        let pcm: Vec<f32> = (0..200).map(|i| (i as f32 - 100.0) / 100.0).collect();
+        let a = add_noise(&pcm, 25.0, 42);
+        let b = add_noise(&pcm, 25.0, 99);
+        assert_ne!(a, b, "different seeds should produce different output");
+    }
+
+    #[test]
+    fn test_add_noise_snr_approximation() {
+        // At very high SNR (100 dB), the output should be very close to input
+        let pcm: Vec<f32> = (0..1000).map(|i| (i as f32 - 500.0) / 500.0).collect();
+        let noisy = add_noise(&pcm, 100.0, 42);
+        // Compute actual SNR of output vs input
+        let signal_power: f32 = pcm.iter().map(|&s| s * s).sum();
+        let noise_power: f32 = pcm
+            .iter()
+            .zip(noisy.iter())
+            .map(|(&s, &n)| (n - s) * (n - s))
+            .sum();
+        let actual_snr_db = 10.0 * (signal_power / noise_power.max(1e-10)).log10();
+        assert!(
+            actual_snr_db > 80.0,
+            "at 100 dB target, actual SNR should be high (was {actual_snr_db:.1} dB)"
+        );
+    }
+
+    #[test]
+    fn test_generate_pink_noise_properties() {
+        // Pink noise should have positive and negative values
+        let noise = generate_pink_noise(1000, rand::rngs::StdRng::seed_from_u64(42));
+        assert_eq!(noise.len(), 1000);
+        let has_positive = noise.iter().any(|&s| s > 0.0);
+        let has_negative = noise.iter().any(|&s| s < 0.0);
+        assert!(has_positive, "pink noise should have positive values");
+        assert!(has_negative, "pink noise should have negative values");
+        // RMS should be near 1.0 (normalized)
+        let rms = super::compute_rms(&noise);
+        assert!(
+            (rms - 1.0).abs() < 0.1,
+            "pink noise RMS should be near 1.0 (was {rms})"
+        );
+    }
+
+    #[test]
+    fn test_augmentation_variants_are_different() {
+        // Verify that the 4 augmentation strategies produce different results
+        let pcm: Vec<f32> = (0..500).map(|i| (i as f32 - 250.0) / 250.0).collect();
+        let speed_down = speed_perturbation(&pcm, 16000, 0.95);
+        let speed_up = speed_perturbation(&pcm, 16000, 1.05);
+        let volume_down = apply_gain(&pcm, -3.0);
+        let noise = add_noise(&pcm, 25.0, 42);
+
+        // Each variant should differ from original AND each other
+        assert_ne!(speed_down, pcm, "speed-down should differ from original");
+        assert_ne!(speed_up, pcm, "speed-up should differ from original");
+        assert_ne!(volume_down, pcm, "volume-down should differ from original");
+        assert_ne!(noise, pcm, "noise should differ from original");
+
+        // Verify they also differ from each other (different transforms)
+        assert_ne!(
+            speed_down, speed_up,
+            "speed-down and speed-up should differ"
+        );
+        assert_ne!(
+            speed_down, volume_down,
+            "speed-down and volume-down should differ"
+        );
+        assert_ne!(speed_down, noise, "speed-down and noise should differ");
+    }
+}
+
+// ── Shared Gaussian sampler seeded-sequence equivalence (mahbot-1043) ─────
+// MANDATORY verification from the manager pin: the extraction must consume
+// exactly the same RNG draws at every site so seeded outputs stay byte-identical.
+// These tests prove the shared helpers reproduce the pre-extraction inline
+// formulas (zero-rejection verifier family and EPSILON-clamp bench family)
+// over ~8000 seeded draw pairs.
+
+#[cfg(test)]
+mod gaussian_sampler_tests {
+    use super::{
+        gaussian_pair_from_uniforms, sample_gaussian_pair, sample_gaussian_pair_clamped,
+        sample_gaussian_scaled,
+    };
+    use rand::RngExt;
+    use rand::SeedableRng;
+
+    /// Reference: the verifier family's pre-extraction zero-rejection loop
+    /// (2 draws per sample, cos-only, sin discarded).
+    fn reference_verifier_sample(rng: &mut impl rand::Rng) -> f32 {
+        loop {
+            let u1: f32 = rng.random();
+            let u2: f32 = rng.random();
+            if u1 > 0.0 && u2 > 0.0 {
+                let r = (-2.0 * u1.ln()).sqrt();
+                let theta = 2.0 * std::f32::consts::PI * u2;
+                break r * theta.cos();
+            }
+        }
+    }
+
+    /// Reference: the verifier test-helper family's pre-extraction loop with a
+    /// scale folded in the historical operation order `(scale * r) * cos`.
+    fn reference_verifier_scaled(rng: &mut impl rand::Rng, scale: f32) -> f32 {
+        loop {
+            let u1: f32 = rng.random();
+            let u2: f32 = rng.random();
+            if u1 > 0.0 && u2 > 0.0 {
+                let r = (-2.0 * u1.ln()).sqrt();
+                let theta = 2.0 * std::f32::consts::PI * u2;
+                break scale * r * theta.cos();
+            }
+        }
+    }
+
+    /// Reference: the bench's pre-extraction EPSILON-clamp pair sampler
+    /// (2 draws per 2 samples, cos+sin).
+    fn reference_bench_pair(rng: &mut impl rand::Rng) -> (f32, f32) {
+        let u1: f32 = rng.random::<f32>().max(f32::EPSILON);
+        let u2: f32 = rng.random::<f32>().max(f32::EPSILON);
+        let z1 = (-2.0 * u1.ln()).sqrt() * (2.0 * core::f32::consts::PI * u2).cos();
+        let z2 = (-2.0 * u1.ln()).sqrt() * (2.0 * core::f32::consts::PI * u2).sin();
+        (z1, z2)
+    }
+
+    #[test]
+    fn seeded_verifier_sequence_byte_identical() {
+        // Bench seed 43, ~8000 draw pairs with the verifier-family draw pattern.
+        const DRAW_PAIRS: usize = 8000;
+        let mut shared_rng = rand::rngs::StdRng::seed_from_u64(43);
+        let mut ref_rng = rand::rngs::StdRng::seed_from_u64(43);
+        for i in 0..DRAW_PAIRS {
+            let (shared_z1, _) = sample_gaussian_pair(&mut shared_rng);
+            let ref_z1 = reference_verifier_sample(&mut ref_rng);
+            assert_eq!(shared_z1, ref_z1, "z1 divergence at pair {i}");
+        }
+    }
+
+    #[test]
+    fn seeded_verifier_scaled_sequence_byte_identical() {
+        // Scale-folding variant (verifier test helpers) — draw sequence and
+        // `(scale * r) * cos(theta)` operation order must match byte-for-byte.
+        const DRAW_PAIRS: usize = 8000;
+        for &scale in &[0.3_f32, 0.6_f32] {
+            let mut shared_rng = rand::rngs::StdRng::seed_from_u64(43);
+            let mut ref_rng = rand::rngs::StdRng::seed_from_u64(43);
+            for i in 0..DRAW_PAIRS {
+                let shared = sample_gaussian_scaled(&mut shared_rng, scale);
+                let reference = reference_verifier_scaled(&mut ref_rng, scale);
+                assert_eq!(shared, reference, "scaled({scale}) divergence at pair {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn seeded_bench_sequence_byte_identical() {
+        // Bench seed 43; 8000 samples = 4000 draw pairs (2 draws per 2 samples).
+        const DRAW_PAIRS: usize = 4000;
+        let mut shared_rng = rand::rngs::StdRng::seed_from_u64(43);
+        let mut ref_rng = rand::rngs::StdRng::seed_from_u64(43);
+        for i in 0..DRAW_PAIRS {
+            let shared = sample_gaussian_pair_clamped(&mut shared_rng);
+            let reference = reference_bench_pair(&mut ref_rng);
+            assert_eq!(shared.0, reference.0, "bench z1 divergence at pair {i}");
+            assert_eq!(shared.1, reference.1, "bench z2 divergence at pair {i}");
+        }
+    }
+
+    #[test]
+    fn pair_math_matches_inline_formulas() {
+        // gaussian_pair_from_uniforms must equal the inline cos/sin formulas.
+        for &(u1, u2) in &[(0.1, 0.2), (0.5, 0.9), (0.001, 0.999), (0.25, 0.75)] {
+            let (z1, z2) = gaussian_pair_from_uniforms(u1, u2);
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = 2.0 * std::f32::consts::PI * u2;
+            assert_eq!(z1, r * theta.cos(), "z1 for ({u1}, {u2})");
+            assert_eq!(z2, r * theta.sin(), "z2 for ({u1}, {u2})");
         }
     }
 }

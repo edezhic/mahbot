@@ -114,3 +114,25 @@ impl EmbeddingSequence {
         }
     }
 }
+
+/// Test-support helper: wrap flat embeddings into a single sequence with the
+/// canonical enrollment provenance used by both the wake-word classifier and
+/// verifier test modules (mahbot-1043).
+///
+/// Replaces the two byte-identical `make_seq` builders that previously lived
+/// in `wake_word_classifier` and `voice_verifier` test modules — they drifted
+/// once (`augmentation_family`), so the helper lives next to the type it
+/// constructs.
+#[cfg(test)]
+pub(crate) fn make_test_sequence(embs: Vec<Vec<f32>>, label: LabelStratum) -> EmbeddingSequence {
+    EmbeddingSequence {
+        id: UtteranceId {
+            sequence_index: 0,
+            variant_index: 0,
+        },
+        source: Source::Enrollment,
+        augmentation_family: None,
+        label_stratum: label,
+        embeddings: embs,
+    }
+}

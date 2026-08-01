@@ -2718,16 +2718,9 @@ pub(crate) fn generate_synthetic_negatives_from_positives(
                 .iter()
                 .zip(std.iter())
                 .map(|(&b, &s)| {
-                    // Box-Muller N(0,1)
-                    let z = loop {
-                        let u1: f32 = rng.random();
-                        let u2: f32 = rng.random();
-                        if u1 > 0.0 && u2 > 0.0 {
-                            let r = (-2.0 * u1.ln()).sqrt();
-                            let theta = 2.0 * std::f32::consts::PI * u2;
-                            break r * theta.cos();
-                        }
-                    };
+                    // Box-Muller N(0,1) — shared helper (mahbot-1043); the
+                    // sin branch is discarded exactly as the inline copy did.
+                    let (z, _) = crate::util::sample_gaussian_pair(&mut rng);
                     // Perturb the base embedding: move away by noise_scale * sigma
                     // This puts the synthetic negative in the same region as real
                     // speech but shifted toward the distribution tails.
@@ -2858,42 +2851,20 @@ pub(crate) fn assert_weight_tier(
 mod tests {
     use super::*;
     use rand::Rng;
-    use rand::RngExt;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
-
-    /// Helper: wrap flat embeddings into a single EmbeddingSequence for testing.
-    fn make_seq(
-        embs: Vec<Vec<f32>>,
-        label: crate::audio::embedding_sequence::LabelStratum,
-    ) -> EmbeddingSequence {
-        EmbeddingSequence {
-            id: crate::audio::embedding_sequence::UtteranceId {
-                sequence_index: 0,
-                variant_index: 0,
-            },
-            source: crate::audio::embedding_sequence::Source::Enrollment,
-            augmentation_family: None,
-            label_stratum: label,
-            embeddings: embs,
-        }
-    }
+    // Shared test fixture (mahbot-1043): single authoritative make_seq body
+    // lives next to the EmbeddingSequence type; local builders drifted once.
+    use crate::audio::embedding_sequence::make_test_sequence as make_seq;
 
     /// Generate a synthetic 288-dim "positive" window with values clustered
     /// around +0.5 (simulating a wake-word embedding window).
     fn make_positive_embedding(rng: &mut impl Rng) -> Vec<f32> {
         (0..VERIFIER_INPUT_DIM)
             .map(|_| {
-                // Positive cluster: N(0.5, 0.3)
-                loop {
-                    let u1: f32 = rng.random();
-                    let u2: f32 = rng.random();
-                    if u1 > 0.0 && u2 > 0.0 {
-                        let r = (-2.0 * u1.ln()).sqrt();
-                        let theta = 2.0 * std::f32::consts::PI * u2;
-                        break 0.5 + 0.3 * r * theta.cos();
-                    }
-                }
+                // Positive cluster: N(0.5, 0.3).  Shared sampler (mahbot-1043)
+                // preserves the pre-extraction `0.3 * r * cos(theta)` ordering.
+                0.5 + crate::util::sample_gaussian_scaled(rng, 0.3)
             })
             .collect()
     }
@@ -2904,15 +2875,7 @@ mod tests {
         (0..VERIFIER_INPUT_DIM)
             .map(|_| {
                 // Negative cluster: N(-0.5, 0.3)
-                loop {
-                    let u1: f32 = rng.random();
-                    let u2: f32 = rng.random();
-                    if u1 > 0.0 && u2 > 0.0 {
-                        let r = (-2.0 * u1.ln()).sqrt();
-                        let theta = 2.0 * std::f32::consts::PI * u2;
-                        break -0.5 + 0.3 * r * theta.cos();
-                    }
-                }
+                -0.5 + crate::util::sample_gaussian_scaled(rng, 0.3)
             })
             .collect()
     }
@@ -2933,15 +2896,7 @@ mod tests {
                 // some dimensions may overlap with the wake word cluster,
                 // making discrimination harder than the old opposite-direction
                 // negatives.
-                loop {
-                    let u1: f32 = rng.random();
-                    let u2: f32 = rng.random();
-                    if u1 > 0.0 && u2 > 0.0 {
-                        let r = (-2.0 * u1.ln()).sqrt();
-                        let theta = 2.0 * std::f32::consts::PI * u2;
-                        break 0.0 + 0.6 * r * theta.cos();
-                    }
-                }
+                0.0 + crate::util::sample_gaussian_scaled(rng, 0.6)
             })
             .collect()
     }
