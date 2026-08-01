@@ -27,6 +27,12 @@
 //! cargo bench --features voice-tests --bench voice_pipeline_e2e
 //! ```
 //!
+//! NOTE: `--no-default-features` skips the app binary for ALL target
+//! selections (`cargo build`/`check`/`test`/`install`), not just bench — this
+//! is inherent to the `required-features` mechanism (bench-only bin exclusion
+//! is not supported by Cargo; `bench = false` does not work, rust-lang/cargo#15702).
+//! Default builds are unaffected (`full` is default-on; the bin always builds).
+//!
 //! NOTE (mahbot-1041): `[profile.bench]` (opt-level=3, fat LTO,
 //! codegen-units=1) is part of the classifier-fingerprint contract — the
 //! archived baseline anchor is `08c9c7b2c503bca943e2…`.  NEVER modify the
