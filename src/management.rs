@@ -1467,6 +1467,72 @@ async fn record_sanitation_failure(ticket_id: &str, reason: impl std::fmt::Displ
     }
 }
 
+/// Register a sanitation agent in the message router and persist the SAME
+/// suffixed agent ID in the ticket's `assigned_to`.
+///
+/// Returns the registered agent ID and its inbox receiver, ready for
+/// [`run_agent`].
+///
+/// # Why the stored ID must equal the registered ID (mahbot-1035)
+///
+/// [`BoardStore::add_comment`] routes mid-work comments to the agent(s)
+/// listed in `assigned_to` via an exact-match lookup in the message router
+/// (`route_comment_to_agents` → `try_route`). [`BoardStore::claim_sanitation`]
+/// stores the **unsuffixed** base ID (`ticket_{id}_sanitation`) as a
+/// claim-time placeholder, but the run agent registers under a **suffixed**
+/// ID (`ticket_{id}_sanitation_{suffix}` — each run starts a fresh session;
+/// see commit 728e79a). Without this step the two never match and mid-run
+/// comments are silently dropped.
+///
+/// Setting `assigned_to` here — rather than only in `claim_sanitation` —
+/// also covers the re-dispatch path: after [`record_sanitation_failure`]
+/// clears `assigned_to`, retry runs would otherwise execute with
+/// `assigned_to = NULL` (comments unrouted AND the poll loop re-dispatching /
+/// cancelling the agent every cycle until the sanitation circuit breaker
+/// trips).
+///
+/// # Ordering invariant (register-before-set)
+///
+/// The router registration MUST happen before `assigned_to` is updated —
+/// routing looks the stored ID up in the router, so persisting an ID that is
+/// not yet registered would create a drop window.
+///
+/// Uses [`BoardStore::set_assigned_to_no_cancel`] (NOT the cancel variant
+/// [`BoardStore::set_assigned_to`]): the cancel variant calls
+/// `AGENT_REGISTRY.cancel_by_ticket_id`, which would kill a concurrently
+/// running agent for this ticket — orphaning the just-registered router
+/// entry. This mirrors the register-before-set ordering of
+/// [`dispatch_engineer`] and the no-cancel assignment of
+/// [`run_parallel_agents`].
+async fn register_sanitation_agent(
+    ticket_id: &str,
+) -> (
+    String,
+    tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>,
+) {
+    let agent_id = format!(
+        "{}_{}",
+        ticket_agent_id(ticket_id, Role::Sanitation.as_str()),
+        crate::generate_suffix()
+    );
+
+    // Register in the message router so comments can be delivered mid-work.
+    let incoming_rx = message_router::register_agent(&agent_id);
+
+    if let Err(e) = board()
+        .set_assigned_to_no_cancel(ticket_id, Some(&agent_id))
+        .await
+    {
+        warn!(
+            ticket = ticket_id,
+            error = %e,
+            "Failed to persist assigned_to for sanitation agent — mid-run comments may not route",
+        );
+    }
+
+    (agent_id, incoming_rx)
+}
+
 /// Run the sanitation agent to inspect new/untracked files in the workspace.
 ///
 /// Called by [`PollPhase::SanitationCheck`] via [`spawn_dispatch`]. Runs a
@@ -1476,14 +1542,10 @@ async fn record_sanitation_failure(ticket_id: &str, reason: impl std::fmt::Displ
 /// After the agent completes, extracts a structured [`SanitationVerdict`] and
 /// delegates to [`process_sanitation_verdict`] for pass/fail processing.
 async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
-    let agent_id = format!(
-        "{}_{}",
-        ticket_agent_id(&ticket.id, Role::Sanitation.as_str()),
-        crate::generate_suffix()
-    );
-
-    // Register in the message router so comments can be delivered mid-work.
-    let incoming_rx = message_router::register_agent(&agent_id);
+    // Register in the message router AND persist the same suffixed agent ID in
+    // assigned_to so mid-run comments route to this agent (see
+    // register_sanitation_agent for the contract and ordering invariant).
+    let (agent_id, incoming_rx) = register_sanitation_agent(&ticket.id).await;
 
     //
     // Unlike handle_qa_passed (which fails closed on git errors — returning early

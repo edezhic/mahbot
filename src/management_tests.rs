@@ -906,15 +906,119 @@ async fn handle_qa_passed_untracked_files_to_insanitation() {
         "QA passed with untracked files should transition to InSanitation"
     );
 
-    // Verify assigned_to is set to the sanitation agent ID
+    // Verify assigned_to is set to a sanitation agent ID for this ticket.
+    //
+    // `handle_qa_passed` claims with the unsuffixed base ID
+    // (`ticket_{id}_sanitation`); the spawned dispatch task may then overwrite
+    // it with the suffixed registered ID (`ticket_{id}_sanitation_{suffix}`)
+    // before this assertion runs. Both are valid sanitation assignments, so
+    // match the prefix rather than the exact claim-time value — asserting the
+    // exact unsuffixed ID would be racy with the background dispatch.
     let ticket = expect_ticket(board(), &ticket_id).await;
-    let expected_key =
-        crate::session::ticket_agent_id(&ticket_id, crate::Role::Sanitation.as_str());
+    let base_key = crate::session::ticket_agent_id(&ticket_id, crate::Role::Sanitation.as_str());
+    assert!(
+        ticket
+            .assigned_to
+            .as_deref()
+            .is_some_and(|a| a.starts_with(&base_key)),
+        "assigned_to should be a sanitation agent ID for this ticket, got {:?}",
+        ticket.assigned_to,
+    );
+}
+
+// ── Sanitation agent registration / comment routing wiring (mahbot-1035) ──
+
+/// Sanitation dispatch must persist the SAME suffixed agent ID it registers
+/// with the message router — the mahbot-1035 contract.
+///
+/// The board routes mid-work comments to the exact ID stored in
+/// `assigned_to` (`route_comment_to_agents` → `try_route`).
+/// [`BoardStore::claim_sanitation`] stores the unsuffixed base ID as a
+/// placeholder; [`register_sanitation_agent`] must overwrite it with the
+/// suffixed ID the run actually registers, otherwise comments are silently
+/// dropped for the whole phase.
+///
+/// This test exercises the register+assign scaffolding directly (no LLM
+/// involved — `dispatch_sanitation` itself would invoke a real provider) and
+/// verifies end-to-end delivery through `add_comment` → message router.
+#[tokio::test]
+async fn sanitation_register_persists_registered_id() {
+    init_management_test_stores().await;
+    let ws = test_ws_named("/tmp/test_san_register", "ws_san_register");
+    let ticket_id = make_ticket(board(), &ws, "San Register", TicketPhase::InSanitation).await;
+
+    let (agent_id, mut rx) = register_sanitation_agent(&ticket_id).await;
+
+    // The stored ID must be exactly the ID registered in the router — the
+    // mismatch that broke comment routing.
+    let ticket = expect_ticket(board(), &ticket_id).await;
     assert_eq!(
         ticket.assigned_to.as_deref(),
-        Some(expected_key.as_str()),
-        "assigned_to should be set to sanitation agent ID"
+        Some(agent_id.as_str()),
+        "assigned_to must store the exact suffixed agent ID registered in the router"
     );
+
+    // The ID must carry the run-unique suffix (fresh session per run — the
+    // deliberate design from commit 728e79a; must not be dropped).
+    let base = crate::session::ticket_agent_id(&ticket_id, crate::Role::Sanitation.as_str());
+    assert!(
+        agent_id.starts_with(&base) && agent_id.len() > base.len(),
+        "sanitation agent ID must be suffixed for run isolation, got {agent_id}"
+    );
+
+    // Wiring proof: a comment routed to the assigned sanitation agent is
+    // delivered via the message router — no silent drop.
+    board()
+        .add_comment(&ticket_id, "manager", "mid-run ping")
+        .await
+        .expect("add_comment should succeed");
+    let job = rx
+        .try_recv()
+        .expect("comment routed to the assigned sanitation agent should be delivered");
+    assert_eq!(job.content, "mid-run ping");
+    assert_eq!(job.kind, crate::message_router::JobKind::TicketComment);
+
+    message_router::unregister_agent(&agent_id);
+}
+
+/// Pin the mahbot-1035 mismatch shape: an unsuffixed `assigned_to` (the
+/// `claim_sanitation` placeholder) does NOT match the suffixed agent ID a
+/// sanitation run registers — comments are silently dropped.
+///
+/// This is the regression the fix eliminates: [`register_sanitation_agent`]
+/// overwrites the placeholder with the registered suffixed ID so routing
+/// matches. The negative assertion guards against someone "simplifying" the
+/// fix by dropping the suffix instead (which would regress per-run session
+/// isolation).
+#[tokio::test]
+async fn sanitation_unsuffixed_assignment_is_not_routed() {
+    init_management_test_stores().await;
+    let ws = test_ws_named("/tmp/test_san_mismatch", "ws_san_mismatch");
+    let ticket_id = make_ticket(board(), &ws, "San Mismatch", TicketPhase::InSanitation).await;
+
+    // Simulate the pre-fix state: assigned_to holds the unsuffixed base ID
+    // (what claim_sanitation stores) while the run registers the suffixed ID.
+    let base = crate::session::ticket_agent_id(&ticket_id, crate::Role::Sanitation.as_str());
+    board()
+        .set_assigned_to_no_cancel(&ticket_id, Some(&base))
+        .await
+        .expect("set assigned_to");
+    let suffixed = format!("{base}_{}", crate::generate_suffix());
+    let mut rx = message_router::register_agent(&suffixed);
+
+    board()
+        .add_comment(&ticket_id, "manager", "should be dropped")
+        .await
+        .expect("add_comment should succeed");
+
+    // The comment is routed to the unsuffixed ID (not registered) — dropped.
+    assert!(
+        rx.try_recv().is_err(),
+        "comment routed to an unsuffixed assigned_to must NOT reach the suffixed \
+         registered agent (mismatch shape pinned by mahbot-1035)"
+    );
+
+    message_router::unregister_agent(&suffixed);
 }
 
 /// handle_qa_passed with a clean working tree (no untracked files, no
