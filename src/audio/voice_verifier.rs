@@ -331,7 +331,8 @@ pub(crate) const VERIFIER_ENSEMBLE_SEEDS: usize = 10;
 ///
 /// This value was selected heuristically (Analyst #3, mahbot-886/mahbot-887).
 /// Re-run the HARD-tier E2E calibration sweep before adjusting:
-/// `cargo bench --bench voice_pipeline_e2e`.  Adjust in source and
+/// `cargo bench --no-default-features --features voice-tests --bench voice_pipeline_e2e`
+/// (canonical minimal invocation, mahbot-1041).  Adjust in source and
 /// re-benchmark.
 ///
 /// ## Interaction with other constants
