@@ -6520,21 +6520,21 @@ async fn finalize_enrollment_pipeline() -> bool {
                 "confusable",
             );
 
-            let v = VoiceVerifier::train(
+            let v = VoiceVerifier::train_ensemble(
                 &pos_for_ver_seqs,
                 &neg_for_verifier_seqs,
                 Some(&per_neg_weights),
                 DEFAULT_VERIFIER_THRESHOLD,
                 CONV_L2_LAMBDA,
-                None,
             );
             if v.is_trained() {
                 info!(
                     "Verifier trained from {} positive + {} \
                      negative sequence(s) (ambient + owner-negative + unrelated + \
-                     confusable, mahbot-913)",
+                     confusable, mahbot-913; {}-member seed ensemble, mahbot-1025)",
                     pos_for_ver_seqs.len(),
                     n_neg,
+                    v.ensemble_size(),
                 );
             } else {
                 warn!(
@@ -6547,17 +6547,17 @@ async fn finalize_enrollment_pipeline() -> bool {
             }
             v
         } else {
-            let v = VoiceVerifier::train_with_synthetic_negatives(
+            let v = VoiceVerifier::train_ensemble_with_synthetic_negatives(
                 &pos_for_ver_seqs,
                 DEFAULT_VERIFIER_THRESHOLD,
-                None,
             );
             if v.is_trained() {
                 info!(
                     "Verifier trained from {} positive \
                      sequence(s) + synthetic negatives (no real or confusable \
-                     negatives available, mahbot-859)",
+                     negatives available, mahbot-859; {}-member seed ensemble, mahbot-1025)",
                     pos_for_ver_seqs.len(),
+                    v.ensemble_size(),
                 );
             } else {
                 warn!(
@@ -6618,20 +6618,28 @@ async fn finalize_enrollment_pipeline() -> bool {
 /// Apply the mahbot-1008 load-time guard to a persisted verifier.
 ///
 /// A collapsed (constant input-independent reject) verifier — e.g. the pre-fix
-/// `sigmoid(fc_bias) = 6.67e-8` brick wall — is replaced with an untrained
-/// no-op so already-enrolled users are not blocked from wake-word detection
-/// until they re-enroll.  Any other verifier passes through unchanged.
+/// `sigmoid(fc_bias) = 6.67e-8` brick wall — is handled by dropping ONLY the
+/// collapsed members and keeping the healthy ones, so already-enrolled users
+/// are not blocked from wake-word detection until they re-enroll.  For a
+/// 10-member ensemble with one collapsed brick this keeps nine healthy members
+/// (mahbot-1025) instead of degrading to classifier-only gating; a verifier
+/// with no healthy members left falls back to an untrained no-op.
 fn resolve_loaded_verifier(v: &VoiceVerifier) -> VoiceVerifier {
-    if v.is_collapsed() {
-        warn!(
-            "Loaded verifier is collapsed (constant input-independent \
-             reject) — treating as untrained no-op (mahbot-1008).  \
-             Re-enrollment will train a fixed verifier."
-        );
-        VoiceVerifier::untrained()
-    } else {
-        v.clone()
+    if !v.is_collapsed() {
+        return v.clone();
     }
+    warn!(
+        "Loaded verifier contains collapsed member(s) (constant input-independent \
+         reject) — dropping them and keeping the healthy members (mahbot-1008/1025)."
+    );
+    let resolved = v.without_collapsed_members();
+    if !resolved.is_trained() {
+        warn!(
+            "Loaded verifier has no healthy members left — treating as untrained \
+             no-op (mahbot-1008).  Re-enrollment will train a fixed verifier."
+        );
+    }
+    resolved
 }
 
 /// Run the voice pipeline background task.
@@ -6693,14 +6701,16 @@ pub async fn run_voice_pipeline() {
                     if let Some(ref members) = model.classifier {
                         set_classifier_weights(members[0].clone());
                     }
-                    // ── Verifier load guard (mahbot-1008) ──
+                    // ── Verifier load guard (mahbot-1008/1025) ──
                     // Already-enrolled users may have persisted a collapsed
                     // reject-all verifier (constant input-independent output,
                     // e.g. sigmoid(fc_bias) = 6.67e-8).  Detecting it here and
-                    // dropping to an untrained no-op restores wake-word
-                    // detection immediately; re-enrollment trains a fixed
-                    // verifier.  Keeping a constant-reject brick would block
-                    // every wake word until the user re-enrolls.
+                    // dropping ONLY the collapsed members (keeping the healthy
+                    // ensemble members, or degrading to an untrained no-op when
+                    // none remain) restores wake-word detection immediately;
+                    // re-enrollment trains a fixed verifier.  Keeping a
+                    // constant-reject brick would block every wake word until
+                    // the user re-enrolls.
                     if let Some(ref v) = model.verifier {
                         set_verifier(resolve_loaded_verifier(v));
                     }
@@ -11486,6 +11496,7 @@ mod tests {
             conv_bias: vec![0.0; CONV_VERIFIER_OUT],
             fc_weight: vec![0.0; CONV_VERIFIER_OUT],
             fc_bias: vec![-2.0], // sigmoid(-2.0) ≈ 0.12
+            ensemble_members: Vec::new(),
         }
     }
 
@@ -11500,6 +11511,7 @@ mod tests {
             conv_bias: vec![0.0; CONV_VERIFIER_OUT],
             fc_weight: vec![0.0; CONV_VERIFIER_OUT],
             fc_bias: vec![3.0], // sigmoid(3.0) ≈ 0.95
+            ensemble_members: Vec::new(),
         }
     }
 
@@ -11517,6 +11529,7 @@ mod tests {
             conv_bias: vec![0.0; CONV_VERIFIER_OUT],
             fc_weight: vec![0.0; CONV_VERIFIER_OUT],
             fc_bias: vec![-16.52], // pre-fix drift → sigmoid ≈ 6.67e-8
+            ensemble_members: Vec::new(),
         };
         assert!(
             collapsed.is_collapsed(),

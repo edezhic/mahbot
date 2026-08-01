@@ -104,18 +104,26 @@ pub(crate) const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.948;
 ///
 /// FP-safety is measured: the highest negative verifier peak on the
 /// approved 59-negative corpus is 0.7587 (`day mahbot_s2`, the mahbot-1022
-/// pre-deferral baseline); across the three final-code runs the worst
-/// per-frame negative peak is 0.6833 (run 20260801-061348, margin 0.177
-/// below the floor — the other two final runs peaked at 0.0495/0.0703),
-/// and 0 false accepts in every archived run (0/177 total).  The binding
-/// positive variant is speed_down (verifier peaks 0.9912 / 0.7886 / 0.9833
-/// across the three final-code runs — the 0.7886 reading is the single
-/// speed_down miss, a genuine rejection below the floor that the ≥3-run
-/// mean-based acceptance absorbs).  The floor stays at 0.86; any future
-/// re-derivation must stay above a freshly-measured negative peak and is
-/// out of scope for this ticket (mahbot-1024 re-scope: the strict
-/// ring-4 formula is report-only diagnostics; acceptance is mean TP ≥ 4/5
-/// across ≥ 3 fresh runs).
+/// pre-deferral baseline); the archive-worst per-frame negative verifier
+/// peak is **0.8396** (run 20260801-085346, margin 0.0204 below the floor),
+/// NOT 0.6833 — the 0.6833 reading (run 20260801-061348) is the archive
+/// second-worst and was previously misquoted as the worst.  The fresh-run
+/// (final-code) worst per-frame negative verifier max is **0.7295** (run
+/// 20260801-090824, margin 0.1305 below the floor); the fresh-run
+/// margin-to-floor distribution is 0.7901 / 0.2680 / 0.1305 across runs
+/// 090605 / 090719 / 090824.  0 false accepts in every archived run
+/// (0/177 total on the 59-negative corpus).  The binding positive variant
+/// is speed_down: there are **two** observed sub-floor peaks — 0.7886
+/// (run 20260801-061348) and 0.8090 (run 20260801-085648) — not one; the
+/// fresh-run speed_down peaks are 0.9485 / 0.8983 / 0.8620 across runs
+/// 090605 / 090719 / 090824 (the 0.8620 reading cleared the floor by
+/// 0.002).  Do NOT quote noise_overlap verifier peaks as negative-FA
+/// margins: the noise_overlap cells are positive wake-word utterances
+/// (cross-speaker TTS audio), not negative-corpus evidence (mahbot-1025).
+/// The floor stays at 0.86; any future re-derivation must stay above a
+/// freshly-measured negative peak and is out of scope for this ticket
+/// (mahbot-1024 re-scope: the strict ring-4 formula is report-only
+/// diagnostics; acceptance is mean TP ≥ 4/5 across ≥ 3 fresh runs).
 pub(crate) const VERIFIER_ACCEPTANCE_FLOOR: f32 = 0.86;
 
 /// Fraction of sequences held out for validation (80/20 train/val split).
@@ -249,6 +257,49 @@ pub(crate) const UNRELATED_UPWEIGHT: f32 = 10.0;
 /// (15×), reflecting the tier: ambient → owner-negative → unrelated → confusable.
 pub(crate) const OWNER_NEGATIVE_UPWEIGHT: f32 = 3.0;
 
+/// How much to upweight cross-speaker wake-word negatives during verifier
+/// training (mahbot-1025).
+///
+/// Cross-speaker TTS wake-word audio is the wake word spoken by a NON-enrolled
+/// voice — under single-speaker semantics it is the most dangerous negative
+/// class (the exact phrase, wrong voice).  Clean and 10/20 dB white/pink
+/// noise-conditioned variants join the verifier negative set as in-distribution
+/// regression canaries.  Weighted at the confusable tier (15×): these are
+/// acoustically the wake word itself, so they must influence the boundary as
+/// strongly as near-miss phrases.
+///
+/// Mechanism note: this is a per-negative-WINDOW weight (each window of a
+/// cross-speaker sequence counts 15× toward the negative-window weight sum).
+/// The POSITIVE class weight is DERIVED from that sum (`neg_weight_sum /
+/// n_pos_windows`) and only then capped at [`MAX_CLASS_WEIGHT`] (50×,
+/// mahbot-1008 Fix 4) — the cap constrains the derived positive weight, not
+/// the negative upweight itself, and prevents per-example memorization of the
+/// positive pool.  A fresh-run trial at 8× relaxed the boundary too far
+/// (member speed_down scores dipped to 0.83) without improving the measured
+/// miss fraction, so 15× is retained.
+///
+/// Cross-speaker negatives only exist in the benchmark harness (they are
+/// generated from held-out test-voice clips), so this knob is compiled only
+/// under the `voice-tests` feature alongside [`crate::audio::voice::voice_pipeline_e2e_test`].
+#[cfg(feature = "voice-tests")]
+pub(crate) const CROSS_SPEAKER_UPWEIGHT: f32 = 15.0;
+
+/// Number of independently-seeded verifier members trained for the
+/// multi-seed ensemble (mahbot-1025).
+///
+/// Each fresh run draws ONE entropy base seed; the N members are trained with
+/// deterministic member seeds `base..base+N` over identical training data.
+/// `predict` returns the MEAN of all trained members' scores, which shrinks
+/// per-run seed variance by ~1/√N.  The measured per-run speed_down miss
+/// probability gate (≤ 0.15, target ~0.04–0.10) is the fraction of members
+/// whose individual speed_down peak falls below [`VERIFIER_ACCEPTANCE_FLOOR`]:
+/// with 10 members the measured fraction resolves 0.0 / 0.1 / 0.2 … so the
+/// target band (0.04–0.10) is observable (0 or 1 member below floor), whereas
+/// 5 members would only resolve 0.0 / 0.2 (no in-band reading).  Inference
+/// cost is ~10×3μs ≈ 30μs per scored window — negligible against the ~760 ms
+/// latency envelope and the 10 ms frame period.
+pub(crate) const VERIFIER_ENSEMBLE_SEEDS: usize = 10;
+
 /// Embedding dimensionality (used by both verifier and voice pipeline).
 /// Minimum number of classifier embeddings required before the verifier gate
 /// is evaluated (mahbot-887).
@@ -334,6 +385,15 @@ fn is_default_verifier_activation(a: &VerifierActivation) -> bool {
 ///
 /// When `trained` is `false`, the verifier is a no-op (all frames pass with
 /// score 1.0).
+///
+/// ## Multi-seed ensemble (mahbot-1025)
+///
+/// Production and the E2E benchmark train [`VERIFIER_ENSEMBLE_SEEDS`]
+/// independently-seeded members over identical data and store the non-primary
+/// members in [`ensemble_members`](Self::ensemble_members).  [`predict`](Self::predict)
+/// returns the MEAN score across the primary and all trained members, which
+/// stabilizes per-run scoring: the measured per-run speed_down miss
+/// probability drops from ~0.22 (single seed) to ≤0.15 with the ensemble.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VoiceVerifier {
     /// Conv1D weight: [CONV_VERIFIER_OUT, EMBEDDING_DIM, kernel_size] = [2, 96, 3] = 576.
@@ -360,6 +420,20 @@ pub struct VoiceVerifier {
     /// Whether this verifier has been trained with positive + negative data.
     #[serde(default)]
     pub trained: bool,
+
+    /// Additional seed-trained ensemble members (mahbot-1025).
+    ///
+    /// When non-empty, [`predict`](Self::predict) averages this verifier's
+    /// score with each trained member's score (mean of
+    /// `1 + ensemble_members.len()` scores).  Members are trained from the
+    /// same data with distinct seeds so the ensemble mean is far more stable
+    /// across fresh runs than any single seed draw.
+    ///
+    /// Serialization: `#[serde(default)]` keeps legacy JSON (no field) loading
+    /// as a single-member verifier; `skip_serializing_if` keeps single-member
+    /// verifiers byte-identical to pre-mahbot-1025 output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ensemble_members: Vec<VoiceVerifier>,
 }
 
 fn default_verifier_threshold() -> f32 {
@@ -438,18 +512,72 @@ impl VoiceVerifier {
             activation: VerifierActivation::LeakyReLU,
             threshold: DEFAULT_VERIFIER_THRESHOLD,
             trained: false,
+            ensemble_members: Vec::new(),
         }
     }
 
-    /// Returns `true` if this verifier has been trained and is ready for
-    /// inference.
+    /// Number of ensemble members including this primary verifier.
+    ///
+    /// Returns `1` for a legacy/single-member verifier.
+    #[must_use]
+    pub fn ensemble_size(&self) -> usize {
+        1 + self.ensemble_members.len()
+    }
+
+    /// Return a **single-member** verifier view: primary weights = member
+    /// `member_idx`, empty ensemble (mahbot-1025).
+    ///
+    /// Used by the E2E benchmark to measure each member's individual
+    /// speed_down peak (the per-run miss-probability variance-reduction gate:
+    /// fraction of members whose standalone peak falls below
+    /// [`VERIFIER_ACCEPTANCE_FLOOR`]).  `member_idx` must be in
+    /// `0..self.ensemble_size()`; out-of-range indices are a programming error
+    /// (`debug_assert!` fires) and fall back to an untrained no-op only as a
+    /// release-build defensive measure.
+    #[must_use]
+    pub fn member_only(&self, member_idx: usize) -> VoiceVerifier {
+        debug_assert!(
+            member_idx < self.ensemble_size(),
+            "member_only: index {member_idx} out of range (ensemble size {})",
+            self.ensemble_size(),
+        );
+        if member_idx == 0 {
+            let mut clone = self.clone();
+            clone.ensemble_members = Vec::new();
+            return clone;
+        }
+        match self.ensemble_members.get(member_idx - 1) {
+            Some(member) => {
+                let mut clone = member.clone();
+                clone.ensemble_members = Vec::new();
+                clone
+            }
+            None => Self::untrained(),
+        }
+    }
+
+    /// Returns `true` if this verifier's primary member is trained and
+    /// structurally valid.
     ///
     /// Validates Conv1D weights: 576-dim conv_weight + 2-dim conv_bias + 2-dim fc_weight + 1-dim fc_bias.
+    /// Ensemble members are NOT required to be trained here: an untrained
+    /// member is SKIPPED by [`predict`](Self::predict) (excluded from both the
+    /// score sum and the member count, so it is neutral — it neither boosts
+    /// nor drags the ensemble mean), so a partially-trained ensemble still
+    /// gates via its trained members (mahbot-1025).  Collapse detection
+    /// ([`is_collapsed`](Self::is_collapsed)) separately probes every member,
+    /// because a COLLAPSED member (constant reject) would drag the ensemble
+    /// mean down on every input.
     #[must_use]
     pub fn is_trained(&self) -> bool {
         if !self.trained {
             return false;
         }
+        self.weights_valid()
+    }
+
+    /// Validate the primary member's weight shapes and finiteness.
+    fn weights_valid(&self) -> bool {
         // conv_weight: [CONV_VERIFIER_OUT, EMBEDDING_DIM, CONV_VERIFIER_KERNEL_SIZE]
         let expected_conv_w = CONV_VERIFIER_OUT * EMBEDDING_DIM * CONV_VERIFIER_KERNEL_SIZE;
         if self.conv_weight.len() != expected_conv_w {
@@ -478,24 +606,60 @@ impl VoiceVerifier {
     ///
     /// Returns a score in `[0.0, 1.0]`. When untrained, always returns `1.0`
     /// (no-op — all frames pass).
+    ///
+    /// ## Multi-seed ensemble (mahbot-1025)
+    ///
+    /// When [`ensemble_members`](Self::ensemble_members) is non-empty, returns
+    /// the MEAN score across this verifier and every trained member — the
+    /// seed-stabilized scoring used by production and the E2E benchmark.  The
+    /// ensemble mean shrinks per-run seed variance (~1/√N) so a fixed input's
+    /// score is far more stable across fresh runs than any single-seed draw.
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn predict(&self, embedding: &[f32]) -> f32 {
         if !self.is_trained() {
             return 1.0;
         }
-
-        predict_conv1d(
+        let mut sum = predict_conv1d(
             embedding,
             &self.conv_weight,
             &self.conv_bias,
             &self.fc_weight,
             &self.fc_bias,
-        )
+        );
+        let mut n = 1;
+        for member in &self.ensemble_members {
+            if member.is_trained() {
+                sum += predict_conv1d(
+                    embedding,
+                    &member.conv_weight,
+                    &member.conv_bias,
+                    &member.fc_weight,
+                    &member.fc_bias,
+                );
+                n += 1;
+            }
+        }
+        sum / n as f32
     }
 
     /// Detect the mahbot-1008 constant-floor collapse: a trained verifier whose
     /// output is input-independent and below its decision threshold for every
     /// input (a reject-all brick wall).
+    ///
+    /// With a multi-seed ensemble (mahbot-1025), ANY trained member that is
+    /// collapsed drags the ensemble mean down on every input by roughly that
+    /// member's healthy contribution / N — and with enough collapsed members,
+    /// or healthy members scoring near the floor, it can push genuine wake
+    /// words below the 0.86 acceptance floor.  The mean alone is NOT a
+    /// reliable collapse detector: ten healthy members at ~0.97 plus one
+    /// collapsed brick at `6.67e-8` still average ≈ 0.87, above the floor.
+    /// The probe therefore runs the deterministic input-independence check on
+    /// the primary AND every trained ensemble member; if any member is
+    /// collapsed, the whole verifier is flagged (callers replace it via
+    /// [`without_collapsed_members`](Self::without_collapsed_members)).  Untrained
+    /// members are skipped (they cannot collapse — an untrained verifier is a
+    /// neutral pass-through, never a constant-reject risk).
     ///
     /// The pre-fix architecture produced exactly this: dead ReLU features →
     /// pooled `[0, 0]` → `logit = fc_bias` → `sigmoid(fc_bias)` regardless of
@@ -515,12 +679,33 @@ impl VoiceVerifier {
     /// functionally a no-op and is deliberately NOT flagged.  The probes are
     /// deterministic (fixed seed) so the verdict is stable across restarts.
     ///
-    /// Used at load time in `voice.rs` to convert already-enrolled users'
-    /// broken verifiers into untrained no-ops until re-enrollment (which now
-    /// produces a working verifier).
+    /// Used at load time in `voice.rs` ([`resolve_loaded_verifier`](crate::audio::voice::resolve_loaded_verifier))
+    /// to drop collapsed members from already-enrolled users' persisted
+    /// verifiers — keeping the healthy members instead of falling back to
+    /// classifier-only gating (mahbot-1025).
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn is_collapsed(&self) -> bool {
+        if !self.is_trained() {
+            return false;
+        }
+        // Every trained member (including the primary) must pass the
+        // input-independence probe — a single collapsed member drags the
+        // ensemble mean down.  Untrained members (1.0 no-ops) are skipped.
+        if self.member_is_collapsed() {
+            return true;
+        }
+        self.ensemble_members
+            .iter()
+            .filter(|m| m.is_trained())
+            .any(VoiceVerifier::member_is_collapsed)
+    }
+
+    /// Probe one verifier's weights (primary or member) for the
+    /// input-independent constant-reject collapse.  Untrained verifiers
+    /// (empty weights) are never collapsed.
+    #[allow(clippy::cast_precision_loss)]
+    fn member_is_collapsed(&self) -> bool {
         const N_PROBES: usize = 8;
         if !self.is_trained() {
             return false;
@@ -534,7 +719,13 @@ impl VoiceVerifier {
             for v in &mut probe {
                 *v = rng.random::<f32>() * 2.0 - 1.0;
             }
-            let score = self.predict(&probe);
+            let score = predict_conv1d(
+                &probe,
+                &self.conv_weight,
+                &self.conv_bias,
+                &self.fc_weight,
+                &self.fc_bias,
+            );
             min = min.min(score);
             max = max.max(score);
             sum += score;
@@ -543,13 +734,54 @@ impl VoiceVerifier {
         let mean = sum / N_PROBES as f32;
         if range < 1e-4 && max < VERIFIER_ACCEPTANCE_FLOOR {
             info!(
-                "VoiceVerifier collapsed: input-independent output (range={range:.2e}, \
+                "VoiceVerifier member collapsed: input-independent output (range={range:.2e}, \
                  mean={mean:.2e}, max={max:.2e}) below acceptance floor={VERIFIER_ACCEPTANCE_FLOOR:.4} \
                  — constant reject-all",
             );
             true
         } else {
             false
+        }
+    }
+
+    /// Return a copy of this verifier with any collapsed members removed
+    /// (mahbot-1025).
+    ///
+    /// A collapsed (constant input-independent reject) member would drag the
+    /// ensemble mean down on every input, so at load time such members are
+    /// dropped rather than poisoning the healthy members' scores — a
+    /// 10-member ensemble with one collapsed brick keeps its nine healthy
+    /// members instead of degrading to classifier-only gating.  If the
+    /// primary is collapsed, the first healthy member is promoted to primary;
+    /// if no healthy trained member remains, returns an untrained no-op.
+    ///
+    /// Callers use this via [`is_collapsed`](Self::is_collapsed) +
+    /// [`resolve_loaded_verifier`](crate::audio::voice::resolve_loaded_verifier)
+    /// at load time.
+    #[must_use]
+    pub fn without_collapsed_members(&self) -> VoiceVerifier {
+        // Collect healthy trained members (primary + ensemble) in order,
+        // each as a single-member verifier so no stale members are attached.
+        let mut healthy: Vec<VoiceVerifier> = Vec::new();
+        if self.is_trained() && !self.member_is_collapsed() {
+            let mut primary = self.clone();
+            primary.ensemble_members = Vec::new();
+            healthy.push(primary);
+        }
+        for member in &self.ensemble_members {
+            if member.is_trained() && !member.member_is_collapsed() {
+                let mut clone = member.clone();
+                clone.ensemble_members = Vec::new();
+                healthy.push(clone);
+            }
+        }
+        match healthy.first() {
+            Some(primary) => {
+                let mut out = primary.clone();
+                out.ensemble_members = healthy.into_iter().skip(1).collect();
+                out
+            }
+            None => Self::untrained(),
         }
     }
 
@@ -938,6 +1170,7 @@ impl VoiceVerifier {
             activation: VerifierActivation::LeakyReLU,
             threshold,
             trained: true,
+            ensemble_members: Vec::new(),
         };
 
         // Log diagnostics.
@@ -1061,6 +1294,96 @@ impl VoiceVerifier {
         (verifier, metrics)
     }
 
+    /// Train a **multi-seed ensemble** verifier (mahbot-1025): train
+    /// [`VERIFIER_ENSEMBLE_SEEDS`] members over the same data with distinct
+    /// seeds and return the primary with the remaining members attached in
+    /// [`ensemble_members`](Self::ensemble_members).
+    ///
+    /// Seed policy: one entropy base seed is drawn per call (matching the
+    /// pre-ensemble `None` policy — never seed-pinned), and member seeds are
+    /// derived deterministically as `base`, `base+1`, …, `base+N-1`.  The
+    /// ensemble MEAN at inference is far more stable across fresh runs than
+    /// any single seed draw (the measured variance-reduction gate: per-run
+    /// speed_down miss probability ≤ 0.15, target ~0.04–0.10).
+    ///
+    /// Each member is trained through [`Self::train_with_metrics`]; member 0's
+    /// metrics are returned (report-only — the members share training data, so
+    /// member-0 diagnostics are representative).  If any member fails to meet
+    /// the minimum positive-window guard, that member is untrained and is
+    /// skipped by [`predict`](Self::predict) (the remaining members still gate).
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    pub fn train_ensemble(
+        positive_sequences: &[EmbeddingSequence],
+        negative_sequences: &[EmbeddingSequence],
+        per_negative_sequence_weights: Option<&[f32]>,
+        threshold: f32,
+        l2_lambda: f32,
+    ) -> Self {
+        Self::train_ensemble_with_metrics(
+            positive_sequences,
+            negative_sequences,
+            per_negative_sequence_weights,
+            threshold,
+            l2_lambda,
+        )
+        .0
+    }
+
+    /// [`Self::train_ensemble`] with training diagnostics (mahbot-1005 §5
+    /// style).  Returns `(verifier, member-0 metrics)`.
+    #[must_use]
+    pub fn train_ensemble_with_metrics(
+        positive_sequences: &[EmbeddingSequence],
+        negative_sequences: &[EmbeddingSequence],
+        per_negative_sequence_weights: Option<&[f32]>,
+        threshold: f32,
+        l2_lambda: f32,
+    ) -> (Self, VerifierTrainingMetrics) {
+        let base_seed: u64 = rand::random();
+        let n_seeds = VERIFIER_ENSEMBLE_SEEDS;
+        let mut members: Vec<VoiceVerifier> = Vec::with_capacity(n_seeds);
+        let mut primary_metrics = VerifierTrainingMetrics::default();
+        for i in 0..n_seeds {
+            let seed = base_seed.wrapping_add(i as u64);
+            let (member, metrics) = Self::train_with_metrics(
+                positive_sequences,
+                negative_sequences,
+                per_negative_sequence_weights,
+                threshold,
+                l2_lambda,
+                Some(seed),
+            );
+            if i == 0 {
+                primary_metrics = metrics;
+            }
+            members.push(member);
+        }
+        // Member 0 becomes the primary; the rest attach as ensemble members.
+        let mut primary = members.remove(0);
+        primary.ensemble_members = members;
+        if primary.is_trained() {
+            info!(
+                "VoiceVerifier ensemble trained: {} members, base seed {base_seed}, \
+                 ensemble size {} (mahbot-1025)",
+                n_seeds,
+                primary.ensemble_size(),
+            );
+        } else {
+            warn!(
+                "VoiceVerifier ensemble left UNTRAINED: {n_seeds} members, base seed {base_seed} \
+                 — primary member failed the minimum-window guard (mahbot-1008 Fix 2)",
+            );
+        }
+        (primary, primary_metrics)
+    }
+
     /// Gather windows for a set of sequence indices (shared helper for train/val split).
     fn gather_windows(
         windows: &[Vec<f32>],
@@ -1083,48 +1406,44 @@ impl VoiceVerifier {
         (out_w, out_l, out_wt)
     }
 
-    /// Convenience: train a verifier using the given positive embeddings and
-    /// automatically generated synthetic negative examples (distribution-
-    /// matched via [`generate_synthetic_negatives_from_positives`]).
-    ///
-    /// When `rng_seed` is `Some(seed)`, uses a seeded RNG for all random
-    /// operations (synthetic negative generation + weight initialization),
-    /// making training deterministic.  When `None`, uses entropy-based RNG
-    /// (production path).
+    /// Multi-seed ensemble synthetic-negative training (mahbot-1025,
+    /// production synthetic-fallback path).  Draws a fresh entropy seed per
+    /// run to generate the synthetic-negative set ONCE from the shared
+    /// positive pool, then delegates member training to
+    /// [`train_ensemble_with_metrics`](Self::train_ensemble_with_metrics),
+    /// which draws its own entropy base seed and trains
+    /// [`VERIFIER_ENSEMBLE_SEEDS`] members over that identical data with
+    /// derived member seeds `base..base+N` — the same identical-data
+    /// seed-ensemble semantics as [`train_ensemble`](Self::train_ensemble):
+    /// the member seeds drive only weight init and the train/val split; the
+    /// training data is shared, so the ensemble mean isolates exactly the
+    /// per-run training-seed variance the ticket targets.  Returns the
+    /// primary with the remaining members attached.
     #[must_use]
-    pub fn train_with_synthetic_negatives(
+    pub fn train_ensemble_with_synthetic_negatives(
         positive_sequences: &[EmbeddingSequence],
         threshold: f32,
-        rng_seed: Option<u64>,
     ) -> Self {
         // Extract flat embeddings from all positive sequences for the helper.
         let flat_positives: Vec<Vec<f32>> = positive_sequences
             .iter()
             .flat_map(|s| s.embeddings.iter().cloned())
             .collect();
-        let negatives = generate_synthetic_negatives_from_positives(
-            SYNTHETIC_NEGATIVES_COUNT,
-            &flat_positives,
-            1.5, // noise_scale — matched to benchmark default
-            rng_seed,
-        );
-        let synth_seq = EmbeddingSequence::negative(
-            crate::audio::embedding_sequence::UtteranceId {
-                sequence_index: 0,
-                variant_index: 0,
-            },
-            crate::audio::embedding_sequence::Source::Synthetic,
-            None,
-            negatives,
-        );
-        Self::train(
+        // Fresh entropy seed for the synthetic-negative set (generated ONCE
+        // per run and shared by every member); the member base seed is drawn
+        // inside train_ensemble_with_metrics.
+        let synth_seed: u64 = rand::random();
+        let synth_seq = build_synthetic_negative_sequence(&flat_positives, Some(synth_seed));
+        // Member loop / primary attach / trained log all live in
+        // train_ensemble_with_metrics — delegating keeps them in one place.
+        Self::train_ensemble_with_metrics(
             positive_sequences,
-            &[synth_seq],
+            std::slice::from_ref(&synth_seq),
             None, // no per-negative weights for synthetic negatives
             threshold,
             CONV_L2_LAMBDA, // use Conv1D default L2 for synthetic bootstrapping
-            rng_seed,
         )
+        .0
     }
 }
 
@@ -2291,6 +2610,37 @@ pub(crate) fn generate_synthetic_negatives_from_positives(
         .collect()
 }
 
+/// Build the synthetic-negative [`EmbeddingSequence`] used by synthetic
+/// negative training: distribution-matched negatives generated from the flat
+/// positive embeddings (mahbot-797), wrapped as a single synthetic negative
+/// sequence.
+///
+/// When `rng_seed` is `Some(seed)`, generation is deterministic.  The
+/// multi-seed ensemble ([`VoiceVerifier::train_ensemble_with_synthetic_negatives`])
+/// generates the sequence ONCE from its entropy base seed and shares it
+/// across all members, so member diversity comes purely from the training
+/// seed (identical-data seed ensemble, mahbot-1025).
+fn build_synthetic_negative_sequence(
+    flat_positives: &[Vec<f32>],
+    rng_seed: Option<u64>,
+) -> EmbeddingSequence {
+    let negatives = generate_synthetic_negatives_from_positives(
+        SYNTHETIC_NEGATIVES_COUNT,
+        flat_positives,
+        1.5, // noise_scale — matched to benchmark default
+        rng_seed,
+    );
+    EmbeddingSequence::negative(
+        crate::audio::embedding_sequence::UtteranceId {
+            sequence_index: 0,
+            variant_index: 0,
+        },
+        crate::audio::embedding_sequence::Source::Synthetic,
+        None,
+        negatives,
+    )
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Embedding pooling
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2627,24 +2977,29 @@ mod tests {
     }
 
     #[test]
-    fn test_train_with_synthetic_negatives_rejects_non_wake_word_speech() {
-        // Tests the production train_with_synthetic_negatives path (mahbot-797):
-        // when fewer than 2 real negative chunks are available, the verifier
-        // is trained via train_with_synthetic_negatives which generates
-        // distribution-matched synthetic negatives internally. This verifies that
-        // the resulting decision boundary correctly rejects non-wake-word
-        // speech embeddings.
+    fn test_synthetic_negatives_reject_non_wake_word_speech() {
+        // Tests the synthetic-negative verifier training mechanism (mahbot-797):
+        // when fewer than 2 real negative chunks are available, the verifier is
+        // trained with distribution-matched synthetic negatives generated from
+        // the positive pool.  This verifies that the resulting decision boundary
+        // correctly rejects non-wake-word speech embeddings.  The single-member
+        // construction below (shared helper + Self::train with a fixed seed) is
+        // deterministic; the multi-seed production variant is covered by
+        // test_ensemble_with_synthetic_negatives_trains_all_members.
         let mut rng = StdRng::seed_from_u64(99);
         let positives: Vec<Vec<f32>> = (0..32).map(|_| make_positive_embedding(&mut rng)).collect();
         let pos_seq = make_seq(
-            positives,
+            positives.clone(),
             crate::audio::embedding_sequence::LabelStratum::Positive,
         );
-
-        // Use the actual production path: train_with_synthetic_negatives.
-        let verifier = VoiceVerifier::train_with_synthetic_negatives(
+        let flat_positives: Vec<Vec<f32>> = positives;
+        let synth_seq = build_synthetic_negative_sequence(&flat_positives, Some(99));
+        let verifier = VoiceVerifier::train(
             &[pos_seq],
+            &[synth_seq],
+            None,
             DEFAULT_VERIFIER_THRESHOLD,
+            CONV_L2_LAMBDA,
             Some(99),
         );
 
@@ -2693,15 +3048,14 @@ mod tests {
             "Verifier should score positive >= 0.4, got score={score:.4}",
         );
 
-        // Verify discrimination: positive score > 0.4 (similar to
-        // test_verifier_rejects_non_wake_speech's Conv1D threshold).
+        // Verify discrimination: positive score > non-wake-word score.
         let held_out_non_wake = make_non_wake_speech_embedding(&mut rng);
         let score_non_wake = verifier.predict(&held_out_non_wake);
-        // Note: train_with_synthetic_negatives uses distribution-matched synthetic
-        // negatives from the positives' statistics. With only synthetic training
-        // data, absolute rejection scores may vary — we verify the verifier
-        // produces a meaningful positive score (≥ 0.4) rather than an absolute
-        // rejection threshold. Real-negative discrimination is covered by
+        // Note: synthetic negatives are distribution-matched to the positives'
+        // statistics. With only synthetic training data, absolute rejection
+        // scores may vary — we verify the verifier produces a meaningful
+        // positive score (≥ 0.4) rather than an absolute rejection threshold.
+        // Real-negative discrimination is covered by
         // test_verifier_rejects_non_wake_speech.
         assert!(
             score >= 0.4,
@@ -2715,6 +3069,95 @@ mod tests {
         assert!(
             score > score_non_wake,
             "Verifier must discriminate: pos={score:.4} non_wake={score_non_wake:.4}",
+        );
+    }
+
+    #[test]
+    fn test_ensemble_with_synthetic_negatives_trains_all_members() {
+        // The multi-seed synthetic-negative ensemble (production fallback path,
+        // mahbot-1025) must train every member over the shared synthetic
+        // negative set and satisfy the common ensemble invariants (per-member
+        // validity, mean prediction, serialization roundtrip — see
+        // assert_ensemble_properties).
+        let mut rng = StdRng::seed_from_u64(1025);
+        let positives: Vec<Vec<f32>> = (0..32).map(|_| make_positive_embedding(&mut rng)).collect();
+        let pos_seq = make_seq(
+            positives,
+            crate::audio::embedding_sequence::LabelStratum::Positive,
+        );
+        let ensemble = VoiceVerifier::train_ensemble_with_synthetic_negatives(
+            &[pos_seq],
+            DEFAULT_VERIFIER_THRESHOLD,
+        );
+        let held_out = make_positive_embedding(&mut rng);
+        assert_ensemble_properties(&ensemble, &held_out, "synthetic-negative ensemble");
+    }
+
+    /// Shared ensemble-property assertions (mahbot-1025), used by both
+    /// ensemble tests (real-negative and synthetic-negative training paths).
+    /// Asserts the common invariants: every member is individually trained and
+    /// single-member, `predict()` equals the arithmetic mean of the member
+    /// scores on a held-out vector, and the serde roundtrip preserves the
+    /// ensemble and its predictions.  Pure structural/deterministic assertions
+    /// (the training seed is entropy-drawn per run, so no absolute score
+    /// thresholds are checked).
+    fn assert_ensemble_properties(ensemble: &VoiceVerifier, held_out: &[f32], label: &str) {
+        assert!(ensemble.is_trained(), "{label}: ensemble must be trained");
+        assert_eq!(
+            ensemble.ensemble_size(),
+            VERIFIER_ENSEMBLE_SEEDS,
+            "{label}: ensemble size must equal VERIFIER_ENSEMBLE_SEEDS",
+        );
+        assert_eq!(
+            ensemble.ensemble_members.len(),
+            VERIFIER_ENSEMBLE_SEEDS - 1,
+            "{label}: members stored in ensemble_members (excluding primary)",
+        );
+        assert!(
+            !ensemble.is_collapsed(),
+            "{label}: healthy ensemble must not be collapsed",
+        );
+
+        // Every member must be individually trained and structurally valid.
+        for idx in 0..ensemble.ensemble_size() {
+            let mv = ensemble.member_only(idx);
+            assert!(mv.is_trained(), "{label}: member {idx} must be trained");
+            assert_eq!(
+                mv.ensemble_size(),
+                1,
+                "{label}: member_only view is single-member",
+            );
+        }
+
+        // predict() == mean of member predictions on a held-out vector.
+        let ensemble_score = ensemble.predict(held_out);
+        let member_scores: Vec<f32> = (0..ensemble.ensemble_size())
+            .map(|idx| ensemble.member_only(idx).predict(held_out))
+            .collect();
+        let member_mean = member_scores.iter().copied().sum::<f32>() / member_scores.len() as f32;
+        assert!(
+            (ensemble_score - member_mean).abs() < 1e-4,
+            "{label}: ensemble predict must equal member mean: ensemble={ensemble_score:.4} \
+             mean={member_mean:.4} members={member_scores:?}",
+        );
+
+        // Serialization roundtrip preserves the ensemble and its predictions.
+        let json = serde_json::to_string(ensemble).expect("serialize ensemble");
+        let deserialized: VoiceVerifier =
+            serde_json::from_str(&json).expect("deserialize ensemble");
+        assert!(
+            deserialized.is_trained(),
+            "{label}: deserialized ensemble must be trained",
+        );
+        assert_eq!(
+            deserialized.ensemble_size(),
+            VERIFIER_ENSEMBLE_SEEDS,
+            "{label}: deserialized ensemble must keep all members",
+        );
+        let after = deserialized.predict(held_out);
+        assert!(
+            (after - ensemble_score).abs() < 1e-4,
+            "{label}: ensemble prediction must survive roundtrip: before={ensemble_score:.4} after={after:.4}",
         );
     }
 
@@ -2800,6 +3243,229 @@ mod tests {
         assert!(!deserialized_untrained.is_trained());
         let score = deserialized_untrained.predict(&[0.0; VERIFIER_INPUT_DIM]);
         assert!((score - 1.0).abs() < 1e-6);
+    }
+
+    // ── Multi-seed ensemble tests (mahbot-1025) ────────────────────────
+
+    #[test]
+    fn test_ensemble_trains_all_members_and_averages() {
+        // The ensemble trains VERIFIER_ENSEMBLE_SEEDS members and predict()
+        // returns their MEAN score.  Member 0 becomes the primary; the rest
+        // attach in ensemble_members.  The common invariants (per-member
+        // validity, mean == predict, roundtrip) live in
+        // assert_ensemble_properties.
+        let mut rng = StdRng::seed_from_u64(1025);
+        let positives: Vec<Vec<f32>> = (0..60).map(|_| make_positive_embedding(&mut rng)).collect();
+        let negatives: Vec<Vec<f32>> = (0..50).map(|_| make_negative_embedding(&mut rng)).collect();
+        let pos_seq = make_seq(
+            positives,
+            crate::audio::embedding_sequence::LabelStratum::Positive,
+        );
+        let neg_seq = make_seq(
+            negatives,
+            crate::audio::embedding_sequence::LabelStratum::Negative,
+        );
+
+        let ensemble = VoiceVerifier::train_ensemble(
+            &[pos_seq],
+            &[neg_seq],
+            None,
+            DEFAULT_VERIFIER_THRESHOLD,
+            CONV_L2_LAMBDA,
+        );
+        let held_out = make_positive_embedding(&mut rng);
+        assert_ensemble_properties(&ensemble, &held_out, "real-negative ensemble");
+    }
+
+    #[test]
+    fn test_ensemble_serializes_backward_compatibly() {
+        // Legacy JSON (no ensemble_members field) must load as a single-member
+        // verifier — pre-mahbot-1025 persisted models keep working.
+        let mut rng = StdRng::seed_from_u64(7);
+        let positives: Vec<Vec<f32>> = (0..40).map(|_| make_positive_embedding(&mut rng)).collect();
+        let negatives: Vec<Vec<f32>> = (0..30).map(|_| make_negative_embedding(&mut rng)).collect();
+        let pos_seq = make_seq(
+            positives,
+            crate::audio::embedding_sequence::LabelStratum::Positive,
+        );
+        let neg_seq = make_seq(
+            negatives,
+            crate::audio::embedding_sequence::LabelStratum::Negative,
+        );
+        let single = VoiceVerifier::train(
+            &[pos_seq],
+            &[neg_seq],
+            None,
+            DEFAULT_VERIFIER_THRESHOLD,
+            CONV_L2_LAMBDA,
+            Some(42),
+        );
+        // Single-member serialization must NOT emit the ensemble field
+        // (skip_serializing_if empty keeps legacy bytes identical).
+        let json = serde_json::to_string(&single).expect("serialize");
+        assert!(
+            !json.contains("ensemble_members"),
+            "single-member verifier must not serialize ensemble_members: {json}",
+        );
+        // And a legacy-shaped JSON without the field must load.
+        let legacy: VoiceVerifier = serde_json::from_str(&json).expect("deserialize legacy");
+        assert!(legacy.is_trained());
+        assert_eq!(legacy.ensemble_size(), 1, "legacy loads as single member");
+        // A member-only view of a single-member verifier is itself.
+        let member = single.member_only(0);
+        assert!(member.is_trained());
+        assert_eq!(member.ensemble_size(), 1);
+    }
+
+    /// Build a trained single-member verifier that rejects every input with a
+    /// constant ~6.67e-8 score (the mahbot-1008 collapse brick).
+    fn constant_reject_brick() -> VoiceVerifier {
+        VoiceVerifier {
+            trained: true,
+            threshold: DEFAULT_VERIFIER_THRESHOLD,
+            activation: VerifierActivation::LeakyReLU,
+            conv_weight: vec![0.0; CONV_VERIFIER_OUT * EMBEDDING_DIM * CONV_VERIFIER_KERNEL_SIZE],
+            conv_bias: vec![0.0; CONV_VERIFIER_OUT],
+            fc_weight: vec![0.0; CONV_VERIFIER_OUT],
+            fc_bias: vec![-16.52], // sigmoid ≈ 6.67e-8
+            ensemble_members: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_ensemble_any_collapsed_member_flags_whole() {
+        // is_collapsed() must probe EVERY trained member: a single collapsed
+        // (constant input-independent reject) member drags the ensemble mean
+        // down on every input and CAN push a genuine wake word below the 0.86
+        // floor — but the mean alone is not a reliable detector (ten healthy
+        // members at ~0.97 + one brick ≈ 0.87, still above the floor), so the
+        // guard is the per-member probe, not the mean crossing.  All assertions
+        // here are deterministic: the flag flips once any member is the brick,
+        // and the mean strictly decreases (the brick's 6.67e-8 replaces the
+        // replaced member's > 1e-3 score).
+        let mut rng = StdRng::seed_from_u64(1025);
+        let positives: Vec<Vec<f32>> = (0..60).map(|_| make_positive_embedding(&mut rng)).collect();
+        let negatives: Vec<Vec<f32>> = (0..50).map(|_| make_negative_embedding(&mut rng)).collect();
+        let pos_seq = make_seq(
+            positives,
+            crate::audio::embedding_sequence::LabelStratum::Positive,
+        );
+        let neg_seq = make_seq(
+            negatives,
+            crate::audio::embedding_sequence::LabelStratum::Negative,
+        );
+        let mut ensemble = VoiceVerifier::train_ensemble(
+            &[pos_seq],
+            &[neg_seq],
+            None,
+            DEFAULT_VERIFIER_THRESHOLD,
+            CONV_L2_LAMBDA,
+        );
+        assert!(!ensemble.is_collapsed(), "healthy ensemble not collapsed");
+
+        // Fixed genuine-wake-word probe; capture the healthy ensemble score and
+        // the replaced member's standalone score BEFORE poisoning.
+        let probe = make_positive_embedding(&mut rng);
+        let healthy_score = ensemble.predict(&probe);
+        let last_idx = ensemble.ensemble_size() - 1;
+        let replaced_member_score = ensemble.member_only(last_idx).predict(&probe);
+        assert!(
+            replaced_member_score > 1e-3,
+            "test precondition: replaced member must score as a genuine wake word \
+             (got {replaced_member_score:.4}); a sub-brick score would make the \
+             drag assertion vacuous",
+        );
+
+        // Replace the last member with a constant reject-all brick.
+        let collapsed = constant_reject_brick();
+        *ensemble.ensemble_members.last_mut().expect("members exist") = collapsed;
+        assert!(
+            ensemble.is_collapsed(),
+            "any collapsed member must flag the whole ensemble",
+        );
+
+        // The brick (≈ 6.67e-8 on every input) strictly lowers the ensemble
+        // mean on the same probe — deterministic given the precondition above:
+        // poisoned − healthy = (6.67e-8 − replaced_member_score) / N < 0.
+        let poisoned_score = ensemble.predict(&probe);
+        assert!(
+            poisoned_score < healthy_score,
+            "collapsed member must drag the ensemble mean down: \
+             healthy={healthy_score:.4} poisoned={poisoned_score:.4}",
+        );
+    }
+
+    #[test]
+    fn test_ensemble_without_collapsed_members_keeps_healthy_members() {
+        // A 10-member ensemble with ONE collapsed brick must keep its nine
+        // healthy members (without_collapsed_members), instead of dropping the
+        // whole verifier to an untrained no-op (which would revert to
+        // classifier-only gating).  Fully-collapsed verifiers still fall back
+        // to an untrained no-op.
+        let mut rng = StdRng::seed_from_u64(1025);
+        let positives: Vec<Vec<f32>> = (0..60).map(|_| make_positive_embedding(&mut rng)).collect();
+        let negatives: Vec<Vec<f32>> = (0..50).map(|_| make_negative_embedding(&mut rng)).collect();
+        let pos_seq = make_seq(
+            positives,
+            crate::audio::embedding_sequence::LabelStratum::Positive,
+        );
+        let neg_seq = make_seq(
+            negatives,
+            crate::audio::embedding_sequence::LabelStratum::Negative,
+        );
+        let mut ensemble = VoiceVerifier::train_ensemble(
+            &[pos_seq],
+            &[neg_seq],
+            None,
+            DEFAULT_VERIFIER_THRESHOLD,
+            CONV_L2_LAMBDA,
+        );
+        assert!(!ensemble.is_collapsed(), "healthy ensemble not collapsed");
+
+        // Capture each member's standalone score on a fixed probe BEFORE
+        // poisoning, so the trimmed mean can be predicted exactly.
+        let probe = make_positive_embedding(&mut rng);
+        let healthy_member_scores: Vec<f32> = (0..ensemble.ensemble_size())
+            .map(|idx| ensemble.member_only(idx).predict(&probe))
+            .collect();
+        assert_eq!(healthy_member_scores.len(), VERIFIER_ENSEMBLE_SEEDS);
+
+        // Poison the LAST member only.
+        *ensemble.ensemble_members.last_mut().expect("members exist") = constant_reject_brick();
+        assert!(
+            ensemble.is_collapsed(),
+            "poisoned ensemble must be flagged collapsed",
+        );
+
+        let trimmed = ensemble.without_collapsed_members();
+        assert!(trimmed.is_trained(), "healthy members must survive");
+        assert_eq!(
+            trimmed.ensemble_size(),
+            VERIFIER_ENSEMBLE_SEEDS - 1,
+            "exactly the collapsed member is dropped",
+        );
+        // The trimmed mean equals the mean of the surviving healthy members.
+        let expected = healthy_member_scores[..VERIFIER_ENSEMBLE_SEEDS - 1]
+            .iter()
+            .copied()
+            .sum::<f32>()
+            / (VERIFIER_ENSEMBLE_SEEDS - 1) as f32;
+        let trimmed_score = trimmed.predict(&probe);
+        assert!(
+            (trimmed_score - expected).abs() < 1e-4,
+            "trimmed mean must equal the healthy members' mean: \
+             trimmed={trimmed_score:.4} expected={expected:.4}",
+        );
+
+        // A fully-collapsed verifier (no healthy members) degrades to an
+        // untrained no-op.
+        let fully_collapsed = constant_reject_brick();
+        assert!(fully_collapsed.is_collapsed());
+        let resolved = fully_collapsed.without_collapsed_members();
+        assert!(
+            !resolved.is_trained(),
+            "fully collapsed must drop to untrained no-op",
+        );
     }
 
     // ── Additional correctness tests ────────────────────────────────
@@ -3176,6 +3842,7 @@ mod tests {
             conv_bias: vec![0.0; CONV_VERIFIER_OUT],
             fc_weight: vec![0.0; CONV_VERIFIER_OUT],
             fc_bias: vec![-16.52], // observed pre-fix drift → sigmoid ≈ 6.67e-8
+            ensemble_members: Vec::new(),
         };
         assert!(collapsed.is_trained());
         assert!(

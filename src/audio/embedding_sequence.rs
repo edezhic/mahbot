@@ -35,6 +35,13 @@ pub enum Source {
     /// speech from the user, used as additional negative examples for both the
     /// classifier and the verifier; mahbot-932).
     Owner,
+    /// Cross-speaker TTS wake-word audio (the wake word spoken by a
+    /// non-enrolled TTS voice) — in-distribution regression negatives for the
+    /// verifier under single-speaker semantics (mahbot-1025).  Clean and
+    /// noise-conditioned (10/20 dB white/pink) variants are generated from
+    /// non-enrolled TTS clips; the verifier must reject them even though the
+    /// phrase is the wake word.
+    CrossSpeaker,
 }
 
 /// Augmentation family for [`Source::Augmentation`].
