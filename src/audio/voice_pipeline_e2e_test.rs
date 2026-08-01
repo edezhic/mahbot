@@ -937,6 +937,13 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
     ctx.score_window.clear();
     ctx.candidate = None;
     ctx.segment_silence_hops = 0;
+    // ── Clear the per-segment deferred-burst latch (mahbot-1023) ──
+    // Warm-up audio passes through the FULL scoring pipeline and therefore
+    // triggers the deferred burst sweep on the warm-up noise.  Without
+    // clearing the latch here, the test utterance's own burst sweep would be
+    // suppressed (the warm-up consumption is a fresh segment boundary for the
+    // benchmark's purposes).
+    ctx.burst_sweep_done = false;
 
     // ── Reset instrumentation (mahbot-1005 §1) ─────────────────────────────
     // Warm-up audio passes through the full scoring pipeline and records into
@@ -1658,6 +1665,7 @@ fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> Det
 
 /// Result for a single wake word variant during detection.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 struct PerVariantResult {
     /// Variant label (e.g. "M1.json seed 100" or "augmented speed_0.9").
     variant: String,
@@ -1770,6 +1778,35 @@ struct PerVariantResult {
     /// Per-hop VAD decisions during streaming detection (one per VAD decision
     /// in processing order).
     per_hop_vad: Vec<bool>,
+
+    // ── mahbot-1023 deferred-burst / acceptance-floor fields ──────────────
+    /// Scoring path that produced the detection (raw source: "burst" /
+    /// "segment_end_pass" / "other").  `None` when not detected.  The
+    /// enrolled-phase report reclassifies "other" via
+    /// [`candidate_created_path`](Self::candidate_created_path): a
+    /// main-loop confirmation of a burst-created candidate is the PRIMARY
+    /// mechanism ("burst_continuation"); a main-loop detection whose
+    /// candidate the main loop created itself is "unexpected" (mahbot-1024).
+    detection_path: Option<String>,
+    /// Scoring path that created the ACTIVE classifier candidate ("burst" /
+    /// "segment_end_pass" / "other"; `None` when no candidate is active).
+    /// Evidence for the [`detection_path`](Self::detection_path)
+    /// reclassification (mahbot-1024).
+    candidate_created_path: Option<String>,
+    /// Whether the deferred burst sweep ran during this variant's session.
+    burst_sweep_fired: bool,
+    /// Mel-frame buffer length at burst-sweep time (the actual live trigger
+    /// geometry — typically 68–80).
+    burst_sweep_buffer_len: Option<usize>,
+    /// Whether the segment-end pass ran at a boundary during this variant's
+    /// session.
+    segment_end_pass_fired: bool,
+    /// Whether the adaptive threshold was still bootstrapping at the end of
+    /// the test utterance (mahbot-1023 score-only feed rule: a full
+    /// high-scoring utterance can keep the bootstrap alive for its whole
+    /// duration — the effective threshold then stays at the static hard
+    /// floor, and miss verdicts must not misread this as an adaptive block).
+    adaptive_bootstrap_persisted: bool,
 }
 
 /// Build a [`PerVariantResult`] from a completed [`run_streaming_detection`]
@@ -1832,6 +1869,20 @@ fn build_per_variant_result(
         per_frame_adaptive_mode: ctx.instrumentation.per_frame_adaptive_mode.clone(),
         per_frame_candidate_state: ctx.instrumentation.per_frame_candidate_state.clone(),
         per_hop_vad: ctx.instrumentation.per_hop_vad.clone(),
+        // mahbot-1023: deferred-burst / acceptance-floor evidence.
+        detection_path: ctx.instrumentation.detection_path.map(str::to_string),
+        candidate_created_path: ctx
+            .instrumentation
+            .candidate_created_path
+            .map(str::to_string),
+        burst_sweep_fired: ctx.instrumentation.burst_sweep_fired,
+        burst_sweep_buffer_len: ctx.instrumentation.burst_sweep_buffer_len,
+        segment_end_pass_fired: ctx.instrumentation.segment_end_pass_fired,
+        adaptive_bootstrap_persisted: ctx
+            .instrumentation
+            .per_frame_adaptive_mode
+            .last()
+            .is_some_and(|m| *m == super::AdaptiveFrameMode::Bootstrap),
     }
 }
 
@@ -1865,8 +1916,11 @@ enum MissVerdict {
     /// confirmation.  Also covers an untrained (no-op) verifier, where no
     /// second-stage gate exists to reject.
     VerifierTiming,
-    /// Warm-up was incomplete when the classifier triggered; the trigger was
-    /// suppressed by verifier warm-up ([`VERIFIER_WARMUP_EMBEDDINGS`]).
+    /// The first classifier threshold crossing fell inside the verifier
+    /// warm-up epoch (frame-accurate, mahbot-1024: frame `i` is warm-up iff
+    /// `warmup_n_embeddings + i + 1 < VERIFIER_WARMUP_EMBEDDINGS`); the
+    /// trigger was suppressed by verifier warm-up
+    /// ([`VERIFIER_WARMUP_EMBEDDINGS`]).
     WarmupSuppression,
     /// AGC explicitly reported non-convergence (`Some(false)`).
     AgcFailure,
@@ -1914,6 +1968,20 @@ impl MissVerdict {
 /// 7. `verifier_timing` / `verifier_rejected` — crossed the effective
 ///    threshold; split by whether the verifier peak reached the verifier
 ///    threshold (lifecycle/timing failure) or not (genuine rejection).
+///
+/// ## Warm-up suppression is frame-accurate (mahbot-1024)
+///
+/// The pre-utterance `warmup_completed` flag is captured BEFORE the
+/// cold-start utterance (always `false` in the cold pass — the utterance
+/// itself consumes the verifier warm-up), so it cannot distinguish a
+/// trigger consumed by warm-up suppression from a genuine post-warm-up
+/// verifier rejection.  The mahbot-1023 speed_down miss (run
+/// 20260801-061348) was mislabeled `warmup_suppression`: its first
+/// threshold crossing was frame 3 — the exact warm-up boundary — and the
+/// verifier genuinely rejected it (peak 0.7886 < 0.86).  The verdict now
+/// uses [`trigger_fell_in_warmup`]: frame `i` is a warm-up frame iff
+/// `warmup_n_embeddings + i + 1 < VERIFIER_WARMUP_EMBEDDINGS` (the ring is
+/// pushed before the warm-up test).
 fn classify_miss(pv: &PerVariantResult) -> MissVerdict {
     if pv.detected {
         return MissVerdict::Detected;
@@ -1922,7 +1990,7 @@ fn classify_miss(pv: &PerVariantResult) -> MissVerdict {
         return MissVerdict::VadFailure;
     }
     let triggered = pv.max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD;
-    if triggered && !pv.warmup_completed {
+    if triggered && !pv.warmup_completed && trigger_fell_in_warmup(pv) {
         return MissVerdict::WarmupSuppression;
     }
     if pv.agc_converged == Some(false) {
@@ -1936,6 +2004,18 @@ fn classify_miss(pv: &PerVariantResult) -> MissVerdict {
         .iter()
         .any(|s| s[ROLLING_SUM_IDX] >= s[THRESHOLD_IDX]);
     if !crossed_effective {
+        // ── mahbot-1023 prolonged-bootstrap branch ──
+        // With the score-only bootstrap feed rule, a full high-scoring
+        // utterance can keep the adaptive state in bootstrap for its whole
+        // duration.  During bootstrap the effective threshold IS the static
+        // hard floor (peek returns None → match_threshold), so reaching the
+        // hard floor (`triggered`) implies crossing the effective threshold —
+        // this arm is structurally UNREACHABLE under a persisted bootstrap.
+        // It is kept as an explicit branch so report readers cannot misread a
+        // persisted bootstrap as an adaptive-threshold failure: the
+        // `adaptive_bootstrap_persisted` per-variant field makes the state
+        // explicit, and the verifier split below is the accurate attribution
+        // whenever the classifier triggered.
         return MissVerdict::AdaptiveThresholdBlocked;
     }
     if !pv.verifier_trained {
@@ -1943,11 +2023,68 @@ fn classify_miss(pv: &PerVariantResult) -> MissVerdict {
         // is a candidate lifecycle/timing issue (expired or audio ended).
         return MissVerdict::VerifierTiming;
     }
-    if pv.verifier_score >= pv.verifier_threshold {
+    // Split by the CONSTANT acceptance floor (0.86, mahbot-1023): the
+    // runtime-calibrated `pv.verifier_threshold` is a report-only reference
+    // and does not arbitrate acceptance.
+    if pv.verifier_score >= crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR {
         MissVerdict::VerifierTiming
     } else {
         MissVerdict::VerifierRejected
     }
+}
+
+/// Frame-accurate warm-up-trigger test (mahbot-1024).
+///
+/// Returns `true` when the first classifier threshold crossing fell inside
+/// the verifier warm-up epoch.  `per_frame_scores[i]` is the
+/// `(warmup_n_embeddings + i + 1)`-th embedding pushed to the ring (the
+/// ring is pushed before the warm-up test in `score_single_embedding`), so
+/// frame `i` is a warm-up frame iff
+/// `warmup_n_embeddings + i + 1 < VERIFIER_WARMUP_EMBEDDINGS`.
+fn trigger_fell_in_warmup(pv: &PerVariantResult) -> bool {
+    let warmup_frames_remaining = crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS
+        .saturating_sub(pv.warmup_n_embeddings + 1);
+    pv.first_trigger_frame_idx
+        .is_some_and(|i| i < warmup_frames_remaining)
+}
+
+/// Reclassify the raw detection source into the enrolled-phase mechanism
+/// taxonomy (mahbot-1024 re-scope).
+///
+/// The raw `detection_source` is the window type where the confirmation
+/// fired.  The measured production mechanism is the **burst-created
+/// candidate confirmed mid-utterance by main-loop continuation** (12/14 of
+/// the archived final-code detections): the deferred burst sweep creates
+/// the candidate, and a subsequent clean main-loop (stride-8) window
+/// confirms it at verifier ≥ 0.86 before the segment-end pass, 760–790 ms
+/// from wake-word onset.  That path must NOT be flagged as a regression.
+///
+/// Returned labels:
+/// - `"burst"` — the deferred burst sweep confirmed directly.
+/// - `"burst_continuation"` — a burst-created candidate was confirmed by a
+///   later main-loop window (the PRIMARY expected mechanism).
+/// - `"segment_end_pass"` — the segment-boundary fallback pass confirmed.
+/// - `"unexpected"` — a main-loop detection whose candidate the main loop
+///   created itself (no burst-created candidate to continue) — the genuine
+///   unexpected-path flag.
+///
+/// `None` when the variant was not detected.
+fn reclassify_detection_path(
+    detection_source: Option<&str>,
+    candidate_created_path: Option<&str>,
+) -> Option<String> {
+    let mechanism = match detection_source? {
+        "burst" | "segment_end_pass" => detection_source?,
+        "other" => {
+            if candidate_created_path == Some("burst") {
+                "burst_continuation"
+            } else {
+                "unexpected"
+            }
+        }
+        other => other,
+    };
+    Some(mechanism.to_string())
 }
 
 /// Extract the maximum rolling sum from per-frame score triples.
@@ -2030,8 +2167,8 @@ impl DetectionMetrics {
 /// | Condition | Counter |
 /// |-----------|---------|
 /// | `max_rolling_sum < MIN_CLASSIFIER_THRESHOLD` | not counted |
-/// | Triggered + `warmup_completed == false` | `warmup_suppressed` |
-/// | Triggered + warmup completed + `detected == false` | `verifier_caught` |
+/// | Triggered + warm-up-epoch trigger (frame-accurate, mahbot-1024) | `warmup_suppressed` |
+/// | Triggered + post-warm-up trigger + `detected == false` | `verifier_caught` |
 /// | Triggered + `detected == true` | `full_pipeline_fa` |
 #[derive(Debug, Default, Clone, Copy)]
 struct ClassifierTriggerMetrics {
@@ -2039,8 +2176,12 @@ struct ClassifierTriggerMetrics {
     total_variants: usize,
     /// Number of variants where max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD.
     classifier_triggers: usize,
-    /// Number where classifier triggered but warmup was not completed,
-    /// so the verifier never evaluated these frames.
+    /// Number where the first classifier trigger fell inside the verifier
+    /// warm-up epoch (frame-accurate, [`trigger_fell_in_warmup`] — the
+    /// pre-utterance `warmup_completed` flag alone would mislabel
+    /// post-warm-up verifier rejections in the cold pass as warm-up
+    /// suppression, mahbot-1024), so the verifier never evaluated these
+    /// frames.
     warmup_suppressed: usize,
     /// Number where classifier triggered, warmup completed, but
     /// detected == false (verifier successfully rejected).
@@ -2098,7 +2239,11 @@ impl ClassifierTriggerMetrics {
         self.total_variants += 1;
         if pv.max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD {
             self.classifier_triggers += 1;
-            if !pv.warmup_completed {
+            // mahbot-1024: warm-up suppression is frame-accurate (the
+            // pre-utterance warmup_completed flag is always false in the
+            // cold pass and cannot distinguish warm-up-epoch triggers from
+            // post-warm-up verifier rejections).
+            if !pv.warmup_completed && trigger_fell_in_warmup(pv) {
                 self.warmup_suppressed += 1;
             } else if !pv.detected {
                 self.verifier_caught += 1;
@@ -2136,7 +2281,9 @@ fn verifier_recall(per_variant: &[PerVariantResult]) -> Option<(usize, usize)> {
             continue;
         }
         evaluated += 1;
-        if pv.verifier_score >= pv.verifier_threshold {
+        // Constant acceptance floor (0.86, mahbot-1023) — the runtime
+        // calibrated value is report-only.
+        if pv.verifier_score >= crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR {
             accepted += 1;
         }
     }
@@ -2307,6 +2454,45 @@ fn pv_to_json(
         serde_json::json!(pv.verifier_trained),
     );
     obj.insert("latency_ms".to_string(), serde_json::json!(pv.latency_ms));
+    // mahbot-1023: deferred-burst / acceptance-floor evidence (all variants).
+    obj.insert(
+        "detection_path".to_string(),
+        serde_json::json!(pv.detection_path),
+    );
+    // mahbot-1024: reclassified mechanism taxonomy (see
+    // reclassify_detection_path).  The raw detection_path stays as evidence;
+    // "mechanism" is the report's taxonomy label.
+    obj.insert(
+        "mechanism".to_string(),
+        serde_json::json!(reclassify_detection_path(
+            pv.detection_path.as_deref(),
+            pv.candidate_created_path.as_deref()
+        )),
+    );
+    obj.insert(
+        "candidate_created_path".to_string(),
+        serde_json::json!(pv.candidate_created_path),
+    );
+    obj.insert(
+        "burst_sweep_fired".to_string(),
+        serde_json::json!(pv.burst_sweep_fired),
+    );
+    obj.insert(
+        "burst_sweep_buffer_len".to_string(),
+        serde_json::json!(pv.burst_sweep_buffer_len),
+    );
+    obj.insert(
+        "segment_end_pass_fired".to_string(),
+        serde_json::json!(pv.segment_end_pass_fired),
+    );
+    obj.insert(
+        "adaptive_bootstrap_persisted".to_string(),
+        serde_json::json!(pv.adaptive_bootstrap_persisted),
+    );
+    obj.insert(
+        "effective_verifier_threshold".to_string(),
+        serde_json::json!(crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR),
+    );
     // Positive-only miss evidence (mahbot-1005 §2/§3/§4, mahbot-1012 §4).
     if category.is_none() {
         let verdict = classify_miss(pv);
@@ -2321,9 +2507,15 @@ fn pv_to_json(
             obj.insert("localization_evidence".to_string(), row.evidence.clone());
         }
         if pv.verifier_trained && !pv.detected {
+            // Margin to the CONSTANT acceptance floor (0.86, mahbot-1023) —
+            // the gate the acceptance protocol applies.  The runtime
+            // calibrated threshold remains visible via verifier_threshold.
             obj.insert(
                 "verifier_rejection_margin".to_string(),
-                serde_json::json!((pv.verifier_threshold - pv.verifier_score).max(0.0)),
+                serde_json::json!(
+                    (crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR - pv.verifier_score)
+                        .max(0.0)
+                ),
             );
         }
         // Trigger-point evidence (mahbot-1005 §3): the classifier's score at the
@@ -2633,13 +2825,16 @@ struct DualPathSide {
     /// Mel-frame position where each scored window started.
     window_start: Vec<usize>,
     /// Number of REAL mel frames inside each scored window (the rest is
-    /// synthetic padding for the short-buffer fallback).  Streaming side: the
-    /// mel buffer length at scoring time minus the window start, capped at
+    /// synthetic padding from the deferred-burst / segment-end-pass padded
+    /// geometry).  Streaming side: the mel buffer length at scoring time
+    /// minus the window start, capped at
     /// [`EMBEDDING_WINDOW_FRAMES`].  Training side: the whole-utterance mel
     /// length minus the window start, capped.  Quantifies the padded-window
-    /// geometry divergence — a streaming window-0 built from ~10 real frames
-    /// is not comparable to a training window-0 built from ~57 real frames,
-    /// even when both anchor at mel frame 0.
+    /// geometry divergence — a streaming window-0 scored at the burst trigger
+    /// (~68–76 real frames at the live flush) vs a training window-0 padded
+    /// from the full utterance, so the real-frame gap is much smaller than
+    /// the old incremental short-buffer fallback's ~10-frame windows (removed
+    /// in mahbot-1023).
     real_frames: Vec<usize>,
     /// Stable hash of each scored window's embedding.
     hashes: Vec<u64>,
@@ -2690,9 +2885,10 @@ impl DualPathSide {
 /// Pairing rule (mahbot-1012 §2): **ordinal** — streaming window `i` is paired
 /// with training window `i`, because both paths anchor their window grids at
 /// speech onset (mel frame 0).  When the streaming path produces extra windows
-/// (e.g. the short-utterance padded fallback), those have `training_idx: None`
-/// and are reported as unmatched.  The per-window `window_start` values are
-/// reported for both sides so grid drift is directly visible.
+/// (e.g. the deferred-burst / segment-end-pass padded windows), those have
+/// `training_idx: None` and are reported as unmatched.  The per-window
+/// `window_start` values are reported for both sides so grid drift is directly
+/// visible.
 ///
 /// # Pairing caveat: buffer-relative vs absolute starts (mahbot-1012 reviewer)
 ///
@@ -2717,10 +2913,11 @@ struct DualPathWindowMatch {
     /// training anchor).
     start_delta: Option<i64>,
     /// Number of REAL mel frames in the streaming window (rest is synthetic
-    /// padding).  Window-0 is typically ~10 for the streaming short-buffer
-    /// fallback vs ~57 for the training full-buffer pad — the real-frame gap
-    /// quantifies the padded-window geometry divergence that a raw hash/
-    /// cosine comparison alone cannot separate from the mel-scope divergence.
+    /// padding from the burst/pass padded geometry).  Window-0 carries
+    /// ~68–76 real frames at the live burst trigger (vs ~57 for the training
+    /// full-buffer pad) — the residual real-frame gap quantifies the
+    /// padded-window geometry divergence that a raw hash/cosine comparison
+    /// alone cannot separate from the mel-scope divergence.
     streaming_real_frames: usize,
     /// Number of REAL mel frames in the training window.
     training_real_frames: usize,
@@ -2852,15 +3049,15 @@ impl MelFrameComparison {
 /// entire current benchmark — both grids start at mel frame 0, so there is no
 /// grid drift to measure: the natural streaming grid IS the training anchor.
 /// The natural/anchored score gap on these clips is driven by **window
-/// content**: the streaming padded fallback scores partial-buffer windows
-/// (only the mel frames accumulated so far, e.g. ~10 real frames at the first
-/// scoring step, the rest synthetic), while the training path scores ONE
-/// full-buffer padded window (~57 real frames).  The per-window
-/// `real_frames` fields make this explicit; a large natural/anchored gap with
-/// a large real-frame gap is evidence for the padded-window geometry
-/// divergence (2), not grid drift (3).  Grid drift would require clips long
-/// enough for mel-buffer trims / gap-recovery re-anchoring to shift the
-/// grid off the anchor.
+/// content**: the streaming side's padded windows (deferred burst /
+/// segment-end pass) contain only the mel frames accumulated at scoring time
+/// (e.g. ~68–76 real frames at the live burst trigger, the rest synthetic),
+/// while the training path scores ONE full-buffer padded window (~57 real
+/// frames).  The per-window `real_frames` fields make this explicit; a large
+/// natural/anchored gap with a large real-frame gap is evidence for the
+/// padded-window geometry divergence (2), not grid drift (3).  Grid drift
+/// would require clips long enough for mel-buffer trims / gap-recovery
+/// re-anchoring to shift the grid off the anchor.
 struct AnchorProbeResult {
     variant: String,
     natural_starts: Vec<usize>,
@@ -3144,8 +3341,8 @@ fn run_dual_path_capture(
 
     // ── Ordinal pairing ───────────────────────────────────────────────────
     // Pair streaming window `i` with training window `i` (both paths anchor at
-    // speech onset).  Extra streaming windows (padded fallback) have no
-    // training counterpart and are reported as unmatched.  Cosine / L2 deltas
+    // speech onset).  Extra streaming windows (burst/pass padded windows) have
+    // no training counterpart and are reported as unmatched.  Cosine / L2 deltas
     // are computed from the RAW embeddings (streaming instrumentation + local
     // training embeddings) so the report quantifies drift, not just equality.
     let n_paired = streaming
@@ -3419,7 +3616,7 @@ fn run_anchor_probe(
 ///   A window-0 mismatch means the mel values diverged before any windowing /
 ///   grid effect (per-call mel floor or VAD gating); a later first-mismatch
 ///   with an overall low match fraction means the divergence starts at that
-///   window (grid drift / padded fallback).
+///   window (grid drift / padded-window geometry).
 /// - (c) vs (d) boundary: "scores are low" is defined as the streaming
 ///   per-window mean total_score falling below the training-path in-sample
 ///   P10 (all training-side per-window scores across all positive variants).
@@ -4129,7 +4326,12 @@ fn run_noise_overlap_test(
 //     must not disturb the shared voice state).
 
 /// B-sweep grid (mahbot-1022): streaming-layout mel buffer lengths B.
-const SWEEP_BS: [usize; 7] = [44, 49, 52, 57, 60, 65, 68];
+/// mahbot-1023: extended to 72/76/80 so the decisive verifier families at the
+/// actual flush-aligned live trigger buffer lengths (B≈72–80, position 24 at
+/// 48–56 real frames — OUTSIDE the original ≤68 grid) are measured, not
+/// extrapolated (manager pin 2).  The sweep extension is for interpretability,
+/// not a hard gate: the ≥3-run acceptance protocol validates the live behavior.
+const SWEEP_BS: [usize; 10] = [44, 49, 52, 57, 60, 65, 68, 72, 76, 80];
 /// In-buffer scoring positions (sequential ring order, stride 8).
 const SWEEP_POSITIONS: [usize; 4] = [0, 8, 16, 24];
 /// Decisive (B, position) cell for the F1-variant verdict (mahbot-1022 item 3a).
@@ -4492,10 +4694,11 @@ impl BsweepCellContext {
 }
 
 /// Score one (B, position) cell with SEQUENTIAL ring semantics (mahbot-1022):
-/// slice `mel[position..b]`, pad to the 76-frame embedding window, compute one
-/// embedding, then `score_single_embedding` with a static gate (no adaptive
-/// state, no candidate tracking).  `ctx` persists across cells within a
-/// B-buffer so positions 0 → 8 → 16 → 24 share ONE embedding ring.  At ring
+/// slice `mel[position..b]` (truncated to the 76-frame embedding window —
+/// mahbot-1023 sweep extension), pad to the 76-frame embedding window, compute
+/// one embedding, then `score_single_embedding` with a static gate (no
+/// adaptive state, no candidate tracking).  `ctx` persists across cells within
+/// a B-buffer so positions 0 → 8 → 16 → 24 share ONE embedding ring.  At ring
 /// length 4 exactly the per-window verifier scores are captured via
 /// [`ring4_window_scores`].
 #[expect(clippy::too_many_arguments)]
@@ -4510,7 +4713,13 @@ fn bsweep_score_cell(
     epsilon: f32,
     geometry: &'static str,
 ) -> BsweepCell {
-    let slice = &mel[position..b];
+    // The embedding window always spans exactly EMBEDDING_WINDOW_FRAMES (76)
+    // mel frames: at B > 76 the window at `position` truncates at
+    // `position + 76` (the frames beyond the window are not part of the
+    // scored window).  The real-frame counts reported via count_true_unique
+    // use the same truncation so the true-unique band matches the window.
+    let window_end = b.min(position + super::EMBEDDING_WINDOW_FRAMES);
+    let slice = &mel[position..window_end];
     let padded = super::pad_mel_frames_to_window(slice);
     // A failed embedding (e.g. model unavailable) makes this cell
     // UNMEASURABLE and must NOT advance the shared ring — a stale embedding
@@ -4538,7 +4747,7 @@ fn bsweep_score_cell(
             Some((max, wins, fams)) => (Some(max), wins, fams),
             None => (None, Vec::new(), Vec::new()),
         };
-    let (true_uniq_bit, true_uniq_tol) = count_true_unique(mel, position, b, epsilon);
+    let (true_uniq_bit, true_uniq_tol) = count_true_unique(mel, position, window_end, epsilon);
     BsweepCell {
         b,
         position,
@@ -4751,9 +4960,10 @@ fn bsweep_sanity_anchor_score(same_audio: &Mahbot1012Report) -> Option<f32> {
 ///
 /// Short-buffer / trimmed-buffer windows (`padded_fallback`, `cold_start_tiled`
 /// — recorded real frames < 76) are INFORMATIONAL: their recorded real-frame
-/// count reflects the streaming buffer state AT SCORING TIME (the growing
-/// short-buffer fallback, or a post-trim re-score with buffer-relative
-/// starts), which the sweep's one-shot recomputed full mel cannot reproduce.
+/// count reflects the streaming buffer state AT SCORING TIME (the deferred
+/// burst / segment-end pass padded geometry, or a post-trim re-score with
+/// buffer-relative starts), which the sweep's one-shot recomputed full mel
+/// cannot reproduce.
 /// They never force `pass = false` — that is the legitimate run-position VAD
 /// divergence the criterion tolerates (the sweep recomputes the shared mel
 /// AFTER Phase 8b, advancing the shared detector).
@@ -4804,9 +5014,9 @@ fn bsweep_cross_check(same_audio: &Mahbot1012Report, shared_mel_len: usize) -> s
                 } else {
                     serde_json::json!(
                         "short-buffer/trimmed-buffer window — recorded rf reflects \
-                         the buffer state at scoring time (growing/padded geometry \
-                         or post-trim buffer-relative starts), which the recomputed \
-                         full mel cannot reproduce; informational only"
+                         the buffer state at scoring time (burst/pass padded \
+                         geometry or post-trim buffer-relative starts), which the \
+                         recomputed full mel cannot reproduce; informational only"
                     )
                 },
             }));
@@ -5016,7 +5226,12 @@ fn run_bsweep(
     // the detection test uses (mahbot-932 Fix 5 semantics).
     let f1_variants =
         pcm_augment_enrollment_variants(&[(f1_pcm.clone(), "F1.json_enroll0".to_string())]);
+    // mahbot-1023: the acceptance arbiter is the CONSTANT
+    // VERIFIER_ACCEPTANCE_FLOOR (0.86) — the runtime-calibrated
+    // `verifier.threshold` becomes a report-only reference (drift
+    // observability) and no longer gates confirmation.
     let verifier_threshold = verifier.threshold;
+    let acceptance_floor = crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR;
     let b68_grid_idx = SWEEP_BS
         .iter()
         .position(|&b| b == DECISIVE_B)
@@ -5044,9 +5259,11 @@ fn run_bsweep(
             let cls_ok = decisive_cell
                 .classifier_score
                 .is_some_and(|s| s >= super::NO_MATCH_RESET_THRESHOLD);
+            // Constant 0.86 floor (mahbot-1023), NOT the runtime-calibrated
+            // threshold: product behavior must match the acceptance protocol.
             let ver_ok = decisive_cell
                 .verifier_ring4
-                .is_some_and(|v| v >= verifier_threshold);
+                .is_some_and(|v| v >= acceptance_floor);
             Some(cls_ok && ver_ok)
         } else {
             None
@@ -5327,17 +5544,23 @@ impl BsweepReport {
             "variants_training_path": variants_training,
             "verdict": {
                 "classifier_threshold": f64::from(super::NO_MATCH_RESET_THRESHOLD),
-                "verifier_threshold": self.verifier_runtime_threshold,
+                "verifier_acceptance_floor": f64::from(
+                    crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR,
+                ),
+                "verifier_runtime_threshold_report_only": self.verifier_runtime_threshold,
                 "confirm_count": self.confirm_count,
                 "measurable_count": self.measurable_count,
                 "passed_4of5": self.passed_4of5,
                 "unmeasurable_variants": self.unmeasurable_variants,
                 "note": "confirm(variant) = classifier(B=68, position 24) >= 0.316 \
                          (NO_MATCH_RESET_THRESHOLD compile-time constant) AND ring-4 \
-                         verifier peak >= runtime verifier.threshold.  Unmeasurable when \
-                         the variant's streaming-layout mel < 68 frames (decisive cell \
-                         UNMEASURABLE; sequence length reported).  passes = 4 of 5 \
-                         confirms over the measurable variants.",
+                         verifier peak >= VERIFIER_ACCEPTANCE_FLOOR (constant 0.86, \
+                         mahbot-1023 — NOT the entropy-seeded runtime-calibrated \
+                         threshold, which is reported above as a report-only \
+                         reference).  Unmeasurable when the variant's streaming-layout \
+                         mel < 68 frames (decisive cell UNMEASURABLE; sequence length \
+                         reported).  passes = 4 of 5 confirms over the measurable \
+                         variants.",
             },
             "negatives": negatives,
             "sanity_anchor": {
@@ -5370,6 +5593,619 @@ impl BsweepReport {
             "trailing_post_trim": self.trailing_post_trim,
         })
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// mahbot-1023: enrolled-speaker benchmark phase (Phase 8d)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Per-variant enrolled-speaker result (mahbot-1023 item 6).
+#[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)]
+struct EnrolledVariantResult {
+    variant: String,
+    /// End-to-end detection through the real streaming cold pass.
+    detected: bool,
+    /// Scoring path that produced the detection, reclassified into the
+    /// enrolled-phase mechanism taxonomy (mahbot-1024): "burst" /
+    /// "burst_continuation" / "segment_end_pass" / "unexpected" (see
+    /// [`reclassify_detection_path`]).  "burst_continuation" (burst-created
+    /// candidate confirmed by main-loop continuation) is the PRIMARY
+    /// expected mechanism; "unexpected" (main-loop-created candidate) is
+    /// the genuine regression signal.  None when not detected.
+    detection_path: Option<String>,
+    /// Raw detection source ("burst" / "segment_end_pass" / "other") — the
+    /// un-reclassified window type where the confirmation fired, kept for
+    /// report transparency alongside the reclassified `detection_path`.
+    detection_source: Option<String>,
+    /// confirm(variant) per the acceptance protocol: classifier gate
+    /// (max rolling sum ≥ MIN_CLASSIFIER_THRESHOLD) AND the RING-4 verifier
+    /// peak at the burst's position 24 (the 4th scored frame's
+    /// max_verifier_score — the live analogue of the B-sweep decisive cell).
+    confirm: bool,
+    /// Ring-4 verifier peak at the burst's position 24 (the 4th scored
+    /// frame).  0.0 when fewer than 4 frames were scored.
+    ring4_verifier_at_pos24: f32,
+    /// Detection latency ms (CPU wall-clock of the feed loop; None when not
+    /// detected).  NOTE: the feed loop processes faster than real-time, so
+    /// this is a processing-cost proxy — the AUDIO position of the detection
+    /// is given by `burst_sweep_buffer_len` × 10 ms (mel model stride).
+    latency_ms: Option<f64>,
+    /// Peak verifier score achieved by any candidate this variant (the
+    /// session-lifetime peak, which can exceed the ring-4 sample when later
+    /// clean windows confirm the burst-created candidate).
+    verifier_peak: f32,
+    /// Per-frame classifier window scores `[total_score, rolling_sum,
+    /// effective_threshold]`.
+    per_frame_scores: Vec<[f32; 3]>,
+    /// Per-frame verifier scores (parallel to `per_frame_scores`).
+    verifier_score_trajectory: Vec<f32>,
+    /// Per-frame mel-window start positions (parallel to `per_frame_scores`).
+    per_frame_window_start: Vec<usize>,
+    /// Per-frame mel-buffer lengths (parallel to `per_frame_scores`).
+    per_frame_mel_buffer_len: Vec<usize>,
+    /// Per-frame window geometry classes (parallel to `per_frame_scores`).
+    per_frame_geometry: Vec<super::WindowGeometry>,
+    /// Per-frame adaptive-threshold modes (parallel to `per_frame_scores`).
+    per_frame_adaptive_mode: Vec<super::AdaptiveFrameMode>,
+    /// Per-frame candidate lifecycle states (parallel to `per_frame_scores`).
+    per_frame_candidate_state: Vec<super::CandidateFrameState>,
+    /// Live burst-trigger buffer length (None when the burst never ran).
+    burst_sweep_buffer_len: Option<usize>,
+    /// Synchronous burst sweep wall-clock (ms; None when the burst never ran).
+    burst_wall_clock_ms: Option<f64>,
+    /// Whether the segment-end pass ran this variant.
+    segment_end_pass_fired: bool,
+    /// Whether the adaptive bootstrap persisted across the whole utterance.
+    adaptive_bootstrap_persisted: bool,
+    /// Miss verdict for non-detected variants (see [`MissVerdict`]).
+    miss_verdict: Option<MissVerdict>,
+}
+
+/// Run the enrolled-speaker benchmark phase (mahbot-1023 item 6).
+///
+/// Positive set: F1's 5 augmentation variants (`_original`, `_speed_down`
+/// (0.95×), `_speed_up` (1.05×, conditional on ≥500 ms pre-pad), `_vol_down`
+/// (−3 dB), `_noise` (pink noise ~25 dB SNR)) — labeled prominently as
+/// IN-SAMPLE / TRAINING-SIDE CONTROL data (user-approved "one speaker first"
+/// direction, NOT a generalization measure; cross-speaker generalization is
+/// a later classifier phase).
+///
+/// Measures end-to-end detection (classifier gate + verifier ≥ 0.86) through
+/// the REAL streaming cold pass — fresh [`PipelineCtx`] per variant, no
+/// warm-up, fresh adaptive state that bootstraps from the first real frames,
+/// cold-start verifier warm-up included — exactly the production post-silence
+/// start.  The deferral (deferred burst + segment-end pass) is exercised for
+/// real through `handle_wake_word_detection`; the synchronous burst stall is
+/// measured per variant (the drop-counter proxy, manager pin 4).
+///
+/// Returns `None` when the F1 training clip is absent.
+#[expect(clippy::too_many_lines)]
+fn run_enrolled_speaker_phase(
+    train_clips: &[(Vec<f32>, String)],
+    classifier: &WakeWordClassifier,
+    verifier: &VoiceVerifier,
+) -> Option<serde_json::Value> {
+    let start = Instant::now();
+    let (f1_pcm, _f1_label) = train_clips.iter().find(|(_, l)| l == "F1.json_enroll0")?;
+    let f1_variants =
+        pcm_augment_enrollment_variants(&[(f1_pcm.clone(), "F1.json_enroll0".to_string())]);
+
+    // ── Set classifier + verifier in global state (the streaming pipeline
+    //    reads them from voice_state) ───────────────────────────────────────
+    super::set_classifier_weights(classifier.weights_ref().clone());
+    super::set_verifier(verifier.clone());
+
+    let mut variants: Vec<EnrolledVariantResult> = Vec::new();
+    for (variant_pcm, variant_label) in &f1_variants {
+        // Cold pass: fresh PipelineCtx per variant, no consume_warmup, fresh
+        // AdaptiveThresholdState (matches production's post-silence start).
+        let mut ctx = super::PipelineCtx::new();
+        let result = run_streaming_detection(variant_pcm, &mut ctx);
+        let pv = build_per_variant_result(variant_label, &result, &ctx, false, 0, verifier);
+        // confirm(variant) per the acceptance protocol: the ring-4 verifier
+        // peak at the burst's position 24 (the 4th scored frame's
+        // max_verifier_score) — the live analogue of the B-sweep decisive
+        // cell.  NOTE: at the live trigger geometry (B = 72–80) position 0 is
+        // a full 76-frame window (not padded), whose embedding can pull the
+        // ring-4 sample below 0.86 even when later clean windows confirm —
+        // that divergence is exactly what the ≥3-run protocol measures; the
+        // session `verifier_peak` is reported alongside for comparison.
+        let ring4_verifier_at_pos24 = pv.verifier_score_trajectory.get(3).copied().unwrap_or(0.0);
+        let confirm = pv.max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD
+            && ring4_verifier_at_pos24 >= crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR;
+        variants.push(EnrolledVariantResult {
+            variant: variant_label.clone(),
+            detected: result.detected,
+            detection_path: reclassify_detection_path(
+                pv.detection_path.as_deref(),
+                pv.candidate_created_path.as_deref(),
+            ),
+            detection_source: pv.detection_path.clone(),
+            confirm,
+            ring4_verifier_at_pos24,
+            latency_ms: result.latency_ms,
+            verifier_peak: pv.verifier_score,
+            per_frame_scores: pv.per_frame_scores.clone(),
+            verifier_score_trajectory: pv.verifier_score_trajectory.clone(),
+            per_frame_window_start: pv.per_frame_window_start.clone(),
+            per_frame_mel_buffer_len: pv.per_frame_mel_buffer_len.clone(),
+            per_frame_geometry: pv.per_frame_geometry.clone(),
+            per_frame_adaptive_mode: pv.per_frame_adaptive_mode.clone(),
+            per_frame_candidate_state: pv.per_frame_candidate_state.clone(),
+            burst_sweep_buffer_len: pv.burst_sweep_buffer_len,
+            burst_wall_clock_ms: ctx.instrumentation.burst_wall_clock_ms,
+            segment_end_pass_fired: pv.segment_end_pass_fired,
+            adaptive_bootstrap_persisted: pv.adaptive_bootstrap_persisted,
+            miss_verdict: if result.detected {
+                None
+            } else {
+                Some(classify_miss(&pv))
+            },
+        });
+        info!(
+            "  Enrolled variant {}: {} — {} (mechanism: {}, source: {}, latency: {:?}ms, verifier peak: {:.4}, ring4@pos24: {:.4}, confirm: {})",
+            variants.len(),
+            variant_label,
+            if result.detected { "DETECTED" } else { "miss" },
+            variants
+                .last()
+                .and_then(|v| v.detection_path.as_deref())
+                .unwrap_or("n/a"),
+            pv.detection_path.as_deref().unwrap_or("n/a"),
+            result.latency_ms,
+            pv.verifier_score,
+            ring4_verifier_at_pos24,
+            confirm,
+        );
+    }
+
+    // ── Aggregate acceptance metrics ────────────────────────────────────────
+    let total = variants.len();
+    let detected_live = variants.iter().filter(|v| v.detected).count();
+    let confirmed = variants.iter().filter(|v| v.confirm).count();
+    // F1 no-regression control (acceptance criterion 2): the original
+    // enrolled variant must be detected in every fresh run.
+    let f1_original_detected = variants
+        .iter()
+        .find(|v| v.variant.ends_with("_original"))
+        .is_some_and(|v| v.detected);
+    let burst_path = variants
+        .iter()
+        .filter(|v| v.detection_path.as_deref() == Some("burst"))
+        .count();
+    let burst_cont_path = variants
+        .iter()
+        .filter(|v| v.detection_path.as_deref() == Some("burst_continuation"))
+        .count();
+    let pass_path = variants
+        .iter()
+        .filter(|v| v.detection_path.as_deref() == Some("segment_end_pass"))
+        .count();
+    let unexpected_path = variants
+        .iter()
+        .filter(|v| v.detection_path.as_deref() == Some("unexpected"))
+        .count();
+    // PRIMARY expected mechanism: burst-family detections (burst sweep
+    // directly, or burst-created candidate confirmed by main-loop
+    // continuation) before the segment-end pass.
+    let primary_mechanism = burst_path + burst_cont_path;
+    let burst_latencies: Vec<f64> = variants
+        .iter()
+        .filter(|v| v.detection_path.as_deref() == Some("burst"))
+        .filter_map(|v| v.latency_ms)
+        .collect();
+    let burst_family_latencies: Vec<f64> = variants
+        .iter()
+        .filter(|v| {
+            matches!(
+                v.detection_path.as_deref(),
+                Some("burst" | "burst_continuation")
+            )
+        })
+        .filter_map(|v| v.latency_ms)
+        .collect();
+    let burst_stalls: Vec<f64> = variants
+        .iter()
+        .filter_map(|v| v.burst_wall_clock_ms)
+        .collect();
+    let live_trigger_bs: Vec<usize> = variants
+        .iter()
+        .filter_map(|v| v.burst_sweep_buffer_len)
+        .collect();
+    let mean = |xs: &[f64]| -> Option<f64> {
+        if xs.is_empty() {
+            None
+        } else {
+            Some(xs.iter().copied().sum::<f64>() / xs.len() as f64)
+        }
+    };
+
+    // ── Near-miss canaries (mahbot-1024 item 5) ────────────────────────────
+    // Investigation triggers, NOT hard gates: firing means the run deserves
+    // review, never an automatic pass/fail.  Per-run reported.
+    let mut canaries_fired: Vec<&'static str> = Vec::new();
+    let mut confirmation_margin_low: Vec<serde_json::Value> = Vec::new();
+    let mut speed_down_peak: Option<f32> = None;
+    for v in &variants {
+        if v.variant.ends_with("_speed_down") {
+            speed_down_peak = Some(v.verifier_peak);
+        }
+        // Canary: any per-run confirmation verifier margin below ~0.90
+        // (confirmed detection whose verifier peak sat in [0.86, 0.90)).
+        if v.detected
+            && v.verifier_peak >= crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR
+            && v.verifier_peak < 0.90
+        {
+            confirmation_margin_low.push(serde_json::json!({
+                "variant": v.variant,
+                "verifier_peak": v.verifier_peak,
+                "margin_above_floor": v.verifier_peak
+                    - crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR,
+            }));
+        }
+    }
+    if !confirmation_margin_low.is_empty() {
+        canaries_fired.push("confirmation_verifier_margin_below_0_90");
+    }
+    // Canary: speed_down variant peak below ~0.90.
+    let speed_down_below_0_90 = speed_down_peak.is_some_and(|p| p < 0.90);
+    if speed_down_below_0_90 {
+        canaries_fired.push("speed_down_peak_below_0_90");
+    }
+
+    let per_variant_json: Vec<serde_json::Value> = variants
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "variant": v.variant,
+                "detected": v.detected,
+                "detection_path": v.detection_path,
+                "detection_source": v.detection_source,
+                "confirm": v.confirm,
+                "ring4_verifier_at_pos24": v.ring4_verifier_at_pos24,
+                "latency_ms": v.latency_ms,
+                "verifier_peak": v.verifier_peak,
+                "classifier_window_scores": v.per_frame_scores,
+                "verifier_score_trajectory": v.verifier_score_trajectory,
+                "per_frame_window_start": v.per_frame_window_start,
+                "per_frame_mel_buffer_len": v.per_frame_mel_buffer_len,
+                "per_frame_geometry": v
+                    .per_frame_geometry
+                    .iter()
+                    .map(|g| g.as_str())
+                    .collect::<Vec<_>>(),
+                "per_frame_adaptive_mode": v
+                    .per_frame_adaptive_mode
+                    .iter()
+                    .map(|m| m.as_str())
+                    .collect::<Vec<_>>(),
+                "per_frame_candidate_state": v
+                    .per_frame_candidate_state
+                    .iter()
+                    .map(|c| c.as_str())
+                    .collect::<Vec<_>>(),
+                "burst_sweep_buffer_len": v.burst_sweep_buffer_len,
+                "burst_wall_clock_ms": v.burst_wall_clock_ms,
+                "segment_end_pass_fired": v.segment_end_pass_fired,
+                "adaptive_bootstrap_persisted": v.adaptive_bootstrap_persisted,
+                "miss_verdict": v.miss_verdict.map(MissVerdict::as_str),
+            })
+        })
+        .collect();
+
+    let phase_ms = start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "  Enrolled-speaker phase: {detected_live}/{total} detected end-to-end, \
+         {confirmed}/{total} confirmed (strict ring-4 formula, report-only), \
+         paths: burst={burst_path} burst_continuation={burst_cont_path} \
+         segment_end_pass={pass_path} unexpected={unexpected_path}",
+    );
+    if unexpected_path > 0 {
+        warn!(
+            "Enrolled-speaker phase: {unexpected_path} detection(s) via the 'unexpected' \
+             path (main-loop-created candidate — no burst-created candidate to continue) — \
+             genuine unexpected-path signal, must be investigated",
+        );
+    }
+    if !canaries_fired.is_empty() {
+        warn!(
+            "Enrolled-speaker phase near-miss canaries fired: {} — investigation \
+             triggers, not a hard gate",
+            canaries_fired.join(", "),
+        );
+    }
+
+    Some(serde_json::json!({
+        "note": "IN-SAMPLE / TRAINING-SIDE CONTROL data (user-approved 'one speaker \
+                 first' direction) — NOT a generalization measure.  Measures end-to-end \
+                 detection (classifier gate + verifier >= VERIFIER_ACCEPTANCE_FLOOR 0.86) \
+                 through the REAL streaming cold pass: fresh PipelineCtx per variant, no \
+                 warm-up, fresh adaptive bootstrap, cold-start verifier warm-up included.  \
+                 Acceptance is re-scoped (mahbot-1024) to the MEASURED PRODUCTION \
+                 MECHANISM: a burst-created candidate confirmed mid-utterance at verifier \
+                 >= 0.86, whether confirmed inside the burst window ('burst') or by \
+                 main-loop continuation of the burst-created candidate \
+                 ('burst_continuation' — the PRIMARY expected path, 12/14 of the \
+                 archived final-code detections, at 760-790 ms from wake-word onset).  \
+                 The strict confirm(variant) formula (ring-4 verifier at the burst's \
+                 position 24, below) and the batch B-sweep readings are report-only \
+                 diagnostics and do NOT gate acceptance.",
+        "f1_clip": "F1.json_enroll0",
+        "phase_ms": phase_ms,
+        "variants_produced": {
+            "total": total,
+            "raw_level_speed_up": variants.iter().filter(|v| v.variant.ends_with("_speed_up")).count(),
+            "raw_level_total": variants.len(),
+            "training_path_speed_up": null,
+            "note": "Produced-variant count per semantics: raw-level speed_up gate = raw \
+                     TTS pre-pad >= 500 ms (this phase's count); the training-path gate \
+                     (VAD-gated speech pre-pad) is reported in the bsweep section.  The \
+                     5-variant set assumes speed_up was produced; if it was skipped the \
+                     produced count is stated explicitly.",
+        },
+        "acceptance": {
+            "detected_live": detected_live,
+            "detected_live_frac": if total > 0 { detected_live as f64 / total as f64 } else { 0.0 },
+            "f1_original_detected": f1_original_detected,
+            "confirmed": confirmed,
+            "confirmed_frac": if total > 0 { confirmed as f64 / total as f64 } else { 0.0 },
+            "target": "mean TP >= 4/5 (0.80) across >= 3 FRESH runs of the final staged \
+                       code — per-run end-to-end detection through the measured \
+                       production mechanism (detected_live), NOT the strict ring-4 \
+                       formula",
+            "strict_ring4_formula_report_only": "confirm(variant) = classifier gate \
+                       (max_rolling_sum >= 2.13) AND ring-4 verifier peak at the burst's \
+                       position 24 >= 0.86 (the live analogue of the B-sweep decisive \
+                       cell).  Kept visible as a report-only diagnostic: at the live \
+                       trigger geometry (B = 72-80) the burst's position-0 window is a \
+                       full 76-frame window (not padded) and its embedding can pull the \
+                       ring-4 sample below 0.86 even when the pipeline detects — the \
+                       divergence is the measurement artifact the re-scope documents, \
+                       NOT a mechanism failure.",
+            "effective_verifier_threshold": crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR,
+            "note": "detected_live = end-to-end through the real cold pass (the \
+                     acceptance metric).  confirmed = strict ring-4 formula (report-only \
+                     diagnostic).  f1_original_detected = F1 no-regression control \
+                     (criterion 2: must be detected in every fresh run).",
+        },
+        "paths": {
+            "burst": burst_path,
+            "burst_continuation": burst_cont_path,
+            "segment_end_pass": pass_path,
+            "unexpected": unexpected_path,
+            "primary_mechanism": primary_mechanism,
+            "note": "burst = deferred burst sweep confirmed directly; \
+                     burst_continuation = burst-created candidate confirmed by \
+                     main-loop continuation BEFORE the segment-end pass (the PRIMARY \
+                     expected mechanism, mahbot-1024); segment_end_pass = boundary \
+                     fallback; unexpected = main-loop-created candidate (no \
+                     burst-created candidate to continue) — the genuine unexpected-path \
+                     signal, flag + investigate, never accept silently.  Acceptance \
+                     requires mean TP >= 4/5 across >= 3 fresh runs via the primary \
+                     mechanism family (burst + burst_continuation), before the \
+                     segment-end pass.",
+        },
+        "latency": {
+            "burst_path_ms": burst_latencies,
+            "burst_path_mean_ms": mean(&burst_latencies),
+            "burst_family_ms": burst_family_latencies,
+            "burst_family_mean_ms": mean(&burst_family_latencies),
+            "burst_path_target": "<= ~1.0 s from speech onset",
+            "audio_position_of_burst_ms": live_trigger_bs
+                .iter()
+                .map(|b| b * 10)
+                .collect::<Vec<_>>(),
+            "note": "latency_ms is the CPU wall-clock of the feed loop (the benchmark \
+                     feeds audio faster than real-time) — a processing-cost proxy, NOT \
+                     the 'from speech onset' audio latency.  The AUDIO position of the \
+                     burst is burst_sweep_buffer_len x 10 ms (mel model stride): the \
+                     live trigger fires ~680-800 ms into the utterance (~56% through \
+                     'mahbot' for F1 at B=68-80), i.e. as the user finishes speaking \
+                     it, NOT instantly — the intentional UX framing.  The <= ~1.0 s \
+                     bound is judged on the audio position; observed confirmation \
+                     760-790 ms from wake-word onset.  burst_family_ms covers the \
+                     primary-mechanism detections (burst + burst_continuation).",
+        },
+        "burst_stall": {
+            "wall_clock_ms": burst_stalls,
+            "max_ms": burst_stalls.iter().copied().fold(0.0_f64, f64::max),
+            "note": "Synchronous burst sweep stall measured through the live pipeline \
+                     (AGC/VAD/block_in_place overhead included).  Worst case ~44-135 ms \
+                     (up to 9 ONNX calls), ~20-60 ms on the confirming path (4 calls); \
+                     the 1.024 s mic channel absorbs it.  No async scoring path is used.  \
+                     DROPPED_CHUNKS is only incremented on the real-mic channel — the \
+                     benchmark feeds audio directly, so the no-drop criterion is an \
+                     operational check on the live mic channel, stated as such (manager \
+                     pin 4).",
+        },
+        "live_trigger_geometry": {
+            "burst_sweep_buffer_lens": live_trigger_bs,
+            "note": "Actual live burst-trigger buffer lengths per variant (the first \
+                     flush-aligned B >= 68).  Reported per run so the acceptance review \
+                     can see the live geometry instead of extrapolating from the B=68 \
+                     static-gate grid (manager pin 2).",
+        },
+        "near_miss_canaries": {
+            "confirmation_verifier_margin_below_0_90": confirmation_margin_low,
+            "speed_down_peak": speed_down_peak,
+            "speed_down_below_0_90": speed_down_below_0_90,
+            "fired": canaries_fired,
+            "note": "Investigation triggers (mahbot-1024 item 5), NOT hard gates: any \
+                     fired canary means the run deserves review before acceptance.  \
+                     'confirmation_verifier_margin_below_0_90' = a confirmed detection \
+                     whose verifier peak sat in [0.86, 0.90); 'speed_down_peak_below_0_90' \
+                     = the binding speed_down variant's verifier peak dipped below 0.90 \
+                     (the single observed speed_down miss peaked at 0.7886, run \
+                     20260801-061348).  Negative-corpus canaries (classifier gate \
+                     crossings, negative-verifier margin-to-floor) are reported in the \
+                     safety_gate section; the per-run verifier weights fingerprint is in \
+                     the bsweep section.",
+        },
+        "per_variant": per_variant_json,
+    }))
+}
+
+/// Compute the mahbot-1023 safety gate over the negative/confusable set.
+///
+/// The deferral adds in-distribution deferred windows (burst + boundary
+/// double-scoring) whose false-positive impact must be MEASURED, not assumed.
+/// Baseline (mahbot-1022): 9/59 classifier gate crossings, 0 end-to-end false
+/// accepts.  The verifier is the false-accept backstop; the confusable
+/// `day mahbot_s2` peak 0.7587 sits 0.1013 below the 0.86 floor.  Because the
+/// verifier is entropy-seeded, an in-distribution confusable may exceed the
+/// floor on some runs — the report distinguishes true false accepts (detected)
+/// from boundary-crossing confusables (verifier peak in [0.86, 1.0] but no
+/// end-to-end accept).
+#[expect(clippy::too_many_lines)]
+fn safety_gate(all_neg_pv: &[(&PerVariantResult, String)]) -> serde_json::Value {
+    let acceptance_floor = crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR;
+    let total = all_neg_pv.len();
+    let gate_crossings = all_neg_pv
+        .iter()
+        .filter(|(pv, _)| pv.max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD)
+        .count();
+    let false_accepts: Vec<(&str, String)> = all_neg_pv
+        .iter()
+        .filter(|(pv, _)| pv.detected)
+        .map(|(pv, cat)| (pv.variant.as_str(), cat.clone()))
+        .collect();
+    let boundary_crossers: Vec<serde_json::Value> = all_neg_pv
+        .iter()
+        .filter(|(pv, _)| {
+            pv.verifier_score >= crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR
+        })
+        .map(|(pv, cat)| {
+            serde_json::json!({
+                "variant": pv.variant,
+                "category": cat,
+                "verifier_peak": pv.verifier_score,
+                "detected": pv.detected,
+                "gate_crossed": pv.max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD,
+            })
+        })
+        .collect();
+    // mahbot-1023 review fix: `pv.verifier_score` is the CANDIDATE-gated peak
+    // (`peak_verifier_score`, updated only while a candidate is active) — it
+    // collapses to 0.0 when no negative crosses the classifier gate, so it
+    // does NOT measure the verifier's negative distribution under the
+    // deferred geometry.  `verifier_score_trajectory` carries the raw
+    // per-frame verifier score (computed for EVERY scored frame once the ring
+    // passes VERIFIER_WARMUP_EMBEDDINGS, independent of candidate state), so
+    // aggregating it actually re-measures the 0.86 floor's FP margin as the
+    // ticket requires (item 7: must be measured, not assumed).  Acceptance
+    // accounting stays per-utterance (manager pin 7): a per-frame floor
+    // crossing is a boundary-crossing confusable, NOT a true false accept —
+    // the classifier gate must also pass for end-to-end detection.
+    let mut per_frame_max: f32 = 0.0;
+    let mut per_frame_total: usize = 0;
+    let mut per_frame_above_floor: usize = 0;
+    let mut boundary_crossing_confusables: Vec<serde_json::Value> = Vec::new();
+    // mahbot-1024 near-miss canary: negative per-frame verifier max within
+    // 0.20 of the floor (margin-to-floor < 0.20) — investigation trigger,
+    // NOT a hard gate.
+    let mut negative_margin_low: Vec<serde_json::Value> = Vec::new();
+    for (pv, cat) in all_neg_pv {
+        let mut utt_max = 0.0_f32;
+        let mut utt_above_floor = false;
+        for &v in &pv.verifier_score_trajectory {
+            per_frame_total += 1;
+            per_frame_max = per_frame_max.max(v);
+            utt_max = utt_max.max(v);
+            if v >= acceptance_floor {
+                per_frame_above_floor += 1;
+                utt_above_floor = true;
+            }
+        }
+        if utt_above_floor {
+            boundary_crossing_confusables.push(serde_json::json!({
+                "variant": pv.variant,
+                "category": cat,
+                "per_frame_verifier_max": utt_max,
+                "detected": pv.detected,
+                "gate_crossed": pv.max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD,
+            }));
+        }
+        if utt_max > acceptance_floor - 0.20 {
+            negative_margin_low.push(serde_json::json!({
+                "variant": pv.variant,
+                "category": cat,
+                "per_frame_verifier_max": utt_max,
+                "margin_to_floor": acceptance_floor - utt_max,
+            }));
+        }
+    }
+    // mahbot-1024 near-miss canaries (investigation triggers, not hard gates).
+    let mut neg_canaries_fired: Vec<&'static str> = Vec::new();
+    if gate_crossings > 0 {
+        neg_canaries_fired.push("classifier_gate_crossing_on_negative_corpus");
+    }
+    if !negative_margin_low.is_empty() {
+        neg_canaries_fired.push("negative_verifier_margin_to_floor_below_0_20");
+    }
+    serde_json::json!({
+        "note": "False-positive impact of the deferred in-distribution windows \
+                 (deferred burst + boundary fallback double-scoring) on the \
+                 negative/confusable set.  Baseline (mahbot-1022, pre-deferral): \
+                 9/59 classifier gate crossings, 0 end-to-end false accepts; \
+                 confusable 'day mahbot_s2' verifier peak 0.7587 (margin 0.1013 \
+                 below the 0.86 floor).  The gate crossing count is EXPECTED to \
+                 change under the deferral — it must be measured, not assumed.  \
+                 Per-utterance accounting (manager pin 7): the acceptance \
+                 denominator is utterances, not frames.  The per-frame negative \
+                 verifier aggregation (mahbot-1023 review fix) uses the raw \
+                 per-frame verifier scores from the trajectories — NOT the \
+                 candidate-gated peak, which is vacuous when no negative crosses \
+                 the classifier gate — so the 0.86 floor's FP margin is actually \
+                 re-measured under the new burst geometry.",
+        "total_negatives": total,
+        "classifier_gate_crossings": gate_crossings,
+        "baseline_gate_crossings": 9,
+        "end_to_end_false_accepts": false_accepts.len(),
+        "false_accept_list": false_accepts,
+        "baseline_false_accepts": 0,
+        "candidate_gated_peak": {
+            "boundary_crossing_confusables": boundary_crossers,
+            "max_negative_verifier_peak": all_neg_pv
+                .iter()
+                .map(|(pv, _)| pv.verifier_score)
+                .fold(0.0_f32, f32::max),
+            "note": "Legacy candidate-gated metrics (baseline comparability).  \
+                     Vacuous when no negative crosses the classifier gate — see \
+                     per_frame_negative_verifier for the real distribution.",
+        },
+        "per_frame_negative_verifier": {
+            "max": per_frame_max,
+            "frames_total": per_frame_total,
+            "frames_above_floor": per_frame_above_floor,
+            "boundary_crossing_confusables": boundary_crossing_confusables,
+            "note": "Aggregated from verifier_score_trajectory (raw per-frame \
+                     verifier scores, not candidate-gated).",
+        },
+        "verifier_acceptance_floor": acceptance_floor,
+        "margin_to_floor": (per_frame_max - acceptance_floor).abs(),
+        "acceptance": "<= 2/59 false accepts (5%) across >= 3 runs; every run with a \
+                       false accept must be investigated before the deferral counts \
+                       as enabled — no FA-bound breach may be silently tolerated.  \
+                       Boundary-crossing confusables (verifier >= floor without a \
+                       classifier-gate crossing) are reported separately and do NOT \
+                       count as false accepts.",
+        "near_miss_canaries": {
+            "classifier_gate_crossing_on_negative_corpus": gate_crossings,
+            "negative_verifier_margin_to_floor_below_0_20": negative_margin_low,
+            "fired": neg_canaries_fired,
+            "note": "Investigation triggers (mahbot-1024 item 5), NOT hard gates.  \
+                     'classifier_gate_crossing_on_negative_corpus' = any negative \
+                     variant crossed the classifier gate (baseline 9/59, mahbot-1022 \
+                     pre-deferral — expected to fire most runs; the count is measured \
+                     per run, not assumed).  'negative_verifier_margin_to_floor_below_0_20' \
+                     = a negative's per-frame verifier max came within 0.20 of the \
+                     0.86 floor (worst observed: 0.7587 baseline / 0.6833 final-code \
+                     runs — both fire).  Positive-side canaries are in the \
+                     enrolled_speaker section; the per-run verifier weights \
+                     fingerprint is in the bsweep section.",
+        },
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5982,6 +6818,10 @@ pub(crate) fn run_internal() {
     // the JSON report can emit a note even when the classifier is degenerate
     // or the F1 clip is unavailable.
     let mut bsweep_report: Option<BsweepReport> = None;
+    // mahbot-1023: enrolled-speaker benchmark phase (Phase 8d).  Declared
+    // here so the JSON report can emit a note even when the classifier is
+    // degenerate or the F1 clip is unavailable.
+    let mut enrolled_report: Option<serde_json::Value> = None;
 
     if !degenerate {
         // Create a pre-warmed adaptive threshold state shared across all
@@ -6088,6 +6928,24 @@ pub(crate) fn run_internal() {
         bsweep_report = run_bsweep(&train_clips, &classifier, &verifier, &same_audio);
         let bsweep_ms = bsweep_start.elapsed().as_secs_f64() * 1000.0;
         eprintln!("  B-sweep completed in {bsweep_ms:.0}ms");
+
+        // ── Phase 8d: Enrolled-speaker benchmark (mahbot-1023) ────────────
+        // End-to-end detection of F1's 5 raw-level augmentation variants
+        // through the REAL streaming cold pass (deferred burst + segment-end
+        // pass + adaptive bootstrap + cold-start verifier warm-up).  Runs
+        // AFTER Phase 8c so the same-run weights fingerprints are available
+        // for interpretability; advances the shared VAD detector (disclosed
+        // in the report — Phase 9+ negatives see the same drift as the
+        // bsweep).  Labeled in-sample / training-side control, NOT a
+        // generalization measure.  Measurement-only — the report is not
+        // pass/fail gated (mahbot-953), but the acceptance protocol judges
+        // the mean across ≥ 3 runs.
+        eprintln!("─── Phase 8d: enrolled-speaker benchmark (mahbot-1023) ───");
+        info!("─── Phase 8d: enrolled-speaker benchmark (mahbot-1023) ───");
+        let enrolled_start = Instant::now();
+        enrolled_report = run_enrolled_speaker_phase(&train_clips, &classifier, &verifier);
+        let enrolled_ms = enrolled_start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("  Enrolled-speaker phase completed in {enrolled_ms:.0}ms");
         // ── Phase 9: Detection — Confusable phrases ──────────────────────
         phase_start!("Phase 9: Negative — confusable phrases");
         let confusable_variants = generate_phrase_variants_cached(
@@ -7191,6 +8049,15 @@ pub(crate) fn run_internal() {
         |r| r.to_json(negative_verifier_extraction(&all_neg_pv)),
     );
 
+    // mahbot-1023: enrolled-speaker phase (Phase 8d) + safety gate (item 7).
+    // The safety gate measures the false-positive impact of the deferred
+    // in-distribution windows (burst + boundary double-scoring) on the
+    // negative/confusable set; baseline 9/59 gate crossings / 0 FAs.
+    let enrolled_json = enrolled_report.unwrap_or_else(|| {
+        serde_json::json!({"note": "Enrolled-speaker phase skipped (degenerate classifier or F1 clip unavailable)"})
+    });
+    let safety_gate_json = safety_gate(&all_neg_pv);
+
     let json = serde_json::json!({
         "benchmark": "voice_pipeline_e2e",
         "_note": "Report-only benchmark — no pass/fail gating (mahbot-953). \
@@ -7242,6 +8109,13 @@ pub(crate) fn run_internal() {
         // mahbot-1006 D: cold-start pass per-variant detail (same schema as
         // per_variant_results, but measured without consume_warmup / fresh
         // adaptive bootstrap).  Empty when the classifier is degenerate.
+        // mahbot-1023: measured under the deferred-burst pipeline — the cold
+        // pass exercises the burst sweep (buffer >= 68 frames) or the
+        // segment-end pass for short utterances, so these numbers reflect
+        // the fix, not the mahbot-1022 0/20 baseline.  The enrolled-speaker
+        // phase (enrolled_speaker section) is the acceptance-relevant
+        // in-sample measurement; this section is the same pipeline over the
+        // full 20-variant positive test set.
         "per_variant_results_cold": serde_json::Value::Array(
             cold_metrics
                 .per_variant
@@ -7273,6 +8147,9 @@ pub(crate) fn run_internal() {
         "verifier_diagnostics": {
             "trained": verifier.is_trained(),
             "threshold": verifier_training_threshold,
+            // mahbot-1023: the acceptance gate is the constant 0.86 floor —
+            // `threshold` above is a report-only reference.
+            "effective_acceptance_threshold": crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR,
             "recall": match verifier_recall_rate {
                 Some((accepted, evaluated)) => serde_json::json!({
                     "accepted": accepted,
@@ -7313,6 +8190,17 @@ pub(crate) fn run_internal() {
         "threshold_calibration": {
             "verifier_trained": verifier.is_trained(),
             "training_threshold": verifier_training_threshold,
+            // mahbot-1023: the runtime-calibrated / fallback threshold is a
+            // report-only reference — the confirmation gate uses the CONSTANT
+            // VERIFIER_ACCEPTANCE_FLOOR (0.86) in all cases (manager pin 1).
+            "effective_acceptance_threshold": crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR,
+            "note": "Effective acceptance threshold is the constant 0.86 \
+                     (VERIFIER_ACCEPTANCE_FLOOR) — the user-approved production \
+                     semantics — NOT the entropy-seeded runtime-calibrated value \
+                     reported above (which drifts across runs: 0.86 -> 0.91 on \
+                     two identical-code runs) and NOT the DEFAULT_VERIFIER_THRESHOLD \
+                     0.948 fallback.  The runtime values remain report-only so \
+                     threshold drift is reviewable over the >=3-run protocol.",
             "benchmark_optimal_threshold_dual": benchmark_dual_threshold,
             "dual_sweep_detection_rate_at_optimal": dual_sweep_dr,
             "dual_sweep_false_accept_rate_at_optimal": dual_sweep_far,
@@ -7337,6 +8225,13 @@ pub(crate) fn run_internal() {
         "reproducibility": reproducibility,
         "mahbot1012": same_audio.to_json(),
         "bsweep": bsweep_json,
+        // mahbot-1023: enrolled-speaker benchmark phase (Phase 8d) — F1's 5
+        // raw-level augmentation variants through the real streaming cold
+        // pass (in-sample / training-side control, NOT generalization).
+        "enrolled_speaker": enrolled_json,
+        // mahbot-1023 item 7: false-positive impact of the deferred
+        // in-distribution windows on the negative/confusable set.
+        "safety_gate": safety_gate_json,
         "config": {
             "num_enrollment_variants": NUM_ENROLLMENT_VARIANTS,
             "min_detection_rate": MIN_DETECTION_RATE,
@@ -7358,9 +8253,13 @@ pub(crate) fn run_internal() {
     // process ends, and a final ticket comment can cite exact numbers.
     if let Ok(report_dir) = crate::config::default_config_dir() {
         let report_path = report_dir.join("voice_pipeline_e2e_report.json");
-        // Preserve the prior report before overwrite (mahbot-1022 operational
-        // requirement): a prior run's report must survive the next run so
-        // cross-run analysis can diff the additive bsweep section.
+        // ── Per-run timestamped archive (mahbot-1023, manager pin 5) ──────
+        // The ≥3-run acceptance protocol computes spread from ACTUAL runs,
+        // which the old single .prior.json scheme cannot support (a 3rd run
+        // would overwrite run 1's archive).  Every run is archived with a
+        // UTC timestamp before the main report path is overwritten, so the
+        // acceptance review has all runs' reports.  The .prior.json copy is
+        // retained for backward compatibility with existing tooling.
         if report_path.exists() {
             let prior_path = report_dir.join("voice_pipeline_e2e_report.prior.json");
             if let Err(e) = std::fs::copy(&report_path, &prior_path) {
@@ -7369,6 +8268,19 @@ pub(crate) fn run_internal() {
                     prior_path.display()
                 );
             }
+        }
+        let archive_stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        let archive_path =
+            report_dir.join(format!("voice_pipeline_e2e_report.{archive_stamp}.json"));
+        match std::fs::write(&archive_path, &json_text) {
+            Ok(()) => info!(
+                "Benchmark report archived to {} (acceptance spread computed from timestamped per-run archives)",
+                archive_path.display()
+            ),
+            Err(e) => warn!(
+                "Could not write benchmark report archive to {}: {e}",
+                archive_path.display()
+            ),
         }
         match std::fs::write(&report_path, json_text) {
             Ok(()) => info!("Benchmark report written to {}", report_path.display()),
@@ -7805,6 +8717,16 @@ fn verdict_test_pv(
         per_frame_adaptive_mode: Vec::new(),
         per_frame_candidate_state: Vec::new(),
         per_hop_vad: Vec::new(),
+        // mahbot-1023: new fields default to the no-burst / no-detection /
+        // not-persisted-bootstrap states.  The acceptance threshold is the
+        // constant 0.86 floor (referenced directly at the gates, not stored
+        // as a field — it can never vary).
+        detection_path: None,
+        candidate_created_path: None,
+        burst_sweep_fired: false,
+        burst_sweep_buffer_len: None,
+        segment_end_pass_fired: false,
+        adaptive_bootstrap_persisted: false,
     }
 }
 
@@ -7846,13 +8768,17 @@ fn classify_miss_covers_all_verdicts() {
         )),
         V::VadFailure,
     );
-    // 4. Warm-up incomplete + classifier triggered → warmup_suppression.
-    assert_eq!(
-        classify_miss(&verdict_test_pv(
-            false, 10, 5, false, None, 2.5, true, 0.0, true, 0.6
-        )),
-        V::WarmupSuppression,
-    );
+    // 4. Warm-up epoch trigger (frame-accurate, mahbot-1024): the first
+    //    threshold crossing fell INSIDE the verifier warm-up epoch (cold
+    //    pass: warmup_n_embeddings=0, frame 1 < 3 warm-up frames) →
+    //    warmup_suppression, even though the pre-utterance warmup_completed
+    //    flag is false.
+    {
+        let mut pv = verdict_test_pv(false, 10, 5, false, None, 2.5, true, 0.0, true, 0.6);
+        pv.warmup_n_embeddings = 0;
+        pv.first_trigger_frame_idx = Some(1);
+        assert_eq!(classify_miss(&pv), V::WarmupSuppression);
+    }
     // 5. AGC explicitly non-converged → agc_failure.
     assert_eq!(
         classify_miss(&verdict_test_pv(
@@ -7891,21 +8817,47 @@ fn classify_miss_covers_all_verdicts() {
         )),
         V::VerifierTiming,
     );
-    // 9. Verifier peak crossed the threshold but detection didn't fire →
-    //    verifier_timing (candidate expired or audio ended first).
+    // 9. Verifier peak crossed the CONSTANT acceptance floor (0.86) but
+    //    detection didn't fire → verifier_timing (candidate expired or audio
+    //    ended first).  The runtime-calibrated threshold (0.6 here) is a
+    //    report-only reference — the split uses VERIFIER_ACCEPTANCE_FLOOR
+    //    (mahbot-1023).
     assert_eq!(
         classify_miss(&verdict_test_pv(
-            false, 10, 5, true, None, 2.5, true, 0.7, true, 0.6
+            false, 10, 5, true, None, 2.5, true, 0.9, true, 0.6
         )),
         V::VerifierTiming,
     );
-    // 10. Verifier peak below threshold → verifier_rejected.
+    // 10. Verifier peak below the acceptance floor → verifier_rejected
+    //     (0.3 < 0.86, even though it exceeds the runtime threshold 0.6).
     assert_eq!(
         classify_miss(&verdict_test_pv(
             false, 10, 5, true, None, 2.5, true, 0.3, true, 0.6
         )),
         V::VerifierRejected,
     );
+    // 11. REGRESSION (mahbot-1024): the cold-pass speed_down miss must NOT
+    //     be mislabeled as warmup_suppression.  The first trigger was frame
+    //     3 — the exact warm-up boundary (VERIFIER_WARMUP_EMBEDDINGS = 4,
+    //     warmup_n_embeddings = 0 → warm-up frames 0..2) — and the verifier
+    //     genuinely rejected the candidate (peak 0.7886 < 0.86 floor) →
+    //     verifier_rejected.  This pins the observed run 20260801-061348
+    //     mislabeling.
+    {
+        let mut pv = verdict_test_pv(false, 10, 5, false, None, 2.5, true, 0.7886, true, 0.6);
+        pv.warmup_n_embeddings = 0;
+        pv.first_trigger_frame_idx = Some(3);
+        assert_eq!(classify_miss(&pv), V::VerifierRejected);
+    }
+    // 12. Post-warm-up trigger with the verifier peak ABOVE the floor but no
+    //     detection → verifier_timing (candidate lifecycle / audio ended),
+    //     NOT warm-up suppression.
+    {
+        let mut pv = verdict_test_pv(false, 10, 5, false, None, 2.5, true, 0.9, true, 0.6);
+        pv.warmup_n_embeddings = 0;
+        pv.first_trigger_frame_idx = Some(4);
+        assert_eq!(classify_miss(&pv), V::VerifierTiming);
+    }
 }
 
 /// `verifier_recall` must count only variants the verifier actually evaluated
@@ -7941,6 +8893,51 @@ fn verifier_recall_counts_evaluated_accepts_only() {
     assert_eq!(verifier_recall(&[rejected]), Some((0, 1)));
     // Nothing evaluated → None.
     assert_eq!(verifier_recall(&[blocked, untrained, warmup]), None);
+}
+
+/// The enrolled-phase mechanism taxonomy (mahbot-1024 re-scope): a
+/// main-loop ("other") detection of a burst-created candidate is the
+/// PRIMARY mechanism ("burst_continuation"), NOT a regression; only a
+/// main-loop detection whose candidate the main loop created itself is
+/// "unexpected".  "burst" / "segment_end_pass" pass through unchanged.
+#[test]
+fn reclassify_detection_path_taxonomy() {
+    // Burst sweep confirmed directly.
+    assert_eq!(
+        reclassify_detection_path(Some("burst"), Some("burst")),
+        Some("burst".to_string()),
+    );
+    // Segment-end pass confirmed (candidate created by burst or main loop —
+    // the boundary pass owns the attribution).
+    assert_eq!(
+        reclassify_detection_path(Some("segment_end_pass"), Some("burst")),
+        Some("segment_end_pass".to_string()),
+    );
+    assert_eq!(
+        reclassify_detection_path(Some("segment_end_pass"), Some("other")),
+        Some("segment_end_pass".to_string()),
+    );
+    // PRIMARY mechanism: burst-created candidate confirmed by main-loop
+    // continuation (the 12/14 archived final-code detections).
+    assert_eq!(
+        reclassify_detection_path(Some("other"), Some("burst")),
+        Some("burst_continuation".to_string()),
+    );
+    // Genuine unexpected path: main loop created AND confirmed its own
+    // candidate (no burst-created candidate to continue).
+    assert_eq!(
+        reclassify_detection_path(Some("other"), Some("other")),
+        Some("unexpected".to_string()),
+    );
+    // Candidate origin unknown (no candidate tracking evidence) — treated as
+    // unexpected rather than silently accepted.
+    assert_eq!(
+        reclassify_detection_path(Some("other"), None),
+        Some("unexpected".to_string()),
+    );
+    // Not detected → None.
+    assert_eq!(reclassify_detection_path(None, None), None);
+    assert_eq!(reclassify_detection_path(None, Some("burst")), None);
 }
 
 /// `agc_converged == None` (insufficient AGC-active frames) must NOT be
@@ -8057,7 +9054,7 @@ fn localization_bucket_b_window0_mismatch_is_embeddings_differ() {
 }
 
 /// (b): majority mismatch with a later first-mismatch is still embeddings
-/// differ (grid drift / padded fallback divergence starts at window k).
+/// differ (grid drift / padded-window geometry divergence starts at window k).
 #[test]
 fn localization_bucket_b_late_majority_mismatch_is_embeddings_differ() {
     let pv = verdict_test_pv(false, 10, 4, true, None, 2.5, true, 0.6, true, 0.6);
@@ -8435,14 +9432,14 @@ fn bsweep_verdict_passes_4of5_and_unmeasurable_fallback() {
 
 #[test]
 fn bsweep_cross_check_scopes_pass_to_full_length_windows() {
-    // F1 trajectory (mirrors the prior-run shape): growing short-buffer
-    // windows (padded_fallback, 1-17 rf) + a full-length misaligned window at
-    // start 3 (true_sliding, 76 rf) + post-trim re-score windows over the
+    // F1 trajectory (mirrors the post-deferral shape): burst/pass padded
+    // windows (padded_fallback, 44-68 rf) + a full-length misaligned window
+    // at start 3 (true_sliding, 76 rf) + post-trim re-score windows over the
     // trimmed buffer (padded_fallback, 68/60/52 rf).
     let mut cmp = test_comparison(4, 0);
     cmp.label = "F1.json_enroll0".to_string();
     cmp.streaming.window_start = vec![0, 8, 3, 0];
-    cmp.streaming.real_frames = vec![10, 2, 76, 68];
+    cmp.streaming.real_frames = vec![68, 60, 76, 68];
     cmp.streaming.geometry = vec![
         "padded_fallback",
         "padded_fallback",
@@ -8469,7 +9466,7 @@ fn bsweep_cross_check_scopes_pass_to_full_length_windows() {
     let w_padded = &json["windows"][0];
     assert_eq!(
         w_padded["comparable"], false,
-        "short-buffer window is informational"
+        "burst/pass padded window is informational"
     );
     assert!(w_padded["note"].is_string());
 

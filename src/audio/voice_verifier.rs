@@ -89,6 +89,35 @@ use crate::{EMBEDDING_DIM, VERIFIER_INPUT_DIM, VERIFIER_WINDOW_SIZE};
 /// 0.4 (mahbot-853), 0.6 (mahbot-829), 0.5 (mahbot-797), 0.3 (mahbot-788).
 pub(crate) const DEFAULT_VERIFIER_THRESHOLD: f32 = 0.948;
 
+/// **Constant** verifier acceptance floor for the wake-word detection
+/// confirmation gate (mahbot-1023).
+///
+/// The user-approved production semantics are: *"the verifier accepts the
+/// enrolled voiceprint at 0.86"*.  Every detection confirmation gate
+/// (`score_single_embedding` candidate confirmation, the no-candidate
+/// fallback gate, `is_collapsed`) uses this **constant** — NOT the
+/// entropy-seeded runtime-calibrated `VoiceVerifier::threshold` (which
+/// drifted 0.86 → 0.91 across two identical-code runs) and NOT the
+/// [`DEFAULT_VERIFIER_THRESHOLD`] fallback (0.948).  The runtime-calibrated
+/// value and the fallback remain report-only references so threshold drift is
+/// observable without affecting product behavior.
+///
+/// FP-safety is measured: the highest negative verifier peak on the
+/// approved 59-negative corpus is 0.7587 (`day mahbot_s2`, the mahbot-1022
+/// pre-deferral baseline); across the three final-code runs the worst
+/// per-frame negative peak is 0.6833 (run 20260801-061348, margin 0.177
+/// below the floor — the other two final runs peaked at 0.0495/0.0703),
+/// and 0 false accepts in every archived run (0/177 total).  The binding
+/// positive variant is speed_down (verifier peaks 0.9912 / 0.7886 / 0.9833
+/// across the three final-code runs — the 0.7886 reading is the single
+/// speed_down miss, a genuine rejection below the floor that the ≥3-run
+/// mean-based acceptance absorbs).  The floor stays at 0.86; any future
+/// re-derivation must stay above a freshly-measured negative peak and is
+/// out of scope for this ticket (mahbot-1024 re-scope: the strict
+/// ring-4 formula is report-only diagnostics; acceptance is mean TP ≥ 4/5
+/// across ≥ 3 fresh runs).
+pub(crate) const VERIFIER_ACCEPTANCE_FLOOR: f32 = 0.86;
+
 /// Fraction of sequences held out for validation (80/20 train/val split).
 ///
 /// Split is per-sequence (avoiding data leakage from overlapping windows) with
@@ -474,9 +503,15 @@ impl VoiceVerifier {
     /// pseudo-random L2-normalized inputs and flag the verifier when:
     ///
     /// - the output range is `< 1e-4` (input-independent), AND
-    /// - the maximum output is below `self.threshold` (constant reject).
+    /// - the maximum output is below [`VERIFIER_ACCEPTANCE_FLOOR`] (constant
+    ///   reject).
     ///
-    /// A constant-*accept* verifier (output ≥ threshold everywhere) is
+    /// The comparison uses the constant 0.86 acceptance floor (mahbot-1023),
+    /// NOT the runtime-calibrated `self.threshold`: a healthy verifier scoring
+    /// in [0.86, 0.91) confirms detections (constant gate) and must therefore
+    /// NOT be flagged collapsed by a higher runtime-calibrated threshold.
+    ///
+    /// A constant-*accept* verifier (output ≥ floor everywhere) is
     /// functionally a no-op and is deliberately NOT flagged.  The probes are
     /// deterministic (fixed seed) so the verdict is stable across restarts.
     ///
@@ -506,11 +541,11 @@ impl VoiceVerifier {
         }
         let range = max - min;
         let mean = sum / N_PROBES as f32;
-        if range < 1e-4 && max < self.threshold {
+        if range < 1e-4 && max < VERIFIER_ACCEPTANCE_FLOOR {
             info!(
                 "VoiceVerifier collapsed: input-independent output (range={range:.2e}, \
-                 mean={mean:.2e}, max={max:.2e}) below threshold={:.4} — constant reject-all",
-                self.threshold,
+                 mean={mean:.2e}, max={max:.2e}) below acceptance floor={VERIFIER_ACCEPTANCE_FLOOR:.4} \
+                 — constant reject-all",
             );
             true
         } else {

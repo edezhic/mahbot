@@ -33,7 +33,9 @@ use crate::ChatDirection;
 use crate::audio::embedding_sequence::{
     AugmentationFamily, EmbeddingSequence, Source, UtteranceId,
 };
-use crate::audio::voice_verifier::{VERIFIER_WARMUP_EMBEDDINGS, VoiceVerifier};
+use crate::audio::voice_verifier::{
+    VERIFIER_ACCEPTANCE_FLOOR, VERIFIER_WARMUP_EMBEDDINGS, VoiceVerifier,
+};
 use crate::audio::wake_word_classifier::{self, ClassifierWeights, WakeWordClassifier};
 use crate::config::CONFIG;
 use crate::turso;
@@ -112,6 +114,37 @@ const VOICE_BATCH_OVERLAP: usize = MEL_STRIDE * 2;
 /// Embedding window: 76 consecutive mel frames (~760ms with the ONNX mel
 /// model's 10ms internal stride, not 16ms — see HOP_LENGTH note above).
 const EMBEDDING_WINDOW_FRAMES: usize = 76;
+
+/// Deferred burst trigger (mahbot-1023): the stride-8 scorer HOLDS position 0
+/// until the accumulated mel-frame buffer reaches this many frames, then
+/// sweeps the start-aligned positions 0/8/16/24 in one synchronous burst with
+/// the trained start-0-aligned padded geometry.
+///
+/// Measured basis (mahbot-1022 B-sweep): the decisive (B=68, position 24)
+/// cell confirms at classifier 0.9981 / ring-4 verifier 0.9393 (44 real
+/// frames).  B≤60 is verifier-doomed (≤0.5401), B=65 has zero margin, and
+/// scoring position 0 below 68 frames resets the rolling window before
+/// positions 8/16/24 can fire.
+///
+/// Confirmation-slack note (measured, mahbot-1023 runs 5–7): the ticket's
+/// original design constraint assumed the sweep must confirm before a later
+/// call's gap recovery re-anchors to a MISALIGNED leading edge whose
+/// static-gate score was 0.2651 < 0.316.  Live mel-flush granularity lands
+/// the trigger at B=76, and the B=79 → start-3 re-score scores ~0.99 at the
+/// live VAD/AGC geometry — the hazard does not manifest, and that same
+/// re-anchored continuation is what updates the burst-created candidate to
+/// confirmation mid-utterance.  The segment-end pass remains the overrun
+/// safety net if a below-reset re-score ever does clear the rolling window.
+const BURST_TRIGGER_FRAMES: usize = 68;
+
+/// Stride of the deferred burst / segment-end pass position grid
+/// (start-aligned positions 0, 8, 16, 24 — mahbot-1023).
+const BURST_STRIDE: usize = 8;
+
+/// Maximum number of positions in the burst sweep / segment-end pass
+/// (4 positions × stride 8 — the ring reaches exactly 4 embeddings at
+/// position 24, where the verifier ring-4 sample gates confirmation).
+const BURST_MAX_POSITIONS: usize = 4;
 
 /// Maximum command recording duration (30 seconds).
 const MAX_RECORD_SECS: usize = 30;
@@ -1659,12 +1692,21 @@ pub(crate) fn score_single_embedding(
     // statistics, preventing the self-defeating loop where high scores
     // inflate the threshold and block detection.
     //
-    // IMPORTANT: During bootstrap we always call feed() regardless of the
-    // score, because we must accumulate enough frames before the adaptive
-    // threshold is meaningful.  The peek()-vs-feed split only activates
-    // after bootstrap (mahbot-852).
+    // mahbot-1023 (bootstrap feed fix): the SAME feed/peek rule applies
+    // during bootstrap — the old unconditional bootstrap feed
+    // (`is_bootstrapping() || total_score < NO_MATCH_RESET_THRESHOLD`)
+    // inflated the adaptive threshold with wake-word-like burst scores
+    // (~0.99) to ~3.0–4.5, blocking candidate survival and verifier
+    // re-sampling after the deferred burst.  With the score-only rule, a
+    // high-scoring utterance legitimately keeps the bootstrap alive for its
+    // whole duration: high scores peek (peek() returns None during
+    // bootstrap → the static match_threshold stays in effect), and only
+    // below-reset background frames feed and advance the bootstrap counter.
+    // Residual contamination cannot persist across the soft reset
+    // (detection→recording handoff) because no wake-word-like score ever
+    // enters the statistics.
     let adaptive_override = adaptive_state.as_mut().and_then(|state| {
-        if state.is_bootstrapping() || total_score < NO_MATCH_RESET_THRESHOLD {
+        if total_score < NO_MATCH_RESET_THRESHOLD {
             state.feed(total_score, adaptive_k)
         } else {
             state.peek(adaptive_k)
@@ -1812,9 +1854,14 @@ pub(crate) fn score_single_embedding(
                 // c: &mut ClassifierCandidate
                 let expired = c.update(max_verifier_score);
 
+                // Confirmation gate (mahbot-1023): the verifier accepts the
+                // enrolled voiceprint at the CONSTANT
+                // VERIFIER_ACCEPTANCE_FLOOR (0.86) — the user-approved
+                // production semantics — not the entropy-seeded
+                // runtime-calibrated `v.threshold` (report-only reference).
                 if let Some(v) = verifier
                     && v.is_trained()
-                    && c.peak_verifier_score >= v.threshold
+                    && c.peak_verifier_score >= VERIFIER_ACCEPTANCE_FLOOR
                 {
                     // Candidate confirmed — detection fires!
                     return (
@@ -1835,7 +1882,8 @@ pub(crate) fn score_single_embedding(
                         if let Some(v) = verifier {
                             info!(
                                 "VOICE_DEBUG: verifier blocked (candidate expired) — \
-                                 peak={:.4} threshold={:.4} rolling_sum={rolling_sum:.4}",
+                                 peak={:.4} acceptance_floor={VERIFIER_ACCEPTANCE_FLOOR:.4} \
+                                 runtime_threshold={:.4} rolling_sum={rolling_sum:.4}",
                                 c.peak_verifier_score, v.threshold,
                             );
                         }
@@ -1867,10 +1915,11 @@ pub(crate) fn score_single_embedding(
             **opt = Some(ClassifierCandidate::new(max_verifier_score));
             candidate_was_created = true;
 
-            // Check threshold immediately on creation
+            // Check threshold immediately on creation (constant floor,
+            // mahbot-1023 — see the candidate-update gate above).
             if let Some(v) = verifier
                 && v.is_trained()
-                && max_verifier_score >= v.threshold
+                && max_verifier_score >= VERIFIER_ACCEPTANCE_FLOOR
             {
                 return (
                     true,
@@ -1894,10 +1943,10 @@ pub(crate) fn score_single_embedding(
 
         // No candidate tracking requested (e.g., enrollment self-test
         // with no active verifier).  Fall back to raw verifier check
-        // on the current frame's score.
+        // on the current frame's score (constant floor, mahbot-1023).
         if let Some(v) = verifier
             && v.is_trained()
-            && max_verifier_score < v.threshold
+            && max_verifier_score < VERIFIER_ACCEPTANCE_FLOOR
         {
             return (
                 false,
@@ -4656,10 +4705,17 @@ impl AdaptiveThresholdState {
     }
 
     /// Returns `true` while the tracker is still in the bootstrap phase
-    /// (first [`ADAPTIVE_BOOTSTRAP_FRAMES`] frames).  During bootstrap the
-    /// caller should always call [`feed`](Self::feed) to populate the window;
-    /// after bootstrap the caller may use [`peek`](Self::peek) for scores
-    /// that should not update the statistics (mahbot-852).
+    /// (first [`ADAPTIVE_BOOTSTRAP_FRAMES`] below-reset frames since the
+    /// score-only feed rule, mahbot-1023).  During bootstrap the caller
+    /// feeds below-reset background scores (which populate the window and
+    /// advance the bootstrap counter) and peeks wake-word-like scores —
+    /// [`peek`](Self::peek) returns `None` during bootstrap, so the static
+    /// [`match_threshold()`] stays in effect (mahbot-852 / mahbot-1023).
+    ///
+    /// Production callers no longer consult this method (the feed/peek rule
+    /// is score-only since mahbot-1023); it exists for unit tests and the
+    /// voice-tests instrumentation mirror.
+    #[cfg(any(test, feature = "voice-tests"))]
     pub(crate) fn is_bootstrapping(&self) -> bool {
         self.bootstrap_count < ADAPTIVE_BOOTSTRAP_FRAMES
     }
@@ -4744,6 +4800,97 @@ impl WindowGeometry {
     }
 }
 
+/// Scoring path that produced a scored window / detection (mahbot-1023).
+///
+/// Carried through [`score_stride8_window`] so the enrolled-speaker benchmark
+/// can attribute every detection to exactly one path:
+///
+/// - [`DeferredBurst`](WindowSource::DeferredBurst) — the start-aligned
+///   deferred burst sweep (buffer ≥ [`BURST_TRIGGER_FRAMES`]).
+/// - [`SegmentEndPass`](WindowSource::SegmentEndPass) — the segment-boundary
+///   fallback pass.
+/// - [`MainStride`](WindowSource::MainStride) — the main stride-8 loop.
+///   In the enrolled phase this is the PRIMARY expected path when it
+///   confirms a burst-created candidate mid-utterance (the report
+///   reclassifies it to "burst_continuation"); it is a genuine
+///   unexpected-path signal only when the main loop created its own
+///   candidate (no burst-created candidate to continue).
+///
+/// Not feature-gated: the enum appears in the production
+/// [`score_stride8_window`] signature.  Its per-frame recording in
+/// [`DetectionInstrumentation`] is voice-tests-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowSource {
+    /// Main stride-8 sliding-window loop.
+    MainStride,
+    /// Deferred burst sweep (start-aligned positions 0/8/16/24, padded
+    /// geometry).
+    DeferredBurst,
+    /// Segment-end boundary pass (start-aligned positions, padded geometry).
+    SegmentEndPass,
+}
+
+impl WindowSource {
+    /// Stable snake_case label for report output (mahbot-1023).
+    ///
+    /// The labels follow the acceptance taxonomy (mahbot-1024 re-scope):
+    /// "burst" and "segment_end_pass" are the two dedicated scoring paths.
+    /// "other" (the main stride-8 loop — a core production path) is the
+    /// PRIMARY expected detection path when it confirms a burst-created
+    /// candidate mid-utterance (the enrolled-phase report reclassifies it
+    /// to "burst_continuation" via the instrumentation's
+    /// `candidate_created_path`); it is a genuine unexpected-path signal
+    /// ONLY when the main loop created AND confirmed its own candidate
+    /// (no burst-created candidate to continue).
+    #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::MainStride => "other",
+            Self::DeferredBurst => "burst",
+            Self::SegmentEndPass => "segment_end_pass",
+        }
+    }
+}
+
+// Pure decision helpers for the deferred-burst state machine (mahbot-1023).
+//
+// Extracted so the hold / burst / segment-end-pass / per-segment-flag
+// lifecycle is unit-testable WITHOUT ONNX models (`ONNX_MODELS` is `None`
+// in unit tests).  The production call sites in [`handle_wake_word_detection`]
+// and [`PipelineCtx::handle_segment_boundary`] use exactly these helpers, so
+// the tests exercise the real control flow.
+
+/// Start-aligned positions to score in the deferred burst sweep.
+///
+/// Returns an empty list while holding (buffer below
+/// [`BURST_TRIGGER_FRAMES`], or the per-segment sweep already ran) — the
+/// incremental per-chunk scoring bug (mahbot-1023) is exactly the old code
+/// scoring position 0 with 2–16 frames per chunk.  When triggered, returns
+/// the start-aligned positions 0/8/16/24 (each strictly below `buffer_len`;
+/// a position at or past the buffer end is never scored — positions beyond
+/// the buffer end must never be re-scored on later calls).
+pub(crate) fn burst_positions_to_score(buffer_len: usize, burst_sweep_done: bool) -> Vec<usize> {
+    if burst_sweep_done || buffer_len < BURST_TRIGGER_FRAMES {
+        return Vec::new();
+    }
+    start_aligned_positions(buffer_len)
+}
+
+/// The start-aligned position grid 0/8/16/24, each strictly below
+/// `buffer_len` (mahbot-1023).
+///
+/// Shared by the deferred burst sweep and the segment-end pass — both score
+/// the same trained start-0-aligned geometry.  Positions at or past the
+/// buffer end are never scored: a position beyond the buffer end must never
+/// be re-scored on later calls (a re-scored ≤17-real-frame window ~0.01
+/// mid-utterance resets the rolling window and expires an active candidate).
+pub(crate) fn start_aligned_positions(buffer_len: usize) -> Vec<usize> {
+    (0..BURST_MAX_POSITIONS * BURST_STRIDE)
+        .step_by(BURST_STRIDE)
+        .take_while(|&p| p < buffer_len)
+        .collect()
+}
+
 /// Classify the geometry of one scored window (mahbot-1012 §1).
 ///
 /// Pure function so the classification is unit-testable without pipeline
@@ -4762,8 +4909,12 @@ impl WindowGeometry {
 ///    post-boundary windows (whose ring was cleared) never classify WarmMixed.
 ///    `test_start_ring_len == 0` (cold pass) means no warm-up embeddings
 ///    exist at all.
-/// 3. **PaddedFallback** — the window came from the short-buffer padded
-///    fallback (real frames + synthetic fade-out tail).
+/// 3. **PaddedFallback** — the window came from a padded geometry: the
+///    deferred burst sweep or the segment-end pass score start-aligned
+///    positions with synthetic fade-out padding when the buffer is shorter
+///    than [`EMBEDDING_WINDOW_FRAMES`] (the old incremental per-chunk
+///    short-buffer fallback was removed in mahbot-1023; the padding class
+///    name is kept for report stability).
 /// 4. **TrueSliding** — a genuine stride-8 sliding window.
 ///
 /// # Ring-capacity correctness (mahbot-1012 reviewer)
@@ -4800,15 +4951,24 @@ pub(crate) fn classify_window_geometry(
 }
 
 /// Per-frame adaptive-threshold mode (mahbot-1012 §1).  Mirrors the
-/// feed/peek/bootstrap decision inside [`score_single_embedding`]: during
-/// bootstrap the state always `feed`s (static threshold in effect); after
-/// bootstrap, scores below `NO_MATCH_RESET_THRESHOLD` `feed` the background
-/// statistics while wake-word-like scores only `peek` (mahbot-852).
+/// feed/peek/bootstrap decision inside [`score_single_embedding`]: the
+/// feed/peek rule is score-based ONLY (scores below `NO_MATCH_RESET_THRESHOLD`
+/// `feed` the background statistics; wake-word-like scores only `peek`),
+/// including during bootstrap (mahbot-1023).  The label is STATE-based for
+/// bootstrap frames (`Bootstrap` while the state has not completed its
+/// bootstrap window, regardless of the feed/peek action taken this frame —
+/// a high-scoring bootstrap frame peeks and still labels `Bootstrap`) and
+/// ACTION-based after bootstrap (`Feed` / `Peek`).  This keeps the labels
+/// accurate in lockstep with the feed rule: a prolonged bootstrap (persisting
+/// across a full high-scoring utterance) labels every frame `Bootstrap`, and
+/// the static [`match_threshold()`] stays in effect throughout (peek returns
+/// `None` during bootstrap).
 #[cfg(feature = "voice-tests")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdaptiveFrameMode {
-    /// Adaptive state still in its bootstrap window — `feed()` called, static
-    /// threshold in effect (`None` returned).
+    /// Adaptive state still in its bootstrap window — the frame either fed
+    /// (below-reset background score) or peeked (wake-word-like score, which
+    /// returns `None` → static [`match_threshold()`] in effect).
     Bootstrap,
     /// Post-bootstrap `feed()` — the frame updated the background statistics.
     Feed,
@@ -5040,6 +5200,41 @@ pub(crate) struct DetectionInstrumentation {
     /// 256-sample half to the VAD).  Correlates with mel-frame positions via
     /// the ~1.6-hop-per-mel-frame ratio (mel stride 160 samples at 16 kHz).
     pub per_hop_vad: Vec<bool>,
+
+    // ── mahbot-1023 deferred-burst instrumentation ────────────────────────
+    /// Whether the deferred burst sweep ran in this segment.  Cleared with
+    /// [`PipelineCtx`] per-segment state (segment resets), NOT per call.
+    pub burst_sweep_fired: bool,
+    /// Mel-frame buffer length at burst-sweep time (None when the burst never
+    /// ran).  The live trigger lands at the first flush-aligned B ≥ 68
+    /// (typically 68–80), reported per variant so the acceptance review can
+    /// see the actual live geometry (manager pin 2).
+    pub burst_sweep_buffer_len: Option<usize>,
+    /// Wall-clock time of the synchronous burst sweep in ms (the one-shot
+    /// ~44–135 ms worst-case stall; measured through the live pipeline with
+    /// AGC/VAD/block_in_place overhead).
+    pub burst_wall_clock_ms: Option<f64>,
+    /// Whether the segment-end pass ran at a boundary in this detection
+    /// session.
+    pub segment_end_pass_fired: bool,
+    /// Scoring path that produced the detection (raw source: "burst" /
+    /// "segment_end_pass" / "other").  None until a detection fires.
+    /// "other" is the PRIMARY expected path when it confirms a
+    /// burst-created candidate (reclassified to "burst_continuation" at
+    /// report time via [`candidate_created_path`](Self::candidate_created_path));
+    /// it is a genuine unexpected-path signal only when the main loop
+    /// created its own candidate.
+    pub detection_path: Option<&'static str>,
+    /// Scoring path that created the CURRENTLY-active classifier candidate
+    /// ("burst" / "segment_end_pass" / "other").  Updated on every
+    /// candidate creation so it always reflects the ACTIVE candidate's
+    /// origin; cleared when the candidate is cleared (expiry or
+    /// below-reset reset).  `None` when no candidate is active.  This is
+    /// the evidence the enrolled-phase report uses to reclassify a
+    /// main-loop detection of a burst-created candidate as the PRIMARY
+    /// mechanism ("burst_continuation", mahbot-1024) instead of a
+    /// regression signal.
+    pub candidate_created_path: Option<&'static str>,
 }
 
 #[cfg(feature = "voice-tests")]
@@ -5071,6 +5266,12 @@ impl DetectionInstrumentation {
             per_frame_candidate_state: Vec::new(),
             test_start_ring_len: 0,
             per_hop_vad: Vec::new(),
+            burst_sweep_fired: false,
+            burst_sweep_buffer_len: None,
+            burst_wall_clock_ms: None,
+            segment_end_pass_fired: false,
+            detection_path: None,
+            candidate_created_path: None,
         }
     }
 }
@@ -5260,6 +5461,23 @@ pub(crate) struct PipelineCtx {
     /// utterance starts from the first mel frame.
     next_window_start: usize,
 
+    /// Per-segment deferred-burst latch (mahbot-1023).
+    ///
+    /// `true` once the start-aligned burst sweep (positions 0/8/16/24) has
+    /// run for the current detection segment.  Cleared ONLY by the per-segment
+    /// resets ([`reset_detection_segment`] and [`reset_pipeline_state`] all
+    /// levels) — never on individual scoring calls.  While `true`:
+    ///
+    /// - the burst sweep cannot re-run (positions beyond the buffer end at
+    ///   burst time must never be re-scored on later calls);
+    /// - the short-buffer padded fallback is suppressed (a re-scored
+    ///   ≤17-real-frame window ~0.01 mid-utterance would reset the rolling
+    ///   window and expire an active candidate).
+    ///
+    /// It does NOT gate the segment-end pass (a failed burst must not
+    /// suppress the boundary fallback).
+    burst_sweep_done: bool,
+
     /// Instrumentation accumulators for wake word detection benchmarking
     /// (mahbot-886).  Feature-gated behind `voice-tests` — zero production
     /// overhead.  Populated by `handle_wake_word_detection` and
@@ -5361,6 +5579,7 @@ impl PipelineCtx {
             candidate: None,
             segment_silence_hops: 0,
             next_window_start: 0,
+            burst_sweep_done: false,
             #[cfg(feature = "voice-tests")]
             instrumentation: DetectionInstrumentation::new(),
         }
@@ -5394,6 +5613,10 @@ impl PipelineCtx {
         self.pre_agc_ring.clear();
         self.negative_audio_buf.clear();
         self.segment_silence_hops = 0;
+        // Per-segment deferred-burst latch: every reset level starts a fresh
+        // segment, so a new utterance must be allowed a new burst sweep
+        // (mahbot-1023).
+        self.burst_sweep_done = false;
 
         // ── Enrollment detection/accumulator state (cleared by all levels) ──
         self.utterance_had_speech = false;
@@ -5546,6 +5769,13 @@ impl PipelineCtx {
         // starts from the first mel frame (mahbot-923).
         self.next_window_start = 0;
 
+        // ── Clear the per-segment deferred-burst latch (mahbot-1023) ──
+        // The segment reset is the ONLY place that clears it (besides
+        // reset_pipeline_state, which also starts a fresh segment): a new
+        // utterance must be allowed a new burst sweep, and mid-utterance
+        // trailing re-scoring must never re-run a finished sweep.
+        self.burst_sweep_done = false;
+
         // ── Reset AGC state (mahbot-1001 Fix 5, mahbot-1009) ──
         // Reset the AudioPreprocessor so that each detection segment starts with
         // a fresh AGC state, matching the training distribution (confusable/
@@ -5592,9 +5822,71 @@ impl PipelineCtx {
         mel_frame_buffer: &mut Vec<Vec<f32>>,
     ) {
         if hop_count >= SEGMENT_TIMEOUT_HOPS {
-            self.reset_detection_segment();
-            voice_batch.clear();
-            mel_frame_buffer.clear();
+            // ── Segment-end pass (mahbot-1023) — no-regression fallback ──
+            // If no detection fired this segment (not recording), models are
+            // loaded, and the buffer has content, score the buffer as it
+            // stands at the boundary — trailing-68-frame trimmed state for
+            // longer utterances (replicating today's accidental flush at
+            // starts 0/8/16 with 68/60/52 real frames), full accumulated
+            // buffer for shorter ones — at start-aligned positions with
+            // padded geometry.  This pass can CONFIRM exactly like the cold
+            // burst (the ring-4 verifier sample ≥ VERIFIER_ACCEPTANCE_FLOOR
+            // fires at position 24), so it is the overrun safety net for the
+            // deferred burst.  (The ticket's original "must confirm before
+            // the misaligned re-score" hazard does not manifest at live
+            // geometry: the trigger lands at B=76 and the B=79 → start-3
+            // re-score scores ~0.99 — mahbot-1023 runs 5–7 — but the pass
+            // stays the safety net if a below-reset re-score ever does clear
+            // the rolling window.)  It is
+            // UNCONDITIONAL at the boundary for non-recording segments with
+            // content — a failed burst must NOT suppress it (F1's only
+            // current detection path is exactly this trailing re-score), and
+            // the per-segment burst_sweep_done latch does not gate it.
+            // Score-then-reset ordering is preserved: the pass runs BEFORE
+            // reset_detection_segment.
+            //
+            // Gates: not recording; models loaded; buffer non-empty; no
+            // detection fired this segment (the caller only reaches this
+            // method with `!is_recording`, and a just-fired detection is
+            // re-checked below so it is not reset).  The burst_sweep_done
+            // latch is deliberately NOT consulted — a failed burst must not
+            // suppress the boundary fallback (enforced structurally: the
+            // position set takes no latch input).
+            if !self.is_recording
+                && let Some(models) = ONNX_MODELS.get()
+                && !mel_frame_buffer.is_empty()
+            {
+                #[cfg(feature = "voice-tests")]
+                {
+                    self.instrumentation.segment_end_pass_fired = true;
+                }
+                // Score from start-aligned position 0 with padded geometry —
+                // NOT from a stale window start.  The shared
+                // `start_aligned_positions` grid covers the burst-equivalent
+                // positions, so the ring-4 verifier sample at position 24 can
+                // confirm exactly like the cold burst (manager pin 3).  The
+                // pass gate does NOT consult the `burst_sweep_done` latch (a
+                // failed burst must not suppress the boundary fallback) —
+                // the latch is structurally absent from the position grid
+                // (it takes no latch input).
+                let positions = start_aligned_positions(mel_frame_buffer.len());
+                score_start_aligned_positions(
+                    mel_frame_buffer,
+                    models,
+                    self,
+                    &positions,
+                    WindowSource::SegmentEndPass,
+                );
+            }
+
+            // Re-check the not-recording condition after the pass: a
+            // just-fired detection must NOT be reset (the detection→recording
+            // handoff in handle_wake_word_detection completes the transition).
+            if !self.is_recording {
+                self.reset_detection_segment();
+                voice_batch.clear();
+                mel_frame_buffer.clear();
+            }
         } else {
             self.segment_silence_hops = hop_count;
         }
@@ -7557,6 +7849,59 @@ fn flush_voice_batch(voice_batch: &mut Vec<f32>, mel_frame_buffer: &mut Vec<Vec<
     }
 }
 
+/// Score a batch of start-aligned positions with padded geometry
+/// (mahbot-1023).
+///
+/// Shared by the deferred burst sweep and the segment-end pass — both score
+/// the same start-aligned grid (0/8/16/24 below the buffer end) with the
+/// trained start-0-aligned padded geometry and stop at the first detection.
+/// A detection propagates to the caller through the `ctx.is_recording`
+/// handoff set inside [`score_stride8_window`] — the sweep stops at the
+/// first detection, leaving `next_window_start` at the detecting position.
+///
+/// Re-anchors `next_window_start` to position 0 first so the trained
+/// geometry is never perturbed by a stale window start.  (The ticket's
+/// original "a misaligned mid-pass position scores ~0.2651 and resets the
+/// rolling window" hazard was measured NOT to manifest at live geometry —
+/// mahbot-1023 runs 5–7: the B=79 → start-3 continuation scores ~0.99 and
+/// is the enabling mechanism for mid-utterance confirmation; the rolling
+/// reset stays guarded by the per-segment burst latch and the boundary
+/// pass.)
+///
+/// On a miss, `next_window_start` ends at the position after the last
+/// scored grid point so the main stride-8 loop can continue from there.
+fn score_start_aligned_positions(
+    mel_frame_buffer: &[Vec<f32>],
+    models: &OnnxModels,
+    ctx: &mut PipelineCtx,
+    positions: &[usize],
+    source: WindowSource,
+) {
+    ctx.next_window_start = 0;
+    for &pos in positions {
+        ctx.next_window_start = pos;
+        let end = mel_frame_buffer.len().min(pos + EMBEDDING_WINDOW_FRAMES);
+        let subslice = &mel_frame_buffer[pos..end];
+        let padded = pad_mel_frames_to_window(subslice);
+        let padded_flag = padded.len() > subslice.len();
+        score_stride8_window(
+            &padded,
+            models,
+            ctx,
+            padded_flag,
+            mel_frame_buffer.len(),
+            source,
+        );
+        if ctx.is_recording {
+            // Detection fired — stop the sweep (the caller's handoff handles
+            // the transition; `next_window_start` is left at the detecting
+            // position, matching the old `return true` semantics).
+            break;
+        }
+        ctx.next_window_start = pos + BURST_STRIDE;
+    }
+}
+
 /// Score a single mel frame window through the embedding + classifier pipeline
 /// (mahbot-923 stride-8 helper).
 ///
@@ -7577,15 +7922,19 @@ fn score_stride8_window(
     mel_window: &[Vec<f32>],
     models: &OnnxModels,
     ctx: &mut PipelineCtx,
-    // mahbot-1012: whether this window came from the short-buffer padded
-    // fallback (real frames + tapered fade-out tail) rather than the main
-    // stride-8 loop.  Only read under `voice-tests` (geometry reporting);
-    // the two call sites in [`handle_wake_word_detection`] always pass a
-    // value so production builds see a constant.
+    // mahbot-1012: whether this window was produced by padding a short real
+    // slice (tapered fade-out tail) rather than a full 76-frame window from
+    // the main stride-8 loop.  Only read under `voice-tests` (geometry
+    // reporting); all call sites pass a value so production builds see a
+    // constant.
     padded_window: bool,
     // mahbot-1012: mel frame buffer length at this scoring step.  Only read
     // under `voice-tests`; the value is a pure observation of pipeline state.
     mel_buffer_len: usize,
+    // mahbot-1023: scoring path that produced this window (deferred burst /
+    // segment-end pass / main stride-8 loop).  Read under `voice-tests` for
+    // the detection-path report; the value is a pure label.
+    source: WindowSource,
 ) -> bool {
     let embed_start = Instant::now();
     let embedding = match crate::util::with_block_in_place(|| compute_embedding(models, mel_window))
@@ -7704,6 +8053,29 @@ fn score_stride8_window(
         if detected {
             ctx.instrumentation.candidates_confirmed += 1;
         }
+        // mahbot-1023: record the scoring path that produced the detection
+        // (raw source: "burst" / "segment_end_pass" / "other").  mahbot-1024:
+        // "other" is NOT a blanket regression — the enrolled-phase report
+        // reclassifies a main-loop confirmation of a burst-created candidate
+        // to the PRIMARY mechanism ("burst_continuation") using
+        // candidate_created_path below.  Only a main-loop detection whose
+        // candidate was created by the main loop itself is genuinely
+        // unexpected.
+        if detected && ctx.instrumentation.detection_path.is_none() {
+            ctx.instrumentation.detection_path = Some(source.as_str());
+        }
+        // mahbot-1024: track the scoring path that created the ACTIVE
+        // candidate.  Updated on every candidate creation so it reflects the
+        // CURRENT candidate's origin; cleared when the candidate is cleared
+        // (expiry or below-reset reset).  `candidate_was_created` and the
+        // clear case are mutually exclusive within one call (creation
+        // requires no active candidate; clearing requires !detected), so the
+        // two branches never conflict.
+        if candidate_was_created {
+            ctx.instrumentation.candidate_created_path = Some(source.as_str());
+        } else if candidate_active_before && ctx.candidate.is_none() {
+            ctx.instrumentation.candidate_created_path = None;
+        }
         // A candidate cleared between frames without confirmation is either an
         // expiry (CANDIDATE_MAX_EMBEDDINGS exceeded) or a below-reset rejection.
         if candidate_active_before && ctx.candidate.is_none() && !detected {
@@ -7743,9 +8115,12 @@ fn score_stride8_window(
             padded_window,
         );
         // Mirror of the feed/peek decision inside score_single_embedding
-        // (voice.rs, adaptive_override): bootstrap always feeds; post-bootstrap,
-        // below-reset scores feed the background statistics and wake-word-like
-        // scores only peek.  `adaptive_bootstrapping_before` is captured
+        // (voice.rs, adaptive_override): the feed/peek rule is score-based
+        // ONLY (below-reset scores feed; wake-word-like scores peek) including
+        // during bootstrap (mahbot-1023).  The label is state-based for
+        // bootstrap frames (Bootstrap while bootstrapping, regardless of the
+        // feed/peek action) and action-based after bootstrap (Feed / Peek) —
+        // see AdaptiveFrameMode.  `adaptive_bootstrapping_before` is captured
         // pre-call so the last bootstrap frame is not mislabeled (feed()
         // advances the counter).  This is deliberately a mirror, not a shared
         // helper: score_single_embedding is production code and must not carry
@@ -7941,95 +8316,149 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     // with stride 8, extracting dense embeddings at each position and scoring
     // through the Conv1D classifier + verifier pipeline.  This replaces the old
     // streaming approach that extracted one embedding per batch flush.
-    let stride = 8usize;
+    //
+    // mahbot-1023 (deferred burst scoring): position 0 is HELD until the
+    // buffer reaches BURST_TRIGGER_FRAMES (68), then scored ONCE at the
+    // start-aligned positions 0/8/16/24 with the trained start-0-aligned
+    // padded geometry.  The old incremental per-chunk scoring scored position 0
+    // with 2–16 real frames (~0.027) and never re-scored it — a single scored
+    // window structurally cannot trigger the 3-consecutive-window gate.  The
+    // short-buffer padded fallback is superseded: mid-utterance re-scoring of
+    // ≤17-real-frame windows (~0.01) resets the rolling window and would kill
+    // an active candidate.  Short utterances (< 68 frames) are covered by the
+    // segment-end pass at the boundary.
     if !ctx.is_recording {
         // No-op flush prevention: skip if buffer hasn't advanced by at least
-        // stride 8 frames since the last extraction.
-        if mel_frame_buffer.len() >= ctx.next_window_start + stride
+        // BURST_STRIDE frames since the last extraction.
+        if mel_frame_buffer.len() >= ctx.next_window_start + BURST_STRIDE
             && ctx.next_window_start < mel_frame_buffer.len()
         {
             let Some(models) = ONNX_MODELS.get() else {
                 return;
             };
 
-            // ── Blinded gap recovery (mahbot-1002) ──
-            // After warm-up or any pipeline action that advances next_window_start
-            // past the leading edge of real audio, the main stride-8 loop may be
-            // unable to fire because next_window_start + EMBEDDING_WINDOW_FRAMES
-            // > buffer_len.  When the buffer has enough frames, reset
-            // next_window_start to the leading edge so extraction from the new
-            // utterance can proceed immediately, eliminating the ~68-frame blind
-            // spot that previously caused 0% detection on test utterances
-            // following warm-up.
-            if ctx.next_window_start + EMBEDDING_WINDOW_FRAMES > mel_frame_buffer.len()
-                && mel_frame_buffer.len() >= EMBEDDING_WINDOW_FRAMES
-            {
-                ctx.next_window_start = mel_frame_buffer.len() - EMBEDDING_WINDOW_FRAMES;
-            }
-
-            // Iterate from next_window_start with stride 8.
-            while ctx.next_window_start + EMBEDDING_WINDOW_FRAMES <= mel_frame_buffer.len() {
-                let window = &mel_frame_buffer
-                    [ctx.next_window_start..ctx.next_window_start + EMBEDDING_WINDOW_FRAMES];
-                if score_stride8_window(window, models, ctx, false, mel_frame_buffer.len()) {
-                    // Detection fired — loop will be restarted on next call
-                    // via fresh stride-8 iteration.  next_window_start is reset
-                    // by reset_pipeline_state(Soft).
-                    break;
+            // ── Deferred burst sweep (mahbot-1023) ──
+            // Fires once per segment on the first call where the buffer
+            // reaches BURST_TRIGGER_FRAMES (68).  Live mel-flush granularity
+            // lands the trigger at B=76 (not the measured B=68 grid cell) —
+            // reported per run as `burst_sweep_buffer_len`.  The sweep runs
+            // synchronously in this call with NO intermediate scoring and
+            // never interleaves with the next mel flush: the 1.024 s mic
+            // channel absorbs the one-shot ~44–135 ms stall (measured as
+            // `burst_wall_clock_ms` under voice-tests).
+            //
+            // Confirmation-slack note (measured, not assumed): the ticket's
+            // design constraint was that the sweep must confirm before gap
+            // recovery re-anchors to a MISALIGNED leading edge whose
+            // static-gate score was 0.2651 < NO_MATCH_RESET_THRESHOLD
+            // (rolling-window reset / candidate expiry).  Live measurement
+            // (runs 5–7) shows the B=79 → start-3 re-score scores ~0.99 at
+            // the live geometry — the hazard does not manifest, and that
+            // same re-anchored continuation is what updates the burst-created
+            // candidate to confirmation mid-utterance.  mahbot-1024: this
+            // burst-created-candidate → main-loop-continuation path is the
+            // PRIMARY expected detection mechanism (the enrolled report
+            // reclassifies the raw "other" source to "burst_continuation");
+            // the segment-end pass remains the overrun safety net if a
+            // below-reset re-score ever does clear the rolling window.
+            let mut burst_swept_this_call = false;
+            // The helper encodes the hold itself (empty position set while
+            // `burst_sweep_done` or below BURST_TRIGGER_FRAMES) — the call
+            // site tests the empty set instead of duplicating the guard.
+            let burst_positions =
+                burst_positions_to_score(mel_frame_buffer.len(), ctx.burst_sweep_done);
+            if !burst_positions.is_empty() {
+                #[cfg(feature = "voice-tests")]
+                let burst_start = Instant::now();
+                // Start-aligned positions only — the helper re-anchors
+                // defensively so the trained start-0-aligned geometry is
+                // never perturbed by a stale window start.
+                score_start_aligned_positions(
+                    &mel_frame_buffer,
+                    models,
+                    ctx,
+                    &burst_positions,
+                    WindowSource::DeferredBurst,
+                );
+                // Same-call gap-recovery suppression (review fix): the gap
+                // recovery below would re-anchor next_window_start to the
+                // leading edge (position 0 at the flush-aligned B=76) and the
+                // main loop would re-score the IDENTICAL full-76 window the
+                // burst just scored at position 0 — a wasted embedding and a
+                // double-counted rolling score (the ring-order-only flip that
+                // let some failed bursts confirm via a misattributed 'other'
+                // path).  The burst already covered the leading edge, so the
+                // main loop resumes from the position after the swept grid on
+                // later calls.
+                burst_swept_this_call = true;
+                // Latch the per-segment "burst sweep done" state — cleared
+                // only by the segment resets.  Prevents the sweep from
+                // re-running and mid-utterance trailing re-scoring from
+                // killing an active candidate.  Does NOT gate the segment-end
+                // pass (a failed burst must not suppress the boundary
+                // fallback).
+                ctx.burst_sweep_done = true;
+                #[cfg(feature = "voice-tests")]
+                {
+                    ctx.instrumentation.burst_sweep_fired = true;
+                    ctx.instrumentation.burst_sweep_buffer_len = Some(mel_frame_buffer.len());
+                    ctx.instrumentation.burst_wall_clock_ms =
+                        Some(burst_start.elapsed().as_secs_f64() * 1000.0);
                 }
-                ctx.next_window_start += stride;
             }
 
-            // Short-buffer handling (mahbot-927): if the buffer has fewer than
-            // EMBEDDING_WINDOW_FRAMES frames AND there are unprocessed frames at
-            // the current next_window_start position, pad each remaining stride-8
-            // window with tapered fade-out and extract embeddings.  This replaces
-            // the old single-shot fallback (mahbot-923) that only fired at
-            // next_window_start == 0, which meant utterances shorter than ~940ms
-            // produced at most 1 embedding -- making detection mathematically
-            // impossible (max rolling sum 0.99 < threshold 2.13).
-            //
-            // The while-loop extracts one embedding per stride-8 position until
-            // the buffer is exhausted or detection fires.  Each embedding is
-            // produced from a padded window of EMBEDDING_WINDOW_FRAMES (76) frames,
-            // where the real frames at [pos..) are followed by a tapered fade-out
-            // to silence.  This ensures even a ~700ms wake word (~67 mel frames)
-            // produces at least 9 embeddings (positions 0..64 in strides of 8),
-            // filling the ROLLING_WINDOW_N (3) window for detection.
-            //
-            // Guards:
-            //  a) No-op flush: the outer guard at line 7246
-            //     (`len() >= next_window_start + stride`) ensures at least stride
-            //     (8) frames arrived since the last extraction, preventing
-            //     re-processing of the same positions.
-            //  b) Tail-of-long-utterance: the inner guard
-            //     `len() < EMBEDDING_WINDOW_FRAMES` ensures the fallback only
-            //     fires for short buffers (< 76 frames) that the main stride-8
-            //     loop cannot handle (it needs next_window_start + 76 <= len()).
-            //  c) Blinded gap: after exhausting a short buffer (e.g., 67 frames),
-            //     next_window_start advances to ~72, creating a ~68-frame blind
-            //     spot where neither the main loop (needs 148+ frames) nor the
-            //     fallback (< 76 frames) extracts embeddings.  This is resolved
-            //     by mahbot-1002's blinded gap recovery (inserted before the main
-            //     stride-8 loop) which resets next_window_start to the leading
-            //     edge when the buffer has >= EMBEDDING_WINDOW_FRAMES frames but
-            //     next_window_start is too far ahead.
-            if ctx.next_window_start < mel_frame_buffer.len()
-                && mel_frame_buffer.len() < EMBEDDING_WINDOW_FRAMES
-            {
-                while ctx.next_window_start < mel_frame_buffer.len() {
-                    let subslice = &mel_frame_buffer[ctx.next_window_start..];
-                    let padded = pad_mel_frames_to_window(subslice);
-                    let detected =
-                        score_stride8_window(&padded, models, ctx, true, mel_frame_buffer.len());
-                    if detected {
-                        // Detection fired -- loop stops; next_window_start is
-                        // NOT advanced past this position.  Symmetric with
-                        // main stride-8 loop: soft reset handles it.
+            // The main stride-8 loop is skipped when the burst just fired a
+            // detection (is_recording true → handoff below).
+            if !ctx.is_recording {
+                // ── Blinded gap recovery (mahbot-1002) ──
+                // After warm-up or any pipeline action that advances
+                // next_window_start past the leading edge of real audio, the
+                // main stride-8 loop may be unable to fire because
+                // next_window_start + EMBEDDING_WINDOW_FRAMES > buffer_len.
+                // When the buffer has enough frames, reset next_window_start
+                // to the leading edge so extraction from the new utterance can
+                // proceed immediately, eliminating the ~68-frame blind spot
+                // that previously caused 0% detection on test utterances
+                // following warm-up.
+                //
+                // mahbot-1023 review fix: the re-anchor is skipped in the
+                // same call as the deferred burst — the burst already scored
+                // the leading edge (positions 0/8/16/24), so re-anchoring to
+                // it would re-score the identical position-0 window.
+                if !burst_swept_this_call
+                    && ctx.next_window_start + EMBEDDING_WINDOW_FRAMES > mel_frame_buffer.len()
+                    && mel_frame_buffer.len() >= EMBEDDING_WINDOW_FRAMES
+                {
+                    ctx.next_window_start = mel_frame_buffer.len() - EMBEDDING_WINDOW_FRAMES;
+                }
+
+                // Iterate from next_window_start with stride 8.
+                while ctx.next_window_start + EMBEDDING_WINDOW_FRAMES <= mel_frame_buffer.len() {
+                    let window = &mel_frame_buffer
+                        [ctx.next_window_start..ctx.next_window_start + EMBEDDING_WINDOW_FRAMES];
+                    if score_stride8_window(
+                        window,
+                        models,
+                        ctx,
+                        false,
+                        mel_frame_buffer.len(),
+                        WindowSource::MainStride,
+                    ) {
+                        // Detection fired — loop will be restarted on next call
+                        // via fresh stride-8 iteration.  next_window_start is reset
+                        // by reset_pipeline_state(Soft).
                         break;
                     }
-                    ctx.next_window_start += stride;
+                    ctx.next_window_start += BURST_STRIDE;
                 }
+                // NOTE: the short-buffer padded fallback (mahbot-927) is
+                // intentionally GONE.  Its incremental per-chunk scoring is
+                // exactly the mahbot-1023 bug (position 0 scored with 2–16
+                // frames per chunk, never re-scored), and after the deferred
+                // burst the fallback's ≤17-real-frame windows (~0.01) would
+                // reset the rolling window mid-utterance.  Short buffers are
+                // covered by the deferred burst (≥ 68 frames) and the
+                // segment-end pass (< 68 frames, at the boundary).
             }
         }
     }
@@ -8097,9 +8526,10 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     // ── Mel frame buffer trim (moved from flush_voice_batch, mahbot-923) ──
     // After the stride-8 loop, keep the last EMBEDDING_WINDOW_FRAMES - 8 mel
     // frames (overlap for continuity with the next batch).  The overlap of 8
-    // frames matches the stride-8 window so the next call has valid context.
-    if mel_frame_buffer.len() > EMBEDDING_WINDOW_FRAMES.saturating_sub(stride) {
-        let keep = EMBEDDING_WINDOW_FRAMES.saturating_sub(stride);
+    // frames matches the BURST_STRIDE window so the next call has valid
+    // context.
+    if mel_frame_buffer.len() > EMBEDDING_WINDOW_FRAMES.saturating_sub(BURST_STRIDE) {
+        let keep = EMBEDDING_WINDOW_FRAMES.saturating_sub(BURST_STRIDE);
         let drain_to = mel_frame_buffer.len().saturating_sub(keep);
         if drain_to > 0 {
             mel_frame_buffer.drain(..drain_to);
@@ -9424,7 +9854,10 @@ mod tests {
     // Tests that the feed/peek branching logic in score_single_embedding is
     // exercised: adaptive_state is passed as Some(...) so the code path that
     // conditionally calls feed() (for background scores) or peek() (for
-    // wake-word-like scores) is actually executed.
+    // wake-word-like scores) is actually executed.  Since mahbot-1023 the
+    // feed/peek rule is score-based ONLY, including during bootstrap (below-
+    // reset scores feed; wake-word-like scores peek) — see
+    // score_single_with_adaptive_state_feeds_background_only.
 
     #[test]
     fn score_single_with_adaptive_state_completes_bootstrap() {
@@ -9471,24 +9904,29 @@ mod tests {
 
     #[test]
     fn score_single_with_adaptive_state_feeds_background_only() {
-        // Verify that score_single_embedding only feeds background scores
-        // (below NO_MATCH_RESET_THRESHOLD) to the adaptive state.  High
-        // scores should go through peek() instead.
-        let classifier = classifier_always_half();
+        // Verify that score_single_embedding feeds ONLY background scores
+        // (below NO_MATCH_RESET_THRESHOLD) to the adaptive state — INCLUDING
+        // during bootstrap (mahbot-1023 bootstrap feed fix).  High scores go
+        // through peek() instead, so a high-scoring utterance never
+        // contaminates the adaptive statistics and can legitimately keep the
+        // bootstrap alive for its whole duration (the static
+        // match_threshold() stays in effect — peek returns None during
+        // bootstrap).
         let embedding = vec![0.5; EMBEDDING_DIM];
+
+        // ── Phase 1: high scores during bootstrap PEEK (no stats, no
+        //    bootstrap progress) ──────────────────────────────────────────
+        // 0.5 is ≥ NO_MATCH_RESET_THRESHOLD (0.316) but keeps the rolling sum
+        // (3 × 0.5 = 1.5) below the 2.13 detection threshold.
+        let classifier_high = classifier_always_half();
         let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
         let mut score_window = Vec::new();
         let mut adaptive = AdaptiveThresholdState::new();
-
-        // Bootstrap: feed enough embeddings to complete bootstrap.
-        // The classifier always produces 0.5 which is ≥ NO_MATCH_RESET_THRESHOLD
-        // (0.316), so during bootstrap these go through feed() unconditionally
-        // (the call site uses feed for all scores).
-        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
+        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES + 1 {
             score_single_embedding(
                 &embedding,
                 &mut ring,
-                Some(&classifier),
+                Some(&classifier_high),
                 None,
                 &mut score_window,
                 Some(&mut adaptive),
@@ -9496,33 +9934,62 @@ mod tests {
                 None,
             );
         }
+        // The bootstrap must NOT have completed and no statistics accumulated:
+        // the old unconditional bootstrap feed would have completed it with
+        // 5 wake-word-like scores (the mahbot-1023 contamination).
+        assert!(
+            adaptive.is_bootstrapping(),
+            "high scores must not complete the bootstrap (peek during bootstrap)",
+        );
+        assert_eq!(
+            adaptive.scores.len(),
+            0,
+            "high scores must not feed the adaptive window even during bootstrap",
+        );
 
-        // Capture state after bootstrap.
-        let scores_len_before = adaptive.scores.len();
-        let sum_before = adaptive.sum;
+        // ── Phase 2: below-reset scores during bootstrap FEED (complete it) ──
+        let classifier_low = classifier_always_score(0.1); // < NO_MATCH_RESET_THRESHOLD
+        let mut ring2 = Vec::with_capacity(EMBEDDING_RING_MAX);
+        let mut score_window2 = Vec::new();
+        let mut adaptive2 = AdaptiveThresholdState::new();
+        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
+            score_single_embedding(
+                &embedding,
+                &mut ring2,
+                Some(&classifier_low),
+                None,
+                &mut score_window2,
+                Some(&mut adaptive2),
+                ADAPTIVE_K_DEFAULT,
+                None,
+            );
+        }
+        assert!(
+            !adaptive2.is_bootstrapping(),
+            "below-reset background scores must complete the bootstrap",
+        );
 
-        // Send another high-scoring embedding (0.5).  This should go through
-        // peek() rather than feed(), so the window should NOT grow.
+        // ── Phase 3: post-bootstrap high scores PEEK (no stats growth) ──
+        let scores_len_before = adaptive2.scores.len();
+        let sum_before = adaptive2.sum;
         score_single_embedding(
             &embedding,
-            &mut ring,
-            Some(&classifier),
+            &mut ring2,
+            Some(&classifier_high),
             None,
-            &mut score_window,
-            Some(&mut adaptive),
+            &mut score_window2,
+            Some(&mut adaptive2),
             ADAPTIVE_K_DEFAULT,
             None,
         );
-
-        // The adaptive state should NOT have been updated (peek doesn't push).
         assert_eq!(
-            adaptive.scores.len(),
+            adaptive2.scores.len(),
             scores_len_before,
-            "adaptive scores should not grow (high scores use peek)",
+            "post-bootstrap high scores must use peek (no window growth)",
         );
         assert!(
-            (adaptive.sum - sum_before).abs() < f32::EPSILON,
-            "adaptive sum should not change (high scores use peek)",
+            (adaptive2.sum - sum_before).abs() < f32::EPSILON,
+            "post-bootstrap high scores must not change the adaptive sum",
         );
     }
 
@@ -9996,6 +10463,210 @@ mod tests {
         assert!(
             !mel_frame_buffer.is_empty(),
             "mel_frame_buffer must survive below threshold"
+        );
+    }
+
+    // ── Deferred burst state machine (mahbot-1023, ONNX-free) ─────────────
+    // The hold / burst-sweep / segment-end-pass / per-segment-flag lifecycle
+    // is extracted into pure helpers (burst_positions_to_score /
+    // start_aligned_positions) plus the PipelineCtx burst_sweep_done latch.
+    // These tests exercise the real control flow WITHOUT ONNX models
+    // (ONNX_MODELS is None in unit tests).
+
+    #[test]
+    fn burst_hold_until_trigger_frames() {
+        // The burst must HOLD position 0 until the buffer reaches
+        // BURST_TRIGGER_FRAMES (68): incremental per-chunk scoring of
+        // positions 0/8/16/24 with 2–16 frames per chunk is exactly the
+        // mahbot-1023 bug (a ~10-real-frame window scores ~0.027 and never
+        // re-scores).
+        for b in 0..BURST_TRIGGER_FRAMES {
+            assert!(
+                burst_positions_to_score(b, false).is_empty(),
+                "buffer {b} < {BURST_TRIGGER_FRAMES} must hold (no scoring)"
+            );
+        }
+        // At exactly the trigger the burst fires from start-aligned position 0.
+        let positions = burst_positions_to_score(BURST_TRIGGER_FRAMES, false);
+        assert_eq!(positions, vec![0, 8, 16, 24], "burst positions at trigger");
+    }
+
+    #[test]
+    fn burst_position_zero_is_never_skipped() {
+        // Invariant: the burst's first scored position is ALWAYS 0 (the
+        // trained start-0-aligned geometry).  Positions never exceed the
+        // buffer end and never re-score later (see burst_sweep_done latch).
+        for b in BURST_TRIGGER_FRAMES..=80 {
+            let positions = burst_positions_to_score(b, false);
+            assert!(!positions.is_empty(), "burst must fire at buffer {b}");
+            assert_eq!(
+                positions.first(),
+                Some(&0),
+                "start-aligned position 0 must never be skipped at buffer {b}"
+            );
+            for &p in &positions {
+                assert!(p < b, "position {p} must be below buffer end {b}");
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(voice)]
+    fn burst_sweep_done_latches_until_segment_reset() {
+        // Per-segment flag lifecycle: burst_sweep_done is set after the sweep
+        // (preventing re-runs and mid-utterance trailing re-scoring) and
+        // cleared ONLY by the segment resets.
+        let _ = init_global();
+        let mut ctx = PipelineCtx::new();
+        assert!(!ctx.burst_sweep_done, "fresh ctx starts with sweep pending");
+
+        // Simulate the sweep having run (as handle_wake_word_detection does).
+        ctx.burst_sweep_done = true;
+        // Rolling-window-reset protection (merged from the former
+        // burst_rolling_window_reset_protection): once the sweep is done,
+        // positions beyond the buffer end at sweep time are NEVER re-scored
+        // on later calls (a re-scored ≤17-real-frame window ~0.01
+        // mid-utterance would reset the rolling window and expire an active
+        // candidate).  The latch returns an empty position set for ANY later
+        // buffer length.
+        for later_b in BURST_TRIGGER_FRAMES..=120 {
+            assert!(
+                burst_positions_to_score(later_b, ctx.burst_sweep_done).is_empty(),
+                "burst must not re-run once the per-segment sweep is done (buffer {later_b})"
+            );
+        }
+
+        // Segment reset clears the latch → a new utterance may burst again.
+        ctx.reset_detection_segment();
+        assert!(
+            !ctx.burst_sweep_done,
+            "segment reset must clear the burst_sweep_done latch"
+        );
+        assert!(
+            !burst_positions_to_score(70, ctx.burst_sweep_done).is_empty(),
+            "a fresh segment must be allowed a new burst sweep"
+        );
+
+        // reset_pipeline_state (all levels) also starts a fresh segment.
+        for level in [ResetLevel::Soft, ResetLevel::Full, ResetLevel::Cancel] {
+            let mut ctx2 = PipelineCtx::new();
+            ctx2.burst_sweep_done = true;
+            ctx2.reset_pipeline_state(level);
+            assert!(
+                !ctx2.burst_sweep_done,
+                "{level:?} reset must clear the burst_sweep_done latch"
+            );
+        }
+    }
+
+    #[test]
+    fn segment_end_pass_uses_burst_grid_latch_independently() {
+        // mahbot-1023 item 8 + manager pin 3: the boundary pass must cover
+        // the burst-equivalent grid (so the ring-4 verifier sample at
+        // position 24 can confirm exactly like the cold burst) AND be
+        // latch-independent — a burst that fired without confirming
+        // (burst_sweep_done == true) must NOT suppress the boundary fallback
+        // (F1's only current detection path is the trailing boundary
+        // re-score).  Both properties are structural in the shared
+        // `start_aligned_positions` grid: the pass and the burst build their
+        // position lists from the same function, and the grid takes no latch
+        // input, so a latched burst (empty set) does not shrink the pass
+        // grid.  The pass gate in handle_segment_boundary never consults the
+        // latch either (it re-checks only not-recording / models-loaded /
+        // non-empty buffer).
+        assert!(
+            start_aligned_positions(0).is_empty(),
+            "no positions at an empty buffer"
+        );
+        for b in 1..=100usize {
+            let pass = start_aligned_positions(b);
+            assert_eq!(
+                pass.first(),
+                Some(&0),
+                "pass must score from start-aligned position 0 at buffer {b}"
+            );
+            for &p in &pass {
+                assert!(p < b, "pass position {p} must be below buffer end {b}");
+            }
+            assert!(
+                pass.len() <= BURST_MAX_POSITIONS,
+                "pass grid must never exceed {BURST_MAX_POSITIONS} positions"
+            );
+            if b >= BURST_TRIGGER_FRAMES {
+                // Burst-equivalent grid: the pass can confirm exactly like
+                // the cold burst.
+                assert_eq!(
+                    pass,
+                    burst_positions_to_score(b, false),
+                    "pass must cover the same grid the burst swept at buffer {b}"
+                );
+                // Latch-independence: the burst is suppressed by the
+                // per-segment latch, the pass grid is not.
+                assert!(
+                    burst_positions_to_score(b, true).is_empty(),
+                    "a latched burst must not re-run at buffer {b}"
+                );
+                assert!(
+                    !pass.is_empty(),
+                    "pass must not be suppressed by a failed burst at buffer {b}"
+                );
+            } else {
+                // Short buffers: the burst holds (no scoring below the
+                // trigger), but the pass still covers the grid the burst
+                // never reached.
+                assert!(
+                    burst_positions_to_score(b, false).is_empty(),
+                    "burst must hold below the trigger at buffer {b}"
+                );
+                assert!(
+                    !pass.is_empty(),
+                    "pass must still cover short buffers the burst never reached at buffer {b}"
+                );
+            }
+        }
+        // Full-grid invariants at the measured confirmable lengths.
+        assert_eq!(
+            start_aligned_positions(BURST_TRIGGER_FRAMES),
+            vec![0, 8, 16, 24],
+            "pass positions at the burst-trigger length"
+        );
+        // Trailing-68 trimmed state (longer utterances): 68/60/52/44 real
+        // frames at positions 0/8/16/24 — the measured confirmable family.
+        assert_eq!(
+            start_aligned_positions(EMBEDDING_WINDOW_FRAMES.saturating_sub(BURST_STRIDE)),
+            vec![0, 8, 16, 24],
+            "trailing-68 pass positions"
+        );
+    }
+
+    #[test]
+    fn segment_boundary_clears_burst_latch_and_buffers() {
+        // handle_segment_boundary at the hop threshold resets the per-segment
+        // burst latch along with the other per-segment state (ONNX-free: the
+        // segment-end pass itself is skipped because ONNX_MODELS is None, so
+        // the reset path is what is exercised here).
+        let mut ctx = PipelineCtx::new();
+        ctx.burst_sweep_done = true;
+        ctx.embedding_ring = vec![vec![0.5; 96]; 3];
+        ctx.score_window = vec![0.5; 5];
+        let mut voice_batch = vec![0.5; 100];
+        let mut mel_frame_buffer = vec![vec![0.5; 32]; 10];
+        ctx.handle_segment_boundary(
+            SEGMENT_TIMEOUT_HOPS,
+            &mut voice_batch,
+            &mut mel_frame_buffer,
+        );
+        assert!(
+            !ctx.burst_sweep_done,
+            "segment boundary must clear the burst_sweep_done latch"
+        );
+        assert!(
+            ctx.embedding_ring.is_empty() && ctx.score_window.is_empty(),
+            "per-segment scoring state must be cleared"
+        );
+        assert!(
+            voice_batch.is_empty() && mel_frame_buffer.is_empty(),
+            "caller's local buffers must be cleared on boundary"
         );
     }
 
@@ -12523,14 +13194,15 @@ mod tests {
         );
     }
 
-    // ── Short-buffer fallback tests (mahbot-927) ──────────────────────────
+    // ── Padded-window geometry tests (mahbot-927 / mahbot-1023) ───────────
     // These test `pad_mel_frames_to_window`, the core padding function used
-    // by the short-buffer embedding fallback in `handle_wake_word_detection`.
-    // The full while-loop (stride-8 over padded subslices) cannot be tested
-    // without ONNX models, but the padding transformation itself is isolated
-    // and fully testable.  A regression of the original deadlock (single-shot
-    // guard at next_window_start == 0) would manifest as incorrect padding
-    // behavior caught by these tests.
+    // by the deferred burst sweep and the segment-end pass
+    // (`score_start_aligned_positions`) to build start-aligned windows
+    // shorter than EMBEDDING_WINDOW_FRAMES.  The full stride-8 scoring loop
+    // cannot be tested without ONNX models, but the padding transformation
+    // itself is isolated and fully testable.  The old incremental
+    // short-buffer fallback (mahbot-927) was removed in mahbot-1023; the
+    // padding semantics it introduced are preserved for the burst/pass.
 
     /// Helper: create a mel frame with identical values across all bands.
     fn mel_frame(val: f32) -> Vec<f32> {
