@@ -2950,18 +2950,19 @@ struct LocalizationRow {
     evidence: serde_json::Value,
 }
 
-/// Score a sequence of embeddings through the classifier + verifier with a
-/// fresh [`PipelineCtx`](super::PipelineCtx) (no AGC/VAD/mel — pure embedding
-/// scoring, the same `score_single_embedding` call the enrollment self-test
-/// uses).  Returns `(per_window_classifier_scores, per_window_verifier_scores,
+/// Shared parameter-passed embedding-scoring loop (mahbot-1022): scores a
+/// sequence of embeddings through the classifier + verifier with a fresh
+/// [`PipelineCtx`](super::PipelineCtx), passing the classifier/verifier as
+/// explicit references.  Pure — does NOT touch global voice state, so both the
+/// mahbot-1012 training-path scoring and the B-sweep training-path scoring
+/// (which must not call `set_classifier_weights` / `set_verifier`) share it.
+/// Returns `(per_window_classifier_scores, per_window_verifier_scores,
 /// max_rolling_sum)`.
-fn score_embedding_sequence(
+fn score_embedding_sequence_with(
     embeddings: &[Vec<f32>],
     classifier: &WakeWordClassifier,
     verifier: &VoiceVerifier,
 ) -> (Vec<f32>, Vec<f32>, f32) {
-    super::set_classifier_weights(classifier.weights_ref().clone());
-    super::set_verifier(verifier.clone());
     let mut ctx = super::PipelineCtx::new();
     let mut scores = Vec::with_capacity(embeddings.len());
     let mut verifier_scores = Vec::with_capacity(embeddings.len());
@@ -2982,6 +2983,23 @@ fn score_embedding_sequence(
         max_rs = max_rs.max(rolling_sum);
     }
     (scores, verifier_scores, max_rs)
+}
+
+/// Score a sequence of embeddings through the classifier + verifier with a
+/// fresh [`PipelineCtx`](super::PipelineCtx) (no AGC/VAD/mel — pure embedding
+/// scoring, the same `score_single_embedding` call the enrollment self-test
+/// uses).  Mirrors [`score_embedding_sequence_with`] but first re-asserts the
+/// trained weights into the global voice state (the mahbot-1012 comparison's
+/// documented behavior).  Returns `(per_window_classifier_scores,
+/// per_window_verifier_scores, max_rolling_sum)`.
+fn score_embedding_sequence(
+    embeddings: &[Vec<f32>],
+    classifier: &WakeWordClassifier,
+    verifier: &VoiceVerifier,
+) -> (Vec<f32>, Vec<f32>, f32) {
+    super::set_classifier_weights(classifier.weights_ref().clone());
+    super::set_verifier(verifier.clone());
+    score_embedding_sequence_with(embeddings, classifier, verifier)
 }
 
 /// AGC a PCM clip through a fresh AudioPreprocessor (the training path's
@@ -4094,6 +4112,1267 @@ fn run_noise_overlap_test(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// mahbot-1022: B-sweep measurement (measurement-only — no hot-path changes)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Measures the static-gate (post-fix) condition: how the Conv1D classifier
+// score, the rolling sum, and the ring-4 verifier peak behave as a function
+// of the streaming-layout mel BUFFER length B and the in-buffer scoring
+// position.  The sweep scores the F1 enrollment clip (and its raw-level
+// variants) through `score_single_embedding` with SEQUENTIAL ring semantics:
+// positions 0 → 8 → 16 → 24 within one B-buffer share ONE embedding ring.
+//
+// Hard constraints honored here:
+//   - No hot-path changes (`voice.rs` detection logic / thresholds untouched).
+//   - No `set_classifier_weights` / `set_verifier` calls — classifier and
+//     verifier are passed explicitly to `score_single_embedding` (the sweep
+//     must not disturb the shared voice state).
+
+/// B-sweep grid (mahbot-1022): streaming-layout mel buffer lengths B.
+const SWEEP_BS: [usize; 7] = [44, 49, 52, 57, 60, 65, 68];
+/// In-buffer scoring positions (sequential ring order, stride 8).
+const SWEEP_POSITIONS: [usize; 4] = [0, 8, 16, 24];
+/// Decisive (B, position) cell for the F1-variant verdict (mahbot-1022 item 3a).
+const DECISIVE_B: usize = 68;
+const DECISIVE_POS: usize = 24;
+/// Expected F1 streaming classifier score at the sanity anchor (mahbot-1022 item 5).
+const BSWEEP_SANITY_EXPECTED: f32 = 0.2651;
+/// Sanity-anchor divergence tolerance (mahbot-1022 item 5).
+const BSWEEP_SANITY_TOLERANCE: f32 = 0.05;
+/// Window-granularity cross-check real-frame tolerance (mahbot-1022 item 1):
+/// the flush-duplicate range per window (0–3 frames per flush boundary).
+const BSWEEP_CROSS_CHECK_TOLERANCE: usize = 3;
+
+/// One (B, position) cell in the B-sweep (mahbot-1022).
+#[derive(Clone)]
+struct BsweepCell {
+    b: usize,
+    position: usize,
+    measurable: bool,
+    classifier_score: Option<f32>,       // None = unmeasurable
+    verifier_ring4: Option<f32>,         // None = not evaluated (ring < 4)
+    verifier_windows: Vec<f32>,          // per-window stride-1 predictions at ring 4
+    verifier_window_rf: Vec<Vec<usize>>, // real-frame family per verifier window
+    max_rolling_sum: f32,
+    true_unique_bit_exact: usize,
+    true_unique_tolerance: usize,
+    geometry: &'static str,
+}
+
+impl BsweepCell {
+    fn unmeasurable(b: usize, position: usize, geometry: &'static str) -> Self {
+        Self {
+            b,
+            position,
+            measurable: false,
+            classifier_score: None,
+            verifier_ring4: None,
+            verifier_windows: Vec::new(),
+            verifier_window_rf: Vec::new(),
+            max_rolling_sum: 0.0,
+            true_unique_bit_exact: 0,
+            true_unique_tolerance: 0,
+            geometry,
+        }
+    }
+}
+
+/// Ring-4 verifier detail at the decisive cell.  Outer `Option`: `None` = the
+/// decisive cell itself was not measurable.  Inner `Option`: `None` = the cell
+/// was measurable but the ring had not reached length 4 (verifier NOT
+/// evaluated — never a zero-confidence 0.0).  `Some((max, per_window_scores,
+/// per_window_real_frame_families))` = the ring-4 max over the two stride-1
+/// windows.
+type BsweepRing4Detail = Option<(Option<f32>, Vec<f32>, Vec<Vec<usize>>)>;
+
+/// One raw-level F1 variant sweep result (mahbot-1022 item 3a).
+struct BsweepVariantRaw {
+    variant: String,
+    mel_len: usize,
+    confirm: Option<bool>, // None = decisive cell unmeasurable (mel < 68)
+    b68_pos24_classifier: Option<f32>,
+    b68_ring4_verifier_peak: Option<f32>,
+    b68_max_rolling_sum: f32,
+    /// Per-B grid (parallel to [`SWEEP_BS`]), cells in position order — the
+    /// "sensitivity" of the classifier/verifier to the buffer length.
+    grid: Vec<Vec<BsweepCell>>,
+}
+
+/// One F1-variant training-path result (mahbot-1022 item 3b).
+struct BsweepVariantTraining {
+    variant: String,
+    produced: bool,
+    n_windows: usize,
+    per_window_classifier: Vec<f32>,
+    per_window_verifier: Vec<f32>,
+    max_rolling_sum: f32,
+}
+
+/// Aggregate B-sweep report (mahbot-1022).  `to_json(negatives)` emits the
+/// additive `bsweep` JSON section merged with the same-run negatives extract.
+struct BsweepReport {
+    phase_ms: f64,
+    f1_mel_len_shared: usize,
+    f1_mel_len_fresh: usize,
+    decisive_cell_measurable_shared: bool,
+    decisive_cell_measurable_fresh: bool,
+    dedup_epsilon: f32,
+    dedup_epsilon_rule: &'static str,
+    dedup_dist_min: f32,
+    dedup_dist_median: f32,
+    dedup_dist_max: f32,
+    /// Per-B grid rows (parallel to [`SWEEP_BS`]); each row = cells in
+    /// position order (sequential ring semantics within a B-buffer).
+    grid: Vec<Vec<BsweepCell>>,
+    /// Fresh-path per-B grid rows (dual-report when the VAD path changes
+    /// measurability of the decisive cell — mahbot-1022 item 1).
+    fresh_grid: Vec<Vec<BsweepCell>>,
+    /// (B=68, position 24) ring-4 verifier detail.  Outer `None` = decisive
+    /// cell not measurable; inner `Option<f32>` = ring-4 max (`None` = ring <
+    /// 4, NOT evaluated).
+    decisive_ring4: BsweepRing4Detail,
+    variants_raw: Vec<BsweepVariantRaw>,
+    variants_training: Vec<BsweepVariantTraining>,
+    confirm_count: usize,
+    measurable_count: usize,
+    passed_4of5: bool,
+    unmeasurable_variants: Vec<String>,
+    sanity_measured: Option<f32>,
+    classifier_fingerprint: String,
+    verifier_fingerprint: String,
+    verifier_runtime_threshold: f32,
+    cross_check: serde_json::Value,
+    trailing_post_trim: serde_json::Value,
+}
+
+/// Streaming-layout mel for a PCM clip (mahbot-1022): AGC via a fresh
+/// [`AudioPreprocessor`], then VAD-gated streaming mel extraction with either
+/// the SHARED live detector (faithful to the streaming pipeline) or a FRESH
+/// detector (the enrollment/training path's per-clip fresh detector).
+/// Returns `(mel_frames, mel_len)`.
+fn bsweep_streaming_mel(pcm: &[f32], shared: bool) -> (Vec<Vec<f32>>, usize) {
+    let agc = agc_pcm(pcm);
+    let (mel, _speech_audio) = if shared {
+        let detector =
+            super::VAD_DETECTOR.get_or_init(|| std::sync::Mutex::new(earshot::Detector::default()));
+        let mut detector = detector.lock().unwrap_poison();
+        super::vad_gate_streaming_mel(&agc, |hop| {
+            super::is_speech_with_detector(hop, &mut detector, super::VAD_THRESHOLD)
+        })
+    } else {
+        let mut detector = Detector::default();
+        super::vad_gate_streaming_mel(&agc, |hop| {
+            super::is_speech_with_detector(hop, &mut detector, super::VAD_THRESHOLD)
+        })
+    };
+    let mel_len = mel.len();
+    (mel, mel_len)
+}
+
+/// Relative L2 distance between two equal-length mel frames:
+/// `||a - b||_2 / max(||a||_2, ||b||_2, 1e-8)`.
+fn frame_relative_l2(a: &[f32], b: &[f32]) -> f32 {
+    let mut diff_sq = 0.0_f32;
+    let mut a_sq = 0.0_f32;
+    let mut b_sq = 0.0_f32;
+    for (x, y) in a.iter().zip(b) {
+        let d = x - y;
+        diff_sq += d * d;
+        a_sq += x * x;
+        b_sq += y * y;
+    }
+    diff_sq.sqrt() / (a_sq.sqrt().max(b_sq.sqrt()).max(1e-8))
+}
+
+/// Derive the dedup epsilon from the sorted boundary-frame relative-L2
+/// distance distribution (mahbot-1022 item 4).
+///
+/// Sorts ascending and finds the largest multiplicative gap `d[i+1]/d[i]`
+/// between adjacent sorted POSITIVE values.  If that max ratio is `>= 2.0`
+/// the distribution is a documented bimodal split (duplicate frames clustered
+/// near 0, distinct frames further out) and epsilon = the geometric mean
+/// `sqrt(d[i] * d[i+1])` of the gap pair.  Otherwise epsilon = 0.0, meaning
+/// the tolerance definition collapses to bit-exact.  Returns
+/// `(epsilon, rule_description)`.
+///
+/// Exact-zero distances (bit-identical frames) sit at the FLOOR of the
+/// duplicate cluster, so the 0 → first-nonzero boundary is NOT treated as a
+/// gap candidate: treating it as infinite would always win AND would yield a
+/// degenerate `sqrt(0 * next) = 0`, collapsing the tolerance to bit-exact
+/// even when a clear bimodal split exists above the zeros.  Only ratios
+/// between adjacent positive values can select the split.
+fn derive_dedup_epsilon(distances: &mut [f32]) -> (f32, &'static str) {
+    if distances.len() < 2 {
+        return (0.0, "insufficient distances (< 2) — tolerance ≡ bit-exact");
+    }
+    distances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut best_ratio = 0.0_f32;
+    let mut best_idx = 0usize;
+    for i in 0..distances.len() - 1 {
+        // Exact-zero distances are the duplicate-cluster floor; a 0 → nonzero
+        // boundary carries no split information (the ratio is undefined, and
+        // its geometric mean would be degenerate 0).
+        if distances[i] <= 0.0 {
+            continue;
+        }
+        let ratio = distances[i + 1] / distances[i];
+        if ratio > best_ratio {
+            best_ratio = ratio;
+            best_idx = i;
+        }
+    }
+    if best_ratio >= 2.0 {
+        let epsilon = (distances[best_idx] * distances[best_idx + 1]).sqrt();
+        (
+            epsilon,
+            "bimodal split: largest positive multiplicative gap >= 2.0; \
+             epsilon = geometric mean of the gap pair (exact-zero distances \
+             form the duplicate-cluster floor and are not gap candidates)",
+        )
+    } else {
+        (
+            0.0,
+            "no bimodal split (max positive gap ratio < 2.0) — tolerance ≡ bit-exact",
+        )
+    }
+}
+
+/// Count true-unique frames in the window-scoped mel slice `[position..b]`
+/// (mahbot-1022 item 4): `1 + count of i in [position+1..b] where frame[i]`
+/// is NOT a duplicate of `frame[i-1]`.
+///
+/// Returns `(bit_exact_count, tolerance_count)`:
+/// - Bit-exact: a duplicate requires all 32 bands bit-identical
+///   (`x.to_bits() == y.to_bits()` per band).
+/// - Tolerance: a duplicate requires `frame_relative_l2 <= epsilon`; when
+///   `epsilon == 0.0` this definition is identical to bit-exact.
+fn count_true_unique(mel: &[Vec<f32>], position: usize, b: usize, epsilon: f32) -> (usize, usize) {
+    if position >= b || position >= mel.len() {
+        return (0, 0);
+    }
+    let end = b.min(mel.len());
+    let mut bit_exact = 1usize;
+    let mut tolerance = 1usize;
+    for i in (position + 1)..end {
+        let prev = &mel[i - 1];
+        let cur = &mel[i];
+        let same_bits = prev.len() == cur.len()
+            && prev
+                .iter()
+                .zip(cur)
+                .all(|(x, y)| x.to_bits() == y.to_bits());
+        if !same_bits {
+            bit_exact += 1;
+        }
+        if epsilon > 0.0 {
+            if frame_relative_l2(prev, cur) > epsilon {
+                tolerance += 1;
+            }
+        } else {
+            tolerance = bit_exact;
+        }
+    }
+    (bit_exact, tolerance)
+}
+
+/// Stride-1 verifier windows at ring length 4 exactly (mahbot-1022 item 2).
+///
+/// The two windows
+/// [`score_single_embedding`](super::score_single_embedding) evaluates once
+/// the ring reaches [`VERIFIER_WARMUP_EMBEDDINGS`] (ring start 0 and 1).
+/// Returns `Some((max, per_window_scores, real_frame_families))`; `None`
+/// when the ring length is not exactly 4 (verifier NOT evaluated — the
+/// caller reports ring < 4 as JSON null, never as a zero-confidence 0.0).
+///
+/// The real-frame family for window start `i` is the real mel-frame count of
+/// each embedding in that window (`ring[i..i+3]`), computed from the ACTUAL
+/// ring embedding positions (`positions[i+j]`) as `b - positions[i+j]` — i.e.
+/// the B, B-8, B-16 / B-8, B-16, B-24 families for the fixed 0/8/16/24 grid
+/// (each family describes the window it is attached to, so the report's
+/// per-window scores and families stay consistent).
+fn ring4_window_scores(
+    ring: &[Vec<f32>],
+    verifier: &VoiceVerifier,
+    b: usize,
+    positions: &[usize],
+) -> Option<(f32, Vec<f32>, Vec<Vec<usize>>)> {
+    if ring.len() != 4 {
+        return None;
+    }
+    let mut window = [0.0_f32; crate::VERIFIER_INPUT_DIM];
+    let mut scores = Vec::with_capacity(2);
+    let mut families = Vec::with_capacity(2);
+    for i in 0..2 {
+        crate::audio::voice_verifier::fill_verifier_window(ring, i, &mut window);
+        scores.push(verifier.predict(&window));
+        let family: Vec<usize> = (0..crate::VERIFIER_WINDOW_SIZE)
+            .map(|j| {
+                let pos = positions.get(i + j).copied().unwrap_or(0);
+                b.saturating_sub(pos)
+            })
+            .collect();
+        families.push(family);
+    }
+    let max = scores.iter().copied().fold(0.0_f32, f32::max);
+    Some((max, scores, families))
+}
+
+/// SHA-256 fingerprint of classifier weights (mahbot-1022 item 6): sha2-256
+/// over the f32 LE bytes of each field in documented order — conv1_weight,
+/// conv1_bias, bn1_gamma, bn1_beta, bn1_running_mean, bn1_running_var,
+/// conv2_weight, conv2_bias, bn2_gamma, bn2_beta, bn2_running_mean,
+/// bn2_running_var, fc_weight, fc_bias — then `bn_eps` (f32 LE), then
+/// `arch.conv1_out`, `arch.conv2_out`, `arch.kernel_size` (u32 LE each).
+/// Returns [`crate::util::hex_string`].
+fn weights_fingerprint_classifier(
+    w: &crate::audio::wake_word_classifier::ClassifierWeights,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut push_f32s = |data: &[f32]| {
+        for v in data {
+            hasher.update(v.to_le_bytes());
+        }
+    };
+    push_f32s(&w.conv1_weight);
+    push_f32s(&w.conv1_bias);
+    push_f32s(&w.bn1_gamma);
+    push_f32s(&w.bn1_beta);
+    push_f32s(&w.bn1_running_mean);
+    push_f32s(&w.bn1_running_var);
+    push_f32s(&w.conv2_weight);
+    push_f32s(&w.conv2_bias);
+    push_f32s(&w.bn2_gamma);
+    push_f32s(&w.bn2_beta);
+    push_f32s(&w.bn2_running_mean);
+    push_f32s(&w.bn2_running_var);
+    push_f32s(&w.fc_weight);
+    push_f32s(&w.fc_bias);
+    hasher.update(w.bn_eps.to_le_bytes());
+    hasher.update((w.arch.conv1_out as u32).to_le_bytes());
+    hasher.update((w.arch.conv2_out as u32).to_le_bytes());
+    hasher.update((w.arch.kernel_size as u32).to_le_bytes());
+    crate::util::hex_string(&hasher.finalize())
+}
+
+/// SHA-256 fingerprint of the verifier (mahbot-1022 item 6): sha2-256 over
+/// the f32 LE bytes of `conv_weight`, `conv_bias`, `fc_weight`, `fc_bias`,
+/// THEN the runtime-calibrated `threshold`.  Returns
+/// [`crate::util::hex_string`].
+fn weights_fingerprint_verifier(v: &VoiceVerifier) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for data in [&v.conv_weight, &v.conv_bias, &v.fc_weight, &v.fc_bias] {
+        for val in data {
+            hasher.update(val.to_le_bytes());
+        }
+    }
+    hasher.update(v.threshold.to_le_bytes());
+    crate::util::hex_string(&hasher.finalize())
+}
+
+/// Per-B-buffer scoring context (mahbot-1022): the sequential embedding ring,
+/// the in-buffer position of each ring embedding, and the Conv1D score window
+/// shared by ALL cells of ONE B-buffer (positions 0 → 8 → 16 → 24 share one
+/// embedding ring — the pinned sequential-ring semantics).
+struct BsweepCellContext {
+    ring: Vec<Vec<f32>>,
+    ring_positions: Vec<usize>,
+    score_window: Vec<f32>,
+}
+
+impl BsweepCellContext {
+    fn new() -> Self {
+        Self {
+            ring: Vec::new(),
+            ring_positions: Vec::new(),
+            score_window: Vec::new(),
+        }
+    }
+}
+
+/// Score one (B, position) cell with SEQUENTIAL ring semantics (mahbot-1022):
+/// slice `mel[position..b]`, pad to the 76-frame embedding window, compute one
+/// embedding, then `score_single_embedding` with a static gate (no adaptive
+/// state, no candidate tracking).  `ctx` persists across cells within a
+/// B-buffer so positions 0 → 8 → 16 → 24 share ONE embedding ring.  At ring
+/// length 4 exactly the per-window verifier scores are captured via
+/// [`ring4_window_scores`].
+#[expect(clippy::too_many_arguments)]
+fn bsweep_score_cell(
+    models: &super::OnnxModels,
+    mel: &[Vec<f32>],
+    position: usize,
+    b: usize,
+    classifier: &WakeWordClassifier,
+    verifier: &VoiceVerifier,
+    ctx: &mut BsweepCellContext,
+    epsilon: f32,
+    geometry: &'static str,
+) -> BsweepCell {
+    let slice = &mel[position..b];
+    let padded = super::pad_mel_frames_to_window(slice);
+    // A failed embedding (e.g. model unavailable) makes this cell
+    // UNMEASURABLE and must NOT advance the shared ring — a stale embedding
+    // would corrupt the sequential-ring scores of later cells in this B-buffer.
+    let Ok(emb) = super::compute_embedding(models, &padded) else {
+        return BsweepCell::unmeasurable(b, position, geometry);
+    };
+    let (_, rolling_sum, total_score, _, _, _) = super::score_single_embedding(
+        &emb,
+        &mut ctx.ring,
+        Some(classifier),
+        Some(verifier),
+        &mut ctx.score_window,
+        None, // static gate — no adaptive state (mahbot-1022)
+        super::ADAPTIVE_K_DEFAULT,
+        None, // no candidate tracking on the sweep
+    );
+    ctx.ring_positions.push(position);
+    // Ring length must be EXACTLY 4 (the gate must match ring4_window_scores'
+    // contract): a hypothetical ring > 4 would otherwise report a silent
+    // Some(0.0) with empty windows.  On the fixed 0/8/16/24 grid the ring
+    // reaches 4 exactly at position 24.
+    let (verifier_ring4, verifier_windows, verifier_window_rf) =
+        match ring4_window_scores(&ctx.ring, verifier, b, &ctx.ring_positions) {
+            Some((max, wins, fams)) => (Some(max), wins, fams),
+            None => (None, Vec::new(), Vec::new()),
+        };
+    let (true_uniq_bit, true_uniq_tol) = count_true_unique(mel, position, b, epsilon);
+    BsweepCell {
+        b,
+        position,
+        measurable: true,
+        classifier_score: Some(total_score),
+        verifier_ring4,
+        verifier_windows,
+        verifier_window_rf,
+        max_rolling_sum: rolling_sum,
+        true_unique_bit_exact: true_uniq_bit,
+        true_unique_tolerance: true_uniq_tol,
+        geometry,
+    }
+}
+
+/// Score the full B × position grid over one streaming-layout mel
+/// (mahbot-1022).  Each B-buffer uses a fresh ring / score window; positions
+/// within a B-buffer share one ring (sequential semantics).  Returns
+/// `(grid, decisive_ring4)` where `decisive_ring4` is the ring-4 verifier
+/// detail at (B=68, position 24): outer `None` = decisive cell not measurable;
+/// inner `Option<f32>` propagates the cell's ring-4 value (`None` = ring < 4,
+/// NOT evaluated).
+fn bsweep_score_grid(
+    mel: &[Vec<f32>],
+    classifier: &WakeWordClassifier,
+    verifier: &VoiceVerifier,
+    epsilon: f32,
+    geometry: &'static str,
+) -> (Vec<Vec<BsweepCell>>, BsweepRing4Detail) {
+    let models = super::ONNX_MODELS
+        .get()
+        .expect("ONNX models must be loaded by the benchmark");
+    let mut grid = Vec::with_capacity(SWEEP_BS.len());
+    let mut decisive_ring4 = None;
+    for &b in &SWEEP_BS {
+        // Every B-buffer is the FIRST B streaming-layout frames from speech
+        // onset (flush-boundary duplicates included) — the pinned geometry
+        // (the caller passes the grid's path label: shared vs fresh VAD).
+        let mut ctx = BsweepCellContext::new();
+        let mut cells = Vec::with_capacity(SWEEP_POSITIONS.len());
+        for &pos in &SWEEP_POSITIONS {
+            if b > mel.len() || pos >= b {
+                // B exceeds the streaming-layout mel length, or the position is
+                // outside the [0..B) window → unmeasurable.
+                cells.push(BsweepCell::unmeasurable(b, pos, geometry));
+                continue;
+            }
+            let cell = bsweep_score_cell(
+                models, mel, pos, b, classifier, verifier, &mut ctx, epsilon, geometry,
+            );
+            if b == DECISIVE_B && pos == DECISIVE_POS {
+                // Propagate the cell's verifier Option: a measurable cell with
+                // ring < 4 (mid-grid embedding failure) stays NOT-evaluated
+                // (JSON null), never a plausible-looking 0.0.
+                decisive_ring4 = Some((
+                    cell.verifier_ring4,
+                    cell.verifier_windows.clone(),
+                    cell.verifier_window_rf.clone(),
+                ));
+            }
+            cells.push(cell);
+        }
+        grid.push(cells);
+    }
+    (grid, decisive_ring4)
+}
+
+/// Run the F1 training-path (enrollment-side) variant scoring (mahbot-1022
+/// item 3b).  The training path is "post-AGC/VAD": AGC the raw F1 PCM, gate
+/// it with a FRESH detector, then augment the VAD-gated speech into the five
+/// variants (original / speed-down 0.95x / speed-up 1.05x conditional on the
+/// VAD-gated speech pre-pad ≥ 500 ms / vol-down −3 dB / pink noise SNR 25 dB
+/// seed 0) — mirroring [`vad_segment_and_enroll`]'s per-utterance augmentation.
+/// Each produced variant is embedded via the whole-utterance mel + stride-8
+/// embeddings path and scored full-sequence per window.  Returns one
+/// [`BsweepVariantTraining`] per produced variant (empty when no speech).
+fn bsweep_training_path_scores(
+    f1_pcm: &[f32],
+    classifier: &WakeWordClassifier,
+    verifier: &VoiceVerifier,
+) -> Vec<BsweepVariantTraining> {
+    let models = super::ONNX_MODELS
+        .get()
+        .expect("ONNX models must be loaded by the benchmark");
+    let agc = agc_pcm(f1_pcm);
+    if agc.is_empty() {
+        return Vec::new();
+    }
+    let mut detector = Detector::default();
+    let (_streaming_mel, speech_audio) = super::vad_gate_streaming_mel(&agc, |hop| {
+        super::is_speech_with_detector(hop, &mut detector, super::VAD_THRESHOLD)
+    });
+    if speech_audio.is_empty() {
+        return Vec::new();
+    }
+
+    // ── Augment the VAD-gated speech (vad_segment_and_enroll semantics) ──
+    // utterance index 0 (single F1 clip) → noise seed 0.
+    let utterance_idx = 0usize;
+    let speed_down =
+        crate::audio::tts_data_gen::speed_perturbation(&speech_audio, TARGET_SAMPLE_RATE, 0.95);
+    let pre_pad_duration_samples = speech_audio
+        .len()
+        .saturating_sub(2 * super::CONTEXT_PADDING_SAMPLES);
+    let pre_pad_duration_ms =
+        (pre_pad_duration_samples as u64 * 1000) / u64::from(TARGET_SAMPLE_RATE);
+    let speed_up = if pre_pad_duration_ms >= 500 {
+        Some(crate::audio::tts_data_gen::speed_perturbation(
+            &speech_audio,
+            TARGET_SAMPLE_RATE,
+            1.05,
+        ))
+    } else {
+        None
+    };
+    let volume_down = crate::util::apply_gain(&speech_audio, -3.0);
+    let noise = crate::util::add_noise(&speech_audio, 25.0, utterance_idx as u64);
+
+    // Variants in push order: original, speed-down, vol-down, noise, then
+    // speed-up chained LAST (conditional on VAD-gated pre-pad >= 500 ms).
+    // (The speed-up gate differs from the raw-level TTS pre-pad gate of
+    // item 3a — the produced-variant counts are reported per semantics.)
+    let variants: Vec<(String, Vec<f32>)> = [
+        ("original".to_string(), speech_audio.clone()),
+        ("speed_down".to_string(), speed_down),
+        ("vol_down".to_string(), volume_down),
+        ("noise".to_string(), noise),
+    ]
+    .into_iter()
+    .chain(speed_up.map(|sp| ("speed_up".to_string(), sp)))
+    .collect();
+
+    let mut results = Vec::with_capacity(variants.len());
+    for (variant_label, variant_pcm) in variants {
+        match super::compute_mel_spectrogram(models, &variant_pcm) {
+            Ok(mel_frames) => match super::embeddings_from_mel_frames(models, &mel_frames) {
+                Ok(embeddings) if !embeddings.is_empty() => {
+                    let (scores, v_scores, max_rs) =
+                        score_embedding_sequence_with(&embeddings, classifier, verifier);
+                    results.push(BsweepVariantTraining {
+                        variant: variant_label,
+                        produced: true,
+                        n_windows: scores.len(),
+                        per_window_classifier: scores,
+                        per_window_verifier: v_scores,
+                        max_rolling_sum: max_rs,
+                    });
+                }
+                _ => results.push(BsweepVariantTraining {
+                    variant: variant_label,
+                    produced: false,
+                    n_windows: 0,
+                    per_window_classifier: Vec::new(),
+                    per_window_verifier: Vec::new(),
+                    max_rolling_sum: 0.0,
+                }),
+            },
+            Err(_) => results.push(BsweepVariantTraining {
+                variant: variant_label,
+                produced: false,
+                n_windows: 0,
+                per_window_classifier: Vec::new(),
+                per_window_verifier: Vec::new(),
+                max_rolling_sum: 0.0,
+            }),
+        }
+    }
+    results
+}
+
+/// Same-run F1 streaming classifier score at the sanity anchor (mahbot-1022
+/// item 5): the F1 training-clip comparison's streaming-side window with
+/// start 3, else real_frames == 76, else the largest-real-frame window.
+fn bsweep_sanity_anchor_score(same_audio: &Mahbot1012Report) -> Option<f32> {
+    let cmp = same_audio
+        .training_clip_comparisons
+        .iter()
+        .find(|c| c.label == "F1.json_enroll0")?;
+    let streaming = &cmp.streaming;
+    let idx = streaming
+        .window_start
+        .iter()
+        .position(|&s| s == 3)
+        .or_else(|| {
+            streaming
+                .real_frames
+                .iter()
+                .position(|&r| r == super::EMBEDDING_WINDOW_FRAMES)
+        })
+        .or_else(|| {
+            streaming
+                .real_frames
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, r)| r)
+                .map(|(i, _)| i)
+        })?;
+    streaming.classifier_scores.get(idx).copied()
+}
+
+/// Window-granularity consistency check (mahbot-1022 item 1): cross-check the
+/// sweep's recomputed shared-path mel window structure against the same-run F1
+/// streaming trajectory's recorded windows.
+///
+/// Pass criterion: for every recorded FULL-LENGTH window (recorded geometry
+/// `true_sliding`, i.e. the window spans the full 76-frame embedding window),
+/// expected real frames = `min(shared_mel_len - start, 76)` and agree =
+/// `|recorded - expected| <= 3` (the flush-duplicate range).  Pass = all
+/// comparable windows agree AND at least one comparable window exists.
+///
+/// Short-buffer / trimmed-buffer windows (`padded_fallback`, `cold_start_tiled`
+/// — recorded real frames < 76) are INFORMATIONAL: their recorded real-frame
+/// count reflects the streaming buffer state AT SCORING TIME (the growing
+/// short-buffer fallback, or a post-trim re-score with buffer-relative
+/// starts), which the sweep's one-shot recomputed full mel cannot reproduce.
+/// They never force `pass = false` — that is the legitimate run-position VAD
+/// divergence the criterion tolerates (the sweep recomputes the shared mel
+/// AFTER Phase 8b, advancing the shared detector).
+fn bsweep_cross_check(same_audio: &Mahbot1012Report, shared_mel_len: usize) -> serde_json::Value {
+    let f1_cmp = same_audio
+        .training_clip_comparisons
+        .iter()
+        .find(|c| c.label == "F1.json_enroll0");
+    let mut windows = Vec::new();
+    let mut n_comparable = 0usize;
+    let mut n_agreeing = 0usize;
+    let mut all_agree = true;
+    if let Some(cmp) = f1_cmp {
+        let streaming = &cmp.streaming;
+        for i in 0..streaming.window_start.len() {
+            let recorded_start = streaming.window_start[i];
+            let recorded_rf = streaming.real_frames.get(i).copied().unwrap_or(0);
+            let recorded_geometry = streaming.geometry.get(i).copied().unwrap_or("");
+            // Full-length window = the full 76-frame embedding window
+            // (true_sliding geometry; the rf == 76 fallback covers a missing
+            // geometry label).  Everything else is a short/trimmed-buffer
+            // window the recomputed full mel cannot verify.
+            let comparable = recorded_geometry == "true_sliding"
+                || recorded_rf >= super::EMBEDDING_WINDOW_FRAMES;
+            let expected_rf = shared_mel_len
+                .saturating_sub(recorded_start)
+                .min(super::EMBEDDING_WINDOW_FRAMES);
+            let delta = recorded_rf.abs_diff(expected_rf);
+            let agree = comparable && delta <= BSWEEP_CROSS_CHECK_TOLERANCE;
+            if comparable {
+                n_comparable += 1;
+                if delta <= BSWEEP_CROSS_CHECK_TOLERANCE {
+                    n_agreeing += 1;
+                } else {
+                    all_agree = false;
+                }
+            }
+            windows.push(serde_json::json!({
+                "recorded_start": recorded_start,
+                "recorded_real_frames": recorded_rf,
+                "recorded_geometry": recorded_geometry,
+                "expected_real_frames": expected_rf,
+                "delta_frames": delta,
+                "comparable": comparable,
+                "agree": agree,
+                "note": if comparable {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(
+                        "short-buffer/trimmed-buffer window — recorded rf reflects \
+                         the buffer state at scoring time (growing/padded geometry \
+                         or post-trim buffer-relative starts), which the recomputed \
+                         full mel cannot reproduce; informational only"
+                    )
+                },
+            }));
+        }
+    }
+    let pass = n_comparable > 0 && all_agree;
+    serde_json::json!({
+        "method": "window-granularity real-frame agreement vs the same-run F1 \
+                   streaming trajectory",
+        "criterion": "per recorded FULL-LENGTH (true_sliding) window: expected real \
+                      frames = min(shared_mel_len - start, 76); agree = \
+                      |recorded - expected| <= 3 (flush-duplicate range).  Pass = \
+                      all comparable windows agree (and >= 1 comparable).  \
+                      Short-buffer / trimmed-buffer windows are informational.",
+        "shared_mel_len": shared_mel_len,
+        "n_recorded_windows": windows.len(),
+        "n_comparable_windows": n_comparable,
+        "n_agreeing_windows": n_agreeing,
+        "pass": pass,
+        "windows": windows,
+        "note": "Same-run trajectory (Phase 8b) vs the sweep's post-Phase-8b \
+                 recomputed shared-path mel.  Run-position-dependent shared VAD \
+                 state can legitimately shift the recomputed mel length; a \
+                 divergent length shows up as |delta| > 3 on the full-length \
+                 windows and flags pass=false with the per-window table for \
+                 inspection.",
+    })
+}
+
+/// Trailing post-trim family (mahbot-1022 item 13): the same-run F1
+/// streaming trajectory's maximal suffix with `real_frames >= 50` — the
+/// window-start set is READ FROM THE RUN, not assumed.
+fn bsweep_trailing_post_trim(same_audio: &Mahbot1012Report) -> serde_json::Value {
+    let f1_cmp = same_audio
+        .training_clip_comparisons
+        .iter()
+        .find(|c| c.label == "F1.json_enroll0");
+    let mut windows = Vec::new();
+    if let Some(cmp) = f1_cmp {
+        let streaming = &cmp.streaming;
+        let mut start_idx = streaming.real_frames.len();
+        while start_idx > 0 && streaming.real_frames[start_idx - 1] >= 50 {
+            start_idx -= 1;
+        }
+        for i in start_idx..streaming.real_frames.len() {
+            windows.push(serde_json::json!({
+                "window_start": streaming.window_start.get(i),
+                "real_frames": streaming.real_frames.get(i),
+                "classifier_score": streaming.classifier_scores.get(i),
+                "verifier_score": streaming.verifier_scores.get(i),
+            }));
+        }
+    }
+    serde_json::json!({
+        "geometry": "trailing-post-trim",
+        "windows": windows,
+        "note": "Maximal suffix of the same-run F1 streaming trajectory with \
+                 real_frames >= 50.  Window-start set is READ FROM THE RUN, not assumed.",
+    })
+}
+
+/// Verdict helper (mahbot-1022 item 3a): `(confirm_count, measurable_count,
+/// passed)` from per-variant confirms where `None` = unmeasurable (mel < 68).
+/// 4-of-5 over the measurable variants: at least 4 measurable AND at least 4
+/// confirmed (fewer than 4 measurable variants cannot reach 4 confirms).
+fn bsweep_verdict_passes(confirms: &[Option<bool>]) -> (usize, usize, bool) {
+    let confirm_count = confirms.iter().filter(|c| c.is_some_and(|v| v)).count();
+    let measurable_count = confirms.iter().filter(|c| c.is_some()).count();
+    let passed = confirm_count >= 4 && measurable_count >= 4;
+    (confirm_count, measurable_count, passed)
+}
+
+/// Same-run negatives verifier extraction (mahbot-1022 item 4): gate crossing
+/// = any frame with `per_frame_scores[i][ROLLING_SUM_IDX] >=
+/// MIN_CLASSIFIER_THRESHOLD`.  Reports total negatives, gate-crossing count,
+/// and per crossing the first-crossing-frame verifier value +
+/// per-variant peak verifier value.  Labeled same-run.
+fn negative_verifier_extraction(all_neg_pv: &[(&PerVariantResult, String)]) -> serde_json::Value {
+    let mut crossings = Vec::new();
+    let mut per_variant_peak = Vec::new();
+    let mut gate_crossing_count = 0usize;
+    for (pv, category) in all_neg_pv {
+        let first_crossing_idx = pv
+            .per_frame_scores
+            .iter()
+            .position(|frame| frame[ROLLING_SUM_IDX] >= MIN_CLASSIFIER_THRESHOLD);
+        if let Some(idx) = first_crossing_idx {
+            gate_crossing_count += 1;
+            let first_crossing_verifier = pv
+                .verifier_score_trajectory
+                .get(idx)
+                .copied()
+                .unwrap_or(0.0);
+            crossings.push(serde_json::json!({
+                "variant": pv.variant,
+                "category": category,
+                "first_crossing_frame_idx": idx,
+                "first_crossing_verifier_value": first_crossing_verifier,
+                "peak_verifier_value": pv.verifier_score,
+            }));
+        }
+        per_variant_peak.push(serde_json::json!({
+            "variant": pv.variant,
+            "category": category,
+            "peak_verifier_value": pv.verifier_score,
+        }));
+    }
+    serde_json::json!({
+        "note": "Same-run negatives (Phase 9-14): gate crossing = any frame with \
+                 rolling_sum >= MIN_CLASSIFIER_THRESHOLD (2.13).  Prior run: 9/59.",
+        "total_negatives": all_neg_pv.len(),
+        "gate_crossing_count": gate_crossing_count,
+        "per_crossing": crossings,
+        "per_variant_peak_verifier": per_variant_peak,
+    })
+}
+
+fn bsweep_cell_to_json(cell: &BsweepCell) -> serde_json::Value {
+    serde_json::json!({
+        "b": cell.b,
+        "position": cell.position,
+        "measurable": cell.measurable,
+        "classifier_score": cell.classifier_score,
+        "verifier_ring4": cell.verifier_ring4,
+        "verifier_windows": cell.verifier_windows,
+        "verifier_window_rf": cell.verifier_window_rf,
+        // Raw buffer length == B (the slice [position..b] is taken from the
+        // exactly-B streaming-layout buffer); emitted explicitly so every cell
+        // row carries the ticket's raw-buffer-length field without a separate
+        // drifiable struct field.
+        "raw_buffer_len": cell.b,
+        "true_unique_bit_exact": cell.true_unique_bit_exact,
+        "true_unique_tolerance": cell.true_unique_tolerance,
+        // Explicit divergence flag (mahbot-1022 item 1): when the two dedup
+        // definitions disagree on a confirm() outcome's true-unique count,
+        // the divergence is flagged here rather than silently choosing one.
+        "dedup_definitions_disagree": cell.measurable
+            && cell.true_unique_bit_exact != cell.true_unique_tolerance,
+        "max_rolling_sum": cell.max_rolling_sum,
+        "geometry": cell.geometry,
+    })
+}
+
+/// Run the full B-sweep measurement (mahbot-1022).  Returns `None` when the
+/// F1 training clip (`"F1.json_enroll0"`) is absent from `train_clips`.
+#[expect(clippy::too_many_lines)]
+fn run_bsweep(
+    train_clips: &[(Vec<f32>, String)],
+    classifier: &WakeWordClassifier,
+    verifier: &VoiceVerifier,
+    same_audio: &Mahbot1012Report,
+) -> Option<BsweepReport> {
+    let start = Instant::now();
+
+    // ── 1. Locate F1 by label ─────────────────────────────────────────────
+    let (f1_pcm, _f1_label) = train_clips.iter().find(|(_, l)| l == "F1.json_enroll0")?;
+
+    // ── 2. Mel length validation on BOTH paths (early) ────────────────────
+    // Primary path = SHARED detector (faithful to the live pipeline);
+    // dual-report FRESH path because measurability differs (analysis:
+    // fresh ~57-58 < 68, shared >= 79).
+    let (shared_mel, shared_len) = bsweep_streaming_mel(f1_pcm, true);
+    let (fresh_mel, fresh_len) = bsweep_streaming_mel(f1_pcm, false);
+    eprintln!(
+        "  B-sweep: F1 streaming-layout mel — shared detector: {shared_len} frames, fresh detector: {fresh_len} frames"
+    );
+    let decisive_cell_measurable_shared = DECISIVE_B <= shared_len;
+    let decisive_cell_measurable_fresh = DECISIVE_B <= fresh_len;
+
+    // ── 3. Dedup: boundary-frame difference distribution (shared mel) ─────
+    let mut boundary_dists: Vec<f32> = shared_mel
+        .windows(2)
+        .map(|w| frame_relative_l2(&w[0], &w[1]))
+        .collect();
+    let (dedup_epsilon, dedup_epsilon_rule) = derive_dedup_epsilon(&mut boundary_dists);
+    let dist_min = boundary_dists.first().copied().unwrap_or(0.0);
+    let dist_median = boundary_dists
+        .get(boundary_dists.len() / 2)
+        .copied()
+        .unwrap_or(0.0);
+    let dist_max = boundary_dists.last().copied().unwrap_or(0.0);
+
+    // ── 4. Primary F1 grid (shared path) ──────────────────────────────────
+    let (grid, decisive_ring4) = bsweep_score_grid(
+        &shared_mel,
+        classifier,
+        verifier,
+        dedup_epsilon,
+        "streaming-layout-first-B",
+    );
+    // Dual-report the FRESH-path grid when the VAD path changes whether the
+    // decisive (B=68, position 24) cell is measurable.  The verdict uses the
+    // shared path; the fresh grid is a labeled comparison (cells with B >
+    // fresh_len are UNMEASURABLE).
+    let (fresh_grid, _fresh_ring4) = bsweep_score_grid(
+        &fresh_mel,
+        classifier,
+        verifier,
+        dedup_epsilon,
+        "streaming-layout-first-B-fresh-vad",
+    );
+
+    // ── 5. F1 raw-level variants (item 3a) ────────────────────────────────
+    // `pcm_augment_enrollment_variants` produces original / speed-down /
+    // speed-up (conditional, >= 500 ms) / vol-down / pink-noise (SNR 25 dB,
+    // seed = clip index 0) at the RAW level — the same PCM-level augment set
+    // the detection test uses (mahbot-932 Fix 5 semantics).
+    let f1_variants =
+        pcm_augment_enrollment_variants(&[(f1_pcm.clone(), "F1.json_enroll0".to_string())]);
+    let verifier_threshold = verifier.threshold;
+    let b68_grid_idx = SWEEP_BS
+        .iter()
+        .position(|&b| b == DECISIVE_B)
+        .expect("DECISIVE_B in SWEEP_BS");
+    let pos24_cell_idx = SWEEP_POSITIONS
+        .iter()
+        .position(|&p| p == DECISIVE_POS)
+        .expect("DECISIVE_POS in SWEEP_POSITIONS");
+    let mut variants_raw = Vec::new();
+    let mut confirms: Vec<Option<bool>> = Vec::new();
+    let mut unmeasurable_variants = Vec::new();
+    for (variant_pcm, variant_label) in &f1_variants {
+        // Each variant recomputes its streaming-layout mel via the SHARED
+        // detector (part of the disclosed shared-detector drift).
+        let (variant_mel, variant_mel_len) = bsweep_streaming_mel(variant_pcm, true);
+        let (variant_grid, _variant_ring4) = bsweep_score_grid(
+            &variant_mel,
+            classifier,
+            verifier,
+            dedup_epsilon,
+            "streaming-layout-first-B",
+        );
+        let decisive_cell = &variant_grid[b68_grid_idx][pos24_cell_idx];
+        let confirm = if decisive_cell.measurable {
+            let cls_ok = decisive_cell
+                .classifier_score
+                .is_some_and(|s| s >= super::NO_MATCH_RESET_THRESHOLD);
+            let ver_ok = decisive_cell
+                .verifier_ring4
+                .is_some_and(|v| v >= verifier_threshold);
+            Some(cls_ok && ver_ok)
+        } else {
+            None
+        };
+        let b68_max_rolling_sum = variant_grid[b68_grid_idx]
+            .iter()
+            .map(|c| c.max_rolling_sum)
+            .fold(0.0_f32, f32::max);
+        if confirm.is_none() {
+            unmeasurable_variants.push(variant_label.clone());
+        }
+        confirms.push(confirm);
+        variants_raw.push(BsweepVariantRaw {
+            variant: variant_label.clone(),
+            mel_len: variant_mel_len,
+            confirm,
+            b68_pos24_classifier: decisive_cell.classifier_score,
+            b68_ring4_verifier_peak: decisive_cell.verifier_ring4,
+            b68_max_rolling_sum,
+            grid: variant_grid,
+        });
+    }
+    let (confirm_count, measurable_count, passed_4of5) = bsweep_verdict_passes(&confirms);
+
+    // ── 6. Training-path variants (item 3b) ───────────────────────────────
+    // Post-AGC/VAD training-path variants: AGC the F1 raw PCM, gate it with a
+    // FRESH detector, then augment the VAD-gated speech (original / speed-down
+    // / speed-up conditional on VAD-gated pre-pad ≥ 500 ms / vol-down / pink
+    // noise SNR 25 dB seed 0) — the exact vad_segment_and_enroll semantics.
+    // The produced-variant count per semantics differs from the raw-level
+    // variants in item 3a (raw TTS pre-pad gate vs VAD-gated speech gate).
+    let variants_training = bsweep_training_path_scores(f1_pcm, classifier, verifier);
+    eprintln!(
+        "  B-sweep: training-path variants produced: {}/5 (speed_up gate on VAD-gated speech)",
+        variants_training.iter().filter(|v| v.produced).count()
+    );
+
+    // ── 7. Sanity anchor (item 5) ─────────────────────────────────────────
+    // Read the same-run F1 streaming trajectory from the Phase 8b capture
+    // (this sweep runs AFTER Phase 8b, so the same-run VAD state applies).
+    let sanity_measured = bsweep_sanity_anchor_score(same_audio);
+    eprintln!(
+        "  B-sweep: sanity anchor — F1 streaming classifier {} (expected ~{BSWEEP_SANITY_EXPECTED})",
+        sanity_measured.map_or_else(|| "unavailable".to_string(), |m| format!("{m:.4}")),
+    );
+
+    // ── 8. Weights fingerprints (item 6) ──────────────────────────────────
+    let classifier_fingerprint = weights_fingerprint_classifier(classifier.weights_ref());
+    let verifier_fingerprint = weights_fingerprint_verifier(verifier);
+    eprintln!(
+        "  B-sweep: weights fingerprints — classifier {:.16}… verifier {:.16}… (verifier threshold {verifier_threshold:.4})",
+        &classifier_fingerprint[..16],
+        &verifier_fingerprint[..16],
+    );
+
+    // ── 9. Cross-check + trailing post-trim (items 12/13) ─────────────────
+    let cross_check = bsweep_cross_check(same_audio, shared_len);
+    let trailing_post_trim = bsweep_trailing_post_trim(same_audio);
+
+    let phase_ms = start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "  B-sweep: verdict path = shared detector; decisive cell measurable: shared={decisive_cell_measurable_shared}, fresh={decisive_cell_measurable_fresh}; confirms {confirm_count}/{measurable_count} → passed_4of5={passed_4of5}"
+    );
+    Some(BsweepReport {
+        phase_ms,
+        f1_mel_len_shared: shared_len,
+        f1_mel_len_fresh: fresh_len,
+        decisive_cell_measurable_shared,
+        decisive_cell_measurable_fresh,
+        dedup_epsilon,
+        dedup_epsilon_rule,
+        dedup_dist_min: dist_min,
+        dedup_dist_median: dist_median,
+        dedup_dist_max: dist_max,
+        grid,
+        fresh_grid,
+        decisive_ring4,
+        variants_raw,
+        variants_training,
+        confirm_count,
+        measurable_count,
+        passed_4of5,
+        unmeasurable_variants,
+        sanity_measured,
+        classifier_fingerprint,
+        verifier_fingerprint,
+        verifier_runtime_threshold: verifier_threshold,
+        cross_check,
+        trailing_post_trim,
+    })
+}
+
+impl BsweepReport {
+    /// Additive `bsweep` JSON section (mahbot-1022), merged with the
+    /// same-run negatives extract (`negatives`).
+    #[expect(
+        clippy::too_many_lines,
+        clippy::needless_pass_by_value,
+        reason = "negatives is a fresh extract moved into the report JSON at assembly"
+    )]
+    fn to_json(&self, negatives: serde_json::Value) -> serde_json::Value {
+        // Sweep grid rows: per-B with the cell array in position order.
+        let grid_rows = |rows: &[Vec<BsweepCell>], geometry: &str| {
+            SWEEP_BS
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| {
+                    let cells = rows.get(i).cloned().unwrap_or_default();
+                    serde_json::json!({
+                        "B": b,
+                        "geometry": geometry,
+                        "cells": cells.iter().map(bsweep_cell_to_json).collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let sweep_grid = grid_rows(&self.grid, "streaming-layout-first-B");
+        // Fresh-path dual-report grid (B > fresh mel length → UNMEASURABLE cells).
+        let fresh_grid = grid_rows(&self.fresh_grid, "streaming-layout-first-B-fresh-vad");
+
+        // Ring-4 detail at (B=68, position 24).  Outer None = decisive cell
+        // not measurable; inner None = ring < 4 → NOT evaluated (JSON null,
+        // never a zero-confidence 0.0).
+        let (ring4_value, per_window_scores, per_window_rf) = match &self.decisive_ring4 {
+            Some((Some(max), wins, fams)) => (
+                serde_json::json!(max),
+                serde_json::json!(wins),
+                serde_json::json!(fams),
+            ),
+            Some((None, _, _)) | None => (
+                serde_json::Value::Null,
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        };
+
+        // Per-variant raw sensitivity: B → { positions: [cells] }.
+        let variants_raw: Vec<serde_json::Value> = self
+            .variants_raw
+            .iter()
+            .map(|v| {
+                let mut sensitivity = serde_json::Map::new();
+                for (i, &b) in SWEEP_BS.iter().enumerate() {
+                    let cells = v.grid.get(i).cloned().unwrap_or_default();
+                    sensitivity.insert(
+                        b.to_string(),
+                        serde_json::json!({
+                            "positions": cells.iter().map(bsweep_cell_to_json).collect::<Vec<_>>(),
+                        }),
+                    );
+                }
+                serde_json::json!({
+                    "variant": v.variant,
+                    "mel_len": v.mel_len,
+                    "confirm": v.confirm,
+                    "B68_pos24_classifier": v.b68_pos24_classifier,
+                    "B68_ring4_verifier_peak": v.b68_ring4_verifier_peak,
+                    "max_rolling_sum_B68": v.b68_max_rolling_sum,
+                    "sensitivity": serde_json::Value::Object(sensitivity),
+                })
+            })
+            .collect();
+
+        let variants_training: Vec<serde_json::Value> = self
+            .variants_training
+            .iter()
+            .map(|v| {
+                serde_json::json!({
+                    "variant": v.variant,
+                    "produced": v.produced,
+                    "n_windows": v.n_windows,
+                    "per_window_classifier": v.per_window_classifier,
+                    "per_window_verifier": v.per_window_verifier,
+                    "max_rolling_sum": v.max_rolling_sum,
+                })
+            })
+            .collect();
+
+        let sanity_diverged = self
+            .sanity_measured
+            .is_some_and(|m| (m - BSWEEP_SANITY_EXPECTED).abs() > BSWEEP_SANITY_TOLERANCE);
+
+        serde_json::json!({
+            "note": "Static-gate (post-fix) condition measurement — NOT today's live \
+                     cold-pass behavior (bootstrap-contamination threshold inflation).  \
+                     Prior baseline is a 0/20 detection-failure run; this sweep does NOT \
+                     reproduce or validate it.  SINGLE-RUN CAVEAT: the verifier is \
+                     entropy-seeded (seed None, mahbot-1006 K), so absolute verifier \
+                     values in this section are run-specific and interpretable only via \
+                     the weights fingerprints below (item 6) — do not compare verifier \
+                     magnitudes across runs without first confirming the fingerprints.",
+            "phase_ms": self.phase_ms,
+            "f1_clip": "F1.json_enroll0",
+            "vad_path": {
+                "primary": "shared_detector",
+                "dual_report": "fresh_detector",
+                "f1_mel_len_shared": self.f1_mel_len_shared,
+                "f1_mel_len_fresh": self.f1_mel_len_fresh,
+                "decisive_cell_measurable_shared": self.decisive_cell_measurable_shared,
+                "decisive_cell_measurable_fresh": self.decisive_cell_measurable_fresh,
+                "drift_disclosure": "Verdict path uses the SHARED VAD detector (faithful \
+                                     to the live pipeline).  The sweep itself advances the \
+                                     shared VAD detector's internal state; Phase 9+ negative \
+                                     phases run after the sweep and therefore see VAD-state \
+                                     drift — accepted and documented per manager pin option b.",
+            },
+            "dedup": {
+                "metric": "relative_l2",
+                "epsilon": self.dedup_epsilon,
+                "epsilon_rule": self.dedup_epsilon_rule,
+                "boundary_frame_distance_distribution": {
+                    "min": self.dedup_dist_min,
+                    "median": self.dedup_dist_median,
+                    "max": self.dedup_dist_max,
+                },
+                "verdict_driving_definition": "tolerance",
+                "note": "Boundary-frame relative-L2 distances across the primary (shared) \
+                         streaming-layout mel sequence.  epsilon is derived from the largest \
+                         multiplicative gap (bimodal split) or 0.0 (tolerance ≡ bit-exact).  \
+                         The labeled primary dedup definition for the reported true-unique \
+                         counts is the tolerance definition (frame_relative_l2 <= epsilon).  \
+                         NOTE: confirm(variant) itself is purely score-based (classifier at \
+                         B=68/position 24 >= 0.316 AND ring-4 verifier peak >= threshold) and \
+                         never consumes the true-unique counts; the dedup definitions determine \
+                         the window-scoped true-unique frame counts (the real-frame band the \
+                         dependent implementation ticket uses), and the per-cell \
+                         'dedup_definitions_disagree' flag reports divergence between the two \
+                         definitions.",
+            },
+            "sweep_grid": sweep_grid,
+            "sweep_grid_fresh_vad_dual": fresh_grid,
+            "ring4": {
+                "B68_position24": {
+                    "ring4_value": ring4_value,
+                    "per_window_scores": per_window_scores,
+                    "per_window_rf": per_window_rf,
+                    "not_evaluated_convention": "verifier at ring < 4 is JSON null (not \
+                                                  evaluated) — NOT a zero-confidence reading",
+                },
+            },
+            "variants_augmentation": "Raw-level F1 variants via \
+                                      pcm_augment_enrollment_variants: original / \
+                                      speed-down (0.95x) / speed-up (1.05x, conditional on \
+                                      >= 500 ms) / vol-down (-3 dB) / pink noise (SNR 25 dB, \
+                                      seed = clip index 0).  Same augment set the detection \
+                                      test uses (mahbot-932 Fix 5 semantics).",
+            "variants_produced_counts": {
+                "raw_level_total": self.variants_raw.len(),
+                "raw_level_speed_up": self
+                    .variants_raw
+                    .iter()
+                    .filter(|v| v.variant.ends_with("_speed_up"))
+                    .count(),
+                "training_path_total": self
+                    .variants_training
+                    .iter()
+                    .filter(|v| v.produced)
+                    .count(),
+                "training_path_speed_up": self
+                    .variants_training
+                    .iter()
+                    .filter(|v| v.produced && v.variant == "speed_up")
+                    .count(),
+                "note": "Raw-level speed_up gate = raw TTS pre-pad >= 500 ms; \
+                         training-path speed_up gate = VAD-gated speech pre-pad >= 500 ms.  \
+                         The two counts can differ; the 4/5 verdict rule assumes 5 produced \
+                         variants, so the produced counts are stated explicitly.",
+            },
+            "training_path_note": "Training-path variants (item 3b) run with a FRESH \
+                                   detector: AGC F1 raw PCM -> vad_gate_streaming_mel \
+                                   (fresh detector) -> augment the VAD-gated speech \
+                                   (original / speed-down / speed-up conditional on VAD-gated \
+                                   pre-pad >= 500 ms / vol-down / pink noise SNR 25 dB \
+                                   seed 0) -> whole-utterance mel -> stride-8 embeddings -> \
+                                   parameter-passed full-sequence scoring (mirrors \
+                                   vad_segment_and_enroll semantics).",
+            "variants_raw": variants_raw,
+            "variants_training_path": variants_training,
+            "verdict": {
+                "classifier_threshold": f64::from(super::NO_MATCH_RESET_THRESHOLD),
+                "verifier_threshold": self.verifier_runtime_threshold,
+                "confirm_count": self.confirm_count,
+                "measurable_count": self.measurable_count,
+                "passed_4of5": self.passed_4of5,
+                "unmeasurable_variants": self.unmeasurable_variants,
+                "note": "confirm(variant) = classifier(B=68, position 24) >= 0.316 \
+                         (NO_MATCH_RESET_THRESHOLD compile-time constant) AND ring-4 \
+                         verifier peak >= runtime verifier.threshold.  Unmeasurable when \
+                         the variant's streaming-layout mel < 68 frames (decisive cell \
+                         UNMEASURABLE; sequence length reported).  passes = 4 of 5 \
+                         confirms over the measurable variants.",
+            },
+            "negatives": negatives,
+            "sanity_anchor": {
+                "expected_approx": BSWEEP_SANITY_EXPECTED,
+                "measured_classifier": self.sanity_measured,
+                "geometry": "streaming-layout-misaligned-start-3",
+                "divergence": sanity_diverged,
+                "note": "Same-run F1 streaming classifier score from the Phase 8b \
+                         training_clip_comparisons (window start 3 — the misaligned \
+                         76-real-frame window, DISTINCT from the trailing post-trim \
+                         family; fallback: real_frames 76, else largest-real-frame \
+                         window).  Divergence flag = |measured - expected| > 0.05.",
+            },
+            "weights_fingerprints": {
+                "classifier": {
+                    "sha256": self.classifier_fingerprint,
+                    "bytes_hashed": "sha2-256 over f32 LE bytes of weight vectors in field \
+                                     order conv1_weight..fc_bias + bn_eps + arch; BN running \
+                                     statistics INCLUDED; NO_MATCH_RESET_THRESHOLD is a \
+                                     compile-time constant (0.316), not hashed",
+                },
+                "verifier": {
+                    "sha256": self.verifier_fingerprint,
+                    "bytes_hashed": "sha2-256 over f32 LE bytes of conv_weight, conv_bias, \
+                                     fc_weight, fc_bias, then runtime-calibrated threshold",
+                    "runtime_threshold": self.verifier_runtime_threshold,
+                },
+            },
+            "cross_check": self.cross_check,
+            "trailing_post_trim": self.trailing_post_trim,
+        })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // The main integration test / benchmark entry point
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -4699,6 +5978,10 @@ pub(crate) fn run_internal() {
     // Declared here so the JSON report can emit it even when the classifier
     // is degenerate (the report then carries an empty/partial section).
     let mut same_audio = Mahbot1012Report::default();
+    // mahbot-1022: B-sweep measurement report (Phase 8c).  Declared here so
+    // the JSON report can emit a note even when the classifier is degenerate
+    // or the F1 clip is unavailable.
+    let mut bsweep_report: Option<BsweepReport> = None;
 
     if !degenerate {
         // Create a pre-warmed adaptive threshold state shared across all
@@ -4790,6 +6073,21 @@ pub(crate) fn run_internal() {
             &pos_metrics.per_variant,
             &cold_metrics.per_variant,
         );
+        // ── Phase 8c: B-sweep (mahbot-1022) — measurement only ────────────
+        // Static-gate condition measurement over the streaming-layout mel
+        // buffer length B (44..68) × in-buffer position (0/8/16/24) on the F1
+        // training clip and its raw-level variants.  Runs AFTER Phase 8b so
+        // the same-run F1 streaming trajectory (sanity anchor / cross-check /
+        // trailing post-trim) is available; the sweep advances the shared VAD
+        // detector (disclosed in the report — Phase 9+ negatives see drift).
+        // Guarded against a degenerate classifier by the enclosing
+        // `if !degenerate` block (line ~5979): when training produced an
+        // all-zero classifier, `bsweep_report` stays `None` and the report
+        // assembly emits the skip note instead.
+        let bsweep_start = Instant::now();
+        bsweep_report = run_bsweep(&train_clips, &classifier, &verifier, &same_audio);
+        let bsweep_ms = bsweep_start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("  B-sweep completed in {bsweep_ms:.0}ms");
         // ── Phase 9: Detection — Confusable phrases ──────────────────────
         phase_start!("Phase 9: Negative — confusable phrases");
         let confusable_variants = generate_phrase_variants_cached(
@@ -5883,6 +7181,16 @@ pub(crate) fn run_internal() {
             .collect(),
     );
 
+    // mahbot-1022: B-sweep section merged with the same-run negatives extract.
+    // Filled from the Phase 8c report when the classifier is non-degenerate
+    // and the F1 clip is present; otherwise a note explains the skip.
+    let bsweep_json = bsweep_report.as_ref().map_or_else(
+        || {
+            serde_json::json!({"note": "B-sweep skipped (degenerate classifier or F1 clip unavailable)"})
+        },
+        |r| r.to_json(negative_verifier_extraction(&all_neg_pv)),
+    );
+
     let json = serde_json::json!({
         "benchmark": "voice_pipeline_e2e",
         "_note": "Report-only benchmark — no pass/fail gating (mahbot-953). \
@@ -6028,6 +7336,7 @@ pub(crate) fn run_internal() {
         },
         "reproducibility": reproducibility,
         "mahbot1012": same_audio.to_json(),
+        "bsweep": bsweep_json,
         "config": {
             "num_enrollment_variants": NUM_ENROLLMENT_VARIANTS,
             "min_detection_rate": MIN_DETECTION_RATE,
@@ -6049,6 +7358,18 @@ pub(crate) fn run_internal() {
     // process ends, and a final ticket comment can cite exact numbers.
     if let Ok(report_dir) = crate::config::default_config_dir() {
         let report_path = report_dir.join("voice_pipeline_e2e_report.json");
+        // Preserve the prior report before overwrite (mahbot-1022 operational
+        // requirement): a prior run's report must survive the next run so
+        // cross-run analysis can diff the additive bsweep section.
+        if report_path.exists() {
+            let prior_path = report_dir.join("voice_pipeline_e2e_report.prior.json");
+            if let Err(e) = std::fs::copy(&report_path, &prior_path) {
+                warn!(
+                    "Could not preserve prior benchmark report to {}: {e}",
+                    prior_path.display()
+                );
+            }
+        }
         match std::fs::write(&report_path, json_text) {
             Ok(()) => info!("Benchmark report written to {}", report_path.display()),
             Err(e) => warn!(
@@ -6826,6 +8147,348 @@ fn localization_bucket_labels_are_stable() {
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), labels.len(), "bucket labels must be unique");
+}
+
+// ── mahbot-1022 B-sweep unit tests ─────────────────────────────────────────
+// Pin the pure measurement helpers (frame distances, dedup epsilon,
+// true-unique counting, ring-4 verifier windows, weight fingerprints,
+// negatives extraction, verdict rule).  The model-dependent sweep driver
+// itself is exercised by the full benchmark, not by these tests.
+
+#[test]
+#[expect(
+    clippy::float_cmp,
+    reason = "exact-zero frame distance is the pinned behavior"
+)]
+fn bsweep_frame_relative_l2_basics() {
+    let a = [1.0_f32, 2.0, 3.0];
+    // Identical → 0.
+    assert_eq!(frame_relative_l2(&a, &a), 0.0);
+    // Scaled (b = 2a) → relative distance ||a-b||/||b|| = 0.5 (small relative).
+    let scaled = [2.0_f32, 4.0, 6.0];
+    let rel = frame_relative_l2(&a, &scaled);
+    assert!(
+        (rel - 0.5).abs() < 1e-5,
+        "scaled → ~0.5 relative, got {rel}"
+    );
+    // Orthogonal → > 0 (sqrt(2) with unit denominators).
+    let orth = frame_relative_l2(&[1.0_f32, 0.0, 0.0], &[0.0, 1.0, 0.0]);
+    assert!(orth > 0.0, "orthogonal → > 0, got {orth}");
+    assert!((orth - std::f32::consts::SQRT_2).abs() < 1e-5);
+}
+
+#[test]
+#[expect(
+    clippy::float_cmp,
+    reason = "the uniform-no-split epsilon collapse to exactly 0.0 is the pinned behavior"
+)]
+fn bsweep_derive_dedup_epsilon_bimodal_vs_uniform() {
+    // Bimodal: duplicate cluster near 0.001, distinct cluster near 0.1.
+    let mut d1 = vec![0.0008_f32, 0.0009, 0.0010, 0.0012, 0.09, 0.11, 0.12];
+    let (eps, rule) = derive_dedup_epsilon(&mut d1);
+    // Sorted: 0.0008, 0.0009, 0.0010, 0.0012, 0.09, 0.11, 0.12.
+    // Ratios: 1.125, 1.111, 1.2, 75.0, 1.222, 1.091 → largest gap at
+    // 0.0012 → 0.09 (ratio 75 ≥ 2.0) → epsilon = sqrt(0.0012 * 0.09).
+    let expected = (0.0012_f32 * 0.09).sqrt();
+    assert!((eps - expected).abs() < 1e-6, "gap midpoint, got {eps}");
+    assert!(
+        rule.contains("bimodal"),
+        "rule must document the bimodal split"
+    );
+    // Uniform: no 2× gap → epsilon 0.0 (tolerance ≡ bit-exact).
+    let mut d2 = vec![0.01_f32, 0.011, 0.012, 0.013, 0.014, 0.015];
+    let (eps2, rule2) = derive_dedup_epsilon(&mut d2);
+    assert_eq!(eps2, 0.0);
+    assert!(
+        rule2.contains("bit-exact"),
+        "rule must state the bit-exact collapse"
+    );
+}
+
+#[test]
+#[expect(
+    clippy::float_cmp,
+    reason = "the isolated-zero no-split epsilon collapse to exactly 0.0 is pinned"
+)]
+fn bsweep_derive_dedup_epsilon_exact_zero_floor_does_not_collapse() {
+    // Regression: exact-zero distances (bit-identical frames) sit at the FLOOR
+    // of the duplicate cluster.  The old rule treated the 0 → first-nonzero
+    // boundary as an infinite gap, which always won AND produced a degenerate
+    // epsilon sqrt(0 * next) = 0 — collapsing the tolerance to bit-exact even
+    // when a clear bimodal split exists ABOVE the zeros (mahbot-1022 reviewer).
+    let mut d = vec![0.0_f32, 0.0, 0.0005, 0.0006, 0.09, 0.11];
+    let (eps, rule) = derive_dedup_epsilon(&mut d);
+    // Sorted: 0.0, 0.0, 0.0005, 0.0006, 0.09, 0.11.  Zero pairs are skipped;
+    // positive ratios: 0.0006/0.0005 = 1.2, 0.09/0.0006 = 150, 0.11/0.09 =
+    // 1.222 → largest gap at 0.0006 → 0.09 → epsilon = sqrt(0.0006 * 0.09).
+    let expected = (0.0006_f32 * 0.09).sqrt();
+    assert!(
+        (eps - expected).abs() < 1e-7,
+        "bimodal split above the zero floor, got {eps}"
+    );
+    assert!(rule.contains("bimodal"), "rule must stay bimodal");
+    assert!(
+        eps > 0.0,
+        "epsilon must NOT collapse to 0 on exact-zero distances"
+    );
+
+    // Isolated exact zero with no near-duplicate cluster → no split → bit-exact.
+    let mut d2 = vec![0.0_f32, 0.5, 0.51, 0.52];
+    let (eps2, rule2) = derive_dedup_epsilon(&mut d2);
+    assert_eq!(eps2, 0.0);
+    assert!(rule2.contains("bit-exact"));
+}
+
+#[test]
+fn bsweep_count_true_unique_duplicate_pair() {
+    // 5 frames: frame 1 and 2 are bit-identical duplicates; all others distinct.
+    let mel: Vec<Vec<f32>> = vec![
+        vec![0.0_f32; 32],
+        vec![0.5; 32],
+        vec![0.5; 32], // bit-identical duplicate of frame 1
+        vec![0.7; 32],
+        vec![0.9; 32],
+    ];
+    // Window [0..5): bit-exact → frame1 dup frame2; others distinct → 1 + 3 = 4.
+    let (bit, tol_bit) = count_true_unique(&mel, 0, 5, 0.0);
+    assert_eq!(bit, 4);
+    assert_eq!(tol_bit, bit, "epsilon == 0 → tolerance ≡ bit-exact");
+    // Tolerance eps = 0.5: frame0→1 (rel 1.0 > 0.5) distinct; 1→2 dup;
+    // 2→3 (rel ~0.286) dup; 3→4 (rel ~0.222) dup → 1 + 1 = 2.
+    let (_b, tol) = count_true_unique(&mel, 0, 5, 0.5);
+    assert_eq!(tol, 2);
+}
+
+/// A trained [`VoiceVerifier`] with zeroed weights — deterministic, input
+/// independent (sigmoid(fc_bias)) — for fingerprint/ring-4 tests.
+#[cfg(test)]
+fn test_bsweep_verifier(threshold: f32) -> VoiceVerifier {
+    use crate::audio::voice_verifier::VerifierActivation;
+    VoiceVerifier {
+        conv_weight: vec![0.0; 2 * 96 * 3],
+        conv_bias: vec![0.0; 2],
+        fc_weight: vec![0.0; 2],
+        fc_bias: vec![0.0; 1],
+        activation: VerifierActivation::LeakyReLU,
+        threshold,
+        trained: true,
+    }
+}
+
+#[test]
+fn bsweep_ring4_window_scores_two_windows() {
+    // Ring embeddings with a SINGLE nonzero dim (dim 0 = k+1) so the
+    // 288-dim L2-normalization keeps the expected sigmoid values tractable.
+    let mut ring: Vec<Vec<f32>> = Vec::new();
+    for k in 0..4 {
+        let mut emb = vec![0.0_f32; 96];
+        emb[0] = k as f32 + 1.0;
+        ring.push(emb);
+    }
+    // Untrained verifier → predict = 1.0 for every window.
+    let untrained = VoiceVerifier::untrained();
+    let (max, scores, fams) =
+        ring4_window_scores(&ring, &untrained, 68, &[0, 8, 16, 24]).expect("ring 4 → Some");
+    assert_eq!(scores.len(), 2, "ring 4 → two stride-1 windows");
+    assert_eq!(scores, vec![1.0, 1.0]);
+    assert!((max - 1.0).abs() < 1e-6);
+    // Real-frame families: window 0 = ring[0..3] at positions 0,8,16 → [68,60,52];
+    // window 1 = ring[1..4] at positions 8,16,24 → [60,52,44].
+    assert_eq!(fams[0], vec![68, 60, 52]);
+    assert_eq!(fams[1], vec![60, 52, 44]);
+
+    // Ring length != 4 → None (verifier NOT evaluated — never a 0.0 sentinel).
+    let short = vec![vec![0.0_f32; 96]; 3];
+    assert!(
+        ring4_window_scores(&short, &untrained, 68, &[0, 8, 16]).is_none(),
+        "ring < 4 → None"
+    );
+
+    // Trained verifier with a discriminating conv weight: window 0 (values
+    // 1,2,3) scores higher than window 1 (values 2,3,4) — sigmoid(5/(3√14))
+    // vs sigmoid(7/(3√29)); the max must be window 0's score.
+    let mut v = test_bsweep_verifier(0.86);
+    v.conv_weight[2] = 1.0; // channel 0, dim 0, kernel offset 2 → picks x[0][li+1]
+    v.fc_weight[0] = 1.0;
+    let (max, scores, _) =
+        ring4_window_scores(&ring, &v, 68, &[0, 8, 16, 24]).expect("ring 4 → Some");
+    assert_eq!(scores.len(), 2);
+    let w0 = 1.0 / (1.0 + (-(5.0_f32 / (3.0 * 14.0_f32.sqrt()))).exp());
+    let w1 = 1.0 / (1.0 + (-(7.0_f32 / (3.0 * 29.0_f32.sqrt()))).exp());
+    assert!(
+        (scores[0] - w0).abs() < 1e-5,
+        "window 0 = {w0}, got {}",
+        scores[0]
+    );
+    assert!(
+        (scores[1] - w1).abs() < 1e-5,
+        "window 1 = {w1}, got {}",
+        scores[1]
+    );
+    assert!(scores[0] > scores[1]);
+    assert!(
+        (max - scores[0]).abs() < 1e-6,
+        "max must be window 0's score"
+    );
+}
+
+#[test]
+fn bsweep_weights_fingerprints_deterministic_and_distinguishing() {
+    use crate::audio::wake_word_classifier::{ArchConfig, ClassifierWeights};
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let w1 = ClassifierWeights::from_rng(&mut rng, &ArchConfig::default());
+    // Deterministic.
+    assert_eq!(
+        weights_fingerprint_classifier(&w1),
+        weights_fingerprint_classifier(&w1)
+    );
+    // Different weights → different hash.
+    let mut w2 = w1.clone();
+    w2.fc_bias[0] += 0.01;
+    assert_ne!(
+        weights_fingerprint_classifier(&w1),
+        weights_fingerprint_classifier(&w2)
+    );
+    // BN running stats are part of the hash (item 6: INCLUDED).
+    let mut w3 = w1.clone();
+    w3.bn1_running_mean[0] += 0.1;
+    assert_ne!(
+        weights_fingerprint_classifier(&w1),
+        weights_fingerprint_classifier(&w3)
+    );
+
+    // Verifier: threshold included.
+    let v1 = test_bsweep_verifier(0.86);
+    let v2 = test_bsweep_verifier(0.5);
+    let h1 = weights_fingerprint_verifier(&v1);
+    assert_eq!(h1, weights_fingerprint_verifier(&v1), "deterministic");
+    assert_ne!(
+        h1,
+        weights_fingerprint_verifier(&v2),
+        "threshold must be hashed"
+    );
+    let h = weights_fingerprint_verifier(&v1);
+    assert_eq!(h.len(), 64, "sha2-256 hex digest");
+    assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
+}
+
+#[test]
+fn bsweep_negative_verifier_extraction_first_crossing_and_peak() {
+    // Crossing variant: verdict_test_pv defaults per_frame_scores to
+    // [[0.9, 2.2, 2.0]] — rolling sum 2.2 >= 2.13 → first crossing at frame 0.
+    let crossing = verdict_test_pv(false, 10, 1, true, None, 2.5, true, 0.7, true, 0.6);
+    // Non-crossing variant: override per_frame_scores below the gate.
+    let mut no_cross = verdict_test_pv(false, 10, 1, true, None, 1.0, false, 0.2, true, 0.6);
+    no_cross.per_frame_scores = vec![[0.1, 0.5, 5.0]];
+    no_cross.verifier_score_trajectory = vec![0.2];
+    let all: Vec<(&PerVariantResult, String)> = vec![
+        (&crossing, "confusable_easy".to_string()),
+        (&no_cross, "unrelated".to_string()),
+    ];
+    let json = negative_verifier_extraction(&all);
+    assert_eq!(json["total_negatives"], 2);
+    assert_eq!(json["gate_crossing_count"], 1);
+    let crossing_json = &json["per_crossing"][0];
+    assert_eq!(crossing_json["first_crossing_frame_idx"], 0);
+    // f32 0.7 serializes as f64::from(0.7f32) — compare in f64 space.
+    assert_eq!(
+        crossing_json["first_crossing_verifier_value"].as_f64(),
+        Some(f64::from(0.7_f32)),
+    );
+    assert_eq!(
+        crossing_json["peak_verifier_value"].as_f64(),
+        Some(f64::from(0.7_f32)),
+    );
+    // Per-variant peaks include both variants.
+    assert_eq!(
+        json["per_variant_peak_verifier"].as_array().map(Vec::len),
+        Some(2)
+    );
+}
+
+#[test]
+fn bsweep_verdict_passes_4of5_and_unmeasurable_fallback() {
+    // 5 measurable, 4 confirm → pass.
+    assert_eq!(
+        bsweep_verdict_passes(&[Some(true), Some(true), Some(true), Some(true), Some(false)]),
+        (4, 5, true),
+    );
+    // 5 measurable, 3 confirm → fail.
+    assert_eq!(
+        bsweep_verdict_passes(&[Some(true), Some(true), Some(true), Some(false), Some(false)]),
+        (3, 5, false),
+    );
+    // Unmeasurable fallback: 4 measurable (3 confirm + 1 reject) → 3 < 4 → fail.
+    assert_eq!(
+        bsweep_verdict_passes(&[Some(true), Some(true), Some(true), Some(false), None]),
+        (3, 4, false),
+    );
+    // Unmeasurable fallback: 4 measurable, all confirm → 4-of-4 measurable → pass.
+    assert_eq!(
+        bsweep_verdict_passes(&[Some(true), Some(true), Some(true), Some(true), None]),
+        (4, 4, true),
+    );
+    // All unmeasurable → fail.
+    assert_eq!(bsweep_verdict_passes(&[None; 5]), (0, 0, false));
+}
+
+#[test]
+fn bsweep_cross_check_scopes_pass_to_full_length_windows() {
+    // F1 trajectory (mirrors the prior-run shape): growing short-buffer
+    // windows (padded_fallback, 1-17 rf) + a full-length misaligned window at
+    // start 3 (true_sliding, 76 rf) + post-trim re-score windows over the
+    // trimmed buffer (padded_fallback, 68/60/52 rf).
+    let mut cmp = test_comparison(4, 0);
+    cmp.label = "F1.json_enroll0".to_string();
+    cmp.streaming.window_start = vec![0, 8, 3, 0];
+    cmp.streaming.real_frames = vec![10, 2, 76, 68];
+    cmp.streaming.geometry = vec![
+        "padded_fallback",
+        "padded_fallback",
+        "true_sliding",
+        "padded_fallback",
+    ];
+    let mut report = Mahbot1012Report::default();
+    report.training_clip_comparisons.push(cmp);
+
+    // Sweep recomputes a 79-frame shared mel: the start-3 full-length window
+    // expects min(79-3, 76) = 76 → agree.  The padded windows are
+    // informational and must NOT force pass=false (the structural-bug fix).
+    let json = bsweep_cross_check(&report, 79);
+    assert_eq!(
+        json["pass"], true,
+        "full-length window agrees, padded windows informational"
+    );
+    assert_eq!(json["n_comparable_windows"], 1);
+    assert_eq!(json["n_agreeing_windows"], 1);
+    let w3 = &json["windows"][2];
+    assert_eq!(w3["recorded_start"], 3);
+    assert_eq!(w3["expected_real_frames"], 76);
+    assert_eq!(w3["agree"], true);
+    let w_padded = &json["windows"][0];
+    assert_eq!(
+        w_padded["comparable"], false,
+        "short-buffer window is informational"
+    );
+    assert!(w_padded["note"].is_string());
+
+    // Divergent full-length window: the recomputed mel is only 74 frames →
+    // start-3 expects min(74-3, 76) = 71 vs recorded 76 → delta 5 → pass=false.
+    let json = bsweep_cross_check(&report, 74);
+    assert_eq!(
+        json["pass"], false,
+        "full-length divergence beyond ±3 flags pass"
+    );
+    assert_eq!(json["n_comparable_windows"], 1);
+    assert_eq!(json["n_agreeing_windows"], 0);
+    assert_eq!(json["windows"][2]["agree"], false);
+
+    // No F1 comparison → no comparable windows → pass=false (unverifiable).
+    let empty = Mahbot1012Report::default();
+    let json = bsweep_cross_check(&empty, 79);
+    assert_eq!(json["pass"], false);
+    assert_eq!(json["n_comparable_windows"], 0);
 }
 
 // ── Non-cached generation helpers (fallback when cache unavailable) ──────
