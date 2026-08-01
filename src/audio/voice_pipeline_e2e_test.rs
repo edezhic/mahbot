@@ -10,15 +10,31 @@
 //! * Negative — completely unrelated speech
 //! * Negative — silence and noise
 //!
-//! # Running as benchmark (recommended)
+//! # Running as benchmark (canonical — minimal feature set)
+//!
+//! The minimal invocation excludes the app binary from the build (the bin is
+//! gated behind the default-on `full` feature via `required-features` on
+//! `[[bin]]`, so `--no-default-features` skips its ~280 s fat-LTO link).
+//! This is the documented fast path for all bench runs (mahbot-1041):
 //!
 //! ```sh
-//! cargo bench --bench voice_pipeline_e2e
+//! cargo bench --no-default-features --features voice-tests --bench voice_pipeline_e2e
 //! ```
 //!
-//! The benchmark uses `[profile.bench]` (opt-level=3, fat LTO, codegen-units=1)
-//! for maximum performance.  First run populates the TTS audio cache
-//! (~14-17 min); subsequent runs complete in ~2-3 min.
+//! A full-feature run (builds the app binary too — much slower) is:
+//!
+//! ```sh
+//! cargo bench --features voice-tests --bench voice_pipeline_e2e
+//! ```
+//!
+//! NOTE (mahbot-1041): `[profile.bench]` (opt-level=3, fat LTO,
+//! codegen-units=1) is part of the classifier-fingerprint contract — the
+//! archived baseline anchor is `08c9c7b2c503bca943e2…`.  NEVER modify the
+//! profile: any codegen change invalidates all archived baselines and forces a
+//! full re-baseline.  The feature-set reduction above is structure-only.
+//!
+//! First run populates the TTS audio cache (~14-17 min); subsequent runs
+//! complete in ~36-38 s (bench body) plus the build time.
 //!
 //! # Requirements
 //!
