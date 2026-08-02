@@ -511,9 +511,7 @@ fn has_disallowed_redirect(segment: &str, state: &ValidationState) -> Result<(),
         // recognized as targeting /dev/null instead of being rejected.
         let after = &segment[i..].trim_start();
         let target = after
-            .split(|ch: char| {
-                ch.is_whitespace() || matches!(ch, '&' | ';' | '|' | ')' | '}')
-            })
+            .split(|ch: char| ch.is_whitespace() || matches!(ch, '&' | ';' | '|' | ')' | '}'))
             .next()
             .unwrap_or("");
 
@@ -1279,9 +1277,9 @@ fn heredoc_delimiter_of(w: &str) -> String {
 fn scratch_paths_under_temp(segment: &str, state: &ValidationState) -> bool {
     let paths = non_flag_path_args(segment);
     !paths.is_empty()
-        && paths
-            .iter()
-            .all(|p| resolve_path_word(p, state).is_some_and(|path| is_path_under_temp(&path, state.ctx)))
+        && paths.iter().all(|p| {
+            resolve_path_word(p, state).is_some_and(|path| is_path_under_temp(&path, state.ctx))
+        })
 }
 
 /// True when a temp mutator's path arguments all resolve under an allowed
@@ -1307,7 +1305,8 @@ fn cp_destination_under_temp(segment: &str, state: &ValidationState) -> bool {
 
     for flag in ["-t", "--target-directory"] {
         if let Some(val) = flag_value(rest, flag) {
-            return resolve_path_word(val, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
+            return resolve_path_word(val, state)
+                .is_some_and(|p| is_path_under_temp(&p, state.ctx));
         }
     }
     if let Some(val) = flag_value_equals(rest, "--target-directory=") {
@@ -1493,7 +1492,9 @@ fn apply_single_binding(name: &str, value: &str, state: &mut ValidationState) {
     } else {
         None
     };
-    let under_temp = resolved.as_ref().is_some_and(|p| is_path_under_temp(p, state.ctx));
+    let under_temp = resolved
+        .as_ref()
+        .is_some_and(|p| is_path_under_temp(p, state.ctx));
     state.vars[var as usize] = VarBinding {
         value: Some(
             resolved.map_or_else(|| clean.to_string(), |p| p.to_string_lossy().into_owned()),
@@ -1571,10 +1572,7 @@ const GIT_REMOTE_MUTATIONS: &[&str] = &[
 fn has_dry_run_token(command: &str) -> bool {
     command.split_whitespace().any(|w| {
         w == "--dry-run"
-            || (w.starts_with('-')
-                && !w.starts_with("--")
-                && w.len() > 1
-                && w[1..].contains('n'))
+            || (w.starts_with('-') && !w.starts_with("--") && w.len() > 1 && w[1..].contains('n'))
     })
 }
 
@@ -1584,10 +1582,7 @@ fn has_dry_run_token(command: &str) -> bool {
 fn has_force_token(command: &str) -> bool {
     command.split_whitespace().any(|w| {
         w == "--force"
-            || (w.starts_with('-')
-                && !w.starts_with("--")
-                && w.len() > 1
-                && w[1..].contains('f'))
+            || (w.starts_with('-') && !w.starts_with("--") && w.len() > 1 && w[1..].contains('f'))
     })
 }
 
@@ -1731,7 +1726,8 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
     }
 
     // git mktag always writes a tag object to the object database — no read-only mode.
-    if subcommand.starts_with("mktag") {        return reject(
+    if subcommand.starts_with("mktag") {
+        return reject(
             trimmed,
             "`git mktag` is not allowed — it always writes a tag object to the object database.",
             "use `git verify-tag` or `git cat-file` to inspect existing tag objects.",
@@ -2274,7 +2270,8 @@ fn has_base64_mutation(command: &str, state: &ValidationState) -> bool {
     // Check -o/--output flag values
     for flag in &["-o", "--output"] {
         if let Some(path) = flag_value(&parts, flag) {
-            return !resolve_path_word(path, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
+            return !resolve_path_word(path, state)
+                .is_some_and(|p| is_path_under_temp(&p, state.ctx));
         }
     }
 
@@ -3388,7 +3385,10 @@ mod tests {
             // Plain assignment segment poisons.
             ("TMPDIR=/etc\ntouch $TMPDIR/out", false),
             // Re-binding to a valid temp root clears the poison.
-            ("export TMPDIR=/etc\nexport TMPDIR=/tmp\ntouch $TMPDIR/out", true),
+            (
+                "export TMPDIR=/etc\nexport TMPDIR=/tmp\ntouch $TMPDIR/out",
+                true,
+            ),
             // Env-prefix rebind to temp clears.
             ("TMPDIR=/etc\nTMPDIR=/tmp touch $TMPDIR/out", true),
             // Binding TMP (initially unset) to temp enables it.

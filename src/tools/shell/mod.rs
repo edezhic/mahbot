@@ -2952,17 +2952,14 @@ mod tests {
             // double-quoted pipe preserved as one segment
             ("echo \"pipe | test\"", &["echo \"pipe | test\""]),
             // ── Newline as command separator ──────────────────────
-            ("touch /tmp/a\necho hi > /tmp/b", &["touch /tmp/a", "echo hi > /tmp/b"]),
+            (
+                "touch /tmp/a\necho hi > /tmp/b",
+                &["touch /tmp/a", "echo hi > /tmp/b"],
+            ),
             // Backslash-newline continuation joins the logical line.
-            (
-                "echo hello \\\nworld",
-                &["echo hello world"],
-            ),
+            ("echo hello \\\nworld", &["echo hello world"]),
             // Heredoc bodies are removed before segmentation (never commands).
-            (
-                "cat <<EOF\nbody\nEOF",
-                &["cat"],
-            ),
+            ("cat <<EOF\nbody\nEOF", &["cat"]),
             (
                 "cat <<EOF > /tmp/out\nbody\nEOF",
                 &["cat   > /tmp/out"], // `<<EOF` marker replaced by a space
