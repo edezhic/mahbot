@@ -460,10 +460,11 @@ impl ShellTool {
         let command_str = super::get_str(&args, "command")?;
 
         // Read-only mode: validate command before execution
-        if self.mode == ShellMode::ReadOnly
-            && let Err(rejection) = check_command(command_str)
-        {
-            anyhow::bail!("{rejection}");
+        if self.mode == ShellMode::ReadOnly {
+            let ctx = self::readonly::CheckContext::for_workspace(ws.as_path());
+            if let Err(rejection) = check_command(command_str, &ctx) {
+                anyhow::bail!("{rejection}");
+            }
         }
 
         // Execute with timeout to prevent hanging commands.
@@ -852,13 +853,20 @@ const fn track_char_context(
 }
 
 /// Split a shell command string into logical segments at shell operators.
-/// Respects single and double quotes.
+/// Respects single and double quotes, treats newlines as command separators
+/// (with backslash-newline line continuation), and removes heredoc bodies
+/// before splitting so body text is never treated as command text.
 fn extract_command_segments(command: &str) -> Vec<String> {
+    // Heredoc bodies are excluded from command scanning (see decision 10 of
+    // the read-only shell guard contract): body text must never be segmented
+    // as commands, and redirect operators inside bodies must not be scanned.
+    let scan = readonly::strip_heredoc_bodies(command);
+
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
     let mut in_double = false;
-    let mut chars = command.chars().peekable();
+    let mut chars = scan.chars().peekable();
 
     let mut flush = |current: &mut String| {
         if !current.trim().is_empty() {
@@ -874,10 +882,26 @@ fn extract_command_segments(command: &str) -> Vec<String> {
         // [`check_outside_quotes`], there is no need for an `escaped` flag
         // in the quote tracker; it only tracks single/double quote state.
         if c == '\\' && !in_single {
-            if let Some(next) = chars.next() {
-                current.push(next);
-            } else {
-                current.push(c); // trailing backslash preserved
+            match chars.next() {
+                // Backslash-newline: line continuation. Real shells join the
+                // logical line, so the newline is consumed without splitting
+                // and without emitting either character.
+                Some('\n') => continue,
+                // Preserve the backslash for quote/redirect-sensitive escapes
+                // (`\'`, `\"`, `\>`, `\<`, `\&`, `\|`, `\;`, `\$`, `` \` ``, `\\`)
+                // so downstream scans (per-segment redirect detection, quote
+                // tracking) can distinguish an escaped operator from a real one.
+                Some(next)
+                    if matches!(
+                        next,
+                        '\\' | '\'' | '"' | '>' | '<' | '&' | '|' | ';' | '$' | '`'
+                    ) =>
+                {
+                    current.push(c);
+                    current.push(next);
+                }
+                Some(next) => current.push(next),
+                None => current.push(c), // trailing backslash preserved
             }
             continue;
         }
@@ -889,6 +913,14 @@ fn extract_command_segments(command: &str) -> Vec<String> {
                     flush(&mut current);
                     continue;
                 }
+                // `>|` is a single compound redirect operator, not a pipe
+                // separator. Splitting at the `|` would leave a bare `>`
+                // segment that the redirect scanner misreads as a target-less
+                // redirect.
+                '|' if current.trim_end().ends_with('>') => {
+                    current.push(c);
+                    continue;
+                }
                 '|' => {
                     if chars.peek() == Some(&'|') {
                         chars.next();
@@ -896,7 +928,9 @@ fn extract_command_segments(command: &str) -> Vec<String> {
                     flush(&mut current);
                     continue;
                 }
-                ';' => {
+                // Newline as command separator: multi-line temp setup scripts
+                // must parse as separate commands.
+                '\n' | ';' => {
                     flush(&mut current);
                     continue;
                 }
@@ -2056,6 +2090,37 @@ mod tests {
                 command: "cd repo && git log --oneline",
                 stdout: "commit abc123\nAuthor: test\nDate:   Mon Jan 1\n\n    initial commit\n",
                 contains: &["commit", "Author"],
+                ..Default::default()
+            },
+            // ── Multi-line commands (newline = command separator) ─────────
+            // Decision 10 regression: newline splitting in the shared
+            // extract_command_segments changes is_chained, which disables
+            // standalone_only output transforms (compact_ls, cargo test state
+            // machine) for multi-line commands. Raw output must pass through.
+            ShellOutputCase {
+                name: "multi-line ls skips compact_ls (newline = chained)",
+                command: "ls -la\ncat README.md",
+                stdout: "total 8\n-rw-r--r--  1 user  group  2048 May 21 10:00 file.txt\n",
+                contains: &["total 8", "file.txt"],
+                not_contains: &["Summary:"],
+                ..Default::default()
+            },
+            ShellOutputCase {
+                name: "multi-line cargo test skips state machine",
+                command: "cargo test --lib\ncat notes.txt",
+                stdout: "Compiling foo v1.0.0\ntest test1 ... ok\ntest result: ok. 1 passed; 1 failed\n",
+                contains: &["Compiling foo", "test1 ... ok", "test result:"],
+                not_contains: &["[cargo test: ok]"],
+                ..Default::default()
+            },
+            // Heredoc bodies are removed before segmentation, so a heredoc
+            // command stays a single segment and keeps its profile (the cargo
+            // test state machine still applies — it is not skipped as chained).
+            ShellOutputCase {
+                name: "heredoc command stays single segment for profile selection",
+                command: "cargo test --lib <<EOF\nbody\nEOF",
+                stdout: "test test1 ... ok\ntest result: ok. 1 passed; 0 failed\n",
+                eq: Some("test result: ok. 1 passed; 0 failed"),
                 ..Default::default()
             },
             // ── npx-wrapped tools (profile selection) ─────────────────

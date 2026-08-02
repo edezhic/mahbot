@@ -168,6 +168,48 @@ fn skip_to_next_line(i: &mut usize, chars: &[(usize, char)]) {
     }
 }
 
+/// True when `<<` at byte index `i` (outside quotes) starts a heredoc whose
+/// body must be stripped. Recognizes bare (`<<EOF`, `<<-EOF`) and fd-prefixed
+/// (`3<<EOF`, `1<<-EOF`) heredocs.
+///
+/// `<<<` is a **herestring**, not a heredoc: it has no body to strip, and
+/// treating it as a heredoc would swallow everything after it — including a
+/// real workspace redirect on the same line (a live-reproduced guard bypass).
+fn is_heredoc_start(chars: &[(usize, char)], i: usize) -> bool {
+    let bare = chars[i].1 == '<' && chars.get(i + 1).is_some_and(|(_, c)| *c == '<');
+    let fd_prefixed = chars[i].1.is_ascii_digit()
+        && chars.get(i + 1).is_some_and(|(_, c)| *c == '<')
+        && chars.get(i + 2).is_some_and(|(_, c)| *c == '<');
+    if !bare && !fd_prefixed {
+        return false;
+    }
+    // Exclude herestrings: `<<<` (bare) and `{digit}<<<` (fd-prefixed).
+    let herestring_start = if fd_prefixed { i + 3 } else { i + 2 };
+    chars.get(herestring_start).is_none_or(|(_, c)| *c != '<')
+}
+
+/// True when the line starting at `line_start` is the heredoc terminator line
+/// for `delimiter`. For `<<-` heredocs, leading TABs are stripped before
+/// matching (bash semantics); for regular heredocs no leading whitespace is
+/// allowed. The delimiter must be followed by end-of-input, CR, or LF.
+fn heredoc_terminator_matches(
+    command: &str,
+    line_start: usize,
+    delimiter: &str,
+    strip_tabs: bool,
+) -> bool {
+    let rest = &command[line_start..];
+    let candidate = if strip_tabs {
+        rest.strip_prefix('\t').unwrap_or(rest)
+    } else {
+        rest
+    };
+    match candidate.strip_prefix(delimiter) {
+        Some(after) => after.is_empty() || after.starts_with('\r') || after.starts_with('\n'),
+        None => false,
+    }
+}
+
 /// Remove heredoc bodies so redirect operators inside them are not scanned.
 ///
 /// # Security invariant
@@ -178,6 +220,19 @@ fn skip_to_next_line(i: &mut usize, chars: &[(usize, char)]) {
 /// redirect operators) to be removed from the scan string, making
 /// [`has_disallowed_redirect`] miss the redirect.
 ///
+/// Two regions must REMAIN scanned so a write command cannot hide:
+/// - the tail of the delimiter line (`cat <<EOF > workspace_file` writes to
+///   `workspace_file` on the delimiter line itself), and
+/// - the line(s) after the terminator (a write command on the line following
+///   `EOF` must not escape scanning).
+///
+/// The heredoc marker itself is replaced with a space so the command string
+/// stays well-formed for redirect scanning and newline segmentation.
+///
+/// Multiple heredocs declared on the same delimiter line (`<<A <<B`) are
+/// tracked in declaration order; bodies are consumed in input order (bash
+/// reads heredoc bodies in the order the terminators appear).
+///
 /// # Known limitation (pre-existing, not addressed here)
 ///
 /// - Heredoc bodies that contain the delimiter within quotes are not detected
@@ -186,37 +241,120 @@ fn skip_to_next_line(i: &mut usize, chars: &[(usize, char)]) {
 ///   This can produce false negatives (allowing a dangerous redirect inside a
 ///   heredoc body whose delimiter appears inside quotes earlier in the body),
 ///   but such multi-line engineered inputs are unlikely in practice.
-fn strip_heredoc_bodies(command: &str) -> String {
-    let mut out = String::new();
-    let mut i = 0;
+#[allow(clippy::too_many_lines)] // security-critical heredoc state machine
+pub(super) fn strip_heredoc_bodies(command: &str) -> String {
+    let chars: Vec<(usize, char)> = command.char_indices().collect();
+    let mut out = String::with_capacity(command.len());
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
-    let chars: Vec<(usize, char)> = command.char_indices().collect();
+    let mut i = 0;
+
+    // Pending heredocs declared on the current delimiter line, in declaration
+    // order (delimiter, strip-tabs flag).
+    let mut queue: Vec<(String, bool)> = Vec::new();
+    // When true, the delimiter line is fully emitted and body lines are being
+    // skipped until the front of `queue` matches.
+    let mut skipping_body = false;
 
     while i < chars.len() {
-        // ── Escape + quote state tracking ──────────────────────────
-        // [`super::track_char_context`] handles both backslash escaping
-        // and quote state transitions, returning `false` when the
-        // character should not be examined for heredoc detection
-        // (escaped, backslash, quote char, or inside quotes). We still
-        // push all such characters to the output to preserve the command
-        // string for redirect scanning.
+        // ── Heredoc body skipping ─────────────────────────────────
+        // Skip whole lines until the line matches the front heredoc's
+        // terminator. The delimiter-line tail was already emitted.
+        if !queue.is_empty() && skipping_body {
+            let line_start = chars[i].0;
+            if heredoc_terminator_matches(command, line_start, &queue[0].0, queue[0].1) {
+                // Advance to the terminator's line ending so the newline is
+                // emitted as a command separator and the line AFTER the
+                // terminator remains scanned (a write command on the next
+                // line must not escape scanning).
+                i = chars
+                    .iter()
+                    .position(|(byte, _)| *byte > line_start + queue[0].0.len() - 1)
+                    .unwrap_or(chars.len());
+                queue.remove(0);
+                if queue.is_empty() {
+                    skipping_body = false;
+                }
+                continue;
+            }
+            skip_to_next_line(&mut i, &chars);
+            continue;
+        }
+
+        // ── Delimiter-line tail ──────────────────────────────────
+        // After the heredoc marker, the rest of the delimiter line remains
+        // scanned (a redirect on the delimiter line is a real write target),
+        // and additional `<<` on the same line start further heredocs.
+        if !queue.is_empty() {
+            if chars[i].1 == '\n' {
+                out.push('\n');
+                i += 1;
+                skipping_body = true;
+                continue;
+            }
+            if !super::track_char_context(chars[i].1, &mut in_single, &mut in_double, &mut escaped)
+            {
+                out.push(chars[i].1);
+                i += 1;
+                continue;
+            }
+            if is_heredoc_start(&chars, i) {
+                out.push(' ');
+                if chars[i].1.is_ascii_digit() {
+                    i += 1;
+                }
+                i += 2;
+                if i >= chars.len() {
+                    break; // dangling `<<` at end of input
+                }
+                while i < chars.len() && chars[i].1.is_whitespace() {
+                    i += 1;
+                }
+                let mut strip_tabs = false;
+                if i < chars.len() && chars[i].1 == '-' {
+                    strip_tabs = true;
+                    i += 1;
+                }
+                while i < chars.len() && chars[i].1.is_whitespace() {
+                    i += 1;
+                }
+                let (delimiter, delim_end) = parse_heredoc_delimiter(command, chars[i].0);
+                queue.push((delimiter, strip_tabs));
+                i = chars
+                    .iter()
+                    .position(|(byte, _)| *byte >= delim_end)
+                    .unwrap_or(chars.len());
+                continue;
+            }
+            out.push(chars[i].1);
+            i += 1;
+            continue;
+        }
+
+        // ── Normal scanning (with heredoc detection) ─────────────
         if !super::track_char_context(chars[i].1, &mut in_single, &mut in_double, &mut escaped) {
             out.push(chars[i].1);
             i += 1;
             continue;
         }
 
-        // ── Heredoc detection (only outside quotes) ────────────────
-        if i + 1 < chars.len() && chars[i].1 == '<' && chars[i + 1].1 == '<' {
+        if is_heredoc_start(&chars, i) {
             out.push(' ');
+            if chars[i].1.is_ascii_digit() {
+                i += 1; // fd-prefixed heredoc (`3<<EOF`)
+            }
             i += 2;
-            // Optional <<- (strip leading tabs from delimiter line)
+            if i >= chars.len() {
+                break; // dangling `<<` at end of input — nothing to strip
+            }
+            // Optional <<- (strip leading tabs from the terminator line)
+            let mut strip_tabs = false;
             while i < chars.len() && chars[i].1.is_whitespace() {
                 i += 1;
             }
             if i < chars.len() && chars[i].1 == '-' {
+                strip_tabs = true;
                 i += 1;
             }
             while i < chars.len() && chars[i].1.is_whitespace() {
@@ -224,33 +362,14 @@ fn strip_heredoc_bodies(command: &str) -> String {
             }
 
             let (delimiter, delim_end) = parse_heredoc_delimiter(command, chars[i].0);
+            queue.push((delimiter, strip_tabs));
+            // Advance past the delimiter token ONLY — the tail of the
+            // delimiter line remains scanned via the delimiter-line-tail
+            // mode above.
             i = chars
                 .iter()
                 .position(|(byte, _)| *byte >= delim_end)
                 .unwrap_or(chars.len());
-
-            // Skip rest of delimiter line
-            skip_to_next_line(&mut i, &chars);
-
-            // Skip body until a line equals the delimiter
-            while i < chars.len() {
-                let line_start = chars[i].0;
-                if command[line_start..].starts_with(&delimiter)
-                    && (command.len() == line_start + delimiter.len()
-                        || matches!(
-                            command.as_bytes().get(line_start + delimiter.len()),
-                            Some(b'\n' | b'\r')
-                        ))
-                {
-                    i = chars
-                        .iter()
-                        .position(|(byte, _)| *byte > line_start + delimiter.len())
-                        .unwrap_or(chars.len());
-                    skip_to_next_line(&mut i, &chars);
-                    break;
-                }
-                skip_to_next_line(&mut i, &chars);
-            }
             continue;
         }
 
@@ -280,72 +399,91 @@ fn parse_heredoc_delimiter(command: &str, start: usize) -> (String, usize) {
     (rest[..end].to_string(), start + end)
 }
 
-/// Detect output redirect operators in a command string, respecting quote state.
-/// Returns true if the command contains a redirect that writes to a
-/// non-allowed destination (not `/dev/null`, not temp dir).
-fn has_disallowed_redirect(command_str: &str) -> bool {
-    let scan_str = strip_heredoc_bodies(command_str);
+/// Detect output redirect operators in a segment, respecting quote state.
+/// Returns an `Err` (rejection message) if the segment contains a redirect
+/// that writes to a non-allowed destination (not `/dev/null`, not temp).
+///
+/// Runs per-segment so the redirect scan sees the tracked current directory
+/// and environment bindings at the segment's position in the command chain.
+/// The segment is expected to already be heredoc-stripped (see
+/// [`strip_heredoc_bodies`]). Command substitutions (`$(...)`, backticks) are
+/// skipped here — their contents are validated separately by
+/// [`scan_substitutions`], and re-scanning them would double-validate
+/// (e.g. a `2>/dev/null` inside a substitution would be misread with the
+/// substitution's closing delimiter attached to the target).
+fn has_disallowed_redirect(segment: &str, ctx: &CheckContext) -> Result<(), String> {
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
+    let bytes = segment.as_bytes();
 
-    // Use `char_indices()` for byte-accurate slicing of the original string
-    // and to fix the pre-existing multi-byte UTF-8 bug (the old `bytes[i] as
-    // char` approach produced garbage for non-ASCII characters).
-    //
-    // MUST use a `while let` loop — a `for` loop over the iterator is NOT
-    // suitable because multi-character redirect operators (>>, >|, >&, 2>,
-    // 2>&1, 1>&2) require manual iterator advancement to skip already-matched
-    // chars.  A `for` loop would double-count those chars on the next
-    // iteration.
-    let mut chars = scan_str.char_indices();
-
-    while let Some((i, c)) = chars.next() {
+    let mut i = 0;
+    while i < segment.len() {
+        let c = segment[i..].chars().next().expect("i < len");
         // [`super::track_char_context`] handles both backslash escaping
         // and quote state transitions, returning `false` when the
         // character should be skipped for redirect detection (escaped,
         // backslash, quote char, or inside quotes).
         if !super::track_char_context(c, &mut in_single, &mut in_double, &mut escaped) {
+            i += c.len_utf8();
+            continue;
+        }
+
+        // Skip command substitution contents (validated separately by
+        // [`scan_substitutions`]).
+        if c == '$' && bytes.get(i + 1) == Some(&b'(') {
+            let (_, next) = find_substitution_end(segment, i + 2);
+            i = next;
+            continue;
+        }
+        if c == '`' {
+            let (_, next) = find_backtick_end(segment, i + 1);
+            i = next;
             continue;
         }
 
         // Check for 2>&1 and 1>&2 — pure stderr-to-stdout merges, always
-        // allowed.  These are 4-character patterns; after matching we skip
-        // the remaining 3 chars with `nth(2)`.
-        if scan_str[i..].starts_with("2>&1") || scan_str[i..].starts_with("1>&2") {
-            chars.nth(2);
+        // allowed.  These are 4-character patterns.
+        if segment[i..].starts_with("2>&1") || segment[i..].starts_with("1>&2") {
+            i += 4;
             continue;
         }
 
         // 2-character redirect operators
-        let redirect_len = if scan_str[i..].starts_with(">&")
-            || scan_str[i..].starts_with(">>")
-            || scan_str[i..].starts_with(">|")
-            || scan_str[i..].starts_with("2>")
+        let redirect_len = if segment[i..].starts_with(">&")
+            || segment[i..].starts_with(">>")
+            || segment[i..].starts_with(">|")
+            || segment[i..].starts_with("2>")
         {
             2
         } else if c == '>' {
             1
         } else {
+            i += c.len_utf8();
             continue;
         };
+        i += redirect_len;
 
-        // Skip remaining chars of the redirect operator (first char already
-        // consumed by the `while let`).  For a 2-char operator, skip 1 more.
-        if redirect_len > 1 {
-            chars.next();
-        }
-
-        // Extract target after redirect operator
-        let after = &scan_str[i + redirect_len..].trim_start();
+        // Extract target after redirect operator. `)` and `}` terminate the
+        // target so a suppressed-stderr read inside a substitution
+        // (`2>/dev/null)`) or a brace-closed group (`2>/dev/null}`) is
+        // recognized as targeting /dev/null instead of being rejected.
+        let after = &segment[i..].trim_start();
         let target = after
-            .split(|ch: char| ch.is_whitespace() || ch == '&' || ch == ';' || ch == '|')
+            .split(|ch: char| {
+                ch.is_whitespace() || matches!(ch, '&' | ';' | '|' | ')' | '}')
+            })
             .next()
             .unwrap_or("");
 
         if target.is_empty() {
             // No target — bare redirect, reject
-            return true;
+            return Err(format!(
+                "⚠️ Read-only mode: command contains a disallowed output redirect.\n\
+                 Command: `{segment}`\n\
+                 Redirects are only allowed to /dev/null, 2>&1, 1>&2, or paths under /tmp, /var/tmp, or the OS temp directory.\n\
+                 Suggestion: pipe to a pager (e.g., `| less`) or use `| head` to limit output."
+            ));
         }
 
         // Allowed targets
@@ -353,20 +491,93 @@ fn has_disallowed_redirect(command_str: &str) -> bool {
             continue;
         }
 
-        let target_path = Path::new(target);
-        if target_path.is_absolute() {
-            if crate::tools::path::is_path_under_allowed_temp(target_path) {
-                continue;
-            }
-            // Absolute non-temp non-devnull = disallowed
-            return true;
+        let resolved = resolve_path_word(target, ctx);
+        let allowed = resolved.is_some_and(|path| is_path_under_temp(&path, ctx));
+        if !allowed {
+            // Absolute/relative non-temp non-devnull = disallowed
+            return Err(format!(
+                "⚠️ Read-only mode: command contains a disallowed output redirect.\n\
+                 Command: `{segment}`\n\
+                 Redirects are only allowed to /dev/null, 2>&1, 1>&2, or paths under /tmp, /var/tmp, or the OS temp directory.\n\
+                 Suggestion: pipe to a pager (e.g., `| less`) or use `| head` to limit output."
+            ));
         }
-
-        // Relative redirect to workspace = disallowed
-        return true;
     }
 
-    false
+    Ok(())
+}
+
+/// Resolve a path word against the validation context for the temp-root check.
+///
+/// Phase 1 semantics: literal absolute paths are resolved directly; relative
+/// paths resolve against the workspace root (so they are rejected as
+/// workspace writes, matching the historical behavior). Phase 2 extends this
+/// with shell-variable/quote/tilde expansion and tracked-CWD resolution,
+/// which is when the `Option` return becomes meaningful (expansion failures
+/// resolve to `None`).
+#[allow(clippy::unnecessary_wraps)] // phase 2 makes this fallible
+fn resolve_path_word(word: &str, ctx: &CheckContext) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(word);
+    if path.is_absolute() {
+        return Some(path);
+    }
+    // Relative paths are workspace-relative by default (initial CWD).
+    Some(ctx.workspace_root.join(word))
+}
+
+/// True when `path` is under one of the context's allowed temp roots.
+fn is_path_under_temp(path: &std::path::Path, ctx: &CheckContext) -> bool {
+    crate::tools::path::is_path_under_roots(path, &ctx.temp_roots)
+}
+
+/// Validation context for a read-only shell command: the workspace root and
+/// temp roots of the session being validated — never the daemon process's
+/// environment (see the guard contract, resolved decisions 6 and 9).
+#[derive(Debug, Clone)]
+pub(super) struct CheckContext {
+    /// Workspace root of the session being validated. Initial tracked CWD and
+    /// the reference against which workspace writes are detected.
+    workspace_root: std::path::PathBuf,
+    /// Allowed temp roots for scratch/temp writes. Defaults to the shared
+    /// path-root set; injectable in tests so a fixture workspace can be
+    /// hermetic (kept distinct from the temp roots).
+    temp_roots: Vec<std::path::PathBuf>,
+}
+
+impl CheckContext {
+    /// Context for a session rooted at `workspace_root` with the standard
+    /// OS temp roots.
+    pub(super) fn for_workspace(workspace_root: &Path) -> Self {
+        Self {
+            workspace_root: workspace_root.to_path_buf(),
+            temp_roots: crate::tools::path::allowed_temp_roots(),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(workspace_root: &Path, temp_roots: Vec<std::path::PathBuf>) -> Self {
+        Self {
+            workspace_root: workspace_root.to_path_buf(),
+            temp_roots,
+        }
+    }
+}
+
+/// Mutable state threaded through the validation of a single command string:
+/// the tracked current directory and temp-variable bindings. Phase 1 carries
+/// only the context; CWD tracking and export-poisoning bindings are added in
+/// phase 2.
+struct ValidationState<'a> {
+    ctx: &'a CheckContext,
+}
+
+impl ValidationState<'_> {
+    /// Snapshot of the current tracking state. Used for command substitutions,
+    /// which execute in a subshell: `cd`/export inside `$(...)` must not leak
+    /// to the outer command's tracking.
+    fn snapshot(&self) -> ValidationState<'_> {
+        ValidationState { ctx: self.ctx }
+    }
 }
 
 // ── Main validation function ──────────────────────────────────────────────
@@ -376,29 +587,136 @@ fn has_disallowed_redirect(command_str: &str) -> bool {
 /// Splits chained commands into segments, checks each segment against
 /// the allowlists and rejection rules, and returns `Ok(())` if the
 /// command is safe, or `Err(String)` with a descriptive rejection message.
-pub(super) fn check_command(command_str: &str) -> Result<(), String> {
+///
+/// Validation is scoped to the session being validated (workspace root +
+/// shell environment from `ctx`) — never the daemon process's environment.
+pub(super) fn check_command(command_str: &str, ctx: &CheckContext) -> Result<(), String> {
     let trimmed = command_str.trim();
     if trimmed.is_empty() {
         return Ok(());
     }
+    let mut state = ValidationState { ctx };
+    validate_string(trimmed, &mut state)
+}
 
-    // Redirect detection runs on the full command string to avoid
-    // segment splitting breaking compound operators like `>|`.
-    if has_disallowed_redirect(trimmed) {
-        return Err(format!(
-            "⚠️ Read-only mode: command contains a disallowed output redirect.\n\
-             Command: `{trimmed}`\n\
-             Redirects are only allowed to /dev/null, 2>&1, 1>&2, or paths under /tmp, /var/tmp, or the OS temp directory.\n\
-             Suggestion: pipe to a pager (e.g., `| less`) or use `| head` to limit output."
-        ));
-    }
+/// Validate a command string (which may contain heredocs, substitutions, and
+/// chained segments) against `state`.
+fn validate_string(s: &str, state: &mut ValidationState) -> Result<(), String> {
+    // Heredoc bodies must be removed before ANY scanning: a heredoc body is
+    // literal text — never commands, redirects, or substitutions. Bodies are
+    // also excluded from the shared segmentation (they never become segments).
+    let scan = strip_heredoc_bodies(s);
 
-    let segments = super::extract_command_segments(trimmed);
+    // Command substitutions (`$(...)`, backticks) are validated as nested
+    // commands so a mutating command hidden inside a substitution cannot
+    // bypass the guard (see the guard contract, phase 1.3).
+    scan_substitutions(&scan, state)?;
+
+    let segments = super::extract_command_segments(&scan);
     for segment in &segments {
-        check_segment(segment)?;
+        has_disallowed_redirect(segment, state.ctx)?;
+        check_segment(segment, state)?;
     }
 
     Ok(())
+}
+
+/// Validate command substitutions (`$(...)` and backticks) as nested commands.
+///
+/// Substitution contents are located with quote/escape awareness and run
+/// through the full command validation recursively (heredocs, redirects,
+/// nested substitutions, and mutator checks all apply inside a substitution).
+/// The nested validation runs against a snapshot of the state because a
+/// substitution executes in a subshell: `cd`/export inside `$(...)` does not
+/// affect the outer command.
+fn scan_substitutions(s: &str, state: &mut ValidationState) -> Result<(), String> {
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    while i < s.len() {
+        let c = s[i..].chars().next().expect("i < s.len()");
+        if !super::track_char_context(c, &mut in_single, &mut in_double, &mut escaped) {
+            i += c.len_utf8();
+            continue;
+        }
+        if c == '$' && s.as_bytes().get(i + 1) == Some(&b'(') {
+            let (inner, next) = find_substitution_end(s, i + 2);
+            validate_substitution_content(inner, state)?;
+            i = next;
+            continue;
+        }
+        if c == '`' {
+            let (inner, next) = find_backtick_end(s, i + 1);
+            validate_substitution_content(inner, state)?;
+            i = next;
+            continue;
+        }
+        i += c.len_utf8();
+    }
+    Ok(())
+}
+
+/// Find the matching close paren for a `$(` substitution whose content starts
+/// at byte `start`. Quote-aware and nesting-aware. Returns
+/// `(content, index_after_close)`. When unterminated, the rest of the string
+/// is returned as content (it still gets validated — fail-closed).
+fn find_substitution_end(s: &str, start: usize) -> (&str, usize) {
+    let bytes = s.as_bytes();
+    let mut depth = 1usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut i = start;
+    while i < s.len() {
+        let c = s[i..].chars().next().expect("i < s.len()");
+        if !super::track_char_context(c, &mut in_single, &mut in_double, &mut escaped) {
+            i += c.len_utf8();
+            continue;
+        }
+        if c == '(' && i > 0 && bytes[i - 1] == b'$' {
+            // Nested `$(` substitution
+            depth += 1;
+        } else if c == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return (&s[start..i], i + 1);
+            }
+        }
+        i += c.len_utf8();
+    }
+    (&s[start..], s.len())
+}
+
+/// Find the closing backtick for a command substitution starting at byte
+/// `start`. Handles `\`` escapes (POSIX backtick quoting). Returns
+/// `(content, index_after_close)`; unterminated backticks return the rest as
+/// content (validated anyway — fail-closed).
+fn find_backtick_end(s: &str, start: usize) -> (&str, usize) {
+    let mut i = start;
+    while i < s.len() {
+        let c = s[i..].chars().next().expect("i < s.len()");
+        if c == '\\' {
+            i += c.len_utf8();
+            if i < s.len() {
+                i += s[i..].chars().next().expect("i < s.len()").len_utf8();
+            }
+            continue;
+        }
+        if c == '`' {
+            return (&s[start..i], i + 1);
+        }
+        i += c.len_utf8();
+    }
+    (&s[start..], s.len())
+}
+
+/// Validate a substitution body as a nested command against a snapshot of the
+/// current state (substitutions run in a subshell — state changes don't leak
+/// to the outer command).
+fn validate_substitution_content(inner: &str, state: &mut ValidationState) -> Result<(), String> {
+    let mut snapshot = state.snapshot();
+    validate_string(inner, &mut snapshot)
 }
 
 /// Construct a read-only rejection error with consistent formatting.
@@ -426,7 +744,7 @@ const TEMP_MUTATORS: &[&str] = &[
 /// and the `predicate` returns true, the command is rejected with the given message.
 struct FlagCheck {
     verb: &'static str,
-    predicate: fn(&str) -> bool,
+    predicate: fn(&str, &CheckContext) -> bool,
     rejection: &'static str,
     suggestion: &'static str,
 }
@@ -499,14 +817,13 @@ const FLAG_CHECKS: &[FlagCheck] = &[
 /// - Combined redirect tokens (operator merged with target, no separate word
 ///   to skip): e.g. `>/dev/null`, `2>/dev/null`, `</dev/null`, `<<`/`<<-` heredocs,
 ///   `<&2`, `<>/tmp/file`, `&>/dev/null`, `&>>file`, `{digit}<<EOF`
-/// - Heredoc operators (`<<`, `<<-`, `{digit}<<`) and everything after them
-///   (delimiter, body, terminating delimiter).  **Limitation:** path arguments
-///   that appear after the heredoc terminator are not validated (e.g.
-///   `tee /tmp/a << 'EOF'\nbody\nEOF /etc/passwd`).  This is consistent with
-///   the best-effort security model documented in [`check_command`].
+/// - Heredoc operators (`<<`, `<<-`, `{digit}<<`) and their bodies, up to and
+///   including the terminating delimiter. Path arguments on the line AFTER the
+///   terminator are scanned again (the heredoc body ends at the terminator).
 ///
-///   The same conservative skip-everything-after-heredoc-operator applies to
-///   fd-prefixed heredocs (`3<<EOF`, `1<<-EOF`).
+///   In practice the segments passed here are already heredoc-stripped by
+///   [`strip_heredoc_bodies`], so body skipping is defensive; the reset at the
+///   terminator keeps the semantics correct if that ever changes.
 fn non_flag_path_args(segment: &str) -> Vec<String> {
     let words: Vec<&str> = segment.split_whitespace().collect();
     let Some(cmd_idx) = super::find_first_command_word_index(&words) else {
@@ -515,10 +832,20 @@ fn non_flag_path_args(segment: &str) -> Vec<String> {
 
     let mut args = Vec::new();
     let mut skip_redirect_target = false;
-    let mut in_heredoc_body = false;
+    // Delimiters of pending heredoc bodies (FIFO — bodies terminate in the
+    // order the heredocs were declared).
+    let mut heredoc_delims: Vec<String> = Vec::new();
 
     for w in &words[cmd_idx + 1..] {
-        if in_heredoc_body {
+        if !heredoc_delims.is_empty() {
+            // In a heredoc body: skip tokens until a line matches the front
+            // delimiter. The line after the terminator remains scanned.
+            if heredoc_delims
+                .first()
+                .is_some_and(|d| w.trim_end_matches('\r') == d.as_str())
+            {
+                heredoc_delims.remove(0);
+            }
             continue;
         }
 
@@ -536,8 +863,8 @@ fn non_flag_path_args(segment: &str) -> Vec<String> {
                 skip_redirect_target = needs_target;
                 continue;
             }
-            TokenKind::Heredoc => {
-                in_heredoc_body = true;
+            TokenKind::Heredoc { delimiter } => {
+                heredoc_delims.push(delimiter);
                 continue;
             }
             TokenKind::Regular => {}
@@ -564,16 +891,17 @@ fn is_digit_suffix_redirect(w: &str, op: u8) -> bool {
 }
 
 /// Result of classifying a whitespace-split shell token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TokenKind {
     /// Not a redirect or heredoc — pass through.
     Regular,
     /// A redirect operator.  When `needs_target`, the caller should skip
     /// the next whitespace-separated word (the redirect target).
     Redirect { needs_target: bool },
-    /// A heredoc start token (e.g. `<<EOF`, `<<-`, `<<<`).  The caller
-    /// should skip subsequent lines until the heredoc body ends.
-    Heredoc,
+    /// A heredoc start token (e.g. `<<EOF`, `<<-EOF`, `3<<EOF`). Carries the
+    /// parsed delimiter so the caller can skip the body and reset when the
+    /// terminator line is reached.
+    Heredoc { delimiter: String },
 }
 
 /// Classify a whitespace-split token as a shell redirect operator or heredoc.
@@ -622,11 +950,29 @@ fn classify_shell_token(w: &str) -> TokenKind {
         _ => {}
     }
 
-    // ── Heredoc detection ─────────────────────────────────────────
-    // Bare heredoc (<<EOF, <<-EOF, <<<) or fd-prefixed heredoc (3<<EOF, 1<<-EOF)
-    if w.starts_with("<<") || (w.len() > 2 && w.as_bytes()[0].is_ascii_digit() && w.contains("<<"))
+    // ── Herestrings (`<<<` / `{digit}<<<`) ────────────────────────
+    // A herestring has no body: it behaves like a redirect that consumes the
+    // next word as its content. Classifying it as a heredoc would make the
+    // caller skip everything after it — hiding a real redirect on the same
+    // line (a live-reproduced guard bypass).
+    if w.starts_with("<<<")
+        || (w.len() > 3 && w.as_bytes()[0].is_ascii_digit() && w.ends_with("<<<"))
     {
-        return TokenKind::Heredoc;
+        return TokenKind::Redirect { needs_target: true };
+    }
+
+    // ── Heredoc detection ─────────────────────────────────────────
+    // Bare heredoc (<<EOF, <<-EOF) or fd-prefixed heredoc (3<<EOF, 1<<-EOF).
+    // `<<<` (herestring) is excluded — it has no body.
+    if (w.starts_with("<<") && !w.starts_with("<<<"))
+        || (w.len() > 2
+            && w.as_bytes()[0].is_ascii_digit()
+            && w.contains("<<")
+            && !w.contains("<<<"))
+    {
+        return TokenKind::Heredoc {
+            delimiter: heredoc_delimiter_of(w),
+        };
     }
 
     // ── Standalone digit-prefixed redirect ────────────────────────
@@ -662,25 +1008,44 @@ fn classify_shell_token(w: &str) -> TokenKind {
     TokenKind::Regular
 }
 
-/// True when every explicit path argument is an absolute path under allowed temp.
-fn scratch_paths_under_temp(segment: &str) -> bool {
+/// Extract the delimiter from a heredoc token like `<<EOF`, `<<-EOF`, or
+/// `3<<EOF` (including quoted delimiters `<<'EOF'`, `<<"EOF"`).
+fn heredoc_delimiter_of(w: &str) -> String {
+    let start = w.find("<<").map_or(0, |i| i + 2);
+    let rest = &w[start..];
+    let rest = rest.strip_prefix('-').unwrap_or(rest);
+    let rest = rest.trim_start();
+    if let Some(quoted) = rest.strip_prefix('\'') {
+        if let Some(end) = quoted.find('\'') {
+            return quoted[..end].to_string();
+        }
+    } else if let Some(quoted) = rest.strip_prefix('"')
+        && let Some(end) = quoted.find('"')
+    {
+        return quoted[..end].to_string();
+    }
+    rest.trim_end().to_string()
+}
+
+/// True when every explicit path argument resolves under an allowed temp root.
+fn scratch_paths_under_temp(segment: &str, ctx: &CheckContext) -> bool {
     let paths = non_flag_path_args(segment);
     !paths.is_empty()
         && paths.iter().all(|p| {
-            let path = Path::new(p);
-            path.is_absolute() && crate::tools::path::is_path_under_allowed_temp(path)
+            resolve_path_word(p, ctx)
+                .is_some_and(|path| is_path_under_temp(&path, ctx))
         })
 }
 
 /// Check a single command segment for unsafe operations.
-fn check_segment(segment: &str) -> Result<(), String> {
+///
+/// `state` carries the tracked current directory and temp-variable bindings
+/// across segments (so `cd /tmp && touch f` resolves `f` against `/tmp`).
+fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), String> {
     let trimmed = segment.trim();
     if trimmed.is_empty() {
         return Ok(());
     }
-
-    // Note: redirect detection is done at the command level in check_command(),
-    // not per-segment, because compound operators like >| span segment boundaries.
 
     // Extract the effective command by stripping shell prefixes and
     // environment variable assignments.
@@ -698,7 +1063,7 @@ fn check_segment(segment: &str) -> Result<(), String> {
     // Scratch mutators (tee, touch, mkdir) are allowed when all explicit
     // path arguments are under an allowed temp directory.
     if SCRATCH_MUTATORS.contains(&first_word) {
-        if scratch_paths_under_temp(trimmed) {
+        if scratch_paths_under_temp(trimmed, state.ctx) {
             return Ok(());
         }
         return reject(
@@ -714,7 +1079,7 @@ fn check_segment(segment: &str) -> Result<(), String> {
     // path arguments target temp directories. The prompt tells agents that
     // writing to the OS temp directory is allowed.
     if TEMP_MUTATORS.contains(&first_word) {
-        if scratch_paths_under_temp(trimmed) {
+        if scratch_paths_under_temp(trimmed, state.ctx) {
             return Ok(());
         }
         return reject(
@@ -749,7 +1114,7 @@ fn check_segment(segment: &str) -> Result<(), String> {
     // Iterates the FLAG_CHECKS table; the first matching entry returns early,
     // otherwise falls through to `Ok(())` for the allow case.
     for check in FLAG_CHECKS {
-        if first_word == check.verb && (check.predicate)(trimmed) {
+        if first_word == check.verb && (check.predicate)(trimmed, state.ctx) {
             return reject(trimmed, check.rejection, check.suggestion);
         }
     }
@@ -1163,7 +1528,7 @@ fn flag_value_equals<'a>(parts: &'a [&'a str], prefix: &str) -> Option<&'a str> 
 
 /// Check if `sed` has `-i` in a way that mutates files outside temp.
 /// When all file operands after `-i` are under temp, returns `false` (allow).
-fn has_sed_mutation(command: &str) -> bool {
+fn has_sed_mutation(command: &str, ctx: &CheckContext) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
     // Find the -i flag position (including -i.bak, -iSUFFIX)
     let i_pos = parts
@@ -1205,24 +1570,23 @@ fn has_sed_mutation(command: &str) -> bool {
     }
 
     !file_operands.iter().all(|p| {
-        let path = Path::new(p);
-        path.is_absolute() && crate::tools::path::is_path_under_allowed_temp(path)
+        resolve_path_word(p, ctx).is_some_and(|path| is_path_under_temp(&path, ctx))
     })
 }
 
 /// Check if `awk -i inplace` is present.
-fn has_inplace(command: &str) -> bool {
+fn has_inplace(command: &str, _ctx: &CheckContext) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
     parts.windows(2).any(|w| w[0] == "-i" && w[1] == "inplace")
 }
 
 /// Check if `dd of=...` writes outside temp.
 /// When `of=` points to a temp path, returns `false` (allow).
-fn has_dd_mutation(command: &str) -> bool {
+fn has_dd_mutation(command: &str, ctx: &CheckContext) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
     if let Some(of_val) = flag_value_equals(&parts, "of=") {
-        let path = Path::new(of_val);
-        return !path.is_absolute() || !crate::tools::path::is_path_under_allowed_temp(path);
+        return !resolve_path_word(of_val, ctx)
+            .is_some_and(|path| is_path_under_temp(&path, ctx));
     }
     false
 }
@@ -1230,7 +1594,7 @@ fn has_dd_mutation(command: &str) -> bool {
 /// Check if curl has output flags that write outside temp.
 /// `-o <path>` / `--output <path>` is allowed when path is under temp.
 /// `-O` / `--remote-name` is always blocked (writes to CWD with URL filename).
-fn has_curl_mutation(command: &str) -> bool {
+fn has_curl_mutation(command: &str, ctx: &CheckContext) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
 
     // -O/--remote-name are always blocked (writes to CWD with URL filename)
@@ -1241,15 +1605,14 @@ fn has_curl_mutation(command: &str) -> bool {
     // -o/--output: blocked unless output path is under temp
     for flag in &["-o", "--output"] {
         if let Some(path) = flag_value(&parts, flag) {
-            let p = Path::new(path);
-            return !p.is_absolute() || !crate::tools::path::is_path_under_allowed_temp(p);
+            return !resolve_path_word(path, ctx)
+                .is_some_and(|p| is_path_under_temp(&p, ctx));
         }
     }
 
     // --output=path syntax
     if let Some(path) = flag_value_equals(&parts, "--output=") {
-        let p = Path::new(path);
-        return !p.is_absolute() || !crate::tools::path::is_path_under_allowed_temp(p);
+        return !resolve_path_word(path, ctx).is_some_and(|p| is_path_under_temp(&p, ctx));
     }
 
     false
@@ -1259,30 +1622,26 @@ fn has_curl_mutation(command: &str) -> bool {
 /// `-O <path>` / `--output-document <path>` / `-P <path>` / `--directory-prefix <path>`
 /// are allowed when the path is under temp.
 /// Without output flags, wget writes to CWD → always blocked.
-fn has_wget_mutation(command: &str) -> bool {
+fn has_wget_mutation(command: &str, ctx: &CheckContext) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
 
     // -O/--output-document: specify output file path
     if let Some(path) = flag_value(&parts, "-O").or_else(|| flag_value(&parts, "--output-document"))
     {
-        let p = Path::new(path);
-        return !p.is_absolute() || !crate::tools::path::is_path_under_allowed_temp(p);
+        return !resolve_path_word(path, ctx).is_some_and(|p| is_path_under_temp(&p, ctx));
     }
     if let Some(path) = flag_value_equals(&parts, "--output-document=") {
-        let p = Path::new(path);
-        return !p.is_absolute() || !crate::tools::path::is_path_under_allowed_temp(p);
+        return !resolve_path_word(path, ctx).is_some_and(|p| is_path_under_temp(&p, ctx));
     }
 
     // -P/--directory-prefix: specify download directory
     if let Some(path) =
         flag_value(&parts, "-P").or_else(|| flag_value(&parts, "--directory-prefix"))
     {
-        let p = Path::new(path);
-        return !p.is_absolute() || !crate::tools::path::is_path_under_allowed_temp(p);
+        return !resolve_path_word(path, ctx).is_some_and(|p| is_path_under_temp(&p, ctx));
     }
     if let Some(path) = flag_value_equals(&parts, "--directory-prefix=") {
-        let p = Path::new(path);
-        return !p.is_absolute() || !crate::tools::path::is_path_under_allowed_temp(p);
+        return !resolve_path_word(path, ctx).is_some_and(|p| is_path_under_temp(&p, ctx));
     }
 
     // No known output flag → wget would write to CWD with URL's filename
@@ -1355,13 +1714,13 @@ fn is_tar_list_only(command: &str) -> bool {
 ///     [`is_tar_list_only`] to whitelist them.
 /// *   Do **not** add positive blacklist checks to this function — they
 ///     would be dead code, masked by the fallback.
-fn is_tar_mutating(command: &str) -> bool {
+fn is_tar_mutating(command: &str, _ctx: &CheckContext) -> bool {
     !is_tar_list_only(command)
 }
 
 /// Check if `base64 -d -o` writes outside temp.
 /// When `-o`/`--output` points to a temp path, returns `false` (allow).
-fn has_base64_mutation(command: &str) -> bool {
+fn has_base64_mutation(command: &str, ctx: &CheckContext) -> bool {
     if !has_any_flag(command, &["-d", "--decode"]) {
         return false; // not decoding → not a mutation
     }
@@ -1371,8 +1730,7 @@ fn has_base64_mutation(command: &str) -> bool {
     // Check -o/--output flag values
     for flag in &["-o", "--output"] {
         if let Some(path) = flag_value(&parts, flag) {
-            let p = Path::new(path);
-            return !p.is_absolute() || !crate::tools::path::is_path_under_allowed_temp(p);
+            return !resolve_path_word(path, ctx).is_some_and(|p| is_path_under_temp(&p, ctx));
         }
     }
 
@@ -1411,16 +1769,34 @@ mod tests {
     use super::*;
     use crate::tools::shell::{NON_DELEGATING_PREFIXES, SHELL_PREFIXES};
 
+    /// Hermetic test context.
+    ///
+    /// The workspace root is a fixed absolute path that is NOT under any OS
+    /// temp root (the "hermetic-test trap": a fixture workspace created under
+    /// `tempfile::tempdir()` lies inside the allowed temp roots, making
+    /// 'workspace write blocked' assertions impossible). Relative paths
+    /// resolve against this root and are therefore rejected as workspace
+    /// writes, matching production semantics where the workspace lives outside
+    /// the OS temp dirs.
+    fn test_ctx() -> CheckContext {
+        CheckContext {
+            workspace_root: std::path::PathBuf::from("/__mahbot_readonly_test_ws__"),
+            temp_roots: crate::tools::path::allowed_temp_roots(),
+        }
+    }
+
     fn ok(cmd: &str) {
+        let ctx = test_ctx();
         assert!(
-            check_command(cmd).is_ok(),
+            check_command(cmd, &ctx).is_ok(),
             "expected ALLOW but got REJECT for: `{cmd}`"
         );
     }
 
     fn assert_rejected(cmd: &str) {
+        let ctx = test_ctx();
         assert!(
-            check_command(cmd).is_err(),
+            check_command(cmd, &ctx).is_err(),
             "expected REJECT but got ALLOW for: `{cmd}`"
         );
     }
@@ -1438,8 +1814,8 @@ mod tests {
 
     /// Assert each token-classification case in a table-driven test.
     fn run_token_cases(cases: &[(&str, TokenKind)]) {
-        for &(input, expected) in cases {
-            assert_eq!(classify_shell_token(input), expected, "{input:?}");
+        for (input, expected) in cases {
+            assert_eq!(classify_shell_token(input), *expected, "{input:?}");
         }
     }
 
@@ -1779,11 +2155,40 @@ mod tests {
             ("&>", TokenKind::Redirect { needs_target: true }),
             ("&>>", TokenKind::Redirect { needs_target: true }),
             // ── Heredoc variants ───────────────────────────────────
-            ("<<EOF", TokenKind::Heredoc),
-            ("<<-EOF", TokenKind::Heredoc),
-            ("<<<", TokenKind::Heredoc),
-            ("3<<EOF", TokenKind::Heredoc),
-            ("1<<-EOF", TokenKind::Heredoc),
+            (
+                "<<EOF",
+                TokenKind::Heredoc {
+                    delimiter: "EOF".to_string(),
+                },
+            ),
+            (
+                "<<-EOF",
+                TokenKind::Heredoc {
+                    delimiter: "EOF".to_string(),
+                },
+            ),
+            (
+                "<<'EOF'",
+                TokenKind::Heredoc {
+                    delimiter: "EOF".to_string(),
+                },
+            ),
+            (
+                "3<<EOF",
+                TokenKind::Heredoc {
+                    delimiter: "EOF".to_string(),
+                },
+            ),
+            (
+                "1<<-EOF",
+                TokenKind::Heredoc {
+                    delimiter: "EOF".to_string(),
+                },
+            ),
+            // ── Herestrings (no body — redirect-like, consumes next word) ─
+            ("<<<", TokenKind::Redirect { needs_target: true }),
+            ("<<<hi", TokenKind::Redirect { needs_target: true }),
+            ("3<<<", TokenKind::Redirect { needs_target: true }),
             // ── Combined redirect (operator + target, no skip) ─────
             (">/dev/null", NO_TARGET),
             (">>file", NO_TARGET),
@@ -2239,5 +2644,141 @@ mod tests {
         for &cmd in temp_ops {
             assert_rejected(&format!("{cmd} /etc/blocked_test"));
         }
+    }
+
+    // ── Phase 1 acceptance: heredocs ──────────────────────────────────────
+
+    /// Every fixed heredoc pattern AND its mutating sibling (guard contract,
+    /// phase 1.1).
+    #[test]
+    fn heredoc_acceptance() {
+        let cases = [
+            // Write command immediately after the terminator must NOT escape
+            // scanning (live bypass: leaked_guard_test.txt).
+            ("cat <<EOF\nbody\nEOF\ntouch workspace_file", false),
+            ("cat <<EOF\nbody\nEOF\ntouch /tmp/scratch_file", true),
+            // Write on the delimiter line must be scanned (live bypass).
+            ("cat <<EOF > workspace_file", false),
+            ("cat <<EOF > /tmp/out", true),
+            // Heredoc body containing mutator-shaped text is literal — allowed.
+            ("cat <<EOF\nrm -rf /tmp\nEOF", true),
+            ("cat <<EOF\ncat > workspace_file\nEOF", true),
+            // Two-heredoc chain: bodies excluded, delimiter-line redirect scanned.
+            (
+                "cat <<EOF1 <<EOF2 > /tmp/out\nbody1 > x\nEOF1\nbody2 > y\nEOF2",
+                true,
+            ),
+            // <<- with tab-indented terminator.
+            ("cat <<-EOF\n\tbody\n\tEOF", true),
+            // CRLF line endings: write after terminator still blocked.
+            ("cat <<EOF\r\nbody\r\nEOF\r\ntouch workspace_file", false),
+            ("cat <<EOF\r\nbody\r\nEOF", true),
+            // Terminator at end of input (no trailing newline).
+            ("cat <<EOF\nbody\nEOF", true),
+            // Quoted delimiter.
+            ("cat <<'EOF'\nbody\nEOF", true),
+            // Heredoc with workspace write after, chained with && on the
+            // line after the terminator.
+            ("cat <<EOF\nbody\nEOF\n&& touch workspace_file", false),
+            // A command on the terminator line itself is NOT a terminator in
+            // bash (unterminated heredoc — nothing executes), so it must not
+            // be treated as a command.
+            ("cat <<EOF\nbody\nEOF && touch workspace_file", true),
+            // fd-prefixed heredoc body not scanned as command text.
+            ("tee /tmp/x 3<< 'EOF'\nbody\nEOF", true),
+        ];
+
+        run_cases(&cases);
+    }
+
+    // ── Phase 1 acceptance: herestrings ──────────────────────────────────
+
+    /// `<<<` must not hide a following redirect (live bypass:
+    /// herestring_escape_test.txt).
+    #[test]
+    fn herestring_acceptance() {
+        let cases = [
+            ("cat <<< hi", true),
+            ("cat <<< hi > workspace_file", false),
+            ("cat <<< hi > /tmp/out", true),
+            ("cat <<< hi > /dev/null", true),
+            ("cat <<< \"hi there\" > /tmp/out", true),
+            ("tee /tmp/scratch.log <<< hi", true),
+        ];
+
+        run_cases(&cases);
+    }
+
+    // ── Phase 1 acceptance: substitutions ────────────────────────────────
+
+    /// `$(...)` and backtick contents are validated as nested commands.
+    #[test]
+    fn substitution_acceptance() {
+        let cases = [
+            // Suppressed-stderr read inside a substitution — allowed.
+            ("echo $(cat /etc/passwd 2>/dev/null)", true),
+            ("echo `cat /etc/passwd 2>/dev/null`", true),
+            // Write inside a substitution — blocked.
+            ("echo $(touch workspace_file)", false),
+            ("echo `touch workspace_file`", false),
+            // Redirect to temp inside a substitution — allowed.
+            ("echo $(echo hi > /tmp/out)", true),
+            // Redirect to workspace inside a substitution — blocked.
+            ("echo $(echo hi > out.txt)", false),
+            ("echo $(echo hi > /etc/passwd)", false),
+            // Nested substitution.
+            ("echo $(echo $(rm -rf /tmp/x))", true),
+            ("echo $(echo $(touch ws_file))", false),
+            // Substitution with a mutating command under temp — allowed.
+            ("echo $(rm -rf /tmp/scratch_dir)", true),
+            // Substitution that writes to workspace via a temp-qualified var is
+            // rejected because the relative target resolves to the workspace.
+            ("echo $(tee /tmp/ok > ws_out)", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    // ── Phase 1 acceptance: redirect-target delimiters ───────────────────
+
+    #[test]
+    fn redirect_delimiter_acceptance() {
+        let cases = [
+            // `)` terminates a redirect target (suppressed-stderr read).
+            ("echo $(cmd 2>/dev/null)", true),
+            ("echo $(cmd 2>/dev/null) done", true),
+            // Redirect to /etc inside a substitution — blocked.
+            ("echo $(echo x > /etc/passwd)", false),
+            // Temp-file redirect ending in `)` — allowed.
+            ("echo $(echo x > /tmp/out)", true),
+            // Relative-file redirect ending in `)` — blocked.
+            ("echo $(echo x > out.txt)", false),
+            // `}` terminates a redirect target too (brace-closed groups).
+            ("echo $(cmd 2>/dev/null} done", true),
+        ];
+
+        run_cases(&cases);
+    }
+
+    // ── Phase 1 acceptance: newline as command separator ─────────────────
+
+    #[test]
+    fn newline_separator_acceptance() {
+        let cases = [
+            // Multi-line temp setup script: each line parses as its own command.
+            ("touch /tmp/a\necho hi > /tmp/b\ncat /tmp/a", true),
+            // Workspace write across a newline — blocked.
+            ("echo hi\ntouch workspace_file", false),
+            ("touch workspace_file\necho hi", false),
+            // Heredoc body with mutator-shaped text is not a command.
+            ("cat <<EOF\nrm -rf /tmp\nEOF\necho done", true),
+            // Backslash-newline continuation joins the logical line.
+            ("echo hello \\\nworld", true),
+            ("touch /tmp/a \\\n/tmp/b", true),
+            // Quote-aware newline: quoted newline is not a separator.
+            ("echo 'a\nb'", true),
+        ];
+
+        run_cases(&cases);
     }
 }

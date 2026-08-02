@@ -256,10 +256,17 @@ fn normalize_path(path: &Path) -> PathBuf {
 /// The input path is normalized (`.`, `..` resolved) *after* tilde expansion
 /// so that `../` segments introduced by tilde expansion or present in the
 /// original path cannot escape the allowed roots via lexical traversal.
-fn is_path_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
+pub(crate) fn is_path_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
     let expanded = crate::util::expand_tilde(&path.to_string_lossy());
     let normalized = normalize_path(&expanded);
     roots.iter().any(|root| normalized.starts_with(root))
+}
+
+/// The canonical allowed temp/scratch roots (shared by the read-path
+/// allowlists and the read-only shell guard).
+#[must_use]
+pub(crate) fn allowed_temp_roots() -> Vec<PathBuf> {
+    ALLOWED_TEMP_ROOTS.clone()
 }
 
 /// Check whether `path` is under an [`EXTRA_READ_ALLOWED`] directory.
@@ -556,12 +563,6 @@ static ALLOWED_TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
     add_path_with_canonical(&mut dirs, std::env::temp_dir().join(".agent"));
     dirs
 });
-
-/// Check whether `path` is under an allowed temp/scratch root.
-#[must_use]
-pub(crate) fn is_path_under_allowed_temp(path: &Path) -> bool {
-    is_path_under_roots(path, &ALLOWED_TEMP_ROOTS)
-}
 
 /// Paths under any of these directories are allowed for reading (temp dir,
 /// dependency caches, SDK headers, etc.). Paths are canonicalized at init
@@ -909,30 +910,31 @@ mod tests {
         }
     }
 
-    // ── is_path_under_allowed_temp tests ────────────────────────────────
+    // ── is_path_under_roots / allowed_temp_roots tests ───────────────────
 
     #[test]
     fn is_path_under_allowed_temp_covers_common_roots() {
+        let roots = allowed_temp_roots();
         let temp = std::env::temp_dir();
         let spill = temp.join(".agent/spill_test.txt");
-        assert!(is_path_under_allowed_temp(&temp.join("scratch.txt")));
-        assert!(is_path_under_allowed_temp(&spill));
-        assert!(is_path_under_allowed_temp(Path::new("/tmp/out.txt")));
-        assert!(is_path_under_allowed_temp(Path::new("/var/tmp/out.txt")));
-        assert!(!is_path_under_allowed_temp(Path::new("relative.txt")));
-        assert!(!is_path_under_allowed_temp(Path::new("/etc/passwd")));
+        assert!(is_path_under_roots(&temp.join("scratch.txt"), &roots));
+        assert!(is_path_under_roots(&spill, &roots));
+        assert!(is_path_under_roots(Path::new("/tmp/out.txt"), &roots));
+        assert!(is_path_under_roots(Path::new("/var/tmp/out.txt"), &roots));
+        assert!(!is_path_under_roots(Path::new("relative.txt"), &roots));
+        assert!(!is_path_under_roots(Path::new("/etc/passwd"), &roots));
         // Path traversal via `..` must be blocked.
         assert!(
-            !is_path_under_allowed_temp(Path::new("/tmp/../etc/passwd")),
+            !is_path_under_roots(Path::new("/tmp/../etc/passwd"), &roots),
             "Path traversal via /tmp/../etc/passwd must be blocked"
         );
         assert!(
-            !is_path_under_allowed_temp(Path::new("/tmp/../../../etc/passwd")),
+            !is_path_under_roots(Path::new("/tmp/../../../etc/passwd"), &roots),
             "Deep path traversal must be blocked"
         );
         // Traversal that stays within temp after normalization should be allowed.
         assert!(
-            is_path_under_allowed_temp(Path::new("/tmp/../tmp/file.txt")),
+            is_path_under_roots(Path::new("/tmp/../tmp/file.txt"), &roots),
             "Traversal back into temp should be allowed"
         );
     }
@@ -1473,7 +1475,7 @@ mod tests {
     /// typically because it resolves back inside the temp root.
     fn assert_allowed_under_temp(path: &str) {
         assert!(
-            is_path_under_allowed_temp(Path::new(path)),
+            is_path_under_roots(Path::new(path), &allowed_temp_roots()),
             "Expected path to be allowed under temp: {path}"
         );
     }
@@ -1482,7 +1484,7 @@ mod tests {
     /// traversal protection).
     fn assert_not_allowed_under_temp(path: &str) {
         assert!(
-            !is_path_under_allowed_temp(Path::new(path)),
+            !is_path_under_roots(Path::new(path), &allowed_temp_roots()),
             "Expected path to be rejected under temp: {path}"
         );
     }
