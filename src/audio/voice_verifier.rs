@@ -1530,15 +1530,38 @@ impl VoiceVerifier {
         positive_sequences: &[EmbeddingSequence],
         threshold: f32,
     ) -> Self {
+        Self::train_ensemble_with_synthetic_negatives_seeded(
+            positive_sequences,
+            threshold,
+            rand::random(),
+        )
+    }
+
+    /// [`Self::train_ensemble_with_synthetic_negatives`] with an explicit
+    /// synthetic-negative seed (mahbot-1045 B2): the EXACT body of the
+    /// production public wrapper, but the entropy draw for the synthetic
+    /// negative set is replaced by the caller-supplied `synth_seed`.  The
+    /// member base seed is still drawn inside
+    /// [`train_ensemble_with_metrics`](Self::train_ensemble_with_metrics),
+    /// preserving the same call order as production: the synthetic-negative
+    /// sequence is built from the shared positive pool with the given seed
+    /// FIRST, then member training runs over that identical data.  Bench/test
+    /// only — production keeps the entropy-drawn public wrapper, so this
+    /// entry point introduces zero production behavior change.
+    #[must_use]
+    pub(crate) fn train_ensemble_with_synthetic_negatives_seeded(
+        positive_sequences: &[EmbeddingSequence],
+        threshold: f32,
+        synth_seed: u64,
+    ) -> Self {
         // Extract flat embeddings from all positive sequences for the helper.
         let flat_positives: Vec<Vec<f32>> = positive_sequences
             .iter()
             .flat_map(|s| s.embeddings.iter().cloned())
             .collect();
-        // Fresh entropy seed for the synthetic-negative set (generated ONCE
-        // per run and shared by every member); the member base seed is drawn
-        // inside train_ensemble_with_metrics.
-        let synth_seed: u64 = rand::random();
+        // Synthetic-negative set seed (generated ONCE per run and shared by
+        // every member); the member base seed is drawn inside
+        // train_ensemble_with_metrics.
         let synth_seq = build_synthetic_negative_sequence(&flat_positives, Some(synth_seed));
         // Member loop / primary attach / trained log all live in
         // train_ensemble_with_metrics — delegating keeps them in one place.

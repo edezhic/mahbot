@@ -77,6 +77,11 @@ use std::time::Instant;
 const ROLLING_SUM_IDX: usize = 1;
 /// Index of the effective threshold field in per_frame_scores `[total_score, rolling_sum, threshold]` triples.
 const THRESHOLD_IDX: usize = 2;
+/// Index of the total (classifier) score field in per_frame_scores
+/// `[total_score, rolling_sum, threshold]` triples (mahbot-1045 B7 — the
+/// layout is shared with production's scoring pipeline, so a production
+/// layout change must not silently corrupt miss classification).
+const TOTAL_SCORE_IDX: usize = 0;
 
 /// Minimum effective threshold for the Conv1D classifier's rolling sum.
 ///
@@ -1146,34 +1151,63 @@ fn ensure_voice_models_loaded() -> Result<(), String> {
 /// For each raw TTS enrollment variant, produces up to 5 sequences:
 /// original, speed-down (0.95×), speed-up (1.05×, conditional on ≥500ms),
 /// volume-down (-3dB), and pink noise (25dB SNR).  Matches the production
-/// pipeline in [`prewarm_phrase_embeddings`](super::prewarm_phrase_embeddings).
+/// pipeline in [`prewarm_phrase_embeddings`](super::prewarm_phrase_embeddings)
+/// via the shared [`super::augment_pcm_variants`] helper (mahbot-1045 A1).
 fn pcm_augment_enrollment_variants(variants: &[(Vec<f32>, String)]) -> Vec<(Vec<f32>, String)> {
     let mut all = Vec::new();
     for (i, (pcm, label)) in variants.iter().enumerate() {
-        // 1. Original (AGC'd, unmodified)
-        all.push((pcm.clone(), format!("{label}_original")));
-
-        // 2. Speed-down (0.95×)
-        let speed_down = crate::util::speed_perturbation(pcm, TARGET_SAMPLE_RATE, 0.95);
-        all.push((speed_down, format!("{label}_speed_down")));
-
-        // 3. Speed-up (1.05×, conditional — skip if too short)
-        let pre_pad_samples = pcm.len().saturating_sub(2 * super::CONTEXT_PADDING_SAMPLES);
-        let pre_pad_ms = (pre_pad_samples as u64 * 1000) / u64::from(TARGET_SAMPLE_RATE);
-        if pre_pad_ms >= 500 {
-            let speed_up = crate::util::speed_perturbation(pcm, TARGET_SAMPLE_RATE, 1.05);
-            all.push((speed_up, format!("{label}_speed_up")));
+        // Noise seed = loop index, gate input = raw TTS PCM, canonical push
+        // order (speed-up 3rd) — preserved verbatim from the pre-dedup code.
+        for variant in super::augment_pcm_variants(pcm, TARGET_SAMPLE_RATE, i as u64, false) {
+            let suffix = match variant.variant_index {
+                0 => "original",
+                1 => "speed_down",
+                2 => "speed_up",
+                3 => "vol_down",
+                4 => "noise",
+                _ => unreachable!("augment_pcm_variants yields only indices 0..=4"),
+            };
+            all.push((variant.pcm, format!("{label}_{suffix}")));
         }
-
-        // 4. Volume-down (-3dB)
-        let vol_down = crate::util::apply_gain(pcm, -3.0);
-        all.push((vol_down, format!("{label}_vol_down")));
-
-        // 5. Pink noise (SNR 25dB)
-        let noise = crate::util::add_noise(pcm, 25.0, i as u64);
-        all.push((noise, format!("{label}_noise")));
     }
     all
+}
+
+/// mahbot-1045 B3 (report-only): quality scoring of the bench's enrollment
+/// clips via production's compute_utterance_quality.  The bench clips have no
+/// pre-AGC ring → noise_rms is None → SNR is the estimate_snr_energy
+/// heuristic — labelled as such (NOT real-room SNR).
+fn enrollment_quality_probe(enrollment_variants: &[(Vec<f32>, String)]) -> serde_json::Value {
+    let mut per_clip = Vec::new();
+    let mut n_clipping = 0usize;
+    let mut snr_sum = 0.0f32;
+    let mut score_sum = 0.0f32;
+
+    for (pcm, label) in enrollment_variants {
+        let q = super::compute_utterance_quality(pcm, None);
+        if q.clipping_detected {
+            n_clipping += 1;
+        }
+        snr_sum += q.snr_db;
+        score_sum += q.score;
+        per_clip.push(serde_json::json!({
+            "label": label,
+            "duration_ms": q.duration_ms,
+            "clipping_detected": q.clipping_detected,
+            "heuristic_snr_db": q.snr_db,
+            "composite_score": q.score,
+        }));
+    }
+
+    let n_clips = enrollment_variants.len();
+    serde_json::json!({
+        "note": "Heuristic SNR (estimate_snr_energy) — the bench's enrollment clips have no pre-AGC noise ring, so this is NOT real-room SNR (mahbot-1045 B3).",
+        "n_clips": n_clips,
+        "n_clipping": n_clipping,
+        "mean_heuristic_snr_db": if n_clips == 0 { 0.0 } else { snr_sum / n_clips as f32 },
+        "mean_composite_score": if n_clips == 0 { 0.0 } else { score_sum / n_clips as f32 },
+        "per_clip": per_clip,
+    })
 }
 
 /// Generate owner-negative sequences (non-wake-word TTS phrases, mahbot-932 Fix 6).
@@ -1216,7 +1250,6 @@ fn generate_owner_negative_sequences(
     model_hash: &str,
     cache_dir: &std::path::Path,
 ) -> Vec<EmbeddingSequence> {
-    use crate::audio::audio_preprocessor::AudioPreprocessor;
     let num_styles = available_styles.len().max(1);
     let mut sequences = Vec::new();
     let config = enrollment_preprocessor_config();
@@ -1236,12 +1269,10 @@ fn generate_owner_negative_sequences(
             ) {
                 // AGC/NS the TTS PCM through a fresh per-clip preprocessor,
                 // fed in FRAME_LENGTH chunks as-is (matches
-                // prewarm_phrase_embeddings, mahbot-1009).
-                let mut pre = AudioPreprocessor::new(config);
-                let mut agc_audio: Vec<f32> = Vec::with_capacity(pcm.len());
-                for chunk in pcm.chunks(chunk_size) {
-                    agc_audio.extend(pre.process(chunk.to_vec()));
-                }
+                // prewarm_phrase_embeddings, mahbot-1009; shared helper
+                // mahbot-1045 A2).
+                let agc_audio =
+                    crate::audio::audio_preprocessor::agc_feed_fresh(&pcm, chunk_size, config);
                 // VAD-gate with a dedicated detector (never the global
                 // VAD_DETECTOR) — only VAD-positive hops produce mel frames,
                 // windows anchor at speech onset (matches the streaming path,
@@ -1388,18 +1419,14 @@ fn generate_ambient_noise_sequences() -> Vec<EmbeddingSequence> {
 fn generate_cross_speaker_negative_sequences(
     test_clips: &[(Vec<f32>, String)],
 ) -> Vec<EmbeddingSequence> {
-    use crate::audio::audio_preprocessor::AudioPreprocessor;
     use crate::util::{NoiseType, add_noise_white_pink};
     let config = enrollment_preprocessor_config();
     let chunk_size = super::FRAME_LENGTH;
     let mut sequences = Vec::new();
     for (clip_idx, (pcm, label)) in test_clips.iter().enumerate() {
-        // Fresh per-clip AGC (mirrors the enrollment path).
-        let mut pre = AudioPreprocessor::new(config);
-        let mut agc_audio: Vec<f32> = Vec::with_capacity(pcm.len());
-        for chunk in pcm.chunks(chunk_size) {
-            agc_audio.extend(pre.process(chunk.to_vec()));
-        }
+        // Fresh per-clip AGC (mirrors the enrollment path; shared helper
+        // mahbot-1045 A2).
+        let agc_audio = crate::audio::audio_preprocessor::agc_feed_fresh(pcm, chunk_size, config);
         // Conditions: clean + 10/20 dB white/pink (ticket mahbot-1025).
         let conditions: Vec<(&str, Vec<f32>)> = vec![
             ("clean", agc_audio.clone()),
@@ -1500,6 +1527,117 @@ fn compute_vad_segments(audio: &[f32]) -> (Vec<bool>, Vec<Vec<f32>>) {
     (vad_decisions, utterances)
 }
 
+/// mahbot-1045 B6 (report-only): regression-guard the mahbot-900 VAD feed
+/// contract on the BENCH side.
+///
+/// Production's VAD feed pattern (voice.rs mic arm, mahbot-900) feeds ONLY
+/// the new [`HOP_LENGTH`](super::HOP_LENGTH) samples per hop through a
+/// streaming earshot detector — never the full overlapping
+/// [`FRAME_LENGTH`](super::FRAME_LENGTH) window (double-feeding corrupts
+/// earshot's ring buffer).  This probe replays that contract literally
+/// against a fresh detector and compares the decisions with the bench's
+/// [`compute_vad_segments`] (which implements the same pattern).  If
+/// [`compute_vad_segments`] ever drifts from the literal contract, the
+/// comparison flags it.
+///
+/// Scope honesty: production code is NOT executed in the offline bench, so
+/// this cannot detect drift in the production arm itself — it locks the
+/// bench's transcription of the contract.  To prove the comparison is
+/// sensitive (not vacuous), a NEGATIVE control feeds the full overlapping
+/// `FRAME_LENGTH` window per hop (the exact violation mahbot-900 forbids);
+/// its mismatch count is reported under `negative_control`.
+fn vad_feed_cross_check_probe(audio: &[f32]) -> serde_json::Value {
+    if audio.len() < super::FRAME_LENGTH {
+        return serde_json::json!({
+            "skipped": true,
+            "feed_pattern": "only_new_hop_samples_per_hop",
+            "note": "audio shorter than FRAME_LENGTH — cannot run the VAD feed cross-check (no full hop frame available)",
+        });
+    }
+
+    // The bench's own VAD segmentation decisions (fresh internal detector).
+    let (bench_decisions, _utterances) = compute_vad_segments(audio);
+
+    let n_frames = audio.len().saturating_sub(super::FRAME_LENGTH) / super::HOP_LENGTH + 1;
+
+    // Reference replay of production's feed pattern (mahbot-900): a FRESH
+    // detector fed EXACTLY the new HOP_LENGTH samples per hop.  The two
+    // detectors are independent — the comparison is decisions-vs-decisions
+    // on the same audio, not shared state.
+    let mut detector = Detector::default();
+    let mut replay_decisions: Vec<bool> = Vec::with_capacity(n_frames);
+    for i in 0..n_frames {
+        let start = i * super::HOP_LENGTH;
+        let new_samples = &audio[start..start + super::HOP_LENGTH];
+        replay_decisions.push(super::is_speech_with_detector(
+            new_samples,
+            &mut detector,
+            super::VAD_THRESHOLD,
+        ));
+    }
+
+    // NEGATIVE control: a fresh detector fed the full OVERLAPPING
+    // FRAME_LENGTH window per hop — double-feeding the 256-sample overlap,
+    // the exact feed-pattern violation mahbot-900 forbids.  If the correct
+    // and violated feeds produce the same decisions on this audio
+    // (feed_pattern_sensitive == false), the main comparison would be
+    // vacuous and the report says so honestly instead of overclaiming.
+    let mut double_fed_detector = Detector::default();
+    let mut double_fed_decisions: Vec<bool> = Vec::with_capacity(n_frames);
+    for i in 0..n_frames {
+        let start = i * super::HOP_LENGTH;
+        let window = &audio[start..start + super::FRAME_LENGTH];
+        double_fed_decisions.push(super::is_speech_with_detector(
+            window,
+            &mut double_fed_detector,
+            super::VAD_THRESHOLD,
+        ));
+    }
+
+    // Element-wise comparison of the independent decision vectors.
+    let n_hops = bench_decisions.len();
+    let n_matching = bench_decisions
+        .iter()
+        .zip(replay_decisions.iter())
+        .filter(|(a, b)| **a == **b)
+        .count();
+    let mismatch_indices: Vec<usize> = bench_decisions
+        .iter()
+        .zip(replay_decisions.iter())
+        .enumerate()
+        .filter(|(_, (a, b))| **a != **b)
+        .map(|(idx, _)| idx)
+        .take(5)
+        .collect();
+    let n_double_fed_mismatches = bench_decisions
+        .iter()
+        .zip(double_fed_decisions.iter())
+        .filter(|(a, b)| **a != **b)
+        .count();
+
+    serde_json::json!({
+        "skipped": false,
+        "feed_pattern": "only_new_hop_samples_per_hop",
+        "n_hops": n_hops,
+        "n_matching": n_matching,
+        "all_match": mismatch_indices.is_empty(),
+        "mismatch_indices": mismatch_indices,
+        "negative_control": {
+            "feed_pattern": "full_overlapping_frame_per_hop (mahbot-900 violation)",
+            "mismatches_vs_bench": n_double_fed_mismatches,
+            "feed_pattern_sensitive": n_double_fed_mismatches > 0,
+        },
+        "note": "Bench-side regression guard for the mahbot-900 VAD feed contract: \
+                 replays production's feed pattern (feed ONLY the new HOP_LENGTH \
+                 samples per hop) through a fresh Detector and compares against \
+                 compute_vad_segments.  Production code is not executed in the \
+                 offline bench, so drift in the production arm itself is not \
+                 detectable here.  The negative control (full overlapping \
+                 FRAME_LENGTH per hop) reports how many hops diverge, proving the \
+                 comparison is sensitive to the feed pattern rather than vacuous.",
+    })
+}
+
 /// Build the audio preprocessor configuration from the same CONFIG flags that
 /// production uses (mahbot-1006 L).
 ///
@@ -1554,7 +1692,6 @@ fn enrollment_preprocessor_config() -> crate::audio::audio_preprocessor::Preproc
 /// verifier training.  The old streaming path was removed in mahbot-923.
 #[allow(clippy::too_many_lines)]
 fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<EmbeddingSequence> {
-    use crate::audio::audio_preprocessor::AudioPreprocessor;
     let chunk_size = super::FRAME_LENGTH;
     let config = enrollment_preprocessor_config();
 
@@ -1570,11 +1707,8 @@ fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<Emb
     // accumulation (mahbot-1006 G).
     let mut per_clip_agc: Vec<Vec<f32>> = Vec::with_capacity(enrollment_variants.len());
     for (samples, _label) in enrollment_variants {
-        let mut pre = AudioPreprocessor::new(config);
-        let mut processed: Vec<f32> = Vec::with_capacity(samples.len());
-        for chunk in samples.chunks(chunk_size) {
-            processed.extend(pre.process(chunk.to_vec()));
-        }
+        let processed =
+            crate::audio::audio_preprocessor::agc_feed_fresh(samples, chunk_size, config);
         per_clip_agc.push(processed);
     }
 
@@ -1617,31 +1751,17 @@ fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<Emb
     let mut dense_sequences: Vec<EmbeddingSequence> = Vec::new();
 
     for (i, utterance) in utterances.iter().enumerate() {
-        let speed_down = crate::util::speed_perturbation(utterance, TARGET_SAMPLE_RATE, 0.95);
-        // Speed-up is conditional on ≥500 ms unpadded duration (matches
-        // handle_enrollment_sample's skip_speed_up).
-        let pre_pad_duration_samples = utterance
-            .len()
-            .saturating_sub(2 * super::CONTEXT_PADDING_SAMPLES);
-        let pre_pad_duration_ms =
-            (pre_pad_duration_samples as u64 * 1000) / u64::from(TARGET_SAMPLE_RATE);
-        let speed_up = if pre_pad_duration_ms >= 500 {
-            Some(crate::util::speed_perturbation(
-                utterance,
-                TARGET_SAMPLE_RATE,
-                1.05,
-            ))
-        } else {
-            None
-        };
-        let volume_down = crate::util::apply_gain(utterance, -3.0);
-        let noise = crate::util::add_noise(utterance, 25.0, i as u64);
+        // Noise seed = utterance index, gate input = VAD-gated utterance
+        // slice, canonical push order (speed-up 3rd) — preserved verbatim
+        // from the pre-dedup code via the shared helper (mahbot-1045 A1).
+        let augmented = super::augment_pcm_variants(utterance, TARGET_SAMPLE_RATE, i as u64, false);
+        let has_speed_up = augmented.iter().any(|v| v.variant_index == 2);
 
         info!(
             "Utterance {i}: {} samples ({:.2}s) → original + speed_down + {} + vol_down + noise",
             utterance.len(),
             utterance.len() as f64 / f64::from(super::SAMPLE_RATE),
-            if speed_up.is_some() {
+            if has_speed_up {
                 "speed_up".to_string()
             } else {
                 "speed_up(skipped,<500ms)".to_string()
@@ -1677,37 +1797,23 @@ fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<Emb
             }
         };
 
-        push_variant(0, Source::Enrollment, None, utterance, &mut dense_sequences);
-        push_variant(
-            1,
-            Source::Augmentation,
-            Some(AugmentationFamily::SpeedDown),
-            &speed_down,
-            &mut dense_sequences,
-        );
-        if let Some(ref spd_up) = speed_up {
+        for variant in augmented {
+            let (source, aug_family) = match variant.variant_index {
+                0 => (Source::Enrollment, None),
+                1 => (Source::Augmentation, Some(AugmentationFamily::SpeedDown)),
+                2 => (Source::Augmentation, Some(AugmentationFamily::SpeedUp)),
+                3 => (Source::Augmentation, Some(AugmentationFamily::Volume)),
+                4 => (Source::Augmentation, Some(AugmentationFamily::Noise)),
+                _ => unreachable!("augment_pcm_variants yields only indices 0..=4"),
+            };
             push_variant(
-                2,
-                Source::Augmentation,
-                Some(AugmentationFamily::SpeedUp),
-                spd_up,
+                variant.variant_index,
+                source,
+                aug_family,
+                &variant.pcm,
                 &mut dense_sequences,
             );
         }
-        push_variant(
-            3,
-            Source::Augmentation,
-            Some(AugmentationFamily::Volume),
-            &volume_down,
-            &mut dense_sequences,
-        );
-        push_variant(
-            4,
-            Source::Augmentation,
-            Some(AugmentationFamily::Noise),
-            &noise,
-            &mut dense_sequences,
-        );
     }
 
     info!(
@@ -2721,7 +2827,7 @@ fn pv_to_json(
             };
             obj.insert(
                 "trigger_frame_total_score".to_string(),
-                serde_json::json!(frame[0]),
+                serde_json::json!(frame[TOTAL_SCORE_IDX]),
             );
             obj.insert(
                 "trigger_frame_rolling_sum".to_string(),
@@ -2815,29 +2921,22 @@ fn augmentation_type(label: &str) -> &'static str {
 
 /// L2-normalized mean embedding (centroid) of the given sequences' embeddings.
 /// Returns `None` when no embeddings exist (mahbot-1005 §6).
+///
+/// The mean-pool step delegates to the production
+/// [`mean_pool_embeddings`](crate::audio::voice_verifier::mean_pool_embeddings)
+/// (mahbot-1045 A5); the L2 normalization stays bench-side so the
+/// `test_vs_train_centroid_cosine` surface is unchanged.
 fn embedding_centroid(
     sequences: &[crate::audio::embedding_sequence::EmbeddingSequence],
 ) -> Option<Vec<f32>> {
-    let mut n = 0usize;
-    let mut sum: Option<Vec<f32>> = None;
-    for seq in sequences {
-        for emb in &seq.embeddings {
-            match &mut sum {
-                Some(s) => {
-                    debug_assert_eq!(s.len(), emb.len());
-                    for (a, b) in s.iter_mut().zip(emb) {
-                        *a += b;
-                    }
-                }
-                None => sum = Some(emb.clone()),
-            }
-            n += 1;
-        }
+    let flat: Vec<Vec<f32>> = sequences
+        .iter()
+        .flat_map(|seq| seq.embeddings.iter().cloned())
+        .collect();
+    if flat.is_empty() {
+        return None;
     }
-    let mut centroid = sum?;
-    for v in &mut centroid {
-        *v /= n as f32;
-    }
+    let mut centroid = crate::audio::voice_verifier::mean_pool_embeddings(&flat);
     let norm = centroid
         .iter()
         .map(|v| v * v)
@@ -3388,15 +3487,14 @@ fn score_embedding_sequence(
 }
 
 /// AGC a PCM clip through a fresh AudioPreprocessor (the training path's
-/// preprocessing — same CONFIG-driven config as streaming, fresh state).
+/// preprocessing — same CONFIG-driven config as streaming, fresh state;
+/// shared helper mahbot-1045 A2).
 fn agc_pcm(pcm: &[f32]) -> Vec<f32> {
-    use crate::audio::audio_preprocessor::AudioPreprocessor;
-    let mut pre = AudioPreprocessor::new(enrollment_preprocessor_config());
-    let mut agc_audio: Vec<f32> = Vec::with_capacity(pcm.len());
-    for chunk in pcm.chunks(super::FRAME_LENGTH) {
-        agc_audio.extend(pre.process(chunk.to_vec()));
-    }
-    agc_audio
+    crate::audio::audio_preprocessor::agc_feed_fresh(
+        pcm,
+        super::FRAME_LENGTH,
+        enrollment_preprocessor_config(),
+    )
 }
 
 /// Run the SAME PCM through both paths and compare per-window embeddings and
@@ -3425,7 +3523,6 @@ fn run_dual_path_capture(
     classifier: &WakeWordClassifier,
     verifier: &VoiceVerifier,
 ) -> DualPathComparison {
-    use crate::audio::audio_preprocessor::AudioPreprocessor;
     let models = super::ONNX_MODELS
         .get()
         .expect("ONNX models must be loaded by the benchmark");
@@ -3447,7 +3544,11 @@ fn run_dual_path_capture(
             .collect(),
         hashes: instr.per_frame_embedding_hashes.clone(),
         embedding_l2: instr.per_frame_embedding_l2_norms.clone(),
-        classifier_scores: instr.per_frame_scores.iter().map(|s| s[0]).collect(),
+        classifier_scores: instr
+            .per_frame_scores
+            .iter()
+            .map(|s| s[TOTAL_SCORE_IDX])
+            .collect(),
         verifier_scores: instr.per_frame_verifier_scores.clone(),
         max_rolling_sum: max_rolling_sum(&instr.per_frame_scores),
         geometry: instr
@@ -3467,11 +3568,11 @@ fn run_dual_path_capture(
     // streaming side is therefore the mel-call granularity (one whole-
     // utterance call vs per-batch flushes) and the window grid, which is
     // exactly what the ticket measures.
-    let mut pre = AudioPreprocessor::new(enrollment_preprocessor_config());
-    let mut agc_audio: Vec<f32> = Vec::with_capacity(pcm.len());
-    for chunk in pcm.chunks(super::FRAME_LENGTH) {
-        agc_audio.extend(pre.process(chunk.to_vec()));
-    }
+    let agc_audio = crate::audio::audio_preprocessor::agc_feed_fresh(
+        pcm,
+        super::FRAME_LENGTH,
+        enrollment_preprocessor_config(),
+    );
     let (training, _training_starts, training_embeddings) = if agc_audio.is_empty() {
         (DualPathSide::empty(), Vec::new(), Vec::new())
     } else {
@@ -3718,7 +3819,6 @@ fn run_anchor_probe(
     classifier: &WakeWordClassifier,
     verifier: &VoiceVerifier,
 ) -> Option<AnchorProbeResult> {
-    use crate::audio::audio_preprocessor::AudioPreprocessor;
     let models = super::ONNX_MODELS
         .get()
         .expect("ONNX models must be loaded by the benchmark");
@@ -3731,7 +3831,7 @@ fn run_anchor_probe(
         .instrumentation
         .per_frame_scores
         .iter()
-        .map(|s| s[0])
+        .map(|s| s[TOTAL_SCORE_IDX])
         .collect();
     let natural_real_frames: Vec<usize> = ctx
         .instrumentation
@@ -3749,11 +3849,11 @@ fn run_anchor_probe(
     }
 
     // ── Training-anchored grid over the streaming mel layout ──────────────
-    let mut pre = AudioPreprocessor::new(enrollment_preprocessor_config());
-    let mut agc_audio: Vec<f32> = Vec::with_capacity(pcm.len());
-    for chunk in pcm.chunks(super::FRAME_LENGTH) {
-        agc_audio.extend(pre.process(chunk.to_vec()));
-    }
+    let agc_audio = crate::audio::audio_preprocessor::agc_feed_fresh(
+        pcm,
+        super::FRAME_LENGTH,
+        enrollment_preprocessor_config(),
+    );
     let mut detector = Detector::default();
     let (mel_frames, _speech_audio) = super::vad_gate_streaming_mel(&agc_audio, |hop| {
         super::is_speech_with_detector(hop, &mut detector, super::VAD_THRESHOLD)
@@ -3896,7 +3996,10 @@ fn classify_localization_bucket(
             let mean_score = if pv.per_frame_scores.is_empty() {
                 0.0
             } else {
-                pv.per_frame_scores.iter().map(|s| s[0]).sum::<f32>()
+                pv.per_frame_scores
+                    .iter()
+                    .map(|s| s[TOTAL_SCORE_IDX])
+                    .sum::<f32>()
                     / pv.per_frame_scores.len() as f32
             };
             ev.insert(
@@ -4634,6 +4737,23 @@ struct BsweepReport {
 /// the SHARED live detector (faithful to the streaming pipeline) or a FRESH
 /// detector (the enrollment/training path's per-clip fresh detector).
 /// Returns `(mel_frames, mel_len)`.
+///
+/// # Global VAD state mutation (mahbot-1045 A6 — documentation only)
+///
+/// When `shared == true` this helper feeds every hop into the global
+/// [`super::VAD_DETECTOR`] singleton (via [`super::vad_gate_streaming_mel`]),
+/// **advancing its internal noise-floor / detection state**.  The B-sweep
+/// calls it with `shared = true` for the F1 clip and each variant; those
+/// calls run AFTER Phase 8b and BEFORE Phase 9, so the mutated detector state
+/// is what Phase 9+ (`per_hop_vad`, negative-phase detection) observes.
+/// This is intentional and baked into the recorded baselines:
+///
+/// * The drift is disclosed in the report under `bsweep.vad_path.drift_disclosure`.
+/// * The `OnceLock<Mutex<Detector>>` has no reset/replace API, and resetting
+///   would break byte-identity of the Phase 9+ `per_hop_vad` surfaces vs the
+///   recorded baseline — do NOT attempt a reset (manager pin, mahbot-1045 A6).
+/// * Phase 8b and Phase 8d also mutate the same global detector before the
+///   sweep runs, so the drift is cumulative across all three.
 fn bsweep_streaming_mel(pcm: &[f32], shared: bool) -> (Vec<Vec<f32>>, usize) {
     let agc = agc_pcm(pcm);
     let (mel, _speech_audio) = if shared {
@@ -5039,39 +5159,36 @@ fn bsweep_training_path_scores(
     }
 
     // ── Augment the VAD-gated speech (vad_segment_and_enroll semantics) ──
-    // utterance index 0 (single F1 clip) → noise seed 0.
+    // utterance index 0 (single F1 clip) → noise seed 0.  Push order via the
+    // shared helper (mahbot-1045 A1) with speed-up chained LAST, preserving
+    // the recorded baseline's produced-variant counts and verifier training
+    // order.
     let utterance_idx = 0usize;
-    let speed_down = crate::util::speed_perturbation(&speech_audio, TARGET_SAMPLE_RATE, 0.95);
-    let pre_pad_duration_samples = speech_audio
-        .len()
-        .saturating_sub(2 * super::CONTEXT_PADDING_SAMPLES);
-    let pre_pad_duration_ms =
-        (pre_pad_duration_samples as u64 * 1000) / u64::from(TARGET_SAMPLE_RATE);
-    let speed_up = if pre_pad_duration_ms >= 500 {
-        Some(crate::util::speed_perturbation(
-            &speech_audio,
-            TARGET_SAMPLE_RATE,
-            1.05,
-        ))
-    } else {
-        None
-    };
-    let volume_down = crate::util::apply_gain(&speech_audio, -3.0);
-    let noise = crate::util::add_noise(&speech_audio, 25.0, utterance_idx as u64);
+    let augmented = super::augment_pcm_variants(
+        &speech_audio,
+        TARGET_SAMPLE_RATE,
+        utterance_idx as u64,
+        true,
+    );
 
     // Variants in push order: original, speed-down, vol-down, noise, then
     // speed-up chained LAST (conditional on VAD-gated pre-pad >= 500 ms).
     // (The speed-up gate differs from the raw-level TTS pre-pad gate of
     // item 3a — the produced-variant counts are reported per semantics.)
-    let variants: Vec<(String, Vec<f32>)> = [
-        ("original".to_string(), speech_audio.clone()),
-        ("speed_down".to_string(), speed_down),
-        ("vol_down".to_string(), volume_down),
-        ("noise".to_string(), noise),
-    ]
-    .into_iter()
-    .chain(speed_up.map(|sp| ("speed_up".to_string(), sp)))
-    .collect();
+    let variants: Vec<(String, Vec<f32>)> = augmented
+        .into_iter()
+        .map(|v| {
+            let label = match v.variant_index {
+                0 => "original",
+                1 => "speed_down",
+                2 => "speed_up",
+                3 => "vol_down",
+                4 => "noise",
+                _ => unreachable!("augment_pcm_variants yields only indices 0..=4"),
+            };
+            (label.to_string(), v.pcm)
+        })
+        .collect();
 
     let mut results = Vec::with_capacity(variants.len());
     for (variant_label, variant_pcm) in variants {
@@ -6513,6 +6630,103 @@ fn safety_gate(all_neg_pv: &[(&PerVariantResult, String)]) -> serde_json::Value 
                      enrolled_speaker section; the per-run verifier weights \
                      fingerprint is in the bsweep section.",
         },
+    })
+}
+
+/// mahbot-1045 B2 (report-only): train the synthetic-negatives fallback
+/// path on the bench's positive sequences (as if Phase-3 owner collection
+/// yielded nothing) with a FIXED seed, and compare recall + fingerprint vs
+/// the main verifier.
+///
+/// The fallback verifier is trained through the bench-only seeded entry
+/// point [`VoiceVerifier::train_ensemble_with_synthetic_negatives_seeded`]
+/// (the production public wrapper still draws entropy via `rand::random()`,
+/// so this probe introduces zero production behavior change).  Its weights
+/// fingerprint uses the SAME [`weights_fingerprint_verifier`] mechanism as
+/// the main verifier so the two are directly comparable, and its recall on
+/// the held-out positive test variants uses the shared training-path scoring
+/// helper [`score_embedding_sequence_with`] with the same constant 0.86
+/// acceptance floor the enrolled-speaker phase applies (mahbot-1023).
+///
+/// # Params
+///
+/// * `pos_sequences` — the bench's positive [`EmbeddingSequence`]s, used to
+///   train the fallback verifier exactly as the production fallback path
+///   would after a Phase-3 owner-collection yield of nothing.
+/// * `pos_test_variants` — held-out positive (PCM, label) test variants,
+///   scored through the fallback verifier for the recall fraction.
+/// * `main_verifier` — the Phase-5 trained verifier; only fingerprinted for
+///   comparison (never mutated).
+/// * `classifier` — the Phase-4 trained classifier, required by the shared
+///   [`score_embedding_sequence_with`] scoring helper.
+fn synthetic_fallback_probe(
+    pos_sequences: &[EmbeddingSequence],
+    pos_test_variants: &[(Vec<f32>, String)],
+    main_verifier: &VoiceVerifier,
+    classifier: &WakeWordClassifier,
+) -> serde_json::Value {
+    // mahbot-1045 — deterministic (the bench never draws entropy here).
+    const SYNTH_FALLBACK_SEED: u64 = 1045;
+
+    // Train the production synthetic-fallback path with the fixed seed.  The
+    // seeded entry point is pub(crate) bench/test-only; production keeps the
+    // entropy-drawn public wrapper.
+    let fallback_verifier = VoiceVerifier::train_ensemble_with_synthetic_negatives_seeded(
+        pos_sequences,
+        DEFAULT_VERIFIER_THRESHOLD,
+        SYNTH_FALLBACK_SEED,
+    );
+
+    // Fingerprint both verifiers with the bench's shared weights-sha256
+    // mechanism (primary + ensemble members + calibrated threshold), so the
+    // fallback-vs-main comparison is apples-to-apples.
+    let fallback_verifier_fingerprint = weights_fingerprint_verifier(&fallback_verifier);
+    let main_verifier_fingerprint = weights_fingerprint_verifier(main_verifier);
+
+    // Recall: score each positive test variant through the fallback verifier
+    // via the shared training-path scoring helper (fresh AGC +
+    // process_enrollment_sample + score_embedding_sequence_with — the same
+    // pure-embedding path the mahbot-1012 / mahbot-1022 comparisons use).
+    // A variant counts as detected when its peak verifier score reaches the
+    // constant VERIFIER_ACCEPTANCE_FLOOR (0.86) — the enrolled-speaker
+    // acceptance criterion (mahbot-1023).  Variants that yield no embeddings
+    // are fail-closed (not detected).
+    let total = pos_test_variants.len();
+    let mut detected = 0usize;
+    for (pcm, _label) in pos_test_variants {
+        let agc_audio = agc_pcm(pcm);
+        let embs = if agc_audio.is_empty() {
+            Vec::new()
+        } else {
+            super::process_enrollment_sample(&agc_audio).unwrap_or_default()
+        };
+        if embs.is_empty() {
+            continue; // fail-closed: no embeddings -> not detected
+        }
+        let (_, verifier_scores, _) =
+            score_embedding_sequence_with(&embs, classifier, &fallback_verifier);
+        let peak = verifier_scores.iter().copied().fold(0.0_f32, f32::max);
+        if peak >= crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR {
+            detected += 1;
+        }
+    }
+
+    serde_json::json!({
+        "seed": SYNTH_FALLBACK_SEED,
+        "trained": fallback_verifier.is_trained(),
+        "fallback_verifier_fingerprint": fallback_verifier_fingerprint,
+        "main_verifier_fingerprint": main_verifier_fingerprint,
+        "recall_on_positive_test_variants": if total > 0 {
+            detected as f64 / total as f64
+        } else {
+            0.0
+        },
+        "n_test_variants": total,
+        "note": "Production synthetic-fallback path (train_ensemble_with_synthetic_negatives, \
+                 used when Phase-3 owner collection yields nothing) trained on the bench's \
+                 positive sequences with a FIXED seed (deterministic, report-only).  The \
+                 seeded entry point is bench/test-only — production still draws entropy via \
+                 rand::random(), so zero production behavior change.",
     })
 }
 
@@ -8332,14 +8546,13 @@ pub(crate) fn run_internal() {
     let train_centroid = embedding_centroid(&pos_sequences);
     let mut test_centroid_sims: Vec<(String, f32)> = Vec::new();
     if !degenerate && let Some(centroid) = &train_centroid {
-        use crate::audio::audio_preprocessor::AudioPreprocessor;
         let chunk_size = super::FRAME_LENGTH;
         for (pcm, label) in &pos_test_variants {
-            let mut pre = AudioPreprocessor::new(enrollment_preprocessor_config());
-            let mut agc_audio: Vec<f32> = Vec::with_capacity(pcm.len());
-            for chunk in pcm.chunks(chunk_size) {
-                agc_audio.extend(pre.process(chunk.to_vec()));
-            }
+            let agc_audio = crate::audio::audio_preprocessor::agc_feed_fresh(
+                pcm,
+                chunk_size,
+                enrollment_preprocessor_config(),
+            );
             if let Ok(embs) = super::process_enrollment_sample(&agc_audio)
                 && !embs.is_empty()
             {
@@ -8378,6 +8591,135 @@ pub(crate) fn run_internal() {
     } else {
         "pink_noise_fallback"
     };
+
+    // ── Phase-B alignment probes (mahbot-1045, report-only) ──
+
+    // B1: TTS-echo gate probe.  The offline bench never runs the mic loop,
+    // so the probe locks the voice-tests setter → is_playback_active()
+    // predicate roundtrip — the exact predicate the production mic arm
+    // consults to drop the WHOLE chunk (pre-AGC ring included) while
+    // playback is active (voice.rs mic-chunk arm, mahbot-896).  The actual
+    // chunk-drop behavior is exercised only by that production arm, which
+    // the offline bench cannot drive; zero production change.
+    let tts_echo_gate_probe = {
+        tts::set_playback_active_for_test(true);
+        let gate_active = tts::is_playback_active();
+        tts::set_playback_active_for_test(false);
+        let gate_cleared = !tts::is_playback_active();
+        serde_json::json!({
+            "probe": "TTS-echo gate (mahbot-1045 B1)",
+            "gate_active_while_playback": gate_active,
+            "gate_cleared_after_clear": gate_cleared,
+            "note": "Predicate-level roundtrip only: the voice-tests setter and \
+                     is_playback_active() (the predicate the production mic arm \
+                     consults at voice.rs:7190 to drop the whole chunk while \
+                     playback is active).  The offline bench never runs the mic \
+                     loop, so the chunk-drop gate itself is not exercised here — \
+                     the instrumentation counters are static regardless of the \
+                     gate; zero production change.",
+        })
+    };
+
+    // B4: production metrics snapshot — the only production diagnostics
+    // surface with zero bench coverage before mahbot-1045.  The offline bench
+    // never runs the mic loop (chunks_received/dropped_chunks stay 0); the
+    // plausibility contract is: embeddings WERE computed by the production
+    // streaming path (Phase 8b same-audio capture) and the drop rate is 0.
+    let production_metrics_probe = {
+        let metrics = super::get_voice_metrics();
+        let drop_rate = metrics.drop_rate(); // guards the 0/0 denominator
+        let plausible = metrics.embeddings_computed > 0 && drop_rate == 0.0;
+        if !plausible {
+            warn!(
+                "mahbot-1045 B4: production metrics implausible — \
+                 embeddings_computed={}, drop_rate={drop_rate}",
+                metrics.embeddings_computed,
+            );
+        }
+        serde_json::json!({
+            "probe": "production metrics (mahbot-1045 B4)",
+            "chunks_received": metrics.chunks_received,
+            "dropped_chunks": metrics.dropped_chunks,
+            "embeddings_computed": metrics.embeddings_computed,
+            "drop_rate": drop_rate,
+            "plausible": plausible,
+            "note": "drop_rate guards the zero denominator (0/0 → 0.0); \
+                     chunks_received/dropped_chunks are mic-loop-only and stay 0 in \
+                     the offline bench by construction.",
+        })
+    };
+
+    // B5: embedding cache hit↔miss equivalence (mahbot-1045, bounded probe).
+    // A full-cache miss recompute is NOT attempted (ONNX for ~200 utterances ×
+    // 5 variants would run minutes — near the 30-min harness budget — and the
+    // prewarm's OnceLock fast-path makes a second in-process prewarm a no-op).
+    // Instead the probe locks the write→read cache-format equivalence on ONE
+    // representative utterance: the miss path writes exactly these bytes and
+    // the hit path reads them back through the same push helper, so a
+    // byte-identical read-back proves a warm run reproduces the cold run's
+    // training data — the mahbot-1029 cache win.
+    let embedding_cache_probe = {
+        let sample = confusable_dense_cache
+            .iter()
+            .find(|s| s.id.variant_index == 0);
+        match sample {
+            Some(first) => {
+                let seq_idx = first.id.sequence_index;
+                let mut variants: Vec<(u8, Vec<Vec<f32>>)> = confusable_dense_cache
+                    .iter()
+                    .filter(|s| s.id.sequence_index == seq_idx)
+                    .map(|s| {
+                        (
+                            u8::try_from(s.id.variant_index).expect("variant index fits in u8"),
+                            s.embeddings.clone(),
+                        )
+                    })
+                    .collect();
+                variants.sort_by_key(|(vi, _)| *vi);
+                let tmp_dir = std::env::temp_dir().join(format!(
+                    "mahbot1045_embed_cache_probe_{}",
+                    std::process::id()
+                ));
+                let key = format!("probe_{seq_idx}");
+                super::write_embedding_cache(&tmp_dir, &key, &variants);
+                let read_back = super::read_embedding_cache(&tmp_dir, &key);
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                serde_json::json!({
+                    "probe": "embedding cache hit↔miss equivalence (mahbot-1045 B5)",
+                    "utterance_sequence_index": seq_idx,
+                    "n_variants_roundtripped": variants.len(),
+                    "read_back_byte_identical": read_back.as_ref() == Some(&variants),
+                    "note": "Bounded probe: cache-format write→read roundtrip on ONE \
+                             representative utterance (no ONNX recompute).",
+                })
+            }
+            None => serde_json::json!({
+                "probe": "embedding cache hit↔miss equivalence (mahbot-1045 B5)",
+                "read_back_byte_identical": false,
+                "note": "SKIPPED — no confusable prewarm sequences available.",
+            }),
+        }
+    };
+
+    // B2: synthetic-fallback verifier path (mahbot-1045, report-only).
+    // Trains the production fallback (used when Phase-3 owner collection
+    // yields nothing) on the bench's positives with a FIXED seed and compares
+    // recall + fingerprint vs the main verifier.  Runs AFTER all phases, so
+    // its internal entropy draw (train_ensemble_with_metrics member seeds)
+    // cannot shift any byte-stable surface.
+    let synthetic_fallback_probe_value =
+        synthetic_fallback_probe(&pos_sequences, &pos_test_variants, &verifier, &classifier);
+
+    // B3: enrollment-quality scoring (mahbot-1045, report-only).  The bench's
+    // clips have no pre-AGC ring → heuristic SNR (estimate_snr_energy).
+    let enrollment_quality_probe_value = enrollment_quality_probe(&train_clips);
+
+    // B6: VAD feed-contract cross-check (mahbot-1045, report-only).  Replays
+    // production's feed pattern (only NEW hop samples) vs the bench's VAD
+    // segmentation on the same audio — the mahbot-900 contract guard.
+    let vad_feed_cross_check_probe_value =
+        vad_feed_cross_check_probe(train_clips.first().map_or(&[], |(pcm, _)| &pcm[..]));
+
     let reproducibility = serde_json::json!({
         "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         "seeds": {
@@ -8402,7 +8744,21 @@ pub(crate) fn run_internal() {
             "warmup_tts_cached": WARMUP_TTS_CACHE.get().is_some(),
             "cache_dir": cache_dir_path.display().to_string(),
         },
+        // mahbot-1045 B7: ring lengths the bench sets and production reads for
+        // geometry classification (previously invisible to the report).
+        "geometry_constants": {
+            "window_size": crate::audio::wake_word_classifier::WINDOW_SIZE,
+            "embedding_ring_max": super::EMBEDDING_RING_MAX,
+            "verifier_window_size": crate::VERIFIER_WINDOW_SIZE,
+        },
         "warmup_source": warmup_source,
+        // mahbot-1045 Phase B alignment probes (report-only, additive).
+        "tts_echo_gate": tts_echo_gate_probe,
+        "production_metrics": production_metrics_probe,
+        "embedding_cache": embedding_cache_probe,
+        "synthetic_fallback": synthetic_fallback_probe_value,
+        "enrollment_quality": enrollment_quality_probe_value,
+        "vad_feed_cross_check": vad_feed_cross_check_probe_value,
         "train_test_split": {
             "n_train_clips": train_clips.len(),
             "n_test_clips": test_clips.len(),
@@ -9179,4 +9535,77 @@ pub(crate) fn run_internal() {
     // Stop heartbeat thread and wait for it to exit.
     heartbeat_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = heartbeat_handle.join();
+}
+
+// ── mahbot-1045 A1 fixture tests ─────────────────────────────────────────
+// Compile under `cargo test --features voice-tests` (the bench module is
+// feature-gated; `#[cfg(test)]` keeps these out of the harness=false bench
+// binary).  Locks the real `pcm_augment_enrollment_variants` site (the
+// canonical raw-TTS-PCM gate input) to the golden captured from the
+// pre-dedup inline code at HEAD 0d1a074.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic fixed input PCM (no RNG) — same generator as the
+    /// `voice.rs::augment_tests` fixture so hashes line up across modules.
+    fn fixture_pcm(len: usize) -> Vec<f32> {
+        let sample_rate = TARGET_SAMPLE_RATE as f32;
+        (0..len)
+            .map(|i| {
+                let t = i as f32 / sample_rate;
+                (0.5 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
+                    + 0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin())
+                    * (1.0 - t / 2.0).max(0.0)
+            })
+            .collect()
+    }
+
+    /// SHA-256 over the ordered `(label, pcm)` pairs as
+    /// `pcm_augment_enrollment_variants` returns them.
+    fn hash_labeled_variants(variants: &[(Vec<f32>, String)]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for (pcm, label) in variants {
+            hasher.update(label.as_bytes());
+            hasher.update([0u8]);
+            for sample in pcm {
+                hasher.update(sample.to_le_bytes());
+            }
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    #[test]
+    fn pcm_augment_enrollment_variants_matches_golden() {
+        // Fixed input + loop-index seed → byte-identical output to the
+        // pre-dedup inline code (golden captured at HEAD 0d1a074).
+        let variants = vec![(fixture_pcm(16000), "wake".to_string())];
+        let out = pcm_augment_enrollment_variants(&variants);
+        let h = hash_labeled_variants(&out);
+        println!("GOLDEN P-site: long={h}");
+
+        let short_variants = vec![(fixture_pcm(4000), "wake".to_string())];
+        let short_out = pcm_augment_enrollment_variants(&short_variants);
+        let hs = hash_labeled_variants(&short_out);
+        println!("GOLDEN P-site: short={hs}");
+
+        assert_eq!(out.len(), 5, "long input → all 5 variants");
+        // captured from pre-dedup HEAD 0d1a074:
+        assert_eq!(
+            h, "713c6c657d2b9852ffba67e09919d82171c14002726abb391dff6bbaeb63e85c",
+            "long-input golden drifted"
+        );
+
+        assert_eq!(short_out.len(), 4, "short input → speed-up skipped");
+        assert!(
+            short_out.iter().all(|(_, l)| !l.ends_with("speed_up")),
+            "short input must not contain a speed-up variant"
+        );
+        assert_eq!(
+            hs, "90e1d139ed23e4ffcd13476a35d91d35b06d2b7e4e5f89eb7d20174c47249494",
+            "short-input golden drifted"
+        );
+    }
 }

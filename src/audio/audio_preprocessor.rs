@@ -477,6 +477,40 @@ impl AudioPreprocessor {
     }
 }
 
+// ── Shared fresh-AGC feed helper (mahbot-1045 A2) ───────────────────────
+
+/// Feed `pcm` through a fresh [`AudioPreprocessor`] in `chunk_size` frames,
+/// returning the concatenated processed audio.
+///
+/// Shared by the E2E bench (7 sites) and the production prewarm path
+/// (`prewarm_phrase_embeddings`) so the per-segment fresh-AGC distribution
+/// cannot drift (mahbot-1009 / mahbot-1006 B/L).  A fresh preprocessor per
+/// segment matches the streaming pipeline's per-segment reset — a shared
+/// preprocessor would process the Nth clip with AGC adapted to N−1 prior
+/// clips, an artifact streaming never produces.
+///
+/// Chunks are fed as-is (no zero-padding): the NS stage buffers incomplete
+/// frames internally and the next chunk completes them — matching the
+/// streaming pipeline's tail accumulation (mahbot-1006 G).
+///
+/// NOTE: the ambient-negative bench path (`generate_ambient_noise_sequences`)
+/// deliberately does NOT use this helper — it routes noise profiles through a
+/// *shared* preprocessor (persistent live-mic semantics), a different
+/// distribution by design.  Changing it would alter ambient-negative
+/// embeddings.
+pub(crate) fn agc_feed_fresh(
+    pcm: &[f32],
+    chunk_size: usize,
+    config: PreprocessorConfig,
+) -> Vec<f32> {
+    let mut pre = AudioPreprocessor::new(config);
+    let mut out: Vec<f32> = Vec::with_capacity(pcm.len());
+    for chunk in pcm.chunks(chunk_size) {
+        out.extend(pre.process(chunk.to_vec()));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -892,19 +926,59 @@ mod tests {
             "Phase 3 after cleanup: rms={rms2:.6} target={target_rms} rel_err={rel_err2:.4}"
         );
     }
-
     /// Test that clear_buffer() resets running_rms to 0.0 so the next speech
     /// chunk triggers lazy init (mahbot-856).
     #[test]
     fn test_lazy_init_after_clear_buffer() {
         run_lazy_init_after_cleanup_test(|pre| pre.clear_buffer());
     }
-
     /// Test that reset() resets running_rms to 0.0 so the next speech chunk
     /// triggers lazy init (mahbot-856).  reset() also reinitialises the noise
     /// suppressor's internal state (not relevant when NS is disabled).
     #[test]
     fn test_lazy_init_after_reset() {
         run_lazy_init_after_cleanup_test(|pre| pre.reset());
+    }
+
+    // ── mahbot-1045 A2: shared fresh-AGC feed helper ──────────────────────
+
+    /// `agc_feed_fresh` must be deterministic and byte-identical to the
+    /// pre-dedup inline fresh-preprocessor chunk loop (same chunk size).
+    /// NOTE: output is NOT chunking-invariant — NS/AGC process per call — so
+    /// every call site must pass its original chunk size (the helper's
+    /// parameter) to preserve the recorded distribution.
+    #[test]
+    fn agc_feed_fresh_matches_inline_loop_and_is_deterministic() {
+        let pcm = sine_tone(0.5, 16_000 + 137, 16_000); // non-multiple of 512
+        let cfg = PreprocessorConfig::default();
+
+        // Reference: the exact inline pattern used by all 8 pre-dedup sites.
+        let mut pre = AudioPreprocessor::new(cfg);
+        let mut expected: Vec<f32> = Vec::with_capacity(pcm.len());
+        for chunk in pcm.chunks(512) {
+            expected.extend(pre.process(chunk.to_vec()));
+        }
+
+        let a = agc_feed_fresh(&pcm, 512, cfg);
+        assert_eq!(
+            a, expected,
+            "helper diverged from the inline fresh-AGC loop"
+        );
+        let b = agc_feed_fresh(&pcm, 512, cfg);
+        assert_eq!(a, b, "helper must be deterministic");
+        assert!(
+            !a.is_empty(),
+            "non-empty input must produce non-empty output"
+        );
+    }
+
+    /// Empty input → empty output, and no panic on tiny inputs.
+    #[test]
+    fn agc_feed_fresh_empty_and_tiny() {
+        let cfg = PreprocessorConfig::default();
+        assert!(agc_feed_fresh(&[], 512, cfg).is_empty());
+        // Sub-frame input (< 160 NS samples) is buffered internally — output
+        // may be empty, but must not panic.
+        let _ = agc_feed_fresh(&[0.1f32; 10], 512, cfg);
     }
 }

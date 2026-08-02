@@ -448,6 +448,19 @@ pub fn is_playback_active() -> bool {
     PLAYBACK_ACTIVE.load(Ordering::Acquire) > 0
 }
 
+/// Test-only hook (mahbot-1045 B1): force the playback-active refcount to a
+/// known state so the E2E bench can probe the TTS-echo gate without real
+/// playback.
+///
+/// Compiled only under the `voice-tests` feature — zero production impact.
+/// The bench runs offline (no mic feed, no real playback), so storing a
+/// fixed value (rather than increment/decrement) is safe there and gives the
+/// probe exact set/clear semantics.
+#[cfg(feature = "voice-tests")]
+pub fn set_playback_active_for_test(active: bool) {
+    PLAYBACK_ACTIVE.store(usize::from(active), Ordering::Release);
+}
+
 /// Initialize the global TTS state.
 pub fn init_global() -> Result<()> {
     GLOBAL_TTS

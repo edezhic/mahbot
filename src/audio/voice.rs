@@ -462,6 +462,271 @@ pub(crate) const CONFUSABLE_SEED_BASE: u64 = 1000;
 ///   seed = UNRELATED_SEED_BASE + i * UNRELATED_SEEDS_PER_PHRASE + j
 pub(crate) const UNRELATED_SEED_BASE: u64 = 2000;
 
+// ── Shared PCM augmentation (mahbot-1045 A1) ─────────────────────────────
+
+/// One PCM variant produced by [`augment_pcm_variants`].
+///
+/// `variant_index` always carries the mahbot-878 index (0 = original,
+/// 1 = speed-down, 2 = speed-up, 3 = volume-down, 4 = pink noise) regardless
+/// of the push order the caller requested.
+#[derive(Debug, Clone)]
+pub(crate) struct AugmentedPcmVariant {
+    /// mahbot-878 variant index (see struct doc).
+    pub variant_index: usize,
+    pub pcm: Vec<f32>,
+}
+
+/// Deterministic 5-variant PCM augmentation of one input clip (mahbot-878).
+///
+/// Produces up to 5 PCM variants from `input`:
+///
+///   0: original (unmodified clone of the input)
+///   1: speed-down 0.95×
+///   2: speed-up 1.05× — included only when the pre-pad duration (input
+///      length minus 2×[`CONTEXT_PADDING_SAMPLES`]) is ≥ 500 ms
+///   3: volume-down −3 dB
+///   4: pink noise at 25 dB SNR, seeded by `noise_seed`
+///
+/// The `input` is the caller's pre-pad gate input (raw TTS PCM, VAD-gated
+/// speech, or a VAD-segmented utterance slice — as each call site passes
+/// today).  `noise_seed` is passed through verbatim (utterance count / TTS
+/// phrase seed / loop index / constant, per site).  All arithmetic is
+/// deterministic — the only RNG is the seeded noise generator inside
+/// [`crate::util::add_noise`].
+///
+/// # Push order
+///
+/// When `speed_up_last` is false the variants are returned in canonical order
+/// 0,1,2,3,4 (speed-up 3rd) — the push order used by every site except the
+/// B-sweep training path.  When true, speed-up is chained LAST (0,1,3,4,2) —
+/// `bsweep_training_path_scores` uses this so its produced-variant counts
+/// and verifier training order match the recorded baseline.  The returned
+/// `variant_index` is unaffected by the push order.
+pub(crate) fn augment_pcm_variants(
+    input: &[f32],
+    sample_rate: u32,
+    noise_seed: u64,
+    speed_up_last: bool,
+) -> Vec<AugmentedPcmVariant> {
+    let speed_down = crate::util::speed_perturbation(input, sample_rate, 0.95);
+    let pre_pad_samples = input.len().saturating_sub(2 * CONTEXT_PADDING_SAMPLES);
+    let pre_pad_ms = (pre_pad_samples as u64 * 1000) / u64::from(sample_rate);
+    let speed_up = if pre_pad_ms >= 500 {
+        Some(crate::util::speed_perturbation(input, sample_rate, 1.05))
+    } else {
+        None
+    };
+    let volume_down = crate::util::apply_gain(input, -3.0);
+    let noise = crate::util::add_noise(input, 25.0, noise_seed);
+
+    let mut variants = Vec::with_capacity(5);
+    variants.push(AugmentedPcmVariant {
+        variant_index: 0,
+        pcm: input.to_vec(),
+    });
+    variants.push(AugmentedPcmVariant {
+        variant_index: 1,
+        pcm: speed_down,
+    });
+    if speed_up_last {
+        variants.push(AugmentedPcmVariant {
+            variant_index: 3,
+            pcm: volume_down,
+        });
+        variants.push(AugmentedPcmVariant {
+            variant_index: 4,
+            pcm: noise,
+        });
+        if let Some(sp) = speed_up {
+            variants.push(AugmentedPcmVariant {
+                variant_index: 2,
+                pcm: sp,
+            });
+        }
+    } else {
+        if let Some(sp) = speed_up {
+            variants.push(AugmentedPcmVariant {
+                variant_index: 2,
+                pcm: sp,
+            });
+        }
+        variants.push(AugmentedPcmVariant {
+            variant_index: 3,
+            pcm: volume_down,
+        });
+        variants.push(AugmentedPcmVariant {
+            variant_index: 4,
+            pcm: noise,
+        });
+    }
+    variants
+}
+
+#[cfg(test)]
+mod augment_tests {
+    //! mahbot-1045 A1: fixture tests locking the shared 5-variant PCM
+    //! augmentation helper to the semantics of the 5 pre-dedup inline sites
+    //! (`pcm_augment_enrollment_variants`, `vad_segment_and_enroll`,
+    //! `bsweep_training_path_scores`, `prewarm_phrase_embeddings`,
+    //! `handle_enrollment_sample`).  Pure arithmetic — no models, no I/O.
+
+    use super::*;
+
+    /// Reference implementation of the pre-dedup inline augmentation,
+    /// transcribed verbatim from the 5 call sites at HEAD 0d1a074 (mahbot-1045
+    /// A1).  All sites shared the identical formula — same speed-up gate
+    /// (`pre_pad_ms >= 500`), same variant order with the B-sweep training
+    /// path chaining speed-up LAST — differing only in sample-rate constant
+    /// (numerically equal), gate input, and noise seed.
+    fn inline_augment(
+        input: &[f32],
+        sample_rate: u32,
+        noise_seed: u64,
+        speed_up_last: bool,
+    ) -> Vec<(usize, Vec<f32>)> {
+        let speed_down = crate::util::speed_perturbation(input, sample_rate, 0.95);
+        let pre_pad_samples = input.len().saturating_sub(2 * CONTEXT_PADDING_SAMPLES);
+        let pre_pad_ms = (pre_pad_samples as u64 * 1000) / u64::from(sample_rate);
+        let speed_up = if pre_pad_ms >= 500 {
+            Some(crate::util::speed_perturbation(input, sample_rate, 1.05))
+        } else {
+            None
+        };
+        let volume_down = crate::util::apply_gain(input, -3.0);
+        let noise = crate::util::add_noise(input, 25.0, noise_seed);
+
+        let mut out = Vec::with_capacity(5);
+        out.push((0, input.to_vec()));
+        out.push((1, speed_down));
+        if speed_up_last {
+            out.push((3, volume_down));
+            out.push((4, noise));
+            if let Some(sp) = speed_up {
+                out.push((2, sp));
+            }
+        } else {
+            if let Some(sp) = speed_up {
+                out.push((2, sp));
+            }
+            out.push((3, volume_down));
+            out.push((4, noise));
+        }
+        out
+    }
+
+    /// Deterministic fixed input PCM (no RNG): 220 Hz + 440 Hz sine ramp that
+    /// decays over the clip — exercises the augmentation's time-domain paths.
+    fn fixed_pcm(len: usize) -> Vec<f32> {
+        let sample_rate = SAMPLE_RATE as f32;
+        (0..len)
+            .map(|i| {
+                let t = i as f32 / sample_rate;
+                (0.5 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
+                    + 0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin())
+                    * (1.0 - t / 2.0).max(0.0)
+            })
+            .collect()
+    }
+
+    /// SHA-256 over the ordered `(variant_index, pcm)` pairs — byte-stable.
+    fn variant_list_hash(variants: &[(usize, Vec<f32>)]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for (idx, pcm) in variants {
+            hasher.update((*idx as u32).to_le_bytes());
+            for sample in pcm {
+                hasher.update(sample.to_le_bytes());
+            }
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Per-site fixture configurations.  `len` is the gate-input length in
+    /// samples (16000 = 1.0 s: pre-pad 800 ms → speed-up present; 4000 =
+    /// 250 ms: pre-pad 50 ms → speed-up skipped).
+    const SITES: [(&str, u64, bool); 5] = [
+        // (site, noise seed source, speed_up_last)
+        ("pcm_augment_enrollment_variants", 3, false), // seed = loop index
+        ("vad_segment_and_enroll", 2, false),          // seed = utterance index
+        ("bsweep_training_path_scores", 0, true),      // seed = utterance_idx = 0, speed-up LAST
+        ("prewarm_phrase_embeddings", 7, false),       // seed = TTS phrase seed
+        ("handle_enrollment_sample", 5, false),        // seed = enrolled_utterance_count
+    ];
+
+    fn run_site(len: usize, seed: u64, speed_up_last: bool) -> Vec<(usize, Vec<f32>)> {
+        let input = fixed_pcm(len);
+        augment_pcm_variants(&input, SAMPLE_RATE, seed, speed_up_last)
+            .into_iter()
+            .map(|v| (v.variant_index, v.pcm))
+            .collect()
+    }
+
+    #[test]
+    fn helper_matches_pre_dedup_inline_semantics() {
+        for &(site, seed, speed_up_last) in &SITES {
+            for len in [16000usize, 4000usize] {
+                let input = fixed_pcm(len);
+                let expected = inline_augment(&input, SAMPLE_RATE, seed, speed_up_last);
+                let actual = run_site(len, seed, speed_up_last);
+                assert_eq!(
+                    expected, actual,
+                    "site {site} (len {len}): helper diverged from pre-dedup inline semantics"
+                );
+                // Both paths must be exercised: long input → speed-up present,
+                // short input → speed-up skipped.
+                let has_speed_up = actual.iter().any(|(idx, _)| *idx == 2);
+                assert_eq!(
+                    has_speed_up,
+                    len == 16000,
+                    "site {site} len {len}: gate flipped"
+                );
+            }
+        }
+    }
+
+    /// Golden hashes captured from the pre-dedup inline code at HEAD 0d1a074
+    /// (via [`inline_augment`], which was verified against the real
+    /// `pcm_augment_enrollment_variants` output in the voice-tests module).
+    /// Any change to the helper's arithmetic, gate, or push order breaks
+    /// these — protecting the byte-stable report surfaces.
+    const GOLDEN_LONG: [&str; 5] = [
+        // (site, seed, speed_up_last=false unless noted) — len 16000
+        "51ea4567dbab1cbf5303beb19e0221264b53d6804f16c7f490451da67be10437", // pcm_augment_enrollment_variants
+        "84e296d09e5061505500cafc5e432456ef33afceda952442913c43d47d8f3682", // vad_segment_and_enroll
+        "6a74756deb45ea25232c43f66a2bb34d68a18f1029d217f3f4a5a648b3d1cbf8", // bsweep_training_path_scores (speed-up LAST)
+        "e6dfdcf2ceb254ff96ac77693c8e597820bd149185b2b692bf20436ebe338aa8", // prewarm_phrase_embeddings
+        "5387f8afe5fdbd923e884e4e17941560bcc299b3fa1b3f99ee6560edd0467ca8", // handle_enrollment_sample
+    ];
+    const GOLDEN_SHORT: [&str; 5] = [
+        // len 4000 (speed-up skipped)
+        "4a82e959bf332c0d0166e77aefb983b059a9e0b57ddca8c2882ad9bca566903a", // pcm_augment_enrollment_variants
+        "10f5278d1e25375c0b7531e949b08ebdc0b6dd068f9c948b9e45a47838d77758", // vad_segment_and_enroll
+        "d638e526c308bbe5fcbc641db6dbae8f66ce370f1738f3426329f0f51d028396", // bsweep_training_path_scores (speed-up LAST)
+        "7b6d27fc60589fa2e400d1f8721ed8962ef3acc87223c0726d271aba8464e798", // prewarm_phrase_embeddings
+        "deca375b26a0d02b62caf34deb18d4b7aafe50102ac027c3ffc667258b808da3", // handle_enrollment_sample
+    ];
+
+    #[test]
+    fn helper_hash_stability() {
+        // Printed once to capture the goldens (see GOLDEN_LONG/SHORT).
+        let mut collected = Vec::new();
+        for (i, &(site, seed, speed_up_last)) in SITES.iter().enumerate() {
+            let long = variant_list_hash(&run_site(16000, seed, speed_up_last));
+            let short = variant_list_hash(&run_site(4000, seed, speed_up_last));
+            println!("GOLDEN site {i} ({site}): long={long} short={short}");
+            collected.push((long, short));
+        }
+        for (i, (long, short)) in collected.iter().enumerate() {
+            let (site, _, _) = SITES[i];
+            assert_eq!(*long, GOLDEN_LONG[i], "site {site} long-input hash drifted");
+            assert_eq!(
+                *short, GOLDEN_SHORT[i],
+                "site {site} short-input hash drifted"
+            );
+        }
+    }
+}
+
 // ── Confusable phrase list for verifier negative training (mahbot-859) ──
 
 /// Canonical confusable near-miss phrases for VoiceVerifier training
@@ -911,8 +1176,6 @@ async fn prewarm_phrase_embeddings(
     // training distribution is representative of what the classifier sees
     // during live inference.
     tokio::task::spawn_blocking(move || {
-        use crate::audio::audio_preprocessor::AudioPreprocessor;
-
         let Some(models) = ONNX_MODELS.get() else {
             return Vec::new();
         };
@@ -1004,12 +1267,14 @@ async fn prewarm_phrase_embeddings(
                 // artifact streaming never produces.  Chunks are fed as-is (no
                 // zero-padding), matching the mic stream (mahbot-1006 G): the
                 // NS stage buffers incomplete frames internally and the next
-                // chunk completes them.
-                let mut pre = AudioPreprocessor::new(pre_config);
-                let mut agc_audio: Vec<f32> = Vec::with_capacity(pcm.len());
-                for chunk in pcm.chunks(FRAME_LENGTH) {
-                    agc_audio.extend(pre.process(chunk.to_vec()));
-                }
+                // chunk completes them.  Shared with the E2E bench via
+                // [`crate::audio::audio_preprocessor::agc_feed_fresh`]
+                // (mahbot-1045 A2).
+                let agc_audio = crate::audio::audio_preprocessor::agc_feed_fresh(
+                    &pcm,
+                    FRAME_LENGTH,
+                    pre_config,
+                );
 
                 // ── 2. VAD-gate (mahbot-1009) ──
                 // Fresh earshot detector per phrase × seed: the prewarm must
@@ -1067,44 +1332,20 @@ async fn prewarm_phrase_embeddings(
                 // (`process_enrollment_sample` → whole-audio mel): the speech
                 // content is identical VAD-gated audio; only the batch-boundary
                 // framing differs slightly.
-                let pre_pad_samples = speech_audio
-                    .len()
-                    .saturating_sub(2 * CONTEXT_PADDING_SAMPLES);
-                let pre_pad_ms = (pre_pad_samples as u64 * 1000) / u64::from(SAMPLE_RATE);
-                let speed_up_opt = if pre_pad_ms >= 500 {
-                    Some(crate::util::speed_perturbation(
-                        &speech_audio,
-                        SAMPLE_RATE,
-                        1.05,
-                    ))
-                } else {
-                    None
-                };
-                let noise_pcm = crate::util::add_noise(&speech_audio, 25.0, seed);
-
-                // 2. Speed-down (0.95×) — variant_index 1
-                let speed_down_pcm =
-                    crate::util::speed_perturbation(&speech_audio, SAMPLE_RATE, 0.95);
-                let dense_embs =
-                    extract_embeddings_from_audio(models, &speed_down_pcm).unwrap_or_default();
-                push_seq(dense_embs, 1);
-
-                // 3. Speed-up (1.05×, conditional) — variant_index 2
-                if let Some(ref sp) = speed_up_opt {
-                    let dense_embs = extract_embeddings_from_audio(models, sp).unwrap_or_default();
-                    push_seq(dense_embs, 2);
+                //
+                // Variant generation is shared with the E2E bench via
+                // [`augment_pcm_variants`] (mahbot-1045 A1): noise seed = the
+                // TTS phrase seed, gate input = VAD-gated speech, canonical
+                // push order (speed-up 3rd).  Variant 0 (original) is pushed
+                // above from the streaming mel frames.
+                for variant in augment_pcm_variants(&speech_audio, SAMPLE_RATE, seed, false) {
+                    if variant.variant_index == 0 {
+                        continue; // original already pushed above
+                    }
+                    let dense_embs =
+                        extract_embeddings_from_audio(models, &variant.pcm).unwrap_or_default();
+                    push_seq(dense_embs, variant.variant_index);
                 }
-
-                // 4. Volume-down (-3dB) — variant_index 3
-                let volume_down_pcm = crate::util::apply_gain(&speech_audio, -3.0);
-                let dense_embs =
-                    extract_embeddings_from_audio(models, &volume_down_pcm).unwrap_or_default();
-                push_seq(dense_embs, 3);
-
-                // 5. Pink noise (SNR 25dB) — variant_index 4
-                let dense_embs =
-                    extract_embeddings_from_audio(models, &noise_pcm).unwrap_or_default();
-                push_seq(dense_embs, 4);
 
                 // ── Persist the per-utterance embedding cache (mahbot-1029 D1) ──
                 // Best-effort: a write failure only costs a recompute on the
@@ -3976,7 +4217,10 @@ pub fn process_enrollment_sample(samples: &[f32]) -> Result<Vec<Vec<f32>>> {
 ///   first sustained speech detection (mahbot-782).  `None` falls back to
 ///   energy-based SNR estimation.
 #[expect(clippy::cast_precision_loss)]
-fn compute_utterance_quality(samples: &[f32], noise_rms: Option<f32>) -> UtteranceQuality {
+pub(crate) fn compute_utterance_quality(
+    samples: &[f32],
+    noise_rms: Option<f32>,
+) -> UtteranceQuality {
     let duration_ms = (samples.len() as u64 * 1000) / u64::from(SAMPLE_RATE);
 
     // ── Clipping detection ───────────────────────────────────────────
@@ -7210,13 +7454,13 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     // spawn_blocking below, avoiding redundant ONNX model lookups and
     // reducing thread spawn overhead.
     //
-    // Pre-padding duration = actual speech duration excluding the 100ms
-    // of context padding at each end.  Used to decide whether speed-up
-    // augmentation is viable (very short utterances would become
-    // unintelligible).
-    let pre_pad_duration_samples = samples.len().saturating_sub(2 * CONTEXT_PADDING_SAMPLES);
-    let pre_pad_duration_ms = (pre_pad_duration_samples as u64 * 1000) / u64::from(SAMPLE_RATE);
-    let skip_speed_up = pre_pad_duration_ms < 500;
+    // Variant generation is shared with the E2E bench via
+    // [`augment_pcm_variants`] (mahbot-1045 A1): noise seed = the enrolled
+    // utterance count read below, gate input = the raw VAD-segmented mic
+    // utterance, canonical push order (speed-up 3rd).  The pre-padding
+    // duration gate (100 ms of context padding at each end; speed-up is
+    // viable only when the unpadded duration is ≥ 500 ms) lives inside the
+    // helper — very short utterances would otherwise become unintelligible.
 
     // Seed for noise from current utterance count (read before incrementing).
     let noise_seed = {
@@ -7225,16 +7469,39 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     };
 
     // Generate variants — all deterministic, no RNG dependency except the
-    // seeded noise generator.
+    // seeded noise generator.  With speed_up_last=false the helper yields
+    // the canonical push order 0,1,2?,3,4 — variant 2 (speed-up) is absent
+    // when the pre-pad duration gate fails, so the remaining length tells
+    // us whether the next element is variant 2 or 3.
     let original = samples.clone();
-    let speed_down = crate::util::speed_perturbation(&samples, SAMPLE_RATE, 0.95);
-    let speed_up = if skip_speed_up {
-        None
+    let mut augmented = augment_pcm_variants(&samples, SAMPLE_RATE, noise_seed, false).into_iter();
+    let _original = augmented
+        .next()
+        .expect("augment_pcm_variants always yields variant 0 (original)");
+    let speed_down = augmented
+        .next()
+        .expect("augment_pcm_variants always yields variant 1 (speed-down)")
+        .pcm;
+    // None when pre-pad < 500 ms (skip_speed_up): the iterator then holds
+    // [3, 4] instead of [2, 3, 4], so 3 remaining elements ⇔ variant 2 present.
+    let speed_up = if augmented.len() == 3 {
+        Some(
+            augmented
+                .next()
+                .expect("augment_pcm_variants always yields variant 2 (speed-up)")
+                .pcm,
+        )
     } else {
-        Some(crate::util::speed_perturbation(&samples, SAMPLE_RATE, 1.05))
+        None
     };
-    let volume_down = crate::util::apply_gain(&samples, -3.0);
-    let noise = crate::util::add_noise(&samples, 25.0, noise_seed);
+    let volume_down = augmented
+        .next()
+        .expect("augment_pcm_variants always yields variant 3 (volume-down)")
+        .pcm;
+    let noise = augmented
+        .next()
+        .expect("augment_pcm_variants always yields variant 4 (noise)")
+        .pcm;
 
     // Clone for quality computation (use the original for quality check).
     let samples_for_quality = original.clone();
