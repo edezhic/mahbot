@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::process::Command;
 use tracing::debug;
 
@@ -131,9 +132,7 @@ impl BrowserTool {
     pub async fn fetch_page_text(&self, url: &str, tab: &str) -> anyhow::Result<String> {
         Self::validate_url(url)?;
 
-        if !Self::is_available().await {
-            anyhow::bail!("chrome-use CLI is not available");
-        }
+        Self::ensure_available().await?;
 
         // Lock is held for the entire navigate + extract sequence so
         // concurrent same-tab access doesn't race between navigation
@@ -157,16 +156,19 @@ impl BrowserTool {
         let _ = self.run_command(&["close"], Some(tab)).await;
     }
 
-    /// Check whether `chrome-use` CLI is available on `$PATH`.
-    pub async fn is_available() -> bool {
-        let cmd = browser_bin();
-        Command::new(cmd)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .is_ok_and(|s| s.success())
+    /// Fail with an actionable error when the chrome-use CLI is missing or the
+    /// daemon is down, distinguishing the two causes. One CLI probe; the daemon
+    /// check is cached.
+    async fn ensure_available() -> anyhow::Result<()> {
+        if !super::browser_daemon::cli_available().await {
+            anyhow::bail!(
+                "chrome-use CLI is not available. Install with: curl -fsSL https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.sh | sh"
+            );
+        }
+        if !super::browser_daemon::is_available().await {
+            anyhow::bail!("{}", super::browser_daemon::daemon_down_message());
+        }
+        Ok(())
     }
 
     /// Validate a URL is structurally safe to navigate to.
@@ -195,8 +197,8 @@ impl BrowserTool {
         args: &[&str],
         tab: Option<&str>,
     ) -> anyhow::Result<BrowserResponse> {
-        let mut cmd = Command::new(browser_bin());
-        ensure_browser_env(&mut cmd);
+        let mut cmd = Command::new(super::browser_daemon::browser_bin());
+        super::browser_daemon::ensure_browser_env(&mut cmd);
         cmd.args(args);
         cmd.arg("--json");
         if let Some(tab) = tab {
@@ -228,6 +230,7 @@ impl BrowserTool {
             } else {
                 enhance_browser_error(error_msg)
             };
+            Self::fail_fast_if_daemon_down(&error_msg)?;
             anyhow::bail!("chrome-use error: {error_msg}");
         }
 
@@ -237,10 +240,23 @@ impl BrowserTool {
         if !response.success {
             let err = response.error.as_deref().unwrap_or("unknown error");
             let enhanced = enhance_browser_error(err.to_string());
+            Self::fail_fast_if_daemon_down(&enhanced)?;
             anyhow::bail!("chrome-use error: {enhanced}");
         }
 
         Ok(response)
+    }
+
+    /// If an error carries the daemon-unavailable signature, mark the daemon
+    /// unhealthy (wakes the auto-recovery watchdog) and return the actionable
+    /// guidance immediately — the CLI already retried internally, so adding
+    /// more retries would only burn more time.
+    fn fail_fast_if_daemon_down(error: &str) -> anyhow::Result<()> {
+        if super::browser_daemon::is_daemon_unavailable_error(error) {
+            super::browser_daemon::note_unhealthy();
+            anyhow::bail!("{}", super::browser_daemon::daemon_down_message());
+        }
+        Ok(())
     }
 
     /// Extract visible rendered text via `innerText`, falling back to `get text`
@@ -346,11 +362,27 @@ impl BrowserTool {
 /// sessions hold open ports and lingering instances that can
 /// interfere with the next daemon startup.
 pub async fn close_all_browser_sessions() {
-    let cmd = browser_bin();
+    if tokio::time::timeout(SHUTDOWN_CLEANUP_TIMEOUT, close_all_browser_sessions_inner())
+        .await
+        .is_err()
+    {
+        tracing::warn!("chrome-use session cleanup timed out — daemon wedged, skipping");
+    }
+}
+
+/// Bound on the whole session-cleanup sequence at shutdown. A wedged daemon
+/// hangs each CLI call in its internal ~152 s retry loop, so without this cap
+/// shutdown would stall; cleanup is best-effort anyway (a dead daemon cannot
+/// be cleaned up, and the watchdog recovers it after restart).
+const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn close_all_browser_sessions_inner() {
+    let cmd = super::browser_daemon::browser_bin();
 
     // List active sessions
     let mut list_cmd = Command::new(cmd);
-    ensure_browser_env(&mut list_cmd);
+    super::browser_daemon::ensure_browser_env(&mut list_cmd);
+    list_cmd.kill_on_drop(true);
     let list_output = match list_cmd.args(["session", "list", "--json"]).output().await {
         Ok(o) => o,
         Err(e) => {
@@ -394,7 +426,8 @@ pub async fn close_all_browser_sessions() {
             // session_id is &String, cmd is &'static str (Copy)
             async move {
                 let mut close_cmd = Command::new(cmd);
-                ensure_browser_env(&mut close_cmd);
+                super::browser_daemon::ensure_browser_env(&mut close_cmd);
+                close_cmd.kill_on_drop(true);
                 match close_cmd
                     .args(["--session", session_id, "close"])
                     .stdout(Stdio::null())
@@ -445,6 +478,10 @@ fn action_schema(name: &str, description: &str, required: &[&str], properties: &
 impl Tool for BrowserTool {
     fn name(&self) -> &'static str {
         "browser"
+    }
+
+    fn is_advertised(&self) -> bool {
+        super::browser_daemon::is_advertised()
     }
 
     fn debug_output(
@@ -595,7 +632,8 @@ impl Tool for BrowserTool {
                 "tab": {
                     "type": "string",
                     "description": "Logical name for this browser session. \
-                     Use \"default\" for most browsing. Only use a different \
+                     Use \"default\" for most browsing. Missing or empty \
+                     defaults to \"default\". Only use a different \
                      name (e.g. \"docs\", \"github\") if you need to keep \
                      multiple pages open simultaneously. Same tab = serialized \
                      operations on that page."
@@ -607,38 +645,41 @@ impl Tool for BrowserTool {
 
     #[allow(clippy::too_many_lines)]
     async fn execute(&self, _ws: &Workspace, args: Value) -> anyhow::Result<String> {
-        let tab = super::get_opt_str(&args, "tab")
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Missing or empty 'tab' field in browser arguments — specify which browser \
-                 session to use (e.g. \"main\", \"docs\"). Each tab is an isolated session."
-                )
-            })?;
+        let mut normalized_notes: Vec<String> = Vec::new();
+        let (tab, tab_note) = normalize_tab(&args);
+        if let Some(note) = tab_note {
+            normalized_notes.push(note);
+        }
 
         let action_value = args
             .get("action")
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Missing 'action' field in browser arguments"))?;
-        let action: BrowserAction =
-            serde_json::from_value(action_value.clone()).map_err(|e| {
-                // Give a more helpful message when the LLM uses wrong field names.
-                let hint = match &action_value {
-                    Value::Object(map) if map.contains_key("find") => {
-                        " 'find' requires 'by', 'value', and 'action' fields (use 'value' not 'name' for the locator text). Valid 'action' values: click, fill, type, hover, focus, check, uncheck, text (use 'text' param only for fill/type, not for the 'text' action)".to_string()
-                    }
-                    _ => String::new(),
-                };
-                anyhow::anyhow!("Invalid browser action arguments{hint}: {e}")
-            })?;
+            .ok_or_else(|| anyhow::anyhow!(corrective_action_error(&args)))?;
+        let (action_value, normalized_note) =
+            normalize_action(action_value, &args).map_err(|e| anyhow::anyhow!(e))?;
+        if let Some(note) = normalized_note {
+            normalized_notes.push(format!("action normalized: {action_value} ({note})"));
+        }
+
+        let action: BrowserAction = serde_json::from_value(action_value.clone()).map_err(|e| {
+            // Give a more helpful message when the LLM uses wrong field names,
+            // always including the exact expected shape so the model can
+            // self-correct in one round-trip.
+            let hint = match &action_value {
+                Value::Object(map) if map.contains_key("find") => {
+                    " 'find' requires 'by', 'value', and 'action' fields (use 'value' not 'name' for the locator text). Valid 'action' values: click, fill, type, hover, focus, check, uncheck, text (use 'text' param only for fill/type, not for the 'text' action)".to_string()
+                }
+                _ => String::new(),
+            };
+            anyhow::anyhow!(
+                "Invalid browser action arguments{hint}. Expected action to be {EXPECTED_ACTION_SHAPE}, \
+                 plus a \"tab\" string. Serde error: {e}"
+            )
+        })?;
 
         debug!(tab, action = ?action, "browser action");
 
-        if !Self::is_available().await {
-            anyhow::bail!(
-                "chrome-use CLI is not available. Install with: curl -fsSL https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.sh | sh"
-            );
-        }
+        Self::ensure_available().await?;
 
         // Validate find locator type early for better diagnostics.
         if let BrowserAction::Find {
@@ -685,29 +726,30 @@ impl Tool for BrowserTool {
 
         // Get or create a per-tab lock — only serializes operations on the
         // same tab. Different tabs run fully concurrently.
-        let _guard = self.acquire_tab_lock(tab).await;
+        let _guard = self.acquire_tab_lock(&tab).await;
 
         if let BrowserAction::GetInnerText { selector } = &action {
-            let output = self.get_inner_text(selector, tab).await?;
-            return Ok(if output.is_empty() {
+            let output = self.get_inner_text(selector, &tab).await?;
+            let body = if output.is_empty() {
                 format!("[Tab: {tab}] (no output)")
             } else {
                 format!("[Tab: {tab}] {output}")
-            });
+            };
+            return Ok(Self::with_normalization_notes(body, &normalized_notes));
         }
 
         let cli_args = Self::build_args(&action)?;
         let str_args: Vec<&str> = cli_args.iter().map(String::as_str).collect();
-        let response = self.run_command(&str_args, Some(tab)).await?;
+        let response = self.run_command(&str_args, Some(&tab)).await?;
 
         // After open, wait for network idle, then auto-snapshot
         // so the LLM sees page content immediately.
         let snapshot_output = if matches!(action, BrowserAction::Open { .. }) {
             let wait_args = ["wait", "--load", "networkidle"];
-            let _ = self.run_command(&wait_args, Some(tab)).await;
+            let _ = self.run_command(&wait_args, Some(&tab)).await;
 
             // Run a compact snapshot to return page content.
-            match self.run_command(&["snapshot", "-c"], Some(tab)).await {
+            match self.run_command(&["snapshot", "-c"], Some(&tab)).await {
                 Ok(snap_resp) => snap_resp
                     .data
                     .as_ref()
@@ -753,47 +795,22 @@ impl Tool for BrowserTool {
             format!("[Tab: {tab}] {output}")
         };
 
-        Ok(output)
+        Ok(Self::with_normalization_notes(output, &normalized_notes))
+    }
+}
+
+impl BrowserTool {
+    /// Prepend a note about argument normalization so the model can see what
+    /// was silently corrected (e.g. flattened fields, XML wrapping).
+    fn with_normalization_notes(output: String, notes: &[String]) -> String {
+        if notes.is_empty() {
+            return output;
+        }
+        format!("[normalized] {}\n{output}", notes.join("; "))
     }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
-
-/// Get the platform-appropriate chrome-use binary name.
-const fn browser_bin() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "chrome-use.exe"
-    } else {
-        "chrome-use"
-    }
-}
-
-/// Set HOME, `CHROMIUM_FLAGS`, and default timeout env vars on the command
-/// so that the Chromium spawned by chrome-use works in service/docker
-/// environments.
-fn ensure_browser_env(cmd: &mut Command) {
-    if std::env::var_os("HOME").is_none() {
-        cmd.env("HOME", "/tmp");
-    }
-    // Suppress Chromium's "--enable-crashes-dialog" and GPU-related flags
-    // that cause issues in headless/service environments.
-    if std::env::var_os("CHROMIUM_FLAGS").is_none() {
-        cmd.env(
-            "CHROMIUM_FLAGS",
-            "--no-first-run --no-default-browser-check --disable-gpu",
-        );
-    }
-    // Default 15-second timeout for all chrome-use actions (including
-    // `wait --text` which would otherwise block much longer).
-    cmd.env("AGENT_BROWSER_DEFAULT_TIMEOUT", "15000");
-    // 5-minute idle timeout — the chrome-use daemon shuts down after
-    // 5 minutes of inactivity, cleaning up browser resources.
-    cmd.env("AGENT_BROWSER_IDLE_TIMEOUT_MS", "300000");
-    // Enable human-like interaction speed for bot-detection avoidance.
-    // chrome-use supports the same env vars as agent-browser for backward
-    // compatibility.
-    cmd.env("AGENT_BROWSER_HUMANIZE", "human");
-}
 
 /// Enhance chrome-use error messages with actionable hints for known
 /// failure patterns.
@@ -808,6 +825,324 @@ fn enhance_browser_error(msg: String) -> String {
         )
     } else {
         msg
+    }
+}
+
+// ── Tolerant action normalization ─────────────────────────────────────────
+
+/// Known browser action variant names (must match `BrowserAction` serde names).
+const KNOWN_ACTIONS: &[&str] = &[
+    "open",
+    "snapshot",
+    "click",
+    "get_text",
+    "get_inner_text",
+    "get_innertext",
+    "innertext",
+    "get_url",
+    "press",
+    "eval",
+    "find",
+];
+
+/// Expected action shape, echoed verbatim in corrective errors so the model
+/// can self-correct in one round-trip.
+const EXPECTED_ACTION_SHAPE: &str = "one of: {\"open\":{\"url\":\"https://...\"}}, \
+    {\"snapshot\":{\"interactive_only\":bool,\"compact\":bool,\"depth\":int}}, \
+    {\"click\":{\"selector\":\"...\"}}, {\"get_text\":{\"selector\":\"...\"}}, \
+    {\"get_innertext\":{\"selector\":\"...\"}}, {\"get_url\":{}}, \
+    {\"press\":{\"key\":\"...\"}}, {\"eval\":{\"js\":\"...\"}}, \
+    {\"find\":{\"by\":\"text|role|label|placeholder|alt|title|testid|first|last|nth\",\
+    \"value\":\"...\",\"action\":\"click|fill|type|hover|focus|check|uncheck|text\"}}";
+
+/// Corrective error for an unrecoverable action shape, listing the exact
+/// expected form instead of raw serde text.
+fn corrective_action_error(received: &Value) -> String {
+    format!(
+        "Invalid browser action arguments. Expected action to be {EXPECTED_ACTION_SHAPE}, \
+         plus a \"tab\" string. Received: {received}"
+    )
+}
+
+/// Missing/empty tab defaults to the documented default session. Tabs are
+/// isolated sessions, so defaulting is safe and echoed in tool output.
+fn normalize_tab(args: &Value) -> (String, Option<String>) {
+    match super::get_opt_str(args, "tab").filter(|s| !s.is_empty()) {
+        Some(tab) => (tab.to_string(), None),
+        None => (
+            "default".to_string(),
+            Some("missing/empty tab defaulted to \"default\"".to_string()),
+        ),
+    }
+}
+
+/// Normalize a model-supplied browser `action` value into the canonical
+/// `{"variant": {...}}` tagged form that `BrowserAction` deserializes from.
+///
+/// Recoverable shapes are mapped to their canonical equivalent and a note
+/// describing the correction is returned (so silent acceptance stays visible
+/// in tool output). Unrecoverable shapes produce a corrective error.
+fn normalize_action(action: Value, args: &Value) -> Result<(Value, Option<String>), String> {
+    match action {
+        // Canonical tagged object: {"open": {...}} or {"open": "https://..."}.
+        Value::Object(map) if map.len() == 1 => {
+            let (name, inner) = map.into_iter().next().expect("len == 1");
+            if !KNOWN_ACTIONS.contains(&name.as_str()) {
+                return Err(corrective_action_error(&json!({name: inner})));
+            }
+            match inner {
+                // {"open": "https://..."} — bare-string value for the open action.
+                Value::String(s) if name == "open" => Ok((
+                    json!({"open": {"url": s}}),
+                    Some("bare-string value for open action treated as url".to_string()),
+                )),
+                Value::Object(o) => {
+                    require_find_action(&name, &o)?;
+                    Ok((json!({name: o}), None))
+                }
+                _ => Err(corrective_action_error(&json!({name: inner}))),
+            }
+        }
+        // Plain string: action name, stringified JSON, XML wrapper, or bare URL.
+        Value::String(s) => {
+            let s = s.trim();
+            // Stringified (double-encoded) JSON action.
+            if s.starts_with('{') {
+                return parse_embedded_json(s, args, "stringified JSON");
+            }
+            // CDATA-wrapped JSON: <![CDATA[{"open": {...}}]]>
+            if let Some(inner) = s
+                .strip_prefix("<![CDATA[")
+                .and_then(|r| r.strip_suffix("]]>"))
+            {
+                return parse_embedded_json(inner.trim(), args, "CDATA-wrapped JSON");
+            }
+            // XML-wrapped action (exact observed patterns only).
+            if s.starts_with('<') {
+                if let Some((v, note)) = parse_xml_action(s) {
+                    return Ok((v, Some(note.to_string())));
+                }
+                return Err(corrective_action_error(&Value::String(s.to_string())));
+            }
+            // Bare URL → open action.
+            if s.starts_with("http://") || s.starts_with("https://") {
+                return Ok((
+                    json!({"open": {"url": s}}),
+                    Some("bare URL treated as open action".to_string()),
+                ));
+            }
+            // Plain action name with flattened sibling fields.
+            if KNOWN_ACTIONS.contains(&s) {
+                return build_action_from_siblings(s, args);
+            }
+            Err(corrective_action_error(&Value::String(s.to_string())))
+        }
+        other => Err(corrective_action_error(&other)),
+    }
+}
+
+/// Parse a JSON action string embedded in an outer wrapper (stringified JSON,
+/// CDATA) and recursively normalize it, prefixing the wrapper name in the note.
+fn parse_embedded_json(
+    s: &str,
+    args: &Value,
+    wrapper: &str,
+) -> Result<(Value, Option<String>), String> {
+    let parsed: Value = serde_json::from_str(s)
+        .map_err(|_| corrective_action_error(&Value::String(s.to_string())))?;
+    let (normalized, note) = normalize_action(parsed, args)?;
+    Ok((
+        normalized,
+        Some(match note {
+            Some(inner) => format!("{wrapper} action; {inner}"),
+            None => format!("{wrapper} action parsed"),
+        }),
+    ))
+}
+
+/// The find action carries its own `action` sub-field — reject it without one
+/// (click vs fill vs text would be a side-effecting guess).
+fn require_find_action(name: &str, o: &serde_json::Map<String, Value>) -> Result<(), String> {
+    if name == "find" && !o.contains_key("action") {
+        return Err(corrective_action_error(&json!({name: o})));
+    }
+    Ok(())
+}
+
+/// Build a tagged action object from a plain action name plus sibling fields,
+/// e.g. `{"action":"open","url":"...","tab":"..."}` → `{"open":{"url":"..."}}`.
+fn build_action_from_siblings(name: &str, args: &Value) -> Result<(Value, Option<String>), String> {
+    let Some(obj) = args.as_object() else {
+        return Err(corrective_action_error(args));
+    };
+    let mut siblings = serde_json::Map::new();
+    for (k, v) in obj {
+        if k == "action" || k == "tab" {
+            continue;
+        }
+        siblings.insert(k.clone(), v.clone());
+    }
+
+    // A sibling named after the action holds the full payload object
+    // (e.g. {"action":"open","open":{"url":"..."}}).
+    if let Some(payload) = siblings.remove(name) {
+        let note = format!("sibling '{name}' object used as action payload");
+        match payload {
+            Value::Object(o) => {
+                require_find_action(name, &o)?;
+                Ok((json!({name: o}), Some(note)))
+            }
+            Value::String(s) if name == "open" => Ok((json!({"open": {"url": s}}), Some(note))),
+            Value::String(s) if name == "find" => {
+                // Stringified JSON payload ({"action":"find","find":"{...}"}).
+                let parsed: Value = serde_json::from_str(&s)
+                    .map_err(|_| corrective_action_error(&Value::String(s.clone())))?;
+                let Value::Object(o) = parsed else {
+                    return Err(corrective_action_error(&Value::String(s)));
+                };
+                require_find_action(name, &o)?;
+                Ok((json!({"find": o}), Some(note)))
+            }
+            _ => Err(corrective_action_error(&Value::Object(siblings))),
+        }
+    } else {
+        match name {
+            // open requires a url.
+            "open" => {
+                let url = siblings
+                    .remove("url")
+                    .ok_or_else(|| corrective_action_error(&Value::Object(siblings.clone())))?;
+                Ok((
+                    json!({"open": {"url": url}}),
+                    Some("flattened 'url' wrapped into open action".to_string()),
+                ))
+            }
+            // find requires by/value/action.
+            "find" => {
+                if !siblings.contains_key("action") {
+                    return Err(corrective_action_error(&Value::Object(siblings)));
+                }
+                Ok((
+                    json!({"find": siblings}),
+                    Some("flattened find fields wrapped into find action".to_string()),
+                ))
+            }
+            _ => Ok((
+                json!({name: siblings}),
+                Some(format!("flattened fields wrapped into {name} action")),
+            )),
+        }
+    }
+}
+
+/// Parse the exact XML-wrapped action strings observed in production
+/// (no general XML parser — only these patterns).
+fn parse_xml_action(s: &str) -> Option<(Value, &'static str)> {
+    let s = s.trim();
+    // <open><url>URL</url></open> or <open>URL</open>, with optional
+    // whitespace/newlines inside, and a possible stray `</action>` suffix.
+    let s = s.strip_suffix("</action>").map_or(s, str::trim);
+    if let Some(inner) = s
+        .strip_prefix("<open>")
+        .and_then(|r| r.strip_suffix("</open>"))
+    {
+        let inner = inner.trim();
+        if inner.is_empty() {
+            return None; // <open></open> — open requires a url.
+        }
+        if let Some(url) = inner
+            .strip_prefix("<url>")
+            .and_then(|r| r.strip_suffix("</url>"))
+        {
+            return Some((
+                json!({"open": {"url": url.trim()}}),
+                "XML <open><url>…</url></open>",
+            ));
+        }
+        return Some((json!({"open": {"url": inner}}), "XML <open>URL</open>"));
+    }
+    // <find><by>..</by><value>..</value><action>..</action></find>
+    if let Some(inner) = s
+        .strip_prefix("<find>")
+        .and_then(|r| r.strip_suffix("</find>"))
+    {
+        let mut fields = serde_json::Map::new();
+        for (tag, key) in [
+            ("by", "by"),
+            ("value", "value"),
+            ("action", "action"),
+            ("text", "text"),
+            ("name", "name"),
+            ("exact", "exact"),
+            ("index", "index"),
+        ] {
+            if let Some(v) = extract_xml_field(inner, tag) {
+                fields.insert(key.to_string(), json!(v));
+            }
+        }
+        // exact/index arrive as XML text ("true", "3") — decode them to the
+        // JSON types the serde struct expects instead of failing deserialization.
+        if let Some(v) = fields
+            .get("exact")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<bool>().ok())
+        {
+            fields.insert("exact".to_string(), json!(v));
+        }
+        if let Some(v) = fields
+            .get("index")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            fields.insert("index".to_string(), json!(v));
+        }
+        if !fields.is_empty() {
+            return Some((json!({"find": fields}), "XML <find>…</find>"));
+        }
+    }
+    // Mangled `<parameter name="open" ...>` serializations observed in
+    // production: either a JSON payload or a nested `<parameter name="url" ...>`
+    // holding the bare URL.
+    if let Some(rest) = s.strip_prefix("<parameter name=\"open\"") {
+        let content = rest.split_once('>').map_or(rest, |(_, r)| r).trim();
+        if content.starts_with('{') {
+            if let Ok(parsed) = serde_json::from_str::<Value>(content) {
+                return Some((
+                    json!({"open": parsed}),
+                    "XML <parameter name=\"open\"> JSON",
+                ));
+            }
+        } else if let Some(url) = content
+            .strip_prefix("<parameter name=\"url\"")
+            .and_then(|r| r.split_once('>').map(|(_, r)| r))
+        {
+            let url = url.trim().trim_end_matches("</parameter>").trim();
+            if !url.is_empty() {
+                return Some((
+                    json!({"open": {"url": url}}),
+                    "XML <parameter name=\"open\"> URL",
+                ));
+            }
+        } else if !content.is_empty() {
+            return Some((
+                json!({"open": {"url": content}}),
+                "XML <parameter name=\"open\"> URL",
+            ));
+        }
+    }
+    None
+}
+
+fn extract_xml_field(inner: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = inner.find(&open)? + open.len();
+    let end = inner[start..].find(&close)? + start;
+    let v = inner[start..end].trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
     }
 }
 
@@ -852,6 +1187,7 @@ fn extract_snapshot_text(data: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::browser_daemon::{browser_bin, ensure_browser_env};
     use crate::util::test::set_env_var;
 
     #[test]
@@ -1258,5 +1594,267 @@ mod tests {
             err.to_string().contains("Only http:// and https://"),
             "expected scheme rejection, got: {err}",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tolerant action normalization — each recoverable shape (flat,
+    // stringified, bare-open, XML, missing-tab) normalizes and passes; each
+    // unrecoverable shape produces the corrective-shape error.
+    // -----------------------------------------------------------------------
+
+    fn assert_normalizes(
+        action: serde_json::Value,
+        args: serde_json::Value,
+        expected: serde_json::Value,
+    ) {
+        let (normalized, note) = normalize_action(action, &args).unwrap_or_else(|e| {
+            panic!("expected normalization to succeed, got: {e}");
+        });
+        assert_eq!(normalized, expected, "normalized action mismatch");
+        assert!(
+            note.is_some(),
+            "recoverable shape should echo a normalization note"
+        );
+    }
+
+    fn assert_rejects(action: serde_json::Value, args: serde_json::Value) {
+        let err = normalize_action(action, &args).unwrap_err();
+        assert!(
+            err.contains("Expected action to be"),
+            "expected corrective shape error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn normalize_flat_action_with_sibling_fields() {
+        // {"action":"open","url":"..."} → {"open":{"url":"..."}}
+        assert_normalizes(
+            json!("open"),
+            json!({"action":"open","url":"https://example.com","tab":"t"}),
+            json!({"open":{"url":"https://example.com"}}),
+        );
+        // {"action":"open","open":{"url":"..."}} → same
+        assert_normalizes(
+            json!("open"),
+            json!({"action":"open","open":{"url":"https://example.com"},"tab":"t"}),
+            json!({"open":{"url":"https://example.com"}}),
+        );
+        // {"action":"open","open":"https://..."} → {"open":{"url":"..."}}
+        assert_normalizes(
+            json!("open"),
+            json!({"action":"open","open":"https://example.com","tab":"t"}),
+            json!({"open":{"url":"https://example.com"}}),
+        );
+        // snapshot with no args
+        assert_normalizes(
+            json!("snapshot"),
+            json!({"action":"snapshot","tab":"t"}),
+            json!({"snapshot":{}}),
+        );
+        // get_text with flattened selector
+        assert_normalizes(
+            json!("get_text"),
+            json!({"action":"get_text","selector":"body","tab":"t"}),
+            json!({"get_text":{"selector":"body"}}),
+        );
+    }
+
+    #[test]
+    fn normalize_stringified_json_action() {
+        // {"action":"{\"open\":{\"url\":\"...\"}}"} → {"open":{"url":"..."}}
+        assert_normalizes(
+            json!("{\"open\": {\"url\": \"https://example.com\"}}"),
+            json!({"action":"{\"open\": {\"url\": \"https://example.com\"}}","tab":"t"}),
+            json!({"open":{"url":"https://example.com"}}),
+        );
+        // CDATA-wrapped JSON
+        assert_normalizes(
+            json!("<![CDATA[{\"open\": {\"url\": \"https://example.com\"}}]]>"),
+            json!({"action":"<![CDATA[{\"open\": {\"url\": \"https://example.com\"}}]]>","tab":"t"}),
+            json!({"open":{"url":"https://example.com"}}),
+        );
+    }
+
+    #[test]
+    fn normalize_bare_open_value() {
+        // {"action":{"open":"https://..."}} → {"open":{"url":"..."}}
+        assert_normalizes(
+            json!({"open":"https://example.com"}),
+            json!({"action":{"open":"https://example.com"},"tab":"t"}),
+            json!({"open":{"url":"https://example.com"}}),
+        );
+        // bare URL string as the whole action
+        assert_normalizes(
+            json!("https://example.com"),
+            json!({"action":"https://example.com","tab":"t"}),
+            json!({"open":{"url":"https://example.com"}}),
+        );
+    }
+
+    #[test]
+    fn normalize_xml_wrapped_actions() {
+        assert_normalizes(
+            json!("<open><url>https://example.com</url></open>"),
+            json!({"action":"<open><url>https://example.com</url></open>","tab":"t"}),
+            json!({"open":{"url":"https://example.com"}}),
+        );
+        assert_normalizes(
+            json!("<open>https://example.com</open>"),
+            json!({"action":"<open>https://example.com</open>","tab":"t"}),
+            json!({"open":{"url":"https://example.com"}}),
+        );
+        // whitespace inside tags
+        assert_normalizes(
+            json!("<open>\n<url>https://example.com</url>\n</open>"),
+            json!({"action":"<open>\n<url>https://example.com</url>\n</open>","tab":"t"}),
+            json!({"open":{"url":"https://example.com"}}),
+        );
+        // stray closing tag
+        assert_normalizes(
+            json!("<open><url>https://example.com</url></open></action>"),
+            json!({"action":"<open><url>https://example.com</url></open></action>","tab":"t"}),
+            json!({"open":{"url":"https://example.com"}}),
+        );
+        // find
+        assert_normalizes(
+            json!("<find><by>first</by><value>a</value><action>click</action></find>"),
+            json!({"action":"<find><by>first</by><value>a</value><action>click</action></find>","tab":"t"}),
+            json!({"find":{"by":"first","value":"a","action":"click"}}),
+        );
+        // find with exact/index — XML text decoded to the serde bool/u32 types
+        assert_normalizes(
+            json!(
+                "<find><by>text</by><value>submit</value><action>click</action><exact>true</exact></find>"
+            ),
+            json!({"action":"<find><by>text</by><value>submit</value><action>click</action><exact>true</exact></find>","tab":"t"}),
+            json!({"find":{"by":"text","value":"submit","action":"click","exact":true}}),
+        );
+        assert_normalizes(
+            json!(
+                "<find><by>nth</by><value>input</value><action>click</action><index>2</index></find>"
+            ),
+            json!({"action":"<find><by>nth</by><value>input</value><action>click</action><index>2</index></find>","tab":"t"}),
+            json!({"find":{"by":"nth","value":"input","action":"click","index":2}}),
+        );
+    }
+
+    #[test]
+    fn missing_or_empty_tab_defaults_to_default() {
+        // Missing tab → documented default session, echoed in tool output.
+        let (tab, note) = normalize_tab(&json!({"action":{"open":{"url":"https://example.com"}}}));
+        assert_eq!(tab, "default");
+        assert!(note.is_some(), "defaulting should be echoed in tool output");
+        // Empty tab → same defaulting.
+        let (tab, note) = normalize_tab(&json!({"tab":"","action":{"open":{"url":"x"}}}));
+        assert_eq!(tab, "default");
+        assert!(note.is_some());
+        // Explicit tab passes through unchanged.
+        let (tab, note) = normalize_tab(&json!({"tab":"docs","action":{"open":{"url":"x"}}}));
+        assert_eq!(tab, "docs");
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn normalize_rejects_unrecoverable_shapes() {
+        // Empty payload
+        assert_rejects(json!(null), json!({}));
+        // Invented action variants
+        assert_rejects(
+            json!({"expand":15}),
+            json!({"action":{"expand":15},"tab":"t"}),
+        );
+        assert_rejects(
+            json!({"__raw":"{\"open\":{...}}"}),
+            json!({"action":{"__raw":"x"},"tab":"t"}),
+        );
+        // Unknown action name
+        assert_rejects(json!("navigate"), json!({"action":"navigate","tab":"t"}));
+        // find missing its own `action` field
+        assert_rejects(
+            json!({"find":{"by":"text","value":"x"}}),
+            json!({"action":{"find":{"by":"text","value":"x"}},"tab":"t"}),
+        );
+        // open without url
+        assert_rejects(json!("open"), json!({"action":"open","tab":"t"}));
+    }
+
+    // -----------------------------------------------------------------------
+    // Daemon-unavailable fail-fast path (guidance without the ~152s retry burn)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn fail_fast_returns_guidance_without_retrying() {
+        let _guard = crate::tools::browser_daemon::with_health_test_lock().await;
+        // Daemon-unavailable signature → actionable guidance, daemon marked
+        // unhealthy (wakes the auto-recovery watchdog).
+        let err = BrowserTool::fail_fast_if_daemon_down(
+            "Failed to read: Resource temporarily unavailable (os error 35) (after 5 retries - daemon may be busy or unresponsive)",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("browser daemon is down"),
+            "expected guidance message, got: {err}"
+        );
+        assert!(!crate::tools::browser_daemon::is_advertised());
+        // Non-daemon errors pass through untouched.
+        assert!(
+            BrowserTool::fail_fast_if_daemon_down("chrome-use error: Element not found").is_ok()
+        );
+        // Restore the global health singleton so later agent-constructing
+        // tests don't inherit a hidden browser tool.
+        crate::tools::browser_daemon::reset_health();
+    }
+
+    // -----------------------------------------------------------------------
+    // KNOWN_ACTIONS lockstep — adding a BrowserAction variant must be mirrored
+    // in the normalization allowlist.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn known_actions_lockstep_with_browser_action_variants() {
+        // Minimal payload per variant/alias name (KNOWN_ACTIONS also carries the
+        // serde aliases on GetInnerText).
+        let payload = |name: &str| -> Value {
+            match name {
+                "open" => json!({"url": "https://example.com"}),
+                "snapshot" | "get_url" => json!({}),
+                "click" => json!({"selector": "@e1"}),
+                "get_text" => json!({"selector": "body"}),
+                "get_inner_text" | "get_innertext" | "innertext" => {
+                    json!({"selector": "body"})
+                }
+                "press" => json!({"key": "Enter"}),
+                "eval" => json!({"js": "1 + 1"}),
+                "find" => json!({"by": "text", "value": "x", "action": "click"}),
+                other => panic!("KNOWN_ACTIONS entry {other} has no lockstep payload"),
+            }
+        };
+        // Every allowlist entry must be a real variant name — stale entries
+        // (e.g. invented actions) fail deserialization here.
+        for name in KNOWN_ACTIONS {
+            let tagged = json!({*name: payload(name)});
+            assert!(
+                serde_json::from_value::<BrowserAction>(tagged.clone()).is_ok(),
+                "KNOWN_ACTIONS entry does not deserialize: {tagged}"
+            );
+        }
+        // Every variant's canonical name must be in the allowlist — a new
+        // BrowserAction variant fails here.
+        for name in [
+            "open",
+            "snapshot",
+            "click",
+            "get_text",
+            "get_inner_text",
+            "get_url",
+            "press",
+            "eval",
+            "find",
+        ] {
+            assert!(
+                KNOWN_ACTIONS.contains(&name),
+                "KNOWN_ACTIONS is missing variant {name}"
+            );
+        }
     }
 }

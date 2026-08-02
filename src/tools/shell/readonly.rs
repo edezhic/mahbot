@@ -1782,8 +1782,8 @@ fn mktemp_binding(value: &str, state: &ValidationState) -> Option<VarBinding> {
         None => Some(temp_binding()),
         Some(dir) => {
             let clean = strip_outer_quotes(dir).map_or(dir, |(c, _)| c);
-            let under_temp = resolve_path_word(clean, state)
-                .is_some_and(|p| is_path_under_temp(&p, state.ctx));
+            let under_temp =
+                resolve_path_word(clean, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
             if under_temp {
                 Some(temp_binding())
             } else {
@@ -4103,22 +4103,34 @@ mod tests {
             // Concrete temp bindings track too.
             ("SNAP=/tmp/snap\ntouch \"$SNAP/f\"", true),
             ("SNAP=$TMPDIR/snap\ntouch \"$SNAP/f\"", true),
-            ("SNAP=/tmp/snap\ndir=$SNAP/.mahbot/db\nmkdir -p \"$dir\"", true),
+            (
+                "SNAP=/tmp/snap\ndir=$SNAP/.mahbot/db\nmkdir -p \"$dir\"",
+                true,
+            ),
             // Non-temp / unknown bindings poison → blocked.
             ("SNAP=/etc\ntouch \"$SNAP/f\"", false),
-            ("SNAP=/__mahbot_readonly_test_ws__/snap\nmkdir -p \"$SNAP/db\"", false),
+            (
+                "SNAP=/__mahbot_readonly_test_ws__/snap\nmkdir -p \"$SNAP/db\"",
+                false,
+            ),
             ("SNAP=$FOO\ntouch \"$SNAP/f\"", false),
             // Temp rebind clears; non-temp rebind stays poisoned.
             ("SNAP=/etc\nSNAP=$(mktemp -d)\ntouch \"$SNAP/f\"", true),
             ("SNAP=$(mktemp -d)\nSNAP=/etc\ntouch \"$SNAP/f\"", false),
-            ("SNAP=$(mktemp -d)\nSNAP=/tmp/other\ntouch \"$SNAP/f\"", true),
+            (
+                "SNAP=$(mktemp -d)\nSNAP=/tmp/other\ntouch \"$SNAP/f\"",
+                true,
+            ),
             // Env-prefix form.
             ("SNAP=/tmp/snap touch $SNAP/f", true),
             ("SNAP=/etc touch $SNAP/f", false),
             // Unbound variable without a temp anchor stays blocked.
             ("touch $FOO/f", false),
             // mktemp with a template still binds.
-            ("SNAP=$(mktemp -d /tmp/mahbot.XXXXXX)\ntouch \"$SNAP/f\"", true),
+            (
+                "SNAP=$(mktemp -d /tmp/mahbot.XXXXXX)\ntouch \"$SNAP/f\"",
+                true,
+            ),
             // mktemp -p/--tmpdir to a temp dir binds; to a non-temp dir does not.
             ("SNAP=$(mktemp -d -p /tmp)\ntouch \"$SNAP/f\"", true),
             ("SNAP=$(mktemp -d --tmpdir=/tmp)\ntouch \"$SNAP/f\"", true),
@@ -4147,7 +4159,10 @@ mod tests {
             ("touch \"$RANDOM/f\"", false),
             // `..` after an opaque suffix is unverifiable → blocked.
             ("SNAP=$(mktemp -d)\ntouch \"$SNAP/$RANDOM/../f\"", false),
-            ("SNAP=$(mktemp -d)\ntouch \"$SNAP/$RANDOM/../../etc/passwd\"", false),
+            (
+                "SNAP=$(mktemp -d)\ntouch \"$SNAP/$RANDOM/../../etc/passwd\"",
+                false,
+            ),
             // `..` before the opaque suffix normalizes concretely → allowed.
             ("SNAP=$(mktemp -d)\ntouch \"$SNAP/../$RANDOM/f\"", true),
         ];
@@ -4185,7 +4200,10 @@ mod tests {
                 "SNAP=$(mktemp -d)\ncp ~/.mahbot/db/board.db /__mahbot_readonly_test_ws__/out",
                 false,
             ),
-            ("SNAP=$(mktemp -d)\nrm -rf /__mahbot_readonly_test_ws__", false),
+            (
+                "SNAP=$(mktemp -d)\nrm -rf /__mahbot_readonly_test_ws__",
+                false,
+            ),
         ];
 
         run_cases(&cases);

@@ -1033,6 +1033,23 @@ pub(crate) trait Tool: Send + Sync {
         true
     }
 
+    /// Whether the tool should be advertised to the model right now.
+    ///
+    /// Returns `true` by default. Tools backed by an external daemon/service
+    /// override this to hide themselves while that service is down, so the
+    /// model doesn't burn calls against a dead backend (e.g. browser when the
+    /// chrome-use daemon is unreachable).
+    ///
+    /// The result is read once when an agent is constructed and kept for the
+    /// agent's lifetime: an agent created during an outage permanently lacks
+    /// the tool even after recovery, and a long-lived agent keeps advertising
+    /// it after the backend dies (its runtime fail-fast then handles that).
+    /// This is deliberate — agents are short-lived per run, and re-checking
+    /// per turn would add latency and complexity.
+    fn is_advertised(&self) -> bool {
+        true
+    }
+
     /// Return the media marker prefix for this tool, if it generates media files.
     ///
     /// Returns the prefix string used to wrap a generated file path in the agent's

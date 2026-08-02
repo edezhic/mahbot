@@ -268,6 +268,16 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::search_engine::init_all_engines(),
     );
 
+    // Browser daemon health watchdog: probes chrome-use daemon liveness and
+    // auto-restarts it with bounded backoff when it dies (browser relay daemon
+    // only — never the mahbot service itself).
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "browser-daemon",
+        mahbot::tools::browser_daemon::run_watchdog(),
+    );
+
     // Voice assistant pipeline — runs in background, manages wake word
     // detection, command recording, transcription, and routing.
     spawn_cancellable(

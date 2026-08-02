@@ -130,6 +130,7 @@ impl Agent {
         channel: String,
     ) -> Self {
         let tools = role.tools();
+        let tools: Vec<Box<dyn Tool>> = tools.into_iter().filter(|t| t.is_advertised()).collect();
         let tool_specs = tools.iter().map(|t| t.spec()).collect();
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
