@@ -100,10 +100,25 @@ impl LogStore {
         Ok(Self { conn })
     }
 
-    /// Insert a single log entry into the database.
-    async fn insert(&self, entry: &LogEntry) -> anyhow::Result<()> {
-        self.conn
-            .execute(
+    /// Insert a batch of log entries in a single transaction.
+    ///
+    /// Each entry would otherwise commit (and fsync the WAL) individually —
+    /// in WAL mode the per-commit fsync dominates the insert cost. Batching
+    /// the diagnostics logs into one transaction reduces N commits to one.
+    /// On failure the whole batch is dropped (the caller's [`spawn_log_writer`]
+    /// clears it regardless) — matching the existing drop-on-failure semantics;
+    /// log entries are diagnostics, not durable state.
+    async fn insert_batch(&self, entries: &[LogEntry]) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .begin_tx()
+            .await
+            .context("Failed to begin log insert transaction")?;
+        for entry in entries {
+            tx.execute(
                 "INSERT INTO logs (timestamp, level, target, message, fields, agent_id, agent_role, workspace) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     entry.timestamp.clone(),
@@ -118,7 +133,11 @@ impl LogStore {
                 ],
             )
             .await
-            .context("Failed to insert log entry")?;
+            .context("Failed to insert log entry in batch")?;
+        }
+        tx.commit()
+            .await
+            .context("Failed to commit log insert transaction")?;
         Ok(())
     }
 
@@ -375,41 +394,105 @@ impl MakeWriter<'_> for LogWriter {
     }
 }
 
+/// Maximum number of log entries accumulated before a forced DB flush.
+///
+/// Bounds the write-lock hold: one flush inserts at most this many rows in a
+/// single transaction.
+const LOG_BATCH_MAX: usize = 50;
+
+/// Maximum age of an accumulated batch before a timer flush.
+///
+/// Keeps the DB insert path fresh under low log volume while the GUI live
+/// broadcast (which stays per-message, unbuffered) is unaffected.
+const LOG_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Spawn a background task that receives JSON log lines and writes them to Turso
 /// and broadcasts them over the channel to the Iced GUI dashboard.
 ///
-/// Each log entry is inserted and broadcast immediately — no batching.
+/// The GUI live broadcast stays per-message (no GUI lag). Only the DB-insert
+/// path batches: entries accumulate in [`LOG_BATCH_MAX`]-sized batches flushed
+/// by [`LOG_FLUSH_INTERVAL`], on batch-cap, or on channel close (flush-before-
+/// shutdown). A crash mid-batch loses at most [`LOG_BATCH_MAX`] entries —
+/// acceptable, since DB log inserts are diagnostics, not durable state.
 fn spawn_log_writer(
+    store: Arc<LogStore>,
+    rx: UnboundedReceiver<String>,
+    broadcast: tokio::sync::broadcast::Sender<String>,
+) {
+    spawn_log_writer_with_interval(store, rx, broadcast, LOG_FLUSH_INTERVAL);
+}
+
+/// [`spawn_log_writer`] with an explicit flush interval — tests inject a
+/// non-production interval (very long, or very short) to exercise the
+/// batch-cap and timer flush paths without racing the production timer.
+fn spawn_log_writer_with_interval(
     store: Arc<LogStore>,
     mut rx: UnboundedReceiver<String>,
     broadcast: tokio::sync::broadcast::Sender<String>,
+    flush_interval: std::time::Duration,
 ) {
     tokio::spawn(async move {
-        while let Some(line) = rx.recv().await {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
+        let mut batch: Vec<LogEntry> = Vec::new();
+        let mut flush_timer = tokio::time::interval(flush_interval);
+        flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first interval tick fires immediately — consume it so the timer
+        // only fires after the first full interval.
+        flush_timer.tick().await;
 
-            let Some(entry) = parse_tracing_json(trimmed) else {
-                continue;
-            };
+        loop {
+            tokio::select! {
+                maybe_line = rx.recv() => {
+                    let Some(line) = maybe_line else {
+                        // Channel closed (all senders dropped, e.g. tracing
+                        // teardown on shutdown) — flush remaining and exit.
+                        flush_log_batch(&store, &mut batch).await;
+                        break;
+                    };
 
-            // Broadcast to dashboard subscribers before inserting (fast path)
-            let _ =
-                broadcast
-                    .send(serde_json::to_string(&entry).expect(
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+
+                    let Some(entry) = parse_tracing_json(trimmed) else {
+                        continue;
+                    };
+
+                    // Broadcast to dashboard subscribers before inserting (fast path)
+                    let _ = broadcast.send(serde_json::to_string(&entry).expect(
                         "log entry broadcast serialization failed; this should not happen",
                     ));
 
-            if let Err(e) = store.insert(&entry).await {
-                // Log insertion failed — nowhere useful to report since
-                // terminal output is disabled and we can't use tracing here
-                // (that would recurse).
-                let _ = e;
+                    batch.push(entry);
+                    if batch.len() >= LOG_BATCH_MAX {
+                        flush_log_batch(&store, &mut batch).await;
+                    }
+                }
+                _ = flush_timer.tick() => {
+                    if !batch.is_empty() {
+                        flush_log_batch(&store, &mut batch).await;
+                    }
+                }
             }
         }
     });
+}
+
+/// Insert all accumulated entries in one transaction and clear the batch.
+///
+/// On failure the batch is still cleared (entries are dropped) — there is no
+/// useful reporting path inside the writer (terminal output is disabled and
+/// tracing would recurse), matching the existing drop-on-failure semantics.
+async fn flush_log_batch(store: &LogStore, batch: &mut Vec<LogEntry>) {
+    if batch.is_empty() {
+        return;
+    }
+    if let Err(e) = store.insert_batch(batch).await {
+        // Log insertion failed — nowhere useful to report since terminal
+        // output is disabled and we can't use tracing here (that would recurse).
+        let _ = e;
+    }
+    batch.clear();
 }
 
 /// Extract a string field from a JSON value, defaulting to `""`.
@@ -559,9 +642,7 @@ mod tests {
 
     // Helper to seed log entries in tests
     async fn seed_entries(store: &LogStore, entries: &[LogEntry]) {
-        for e in entries {
-            store.insert(e).await.unwrap();
-        }
+        store.insert_batch(entries).await.unwrap();
     }
 
     #[tokio::test]
@@ -592,6 +673,84 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].message, "oh no");
         assert_eq!(entries[1].message, "hi");
+    }
+
+    /// Poll `store.query` until the total entry count reaches `expected` or the
+    /// timeout elapses. Avoids the fixed-sleep races of the earlier version
+    /// (the writer and the test share a runtime, so wall-clock sleeps can be
+    /// skewed by writer-side DB work on loaded machines).
+    async fn wait_for_total(store: &LogStore, expected: usize, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let (_, total) = store.query(&LogQuery::default()).await.unwrap();
+            if total == expected {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for total == {expected}, got {total}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_log_writer_batches_and_timer_flushes() {
+        // Writer 1: a flush interval long enough that the timer can never fire
+        // during the test — only the batch-cap path can insert rows.
+        let (store, _dir) = test_store().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(256);
+        spawn_log_writer_with_interval(
+            store.clone(),
+            rx,
+            broadcast_tx,
+            std::time::Duration::from_secs(60),
+        );
+
+        // One entry first — below the batch cap, so it stays buffered.
+        tx.send(
+            r#"{"timestamp":"2025-01-01T00:00:02Z","level":"INFO","target":"test","fields":{"message":"timer flush"}}"#
+                .to_string(),
+        )
+        .unwrap();
+
+        // Then LOG_BATCH_MAX more entries — the batch-cap flush fires as soon
+        // as the writer accumulates a full batch (the timer cannot fire here).
+        for i in 0..LOG_BATCH_MAX {
+            tx.send(
+                format!(
+                    r#"{{"timestamp":"2025-01-01T00:00:03Z","level":"INFO","target":"test","fields":{{"message":"batch {i}"}}}}"#
+                ),
+            )
+            .unwrap();
+        }
+
+        // The cap flush must insert exactly LOG_BATCH_MAX entries; the lone
+        // earlier entry is still buffered (60s timer never fired).
+        wait_for_total(&store, LOG_BATCH_MAX, std::time::Duration::from_secs(10)).await;
+
+        // Writer 2: a very short flush interval — the timer path must flush a
+        // lone buffered entry without needing the cap or channel close.
+        let (store2, _dir2) = test_store().await;
+        let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (broadcast_tx2, _) = tokio::sync::broadcast::channel(256);
+        spawn_log_writer_with_interval(
+            store2.clone(),
+            rx2,
+            broadcast_tx2,
+            std::time::Duration::from_millis(50),
+        );
+        tx2.send(
+            r#"{"timestamp":"2025-01-01T00:00:04Z","level":"INFO","target":"test","fields":{"message":"timer fired"}}"#
+                .to_string(),
+        )
+        .unwrap();
+        wait_for_total(&store2, 1, std::time::Duration::from_secs(10)).await;
+
+        drop(tx);
+        drop(tx2);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     #[tokio::test]

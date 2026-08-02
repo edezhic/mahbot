@@ -931,6 +931,73 @@ mod tests {
         );
     }
 
+    /// Guard: raw `turso::Builder` usage is confined to the persistence module
+    /// (`src/turso.rs`) and the debug CLI (`src/debug.rs`).
+    ///
+    /// All database access must go through [`crate::turso::Connection`], which
+    /// centralises the experimental feature flags, busy timeout, mutex
+    /// serialization, and dangling-transaction handling. The debug CLI is the
+    /// documented exception: it needs the upstream lazy `Rows` iterator for
+    /// `mahbot debug` queries.
+    ///
+    /// This is a source-scanning tripwire, not a security boundary: any new
+    /// module that opens a database via `turso::Builder` / `Builder::new_local`
+    /// directly fails this test with a pointer to the canonical path.
+    #[test]
+    fn raw_builder_usage_is_confined_to_persistence_and_debug() {
+        const PATTERNS: [&str; 2] = ["turso::Builder", "Builder::new_local"];
+        const ALLOWED: [&str; 2] = ["src/turso.rs", "src/debug.rs"];
+
+        fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read src directory") {
+                let path = entry.expect("read directory entry").path();
+                if path.is_dir() {
+                    collect_rs_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        collect_rs_files(&manifest_dir.join("src"), &mut files);
+
+        let mut violations: Vec<(String, &'static str)> = Vec::new();
+        for file in files {
+            let rel = file
+                .strip_prefix(manifest_dir)
+                .expect("source files live under the manifest dir")
+                .to_string_lossy()
+                .to_string();
+            if ALLOWED.contains(&rel.as_str()) {
+                continue;
+            }
+            let content = std::fs::read_to_string(&file).expect("read source file");
+            // Skip line comments (// and ///) so doc comments mentioning the
+            // builder don't false-positive — the tripwire targets actual code
+            // usage. Block comments are not handled (best-effort by design).
+            let code_only: String = content
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for pattern in PATTERNS {
+                if code_only.contains(pattern) {
+                    violations.push((rel.clone(), pattern));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "raw turso::Builder usage outside the persistence module and debug CLI.\n\
+             All database access must go through crate::turso::Connection (turso.rs);\n\
+             the debug CLI (debug.rs) is the only documented exception.\n\
+             Violations: {violations:#?}"
+        );
+    }
+
     #[test]
     fn test_sanitize_fts_query() {
         let cases = [

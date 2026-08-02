@@ -181,6 +181,18 @@ codegen-units = 256
 [profile.dev.package."*"]
 debug = false
 
+# qwen-asr (local speech-to-text, macOS/Linux) is inference code: opt-level 3 +
+# codegen-units 1 keeps transcription fast enough for real-time voice use even
+# in dev builds, where the default opt-level 0 would make the ASR model
+# noticeably slower. This override is deliberately placed under `profile.dev`
+# (not `profile.test`): `[profile.test]` inherits `dev`, so test builds already
+# share the same optimized qwen-asr artifact. A separate `[profile.test.package.qwen-asr]`
+# override would produce a SECOND artifact fingerprint (2× disk, one-time full
+# recompile of qwen-asr per clean test run) without any runtime benefit — tests
+# exercise the same optimized code — and could regress warm test-cache reuse.
+# The dependency-compilation behavior of per-package test overrides was verified
+# empirically on cargo 1.97.1 (mahbot-1046); the dev override already covers
+# tests, so no test override is added.
 [profile.dev.package.qwen-asr]
 opt-level = 3
 codegen-units = 1

@@ -1379,6 +1379,166 @@ async fn dispatch_diagnostics_cases() {
     }
 }
 
+// ── Diagnostics clippy gate safety net ──────────────────────────────
+
+/// Create a git-inited cargo scratch crate under `dir` with the given
+/// `main.rs` body, committed so `cargo clippy --fix` can run (cargo fix
+/// requires a VCS unless `--allow-no-vcs` is passed, matching real
+/// workspaces).
+fn make_diagnostics_scratch_crate(dir: &tempfile::TempDir, main_body: &str) {
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"diaggate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write scratch Cargo.toml");
+    std::fs::create_dir_all(dir.path().join("src")).expect("create scratch src dir");
+    std::fs::write(dir.path().join("src").join("main.rs"), main_body)
+        .expect("write scratch main.rs");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-qm",
+        "init",
+    ]);
+}
+
+/// The stored (broken) diagnostics commands: a plain lint-fix slot plus a
+/// lint slot that is the gate-breaking compound (`--fix` + `-D warnings` in
+/// one invocation, rust-clippy#17444). The runner must repair the lint slot
+/// into the fix+gate chain and skip the now-redundant lint-fix slot (the
+/// compound's fix pass is exactly the stored lint-fix).
+fn gate_breaking_stored_commands() -> DiagnosticsCommands {
+    DiagnosticsCommands {
+        lint_fix: Some("cargo clippy --fix --allow-dirty".to_string()),
+        lint: Some("cargo clippy --fix --allow-dirty -- -D warnings".to_string()),
+        ..Default::default()
+    }
+}
+
+/// The gate-breaking clippy compound (rust-clippy#17444 — `clippy --fix` +
+/// `-D warnings` in one invocation silently disables the lint gate and exits 0
+/// with unfixable warnings remaining) is repaired at execution time: the runner
+/// rewrites it into the gate-preserving fix+gate chain and skips the
+/// now-redundant separate lint-fix slot. A known-unfixable lint must still
+/// fail the run — this is the acceptance test for "`-D warnings` enforced in
+/// every diagnostics run".
+///
+/// The scratch crate carries `too_many_arguments` (9 args): it is
+/// **warn-by-default** and **not auto-fixable** (verified on the pinned 1.97.1:
+/// plain `cargo clippy` exits 0 with a warning; `cargo clippy -- -D warnings`
+/// exits 101 with `could not compile`). The fix pass therefore exits 0, and the
+/// gate pass fails **only because the repaired chain retains `-D warnings`** —
+/// if a regression dropped the gate, the run would pass and this test would
+/// fail. (The earlier `absurd_extreme_comparisons` crate was rejected for this
+/// purpose: that lint is deny-by-default, so the gate was not isolated.)
+///
+/// The gate must fail for the right reason: `could not compile` is emitted only
+/// when rustc breaks the build under the deny — a cargo usage error (the
+/// fix-only-flag retention regression) or the fix pass (warnings only, exit 0)
+/// never produce it — and the executed gate pass command (`cargo clippy --
+/// -D warnings`) is printed verbatim in the comment, pinning the exact string
+/// the runner executes.
+#[tokio::test]
+async fn diagnostics_repairs_gate_breaking_clippy_compound() {
+    if !crate::git_commands::git_is_installed().await {
+        eprintln!("git not installed — skipping git-dependent test");
+        return;
+    }
+    init_management_test_stores().await;
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let ws_path = dir.path().to_string_lossy().to_string();
+    make_diagnostics_scratch_crate(
+        &dir,
+        "fn main() {\n    let _ = too_many(1, 2, 3, 4, 5, 6, 7, 8, 9);\n}\n\nfn too_many(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32, g: i32, h: i32, i: i32) -> i32 {\n    a + b + c + d + e + f + g + h + i\n}\n",
+    );
+
+    let ws = create_test_workspace(&ws_path, "diag_gate_repair").await;
+
+    let (comment, all_passed) =
+        run_diagnostics_commands(&gate_breaking_stored_commands(), &ws).await;
+
+    assert!(
+        !all_passed,
+        "the -D warnings gate must catch the warn-by-default lint — the run must fail"
+    );
+    assert!(
+        comment.contains("&&"),
+        "the broken compound should be repaired into a fix+gate chain, comment was:\n{comment}"
+    );
+    assert!(
+        !comment.contains("lint-fix"),
+        "the redundant lint-fix slot should be skipped when lint merges fix+gate, comment was:\n{comment}"
+    );
+    // The repaired gate pass command is printed verbatim in the comment's
+    // `lint (…):` header — this pins the executed gate string itself, not just
+    // its observable failure.
+    assert!(
+        comment.contains("cargo clippy -- -D warnings"),
+        "the executed gate pass must carry `-D warnings`, comment was:\n{comment}"
+    );
+    assert!(
+        comment.contains("could not compile"),
+        "the -D warnings gate must break the build on the warn-by-default lint, comment was:\n{comment}"
+    );
+    let failed_marker = load_prompt("diagnostics_failed.md");
+    assert!(
+        comment.contains(&format!("{failed_marker} lint")),
+        "failure attribution should name the lint slot, comment was:\n{comment}"
+    );
+}
+
+/// Regression guard for the normalization fix: the repaired gate pass must not
+/// carry fix-only flags (`--allow-dirty` / `--allow-no-vcs` / `--allow-staged`
+/// / `--broken-code` are rejected by a plain `cargo clippy` invocation with a
+/// usage error, exit 1, on the pinned 1.97.1 toolchain) — otherwise the
+/// repaired chain fails on every run, even on lint-free code, turning the very
+/// scenario the safety net exists to repair into an always-failing diagnostics
+/// run.
+#[tokio::test]
+async fn diagnostics_repaired_chain_passes_on_clean_crate() {
+    if !crate::git_commands::git_is_installed().await {
+        eprintln!("git not installed — skipping git-dependent test");
+        return;
+    }
+    init_management_test_stores().await;
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let ws_path = dir.path().to_string_lossy().to_string();
+    make_diagnostics_scratch_crate(&dir, "fn main() {\n    println!(\"clean\");\n}\n");
+
+    let ws = create_test_workspace(&ws_path, "diag_gate_repair_clean").await;
+
+    let (comment, all_passed) =
+        run_diagnostics_commands(&gate_breaking_stored_commands(), &ws).await;
+
+    assert!(
+        all_passed,
+        "the repaired chain must succeed on lint-free code, comment was:\n{comment}"
+    );
+    assert!(
+        comment.contains("&&"),
+        "the broken compound should still be repaired into a fix+gate chain, comment was:\n{comment}"
+    );
+    assert!(
+        comment.contains(&load_prompt("diagnostics_passed.md")),
+        "the run should end with the pass marker, comment was:\n{comment}"
+    );
+}
+
 // ── dispatch_verifiers skip-review ──────────────────────────────
 
 /// When a ticket is in InReview and the working tree has no unstaged changes,

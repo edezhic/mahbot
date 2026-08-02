@@ -8,4 +8,6 @@ Each field is a shell command string (the minimal invocation that works from the
 
 For multi-language projects, each command must be a compound command chained with `&&` covering all languages.
 
+Lint commands must keep the auto-fix pass and the lint gate in SEPARATE fields: `lint_fix` is a fix-only command (e.g. `cargo clippy --fix --allow-dirty`) and `lint` is a gate-only command (e.g. `cargo clippy -- -D warnings`). NEVER combine `--fix` with a `-D`/`--deny` gate in a single invocation — clippy's fix driver silently disables the lint gate in that form (rust-clippy#17444) and exits 0 with unfixable warnings remaining.
+
 Output ONLY the JSON object. Do NOT call any tools.

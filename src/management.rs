@@ -1749,6 +1749,22 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
 /// Appends a pass/fail marker before returning. Labels are string literals from
 /// [`DiagnosticsCommands::commands`].
 ///
+/// # Clippy gate safety net
+///
+/// Before execution, each stored command is passed through
+/// [`crate::normalize_gate_breaking_clippy_compound`]: a gate-breaking
+/// `clippy --fix … -- -D warnings` compound (rust-clippy#17444 — the fix
+/// driver silently drops the lint gate and exits 0 with unfixable warnings
+/// remaining) is rewritten into the gate-preserving two-pass chain
+/// `clippy --fix … && clippy … -- -D warnings` (the gate pass strips the
+/// fix-only flags that a plain clippy invocation rejects), so a
+/// stored/generated command can never silently disable the `-D warnings`
+/// gate. When the `lint` slot is normalized this way **and** the compound's
+/// fix pass is exactly the stored `lint-fix` command, the now-redundant
+/// separate `lint-fix` slot is skipped so the fix pass does not run twice; a
+/// differently-configured `lint-fix` (e.g. `--all-targets`) is still run so
+/// its coverage is never dropped.
+///
 /// Returns `(comment_text, all_passed)` where `comment_text` includes the
 /// [`DIAGNOSTICS_COMMENT_PREFIX`] header and the appropriate pass/fail marker.
 async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) -> (String, bool) {
@@ -1756,10 +1772,24 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
     let mut all_passed = true;
     let mut failed_at: &str = "";
 
+    // If the lint slot holds a gate-breaking clippy compound whose fix pass is
+    // equivalent to the stored lint-fix, it will be normalized into a fix+gate
+    // chain below and the separate lint-fix slot becomes redundant — skip it
+    // so the fix pass does not run twice. A differently-configured lint-fix
+    // (equivalence check fails) is still run so its coverage is not dropped.
+    let lint_slot_merged = diag.lint_slot_merges_lint_fix();
+
     for (label, cmd_opt) in diag.commands() {
         let Some(cmd) = cmd_opt else {
             continue;
         };
+
+        if lint_slot_merged && label == "lint-fix" {
+            continue;
+        }
+
+        let normalized = crate::normalize_gate_breaking_clippy_compound(cmd);
+        let cmd: &str = normalized.as_deref().unwrap_or(cmd);
 
         let _ = write!(comment, "\n\n{label} ({cmd}):\n");
 
