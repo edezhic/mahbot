@@ -411,7 +411,7 @@ fn parse_heredoc_delimiter(command: &str, start: usize) -> (String, usize) {
 /// [`scan_substitutions`], and re-scanning them would double-validate
 /// (e.g. a `2>/dev/null` inside a substitution would be misread with the
 /// substitution's closing delimiter attached to the target).
-fn has_disallowed_redirect(segment: &str, ctx: &CheckContext) -> Result<(), String> {
+fn has_disallowed_redirect(segment: &str, state: &ValidationState) -> Result<(), String> {
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
@@ -491,8 +491,8 @@ fn has_disallowed_redirect(segment: &str, ctx: &CheckContext) -> Result<(), Stri
             continue;
         }
 
-        let resolved = resolve_path_word(target, ctx);
-        let allowed = resolved.is_some_and(|path| is_path_under_temp(&path, ctx));
+        let resolved = resolve_path_word(target, state);
+        let allowed = resolved.is_some_and(|path| is_path_under_temp(&path, state.ctx));
         if !allowed {
             // Absolute/relative non-temp non-devnull = disallowed
             return Err(format!(
@@ -507,22 +507,156 @@ fn has_disallowed_redirect(segment: &str, ctx: &CheckContext) -> Result<(), Stri
     Ok(())
 }
 
-/// Resolve a path word against the validation context for the temp-root check.
-///
-/// Phase 1 semantics: literal absolute paths are resolved directly; relative
-/// paths resolve against the workspace root (so they are rejected as
-/// workspace writes, matching the historical behavior). Phase 2 extends this
-/// with shell-variable/quote/tilde expansion and tracked-CWD resolution,
-/// which is when the `Option` return becomes meaningful (expansion failures
-/// resolve to `None`).
-#[allow(clippy::unnecessary_wraps)] // phase 2 makes this fallible
-fn resolve_path_word(word: &str, ctx: &CheckContext) -> Option<std::path::PathBuf> {
-    let path = std::path::PathBuf::from(word);
-    if path.is_absolute() {
-        return Some(path);
+/// Resolve a path word (mutator argument, redirect target, or flag value)
+/// into an absolute path against the tracked state: shell-variable expansion
+/// (`$VAR`/`${VAR}`), balanced surrounding quotes, tilde handling, and
+/// resolution against the tracked current directory. Returns `None` when the
+/// word cannot be safely resolved — unknown/poisoned variables, tilde paths
+/// (never under temp), unbalanced/mixed quotes, relative paths without a
+/// tracked CWD, or relative globs — all of which reject (fail-closed).
+fn resolve_path_word(word: &str, state: &ValidationState) -> Option<std::path::PathBuf> {
+    // Strip balanced surrounding quotes (`"/tmp/x"`, `'/tmp/x'`).
+    // Single-quoted words do NOT expand variables (`'$TMPDIR/x'` is a literal
+    // filename containing `$`, which never resolves under temp).
+    let (content, single_quoted) = strip_outer_quotes(word)?;
+    if content.is_empty() {
+        return None;
     }
-    // Relative paths are workspace-relative by default (initial CWD).
-    Some(ctx.workspace_root.join(word))
+    // Tilde paths resolve to $HOME (or another user's home) — never under a
+    // temp root (decision 6), so they always reject.
+    if content.starts_with('~') {
+        return None;
+    }
+    let expanded = expand_vars(content, single_quoted, state)?;
+    if expanded.is_empty() {
+        return None;
+    }
+    let path = std::path::PathBuf::from(&expanded);
+    if path.is_relative() {
+        // Relative globs stay rejected (they could match workspace files).
+        if contains_glob(&expanded) {
+            return None;
+        }
+        let cwd = state.cwd.as_ref()?; // fail-closed when tracking was reset
+        return Some(cwd.join(&expanded));
+    }
+    Some(path)
+}
+
+/// Strip balanced surrounding single/double quotes from a shell word.
+/// Returns `(content, was_single_quoted)`, or `None` for unbalanced/mixed
+/// quotes (e.g. `"/tmp`, `'/tmp"`, `ab"cd`).
+fn strip_outer_quotes(word: &str) -> Option<(&str, bool)> {
+    let bytes = word.as_bytes();
+    if word.len() >= 2
+        && matches!(bytes[0], b'\'' | b'"')
+        && matches!(bytes[word.len() - 1], b'\'' | b'"')
+    {
+        let open = bytes[0];
+        let close = bytes[word.len() - 1];
+        if open != close {
+            return None; // mixed quotes: `'..."`
+        }
+        let inner = &word[1..word.len() - 1];
+        if inner.contains(open as char) {
+            return None; // unbalanced inside: `"a"b"`
+        }
+        return Some((inner, open == b'\''));
+    }
+    if word.contains(['\'', '"']) {
+        return None;
+    }
+    Some((word, false))
+}
+
+/// Expand `$VAR` / `${VAR}` references in `word`. Inside single quotes nothing
+/// expands. Unknown/unset variables, poisoned variables, `$HOME`, and
+/// `$PWD`-when-untracked all resolve to `None` (reject). Escaped `\$`
+/// (backslash preserved by the segmenter) is literal.
+fn expand_vars(word: &str, single_quoted: bool, state: &ValidationState) -> Option<String> {
+    if single_quoted {
+        // No expansion inside single quotes — a literal `$` is not a valid
+        // temp path.
+        if word.contains('$') {
+            return None;
+        }
+        return Some(word.to_string());
+    }
+    let mut out = String::with_capacity(word.len());
+    let mut i = 0;
+    while i < word.len() {
+        let rest = &word[i..];
+        // Escaped dollar/backslash/backtick: literal character, no expansion.
+        if let Some(next) = rest.strip_prefix('\\') {
+            let c = next.chars().next().expect("non-empty after backslash");
+            if matches!(c, '$' | '\\' | '`') {
+                out.push(c);
+            } else {
+                out.push('\\');
+                out.push(c);
+            }
+            i += 1 + c.len_utf8();
+            continue;
+        }
+        if let Some((name, len)) = parse_var_ref(rest) {
+            out.push_str(&resolve_var(name, state)?);
+            i += len;
+        } else {
+            let c = rest.chars().next().expect("i < len");
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    Some(out)
+}
+
+/// Parse a `$NAME` or `${NAME}` reference at the start of `rest`.
+/// Returns `(name, total_consumed_len)`.
+fn parse_var_ref(rest: &str) -> Option<(&str, usize)> {
+    let after_dollar = rest.strip_prefix('$')?;
+    if let Some(braced) = after_dollar.strip_prefix('{') {
+        let end = braced.find('}')?;
+        let name = &braced[..end];
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Some((name, 2 + end + 1)); // $ { name }
+        }
+        return None;
+    }
+    let name_len = after_dollar
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .count();
+    if name_len == 0 {
+        return None;
+    }
+    Some((&after_dollar[..name_len], 1 + name_len))
+}
+
+/// Resolve a single variable reference for expansion.
+///
+/// - `$PWD` resolves to the tracked CWD (initial = workspace root); `None`
+///   when tracking was reset (fail-closed).
+/// - `$HOME` and all other variables never satisfy the temp-root check
+///   (decision 6).
+/// - TMPDIR/TMP/TEMP resolve to their bound value unless poisoned.
+fn resolve_var(name: &str, state: &ValidationState) -> Option<String> {
+    match name {
+        "PWD" => state.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        "HOME" => None,
+        _ => {
+            let var = TempVar::from_name(name)?;
+            let binding = &state.vars[var as usize];
+            if binding.poisoned {
+                return None;
+            }
+            binding.value.clone()
+        }
+    }
+}
+
+/// True when the string contains glob metacharacters (`*`, `?`, `[`).
+fn contains_glob(s: &str) -> bool {
+    s.contains(['*', '?', '['])
 }
 
 /// True when `path` is under one of the context's allowed temp roots.
@@ -530,9 +664,10 @@ fn is_path_under_temp(path: &std::path::Path, ctx: &CheckContext) -> bool {
     crate::tools::path::is_path_under_roots(path, &ctx.temp_roots)
 }
 
-/// Validation context for a read-only shell command: the workspace root and
-/// temp roots of the session being validated — never the daemon process's
-/// environment (see the guard contract, resolved decisions 6 and 9).
+/// Validation context for a read-only shell command: the workspace root,
+/// temp roots, and session-environment snapshot of the session being
+/// validated — never the daemon process's environment (see the guard
+/// contract, resolved decisions 6 and 9).
 #[derive(Debug, Clone)]
 pub(super) struct CheckContext {
     /// Workspace root of the session being validated. Initial tracked CWD and
@@ -542,41 +677,113 @@ pub(super) struct CheckContext {
     /// path-root set; injectable in tests so a fixture workspace can be
     /// hermetic (kept distinct from the temp roots).
     temp_roots: Vec<std::path::PathBuf>,
+    /// Baseline temp-variable bindings (TMPDIR/TMP/TEMP) of the session's
+    /// shell environment. The daemon's shell launcher sets `TMPDIR=/tmp`
+    /// (see `baseline_env_value`), so the production default is exactly that;
+    /// tests inject their own.
+    temp_vars: Vec<(String, String)>,
 }
 
 impl CheckContext {
     /// Context for a session rooted at `workspace_root` with the standard
-    /// OS temp roots.
+    /// OS temp roots and the session shell's temp-variable bindings.
     pub(super) fn for_workspace(workspace_root: &Path) -> Self {
         Self {
             workspace_root: workspace_root.to_path_buf(),
             temp_roots: crate::tools::path::allowed_temp_roots(),
+            temp_vars: vec![("TMPDIR".to_string(), "/tmp".to_string())],
         }
     }
 
     #[cfg(test)]
-    fn for_test(workspace_root: &Path, temp_roots: Vec<std::path::PathBuf>) -> Self {
+    fn for_test(
+        workspace_root: &Path,
+        temp_roots: Vec<std::path::PathBuf>,
+        temp_vars: Vec<(String, String)>,
+    ) -> Self {
         Self {
             workspace_root: workspace_root.to_path_buf(),
             temp_roots,
+            temp_vars,
         }
     }
 }
 
+/// Temp variables tracked for expansion and export-poisoning (contract
+/// decision 5): TMPDIR/TMP/TEMP are the only variables that can ever satisfy
+/// the temp-root check; `$HOME` and all others never do (decision 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TempVar {
+    Tmpdir,
+    Tmp,
+    Temp,
+}
+
+impl TempVar {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "TMPDIR" => Some(Self::Tmpdir),
+            "TMP" => Some(Self::Tmp),
+            "TEMP" => Some(Self::Temp),
+            _ => None,
+        }
+    }
+}
+
+/// Binding state for one tracked temp variable.
+#[derive(Debug, Clone)]
+struct VarBinding {
+    /// Bound value; `None` = unset/unknown in the session shell environment.
+    value: Option<String>,
+    /// When true, subsequent expansions of this variable reject (decision 5).
+    /// Set by binding to a non-temp path; cleared by re-binding to a valid
+    /// temp root.
+    poisoned: bool,
+}
+
 /// Mutable state threaded through the validation of a single command string:
-/// the tracked current directory and temp-variable bindings. Phase 1 carries
-/// only the context; CWD tracking and export-poisoning bindings are added in
-/// phase 2.
+/// the tracked current directory and temp-variable bindings.
 struct ValidationState<'a> {
     ctx: &'a CheckContext,
+    /// Tracked current directory. `None` = fail-closed: relative paths reject
+    /// (decision 7 — any non-literal-absolute `cd` form resets tracking).
+    cwd: Option<std::path::PathBuf>,
+    /// Bindings for [`TempVar`] (TMPDIR, TMP, TEMP) in declaration order.
+    vars: [VarBinding; 3],
 }
 
 impl ValidationState<'_> {
+    /// Initial state: CWD = the session's workspace root; temp vars bound from
+    /// the context's session-environment snapshot.
+    fn new(ctx: &CheckContext) -> ValidationState<'_> {
+        let mut vars = [(); 3].map(|()| VarBinding {
+            value: None,
+            poisoned: false,
+        });
+        for (name, value) in &ctx.temp_vars {
+            if let Some(var) = TempVar::from_name(name) {
+                vars[var as usize] = VarBinding {
+                    value: Some(value.clone()),
+                    poisoned: false,
+                };
+            }
+        }
+        ValidationState {
+            ctx,
+            cwd: Some(ctx.workspace_root.clone()),
+            vars,
+        }
+    }
+
     /// Snapshot of the current tracking state. Used for command substitutions,
     /// which execute in a subshell: `cd`/export inside `$(...)` must not leak
     /// to the outer command's tracking.
     fn snapshot(&self) -> ValidationState<'_> {
-        ValidationState { ctx: self.ctx }
+        ValidationState {
+            ctx: self.ctx,
+            cwd: self.cwd.clone(),
+            vars: self.vars.clone(),
+        }
     }
 }
 
@@ -595,7 +802,7 @@ pub(super) fn check_command(command_str: &str, ctx: &CheckContext) -> Result<(),
     if trimmed.is_empty() {
         return Ok(());
     }
-    let mut state = ValidationState { ctx };
+    let mut state = ValidationState::new(ctx);
     validate_string(trimmed, &mut state)
 }
 
@@ -614,7 +821,7 @@ fn validate_string(s: &str, state: &mut ValidationState) -> Result<(), String> {
 
     let segments = super::extract_command_segments(&scan);
     for segment in &segments {
-        has_disallowed_redirect(segment, state.ctx)?;
+        has_disallowed_redirect(segment, state)?;
         check_segment(segment, state)?;
     }
 
@@ -744,7 +951,7 @@ const TEMP_MUTATORS: &[&str] = &[
 /// and the `predicate` returns true, the command is rejected with the given message.
 struct FlagCheck {
     verb: &'static str,
-    predicate: fn(&str, &CheckContext) -> bool,
+    predicate: fn(&str, &ValidationState) -> bool,
     rejection: &'static str,
     suggestion: &'static str,
 }
@@ -1028,13 +1235,50 @@ fn heredoc_delimiter_of(w: &str) -> String {
 }
 
 /// True when every explicit path argument resolves under an allowed temp root.
-fn scratch_paths_under_temp(segment: &str, ctx: &CheckContext) -> bool {
+fn scratch_paths_under_temp(segment: &str, state: &ValidationState) -> bool {
     let paths = non_flag_path_args(segment);
     !paths.is_empty()
-        && paths.iter().all(|p| {
-            resolve_path_word(p, ctx)
-                .is_some_and(|path| is_path_under_temp(&path, ctx))
-        })
+        && paths
+            .iter()
+            .all(|p| resolve_path_word(p, state).is_some_and(|path| is_path_under_temp(&path, state.ctx)))
+}
+
+/// True when a temp mutator's path arguments all resolve under an allowed
+/// temp root. `cp` is special-cased: only the destination must be under temp
+/// (sources are read-only — copying from anywhere into temp is allowed;
+/// copying into the workspace stays blocked, contract decision 8).
+fn temp_mutator_paths_under_temp(segment: &str, first_word: &str, state: &ValidationState) -> bool {
+    if first_word == "cp" {
+        return cp_destination_under_temp(segment, state);
+    }
+    scratch_paths_under_temp(segment, state)
+}
+
+/// Identify the `cp` destination (contract decision 8): the value of
+/// `-t`/`--target-directory`, or the last non-flag path argument. With no
+/// identifiable destination the command is rejected.
+fn cp_destination_under_temp(segment: &str, state: &ValidationState) -> bool {
+    let words: Vec<&str> = segment.split_whitespace().collect();
+    let Some(cmd_idx) = super::find_first_command_word_index(&words) else {
+        return false;
+    };
+    let rest = &words[cmd_idx + 1..];
+
+    for flag in ["-t", "--target-directory"] {
+        if let Some(val) = flag_value(rest, flag) {
+            return resolve_path_word(val, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
+        }
+    }
+    if let Some(val) = flag_value_equals(rest, "--target-directory=") {
+        return resolve_path_word(val, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
+    }
+
+    match non_flag_path_args(segment).last() {
+        Some(dest) => {
+            resolve_path_word(dest, state).is_some_and(|p| is_path_under_temp(&p, state.ctx))
+        }
+        None => false, // no identifiable destination → reject
+    }
 }
 
 /// Check a single command segment for unsafe operations.
@@ -1046,6 +1290,29 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
     if trimmed.is_empty() {
         return Ok(());
     }
+
+    // ── CWD tracking (contract decision 7) ─────────────────────────
+    // Only a literal absolute `cd` into a directory that exists at validation
+    // time updates the tracked CWD. All other cd forms — relative (`cd src`),
+    // `cd ..`, `cd -`, bare `cd`, `cd $VAR`, `cd ~`, pushd/popd — reset
+    // tracking to fail-closed: subsequent relative path arguments and
+    // redirect targets reject.
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    let first_effective = words
+        .iter()
+        .find(|w| !super::is_env_assignment(w))
+        .copied()
+        .unwrap_or("");
+    if matches!(first_effective, "cd" | "pushd" | "popd") {
+        update_cwd_for_cd(trimmed, state);
+        return Ok(());
+    }
+
+    // ── Temp-variable bindings (contract decision 5) ───────────────
+    // `export X=...`, plain `X=...` segments, and env-prefix forms
+    // (`TMPDIR=/tmp cmd`) bind the temp variables; a non-temp binding poisons
+    // the variable, a temp-root binding clears the poison.
+    apply_env_bindings(trimmed, state);
 
     // Extract the effective command by stripping shell prefixes and
     // environment variable assignments.
@@ -1063,7 +1330,7 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
     // Scratch mutators (tee, touch, mkdir) are allowed when all explicit
     // path arguments are under an allowed temp directory.
     if SCRATCH_MUTATORS.contains(&first_word) {
-        if scratch_paths_under_temp(trimmed, state.ctx) {
+        if scratch_paths_under_temp(trimmed, state) {
             return Ok(());
         }
         return reject(
@@ -1075,11 +1342,11 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
         );
     }
 
-    // Temp mutators (cp, mv, rm, gzip, etc.) are allowed when all explicit
-    // path arguments target temp directories. The prompt tells agents that
+    // Temp mutators (cp, mv, rm, gzip, etc.) are allowed when their path
+    // arguments target temp directories. The prompt tells agents that
     // writing to the OS temp directory is allowed.
     if TEMP_MUTATORS.contains(&first_word) {
-        if scratch_paths_under_temp(trimmed, state.ctx) {
+        if temp_mutator_paths_under_temp(trimmed, first_word, state) {
             return Ok(());
         }
         return reject(
@@ -1114,12 +1381,84 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
     // Iterates the FLAG_CHECKS table; the first matching entry returns early,
     // otherwise falls through to `Ok(())` for the allow case.
     for check in FLAG_CHECKS {
-        if first_word == check.verb && (check.predicate)(trimmed, state.ctx) {
+        if first_word == check.verb && (check.predicate)(trimmed, state) {
             return reject(trimmed, check.rejection, check.suggestion);
         }
     }
 
     Ok(())
+}
+
+/// Update the tracked CWD for a `cd`/`pushd`/`popd` segment (decision 7).
+///
+/// Only a literal absolute `cd` into an existing directory tracks; every other
+/// form (relative, `..`, `-`, bare, `$VAR`, `~`, pushd/popd) resets tracking
+/// to fail-closed (`None` → relative paths reject).
+fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
+    let words: Vec<&str> = segment.split_whitespace().collect();
+    let Some(cd_idx) = words
+        .iter()
+        .position(|w| matches!(*w, "cd" | "pushd" | "popd"))
+    else {
+        return;
+    };
+    let cmd = words[cd_idx];
+    match words.get(cd_idx + 1) {
+        Some(target) if cmd == "cd" && target.starts_with('/') => {
+            let p = std::path::PathBuf::from(target);
+            // Filesystem existence checks are expected and acceptable
+            // (decision 7); a nonexistent target fails the command, so
+            // tracking resets fail-closed.
+            state.cwd = if p.is_dir() { Some(p) } else { None };
+        }
+        _ => state.cwd = None,
+    }
+}
+
+/// Apply temp-variable bindings from a segment (decision 5): `export X=...`,
+/// plain `X=...` assignment segments, and leading env-prefix assignments
+/// (`TMPDIR=/tmp cmd`). Bare `export` / `export NAME` are no-ops.
+fn apply_env_bindings(segment: &str, state: &mut ValidationState) {
+    let words: Vec<&str> = segment.split_whitespace().collect();
+    if words.first() == Some(&"export") {
+        for w in &words[1..] {
+            if let Some((name, value)) = w.split_once('=') {
+                apply_single_binding(name, value, state);
+            }
+            // `export NAME` without a value neither clears poisoning nor
+            // enables anything new (decision 5).
+        }
+        return;
+    }
+    for w in words.iter().take_while(|w| super::is_env_assignment(w)) {
+        if let Some((name, value)) = w.split_once('=') {
+            apply_single_binding(name, value, state);
+        }
+    }
+}
+
+/// Bind a single `NAME=value` assignment to a tracked temp variable.
+///
+/// The stored value is the *resolved* path (shell expansion happens at
+/// assignment time, so `export TMPDIR="$TMPDIR/x"` binds the expanded path).
+fn apply_single_binding(name: &str, value: &str, state: &mut ValidationState) {
+    let Some(var) = TempVar::from_name(name) else {
+        return;
+    };
+    // Strip balanced surrounding quotes from the value (`export TMPDIR="/tmp"`).
+    let clean = strip_outer_quotes(value).map_or(value, |(c, _)| c);
+    let resolved = if !clean.is_empty() && !clean.starts_with('~') {
+        resolve_path_word(clean, state)
+    } else {
+        None
+    };
+    let under_temp = resolved.as_ref().is_some_and(|p| is_path_under_temp(p, state.ctx));
+    state.vars[var as usize] = VarBinding {
+        value: Some(
+            resolved.map_or_else(|| clean.to_string(), |p| p.to_string_lossy().into_owned()),
+        ),
+        poisoned: !under_temp,
+    };
 }
 
 // ── Git-specific checks ──────────────────────────────────────────────────
@@ -1528,7 +1867,7 @@ fn flag_value_equals<'a>(parts: &'a [&'a str], prefix: &str) -> Option<&'a str> 
 
 /// Check if `sed` has `-i` in a way that mutates files outside temp.
 /// When all file operands after `-i` are under temp, returns `false` (allow).
-fn has_sed_mutation(command: &str, ctx: &CheckContext) -> bool {
+fn has_sed_mutation(command: &str, state: &ValidationState) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
     // Find the -i flag position (including -i.bak, -iSUFFIX)
     let i_pos = parts
@@ -1570,23 +1909,23 @@ fn has_sed_mutation(command: &str, ctx: &CheckContext) -> bool {
     }
 
     !file_operands.iter().all(|p| {
-        resolve_path_word(p, ctx).is_some_and(|path| is_path_under_temp(&path, ctx))
+        resolve_path_word(p, state).is_some_and(|path| is_path_under_temp(&path, state.ctx))
     })
 }
 
 /// Check if `awk -i inplace` is present.
-fn has_inplace(command: &str, _ctx: &CheckContext) -> bool {
+fn has_inplace(command: &str, _state: &ValidationState) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
     parts.windows(2).any(|w| w[0] == "-i" && w[1] == "inplace")
 }
 
 /// Check if `dd of=...` writes outside temp.
 /// When `of=` points to a temp path, returns `false` (allow).
-fn has_dd_mutation(command: &str, ctx: &CheckContext) -> bool {
+fn has_dd_mutation(command: &str, state: &ValidationState) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
     if let Some(of_val) = flag_value_equals(&parts, "of=") {
-        return !resolve_path_word(of_val, ctx)
-            .is_some_and(|path| is_path_under_temp(&path, ctx));
+        return !resolve_path_word(of_val, state)
+            .is_some_and(|path| is_path_under_temp(&path, state.ctx));
     }
     false
 }
@@ -1594,7 +1933,7 @@ fn has_dd_mutation(command: &str, ctx: &CheckContext) -> bool {
 /// Check if curl has output flags that write outside temp.
 /// `-o <path>` / `--output <path>` is allowed when path is under temp.
 /// `-O` / `--remote-name` is always blocked (writes to CWD with URL filename).
-fn has_curl_mutation(command: &str, ctx: &CheckContext) -> bool {
+fn has_curl_mutation(command: &str, state: &ValidationState) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
 
     // -O/--remote-name are always blocked (writes to CWD with URL filename)
@@ -1605,14 +1944,14 @@ fn has_curl_mutation(command: &str, ctx: &CheckContext) -> bool {
     // -o/--output: blocked unless output path is under temp
     for flag in &["-o", "--output"] {
         if let Some(path) = flag_value(&parts, flag) {
-            return !resolve_path_word(path, ctx)
-                .is_some_and(|p| is_path_under_temp(&p, ctx));
+            return !resolve_path_word(path, state)
+                .is_some_and(|p| is_path_under_temp(&p, state.ctx));
         }
     }
 
     // --output=path syntax
     if let Some(path) = flag_value_equals(&parts, "--output=") {
-        return !resolve_path_word(path, ctx).is_some_and(|p| is_path_under_temp(&p, ctx));
+        return !resolve_path_word(path, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
     }
 
     false
@@ -1622,26 +1961,26 @@ fn has_curl_mutation(command: &str, ctx: &CheckContext) -> bool {
 /// `-O <path>` / `--output-document <path>` / `-P <path>` / `--directory-prefix <path>`
 /// are allowed when the path is under temp.
 /// Without output flags, wget writes to CWD → always blocked.
-fn has_wget_mutation(command: &str, ctx: &CheckContext) -> bool {
+fn has_wget_mutation(command: &str, state: &ValidationState) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
 
     // -O/--output-document: specify output file path
     if let Some(path) = flag_value(&parts, "-O").or_else(|| flag_value(&parts, "--output-document"))
     {
-        return !resolve_path_word(path, ctx).is_some_and(|p| is_path_under_temp(&p, ctx));
+        return !resolve_path_word(path, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
     }
     if let Some(path) = flag_value_equals(&parts, "--output-document=") {
-        return !resolve_path_word(path, ctx).is_some_and(|p| is_path_under_temp(&p, ctx));
+        return !resolve_path_word(path, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
     }
 
     // -P/--directory-prefix: specify download directory
     if let Some(path) =
         flag_value(&parts, "-P").or_else(|| flag_value(&parts, "--directory-prefix"))
     {
-        return !resolve_path_word(path, ctx).is_some_and(|p| is_path_under_temp(&p, ctx));
+        return !resolve_path_word(path, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
     }
     if let Some(path) = flag_value_equals(&parts, "--directory-prefix=") {
-        return !resolve_path_word(path, ctx).is_some_and(|p| is_path_under_temp(&p, ctx));
+        return !resolve_path_word(path, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
     }
 
     // No known output flag → wget would write to CWD with URL's filename
@@ -1714,13 +2053,13 @@ fn is_tar_list_only(command: &str) -> bool {
 ///     [`is_tar_list_only`] to whitelist them.
 /// *   Do **not** add positive blacklist checks to this function — they
 ///     would be dead code, masked by the fallback.
-fn is_tar_mutating(command: &str, _ctx: &CheckContext) -> bool {
+fn is_tar_mutating(command: &str, _state: &ValidationState) -> bool {
     !is_tar_list_only(command)
 }
 
 /// Check if `base64 -d -o` writes outside temp.
 /// When `-o`/`--output` points to a temp path, returns `false` (allow).
-fn has_base64_mutation(command: &str, ctx: &CheckContext) -> bool {
+fn has_base64_mutation(command: &str, state: &ValidationState) -> bool {
     if !has_any_flag(command, &["-d", "--decode"]) {
         return false; // not decoding → not a mutation
     }
@@ -1730,7 +2069,7 @@ fn has_base64_mutation(command: &str, ctx: &CheckContext) -> bool {
     // Check -o/--output flag values
     for flag in &["-o", "--output"] {
         if let Some(path) = flag_value(&parts, flag) {
-            return !resolve_path_word(path, ctx).is_some_and(|p| is_path_under_temp(&p, ctx));
+            return !resolve_path_word(path, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
         }
     }
 
@@ -1782,6 +2121,8 @@ mod tests {
         CheckContext {
             workspace_root: std::path::PathBuf::from("/__mahbot_readonly_test_ws__"),
             temp_roots: crate::tools::path::allowed_temp_roots(),
+            // Match the session shell environment (TMPDIR=/tmp); TMP/TEMP unset.
+            temp_vars: vec![("TMPDIR".to_string(), "/tmp".to_string())],
         }
     }
 
@@ -2520,7 +2861,10 @@ mod tests {
             ("xz /tmp/file.txt", true),
             ("zstd /tmp/file.txt", true),
             ("zip /tmp/out.zip /tmp/file1 /tmp/file2", true),
-            ("cp /etc/passwd /tmp/out", false), // source outside temp
+            // cp: only the DESTINATION must be under temp (sources are
+            // read-only — copying from anywhere into temp is allowed;
+            // copying into the workspace stays blocked, decision 8).
+            ("cp /etc/passwd /tmp/out", true), // source outside temp, dest temp
             // ── Flag-based temp-aware checks ──
             // curl -o to temp → allowed
             ("curl -o /tmp/file URL", true),
@@ -2777,6 +3121,139 @@ mod tests {
             ("touch /tmp/a \\\n/tmp/b", true),
             // Quote-aware newline: quoted newline is not a separator.
             ("echo 'a\nb'", true),
+        ];
+
+        run_cases(&cases);
+    }
+
+    // ── Phase 2 acceptance: variable/tilde/quote expansion ───────────────
+
+    #[test]
+    fn expansion_acceptance() {
+        let cases = [
+            // Temp writes via env vars and quoted env vars — allowed.
+            ("touch $TMPDIR/out.txt", true),
+            ("touch \"$TMPDIR/out.txt\"", true),
+            ("touch ${TMPDIR}/out.txt", true),
+            ("echo hi > $TMPDIR/out", true),
+            ("echo hi > \"$TMPDIR/out\"", true),
+            ("tee $TMPDIR/scratch.log", true),
+            ("mkdir -p $TMPDIR/scratch_dir", true),
+            ("rm $TMPDIR/scratch.txt", true),
+            ("sed -i 's/a/b/' /tmp/file", true),
+            ("dd of=$TMPDIR/out bs=1 count=1", true),
+            ("curl -o $TMPDIR/file URL", true),
+            // $PWD resolves to the workspace (initial CWD) — blocked.
+            ("touch $PWD/out.txt", false),
+            ("echo hi > $PWD/out", false),
+            // Unknown/unset variables — blocked.
+            ("touch $FOO/out.txt", false),
+            ("touch $TMP/out.txt", false), // TMP unset in the session env
+            // Tilde / $HOME — never under temp — blocked.
+            ("touch ~/out.txt", false),
+            ("touch $HOME/out.txt", false),
+            // Single-quoted (unexpanded) var — blocked.
+            ("touch '$TMPDIR/out.txt'", false),
+            // Unbalanced quotes — blocked.
+            ("touch \"$TMPDIR/out.txt", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    // ── Phase 2 acceptance: export poisoning ─────────────────────────────
+
+    #[test]
+    fn export_poisoning_acceptance() {
+        let cases = [
+            // Binding TMPDIR to a non-temp path poisons it (export form).
+            ("export TMPDIR=/etc\necho hi > $TMPDIR/out", false),
+            // Env-prefix form poisons too.
+            ("TMPDIR=/etc touch $TMPDIR/out", false),
+            // Plain assignment segment poisons.
+            ("TMPDIR=/etc\ntouch $TMPDIR/out", false),
+            // Re-binding to a valid temp root clears the poison.
+            ("export TMPDIR=/etc\nexport TMPDIR=/tmp\ntouch $TMPDIR/out", true),
+            // Env-prefix rebind to temp clears.
+            ("TMPDIR=/etc\nTMPDIR=/tmp touch $TMPDIR/out", true),
+            // Binding TMP (initially unset) to temp enables it.
+            ("export TMP=/tmp\ntouch $TMP/out", true),
+            // Bare export / export NAME are no-ops.
+            ("export\ntouch $TMPDIR/out", true),
+            ("export TMP\ntouch $TMPDIR/out", true),
+            // Quoted value in export.
+            ("export TMPDIR=\"/tmp\"\ntouch $TMPDIR/out", true),
+        ];
+
+        run_cases(&cases);
+    }
+
+    // ── Phase 2 acceptance: copy vs move/delete semantics ────────────────
+
+    #[test]
+    fn copy_move_acceptance() {
+        let cases = [
+            // cp: only the destination must be under temp.
+            ("cp /etc/passwd /tmp/out", true),
+            ("cp /tmp/a /tmp/b", true),
+            ("cp -t /tmp/d s1 s2", true),
+            ("cp --target-directory /tmp/d s1 s2", true),
+            ("cp --target-directory=/tmp/d s1", true),
+            // cp into the workspace stays blocked.
+            ("cp /etc/passwd ws_file", false),
+            ("cp /tmp/a /etc/passwd", false),
+            ("cp -t /workspace/d s1", false),
+            ("cp", false),
+            // mv/rm: all args must be under temp (move from workspace to temp
+            // deletes a source → blocked).
+            ("mv /tmp/a /tmp/b", true),
+            ("mv ws_file /tmp/out", false),
+            ("rm /tmp/scratch.txt", true),
+            ("rm ws_file", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    // ── Phase 2 acceptance: current-directory tracking ───────────────────
+
+    #[test]
+    fn cwd_tracking_acceptance() {
+        let cases = [
+            // cd to temp + relative write — allowed.
+            ("cd /tmp && touch f", true),
+            ("cd /tmp && echo hi > out.txt", true),
+            ("cd /tmp && tee scratch.log", true),
+            // cd to a non-temp dir then relative write — blocked.
+            ("cd /tmp && cd /etc && touch f", false),
+            ("cd / && touch f", false),
+            // Relative cd resets tracking to fail-closed (decision 7).
+            ("cd /tmp && cd src && touch f", false),
+            ("cd /tmp && cd .. && touch f", false),
+            ("cd .. && touch f", false),
+            ("cd - && touch f", false),
+            ("cd && touch f", false),
+            ("cd $TMPDIR && touch f", false),
+            ("cd ~ && touch f", false),
+            // pushd/popd always reset.
+            ("cd /tmp && pushd /tmp && touch f", false),
+            ("cd /tmp && popd && touch f", false),
+            // cd to nonexistent dir + write — blocked.
+            ("cd /nonexistent_dir_xyz_1059 && touch f", false),
+            // $PWD after tracked cd resolves to the tracked CWD.
+            ("cd /tmp && touch $PWD/out", true),
+            ("cd /tmp && touch $PWD/../../etc/passwd", false),
+            // cd to workspace + rm — blocked.
+            ("cd / && rm f", false),
+            // Relative path args without cd resolve to the workspace — blocked.
+            ("touch f", false),
+            // Relative globs stay rejected even under a temp CWD.
+            ("cd /tmp && touch *.log", false),
+            // `..`-normalized escape from a temp CWD — blocked.
+            ("cd /tmp && echo hi > ../etc/passwd", false),
+            // cp destination "." = current dir (workspace → blocked, temp → allowed).
+            ("cp /tmp/a .", false),
+            ("cd /tmp && cp /tmp/a .", true),
         ];
 
         run_cases(&cases);
