@@ -693,10 +693,12 @@ fn strip_outer_quotes(word: &str) -> Option<(&str, bool)> {
 ///
 /// Temp-tagged variables (`NAME=$(mktemp -d)`) expand to a synthetic anchor
 /// path (first allowed temp root + one level — the same depth as a real
-/// `mktemp` result, so `..` chains escape at the same depth). Unbound
-/// variables after a temp anchor expand to an opaque placeholder segment
-/// (`$SNAP/$RANDOM/f`); the tail after the first opaque segment is
-/// unverifiable, so any `..` path segment there fails closed.
+/// `mktemp` result, so `..` chains escape at the same depth). The `$RANDOM`
+/// builtin after a temp anchor expands to an opaque placeholder segment
+/// (`$SNAP/$RANDOM/f`); any other unbound variable fails closed (its ambient
+/// value is outside the guard's tracking model). The tail after the first
+/// opaque segment is unverifiable, so any `..` path segment there fails
+/// closed.
 fn expand_vars(word: &str, single_quoted: bool, state: &ValidationState) -> Option<String> {
     if single_quoted {
         // No expansion inside single quotes — a literal `$` is not a valid
@@ -728,8 +730,14 @@ fn expand_vars(word: &str, single_quoted: bool, state: &ValidationState) -> Opti
                 VarValue::Concrete(text) => out.push_str(&text),
                 VarValue::TempRoot => out.push_str(&temp_anchor_path(state.ctx)),
                 VarValue::Opaque => {
-                    // Unbound variable: usable only as an opaque suffix after
-                    // a temp anchor has been established.
+                    // Only the `$RANDOM` builtin is a safe opaque suffix after
+                    // a temp anchor: it always expands to a bare word (or
+                    // empty in POSIX sh), never to a path that could escape.
+                    // Any other unbound variable fails closed — its ambient
+                    // value is outside the guard's tracking model.
+                    if name != "RANDOM" {
+                        return None;
+                    }
                     if opaque_from.is_none() && !is_under_temp_prefix(&out, state) {
                         return None;
                     }
@@ -814,8 +822,9 @@ enum VarValue {
     /// Unknown concrete value provably under a temp root
     /// (`NAME=$(mktemp -d)`).
     TempRoot,
-    /// Unbound/unknown variable — only usable as an opaque suffix after a
-    /// temp anchor has been established (`$SNAP/$RANDOM/f`).
+    /// Unbound/unknown variable — only the `$RANDOM` builtin is usable as an
+    /// opaque suffix after a temp anchor has been established
+    /// (`$SNAP/$RANDOM/f`); any other unbound variable fails closed.
     Opaque,
     /// Poisoned or otherwise unprovable (`$HOME`, untracked `$PWD`) — always
     /// fail-closed.
@@ -841,10 +850,11 @@ fn resolve_var(name: &str, state: &ValidationState) -> VarValue {
         _ => match state.vars.get(name) {
             None => VarValue::Opaque,
             Some(b) if b.poisoned => VarValue::Blocked,
-            Some(b) if b.temp_root => VarValue::TempRoot,
             Some(b) => match &b.value {
+                // `value == None` marks a temp-tagged binding
+                // (`NAME=$(mktemp -d)`) with an unknown concrete value.
                 Some(v) => VarValue::Concrete(v.clone()),
-                None => VarValue::Opaque,
+                None => VarValue::TempRoot,
             },
         },
     }
@@ -908,14 +918,9 @@ impl CheckContext {
 /// Binding state for one tracked variable.
 #[derive(Debug, Clone)]
 struct VarBinding {
-    /// Bound value; `None` = unknown concrete value (only for `temp_root`
-    /// bindings like `NAME=$(mktemp -d)`).
+    /// Bound value; `None` = unknown concrete value provably under a temp
+    /// root (`NAME=$(mktemp -d)`).
     value: Option<String>,
-    /// True when the variable is provably bound under a temp root even though
-    /// the concrete value is unknown (`NAME=$(mktemp -d)`). With
-    /// `value == None` this marks a temp-tagged binding; with a concrete value
-    /// it is redundant (poisoning already encodes the temp/non-temp verdict).
-    temp_root: bool,
     /// When true, subsequent expansions of this variable reject (fail-closed).
     /// Set by binding to a non-temp path; cleared by re-binding to a valid
     /// temp root.
@@ -933,6 +938,10 @@ struct ValidationState<'a> {
     /// (TMPDIR/TMP/TEMP) plus any variable assigned a temp-root value
     /// (`SNAP=$(mktemp -d)`, `SNAP=/tmp/x`, ...) in the command chain.
     vars: std::collections::HashMap<String, VarBinding>,
+    /// Directories provably created by an approved `mkdir` earlier in this
+    /// command chain (normalized temp paths). A later `cd` into one of them
+    /// tracks even when the directory did not exist at validation time.
+    created_dirs: std::collections::HashSet<std::path::PathBuf>,
 }
 
 impl ValidationState<'_> {
@@ -945,7 +954,6 @@ impl ValidationState<'_> {
                 name.clone(),
                 VarBinding {
                     value: Some(value.clone()),
-                    temp_root: false,
                     poisoned: false,
                 },
             );
@@ -954,6 +962,7 @@ impl ValidationState<'_> {
             ctx,
             cwd: Some(ctx.workspace_root.clone()),
             vars,
+            created_dirs: std::collections::HashSet::new(),
         }
     }
 
@@ -965,6 +974,7 @@ impl ValidationState<'_> {
             ctx: self.ctx,
             cwd: self.cwd.clone(),
             vars: self.vars.clone(),
+            created_dirs: self.created_dirs.clone(),
         }
     }
 }
@@ -1454,11 +1464,12 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
     }
 
     // ── CWD tracking (contract decision 7) ─────────────────────────
-    // Only a literal absolute `cd` into a directory that exists at validation
-    // time updates the tracked CWD. All other cd forms — relative (`cd src`),
-    // `cd ..`, `cd -`, bare `cd`, `cd $VAR`, `cd ~`, pushd/popd — reset
-    // tracking to fail-closed: subsequent relative path arguments and
-    // redirect targets reject.
+    // A literal absolute `cd` into a directory that exists at validation time
+    // (or was created by `mkdir` earlier in the chain) updates the tracked
+    // CWD. All other cd forms — relative `cd` whose target does not provably
+    // resolve under a tracked temp cwd, `cd ..`, `cd -`, bare `cd`,
+    // `cd $VAR`, `cd ~`, pushd/popd — reset tracking to fail-closed:
+    // subsequent relative path arguments and redirect targets reject.
     let words: Vec<&str> = trimmed.split_whitespace().collect();
     let first_effective = words
         .iter()
@@ -1493,6 +1504,12 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
     // path arguments are under an allowed temp directory.
     if SCRATCH_MUTATORS.contains(&first_word) {
         if scratch_paths_under_temp(trimmed, state) {
+            // `mkdir` creates the directories it names — record them so a
+            // later `cd` in the same chain can track them even though they
+            // did not exist at validation time.
+            if first_word == "mkdir" {
+                record_mkdir_targets(trimmed, state);
+            }
             return Ok(());
         }
         return reject(
@@ -1561,13 +1578,17 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
 
 /// Update the tracked CWD for a `cd`/`pushd`/`popd` segment (decision 7).
 ///
-/// A literal absolute `cd` into a temp-root path tracks even when the
-/// directory does not exist at validation time (created earlier in the same
-/// command chain). A literal absolute `cd` elsewhere tracks only when the
-/// directory exists; every other form — relative `cd` whose normalized result
-/// escapes a tracked temp cwd, `cd ..`, `cd -`, bare `cd`, `cd $VAR`,
-/// `cd ~`, pushd/popd — resets tracking to fail-closed (`None` → relative
-/// paths reject).
+/// A literal absolute `cd` into a temp-root path tracks only when the
+/// directory exists at validation time or was provably created by `mkdir`
+/// earlier in the same command chain: a nonexistent target fails the `cd` at
+/// runtime, leaving the real CWD in place, so tracking it would approve a
+/// chained write that actually lands elsewhere. A literal absolute `cd`
+/// elsewhere tracks only when the directory exists. Every other form —
+/// relative `cd` whose target does not provably resolve under a tracked temp
+/// cwd, `cd ..`, `cd -`, bare `cd`, `cd $VAR`, `cd ~`, pushd/popd — resets
+/// tracking to fail-closed (`None` → relative paths reject). Relative targets
+/// are expanded against the tracked state before tracking, so `$VAR`, `~`,
+/// `-` and `$OLDPWD` cannot smuggle a non-temp location past the guard.
 fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
     let words: Vec<&str> = segment.split_whitespace().collect();
     let Some(cd_idx) = words
@@ -1581,9 +1602,16 @@ fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
         Some(target) if cmd == "cd" && target.starts_with('/') => {
             let p = std::path::PathBuf::from(target);
             if is_path_under_temp(&p, state.ctx) {
-                // Temp cd: tracks regardless of existence (the directory may
-                // have been created earlier in the same command chain).
-                state.cwd = Some(p);
+                // Track only when the directory exists or was created earlier
+                // in this chain (mkdir); a nonexistent target would fail the
+                // `cd` at runtime and a chained write would land in the real
+                // CWD (fail-closed).
+                let normalized = crate::tools::path::normalize_path(&p);
+                state.cwd = if p.is_dir() || state.created_dirs.contains(&normalized) {
+                    Some(p)
+                } else {
+                    None
+                };
             } else {
                 // Filesystem existence checks are expected and acceptable
                 // (decision 7); a nonexistent target fails the command, so
@@ -1592,9 +1620,11 @@ fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
             }
         }
         Some(target) if cmd == "cd" => {
-            // Relative cd under a tracked temp cwd is allowed iff the
-            // normalized result stays under a temp root; anything else resets
-            // fail-closed.
+            // Relative cd under a tracked temp cwd is allowed iff the target
+            // — after variable expansion — resolves to a path under a temp
+            // root; anything else resets fail-closed. `~` and `-` never
+            // resolve under temp, and unresolvable targets (`$HOME`,
+            // `$OLDPWD`, unbound variables) reject.
             let Some(cwd) = &state.cwd else {
                 state.cwd = None;
                 return;
@@ -1603,7 +1633,15 @@ fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
                 state.cwd = None;
                 return;
             }
-            let normalized = crate::tools::path::normalize_path(&cwd.join(target));
+            if target.starts_with('~') || *target == "-" {
+                state.cwd = None;
+                return;
+            }
+            let Some(resolved) = resolve_path_word(target, state) else {
+                state.cwd = None;
+                return;
+            };
+            let normalized = crate::tools::path::normalize_path(&resolved);
             state.cwd = if is_path_under_temp(&normalized, state.ctx) {
                 Some(normalized)
             } else {
@@ -1611,6 +1649,35 @@ fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
             };
         }
         _ => state.cwd = None,
+    }
+}
+
+/// Record temp directories created by an approved `mkdir` segment (normalized
+/// paths) so a later `cd` in the same command chain can track them even though
+/// they did not exist at validation time. With `-p`/`--parents` the ancestors
+/// are recorded too — `mkdir -p` creates them along the way.
+fn record_mkdir_targets(segment: &str, state: &mut ValidationState) {
+    let parents = segment
+        .split_whitespace()
+        .any(|w| w == "-p" || w == "--parents");
+    for arg in non_flag_path_args(segment) {
+        let Some(resolved) = resolve_path_word(&arg, state) else {
+            continue;
+        };
+        let mut dir = crate::tools::path::normalize_path(&resolved);
+        if !is_path_under_temp(&dir, state.ctx) {
+            continue;
+        }
+        state.created_dirs.insert(dir.clone());
+        if parents {
+            while let Some(parent) = dir.parent() {
+                dir = parent.to_path_buf();
+                if !is_path_under_temp(&dir, state.ctx) {
+                    break;
+                }
+                state.created_dirs.insert(dir.clone());
+            }
+        }
     }
 }
 
@@ -1715,7 +1782,6 @@ fn apply_single_binding(name: &str, value: &str, state: &mut ValidationState) {
             value: Some(
                 resolved.map_or_else(|| clean.to_string(), |p| p.to_string_lossy().into_owned()),
             ),
-            temp_root: false,
             poisoned: !under_temp,
         },
     );
@@ -1736,9 +1802,18 @@ fn substitution_body(value: &str) -> Option<&str> {
 /// Detect a `NAME=$(mktemp ...)` / `` NAME=`mktemp ...` `` assignment and
 /// return a temp-tagged binding (unknown concrete value, provably under a
 /// temp root). Returns `None` when the value is not an mktemp substitution or
-/// when the invocation overrides its directory with a non-temp path (the
-/// variable then falls through to the normal binding path, which poisons it —
-/// fail-closed).
+/// when the invocation's landing directory is not provably under a temp root
+/// (the variable then falls through to the normal binding path, which poisons
+/// it — fail-closed).
+///
+/// The landing directory comes from `-p DIR` / `--tmpdir[=DIR]` or from a
+/// positional template. The template is honored: only a template that
+/// provably resolves under a temp root (an absolute temp path, or a variable
+/// expanding to one) binds. Absolute non-temp templates (e.g. under /etc, the
+/// workspace, $HOME), relative templates (resolved against the shell cwd) and
+/// the `-- <template>` forms carrying them all fail closed. An unrecognized
+/// option or a second template makes mktemp error at runtime — the variable
+/// would bind empty, so a temp anchor would be a false one; fail closed.
 fn mktemp_binding(value: &str, state: &ValidationState) -> Option<VarBinding> {
     let inner = substitution_body(value)?;
     let mut words = inner.split_whitespace();
@@ -1747,6 +1822,7 @@ fn mktemp_binding(value: &str, state: &ValidationState) -> Option<VarBinding> {
     }
     let args: Vec<&str> = words.collect();
     let mut target_dir: Option<&str> = None;
+    let mut template: Option<&str> = None;
     let mut after_ddash = false;
     let mut i = 0;
     while i < args.len() {
@@ -1769,13 +1845,55 @@ fn mktemp_binding(value: &str, state: &ValidationState) -> Option<VarBinding> {
             }
             if let Some(dir) = a.strip_prefix("--tmpdir=") {
                 target_dir = Some(dir);
+                i += 1;
+                continue;
+            }
+            // `-t prefix` takes a value (BSD spelling); the result still
+            // lands under $TMPDIR — a temp root.
+            if a == "-t" {
+                if i + 1 < args.len() {
+                    i += 2;
+                    continue;
+                }
+                return None; // missing prefix value → mktemp errors at runtime
+            }
+            // Known boolean flags and `=`-form options do not affect where
+            // the result lands.
+            if matches!(a, "-d" | "-q" | "-u" | "--dry-run" | "--quiet")
+                || a.starts_with("--suffix=")
+            {
+                i += 1;
+                continue;
+            }
+            if a.starts_with('-') {
+                return None; // unrecognized option → fail-closed
             }
         }
+        // First positional argument is the template; a second one makes
+        // mktemp error at runtime → fail-closed.
+        if template.is_some() {
+            return None;
+        }
+        template = Some(a);
         i += 1;
+    }
+    // The template determines the landing path when present: it must
+    // provably resolve under a temp root. Relative templates resolve against
+    // the tracked CWD — the shell cwd at runtime — so they fail closed unless
+    // that cwd is already a tracked temp root. A template without trailing
+    // X's makes mktemp error at runtime and bind the variable empty, so no
+    // temp anchor may be created (fail-closed).
+    if let Some(t) = template {
+        let clean = strip_outer_quotes(t).map_or(t, |(c, _)| c);
+        if !clean.ends_with("XXXXXX") {
+            return None;
+        }
+        if resolve_path_word(clean, state).is_none_or(|p| !is_path_under_temp(&p, state.ctx)) {
+            return None;
+        }
     }
     let temp_binding = || VarBinding {
         value: None,
-        temp_root: true,
         poisoned: false,
     };
     match target_dir {
@@ -3903,10 +4021,29 @@ mod tests {
             ("cd /tmp && popd && touch f", false),
             // cd to nonexistent dir + write — blocked (non-temp target).
             ("cd /nonexistent_dir_xyz_1059 && touch f", false),
-            // cd to a nonexistent temp dir tracks (created earlier in the
-            // same command chain).
-            ("cd /tmp/nonexistent_x && touch f", true),
+            // cd to a nonexistent temp dir fails closed in every chaining
+            // spelling: at runtime the cd fails and the write lands in the
+            // real CWD (the workspace). The dir must exist at validation time
+            // or have been created by `mkdir` earlier in the same chain.
+            ("cd /tmp/nonexistent_x && touch f", false),
+            ("cd /tmp/nonexistent_x ; touch f", false),
+            ("cd /tmp/nonexistent_x\ntouch f", false),
+            ("cd /tmp/nonexistent_x || touch f", false),
             ("mkdir -p /tmp/snap && cd /tmp/snap && touch f", true),
+            ("mkdir -p /tmp/snap; cd /tmp/snap; touch f", true),
+            ("mkdir -p /tmp/snap\ncd /tmp/snap\ntouch f", true),
+            ("mkdir /tmp/snap; cd /tmp/snap; touch f", true),
+            // mkdir -p records ancestors too.
+            ("mkdir -p /tmp/a/b; cd /tmp/a; touch f", true),
+            // Relative cd targets are expanded before tracking: a target that
+            // expands to a non-temp location fails closed.
+            ("cd /tmp && cd $TMPDIR && touch f", true),
+            ("cd /tmp && cd $HOME && touch f", false),
+            ("cd /tmp && cd ~ && touch f", false),
+            ("cd /tmp && cd - && touch f", false),
+            ("cd /tmp && cd $OLDPWD && rm -rf x", false),
+            ("cd /tmp && cd $OLDPWD && touch f", false),
+            ("cd /tmp && cd $FOO && touch f", false),
             // $PWD after tracked cd resolves to the tracked CWD.
             ("cd /tmp && touch $PWD/out", true),
             ("cd /tmp && touch $PWD/../../etc/passwd", false),
@@ -4131,6 +4268,54 @@ mod tests {
                 "SNAP=$(mktemp -d /tmp/mahbot.XXXXXX)\ntouch \"$SNAP/f\"",
                 true,
             ),
+            // Positional templates that provably resolve under a temp root
+            // bind — including the `-- <template>` form and variables
+            // expanding to a temp path.
+            (
+                "SNAP=$(mktemp -d -- /tmp/mahbot.XXXXXX)\ntouch \"$SNAP/f\"",
+                true,
+            ),
+            (
+                "SNAP=$(mktemp -d \"$TMPDIR/mahbot.XXXXXX\")\ntouch \"$SNAP/f\"",
+                true,
+            ),
+            // Absolute non-temp, $HOME, relative (shell-cwd) and workspace
+            // templates fail closed — no temp-root binding, writes via the
+            // variable reject.
+            (
+                "SNAP=$(mktemp -d /etc/mahbot.XXXXXX)\ntouch \"$SNAP/f\"",
+                false,
+            ),
+            (
+                "SNAP=$(mktemp -d /__mahbot_readonly_test_ws__/snap.XXXXXX)\ntouch \"$SNAP/f\"",
+                false,
+            ),
+            (
+                "SNAP=$(mktemp -d $HOME/snap.XXXXXX)\ntouch \"$SNAP/f\"",
+                false,
+            ),
+            ("SNAP=$(mktemp -d snap.XXXXXX)\ntouch \"$SNAP/f\"", false),
+            ("SNAP=$(mktemp -d ./snap.XXXXXX)\ntouch \"$SNAP/f\"", false),
+            // The `-- <template>` form carries the same rules.
+            (
+                "SNAP=$(mktemp -d -- /etc/mahbot.XXXXXX)\ntouch \"$SNAP/f\"",
+                false,
+            ),
+            ("SNAP=$(mktemp -d -- snap.XXXXXX)\ntouch \"$SNAP/f\"", false),
+            (
+                "SNAP=$(mktemp -d -- $HOME/snap.XXXXXX)\ntouch \"$SNAP/f\"",
+                false,
+            ),
+            // A second positional template makes mktemp error at runtime —
+            // the variable would bind empty, so no temp anchor.
+            (
+                "SNAP=$(mktemp -d /tmp/a.XXXXXX /tmp/b.XXXXXX)\ntouch \"$SNAP/f\"",
+                false,
+            ),
+            // A template without trailing X's makes mktemp error at runtime —
+            // the variable would bind empty, so no temp anchor.
+            ("SNAP=$(mktemp -d /tmp/foo)\ntouch \"$SNAP/f\"", false),
+            ("SNAP=$(mktemp -d /tmp/foo.XX)\ntouch \"$SNAP/f\"", false),
             // mktemp -p/--tmpdir to a temp dir binds; to a non-temp dir does not.
             ("SNAP=$(mktemp -d -p /tmp)\ntouch \"$SNAP/f\"", true),
             ("SNAP=$(mktemp -d --tmpdir=/tmp)\ntouch \"$SNAP/f\"", true),
@@ -4146,7 +4331,9 @@ mod tests {
     }
 
     /// Opaque suffixes (`$$`, `$RANDOM`) under a temp prefix resolve; without
-    /// a temp anchor, or after an escape segment, they stay fail-closed.
+    /// a temp anchor, or after an escape segment, they stay fail-closed. An
+    /// arbitrary unbound variable is never treated as an opaque suffix —
+    /// only the `$RANDOM` builtin is.
     #[test]
     fn opaque_suffix_acceptance() {
         let cases = [
@@ -4157,6 +4344,9 @@ mod tests {
             ("touch \"/tmp/$RANDOM/f\"", true),
             // Without a temp anchor the opaque variable is unprovable.
             ("touch \"$RANDOM/f\"", false),
+            // Arbitrary unbound variables fail closed even after a temp anchor.
+            ("SNAP=$(mktemp -d)\ntouch \"$SNAP/$FOO/f\"", false),
+            ("SNAP=$(mktemp -d)\ntouch \"$SNAP/$PATH/f\"", false),
             // `..` after an opaque suffix is unverifiable → blocked.
             ("SNAP=$(mktemp -d)\ntouch \"$SNAP/$RANDOM/../f\"", false),
             (
