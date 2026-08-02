@@ -40,17 +40,25 @@
 //! codegen shifts are expected, and there is no re-baseline ceremony.
 //!
 //! First run populates the TTS audio cache (~14-17 min); subsequent runs
-//! complete in ~33-35 s (bench body — Phase 13's cooldown probes add ~6.5 s of
+//! complete in ~28-31 s (bench body — Phase 13's cooldown probes add ~6.5 s of
 //! excluded-from-timing sleeps: 2.5 s suppression + 3.5 s recovery probes both
 //! measured from Detection 1's timestamp (overlapping, max ≈ 3.5 s)) plus the
-//! build time.  The bench-leanness cleanup removed the report-only same-audio
-//! (8b), B-sweep (8c), volume-sweep, mid-utterance, and cooldown boundary-probe
-//! phases (~8-10 s saved); the classifier/verifier weights fingerprints
-//! previously emitted inside the B-sweep section are now a top-level
-//! `weights_fingerprints` key emitted in teardown (byte-identical pure weight
-//! hashes).  Removing 8b/8c changes the shared VAD-detector drift state
-//! entering the Phase 9-12 FA canaries, so post-change canary numbers are NOT
-//! strictly comparable to archived baselines (disclosed in the report _note).
+//! build time; the exact figure is auditable from the top-level
+//! `total_wall_time_ms` key (whole run, report-assembly window included).
+//! The bench-leanness cleanup removed the report-only same-audio (8b),
+//! B-sweep (8c), volume-sweep, mid-utterance, cooldown boundary-probe, B2
+//! synthetic-fallback probe, train/test-alignment cosine diagnostics, and the
+//! dead top-level latency section (~11-16 s saved total); the
+//! classifier/verifier weights fingerprints previously emitted inside the
+//! B-sweep section are now a top-level `weights_fingerprints` key emitted in
+//! teardown (byte-identical pure weight hashes).  Removing 8b/8c changes the
+//! shared VAD-detector drift state entering the Phase 9-12 FA canaries, so
+//! post-change canary numbers are NOT strictly comparable to archived
+//! baselines (disclosed in the report _note); the noise_overlap clean-cell
+//! trim (2 of 3 byte-identical infinite-SNR clean cells removed) likewise
+//! shifts the in-phase shared adaptive trajectory for the remaining
+//! noise_overlap cells — all detections are 0/20, so the FA-canary impact is
+//! cosmetic, but cross-run comparability is disclosed for the same reason.
 //!
 //! # Requirements
 //!
@@ -2443,8 +2451,6 @@ struct DetectionMetrics {
     total: usize,
     detected: usize,
     false_accepts: Vec<String>,
-    /// Latency samples from true-positive detections (ms).
-    latencies: Vec<f64>,
     /// Per-variant detail for positive detection logging (mahbot-845).
     per_variant: Vec<PerVariantResult>,
 }
@@ -2455,39 +2461,6 @@ impl DetectionMetrics {
             0.0
         } else {
             self.detected as f64 / self.total as f64
-        }
-    }
-
-    fn mean_latency(&self) -> Option<f64> {
-        if self.latencies.is_empty() {
-            None
-        } else {
-            Some(self.latencies.iter().copied().sum::<f64>() / self.latencies.len() as f64)
-        }
-    }
-
-    fn median_latency(&self) -> Option<f64> {
-        let mut sorted = self.latencies.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let n = sorted.len();
-        if n == 0 {
-            None
-        } else if n.is_multiple_of(2) {
-            Some(f64::midpoint(sorted[n / 2 - 1], sorted[n / 2]))
-        } else {
-            Some(sorted[n / 2])
-        }
-    }
-
-    fn p95_latency(&self) -> Option<f64> {
-        let mut sorted = self.latencies.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let n = sorted.len();
-        if n == 0 {
-            None
-        } else {
-            let idx = ((n as f64) * 0.95).ceil() as usize - 1;
-            Some(sorted[idx.min(n - 1)])
         }
     }
 }
@@ -2949,54 +2922,6 @@ fn augmentation_type(label: &str) -> &'static str {
     }
 }
 
-/// L2-normalized mean embedding (centroid) of the given sequences' embeddings.
-/// Returns `None` when no embeddings exist (mahbot-1005 §6).
-///
-/// The mean-pool step delegates to the production
-/// [`mean_pool_embeddings`](crate::audio::voice_verifier::mean_pool_embeddings)
-/// (mahbot-1045 A5); the L2 normalization stays bench-side so the
-/// `test_vs_train_centroid_cosine` surface is unchanged.
-fn embedding_centroid(
-    sequences: &[crate::audio::embedding_sequence::EmbeddingSequence],
-) -> Option<Vec<f32>> {
-    let flat: Vec<Vec<f32>> = sequences
-        .iter()
-        .flat_map(|seq| seq.embeddings.iter().cloned())
-        .collect();
-    if flat.is_empty() {
-        return None;
-    }
-    let mut centroid = crate::audio::voice_verifier::mean_pool_embeddings(&flat);
-    let norm = centroid
-        .iter()
-        .map(|v| v * v)
-        .sum::<f32>()
-        .sqrt()
-        .max(1e-10);
-    for v in &mut centroid {
-        *v /= norm;
-    }
-    Some(centroid)
-}
-
-/// Cosine similarity between two equal-length vectors (L2-normalizes on the fly).
-/// Used by the train/test alignment section (mahbot-1006 §6).
-///
-/// Deliberately does NOT delegate to [`crate::vector::cosine_similarity`]:
-/// that helper clamps to [0, 1], which would erase negative cosines that are
-/// meaningful drift evidence (anti-correlated embeddings between test and
-/// training centroid).  The canonical helper's length/NaN guards are also
-/// skipped — both sides here are same-dimension embedding vectors produced by
-/// the same model, and a NaN/zero-denominator result correctly reads as "no
-/// meaningful similarity" for the report.  If a future consolidation
-/// re-introduces the clamp, negative-cosine evidence in the alignment report
-/// would silently disappear — keep this divergence documented.
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let na = a.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
-    let nb = b.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-10);
-    a.iter().zip(b).map(|(x, y)| x * y / (na * nb)).sum::<f32>()
-}
-
 /// Process a list of audio clips through the detection pipeline, recording
 /// results in `metrics`.  Shared helper for positive and negative detection
 /// test blocks, eliminating the repetitive match-and-track boilerplate.
@@ -3100,9 +3025,6 @@ fn test_detection_samples(
         }
         let peak = ctx.instrumentation.peak_score;
         if result.detected {
-            if let Some(lat) = result.latency_ms {
-                metrics.latencies.push(lat);
-            }
             on_detection(metrics, label);
         }
         // Record per-variant result (mahbot-845) with verifier score (mahbot-859)
@@ -3127,51 +3049,6 @@ fn test_detection_samples(
             peak,
         );
     }
-}
-
-/// Shared parameter-passed embedding-scoring loop (mahbot-1022): scores a
-/// sequence of embeddings through the classifier + verifier with a fresh
-/// [`PipelineCtx`](super::PipelineCtx), passing the classifier/verifier as
-/// explicit references.  Pure — does NOT touch global voice state, so the
-/// synthetic-fallback probe (which must not call `set_classifier_weights` /
-/// `set_verifier`) uses it.  Returns `(per_window_classifier_scores,
-/// per_window_verifier_scores, max_rolling_sum)`.
-fn score_embedding_sequence_with(
-    embeddings: &[Vec<f32>],
-    classifier: &WakeWordClassifier,
-    verifier: &VoiceVerifier,
-) -> (Vec<f32>, Vec<f32>, f32) {
-    let mut ctx = super::PipelineCtx::new();
-    let mut scores = Vec::with_capacity(embeddings.len());
-    let mut verifier_scores = Vec::with_capacity(embeddings.len());
-    let mut max_rs = 0.0f32;
-    for emb in embeddings {
-        let (_, rolling_sum, total_score, _, max_verifier, _) = super::score_single_embedding(
-            emb,
-            &mut ctx.embedding_ring,
-            Some(classifier),
-            Some(verifier),
-            &mut ctx.score_window,
-            None, // static threshold — the training path has no adaptive state
-            ctx.adaptive_k,
-            None, // no candidate tracking on the training side
-        );
-        scores.push(total_score);
-        verifier_scores.push(max_verifier);
-        max_rs = max_rs.max(rolling_sum);
-    }
-    (scores, verifier_scores, max_rs)
-}
-
-/// AGC a PCM clip through a fresh AudioPreprocessor (the training path's
-/// preprocessing — same CONFIG-driven config as streaming, fresh state;
-/// shared helper mahbot-1045 A2).
-fn agc_pcm(pcm: &[f32]) -> Vec<f32> {
-    crate::audio::audio_preprocessor::agc_feed_fresh(
-        pcm,
-        super::FRAME_LENGTH,
-        enrollment_preprocessor_config(),
-    )
 }
 
 // ── Noise-overlapped detection test (mahbot-845) ─────────────────────────
@@ -3236,7 +3113,13 @@ fn run_noise_overlap_test(
     let mut results = Vec::new();
 
     for (snr_label, snr_db) in NOISE_OVERLAP_SNRS {
-        for (noise_label, noise_gen) in NOISE_OVERLAP_TYPES {
+        for (i, (noise_label, noise_gen)) in NOISE_OVERLAP_TYPES.iter().enumerate() {
+            // Infinite-SNR mixing returns the speech unchanged (mix_at_snr),
+            // so the three clean cells are byte-identical — keep only the
+            // first noise type as the single representative clean cell.
+            if !snr_db.is_finite() && i > 0 {
+                continue;
+            }
             let noise = noise_gen();
             let mut metrics = DetectionMetrics::default();
 
@@ -3279,9 +3162,6 @@ fn run_noise_overlap_test(
                 };
 
                 if result.detected {
-                    if let Some(lat) = result.latency_ms {
-                        metrics.latencies.push(lat);
-                    }
                     metrics.detected += 1;
                 }
                 metrics.per_variant.push(build_per_variant_result(
@@ -4103,103 +3983,6 @@ fn safety_gate(all_neg_pv: &[(&PerVariantResult, String)]) -> serde_json::Value 
                       enrolled_speaker section; the per-run weights fingerprints are in \
                       the top-level weights_fingerprints section.",
         },
-    })
-}
-
-/// mahbot-1045 B2 (report-only): train the synthetic-negatives fallback
-/// path on the bench's positive sequences (as if Phase-3 owner collection
-/// yielded nothing) with a FIXED seed, and compare recall + fingerprint vs
-/// the main verifier.
-///
-/// The fallback verifier is trained through the bench-only seeded entry
-/// point [`VoiceVerifier::train_ensemble_with_synthetic_negatives_seeded`]
-/// (the production public wrapper still draws entropy via `rand::random()`,
-/// so this probe introduces zero production behavior change).  Its weights
-/// fingerprint uses the SAME [`weights_fingerprint_verifier`] mechanism as
-/// the main verifier so the two are directly comparable, and its recall on
-/// the held-out positive test variants uses the shared training-path scoring
-/// helper [`score_embedding_sequence_with`] with the same constant 0.86
-/// acceptance floor the enrolled-speaker phase applies (mahbot-1023).
-///
-/// # Params
-///
-/// * `pos_sequences` — the bench's positive [`EmbeddingSequence`]s, used to
-///   train the fallback verifier exactly as the production fallback path
-///   would after a Phase-3 owner-collection yield of nothing.
-/// * `pos_test_variants` — held-out positive (PCM, label) test variants,
-///   scored through the fallback verifier for the recall fraction.
-/// * `main_verifier` — the Phase-5 trained verifier; only fingerprinted for
-///   comparison (never mutated).
-/// * `classifier` — the Phase-4 trained classifier, required by the shared
-///   [`score_embedding_sequence_with`] scoring helper.
-fn synthetic_fallback_probe(
-    pos_sequences: &[EmbeddingSequence],
-    pos_test_variants: &[(Vec<f32>, String)],
-    main_verifier: &VoiceVerifier,
-    classifier: &WakeWordClassifier,
-) -> serde_json::Value {
-    // mahbot-1045 — deterministic (the bench never draws entropy here).
-    const SYNTH_FALLBACK_SEED: u64 = 1045;
-
-    // Train the production synthetic-fallback path with the fixed seed.  The
-    // seeded entry point is pub(crate) bench/test-only; production keeps the
-    // entropy-drawn public wrapper.
-    let fallback_verifier = VoiceVerifier::train_ensemble_with_synthetic_negatives_seeded(
-        pos_sequences,
-        DEFAULT_VERIFIER_THRESHOLD,
-        SYNTH_FALLBACK_SEED,
-    );
-
-    // Fingerprint both verifiers with the bench's shared weights-sha256
-    // mechanism (primary + ensemble members + calibrated threshold), so the
-    // fallback-vs-main comparison is apples-to-apples.
-    let fallback_verifier_fingerprint = weights_fingerprint_verifier(&fallback_verifier);
-    let main_verifier_fingerprint = weights_fingerprint_verifier(main_verifier);
-
-    // Recall: score each positive test variant through the fallback verifier
-    // via the shared training-path scoring helper (fresh AGC +
-    // process_enrollment_sample + score_embedding_sequence_with — the same
-    // pure-embedding path the enrolled-speaker phase's training side uses).
-    // A variant counts as detected when its peak verifier score reaches the
-    // constant VERIFIER_ACCEPTANCE_FLOOR (0.86) — the enrolled-speaker
-    // acceptance criterion (mahbot-1023).  Variants that yield no embeddings
-    // are fail-closed (not detected).
-    let total = pos_test_variants.len();
-    let mut detected = 0usize;
-    for (pcm, _label) in pos_test_variants {
-        let agc_audio = agc_pcm(pcm);
-        let embs = if agc_audio.is_empty() {
-            Vec::new()
-        } else {
-            super::process_enrollment_sample(&agc_audio).unwrap_or_default()
-        };
-        if embs.is_empty() {
-            continue; // fail-closed: no embeddings -> not detected
-        }
-        let (_, verifier_scores, _) =
-            score_embedding_sequence_with(&embs, classifier, &fallback_verifier);
-        let peak = verifier_scores.iter().copied().fold(0.0_f32, f32::max);
-        if peak >= crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR {
-            detected += 1;
-        }
-    }
-
-    serde_json::json!({
-        "seed": SYNTH_FALLBACK_SEED,
-        "trained": fallback_verifier.is_trained(),
-        "fallback_verifier_fingerprint": fallback_verifier_fingerprint,
-        "main_verifier_fingerprint": main_verifier_fingerprint,
-        "recall_on_positive_test_variants": if total > 0 {
-            detected as f64 / total as f64
-        } else {
-            0.0
-        },
-        "n_test_variants": total,
-        "note": "Production synthetic-fallback path (train_ensemble_with_synthetic_negatives, \
-                 used when Phase-3 owner collection yields nothing) trained on the bench's \
-                 positive sequences with a FIXED seed (deterministic, report-only).  The \
-                 seeded entry point is bench/test-only — production still draws entropy via \
-                 rand::random(), so zero production behavior change.",
     })
 }
 
@@ -5259,11 +5042,6 @@ pub(crate) fn run_internal() {
     // Per-tier confusable fa tracking (mahbot-871). Populated after Phase 9.
     let mut conf_fa_by_tier: [Vec<String>; 3] = [Vec::new(), Vec::new(), Vec::new()];
 
-    // Latency stats — declared here (for scope) but populated inside the
-    // detection block (or remain at defaults when degenerate).
-    let (mut lat_mean, mut lat_median, mut lat_p95) = (0.0_f64, 0.0_f64, 0.0_f64);
-    let mut latency_samples = 0usize;
-
     // Cooldown-phase detection time — hoisted from the detection block so the
     // JSON report can emit it even when the classifier is degenerate
     // (mahbot-1005 §8).
@@ -5717,22 +5495,6 @@ pub(crate) fn run_internal() {
         phase_start!("Phase 14: Noise-overlapped detection");
         noise_overlap_results = run_noise_overlap_test(&pos_test_variants, &classifier, &verifier);
         phase_times[P_NOISE_OVERLAP] = phase_end_ms!();
-
-        // ── Part 2: Latency measurement ─────────────────────────────────
-        latency_samples = pos_metrics.latencies.len();
-        (lat_mean, lat_median, lat_p95) = if pos_metrics.latencies.is_empty() {
-            info!("Detection latency: no samples collected");
-            (0.0, 0.0, 0.0)
-        } else {
-            let mean = pos_metrics.mean_latency().unwrap_or(0.0);
-            let median = pos_metrics.median_latency().unwrap_or(0.0);
-            let p95 = pos_metrics.p95_latency().unwrap_or(0.0);
-            info!(
-                "Detection latency: mean={mean:.1}ms median={median:.1}ms p95={p95:.1}ms (n={})",
-                pos_metrics.latencies.len(),
-            );
-            (mean, median, p95)
-        };
     } else {
         // Degenerate classifier — skip all detection phases
         phase_times[P_POSITIVE_VARIANTS] = 0;
@@ -5813,9 +5575,10 @@ pub(crate) fn run_internal() {
                 .unwrap_or(false)
         })
         .count();
-    // The acceptance protocol's 0/300 target is 15 cells × ~20 variants —
-    // derive the denominator from the actual measured cell×variant matrix so
-    // every report string below stays in lockstep with the real FA count.
+    // The acceptance protocol's 0/260 target is 13 cells × ~20 variants (1
+    // representative clean cell + 4 SNR levels × 3 noise types) — derive the
+    // denominator from the actual measured cell×variant matrix so every report
+    // string below stays in lockstep with the real FA count.
     let noise_overlap_total_variants: usize = noise_overlap_results
         .iter()
         .map(|(_, _, detail)| detail.len())
@@ -6529,57 +6292,6 @@ pub(crate) fn run_internal() {
             .collect(),
     );
 
-    // ── Train/test alignment (§6) ──
-    // Embedding cosine similarity between held-out test variants and the
-    // training centroid.  The centroid is the L2-normalised mean of all
-    // training embeddings (pos_sequences); each test variant's embeddings are
-    // recomputed through the SAME processing the training path applies — a
-    // fresh CONFIG-driven AudioPreprocessor (mahbot-1006 B/L) followed by
-    // process_enrollment_sample — so the comparison is apples-to-apples.
-    // (The detection path itself applies AGC via process_frame; this check
-    // mirrors the training AGC for an embedding-space comparison.)
-    let train_centroid = embedding_centroid(&pos_sequences);
-    let mut test_centroid_sims: Vec<(String, f32)> = Vec::new();
-    if !degenerate && let Some(centroid) = &train_centroid {
-        let chunk_size = super::FRAME_LENGTH;
-        for (pcm, label) in &pos_test_variants {
-            let agc_audio = crate::audio::audio_preprocessor::agc_feed_fresh(
-                pcm,
-                chunk_size,
-                enrollment_preprocessor_config(),
-            );
-            if let Ok(embs) = super::process_enrollment_sample(&agc_audio)
-                && !embs.is_empty()
-            {
-                let mut mean = vec![0.0_f32; embs[0].len()];
-                for e in &embs {
-                    debug_assert_eq!(mean.len(), e.len());
-                    for (a, b) in mean.iter_mut().zip(e) {
-                        *a += b;
-                    }
-                }
-                for v in &mut mean {
-                    *v /= embs.len() as f32;
-                }
-                test_centroid_sims.push((label.clone(), cosine_similarity(&mean, centroid)));
-            }
-        }
-    }
-    let test_centroid_sim_stats = {
-        let sims: Vec<f32> = test_centroid_sims.iter().map(|(_, s)| *s).collect();
-        serde_json::json!({
-            "n": sims.len(),
-            "min": deciles(&sims).map(|d| d[0]),
-            "mean": if sims.is_empty() { None } else {
-                Some(sims.iter().copied().sum::<f32>() / sims.len() as f32)
-            },
-            "max": deciles(&sims).map(|d| d[9]),
-            "per_variant": test_centroid_sims.iter().map(|(l, s)| {
-                serde_json::json!({ "variant": l, "cosine_similarity": s })
-            }).collect::<Vec<_>>(),
-        })
-    };
-
     // ── Reproducibility metadata (§10) ──
     let warmup_source = if WARMUP_TTS_CACHE.get().is_some() {
         "tts"
@@ -6697,15 +6409,6 @@ pub(crate) fn run_internal() {
         }
     };
 
-    // B2: synthetic-fallback verifier path (mahbot-1045, report-only).
-    // Trains the production fallback (used when Phase-3 owner collection
-    // yields nothing) on the bench's positives with a FIXED seed and compares
-    // recall + fingerprint vs the main verifier.  Runs AFTER all phases, so
-    // its internal entropy draw (train_ensemble_with_metrics member seeds)
-    // cannot shift any byte-stable surface.
-    let synthetic_fallback_probe_value =
-        synthetic_fallback_probe(&pos_sequences, &pos_test_variants, &verifier, &classifier);
-
     // B3: enrollment-quality scoring (mahbot-1045, report-only).  The bench's
     // clips have no pre-AGC ring → heuristic SNR (estimate_snr_energy).
     let enrollment_quality_probe_value = enrollment_quality_probe(&train_clips);
@@ -6752,7 +6455,6 @@ pub(crate) fn run_internal() {
         "tts_echo_gate": tts_echo_gate_probe,
         "production_metrics": production_metrics_probe,
         "embedding_cache": embedding_cache_probe,
-        "synthetic_fallback": synthetic_fallback_probe_value,
         "enrollment_quality": enrollment_quality_probe_value,
         "vad_feed_cross_check": vad_feed_cross_check_probe_value,
         "train_test_split": {
@@ -6954,8 +6656,13 @@ pub(crate) fn run_internal() {
         .unwrap_or_default();
     let safety_gate_json = safety_gate(&all_neg_pv);
 
+    // Total wall time — the whole run (start → report emission), report-
+    // assembly window included, so run-time claims are auditable from the JSON.
+    let total_wall_time_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
+
     let json = serde_json::json!({
         "benchmark": "voice_pipeline_e2e",
+        "total_wall_time_ms": total_wall_time_ms,
         "_note": format!(
             "Report-only benchmark — no pass/fail gating (mahbot-953).  \
              'passed' was removed in mahbot-1005: it was hardcoded true and \
@@ -6975,7 +6682,15 @@ pub(crate) fn run_internal() {
              phase (8d) remains the only pre-canary mutator of the shared \
              VAD detector, so Phase 9-12 FA-canary numbers are NOT strictly \
              comparable to pre-change baselines (the prior drift disclosure \
-             covered the cumulative 8b+8c+8d state).",
+             covered the cumulative 8b+8c+8d state).  A later leanness pass \
+             removed the B2 synthetic-fallback probe, the train/test-alignment \
+             cosine diagnostics, and the dead top-level latency section \
+             (report-only; total_wall_time_ms is the auditable run-time \
+             surface), and trimmed 2 of 3 byte-identical infinite-SNR clean \
+             cells from noise_overlap — the remaining cells share the same \
+             in-phase adaptive trajectory as before, but cross-run FA-canary \
+             comparability is slightly shifted (all detections are 0/20, so \
+             the impact is cosmetic).",
             crate::audio::voice_verifier::VERIFIER_ENSEMBLE_SEEDS,
         ),
         "total_false_accepts": total_false_accepts,
@@ -7041,24 +6756,6 @@ pub(crate) fn run_internal() {
         ),
         "per_variant_negatives": serde_json::Value::Array(negative_pv),
         "noise_overlap": noise_overlap_json,
-        "latency": {
-            "mean_ms": if latency_samples > 0 {
-                serde_json::Value::from(lat_mean)
-            } else {
-                serde_json::Value::Null
-            },
-            "median_ms": if latency_samples > 0 {
-                serde_json::Value::from(lat_median)
-            } else {
-                serde_json::Value::Null
-            },
-            "p95_ms": if latency_samples > 0 {
-                serde_json::Value::from(lat_p95)
-            } else {
-                serde_json::Value::Null
-            },
-            "samples": latency_samples,
-        },
         "classifier_diagnostics": classifier_diagnostics_json,
         "verifier_diagnostics": {
             "trained": verifier.is_trained(),
@@ -7145,12 +6842,6 @@ pub(crate) fn run_internal() {
             "benchmark_detection_rate": benchmark_detection_rate,
         },
         "per_augmentation_detection": per_augmentation,
-        "train_test_alignment": {
-            "test_vs_train_centroid_cosine": test_centroid_sim_stats,
-            "note": "2/3-1/3 split is by enrollment-list order; per-augmentation \
-                     rates and cosine similarities are disclosed to surface any \
-                     structural distribution shift between train and test.",
-        },
         "cooldown": {
             "detection_time_ms": cooldown_detection_time_ms,
             "first_detection_fired": cooldown_first_detected,
