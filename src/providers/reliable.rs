@@ -284,6 +284,20 @@ impl Provider for ReliableProvider {
 
         anyhow::bail!("All attempts failed.\n{}", failures.join("\n"))
     }
+
+    /// Scoped single-attempt chat (mahbot-1066): delegates to the inner
+    /// provider, bypassing this wrapper's retry loop — the outer retry loops
+    /// in [`crate::retry`] are the single retry authority for scoped calls.
+    async fn chat_scoped(
+        &self,
+        request: ChatRequest,
+        idle_timeout: std::time::Duration,
+        deadline: std::time::Instant,
+    ) -> Result<ChatResponse, super::ScopedCallError> {
+        self.provider
+            .chat_scoped(request, idle_timeout, deadline)
+            .await
+    }
 }
 
 #[cfg(test)]

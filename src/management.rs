@@ -1445,8 +1445,23 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
 
 /// Record a sanitation failure: add a [`SANITATION_ROLE`] comment for the circuit breaker
 /// and clear assigned_to so the ticket can be re-dispatched.
-async fn record_sanitation_failure(ticket_id: &str, reason: impl std::fmt::Display) {
-    let reason_str = format!("{} — {reason}", load_prompt("sanitation_failed.md"));
+///
+/// `raw_dump` (mahbot-1066 Amendment B): when the failure is a verdict
+/// extraction failure, the last-attempt raw response is dumped into the
+/// comment the same way the parallel verdict path does.
+async fn record_sanitation_failure(
+    ticket_id: &str,
+    reason: impl std::fmt::Display,
+    raw_dump: Option<&crate::retry::RetryExhausted>,
+) {
+    let reason_str = match raw_dump {
+        Some(failure) => format!(
+            "{} — {reason}\n\n{}",
+            load_prompt("sanitation_failed.md"),
+            raw_response_dump_section(failure)
+        ),
+        None => format!("{} — {reason}", load_prompt("sanitation_failed.md")),
+    };
     if let Err(e) = crate::turso::with_tx(
         &board().conn,
         ticket_id,
@@ -1615,26 +1630,32 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
             ticket = %ticket.id,
             "Sanitation agent returned no output — clearing assigned_to for retry"
         );
-        record_sanitation_failure(&ticket.id, "agent returned no output").await;
+        record_sanitation_failure(&ticket.id, "agent returned no output", None).await;
         return;
     }
 
     let extraction_prompt = crate::prompt::load_prompt("extraction/sanitation.md");
 
-    let verdict: crate::SanitationVerdict =
-        match agent.extract_structured(&extraction_prompt, 5).await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(
-                    ticket = %ticket.id,
-                    error = %e,
-                    "Failed to extract sanitation verdict — clearing assigned_to for retry"
-                );
-                record_sanitation_failure(&ticket.id, format!("verdict extraction error: {e}"))
-                    .await;
-                return;
-            }
-        };
+    let verdict: crate::SanitationVerdict = match agent
+        .extract_verdict(&extraction_prompt, Some(&validate_sanitation_verdict))
+        .await
+    {
+        Ok(v) => v,
+        Err(failure) => {
+            warn!(
+                ticket = %ticket.id,
+                error = %failure,
+                "Failed to extract sanitation verdict — clearing assigned_to for retry"
+            );
+            record_sanitation_failure(
+                &ticket.id,
+                format!("verdict extraction error: {failure}"),
+                Some(&failure),
+            )
+            .await;
+            return;
+        }
+    };
 
     process_sanitation_verdict(&ticket, verdict).await;
 }
@@ -1979,10 +2000,31 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 enum ParallelVerdict {
     /// Agent failed to produce any response (crashed, timed out, empty output).
     NoResponse,
-    /// Agent produced a response but structured verdict extraction failed.
-    ParseFailed,
+    /// Agent produced a response but structured verdict extraction failed
+    /// after exhausting the hardened retry loop. Carries the
+    /// [`crate::retry::RetryExhausted`] so the raw last-attempt response can be
+    /// dumped into the ticket comment (mahbot-1066 Amendment B).
+    ParseFailed(crate::retry::RetryExhausted),
     /// Agent produced a successfully-parsed verdict.
     Verdict(crate::Verdict),
+}
+
+/// Reject verdict scores outside [0,10] — a garbage score must never pass any
+/// gate (mahbot-1066 item 5). Runs fail-closed inside the extraction retry
+/// loop: rejection is a parse failure and triggers the re-prompt.
+fn validate_verdict_score(v: &crate::Verdict) -> Result<(), String> {
+    if v.score <= 10 {
+        Ok(())
+    } else {
+        Err(format!("verdict score {} out of range [0,10]", v.score))
+    }
+}
+
+/// Sanitation verdicts carry a `bool` pass flag — nothing to range-check.
+/// The `Result` signature is required by [`crate::ExtractionValidator`].
+#[allow(clippy::unnecessary_wraps)]
+fn validate_sanitation_verdict(_v: &crate::SanitationVerdict) -> Result<(), String> {
+    Ok(())
 }
 
 /// Run [`PARALLEL_AGENT_COUNT`] agents of the same role in parallel, then extract structured verdicts
@@ -2062,18 +2104,26 @@ async fn run_parallel_agents(
                     if response.is_empty() {
                         return ParallelVerdict::NoResponse;
                     }
-                    // KV cache preservation: `agent.extract_structured` uses the
+                    // KV cache preservation: `agent.extract_verdict` uses the
                     // agent's own parameters (model, temperature, reasoning_effort,
                     // tools, provider routing) so the extraction call is byte-identical
                     // to the original verifier agent call — the provider can reuse the
                     // cached prefix.
+                    //
+                    // mahbot-1066: hardened outer retry loop (7 attempts, backoff,
+                    // 600s wall cap) with fail-closed score validation. On terminal
+                    // failure the RetryExhausted (carrying the last-attempt raw
+                    // text) flows into ParallelVerdict::ParseFailed for the ticket
+                    // comment (Amendment B).
                     let verdict = agent
-                        .extract_structured::<crate::Verdict>(&extraction_prompt, 5)
-                        .await
-                        .ok();
+                        .extract_verdict::<crate::Verdict>(
+                            &extraction_prompt,
+                            Some(&validate_verdict_score),
+                        )
+                        .await;
                     match verdict {
-                        Some(v) => ParallelVerdict::Verdict(v),
-                        None => ParallelVerdict::ParseFailed,
+                        Ok(v) => ParallelVerdict::Verdict(v),
+                        Err(e) => ParallelVerdict::ParseFailed(e),
                     }
                 }
             })
@@ -2125,6 +2175,41 @@ enum VerdictFilter {
     FailingOnly,
 }
 
+/// Byte cap for the raw last-attempt response dump in verdict-failure
+/// comments (mahbot-1066 Amendment B). No comment-size limit exists in the
+/// store, but every downstream agent reads all comments verbatim and the
+/// failure notification embeds the last comment — so cap the dump using the
+/// sandwich-truncation pattern (head + explicit "(N bytes omitted)" marker +
+/// tail — the tail shows where a mid-JSON cut landed).
+const VERDICT_RAW_DUMP_CAP: usize = 24_000;
+
+/// Build the raw-response dump section for a verdict-extraction failure
+/// comment.
+///
+/// - `Some(non-empty)` → sandwich-truncated raw text in a code fence.
+/// - `Some(empty)` → explicit "final attempt was a tool call" note.
+/// - `None` → transport/truncation final failure: per-attempt trail +
+///   classification (no in-loop text exists to dump).
+///
+/// No scrubbing/markdown-escaping is applied — analyst reports are already
+/// written unescaped on the comment path (pre-existing condition, out of
+/// scope for mahbot-1066).
+fn raw_response_dump_section(failure: &crate::retry::RetryExhausted) -> String {
+    match failure.last_raw.as_deref() {
+        Some(text) if !text.trim().is_empty() => format!(
+            "Raw agent response (last attempt):\n```\n{}\n```",
+            crate::util::truncate_sandwich(text, VERDICT_RAW_DUMP_CAP, "verdict response")
+        ),
+        Some(_) => "Final attempt was a tool call — no text response produced.".to_string(),
+        None => format!(
+            "Extraction failed after {} attempt(s) — final failure: {} ({})",
+            failure.failures.len(),
+            failure.final_class.label(),
+            failure.detail,
+        ),
+    }
+}
+
 /// Determine whether a parallel verifier result warrants a comment,
 /// and format the comment string if so.
 ///
@@ -2161,10 +2246,15 @@ fn format_verdict_comment(
             }
             Some(comment)
         }
-        ParallelVerdict::ParseFailed => Some(substitute(
-            &load_prompt("verdict_parse_failed.md"),
-            &[("{{comment_role}}", comment_role)],
-        )),
+        ParallelVerdict::ParseFailed(failure) => {
+            // Amendment B: the ticket comment carries the raw last-attempt
+            // response (diagnosability only — gates stay fail-closed).
+            let base = substitute(
+                &load_prompt("verdict_parse_failed.md"),
+                &[("{{comment_role}}", comment_role)],
+            );
+            Some(format!("{base}\n\n{}", raw_response_dump_section(failure)))
+        }
         ParallelVerdict::NoResponse => Some(substitute(
             &load_prompt("verdict_no_response.md"),
             &[("{{comment_role}}", comment_role)],
@@ -2267,7 +2357,7 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
             }
             ParallelVerdict::Verdict(v) if v.score >= ANALYST_PASS_THRESHOLD => minor_issues += 1,
             ParallelVerdict::Verdict(_) => potential_blockers += 1,
-            ParallelVerdict::NoResponse | ParallelVerdict::ParseFailed => missing_analysis += 1,
+            ParallelVerdict::NoResponse | ParallelVerdict::ParseFailed(_) => missing_analysis += 1,
         }
     }
 

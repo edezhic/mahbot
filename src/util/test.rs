@@ -25,7 +25,7 @@ use crate::turso;
 use crate::util::UnwrapPoison;
 use crate::workspace::test_ws_named;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// Shared test root directory, created once and intentionally leaked
 /// for the process lifetime.
@@ -39,6 +39,170 @@ static TEST_ROOT: OnceLock<PathBuf> = OnceLock::new();
 pub fn env_lock() -> &'static std::sync::Mutex<()> {
     static ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
     ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Shared lock serializing tests that install the retry-policy override and /
+/// or the fake provider (mahbot-1066 scoped-retry tests).
+///
+/// Both [`crate::retry::swap_test_retry_policy`] (via
+/// [`install_test_retry_policy`]) and
+/// [`crate::providers::swap_provider_for_test`] mutate process-global state;
+/// tests using either must hold this lock for their duration.
+///
+/// # Panic safety
+///
+/// The lock is poison-tolerant: a test that panics while holding it poisons
+/// the mutex, and the next caller recovers the guard via
+/// [`PoisonError::into_inner`] instead of panicking — a single test failure
+/// cannot cascade into every subsequent retry test.
+pub fn retry_tests_lock() -> std::sync::MutexGuard<'static, ()> {
+    static RETRY_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    RETRY_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+// ── Retry-policy guard for scoped-retry tests (mahbot-1066) ──────────────
+
+/// RAII guard restoring the previous test retry-policy override on drop.
+///
+/// Returned by [`install_test_retry_policy`] — holding it (typically
+/// `let _policy_guard`) restores the pre-test override (or unset state) when
+/// the test finishes, including on panic, so a tiny test policy never leaks
+/// into other tests. Mirrors [`FakeProviderGuard`].
+#[must_use]
+pub(crate) struct RetryPolicyGuard {
+    previous: Option<crate::retry::RetryPolicy>,
+}
+
+impl Drop for RetryPolicyGuard {
+    fn drop(&mut self) {
+        crate::retry::restore_test_retry_policy(self.previous.take());
+    }
+}
+
+/// Install a test retry-policy override for the duration of the returned
+/// guard.
+///
+/// Callers must hold [`retry_tests_lock()`] for the duration and keep the
+/// returned guard alive — dropping it restores the previous override.
+pub(crate) fn install_test_retry_policy(policy: crate::retry::RetryPolicy) -> RetryPolicyGuard {
+    let previous = crate::retry::swap_test_retry_policy(policy);
+    RetryPolicyGuard { previous }
+}
+
+// ── Fake provider for scoped-retry tests (mahbot-1066) ──────────────────
+
+/// Scripted [`crate::Provider`] test double for the scoped retry loops.
+///
+/// Each [`chat_scoped`](crate::Provider::chat_scoped) call pops the next
+/// scripted outcome: either `Ok(ChatResponse)` or an error carrying an
+/// explicit [`FailureClass`] (so classification is exercised without HTTP).
+/// Every request's `Debug` fingerprint is recorded so tests can assert
+/// byte-identical retries vs. parse-failure re-prompts.
+pub(crate) struct FakeProvider {
+    script: std::sync::Mutex<
+        std::collections::VecDeque<Result<crate::ChatResponse, crate::providers::ScopedCallError>>,
+    >,
+    /// `Debug` fingerprint of every request received (byte-identity checks).
+    pub request_fingerprints: std::sync::Mutex<Vec<String>>,
+}
+
+impl FakeProvider {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            script: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            request_fingerprints: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Push a scripted successful response with the given text.
+    #[must_use]
+    pub(crate) fn ok(self, text: &str) -> Self {
+        self.script
+            .lock()
+            .unwrap()
+            .push_back(Ok(crate::ChatResponse {
+                text: Some(text.to_string()),
+                ..crate::ChatResponse::default()
+            }));
+        self
+    }
+
+    /// Push a scripted failure with the given granular class.
+    #[must_use]
+    pub(crate) fn err(self, class: crate::retry::FailureClass, msg: &str) -> Self {
+        let inner = anyhow::anyhow!("{msg}");
+        let record = crate::retry::RetryFailureRecord::new_simple(0, class, &inner, 1, None);
+        self.script
+            .lock()
+            .unwrap()
+            .push_back(Err(crate::providers::ScopedCallError::new(
+                inner, record, class,
+            )));
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::Provider for FakeProvider {
+    async fn chat(&self, _request: crate::ChatRequest) -> anyhow::Result<crate::ChatResponse> {
+        // The scoped tests always go through `chat_scoped`; this is a
+        // safety-net implementation for the trait's default path.
+        Ok(crate::ChatResponse::default())
+    }
+
+    // `ScopedCallError` is deliberately large (full diagnostics payload); the
+    // scripted-Result shape is the point of this test double.
+    #[allow(clippy::result_large_err)]
+    async fn chat_scoped(
+        &self,
+        request: crate::ChatRequest,
+        _idle_timeout: std::time::Duration,
+        _deadline: std::time::Instant,
+    ) -> Result<crate::ChatResponse, crate::providers::ScopedCallError> {
+        self.request_fingerprints
+            .lock()
+            .unwrap()
+            .push(format!("{request:?}"));
+        self.script.lock().unwrap().pop_front().unwrap_or_else(|| {
+            Ok(crate::ChatResponse {
+                text: Some("unscripted default".to_string()),
+                ..crate::ChatResponse::default()
+            })
+        })
+    }
+
+    async fn warmup(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// RAII guard restoring the previous global provider on drop.
+///
+/// Returned by [`install_fake_provider`] — holding it (typically `let _guard`)
+/// restores the pre-test provider (or unset state) when the test finishes,
+/// including on panic, so the fake never leaks into other tests.
+#[must_use]
+pub(crate) struct FakeProviderGuard {
+    previous: Option<Arc<dyn crate::Provider>>,
+}
+
+impl Drop for FakeProviderGuard {
+    fn drop(&mut self) {
+        crate::providers::restore_provider_for_test(self.previous.take());
+    }
+}
+
+/// Install a [`FakeProvider`] as the global provider for tests.
+///
+/// Callers must hold [`retry_tests_lock()`] for the duration and keep the
+/// returned guard alive — dropping it restores the previous provider.
+pub(crate) fn install_fake_provider(provider: Arc<dyn crate::Provider>) -> FakeProviderGuard {
+    let previous = crate::providers::swap_provider_for_test(provider);
+    FakeProviderGuard { previous }
 }
 
 /// RAII guard that restores an environment variable to its original value
@@ -644,5 +808,66 @@ mod env_var_guard_tests {
         unsafe {
             std::env::remove_var("MAHBOT_TEST_PANIC_ORIGINAL");
         }
+    }
+}
+
+#[cfg(test)]
+mod retry_policy_guard_tests {
+    use super::*;
+
+    /// The tiny test policy's `max_attempts` (3) — distinguishes it from the
+    /// production default (7) when asserting restore semantics.
+    const TINY_MAX_ATTEMPTS: u32 = 3;
+
+    #[test]
+    fn installs_and_restores_on_drop() {
+        let _lock = retry_tests_lock();
+        assert_eq!(
+            crate::retry::RetryPolicy::current().max_attempts,
+            crate::retry::DEFAULT_RETRY_MAX_ATTEMPTS
+        );
+        let guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+        assert_eq!(
+            crate::retry::RetryPolicy::current().max_attempts,
+            TINY_MAX_ATTEMPTS
+        );
+        drop(guard);
+        assert_eq!(
+            crate::retry::RetryPolicy::current().max_attempts,
+            crate::retry::DEFAULT_RETRY_MAX_ATTEMPTS,
+            "guard must restore the pre-test override on drop"
+        );
+    }
+
+    #[test]
+    fn restores_on_panic() {
+        let _lock = retry_tests_lock();
+        let result = std::panic::catch_unwind(|| {
+            let _guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+            assert_eq!(
+                crate::retry::RetryPolicy::current().max_attempts,
+                TINY_MAX_ATTEMPTS
+            );
+            panic!("intentional panic while holding the policy guard");
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            crate::retry::RetryPolicy::current().max_attempts,
+            crate::retry::DEFAULT_RETRY_MAX_ATTEMPTS,
+            "a panicking test must not leak the tiny policy into later tests"
+        );
+    }
+
+    #[test]
+    fn lock_recovers_after_poison() {
+        // A test that panics while holding retry_tests_lock poisons the std
+        // Mutex; the next acquire must recover the guard (PoisonError
+        // into_inner) instead of panicking — one failure cannot cascade.
+        let result = std::panic::catch_unwind(|| {
+            let _lock = retry_tests_lock();
+            panic!("intentional panic while holding the retry lock");
+        });
+        assert!(result.is_err());
+        let _lock = retry_tests_lock(); // must not panic despite poisoning
     }
 }

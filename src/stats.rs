@@ -35,7 +35,27 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_role ON tool_calls(role);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_name ON tool_calls(tool_name);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_recorded_at ON tool_calls(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_workspace ON tool_calls(workspace);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_error_message ON tool_calls(error_message);";
+CREATE INDEX IF NOT EXISTS idx_tool_calls_error_message ON tool_calls(error_message);
+CREATE TABLE IF NOT EXISTS retry_failures (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    attempt           INTEGER NOT NULL,
+    failure_class     TEXT NOT NULL,
+    error_chain       TEXT NOT NULL,
+    http_version      TEXT,
+    content_length    INTEGER,
+    actual_body_len   INTEGER,
+    content_encoding  TEXT,
+    transfer_encoding TEXT,
+    elapsed_ms        INTEGER NOT NULL,
+    body_head         TEXT NOT NULL DEFAULT '',
+    body_tail         TEXT NOT NULL DEFAULT '',
+    finish_reason     TEXT,
+    completion_tokens INTEGER,
+    retry_after_ms    INTEGER,
+    recorded_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_retry_failures_recorded_at ON retry_failures(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_retry_failures_class ON retry_failures(failure_class);";
 
 // Column definitions for tool_error SELECT queries.
 crate::columns! {
@@ -227,6 +247,40 @@ impl StatsStore {
             .await?;
         }
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Persist a per-attempt retry failure diagnostic (mahbot-1066) to the
+    /// dedicated `retry_failures` table. Called from [`crate::retry`]'s outer
+    /// loops — never fails the calling operation (callers treat errors as
+    /// best-effort).
+    pub async fn record_retry_failure(&self, rec: &crate::retry::RetryFailureRecord) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO retry_failures \
+                 (attempt, failure_class, error_chain, http_version, content_length, \
+                  actual_body_len, content_encoding, transfer_encoding, elapsed_ms, \
+                  body_head, body_tail, finish_reason, completion_tokens, retry_after_ms, recorded_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                turso::params![
+                    i64::from(rec.attempt),
+                    rec.class.label(),
+                    rec.error_chain.clone(),
+                    rec.http_version.clone(),
+                    rec.content_length.map(i64::try_from).transpose()?,
+                    rec.actual_body_len.map(i64::try_from).transpose()?,
+                    rec.content_encoding.clone(),
+                    rec.transfer_encoding.clone(),
+                    i64::try_from(rec.elapsed_ms)?,
+                    rec.body_head.clone(),
+                    rec.body_tail.clone(),
+                    rec.finish_reason.clone(),
+                    rec.completion_tokens.map(i64::try_from).transpose()?,
+                    rec.retry_after_ms.map(i64::try_from).transpose()?,
+                    rec.recorded_at.clone(),
+                ],
+            )
+            .await?;
         Ok(())
     }
 }
@@ -489,5 +543,87 @@ mod tests {
             .await
             .expect("query_tool_errors with workspace filter");
         assert_eq!(total, 0, "other-ws should have 0 errors");
+    }
+
+    /// `retry_failures` insert round-trip (mahbot-1066) — verifies the schema
+    /// and the parameterized insert are valid against a real store.
+    #[tokio::test]
+    async fn record_retry_failure_round_trip() {
+        let (store, _tmp) = crate::open_test_store!(StatsStore, "stats");
+        let rec = crate::retry::RetryFailureRecord::with_metadata(
+            3,
+            crate::retry::FailureClass::TruncatedEnvelope,
+            &anyhow::anyhow!("OpenRouter error reading response body: eof"),
+            1_234,
+            Some("HTTP/2".to_string()),
+            Some(10_000),
+            Some(5_000),
+            Some("identity".to_string()),
+            Some("chunked".to_string()),
+            r#"{"choices":[{"message":{"content":"{"#,
+            Some("length".to_string()),
+            Some(4_000),
+            Some(7_500),
+        );
+
+        store
+            .record_retry_failure(&rec)
+            .await
+            .expect("insert retry failure");
+
+        // Round-trip: read the row back and verify the fields survived.
+        let rows = store
+            .conn
+            .query(
+                "SELECT attempt, failure_class, error_chain, http_version, \
+                        content_length, actual_body_len, content_encoding, \
+                        transfer_encoding, elapsed_ms, body_head, body_tail, \
+                        finish_reason, completion_tokens, retry_after_ms \
+                 FROM retry_failures WHERE attempt = 3",
+                crate::turso::params![],
+            )
+            .await
+            .expect("query retry failure");
+        let mut rows = rows.into_iter();
+        let row = rows.next().expect("row must exist");
+        assert_eq!(row.get::<i64>(0).expect("attempt"), 3);
+        assert_eq!(row.get::<String>(1).expect("class"), "truncated_envelope");
+        assert!(
+            row.get::<String>(2)
+                .expect("error_chain")
+                .contains("error reading response body")
+        );
+        assert_eq!(
+            row.get::<Option<String>>(3).expect("http"),
+            Some("HTTP/2".to_string())
+        );
+        assert_eq!(
+            row.get::<Option<i64>>(4).expect("content_length"),
+            Some(10_000)
+        );
+        assert_eq!(
+            row.get::<Option<i64>>(5).expect("actual_body_len"),
+            Some(5_000)
+        );
+        assert_eq!(
+            row.get::<Option<String>>(6).expect("ce"),
+            Some("identity".to_string())
+        );
+        assert_eq!(
+            row.get::<Option<String>>(7).expect("te"),
+            Some("chunked".to_string())
+        );
+        assert_eq!(row.get::<i64>(8).expect("elapsed"), 1_234);
+        assert!(row.get::<String>(9).expect("body_head").starts_with('{'));
+        assert_eq!(
+            row.get::<Option<String>>(11).expect("finish"),
+            Some("length".to_string())
+        );
+        assert_eq!(row.get::<Option<i64>>(12).expect("tokens"), Some(4_000));
+        assert_eq!(
+            row.get::<Option<i64>>(13).expect("retry_after"),
+            Some(7_500)
+        );
+        assert!(rows.next().is_none(), "only one row expected");
     }
 }

@@ -322,6 +322,21 @@ pub struct ConfigData {
     /// Maximum age of voice PCM cache entries in days (default: `"30"`).
     /// Entries older than this are evicted. `0` means unlimited (no age-based eviction).
     pub voice_cache_max_age_days: Option<String>,
+    /// Retry loop max attempts for scoped LLM operations — verdict extraction
+    /// (Analyst/Reviewer/QA/Sanitation) and analyst consolidation (mahbot-1066).
+    /// Default: `"7"`. Invalid values fall back to the default.
+    pub retry_max_attempts: Option<String>,
+    /// Retry loop base backoff in milliseconds for scoped operations.
+    /// Default: `"5000"` (canonical schedule 5/10/20/40/60/90 s). Invalid
+    /// values fall back to the default.
+    pub retry_base_backoff_ms: Option<String>,
+    /// Retry loop backoff cap in milliseconds for scoped operations.
+    /// Default: `"90000"`. Invalid values fall back to the default.
+    pub retry_max_backoff_ms: Option<String>,
+    /// Whole-operation wall-clock cap in seconds for scoped operations,
+    /// authoritative over attempt count. Default: `"600"`. Invalid values
+    /// fall back to the default.
+    pub operation_timeout_secs: Option<String>,
     /// Per-role model overrides.
     pub per_role_configs: Vec<RoleConfig>,
     /// Per-model provider routing.
@@ -550,6 +565,10 @@ string_config_fields! {
     adaptive_k [or(DEFAULT_ADAPTIVE_K)],
     voice_cache_max_size_mb [or(DEFAULT_VOICE_CACHE_MAX_SIZE_MB)],
     voice_cache_max_age_days [or(DEFAULT_VOICE_CACHE_MAX_AGE_DAYS)],
+    retry_max_attempts [or(crate::retry::DEFAULT_RETRY_MAX_ATTEMPTS_STR)],
+    retry_base_backoff_ms [or(crate::retry::DEFAULT_RETRY_BASE_BACKOFF_MS_STR)],
+    retry_max_backoff_ms [or(crate::retry::DEFAULT_RETRY_MAX_BACKOFF_MS_STR)],
+    operation_timeout_secs [or(crate::retry::DEFAULT_OPERATION_TIMEOUT_SECS_STR)],
 }
 
 impl ConfigData {

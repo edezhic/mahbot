@@ -761,6 +761,30 @@ impl Agent {
         .await
     }
 
+    /// Extract a structured verdict with the hardened scoped retry loop
+    /// (mahbot-1066).
+    ///
+    /// KV-cache requirements: identical to [`Self::extract_structured`] — the
+    /// params come from [`Self::build_chat_request`] so all attempts are
+    /// byte-identical except the parse-failure re-prompt.
+    ///
+    /// `validate` runs fail-closed on the parsed value (e.g. score ∈ [0,10]):
+    /// a rejected value is treated as a parse failure and re-prompted.
+    pub(crate) async fn extract_verdict<T: serde::de::DeserializeOwned>(
+        &self,
+        extraction_prompt: &str,
+        validate: Option<&crate::ExtractionValidator<T>>,
+    ) -> Result<T, crate::retry::RetryExhausted> {
+        let params = self.build_chat_request(vec![], false);
+        crate::extraction::retry_extract_structured_scoped(
+            self.session.history(),
+            extraction_prompt,
+            &params,
+            validate,
+        )
+        .await
+    }
+
     /// Summarise the agent's session history.
     ///
     /// KV-cache requirements: see [`Self::build_chat_request`].

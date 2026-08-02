@@ -3,7 +3,8 @@
 //! This module provides a single implementation that works for all of them.
 
 use crate::providers::reasoning_roundtrip;
-use crate::providers::{ensure_chat_completions_url, provider_routing_json};
+use crate::providers::{ScopedCallError, ensure_chat_completions_url, provider_routing_json};
+use crate::retry::{FailureClass, RetryFailureRecord};
 use crate::util::error::HttpError;
 use crate::util::json::try_repair_json;
 use crate::{
@@ -11,12 +12,14 @@ use crate::{
     ChatRole, Provider, ProviderUsage, Reasoning, ToolCall as ProviderToolCall, ToolSpec,
 };
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::{
     Client, RequestBuilder,
     header::{HeaderMap, HeaderValue},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// A provider that speaks the OpenAI-compatible chat completions API.
 pub(crate) struct OpenAiCompatibleProvider {
@@ -31,6 +34,11 @@ pub(crate) struct OpenAiCompatibleProvider {
     /// Cached HTTP client with connection reuse across all API calls.
     /// Initialized lazily on first `http_client()` call.
     http_client: OnceLock<Client>,
+    /// Cached HTTP client for scoped calls (mahbot-1066): NO total request
+    /// timeout — per-attempt total is enforced by the scoped caller against
+    /// the remaining operation budget, and idle timeouts reset while data
+    /// flows. Initialized lazily on first `http_client_scoped()` call.
+    http_client_scoped: OnceLock<Client>,
 }
 
 impl OpenAiCompatibleProvider {
@@ -43,6 +51,7 @@ impl OpenAiCompatibleProvider {
             timeout_secs: 120,
             extra_headers: std::collections::HashMap::new(),
             http_client: OnceLock::new(),
+            http_client_scoped: OnceLock::new(),
         }
     }
 
@@ -56,37 +65,53 @@ impl OpenAiCompatibleProvider {
         self
     }
 
-    pub(crate) fn http_client(&self) -> &Client {
-        self.http_client.get_or_init(|| {
-            let mut builder = Client::builder()
-                .timeout(std::time::Duration::from_secs(self.timeout_secs))
-                .connect_timeout(std::time::Duration::from_secs(10));
+    /// Build the shared HTTP client with the given total request timeout.
+    ///
+    /// `Some(timeout)` yields the default client (120 s total request
+    /// timeout); `None` yields the scoped client (no total timeout — the
+    /// scoped call paths enforce their own per-attempt deadline and idle
+    /// timeout). Connection pool, connect timeout, and extra headers are
+    /// identical in both.
+    fn build_client(&self, timeout: Option<Duration>) -> Client {
+        let mut builder = Client::builder().connect_timeout(Duration::from_secs(10));
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
 
-            if !self.extra_headers.is_empty() {
-                let mut headers = HeaderMap::new();
-                for (key, value) in &self.extra_headers {
-                    match (
-                        reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                        HeaderValue::from_str(value),
-                    ) {
-                        (Ok(name), Ok(val)) => {
-                            headers.insert(name, val);
-                        }
-                        _ => {
-                            tracing::warn!(
-                                header = key,
-                                "Skipping invalid extra header name or value"
-                            );
-                        }
+        if !self.extra_headers.is_empty() {
+            let mut headers = HeaderMap::new();
+            for (key, value) in &self.extra_headers {
+                match (
+                    reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                    HeaderValue::from_str(value),
+                ) {
+                    (Ok(name), Ok(val)) => {
+                        headers.insert(name, val);
+                    }
+                    _ => {
+                        tracing::warn!(header = key, "Skipping invalid extra header name or value");
                     }
                 }
-                builder = builder.default_headers(headers);
             }
+            builder = builder.default_headers(headers);
+        }
 
-            builder
-                .build()
-                .expect("Failed to build HTTP client — check TLS/network configuration")
-        })
+        builder
+            .build()
+            .expect("Failed to build HTTP client — check TLS/network configuration")
+    }
+
+    pub(crate) fn http_client(&self) -> &Client {
+        self.http_client
+            .get_or_init(|| self.build_client(Some(Duration::from_secs(self.timeout_secs))))
+    }
+
+    /// Scoped HTTP client: same connection pool and headers as
+    /// [`Self::http_client`] but WITHOUT the total request timeout. The scoped
+    /// call paths enforce their own per-attempt deadline and idle timeout.
+    pub(crate) fn http_client_scoped(&self) -> &Client {
+        self.http_client_scoped
+            .get_or_init(|| self.build_client(None))
     }
 }
 
@@ -123,6 +148,8 @@ struct UsageInfo {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 /// Remove `<think>...</think>` blocks from model output.
@@ -571,9 +598,16 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    /// Build the HTTP request for [`Provider::chat`].
-    /// This function itself is synchronous; the caller (chat) sends the request asynchronously.
-    fn build_http_request(&self, request: &ProviderChatRequest) -> RequestBuilder {
+    /// Build the HTTP request for [`Provider::chat`] / [`Provider::chat_scoped`].
+    /// This function itself is synchronous; the caller sends the request asynchronously.
+    ///
+    /// The request BYTES are identical regardless of which client is used —
+    /// the scoped client only differs in timeout semantics, never in payload.
+    fn build_http_request_with_client(
+        &self,
+        client: &Client,
+        request: &ProviderChatRequest,
+    ) -> RequestBuilder {
         let native =
             Self::convert_messages_for_native(&request.messages, request.allow_image_parts);
         let tool_specs = Self::convert_tool_specs(request.tools.as_deref());
@@ -609,8 +643,13 @@ impl OpenAiCompatibleProvider {
         };
 
         let url = ensure_chat_completions_url(&self.base_url);
-        let builder = self.http_client().post(url).json(&payload);
+        let builder = client.post(url).json(&payload);
         self.attach_auth_header(builder)
+    }
+
+    /// Build the HTTP request for the default (non-scoped) client.
+    fn build_http_request(&self, request: &ProviderChatRequest) -> RequestBuilder {
+        self.build_http_request_with_client(self.http_client(), request)
     }
 
     /// Attach the `Authorization: Bearer` header if a credential is configured.
@@ -621,6 +660,122 @@ impl OpenAiCompatibleProvider {
         }
         builder
     }
+}
+
+/// Outcome of an idle-timeout body read.
+enum BodyReadOutcome {
+    /// Body fully read.
+    Complete(Vec<u8>),
+    /// Read failed partway (transport / idle timeout / shutdown).
+    /// Carries the partial bytes plus a message for the error trail.
+    Failed {
+        partial: Vec<u8>,
+        message: String,
+        class: FailureClass,
+    },
+}
+
+/// Read a response body chunk-by-chunk with an idle timeout that resets while
+/// data flows, also bounding the whole read by `deadline`.
+///
+/// `idle_timeout` guards against a stalled connection mid-body — the
+/// truncation signature this hardening targets. The read is shutdown-abortable
+/// via [`crate::shutdown::race_shutdown`].
+///
+/// Every chunk wait is bounded by `min(idle_timeout, remaining_budget)`, so a
+/// stalled chunk can never overshoot the operation deadline by more than the
+/// scheduling latency between the timeout firing and the next check — the
+/// wall-clock cap holds precisely for the body-read phase, not just the send
+/// phase. When the tighter bound was the wall budget, the failure classifies
+/// as [`FailureClass::WallClockExceeded`] rather than a truncation idle
+/// timeout.
+async fn read_body_idle(
+    response: reqwest::Response,
+    idle_timeout: Duration,
+    deadline: Instant,
+) -> BodyReadOutcome {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return BodyReadOutcome::Failed {
+                partial: body,
+                message: "response body read exceeded remaining operation budget".to_string(),
+                class: FailureClass::WallClockExceeded,
+            };
+        }
+        let wait_bound = idle_timeout.min(remaining);
+        let next_chunk = crate::shutdown::race_shutdown(stream.next());
+        let chunk = match tokio::time::timeout(wait_bound, next_chunk).await {
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    // The tighter bound was the wall budget — classify as such,
+                    // not as an idle timeout.
+                    return BodyReadOutcome::Failed {
+                        partial: body,
+                        message: "response body read exceeded remaining operation budget"
+                            .to_string(),
+                        class: FailureClass::WallClockExceeded,
+                    };
+                }
+                return BodyReadOutcome::Failed {
+                    partial: body,
+                    message: format!(
+                        "response body read idle timeout after {idle_timeout:?} \
+                         with no data flowing"
+                    ),
+                    class: FailureClass::TruncatedEnvelope,
+                };
+            }
+            Ok(Err(_)) => {
+                return BodyReadOutcome::Failed {
+                    partial: body,
+                    message: "shutdown during response body read".to_string(),
+                    class: FailureClass::Shutdown,
+                };
+            }
+            Ok(Ok(Some(chunk))) => chunk,
+            Ok(Ok(None)) => break,
+        };
+        match chunk {
+            Ok(bytes) => body.extend_from_slice(&bytes),
+            Err(e) => {
+                return BodyReadOutcome::Failed {
+                    partial: body,
+                    message: format!("{e}"),
+                    class: FailureClass::TruncatedEnvelope,
+                };
+            }
+        }
+    }
+    BodyReadOutcome::Complete(body)
+}
+
+/// Best-effort extraction of `finish_reason` / `completion_tokens` from a
+/// possibly-truncated JSON body.
+///
+/// A full `ApiChatResponse` parse is attempted first; if the envelope is cut
+/// mid-body we fall back to lenient JSON value parsing so telemetry survives
+/// where possible.
+fn envelope_telemetry(body: &str) -> (Option<String>, Option<u64>) {
+    if let Ok(native) = serde_json::from_str::<ApiChatResponse>(body) {
+        let finish = native.choices.first().and_then(|c| c.finish_reason.clone());
+        let tokens = native.usage.as_ref().and_then(|u| u.completion_tokens);
+        return (finish, tokens);
+    }
+    // Lenient fallback for truncated envelopes.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        let finish = value
+            .pointer("/choices/0/finish_reason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let tokens = value
+            .pointer("/usage/completion_tokens")
+            .and_then(serde_json::Value::as_u64);
+        return (finish, tokens);
+    }
+    (None, None)
 }
 
 #[async_trait]
@@ -691,6 +846,294 @@ impl Provider for OpenAiCompatibleProvider {
         let _ = self.attach_auth_header(builder).send().await?;
         Ok(())
     }
+
+    /// Scoped single-attempt chat (mahbot-1066): one HTTP request, no
+    /// provider-internal retries, idle-timeout body reads, per-attempt total
+    /// bounded by the remaining operation deadline.
+    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
+    async fn chat_scoped(
+        &self,
+        request: ProviderChatRequest,
+        idle_timeout: Duration,
+        deadline: Instant,
+    ) -> Result<ProviderChatResponse, ScopedCallError> {
+        let started = Instant::now();
+        let req_builder = self.build_http_request_with_client(self.http_client_scoped(), &request);
+        let model = request.model;
+
+        // ── Send — bounded by the idle timeout (TTFB) AND the remaining budget ──
+        // A pre-header server stall must not consume the whole operation
+        // budget on attempt 1 (burst-shaped recovery needs later attempts), so
+        // the header wait is capped by `idle_timeout`; the remaining wall
+        // budget remains the outer bound.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let send_timeout = idle_timeout.min(remaining);
+        let send_fut = crate::shutdown::race_shutdown(req_builder.send());
+        let response = match tokio::time::timeout(send_timeout, send_fut).await {
+            Err(_) => {
+                let budget_expired = remaining <= idle_timeout;
+                let err = if budget_expired {
+                    anyhow::anyhow!("{} request exceeded remaining operation budget", self.name)
+                } else {
+                    anyhow::anyhow!(
+                        "{} request timed out waiting for response headers \
+                         (idle timeout {idle_timeout:?})",
+                        self.name
+                    )
+                };
+                let class = if budget_expired {
+                    FailureClass::WallClockExceeded
+                } else {
+                    FailureClass::Transport
+                };
+                let record = RetryFailureRecord::new_simple(
+                    0,
+                    class,
+                    &err,
+                    started.elapsed().as_millis() as u64,
+                    None,
+                );
+                return Err(ScopedCallError::new(err, record, class));
+            }
+            Ok(Err(_)) => {
+                let err = anyhow::anyhow!("shutdown during request");
+                let record = RetryFailureRecord::new_simple(
+                    0,
+                    FailureClass::Shutdown,
+                    &err,
+                    started.elapsed().as_millis() as u64,
+                    None,
+                );
+                return Err(ScopedCallError::new(err, record, FailureClass::Shutdown));
+            }
+            Ok(Ok(Err(e))) => {
+                let err = anyhow::Error::from(e).context(format!("{} transport error", self.name));
+                let record = RetryFailureRecord::new_simple(
+                    0,
+                    FailureClass::Transport,
+                    &err,
+                    started.elapsed().as_millis() as u64,
+                    None,
+                );
+                return Err(ScopedCallError::new(err, record, FailureClass::Transport));
+            }
+            Ok(Ok(Ok(resp))) => resp,
+        };
+
+        // ── Response metadata (telemetry) ──
+        let http_version = Some(format!("{:?}", response.version()));
+        let content_length = response.content_length();
+        let content_encoding = response
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let transfer_encoding = response
+            .headers()
+            .get(reqwest::header::TRANSFER_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
+        if !response.status().is_success() {
+            return Err(scoped_http_error(
+                self,
+                response,
+                started,
+                http_version,
+                content_length,
+                content_encoding,
+                transfer_encoding,
+                idle_timeout,
+                deadline,
+            )
+            .await);
+        }
+
+        // ── Read body with idle timeout ──
+        let (body_bytes, read_failure) =
+            match read_body_idle(response, idle_timeout, deadline).await {
+                BodyReadOutcome::Complete(bytes) => (bytes, None),
+                BodyReadOutcome::Failed {
+                    partial,
+                    message,
+                    class,
+                } => (partial, Some((message, class))),
+            };
+        let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
+        let actual_len = body_bytes.len();
+
+        if let Some((read_msg, class)) = read_failure {
+            let err = anyhow::anyhow!("{} error reading response body: {read_msg}", self.name);
+            let (finish_reason, completion_tokens) = envelope_telemetry(&body_str);
+            let record = RetryFailureRecord::with_metadata(
+                0,
+                class,
+                &err,
+                started.elapsed().as_millis() as u64,
+                http_version.clone(),
+                content_length,
+                Some(actual_len),
+                content_encoding.clone(),
+                transfer_encoding.clone(),
+                &body_str,
+                finish_reason,
+                completion_tokens,
+                None,
+            );
+            return Err(ScopedCallError::new(err, record, class));
+        }
+
+        let native_response: ApiChatResponse = match serde_json::from_str(&body_str) {
+            Ok(native) => native,
+            Err(e) => {
+                // Content-length vs actual comparison: equal ⇒ the server
+                // finalized a short body; shorter ⇒ framing anomaly (truncated
+                // envelope — the same defect class as body-read errors).
+                let truncated = content_length.is_some_and(|cl| cl != actual_len as u64);
+                let class = if truncated {
+                    FailureClass::TruncatedEnvelope
+                } else {
+                    FailureClass::Parse
+                };
+                let err = anyhow::anyhow!(
+                    "{} chat completions parse error: {e}; body ({}): {:.500}",
+                    self.name,
+                    body_str.len(),
+                    body_str
+                );
+                let (finish_reason, completion_tokens) = envelope_telemetry(&body_str);
+                let record = RetryFailureRecord::with_metadata(
+                    0,
+                    class,
+                    &err,
+                    started.elapsed().as_millis() as u64,
+                    http_version,
+                    content_length,
+                    Some(actual_len),
+                    content_encoding,
+                    transfer_encoding,
+                    &body_str,
+                    finish_reason,
+                    completion_tokens,
+                    None,
+                );
+                return Err(ScopedCallError::new(err, record, class));
+            }
+        };
+
+        let usage = native_response.usage.map(|u| ProviderUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            cached_input_tokens: None,
+        });
+        let message = native_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|choice| choice.message)
+            .ok_or_else(|| {
+                let err = anyhow::anyhow!("No response from {}", self.name);
+                let class = FailureClass::NoResponse;
+                let record = RetryFailureRecord::new_simple(
+                    0,
+                    class,
+                    &err,
+                    started.elapsed().as_millis() as u64,
+                    None,
+                );
+                ScopedCallError::new(err, record, class)
+            })?;
+
+        let result = Self::parse_native_response(message, usage);
+
+        if !result.tool_calls.is_empty() && result.reasoning.is_none() {
+            tracing::debug!(
+                provider = %self.name,
+                model,
+                "tool turn: parsed response has no reasoning fields",
+            );
+        }
+
+        Ok(result)
+    }
+}
+
+/// Build a [`ScopedCallError`] from an HTTP error response (non-2xx).
+///
+/// Reads the error body with idle-timeout semantics so a stalled error-body
+/// read cannot hang past the operation deadline, and classifies via the
+/// provider error classifier.
+#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
+async fn scoped_http_error(
+    provider: &OpenAiCompatibleProvider,
+    response: reqwest::Response,
+    started: Instant,
+    http_version: Option<String>,
+    content_length: Option<u64>,
+    content_encoding: Option<String>,
+    transfer_encoding: Option<String>,
+    idle_timeout: Duration,
+    deadline: Instant,
+) -> ScopedCallError {
+    let status = response.status().as_u16();
+    let retry_after_ms = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::util::error::parse_retry_after_value);
+    let (body_bytes, message) = match read_body_idle(response, idle_timeout, deadline).await {
+        BodyReadOutcome::Complete(bytes) => (bytes, None),
+        BodyReadOutcome::Failed {
+            partial, message, ..
+        } => (partial, Some(message)),
+    };
+    let body = String::from_utf8_lossy(&body_bytes).into_owned();
+    let actual_len = body_bytes.len();
+
+    let http_err = HttpError {
+        status,
+        body: body.clone(),
+        retry_after_ms,
+        context: provider.name.clone(),
+    };
+    let inner = anyhow::Error::from(http_err);
+    let body_read_failed = message.is_some();
+    let inner = match message {
+        None => inner,
+        Some(read_msg) => inner.context(format!(
+            "{} error reading response body: {read_msg}",
+            provider.name
+        )),
+    };
+
+    let class = match crate::providers::reliable::classify_err(&inner) {
+        crate::providers::reliable::ErrorClass::NonRetryable => FailureClass::NonRetryable,
+        // The error body itself was truncated mid-read — preserve the
+        // truncation distinction (the defect class this hardening targets)
+        // when the status classification would otherwise be retryable. A
+        // non-retryable status (auth, quota) still aborts immediately.
+        crate::providers::reliable::ErrorClass::Retryable if body_read_failed => {
+            FailureClass::TruncatedEnvelope
+        }
+        crate::providers::reliable::ErrorClass::Retryable => FailureClass::Transport,
+    };
+    let (finish_reason, completion_tokens) = envelope_telemetry(&body);
+    let record = RetryFailureRecord::with_metadata(
+        0,
+        class,
+        &inner,
+        started.elapsed().as_millis() as u64,
+        http_version,
+        content_length,
+        Some(actual_len),
+        content_encoding,
+        transfer_encoding,
+        &body,
+        finish_reason,
+        completion_tokens,
+        retry_after_ms,
+    );
+    ScopedCallError::new(inner, record, class)
 }
 
 #[cfg(test)]

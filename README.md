@@ -129,6 +129,14 @@ Rust **2024**, native **Iced** dashboard, **Tokio** async. Single-instance lock;
 
 This is beta quality software. It has already processed thousands of tickets on it's own codebase and improving every day, and I already prefer it over Cursor + GPT 5.5 xhigh despite having expiring credits left there. However, it heavily uses Turso which is in beta itself and multiple times the board DB got corrupted, fff-search seems to reindex workspaces way more than required, chrome-use is a somewhat questionable choice, and most likely there are still some bugs left. Nevertheless, it's already very much usable with the default configs.
 
+**LLM response truncation (known defect, mitigated):** the OpenRouter gateway /
+pinned DeepSeek upstream occasionally terminates non-streaming response bodies
+mid-frame (observed as "error reading response body" or an EOF-while-parsing
+error). Verdict extraction and analyst consolidation now run a hardened outer
+retry loop (7 attempts, 5/10/20/40/60/90 s backoff, 600 s wall cap, byte-identical
+request parameters) — see `docs/ops/retry-policy.md`. Operator-adjustable via
+the GUI Settings → Retry section.
+
 ## License
 
 MIT OR Apache-2.0 — see `Cargo.toml`.

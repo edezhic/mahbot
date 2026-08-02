@@ -1586,3 +1586,106 @@ async fn dispatch_verifiers_skip_review_when_no_unstaged_changes() {
         "Expected a SYSTEM_ROLE comment explaining the skip-review reason"
     );
 }
+
+// ── mahbot-1066 Amendment B: verdict raw-response comments ───────────────
+
+/// Build a [`crate::retry::RetryExhausted`] with the given last-attempt raw text.
+fn retry_exhausted_with_raw(last_raw: Option<String>) -> crate::retry::RetryExhausted {
+    let rec = crate::retry::RetryFailureRecord::new_simple(
+        1,
+        crate::retry::FailureClass::Parse,
+        &anyhow::anyhow!("parse failed"),
+        100,
+        None,
+    );
+    crate::retry::RetryExhausted::with_last_raw(
+        vec![rec],
+        crate::retry::FailureClass::Parse,
+        last_raw,
+    )
+}
+
+#[test]
+fn parse_failed_comment_carries_raw_last_attempt_response() {
+    let raw = r#"{"score": 9, "critique": "solid", "issues": []}"#;
+    let pv = ParallelVerdict::ParseFailed(retry_exhausted_with_raw(Some(raw.to_string())));
+    let comment = format_verdict_comment(&pv, "analyst_1", VerdictFilter::All)
+        .expect("parse-failed must produce a comment");
+    assert!(comment.contains("verdict extraction failed"), "{comment}");
+    assert!(comment.contains("Raw agent response"), "{comment}");
+    assert!(
+        comment.contains(raw),
+        "raw text must be in the comment: {comment}"
+    );
+    // The template's role attribution is preserved.
+    assert!(comment.contains("analyst_1"), "{comment}");
+}
+
+#[test]
+fn parse_failed_comment_sandwich_truncates_large_raw() {
+    // 30_000-byte raw dump exceeds the 24_000-byte cap → sandwich marker.
+    let big = format!("HEAD{}", "x".repeat(30_000));
+    let pv = ParallelVerdict::ParseFailed(retry_exhausted_with_raw(Some(big)));
+    let comment =
+        format_verdict_comment(&pv, "reviewer_2", VerdictFilter::FailingOnly).expect("comment");
+    assert!(
+        comment.contains("bytes omitted at verdict response truncation"),
+        "sandwich marker must appear: {}",
+        &comment[..comment.len().min(300)]
+    );
+    assert!(comment.contains("HEAD"), "head must be preserved");
+    assert!(
+        comment.contains(&"x".repeat(8_000)),
+        "tail must be preserved (shows where a mid-JSON cut landed)"
+    );
+    assert!(
+        comment.len() < 26_000,
+        "comment must be capped near the dump cap, got {}",
+        comment.len()
+    );
+}
+
+#[test]
+fn parse_failed_comment_tool_call_final_attempt_note() {
+    // Some(empty) — the final attempt was a tool call, no text.
+    let pv = ParallelVerdict::ParseFailed(retry_exhausted_with_raw(Some(String::new())));
+    let comment = format_verdict_comment(&pv, "qa_3", VerdictFilter::FailingOnly).expect("comment");
+    assert!(
+        comment
+            .to_lowercase()
+            .contains("final attempt was a tool call"),
+        "{comment}"
+    );
+}
+
+#[test]
+fn parse_failed_comment_transport_failure_carries_trail() {
+    // None — the final attempt died before producing text (transport).
+    let mut failure = retry_exhausted_with_raw(None);
+    failure.final_class = crate::retry::FailureClass::TruncatedEnvelope;
+    let pv = ParallelVerdict::ParseFailed(failure);
+    let comment = format_verdict_comment(&pv, "analyst_2", VerdictFilter::All).expect("comment");
+    assert!(comment.contains("truncated_envelope"), "{comment}");
+    assert!(comment.contains("1 attempt(s)"), "{comment}");
+}
+
+#[test]
+fn no_response_keeps_existing_template() {
+    let comment = format_verdict_comment(&no_verdict(), "analyst_1", VerdictFilter::All)
+        .expect("no-response must produce a comment");
+    assert!(
+        comment.contains("failed to produce a response"),
+        "{comment}"
+    );
+}
+
+#[test]
+fn raw_response_dump_section_covers_sanitation_shape() {
+    // The sanitation failure comment path reuses raw_response_dump_section;
+    // verify the same truncation/marker contract holds there.
+    let raw = "Sanitation agent output with details";
+    let failure = retry_exhausted_with_raw(Some(raw.to_string()));
+    let section = raw_response_dump_section(&failure);
+    assert!(section.contains("Raw agent response"), "{section}");
+    assert!(section.contains(raw), "{section}");
+}

@@ -136,14 +136,7 @@ impl Tool for AskTool {
                 .unwrap_or_default();
 
             tokio::spawn(async move {
-                let result = run_sub_agent(&ws, role, &ask).await;
-                let message = match result {
-                    Ok(text) => format!("<ask-tool-result>\n\n{text}</ask-tool-result>"),
-                    Err(e) => {
-                        tracing::debug!(error = %e, "async AskTool sub-agent failed");
-                        format!("<ask-tool-result>\n\nAn error occurred: {e}</ask-tool-result>")
-                    }
-                };
+                let message = build_async_ask_message(run_sub_agent(&ws, role, &ask).await);
 
                 // Route result to the caller's agent channel.
                 // Manager callers route to `manager_{ws_name}`.
@@ -172,6 +165,21 @@ impl Tool for AskTool {
 
         // Sync path — blocks caller until sub-agent completes.
         run_sub_agent(ws, role, ask).await
+    }
+}
+
+/// Build the `<ask-tool-result>` envelope message for an async ask dispatch.
+///
+/// Shared by the async dispatch path (the `tokio::spawn` body in
+/// [`AskTool::execute`]) and tests — the envelope shape that reaches the
+/// caller's agent channel is production code, not a test re-wrap.
+fn build_async_ask_message(result: anyhow::Result<String>) -> String {
+    match result {
+        Ok(text) => wrap_ask_tool_result(&text),
+        Err(e) => {
+            tracing::debug!(error = %e, "async AskTool sub-agent failed");
+            wrap_ask_tool_result(&format!("An error occurred: {e}"))
+        }
     }
 }
 
@@ -243,6 +251,25 @@ async fn run_parallel_analysts(ws: &Workspace, ask: &str, count: usize) -> Vec<O
     join_all(futures).await
 }
 
+/// Wrap a sub-agent result in the `<ask-tool-result>` envelope delivered to
+/// the caller's agent channel.
+fn wrap_ask_tool_result(text: &str) -> String {
+    format!("<ask-tool-result>\n\n{text}</ask-tool-result>")
+}
+
+/// Wrap escaped analyst reports in the canonical markdown shape used by the
+/// consolidation request AND the fail-open raw dump: `### Report from Analyst N`
+/// sections joined by blank lines (the caller adds the surrounding heading).
+/// Triple-backtick escaping is applied by the caller before this function.
+fn format_analyst_reports_markdown(escaped: &[String]) -> String {
+    let mut parts = Vec::new();
+    for (i, report) in escaped.iter().enumerate() {
+        parts.push(format!("### Report from Analyst {}", i + 1));
+        parts.push(report.clone());
+    }
+    parts.join("\n\n")
+}
+
 /// Consolidate parallel analyst responses via a single LLM synthesis call.
 ///
 /// Message structure (per manager refinement):
@@ -252,7 +279,13 @@ async fn run_parallel_analysts(ws: &Workspace, ask: &str, count: usize) -> Vec<O
 /// Graceful degradation:
 /// - 0 valid responses → error
 /// - 1 valid response → returned directly (no consolidation call)
-/// - 2–3 valid responses → consolidated via [`crate::providers::chat`]
+/// - 2–3 valid responses → consolidated via [`crate::retry::retry_chat`]
+///
+/// Fail-open (mahbot-1066 Amendment A): when consolidation fails after all
+/// retries (or on any immediate non-retryable error), the raw VALID analyst
+/// reports are delivered with an explicit "unconsolidated" marker instead of
+/// an error — findings are never lost. The result is free-form text consumed
+/// only by LLMs; nothing parses it.
 async fn consolidate_analyst_responses(
     ask: &str,
     responses: Vec<Option<String>>,
@@ -292,12 +325,8 @@ async fn consolidate_analyst_responses(
 
             // User message = reports section only, built for the exact count
             // of responding analysts (no empty headers for missing analysts).
-            let mut user_parts = vec!["## Analyst Reports".to_string()];
-            for (i, report) in escaped.iter().enumerate() {
-                user_parts.push(format!("### Report from Analyst {}", i + 1));
-                user_parts.push(report.clone());
-            }
-            let user_content = user_parts.join("\n\n");
+            let reports_markdown = format_analyst_reports_markdown(&escaped);
+            let user_content = format!("## Analyst Reports\n\n{reports_markdown}");
 
             let request = ChatRequest {
                 messages: vec![
@@ -314,12 +343,30 @@ async fn consolidate_analyst_responses(
                 provider_allow_fallbacks: routing.allow_fallbacks,
             };
 
-            let response = crate::providers::chat(request).await?;
-            let text = response.text_or_empty().to_string();
-            if text.is_empty() {
-                anyhow::bail!("Consolidation LLM returned empty response");
+            // Hardened outer retry loop (mahbot-1066): the request is
+            // byte-identical across ALL attempts (no re-prompt exists here);
+            // 7 attempts, backoff 5/10/20/40/60/90 s, 600 s wall cap. The outer
+            // loop is the single retry authority — provider-internal retries
+            // are suppressed on scoped calls, so at most 7 HTTP calls happen.
+            let policy = crate::retry::RetryPolicy::current();
+            match crate::retry::retry_chat(request, &policy).await {
+                // retry_chat only returns Ok with non-empty (trimmed) text —
+                // empty responses are classified as NoResponse and retried.
+                Ok(response) => Ok(response.text_or_empty().to_string()),
+                Err(exhausted) => {
+                    // Fail-open (Amendment A): deliver the raw valid analyst
+                    // reports with an explicit marker instead of discarding
+                    // them. Precedent: n=1 valid reports already pass through
+                    // raw without consolidation.
+                    tracing::warn!(
+                        error = %exhausted,
+                        "Analyst consolidation failed — delivering raw analyst reports"
+                    );
+                    Ok(format!(
+                        "## Analyst Reports\n\n(unconsolidated — consolidation failed: {exhausted})\n\n{reports_markdown}"
+                    ))
+                }
             }
-            Ok(text)
         }
     }
 }
@@ -327,8 +374,10 @@ async fn consolidate_analyst_responses(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::test::{FakeProvider, install_fake_provider, retry_tests_lock};
     use crate::workspace::test_ws;
     use serde_json::json;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_ask_missing_args() {
@@ -488,6 +537,201 @@ mod tests {
             result.unwrap(),
             "valid",
             "Should return the only non-empty response"
+        );
+    }
+
+    // ── mahbot-1066 Amendment A: consolidation fail-open ────────────────
+
+    /// Helper: run consolidation with the given fake provider outcomes
+    /// scripted, returning the consolidation result.
+    async fn consolidate_with_script(
+        responses: Vec<Option<String>>,
+        fake: FakeProvider,
+    ) -> anyhow::Result<String> {
+        let provider: Arc<dyn crate::Provider> = Arc::new(fake);
+        let _guard = install_fake_provider(provider);
+        consolidate_analyst_responses("test question", responses).await
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    async fn test_consolidation_fail_open_delivers_raw_reports() {
+        let _guard = retry_tests_lock();
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // Consolidation retries (transport failures) exhaust → fail open.
+        let fake = FakeProvider::new()
+            .err(
+                crate::retry::FailureClass::Transport,
+                "error reading response body",
+            )
+            .err(
+                crate::retry::FailureClass::Transport,
+                "error reading response body",
+            )
+            .err(
+                crate::retry::FailureClass::Transport,
+                "error reading response body",
+            );
+        let result = consolidate_with_script(
+            vec![
+                Some("report one".to_string()),
+                Some("report two".to_string()),
+                None,
+            ],
+            fake,
+        )
+        .await;
+        let text = result.expect("fail-open must succeed with raw reports");
+        assert!(
+            text.contains("unconsolidated — consolidation failed"),
+            "must carry the unconsolidated marker: {text}"
+        );
+        assert!(text.contains("## Analyst Reports"), "{text}");
+        assert!(text.contains("### Report from Analyst 1"), "{text}");
+        assert!(text.contains("report one"), "{text}");
+        assert!(text.contains("### Report from Analyst 2"), "{text}");
+        assert!(text.contains("report two"), "{text}");
+        assert!(!text.contains("### Report from Analyst 3"), "{text}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    async fn test_consolidation_non_retryable_fails_open() {
+        let _guard = retry_tests_lock();
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // Even an immediate non-retryable error fails open (Amendment A).
+        let fake = FakeProvider::new().err(
+            crate::retry::FailureClass::NonRetryable,
+            "insufficient balance",
+        );
+        let result = consolidate_with_script(
+            vec![
+                Some("alpha".to_string()),
+                Some("beta".to_string()),
+                Some("gamma".to_string()),
+            ],
+            fake,
+        )
+        .await;
+        let text = result.expect("non-retryable consolidation failure fails open");
+        assert!(
+            text.contains("unconsolidated — consolidation failed"),
+            "{text}"
+        );
+        assert!(text.contains("alpha"), "{text}");
+        assert!(text.contains("beta"), "{text}");
+        assert!(text.contains("gamma"), "{text}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    async fn test_consolidation_success_unchanged() {
+        let _guard = retry_tests_lock();
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = FakeProvider::new().ok("synthesized answer");
+        let result = consolidate_with_script(
+            vec![
+                Some("report a".to_string()),
+                Some("report b".to_string()),
+                None,
+            ],
+            fake,
+        )
+        .await;
+        assert_eq!(
+            result.expect("success"),
+            "synthesized answer",
+            "successful consolidation output unchanged"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    async fn test_consolidation_fail_open_mixed_failure_classes() {
+        let _guard = retry_tests_lock();
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // Mixed transport + NoResponse (empty text) failures exercise both
+        // retry_chat branches in one script; exhaustion still fails open
+        // (Amendment A). Script: transport error, then two empty responses.
+        let fake = FakeProvider::new()
+            .err(
+                crate::retry::FailureClass::Transport,
+                "error reading response body",
+            )
+            .ok("")
+            .ok("");
+        let result = consolidate_with_script(
+            vec![
+                Some("only usable".to_string()),
+                Some("second".to_string()),
+                None,
+            ],
+            fake,
+        )
+        .await;
+        let text = result.expect("mixed failures still fail open");
+        assert!(
+            text.contains("unconsolidated — consolidation failed"),
+            "{text}"
+        );
+        assert!(text.contains("only usable"), "{text}");
+        assert!(text.contains("second"), "{text}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    async fn test_consolidation_async_envelope_carries_marker() {
+        // The async dispatch path (tokio::spawn in AskTool::execute) builds
+        // its envelope via build_async_ask_message — this test drives the REAL
+        // fail-open consolidation result through that production builder
+        // (not a manual re-wrap), asserting the exact envelope + marker shape
+        // that reaches the caller's agent channel.
+        let _guard = retry_tests_lock();
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = FakeProvider::new()
+            .err(crate::retry::FailureClass::Transport, "down")
+            .err(crate::retry::FailureClass::Transport, "down")
+            .err(crate::retry::FailureClass::Transport, "down");
+        let result = consolidate_with_script(
+            vec![
+                Some("raw report".to_string()),
+                Some("raw report 2".to_string()),
+                None,
+            ],
+            fake,
+        )
+        .await;
+        let envelope = build_async_ask_message(result);
+        assert!(envelope.contains("<ask-tool-result>"), "{envelope}");
+        assert!(
+            envelope.contains("unconsolidated — consolidation failed"),
+            "{envelope}"
+        );
+        assert!(envelope.contains("raw report"), "{envelope}");
+        assert!(
+            envelope.ends_with("</ask-tool-result>"),
+            "envelope must close: {envelope}"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_envelope_wraps_sub_agent_errors() {
+        // The async dispatch path's error branch: a failed sub-agent is
+        // wrapped in the same envelope with the error text.
+        let envelope = build_async_ask_message(Err(anyhow::anyhow!("sub-agent exploded")));
+        assert!(envelope.contains("<ask-tool-result>"), "{envelope}");
+        assert!(
+            envelope.contains("An error occurred: sub-agent exploded"),
+            "{envelope}"
+        );
+        assert!(
+            envelope.ends_with("</ask-tool-result>"),
+            "envelope must close: {envelope}"
         );
     }
 }

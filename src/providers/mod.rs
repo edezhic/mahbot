@@ -43,11 +43,79 @@ pub(crate) fn test_request(
 }
 
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 pub(crate) use crate::providers::transcribe::ImageTranscriber;
 
+use crate::retry::{FailureClass, RetryFailureRecord};
 use compatible::OpenAiCompatibleProvider;
 use reliable::ReliableProvider;
+
+// ── Scoped call error (mahbot-1066) ────────────────────────────────────
+
+/// Error from a scoped (single-attempt) provider call.
+///
+/// Carries the underlying error, a granular [`FailureClass`], and the
+/// per-attempt diagnostics [`RetryFailureRecord`] so the outer retry loop can
+/// classify, persist telemetry, and build human-readable failure trails
+/// without re-stringifying.
+#[derive(Debug)]
+pub(crate) struct ScopedCallError {
+    pub inner: anyhow::Error,
+    pub record: RetryFailureRecord,
+    pub class: FailureClass,
+}
+
+impl ScopedCallError {
+    #[must_use]
+    pub(crate) fn new(
+        inner: anyhow::Error,
+        record: RetryFailureRecord,
+        class: FailureClass,
+    ) -> Self {
+        Self {
+            inner,
+            record,
+            class,
+        }
+    }
+
+    /// Build from a plain error with no HTTP metadata (default trait-impl
+    /// path / test doubles). Classification reuses the provider error
+    /// classifier; Retry-After is extracted when the error wraps an
+    /// [`HttpError`](crate::util::error::HttpError).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn from_plain(inner: anyhow::Error, started: Instant) -> Self {
+        let class = classify_failure(&inner);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let retry_after_ms = reliable::parse_retry_after_ms(&inner);
+        let record = RetryFailureRecord::new_simple(0, class, &inner, elapsed_ms, retry_after_ms);
+        Self {
+            inner,
+            record,
+            class,
+        }
+    }
+}
+
+impl std::fmt::Display for ScopedCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.inner)
+    }
+}
+
+impl std::error::Error for ScopedCallError {}
+
+/// Map a plain error to a granular [`FailureClass`] using the provider error
+/// classifier (retryable vs non-retryable).
+#[must_use]
+pub(crate) fn classify_failure(err: &anyhow::Error) -> FailureClass {
+    match reliable::classify_err(err) {
+        reliable::ErrorClass::NonRetryable => FailureClass::NonRetryable,
+        reliable::ErrorClass::Retryable => FailureClass::Transport,
+    }
+}
 
 /// Ensure a base URL includes the `/chat/completions` path segment.
 /// If the URL already ends with `/chat/completions`, it is returned as-is.
@@ -284,6 +352,42 @@ pub(crate) async fn chat(request: ChatRequest) -> anyhow::Result<ChatResponse> {
         .clone()
         .expect("PROVIDER not initialized");
     provider.chat(request).await
+}
+
+/// Single-attempt scoped chat for the outer retry loops (mahbot-1066).
+///
+/// Suppresses provider-internal retries (the outer loop is the single retry
+/// authority), applies idle-timeout semantics, and bounds the attempt by the
+/// remaining operation deadline. See [`Provider::chat_scoped`].
+pub(crate) async fn chat_scoped(
+    request: ChatRequest,
+    idle_timeout: std::time::Duration,
+    deadline: Instant,
+) -> Result<ChatResponse, ScopedCallError> {
+    let provider = PROVIDER
+        .read()
+        .unwrap_poison()
+        .clone()
+        .expect("PROVIDER not initialized");
+    provider.chat_scoped(request, idle_timeout, deadline).await
+}
+
+/// Swap the global provider for tests, returning the previous value so the
+/// caller can restore it (see `util::test::install_fake_provider`'s RAII
+/// guard). Test doubles override [`Provider::chat_scoped`] to control failure
+/// classes and request bytes without touching the network.
+#[cfg(test)]
+pub(crate) fn swap_provider_for_test(provider: Arc<dyn Provider>) -> Option<Arc<dyn Provider>> {
+    let mut guard = PROVIDER.write().unwrap_poison();
+    let previous = guard.clone();
+    *guard = Some(provider);
+    previous
+}
+
+/// Restore a previously swapped-out global provider (test isolation).
+#[cfg(test)]
+pub(crate) fn restore_provider_for_test(previous: Option<Arc<dyn Provider>>) {
+    *PROVIDER.write().unwrap_poison() = previous;
 }
 
 /// Create a resilient OpenAI-compatible provider from flat config.

@@ -32,6 +32,7 @@ pub mod message_router;
 pub(crate) mod prompt;
 pub mod providers;
 pub mod registry;
+pub(crate) mod retry;
 pub(crate) mod role;
 pub mod search_engine;
 pub mod self_update;
@@ -1142,10 +1143,56 @@ pub(crate) struct ChatRequest {
     pub provider_allow_fallbacks: Option<bool>,
 }
 
+/// Validator callback for scoped structured extraction (mahbot-1066): rejects
+/// a parsed value (e.g. verdict score ∉ [0,10]). A rejection is treated as a
+/// parse failure inside the extraction retry loop (re-prompted, fail-closed).
+/// Must be `Send + Sync` because extraction runs inside `join_all` futures.
+pub(crate) type ExtractionValidator<T> = dyn Fn(&T) -> Result<(), String> + Send + Sync;
+
 #[async_trait]
 pub(crate) trait Provider: Send + Sync {
     /// Send a chat request using the model specified in the request.
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse>;
+
+    /// Single-attempt chat for the scoped retry paths (mahbot-1066).
+    ///
+    /// Used by the outer retry loops in [`crate::retry`] for verdict
+    /// extraction and analyst consolidation. Contract:
+    ///
+    /// - **No provider-internal retries** — this call makes exactly one HTTP
+    ///   request; the outer loop is the single retry authority.
+    /// - **Idle-timeout semantics** — `idle_timeout` resets while data flows
+    ///   (a stalled connection mid-body is the truncation signature this
+    ///   hardening targets).
+    /// - **Per-attempt total = remaining wall budget** — implementations
+    ///   should not outlive `deadline`.
+    /// - On failure the returned [`ScopedCallError`] carries per-attempt
+    ///   diagnostics (response metadata, body head/tail) for the durable
+    ///   `retry_failures` table.
+    ///
+    /// The default implementation delegates to [`Self::chat`] with a plain
+    /// (metadata-less) failure record — used by non-wrapping providers (and
+    /// test doubles).
+    ///
+    /// **Contract caveat**: this fallback does NOT honor the guarantees above
+    /// (no provider-internal retries, idle-timeout / remaining-budget bounds).
+    /// Any provider used by the scoped retry paths (verdict extraction /
+    /// analyst consolidation) MUST override this method;
+    /// [`crate::providers::compatible::OpenAiCompatibleProvider`] (via
+    /// `ReliableProvider`) and the test double do.
+    async fn chat_scoped(
+        &self,
+        request: ChatRequest,
+        idle_timeout: std::time::Duration,
+        deadline: std::time::Instant,
+    ) -> Result<ChatResponse, crate::providers::ScopedCallError> {
+        let started = std::time::Instant::now();
+        let _ = (idle_timeout, deadline);
+        match self.chat(request).await {
+            Ok(resp) => Ok(resp),
+            Err(e) => Err(crate::providers::ScopedCallError::from_plain(e, started)),
+        }
+    }
 
     async fn warmup(&self) -> anyhow::Result<()> {
         Ok(())

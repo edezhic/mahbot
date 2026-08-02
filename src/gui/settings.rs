@@ -892,6 +892,8 @@ impl SettingsState {
             self.generation_section(),
             Space::new().height(16),
             self.integrations_section(),
+            Space::new().height(16),
+            self.retry_section(),
         ];
 
         let mut content = column![
@@ -2026,6 +2028,61 @@ impl SettingsState {
     }
 
     // ── Model picker view helper ───────────────────────────────
+
+    /// Retry policy for scoped LLM operations (mahbot-1066) — verdict
+    /// extraction (Analyst/Reviewer/QA/Sanitation) and analyst consolidation.
+    ///
+    /// All four tunables share the hardened outer retry loop: 7 attempts,
+    /// backoff 5/10/20/40/60/90 s, ±25% jitter on the sleep only, Retry-After
+    /// honored (clamped [5000, 90000] ms), shutdown-abortable, 600 s
+    /// wall-clock cap. Empty values fall back to the defaults.
+    fn retry_section(&self) -> Element<'_, SettingsMessage> {
+        section(
+            "Retry",
+            column![
+                text("Verdict extraction + analyst consolidation (scoped calls)")
+                    .size(11)
+                    .color(theme::TEXT_SECONDARY),
+                Space::new().height(4),
+                config_text_input(
+                    "Max Attempts",
+                    crate::retry::DEFAULT_RETRY_MAX_ATTEMPTS_STR,
+                    self.config
+                        .retry_max_attempts
+                        .as_deref()
+                        .unwrap_or_default(),
+                    "retry_max_attempts",
+                ),
+                config_text_input(
+                    "Base Backoff (ms)",
+                    crate::retry::DEFAULT_RETRY_BASE_BACKOFF_MS_STR,
+                    self.config
+                        .retry_base_backoff_ms
+                        .as_deref()
+                        .unwrap_or_default(),
+                    "retry_base_backoff_ms",
+                ),
+                config_text_input(
+                    "Max Backoff (ms)",
+                    crate::retry::DEFAULT_RETRY_MAX_BACKOFF_MS_STR,
+                    self.config
+                        .retry_max_backoff_ms
+                        .as_deref()
+                        .unwrap_or_default(),
+                    "retry_max_backoff_ms",
+                ),
+                config_text_input(
+                    "Operation Timeout (s)",
+                    crate::retry::DEFAULT_OPERATION_TIMEOUT_SECS_STR,
+                    self.config
+                        .operation_timeout_secs
+                        .as_deref()
+                        .unwrap_or_default(),
+                    "operation_timeout_secs",
+                ),
+            ],
+        )
+    }
 
     fn generation_section(&self) -> Element<'_, SettingsMessage> {
         section(
