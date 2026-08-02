@@ -35,7 +35,7 @@
 //!
 //! ## Live-instance artifact detection
 //!
-//! When a foreign standard-SQLite actor removes/recreates `-wal`/`-shm` files
+//! When a foreign standard-SQLite actor removes/recreates `-wal` files
 //! under the running daemon, the daemon's WAL fd becomes orphaned: the `.tshm`
 //! header advertises live frames while the on-disk `-wal` is empty, so reads
 //! hit torn-frame errors. Before opening, the CLI parses the `.tshm` header
@@ -311,7 +311,7 @@ fn artifact_error_message(db_path: &Path) -> String {
          The running daemon's WAL file descriptor is orphaned: its on-disk \
          `-wal` file is empty while the `.tshm` coordination header advertises \
          live WAL frames (foreign standard-SQLite activity likely removed or \
-         replaced the `-wal`/`-shm` files under the daemon). Query a snapshot \
+         replaced the `-wal` files under the daemon). Query a snapshot \
          copy instead — see docs/ops/wal-snapshots.md. Never delete or recreate \
          `-wal`/`-shm`/`-tshm` files while the daemon runs.",
         db_path.display()

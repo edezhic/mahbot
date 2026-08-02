@@ -251,8 +251,8 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
 
     // Live-WAL/tshm artifact guard: periodically inspects the store file set
     // and warns when the daemon's WAL fd is orphaned (live frames advertised
-    // by .tshm but an empty on-disk -wal) or a foreign standard-SQLite -shm
-    // file is present. Detection only — never touches the files.
+    // by .tshm but an empty on-disk -wal). Detection only — never touches the
+    // files.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,

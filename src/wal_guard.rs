@@ -18,9 +18,9 @@
 //!   set into an [`StoreArtifactStatus`] without opening the database.
 //! - [`run_wal_guard_loop`] — background task that periodically inspects the
 //!   live store directory and emits `tracing::warn!` diagnostics when the
-//!   orphaned-WAL or foreign-`-shm` condition is present.
+//!   orphaned-WAL condition is present.
 //!
-//! ## Signals
+//! ## Signal
 //!
 //! - **Orphaned WAL**: `.tshm` header advertises live frames
 //!   (`max_frame > 0`) while the on-disk `-wal` is 0 bytes. This is the
@@ -28,11 +28,6 @@
 //!   to an unlinked inode). It is inherently racy: right after a 5-minute
 //!   checkpoint `max_frame` reads 0 even for orphaned stores, so the guard
 //!   only fires while the daemon actively publishes frames.
-//! - **Foreign `-shm`**: a standard-SQLite `-shm` file exists at a store
-//!   path. Limbo never creates `-shm` (it uses `-tshm`), so presence means an
-//!   external SQLite process touched the store, or a stale artifact from one.
-//!   This is a secondary signal: healthy stores can carry stale `-shm` files
-//!   without any current problem.
 
 use std::path::Path;
 use std::time::Duration;
@@ -65,10 +60,7 @@ const WAL_GUARD_INTERVAL_SECS: u64 = 60;
 
 /// Re-announce the persistent **orphaned-WAL** condition after this many
 /// consecutive checks (avoids log spam while still surfacing a long-lived
-/// condition). The foreign `-shm` signal warns on transition only: stale
-/// `-shm` files can persist indefinitely (they cannot be removed without the
-/// forbidden restart window), so periodic re-announcement would produce
-/// permanent log noise on healthy stores.
+/// condition).
 const REANNOUNCE_EVERY_CHECKS: u64 = 10;
 
 /// Parsed `.tshm` coordination header fields.
@@ -91,8 +83,6 @@ pub struct StoreArtifactStatus {
     pub tshm: Option<TshmHeader>,
     /// On-disk `-wal` size in bytes (0 when missing or empty).
     pub wal_size: u64,
-    /// A standard-SQLite `-shm` file exists at the store path.
-    pub shm_exists: bool,
     /// True when `.tshm` advertises live frames but the on-disk `-wal` is
     /// empty — the live-instance artifact (orphaned WAL fd).
     pub orphaned_wal: bool,
@@ -154,18 +144,15 @@ pub fn inspect_store(root: &Path, name: &str) -> StoreArtifactStatus {
     let db_dir = root.join("db");
     let wal_path = db_dir.join(format!("{name}.db-wal"));
     let tshm_path = db_dir.join(format!("{name}.db-tshm"));
-    let shm_path = db_dir.join(format!("{name}.db-shm"));
 
     let tshm = parse_tshm_header(&tshm_path);
     let wal_size = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
-    let shm_exists = shm_path.exists();
     let orphaned_wal = is_orphaned_wal(tshm, wal_size);
 
     StoreArtifactStatus {
         store: name.to_string(),
         tshm,
         wal_size,
-        shm_exists,
         orphaned_wal,
     }
 }
@@ -180,14 +167,12 @@ pub fn check_all_stores(root: &Path) -> Vec<StoreArtifactStatus> {
 }
 
 /// Background loop: periodically inspect the live store directory and emit
-/// warnings when the orphaned-WAL or foreign-`-shm` condition is present.
+/// warnings when the orphaned-WAL condition is present.
 ///
 /// Warnings are emitted on condition transitions. The orphaned-WAL condition
 /// is additionally re-announced every [`REANNOUNCE_EVERY_CHECKS`] checks while
 /// persistent (it is the dynamic, higher-severity signal — it fluctuates with
-/// daemon activity and checkpoint cycles); the foreign `-shm` signal warns on
-/// transition only, since stale `-shm` files are static and can persist
-/// indefinitely.
+/// daemon activity and checkpoint cycles).
 pub async fn run_wal_guard_loop() {
     let root = match crate::config::default_config_dir() {
         Ok(root) => root,
@@ -227,27 +212,6 @@ pub async fn run_wal_guard_loop() {
                 last_seen.insert(store.clone(), true);
             } else {
                 last_seen.insert(store.clone(), false);
-            }
-
-            let shm_key = format!("{store}:shm");
-            if status.shm_exists {
-                // Transition-only warning: a persistent stale -shm must not
-                // re-announce every ~10 minutes forever (all 8 stores currently
-                // carry one; they cannot be cleaned without a restart window).
-                let announce = last_seen.get(&shm_key).copied() != Some(true);
-                if announce {
-                    warn!(
-                        store = %status.store,
-                        "wal-guard: foreign standard-SQLite -shm file present at a live \
-                         store path (Limbo never creates -shm). Either an external SQLite \
-                         process opened this store or a stale artifact remains from one. \
-                         This can break the daemon's WAL coordination if it deletes/recreates \
-                         -wal/-shm while the daemon runs.",
-                    );
-                }
-                last_seen.insert(shm_key, true);
-            } else {
-                last_seen.insert(shm_key, false);
             }
         }
     }
@@ -310,16 +274,15 @@ mod tests {
     }
 
     #[test]
-    fn detects_orphaned_wal_and_foreign_shm() {
+    fn detects_orphaned_wal() {
         let dir = std::env::temp_dir().join(format!("wal_guard_state_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        // Healthy store: tshm advertises 0 frames, wal empty, no shm.
+        // Healthy store: tshm advertises 0 frames, wal empty.
         write(&dir.join("db/board.db-tshm"), &tshm_bytes(0, 0, 5));
         write(&dir.join("db/board.db-wal"), &[]);
         let s = inspect_store(&dir, "board");
         assert!(!s.orphaned_wal);
-        assert!(!s.shm_exists);
 
         // Orphaned store: tshm advertises live frames, wal empty.
         write(
@@ -331,14 +294,6 @@ mod tests {
         assert!(s.orphaned_wal);
         assert!(s.tshm.is_some());
         assert_eq!(s.tshm.unwrap().max_frame, 356);
-
-        // Healthy store with a stale foreign -shm file.
-        write(&dir.join("db/users.db-tshm"), &tshm_bytes(0, 0, 1));
-        write(&dir.join("db/users.db-wal"), &[]);
-        write(&dir.join("db/users.db-shm"), &[0u8; 32_768]);
-        let s = inspect_store(&dir, "users");
-        assert!(!s.orphaned_wal);
-        assert!(s.shm_exists);
 
         // Active write on a healthy store: max_frame > 0, wal non-empty → not orphaned.
         write(&dir.join("db/stats.db-tshm"), &tshm_bytes(120, 0, 3));
