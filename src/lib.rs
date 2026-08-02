@@ -790,12 +790,155 @@ pub struct Agent {
 #[derive(Clone, Deserialize)]
 pub(crate) struct Verdict {
     /// Quality score from 0 (worst) to 10 (best).
+    #[serde(deserialize_with = "de_verdict_score")]
     pub score: u8,
     /// Optional constructive critique from the verifier.
     pub critique: Option<String>,
     /// List of specific issues detected in the response.
     #[serde(rename = "issues")]
     pub issues_detected: Vec<String>,
+}
+
+/// Deserialize a verdict score, self-healing common model emissions:
+/// - [0,10] integers pass through; fractional values floor (8.5 → 8).
+/// - [11,100] divides by 10 then floors (85 → 8, 11 → 1, 100 → 10).
+/// - Integers 101–255 pass through so downstream validation keeps
+///   classifying them as out-of-range (failure-class stability).
+/// - Everything else (non-numeric, negative, the (10,11) gap, fractions
+///   outside the bands) fails closed — range checks precede any cast.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn de_verdict_score<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let Some(n) = value.as_number() else {
+        return Err(D::Error::custom("verdict score must be a number"));
+    };
+    if let Some(i) = n.as_i64() {
+        return if (0..=10).contains(&i) {
+            Ok(i as u8)
+        } else if (11..=100).contains(&i) {
+            Ok((i / 10) as u8)
+        } else if (101..=255).contains(&i) {
+            // Out-of-range integers pass through so downstream validation
+            // keeps their out-of-range classification (failure-class stability).
+            Ok(i as u8)
+        } else {
+            Err(D::Error::custom("verdict score out of accepted ranges"))
+        };
+    }
+    let f = n
+        .as_f64()
+        .ok_or_else(|| D::Error::custom("verdict score out of accepted ranges"))?;
+    if (0.0..=10.0).contains(&f) {
+        Ok(f.floor() as u8)
+    } else if (11.0..=100.0).contains(&f) {
+        Ok((f / 10.0).floor() as u8)
+    } else {
+        Err(D::Error::custom("verdict score out of accepted ranges"))
+    }
+}
+
+#[cfg(test)]
+mod verdict_score_tests {
+    use super::*;
+
+    #[test]
+    fn verdict_score_accepts_native_and_percent_bands() {
+        struct Case {
+            json: &'static str,
+            expected: Option<u8>,
+        }
+        let cases = [
+            // Native band [0,10]: integers unchanged, fractions floor.
+            Case {
+                json: r#"{"score": 8, "issues": []}"#,
+                expected: Some(8),
+            },
+            Case {
+                json: r#"{"score": 10, "issues": []}"#,
+                expected: Some(10),
+            },
+            Case {
+                json: r#"{"score": 8.5, "issues": []}"#,
+                expected: Some(8),
+            },
+            Case {
+                json: r#"{"score": 10.0, "issues": []}"#,
+                expected: Some(10),
+            },
+            // Percent band [11,100]: divide by 10, then floor.
+            Case {
+                json: r#"{"score": 85, "issues": []}"#,
+                expected: Some(8),
+            },
+            Case {
+                json: r#"{"score": 11, "issues": []}"#,
+                expected: Some(1),
+            },
+            Case {
+                json: r#"{"score": 100, "issues": []}"#,
+                expected: Some(10),
+            },
+            Case {
+                json: r#"{"score": 85.5, "issues": []}"#,
+                expected: Some(8),
+            },
+            // Integers 101–255 pass through for downstream out-of-range
+            // classification (failure-class stability).
+            Case {
+                json: r#"{"score": 101, "issues": []}"#,
+                expected: Some(101),
+            },
+            Case {
+                json: r#"{"score": 255, "issues": []}"#,
+                expected: Some(255),
+            },
+            // (10,11) gap and everything outside the bands fail closed.
+            Case {
+                json: r#"{"score": 10.5, "issues": []}"#,
+                expected: None,
+            },
+            Case {
+                json: r#"{"score": 10.9, "issues": []}"#,
+                expected: None,
+            },
+            Case {
+                json: r#"{"score": -1, "issues": []}"#,
+                expected: None,
+            },
+            Case {
+                json: r#"{"score": -1.0, "issues": []}"#,
+                expected: None,
+            },
+            Case {
+                json: r#"{"score": 100.5, "issues": []}"#,
+                expected: None,
+            },
+            Case {
+                json: r#"{"score": 300, "issues": []}"#,
+                expected: None,
+            },
+            Case {
+                json: r#"{"score": "high", "issues": []}"#,
+                expected: None,
+            },
+        ];
+        for case in &cases {
+            let parsed = serde_json::from_str::<Verdict>(case.json);
+            match case.expected {
+                Some(score) => assert_eq!(
+                    parsed.expect("must deserialize").score,
+                    score,
+                    "case: {}",
+                    case.json
+                ),
+                None => assert!(parsed.is_err(), "must fail closed: {}", case.json),
+            }
+        }
+    }
 }
 
 /// Result of a sanitation agent's file inspection.

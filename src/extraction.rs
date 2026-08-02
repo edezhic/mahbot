@@ -472,9 +472,9 @@ mod tests {
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy()); // 3 attempts
         let fake = Arc::new(
             FakeProvider::new()
-                .ok(r#"{"score": 42}"#)
-                .ok(r#"{"score": 42}"#)
-                .ok(r#"{"score": 42}"#),
+                .ok(r#"{"score": 101}"#) // just above the accepted [11,100] band
+                .ok(r#"{"score": 101}"#)
+                .ok(r#"{"score": 101}"#),
         );
         let result = extract_with(fake).await;
         let failure = result.expect_err("garbage score must never pass");
