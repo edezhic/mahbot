@@ -17,11 +17,8 @@ exclude = [".DS_Store"]
 [features]
 # `full` is a default-on marker feature used by `required-features` on the app
 # binary ([[bin]]).  It gates NO code or dependencies itself; it exists so that
-# `--no-default-features` bench builds skip the binary entirely (the bin is a
-# second full-program fat-LTO link, ~280 s of the ~357 s warm bench rebuild).
-# Keeping the lib's feature surface identical between default and minimal builds
-# preserves the classifier-fingerprint contract (anchor 08c9c7b2c503…,
-# mahbot-1041): the minimal build must NOT perturb audio codegen.
+# `--no-default-features` bench builds skip the binary entirely — the bin is a
+# second full-program link that bench runs never exercise.
 default = ["full"]
 full = []
 voice-tests = []
@@ -32,7 +29,7 @@ name = "mahbot"
 path = "src/main.rs"
 # Skip the app binary for `--no-default-features` builds.  The canonical bench
 # invocation `cargo bench --no-default-features --features voice-tests` uses
-# this to avoid the bin's fat-LTO link (~280 s of the warm bench rebuild).
+# this to avoid the bin's full-program link.
 # NOTE: `bench = false` does NOT prevent `cargo bench` from building the bin
 # (rust-lang/cargo#15702); `required-features` is the reliable mechanism.
 required-features = ["full"]
@@ -216,11 +213,11 @@ debug = "line-tables-only"
 codegen-units = 256
 
 [profile.bench]
+# Release-like (opt-level 2 / codegen-units 32 / no LTO): the bench is a
+# production-performance proxy, and release codegen rebuilds ~3-4x faster than
+# the old opt-level 3 + fat-LTO profile.  incremental must stay explicitly off
+# here — the release profile it inherits enables it.
 inherits = "release"
-opt-level = 3
-lto = true
-codegen-units = 1
-debug = 0
 incremental = false
 
 [patch.crates-io]

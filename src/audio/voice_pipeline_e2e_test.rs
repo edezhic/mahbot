@@ -14,8 +14,8 @@
 //!
 //! The minimal invocation excludes the app binary from the build (the bin is
 //! gated behind the default-on `full` feature via `required-features` on
-//! `[[bin]]`, so `--no-default-features` skips its ~280 s fat-LTO link).
-//! This is the documented fast path for all bench runs (mahbot-1041):
+//! `[[bin]]`, so `--no-default-features` skips its full-program link).
+//! This is the documented fast path for all bench runs:
 //!
 //! ```sh
 //! cargo bench --no-default-features --features voice-tests --bench voice_pipeline_e2e
@@ -33,11 +33,11 @@
 //! is not supported by Cargo; `bench = false` does not work, rust-lang/cargo#15702).
 //! Default builds are unaffected (`full` is default-on; the bin always builds).
 //!
-//! NOTE (mahbot-1041): `[profile.bench]` (opt-level=3, fat LTO,
-//! codegen-units=1) is part of the classifier-fingerprint contract — the
-//! archived baseline anchor is `08c9c7b2c503bca943e2…`.  NEVER modify the
-//! profile: any codegen change invalidates all archived baselines and forces a
-//! full re-baseline.  The feature-set reduction above is structure-only.
+//! NOTE: `[profile.bench]` is release-like (opt-level 2, codegen-units 32,
+//! no LTO, incremental off) — the bench is a production-performance proxy, so
+//! release codegen is the faithful target.  Classifier/verifier fingerprints
+//! and sanity anchors are report-only measurements: nothing gates on them,
+//! codegen shifts are expected, and there is no re-baseline ceremony.
 //!
 //! First run populates the TTS audio cache (~14-17 min); subsequent runs
 //! complete in ~45 s (bench body — Phase 13's cooldown probes add ~6.5 s of
