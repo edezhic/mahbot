@@ -247,6 +247,12 @@ fn heredoc_terminator_matches(
 /// The heredoc marker itself is replaced with a space so the command string
 /// stays well-formed for redirect scanning and newline segmentation.
 ///
+/// Command substitutions inside **unquoted** heredoc bodies are ALSO emitted
+/// (as `$(...)`/backtick spans) so they remain scanned: real bash executes
+/// `$(touch x)` inside `cat <<EOF\n$(touch x)\nEOF`, so stripping the body
+/// entirely would hide the mutation. Bodies of **quoted** delimiters
+/// (`<<'EOF'`, `<<"EOF"`) are literal in bash — nothing is emitted for them.
+///
 /// Multiple heredocs declared on the same delimiter line (`<<A <<B`) are
 /// tracked in declaration order; bodies are consumed in input order (bash
 /// reads heredoc bodies in the order the terminators appear).
@@ -269,8 +275,10 @@ pub(super) fn strip_heredoc_bodies(command: &str) -> String {
     let mut i = 0;
 
     // Pending heredocs declared on the current delimiter line, in declaration
-    // order (delimiter, strip-tabs flag).
-    let mut queue: Vec<(String, bool)> = Vec::new();
+    // order: (delimiter, strip-tabs flag, body-expands flag). The last field
+    // is true when the delimiter was unquoted — bash then performs command
+    // substitution inside the body, so substitution spans must be emitted.
+    let mut queue: Vec<(String, bool, bool)> = Vec::new();
     // When true, the delimiter line is fully emitted and body lines are being
     // skipped until the front of `queue` matches.
     let mut skipping_body = false;
@@ -296,6 +304,20 @@ pub(super) fn strip_heredoc_bodies(command: &str) -> String {
                 }
                 continue;
             }
+            // Emit command-substitution spans from unquoted bodies so they
+            // stay scanned (see the security invariant above).
+            if queue[0].2 {
+                let line_end = command[line_start..]
+                    .find('\n')
+                    .map_or(command.len(), |off| line_start + off);
+                if emit_body_substitutions(&command[line_start..line_end], &mut out)
+                    && line_end < command.len()
+                {
+                    // Keep emitted spans on separate lines so segmentation
+                    // treats each as its own command.
+                    out.push('\n');
+                }
+            }
             skip_to_next_line(&mut i, &chars);
             continue;
         }
@@ -318,42 +340,14 @@ pub(super) fn strip_heredoc_bodies(command: &str) -> String {
                 continue;
             }
             if is_herestring_start(&chars, i) {
-                // Preserve the `<<<` operator (replaced by nothing) so the
-                // token classifier can still see it and skip the herestring
-                // content word as a path argument.
-                let skip = if chars[i].1.is_ascii_digit() { 4 } else { 3 };
-                for c in &chars[i..i + skip] {
-                    out.push(c.1);
-                }
-                i += skip;
+                i = emit_herestring(&chars, i, &mut out);
                 continue;
             }
             if is_heredoc_start(&chars, i) {
-                out.push(' ');
-                if chars[i].1.is_ascii_digit() {
-                    i += 1;
+                match consume_heredoc_marker(command, &chars, i, &mut out, &mut queue) {
+                    Some(next) => i = next,
+                    None => break, // dangling `<<` at end of input
                 }
-                i += 2;
-                if i >= chars.len() {
-                    break; // dangling `<<` at end of input
-                }
-                while i < chars.len() && chars[i].1.is_whitespace() {
-                    i += 1;
-                }
-                let mut strip_tabs = false;
-                if i < chars.len() && chars[i].1 == '-' {
-                    strip_tabs = true;
-                    i += 1;
-                }
-                while i < chars.len() && chars[i].1.is_whitespace() {
-                    i += 1;
-                }
-                let (delimiter, delim_end) = parse_heredoc_delimiter(command, chars[i].0);
-                queue.push((delimiter, strip_tabs));
-                i = chars
-                    .iter()
-                    .position(|(byte, _)| *byte >= delim_end)
-                    .unwrap_or(chars.len());
                 continue;
             }
             out.push(chars[i].1);
@@ -369,48 +363,15 @@ pub(super) fn strip_heredoc_bodies(command: &str) -> String {
         }
 
         if is_herestring_start(&chars, i) {
-            // Preserve the `<<<` operator (replaced by nothing) so the
-            // token classifier can still see it and skip the herestring
-            // content word as a path argument.
-            let skip = if chars[i].1.is_ascii_digit() { 4 } else { 3 };
-            for c in &chars[i..i + skip] {
-                out.push(c.1);
-            }
-            i += skip;
+            i = emit_herestring(&chars, i, &mut out);
             continue;
         }
 
         if is_heredoc_start(&chars, i) {
-            out.push(' ');
-            if chars[i].1.is_ascii_digit() {
-                i += 1; // fd-prefixed heredoc (`3<<EOF`)
+            match consume_heredoc_marker(command, &chars, i, &mut out, &mut queue) {
+                Some(next) => i = next,
+                None => break, // dangling `<<` at end of input — nothing to strip
             }
-            i += 2;
-            if i >= chars.len() {
-                break; // dangling `<<` at end of input — nothing to strip
-            }
-            // Optional <<- (strip leading tabs from the terminator line)
-            let mut strip_tabs = false;
-            while i < chars.len() && chars[i].1.is_whitespace() {
-                i += 1;
-            }
-            if i < chars.len() && chars[i].1 == '-' {
-                strip_tabs = true;
-                i += 1;
-            }
-            while i < chars.len() && chars[i].1.is_whitespace() {
-                i += 1;
-            }
-
-            let (delimiter, delim_end) = parse_heredoc_delimiter(command, chars[i].0);
-            queue.push((delimiter, strip_tabs));
-            // Advance past the delimiter token ONLY — the tail of the
-            // delimiter line remains scanned via the delimiter-line-tail
-            // mode above.
-            i = chars
-                .iter()
-                .position(|(byte, _)| *byte >= delim_end)
-                .unwrap_or(chars.len());
             continue;
         }
 
@@ -421,23 +382,127 @@ pub(super) fn strip_heredoc_bodies(command: &str) -> String {
     out
 }
 
+/// Consume a heredoc marker at `i` (bare `<<` or fd-prefixed `{digit}<<`):
+/// parse its delimiter and push `(delimiter, strip_tabs, expands)` onto
+/// `queue`. The marker itself is replaced by a single space in `out` so the
+/// tail of the delimiter line remains scannable (a redirect there is a real
+/// write target). Returns `Some(next_index)` or `None` for a dangling `<<`
+/// at end of input.
+///
+/// Used by both the normal-scanning path and the delimiter-line-tail path so
+/// the marker grammar (fd prefix, `<<-` tabs, whitespace, quoted delimiter)
+/// lives in exactly one place.
+fn consume_heredoc_marker(
+    command: &str,
+    chars: &[(usize, char)],
+    mut i: usize,
+    out: &mut String,
+    queue: &mut Vec<(String, bool, bool)>,
+) -> Option<usize> {
+    out.push(' ');
+    if chars[i].1.is_ascii_digit() {
+        i += 1; // fd-prefixed heredoc (`3<<EOF`)
+    }
+    i += 2;
+    if i >= chars.len() {
+        return None; // dangling `<<` at end of input — nothing to strip
+    }
+    while i < chars.len() && chars[i].1.is_whitespace() {
+        i += 1;
+    }
+    let mut strip_tabs = false;
+    if i < chars.len() && chars[i].1 == '-' {
+        strip_tabs = true;
+        i += 1;
+    }
+    while i < chars.len() && chars[i].1.is_whitespace() {
+        i += 1;
+    }
+    let (delimiter, delim_end, quoted) = parse_heredoc_delimiter(command, chars[i].0);
+    queue.push((delimiter, strip_tabs, !quoted));
+    Some(
+        chars
+            .iter()
+            .position(|(byte, _)| *byte >= delim_end)
+            .unwrap_or(chars.len()),
+    )
+}
+
+/// Emit a herestring operator (`<<<` or `{digit}<<<`) unchanged so the token
+/// classifier still sees it and can skip the herestring content word as a
+/// path argument (a herestring has no body to strip).
+fn emit_herestring(chars: &[(usize, char)], i: usize, out: &mut String) -> usize {
+    let skip = if chars[i].1.is_ascii_digit() { 4 } else { 3 };
+    for c in &chars[i..i + skip] {
+        out.push(c.1);
+    }
+    i + skip
+}
+
+/// Emit command-substitution spans (`$(...)`, backticks) found in an
+/// unquoted heredoc body line, so they remain scanned as nested commands.
+///
+/// Real bash performs command substitution inside heredoc bodies whose
+/// delimiter is unquoted (`cat <<EOF\n$(touch x)\nEOF` runs `touch x`), so
+/// stripping the body entirely would hide the mutation from the guard.
+/// Quoted delimiters (`<<'EOF'`, `<<"EOF"`) make the body literal — no
+/// expansion occurs — so this is only called for unquoted bodies.
+/// Backslash escapes (`\$`, `` \` ``, `\\`) prevent expansion and are
+/// skipped. Returns `true` when at least one span was emitted.
+fn emit_body_substitutions(line: &str, out: &mut String) -> bool {
+    let mut emitted = false;
+    let bytes = line.as_bytes();
+    let mut j = 0;
+    while j < line.len() {
+        let c = line[j..].chars().next().expect("j < line.len()");
+        if c == '\\' {
+            // Backslash escapes the next char in heredoc bodies — the
+            // escaped char is literal, so skip past both.
+            j += c.len_utf8();
+            if j < line.len() {
+                j += line[j..].chars().next().expect("j < line.len()").len_utf8();
+            }
+            continue;
+        }
+        if c == '$' && bytes.get(j + 1) == Some(&b'(') {
+            let (_, next) = find_substitution_end(line, j + 2);
+            out.push_str(&line[j..next]);
+            j = next;
+            emitted = true;
+            continue;
+        }
+        if c == '`' {
+            let (_, next) = find_backtick_end(line, j + 1);
+            out.push_str(&line[j..next]);
+            j = next;
+            emitted = true;
+            continue;
+        }
+        j += c.len_utf8();
+    }
+    emitted
+}
+
 /// Parse a heredoc delimiter token starting at `start` (byte index).
-fn parse_heredoc_delimiter(command: &str, start: usize) -> (String, usize) {
+/// Returns `(delimiter, end_byte, was_quoted)`. `was_quoted` is true when
+/// the delimiter was quoted (`<<'EOF'`, `<<"EOF"`) — bash then treats the
+/// body as literal (no parameter/command/arithmetic expansion).
+fn parse_heredoc_delimiter(command: &str, start: usize) -> (String, usize, bool) {
     let rest = &command[start..];
     if let Some(rest) = rest.strip_prefix('\'') {
         if let Some(end) = rest.find('\'') {
             let delim = &rest[..end];
-            return (delim.to_string(), start + 1 + end + 1);
+            return (delim.to_string(), start + 1 + end + 1, true);
         }
     } else if let Some(rest) = rest.strip_prefix('"')
         && let Some(end) = rest.find('"')
     {
         let delim = &rest[..end];
-        return (delim.to_string(), start + 1 + end + 1);
+        return (delim.to_string(), start + 1 + end + 1, true);
     }
 
     let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-    (rest[..end].to_string(), start + end)
+    (rest[..end].to_string(), start + end, false)
 }
 
 /// Detect output redirect operators in a segment, respecting quote state.
@@ -851,16 +916,27 @@ fn validate_string(s: &str, state: &mut ValidationState) -> Result<(), String> {
     // Heredoc bodies must be removed before ANY scanning: a heredoc body is
     // literal text — never commands, redirects, or substitutions. Bodies are
     // also excluded from the shared segmentation (they never become segments).
+    // Command substitutions inside *unquoted* bodies are emitted by the
+    // stripper so they remain scanned (see [`strip_heredoc_bodies`]).
     let scan = strip_heredoc_bodies(s);
 
-    // Command substitutions (`$(...)`, backticks) are validated as nested
-    // commands so a mutating command hidden inside a substitution cannot
-    // bypass the guard (see the guard contract, phase 1.3).
-    scan_substitutions(&scan, state)?;
-
-    let segments = super::extract_command_segments(&scan);
+    // Segment once on the already-stripped string (no redundant second strip).
+    let segments = super::extract_command_segments_stripped(&scan);
     for segment in &segments {
+        // Output redirects are validated against the state BEFORE this
+        // segment's own `cd`/export bindings: bash expands redirect targets
+        // with the shell's current variables, and an env-prefix assignment
+        // does not affect them.
         has_disallowed_redirect(segment, state)?;
+        // Command substitutions are validated with the state as of this
+        // segment — prior segments' `cd`/export bindings apply. Like
+        // redirects, a substitution does not see its own segment's
+        // env-prefix (it expands before the prefix is applied to the
+        // command), so substitution scanning runs before `check_segment`
+        // applies this segment's bindings. Nested validation snapshots the
+        // state: `cd`/export inside `$(...)` runs in a subshell and must not
+        // leak to the outer command.
+        scan_substitutions(segment, state)?;
         check_segment(segment, state)?;
     }
 
@@ -872,9 +948,14 @@ fn validate_string(s: &str, state: &mut ValidationState) -> Result<(), String> {
 /// Substitution contents are located with quote/escape awareness and run
 /// through the full command validation recursively (heredocs, redirects,
 /// nested substitutions, and mutator checks all apply inside a substitution).
-/// The nested validation runs against a snapshot of the state because a
-/// substitution executes in a subshell: `cd`/export inside `$(...)` does not
-/// affect the outer command.
+///
+/// Called once per segment from [`validate_string`]'s segment loop, so each
+/// substitution is validated with the state at its segment's position —
+/// prior segments' `cd`/export bindings apply (e.g. `export TMPDIR=/etc`
+/// poisons `$TMPDIR` expansions in a later substitution). The nested
+/// validation runs against a snapshot of the state because a substitution
+/// executes in a subshell: `cd`/export inside `$(...)` does not affect the
+/// outer command.
 fn scan_substitutions(s: &str, state: &mut ValidationState) -> Result<(), String> {
     let mut i = 0;
     let mut in_single = false;
@@ -1063,13 +1144,11 @@ const FLAG_CHECKS: &[FlagCheck] = &[
 /// - Combined redirect tokens (operator merged with target, no separate word
 ///   to skip): e.g. `>/dev/null`, `2>/dev/null`, `</dev/null`, `<<`/`<<-` heredocs,
 ///   `<&2`, `<>/tmp/file`, `&>/dev/null`, `&>>file`, `{digit}<<EOF`
-/// - Heredoc operators (`<<`, `<<-`, `{digit}<<`) and their bodies, up to and
-///   including the terminating delimiter. Path arguments on the line AFTER the
-///   terminator are scanned again (the heredoc body ends at the terminator).
 ///
-///   In practice the segments passed here are already heredoc-stripped by
-///   [`strip_heredoc_bodies`], so body skipping is defensive; the reset at the
-///   terminator keeps the semantics correct if that ever changes.
+/// Heredoc markers are classified as self-contained redirects: the segments
+/// passed here are always heredoc-stripped by [`strip_heredoc_bodies`] (the
+/// marker is replaced by a space), so the only `<<` tokens that can appear
+/// are quoted ones (`echo "<<EOF"`), which classify as ordinary words.
 fn non_flag_path_args(segment: &str) -> Vec<String> {
     let words: Vec<&str> = segment.split_whitespace().collect();
     let Some(cmd_idx) = super::find_first_command_word_index(&words) else {
@@ -1078,23 +1157,8 @@ fn non_flag_path_args(segment: &str) -> Vec<String> {
 
     let mut args = Vec::new();
     let mut skip_redirect_target = false;
-    // Delimiters of pending heredoc bodies (FIFO — bodies terminate in the
-    // order the heredocs were declared).
-    let mut heredoc_delims: Vec<String> = Vec::new();
 
     for w in &words[cmd_idx + 1..] {
-        if !heredoc_delims.is_empty() {
-            // In a heredoc body: skip tokens until a line matches the front
-            // delimiter. The line after the terminator remains scanned.
-            if heredoc_delims
-                .first()
-                .is_some_and(|d| w.trim_end_matches('\r') == d.as_str())
-            {
-                heredoc_delims.remove(0);
-            }
-            continue;
-        }
-
         if skip_redirect_target {
             skip_redirect_target = false;
             continue;
@@ -1104,16 +1168,9 @@ fn non_flag_path_args(segment: &str) -> Vec<String> {
             continue;
         }
 
-        match classify_shell_token(w) {
-            TokenKind::Redirect { needs_target } => {
-                skip_redirect_target = needs_target;
-                continue;
-            }
-            TokenKind::Heredoc { delimiter } => {
-                heredoc_delims.push(delimiter);
-                continue;
-            }
-            TokenKind::Regular => {}
+        if let TokenKind::Redirect { needs_target } = classify_shell_token(w) {
+            skip_redirect_target = needs_target;
+            continue;
         }
 
         args.push(w.to_string());
@@ -1144,18 +1201,19 @@ enum TokenKind {
     /// A redirect operator.  When `needs_target`, the caller should skip
     /// the next whitespace-separated word (the redirect target).
     Redirect { needs_target: bool },
-    /// A heredoc start token (e.g. `<<EOF`, `<<-EOF`, `3<<EOF`). Carries the
-    /// parsed delimiter so the caller can skip the body and reset when the
-    /// terminator line is reached.
-    Heredoc { delimiter: String },
 }
 
-/// Classify a whitespace-split token as a shell redirect operator or heredoc.
+/// Classify a whitespace-split token as a shell redirect operator.
 ///
 /// Returns [`TokenKind::Redirect`] with `needs_target` indicating whether
 /// the operator expects a following word (e.g. `>` → needs target, `2>&1` →
-/// self-contained), [`TokenKind::Heredoc`] for heredoc start tokens that
-/// trigger body-skipping, or [`TokenKind::Regular`] for anything else.
+/// self-contained), or [`TokenKind::Regular`] for anything else.
+///
+/// Heredoc markers (`<<EOF`, `<<-EOF`, `3<<EOF`) classify as self-contained
+/// redirects (the marker embeds its delimiter). The read-only guard only
+/// ever sees heredoc-stripped segments — [`strip_heredoc_bodies`] replaces
+/// markers with spaces — so this is defensive; there is no heredoc body to
+/// skip here.
 ///
 /// # Ordering invariants
 ///
@@ -1207,20 +1265,6 @@ fn classify_shell_token(w: &str) -> TokenKind {
         return TokenKind::Redirect { needs_target: true };
     }
 
-    // ── Heredoc detection ─────────────────────────────────────────
-    // Bare heredoc (<<EOF, <<-EOF) or fd-prefixed heredoc (3<<EOF, 1<<-EOF).
-    // `<<<` (herestring) is excluded — it has no body.
-    if (w.starts_with("<<") && !w.starts_with("<<<"))
-        || (w.len() > 2
-            && w.as_bytes()[0].is_ascii_digit()
-            && w.contains("<<")
-            && !w.contains("<<<"))
-    {
-        return TokenKind::Heredoc {
-            delimiter: heredoc_delimiter_of(w),
-        };
-    }
-
     // ── Standalone digit-prefixed redirect ────────────────────────
     // e.g. 2>, 10>, 3< — expects a target word
     if is_digit_suffix_redirect(w, b'>') || is_digit_suffix_redirect(w, b'<') {
@@ -1252,25 +1296,6 @@ fn classify_shell_token(w: &str) -> TokenKind {
     }
 
     TokenKind::Regular
-}
-
-/// Extract the delimiter from a heredoc token like `<<EOF`, `<<-EOF`, or
-/// `3<<EOF` (including quoted delimiters `<<'EOF'`, `<<"EOF"`).
-fn heredoc_delimiter_of(w: &str) -> String {
-    let start = w.find("<<").map_or(0, |i| i + 2);
-    let rest = &w[start..];
-    let rest = rest.strip_prefix('-').unwrap_or(rest);
-    let rest = rest.trim_start();
-    if let Some(quoted) = rest.strip_prefix('\'') {
-        if let Some(end) = quoted.find('\'') {
-            return quoted[..end].to_string();
-        }
-    } else if let Some(quoted) = rest.strip_prefix('"')
-        && let Some(end) = quoted.find('"')
-    {
-        return quoted[..end].to_string();
-    }
-    rest.trim_end().to_string()
 }
 
 /// True when every explicit path argument resolves under an allowed temp root.
@@ -2697,37 +2722,13 @@ mod tests {
             // ── Bash standalone (expects target) ───────────────────
             ("&>", TokenKind::Redirect { needs_target: true }),
             ("&>>", TokenKind::Redirect { needs_target: true }),
-            // ── Heredoc variants ───────────────────────────────────
-            (
-                "<<EOF",
-                TokenKind::Heredoc {
-                    delimiter: "EOF".to_string(),
-                },
-            ),
-            (
-                "<<-EOF",
-                TokenKind::Heredoc {
-                    delimiter: "EOF".to_string(),
-                },
-            ),
-            (
-                "<<'EOF'",
-                TokenKind::Heredoc {
-                    delimiter: "EOF".to_string(),
-                },
-            ),
-            (
-                "3<<EOF",
-                TokenKind::Heredoc {
-                    delimiter: "EOF".to_string(),
-                },
-            ),
-            (
-                "1<<-EOF",
-                TokenKind::Heredoc {
-                    delimiter: "EOF".to_string(),
-                },
-            ),
+            // ── Heredoc variants (self-contained; segments are always
+            //    heredoc-stripped, so this is defensive) ────────────
+            ("<<EOF", NO_TARGET),
+            ("<<-EOF", NO_TARGET),
+            ("<<'EOF'", NO_TARGET),
+            ("3<<EOF", NO_TARGET),
+            ("1<<-EOF", NO_TARGET),
             // ── Herestrings (no body — redirect-like, consumes next word) ─
             ("<<<", TokenKind::Redirect { needs_target: true }),
             ("<<<hi", TokenKind::Redirect { needs_target: true }),
@@ -3242,6 +3243,33 @@ mod tests {
             ("cat <<EOF\nbody\nEOF && touch workspace_file", true),
             // fd-prefixed heredoc body not scanned as command text.
             ("tee /tmp/x 3<< 'EOF'\nbody\nEOF", true),
+            // ── Command substitutions in heredoc bodies ─────────────
+            // Real bash executes `$(...)`/backticks inside UNQUOTED heredoc
+            // bodies, so those spans must remain scanned (reviewer round).
+            ("cat <<EOF\n$(touch workspace_file)\nEOF", false),
+            ("cat <<EOF\n$(echo hi > workspace_file)\nEOF", false),
+            ("cat <<EOF\n`touch workspace_file`\nEOF", false),
+            // Temp-targeted body substitutions stay allowed.
+            ("cat <<EOF\n$(touch /tmp/x)\nEOF", true),
+            ("cat <<EOF\n$(echo hi > /tmp/out)\nEOF", true),
+            // Nested substitution in an unquoted body.
+            ("cat <<EOF\n$(echo $(touch workspace_file))\nEOF", false),
+            // Escaped `\$(` in an unquoted body is literal — allowed.
+            ("cat <<EOF\n\\$(touch workspace_file)\nEOF", true),
+            // Quoted delimiters make the body literal — no expansion.
+            ("cat <<'EOF'\n$(touch workspace_file)\nEOF", true),
+            ("cat <<\"EOF\"\n$(touch workspace_file)\nEOF", true),
+            // Plain mutator-shaped body text (no substitution) stays literal.
+            ("cat <<EOF\ntouch workspace_file\nEOF", true),
+            // Multiple heredocs: a body substitution in the first body is
+            // still scanned.
+            ("cat <<A <<B\n$(touch workspace_file)\nA\nB", false),
+            // Body substitution followed by a workspace write after the
+            // terminator — both caught.
+            ("cat <<EOF\n$(echo hi)\nEOF\ntouch workspace_file", false),
+            // Body substitution under a temp cd — allowed (state at the
+            // heredoc's position in the chain applies).
+            ("cd /tmp && cat <<EOF\n$(touch rel)\nEOF", true),
         ];
 
         run_cases(&cases);
@@ -3290,6 +3318,65 @@ mod tests {
             // Substitution that writes to workspace via a temp-qualified var is
             // rejected because the relative target resolves to the workspace.
             ("echo $(tee /tmp/ok > ws_out)", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    // ── Phase 1.3×2 integration: substitution × cd/export state ──────────
+
+    /// Substitutions must be validated with the state at their segment's
+    /// position — prior segments' `cd`/export bindings apply (reviewer round:
+    /// the upfront whole-string scan validated every substitution against the
+    /// initial state, leaving the poisoned-export bypass open and rejecting
+    /// legit temp writes after a `cd`).
+    #[test]
+    fn substitution_state_acceptance() {
+        let cases = [
+            // Export-poisoning bypass: `export TMPDIR=/etc` in a prior segment
+            // must poison expansions inside a later substitution (phase 1.3
+            // "verifiably closed" + decision 5).
+            ("export TMPDIR=/etc\necho $(touch $TMPDIR/x)", false),
+            ("export TMPDIR=/etc\ncat $(echo hi > $TMPDIR/out)", false),
+            // Same via the workspace-root spelling.
+            (
+                "export TMPDIR=/__mahbot_readonly_test_ws__\necho $(echo hi > $TMPDIR/out)",
+                false,
+            ),
+            // Env-prefix binding in a prior segment poisons a later
+            // substitution (decision 5's env-prefix form).
+            ("TMPDIR=/etc true\necho $(touch $TMPDIR/x)", false),
+            // Poison cleared by a temp-root rebind before the substitution.
+            (
+                "export TMPDIR=/etc\nexport TMPDIR=/tmp\necho $(touch $TMPDIR/x)",
+                true,
+            ),
+            // cd to temp + relative write inside a substitution — allowed
+            // (false-positive fix: the upfront scan rejected this against the
+            // workspace-root CWD).
+            ("cd /tmp && echo $(touch rel)", true),
+            ("cd /tmp && echo $(echo hi > out.txt)", true),
+            // cd to a non-temp dir + relative write inside a substitution —
+            // blocked.
+            ("cd /etc && echo $(touch rel)", false),
+            // Substitution-internal `;` must not fragment the substitution:
+            // a `cd` inside the subshell applies to the rest of the
+            // substitution content.
+            ("echo $(cd /tmp; touch rel)", true),
+            ("echo $(cd /etc; touch rel)", false),
+            // Export inside a substitution poisons only the substitution's
+            // own environment (snapshot semantics), not the outer command.
+            ("echo $(export TMPDIR=/etc; touch $TMPDIR/x)", false),
+            (
+                "echo $(export TMPDIR=/etc; echo hi)\ntouch $TMPDIR/outer",
+                true,
+            ),
+            // Mutator inside a substitution after a temp cd stays blocked
+            // when it targets the workspace (relative to the subshell CWD).
+            ("cd /tmp && echo $(touch ws_file)", true),
+            // A workspace write AFTER a substitution is still caught.
+            ("cd /tmp && echo $(touch rel) && touch ws_file", true),
+            ("echo $(echo hi) && touch ws_file", false),
         ];
 
         run_cases(&cases);

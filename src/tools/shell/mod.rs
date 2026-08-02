@@ -856,17 +856,32 @@ const fn track_char_context(
 /// Respects single and double quotes, treats newlines as command separators
 /// (with backslash-newline line continuation), and removes heredoc bodies
 /// before splitting so body text is never treated as command text.
+///
+/// Command substitutions (`$(...)`, backticks) are kept whole: separators
+/// inside a substitution body are part of the substitution, not command
+/// separators. Splitting inside a substitution would fragment it across
+/// segments, breaking the read-only guard's per-segment substitution
+/// validation (the fragments would be scanned as ordinary commands with
+/// the outer state, losing the subshell snapshot semantics).
 fn extract_command_segments(command: &str) -> Vec<String> {
     // Heredoc bodies are excluded from command scanning (see decision 10 of
     // the read-only shell guard contract): body text must never be segmented
     // as commands, and redirect operators inside bodies must not be scanned.
     let scan = readonly::strip_heredoc_bodies(command);
+    extract_command_segments_stripped(&scan)
+}
 
+/// Core segmentation on an already-heredoc-stripped string.
+///
+/// Kept separate from [`extract_command_segments`] so the read-only guard can
+/// strip heredoc bodies once and segment the result without a redundant second
+/// strip pass over the same text.
+fn extract_command_segments_stripped(stripped: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
     let mut in_double = false;
-    let mut chars = scan.chars().peekable();
+    let mut chars = stripped.chars().peekable();
 
     let mut flush = |current: &mut String| {
         if !current.trim().is_empty() {
@@ -907,6 +922,53 @@ fn extract_command_segments(command: &str) -> Vec<String> {
         }
 
         if check_outside_quotes(c, &mut in_single, &mut in_double) {
+            // ── Command substitution `$(...)` — keep the whole body in the
+            // current segment. Separators inside it (`;`, `&&`, newline) are
+            // part of the substitution, not command separators; splitting
+            // there would fragment the body across segments and lose the
+            // subshell state when the read-only guard validates each
+            // substitution as a nested command.
+            if c == '$' && chars.peek() == Some(&'(') {
+                current.push(c);
+                current.push(chars.next().expect("peeked '('"));
+                let mut depth = 1usize;
+                let mut sub_single = false;
+                let mut sub_double = false;
+                let mut sub_escaped = false;
+                while let Some(c2) = chars.next() {
+                    current.push(c2);
+                    if !track_char_context(c2, &mut sub_single, &mut sub_double, &mut sub_escaped) {
+                        continue;
+                    }
+                    if c2 == '$' && chars.peek() == Some(&'(') {
+                        depth += 1;
+                        continue;
+                    }
+                    if c2 == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            // ── Backtick command substitution — same treatment ──────
+            if c == '`' {
+                current.push(c);
+                let mut sub_escaped = false;
+                for c2 in chars.by_ref() {
+                    current.push(c2);
+                    if sub_escaped {
+                        sub_escaped = false;
+                    } else if c2 == '\\' {
+                        sub_escaped = true;
+                    } else if c2 == '`' {
+                        break;
+                    }
+                }
+                continue;
+            }
             match c {
                 '&' if chars.peek() == Some(&'&') => {
                     chars.next(); // consume second &
@@ -2138,6 +2200,19 @@ mod tests {
                 eq: Some("test result: ok. 1 passed; 0 failed"),
                 ..Default::default()
             },
+            // Decision-10 regression: a heredoc whose UNQUOTED body contains a
+            // command substitution emits that substitution as its own segment
+            // (it must remain scanned — bash executes `$()` in unquoted
+            // bodies), so the command becomes chained and standalone-only
+            // profiles (the cargo test state machine) are skipped.
+            ShellOutputCase {
+                name: "heredoc with substitution body becomes chained",
+                command: "cargo test --lib <<EOF\n$(echo hi)\nEOF",
+                stdout: "Compiling foo v1.0.0\ntest test1 ... ok\ntest result: ok. 1 passed; 0 failed\n",
+                contains: &["Compiling foo", "test1 ... ok", "test result:"],
+                not_contains: &["[cargo test: ok]"],
+                ..Default::default()
+            },
             // ── npx-wrapped tools (profile selection) ─────────────────
             ShellOutputCase {
                 name: "npx eslint selects eslint profile",
@@ -2968,6 +3043,25 @@ mod tests {
             ("cat <<< hi > /tmp/out", &["cat <<< hi > /tmp/out"]),
             // `>|` compound redirect is not split at the pipe.
             ("echo hi >| /tmp/force", &["echo hi >| /tmp/force"]),
+            // ── Command substitutions stay whole ────────────────────
+            // Separators inside `$(...)` are part of the substitution, not
+            // command separators (splitting would fragment the body across
+            // segments and break per-segment substitution validation).
+            ("echo $(echo hi; touch x)", &["echo $(echo hi; touch x)"]),
+            ("echo $(echo hi) ; touch x", &["echo $(echo hi)", "touch x"]),
+            ("echo `echo hi; touch x`", &["echo `echo hi; touch x`"]),
+            (
+                "cd /tmp && echo $(echo a && echo b)",
+                &["cd /tmp", "echo $(echo a && echo b)"],
+            ),
+            // Nested substitution stays inside the outer one.
+            ("echo $(echo $(ls; pwd))", &["echo $(echo $(ls; pwd))"]),
+            // Substitution with newline inside stays whole.
+            ("echo $(echo hi\necho bye)", &["echo $(echo hi\necho bye)"]),
+            // Heredoc body with a substitution: the body substitution is
+            // emitted as its own segment (it must remain scanned — bash
+            // executes `$()` inside unquoted heredoc bodies).
+            ("cat <<EOF\n$(touch ws)\nEOF", &["cat", "$(touch ws)"]),
         ];
         for (input, expected) in cases {
             let result = extract_command_segments(input);
