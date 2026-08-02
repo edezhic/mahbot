@@ -3062,6 +3062,22 @@ mod tests {
             // emitted as its own segment (it must remain scanned — bash
             // executes `$()` inside unquoted heredoc bodies).
             ("cat <<EOF\n$(touch ws)\nEOF", &["cat", "$(touch ws)"]),
+            // Double-quoted substitutions stay whole too: a `;` inside
+            // `"$(...)"` is part of the substitution, not a separator, and
+            // bash executes the body, so segmentation must not fragment it
+            // (QA round: double-quoted substitution bypass fix).
+            (
+                "echo \"$(echo hi; touch x)\"",
+                &["echo \"$(echo hi; touch x)\""],
+            ),
+            (
+                "echo \"$(echo hi)\" ; touch x",
+                &["echo \"$(echo hi)\"", "touch x"],
+            ),
+            (
+                "echo \"`echo hi; touch x`\"",
+                &["echo \"`echo hi; touch x`\""],
+            ),
         ];
         for (input, expected) in cases {
             let result = extract_command_segments(input);

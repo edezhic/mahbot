@@ -207,9 +207,10 @@ fn is_herestring_start(chars: &[(usize, char)], i: usize) -> bool {
 }
 
 /// True when the line starting at `line_start` is the heredoc terminator line
-/// for `delimiter`. For `<<-` heredocs, leading TABs are stripped before
-/// matching (bash semantics); for regular heredocs no leading whitespace is
-/// allowed. The delimiter must be followed by end-of-input, CR, or LF.
+/// for `delimiter`. For `<<-` heredocs, ALL leading TABs are stripped before
+/// matching (bash strips every leading tab, not just one); for regular
+/// heredocs no leading whitespace is allowed. The delimiter must be followed
+/// by end-of-input, CR, or LF.
 fn heredoc_terminator_matches(
     command: &str,
     line_start: usize,
@@ -218,7 +219,7 @@ fn heredoc_terminator_matches(
 ) -> bool {
     let rest = &command[line_start..];
     let candidate = if strip_tabs {
-        rest.strip_prefix('\t').unwrap_or(rest)
+        rest.trim_start_matches('\t')
     } else {
         rest
     };
@@ -293,10 +294,17 @@ pub(super) fn strip_heredoc_bodies(command: &str) -> String {
                 // Advance to the terminator's line ending so the newline is
                 // emitted as a command separator and the line AFTER the
                 // terminator remains scanned (a write command on the next
-                // line must not escape scanning).
+                // line must not escape scanning). The terminator may be
+                // preceded by any number of tabs under `<<-` and its
+                // delimiter may contain shell metacharacters (quoted
+                // delimiters), so skip to the line end rather than assuming
+                // the delimiter starts at `line_start`.
+                let line_end = command[line_start..]
+                    .find('\n')
+                    .map_or(command.len(), |off| line_start + off);
                 i = chars
                     .iter()
-                    .position(|(byte, _)| *byte > line_start + queue[0].0.len() - 1)
+                    .position(|(byte, _)| *byte >= line_end)
                     .unwrap_or(chars.len());
                 queue.remove(0);
                 if queue.is_empty() {
@@ -516,7 +524,10 @@ fn parse_heredoc_delimiter(command: &str, start: usize) -> (String, usize, bool)
 /// skipped here — their contents are validated separately by
 /// [`scan_substitutions`], and re-scanning them would double-validate
 /// (e.g. a `2>/dev/null` inside a substitution would be misread with the
-/// substitution's closing delimiter attached to the target).
+/// substitution's closing delimiter attached to the target). Substitution
+/// starts are recognized even inside double quotes: bash executes
+/// `"$(touch f)"`, so a write hidden in a double-quoted substitution must
+/// still be skipped here and validated by [`scan_substitutions`].
 fn has_disallowed_redirect(segment: &str, state: &ValidationState) -> Result<(), String> {
     let mut in_single = false;
     let mut in_double = false;
@@ -526,25 +537,27 @@ fn has_disallowed_redirect(segment: &str, state: &ValidationState) -> Result<(),
     let mut i = 0;
     while i < segment.len() {
         let c = segment[i..].chars().next().expect("i < len");
+        // Command substitutions run inside double quotes too (`"$(...)"`,
+        // `` "`...`" ``), so detect their starts before the quote-state skip
+        // below. Inside single quotes `$(`/backticks are literal; a preceding
+        // escape backslash makes them literal too.
+        if !escaped && !in_single && (c == '$' && bytes.get(i + 1) == Some(&b'(') || c == '`') {
+            let next = if c == '$' {
+                let (_, next) = find_substitution_end(segment, i + 2);
+                next
+            } else {
+                let (_, next) = find_backtick_end(segment, i + 1);
+                next
+            };
+            i = next;
+            continue;
+        }
         // [`super::track_char_context`] handles both backslash escaping
         // and quote state transitions, returning `false` when the
         // character should be skipped for redirect detection (escaped,
         // backslash, quote char, or inside quotes).
         if !super::track_char_context(c, &mut in_single, &mut in_double, &mut escaped) {
             i += c.len_utf8();
-            continue;
-        }
-
-        // Skip command substitution contents (validated separately by
-        // [`scan_substitutions`]).
-        if c == '$' && bytes.get(i + 1) == Some(&b'(') {
-            let (_, next) = find_substitution_end(segment, i + 2);
-            i = next;
-            continue;
-        }
-        if c == '`' {
-            let (_, next) = find_backtick_end(segment, i + 1);
-            i = next;
             continue;
         }
 
@@ -948,6 +961,10 @@ fn validate_string(s: &str, state: &mut ValidationState) -> Result<(), String> {
 /// Substitution contents are located with quote/escape awareness and run
 /// through the full command validation recursively (heredocs, redirects,
 /// nested substitutions, and mutator checks all apply inside a substitution).
+/// Substitution starts are recognized even inside double quotes: bash executes
+/// `"$(touch f)"` and `` "`touch f`" ``, so a write hidden in a double-quoted
+/// substitution must be found here. Inside single quotes (and after an escape
+/// backslash) `$(`/backticks are literal and are not substitutions.
 ///
 /// Called once per segment from [`validate_string`]'s segment loop, so each
 /// substitution is validated with the state at its segment's position —
@@ -963,20 +980,26 @@ fn scan_substitutions(s: &str, state: &mut ValidationState) -> Result<(), String
     let mut escaped = false;
     while i < s.len() {
         let c = s[i..].chars().next().expect("i < s.len()");
+        // Detect substitution starts before the quote-state skip: they run
+        // inside double quotes (`"$(...)"`, `` "`...`" ``) but are literal
+        // inside single quotes or after an escape backslash.
+        if !escaped
+            && !in_single
+            && (c == '$' && s.as_bytes().get(i + 1) == Some(&b'(') || c == '`')
+        {
+            if c == '$' {
+                let (inner, next) = find_substitution_end(s, i + 2);
+                validate_substitution_content(inner, state)?;
+                i = next;
+            } else {
+                let (inner, next) = find_backtick_end(s, i + 1);
+                validate_substitution_content(inner, state)?;
+                i = next;
+            }
+            continue;
+        }
         if !super::track_char_context(c, &mut in_single, &mut in_double, &mut escaped) {
             i += c.len_utf8();
-            continue;
-        }
-        if c == '$' && s.as_bytes().get(i + 1) == Some(&b'(') {
-            let (inner, next) = find_substitution_end(s, i + 2);
-            validate_substitution_content(inner, state)?;
-            i = next;
-            continue;
-        }
-        if c == '`' {
-            let (inner, next) = find_backtick_end(s, i + 1);
-            validate_substitution_content(inner, state)?;
-            i = next;
             continue;
         }
         i += c.len_utf8();
@@ -1625,9 +1648,14 @@ fn has_force_token(command: &str) -> bool {
 /// clean/push forms.
 fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Result<(), String>> {
     // git stash: `list` and `show` are read-only inspection; everything else
-    // (push, pop, apply, drop, ...) modifies the working tree.
+    // (push, pop, apply, drop, ...) modifies the working tree. Matching is
+    // exact at the stash subcommand word — a mutation like
+    // `git stash push -m "stash show"` stays blocked even though its message
+    // contains a read-form word.
     if subcommand.starts_with("stash") {
-        if subcommand.contains("stash list") || subcommand.contains("stash show") {
+        let words: Vec<&str> = subcommand.split_whitespace().collect();
+        let stash_cmd = words.get(1).copied().unwrap_or("");
+        if matches!(stash_cmd, "show" | "list") {
             return Some(Ok(()));
         }
         return Some(reject(
@@ -3227,6 +3255,14 @@ mod tests {
             ),
             // <<- with tab-indented terminator.
             ("cat <<-EOF\n\tbody\n\tEOF", true),
+            // <<- strips ALL leading tabs (bash semantics): a 2+-tab-indented
+            // terminator still terminates, so a write on the line after it
+            // must be scanned (QA round: the matcher stripped only one tab,
+            // swallowing the write as body text).
+            ("cat <<-EOF\n\tbody\n\t\tEOF", true),
+            ("cat <<-EOF\n\tbody\n\t\tEOF\ntouch workspace_file", false),
+            ("cat <<-EOF\n\tbody\n\t\t\tEOF\ntouch workspace_file", false),
+            ("cat <<-EOF\n\tbody\n\t\tEOF\ntouch /tmp/scratch_file", true),
             // CRLF line endings: write after terminator still blocked.
             ("cat <<EOF\r\nbody\r\nEOF\r\ntouch workspace_file", false),
             ("cat <<EOF\r\nbody\r\nEOF", true),
@@ -3237,6 +3273,15 @@ mod tests {
             // Heredoc with workspace write after, chained with && on the
             // line after the terminator.
             ("cat <<EOF\nbody\nEOF\n&& touch workspace_file", false),
+            // Double-quoted `$()` in an unquoted heredoc body still expands
+            // in bash (quote chars are literal in heredoc bodies) — blocked.
+            ("cat <<EOF\n\"$(touch workspace_file)\"\nEOF", false),
+            // Multi-tab <<- terminator with a substitution body and a write
+            // after the terminator — all caught.
+            (
+                "cat <<-EOF\n\t$(touch workspace_file)\n\t\tEOF\ntouch /tmp/ok",
+                false,
+            ),
             // A command on the terminator line itself is NOT a terminator in
             // bash (unterminated heredoc — nothing executes), so it must not
             // be treated as a command.
@@ -3318,6 +3363,68 @@ mod tests {
             // Substitution that writes to workspace via a temp-qualified var is
             // rejected because the relative target resolves to the workspace.
             ("echo $(tee /tmp/ok > ws_out)", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    // ── Phase 1.3 acceptance: double-quoted substitutions ────────────────
+
+    /// bash executes `$(...)`/backticks inside double quotes
+    /// (`echo "$(touch f)"` runs `touch f`), so writes hidden in
+    /// double-quoted substitutions must be rejected (QA round: the guard
+    /// previously skipped all double-quoted content, leaving this spelling
+    /// of the phase-1.3 bypass open). Literal quoted text (no substitution)
+    /// and escaped/single-quoted `$(` stay allowed.
+    #[test]
+    fn double_quoted_substitution_acceptance() {
+        let cases = [
+            // Flat double-quoted substitution with a workspace write — blocked.
+            ("echo \"$(touch workspace_file)\"", false),
+            ("echo \"$(echo hi > workspace_file)\"", false),
+            ("echo \"`touch workspace_file`\"", false),
+            ("echo \"$(rm -f workspace_file)\"", false),
+            ("echo \"$(rm -f /tmp/scratch_file)\"", true),
+            // Nested double-quoted substitution — blocked at the inner level.
+            ("echo \"$(echo $(touch nested))\"", false),
+            ("echo \"$(echo hi > $(echo workspace_file))\"", false),
+            // Temp-targeted double-quoted substitution — allowed.
+            ("echo \"$(echo hi > /tmp/out)\"", true),
+            ("echo \"$(touch /tmp/scratch)\"", true),
+            // Plain double-quoted substitution (pure read) — allowed.
+            ("echo \"$(echo hi)\"", true),
+            ("echo \"$(ls 2>&1)\"", true),
+            // Literal double-quoted text with a `>` — not a redirect.
+            ("echo \"a > b\"", true),
+            // Outside-quote redirect after a double-quoted substitution.
+            ("echo \"$(echo hi)\" > /tmp/out", true),
+            ("echo \"$(echo hi)\" > workspace_file", false),
+            // Escaped `\$(` inside double quotes is literal — allowed.
+            ("echo \"abc\\$(touch workspace_file)\"", true),
+            // Escaped backtick inside double quotes is literal — allowed.
+            ("echo \"abc\\`touch workspace_file\\`\"", true),
+            // Single-quoted `$(` is literal — allowed.
+            ("echo '$(touch workspace_file)'", true),
+            // Backtick substitution spanning a quote-aware body.
+            ("echo \"`echo hi; echo hi2`\"", true),
+            // Double-quoted substitution with an internal cd — state applies.
+            ("echo \"$(cd /tmp; touch rel)\"", true),
+            ("echo \"$(cd /etc; touch rel)\"", false),
+            // Poisoned export in a prior segment applies to a double-quoted
+            // substitution (decision 5 + phase 1.3 integration).
+            ("export TMPDIR=/etc\necho \"$(touch $TMPDIR/x)\"", false),
+            (
+                "export TMPDIR=/__mahbot_readonly_test_ws__\necho \"$(echo hi > $TMPDIR/out)\"",
+                false,
+            ),
+            (
+                "export TMPDIR=/etc\nexport TMPDIR=/tmp\necho \"$(touch $TMPDIR/x)\"",
+                true,
+            ),
+            // Herestring content expands substitutions — a write in a
+            // double-quoted herestring word must be caught.
+            ("cat <<< \"$(touch workspace_file)\"", false),
+            ("cat <<< \"$(echo hi)\"", true),
         ];
 
         run_cases(&cases);
@@ -3612,6 +3719,14 @@ mod tests {
             ("git stash drop", false),
             ("git stash push", false),
             ("git stash", false),
+            // Exact stash subcommand matching: a mutation whose message
+            // contains a read-form word must stay blocked (QA round: the
+            // substring check allowed `git stash push -m "stash show"`).
+            ("git stash push -m \"stash show\"", false),
+            ("git stash push -m \"stash list\"", false),
+            ("git stash store 0123abcd \"stash show\"", false),
+            ("git stash show --stat stash@{0}", true),
+            ("git stash list --oneline", true),
             ("git submodule foreach", false),
             ("git submodule update", false),
             ("git submodule add https://example.com/repo.git", false),
