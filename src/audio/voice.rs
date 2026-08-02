@@ -120,11 +120,11 @@ const EMBEDDING_WINDOW_FRAMES: usize = 76;
 /// sweeps the start-aligned positions 0/8/16/24 in one synchronous burst with
 /// the trained start-0-aligned padded geometry.
 ///
-/// Measured basis (mahbot-1022 B-sweep): the decisive (B=68, position 24)
-/// cell confirms at classifier 0.9981 / ring-4 verifier 0.9393 (44 real
-/// frames).  B≤60 is verifier-doomed (≤0.5401), B=65 has zero margin, and
-/// scoring position 0 below 68 frames resets the rolling window before
-/// positions 8/16/24 can fire.
+/// Measured basis (mahbot-1022 deferred-burst sweep): the decisive
+/// (B=68, position 24) cell confirms at classifier 0.9981 / ring-4 verifier
+/// 0.9393 (44 real frames).  B≤60 is verifier-doomed (≤0.5401), B=65 has
+/// zero margin, and scoring position 0 below 68 frames resets the rolling
+/// window before positions 8/16/24 can fire.
 ///
 /// Confirmation-slack note (measured, mahbot-1023 runs 5–7): the ticket's
 /// original design constraint assumed the sweep must confirm before a later
@@ -496,17 +496,13 @@ pub(crate) struct AugmentedPcmVariant {
 ///
 /// # Push order
 ///
-/// When `speed_up_last` is false the variants are returned in canonical order
-/// 0,1,2,3,4 (speed-up 3rd) — the push order used by every site except the
-/// B-sweep training path.  When true, speed-up is chained LAST (0,1,3,4,2) —
-/// `bsweep_training_path_scores` uses this so its produced-variant counts
-/// and verifier training order match the recorded baseline.  The returned
-/// `variant_index` is unaffected by the push order.
+/// Variants are returned in canonical order 0,1,2,3,4 (speed-up 3rd) — the
+/// push order every call site uses.  The returned `variant_index` is
+/// unaffected by the push order.
 pub(crate) fn augment_pcm_variants(
     input: &[f32],
     sample_rate: u32,
     noise_seed: u64,
-    speed_up_last: bool,
 ) -> Vec<AugmentedPcmVariant> {
     let speed_down = crate::util::speed_perturbation(input, sample_rate, 0.95);
     let pre_pad_samples = input.len().saturating_sub(2 * CONTEXT_PADDING_SAMPLES);
@@ -528,62 +524,41 @@ pub(crate) fn augment_pcm_variants(
         variant_index: 1,
         pcm: speed_down,
     });
-    if speed_up_last {
+    if let Some(sp) = speed_up {
         variants.push(AugmentedPcmVariant {
-            variant_index: 3,
-            pcm: volume_down,
-        });
-        variants.push(AugmentedPcmVariant {
-            variant_index: 4,
-            pcm: noise,
-        });
-        if let Some(sp) = speed_up {
-            variants.push(AugmentedPcmVariant {
-                variant_index: 2,
-                pcm: sp,
-            });
-        }
-    } else {
-        if let Some(sp) = speed_up {
-            variants.push(AugmentedPcmVariant {
-                variant_index: 2,
-                pcm: sp,
-            });
-        }
-        variants.push(AugmentedPcmVariant {
-            variant_index: 3,
-            pcm: volume_down,
-        });
-        variants.push(AugmentedPcmVariant {
-            variant_index: 4,
-            pcm: noise,
+            variant_index: 2,
+            pcm: sp,
         });
     }
+    variants.push(AugmentedPcmVariant {
+        variant_index: 3,
+        pcm: volume_down,
+    });
+    variants.push(AugmentedPcmVariant {
+        variant_index: 4,
+        pcm: noise,
+    });
     variants
 }
 
 #[cfg(test)]
 mod augment_tests {
     //! mahbot-1045 A1: fixture tests locking the shared 5-variant PCM
-    //! augmentation helper to the semantics of the 5 pre-dedup inline sites
+    //! augmentation helper to the semantics of the 4 pre-dedup inline sites
     //! (`pcm_augment_enrollment_variants`, `vad_segment_and_enroll`,
-    //! `bsweep_training_path_scores`, `prewarm_phrase_embeddings`,
-    //! `handle_enrollment_sample`).  Pure arithmetic — no models, no I/O.
+    //! `prewarm_phrase_embeddings`, `handle_enrollment_sample`).  Pure
+    //! arithmetic — no models, no I/O.  The former B-sweep training-path
+    //! site was removed in the bench-leanness cleanup (its speed-up-LAST
+    //! ordering coverage is gone with it — report-only).
 
     use super::*;
 
     /// Reference implementation of the pre-dedup inline augmentation,
-    /// transcribed verbatim from the 5 call sites at HEAD 0d1a074 (mahbot-1045
+    /// transcribed verbatim from the 4 call sites at HEAD 0d1a074 (mahbot-1045
     /// A1).  All sites shared the identical formula — same speed-up gate
-    /// (`pre_pad_ms >= 500`), same variant order with the B-sweep training
-    /// path chaining speed-up LAST — differing only in sample-rate constant
-    /// (numerically equal), gate input, and noise seed.
-    fn inline_augment(
-        input: &[f32],
-        sample_rate: u32,
-        noise_seed: u64,
-        speed_up_last: bool,
-    ) -> Vec<(usize, Vec<f32>)> {
+    /// (`pre_pad_ms >= 500`), same variant order — differing only in
+    /// sample-rate constant (numerically equal), gate input, and noise seed.
+    fn inline_augment(input: &[f32], sample_rate: u32, noise_seed: u64) -> Vec<(usize, Vec<f32>)> {
         let speed_down = crate::util::speed_perturbation(input, sample_rate, 0.95);
         let pre_pad_samples = input.len().saturating_sub(2 * CONTEXT_PADDING_SAMPLES);
         let pre_pad_ms = (pre_pad_samples as u64 * 1000) / u64::from(sample_rate);
@@ -598,19 +573,11 @@ mod augment_tests {
         let mut out = Vec::with_capacity(5);
         out.push((0, input.to_vec()));
         out.push((1, speed_down));
-        if speed_up_last {
-            out.push((3, volume_down));
-            out.push((4, noise));
-            if let Some(sp) = speed_up {
-                out.push((2, sp));
-            }
-        } else {
-            if let Some(sp) = speed_up {
-                out.push((2, sp));
-            }
-            out.push((3, volume_down));
-            out.push((4, noise));
+        if let Some(sp) = speed_up {
+            out.push((2, sp));
         }
+        out.push((3, volume_down));
+        out.push((4, noise));
         out
     }
 
@@ -644,18 +611,17 @@ mod augment_tests {
     /// Per-site fixture configurations.  `len` is the gate-input length in
     /// samples (16000 = 1.0 s: pre-pad 800 ms → speed-up present; 4000 =
     /// 250 ms: pre-pad 50 ms → speed-up skipped).
-    const SITES: [(&str, u64, bool); 5] = [
-        // (site, noise seed source, speed_up_last)
-        ("pcm_augment_enrollment_variants", 3, false), // seed = loop index
-        ("vad_segment_and_enroll", 2, false),          // seed = utterance index
-        ("bsweep_training_path_scores", 0, true),      // seed = utterance_idx = 0, speed-up LAST
-        ("prewarm_phrase_embeddings", 7, false),       // seed = TTS phrase seed
-        ("handle_enrollment_sample", 5, false),        // seed = enrolled_utterance_count
+    const SITES: [(&str, u64); 4] = [
+        // (site, noise seed source)
+        ("pcm_augment_enrollment_variants", 3), // seed = loop index
+        ("vad_segment_and_enroll", 2),          // seed = utterance index
+        ("prewarm_phrase_embeddings", 7),       // seed = TTS phrase seed
+        ("handle_enrollment_sample", 5),        // seed = enrolled_utterance_count
     ];
 
-    fn run_site(len: usize, seed: u64, speed_up_last: bool) -> Vec<(usize, Vec<f32>)> {
+    fn run_site(len: usize, seed: u64) -> Vec<(usize, Vec<f32>)> {
         let input = fixed_pcm(len);
-        augment_pcm_variants(&input, SAMPLE_RATE, seed, speed_up_last)
+        augment_pcm_variants(&input, SAMPLE_RATE, seed)
             .into_iter()
             .map(|v| (v.variant_index, v.pcm))
             .collect()
@@ -663,11 +629,11 @@ mod augment_tests {
 
     #[test]
     fn helper_matches_pre_dedup_inline_semantics() {
-        for &(site, seed, speed_up_last) in &SITES {
+        for &(site, seed) in &SITES {
             for len in [16000usize, 4000usize] {
                 let input = fixed_pcm(len);
-                let expected = inline_augment(&input, SAMPLE_RATE, seed, speed_up_last);
-                let actual = run_site(len, seed, speed_up_last);
+                let expected = inline_augment(&input, SAMPLE_RATE, seed);
+                let actual = run_site(len, seed);
                 assert_eq!(
                     expected, actual,
                     "site {site} (len {len}): helper diverged from pre-dedup inline semantics"
@@ -689,19 +655,17 @@ mod augment_tests {
     /// `pcm_augment_enrollment_variants` output in the voice-tests module).
     /// Any change to the helper's arithmetic, gate, or push order breaks
     /// these — protecting the byte-stable report surfaces.
-    const GOLDEN_LONG: [&str; 5] = [
-        // (site, seed, speed_up_last=false unless noted) — len 16000
+    const GOLDEN_LONG: [&str; 4] = [
+        // (site, seed) — len 16000
         "51ea4567dbab1cbf5303beb19e0221264b53d6804f16c7f490451da67be10437", // pcm_augment_enrollment_variants
         "84e296d09e5061505500cafc5e432456ef33afceda952442913c43d47d8f3682", // vad_segment_and_enroll
-        "6a74756deb45ea25232c43f66a2bb34d68a18f1029d217f3f4a5a648b3d1cbf8", // bsweep_training_path_scores (speed-up LAST)
         "e6dfdcf2ceb254ff96ac77693c8e597820bd149185b2b692bf20436ebe338aa8", // prewarm_phrase_embeddings
         "5387f8afe5fdbd923e884e4e17941560bcc299b3fa1b3f99ee6560edd0467ca8", // handle_enrollment_sample
     ];
-    const GOLDEN_SHORT: [&str; 5] = [
+    const GOLDEN_SHORT: [&str; 4] = [
         // len 4000 (speed-up skipped)
         "4a82e959bf332c0d0166e77aefb983b059a9e0b57ddca8c2882ad9bca566903a", // pcm_augment_enrollment_variants
         "10f5278d1e25375c0b7531e949b08ebdc0b6dd068f9c948b9e45a47838d77758", // vad_segment_and_enroll
-        "d638e526c308bbe5fcbc641db6dbae8f66ce370f1738f3426329f0f51d028396", // bsweep_training_path_scores (speed-up LAST)
         "7b6d27fc60589fa2e400d1f8721ed8962ef3acc87223c0726d271aba8464e798", // prewarm_phrase_embeddings
         "deca375b26a0d02b62caf34deb18d4b7aafe50102ac027c3ffc667258b808da3", // handle_enrollment_sample
     ];
@@ -710,14 +674,14 @@ mod augment_tests {
     fn helper_hash_stability() {
         // Printed once to capture the goldens (see GOLDEN_LONG/SHORT).
         let mut collected = Vec::new();
-        for (i, &(site, seed, speed_up_last)) in SITES.iter().enumerate() {
-            let long = variant_list_hash(&run_site(16000, seed, speed_up_last));
-            let short = variant_list_hash(&run_site(4000, seed, speed_up_last));
+        for (i, &(site, seed)) in SITES.iter().enumerate() {
+            let long = variant_list_hash(&run_site(16000, seed));
+            let short = variant_list_hash(&run_site(4000, seed));
             println!("GOLDEN site {i} ({site}): long={long} short={short}");
             collected.push((long, short));
         }
         for (i, (long, short)) in collected.iter().enumerate() {
-            let (site, _, _) = SITES[i];
+            let (site, _) = SITES[i];
             assert_eq!(*long, GOLDEN_LONG[i], "site {site} long-input hash drifted");
             assert_eq!(
                 *short, GOLDEN_SHORT[i],
@@ -1338,7 +1302,7 @@ async fn prewarm_phrase_embeddings(
                 // TTS phrase seed, gate input = VAD-gated speech, canonical
                 // push order (speed-up 3rd).  Variant 0 (original) is pushed
                 // above from the streaming mel frames.
-                for variant in augment_pcm_variants(&speech_audio, SAMPLE_RATE, seed, false) {
+                for variant in augment_pcm_variants(&speech_audio, SAMPLE_RATE, seed) {
                     if variant.variant_index == 0 {
                         continue; // original already pushed above
                     }
@@ -7469,12 +7433,12 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     };
 
     // Generate variants — all deterministic, no RNG dependency except the
-    // seeded noise generator.  With speed_up_last=false the helper yields
-    // the canonical push order 0,1,2?,3,4 — variant 2 (speed-up) is absent
-    // when the pre-pad duration gate fails, so the remaining length tells
-    // us whether the next element is variant 2 or 3.
+    // seeded noise generator.  The helper yields the canonical push order
+    // 0,1,2?,3,4 — variant 2 (speed-up) is absent when the pre-pad duration
+    // gate fails, so the remaining length tells us whether the next element
+    // is variant 2 or 3.
     let original = samples.clone();
-    let mut augmented = augment_pcm_variants(&samples, SAMPLE_RATE, noise_seed, false).into_iter();
+    let mut augmented = augment_pcm_variants(&samples, SAMPLE_RATE, noise_seed).into_iter();
     let _original = augmented
         .next()
         .expect("augment_pcm_variants always yields variant 0 (original)");
