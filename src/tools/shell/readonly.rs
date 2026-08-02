@@ -687,9 +687,16 @@ fn strip_outer_quotes(word: &str) -> Option<(&str, bool)> {
 }
 
 /// Expand `$VAR` / `${VAR}` references in `word`. Inside single quotes nothing
-/// expands. Unknown/unset variables, poisoned variables, `$HOME`, and
-/// `$PWD`-when-untracked all resolve to `None` (reject). Escaped `\$`
-/// (backslash preserved by the segmenter) is literal.
+/// expands. Returns `None` (reject) when the expansion is unprovable: an
+/// unbound variable without a temp anchor, a poisoned variable, `$HOME`,
+/// `$PWD`-when-untracked, or a `..` escape segment after an opaque suffix.
+///
+/// Temp-tagged variables (`NAME=$(mktemp -d)`) expand to a synthetic anchor
+/// path (first allowed temp root + one level — the same depth as a real
+/// `mktemp` result, so `..` chains escape at the same depth). Unbound
+/// variables after a temp anchor expand to an opaque placeholder segment
+/// (`$SNAP/$RANDOM/f`); the tail after the first opaque segment is
+/// unverifiable, so any `..` path segment there fails closed.
 fn expand_vars(word: &str, single_quoted: bool, state: &ValidationState) -> Option<String> {
     if single_quoted {
         // No expansion inside single quotes — a literal `$` is not a valid
@@ -700,6 +707,7 @@ fn expand_vars(word: &str, single_quoted: bool, state: &ValidationState) -> Opti
         return Some(word.to_string());
     }
     let mut out = String::with_capacity(word.len());
+    let mut opaque_from: Option<usize> = None;
     let mut i = 0;
     while i < word.len() {
         let rest = &word[i..];
@@ -716,7 +724,22 @@ fn expand_vars(word: &str, single_quoted: bool, state: &ValidationState) -> Opti
             continue;
         }
         if let Some((name, len)) = parse_var_ref(rest) {
-            out.push_str(&resolve_var(name, state)?);
+            match resolve_var(name, state) {
+                VarValue::Concrete(text) => out.push_str(&text),
+                VarValue::TempRoot => out.push_str(&temp_anchor_path(state.ctx)),
+                VarValue::Opaque => {
+                    // Unbound variable: usable only as an opaque suffix after
+                    // a temp anchor has been established.
+                    if opaque_from.is_none() && !is_under_temp_prefix(&out, state) {
+                        return None;
+                    }
+                    if opaque_from.is_none() {
+                        opaque_from = Some(out.len());
+                    }
+                    out.push_str(OPAQUE_SEGMENT);
+                }
+                VarValue::Blocked => return None,
+            }
             i += len;
         } else {
             let c = rest.chars().next().expect("i < len");
@@ -724,7 +747,41 @@ fn expand_vars(word: &str, single_quoted: bool, state: &ValidationState) -> Opti
             i += c.len_utf8();
         }
     }
+    // The tail after the first opaque suffix is unverifiable: a `..` path
+    // segment there could escape through the unknown value (fail-closed).
+    if let Some(start) = opaque_from
+        && out[start..].split('/').any(|seg| seg == "..")
+    {
+        return None;
+    }
     Some(out)
+}
+
+/// Synthetic anchor path for a temp-tagged variable (`NAME=$(mktemp -d)`):
+/// the first allowed temp root plus one level. The concrete value is unknown,
+/// but any `mktemp` result lives exactly one level below a temp root, so
+/// `..` chains over this anchor produce the same under-temp verdict as the
+/// real value.
+fn temp_anchor_path(ctx: &CheckContext) -> String {
+    let root = ctx
+        .temp_roots
+        .first()
+        .map_or_else(|| "/tmp".to_string(), |p| p.to_string_lossy().into_owned());
+    format!("{root}/{TEMP_ANCHOR_SEGMENT}")
+}
+
+/// Placeholder segment for a temp-tagged variable's unknown concrete value.
+const TEMP_ANCHOR_SEGMENT: &str = "__mahbot_temp__";
+
+/// Placeholder segment for an unbound variable used as an opaque suffix after
+/// a temp anchor. Must not contain `/` or `..`.
+const OPAQUE_SEGMENT: &str = "__mahbot_opaque__";
+
+/// True when the partial expansion text is provably under a temp root (a
+/// literal temp prefix or a temp-anchored variable has been emitted).
+fn is_under_temp_prefix(out: &str, state: &ValidationState) -> bool {
+    let p = Path::new(out);
+    p.is_absolute() && crate::tools::path::is_path_under_roots(p, &state.ctx.temp_roots)
 }
 
 /// Parse a `$NAME` or `${NAME}` reference at the start of `rest`.
@@ -749,25 +806,47 @@ fn parse_var_ref(rest: &str) -> Option<(&str, usize)> {
     Some((&after_dollar[..name_len], 1 + name_len))
 }
 
+/// How a variable reference resolves for expansion.
+enum VarValue {
+    /// Concrete expansion text (a fully-resolved value, e.g. `/tmp`,
+    /// `$PWD`'s tracked CWD).
+    Concrete(String),
+    /// Unknown concrete value provably under a temp root
+    /// (`NAME=$(mktemp -d)`).
+    TempRoot,
+    /// Unbound/unknown variable — only usable as an opaque suffix after a
+    /// temp anchor has been established (`$SNAP/$RANDOM/f`).
+    Opaque,
+    /// Poisoned or otherwise unprovable (`$HOME`, untracked `$PWD`) — always
+    /// fail-closed.
+    Blocked,
+}
+
 /// Resolve a single variable reference for expansion.
 ///
-/// - `$PWD` resolves to the tracked CWD (initial = workspace root); `None`
+/// - `$PWD` resolves to the tracked CWD (initial = workspace root); `Blocked`
 ///   when tracking was reset (fail-closed).
-/// - `$HOME` and all other variables never satisfy the temp-root check
-///   (decision 6).
-/// - TMPDIR/TMP/TEMP resolve to their bound value unless poisoned.
-fn resolve_var(name: &str, state: &ValidationState) -> Option<String> {
+/// - `$HOME` and poisoned variables are always `Blocked` (decision 6).
+/// - Bound variables (TMPDIR/TMP/TEMP from the session env, plus any variable
+///   assigned a temp-root value in the chain) resolve to their value or
+///   [`VarValue::TempRoot`] when the value is a fresh `$(mktemp -d)` root.
+/// - Unbound variables are [`VarValue::Opaque`].
+fn resolve_var(name: &str, state: &ValidationState) -> VarValue {
     match name {
-        "PWD" => state.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
-        "HOME" => None,
-        _ => {
-            let var = TempVar::from_name(name)?;
-            let binding = &state.vars[var as usize];
-            if binding.poisoned {
-                return None;
-            }
-            binding.value.clone()
-        }
+        "PWD" => match &state.cwd {
+            Some(cwd) => VarValue::Concrete(cwd.to_string_lossy().into_owned()),
+            None => VarValue::Blocked,
+        },
+        "HOME" => VarValue::Blocked,
+        _ => match state.vars.get(name) {
+            None => VarValue::Opaque,
+            Some(b) if b.poisoned => VarValue::Blocked,
+            Some(b) if b.temp_root => VarValue::TempRoot,
+            Some(b) => match &b.value {
+                Some(v) => VarValue::Concrete(v.clone()),
+                None => VarValue::Opaque,
+            },
+        },
     }
 }
 
@@ -826,33 +905,18 @@ impl CheckContext {
     }
 }
 
-/// Temp variables tracked for expansion and export-poisoning (contract
-/// decision 5): TMPDIR/TMP/TEMP are the only variables that can ever satisfy
-/// the temp-root check; `$HOME` and all others never do (decision 6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TempVar {
-    Tmpdir,
-    Tmp,
-    Temp,
-}
-
-impl TempVar {
-    fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "TMPDIR" => Some(Self::Tmpdir),
-            "TMP" => Some(Self::Tmp),
-            "TEMP" => Some(Self::Temp),
-            _ => None,
-        }
-    }
-}
-
-/// Binding state for one tracked temp variable.
+/// Binding state for one tracked variable.
 #[derive(Debug, Clone)]
 struct VarBinding {
-    /// Bound value; `None` = unset/unknown in the session shell environment.
+    /// Bound value; `None` = unknown concrete value (only for `temp_root`
+    /// bindings like `NAME=$(mktemp -d)`).
     value: Option<String>,
-    /// When true, subsequent expansions of this variable reject (decision 5).
+    /// True when the variable is provably bound under a temp root even though
+    /// the concrete value is unknown (`NAME=$(mktemp -d)`). With
+    /// `value == None` this marks a temp-tagged binding; with a concrete value
+    /// it is redundant (poisoning already encodes the temp/non-temp verdict).
+    temp_root: bool,
+    /// When true, subsequent expansions of this variable reject (fail-closed).
     /// Set by binding to a non-temp path; cleared by re-binding to a valid
     /// temp root.
     poisoned: bool,
@@ -865,25 +929,26 @@ struct ValidationState<'a> {
     /// Tracked current directory. `None` = fail-closed: relative paths reject
     /// (decision 7 — any non-literal-absolute `cd` form resets tracking).
     cwd: Option<std::path::PathBuf>,
-    /// Bindings for [`TempVar`] (TMPDIR, TMP, TEMP) in declaration order.
-    vars: [VarBinding; 3],
+    /// Tracked variable bindings by name: the session temp variables
+    /// (TMPDIR/TMP/TEMP) plus any variable assigned a temp-root value
+    /// (`SNAP=$(mktemp -d)`, `SNAP=/tmp/x`, ...) in the command chain.
+    vars: std::collections::HashMap<String, VarBinding>,
 }
 
 impl ValidationState<'_> {
     /// Initial state: CWD = the session's workspace root; temp vars bound from
     /// the context's session-environment snapshot.
     fn new(ctx: &CheckContext) -> ValidationState<'_> {
-        let mut vars = [(); 3].map(|()| VarBinding {
-            value: None,
-            poisoned: false,
-        });
+        let mut vars = std::collections::HashMap::new();
         for (name, value) in &ctx.temp_vars {
-            if let Some(var) = TempVar::from_name(name) {
-                vars[var as usize] = VarBinding {
+            vars.insert(
+                name.clone(),
+                VarBinding {
                     value: Some(value.clone()),
+                    temp_root: false,
                     poisoned: false,
-                };
-            }
+                },
+            );
         }
         ValidationState {
             ctx,
@@ -1321,6 +1386,15 @@ fn classify_shell_token(w: &str) -> TokenKind {
     TokenKind::Regular
 }
 
+/// True when a path argument contains a `$` variable that failed to resolve —
+/// used to tailor rejection messages with the recognized temp-variable
+/// spellings (a literal temp path, or `NAME=$(mktemp -d)`).
+fn has_unresolved_var_path(segment: &str, state: &ValidationState) -> bool {
+    non_flag_path_args(segment)
+        .iter()
+        .any(|p| p.contains('$') && resolve_path_word(p, state).is_none())
+}
+
 /// True when every explicit path argument resolves under an allowed temp root.
 fn scratch_paths_under_temp(segment: &str, state: &ValidationState) -> bool {
     let paths = non_flag_path_args(segment);
@@ -1426,7 +1500,11 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
             &format!(
                 "`{first_word}` is not allowed outside temp directories — it modifies the workspace."
             ),
-            "use read-only alternatives to inspect files, e.g. `cat`, `head`, `tail`, `ls`, `file`, `stat`.",
+            if has_unresolved_var_path(trimmed, state) {
+                "use a literal path under /tmp, or bind the directory first with `NAME=$(mktemp -d)` and reference `$NAME`."
+            } else {
+                "use read-only alternatives to inspect files, e.g. `cat`, `head`, `tail`, `ls`, `file`, `stat`."
+            },
         );
     }
 
@@ -1442,7 +1520,11 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
             &format!(
                 "`{first_word}` is not allowed outside temp directories — it modifies files outside /tmp."
             ),
-            "use paths under /tmp, /var/tmp, or the OS temp directory, or use read-only alternatives like `cat`, `head`, `tail`, `ls`, `file`, `stat`.",
+            if has_unresolved_var_path(trimmed, state) {
+                "use a literal path under /tmp, or bind the directory first with `NAME=$(mktemp -d)` and reference `$NAME`."
+            } else {
+                "use paths under /tmp, /var/tmp, or the OS temp directory, or use read-only alternatives like `cat`, `head`, `tail`, `ls`, `file`, `stat`."
+            },
         );
     }
 
@@ -1479,9 +1561,13 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
 
 /// Update the tracked CWD for a `cd`/`pushd`/`popd` segment (decision 7).
 ///
-/// Only a literal absolute `cd` into an existing directory tracks; every other
-/// form (relative, `..`, `-`, bare, `$VAR`, `~`, pushd/popd) resets tracking
-/// to fail-closed (`None` → relative paths reject).
+/// A literal absolute `cd` into a temp-root path tracks even when the
+/// directory does not exist at validation time (created earlier in the same
+/// command chain). A literal absolute `cd` elsewhere tracks only when the
+/// directory exists; every other form — relative `cd` whose normalized result
+/// escapes a tracked temp cwd, `cd ..`, `cd -`, bare `cd`, `cd $VAR`,
+/// `cd ~`, pushd/popd — resets tracking to fail-closed (`None` → relative
+/// paths reject).
 fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
     let words: Vec<&str> = segment.split_whitespace().collect();
     let Some(cd_idx) = words
@@ -1494,10 +1580,35 @@ fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
     match words.get(cd_idx + 1) {
         Some(target) if cmd == "cd" && target.starts_with('/') => {
             let p = std::path::PathBuf::from(target);
-            // Filesystem existence checks are expected and acceptable
-            // (decision 7); a nonexistent target fails the command, so
-            // tracking resets fail-closed.
-            state.cwd = if p.is_dir() { Some(p) } else { None };
+            if is_path_under_temp(&p, state.ctx) {
+                // Temp cd: tracks regardless of existence (the directory may
+                // have been created earlier in the same command chain).
+                state.cwd = Some(p);
+            } else {
+                // Filesystem existence checks are expected and acceptable
+                // (decision 7); a nonexistent target fails the command, so
+                // tracking resets fail-closed.
+                state.cwd = if p.is_dir() { Some(p) } else { None };
+            }
+        }
+        Some(target) if cmd == "cd" => {
+            // Relative cd under a tracked temp cwd is allowed iff the
+            // normalized result stays under a temp root; anything else resets
+            // fail-closed.
+            let Some(cwd) = &state.cwd else {
+                state.cwd = None;
+                return;
+            };
+            if !is_path_under_temp(cwd, state.ctx) {
+                state.cwd = None;
+                return;
+            }
+            let normalized = crate::tools::path::normalize_path(&cwd.join(target));
+            state.cwd = if is_path_under_temp(&normalized, state.ctx) {
+                Some(normalized)
+            } else {
+                None
+            };
         }
         _ => state.cwd = None,
     }
@@ -1507,7 +1618,7 @@ fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
 /// plain `X=...` assignment segments, and leading env-prefix assignments
 /// (`TMPDIR=/tmp cmd`). Bare `export` / `export NAME` are no-ops.
 fn apply_env_bindings(segment: &str, state: &mut ValidationState) {
-    let words: Vec<&str> = segment.split_whitespace().collect();
+    let words = split_words_keeping_substitutions(segment);
     if words.first() == Some(&"export") {
         for w in &words[1..] {
             if let Some((name, value)) = w.split_once('=') {
@@ -1525,16 +1636,71 @@ fn apply_env_bindings(segment: &str, state: &mut ValidationState) {
     }
 }
 
-/// Bind a single `NAME=value` assignment to a tracked temp variable.
+/// Split a segment into whitespace-separated words, keeping `$(...)` /
+/// backtick substitutions whole — their bodies may contain spaces, and
+/// `NAME=$(mktemp -d)` must stay one assignment word.
+fn split_words_keeping_substitutions(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    while i < s.len() {
+        let c = s[i..].chars().next().expect("i < len");
+        // Substitution starts are recognized inside double quotes too, but are
+        // literal inside single quotes or after an escape backslash.
+        if !escaped && !in_single && (c == '$' && bytes.get(i + 1) == Some(&b'(') || c == '`') {
+            let next = if c == '$' {
+                let (_, next) = find_substitution_end(s, i + 2);
+                next
+            } else {
+                let (_, next) = find_backtick_end(s, i + 1);
+                next
+            };
+            i = next;
+            continue;
+        }
+        if !super::track_char_context(c, &mut in_single, &mut in_double, &mut escaped) {
+            i += c.len_utf8();
+            continue;
+        }
+        if c.is_whitespace() {
+            if start < i {
+                out.push(&s[start..i]);
+            }
+            i += c.len_utf8();
+            start = i;
+            continue;
+        }
+        i += c.len_utf8();
+    }
+    if start < s.len() {
+        out.push(&s[start..]);
+    }
+    out
+}
+
+/// Bind a single `NAME=value` assignment to a tracked variable.
+///
+/// Any variable assigned a value that provably resolves under a temp root is
+/// tracked for path resolution (TMPDIR/TMP/TEMP as before, plus e.g.
+/// `SNAP=/tmp/x`). `NAME=$(mktemp -d)` / `` NAME=`mktemp -d` `` bind the
+/// variable to a fresh temp root with an unknown concrete value. A non-temp
+/// binding poisons the variable (fail-closed); a temp binding clears the
+/// poison.
 ///
 /// The stored value is the *resolved* path (shell expansion happens at
 /// assignment time, so `export TMPDIR="$TMPDIR/x"` binds the expanded path).
 fn apply_single_binding(name: &str, value: &str, state: &mut ValidationState) {
-    let Some(var) = TempVar::from_name(name) else {
-        return;
-    };
     // Strip balanced surrounding quotes from the value (`export TMPDIR="/tmp"`).
     let clean = strip_outer_quotes(value).map_or(value, |(c, _)| c);
+    // `NAME=$(mktemp -d)` binds a fresh temp root with an unknown value.
+    if let Some(binding) = mktemp_binding(clean, state) {
+        state.vars.insert(name.to_string(), binding);
+        return;
+    }
     let resolved = if !clean.is_empty() && !clean.starts_with('~') {
         resolve_path_word(clean, state)
     } else {
@@ -1543,12 +1709,88 @@ fn apply_single_binding(name: &str, value: &str, state: &mut ValidationState) {
     let under_temp = resolved
         .as_ref()
         .is_some_and(|p| is_path_under_temp(p, state.ctx));
-    state.vars[var as usize] = VarBinding {
-        value: Some(
-            resolved.map_or_else(|| clean.to_string(), |p| p.to_string_lossy().into_owned()),
-        ),
-        poisoned: !under_temp,
+    state.vars.insert(
+        name.to_string(),
+        VarBinding {
+            value: Some(
+                resolved.map_or_else(|| clean.to_string(), |p| p.to_string_lossy().into_owned()),
+            ),
+            temp_root: false,
+            poisoned: !under_temp,
+        },
+    );
+}
+
+/// Extract the command body from a `$(...)` or `` `...` `` substitution
+/// (outer quotes already stripped).
+fn substitution_body(value: &str) -> Option<&str> {
+    if let Some(inner) = value.strip_prefix("$(") {
+        return inner.strip_suffix(')');
+    }
+    if let Some(inner) = value.strip_prefix('`') {
+        return inner.strip_suffix('`');
+    }
+    None
+}
+
+/// Detect a `NAME=$(mktemp ...)` / `` NAME=`mktemp ...` `` assignment and
+/// return a temp-tagged binding (unknown concrete value, provably under a
+/// temp root). Returns `None` when the value is not an mktemp substitution or
+/// when the invocation overrides its directory with a non-temp path (the
+/// variable then falls through to the normal binding path, which poisons it —
+/// fail-closed).
+fn mktemp_binding(value: &str, state: &ValidationState) -> Option<VarBinding> {
+    let inner = substitution_body(value)?;
+    let mut words = inner.split_whitespace();
+    if words.next()? != "mktemp" {
+        return None;
+    }
+    let args: Vec<&str> = words.collect();
+    let mut target_dir: Option<&str> = None;
+    let mut after_ddash = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--" {
+            after_ddash = true;
+            i += 1;
+            continue;
+        }
+        if !after_ddash {
+            // `-p DIR` / `--tmpdir DIR` / `--tmpdir=DIR` override the target
+            // directory; the result is only temp when that directory is.
+            if a == "-p" || a == "--tmpdir" {
+                if i + 1 < args.len() {
+                    target_dir = Some(args[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                return None; // missing dir value → fail-closed
+            }
+            if let Some(dir) = a.strip_prefix("--tmpdir=") {
+                target_dir = Some(dir);
+            }
+        }
+        i += 1;
+    }
+    let temp_binding = || VarBinding {
+        value: None,
+        temp_root: true,
+        poisoned: false,
     };
+    match target_dir {
+        None => Some(temp_binding()),
+        Some(dir) => {
+            let clean = strip_outer_quotes(dir).map_or(dir, |(c, _)| c);
+            let under_temp = resolve_path_word(clean, state)
+                .is_some_and(|p| is_path_under_temp(&p, state.ctx));
+            if under_temp {
+                Some(temp_binding())
+            } else {
+                None
+            }
+        }
+    }
 }
 
 // ── Git-specific checks ──────────────────────────────────────────────────
@@ -2040,6 +2282,13 @@ fn check_cargo_segment(segment: &str) -> Result<(), String> {
                 trimmed,
                 "`cargo generate-lockfile` is not allowed — it creates or overwrites Cargo.lock.",
                 "switch to full shell mode to use `cargo generate-lockfile`.",
+            );
+        }
+        "run" => {
+            return reject(
+                trimmed,
+                "`cargo run` is not allowed — it executes the built binary, which may write files.",
+                "build with `cargo build` first, then invoke the built binary directly, e.g. `./target/debug/<bin> --help`.",
             );
         }
         _ => {}
@@ -3636,9 +3885,14 @@ mod tests {
             // cd to a non-temp dir then relative write — blocked.
             ("cd /tmp && cd /etc && touch f", false),
             ("cd / && touch f", false),
-            // Relative cd resets tracking to fail-closed (decision 7).
-            ("cd /tmp && cd src && touch f", false),
+            // Relative cd under a tracked temp cwd tracks iff the normalized
+            // result stays under a temp root.
+            ("cd /tmp && cd src && touch f", true),
+            ("cd /tmp && cd a/b/c && echo hi > out.txt", true),
             ("cd /tmp && cd .. && touch f", false),
+            ("cd /tmp && cd ../etc && touch f", false),
+            ("cd /tmp && cd ../../../etc && touch f", false),
+            ("cd /tmp && cd /etc && cd src && touch f", false),
             ("cd .. && touch f", false),
             ("cd - && touch f", false),
             ("cd && touch f", false),
@@ -3647,11 +3901,16 @@ mod tests {
             // pushd/popd always reset.
             ("cd /tmp && pushd /tmp && touch f", false),
             ("cd /tmp && popd && touch f", false),
-            // cd to nonexistent dir + write — blocked.
+            // cd to nonexistent dir + write — blocked (non-temp target).
             ("cd /nonexistent_dir_xyz_1059 && touch f", false),
+            // cd to a nonexistent temp dir tracks (created earlier in the
+            // same command chain).
+            ("cd /tmp/nonexistent_x && touch f", true),
+            ("mkdir -p /tmp/snap && cd /tmp/snap && touch f", true),
             // $PWD after tracked cd resolves to the tracked CWD.
             ("cd /tmp && touch $PWD/out", true),
             ("cd /tmp && touch $PWD/../../etc/passwd", false),
+            ("cd /tmp && cd src && touch $PWD/out", true),
             // cd to workspace + rm — blocked.
             ("cd / && rm f", false),
             // Relative path args without cd resolve to the workspace — blocked.
@@ -3743,6 +4002,12 @@ mod tests {
             // Toolchain specifier no longer becomes the parsed subcommand.
             ("cargo +nightly build", true),
             ("cargo +stable check", true),
+            ("cargo +nightly test", true),
+            ("cargo +nightly clippy", true),
+            ("cargo +nightly doc", true),
+            ("cargo +nightly run", false),
+            ("cargo +nightly fix", false),
+            ("cargo +nightly update", false),
             // stderr-capture suffix no longer becomes the parsed subcommand.
             ("cargo --version 2>&1", true),
             ("cargo build 2>&1", true),
@@ -3807,5 +4072,145 @@ mod tests {
         ];
 
         run_cases(&cases);
+    }
+
+    // ── Temp-value variable binding ──────────────────────────────────────
+
+    /// `NAME=$(mktemp -d)` / backtick spellings bind a fresh temp root with an
+    /// unknown concrete value; writes via `$NAME` resolve under that root.
+    /// Non-temp and unknown bindings poison the variable (fail-closed);
+    /// temp re-binds clear the poison.
+    #[test]
+    fn temp_var_binding_acceptance() {
+        let cases = [
+            // mktemp substitution binds a temp root; writes via $SNAP allowed.
+            ("SNAP=$(mktemp -d)\ntouch \"$SNAP/f\"", true),
+            ("SNAP=$(mktemp -d)\necho hi > \"$SNAP/out\"", true),
+            ("SNAP=$(mktemp -d)\ncp /etc/passwd \"$SNAP/out\"", true),
+            ("SNAP=$(mktemp -d)\nmkdir -p \"$SNAP/a/b\"", true),
+            ("SNAP=$(mktemp -d)\nrm -rf \"$SNAP\"", true),
+            ("SNAP=$(mktemp -d)\nrm -rf \"$SNAP/\"", true),
+            // Backtick and quoted-substitution spellings.
+            ("SNAP=`mktemp -d`\ntouch \"$SNAP/f\"", true),
+            ("SNAP=\"$(mktemp -d)\"\ntouch \"$SNAP/f\"", true),
+            // export form.
+            ("export SNAP=$(mktemp -d)\ntouch \"$SNAP/f\"", true),
+            // Binding inside a substitution applies within the subshell.
+            ("echo $(SNAP=$(mktemp -d); touch \"$SNAP/f\")", true),
+            // Braced / unbraced references.
+            ("SNAP=$(mktemp -d)\ntouch $SNAP/f", true),
+            ("SNAP=$(mktemp -d)\ntouch ${SNAP}/f", true),
+            // Concrete temp bindings track too.
+            ("SNAP=/tmp/snap\ntouch \"$SNAP/f\"", true),
+            ("SNAP=$TMPDIR/snap\ntouch \"$SNAP/f\"", true),
+            ("SNAP=/tmp/snap\ndir=$SNAP/.mahbot/db\nmkdir -p \"$dir\"", true),
+            // Non-temp / unknown bindings poison → blocked.
+            ("SNAP=/etc\ntouch \"$SNAP/f\"", false),
+            ("SNAP=/__mahbot_readonly_test_ws__/snap\nmkdir -p \"$SNAP/db\"", false),
+            ("SNAP=$FOO\ntouch \"$SNAP/f\"", false),
+            // Temp rebind clears; non-temp rebind stays poisoned.
+            ("SNAP=/etc\nSNAP=$(mktemp -d)\ntouch \"$SNAP/f\"", true),
+            ("SNAP=$(mktemp -d)\nSNAP=/etc\ntouch \"$SNAP/f\"", false),
+            ("SNAP=$(mktemp -d)\nSNAP=/tmp/other\ntouch \"$SNAP/f\"", true),
+            // Env-prefix form.
+            ("SNAP=/tmp/snap touch $SNAP/f", true),
+            ("SNAP=/etc touch $SNAP/f", false),
+            // Unbound variable without a temp anchor stays blocked.
+            ("touch $FOO/f", false),
+            // mktemp with a template still binds.
+            ("SNAP=$(mktemp -d /tmp/mahbot.XXXXXX)\ntouch \"$SNAP/f\"", true),
+            // mktemp -p/--tmpdir to a temp dir binds; to a non-temp dir does not.
+            ("SNAP=$(mktemp -d -p /tmp)\ntouch \"$SNAP/f\"", true),
+            ("SNAP=$(mktemp -d --tmpdir=/tmp)\ntouch \"$SNAP/f\"", true),
+            ("SNAP=$(mktemp -d --tmpdir /tmp)\ntouch \"$SNAP/f\"", true),
+            ("SNAP=$(mktemp -d -p /etc)\ntouch \"$SNAP/f\"", false),
+            (
+                "SNAP=$(mktemp -d --tmpdir=/__mahbot_readonly_test_ws__)\ntouch \"$SNAP/f\"",
+                false,
+            ),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// Opaque suffixes (`$$`, `$RANDOM`) under a temp prefix resolve; without
+    /// a temp anchor, or after an escape segment, they stay fail-closed.
+    #[test]
+    fn opaque_suffix_acceptance() {
+        let cases = [
+            ("SNAP=$(mktemp -d)\ntouch \"$SNAP/$RANDOM/f\"", true),
+            ("SNAP=$(mktemp -d)\ntouch \"$SNAP/$$/f\"", true),
+            ("SNAP=$(mktemp -d)\ntouch \"$SNAP/$RANDOM\"", true),
+            ("SNAP=$(mktemp -d)\necho hi > \"$SNAP/$RANDOM/out\"", true),
+            ("touch \"/tmp/$RANDOM/f\"", true),
+            // Without a temp anchor the opaque variable is unprovable.
+            ("touch \"$RANDOM/f\"", false),
+            // `..` after an opaque suffix is unverifiable → blocked.
+            ("SNAP=$(mktemp -d)\ntouch \"$SNAP/$RANDOM/../f\"", false),
+            ("SNAP=$(mktemp -d)\ntouch \"$SNAP/$RANDOM/../../etc/passwd\"", false),
+            // `..` before the opaque suffix normalizes concretely → allowed.
+            ("SNAP=$(mktemp -d)\ntouch \"$SNAP/../$RANDOM/f\"", true),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// The documented snapshot-query procedure (idiomatic and literal
+    /// spellings) passes; workspace-targeting variants of the same shapes stay
+    /// blocked.
+    #[test]
+    fn snapshot_query_procedure_acceptance() {
+        let cases = [
+            // Idiomatic spelling.
+            (
+                "SNAP=$(mktemp -d)\nmkdir -p \"$SNAP/.mahbot/db\"\ncp ~/.mahbot/db/board.db \"$SNAP/.mahbot/db/\"\nHOME=\"$SNAP\" mahbot debug --db board \"SELECT 1\"\nrm -rf \"$SNAP\"",
+                true,
+            ),
+            // Full for-loop spelling from the deleted ops doc.
+            (
+                "SNAP=$(mktemp -d)\nmkdir -p \"$SNAP/.mahbot/db\"\nfor db in ~/.mahbot/db/*.db; do\ncp \"$db\" \"$SNAP/.mahbot/db/\"\ncp \"$db-wal\" \"$SNAP/.mahbot/db/\" 2>/dev/null || true\ndone\nHOME=\"$SNAP\" mahbot debug --db sessions \"SELECT COUNT(*) FROM messages\"\nrm -rf \"$SNAP\"",
+                true,
+            ),
+            // Literal spelling: concrete temp bindings.
+            (
+                "SNAP=/tmp/mahbot-snap\ndir=$SNAP/.mahbot/db\nmkdir -p \"$dir\"\ncp ~/.mahbot/db/board.db \"$dir/\"\nHOME=\"$SNAP\" mahbot debug --db board \"SELECT 1\"\nrm -rf \"$SNAP\"",
+                true,
+            ),
+            // Workspace-targeting variants of the same shapes stay blocked.
+            (
+                "SNAP=/__mahbot_readonly_test_ws__/snap\nmkdir -p \"$SNAP/.mahbot/db\"",
+                false,
+            ),
+            (
+                "SNAP=$(mktemp -d)\ncp ~/.mahbot/db/board.db /__mahbot_readonly_test_ws__/out",
+                false,
+            ),
+            ("SNAP=$(mktemp -d)\nrm -rf /__mahbot_readonly_test_ws__", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// Denial messages teach the recognized spelling: a literal temp path or
+    /// `NAME=$(mktemp -d)` for unresolvable variables, and `cargo build` +
+    /// direct binary invocation for `cargo run`.
+    #[test]
+    fn denial_message_education() {
+        let ctx = test_ctx();
+        let err = check_command("touch $FOO/out", &ctx).unwrap_err();
+        assert!(
+            err.contains("$(mktemp -d)"),
+            "scratch-mutator denial should teach the variable spelling: {err}"
+        );
+        let err = check_command("rm $FOO/out", &ctx).unwrap_err();
+        assert!(
+            err.contains("$(mktemp -d)"),
+            "temp-mutator denial should teach the variable spelling: {err}"
+        );
+        let err = check_command("cargo run", &ctx).unwrap_err();
+        assert!(
+            err.contains("cargo build") && err.contains("target/debug"),
+            "cargo run denial should teach the built-binary alternative: {err}"
+        );
     }
 }

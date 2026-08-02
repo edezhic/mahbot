@@ -194,7 +194,7 @@ pub(crate) async fn resolve_read_target(
 ///   Unix-like systems (macOS, Linux) where `Prefix` components do not
 ///   occur.
 #[must_use]
-fn normalize_path(path: &Path) -> PathBuf {
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     use std::path::Component;
 
     let mut normalized: Vec<Component<'_>> = Vec::new();
