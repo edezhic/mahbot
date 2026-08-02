@@ -40,7 +40,10 @@
 //! full re-baseline.  The feature-set reduction above is structure-only.
 //!
 //! First run populates the TTS audio cache (~14-17 min); subsequent runs
-//! complete in ~36-38 s (bench body) plus the build time.
+//! complete in ~45 s (bench body — Phase 13's cooldown probes add ~6.5 s of
+//! excluded-from-timing sleeps: 2.5 s suppression + 3.5 s recovery probes both
+//! measured from Detection 1's timestamp (overlapping, max ≈ 3.5 s) plus the
+//! ~3.03 s boundary probe, mahbot-1052) plus the build time.
 //!
 //! # Requirements
 //!
@@ -1173,6 +1176,28 @@ fn pcm_augment_enrollment_variants(variants: &[(Vec<f32>, String)]) -> Vec<(Vec<
     all
 }
 
+/// Locate the enrolled-speaker F1 training clip (`"F1.json_enroll0"`) and
+/// build its five raw-level PCM augmentation variants (original / speed-down /
+/// speed-up / vol-down / noise) — the canonical construction used by the
+/// enrolled-speaker phase (mahbot-1023 Phase 8d), the B-sweep (mahbot-1022),
+/// and the Phase 13 cooldown re-point (mahbot-1052).  `None` when the F1 clip
+/// is absent from `train_clips`.
+///
+/// NOTE (mahbot-1052 reviewer_3): the same find+augment chain appears inline
+/// in `run_bsweep` (~line 5510/5562) and `run_enrolled_speaker_phase`
+/// (~line 6029).  Those sites additionally use the RAW `f1_pcm` (for the
+/// streaming-layout mel) and iterate ALL five variants, so they cannot consume
+/// this helper's `_original` selection directly; consolidating them is
+/// deliberately deferred to honor the mahbot-1052 non-goal "no changes to
+/// other phases".  New F1-construction sites should use this helper.
+fn f1_enrollment_variants(train_clips: &[(Vec<f32>, String)]) -> Option<Vec<(Vec<f32>, String)>> {
+    let (f1_pcm, _) = train_clips.iter().find(|(_, l)| l == "F1.json_enroll0")?;
+    Some(pcm_augment_enrollment_variants(&[(
+        f1_pcm.clone(),
+        "F1.json_enroll0".to_string(),
+    )]))
+}
+
 /// mahbot-1045 B3 (report-only): quality scoring of the bench's enrollment
 /// clips via production's compute_utterance_quality.  The bench clips have no
 /// pre-AGC ring → noise_rms is None → SNR is the estimate_snr_energy
@@ -1948,6 +1973,30 @@ fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> Det
         latency_ms: None,
         agc_converged,
         adaptive_state_pre_flush,
+    }
+}
+
+/// Sleep until the ctx's last wake-word detection is at least `target_elapsed`
+/// old, measured from the [`PipelineCtx::last_wake_word_detection`] field (the
+/// timestamp set inside the feed loop), NOT from `run_streaming_detection`'s
+/// return time.
+///
+/// Detection sets the cooldown timestamp *inside* the feed loop
+/// (`score_stride8_window` → `ctx.last_wake_word_detection = Some(now)`), so
+/// returning from `run_streaming_detection` adds a variable detection-to-return
+/// delta.  Sleeping relative to the timestamp itself avoids that jitter when
+/// probing the cooldown gate at specific elapsed times (mahbot-1052).
+///
+/// When the timestamp is absent (should not happen mid-Phase-13), no sleep
+/// occurs — the caller's probes rely on the timestamp being present after a
+/// fired detection.
+fn sleep_until_cooldown_elapsed(ctx: &super::PipelineCtx, target_elapsed: Duration) {
+    if let Some(last) = ctx.last_wake_word_detection {
+        let target = last + target_elapsed;
+        let now = Instant::now();
+        if target > now {
+            std::thread::sleep(target - now);
+        }
     }
 }
 
@@ -7796,6 +7845,19 @@ pub(crate) fn run_internal() {
     let mut cooldown_first_detected: Option<bool> = None;
     let mut cooldown_suppressed: Option<bool> = None;
     let mut cooldown_after_recovered: Option<bool> = None;
+    // mahbot-1052: additive cooldown.* report keys.  The phase was re-pointed
+    // at the enrolled-speaker F1 original variant (the M2–M5 held-out clips
+    // are rejected by the post-1025 verifier, so the old precondition could
+    // never hold).  All keys stay `None` on the degenerate-classifier path and
+    // on a visible skip (F1 clip missing / first detection failed) — the
+    // report emits them as `null` with `skip_reason` set, never panics.
+    let mut cooldown_source_variant: Option<String> = None;
+    let mut cooldown_skip_reason: Option<String> = None;
+    let mut cooldown_suppressed_at_2_5s: Option<bool> = None;
+    let mut cooldown_accumulation_cap_observed: Option<usize> = None;
+    let mut cooldown_buffered_audio_processed_after_expiry: Option<bool> = None;
+    let mut cooldown_boundary_probe_elapsed_ms: Option<f64> = None;
+    let mut cooldown_boundary_probe_detected: Option<bool> = None;
 
     // Per-variant metrics for noise profiles (collected across all profiles).
     let mut noise_metrics: Vec<DetectionMetrics> = Vec::new();
@@ -8055,17 +8117,66 @@ pub(crate) fn run_internal() {
         phase_times[P_NOISE_PROFILES] = phase_end_ms!();
 
         // ── Phase 13: Cooldown verification ──────────────────────────────
-        // The ~3.1s sleep is EXCLUDED from the timing measurement.
+        // mahbot-1052: re-pointed at the ENROLLED-SPEAKER F1 original variant
+        // (Phase 8d's construction: F1.json_enroll0 lookup +
+        // pcm_augment_enrollment_variants, _original pinned — 85/85 reliable;
+        // speed_down/noise fail ~4–6% historically).  The previous source,
+        // pos_test_variants.first(), is an M2–M5 held-out CROSS-SPEAKER clip.
+        // The phase has been dead since at least the mahbot-1023 positive-class
+        // re-scoping (0/20 cross-speaker detection predates 1025); the
+        // post-1025 verifier training made the rejection structural — its
+        // "first detection should fire" precondition could never hold, so the
+        // whole assertion block silently skipped (85/85 archived reports show
+        // first_detection_fired: false with null cooldown keys).  The enrolled-
+        // speaker positive measurement moved to Phase 8d but Phase 13 was never
+        // re-pointed; this phase restores the cooldown verification the
+        // mahbot-770/802/818 bugs motivated.
         //
-        // Only Detection 1 receives warm-up prepend (mahbot-922): Detection 2
-        // reuses the same ctx with cooldown active (processing hits the cooldown
-        // gate and calls reset_detection_segment(), which clears the embedding
-        // ring).  After cooldown expiry, Detection 3 starts with an empty ring
-        // and survives warm-up naturally because the wake word utterance is well
-        // over 512ms long — the first ~512ms is consumed by the built-in warm-up
-        // suppression, and the remaining audio is long enough to fire detection.
+        // Cooldown semantics under test (production, unchanged):
+        //   - WAKE_WORD_COOLDOWN (3.0 s) gate in handle_wake_word_detection;
+        //   - audio fed during cooldown is BUFFERED (not discarded) into
+        //     ctx.audio_buffer up to COOLDOWN_ACCUMULATION_CAP (1024 samples =
+        //     2 frames, mahbot-802) and processed when the gate expires;
+        //   - the stride-8 burst/main loop is gated on `!is_recording`, which
+        //     stays true after a detection fires (Soft reset preserves it) —
+        //     the bench must reset `is_recording` between detections or the
+        //     recovery probe cannot fire (mahbot-1052, analyst review).
+        //
+        // Probe schedule (all sleeps EXCLUDED from phase timing):
+        //   Detection 1  t≈0      warm pass — must fire
+        //   Detection 2  t≈0      gate closed — suppressed + cap probe
+        //   Detection 3  ~2.5 s   gate still closed (2.5 < 3.0) — suppressed
+        //   Detection 4  ~3.5 s   gate expired — fires (natural expiry, NO
+        //                          manual last_wake_word_detection clear)
+        //   Boundary     ~3.03 s  report-only earliest-re-detection probe
+        //                          (WAKE_WORD_COOLDOWN 3.0 s + one 32 ms
+        //                          FRAME_LENGTH chunk), run LAST because its
+        //                          firing updates last_wake_word_detection.
+        //
+        // Gate vs report (mahbot-1052 pin 4, reviewer_3): Detections 3 and 4
+        // ARE the gate — HARD assertions, so a production cooldown regression
+        // (e.g. halved WAKE_WORD_COOLDOWN) fails the bench instead of only
+        // warning.  Slack margins (2.5 s / 3.5 s) are deliberate: wall-clock
+        // timing on a loaded bench CPU is jittery, so the assertions never
+        // probe 2.99/3.01 s (500 ms from the 3.0 s boundary either way, far
+        // beyond any plausible thread::sleep drift).  Detection 2 keeps the
+        // pre-existing soft `cooldown_suppressed_redetection` report key; the
+        // ~3.03 s boundary probe is report-only evidence (jitter-sensitive).
         info!("─── {}. Cooldown verification ───", P_COOLDOWN + 1);
-        if let Some((first_pos, _label)) = pos_test_variants.first() {
+        // Variant CONSTRUCTION only — mirrors run_enrolled_speaker_phase's F1
+        // lookup + augmentation WITHOUT re-running the phase (which would
+        // re-run 5 variants + the member-only verifier loop, mutating global
+        // verifier state; mahbot-1052 manager pin).  `_original` is pinned:
+        // speed_down/noise fail ~4–6% of runs historically (reviewer_3).
+        // The shared find+augment chain lives in [`f1_enrollment_variants`];
+        // run_bsweep / run_enrolled_speaker_phase keep their inline copies
+        // (they need the raw F1 PCM and ALL five variants — see the helper's
+        // NOTE; consolidating them is deferred to honor the mahbot-1052
+        // non-goal "no changes to other phases").
+        let f1_cooldown_variant: Option<(Vec<f32>, String)> = f1_enrollment_variants(&train_clips)
+            .and_then(|variants| variants.into_iter().find(|(_, l)| l.ends_with("_original")));
+        if let Some((f1_original, f1_label)) = f1_cooldown_variant {
+            cooldown_source_variant = Some(f1_label.clone());
             let mut ctx = super::PipelineCtx::new();
             // Propagate the shared adaptive state accumulated across phases 8-12
             // so the adaptive code path is active during cooldown testing too.
@@ -8073,26 +8184,45 @@ pub(crate) fn run_internal() {
 
             // Detection 1: should fire (consume warm-up first so the verifier
             // is active and latency measures only the wake word — mahbot-922).
+            // NOTE: this is a WARM pass (consume_warmup + warmed shared
+            // adaptive state), unlike Phase 8d's cold pass — the acceptance
+            // criterion "assertions actually fire" carries residual risk until
+            // measured across ≥3 warm runs (mahbot-1052 manager pin 10); a
+            // failure here becomes a VISIBLE skip (skip_reason), never silent.
             consume_warmup(&mut ctx);
             let t0 = Instant::now();
-            let detected = run_streaming_detection(first_pos, &mut ctx);
+            let detected = run_streaming_detection(&f1_original, &mut ctx);
             cooldown_detection_time_ms += t0.elapsed().as_secs_f64() * 1000.0;
             if !detected.detected {
                 cooldown_first_detected = Some(false);
-                warn!(
-                    "Cooldown test: first detection should fire but didn't (detection rate is 0/{} — skipping cooldown)",
-                    pos_test_variants.len()
+                let reason = format!(
+                    "F1 enrolled-speaker variant {f1_label} did not fire in the warm pass — \
+                     skipping cooldown assertions (mahbot-1052)"
                 );
+                warn!("{reason}");
+                cooldown_skip_reason = Some(reason);
                 // Skip remaining cooldown assertions since detection didn't fire.
                 // The test will still exercise noise overlap and other phases.
             } else {
                 cooldown_first_detected = Some(true);
-                info!("Cooldown test: first detection fired ✓");
+                info!("Cooldown test: first detection fired ✓ ({f1_label})");
+                // Detection set is_recording = true + last_wake_word_detection
+                // (score_stride8_window).  The stride-8 burst/main loop is
+                // gated on !is_recording, and Soft reset preserves it — reset
+                // it between detections or the recovery probe cannot fire
+                // (mahbot-1052).
+                ctx.is_recording = false;
 
-                // Detection 2: should NOT fire during cooldown
+                // Detection 2: should NOT fire during cooldown (gate closed,
+                // t≈0).  Also the accumulation-cap probe: the full F1 feed is
+                // far larger than COOLDOWN_ACCUMULATION_CAP, so the cooldown
+                // path must have buffered exactly `cap` samples (mahbot-802
+                // semantics: audio fed during cooldown is buffered, not
+                // discarded).  Asserted DURING cooldown because the expiry
+                // handoff consumes/clears the buffer (mahbot-1052 pin 6).
                 let before_cooldown = ctx.last_wake_word_detection;
                 let t1 = Instant::now();
-                let silenced = run_streaming_detection(first_pos, &mut ctx);
+                let silenced = run_streaming_detection(&f1_original, &mut ctx);
                 cooldown_detection_time_ms += t1.elapsed().as_secs_f64() * 1000.0;
                 if silenced.detected {
                     cooldown_suppressed = Some(false);
@@ -8104,36 +8234,143 @@ pub(crate) fn run_internal() {
                 if ctx.last_wake_word_detection != before_cooldown {
                     warn!("Cooldown test: last_wake_word_detection changed during cooldown");
                 }
-
-                // Wait for cooldown to expire (sleep excluded from timing)
+                cooldown_accumulation_cap_observed = Some(ctx.audio_buffer.len());
+                assert_eq!(
+                    ctx.audio_buffer.len(),
+                    super::COOLDOWN_ACCUMULATION_CAP,
+                    "Cooldown accumulation cap violated: audio_buffer.len() = {} \
+                     (cap = {}, mahbot-802 semantics: cooldown audio is buffered up to the cap)",
+                    ctx.audio_buffer.len(),
+                    super::COOLDOWN_ACCUMULATION_CAP,
+                );
                 info!(
-                    "Cooldown test: waiting {}ms for cooldown expiry...",
-                    super::WAKE_WORD_COOLDOWN.as_millis()
-                );
-                std::thread::sleep(
-                    super::WAKE_WORD_COOLDOWN + std::time::Duration::from_millis(100),
+                    "Cooldown test: audio fed during cooldown buffered to exactly cap \
+                     ({} samples) ✓ — not discarded (mahbot-802)",
+                    super::COOLDOWN_ACCUMULATION_CAP,
                 );
 
-                // Detection 3: should fire again after cooldown
-                ctx.last_wake_word_detection = None;
+                // Detection 3: natural-expiry probe at ~2.5 s — the gate must
+                // STILL be closed (2.5 s < WAKE_WORD_COOLDOWN 3.0 s).  The old
+                // code cleared last_wake_word_detection before this probe,
+                // bypassing production's real gate; the natural expiry is the
+                // production behavior under test (mahbot-1052).
+                //
+                // GATE (mahbot-1052 pin 4, reviewer_3): HARD assertion, not
+                // warn-soft — a production cooldown regression (e.g. halved or
+                // removed WAKE_WORD_COOLDOWN) must FAIL the bench.  The 500 ms
+                // slack margin (2.5 s vs 3.0 s) is jitter-safe, and the
+                // suppressed feed + silence flush complete ~100 ms after the
+                // sleep (the bench feeds far faster than real-time), leaving
+                // ~400 ms of margin.
+                sleep_until_cooldown_elapsed(&ctx, Duration::from_millis(2500));
                 let t2 = Instant::now();
-                let after_cooldown = run_streaming_detection(first_pos, &mut ctx);
+                let at_2_5s = run_streaming_detection(&f1_original, &mut ctx);
                 cooldown_detection_time_ms += t2.elapsed().as_secs_f64() * 1000.0;
-                if !after_cooldown.detected {
-                    cooldown_after_recovered = Some(false);
-                    warn!("Cooldown test: detection should fire after cooldown expires but didn't");
-                } else {
-                    cooldown_after_recovered = Some(true);
-                    info!("Cooldown test: detection fired after cooldown ✓");
+                assert!(
+                    !at_2_5s.detected,
+                    "Cooldown gate violation: re-detection fired at ~2.5s (elapsed {}ms) while \
+                     WAKE_WORD_COOLDOWN = {}ms — the gate must stay closed until natural expiry \
+                     (mahbot-1052 pin 4)",
+                    ctx.last_wake_word_detection
+                        .map_or(0, |l| l.elapsed().as_millis()),
+                    super::WAKE_WORD_COOLDOWN.as_millis(),
+                );
+                cooldown_suppressed_at_2_5s = Some(true);
+                info!("Cooldown test: re-detection still suppressed at ~2.5s ✓");
+
+                // Detection 4: recovery probe at ~3.5 s — the gate has expired
+                // naturally, so detection must fire again (the old fixed 3.1 s
+                // sleep is restructured into this probe schedule, mahbot-1052
+                // pin 5).  is_recording was left true by Detection 1 and the
+                // suppressed probes never clear it — reset it so the stride-8
+                // burst/main loop runs.
+                //
+                // GATE (mahbot-1052 pin 4): HARD assertion like Detection 3
+                // (500 ms slack past the 3.0 s boundary — jitter-safe).
+                //
+                // Buffered-audio-processed evidence (reviewer_3, mahbot-1052):
+                // the post-firing state `audio_buffer.is_empty() &&
+                // !command_buffer.is_empty()` alone is TAUTOLOGICAL — the
+                // mem::take at the start of every non-cooldown
+                // handle_wake_word_detection call (voice.rs:8638) plus the
+                // detection→recording handoff (voice.rs:8891-8898) always
+                // leave audio_buffer empty and command_buffer repopulated once
+                // detection fires, whether or not the cooldown-accumulated
+                // samples survived.  The DISCRIMINATING observable is the
+                // buffer length BEFORE this feed: after Detection 2's cap
+                // probe (hard-asserted == CAP) and Detection 3's suppressed
+                // feed (cooldown re-entry adds nothing beyond the cap), the
+                // buffer still holds exactly the cap samples at expiry, and
+                // the firing detection's handoff consumes them into
+                // command_buffer.  (A `command_buffer.len() >= CAP` check
+                // would NOT discriminate: the recovery feed alone exceeds CAP
+                // samples.)  The key therefore reports
+                // `pre-feed len >= CAP && post-firing consumed` — i.e. the
+                // cooldown-accumulated audio survived to expiry AND was
+                // processed into the recording buffer.  Report-only: under
+                // extreme wall-clock load the D3 silence flush could cross the
+                // expiry boundary and legitimately consume the buffer early,
+                // which is not a production defect.
+                ctx.is_recording = false;
+                let pre_recovery_buffer_len = ctx.audio_buffer.len();
+                sleep_until_cooldown_elapsed(&ctx, Duration::from_millis(3500));
+                let t3 = Instant::now();
+                let after_cooldown = run_streaming_detection(&f1_original, &mut ctx);
+                cooldown_detection_time_ms += t3.elapsed().as_secs_f64() * 1000.0;
+                assert!(
+                    after_cooldown.detected,
+                    "Cooldown gate violation: detection did NOT fire at ~3.5s (elapsed {}ms) \
+                     after WAKE_WORD_COOLDOWN = {}ms expired — recovery failed \
+                     (mahbot-1052 pin 4)",
+                    ctx.last_wake_word_detection
+                        .map_or(0, |l| l.elapsed().as_millis()),
+                    super::WAKE_WORD_COOLDOWN.as_millis(),
+                );
+                cooldown_after_recovered = Some(true);
+                info!("Cooldown test: detection fired after cooldown ✓");
+                cooldown_buffered_audio_processed_after_expiry = Some(
+                    pre_recovery_buffer_len >= super::COOLDOWN_ACCUMULATION_CAP
+                        && ctx.audio_buffer.is_empty()
+                        && !ctx.command_buffer.is_empty(),
+                );
+
+                // Boundary probe (report-only, mahbot-1052 item 4): probe the
+                // true earliest re-detection boundary — WAKE_WORD_COOLDOWN
+                // (3.0 s) + one FRAME_LENGTH chunk (32 ms at 16 kHz) ≈ 3.03 s.
+                // NO assertion: a hard 3.03 s gate is wall-clock-jitter-risky on
+                // a loaded bench CPU.  State-isolated: its firing updates
+                // last_wake_word_detection, so it runs LAST in this context.
+                ctx.is_recording = false;
+                sleep_until_cooldown_elapsed(
+                    &ctx,
+                    super::WAKE_WORD_COOLDOWN + Duration::from_millis(32),
+                );
+                if let Some(last) = ctx.last_wake_word_detection {
+                    cooldown_boundary_probe_elapsed_ms =
+                        Some(last.elapsed().as_secs_f64() * 1000.0);
                 }
+                let t4 = Instant::now();
+                let boundary = run_streaming_detection(&f1_original, &mut ctx);
+                cooldown_detection_time_ms += t4.elapsed().as_secs_f64() * 1000.0;
+                cooldown_boundary_probe_detected = Some(boundary.detected);
+                info!(
+                    "Cooldown test: earliest-boundary probe at ~3.03s → detected={} \
+                     (report-only evidence, no assertion — jitter-sensitive)",
+                    boundary.detected,
+                );
             } // close the if detected.detected/else block
         } else {
-            warn!("Cooldown test: no positive variants available, skipping");
+            let reason = "F1.json_enroll0 missing from train clips — cannot re-point Phase 13 at \
+                 the enrolled-speaker positive variant (mahbot-1052); Phase 8d's fallback \
+                 ('?' lookup) is mirrored here"
+                .to_string();
+            warn!("{reason}");
+            cooldown_skip_reason = Some(reason);
         }
         info!(
-            "  → Phase 13 detection work completed in {:.0}ms (excl. {}ms sleep)",
+            "  → Phase 13 detection work completed in {:.0}ms (excl. probe sleeps: \
+             ~2.5s suppressed + ~3.5s recovery + ~3.03s boundary)",
             cooldown_detection_time_ms,
-            super::WAKE_WORD_COOLDOWN.as_millis() + 100,
         );
         phase_times[P_COOLDOWN] = cooldown_detection_time_ms as u64;
 
@@ -8180,6 +8417,16 @@ pub(crate) fn run_internal() {
         phase_times[P_NOISE_PROFILES] = 0;
         phase_times[P_COOLDOWN] = 0;
         phase_times[P_NOISE_OVERLAP] = 0;
+        // mahbot-1052 pin 8: on the degenerate path the cooldown.* keys stay
+        // null (hoisted vars), but the skip must be VISIBLE — emit the reason
+        // so the report never silently lacks it (mirrors the mahbot-1005
+        // hoisting pattern; the F1-missing / warm-pass-failure skip reasons
+        // are set inside the Phase 13 block above).
+        let reason = "degenerate classifier (near-zero weights) — all detection phases, \
+             including Phase 13 cooldown verification, were skipped (mahbot-1052)"
+            .to_string();
+        warn!("{reason}");
+        cooldown_skip_reason = Some(reason);
     }
 
     // ── Env-gated FAPH phase (mahbot-1057) ────────────────────────────────
@@ -9606,6 +9853,20 @@ pub(crate) fn run_internal() {
             "first_detection_fired": cooldown_first_detected,
             "cooldown_suppressed_redetection": cooldown_suppressed,
             "detection_recovered_after_cooldown": cooldown_after_recovered,
+            // mahbot-1052: additive keys (re-point at the enrolled-speaker F1
+            // original variant; visible skip via skip_reason, never silent).
+            "source_variant": cooldown_source_variant,
+            "skip_reason": cooldown_skip_reason,
+            "suppressed_at_2_5s": cooldown_suppressed_at_2_5s,
+            "accumulation_cap_samples": super::COOLDOWN_ACCUMULATION_CAP,
+            "audio_buffer_len_during_cooldown": cooldown_accumulation_cap_observed,
+            "buffered_audio_processed_after_expiry": cooldown_buffered_audio_processed_after_expiry,
+            "boundary_probe_elapsed_ms": cooldown_boundary_probe_elapsed_ms,
+            "boundary_probe_detected": cooldown_boundary_probe_detected,
+            "note": "GATE (hard assertions, mahbot-1052 pin 4): suppressed at ~2.5s, fires at \
+                     ~3.5s — slack margins, jitter-safe; the ~3.03s earliest-boundary probe is \
+                     report-only evidence (wall-clock jitter on a loaded bench CPU); probe sleeps \
+                     are excluded from detection_time_ms (mahbot-1052).",
         },
         "reproducibility": reproducibility,
         "mahbot1012": same_audio.to_json(),
