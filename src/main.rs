@@ -330,13 +330,24 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
     });
 
     // Periodic WAL checkpoint as defense-in-depth against data loss from
-    // crashes or missed shutdown-path checkpoints.
+    // crashes or missed shutdown-path checkpoints. Non-truncating (PASSIVE)
+    // below the WAL-size cap — TRUNCATE resets the shared WAL frame index,
+    // which is the two-writer corruption vector under live connections, so the
+    // periodic loop avoids it (see checkpoint::periodic_checkpoint_all_databases).
     spawn_cancellable(&mut tasks, &shutdown_token, "auto-checkpoint", async {
         loop {
             if !mahbot::shutdown::sleep_or_shutdown(Duration::from_mins(5)).await {
                 break;
             }
-            mahbot::checkpoint::checkpoint_all_databases().await;
+            // The self-update path checkpoints all stores itself and cancels
+            // the shutdown token right after; skip a periodic round that would
+            // land inside the update handoff window. A round already in flight
+            // when the update starts can still finish — bounded to one
+            // iteration, since the next sleep breaks on the cancelled token.
+            if mahbot::self_update::update_is_finalizing() {
+                break;
+            }
+            mahbot::checkpoint::periodic_checkpoint_all_databases().await;
             mahbot::checkpoint::verify_all_databases().await;
         }
     });

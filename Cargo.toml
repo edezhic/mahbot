@@ -23,6 +23,9 @@ default = ["full"]
 full = []
 voice-tests = []
 voice-debug = []
+# Gates the two-writer checkpoint-race repro harness (benches/wal_race_repro.rs),
+# a discovery/regression instrument — not part of default bench builds.
+wal-repro = []
 
 [[bin]]
 name = "mahbot"
@@ -168,6 +171,11 @@ serial_test = "3"
 name = "voice_pipeline_e2e"
 harness = false
 required-features = ["voice-tests"]
+
+[[bench]]
+name = "wal_race_repro"
+harness = false
+required-features = ["wal-repro"]
 
 [profile.dev]
 incremental = true

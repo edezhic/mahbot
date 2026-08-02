@@ -7,13 +7,16 @@ use crate::turso;
 use crate::util::UnwrapPoison;
 use crate::util::json;
 use anyhow::Context;
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use std::io;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::OnceCell;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tracing::warn;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use turso::{Row, Value, params};
@@ -100,9 +103,34 @@ impl LogStore {
     ///
     /// `pub(crate)` (matching every other store's generated `open`) so tests in
     /// other modules can create a real log store via [`crate::open_test_store!`].
+    ///
+    /// Boot-time quarantine: if the existing store fails integrity verification
+    /// (corruption-class `quick_check` output, or the open/verify path
+    /// panicking — opening a corrupt store under multiprocess_wal can panic),
+    /// the whole artifact family (database plus `-wal`/`-shm`/`-tshm`
+    /// sidecars) is moved aside to a timestamped quarantine name and a fresh
+    /// store is created. Logs-only by construction: this lives in the logs
+    /// open path and is never reachable from the shared store helpers. Boot
+    /// never fails because of the quarantine mechanism — rename failures are
+    /// logged and the store is recreated (or, in the extreme case, the
+    /// pre-quarantine error is surfaced).
     pub(crate) async fn open(root: &Path) -> anyhow::Result<Self> {
-        let conn = crate::turso::open_store(root, "logs", LOGS_SCHEMA).await?;
-        Ok(Self { conn })
+        match open_verified_logs_store(root).await {
+            Ok(conn) => Ok(Self { conn }),
+            Err(OpenFailure::Corrupt(reason)) => {
+                warn!(
+                    error = %reason,
+                    "logs store failed integrity verification — quarantining artifact family \
+                     and recreating a fresh store",
+                );
+                quarantine_logs_artifacts(root);
+                let conn = crate::turso::open_store(root, "logs", LOGS_SCHEMA)
+                    .await
+                    .context("Failed to recreate logs store after quarantine")?;
+                Ok(Self { conn })
+            }
+            Err(OpenFailure::Other(e)) => Err(e),
+        }
     }
 
     /// Insert a batch of log entries in a single transaction.
@@ -213,6 +241,132 @@ impl LogStore {
         }
 
         Ok((entries, total))
+    }
+}
+
+/// Outcome of opening + verifying the logs store at boot.
+enum OpenFailure {
+    /// Quarantine-worthy: integrity verification failed, the open failed with
+    /// a corruption-class error, or the open/verify path panicked (opening a
+    /// corrupt store under multiprocess_wal can panic).
+    Corrupt(String),
+    /// Non-quarantine failures (busy/locked/IO) — propagate unchanged.
+    Other(anyhow::Error),
+}
+
+/// Open the logs store and verify its integrity.
+///
+/// On a corruption-class failure the connection is dropped before returning so
+/// the caller can rename the artifact family (POSIX open-file rename
+/// semantics) and recreate the store — the recreated store must be the one
+/// registered in `LOG_STORE`/`iter_checkpoint_stores`.
+///
+/// The open itself is panic-absorbed: opening a corrupt store under
+/// multiprocess_wal can panic (e.g. the shared-WAL frame-index invariant), and
+/// a boot-time panic here must quarantine rather than crash startup.
+async fn open_verified_logs_store(root: &Path) -> Result<crate::turso::Connection, OpenFailure> {
+    let open = AssertUnwindSafe(crate::turso::open_store(root, "logs", LOGS_SCHEMA))
+        .catch_unwind()
+        .await;
+    let conn = match open {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(e)) => {
+            let db_path = root.join("db").join("logs.db");
+            // A store that exists but cannot be opened at all is corrupt —
+            // quarantine so boot can proceed with a fresh store. A missing
+            // file (first boot) opens fine, so this path implies an existing
+            // file that is unreadable. Busy/locked/IO-class open errors
+            // (disk full, transient permission) never quarantine — route
+            // through the same classifier as the quick_check path.
+            if db_path.exists() && is_corruption_class(&e) {
+                return Err(OpenFailure::Corrupt(format!("open failed: {e:#}")));
+            }
+            return Err(OpenFailure::Other(e));
+        }
+        Err(payload) => {
+            return Err(OpenFailure::Corrupt(format!(
+                "open panicked: {}",
+                crate::util::panic_message(&*payload)
+            )));
+        }
+    };
+    let verify = AssertUnwindSafe(conn.quick_check()).catch_unwind().await;
+    match verify {
+        Ok(Ok(())) => Ok(conn),
+        Ok(Err(e)) if is_corruption_class(&e) => Err(OpenFailure::Corrupt(format!("{e:#}"))),
+        Ok(Err(e)) => Err(OpenFailure::Other(e)),
+        Err(payload) => Err(OpenFailure::Corrupt(format!(
+            "integrity check panicked: {}",
+            crate::util::panic_message(&*payload)
+        ))),
+    }
+}
+
+/// True when a `quick_check` failure is corruption-class rather than a
+/// busy/locked/IO failure of the PRAGMA itself.
+///
+/// Two forms qualify: the PRAGMA returned a non-`ok` row (our
+/// `Database integrity check failed` bail), or the PRAGMA failed to execute
+/// with a message that is not a lock/busy or I/O condition (e.g. a page-level
+/// error reading a zeroed page — `Invalid page type`). Only corruption-class
+/// failures quarantine — a busy or locked store must never trigger the rename
+/// path.
+///
+/// Note: this is a negation-based substring heuristic. A corruption message
+/// that happens to contain `busy`/`locked` would be misclassified as
+/// non-corruption (boot fails rather than quarantines), and an I/O error
+/// lacking the expected tokens could false-quarantine. The open-failure path
+/// has a sharper inversion: a corrupt store that fails to OPEN with an
+/// I/O-flavored message (e.g. a zeroed page read surfacing as `i/o error`)
+/// is classified non-corruption and boot fails without quarantine — the
+/// opposite of the intended resilience. Conversely an error lacking the
+/// tokens (e.g. `No space left on device`, `too many open files`) false-
+/// quarantines a healthy store. Bounded to the logs-only boot path (the
+/// primary target — `Invalid page type` from zeroed pages — is caught);
+/// accepted as pragmatic.
+fn is_corruption_class(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}");
+    if msg.contains("Database integrity check failed") {
+        return true;
+    }
+    let lower = msg.to_lowercase();
+    !(lower.contains("busy")
+        || lower.contains("locked")
+        || lower.contains("i/o error")
+        || lower.contains("no such file")
+        || lower.contains("permission denied"))
+}
+
+/// Move the logs store's whole artifact family aside to a timestamped
+/// quarantine name. Best-effort: a rename failure is logged, never fatal.
+///
+/// The timestamp is second-granularity and `rename` would silently overwrite
+/// an existing destination, so a monotonically increasing sequence suffix
+/// guarantees uniqueness across multiple quarantines within the same second.
+fn quarantine_logs_artifacts(root: &Path) {
+    static QUARANTINE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let db_dir = root.join("db");
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let seq = QUARANTINE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let base = if seq == 0 {
+        format!("logs.db.quarantine-{stamp}")
+    } else {
+        format!("logs.db.quarantine-{stamp}-{seq}")
+    };
+    for suffix in ["", "-wal", "-shm", "-tshm"] {
+        let src = db_dir.join(format!("logs.db{suffix}"));
+        if !src.exists() {
+            continue;
+        }
+        let dst = db_dir.join(format!("{base}{suffix}"));
+        if let Err(e) = std::fs::rename(&src, &dst) {
+            warn!(
+                error = %e,
+                from = %src.display(),
+                to = %dst.display(),
+                "Failed to quarantine corrupt logs store artifact",
+            );
+        }
     }
 }
 
@@ -419,6 +573,16 @@ const LOG_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// by [`LOG_FLUSH_INTERVAL`], on batch-cap, or on channel close (flush-before-
 /// shutdown). A crash mid-batch loses at most [`LOG_BATCH_MAX`] entries —
 /// acceptable, since DB log inserts are diagnostics, not durable state.
+///
+/// A storage-layer panic (e.g. the shared-WAL frame-index invariant violation)
+/// must not silently freeze persistence: the flush is panic-absorbed with a
+/// bounded number of restarts and backoff, recorded on the visible failure
+/// surface, and past the bound the writer stops flushing with a terminal banner
+/// instead of spinning on a broken connection. During backoff sleeps the writer
+/// is not polling the channel, so lines accumulate in the unbounded channel —
+/// bounded by the backoff schedule, drained once flushing resumes. In the
+/// terminal stopped state the writer keeps draining the channel (broadcast +
+/// drop), so the channel does not grow indefinitely.
 fn spawn_log_writer(
     store: Arc<LogStore>,
     rx: UnboundedReceiver<String>,
@@ -450,7 +614,9 @@ fn spawn_log_writer_with_interval(
                     let Some(line) = maybe_line else {
                         // Channel closed (all senders dropped, e.g. tracing
                         // teardown on shutdown) — flush remaining and exit.
-                        flush_log_batch(&store, &mut batch).await;
+                        if !log_writer_stopped() {
+                            absorb_flush(&store, &mut batch).await;
+                        }
                         break;
                     };
 
@@ -468,19 +634,59 @@ fn spawn_log_writer_with_interval(
                         "log entry broadcast serialization failed; this should not happen",
                     ));
 
+                    if log_writer_stopped() {
+                        // Terminal state: keep draining + broadcasting, but drop
+                        // entries instead of pushing them onto a batch that will
+                        // never be flushed (prevents unbounded memory growth).
+                        continue;
+                    }
+
                     batch.push(entry);
                     if batch.len() >= LOG_BATCH_MAX {
-                        flush_log_batch(&store, &mut batch).await;
+                        absorb_flush(&store, &mut batch).await;
                     }
                 }
                 _ = flush_timer.tick() => {
-                    if !batch.is_empty() {
-                        flush_log_batch(&store, &mut batch).await;
+                    if !batch.is_empty() && !log_writer_stopped() {
+                        absorb_flush(&store, &mut batch).await;
                     }
                 }
             }
         }
     });
+}
+
+/// Flush the accumulated batch, absorbing storage-layer panics.
+///
+/// A panic here indicates a broken connection (e.g. the frame-index invariant
+/// violation); it is recorded on the failure surface, the batch is dropped, and
+/// the writer backs off before the next attempt. After
+/// [`LOG_WRITER_MAX_CONSECUTIVE_PANICS`] consecutive panics the writer enters
+/// the terminal stopped state (visible banner) rather than spinning forever.
+/// A successful flush resets the consecutive-panic counter.
+async fn absorb_flush(store: &LogStore, batch: &mut Vec<LogEntry>) {
+    let result = AssertUnwindSafe(flush_log_batch(store, batch))
+        .catch_unwind()
+        .await;
+    match result {
+        Ok(()) => reset_log_writer_panic_state(),
+        Err(payload) => {
+            batch.clear();
+            let message = format!(
+                "log writer storage panic: {}",
+                crate::util::panic_message(&*payload)
+            );
+            let consecutive = record_log_writer_panic(&message);
+            if log_writer_stopped() {
+                eprintln!(
+                    "[mahbot] log store writer stopped after {consecutive} consecutive storage \
+                     panics: {message}"
+                );
+            } else {
+                tokio::time::sleep(log_writer_panic_backoff(consecutive)).await;
+            }
+        }
+    }
 }
 
 /// Insert all accumulated entries in one transaction and clear the batch.
@@ -531,6 +737,48 @@ const LOG_INSERT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_
 /// Minimum interval between stderr warnings about log-write failures.
 const LOG_WRITE_STDERR_WARN_INTERVAL_MS: u64 = 60_000;
 
+/// Consecutive storage-panic restarts before the writer stops flushing
+/// permanently. A storage-layer panic indicates a broken connection (e.g. the
+/// shared-WAL frame-index invariant violation); retrying past this bound would
+/// spin forever on a connection that keeps panicking.
+const LOG_WRITER_MAX_CONSECUTIVE_PANICS: u32 = 5;
+
+/// Base backoff after a storage panic (doubles per consecutive panic, capped).
+const LOG_WRITER_PANIC_BACKOFF_MS: u64 = 500;
+
+/// Consecutive-panic restart state machine for the log writer.
+///
+/// Pure and unit-testable; the global writer state ([`LOG_WRITE_LAST_ERROR`])
+/// mirrors this struct.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LogWriterPanicState {
+    /// Consecutive storage-panic restarts in progress (0 when the last flush
+    /// succeeded).
+    pub consecutive_panics: u32,
+    /// True once the writer stopped flushing permanently after exceeding
+    /// [`LOG_WRITER_MAX_CONSECUTIVE_PANICS`] — the terminal banner state.
+    pub writer_stopped: bool,
+}
+
+impl LogWriterPanicState {
+    /// Record a storage panic; returns the updated consecutive-panic count.
+    #[must_use]
+    pub fn record_panic(&mut self) -> u32 {
+        self.consecutive_panics += 1;
+        if self.consecutive_panics >= LOG_WRITER_MAX_CONSECUTIVE_PANICS {
+            self.writer_stopped = true;
+        }
+        self.consecutive_panics
+    }
+
+    /// Reset the consecutive-panic counter after a successful flush. The
+    /// terminal stopped state is sticky — a stopped writer never flushes again
+    /// (the broken connection cannot be healed without reopening the store).
+    pub fn reset(&mut self) {
+        self.consecutive_panics = 0;
+    }
+}
+
 /// Snapshot of the log-writer failure surface, for display and tests.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LogWriteErrorInfo {
@@ -540,6 +788,8 @@ pub struct LogWriteErrorInfo {
     pub last_timestamp: Option<String>,
     /// Message of the most recent failure.
     pub last_message: Option<String>,
+    /// Writer panic-restart state.
+    pub panic_state: LogWriterPanicState,
 }
 
 /// Most recent log-batch insert failure observed by the writer task.
@@ -569,29 +819,100 @@ pub fn log_write_error_info() -> LogWriteErrorInfo {
 }
 
 /// Record a failed log-batch insert on the observability surface.
-///
-/// Updates the counter and last-error fields and emits a rate-limited stderr
-/// warning. stderr is not routed through tracing, so this cannot recurse into
-/// the writer task.
 fn record_log_write_failure(error: Option<anyhow::Error>) {
     let message = error.map_or_else(
         || "unknown log insert failure".to_string(),
         |e| format!("{e:#}"),
     );
-    let count = {
+    record_log_write_failure_impl(&message, LogFailureKind::Insert);
+}
+
+/// Record a storage-layer panic absorbed by the writer. Returns the updated
+/// consecutive-panic count. The terminal stopped state additionally gets an
+/// unconditional banner from the caller.
+fn record_log_writer_panic(message: &str) -> u32 {
+    record_log_write_failure_impl(message, LogFailureKind::WriterPanic)
+}
+
+/// Which failure kind is being recorded — drives the stderr label and whether
+/// the storage-panic restart counter is bumped.
+#[derive(Clone, Copy)]
+enum LogFailureKind {
+    Insert,
+    WriterPanic,
+}
+
+impl LogFailureKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Insert => "insert failure",
+            Self::WriterPanic => "writer panic",
+        }
+    }
+
+    fn records_panic(self) -> bool {
+        matches!(self, Self::WriterPanic)
+    }
+}
+
+/// Shared failure-recording core: bumps the counter, stamps timestamp/message,
+/// optionally records a storage-panic restart, and emits a rate-limited stderr
+/// warning (`kind` labels the failure on the stderr line). stderr is not
+/// routed through tracing, so this cannot recurse into the writer task.
+fn record_log_write_failure_impl(message: &str, kind: LogFailureKind) -> u32 {
+    let (count, consecutive) = {
         let mut guard = LOG_WRITE_LAST_ERROR.lock().unwrap_poison();
         let entry = guard.get_or_insert(LogWriteErrorInfo::default());
         entry.count += 1;
         entry.last_timestamp = Some(turso::now());
-        entry.last_message = Some(message.clone());
-        entry.count
+        entry.last_message = Some(message.to_string());
+        let consecutive = if kind.records_panic() {
+            entry.panic_state.record_panic()
+        } else {
+            entry.panic_state.consecutive_panics
+        };
+        (entry.count, consecutive)
     };
+    emit_stderr_warning(count, message, kind.label());
+    consecutive
+}
 
+/// Reset the consecutive-panic counter (and the terminal stopped flag) after a
+/// successful flush.
+fn reset_log_writer_panic_state() {
+    let mut guard = LOG_WRITE_LAST_ERROR.lock().unwrap_poison();
+    if let Some(entry) = guard.as_mut() {
+        entry.panic_state.reset();
+    }
+}
+
+/// True once the writer has permanently stopped flushing (terminal banner).
+fn log_writer_stopped() -> bool {
+    LOG_WRITE_LAST_ERROR
+        .lock()
+        .unwrap_poison()
+        .as_ref()
+        .is_some_and(|e| e.panic_state.writer_stopped)
+}
+
+/// Backoff after the `n`-th consecutive storage panic: 500ms, 1s, 2s, … capped
+/// at 30s. The terminal bound ([`LOG_WRITER_MAX_CONSECUTIVE_PANICS`]) ends the
+/// sequence before the cap engages today; the cap guards a future bound
+/// increase.
+fn log_writer_panic_backoff(consecutive: u32) -> std::time::Duration {
+    let shift = consecutive.saturating_sub(1).min(6);
+    let ms = LOG_WRITER_PANIC_BACKOFF_MS.saturating_mul(1 << shift);
+    std::time::Duration::from_millis(ms.min(30_000))
+}
+
+/// Rate-limited stderr warning (stderr bypasses tracing, so this cannot
+/// recurse into the writer task).
+fn emit_stderr_warning(count: u64, message: &str, kind: &str) {
     let now_ms = unix_millis();
     let last_warn_ms = LOG_WRITE_LAST_STDERR_WARN_MS.load(Ordering::SeqCst);
     if now_ms.saturating_sub(last_warn_ms) >= LOG_WRITE_STDERR_WARN_INTERVAL_MS {
         LOG_WRITE_LAST_STDERR_WARN_MS.store(now_ms, Ordering::SeqCst);
-        eprintln!("[mahbot] log store insert failure #{count}: {message}");
+        eprintln!("[mahbot] log store {kind} #{count}: {message}");
     }
 }
 
@@ -1127,5 +1448,146 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, 2, "no search filter should return all entries");
+    }
+
+    /// The writer's panic-restart bound: after enough consecutive panics the
+    /// writer enters the terminal stopped state (banner), and a successful
+    /// flush resets the counter (the stopped state is sticky).
+    #[test]
+    fn test_log_writer_panic_state_machine() {
+        let mut state = LogWriterPanicState::default();
+        assert!(!state.writer_stopped);
+        for i in 1..=LOG_WRITER_MAX_CONSECUTIVE_PANICS {
+            let _ = state.record_panic();
+            assert_eq!(state.consecutive_panics, i);
+        }
+        assert!(
+            state.writer_stopped,
+            "writer must stop after the consecutive-panic bound"
+        );
+        state.reset();
+        assert_eq!(state.consecutive_panics, 0);
+        assert!(
+            state.writer_stopped,
+            "terminal stopped state is sticky across reset"
+        );
+    }
+
+    /// Boot-time quarantine: a logs store whose main DB file is corrupt is
+    /// moved aside to a timestamped quarantine name and a fresh store is
+    /// created in its place, without failing the open.
+    #[tokio::test]
+    async fn test_log_store_open_quarantines_corrupt_store() {
+        let tmp = tempfile::TempDir::new().expect("temp dir for test");
+        let root = tmp.path();
+
+        // Build a store with real data, then checkpoint so all pages live in
+        // the main DB file (not the WAL), then close it.
+        {
+            let store = LogStore::open(root).await.expect("open healthy store");
+            store
+                .insert_batch(&[LogEntry {
+                    timestamp: "2025-01-01T00:00:00Z".into(),
+                    level: "INFO".into(),
+                    target: "test".into(),
+                    message: "pre-corruption".into(),
+                    fields: serde_json::Value::Null,
+                    agent_id: String::new(),
+                    agent_role: String::new(),
+                    workspace: String::new(),
+                }])
+                .await
+                .expect("seed entry");
+            store
+                .conn
+                .checkpoint()
+                .await
+                .expect("checkpoint so pages land in the main DB file");
+        }
+
+        // Corrupt a b-tree page in the main DB file (zero page 2; the header
+        // page 1 stays intact so the file still opens).
+        let db_path = root.join("db").join("logs.db");
+        let bytes = std::fs::read(&db_path).expect("read db file");
+        assert!(bytes.len() > 8192, "test needs a multi-page db file");
+        let mut corrupted = bytes.clone();
+        corrupted[4096..8192].fill(0);
+        std::fs::write(&db_path, corrupted).expect("corrupt db file");
+
+        // Open must succeed with a fresh store, leaving the corrupt artifact
+        // family quarantined.
+        let store = LogStore::open(root).await.expect("open must not fail");
+        let (_, total) = store
+            .query(&LogQuery::default())
+            .await
+            .expect("fresh store query");
+        assert_eq!(total, 0, "fresh store must be empty");
+        let quarantined: Vec<_> = std::fs::read_dir(root.join("db"))
+            .expect("read db dir")
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("quarantine-"))
+            .collect();
+        assert!(
+            !quarantined.is_empty(),
+            "corrupt artifact family must be quarantined, found: {quarantined:?}"
+        );
+    }
+
+    /// Boot-time quarantine via the open-failure path: a store whose header is
+    /// so corrupt it cannot even be opened (invalid page-size field) is still
+    /// quarantined and recreated, rather than failing boot.
+    #[tokio::test]
+    async fn test_log_store_open_quarantines_unopenable_store() {
+        let tmp = tempfile::TempDir::new().expect("temp dir for test");
+        let root = tmp.path();
+
+        {
+            let store = LogStore::open(root).await.expect("open healthy store");
+            store
+                .insert_batch(&[LogEntry {
+                    timestamp: "2025-01-01T00:00:00Z".into(),
+                    level: "INFO".into(),
+                    target: "test".into(),
+                    message: "pre-corruption".into(),
+                    fields: serde_json::Value::Null,
+                    agent_id: String::new(),
+                    agent_role: String::new(),
+                    workspace: String::new(),
+                }])
+                .await
+                .expect("seed entry");
+            store
+                .conn
+                .checkpoint()
+                .await
+                .expect("checkpoint so pages land in the main DB file");
+        }
+
+        // Zero the header's page-size field (big-endian u16 at byte offset 16)
+        // so the file cannot be opened at all — Limbo bails with a corruption
+        // error ("invalid page size in database header") rather than an IO error.
+        let db_path = root.join("db").join("logs.db");
+        let mut bytes = std::fs::read(&db_path).expect("read db file");
+        bytes[16] = 0;
+        bytes[17] = 0;
+        std::fs::write(&db_path, bytes).expect("corrupt db file");
+
+        let store = LogStore::open(root).await.expect("open must not fail");
+        let (_, total) = store
+            .query(&LogQuery::default())
+            .await
+            .expect("fresh store query");
+        assert_eq!(total, 0, "fresh store must be empty");
+        let quarantined: Vec<_> = std::fs::read_dir(root.join("db"))
+            .expect("read db dir")
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("quarantine-"))
+            .collect();
+        assert!(
+            !quarantined.is_empty(),
+            "unopenable store must be quarantined, found: {quarantined:?}"
+        );
     }
 }

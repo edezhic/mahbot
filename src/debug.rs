@@ -312,8 +312,8 @@ fn artifact_error_message(db_path: &Path) -> String {
          `-wal` file is empty while the `.tshm` coordination header advertises \
          live WAL frames (foreign standard-SQLite activity likely removed or \
          replaced the `-wal` files under the daemon). Query a snapshot \
-         copy instead — see docs/ops/wal-snapshots.md. Never delete or recreate \
-         `-wal`/`-shm`/`-tshm` files while the daemon runs.",
+         copy instead — see the snapshot-query procedure in the README. Never \
+         delete or recreate `-wal`/`-shm`/`-tshm` files while the daemon runs.",
         db_path.display()
     )
 }
@@ -333,8 +333,8 @@ fn corruption_error_message(db_path: &Path, retries: usize) -> String {
         format!(
             "database corruption/inconsistency: cannot read '{}' — the read \
              produced a WAL/page error even after {retries} retries. This is a \
-             live store: query a snapshot copy instead (see \
-             docs/ops/wal-snapshots.md), or retry during a quiet window.",
+             live store: query a snapshot copy instead (see the snapshot-query \
+             procedure in the README), or retry during a quiet window.",
             db_path.display(),
         )
     } else {
@@ -344,7 +344,8 @@ fn corruption_error_message(db_path: &Path, retries: usize) -> String {
              No `-tshm` was present, so this is a snapshot copy, not a live \
              store. Re-copy the store files (a copy taken mid-checkpoint can be \
              inconsistent); if a fresh copy still fails, the store's on-disk \
-             data itself is corrupt — see docs/ops/wal-snapshots.md.",
+             data itself is corrupt — see the snapshot-query procedure in the \
+             README.",
             db_path.display()
         )
     }
@@ -675,7 +676,7 @@ mod tests {
         let msg = artifact_error_message(Path::new("/tmp/x/board.db"));
         assert!(msg.contains("live instance artifact"));
         assert!(msg.contains("snapshot"));
-        assert!(msg.contains("wal-snapshots.md"));
+        assert!(msg.contains("README"));
     }
 
     /// End-to-end: `run_debug_with_args` opens a real (temporary) store

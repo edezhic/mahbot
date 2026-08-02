@@ -2,10 +2,11 @@
 //!
 //! Uses `flock()` for single-instance enforcement (kernel guarantees lock release on
 //! process death). The update flow: `cargo build --release` → `self_replace` →
-//! copy to cargo install bin → release lock → spawn new instance from cargo bin
-//! path (or `current_exe()` fallback) → remove build artifact (guarded against
-//! deleting the spawn target, `current_exe()`, or the cargo bin path) →
-//! checkpoint all Turso databases → `exit(0)`.
+//! copy to cargo install bin → shutdown agents → checkpoint all Turso databases
+//! (the last single-writer checkpoint, while the instance lock is still held) →
+//! release lock → spawn new instance from cargo bin path (or `current_exe()`
+//! fallback) → remove build artifact (guarded against deleting the spawn
+//! target, `current_exe()`, or the cargo bin path) → `exit(0)`.
 //!
 //! The cargo install path resolution uses `$CARGO_HOME` if set, else
 //! `~/.cargo/bin` via `directories::UserDirs` — this ensures the
@@ -22,7 +23,7 @@
 //!
 //! `posix_spawn` triggers async Gatekeeper code-signing validation; deleting the
 //! spawn target during validation produces empty stderr (SIGKILL by `syspolicyd`).
-//! See `should_delete_build_artifact()` and `execute_update()` steps 12–13.
+//! See `should_delete_build_artifact()` and `execute_update()` steps 13–14.
 //!
 //! Self-update is only available when running from the original build checkout
 //! directory — `CARGO_MANIFEST_DIR` is a compile-time constant embedded via
@@ -243,6 +244,20 @@ static UPDATE_MUTEX: Mutex<()> = Mutex::const_new(());
 
 // ── Execute update ────────────────────────────────────────────────────────
 
+/// Set while [`execute_update`] runs its finalizing window (step 10 shutdown
+/// through `exit(0)`). During this window the update path owns the process:
+/// the GUI exit path waits ([`update_is_finalizing`]) instead of exiting, so a
+/// window close or SIGINT cannot abort the update's checkpoint on the iced
+/// runtime and leave the daemon down without a replacement.
+static UPDATE_FINALIZING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True while [`execute_update`] is in its finalizing window (daemon shut
+/// down; checkpoint, lock release, spawn, and `exit(0)` pending).
+#[must_use]
+pub fn update_is_finalizing() -> bool {
+    UPDATE_FINALIZING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Execute a self-update: build from source, swap binary, install to cargo bin,
 /// notify admin, restart.
 ///
@@ -349,28 +364,46 @@ pub(crate) async fn execute_update() -> Result<()> {
     notify_admin("🔄 Starting new instance…", admin_target.as_deref()).await;
 
     // 10. Shutdown: cancel all agents, close browser sessions, signal shutdown.
+    //     From here through exit(0) the update path owns the process: the GUI
+    //     exit path waits (update_is_finalizing) instead of exiting, so this
+    //     sequence cannot be aborted by a window close or SIGINT racing the
+    //     step-11 checkpoint on the iced runtime.
+    UPDATE_FINALIZING.store(true, std::sync::atomic::Ordering::SeqCst);
     crate::registry::AGENT_REGISTRY.shutdown_all();
     crate::tools::browser::close_all_browser_sessions().await;
     crate::shutdown::shutdown();
 
-    // 11. Release instance lock so the child process can acquire it on startup.
+    // 11. Checkpoint all databases BEFORE releasing the instance lock and
+    //     spawning the replacement. `exit(0)` below bypasses Rust destructors,
+    //     so Turso connections are never properly closed. With the lock still
+    //     held this is the last single-writer checkpoint: no checkpoint runs
+    //     after the replacement is live (the GUI exit path waits while the
+    //     update is finalizing — see `save_and_exit` / `update_is_finalizing`).
+    crate::checkpoint::checkpoint_all_databases().await;
+
+    // 12. Release instance lock so the child process can acquire it on startup.
     release_instance_lock().await;
 
-    // 12. Spawn the new instance from the determined spawn path.
+    // 13. Spawn the new instance from the determined spawn path.
     //     On macOS, posix_spawn triggers asynchronous Gatekeeper code signature
     //     validation. Spawning before deletion guarantees the spawn target is
     //     never deleted during or before the child's startup window.
     if let Err(e) = spawn_new_instance_from(&spawn_path, admin_target.as_deref()).await {
-        // Spawn failed — re-acquire the lock since the process stays alive.
+        // Spawn failed — the process stays alive (unless a genuine window
+        // close was requested during the finalizing window, in which case the
+        // GUI honors it with its own checkpoint + exit via UpdateResult).
+        // Clear the finalizing flag and re-acquire the lock.
+        UPDATE_FINALIZING.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Re-acquire the lock since the process stays alive.
         if let Err(lock_err) = reacquire_instance_lock().await {
             error!(%lock_err, "Failed to re-acquire instance lock after spawn failure");
         }
         return Err(e);
     }
 
-    // 13. Clean up the build output binary after successful spawn.
+    // 14. Clean up the build output binary after successful spawn.
     //     Note: never delete:
-    //     - The spawn target (prevents macOS Gatekeeper race — see step 12).
+    //     - The spawn target (prevents macOS Gatekeeper race — see step 13).
     //     - The current_exe path (same Gatekeeper concern).
     //     - The cargo bin path (same Gatekeeper concern, also the spawn target).
     //     All comparisons use canonicalized paths to handle symlinks correctly.
@@ -392,12 +425,6 @@ pub(crate) async fn execute_update() -> Result<()> {
             "Skipping deletion of build artifact (matches current_exe or cargo bin path)"
         );
     }
-
-    // 14. Checkpoint all databases to prevent WAL data loss.
-    //     `exit(0)` below bypasses Rust destructors, so Turso connections are
-    //     never properly closed. Without this checkpoint, pending WAL writes are
-    //     silently lost (e.g., archived tickets reappear after restart).
-    crate::checkpoint::checkpoint_all_databases().await;
 
     // 15. Exit — spawn succeeded.
     std::process::exit(0);

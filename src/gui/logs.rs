@@ -532,6 +532,11 @@ impl LogsState {
             .last_message
             .as_deref()
             .unwrap_or("unknown log insert failure");
+        let stopped = if info.panic_state.writer_stopped {
+            " Log persistence is STOPPED until the daemon restarts."
+        } else {
+            ""
+        };
 
         container(
             row![
@@ -541,7 +546,7 @@ impl LogsState {
                 Space::new().width(6),
                 text(format!(
                     "Log store write failures: {} — durable log persistence is degraded{last}. \
-                     Latest error: {detail}",
+                     Latest error: {detail}{stopped}",
                     info.count
                 ))
                 .size(12)

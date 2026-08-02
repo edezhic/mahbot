@@ -205,8 +205,9 @@ pub async fn run_wal_guard_loop() {
                         "wal-guard: orphaned WAL detected — .tshm advertises live frames but \
                          the on-disk -wal is empty; the daemon's WAL fd is orphaned \
                          (foreign standard-SQLite activity). Reads through .tshm will hit \
-                         torn-frame errors. Query snapshot copies (docs/ops/wal-snapshots.md); \
-                         never delete/recreate -wal/-shm/-tshm while the daemon runs.",
+                         torn-frame errors. Query snapshot copies (see the snapshot-query \
+                         procedure in the README); never delete/recreate -wal/-shm/-tshm \
+                         while the daemon runs.",
                     );
                 }
                 last_seen.insert(store.clone(), true);

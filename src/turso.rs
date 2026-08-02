@@ -535,12 +535,43 @@ impl Connection {
     /// unwritten WAL pages.
     ///
     /// Safe to call even if the database is not in WAL mode — non-WAL databases
-    /// treat this as a no-op.
-    pub async fn checkpoint(&self) -> anyhow::Result<()> {
-        self.query("PRAGMA wal_checkpoint(TRUNCATE);", ())
+    /// treat this as a no-op (the result row reports `log == checkpointed == -1`).
+    ///
+    /// The result row is parsed into a [`CheckpointOutcome`] so callers can
+    /// distinguish a complete checkpoint from a busy or partial one — Limbo
+    /// never reports a busy result in the row's first column on its success
+    /// path, so incompleteness must be derived from `log > checkpointed`.
+    pub async fn checkpoint(&self) -> anyhow::Result<CheckpointOutcome> {
+        self.run_checkpoint("TRUNCATE").await
+    }
+
+    /// Run a non-truncating (PASSIVE) WAL checkpoint.
+    ///
+    /// Backfills as many WAL frames as possible into the main database file
+    /// without blocking readers or writers and without truncating the WAL —
+    /// it never resets the shared WAL frame index, so it is safe to run while
+    /// other connections are live. The WAL file keeps growing until a
+    /// TRUNCATE checkpoint runs; callers bound that growth with a size cap.
+    pub async fn checkpoint_passive(&self) -> anyhow::Result<CheckpointOutcome> {
+        self.run_checkpoint("PASSIVE").await
+    }
+
+    async fn run_checkpoint(&self, mode: &str) -> anyhow::Result<CheckpointOutcome> {
+        let rows = self
+            .query(&format!("PRAGMA wal_checkpoint({mode});"), ())
             .await
             .context("Failed to checkpoint WAL")?;
-        Ok(())
+        let row = rows
+            .first()
+            .context("PRAGMA wal_checkpoint returned no result row")?;
+        Ok(CheckpointOutcome {
+            busy: match row.get_value(0)? {
+                Value::Integer(n) => n != 0,
+                _ => anyhow::bail!("Unexpected result from PRAGMA wal_checkpoint"),
+            },
+            log_frames: int_column(row, 1)?,
+            checkpointed_frames: int_column(row, 2)?,
+        })
     }
 
     /// Run PRAGMA quick_check to verify database integrity.
@@ -600,6 +631,42 @@ impl Connection {
             }
         }
         Ok(problems)
+    }
+}
+
+/// Outcome of `PRAGMA wal_checkpoint`, parsed from its 3-column result row
+/// (`busy`, `log`, `checkpointed`).
+///
+/// Limbo's `op_checkpoint` writes `busy == 0` on its success path; `busy == 1`
+/// is set only on the pager checkpoint error path. A partial checkpoint is
+/// therefore detected via `log > checkpointed` (frames remaining in the WAL).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointOutcome {
+    /// True when the checkpoint returned SQLITE_BUSY (locks held by another
+    /// writer/checkpointer).
+    pub busy: bool,
+    /// WAL frame high-water mark after the checkpoint (`-1` for non-WAL
+    /// databases). After a complete TRUNCATE the frame index resets, so this
+    /// equals `checkpointed_frames`; `is_complete` relies on that reset.
+    pub log_frames: i64,
+    /// Frames backfilled into the database by the checkpoint (`-1` for
+    /// non-WAL databases).
+    pub checkpointed_frames: i64,
+}
+
+impl CheckpointOutcome {
+    /// True when every WAL frame was backfilled and no busy condition was hit.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        !self.busy && self.log_frames <= self.checkpointed_frames
+    }
+}
+
+/// Read an integer column from a checkpoint result row.
+fn int_column(row: &Row, idx: usize) -> anyhow::Result<i64> {
+    match row.get_value(idx)? {
+        Value::Integer(n) => Ok(n),
+        _ => anyhow::bail!("Unexpected result from PRAGMA wal_checkpoint"),
     }
 }
 
@@ -942,7 +1009,10 @@ mod tests {
     ///
     /// This is a source-scanning tripwire, not a security boundary: any new
     /// module that opens a database via `turso::Builder` / `Builder::new_local`
-    /// directly fails this test with a pointer to the canonical path.
+    /// directly fails this test with a pointer to the canonical path. (The
+    /// cross-process repro bench in `benches/` is outside this scan and is a
+    /// documented exception — it needs raw builder access for the two-writer
+    /// harness.)
     #[test]
     fn raw_builder_usage_is_confined_to_persistence_and_debug() {
         const PATTERNS: [&str; 2] = ["turso::Builder", "Builder::new_local"];
@@ -1067,6 +1137,68 @@ mod tests {
     }
 
     // ── quick_check tests ────────────────────────────────────────────
+
+    /// Verify that checkpoint reports a complete outcome on a healthy database
+    /// for both TRUNCATE and PASSIVE modes, and that the outcome is parsed from
+    /// the result row (not silently discarded as success).
+    #[tokio::test]
+    async fn test_checkpoint_reports_complete_outcome() {
+        let tmp = tempfile::TempDir::new().expect("temp dir for test");
+        let conn = Connection::open(tmp.path().join("test.db").as_path())
+            .await
+            .expect("open test database");
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _test (id INTEGER PRIMARY KEY, val TEXT NOT NULL)",
+            (),
+        )
+        .await
+        .expect("create test table");
+        conn.execute("INSERT INTO _test (id, val) VALUES (1, 'hello')", ())
+            .await
+            .expect("insert test row");
+
+        for mode in ["checkpoint", "checkpoint_passive"] {
+            let outcome = match mode {
+                "checkpoint" => conn.checkpoint().await,
+                _ => conn.checkpoint_passive().await,
+            }
+            .expect("checkpoint should succeed on a healthy database");
+            assert!(
+                outcome.is_complete(),
+                "{mode} outcome must be complete: {outcome:?}"
+            );
+        }
+    }
+
+    /// Exercise the busy/partial detection directly: `is_complete` is false for
+    /// a busy condition or when WAL frames remain uncheckpointed (`log >
+    /// checkpointed`), and true only for a fully backfilled, non-busy outcome.
+    #[test]
+    fn checkpoint_outcome_completeness_predicate() {
+        let complete = CheckpointOutcome {
+            busy: false,
+            log_frames: 0,
+            checkpointed_frames: 0,
+        };
+        assert!(complete.is_complete());
+
+        let busy = CheckpointOutcome {
+            busy: true,
+            log_frames: 0,
+            checkpointed_frames: 0,
+        };
+        assert!(!busy.is_complete(), "busy outcome must be incomplete");
+
+        let partial = CheckpointOutcome {
+            busy: false,
+            log_frames: 12,
+            checkpointed_frames: 5,
+        };
+        assert!(
+            !partial.is_complete(),
+            "uncheckpointed WAL frames must be incomplete"
+        );
+    }
 
     /// Verify that quick_check returns Ok on a healthy (empty) database.
     #[tokio::test]

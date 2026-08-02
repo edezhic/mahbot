@@ -459,6 +459,13 @@ pub struct Dashboard {
     /// Whether a self-update is available or in progress.
     /// Controls button visibility/disabled state.
     update_status: UpdateStatus,
+    /// True when a genuine window close was requested while the update was in
+    /// its finalizing window (daemon shut down; checkpoint + spawn + exit
+    /// pending). Only a user close (`CloseRequested`) sets this — the update's
+    /// own step-10 `shutdown()` also fires `Message::Shutdown` via the
+    /// subscription, which must not be mistaken for an exit request. If the
+    /// update fails, this flag makes the GUI run its own checkpoint + exit.
+    exit_requested_during_update: bool,
     logs_state: logs::LogsState,
     board_state: board::BoardState,
     sessions_state: sessions::SessionsState,
@@ -501,6 +508,7 @@ impl Dashboard {
             } else {
                 UpdateStatus::Unavailable
             },
+            exit_requested_during_update: false,
             logs_state: logs::LogsState::new(),
             board_state: board::BoardState::new(),
             sessions_state: sessions::SessionsState::new(),
@@ -580,8 +588,27 @@ impl Dashboard {
         );
     }
 
-    fn save_and_exit(&self) -> Task<Message> {
+    fn save_and_exit(&mut self, close_requested: bool) -> Task<Message> {
         self.persist_window_state();
+        if self.update_status == UpdateStatus::InProgress
+            && crate::self_update::update_is_finalizing()
+        {
+            // The update path has shut down the daemon and owns the exit:
+            // checkpoint (execute_update step 11), lock release, spawn, exit(0).
+            // Exiting here would drop the iced runtime and abort that sequence
+            // mid-checkpoint, leaving the daemon down without a replacement —
+            // so wait instead. Only a genuine window close records the exit
+            // request (the update's own shutdown fires this path too); if the
+            // update fails, UpdateResult re-enters this path (with the flag
+            // cleared and status no longer InProgress) and honors the close.
+            if close_requested {
+                self.exit_requested_during_update = true;
+            }
+            return Task::none();
+        }
+        // Not updating, or the update is still building (this exit aborts it —
+        // the update hasn't checkpointed anything yet): the normal exit
+        // checkpoint still runs.
         Task::perform(crate::checkpoint::checkpoint_all_databases(), |()| {
             Message::CheckpointAndExit
         })
@@ -915,7 +942,8 @@ impl Dashboard {
             Message::BootWorkspaces(workspaces, restored_name) => {
                 self.apply_boot_workspaces(workspaces, restored_name.as_deref().unwrap_or(""))
             }
-            Message::Shutdown | Message::CloseRequested(_) => self.save_and_exit(),
+            Message::CloseRequested(_) => self.save_and_exit(true),
+            Message::Shutdown => self.save_and_exit(false),
             Message::CheckpointAndExit => iced::exit(),
             Message::WindowEvent(id, event) => match event {
                 window::Event::Resized(new_size) => {
@@ -1083,6 +1111,13 @@ impl Dashboard {
                     self.update_status = UpdateStatus::Available;
                     self.toasts
                         .push(Toast::from_toast_msg(&ToastMessage::Error(err)));
+                    if self.exit_requested_during_update {
+                        // A genuine window close was requested while the update
+                        // owned the exit; it failed, so run the normal exit
+                        // checkpoint.
+                        self.exit_requested_during_update = false;
+                        return self.save_and_exit(false);
+                    }
                 }
                 Task::none()
             }
