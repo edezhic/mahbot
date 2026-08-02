@@ -6734,6 +6734,418 @@ fn synthetic_fallback_probe(
 // The main integration test / benchmark entry point
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Env-gated FAPH phase (mahbot-1057): real-audio false-acceptance-per-hour
+/// bench.
+///
+/// Feeds the pinned corpus (`faph_corpus_manifest.json` — alexwengg/musan_mini,
+/// 812 files, ~5.99 h audio, SHA-256-pinned per file) through the production
+/// streaming detection path as **ambient audio** (fresh
+/// [`super::PipelineCtx`] per corpus file, all samples fed in
+/// [`FRAME_LENGTH`](super::FRAME_LENGTH) chunks via [`process_frame`], no
+/// early exit) and counts false-accept events.
+///
+/// # FA-counting semantics (pinned by mahbot-1053 planning gate)
+///
+/// - **Event-based**: each fresh detection event (a new
+///   `last_wake_word_detection` timestamp) counts as 1 FA.
+/// - **Cooldown suppression**: production's `WAKE_WORD_COOLDOWN` (3 s) gate
+///   suppresses re-detections within 3 s — suppressed re-detections cannot
+///   set a new timestamp and therefore never count.
+/// - **Fresh ctx per file**: [`super::PipelineCtx::new`] per corpus file.
+/// - **audio-hours = total duration fed INCLUDING silence** (all samples,
+///   not just VAD-positive frames).
+/// - **Ambient feed, not commands**: [`run_streaming_detection`] early-exits
+///   on the first detection and cannot count multiple events — this phase
+///   feeds every sample through [`process_frame`] and re-arms the pipeline
+///   after each event exactly like production's post-command reset
+///   (`reset_pipeline_state(Soft)` + `is_recording = false`, preserving the
+///   cooldown timestamp).
+///
+/// # Degraded-skip contract
+///
+/// Corpus absent / download fail / hash mismatch / offline ⇒ returns a
+/// documented `"status": "skipped"` report with reason keys — NEVER a hard
+/// error (the bench completes with a documented skip).
+///
+/// # Return value
+///
+/// `None` when the env gate is off (standard-run report surface untouched —
+/// no `faph` key is added to the JSON).  `Some(json)` when
+/// `MAHBOT_FAPH=1` (ran or documented-skipped).
+fn run_faph_phase() -> Option<serde_json::Value> {
+    if std::env::var("MAHBOT_FAPH").as_deref() != Ok("1") {
+        return None;
+    }
+    Some(run_faph_phase_inner())
+}
+
+/// Inner FAPH phase body (env gate already checked).
+#[expect(clippy::too_many_lines)]
+fn run_faph_phase_inner() -> serde_json::Value {
+    let phase_start = Instant::now();
+
+    // ── Corpus manifest (pinned, embedded at compile time) ──
+    let manifest: serde_json::Value =
+        match serde_json::from_str(include_str!("faph_corpus_manifest.json")) {
+            Ok(m) => m,
+            Err(e) => {
+                return faph_skip_json(
+                    "manifest_parse_failed",
+                    &format!("embedded manifest failed to parse: {e}"),
+                );
+            }
+        };
+    let files: Vec<(String, String, u64)> = match manifest["files"].as_array() {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|f| {
+                Some((
+                    f[0].as_str()?.to_string(),
+                    f[1].as_str()?.to_string(),
+                    f[2].as_u64()?,
+                ))
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let repo = manifest["repo"].as_str().unwrap_or("alexwengg/musan_mini");
+    let revision = manifest["revision"].as_str().unwrap_or("");
+    let corpus_sha = manifest["corpus_sha256"].as_str().unwrap_or("?");
+    let version = manifest["version"].as_u64().unwrap_or(0);
+    if files.is_empty() {
+        return faph_skip_json("manifest_empty", "manifest file list is empty");
+    }
+
+    // ── Corpus cache root (self-contained, persistent, under ~/.mahbot/) ──
+    let cache_root = match crate::config::default_config_dir() {
+        Ok(d) => d.join("faph_corpus"),
+        Err(e) => {
+            return faph_skip_json(
+                "cache_root_unavailable",
+                &format!("cannot resolve ~/.mahbot for corpus cache: {e}"),
+            );
+        }
+    };
+
+    // ── Self-contained download/verify (no embedder.rs dependency) ────────
+    let mut download_errors: Vec<String> = Vec::new();
+    for (path, sha256, size) in &files {
+        let dest = cache_root.join(path);
+        if dest.exists() && std::fs::metadata(&dest).is_ok_and(|m| m.len() == *size) {
+            // Verify SHA-256 (fast path: already verified on a prior run or
+            // download below).
+            match faph_sha256_file(&dest) {
+                Ok(h) if h == *sha256 => continue,
+                Ok(_) => {
+                    download_errors.push(format!("{path}: hash mismatch on cached file"));
+                    continue;
+                }
+                Err(e) => {
+                    download_errors.push(format!("{path}: read error {e}"));
+                    continue;
+                }
+            }
+        }
+        let url = format!("https://huggingface.co/datasets/{repo}/resolve/{revision}/{path}");
+        match faph_download_file(&url, &dest, sha256) {
+            Ok(()) => {
+                info!("FAPH corpus: downloaded {path} ({size} bytes)");
+            }
+            Err(e) => {
+                download_errors.push(format!("{path}: {e}"));
+            }
+        }
+    }
+
+    // ── Degraded-skip contract: any missing/mismatched file → skip ────────
+    if !download_errors.is_empty() {
+        let reason = format!(
+            "corpus incomplete — {} file(s) failed download/verify (first: {})",
+            download_errors.len(),
+            download_errors[0],
+        );
+        return faph_skip_json("corpus_download_failed", &reason);
+    }
+
+    // ── Feed loop: ambient audio FA counting ──────────────────────────────
+    // Classifier + verifier must be set as globals (score_stride8_window
+    // reads them from voice_state()).  The bench's earlier phases set them;
+    // re-set from the local trained models to be self-contained.
+    let Some(weights) = super::get_classifier_weights() else {
+        return faph_skip_json(
+            "classifier_unavailable",
+            "no trained classifier weights in global state",
+        );
+    };
+    let verifier = super::get_verifier();
+    super::set_classifier_weights(weights.clone());
+    super::set_verifier(verifier.clone());
+
+    let mut total_audio_secs = 0.0f64;
+    let mut total_events = 0u64;
+    let mut files_fed = 0u64;
+    let mut files_decode_failed = 0u64;
+    let mut per_file_events: Vec<serde_json::Value> = Vec::new();
+
+    for (path, _sha256, _size) in &files {
+        let p = cache_root.join(path);
+        let samples = match crate::audio::local_transcriber::decode_audio_to_mono_f32(&p) {
+            Ok(s) => s,
+            Err(e) => {
+                files_decode_failed += 1;
+                warn!("FAPH corpus: decode failed for {path}: {e}");
+                continue;
+            }
+        };
+        let audio_secs = samples.len() as f64 / f64::from(super::SAMPLE_RATE);
+        total_audio_secs += audio_secs;
+        let events = faph_count_events(&samples);
+        total_events += events;
+        files_fed += 1;
+        per_file_events.push(serde_json::json!({
+            "path": path,
+            "audio_secs": audio_secs,
+            "fa_events": events,
+        }));
+    }
+
+    let wall_secs = phase_start.elapsed().as_secs_f64();
+    let audio_hours = total_audio_secs / 3600.0;
+    let fa_per_hour = if audio_hours > 0.0 {
+        total_events as f64 / audio_hours
+    } else {
+        f64::NAN
+    };
+    // Poisson 95% upper bound on the rate (k events in T hours): the largest
+    // λ such that the Poisson tail P(X ≤ k) ≥ 0.025 is 0.5·χ²(0.975, 2(k+1))/T.
+    // Wilson–Hilferty chi-square quantile (<0.6% error at these df).
+    let poisson_upper_events = 0.5 * chi2_quantile(0.975, 2.0 * (total_events as f64 + 1.0));
+    let poisson_upper_per_hour = if audio_hours > 0.0 {
+        poisson_upper_events / audio_hours
+    } else {
+        f64::NAN
+    };
+
+    info!(
+        "FAPH (mahbot-1057): {files_fed} files fed, {audio_hours:.2} h audio, {total_events} FA events, \
+         {fa_per_hour:.4} FA/h (Poisson 95% upper {poisson_upper_per_hour:.4}/h), {wall_secs:.1}s wall",
+    );
+    eprintln!(
+        "         FAPH: {files_fed} files fed, {audio_hours:.2} h audio, {total_events} FA events, \
+         {fa_per_hour:.4} FA/h (Poisson 95% upper {poisson_upper_per_hour:.4}/h), {wall_secs:.1}s wall",
+    );
+
+    serde_json::json!({
+        "status": "ran",
+        "metric": "SPONTANEOUS-CONFUSABLE FA rate — corpus contains ~zero wake-word \
+                   utterances, so every detection is a spontaneous false accept",
+        "corpus": {
+            "manifest_version": version,
+            "repo": repo,
+            "revision": revision,
+            "corpus_sha256": corpus_sha,
+            "files_total": files.len(),
+            "audio_hours_total": total_audio_secs / 3600.0,
+        },
+        "feed": {
+            "files_fed": files_fed,
+            "files_decode_failed": files_decode_failed,
+            "audio_hours_fed": audio_hours,
+            "wall_secs": wall_secs,
+            "realtime_factor": if wall_secs > 0.0 { total_audio_secs / wall_secs } else { f64::NAN },
+            "semantics": "ambient feed — fresh PipelineCtx per corpus file, all samples in \
+                          FRAME_LENGTH chunks via process_frame, no early exit; \
+                          audio-hours include silence",
+        },
+        "fa": {
+            "events": total_events,
+            "fa_per_hour": fa_per_hour,
+            "poisson_95_upper_per_hour": poisson_upper_per_hour,
+            "poisson_95_upper_events": poisson_upper_events,
+            "cooldown_suppression": "WAKE_WORD_COOLDOWN (3 s) — suppressed re-detections \
+                                     cannot fire and never count",
+            "fresh_ctx_per_file": true,
+        },
+        "provenance": "0.008–0.083 FA/h projection = manager's 7050-fork analysis of \
+                       synthetic cross-speaker noise-overlap rates (recorded when citing); \
+                       NOT a direct <1 FA/24h demonstration — this phase reports a Poisson \
+                       confidence/upper bound from the actual audio-hours processed",
+        "per_file": per_file_events,
+    })
+}
+
+/// Build a documented-skip FAPH report (degraded-skip contract — never a
+/// hard error).
+fn faph_skip_json(reason_key: &str, detail: &str) -> serde_json::Value {
+    warn!("FAPH (mahbot-1057) skipped: {reason_key} — {detail}");
+    eprintln!("         FAPH (mahbot-1057) skipped: {reason_key} — {detail}");
+    serde_json::json!({
+        "status": "skipped",
+        "skip_reason": reason_key,
+        "skip_detail": detail,
+        "metric": "SPONTANEOUS-CONFUSABLE FA rate — not measured (degraded skip)",
+    })
+}
+
+/// SHA-256 of a file (hex).
+fn faph_sha256_file(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let data = std::fs::read(path)?;
+    Ok(crate::util::hex_string(&Sha256::digest(&data)))
+}
+
+/// Self-contained single-file download with SHA-256 verification.
+///
+/// Downloads `url` to `dest` (creating parent dirs), verifies the SHA-256
+/// against the manifest pin, and only then writes the file.  Uses its own
+/// local current-thread tokio runtime — deliberately NOT the embedder.rs
+/// download precedent (mahbot-1041 gated embedder/providers out of the bench
+/// surface), and no new runtime dependency for the standard bench run.
+fn faph_download_file(
+    url: &str,
+    dest: &std::path::Path,
+    expected_sha256: &str,
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    // Self-contained runtime: safe from a spawn_blocking context (no outer
+    // async context is entered; Handle::try_current is checked first so a
+    // runtime already present on this thread is reused rather than nested).
+    let fut = async {
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP status {}", resp.status()));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("body read failed: {e}"))?;
+        Ok::<Vec<u8>, String>(bytes.to_vec())
+    };
+    let bytes = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.block_on(fut)
+    } else {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("cannot build download runtime: {e}"))?;
+        rt.block_on(fut)
+    }?;
+    let sha = crate::util::hex_string(&Sha256::digest(&bytes));
+    if sha != expected_sha256 {
+        return Err(format!(
+            "SHA-256 mismatch: expected {expected_sha256}, got {sha}"
+        ));
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    std::fs::write(dest, &bytes).map_err(|e| format!("write: {e}"))
+}
+
+/// Count false-accept events while feeding one corpus file as ambient audio.
+///
+/// Fresh [`super::PipelineCtx`]; feeds every sample in
+/// [`FRAME_LENGTH`](super::FRAME_LENGTH) chunks through [`process_frame`]
+/// (AGC → `handle_wake_word_detection`), counting each fresh
+/// `last_wake_word_detection` timestamp as one event.  Production's
+/// `WAKE_WORD_COOLDOWN` gate runs inside `handle_wake_word_detection`, so
+/// re-detections within 3 s are structurally suppressed and never produce a
+/// new timestamp.  After each event the pipeline is re-armed exactly like
+/// production's post-command reset: `reset_pipeline_state(Soft)` (preserves
+/// the cooldown timestamp) + `is_recording = false`.
+fn faph_count_events(samples: &[f32]) -> u64 {
+    let mut ctx = super::PipelineCtx::new();
+    let mut events = 0u64;
+    let mut last_event_ts: Option<std::time::Instant> = None;
+    for chunk in samples.chunks(super::FRAME_LENGTH) {
+        process_frame(chunk, &mut ctx);
+        if let Some(ts) = ctx.last_wake_word_detection
+            && last_event_ts != Some(ts)
+        {
+            events += 1;
+            last_event_ts = Some(ts);
+            // Re-arm (production post-command reset): Soft preserves the
+            // cooldown timestamp so re-detections within 3 s stay suppressed.
+            ctx.reset_pipeline_state(super::ResetLevel::Soft);
+            ctx.is_recording = false;
+        }
+    }
+    events
+}
+
+/// Chi-square quantile via the Wilson–Hilferty approximation.
+///
+/// `χ²_α(ν) ≈ ν·(1 − 2/(9ν) + z_α·√(2/(9ν)))³` where `z_α` is the standard
+/// normal quantile (Acklam's algorithm).  Error < 0.6% at the degrees of
+/// freedom used for the FAPH Poisson bound (df ≥ 2).
+fn chi2_quantile(p: f64, df: f64) -> f64 {
+    let z = normal_quantile(p);
+    let base = 1.0 - 2.0 / (9.0 * df) + z * (2.0 / (9.0 * df)).sqrt();
+    df * base * base * base
+}
+
+/// Standard normal quantile (Acklam's algorithm).
+///
+/// Coefficients are function-level `const`s declared before any statements to
+/// satisfy clippy::items_after_statements.
+fn normal_quantile(p: f64) -> f64 {
+    const A: [f64; 6] = [
+        -3.969_683_028_665_376e1,
+        2.209_460_984_245_205e2,
+        -2.759_285_104_469_687e2,
+        1.383_577_518_672_69e2,
+        -3.066_479_806_614_716e1,
+        2.506_628_277_459_239,
+    ];
+    const B: [f64; 5] = [
+        -5.447_609_879_822_406e1,
+        1.615_858_368_580_409e2,
+        -1.556_989_798_598_866e2,
+        6.680_131_188_771_972e1,
+        -1.328_068_155_288_572e1,
+    ];
+    const C: [f64; 6] = [
+        -7.784_894_002_430_293e-3,
+        -3.223_964_580_411_365e-1,
+        -2.400_758_277_161_838,
+        -2.549_732_539_343_734,
+        4.374_664_141_464_968,
+        2.938_163_982_698_783,
+    ];
+    const D: [f64; 4] = [
+        7.784_695_709_041_462e-3,
+        3.224_671_290_700_398e-1,
+        2.445_134_137_142_996,
+        3.754_408_661_907_416,
+    ];
+    const P_LOW: f64 = 0.024_25;
+    const P_HIGH: f64 = 1.0 - P_LOW;
+    debug_assert!((0.0..=1.0).contains(&p));
+    let p = p.clamp(1e-12, 1.0 - 1e-12);
+    if p < P_LOW {
+        let q = (-2.0 * p.ln()).sqrt();
+        let num = ((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5];
+        let den = (((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0;
+        num / den
+    } else if p > P_HIGH {
+        let q = (-2.0 * (1.0 - p).ln()).sqrt();
+        let num = ((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5];
+        let den = (((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0;
+        -num / den
+    } else {
+        let q = p - 0.5;
+        let r = q * q;
+        let num = (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q;
+        let den = ((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0;
+        num / den
+    }
+}
+
 /// Run the full voice pipeline E2E benchmark.
 ///
 /// This is called from `voice::run_voice_pipeline_benchmark()` which is the
@@ -7769,6 +8181,20 @@ pub(crate) fn run_internal() {
         phase_times[P_COOLDOWN] = 0;
         phase_times[P_NOISE_OVERLAP] = 0;
     }
+
+    // ── Env-gated FAPH phase (mahbot-1057) ────────────────────────────────
+    // Real-audio false-acceptance-per-hour bench phase.  Runs AFTER the
+    // existing phases (reuses the bench's flock + 30-min timeout); the
+    // standard-run report surface is untouched because the report section is
+    // only added to the JSON when the env gate is on (None → no key).
+    //
+    // Corpus sizing (recorded on mahbot-1057 before this phase was built):
+    // measured detection-path throughput on the idle machine (2026-08-02)
+    // was ~47.8× real-time (speech) / ~60.7× (noise), blended ~51.8× for the
+    // corpus's 3.85 h speech + 2.14 h noise mix → the full 5.99 h pinned
+    // corpus projects to ~7 min wall, well inside the 30-min harness budget.
+    // The phase therefore feeds the FULL pinned corpus (812 files).
+    let faph_report: Option<serde_json::Value> = run_faph_phase();
 
     // ── Phase 15 timing ─────────────────────────────────
     phase_start!("Phase 15: Teardown");
@@ -9198,6 +9624,15 @@ pub(crate) fn run_internal() {
         }
     });
 
+    // ── FAPH section (mahbot-1057, env-gated additive key) ───────────────
+    // Only present when MAHBOT_FAPH=1 (ran or documented-skipped).  Standard
+    // runs leave `faph_report` as None → the report surface is byte-identical
+    // to the pre-change baseline (fingerprint / key-set contract).
+    let mut json = json;
+    if let Some(faph) = faph_report {
+        json["faph"] = faph;
+    }
+
     // Output delimited JSON for CI tooling
     println!("--- BENCHMARK_JSON_BEGIN ---");
     let json_text = serde_json::to_string_pretty(&json).expect("JSON serialization");
@@ -9607,5 +10042,62 @@ mod tests {
             hs, "90e1d139ed23e4ffcd13476a35d91d35b06d2b7e4e5f89eb7d20174c47249494",
             "short-input golden drifted"
         );
+    }
+
+    // ── mahbot-1057: FAPH Poisson CI helpers ──────────────────────────────
+
+    /// Wilson–Hilferty χ² quantile vs published values (df = 2(k+1) for the
+    /// Poisson 95% upper bound).  Tolerances are generous (~1%): the bound is
+    /// report-only, and the approximation error at these df is < 0.6%.
+    #[test]
+    fn chi2_quantile_matches_published_values() {
+        // Standard 97.5% chi-square quantiles (df=2,4,6,8,10) from NIST tables.
+        let cases: &[(f64, f64)] = &[
+            (2.0, 7.3778),
+            (4.0, 11.1433),
+            (6.0, 14.4494),
+            (8.0, 17.5345),
+            (10.0, 20.4832),
+        ];
+        for (df, expected) in cases {
+            let got = chi2_quantile(0.975, *df);
+            assert!(
+                (got - expected).abs() / expected < 0.01,
+                "df={df}: got {got:.4}, expected {expected:.4}"
+            );
+        }
+        // df=2 (k=0): upper events for 0 FAs ≈ 3.668 (0.5·χ²(0.975,2)).
+        let k0_upper = 0.5 * chi2_quantile(0.975, 2.0);
+        assert!((k0_upper - 3.688).abs() < 0.05, "k=0 upper: {k0_upper}");
+    }
+
+    /// Normal quantile sanity: Φ⁻¹(0.5) = 0, Φ⁻¹(0.975) ≈ 1.96,
+    /// Φ⁻¹(0.025) ≈ -1.96.
+    #[test]
+    fn normal_quantile_sanity() {
+        assert!(normal_quantile(0.5).abs() < 1e-9, "median must be 0");
+        assert!((normal_quantile(0.975) - 1.959_964).abs() < 1e-3);
+        assert!((normal_quantile(0.025) + 1.959_964).abs() < 1e-3);
+        // Monotonic.
+        let a = normal_quantile(0.3);
+        let b = normal_quantile(0.7);
+        assert!(a < b, "quantile must be monotonic");
+    }
+
+    /// FAPH Poisson upper bound: 0 events in 5.99 h → the 95% upper per-hour
+    /// rate is 0.5·χ²(0.975, 2)/5.99 ≈ 0.61/h (not a <1 FA/24h claim).
+    #[test]
+    fn faph_poisson_upper_bound_semantics() {
+        let audio_hours = 5.99_f64;
+        let events = 0_u64;
+        let upper_events = 0.5 * chi2_quantile(0.975, 2.0 * (events as f64 + 1.0));
+        let per_hour = upper_events / audio_hours;
+        assert!(
+            per_hour > 0.5 && per_hour < 0.7,
+            "0 FA/5.99h → ~0.61/h upper"
+        );
+        // The bound must shrink as audio-hours grow (3 runs = 17.97 h).
+        let per_hour_3 = upper_events / (audio_hours * 3.0);
+        assert!(per_hour_3 < per_hour, "more hours → tighter upper bound");
     }
 }
