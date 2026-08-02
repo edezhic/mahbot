@@ -497,7 +497,12 @@ impl LogsState {
             LogsTab::AllLogs | LogsTab::Issues => self.logs_view(),
         };
 
-        let content = column![tab_bar, filter_bar, body]
+        // ── Log-writer persistence warning banner ──────────────────
+        // Surfaces log-store insert failures (the writer task cannot use
+        // tracing to report them without recursing into itself).
+        let write_error_banner = Self::write_error_banner();
+
+        let content = column![tab_bar, write_error_banner, filter_bar, body]
             .width(Length::Fill)
             .height(Length::Fill);
 
@@ -506,6 +511,55 @@ impl LogsState {
             .height(Length::Fill)
             .style(theme::base_container_style)
             .into()
+    }
+
+    /// Render a warning banner when the log-writer task has observed DB insert
+    /// failures (visible on the Logs page — the sanctioned observability
+    /// surface for log-persistence outages). Returns an empty element when
+    /// there is nothing to report.
+    fn write_error_banner() -> Element<'static, LogMessage> {
+        let info = crate::logs::log_write_error_info();
+        if info.count == 0 {
+            return Space::new().height(0).into();
+        }
+
+        let last = info
+            .last_timestamp
+            .as_deref()
+            .map(|ts| format!(" (last: {ts})"))
+            .unwrap_or_default();
+        let detail = info
+            .last_message
+            .as_deref()
+            .unwrap_or("unknown log insert failure");
+
+        container(
+            row![
+                lucide::triangle_alert::<iced::Theme, iced::Renderer>()
+                    .size(14)
+                    .color(theme::STATUS_WARNING),
+                Space::new().width(6),
+                text(format!(
+                    "Log store write failures: {} — durable log persistence is degraded{last}. \
+                     Latest error: {detail}",
+                    info.count
+                ))
+                .size(12)
+                .color(theme::TEXT_MUTED),
+            ]
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([4, 8])
+        .style(|_theme: &iced::Theme| container::Style {
+            border: iced::Border {
+                radius: 4.0.into(),
+                width: 1.0,
+                color: theme::STATUS_WARNING,
+            },
+            ..container::Style::default()
+        })
+        .into()
     }
 
     /// Render the shared filter bar: role picklist, workspace picklist, search input.

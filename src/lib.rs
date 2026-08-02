@@ -45,6 +45,7 @@ pub mod turso;
 pub mod users;
 pub mod util;
 pub(crate) mod vector;
+pub mod wal_guard;
 pub mod workspace;
 
 use async_trait::async_trait;

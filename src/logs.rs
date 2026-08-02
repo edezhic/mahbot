@@ -4,12 +4,14 @@
 //! A broadcast channel feeds live log entries to the Iced native GUI dashboard.
 
 use crate::turso;
+use crate::util::UnwrapPoison;
 use crate::util::json;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::OnceCell;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing_subscriber::fmt::MakeWriter;
@@ -95,7 +97,10 @@ CREATE INDEX IF NOT EXISTS idx_logs_workspace ON logs(workspace);";
 
 impl LogStore {
     /// Open (or create) the log database at `root/db/logs.db` and run schema migrations.
-    async fn open(root: &Path) -> anyhow::Result<Self> {
+    ///
+    /// `pub(crate)` (matching every other store's generated `open`) so tests in
+    /// other modules can create a real log store via [`crate::open_test_store!`].
+    pub(crate) async fn open(root: &Path) -> anyhow::Result<Self> {
         let conn = crate::turso::open_store(root, "logs", LOGS_SCHEMA).await?;
         Ok(Self { conn })
     }
@@ -480,19 +485,122 @@ fn spawn_log_writer_with_interval(
 
 /// Insert all accumulated entries in one transaction and clear the batch.
 ///
-/// On failure the batch is still cleared (entries are dropped) — there is no
-/// useful reporting path inside the writer (terminal output is disabled and
-/// tracing would recurse), matching the existing drop-on-failure semantics.
+/// On persistent failure the batch is still cleared (entries are dropped) —
+/// log entries are diagnostics, not durable state. Failures are **not**
+/// swallowed: they are recorded on the [`log_write_error_info`] surface
+/// (rendered on the GUI Logs page) and reported to stderr at a bounded rate.
+/// No `tracing!` call is made from here — the writer task consumes the tracing
+/// channel, so tracing from inside it would recurse into itself.
 async fn flush_log_batch(store: &LogStore, batch: &mut Vec<LogEntry>) {
     if batch.is_empty() {
         return;
     }
-    if let Err(e) = store.insert_batch(batch).await {
-        // Log insertion failed — nowhere useful to report since terminal
-        // output is disabled and we can't use tracing here (that would recurse).
-        let _ = e;
+
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 0..LOG_INSERT_MAX_ATTEMPTS {
+        match store.insert_batch(batch).await {
+            Ok(()) => {
+                batch.clear();
+                return;
+            }
+            Err(e) => {
+                last_error = Some(e);
+                if attempt + 1 < LOG_INSERT_MAX_ATTEMPTS {
+                    tokio::time::sleep(LOG_INSERT_RETRY_BACKOFF).await;
+                }
+            }
+        }
     }
+
+    record_log_write_failure(last_error);
     batch.clear();
+}
+
+// ── Log-writer error observability ──────────────────────────────────
+
+/// Maximum number of insert attempts (including the first) for one log batch.
+///
+/// Retrying inside the writer is safe: the batch is only dropped after all
+/// attempts fail. The total added latency is bounded by
+/// `(LOG_INSERT_MAX_ATTEMPTS - 1) × LOG_INSERT_RETRY_BACKOFF`.
+const LOG_INSERT_MAX_ATTEMPTS: usize = 3;
+
+/// Backoff between log-batch insert retry attempts.
+const LOG_INSERT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Minimum interval between stderr warnings about log-write failures.
+const LOG_WRITE_STDERR_WARN_INTERVAL_MS: u64 = 60_000;
+
+/// Snapshot of the log-writer failure surface, for display and tests.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LogWriteErrorInfo {
+    /// Total number of batch insert failures recorded since startup.
+    pub count: u64,
+    /// RFC 3339 timestamp of the most recent failure.
+    pub last_timestamp: Option<String>,
+    /// Message of the most recent failure.
+    pub last_message: Option<String>,
+}
+
+/// Most recent log-batch insert failure observed by the writer task.
+///
+/// Count, timestamp, and message live behind a single mutex so readers always
+/// observe a consistent triple — a torn pair (timestamp from one failure with
+/// the message from the next) would be misleading on the observability
+/// surface.
+static LOG_WRITE_LAST_ERROR: std::sync::Mutex<Option<LogWriteErrorInfo>> =
+    std::sync::Mutex::new(None);
+
+/// Unix millis of the last stderr warning (rate limiter).
+static LOG_WRITE_LAST_STDERR_WARN_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Read the log-writer failure surface.
+///
+/// This is the sanctioned surface for log-persistence outages: the GUI Logs
+/// page renders a warning banner from it. It is safe to call from anywhere
+/// (no tracing involved), including from inside the writer task itself.
+#[must_use]
+pub fn log_write_error_info() -> LogWriteErrorInfo {
+    LOG_WRITE_LAST_ERROR
+        .lock()
+        .unwrap_poison()
+        .clone()
+        .unwrap_or_default()
+}
+
+/// Record a failed log-batch insert on the observability surface.
+///
+/// Updates the counter and last-error fields and emits a rate-limited stderr
+/// warning. stderr is not routed through tracing, so this cannot recurse into
+/// the writer task.
+fn record_log_write_failure(error: Option<anyhow::Error>) {
+    let message = error.map_or_else(
+        || "unknown log insert failure".to_string(),
+        |e| format!("{e:#}"),
+    );
+    let count = {
+        let mut guard = LOG_WRITE_LAST_ERROR.lock().unwrap_poison();
+        let entry = guard.get_or_insert(LogWriteErrorInfo::default());
+        entry.count += 1;
+        entry.last_timestamp = Some(turso::now());
+        entry.last_message = Some(message.clone());
+        entry.count
+    };
+
+    let now_ms = unix_millis();
+    let last_warn_ms = LOG_WRITE_LAST_STDERR_WARN_MS.load(Ordering::SeqCst);
+    if now_ms.saturating_sub(last_warn_ms) >= LOG_WRITE_STDERR_WARN_INTERVAL_MS {
+        LOG_WRITE_LAST_STDERR_WARN_MS.store(now_ms, Ordering::SeqCst);
+        eprintln!("[mahbot] log store insert failure #{count}: {message}");
+    }
+}
+
+/// Current Unix time in milliseconds.
+fn unix_millis() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+        d.as_secs().saturating_mul(1_000) + u64::from(d.subsec_millis())
+    })
 }
 
 /// Extract a string field from a JSON value, defaulting to `""`.
@@ -692,6 +800,78 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn test_flush_log_batch_records_failure_on_surface() {
+        let (store, _dir) = test_store().await;
+        let baseline = log_write_error_info().count;
+
+        let entry = LogEntry {
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            level: "INFO".to_string(),
+            target: "test".to_string(),
+            message: "should not persist".to_string(),
+            fields: serde_json::Value::Null,
+            agent_id: String::new(),
+            agent_role: String::new(),
+            workspace: String::new(),
+        };
+
+        // Deterministic insert failure: drop the logs table through the store's
+        // own connection, so the batch INSERT fails at prepare time.
+        store
+            .conn
+            .execute("DROP TABLE logs", ())
+            .await
+            .expect("drop logs table for failure test");
+
+        let mut batch = vec![entry];
+        flush_log_batch(&store, &mut batch).await;
+
+        // The batch must be dropped (entries are diagnostics) and the failure
+        // must be visible on the sanctioned surface.
+        assert!(batch.is_empty(), "failed batch must still be cleared");
+        let info = log_write_error_info();
+        assert!(
+            info.count > baseline,
+            "failure count must advance: baseline {baseline}, now {}",
+            info.count
+        );
+        assert!(
+            info.last_message.is_some(),
+            "last-error message must be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_flush_log_batch_retries_then_records() {
+        // After restoring write access, a retried flush must succeed without
+        // recording a failure — the bounded retry absorbs transient errors.
+        let (store, _dir) = test_store().await;
+        let baseline = log_write_error_info().count;
+
+        let mut batch = vec![LogEntry {
+            timestamp: "2025-01-01T00:00:01Z".to_string(),
+            level: "INFO".to_string(),
+            target: "test".to_string(),
+            message: "persisted".to_string(),
+            fields: serde_json::Value::Null,
+            agent_id: String::new(),
+            agent_role: String::new(),
+            workspace: String::new(),
+        }];
+        flush_log_batch(&store, &mut batch).await;
+
+        assert!(batch.is_empty());
+        assert_eq!(
+            log_write_error_info().count,
+            baseline,
+            "no failure recorded"
+        );
+        let (entries, total) = store.query(&LogQuery::default()).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(entries[0].message, "persisted");
     }
 
     #[tokio::test]
