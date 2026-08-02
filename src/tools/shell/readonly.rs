@@ -128,6 +128,9 @@ const GIT_SAFE_SUBCOMMANDS: &[&str] = &[
     "branch",
     "tag",
     "stash list",
+    "stash show",
+    "show-ref",
+    "ls-remote",
 ];
 
 /// Safe cargo subcommands that only affect build artifacts in `target/` or are purely
@@ -186,6 +189,21 @@ fn is_heredoc_start(chars: &[(usize, char)], i: usize) -> bool {
     // Exclude herestrings: `<<<` (bare) and `{digit}<<<` (fd-prefixed).
     let herestring_start = if fd_prefixed { i + 3 } else { i + 2 };
     chars.get(herestring_start).is_none_or(|(_, c)| *c != '<')
+}
+
+/// True when `<<<` at byte index `i` (outside quotes) starts a herestring
+/// (which has no body to strip, but whose operator must be skipped so its
+/// second `<` isn't misread as a heredoc start). Recognizes bare (`<<<`)
+/// and fd-prefixed (`3<<<`) herestrings.
+fn is_herestring_start(chars: &[(usize, char)], i: usize) -> bool {
+    let bare = chars[i].1 == '<'
+        && chars.get(i + 1).is_some_and(|(_, c)| *c == '<')
+        && chars.get(i + 2).is_some_and(|(_, c)| *c == '<');
+    let fd_prefixed = chars[i].1.is_ascii_digit()
+        && chars.get(i + 1).is_some_and(|(_, c)| *c == '<')
+        && chars.get(i + 2).is_some_and(|(_, c)| *c == '<')
+        && chars.get(i + 3).is_some_and(|(_, c)| *c == '<');
+    bare || fd_prefixed
 }
 
 /// True when the line starting at `line_start` is the heredoc terminator line
@@ -299,6 +317,17 @@ pub(super) fn strip_heredoc_bodies(command: &str) -> String {
                 i += 1;
                 continue;
             }
+            if is_herestring_start(&chars, i) {
+                // Preserve the `<<<` operator (replaced by nothing) so the
+                // token classifier can still see it and skip the herestring
+                // content word as a path argument.
+                let skip = if chars[i].1.is_ascii_digit() { 4 } else { 3 };
+                for c in &chars[i..i + skip] {
+                    out.push(c.1);
+                }
+                i += skip;
+                continue;
+            }
             if is_heredoc_start(&chars, i) {
                 out.push(' ');
                 if chars[i].1.is_ascii_digit() {
@@ -336,6 +365,18 @@ pub(super) fn strip_heredoc_bodies(command: &str) -> String {
         if !super::track_char_context(chars[i].1, &mut in_single, &mut in_double, &mut escaped) {
             out.push(chars[i].1);
             i += 1;
+            continue;
+        }
+
+        if is_herestring_start(&chars, i) {
+            // Preserve the `<<<` operator (replaced by nothing) so the
+            // token classifier can still see it and skip the herestring
+            // content word as a path argument.
+            let skip = if chars[i].1.is_ascii_digit() { 4 } else { 3 };
+            for c in &chars[i..i + skip] {
+                out.push(c.1);
+            }
+            i += skip;
             continue;
         }
 
@@ -1524,6 +1565,153 @@ const GIT_REMOTE_MUTATIONS: &[&str] = &[
     "prune",
 ];
 
+/// True when the command has a git dry-run token: `-n`, `--dry-run`, or a
+/// combined short flag containing `n` (e.g. `clean -ndx`). Long flags are
+/// excluded so `--name-only`-style tokens don't count.
+fn has_dry_run_token(command: &str) -> bool {
+    command.split_whitespace().any(|w| {
+        w == "--dry-run"
+            || (w.starts_with('-')
+                && !w.starts_with("--")
+                && w.len() > 1
+                && w[1..].contains('n'))
+    })
+}
+
+/// True when the command has a git force token: `-f`, `--force`, or a
+/// combined short flag containing `f` (e.g. `clean -fd`, `push -fn`).
+/// Any force token blocks dry-run clean/push (decision 3).
+fn has_force_token(command: &str) -> bool {
+    command.split_whitespace().any(|w| {
+        w == "--force"
+            || (w.starts_with('-')
+                && !w.starts_with("--")
+                && w.len() > 1
+                && w[1..].contains('f'))
+    })
+}
+
+/// Phase-3 read-only git allowlist rules (contract decisions 3/4 and the
+/// phase-3 scope): `stash show`, `config` read forms, `rebase --show-current`,
+/// `push --dry-run`/`-n`, `clean -n`/`--dry-run`, and `submodule status`.
+///
+/// Returns `Some(result)` when `subcommand` matches one of these prefixes
+/// (the caller returns it directly), `None` when the subcommand is outside
+/// these rules and should fall through to the general safe-list match.
+///
+/// Matching is exact: mutating siblings stay blocked (`stash pop`,
+/// `config user.name Egor`, `rebase --continue`, `push origin main`,
+/// `clean -f`, `submodule foreach`), and any force token blocks the dry-run
+/// clean/push forms.
+fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Result<(), String>> {
+    // git stash: `list` and `show` are read-only inspection; everything else
+    // (push, pop, apply, drop, ...) modifies the working tree.
+    if subcommand.starts_with("stash") {
+        if subcommand.contains("stash list") || subcommand.contains("stash show") {
+            return Some(Ok(()));
+        }
+        return Some(reject(
+            trimmed,
+            "`git stash` is not allowed — it modifies the working tree.",
+            "use `git stash list` to view stashes, or `git diff` to preview changes.",
+        ));
+    }
+
+    // git config read/write rule (decision 4): exactly one positional after
+    // `config` (key read) is allowed; two positionals (key + value) write.
+    // Explicit get forms (--list, -l, --get, --get-all, --get-regexp,
+    // --name-only) are allowed; write/edit forms are blocked.
+    if subcommand.starts_with("config") {
+        let words: Vec<&str> = subcommand.split_whitespace().collect();
+        let rest = &words[1..];
+        if rest.iter().any(|w| {
+            matches!(
+                *w,
+                "--list" | "-l" | "--get" | "--get-all" | "--get-regexp" | "--name-only"
+            )
+        }) {
+            return Some(Ok(()));
+        }
+        if rest.iter().any(|w| {
+            matches!(
+                *w,
+                "--add"
+                    | "--unset"
+                    | "--unset-all"
+                    | "--edit"
+                    | "--remove-section"
+                    | "--rename-section"
+                    | "--replace-all"
+            )
+        }) {
+            return Some(reject(
+                trimmed,
+                "`git config` write/edit forms are not allowed — they modify repository or global config.",
+                "use `git config user.name` (key read), `git config --list`, or `git config --get <key>` to inspect configuration.",
+            ));
+        }
+        match rest.iter().filter(|w| !w.starts_with('-')).count() {
+            0 | 1 => Some(Ok(())), // bare `git config` / key read
+            _ => Some(reject(
+                trimmed,
+                "`git config` with a value is not allowed — it writes configuration.",
+                "use `git config user.name` (key read) or `git config --list` to inspect configuration.",
+            )),
+        }
+    } else if subcommand.starts_with("rebase") {
+        // git rebase --show-current is a pure read; every other rebase form
+        // mutates the branch history.
+        let words: Vec<&str> = subcommand.split_whitespace().collect();
+        if words.len() >= 2 && words[1] == "--show-current" {
+            return Some(Ok(()));
+        }
+        Some(reject(
+            trimmed,
+            "`git rebase` is not allowed — it rewrites branch history.",
+            "use `git rebase --show-current` to see the in-progress rebase, or `git log` to inspect history.",
+        ))
+    } else if subcommand.starts_with("push") {
+        // git push --dry-run (-n/--dry-run) performs a network read with no
+        // local mutation; any force token in the same command blocks it
+        // (decision 3).
+        if has_dry_run_token(subcommand) && !has_force_token(subcommand) {
+            Some(Ok(()))
+        } else {
+            Some(reject(
+                trimmed,
+                "`git push` is not allowed — it writes to a remote repository.",
+                "use `git push --dry-run` to preview what would be pushed without sending anything.",
+            ))
+        }
+    } else if subcommand.starts_with("clean") {
+        // git clean -n/--dry-run previews removals; any force token blocks it
+        // (decision 3).
+        if has_dry_run_token(subcommand) && !has_force_token(subcommand) {
+            Some(Ok(()))
+        } else {
+            Some(reject(
+                trimmed,
+                "`git clean` is not allowed — it deletes untracked files.",
+                "use `git clean -n` to preview what would be removed without deleting anything.",
+            ))
+        }
+    } else if subcommand.starts_with("submodule") {
+        // git submodule: `status` (and bare `submodule`, which prints a status
+        // summary) are read-only; foreach/update/add/... mutate submodules.
+        let words: Vec<&str> = subcommand.split_whitespace().collect();
+        match words.get(1) {
+            None | Some(&"status") => Some(Ok(())),
+            Some(sub) => Some(reject(
+                trimmed,
+                &format!("`git submodule {sub}` is not allowed — it modifies submodules."),
+                "use `git submodule status` to inspect submodule state.",
+            )),
+        }
+    } else {
+        None
+    }
+}
+
 fn check_git_segment(segment: &str) -> Result<(), String> {
     let trimmed = segment.trim();
 
@@ -1534,18 +1722,16 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    // git stash (without "list") is rejected
-    if subcommand.starts_with("stash") && !subcommand.contains("stash list") {
-        return reject(
-            trimmed,
-            "`git stash` is not allowed — it modifies the working tree.",
-            "use `git stash list` to view stashes, or `git diff` to preview changes.",
-        );
+    // Phase-3 read-only allowlist rules (stash/config/rebase/push/clean/
+    // submodule). These run BEFORE the general safe-list match because the
+    // subcommands are not (all) in GIT_SAFE_SUBCOMMANDS, and the stash check
+    // must exempt `stash show` at this layer.
+    if let Some(result) = check_git_read_only_extensions(trimmed, &subcommand) {
+        return result;
     }
 
     // git mktag always writes a tag object to the object database — no read-only mode.
-    if subcommand.starts_with("mktag") {
-        return reject(
+    if subcommand.starts_with("mktag") {        return reject(
             trimmed,
             "`git mktag` is not allowed — it always writes a tag object to the object database.",
             "use `git verify-tag` or `git cat-file` to inspect existing tag objects.",
@@ -1591,8 +1777,9 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
         return Err(format!(
             "⚠️ Read-only mode: the `git {subcommand}` subcommand is not allowed — it may mutate the repository.\n\
              Command: `{trimmed}`\n\
-             Allowed git subcommands for read-only mode: status, log, diff, show, blame, branch, tag, remote, stash list,\n\
-             and other inspection-only commands. Suggestion: use these for repository exploration."
+             Allowed git subcommands for read-only mode: status, log, diff, show, blame, branch, tag, remote,\n\
+             stash list/show, show-ref, ls-remote, submodule status, config reads, rebase --show-current,\n\
+             push --dry-run, clean -n, and other inspection-only commands. Suggestion: use these for repository exploration."
         ));
     }
 
@@ -1769,11 +1956,29 @@ fn check_cargo_segment(segment: &str) -> Result<(), String> {
 
     let base = subcommand.split_whitespace().next().unwrap_or("");
 
+    // ── Help/version exemption (decision 1) ────────────────────────
+    // `-h`/`--help`/`-V`/`--version` appearing as a standalone token BEFORE a
+    // `--` separator is a pure read and is allowed for ANY cargo subcommand,
+    // including `run`. Tokens after `--` stay blocked (`cargo run -- --help`).
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    let help_version_before_ddash = words
+        .iter()
+        .take_while(|w| **w != "--")
+        .any(|w| matches!(*w, "-h" | "--help" | "-V" | "--version"));
+    if help_version_before_ddash {
+        return Ok(());
+    }
+
     // ── Specific rejection messages for subcommands that modify source files ──
     // These are checked before the allowlist so they get tailored suggestions
     // instead of the generic "use cargo check, cargo test, ..." message.
     match base {
         "update" => {
+            if words.contains(&"--dry-run") {
+                // Dry-run previews changes without modifying Cargo.lock
+                // (phase 3, decision 1/10).
+                return Ok(());
+            }
             return reject(
                 trimmed,
                 "`cargo update` is not allowed — it modifies Cargo.lock.",
@@ -2303,7 +2508,7 @@ mod tests {
             ("cargo fix", false),
             // cargo update and generate-lockfile are rejected with tailored messages
             ("cargo update", false),
-            ("cargo update --dry-run", false),
+            ("cargo update --dry-run", true), // dry-run preview — read-only
             ("cargo generate-lockfile", false),
         ];
 
@@ -2787,6 +2992,16 @@ mod tests {
                 expected: "stash list",
             },
             Case {
+                name: "stderr capture suffix skipped",
+                input: "git --version 2>&1",
+                expected: "",
+            },
+            Case {
+                name: "stderr capture after subcommand",
+                input: "git status 2>&1",
+                expected: "status 2>&1",
+            },
+            Case {
                 name: "multiple env",
                 input: "CC=gcc CXX=g++ git status",
                 expected: "status",
@@ -3254,6 +3469,139 @@ mod tests {
             // cp destination "." = current dir (workspace → blocked, temp → allowed).
             ("cp /tmp/a .", false),
             ("cd /tmp && cp /tmp/a .", true),
+        ];
+
+        run_cases(&cases);
+    }
+
+    // ── Phase 3 acceptance: git read-only operations ─────────────────────
+
+    #[test]
+    fn git_read_only_acceptance() {
+        let cases = [
+            // Allowed read forms (phase 3, decisions 3/4).
+            ("git stash show", true),
+            ("git stash show stash@{0}", true),
+            ("git show-ref", true),
+            ("git ls-remote", true),
+            ("git submodule status", true),
+            ("git submodule status --recursive", true),
+            ("git submodule", true),
+            ("git config user.name", true),
+            ("git config --global user.name", true),
+            ("git config --list", true),
+            ("git config -l", true),
+            ("git config --get user.name", true),
+            ("git config --get-all core.pager", true),
+            ("git config --name-only --get-regexp '^core\\.'", true),
+            ("git rebase --show-current", true),
+            ("git push --dry-run", true),
+            ("git push -n", true),
+            ("git push -n origin main", true),
+            ("git clean -n", true),
+            ("git clean --dry-run", true),
+            ("git clean -ndx", true),
+            ("git --version 2>&1", true),
+            ("git status 2>&1", true),
+            // Mutating siblings stay blocked.
+            ("git config user.name Egor", false),
+            ("git config --global user.name Egor", false),
+            ("git config --add core.pager less", false),
+            ("git config --edit", false),
+            ("git config --unset user.name", false),
+            ("git rebase --continue", false),
+            ("git rebase main", false),
+            ("git rebase", false),
+            ("git push origin main", false),
+            ("git push", false),
+            ("git push --dry-run -f", false),
+            ("git push -fn", false),
+            ("git clean -f", false),
+            ("git clean -n -f", false),
+            ("git clean -fd", false),
+            ("git clean", false),
+            ("git stash pop", false),
+            ("git stash apply", false),
+            ("git stash drop", false),
+            ("git stash push", false),
+            ("git stash", false),
+            ("git submodule foreach", false),
+            ("git submodule update", false),
+            ("git submodule add https://example.com/repo.git", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    // ── Phase 3 acceptance: cargo read-only invocations ──────────────────
+
+    #[test]
+    fn cargo_read_only_acceptance() {
+        let cases = [
+            // Toolchain specifier no longer becomes the parsed subcommand.
+            ("cargo +nightly build", true),
+            ("cargo +stable check", true),
+            // stderr-capture suffix no longer becomes the parsed subcommand.
+            ("cargo --version 2>&1", true),
+            ("cargo build 2>&1", true),
+            ("git --version 2>&1", true),
+            // Help/version exemption for any subcommand, before `--`.
+            ("cargo fix --help", true),
+            ("cargo run --help", true),
+            ("cargo run -h", true),
+            ("cargo nextest --version", true),
+            ("cargo --version", true),
+            ("cargo build -V", true),
+            // update --dry-run allowed; plain update blocked.
+            ("cargo update --dry-run", true),
+            ("cargo update", false),
+            // Still blocked.
+            ("cargo fix", false),
+            ("cargo run", false),
+            ("cargo run -- --help", false),
+            ("cargo clippy --fix", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    // ── Phase 3 acceptance: keep-blocked battery ─────────────────────────
+
+    #[test]
+    fn keep_blocked_battery() {
+        let cases = [
+            // Process control — all forms.
+            ("kill 1234", false),
+            ("kill -9 1234", false),
+            ("pkill -f mahbot", false),
+            ("killall chrome", false),
+            // ln in all forms.
+            ("ln -s /tmp/a /tmp/b", false),
+            ("ln /tmp/a /tmp/b", false),
+            // unzip extract.
+            ("unzip archive.zip", false),
+            ("unzip -o archive.zip -d /tmp/out", false),
+            // Live-DB sidecar deletion (tilde / $HOME spellings).
+            ("rm ~/.mahbot/db/board.db-wal", false),
+            ("rm $HOME/.mahbot/db/board.db-wal", false),
+            // rm -rf target.
+            ("rm -rf target", false),
+            // cargo mutators.
+            ("cargo clippy --fix", false),
+            ("cargo run", false),
+            ("cargo fix", false),
+            // git init even in temp.
+            ("git init", false),
+            ("git init /tmp/x", false),
+            // Non-read-only git mutations.
+            ("git commit -m test", false),
+            ("git reset --hard", false),
+            // sed/awk/dd/curl/wget on workspace targets.
+            ("sed -i 's/a/b/' file", false),
+            ("awk -i inplace '{print $1}' file", false),
+            ("dd if=/dev/zero of=file bs=1 count=1", false),
+            ("curl -o out.txt URL", false),
+            ("wget -O out.txt URL", false),
         ];
 
         run_cases(&cases);

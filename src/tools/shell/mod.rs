@@ -945,16 +945,31 @@ fn extract_command_segments(command: &str) -> Vec<String> {
 
 /// Find the index of the first non-flag word in a slice, skipping:
 /// - Git global flags (and their values) when `is_git` is true
+/// - Cargo toolchain specifiers (`+nightly`-style) when not git
+/// - Stderr-capture suffixes (`2>&1`, `1>&2`) — never a subcommand
 /// - Any word starting with `-`
 ///
 /// Shared helper used by [`canonical_command`] and `extract_git_subcommand`
-/// to avoid duplicating the flag-skipping loop.
+/// to avoid duplicating the flag-skipping loop. The toolchain/stderr-capture
+/// skipping fixes the subcommand-resolution bugs where `cargo +nightly build`
+/// or `git --version 2>&1` parsed the toolchain/suffix as the subcommand
+/// (guard contract, resolved decision 11).
 pub(super) fn find_first_non_flag_index(words: &[&str], is_git: bool) -> Option<usize> {
     let mut i = 0;
     while i < words.len() {
         let w = words[i];
         if is_git && GIT_GLOBAL_FLAGS.contains(&w) {
             i += 2; // skip flag and its value (safe: loop condition checks len)
+            continue;
+        }
+        // Toolchain specifiers (`+nightly`, `+stable`) — cargo only.
+        if !is_git && w.starts_with('+') {
+            i += 1;
+            continue;
+        }
+        // Stderr-capture suffixes (`2>&1`, `1>&2`) are not subcommands.
+        if w == "2>&1" || w == "1>&2" {
+            i += 1;
             continue;
         }
         if w.starts_with('-') {
@@ -2936,6 +2951,26 @@ mod tests {
             ("echo 'foo && bar'", &["echo 'foo && bar'"]),
             // double-quoted pipe preserved as one segment
             ("echo \"pipe | test\"", &["echo \"pipe | test\""]),
+            // ── Newline as command separator ──────────────────────
+            ("touch /tmp/a\necho hi > /tmp/b", &["touch /tmp/a", "echo hi > /tmp/b"]),
+            // Backslash-newline continuation joins the logical line.
+            (
+                "echo hello \\\nworld",
+                &["echo hello world"],
+            ),
+            // Heredoc bodies are removed before segmentation (never commands).
+            (
+                "cat <<EOF\nbody\nEOF",
+                &["cat"],
+            ),
+            (
+                "cat <<EOF > /tmp/out\nbody\nEOF",
+                &["cat   > /tmp/out"], // `<<EOF` marker replaced by a space
+            ),
+            // Herestrings have no body — the whole line stays one segment.
+            ("cat <<< hi > /tmp/out", &["cat <<< hi > /tmp/out"]),
+            // `>|` compound redirect is not split at the pipe.
+            ("echo hi >| /tmp/force", &["echo hi >| /tmp/force"]),
         ];
         for (input, expected) in cases {
             let result = extract_command_segments(input);
@@ -2977,6 +3012,15 @@ mod tests {
             // Only flags without values are skipped for non-git commands.
             // --release and --verbose don't take values, so both are skipped.
             ("cargo --release --verbose build", "cargo build"),
+            // ── Toolchain specifiers and stderr-capture suffixes ───
+            // `+nightly`-style toolchain specifiers and `2>&1`/`1>&2` suffixes
+            // must never become the parsed subcommand (decision 11).
+            ("cargo +nightly build", "cargo build"),
+            ("cargo +stable check", "cargo check"),
+            ("cargo build 2>&1", "cargo build"),
+            ("cargo --version 2>&1", "cargo"),
+            ("git --version 2>&1", "git"),
+            ("git status 2>&1", "git status"),
             // ── Environment variable assignments ───────────────────
             ("CC=gcc make", "make"), // env assignment before command
             ("VAR=val cargo check", "cargo check"),
