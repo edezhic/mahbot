@@ -1,17 +1,26 @@
-//! Shared model-loading state machine wrapper (mahbot-1043).
+//! Shared model-loading state machine wrapper.
 //!
 //! Extracted from the duplicated `AtomicU8` lifecycle blocks (Uninit→Loading→
 //! Ready/Failed) in `audio::tts`, `audio::local_transcriber`, and `embedder`.
-//! This is an **extraction only** — each module keeps its own guard, `Drop`
-//! behavior, and reset/retry paths.  Concurrency behavior is intentionally NOT
-//! unified across modules (the ticket's explicit non-goal).
+//! `ModelState`/`AtomicModelState` provide the shared state representation;
+//! [`ModelLoadGuard`] unifies the byte-identical Loading→Failed Drop guard used
+//! by `embedder` and `audio::tts` for panic safety in background download tasks.
+//!
+//! Deliberate non-unifications (semantics-preserving scope):
+//! * The per-module singletons keep their own container/value types — `embedder`
+//!   uses `RwLock<Option<_>>`, `tts` `OnceLock<RwLock<Option<_>>>`, and
+//!   `local_transcriber` `Mutex<Option<_>>`.  Unifying these would change
+//!   synchronization semantics (poisoning, init-once, contention).
+//! * `audio::local_transcriber` has no Drop guard: a panic in its download loop
+//!   would otherwise flip a stuck-Loading state to Failed, an observable
+//!   failure-behavior change outside this scope.
 //!
 //! Memory-ordering semantics are preserved exactly from the original copies:
 //! `Acquire` loads, `Release` stores, `AcqRel`/`Acquire` compare-exchange.
 //!
 //! Note: `audio::voice` has its own local `ModelState`/`AtomicModelState`
 //! (voice.rs) which is deliberately NOT migrated — the naming overlap is
-//! intentional and scoped (mahbot-1043 manager pin).
+//! intentional and scoped.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -67,5 +76,59 @@ impl AtomicModelState {
             .compare_exchange(expected as u8, new as u8, success, failure)
             .map(ModelState::from_u8)
             .map_err(ModelState::from_u8)
+    }
+}
+
+/// Drop guard that transitions a model-loading state from [`ModelState::Loading`]
+/// to [`ModelState::Failed`].
+///
+/// If the background download task panics, Tokio catches the panic and swallows
+/// it; without this guard the state would remain permanently stuck in
+/// [`ModelState::Loading`], silently disabling the feature until process
+/// restart.  On normal success or explicit terminal failure the CAS is a no-op
+/// (wrong expected value).
+pub(crate) struct ModelLoadGuard<'a>(&'a AtomicModelState);
+
+impl<'a> ModelLoadGuard<'a> {
+    pub(crate) const fn new(state: &'a AtomicModelState) -> Self {
+        Self(state)
+    }
+}
+
+impl Drop for ModelLoadGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .compare_exchange(
+                ModelState::Loading,
+                ModelState::Failed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AtomicModelState, ModelLoadGuard, ModelState};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn guard_transitions_loading_to_failed_on_drop() {
+        let state = AtomicModelState::new(ModelState::Loading);
+        let guard = ModelLoadGuard::new(&state);
+        drop(guard);
+        assert_eq!(state.load(Ordering::Acquire), ModelState::Failed);
+    }
+
+    #[test]
+    fn guard_drop_is_noop_on_terminal_states() {
+        let ready = AtomicModelState::new(ModelState::Ready);
+        drop(ModelLoadGuard::new(&ready));
+        assert_eq!(ready.load(Ordering::Acquire), ModelState::Ready);
+
+        let failed = AtomicModelState::new(ModelState::Failed);
+        drop(ModelLoadGuard::new(&failed));
+        assert_eq!(failed.load(Ordering::Acquire), ModelState::Failed);
     }
 }

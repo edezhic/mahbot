@@ -27,7 +27,7 @@
 //!
 //! # State machine
 //!
-//! The loading state uses [`AtomicU8`] with the same states as [`crate::embedder`]:
+//! The loading state uses [`crate::util::model_state::ModelState`]:
 //!
 //! | Value | Name     | Meaning                                      |
 //! |-------|----------|----------------------------------------------|
@@ -39,7 +39,7 @@
 
 use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
-use crate::util::model_state::{AtomicModelState, ModelState};
+use crate::util::model_state::{AtomicModelState, ModelLoadGuard, ModelState};
 use anyhow::{Context, Result, anyhow};
 use candle_core::{Device, Tensor};
 use candle_onnx::simple_eval;
@@ -125,9 +125,9 @@ const ALL_VOICE_STYLE_NAMES: &[&str] = &[
 
 /// Atomic model-loading state (Uninit → Loading → Ready / Failed).
 ///
-/// Shared wrapper extracted in mahbot-1043:
-/// [`crate::util::model_state::ModelState`] — the guard/retry paths below
-/// (`TtsGuard`, [`spawn_download`], [`retry_download`]) are unchanged.
+/// Shared wrapper: [`crate::util::model_state::ModelState`] with the shared
+/// [`crate::util::model_state::ModelLoadGuard`] for panic safety; retry paths
+/// below ([`spawn_download`], [`retry_download`]) are unchanged.
 static STATE: AtomicModelState = AtomicModelState::new(ModelState::Uninit);
 static GLOBAL_TTS: OnceLock<RwLock<Option<Arc<TtsEngine>>>> = OnceLock::new();
 static CANCEL_TX: OnceLock<broadcast::Sender<()>> = OnceLock::new();
@@ -863,23 +863,9 @@ fn emit_download_event(event: TtsDownloadEvent) {
     }
 }
 
-struct TtsGuard;
-
-impl Drop for TtsGuard {
-    fn drop(&mut self) {
-        STATE
-            .compare_exchange(
-                ModelState::Loading,
-                ModelState::Failed,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .ok();
-    }
-}
-
 async fn download_retry_loop() {
-    let _guard = TtsGuard;
+    // Transitions Loading→Failed on drop if the loop is cancelled or panics.
+    let _guard = ModelLoadGuard::new(&STATE);
     let Some(dir) = model_dir() else {
         warn!("TTS: cannot resolve model directory");
         STATE.store(ModelState::Failed, Ordering::Release);

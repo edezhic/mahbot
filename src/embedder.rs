@@ -28,7 +28,7 @@
 //! or dead code.
 
 use crate::util::UnwrapPoison;
-use crate::util::model_state::{AtomicModelState, ModelState};
+use crate::util::model_state::{AtomicModelState, ModelLoadGuard, ModelState};
 use anyhow::{Context, Result, anyhow};
 use candle_core::quantized::{QMatMul, gguf_file};
 use candle_core::{DType, Device, Tensor};
@@ -127,7 +127,7 @@ static GLOBAL_EMBEDDER: RwLock<Option<Embedder>> = RwLock::new(None);
 /// |            |            | (e.g. TLS backend unavailable).                     |
 /// |            |            | [`download_retry_loop()`] transitions state to      |
 /// |            |            | [`ModelState::Failed`] and returns.                       |
-/// | `LOADING`  | `FAILED`   | **Background task panic:** [`EmbedderGuard`]'s      |
+/// | `LOADING`  | `FAILED`   | **Background task panic:** [`ModelLoadGuard`]'s    |
 /// |            |            | [`Drop`] guard transitions state to [`ModelState::Failed`]|
 /// |            |            | when [`download_retry_loop()`] is dropped without   |
 /// |            |            | reaching a terminal state (e.g. a panic in Candle   |
@@ -255,37 +255,6 @@ where
 
 // ── Background download with retry ────────────────────────────────────
 
-/// Guard that transitions [`STATE`] from [`ModelState::Loading`] to [`ModelState::Failed`] on drop.
-///
-/// If the background download task panics (e.g., a future dependency bug in Candle or
-/// tokenizers), Tokio catches the panic and swallows it. Without this guard, [`STATE`]
-/// would remain permanently stuck in [`ModelState::Loading`], causing every subsequent call
-/// to [`ensure_embedder()`] to return `false` immediately, silently disabling semantic
-/// search until the process is restarted.
-///
-/// # Invariants
-///
-/// * **Normal success:** [`set_embedder_ready()`] sets [`STATE`] to [`ModelState::Ready`]; the
-///   guard's CAS is a no-op (wrong expected value).
-/// * **Explicit terminal failure:** The function stores [`ModelState::Failed`] before returning;
-///   the guard's CAS is a no-op (wrong expected value).
-/// * **Panic / early drop:** [`STATE`] is still [`ModelState::Loading`]; the CAS succeeds and
-///   transitions to [`ModelState::Failed`].
-struct EmbedderGuard;
-
-impl Drop for EmbedderGuard {
-    fn drop(&mut self) {
-        STATE
-            .compare_exchange(
-                ModelState::Loading,
-                ModelState::Failed,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .ok();
-    }
-}
-
 /// Background retry loop that downloads model and tokenizer files.
 ///
 /// Uses exponential backoff (1 min → 2 min → 4 min → … → 30 min max) for
@@ -316,7 +285,8 @@ impl Drop for EmbedderGuard {
 /// [`ensure_embedder`], already validates this with `.expect()` before spawning,
 /// and `storage_root` is a `OnceLock` that cannot revert to `None` once set.
 async fn download_retry_loop() {
-    let _guard = EmbedderGuard;
+    // Transitions Loading→Failed on drop if the loop is cancelled or panics.
+    let _guard = ModelLoadGuard::new(&STATE);
     let models_dir =
         models_dir().expect("CONFIG must be initialized before embedder initialization");
     std::fs::create_dir_all(&models_dir).ok();

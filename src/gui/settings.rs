@@ -609,8 +609,8 @@ impl SettingsState {
                 let toggle_gen = self.tts_toggle_gen;
 
                 // When toggling ON with uncached models, trigger download.
-                // Uses spawn_or_retry_download to handle both STATE_UNINIT
-                // (initial download) and STATE_FAILED (retry after previous
+                // Uses spawn_or_retry_download to handle both ModelState::Uninit
+                // (initial download) and ModelState::Failed (retry after previous
                 // permanent failure), matching voice's auto-retry behaviour.
                 if enabled && !crate::audio::tts::try_load_cached() {
                     crate::audio::tts::spawn_or_retry_download();
@@ -3242,7 +3242,7 @@ mod tests {
                 // test isolation issues (other tests may have set it in global CONFIG).
                 let _ = s.config.set_string_field("tts_enabled", "");
                 s.config.normalize();
-                crate::audio::tts::test_set_state(2); // STATE_READY
+                crate::audio::tts::test_set_state(2); // ModelState::Ready
             },
         );
     }
