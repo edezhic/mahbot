@@ -751,6 +751,21 @@ fn expand_vars(word: &str, single_quoted: bool, state: &ValidationState) -> Opti
             i += len;
         } else {
             let c = rest.chars().next().expect("i < len");
+            // An unescaped `$(`/backtick (command substitution) or an
+            // unparseable `${...}` (parameter expansion with modifiers, e.g.
+            // `${FOO:-../etc}`) has an unprovable output, so the word cannot
+            // resolve to a concrete path — fail-closed (the escaped forms
+            // were handled above; single-quoted words never reach this
+            // branch; plain `${NAME}` parses as a variable reference).
+            if c == '`'
+                || (c == '$'
+                    && rest
+                        .as_bytes()
+                        .get(1)
+                        .is_some_and(|b| matches!(*b, b'(' | b'{')))
+            {
+                return None;
+            }
             out.push(c);
             i += c.len_utf8();
         }
@@ -1778,14 +1793,38 @@ fn split_words_keeping_substitutions(s: &str) -> Vec<&str> {
 /// assignment time, so `export TMPDIR="$TMPDIR/x"` binds the expanded path).
 fn apply_single_binding(name: &str, value: &str, state: &mut ValidationState) {
     // Strip balanced surrounding quotes from the value (`export TMPDIR="/tmp"`).
-    let clean = strip_outer_quotes(value).map_or(value, |(c, _)| c);
+    // A single-quoted value is a literal — no expansion, no substitution —
+    // so it can never be an mktemp temp binding.
+    let (clean, single_quoted) = strip_outer_quotes(value).map_or((value, false), |(c, q)| (c, q));
     // `NAME=$(mktemp -d)` binds a fresh temp root with an unknown value.
-    if let Some(binding) = mktemp_binding(clean, state) {
-        state.vars.insert(name.to_string(), binding);
-        return;
+    if !single_quoted {
+        if let Some(binding) = mktemp_binding(clean, state) {
+            state.vars.insert(name.to_string(), binding);
+            return;
+        }
+        // Any other command substitution has an unprovable output. Resolving
+        // the raw `$(...)` string as a literal path would fabricate a temp
+        // value against a tracked temp cwd (`cd /tmp; SNAP=$(mktemp -d -p
+        // /tmp/nonexistent_x)`): at runtime mktemp errors, SNAP binds empty,
+        // and the chained write lands outside every temp root. Bind such
+        // variables poisoned (fail-closed).
+        if substitution_body(clean).is_some() {
+            state.vars.insert(
+                name.to_string(),
+                VarBinding {
+                    value: Some(clean.to_string()),
+                    poisoned: true,
+                },
+            );
+            return;
+        }
     }
     let resolved = if !clean.is_empty() && !clean.starts_with('~') {
-        resolve_path_word(clean, state)
+        if single_quoted && clean.contains('$') {
+            None // literal `$` (e.g. `'$(mktemp -d)'`) never resolves under temp
+        } else {
+            resolve_path_word(clean, state)
+        }
     } else {
         None
     };
@@ -4419,6 +4458,86 @@ mod tests {
                 "SNAP=$(mktemp -d --suffix=.foo /tmp/x.XXXXXX)\ntouch \"$SNAP/f\"",
                 false,
             ),
+            // The same fail-closed shapes must hold when the initial cwd is a
+            // tracked temp dir: the raw `$(mktemp ...)` substitution string
+            // must never resolve as a literal path against a tracked temp cwd
+            // and bind as a temp value — at runtime mktemp errors, SNAP binds
+            // empty, and the chained write lands outside every temp root.
+            (
+                "cd /tmp; SNAP=$(mktemp -d -p /tmp/nonexistent_x); touch $SNAP/f",
+                false,
+            ),
+            (
+                "cd /tmp\nSNAP=$(mktemp -d -p /tmp/nonexistent_x)\ntouch $SNAP/f",
+                false,
+            ),
+            (
+                "cd /tmp && SNAP=$(mktemp -d -p /tmp/nonexistent_x) && touch $SNAP/f",
+                false,
+            ),
+            ("cd /tmp; SNAP=$(mktemp -d -p /etc); touch $SNAP/f", false),
+            (
+                "cd /tmp; SNAP=$(mktemp -d /etc/foo.XXXXXX); touch $SNAP/f",
+                false,
+            ),
+            (
+                "cd /tmp; SNAP=$(mktemp -d --tmpdir /tmp); touch $SNAP/f",
+                false,
+            ),
+            (
+                "cd /tmp; SNAP=$(mktemp -d --tmpdir=/tmp/nonexistent_x); touch $SNAP/f",
+                false,
+            ),
+            (
+                "cd /tmp; SNAP=$(mktemp -d --suffix=.foo /tmp/x.XXXXXX); touch $SNAP/f",
+                false,
+            ),
+            // Workspace-targeting chains through the unprovable substitution
+            // stay blocked.
+            (
+                "cd /tmp; SNAP=$(mktemp -d -p /etc); rm -rf $SNAP/Users/egordezic/Desktop/mahbot",
+                false,
+            ),
+            (
+                "cd /tmp; SNAP=$(mktemp -d -p /etc); echo pwn > $SNAP/Users/egordezic/Desktop/mahbot/x",
+                false,
+            ),
+            (
+                "cd /tmp; SNAP=$(mktemp -d -p /etc); tee $SNAP/Users/egordezic/Desktop/mahbot/x",
+                false,
+            ),
+            // A substitution used directly in a path argument is equally
+            // unprovable: at runtime mktemp errors, the empty expansion makes
+            // the write land at /f or the workspace path.
+            ("cd /tmp; touch $(mktemp -d -p /etc)/f", false),
+            ("cd /tmp; echo hi > $(mktemp -d -p /etc)/f", false),
+            (
+                "cd /tmp; rm -rf $(mktemp -d -p /etc)/Users/egordezic/Desktop/mahbot",
+                false,
+            ),
+            ("cd /tmp; touch `mktemp -d -p /etc`/f", false),
+            // Provable bindings keep working under a tracked temp cwd.
+            ("cd /tmp; SNAP=$(mktemp -d); touch $SNAP/f", true),
+            ("cd /tmp; SNAP=$(mktemp -d -p /tmp); touch $SNAP/f", true),
+            (
+                "cd /tmp; SNAP=$(mktemp -d --tmpdir=/tmp); touch $SNAP/f",
+                true,
+            ),
+            // A single-quoted `$(...)` is a literal, not a substitution: it
+            // never binds a temp root. A substitution embedded in a larger
+            // value is unprovable too — fail-closed.
+            ("SNAP='$(mktemp -d)'\ntouch \"$SNAP/f\"", false),
+            (
+                "cd /tmp; SNAP=pre$(mktemp -d -p /etc); touch $SNAP/f",
+                false,
+            ),
+            // Parameter expansions with modifiers (`${FOO:-../etc}`) are
+            // unprovable: the default can carry `..` and escape the temp
+            // root at runtime, so words containing them fail to resolve.
+            ("cd /tmp; echo hi > /tmp/${FOO:-../etc}/f", false),
+            ("echo hi > /tmp/${FOO:-../etc}/f", false),
+            ("cd /tmp; touch /tmp/${FOO//x/../etc}/f", false),
+            ("cd /tmp; echo hi > \"/tmp/${FOO:-../etc}/f\"", false),
         ];
 
         run_cases(&cases);
