@@ -1,6 +1,7 @@
 //! Shared state types used across GUI pages.
 
 use iced::Task;
+use iced::widget::text_editor;
 
 /// Pagination state shared by dashboard pages that display paginated data.
 ///
@@ -232,6 +233,80 @@ impl DebounceState {
     }
 }
 
+// ── Undo/Redo stack ─────────────────────────────────────────────────
+
+/// Snapshot-based undo/redo stack for a text input editor.
+///
+/// Stores `(String, Cursor)` pairs because [`text_editor::Content`] does not
+/// implement `Clone` in a way that preserves cursor position.  Restoration
+/// reconstructs via [`text_editor::Content::with_text`] +
+/// [`text_editor::Content::move_to`].
+#[derive(Debug, Clone)]
+pub(crate) struct UndoStack {
+    /// Previous states, newest last.
+    undo: Vec<UndoSnapshot>,
+    /// Undone states, cleared on new edit.
+    redo: Vec<UndoSnapshot>,
+}
+
+/// A single undo snapshot for a text input editor.
+#[derive(Debug, Clone)]
+pub(crate) struct UndoSnapshot {
+    pub(crate) text: String,
+    pub(crate) cursor: text_editor::Cursor,
+}
+
+impl UndoStack {
+    const MAX_UNDO_DEPTH: usize = 100;
+
+    pub(crate) const fn new() -> Self {
+        Self {
+            undo: Vec::new(),
+            redo: Vec::new(),
+        }
+    }
+
+    /// Take a snapshot before an edit is performed.
+    pub(crate) fn snap_before_edit(&mut self, content: &text_editor::Content) {
+        self.redo.clear();
+        self.undo.push(UndoSnapshot {
+            text: content.text(),
+            cursor: content.cursor(),
+        });
+        if self.undo.len() > Self::MAX_UNDO_DEPTH {
+            self.undo.remove(0);
+        }
+    }
+
+    fn push_and_pop(
+        dst: &mut Vec<UndoSnapshot>,
+        src: &mut Vec<UndoSnapshot>,
+        content: &text_editor::Content,
+    ) -> Option<UndoSnapshot> {
+        dst.push(UndoSnapshot {
+            text: content.text(),
+            cursor: content.cursor(),
+        });
+        src.pop()
+    }
+
+    /// Pop the most recent snapshot, saving current state to the redo stack.
+    pub(crate) fn undo(&mut self, content: &text_editor::Content) -> Option<UndoSnapshot> {
+        Self::push_and_pop(&mut self.redo, &mut self.undo, content)
+    }
+
+    /// Pop the most recent undone snapshot, saving current state to the undo stack.
+    pub(crate) fn redo(&mut self, content: &text_editor::Content) -> Option<UndoSnapshot> {
+        Self::push_and_pop(&mut self.undo, &mut self.redo, content)
+    }
+
+    /// Reset the stack (e.g. after sending a message).
+    pub(crate) fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+    }
+}
+
 // ── String helpers ──────────────────────────────────────────────────
 
 /// Convert a string reference to `None` if empty, otherwise
@@ -243,5 +318,65 @@ pub(crate) fn none_if_empty(s: &str) -> Option<String> {
         None
     } else {
         Some(s.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stack with one snapshot of `text` taken before any edit.
+    fn stack_with_snapshot(text: &str) -> UndoStack {
+        let mut stack = UndoStack::new();
+        let content = text_editor::Content::with_text(text);
+        stack.snap_before_edit(&content);
+        stack
+    }
+
+    #[test]
+    fn undo_restores_snapshot() {
+        let mut stack = stack_with_snapshot("original");
+        let modified = text_editor::Content::with_text("modified");
+        let snapshot = stack.undo(&modified).unwrap();
+        assert_eq!(snapshot.text, "original");
+    }
+
+    #[test]
+    fn redo_restores_undone_state() {
+        let mut stack = stack_with_snapshot("original");
+        let modified = text_editor::Content::with_text("modified");
+        let _ = stack.undo(&modified);
+
+        let snapshot = stack.redo(&modified).unwrap();
+        assert_eq!(snapshot.text, "modified");
+    }
+
+    #[test]
+    fn new_edit_clears_redo() {
+        let mut stack = stack_with_snapshot("v1");
+        let v2 = text_editor::Content::with_text("v2");
+        let _ = stack.undo(&v2);
+
+        // New edit after undo should clear redo.
+        let v3 = text_editor::Content::with_text("v3");
+        stack.snap_before_edit(&v3);
+
+        assert!(stack.redo(&v3).is_none());
+    }
+
+    #[test]
+    fn snapshot_preserves_cursor() {
+        let mut content = text_editor::Content::with_text("line1\nline2\nline3");
+        content.move_to(text_editor::Cursor {
+            position: text_editor::Position { line: 1, column: 2 },
+            selection: None,
+        });
+        let mut stack = UndoStack::new();
+        stack.snap_before_edit(&content);
+
+        let modified = text_editor::Content::with_text("changed");
+        let snapshot = stack.undo(&modified).unwrap();
+        assert_eq!(snapshot.cursor.position.line, 1);
+        assert_eq!(snapshot.cursor.position.column, 2);
     }
 }

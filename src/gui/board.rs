@@ -37,80 +37,6 @@ pub struct CommitStats {
     files: Vec<FileStat>,
 }
 
-// ── Comment Input Undo/Redo ──────────────────────────────────────────
-
-/// Snapshot-based undo/redo stack for the comment input text editor.
-///
-/// Stores `(String, Cursor)` pairs because [`text_editor::Content`] does not
-/// implement `Clone` in a way that preserves cursor position.  Restoration
-/// reconstructs via [`text_editor::Content::with_text`] +
-/// [`text_editor::Content::move_to`].
-#[derive(Debug, Clone)]
-struct UndoStack {
-    /// Previous states, newest last.
-    undo: Vec<UndoSnapshot>,
-    /// Undone states, cleared on new edit.
-    redo: Vec<UndoSnapshot>,
-}
-
-/// A single undo snapshot for the comment input.
-#[derive(Debug, Clone)]
-struct UndoSnapshot {
-    text: String,
-    cursor: text_editor::Cursor,
-}
-
-impl UndoStack {
-    const MAX_UNDO_DEPTH: usize = 100;
-
-    const fn new() -> Self {
-        Self {
-            undo: Vec::new(),
-            redo: Vec::new(),
-        }
-    }
-
-    /// Take a snapshot before an edit is performed.
-    fn snap_before_edit(&mut self, content: &text_editor::Content) {
-        self.redo.clear();
-        self.undo.push(UndoSnapshot {
-            text: content.text(),
-            cursor: content.cursor(),
-        });
-        if self.undo.len() > Self::MAX_UNDO_DEPTH {
-            self.undo.remove(0);
-        }
-    }
-
-    fn push_and_pop(
-        dst: &mut Vec<UndoSnapshot>,
-        src: &mut Vec<UndoSnapshot>,
-        content: &text_editor::Content,
-    ) -> Option<UndoSnapshot> {
-        dst.push(UndoSnapshot {
-            text: content.text(),
-            cursor: content.cursor(),
-        });
-        src.pop()
-    }
-
-    /// Pop the most recent snapshot, saving current state to the redo stack.
-    fn undo(&mut self, content: &text_editor::Content) -> Option<UndoSnapshot> {
-        Self::push_and_pop(&mut self.redo, &mut self.undo, content)
-    }
-
-    /// Pop the most recent undone snapshot, saving current state to the undo stack.
-    fn redo(&mut self, content: &text_editor::Content) -> Option<UndoSnapshot> {
-        Self::push_and_pop(&mut self.undo, &mut self.redo, content)
-    }
-
-    /// Reset the stack (e.g. after sending a comment or switching tickets).
-    fn clear(&mut self) {
-        self.undo.clear();
-        self.redo.clear();
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum BoardMessage {
     Refreshed(Vec<Ticket>),
@@ -228,7 +154,7 @@ pub struct BoardState {
     /// in the comment input (matching the Home chat input pattern).
     modifiers: keyboard::Modifiers,
     /// Undo/redo stack for the comment input text editor.
-    undo_stack: UndoStack,
+    undo_stack: super::common::UndoStack,
 
     // ── Ticket search (sidebar) ──────────────────────────────────
     /// Current search query (empty = no search active).
@@ -263,7 +189,7 @@ impl BoardState {
             current_user_name: None,
             comment_generation: 0,
             modifiers: keyboard::Modifiers::empty(),
-            undo_stack: UndoStack::new(),
+            undo_stack: super::common::UndoStack::new(),
             search_query: String::new(),
             search_results: Vec::new(),
             search_generation: 0,
