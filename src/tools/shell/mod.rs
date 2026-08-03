@@ -65,7 +65,7 @@ pub(super) const NON_DELEGATING_PREFIXES: &[&str] =
 const GIT_GLOBAL_FLAGS: &[&str] = &["-C", "--git-dir", "--work-tree", "-c"];
 
 /// Default maximum shell command execution time before kill.
-const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 600;
 /// Absolute maximum allowed shell command timeout (1 hour).
 /// Prevents agents from setting absurdly long timeouts.
 const MAX_SHELL_TIMEOUT_SECS: u64 = 3600;
@@ -425,6 +425,9 @@ fn format_timeout_error(
         let _ = write!(msg, "\npid: {p}");
     }
     msg.push_str("\nreason: command was killed after exceeding the timeout");
+    msg.push_str(
+        "\nhint: for known-long commands, pass a larger per-call timeout via the `timeout_secs` tool argument (max 3600s).",
+    );
 
     append_output_tail(&mut msg, "stdout", stdout);
     append_output_tail(&mut msg, "stderr", stderr);
@@ -736,7 +739,7 @@ impl Tool for ShellTool {
                 },
                 "timeout_secs": {
                     "type": "integer",
-                    "description": "Optional custom timeout in seconds (default: 300, max: 3600). Use this for long-running commands that need more than the default 5-minute timeout.",
+                    "description": "Optional custom timeout in seconds (default: 600, max: 3600). Use this for long-running commands that need more than the default 10-minute timeout.",
                     "minimum": 1,
                     "maximum": 3600
                 },
@@ -2706,6 +2709,7 @@ mod tests {
         );
         assert!(msg.contains("elapsed:"), "msg: {msg}");
         assert!(msg.contains("timeout_limit:"), "msg: {msg}");
+        assert!(msg.contains("timeout_secs"), "msg: {msg}");
         assert!(msg.contains("before-timeout"), "msg: {msg}");
 
         // Verify ANSI escape sequences are stripped from timeout error messages
