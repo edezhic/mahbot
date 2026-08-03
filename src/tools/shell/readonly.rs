@@ -881,8 +881,30 @@ fn contains_glob(s: &str) -> bool {
 }
 
 /// True when `path` is under one of the context's allowed temp roots.
+///
+/// The lexical root check is followed by symlink resolution of the deepest
+/// existing ancestor: a symlink inside a temp root can point at a non-temp
+/// directory (e.g. the workspace), and writes through it land outside every
+/// temp root — `is_dir` follows the symlink while a purely lexical root
+/// comparison does not. Nonexistent tails climb to their existing parent,
+/// which is where the write actually lands.
 fn is_path_under_temp(path: &std::path::Path, ctx: &CheckContext) -> bool {
-    crate::tools::path::is_path_under_roots(path, &ctx.temp_roots)
+    if !crate::tools::path::is_path_under_roots(path, &ctx.temp_roots) {
+        return false;
+    }
+    let mut probe = path;
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(probe) {
+            return crate::tools::path::is_path_under_roots(&canon, &ctx.temp_roots);
+        }
+        let Some(parent) = probe.parent() else {
+            return true;
+        };
+        if parent == probe {
+            return true;
+        }
+        probe = parent;
+    }
 }
 
 /// Validation context for a read-only shell command: the workspace root,
@@ -1487,10 +1509,18 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
     // created temp dir, `cd ..`, `cd -`, bare `cd`, `cd $VAR`, `cd ~`,
     // pushd/popd — reset tracking to fail-closed: subsequent relative path
     // arguments and redirect targets reject.
+    //
+    // The verb is located after env assignments and the shell prefixes that
+    // forward their command to the current shell (`command`/`builtin`/`time`/
+    // `eval` — `command cd /etc` moves the real CWD). Non-forwarding prefixes
+    // (`sudo`/`env`/`nice`/…) run the `cd` in a child shell, so the real CWD
+    // never changes and the segment is not routed here.
     let words: Vec<&str> = trimmed.split_whitespace().collect();
     let first_effective = words
         .iter()
-        .find(|w| !super::is_env_assignment(w))
+        .find(|w| {
+            !super::is_env_assignment(w) && !matches!(**w, "command" | "builtin" | "time" | "eval")
+        })
         .copied()
         .unwrap_or("");
     if matches!(first_effective, "cd" | "pushd" | "popd") {
@@ -1656,12 +1686,13 @@ fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
     if target.starts_with('/') {
         let p = std::path::PathBuf::from(target);
         if is_path_under_temp(&p, state.ctx) {
-            // Track only when the directory exists or was created earlier
-            // in this chain (mkdir); a nonexistent target would fail the
-            // `cd` at runtime and a chained write would land in the real
-            // CWD (fail-closed).
+            // Track only when the directory exists or was provably created by
+            // `mkdir` earlier in this chain. A nonexistent target — or one
+            // whose raw path has a missing prefix component (`/tmp/a/../b`
+            // with `a` absent) — fails the `cd` at runtime and a chained
+            // write would land in the real CWD (fail-closed).
             let normalized = crate::tools::path::normalize_path(&p);
-            state.cwd = if p.is_dir() || state.created_dirs.contains(&normalized) {
+            state.cwd = if path_exists_or_created(&p, &normalized, state) {
                 Some(p)
             } else {
                 None
@@ -1699,13 +1730,31 @@ fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
         };
         let normalized = crate::tools::path::normalize_path(&resolved);
         state.cwd = if is_path_under_temp(&normalized, state.ctx)
-            && (normalized.is_dir() || state.created_dirs.contains(&normalized))
+            && path_exists_or_created(&resolved, &normalized, state)
         {
             Some(normalized)
         } else {
             None
         };
     }
+}
+
+/// A `cd`/`mktemp` target is provably reachable at runtime when the raw path
+/// resolves through the filesystem (`is_dir` follows every component,
+/// matching `chdir`/`stat` semantics) or — for `..`-free paths — was recorded
+/// by an earlier `mkdir` in the chain. A raw path containing `..` is only
+/// provable when it already exists: a missing prefix component fails the
+/// command at runtime even when the normalized tail exists.
+fn path_exists_or_created(
+    raw: &std::path::Path,
+    normalized: &std::path::Path,
+    state: &ValidationState,
+) -> bool {
+    raw.is_dir()
+        || (!raw
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+            && state.created_dirs.contains(normalized))
 }
 
 /// Record temp directories created by an approved `mkdir` segment (normalized
@@ -1987,13 +2036,21 @@ fn mktemp_binding(value: &str, state: &ValidationState) -> Option<VarBinding> {
     // the tracked CWD — the shell cwd at runtime — so they fail closed unless
     // that cwd is already a tracked temp root. A template without trailing
     // X's makes mktemp error at runtime and bind the variable empty, so no
-    // temp anchor may be created (fail-closed).
+    // temp anchor may be created (fail-closed). mktemp creates the final
+    // component, so the raw parent must be traversable at runtime — a missing
+    // prefix component (`a/../b.XXXXXX` with `a` absent) errors mktemp even
+    // when the normalized tail exists.
     if let Some(t) = template {
         let clean = strip_outer_quotes(t).map_or(t, |(c, _)| c);
         if !clean.ends_with("XXXXXX") {
             return None;
         }
-        if resolve_path_word(clean, state).is_none_or(|p| !is_path_under_temp(&p, state.ctx)) {
+        let p = resolve_path_word(clean, state)?;
+        let parent = p.parent()?;
+        let parent_norm = crate::tools::path::normalize_path(parent);
+        if !is_path_under_temp(&p, state.ctx)
+            || !path_exists_or_created(parent, &parent_norm, state)
+        {
             return None;
         }
     }
@@ -2004,13 +2061,14 @@ fn mktemp_binding(value: &str, state: &ValidationState) -> Option<VarBinding> {
         }),
         Some(dir) => {
             let clean = strip_outer_quotes(dir).map_or(dir, |(c, _)| c);
-            let p = resolve_path_word(clean, state)?;
-            let p = crate::tools::path::normalize_path(&p);
+            let raw = resolve_path_word(clean, state)?;
+            let normalized = crate::tools::path::normalize_path(&raw);
             // mktemp never creates the `-p` directory: it errors when the dir
-            // does not exist and the variable binds empty (false temp anchor).
-            // Track only when the dir exists at validation time or was
-            // provably created by `mkdir` earlier in the chain.
-            if is_path_under_temp(&p, state.ctx) && (p.is_dir() || state.created_dirs.contains(&p))
+            // does not exist (or its raw path is un-traversable, e.g. a
+            // missing prefix component) and the variable binds empty (false
+            // temp anchor). Track only when the dir provably exists.
+            if is_path_under_temp(&normalized, state.ctx)
+                && path_exists_or_created(&raw, &normalized, state)
             {
                 Some(VarBinding {
                     value: None,
@@ -4228,6 +4286,16 @@ mod tests {
             ("cd /tmp && cd -L -- /tmp && touch f", true),
             ("mkdir -p /tmp/snap && cd -P /tmp/snap && touch f", true),
             ("cd /tmp && cd -P /tmp/nonexistent_x && touch f", false),
+            // Prefixed cd forms (`command`/`builtin`/`time`/`eval`) run the cd
+            // in the current shell — routed and tracked like a bare cd.
+            ("cd /tmp && command cd /tmp && touch f", true),
+            ("cd /tmp && builtin cd /tmp && touch f", true),
+            (
+                "mkdir -p /tmp/snap && cd /tmp && time cd /tmp/snap && touch f",
+                true,
+            ),
+            ("cd /tmp && eval cd /tmp && echo hi > out.txt", true),
+            ("cd /tmp && command cd -L -- /tmp && touch f", true),
         ];
 
         run_cases(&cases);
@@ -4728,5 +4796,84 @@ mod tests {
             err.contains("cargo build") && err.contains("target/debug"),
             "cargo run denial should teach the built-binary alternative: {err}"
         );
+    }
+
+    #[test]
+    fn symlink_escape_fails_closed() {
+        // A symlink inside a temp root pointing at an existing non-temp dir:
+        // writes through it land outside every temp root. The target must
+        // exist for canonicalize to resolve through it; the project directory
+        // is a stable non-temp anchor.
+        let target = std::env::current_dir().expect("cwd");
+        let link = std::env::temp_dir().join(format!("mahbot_ro_probe_{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let link_str = link.to_string_lossy().into_owned();
+        let cases = [
+            (format!("cd {link_str} && touch f"), false),
+            (format!("cd {link_str} ; touch f"), false),
+            (format!("touch {link_str}/f"), false),
+            (format!("rm -rf {link_str}/x"), false),
+            (format!("echo hi > {link_str}/out.txt"), false),
+            (format!("tee {link_str}/x"), false),
+            (format!("cp /tmp/a {link_str}/dest"), false),
+        ];
+        for (command, allowed) in &cases {
+            if *allowed {
+                ok(command);
+            } else {
+                assert_rejected(command);
+            }
+        }
+        let _ = std::fs::remove_file(&link);
+    }
+
+    #[test]
+    fn prefixed_cd_and_dotdot_escapes_fail_closed() {
+        let cases = [
+            // Prefixed cd forms (`command`/`builtin`/`time`/`eval`) run the cd
+            // in the current shell; a non-temp target must reset fail-closed.
+            ("cd /tmp && command cd /etc && touch f", false),
+            ("cd /tmp && command cd -- /etc && touch f", false),
+            ("cd /tmp && builtin cd $HOME && touch f", false),
+            ("cd /tmp && builtin cd -P /etc && touch f", false),
+            ("cd /tmp && time cd ~ && touch f", false),
+            ("cd /tmp && eval cd \"$HOME\" && touch f", false),
+            (
+                "cd /tmp && command cd /__mahbot_readonly_test_ws__ && rm -rf x",
+                false,
+            ),
+            (
+                "cd /tmp && builtin cd /__mahbot_readonly_test_ws__ && touch f",
+                false,
+            ),
+            // `..`-collapsed missing-prefix targets (mkdir-created tail).
+            (
+                "mkdir -p /tmp/qa_b && cd /tmp/qa_a/../qa_b && touch ../x",
+                false,
+            ),
+            (
+                "mkdir -p /tmp/qa_b && cd /tmp && cd qa_a/../qa_b && touch ../x",
+                false,
+            ),
+            (
+                "mkdir -p /tmp/qa_b && cd /tmp && SNAP=$(mktemp -d -p qa_a/../qa_b) && touch $SNAP/f",
+                false,
+            ),
+            (
+                "mkdir -p /tmp/qa_b && cd /tmp && SNAP=$(mktemp -d qa_a/../qa_b.XXXXXX) && touch $SNAP/f",
+                false,
+            ),
+            // The `..`-collapsed shape via the -P flag path.
+            (
+                "mkdir -p /tmp/qa_b && cd /tmp && cd -P qa_a/../qa_b && touch ../x",
+                false,
+            ),
+            // Prefixed cd to a temp target stays accepted (routed, tracks).
+            ("cd /tmp && command cd /tmp && touch f", true),
+            ("cd /tmp && builtin cd -P /tmp && touch f", true),
+        ];
+
+        run_cases(&cases);
     }
 }
