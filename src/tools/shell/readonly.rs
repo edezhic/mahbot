@@ -1481,10 +1481,12 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
     // ── CWD tracking (contract decision 7) ─────────────────────────
     // A literal absolute `cd` into a directory that exists at validation time
     // (or was created by `mkdir` earlier in the chain) updates the tracked
-    // CWD. All other cd forms — relative `cd` whose target does not provably
-    // resolve under a tracked temp cwd, `cd ..`, `cd -`, bare `cd`,
-    // `cd $VAR`, `cd ~`, pushd/popd — reset tracking to fail-closed:
-    // subsequent relative path arguments and redirect targets reject.
+    // CWD, after skipping `cd` option flags (`-P`/`-L`/`--`); a flag-only
+    // form (`cd -P` → `$HOME`) or invalid option resets. All other cd forms —
+    // relative `cd` whose target does not provably resolve to an existing or
+    // created temp dir, `cd ..`, `cd -`, bare `cd`, `cd $VAR`, `cd ~`,
+    // pushd/popd — reset tracking to fail-closed: subsequent relative path
+    // arguments and redirect targets reject.
     let words: Vec<&str> = trimmed.split_whitespace().collect();
     let first_effective = words
         .iter()
@@ -1600,13 +1602,18 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
 /// directory exists at validation time or was provably created by `mkdir`
 /// earlier in the same command chain: a nonexistent target fails the `cd` at
 /// runtime, leaving the real CWD in place, so tracking it would approve a
-/// chained write that actually lands elsewhere. A literal absolute `cd`
-/// elsewhere tracks only when the directory exists. Every other form —
-/// relative `cd` whose target does not provably resolve under a tracked temp
-/// cwd, `cd ..`, `cd -`, bare `cd`, `cd $VAR`, `cd ~`, pushd/popd — resets
-/// tracking to fail-closed (`None` → relative paths reject). Relative targets
-/// are expanded against the tracked state before tracking, so `$VAR`, `~`,
-/// `-` and `$OLDPWD` cannot smuggle a non-temp location past the guard.
+/// chained write that actually lands elsewhere (or escapes a `..` chain past
+/// the temp root when the tracked depth does not match). A literal absolute
+/// `cd` elsewhere tracks only when the directory exists. Every other form —
+/// relative `cd` whose target does not provably resolve to an existing or
+/// created temp dir, `cd ..`, `cd -`, bare `cd`, `cd $VAR`, `cd ~`,
+/// pushd/popd — resets tracking to fail-closed (`None` → relative paths
+/// reject). `cd` option flags (`-P`/`-L`/`--`) are skipped before the target
+/// is resolved; a flag-only form (`cd -P`) targets `$HOME` and an invalid
+/// option (`-e`, `-@`, …) errors at runtime, so both reset fail-closed.
+/// Relative targets are expanded against the tracked state before tracking,
+/// so `$VAR`, `~`, `-` and `$OLDPWD` cannot smuggle a non-temp location past
+/// the guard.
 fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
     let words: Vec<&str> = segment.split_whitespace().collect();
     let Some(cd_idx) = words
@@ -1615,58 +1622,89 @@ fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
     else {
         return;
     };
-    let cmd = words[cd_idx];
-    match words.get(cd_idx + 1) {
-        Some(target) if cmd == "cd" && target.starts_with('/') => {
-            let p = std::path::PathBuf::from(target);
-            if is_path_under_temp(&p, state.ctx) {
-                // Track only when the directory exists or was created earlier
-                // in this chain (mkdir); a nonexistent target would fail the
-                // `cd` at runtime and a chained write would land in the real
-                // CWD (fail-closed).
-                let normalized = crate::tools::path::normalize_path(&p);
-                state.cwd = if p.is_dir() || state.created_dirs.contains(&normalized) {
-                    Some(p)
-                } else {
-                    None
-                };
-            } else {
-                // Filesystem existence checks are expected and acceptable
-                // (decision 7); a nonexistent target fails the command, so
-                // tracking resets fail-closed.
-                state.cwd = if p.is_dir() { Some(p) } else { None };
+    // pushd/popd always reset fail-closed; only `cd` tracks.
+    if words[cd_idx] != "cd" {
+        state.cwd = None;
+        return;
+    }
+    // Skip option words before resolving the real target. `-P`/`-L` (and
+    // combined forms) are valid; `--` ends option parsing; any other `-…`
+    // option (`-e`, `-@`, `-x`, …) errors at runtime, so the `cd` never
+    // happens and the real CWD stays put — tracking would approve a chained
+    // write that lands there. A bare `cd`/`cd -P` (no target after the
+    // flags) targets `$HOME`. All of these reset fail-closed; `-` alone is
+    // the `$OLDPWD` target, never an option.
+    let mut i = cd_idx + 1;
+    let mut options_ended = false;
+    let target = loop {
+        let Some(w) = words.get(i) else { break None };
+        if !options_ended && w.starts_with('-') && *w != "-" {
+            if *w == "--" {
+                options_ended = true;
+            } else if !w[1..].bytes().all(|b| matches!(b, b'P' | b'L')) {
+                break None;
             }
+            i += 1;
+            continue;
         }
-        Some(target) if cmd == "cd" => {
-            // Relative cd under a tracked temp cwd is allowed iff the target
-            // — after variable expansion — resolves to a path under a temp
-            // root; anything else resets fail-closed. `~` and `-` never
-            // resolve under temp, and unresolvable targets (`$HOME`,
-            // `$OLDPWD`, unbound variables) reject.
-            let Some(cwd) = &state.cwd else {
-                state.cwd = None;
-                return;
-            };
-            if !is_path_under_temp(cwd, state.ctx) {
-                state.cwd = None;
-                return;
-            }
-            if target.starts_with('~') || *target == "-" {
-                state.cwd = None;
-                return;
-            }
-            let Some(resolved) = resolve_path_word(target, state) else {
-                state.cwd = None;
-                return;
-            };
-            let normalized = crate::tools::path::normalize_path(&resolved);
-            state.cwd = if is_path_under_temp(&normalized, state.ctx) {
-                Some(normalized)
+        break Some(*w);
+    };
+    let Some(target) = target else {
+        state.cwd = None;
+        return;
+    };
+    if target.starts_with('/') {
+        let p = std::path::PathBuf::from(target);
+        if is_path_under_temp(&p, state.ctx) {
+            // Track only when the directory exists or was created earlier
+            // in this chain (mkdir); a nonexistent target would fail the
+            // `cd` at runtime and a chained write would land in the real
+            // CWD (fail-closed).
+            let normalized = crate::tools::path::normalize_path(&p);
+            state.cwd = if p.is_dir() || state.created_dirs.contains(&normalized) {
+                Some(p)
             } else {
                 None
             };
+        } else {
+            // Filesystem existence checks are expected and acceptable
+            // (decision 7); a nonexistent target fails the command, so
+            // tracking resets fail-closed.
+            state.cwd = if p.is_dir() { Some(p) } else { None };
         }
-        _ => state.cwd = None,
+    } else {
+        // Relative cd under a tracked temp cwd tracks iff the target — after
+        // variable expansion — resolves to a path under a temp root that
+        // exists at validation time or was created by `mkdir` earlier in the
+        // chain. A nonexistent target fails the `cd` at runtime, leaving the
+        // real CWD one level shallower: tracking the deeper path would let a
+        // `..` chained write climb past the temp root (fail-closed). `~` and
+        // `-` never resolve under temp, and unresolvable targets (`$HOME`,
+        // `$OLDPWD`, unbound variables) reject.
+        let Some(cwd) = &state.cwd else {
+            state.cwd = None;
+            return;
+        };
+        if !is_path_under_temp(cwd, state.ctx) {
+            state.cwd = None;
+            return;
+        }
+        if target.starts_with('~') || target == "-" {
+            state.cwd = None;
+            return;
+        }
+        let Some(resolved) = resolve_path_word(target, state) else {
+            state.cwd = None;
+            return;
+        };
+        let normalized = crate::tools::path::normalize_path(&resolved);
+        state.cwd = if is_path_under_temp(&normalized, state.ctx)
+            && (normalized.is_dir() || state.created_dirs.contains(&normalized))
+        {
+            Some(normalized)
+        } else {
+            None
+        };
     }
 }
 
@@ -4078,13 +4116,29 @@ mod tests {
             ("cd /tmp && cd /etc && touch f", false),
             ("cd / && touch f", false),
             // Relative cd under a tracked temp cwd tracks iff the normalized
-            // result stays under a temp root.
-            ("cd /tmp && cd src && touch f", true),
-            ("cd /tmp && cd a/b/c && echo hi > out.txt", true),
+            // result stays under a temp root AND the directory exists or was
+            // created by `mkdir` earlier in the chain (a nonexistent target
+            // fails the `cd` at runtime, so tracking its deeper path would let
+            // a `..` chained write escape the temp root).
+            ("mkdir -p /tmp/src && cd /tmp && cd src && touch f", true),
+            (
+                "mkdir -p /tmp/a/b/c && cd /tmp && cd a/b/c && echo hi > out.txt",
+                true,
+            ),
             ("cd /tmp && cd .. && touch f", false),
             ("cd /tmp && cd ../etc && touch f", false),
             ("cd /tmp && cd ../../../etc && touch f", false),
             ("cd /tmp && cd /etc && cd src && touch f", false),
+            // Nonexistent relative targets fail the `cd` at runtime — the
+            // chained write lands one level shallower, where a `..` chain
+            // escapes the temp root. Fail closed in every chaining spelling.
+            ("cd /tmp && cd a/b/c && touch ../x", false),
+            ("cd /tmp ; cd a/b/c ; touch ../x", false),
+            ("cd /tmp\ncd a/b/c\ntouch ../x", false),
+            (
+                "mkdir -p /tmp/a/b/c && cd /tmp && cd a/b/c && touch ../x",
+                true,
+            ),
             ("cd .. && touch f", false),
             ("cd - && touch f", false),
             ("cd && touch f", false),
@@ -4150,7 +4204,13 @@ mod tests {
             // $PWD after tracked cd resolves to the tracked CWD.
             ("cd /tmp && touch $PWD/out", true),
             ("cd /tmp && touch $PWD/../../etc/passwd", false),
-            ("cd /tmp && cd src && touch $PWD/out", true),
+            // A nonexistent relative target must not be tracked: `$PWD` would
+            // then resolve one level deeper than the real CWD.
+            ("cd /tmp ; cd src ; touch $PWD/../etc/passwd", false),
+            (
+                "mkdir -p /tmp/src && cd /tmp && cd src && touch $PWD/out",
+                true,
+            ),
             // cd to workspace + rm — blocked.
             ("cd / && rm f", false),
             // Relative path args without cd resolve to the workspace — blocked.
@@ -4162,6 +4222,41 @@ mod tests {
             // cp destination "." = current dir (workspace → blocked, temp → allowed).
             ("cp /tmp/a .", false),
             ("cd /tmp && cp /tmp/a .", true),
+            // cd option flags are skipped before resolving the target.
+            ("cd /tmp && cd -P /tmp && touch f", true),
+            ("cd /tmp && cd -L /tmp && echo hi > out.txt", true),
+            ("cd /tmp && cd -L -- /tmp && touch f", true),
+            ("mkdir -p /tmp/snap && cd -P /tmp/snap && touch f", true),
+            ("cd /tmp && cd -P /tmp/nonexistent_x && touch f", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    #[test]
+    fn cd_flag_forms_fail_closed() {
+        let cases = [
+            // Option flags were parsed as the cd target (tracking `/tmp/-P`
+            // etc.) while the runtime cd lands in /etc, $HOME, or $OLDPWD —
+            // the chained write escapes every temp root.
+            ("cd /tmp && cd -P /etc && touch f", false),
+            ("cd /tmp && cd -L /etc && rm -rf x", false),
+            ("cd /tmp && cd -PL /etc && touch f", false),
+            ("cd /tmp && cd -P && touch f", false),
+            ("cd /tmp && cd -L && touch f", false),
+            ("cd /tmp && cd -PL && touch f", false),
+            ("cd /tmp && cd -- $HOME && touch f", false),
+            ("cd /tmp && cd -- - && touch f", false),
+            ("cd /tmp && cd -- - && rm -rf x", false),
+            ("cd /tmp && cd -P - && touch f", false),
+            // Invalid options error at runtime (the cd never happens), so
+            // tracking them would approve a write that lands in the real CWD.
+            ("cd /tmp && cd -e /tmp && touch f", false),
+            ("cd /tmp && cd -eP /tmp && touch f", false),
+            ("cd /tmp && cd -Pe /tmp && touch f", false),
+            ("cd /tmp && cd -@ /tmp && touch f", false),
+            ("cd /tmp && cd -x /tmp && touch f", false),
+            ("cd /tmp && cd -P-L /tmp && touch f", false),
         ];
 
         run_cases(&cases);
