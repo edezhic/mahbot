@@ -552,6 +552,16 @@ fn has_disallowed_redirect(segment: &str, state: &ValidationState) -> Result<(),
             i = next;
             continue;
         }
+        // Bare `((...))` arithmetic span: `>`/`<` inside are comparisons, not
+        // redirects (`(( i > 3 ))`, `for ((i=0; i>3; i++))` — false-rejected
+        // before this skip). Adjacent parens are arithmetic; `( (` with a
+        // space is a nested subshell and stays scanned. Skipping inside
+        // quotes would risk swallowing a real redirect after an unterminated
+        // quoted `((`, so only unquoted spans are skipped.
+        if !escaped && !in_single && !in_double && c == '(' && bytes.get(i + 1) == Some(&b'(') {
+            i = find_arithmetic_end(segment, i);
+            continue;
+        }
         // [`super::track_char_context`] handles both backslash escaping
         // and quote state transitions, returning `false` when the
         // character should be skipped for redirect detection (escaped,
@@ -663,7 +673,7 @@ fn resolve_path_word(word: &str, state: &ValidationState) -> Option<std::path::P
 /// Strip balanced surrounding single/double quotes from a shell word.
 /// Returns `(content, was_single_quoted)`, or `None` for unbalanced/mixed
 /// quotes (e.g. `"/tmp`, `'/tmp"`, `ab"cd`).
-fn strip_outer_quotes(word: &str) -> Option<(&str, bool)> {
+pub(super) fn strip_outer_quotes(word: &str) -> Option<(&str, bool)> {
     let bytes = word.as_bytes();
     if word.len() >= 2
         && matches!(bytes[0], b'\'' | b'"')
@@ -849,7 +859,10 @@ enum VarValue {
 /// Resolve a single variable reference for expansion.
 ///
 /// - `$PWD` resolves to the tracked CWD (initial = workspace root); `Blocked`
-///   when tracking was reset (fail-closed).
+///   when tracking was reset (fail-closed). An explicit `PWD=...` assignment
+///   in the chain takes precedence over tracked-cwd resolution (bash sets
+///   `$PWD` from the assignment, and a poisoned non-temp assignment must not
+///   be masked by the tracked CWD).
 /// - `$HOME` and poisoned variables are always `Blocked` (decision 6).
 /// - Bound variables (TMPDIR/TMP/TEMP from the session env, plus any variable
 ///   assigned a temp-root value in the chain) resolve to their value or
@@ -857,9 +870,23 @@ enum VarValue {
 /// - Unbound variables are [`VarValue::Opaque`].
 fn resolve_var(name: &str, state: &ValidationState) -> VarValue {
     match name {
-        "PWD" => match &state.cwd {
-            Some(cwd) => VarValue::Concrete(cwd.to_string_lossy().into_owned()),
-            None => VarValue::Blocked,
+        "PWD" => match state.vars.get(name) {
+            // Explicit assignment wins: `PWD=/etc` must not be masked by the
+            // tracked CWD (`cd /tmp && PWD=/etc touch $PWD/f` → /etc/f).
+            Some(b) => {
+                if b.poisoned {
+                    VarValue::Blocked
+                } else {
+                    match &b.value {
+                        Some(v) => VarValue::Concrete(v.clone()),
+                        None => VarValue::TempRoot,
+                    }
+                }
+            }
+            None => match &state.cwd {
+                Some(cwd) => VarValue::Concrete(cwd.to_string_lossy().into_owned()),
+                None => VarValue::Blocked,
+            },
         },
         "HOME" => VarValue::Blocked,
         _ => match state.vars.get(name) {
@@ -971,6 +998,12 @@ struct ValidationState<'a> {
     /// Tracked current directory. `None` = fail-closed: relative paths reject
     /// (decision 7 — any non-literal-absolute `cd` form resets tracking).
     cwd: Option<std::path::PathBuf>,
+    /// Number of `cd`/`pushd`/`popd` verbs (incl. eval-body cds) executed so
+    /// far in the current-shell context. Construct parsers compare a part's
+    /// count against the construct start to detect a cd that leaks into the
+    /// parent shell (if/for/while/case/select bodies run in the current
+    /// shell): the leaked CWD is untrackable, so the outer tracking resets.
+    cd_count: u64,
     /// Tracked variable bindings by name: the session temp variables
     /// (TMPDIR/TMP/TEMP) plus any variable assigned a temp-root value
     /// (`SNAP=$(mktemp -d)`, `SNAP=/tmp/x`, ...) in the command chain.
@@ -981,10 +1014,10 @@ struct ValidationState<'a> {
     created_dirs: std::collections::HashSet<std::path::PathBuf>,
 }
 
-impl ValidationState<'_> {
+impl<'a> ValidationState<'a> {
     /// Initial state: CWD = the session's workspace root; temp vars bound from
     /// the context's session-environment snapshot.
-    fn new(ctx: &CheckContext) -> ValidationState<'_> {
+    fn new(ctx: &'a CheckContext) -> ValidationState<'a> {
         let mut vars = std::collections::HashMap::new();
         for (name, value) in &ctx.temp_vars {
             vars.insert(
@@ -998,6 +1031,7 @@ impl ValidationState<'_> {
         ValidationState {
             ctx,
             cwd: Some(ctx.workspace_root.clone()),
+            cd_count: 0,
             vars,
             created_dirs: std::collections::HashSet::new(),
         }
@@ -1005,11 +1039,13 @@ impl ValidationState<'_> {
 
     /// Snapshot of the current tracking state. Used for command substitutions,
     /// which execute in a subshell: `cd`/export inside `$(...)` must not leak
-    /// to the outer command's tracking.
-    fn snapshot(&self) -> ValidationState<'_> {
+    /// to the outer command's tracking. Returns a state with the same context
+    /// lifetime (not tied to `&self`), so snapshots can outlive the borrow.
+    fn snapshot(&self) -> ValidationState<'a> {
         ValidationState {
             ctx: self.ctx,
             cwd: self.cwd.clone(),
+            cd_count: self.cd_count,
             vars: self.vars.clone(),
             created_dirs: self.created_dirs.clone(),
         }
@@ -1035,37 +1071,1124 @@ pub(super) fn check_command(command_str: &str, ctx: &CheckContext) -> Result<(),
     validate_string(trimmed, &mut state)
 }
 
-/// Validate a command string (which may contain heredocs, substitutions, and
-/// chained segments) against `state`.
+/// Validate a command string (which may contain heredocs, substitutions,
+/// pipelines, background jobs, and compound constructs) against `state`.
+///
+/// Heredoc bodies are stripped before any scanning (body text is literal —
+/// never commands, redirects, or substitutions; substitutions inside
+/// *unquoted* bodies are emitted by the stripper so they remain scanned).
+/// The result is walked by [`scan_list`], which validates each simple command
+/// and recurses into compound constructs (if/for/while/until/select/case,
+/// brace groups, subshells, function definitions).
 fn validate_string(s: &str, state: &mut ValidationState) -> Result<(), String> {
-    // Heredoc bodies must be removed before ANY scanning: a heredoc body is
-    // literal text — never commands, redirects, or substitutions. Bodies are
-    // also excluded from the shared segmentation (they never become segments).
-    // Command substitutions inside *unquoted* bodies are emitted by the
-    // stripper so they remain scanned (see [`strip_heredoc_bodies`]).
     let scan = strip_heredoc_bodies(s);
-
-    // Segment once on the already-stripped string (no redundant second strip).
-    let segments = super::extract_command_segments_stripped(&scan);
-    for segment in &segments {
-        // Output redirects are validated against the state BEFORE this
-        // segment's own `cd`/export bindings: bash expands redirect targets
-        // with the shell's current variables, and an env-prefix assignment
-        // does not affect them.
-        has_disallowed_redirect(segment, state)?;
-        // Command substitutions are validated with the state as of this
-        // segment — prior segments' `cd`/export bindings apply. Like
-        // redirects, a substitution does not see its own segment's
-        // env-prefix (it expands before the prefix is applied to the
-        // command), so substitution scanning runs before `check_segment`
-        // applies this segment's bindings. Nested validation snapshots the
-        // state: `cd`/export inside `$(...)` runs in a subshell and must not
-        // leak to the outer command.
-        scan_substitutions(segment, state)?;
-        check_segment(segment, state)?;
-    }
-
+    scan_list(&scan, 0, &[], &[], state, false)?;
     Ok(())
+}
+
+/// Validate a single simple command (no compound constructs) against `state`:
+/// redirect scan, substitution scan, then the segment check. Used by
+/// [`scan_list`] for both chain members and pipeline members (the latter get
+/// a fresh snapshot so their state changes never leak). `negated` marks a
+/// `!`-prefixed segment (`time` demoted to external there).
+fn validate_simple_command(
+    seg: &str,
+    state: &mut ValidationState,
+    negated: bool,
+) -> Result<(), String> {
+    let seg = seg.trim();
+    if seg.is_empty() {
+        return Ok(());
+    }
+    // Output redirects are validated against the state BEFORE this segment's
+    // own `cd`/export bindings: bash expands redirect targets with the shell's
+    // current variables, and an env-prefix assignment does not affect them.
+    has_disallowed_redirect(seg, state)?;
+    // Command substitutions are validated with the state as of this segment —
+    // prior segments' `cd`/export bindings apply. Like redirects, a
+    // substitution does not see its own segment's env-prefix (it expands
+    // before the prefix is applied to the command), so substitution scanning
+    // runs before `check_segment` applies this segment's bindings. Nested
+    // validation snapshots the state: `cd`/export inside `$(...)` runs in a
+    // subshell and must not leak to the outer command.
+    scan_substitutions(seg, state)?;
+    check_segment(seg, state, negated)
+}
+
+// ── Construct-aware list walker ────────────────────────────────────────
+
+/// True when `s` (trailing whitespace trimmed) ends with an unescaped `>` or
+/// `<` — an `&`/`|` immediately following is a redirect operator (`2>&1`,
+/// `>|`, …), not a separator. A trailing backslash escapes the metachar
+/// (`echo a\> & touch f`: the `>` is a literal argument, so the `&` IS a
+/// background separator).
+///
+/// Quote awareness is implicit: the caller's `current` buffer preserves quote
+/// characters, so a quoted `>`/`<` is always followed by its closing quote
+/// (`echo ">" &` → `current` ends with `"` → separator, matching bash where
+/// the quoted `>` is a literal argument).
+fn ends_with_unescaped_redirect_op(s: &str) -> bool {
+    let s = s.trim_end();
+    if !s.ends_with(['>', '<']) {
+        return false;
+    }
+    let backslashes = s.chars().rev().skip(1).take_while(|c| *c == '\\').count();
+    backslashes % 2 == 0
+}
+
+/// Walk a shell list (a top-level command string or a construct body) from
+/// byte `start`, validating each simple command and recursing into compound
+/// constructs, until a terminator appears or the input ends.
+///
+/// `stop_keywords` are matched at command position (word boundaries): the
+/// construct keywords (`then`, `do`, `done`, `fi`, `elif`, `else`, `esac`)
+/// plus the single-char `}`/`)` group terminators. `stop_tokens` are matched
+/// at any unquoted position: `;;`, `;&`, `;;&` (case-body terminators, which
+/// bash does not require to be preceded by whitespace).
+///
+/// Returns the index after the terminator (or `s.len()` at end of input).
+///
+/// State semantics: `&&`/`||`/`;`/newline thread the state between commands.
+/// Pipeline members (`|`, `|&`) run in subshells: each member is validated
+/// against a snapshot of the state at pipeline start and its changes never
+/// leak. A single `&` backgrounds the whole preceding chain: the chain ran in
+/// a child, so the state is restored to the chain start. Stray terminators at
+/// command position reject (fail-closed).
+///
+/// A leading `!` negates the exit status of the whole following pipeline but
+/// only the direct list: it demotes a head-of-list `time` to the external
+/// command (bash recognizes the reserved word only at a fresh command start),
+/// while `cd` and everything else still run in the current shell. The flag
+/// resets at `&&`/`||`/`;`/newline/`&` (a new list) and is not passed into
+/// nested constructs (`! { time cd /tmp; }` keeps `time` reserved inside the
+/// brace body).
+///
+/// `time_external_head`: the FIRST validated unit of this list runs after a
+/// keyword where bash does not recognize `time` as the reserved word — the
+/// first word of an `if`/`elif`/`while`/`until` condition or of a case-arm
+/// body (probe-verified: `if time cd /etc; ...` runs external `/usr/bin/time`
+/// with the timed cd in a child). Only that unit demotes; a separator or
+/// newline before the first word returns `time` to reserved (`if \n time cd
+/// /etc` is the reserved word again).
+#[allow(clippy::too_many_lines)] // security-critical list walker
+fn scan_list(
+    s: &str,
+    start: usize,
+    stop_keywords: &[&str],
+    stop_tokens: &[&str],
+    state: &mut ValidationState,
+    time_external_head: bool,
+) -> Result<usize, String> {
+    let mut i = start;
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    // `!`-negation context: set when a `!` is consumed at command position,
+    // cleared at list separators (the negation applies to one pipeline only).
+    let mut negated = false;
+    // Condition/case-arm head: demotes `time` for the first validated unit
+    // only (see `time_external_head`); consumed at the first flush.
+    let mut time_external_pending = time_external_head;
+    // State at the start of the current chain — restored at `&` boundaries
+    // (the whole chain ran in a background child).
+    let mut chain_start = state.snapshot();
+    // State at the start of the current pipeline — pipeline members validate
+    // against snapshots of it; `state` itself is never mutated by members.
+    let mut pipeline_state: Option<ValidationState> = None;
+    let mut in_pipeline = false;
+
+    while i < s.len() {
+        let c = s[i..].chars().next().expect("i < s.len()");
+
+        // Backslash: preserve the escape so downstream scans see it
+        // (`c\144` is an unprovable verb, `\;` is an escaped separator).
+        // Backslash-newline is a line continuation (joined, not a separator).
+        if c == '\\' && !in_single {
+            let Some(next) = s[i + c.len_utf8()..].chars().next() else {
+                current.push(c);
+                break;
+            };
+            if next == '\n' {
+                i += c.len_utf8() + next.len_utf8();
+                continue;
+            }
+            current.push(c);
+            current.push(next);
+            i += c.len_utf8() + next.len_utf8();
+            continue;
+        }
+
+        // Command substitutions stay whole: separators inside `$(...)` are
+        // part of the substitution, not list separators (their content is
+        // validated by the substitution scan with subshell semantics).
+        if !escaped
+            && !in_single
+            && (c == '$' && s.as_bytes().get(i + 1) == Some(&b'(') || c == '`')
+        {
+            let next = if c == '$' {
+                find_substitution_end(s, i + 2).1
+            } else {
+                find_backtick_end(s, i + 1).1
+            };
+            current.push_str(&s[i..next]);
+            i = next;
+            continue;
+        }
+
+        // Bare `((...))` arithmetic spans stay whole (their `;`/`)` are
+        // arithmetic, not list structure).
+        if !escaped
+            && !in_single
+            && !in_double
+            && c == '('
+            && s.as_bytes().get(i + 1) == Some(&b'(')
+        {
+            let next = find_arithmetic_end(s, i);
+            current.push_str(&s[i..next]);
+            i = next;
+            continue;
+        }
+
+        if !super::track_char_context(c, &mut in_single, &mut in_double, &mut escaped) {
+            current.push(c);
+            i += c.len_utf8();
+            continue;
+        }
+
+        // Case-body terminators (`;;`, `;&`, `;;&`) match at any position —
+        // bash does not require a space before them (`echo hi;;`).
+        if !in_single
+            && !in_double
+            && !escaped
+            && let Some(tok) = stop_tokens.iter().find(|t| s[i..].starts_with(**t))
+        {
+            validate_unit(
+                &current,
+                state,
+                pipeline_state.as_ref(),
+                in_pipeline,
+                negated || time_external_pending,
+            )?;
+            current.clear();
+            return Ok(i + tok.len());
+        }
+
+        // At command position: compound constructs, terminators, `!` negation.
+        // Only at non-whitespace chars — a whitespace position must not read
+        // ahead past the whitespace into a following token (the ` }` of a
+        // brace group must be caught by the stop-token check at the `}`, not
+        // treated as a stray terminator from the space position).
+        if current.trim().is_empty()
+            && !c.is_whitespace()
+            && let Some(keyword) = read_keyword_at(s, i)
+        {
+            if stop_keywords.contains(&keyword.as_str()) {
+                validate_unit(
+                    &current,
+                    state,
+                    pipeline_state.as_ref(),
+                    in_pipeline,
+                    negated || time_external_pending,
+                )?;
+                current.clear();
+                return Ok(i + keyword.len());
+            }
+            // `!` pipeline negation — the following pipeline runs in the
+            // current shell but `time` loses its reserved-word status (the
+            // external command's timed command runs in a child). Skip the
+            // operator; the negation applies until the next list separator.
+            if keyword == "!" {
+                negated = true;
+                i += 1;
+                continue;
+            }
+            // A pipeline-member construct runs in a subshell: validate it
+            // against a snapshot of the pipeline-start state and discard the
+            // result (its bindings/cwd must not leak into the parent). Chain
+            // members use the threaded `state` (brace groups run in the
+            // current shell).
+            if in_pipeline {
+                let mut snap = pipeline_state
+                    .as_ref()
+                    .expect("pipeline state set while in pipeline")
+                    .snapshot();
+                match handle_construct(s, i, &mut snap)? {
+                    ConstructAction::Consumed(after) => {
+                        i = after;
+                        continue;
+                    }
+                    ConstructAction::Accumulate(after) => {
+                        current.push_str(&s[i..after]);
+                        i = after;
+                        continue;
+                    }
+                    ConstructAction::NotConstruct => {}
+                }
+            } else {
+                match handle_construct(s, i, state)? {
+                    ConstructAction::Consumed(after) => {
+                        i = after;
+                        continue;
+                    }
+                    ConstructAction::Accumulate(after) => {
+                        current.push_str(&s[i..after]);
+                        i = after;
+                        continue;
+                    }
+                    ConstructAction::NotConstruct => {}
+                }
+            }
+        }
+
+        // ── Separators ────────────────────────────────────────────
+        let bytes = s.as_bytes();
+        match c {
+            '&' => {
+                match bytes.get(i + 1) {
+                    Some(b'&') => {
+                        // `&&` — chain continues with threaded state.
+                        validate_unit(
+                            &current,
+                            state,
+                            pipeline_state.as_ref(),
+                            in_pipeline,
+                            negated || time_external_pending,
+                        )?;
+                        current.clear();
+                        time_external_pending = false;
+                        in_pipeline = false;
+                        pipeline_state = None;
+                        negated = false;
+                        i += 2;
+                    }
+                    Some(b'>') => {
+                        // `&>` / `&>>` redirect — not a separator.
+                        current.push(c);
+                        i += 1;
+                    }
+                    _ if ends_with_unescaped_redirect_op(&current) => {
+                        // `>&`, `<&`, `2>&1` — redirect, not a separator.
+                        current.push(c);
+                        i += 1;
+                    }
+                    _ => {
+                        // Single `&`: the whole chain ran in a background
+                        // child — its state changes are discarded.
+                        validate_unit(
+                            &current,
+                            state,
+                            pipeline_state.as_ref(),
+                            in_pipeline,
+                            negated || time_external_pending,
+                        )?;
+                        current.clear();
+                        time_external_pending = false;
+                        in_pipeline = false;
+                        pipeline_state = None;
+                        negated = false;
+                        *state = chain_start.snapshot();
+                        chain_start = state.snapshot();
+                        i += 1;
+                    }
+                }
+            }
+            '|' => {
+                if bytes.get(i + 1) == Some(&b'|') {
+                    // `||` — OR-list: the left side runs in the current shell
+                    // and the right side only when the left fails. Thread
+                    // state like `&&` (a failed left side left the real state
+                    // unchanged, which matches the fail-closed tracking rules
+                    // for failed commands). `||` is NOT a pipeline. Accepted
+                    // residual: the right side is validated against the
+                    // threaded state but runs exactly when the left FAILED
+                    // (`cd /tmp || touch f` — touch lands in the real CWD);
+                    // pre-existing baseline behavior, pinned by the `||`
+                    // battery, not a hole this ticket closes.
+                    validate_unit(
+                        &current,
+                        state,
+                        pipeline_state.as_ref(),
+                        in_pipeline,
+                        negated || time_external_pending,
+                    )?;
+                    current.clear();
+                    time_external_pending = false;
+                    in_pipeline = false;
+                    pipeline_state = None;
+                    negated = false;
+                    i += 2;
+                } else if ends_with_unescaped_redirect_op(&current) {
+                    // `>|` compound redirect — not a pipe.
+                    current.push(c);
+                    i += 1;
+                } else {
+                    // `|` / `|&` pipeline: members run in subshells. The
+                    // FIRST member must flush against the pipeline-start
+                    // snapshot too — set it before the flush. `negated`
+                    // stays set: the whole pipeline is negated by a leading
+                    // `!` (`! time cd /tmp | cat` — time is external in
+                    // every member).
+                    if pipeline_state.is_none() {
+                        pipeline_state = Some(state.snapshot());
+                    }
+                    in_pipeline = true;
+                    validate_unit(
+                        &current,
+                        state,
+                        pipeline_state.as_ref(),
+                        in_pipeline,
+                        negated || time_external_pending,
+                    )?;
+                    current.clear();
+                    time_external_pending = false;
+                    i += if bytes.get(i + 1) == Some(&b'&') {
+                        2
+                    } else {
+                        1
+                    };
+                }
+            }
+            ';' | '\n' => {
+                validate_unit(
+                    &current,
+                    state,
+                    pipeline_state.as_ref(),
+                    in_pipeline,
+                    negated || time_external_pending,
+                )?;
+                current.clear();
+                time_external_pending = false;
+                in_pipeline = false;
+                pipeline_state = None;
+                negated = false;
+                chain_start = state.snapshot();
+                i += c.len_utf8();
+            }
+            _ => {
+                current.push(c);
+                i += c.len_utf8();
+            }
+        }
+    }
+    validate_unit(
+        &current,
+        state,
+        pipeline_state.as_ref(),
+        in_pipeline,
+        negated || time_external_pending,
+    )?;
+    Ok(s.len())
+}
+
+/// Validate the accumulated unit (a simple command or already-validated
+/// construct span) against the effective state: pipeline members use a fresh
+/// snapshot of the pipeline-start state (discarded — no leak); chain members
+/// use the threaded `state` directly. `negated` marks a `!`-prefixed unit.
+fn validate_unit(
+    current: &str,
+    state: &mut ValidationState,
+    pipeline_state: Option<&ValidationState>,
+    in_pipeline: bool,
+    negated: bool,
+) -> Result<(), String> {
+    if in_pipeline {
+        let mut snap = pipeline_state
+            .expect("pipeline state set while in pipeline")
+            .snapshot();
+        validate_simple_command(current, &mut snap, negated)
+    } else {
+        validate_simple_command(current, state, negated)
+    }
+}
+
+/// Construct a read-only rejection message (the `Err` payload).
+fn reject_msg(cmd: &str, why: &str, suggestion: &str) -> String {
+    format!(
+        "⚠️ Read-only mode: {why}\n\
+         Command: `{cmd}`\n\
+         Suggestion: {suggestion}"
+    )
+}
+
+/// What to do with a token at command position.
+enum ConstructAction {
+    /// A compound construct was consumed and validated; continue after the
+    /// returned index without accumulating text.
+    Consumed(usize),
+    /// A span that stays whole inside the current command (bare `((...))`
+    /// arithmetic); accumulate `s[i..after]`.
+    Accumulate(usize),
+    /// Not a construct — accumulate normally.
+    NotConstruct,
+}
+
+/// Read the next shell word at `i` (skipping leading whitespace, including
+/// newlines — construct keywords can follow a newline: `if true\n then`).
+/// Returns `None` when the word is quoted (a quoted keyword is a literal
+/// command name, not a keyword) or when there is no word.
+fn read_keyword_at(s: &str, i: usize) -> Option<String> {
+    let mut k = i;
+    while k < s.len() && s[k..].chars().next().expect("k < len").is_whitespace() {
+        k += s[k..].chars().next().expect("k < len").len_utf8();
+    }
+    let mut word = String::new();
+    while k < s.len() {
+        let c = s[k..].chars().next().expect("k < len");
+        if c.is_whitespace() || matches!(c, ';' | '&' | '|' | '\n') {
+            break;
+        }
+        if matches!(c, '\'' | '"' | '$' | '`' | '\\') {
+            return None; // quoted / substitution-formed — not a keyword
+        }
+        word.push(c);
+        k += c.len_utf8();
+    }
+    (!word.is_empty()).then_some(word)
+}
+
+/// Dispatch a token at command position: compound constructs, stray
+/// terminators (reject), `{`/`(` groups, arithmetic. (`!` negation is handled
+/// by [`scan_list`] itself — it must set the negated-context flag.)
+///
+/// `base` is the state the construct's parts snapshot from. For chain members
+/// it is the threaded state; for pipeline members the caller passes a fresh
+/// snapshot (which is discarded after the construct — pipeline members run in
+/// subshells). Brace groups thread `base` (they run in the current shell).
+fn handle_construct(
+    s: &str,
+    i: usize,
+    base: &mut ValidationState,
+) -> Result<ConstructAction, String> {
+    let Some(word) = read_keyword_at(s, i) else {
+        return Ok(ConstructAction::NotConstruct);
+    };
+    match word.as_str() {
+        "if" => Ok(ConstructAction::Consumed(parse_if(s, i, base)?)),
+        "for" | "select" => Ok(ConstructAction::Consumed(parse_for(s, i, base)?)),
+        "while" | "until" => Ok(ConstructAction::Consumed(parse_while_until(s, i, base)?)),
+        "case" => Ok(ConstructAction::Consumed(parse_case(s, i, base)?)),
+        "function" => Ok(ConstructAction::Consumed(parse_function(s, i, base)?)),
+        // Stray terminators at command position — the construct they close is
+        // not open here (fail-closed; bash treats them as syntax errors).
+        "fi" | "done" | "esac" | "then" | "do" | "elif" | "else" | "}" | ")" => Err(reject_msg(
+            &s[i..],
+            "a shell control keyword appears without its matching construct.",
+            "remove the stray keyword, or complete the construct it belongs to.",
+        )),
+        _ => {
+            let c = s[i..].chars().next().expect("i < len");
+            if c == '{' && is_brace_group_start(s, i) {
+                Ok(ConstructAction::Consumed(parse_brace(s, i, base)?))
+            } else if c == '(' {
+                // `((` is the arithmetic command (kept whole, validated as a
+                // simple command); `(` is a subshell.
+                if s.as_bytes().get(i + 1) == Some(&b'(') {
+                    Ok(ConstructAction::Accumulate(find_arithmetic_end(s, i)))
+                } else {
+                    Ok(ConstructAction::Consumed(parse_subshell(s, i, base)?))
+                }
+            } else {
+                // `name()` / `name ()` function definition (POSIX form).
+                if looks_like_function_def(s, i) {
+                    Ok(ConstructAction::Consumed(parse_function(s, i, base)?))
+                } else {
+                    Ok(ConstructAction::NotConstruct)
+                }
+            }
+        }
+    }
+}
+
+/// True when the word at `i` is an identifier immediately followed by `()`
+/// (optionally with whitespace between): a POSIX function definition.
+fn looks_like_function_def(s: &str, i: usize) -> bool {
+    let mut k = i;
+    let mut name_len = 0usize;
+    while k < s.len() {
+        let c = s[k..].chars().next().expect("k < len");
+        if !(c.is_ascii_alphanumeric() || c == '_') {
+            break;
+        }
+        k += c.len_utf8();
+        name_len += 1;
+    }
+    if name_len == 0 {
+        return false;
+    }
+    while k < s.len() && s[k..].chars().next().is_some_and(char::is_whitespace) {
+        k += s[k..].chars().next().expect("k < len").len_utf8();
+    }
+    s[k..].starts_with("()")
+}
+
+/// Read one shell word at `i` (quote/substitution aware, skipping leading
+/// whitespace). Returns `(word_text, index_after)`.
+fn read_word_at(s: &str, i: usize) -> (String, usize) {
+    let mut k = i;
+    while k < s.len() && s[k..].chars().next().expect("k < len").is_whitespace() {
+        k += s[k..].chars().next().expect("k < len").len_utf8();
+    }
+    let mut word = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    while k < s.len() {
+        let c = s[k..].chars().next().expect("k < len");
+        if c == '\\' && !in_single {
+            let Some(next) = s[k + c.len_utf8()..].chars().next() else {
+                word.push(c);
+                k += c.len_utf8();
+                break;
+            };
+            word.push(c);
+            word.push(next);
+            k += c.len_utf8() + next.len_utf8();
+            continue;
+        }
+        if !escaped
+            && !in_single
+            && (c == '$' && s.as_bytes().get(k + 1) == Some(&b'(') || c == '`')
+        {
+            let next = if c == '$' {
+                find_substitution_end(s, k + 2).1
+            } else {
+                find_backtick_end(s, k + 1).1
+            };
+            word.push_str(&s[k..next]);
+            k = next;
+            continue;
+        }
+        if !super::track_char_context(c, &mut in_single, &mut in_double, &mut escaped) {
+            word.push(c);
+            k += c.len_utf8();
+            continue;
+        }
+        if c.is_whitespace() || matches!(c, ';' | '&' | '|' | '\n') {
+            break;
+        }
+        word.push(c);
+        k += c.len_utf8();
+    }
+    (word, k)
+}
+
+/// Find the `do` keyword after a for/while header. Skips `;`/newline
+/// separators and whitespace; returns the index after `do`, or `Err` when
+/// the header is unterminated.
+fn find_do_keyword(s: &str, mut i: usize) -> Result<usize, String> {
+    loop {
+        while i < s.len() && s[i..].chars().next().expect("i < len").is_whitespace() {
+            i += s[i..].chars().next().expect("i < len").len_utf8();
+        }
+        if i >= s.len() {
+            return Err(reject_msg(
+                s,
+                "a for/while/until/select construct is missing its `do` keyword.",
+                "write the construct with its closing `done`.",
+            ));
+        }
+        let c = s[i..].chars().next().expect("i < len");
+        if matches!(c, ';' | '\n') {
+            i += c.len_utf8();
+            continue;
+        }
+        break;
+    }
+    match read_keyword_at(s, i) {
+        Some(w) if w == "do" => Ok(i + 2),
+        _ => Err(reject_msg(
+            s,
+            "a for/while/until/select construct is missing its `do` keyword.",
+            "write the construct with its closing `done`.",
+        )),
+    }
+}
+
+/// The stop keyword/token that ended a [`scan_list`] call returning `after`
+/// (the index right after the keyword). Used by the construct parsers to
+/// dispatch on which terminator stopped the scan.
+fn stop_keyword_at(s: &str, after: usize) -> Option<&str> {
+    for kw in ["elif", "else", "esac", "done", "then", "fi", "do", "}", ")"] {
+        if after >= kw.len() && &s[after - kw.len()..after] == kw {
+            return Some(kw);
+        }
+    }
+    None
+}
+
+// ── Compound construct parsers ─────────────────────────────────────────
+
+/// A cd executed inside a construct part runs in the current shell (if/for/
+/// while/case/select bodies and conditions leak to the parent) — the leaked
+/// CWD is untrackable, so the outer tracking resets fail-closed. The counter
+/// propagates so enclosing constructs detect the cd too. Conservative by
+/// design: even a temp-target cd in a body resets (the guard cannot prove the
+/// construct executes at runtime), which over-rejects safe spellings but never
+/// under-rejects.
+///
+/// Variable bindings made inside the part leak at runtime the same way
+/// (`if true; then export TMPDIR=/etc; fi; touch $TMPDIR/f` writes to /etc).
+/// They are merged conservatively: a binding that differs from the outer one
+/// is uncertain (the construct may not take that branch), so the variable
+/// poisons — its expansions reject fail-closed. A variable FIRST bound inside
+/// a part is uncertain too (the branch may not execute, leaving it unset at
+/// runtime — `if false; then D=/tmp; fi; touch $D/f` writes to `/f`), so it
+/// also poisons, mirroring the cd reset.
+fn note_part_cd(part: &ValidationState, base: &mut ValidationState) {
+    if part.cd_count != base.cd_count {
+        base.cwd = None;
+        base.cd_count = part.cd_count;
+    }
+    for (name, pb) in &part.vars {
+        match base.vars.get(name) {
+            Some(bb) if !bb.poisoned && !pb.poisoned && bb.value == pb.value => {}
+            // Unknown (first bound inside the part — the branch may not
+            // execute) or diverging binding: uncertain, poison fail-closed.
+            None | Some(_) => {
+                base.vars.insert(
+                    name.clone(),
+                    VarBinding {
+                        poisoned: true,
+                        value: pb.value.clone(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Parse an `if`/`elif`/`else` construct starting at `i` (at `if`). The whole
+/// construct is a conditional boundary: every part is validated against a
+/// snapshot of the pre-construct state and nothing leaks past `fi`.
+fn parse_if(s: &str, i: usize, base: &mut ValidationState) -> Result<usize, String> {
+    let after_if = i + 2;
+    let mut cond = base.snapshot();
+    // `time` is external at the first word of the condition (probe-verified:
+    // `if time cd ...` runs /usr/bin/time; the timed cd is in a child).
+    let then_idx = scan_list(s, after_if, &["then"], &[], &mut cond, true)?;
+    note_part_cd(&cond, base);
+    let mut body = base.snapshot();
+    let mut after_part = scan_list(s, then_idx, &["elif", "else", "fi"], &[], &mut body, false)?;
+    note_part_cd(&body, base);
+    loop {
+        match stop_keyword_at(s, after_part) {
+            Some("elif") => {
+                let mut econd = base.snapshot();
+                let ethen = scan_list(s, after_part, &["then"], &[], &mut econd, true)?;
+                note_part_cd(&econd, base);
+                let mut ebody = base.snapshot();
+                after_part = scan_list(s, ethen, &["elif", "else", "fi"], &[], &mut ebody, false)?;
+                note_part_cd(&ebody, base);
+            }
+            Some("else") => {
+                let mut eb = base.snapshot();
+                let fi = scan_list(s, after_part, &["fi"], &[], &mut eb, false)?;
+                note_part_cd(&eb, base);
+                return Ok(fi);
+            }
+            Some("fi") => return Ok(after_part),
+            _ => {
+                return Err(reject_msg(
+                    s,
+                    "an if construct is missing its closing `fi`.",
+                    "write the construct with its closing `fi`.",
+                ));
+            }
+        }
+    }
+}
+
+/// Parse a `while`/`until` construct: condition until `do`, body until
+/// `done`. The whole construct is a conditional boundary — nothing leaks.
+fn parse_while_until(s: &str, i: usize, base: &mut ValidationState) -> Result<usize, String> {
+    let after_kw = i + 5;
+    let mut cond = base.snapshot();
+    // `time` is external at the first word of the condition (`while time cd
+    // ...` runs /usr/bin/time; the timed cd is in a child).
+    let do_idx = scan_list(s, after_kw, &["do"], &[], &mut cond, true)?;
+    note_part_cd(&cond, base);
+    if stop_keyword_at(s, do_idx) != Some("do") {
+        return Err(reject_msg(
+            s,
+            "a while/until construct is missing its `do` keyword.",
+            "write the construct with its closing `done`.",
+        ));
+    }
+    let mut body = base.snapshot();
+    let done_idx = scan_list(s, do_idx, &["done"], &[], &mut body, false)?;
+    note_part_cd(&body, base);
+    if stop_keyword_at(s, done_idx) != Some("done") {
+        return Err(reject_msg(
+            s,
+            "a while/until construct is missing its closing `done`.",
+            "write the construct with its closing `done`.",
+        ));
+    }
+    Ok(done_idx)
+}
+
+/// Parse a `for`/`select` construct. `for name [in words]; do body; done` or
+/// `for ((arith)); do body; done`. The loop variable is temp-bound only when
+/// every static prefix in the header word list provably resolves under a temp
+/// root; the body is validated from a pre-construct snapshot plus that
+/// binding; nothing leaks past `done`.
+fn parse_for(s: &str, i: usize, base: &mut ValidationState) -> Result<usize, String> {
+    let after_kw = i + if s[i..].starts_with("select") { 6 } else { 3 };
+    let (name, after_name) = read_word_at(s, after_kw);
+    if name.starts_with("((") {
+        // Arithmetic header: `for (( init; cond; incr )); do`. The header is
+        // an expression, not commands — but command substitutions inside it
+        // execute and must be validated.
+        let first_paren = after_name - name.len();
+        let after_arith = find_arithmetic_end(s, first_paren);
+        let mut header_state = base.snapshot();
+        scan_substitutions(&s[first_paren..after_arith], &mut header_state)?;
+        let do_idx = find_do_keyword(s, after_arith)?;
+        let mut body = base.snapshot();
+        let done_idx = scan_list(s, do_idx, &["done"], &[], &mut body, false)?;
+        note_part_cd(&body, base);
+        if stop_keyword_at(s, done_idx) != Some("done") {
+            return Err(reject_msg(
+                s,
+                "a for/select construct is missing its closing `done`.",
+                "write the construct with its closing `done`.",
+            ));
+        }
+        return Ok(done_idx);
+    }
+    if name.is_empty() {
+        return Err(reject_msg(
+            s,
+            "a for/select construct is missing its loop variable.",
+            "write `for name in ...; do ...; done`.",
+        ));
+    }
+    let mut words: Vec<String> = Vec::new();
+    let mut pos = after_name;
+    // Optional `in` keyword — read it with its true extent (read_word_at
+    // skips leading whitespace; advancing by the keyword length from the
+    // pre-whitespace position would land mid-keyword).
+    let (first_word, after_first) = read_word_at(s, pos);
+    if first_word == "in" {
+        pos = after_first;
+        // Collect the word list until `;`/newline (the `do` follows).
+        loop {
+            while pos < s.len() && s[pos..].chars().next().expect("pos < len").is_whitespace() {
+                pos += s[pos..].chars().next().expect("pos < len").len_utf8();
+            }
+            if pos >= s.len() {
+                break;
+            }
+            let ch = s[pos..].chars().next().expect("pos < len");
+            if matches!(ch, ';' | '\n') {
+                break;
+            }
+            if ch == '(' && s.as_bytes().get(pos + 1) == Some(&b'(') {
+                // A bare `((` inside the word list is malformed — reject.
+                return Err(reject_msg(
+                    s,
+                    "a for/select header contains an unexpected arithmetic span.",
+                    "write the header as `for name in words; do ...; done`.",
+                ));
+            }
+            let (word, after_word) = read_word_at(s, pos);
+            if word.is_empty() {
+                break;
+            }
+            // `do` at the start of a word is a LIST WORD on the runtime shell
+            // (bash 3.2: `for x in do; do ...` iterates over `do`) — only
+            // `;`/newline end the list. POSIX requires that separator before
+            // `do`, and bash rejects `for x in a b do ...` as a syntax error,
+            // so consuming `do` here and failing `find_do_keyword` below is
+            // the correct fail-closed outcome for that spelling.
+            words.push(word);
+            pos = after_word;
+        }
+        // Command substitutions in the word list execute at loop start and
+        // must be validated (`for x in $(touch f); do ...`).
+        let mut header_state = base.snapshot();
+        for word in &words {
+            scan_substitutions(word, &mut header_state)?;
+        }
+    }
+    let do_idx = find_do_keyword(s, pos)?;
+    let mut body = base.snapshot();
+    if let Some(binding) = loop_var_binding(&words, base) {
+        body.vars.insert(name, binding);
+    }
+    let done_idx = scan_list(s, do_idx, &["done"], &[], &mut body, false)?;
+    note_part_cd(&body, base);
+    if stop_keyword_at(s, done_idx) != Some("done") {
+        return Err(reject_msg(
+            s,
+            "a for/select construct is missing its closing `done`.",
+            "write the construct with its closing `done`.",
+        ));
+    }
+    Ok(done_idx)
+}
+
+/// Temp-binding for a for-loop variable: only when every static prefix of the
+/// header word list provably resolves under a temp root (`for f in /tmp/*.db`)
+/// is the variable temp-bound; a non-temp prefix (`for db in ~/.mahbot/db/*.db`)
+/// leaves it unbound (existing fail-closed semantics apply).
+fn loop_var_binding(words: &[String], state: &ValidationState) -> Option<VarBinding> {
+    if words.is_empty() {
+        return None;
+    }
+    words
+        .iter()
+        .all(|w| {
+            // Static prefix: up to the first glob metacharacter.
+            let prefix = w.find(['*', '?', '[']).map_or(w.as_str(), |g| &w[..g]);
+            if prefix.is_empty() {
+                return false;
+            }
+            resolve_path_word(prefix, state).is_some_and(|p| {
+                is_path_under_temp(&crate::tools::path::normalize_path(&p), state.ctx)
+            })
+        })
+        .then_some(VarBinding {
+            value: None,
+            poisoned: false,
+        })
+}
+
+/// Parse a `case word in pattern) body ;; ... esac` construct. The subject
+/// and patterns are validated for command substitutions (bash executes them);
+/// each body is validated from a pre-construct snapshot; nothing leaks past
+/// `esac`. `;;`, `;&`, and `;;&` terminate bodies.
+fn parse_case(s: &str, i: usize, base: &mut ValidationState) -> Result<usize, String> {
+    let after_case = i + 4;
+    let (subject, mut k) = read_word_at(s, after_case);
+    if subject.is_empty() {
+        return Err(reject_msg(
+            s,
+            "a case construct is missing its subject word.",
+            "write `case word in pattern) body ;; esac`.",
+        ));
+    }
+    let mut subj_state = base.snapshot();
+    scan_substitutions(&subject, &mut subj_state)?;
+    // Find the `in` keyword at command position.
+    loop {
+        while k < s.len() && s[k..].chars().next().expect("k < len").is_whitespace() {
+            k += s[k..].chars().next().expect("k < len").len_utf8();
+        }
+        if k >= s.len() {
+            return Err(reject_msg(
+                s,
+                "a case construct is missing its `in` keyword.",
+                "write `case word in ... esac`.",
+            ));
+        }
+        let c = s[k..].chars().next().expect("k < len");
+        if matches!(c, ';' | '\n') {
+            k += c.len_utf8();
+            continue;
+        }
+        break;
+    }
+    let in_word = read_keyword_at(s, k);
+    if in_word.as_deref() != Some("in") {
+        return Err(reject_msg(
+            s,
+            "a case construct is missing its `in` keyword.",
+            "write `case word in ... esac`.",
+        ));
+    }
+    k += 2;
+    // Pattern/body loop.
+    loop {
+        // Pattern section: until an unquoted `)`.
+        let (pat, after_pat) = scan_case_pattern(s, k)?;
+        let mut pat_state = base.snapshot();
+        scan_substitutions(&pat, &mut pat_state)?;
+        // Body until `;;`/`;&`/`;;&` (or `esac` for an empty last body).
+        let mut body = base.snapshot();
+        // `time` is external at the first word of the arm body (probe-
+        // verified: `case x in x) time cd ...` runs /usr/bin/time).
+        let after_body = scan_list(
+            s,
+            after_pat,
+            &["esac"],
+            &[";;", ";&", ";;&"],
+            &mut body,
+            true,
+        )?;
+        note_part_cd(&body, base);
+        // The body scan stopped at `esac` (empty last body) or a `;;`-family
+        // terminator — either way, `esac` must close the construct next.
+        if stop_keyword_at(s, after_body) == Some("esac") {
+            return Ok(after_body);
+        }
+        let mut j = after_body;
+        while j < s.len() && s[j..].chars().next().expect("j < len").is_whitespace() {
+            j += s[j..].chars().next().expect("j < len").len_utf8();
+        }
+        if read_keyword_at(s, j).as_deref() == Some("esac") {
+            return Ok(j + 4);
+        }
+        // Next pattern.
+        k = after_body;
+    }
+}
+
+/// Scan a case pattern section from `i` until an unquoted `)` that ends the
+/// pattern list. Patterns may span newlines and contain `|` alternation (not
+/// a pipeline separator here). Returns `(pattern_text, index_after_paren)`.
+fn scan_case_pattern(s: &str, i: usize) -> Result<(String, usize), String> {
+    let mut k = i;
+    let mut pat = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    while k < s.len() {
+        let c = s[k..].chars().next().expect("k < len");
+        if c == '\\' && !in_single {
+            let Some(next) = s[k + c.len_utf8()..].chars().next() else {
+                return Err(reject_msg(
+                    s,
+                    "a case pattern is unterminated.",
+                    "write `case word in pattern) body ;; esac`.",
+                ));
+            };
+            pat.push(c);
+            pat.push(next);
+            k += c.len_utf8() + next.len_utf8();
+            continue;
+        }
+        if !escaped
+            && !in_single
+            && (c == '$' && s.as_bytes().get(k + 1) == Some(&b'(') || c == '`')
+        {
+            let next = if c == '$' {
+                find_substitution_end(s, k + 2).1
+            } else {
+                find_backtick_end(s, k + 1).1
+            };
+            pat.push_str(&s[k..next]);
+            k = next;
+            continue;
+        }
+        if !super::track_char_context(c, &mut in_single, &mut in_double, &mut escaped) {
+            pat.push(c);
+            k += c.len_utf8();
+            continue;
+        }
+        if c == ')' {
+            return Ok((pat, k + 1));
+        }
+        pat.push(c);
+        k += c.len_utf8();
+    }
+    Err(reject_msg(
+        s,
+        "a case pattern is unterminated.",
+        "write `case word in pattern) body ;; esac`.",
+    ))
+}
+
+/// `{` opens a brace group only as a reserved word — bash requires it to be
+/// delimited by whitespace or a metacharacter on the right (`{touch,}` is a
+/// single brace-expansion word, not a group; `}` does not delimit — `{}` is
+/// a syntax error). An undelimited `{` falls through to the segment validator,
+/// where a `{`-containing verb is unprovable (fail-closed).
+fn is_brace_group_start(s: &str, i: usize) -> bool {
+    match s[i + 1..].chars().next() {
+        None => true, // `{` at end of input — unterminated, rejected below
+        Some(c) => c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '<' | '>'),
+    }
+}
+
+/// Parse a `{ body; }` brace group starting at `i`. Brace groups run in the
+/// current shell: the pre-group state threads through the body (validated as
+/// commands — mutators reject, temp-scoped writes stay allowed). Any
+/// `cd`/`pushd`/`popd` inside resets the tracked CWD after the group
+/// (conservative: the cd moved the real CWD behind the guard).
+fn parse_brace(s: &str, i: usize, state: &mut ValidationState) -> Result<usize, String> {
+    let body_start = i + 1;
+    let entry_count = state.cd_count;
+    let after_body = scan_list(s, body_start, &[], &["}"], state, false)?;
+    if stop_keyword_at(s, after_body) != Some("}") {
+        return Err(reject_msg(
+            s,
+            "a brace group is missing its closing `}`.",
+            "write `{ ...; }` with the closing brace.",
+        ));
+    }
+    // A `cd`/`pushd`/`popd` executed in the group — including one hidden in a
+    // quoted eval body (`{ eval 'cd /tmp'; }`) — moves the real CWD behind the
+    // guard: reset tracking fail-closed (conservative, pinned). Position-aware:
+    // only command-position cd verbs bump the counter (`{ echo cd; }` does not).
+    if state.cd_count != entry_count {
+        state.cwd = None;
+    }
+    Ok(after_body)
+}
+
+/// Parse a `( body )` subshell starting at `i`. The body is validated from a
+/// pre-construct snapshot and nothing leaks past the closing paren.
+fn parse_subshell(s: &str, i: usize, base: &ValidationState) -> Result<usize, String> {
+    let mut body = base.snapshot();
+    let after_body = scan_list(s, i + 1, &[], &[")"], &mut body, false)?;
+    if stop_keyword_at(s, after_body) != Some(")") {
+        return Err(reject_msg(
+            s,
+            "a subshell is missing its closing `)`.",
+            "write `( ... )` with the closing parenthesis.",
+        ));
+    }
+    Ok(after_body)
+}
+
+/// Parse a function definition starting at `i`: `function name { ... }`,
+/// `name() { ... }`, or `name () ( ... )`. The body is a compound command
+/// validated from a pre-construct snapshot; a function body is non-leaking
+/// (it does not execute at definition time).
+fn parse_function(s: &str, i: usize, base: &ValidationState) -> Result<usize, String> {
+    let base = base.snapshot();
+    let mut k = i;
+    if s[k..].starts_with("function") {
+        k += 8;
+    }
+    // Read the function name.
+    let (name, after_name) = read_word_at(s, k);
+    if name.is_empty() {
+        return Err(reject_msg(
+            s,
+            "a function definition is missing its name.",
+            "write `name() { ...; }`.",
+        ));
+    }
+    k = after_name;
+    // Optional `()` between the name and the body.
+    while k < s.len() && s[k..].chars().next().expect("k < len").is_whitespace() {
+        k += s[k..].chars().next().expect("k < len").len_utf8();
+    }
+    if s[k..].starts_with("()") {
+        k += 2;
+    }
+    // The body opens with `{` (or `(` — a subshell-bodied function).
+    while k < s.len() && s[k..].chars().next().expect("k < len").is_whitespace() {
+        k += s[k..].chars().next().expect("k < len").len_utf8();
+    }
+    let c = s[k..].chars().next().expect("k < len");
+    let after_body = if c == '{' {
+        let mut body = base.snapshot();
+        scan_list(s, k + 1, &[], &["}"], &mut body, false)?
+    } else if c == '(' {
+        let mut body = base.snapshot();
+        scan_list(s, k + 1, &[], &[")"], &mut body, false)?
+    } else {
+        return Err(reject_msg(
+            s,
+            "a function definition is missing its body.",
+            "write `name() { ...; }`.",
+        ));
+    };
+    Ok(after_body)
 }
 
 /// Validate command substitutions (`$(...)` and backticks) as nested commands.
@@ -1101,7 +2224,14 @@ fn scan_substitutions(s: &str, state: &mut ValidationState) -> Result<(), String
         {
             if c == '$' {
                 let (inner, next) = find_substitution_end(s, i + 2);
-                validate_substitution_content(inner, state)?;
+                // `$((...))` arithmetic expansion: the expression is not a
+                // command, but nested substitutions inside it execute and
+                // must be validated (e.g. `$(( $(touch x) + 1 ))`).
+                if s.as_bytes().get(i + 2) == Some(&b'(') {
+                    scan_substitutions(inner, state)?;
+                } else {
+                    validate_substitution_content(inner, state)?;
+                }
                 i = next;
             } else {
                 let (inner, next) = find_backtick_end(s, i + 1);
@@ -1120,11 +2250,13 @@ fn scan_substitutions(s: &str, state: &mut ValidationState) -> Result<(), String
 }
 
 /// Find the matching close paren for a `$(` substitution whose content starts
-/// at byte `start`. Quote-aware and nesting-aware. Returns
-/// `(content, index_after_close)`. When unterminated, the rest of the string
-/// is returned as content (it still gets validated — fail-closed).
+/// at byte `start`. Quote-aware and nesting-aware: every unquoted paren counts
+/// (the second `(` of a `$((` arithmetic span, subshell parens, and nested
+/// `$(` all nest), so `$(( (a) * (b) ))` and `$( (echo hi) )` end at the
+/// correct close. Returns `(content, index_after_close)`. When unterminated,
+/// the rest of the string is returned as content (it still gets validated —
+/// fail-closed).
 fn find_substitution_end(s: &str, start: usize) -> (&str, usize) {
-    let bytes = s.as_bytes();
     let mut depth = 1usize;
     let mut in_single = false;
     let mut in_double = false;
@@ -1136,8 +2268,7 @@ fn find_substitution_end(s: &str, start: usize) -> (&str, usize) {
             i += c.len_utf8();
             continue;
         }
-        if c == '(' && i > 0 && bytes[i - 1] == b'$' {
-            // Nested `$(` substitution
+        if c == '(' {
             depth += 1;
         } else if c == ')' {
             depth -= 1;
@@ -1148,6 +2279,36 @@ fn find_substitution_end(s: &str, start: usize) -> (&str, usize) {
         i += c.len_utf8();
     }
     (&s[start..], s.len())
+}
+
+/// Skip a bare `((...))` arithmetic span whose first `(` is at byte `i`.
+/// Returns the index after the closing `))`, or `s.len()` when unterminated.
+/// Quote-aware and paren-nesting-aware (`(( (a+b) * (c+d) ))`).
+fn find_arithmetic_end(s: &str, i: usize) -> usize {
+    let mut depth = 2usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut j = i + 2;
+    while j < s.len() {
+        let c = s[j..].chars().next().expect("j < s.len()");
+        if !super::track_char_context(c, &mut in_single, &mut in_double, &mut escaped) {
+            j += c.len_utf8();
+            continue;
+        }
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return j + 1;
+                }
+            }
+            _ => {}
+        }
+        j += c.len_utf8();
+    }
+    s.len()
 }
 
 /// Find the closing backtick for a command substitution starting at byte
@@ -1490,37 +2651,235 @@ fn cp_destination_under_temp(segment: &str, state: &ValidationState) -> bool {
     }
 }
 
-/// First effective command word of a segment: after env assignments, the
-/// forwarding prefixes (`command`/`builtin`/`time` — they run their command
-/// in the current shell), and the option words that still forward
-/// (`command -p`, `time -p`). Any other option word (`command -v`, `time -x`,
-/// `builtin -x`) is informational or invalid and ends the scan — the command
-/// is never executed. Quoted words (`"cd"`) match by their unquoted content.
-/// `eval` is not skipped: its body is handled as a current-shell construct.
-fn effective_verb<'a>(words: &[&'a str]) -> Option<(usize, &'a str)> {
-    let mut forwarding: Option<&str> = None;
-    for (i, w) in words.iter().enumerate() {
-        if super::is_env_assignment(w) {
-            continue;
-        }
-        let unquoted = strip_outer_quotes(w).map_or("", |(c, _)| c);
-        if matches!(unquoted, "command" | "builtin" | "time") {
-            forwarding = Some(unquoted);
-            continue;
-        }
-        if unquoted == "-p" && matches!(forwarding, Some("command" | "time")) {
-            continue;
-        }
-        return Some((i, unquoted));
+/// True when the trimmed segment is exactly one command-substitution span
+/// (`$(...)` or backtick) with no leading/trailing content — a bare
+/// substitution at command position, whose content executes in a subshell and
+/// is validated by [`scan_substitutions`] (the emitted heredoc-body spans and
+/// standalone `$(cmd)` commands).
+fn is_bare_substitution_segment(s: &str) -> bool {
+    let s = s.trim();
+    if s.starts_with("$(") {
+        let (_, next) = find_substitution_end(s, 2);
+        return next == s.len();
     }
-    None
+    if s.starts_with('`') {
+        let (_, next) = find_backtick_end(s, 1);
+        return next == s.len();
+    }
+    false
+}
+
+/// Classification of a command verb word: provably literal (possibly with
+/// balanced surrounding quotes) or unprovable (concatenated quotes, ANSI-C
+/// quoting, escapes, substitutions — the guard cannot prove what the word
+/// resolves to without full shell word-expansion modeling).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VerbClass<'a> {
+    Literal(&'a str),
+    Unprovable,
+}
+
+/// Result of scanning a segment's leading env assignments and shell prefixes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VerbResolution<'a> {
+    /// Verb word found at `idx` in the whitespace-split words.
+    Verb { idx: usize, class: VerbClass<'a> },
+    /// A forwarding prefix with informational/invalid options (`command -v`,
+    /// `builtin -p`, `time -p -p`): the command is provably never executed,
+    /// so the segment leaves the real CWD and environment untouched.
+    Informational,
+    /// No verb word (empty segment, only env assignments).
+    None,
+}
+
+/// First effective command word of a segment: after env assignments and the
+/// forwarding prefixes (`command`/`builtin`, plus `time` at the head), each
+/// prefix's option grammar decides whether the command executes:
+///
+/// - `command`: `-p` (repeatable, including combined `-pp`) forwards; `-v`/`-V`
+///   (alone or combined) and invalid options are informational (the command is
+///   described or the option errors — it never executes); `--` ends options
+///   and forwards.
+/// - `builtin`: `--` forwards; any other option is invalid → informational.
+/// - `time`: forwards ONLY as the unquoted first word of the full segment,
+///   outside a `!`-negated list and outside a condition/case-arm head (the
+///   first word of an `if`/`elif`/`while`/`until` condition or case-arm
+///   body — `if time cd /tmp` runs external time with the timed cd in a
+///   child). Quoted `"time"`, an env assignment or `command`/`builtin`
+///   before it, a nested `time time`, or `! time` all resolve to the
+///   external `time` command — its timed command runs in a child, so the
+///   guard must not track a cwd the shell does not reach. At most one
+///   UNQUOTED `-p` follows (a quoted `"-p"` is the timed command, not an
+///   option — keyword parsing); any further word (including `--`, a second
+///   `-p`, or `-v`) IS the timed command, and a `-`-prefixed one does not
+///   exist (`-p: command not found`) → informational.
+///
+/// Prefixes may be composed (`command builtin cd`, `time command cd`,
+/// `builtin -- command cd`) — each level forwards to the current shell, so
+/// the loop continues until a non-forwarding verb is found. Non-forwarding
+/// prefixes (`env`/`sudo`/`nice`/…) run in a child shell and are returned as
+/// the verb (their command's CWD change never reaches the parent).
+///
+/// Leading env assignments (`TMPDIR=/tmp cd /tmp`) are valid before the first
+/// prefix, and after `time` (whose operand is a full command list — `time
+/// FOO=bar cd /tmp` runs the cd). After `command`/`builtin` a `FOO=bar` word
+/// is the COMMAND NAME (`command FOO=bar cd /tmp` errors 127 and the cd never
+/// runs), so assignments are never skipped there.
+///
+/// The verb word is classified by [`classify_verb_word`]: balanced-quoted
+/// words (`"cd"`) stay literal and modeled; concatenated (`"c"d`, `c'd'`),
+/// ANSI-C (`$'cd'`), escaped (`c\144`), or substitution-formed verbs are
+/// unprovable. `eval` is not skipped: its body is handled as a current-shell
+/// construct.
+fn resolve_verb<'a>(words: &[&'a str], negated: bool) -> VerbResolution<'a> {
+    let mut i = 0;
+    // Leading env assignments are valid before the first prefix
+    // (`TMPDIR=/tmp cd /tmp` runs the cd). After `command`/`builtin` a
+    // `FOO=bar` word is the COMMAND NAME (`command FOO=bar cd /tmp` errors
+    // with 127 — the cd never runs), so assignments are skipped only here
+    // and after `time`, whose operand is a full command list (`time FOO=bar
+    // cd /tmp` runs the cd).
+    while i < words.len() && super::is_env_assignment(words[i]) {
+        i += 1;
+    }
+    loop {
+        if i >= words.len() {
+            return VerbResolution::None;
+        }
+        let w = words[i];
+        let unquoted = strip_outer_quotes(w).map_or("", |(c, _)| c);
+        if !matches!(unquoted, "command" | "builtin" | "time") {
+            return VerbResolution::Verb {
+                idx: i,
+                class: classify_verb_word(w),
+            };
+        }
+        let opts = &words[i + 1..];
+        let mut j = 0;
+        let executes = match unquoted {
+            "command" => loop {
+                let Some(o) = opts.get(j) else {
+                    return VerbResolution::Informational;
+                };
+                let oq = strip_outer_quotes(o).map_or("", |(c, _)| c);
+                if oq == "--" {
+                    j += 1;
+                    break true;
+                }
+                // `-p` is repeatable and combined short flags forward
+                // (`-pp`, `-ppp` execute the command; `-pv`/`-pV` are
+                // informational — `-v`/`-V` describe instead of run).
+                if oq.starts_with('-') && oq.len() > 1 && oq[1..].bytes().all(|b| b == b'p') {
+                    j += 1;
+                    continue;
+                }
+                if oq.starts_with('-') && oq.len() > 1 {
+                    return VerbResolution::Informational;
+                }
+                break true;
+            },
+            "builtin" => {
+                let Some(o) = opts.first() else {
+                    return VerbResolution::Informational;
+                };
+                let oq = strip_outer_quotes(o).map_or("", |(c, _)| c);
+                if oq == "--" {
+                    j = 1;
+                    true
+                } else if oq.starts_with('-') && oq.len() > 1 {
+                    return VerbResolution::Informational;
+                } else {
+                    true
+                }
+            }
+            _ => {
+                // `time` is the reserved word only as the unquoted first word
+                // of the FULL segment (`i == 0`, raw word `time`), outside a
+                // `!`-negated list and outside a condition/case-arm head.
+                // Quoted `"time"`, an env assignment or `command`/`builtin`
+                // before it, a nested `time time`, and `! time` (or `time`
+                // right after `if`/`elif`/`while`/`until`/`)`) all resolve to
+                // the external `time` command — its timed command runs in a
+                // child, so the real CWD never changes and tracking would
+                // approve a chained write that lands in the workspace
+                // (fail-closed: return it as a verb).
+                if i != 0 || w != "time" || negated {
+                    return VerbResolution::Verb {
+                        idx: i,
+                        class: classify_verb_word(w),
+                    };
+                }
+                // `time` consumes at most one `-p`, matched on the RAW word:
+                // keyword parsing treats a quoted `"-p"` as the timed command
+                // (`-p: command not found`, nothing executes), not as the
+                // option. Anything after the option is the timed command; a
+                // `-`-prefixed one does not exist (`time -p -p` →
+                // `-p: command not found`), so nothing executes.
+                if opts.first().is_some_and(|o| *o == "-p") {
+                    j += 1;
+                }
+                if opts.get(j).is_some_and(|o| {
+                    let oq = strip_outer_quotes(o).map_or("", |(c, _)| c);
+                    oq.starts_with('-') && oq.len() > 1
+                }) {
+                    return VerbResolution::Informational;
+                }
+                true
+            }
+        };
+        if !executes {
+            return VerbResolution::Informational;
+        }
+        let idx = i + 1 + j;
+        if idx >= words.len() {
+            return VerbResolution::None;
+        }
+        // The forwarded verb may itself be a forwarding prefix — continue the
+        // loop so composed prefixes resolve to the real verb. Only `time`
+        // takes a full command list, so env assignments are valid again there
+        // (`time FOO=bar cd /tmp` runs the cd); after `command`/`builtin` the
+        // next word is the command name and must NOT be skipped.
+        i = idx;
+        if unquoted == "time" {
+            while i < words.len() && super::is_env_assignment(words[i]) {
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Classify a verb word as provably literal or unprovable.
+///
+/// A balanced-quoted word (`"cd"`, `'cd'`) is literal (the shell concatenates
+/// nothing and the quoted content is the command name). Anything with `$`
+/// (variables, `$(...)`, ANSI-C `$'...'`), backslashes, brace-expansion
+/// metacharacters (`{touch,}` expands to `touch` — an unmodeled word list),
+/// or quote characters outside a balanced pair (`"c"d`, `c'd'`) cannot be
+/// normalized without full word-expansion modeling — unprovable, fail-closed.
+fn classify_verb_word(w: &str) -> VerbClass<'_> {
+    if w.contains(['$', '\\', '{', '}', ',']) {
+        return VerbClass::Unprovable;
+    }
+    if let Some((content, _)) = strip_outer_quotes(w) {
+        if content.is_empty() || content.contains(['\'', '"']) {
+            return VerbClass::Unprovable;
+        }
+        return VerbClass::Literal(content);
+    }
+    if w.contains(['\'', '"']) {
+        return VerbClass::Unprovable;
+    }
+    VerbClass::Literal(w)
 }
 
 /// Check a single command segment for unsafe operations.
 ///
 /// `state` carries the tracked current directory and temp-variable bindings
 /// across segments (so `cd /tmp && touch f` resolves `f` against `/tmp`).
-fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), String> {
+/// `negated` is set when the segment follows a `!` pipeline-negation
+/// operator: `time` loses its reserved-word status there (external command).
+#[allow(clippy::too_many_lines)] // security-critical segment validator
+fn check_segment(segment: &str, state: &mut ValidationState, negated: bool) -> Result<(), String> {
     let trimmed = segment.trim();
     if trimmed.is_empty() {
         return Ok(());
@@ -1537,61 +2896,73 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
     // arguments and redirect targets reject.
     //
     // The verb is located after env assignments and the shell prefixes that
-    // forward their command to the current shell (`command`/`builtin`/`time`),
-    // including the execution options that still forward (`command -p`,
-    // `time -p`). Informational/invalid options (`command -v`, `time -x`,
-    // `builtin -x`) never execute the command, so they are not skipped.
+    // forward their command to the current shell (`command`/`builtin`, plus
+    // `time` as the unquoted first word — quoted/composed/negated/assigned
+    // spellings and a condition/case-arm head (`if time cd /tmp`) resolve to
+    // the external `time` and are NOT routed here),
+    // with each prefix's option grammar deciding whether the command executes
+    // (`command -p`/`--`, `builtin --`, `time -p` forward; `command -v`,
+    // `builtin -p`, `time -p -p` are informational). A verb that cannot be
+    // normalized to a literal word (`"c"d`, `$'cd'`, `c\144`, `$(...)d`) is
+    // unprovable — rejected outright (it could be a cd OR a mutator).
     // `eval` is a verb, not a prefix: its body is evaluated in the current
-    // shell, so a `cd` inside is handled like a bare cd. Quoted verbs
+    // shell, so a `cd` inside is handled like a bare cd. Balanced-quoted verbs
     // (`"cd"`) match by their unquoted content. Non-forwarding prefixes
     // (`sudo`/`env`/`nice`/…) run the command in a child shell, so the real
     // CWD never changes and the segment is not routed here.
-    let words: Vec<&str> = trimmed.split_whitespace().collect();
-    let (verb_idx, verb) = effective_verb(&words).unwrap_or((0, ""));
+    let words: Vec<&str> = split_words_keeping_substitutions(trimmed);
+    let (verb_idx, verb) = match resolve_verb(&words, negated) {
+        VerbResolution::Informational | VerbResolution::None => {
+            apply_env_bindings(trimmed, state, negated);
+            return Ok(());
+        }
+        VerbResolution::Verb {
+            class: VerbClass::Unprovable,
+            ..
+        } => {
+            // A bare command substitution at command position (a standalone
+            // `$(...)`/backtick span, e.g. emitted from a heredoc body) is not
+            // a real verb: its content executes in a subshell and was already
+            // validated by `scan_substitutions`. Only a substitution-FORMED
+            // verb with trailing content (`$(printf c)d`) is unprovable.
+            if !is_bare_substitution_segment(trimmed) {
+                return reject(
+                    trimmed,
+                    "the command verb cannot be proven safe (concatenated quotes, escapes, or substitution-formed).",
+                    "write the command name literally (e.g. `cd`, `rm`) so it can be validated.",
+                );
+            }
+            apply_env_bindings(trimmed, state, negated);
+            return Ok(());
+        }
+        VerbResolution::Verb {
+            idx,
+            class: VerbClass::Literal(v),
+        } => (idx, v),
+    };
     if matches!(verb, "cd" | "pushd" | "popd") {
-        update_cwd_for_cd(trimmed, state);
+        update_cwd_for_cd(trimmed, state, negated);
         return Ok(());
     }
     if verb == "eval" {
         // A cd in the body is handled as a current-shell cd; otherwise fall
         // through so the body is validated as its own command (first_command_word
         // strips `eval`), matching pre-existing behavior for eval write content.
-        if handle_eval_body(&words[verb_idx + 1..], state) {
-            return Ok(());
+        match handle_eval_body(&words[verb_idx + 1..], state) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => return Err(e),
         }
     }
-    if verb == "{" {
-        // Brace groups run in the current shell. A write-capable verb inside
-        // writes unvalidated — reject outright. A `cd`/`pushd`/`popd` inside
-        // changes the real CWD without tracking — reset so chained relative
-        // writes reject.
-        let inner = &words[verb_idx + 1..];
-        if inner.iter().any(|w| {
-            let u = strip_outer_quotes(w).map_or(*w, |(c, _)| c);
-            SCRATCH_MUTATORS.contains(&u)
-                || TEMP_MUTATORS.contains(&u)
-                || MUTATING_COMMANDS.contains(&u)
-                || FLAG_CHECKS.iter().any(|c| c.verb == u)
-        }) {
-            return reject(
-                trimmed,
-                "commands inside brace groups are not validated here.",
-                "write to the OS temp directory with plain commands on separate lines.",
-            );
-        }
-        if inner.iter().any(|w| {
-            let u = strip_outer_quotes(w).map_or(*w, |(c, _)| c);
-            matches!(u, "cd" | "pushd" | "popd")
-        }) {
-            state.cwd = None;
-        }
-    }
+    // NOTE: a `{` at verb position never reaches here — `scan_list` parses
+    // real brace groups at command position (`parse_brace`), and any other
+    // `{`-containing verb is classified Unprovable above and rejected.
 
     // ── Temp-variable bindings (contract decision 5) ───────────────
     // `export X=...`, plain `X=...` segments, and env-prefix forms
     // (`TMPDIR=/tmp cmd`) bind the temp variables; a non-temp binding poisons
     // the variable, a temp-root binding clears the poison.
-    apply_env_bindings(trimmed, state);
+    apply_env_bindings(trimmed, state, negated);
 
     // Extract the effective command by stripping shell prefixes and
     // environment variable assignments.
@@ -1600,6 +2971,21 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
     if first_word.is_empty() {
         return Ok(());
     }
+
+    // Normalize the verb for blocklist matching: a balanced-quoted word
+    // (`"rm"` executes `rm`) matches by its unquoted content; a concatenated/
+    // ANSI-C/escape/substitution-formed verb cannot be proven — reject rather
+    // than let it bypass the mutator/git/cargo/flag checks (fail-closed).
+    let first_word = match classify_verb_word(first_word) {
+        VerbClass::Literal(v) => v,
+        VerbClass::Unprovable => {
+            return reject(
+                trimmed,
+                "the command verb cannot be proven safe (concatenated quotes, escapes, or substitution-formed).",
+                "write the command name literally (e.g. `rm`, `touch`) so it can be validated.",
+            );
+        }
+    };
 
     // 'mktemp' creates a temp directory and outputs its path — always allowed.
     if first_word == "mktemp" {
@@ -1702,12 +3088,19 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
 /// option (`-e`, `-@`, …) errors at runtime, so both reset fail-closed.
 /// Relative targets are expanded against the tracked state before tracking,
 /// so `$VAR`, `~`, `-` and `$OLDPWD` cannot smuggle a non-temp location past
-/// the guard. The verb is located by [`effective_verb`], so forwarding
-/// prefixes (`command`/`builtin`/`time`, with `-p`), quoted verbs (`"cd"`)
-/// and env assignments are handled before the target is resolved.
-fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
-    let words: Vec<&str> = segment.split_whitespace().collect();
-    let Some((verb_idx, verb)) = effective_verb(&words) else {
+/// the guard. The verb is located by [`resolve_verb`], so forwarding
+/// prefixes (`command`/`builtin`, plus `time` as the unquoted first word
+/// outside condition heads), quoted verbs (`"cd"`) and env assignments are
+/// handled before the target is resolved. `negated` (`!` before the
+/// segment) demotes `time` to the external command — a timed `cd` then runs
+/// in a child and must not track.
+fn update_cwd_for_cd(segment: &str, state: &mut ValidationState, negated: bool) {
+    let words: Vec<&str> = split_words_keeping_substitutions(segment);
+    let VerbResolution::Verb {
+        idx: verb_idx,
+        class: VerbClass::Literal(verb),
+    } = resolve_verb(&words, negated)
+    else {
         return;
     };
     process_cd_words(&words, verb_idx, verb, state);
@@ -1727,6 +3120,9 @@ fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
 /// (a quoted `"-P"` is a literal target), while the resolved target is
 /// quote-stripped (`cd "/tmp"`).
 fn process_cd_words(words: &[&str], cd_idx: usize, verb: &str, state: &mut ValidationState) {
+    // Every executed cd/pushd/popd moves the real CWD in the current shell —
+    // construct parsers compare this counter to detect the leak.
+    state.cd_count += 1;
     if verb != "cd" {
         state.cwd = None;
         return;
@@ -1750,6 +3146,14 @@ fn process_cd_words(words: &[&str], cd_idx: usize, verb: &str, state: &mut Valid
         state.cwd = None;
         return;
     };
+    // A word after the target is an extra operand (`cd /tmp extra`). The
+    // runtime shell (bash 3.2) ignores extras and executes the cd to the first
+    // target; the guard cannot prove the target across shells — reset
+    // fail-closed.
+    if words.get(i + 1).is_some() {
+        state.cwd = None;
+        return;
+    }
     if target.starts_with('/') {
         let p = std::path::PathBuf::from(target);
         if is_path_under_temp(&p, state.ctx) {
@@ -1811,24 +3215,40 @@ fn process_cd_words(words: &[&str], cd_idx: usize, verb: &str, state: &mut Valid
 /// (one layer of surrounding quotes) and processed like a bare cd when it is
 /// a clean simple `cd [target]`; any other cd/pushd/popd shape — extra
 /// commands, separators, mixed quoting, or a pushd/popd — resets tracking
-/// fail-closed. Returns `true` when the segment was consumed by cd handling;
-/// a body without a cd verb returns `false` so the caller validates it as its
-/// own command (eval write content stays outside the guard's model).
-fn handle_eval_body(body_words: &[&str], state: &mut ValidationState) -> bool {
+/// fail-closed. A body whose first command verb cannot be normalized to a
+/// literal word (`eval '"c"d /etc'`) could be a current-shell cd or a mutator
+/// — rejected outright. A fully quoted body without a cd verb is the
+/// documented eval-write residual (accepted — the guard does not model its
+/// content). Returns `Ok(true)` when the segment was consumed; a body with no
+/// cd verb that is not fully quoted returns `Ok(false)` so the caller
+/// validates it as its own command.
+fn handle_eval_body(body_words: &[&str], state: &mut ValidationState) -> Result<bool, String> {
     let joined = body_words.join(" ");
-    let (decoded, clean) = if let Some((content, _)) = strip_outer_quotes(&joined) {
-        (content.to_string(), true)
+    let (decoded, clean, quoted) = if let Some((content, _)) = strip_outer_quotes(&joined) {
+        (content.to_string(), true, joined.starts_with(['\'', '"']))
     } else {
         let mut s = String::with_capacity(joined.len());
         s.extend(joined.chars().filter(|c| !matches!(c, '\'' | '"')));
-        (s, false)
+        (s, false, false)
     };
     let toks: Vec<&str> = decoded.split_whitespace().collect();
+    if let Some(first) = toks.first()
+        && matches!(classify_verb_word(first), VerbClass::Unprovable)
+    {
+        return Err(reject_msg(
+            &joined,
+            "the eval body's command verb cannot be proven safe (concatenated quotes, escapes, or substitution-formed).",
+            "write the command name literally (e.g. `cd`, `rm`) so it can be validated.",
+        ));
+    }
     let Some((ti, tv)) = toks.iter().enumerate().find_map(|(i, w)| {
         let u = strip_outer_quotes(w).map_or(*w, |(c, _)| c);
         matches!(u, "cd" | "pushd" | "popd").then_some((i, u))
     }) else {
-        return false;
+        // No cd verb. A fully quoted body is the documented eval-write
+        // residual — accepted by design. An unquoted body is visible and
+        // falls through for normal validation.
+        return Ok(quoted);
     };
     let simple = clean
         && tv == "cd"
@@ -1836,13 +3256,15 @@ fn handle_eval_body(body_words: &[&str], state: &mut ValidationState) -> bool {
         && !toks[1..].iter().any(|w| {
             let u = strip_outer_quotes(w).map_or(*w, |(c, _)| c);
             matches!(u, "&&" | "||" | ";" | "|" | "cd" | "pushd" | "popd")
+                || u.ends_with([';', '&', '|'])
         });
     if !simple {
+        state.cd_count += 1;
         state.cwd = None;
-        return true;
+        return Ok(true);
     }
     process_cd_words(&toks, 0, "cd", state);
-    true
+    Ok(true)
 }
 
 /// A `cd`/`mktemp` target is provably reachable at runtime when the raw path
@@ -1908,22 +3330,50 @@ fn record_mkdir_targets(segment: &str, state: &mut ValidationState) {
 /// Apply temp-variable bindings from a segment (decision 5): `export X=...`,
 /// plain `X=...` assignment segments, and leading env-prefix assignments
 /// (`TMPDIR=/tmp cmd`). Bare `export` / `export NAME` are no-ops.
-fn apply_env_bindings(segment: &str, state: &mut ValidationState) {
+///
+/// The `export` verb is located with the same normalization as the rest of
+/// the guard: quoted spellings (`"export" X=...`, `'export' X=...`) and the
+/// forwarding prefixes that run in the current shell (`command export X=...`,
+/// `time export ...` — time only as the unquoted first word outside
+/// condition heads) bind like a plain export. The verb search runs against the FULL word list: an env
+/// assignment before `time` (`TMPDIR=/tmp time export X=...`) demotes it to
+/// the external command, whose export never reaches the parent — nothing
+/// binds. Assignment words are quote-normalized too (`export "TMPDIR=/etc"`,
+/// `"TMPDIR"=/etc` bind by their unquoted name). Non-forwarding prefixes
+/// (`env export`, `sudo export`) run in a child shell — the export never
+/// reaches the parent, so nothing binds there.
+fn apply_env_bindings(segment: &str, state: &mut ValidationState, negated: bool) {
     let words = split_words_keeping_substitutions(segment);
-    if words.first() == Some(&"export") {
-        for w in &words[1..] {
-            if let Some((name, value)) = w.split_once('=') {
-                apply_single_binding(name, value, state);
-            }
-            // `export NAME` without a value neither clears poisoning nor
-            // enables anything new (decision 5).
-        }
-        return;
+    let first_non_assign = words
+        .iter()
+        .position(|w| !super::is_env_assignment(w))
+        .unwrap_or(words.len());
+    for w in &words[..first_non_assign] {
+        bind_assignment_word(w, state);
     }
-    for w in words.iter().take_while(|w| super::is_env_assignment(w)) {
-        if let Some((name, value)) = w.split_once('=') {
-            apply_single_binding(name, value, state);
+    // The verb search uses the full word list (not the assignment-stripped
+    // slice): `time` is a forwarding prefix only at segment position 0, so
+    // `TMPDIR=/tmp time export X=...` must resolve the external `time` — a
+    // slice-relative head would wrongly forward and bind the export.
+    if let VerbResolution::Verb {
+        idx,
+        class: VerbClass::Literal(v),
+    } = resolve_verb(&words, negated)
+        && v == "export"
+    {
+        for w in &words[idx + 1..] {
+            bind_assignment_word(w, state);
         }
+    }
+}
+
+/// Bind a single `NAME=value` assignment word, stripping balanced surrounding
+/// quotes first so `export "TMPDIR=/etc"` and `"TMPDIR"=/etc` bind by their
+/// unquoted name (the shell concatenates quoted pieces into one word).
+fn bind_assignment_word(w: &str, state: &mut ValidationState) {
+    let w = strip_outer_quotes(w).map_or(w, |(c, _)| c);
+    if let Some((name, value)) = w.split_once('=') {
+        apply_single_binding(name, value, state);
     }
 }
 
@@ -1985,6 +3435,8 @@ fn split_words_keeping_substitutions(s: &str) -> Vec<&str> {
 /// The stored value is the *resolved* path (shell expansion happens at
 /// assignment time, so `export TMPDIR="$TMPDIR/x"` binds the expanded path).
 fn apply_single_binding(name: &str, value: &str, state: &mut ValidationState) {
+    // Quoted assignment names (`"TMPDIR"=/etc`) bind by their unquoted content.
+    let name = strip_outer_quotes(name).map_or(name, |(c, _)| c);
     // Strip balanced surrounding quotes from the value (`export TMPDIR="/tmp"`).
     // A single-quoted value is a literal — no expansion, no substitution —
     // so it can never be an mktemp temp binding.
@@ -2611,9 +4063,12 @@ fn extract_git_subcommand(segment: &str) -> String {
     let words: Vec<&str> = segment.split_whitespace().collect();
 
     // Skip shell prefixes, env assignments, and flags to find "git"
-    // (e.g., GIT_DIR=/tmp git push, sudo git push, env git push).
+    // (e.g., GIT_DIR=/tmp git push, sudo git push, env git push). A
+    // balanced-quoted `"git"` is the same command (normalized).
     let git_idx = super::find_first_command_word_index(&words);
-    if git_idx.is_none_or(|idx| words[idx] != "git") {
+    if git_idx
+        .is_none_or(|idx| strip_outer_quotes(words[idx]).map_or(words[idx], |(c, _)| c) != "git")
+    {
         return String::new();
     }
     let git_idx = git_idx.unwrap();
@@ -4908,9 +6363,10 @@ mod tests {
     fn symlink_escape_fails_closed() {
         // A symlink inside a temp root pointing at an existing non-temp dir:
         // writes through it land outside every temp root. The target must
-        // exist for canonicalize to resolve through it; the project directory
-        // is a stable non-temp anchor.
-        let target = std::env::current_dir().expect("cwd");
+        // exist for canonicalize to resolve through it; `/etc` is a stable
+        // non-temp anchor that does not depend on the test process cwd (the
+        // checkout can itself live under a temp root in CI/dev setups).
+        let target = std::path::PathBuf::from("/etc");
         let link = std::env::temp_dir().join(format!("mahbot_ro_probe_{}", std::process::id()));
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
@@ -5008,6 +6464,25 @@ mod tests {
             // eval bodies with cd + extra commands reset fail-closed.
             ("cd /tmp && eval 'cd /etc; echo hi' && touch f", false),
             ("cd /tmp && eval 'cd /tmp && cd /etc' && touch f", false),
+            // A `;` glued to the target is still a separator — the body is
+            // not a simple cd, so tracking resets fail-closed.
+            ("cd /tmp && eval 'cd /tmp; touch f' && touch g", false),
+            // Quoted eval bodies WITHOUT a cd verb are the documented
+            // eval-write residual — accepted (baseline behavior, pinned
+            // non-goal; the guard does not model quoted eval body content).
+            ("eval 'echo hi'", true),
+            ("eval 'ls'", true),
+            ("eval \"echo hi\"", true),
+            ("eval 'touch /tmp/x'", true),
+            ("eval 'rm -rf /tmp/x'", true),
+            ("eval 'touch f'", true),
+            ("eval 'echo hi && touch f'", true),
+            ("eval 'cd /tmp; rm -rf /tmp/x'", true),
+            // UNQUOTED eval bodies are visible and validated normally.
+            ("eval echo hi", true),
+            ("eval touch /tmp/x", true),
+            ("eval touch f", false),
+            ("eval rm -rf /__mahbot_readonly_test_ws__", false),
             // Brace groups run in the current shell: a cd inside changes the
             // real CWD without tracking, and a mutator inside writes
             // unvalidated — both fail closed.
@@ -5048,5 +6523,806 @@ mod tests {
         ];
 
         run_cases(&cases);
+    }
+
+    /// Composed forwarding prefixes (`command builtin cd`, `time command cd`,
+    /// `builtin -- command cd`, ...) execute the forwarded verb in the current
+    /// shell — a cd hidden behind composed prefixes routes through cd tracking
+    /// (fail-closed for non-temp targets) instead of falling through as an
+    /// unmodeled non-mutator. Informational composed forms never execute.
+    #[test]
+    fn composed_forwarding_prefixes_fail_closed() {
+        let cases = [
+            // cd behind two forwarding prefixes — tracking updates/resets.
+            ("cd /tmp && command builtin cd /etc && touch f", false),
+            ("cd /tmp && command command cd /etc && touch f", false),
+            ("cd /tmp && builtin command cd /etc && touch f", false),
+            ("cd /tmp && command -p builtin cd /etc && touch f", false),
+            ("cd /tmp && time command cd /etc && touch f", false),
+            ("cd /tmp && time builtin cd /etc && touch f", false),
+            ("cd /tmp && builtin -- command cd /etc && touch f", false),
+            // Three levels.
+            (
+                "cd /tmp && command builtin command cd /etc && touch f",
+                false,
+            ),
+            // Workspace-target variant.
+            (
+                "cd /tmp && command builtin cd /__mahbot_readonly_test_ws__ && rm -rf x",
+                false,
+            ),
+            // Temp target behind composed prefixes tracks — write allowed.
+            ("cd /tmp && command builtin cd /tmp && touch f", true),
+            ("time command cd /tmp && touch f", true),
+            // Combined -p flags still forward through the composition.
+            ("cd /tmp && command -pp builtin cd /etc && touch f", false),
+            // Informational composed forms never execute — tracking unchanged.
+            ("cd /tmp && command -v builtin && touch f", true),
+            ("cd /tmp && command builtin -v cd && touch f", true),
+            ("cd /tmp && builtin command -v cd && touch f", true),
+            ("cd /tmp && time command -v cd && touch f", true),
+            // An env-assignment word after `command`/`builtin` is the COMMAND
+            // name (`command FOO=bar cd /tmp` errors 127 — the cd never runs),
+            // so tracking stays unchanged and a chained write fails closed.
+            ("command FOO=bar cd /tmp; touch f", false),
+            ("builtin FOO=bar cd /tmp; touch f", false),
+            ("command -- FOO=bar cd /tmp; touch f", false),
+            ("command -p FOO=bar cd /tmp; touch f", false),
+            ("command -pp FOO=bar cd /tmp; touch f", false),
+            ("command builtin FOO=bar cd /tmp; touch f", false),
+            ("command -pp builtin FOO=bar cd /tmp; rm -rf x", false),
+            ("command -p FOO=bar cd /tmp; rm -rf x", false),
+            // `time` takes a full command list: the env assignment is valid
+            // and the timed cd runs (tracked to the temp dir).
+            ("time FOO=bar cd /tmp && touch f", true),
+            ("time FOO=bar cd /etc && touch f", false),
+            ("time -p FOO=bar cd /tmp && touch f", true),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// `time` is a forwarding prefix only as the UNQUOTED first word of a
+    /// full segment, outside a `!`-negated list (bash 3.2 probe-verified):
+    /// quoted `"time"`/`'time'`, an env assignment before it, a
+    /// `command`/`builtin` before it, a nested `time time`, and `! time` all
+    /// resolve to the external `time` command whose timed command runs in a
+    /// child — the guard must not track a cwd the shell never reaches
+    /// (fail-closed: a chained relative write against the workspace rejects).
+    #[test]
+    fn time_prefix_requires_head_position_and_unquoted() {
+        let cases = [
+            // Quoted `time` — P0 shape: the timed cd runs in a child, the
+            // real CWD stays in the workspace, so a chained relative write
+            // must reject against it.
+            ("\"time\" cd /tmp && touch f", false),
+            ("'time' cd /tmp && touch f", false),
+            ("\"time\" cd /tmp; rm -rf x", false),
+            // Bare quoted segment is allowed-but-untracked (nothing runs in
+            // the workspace); P0 protection comes from the chained-write
+            // rejection above.
+            ("\"time\" cd /tmp", true),
+            ("'time' cd /tmp", true),
+            ("\"time\" cd /tmp && cd /tmp && touch f", true),
+            // The shared-path quote-normalization still surfaces mutators
+            // behind quoted `time` to the blocklist dispatch (external time
+            // executes its command).
+            ("\"time\" rm -rf /__mahbot_readonly_test_ws__", false),
+            ("\"time\" git commit -m test", false),
+            // The `cd /tmp && "time" cd /etc && touch f` shape flips from
+            // REJECT to ALLOW: the first cd tracks /tmp, the quoted-time cd
+            // runs in a child (no tracking change), and the write resolves
+            // against the tracked /tmp — matching the real shell (the
+            // pre-fix REJECT came from buggy /etc tracking).
+            ("cd /tmp && \"time\" cd /etc && touch f", true),
+            ("cd /tmp && 'time' cd /etc && touch f", true),
+            // Composed prefixes demote `time` to the external command.
+            ("command time cd /tmp && touch f", false),
+            ("builtin time cd /tmp && touch f", false),
+            ("command -- time cd /tmp && touch f", false),
+            ("command time cd /etc && touch f", false),
+            ("time time cd /tmp && touch f", false),
+            ("command time export SNAP=/tmp; cd $SNAP; touch f", false),
+            // Env assignment before `time` demotes it to external.
+            ("TMPDIR=/tmp time cd /tmp && touch f", false),
+            ("TMPDIR=/tmp time cd /etc && touch f", false),
+            ("TMPDIR=/tmp time export SNAP=/tmp; touch $SNAP/f", false),
+            (
+                "TMPDIR=/tmp time export SNAP=/tmp; cd $SNAP; touch f",
+                false,
+            ),
+            // `!` negation demotes `time` (external) but not `cd` (current
+            // shell — the pinned `! cd /tmp && touch f` ALLOW stays).
+            ("! time cd /tmp; touch f", false),
+            ("! time cd /tmp; rm -rf x", false),
+            ("! time cd /tmp && touch f", false),
+            ("! time cd /tmp | cat; touch f", false),
+            ("! cd /tmp; touch f", true),
+            ("! cd /tmp && touch f", true),
+            // Unquoted head-of-list `time` keeps forwarding (current-shell
+            // timed command — tracking unchanged).
+            ("time cd /tmp && touch f", true),
+            ("time cd /etc && touch f", false),
+            ("time -p cd /tmp && touch f", true),
+            ("time command cd /tmp && touch f", true),
+            ("time builtin cd /tmp && touch f", true),
+            ("time export SNAP=/tmp; touch $SNAP/f", true),
+            (
+                "time export SNAP=/tmp && cd /tmp && cd $SNAP && touch f",
+                true,
+            ),
+            ("time FOO=bar cd /tmp && touch f", true),
+            ("time -p FOO=bar cd /tmp && touch f", true),
+            // Quoted `-p` after unquoted head-of-list `time` is the TIMED
+            // COMMAND (`-p: command not found` — nothing executes, no
+            // tracking), not the option: a chained write lands in the
+            // workspace and must reject. Bare segment is allowed-but-
+            // untracked (the command errors, the real CWD is untouched).
+            ("time \"-p\" cd /tmp; touch f", false),
+            ("time \"-p\" cd /tmp; rm -rf x", false),
+            ("time '-p' cd /tmp; touch f", false),
+            ("time \"-p\" cd /tmp && touch f", false),
+            ("time \"-p\" cd /tmp || touch f", false),
+            ("time \"-p\" cd /tmp", true),
+            // `'time' '-p'`: quoted time resolves external (child process),
+            // and the quoted option would be its timed command either way —
+            // no tracking, chained write rejects.
+            ("'time' '-p' cd /tmp; touch f", false),
+            // Unquoted `-p` option with a quoted timed command that errors.
+            ("time -p \"-p\" cd /tmp; touch f", false),
+            // Unquoted `-p` forwards a quoted timed command (`"cd"` is the
+            // builtin — current shell, tracking unchanged).
+            ("time -p \"cd\" /tmp && touch f", true),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// `time` is the EXTERNAL command at the first word of an
+    /// if/elif/while/until condition or case-arm body (probe-verified on
+    /// bash 3.2: the timed cd runs in a child, the parent CWD stays put) —
+    /// the guard must not track a cwd the shell does not reach, so a write
+    /// chained inside the condition rejects against the real CWD. A
+    /// separator/newline before the first word returns `time` to the
+    /// reserved word (`if \n time cd /tmp` tracks), and bodies keep it
+    /// reserved.
+    #[test]
+    fn time_in_construct_conditions_is_external() {
+        let cases = [
+            // Condition-head / arm-head time: external — no tracking,
+            // chained write rejects against the workspace.
+            ("if time cd /tmp; touch f; then :; fi", false),
+            ("if time cd /tmp && touch f; then :; fi", false),
+            ("if time cd /tmp; rm -rf x; then :; fi", false),
+            ("while time cd /tmp; touch f; do :; done", false),
+            ("until time cd /tmp; touch f; do :; done", false),
+            (
+                "if false; then :; elif time cd /tmp; touch f; then :; fi",
+                false,
+            ),
+            ("case x in x) time cd /tmp; touch f;; esac", false),
+            // `!` after the keyword demotes too (already negated).
+            ("if ! time cd /tmp; touch f; then :; fi", false),
+            // A newline before the first word returns `time` to reserved:
+            // tracked, chained temp write allowed.
+            ("if\n time cd /tmp; touch f; then :; fi", true),
+            // After a separator inside the condition / arm, `time` is
+            // reserved again — the demotion covers the first unit only.
+            ("if true && time cd /tmp && touch f; then :; fi", true),
+            ("if cd /tmp && time cd /etc && touch f; then :; fi", false),
+            ("case x in x) true && time cd /tmp && touch f;; esac", true),
+            // Bodies keep `time` reserved (current-shell timed command).
+            ("if true; then time cd /tmp; touch f; fi", true),
+            ("if false; then :; else time cd /tmp; touch f; fi", true),
+            ("while true; do time cd /tmp; touch f; break; done", true),
+        ];
+
+        run_cases(&cases);
+    }
+
+    // ── Fail-closed-by-default residuals (unmodeled constructs) ─────────
+
+    /// Concatenated-quote / ANSI-C / escape / substitution-formed cd verbs
+    /// reset (chained relative writes reject); the same verb forms for
+    /// mutators reject outright. Each residual spelling gets its own case.
+    #[test]
+    fn unmodeled_verb_forms_fail_closed() {
+        let cases = [
+            // Concatenated-quote cd verbs — chained writes fail closed.
+            ("cd /tmp && \"c\"d /etc && touch f", false),
+            ("cd /tmp && \"c\"d /tmp && touch f", false),
+            ("cd /tmp && c'd' /etc && touch f", false),
+            ("cd /tmp && \"c\"'d' /etc && touch f", false),
+            // ANSI-C quoting.
+            ("cd /tmp && $'cd' /etc && touch f", false),
+            ("cd /tmp && $'cd' /tmp && touch f", false),
+            // Escape-formed verb.
+            ("cd /tmp && c\\144 /etc && touch f", false),
+            // Substitution-formed verb.
+            ("cd /tmp && $(printf c)d /etc && touch f", false),
+            ("cd /tmp && $(printf c)d /tmp && touch f", false),
+            // Concatenated-quote pushd.
+            ("cd /tmp && \"p\"ushd /etc && touch f", false),
+            // Concatenated-quote mutators — rejected outright.
+            ("\"r\"m -rf /__mahbot_readonly_test_ws__", false),
+            ("\"t\"ouch /__mahbot_readonly_test_ws__/x", false),
+            ("\"c\"p /etc/passwd /__mahbot_readonly_test_ws__/out", false),
+            ("\"g\"it commit -m x", false),
+            ("\"m\"kdir /__mahbot_readonly_test_ws__/x", false),
+            ("$'rm' -rf /__mahbot_readonly_test_ws__", false),
+            ("r\\155 -rf /__mahbot_readonly_test_ws__", false),
+            ("$(printf r)m -rf /__mahbot_readonly_test_ws__", false),
+            // Quoted mutators inside eval bodies — rejected outright.
+            ("eval '\"t\"ouch /__mahbot_readonly_test_ws__/x'", false),
+            ("eval '\"c\"d /etc' && touch f", false),
+            // Fully-quoted mutators execute the unquoted command — the
+            // blocklist dispatch normalizes the verb (item 2).
+            ("\"rm\" -rf /__mahbot_readonly_test_ws__", false),
+            ("\"touch\" /__mahbot_readonly_test_ws__/x", false),
+            ("\"cp\" /etc/passwd /__mahbot_readonly_test_ws__/out", false),
+            ("\"mkdir\" /__mahbot_readonly_test_ws__/x", false),
+            ("\"sed\" -i s/a/b/ /__mahbot_readonly_test_ws__/f", false),
+            ("\"git\" commit -m x", false),
+            ("\"git\" status", true),
+            // Prefix-wrapped quoted mutators route through the same
+            // normalization (sudo/env/nice/npx forward the command).
+            ("sudo \"rm\" -rf /__mahbot_readonly_test_ws__", false),
+            ("env \"touch\" /__mahbot_readonly_test_ws__/x", false),
+            (
+                "nice \"cp\" /etc/passwd /__mahbot_readonly_test_ws__/out",
+                false,
+            ),
+            ("npx \"git\" push", false),
+            // Fully-quoted PREFIXES are stripped before the blocklist dispatch
+            // too — `"env"` forwards like `env`, so the quoted mutator verb
+            // behind it must still be found (quote-level-deep variant).
+            ("\"env\" \"t\"ouch /__mahbot_readonly_test_ws__/x", false),
+            ("\"exec\" \"r\"m -rf /__mahbot_readonly_test_ws__", false),
+            ("\"npx\" \"g\"it push", false),
+            ("\"env\" \"git\" push", false),
+            ("\"nice\" \"t\"ouch /__mahbot_readonly_test_ws__/x", false),
+            ("\"nohup\" \"t\"ouch /__mahbot_readonly_test_ws__/x", false),
+            ("\"sudo\" \"rm\" -rf /__mahbot_readonly_test_ws__", false),
+            ("\"env\" \"ls\" /tmp", true),
+            ("\"env\" \"git\" status", true),
+            // Brace-expansion verbs (`{touch,}` expands to `touch`) cannot be
+            // normalized to a single word — unprovable, rejected (item 2).
+            ("{touch,} f", false),
+            ("{cp,} a b", false),
+            ("{rm,} -rf /__mahbot_readonly_test_ws__", false),
+            ("{touch,} /tmp/ok", false),
+            ("cd /tmp && {touch,} f", false),
+            ("{touch,} /tmp/x && echo hi", false),
+            // Brace expansion in ARGUMENT position is not a verb — benign
+            // commands with brace-expanded args stay allowed.
+            ("echo {a,b}", true),
+            ("ls {a,b}", true),
+            // Fully-quoted benign verbs stay modeled and allowed.
+            ("\"ls\" -la /tmp", true),
+            ("\"echo\" hi", true),
+            ("sudo \"ls\" /tmp", true),
+            // Concatenated-quote benign verbs are unprovable — reject.
+            ("\"c\"at /etc/passwd", false),
+            // Fully-quoted cd stays modeled (balanced quotes are provable).
+            ("cd /tmp && command \"cd\" /tmp && touch f", true),
+            ("\"cd\" /tmp && touch f", true),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// `--` after a forwarding prefix executes the command in the current
+    /// shell; a non-temp target must reset fail-closed. Informational/invalid
+    /// prefix options never execute the command — tracking stays unchanged.
+    #[test]
+    fn prefix_dashdash_and_informational_options() {
+        let cases = [
+            ("cd /tmp && command -- cd /etc && touch f", false),
+            ("cd /tmp && builtin -- cd /etc && touch f", false),
+            ("cd /tmp && command -p -- cd /etc && touch f", false),
+            ("cd /tmp && command -- 'cd' /etc && touch f", false),
+            ("cd /tmp && command -- pushd /etc && touch f", false),
+            // Forwarding forms with a temp target keep tracking.
+            ("cd /tmp && command -- cd /tmp && touch f", true),
+            ("cd /tmp && builtin -- cd -P /tmp && touch f", true),
+            ("cd /tmp && command -p -- cd /tmp && touch f", true),
+            // command -p is repeatable and forwards.
+            ("cd /tmp && command -p -p cd /etc && touch f", false),
+            ("cd /tmp && command -p -p cd /tmp && touch f", true),
+            // Combined short flags forward like repeated -p (`-pp` executes);
+            // a -v/-V anywhere in the combination is informational.
+            ("cd /tmp && command -pp cd /etc && touch f", false),
+            ("cd /tmp && command -pp cd /tmp && touch f", true),
+            ("cd /tmp && command -ppp cd /tmp && touch f", true),
+            ("command -pp rm -rf /__mahbot_readonly_test_ws__", false),
+            ("cd /tmp && command -pp -v cd /etc && touch f", true),
+            // Informational options never execute the command: tracking stays
+            // where the real CWD is (a chained temp write stays allowed).
+            ("cd /tmp && command -v cd /tmp && touch f", true),
+            ("cd /tmp && command -V cd && touch f", true),
+            ("cd /tmp && command -p -v cd /etc && touch f", true),
+            ("cd /tmp && command -pv cd /etc && touch f", true),
+            ("cd /tmp && command -x cd /etc && touch f", true),
+            ("cd /tmp && builtin -p cd /tmp && touch f", true),
+            // time consumes at most one -p: the second becomes the timed
+            // command (`-p: command not found`), so cd never runs — tracking
+            // unchanged. A chained relative write is validated against the
+            // real (unchanged) CWD and must reject when that is the workspace.
+            ("time -p -p cd /tmp && touch f", false),
+            ("cd /tmp && time -p -p cd /etc && touch f", true),
+            ("cd /tmp && time -p -p cd /tmp && touch f", true),
+            // `--` after time is the timed command (not found) — informational.
+            ("cd /tmp && time -- cd /etc && touch f", true),
+            ("cd /tmp && time -v cd /etc && touch f", true),
+            // time -p forwards.
+            ("cd /tmp && time -p cd /etc && touch f", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// `cd` in a pipeline member or after a single `&` runs in a subshell or
+    /// child — the parent CWD does not change, and the state before the
+    /// boundary continues after it.
+    #[test]
+    fn pipeline_and_background_cd_fail_closed() {
+        let cases = [
+            // Pipeline member cd — parent CWD unchanged (workspace).
+            ("cd /tmp | true && touch f", false),
+            ("cd /tmp | cat && touch f", false),
+            ("cd /tmp | true\n touch f", false),
+            // State before the pipeline continues after it.
+            ("cd /tmp && ls | grep x && touch f", true),
+            ("cd /tmp && cd /etc | true && touch f", true),
+            // Constructs as pipeline members run in subshells — their state
+            // never leaks into the parent chain.
+            ("ls | { SNAP=/tmp/x; } && touch $SNAP/f", false),
+            ("ls | { cd /etc; } && touch f", false),
+            ("ls | ( SNAP=/tmp/x ) && touch $SNAP/f", false),
+            ("ls | if true; then SNAP=/tmp/x; fi && touch $SNAP/f", false),
+            // A brace cd in a pipeline is contained (subshell) — the parent
+            // cwd stays /tmp for the chained write.
+            ("cd /tmp && ls | { cd /tmp; } && touch f", true),
+            // Single-& background cd — parent CWD unchanged (workspace).
+            ("cd /tmp & touch f", false),
+            ("cd /tmp & rm -rf x", false),
+            ("cd /tmp & touch /tmp/x", true),
+            ("cd /tmp && touch a & touch f", false),
+            ("cd /tmp & echo done", true),
+            // `&&` is not a background separator.
+            ("cd /tmp && touch f", true),
+            // Redirect operators containing & are not separators.
+            ("echo hi 2>&1", true),
+            ("echo hi &> /tmp/out", true),
+            ("echo hi >& /tmp/out", true),
+            ("echo hi <&1", true),
+            ("cat /tmp/x >& /tmp/out", true),
+            // An ESCAPED `\>`/`\<` at segment end is a literal argument, not a
+            // redirect operator — the following `&`/`|` IS a separator, so the
+            // trailing command is validated independently (fail-closed).
+            ("echo a\\> & touch f", false),
+            ("echo a\\< & touch f", false),
+            ("echo a\\> & touch /tmp/ok", true),
+            ("echo a\\> | rm -rf /__mahbot_readonly_test_ws__", false),
+            ("echo a\\> | grep x && touch /tmp/ok", true),
+            ("echo a\\> 2>&1 & touch f", false),
+            // A QUOTED `>`/`<` is a literal argument — the trailing quote keeps
+            // the `&`/`|` a separator, so the trailing command is validated
+            // independently (fail-closed).
+            ("echo \">\" & touch f", false),
+            ("echo '>' & touch f", false),
+            ("echo \">\" | rm -rf /__mahbot_readonly_test_ws__", false),
+            ("echo '<' | rm -rf /__mahbot_readonly_test_ws__", false),
+            ("echo \"a>b\" & touch f", false),
+            ("echo hi \"2>&1\" & touch f", false),
+            ("echo x > \"/tmp/out\" & touch f", false),
+            ("echo \"a\" > /tmp/out & touch f", false),
+            // `>|` (clobber redirect) stays whole; `\>` before `|` does not.
+            ("echo hi >| /tmp/out", true),
+            // `||` is an OR-list, not a pipeline: the left side runs in the
+            // current shell and the right side only on failure. State threads
+            // like `&&` — a cd on the left tracks (baseline behavior).
+            ("cd /tmp || touch f", true),
+            ("cd /tmp || rm -rf x", true),
+            ("cd /tmp || true && touch f", true),
+            ("cd /etc || true && touch f", false),
+            ("false || rm -rf /__mahbot_readonly_test_ws__", false),
+            ("false || touch /__mahbot_readonly_test_ws__/x", false),
+            // A subshell `||` is non-leaking — the parent cwd stays /tmp.
+            ("cd /tmp && (cd /etc || true) && touch f", true),
+            ("cd /tmp/nonexistent_x || touch f", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// Explicit PWD assignment must not be masked by tracked-cwd resolution.
+    #[test]
+    fn explicit_pwd_assignment_fails_closed() {
+        let cases = [
+            ("export PWD=/etc && touch $PWD/f", false),
+            ("PWD=/etc touch $PWD/f", false),
+            ("cd /tmp && export PWD=/etc && touch $PWD/f", false),
+            ("cd /tmp && PWD=/etc touch $PWD/f", false),
+            ("cd /tmp && export PWD=/etc && touch /tmp/ok", true),
+            // A temp PWD binding resolves normally.
+            ("cd /tmp && PWD=/tmp && touch $PWD/f", true),
+            // Untracked PWD still resolves to the workspace root.
+            ("touch $PWD/f", false),
+            ("cd /tmp && touch $PWD/out", true),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// The brace-group eval shape (`{ eval 'cd /etc'; }`) runs the eval body
+    /// in the current shell — chained relative writes fail closed.
+    #[test]
+    fn brace_eval_body_fails_closed() {
+        let cases = [
+            ("cd /tmp && { eval 'cd /etc'; } && touch f", false),
+            ("cd /tmp && { eval \"cd /etc\"; } && touch f", false),
+            ("cd /tmp && { eval 'cd /tmp'; } && touch f", false),
+            ("cd /tmp && { eval 'cd /etc' ; } && rm -rf x", false),
+            // A brace group with only reads stays allowed.
+            ("cd /tmp && { ls; } && touch f", true),
+            ("{ echo hi; } && touch /tmp/x", true),
+            // A cd-SHAPED argument word is not a cd — no reset (position-aware).
+            ("cd /tmp && { echo cd; } && touch f", true),
+            ("cd /tmp && { echo \"hello cd\"; } && touch f", true),
+            ("cd /tmp && { grep cd file; } && touch f", true),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// `cd` with extra operands: the runtime shell ignores extras and executes
+    /// the cd to the first target — the guard cannot prove the target across
+    /// shells, so tracking resets fail-closed.
+    #[test]
+    fn cd_extra_operands_fail_closed() {
+        let cases = [
+            ("cd /tmp extra && touch f", false),
+            ("cd /tmp && cd /etc extra && touch f", false),
+            ("cd /tmp && cd -P /tmp extra && touch f", false),
+            ("cd /tmp && command cd /tmp extra && touch f", false),
+            ("eval 'cd /tmp extra' && touch f", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    // ── Control constructs (fail-closed bodies/conditions, no leakage) ────
+
+    /// Control-construct bodies and conditions get the same checks as
+    /// top-level commands: workspace-targeting mutations and disallowed
+    /// redirects reject; pure reads and temp-scoped writes stay allowed —
+    /// across every construct class, both case spellings, nested constructs,
+    /// constructs in substitutions, `!`-negated commands, and `&`/`|&`
+    /// backgrounds.
+    #[test]
+    fn control_construct_bodies_and_conditions() {
+        let cases = [
+            // if / elif / else bodies and conditions.
+            ("if true; then touch f; fi", false),
+            ("if true; then touch /tmp/f; fi", true),
+            ("if false; then echo hi; fi", true),
+            ("if true; then echo hi > f; fi", false),
+            ("if true; then echo hi > /tmp/out; fi", true),
+            ("if cd /etc; then echo hi; fi", true),
+            ("if true; then rm -rf f; else echo hi; fi", false),
+            ("if false; then echo a; elif true; then touch f; fi", false),
+            ("if false; then echo a; else touch /tmp/f; fi", true),
+            ("if true\nthen touch f; fi", false),
+            // while / until conditions and bodies.
+            ("while true; do touch f; done", false),
+            ("while true; do touch /tmp/f; done", true),
+            ("while grep -q x file; do echo hi; done", true),
+            ("until false; do rm -rf x; done", false),
+            ("until false; do touch /tmp/f; done", true),
+            // for: word lists, arithmetic headers, loop-var temp binding.
+            ("for x in a b; do touch f; done", false),
+            ("for x in a b; do touch /tmp/f; done", true),
+            ("for x in /tmp/*.db; do rm \"$x\"; done", true),
+            (
+                "for db in ~/.mahbot/db/*.db; do cp \"$db\" /tmp/x/; done",
+                true,
+            ),
+            ("for x in a; do rm \"$x\"; done", false),
+            ("for ((i=0; i>3; i++)); do echo hi; done", true),
+            ("for ((i=0; i>3; i++)); do touch f; done", false),
+            ("for x; do echo hi; done", true),
+            // `do` is a LIST WORD on the runtime shell (bash 3.2 iterates over
+            // it in `for x in do; do ...`); omitting the `;`/newline before
+            // `do` is a syntax error there, and the guard's rejection matches.
+            ("for x in do; do echo hi; done", true),
+            ("for x in a b do echo hi; done", false),
+            // select.
+            ("select x in a b; do touch f; done", false),
+            ("select x in a b; do echo hi; done", true),
+            // case: `|`-pattern and plain `;;` spellings.
+            ("case x in a|b) touch f;; esac", false),
+            ("case x in a|b) echo hi;; esac", true),
+            ("case x in a) touch /tmp/f;; b) touch /tmp/g;; esac", true),
+            ("case x in a) touch f;; esac", false),
+            ("case x in\na) echo hi;;\nesac", true),
+            ("case x in\nx) touch f;;\nesac", false),
+            // subshells.
+            ("( touch f )", false),
+            ("( touch /tmp/f )", true),
+            ("( cd /tmp && touch f )", true),
+            ("( cd /etc && touch f )", false),
+            // brace groups.
+            ("{ touch f; }", false),
+            ("{ touch /tmp/f; }", true),
+            ("cd /tmp && { rm -rf x; }", true),
+            // function definitions.
+            ("f() { touch f; }", false),
+            ("f() { touch /tmp/f; }", true),
+            ("function f { rm -rf x; }", false),
+            ("function f() { touch /tmp/f; }", true),
+            ("function f () { touch /tmp/f; }", true),
+            ("function f() { touch f; }", false),
+            ("f () ( touch /tmp/f )", true),
+            // nested constructs.
+            ("if true; then for x in a; do touch f; done; fi", false),
+            ("if true; then for x in a; do touch /tmp/f; done; fi", true),
+            ("while true; do if false; then touch f; fi; done", false),
+            (
+                "if true; then while false; do cd /tmp; done; fi; touch f",
+                false,
+            ),
+            // constructs in substitutions (subshell semantics).
+            ("echo $(if true; then touch f; fi)", false),
+            ("echo $(if true; then touch /tmp/f; fi)", true),
+            ("echo $(for x in /tmp/*; do echo $x; done)", true),
+            ("echo $(while true; do touch f; done)", false),
+            // !-negated commands run in the current shell.
+            ("! cd /tmp && touch f", true),
+            ("! cd /etc && touch f", false),
+            ("! ls && touch /tmp/x", true),
+            // & and |& backgrounds.
+            ("cd /tmp & touch f", false),
+            ("cd /tmp & touch /tmp/x", true),
+            ("cd /tmp |& true && touch f", false),
+            ("ls |& grep x && touch /tmp/x", true),
+            // Heredocs inside construct bodies: the body is stripped before
+            // the walker; a workspace redirect on the delimiter line rejects
+            // (the terminator must be on its own line — `EOF; fi` is not a
+            // valid terminator in bash either, so nothing runs there).
+            ("if true; then cat <<EOF\nbody\nEOF\nfi", true),
+            ("if true; then cat <<EOF > f\nbody\nEOF\nfi", false),
+            ("while true; do cat <<EOF > /tmp/out\nbody\nEOF\ndone", true),
+            // Unterminated constructs reject.
+            ("while true; do echo hi", false),
+            ("for x in a b; do echo hi", false),
+            ("{ echo hi; ", false),
+            ("( echo hi ", false),
+            // Header/pattern substitutions are still validated.
+            ("for x in $(touch f); do echo hi; done", false),
+            ("for x in $(touch /tmp/x); do echo hi; done", true),
+            ("for ((i=$(touch f); i<3; i++)); do echo hi; done", false),
+            ("case $(touch f) in a) echo hi;; esac", false),
+            ("case $(touch /tmp/x) in a) echo hi;; esac", true),
+            ("if $(touch f); then echo hi; fi", false),
+            ("if $(touch /tmp/x); then echo hi; fi", true),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// Nothing set inside if/while/for/case/select bodies or subshells leaks
+    /// after the construct: post-construct commands are validated from the
+    /// pre-construct cwd — the `if false; then cd /tmp; fi; touch f` shape in
+    /// both the `;` and newline spellings rejects.
+    #[test]
+    fn construct_state_does_not_leak() {
+        let cases = [
+            ("if false; then cd /tmp; fi; touch f", false),
+            ("if false; then cd /tmp; fi\ntouch f", false),
+            ("if true; then cd /tmp; fi; touch f", false),
+            ("while false; do cd /tmp; done; touch f", false),
+            ("for x in a; do cd /tmp; done; touch f", false),
+            ("case x in a) cd /tmp;; esac; touch f", false),
+            ("( cd /tmp ); touch f", false),
+            ("f() { cd /tmp; }; touch f", false),
+            // Pre-construct state threads INTO constructs.
+            ("cd /tmp && if true; then touch f; fi", true),
+            ("cd /tmp && while true; do touch f; done", true),
+            ("cd /tmp && { touch f; }", true),
+            (
+                "SNAP=$(mktemp -d)\nif true; then touch \"$SNAP/f\"; fi",
+                true,
+            ),
+            // Construct changes never affect a chained write after the
+            // construct, even with an intervening separator.
+            ("if false; then cd /tmp; fi ; touch f", false),
+            // A cd inside a body or condition runs in the CURRENT shell (bash
+            // if/for/while/case bodies are not subshells) — the leaked CWD is
+            // untrackable, so chained relative writes fail closed.
+            ("cd /tmp && if true; then cd /etc; fi && touch f", false),
+            ("cd /tmp && if true; then cd /etc; fi\ntouch f", false),
+            ("cd /tmp && if cd /etc; then :; fi && touch f", false),
+            (
+                "cd /tmp && if false; then :; elif true; then cd /etc; fi && touch f",
+                false,
+            ),
+            (
+                "cd /tmp && if false; then :; else cd /etc; fi && touch f",
+                false,
+            ),
+            ("cd /tmp && for x in 1; do cd /etc; done && touch f", false),
+            (
+                "cd /tmp && while true; do cd /etc; break; done && touch f",
+                false,
+            ),
+            (
+                "cd /tmp && until false; do cd /etc; break; done && touch f",
+                false,
+            ),
+            ("cd /tmp && case a in a) cd /etc;; esac && touch f", false),
+            (
+                "cd /tmp && if true; then if true; then cd /etc; fi; fi && touch f",
+                false,
+            ),
+            // No cd in the construct: pre-construct tracking threads through.
+            ("cd /tmp && if true; then echo hi; fi && touch f", true),
+            ("cd /tmp && for x in 1; do echo hi; done && touch f", true),
+            // Subshell / pipeline-member cds do NOT leak — state continues.
+            ("cd /tmp && (cd /etc) && touch f", true),
+            ("cd /tmp && (cd /tmp) && touch f", true),
+            // Non-temp var rebindings inside current-shell construct bodies
+            // leak at runtime (`if true; then export TMPDIR=/etc; fi; touch
+            // $TMPDIR/f` writes to /etc) — the binding poisons the outer
+            // tracking so the chained write fails closed.
+            (
+                "if true; then export TMPDIR=/etc; fi; touch $TMPDIR/f",
+                false,
+            ),
+            (
+                "if true; then export TMPDIR=/etc; fi\ntouch $TMPDIR/f",
+                false,
+            ),
+            (
+                "cd /tmp && if true; then export TMPDIR=/etc; fi && touch $TMPDIR/f",
+                false,
+            ),
+            (
+                "for x in 1; do export TMPDIR=/etc; done; touch $TMPDIR/f",
+                false,
+            ),
+            (
+                "while true; do export TMPDIR=/etc; break; done; touch $TMPDIR/f",
+                false,
+            ),
+            (
+                "case a in a) export TMPDIR=/etc;; esac; touch $TMPDIR/f",
+                false,
+            ),
+            (
+                "if true; then export TMPDIR=/etc; else export TMPDIR=/tmp; fi; touch $TMPDIR/f",
+                false,
+            ),
+            // A temp-scoped rebind inside a body leaks but stays safe.
+            (
+                "if true; then export TMPDIR=/tmp; fi; touch $TMPDIR/f",
+                true,
+            ),
+            // Subshell bodies do NOT leak their bindings.
+            ("( export TMPDIR=/etc ); touch $TMPDIR/f", true),
+            // A variable FIRST bound inside a conditional part is uncertain
+            // (the branch may not execute, leaving it unset at runtime —
+            // `if false; then D=/tmp; fi; touch $D/f` writes to /f), so it
+            // poisons even when the binding is temp-scoped.
+            ("if false; then D=/tmp; fi; touch $D/f", false),
+            ("if true; then D=/tmp; fi; touch $D/f", false),
+            ("if false; then D=/tmp; fi\ntouch $D/f", false),
+            (
+                "cd /tmp && if false; then D=/tmp; fi; cd $D && touch f",
+                false,
+            ),
+            ("while false; do D=/tmp; done; touch $D/f", false),
+            ("for x in 1; do D=/tmp; done; touch $D/f", false),
+            ("case a in a) D=/tmp;; esac; touch $D/f", false),
+            (
+                "if true; then if false; then D=/tmp; fi; fi; touch $D/f",
+                false,
+            ),
+            // Subshell bindings are discarded entirely — $D stays unbound.
+            ("( D=/tmp ); touch $D/f", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// Quoted and prefix-composed `export` verbs bind exactly like a plain
+    /// export (the shell concatenates quotes and the forwarding prefixes run
+    /// in the current shell), so a non-temp binding poisons the tracked
+    /// variable and a chained `$VAR` expansion fails closed. Non-forwarding
+    /// prefixes (`env`/`sudo`) run the export in a child shell — nothing
+    /// leaks, so the outer binding stays.
+    #[test]
+    fn quoted_and_prefixed_export_bindings() {
+        let cases = [
+            // Quoted export verbs.
+            (
+                "\"export\" TMPDIR=/__mahbot_readonly_test_ws__; touch $TMPDIR/f",
+                false,
+            ),
+            ("'export' TMPDIR=/etc; touch $TMPDIR/f", false),
+            // Quoted assignment words bind by their unquoted name.
+            (
+                "export \"TMPDIR=/__mahbot_readonly_test_ws__\"; touch $TMPDIR/f",
+                false,
+            ),
+            ("export TMPDIR=\"/etc\"; touch $TMPDIR/f", false),
+            ("export \"TMPDIR\"=/etc; touch $TMPDIR/f", false),
+            // Forwarding prefixes that run export in the current shell.
+            ("command export TMPDIR=/etc; touch $TMPDIR/f", false),
+            ("builtin export TMPDIR=/etc; touch $TMPDIR/f", false),
+            ("time export TMPDIR=/etc; touch $TMPDIR/f", false),
+            ("command -p export TMPDIR=/etc; touch $TMPDIR/f", false),
+            ("builtin -- export TMPDIR=/etc; touch $TMPDIR/f", false),
+            ("command builtin export TMPDIR=/etc; touch $TMPDIR/f", false),
+            ("time -p export TMPDIR=/etc; touch $TMPDIR/f", false),
+            // Non-forwarding prefixes run export in a child — no leak.
+            ("env export TMPDIR=/etc; touch $TMPDIR/f", true),
+            ("sudo export TMPDIR=/etc; touch $TMPDIR/f", true),
+            // Temp-target bindings through the same spellings stay allowed.
+            ("\"export\" TMPDIR=/tmp; touch $TMPDIR/f", true),
+            ("export \"TMPDIR=/tmp\"; touch $TMPDIR/f", true),
+            ("command export TMPDIR=/tmp; touch $TMPDIR/f", true),
+            ("\"export\" SNAP=/tmp/x; touch \"$SNAP/f\"", true),
+            // Informational export forms never execute — no binding.
+            ("command -v export; touch $TMPDIR/f", true),
+            // Plain spellings (regression anchors).
+            ("export TMPDIR=/etc; touch $TMPDIR/f", false),
+            ("export TMPDIR=/tmp; touch $TMPDIR/f", true),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// The two pinned temp-idiot shapes stay allowed: a temp-cwd cd followed
+    /// by a temp-scoped removal in a body, and a temp-dir binding followed by
+    /// a temp-scoped copy in a body.
+    #[test]
+    fn pinned_temp_idiot_shapes_allowed() {
+        let cases = [
+            // temp-cwd cd followed by temp-scoped removal in a brace body.
+            ("cd /tmp && { rm -rf x; }", true),
+            ("cd /tmp && { rm -rf x; } && touch /tmp/ok", true),
+            // temp-dir binding followed by temp-scoped copy in a brace body.
+            ("SNAP=$(mktemp -d) && { cp /etc/passwd \"$SNAP/\"; }", true),
+            (
+                "SNAP=$(mktemp -d)\nmkdir -p \"$SNAP/d\"\n{ cp /etc/passwd \"$SNAP/d/\"; }",
+                true,
+            ),
+            // The same shapes with workspace targets stay blocked.
+            ("cd /tmp && { rm -rf /__mahbot_readonly_test_ws__; }", false),
+            (
+                "SNAP=$(mktemp -d) && { cp /etc/passwd /__mahbot_readonly_test_ws__/; }",
+                false,
+            ),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// Substitution-span matching balances every unquoted paren: nested
+    /// arithmetic parens (`$(( (a) * (b) ))`), subshell parens, and nested
+    /// `$(` substitutions all end at the correct close.
+    #[test]
+    fn substitution_end_nested_parens() {
+        let s = "echo $(( (a) * (b) )) tail";
+        let (content, next) = find_substitution_end(s, 7);
+        assert_eq!(content, "( (a) * (b) )");
+        assert_eq!(&s[next..], " tail");
+        let s = "echo $( (echo hi) ) tail";
+        let (_, next) = find_substitution_end(s, 7);
+        assert_eq!(&s[next..], " tail");
+        let s = "echo $(echo $(echo hi)) tail";
+        let (_, next) = find_substitution_end(s, 7);
+        assert_eq!(&s[next..], " tail");
     }
 }

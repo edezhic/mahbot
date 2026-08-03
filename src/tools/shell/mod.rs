@@ -876,9 +876,8 @@ fn extract_command_segments(command: &str) -> Vec<String> {
 
 /// Core segmentation on an already-heredoc-stripped string.
 ///
-/// Kept separate from [`extract_command_segments`] so the read-only guard can
-/// strip heredoc bodies once and segment the result without a redundant second
-/// strip pass over the same text.
+/// Kept separate from [`extract_command_segments`] so callers with an
+/// already-stripped string avoid a redundant second strip pass.
 fn extract_command_segments_stripped(stripped: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
@@ -1050,11 +1049,20 @@ pub(super) fn find_first_non_flag_index(words: &[&str], is_git: bool) -> Option<
 /// flag, or environment variable assignment).
 ///
 /// Shared helper used by [`first_command_word`] and [`canonical_command`]
-/// to avoid duplicating the scanning logic.
+/// to avoid duplicating the scanning logic. A balanced-quoted word (`"env"`,
+/// `'sudo'`) names the same program — it is normalized before the prefix
+/// match so `"env" "t"ouch` resolves to `touch` instead of being masked as
+/// an unknown quoted `env` (fail-closed blocklist dispatch). Env assignments
+/// are matched the same way (`"TMPDIR=/tmp"` is an assignment), so `export
+/// "TMPDIR=/tmp"` has no command word and `"TMPDIR=/tmp" cmd` resolves to
+/// `cmd`. Note this also feeds profile selection (`"env" ls` classifies as
+/// the ls profile), which is directionally more correct for exotic
+/// quoted-prefix spellings.
 pub(super) fn find_first_command_word_index(words: &[&str]) -> Option<usize> {
-    words
-        .iter()
-        .position(|w| !SHELL_PREFIXES.contains(w) && !w.starts_with('-') && !is_env_assignment(w))
+    words.iter().position(|w| {
+        let u = readonly::strip_outer_quotes(w).map_or(*w, |(c, _)| c);
+        !SHELL_PREFIXES.contains(&u) && !w.starts_with('-') && !is_env_assignment(u)
+    })
 }
 
 /// Extract the first command word index, basename, and the whitespace-split words
