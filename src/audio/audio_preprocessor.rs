@@ -135,7 +135,7 @@ pub struct AudioPreprocessor {
     /// immediately reflects the actual audio level.  Lazy init eliminates
     /// the ~3.6s convergence delay that occurred with [`TARGET_RMS`]
     /// initialisation during quiet audio (e.g. volume-reduced variants at
-    /// -6dB where RMS ≈ 0.025).  Updated via asymmetric EMA:
+    /// -3dB where RMS ≈ 0.025).  Updated via asymmetric EMA:
     /// - Fast attack (0.20) when chunk RMS exceeds running estimate
     /// - Slow release (0.02) when chunk RMS is below running estimate
     ///
@@ -178,7 +178,7 @@ impl AudioPreprocessor {
             // Initialise to 0.0 so the AGC lazily initialises on the first
             // non-zero frame (mahbot-856).  Initialising to TARGET_RMS caused
             // the gain to start at 1.0× for quiet audio (e.g. volume-reduced
-            // variants at -6dB) and take ~114 frames (~3.6s) to converge to
+            // variants at -3dB) and take ~114 frames (~3.6s) to converge to
             // the correct level via slow release — the utterance was already
             // over before meaningful amplification kicked in.  With lazy
             // initialisation the AGC immediately sets running_rms to the

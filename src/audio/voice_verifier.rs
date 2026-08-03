@@ -1405,8 +1405,10 @@ impl VoiceVerifier {
     }
 
     /// [`Self::train_ensemble_with_metrics`] with an explicit base seed
-    /// (test-injectable; production uses the entropy-drawn public wrapper).
-    fn train_ensemble_with_metrics_seeded(
+    /// (test-injectable and bench-visible; production uses the entropy-drawn
+    /// public wrapper).  The voice bench calls this when a run pins the seed
+    /// via `MAHBOT_VOICE_BENCH_VERIFIER_SEED`.
+    pub(crate) fn train_ensemble_with_metrics_seeded(
         positive_sequences: &[EmbeddingSequence],
         negative_sequences: &[EmbeddingSequence],
         per_negative_sequence_weights: Option<&[f32]>,
@@ -1919,17 +1921,24 @@ fn split_negative_sequences(
     }
 
     if stratify_by_source {
-        // Group by source tier, shuffle within tier, take the same fraction
-        // from each tier (mahbot-949).
-        use std::collections::HashMap;
-        let mut by_tier: HashMap<crate::audio::embedding_sequence::Source, Vec<usize>> =
-            HashMap::new();
+        // Group by source tier in FIRST-APPEARANCE order (deterministic).
+        // A HashMap iteration would randomize the tier-processing order across
+        // processes (RandomState per-instance seed), which reorders the
+        // sequential rng draw sequence each tier's shuffle consumes — breaking
+        // pinned-seed reproducibility (the voice bench's MAHBOT_VOICE_BENCH_VERIFIER_SEED
+        // contract: same seed ⇒ byte-identical verifier weights).
+        let mut tiers: Vec<(Source, Vec<usize>)> = Vec::new();
         for &i in &neg_seq_idx {
-            by_tier.entry(seq_infos[i].source).or_default().push(i);
+            let src = seq_infos[i].source;
+            if let Some(entry) = tiers.iter_mut().find(|(s, _)| *s == src) {
+                entry.1.push(i);
+            } else {
+                tiers.push((src, vec![i]));
+            }
         }
         let mut tr_out = Vec::new();
         let mut val_out = Vec::new();
-        for (_tier, mut idxs) in by_tier {
+        for (_tier, mut idxs) in tiers {
             idxs.shuffle(rng);
             let n_val_tier = ((idxs.len() as f32) * VALIDATION_SPLIT).round() as usize;
             let n_val_tier = n_val_tier.min(idxs.len().saturating_sub(1));
@@ -3855,6 +3864,47 @@ mod tests {
             v1.fc_bias, v2.fc_bias,
             "fc_bias differs between deterministic Conv1D training runs"
         );
+    }
+
+    #[test]
+    fn test_split_negative_sequences_multi_tier_deterministic() {
+        // Regression guard (mahbot-1081): the per-tier grouping must be
+        // first-appearance-order deterministic.  A HashMap grouping randomized
+        // tier-processing order across instances (RandomState per instance),
+        // which reordered the sequential rng draw sequence each tier's shuffle
+        // consumes — the same seed then produced different splits (and hence
+        // different verifier weights) across processes.  The single-tier
+        // determinism test above could never catch that; this one exercises
+        // multiple source tiers.
+        use crate::audio::embedding_sequence::Source;
+        let mut infos: Vec<SeqInfo> = Vec::new();
+        for (src, n) in [
+            (Source::Confusable, 5usize),
+            (Source::Unrelated, 7usize),
+            (Source::Ambient, 9usize),
+            (Source::Synthetic, 11usize),
+        ] {
+            for i in 0..n {
+                infos.push(SeqInfo {
+                    start: i,
+                    count: 1,
+                    is_positive: false,
+                    source: src,
+                    augmentation_family: None,
+                });
+            }
+        }
+        let run = |seed: u64| {
+            let mut rng = StdRng::seed_from_u64(seed);
+            split_negative_sequences(&infos, &mut rng, true)
+        };
+        let (tr1, val1) = run(7);
+        let (tr2, val2) = run(7);
+        assert_eq!(tr1, tr2, "train split differs between same-seed runs");
+        assert_eq!(val1, val2, "val split differs between same-seed runs");
+        // Sanity: the split partitions all negatives across the tiers.
+        assert_eq!(tr1.len() + val1.len(), infos.len());
+        assert!(!val1.is_empty(), "multi-tier split produced no validation");
     }
 
     #[test]
