@@ -1504,9 +1504,12 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
     // path arguments are under an allowed temp directory.
     if SCRATCH_MUTATORS.contains(&first_word) {
         if scratch_paths_under_temp(trimmed, state) {
-            // `mkdir` creates the directories it names — record them so a
-            // later `cd` in the same chain can track them even though they
-            // did not exist at validation time.
+            // `mkdir` creates the directories it names — record those whose
+            // creation is provable (all `-p` targets, and non-`-p` targets
+            // whose parent already exists) so a later `cd` in the same chain
+            // can track them even though they did not exist at validation
+            // time. A non-`-p` target under a missing parent errors at
+            // runtime and must not be treated as created (fail-closed).
             if first_word == "mkdir" {
                 record_mkdir_targets(trimmed, state);
             }
@@ -1664,19 +1667,32 @@ fn record_mkdir_targets(segment: &str, state: &mut ValidationState) {
         let Some(resolved) = resolve_path_word(&arg, state) else {
             continue;
         };
-        let mut dir = crate::tools::path::normalize_path(&resolved);
+        let dir = crate::tools::path::normalize_path(&resolved);
         if !is_path_under_temp(&dir, state.ctx) {
             continue;
         }
-        state.created_dirs.insert(dir.clone());
         if parents {
-            while let Some(parent) = dir.parent() {
-                dir = parent.to_path_buf();
-                if !is_path_under_temp(&dir, state.ctx) {
+            // `-p` creates the whole chain, so every ancestor is provable.
+            state.created_dirs.insert(dir.clone());
+            let mut d = dir;
+            while let Some(parent) = d.parent() {
+                d = parent.to_path_buf();
+                if !is_path_under_temp(&d, state.ctx) {
                     break;
                 }
-                state.created_dirs.insert(dir.clone());
+                state.created_dirs.insert(d.clone());
             }
+        } else if dir.parent().is_some_and(|p| {
+            // Without `-p`, mkdir fails when the parent is absent at runtime:
+            // a target is only provably created when its immediate parent
+            // exists at validation time or was created by `mkdir` earlier in
+            // this chain.
+            p.is_dir()
+                || state
+                    .created_dirs
+                    .contains(&crate::tools::path::normalize_path(p))
+        }) {
+            state.created_dirs.insert(dir);
         }
     }
 }
@@ -1806,14 +1822,22 @@ fn substitution_body(value: &str) -> Option<&str> {
 /// (the variable then falls through to the normal binding path, which poisons
 /// it — fail-closed).
 ///
-/// The landing directory comes from `-p DIR` / `--tmpdir[=DIR]` or from a
-/// positional template. The template is honored: only a template that
+/// The landing directory comes from `-p DIR` / `--tmpdir=DIR` or from a
+/// positional template. `-p DIR` is honored only when DIR provably exists (at
+/// validation time or created by `mkdir` earlier in the chain): mktemp never
+/// creates that directory, so a missing one makes it error and bind the
+/// variable empty — a false temp anchor. The template is honored only when it
 /// provably resolves under a temp root (an absolute temp path, or a variable
-/// expanding to one) binds. Absolute non-temp templates (e.g. under /etc, the
+/// expanding to one). Absolute non-temp templates (e.g. under /etc, the
 /// workspace, $HOME), relative templates (resolved against the shell cwd) and
-/// the `-- <template>` forms carrying them all fail closed. An unrecognized
-/// option or a second template makes mktemp error at runtime — the variable
-/// would bind empty, so a temp anchor would be a false one; fail closed.
+/// the `-- <template>` forms carrying them all fail closed. The
+/// space-separated `--tmpdir DIR` form is not provable — GNU treats the value
+/// as optional (needs `=`) and errors at runtime there, while macOS joins
+/// `DIR` as a template under /tmp instead of using it as the target dir — so
+/// it fails closed; only the `=` form binds. An unrecognized option (e.g.
+/// `--suffix=`, which macOS mktemp rejects) or a second template makes mktemp
+/// error at runtime — the variable would bind empty, so a temp anchor would
+/// be a false one; fail closed.
 fn mktemp_binding(value: &str, state: &ValidationState) -> Option<VarBinding> {
     let inner = substitution_body(value)?;
     let mut words = inner.split_whitespace();
@@ -1833,9 +1857,10 @@ fn mktemp_binding(value: &str, state: &ValidationState) -> Option<VarBinding> {
             continue;
         }
         if !after_ddash {
-            // `-p DIR` / `--tmpdir DIR` / `--tmpdir=DIR` override the target
-            // directory; the result is only temp when that directory is.
-            if a == "-p" || a == "--tmpdir" {
+            // `-p DIR` / `--tmpdir=DIR` override the target directory; the
+            // result is only temp when that directory provably exists under
+            // temp (see the gating below the parse loop).
+            if a == "-p" {
                 if i + 1 < args.len() {
                     target_dir = Some(args[i + 1]);
                     i += 2;
@@ -1843,13 +1868,18 @@ fn mktemp_binding(value: &str, state: &ValidationState) -> Option<VarBinding> {
                 }
                 return None; // missing dir value → fail-closed
             }
+            // The space-separated `--tmpdir DIR` form is not provable across
+            // platforms (see the doc comment) → fail-closed; only `=` binds.
+            if a == "--tmpdir" {
+                return None;
+            }
             if let Some(dir) = a.strip_prefix("--tmpdir=") {
                 target_dir = Some(dir);
                 i += 1;
                 continue;
             }
-            // `-t prefix` takes a value (BSD spelling); the result still
-            // lands under $TMPDIR — a temp root.
+            // `-t prefix` takes a value (BSD spelling); the result lands under
+            // the OS temp root (`temp_dir()`), an allowed temp root.
             if a == "-t" {
                 if i + 1 < args.len() {
                     i += 2;
@@ -1857,16 +1887,14 @@ fn mktemp_binding(value: &str, state: &ValidationState) -> Option<VarBinding> {
                 }
                 return None; // missing prefix value → mktemp errors at runtime
             }
-            // Known boolean flags and `=`-form options do not affect where
-            // the result lands.
-            if matches!(a, "-d" | "-q" | "-u" | "--dry-run" | "--quiet")
-                || a.starts_with("--suffix=")
-            {
+            // Known boolean flags do not affect where the result lands.
+            if matches!(a, "-d" | "-q" | "-u" | "--dry-run" | "--quiet") {
                 i += 1;
                 continue;
             }
             if a.starts_with('-') {
-                return None; // unrecognized option → fail-closed
+                return None; // unrecognized option (e.g. `--suffix=`, which
+                // macOS mktemp rejects) → fail-closed
             }
         }
         // First positional argument is the template; a second one makes
@@ -1892,18 +1920,25 @@ fn mktemp_binding(value: &str, state: &ValidationState) -> Option<VarBinding> {
             return None;
         }
     }
-    let temp_binding = || VarBinding {
-        value: None,
-        poisoned: false,
-    };
     match target_dir {
-        None => Some(temp_binding()),
+        None => Some(VarBinding {
+            value: None,
+            poisoned: false,
+        }),
         Some(dir) => {
             let clean = strip_outer_quotes(dir).map_or(dir, |(c, _)| c);
-            let under_temp =
-                resolve_path_word(clean, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
-            if under_temp {
-                Some(temp_binding())
+            let p = resolve_path_word(clean, state)?;
+            let p = crate::tools::path::normalize_path(&p);
+            // mktemp never creates the `-p` directory: it errors when the dir
+            // does not exist and the variable binds empty (false temp anchor).
+            // Track only when the dir exists at validation time or was
+            // provably created by `mkdir` earlier in the chain.
+            if is_path_under_temp(&p, state.ctx) && (p.is_dir() || state.created_dirs.contains(&p))
+            {
+                Some(VarBinding {
+                    value: None,
+                    poisoned: false,
+                })
             } else {
                 None
             }
@@ -4035,6 +4070,35 @@ mod tests {
             ("mkdir /tmp/snap; cd /tmp/snap; touch f", true),
             // mkdir -p records ancestors too.
             ("mkdir -p /tmp/a/b; cd /tmp/a; touch f", true),
+            // Non-`-p` mkdir into a missing parent errors at runtime — the
+            // target is not provably created, so the chained cd/write fails
+            // closed in every spelling.
+            (
+                "mkdir /tmp/absent_parent_x/dir_y; cd /tmp/absent_parent_x/dir_y; touch f",
+                false,
+            ),
+            (
+                "mkdir /tmp/absent_parent_x/dir_y\ncd /tmp/absent_parent_x/dir_y\ntouch f",
+                false,
+            ),
+            (
+                "mkdir /tmp/absent_parent_x/dir_y || cd /tmp/absent_parent_x/dir_y || touch f",
+                false,
+            ),
+            (
+                "mkdir /tmp/absent_parent_x/dir_y; cd /tmp/absent_parent_x/dir_y; rm -rf x",
+                false,
+            ),
+            (
+                "mkdir /tmp/absent_parent_x/dir_y; cd /tmp/absent_parent_x/dir_y; tee out",
+                false,
+            ),
+            // A non-`-p` target whose parent was created earlier in the chain
+            // (transitively) is provable.
+            (
+                "mkdir -p /tmp/chain_a; mkdir /tmp/chain_a/chain_b; cd /tmp/chain_a/chain_b; touch f",
+                true,
+            ),
             // Relative cd targets are expanded before tracking: a target that
             // expands to a non-temp location fails closed.
             ("cd /tmp && cd $TMPDIR && touch f", true),
@@ -4316,13 +4380,43 @@ mod tests {
             // the variable would bind empty, so no temp anchor.
             ("SNAP=$(mktemp -d /tmp/foo)\ntouch \"$SNAP/f\"", false),
             ("SNAP=$(mktemp -d /tmp/foo.XX)\ntouch \"$SNAP/f\"", false),
-            // mktemp -p/--tmpdir to a temp dir binds; to a non-temp dir does not.
+            // mktemp -p/--tmpdir to a provably existing temp dir binds; to a
+            // non-temp dir does not. mktemp never creates the -p directory,
+            // so a nonexistent one makes it error at runtime and bind the
+            // variable empty — the chained write would land outside every
+            // temp root (false temp anchor), so it fails closed.
             ("SNAP=$(mktemp -d -p /tmp)\ntouch \"$SNAP/f\"", true),
             ("SNAP=$(mktemp -d --tmpdir=/tmp)\ntouch \"$SNAP/f\"", true),
-            ("SNAP=$(mktemp -d --tmpdir /tmp)\ntouch \"$SNAP/f\"", true),
             ("SNAP=$(mktemp -d -p /etc)\ntouch \"$SNAP/f\"", false),
             (
                 "SNAP=$(mktemp -d --tmpdir=/__mahbot_readonly_test_ws__)\ntouch \"$SNAP/f\"",
+                false,
+            ),
+            (
+                "SNAP=$(mktemp -d -p /tmp/nonexistent_x)\ntouch \"$SNAP/f\"",
+                false,
+            ),
+            (
+                "SNAP=$(mktemp -d -p /tmp/nonexistent_x) ; touch \"$SNAP/f\"",
+                false,
+            ),
+            (
+                "SNAP=$(mktemp -d --tmpdir=/tmp/nonexistent_x)\ntouch \"$SNAP/f\"",
+                false,
+            ),
+            // A -p dir created by `mkdir` earlier in the chain is provable.
+            (
+                "mkdir -p /tmp/snapdir; SNAP=$(mktemp -d -p /tmp/snapdir)\ntouch \"$SNAP/f\"",
+                true,
+            ),
+            // The space-separated `--tmpdir DIR` form is not provable (GNU
+            // optional-arg semantics error there; macOS joins DIR as a
+            // template under /tmp) → fail-closed.
+            ("SNAP=$(mktemp -d --tmpdir /tmp)\ntouch \"$SNAP/f\"", false),
+            ("SNAP=$(mktemp -d --tmpdir /etc)\ntouch \"$SNAP/f\"", false),
+            // `--suffix=` is GNU-only; macOS mktemp rejects it → fail-closed.
+            (
+                "SNAP=$(mktemp -d --suffix=.foo /tmp/x.XXXXXX)\ntouch \"$SNAP/f\"",
                 false,
             ),
         ];
