@@ -1490,6 +1490,32 @@ fn cp_destination_under_temp(segment: &str, state: &ValidationState) -> bool {
     }
 }
 
+/// First effective command word of a segment: after env assignments, the
+/// forwarding prefixes (`command`/`builtin`/`time` — they run their command
+/// in the current shell), and the option words that still forward
+/// (`command -p`, `time -p`). Any other option word (`command -v`, `time -x`,
+/// `builtin -x`) is informational or invalid and ends the scan — the command
+/// is never executed. Quoted words (`"cd"`) match by their unquoted content.
+/// `eval` is not skipped: its body is handled as a current-shell construct.
+fn effective_verb<'a>(words: &[&'a str]) -> Option<(usize, &'a str)> {
+    let mut forwarding: Option<&str> = None;
+    for (i, w) in words.iter().enumerate() {
+        if super::is_env_assignment(w) {
+            continue;
+        }
+        let unquoted = strip_outer_quotes(w).map_or("", |(c, _)| c);
+        if matches!(unquoted, "command" | "builtin" | "time") {
+            forwarding = Some(unquoted);
+            continue;
+        }
+        if unquoted == "-p" && matches!(forwarding, Some("command" | "time")) {
+            continue;
+        }
+        return Some((i, unquoted));
+    }
+    None
+}
+
 /// Check a single command segment for unsafe operations.
 ///
 /// `state` carries the tracked current directory and temp-variable bindings
@@ -1511,21 +1537,54 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
     // arguments and redirect targets reject.
     //
     // The verb is located after env assignments and the shell prefixes that
-    // forward their command to the current shell (`command`/`builtin`/`time`/
-    // `eval` — `command cd /etc` moves the real CWD). Non-forwarding prefixes
-    // (`sudo`/`env`/`nice`/…) run the `cd` in a child shell, so the real CWD
-    // never changes and the segment is not routed here.
+    // forward their command to the current shell (`command`/`builtin`/`time`),
+    // including the execution options that still forward (`command -p`,
+    // `time -p`). Informational/invalid options (`command -v`, `time -x`,
+    // `builtin -x`) never execute the command, so they are not skipped.
+    // `eval` is a verb, not a prefix: its body is evaluated in the current
+    // shell, so a `cd` inside is handled like a bare cd. Quoted verbs
+    // (`"cd"`) match by their unquoted content. Non-forwarding prefixes
+    // (`sudo`/`env`/`nice`/…) run the command in a child shell, so the real
+    // CWD never changes and the segment is not routed here.
     let words: Vec<&str> = trimmed.split_whitespace().collect();
-    let first_effective = words
-        .iter()
-        .find(|w| {
-            !super::is_env_assignment(w) && !matches!(**w, "command" | "builtin" | "time" | "eval")
-        })
-        .copied()
-        .unwrap_or("");
-    if matches!(first_effective, "cd" | "pushd" | "popd") {
+    let (verb_idx, verb) = effective_verb(&words).unwrap_or((0, ""));
+    if matches!(verb, "cd" | "pushd" | "popd") {
         update_cwd_for_cd(trimmed, state);
         return Ok(());
+    }
+    if verb == "eval" {
+        // A cd in the body is handled as a current-shell cd; otherwise fall
+        // through so the body is validated as its own command (first_command_word
+        // strips `eval`), matching pre-existing behavior for eval write content.
+        if handle_eval_body(&words[verb_idx + 1..], state) {
+            return Ok(());
+        }
+    }
+    if verb == "{" {
+        // Brace groups run in the current shell. A write-capable verb inside
+        // writes unvalidated — reject outright. A `cd`/`pushd`/`popd` inside
+        // changes the real CWD without tracking — reset so chained relative
+        // writes reject.
+        let inner = &words[verb_idx + 1..];
+        if inner.iter().any(|w| {
+            let u = strip_outer_quotes(w).map_or(*w, |(c, _)| c);
+            SCRATCH_MUTATORS.contains(&u)
+                || TEMP_MUTATORS.contains(&u)
+                || MUTATING_COMMANDS.contains(&u)
+                || FLAG_CHECKS.iter().any(|c| c.verb == u)
+        }) {
+            return reject(
+                trimmed,
+                "commands inside brace groups are not validated here.",
+                "write to the OS temp directory with plain commands on separate lines.",
+            );
+        }
+        if inner.iter().any(|w| {
+            let u = strip_outer_quotes(w).map_or(*w, |(c, _)| c);
+            matches!(u, "cd" | "pushd" | "popd")
+        }) {
+            state.cwd = None;
+        }
     }
 
     // ── Temp-variable bindings (contract decision 5) ───────────────
@@ -1643,27 +1702,35 @@ fn check_segment(segment: &str, state: &mut ValidationState) -> Result<(), Strin
 /// option (`-e`, `-@`, …) errors at runtime, so both reset fail-closed.
 /// Relative targets are expanded against the tracked state before tracking,
 /// so `$VAR`, `~`, `-` and `$OLDPWD` cannot smuggle a non-temp location past
-/// the guard.
+/// the guard. The verb is located by [`effective_verb`], so forwarding
+/// prefixes (`command`/`builtin`/`time`, with `-p`), quoted verbs (`"cd"`)
+/// and env assignments are handled before the target is resolved.
 fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
     let words: Vec<&str> = segment.split_whitespace().collect();
-    let Some(cd_idx) = words
-        .iter()
-        .position(|w| matches!(*w, "cd" | "pushd" | "popd"))
-    else {
+    let Some((verb_idx, verb)) = effective_verb(&words) else {
         return;
     };
-    // pushd/popd always reset fail-closed; only `cd` tracks.
-    if words[cd_idx] != "cd" {
+    process_cd_words(&words, verb_idx, verb, state);
+}
+
+/// Resolve the target of a `cd`/`pushd`/`popd` verb at `cd_idx` (shared by
+/// direct cd segments and decoded `eval` bodies). pushd/popd always reset
+/// fail-closed; only `cd` tracks.
+///
+/// Skip option words before resolving the real target. `-P`/`-L` (and
+/// combined forms) are valid; `--` ends option parsing; any other `-…`
+/// option (`-e`, `-@`, `-x`, …) errors at runtime, so the `cd` never
+/// happens and the real CWD stays put — tracking would approve a chained
+/// write that lands there. A bare `cd`/`cd -P` (no target after the flags)
+/// targets `$HOME`. All of these reset fail-closed; `-` alone is the
+/// `$OLDPWD` target, never an option. Option detection uses the raw word
+/// (a quoted `"-P"` is a literal target), while the resolved target is
+/// quote-stripped (`cd "/tmp"`).
+fn process_cd_words(words: &[&str], cd_idx: usize, verb: &str, state: &mut ValidationState) {
+    if verb != "cd" {
         state.cwd = None;
         return;
     }
-    // Skip option words before resolving the real target. `-P`/`-L` (and
-    // combined forms) are valid; `--` ends option parsing; any other `-…`
-    // option (`-e`, `-@`, `-x`, …) errors at runtime, so the `cd` never
-    // happens and the real CWD stays put — tracking would approve a chained
-    // write that lands there. A bare `cd`/`cd -P` (no target after the
-    // flags) targets `$HOME`. All of these reset fail-closed; `-` alone is
-    // the `$OLDPWD` target, never an option.
     let mut i = cd_idx + 1;
     let mut options_ended = false;
     let target = loop {
@@ -1677,7 +1744,7 @@ fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
             i += 1;
             continue;
         }
-        break Some(*w);
+        break Some(strip_outer_quotes(w).map_or(*w, |(c, _)| c));
     };
     let Some(target) = target else {
         state.cwd = None;
@@ -1737,6 +1804,45 @@ fn update_cwd_for_cd(segment: &str, state: &mut ValidationState) {
             None
         };
     }
+}
+
+/// An `eval` segment evaluates its body in the current shell, so a `cd` in
+/// the body moves the real CWD behind the guard's back. The body is decoded
+/// (one layer of surrounding quotes) and processed like a bare cd when it is
+/// a clean simple `cd [target]`; any other cd/pushd/popd shape — extra
+/// commands, separators, mixed quoting, or a pushd/popd — resets tracking
+/// fail-closed. Returns `true` when the segment was consumed by cd handling;
+/// a body without a cd verb returns `false` so the caller validates it as its
+/// own command (eval write content stays outside the guard's model).
+fn handle_eval_body(body_words: &[&str], state: &mut ValidationState) -> bool {
+    let joined = body_words.join(" ");
+    let (decoded, clean) = if let Some((content, _)) = strip_outer_quotes(&joined) {
+        (content.to_string(), true)
+    } else {
+        let mut s = String::with_capacity(joined.len());
+        s.extend(joined.chars().filter(|c| !matches!(c, '\'' | '"')));
+        (s, false)
+    };
+    let toks: Vec<&str> = decoded.split_whitespace().collect();
+    let Some((ti, tv)) = toks.iter().enumerate().find_map(|(i, w)| {
+        let u = strip_outer_quotes(w).map_or(*w, |(c, _)| c);
+        matches!(u, "cd" | "pushd" | "popd").then_some((i, u))
+    }) else {
+        return false;
+    };
+    let simple = clean
+        && tv == "cd"
+        && ti == 0
+        && !toks[1..].iter().any(|w| {
+            let u = strip_outer_quotes(w).map_or(*w, |(c, _)| c);
+            matches!(u, "&&" | "||" | ";" | "|" | "cd" | "pushd" | "popd")
+        });
+    if !simple {
+        state.cwd = None;
+        return true;
+    }
+    process_cd_words(&toks, 0, "cd", state);
+    true
 }
 
 /// A `cd`/`mktemp` target is provably reachable at runtime when the raw path
@@ -4872,6 +4978,73 @@ mod tests {
             // Prefixed cd to a temp target stays accepted (routed, tracks).
             ("cd /tmp && command cd /tmp && touch f", true),
             ("cd /tmp && builtin cd -P /tmp && touch f", true),
+            // Prefix execution options and quoted verbs route and track.
+            ("cd /tmp && command -p cd /tmp && touch f", true),
+            ("cd /tmp && time -p cd /tmp && touch f", true),
+            ("cd /tmp && command \"cd\" /tmp && touch f", true),
+            ("cd /tmp && eval 'cd /tmp' && touch f", true),
+            ("cd /tmp && eval \"cd /tmp\" && touch f", true),
+            // Informational/invalid prefix options never execute the cd, so
+            // they are not routed — tracking stays where the real CWD is.
+            ("cd /tmp && command -v cd /tmp && touch f", true),
+            ("cd /tmp && builtin -p cd /tmp && touch f", true),
+        ];
+
+        run_cases(&cases);
+    }
+
+    #[test]
+    fn quoted_eval_and_brace_escapes_fail_closed() {
+        let cases = [
+            // Quoted eval bodies run in the current shell: a cd inside moves
+            // the real CWD behind the guard — fail closed.
+            ("cd /tmp && eval 'cd /etc' && touch f", false),
+            ("cd /tmp && eval \"cd /etc\" && touch f", false),
+            ("cd /tmp && eval \"cd $HOME\" && touch f", false),
+            ("cd /tmp && command eval 'cd /etc' && touch f", false),
+            ("cd /tmp && time eval 'cd /etc' && touch f", false),
+            ("cd /tmp && builtin eval 'cd /etc' && touch f", false),
+            ("cd /tmp && eval 'cd /etc' && rm -rf x", false),
+            // eval bodies with cd + extra commands reset fail-closed.
+            ("cd /tmp && eval 'cd /etc; echo hi' && touch f", false),
+            ("cd /tmp && eval 'cd /tmp && cd /etc' && touch f", false),
+            // Brace groups run in the current shell: a cd inside changes the
+            // real CWD without tracking, and a mutator inside writes
+            // unvalidated — both fail closed.
+            ("cd /tmp && { cd /etc; } && touch f", false),
+            ("cd /tmp && { cd /etc } && touch f", false),
+            ("cd /tmp && { cd /etc;\n} && touch f", false),
+            ("cd /tmp && { cd /etc; } && rm -rf x", false),
+            ("{ touch f; }", false),
+            ("cd /tmp && { cd /tmp; } && touch f", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    #[test]
+    fn prefix_option_and_quoted_verb_fail_closed() {
+        let cases = [
+            // `command -p` / `time -p` execute the cd in the current shell —
+            // a non-temp target must reset fail-closed.
+            ("cd /tmp && command -p cd /etc && touch f", false),
+            ("cd /tmp && command -p cd -P /etc && touch f", false),
+            ("cd /tmp && time -p cd /etc && touch f", false),
+            ("cd /tmp && time -p cd ~ && touch f", false),
+            (
+                "cd /tmp && command -p cd /__mahbot_readonly_test_ws__ && rm -rf x",
+                false,
+            ),
+            // Quoted cd/pushd verbs still execute in the current shell.
+            ("cd /tmp && command \"cd\" /etc && touch f", false),
+            ("cd /tmp && builtin 'cd' $HOME && touch f", false),
+            ("cd /tmp && time \"cd\" /etc && touch f", false),
+            ("cd /tmp && command 'pushd' /etc && touch f", false),
+            ("\"cd\" /etc && touch f", false),
+            (
+                "cd /tmp && \"cd\" /__mahbot_readonly_test_ws__ && rm -rf x",
+                false,
+            ),
         ];
 
         run_cases(&cases);
