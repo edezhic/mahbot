@@ -66,7 +66,9 @@ CREATE TABLE IF NOT EXISTS tickets (
     is_archived     INTEGER NOT NULL DEFAULT 0,
     embedding       BLOB,
     pipeline_reservation INTEGER NOT NULL DEFAULT 0,
-    priority        INTEGER NOT NULL DEFAULT 1
+    priority        INTEGER NOT NULL DEFAULT 1,
+    reviewed_head   TEXT,
+    reviewed_tree   TEXT
 );
 CREATE TABLE IF NOT EXISTS ticket_comments (
     id          TEXT PRIMARY KEY,
@@ -108,6 +110,8 @@ crate::columns! {
         IS_ARCHIVED            => "is_archived",
         PIPELINE_RESERVATION   => "pipeline_reservation",
         PRIORITY               => "priority",
+        REVIEWED_HEAD          => "reviewed_head",
+        REVIEWED_TREE          => "reviewed_tree",
     }
 }
 
@@ -266,6 +270,15 @@ pub struct Ticket {
     /// priority over other ReadyForDevelopment tickets during claim.
     pub pipeline_reservation: bool,
     pub priority: i64,
+    /// HEAD commit hash at the last completed reviewer round on this ticket.
+    /// `None` until the first reviewer pass finishes — used by the reviewer
+    /// skip-gate to detect brand-new content that must never skip review.
+    pub reviewed_head: Option<String>,
+    /// `git write-tree` index tree hash at the last completed reviewer round
+    /// (captured after the post-review auto-stage). Together with
+    /// [`reviewed_head`](Self::reviewed_head) and a clean porcelain this
+    /// identifies the exact content reviewers saw.
+    pub reviewed_tree: Option<String>,
 }
 
 impl Ticket {
@@ -603,6 +616,7 @@ pub(crate) enum LoadComments {
 ///
 /// These run only for databases created with older versions.
 /// Can be safely removed once all active databases have been migrated.
+#[allow(clippy::too_many_lines)] // linear sequence of versioned migration blocks
 async fn run_schema_migrations(conn: &turso::Connection) -> anyhow::Result<()> {
     // ── schema migration: rename `status` column to `phase` ───────────
     let version_rows = conn
@@ -685,6 +699,50 @@ async fn run_schema_migrations(conn: &turso::Connection) -> anyhow::Result<()> {
 
         if !has_priority {
             info!("Schema migration complete: added tickets.priority column (version 2)");
+        }
+    }
+
+    // ── schema migration: add reviewed-base columns ─────────────────
+    if current_version < 3 {
+        let table_info = conn
+            .query("PRAGMA table_info('tickets')", ())
+            .await
+            .context("Failed to read PRAGMA table_info for tickets table")?;
+
+        let col_names: Vec<String> = table_info
+            .iter()
+            .filter_map(|row| row.get::<String>(1).ok())
+            .collect();
+        let mut added = Vec::new();
+        for (col, ddl) in [
+            (
+                "reviewed_head",
+                "ALTER TABLE tickets ADD COLUMN reviewed_head TEXT",
+            ),
+            (
+                "reviewed_tree",
+                "ALTER TABLE tickets ADD COLUMN reviewed_tree TEXT",
+            ),
+        ] {
+            if !col_names.iter().any(|n| n == col) {
+                info!("Schema migration: adding tickets.{col} column");
+                conn.execute(ddl, ()).await.with_context(|| {
+                    format!("Schema migration failed: unable to add tickets.{col}")
+                })?;
+                added.push(col);
+            }
+        }
+
+        conn.execute("PRAGMA user_version = 3", ())
+            .await
+            .context("Schema migration failed: unable to set PRAGMA user_version to 3")?;
+
+        conn.checkpoint().await.context(
+            "Schema migration failed: unable to checkpoint after adding reviewed-base columns",
+        )?;
+
+        if !added.is_empty() {
+            info!("Schema migration complete: added {added:?} columns (version 3)");
         }
     }
     Ok(())
@@ -983,6 +1041,8 @@ impl BoardStore {
             is_archived: row.get::<bool>(COL_TICKET_IS_ARCHIVED)?,
             pipeline_reservation: row.get::<bool>(COL_TICKET_PIPELINE_RESERVATION)?,
             priority: row.get::<i64>(COL_TICKET_PRIORITY)?,
+            reviewed_head: row.get(COL_TICKET_REVIEWED_HEAD)?,
+            reviewed_tree: row.get(COL_TICKET_REVIEWED_TREE)?,
         })
     }
 
@@ -1491,6 +1551,25 @@ impl BoardStore {
             ticket_id,
         );
         prepared.execute_tx(tx).await
+    }
+
+    /// Record the reviewed content base (HEAD + index tree) on a ticket.
+    ///
+    /// Set after a completed reviewer round so later rounds can skip the
+    /// reviewer pass only when their content is identical to this base.
+    /// `None` values clear the base (ticket becomes never-reviewed).
+    pub(crate) async fn set_reviewed_base(
+        &self,
+        ticket_id: &str,
+        head: Option<&str>,
+        tree: Option<&str>,
+    ) -> Result<()> {
+        let prepared = Self::build_ticket_update_with_updated_at(
+            "reviewed_head = ?, reviewed_tree = ?",
+            vec![Value::from(head), Value::from(tree)],
+            ticket_id,
+        );
+        prepared.execute_no_cancel(&self.conn).await
     }
 
     /// Transition pairs for crash/restart recovery (extracted so tests can verify

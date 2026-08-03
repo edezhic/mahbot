@@ -2064,6 +2064,8 @@ async fn test_ticket_roundtrip_all_fields() {
             is_archived: false,
             pipeline_reservation: false,
             priority: 1,
+            reviewed_head: None,
+            reviewed_tree: None,
         },
     );
 
@@ -2078,6 +2080,11 @@ async fn test_ticket_roundtrip_all_fields() {
         .await
         .expect("set_commit_info_tx");
     tx.commit().await.unwrap();
+
+    store
+        .set_reviewed_base(&id, Some("reviewed-head-hash"), Some("reviewed-tree-hash"))
+        .await
+        .expect("set_reviewed_base");
 
     let ticket = store
         .get_ticket(&id)
@@ -2118,6 +2125,8 @@ async fn test_ticket_roundtrip_all_fields() {
             is_archived: false,
             pipeline_reservation: false,
             priority: 1,
+            reviewed_head: Some("reviewed-head-hash".into()),
+            reviewed_tree: Some("reviewed-tree-hash".into()),
         },
     );
 
@@ -2163,6 +2172,8 @@ async fn test_ticket_roundtrip_all_fields() {
             is_archived: true,
             pipeline_reservation: false,
             priority: 1,
+            reviewed_head: Some("reviewed-head-hash".into()),
+            reviewed_tree: Some("reviewed-tree-hash".into()),
         },
     );
 }
@@ -2606,7 +2617,7 @@ CREATE TABLE IF NOT EXISTS ticket_counters (
 ///   3. Opens the database via [`BoardStore`], which triggers migration in `after_open`
 ///   4. Verifies data survived intact
 ///   5. Verifies the column is now named `phase`
-///   6. Verifies `PRAGMA user_version = 2` (all migrations applied)
+///   6. Verifies `PRAGMA user_version = 3` (all migrations applied)
 ///   7. Re-opens to verify idempotency
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
@@ -2701,15 +2712,20 @@ async fn test_status_to_phase_migration() {
         col_names.iter().any(|n| n == "phase"),
         "column 'phase' must exist after migration; found: {col_names:?}",
     );
+    assert!(
+        col_names.iter().any(|n| n == "reviewed_head")
+            && col_names.iter().any(|n| n == "reviewed_tree"),
+        "reviewed-base columns must exist after migration; found: {col_names:?}",
+    );
 
-    // ── 6. Verify PRAGMA user_version = 2 ──────────────────────────────
+    // ── 6. Verify PRAGMA user_version = 3 ──────────────────────────────
     let ver_rows = store
         .conn
         .query("PRAGMA user_version", ())
         .await
         .expect("query user_version after migration");
     let version: i64 = ver_rows[0].get(0).expect("get user_version value");
-    assert_eq!(version, 2, "user_version should be 2 after all migrations");
+    assert_eq!(version, 3, "user_version should be 3 after all migrations");
 
     // ── 7. Re-open to verify idempotency ───────────────────────────────
     drop(store);
@@ -2737,14 +2753,14 @@ async fn test_status_to_phase_migration() {
         .any(|r| r.get::<String>(1).ok().as_deref() == Some("phase"));
     assert!(has_phase2, "column should still be 'phase' after re-open");
 
-    // Version still 2
+    // Version still 3
     let ver_rows2 = store2
         .conn
         .query("PRAGMA user_version", ())
         .await
         .expect("query user_version after re-open");
     let version2: i64 = ver_rows2[0].get(0).expect("get version");
-    assert_eq!(version2, 2, "user_version should remain 2 after re-open");
+    assert_eq!(version2, 3, "user_version should remain 3 after re-open");
 }
 
 // ── route_comment_to_agents tests ─────────────────────────────────────

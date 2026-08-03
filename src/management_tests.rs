@@ -2,8 +2,8 @@ use super::*;
 use crate::prompt::{load_prompt, substitute};
 use crate::util::test::make_ticket;
 use crate::util::test::{
-    create_test_workspace, expect_ticket, expect_ticket_phase, init_management_test_stores,
-    init_test_stores,
+    FakeProvider, create_test_workspace, expect_ticket, expect_ticket_phase,
+    init_management_test_stores, init_test_stores,
 };
 use crate::workspace::test_ws_named;
 use strum::IntoEnumIterator;
@@ -1541,11 +1541,68 @@ async fn diagnostics_repaired_chain_passes_on_clean_crate() {
 
 // ── dispatch_verifiers skip-review ──────────────────────────────
 
-/// When a ticket is in InReview and the working tree has no unstaged changes,
-/// dispatch_verifiers should skip spawning reviewers and transition directly
-/// to Reviewed with a system comment explaining the skip.
+/// A ticket with no recorded reviewed base must never skip the reviewer
+/// pass — even on a clean working tree (first review round, brand-new
+/// commit). The full review runs: here all three agents fail to produce
+/// verdicts, so the ticket goes to Failed instead of being auto-advanced
+/// to Reviewed.
+#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
 #[tokio::test]
-async fn dispatch_verifiers_skip_review_when_no_unstaged_changes() {
+async fn dispatch_verifiers_without_review_base_runs_full_review() {
+    if !crate::git_commands::git_is_installed().await {
+        eprintln!("git not installed — skipping git-dependent test");
+        return;
+    }
+
+    let _lock = crate::util::test::retry_tests_lock();
+    let _provider_guard = crate::util::test::install_fake_provider(Arc::new(FakeProvider::new()));
+
+    let (_dir, repo_path) = crate::util::test::init_temp_repo();
+    let repo_str = repo_path.to_str().expect("temp path is valid UTF-8");
+
+    let (ws, ticket_id) = setup_ticket(
+        repo_str,
+        "no_review_base_test",
+        "No Review Base Test",
+        TicketPhase::InReview,
+    )
+    .await;
+
+    let ticket = Arc::new(expect_ticket(board(), &ticket_id).await);
+    assert!(
+        ticket.reviewed_head.is_none(),
+        "test precondition: ticket must start without a reviewed base"
+    );
+
+    dispatch_verifiers(ticket, ws, REVIEWER_VI).await;
+
+    // The reviewer pass ran (no verdicts produced → Failed), so the ticket
+    // must NOT have been auto-advanced to Reviewed.
+    let phase = expect_ticket_phase(board(), &ticket_id).await;
+    assert_ne!(
+        phase,
+        TicketPhase::Reviewed,
+        "A ticket with no reviewed base must never skip the reviewer pass"
+    );
+
+    // No skip comment may have been written.
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get_comments");
+    assert!(
+        !comments
+            .iter()
+            .any(|c| c.role == SYSTEM_ROLE && c.content.contains("Skipping reviewer dispatch")),
+        "No skip comment expected when the reviewer pass must run"
+    );
+}
+
+/// When the current content is identical to the ticket's recorded reviewed
+/// base (same HEAD, same index tree, clean porcelain), the reviewer pass may
+/// legitimately be skipped — this is the comment-only-round case.
+#[tokio::test]
+async fn dispatch_verifiers_skip_review_when_content_matches_base() {
     if !crate::git_commands::git_is_installed().await {
         eprintln!("git not installed — skipping git-dependent test");
         return;
@@ -1556,22 +1613,36 @@ async fn dispatch_verifiers_skip_review_when_no_unstaged_changes() {
 
     let (ws, ticket_id) = setup_ticket(
         repo_str,
-        "skip_review_test",
-        "Skip Review Test",
+        "skip_review_base_test",
+        "Skip Review Base Test",
         TicketPhase::InReview,
     )
     .await;
+
+    // Record a reviewed base matching the current repo content
+    // (HEAD + index tree of the clean committed tree).
+    let head = crate::git_commands::run_git_head(&repo_path)
+        .await
+        .expect("head query")
+        .expect("repo has commits");
+    let tree = crate::git_commands::run_git_write_tree(&repo_path)
+        .await
+        .expect("tree query")
+        .expect("index writable");
+    board()
+        .set_reviewed_base(&ticket_id, Some(&head), Some(&tree))
+        .await
+        .expect("set_reviewed_base");
 
     let ticket = Arc::new(expect_ticket(board(), &ticket_id).await);
 
     dispatch_verifiers(ticket, ws, REVIEWER_VI).await;
 
-    // Verify the ticket was transitioned to Reviewed.
     let phase = expect_ticket_phase(board(), &ticket_id).await;
     assert_eq!(
         phase,
         TicketPhase::Reviewed,
-        "Ticket with no unstaged changes should skip review and go directly to Reviewed"
+        "Content identical to the reviewed base should skip review and go directly to Reviewed"
     );
 
     // Verify a SYSTEM_ROLE comment was written explaining the skip.
@@ -1582,9 +1653,51 @@ async fn dispatch_verifiers_skip_review_when_no_unstaged_changes() {
     assert!(
         comments
             .iter()
-            .any(|c| { c.role == SYSTEM_ROLE && c.content.contains("No unstaged changes") }),
+            .any(|c| c.role == SYSTEM_ROLE && c.content.contains("Skipping reviewer dispatch")),
         "Expected a SYSTEM_ROLE comment explaining the skip-review reason"
     );
+}
+
+/// The skip decision must be conservative — may over-review, never
+/// under-review: only content identical to the recorded base skips.
+#[test]
+fn should_skip_review_decision_matrix() {
+    let base = (Some("base-head"), Some("base-tree"));
+    let same = base;
+    let none = (None, None);
+    let cases: [(
+        (Option<&str>, Option<&str>),
+        (Option<&str>, Option<&str>),
+        &str,
+        bool,
+    ); 12] = [
+        // No recorded base → never skip (first review round).
+        (none, same, "", false),
+        ((None, Some("base-tree")), same, "", false),
+        ((Some("base-head"), None), same, "", false),
+        // Identical content → skip (comment-only round).
+        (base, same, "", true),
+        // New committed content (HEAD change) → review.
+        (base, (Some("new-head"), Some("new-tree")), "", false),
+        // Empty commit (HEAD change, same tree) → review.
+        (base, (Some("new-head"), Some("base-tree")), "", false),
+        // Staged content (index tree change) → review.
+        (base, (Some("base-head"), Some("new-tree")), "", false),
+        // Unstaged / untracked changes → review.
+        (base, same, " M src/lib.rs", false),
+        (base, same, "?? new_file.txt", false),
+        // Uncomputable identity → review (fail open).
+        (base, (None, Some("base-tree")), "", false),
+        (base, (Some("base-head"), None), "", false),
+        (base, same, "\n\n", true), // blank porcelain is still clean
+    ];
+    for (i, (reviewed, current, porcelain, expected)) in cases.iter().enumerate() {
+        assert_eq!(
+            should_skip_review(reviewed.0, reviewed.1, current.0, current.1, porcelain),
+            *expected,
+            "case {i}"
+        );
+    }
 }
 
 // ── mahbot-1066 Amendment B: verdict raw-response comments ───────────────

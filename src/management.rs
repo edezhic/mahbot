@@ -21,6 +21,7 @@
 
 use std::fmt::Write;
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -32,7 +33,7 @@ use crate::agent::run_agent;
 use crate::board::{BOARD, BoardStore, PipelineCheck, Ticket, TicketComment, TicketPhase};
 use crate::git_commands::{
     has_unstaged_changes, list_new_or_untracked_files, parse_new_files_from_porcelain,
-    run_git_add_all, run_git_status,
+    run_git_add_all, run_git_head, run_git_status, run_git_write_tree,
 };
 use crate::message_router;
 use crate::prompt::{load_prompt, substitute};
@@ -2648,13 +2649,16 @@ async fn try_trip_circuit_breaker(
 ///    it waits until the ticket reaches Done (after the QaPassed commit succeeds in
 ///    [`handle_qa_passed`]).
 ///
+/// Returns `true` when the comment+transition completed, `false` on failure
+/// (the ticket stays in `verifier.active_phase`).
+///
 /// See the "Parallel agent helpers (shared)" section for why this is separate
 /// from [`process_analyst_verdicts`].
 async fn process_verifier_verdicts(
     ticket: &Ticket,
     results: &[ParallelVerdict],
     verifier: VerifierInfo,
-) {
+) -> bool {
     let all_failed = results
         .iter()
         .all(|r| !matches!(r, ParallelVerdict::Verdict(_)));
@@ -2706,7 +2710,7 @@ async fn process_verifier_verdicts(
     )
     .await
     {
-        return;
+        return false;
     }
 
     if all_failed {
@@ -2728,6 +2732,58 @@ async fn process_verifier_verdicts(
             log_label = verifier.log_label,
         );
     }
+    true
+}
+
+/// Decide whether the reviewer pass may be skipped for a ticket.
+///
+/// Skipping is allowed ONLY when the ticket has a recorded reviewed base
+/// (from a prior completed review round on this ticket) and the current
+/// content is identical to that base: same HEAD commit, same index tree,
+/// and a clean porcelain (no unstaged or untracked changes).
+///
+/// Conservative by design — may over-review, never under-review: any missing
+/// input (no recorded base, uncomputable HEAD/tree) yields `false` (review).
+#[must_use]
+fn should_skip_review(
+    reviewed_head: Option<&str>,
+    reviewed_tree: Option<&str>,
+    current_head: Option<&str>,
+    current_tree: Option<&str>,
+    porcelain: &str,
+) -> bool {
+    let (Some(base_head), Some(base_tree)) = (reviewed_head, reviewed_tree) else {
+        return false;
+    };
+    let (Some(head), Some(tree)) = (current_head, current_tree) else {
+        return false;
+    };
+    head == base_head && tree == base_tree && !has_unstaged_changes(porcelain)
+}
+
+/// Compute the skip-review decision for a ticket: fetch the current content
+/// identity (porcelain, HEAD, index tree) and compare it against the ticket's
+/// recorded reviewed base. Errors propagate to the caller, which must default
+/// to running the full review.
+async fn compute_review_skip(ticket: &Ticket, repo_path: &Path) -> anyhow::Result<bool> {
+    let porcelain = run_git_status(repo_path).await?;
+    let head = run_git_head(repo_path).await?;
+    let tree = run_git_write_tree(repo_path).await?;
+    if (head.is_none() || tree.is_none()) && ticket.reviewed_head.is_some() {
+        warn!(
+            ticket = %ticket.id,
+            head = head.is_some(),
+            tree = tree.is_some(),
+            "Could not compute full content identity — running full review",
+        );
+    }
+    Ok(should_skip_review(
+        ticket.reviewed_head.as_deref(),
+        ticket.reviewed_tree.as_deref(),
+        head.as_deref(),
+        tree.as_deref(),
+        &porcelain,
+    ))
 }
 
 /// Shared dispatch logic for parallel verifiers (reviewers and QA).
@@ -2741,8 +2797,10 @@ async fn process_verifier_verdicts(
 /// `assigned_to` set to `NULL` during the [`claim_ticket_in_workspace`] claim).
 async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo) {
     // ── Skip-review check for Reviewers ──────────────────────────────
-    // If no unstaged changes exist, all code was already reviewed in a
-    // previous round — transition directly to Reviewed without spawning agents.
+    // Skip ONLY when the current content is identical to the reviewed base
+    // recorded on this ticket by a prior completed review round (same HEAD,
+    // same index tree, clean porcelain). A ticket with no recorded base —
+    // first review round, brand-new commit — must always run the full pass.
     let is_reviewer = vi.role == Role::Reviewer;
     let repo_path = ws.as_path();
     let git_available = is_reviewer
@@ -2750,29 +2808,29 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
         && crate::git_commands::is_git_repo(repo_path);
 
     if git_available {
-        match run_git_status(repo_path).await {
-            Ok(porcelain) => {
-                if !has_unstaged_changes(&porcelain) {
-                    info!(
-                        ticket = %ticket.id,
-                        "No unstaged changes — skipping reviewer dispatch",
-                    );
-                    let _ = comment_and_transition(
-                        TransitionCtx {
-                            ticket: &ticket,
-                            source: vi.active_phase,
-                            target: TicketPhase::Reviewed,
-                            notify: NotifyPolicy::Buffer,
-                            log_label: vi.log_label,
-                        },
-                        SYSTEM_ROLE,
-                        "No unstaged changes detected — all code was already reviewed in a \
-                             previous round. Skipping reviewer dispatch.",
-                    )
-                    .await;
-                    return;
-                }
+        match compute_review_skip(&ticket, repo_path).await {
+            Ok(true) => {
+                info!(
+                    ticket = %ticket.id,
+                    "Content identical to reviewed base — skipping reviewer dispatch",
+                );
+                let _ = comment_and_transition(
+                    TransitionCtx {
+                        ticket: &ticket,
+                        source: vi.active_phase,
+                        target: TicketPhase::Reviewed,
+                        notify: NotifyPolicy::Buffer,
+                        log_label: vi.log_label,
+                    },
+                    SYSTEM_ROLE,
+                    "Content is identical to the reviewed base recorded for this ticket \
+                     (same HEAD commit and index tree, no working-tree changes). \
+                     Skipping reviewer dispatch.",
+                )
+                .await;
+                return;
             }
+            Ok(false) => {}
             Err(e) => {
                 warn!(
                     ticket = %ticket.id,
@@ -2803,23 +2861,50 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
         return;
     }
 
-    process_verifier_verdicts(&ticket, &results, vi).await;
+    let transitioned = process_verifier_verdicts(&ticket, &results, vi).await;
 
-    // ── Auto-stage after review ──────────────────────────────────────
-    // Stage all working tree changes so they are marked as "already reviewed"
-    // for the next pipeline round. This runs regardless of pass/fail outcome.
-    if git_available {
+    // ── Auto-stage + record reviewed base after review ───────────────
+    // Stage all working tree changes so the index captures the reviewed
+    // content, then record the resulting HEAD + index tree as the ticket's
+    // reviewed base. Runs only for reviewers whose round actually produced
+    // verdicts and transitioned the ticket — a skipped base on a failed
+    // transition or an all-failed round (content never reviewed) would let a
+    // later round skip content nobody saw.
+    let reviewed = results
+        .iter()
+        .any(|r| matches!(r, ParallelVerdict::Verdict(_)));
+    if git_available && transitioned && reviewed {
         if let Err(e) = run_git_add_all(repo_path).await {
             warn!(
                 ticket = %ticket.id,
                 error = %e,
-                "Failed to stage changes after review — continuing",
+                "Failed to stage changes after review — reviewed base not recorded",
             );
         } else {
-            debug!(
-                ticket = %ticket.id,
-                "Staged all changes after review",
-            );
+            let head = run_git_head(repo_path).await.ok().flatten();
+            let tree = run_git_write_tree(repo_path).await.ok().flatten();
+            if head.is_none() || tree.is_none() {
+                warn!(
+                    ticket = %ticket.id,
+                    head = head.is_some(),
+                    tree = tree.is_some(),
+                    "Could not compute content identity after review — reviewed base not recorded",
+                );
+            } else if let Err(e) = board()
+                .set_reviewed_base(&ticket.id, head.as_deref(), tree.as_deref())
+                .await
+            {
+                warn!(
+                    ticket = %ticket.id,
+                    error = %e,
+                    "Failed to record reviewed base — later rounds will re-review",
+                );
+            } else {
+                debug!(
+                    ticket = %ticket.id,
+                    "Recorded reviewed base after review",
+                );
+            }
         }
     }
 }

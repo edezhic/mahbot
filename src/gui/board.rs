@@ -1779,6 +1779,8 @@ mod tests {
             is_archived: false,
             pipeline_reservation: false,
             priority: 0,
+            reviewed_head: None,
+            reviewed_tree: None,
         });
         state
     }
@@ -2014,6 +2016,8 @@ mod tests {
             is_archived: false,
             pipeline_reservation: false,
             priority: 0,
+            reviewed_head: None,
+            reviewed_tree: None,
         };
         let _task = state.update(BoardMessage::TicketDetails(Box::new(ticket)));
 
@@ -2061,6 +2065,8 @@ mod tests {
             is_archived: false,
             pipeline_reservation: false,
             priority: 0,
+            reviewed_head: None,
+            reviewed_tree: None,
         });
 
         // First Escape: focused → blur (clear flag), modal stays open
@@ -2197,6 +2203,8 @@ mod tests {
             is_archived: false,
             pipeline_reservation: false,
             priority: 0,
+            reviewed_head: None,
+            reviewed_tree: None,
         }];
         state.search_generation = 5;
 
@@ -2250,6 +2258,8 @@ mod tests {
                 is_archived: false,
                 pipeline_reservation: false,
                 priority: 0,
+                reviewed_head: None,
+                reviewed_tree: None,
             }],
             50,
         ));
@@ -2287,6 +2297,8 @@ mod tests {
                 is_archived: false,
                 pipeline_reservation: false,
                 priority: 0,
+                reviewed_head: None,
+                reviewed_tree: None,
             }],
             42,
         ));
@@ -2319,6 +2331,8 @@ mod tests {
             is_archived: false,
             pipeline_reservation: false,
             priority: 0,
+            reviewed_head: None,
+            reviewed_tree: None,
         }];
         state.search_generation = 7;
 

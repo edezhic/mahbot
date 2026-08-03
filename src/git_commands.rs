@@ -295,6 +295,29 @@ pub async fn run_git_add_all(repo_path: &Path) -> anyhow::Result<String> {
     run_git_command(repo_path, &["add", "-A"]).await
 }
 
+/// Run `git rev-parse HEAD` and return the trimmed commit hash.
+///
+/// Returns `None` when HEAD cannot be resolved (e.g. a repository with no
+/// commits yet). Callers must treat `None` as unknown — never as a match.
+pub async fn run_git_head(repo_path: &Path) -> anyhow::Result<Option<String>> {
+    match run_git_command(repo_path, &["rev-parse", "HEAD"]).await {
+        Ok(out) => Ok(Some(out.trim().to_string())),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Run `git write-tree` and return the trimmed index tree hash.
+///
+/// The tree hash identifies the exact staged content (index). Returns `None`
+/// when the index cannot be written (e.g. unmerged entries). Callers must
+/// treat `None` as unknown — never as a match.
+pub async fn run_git_write_tree(repo_path: &Path) -> anyhow::Result<Option<String>> {
+    match run_git_command(repo_path, &["write-tree"]).await {
+        Ok(out) => Ok(Some(out.trim().to_string())),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Stage all changes and commit with the given message.
 /// Runs `git add -A` followed by `git commit -m "<msg>"`,
 /// then captures the full SHA via `git rev-parse HEAD` and
@@ -757,6 +780,49 @@ mod tests {
 
         let has = git_has_commits(&repo_path).await.expect("git_has_commits");
         assert!(!has, "empty repo should not have commits");
+    }
+
+    #[tokio::test]
+    async fn test_run_git_head_and_write_tree_fingerprint() {
+        let (_dir, repo_path) = init_temp_repo();
+        let head1 = run_git_head(&repo_path)
+            .await
+            .expect("head query")
+            .expect("repo has commits");
+        let tree1 = run_git_write_tree(&repo_path)
+            .await
+            .expect("tree query")
+            .expect("index writable");
+
+        // Staged content change → new index tree, unchanged HEAD.
+        std::fs::write(repo_path.join("test.txt"), b"line1\nline2\n").expect("write file");
+        run_git_add_all(&repo_path).await.expect("git add");
+        let head2 = run_git_head(&repo_path)
+            .await
+            .expect("head query")
+            .expect("repo has commits");
+        let tree2 = run_git_write_tree(&repo_path)
+            .await
+            .expect("tree query")
+            .expect("index writable");
+        assert_eq!(head1, head2, "staging must not change HEAD");
+        assert_ne!(tree1, tree2, "staging must change the index tree");
+    }
+
+    #[tokio::test]
+    async fn test_run_git_head_none_without_commits() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let repo_path = dir.path().to_path_buf();
+
+        let status = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&repo_path)
+            .status()
+            .expect("git init");
+        assert!(status.success());
+
+        let head = run_git_head(&repo_path).await.expect("head query");
+        assert!(head.is_none(), "commit-less repo must not resolve HEAD");
     }
 
     #[tokio::test]
