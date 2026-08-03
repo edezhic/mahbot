@@ -406,6 +406,8 @@ fn extract_urls(text: &str) -> Vec<String> {
 /// Links are fetched concurrently using the shared `BrowserTool` — each URL
 /// gets its own isolated session tab that is closed after text extraction.
 pub async fn enrich_links(content: &str) -> Cow<'_, str> {
+    // Truncate very long snippets to keep messages manageable.
+    const MAX_TEXT_LEN: usize = 5000;
     let urls = extract_urls(content);
     if urls.is_empty() {
         return Cow::Borrowed(content);
@@ -443,8 +445,11 @@ pub async fn enrich_links(content: &str) -> Cow<'_, str> {
     for task in tasks {
         match task.await {
             Ok((url, Ok(body_text))) => {
-                // Truncate very long text to keep messages manageable.
-                const MAX_TEXT_LEN: usize = 5000;
+                if body_text.trim().is_empty() {
+                    // Blank/empty page — don't insert an empty snippet.
+                    tracing::debug!(url, "Link enricher: page text is empty, skipping snippet");
+                    continue;
+                }
                 let snippet = if body_text.len() > MAX_TEXT_LEN {
                     let end = body_text.floor_char_boundary(MAX_TEXT_LEN);
                     format!("{}…", &body_text[..end])

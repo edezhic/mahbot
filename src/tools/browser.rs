@@ -21,6 +21,8 @@ struct BrowserResponse {
     success: bool,
     data: Option<Value>,
     error: Option<String>,
+    /// Stable error-envelope code (v1.5.78+) — present on structured errors.
+    code: Option<String>,
 }
 
 /// Actions for navigating and extracting content from web pages.
@@ -138,7 +140,11 @@ impl BrowserTool {
         // concurrent same-tab access doesn't race between navigation
         // and text extraction.
         let _guard = self.acquire_tab_lock(tab).await;
-        self.run_command(&["open", url], Some(tab)).await?;
+        let opened = self.run_command(&["open", url], Some(tab)).await?;
+
+        // A real navigation attempt that ends on the scratch `about:blank`
+        // never committed — fail loudly instead of returning empty content.
+        self.bail_on_blank_navigation(tab, url, &opened).await?;
 
         // Wait for network idle (best-effort — no hard error on timeout).
         let _ = self
@@ -154,6 +160,32 @@ impl BrowserTool {
     /// Close a browser session tab by name (best-effort).
     pub async fn close_session(&self, tab: &str) {
         let _ = self.run_command(&["close"], Some(tab)).await;
+    }
+
+    /// If the response shows the tab still on the scratch `about:blank` page,
+    /// the navigation never committed — close the session (best-effort) and
+    /// fail with the cause. No-op when the navigation committed.
+    async fn bail_on_blank_navigation(
+        &self,
+        tab: &str,
+        url: &str,
+        response: &BrowserResponse,
+    ) -> anyhow::Result<()> {
+        if response
+            .data
+            .as_ref()
+            .and_then(|d| d.get("url"))
+            .and_then(Value::as_str)
+            .is_some_and(is_blank_page_url)
+        {
+            self.close_session(tab).await;
+            anyhow::bail!(
+                "Navigation failed: the tab is still on a blank page after opening {url} — the \
+                 page never loaded. This usually means the site is unreachable or blocks \
+                 automated navigation, or the chrome-use extension relay is down."
+            );
+        }
+        Ok(())
     }
 
     /// Fail with an actionable error when the chrome-use CLI is missing or the
@@ -221,16 +253,19 @@ impl BrowserTool {
         // get a meaningful error, fall back to stderr-only bail otherwise.
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let error_msg = match serde_json::from_str::<BrowserResponse>(&stdout) {
-                Ok(resp) => resp.error.unwrap_or_default(),
-                Err(_) => stderr.trim().to_string(),
+            let (error_msg, code) = match serde_json::from_str::<BrowserResponse>(&stdout) {
+                Ok(resp) => {
+                    let BrowserResponse { error, code, .. } = resp;
+                    (error.unwrap_or_default(), code)
+                }
+                Err(_) => (stderr.trim().to_string(), None),
             };
             let error_msg = if error_msg.is_empty() {
                 format!("chrome-use exited with code {}", output.status)
             } else {
                 enhance_browser_error(error_msg)
             };
-            Self::fail_fast_if_daemon_down(&error_msg)?;
+            Self::fail_fast_if_daemon_down(&error_msg, code.as_deref())?;
             anyhow::bail!("chrome-use error: {error_msg}");
         }
 
@@ -240,20 +275,22 @@ impl BrowserTool {
         if !response.success {
             let err = response.error.as_deref().unwrap_or("unknown error");
             let enhanced = enhance_browser_error(err.to_string());
-            Self::fail_fast_if_daemon_down(&enhanced)?;
+            Self::fail_fast_if_daemon_down(&enhanced, response.code.as_deref())?;
             anyhow::bail!("chrome-use error: {enhanced}");
         }
 
         Ok(response)
     }
 
-    /// If an error carries the daemon-unavailable signature, mark the daemon
-    /// unhealthy (wakes the auto-recovery watchdog) and return the actionable
-    /// guidance immediately — the CLI already retried internally, so adding
-    /// more retries would only burn more time.
-    fn fail_fast_if_daemon_down(error: &str) -> anyhow::Result<()> {
-        if super::browser_daemon::is_daemon_unavailable_error(error) {
-            super::browser_daemon::note_unhealthy();
+    /// If an error carries the daemon-unavailable signature or envelope code,
+    /// mark the daemon unhealthy (wakes the auto-recovery watchdog) and return
+    /// the actionable guidance immediately — the CLI already retried
+    /// internally, so adding more retries would only burn more time.
+    fn fail_fast_if_daemon_down(error: &str, code: Option<&str>) -> anyhow::Result<()> {
+        if super::browser_daemon::is_daemon_unavailable_error(error)
+            || super::browser_daemon::is_daemon_unavailable_code(code)
+        {
+            super::browser_daemon::note_unhealthy(error);
             anyhow::bail!("{}", super::browser_daemon::daemon_down_message());
         }
         Ok(())
@@ -742,6 +779,13 @@ impl Tool for BrowserTool {
         let str_args: Vec<&str> = cli_args.iter().map(String::as_str).collect();
         let response = self.run_command(&str_args, Some(&tab)).await?;
 
+        // A real navigation attempt that ends on the scratch `about:blank`
+        // never committed — fail loudly (and close the tab best-effort)
+        // instead of reporting success with no content.
+        if let BrowserAction::Open { url } = &action {
+            self.bail_on_blank_navigation(&tab, url, &response).await?;
+        }
+
         // After open, wait for network idle, then auto-snapshot
         // so the LLM sees page content immediately.
         let snapshot_output = if matches!(action, BrowserAction::Open { .. }) {
@@ -811,6 +855,15 @@ impl BrowserTool {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
+
+/// A navigation that ends here never committed — the tab stayed on the scratch
+/// `about:blank` page (relay broken, navigation blocked, etc.). Keyed on the
+/// final URL only, so legitimately content-free pages (image URLs, PDFs, canvas
+/// shells) are not false-flagged by having zero extracted text.
+fn is_blank_page_url(url: &str) -> bool {
+    let url = url.trim();
+    url.is_empty() || url.starts_with("about:blank")
+}
 
 /// Enhance chrome-use error messages with actionable hints for known
 /// failure patterns.
@@ -1739,6 +1792,19 @@ mod tests {
     }
 
     #[test]
+    fn blank_page_url_predicate() {
+        // Scratch/about pages that never committed are blank-page failures.
+        assert!(is_blank_page_url("about:blank"));
+        assert!(is_blank_page_url("about:blank#blocked"));
+        assert!(is_blank_page_url(""));
+        // Real pages — even ones that render no text — are NOT blank failures
+        // (image URLs, PDFs, canvas shells).
+        assert!(!is_blank_page_url("https://example.com/image.png"));
+        assert!(!is_blank_page_url("https://example.com/file.pdf"));
+        assert!(!is_blank_page_url("about:srcdoc"));
+    }
+
+    #[test]
     fn missing_or_empty_tab_defaults_to_default() {
         // Missing tab → documented default session, echoed in tool output.
         let (tab, note) = normalize_tab(&json!({"action":{"open":{"url":"https://example.com"}}}));
@@ -1789,6 +1855,7 @@ mod tests {
         // unhealthy (wakes the auto-recovery watchdog).
         let err = BrowserTool::fail_fast_if_daemon_down(
             "Failed to read: Resource temporarily unavailable (os error 35) (after 5 retries - daemon may be busy or unresponsive)",
+            None,
         )
         .unwrap_err();
         assert!(
@@ -1796,9 +1863,34 @@ mod tests {
             "expected guidance message, got: {err}"
         );
         assert!(!crate::tools::browser_daemon::is_advertised());
-        // Non-daemon errors pass through untouched.
+        // The unambiguous daemon-side envelope code fails fast too (no message
+        // matching).
+        let err = BrowserTool::fail_fast_if_daemon_down(
+            "chrome-use error: browser not launched",
+            Some("browser_not_launched"),
+        )
+        .unwrap_err();
         assert!(
-            BrowserTool::fail_fast_if_daemon_down("chrome-use error: Element not found").is_ok()
+            err.to_string().contains("browser daemon is down"),
+            "expected guidance message, got: {err}"
+        );
+        // Site-level failures — even ones carrying the coarse `connection_failed`
+        // code (the CLI assigns it to any "connection" text) — pass through as
+        // truthful navigation failures and leave the daemon healthy.
+        assert!(
+            BrowserTool::fail_fast_if_daemon_down(
+                "chrome-use error: Navigation failed: net::ERR_CONNECTION_REFUSED",
+                Some("connection_failed"),
+            )
+            .is_ok()
+        );
+        assert!(
+            BrowserTool::fail_fast_if_daemon_down("chrome-use error: Element not found", None)
+                .is_ok()
+        );
+        assert!(
+            BrowserTool::fail_fast_if_daemon_down("chrome-use error: timed out", Some("timeout"))
+                .is_ok()
         );
         // Restore the global health singleton so later agent-constructing
         // tests don't inherit a hidden browser tool.
