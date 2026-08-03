@@ -323,7 +323,6 @@ impl Role {
             }
             Role::Artist => {
                 vec![
-                    Box::new(BrowserTool::default()),
                     Box::new(SearchTool),
                     Box::new(ImageGenTool),
                     Box::new(VideoGenTool),
