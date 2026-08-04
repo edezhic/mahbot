@@ -40,13 +40,13 @@
 //! there is no re-baseline ceremony.
 //!
 //! First run populates the TTS audio cache (~14-17 min); subsequent runs
-//! complete in ~30-40 s (bench body — Phase 13's cooldown probes add ~6.5 s of
-//! excluded-from-timing sleeps: 2.5 s suppression + 3.5 s recovery probes both
-//! measured from Detection 1's timestamp (overlapping, max ≈ 3.5 s); the
-//! Phase-1 held-out recall set + cross-speaker probe matrix land warm runs at
-//! ~36 s) plus the build time; the exact figure is auditable from the
-//! top-level `total_wall_time_ms` key (whole run, report-assembly window
-//! included).  The first run after a recipe change is a cold
+//! complete in the tens of seconds (the expanded TEST surface — 40-clip
+//! wake-only basis, SNR envelope over it, doubled negative pools,
+//! wake-over-babble, owner-negative detection, probe scale-up — structurally
+//! exceeds the ~39 s report-only budget figure; the figure stays untouched by
+//! design); the exact wall clock is auditable
+//! from the top-level `total_wall_time_ms` key (whole run, report-assembly
+//! window included).  The first run after a recipe change is a cold
 //! embedding cache (versioned keys all miss) — the budget is verified on that
 //! cold run, and the one-time TTS synthesis for new owner-negative phrases is
 //! paid outside the warm budget.
@@ -367,14 +367,14 @@ impl GuidedPromptGroup {
 ///
 /// Report-only target: the enrolled-speaker held-out recall (unseen
 /// renderings of the enrolled voice) is compared against this in the report
-/// banner; the 0.2 granularity reflects the 16-clip wake-only held-out recall
-/// set, where each miss costs roughly 6 percentage points.
+/// banner; the 0.2 granularity reflects the 40-clip wake-only held-out recall
+/// set, where each miss costs roughly 2.5 percentage points.
 const MIN_DETECTION_RATE: f64 = 0.60;
 
 /// Acceptance-basis prefix for the current report series.
-/// `cross_run_summary` filters archives by this so v2 wake-only runs never mix
-/// with v1 24-clip archives in the ≥3-run spread.
-const ACCEPTANCE_BASIS_PREFIX: &str = "held_out_recall_v2";
+/// `cross_run_summary` filters archives by this so v3 (enlarged 40-clip basis)
+/// runs never mix with v2 16-clip archives in the ≥3-run spread.
+const ACCEPTANCE_BASIS_PREFIX: &str = "held_out_recall_v3";
 
 // Per-category false accept limits are now dynamic by tier — see
 // [`tier_limits`] and [`BenchTier`] (mahbot-871).
@@ -392,8 +392,13 @@ const CONFUSABLE_EASY: &[&str] = super::CONFUSABLE_EASY;
 /// Uses the canonical list from the parent `voice` module (mahbot-872).
 const UNRELATED_PHRASES: &[&str] = super::UNRELATED_PHRASES;
 
-/// Silence audio length in samples (1 second at 16 kHz).
-const SILENCE_LEN: usize = 16_000;
+/// Silence durations for the negative silence matrix: three
+/// durations in samples at 16 kHz (0.5 s / 1.0 s / 2.0 s).
+const SILENCE_DURATIONS: &[(&str, usize)] = &[
+    ("silence_0_5s", 8_000),
+    ("silence_1_0s", 16_000),
+    ("silence_2_0s", 32_000),
+];
 
 /// Noise audio length in samples (1 second at 16 kHz).
 const NOISE_LEN: usize = 16_000;
@@ -404,6 +409,9 @@ const NOISE_LEN: usize = 16_000;
 /// produces PCM f32 samples at 16 kHz.
 type NoiseGenerator = fn() -> Vec<f32>;
 
+/// Training noise profiles.  This list feeds classifier training via
+/// [`generate_ambient_noise_sequences`] — the detection-only additions
+/// ([`NOISE_PROFILES_DETECTION_ONLY`]) must never be appended here.
 const NOISE_PROFILES: &[(&str, NoiseGenerator)] = &[
     ("white uniform noise", generate_white_uniform_noise),
     ("white gaussian noise", generate_white_gaussian_noise),
@@ -416,6 +424,24 @@ const NOISE_PROFILES: &[(&str, NoiseGenerator)] = &[
     ("modulated noise", generate_modulated_noise),
     ("high-frequency hiss", generate_high_freq_hiss),
 ];
+
+/// Detection-only noise profiles: fresh generator seeds 52-55.  Chained after
+/// [`NOISE_PROFILES`] at the detection call sites — never appended to the
+/// training list.
+const NOISE_PROFILES_DETECTION_ONLY: &[(&str, NoiseGenerator)] = &[
+    ("impulse burst noise", generate_impulse_burst_noise),
+    ("oscillating tone noise", generate_oscillating_tone_noise),
+    ("crackle static noise", generate_crackle_static_noise),
+    ("pulsed broadband noise", generate_pulsed_broadband_noise),
+];
+
+/// All noise profiles for the detection call sites: the training list plus
+/// the detection-only additions (training never sees the latter).  Single
+/// owner of the "detection enumerations include the detection-only profiles"
+/// invariant.
+fn all_noise_profiles() -> impl Iterator<Item = &'static (&'static str, NoiseGenerator)> {
+    NOISE_PROFILES.iter().chain(NOISE_PROFILES_DETECTION_ONLY)
+}
 
 /// TTS target sample rate (voice pipeline rate).
 const TARGET_SAMPLE_RATE: u32 = 16_000;
@@ -444,6 +470,22 @@ const NOISE_OVERLAP_TYPES: &[(&str, NoiseGenerator)] = &[
     ("pink", generate_pink_noise),
     ("brown", generate_brown_noise),
 ];
+
+/// Overlapping-speech babble phrases: non-wake speech rendered by the bench's
+/// existing TTS voices, mixed with held-out wake clips as a speech-on-speech
+/// interferer.  Self-contained — no external audio assets.
+const BABBLE_PHRASES: &[&str] = &[
+    "let me tell you about the meeting tomorrow",
+    "could you pass the remote control please",
+    "the weather today is surprisingly warm",
+];
+
+/// Babble overlay seed base (9500+ — collision-free; owner-negative training
+/// uses 9000-9029).
+const BABBLE_SEED_BASE: u64 = 9500;
+
+/// SNR levels for the wake-over-babble cells (dB).
+const BABBLE_SNRS: &[(&str, f32)] = &[("10dB", 10.0), ("5dB", 5.0), ("0dB", 0.0)];
 
 // ── Tiered benchmark configuration (mahbot-871) ────────────────────────────
 
@@ -527,6 +569,24 @@ fn phrase_from_label<'a>(label: &'a str, prefix: &str) -> &'a str {
     }
     // No valid seed suffix found; return the full string after the prefix.
     after_prefix
+}
+
+/// Confusable seed band for a variant label ("confusable" or "confusable2").
+fn confusable_band(label: &str) -> &str {
+    if label.starts_with("confusable2_") {
+        "confusable2"
+    } else {
+        "confusable"
+    }
+}
+
+/// Extract the phrase text from a confusable-band variant label.  The
+/// detection pool spans two seed bands: band 1 labels use the "confusable"
+/// prefix, band 2 uses "confusable2" (a distinct prefix, not a re-key of
+/// existing clips).  Both parse to the same phrase text so [`tier_for_phrase`]
+/// lookup works for either band.
+fn confusable_phrase(label: &str) -> &str {
+    phrase_from_label(label, confusable_band(label))
 }
 
 /// Determine the difficulty tier for a confusable phrase.
@@ -720,8 +780,11 @@ fn generate_enrollment_variants_cached(
     variants
 }
 
-/// Wake-only held-out recall clip count (seeds 3000..3000+N).
-const HELD_OUT_WAKE_ONLY_CLIPS: usize = 16;
+/// Wake-only held-out recall clip count (seeds 3000..3000+N).  Enlarged to
+/// 40: the original 16 clips (3000-3015) plus 24 new clips in the freed
+/// collision-free band (3016-3039).  The basis IS this enlarged set — there
+/// is no separate 16-clip sub-pool.
+const HELD_OUT_WAKE_ONLY_CLIPS: usize = 40;
 
 /// Generate the held-out recall set: unseen renderings of the ENROLLED voice
 /// at collision-free seeds (3000+ — avoids 100-109 enrollment, 800+ detection
@@ -803,6 +866,38 @@ fn generate_cross_speaker_probe_clips_cached(
         }
     }
     clips
+}
+
+/// Generate the wake-over-babble overlay track: non-wake phrases rendered by
+/// the bench's existing TTS voices, concatenated into one multi-voice babble
+/// segment.  Self-contained — no external audio assets.  The wake clips are
+/// mixed against this track in-memory at the babble SNR cells; only the
+/// babble clips themselves enter the PCM cache.
+fn generate_babble_overlay_cached(
+    available_styles: &[String],
+    model_hash: &str,
+    cache_dir: &std::path::Path,
+) -> Option<Vec<f32>> {
+    let num_styles = available_styles.len().max(1);
+    let mut track: Vec<f32> = Vec::new();
+    for (i, &phrase) in BABBLE_PHRASES.iter().enumerate() {
+        let style = if available_styles.is_empty() {
+            DEFAULT_TTS_STYLE
+        } else {
+            &available_styles[(i * 2) % num_styles]
+        };
+        if let Some(pcm) = synthesize_wake_word_variant_cached(
+            phrase,
+            style,
+            BABBLE_SEED_BASE + i as u64,
+            TARGET_SAMPLE_RATE,
+            model_hash,
+            cache_dir,
+        ) {
+            track.extend_from_slice(&pcm);
+        }
+    }
+    (!track.is_empty()).then_some(track)
 }
 
 /// Seed configuration for TTS phrase variant generation.
@@ -1006,6 +1101,70 @@ fn generate_high_freq_hiss() -> Vec<f32> {
             let hiss = 0.9 * (white - prev) + 0.8 * prev;
             prev = white;
             hiss.clamp(-1.0, 1.0)
+        })
+        .collect()
+}
+
+// Detection-only noise profiles: fresh generator seeds 52-55.  These live in
+// [`NOISE_PROFILES_DETECTION_ONLY`] only — appending them to
+// [`NOISE_PROFILES`] would silently extend classifier training.
+
+/// Impulse burst noise: sparse broadband clicks.
+fn generate_impulse_burst_noise() -> Vec<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(52);
+    (0..NOISE_LEN)
+        .map(|_| {
+            if rng.random::<f32>() < 0.02 {
+                (rng.random::<f32>() * 2.0 - 1.0).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+/// Oscillating tone noise: slow frequency sweep mixed with white noise.
+fn generate_oscillating_tone_noise() -> Vec<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(53);
+    (0..NOISE_LEN)
+        .map(|i| {
+            let t = i as f32 / TARGET_SAMPLE_RATE as f32;
+            let freq = 200.0 + 300.0 * (2.0 * core::f32::consts::PI * 0.5 * t).sin();
+            let tone = (2.0 * core::f32::consts::PI * freq * t).sin() * 0.3;
+            let noise: f32 = rng.random::<f32>() * 2.0 - 1.0;
+            (tone + noise * 0.5).clamp(-1.0, 1.0)
+        })
+        .collect()
+}
+
+/// Crackle static noise: sparse high-amplitude transients over a quiet floor.
+fn generate_crackle_static_noise() -> Vec<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(54);
+    let mut prev: f32 = 0.0;
+    (0..NOISE_LEN)
+        .map(|_| {
+            let white = rng.random::<f32>() * 2.0 - 1.0;
+            let crackle = if rng.random::<f32>() < 0.005 {
+                white * 3.0
+            } else {
+                white * 0.1
+            };
+            let hi = 0.9 * (crackle - prev) + 0.8 * prev;
+            prev = crackle;
+            hi.clamp(-1.0, 1.0)
+        })
+        .collect()
+}
+
+/// Pulsed broadband noise: white noise gated by a slow square envelope.
+fn generate_pulsed_broadband_noise() -> Vec<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(55);
+    (0..NOISE_LEN)
+        .map(|i| {
+            let t = i as f32 / TARGET_SAMPLE_RATE as f32;
+            let gate = if (t * 2.0).sin() > 0.0 { 1.0 } else { 0.0 };
+            let noise: f32 = rng.random::<f32>() * 2.0 - 1.0;
+            (noise * gate).clamp(-1.0, 1.0)
         })
         .collect()
 }
@@ -2890,14 +3049,20 @@ fn mix_at_snr(speech: &[f32], noise: &[f32], snr_db: f32) -> Vec<f32> {
 }
 
 /// One channel-condition cell for [`run_detection_matrix`]: either a
-/// pre-generated noise buffer mixed at a target SNR (noise-overlap matrix) or
-/// seeded white noise per clip (cross-speaker probe matrix).
+/// pre-generated noise buffer mixed at a target SNR (noise-overlap matrix),
+/// seeded white noise per clip (cross-speaker probe matrix), or a per-clip
+/// slice of a babble track (wake-over-babble).
 enum CellMix {
     /// `mix_at_snr(pcm, noise, snr_db)` — infinite SNR returns speech unchanged.
     AtSnr { noise: Vec<f32>, snr_db: f32 },
     /// `add_noise_white_pink(pcm, snr, White, seed_base + clip_index)`, or the
     /// clip unchanged when `snr_db` is None (clean cell).
     SeededWhite { snr_db: Option<f32>, seed_base: u64 },
+    /// Clip `i` mixes against a `~pcm.len()`-long slice of the babble track at
+    /// `i * (track.len() - slice_len) / clips.len()` so the full multi-voice
+    /// track is sampled across the set (and SNR is computed on the actual
+    /// mixed window, not the whole track).
+    Babble { track: Vec<f32>, snr_db: f32 },
 }
 
 /// Shared per-cell streaming-detection loop for the noise-overlap and
@@ -2938,6 +3103,16 @@ fn run_detection_matrix(
                     ),
                     None => pcm.clone(),
                 },
+                CellMix::Babble { track, snr_db } => {
+                    let n = pcm.len().min(track.len());
+                    let span = track.len() - n;
+                    let start = if span > 0 {
+                        (i * span) / clips.len()
+                    } else {
+                        0
+                    };
+                    mix_at_snr(pcm, &track[start..start + n], *snr_db)
+                }
             };
             metrics.total += 1;
 
@@ -3000,13 +3175,14 @@ fn run_detection_matrix(
 /// Run noise-overlapped detection tests.
 ///
 /// For each combination of SNR level and noise type, mix the wake word
-/// variants with the noise and test detection.  Returns `(key, rate,
-/// per_variant_detail)` per combination so per-variant peak scores are
-/// available for false-reject root-causing (mahbot-1005 §8).
+/// variants with the noise and test detection.  Returns the
+/// `(key, rate, detected, per_variant_detail)` cell shape of
+/// [`run_detection_matrix`] so callers get the per-cell detection count
+/// without re-parsing the per-variant detail (mahbot-1005 §8).
 fn run_noise_overlap_test(
     positive_variants: &[(Vec<f32>, String)],
     classifier: &WakeWordClassifier,
-) -> Vec<(String, f64, Vec<serde_json::Value>)> {
+) -> Vec<(String, f64, usize, Vec<serde_json::Value>)> {
     let mut cells: Vec<(String, CellMix)> = Vec::new();
     for (snr_label, snr_db) in NOISE_OVERLAP_SNRS {
         for (i, (noise_label, noise_gen)) in NOISE_OVERLAP_TYPES.iter().enumerate() {
@@ -3032,33 +3208,38 @@ fn run_noise_overlap_test(
         "noise_overlap",
         "Noise overlap",
     )
-    .into_iter()
-    .map(|(key, rate, _detected, detail)| (key, rate, detail))
-    .collect()
 }
 
 /// Cross-speaker probe matrix: held-out RESERVED voices at
-/// unseen seeds across clean + 10/20 dB white conditions (warm pass, shared
+/// unseen seeds across clean + 5/10/20 dB white conditions (warm pass, shared
 /// adaptive — same methodology as the canary matrix).  The reserved voices
 /// are absent from EVERY training path.  Cross-speaker detections are CORRECT
 /// speaker-blind behaviour (the wake word fires for any speaker), so the
 /// matrix is a DIAGNOSTIC (high detection expected), not a false-accept gate.
 ///
-/// Returns the per-cell results in the same `(key, rate, detail)` shape as
-/// [`run_noise_overlap_test`] plus the total detection count.
+/// Returns the per-cell `(key, rate, detected, detail)` shape of
+/// [`run_detection_matrix`].
 fn run_cross_speaker_probe_matrix(
     probe_clips: &[(Vec<f32>, String)],
     classifier: &WakeWordClassifier,
-) -> (Vec<(String, f64, Vec<serde_json::Value>)>, usize) {
-    // 3 channel conditions per probe clip (clean + 10/20 dB white — the same
+) -> Vec<(String, f64, usize, Vec<serde_json::Value>)> {
+    // 4 channel conditions per probe clip (clean + 5/10/20 dB white — the same
     // vocabulary as the cross-speaker training-condition set so the probe is
-    // apples-to-apples with the trained-in canaries).
+    // apples-to-apples with the trained-in canaries; the 5 dB cell is an
+    // additional probe condition).
     let cells = [
         (
             "clean".to_string(),
             CellMix::SeededWhite {
                 snr_db: None,
                 seed_base: 0,
+            },
+        ),
+        (
+            "5db_white".to_string(),
+            CellMix::SeededWhite {
+                snr_db: Some(5.0),
+                seed_base: 7200,
             },
         ),
         (
@@ -3076,20 +3257,12 @@ fn run_cross_speaker_probe_matrix(
             },
         ),
     ];
-    let cells_out = run_detection_matrix(
+    run_detection_matrix(
         probe_clips,
         classifier,
         &cells,
         "cross_speaker_probe",
         "Cross-speaker probe",
-    );
-    let fa_count: usize = cells_out.iter().map(|(_, _, detected, _)| *detected).sum();
-    (
-        cells_out
-            .into_iter()
-            .map(|(key, rate, _detected, detail)| (key, rate, detail))
-            .collect(),
-        fa_count,
     )
 }
 
@@ -3099,36 +3272,43 @@ fn run_cross_speaker_probe_matrix(
 /// (cross-speaker cells — speaker-blindness, high detection expected).
 fn warn_fa_cells(
     label: &str,
-    results: &[(String, f64, Vec<serde_json::Value>)],
+    results: &[(String, f64, usize, Vec<serde_json::Value>)],
     total_variants: usize,
     tail: &str,
     warn: bool,
 ) {
-    for (key, rate, detail) in results {
-        let fas = detail
-            .iter()
-            .filter(|v| {
-                v.get("detected")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-            })
-            .count();
-        if warn && fas > 0 {
+    for (key, rate, detected, detail) in results {
+        if warn && *detected > 0 {
             warn!(
-                "{label} FA: {key} accepted {fas}/{detail_len} cells \
+                "{label} FA: {key} accepted {detected}/{detail_len} cells \
                  (rate {rate_pct:.1}%) — target 0/{total_variants} per fresh run{tail}",
                 detail_len = detail.len(),
                 rate_pct = rate * 100.0,
             );
         } else {
             info!(
-                "{label} diagnostic: {key} detected {fas}/{detail_len} cells \
+                "{label} diagnostic: {key} detected {detected}/{detail_len} cells \
                  (rate {rate_pct:.1}%) — speaker-blindness, high detection expected{tail}",
                 detail_len = detail.len(),
                 rate_pct = rate * 100.0,
             );
         }
     }
+}
+
+/// Map one detection-matrix cell to its report JSON, using the returned
+/// per-cell detection count (no per-variant re-parse).
+fn cell_json(
+    (key, rate, detected, detail): &(String, f64, usize, Vec<serde_json::Value>),
+) -> (String, serde_json::Value) {
+    (
+        key.clone(),
+        serde_json::json!({
+            "detection_rate": rate,
+            "detected": detected,
+            "per_variant": detail,
+        }),
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3374,10 +3554,11 @@ fn run_enrolled_speaker_phase(
         },
         "acceptance": {
             "basis": format!(
-                "held_out_recall_v2 — {} unseen enrolled-voice wake-only clips, seeds \
-                 3000+; embedded-in-sentence detection removed (not a product \
-                 requirement); the in-sample F1 control is removed (all enrollment clips \
-                 are training data)",
+                "held_out_recall_v3 — {} unseen enrolled-voice wake-only clips, seeds \
+                 3000+ (enlarged from v2's 16 clips — the basis IS the \
+                 enlarged set, no 16-clip sub-pool); embedded-in-sentence detection \
+                 removed (not a product requirement); the in-sample F1 control is \
+                 removed (all enrollment clips are training data)",
                 total,
             ),
             "total_variants": total,
@@ -3394,8 +3575,8 @@ fn run_enrolled_speaker_phase(
                 MIN_DETECTION_RATE * 100.0,
             ),
             "note": "detected_live = end-to-end through the real cold pass (the \
-                     acceptance metric).  Bumped to v2 (16 wake-only clips): never \
-                     compared against v1 24-clip archives.",
+                     acceptance metric).  Bumped to v3 (40 wake-only clips): \
+                     never compared against v2 16-clip archives.",
         },
         "paths": {
             "burst": burst_path,
@@ -3485,20 +3666,30 @@ fn safety_gate(all_neg_pv: &[(&PerVariantResult, String)]) -> serde_json::Value 
                  (deferred burst + boundary fallback double-scoring) on the \
                  negative/confusable set.  Baseline (mahbot-1022, pre-deferral): \
                  9/59 classifier gate crossings, 0 end-to-end false accepts.  \
-                 The gate crossing count is EXPECTED to change under the \
-                 deferral — it must be measured, not assumed.  Per-utterance \
-                 accounting (manager pin 7): the acceptance denominator is \
-                 utterances, not frames.",
+                 The test-surface expansion doubled the confusable/unrelated \
+                 pools, made silence a 3-duration matrix, and added 4 \
+                 detection-only noise profiles — the counts are measured over \
+                 the enlarged corpus, so the 59-clip baseline is historical \
+                 context only.  The gate crossing count is EXPECTED to change \
+                 under the deferral — it must be measured, not assumed.  \
+                 Per-utterance accounting (manager pin 7): the acceptance \
+                 denominator is utterances, not frames.",
         "total_negatives": total,
         "classifier_gate_crossings": gate_crossings,
         "baseline_gate_crossings": 9,
         "end_to_end_false_accepts": false_accepts.len(),
         "false_accept_list": false_accepts,
         "baseline_false_accepts": 0,
-        "acceptance": "<= 2/59 false accepts (5%) across >= 3 runs; every run with a \
-                       false accept must be investigated — no FA-bound breach may be \
-                       silently tolerated.  Gate crossings without an end-to-end \
-                       detection do NOT count as false accepts.",
+        "acceptance": format!(
+            "<= {allowance} false accepts (5% of the {total}-negative corpus — the \
+             rate is preserved, so the absolute allowance scales with the enlarged \
+             test corpus, explicitly acknowledged) across >= 3 runs; every run with \
+             a false accept must be investigated — no FA-bound breach may be silently \
+             tolerated.  Gate crossings without an end-to-end detection do NOT count \
+             as false accepts.",
+            allowance = (total as f64 * 0.05).ceil() as usize,
+            total = total,
+        ),
         "near_miss_canaries": {
             "classifier_gate_crossing_on_negative_corpus": gate_crossings,
             "fired": neg_canaries_fired,
@@ -3644,8 +3835,8 @@ fn numeric_distribution(values: &[f64]) -> serde_json::Value {
 /// default-run budget is unaffected — 3 × ~3 MB JSON parses, tens of ms.
 /// Corrupt/unreadable archives are skipped (the count says how many were
 /// usable).  Archives are additionally filtered by acceptance basis
-/// ([`ACCEPTANCE_BASIS_PREFIX`]) so v2 wake-only runs never mix with v1
-/// 24-clip archives in the ≥3-run spread.
+/// ([`ACCEPTANCE_BASIS_PREFIX`]) so v3 enlarged-basis runs never mix with v2
+/// 16-clip archives in the ≥3-run spread.
 fn cross_run_summary() -> serde_json::Value {
     let Ok(report_dir) = crate::config::default_config_dir() else {
         return serde_json::json!({"archives_found": 0, "note": "report dir unavailable"});
@@ -3752,9 +3943,9 @@ fn cross_run_summary() -> serde_json::Value {
         },
         "note": "Last 3 pre-existing timestamped archives (bounded so the default-run \
                  budget holds) filtered to the current acceptance basis \
-                 (ACCEPTANCE_BASIS_PREFIX) — v2 wake-only runs never mix with v1 \
-                 24-clip archives in the >=3-run spread.  The v2 \
-                 series starts fresh: until 3 v2 runs accumulate, the spread is \
+                 (ACCEPTANCE_BASIS_PREFIX) — v3 enlarged-basis runs never mix with v2 \
+                 16-clip archives in the >=3-run spread.  The v3 \
+                 series starts fresh: until 3 v3 runs accumulate, the spread is \
                  partial.",
     })
 }
@@ -4560,7 +4751,8 @@ pub(crate) fn run_internal() {
     // ── All 10 enrollment clips are training data ────────────────────────
     // The old 2/3 : 1/3 clip-level split is gone: every raw clip feeds
     // vad_segment_and_enroll (AGC → VAD → augment → embeddings).  Detection
-    // control re-bases onto the 16 held-out wake-only recall clips (Phase 7d),
+    // control re-bases onto the 40 held-out wake-only recall clips (Phase 7d,
+    // the enlarged set),
     // generated strictly after training at unseen seeds (3000+).
     let train_clips = enrollment_variants;
     info!(
@@ -4977,10 +5169,10 @@ pub(crate) fn run_internal() {
     let mut unrelated_metrics = DetectionMetrics::default();
     let mut silence_metric = DetectionMetrics::default();
     let mut noise_false_accepts: Vec<String> = Vec::new();
-    let mut noise_overlap_results: Vec<(String, f64, Vec<serde_json::Value>)> = Vec::new();
+    let mut noise_overlap_results: Vec<(String, f64, usize, Vec<serde_json::Value>)> = Vec::new();
     // held-out cross-speaker probe matrix (reserved voices) —
     // reported separately from the trained-in canary matrix.
-    let mut probe_overlap_results: Vec<(String, f64, Vec<serde_json::Value>)> = Vec::new();
+    let mut probe_overlap_results: Vec<(String, f64, usize, Vec<serde_json::Value>)> = Vec::new();
     let mut probe_fa_count: usize = 0;
     // Per-tier confusable fa tracking (mahbot-871). Populated after Phase 9.
     let mut conf_fa_by_tier: [Vec<String>; 3] = [Vec::new(), Vec::new(), Vec::new()];
@@ -5014,6 +5206,12 @@ pub(crate) fn run_internal() {
     // degenerate.
     let mut enrolled_report: Option<serde_json::Value> = None;
 
+    // Expanded TEST-surface report sections (report-only; filled inside the
+    // `!degenerate` block, emitted as `null`-free keys only when present).
+    let mut held_out_snr_envelope: Option<serde_json::Value> = None;
+    let mut overlapping_speech: Option<serde_json::Value> = None;
+    let mut owner_negative_detection: Option<serde_json::Value> = None;
+
     if !degenerate {
         // Create a pre-warmed adaptive threshold state shared across all
         // detection phases so the adaptive code path is exercised end-to-end
@@ -5042,7 +5240,7 @@ pub(crate) fn run_internal() {
         );
         let cross_speaker_probe_clips = generate_cross_speaker_probe_clips_cached(
             &voice_allocation.reserved,
-            10, // seeds per reserved voice
+            20, // seeds per reserved voice (scale-up)
             &model_version_hash,
             &cache_dir_path,
         );
@@ -5135,8 +5333,12 @@ pub(crate) fn run_internal() {
         let enrolled_ms = enrolled_start.elapsed().as_secs_f64() * 1000.0;
         eprintln!("  Enrolled-speaker phase completed in {enrolled_ms:.0}ms");
         // ── Phase 8: Detection — Confusable phrases ──────────────────────
+        // The detection pool spans two seed bands: band 1 (800+) with the
+        // "confusable" prefix, band 2 (810+) with the distinct "confusable2"
+        // prefix (the band must not re-key existing 800+ clips).  Both bands
+        // feed the same confusable false-accept tally and per-tier split.
         phase_start!("Phase 8: Negative — confusable phrases");
-        let confusable_variants = generate_phrase_variants_cached(
+        let mut confusable_variants = generate_phrase_variants_cached(
             CONFUSABLE_PHRASES,
             &available_styles,
             SeedConfig {
@@ -5148,8 +5350,20 @@ pub(crate) fn run_internal() {
             &model_version_hash,
             &cache_dir_path,
         );
+        confusable_variants.extend(generate_phrase_variants_cached(
+            CONFUSABLE_PHRASES,
+            &available_styles,
+            SeedConfig {
+                base_seed: 810,
+                num_variants: 1,
+                seed_variant: 0,
+            },
+            "confusable2",
+            &model_version_hash,
+            &cache_dir_path,
+        ));
         info!(
-            "Generated {} confusable phrase variants",
+            "Generated {} confusable phrase variants (2 seed bands: 800+, 810+)",
             confusable_variants.len()
         );
         test_detection_samples(
@@ -5162,15 +5376,18 @@ pub(crate) fn run_internal() {
         );
         // Split false accepts by tier for per-tier tracking (mahbot-871).
         for label in &conf_metrics.false_accepts {
-            let phrase = phrase_from_label(label, "confusable");
+            let phrase = confusable_phrase(label);
             let tier_idx = tier_for_phrase(phrase).index();
             conf_fa_by_tier[tier_idx].push(label.clone());
         }
         phase_times[P_CONFUSABLE_NEGATIVES] = phase_end_ms!();
 
         // ── Phase 10: Detection — Unrelated phrases ───────────────────────
+        // The unrelated detection pool spans two seed bands: band 1 (900+)
+        // with the "unrelated" prefix, band 2 (910+) with the distinct
+        // "unrelated2" prefix.
         phase_start!("Phase 9: Negative — unrelated phrases");
-        let unrelated_variants = generate_phrase_variants_cached(
+        let mut unrelated_variants = generate_phrase_variants_cached(
             UNRELATED_PHRASES,
             &available_styles,
             SeedConfig {
@@ -5182,8 +5399,20 @@ pub(crate) fn run_internal() {
             &model_version_hash,
             &cache_dir_path,
         );
+        unrelated_variants.extend(generate_phrase_variants_cached(
+            UNRELATED_PHRASES,
+            &available_styles,
+            SeedConfig {
+                base_seed: 910,
+                num_variants: 1,
+                seed_variant: 0,
+            },
+            "unrelated2",
+            &model_version_hash,
+            &cache_dir_path,
+        ));
         info!(
-            "Generated {} unrelated phrase variants",
+            "Generated {} unrelated phrase variants (2 seed bands: 900+, 910+)",
             unrelated_variants.len()
         );
         test_detection_samples(
@@ -5197,9 +5426,14 @@ pub(crate) fn run_internal() {
         phase_times[P_UNRELATED_NEGATIVES] = phase_end_ms!();
 
         // ── Phase 11: Detection — Silence ────────────────────────────────
+        // Silence becomes a small matrix (three durations).
         phase_start!("Phase 10: Negative — silence");
+        let silence_variants: Vec<(Vec<f32>, String)> = SILENCE_DURATIONS
+            .iter()
+            .map(|(label, len)| (vec![0.0f32; *len], label.to_string()))
+            .collect();
         test_detection_samples(
-            &[(vec![0.0f32; SILENCE_LEN], "silence".to_string())],
+            &silence_variants,
             &classifier,
             &mut silence_metric,
             |m, l| m.false_accepts.push(l.to_string()),
@@ -5209,8 +5443,10 @@ pub(crate) fn run_internal() {
         phase_times[P_SILENCE_NEGATIVES] = phase_end_ms!();
 
         // ── Phase 12: Detection — Noise profiles ─────────────────────────
+        // The 4 detection-only profiles join the phase but NEVER the training
+        // list (NOISE_PROFILES — see NOISE_PROFILES_DETECTION_ONLY).
         phase_start!("Phase 11: Negative — noise profiles");
-        for (label, generator) in NOISE_PROFILES {
+        for (label, generator) in all_noise_profiles() {
             info!("  Testing noise profile: {label}");
             let noise = generator();
             let mut metric = DetectionMetrics::default();
@@ -5231,6 +5467,66 @@ pub(crate) fn run_internal() {
             noise_metrics.push(metric);
         }
         phase_times[P_NOISE_PROFILES] = phase_end_ms!();
+
+        // ── Wake-over-babble ─────────────────────────────────────────────
+        // Held-out wake clips mixed with a multi-voice TTS babble track at a
+        // few SNR levels — speech-on-speech interference (the AGC-convergence
+        // failure class under a speech interferer).  In-memory mixing; only
+        // the babble clips enter the PCM cache.  Report-only diagnostic (the
+        // wake word IS present — high detection is the healthy reading).
+        eprintln!("─── Wake-over-babble (report-only) ───");
+        if let Some(babble_track) =
+            generate_babble_overlay_cached(&available_styles, &model_version_hash, &cache_dir_path)
+        {
+            let babble_cells: Vec<(String, CellMix)> = BABBLE_SNRS
+                .iter()
+                .map(|(snr_label, snr_db)| {
+                    (
+                        format!("babble_{snr_label}"),
+                        CellMix::Babble {
+                            track: babble_track.clone(),
+                            snr_db: *snr_db,
+                        },
+                    )
+                })
+                .collect();
+            let babble_start = Instant::now();
+            let babble_results = run_detection_matrix(
+                &held_out_recall_clips,
+                &classifier,
+                &babble_cells,
+                "overlapping_speech",
+                "Wake-over-babble",
+            );
+            let babble_ms = babble_start.elapsed().as_secs_f64() * 1000.0;
+            let babble_total: usize = babble_results.iter().map(|(_, _, _, d)| d.len()).sum();
+            let babble_detected: usize = babble_results
+                .iter()
+                .map(|(_, _, detected, _)| *detected)
+                .sum();
+            eprintln!(
+                "  Wake-over-babble: {babble_detected}/{babble_total} detected ({babble_ms:.0}ms)"
+            );
+            overlapping_speech = Some(serde_json::json!({
+                "cells": serde_json::Value::Object(
+                    babble_results.iter().map(&cell_json).collect(),
+                ),
+                "n_cells": babble_results.len(),
+                "total_variants": babble_total,
+                "detected": babble_detected,
+                "phase_ms": babble_ms,
+                "note": "Held-out wake clips over a TTS-rendered babble track \
+                         (non-wake phrases, seeds 9500+): each clip mixes against a \
+                         ~1 s slice of the track, with per-clip offsets sampling the \
+                         multi-voice track across the set, at 10/5/0 dB.  SNR is \
+                         computed on the mixed slice.  The wake word IS present, so \
+                         high detection is the healthy reading (speaker-blindness \
+                         diagnostic, report-only).  In-memory mixing; the babble \
+                         track is the only new cache content.",
+            }));
+        } else {
+            warn!("Babble overlay synthesis produced no audio — wake-over-babble section skipped");
+        }
 
         // ── Phase 12: Cooldown verification ──────────────────────────────
         // mahbot-1052: re-pointed at the ENROLLED-SPEAKER original variant
@@ -5447,6 +5743,61 @@ pub(crate) fn run_internal() {
         );
         phase_times[P_COOLDOWN] = cooldown_detection_time_ms as u64;
 
+        // ── Owner-negative detection ─────────────────────────────────────
+        // Runs AFTER the cooldown assertions so this report-only block cannot
+        // perturb the shared adaptive state feeding Phase 12's hard gates.
+        // The enrolled voice's non-wake speech is trained in (Phase 3) but was
+        // never measured in detection.  This block runs the SAME owner-negative
+        // clips (seeds 9000+, cache hits) through the streaming path —
+        // report-only.  The clips are trained-in, so any detection is an
+        // in-distribution misclassification signal (canary-style), never a
+        // generalization claim; the count does NOT feed total_false_accepts.
+        eprintln!("─── Owner-negative detection (report-only) ───");
+        let owner_neg_start = Instant::now();
+        let mut owner_neg_clips: Vec<(Vec<f32>, String)> = Vec::new();
+        for (i, &phrase) in OWNER_NEGATIVE_PHRASES.iter().enumerate() {
+            for s in 0..3 {
+                let seed_val = 9000 + i as u64 * 3 + s as u64;
+                if let Some(pcm) = synthesize_wake_word_variant_cached(
+                    phrase,
+                    &voice_allocation.enrolled,
+                    seed_val,
+                    TARGET_SAMPLE_RATE,
+                    &model_version_hash,
+                    &cache_dir_path,
+                ) {
+                    owner_neg_clips.push((pcm, format!("owner_negative_{phrase}_s{seed_val}")));
+                }
+            }
+        }
+        let mut owner_neg_metrics = DetectionMetrics::default();
+        test_detection_samples(
+            &owner_neg_clips,
+            &classifier,
+            &mut owner_neg_metrics,
+            |m, l| m.false_accepts.push(l.to_string()),
+            Some(&mut shared_adaptive),
+            false, // warm pass (consistent with the other negative phases)
+        );
+        let owner_neg_ms = owner_neg_start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "  Owner-negative detection: {}/{} detected ({owner_neg_ms:.0}ms)",
+            owner_neg_metrics.detected, owner_neg_metrics.total,
+        );
+        owner_negative_detection = Some(serde_json::json!({
+            "n_clips": owner_neg_metrics.total,
+            "detected": owner_neg_metrics.detected,
+            "false_accepts": owner_neg_metrics.false_accepts,
+            "phase_ms": owner_neg_ms,
+            "per_variant": owner_neg_metrics.per_variant.iter().map(|pv| pv_to_json(pv, Some("owner_negative"))).collect::<Vec<_>>(),
+            "note": "The enrolled voice's non-wake speech (OWNER_NEGATIVE_PHRASES, \
+                     seeds 9000+) measured in detection for the first time.  These are \
+                     the SAME clips Phase 3 trains on, so any detection is an \
+                     in-distribution misclassification signal (canary-style), not a \
+                     generalization claim.  Report-only; does NOT feed \
+                     total_false_accepts.",
+        }));
+
         // ── Noise-overlapped detection + cross-speaker probes (mahbot-845,
         //    restructured) ──────────────────────────────────────
         // Two matrices under the same phase (both report-only diagnostics —
@@ -5461,15 +5812,53 @@ pub(crate) fn run_internal() {
         //      speaker phases nor the probe matrix exercise the canary
         //      voices' augmentations);
         //   2. held_out_probes — the RESERVED voices (M4/M5) at unseen seeds
-        //      across clean + 10/20 dB white (honest generalization probes).
+        //      across clean + 5/10/20 dB white (honest generalization probes).
         phase_start!("Phase 13: Noise-overlapped detection + cross-speaker probes");
         let canary_overlap_results = run_noise_overlap_test(&canary_clips, &classifier);
-        let (probe_cells, probe_fas) =
-            run_cross_speaker_probe_matrix(&cross_speaker_probe_clips, &classifier);
+        let probe_cells = run_cross_speaker_probe_matrix(&cross_speaker_probe_clips, &classifier);
         noise_overlap_results = canary_overlap_results;
         probe_overlap_results = probe_cells;
-        probe_fa_count = probe_fas;
+        probe_fa_count = probe_overlap_results
+            .iter()
+            .map(|(_, _, detected, _)| *detected)
+            .sum();
         phase_times[P_NOISE_OVERLAP] = phase_end_ms!();
+
+        // ── Held-out SNR envelope ─────────────────────────────────────────
+        // The enlarged held-out wake-only basis is tested clean only in
+        // Phase 7d.  This section re-runs the FULL enlarged set through the
+        // existing noise-overlap matrix (white/pink/brown × 20/10/5/0 dB +
+        // clean — 13 cells) as an in-memory report section — no cache growth.
+        // Directly exercises the AGC-convergence failure class behind the
+        // current miss (never exercised under noise before).  Report-only;
+        // warm pass with a shared adaptive state (same methodology as the
+        // canary matrix).
+        eprintln!("─── Held-out SNR envelope (report-only) ───");
+        let snr_start = Instant::now();
+        let snr_results = run_noise_overlap_test(&held_out_recall_clips, &classifier);
+        let snr_ms = snr_start.elapsed().as_secs_f64() * 1000.0;
+        let snr_total: usize = snr_results.iter().map(|(_, _, _, d)| d.len()).sum();
+        let snr_detected: usize = snr_results
+            .iter()
+            .map(|(_, _, detected, _)| *detected)
+            .sum();
+        eprintln!("  Held-out SNR envelope: {snr_detected}/{snr_total} detected ({snr_ms:.0}ms)");
+        held_out_snr_envelope = Some(serde_json::json!({
+            "cells": serde_json::Value::Object(
+                snr_results.iter().map(&cell_json).collect(),
+            ),
+            "n_cells": snr_results.len(),
+            "total_variants": snr_total,
+            "detected": snr_detected,
+            "phase_ms": snr_ms,
+            "note": "The ENLARGED held-out wake-only basis (all 40 clips, seeds \
+                     3000-3039) through the existing 13-cell noise matrix \
+                     (white/pink/brown x 20/10/5/0 dB + clean).  In-memory mixing, \
+                     no cache growth.  The wake word IS present — high detection is \
+                     the healthy reading; this directly exercises the \
+                     AGC-convergence failure class under noise that the single \
+                     current miss exhibits.  Report-only.",
+        }));
     } else {
         // Degenerate classifier — skip all detection phases
         phase_times[P_POSITIVE_VARIANTS] = 0;
@@ -5522,22 +5911,17 @@ pub(crate) fn run_internal() {
     // reported in noise_overlap / false_accepts but do NOT feed the tally.
     let noise_overlap_detections: usize = noise_overlap_results
         .iter()
-        .flat_map(|(_, _, detail)| detail.iter())
-        .filter(|v| {
-            v.get("detected")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-        })
-        .count();
+        .map(|(_, _, detected, _)| *detected)
+        .sum();
     // The canary target is derived from the actual measured cell×variant
     // matrix so every report string stays in lockstep with the measured count.
     let noise_overlap_total_variants: usize = noise_overlap_results
         .iter()
-        .map(|(_, _, detail)| detail.len())
+        .map(|(_, _, _, detail)| detail.len())
         .sum();
     let probe_total_variants: usize = probe_overlap_results
         .iter()
-        .map(|(_, _, detail)| detail.len())
+        .map(|(_, _, _, detail)| detail.len())
         .sum();
     let shared_fa_count = unrelated_metrics.false_accepts.len()
         + silence_metric.false_accepts.len()
@@ -5565,10 +5949,10 @@ pub(crate) fn run_internal() {
     let unrel_classifier = ClassifierTriggerMetrics::compute(&unrelated_metrics.per_variant);
     let silence_classifier = ClassifierTriggerMetrics::compute(&silence_metric.per_variant);
 
-    // Per-tier confusable classifier trigger metrics
+    // Per-tier confusable classifier trigger metrics (both seed bands).
     let mut conf_classifier_by_tier: [ClassifierTriggerMetrics; 3] = Default::default();
     for pv in &conf_metrics.per_variant {
-        let phrase = phrase_from_label(&pv.variant, "confusable");
+        let phrase = confusable_phrase(&pv.variant);
         conf_classifier_by_tier[tier_for_phrase(phrase).index()].accumulate(pv);
     }
 
@@ -5578,8 +5962,7 @@ pub(crate) fn run_internal() {
     // (all-zero) metrics so downstream output paths (JSON, info!(),
     // eprintln) always have consistent data without conditional guards.
     let noise_classifier_per_profile: Vec<ClassifierTriggerMetrics> = if noise_metrics.is_empty() {
-        NOISE_PROFILES
-            .iter()
+        all_noise_profiles()
             .map(|_| ClassifierTriggerMetrics::default())
             .collect()
     } else {
@@ -5679,15 +6062,18 @@ pub(crate) fn run_internal() {
         info!("  False triggers: {:?}", unrelated_metrics.false_accepts);
     }
     info!(
-        "Silence false accepts: {} / 1 (limit ≤{})",
+        "Silence false accepts: {} / {} ({} durations, limit ≤{})",
         silence_metric.false_accepts.len(),
+        silence_metric.total,
+        SILENCE_DURATIONS.len(),
         0, // all tiers have silence limit = 0
     );
+    let n_noise_profiles = all_noise_profiles().count();
     info!(
         "Noise false accepts: {} / {} ({} profiles, limit ≤{}–{} across tiers)",
         noise_false_accepts.len(),
-        NOISE_PROFILES.len(),
-        NOISE_PROFILES.len(),
+        n_noise_profiles,
+        n_noise_profiles,
         tier_limit_sets[0].noise,
         tier_limit_sets[2].noise,
     );
@@ -5720,12 +6106,9 @@ pub(crate) fn run_internal() {
         "{}",
         ct_line("Noise (aggregate)", &noise_classifier_aggregate)
     );
-    for i in 0..NOISE_PROFILES.len() {
+    for (i, (label, _)) in all_noise_profiles().enumerate() {
         let profile_ct = &noise_classifier_per_profile[i];
-        info!(
-            "    └─ {}",
-            ct_line(NOISE_PROFILES[i].0, profile_ct).trim_start()
-        );
+        info!("    └─ {}", ct_line(label, profile_ct).trim_start());
     }
 
     info!("──────────────────────────────────────────────");
@@ -5780,9 +6163,10 @@ pub(crate) fn run_internal() {
     // (mahbot-871).  The flat list is reused for score distributions below.
     let mut all_neg_pv: Vec<(&PerVariantResult, String)> = Vec::new();
     for pv in &conf_metrics.per_variant {
-        let phrase = phrase_from_label(&pv.variant, "confusable");
+        let phrase = confusable_phrase(&pv.variant);
         let variant_tier = tier_for_phrase(phrase);
-        all_neg_pv.push((pv, format!("confusable_{}", variant_tier.as_str())));
+        let band = confusable_band(&pv.variant);
+        all_neg_pv.push((pv, format!("{band}_{}", variant_tier.as_str())));
     }
     for pv in &unrelated_metrics.per_variant {
         all_neg_pv.push((pv, "unrelated".to_string()));
@@ -6160,9 +6544,12 @@ pub(crate) fn run_internal() {
         "noise": {
             "aggregate": ct_to_json(&noise_classifier_aggregate),
             "per_profile": serde_json::Value::Object(
-                NOISE_PROFILES.iter().enumerate().map(|(i, (label, _))| {
-                    (label.to_string(), ct_to_json(&noise_classifier_per_profile[i]))
-                }).collect()
+                all_noise_profiles()
+                    .enumerate()
+                    .map(|(i, (label, _))| {
+                        (label.to_string(), ct_to_json(&noise_classifier_per_profile[i]))
+                    })
+                    .collect()
             ),
         },
     });
@@ -6225,24 +6612,6 @@ pub(crate) fn run_internal() {
     // speaker-blindness DIAGNOSTICS (cross-speaker wake-word detections are
     // correct behaviour — high detection expected), reported without pass/fail
     // semantics and NOT counted into total_false_accepts.
-    let cell_json = |(key, rate, detail): &(String, f64, Vec<serde_json::Value>)| {
-        let fas = detail
-            .iter()
-            .filter(|v| {
-                v.get("detected")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-            })
-            .count();
-        (
-            key.clone(),
-            serde_json::json!({
-                "detection_rate": rate,
-                "detected": fas,
-                "per_variant": detail,
-            }),
-        )
-    };
     let noise_overlap_json = serde_json::json!({
         "sections": {
             "in_distribution_canaries": serde_json::Value::Object(
@@ -6257,7 +6626,7 @@ pub(crate) fn run_internal() {
              13-cell noise matrix (kept from mahbot-1025; any detection is a \
              trained-in speaker-blindness diagnostic).  held_out_probes = \
              RESERVED voices (absent from every training path) at unseen seeds \
-             across clean + 10/20 dB white (honest cross-speaker \
+             across clean + 5/10/20 dB white (honest cross-speaker \
              generalization probes).  Both are DIAGNOSTICS: speaker-blind \
              detection means a non-enrolled voice's wake word fires — high \
              detection is expected and healthy; low detection is reportable, \
@@ -6317,8 +6686,9 @@ pub(crate) fn run_internal() {
              enrolled speaker is ONE TTS voice with guided-prompt DSP \
              conditioning instead of 10 rotated voices — all detection/FA \
              numbers re-baseline, expected); the enrolled-speaker acceptance \
-             basis is a HELD-OUT WAKE-ONLY recall set (16 unseen \
-              enrolled-voice renderings, seeds 3000+, Wilson CI reported — \
+             basis is a HELD-OUT WAKE-ONLY recall set (40 unseen \
+              enrolled-voice renderings, seeds 3000+ — enlarged from 16, \
+              Wilson CI reported — \
               embedded-in-sentence detection removed); the M4/M5 \
              reserved voices are absent from every training path and probed at \
              unseen seeds as diagnostics; the confusable/unrelated negative \
@@ -6333,13 +6703,23 @@ pub(crate) fn run_internal() {
              confusable/unrelated) use the bounded 2-cell recipe (original + \
              pink 25 dB) instead of the old 5-cell set — a deliberate budget \
              tradeoff: the 12-cell positive recipe's cold embedding recompute \
-             over the full 5-cell negatives measured ~68 s (archive \
-             20260804-155415) and ~84 s with the final owner pool (A/B run) — \
+             over the full 5-cell negatives measured ~68 s and ~84 s with the \
+             final owner pool (A/B run) — \
              both over the 39 s bound — so the speed/volume negative cells \
              were dropped.  The \
              low-SNR negative cell (brown-10) lives on the owner/ambient \
              path.  The deterministic easy-tier confusable FA (if present) is \
-             measured under this bounded negative recipe."
+             measured under this bounded negative recipe.  The TEST side \
+             was expanded: 40-clip wake-only basis (seeds \
+             3000-3039), a held-out SNR envelope over it (13-cell noise \
+             matrix, in-memory), doubled confusable/unrelated detection pools \
+             (new seed bands 810+/910+ with distinct label prefixes), a \
+             three-duration silence matrix, 4 detection-only noise profiles \
+             (fresh seeds 52-55 — never the training list), wake-over-babble \
+             cells (TTS-voice overlays), an owner-negative detection block \
+             (trained-in clips, canary-style), and a cross-speaker probe \
+             scale-up (20 seeds/voice + a 5 dB cell).  All earlier bench \
+             results were purged — the v3 series starts clean."
         ),
         "total_false_accepts": total_false_accepts,
         // additive: single-voice enrollment disclosure — voice
@@ -6488,6 +6868,17 @@ pub(crate) fn run_internal() {
     // block is already at serde_json's recursion limit).
     json["deployability"] = deployability.clone();
     json["cross_run"] = cross_run;
+    // Expanded TEST-surface report sections (absent when degenerate — the keys
+    // are only inserted when the corresponding phase ran).
+    if let Some(v) = held_out_snr_envelope {
+        json["held_out_snr_envelope"] = v;
+    }
+    if let Some(v) = overlapping_speech {
+        json["overlapping_speech"] = v;
+    }
+    if let Some(v) = owner_negative_detection {
+        json["owner_negative_detection"] = v;
+    }
     // Default-run wall-clock budget acknowledgment: the acceptance window is
     // ~33-39 s; env-gated phases (FAPH / multi-seed) extend the wall clock by
     // design, so the budget check applies only to default runs.  Measured
@@ -6515,10 +6906,10 @@ pub(crate) fn run_internal() {
         } else if perf_wall_clock_secs > 39.0 {
             format!(
                 "Default-run wall clock {perf_wall_clock_secs:.1}s exceeds the ~33-39s \
-                 observed envelope and its upper bound (39s) — attributable to machine load \
-                 plus the one-time wake-phrase re-baselining (TTS cache invalidation and \
-                 re-trained detection dynamics); the bounded Phase 0 additions measure in \
-                 tens of ms.",
+                 observed envelope and its upper bound (39s) — the expanded test surface \
+                 (40-clip basis, SNR envelope, doubled pools, babble, owner-negative \
+                 detection, probe scale-up) structurally grows the default run; the \
+                 budget figure is report-only and untouched.",
             )
         } else {
             format!(

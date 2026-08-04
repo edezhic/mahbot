@@ -468,8 +468,8 @@ pub(crate) enum AugmentSet {
     /// product tradeoff: the old speed/volume negative cells are dropped so
     /// the expanded 12-cell positive recipe's cold embedding recompute fits
     /// the 39 s bench budget (the full 5-cell negative set measured ~68 s
-    /// cold — bench archive 20260804-155415; ~84 s with the final owner
-    /// pool — both over budget); disclosed in the bench report.  Low-SNR
+    /// cold; ~84 s with the final owner pool — both over budget); disclosed
+    /// in the bench report.  Low-SNR
     /// negative coverage lives on the owner/ambient path (owner negatives
     /// get a brown-10 variant).
     Negatives,
