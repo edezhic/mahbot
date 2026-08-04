@@ -1059,6 +1059,44 @@ async fn run_single_agent(
     result
 }
 
+/// Build the failure comment for a failed Engineer run.
+///
+/// Persists the classified cause + underlying detail so distinct root causes
+/// (LLM retry exhaustion, process shutdown, user cancellation, concrete agent
+/// errors) stop looking identical in ticket history. The generic template is
+/// retained only for genuinely-unknown causes. Error detail is credential-
+/// scrubbed then sandwich-truncated to [`VERDICT_RAW_DUMP_CAP`].
+///
+/// Classification order matters: the global shutdown token fires on SIGTERM/
+/// SIGINT and dashboard close, the per-agent token on /stop and dashboard
+/// close — check the global token first so shutdown isn't mislabeled as a
+/// user cancel. The generic template branch is a total-function fallback for
+/// genuinely-unknown causes (currently unreachable via run_agent's contract,
+/// which yields either a captured error or a cancelled agent) — retained per
+/// the failure-reporting contract. The failure-comment write during service
+/// shutdown is best-effort (the dispatch task is detached); acceptable —
+/// state semantics are unchanged.
+fn engineer_failure_comment(shutdown: bool, cancelled: bool, error: Option<&str>) -> String {
+    if shutdown {
+        return "Engineer failed: service shutting down — the run was interrupted \
+                by process shutdown."
+            .to_string();
+    }
+    if cancelled {
+        return "Engineer failed: cancelled by user.".to_string();
+    }
+    let Some(detail) = error else {
+        return load_prompt("engineer_failed.md");
+    };
+    let detail = crate::util::scrub_credentials(detail);
+    let detail = crate::util::truncate_sandwich(&detail, VERDICT_RAW_DUMP_CAP, "engineer failure");
+    if detail.contains("All attempts failed") {
+        format!("Engineer failed: LLM provider retry exhaustion.\n\n{detail}")
+    } else {
+        format!("Engineer failed.\n\n{detail}")
+    }
+}
+
 /// Run an Engineer agent to implement the ticket.
 ///
 /// Gathers feedback comments from all roles since the last engineer run and
@@ -1100,7 +1138,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         );
     }
 
-    let (_agent, response) = run_single_agent(
+    let (agent, response) = run_single_agent(
         agent_id,
         Role::Engineer,
         &ws,
@@ -1117,7 +1155,13 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
 
     // Diagnostics are dispatched by the poll loop as a separate
     // PollPhase::DiagnosticsCheck — see poll_round().
-    let engineer_failed = load_prompt("engineer_failed.md");
+    // Owned at function scope so its borrow outlives the if/else below;
+    // only read on the failure path.
+    let failure_comment = engineer_failure_comment(
+        crate::shutdown::shutdown_token().is_cancelled(),
+        agent.is_cancelled(),
+        agent.failure.as_deref(),
+    );
     let (comment_text, target_phase, notify) = if let Some(ref text) = response {
         (
             text.as_str(),
@@ -1126,7 +1170,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         )
     } else {
         (
-            engineer_failed.as_str(),
+            failure_comment.as_str(),
             TicketPhase::Failed,
             NotifyPolicy::Notify,
         )

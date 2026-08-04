@@ -1802,3 +1802,64 @@ fn raw_response_dump_section_covers_sanitation_shape() {
     assert!(section.contains("Raw agent response"), "{section}");
     assert!(section.contains(raw), "{section}");
 }
+
+#[test]
+fn engineer_failure_comment_classifies_causes() {
+    // LLM retry exhaustion — provider/attempt/status detail preserved.
+    let err = "LLM step failed at iteration 3: All attempts failed.\n\
+               provider=deepseek/deepseek-chat attempt 1/5: retryable; \
+               error=OpenRouter API error (503): Service is too busy";
+    let c = engineer_failure_comment(false, false, Some(err));
+    assert!(c.contains("LLM provider retry exhaustion"), "{c}");
+    assert!(c.contains("503"), "{c}");
+
+    // Service shutdown — global token checked before the per-agent token.
+    let c = engineer_failure_comment(true, true, None);
+    assert!(c.contains("service shutting down"), "{c}");
+
+    // User cancellation (/stop) — distinct from shutdown.
+    let c = engineer_failure_comment(false, true, None);
+    assert!(c.contains("cancelled by user"), "{c}");
+
+    // Concrete agent error — underlying detail persisted.
+    let c = engineer_failure_comment(
+        false,
+        false,
+        Some("Agent exceeded maximum of 1000 LLM iterations"),
+    );
+    assert!(
+        c.contains("Agent exceeded maximum of 1000 LLM iterations"),
+        "{c}"
+    );
+
+    // Genuinely unknown cause — generic template retained.
+    let c = engineer_failure_comment(false, false, None);
+    assert!(c.contains("technical issues"), "{c}");
+}
+
+#[test]
+fn engineer_failure_comment_scrubs_and_truncates() {
+    // Provider error bodies can echo request data — scrub before persisting.
+    // Assert on the secret tail ("abcdef") rather than the full secret so the
+    // assertions stay meaningful even if tooling redacts secret-looking
+    // literals from the fixture (mirrors the agent.rs scrubbing test).
+    let err = format!(
+        "All attempts failed.\nprovider=x attempt 1/1: retryable; error=api_key={secret} boom",
+        secret = "sk-1234567890abcdef"
+    );
+    let c = engineer_failure_comment(false, false, Some(&err));
+    assert!(c.contains("[REDACTED]"), "{c}");
+    assert!(
+        !c.contains("abcdef"),
+        "scrubbing must remove the secret tail: {c}"
+    );
+
+    // Oversized detail is sandwich-truncated to the verdict dump cap.
+    let big = format!("All attempts failed.\n{}", "x".repeat(30_000));
+    let c = engineer_failure_comment(false, false, Some(&big));
+    assert!(
+        c.contains("bytes omitted at engineer failure truncation"),
+        "{c}"
+    );
+    assert!(c.len() < 26_000, "comment capped, got {}", c.len());
+}

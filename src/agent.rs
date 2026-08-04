@@ -162,6 +162,7 @@ impl Agent {
             user_name,
             channel,
             incoming_rx: None,
+            failure: None,
         }
     }
 }
@@ -929,6 +930,9 @@ pub(crate) async fn run_agent(
     match result {
         Ok(response) => (agent, Some(response)),
         Err(e) => {
+            // Capture the real cause (full chain) so ticket dispatchers can
+            // persist it in failure comments instead of a generic placeholder.
+            agent.failure = Some(format!("{e:#}"));
             // During global (SIGTERM/SIGINT) shutdown, every in-flight agent
             // hits the `tokio::select!` shutdown branch in work() and returns
             // an error — this is expected, not a real failure. Log at debug!
@@ -1017,6 +1021,7 @@ mod tests {
             user_name: String::new(),
             channel: String::new(),
             incoming_rx: None,
+            failure: None,
         }
     }
 

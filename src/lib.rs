@@ -775,6 +775,10 @@ pub struct Agent {
     /// and injects received messages into the session history.
     pub(crate) incoming_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>>,
+    /// Raw failure detail from the last run — set by [`crate::agent::run_agent`]
+    /// on error, left `None` on success or cancellation (callers classify
+    /// cancellation via the cancel tokens).
+    pub(crate) failure: Option<String>,
 }
 
 // ── Verdict type ─────────────────────────────────────────────────
