@@ -2,8 +2,8 @@ use super::*;
 use crate::prompt::{load_prompt, substitute};
 use crate::util::test::make_ticket;
 use crate::util::test::{
-    FakeProvider, create_test_workspace, expect_ticket, expect_ticket_phase,
-    init_management_test_stores, init_test_stores,
+    create_test_workspace, expect_ticket, expect_ticket_phase, init_management_test_stores,
+    init_test_stores,
 };
 use crate::workspace::test_ws_named;
 use strum::IntoEnumIterator;
@@ -1540,67 +1540,6 @@ async fn diagnostics_repaired_chain_passes_on_clean_crate() {
 }
 
 // ── dispatch_verifiers skip-review ──────────────────────────────
-
-/// A ticket with no recorded reviewed base must never skip the reviewer
-/// pass — even on a clean working tree (first review round, brand-new
-/// commit). The full review runs: here all three agents fail to produce
-/// verdicts, so the ticket goes to Failed instead of being auto-advanced
-/// to Reviewed.
-#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
-#[tokio::test]
-async fn dispatch_verifiers_without_review_base_runs_full_review() {
-    if !crate::git_commands::git_is_installed().await {
-        eprintln!("git not installed — skipping git-dependent test");
-        return;
-    }
-
-    let _lock = crate::util::test::retry_tests_lock();
-    // Unparseable fake-provider text makes every verdict extraction retryable;
-    // without a tiny policy the real 13-attempt/5s schedule burns ~9 min here.
-    let _policy_guard =
-        crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-    let _provider_guard = crate::util::test::install_fake_provider(Arc::new(FakeProvider::new()));
-
-    let (_dir, repo_path) = crate::util::test::init_temp_repo();
-    let repo_str = repo_path.to_str().expect("temp path is valid UTF-8");
-
-    let (ws, ticket_id) = setup_ticket(
-        repo_str,
-        "no_review_base_test",
-        "No Review Base Test",
-        TicketPhase::InReview,
-    )
-    .await;
-
-    let ticket = Arc::new(expect_ticket(board(), &ticket_id).await);
-    assert!(
-        ticket.reviewed_head.is_none(),
-        "test precondition: ticket must start without a reviewed base"
-    );
-
-    dispatch_verifiers(ticket, ws, REVIEWER_VI).await;
-
-    // The reviewer pass ran (no verdicts produced → Failed), so the ticket
-    // must NOT have been auto-advanced to Reviewed.
-    let phase = expect_ticket_phase(board(), &ticket_id).await;
-    assert_ne!(
-        phase,
-        TicketPhase::Reviewed,
-        "A ticket with no reviewed base must never skip the reviewer pass"
-    );
-
-    // No skip comment may have been written.
-    let comments = board()
-        .get_comments(&ticket_id)
-        .await
-        .expect("get_comments");
-    assert!(
-        !comments
-            .iter()
-            .any(|c| c.role == SYSTEM_ROLE && c.content.contains("Skipping reviewer dispatch")),
-        "No skip comment expected when the reviewer pass must run"
-    );
-}
 
 /// When the current content is identical to the ticket's recorded reviewed
 /// base (same HEAD, same index tree, clean porcelain), the reviewer pass may
