@@ -1090,7 +1090,10 @@ fn engineer_failure_comment(shutdown: bool, cancelled: bool, error: Option<&str>
     };
     let detail = crate::util::scrub_credentials(detail);
     let detail = crate::util::truncate_sandwich(&detail, VERDICT_RAW_DUMP_CAP, "engineer failure");
-    if detail.contains("All attempts failed") {
+    // Matches the agent-loop exhaustion marker ("exhausted retry budget") and
+    // the legacy ReliableProvider marker ("All attempts failed") so retry
+    // exhaustion keeps its dedicated classification.
+    if detail.contains("exhausted retry budget") || detail.contains("All attempts failed") {
         format!("Engineer failed: LLM provider retry exhaustion.\n\n{detail}")
     } else {
         format!("Engineer failed.\n\n{detail}")
@@ -1809,6 +1812,12 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
 
 // ── Post-development diagnostics ───────────────────────────────────────
 
+/// Timeout cap for the `unit-test` diagnostics slot. Full test suites can
+/// legitimately run minutes on loaded machines, so the default 600s shell cap
+/// races slow-but-healthy runs; the fast lint/check/build slots keep the
+/// default so genuinely hung commands still fail fast.
+const UNIT_TEST_DIAGNOSTICS_TIMEOUT_SECS: u64 = 1200;
+
 /// Run diagnostics commands sequentially, collecting output and pass/fail status.
 ///
 /// Executes each non-`None` command from [`DiagnosticsCommands::commands`] via
@@ -1861,8 +1870,13 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 
         let _ = write!(comment, "\n\n{label} ({cmd}):\n");
 
+        let mut args = serde_json::json!({ "command": cmd });
+        if label == DiagnosticsCommands::UNIT_TEST_LABEL {
+            args["timeout_secs"] = serde_json::json!(UNIT_TEST_DIAGNOSTICS_TIMEOUT_SECS);
+        }
+
         match ShellTool::new(ShellMode::Full)
-            .execute_with_status(ws, serde_json::json!({"command": cmd}))
+            .execute_with_status(ws, args)
             .await
         {
             Ok((output, exit_code)) => {
@@ -2157,8 +2171,9 @@ async fn run_parallel_agents(
                     // to the original verifier agent call — the provider can reuse the
                     // cached prefix.
                     //
-                    // mahbot-1066: hardened outer retry loop (7 attempts, backoff,
-                    // 600s wall cap) with fail-closed score validation. On terminal
+                    // mahbot-1066: hardened outer retry loop (13 attempts,
+                    // backoff 5/10/20/40/60/60 s, 720 s wall cap) with
+                    // fail-closed score validation. On terminal
                     // failure the RetryExhausted (carrying the last-attempt raw
                     // text) flows into ParallelVerdict::ParseFailed for the ticket
                     // comment (Amendment B).

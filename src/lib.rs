@@ -89,6 +89,10 @@ impl DiagnosticsCommands {
     /// Number of command categories (must match the array length in [`Self::commands`]).
     pub const COMMAND_COUNT: usize = 7;
 
+    /// Label of the `unit-test` slot. Shared with the diagnostics runner so
+    /// its extended-timeout wiring can't silently drift from the label list.
+    pub(crate) const UNIT_TEST_LABEL: &str = "unit-test";
+
     /// Static labels for the 7 command categories, matching the order in [`Self::commands`].
     pub const COMMAND_LABELS: [&str; Self::COMMAND_COUNT] = [
         "format",
@@ -97,7 +101,7 @@ impl DiagnosticsCommands {
         "lint",
         "type-check",
         "build",
-        "unit-test",
+        Self::UNIT_TEST_LABEL,
     ];
 
     /// Ordered iterator of (label, command) pairs. `None` entries are undiscovered — skipped.
@@ -110,7 +114,7 @@ impl DiagnosticsCommands {
             ("lint", self.lint.as_deref()),
             ("type-check", self.type_check.as_deref()),
             ("build", self.build.as_deref()),
-            ("unit-test", self.unit_test.as_deref()),
+            (Self::UNIT_TEST_LABEL, self.unit_test.as_deref()),
         ]
     }
 
@@ -1311,10 +1315,10 @@ pub(crate) trait Provider: Send + Sync {
     /// Send a chat request using the model specified in the request.
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse>;
 
-    /// Single-attempt chat for the scoped retry paths (mahbot-1066).
+    /// Single-attempt chat for the outer retry paths.
     ///
-    /// Used by the outer retry loops in [`crate::retry`] for verdict
-    /// extraction and analyst consolidation. Contract:
+    /// Used by the outer retry loops in [`crate::retry`] for agent-loop LLM
+    /// calls, verdict extraction and analyst consolidation. Contract:
     ///
     /// - **No provider-internal retries** — this call makes exactly one HTTP
     ///   request; the outer loop is the single retry authority.

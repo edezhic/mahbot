@@ -174,8 +174,9 @@ impl ReliableProvider {
     pub(crate) fn compute_backoff(base: u64, err: &anyhow::Error) -> u64 {
         if let Some(retry_after) = parse_retry_after_ms(err) {
             // Retry-After is authoritative — follow it precisely,
-            // clamped to [base, 30_000] ms.
-            retry_after.min(30_000).max(base)
+            // clamped to [base, RETRY_AFTER_MAX_MS] (unified with the
+            // scoped retry paths in src/retry.rs).
+            retry_after.min(crate::retry::RETRY_AFTER_MAX_MS).max(base)
         } else {
             // Jitter: randomize within [75%, 125%) of base so parallel agents
             // retrying on the same transient error don't synchronize.
@@ -263,7 +264,11 @@ impl Provider for ReliableProvider {
                             error = %error_detail,
                             "Provider call failed, retrying"
                         );
-                        backoff_ms = backoff_ms.saturating_mul(2);
+                        // Doubling is capped at the unified 60 s backoff cap
+                        // (same value as the scoped paths' default max backoff).
+                        backoff_ms = backoff_ms
+                            .saturating_mul(2)
+                            .min(crate::retry::DEFAULT_RETRY_MAX_BACKOFF_MS);
                     } else {
                         let log_msg = match class {
                             ErrorClass::NonRetryable => "Non-retryable error, aborting",
@@ -511,12 +516,12 @@ mod tests {
             anyhow::Error::from(HttpError::new(429, "test", "rate limited", Some(3_000)));
         assert_eq!(ReliableProvider::compute_backoff(500, &structured), 3_000);
 
-        // ── compute_backoff: clamps retry-after to MAX_BACKOFF (30s) ──
+        // ── compute_backoff: clamps retry-after to MAX_BACKOFF (60s) ──
         let with_long_retry =
             anyhow::Error::from(HttpError::new(429, "test", "rate limit", Some(120_000)));
         assert_eq!(
             ReliableProvider::compute_backoff(500, &with_long_retry),
-            30_000
+            60_000
         );
 
         // ── compute_backoff: jittered fallback when no retry-after ──

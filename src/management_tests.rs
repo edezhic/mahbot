@@ -1555,6 +1555,10 @@ async fn dispatch_verifiers_without_review_base_runs_full_review() {
     }
 
     let _lock = crate::util::test::retry_tests_lock();
+    // Unparseable fake-provider text makes every verdict extraction retryable;
+    // without a tiny policy the real 13-attempt/5s schedule burns ~9 min here.
+    let _policy_guard =
+        crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
     let _provider_guard = crate::util::test::install_fake_provider(Arc::new(FakeProvider::new()));
 
     let (_dir, repo_path) = crate::util::test::init_temp_repo();
@@ -1806,9 +1810,11 @@ fn raw_response_dump_section_covers_sanitation_shape() {
 #[test]
 fn engineer_failure_comment_classifies_causes() {
     // LLM retry exhaustion — provider/attempt/status detail preserved.
-    let err = "LLM step failed at iteration 3: All attempts failed.\n\
-               provider=deepseek/deepseek-chat attempt 1/5: retryable; \
-               error=OpenRouter API error (503): Service is too busy";
+    // The agent-loop marker ("exhausted retry budget") replaces the legacy
+    // ReliableProvider "All attempts failed" marker.
+    let err = "LLM step failed at iteration 3: LLM call exhausted retry budget: \
+               12 attempt(s) failed (last: transport): OpenRouter API error (503): \
+               Service is too busy";
     let c = engineer_failure_comment(false, false, Some(err));
     assert!(c.contains("LLM provider retry exhaustion"), "{c}");
     assert!(c.contains("503"), "{c}");
@@ -1844,7 +1850,8 @@ fn engineer_failure_comment_scrubs_and_truncates() {
     // assertions stay meaningful even if tooling redacts secret-looking
     // literals from the fixture (mirrors the agent.rs scrubbing test).
     let err = format!(
-        "All attempts failed.\nprovider=x attempt 1/1: retryable; error=api_key={secret} boom",
+        "LLM call exhausted retry budget: 12 attempt(s) failed (last: transport): \
+         provider=x attempt 1/1: retryable; error=api_key={secret} boom",
         secret = "sk-1234567890abcdef"
     );
     let c = engineer_failure_comment(false, false, Some(&err));
@@ -1855,7 +1862,7 @@ fn engineer_failure_comment_scrubs_and_truncates() {
     );
 
     // Oversized detail is sandwich-truncated to the verdict dump cap.
-    let big = format!("All attempts failed.\n{}", "x".repeat(30_000));
+    let big = format!("LLM call exhausted retry budget: {}", "x".repeat(30_000));
     let c = engineer_failure_comment(false, false, Some(&big));
     assert!(
         c.contains("bytes omitted at engineer failure truncation"),

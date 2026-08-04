@@ -1,8 +1,11 @@
+use std::fmt::Write;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
+use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
-use crate::providers::chat;
 use crate::providers::plaintext_for_display;
 use crate::providers::reasoning_roundtrip::assistant_replay_payload;
 use crate::session::Session;
@@ -12,10 +15,6 @@ use crate::tools::{
 };
 use crate::util::{MEDIA_MARKER_RE, UnwrapPoison, parse_media_marker, scrub_credentials};
 use crate::{Agent, ChatMessage, ChatRequest, ChatResponse, Tool, ToolCall, ToolOutputPhase};
-use std::fmt::Write;
-use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
-use tracing::Instrument;
 
 // ── Per-tool-call user context ─────────────────────────────────────
 // Set by the Agent work loop before each tool execute(), read by tools
@@ -550,7 +549,10 @@ impl Agent {
             self.role.requires_multimodal(),
         );
 
-        chat(request).await
+        let policy = crate::retry::RetryPolicy::current();
+        crate::retry::agent_chat(request, &policy)
+            .await
+            .map_err(|e| anyhow::anyhow!("LLM call exhausted retry budget: {e}"))
     }
 
     /// Log tool-call notifications
@@ -794,7 +796,10 @@ impl Agent {
         let mut history = self.session.history().to_vec();
         history.push(crate::ChatMessage::user(self.role.summary_prompt()));
 
-        let chat_resp = crate::providers::chat(self.build_chat_request(history, false)).await?;
+        let policy = crate::retry::RetryPolicy::current();
+        let chat_resp = crate::retry::agent_chat(self.build_chat_request(history, false), &policy)
+            .await
+            .map_err(|e| anyhow::anyhow!("summarization LLM call exhausted retry budget: {e}"))?;
 
         if let Some(ref u) = chat_resp.usage {
             tracing::debug!(

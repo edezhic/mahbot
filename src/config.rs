@@ -322,19 +322,19 @@ pub struct ConfigData {
     /// Maximum age of voice PCM cache entries in days (default: `"30"`).
     /// Entries older than this are evicted. `0` means unlimited (no age-based eviction).
     pub voice_cache_max_age_days: Option<String>,
-    /// Retry loop max attempts for scoped LLM operations — verdict extraction
-    /// (Analyst/Reviewer/QA/Sanitation) and analyst consolidation (mahbot-1066).
-    /// Default: `"7"`. Invalid values fall back to the default.
+    /// Retry loop max attempts for LLM operations — agent-loop chat calls,
+    /// verdict extraction (Analyst/Reviewer/QA/Sanitation) and analyst
+    /// consolidation. Default: `"13"`. Invalid values fall back to the default.
     pub retry_max_attempts: Option<String>,
-    /// Retry loop base backoff in milliseconds for scoped operations.
-    /// Default: `"5000"` (canonical schedule 5/10/20/40/60/90 s). Invalid
+    /// Retry loop base backoff in milliseconds for LLM operations.
+    /// Default: `"5000"` (canonical schedule 5/10/20/40/60/60… s). Invalid
     /// values fall back to the default.
     pub retry_base_backoff_ms: Option<String>,
-    /// Retry loop backoff cap in milliseconds for scoped operations.
-    /// Default: `"90000"`. Invalid values fall back to the default.
+    /// Retry loop backoff cap in milliseconds for LLM operations.
+    /// Default: `"60000"`. Invalid values fall back to the default.
     pub retry_max_backoff_ms: Option<String>,
-    /// Whole-operation wall-clock cap in seconds for scoped operations,
-    /// authoritative over attempt count. Default: `"600"`. Invalid values
+    /// Whole-operation wall-clock cap in seconds for LLM operations,
+    /// authoritative over attempt count. Default: `"720"`. Invalid values
     /// fall back to the default.
     pub operation_timeout_secs: Option<String>,
     /// Per-role model overrides.

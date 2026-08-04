@@ -354,7 +354,8 @@ pub(crate) async fn chat(request: ChatRequest) -> anyhow::Result<ChatResponse> {
     provider.chat(request).await
 }
 
-/// Single-attempt scoped chat for the outer retry loops (mahbot-1066).
+/// Single-attempt scoped chat for the outer retry loops — agent-loop LLM
+/// calls, verdict extraction, consolidation.
 ///
 /// Suppresses provider-internal retries (the outer loop is the single retry
 /// authority), applies idle-timeout semantics, and bounds the attempt by the

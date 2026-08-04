@@ -79,9 +79,10 @@ pub(crate) async fn retry_extract_structured<T: DeserializeOwned>(
 
 // ── Scoped retry extraction (mahbot-1066 — verdict paths) ────────────────
 
-/// Scoped structured extraction with the hardened outer retry loop
-/// (mahbot-1066): 7 attempts, backoff 5/10/20/40/60/90 s, Retry-After
-/// honored, shutdown-abortable, 600 s wall-clock cap.
+/// Scoped structured extraction with the hardened outer retry loop:
+/// 13 attempts, backoff 5/10/20/40/60/60… s
+/// (doubling capped at 60 s), Retry-After honored, shutdown-abortable,
+/// 720 s wall-clock cap.
 ///
 /// The outer loop is the SINGLE retry authority — provider-internal retries
 /// are suppressed via [`crate::providers::chat_scoped`], so total provider

@@ -343,11 +343,12 @@ async fn consolidate_analyst_responses(
                 provider_allow_fallbacks: routing.allow_fallbacks,
             };
 
-            // Hardened outer retry loop (mahbot-1066): the request is
-            // byte-identical across ALL attempts (no re-prompt exists here);
-            // 7 attempts, backoff 5/10/20/40/60/90 s, 600 s wall cap. The outer
-            // loop is the single retry authority — provider-internal retries
-            // are suppressed on scoped calls, so at most 7 HTTP calls happen.
+            // Hardened outer retry loop: the
+            // request is byte-identical across ALL attempts (no re-prompt
+            // exists here); 13 attempts, backoff 5/10/20/40/60/60… s, 720 s
+            // wall cap. The outer loop is the single retry authority —
+            // provider-internal retries are suppressed on scoped calls, so at
+            // most 13 HTTP calls happen.
             let policy = crate::retry::RetryPolicy::current();
             match crate::retry::retry_chat(request, &policy).await {
                 // retry_chat only returns Ok with non-empty (trimmed) text —

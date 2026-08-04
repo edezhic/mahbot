@@ -2025,18 +2025,19 @@ impl SettingsState {
 
     // ── Model picker view helper ───────────────────────────────
 
-    /// Retry policy for scoped LLM operations (mahbot-1066) — verdict
+    /// Retry policy for LLM operations — agent-loop chat calls, verdict
     /// extraction (Analyst/Reviewer/QA/Sanitation) and analyst consolidation.
     ///
-    /// All four tunables share the hardened outer retry loop: 7 attempts,
-    /// backoff 5/10/20/40/60/90 s, ±25% jitter on the sleep only, Retry-After
-    /// honored (clamped [5000, 90000] ms), shutdown-abortable, 600 s
-    /// wall-clock cap. Empty values fall back to the defaults.
+    /// All four tunables share the hardened outer retry loop: 13 attempts,
+    /// backoff 5/10/20/40/60/60… s (base 5000 ms, doubling capped at
+    /// 60000 ms), ±25% jitter on the sleep only, Retry-After honored (clamped
+    /// [5000, 60000] ms), shutdown-abortable, 720 s wall-clock cap. Empty
+    /// values fall back to the defaults.
     fn retry_section(&self) -> Element<'_, SettingsMessage> {
         section(
             "Retry",
             column![
-                text("Verdict extraction + analyst consolidation (scoped calls)")
+                text("Agent LLM calls + verdict extraction + consolidation")
                     .size(11)
                     .color(theme::TEXT_SECONDARY),
                 Space::new().height(4),

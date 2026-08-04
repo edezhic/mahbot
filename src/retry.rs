@@ -1,18 +1,20 @@
-//! Outer retry orchestration for scoped LLM operations (mahbot-1066).
+//! Outer retry orchestration for LLM operations.
 //!
-//! Two expensive code paths use this module:
+//! Three expensive code paths use this module:
 //!
-//! 1. **Verdict extraction** — structured pass/fail verdicts from Analyst /
+//! 1. **Agent-loop LLM calls** — every chat call an agent makes while working
+//!    (`src/agent.rs`).
+//! 2. **Verdict extraction** — structured pass/fail verdicts from Analyst /
 //!    Reviewer / QA / Sanitation agents (`src/extraction.rs`).
-//! 2. **Analyst consolidation** — the synthesis of the 3 parallel analyst
+//! 3. **Analyst consolidation** — the synthesis of the 3 parallel analyst
 //!    reports in the ask tool (`src/tools/ask.rs`).
 //!
 //! # Single retry authority
 //!
-//! The outer loop in this module is the **single retry authority**: on scoped
+//! The outer loop in this module is the **single retry authority**: on these
 //! calls provider-internal retries are suppressed (see [`Provider::chat_scoped`]),
 //! so total provider HTTP calls per operation are explicitly bounded:
-//! 7 per verdict extraction, 7 per consolidation, 21 per 3-analyst wave.
+//! 13 per agent LLM call, 13 per verdict extraction, 13 per consolidation.
 //!
 //! # Byte-identical retry parameters
 //!
@@ -25,11 +27,18 @@
 //!
 //! # Schedule
 //!
-//! 7 loop attempts; backoff 5/10/20/40/60/90 s (canonical literal; config
-//! exposes base 5000 ms / cap 90000 ms); ±25% jitter on the SLEEP ONLY (never
-//! on request bytes); Retry-After honored, clamped [5000 ms, 90000 ms];
-//! shutdown-abortable; per-operation wall-clock cap 600 s (10 min),
-//! authoritative over attempt count.
+//! 13 loop attempts; backoff 5/10/20/40/60/60… s (base 5000 ms, doubling
+//! capped at 60000 ms; total sleep 555 s); ±25% jitter on the SLEEP ONLY
+//! (never on request bytes); Retry-After honored, clamped [5000 ms, 60000 ms];
+//! shutdown-abortable; per-operation wall-clock cap 720 s (12 min),
+//! authoritative over attempt count — rides out sustained 503 outages up to
+//! ~10 min before failing (bounded worst-case stall 12 min).
+//!
+//! Per-attempt timeout semantics come from [`Provider::chat_scoped`]: the
+//! header wait (TTFB) is bounded by the 1-min idle timeout and the whole
+//! attempt by the remaining operation budget — a healthy-but-slow generation
+//! with data flowing is never cut, but a pre-header stall longer than 60 s is
+//! aborted and retried.
 //!
 //! # Telemetry
 //!
@@ -47,23 +56,24 @@ use crate::{ChatRequest, ChatResponse};
 // The string constants are referenced by config.rs's macro invocation
 // (`or(...)` annotations); the parsed defaults live here.
 
-pub(crate) const DEFAULT_RETRY_MAX_ATTEMPTS_STR: &str = "7";
+pub(crate) const DEFAULT_RETRY_MAX_ATTEMPTS_STR: &str = "13";
 pub(crate) const DEFAULT_RETRY_BASE_BACKOFF_MS_STR: &str = "5000";
-pub(crate) const DEFAULT_RETRY_MAX_BACKOFF_MS_STR: &str = "90000";
-pub(crate) const DEFAULT_OPERATION_TIMEOUT_SECS_STR: &str = "600";
+pub(crate) const DEFAULT_RETRY_MAX_BACKOFF_MS_STR: &str = "60000";
+pub(crate) const DEFAULT_OPERATION_TIMEOUT_SECS_STR: &str = "720";
 
-pub(crate) const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 7;
+pub(crate) const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 13;
 pub(crate) const DEFAULT_RETRY_BASE_BACKOFF_MS: u64 = 5_000;
-pub(crate) const DEFAULT_RETRY_MAX_BACKOFF_MS: u64 = 90_000;
-pub(crate) const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_mins(10);
+pub(crate) const DEFAULT_RETRY_MAX_BACKOFF_MS: u64 = 60_000;
+pub(crate) const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_mins(12);
 
 /// Idle (read) timeout for scoped calls — resets while data flows.
 pub(crate) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Lower clamp for Retry-After honoring.
 const RETRY_AFTER_MIN_MS: u64 = 5_000;
-/// Upper clamp for Retry-After honoring.
-const RETRY_AFTER_MAX_MS: u64 = 90_000;
+/// Upper clamp for Retry-After honoring — unified at 60 s across the agent
+/// loop and the scoped paths (ReliableProvider's legacy chat path uses it too).
+pub(crate) const RETRY_AFTER_MAX_MS: u64 = 60_000;
 
 // ── RetryPolicy — snapshot of tunables at operation start ────────────────
 
@@ -73,14 +83,14 @@ const RETRY_AFTER_MAX_MS: u64 = 90_000;
 /// and reuse. Invalid configured values fall back to defaults.
 #[derive(Debug, Clone)]
 pub(crate) struct RetryPolicy {
-    /// Total loop attempts (default 7). The operation makes at most this many
+    /// Total loop attempts (default 13). The operation makes at most this many
     /// provider HTTP calls.
     pub max_attempts: u32,
     /// Base backoff in milliseconds (default 5000).
     pub base_backoff_ms: u64,
-    /// Backoff cap in milliseconds (default 90000).
+    /// Backoff cap in milliseconds (default 60000).
     pub max_backoff_ms: u64,
-    /// Whole-operation wall-clock cap (default 600 s). Authoritative over
+    /// Whole-operation wall-clock cap (default 720 s). Authoritative over
     /// attempt count.
     pub operation_timeout: Duration,
     /// Idle timeout for a single provider call, resetting while data flows.
@@ -196,37 +206,16 @@ fn parse_cfg_u64(key: &str, raw: &str, fallback: u64) -> u64 {
 
 /// Compute the canonical backoff sleep sequence (ms) for a policy.
 ///
-/// Default configuration (base 5000 / cap 90000) yields the pinned canonical
-/// literal 5/10/20/40/60/90 s — the 60 s and 90 s tails are deliberate
-/// deviations from pure doubling (mahbot-1066 spec).
-///
-/// Any custom base or cap produces a pure doubling sequence capped at
-/// `max_backoff_ms` (e.g. base 10000 / cap 90000 → 10/20/40/80/90; base 5000 /
-/// cap 60000 → 5/10/20/40/60). The pinned 60 s tail applies ONLY to the
-/// default configuration — an operator customizing base or cap opts into the
-/// formula.
+/// Pure doubling from `base_backoff_ms`, capped at `max_backoff_ms`. The
+/// default configuration (base 5000 / cap 60000) yields the binding agent-loop
+/// schedule 5/10/20/40/60/60… s — total sleep 555 s over 13 attempts.
 #[must_use]
 pub(crate) fn backoff_sequence(policy: &RetryPolicy) -> Vec<u64> {
     let sleeps = policy.max_attempts.saturating_sub(1) as usize;
     let mut seq = Vec::with_capacity(sleeps);
     for i in 0..sleeps {
-        if policy.base_backoff_ms == DEFAULT_RETRY_BASE_BACKOFF_MS
-            && policy.max_backoff_ms == DEFAULT_RETRY_MAX_BACKOFF_MS
-        {
-            // Pinned canonical literal (the two tail values differ from pure
-            // doubling — 60 and 90 are deliberate).
-            seq.push(match i {
-                0 => 5_000,
-                1 => 10_000,
-                2 => 20_000,
-                3 => 40_000,
-                4 => 60_000,
-                _ => 90_000,
-            });
-        } else {
-            let doubled = policy.base_backoff_ms.saturating_mul(1u64 << i.min(6));
-            seq.push(doubled.min(policy.max_backoff_ms));
-        }
+        let doubled = policy.base_backoff_ms.saturating_mul(1u64 << i.min(6));
+        seq.push(doubled.min(policy.max_backoff_ms));
     }
     seq
 }
@@ -234,7 +223,7 @@ pub(crate) fn backoff_sequence(policy: &RetryPolicy) -> Vec<u64> {
 /// Compute the actual sleep for one inter-attempt gap.
 ///
 /// Retry-After (when present) is authoritative and followed precisely, clamped
-/// to [5000 ms, 90000 ms]. Otherwise ±25% jitter is applied to the schedule
+/// to [5000 ms, 60000 ms]. Otherwise ±25% jitter is applied to the schedule
 /// backoff — jitter touches the SLEEP ONLY, never the request bytes.
 #[must_use]
 pub(crate) fn compute_sleep_ms(schedule_ms: u64, retry_after_ms: Option<u64>) -> u64 {
@@ -617,10 +606,38 @@ impl RetryLoop {
 /// The request is byte-identical across ALL attempts — there is no re-prompt
 /// here (consolidation has no target schema). Retryable conditions: provider
 /// failures of any retryable class AND empty response text.
-#[allow(clippy::cast_possible_truncation)]
 pub(crate) async fn retry_chat(
     request: ChatRequest,
     policy: &RetryPolicy,
+) -> Result<ChatResponse, RetryExhausted> {
+    retry_chat_with(request, policy, |r| {
+        r.text.as_deref().is_some_and(|t| !t.trim().is_empty())
+    })
+    .await
+}
+
+/// Agent-loop LLM call with the same outer retry loop.
+///
+/// Byte-identical request across ALL attempts; retries provider failures of
+/// any retryable class and honors the operation wall-clock cap. Any `Ok`
+/// response is accepted — empty text is a valid tool-call turn, so unlike
+/// consolidation there is no text contract.
+pub(crate) async fn agent_chat(
+    request: ChatRequest,
+    policy: &RetryPolicy,
+) -> Result<ChatResponse, RetryExhausted> {
+    retry_chat_with(request, policy, |_| true).await
+}
+
+/// Shared outer retry loop: at most `policy.max_attempts` single-attempt
+/// scoped calls, wall-clock-bounded, with per-attempt telemetry. `is_success`
+/// decides whether an `Ok` response ends the loop (empty-text handling differs
+/// between the agent path and consolidation).
+#[allow(clippy::cast_possible_truncation)]
+async fn retry_chat_with(
+    request: ChatRequest,
+    policy: &RetryPolicy,
+    is_success: impl Fn(&ChatResponse) -> bool + Send,
 ) -> Result<ChatResponse, RetryExhausted> {
     let mut loop_state = RetryLoop::new(policy);
 
@@ -638,14 +655,14 @@ pub(crate) async fn retry_chat(
         .await
         {
             Ok(resp) => {
-                if resp.text.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+                if is_success(&resp) {
                     return Ok(resp);
                 }
                 let elapsed = attempt_started.elapsed().as_millis() as u64;
                 let rec = RetryFailureRecord::new_simple(
                     attempt,
                     FailureClass::NoResponse,
-                    &anyhow::anyhow!("consolidation LLM returned empty response"),
+                    &anyhow::anyhow!("LLM returned empty response"),
                     elapsed,
                     None,
                 );
@@ -709,9 +726,9 @@ mod tests {
     }
 
     #[test]
-    fn default_backoff_sequence_is_pinned_literal() {
+    fn default_backoff_sequence_is_doubling_capped() {
         let p = RetryPolicy {
-            max_attempts: 7,
+            max_attempts: DEFAULT_RETRY_MAX_ATTEMPTS,
             base_backoff_ms: DEFAULT_RETRY_BASE_BACKOFF_MS,
             max_backoff_ms: DEFAULT_RETRY_MAX_BACKOFF_MS,
             operation_timeout: DEFAULT_OPERATION_TIMEOUT,
@@ -719,7 +736,10 @@ mod tests {
         };
         assert_eq!(
             backoff_sequence(&p),
-            vec![5_000, 10_000, 20_000, 40_000, 60_000, 90_000]
+            vec![
+                5_000, 10_000, 20_000, 40_000, 60_000, 60_000, 60_000, 60_000, 60_000, 60_000,
+                60_000, 60_000
+            ]
         );
     }
 
@@ -739,43 +759,11 @@ mod tests {
     }
 
     #[test]
-    fn custom_config_at_default_base_drops_pinned_tail() {
-        // The pinned 60 s tail is a DELIBERATE deviation from doubling and
-        // applies only to the default base+cap pair (see backoff_sequence
-        // docs). Changing only the cap opts into pure doubling:
-        //  - cap 60000 → 5/10/20/40/60 (60 here is doubling capped at cap,
-        //    not the pinned literal)
-        //  - cap 120000 → 5/10/20/40/80/120 (the deliberate 60 disappears)
-        let p = RetryPolicy {
-            max_attempts: 6,
-            base_backoff_ms: DEFAULT_RETRY_BASE_BACKOFF_MS,
-            max_backoff_ms: 60_000,
-            operation_timeout: DEFAULT_OPERATION_TIMEOUT,
-            idle_timeout: DEFAULT_IDLE_TIMEOUT,
-        };
-        assert_eq!(
-            backoff_sequence(&p),
-            vec![5_000, 10_000, 20_000, 40_000, 60_000]
-        );
-        let p = RetryPolicy {
-            max_attempts: 7,
-            base_backoff_ms: DEFAULT_RETRY_BASE_BACKOFF_MS,
-            max_backoff_ms: 120_000,
-            operation_timeout: DEFAULT_OPERATION_TIMEOUT,
-            idle_timeout: DEFAULT_IDLE_TIMEOUT,
-        };
-        assert_eq!(
-            backoff_sequence(&p),
-            vec![5_000, 10_000, 20_000, 40_000, 80_000, 120_000]
-        );
-    }
-
-    #[test]
     fn compute_sleep_honors_retry_after_clamped() {
-        // Retry-After followed precisely within [5000, 90000].
+        // Retry-After followed precisely within [5000, 60000].
         assert_eq!(compute_sleep_ms(5_000, Some(7_000)), 7_000);
         assert_eq!(compute_sleep_ms(5_000, Some(1_000)), 5_000);
-        assert_eq!(compute_sleep_ms(5_000, Some(200_000)), 90_000);
+        assert_eq!(compute_sleep_ms(5_000, Some(200_000)), 60_000);
     }
 
     #[test]
@@ -794,7 +782,7 @@ mod tests {
     async fn stale_retry_after_does_not_stick_across_failures() {
         // A 429 Retry-After applies only to the sleep following the 429. A
         // later non-429 failure (parse / NoResponse, no Retry-After) must
-        // clear it — otherwise a stale value wastes up to 90 s of the 600 s
+        // clear it — otherwise a stale value wastes up to 60 s of the 720 s
         // wall budget per occurrence (reviewer finding).
         let _guard = crate::util::test::retry_tests_lock();
         let policy = tiny_test_policy();
@@ -921,5 +909,59 @@ mod tests {
         ] {
             let _ = crate::config::CONFIG.set_string_field(key, "");
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    async fn agent_chat_rides_out_sustained_outage_and_recovers() {
+        let _guard = crate::util::test::retry_tests_lock();
+        // The binding agent-loop budget (13 attempts): the first 12 attempts
+        // hit a sustained 503-style outage, the 13th recovers. The old
+        // ReliableProvider budget (5 attempts) would have died at attempt 5.
+        let policy = RetryPolicy {
+            max_attempts: 13,
+            base_backoff_ms: 1,
+            max_backoff_ms: 1,
+            operation_timeout: Duration::from_mins(12),
+            idle_timeout: Duration::from_secs(1),
+        };
+        let mut fake = crate::util::test::FakeProvider::new();
+        for i in 0..12 {
+            fake = fake.err(FailureClass::Transport, &format!("503 outage attempt {i}"));
+        }
+        let fake = fake.ok("recovered");
+        let _provider_guard = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        let request = crate::providers::test_request(vec![crate::ChatMessage::user("hi")], None);
+        let resp = agent_chat(request, &policy)
+            .await
+            .expect("must recover on attempt 13");
+        assert_eq!(resp.text_or_empty(), "recovered");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    async fn agent_chat_wall_clock_cap_binds() {
+        let _guard = crate::util::test::retry_tests_lock();
+        // 13 attempts but a 100 ms wall cap and 1 s backoff — the cap binds.
+        let policy = RetryPolicy {
+            max_attempts: 13,
+            base_backoff_ms: 1_000,
+            max_backoff_ms: 1_000,
+            operation_timeout: Duration::from_millis(100),
+            idle_timeout: Duration::from_secs(1),
+        };
+        let fake = crate::util::test::FakeProvider::new()
+            .err(FailureClass::Transport, "slow outage")
+            .err(FailureClass::Transport, "slow outage");
+        let _provider_guard = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        let request = crate::providers::test_request(vec![crate::ChatMessage::user("hi")], None);
+        let failure = agent_chat(request, &policy)
+            .await
+            .expect_err("wall-clock cap must bind");
+        assert_eq!(failure.final_class, FailureClass::WallClockExceeded);
+        assert!(
+            failure.failures.len() <= 2,
+            "cap must stop the loop before 13 attempts"
+        );
     }
 }
