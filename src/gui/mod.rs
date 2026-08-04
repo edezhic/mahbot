@@ -1465,10 +1465,7 @@ impl Dashboard {
         // to destroy the entire widget tree, losing scroll positions, cursor
         // states, and all other widget state.
         let overlay: Element<'_, Message> = if self.toasts.is_empty() {
-            container(text(""))
-                .width(Length::Shrink)
-                .height(Length::Shrink)
-                .into()
+            widget_helpers::empty_stack_placeholder()
         } else {
             let mut toast_col = Column::new().spacing(6).align_x(Alignment::Center);
             for toast in &self.toasts {
@@ -1505,10 +1502,7 @@ impl Dashboard {
         let diff_overlay: Element<'_, Message> = if self.show_diff_modal {
             render_diff_modal(&self.diff_state)
         } else {
-            container(text(""))
-                .width(Length::Shrink)
-                .height(Length::Shrink)
-                .into()
+            widget_helpers::empty_stack_placeholder()
         };
 
         // ── Branch management modal overlay ─────────────────────────
@@ -1516,10 +1510,7 @@ impl Dashboard {
             let inner = self.git_state.view().map(Message::Git);
             modal_overlay(inner, Message::Git(git::GitMessage::CloseModal))
         } else {
-            container(text(""))
-                .width(Length::Shrink)
-                .height(Length::Shrink)
-                .into()
+            widget_helpers::empty_stack_placeholder()
         };
 
         iced::widget::stack![body, diff_overlay, branch_overlay, overlay].into()

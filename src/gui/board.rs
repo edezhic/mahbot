@@ -1160,11 +1160,7 @@ impl BoardState {
         } else {
             // Keep Stack widget type stable to prevent MouseArea state
             // from becoming orphaned when the modal closes.
-            iced::widget::stack([container(text(""))
-                .width(Length::Shrink)
-                .height(Length::Shrink)
-                .into()])
-            .into()
+            iced::widget::stack([widget_helpers::empty_stack_placeholder()]).into()
         }
     }
 

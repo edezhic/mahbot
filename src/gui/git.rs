@@ -9,6 +9,7 @@
 //! at the Dashboard level.
 
 use super::theme;
+use super::widget_helpers;
 
 use iced::widget::{Column, Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Element, Length, Task};
@@ -436,10 +437,7 @@ impl GitState {
     /// Returns an empty element when the modal is closed.
     pub fn view(&self) -> Element<'_, GitMessage> {
         if !self.show_branch_modal {
-            return container(text(""))
-                .width(Length::Shrink)
-                .height(Length::Shrink)
-                .into();
+            return widget_helpers::empty_stack_placeholder();
         }
 
         let search_input = text_input("Search branches…", &self.branch_search_query)

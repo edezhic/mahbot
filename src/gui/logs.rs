@@ -765,11 +765,7 @@ impl LogsState {
             theme::role_badge_color(&entry.agent_role).0
         };
 
-        let timestamp = if entry.timestamp.len() > 19 {
-            &entry.timestamp[11..19] // Extract HH:MM:SS from ISO 8601
-        } else {
-            &entry.timestamp
-        };
+        let timestamp = theme::format_hhmmss(&entry.timestamp);
 
         let mut entry_view = column![
             row![

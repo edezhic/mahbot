@@ -201,11 +201,7 @@ impl ToolFailuresState {
     fn render_metadata_row(entry: &ToolErrorEntry) -> iced::widget::Row<'_, ToolFailuresMessage> {
         let (fg, bg) = theme::role_badge_color(&entry.role);
 
-        let timestamp = if entry.recorded_at.len() > 19 {
-            &entry.recorded_at[11..19] // Extract HH:MM:SS from ISO 8601
-        } else {
-            &entry.recorded_at
-        };
+        let timestamp = theme::format_hhmmss(&entry.recorded_at);
 
         let duration_label = format!("{}ms", entry.duration_ms);
 

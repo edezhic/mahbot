@@ -1700,11 +1700,7 @@ impl SettingsState {
             )
         } else {
             // Keep Stack widget type stable
-            iced::widget::stack([container(text(""))
-                .width(Length::Shrink)
-                .height(Length::Shrink)
-                .into()])
-            .into()
+            iced::widget::stack([widget_helpers::empty_stack_placeholder()]).into()
         }
     }
 

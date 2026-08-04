@@ -327,6 +327,18 @@ pub fn format_timestamp(ts: &str) -> String {
     }
 }
 
+/// Extract the HH:MM:SS portion of an ISO 8601 timestamp, or the full
+/// string when shorter than 20 chars. Char-boundary safe (mirrors
+/// `format_timestamp`'s hardening); byte-identical to a raw `ts[11..19]`
+/// slice for ASCII timestamps.
+pub fn format_hhmmss(ts: &str) -> &str {
+    if ts.len() > 19 {
+        &ts[ts.floor_char_boundary(11)..ts.floor_char_boundary(19)]
+    } else {
+        ts
+    }
+}
+
 // ── Workspace status colors ───────────────────────────────────────
 
 #[must_use]

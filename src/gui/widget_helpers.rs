@@ -1,4 +1,4 @@
-//! Shared widget utilities — modal backdrop overlay.
+//! Shared widget utilities — modal backdrop overlay and type-stable placeholder.
 
 use iced::widget::{container, mouse_area, stack, text};
 use iced::{Color, Element, Length};
@@ -45,4 +45,21 @@ pub fn modal_backdrop<'a, Message: 'a + Clone>(
         .center_y(Length::Fill);
 
     stack([backdrop.into(), centered.into()]).into()
+}
+
+/// Zero-size placeholder that keeps an overlay slot's widget type stable
+/// across show/hide transitions. Iced destroys widget state (scroll
+/// positions, open popovers) when the widget tree tag changes between
+/// frames, so the closed state must return the identical bare Container.
+/// Callers whose open state is a Stack (board.rs, settings.rs modal
+/// overlays) must wrap this in `iced::widget::stack([...])` themselves.
+/// Known pre-existing quirks, not fixed here: git.rs's closed-branch is
+/// unreachable (`view()` is gated on the modal being open), and the mod.rs
+/// diff/branch overlay slots use a bare-Container placeholder against
+/// Stack open states (type mismatch predates this helper).
+pub fn empty_stack_placeholder<'a, Message: 'a>() -> Element<'a, Message> {
+    container(text(""))
+        .width(Length::Shrink)
+        .height(Length::Shrink)
+        .into()
 }
