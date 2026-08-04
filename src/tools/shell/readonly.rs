@@ -618,9 +618,7 @@ fn has_disallowed_redirect(segment: &str, state: &ValidationState) -> Result<(),
             continue;
         }
 
-        let resolved = resolve_path_word(target, state);
-        let allowed = resolved.is_some_and(|path| is_path_under_temp(&path, state.ctx));
-        if !allowed {
+        if writes_outside_temp(target, state) {
             // Absolute/relative non-temp non-devnull = disallowed
             return Err(format!(
                 "⚠️ Read-only mode: command contains a disallowed output redirect.\n\
@@ -668,6 +666,13 @@ fn resolve_path_word(word: &str, state: &ValidationState) -> Option<std::path::P
         return Some(cwd.join(&expanded));
     }
     Some(path)
+}
+
+/// True when `word` does not provably resolve under an allowed temp root.
+/// Resolution failure counts as outside temp (fail-closed): unknown or
+/// poisoned variables, tilde paths, and unanchored relative paths all reject.
+fn writes_outside_temp(word: &str, state: &ValidationState) -> bool {
+    !resolve_path_word(word, state).is_some_and(|p| is_path_under_temp(&p, state.ctx))
 }
 
 /// Strip balanced surrounding single/double quotes from a shell word.
@@ -2363,6 +2368,64 @@ const TEMP_MUTATORS: &[&str] = &[
     "cp", "mv", "rm", "rmdir", "unlink", "gzip", "gunzip", "bzip2", "xz", "zstd", "zip",
 ];
 
+/// One temp-gated mutator dispatch row.
+struct MutatorCheck {
+    verbs: &'static [&'static str],
+    /// Reject predicate: true when the invocation writes outside temp and must
+    /// be rejected; `None` = always rejected (unconditional mutator).
+    rejects: Option<fn(&str, &str, &ValidationState) -> bool>,
+    /// Rejection reason template with a `{verb}` placeholder.
+    rejection: &'static str,
+    /// Suggestion strings: the first educates about recognized temp-variable
+    /// spellings when a `$` path failed to resolve; the second is the generic
+    /// read-only-alternatives fallback.
+    suggestions: (&'static str, &'static str),
+}
+
+/// True when a scratch mutator writes outside temp.
+fn scratch_rejects(segment: &str, _verb: &str, state: &ValidationState) -> bool {
+    !scratch_paths_under_temp(segment, state)
+}
+
+/// True when a temp mutator writes outside temp; `cp` only needs its
+/// destination under temp (sources are read-only — copying from anywhere
+/// into temp is allowed; copying into the workspace stays blocked).
+fn temp_rejects(segment: &str, verb: &str, state: &ValidationState) -> bool {
+    !temp_mutator_paths_under_temp(segment, verb, state)
+}
+
+const READONLY_ALTERNATIVES: &str = "use read-only alternatives to inspect files, e.g. `cat`, `head`, `tail`, `ls`, `file`, `stat`.";
+
+/// Temp-gated mutator dispatch, iterated in order by [`check_segment`]:
+/// scratch mutators (tee/touch/mkdir), temp mutators (cp/mv/rm/…), then the
+/// unconditional mutators (always rejected).
+const MUTATOR_CHECKS: &[MutatorCheck] = &[
+    MutatorCheck {
+        verbs: SCRATCH_MUTATORS,
+        rejects: Some(scratch_rejects),
+        rejection: "`{verb}` is not allowed outside temp directories — it modifies the workspace.",
+        suggestions: (
+            "use a literal path under /tmp, or bind the directory first with `NAME=$(mktemp -d)` and reference `$NAME`.",
+            READONLY_ALTERNATIVES,
+        ),
+    },
+    MutatorCheck {
+        verbs: TEMP_MUTATORS,
+        rejects: Some(temp_rejects),
+        rejection: "`{verb}` is not allowed outside temp directories — it modifies files outside /tmp.",
+        suggestions: (
+            "use a literal path under /tmp, or bind the directory first with `NAME=$(mktemp -d)` and reference `$NAME`.",
+            "use paths under /tmp, /var/tmp, or the OS temp directory, or use read-only alternatives like `cat`, `head`, `tail`, `ls`, `file`, `stat`.",
+        ),
+    },
+    MutatorCheck {
+        verbs: MUTATING_COMMANDS,
+        rejects: None,
+        rejection: "`{verb}` is not allowed — it modifies the workspace.",
+        suggestions: (READONLY_ALTERNATIVES, READONLY_ALTERNATIVES),
+    },
+];
+
 /// A flag-dependent command check: if the command's first word matches `verb`
 /// and the `predicate` returns true, the command is rejected with the given message.
 struct FlagCheck {
@@ -2606,10 +2669,7 @@ fn has_unresolved_var_path(segment: &str, state: &ValidationState) -> bool {
 /// True when every explicit path argument resolves under an allowed temp root.
 fn scratch_paths_under_temp(segment: &str, state: &ValidationState) -> bool {
     let paths = non_flag_path_args(segment);
-    !paths.is_empty()
-        && paths.iter().all(|p| {
-            resolve_path_word(p, state).is_some_and(|path| is_path_under_temp(&path, state.ctx))
-        })
+    !paths.is_empty() && paths.iter().all(|p| !writes_outside_temp(p, state))
 }
 
 /// True when a temp mutator's path arguments all resolve under an allowed
@@ -2635,18 +2695,15 @@ fn cp_destination_under_temp(segment: &str, state: &ValidationState) -> bool {
 
     for flag in ["-t", "--target-directory"] {
         if let Some(val) = flag_value(rest, flag) {
-            return resolve_path_word(val, state)
-                .is_some_and(|p| is_path_under_temp(&p, state.ctx));
+            return !writes_outside_temp(val, state);
         }
     }
     if let Some(val) = flag_value_equals(rest, "--target-directory=") {
-        return resolve_path_word(val, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
+        return !writes_outside_temp(val, state);
     }
 
     match non_flag_path_args(segment).last() {
-        Some(dest) => {
-            resolve_path_word(dest, state).is_some_and(|p| is_path_under_temp(&p, state.ctx))
-        }
+        Some(dest) => !writes_outside_temp(dest, state),
         None => false, // no identifiable destination → reject
     }
 }
@@ -2992,61 +3049,37 @@ fn check_segment(segment: &str, state: &mut ValidationState, negated: bool) -> R
         return Ok(());
     }
 
-    // Scratch mutators (tee, touch, mkdir) are allowed when all explicit
-    // path arguments are under an allowed temp directory.
-    if SCRATCH_MUTATORS.contains(&first_word) {
-        if scratch_paths_under_temp(trimmed, state) {
-            // `mkdir` creates the directories it names — record those whose
-            // creation is provable (all `-p` targets, and non-`-p` targets
-            // whose parent already exists) so a later `cd` in the same chain
-            // can track them even though they did not exist at validation
-            // time. A non-`-p` target under a missing parent errors at
-            // runtime and must not be treated as created (fail-closed).
-            if first_word == "mkdir" {
-                record_mkdir_targets(trimmed, state);
-            }
-            return Ok(());
+    // Temp-gated mutator dispatch (scratch, temp, unconditional). A matching
+    // verb is rejected when its reject predicate reports a write outside temp
+    // (`None` = always rejected). `mkdir` additionally records its provably
+    // created directories (all `-p` targets, and non-`-p` targets whose parent
+    // already exists) so a later `cd` in the same chain can track them even
+    // though they did not exist at validation time — a non-`-p` target under a
+    // missing parent errors at runtime and must not be treated as created
+    // (fail-closed).
+    for check in MUTATOR_CHECKS {
+        if !check.verbs.contains(&first_word) {
+            continue;
         }
-        return reject(
-            trimmed,
-            &format!(
-                "`{first_word}` is not allowed outside temp directories — it modifies the workspace."
-            ),
-            if has_unresolved_var_path(trimmed, state) {
-                "use a literal path under /tmp, or bind the directory first with `NAME=$(mktemp -d)` and reference `$NAME`."
-            } else {
-                "use read-only alternatives to inspect files, e.g. `cat`, `head`, `tail`, `ls`, `file`, `stat`."
-            },
-        );
-    }
-
-    // Temp mutators (cp, mv, rm, gzip, etc.) are allowed when their path
-    // arguments target temp directories. The prompt tells agents that
-    // writing to the OS temp directory is allowed.
-    if TEMP_MUTATORS.contains(&first_word) {
-        if temp_mutator_paths_under_temp(trimmed, first_word, state) {
-            return Ok(());
+        if check
+            .rejects
+            .is_none_or(|reject| reject(trimmed, first_word, state))
+        {
+            let (education, fallback) = check.suggestions;
+            return reject(
+                trimmed,
+                &check.rejection.replace("{verb}", first_word),
+                if has_unresolved_var_path(trimmed, state) {
+                    education
+                } else {
+                    fallback
+                },
+            );
         }
-        return reject(
-            trimmed,
-            &format!(
-                "`{first_word}` is not allowed outside temp directories — it modifies files outside /tmp."
-            ),
-            if has_unresolved_var_path(trimmed, state) {
-                "use a literal path under /tmp, or bind the directory first with `NAME=$(mktemp -d)` and reference `$NAME`."
-            } else {
-                "use paths under /tmp, /var/tmp, or the OS temp directory, or use read-only alternatives like `cat`, `head`, `tail`, `ls`, `file`, `stat`."
-            },
-        );
-    }
-
-    // Unconditional rejections — commands that always mutate.
-    if MUTATING_COMMANDS.contains(&first_word) {
-        return reject(
-            trimmed,
-            &format!("`{first_word}` is not allowed — it modifies the workspace."),
-            "use read-only alternatives to inspect files, e.g. `cat`, `head`, `tail`, `ls`, `file`, `stat`.",
-        );
+        if first_word == "mkdir" {
+            record_mkdir_targets(trimmed, state);
+        }
+        return Ok(());
     }
 
     // Git-specific checks
@@ -3702,6 +3735,38 @@ const GIT_REMOTE_MUTATIONS: &[&str] = &[
     "prune",
 ];
 
+/// Git subcommands that always write to the object database or working tree —
+/// rejected regardless of flags. Prefix-matched (`subcommand.starts_with`).
+const GIT_ALWAYS_MUTATE: &[(&str, &str, &str)] = &[
+    // git mktag always writes a tag object to the object database — no read-only mode.
+    (
+        "mktag",
+        "`git mktag` is not allowed — it always writes a tag object to the object database.",
+        "use `git verify-tag` or `git cat-file` to inspect existing tag objects.",
+    ),
+    // git mktree always writes a tree object to the object database — no read-only mode.
+    (
+        "mktree",
+        "`git mktree` is not allowed — it always writes a tree object to the object database.",
+        "use `git ls-tree` to inspect existing tree objects.",
+    ),
+    // git merge-file without -p/--stdout overwrites the <current> file in-place.
+    // Even with -p/--stdout, the --object-id variant writes to the object store.
+    // Rather than a complex multi-flag check, reject entirely for safety.
+    (
+        "merge-file",
+        "`git merge-file` is not allowed — it mutates files or writes to the object database.",
+        "use `git diff` to compare files, or `diff`/`diff3` for three-way comparisons.",
+    ),
+    // git merge-tree since Git 2.40 defaults to --write-tree, which creates tree
+    // objects in the object database. The alternative --trivial-merge is deprecated.
+    (
+        "merge-tree",
+        "`git merge-tree` is not allowed — it writes tree objects in its default mode.",
+        "use `git merge-base` to find the merge base, or `git diff-tree` to inspect trees.",
+    ),
+];
+
 /// True when the command has a git dry-run token: `-n`, `--dry-run`, or a
 /// combined short flag containing `n` (e.g. `clean -ndx`). Long flags are
 /// excluded so `--name-only`-style tokens don't count.
@@ -3866,43 +3931,12 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
         return result;
     }
 
-    // git mktag always writes a tag object to the object database — no read-only mode.
-    if subcommand.starts_with("mktag") {
-        return reject(
-            trimmed,
-            "`git mktag` is not allowed — it always writes a tag object to the object database.",
-            "use `git verify-tag` or `git cat-file` to inspect existing tag objects.",
-        );
-    }
-
-    // git mktree always writes a tree object to the object database — no read-only mode.
-    if subcommand.starts_with("mktree") {
-        return reject(
-            trimmed,
-            "`git mktree` is not allowed — it always writes a tree object to the object database.",
-            "use `git ls-tree` to inspect existing tree objects.",
-        );
-    }
-
-    // git merge-file without -p/--stdout overwrites the <current> file in-place.
-    // Even with -p/--stdout, the --object-id variant writes to the object store.
-    // Rather than a complex multi-flag check, reject entirely for safety.
-    if subcommand.starts_with("merge-file") {
-        return reject(
-            trimmed,
-            "`git merge-file` is not allowed — it mutates files or writes to the object database.",
-            "use `git diff` to compare files, or `diff`/`diff3` for three-way comparisons.",
-        );
-    }
-
-    // git merge-tree since Git 2.40 defaults to --write-tree, which creates tree
-    // objects in the object database. The alternative --trivial-merge is deprecated.
-    if subcommand.starts_with("merge-tree") {
-        return reject(
-            trimmed,
-            "`git merge-tree` is not allowed — it writes tree objects in its default mode.",
-            "use `git merge-base` to find the merge base, or `git diff-tree` to inspect trees.",
-        );
+    // git subcommands that always write to the object database or working
+    // tree — rejected regardless of flags (prefix-matched).
+    for &(prefix, why, suggestion) in GIT_ALWAYS_MUTATE {
+        if subcommand.starts_with(prefix) {
+            return reject(trimmed, why, suggestion);
+        }
     }
 
     let matched_safe = GIT_SAFE_SUBCOMMANDS
@@ -4217,6 +4251,20 @@ fn flag_value_equals<'a>(parts: &'a [&'a str], prefix: &str) -> Option<&'a str> 
     parts.iter().find_map(|p| p.strip_prefix(prefix))
 }
 
+/// Value of the first of `flags` found in space-separated form, falling back
+/// to the `=` form of `equals_prefix` when set. `None` when no flag is
+/// present. The `=` fallback is opt-in per tool: base64 has no `=` form.
+fn output_flag_value<'a>(
+    parts: &'a [&'a str],
+    flags: &[&str],
+    equals_prefix: Option<&str>,
+) -> Option<&'a str> {
+    flags
+        .iter()
+        .find_map(|f| flag_value(parts, f))
+        .or_else(|| equals_prefix.and_then(|p| flag_value_equals(parts, p)))
+}
+
 /// Check if `sed` has `-i` in a way that mutates files outside temp.
 /// When all file operands after `-i` are under temp, returns `false` (allow).
 fn has_sed_mutation(command: &str, state: &ValidationState) -> bool {
@@ -4260,9 +4308,7 @@ fn has_sed_mutation(command: &str, state: &ValidationState) -> bool {
         return true; // `sed -i` without file operand → reject (conservative)
     }
 
-    !file_operands.iter().all(|p| {
-        resolve_path_word(p, state).is_some_and(|path| is_path_under_temp(&path, state.ctx))
-    })
+    file_operands.iter().any(|p| writes_outside_temp(p, state))
 }
 
 /// Check if `awk -i inplace` is present.
@@ -4276,8 +4322,7 @@ fn has_inplace(command: &str, _state: &ValidationState) -> bool {
 fn has_dd_mutation(command: &str, state: &ValidationState) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
     if let Some(of_val) = flag_value_equals(&parts, "of=") {
-        return !resolve_path_word(of_val, state)
-            .is_some_and(|path| is_path_under_temp(&path, state.ctx));
+        return writes_outside_temp(of_val, state);
     }
     false
 }
@@ -4293,17 +4338,9 @@ fn has_curl_mutation(command: &str, state: &ValidationState) -> bool {
         return true;
     }
 
-    // -o/--output: blocked unless output path is under temp
-    for flag in &["-o", "--output"] {
-        if let Some(path) = flag_value(&parts, flag) {
-            return !resolve_path_word(path, state)
-                .is_some_and(|p| is_path_under_temp(&p, state.ctx));
-        }
-    }
-
-    // --output=path syntax
-    if let Some(path) = flag_value_equals(&parts, "--output=") {
-        return !resolve_path_word(path, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
+    // -o/--output (space and = forms): blocked unless the path is under temp
+    if let Some(path) = output_flag_value(&parts, &["-o", "--output"], Some("--output=")) {
+        return writes_outside_temp(path, state);
     }
 
     false
@@ -4316,23 +4353,21 @@ fn has_curl_mutation(command: &str, state: &ValidationState) -> bool {
 fn has_wget_mutation(command: &str, state: &ValidationState) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
 
-    // -O/--output-document: specify output file path
-    if let Some(path) = flag_value(&parts, "-O").or_else(|| flag_value(&parts, "--output-document"))
-    {
-        return !resolve_path_word(path, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
+    // -O/--output-document and -P/--directory-prefix (space and = forms):
+    // allowed when the path is under temp.
+    if let Some(path) = output_flag_value(
+        &parts,
+        &["-O", "--output-document"],
+        Some("--output-document="),
+    ) {
+        return writes_outside_temp(path, state);
     }
-    if let Some(path) = flag_value_equals(&parts, "--output-document=") {
-        return !resolve_path_word(path, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
-    }
-
-    // -P/--directory-prefix: specify download directory
-    if let Some(path) =
-        flag_value(&parts, "-P").or_else(|| flag_value(&parts, "--directory-prefix"))
-    {
-        return !resolve_path_word(path, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
-    }
-    if let Some(path) = flag_value_equals(&parts, "--directory-prefix=") {
-        return !resolve_path_word(path, state).is_some_and(|p| is_path_under_temp(&p, state.ctx));
+    if let Some(path) = output_flag_value(
+        &parts,
+        &["-P", "--directory-prefix"],
+        Some("--directory-prefix="),
+    ) {
+        return writes_outside_temp(path, state);
     }
 
     // No known output flag → wget would write to CWD with URL's filename
@@ -4418,12 +4453,10 @@ fn has_base64_mutation(command: &str, state: &ValidationState) -> bool {
 
     let parts: Vec<&str> = command.split_whitespace().collect();
 
-    // Check -o/--output flag values
-    for flag in &["-o", "--output"] {
-        if let Some(path) = flag_value(&parts, flag) {
-            return !resolve_path_word(path, state)
-                .is_some_and(|p| is_path_under_temp(&p, state.ctx));
-        }
+    // -o/--output (space form only — base64 has no `=` form): blocked unless
+    // the path is under temp
+    if let Some(path) = output_flag_value(&parts, &["-o", "--output"], None) {
+        return writes_outside_temp(path, state);
     }
 
     // No -o/--output flag → output to stdout, not mutating
@@ -5298,21 +5331,12 @@ mod tests {
     /// and rejected with non-temp paths, preventing coverage drift.
     #[test]
     fn all_temp_mutators_allowed_with_temp_paths() {
-        // cp, mv, rm, rmdir, unlink: basic file ops
-        let temp_ops: &[(&str, &str)] = &[
-            ("cp", "/tmp/a /tmp/b"),
-            ("mv", "/tmp/a /tmp/b"),
-            ("rm", "/tmp/scratch.txt"),
-            ("rmdir", "/tmp/scratch_dir"),
-            ("unlink", "/tmp/link"),
-            ("gzip", "/tmp/file.txt"),
-            ("gunzip", "/tmp/file.txt.gz"),
-            ("bzip2", "/tmp/file.txt"),
-            ("xz", "/tmp/file.txt"),
-            ("zstd", "/tmp/file.txt"),
-            ("zip", "/tmp/out.zip /tmp/file1"),
-        ];
-        for &(cmd, args) in temp_ops {
+        for &cmd in TEMP_MUTATORS {
+            let args = match cmd {
+                "cp" | "mv" => "/tmp/a /tmp/b",
+                "zip" => "/tmp/out.zip /tmp/file1",
+                _ => "/tmp/scratch.txt",
+            };
             ok(&format!("{cmd} {args}"));
         }
     }
@@ -5321,11 +5345,31 @@ mod tests {
     /// with a non-temp absolute path, preventing accidental test drift.
     #[test]
     fn all_temp_mutators_rejected_with_non_temp() {
-        let temp_ops: &[&str] = &[
-            "cp", "mv", "rm", "rmdir", "unlink", "gzip", "gunzip", "bzip2", "xz", "zstd", "zip",
-        ];
-        for &cmd in temp_ops {
+        for &cmd in TEMP_MUTATORS {
             assert_rejected(&format!("{cmd} /etc/blocked_test"));
+        }
+    }
+
+    /// Renders every [`MUTATOR_CHECKS`] rejection template so malformed
+    /// `{verb}` placeholders fail in CI instead of at runtime, and sanity-
+    /// checks the static git always-mutate rows.
+    #[test]
+    fn mutator_table_rows_render() {
+        for check in MUTATOR_CHECKS {
+            for &verb in check.verbs {
+                let rendered = check.rejection.replace("{verb}", verb);
+                assert!(
+                    !rendered.contains('{'),
+                    "unsubstituted placeholder in rejection: {rendered}"
+                );
+                assert!(
+                    rendered.contains(verb),
+                    "verb missing from rendered rejection: {rendered}"
+                );
+            }
+        }
+        for &(_, why, suggestion) in GIT_ALWAYS_MUTATE {
+            assert!(!why.is_empty() && !suggestion.is_empty());
         }
     }
 
