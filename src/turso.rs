@@ -349,6 +349,18 @@ pub(crate) struct Connection {
     has_dangling_tx: Arc<AtomicBool>,
 }
 
+/// Message prefix of a known Limbo integrity_check false positive.
+///
+/// Limbo's FTS keeps tantivy chunks in an internal backing index while the
+/// dir table stays empty, so the index-cardinality comparison always
+/// mismatches once the index has content (upstream tursodatabase/turso#7611,
+/// unfixed through 0.7.x). Only this exact count-mismatch message is masked;
+/// other messages naming the same internal index (missing/non-unique entries)
+/// signal real corruption and stay reported. Re-check if upstream lands a fix
+/// or renames internals.
+const KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE: &str =
+    "wrong # of entries in index __turso_internal_fts_dir_";
+
 /// Map each row in a slice through a fallible closure, collecting into a
 /// `Vec<turso::Result<T>>` with per-row error conversion.
 ///
@@ -591,9 +603,10 @@ impl Connection {
             .await
             .context("Failed to execute PRAGMA quick_check")?;
 
-        if let Some(row) = rows.first() {
+        for row in &rows {
             match row.get_value(0)? {
                 Value::Text(s) if s == "ok" => {}
+                Value::Text(s) if s.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE) => {}
                 Value::Text(s) => anyhow::bail!("Database integrity check failed: {s}"),
                 _ => anyhow::bail!("Unexpected result from PRAGMA quick_check"),
             }
@@ -629,6 +642,7 @@ impl Connection {
         for row in &rows {
             match row.get_value(0)? {
                 Value::Text(s) if s == "ok" => { /* healthy, skip */ }
+                Value::Text(s) if s.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE) => {}
                 Value::Text(s) => problems.push(s),
                 _ => anyhow::bail!("Unexpected result from PRAGMA integrity_check"),
             }
@@ -1273,5 +1287,20 @@ mod tests {
             problems.is_empty(),
             "expected no integrity problems, got: {problems:?}",
         );
+    }
+
+    /// The known FTS-dir count-mismatch false positive is masked, while other
+    /// messages naming the same internal index (genuine corruption) are not.
+    #[test]
+    fn known_fts_dir_false_positive_classification() {
+        let fp = "wrong # of entries in index __turso_internal_fts_dir_idx_tickets_title_fts_key";
+        assert!(fp.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE));
+
+        let genuine_missing =
+            "row 5 missing from index __turso_internal_fts_dir_idx_tickets_title_fts_key";
+        let genuine_unique =
+            "non-unique entry in index __turso_internal_fts_dir_idx_tickets_title_fts_key";
+        assert!(!genuine_missing.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE));
+        assert!(!genuine_unique.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE));
     }
 }
