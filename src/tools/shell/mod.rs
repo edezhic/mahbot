@@ -10,6 +10,7 @@ use std::process::Stdio;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
 use crate::util::scrub_credentials;
 use crate::util::strip_ansi_escapes;
 
@@ -787,8 +788,6 @@ impl Tool for ShellTool {
     }
 }
 
-const SPILL_THRESHOLD_BYTES: usize = 5_000;
-
 /// Once-flag for cleaning up old spill files at daemon startup.
 static SPILL_DIR_CLEANED: AtomicBool = AtomicBool::new(false);
 
@@ -1256,14 +1255,14 @@ fn finish_shell_output(
     // head/tail truncation reducing inline content to a snippet.
     // `full_output_for_spill` is already credential-scrubbed.
     // The `pre` value is only provided when output exceeds
-    // `SPILL_THRESHOLD_BYTES` (guaranteed by `apply_line_truncation`),
+    // `TOOL_OUTPUT_BUDGET_BYTES` (guaranteed by `apply_line_truncation`),
     // so no length re-check is needed here.
     if let Some(pre) = full_output_for_spill {
         debug_assert!(
-            pre.len() > SPILL_THRESHOLD_BYTES,
+            pre.len() > TOOL_OUTPUT_BUDGET_BYTES,
             "invariant: pre-truncation output ({}) must exceed threshold ({})",
             pre.len(),
-            SPILL_THRESHOLD_BYTES,
+            TOOL_OUTPUT_BUDGET_BYTES,
         );
         let byte_count = pre.len();
         let line_count = pre.lines().count();
@@ -1276,7 +1275,7 @@ fn finish_shell_output(
     }
 
     // No pre-truncation spill — try spilling the final combined output
-    try_spill_to_file(combined, SPILL_THRESHOLD_BYTES)
+    try_spill_to_file(combined, TOOL_OUTPUT_BUDGET_BYTES)
 }
 
 /// Append `line` to `buf`, inserting a `'\n'` separator if `buf` is non-empty.
@@ -1641,7 +1640,7 @@ fn format_sandwich(output: &str, head: usize, tail: usize) -> String {
 ///
 /// Returns `(truncated_output, pre_truncation_copy)` where the copy captures the
 /// full output before truncation for potential spilling by `finish_shell_output`.
-/// Head/tail is gated on `SPILL_THRESHOLD_BYTES` — small outputs are shown in full
+/// Head/tail is gated on `TOOL_OUTPUT_BUDGET_BYTES` — small outputs are shown in full
 /// regardless of configured head/tail line counts.
 fn apply_line_truncation(output: &str, profile: &Profile) -> (String, Option<String>) {
     let head = profile.head_lines.unwrap_or(0);
@@ -1657,8 +1656,9 @@ fn apply_line_truncation(output: &str, profile: &Profile) -> (String, Option<Str
 
     // Capture pre-truncation output for spilling — only when head/tail
     // actually truncates (byte threshold exceeded + would reduce lines).
-    let should_sandwich =
-        (head > 0 || tail > 0) && line_count > head + tail && output.len() > SPILL_THRESHOLD_BYTES;
+    let should_sandwich = (head > 0 || tail > 0)
+        && line_count > head + tail
+        && output.len() > TOOL_OUTPUT_BUDGET_BYTES;
 
     let pre_truncation = if should_sandwich {
         Some(output.to_string())
@@ -1713,7 +1713,7 @@ fn cap_at_max_lines(output: &str, max: usize) -> String {
 /// from this single scrubbed source.
 ///
 /// Early-return stages (on_empty) call `combine_output` only.  The main path continues through `combine_output` →
-/// `finish_shell_output` (timing, spill-to-file).  `SPILL_THRESHOLD_BYTES`
+/// `finish_shell_output` (timing, spill-to-file).  `TOOL_OUTPUT_BUDGET_BYTES`
 /// (5 KB) gates the head/tail truncation and spill preview — it is a trigger,
 /// not a truncation cutoff.  `finish_shell_output` → `try_spill_to_file`'s
 /// use of `crate::util::truncate_tool_output` (5 KB head+tail) provides a final
@@ -2877,12 +2877,12 @@ mod tests {
     fn try_spill_to_file_behavior() {
         // Small output passes through unchanged
         let short = "hello".to_string();
-        let result = try_spill_to_file(short, 5_000);
+        let result = try_spill_to_file(short, TOOL_OUTPUT_BUDGET_BYTES);
         assert_eq!(result, "hello", "short output should pass through");
 
         // Large single-line output spills
-        let large = "x".repeat(10_000);
-        let result = try_spill_to_file(large, 5_000);
+        let large = "x".repeat(TOOL_OUTPUT_BUDGET_BYTES * 2);
+        let result = try_spill_to_file(large, TOOL_OUTPUT_BUDGET_BYTES);
         assert!(
             result.contains("[Output saved to"),
             "should contain spill path"
@@ -2897,10 +2897,10 @@ mod tests {
         let multi = lines.join("\n");
         let multi_len = multi.len();
         assert!(
-            multi_len > 5_000,
+            multi_len > TOOL_OUTPUT_BUDGET_BYTES,
             "test data {multi_len} must exceed spill threshold"
         );
-        let result = try_spill_to_file(multi, 5_000);
+        let result = try_spill_to_file(multi, TOOL_OUTPUT_BUDGET_BYTES);
         assert!(
             result.contains("[Output saved to"),
             "should contain spill path"
@@ -3498,7 +3498,7 @@ mod tests {
     #[test]
     fn truncate_head_tail_triggers_sandwich_large_output() {
         let p = Profile::new("test").head(2).tail(2);
-        // Generate output large enough to exceed SPILL_THRESHOLD_BYTES
+        // Generate output large enough to exceed TOOL_OUTPUT_BUDGET_BYTES
         let lines: Vec<String> = (0..100)
             .map(|i| {
                 format!(
@@ -3508,7 +3508,7 @@ mod tests {
             .collect();
         let output = lines.join("\n");
         assert!(
-            output.len() > SPILL_THRESHOLD_BYTES,
+            output.len() > TOOL_OUTPUT_BUDGET_BYTES,
             "test output must exceed threshold (got {} bytes)",
             output.len()
         );
@@ -3600,11 +3600,11 @@ mod tests {
     fn check_finish(cases: &[FinishCase]) {
         for case in cases {
             // For pre-truncation spill path: repeat the string enough times to
-            // exceed SPILL_THRESHOLD_BYTES, triggering the spill-to-file branch
+            // exceed TOOL_OUTPUT_BUDGET_BYTES, triggering the spill-to-file branch
             // in finish_shell_output. The spill content is pre-scrubbed by
             // apply_profile_pipeline before being passed to finish_shell_output.
             // This test verifies that the spill hint is properly appended.
-            let pre_owned = case.pre.map(|s| s.repeat(SPILL_THRESHOLD_BYTES + 1));
+            let pre_owned = case.pre.map(|s| s.repeat(TOOL_OUTPUT_BUDGET_BYTES + 1));
             let result = finish_shell_output(
                 case.combined.to_string(),
                 case.elapsed,

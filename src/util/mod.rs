@@ -318,11 +318,15 @@ pub fn truncate_sandwich(s: &str, max_bytes: usize, label: &str) -> String {
     }
 }
 
+/// Shared byte budget for tool output passed to the LLM: used by the shell
+/// spill threshold, the read tool preview cap, and [`truncate_tool_output`].
+pub(crate) const TOOL_OUTPUT_BUDGET_BYTES: usize = 5_000;
+
 /// Truncate tool output for LLM consumption (delegates to [`truncate_sandwich`]
-/// with a 5 000-byte limit). Returns input unchanged if within limit.
+/// with the shared [`TOOL_OUTPUT_BUDGET_BYTES`] limit). Returns input unchanged if within limit.
 #[must_use]
 pub fn truncate_tool_output(output: &str) -> String {
-    truncate_sandwich(output, 5_000, "tool output")
+    truncate_sandwich(output, TOOL_OUTPUT_BUDGET_BYTES, "tool output")
 }
 
 /// Read a local image file and return a base64 data URI suitable for native

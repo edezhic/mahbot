@@ -659,7 +659,7 @@ fn resolve_path_word(word: &str, state: &ValidationState) -> Option<std::path::P
     let path = std::path::PathBuf::from(&expanded);
     if path.is_relative() {
         // Relative globs stay rejected (they could match workspace files).
-        if contains_glob(&expanded) {
+        if crate::tools::path::contains_glob(&expanded, false) {
             return None;
         }
         let cwd = state.cwd.as_ref()?; // fail-closed when tracking was reset
@@ -907,11 +907,6 @@ fn resolve_var(name: &str, state: &ValidationState) -> VarValue {
     }
 }
 
-/// True when the string contains glob metacharacters (`*`, `?`, `[`).
-fn contains_glob(s: &str) -> bool {
-    s.contains(['*', '?', '['])
-}
-
 /// True when `path` is under one of the context's allowed temp roots.
 ///
 /// The lexical root check is followed by symlink resolution of the deepest
@@ -967,19 +962,6 @@ impl CheckContext {
             workspace_root: workspace_root.to_path_buf(),
             temp_roots: crate::tools::path::allowed_temp_roots(),
             temp_vars: vec![("TMPDIR".to_string(), "/tmp".to_string())],
-        }
-    }
-
-    #[cfg(test)]
-    fn for_test(
-        workspace_root: &Path,
-        temp_roots: Vec<std::path::PathBuf>,
-        temp_vars: Vec<(String, String)>,
-    ) -> Self {
-        Self {
-            workspace_root: workspace_root.to_path_buf(),
-            temp_roots,
-            temp_vars,
         }
     }
 }

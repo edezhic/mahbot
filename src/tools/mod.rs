@@ -72,12 +72,6 @@ use crate::util::json::{
     get_usize,
 };
 
-/// Returns true when the path looks like a glob rather than a literal file path.
-#[must_use]
-fn path_contains_wildcard(path: &str) -> bool {
-    path.contains(['*', '?', '[', ']'])
-}
-
 /// Build a JSON schema for tool parameters.
 ///
 /// Wraps `properties` in the standard `{"type": "object", "properties": {...}}`
@@ -360,10 +354,10 @@ mod tests {
     }
 
     #[test]
-    fn path_contains_wildcard_detects_globs() {
-        assert!(path_contains_wildcard("src/*.rs"));
-        assert!(path_contains_wildcard("lib?.rs"));
-        assert!(!path_contains_wildcard("src/main.rs"));
+    fn contains_glob_detects_wildcards() {
+        assert!(crate::tools::path::contains_glob("src/*.rs", true));
+        assert!(crate::tools::path::contains_glob("lib?.rs", true));
+        assert!(!crate::tools::path::contains_glob("src/main.rs", true));
     }
 
     #[test]

@@ -8,6 +8,15 @@ use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+/// True when `s` contains glob metacharacters (`*`, `?`, `[`, and optionally `]`).
+///
+/// `include_close_bracket` preserves per-site semantics: the read tool treats a
+/// lone `]` as a glob signal, the shell readonly sandbox does not.
+#[must_use]
+pub(crate) fn contains_glob(s: &str, include_close_bracket: bool) -> bool {
+    s.contains(['*', '?', '[']) || (include_close_bracket && s.contains(']'))
+}
+
 /// Canonicalize the parent directory of `path` and join the original file name.
 ///
 /// This is the common canonicalization strategy used by both

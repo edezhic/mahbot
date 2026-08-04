@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::tools::{ShellMode, ShellTool, search::SearchTool};
+use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
 use crate::util::tree_sitter::ALL_TREE_SITTER_EXTENSIONS;
 use crate::{Tool, ToolOutputPhase, Workspace};
 use async_trait::async_trait;
@@ -75,7 +76,7 @@ impl Tool for ReadTool {
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
         let path = super::get_str(&args, "path")?.to_string();
 
-        if super::path_contains_wildcard(&path) {
+        if super::path::contains_glob(&path, true) {
             return self.recover_wildcard_path(ws, &path).await;
         }
 
@@ -105,8 +106,7 @@ impl Tool for ReadTool {
     }
 
     fn format_output(&self, output: &str) -> String {
-        const MAX_BYTES: usize = 5_000;
-        if output.len() <= MAX_BYTES {
+        if output.len() <= TOOL_OUTPUT_BUDGET_BYTES {
             return output.to_string();
         }
 
@@ -121,7 +121,8 @@ impl Tool for ReadTool {
 
                 // Worst-case marker length — `omitted ≤ expected` guarantees the actual marker never exceeds this
                 let marker_budget = format!("\n... ({expected} lines omitted)").len();
-                let body_budget = MAX_BYTES.saturating_sub(header.len() + marker_budget + 1);
+                let body_budget =
+                    TOOL_OUTPUT_BUDGET_BYTES.saturating_sub(header.len() + marker_budget + 1);
 
                 // Truncate at last complete line boundary within budget
                 let cut = body.floor_char_boundary(body_budget.min(body.len()));
