@@ -18,9 +18,9 @@ use crate::diff_parse::{
     DiffContent, DiffFileStatus, DiffLineKind, make_untracked_diff_file, parse_git_diff,
 };
 use crate::git_commands::{
-    CommitInfo, DiscardTarget, git_has_commits, git_is_installed, is_git_repo,
-    parse_untracked_from_porcelain, run_git_commit, run_git_diff, run_git_discard, run_git_show,
-    run_git_status,
+    CommitInfo, DiscardTarget, MAX_UNTRACKED_SIZE, UntrackedFileRead, git_has_commits,
+    git_is_installed, is_git_repo, parse_untracked_from_porcelain, read_untracked_file,
+    run_git_commit, run_git_diff, run_git_discard, run_git_show, run_git_status,
 };
 
 use iced::widget::Id;
@@ -38,7 +38,6 @@ use super::widgets::{self, FileTree};
 
 const MAX_DIFF_LINES: usize = 5000;
 const MAX_HUNKS: usize = 100;
-const MAX_UNTRACKED_SIZE: u64 = 1024 * 1024;
 
 /// Returns `true` if `file` matches the optional `selected_file` path.
 ///
@@ -1372,40 +1371,22 @@ async fn add_untracked_files(
     let untracked = parse_untracked_from_porcelain(&status_output);
 
     for path in &untracked {
-        let full = ws_path.join(path);
-        if !full.is_file() {
-            continue;
-        }
-        let Ok(meta) = tokio::fs::metadata(&full).await else {
-            continue;
-        };
-        if meta.len() > MAX_UNTRACKED_SIZE {
-            parsed.push(crate::diff_parse::DiffFile::placeholder(
-                path.clone(),
-                DiffContent::TooLarge(meta.len()),
-            ));
-            continue;
-        }
-        let Ok(content) = tokio::fs::read(&full).await else {
-            continue;
-        };
-        if content.contains(&0) {
-            parsed.push(crate::diff_parse::DiffFile::placeholder(
-                path.clone(),
-                DiffContent::Binary,
-            ));
-            continue;
-        }
-        match String::from_utf8(content) {
-            Ok(text) => {
-                parsed.push(make_untracked_diff_file(path, &text));
+        match read_untracked_file(&ws_path.join(path), MAX_UNTRACKED_SIZE).await {
+            UntrackedFileRead::Text(text) => parsed.push(make_untracked_diff_file(path, &text)),
+            UntrackedFileRead::TooLarge(size) => {
+                parsed.push(crate::diff_parse::DiffFile::placeholder(
+                    path.clone(),
+                    DiffContent::TooLarge(size),
+                ));
             }
-            Err(_) => {
+            UntrackedFileRead::Binary => {
                 parsed.push(crate::diff_parse::DiffFile::placeholder(
                     path.clone(),
                     DiffContent::Binary,
                 ));
             }
+            // Unreadable / non-file paths produce no placeholder.
+            UntrackedFileRead::Skip => {}
         }
     }
 
@@ -2443,5 +2424,44 @@ mod tests {
             state.personal_workspace_path.is_none(),
             "personal_workspace_path should be cleared to prevent stale workspace path"
         );
+    }
+
+    // ── add_untracked_files — classifier + placeholder emission ──
+
+    /// Verify the untracked-file classifier mapping: text files become parseable
+    /// entries, null-byte and invalid-UTF-8 files become Binary placeholders
+    /// (the latter must NOT be dropped), oversized files become TooLarge with
+    /// their real size, and directories are skipped entirely.
+    #[tokio::test]
+    async fn test_add_untracked_files_classification() {
+        let (_dir, repo_path) = crate::util::test::init_temp_repo();
+        std::fs::write(repo_path.join("new.txt"), b"line1\nline2\n").unwrap();
+        std::fs::write(repo_path.join("binary.bin"), b"a\x00b").unwrap();
+        // Invalid UTF-8 without a null byte — Binary, not skipped.
+        std::fs::write(repo_path.join("invalid.bin"), [0xC3, 0x28]).unwrap();
+        // Oversized — gated before read, placeholder carries the real size.
+        let big_size = MAX_UNTRACKED_SIZE as usize + 1;
+        let mut big = vec![b'a'; big_size];
+        big[big_size - 1] = b'\n';
+        std::fs::write(repo_path.join("big.txt"), &big).unwrap();
+        // Directory (with contents, so porcelain emits `?? new_dir/`) — the
+        // classifier's is_file() gate skips it, no placeholder.
+        std::fs::create_dir(repo_path.join("new_dir")).unwrap();
+        std::fs::write(repo_path.join("new_dir/inner.txt"), b"x").unwrap();
+
+        let mut parsed = Vec::new();
+        add_untracked_files(&mut parsed, &repo_path).await.unwrap();
+
+        let find = |path: &str| parsed.iter().find(|f| f.path == path);
+        assert_eq!(find("new.txt").unwrap().content, DiffContent::Parseable);
+        assert_eq!(find("binary.bin").unwrap().content, DiffContent::Binary);
+        assert_eq!(find("invalid.bin").unwrap().content, DiffContent::Binary);
+        assert_eq!(
+            find("big.txt").unwrap().content,
+            DiffContent::TooLarge(big_size as u64)
+        );
+        // Porcelain lists non-empty untracked dirs as `?? new_dir/` — the
+        // parsed entry is skipped, so no placeholder with that path exists.
+        assert!(find("new_dir/").is_none(), "directories must be skipped");
     }
 }

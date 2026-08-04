@@ -63,9 +63,12 @@ pub(crate) fn parse_utc_timestamp(s: &str) -> Result<DateTime<Utc>, chrono::Pars
 /// See the test `builder_mapping_matches_experimental_features` which verifies that
 /// the field-by-field mapping in [`Connection::open`] enables exactly the features
 /// listed here.
-#[expect(
-    dead_code,
-    reason = "Referenced only by assertion tests; kept for documentation"
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Referenced only by assertion tests; kept for documentation"
+    )
 )]
 pub(crate) const EXPERIMENTAL_FEATURES: &[&str] = &["index_method", "multiprocess_wal"];
 
@@ -746,6 +749,35 @@ impl Drop for TxGuard<'_> {
 // ─────────────────────────────────────────────────────────────────────
 // Schema / index management
 // ─────────────────────────────────────────────────────────────────────
+
+/// Read the current schema version from `PRAGMA user_version`.
+///
+/// Fresh or legacy databases without a user_version report 0.
+pub(crate) async fn read_schema_version(conn: &Connection) -> anyhow::Result<i64> {
+    let rows = conn
+        .query("PRAGMA user_version", ())
+        .await
+        .context("Failed to read PRAGMA user_version for schema migration")?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.get::<i64>(0).ok())
+        .unwrap_or(0))
+}
+
+/// Check whether `table` has a column named `column` (via `PRAGMA table_info`).
+pub(crate) async fn column_exists(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+) -> anyhow::Result<bool> {
+    let rows = conn
+        .query(&format!("PRAGMA table_info('{table}')"), ())
+        .await
+        .with_context(|| format!("Failed to read PRAGMA table_info for {table} table"))?;
+    Ok(rows
+        .iter()
+        .any(|row| row.get::<String>(1).ok().as_deref() == Some(column)))
+}
 
 /// Ensure a full-text search index exists with the correct tokenizer.
 /// Drops and recreates if the existing index has a different tokenizer.

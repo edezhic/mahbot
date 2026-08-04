@@ -619,25 +619,11 @@ pub(crate) enum LoadComments {
 #[allow(clippy::too_many_lines)] // linear sequence of versioned migration blocks
 async fn run_schema_migrations(conn: &turso::Connection) -> anyhow::Result<()> {
     // ── schema migration: rename `status` column to `phase` ───────────
-    let version_rows = conn
-        .query("PRAGMA user_version", ())
-        .await
-        .context("Failed to read PRAGMA user_version for schema migration")?;
-    let current_version: i64 = version_rows
-        .first()
-        .and_then(|row| row.get::<i64>(0).ok())
-        .unwrap_or(0);
+    let current_version = turso::read_schema_version(conn).await?;
 
     if current_version < 1 {
         // Check whether the old `status` column still exists (migration needed).
-        let table_info = conn
-            .query("PRAGMA table_info('tickets')", ())
-            .await
-            .context("Failed to read PRAGMA table_info for tickets table")?;
-
-        let has_status_column = table_info
-            .iter()
-            .any(|row| row.get::<String>(1).ok().as_deref() == Some("status"));
+        let has_status_column = turso::column_exists(conn, "tickets", "status").await?;
 
         if has_status_column {
             info!("Schema migration: renaming tickets.status to tickets.phase");
@@ -670,14 +656,7 @@ async fn run_schema_migrations(conn: &turso::Connection) -> anyhow::Result<()> {
     // ── schema migration: add `priority` column ────────────────────
     if current_version < 2 {
         // Check whether the `priority` column already exists (idempotency).
-        let table_info = conn
-            .query("PRAGMA table_info('tickets')", ())
-            .await
-            .context("Failed to read PRAGMA table_info for tickets table")?;
-
-        let has_priority = table_info
-            .iter()
-            .any(|row| row.get::<String>(1).ok().as_deref() == Some("priority"));
+        let has_priority = turso::column_exists(conn, "tickets", "priority").await?;
 
         if !has_priority {
             info!("Schema migration: adding tickets.priority column");

@@ -31,13 +31,45 @@ impl CommitInfo {
     }
 }
 
-/// Maximum size (1 MiB) for reading untracked files in [`run_git_diff_stats`].
+/// Maximum size (1 MiB) for reading untracked files in [`run_git_diff_stats`]
+/// and the diff page's untracked-file display.
 ///
-/// Files larger than this are silently skipped to avoid UI lag since the
-/// function is called every ~5 seconds for the footer bar stats display.
+/// Files larger than this are skipped to avoid UI lag on the periodic
+/// refreshes (dashboard tick every second, diff page every 5 seconds).
+pub(crate) const MAX_UNTRACKED_SIZE: u64 = 1024 * 1024;
+
+/// Classification of an untracked file read for diff display / line counting.
 ///
-/// Named to match the same-purpose constant in [`crate::gui::diff`].
-const MAX_UNTRACKED_SIZE: u64 = 1024 * 1024;
+/// Ordering is load-bearing: size is checked from metadata before reading,
+/// then null-byte detection, then UTF-8 validity. Unreadable paths are skipped
+/// entirely — only `TooLarge` and `Binary` produce GUI placeholders.
+pub(crate) enum UntrackedFileRead {
+    Text(String),
+    TooLarge(u64),
+    Binary,
+    Skip,
+}
+
+pub(crate) async fn read_untracked_file(path: &Path, max_size: u64) -> UntrackedFileRead {
+    if !path.is_file() {
+        return UntrackedFileRead::Skip;
+    }
+    let Ok(meta) = tokio::fs::metadata(path).await else {
+        return UntrackedFileRead::Skip;
+    };
+    if meta.len() > max_size {
+        return UntrackedFileRead::TooLarge(meta.len());
+    }
+    let Ok(content) = tokio::fs::read(path).await else {
+        return UntrackedFileRead::Skip;
+    };
+    if content.contains(&0) {
+        return UntrackedFileRead::Binary;
+    }
+    // Invalid UTF-8 without a null byte is still binary — never Skip, or the
+    // GUI would silently drop the file instead of showing a placeholder.
+    String::from_utf8(content).map_or(UntrackedFileRead::Binary, UntrackedFileRead::Text)
+}
 
 /// Whether to discard changes in a single file or an entire directory tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -519,8 +551,8 @@ pub async fn run_git_behind_ahead(repo_path: &Path) -> anyhow::Result<(usize, us
 /// Also counts lines from untracked (new) files, since `git diff HEAD` only
 /// considers tracked files. Untracked files larger than
 /// [`MAX_UNTRACKED_SIZE`] or detected as binary are silently skipped to
-/// avoid UI lag (this function is called every ~5 seconds for the footer bar
-/// stats).
+/// avoid UI lag (this function runs on the every-second dashboard refresh
+/// tick).
 ///
 /// Delegates to `parse_numstat` for tracked file diffs and
 /// `parse_untracked_from_porcelain` for untracked file enumeration.
@@ -542,33 +574,14 @@ pub async fn run_git_diff_stats(repo_path: &Path) -> anyhow::Result<(i64, i64)> 
     let untracked = parse_untracked_from_porcelain(&status_output);
 
     for path in &untracked {
-        let full = repo_path.join(path);
-        if !full.is_file() {
-            continue;
+        if let UntrackedFileRead::Text(text) =
+            read_untracked_file(&repo_path.join(path), MAX_UNTRACKED_SIZE).await
+        {
+            // All lines in an untracked file count as added lines
+            #[allow(clippy::cast_possible_wrap)]
+            let line_count = text.lines().count() as i64;
+            added += line_count;
         }
-        let Ok(meta) = tokio::fs::metadata(&full).await else {
-            continue;
-        };
-        // Skip files larger than MAX_UNTRACKED_SIZE to avoid UI lag
-        // (footer refreshes every ~5s).
-        if meta.len() > MAX_UNTRACKED_SIZE {
-            continue;
-        }
-        let Ok(content) = tokio::fs::read(&full).await else {
-            continue;
-        };
-        // Skip binary files (null byte check + UTF-8 check), matching the
-        // approach used in add_untracked_files (gui/diff.rs).
-        if content.contains(&0) {
-            continue;
-        }
-        let Ok(text) = String::from_utf8(content) else {
-            continue;
-        };
-        // All lines in an untracked file count as added lines
-        #[allow(clippy::cast_possible_wrap)]
-        let line_count = text.lines().count() as i64;
-        added += line_count;
     }
 
     Ok((added, removed))

@@ -36,7 +36,7 @@ use crate::channels::{
 };
 use crate::users::UserRecord;
 use crate::util::UnwrapPoison;
-use crate::{ChatEvent, Role, SendMessage, Workspace};
+use crate::{Channel, ChatEvent, Role, SendMessage, Workspace};
 
 // ── Job definition ─────────────────────────────────────────────────────────
 
@@ -509,6 +509,42 @@ fn broadcast_typing(users: &[UserRecord], workspace: &str, is_typing: bool) {
 
 // ── Response delivery ─────────────────────────────────────────────────────
 
+/// Outcome of attempting to deliver a response on a single channel.
+enum DeliverOutcome {
+    Sent,
+    /// Recipient is not reachable on this channel.
+    Unresolvable,
+    /// Transport send failed.
+    Failed(anyhow::Error),
+}
+
+/// Resolve the recipient and send `response` on `channel`.
+///
+/// Returns the outcome so each delivery function applies its own per-variant
+/// logging — resolve-miss handling (silent skip vs warn+abort) and error
+/// wording differ between manager / single-user / unregistered delivery.
+async fn deliver_on_channel(
+    channel: &dyn Channel,
+    user_name: &str,
+    reply_target: &str,
+    response: &str,
+) -> DeliverOutcome {
+    let Some(recipient) = channel.resolve_recipient(user_name, reply_target) else {
+        return DeliverOutcome::Unresolvable;
+    };
+    match channel
+        .send(&SendMessage {
+            content: response.to_string(),
+            recipient,
+            reply_markup: None,
+        })
+        .await
+    {
+        Ok(()) => DeliverOutcome::Sent,
+        Err(e) => DeliverOutcome::Failed(e),
+    }
+}
+
 /// Deliver a response to all workspace users (Manager role).
 async fn deliver_manager_response(response: &str, users: &[UserRecord], job: &AgentJob) {
     if users.is_empty() {
@@ -550,16 +586,8 @@ async fn deliver_manager_response(response: &str, users: &[UserRecord], job: &Ag
         for user in users {
             for binding in &user.channels {
                 let reply_target = binding.reply_target.as_deref().unwrap_or(&user.name);
-                let Some(recipient) = channel.resolve_recipient(&user.name, reply_target) else {
-                    continue;
-                };
-                if let Err(e) = channel
-                    .send(&SendMessage {
-                        content: response.to_string(),
-                        recipient,
-                        reply_markup: None,
-                    })
-                    .await
+                if let DeliverOutcome::Failed(e) =
+                    deliver_on_channel(channel.as_ref(), &user.name, reply_target, response).await
                 {
                     error!(
                         channel = %channel_name,
@@ -630,16 +658,8 @@ async fn deliver_single_user_response(
         }
 
         let target_addr = binding.reply_target.as_deref().unwrap_or(&user.name);
-        let Some(recipient) = chan.resolve_recipient(&user.name, target_addr) else {
-            continue;
-        };
-        if let Err(e) = chan
-            .send(&SendMessage {
-                content: response.to_string(),
-                recipient,
-                reply_markup: None,
-            })
-            .await
+        if let DeliverOutcome::Failed(e) =
+            deliver_on_channel(chan.as_ref(), &user.name, target_addr, response).await
         {
             error!(
                 channel = %channel,
@@ -684,30 +704,20 @@ async fn deliver_unregistered_user_response(response: &str, job: &AgentJob, role
     // behaviour of `send_channel_reply` which preserved the original
     // `msg.reply_target`.
     let reply_target = job.reply_target.as_deref().unwrap_or(&job.user_name);
-    let Some(recipient) = chan.resolve_recipient(&job.user_name, reply_target) else {
-        warn!(
+    match deliver_on_channel(chan.as_ref(), &job.user_name, reply_target, response).await {
+        DeliverOutcome::Unresolvable => warn!(
             workspace = %job.workspace_name,
             user = %job.user_name,
             channel = %ch,
             "Message router [{role}]: cannot resolve recipient for unregistered user — \
              response was persisted but not delivered via transport",
-        );
-        return;
-    };
-
-    if let Err(e) = chan
-        .send(&SendMessage {
-            content: response.to_string(),
-            recipient,
-            reply_markup: None,
-        })
-        .await
-    {
-        error!(
+        ),
+        DeliverOutcome::Failed(e) => error!(
             channel = %ch,
             user = %job.user_name,
             "Message router [{role}]: failed to send response to unregistered user: {e}",
-        );
+        ),
+        DeliverOutcome::Sent => {}
     }
 }
 

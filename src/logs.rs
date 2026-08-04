@@ -237,7 +237,7 @@ impl LogStore {
 
         let mut entries = Vec::new();
         for row in rows {
-            entries.push(row_to_entry(&row)?);
+            entries.push(log_entry_from_row(&row)?);
         }
 
         Ok((entries, total))
@@ -459,7 +459,7 @@ fn build_where_clause(filters: &LogQuery) -> (String, Vec<Value>) {
     }
 }
 
-fn row_to_entry(row: &Row) -> anyhow::Result<LogEntry> {
+fn log_entry_from_row(row: &Row) -> anyhow::Result<LogEntry> {
     let timestamp = row.get::<String>(COL_LOGS_TIMESTAMP)?;
     let level = row.get::<String>(COL_LOGS_LEVEL)?;
     let target = row.get::<String>(COL_LOGS_TARGET)?;

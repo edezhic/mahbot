@@ -22,6 +22,7 @@ use rand::{RngExt, SeedableRng};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
+use tracing::error;
 
 /// Extension trait to unwrap poisoned lock results, replacing
 /// `.unwrap_or_else(std::sync::PoisonError::into_inner)` with `.unwrap_poison()`.
@@ -241,6 +242,25 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
         msg.clone()
     } else {
         "unknown panic".to_string()
+    }
+}
+
+/// Log panics/cancellations from a `join_all`-aggregated batch of spawned
+/// task results, keeping the enclosing loop alive.
+pub(crate) fn log_join_failures(
+    results: Vec<Result<(), tokio::task::JoinError>>,
+    panic_log: &str,
+    cancelled_log: &str,
+) {
+    for result in results {
+        if let Err(e) = result {
+            if e.is_panic() {
+                let payload = e.into_panic();
+                error!(error = %panic_message(&*payload), "{panic_log}");
+            } else {
+                error!("{cancelled_log}");
+            }
+        }
     }
 }
 

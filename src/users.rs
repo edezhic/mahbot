@@ -123,12 +123,12 @@ impl UserStore {
         Ok(())
     }
 
-    /// Get the selected workspace name for a user, if any.
-    pub async fn get_selected_workspace_name(&self, user_name: &str) -> Result<Option<String>> {
+    /// Fetch a single nullable column from the user's row, if the user exists.
+    async fn user_column(&self, column: &str, user_name: &str) -> Result<Option<String>> {
         let rows = self
             .conn
             .query(
-                "SELECT selected_workspace FROM users WHERE name = ?1",
+                &format!("SELECT {column} FROM users WHERE name = ?1"),
                 turso::params![user_name],
             )
             .await?;
@@ -138,19 +138,14 @@ impl UserStore {
         }
     }
 
+    /// Get the selected workspace name for a user, if any.
+    pub async fn get_selected_workspace_name(&self, user_name: &str) -> Result<Option<String>> {
+        self.user_column("selected_workspace", user_name).await
+    }
+
     /// Get the active role for a user, if any.
     pub async fn get_active_role(&self, user_name: &str) -> Result<Option<String>> {
-        let rows = self
-            .conn
-            .query(
-                "SELECT selected_role FROM users WHERE name = ?1",
-                turso::params![user_name],
-            )
-            .await?;
-        match rows.into_iter().next() {
-            Some(row) => Ok(row.get::<Option<String>>(0)?),
-            None => Ok(None),
-        }
+        self.user_column("selected_role", user_name).await
     }
 
     // ── Channel bindings ──────────────────────────────────────

@@ -171,8 +171,8 @@ fn session_metadata_from_row(agent_id: &str, activity_str: &str, count: i64) -> 
 /// Shared helper used by [`SessionStore::append_messages`].
 ///
 /// When `context` is `Some((channel, user_name, workspace_name, role))`, the context columns
-/// are set atomically alongside the messages — closing the atomicity gap described in
-/// [`SessionStore::set_session_context`].  This is the preferred path for new sessions
+/// are set atomically alongside the messages — closing the atomicity gap of separate
+/// context writes.  This is the preferred path for new sessions
 /// and subsequent turns.
 async fn insert_messages_in_transaction(
     tx: &TxGuard<'_>,
@@ -483,51 +483,6 @@ impl SessionStore {
         })
     }
 
-    /// Store session context (channel, user_name, workspace_name, role)
-    /// alongside the session metadata for use by the dead-session recovery
-    /// poller.
-    ///
-    /// Uses an upsert so it works regardless of whether a metadata row already
-    /// exists.
-    ///
-    /// # Atomicity note
-    ///
-    /// Prefer [`batch_append_with_context`](SessionStore::batch_append_with_context)
-    /// or [`append_with_context`](SessionStore::append_with_context) when
-    /// setting context alongside message persistence — they write both in a
-    /// single transaction.  This standalone method is retained for external
-    /// callers that may need to set context independently of message insertion.
-    ///
-    /// When called separately from message persistence, a crash between the
-    /// message write and this method leaves the session with messages but no
-    /// context (unrecoverable by the dead-session poller).  This is a narrow
-    /// window and accepted for callers that cannot batch the write.
-    #[allow(dead_code)]
-    pub(crate) async fn set_session_context(
-        &self,
-        agent_id: &str,
-        channel: &str,
-        user_name: &str,
-        workspace_name: &str,
-        role: &str,
-    ) -> Result<()> {
-        let now = turso::now();
-        self.conn
-            .execute(
-                "INSERT INTO session_metadata (agent_id, created_at, last_activity, channel, user_name, workspace_name, role)
-                 VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(agent_id) DO UPDATE SET
-                 channel = excluded.channel,
-                 user_name = excluded.user_name,
-                 workspace_name = excluded.workspace_name,
-                 role = excluded.role",
-                params![agent_id, now, channel, user_name, workspace_name, role],
-            )
-            .await
-            .context("Failed to set session context")?;
-        Ok(())
-    }
-
     /// Retrieve stored session context for a given agent ID.
     /// Returns `None` if the session has no metadata or the context columns
     /// are null (pre-migration sessions).
@@ -580,25 +535,11 @@ impl SessionStore {
 /// Migration v2: add context columns (`channel`, `user_name`, `workspace_name`, `role`).
 #[allow(clippy::too_many_lines)]
 async fn run_session_migrations(conn: &turso::Connection) -> anyhow::Result<()> {
-    let version_rows = conn
-        .query("PRAGMA user_version", ())
-        .await
-        .context("Failed to read PRAGMA user_version for schema migration")?;
-    let current_version: i64 = version_rows
-        .first()
-        .and_then(|row| row.get::<i64>(0).ok())
-        .unwrap_or(0);
+    let current_version = turso::read_schema_version(conn).await?;
 
     if current_version < 1 {
         // Check whether the old `session_key` column still exists in sessions table.
-        let table_info = conn
-            .query("PRAGMA table_info('sessions')", ())
-            .await
-            .context("Failed to read PRAGMA table_info for sessions table")?;
-
-        let has_session_key = table_info
-            .iter()
-            .any(|row| row.get::<String>(1).ok().as_deref() == Some("session_key"));
+        let has_session_key = turso::column_exists(conn, "sessions", "session_key").await?;
 
         if has_session_key {
             tracing::info!("Schema migration: renaming sessions.session_key to sessions.agent_id");
@@ -613,14 +554,8 @@ async fn run_session_migrations(conn: &turso::Connection) -> anyhow::Result<()> 
         }
 
         // Same for session_metadata table.
-        let meta_table_info = conn
-            .query("PRAGMA table_info('session_metadata')", ())
-            .await
-            .context("Failed to read PRAGMA table_info for session_metadata table")?;
-
-        let meta_has_session_key = meta_table_info
-            .iter()
-            .any(|row| row.get::<String>(1).ok().as_deref() == Some("session_key"));
+        let meta_has_session_key =
+            turso::column_exists(conn, "session_metadata", "session_key").await?;
 
         if meta_has_session_key {
             tracing::info!(
@@ -928,9 +863,16 @@ mod tests {
         // Initially, no context should exist.
         assert!(store().get_session_context(&agent_id).await.is_none());
 
-        // Store context.
+        // Store context alongside a message.
         store()
-            .set_session_context(&agent_id, "gui", "alice", "work", "engineer")
+            .append_with_context(
+                &agent_id,
+                &ChatMessage::user("hello"),
+                "gui",
+                "alice",
+                "work",
+                "engineer",
+            )
             .await
             .unwrap();
 
@@ -946,7 +888,14 @@ mod tests {
 
         // Overwrite with different values.
         store()
-            .set_session_context(&agent_id, "telegram", "bob", "project-x", "analyst")
+            .append_with_context(
+                &agent_id,
+                &ChatMessage::user("hello again"),
+                "telegram",
+                "bob",
+                "project-x",
+                "analyst",
+            )
             .await
             .unwrap();
 
@@ -1001,11 +950,17 @@ mod tests {
         let maintainer_id = format!("maintainer_{}", unique_key());
 
         for id in &[&direct_id, &manager_id, &ticket_id, &ask_id, &maintainer_id] {
-            store().append(id, &ChatMessage::user("msg")).await.unwrap();
-            // list_sessions_with_metadata joins with session_metadata, so we
-            // need metadata rows too (append doesn't create them).
+            // list_sessions_with_metadata joins with session_metadata, so the
+            // context columns are needed too (append alone doesn't create them).
             store()
-                .set_session_context(id, "test_channel", "test_user", "test_ws", "engineer")
+                .append_with_context(
+                    id,
+                    &ChatMessage::user("msg"),
+                    "test_channel",
+                    "test_user",
+                    "test_ws",
+                    "engineer",
+                )
                 .await
                 .unwrap();
         }

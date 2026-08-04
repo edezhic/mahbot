@@ -919,19 +919,11 @@ async fn poll_round() {
         .collect();
 
     let results = join_all(tasks).await;
-    for result in results {
-        if let Err(e) = result {
-            if e.is_panic() {
-                let payload = e.into_panic();
-                error!(
-                    error = %panic_message(&*payload),
-                    "Panic in workspace poll round — management loop continues",
-                );
-            } else {
-                error!("Workspace poll task was cancelled — management loop continues");
-            }
-        }
-    }
+    crate::util::log_join_failures(
+        results,
+        "Panic in workspace poll round — management loop continues",
+        "Workspace poll task was cancelled — management loop continues",
+    );
 }
 
 /// Process all five pipeline steps for a single workspace.

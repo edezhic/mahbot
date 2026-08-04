@@ -5,7 +5,7 @@
 
 use chrono::Utc;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use futures_util::future::join_all;
 
@@ -15,7 +15,6 @@ use crate::WorkspaceStatus;
 use crate::agent::run_agent;
 use crate::board::TicketPhase;
 use crate::turso;
-use crate::util::panic_message;
 
 /// Maximum number of tickets allowed in Analysis + Planning + ReadyForDevelopment
 /// before the maintainer pauses ticket creation.
@@ -149,19 +148,11 @@ pub async fn run_maintainer_loop() {
             .collect();
 
         let results = join_all(tasks).await;
-        for result in results {
-            if let Err(e) = result {
-                if e.is_panic() {
-                    let payload = e.into_panic();
-                    error!(
-                        error = %panic_message(&*payload),
-                        "Panic in maintainer task — maintainer loop continues",
-                    );
-                } else {
-                    error!("Maintainer task was cancelled — maintainer loop continues");
-                }
-            }
-        }
+        crate::util::log_join_failures(
+            results,
+            "Panic in maintainer task — maintainer loop continues",
+            "Maintainer task was cancelled — maintainer loop continues",
+        );
     }
 }
 
