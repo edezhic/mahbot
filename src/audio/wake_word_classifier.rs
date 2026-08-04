@@ -36,8 +36,6 @@ use tracing::info;
 use crate::audio::embedding_sequence::EmbeddingSequence;
 
 use crate::EMBEDDING_DIM;
-#[cfg(test)]
-use crate::audio::embedding_sequence::LabelStratum;
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -1308,7 +1306,7 @@ mod tests {
     #[test]
     fn test_build_windows_basic() {
         let embs: Vec<Vec<f32>> = (0..5).map(|i| vec![i as f32; EMBEDDING_DIM]).collect();
-        let seq = make_seq(embs, LabelStratum::Positive);
+        let seq = make_seq(embs);
         assert_eq!(build_windows(&[seq]).len(), 3);
 
         // Empty array produces no windows.
@@ -1318,7 +1316,7 @@ mod tests {
         // matching streaming inference behavior (mahbot-1001 Fix 4).
         // 2 embeddings → 2 tiled windows: [e0, e0, e0] and [e0, e1, e1]
         let short_embs: Vec<Vec<f32>> = (0..2).map(|i| vec![i as f32; EMBEDDING_DIM]).collect();
-        let short_seq = make_seq(short_embs, LabelStratum::Positive);
+        let short_seq = make_seq(short_embs);
         assert_eq!(build_windows(&[short_seq]).len(), 2);
     }
 
@@ -1331,10 +1329,7 @@ mod tests {
         let embs2: Vec<Vec<f32>> = (0..2)
             .map(|i| vec![(i + 10) as f32; EMBEDDING_DIM])
             .collect();
-        let seqs = [
-            make_seq(embs1, LabelStratum::Positive),
-            make_seq(embs2, LabelStratum::Positive),
-        ];
+        let seqs = [make_seq(embs1), make_seq(embs2)];
         assert!(
             !build_windows(&seqs).is_empty(),
             "short sequences now produce tiled windows (mahbot-1001)"
@@ -1347,10 +1342,7 @@ mod tests {
         let embs4: Vec<Vec<f32>> = (0..WINDOW_SIZE)
             .map(|i| vec![(i + 100) as f32; EMBEDDING_DIM])
             .collect();
-        let seqs2 = [
-            make_seq(embs3, LabelStratum::Positive),
-            make_seq(embs4, LabelStratum::Positive),
-        ];
+        let seqs2 = [make_seq(embs3), make_seq(embs4)];
         assert_eq!(build_windows(&seqs2).len(), 2);
     }
 
@@ -1442,8 +1434,8 @@ mod tests {
         let pos_embs: Vec<Vec<f32>> = (0..n_embs).map(|_| make_emb(0.3, 0.4)).collect();
         let neg_embs: Vec<Vec<f32>> = (0..n_embs).map(|_| make_emb(-0.3, 0.4)).collect();
         // Each set is a single sequence to keep the window count the same.
-        let pos_seqs = [make_seq(pos_embs, LabelStratum::Positive)];
-        let neg_seqs = [make_seq(neg_embs, LabelStratum::Negative)];
+        let pos_seqs = [make_seq(pos_embs)];
+        let neg_seqs = [make_seq(neg_embs)];
 
         let cfg = TrainingConfig {
             // Reduced from 80 in mahbot-1029 — convergence margin validated

@@ -3,7 +3,7 @@
 //! This test exercises the **enrollment-to-detection cycle with realistic
 //! TTS-generated speech audio**.  It uses the TTS engine to synthesize wake
 //! word variants, feeds them through the enrollment pipeline, trains the
-//! Conv1D classifier and VoiceVerifier, then runs detection on:
+//! Conv1D classifier, then runs detection on:
 //!
 //! * Positive cases (wake word variants)
 //! * Negative — confusable near-miss phrases
@@ -35,7 +35,7 @@
 //!
 //! NOTE: `[profile.bench]` is release-like (opt-level 2, codegen-units 32,
 //! no LTO, incremental off) — the bench is a production-performance proxy, so
-//! release codegen is the faithful target.  Classifier/verifier fingerprints
+//! release codegen is the faithful target.  Classifier fingerprints
 //! and sanity anchors are report-only measurements: nothing gates on them,
 //! codegen shifts are expected, and there is no re-baseline ceremony.
 //!
@@ -50,10 +50,7 @@
 //! The bench-leanness cleanup removed the report-only same-audio (8b),
 //! B-sweep (8c), volume-sweep, mid-utterance, cooldown boundary-probe, B2
 //! synthetic-fallback probe, train/test-alignment cosine diagnostics, and the
-//! dead top-level latency section (~11-16 s saved total); the
-//! classifier/verifier weights fingerprints previously emitted inside the
-//! B-sweep section are now a top-level `weights_fingerprints` key emitted in
-//! teardown (byte-identical pure weight hashes).  Removing 8b/8c changes the
+//! dead top-level latency section (~11-16 s saved total).  Removing 8b/8c changes the
 //! shared VAD-detector drift state entering the Phase 9-12 FA canaries, so
 //! post-change canary numbers are NOT strictly comparable to archived
 //! baselines (disclosed in the report _note); the noise_overlap clean-cell
@@ -81,10 +78,6 @@
 use super::*; // voice module items (process_enrollment_sample, etc.)
 use crate::audio::embedding_sequence::{EmbeddingSequence, Source, UtteranceId};
 use crate::audio::tts;
-use crate::audio::voice_verifier::{
-    CALIBRATION_LAMBDA, CALIBRATION_SWEEP_STEP, CONV_L2_LAMBDA, DEFAULT_VERIFIER_THRESHOLD,
-    VoiceVerifier,
-};
 use crate::audio::wake_word_classifier::WakeWordClassifier;
 use earshot::Detector;
 use rand::{RngExt, SeedableRng};
@@ -113,48 +106,19 @@ const TOTAL_SCORE_IDX: usize = 0;
 /// vs the old mixed old-style + streaming distribution): 2.13 = 1.35 * 1.58.
 const MIN_CLASSIFIER_THRESHOLD: f32 = 2.13;
 
-/// Number of samples to prepend for verifier warm-up (mahbot-922, mahbot-926).
+/// Number of samples in the warm-up audio prepended before each test
+/// utterance (mahbot-922, mahbot-926).
 ///
-/// ~1.28 s of noise at 16 kHz, consumed by the verifier warm-up period
-/// (4 embeddings, see [`VERIFIER_WARMUP_EMBEDDINGS`](crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS))
-/// so the actual test utterance arrives with a fully active verifier — matching
-/// production behaviour where the warm-up is consumed during background
-/// silence/noise before anyone speaks.
-///
-/// ## Derivation (mahbot-926, stride-8 alignment)
-///
-/// After mahbot-923 switched to stride-8 sliding-window embedding extraction,
-/// each embedding requires [`EMBEDDING_WINDOW_FRAMES`] (76) consecutive mel
-/// frames.  Mel frames are produced by the ONNX `melspectrogram` model at
-/// 10 ms intervals (hop = 160 samples at 16 kHz).
-///
-/// The number of mel frames from N audio samples:
-/// ```text
-/// mel_frames = max(0, (N - 512) / 160 + 1)
-/// ```
-/// where 512 is the STFT window size and 160 is the hop length.
-///
-/// The stride-8 sliding window produces one embedding every 8 mel frames
-/// (80 ms).  To get `N` embeddings we need at least `76 + (N-1) × 8` mel
-/// frames.  For `N = VERIFIER_WARMUP_EMBEDDINGS = 4`:
-/// ```text
-/// mel_frames_needed = 76 + 3 × 8 = 100
-/// samples_needed   ≈ (100 - 1) × 160 + 512 = 16352
-/// ```
-///
-/// 20480 samples (~1.28 s, ~125 mel frames) produces 7 stride-8 embeddings,
-/// safely above the minimum of 4.  The excess margin (~3 extra embeddings)
-/// provides robustness against pipeline changes (stride, window size, VAD
-/// sensitivity).  If the embedding window or stride changes in `voice.rs`,
-/// this constant should be recalculated to maintain ≥ 4 embeddings.
+/// ~1.28 s of background audio at 16 kHz fed through the pipeline before the
+/// test utterance so the warm pass exercises the AGC-adapted, ring-primed
+/// path (production background silence/noise before anyone speaks).
 const WARMUP_PREPEND_SAMPLES: usize = 20480; // 1.28s × 16 kHz
 
-/// TTS phrase for verifier warm-up audio (mahbot-947).
+/// TTS phrase for warm-up audio (mahbot-947).
 ///
 /// A short non-wake-word phrase synthesised via the already-loaded TTS engine.
 /// Speech-like harmonics guarantee the Earshot neural VAD triggers, producing
-/// enough embeddings to consume the verifier warm-up period before the actual
-/// test utterance is processed.
+/// embeddings for the pre-utterance ring.
 ///
 /// Must NOT contain the wake word ([`wake_word()`] — runtime-resolved from the
 /// deployed config store) or phonetically similar phrases that could trigger
@@ -274,12 +238,12 @@ fn read_deployed_wake_phrase() -> Option<String> {
 /// conditioning.
 const NUM_ENROLLMENT_VARIANTS: usize = 10;
 
-/// Owner-negative (non-wake-word) phrases for verifier/classifier training
+/// Owner-negative (non-wake-word) phrases for classifier training
 /// (mahbot-932 Fix 6, re-scoped).
 ///
 /// These are generated via TTS from the ENROLLED voice only (the owner's own
 /// non-wake-word speech), tagged as `Source::Owner`, and used to help the
-/// models reject general speech from the enrolled user.  The phrase list is
+/// model reject general speech from the enrolled user.  The phrase list is
 /// DISJOINT from the confusable/unrelated pools so no phrase is double-labeled
 /// across training tiers (the old list overlapped the unrelated pool:
 /// 'turn on the lights' / 'what time is it' exact matches, 'good morning' vs
@@ -299,13 +263,13 @@ const OWNER_NEGATIVE_PHRASES: &[&str] = &[
 /// The standard 10-style set is F1-F5, M1-M5 in list order.  The allocation
 /// (by index into `available_styles`) guarantees the reserved voices are
 /// absent from EVERY training path:
-/// - enrolled: index 0 (F1) — the ONLY voice in the enrollment clips, owner
-///   negatives, and the verifier positive pool.
+/// - enrolled: index 0 (F1) — the ONLY voice in the enrollment clips and
+///   owner negatives.
 /// - negative pool: indices 0..6 (F1..M1) — the confusable/unrelated prewarm
 ///   styles.  Production rotates ALL voices; the canary+reserved voices are
 ///   dropped so they never train in.
-/// - canaries: indices 6..8 (M2, M3) — trained-in verifier cross-speaker
-///   negatives + the in-distribution canary matrix (kept from mahbot-1025).
+/// - canaries: indices 6..8 (M2, M3) — the in-distribution canary matrix
+///   (kept from mahbot-1025).
 /// - reserved: indices 8..10 (M4, M5) — held-out cross-speaker probes.
 struct VoiceAllocation {
     enrolled: String,
@@ -392,37 +356,12 @@ impl GuidedPromptGroup {
 
 /// Minimum detection rate for positive (wake word) variants required to pass.
 ///
-/// NOTE (mahbot-997): The benchmark auto-computes a suggested value for this
-/// constant via the post-hoc verifier threshold analysis.  To update, run the
-/// benchmark 3× (the verifier is a
-/// [`VERIFIER_ENSEMBLE_SEEDS`](crate::audio::voice_verifier::VERIFIER_ENSEMBLE_SEEDS)-member
-/// multi-seed ensemble since mahbot-1025), take the mean of the three
-/// `computed_min_dr` values, and set this constant to
-/// `floor(mean / 0.2) * 0.2`.  The 0.2 granularity reflects the 24-clip
-/// held-out recall set (16 wake-only + 8 embedded) where each
-/// miss costs roughly 4 percentage points.
+/// Report-only target: the enrolled-speaker held-out recall (unseen
+/// renderings of the enrolled voice) is compared against this in the report
+/// banner; the 0.2 granularity reflects the 24-clip held-out recall set
+/// (16 wake-only + 8 embedded) where each miss costs roughly 4 percentage
+/// points.
 const MIN_DETECTION_RATE: f64 = 0.60;
-
-/// Minimum verifier recall on positive (wake-word) test variants (mahbot-1008
-/// Fix 6).
-///
-/// The verifier must accept at least this fraction of genuine wake-word
-/// variants that it actually evaluates (verifier trained + warm-up complete +
-/// classifier crossed the effective threshold).  The pre-fix verifier scored
-/// `6.67e-8` on every out-of-distribution input — a 0% accept rate — while the
-/// benchmark reported "0% detection" as a success because it had no
-/// verifier-recall metric.
-///
-/// ## Report-only semantics (mahbot-953 precedent)
-///
-/// This constant gates a prominent WARNING, not a hard assert: mahbot-953
-/// deliberately removed all benchmark pass/fail gating, and the mahbot-997
-/// auto-suggestion protocol can ratchet `MIN_DETECTION_RATE` toward 0.0 on
-/// failing runs (see the detection-rate hint below, which now refuses to
-/// endorse lowering the constant on a failing run).  A hard gate can be
-/// re-introduced in a follow-up ticket once fixes #1-#5 have been validated
-/// across benchmark runs.
-const VERIFIER_RECALL_MIN: f64 = 0.90;
 
 // Per-category false accept limits are now dynamic by tier — see
 // [`tier_limits`] and [`BenchTier`] (mahbot-871).
@@ -635,7 +574,7 @@ fn synthesize_wake_word_variant_cached(
 
 // ── Guided-prompt DSP conditioning ──────────────────────────
 // All primitives are deterministic (pure arithmetic or seeded RNG): the
-// pinned-seed verifier-weights contract and cross-run comparability hold.
+// pinned-seed weights contract and cross-run comparability hold.
 
 /// Deterministic first-order IIR lowpass (one-pole):
 /// `y[n] = y[n-1] + α(x[n] − y[n-1])`, `α = 1 − exp(−2π fc / fs)`.
@@ -787,11 +726,10 @@ const EMBEDDED_WAKE_TEMPLATES: &[&str] = &[
 const HELD_OUT_WAKE_ONLY_CLIPS: usize = 16;
 
 /// Generate the held-out recall set: unseen renderings of the ENROLLED voice
-/// at collision-free seeds (3000+ — avoids 100-109 enrollment, 200-235
-/// verifier-extra, 800+ detection variants, 947 warmup, 1000+ owner/confusable
-/// training, 2000+ unrelated training).  Wake phrase alone plus embedded in
-/// sentences.  Generated strictly after training and never added to any
-/// training pool.
+/// at collision-free seeds (3000+ — avoids 100-109 enrollment, 800+ detection
+/// variants, 947 warmup, 1000+ owner/confusable training, 2000+ unrelated
+/// training).  Wake phrase alone plus embedded in sentences.  Generated
+/// strictly after training and never added to any training pool.
 fn generate_held_out_recall_clips_cached(
     enrolled_style: &str,
     model_hash: &str,
@@ -829,8 +767,7 @@ fn generate_held_out_recall_clips_cached(
 }
 
 /// Generate the trained-in canary clips (M2/M3 at seeds 6000/6100): the SAME
-/// clips feed the verifier's cross-speaker negative tier AND the
-/// in-distribution canary matrix — they are training data, so
+/// clips feed the in-distribution canary matrix — they are training data, so
 /// any canary detection is a trained-in regression signal, never a
 /// generalization probe.
 fn generate_canary_clips_cached(
@@ -881,71 +818,6 @@ fn generate_cross_speaker_probe_clips_cached(
         }
     }
     clips
-}
-
-/// Generate additional wake-word TTS clips for the VERIFIER's positive
-/// training pool (mahbot-1025, re-scoped).
-///
-/// The verifier's positive pool is the root of its seed-driven calibration
-/// variance (~30–55 windows from the 6 train clips).  This helper synthesizes
-/// extra wake-word clips for the ENROLLED voice ONLY (single-speaker
-/// semantics: the verifier must accept exactly one voice) at additional seeds,
-/// so the verifier trains on a larger, more diverse positive pool without
-/// changing the classifier's frozen enrollment positives (`pos_sequences`).
-/// The 36-seed × 2 (original + slow) count preserves the mahbot-1025 pool
-/// size that fixed the seed-driven calibration variance.
-///
-/// Each extra clip is also emitted as a 0.90× speed-perturbed rendition
-/// (`_slow`): the enrolled speaker's speed_down (0.95×) test variant is the
-/// hardest for per-member scoring (the measured miss-fraction tail comes from
-/// members scoring it 0.83–0.86), so the verifier positive pool carries
-/// explicitly slower speech (deeper than the 0.95× test variant) to push the
-/// per-member slow-speech scores up.
-///
-/// Returns `(samples, label)` tuples with distinct labels
-/// (`{style}_verifier_extra{seed}` / `{style}_verifier_extra{seed}_slow`) so
-/// provenance is clear in the report.
-fn generate_extra_verifier_positives_cached(
-    enrolled_style: &str,
-    model_hash: &str,
-    cache_dir: &std::path::Path,
-) -> Vec<(Vec<f32>, String)> {
-    // 36 extra seeds for the enrolled voice → 36 clips + 36 slow renditions →
-    // ~72 clips → ~360 extra positive sequences after vad_segment_and_enroll
-    // (each clip yields ~5 variants).  The base pool is only ~30–55 windows
-    // from the 6 train clips; the mahbot-1025 fresh-run protocol showed 2
-    // extra seeds/voice left the per-member speed_down miss fraction at ~0.3
-    // (gate ≤0.15) and 6 seeds at ~0.03 (mostly 0.000 with a rare 0.200 tail),
-    // so the pool is expanded further to push the per-member miss probability
-    // toward zero — the ticket identifies the tiny positive pool as the root
-    // of the seed-driven calibration variance.
-    const EXTRA_SEEDS_PER_VOICE: usize = 36;
-    let mut variants = Vec::new();
-    for s in 0..EXTRA_SEEDS_PER_VOICE {
-        // Distinct seed range (200-235) so these never collide with the
-        // base enrollment seeds (100-109) or any held-out range (3000+).
-        let seed = 200 + s as u64;
-        if let Some(pcm) = synthesize_wake_word_variant_cached(
-            wake_word(),
-            enrolled_style,
-            seed,
-            TARGET_SAMPLE_RATE,
-            model_hash,
-            cache_dir,
-        ) {
-            variants.push((
-                pcm.clone(),
-                format!("{enrolled_style}_verifier_extra{seed}"),
-            ));
-            // Slower/lower-pitch rendition of the SAME clip (no extra TTS
-            // synthesis — pure resampling).  The verifier then trains on
-            // explicitly slower wake-word speech, which is where the
-            // per-member speed_down misses live (mahbot-1025).
-            let slow = crate::util::speed_perturbation(&pcm, TARGET_SAMPLE_RATE, 0.90);
-            variants.push((slow, format!("{enrolled_style}_verifier_extra{seed}_slow")));
-        }
-    }
-    variants
 }
 
 /// Seed configuration for TTS phrase variant generation.
@@ -1170,8 +1042,7 @@ fn generate_high_freq_hiss() -> Vec<f32> {
 /// ## Fallback rationale
 /// The pink noise + 200 Hz tone was the original warm-up signal (mahbot-922/926),
 /// but its lack of speech-like harmonic structure causes the Earshot neural VAD
-/// to reject it as non-speech, producing 0 embeddings and leaving the verifier
-/// cold.  This was the root cause of Phase 8's 0% detection rate (mahbot-947).
+/// to reject it as non-speech, producing 0 embeddings and an unprimed ring.
 fn generate_warmup_noise() -> Cow<'static, [f32]> {
     // TTS cache hit — fast path, no synthesis needed.
     if let Some(cached) = WARMUP_TTS_CACHE.get() {
@@ -1180,7 +1051,7 @@ fn generate_warmup_noise() -> Cow<'static, [f32]> {
 
     // First call (or cache not yet populated): try TTS synthesis.
     // Speech-like harmonics guarantee Earshot VAD triggers, producing
-    // enough mel frames for ≥7 stride-8 embeddings.
+    // embeddings that prime the ring.
     if let Some(pcm) = try_warmup_tts() {
         let cached = WARMUP_TTS_CACHE.get_or_init(|| pcm);
         // Safety: we just verified get() returns None above; no race
@@ -1192,7 +1063,7 @@ fn generate_warmup_noise() -> Cow<'static, [f32]> {
     // TTS on future calls if models become available).
     warn!(
         "TTS warm-up synthesis failed — falling back to pink noise + tone. \
-         This may not trigger Earshot VAD, causing 0 warm-up embeddings. \
+         This may not trigger Earshot VAD, producing 0 warm-up embeddings. \
          Ensure TTS models are cached (~/.mahbot/models/tts/)."
     );
     Cow::Owned(generate_warmup_noise_fallback())
@@ -1295,7 +1166,7 @@ fn process_frame(samples: &[f32], ctx: &mut super::PipelineCtx) {
 /// in [`FRAME_LENGTH`](super::FRAME_LENGTH) chunks, then send silence frames to flush any
 /// remaining voice batch — matching the processing pattern in [`run_streaming_detection`].
 ///
-/// This is used to pre-warm the pipeline (verifier, AGC) before the actual test utterance,
+/// This is used to pre-warm the pipeline (AGC) before the actual test utterance,
 /// without contaminating latency measurements (mahbot-922).
 fn feed_audio(samples: &[f32], ctx: &mut super::PipelineCtx) {
     for chunk in samples.chunks(super::FRAME_LENGTH) {
@@ -1312,26 +1183,14 @@ fn feed_audio(samples: &[f32], ctx: &mut super::PipelineCtx) {
     }
 }
 
-/// Consume the verifier warm-up period by feeding [`generate_warmup_noise`] through
-/// [`feed_audio`].  After this call the verifier is active and the latency timer in
-/// [`run_streaming_detection`] reflects only the test utterance (mahbot-922, mahbot-926).
-///
-/// ## Stride-8 warm-up (mahbot-926)
-///
-/// The stride-8 sliding-window embedding extraction (mahbot-923) requires at least
-/// [`EMBEDDING_WINDOW_FRAMES`](super::EMBEDDING_WINDOW_FRAMES) mel frames (76) to
-/// produce even one embedding.  With [`WARMUP_PREPEND_SAMPLES`] = 20480, the warm-up
-/// noise produces ~125 mel frames → 7 stride-8 embeddings, safely exceeding the
-/// verifier's [`VERIFIER_WARMUP_EMBEDDINGS`] = 4 requirement.
+/// Feed the warm-up audio through [`feed_audio`] so the warm pass starts the
+/// test utterance with a ring-primed, AGC-adapted path (mahbot-922, mahbot-926).
 ///
 /// ## Diagnostics
 ///
-/// - If VAD didn't trigger (fewer than [`VERIFIER_WARMUP_EMBEDDINGS`] embeddings
-///   produced), a `warn!()` is emitted so maintainers know the warm-up wasn't fully
-///   consumed.  Detection on short utterances (<1 s) will be disadvantaged.
-/// - If the warm-up noise triggered a false detection, a `warn!()` is emitted and
-///   the detection state is restored to prevent cooldown from corrupting subsequent
-///   benchmark measurements (mahbot-922).
+/// If the warm-up noise triggered a false detection, a `warn!()` is emitted and
+/// the detection state is restored to prevent cooldown from corrupting subsequent
+/// benchmark measurements (mahbot-922).
 ///
 /// ## Residue clearing (mahbot-1003, mahbot-1006)
 ///
@@ -1342,64 +1201,29 @@ fn feed_audio(samples: &[f32], ctx: &mut super::PipelineCtx) {
 ///   test utterance mel frames, not warm-up remnants + test audio mixed together.
 /// - **`next_window_start`** — reset to 0 so embedding extraction starts from the
 ///   first test-utterance mel frame.
-/// - **`score_window`** — cleared so warm-up classifier scores cannot create a
-///   premature candidate on the first test embedding.
-/// - **`candidate`** — cleared to discard any bounded classifier candidate that
-///   may have formed after the warm-up embeddings exceeded
-///   [`VERIFIER_WARMUP_EMBEDDINGS`].
+/// - **`score_window`** — cleared so warm-up classifier scores cannot carry into
+///   the first test embedding's rolling sum.
 /// - **`segment_silence_hops`** — reset to 0 so the test utterance starts a fresh
 ///   segment (the warm-up flush's VAD-negative hops must not shorten the test
 ///   utterance's trailing-silence window, mahbot-1006 H).
+/// - **`burst_sweep_done`** — cleared (mahbot-1023): warm-up audio passes through
+///   the full scoring pipeline and would otherwise suppress the test utterance's
+///   own burst sweep.
 /// - **`audio_preprocessor`** — `reset()` (mahbot-1006 A): the warm-up drives the
 ///   AGC to a speech-adapted gain and the NS to a speech-adapted profile; both
 ///   must be fresh for the test utterance, matching training's lazy-init AGC and
 ///   production's `reset_detection_segment()` at segment boundaries.
 ///
-/// **Preserved**: `embedding_ring` (keeps warm-up embeddings so
-/// [`is_warmup_period`](crate::audio::voice_verifier::VoiceVerifier) returns
-/// `false` and detections are not suppressed), `adaptive_threshold` (preserves
-/// warm-up-adapted state — see mahbot-1006 F; the cold-start pass instead uses
-/// a fresh [`AdaptiveThresholdState::new`]).
-///
-/// ## Warm-up ring-content divergence (mahbot-1006 E)
-///
-/// The preserved warm-up embeddings in `embedding_ring` are TTS speech
-/// embeddings, whereas production's ring at a segment start contains ambient
-/// noise/silence embeddings.  This is an accepted divergence for the warm pass:
-/// the warm-up must produce embeddings at all (only VAD-triggering speech does
-/// so reliably), and the classifier's first test windows are pure test content
-/// because `mel_frame_buffer` is cleared.  The cold-start pass (mahbot-1006 D)
-/// measures the empty-ring case instead, which is production's exact post-
-/// silence state.
+/// **Preserved**: `embedding_ring` (warm-up embeddings prime the classifier's
+/// first Conv1D windows), `adaptive_threshold` (preserves warm-up-adapted state —
+/// see mahbot-1006 F; the cold-start pass instead uses a fresh
+/// [`AdaptiveThresholdState::new`]).
 fn consume_warmup(ctx: &mut super::PipelineCtx) {
-    let before_embeddings = ctx.embedding_ring.len();
     let before_detection = ctx.last_wake_word_detection;
     let noise = generate_warmup_noise();
 
     // ── Feed warm-up audio (single pass) ───────────────────────────────────
-    // With TTS-generated speech, VAD triggers on almost every frame, producing
-    // enough mel frames for ≥7 stride-8 embeddings.  A single pass suffices —
-    // re-feeding identical audio through an already-adapted AGC cannot increase
-    // VAD triggering (mahbot-926, reviewer feedback).
     feed_audio(&noise, ctx);
-    let produced = ctx.embedding_ring.len().saturating_sub(before_embeddings);
-
-    // Diagnostic: validate warm-up produced enough embeddings (mahbot-922/926).
-    // When warm-up fails (TTS not available, pink noise used), this warning
-    // indicates the verifier will NOT be active — every variant's first 4
-    // embeddings will be consumed by warm-up suppression instead of scoring,
-    // making detection impossible for short utterances (<1 s).
-    if produced < crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS {
-        warn!(
-            "Warm-up produced only {} embedding(s) (need >= {}) — \
-             verifier will NOT be active for this variant.  \
-             This is expected when using the pink-noise fallback (TTS not available). \
-             Every variant's first 4 embeddings will be consumed by warm-up suppression. \
-             Detection on short utterances (<1 s) will be disadvantaged.",
-            produced,
-            crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS,
-        );
-    }
 
     // Guard: warm-up noise should not trigger a false detection.  If it does,
     // restore the pre-warm-up state so cooldown doesn't suppress all subsequent
@@ -1416,75 +1240,29 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
     }
 
     // ── Clear warm-up residues before test utterance processing (mahbot-1003) ──
-    // Warm-up audio produces mel frames, classifier scores, and may create a
-    // bounded classifier candidate.  These residues must be cleared so the
-    // test utterance starts with a clean detection slate.  Specifically:
-    //
-    // 1. Mel frame contamination — the first stride-8 windows would span
-    //    warm-up remnants + test audio, producing mixed-content embeddings
-    //    that score poorly and fall below NO_MATCH_RESET_THRESHOLD, clearing
-    //    the score window before clean test embeddings arrive.
-    //
-    // 2. Premature candidate — preserved warm-up classifier scores may create
-    //    a candidate on the first test embedding, consuming test frames without
-    //    verifier confirmation, then expiring before enough clean frames
-    //    remain to re-trigger.
-    //
-    // 3. Candidate from warm-up — a candidate may have formed after the
-    //    warm-up embeddings exceeded VERIFIER_WARMUP_EMBEDDINGS.  Without
-    //    clearing it, the candidate would consume test utterance frames
-    //    during its update lifecycle.
-    //
-    // embedding_ring is preserved so is_warmup_period returns false for test
-    // utterances — the verifier has context and detections are NOT suppressed.
+    // Warm-up audio produces mel frames and classifier scores.  These residues
+    // must be cleared so the test utterance starts with a clean detection slate:
+    // the first stride-8 windows would otherwise span warm-up remnants + test
+    // audio, producing mixed-content embeddings that score poorly and fall below
+    // NO_MATCH_RESET_THRESHOLD, clearing the score window before clean test
+    // embeddings arrive.
     ctx.mel_frame_buffer.clear();
     ctx.next_window_start = 0;
     ctx.score_window.clear();
-    ctx.candidate = None;
     ctx.segment_silence_hops = 0;
-    // ── Clear the per-segment deferred-burst latch (mahbot-1023) ──
-    // Warm-up audio passes through the FULL scoring pipeline and therefore
-    // triggers the deferred burst sweep on the warm-up noise.  Without
-    // clearing the latch here, the test utterance's own burst sweep would be
-    // suppressed (the warm-up consumption is a fresh segment boundary for the
-    // benchmark's purposes).
+    // Clear the per-segment deferred-burst latch (mahbot-1023): warm-up audio
+    // passes through the FULL scoring pipeline and triggers the deferred burst
+    // sweep on the warm-up noise; without clearing the latch here, the test
+    // utterance's own burst sweep would be suppressed.
     ctx.burst_sweep_done = false;
 
     // ── Reset instrumentation (mahbot-1005 §1) ─────────────────────────────
     // Warm-up audio passes through the full scoring pipeline and records into
-    // ctx.instrumentation: per_frame_scores, peak_score, peak_verifier_score,
-    // candidate lifecycle counters, VAD counts, and the adaptive threshold
-    // trajectory.  Without a reset, warm-up-only scores contaminate the test
-    // utterance's per-variant metrics:
-    //
-    //   - Silence/noise negatives report "classifier triggers" from warm-up
-    //     speech (the fake "Silence: 1/1 trigger").
-    //   - Inflated trigger counts across all categories.
-    //   - Miss-classification buckets polluted by warm-up frames (a genuine
-    //     classifier miss rebucketed as "verifier miss").
-    //   - peak_verifier_score non-zero even for silence variants.
-    //
-    // The warm-up "head start" (mahbot-1002) remains observable via the two
-    // warmup_* fields captured below — the values are preserved, not hidden.
-    //
-    // ctx.peak_score is also reset: although the streaming path never writes it
-    // today, reset_detection_segment() flushes it into instrumentation, so any
-    // future writer would re-contaminate the fresh instrumentation at the next
-    // segment boundary (analyst feedback, mahbot-1005).
-    let warmup_max_rolling_sum = max_rolling_sum(&ctx.instrumentation.per_frame_scores);
-    let warmup_peak_verifier_score = ctx.instrumentation.peak_verifier_score;
-    ctx.instrumentation = super::DetectionInstrumentation {
-        warmup_max_rolling_sum,
-        warmup_peak_verifier_score,
-        ..super::DetectionInstrumentation::new()
-    };
-    // mahbot-1012: record the preserved warm-up ring length so the first test
-    // windows (whose Conv1D window spans warm-up entries + test entries) can
-    // be classified as `WindowGeometry::WarmMixed`.  Set AFTER the reset
-    // above — the struct-update reset would otherwise zero it.  The embedding
-    // ring itself is preserved through the reset (it is not cleared), so this
-    // equals `warmup_n_embeddings` as reported to the caller.
-    ctx.instrumentation.test_start_ring_len = ctx.embedding_ring.len();
+    // ctx.instrumentation: per_frame_scores, peak_score, VAD counts, and the
+    // adaptive threshold trajectory.  Without a reset, warm-up-only scores
+    // contaminate the test utterance's per-variant metrics (silence/noise
+    // negatives would report "classifier triggers" from warm-up speech).
+    ctx.instrumentation = super::DetectionInstrumentation::new();
     ctx.peak_score = 0.0;
 
     // ── Fresh AGC/NS state for the test utterance (mahbot-1006 A) ─────────
@@ -1500,13 +1278,7 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
     // reset() (not clear_buffer()): the critique on mahbot-1006 noted the two
     // differ in NS-profile preservation, and production segment boundaries use
     // reset() — the warm-up TTS speech should not seed the noise suppressor's
-    // adapted profile for the test utterance either.
-    //
-    // Note (warm-up source reporting): when TTS warm-up is unavailable and the
-    // pink-noise fallback fires, the fallback drives the AGC toward MIN_GAIN
-    // (0.25×).  Without this reset that would guarantee VAD misses on short
-    // utterances; with it the test utterance starts from lazy init like
-    // training and production's digital-silence case.  The warm-up source is
+    // adapted profile for the test utterance either.  The warm-up source is
     // reported in the JSON reproducibility block.
     ctx.audio_preprocessor.reset();
 }
@@ -1642,7 +1414,7 @@ fn enrollment_quality_probe(enrollment_variants: &[(Vec<f32>, String)]) -> serde
 /// Fix 6, re-scoped).
 ///
 /// These are TTS-synthesised phrases tagged as `Source::Owner` for use in
-/// classifier and verifier training.  Since the re-scope the owner is the
+/// classifier training.  Since the re-scope the owner is the
 /// ENROLLED voice only (single-speaker semantics — the owner's own non-wake
 /// speech); the multi-voice style rotation is gone.  Documented limitation:
 /// TTS speech cannot match the distribution of real human Phase 3 speech.
@@ -1652,7 +1424,7 @@ fn enrollment_quality_probe(enrollment_variants: &[(Vec<f32>, String)]) -> serde
 /// Production captures owner negatives as real post-AGC/post-NS mic audio
 /// (Phase 3 collection).  The benchmark's TTS surrogates are therefore routed
 /// through the same pipeline as production's `prewarm_phrase_embeddings`
-/// TTS-negative path so the classifier/verifier do not train on a raw-TTS
+/// TTS-negative path so the classifier does not train on a raw-TTS
 /// distribution that production never produces:
 ///
 /// 1. **Fresh [`AudioPreprocessor`] per phrase × seed** (mahbot-1009) — fed in
@@ -1733,13 +1505,12 @@ fn generate_owner_negative_sequences(
                 );
                 match embs {
                     Ok(embs) if !embs.is_empty() => {
-                        sequences.push(EmbeddingSequence::negative(
+                        sequences.push(EmbeddingSequence::new(
                             UtteranceId {
                                 sequence_index: i * 3 + seed,
                                 variant_index: 0,
                             },
                             Source::Owner,
-                            None,
                             embs,
                         ));
                     }
@@ -1762,7 +1533,7 @@ fn generate_owner_negative_sequences(
 /// collected during Phase 3.  The benchmark's synthetic noise profiles are
 /// therefore routed through a **shared** [`AudioPreprocessor`] (matching the
 /// persistent live-mic preprocessor) before embedding extraction, so the
-/// classifier/verifier do not train on a raw-noise distribution production
+/// classifier does not train on a raw-noise distribution production
 /// never produces.  Documented limitation: synthetic noise through a fresh
 /// noise suppressor is more aggressively attenuated than production's
 /// room-adapted NS; this is a surrogate for real ambient capture.
@@ -1788,13 +1559,12 @@ fn generate_ambient_noise_sequences() -> Vec<EmbeddingSequence> {
         let agc_raw = process_agc(&raw);
         match super::process_enrollment_sample(&agc_raw) {
             Ok(embs) if !embs.is_empty() => {
-                sequences.push(EmbeddingSequence::negative(
+                sequences.push(EmbeddingSequence::new(
                     UtteranceId {
                         sequence_index: seq_idx * 2,
                         variant_index: 0,
                     },
                     Source::Ambient,
-                    None,
                     embs,
                 ));
             }
@@ -1805,107 +1575,16 @@ fn generate_ambient_noise_sequences() -> Vec<EmbeddingSequence> {
         let agc_attenuated = process_agc(&attenuated);
         match super::process_enrollment_sample(&agc_attenuated) {
             Ok(embs) if !embs.is_empty() => {
-                sequences.push(EmbeddingSequence::negative(
+                sequences.push(EmbeddingSequence::new(
                     UtteranceId {
                         sequence_index: seq_idx * 2 + 1,
                         variant_index: 0,
                     },
                     Source::Ambient,
-                    None,
                     embs,
                 ));
             }
             _ => warn!("Ambient '{label}' level-1: no embeddings"),
-        }
-    }
-    sequences
-}
-
-/// Generate cross-speaker TTS wake-word negatives for verifier training
-/// (mahbot-1025, re-scoped).
-///
-/// The ticket's user-approved reclassification: the noise_overlap M2/M3
-/// cross-speaker cells are **in-distribution regression canaries** — the wake
-/// word spoken by a NON-enrolled TTS voice must be REJECTED by the verifier
-/// (single-speaker semantics; cross-speaker generalization is probed honestly
-/// with the RESERVED M4/M5 voices, which are absent from every training path).
-///
-/// This helper produces the verifier's in-distribution negative sequences
-/// from the trained-in canary clips (M2/M3): each clip's wake-word audio is
-/// embedded as a [`Source::CrossSpeaker`] negative in five conditions —
-/// clean, 10 dB white, 20 dB white, 10 dB pink, 20 dB pink (the ticket's
-/// "clean and 10/20 dB white/pink noise-conditioned variants").  Positives
-/// stay unchanged; the classifier negative set is untouched (verifier-only).
-///
-/// ## Preprocessing alignment
-///
-/// Mirrors the owner-negative path (mahbot-1009): each clip goes through a
-/// fresh [`AudioPreprocessor`] (AGC + NS) in [`FRAME_LENGTH`](super::FRAME_LENGTH)
-/// chunks, then the noise-conditioned variant is embedded via
-/// [`super::process_enrollment_sample`] (dense stride-8 embeddings).  The
-/// shared-AudioPreprocessor/`vad_gate_streaming_mel` variant used by
-/// `generate_owner_negative_sequences` is deliberately NOT used here — the
-/// cross-speaker negatives are wake-word AUDIO (not general speech), so the
-/// enrollment-embedding path (AGC → process_enrollment_sample) matches the
-/// positive-wake-word distribution the verifier must separate from.
-fn generate_cross_speaker_negative_sequences(
-    canary_clips: &[(Vec<f32>, String)],
-) -> Vec<EmbeddingSequence> {
-    use crate::util::{NoiseType, add_noise_white_pink};
-    let config = enrollment_preprocessor_config();
-    let chunk_size = super::FRAME_LENGTH;
-    let mut sequences = Vec::new();
-    for (clip_idx, (pcm, label)) in canary_clips.iter().enumerate() {
-        // Fresh per-clip AGC (mirrors the enrollment path; shared helper
-        // mahbot-1045 A2).
-        let agc_audio = crate::audio::audio_preprocessor::agc_feed_fresh(pcm, chunk_size, config);
-        // Conditions: clean + 10/20 dB white/pink (ticket mahbot-1025).
-        let conditions: Vec<(&str, Vec<f32>)> = vec![
-            ("clean", agc_audio.clone()),
-            (
-                "10db_white",
-                add_noise_white_pink(
-                    &agc_audio,
-                    10.0,
-                    NoiseType::White,
-                    Some(clip_idx as u64 + 1),
-                ),
-            ),
-            (
-                "20db_white",
-                add_noise_white_pink(
-                    &agc_audio,
-                    20.0,
-                    NoiseType::White,
-                    Some(clip_idx as u64 + 2),
-                ),
-            ),
-            (
-                "10db_pink",
-                add_noise_white_pink(&agc_audio, 10.0, NoiseType::Pink, Some(clip_idx as u64 + 3)),
-            ),
-            (
-                "20db_pink",
-                add_noise_white_pink(&agc_audio, 20.0, NoiseType::Pink, Some(clip_idx as u64 + 4)),
-            ),
-        ];
-        for (variant_idx, (cond, audio)) in conditions.iter().enumerate() {
-            match super::process_enrollment_sample(audio) {
-                Ok(embs) if !embs.is_empty() => {
-                    let n = embs.len();
-                    sequences.push(EmbeddingSequence::negative(
-                        UtteranceId {
-                            sequence_index: clip_idx,
-                            variant_index: variant_idx,
-                        },
-                        Source::CrossSpeaker,
-                        None,
-                        embs,
-                    ));
-                    info!("Cross-speaker negative '{label}' {cond}: {n} embeddings (mahbot-1025)",);
-                }
-                _ => warn!("Cross-speaker negative '{label}' {cond}: no embeddings"),
-            }
         }
     }
     sequences
@@ -1970,13 +1649,12 @@ fn generate_restricted_phrase_negatives(
             let mut utterance_variants: Vec<(u8, Vec<Vec<f32>>)> = Vec::new();
             let mut push_seq = |embs: Vec<Vec<f32>>, vi: usize| {
                 if !embs.is_empty() {
-                    dense_sequences.push(EmbeddingSequence::negative(
+                    dense_sequences.push(EmbeddingSequence::new(
                         UtteranceId {
                             sequence_index: phrase_index_for_id,
                             variant_index: vi,
                         },
                         source,
-                        None,
                         embs.clone(),
                     ));
                     utterance_variants
@@ -2258,8 +1936,8 @@ fn enrollment_preprocessor_config() -> crate::audio::audio_preprocessor::Preproc
 ///    `handle_enrollment_sample` variant set (mahbot-878) — then extracts
 ///    embeddings from the original and all 4 variants.
 ///
-/// Returns dense-only EmbeddingSequences (stride-8) for classifier and
-/// verifier training.  The old streaming path was removed in mahbot-923.
+/// Returns dense-only EmbeddingSequences (stride-8) for classifier
+/// training.  The old streaming path was removed in mahbot-923.
 #[allow(clippy::too_many_lines)]
 fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<EmbeddingSequence> {
     let chunk_size = super::FRAME_LENGTH;
@@ -2343,18 +2021,16 @@ fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<Emb
         // 4 = noise).
         let push_variant = |variant_index: usize,
                             source: Source,
-                            aug_family: Option<AugmentationFamily>,
                             pcm: &[f32],
                             sequences: &mut Vec<EmbeddingSequence>| {
             match super::process_enrollment_sample(pcm) {
                 Ok(embeddings) if !embeddings.is_empty() => {
-                    sequences.push(EmbeddingSequence::positive(
+                    sequences.push(EmbeddingSequence::new(
                         UtteranceId {
                             sequence_index: i,
                             variant_index,
                         },
                         source,
-                        aug_family,
                         embeddings,
                     ));
                 }
@@ -2368,18 +2044,14 @@ fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<Emb
         };
 
         for variant in augmented {
-            let (source, aug_family) = match variant.variant_index {
-                0 => (Source::Enrollment, None),
-                1 => (Source::Augmentation, Some(AugmentationFamily::SpeedDown)),
-                2 => (Source::Augmentation, Some(AugmentationFamily::SpeedUp)),
-                3 => (Source::Augmentation, Some(AugmentationFamily::Volume)),
-                4 => (Source::Augmentation, Some(AugmentationFamily::Noise)),
+            let source = match variant.variant_index {
+                0 => Source::Enrollment,
+                1..=4 => Source::Augmentation,
                 _ => unreachable!("augment_pcm_variants yields only indices 0..=4"),
             };
             push_variant(
                 variant.variant_index,
                 source,
-                aug_family,
                 &variant.pcm,
                 &mut dense_sequences,
             );
@@ -2563,13 +2235,10 @@ struct PerVariantResult {
     /// Maximum rolling sum (sum of 3 consecutive total_scores with decay)
     /// achieved during processing. Derived from per_frame_scores.
     max_rolling_sum: f32,
-    /// Peak verifier prediction score achieved during processing
-    /// (0.0 if verifier is untrained or no embeddings passed the threshold).
-    verifier_score: f32,
     /// Number of embeddings produced during streaming detection (mahbot-886).
-    /// This is the length of the verifier's embedding ring buffer after
-    /// processing, which directly reflects how many mel frames passed through
-    /// the embedding model (mahbot-922).
+    /// This is the length of the embedding ring buffer after processing, which
+    /// directly reflects how many mel frames passed through the embedding model
+    /// (mahbot-922).
     n_embeddings: usize,
     /// Number of frames where total_score < NO_MATCH_RESET_THRESHOLD (0.316).
     n_frames_below_reset: usize,
@@ -2583,52 +2252,15 @@ struct PerVariantResult {
     /// scoring (mahbot-891).  Use `ROLLING_SUM_IDX` / `THRESHOLD_IDX` for named
     /// access to the rolling sum and effective threshold fields respectively.
     per_frame_scores: Vec<[f32; 3]>,
-    /// Whether the verifier warm-up was completed before this variant's test
-    /// utterance was processed (embedding_ring had ≥
-    /// [`VERIFIER_WARMUP_EMBEDDINGS`](crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS)
-    /// entries after `consume_warmup`).  When `false`, the verifier will NOT be
-    /// active, and the first 4 embeddings from the test utterance are consumed
-    /// by warm-up suppression (mahbot-947).
-    warmup_completed: bool,
-    /// Number of embeddings in the ring buffer after warm-up consumption,
-    /// before processing the test utterance (mahbot-947).
-    warmup_n_embeddings: usize,
-    /// Per-frame peak verifier score, parallel to `per_frame_scores`
-    /// (mahbot-1005 §4).  0.0 per-frame means the verifier was not evaluated on
-    /// that frame (warm-up period / untrained verifier), not a zero-confidence
-    /// rejection.
-    verifier_score_trajectory: Vec<f32>,
-    /// Number of classifier candidates created during this session (mahbot-1005 §4).
-    candidates_created: usize,
-    /// Number of candidates confirmed (detection fired via the verifier gate).
-    candidates_confirmed: usize,
-    /// Number of candidates cleared without confirmation (expired via
-    /// CANDIDATE_MAX_EMBEDDINGS or reset by a below-reset score frame).
-    candidates_expired: usize,
     /// Index of the first classifier-trigger frame within `per_frame_scores`.
     /// `None` when the classifier never triggered on test-utterance frames.
     first_trigger_frame_idx: Option<usize>,
-    /// Max rolling sum achieved by warm-up audio only (mahbot-1005 §1).
-    warmup_max_rolling_sum: f32,
-    /// Peak verifier score achieved by warm-up audio only (mahbot-1005 §1).
-    warmup_peak_verifier_score: f32,
-    /// Number of frames where the classifier triggered but detection was
-    /// suppressed by verifier warm-up during the test run.
-    n_warmup_suppressed_frames: usize,
     /// Number of embeddings attributed to the test utterance — the length of
     /// `per_frame_scores` (one entry per scored embedding after the warm-up
     /// instrumentation reset).  Unlike `n_embeddings` (ring length at end,
     /// which includes the intentionally preserved warm-up embeddings and can be
     /// cleared by a segment boundary), this counts only test-utterance frames.
     n_test_embeddings: usize,
-    /// Verifier decision threshold in effect during this variant's processing.
-    /// Used as the `threshold_at_peak` evidence for miss classification.
-    verifier_threshold: f32,
-    /// Whether the verifier was trained (and therefore the second-stage gate
-    /// was active) during this variant's processing.  When `false`, the
-    /// verifier is a no-op and a miss after crossing the effective threshold
-    /// is a candidate lifecycle/timing issue, not a verifier rejection.
-    verifier_trained: bool,
     /// Per-frame adaptive threshold trajectory (parallel to `per_frame_scores`,
     /// mahbot-1005 §8).  Previously collected in `DetectionInstrumentation`
     /// but never emitted in the benchmark report.
@@ -2656,27 +2288,14 @@ struct PerVariantResult {
     /// Adaptive-threshold mode of each scored frame (see
     /// [`super::AdaptiveFrameMode`]).
     per_frame_adaptive_mode: Vec<super::AdaptiveFrameMode>,
-    /// Candidate lifecycle state after each scored frame (see
-    /// [`super::CandidateFrameState`]).
-    per_frame_candidate_state: Vec<super::CandidateFrameState>,
     /// Per-hop VAD decisions during streaming detection (one per VAD decision
     /// in processing order).
     per_hop_vad: Vec<bool>,
 
     // ── mahbot-1023 deferred-burst / acceptance-floor fields ──────────────
     /// Scoring path that produced the detection (raw source: "burst" /
-    /// "segment_end_pass" / "other").  `None` when not detected.  The
-    /// enrolled-phase report reclassifies "other" via
-    /// [`candidate_created_path`](Self::candidate_created_path): a
-    /// main-loop confirmation of a burst-created candidate is the PRIMARY
-    /// mechanism ("burst_continuation"); a main-loop detection whose
-    /// candidate the main loop created itself is "unexpected" (mahbot-1024).
+    /// "segment_end_pass" / "other").  `None` when not detected.
     detection_path: Option<String>,
-    /// Scoring path that created the ACTIVE classifier candidate ("burst" /
-    /// "segment_end_pass" / "other"; `None` when no candidate is active).
-    /// Evidence for the [`detection_path`](Self::detection_path)
-    /// reclassification (mahbot-1024).
-    candidate_created_path: Option<String>,
     /// Whether the deferred burst sweep ran during this variant's session.
     burst_sweep_fired: bool,
     /// Mel-frame buffer length at burst-sweep time (the actual live trigger
@@ -2701,9 +2320,6 @@ fn build_per_variant_result(
     label: &str,
     result: &DetectionResult,
     ctx: &super::PipelineCtx,
-    warmup_completed: bool,
-    warmup_n_embeddings: usize,
-    verifier: &VoiceVerifier,
 ) -> PerVariantResult {
     let peak = ctx.instrumentation.peak_score;
     let max_rs = max_rolling_sum(&ctx.instrumentation.per_frame_scores);
@@ -2718,7 +2334,6 @@ fn build_per_variant_result(
         detected: result.detected,
         peak_score: peak,
         max_rolling_sum: max_rs,
-        verifier_score: ctx.instrumentation.peak_verifier_score,
         n_embeddings: ctx.embedding_ring.len(),
         n_frames_below_reset: ctx.instrumentation.n_frames_below_reset,
         // Captured pre-flush in run_streaming_detection (mahbot-1006 A/H) —
@@ -2727,19 +2342,8 @@ fn build_per_variant_result(
         agc_converged: result.agc_converged,
         vad_speech_frames: ctx.instrumentation.vad_speech_frames,
         per_frame_scores: ctx.instrumentation.per_frame_scores.clone(),
-        warmup_completed,
-        warmup_n_embeddings,
-        verifier_score_trajectory: ctx.instrumentation.per_frame_verifier_scores.clone(),
-        candidates_created: ctx.instrumentation.candidates_created,
-        candidates_confirmed: ctx.instrumentation.candidates_confirmed,
-        candidates_expired: ctx.instrumentation.candidates_expired,
         first_trigger_frame_idx: ctx.instrumentation.first_trigger_frame_idx,
-        warmup_max_rolling_sum: ctx.instrumentation.warmup_max_rolling_sum,
-        warmup_peak_verifier_score: ctx.instrumentation.warmup_peak_verifier_score,
-        n_warmup_suppressed_frames: ctx.instrumentation.n_warmup_suppressed_frames,
         n_test_embeddings,
-        verifier_threshold: verifier.threshold,
-        verifier_trained: verifier.is_trained(),
         adaptive_threshold_trajectory: ctx.instrumentation.adaptive_threshold_trajectory.clone(),
         ceiling_limited_frames: ctx.instrumentation.ceiling_limited_frames,
         latency_ms: result.latency_ms,
@@ -2751,14 +2355,9 @@ fn build_per_variant_result(
         per_frame_mel_buffer_len: ctx.instrumentation.per_frame_mel_buffer_len.clone(),
         per_frame_geometry: ctx.instrumentation.per_frame_geometry.clone(),
         per_frame_adaptive_mode: ctx.instrumentation.per_frame_adaptive_mode.clone(),
-        per_frame_candidate_state: ctx.instrumentation.per_frame_candidate_state.clone(),
         per_hop_vad: ctx.instrumentation.per_hop_vad.clone(),
         // mahbot-1023: deferred-burst / acceptance-floor evidence.
         detection_path: ctx.instrumentation.detection_path.map(str::to_string),
-        candidate_created_path: ctx
-            .instrumentation
-            .candidate_created_path
-            .map(str::to_string),
         burst_sweep_fired: ctx.instrumentation.burst_sweep_fired,
         burst_sweep_buffer_len: ctx.instrumentation.burst_sweep_buffer_len,
         segment_end_pass_fired: ctx.instrumentation.segment_end_pass_fired,
@@ -2791,21 +2390,6 @@ enum MissVerdict {
     /// Crossed the hard floor ([`MIN_CLASSIFIER_THRESHOLD`] = 2.13) but never
     /// crossed the effective adaptive threshold.
     AdaptiveThresholdBlocked,
-    /// Crossed the effective threshold; a candidate existed but the verifier
-    /// peak stayed below the verifier decision threshold.
-    VerifierRejected,
-    /// Crossed the effective threshold and the verifier peak reached the
-    /// verifier threshold, yet detection did not fire — the candidate expired
-    /// ([`CANDIDATE_MAX_EMBEDDINGS`] exceeded) or the audio ended before
-    /// confirmation.  Also covers an untrained (no-op) verifier, where no
-    /// second-stage gate exists to reject.
-    VerifierTiming,
-    /// The first classifier threshold crossing fell inside the verifier
-    /// warm-up epoch (frame-accurate, mahbot-1024: frame `i` is warm-up iff
-    /// `warmup_n_embeddings + i + 1 < VERIFIER_WARMUP_EMBEDDINGS`); the
-    /// trigger was suppressed by verifier warm-up
-    /// ([`VERIFIER_WARMUP_EMBEDDINGS`]).
-    WarmupSuppression,
     /// AGC explicitly reported non-convergence (`Some(false)`).
     AgcFailure,
 }
@@ -2818,9 +2402,6 @@ impl MissVerdict {
             Self::VadFailure => "vad_failure",
             Self::ClassifierNoTrigger => "classifier_no_trigger",
             Self::AdaptiveThresholdBlocked => "adaptive_threshold_blocked",
-            Self::VerifierRejected => "verifier_rejected",
-            Self::VerifierTiming => "verifier_timing",
-            Self::WarmupSuppression => "warmup_suppression",
             Self::AgcFailure => "agc_failure",
         }
     }
@@ -2834,42 +2415,17 @@ impl MissVerdict {
 /// 2. `vad_failure` — VAD never fired (zero speech frames) OR no embeddings
 ///    were scored during the test utterance (`per_frame_scores` is empty after
 ///    the warm-up instrumentation reset).  Score-based verdicts are meaningless
-///    when the classifier never saw test audio.  This fixes the old
-///    mis-bucketing where a zero-embedding miss was labeled "classifier".
-/// 3. `warmup_suppression` — warm-up incomplete AND the classifier triggered.
-///    The trigger was structurally suppressed before scoring, which is a more
-///    fundamental explanation than any score/AGC issue.
-/// 4. `agc_failure` — AGC explicitly reported `Some(false)`.  `None`
+///    when the classifier never saw test audio.
+/// 3. `agc_failure` — AGC explicitly reported `Some(false)`.  `None`
 ///    (insufficient AGC-active frames) is NOT `agc_failure` — short utterances
 ///    fall through to the score-based verdicts.
-/// 5. `classifier_no_trigger` — never reached [`MIN_CLASSIFIER_THRESHOLD`]
+/// 4. `classifier_no_trigger` — never reached [`MIN_CLASSIFIER_THRESHOLD`]
 ///    (2.13) on test-utterance frames.
-/// 6. `adaptive_threshold_blocked` — reached the hard floor (2.13) but never
+/// 5. `adaptive_threshold_blocked` — reached the hard floor (2.13) but never
 ///    reached the per-frame effective adaptive threshold.  "Hard floor" here is
 ///    [`MIN_CLASSIFIER_THRESHOLD`] (the classifier-trigger condition), NOT
 ///    [`ADAPTIVE_FLOOR`](super::ADAPTIVE_FLOOR) (the adaptive threshold's own
 ///    clamp floor, which is an internal detail of the adaptive state).
-/// 7. `verifier_timing` / `verifier_rejected` — crossed the effective
-///    threshold; split by whether the verifier peak reached the verifier
-///    threshold (lifecycle/timing failure) or not (genuine rejection).
-///
-/// ## Warm-up suppression is frame-accurate (mahbot-1024)
-///
-/// The pre-utterance `warmup_completed` flag is captured BEFORE the
-/// cold-start utterance (always `false` in the cold pass — the utterance
-/// itself consumes the verifier warm-up), so it cannot distinguish a
-/// trigger consumed by warm-up suppression from a genuine post-warm-up
-/// verifier rejection.  The mahbot-1023 speed_down miss (run
-/// 20260801-061348) was mislabeled `warmup_suppression`: its first
-/// threshold crossing was frame 3 — the exact warm-up boundary — and the
-/// verifier genuinely rejected it (peak 0.7886 < 0.86).  A second observed
-/// speed_down sub-floor peak is 0.8090 (run 20260801-085648) — the two
-/// readings are the archive's only speed_down sub-floor peaks (mahbot-1025
-/// doc fix; the fresh-run peaks 0.9485 / 0.8983 / 0.8620 all cleared the
-/// floor).  The verdict now
-/// uses [`trigger_fell_in_warmup`]: frame `i` is a warm-up frame iff
-/// `warmup_n_embeddings + i + 1 < VERIFIER_WARMUP_EMBEDDINGS` (the ring is
-/// pushed before the warm-up test).
 fn classify_miss(pv: &PerVariantResult) -> MissVerdict {
     if pv.detected {
         return MissVerdict::Detected;
@@ -2877,102 +2433,24 @@ fn classify_miss(pv: &PerVariantResult) -> MissVerdict {
     if pv.vad_speech_frames == 0 || pv.per_frame_scores.is_empty() {
         return MissVerdict::VadFailure;
     }
-    let triggered = pv.max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD;
-    if triggered && !pv.warmup_completed && trigger_fell_in_warmup(pv) {
-        return MissVerdict::WarmupSuppression;
-    }
     if pv.agc_converged == Some(false) {
         return MissVerdict::AgcFailure;
     }
-    if !triggered {
+    if pv.max_rolling_sum < MIN_CLASSIFIER_THRESHOLD {
         return MissVerdict::ClassifierNoTrigger;
     }
-    let crossed_effective = pv
-        .per_frame_scores
-        .iter()
-        .any(|s| s[ROLLING_SUM_IDX] >= s[THRESHOLD_IDX]);
-    if !crossed_effective {
-        // ── mahbot-1023 prolonged-bootstrap branch ──
-        // With the score-only bootstrap feed rule, a full high-scoring
-        // utterance can keep the adaptive state in bootstrap for its whole
-        // duration.  During bootstrap the effective threshold IS the static
-        // hard floor (peek returns None → match_threshold), so reaching the
-        // hard floor (`triggered`) implies crossing the effective threshold —
-        // this arm is structurally UNREACHABLE under a persisted bootstrap.
-        // It is kept as an explicit branch so report readers cannot misread a
-        // persisted bootstrap as an adaptive-threshold failure: the
-        // `adaptive_bootstrap_persisted` per-variant field makes the state
-        // explicit, and the verifier split below is the accurate attribution
-        // whenever the classifier triggered.
-        return MissVerdict::AdaptiveThresholdBlocked;
-    }
-    if !pv.verifier_trained {
-        // No second-stage gate: a miss after crossing the effective threshold
-        // is a candidate lifecycle/timing issue (expired or audio ended).
-        return MissVerdict::VerifierTiming;
-    }
-    // Split by the CONSTANT acceptance floor (0.86, mahbot-1023): the
-    // runtime-calibrated `pv.verifier_threshold` is a report-only reference
-    // and does not arbitrate acceptance.
-    if pv.verifier_score >= crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR {
-        MissVerdict::VerifierTiming
-    } else {
-        MissVerdict::VerifierRejected
-    }
+    // Crossed the hard floor but never the effective threshold.  With no
+    // second-stage gate, crossing the effective threshold IS detection, so a
+    // classifier trigger without detection means the adaptive threshold never
+    // came down to meet the rolling sum.
+    MissVerdict::AdaptiveThresholdBlocked
 }
 
-/// Frame-accurate warm-up-trigger test (mahbot-1024).
-///
-/// Returns `true` when the first classifier threshold crossing fell inside
-/// the verifier warm-up epoch.  `per_frame_scores[i]` is the
-/// `(warmup_n_embeddings + i + 1)`-th embedding pushed to the ring (the
-/// ring is pushed before the warm-up test in `score_single_embedding`), so
-/// frame `i` is a warm-up frame iff
-/// `warmup_n_embeddings + i + 1 < VERIFIER_WARMUP_EMBEDDINGS`.
-fn trigger_fell_in_warmup(pv: &PerVariantResult) -> bool {
-    let warmup_frames_remaining = crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS
-        .saturating_sub(pv.warmup_n_embeddings + 1);
-    pv.first_trigger_frame_idx
-        .is_some_and(|i| i < warmup_frames_remaining)
-}
-
-/// Reclassify the raw detection source into the enrolled-phase mechanism
-/// taxonomy (mahbot-1024 re-scope).
-///
-/// The raw `detection_source` is the window type where the confirmation
-/// fired.  The measured production mechanism is the **burst-created
-/// candidate confirmed mid-utterance by main-loop continuation** (12/14 of
-/// the archived final-code detections): the deferred burst sweep creates
-/// the candidate, and a subsequent clean main-loop (stride-8) window
-/// confirms it at verifier ≥ 0.86 before the segment-end pass, 760–790 ms
-/// from wake-word onset.  That path must NOT be flagged as a regression.
-///
-/// Returned labels:
-/// - `"burst"` — the deferred burst sweep confirmed directly.
-/// - `"burst_continuation"` — a burst-created candidate was confirmed by a
-///   later main-loop window (the PRIMARY expected mechanism).
-/// - `"segment_end_pass"` — the segment-boundary fallback pass confirmed.
-/// - `"unexpected"` — a main-loop detection whose candidate the main loop
-///   created itself (no burst-created candidate to continue) — the genuine
-///   unexpected-path flag.
-///
-/// `None` when the variant was not detected.
-fn reclassify_detection_path(
-    detection_source: Option<&str>,
-    candidate_created_path: Option<&str>,
-) -> Option<String> {
-    let mechanism = match detection_source? {
-        "burst" | "segment_end_pass" => detection_source?,
-        "other" => {
-            if candidate_created_path == Some("burst") {
-                "burst_continuation"
-            } else {
-                "unexpected"
-            }
-        }
-        other => other,
-    };
-    Some(mechanism.to_string())
+/// Normalize a raw detection source ("burst" / "segment_end_pass" / "other")
+/// to the report label.  Without the verifier/candidate machinery the raw
+/// source is the final mechanism — no reclassification is needed.
+fn reclassify_detection_path(detection_source: Option<&str>) -> Option<String> {
+    detection_source.map(str::to_string)
 }
 
 /// Extract the maximum rolling sum from per-frame score triples.
@@ -3011,34 +2489,14 @@ impl DetectionMetrics {
 
 /// Classifier-only trigger metrics for a set of negative variants.
 ///
-/// These metrics track the classifier stage independently from the
-/// verifier, allowing separate monitoring of classifier behavior and
-/// verifier filtering effectiveness run over run.
-///
-/// The four counters decompose what happens when the classifier triggers:
-///
-/// | Condition | Counter |
-/// |-----------|---------|
-/// | `max_rolling_sum < MIN_CLASSIFIER_THRESHOLD` | not counted |
-/// | Triggered + warm-up-epoch trigger (frame-accurate, mahbot-1024) | `warmup_suppressed` |
-/// | Triggered + post-warm-up trigger + `detected == false` | `verifier_caught` |
-/// | Triggered + `detected == true` | `full_pipeline_fa` |
+/// Tracks the classifier stage independently so false-accept behavior is
+/// decomposed into classifier triggers vs full-pipeline detections.
 #[derive(Debug, Default, Clone, Copy)]
 struct ClassifierTriggerMetrics {
     /// Total variants tested in this group.
     total_variants: usize,
     /// Number of variants where max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD.
     classifier_triggers: usize,
-    /// Number where the first classifier trigger fell inside the verifier
-    /// warm-up epoch (frame-accurate, [`trigger_fell_in_warmup`] — the
-    /// pre-utterance `warmup_completed` flag alone would mislabel
-    /// post-warm-up verifier rejections in the cold pass as warm-up
-    /// suppression, mahbot-1024), so the verifier never evaluated these
-    /// frames.
-    warmup_suppressed: usize,
-    /// Number where classifier triggered, warmup completed, but
-    /// detected == false (verifier successfully rejected).
-    verifier_caught: usize,
     /// Number where detected == true (full pipeline false accept).
     full_pipeline_fa: usize,
 }
@@ -3053,36 +2511,6 @@ impl ClassifierTriggerMetrics {
         m
     }
 
-    /// The verifier's prevention effectiveness: fraction of classifier triggers
-    /// that reached a fully-active verifier AND were rejected by it (i.e. did
-    /// NOT become full-pipeline false accepts).  Warm-up suppression is EXCLUDED
-    /// (mahbot-1005 §7): it is a pipeline-timing artefact, not verifier
-    /// discrimination, and mixing it in inflated the old metric.
-    ///
-    /// Returns `None` when there are no verifier-evaluated triggers
-    /// (division by zero).
-    fn prevention_rate(&self) -> Option<f64> {
-        let prevented = self.verifier_caught;
-        let evaluated = self.verifier_caught + self.full_pipeline_fa;
-        if evaluated == 0 {
-            None
-        } else {
-            Some(prevented as f64 / evaluated as f64)
-        }
-    }
-
-    /// Fraction of classifier triggers suppressed because the verifier warm-up
-    /// was incomplete (mahbot-1005 §7).  Reported separately from
-    /// [`prevention_rate`](Self::prevention_rate) so warm-up suppression is
-    /// observable without being attributed to the verifier.
-    fn warmup_suppression_rate(&self) -> Option<f64> {
-        if self.classifier_triggers == 0 {
-            None
-        } else {
-            Some(self.warmup_suppressed as f64 / self.classifier_triggers as f64)
-        }
-    }
-
     /// Accumulate a single per-variant result into this metrics struct.
     ///
     /// This shares the classification branching logic with [`compute`] so that
@@ -3092,58 +2520,10 @@ impl ClassifierTriggerMetrics {
         self.total_variants += 1;
         if pv.max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD {
             self.classifier_triggers += 1;
-            // mahbot-1024: warm-up suppression is frame-accurate (the
-            // pre-utterance warmup_completed flag is always false in the
-            // cold pass and cannot distinguish warm-up-epoch triggers from
-            // post-warm-up verifier rejections).
-            if !pv.warmup_completed && trigger_fell_in_warmup(pv) {
-                self.warmup_suppressed += 1;
-            } else if !pv.detected {
-                self.verifier_caught += 1;
-            } else {
+            if pv.detected {
                 self.full_pipeline_fa += 1;
             }
         }
-    }
-}
-
-/// Verifier recall on positive (wake-word) test variants (mahbot-1008 Fix 6).
-///
-/// The fraction of genuine wake-word variants the verifier ACCEPTED among
-/// those it actually evaluated: verifier trained + warm-up complete + the
-/// classifier crossed the effective adaptive threshold (so a candidate existed
-/// and the verifier gate was the deciding factor).  A variant counts as
-/// accepted when its peak verifier score reached the verifier decision
-/// threshold.
-///
-/// Returns `None` when the verifier was untrained or no variant reached the
-/// verifier gate (division by zero).  Otherwise returns `(accepted,
-/// evaluated)`.
-fn verifier_recall(per_variant: &[PerVariantResult]) -> Option<(usize, usize)> {
-    let mut evaluated = 0usize;
-    let mut accepted = 0usize;
-    for pv in per_variant {
-        if !pv.verifier_trained || !pv.warmup_completed {
-            continue;
-        }
-        let crossed_effective = pv
-            .per_frame_scores
-            .iter()
-            .any(|s| s[ROLLING_SUM_IDX] >= s[THRESHOLD_IDX]);
-        if !crossed_effective {
-            continue;
-        }
-        evaluated += 1;
-        // Constant acceptance floor (0.86, mahbot-1023) — the runtime
-        // calibrated value is report-only.
-        if pv.verifier_score >= crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR {
-            accepted += 1;
-        }
-    }
-    if evaluated == 0 {
-        None
-    } else {
-        Some((accepted, evaluated))
     }
 }
 
@@ -3152,19 +2532,15 @@ fn ct_to_json(ct: &ClassifierTriggerMetrics) -> serde_json::Value {
     serde_json::json!({
         "total_variants": ct.total_variants,
         "classifier_triggers": ct.classifier_triggers,
-        "warmup_suppressed": ct.warmup_suppressed,
-        "verifier_caught": ct.verifier_caught,
         "full_pipeline_fa": ct.full_pipeline_fa,
-        "prevention_rate": ct.prevention_rate(),
-        "warmup_suppression_rate": ct.warmup_suppression_rate(),
     })
 }
 
 /// Full per-variant diagnostics for BOTH positive and negative variants
-/// (mahbot-1005 §9).  Negatives historically omitted per-frame scores, verifier
-/// trajectories, VAD/AGC detail and trigger-frame info — false-accept
-/// root-causing was impossible without them.  For positives (`category: None`)
-/// the exhaustive miss verdict and rejection-margin evidence are added.
+/// (mahbot-1005 §9).  Negatives historically omitted per-frame scores, VAD/AGC
+/// detail and trigger-frame info — false-accept root-causing was impossible
+/// without them.  For positives (`category: None`) the exhaustive miss verdict
+/// and trigger-point evidence are added.
 // Clippy: this is a pure JSON serialization shim — one insert per field; the
 // line count is inherent to the schema, not control flow worth splitting.
 #[expect(clippy::too_many_lines)]
@@ -3179,10 +2555,6 @@ fn pv_to_json(pv: &PerVariantResult, category: Option<&str>) -> serde_json::Valu
     obj.insert(
         "max_rolling_sum".to_string(),
         serde_json::json!(pv.max_rolling_sum),
-    );
-    obj.insert(
-        "verifier_score".to_string(),
-        serde_json::json!(pv.verifier_score),
     );
     obj.insert(
         "n_embeddings".to_string(),
@@ -3207,10 +2579,6 @@ fn pv_to_json(pv: &PerVariantResult, category: Option<&str>) -> serde_json::Valu
     obj.insert(
         "per_frame_scores".to_string(),
         serde_json::json!(pv.per_frame_scores),
-    );
-    obj.insert(
-        "verifier_score_trajectory".to_string(),
-        serde_json::json!(pv.verifier_score_trajectory),
     );
     // mahbot-1012: per-frame scoring geometry — parallel to per_frame_scores.
     obj.insert(
@@ -3247,79 +2615,16 @@ fn pv_to_json(pv: &PerVariantResult, category: Option<&str>) -> serde_json::Valu
                 .collect::<Vec<_>>()
         ),
     );
-    obj.insert(
-        "per_frame_candidate_state".to_string(),
-        serde_json::json!(
-            pv.per_frame_candidate_state
-                .iter()
-                .map(|c| c.as_str())
-                .collect::<Vec<_>>()
-        ),
-    );
     obj.insert("per_hop_vad".to_string(), serde_json::json!(pv.per_hop_vad));
-    obj.insert(
-        "warmup_completed".to_string(),
-        serde_json::json!(pv.warmup_completed),
-    );
-    obj.insert(
-        "warmup_n_embeddings".to_string(),
-        serde_json::json!(pv.warmup_n_embeddings),
-    );
-    obj.insert(
-        "warmup_max_rolling_sum".to_string(),
-        serde_json::json!(pv.warmup_max_rolling_sum),
-    );
-    obj.insert(
-        "warmup_peak_verifier_score".to_string(),
-        serde_json::json!(pv.warmup_peak_verifier_score),
-    );
-    obj.insert(
-        "n_warmup_suppressed_frames".to_string(),
-        serde_json::json!(pv.n_warmup_suppressed_frames),
-    );
-    obj.insert(
-        "candidates_created".to_string(),
-        serde_json::json!(pv.candidates_created),
-    );
-    obj.insert(
-        "candidates_confirmed".to_string(),
-        serde_json::json!(pv.candidates_confirmed),
-    );
-    obj.insert(
-        "candidates_expired".to_string(),
-        serde_json::json!(pv.candidates_expired),
-    );
     obj.insert(
         "first_trigger_frame_idx".to_string(),
         serde_json::json!(pv.first_trigger_frame_idx),
-    );
-    obj.insert(
-        "verifier_threshold".to_string(),
-        serde_json::json!(pv.verifier_threshold),
-    );
-    obj.insert(
-        "verifier_trained".to_string(),
-        serde_json::json!(pv.verifier_trained),
     );
     obj.insert("latency_ms".to_string(), serde_json::json!(pv.latency_ms));
     // mahbot-1023: deferred-burst / acceptance-floor evidence (all variants).
     obj.insert(
         "detection_path".to_string(),
         serde_json::json!(pv.detection_path),
-    );
-    // mahbot-1024: reclassified mechanism taxonomy (see
-    // reclassify_detection_path).  The raw detection_path stays as evidence;
-    // "mechanism" is the report's taxonomy label.
-    obj.insert(
-        "mechanism".to_string(),
-        serde_json::json!(reclassify_detection_path(
-            pv.detection_path.as_deref(),
-            pv.candidate_created_path.as_deref()
-        )),
-    );
-    obj.insert(
-        "candidate_created_path".to_string(),
-        serde_json::json!(pv.candidate_created_path),
     );
     obj.insert(
         "burst_sweep_fired".to_string(),
@@ -3337,26 +2642,10 @@ fn pv_to_json(pv: &PerVariantResult, category: Option<&str>) -> serde_json::Valu
         "adaptive_bootstrap_persisted".to_string(),
         serde_json::json!(pv.adaptive_bootstrap_persisted),
     );
-    obj.insert(
-        "effective_verifier_threshold".to_string(),
-        serde_json::json!(crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR),
-    );
-    // Positive-only miss evidence (mahbot-1005 §2/§3/§4, mahbot-1012 §4).
+    // Positive-only miss evidence (mahbot-1005 §2/§3, mahbot-1012 §4).
     if category.is_none() {
         let verdict = classify_miss(pv);
         obj.insert("verdict".to_string(), serde_json::json!(verdict.as_str()));
-        if pv.verifier_trained && !pv.detected {
-            // Margin to the CONSTANT acceptance floor (0.86, mahbot-1023) —
-            // the gate the acceptance protocol applies.  The runtime
-            // calibrated threshold remains visible via verifier_threshold.
-            obj.insert(
-                "verifier_rejection_margin".to_string(),
-                serde_json::json!(
-                    (crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR - pv.verifier_score)
-                        .max(0.0)
-                ),
-            );
-        }
         // Trigger-point evidence (mahbot-1005 §3): the classifier's score at the
         // first trigger frame and where in the utterance it occurred.  VAD is
         // binary (is_speech), so "noise burst" vs "silence" at the trigger
@@ -3392,22 +2681,6 @@ fn pv_to_json(pv: &PerVariantResult, category: Option<&str>) -> serde_json::Valu
                 }),
             );
         }
-        // "never evaluated" vs "rejected with zero confidence" (mahbot-1005 §4):
-        // a verifier_score of 0.0 means the verifier was never evaluated when
-        // the warm-up was incomplete or the verifier is untrained; otherwise it
-        // is a genuine zero-confidence evaluation.
-        if pv.verifier_score == 0.0 {
-            let meaning =
-                if pv.verifier_trained && pv.warmup_completed && !pv.per_frame_scores.is_empty() {
-                    "evaluated_zero_confidence"
-                } else {
-                    "never_evaluated"
-                };
-            obj.insert(
-                "verifier_score_meaning".to_string(),
-                serde_json::json!(meaning),
-            );
-        }
     }
     serde_json::Value::Object(obj)
 }
@@ -3428,21 +2701,6 @@ fn deciles(scores: &[f32]) -> Option<[f32; 10]> {
         *slot = sorted[idx.min(sorted.len() - 1)];
     }
     Some(out)
-}
-
-/// Fixed-range histogram with `n_buckets` buckets over `[lo, hi]`.  Values
-/// below `lo` fall into bucket 0, values above `hi` into the last bucket.
-fn histogram_buckets(scores: &[f32], n_buckets: usize, lo: f32, hi: f32) -> Vec<usize> {
-    let mut buckets = vec![0usize; n_buckets.max(1)];
-    if scores.is_empty() || n_buckets == 0 {
-        return buckets;
-    }
-    let span = (hi - lo).max(f32::EPSILON);
-    for &s in scores {
-        let t = ((s - lo) / span * n_buckets as f32).clamp(0.0, n_buckets as f32 - 1.0);
-        buckets[t as usize] += 1;
-    }
-    buckets
 }
 
 /// Identify the PCM augmentation type from a variant label (mahbot-1005 §6).
@@ -3470,7 +2728,7 @@ fn augmentation_type(label: &str) -> &'static str {
 ///
 /// # Parameters
 /// - `variants`: audio clips with descriptive labels.
-/// - `classifier`, `verifier`: trained models passed to the streaming pipeline.
+/// - `classifier`: the trained classifier passed to the streaming pipeline.
 /// - `metrics`: records total/detected; `on_detection` fills detected or
 ///   false_accepts.
 /// - `on_detection`: called with `(&mut metrics, label_str)` when the
@@ -3479,16 +2737,14 @@ fn augmentation_type(label: &str) -> &'static str {
 fn test_detection_samples(
     variants: &[(Vec<f32>, String)],
     classifier: &WakeWordClassifier,
-    verifier: &VoiceVerifier,
     metrics: &mut DetectionMetrics,
     on_detection: impl Fn(&mut DetectionMetrics, &str),
     mut adaptive_state: Option<&mut super::AdaptiveThresholdState>,
     cold_start: bool,
 ) {
-    // Set classifier + verifier in global state for the streaming pipeline.
-    // score_stride8_window reads these from voice_state().
+    // Set the classifier in global state for the streaming pipeline.
+    // score_stride8_window reads it from voice_state().
     super::set_classifier_weights(classifier.weights_ref().clone());
-    super::set_verifier(verifier.clone());
 
     for (i, (samples, label)) in variants.iter().enumerate() {
         info!(
@@ -3514,33 +2770,12 @@ fn test_detection_samples(
         if !cold_start && let Some(ref mut state) = adaptive_state {
             ctx.adaptive_threshold = state.clone();
         }
-        // Consume verifier warm-up before the test utterance so the latency
-        // timer measures only the wake word (mahbot-922, reviewer feedback).
-        //
-        // Cold start (mahbot-1006 D): production has no warm-up — the first
-        // VERIFIER_WARMUP_EMBEDDINGS embeddings of every utterance after
-        // silence are suppressed during verifier warm-up.  The cold pass skips
-        // consume_warmup so the test utterance itself consumes the warm-up
-        // period, exactly like production's post-silence start.
-        let (warmup_n_embeddings, warmup_completed) = if cold_start {
-            (0, false)
-        } else {
+        // Warm pass: feed warm-up audio so the latency timer measures only the
+        // wake word and the ring is primed (mahbot-922).  The cold pass skips
+        // consume_warmup — production has no warm-up after a silence boundary.
+        if !cold_start {
             consume_warmup(&mut ctx);
-            let n = ctx.embedding_ring.len();
-            let completed = n >= crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS;
-            info!(
-                "  Variant {}/{}: {label} — warm-up {} ({} embeddings)",
-                i + 1,
-                variants.len(),
-                if completed {
-                    "completed ✓"
-                } else {
-                    "FAILED ✗"
-                },
-                n,
-            );
-            (n, completed)
-        };
+        }
         let result = run_streaming_detection(samples, &mut ctx);
         // Propagate the updated adaptive state for the next variant (warm pass
         // only — the cold pass keeps each variant's bootstrap independent).
@@ -3569,16 +2804,11 @@ fn test_detection_samples(
         if result.detected {
             on_detection(metrics, label);
         }
-        // Record per-variant result (mahbot-845) with verifier score (mahbot-859)
-        // and per-variant instrumentation (mahbot-886, mahbot-1005).
-        metrics.per_variant.push(build_per_variant_result(
-            label,
-            &result,
-            &ctx,
-            warmup_completed,
-            warmup_n_embeddings,
-            verifier,
-        ));
+        // Record per-variant result (mahbot-845) and per-variant
+        // instrumentation (mahbot-886, mahbot-1005).
+        metrics
+            .per_variant
+            .push(build_per_variant_result(label, &result, &ctx));
         info!(
             "  Variant {}/{}: {label} — {} (peak_score={:.4})",
             i + 1,
@@ -3643,21 +2873,19 @@ enum CellMix {
 /// Shared per-cell streaming-detection loop for the noise-overlap and
 /// cross-speaker-probe matrices.  One warmed adaptive state is carried across
 /// all cells (with the boundary-fire guard from `test_detection_samples`),
-/// each clip gets a fresh `PipelineCtx`, and the verifier warm-up is consumed
+/// each clip gets a fresh `PipelineCtx`, and the warm-up audio is consumed
 /// so the latency timer starts at the utterance (mahbot-922).  Returns
 /// per-cell `(key, rate, detected, detail)`.
 fn run_detection_matrix(
     clips: &[(Vec<f32>, String)],
     classifier: &WakeWordClassifier,
-    verifier: &VoiceVerifier,
     cells: &[(String, CellMix)],
     detail_tag: &'static str,
     log_prefix: &'static str,
 ) -> Vec<(String, f64, usize, Vec<serde_json::Value>)> {
-    // Set classifier + verifier in global state (test_detection_samples does
-    // this too but we inline the loop to share adaptive state across variants).
+    // Set the classifier in global state (test_detection_samples does this too
+    // but we inline the loop to share adaptive state across variants).
     super::set_classifier_weights(classifier.weights_ref().clone());
-    super::set_verifier(verifier.clone());
     // Pre-warm a shared adaptive threshold state so the benchmark actually
     // exercises the adaptive code path (reviewer_2, mahbot-845).  Without
     // this, test_detection_samples — which creates a fresh PipelineCtx per
@@ -3690,12 +2918,9 @@ fn run_detection_matrix(
             ctx.adaptive_threshold = shared_adaptive.clone();
             // adaptive_k is already set by PipelineCtx::new() from config.
 
-            // Consume verifier warm-up so the latency timer starts at the
+            // Consume warm-up so the latency timer starts at the
             // utterance (mahbot-922).
             consume_warmup(&mut ctx);
-            let warmup_n_embeddings = ctx.embedding_ring.len();
-            let warmup_completed =
-                warmup_n_embeddings >= crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS;
             let result = run_streaming_detection(&mixed_pcm, &mut ctx);
 
             // Persist the updated adaptive state for the next variant,
@@ -3720,14 +2945,9 @@ fn run_detection_matrix(
             if result.detected {
                 metrics.detected += 1;
             }
-            metrics.per_variant.push(build_per_variant_result(
-                label,
-                &result,
-                &ctx,
-                warmup_completed,
-                warmup_n_embeddings,
-                verifier,
-            ));
+            metrics
+                .per_variant
+                .push(build_per_variant_result(label, &result, &ctx));
         }
 
         let rate = metrics.detection_rate();
@@ -3751,12 +2971,11 @@ fn run_detection_matrix(
 ///
 /// For each combination of SNR level and noise type, mix the wake word
 /// variants with the noise and test detection.  Returns `(key, rate,
-/// per_variant_detail)` per combination so per-variant peak scores and verifier
-/// evidence are available for false-reject root-causing (mahbot-1005 §8).
+/// per_variant_detail)` per combination so per-variant peak scores are
+/// available for false-reject root-causing (mahbot-1005 §8).
 fn run_noise_overlap_test(
     positive_variants: &[(Vec<f32>, String)],
     classifier: &WakeWordClassifier,
-    verifier: &VoiceVerifier,
 ) -> Vec<(String, f64, Vec<serde_json::Value>)> {
     let mut cells: Vec<(String, CellMix)> = Vec::new();
     for (snr_label, snr_db) in NOISE_OVERLAP_SNRS {
@@ -3779,7 +2998,6 @@ fn run_noise_overlap_test(
     run_detection_matrix(
         positive_variants,
         classifier,
-        verifier,
         &cells,
         "noise_overlap",
         "Noise overlap",
@@ -3792,15 +3010,15 @@ fn run_noise_overlap_test(
 /// Cross-speaker probe matrix: held-out RESERVED voices at
 /// unseen seeds across clean + 10/20 dB white conditions (warm pass, shared
 /// adaptive — same methodology as the canary matrix).  The reserved voices
-/// are absent from EVERY training path, so any detection is a genuine
-/// cross-speaker generalization false accept (not a trained-in canary).
+/// are absent from EVERY training path.  Cross-speaker detections are CORRECT
+/// speaker-blind behaviour (the wake word fires for any speaker), so the
+/// matrix is a DIAGNOSTIC (high detection expected), not a false-accept gate.
 ///
 /// Returns the per-cell results in the same `(key, rate, detail)` shape as
-/// [`run_noise_overlap_test`] plus the total false-accept count.
+/// [`run_noise_overlap_test`] plus the total detection count.
 fn run_cross_speaker_probe_matrix(
     probe_clips: &[(Vec<f32>, String)],
     classifier: &WakeWordClassifier,
-    verifier: &VoiceVerifier,
 ) -> (Vec<(String, f64, Vec<serde_json::Value>)>, usize) {
     // 3 channel conditions per probe clip (clean + 10/20 dB white — the same
     // vocabulary as the cross-speaker training-condition set so the probe is
@@ -3831,7 +3049,6 @@ fn run_cross_speaker_probe_matrix(
     let cells_out = run_detection_matrix(
         probe_clips,
         classifier,
-        verifier,
         &cells,
         "cross_speaker_probe",
         "Cross-speaker probe",
@@ -3846,14 +3063,16 @@ fn run_cross_speaker_probe_matrix(
     )
 }
 
-/// Report-only FA warning for a detection-matrix result set: any detected
-/// cell above the 0-target warns, never aborts.  Shared by the trained-in
-/// canary and reserved-voice probe matrices.
+/// Report-only FA reporter for a detection-matrix result set: any detected
+/// cell above the 0-target warns when `warn` is true (true-negative phases),
+/// otherwise the detection rate is logged as a diagnostic with no warning
+/// (cross-speaker cells — speaker-blindness, high detection expected).
 fn warn_fa_cells(
     label: &str,
     results: &[(String, f64, Vec<serde_json::Value>)],
     total_variants: usize,
     tail: &str,
+    warn: bool,
 ) {
     for (key, rate, detail) in results {
         let fas = detail
@@ -3864,82 +3083,22 @@ fn warn_fa_cells(
                     .unwrap_or(false)
             })
             .count();
-        if fas > 0 {
+        if warn && fas > 0 {
             warn!(
                 "{label} FA: {key} accepted {fas}/{detail_len} cells \
                  (rate {rate_pct:.1}%) — target 0/{total_variants} per fresh run{tail}",
                 detail_len = detail.len(),
                 rate_pct = rate * 100.0,
             );
+        } else {
+            info!(
+                "{label} diagnostic: {key} detected {fas}/{detail_len} cells \
+                 (rate {rate_pct:.1}%) — speaker-blindness, high detection expected{tail}",
+                detail_len = detail.len(),
+                rate_pct = rate * 100.0,
+            );
         }
     }
-}
-
-/// SHA-256 fingerprint of classifier weights (mahbot-1022 item 6, relocated
-/// to teardown during the bench-leanness cleanup): sha2-256 over the f32 LE
-/// bytes of each field in documented order — conv1_weight, conv1_bias,
-/// bn1_gamma, bn1_beta, bn1_running_mean, bn1_running_var, conv2_weight,
-/// conv2_bias, bn2_gamma, bn2_beta, bn2_running_mean, bn2_running_var,
-/// fc_weight, fc_bias — then `bn_eps` (f32 LE), then `arch.conv1_out`,
-/// `arch.conv2_out`, `arch.kernel_size` (u32 LE each).  Returns
-/// [`crate::util::hex_string`].
-fn weights_fingerprint_classifier(
-    w: &crate::audio::wake_word_classifier::ClassifierWeights,
-) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    let mut push_f32s = |data: &[f32]| {
-        for v in data {
-            hasher.update(v.to_le_bytes());
-        }
-    };
-    push_f32s(&w.conv1_weight);
-    push_f32s(&w.conv1_bias);
-    push_f32s(&w.bn1_gamma);
-    push_f32s(&w.bn1_beta);
-    push_f32s(&w.bn1_running_mean);
-    push_f32s(&w.bn1_running_var);
-    push_f32s(&w.conv2_weight);
-    push_f32s(&w.conv2_bias);
-    push_f32s(&w.bn2_gamma);
-    push_f32s(&w.bn2_beta);
-    push_f32s(&w.bn2_running_mean);
-    push_f32s(&w.bn2_running_var);
-    push_f32s(&w.fc_weight);
-    push_f32s(&w.fc_bias);
-    hasher.update(w.bn_eps.to_le_bytes());
-    hasher.update((w.arch.conv1_out as u32).to_le_bytes());
-    hasher.update((w.arch.conv2_out as u32).to_le_bytes());
-    hasher.update((w.arch.kernel_size as u32).to_le_bytes());
-    crate::util::hex_string(&hasher.finalize())
-}
-
-/// SHA-256 fingerprint of the verifier (mahbot-1022 item 6, relocated to
-/// teardown during the bench-leanness cleanup): sha2-256 over the f32 LE
-/// bytes of `conv_weight`, `conv_bias`, `fc_weight`, `fc_bias`, THEN the
-/// runtime-calibrated `threshold`.  Returns [`crate::util::hex_string`].
-fn weights_fingerprint_verifier(v: &VoiceVerifier) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    // Hash the primary member's weights, then every ensemble member's weights
-    // in order (mahbot-1025) so the fingerprint distinguishes the full
-    // multi-seed ensemble, not just member 0.
-    let mut member_views: Vec<&VoiceVerifier> = vec![v];
-    member_views.extend(v.ensemble_members.iter());
-    for member in member_views {
-        for data in [
-            &member.conv_weight,
-            &member.conv_bias,
-            &member.fc_weight,
-            &member.fc_bias,
-        ] {
-            for val in data {
-                hasher.update(val.to_le_bytes());
-            }
-        }
-    }
-    hasher.update(v.threshold.to_le_bytes());
-    crate::util::hex_string(&hasher.finalize())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3953,41 +3112,19 @@ struct EnrolledVariantResult {
     variant: String,
     /// End-to-end detection through the real streaming cold pass.
     detected: bool,
-    /// Scoring path that produced the detection, reclassified into the
-    /// enrolled-phase mechanism taxonomy (mahbot-1024): "burst" /
-    /// "burst_continuation" / "segment_end_pass" / "unexpected" (see
-    /// [`reclassify_detection_path`]).  "burst_continuation" (burst-created
-    /// candidate confirmed by main-loop continuation) is the PRIMARY
-    /// expected mechanism; "unexpected" (main-loop-created candidate) is
-    /// the genuine regression signal.  None when not detected.
+    /// Scoring path that produced the detection (raw source: "burst" /
+    /// "segment_end_pass" / "other").  None when not detected.
     detection_path: Option<String>,
-    /// Raw detection source ("burst" / "segment_end_pass" / "other") — the
-    /// un-reclassified window type where the confirmation fired, kept for
-    /// report transparency alongside the reclassified `detection_path`.
+    /// Raw detection source kept for report transparency.
     detection_source: Option<String>,
-    /// confirm(variant) per the acceptance protocol: classifier gate
-    /// (max rolling sum ≥ MIN_CLASSIFIER_THRESHOLD) AND the RING-4 verifier
-    /// peak at the burst's position 24 (the 4th scored frame's
-    /// max_verifier_score — the live analogue of the removed B-sweep
-    /// decisive cell).
-    confirm: bool,
-    /// Ring-4 verifier peak at the burst's position 24 (the 4th scored
-    /// frame).  0.0 when fewer than 4 frames were scored.
-    ring4_verifier_at_pos24: f32,
     /// Detection latency ms (CPU wall-clock of the feed loop; None when not
     /// detected).  NOTE: the feed loop processes faster than real-time, so
     /// this is a processing-cost proxy — the AUDIO position of the detection
     /// is given by `burst_sweep_buffer_len` × 10 ms (mel model stride).
     latency_ms: Option<f64>,
-    /// Peak verifier score achieved by any candidate this variant (the
-    /// session-lifetime peak, which can exceed the ring-4 sample when later
-    /// clean windows confirm the burst-created candidate).
-    verifier_peak: f32,
     /// Per-frame classifier window scores `[total_score, rolling_sum,
     /// effective_threshold]`.
     per_frame_scores: Vec<[f32; 3]>,
-    /// Per-frame verifier scores (parallel to `per_frame_scores`).
-    verifier_score_trajectory: Vec<f32>,
     /// Per-frame mel-window start positions (parallel to `per_frame_scores`).
     per_frame_window_start: Vec<usize>,
     /// Per-frame mel-buffer lengths (parallel to `per_frame_scores`).
@@ -3996,8 +3133,6 @@ struct EnrolledVariantResult {
     per_frame_geometry: Vec<super::WindowGeometry>,
     /// Per-frame adaptive-threshold modes (parallel to `per_frame_scores`).
     per_frame_adaptive_mode: Vec<super::AdaptiveFrameMode>,
-    /// Per-frame candidate lifecycle states (parallel to `per_frame_scores`).
-    per_frame_candidate_state: Vec<super::CandidateFrameState>,
     /// Live burst-trigger buffer length (None when the burst never ran).
     burst_sweep_buffer_len: Option<usize>,
     /// Synchronous burst sweep wall-clock (ms; None when the burst never ran).
@@ -4015,49 +3150,26 @@ struct EnrolledVariantResult {
 /// and the held-out recall set).
 ///
 /// Cold pass: fresh [`PipelineCtx`] per clip, no warm-up, fresh adaptive
-/// bootstrap, cold-start verifier warm-up included — the production
-/// post-silence start.  The deferral (deferred burst + segment-end pass) is
-/// exercised for real through `handle_wake_word_detection`.
-fn run_enrolled_cold_variant(
-    label: &str,
-    pcm: &[f32],
-    verifier: &VoiceVerifier,
-) -> EnrolledVariantResult {
+/// bootstrap — the production post-silence start.  The deferral (deferred
+/// burst + segment-end pass) is exercised for real through
+/// `handle_wake_word_detection`.
+fn run_enrolled_cold_variant(label: &str, pcm: &[f32]) -> EnrolledVariantResult {
     // Cold pass: fresh PipelineCtx per variant, no consume_warmup, fresh
     // AdaptiveThresholdState (matches production's post-silence start).
     let mut ctx = super::PipelineCtx::new();
     let result = run_streaming_detection(pcm, &mut ctx);
-    let pv = build_per_variant_result(label, &result, &ctx, false, 0, verifier);
-    // confirm(variant) per the acceptance protocol: the ring-4 verifier
-    // peak at the burst's position 24 (the 4th scored frame's
-    // max_verifier_score) — the live analogue of the removed B-sweep
-    // decisive cell.  NOTE: at the live trigger geometry (B = 72–80) position 0 is
-    // a full 76-frame window (not padded), whose embedding can pull the
-    // ring-4 sample below 0.86 even when later clean windows confirm —
-    // that divergence is exactly what the ≥3-run protocol measures; the
-    // session `verifier_peak` is reported alongside for comparison.
-    let ring4_verifier_at_pos24 = pv.verifier_score_trajectory.get(3).copied().unwrap_or(0.0);
-    let confirm = pv.max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD
-        && ring4_verifier_at_pos24 >= crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR;
+    let pv = build_per_variant_result(label, &result, &ctx);
     EnrolledVariantResult {
         variant: label.to_string(),
         detected: result.detected,
-        detection_path: reclassify_detection_path(
-            pv.detection_path.as_deref(),
-            pv.candidate_created_path.as_deref(),
-        ),
+        detection_path: reclassify_detection_path(pv.detection_path.as_deref()),
         detection_source: pv.detection_path.clone(),
-        confirm,
-        ring4_verifier_at_pos24,
         latency_ms: result.latency_ms,
-        verifier_peak: pv.verifier_score,
         per_frame_scores: pv.per_frame_scores.clone(),
-        verifier_score_trajectory: pv.verifier_score_trajectory.clone(),
         per_frame_window_start: pv.per_frame_window_start.clone(),
         per_frame_mel_buffer_len: pv.per_frame_mel_buffer_len.clone(),
         per_frame_geometry: pv.per_frame_geometry.clone(),
         per_frame_adaptive_mode: pv.per_frame_adaptive_mode.clone(),
-        per_frame_candidate_state: pv.per_frame_candidate_state.clone(),
         burst_sweep_buffer_len: pv.burst_sweep_buffer_len,
         burst_wall_clock_ms: ctx.instrumentation.burst_wall_clock_ms,
         segment_end_pass_fired: pv.segment_end_pass_fired,
@@ -4075,11 +3187,10 @@ fn run_enrolled_cold_variant(
 /// The acceptance basis is the HELD-OUT recall set: unseen renderings of the
 /// enrolled voice (new seeds in a collision-free range; wake phrase alone and
 /// embedded in sentences), measured through the real streaming cold pass
-/// (deferred burst + segment-end pass + adaptive bootstrap + cold-start
-/// verifier warm-up).  Generated strictly after training and never added to
-/// any training pool.  The F1 training-clip 5-augmentation control is kept as
-/// a report-only diagnostic sub-section (it powers f1_original_detected,
-/// f1_noise_verifier_peak and the per-member speed_down variance gate).
+/// (deferred burst + segment-end pass + adaptive bootstrap).  Generated
+/// strictly after training and never added to any training pool.  The F1
+/// training-clip 5-augmentation control is kept as a report-only diagnostic
+/// sub-section (it powers f1_original_detected).
 ///
 /// `enrolled_label` is the enrolled clip's label (`{style}_enroll0`, derived
 /// from [`allocate_voices`]) — the control clip lookup flows from the voice
@@ -4089,7 +3200,6 @@ fn run_enrolled_speaker_phase(
     train_clips: &[(Vec<f32>, String)],
     held_out_clips: &[(Vec<f32>, String)],
     classifier: &WakeWordClassifier,
-    verifier: &VoiceVerifier,
     enrolled_label: &str,
 ) -> Option<serde_json::Value> {
     let start = Instant::now();
@@ -4097,26 +3207,21 @@ fn run_enrolled_speaker_phase(
     let enrolled_variants =
         pcm_augment_enrollment_variants(&[(enrolled_pcm.clone(), enrolled_label.to_string())]);
 
-    // ── Set classifier + verifier in global state (the streaming pipeline
-    //    reads them from voice_state) ───────────────────────────────────────
+    // Set the classifier in global state (the streaming pipeline reads it
+    // from voice_state).
     super::set_classifier_weights(classifier.weights_ref().clone());
-    super::set_verifier(verifier.clone());
 
     // ── F1 training-clip control (5 raw-level augmentations, in-sample) ──
     let mut variants: Vec<EnrolledVariantResult> = Vec::new();
     for (variant_pcm, variant_label) in &enrolled_variants {
-        let v = run_enrolled_cold_variant(variant_label, variant_pcm, verifier);
+        let v = run_enrolled_cold_variant(variant_label, variant_pcm);
         info!(
-            "  F1 control variant {}: {} — {} (mechanism: {}, source: {}, latency: {:?}ms, verifier peak: {:.4}, ring4@pos24: {:.4}, confirm: {})",
+            "  F1 control variant {}: {} — {} (source: {}, latency: {:?}ms)",
             variants.len() + 1,
             variant_label,
             if v.detected { "DETECTED" } else { "miss" },
             v.detection_path.as_deref().unwrap_or("n/a"),
-            v.detection_source.as_deref().unwrap_or("n/a"),
             v.latency_ms,
-            v.verifier_peak,
-            v.ring4_verifier_at_pos24,
-            v.confirm,
         );
         variants.push(v);
     }
@@ -4124,95 +3229,16 @@ fn run_enrolled_speaker_phase(
     // ── Held-out recall pass (cold, per clip) — the acceptance basis ─────
     let mut recall_variants: Vec<EnrolledVariantResult> = Vec::new();
     for (recall_pcm, recall_label) in held_out_clips {
-        let v = run_enrolled_cold_variant(recall_label, recall_pcm, verifier);
+        let v = run_enrolled_cold_variant(recall_label, recall_pcm);
         info!(
-            "  Held-out recall clip {}: {} — {} (mechanism: {}, latency: {:?}ms, verifier peak: {:.4})",
+            "  Held-out recall clip {}: {} — {} (source: {}, latency: {:?}ms)",
             recall_variants.len() + 1,
             recall_label,
             if v.detected { "DETECTED" } else { "miss" },
             v.detection_path.as_deref().unwrap_or("n/a"),
             v.latency_ms,
-            v.verifier_peak,
         );
         recall_variants.push(v);
-    }
-
-    // ── Per-member speed_down peaks (mahbot-1025 variance-reduction gate) ──
-    // For every ensemble member (including the primary), measure the member's
-    // STANDALONE verifier peak on the F1 speed_down variant through the same
-    // streaming cold pass used for the acceptance metric.  The fraction of
-    // TRAINED members whose standalone peak falls below
-    // VERIFIER_ACCEPTANCE_FLOOR is the per-run single-seed speed_down
-    // miss-probability estimate (gate ≤0.15, target band ~0.04–0.10).  The
-    // ensemble mean (speed_down_peak above) is the acceptance metric; the
-    // member distribution is the variance-reduction evidence.
-    //
-    // Denominator semantics: only TRAINED members are counted.  Members share
-    // training data (same minimum-window guard), so they train/fail together
-    // — but if one were untrained, its standalone peak would be a guaranteed
-    // 1.0 (accept-all) and counting it would silently inflate the denominator
-    // with a guaranteed pass.  Untrained members are excluded and logged; a
-    // variant with zero trained members fails closed (miss fraction 1.0).
-    let mut speed_down_member_peaks: Vec<f32> = Vec::new();
-    let mut speed_down_member_untrained: usize = 0;
-    let speed_down_variant = enrolled_variants
-        .iter()
-        .find(|(_, l)| l.ends_with("_speed_down"));
-    if let Some((spd_pcm, _)) = speed_down_variant {
-        for member_idx in 0..verifier.ensemble_size() {
-            let member_verifier = verifier.member_only(member_idx);
-            if !member_verifier.is_trained() {
-                speed_down_member_untrained += 1;
-                warn!(
-                    "speed_down member gate: member {member_idx} is UNTRAINED — \
-                     excluded from the miss-fraction denominator (members share \
-                     training data, so this indicates an anomaly; mahbot-1025)",
-                );
-                continue;
-            }
-            super::set_verifier(member_verifier.clone());
-            let mut mctx = super::PipelineCtx::new();
-            let mres = run_streaming_detection(spd_pcm, &mut mctx);
-            let mpv = build_per_variant_result(
-                "speed_down_member",
-                &mres,
-                &mctx,
-                false,
-                0,
-                &member_verifier,
-            );
-            speed_down_member_peaks.push(mpv.verifier_score);
-        }
-        // Restore the full ensemble verifier for the remaining phases.
-        super::set_verifier(verifier.clone());
-    }
-    let speed_down_member_miss_fraction: f32 = if speed_down_member_peaks.is_empty() {
-        // Not measurable: no speed_down variant (report 0.0 as before) OR the
-        // variant existed but every member was untrained (fail-closed 1.0).
-        if speed_down_member_untrained > 0 {
-            warn!(
-                "speed_down member gate: no trained members to measure — miss \
-                 fraction reported as 1.0 (fail-closed; mahbot-1025)",
-            );
-            1.0
-        } else {
-            0.0
-        }
-    } else {
-        let below = speed_down_member_peaks
-            .iter()
-            .filter(|&&p| p < crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR)
-            .count();
-        below as f32 / speed_down_member_peaks.len() as f32
-    };
-    if !speed_down_member_peaks.is_empty() {
-        info!(
-            "Verifier ensemble speed_down member peaks: {:?} — miss fraction {:.3} \
-             over {n_trained} trained member(s) (gate ≤0.15, mahbot-1025)",
-            speed_down_member_peaks,
-            speed_down_member_miss_fraction,
-            n_trained = speed_down_member_peaks.len(),
-        );
     }
 
     // ── Aggregate acceptance metrics ────────────────────────────────────────
@@ -4220,7 +3246,6 @@ fn run_enrolled_speaker_phase(
     // (`recall_variants`), not the F1 training-clip control (`variants`).
     let total = recall_variants.len();
     let detected_live = recall_variants.iter().filter(|v| v.detected).count();
-    let confirmed = recall_variants.iter().filter(|v| v.confirm).count();
     // Wilson 95% confidence interval for the held-out recall proportion
     // (binomial; report-only).
     let recall_ci = wilson_ci(detected_live, total);
@@ -4230,47 +3255,29 @@ fn run_enrolled_speaker_phase(
         .iter()
         .find(|v| v.variant.ends_with("_original"))
         .is_some_and(|v| v.detected);
-    // mahbot-1025: F1_noise explicit measurement — the F1 noise-augmented
-    // variant's verifier peak must stay ≥ the 0.86 floor in every run (it is
-    // borderline 0.858–0.932 in the archive and the negative-corpus expansion
-    // must not push it below floor; measured explicitly, never assumed).
-    let enrolled_noise_verifier_peak = variants
-        .iter()
-        .find(|v| v.variant.ends_with("_noise"))
-        .map(|v| v.verifier_peak);
     let burst_path = recall_variants
         .iter()
         .filter(|v| v.detection_path.as_deref() == Some("burst"))
-        .count();
-    let burst_cont_path = recall_variants
-        .iter()
-        .filter(|v| v.detection_path.as_deref() == Some("burst_continuation"))
         .count();
     let pass_path = recall_variants
         .iter()
         .filter(|v| v.detection_path.as_deref() == Some("segment_end_pass"))
         .count();
-    let unexpected_path = recall_variants
+    let other_path = recall_variants
         .iter()
-        .filter(|v| v.detection_path.as_deref() == Some("unexpected"))
+        .filter(|v| v.detection_path.as_deref() == Some("other"))
         .count();
-    // PRIMARY expected mechanism: burst-family detections (burst sweep
-    // directly, or burst-created candidate confirmed by main-loop
-    // continuation) before the segment-end pass.
-    let primary_mechanism = burst_path + burst_cont_path;
+    // Mid-utterance paths (main-loop or deferred burst) before the boundary
+    // fallback.
+    let primary_mechanism = burst_path + other_path;
     let burst_latencies: Vec<f64> = recall_variants
         .iter()
         .filter(|v| v.detection_path.as_deref() == Some("burst"))
         .filter_map(|v| v.latency_ms)
         .collect();
-    let burst_family_latencies: Vec<f64> = recall_variants
+    let detected_latencies: Vec<f64> = recall_variants
         .iter()
-        .filter(|v| {
-            matches!(
-                v.detection_path.as_deref(),
-                Some("burst" | "burst_continuation")
-            )
-        })
+        .filter(|v| v.detected)
         .filter_map(|v| v.latency_ms)
         .collect();
     let burst_stalls: Vec<f64> = recall_variants
@@ -4291,49 +3298,23 @@ fn run_enrolled_speaker_phase(
 
     // ── Near-miss canaries (mahbot-1024 item 5) ────────────────────────────
     // Investigation triggers, NOT hard gates: firing means the run deserves
-    // review, never an automatic pass/fail.  Per-run reported.  The
-    // confirmation-margin canary scans the HELD-OUT recall set; the
-    // speed_down / F1_noise canaries read the F1 training-clip control
-    // (`variants`) — the F1 control variants are the only ones carrying the
-    // speed_down / noise suffixes (re-scope).
+    // review, never an automatic pass/fail.  Without a verifier the canary is
+    // the classifier gate: a held-out recall variant that crossed the
+    // classifier gate (max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD) but was
+    // NOT detected end-to-end.
     let mut canaries_fired: Vec<&'static str> = Vec::new();
-    let mut confirmation_margin_low: Vec<serde_json::Value> = Vec::new();
-    let mut speed_down_peak: Option<f32> = None;
-    for v in &recall_variants {
-        // Canary: any per-run confirmation verifier margin below ~0.90
-        // (confirmed detection whose verifier peak sat in [0.86, 0.90)).
-        if v.detected
-            && v.verifier_peak >= crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR
-            && v.verifier_peak < 0.90
-        {
-            confirmation_margin_low.push(serde_json::json!({
-                "variant": v.variant,
-                "verifier_peak": v.verifier_peak,
-                "margin_above_floor": v.verifier_peak
-                    - crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR,
-            }));
-        }
-    }
-    for v in &variants {
-        if v.variant.ends_with("_speed_down") {
-            speed_down_peak = Some(v.verifier_peak);
-        }
-    }
-    if !confirmation_margin_low.is_empty() {
-        canaries_fired.push("confirmation_verifier_margin_below_0_90");
-    }
-    // Canary: speed_down variant peak below ~0.90.
-    let speed_down_below_0_90 = speed_down_peak.is_some_and(|p| p < 0.90);
-    if speed_down_below_0_90 {
-        canaries_fired.push("speed_down_peak_below_0_90");
-    }
-    // mahbot-1025: F1_noise explicit canary — verifier peak below the 0.86
-    // acceptance floor (borderline in the archive; must be re-measured every
-    // run, never assumed).
-    if enrolled_noise_verifier_peak
-        .is_some_and(|p| p < crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR)
-    {
-        canaries_fired.push("f1_noise_verifier_below_floor");
+    let gate_crossed_not_detected: Vec<serde_json::Value> = recall_variants
+        .iter()
+        .filter(|v| {
+            !v.detected
+                && v.per_frame_scores
+                    .iter()
+                    .any(|s| s[ROLLING_SUM_IDX] >= MIN_CLASSIFIER_THRESHOLD)
+        })
+        .map(|v| serde_json::json!({ "variant": v.variant }))
+        .collect();
+    if !gate_crossed_not_detected.is_empty() {
+        canaries_fired.push("classifier_gate_crossed_not_detected");
     }
 
     let per_variant_json: Vec<serde_json::Value> = recall_variants
@@ -4344,12 +3325,8 @@ fn run_enrolled_speaker_phase(
                 "detected": v.detected,
                 "detection_path": v.detection_path,
                 "detection_source": v.detection_source,
-                "confirm": v.confirm,
-                "ring4_verifier_at_pos24": v.ring4_verifier_at_pos24,
                 "latency_ms": v.latency_ms,
-                "verifier_peak": v.verifier_peak,
                 "classifier_window_scores": v.per_frame_scores,
-                "verifier_score_trajectory": v.verifier_score_trajectory,
                 "per_frame_window_start": v.per_frame_window_start,
                 "per_frame_mel_buffer_len": v.per_frame_mel_buffer_len,
                 "per_frame_geometry": v
@@ -4361,11 +3338,6 @@ fn run_enrolled_speaker_phase(
                     .per_frame_adaptive_mode
                     .iter()
                     .map(|m| m.as_str())
-                    .collect::<Vec<_>>(),
-                "per_frame_candidate_state": v
-                    .per_frame_candidate_state
-                    .iter()
-                    .map(|c| c.as_str())
                     .collect::<Vec<_>>(),
                 "burst_sweep_buffer_len": v.burst_sweep_buffer_len,
                 "burst_wall_clock_ms": v.burst_wall_clock_ms,
@@ -4385,8 +3357,6 @@ fn run_enrolled_speaker_phase(
                 "variant": v.variant,
                 "detected": v.detected,
                 "detection_path": v.detection_path,
-                "confirm": v.confirm,
-                "verifier_peak": v.verifier_peak,
             })
         })
         .collect();
@@ -4411,17 +3381,8 @@ fn run_enrolled_speaker_phase(
     let phase_ms = start.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
         "  Enrolled-speaker phase (held-out recall): {detected_live}/{total} detected end-to-end, \
-         {confirmed}/{total} confirmed (strict ring-4 formula, report-only), \
-         paths: burst={burst_path} burst_continuation={burst_cont_path} \
-         segment_end_pass={pass_path} unexpected={unexpected_path}",
+         paths: burst={burst_path} segment_end_pass={pass_path} other={other_path}",
     );
-    if unexpected_path > 0 {
-        warn!(
-            "Enrolled-speaker phase: {unexpected_path} detection(s) via the 'unexpected' \
-             path (main-loop-created candidate — no burst-created candidate to continue) — \
-             genuine unexpected-path signal, must be investigated",
-        );
-    }
     if !canaries_fired.is_empty() {
         warn!(
             "Enrolled-speaker phase near-miss canaries fired: {} — investigation \
@@ -4436,18 +3397,9 @@ fn run_enrolled_speaker_phase(
                  unseen renderings of the ENROLLED voice: new seeds in a collision-free \
                  range, wake phrase alone and embedded in sentences, generated strictly \
                  after training and never added to any training pool.  Measures \
-                 end-to-end detection (classifier gate + verifier >= \
-                 VERIFIER_ACCEPTANCE_FLOOR 0.86) through the REAL streaming cold pass: \
-                 fresh PipelineCtx per clip, no warm-up, fresh adaptive bootstrap, \
-                 cold-start verifier warm-up included.  The F1 training-clip control \
-                 (f1_control sub-section) is report-only.  Acceptance is re-scoped \
-                 (mahbot-1024) to the MEASURED PRODUCTION MECHANISM: a burst-created \
-                 candidate confirmed mid-utterance at verifier >= 0.86, whether \
-                 confirmed inside the burst window ('burst') or by main-loop \
-                 continuation of the burst-created candidate ('burst_continuation' — \
-                 the PRIMARY expected path).  The strict confirm(variant) formula \
-                 (ring-4 verifier at the burst's position 24, below) is a report-only \
-                 diagnostic and does NOT gate acceptance.",
+                 end-to-end detection through the REAL streaming cold pass: fresh \
+                 PipelineCtx per clip, no warm-up, fresh adaptive bootstrap.  The F1 \
+                 training-clip control (f1_control sub-section) is report-only.",
         "f1_clip": enrolled_label,
         "phase_ms": phase_ms,
         "held_out_recall": {
@@ -4469,17 +3421,8 @@ fn run_enrolled_speaker_phase(
             "variants": enrolled_control_json,
             "note": "F1 training-clip 5-augmentation control (in-sample; the clip is the \
                      guided-prompt-conditioned enrollment PCM — the '_original' variant is \
-                     NOT raw TTS) — report-only diagnostic powering f1_original_detected / \
-                     f1_noise_verifier_peak / the per-member speed_down variance gate; NOT \
-                     the acceptance basis.",
-        },
-        "variants_produced": {
-            "total": total,
-            "raw_level_speed_up": null,
-            "raw_level_total": null,
-            "note": "Since the re-scope the enrolled-speaker phase measures the held-out \
-                     recall set (per-clip, no raw-level 5-augmentation split); the \
-                     raw-level 5-variant counts now live in the f1_control sub-section.",
+                     NOT raw TTS) — report-only diagnostic powering f1_original_detected; \
+                     NOT the acceptance basis.",
         },
         "acceptance": {
             "basis": format!(
@@ -4496,64 +3439,32 @@ fn run_enrolled_speaker_phase(
                     for the held-out recall binomial proportion."})
             }),
             "f1_original_detected": enrolled_original_detected,
-            "confirmed": confirmed,
-            "confirmed_frac": if total > 0 { confirmed as f64 / total as f64 } else { 0.0 },
             "target": format!(
                 "mean held-out recall >= {:.0}% (MIN_DETECTION_RATE) across >= 3 FRESH runs \
-                 of the final staged code — per-run end-to-end detection through the measured \
-                 production mechanism (detected_live) on unseen enrolled-voice renderings \
-                 (wake-alone + embedded), NOT the strict ring-4 formula",
+                 of the final staged code — per-run end-to-end detection (detected_live) on \
+                 unseen enrolled-voice renderings (wake-alone + embedded)",
                 MIN_DETECTION_RATE * 100.0,
             ),
-            "strict_ring4_formula_report_only": "confirm(variant) = classifier gate \
-                       (max_rolling_sum >= 2.13) AND ring-4 verifier peak at the burst's \
-                       position 24 >= 0.86 (the live analogue of the removed B-sweep \
-                       decisive cell).  Kept visible as a report-only diagnostic: at the \
-                       live trigger geometry (B = 72-80) the burst's position-0 window is \
-                       a full 76-frame window (not padded) and its embedding can pull the \
-                       ring-4 sample below 0.86 even when the pipeline detects — the \
-                       divergence is the measurement artifact the re-scope documents, \
-                       NOT a mechanism failure.",
-            "effective_verifier_threshold": crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR,
-            "speed_down_member_peaks": speed_down_member_peaks,
-            "speed_down_member_miss_fraction": speed_down_member_miss_fraction,
-            // mahbot-1025: explicit F1_noise measurement (verifier peak must
-            // stay ≥ 0.86 every run — borderline in the archive).
-            "f1_noise_verifier_peak": enrolled_noise_verifier_peak,
-            "f1_noise_above_floor": enrolled_noise_verifier_peak
-                .is_some_and(|p| p >= crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR),
             "note": "detected_live = end-to-end through the real cold pass (the \
-                     acceptance metric).  confirmed = strict ring-4 formula (report-only \
-                     diagnostic).  f1_original_detected = F1 no-regression control \
-                     (criterion 2: must be detected in every fresh run).  \
-                     speed_down_member_peaks = each ensemble member's STANDALONE \
-                     speed_down verifier peak (mahbot-1025); the miss fraction is the \
-                     per-run single-seed miss-probability estimate (gate ≤0.15, target \
-                     band ~0.04–0.10).  f1_noise_verifier_peak = the F1 noise variant's \
-                     verifier peak, measured explicitly every run (must be ≥ 0.86).",
+                     acceptance metric).  f1_original_detected = F1 no-regression control \
+                     (criterion 2: must be detected in every fresh run).",
         },
         "paths": {
             "burst": burst_path,
-            "burst_continuation": burst_cont_path,
             "segment_end_pass": pass_path,
-            "unexpected": unexpected_path,
+            "other": other_path,
             "primary_mechanism": primary_mechanism,
-            "note": "burst = deferred burst sweep confirmed directly; \
-                     burst_continuation = burst-created candidate confirmed by \
-                     main-loop continuation BEFORE the segment-end pass (the PRIMARY \
-                     expected mechanism, mahbot-1024); segment_end_pass = boundary \
-                     fallback; unexpected = main-loop-created candidate (no \
-                     burst-created candidate to continue) — the genuine unexpected-path \
-                     signal, flag + investigate, never accept silently.  Acceptance \
-                     requires mean TP >= 4/5 across >= 3 fresh runs via the primary \
-                     mechanism family (burst + burst_continuation), before the \
-                     segment-end pass.",
+            "note": "Raw detection sources (no candidate/verifier reclassification): \
+                     burst = deferred burst sweep fired; other = main-loop stride-8 \
+                     window fired; segment_end_pass = boundary fallback pass fired.  \
+                     Acceptance requires mean TP >= 4/5 across >= 3 fresh runs via the \
+                     mid-utterance paths (burst + other), before the segment-end pass.",
         },
         "latency": {
+            "detected_path_ms": detected_latencies,
+            "detected_path_mean_ms": mean(&detected_latencies),
             "burst_path_ms": burst_latencies,
             "burst_path_mean_ms": mean(&burst_latencies),
-            "burst_family_ms": burst_family_latencies,
-            "burst_family_mean_ms": mean(&burst_family_latencies),
             "burst_path_target": "<= ~1.0 s from speech onset",
             "audio_position_of_burst_ms": live_trigger_bs
                 .iter()
@@ -4565,22 +3476,18 @@ fn run_enrolled_speaker_phase(
                      burst is burst_sweep_buffer_len x 10 ms (mel model stride): the \
                      live trigger fires ~680-800 ms into the utterance (~56% through \
                      'mahbot' for F1 at B=68-80), i.e. as the user finishes speaking \
-                     it, NOT instantly — the intentional UX framing.  The <= ~1.0 s \
-                     bound is judged on the audio position; observed confirmation \
-                     760-790 ms from wake-word onset.  burst_family_ms covers the \
-                     primary-mechanism detections (burst + burst_continuation).",
+                     it, NOT instantly — the intentional UX framing.",
         },
         "burst_stall": {
             "wall_clock_ms": burst_stalls,
             "max_ms": burst_stalls.iter().copied().fold(0.0_f64, f64::max),
             "note": "Synchronous burst sweep stall measured through the live pipeline \
                      (AGC/VAD/block_in_place overhead included).  Worst case ~44-135 ms \
-                     (up to 9 ONNX calls), ~20-60 ms on the confirming path (4 calls); \
-                     the 1.024 s mic channel absorbs it.  No async scoring path is used.  \
-                     DROPPED_CHUNKS is only incremented on the real-mic channel — the \
-                     benchmark feeds audio directly, so the no-drop criterion is an \
-                     operational check on the live mic channel, stated as such (manager \
-                     pin 4).",
+                     (up to 9 ONNX calls); the 1.024 s mic channel absorbs it.  No async \
+                     scoring path is used.  DROPPED_CHUNKS is only incremented on the \
+                     real-mic channel — the benchmark feeds audio directly, so the \
+                     no-drop criterion is an operational check on the live mic channel, \
+                     stated as such (manager pin 4).",
         },
         "live_trigger_geometry": {
             "burst_sweep_buffer_lens": live_trigger_bs,
@@ -4590,23 +3497,13 @@ fn run_enrolled_speaker_phase(
                      static-gate grid (manager pin 2).",
         },
         "near_miss_canaries": {
-            "confirmation_verifier_margin_below_0_90": confirmation_margin_low,
-            "speed_down_peak": speed_down_peak,
-            "speed_down_below_0_90": speed_down_below_0_90,
+            "classifier_gate_crossed_not_detected": gate_crossed_not_detected,
             "fired": canaries_fired,
             "note": "Investigation triggers (mahbot-1024 item 5), NOT hard gates: any \
                      fired canary means the run deserves review before acceptance.  \
-                     'confirmation_verifier_margin_below_0_90' = a confirmed detection \
-                     whose verifier peak sat in [0.86, 0.90); 'speed_down_peak_below_0_90' \
-                     = the binding speed_down variant's verifier peak dipped below 0.90 \
-                     (TWO observed speed_down sub-floor peaks: 0.7886 run 20260801-061348 \
-                     and 0.8090 run 20260801-085648 — not one); \
-                      'f1_noise_verifier_below_floor' = the F1 noise variant's verifier \
-                      peak fell below the 0.86 acceptance floor (mahbot-1025 explicit \
-                      measurement).  Negative-corpus canaries (classifier gate \
-                     crossings, negative-verifier margin-to-floor) are reported in the \
-                     safety_gate section; the per-run weights fingerprints are in the \
-                     top-level weights_fingerprints section.",
+                     'classifier_gate_crossed_not_detected' = a held-out recall variant \
+                     crossed the classifier gate (max_rolling_sum >= 2.13) but was not \
+                     detected end-to-end.",
         },
         "per_variant": per_variant_json,
     }))
@@ -4617,15 +3514,9 @@ fn run_enrolled_speaker_phase(
 /// The deferral adds in-distribution deferred windows (burst + boundary
 /// double-scoring) whose false-positive impact must be MEASURED, not assumed.
 /// Baseline (mahbot-1022): 9/59 classifier gate crossings, 0 end-to-end false
-/// accepts.  The verifier is the false-accept backstop; the confusable
-/// `day mahbot_s2` peak 0.7587 sits 0.1013 below the 0.86 floor.  Because the
-/// verifier is entropy-seeded, an in-distribution confusable may exceed the
-/// floor on some runs — the report distinguishes true false accepts (detected)
-/// from boundary-crossing confusables (verifier peak in [0.86, 1.0] but no
-/// end-to-end accept).
-#[expect(clippy::too_many_lines)]
+/// accepts.  The classifier gate crossing count is measured per run; true
+/// false accepts (end-to-end detections) are counted separately.
 fn safety_gate(all_neg_pv: &[(&PerVariantResult, String)]) -> serde_json::Value {
-    let acceptance_floor = crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR;
     let total = all_neg_pv.len();
     let gate_crossings = all_neg_pv
         .iter()
@@ -4636,143 +3527,39 @@ fn safety_gate(all_neg_pv: &[(&PerVariantResult, String)]) -> serde_json::Value 
         .filter(|(pv, _)| pv.detected)
         .map(|(pv, cat)| (pv.variant.as_str(), cat.clone()))
         .collect();
-    let boundary_crossers: Vec<serde_json::Value> = all_neg_pv
-        .iter()
-        .filter(|(pv, _)| {
-            pv.verifier_score >= crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR
-        })
-        .map(|(pv, cat)| {
-            serde_json::json!({
-                "variant": pv.variant,
-                "category": cat,
-                "verifier_peak": pv.verifier_score,
-                "detected": pv.detected,
-                "gate_crossed": pv.max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD,
-            })
-        })
-        .collect();
-    // mahbot-1023 review fix: `pv.verifier_score` is the CANDIDATE-gated peak
-    // (`peak_verifier_score`, updated only while a candidate is active) — it
-    // collapses to 0.0 when no negative crosses the classifier gate, so it
-    // does NOT measure the verifier's negative distribution under the
-    // deferred geometry.  `verifier_score_trajectory` carries the raw
-    // per-frame verifier score (computed for EVERY scored frame once the ring
-    // passes VERIFIER_WARMUP_EMBEDDINGS, independent of candidate state), so
-    // aggregating it actually re-measures the 0.86 floor's FP margin as the
-    // ticket requires (item 7: must be measured, not assumed).  Acceptance
-    // accounting stays per-utterance (manager pin 7): a per-frame floor
-    // crossing is a boundary-crossing confusable, NOT a true false accept —
-    // the classifier gate must also pass for end-to-end detection.
-    let mut per_frame_max: f32 = 0.0;
-    let mut per_frame_total: usize = 0;
-    let mut per_frame_above_floor: usize = 0;
-    let mut boundary_crossing_confusables: Vec<serde_json::Value> = Vec::new();
-    // mahbot-1024 near-miss canary: negative per-frame verifier max within
-    // 0.20 of the floor (margin-to-floor < 0.20) — investigation trigger,
-    // NOT a hard gate.
-    let mut negative_margin_low: Vec<serde_json::Value> = Vec::new();
-    for (pv, cat) in all_neg_pv {
-        let mut utt_max = 0.0_f32;
-        let mut utt_above_floor = false;
-        for &v in &pv.verifier_score_trajectory {
-            per_frame_total += 1;
-            per_frame_max = per_frame_max.max(v);
-            utt_max = utt_max.max(v);
-            if v >= acceptance_floor {
-                per_frame_above_floor += 1;
-                utt_above_floor = true;
-            }
-        }
-        if utt_above_floor {
-            boundary_crossing_confusables.push(serde_json::json!({
-                "variant": pv.variant,
-                "category": cat,
-                "per_frame_verifier_max": utt_max,
-                "detected": pv.detected,
-                "gate_crossed": pv.max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD,
-            }));
-        }
-        if utt_max > acceptance_floor - 0.20 {
-            negative_margin_low.push(serde_json::json!({
-                "variant": pv.variant,
-                "category": cat,
-                "per_frame_verifier_max": utt_max,
-                "margin_to_floor": acceptance_floor - utt_max,
-            }));
-        }
-    }
     // mahbot-1024 near-miss canaries (investigation triggers, not hard gates).
     let mut neg_canaries_fired: Vec<&'static str> = Vec::new();
     if gate_crossings > 0 {
         neg_canaries_fired.push("classifier_gate_crossing_on_negative_corpus");
     }
-    if !negative_margin_low.is_empty() {
-        neg_canaries_fired.push("negative_verifier_margin_to_floor_below_0_20");
-    }
     serde_json::json!({
         "note": "False-positive impact of the deferred in-distribution windows \
                  (deferred burst + boundary fallback double-scoring) on the \
                  negative/confusable set.  Baseline (mahbot-1022, pre-deferral): \
-                 9/59 classifier gate crossings, 0 end-to-end false accepts; \
-                 confusable 'day mahbot_s2' verifier peak 0.7587 (margin 0.1013 \
-                 below the 0.86 floor).  The gate crossing count is EXPECTED to \
-                 change under the deferral — it must be measured, not assumed.  \
-                 Per-utterance accounting (manager pin 7): the acceptance \
-                 denominator is utterances, not frames.  The per-frame negative \
-                 verifier aggregation (mahbot-1023 review fix) uses the raw \
-                 per-frame verifier scores from the trajectories — NOT the \
-                 candidate-gated peak, which is vacuous when no negative crosses \
-                 the classifier gate — so the 0.86 floor's FP margin is actually \
-                 re-measured under the new burst geometry.",
+                 9/59 classifier gate crossings, 0 end-to-end false accepts.  \
+                 The gate crossing count is EXPECTED to change under the \
+                 deferral — it must be measured, not assumed.  Per-utterance \
+                 accounting (manager pin 7): the acceptance denominator is \
+                 utterances, not frames.",
         "total_negatives": total,
         "classifier_gate_crossings": gate_crossings,
         "baseline_gate_crossings": 9,
         "end_to_end_false_accepts": false_accepts.len(),
         "false_accept_list": false_accepts,
         "baseline_false_accepts": 0,
-        "candidate_gated_peak": {
-            "boundary_crossing_confusables": boundary_crossers,
-            "max_negative_verifier_peak": all_neg_pv
-                .iter()
-                .map(|(pv, _)| pv.verifier_score)
-                .fold(0.0_f32, f32::max),
-            "note": "Legacy candidate-gated metrics (baseline comparability).  \
-                     Vacuous when no negative crosses the classifier gate — see \
-                     per_frame_negative_verifier for the real distribution.",
-        },
-        "per_frame_negative_verifier": {
-            "max": per_frame_max,
-            "frames_total": per_frame_total,
-            "frames_above_floor": per_frame_above_floor,
-            "boundary_crossing_confusables": boundary_crossing_confusables,
-            "note": "Aggregated from verifier_score_trajectory (raw per-frame \
-                     verifier scores, not candidate-gated).",
-        },
-        "verifier_acceptance_floor": acceptance_floor,
-        "margin_to_floor": (per_frame_max - acceptance_floor).abs(),
         "acceptance": "<= 2/59 false accepts (5%) across >= 3 runs; every run with a \
-                       false accept must be investigated before the deferral counts \
-                       as enabled — no FA-bound breach may be silently tolerated.  \
-                       Boundary-crossing confusables (verifier >= floor without a \
-                       classifier-gate crossing) are reported separately and do NOT \
-                       count as false accepts.",
+                       false accept must be investigated — no FA-bound breach may be \
+                       silently tolerated.  Gate crossings without an end-to-end \
+                       detection do NOT count as false accepts.",
         "near_miss_canaries": {
             "classifier_gate_crossing_on_negative_corpus": gate_crossings,
-            "negative_verifier_margin_to_floor_below_0_20": negative_margin_low,
             "fired": neg_canaries_fired,
             "note": "Investigation triggers (mahbot-1024 item 5), NOT hard gates.  \
                      'classifier_gate_crossing_on_negative_corpus' = any negative \
                      variant crossed the classifier gate (baseline 9/59, mahbot-1022 \
                      pre-deferral — expected to fire most runs; the count is measured \
-                     per run, not assumed).  'negative_verifier_margin_to_floor_below_0_20' \
-                     = a negative's per-frame verifier max came within 0.20 of the \
-                     0.86 floor (archive-worst: 0.8396 run 20260801-085346, margin 0.0204; \
-                     fresh-run worst: 0.7295 run 20260801-090824, margin 0.1305; fresh-run \
-                     margin distribution 0.7901 / 0.2680 / 0.1305 across runs 090605 / \
-                     090719 / 090824 — the 0.6833 reading is archive second-worst, NOT \
-                     the floor-relevant peak).  Positive-side canaries are in the \
-                      enrolled_speaker section; the per-run weights fingerprints are in \
-                      the top-level weights_fingerprints section.",
+                     per run, not assumed).  Positive-side canaries are in the \
+                     enrolled_speaker section.",
         },
     })
 }
@@ -4801,15 +3588,14 @@ fn enrollment_self_test_counts(
         let mut score_window = Vec::new();
         let mut detected = false;
         for embedding in &seq.embeddings {
-            let (detected_this, _, _, _, _, _) = super::score_single_embedding(
+            let (detected_this, _, _, _) = super::score_single_embedding(
                 embedding,
                 &mut embedding_ring,
                 Some(classifier),
-                None, // no verifier gate during enrollment self-test
                 &mut score_window,
                 None, // no adaptive threshold during enrollment self-test
                 super::ADAPTIVE_K_DEFAULT,
-                None, // no peak verifier tracking during self-test
+                false, // not a burst-path score
             );
             if detected_this {
                 detected = true;
@@ -4868,7 +3654,7 @@ fn deployability_json(
                 ))
             },
             "note": "Mirrors production's run_enrollment_self_test loop (fresh \
-                     score_single_embedding per utterance, no verifier gate); the recall \
+                     score_single_embedding per utterance); the recall \
                      numbers are the deployability signal, labeled informational-only \
                      because the bench is report-only.",
         }),
@@ -4910,7 +3696,6 @@ fn numeric_distribution(values: &[f64]) -> serde_json::Value {
 /// default-run budget is unaffected — 3 × ~3 MB JSON parses, tens of ms.
 /// Corrupt/unreadable archives are skipped (the count says how many were
 /// usable).
-#[expect(clippy::too_many_lines)]
 fn cross_run_summary() -> serde_json::Value {
     let Ok(report_dir) = crate::config::default_config_dir() else {
         return serde_json::json!({"archives_found": 0, "note": "report dir unavailable"});
@@ -4943,7 +3728,6 @@ fn cross_run_summary() -> serde_json::Value {
     let mut fracs: Vec<f64> = Vec::new();
     let mut fas: Vec<f64> = Vec::new();
     let mut self_test_passed: Vec<bool> = Vec::new();
-    let mut fingerprints: Vec<String> = Vec::new();
     let mut phrases: Vec<String> = Vec::new();
     for path in &archives {
         let name = path
@@ -4967,9 +3751,6 @@ fn cross_run_summary() -> serde_json::Value {
             .get("self_test")
             .and_then(|s| s.get("passed"))
             .and_then(serde_json::Value::as_bool);
-        let fp = v
-            .pointer("/weights_fingerprints/verifier/sha256")
-            .and_then(serde_json::Value::as_str);
         let phrase = v
             .pointer("/reproducibility/wake_phrase/used")
             .and_then(serde_json::Value::as_str);
@@ -4985,9 +3766,6 @@ fn cross_run_summary() -> serde_json::Value {
         if let Some(b) = st {
             self_test_passed.push(b);
         }
-        if let Some(s) = fp {
-            fingerprints.push(s.to_string());
-        }
         if let Some(s) = phrase {
             phrases.push(s.to_string());
         }
@@ -4997,7 +3775,6 @@ fn cross_run_summary() -> serde_json::Value {
             "acceptance_basis": basis,
             "total_false_accepts": total_fa,
             "self_test_passed": st,
-            "verifier_fingerprint": fp,
             "wake_phrase_used": phrase,
         }));
     }
@@ -5012,201 +3789,16 @@ fn cross_run_summary() -> serde_json::Value {
                 "n": self_test_passed.len(),
                 "values": self_test_passed,
             }),
-            "verifier_fingerprints": serde_json::json!({
-                "n": fingerprints.len(),
-                "values": fingerprints,
-                "all_identical": fingerprints
-                    .iter()
-                    .all(|f| f == fingerprints.first().unwrap_or(&String::new())),
-            }),
             "wake_phrase_used": serde_json::json!({
                 "n": phrases.len(),
                 "values": phrases,
             }),
         },
         "note": "Last 3 pre-existing timestamped archives (bounded so the default-run \
-                 budget holds).  The >=3-run acceptance protocol reads the spread here; \
-                 identical verifier fingerprints across runs prove a pinned seed.",
+                 budget holds).  The >=3-run acceptance protocol reads the spread here.  \
+                 Missing keys degrade gracefully: pre-1104 archives were deleted, so this \
+                 covers only 1104+ reports.",
     })
-}
-
-/// Env-gated multi-seed mode (`MAHBOT_VOICE_BENCH_MULTI_SEED=N`): re-run the
-/// cheap detection/training phases over N verifier seeds and report per-metric
-/// distributions (mean/min/max/percentiles) instead of the single
-/// entropy-drawn point values of the main run.
-///
-/// The verifier's per-run random base seed is the bench's only entropy source,
-/// so per-seed point values wander.  This sweep re-trains the verifier per
-/// seed (the only seed-dependent phase) and re-runs the enrolled-speaker
-/// acceptance + confusable/unrelated/silence/noise detection passes against
-/// the already-synthesized (TTS-cached, seed-independent) variant sets.
-/// Excluded: FAPH (5.99 h corpus per seed would blow the harness budget),
-/// noise-overlap (~13 s per seed) and the cooldown hard-assertion phase.
-///
-/// Seeds are `base + 0..N` where `base` is the pinned seed
-/// ([`MAHBOT_VOICE_BENCH_VERIFIER_SEED`]) when set, else a fresh entropy draw
-/// (preserving the default per-run entropy policy).  The main verifier and
-/// global pipeline state are restored before returning.
-#[expect(clippy::too_many_arguments, clippy::too_many_lines)]
-fn run_multi_seed_sweep(
-    classifier: &WakeWordClassifier,
-    base_verifier: &VoiceVerifier,
-    verifier_pos_sequences: &[EmbeddingSequence],
-    verifier_neg_sequences: &[EmbeddingSequence],
-    per_negative_sequence_weights: &[f32],
-    train_clips: &[(Vec<f32>, String)],
-    held_out_clips: &[(Vec<f32>, String)],
-    confusable_variants: &[(Vec<f32>, String)],
-    unrelated_variants: &[(Vec<f32>, String)],
-    enrolled_label: &str,
-) -> Option<serde_json::Value> {
-    let n_seeds: usize = std::env::var("MAHBOT_VOICE_BENCH_MULTI_SEED")
-        .ok()?
-        .parse()
-        .ok()?;
-    if n_seeds == 0 {
-        return None;
-    }
-    let base_seed = pinned_verifier_seed().unwrap_or_else(rand::random);
-    let sweep_start = Instant::now();
-    let mut per_seed: Vec<serde_json::Value> = Vec::new();
-    let mut enrolled_fracs: Vec<f64> = Vec::new();
-    let mut total_fas: Vec<f64> = Vec::new();
-    let mut conf_fas: Vec<f64> = Vec::new();
-    let mut recalls: Vec<f64> = Vec::new();
-    let mut thresholds: Vec<f64> = Vec::new();
-    for i in 0..n_seeds {
-        let seed = base_seed.wrapping_add(i as u64);
-        let (v, vm) = VoiceVerifier::train_ensemble_with_metrics_seeded(
-            verifier_pos_sequences,
-            verifier_neg_sequences,
-            Some(per_negative_sequence_weights),
-            DEFAULT_VERIFIER_THRESHOLD,
-            CONV_L2_LAMBDA,
-            seed,
-        );
-        // Both run_enrolled_speaker_phase and test_detection_samples set the
-        // classifier/verifier globals internally on entry — no explicit set
-        // needed here.
-        // Per-seed shared adaptive state — same shared-across-phases pattern
-        // as the main negative phases, but COLD-bootstrapped (new(), not
-        // warmed()): identical across seeds, so the cross-seed distributions
-        // are unaffected.
-        let mut shared_adaptive = super::AdaptiveThresholdState::new();
-        let enrolled =
-            run_enrolled_speaker_phase(train_clips, held_out_clips, classifier, &v, enrolled_label);
-        let enrolled_frac = enrolled
-            .as_ref()
-            .and_then(|r| r.get("acceptance"))
-            .and_then(|a| a.get("detected_live_frac"))
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(f64::NAN);
-        let mut conf = DetectionMetrics::default();
-        test_detection_samples(
-            confusable_variants,
-            classifier,
-            &v,
-            &mut conf,
-            |m, l| m.false_accepts.push(l.to_string()),
-            Some(&mut shared_adaptive),
-            false,
-        );
-        let mut unrel = DetectionMetrics::default();
-        test_detection_samples(
-            unrelated_variants,
-            classifier,
-            &v,
-            &mut unrel,
-            |m, l| m.false_accepts.push(l.to_string()),
-            Some(&mut shared_adaptive),
-            false,
-        );
-        let mut silence = DetectionMetrics::default();
-        test_detection_samples(
-            &[(vec![0.0f32; SILENCE_LEN], "silence".to_string())],
-            classifier,
-            &v,
-            &mut silence,
-            |m, l| m.false_accepts.push(l.to_string()),
-            Some(&mut shared_adaptive),
-            false,
-        );
-        let mut noise_fa = 0usize;
-        for (label, generator) in NOISE_PROFILES {
-            let mut m = DetectionMetrics::default();
-            let noise = generator();
-            test_detection_samples(
-                &[(noise, (*label).to_string())],
-                classifier,
-                &v,
-                &mut m,
-                |m, l| m.false_accepts.push(l.to_string()),
-                Some(&mut shared_adaptive),
-                false,
-            );
-            noise_fa += m.false_accepts.len();
-        }
-        let total_fa = conf.false_accepts.len()
-            + unrel.false_accepts.len()
-            + silence.false_accepts.len()
-            + noise_fa;
-        let recall = f64::from(vm.tpr.unwrap_or(f32::NAN));
-        if !enrolled_frac.is_nan() {
-            enrolled_fracs.push(enrolled_frac);
-        }
-        total_fas.push(total_fa as f64);
-        conf_fas.push(conf.false_accepts.len() as f64);
-        recalls.push(recall);
-        thresholds.push(f64::from(v.threshold));
-        per_seed.push(serde_json::json!({
-            "seed": seed,
-            "enrolled_detected_live_frac": enrolled_frac,
-            "confusable_fa": conf.false_accepts.len(),
-            "unrelated_fa": unrel.false_accepts.len(),
-            "silence_fa": silence.false_accepts.len(),
-            "noise_fa": noise_fa,
-            "total_false_accepts": total_fa,
-            "verifier_val_recall": recall,
-            "verifier_threshold": v.threshold,
-        }));
-        info!("Multi-seed sweep: seed {seed} → enrolled {enrolled_frac:.2} / total FA {total_fa}");
-    }
-    // Restore the main verifier + classifier global state for the remaining
-    // (report-only) phases.
-    super::set_classifier_weights(classifier.weights_ref().clone());
-    super::set_verifier(base_verifier.clone());
-    let wall_secs = sweep_start.elapsed().as_secs_f64();
-    eprintln!(
-        "  Multi-seed sweep ({n_seeds} seeds, base {base_seed}) completed in {wall_secs:.1}s \
-         — distributions in the report's multi_seed section"
-    );
-    Some(serde_json::json!({
-        "n_seeds": n_seeds,
-        "base_seed": base_seed,
-        "wall_secs": wall_secs,
-        "per_seed": per_seed,
-        "distribution": {
-            "enrolled_detected_live_frac": numeric_distribution(&enrolled_fracs),
-            "total_false_accepts": numeric_distribution(&total_fas),
-            "confusable_fa": numeric_distribution(&conf_fas),
-            "verifier_val_recall": numeric_distribution(&recalls),
-            "verifier_threshold": numeric_distribution(&thresholds),
-        },
-        "note": "Env-gated (MAHBOT_VOICE_BENCH_MULTI_SEED=N); re-runs verifier training + \
-                 enrolled-speaker acceptance + confusable/unrelated/silence/noise detection \
-                 per seed.  Excluded: FAPH, noise-overlap, cooldown (see helper docs).  A \
-                 pinned seed (MAHBOT_VOICE_BENCH_VERIFIER_SEED) makes every entry \
-                 byte-reproducible.",
-    }))
-}
-
-/// Pinned verifier base seed from `MAHBOT_VOICE_BENCH_VERIFIER_SEED`.
-/// Unset (default) preserves the bench's per-run entropy policy.
-fn pinned_verifier_seed() -> Option<u64> {
-    std::env::var("MAHBOT_VOICE_BENCH_VERIFIER_SEED")
-        .ok()?
-        .parse()
-        .ok()
 }
 
 /// Env-gated FAPH phase (mahbot-1057, honest methodology mahbot-1081):
@@ -5364,18 +3956,16 @@ fn run_faph_phase_inner() -> serde_json::Value {
     }
 
     // ── Feed loop: ambient audio FA counting ──────────────────────────────
-    // Classifier + verifier must be set as globals (score_stride8_window
-    // reads them from voice_state()).  The bench's earlier phases set them;
-    // re-set from the local trained models to be self-contained.
+    // Classifier must be set as a global (score_stride8_window reads it from
+    // voice_state()).  The bench's earlier phases set it; re-set from the
+    // local trained model to be self-contained.
     let Some(weights) = super::get_classifier_weights() else {
         return faph_skip_json(
             "classifier_unavailable",
             "no trained classifier weights in global state",
         );
     };
-    let verifier = super::get_verifier();
     super::set_classifier_weights(weights.clone());
-    super::set_verifier(verifier.clone());
 
     let mut total_audio_secs = 0.0f64;
     let mut total_vad_active_secs = 0.0f64;
@@ -5385,11 +3975,11 @@ fn run_faph_phase_inner() -> serde_json::Value {
     let mut per_file_events: Vec<serde_json::Value> = Vec::new();
 
     // Continuous listening (honest FAPH methodology): ONE PipelineCtx across
-    // the whole corpus so AGC convergence, the adaptive threshold, the
-    // verifier warm-up and noise-RMS behavior persist the way production
-    // actually listens.  A short silence gap between files fires the natural
-    // segment-boundary reset (reset_detection_segment after
-    // SEGMENT_TIMEOUT_HOPS of VAD-inactive audio).
+    // the whole corpus so AGC convergence, the adaptive threshold, and
+    // noise-RMS behavior persist the way production actually listens.  A short
+    // silence gap between files fires the natural segment-boundary reset
+    // (reset_detection_segment after SEGMENT_TIMEOUT_HOPS of VAD-inactive
+    // audio).
     let gap: Vec<f32> = vec![0.0; FILE_GAP_SAMPLES];
     let mut ctx = super::PipelineCtx::new();
     let mut audio_pos = 0.0f64;
@@ -5710,19 +4300,16 @@ fn faph_clear_instrumentation(ctx: &mut super::PipelineCtx) {
     ctx.instrumentation.per_frame_scores.clear();
     ctx.instrumentation.per_frame_embeddings.clear();
     ctx.instrumentation.per_frame_geometry.clear();
-    ctx.instrumentation.per_frame_verifier_scores.clear();
     ctx.instrumentation.adaptive_threshold_trajectory.clear();
     ctx.instrumentation.per_frame_embedding_hashes.clear();
     ctx.instrumentation.per_frame_embedding_l2_norms.clear();
     ctx.instrumentation.per_frame_window_start.clear();
     ctx.instrumentation.per_frame_mel_buffer_len.clear();
     ctx.instrumentation.per_frame_adaptive_mode.clear();
-    ctx.instrumentation.per_frame_candidate_state.clear();
     ctx.instrumentation.per_hop_vad.clear();
     ctx.instrumentation.n_frames_below_reset = 0;
     ctx.instrumentation.vad_speech_frames = 0;
     ctx.instrumentation.ceiling_limited_frames = 0;
-    ctx.instrumentation.n_warmup_suppressed_frames = 0;
 }
 
 /// Chi-square quantile via the Wilson–Hilferty approximation.
@@ -5826,18 +4413,17 @@ pub(crate) fn run_internal() {
     const P_VAD_ENROLLMENT: usize = 1;
     const P_NEG_TRAINING_DATA: usize = 2;
     const P_CLASSIFIER_TRAINING: usize = 3;
-    const P_VERIFIER_TRAINING: usize = 4;
-    const P_GLOBAL_STATE: usize = 5;
-    const P_STREAMING_SETUP: usize = 6;
-    const P_POSITIVE_VARIANTS: usize = 7;
-    const P_CONFUSABLE_NEGATIVES: usize = 8;
-    const P_UNRELATED_NEGATIVES: usize = 9;
-    const P_SILENCE_NEGATIVES: usize = 10;
-    const P_NOISE_PROFILES: usize = 11;
-    const P_COOLDOWN: usize = 12;
-    const P_NOISE_OVERLAP: usize = 13;
-    const P_TEARDOWN: usize = 14;
-    const NUM_PHASES: usize = 15;
+    const P_GLOBAL_STATE: usize = 4;
+    const P_STREAMING_SETUP: usize = 5;
+    const P_POSITIVE_VARIANTS: usize = 6;
+    const P_CONFUSABLE_NEGATIVES: usize = 7;
+    const P_UNRELATED_NEGATIVES: usize = 8;
+    const P_SILENCE_NEGATIVES: usize = 9;
+    const P_NOISE_PROFILES: usize = 10;
+    const P_COOLDOWN: usize = 11;
+    const P_NOISE_OVERLAP: usize = 12;
+    const P_TEARDOWN: usize = 13;
+    const NUM_PHASES: usize = 14;
 
     // ── Heartbeat drop guard (mahbot-944) ──────────────────────────────
     // Defined as an item (before any statements) so it satisfies Clippy's
@@ -6044,16 +4630,15 @@ pub(crate) fn run_internal() {
         test_clips.len(),
         test_variants.len(),
     );
-    // Trained-in canary clips (M2/M3) — generated here so Phase 3 can build
-    // the verifier cross-speaker negative tier from the SAME clips the
-    // in-distribution canary matrix later tests.
+    // Trained-in canary clips (M2/M3) — generated here so the in-distribution
+    // canary matrix can test the SAME clips.
     let canary_clips = generate_canary_clips_cached(
         &voice_allocation.canaries,
         &model_version_hash,
         &cache_dir_path,
     );
     info!(
-        "Trained-in canary clips: {} (M2/M3 wake word — verifier cross-speaker negatives + in-distribution canary matrix)",
+        "Trained-in canary clips: {} (M2/M3 wake word — in-distribution canary matrix)",
         canary_clips.len(),
     );
     phase_times[P_ENROLLMENT_AUDIO] = phase_end_ms!();
@@ -6086,33 +4671,6 @@ pub(crate) fn run_internal() {
             .map(|s| s.embeddings.len())
             .sum::<usize>(),
         pos_sequences.len(),
-    );
-
-    // ── Verifier-only positive expansion (mahbot-1025) ─────────────────
-    // The verifier's tiny positive pool (~30-55 windows from the 6 train
-    // clips) is the root of its seed-driven calibration variance.  Synthesize
-    // extra wake-word clips for the ENROLLED voice at additional seeds and
-    // run them through the same VAD-gated enrollment path.  The CLASSIFIER
-    // keeps the frozen `pos_sequences` (its acceptance is already met and
-    // untouched); only the verifier trains on the expanded pool.
-    let extra_verifier_clips = generate_extra_verifier_positives_cached(
-        &voice_allocation.enrolled,
-        &model_version_hash,
-        &cache_dir_path,
-    );
-    info!(
-        "Verifier positive expansion: {} extra train clips (mahbot-1025)",
-        extra_verifier_clips.len(),
-    );
-    let extra_verifier_pos = vad_segment_and_enroll(&extra_verifier_clips);
-    let mut verifier_pos_sequences: Vec<EmbeddingSequence> = pos_sequences.clone();
-    let n_base_verifier_pos = verifier_pos_sequences.len();
-    verifier_pos_sequences.extend(extra_verifier_pos);
-    info!(
-        "Verifier positive pool: {} base + {} extra = {} sequences (mahbot-1025)",
-        n_base_verifier_pos,
-        verifier_pos_sequences.len() - n_base_verifier_pos,
-        verifier_pos_sequences.len(),
     );
 
     phase_times[P_VAD_ENROLLMENT] = phase_end_ms!();
@@ -6174,8 +4732,6 @@ pub(crate) fn run_internal() {
          silently train a weaker model"
     );
 
-    let (classifier_neg_sequences, verifier_neg_sequences, per_negative_sequence_weights);
-
     // Generate ambient noise sequences (mahbot-932 Fix 7) — replaces synthetic negatives.
     let ambient_sequences = generate_ambient_noise_sequences();
     info!(
@@ -6185,15 +4741,14 @@ pub(crate) fn run_internal() {
     );
 
     // ── Bench-local restricted pools (mahbot-880, mahbot-923) ──
-    // After mahbot-923 the pipeline uses dense stride-8 embeddings throughout
-    // — both classifier and verifier use the same dense sequences.  Ambient +
-    // owner-negative replace the old synthetic negatives (mahbot-932).
+    // After mahbot-923 the pipeline uses dense stride-8 embeddings throughout.
+    // Ambient + owner-negative replace the old synthetic negatives (mahbot-932).
 
     // Build classifier negative sequences: ambient → owner → confusable → unrelated
     // (mahbot-932 Fix 7, Fix 8).  No synthetic negatives — production uses zero
     // synthetic embedding-space negatives.
-    let mut classifier_neg_seqs: Vec<EmbeddingSequence> = Vec::new();
-    classifier_neg_seqs.extend(ambient_sequences.clone());
+    let mut classifier_neg_sequences: Vec<EmbeddingSequence> = Vec::new();
+    classifier_neg_sequences.extend(ambient_sequences);
 
     // Owner-negative sequences (enrolled voice only).
     let owner_seqs = generate_owner_negative_sequences(
@@ -6207,126 +4762,9 @@ pub(crate) fn run_internal() {
         owner_seqs.len(),
         voice_allocation.enrolled,
     );
-    classifier_neg_seqs.extend(owner_seqs.clone());
-    classifier_neg_seqs.extend(confusable_neg_seqs.clone());
-    classifier_neg_seqs.extend(unrelated_neg_seqs.clone());
-
-    let n_dense_total = classifier_neg_seqs.len();
-    classifier_neg_sequences = classifier_neg_seqs;
-
-    // Verifier uses the same dense cache embeddings as the classifier.
-    // Build verifier negative sequences in 5-tier order:
-    // ambient → owner → unrelated → confusable → cross-speaker (mahbot-1025).
-    let mut verifier_neg_seqs: Vec<EmbeddingSequence> = Vec::new();
-    verifier_neg_seqs.extend(ambient_sequences);
-    verifier_neg_seqs.extend(owner_seqs);
-    verifier_neg_seqs.extend(unrelated_neg_seqs.clone());
-    verifier_neg_seqs.extend(confusable_neg_seqs.clone());
-    // Cross-speaker TTS wake-word negatives (M2/M3 canary clips, clean + 10/20 dB
-    // white/pink) — in-distribution regression canaries under single-speaker
-    // semantics (mahbot-1025, re-scoped: the former M2-M5 test
-    // clips moved to dedicated canary/reserved pools).  Verifier-only: the
-    // classifier negative set is untouched above (classifier_neg_seqs).
-    let cross_speaker_seqs = generate_cross_speaker_negative_sequences(&canary_clips);
-    let n_cross_speaker = cross_speaker_seqs.len();
-    info!(
-        "Generated {n_cross_speaker} cross-speaker wake-word negative sequences \
-         from {} trained-in canary clips (clean + 10/20 dB white/pink)",
-        canary_clips.len(),
-    );
-    verifier_neg_seqs.extend(cross_speaker_seqs);
-    verifier_neg_sequences = verifier_neg_seqs;
-
-    // Build per-sequence 5-tier weights matching production (mahbot-932 Fix 8)
-    // plus the mahbot-1025 cross-speaker tier:
-    // ambient (1.0×) → owner-negative (OWNER_NEGATIVE_UPWEIGHT×)
-    // → unrelated (UNRELATED_UPWEIGHT×) → confusable (CONFUSABLE_UPWEIGHT×)
-    // → cross-speaker (CROSS_SPEAKER_UPWEIGHT×).
-    let n_ambient = classifier_neg_sequences
-        .iter()
-        .filter(|s| s.source == Source::Ambient)
-        .count();
-    let n_owner = classifier_neg_sequences
-        .iter()
-        .filter(|s| s.source == Source::Owner)
-        .count();
-    let n_confusable = confusable_neg_seqs.len();
-    let n_unrelated = unrelated_neg_seqs.len();
-    let n_seq_total = n_ambient + n_owner + n_confusable + n_unrelated + n_cross_speaker;
-
-    let mut pw: Vec<f32> = Vec::with_capacity(n_seq_total);
-    pw.extend(std::iter::repeat_n(1.0, n_ambient));
-    pw.extend(std::iter::repeat_n(
-        crate::audio::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
-        n_owner,
-    ));
-    pw.extend(std::iter::repeat_n(
-        crate::audio::voice_verifier::UNRELATED_UPWEIGHT,
-        n_unrelated,
-    ));
-    pw.extend(std::iter::repeat_n(
-        crate::audio::voice_verifier::CONFUSABLE_UPWEIGHT,
-        n_confusable,
-    ));
-    pw.extend(std::iter::repeat_n(
-        crate::audio::voice_verifier::CROSS_SPEAKER_UPWEIGHT,
-        n_cross_speaker,
-    ));
-    per_negative_sequence_weights = pw;
-
-    // Structural guard: verify weight tier boundaries (mahbot-880).
-    crate::audio::voice_verifier::assert_weight_tier(
-        &per_negative_sequence_weights,
-        0,
-        n_ambient,
-        1.0,
-        "ambient",
-    );
-    crate::audio::voice_verifier::assert_weight_tier(
-        &per_negative_sequence_weights,
-        n_ambient,
-        n_owner,
-        crate::audio::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
-        "owner-negative",
-    );
-    crate::audio::voice_verifier::assert_weight_tier(
-        &per_negative_sequence_weights,
-        n_ambient + n_owner,
-        n_unrelated,
-        crate::audio::voice_verifier::UNRELATED_UPWEIGHT,
-        "unrelated",
-    );
-    crate::audio::voice_verifier::assert_weight_tier(
-        &per_negative_sequence_weights,
-        n_ambient + n_owner + n_unrelated,
-        n_confusable,
-        crate::audio::voice_verifier::CONFUSABLE_UPWEIGHT,
-        "confusable",
-    );
-    crate::audio::voice_verifier::assert_weight_tier(
-        &per_negative_sequence_weights,
-        n_ambient + n_owner + n_unrelated + n_confusable,
-        n_cross_speaker,
-        crate::audio::voice_verifier::CROSS_SPEAKER_UPWEIGHT,
-        "cross-speaker",
-    );
-    assert_eq!(per_negative_sequence_weights.len(), n_seq_total);
-
-    info!(
-        "Built {} verifier neg sequences ({} ambient@1.0× + {} owner@{}× + {} unrelated@{}× + {} confusable@{}× + {} cross-speaker@{}×) \
-         and {} classifier neg sequences (mahbot-932 Fix 8; cross-speaker tier mahbot-1025)",
-        n_seq_total,
-        n_ambient,
-        n_owner,
-        crate::audio::voice_verifier::OWNER_NEGATIVE_UPWEIGHT,
-        n_unrelated,
-        crate::audio::voice_verifier::UNRELATED_UPWEIGHT,
-        n_confusable,
-        crate::audio::voice_verifier::CONFUSABLE_UPWEIGHT,
-        n_cross_speaker,
-        crate::audio::voice_verifier::CROSS_SPEAKER_UPWEIGHT,
-        n_dense_total,
-    );
+    classifier_neg_sequences.extend(owner_seqs);
+    classifier_neg_sequences.extend(confusable_neg_seqs.clone());
+    classifier_neg_sequences.extend(unrelated_neg_seqs.clone());
 
     // ── Regression assertions (mahbot-932) ──
     assert!(
@@ -6340,12 +4778,6 @@ pub(crate) fn run_internal() {
             .iter()
             .any(|s| s.source == Source::Owner),
         "Phase 3 must produce owner-negative sequences (mahbot-932 Fix 6)",
-    );
-    assert!(
-        !classifier_neg_sequences
-            .iter()
-            .any(|s| s.source == Source::Synthetic),
-        "Phase 3 must NOT produce synthetic negatives (mahbot-932 Fix 7)",
     );
 
     phase_times[P_NEG_TRAINING_DATA] = phase_end_ms!();
@@ -6444,9 +4876,8 @@ pub(crate) fn run_internal() {
 
     // Weights + training metrics for the detection phases and the report.
     // On the double-failure path the seeded placeholder weights keep the
-    // report's weights_fingerprints key populated (deterministic); the
-    // self-test / deployability verdict is skipped entirely and `degenerate`
-    // skips every detection phase.
+    // report populated (deterministic); the self-test / deployability verdict
+    // is skipped entirely and `degenerate` skips every detection phase.
     let (
         weights,
         epochs_trained,
@@ -6588,69 +5019,20 @@ pub(crate) fn run_internal() {
     }
     phase_times[P_CLASSIFIER_TRAINING] = phase_end_ms!();
 
-    // ── Phase 5: Train the VoiceVerifier (mahbot-855, mahbot-861) ─────────
-    phase_start!("Phase 5: Training VoiceVerifier");
-
-    // mahbot-1025: the verifier is a VERIFIER_ENSEMBLE_SEEDS-member multi-seed
-    // ensemble whose predict() averages all member scores, shrinking per-run
-    // seed variance.  The benchmark matches production exactly — both call
-    // train_ensemble_with_metrics — UNLESS the run pins the seed via
-    // MAHBOT_VOICE_BENCH_VERIFIER_SEED (Phase 0 determinism: a pinned seed
-    // reproduces byte-identical verifier weights, validated by the
-    // weights_fingerprints report key).  The positive pool is the expanded
-    // verifier_pos_sequences (base + extra TTS seeds, mahbot-1025 item 2).
-    let verifier_base_seed: Option<u64> = pinned_verifier_seed();
-    let (verifier, verifier_metrics) = match verifier_base_seed {
-        Some(seed) => VoiceVerifier::train_ensemble_with_metrics_seeded(
-            &verifier_pos_sequences,
-            &verifier_neg_sequences,
-            Some(&per_negative_sequence_weights),
-            DEFAULT_VERIFIER_THRESHOLD,
-            CONV_L2_LAMBDA,
-            seed,
-        ),
-        None => VoiceVerifier::train_ensemble_with_metrics(
-            &verifier_pos_sequences,
-            &verifier_neg_sequences,
-            Some(&per_negative_sequence_weights), // per-sequence weights matching production (mahbot-870 Fix 3)
-            DEFAULT_VERIFIER_THRESHOLD,
-            CONV_L2_LAMBDA,
-        ),
-    };
-    if let Some(seed) = verifier_base_seed {
-        info!("VoiceVerifier base seed PINNED to {seed} (MAHBOT_VOICE_BENCH_VERIFIER_SEED)");
-    }
-
-    if verifier.is_trained() {
-        info!(
-            "VoiceVerifier trained successfully with {} dense positive + {} negative sequences \
-             (ambient + owner-negative + confusable + unrelated + cross-speaker, mahbot-932/1025).  \
-             Calibrated threshold={:.4}.",
-            verifier_pos_sequences.len(),
-            verifier_neg_sequences.len(),
-            verifier.threshold,
-        );
-    } else {
-        warn!("VoiceVerifier is untrained (insufficient data)");
-    }
-    let verifier_training_threshold = verifier.threshold;
-    phase_times[P_VERIFIER_TRAINING] = phase_end_ms!();
-
-    // ── Phase 6: Set global state for streaming detection ────────────────
-    phase_start!("Phase 6: Setting global state");
+    // ── Phase 5: Set global state for streaming detection ────────────────
+    phase_start!("Phase 5: Setting global state");
     super::set_classifier_weights(weights.clone());
-    super::set_verifier(verifier.clone());
     phase_times[P_GLOBAL_STATE] = phase_end_ms!();
 
-    // ── Phase 7: Streaming detection setup ────────────────────────────────
-    phase_start!("Phase 7: Streaming detection setup");
-    // This phase is mostly a no-op — the setup was already done in Phase 6.
+    // ── Phase 6: Streaming detection setup ────────────────────────────────
+    phase_start!("Phase 6: Streaming detection setup");
+    // This phase is mostly a no-op — the setup was already done in Phase 5.
     // The timing will be near-zero, which is expected.
     phase_times[P_STREAMING_SETUP] = phase_end_ms!();
 
     // Collect held-out positive wake variants for detection testing (mahbot-911).
     // These are the remaining variants after the PCM-augmented train/test split
-    // (mahbot-932 Fix 5), NOT the variants used for classifier/verifier training.
+    // (mahbot-932 Fix 5), NOT the variants used for classifier training.
     // Since the re-scope the enrollment is single-voice, so this is the SAME
     // speaker's test-split clips (the former M2-M5 cross-speaker clips moved to
     // dedicated canary/reserved pools).
@@ -6689,10 +5071,10 @@ pub(crate) fn run_internal() {
     let mut cooldown_after_recovered: Option<bool> = None;
     // mahbot-1052: additive cooldown.* report keys.  The phase was re-pointed
     // at the enrolled-speaker F1 original variant (the M2–M5 held-out clips
-    // are rejected by the post-1025 verifier, so the old precondition could
-    // never hold).  All keys stay `None` on the degenerate-classifier path and
-    // on a visible skip (F1 clip missing / first detection failed) — the
-    // report emits them as `null` with `skip_reason` set, never panics.
+    // are rejected under single-speaker semantics, so the old precondition
+    // could never hold).  All keys stay `None` on the degenerate-classifier
+    // path and on a visible skip (F1 clip missing / first detection failed) —
+    // the report emits them as `null` with `skip_reason` set, never panics.
     let mut cooldown_source_variant: Option<String> = None;
     let mut cooldown_skip_reason: Option<String> = None;
     let mut cooldown_suppressed_at_2_5s: Option<bool> = None;
@@ -6702,15 +5084,10 @@ pub(crate) fn run_internal() {
     // Per-variant metrics for noise profiles (collected across all profiles).
     let mut noise_metrics: Vec<DetectionMetrics> = Vec::new();
 
-    // mahbot-1023: enrolled-speaker benchmark phase (Phase 8d).  Declared
+    // mahbot-1023: enrolled-speaker benchmark phase (Phase 7d).  Declared
     // here so the JSON report can emit a note even when the classifier is
     // degenerate or the F1 clip is unavailable.
     let mut enrolled_report: Option<serde_json::Value> = None;
-
-    // Env-gated multi-seed sweep (MAHBOT_VOICE_BENCH_MULTI_SEED=N): per-seed
-    // distributions over the cheap detection/training phases.  None on the
-    // degenerate path and when the env gate is off → no `multi_seed` report key.
-    let mut multi_seed_report: Option<serde_json::Value> = None;
 
     if !degenerate {
         // Create a pre-warmed adaptive threshold state shared across all
@@ -6753,16 +5130,14 @@ pub(crate) fn run_internal() {
             voice_allocation.reserved,
         );
 
-        // ── Phase 8: Detection — Positive cases ───────────────────────────
-        phase_start!("Phase 8: Positive (wake word) variants");
+        // ── Phase 7: Detection — Positive cases ───────────────────────────
+        phase_start!("Phase 7: Positive (wake word) variants");
         // Warm pass (existing behavior): consume_warmup + shared pre-warmed
         // adaptive state.  Measures the optimistic production scenario where
-        // the verifier is active before the utterance (background audio has
-        // already filled the ring).
+        // the background audio has already filled the ring.
         test_detection_samples(
             &pos_test_variants,
             &classifier,
-            &verifier,
             &mut pos_metrics,
             |m, _| m.detected += 1,
             Some(&mut shared_adaptive),
@@ -6780,11 +5155,9 @@ pub(crate) fn run_internal() {
 
         // ── Cold-start pass (mahbot-1006 D) ─────────────────────────────
         // Production has no warm-up: after ≥SEGMENT_TIMEOUT_HOPS of silence the
-        // segment boundary resets the ring, and the first
-        // VERIFIER_WARMUP_EMBEDDINGS embeddings of the next utterance are
-        // suppressed during verifier warm-up.  A short wake word therefore has
+        // segment boundary resets the ring.  A short wake word therefore has
         // only a few scorable embeddings.  The warm pass cannot measure this —
-        // it pre-warms the verifier, the AGC, and the classifier window.
+        // it pre-warms the AGC and the classifier window.
         //
         // The cold pass re-runs the positive variants with a fresh PipelineCtx
         // per variant, no consume_warmup, and a fresh AdaptiveThresholdState
@@ -6798,7 +5171,6 @@ pub(crate) fn run_internal() {
         test_detection_samples(
             &pos_test_variants,
             &classifier,
-            &verifier,
             &mut cold_metrics,
             |m, _| m.detected += 1,
             None, // fresh adaptive state per variant (item F)
@@ -6814,29 +5186,27 @@ pub(crate) fn run_internal() {
         );
         phase_times[P_POSITIVE_VARIANTS] = phase_end_ms!();
 
-        // ── Phase 8d: Enrolled-speaker benchmark (held-out recall) ─────────
+        // ── Phase 7d: Enrolled-speaker benchmark (held-out recall) ─────────
         // End-to-end detection of the HELD-OUT recall set (unseen enrolled-voice
         // renderings, wake-alone + embedded, generated after training) through
         // the REAL streaming cold pass (deferred burst + segment-end pass +
-        // adaptive bootstrap + cold-start verifier warm-up).  The F1
-        // training-clip 5-augmentation control is kept as a report-only
-        // diagnostic.  Measurement-only — the report is not pass/fail gated
-        // (mahbot-953), but the acceptance protocol judges the mean across ≥ 3
-        // runs.
-        eprintln!("─── Phase 8d: enrolled-speaker benchmark (held-out recall) ───");
-        info!("─── Phase 8d: enrolled-speaker benchmark (held-out recall) ───");
+        // adaptive bootstrap).  The F1 training-clip 5-augmentation control is
+        // kept as a report-only diagnostic.  Measurement-only — the report is
+        // not pass/fail gated (mahbot-953), but the acceptance protocol judges
+        // the mean across ≥ 3 runs.
+        eprintln!("─── Phase 7d: enrolled-speaker benchmark (held-out recall) ───");
+        info!("─── Phase 7d: enrolled-speaker benchmark (held-out recall) ───");
         let enrolled_start = Instant::now();
         enrolled_report = run_enrolled_speaker_phase(
             &train_clips,
             &held_out_recall_clips,
             &classifier,
-            &verifier,
             &enrolled_label,
         );
         let enrolled_ms = enrolled_start.elapsed().as_secs_f64() * 1000.0;
         eprintln!("  Enrolled-speaker phase completed in {enrolled_ms:.0}ms");
-        // ── Phase 9: Detection — Confusable phrases ──────────────────────
-        phase_start!("Phase 9: Negative — confusable phrases");
+        // ── Phase 8: Detection — Confusable phrases ──────────────────────
+        phase_start!("Phase 8: Negative — confusable phrases");
         let confusable_variants = generate_phrase_variants_cached(
             CONFUSABLE_PHRASES,
             &available_styles,
@@ -6856,7 +5226,6 @@ pub(crate) fn run_internal() {
         test_detection_samples(
             &confusable_variants,
             &classifier,
-            &verifier,
             &mut conf_metrics,
             |m, l| m.false_accepts.push(l.to_string()),
             Some(&mut shared_adaptive),
@@ -6871,7 +5240,7 @@ pub(crate) fn run_internal() {
         phase_times[P_CONFUSABLE_NEGATIVES] = phase_end_ms!();
 
         // ── Phase 10: Detection — Unrelated phrases ───────────────────────
-        phase_start!("Phase 10: Negative — unrelated phrases");
+        phase_start!("Phase 9: Negative — unrelated phrases");
         let unrelated_variants = generate_phrase_variants_cached(
             UNRELATED_PHRASES,
             &available_styles,
@@ -6891,7 +5260,6 @@ pub(crate) fn run_internal() {
         test_detection_samples(
             &unrelated_variants,
             &classifier,
-            &verifier,
             &mut unrelated_metrics,
             |m, l| m.false_accepts.push(l.to_string()),
             Some(&mut shared_adaptive),
@@ -6900,11 +5268,10 @@ pub(crate) fn run_internal() {
         phase_times[P_UNRELATED_NEGATIVES] = phase_end_ms!();
 
         // ── Phase 11: Detection — Silence ────────────────────────────────
-        phase_start!("Phase 11: Negative — silence");
+        phase_start!("Phase 10: Negative — silence");
         test_detection_samples(
             &[(vec![0.0f32; SILENCE_LEN], "silence".to_string())],
             &classifier,
-            &verifier,
             &mut silence_metric,
             |m, l| m.false_accepts.push(l.to_string()),
             Some(&mut shared_adaptive),
@@ -6913,7 +5280,7 @@ pub(crate) fn run_internal() {
         phase_times[P_SILENCE_NEGATIVES] = phase_end_ms!();
 
         // ── Phase 12: Detection — Noise profiles ─────────────────────────
-        phase_start!("Phase 12: Negative — noise profiles");
+        phase_start!("Phase 11: Negative — noise profiles");
         for (label, generator) in NOISE_PROFILES {
             info!("  Testing noise profile: {label}");
             let noise = generator();
@@ -6921,7 +5288,6 @@ pub(crate) fn run_internal() {
             test_detection_samples(
                 &[(noise, (*label).to_string())],
                 &classifier,
-                &verifier,
                 &mut metric,
                 |m, l| m.false_accepts.push(l.to_string()),
                 Some(&mut shared_adaptive),
@@ -6937,21 +5303,18 @@ pub(crate) fn run_internal() {
         }
         phase_times[P_NOISE_PROFILES] = phase_end_ms!();
 
-        // ── Phase 13: Cooldown verification ──────────────────────────────
+        // ── Phase 12: Cooldown verification ──────────────────────────────
         // mahbot-1052: re-pointed at the ENROLLED-SPEAKER original variant
-        // (Phase 8d's construction: enrolled-voice `_enroll0` lookup +
+        // (Phase 7d's construction: enrolled-voice `_enroll0` lookup +
         // pcm_augment_enrollment_variants, _original pinned — 85/85 reliable;
         // speed_down/noise fail ~4–6% historically).  The previous source,
-        // pos_test_variants.first(), is an M2–M5 held-out CROSS-SPEAKER clip.
-        // The phase has been dead since at least the mahbot-1023 positive-class
-        // re-scoping (0/20 cross-speaker detection predates 1025); the
-        // post-1025 verifier training made the rejection structural — its
-        // "first detection should fire" precondition could never hold, so the
-        // whole assertion block silently skipped (85/85 archived reports show
-        // first_detection_fired: false with null cooldown keys).  The enrolled-
-        // speaker positive measurement moved to Phase 8d but Phase 13 was never
-        // re-pointed; this phase restores the cooldown verification the
-        // mahbot-770/802/818 bugs motivated.
+        // pos_test_variants.first(), is an M2–M5 held-out CROSS-SPEAKER clip —
+        // rejected under single-speaker semantics, so its "first detection
+        // should fire" precondition could never hold and the whole assertion
+        // block silently skipped.  The enrolled-speaker positive measurement
+        // moved to Phase 7d but the cooldown phase was never re-pointed; this
+        // phase restores the cooldown verification the mahbot-770/802/818 bugs
+        // motivated.
         //
         // Cooldown semantics under test (production, unchanged):
         //   - WAKE_WORD_COOLDOWN (3.0 s) gate in handle_wake_word_detection;
@@ -6981,9 +5344,7 @@ pub(crate) fn run_internal() {
         info!("─── {}. Cooldown verification ───", P_COOLDOWN + 1);
         // Variant CONSTRUCTION only — mirrors run_enrolled_speaker_phase's
         // enrolled-voice lookup + augmentation WITHOUT re-running the phase
-        // (which would
-        // re-run 5 variants + the member-only verifier loop, mutating global
-        // verifier state; mahbot-1052 manager pin).  `_original` is pinned:
+        // (mahbot-1052 manager pin).  `_original` is pinned:
         // speed_down/noise fail ~4–6% of runs historically (reviewer_3).
         // The shared find+augment chain lives in [`enrolled_clip_variants`];
         // run_enrolled_speaker_phase keeps its inline copy (it needs the raw
@@ -6998,10 +5359,10 @@ pub(crate) fn run_internal() {
             // so the adaptive code path is active during cooldown testing too.
             ctx.adaptive_threshold = shared_adaptive.clone();
 
-            // Detection 1: should fire (consume warm-up first so the verifier
-            // is active and latency measures only the wake word — mahbot-922).
+            // Detection 1: should fire (consume warm-up audio first so latency
+            // measures only the wake word — mahbot-922).
             // NOTE: this is a WARM pass (consume_warmup + warmed shared
-            // adaptive state), unlike Phase 8d's cold pass — the acceptance
+            // adaptive state), unlike Phase 7d's cold pass — the acceptance
             // criterion "assertions actually fire" carries residual risk until
             // measured across ≥3 warm runs (mahbot-1052 manager pin 10); a
             // failure here becomes a VISIBLE skip (skip_reason), never silent.
@@ -7128,14 +5489,6 @@ pub(crate) fn run_internal() {
                 ctx.is_recording = false;
                 let pre_recovery_buffer_len = ctx.audio_buffer.len();
                 sleep_until_cooldown_elapsed(&ctx, Duration::from_millis(3500));
-                // Re-warm the verifier before the recovery feed: the
-                // cooldown-expiry handoff can fire the segment-boundary reset
-                // (clearing the ring that Detection 1's warm-up built), and a
-                // short deployed phrase (e.g. "mahbot" vs "hey mahbot") has
-                // too few post-warm-up embeddings to detect cold — exactly the
-                // phase-0 phrase-alignment hazard.  The gate under test
-                // (cooldown expiry → detection fires again) is unaffected.
-                consume_warmup(&mut ctx);
                 let t3 = Instant::now();
                 let after_cooldown = run_streaming_detection(&enrolled_original, &mut ctx);
                 cooldown_detection_time_ms += t3.elapsed().as_secs_f64() * 1000.0;
@@ -7174,10 +5527,11 @@ pub(crate) fn run_internal() {
 
         // ── Noise-overlapped detection + cross-speaker probes (mahbot-845,
         //    restructured) ──────────────────────────────────────
-        // Two matrices under the same phase:
+        // Two matrices under the same phase (both report-only diagnostics —
+        // cross-speaker detections are correct speaker-blind behaviour):
         //   1. in_distribution_canaries — the trained-in M2/M3 clips under the
         //      full 13-cell noise matrix (kept from mahbot-1025; any detection
-        //      is a trained-in regression canary).  The canary clips are fed
+        //      is a trained-in canary diagnostic).  The canary clips are fed
         //      ORIGINAL-only: the 13-cell noise-condition vocabulary IS the
         //      canary test's defining structure.  The 5-augmentation dimension
         //      was dropped when M4/M5 moved to the reserved held-out probes
@@ -7186,30 +5540,14 @@ pub(crate) fn run_internal() {
         //      voices' augmentations);
         //   2. held_out_probes — the RESERVED voices (M4/M5) at unseen seeds
         //      across clean + 10/20 dB white (honest generalization probes).
-        phase_start!("Phase 14: Noise-overlapped detection + cross-speaker probes");
-        let canary_overlap_results = run_noise_overlap_test(&canary_clips, &classifier, &verifier);
+        phase_start!("Phase 13: Noise-overlapped detection + cross-speaker probes");
+        let canary_overlap_results = run_noise_overlap_test(&canary_clips, &classifier);
         let (probe_cells, probe_fas) =
-            run_cross_speaker_probe_matrix(&cross_speaker_probe_clips, &classifier, &verifier);
+            run_cross_speaker_probe_matrix(&cross_speaker_probe_clips, &classifier);
         noise_overlap_results = canary_overlap_results;
         probe_overlap_results = probe_cells;
         probe_fa_count = probe_fas;
         phase_times[P_NOISE_OVERLAP] = phase_end_ms!();
-
-        // ── Env-gated multi-seed sweep (Phase 0 determinism) ─────────
-        // Re-runs the cheap detection/training phases over N verifier seeds
-        // and reports per-metric distributions (additive, env-gated key).
-        multi_seed_report = run_multi_seed_sweep(
-            &classifier,
-            &verifier,
-            &verifier_pos_sequences,
-            &verifier_neg_sequences,
-            &per_negative_sequence_weights,
-            &train_clips,
-            &held_out_recall_clips,
-            &confusable_variants,
-            &unrelated_variants,
-            &enrolled_label,
-        );
     } else {
         // Degenerate classifier — skip all detection phases
         phase_times[P_POSITIVE_VARIANTS] = 0;
@@ -7225,7 +5563,7 @@ pub(crate) fn run_internal() {
         // hoisting pattern; the F1-missing / warm-pass-failure skip reasons
         // are set inside the Phase 13 block above).
         let reason = "degenerate classifier (near-zero weights) — all detection phases, \
-             including Phase 13 cooldown verification, were skipped (mahbot-1052)"
+             including Phase 12 cooldown verification, were skipped (mahbot-1052)"
             .to_string();
         warn!("{reason}");
         cooldown_skip_reason = Some(reason);
@@ -7245,29 +5583,8 @@ pub(crate) fn run_internal() {
     // The phase therefore feeds the FULL pinned corpus (812 files).
     let faph_report: Option<serde_json::Value> = run_faph_phase();
 
-    // ── Phase 15 timing ─────────────────────────────────
-    phase_start!("Phase 15: Teardown");
-
-    // ── Weights fingerprints (teardown relocation) ─────────────────────────
-    // The classifier/verifier weight fingerprints were previously emitted
-    // inside the (removed) B-sweep section; they are re-emitted here as a
-    // top-level report key so the per-run weights identity stays observable.
-    // Pure weight hashes — byte-identical to the historical bsweep readings.
-    let weights_fingerprints_json = serde_json::json!({
-        "classifier": {
-            "sha256": weights_fingerprint_classifier(classifier.weights_ref()),
-            "bytes_hashed": "sha2-256 over f32 LE bytes of weight vectors in field \
-                             order conv1_weight..fc_bias + bn_eps + arch; BN running \
-                             statistics INCLUDED; NO_MATCH_RESET_THRESHOLD is a \
-                             compile-time constant (0.316), not hashed",
-        },
-        "verifier": {
-            "sha256": weights_fingerprint_verifier(&verifier),
-            "bytes_hashed": "sha2-256 over f32 LE bytes of conv_weight, conv_bias, \
-                             fc_weight, fc_bias, then runtime-calibrated threshold",
-            "runtime_threshold": verifier.threshold,
-        },
-    });
+    // ── Phase 14 timing ─────────────────────────────────
+    phase_start!("Phase 14: Teardown");
 
     let tier_limit_sets = [
         tier_limits(BenchTier::Easy),
@@ -7276,16 +5593,12 @@ pub(crate) fn run_internal() {
     ];
 
     // Compute total false accepts across all categories.
-    // mahbot-1025: the noise_overlap cross-speaker cells are official FA
-    // canaries — every detected variant across ALL noise_overlap cells is a
-    // cross-speaker false accept (a non-enrolled speaker's wake word accepted
-    // under noise; single-speaker semantics).  The cells now
-    // cover the trained-in M2/M3 canary matrix (in-distribution regression
-    // canaries, relabeled) — the held-out RESERVED-voice probes are counted
-    // separately (cross_speaker_probes) so the honest generalization signal is
-    // never mixed into the trained-in canary tally.  The per-cell `detail` JSON
-    // carries per-variant `detected` flags, so we sum them.
-    let noise_overlap_cross_speaker_fas: usize = noise_overlap_results
+    // True-negative phases only: confusable / unrelated / silence / noise.
+    // The noise_overlap canary and cross-speaker probe matrices are
+    // speaker-blindness DIAGNOSTICS (cross-speaker wake-word detections are
+    // correct behaviour, not false accepts) — their detection counts are
+    // reported in noise_overlap / false_accepts but do NOT feed the tally.
+    let noise_overlap_detections: usize = noise_overlap_results
         .iter()
         .flat_map(|(_, _, detail)| detail.iter())
         .filter(|v| {
@@ -7295,7 +5608,7 @@ pub(crate) fn run_internal() {
         })
         .count();
     // The canary target is derived from the actual measured cell×variant
-    // matrix so every report string stays in lockstep with the real FA count.
+    // matrix so every report string stays in lockstep with the measured count.
     let noise_overlap_total_variants: usize = noise_overlap_results
         .iter()
         .map(|(_, _, detail)| detail.len())
@@ -7306,8 +5619,7 @@ pub(crate) fn run_internal() {
         .sum();
     let shared_fa_count = unrelated_metrics.false_accepts.len()
         + silence_metric.false_accepts.len()
-        + noise_false_accepts.len()
-        + noise_overlap_cross_speaker_fas;
+        + noise_false_accepts.len();
 
     // Per-tier confusable FA counts
     let conf_fa_counts = [
@@ -7359,8 +5671,6 @@ pub(crate) fn run_internal() {
         |mut acc, m| {
             acc.total_variants += m.total_variants;
             acc.classifier_triggers += m.classifier_triggers;
-            acc.warmup_suppressed += m.warmup_suppressed;
-            acc.verifier_caught += m.verifier_caught;
             acc.full_pipeline_fa += m.full_pipeline_fa;
             acc
         },
@@ -7387,9 +5697,9 @@ pub(crate) fn run_internal() {
         } else {
             (pos_metrics.detected, pos_metrics.total)
         };
-    // Whether the enrolled-speaker phase (Phase 8d) actually ran.  When it did
+    // Whether the enrolled-speaker phase (Phase 7d) actually ran.  When it did
     // not (degenerate classifier / F1 clip unavailable), enrolled_detected/
-    // enrolled_total fall back to Phase-8 counts (the same-speaker
+    // enrolled_total fall back to Phase-7 counts (the same-speaker
     // enrollment-split clips under the re-scope).  The MIN_DETECTION_RATE
     // suggestion and the ratchet guard are skipped in that case so a
     // degenerate run cannot print a ratchet-to-zero 0.0 suggestion (mahbot-1008
@@ -7398,42 +5708,6 @@ pub(crate) fn run_internal() {
         .as_ref()
         .and_then(|r| r.get("acceptance"))
         .is_some();
-
-    // ── Verifier recall on wake-word variants (mahbot-1008 Fix 6) ──
-    // The pre-fix verifier accepted 0/17 positive variants (constant 6.67e-8
-    // reject-all) while the benchmark reported the 0% detection rate without a
-    // verifier-recall signal.  Compute the accept rate over variants the
-    // verifier actually evaluated.  The positive class is the
-    // ENROLLED speaker's wake word (Phase 8d held-out recall set).
-    // Computed before the report so both the human-readable report and the JSON
-    // output use the same value.
-    let verifier_recall_rate = if let Some(arr) = enrolled_report
-        .as_ref()
-        .and_then(|r| r.get("per_variant"))
-        .and_then(serde_json::Value::as_array)
-        .filter(|arr| !arr.is_empty())
-    {
-        // Held-out recall clips: the verifier is evaluated on every clip;
-        // accepted = verifier peak >= the constant 0.86 acceptance floor.
-        let evaluated = arr.len();
-        let accepted = arr
-            .iter()
-            .filter(|v| {
-                v.get("verifier_peak")
-                    .and_then(serde_json::Value::as_f64)
-                    .is_some_and(|p| {
-                        p >= f64::from(crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR)
-                    })
-            })
-            .count();
-        if evaluated == 0 {
-            None
-        } else {
-            Some((accepted, evaluated))
-        }
-    } else {
-        verifier_recall(&pos_metrics.per_variant)
-    };
 
     info!("══════════════════════════════════════════════");
     info!("      Voice Pipeline E2E Benchmark Results");
@@ -7455,37 +5729,6 @@ pub(crate) fn run_internal() {
         enrolled_total,
         MIN_DETECTION_RATE * 100.0,
     );
-    // ── Verifier recall report (mahbot-1008 Fix 6) ──
-    // Report-only warning (mahbot-953 precedent): a verifier that rejects most
-    // genuine wake words it evaluates is a brick wall regardless of the
-    // overall detection rate.  An untrained (no-op) verifier reports N/A —
-    // there is no gate to measure.
-    match verifier_recall_rate {
-        Some((accepted, evaluated)) => {
-            let r = accepted as f64 / evaluated as f64;
-            info!(
-                "Verifier recall: {:.1}% ({accepted}/{evaluated}) — minimum ≥{:.0}% \
-                 (over variants the verifier actually evaluated)",
-                r * 100.0,
-                VERIFIER_RECALL_MIN * 100.0,
-            );
-            if r < VERIFIER_RECALL_MIN {
-                warn!(
-                    "Verifier recall BELOW minimum: {:.1}% < {:.0}% (mahbot-1008 Fix 6). \
-                     The verifier rejects too many genuine wake words — check the \
-                     verifier_diagnostics.training block for held-out TPR.",
-                    r * 100.0,
-                    VERIFIER_RECALL_MIN * 100.0,
-                );
-            }
-        }
-        None => {
-            info!(
-                "Verifier recall: N/A (verifier untrained or no variant reached the \
-                 verifier gate) — no second-stage gate was active for these variants."
-            );
-        }
-    }
     info!(
         "Confusable false accepts: easy={} (limit ≤{}), medium={} (limit ≤{}), hard={} (limit ≤{})",
         conf_fa_counts[0],
@@ -7536,21 +5779,12 @@ pub(crate) fn run_internal() {
     info!("──────────────────────────────────────────────");
     info!("  Classifier trigger metrics (negative phases):");
 
-    let pr = |ct: &ClassifierTriggerMetrics| -> String {
-        match ct.prevention_rate() {
-            Some(r) => format!("{:.0}%", r * 100.0),
-            None => "N/A".to_string(),
-        }
-    };
     let ct_line = |name: &str, ct: &ClassifierTriggerMetrics| -> String {
         format!(
-            "    {name}: {tr}/{tot} triggers, warmup_suppressed={ws}, verifier_caught={vc}, fa={fa}, prevention={pr}",
+            "    {name}: {tr}/{tot} triggers, fa={fa}",
             tr = ct.classifier_triggers,
             tot = ct.total_variants,
-            ws = ct.warmup_suppressed,
-            vc = ct.verifier_caught,
             fa = ct.full_pipeline_fa,
-            pr = pr(ct),
         )
     };
     info!("{}", ct_line("Confusable", &conf_classifier));
@@ -7588,204 +5822,30 @@ pub(crate) fn run_internal() {
     info!("Enrollment consistency: validated by finalize_enrollment (Phase 4)");
     info!("══════════════════════════════════════════════");
 
-    // ── Phase 15 timing ─────────────────────────────────
+    // ── Phase 14 timing ─────────────────────────────────
     phase_times[P_TEARDOWN] = phase_end_ms!();
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Post-hoc verifier threshold analysis (mahbot-997)
-    // ═══════════════════════════════════════════════════════════════════════
-
-    // Collect positive verifier scores for post-hoc optimal threshold sweep.
-    // The positive class is the enrolled speaker's held-out
-    // recall set (per_variant verifier peaks from Phase 8d).  When the
-    // enrolled phase did not run (degenerate classifier / F1 clip unavailable)
-    // it falls back to the Phase-8 peaks (degraded — same-speaker
-    // enrollment-split clips).
-    let pos_verifier_scores: Vec<f32> = enrolled_report
-        .as_ref()
-        .and_then(|r| r.get("per_variant"))
-        .and_then(serde_json::Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.get("verifier_peak"))
-                .filter_map(serde_json::Value::as_f64)
-                .map(|p| p as f32)
-                .collect::<Vec<f32>>()
-        })
-        .filter(|scores: &Vec<f32>| !scores.is_empty())
-        .unwrap_or_else(|| {
-            pos_metrics
-                .per_variant
-                .iter()
-                .map(|pv| pv.verifier_score)
-                .collect()
-        });
-
-    let n_pos_total = pos_verifier_scores.len();
-    let benchmark_detection_rate = if enrolled_total > 0 {
-        // Enrolled-speaker end-to-end detection rate (the true positive class,
-        // mahbot-1025 reclassification).
-        enrolled_detected as f64 / enrolled_total as f64
-    } else if n_pos_total > 0 {
-        pos_metrics.detected as f64 / n_pos_total as f64
-    } else {
-        0.0
-    };
-
-    // Collect negative verifier scores across ALL negative categories so the
-    // threshold sweep accounts for false-accept impact (mahbot-1005 §7).  The
-    // old sweep optimised positives only, which is blind to false accepts.
-    let mut neg_verifier_scores: Vec<f32> = Vec::new();
-    for pv in &conf_metrics.per_variant {
-        neg_verifier_scores.push(pv.verifier_score);
-    }
-    for pv in &unrelated_metrics.per_variant {
-        neg_verifier_scores.push(pv.verifier_score);
-    }
-    for pv in &silence_metric.per_variant {
-        neg_verifier_scores.push(pv.verifier_score);
-    }
-    for metric in &noise_metrics {
-        for pv in &metric.per_variant {
-            neg_verifier_scores.push(pv.verifier_score);
-        }
-    }
-    let n_neg_total = neg_verifier_scores.len();
-
-    // ── Dual sweep (mahbot-1005 §7) ────────────────────────────────────────
-    // Sweep BOTH positives and negatives, mirroring the training calibration:
-    // maximise TPR - λ×FPR subject to TPR ≥ 0.90, preferring higher thresholds
-    // on ties (fewer false accepts).  This replaces the positives-only sweep
-    // that ignored false-accept impact entirely.
-    let sweep_steps = (1.0 / CALIBRATION_SWEEP_STEP).round() as usize + 1;
-    let mut benchmark_dual_threshold = verifier_training_threshold;
-    let mut dual_sweep_dr = benchmark_detection_rate;
-    let mut dual_sweep_far = if n_neg_total > 0 { 1.0 } else { 0.0 };
-    if n_pos_total > 0 {
-        let mut best_youden = f64::NEG_INFINITY;
-        for step in 0..sweep_steps {
-            let t = step as f32 * CALIBRATION_SWEEP_STEP;
-            let tp = pos_verifier_scores.iter().filter(|&&s| s >= t).count();
-            let fp = neg_verifier_scores.iter().filter(|&&s| s >= t).count();
-            let tpr = tp as f64 / n_pos_total as f64;
-            let fpr = if n_neg_total > 0 {
-                fp as f64 / n_neg_total as f64
-            } else {
-                0.0
-            };
-            let youden = tpr - f64::from(CALIBRATION_LAMBDA) * fpr;
-            let feasible = tpr >= 0.90;
-            // Lexicographic maximisation over (Youden, threshold): prefer the
-            // higher Youden, breaking ties toward the higher threshold (fewer
-            // false accepts).  Tuple comparison avoids clippy::float_cmp on
-            // the original `youden == best_youden` tie-break.
-            let candidate = (youden, f64::from(t));
-            let best = (best_youden, f64::from(benchmark_dual_threshold));
-            if feasible && candidate > best {
-                best_youden = youden;
-                benchmark_dual_threshold = t;
-                dual_sweep_dr = tpr;
-                dual_sweep_far = fpr;
-            }
-        }
-    }
-
-    // Compute the suggested MIN_DETECTION_RATE constant.
-    // Formula: floor(mean_rate / 0.2) × 0.2, where mean_rate is the detection
-    // rate from this benchmark run.  Granularity 0.2 (20%) reflects the
-    // ~17-variant test set where each miss costs ~6 percentage points.
-    // The rate is the ENROLLED-SPEAKER held-out recall (24 clips
-    // — each miss costs ~4 points); the suggestion is report-only and the
-    // ratchet guard below never lowers the constant on a failing run.
-    let computed_min_dr: Option<f64> = if enrolled_phase_ran && enrolled_total > 0 {
-        // The enrolled-speaker held-out recall is the true single-speaker
-        // positive signal (re-scope); the suggestion is
-        // only meaningful when that phase actually ran.  Add epsilon before
-        // floor() to guard against IEEE 754 imprecision: e.g., 0.80 / 0.2 =
-        // 3.999999... would floor to 3 without epsilon.
-        let dr_f64 = enrolled_detected as f64 / enrolled_total as f64;
-        Some(((dr_f64 / 0.2 + 1e-12).floor() * 0.2 * 1000.0).round() / 1000.0)
-    } else {
-        None
-    };
-
-    let threshold_divergence = (benchmark_dual_threshold - verifier_training_threshold).abs();
-
-    info!(
-        "Verifier threshold analysis (mahbot-997): \
-         training_threshold={verifier_training_threshold:.4}, \
-         benchmark-optimal threshold (post-hoc dual sweep)={benchmark_dual_threshold:.4}, \
-         divergence={threshold_divergence:.4}",
-    );
-    if let Some(computed_min_dr) = computed_min_dr {
-        info!(
-            "MIN_DETECTION_RATE hint: current_constant={MIN_DETECTION_RATE:.2}, \
-             computed={computed_min_dr:.3} (= floor({:.3} / 0.2) × 0.2).  \
-             Update MIN_DETECTION_RATE constant if this run is representative.",
-            benchmark_detection_rate,
-        );
-    } else {
-        info!(
-            "MIN_DETECTION_RATE hint skipped: enrolled-speaker phase did not run — \
-             no positive detection signal to suggest a rate from (mahbot-1025).",
-        );
-    }
-    // ── Ratchet guard (mahbot-1008) ──
-    // The mahbot-997 auto-suggestion formula floors to 0.0 on failing runs,
-    // which would endorse 0% detection as passing by ratcheting the constant
-    // toward zero.  A failing run must never lower the bar.  Guarded on the
-    // enrolled phase actually running: when it did not, benchmark_detection_rate
-    // is the cross-speaker fallback (negatives, ~0), which is not a meaningful
-    // positive rate and must not trigger the warning.
-    if enrolled_phase_ran && benchmark_detection_rate < MIN_DETECTION_RATE {
-        warn!(
-            "Detection rate {:.1}% is BELOW the current MIN_DETECTION_RATE constant \
-             ({:.0}%) — do NOT lower MIN_DETECTION_RATE based on this failing run \
-             (mahbot-1008 ratchet guard).",
-            benchmark_detection_rate * 100.0,
-            MIN_DETECTION_RATE * 100.0,
-        );
-    }
-
-    // If training-optimal and benchmark-optimal thresholds diverge by >0.05,
-    // suggest λ adjustment in Stage 1 calibration.
-    if verifier.is_trained() && threshold_divergence > 0.05 {
-        let suggested_lambda =
-            CALIBRATION_LAMBDA * (benchmark_dual_threshold / verifier_training_threshold);
-        warn!(
-            "Verifier threshold divergence > 0.05: training={verifier_training_threshold:.4} vs \
-             benchmark={benchmark_dual_threshold:.4} (Δ={threshold_divergence:.4}).  \
-             Consider adjusting Stage 1 λ from {CALIBRATION_LAMBDA:.1} to ~{suggested_lambda:.1} \
-             (λ_new = λ_old × benchmark_threshold / training_threshold).  \
-             Re-run benchmark to validate.",
-        );
-    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // JSON metrics output
     // ═══════════════════════════════════════════════════════════════════════
 
-    // Noise-overlap: under the mahbot-1025 reclassification the noise_overlap
-    // cells are in-distribution verifier regression canaries (non-enrolled
-    // speakers' wake words, single-speaker semantics) — any detection is a
-    // FALSE ACCEPT, and the acceptance protocol requires
-    // 0/{noise_overlap_total_variants} per fresh run.  The per-cell rate is
-    // reported and the canary FA count joins the official FA tally
-    // (`noise_overlap_cross_speaker_fas` above).  Warnings only — report-only
-    // (mahbot-953).
+    // Noise-overlap canary + held-out probe matrices: speaker-blindness
+    // DIAGNOSTICS — cross-speaker wake-word detections are correct behaviour
+    // (high detection expected), so these report rates without warnings and do
+    // NOT count into total_false_accepts.
     warn_fa_cells(
         "Noise-overlap in-distribution canary",
         &noise_overlap_results,
         noise_overlap_total_variants,
         "",
+        false,
     );
-    // held-out probe FAs (reserved voices — honest generalization
-    // probes).  Any detection here is a genuine cross-speaker acceptance.
     warn_fa_cells(
         "Cross-speaker probe",
         &probe_overlap_results,
         probe_total_variants,
         "; reserved voices",
+        false,
     );
 
     // NOTE: all pass/fail gating was removed in mahbot-953.  Threshold checks
@@ -7797,8 +5857,7 @@ pub(crate) fn run_internal() {
     // Build the JSON output
     // Build per-variant negative diagnostics with FULL per-variant detail
     // (mahbot-1005 §9).  Confusable variants are always tier-qualified
-    // (mahbot-871).  The flat list is reused for score distributions,
-    // verifier histograms, and rejection margins below.
+    // (mahbot-871).  The flat list is reused for score distributions below.
     let mut all_neg_pv: Vec<(&PerVariantResult, String)> = Vec::new();
     for pv in &conf_metrics.per_variant {
         let phrase = phrase_from_label(&pv.variant, "confusable");
@@ -7843,8 +5902,8 @@ pub(crate) fn run_internal() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // mahbot-1005 diagnostics: verdicts, distributions, verifier evidence,
-    // train/test alignment, and reproducibility metadata
+    // mahbot-1005 diagnostics: verdicts, distributions, train/test alignment,
+    // and reproducibility metadata
     // ═══════════════════════════════════════════════════════════════════════
 
     // ── Exhaustive per-variant verdicts for positives (§2) ──
@@ -7892,86 +5951,6 @@ pub(crate) fn run_internal() {
             .count();
         (total_frames, above_threshold)
     };
-
-    // ── Verifier evidence (§4) ──
-    // Per-category verifier peak-score histograms over [0,1] with 20 buckets.
-    let verifier_hist_buckets = 20usize;
-    let mut verifier_hist: std::collections::BTreeMap<String, serde_json::Value> =
-        std::collections::BTreeMap::new();
-    let pos_vscores: Vec<f32> = pos_metrics
-        .per_variant
-        .iter()
-        .map(|pv| pv.verifier_score)
-        .collect();
-    verifier_hist.insert(
-        "positive".to_string(),
-        serde_json::json!({
-            "histogram": histogram_buckets(&pos_vscores, verifier_hist_buckets, 0.0, 1.0),
-            "deciles": deciles(&pos_vscores),
-            "n": pos_vscores.len(),
-        }),
-    );
-    for cat in [
-        "confusable_easy",
-        "confusable_medium",
-        "confusable_hard",
-        "unrelated",
-        "silence",
-        "noise",
-    ] {
-        let scores: Vec<f32> = all_neg_pv
-            .iter()
-            .filter(|(_, c)| c == cat)
-            .map(|(pv, _)| pv.verifier_score)
-            .collect();
-        verifier_hist.insert(
-            cat.to_string(),
-            serde_json::json!({
-                "histogram": histogram_buckets(&scores, verifier_hist_buckets, 0.0, 1.0),
-                "deciles": deciles(&scores),
-                "n": scores.len(),
-            }),
-        );
-    }
-
-    // Candidate lifecycle totals across all positive + negative variants.
-    let candidate_lifecycle = {
-        let mut created = 0usize;
-        let mut confirmed = 0usize;
-        let mut expired = 0usize;
-        for pv in pos_metrics
-            .per_variant
-            .iter()
-            .chain(all_neg_pv.iter().map(|(pv, _)| *pv))
-        {
-            created += pv.candidates_created;
-            confirmed += pv.candidates_confirmed;
-            expired += pv.candidates_expired;
-        }
-        serde_json::json!({ "created": created, "confirmed": confirmed, "expired": expired })
-    };
-
-    // Rejection margins (threshold − verifier_peak) for variants that were
-    // evaluated by a trained verifier and rejected (peak below threshold).
-    let rejection_margins: Vec<serde_json::Value> = pos_metrics
-        .per_variant
-        .iter()
-        .chain(all_neg_pv.iter().map(|(pv, _)| *pv))
-        .filter(|pv| {
-            pv.verifier_trained
-                && !pv.detected
-                && pv.verifier_score < pv.verifier_threshold
-                && pv.verifier_score > 0.0
-        })
-        .map(|pv| {
-            serde_json::json!({
-                "variant": pv.variant,
-                "verifier_peak": pv.verifier_score,
-                "threshold": pv.verifier_threshold,
-                "margin": pv.verifier_threshold - pv.verifier_score,
-            })
-        })
-        .collect();
 
     // ── Per-augmentation detection rates (§6) ──
     // Discloses whether the tail-of-list 2/3-1/3 split (by list order) biases
@@ -8138,24 +6117,12 @@ pub(crate) fn run_internal() {
             "canary_styles": voice_allocation.canaries,
             "reserved_probe_styles": voice_allocation.reserved,
             "note": "Single-voice allocation: the enrolled voice is the \
-                     only voice in enrollment / owner negatives / verifier positives; \
+                     only voice in enrollment / owner negatives; \
                      the reserved probe voices are absent from EVERY training path.",
         },
         "seeds": {
             // Classifier seed is fixed inside finalize_enrollment (voice.rs).
             "classifier": 0,
-            // mahbot-1025: the verifier is a multi-seed ensemble — one base
-            // seed per run with VERIFIER_ENSEMBLE_SEEDS member seeds derived
-            // deterministically from it; predict() = member mean.  Phase 0
-            // (mahbot-1081): the base seed is pinnable via
-            // MAHBOT_VOICE_BENCH_VERIFIER_SEED — a pinned seed reproduces
-            // byte-identical verifier weights (validated by the
-            // weights_fingerprints report key); unset preserves per-run entropy.
-            "verifier_ensemble_members": crate::audio::voice_verifier::VERIFIER_ENSEMBLE_SEEDS,
-            "verifier_base_seed": match verifier_base_seed {
-                Some(seed) => serde_json::Value::String(format!("pinned:{seed}")),
-                None => serde_json::Value::String("entropy (per run, never pinned)".to_string()),
-            },
             "tts_warmup": 947,
         },
         "wake_phrase": {
@@ -8186,7 +6153,6 @@ pub(crate) fn run_internal() {
         "geometry_constants": {
             "window_size": crate::audio::wake_word_classifier::WINDOW_SIZE,
             "embedding_ring_max": super::EMBEDDING_RING_MAX,
-            "verifier_window_size": crate::VERIFIER_WINDOW_SIZE,
         },
         "warmup_source": warmup_source,
         // mahbot-1045 Phase B alignment probes (report-only, additive).
@@ -8242,8 +6208,7 @@ pub(crate) fn run_internal() {
         "total_misses": pos_metrics.total - pos_metrics.detected,
         // mahbot-1006 D: cold-start pass — fresh PipelineCtx per variant,
         // no consume_warmup, fresh AdaptiveThresholdState::new() bootstrap.
-        // Measures production's post-silence start where the first
-        // VERIFIER_WARMUP_EMBEDDINGS embeddings are suppressed.
+        // Measures production's post-silence start.
         "cold_rate": if cold_metrics.total > 0 {
             serde_json::Value::from(cold_metrics.detection_rate())
         } else {
@@ -8338,13 +6303,11 @@ pub(crate) fn run_internal() {
         },
     });
 
-    // noise_overlap restructured into two labeled sections —
-    // the trained-in canary matrix (in-distribution verifier regression
-    // canaries, kept from mahbot-1025) and the held-out reserved-voice probe
-    // matrix (honest cross-speaker generalization probes).  The canary FA
-    // tally feeds false_accepts.noise_overlap_cross_speaker (unchanged key,
-    // relabeled); the probe FA tally feeds false_accepts.cross_speaker_probes
-    // (additive key).
+    // noise_overlap restructured into two labeled sections — the trained-in
+    // canary matrix and the held-out reserved-voice probe matrix.  Both are
+    // speaker-blindness DIAGNOSTICS (cross-speaker wake-word detections are
+    // correct behaviour — high detection expected), reported without pass/fail
+    // semantics and NOT counted into total_false_accepts.
     let cell_json = |(key, rate, detail): &(String, f64, Vec<serde_json::Value>)| {
         let fas = detail
             .iter()
@@ -8374,58 +6337,27 @@ pub(crate) fn run_internal() {
         },
         "note": format!(
             "in_distribution_canaries = trained-in M2/M3 wake-word clips under the \
-             13-cell noise matrix (in-distribution verifier regression canaries, \
-             mahbot-1025 — any detection is a trained-in regression signal, target \
-             {canary_target} per run).  held_out_probes = RESERVED \
-             voices (absent from every training path) at unseen seeds across clean + \
-             10/20 dB white (honest cross-speaker generalization probes — \
-             target {probe_target} per run; counted in \
-             false_accepts.cross_speaker_probes).  Both are report-only: the red \
-             canary state must not be hidden by the relabeling.",
-            canary_target = if voice_allocation.canaries.is_empty() {
-                "n/a (no canary voices on this machine)"
-            } else {
-                "0/{noise_overlap_total_variants}"
-            },
-            probe_target = if voice_allocation.reserved.is_empty() {
-                "n/a (no reserved probe voices on this machine)"
-            } else {
-                "0/{probe_total_variants}"
-            },
+             13-cell noise matrix (kept from mahbot-1025; any detection is a \
+             trained-in speaker-blindness diagnostic).  held_out_probes = \
+             RESERVED voices (absent from every training path) at unseen seeds \
+             across clean + 10/20 dB white (honest cross-speaker \
+             generalization probes).  Both are DIAGNOSTICS: speaker-blind \
+             detection means a non-enrolled voice's wake word fires — high \
+             detection is expected and healthy; low detection is reportable, \
+             never a failure.  Measured {canary_total} canary + \
+             {probe_total} probe cells this run.",
+            canary_total = noise_overlap_total_variants,
+            probe_total = probe_total_variants,
         ),
     });
 
-    // mahbot-1023: enrolled-speaker phase (Phase 8d) + safety gate (item 7).
+    // mahbot-1023: enrolled-speaker phase (Phase 7d) + safety gate (item 7).
     // The safety gate measures the false-positive impact of the deferred
     // in-distribution windows (burst + boundary double-scoring) on the
     // negative/confusable set; baseline 9/59 gate crossings / 0 FAs.
     let enrolled_json = enrolled_report.unwrap_or_else(|| {
         serde_json::json!({"note": "Enrolled-speaker phase skipped (degenerate classifier or F1 clip unavailable)"})
     });
-    // mahbot-1025: hoist the per-member speed_down peaks from the enrolled
-    // report into the top-level verifier_diagnostics (the variance-reduction
-    // gate).  Defaults: empty peaks / miss fraction 0 when the phase was
-    // skipped.  The miss fraction is read from the enrolled report itself
-    // (single source of truth — it already excludes untrained members and
-    // fails closed at 1.0 when no trained member was measurable), not
-    // recomputed here.
-    let (speed_down_member_peaks, speed_down_member_miss_fraction): (Vec<f32>, f32) = enrolled_json
-        .get("acceptance")
-        .and_then(|a| a.get("speed_down_member_peaks"))
-        .and_then(|p| p.as_array())
-        .map(|arr| {
-            let peaks: Vec<f32> = arr
-                .iter()
-                .filter_map(|v| v.as_f64().map(|x| x as f32))
-                .collect();
-            let miss = enrolled_json
-                .get("acceptance")
-                .and_then(|a| a.get("speed_down_member_miss_fraction"))
-                .and_then(serde_json::Value::as_f64)
-                .map_or(0.0, |m| m as f32);
-            (peaks, miss)
-        })
-        .unwrap_or_default();
     let safety_gate_json = safety_gate(&all_neg_pv);
 
     // Total wall time — the whole run (start → report emission), report-
@@ -8446,56 +6378,38 @@ pub(crate) fn run_internal() {
              misleading.  Compare against the limits in 'results' instead. \
              mahbot-1006 aligned the benchmark's training/inference \
              processing with production (AGC→augment ordering, cold-start \
-             pass, CONFIG-driven preprocessor, preprocessed negatives, \
-             verifier seed None) — detection/FA numbers are NOT directly \
-             comparable to the mahbot-1004/948 baselines.  mahbot-1025: \
-             the verifier is now a {}-member multi-seed ensemble (entropy \
-             base seed per run, member seeds derived deterministically); \
-             the M2-M5 wake-word clips (clean + 10/20 dB white/pink) joined \
-             the verifier negative set as IN-DISTRIBUTION VERIFIER REGRESSION \
-             CANARIES (trained-in clips, NOT cross-speaker generalization \
-             probes), and the noise_overlap cells are official FA canaries.  \
-             The bench-leanness cleanup removed the same-audio (8b) and \
-             B-sweep (8c) report-only phases; the enrolled-speaker \
-             phase (8d) remains the only pre-canary mutator of the shared \
-             VAD detector, so Phase 9-12 FA-canary numbers are NOT strictly \
-             comparable to pre-change baselines (the prior drift disclosure \
-             covered the cumulative 8b+8c+8d state).  A later leanness pass \
-             removed the B2 synthetic-fallback probe, the train/test-alignment \
-             cosine diagnostics, and the dead top-level latency section \
-             (report-only; total_wall_time_ms is the auditable run-time \
-             surface), and trimmed 2 of 3 byte-identical infinite-SNR clean \
-             cells from noise_overlap — the remaining cells share the same \
-             in-phase adaptive trajectory as before, but cross-run FA-canary \
-             comparability is slightly shifted (all detections are 0/20, so \
-             the impact is cosmetic).  mahbot-1081 (Phase 0, additive keys): \
+             pass, CONFIG-driven preprocessor, preprocessed negatives) — \
+             detection/FA numbers are NOT directly comparable to the \
+             mahbot-1004/948 baselines.  The speaker-verifier stage, the \
+             classifier-candidate machinery, warm-up suppression, and all \
+             model fingerprinting were removed; detection is immediate-fire \
+             and speaker-blind.  total_false_accepts semantics changed: the \
+             pre-change 13 (all canary-matrix cross-speaker detections) is \
+             now 0, because cross-speaker wake-word detections are CORRECT \
+             speaker-blind behaviour reported as DIAGNOSTICS \
+             (noise_overlap / false_accepts.cross_speaker_probes), with no \
+             pass/fail semantics (high detection expected; low detection is \
+             reportable, not a failure).  Pre-change archives were deleted — \
+             cross_run covers only current-format reports.  The \
+             bench-leanness cleanup removed the same-audio (8b) and B-sweep \
+             (8c) report-only phases.  mahbot-1081 (Phase 0, additive keys): \
              the bench now synthesizes and tests the deployed config-store \
-             wake phrase (reproducibility.wake_phrase), surfaces the \
+             wake phrase (reproducibility.wake_phrase) and surfaces the \
              deployability verdict (top-level deployability — informational, \
-             the bench never hard-gates), summarizes the last 3 archived runs \
-              (top-level cross_run), pins the verifier seed via \
-              MAHBOT_VOICE_BENCH_VERIFIER_SEED (byte-identical weights, \
-              validated by weights_fingerprints) and reports per-metric \
-              distributions under MAHBOT_VOICE_BENCH_MULTI_SEED=N (top-level \
-              multi_seed, env-gated).  Phase 1, re-baselining \
-              DISCLOSED): single-voice enrollment (the enrolled speaker is \
-              ONE TTS voice with guided-prompt DSP conditioning instead of 10 \
-              rotated voices — weights fingerprints and all detection/FA \
-              numbers re-baseline, expected); the enrolled-speaker acceptance \
-              basis moved from the F1 training clip's 5 augmentations to a \
-              HELD-OUT recall set (unseen enrolled-voice renderings, wake-alone \
-              + embedded, Wilson CI reported); cross-speaker rejection is now \
-              honest (M4/M5 reserved voices absent from every training path, \
-              tested at unseen seeds — false_accepts.cross_speaker_probes); \
-              the trained-in canaries shrank from M2-M5 to M2/M3 (relabeled \
-              in-distribution canaries, still reported red — not hidden); the \
-              confusable/unrelated negative pools are built bench-locally over \
-              the negative-pool styles (production's all-voice prewarm would \
-              train the reserved voices in); the benchmark-local embedding \
-              cache keys match production's, so warm-run cost is unchanged.  \
-              First run after the change pays one-time TTS synthesis for the \
-              new held-out/probe/canary clips (outside the warm budget).",
-            crate::audio::voice_verifier::VERIFIER_ENSEMBLE_SEEDS,
+             the bench never hard-gates).  Single-voice enrollment (the \
+             enrolled speaker is ONE TTS voice with guided-prompt DSP \
+             conditioning instead of 10 rotated voices — all detection/FA \
+             numbers re-baseline, expected); the enrolled-speaker acceptance \
+             basis is a HELD-OUT recall set (unseen enrolled-voice renderings, \
+             wake-alone + embedded, Wilson CI reported); the M4/M5 reserved \
+             voices are absent from every training path and probed at unseen \
+             seeds as diagnostics; the confusable/unrelated negative pools \
+             are built bench-locally over the negative-pool styles \
+             (production's all-voice prewarm would train the reserved voices \
+             in); the benchmark-local embedding cache keys match production's, \
+             so warm-run cost is unchanged.  First run after the change pays \
+             one-time TTS synthesis for the new held-out/probe/canary clips \
+             (outside the warm budget)."
         ),
         "total_false_accepts": total_false_accepts,
         // additive: single-voice enrollment disclosure — voice
@@ -8552,31 +6466,11 @@ pub(crate) fn run_internal() {
             "unrelated": unrelated_metrics.false_accepts.len(),
             "silence": silence_metric.false_accepts.len(),
             "noise": noise_false_accepts.len(),
-            // Official FA canaries — any detection of a
-            // non-enrolled speaker's wake word in the trained-in canary cells
-            // (in-distribution verifier regression canaries, NOT cross-speaker
-            // generalization probes; the M2-M5 matrix shrank to M2/M3 so M4/M5
-            // could become the reserved held-out voices).
-            "noise_overlap_cross_speaker": noise_overlap_cross_speaker_fas,
-            "noise_overlap_cross_speaker_target": if voice_allocation.canaries.is_empty() {
-                "n/a — no canary voices on this machine (fewer than 8 TTS styles)".to_string()
-            } else {
-                format!(
-                    "0/{noise_overlap_total_variants} per fresh run (across all three runs)"
-                )
-            },
-            // honest cross-speaker generalization probes — the
-            // RESERVED voices (absent from every training path) at unseen
-            // seeds across clean + 10/20 dB white.  Additive key: the
-            // historical total_false_accepts stays comparable (it counts the
-            // trained-in canaries only).
+            // Speaker-blindness DIAGNOSTICS (not false accepts): cross-speaker
+            // wake-word detections are correct behaviour, so these counts do
+            // NOT feed total_false_accepts.
+            "noise_overlap_cross_speaker": noise_overlap_detections,
             "cross_speaker_probes": probe_fa_count,
-            "cross_speaker_probes_target": if voice_allocation.reserved.is_empty() {
-                "n/a — no reserved probe voices on this machine (fewer than 10 TTS styles)"
-                    .to_string()
-            } else {
-                format!("0/{probe_total_variants} per fresh run (reserved voices)")
-            },
             "total": total_false_accepts,
         },
         "classifier_trigger_metrics": classifier_trigger_json,
@@ -8585,17 +6479,16 @@ pub(crate) fn run_internal() {
             "phase_2_vad_enrollment_ms": phase_times[P_VAD_ENROLLMENT],
             "phase_3_negative_training_data_ms": phase_times[P_NEG_TRAINING_DATA],
             "phase_4_classifier_training_ms": phase_times[P_CLASSIFIER_TRAINING],
-            "phase_5_voice_verifier_training_ms": phase_times[P_VERIFIER_TRAINING],
-            "phase_6_global_state_setup_ms": phase_times[P_GLOBAL_STATE],
-            "phase_7_streaming_detection_setup_ms": phase_times[P_STREAMING_SETUP],
-            "phase_8_positive_variants_ms": phase_times[P_POSITIVE_VARIANTS],
-            "phase_9_confusable_negatives_ms": phase_times[P_CONFUSABLE_NEGATIVES],
-            "phase_10_unrelated_negatives_ms": phase_times[P_UNRELATED_NEGATIVES],
-            "phase_11_silence_negatives_ms": phase_times[P_SILENCE_NEGATIVES],
-            "phase_12_noise_profiles_ms": phase_times[P_NOISE_PROFILES],
-            "phase_13_cooldown_ms": phase_times[P_COOLDOWN],
-            "phase_14_noise_overlap_ms": phase_times[P_NOISE_OVERLAP],
-            "phase_15_teardown_ms": phase_times[P_TEARDOWN],
+            "phase_5_global_state_setup_ms": phase_times[P_GLOBAL_STATE],
+            "phase_6_streaming_detection_setup_ms": phase_times[P_STREAMING_SETUP],
+            "phase_7_positive_variants_ms": phase_times[P_POSITIVE_VARIANTS],
+            "phase_8_confusable_negatives_ms": phase_times[P_CONFUSABLE_NEGATIVES],
+            "phase_9_unrelated_negatives_ms": phase_times[P_UNRELATED_NEGATIVES],
+            "phase_10_silence_negatives_ms": phase_times[P_SILENCE_NEGATIVES],
+            "phase_11_noise_profiles_ms": phase_times[P_NOISE_PROFILES],
+            "phase_12_cooldown_ms": phase_times[P_COOLDOWN],
+            "phase_13_noise_overlap_ms": phase_times[P_NOISE_OVERLAP],
+            "phase_14_teardown_ms": phase_times[P_TEARDOWN],
         },
         "per_variant_results": serde_json::Value::Array(
             pos_metrics
@@ -8624,90 +6517,6 @@ pub(crate) fn run_internal() {
         "per_variant_negatives": serde_json::Value::Array(negative_pv),
         "noise_overlap": noise_overlap_json,
         "classifier_diagnostics": classifier_diagnostics_json,
-        "verifier_diagnostics": {
-            "trained": verifier.is_trained(),
-            "threshold": verifier_training_threshold,
-            // mahbot-1025: multi-seed ensemble size (1 = legacy single member).
-            "ensemble_size": verifier.ensemble_size(),
-            "ensemble_seeds": crate::audio::voice_verifier::VERIFIER_ENSEMBLE_SEEDS,
-            // mahbot-1025: per-member speed_down peak distribution (the
-            // variance-reduction gate).  Computed on the F1 speed_down variant
-            // through each member's standalone verifier; the fraction of
-            // members below VERIFIER_ACCEPTANCE_FLOOR is the per-run
-            // single-seed miss-probability estimate (target ≤0.15, band
-            // ~0.04–0.10).
-            "speed_down_member_peaks": speed_down_member_peaks,
-            "speed_down_member_miss_fraction": speed_down_member_miss_fraction,
-            // mahbot-1023: the acceptance gate is the constant 0.86 floor —
-            // `threshold` above is a report-only reference.
-            "effective_acceptance_threshold": crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR,
-            "recall": match verifier_recall_rate {
-                Some((accepted, evaluated)) => serde_json::json!({
-                    "accepted": accepted,
-                    "evaluated": evaluated,
-                    "rate": accepted as f64 / evaluated as f64,
-                    "minimum": VERIFIER_RECALL_MIN,
-                    "passes": (accepted as f64 / evaluated as f64) >= VERIFIER_RECALL_MIN,
-                }),
-                None => serde_json::json!({
-                    "accepted": 0,
-                    "evaluated": 0,
-                    "rate": null,
-                    "minimum": VERIFIER_RECALL_MIN,
-                    "passes": null,
-                    "note": "verifier untrained or no variant reached the verifier gate",
-                }),
-            },
-            "score_histograms": verifier_hist,
-            "candidate_lifecycle": candidate_lifecycle,
-            "rejection_margins": rejection_margins,
-            "training": {
-                "epochs_trained": verifier_metrics.epochs_trained,
-                "per_epoch_train_loss": verifier_metrics.per_epoch_train_loss,
-                "per_epoch_val_loss": verifier_metrics.per_epoch_val_loss,
-                "val_pos_score_mean": verifier_metrics.val_pos_score_mean,
-                "val_neg_score_mean": verifier_metrics.val_neg_score_mean,
-                "youden_index": verifier_metrics.youden_index,
-                "tpr_at_threshold": verifier_metrics.tpr,
-                "fpr_at_threshold": verifier_metrics.fpr,
-                "n_val_pos": verifier_metrics.n_val_pos,
-                "n_val_neg": verifier_metrics.n_val_neg,
-                "threshold_calibrated": verifier_metrics.threshold_calibrated,
-                "threshold_is_fallback": verifier_metrics.threshold_is_fallback,
-            },
-        },
-        "threshold_calibration": {
-            "verifier_trained": verifier.is_trained(),
-            "training_threshold": verifier_training_threshold,
-            // mahbot-1023: the runtime-calibrated / fallback threshold is a
-            // report-only reference — the confirmation gate uses the CONSTANT
-            // VERIFIER_ACCEPTANCE_FLOOR (0.86) in all cases (manager pin 1).
-            "effective_acceptance_threshold": crate::audio::voice_verifier::VERIFIER_ACCEPTANCE_FLOOR,
-            "note": "Effective acceptance threshold is the constant 0.86 \
-                     (VERIFIER_ACCEPTANCE_FLOOR) — the user-approved production \
-                     semantics — NOT the entropy-seeded runtime-calibrated value \
-                     reported above (which drifts across runs: 0.86 -> 0.91 on \
-                     two identical-code runs) and NOT the DEFAULT_VERIFIER_THRESHOLD \
-                     0.948 fallback.  The runtime values remain report-only so \
-                     threshold drift is reviewable over the >=3-run protocol.",
-            "benchmark_optimal_threshold_dual": benchmark_dual_threshold,
-            "dual_sweep_detection_rate_at_optimal": dual_sweep_dr,
-            "dual_sweep_false_accept_rate_at_optimal": dual_sweep_far,
-            "threshold_divergence": threshold_divergence,
-            "computed_min_detection_rate_suggestion": computed_min_dr,
-            "computed_min_detection_rate_note": match computed_min_dr {
-                Some(_) => format!(
-                    "= floor({benchmark_detection_rate:.3} / 0.2) × 0.2, from the \
-                     enrolled-speaker detection rate",
-                ),
-                None => "skipped — enrolled-speaker phase did not run (degenerate classifier \
-                         / F1 clip unavailable); the cross-speaker fallback is not a positive \
-                         signal (mahbot-1025)"
-                    .to_string(),
-            },
-            "current_min_detection_rate_constant": MIN_DETECTION_RATE,
-            "benchmark_detection_rate": benchmark_detection_rate,
-        },
         "per_augmentation_detection": per_augmentation,
         "cooldown": {
             "detection_time_ms": cooldown_detection_time_ms,
@@ -8727,10 +6536,7 @@ pub(crate) fn run_internal() {
                      detection_time_ms (mahbot-1052).",
         },
         "reproducibility": reproducibility,
-        // Classifier/verifier weight fingerprints relocated from the removed
-        // B-sweep section — byte-identical pure weight hashes.
-        "weights_fingerprints": weights_fingerprints_json,
-        // mahbot-1023: enrolled-speaker benchmark phase (Phase 8d) — F1's 5
+        // mahbot-1023: enrolled-speaker benchmark phase (Phase 7d) — F1's 5
         // raw-level augmentation variants through the real streaming cold
         // pass (in-sample / training-side control, NOT generalization).
         "enrolled_speaker": enrolled_json,
@@ -8740,7 +6546,6 @@ pub(crate) fn run_internal() {
         "config": {
             "num_enrollment_variants": NUM_ENROLLMENT_VARIANTS,
             "min_detection_rate": MIN_DETECTION_RATE,
-            "verifier_recall_min": VERIFIER_RECALL_MIN,
         }
     });
 
@@ -8768,13 +6573,13 @@ pub(crate) fn run_internal() {
         "default_run_budget_secs": "33-39 (observed envelope; criterion is the \
                                      upper bound — see budget_upper_bound_secs)",
         "budget_upper_bound_secs": 39.0,
-        "budget_met": if faph_report.is_some() || multi_seed_report.is_some() {
+        "budget_met": if faph_report.is_some() {
             serde_json::Value::Null
         } else {
             serde_json::Value::Bool(perf_wall_clock_secs <= 39.0)
         },
-        "note": if faph_report.is_some() || multi_seed_report.is_some() {
-            "Env-gated phases ran (FAPH / multi-seed) — the ~33-39s default-run budget \
+        "note": if faph_report.is_some() {
+            "Env-gated FAPH phase ran — the ~33-39s default-run budget \
              does not apply to this run."
                 .to_string()
         } else if perf_wall_clock_secs > 39.0 {
@@ -8794,10 +6599,6 @@ pub(crate) fn run_internal() {
     });
     if let Some(faph) = faph_report {
         json["faph"] = faph;
-    }
-    // Env-gated multi-seed distributions (MAHBOT_VOICE_BENCH_MULTI_SEED=N).
-    if let Some(ms) = multi_seed_report {
-        json["multi_seed"] = ms;
     }
 
     // Output delimited JSON for CI tooling
@@ -8881,14 +6682,6 @@ pub(crate) fn run_internal() {
     let fa_easy = conf_fa_by_tier[0].len();
     let fa_medium = conf_fa_by_tier[1].len();
     let fa_hard = conf_fa_by_tier[2].len();
-    // MIN_DR suggestion line: null (None) when the enrolled phase did not run
-    // — the cross-speaker fallback is not a positive signal to suggest from.
-    // Note: fractions are formatted as percentages (×100) — the banner is the
-    // human-readable acceptance report and must match the JSON values.
-    let min_dr_suggestion = computed_min_dr.map_or_else(
-        || "skipped (enrolled phase did not run)".to_string(),
-        |v| format!("{:.0}%", v * 100.0),
-    );
 
     eprintln!(
         "\n\
@@ -8898,8 +6691,7 @@ pub(crate) fn run_internal() {
          Date/Time:      {timestamp}\n\
          Tier:           Easy/Medium/Hard (per-tier limits)\n\
          Detection rate: {dr_pct:.1}% ({enrolled_detected}/{enrolled_total})  {dr_pass}\n\
-         MIN_DR target:  ≥{min_dr_const_pct:.0}% (suggestion: {min_dr_suggestion})\n\
-         Threshold:      training={verifier_training_threshold:.4}, dual-sweep-optimal={benchmark_dual_threshold:.4}\n\
+         MIN_DR target:  ≥{min_dr_const_pct:.0}% (report-only)\n\
          False accepts:\n\
            Confusable:\n\
              Easy:    {fa_easy}",
@@ -8934,10 +6726,7 @@ pub(crate) fn run_internal() {
         noise_limit = tier_limits(BenchTier::Hard).noise,
     );
     eprintln!(
-        "           Noise-overlap (in-distribution canaries): {cross_count}  {cross_mark} (target 0/{cross_target} per fresh run)",
-        cross_count = noise_overlap_cross_speaker_fas,
-        cross_mark = mk(noise_overlap_cross_speaker_fas == 0),
-        cross_target = noise_overlap_total_variants,
+        "           Cross-speaker diagnostics (speaker-blind, high expected): canaries {noise_overlap_detections}/{noise_overlap_total_variants}, probes {probe_fa_count}/{probe_total_variants}",
     );
     eprintln!(
         "           ───────────────────────────────────────\n\
@@ -8958,18 +6747,10 @@ pub(crate) fn run_internal() {
 
     // ── Classifier trigger summary (mahbot-952) ────────────────────────
     let ct_stderr = |ct: &ClassifierTriggerMetrics| -> String {
-        match ct.prevention_rate() {
-            Some(r) => format!(
-                "{}/{} triggers, ws={}, vc={}, fa={}, prevention={:.0}%",
-                ct.classifier_triggers,
-                ct.total_variants,
-                ct.warmup_suppressed,
-                ct.verifier_caught,
-                ct.full_pipeline_fa,
-                r * 100.0,
-            ),
-            None => format!("{}/{} triggers", ct.classifier_triggers, ct.total_variants),
-        }
+        format!(
+            "{}/{} triggers, fa={}",
+            ct.classifier_triggers, ct.total_variants, ct.full_pipeline_fa
+        )
     };
     eprintln!(
         "         Classifier triggers:\
@@ -9034,7 +6815,7 @@ pub(crate) fn run_internal() {
     // (zero detections = zero false accepts) (mahbot-911).
     // NOTE: report-only — warns instead of asserting (mahbot-953).
     // The positive class is the enrolled speaker's wake word,
-    // measured end-to-end by the Phase-8d held-out recall phase (detected_live).
+    // measured end-to-end by the Phase-7d held-out recall phase (detected_live).
     let (positive_detected, positive_total): (u64, u64) =
         (enrolled_detected as u64, enrolled_total as u64);
     if positive_detected == 0 {
@@ -9050,52 +6831,28 @@ pub(crate) fn run_internal() {
         );
     }
 
-    // Calibrated threshold check (mahbot-997).
-    // The verifier threshold is now auto-calibrated during training.  This
-    // informational section displays the benchmark-optimal threshold and the
-    // computed MIN_DETECTION_RATE suggestion (see dual-sweep analysis above).
-    // The "benchmark detection rate" is the enrolled-speaker
-    // held-out recall (the true single-speaker positive class).
+    // Enrolled-speaker held-out recall summary (report-only).
     let actual_dr = if enrolled_total > 0 {
         enrolled_detected as f64 / enrolled_total as f64
     } else {
         pos_metrics.detection_rate()
     };
-    let detected_total = (enrolled_detected, enrolled_total);
     if enrolled_phase_ran {
         info!(
-            "Verifier threshold status: trained={} auto-calibrated={:.4}, \
-             enrolled-speaker detection rate={:.1}% ({}/{}), \
-             benchmark-optimal (dual sweep)={benchmark_dual_threshold:.4}, \
-             computed MIN_DETECTION_RATE suggestion={}",
-            verifier.is_trained(),
-            verifier_training_threshold,
+            "Enrolled-speaker held-out recall: {:.1}% ({}/{}) — target ≥{:.0}%",
             actual_dr * 100.0,
-            detected_total.0,
-            detected_total.1,
-            computed_min_dr.map_or_else(
-                || "skipped (enrolled phase did not run)".to_string(),
-                |v| format!("{v:.3}"),
-            ),
+            enrolled_detected,
+            enrolled_total,
+            MIN_DETECTION_RATE * 100.0,
         );
     }
 
-    // ── mahbot-1025 ensemble + cross-speaker summary ────────────────────
+    // ── Cross-speaker speaker-blindness summary (diagnostics) ───────────
     eprintln!(
-        "         Verifier ensemble: {n_members} members (seed ensemble), \
-         speed_down member miss fraction: {miss_fraction:.3} (gate ≤0.15, target ~0.04–0.10), \
-         cross-speaker noise_overlap FAs: {cross_fas}/{noise_overlap_total_variants} target",
-        n_members = verifier.ensemble_size(),
-        miss_fraction = speed_down_member_miss_fraction,
-        cross_fas = noise_overlap_cross_speaker_fas,
+        "         Cross-speaker diagnostics (speaker-blind — high detection expected): \
+         canaries {noise_overlap_detections}/{noise_overlap_total_variants}, \
+         probes {probe_fa_count}/{probe_total_variants}",
     );
-    if let Some(noise_verifier_peak) = enrolled_json
-        .get("acceptance")
-        .and_then(|a| a.get("f1_noise_verifier_peak"))
-        .and_then(serde_json::Value::as_f64)
-    {
-        eprintln!("         F1_noise verifier peak: {noise_verifier_peak:.4} (must be ≥ 0.86)");
-    }
 
     // Per-tier confusable false-accept checks (mahbot-871)
     // NOTE: report-only — warns instead of asserting (mahbot-953).

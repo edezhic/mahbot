@@ -1267,18 +1267,9 @@ impl ChatResponse {
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 32_000;
 
 // ── Voice pipeline shared constants ─────────────────────────────────────────
-// These live in lib.rs (not voice_verifier.rs) to avoid a circular module
-// dependency: wake_word_classifier.rs needs EMBEDDING_DIM.  Placing them here
-// keeps the dependency graph acyclic.
 
 /// Dimensionality of the per-frame embedding vectors (96-dim).
 pub(crate) const EMBEDDING_DIM: usize = 96;
-
-/// Number of consecutive frames in a verifier window (matching classifier).
-pub(crate) const VERIFIER_WINDOW_SIZE: usize = 3;
-
-/// Input dimension for the verifier: 3 × 96 = 288.
-pub(crate) const VERIFIER_INPUT_DIM: usize = EMBEDDING_DIM * VERIFIER_WINDOW_SIZE;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ChatRequest {

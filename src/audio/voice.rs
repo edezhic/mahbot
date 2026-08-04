@@ -9,8 +9,8 @@
 //! 2. **Voice activity detection** — energy-based VAD to gate processing
 //! 3. **Mel spectrogram extraction** — via `melspectrogram.onnx` (candle-onnx)
 //! 4. **Neural embedding** — via `embedding_model.onnx` (candle-onnx), 96-dim vectors
-//! 5. **Wake word matching** — Conv1D classifier on a 3-embedding sliding window,
-//!    followed by a Conv1D verifier (AND gate).
+//! 5. **Wake word matching** — Conv1D classifier on a 3-embedding sliding window
+//!    with immediate-fire rolling-sum detection (speaker-blind).
 //! 6. **Command recording** — record speech until silence or 30s cap
 //! 7. **Transcription** — via existing Qwen3-ASR local transcriber
 //! 8. **Routing** — transcribed text is routed to the user's active role via
@@ -30,19 +30,14 @@
 //! Stored in `~/.mahbot/models/openwakeword/`.
 
 use crate::ChatDirection;
-use crate::audio::embedding_sequence::{
-    AugmentationFamily, EmbeddingSequence, Source, UtteranceId,
-};
-use crate::audio::voice_verifier::{
-    VERIFIER_ACCEPTANCE_FLOOR, VERIFIER_WARMUP_EMBEDDINGS, VoiceVerifier,
-};
+use crate::EMBEDDING_DIM;
+use crate::audio::embedding_sequence::{EmbeddingSequence, Source, UtteranceId};
 use crate::audio::wake_word_classifier::{self, ClassifierWeights, WakeWordClassifier};
 use crate::config::CONFIG;
 use crate::turso;
 use crate::util::UnwrapPoison;
 use crate::util::hex_string;
 use crate::vector::cosine_similarity;
-use crate::{EMBEDDING_DIM, VERIFIER_WINDOW_SIZE};
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sha2::{Digest, Sha256};
@@ -120,20 +115,8 @@ const EMBEDDING_WINDOW_FRAMES: usize = 76;
 /// sweeps the start-aligned positions 0/8/16/24 in one synchronous burst with
 /// the trained start-0-aligned padded geometry.
 ///
-/// Measured basis (mahbot-1022 deferred-burst sweep): the decisive
-/// (B=68, position 24) cell confirms at classifier 0.9981 / ring-4 verifier
-/// 0.9393 (44 real frames).  B≤60 is verifier-doomed (≤0.5401), B=65 has
-/// zero margin, and scoring position 0 below 68 frames resets the rolling
-/// window before positions 8/16/24 can fire.
-///
-/// Confirmation-slack note (measured, mahbot-1023 runs 5–7): the ticket's
-/// original design constraint assumed the sweep must confirm before a later
-/// call's gap recovery re-anchors to a MISALIGNED leading edge whose
-/// static-gate score was 0.2651 < 0.316.  Live mel-flush granularity lands
-/// the trigger at B=76, and the B=79 → start-3 re-score scores ~0.99 at the
-/// live VAD/AGC geometry — the hazard does not manifest, and that same
-/// re-anchored continuation is what updates the burst-created candidate to
-/// confirmation mid-utterance.  The segment-end pass remains the overrun
+/// Scoring position 0 below 68 frames resets the rolling window before
+/// positions 8/16/24 can fire.  The segment-end pass remains the overrun
 /// safety net if a below-reset re-score ever does clear the rolling window.
 const BURST_TRIGGER_FRAMES: usize = 68;
 
@@ -142,8 +125,7 @@ const BURST_TRIGGER_FRAMES: usize = 68;
 const BURST_STRIDE: usize = 8;
 
 /// Maximum number of positions in the burst sweep / segment-end pass
-/// (4 positions × stride 8 — the ring reaches exactly 4 embeddings at
-/// position 24, where the verifier ring-4 sample gates confirmation).
+/// (4 positions × stride 8).
 const BURST_MAX_POSITIONS: usize = 4;
 
 /// Maximum command recording duration (30 seconds).
@@ -249,13 +231,13 @@ pub(crate) const DEFAULT_WAKE_WORD_PHRASE: &str = "mahbot";
 ///
 /// When the enrolled wake word is not "mahbot" or "hey mahbot", the
 /// Mahbot-specific confusable phrases ([`CONFUSABLE_PHRASES`]) are excluded
-/// from both classifier and verifier training. The model trains on ambient
+/// from classifier training. The model trains on ambient
 /// negatives and general-purpose unrelated speech ([`UNRELATED_PHRASES`])
 /// only.
 ///
 /// This is a **known quality regression** for non-Mahbot phrases — ambient-only
 /// negatives do not teach the model to reject phonetic near-misses (e.g., "pay
-/// mabot" sounds similar to "hey mahbot"). The verifier will likely false-accept
+/// mabot" sounds similar to "hey mahbot"). The model will likely false-accept
 /// more wake-word-like sounds until a general-purpose phonetic near-miss generator
 /// is implemented (future work, mahbot-909 scope note).
 ///
@@ -341,14 +323,14 @@ const EMBEDDING_RING_MAX: usize = 19;
 const NUM_ENROLLMENT_SAMPLES: usize = 10;
 
 /// Minimum length (in audio samples at 16kHz) for a collected ambient audio
-/// chunk to be used as a negative verifier training example (mahbot-797).
+/// chunk to be used as a negative training example (mahbot-797).
 ///
 /// Set to 0.5s of audio, which produces ~31 mel frames (padded to 76 for the
 /// embedding model).  Chunks shorter than this are discarded — they would be
 /// mostly padding/silence and provide negligible discriminative signal.
 const MIN_NEGATIVE_AUDIO_LEN: usize = SAMPLE_RATE as usize / 2;
 
-/// Maximum number of ambient noise chunks to retain for verifier training.
+/// Maximum number of ambient noise chunks to retain for negative training.
 /// If training repeatedly fails (ONNX not loaded, <2 chunks, or empty
 /// embeddings), this cap prevents unbounded memory growth in the voice
 /// pipeline state (mahbot-800).
@@ -358,15 +340,12 @@ const MAX_NEGATIVE_AUDIO_CHUNKS: usize = 100;
 
 /// Target VAD-positive speech duration for owner-negative Phase 3 collection.
 /// ~60 seconds of VAD-positive general speech from the user, used alongside
-/// ambient/cache negatives to train a better verifier.
+/// ambient/cache negatives to train the classifier.
 const NEGATIVES_TARGET_SECONDS: usize = 60;
 
 /// Maximum owner-negative audio samples to retain (90s cap, 1.5× the target).
 /// This prevents unbounded memory growth if the user speaks continuously.
 const MAX_OWNER_NEGATIVE_SAMPLES: usize = SAMPLE_RATE as usize * NEGATIVES_TARGET_SECONDS * 3 / 2;
-
-/// Upweight for owner-negative sequences during verifier training.
-const OWNER_NEGATIVE_UPWEIGHT: f32 = crate::audio::voice_verifier::OWNER_NEGATIVE_UPWEIGHT;
 
 /// Wall-clock timeout for Phase 3 owner-negative collection (120 seconds).
 /// If the user stays silent or provides very little speech, the pipeline
@@ -691,9 +670,9 @@ mod augment_tests {
     }
 }
 
-// ── Confusable phrase list for verifier negative training (mahbot-859) ──
+// ── Confusable phrase list for negative training (mahbot-859) ──
 
-/// Canonical confusable near-miss phrases for VoiceVerifier training
+/// Canonical confusable near-miss phrases for negative training
 /// (mahbot-859).
 pub(crate) const CONFUSABLE_PHRASES: &[&str] = &[
     // ── Direct phonetic substitutions (wake-word-like) ──────────────
@@ -730,11 +709,11 @@ pub(crate) const CONFUSABLE_PHRASES: &[&str] = &[
     "may bot",
 ];
 
-/// Unrelated speech phrases for verifier negative training (mahbot-872).
+/// Unrelated speech phrases for negative training (mahbot-872).
 ///
 /// These are phonetically and semantically unrelated to the wake word, and
 /// cover short commands, medium phrases, long utterances, and non-English
-/// speech.  The verifier must reject all non-wake-word speech regardless
+/// speech.  The classifier must reject all non-wake-word speech regardless
 /// of language or sentence structure.
 pub(crate) const UNRELATED_PHRASES: &[&str] = &[
     // ── Short commands (2-4 words) ──────────────────────────────────
@@ -813,29 +792,27 @@ pub(crate) const CONFUSABLE_EASY: &[&str] = &[
 /// match the production inference distribution (mahbot-859 Fix 2).
 ///
 /// After the dense-stride-8 alignment (mahbot-923), this is the single cache used
-/// for both classifier and verifier training — the streaming cache was removed.
+/// for classifier training — the streaming cache was removed.
 ///
-/// The embeddings are used during verifier and classifier training to teach the
-/// models to reject confusable near-miss phrases.
+/// The embeddings are used during classifier training to teach the
+/// model to reject confusable near-miss phrases.
 ///
 /// Once set, the cache is immutable — a new process is needed to regenerate
 /// (e.g. after ONNX model changes).  If pre-warming fails or is not yet
-/// complete, [`confusable_dense_embeddings`] returns an empty slice and both
-/// models train on ambient negatives only.
+/// complete, [`confusable_dense_embeddings`] returns an empty slice and the
+/// classifier trains on ambient negatives only.
 static CONFUSABLE_EMBEDDINGS_CACHE: OnceLock<Vec<EmbeddingSequence>> = OnceLock::new();
 
-/// Get the pre-computed confusable phrase dense embeddings for classifier
-/// and verifier negative training (mahbot-923).
+/// Get the pre-computed confusable phrase dense embeddings for classifier negative training (mahbot-923).
 ///
 /// Returns a cached slice of dense-stride-8 embedding vectors pre-computed
 /// during startup via [`prewarm_confusable_embeddings`].  After the
-/// dense-stride-8 alignment (mahbot-923), the same cache serves both
-/// classifier and verifier — the streaming cache was removed.
+/// dense-stride-8 alignment (mahbot-923), the same cache serves the
+/// classifier — the streaming cache was removed.
 ///
 /// If the pre-warm has not completed yet or models are not available, returns
-/// an empty slice — both models train on ambient negatives only as a
-/// graceful fallback (the single cache serves both classifier and verifier
-/// after mahbot-923).
+/// an empty slice — the classifier trains on ambient negatives only as a
+/// graceful fallback.
 pub(crate) fn confusable_dense_embeddings() -> &'static [EmbeddingSequence] {
     match CONFUSABLE_EMBEDDINGS_CACHE.get() {
         Some(cache) => &cache[..],
@@ -851,24 +828,23 @@ pub(crate) fn confusable_dense_embeddings() -> &'static [EmbeddingSequence] {
 /// automatically invalidate cached audio.
 ///
 /// After the dense-stride-8 alignment (mahbot-923), this is the single cache used
-/// for both classifier and verifier training — the streaming cache was removed.
+/// for classifier training — the streaming cache was removed.
 ///
-/// The embeddings are used during verifier and classifier training to teach the
-/// models to reject non-wake-word speech.
+/// The embeddings are used during classifier training to teach the
+/// model to reject non-wake-word speech.
 ///
 /// Once set, the cache is immutable — a new process is needed to regenerate.
 static UNRELATED_EMBEDDINGS_CACHE: OnceLock<Vec<EmbeddingSequence>> = OnceLock::new();
 
-/// Get the pre-computed unrelated speech dense embeddings for classifier
-/// and verifier negative training (mahbot-923).
+/// Get the pre-computed unrelated speech dense embeddings for classifier negative training (mahbot-923).
 ///
 /// Returns a cached slice of dense-stride-8 embedding vectors pre-computed
 /// during startup via [`prewarm_unrelated_embeddings`].  After the
-/// dense-stride-8 alignment (mahbot-923), the same cache serves both
-/// classifier and verifier — the streaming cache was removed.
+/// dense-stride-8 alignment (mahbot-923), the same cache serves the
+/// classifier — the streaming cache was removed.
 ///
 /// If the pre-warm has not completed yet or models are not available, returns
-/// an empty slice — both models train on ambient + confusable negatives only
+/// an empty slice — the classifier trains on ambient + confusable negatives only
 /// as a graceful fallback.
 pub(crate) fn unrelated_dense_embeddings() -> &'static [EmbeddingSequence] {
     match UNRELATED_EMBEDDINGS_CACHE.get() {
@@ -886,7 +862,7 @@ pub(crate) fn unrelated_dense_embeddings() -> &'static [EmbeddingSequence] {
 ///
 /// Starting from mahbot-932, this function is decoupled from the TTS playback
 /// toggle (`tts_enabled` config) — confusable/unrelated phrase embeddings are
-/// needed for classifier and verifier training regardless of whether audio
+/// needed for classifier training regardless of whether audio
 /// playback is enabled.  If TTS models are not yet loaded, a download is
 /// triggered on demand (~400 MB on first voice init).
 ///
@@ -903,7 +879,7 @@ const MAX_TTS_STYLE_POLLS: u32 = 10;
 async fn wait_for_tts_styles() -> Option<Vec<String>> {
     // Trigger TTS model download if not already available (decoupled from
     // the playback toggle — mahbot-932).  This ensures confusable/unrelated
-    // phrase embeddings are generated for classifier and verifier training
+    // phrase embeddings are generated for classifier training
     // regardless of whether audio playback is enabled.
     //
     // Note: try_load_cached() now attempts disk loading even when STATE is
@@ -938,8 +914,7 @@ async fn wait_for_tts_styles() -> Option<Vec<String>> {
                 if crate::audio::tts::download_failed() {
                     info!(
                         "TTS model download permanently failed — confusable negative \
-                         embeddings pre-warm skipped (verifier trains on \
-                         ambient negatives only)"
+                         embeddings pre-warm skipped (ambient negatives only)"
                     );
                     return None;
                 }
@@ -1003,7 +978,7 @@ async fn wait_for_tts_styles() -> Option<Vec<String>> {
 /// embeddings are extracted from cached PCM on the next startup.
 ///
 /// The resulting embeddings are stored in [`CONFUSABLE_EMBEDDINGS_CACHE`] and
-/// later used during classifier and verifier training (single cache serves both,
+/// later used during classifier training (single cache serves both,
 /// mahbot-923).  If TTS models or voice ONNX models
 /// are not available, the function returns without populating the cache and
 /// both models train on ambient negatives only.
@@ -1176,13 +1151,12 @@ async fn prewarm_phrase_embeddings(
                 let mut utterance_variants: Vec<(u8, Vec<Vec<f32>>)> = Vec::new();
                 let mut push_seq = |embs: Vec<Vec<f32>>, vi: usize| {
                     if !embs.is_empty() {
-                        dense_sequences.push(EmbeddingSequence::negative(
+                        dense_sequences.push(EmbeddingSequence::new(
                             UtteranceId {
                                 sequence_index: phrase_index_for_id,
                                 variant_index: vi,
                             },
                             source,
-                            None,
                             embs.clone(),
                         ));
                         // Variant indices are 0..=4 by construction.
@@ -1415,68 +1389,6 @@ const NEGATIVE_DISTRIBUTION_MEAN: f32 = 0.033;
 /// multiplier accounts for the higher per-frame scores from stride-8 dense
 /// embeddings and is derived from benchmark calibration (mahbot-923).
 const NO_MATCH_RESET_THRESHOLD: f32 = 0.316;
-
-/// Maximum number of embeddings a classifier candidate can accumulate
-/// verifier evidence from before being discarded (mahbot-895).
-///
-/// A candidate is created when the classifier's rolling sum first crosses
-/// the threshold (post-warm-up).  It accumulates verifier peak scores from
-/// each subsequent embedding for at most this many embeddings.  If the peak
-/// reaches the verifier's threshold within this window, the candidate
-/// triggers detection.  Otherwise, the candidate expires and is discarded.
-///
-/// At ~80 ms per stride-8 embedding step (stride = 8 mel frames at
-/// 10 ms/frame), 4 stride-8 embeddings span frames 0..100 = ~1000 ms of
-/// audio — giving the verifier enough temporal context while preventing
-/// unbounded accumulation across long utterances.  (The old pre-stride-8
-/// streaming pipeline produced one embedding per ~128 ms batch flush;
-/// with stride-8 each successive embedding advances by 8 mel frames.)
-/// The temporal span of 4 embeddings was ~512 ms before mahbot-923
-/// (one embedding per 2048-sample flush), and ~1000 ms after stride-8.
-const CANDIDATE_MAX_EMBEDDINGS: usize = 4;
-
-/// A bounded detection candidate created when the classifier's rolling sum
-/// first crosses the threshold (mahbot-895).
-///
-/// Replaces the session-lifetime `peak_verifier_score` with a per-candidate
-/// accumulator.  A candidate is created on the first threshold crossing
-/// post-warm-up, accumulates verifier evidence from a bounded window of
-/// subsequent embeddings, then either triggers (verifier confirms) or is
-/// discarded (verifier rejects or maximum window exceeded).  Each candidate's
-/// verifier evidence is independent and bounded, eliminating cross-candidate
-/// contamination.
-#[derive(Debug, Clone)]
-pub(crate) struct ClassifierCandidate {
-    /// Number of embeddings accumulated since candidate creation, including
-    /// the first threshold-crossing embedding.  When this reaches
-    /// [`CANDIDATE_MAX_EMBEDDINGS`], the candidate expires if the verifier
-    /// peak is still below threshold.
-    embedding_count: usize,
-    /// Peak verifier score across all embeddings in this candidate's window.
-    /// Only updated from `max_verifier_score` values computed during this
-    /// candidate's lifetime — no cross-candidate contamination.
-    peak_verifier_score: f32,
-}
-
-impl ClassifierCandidate {
-    fn new(initial_verifier_score: f32) -> Self {
-        Self {
-            embedding_count: 1,
-            peak_verifier_score: initial_verifier_score,
-        }
-    }
-
-    /// Update this candidate's verifier peak and increment the embedding
-    /// counter.  Returns `true` if the candidate has reached its maximum
-    /// window and should be expired.
-    fn update(&mut self, verifier_score: f32) -> bool {
-        self.embedding_count += 1;
-        if verifier_score > self.peak_verifier_score {
-            self.peak_verifier_score = verifier_score;
-        }
-        self.embedding_count >= CANDIDATE_MAX_EMBEDDINGS
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Voice pipeline metrics — always-on atomic counters (mahbot-912)
@@ -1761,8 +1673,11 @@ const ADAPTIVE_BOOTSTRAP_FRAMES: usize = 5;
 /// Returns `true` when the rolling sum of recent scores meets or exceeds
 /// `match_threshold()`.  When the incoming score is below
 /// [`NO_MATCH_RESET_THRESHOLD`], the window is cleared entirely to prevent
-/// slow accumulation from noise.  On detection the score window is NOT
-/// cleared here — the caller is responsible for full pipeline cleanup.
+/// slow accumulation from noise — unless `preserve_window_on_reset` is set
+/// (deferred-burst path only, mahbot-1104): a low-scoring burst frame
+/// contributes nothing to the score and must not wipe an in-progress wake
+/// mid-detection.  On detection the score window is NOT cleared here — the
+/// caller is responsible for full pipeline cleanup.
 ///
 /// This function is pure with respect to global state: it only reads its
 /// parameters and modifies `score_window` in place.  This makes it directly
@@ -1771,18 +1686,24 @@ fn process_wake_word_score(
     total_score: f32,
     score_window: &mut Vec<f32>,
     adaptive_threshold_override: Option<f32>,
+    preserve_window_on_reset: bool,
 ) -> (bool, f32) {
     if total_score < NO_MATCH_RESET_THRESHOLD {
         // Far from matching — reset the entire rolling window to prevent
-        // slow accumulation from noise.
-        if !score_window.is_empty() {
-            debug!(
-                "Wake word match lost: total_score={total_score:.4} < NO_MATCH_RESET_THRESHOLD \
-                 (window reset, had {} scores)",
-                score_window.len(),
-            );
+        // slow accumulation from noise.  Burst-path frames (mahbot-1104)
+        // never clear: they contribute nothing to the score, and a mid-wake
+        // wipe would kill an otherwise-valid detection that started near the
+        // utterance beginning.
+        if !preserve_window_on_reset {
+            if !score_window.is_empty() {
+                debug!(
+                    "Wake word match lost: total_score={total_score:.4} < NO_MATCH_RESET_THRESHOLD \
+                     (window reset, had {} scores)",
+                    score_window.len(),
+                );
+            }
+            score_window.clear();
         }
-        score_window.clear();
         (false, 0.0)
     } else {
         // Good-enough frame: append score to rolling window.
@@ -1823,13 +1744,15 @@ fn process_wake_word_score(
 /// It manages the ring buffer, runs the Conv1D classifier forward pass
 /// (tiling available embeddings to fill the 3-embedding window when the ring
 /// has fewer than 3 entries — see [`score_single_embedding`] implementation),
-/// applies rolling window scoring via [`process_wake_word_score`], and checks
-/// the second-stage verifier (Conv1D) gate via a bounded classifier candidate.
+/// feeds/peeks the adaptive threshold, and applies rolling window scoring via
+/// [`process_wake_word_score`].  Detection fires immediately when the rolling
+/// sum crosses the effective threshold — the pipeline is speaker-blind with
+/// no second-stage gate (mahbot-1104).
 ///
 /// # Returns
-/// - `(true, rolling_sum, total_score, effective_threshold, max_verifier_score)` — the embedding
-///   triggered wake word detection (all gates passed).
-/// - `(false, _, total_score, effective_threshold, max_verifier_score)` — continue feeding more
+/// - `(true, rolling_sum, total_score, effective_threshold)` — the embedding
+///   triggered wake word detection.
+/// - `(false, _, total_score, effective_threshold)` — continue feeding more
 ///   embeddings (the ring buffer and score window are updated for the next
 ///   call).
 ///
@@ -1837,65 +1760,35 @@ fn process_wake_word_score(
 ///   (0.0 if the window was reset due to low score).
 /// - `total_score` — the raw soft score from the Conv1D classifier.
 /// - `effective_threshold` — the threshold value used for the rolling window
-///   comparison this frame (see below).
-/// - `max_verifier_score` — the maximum verifier score across all stride-1
-///   3-frame windows in the ring buffer for this embedding (0.0 if the verifier
-///   was not computed, e.g. during warm-up or when no verifier is configured).
-///   Used by the activation trace (mahbot-897) and available for diagnostics.
-///
-/// The `effective_threshold` is either the adaptive threshold (post-bootstrap)
-/// or the static [`match_threshold()`] (during bootstrap or when no adaptive
-/// state is configured).  During the verifier warm-up period
-/// (< `VERIFIER_WARMUP_EMBEDDINGS` with a trained verifier) the threshold is
-/// NOT modified — all detections are unconditionally suppressed before the
-/// rolling window comparison is ever reported (mahbot-893).  Recorded in
-/// [`DetectionInstrumentation`] for miss-classification analysis (mahbot-891).
-///
-/// # Bounded classifier candidate (mahbot-895)
-///
-/// The [`peak_verifier_score`] session-lifetime accumulator has been replaced
-/// by a per-candidate bounded [`ClassifierCandidate`].  When the rolling sum
-/// first crosses the threshold (post-warm-up), a candidate is created.  It
-/// accumulates verifier evidence from subsequent embeddings (up to
-/// [`CANDIDATE_MAX_EMBEDDINGS`] ≈ 512 ms of additional context).  If the
-/// candidate's verifier peak reaches the verifier's threshold, detection is
-/// confirmed.  If the candidate expires without confirmation (max window or
-/// score reset), it is discarded — no cross-candidate contamination.
+///   comparison this frame (adaptive threshold post-bootstrap, or static
+///   [`match_threshold()`] during bootstrap / when no adaptive state is
+///   configured).
 ///
 /// # Parameters
 /// - `embedding` — one 96-dim embedding vector to process.
 /// - `embedding_ring` — persistent ring buffer (shared across frames in the
 ///   live pipeline; fresh per utterance in tests).
 /// - `classifier` — trained Conv1D classifier (`None` skips classification).
-/// - `verifier` — trained Conv1D verifier (`None` skips the
-///   second-stage gate, matching enrollment self-test behaviour).
 /// - `score_window` — persistent rolling window of recent confidence scores.
 /// - `adaptive_state` — optional adaptive threshold state (`None` disables
 ///   adaptive threshold adjustment).
 /// - `adaptive_k` — multiplier for the adaptive threshold's standard-deviation
 ///   term (passed to [`AdaptiveThresholdState::next_threshold`]).
-/// - `candidate` — optional bounded classifier candidate (mahbot-895).
-///   Pass `Some(&mut candidate_field)` to create/update/expire a candidate
-///   across frames; pass `None` to skip candidate tracking (e.g. enrollment
-///   self-test when no verifier is active).
-#[expect(clippy::too_many_arguments)]
+/// - `burst_path` — true when scored by the deferred-burst sweep
+///   (start-aligned positions).  Burst-path frames never clear the rolling
+///   window on a below-reset score (mahbot-1104): they contribute nothing to
+///   the score, and a mid-wake wipe would kill a valid detection that started
+///   near the utterance beginning.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn score_single_embedding(
     embedding: &[f32],
     embedding_ring: &mut Vec<Vec<f32>>,
     classifier: Option<&WakeWordClassifier>,
-    verifier: Option<&VoiceVerifier>,
     score_window: &mut Vec<f32>,
     mut adaptive_state: Option<&mut AdaptiveThresholdState>,
     adaptive_k: f32,
-    mut candidate: Option<&mut Option<ClassifierCandidate>>,
-) -> (bool, f32, f32, f32, f32, bool) {
-    // Track whether a new ClassifierCandidate was created during this call
-    // (mahbot-897).  Used by the caller to increment the candidate ID counter
-    // without temporal coupling (the old pattern was a pre-call capture +
-    // post-call comparison that silently degrades if code is inserted between).
-    let mut candidate_was_created = false;
-
+    burst_path: bool,
+) -> (bool, f32, f32, f32) {
     // ── Ring buffer ───────────────────────────────────────────────────
     embedding_ring.push(embedding.to_vec());
     while embedding_ring.len() > EMBEDDING_RING_MAX {
@@ -1905,8 +1798,7 @@ pub(crate) fn score_single_embedding(
     // ── Conv1D classifier forward pass ───────────────────────────────────
     // Scores a window of 3 consecutive embeddings via Conv1D + sigmoid.
     // Falls back to repeat-last tiling when fewer than 3 embeddings are
-    // available.  The Conv1D classifier is the primary scorer; the verifier below acts
-    // as a light second-stage gate.
+    // available.
     let total_score = if let Some(c) = classifier {
         if embedding_ring.len() >= wake_word_classifier::WINDOW_SIZE {
             let start = embedding_ring.len() - wake_word_classifier::WINDOW_SIZE;
@@ -1936,15 +1828,14 @@ pub(crate) fn score_single_embedding(
     // during bootstrap — the old unconditional bootstrap feed
     // (`is_bootstrapping() || total_score < NO_MATCH_RESET_THRESHOLD`)
     // inflated the adaptive threshold with wake-word-like burst scores
-    // (~0.99) to ~3.0–4.5, blocking candidate survival and verifier
-    // re-sampling after the deferred burst.  With the score-only rule, a
-    // high-scoring utterance legitimately keeps the bootstrap alive for its
-    // whole duration: high scores peek (peek() returns None during
-    // bootstrap → the static match_threshold stays in effect), and only
-    // below-reset background frames feed and advance the bootstrap counter.
-    // Residual contamination cannot persist across the soft reset
-    // (detection→recording handoff) because no wake-word-like score ever
-    // enters the statistics.
+    // (~0.99) to ~3.0–4.5, blocking detection after the deferred burst.
+    // With the score-only rule, a high-scoring utterance legitimately keeps
+    // the bootstrap alive for its whole duration: high scores peek
+    // (peek() returns None during bootstrap → the static match_threshold
+    // stays in effect), and only below-reset background frames feed and
+    // advance the bootstrap counter.  Residual contamination cannot persist
+    // across the soft reset (detection→recording handoff) because no
+    // wake-word-like score ever enters the statistics.
     let adaptive_override = adaptive_state.as_mut().and_then(|state| {
         if total_score < NO_MATCH_RESET_THRESHOLD {
             state.feed(total_score, adaptive_k)
@@ -1953,26 +1844,12 @@ pub(crate) fn score_single_embedding(
         }
     });
 
-    // ── Compute effective threshold for instrumentation (mahbot-891) ──
-    // The effective threshold is the adaptive override (when available,
-    // post-bootstrap) or the static match_threshold().  During verifier
-    // warm-up (< VERIFIER_WARMUP_EMBEDDINGS with trained verifier) the
-    // threshold is no longer raised — all detections are structurally
-    // suppressed instead (mahbot-893, see below).
-    // ── Verifier warm-up detection (mahbot-887) ──────────────────────
-    // Track whether we are in the verifier warm-up period (ring buffer
-    // too small for the verifier's 3-frame stride-1 windows to be
-    // temporally representative).  During this window all wake word
-    // detections are unconditionally suppressed (mahbot-893).
+    // ── Effective threshold (adaptive post-bootstrap, static otherwise) ──
     let effective_threshold = adaptive_override.unwrap_or_else(match_threshold);
-    let is_warmup_period = match verifier {
-        Some(v) => v.is_trained() && embedding_ring.len() < VERIFIER_WARMUP_EMBEDDINGS,
-        None => false,
-    };
 
     // ── Rolling window gate (mahbot-773) ─────────────────────────────
-    let (mut detected, rolling_sum) =
-        process_wake_word_score(total_score, score_window, adaptive_override);
+    let (detected, rolling_sum) =
+        process_wake_word_score(total_score, score_window, adaptive_override, burst_path);
 
     // ── Voice debug logging (mahbot-850) ─────────────────────────────
     // When the `voice-debug` feature is enabled, log every per-frame
@@ -1984,6 +1861,8 @@ pub(crate) fn score_single_embedding(
         let passed_threshold = total_score >= NO_MATCH_RESET_THRESHOLD;
         let below_note = if passed_threshold {
             ""
+        } else if burst_path {
+            " (below NO_MATCH_RESET_THRESHOLD — burst frame, window preserved)"
         } else {
             " (below NO_MATCH_RESET_THRESHOLD — window reset)"
         };
@@ -1993,238 +1872,13 @@ pub(crate) fn score_single_embedding(
         );
     }
 
-    // ── Verifier max score (mahbot-859, mahbot-870) ──────────────────
-    // Always compute the max verifier prediction over stride-1 3-frame
-    // windows from the ring buffer.  The verifier now operates on 288-dim
-    // windows (3×96) matching the classifier's windowing convention.
-    // Each window is formed from 3 consecutive embeddings via the shared
-    // `fill_verifier_window()` helper (stack-allocated, no heap allocation
-    // on the inference hot path).  The max across all stride-1 windows in
-    // the windowing range (line 957-958) is computed below, then accumulated
-    // into `peak_verifier_score` (across all frames) for the gate decision
-    // (mahbot-870).  Using the accumulated peak gives the verifier time to
-    // build temporally representative 3-frame windows — the rolling sum
-    // can peak at frame ~3 while the verifier needs frame ~5+.
-    //
-    // WARM-UP (mahbot-887): During the first `VERIFIER_WARMUP_EMBEDDINGS`
-    // embeddings, the verifier score computation is skipped entirely
-    // (max_verifier_score stays 0.0).  At the onset, the verifier only
-    // sees a single 3-frame window formed from the first few mel frames,
-    // which contain the silence-to-speech transient and produce unreliable
-    // low scores.  The rolling sum often decays before enough embeddings
-    // (≥5) accumulate for a temporally representative window.  By skipping
-    // the verifier entirely during warm-up, the Conv1D classifier alone
-    // gates the detection — which matches its design as the primary scorer.
-    // The complementary gate condition below also checks this threshold so
-    // that the verifier does not block on the warm-up frames even if
-    // `peak_verifier_score` is 0.0.
-    let max_verifier_score: f32 = if let Some(v) = verifier
-        && v.is_trained()
-        && embedding_ring.len() >= VERIFIER_WARMUP_EMBEDDINGS
-    {
-        let start = embedding_ring
-            .len()
-            .saturating_sub(ROLLING_WINDOW_N + VERIFIER_WINDOW_SIZE - 1);
-        let end = embedding_ring.len();
-        let mut max_score = 0.0f32;
-        // Score all stride-1 windows in the range [start, end - VERIFIER_WINDOW_SIZE].
-        // Use a fixed-size stack array (no heap allocation) for real-time safety
-        // on the streaming inference path (mahbot-870).
-        let mut window = [0.0f32; crate::VERIFIER_INPUT_DIM];
-        for i in start..=end.saturating_sub(VERIFIER_WINDOW_SIZE) {
-            crate::audio::voice_verifier::fill_verifier_window(embedding_ring, i, &mut window);
-            let score = v.predict(&window);
-            max_score = max_score.max(score);
-        }
-        max_score
-    } else {
-        0.0
-    };
-
-    // ── Bounded classifier candidate (mahbot-895) ─────────────────────
-    // Replaces the session-lifetime `peak_verifier_score` accumulator.
-    // A candidate is created when the rolling sum first crosses threshold
-    // (post-warm-up).  It accumulates the verifier peak from subsequent
-    // embeddings (up to CANDIDATE_MAX_EMBEDDINGS).  If the peak reaches
-    // the verifier's threshold, detection triggers.  If the candidate
-    // expires without confirming, it is discarded — each candidate is
-    // fully independent with no cross-candidate contamination.
-
-    // ── Warm-up suppression (mahbot-893) ─────────────────────────────
-    // Completely suppress all wake word detections during the verifier
-    // warm-up period (embedding_ring.len() < VERIFIER_WARMUP_EMBEDDINGS
-    // with a trained verifier).  No detection is ever reported during
-    // warm-up, regardless of classifier score, threshold, or rolling
-    // sum.  With mahbot-1002, warm-up scores are preserved through the
-    // warm-up→active transition (the old mahbot-899 clear was removed),
-    // giving the rolling sum a head start from warm-up accumulation.
-    // This enables earlier detection on short utterances without
-    // compromising the verifier gate.  No candidate is created during
-    // warm-up — candidates only start after warm-up ends, ensuring the
-    // verifier has enough context from the start.
-    //
-    // Safety (mahbot-893): Per-frame benchmark analysis shows that no
-    // genuine wake word variant crosses the classifier threshold during
-    // the first 4 embeddings.  All 11-13 detected variants cross at
-    // frame 6 or later.  Suppressing warm-up detections has zero impact
-    // on detection rate in the current benchmark.  If the classifier
-    // output distribution shifts (model retraining, new enrollment
-    // variants, new TTS voices), the `warn!` log below provides
-    // production observability into suppressed warm-up frames.
-    let was_warmup_suppressed = is_warmup_period && detected;
-    if was_warmup_suppressed {
-        warn!(
-            "Wake word detection suppressed during verifier warm-up: \
-             rolling_sum={rolling_sum:.4} total_score={total_score:.4} ring_len={}",
-            embedding_ring.len(),
-        );
-    }
-    if is_warmup_period {
-        detected = false;
-    }
-
-    // ── Candidate lifecycle ───────────────────────────────────────────
+    // Immediate-fire (mahbot-1104): no second-stage gate — a threshold
+    // crossing fires detection on this frame (speaker-blind pipeline).
     if detected {
-        // Match on a mut ref to avoid moving `candidate`
-        if let Some(opt) = &mut candidate {
-            // opt: &mut &mut Option<ClassifierCandidate>
-            // **opt is the caller's Option<ClassifierCandidate> field
-
-            if let Some(c) = opt.as_mut() {
-                // c: &mut ClassifierCandidate
-                let expired = c.update(max_verifier_score);
-
-                // Confirmation gate (mahbot-1023): the verifier accepts the
-                // enrolled voiceprint at the CONSTANT
-                // VERIFIER_ACCEPTANCE_FLOOR (0.86) — the user-approved
-                // production semantics — not the entropy-seeded
-                // runtime-calibrated `v.threshold` (report-only reference).
-                if let Some(v) = verifier
-                    && v.is_trained()
-                    && c.peak_verifier_score >= VERIFIER_ACCEPTANCE_FLOOR
-                {
-                    // Candidate confirmed — detection fires!
-                    return (
-                        true,
-                        rolling_sum,
-                        total_score,
-                        effective_threshold,
-                        max_verifier_score,
-                        candidate_was_created,
-                    );
-                }
-
-                if expired {
-                    // Candidate expired — max window exceeded without
-                    // verifier confirmation.  Discard the candidate.
-                    #[cfg(feature = "voice-debug")]
-                    {
-                        if let Some(v) = verifier {
-                            info!(
-                                "VOICE_DEBUG: verifier blocked (candidate expired) — \
-                                 peak={:.4} acceptance_floor={VERIFIER_ACCEPTANCE_FLOOR:.4} \
-                                 runtime_threshold={:.4} rolling_sum={rolling_sum:.4}",
-                                c.peak_verifier_score, v.threshold,
-                            );
-                        }
-                    }
-                    **opt = None;
-                    return (
-                        false,
-                        rolling_sum,
-                        total_score,
-                        effective_threshold,
-                        max_verifier_score,
-                        candidate_was_created,
-                    );
-                }
-
-                // Candidate still alive — verifier hasn't confirmed yet
-                // but the window hasn't expired either.
-                return (
-                    false,
-                    rolling_sum,
-                    total_score,
-                    effective_threshold,
-                    max_verifier_score,
-                    candidate_was_created,
-                );
-            }
-
-            // No active candidate — this is the first threshold crossing.
-            **opt = Some(ClassifierCandidate::new(max_verifier_score));
-            candidate_was_created = true;
-
-            // Check threshold immediately on creation (constant floor,
-            // mahbot-1023 — see the candidate-update gate above).
-            if let Some(v) = verifier
-                && v.is_trained()
-                && max_verifier_score >= VERIFIER_ACCEPTANCE_FLOOR
-            {
-                return (
-                    true,
-                    rolling_sum,
-                    total_score,
-                    effective_threshold,
-                    max_verifier_score,
-                    candidate_was_created,
-                );
-            }
-
-            return (
-                false,
-                rolling_sum,
-                total_score,
-                effective_threshold,
-                max_verifier_score,
-                candidate_was_created,
-            );
-        }
-
-        // No candidate tracking requested (e.g., enrollment self-test
-        // with no active verifier).  Fall back to raw verifier check
-        // on the current frame's score (constant floor, mahbot-1023).
-        if let Some(v) = verifier
-            && v.is_trained()
-            && max_verifier_score < VERIFIER_ACCEPTANCE_FLOOR
-        {
-            return (
-                false,
-                rolling_sum,
-                total_score,
-                effective_threshold,
-                max_verifier_score,
-                candidate_was_created,
-            );
-        }
-        return (
-            true,
-            rolling_sum,
-            total_score,
-            effective_threshold,
-            max_verifier_score,
-            candidate_was_created,
-        );
+        (true, rolling_sum, total_score, effective_threshold)
+    } else {
+        (false, rolling_sum, total_score, effective_threshold)
     }
-
-    // ── Score window was reset (or never reached threshold) ─────────────
-    // If total_score < NO_MATCH_RESET_THRESHOLD, the rolling window was
-    // cleared.  Expire any active candidate.
-    if total_score < NO_MATCH_RESET_THRESHOLD
-        && let Some(opt) = candidate.as_mut()
-        && opt.is_some()
-    {
-        **opt = None;
-    }
-
-    (
-        false,
-        rolling_sum,
-        total_score,
-        effective_threshold,
-        max_verifier_score,
-        candidate_was_created,
-    )
 }
 
 /// VAD threshold: scores >= this are considered speech.
@@ -2359,7 +2013,7 @@ pub enum VoiceStatus {
         sample: usize,
         total: usize,
     },
-    /// Collecting owner-general speech as negative verifier examples
+    /// Collecting owner-general speech as negative examples
     /// (Phase 3 enrollment, mahbot-913).  `accumulated_secs` is the
     /// VAD-positive speech time collected so far, `target_secs` is the
     /// target (typically 60), `wall_clock_elapsed` is the wall-clock
@@ -2483,21 +2137,19 @@ struct VoicePipelineState {
     /// Cached classifier for inference (avoids per-frame clone of weights).
     /// Recreated when [`classifier_weights`] changes.
     classifier: Option<WakeWordClassifier>,
-    /// Second-stage Conv1D verifier.
-    verifier: VoiceVerifier,
     /// Per-utterance embeddings extracted via the full-utterance mel pipeline
     /// with dense stride-8 sliding window (used for both Conv1D classifier and
-    /// VoiceVerifier training after mahbot-923).  Streaming buffer was removed
+    /// classifier training after mahbot-923).  Streaming buffer was removed
     /// — both models now train on the same dense embedding distribution.
     enrollment_buffer: Vec<EmbeddingSequence>,
     /// Raw audio chunks collected during non-wake-word periods of enrollment
     /// (pre-enrollment ambient noise and inter-utterance silence).  These are
-    /// processed through the ONNX embedding model at verifier training time to
-    /// produce real (non-synthetic) negative examples for the verifier (mahbot-797).
+    /// processed through the ONNX embedding model at training time to
+    /// produce real (non-synthetic) negative examples (mahbot-797).
     negative_audio_chunks: Vec<Vec<f32>>,
     /// Owner-negative audio chunks collected during Phase 3 enrollment
     /// (mahbot-913).  ~60 seconds of VAD-positive general speech from the user,
-    /// stored as audio chunks for embedding extraction at verifier training time.
+    /// stored as audio chunks for embedding extraction at training time.
     /// Preserved across Full/Soft pipeline resets (same as `negative_audio_chunks`)
     /// but cleared on Cancel (via `reset_enrollment`).
     owner_negative_chunks: Vec<Vec<f32>>,
@@ -2583,7 +2235,6 @@ pub fn init_global() -> Result<()> {
             status: VoiceStatus::Disabled,
             classifier_weights: None,
             classifier: None,
-            verifier: VoiceVerifier::untrained(),
             enrollment_buffer: Vec::new(),
             negative_audio_chunks: Vec::new(),
             owner_negative_chunks: Vec::new(),
@@ -2633,15 +2284,6 @@ pub fn set_classifier_weights(weights: ClassifierWeights) {
     let mut state = voice_state().write().unwrap_poison();
     state.classifier_weights = Some(weights.clone());
     state.classifier = Some(WakeWordClassifier::new(weights));
-}
-
-#[must_use]
-pub fn get_verifier() -> VoiceVerifier {
-    voice_state().read().unwrap_poison().verifier.clone()
-}
-
-pub fn set_verifier(verifier: VoiceVerifier) {
-    voice_state().write().unwrap_poison().verifier = verifier;
 }
 
 pub fn send_command(cmd: VoiceCommand) {
@@ -4345,15 +3987,14 @@ fn run_enrollment_self_test(
         let mut detected = false;
 
         for embedding in &seq.embeddings {
-            let (detected_this, _, _, _, _, _) = score_single_embedding(
+            let (detected_this, _, _, _) = score_single_embedding(
                 embedding,
                 &mut embedding_ring,
                 Some(classifier),
-                None, // no verifier gate during enrollment self-test
                 &mut score_window,
                 None, // no adaptive threshold during enrollment self-test
                 ADAPTIVE_K_DEFAULT,
-                None, // no peak verifier tracking during self-test
+                false,
             );
             if detected_this {
                 detected = true;
@@ -4639,6 +4280,35 @@ pub(crate) fn finalize_enrollment(
     Ok(result)
 }
 
+/// Mean-pool a sequence of per-frame embeddings (from one utterance) into a
+/// single 96-dim embedding vector.
+///
+/// Used by [`validate_enrollment_consistency`] to compute per-utterance means
+/// for centroid cosine-similarity analysis.  Returns an empty `Vec` when
+/// `embeddings` is empty.
+#[must_use]
+pub fn mean_pool_embeddings(embeddings: &[Vec<f32>]) -> Vec<f32> {
+    if embeddings.is_empty() {
+        return Vec::new();
+    }
+    let dim = embeddings[0].len();
+    if dim == 0 {
+        return Vec::new();
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let n = embeddings.len() as f32;
+    let mut mean = vec![0.0; dim];
+    for emb in embeddings {
+        for (i, &v) in emb.iter().enumerate() {
+            mean[i] += v;
+        }
+    }
+    for v in &mut mean {
+        *v /= n;
+    }
+    mean
+}
+
 /// Validate enrollment utterance quality via centroid cosine similarity.
 ///
 /// # Gating
@@ -4668,7 +4338,7 @@ pub(crate) fn validate_enrollment_consistency(sequences: &[EmbeddingSequence]) -
     let qualified: Vec<Vec<f32>> = sequences
         .iter()
         .filter(|seq| seq.embeddings.len() >= 3)
-        .map(|seq| crate::audio::voice_verifier::mean_pool_embeddings(&seq.embeddings))
+        .map(|seq| mean_pool_embeddings(&seq.embeddings))
         .collect();
 
     let total = qualified.len();
@@ -4678,7 +4348,7 @@ pub(crate) fn validate_enrollment_consistency(sequences: &[EmbeddingSequence]) -
          Speak clearly and close to the microphone.",
     );
 
-    let centroid = crate::audio::voice_verifier::mean_pool_embeddings(&qualified);
+    let centroid = mean_pool_embeddings(&qualified);
 
     // Count utterances that pass the similarity threshold
     let passed = qualified
@@ -5308,41 +4978,6 @@ impl AdaptiveFrameMode {
     }
 }
 
-/// Per-frame classifier-candidate lifecycle state (mahbot-1012 §1).  Parallel
-/// to the aggregate `candidates_created/confirmed/expired` counters, but
-/// per-frame so the report can trace the exact candidate trajectory.
-#[cfg(feature = "voice-tests")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CandidateFrameState {
-    /// No candidate was active and none was created this frame.
-    None,
-    /// A new candidate was created this frame (first threshold crossing).
-    Created,
-    /// A candidate was already active and remains active.
-    Active,
-    /// Detection fired — the candidate was confirmed (or the no-candidate
-    /// fallback verifier gate passed).
-    Confirmed,
-    /// A previously-active candidate was cleared this frame without
-    /// confirmation (expired via [`CANDIDATE_MAX_EMBEDDINGS`] or reset by a
-    /// below-`NO_MATCH_RESET_THRESHOLD` score).
-    Expired,
-}
-
-#[cfg(feature = "voice-tests")]
-impl CandidateFrameState {
-    /// Stable snake_case label for JSON output (mahbot-1012).
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Created => "created",
-            Self::Active => "active",
-            Self::Confirmed => "confirmed",
-            Self::Expired => "expired",
-        }
-    }
-}
-
 /// Deterministic 64-bit hash of an embedding for cross-path comparison
 /// (mahbot-1012 §1).
 ///
@@ -5403,7 +5038,7 @@ pub(crate) struct DetectionInstrumentation {
     /// (adaptive threshold post-bootstrap, or static match_threshold()
     /// during bootstrap / when no adaptive state is configured).  Used by
     /// the benchmark's miss-classification logic to distinguish
-    /// adaptive-threshold blocks from verifier blocks (mahbot-891).
+    /// adaptive-threshold blocks (mahbot-891).
     pub per_frame_scores: Vec<[f32; 3]>,
     /// Count of frames where `total_score < NO_MATCH_RESET_THRESHOLD` (0.316).
     pub n_frames_below_reset: usize,
@@ -5419,17 +5054,6 @@ pub(crate) struct DetectionInstrumentation {
     /// maximum peak across all segments so the E2E benchmark reports an
     /// accurate value.
     pub peak_score: f32,
-    /// Peak verifier score across all candidates (mahbot-895).
-    ///
-    /// Max-tracked from all bounded [`ClassifierCandidate`] instances that were
-    /// created during this detection session.  When a candidate expires or is
-    /// cleared, its peak is flushed here.  For non-detected variants this is
-    /// the highest verifier peak achieved by any candidate in the session; for
-    /// detected variants it preserves the pre-reset value from the candidate
-    /// that triggered.  The bounded candidate model (mahbot-895) ensures each
-    /// candidate's peak reflects only its own temporal window — no cross-candidate
-    /// contamination.
-    pub peak_verifier_score: f32,
     /// Per-frame adaptive threshold trajectory (mahbot-923 §7).
     /// Records the effective threshold value (`per_frame_scores[i][2]`) at each
     /// embedding frame so the two-tier ADAPTIVE_CEILING escalation plan
@@ -5440,43 +5064,11 @@ pub(crate) struct DetectionInstrumentation {
     /// When this is non-zero AND detection rate is below target, the ceiling
     /// is the likely limiting factor and escalation should be considered.
     pub ceiling_limited_frames: usize,
-    /// Per-frame peak verifier score (mahbot-1005 §4).  One entry per embedding
-    /// frame, parallel to [`per_frame_scores`](Self::per_frame_scores).  A value
-    /// of 0.0 means the verifier was not evaluated on that frame (verifier
-    /// warm-up period, or untrained verifier) — it is NOT a rejection with zero
-    /// confidence.  Previously `max_verifier_score` was computed and discarded
-    /// at the [`score_stride8_window`] call site.
-    pub per_frame_verifier_scores: Vec<f32>,
-    /// Number of frames where the classifier triggered (rolling sum reached the
-    /// effective threshold) but detection was suppressed by verifier warm-up
-    /// (embedding ring below [`VERIFIER_WARMUP_EMBEDDINGS`] with a trained
-    /// verifier).  Feed for the benchmark's `warmup_suppression` verdict
-    /// (mahbot-1005 §2).
-    pub n_warmup_suppressed_frames: usize,
-    /// Number of bounded classifier candidates created during this session
-    /// (mahbot-1005 §4).
-    pub candidates_created: usize,
-    /// Number of candidates that reached verifier confirmation (detection fired
-    /// via the candidate path).
-    pub candidates_confirmed: usize,
-    /// Number of candidates cleared without confirmation — either expired via
-    /// [`CANDIDATE_MAX_EMBEDDINGS`] or reset by a below-`NO_MATCH_RESET_THRESHOLD`
-    /// score frame.  The two paths are distinguished at report time via the
-    /// frame's `total_score` (reset-rejection iff the clearing frame scored
-    /// below `NO_MATCH_RESET_THRESHOLD`).
-    pub candidates_expired: usize,
     /// Index into [`per_frame_scores`](Self::per_frame_scores) of the first
     /// frame where the rolling sum reached the effective threshold (classifier
     /// trigger).  `None` if the classifier never triggered on test-utterance
     /// frames (mahbot-1005 §2 evidence).
     pub first_trigger_frame_idx: Option<usize>,
-    /// Maximum rolling sum achieved by warm-up audio only (mahbot-1005 §1).
-    /// Captured at the [`consume_warmup`](crate::audio::voice_pipeline_e2e_test::consume_warmup)
-    /// instrumentation reset so the warm-up "head start" remains observable
-    /// instead of being silently discarded.
-    pub warmup_max_rolling_sum: f32,
-    /// Peak verifier score achieved by warm-up audio only (mahbot-1005 §1).
-    pub warmup_peak_verifier_score: f32,
 
     // ── mahbot-1012 per-frame scoring geometry ────────────────────────────
     // All `per_frame_*` arrays below are parallel to
@@ -5507,9 +5099,6 @@ pub(crate) struct DetectionInstrumentation {
     /// Adaptive-threshold mode (bootstrap / feed / peek) of each scored frame.
     /// See [`AdaptiveFrameMode`].
     pub per_frame_adaptive_mode: Vec<AdaptiveFrameMode>,
-    /// Candidate lifecycle state after each scored frame.  See
-    /// [`CandidateFrameState`].
-    pub per_frame_candidate_state: Vec<CandidateFrameState>,
     /// Number of preserved warm-up embeddings at the start of the test
     /// utterance (set by the benchmark's `consume_warmup` after the
     /// instrumentation reset).  Used to classify the first test windows as
@@ -5539,22 +5128,7 @@ pub(crate) struct DetectionInstrumentation {
     pub segment_end_pass_fired: bool,
     /// Scoring path that produced the detection (raw source: "burst" /
     /// "segment_end_pass" / "other").  None until a detection fires.
-    /// "other" is the PRIMARY expected path when it confirms a
-    /// burst-created candidate (reclassified to "burst_continuation" at
-    /// report time via [`candidate_created_path`](Self::candidate_created_path));
-    /// it is a genuine unexpected-path signal only when the main loop
-    /// created its own candidate.
     pub detection_path: Option<&'static str>,
-    /// Scoring path that created the CURRENTLY-active classifier candidate
-    /// ("burst" / "segment_end_pass" / "other").  Updated on every
-    /// candidate creation so it always reflects the ACTIVE candidate's
-    /// origin; cleared when the candidate is cleared (expiry or
-    /// below-reset reset).  `None` when no candidate is active.  This is
-    /// the evidence the enrolled-phase report uses to reclassify a
-    /// main-loop detection of a burst-created candidate as the PRIMARY
-    /// mechanism ("burst_continuation", mahbot-1024) instead of a
-    /// regression signal.
-    pub candidate_created_path: Option<&'static str>,
 }
 
 #[cfg(feature = "voice-tests")]
@@ -5565,17 +5139,9 @@ impl DetectionInstrumentation {
             n_frames_below_reset: 0,
             vad_speech_frames: 0,
             peak_score: 0.0,
-            peak_verifier_score: 0.0,
             adaptive_threshold_trajectory: Vec::new(),
             ceiling_limited_frames: 0,
-            per_frame_verifier_scores: Vec::new(),
-            n_warmup_suppressed_frames: 0,
-            candidates_created: 0,
-            candidates_confirmed: 0,
-            candidates_expired: 0,
             first_trigger_frame_idx: None,
-            warmup_max_rolling_sum: 0.0,
-            warmup_peak_verifier_score: 0.0,
             per_frame_embedding_hashes: Vec::new(),
             per_frame_embedding_l2_norms: Vec::new(),
             per_frame_embeddings: Vec::new(),
@@ -5583,7 +5149,6 @@ impl DetectionInstrumentation {
             per_frame_mel_buffer_len: Vec::new(),
             per_frame_geometry: Vec::new(),
             per_frame_adaptive_mode: Vec::new(),
-            per_frame_candidate_state: Vec::new(),
             test_start_ring_len: 0,
             per_hop_vad: Vec::new(),
             burst_sweep_fired: false,
@@ -5591,7 +5156,6 @@ impl DetectionInstrumentation {
             burst_wall_clock_ms: None,
             segment_end_pass_fired: false,
             detection_path: None,
-            candidate_created_path: None,
         }
     }
 }
@@ -5750,19 +5314,6 @@ pub(crate) struct PipelineCtx {
     /// session.  Reset on each detection attempt.  Used by the E2E
     /// benchmark for per-variant peak score reporting.
     peak_score: f32,
-    /// Active bounded classifier candidate (mahbot-895).
-    ///
-    /// When `Some`, the classifier's rolling sum has crossed the threshold
-    /// and this candidate is accumulating verifier evidence from subsequent
-    /// embeddings.  The candidate either triggers detection (verifier peak
-    /// reaches threshold), expires (max window exceeded without trigger or
-    /// score drops below [`NO_MATCH_RESET_THRESHOLD`]), or is cleared on
-    /// pipeline resets (Full, Soft, Cancel) and segment boundaries.
-    ///
-    /// Replaces the previous session-lifetime `peak_verifier_score` field.
-    /// Each candidate's verifier peak is bounded to its own temporal window,
-    /// eliminating cross-candidate contamination (mahbot-895).
-    candidate: Option<ClassifierCandidate>,
 
     /// Consecutive VAD-negative frame hops since the last VAD-positive frame,
     /// accumulated across calls to [`handle_wake_word_detection`] (mahbot-894).
@@ -5896,7 +5447,6 @@ impl PipelineCtx {
                     .clamp(ADAPTIVE_K_MIN, ADAPTIVE_K_MAX)
             },
             peak_score: 0.0,
-            candidate: None,
             segment_silence_hops: 0,
             next_window_start: 0,
             burst_sweep_done: false,
@@ -5971,7 +5521,6 @@ impl PipelineCtx {
                 reset_vad();
                 self.adaptive_threshold.reset();
                 self.peak_score = 0.0;
-                self.candidate = None;
                 self.next_window_start = 0;
 
                 // Full does NOT clear global enrollment accumulators — those
@@ -5987,11 +5536,10 @@ impl PipelineCtx {
                 self.audio_preprocessor.clear_buffer();
                 // Clear any active candidate (mahbot-895).  A stale candidate
                 // from the previous detection session would carry cross-candidate
-                // verifier contamination across Soft pipeline resets (which occur
+                // cross-utterance contamination across Soft pipeline resets (which occur
                 // during the detection→recording handoff).  The candidate will
                 // be re-created naturally when the rolling sum next crosses the
                 // threshold.
-                self.candidate = None;
                 // Reset stride-8 window position so the next utterance starts
                 // from the first mel frame (mahbot-923).
                 self.next_window_start = 0;
@@ -6002,7 +5550,6 @@ impl PipelineCtx {
                 self.audio_preprocessor.clear_buffer();
                 self.adaptive_threshold.reset();
                 self.peak_score = 0.0;
-                self.candidate = None;
                 self.next_window_start = 0;
 
                 // Cancel also clears global enrollment accumulators.
@@ -6016,18 +5563,17 @@ impl PipelineCtx {
     /// consecutive VAD-negative hops have been observed since the last
     /// VAD-positive frame.
     ///
-    /// This prevents classifier scores, rolling sums, and verifier state from
+    /// This prevents classifier scores and rolling sums from
     /// accumulating across separate utterances separated by more than ~300 ms
     /// of silence, which was a structural source of false triggers.
     ///
     /// | Field | Reset? | Rationale |
     /// |---|---|---|
     /// | `voice_batch`, `mel_frame_buffer` | No (caller-managed) | These are taken via `std::mem::take` into local variables before this method runs (see [`handle_wake_word_detection`]); the caller clears the locals separately. Clearing them here would be a no-op. |
-    /// | `embedding_ring` | Yes | Prevents stale embeddings from mixing with new utterance; note this re-enters the verifier warm-up period (first 4 embeddings ~512 ms have suppressed detection during which detection cannot fire), an accepted trade-off that matches cooldown-expiry behaviour. Warm-up is addressed as a separate concern (mahbot-903). |
+    /// | `embedding_ring` | Yes | Prevents stale embeddings from mixing with new utterance; matches cooldown-expiry behaviour. |
     /// | `score_window` | Yes | **Critical**: rolling scores must not accumulate across utterances — this is the primary false-trigger mechanism this function fixes |
     /// | `adaptive_threshold` | Yes | Noise floor estimate is per-segment; the 5-call bootstrap (~640 ms of voiced frames at ~128 ms/embedding) is brief and acceptable |
     /// | `peak_score` | Yes | Diagnostic peak for the current segment; captured to `instrumentation` before clearing |
-    /// | `candidate` | Yes | Stale candidate from previous utterance would carry cross-candidate verifier contamination (mahbot-895) |
     /// | `segment_silence_hops` | Yes | Reset the silence counter so the next segment starts fresh |
     ///
     /// **Preserved**: `voice_batch`, `mel_frame_buffer` (caller-managed, see above),
@@ -6037,36 +5583,22 @@ impl PipelineCtx {
     /// `is_recording`, `audio_preprocessor` (noise profile survives).
     ///
     /// ## Instrumentation save (`#[cfg(feature = "voice-tests")]`)
-    /// Before clearing per-segment scores, the running max of both
-    /// `peak_score` and `peak_verifier_score` is flushed to `self.instrumentation`
+    /// Before clearing per-segment scores, the running max of
+    /// `peak_score` is flushed to `self.instrumentation`
     /// so the E2E benchmark (which reads instrumentation after
     /// `run_streaming_detection` returns) captures the true cross-segment maxima
     /// even when a segment boundary fires during silence-flush post-processing.
-    /// ### Bounded candidate flush (mahbot-895)
-    /// Before clearing, the active candidate's `peak_verifier_score` is flushed
-    /// to `self.instrumentation` so the E2E benchmark captures the candidate's
-    /// peak verifier evidence.  This replaces the previous session-lifetime
-    /// `peak_verifier_score` accumulator.
     fn reset_detection_segment(&mut self) {
         // ── Save diagnostic peaks before clearing (voice-tests only) ──
         #[cfg(feature = "voice-tests")]
         {
-            // Save the running max of both peaks so cross-segment maxima
+            // Save the running max of the peak so cross-segment maxima
             // survive the clearing below.  Without this, a segment boundary
             // that fires during silence-flush post-processing (between the
             // last on_flush call and the reset) would lose the peaks from
             // the just-ended segment.
             if self.peak_score > self.instrumentation.peak_score {
                 self.instrumentation.peak_score = self.peak_score;
-            }
-            // Flush the active candidate's verifier peak before clearing
-            // (mahbot-895).  The candidate is bounded to a single utterance's
-            // temporal window, so its peak is the correct evidence for this
-            // segment.
-            if let Some(c) = &self.candidate
-                && c.peak_verifier_score > self.instrumentation.peak_verifier_score
-            {
-                self.instrumentation.peak_verifier_score = c.peak_verifier_score;
             }
         }
 
@@ -6078,9 +5610,6 @@ impl PipelineCtx {
         // ── Reset threshold/scores ──
         self.adaptive_threshold.reset();
         self.peak_score = 0.0;
-        // Clear active candidate (mahbot-895): each segment gets its own
-        // independent candidate, bounded to its temporal window.
-        self.candidate = None;
 
         // ── Reset silence counter ──
         self.segment_silence_hops = 0;
@@ -6118,7 +5647,7 @@ impl PipelineCtx {
     ///
     /// If `hop_count` reaches [`SEGMENT_TIMEOUT_HOPS`], resets per-segment
     /// detection state and clears the caller's local batch buffers so that
-    /// classifier scores, rolling sums, and verifier state do not accumulate
+    /// classifier scores and rolling sums do not accumulate
     /// across separate utterances.
     ///
     /// If `hop_count` is below the threshold, persists the counter in
@@ -6150,7 +5679,7 @@ impl PipelineCtx {
             // starts 0/8/16 with 68/60/52 real frames), full accumulated
             // buffer for shorter ones — at start-aligned positions with
             // padded geometry.  This pass can CONFIRM exactly like the cold
-            // burst (the ring-4 verifier sample ≥ VERIFIER_ACCEPTANCE_FLOOR
+            // burst (the ring-4 sample fires at position 24),
             // fires at position 24), so it is the overrun safety net for the
             // deferred burst.  (The ticket's original "must confirm before
             // the misaligned re-score" hazard does not manifest at live
@@ -6183,7 +5712,7 @@ impl PipelineCtx {
                 // Score from start-aligned position 0 with padded geometry —
                 // NOT from a stale window start.  The shared
                 // `start_aligned_positions` grid covers the burst-equivalent
-                // positions, so the ring-4 verifier sample at position 24 can
+                // positions, so the ring-4 sample at position 24 can
                 // confirm exactly like the cold burst (manager pin 3).  The
                 // pass gate does NOT consult the `burst_sweep_done` latch (a
                 // failed burst must not suppress the boundary fallback) —
@@ -6514,7 +6043,7 @@ fn schedule_listening_transition(ctx: &mut PipelineCtx) {
     });
 }
 
-/// Finalize the enrollment pipeline: train classifier + verifier with 4-tier
+/// Finalize the enrollment pipeline: train the classifier with
 /// negative weights (ambient → owner-negative → unrelated → confusable).
 ///
 /// Extracted from the original training block in `handle_enrollment_sample`
@@ -6567,12 +6096,7 @@ async fn finalize_enrollment_pipeline() -> bool {
                 };
                 match process_enrollment_sample(chunk) {
                     Ok(embs) => {
-                        neg_seqs.push(EmbeddingSequence::negative(
-                            chunk_id,
-                            Source::Ambient,
-                            None,
-                            embs,
-                        ));
+                        neg_seqs.push(EmbeddingSequence::new(chunk_id, Source::Ambient, embs));
                     }
                     Err(e) => warn!(
                         "Failed to extract dense negative embedding \
@@ -6602,12 +6126,7 @@ async fn finalize_enrollment_pipeline() -> bool {
                 };
                 match process_enrollment_sample(chunk) {
                     Ok(embs) => {
-                        owner_seqs.push(EmbeddingSequence::negative(
-                            chunk_id,
-                            Source::Owner,
-                            None,
-                            embs,
-                        ));
+                        owner_seqs.push(EmbeddingSequence::new(chunk_id, Source::Owner, embs));
                     }
                     Err(e) => warn!(
                         "Failed to extract dense owner-negative embedding \
@@ -6651,7 +6170,7 @@ async fn finalize_enrollment_pipeline() -> bool {
 
     // ── Build positive sequences for training (dense-only after mahbot-923) ──
     let mut pos_sequences: Vec<EmbeddingSequence> = Vec::with_capacity(enrollment_buffer.len());
-    pos_sequences.extend(enrollment_buffer.clone()); // .clone() — verifier needs this too
+    pos_sequences.extend(enrollment_buffer.clone());
 
     // ── Build negative sequences for classifier training ──
     let confusable_dense = confusable_dense_embeddings();
@@ -6663,7 +6182,7 @@ async fn finalize_enrollment_pipeline() -> bool {
             "Adding {n_ambient_classifier} dense ambient negative \
              sequences to classifier negative set (mahbot-923)",
         );
-        neg_sequences.extend(negative_sequences.clone()); // clone — used again for verifier
+        neg_sequences.extend(negative_sequences.clone());
     }
     let n_owner_classifier = owner_negative_sequences.len();
     if n_owner_classifier > 0 {
@@ -6671,7 +6190,7 @@ async fn finalize_enrollment_pipeline() -> bool {
             "Adding {n_owner_classifier} owner-negative dense sequences \
              to classifier negative set (mahbot-932)",
         );
-        neg_sequences.extend(owner_negative_sequences.clone()); // clone — used again for verifier
+        neg_sequences.extend(owner_negative_sequences.clone());
     }
     if use_mahbot_confusables && !confusable_dense.is_empty() {
         info!(
@@ -6689,7 +6208,7 @@ async fn finalize_enrollment_pipeline() -> bool {
         neg_sequences.extend_from_slice(unrelated_dense);
     }
 
-    // Note: class-balanced weights (not per-tier weights like the verifier)
+    // Note: class-balanced weights
     // — this is an intentional design difference (mahbot-932).
 
     // ── Classifier training via finalize_enrollment ──
@@ -6718,184 +6237,7 @@ async fn finalize_enrollment_pipeline() -> bool {
         }
     };
 
-    // ── Train verifier in spawn_blocking (CPU-bound Conv1D) ──
-    let pos_for_ver_seqs = enrollment_buffer; // moved — cloned above for classifier
-    let self_test_seqs = pos_for_ver_seqs.clone();
-    let confusable_embs = confusable_dense_embeddings();
-    let unrelated_embs = unrelated_dense_embeddings();
-    let n_confusable_pre = if use_mahbot_confusables {
-        confusable_embs.len()
-    } else {
-        0
-    };
-    let n_unrelated_pre = unrelated_embs.len();
-    let n_ambient_pre = negative_sequences.len();
-    let n_owner_pre = owner_negative_sequences.len();
-
-    // Build negative sequences: ambient → owner-negative → unrelated → confusable.
-    let neg_for_verifier_seqs = {
-        let mut neg: Vec<EmbeddingSequence> = Vec::new();
-        // Ambient first (per-chunk sequences, each weight 1.0)
-        if n_ambient_pre > 0 {
-            info!(
-                "Adding {n_ambient_pre} dense ambient negative \
-                 sequences to verifier negative set (mahbot-923)",
-            );
-            neg.extend(negative_sequences); // moved — per-chunk EmbeddingSequences
-        }
-        // Owner-negative second (Phase 3 speech chunks)
-        if n_owner_pre > 0 {
-            info!(
-                "Adding {n_owner_pre} owner-negative dense \
-                 sequences to verifier negative set (mahbot-913)",
-            );
-            neg.extend(owner_negative_sequences); // moved
-        }
-        // Unrelated speech next
-        if !unrelated_embs.is_empty() {
-            info!(
-                "Adding {} pre-computed unrelated speech dense \
-                         sequences to verifier negative set (mahbot-923)",
-                unrelated_embs.len(),
-            );
-            neg.extend_from_slice(unrelated_embs);
-        }
-        // Confusable last
-        if use_mahbot_confusables && !confusable_embs.is_empty() {
-            info!(
-                "Adding {} pre-computed confusable phrase dense \
-                         sequences to verifier negative set for Mahbot wake word \
-                         '{enrolled_phrase}' (mahbot-923)",
-                confusable_embs.len(),
-            );
-            neg.extend_from_slice(confusable_embs);
-        }
-        neg
-    };
-
-    let verifier = tokio::task::spawn_blocking(move || {
-        use crate::audio::voice_verifier::{
-            assert_weight_tier, CONFUSABLE_UPWEIGHT,
-            CONV_L2_LAMBDA, DEFAULT_VERIFIER_THRESHOLD, MIN_POSITIVE_WINDOWS,
-            UNRELATED_UPWEIGHT, VoiceVerifier,
-        };
-
-        if pos_for_ver_seqs.is_empty() {
-            warn!("Could not train verifier: no valid positive sequences");
-            VoiceVerifier::untrained()
-        } else if !neg_for_verifier_seqs.is_empty() {
-            let n_neg = neg_for_verifier_seqs.len();
-            let n_confusable = n_confusable_pre;
-            let n_unrelated = n_unrelated_pre;
-            let n_ambient = n_ambient_pre;
-            let n_owner = n_owner_pre;
-            let n_ambient_from_total = n_neg.saturating_sub(n_owner + n_confusable + n_unrelated);
-            debug_assert_eq!(n_ambient, n_ambient_from_total,
-                "ambient sequence count mismatch: expected {n_ambient}, total neg sequences {n_neg} - owner {n_owner} - confusable {n_confusable} - unrelated {n_unrelated} = {n_ambient_from_total}");
-
-            // ── 4-tier weight construction (mahbot-913) ──
-            // Order: ambient (1.0×) → owner-negative (OWNER_NEGATIVE_UPWEIGHT×)
-            //        → unrelated (UNRELATED_UPWEIGHT×) → confusable (CONFUSABLE_UPWEIGHT×)
-            let mut per_neg_weights: Vec<f32> = Vec::with_capacity(n_neg);
-            per_neg_weights.extend(std::iter::repeat_n(1.0, n_ambient));
-            if n_owner > 0 {
-                per_neg_weights.extend(std::iter::repeat_n(
-                    OWNER_NEGATIVE_UPWEIGHT, n_owner));
-            }
-            per_neg_weights.extend(std::iter::repeat_n(
-                UNRELATED_UPWEIGHT, n_unrelated));
-            per_neg_weights.extend(std::iter::repeat_n(
-                CONFUSABLE_UPWEIGHT, n_confusable));
-            info!(
-                "Building per-sequence weights: {n_ambient} ambient (1.0) + \
-                 {n_owner} owner-negative ({OWNER_NEGATIVE_UPWEIGHT}×) + \
-                 {n_unrelated} unrelated ({UNRELATED_UPWEIGHT}×) + \
-                 {n_confusable} confusable ({CONFUSABLE_UPWEIGHT}×) for \
-                 {n_neg} total negative sequences (mahbot-913)",
-            );
-            // Structural guard: verify weight ordering matches concatenation
-            // order (ambient → owner-negative → unrelated → confusable).
-            assert_weight_tier(&per_neg_weights, 0, n_ambient, 1.0, "ambient");
-            if n_owner > 0 {
-                assert_weight_tier(
-                    &per_neg_weights,
-                    n_ambient,
-                    n_owner,
-                    OWNER_NEGATIVE_UPWEIGHT,
-                    "owner-negative",
-                );
-            }
-            assert_weight_tier(
-                &per_neg_weights,
-                n_ambient + n_owner,
-                n_unrelated,
-                UNRELATED_UPWEIGHT,
-                "unrelated",
-            );
-            assert_weight_tier(
-                &per_neg_weights,
-                n_ambient + n_owner + n_unrelated,
-                n_confusable,
-                CONFUSABLE_UPWEIGHT,
-                "confusable",
-            );
-
-            let v = VoiceVerifier::train_ensemble(
-                &pos_for_ver_seqs,
-                &neg_for_verifier_seqs,
-                Some(&per_neg_weights),
-                DEFAULT_VERIFIER_THRESHOLD,
-                CONV_L2_LAMBDA,
-            );
-            if v.is_trained() {
-                info!(
-                    "Verifier trained from {} positive + {} \
-                     negative sequence(s) (ambient + owner-negative + unrelated + \
-                     confusable, mahbot-913; {}-member seed ensemble, mahbot-1025)",
-                    pos_for_ver_seqs.len(),
-                    n_neg,
-                    v.ensemble_size(),
-                );
-            } else {
-                warn!(
-                    "Verifier left UNTRAINED (no-op): {} positive sequences produced \
-                     fewer than the {MIN_POSITIVE_WINDOWS}-window minimum \
-                     (mahbot-1008 Fix 2).  A reject-all brick wall is worse than \
-                     no verifier — wake words will pass with classifier-only gating.",
-                    pos_for_ver_seqs.len(),
-                );
-            }
-            v
-        } else {
-            let v = VoiceVerifier::train_ensemble_with_synthetic_negatives(
-                &pos_for_ver_seqs,
-                DEFAULT_VERIFIER_THRESHOLD,
-            );
-            if v.is_trained() {
-                info!(
-                    "Verifier trained from {} positive \
-                     sequence(s) + synthetic negatives (no real or confusable \
-                     negatives available, mahbot-859; {}-member seed ensemble, mahbot-1025)",
-                    pos_for_ver_seqs.len(),
-                    v.ensemble_size(),
-                );
-            } else {
-                warn!(
-                    "Verifier left UNTRAINED (no-op): {} positive sequences produced \
-                     fewer than the {MIN_POSITIVE_WINDOWS}-window minimum \
-                     (mahbot-1008 Fix 2).  Wake words will pass with \
-                     classifier-only gating.",
-                    pos_for_ver_seqs.len(),
-                );
-            }
-            v
-        }
-    })
-    .await
-    .unwrap_or_else(|e| {
-        warn!("Verifier training task panicked: {e}");
-        crate::audio::voice_verifier::VoiceVerifier::untrained()
-    });
+    let self_test_seqs = enrollment_buffer;
 
     // ── Cancel guard: check before persisting (mahbot-913) ──
     if crate::shutdown::shutdown_token().is_cancelled() {
@@ -6917,9 +6259,8 @@ async fn finalize_enrollment_pipeline() -> bool {
     }
     info!("Enrollment self-test: passed — deploying model");
 
-    // ── Store classifier + verifier in global state ──
+    // ── Store classifier in global state ──
     set_classifier_weights(weights);
-    set_verifier(verifier);
 
     // ── Persist to config DB ──
     persist_model_state().await;
@@ -6933,33 +6274,6 @@ async fn finalize_enrollment_pipeline() -> bool {
     }
 
     true
-}
-
-/// Apply the mahbot-1008 load-time guard to a persisted verifier.
-///
-/// A collapsed (constant input-independent reject) verifier — e.g. the pre-fix
-/// `sigmoid(fc_bias) = 6.67e-8` brick wall — is handled by dropping ONLY the
-/// collapsed members and keeping the healthy ones, so already-enrolled users
-/// are not blocked from wake-word detection until they re-enroll.  For a
-/// 10-member ensemble with one collapsed brick this keeps nine healthy members
-/// (mahbot-1025) instead of degrading to classifier-only gating; a verifier
-/// with no healthy members left falls back to an untrained no-op.
-fn resolve_loaded_verifier(v: &VoiceVerifier) -> VoiceVerifier {
-    if !v.is_collapsed() {
-        return v.clone();
-    }
-    warn!(
-        "Loaded verifier contains collapsed member(s) (constant input-independent \
-         reject) — dropping them and keeping the healthy members (mahbot-1008/1025)."
-    );
-    let resolved = v.without_collapsed_members();
-    if !resolved.is_trained() {
-        warn!(
-            "Loaded verifier has no healthy members left — treating as untrained \
-             no-op (mahbot-1008).  Re-enrollment will train a fixed verifier."
-        );
-    }
-    resolved
 }
 
 /// Run the voice pipeline background task.
@@ -7002,16 +6316,6 @@ pub async fn run_voice_pipeline() {
                     );
                 }
 
-                // ── Hash verification (warning only, non-gating) ────
-                if !model.model_hash.is_empty()
-                    && let Err(e) = verify_model_hash(&model)
-                {
-                    warn!(
-                        "Wake word model hash mismatch (data may be corrupted): {e}. \
-                             Re-training will fix this."
-                    );
-                }
-
                 // ── Load model data ─────────────────────────────────
                 let all_valid = model
                     .classifier
@@ -7021,23 +6325,10 @@ pub async fn run_voice_pipeline() {
                     if let Some(ref members) = model.classifier {
                         set_classifier_weights(members[0].clone());
                     }
-                    // ── Verifier load guard (mahbot-1008/1025) ──
-                    // Already-enrolled users may have persisted a collapsed
-                    // reject-all verifier (constant input-independent output,
-                    // e.g. sigmoid(fc_bias) = 6.67e-8).  Detecting it here and
-                    // dropping ONLY the collapsed members (keeping the healthy
-                    // ensemble members, or degrading to an untrained no-op when
-                    // none remain) restores wake-word detection immediately;
-                    // re-enrollment trains a fixed verifier.  Keeping a
-                    // constant-reject brick would block every wake word until
-                    // the user re-enrolls.
-                    if let Some(ref v) = model.verifier {
-                        set_verifier(resolve_loaded_verifier(v));
-                    }
                     let n = model.classifier.as_ref().map_or(0, Vec::len);
                     info!(
                         "Loaded wake word model from config \
-                         (v{}, {} classifier weight set(s) + verifier, phrase={})",
+                         (v{}, {} classifier weight set(s), phrase={})",
                         model.schema_version, n, model.phrase,
                     );
                     // Cache the phrase from the loaded model so
@@ -7146,7 +6437,7 @@ pub async fn run_voice_pipeline() {
                 // contaminating:
                 //   - noise suppressor / AGC internal state
                 //   - earshot VAD ring buffer and noise floor estimate
-                //   - wake word classifier embeddings and verifier scores
+                //   - wake word classifier embeddings and scores
                 //   - enrollment noise RMS estimates (pre-AGC ring buffer)
                 //
                 // The gate stays active for a reverb tail period after playback
@@ -7391,11 +6682,11 @@ fn check_enrollment_utterance_length(
 // Implementation note: `apply_gain`, `generate_pink_noise`, and `add_noise`
 // are defined in `crate::util` (mahbot-878 canonical implementations).
 //
-/// Extracts dense stride-8 embeddings for Conv1D classifier and verifier
+/// Extracts dense stride-8 embeddings for the Conv1D classifier
 /// training (mahbot-856, mahbot-923).  After mahbot-923, only dense stride-8
 /// embeddings are used — streaming extraction was removed.  Dense embeddings
 /// provide a strong learning signal (many windows per utterance) and the same
-/// distribution is used for both classifier and verifier training.
+/// distribution is used for classifier training.
 ///
 /// ONNX inference is CPU-bound (mel spectrogram + embedding computation).
 /// It runs on a blocking thread via `spawn_blocking` to avoid starving
@@ -7520,21 +6811,21 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
         .enrolled_utterance_count;
 
     // Collect results into a single EmbeddingSequence buffer.  After mahbot-923,
-    // both classifier and verifier train on the same dense stride-8 embedding
+    // the classifier trains on the same dense stride-8 embedding
     // distribution — streaming extraction was removed.
     let mut old_results: Vec<EmbeddingSequence> = Vec::with_capacity(5);
 
     // Helper macro: push variant embeddings if extraction succeeded.
     // After mahbot-923, each variant yields a single EmbeddingSequence (dense).
     macro_rules! push_variant {
-        ($variant_index:expr, $source:expr, $aug_family:expr, $dense:expr) => {
+        ($variant_index:expr, $source:expr, $dense:expr) => {
             match $dense {
                 Ok(embs) => {
                     let id = UtteranceId {
                         sequence_index: enrollment_index,
                         variant_index: $variant_index,
                     };
-                    old_results.push(EmbeddingSequence::positive(id, $source, $aug_family, embs));
+                    old_results.push(EmbeddingSequence::new(id, $source, embs));
                 }
                 Err(ref e) => {
                     warn!(
@@ -7544,44 +6835,23 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
                 }
             }
         };
-        ($variant_index:expr, $source:expr, $aug_family:expr, $dense:expr, optional) => {
+        ($variant_index:expr, $source:expr, $dense:expr, optional) => {
             if let Some(dense_res) = $dense {
-                push_variant!($variant_index, $source, $aug_family, dense_res);
+                push_variant!($variant_index, $source, dense_res);
             }
         };
     }
 
     // Original (variant 0) — file under Source::Enrollment, no augmentation
-    push_variant!(0, Source::Enrollment, None, results.0);
-    // Speed-down (variant 1) — Augmentation with SpeedDown family
-    push_variant!(
-        1,
-        Source::Augmentation,
-        Some(AugmentationFamily::SpeedDown),
-        results.1
-    );
+    push_variant!(0, Source::Enrollment, results.0);
+    // Speed-down (variant 1)
+    push_variant!(1, Source::Augmentation, results.1);
     // Speed-up (variant 2, optional — skipped when utterance <500ms unpadded duration)
-    push_variant!(
-        2,
-        Source::Augmentation,
-        Some(AugmentationFamily::SpeedUp),
-        results.2,
-        optional
-    );
+    push_variant!(2, Source::Augmentation, results.2, optional);
     // Volume-down (variant 3)
-    push_variant!(
-        3,
-        Source::Augmentation,
-        Some(AugmentationFamily::Volume),
-        results.3
-    );
+    push_variant!(3, Source::Augmentation, results.3);
     // Noise (variant 4)
-    push_variant!(
-        4,
-        Source::Augmentation,
-        Some(AugmentationFamily::Noise),
-        results.4
-    );
+    push_variant!(4, Source::Augmentation, results.4);
 
     let (utterance_count, count, quality) = {
         let mut state = voice_state().write().unwrap_poison();
@@ -7631,7 +6901,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
 /// dimensions).
 pub(crate) const MODEL_SCHEMA_VERSION: u32 = 1;
 
-/// Serialisable form of the wake word model (classifier + verifier + versioning).
+/// Serialisable form of the wake word model (classifier + versioning).
 ///
 /// # Versioning & Compatibility
 ///
@@ -7640,8 +6910,6 @@ pub(crate) const MODEL_SCHEMA_VERSION: u32 = 1;
 /// - `schema_version` is not a recognized version (currently only 1).
 /// - `embedding_dim` does not match the runtime `EMBEDDING_DIM` (96).
 /// - `window_size` does not match the runtime `WINDOW_SIZE` (3).
-/// - `model_hash` is non-empty and does not match a recomputed hash of the
-///   other fields (data integrity check).
 ///
 /// # Legacy Migration (mahbot-898)
 ///
@@ -7677,13 +6945,6 @@ struct PersistedModel {
     #[serde(default)]
     trained_at: String,
 
-    // ── Integrity ─────────────────────────────────────────────────
-    /// SHA-256 hex digest of the canonical JSON representation of all
-    /// other fields (computed at persist time, verified at load time).
-    /// Empty string = hash not computed (legacy or migration in progress).
-    #[serde(default)]
-    model_hash: String,
-
     // ── Model Data ────────────────────────────────────────────────
     /// Single classifier weight set, stored as Vec for backward compat with
     /// persisted models.
@@ -7694,9 +6955,6 @@ struct PersistedModel {
     /// newly persisted models and never read on load (uniform averaging).
     #[serde(skip_serializing_if = "Option::is_none")]
     val_losses: Option<Vec<f32>>,
-    /// Second-stage Conv1D verifier.
-    #[serde(default)]
-    verifier: Option<VoiceVerifier>,
 }
 
 // ── Default helpers for serde ────────────────────────────────────────
@@ -7770,23 +7028,6 @@ where
     }
 }
 
-/// Compute the SHA-256 hash of the model's canonical JSON representation,
-/// excluding the `model_hash` field itself.
-///
-/// The canonical form is: serialize to `serde_json::Value`, remove the
-/// `model_hash` key, re-serialize to string, hash.
-fn compute_model_hash(model: &PersistedModel) -> String {
-    let mut canonical =
-        serde_json::to_value(model).expect("PersistedModel serialization must not fail");
-    if let Some(obj) = canonical.as_object_mut() {
-        obj.remove("model_hash");
-    }
-    let json = serde_json::to_string(&canonical).expect("JSON value serialization must not fail");
-    let mut hasher = Sha256::new();
-    hasher.update(json.as_bytes());
-    hex_string(&hasher.finalize())
-}
-
 /// Check that a loaded model is compatible with the running system.
 ///
 /// Fails with a descriptive message if:
@@ -7824,27 +7065,11 @@ fn check_model_compatibility(model: &PersistedModel) -> Result<()> {
     Ok(())
 }
 
-/// Verify the model hash if present. Returns `Ok(())` when hash is empty
-/// (legacy model without hash) or when the hash matches.
-fn verify_model_hash(model: &PersistedModel) -> Result<()> {
-    if model.model_hash.is_empty() {
-        return Ok(());
-    }
-    let computed = compute_model_hash(model);
-    anyhow::ensure!(
-        computed == model.model_hash,
-        "Model hash mismatch: stored={stored}, computed={computed}",
-        stored = model.model_hash,
-    );
-    Ok(())
-}
-
 /// Migrate a legacy (v0) model to the current schema version in-place.
 ///
 /// Fills in default values for fields that the legacy format did not store
-/// (phrase, embedding_dim, window_size, created_at, trained_at, model_hash).
+/// (phrase, embedding_dim, window_size, created_at, trained_at).
 /// After migration, `model.schema_version` is `MODEL_SCHEMA_VERSION` and
-/// `model.model_hash` is computed from the migrated fields.
 ///
 /// Returns early (no-op) if the model is not legacy (schema_version != 0) or
 /// if the model has no classifier data — the latter prevents accidental
@@ -7875,7 +7100,6 @@ fn migrate_legacy_model(model: &mut PersistedModel) {
         model.created_at.clone_from(&now);
     }
     model.trained_at = now;
-    model.model_hash = compute_model_hash(model);
 }
 
 impl Default for PersistedModel {
@@ -7888,10 +7112,8 @@ impl Default for PersistedModel {
             training_seeds: Vec::new(),
             created_at: String::new(),
             trained_at: String::new(),
-            model_hash: String::new(),
             classifier: None,
             val_losses: None,
-            verifier: None,
         }
     }
 }
@@ -7928,10 +7150,9 @@ async fn persist_wake_word_model(model: &PersistedModel) -> bool {
     true
 }
 
-/// Persist current classifier weights and verifier to the config database.
+/// Persist current classifier weights to the config database.
 async fn persist_model_state() {
     let weights = get_classifier_weights();
-    let verifier = get_verifier();
 
     // Read the enrolling phrase (set at enrollment start) and clear it
     // so re-enrollment starts fresh.
@@ -7956,7 +7177,7 @@ async fn persist_model_state() {
 
     let now = turso::now();
 
-    let mut model = PersistedModel {
+    let model = PersistedModel {
         schema_version: MODEL_SCHEMA_VERSION,
         phrase,
         embedding_dim: u32::try_from(EMBEDDING_DIM).unwrap(),
@@ -7970,12 +7191,9 @@ async fn persist_model_state() {
             existing_created_at
         },
         trained_at: now,
-        model_hash: String::new(), // computed below
         classifier: weights.map(|w| vec![w]),
         val_losses: None, // mahbot-904: no longer stored (uniform averaging)
-        verifier: Some(verifier),
     };
-    model.model_hash = compute_model_hash(&model);
 
     if persist_wake_word_model(&model).await {
         // On success, cache the phrase in model_phrase so get_enrolled_phrase()
@@ -8244,7 +7462,7 @@ fn score_start_aligned_positions(
 /// (mahbot-923 stride-8 helper).
 ///
 /// Computes the dense embedding from `mel_window` via ONNX, passes it through
-/// [`score_single_embedding`] with the current classifier and verifier, records
+/// [`score_single_embedding`] with the current classifier, records
 /// instrumentation (feature-gated behind `voice-tests`), and transitions to
 /// recording mode if detection fires.
 ///
@@ -8295,7 +7513,7 @@ fn score_stride8_window(
     };
 
     // ── Scope the read lock so it drops before set_status() ───────────
-    // score_single_embedding needs classifier + verifier from the global
+    // score_single_embedding needs the classifier from the global
     // voice state.  We acquire a read lock, call the function (which only
     // borrows the data temporarily), then let the guard drop at the end of
     // this block.  This avoids a read→write upgrade deadlock: the caller
@@ -8306,44 +7524,25 @@ fn score_stride8_window(
     // Historical context: commit da06926 fixed a double-read-lock in this
     // same function but missed this read→write upgrade path (mahbot-946).
     // Do NOT rely on NLL early-drop — always scope the guard explicitly.
-    // ── Capture pre-call state for candidate-lifecycle and warm-up suppression
-    //    instrumentation (mahbot-1005 §2/§4).  The candidate may be created,
-    //    confirmed, expired, or reset inside score_single_embedding; comparing
-    //    state before/after lets us count lifecycle events without changing
-    //    score_single_embedding's return contract.
+    // ── Capture pre-call ring length for geometry instrumentation ──
     #[cfg(feature = "voice-tests")]
-    let (candidate_active_before, ring_len_before, verifier_trained) = {
-        let state = voice_state().read().unwrap_poison();
-        (
-            ctx.candidate.is_some(),
-            ctx.embedding_ring.len(),
-            state.verifier.is_trained(),
-        )
-    };
+    let ring_len_before = ctx.embedding_ring.len();
     // mahbot-1012: capture the adaptive bootstrap state BEFORE the call —
     // `feed()` advances the bootstrap counter, so post-call `is_bootstrapping()`
     // cannot distinguish the last bootstrap frame from a post-bootstrap frame.
     #[cfg(feature = "voice-tests")]
     let adaptive_bootstrapping_before = ctx.adaptive_threshold.is_bootstrapping();
     #[cfg_attr(not(feature = "voice-tests"), allow(unused_variables))]
-    let (
-        detected,
-        rolling_sum,
-        total_score,
-        effective_threshold,
-        max_verifier_score,
-        candidate_was_created,
-    ) = {
+    let (detected, rolling_sum, total_score, effective_threshold) = {
         let state = voice_state().read().unwrap_poison();
         score_single_embedding(
             &embedding,
             &mut ctx.embedding_ring,
             state.classifier.as_ref(),
-            Some(&state.verifier),
             &mut ctx.score_window,
             Some(&mut ctx.adaptive_threshold),
             ctx.adaptive_k,
-            Some(&mut ctx.candidate),
+            source == WindowSource::DeferredBurst,
         )
     }; // <── read guard dropped here, before any write-lock acquisition
 
@@ -8374,50 +7573,10 @@ fn score_stride8_window(
         if effective_threshold >= ADAPTIVE_CEILING {
             ctx.instrumentation.ceiling_limited_frames += 1;
         }
-        let verifier_peak = ctx.candidate.as_ref().map(|c| c.peak_verifier_score);
-        if let Some(p) = verifier_peak
-            && p > ctx.instrumentation.peak_verifier_score
-        {
-            ctx.instrumentation.peak_verifier_score = p;
-        }
-        // ── mahbot-1005: per-frame verifier scores, candidate lifecycle, and
-        //    warm-up suppression evidence ─────────────────────────────────
-        ctx.instrumentation
-            .per_frame_verifier_scores
-            .push(max_verifier_score);
-        if candidate_was_created {
-            ctx.instrumentation.candidates_created += 1;
-        }
-        if detected {
-            ctx.instrumentation.candidates_confirmed += 1;
-        }
         // mahbot-1023: record the scoring path that produced the detection
-        // (raw source: "burst" / "segment_end_pass" / "other").  mahbot-1024:
-        // "other" is NOT a blanket regression — the enrolled-phase report
-        // reclassifies a main-loop confirmation of a burst-created candidate
-        // to the PRIMARY mechanism ("burst_continuation") using
-        // candidate_created_path below.  Only a main-loop detection whose
-        // candidate was created by the main loop itself is genuinely
-        // unexpected.
+        // (raw source: "burst" / "segment_end_pass" / "other").
         if detected && ctx.instrumentation.detection_path.is_none() {
             ctx.instrumentation.detection_path = Some(source.as_str());
-        }
-        // mahbot-1024: track the scoring path that created the ACTIVE
-        // candidate.  Updated on every candidate creation so it reflects the
-        // CURRENT candidate's origin; cleared when the candidate is cleared
-        // (expiry or below-reset reset).  `candidate_was_created` and the
-        // clear case are mutually exclusive within one call (creation
-        // requires no active candidate; clearing requires !detected), so the
-        // two branches never conflict.
-        if candidate_was_created {
-            ctx.instrumentation.candidate_created_path = Some(source.as_str());
-        } else if candidate_active_before && ctx.candidate.is_none() {
-            ctx.instrumentation.candidate_created_path = None;
-        }
-        // A candidate cleared between frames without confirmation is either an
-        // expiry (CANDIDATE_MAX_EMBEDDINGS exceeded) or a below-reset rejection.
-        if candidate_active_before && ctx.candidate.is_none() && !detected {
-            ctx.instrumentation.candidates_expired += 1;
         }
         // First classifier-trigger frame index.  `rolling_sum >= effective_threshold`
         // mirrors the pre-suppression `detected` computed by process_wake_word_score
@@ -8428,16 +7587,6 @@ fn score_stride8_window(
         {
             ctx.instrumentation.first_trigger_frame_idx =
                 Some(ctx.instrumentation.per_frame_scores.len() - 1);
-        }
-        // Warm-up suppression counter.  score_single_embedding suppresses any
-        // detection while the ring (post-push) is below VERIFIER_WARMUP_EMBEDDINGS
-        // with a trained verifier.  The ring is pushed once per call, so
-        // `ring_len_before + 1` is the post-push length (warm-up lengths are
-        // always well below EMBEDDING_RING_MAX, so the cap never interferes).
-        let is_warmup_frame = verifier_trained
-            && ring_len_before + 1 < crate::audio::voice_verifier::VERIFIER_WARMUP_EMBEDDINGS;
-        if is_warmup_frame && rolling_sum >= effective_threshold {
-            ctx.instrumentation.n_warmup_suppressed_frames += 1;
         }
 
         // ── mahbot-1012: per-frame scoring geometry (parallel to
@@ -8471,17 +7620,6 @@ fn score_stride8_window(
         } else {
             AdaptiveFrameMode::Peek
         };
-        let candidate_state = if detected {
-            CandidateFrameState::Confirmed
-        } else if candidate_was_created {
-            CandidateFrameState::Created
-        } else if candidate_active_before && ctx.candidate.is_some() {
-            CandidateFrameState::Active
-        } else if candidate_active_before {
-            CandidateFrameState::Expired
-        } else {
-            CandidateFrameState::None
-        };
         ctx.instrumentation
             .per_frame_embedding_hashes
             .push(embedding_hash(&embedding));
@@ -8499,9 +7637,6 @@ fn score_stride8_window(
         ctx.instrumentation
             .per_frame_adaptive_mode
             .push(adaptive_mode);
-        ctx.instrumentation
-            .per_frame_candidate_state
-            .push(candidate_state);
     }
 
     if detected {
@@ -8652,7 +7787,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     // ── Stride-8 sliding window embedding extraction (mahbot-923) ──
     // After the VAD-gating loop, iterate over the accumulated mel frame buffer
     // with stride 8, extracting dense embeddings at each position and scoring
-    // through the Conv1D classifier + verifier pipeline.  This replaces the old
+    // through the Conv1D classifier pipeline.  This replaces the old
     // streaming approach that extracted one embedding per batch flush.
     //
     // mahbot-1023 (deferred burst scoring): position 0 is HELD until the
@@ -8818,7 +7953,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     // If we've accumulated enough consecutive VAD-negative hops since the
     // last VAD-positive frame, declare a segment boundary and reset
     // per-segment detection state.  This prevents classifier scores, rolling
-    // sums, and verifier state from accumulating across separate utterances
+    // sums from accumulating across separate utterances
     // separated by more than ~300ms of silence.
     //
     // If detection fired during the frame loop, the pipeline transitioned to
@@ -8902,13 +8037,13 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
 /// status) — utterance construction itself is delegated to the extracted
 /// function (mahbot-823).
 ///
-/// **Verifier negative collection** (mahbot-797): Non-VAD frames captured
+/// **Negative collection** (mahbot-797): Non-VAD frames captured
 /// before the first detected speech (pre-enrollment ambient noise) and during
 /// inter-utterance silence (audio between wake word utterances) are accumulated
 /// into `ctx.negative_audio_buf`. On the first transition to sustained speech,
 /// this buffer is saved as a chunk in `voice_state().negative_audio_chunks`.
 /// These real (non-synthetic) negative examples are later used to train the
-/// wake word verifier at enrollment finalization, replacing the old synthetic
+/// classifier at enrollment finalization, replacing the old synthetic
 /// Gaussian noise that caused false triggers (mahbot-797 Fix 4).
 ///
 /// **VAD symmetry** (mahbot-765): Only VAD-positive frames are accumulated
@@ -8990,11 +8125,11 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                 // quiet environments (mahbot-782 used raw_audio_ring which
                 // contains post-AGC audio, causing this false-positive).
                 let already_had_speech = ctx.utterance_had_speech;
-                // ── Save collected ambient audio for verifier negatives (mahbot-797) ──
+                // ── Save collected ambient audio for negatives (mahbot-797) ──
                 // On the FIRST transition from silence to sustained speech,
                 // save the accumulated non-wake-word audio (pre-enrollment
                 // ambient noise or inter-utterance silence) as a potential
-                // negative training example for the verifier.
+                // negative training example.
                 if !already_had_speech {
                     if ctx.negative_audio_buf.len() >= MIN_NEGATIVE_AUDIO_LEN {
                         let mut state = voice_state().write().unwrap_poison();
@@ -9083,7 +8218,7 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                     set_status(VoiceStatus::WaitingForSilenceDuringEnrollment { sample, total });
                 }
             } else if !ctx.utterance_had_speech {
-                // Accumulate non-VAD audio for verifier negatives (mahbot-797):
+                // Accumulate non-VAD audio for negatives (mahbot-797):
                 // pre-enrollment ambient noise, inter-utterance silence, or
                 // any non-wake-word audio between utterances.  Each frame
                 // contributes HOP_LENGTH new samples.
@@ -9259,11 +8394,6 @@ fn handle_negative_collection_audio(samples: &[f32], ctx: &mut PipelineCtx) {
 mod tests {
     use super::*;
     use crate::EMBEDDING_DIM;
-    use crate::VERIFIER_INPUT_DIM;
-    use crate::audio::voice_verifier::{
-        CONV_VERIFIER_KERNEL_SIZE, CONV_VERIFIER_OUT, DEFAULT_VERIFIER_THRESHOLD,
-        VerifierActivation,
-    };
     use crate::util::test::set_env_var;
     use std::time::{Duration, Instant};
 
@@ -10025,15 +9155,14 @@ mod tests {
         let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
         let mut score_window = Vec::new();
 
-        let (detected, _, _, _, _, _) = score_single_embedding(
+        let (detected, _, _, _) = score_single_embedding(
             &embedding,
             &mut ring,
             Some(&classifier),
-            None,
             &mut score_window,
             None,
             ADAPTIVE_K_DEFAULT,
-            None,
+            false,
         );
 
         // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.316) → window appended.
@@ -10065,15 +9194,14 @@ mod tests {
         let mut score_window = Vec::new();
 
         // First embedding: ring = [a], tiled to [a, a, a] → score ~0.5.
-        let (_detected, _, _, _, _, _) = score_single_embedding(
+        let (_detected, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
-            None,
             &mut score_window,
             None,
             ADAPTIVE_K_DEFAULT,
-            None,
+            false,
         );
         assert!(
             !score_window.is_empty(),
@@ -10087,15 +9215,14 @@ mod tests {
 
         // Second embedding: ring = [a, b], tiled to [a, b, b] → score ~0.5.
         score_window.clear();
-        let (detected, _, _, _, _, _) = score_single_embedding(
+        let (detected, _, _, _) = score_single_embedding(
             &emb,
             &mut ring,
             Some(&classifier),
-            None,
             &mut score_window,
             None,
             ADAPTIVE_K_DEFAULT,
-            None,
+            false,
         );
         assert!(
             !detected,
@@ -10121,11 +9248,10 @@ mod tests {
                 &emb,
                 &mut ring,
                 Some(&classifier),
-                None,
                 &mut score_window,
                 None,
                 ADAPTIVE_K_DEFAULT,
-                None,
+                false,
             );
         }
 
@@ -10152,11 +9278,10 @@ mod tests {
             &embedding,
             &mut ring_tiled,
             Some(&classifier),
-            None,
             &mut sw_tiled,
             None,
             ADAPTIVE_K_DEFAULT,
-            None,
+            false,
         );
         let tiled_score = sw_tiled.last().copied().unwrap_or(0.0);
 
@@ -10168,11 +9293,10 @@ mod tests {
                 &embedding,
                 &mut ring_nat,
                 Some(&classifier),
-                None,
                 &mut sw_nat,
                 None,
                 ADAPTIVE_K_DEFAULT,
-                None,
+                false,
             );
         }
         let natural_score = sw_nat.last().copied().unwrap_or(0.0);
@@ -10210,15 +9334,14 @@ mod tests {
 
         // Send enough embeddings to complete the bootstrap.
         for i in 0..ADAPTIVE_BOOTSTRAP_FRAMES + 1 {
-            let (detected, _, _, _, _, _) = score_single_embedding(
+            let (detected, _, _, _) = score_single_embedding(
                 &embedding,
                 &mut ring,
                 Some(&classifier),
-                None,
                 &mut score_window,
                 Some(&mut adaptive),
                 ADAPTIVE_K_DEFAULT,
-                None,
+                false,
             );
             // None of these should detect (rolling sum ~0.9 < 1.35).
             assert!(!detected, "frame {i} should not detect wake word");
@@ -10261,11 +9384,10 @@ mod tests {
                 &embedding,
                 &mut ring,
                 Some(&classifier_high),
-                None,
                 &mut score_window,
                 Some(&mut adaptive),
                 ADAPTIVE_K_DEFAULT,
-                None,
+                false,
             );
         }
         // The bootstrap must NOT have completed and no statistics accumulated:
@@ -10291,11 +9413,10 @@ mod tests {
                 &embedding,
                 &mut ring2,
                 Some(&classifier_low),
-                None,
                 &mut score_window2,
                 Some(&mut adaptive2),
                 ADAPTIVE_K_DEFAULT,
-                None,
+                false,
             );
         }
         assert!(
@@ -10310,11 +9431,10 @@ mod tests {
             &embedding,
             &mut ring2,
             Some(&classifier_high),
-            None,
             &mut score_window2,
             Some(&mut adaptive2),
             ADAPTIVE_K_DEFAULT,
-            None,
+            false,
         );
         assert_eq!(
             adaptive2.scores.len(),
@@ -10416,7 +9536,6 @@ mod tests {
         ctx.auto_start_pending = true;
         ctx.is_recording = true;
         ctx.peak_score = 0.75;
-        ctx.candidate = Some(ClassifierCandidate::new(0.75));
         ctx
     }
 
@@ -10485,13 +9604,12 @@ mod tests {
         // Pre-populate global enrollment state.
         {
             let mut state = voice_state().write().unwrap_poison();
-            state.enrollment_buffer.push(EmbeddingSequence::positive(
+            state.enrollment_buffer.push(EmbeddingSequence::new(
                 UtteranceId {
                     sequence_index: 0,
                     variant_index: 0,
                 },
                 Source::Enrollment,
-                None,
                 vec![vec![0.5; 96]],
             ));
             state.negative_audio_chunks.push(vec![0.5; 100]);
@@ -10507,10 +9625,6 @@ mod tests {
         assert!(!ctx.auto_start_pending);
         assert!(!ctx.is_recording);
         assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset on Full");
-        assert!(
-            ctx.candidate.is_none(),
-            "candidate must be None on Full (peak_verifier_score cleared, mahbot-895)",
-        );
 
         // Global enrollment accumulators PRESERVED by Full — they survive
         // mic stop/start cycles so mid-enrollment progress is not lost on
@@ -10543,13 +9657,12 @@ mod tests {
         let mut ctx = ctx_with_populated_buffers();
 
         // Pre-populate global enrollment state so we can verify it's preserved.
-        let saved_buffer = vec![EmbeddingSequence::positive(
+        let saved_buffer = vec![EmbeddingSequence::new(
             UtteranceId {
                 sequence_index: 0,
                 variant_index: 0,
             },
             Source::Enrollment,
-            None,
             vec![vec![0.5; 96]],
         )];
         let saved_chunks = vec![vec![0.5; 100]];
@@ -10578,7 +9691,6 @@ mod tests {
         // (which is only reset on Full/Cancel alongside the wider acoustic state).
         // The candidate will be re-created naturally when the rolling sum next
         // crosses the threshold.
-        assert!(ctx.candidate.is_none(), "candidate must be None on Soft");
         assert_eq!(ctx.peak_score, saved_peak_score);
 
         // Global enrollment accumulators preserved.
@@ -10600,13 +9712,12 @@ mod tests {
         // Pre-populate global enrollment state so we can verify it's cleared.
         {
             let mut state = voice_state().write().unwrap_poison();
-            state.enrollment_buffer.push(EmbeddingSequence::positive(
+            state.enrollment_buffer.push(EmbeddingSequence::new(
                 UtteranceId {
                     sequence_index: 0,
                     variant_index: 0,
                 },
                 Source::Enrollment,
-                None,
                 vec![vec![0.5; 96]],
             ));
             state.negative_audio_chunks.push(vec![0.5; 100]);
@@ -10628,7 +9739,6 @@ mod tests {
         assert_eq!(ctx.is_recording, saved_recording);
         // Cancel resets peak_score and candidate.
         assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset on Cancel");
-        assert!(ctx.candidate.is_none(), "candidate must be None on Cancel",);
 
         // Global enrollment accumulators cleared (unlike Soft).
         let state = voice_state().read().unwrap_poison();
@@ -10673,11 +9783,9 @@ mod tests {
         {
             let mut ctx = PipelineCtx::new();
             ctx.peak_score = 0.85;
-            ctx.candidate = Some(ClassifierCandidate::new(0.70));
 
-            // Pre-seed instrumentation with lower values to verify max-tracking
+            // Pre-seed instrumentation with a lower value to verify max-tracking
             ctx.instrumentation.peak_score = 0.10;
-            ctx.instrumentation.peak_verifier_score = 0.05;
 
             ctx.reset_detection_segment();
 
@@ -10685,11 +9793,6 @@ mod tests {
             assert!(
                 ctx.instrumentation.peak_score >= 0.85 - f32::EPSILON,
                 "instrumentation.peak_score should capture pre-reset peak_score"
-            );
-            // Instrumentation should have captured the candidate's peak_verifier_score
-            assert!(
-                ctx.instrumentation.peak_verifier_score >= 0.70 - f32::EPSILON,
-                "instrumentation.peak_verifier_score should capture pre-reset candidate peak"
             );
         }
     }
@@ -10705,7 +9808,6 @@ mod tests {
         ctx.embedding_ring = vec![vec![0.5; 96]; 3];
         ctx.score_window = vec![0.5; 5];
         ctx.peak_score = 0.75;
-        ctx.candidate = Some(ClassifierCandidate::new(0.50));
         ctx.segment_silence_hops = 10;
 
         // Complete adaptive threshold bootstrap so the reset-to-bootstrapping
@@ -10740,7 +9842,6 @@ mod tests {
         );
         assert!(ctx.score_window.is_empty(), "score_window must be cleared");
         assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset");
-        assert!(ctx.candidate.is_none(), "candidate must be reset (None)");
         assert_eq!(
             ctx.segment_silence_hops, 0,
             "segment_silence_hops must be reset"
@@ -10896,7 +9997,7 @@ mod tests {
     #[test]
     fn segment_end_pass_uses_burst_grid_latch_independently() {
         // mahbot-1023 item 8 + manager pin 3: the boundary pass must cover
-        // the burst-equivalent grid (so the ring-4 verifier sample at
+        // the burst-equivalent grid (so the ring-4 sample at
         // position 24 can confirm exactly like the cold burst) AND be
         // latch-independent — a burst that fired without confirming
         // (burst_sweep_done == true) must NOT suppress the boundary fallback
@@ -11028,7 +10129,6 @@ mod tests {
         ctx.embedding_ring = vec![vec![0.5; 96]; 3];
         ctx.score_window = vec![0.5; 5];
         ctx.peak_score = 0.75;
-        ctx.candidate = Some(ClassifierCandidate::new(0.50));
         ctx.segment_silence_hops = SEGMENT_TIMEOUT_HOPS - 5; // 14, just below threshold
 
         // Pre-populate ctx-level copies to verify caller-managed invariant.
@@ -11116,10 +10216,6 @@ mod tests {
         );
         assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset");
         assert!(
-            ctx.candidate.is_none(),
-            "candidate must be None after boundary"
-        );
-        assert!(
             voice_batch.is_empty(),
             "local voice_batch must be cleared on boundary"
         );
@@ -11169,7 +10265,6 @@ mod tests {
         ctx.embedding_ring = vec![vec![0.5; 96]; 3];
         ctx.score_window = vec![0.5; 5];
         ctx.peak_score = 0.75;
-        ctx.candidate = Some(ClassifierCandidate::new(0.50));
 
         let mut voice_batch = Vec::new();
         let mut mel_frame_buffer = Vec::new();
@@ -11237,10 +10332,6 @@ mod tests {
             "score_window must be cleared after boundary"
         );
         assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset");
-        assert!(
-            ctx.candidate.is_none(),
-            "candidate must be None after boundary"
-        );
         assert!(
             voice_batch.is_empty(),
             "local voice_batch must be cleared on boundary"
@@ -11371,13 +10462,12 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(ui, &dim)| {
-                EmbeddingSequence::positive(
+                EmbeddingSequence::new(
                     UtteranceId {
                         sequence_index: ui,
                         variant_index: 0,
                     },
                     Source::Enrollment,
-                    None,
                     vec![basis_embedding(dim); n_embs_per_utt],
                 )
             })
@@ -11605,10 +10695,9 @@ mod tests {
                     sequence_index: state.enrolled_utterance_count,
                     variant_index: vi,
                 };
-                state.enrollment_buffer.push(EmbeddingSequence::positive(
+                state.enrollment_buffer.push(EmbeddingSequence::new(
                     id,
                     Source::Enrollment,
-                    None,
                     vec![vec![0.1; 96]; n_windows],
                 ));
             }
@@ -11620,7 +10709,6 @@ mod tests {
             status: VoiceStatus::Disabled,
             classifier_weights: None,
             classifier: None,
-            verifier: crate::audio::voice_verifier::VoiceVerifier::untrained(),
             enrollment_buffer: Vec::new(),
             negative_audio_chunks: Vec::new(),
             owner_negative_chunks: Vec::new(),
@@ -11705,619 +10793,6 @@ mod tests {
         );
     }
 
-    // ── Verifier warm-up gate tests (mahbot-887) ─────────────────────────
-    //
-    // Tests that warm-up detections are unconditionally suppressed
-    // (< VERIFIER_WARMUP_EMBEDDINGS embeddings), and that the verifier
-    // gate activates correctly afterwards.
-    //
-    // These tests construct a verifier that always rejects (b3 = -2.0 →
-    // sigmoid(-2.0) ≈ 0.12 < DEFAULT_VERIFIER_THRESHOLD = 0.50) and a
-    // classifier that always scores 0.55, so the rolling sum reaches the
-    // detection threshold (1.35) at the 3rd embedding (1.65 ≥ 1.35).
-
-    /// Build a verifier that always produces a score below the rejection
-    /// threshold.  Conv1D fc_bias = -2.0 gives sigmoid(-2.0) ≈ 0.12 < 0.948.
-    fn verifier_always_reject() -> VoiceVerifier {
-        VoiceVerifier {
-            trained: true,
-            threshold: DEFAULT_VERIFIER_THRESHOLD,
-            activation: VerifierActivation::LeakyReLU,
-            conv_weight: vec![0.0; CONV_VERIFIER_OUT * EMBEDDING_DIM * CONV_VERIFIER_KERNEL_SIZE],
-            conv_bias: vec![0.0; CONV_VERIFIER_OUT],
-            fc_weight: vec![0.0; CONV_VERIFIER_OUT],
-            fc_bias: vec![-2.0], // sigmoid(-2.0) ≈ 0.12
-            ensemble_members: Vec::new(),
-        }
-    }
-
-    /// Build a verifier that always produces a score above the confirmation
-    /// threshold.  Conv1D fc_bias = 3.0 gives sigmoid(3.0) ≈ 0.95 > 0.948.
-    fn verifier_always_accept() -> VoiceVerifier {
-        VoiceVerifier {
-            trained: true,
-            threshold: DEFAULT_VERIFIER_THRESHOLD,
-            activation: VerifierActivation::LeakyReLU,
-            conv_weight: vec![0.0; CONV_VERIFIER_OUT * EMBEDDING_DIM * CONV_VERIFIER_KERNEL_SIZE],
-            conv_bias: vec![0.0; CONV_VERIFIER_OUT],
-            fc_weight: vec![0.0; CONV_VERIFIER_OUT],
-            fc_bias: vec![3.0], // sigmoid(3.0) ≈ 0.95
-            ensemble_members: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn loaded_collapsed_verifier_drops_to_untrained_noop() {
-        // mahbot-1008: a persisted collapsed (constant-reject) verifier must be
-        // replaced by an untrained no-op at load time, so already-enrolled
-        // users aren't bricked until re-enrollment.  Exercises the exact
-        // production branch used by run_voice_pipeline's load guard.
-        let collapsed = VoiceVerifier {
-            trained: true,
-            threshold: DEFAULT_VERIFIER_THRESHOLD,
-            activation: VerifierActivation::LeakyReLU,
-            conv_weight: vec![0.0; CONV_VERIFIER_OUT * EMBEDDING_DIM * CONV_VERIFIER_KERNEL_SIZE],
-            conv_bias: vec![0.0; CONV_VERIFIER_OUT],
-            fc_weight: vec![0.0; CONV_VERIFIER_OUT],
-            fc_bias: vec![-16.52], // pre-fix drift → sigmoid ≈ 6.67e-8
-            ensemble_members: Vec::new(),
-        };
-        assert!(
-            collapsed.is_collapsed(),
-            "precondition: constant reject-all must be flagged collapsed"
-        );
-        let resolved = resolve_loaded_verifier(&collapsed);
-        assert!(
-            !resolved.is_trained(),
-            "collapsed verifier must be dropped to untrained no-op"
-        );
-        // The no-op passes every frame (classifier-only gating).
-        let score = resolved.predict(&[0.5; VERIFIER_INPUT_DIM]);
-        assert!(
-            (score - 1.0).abs() < 1e-6,
-            "untrained no-op must pass every frame (score={score})"
-        );
-
-        // A healthy (non-collapsed) verifier passes through unchanged.
-        let healthy = verifier_always_accept();
-        assert!(
-            !healthy.is_collapsed(),
-            "precondition: constant-accept above threshold is not collapsed"
-        );
-        let resolved = resolve_loaded_verifier(&healthy);
-        assert!(
-            resolved.is_trained(),
-            "healthy verifier must pass through the load guard unchanged"
-        );
-    }
-
-    #[test]
-    fn verifier_warmup_suppresses_all_detections() {
-        // With 1-3 embeddings (ring.len() < VERIFIER_WARMUP_EMBEDDINGS=4),
-        // all wake word detections are unconditionally suppressed — even
-        // when the classifier consistently scores high enough for the
-        // rolling sum to cross the detection threshold (mahbot-893).
-        // The rolling sum IS computed and the score window IS updated,
-        // but detection is never reported during the warm-up period.
-        let classifier = classifier_always_score(0.80); // 3×0.80 = 2.40 ≥ 2.13
-        let verifier = verifier_always_reject();
-        let emb = vec![0.5; EMBEDDING_DIM];
-        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
-        let mut score_window = Vec::new();
-
-        // Push 3 embeddings: none should trigger detection (all suppressed).
-        for i in 0..3 {
-            let (detected, rolling_sum, _, _, _, _) = score_single_embedding(
-                &emb,
-                &mut ring,
-                Some(&classifier),
-                Some(&verifier),
-                &mut score_window,
-                None,
-                ADAPTIVE_K_DEFAULT,
-                None,
-            );
-            assert!(
-                !detected,
-                "warm-up should suppress all detections at embedding {} \
-                 (ring.len={}, rolling_sum={rolling_sum:.4})",
-                i + 1,
-                ring.len(),
-            );
-        }
-
-        // Rolling sum and ring should still have accumulated normally.
-        assert_eq!(ring.len(), 3, "ring should have 3 embeddings after 3 feeds",);
-        let rolling_sum_after_3: f32 = score_window.iter().sum();
-        assert!(
-            (rolling_sum_after_3 - 2.40).abs() < 0.01,
-            "rolling sum should be 2.40 (3 × 0.80) after 3 embeddings, got {rolling_sum_after_3:.4}",
-        );
-
-        // 4th embedding: warm-up is over (ring.len() >= 4).  The score
-        // window accumulates all warm-up scores (mahbot-1002 removed the
-        // old mahbot-899 clear), so the rolling sum (3 × 0.80 = 2.40 after
-        // ROLLING_WINDOW_N=3 trimming) is above threshold — detection is
-        // blocked by the verifier gate (verifier_always_reject), not the
-        // rolling sum.
-        let (detected, rolling_sum, _, _, _, _) = score_single_embedding(
-            &emb,
-            &mut ring,
-            Some(&classifier),
-            Some(&verifier),
-            &mut score_window,
-            None,
-            ADAPTIVE_K_DEFAULT,
-            None,
-        );
-        assert!(
-            !detected,
-            "4th embedding should be blocked by verifier, not rolling sum; \
-             rolling_sum={rolling_sum:.4}",
-        );
-        // The score window was NOT cleared at the warm-up→active transition
-        // (mahbot-1002), and is capped at ROLLING_WINDOW_N=3.  After 4
-        // embeddings the oldest score was evicted, keeping the 3 most recent.
-        assert_eq!(
-            score_window.len(),
-            3,
-            "score window should have 3 scores (capped at ROLLING_WINDOW_N)",
-        );
-        let post_warmup_rolling_sum: f32 = score_window.iter().sum();
-        assert!(
-            (post_warmup_rolling_sum - 2.40).abs() < 0.01,
-            "rolling sum should be ~2.40 (3 × 0.80), got {post_warmup_rolling_sum:.4}",
-        );
-    }
-
-    #[test]
-    fn score_window_preserved_across_warmup_transition() {
-        // Verify that the score window is NOT cleared at the verifier
-        // warm-up→active transition (mahbot-1002 removed the old mahbot-899
-        // clear).  Warm-up classifier scores accumulate normally through
-        // the transition, giving the rolling sum a head start.
-        let classifier = classifier_always_score(0.55);
-        let verifier = verifier_always_reject();
-        let emb = vec![0.5; EMBEDDING_DIM];
-        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
-        let mut score_window = Vec::new();
-
-        // ── Embeddings 1-3: warm-up period ──────────────────────────
-        // Scores accumulate normally during warm-up.
-        for i in 0..VERIFIER_WARMUP_EMBEDDINGS - 1 {
-            let (detected, _, _, _, _, _) = score_single_embedding(
-                &emb,
-                &mut ring,
-                Some(&classifier),
-                Some(&verifier),
-                &mut score_window,
-                None,
-                ADAPTIVE_K_DEFAULT,
-                None,
-            );
-            assert!(!detected, "warm-up should suppress detection at {i}");
-            if i == 2 {
-                assert_eq!(score_window.len(), 3, "warm-up window should have 3 scores");
-            }
-        }
-        let warmup_rolling_sum: f32 = score_window.iter().sum();
-        assert!(
-            (warmup_rolling_sum - 1.65).abs() < 0.01,
-            "warm-up rolling sum should be 1.65 (3 × 0.55), got {warmup_rolling_sum:.4}",
-        );
-
-        // ── Embedding 4: warm-up→active transition ──────────────────
-        // Score window should NOT be cleared (mahbot-1002).  All 4 scores
-        // should remain: the 3 warm-up scores plus the current frame.
-        let (detected, _, _, _, _, _) = score_single_embedding(
-            &emb,
-            &mut ring,
-            Some(&classifier),
-            Some(&verifier),
-            &mut score_window,
-            None,
-            ADAPTIVE_K_DEFAULT,
-            None,
-        );
-        assert!(
-            !detected,
-            "no detection at transition (blocked by verifier)"
-        );
-        assert_eq!(
-            score_window.len(),
-            3,
-            "score window should have 3 scores (capped at ROLLING_WINDOW_N=3)",
-        );
-        let transition_rolling_sum: f32 = score_window.iter().sum();
-        assert!(
-            (transition_rolling_sum - 1.65).abs() < 0.01,
-            "rolling sum after transition should be ~1.65 (3 × 0.55), \
-             got {transition_rolling_sum:.4}",
-        );
-
-        // ── Embedding 5: fully active (no more resets) ──────────────
-        // The window should remain at ROLLING_WINDOW_N=3, no clearing.
-        let (detected, _, _, _, _, _) = score_single_embedding(
-            &emb,
-            &mut ring,
-            Some(&classifier),
-            Some(&verifier),
-            &mut score_window,
-            None,
-            ADAPTIVE_K_DEFAULT,
-            None,
-        );
-        assert!(
-            !detected,
-            "no detection at embedding 5 (blocked by verifier)"
-        );
-        assert_eq!(
-            score_window.len(),
-            3,
-            "score window should still have 3 scores (capped at ROLLING_WINDOW_N)",
-        );
-        let post_transition_sum: f32 = score_window.iter().sum();
-        assert!(
-            (post_transition_sum - 1.65).abs() < 0.01,
-            "rolling sum after embedding 5 should be 1.65 (3 × 0.55), \
-             got {post_transition_sum:.4}",
-        );
-    }
-
-    #[test]
-    fn verifier_gate_without_warmup_skips_with_untrained_verifier() {
-        // When the verifier is untrained, `is_trained()` returns false and
-        // the gate is skipped regardless of embedding count.  This ensures
-        // the warm-up condition does not interfere with the untrained path.
-        let classifier = classifier_always_score(0.8);
-        let verifier = VoiceVerifier::untrained(); // always passes (predict returns 1.0)
-        let emb = vec![0.5; EMBEDDING_DIM];
-        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
-        let mut score_window = Vec::new();
-
-        // Push 3 embeddings — detection should pass.
-        for i in 0..3 {
-            let (detected, _, _, _, _, _) = score_single_embedding(
-                &emb,
-                &mut ring,
-                Some(&classifier),
-                Some(&verifier),
-                &mut score_window,
-                None,
-                ADAPTIVE_K_DEFAULT,
-                None,
-            );
-            if i < 2 {
-                assert!(!detected, "no detection before 3rd embedding");
-            } else {
-                assert!(
-                    detected,
-                    "3rd embedding should pass with untrained verifier: ring.len={}",
-                    ring.len(),
-                );
-            }
-        }
-
-        // 4th embedding — should also pass (untrained verifier never blocks).
-        let ring_len_before = ring.len();
-        let (detected, _, _, _, _, _) = score_single_embedding(
-            &emb,
-            &mut ring,
-            Some(&classifier),
-            Some(&verifier),
-            &mut score_window,
-            None,
-            ADAPTIVE_K_DEFAULT,
-            None,
-        );
-        assert!(
-            detected,
-            "untrained verifier should never block, even at {ring_len_before} embeddings",
-        );
-    }
-
-    #[test]
-    fn bounded_candidate_expiry_cycle() {
-        // Verifies the full bounded-candidate lifecycle when the verifier
-        // never confirms: creation on first threshold crossing, accumulation
-        // across frames, expiry after CANDIDATE_MAX_EMBEDDINGS, and
-        // re-creation after expiry.  No cross-candidate contamination —
-        // each cycle starts with a fresh peak_verifier_score.
-        //
-        // The classifier always returns 0.80 (above NO_MATCH_RESET_THRESHOLD),
-        // so the rolling sum needs 3 embeddings to cross the detection threshold.
-        // The verifier always rejects (peak ~0.12 < 0.948 threshold).
-        // Candidate tracking is enabled throughout.
-        let classifier = classifier_always_score(0.8);
-        let verifier = verifier_always_reject();
-        let emb = vec![0.5; EMBEDDING_DIM];
-        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
-        let mut score_window = Vec::new();
-        let mut candidate: Option<ClassifierCandidate> = None;
-
-        // ── Embeddings 1-3: warm-up period ──────────────────────────
-        // During warm-up (ring.len() < VERIFIER_WARMUP_EMBEDDINGS = 4),
-        // all detections are suppressed and no candidate is created.
-        for i in 0..VERIFIER_WARMUP_EMBEDDINGS - 1 {
-            let (detected, _, _, _, _, _) = score_single_embedding(
-                &emb,
-                &mut ring,
-                Some(&classifier),
-                Some(&verifier),
-                &mut score_window,
-                None,
-                ADAPTIVE_K_DEFAULT,
-                Some(&mut candidate),
-            );
-            assert!(!detected, "warm-up should suppress detection at {i}");
-            assert!(
-                candidate.is_none(),
-                "no candidate should exist during warm-up at {i}"
-            );
-        }
-        assert_eq!(
-            ring.len(),
-            3,
-            "ring should have 3 embeddings after warm-up feeds"
-        );
-
-        // ── Embedding 4: warm-up→active transition, threshold crossing ──
-        // With warm-up scores preserved (mahbot-1002), the rolling sum is
-        // 4 × 0.80 = 3.20 >= 2.13, so the threshold is crossed immediately
-        // after warm-up.  Candidate is created with verifier peak ~0.12 (reject).
-        let (detected, _, _, _, _, _) = score_single_embedding(
-            &emb,
-            &mut ring,
-            Some(&classifier),
-            Some(&verifier),
-            &mut score_window,
-            None,
-            ADAPTIVE_K_DEFAULT,
-            Some(&mut candidate),
-        );
-        assert!(
-            !detected,
-            "verifier should block detection (peak ~0.12 < 0.60)"
-        );
-        let c = candidate
-            .as_ref()
-            .expect("candidate should exist after first threshold crossing at embedding 4");
-        assert_eq!(
-            c.embedding_count, 1,
-            "candidate should have count=1 on creation"
-        );
-        assert!(
-            c.peak_verifier_score < DEFAULT_VERIFIER_THRESHOLD,
-            "verifier peak should be below threshold (reject verifier)"
-        );
-
-        // ── Embeddings 5-6: candidate accumulation ─────────────────
-        // Each frame updates peak and increments count.  Verifier never
-        // confirms (peak stays below threshold).
-        for _ in 0..CANDIDATE_MAX_EMBEDDINGS - 2 {
-            let (detected, _, _, _, _, _) = score_single_embedding(
-                &emb,
-                &mut ring,
-                Some(&classifier),
-                Some(&verifier),
-                &mut score_window,
-                None,
-                ADAPTIVE_K_DEFAULT,
-                Some(&mut candidate),
-            );
-            assert!(!detected, "verifier should still block during accumulation");
-            let c = candidate
-                .as_ref()
-                .expect("candidate should still be accumulating");
-            assert!(
-                c.peak_verifier_score < DEFAULT_VERIFIER_THRESHOLD,
-                "peak should stay below threshold during accumulation"
-            );
-        }
-
-        // ── Embedding 7: expiry ─────────────────────────────────
-        // The (CANDIDATE_MAX_EMBEDDINGS)th update returns expired=true,
-        // clearing the candidate.
-        let count_before_expiry = candidate.as_ref().map(|c| c.embedding_count);
-        let (detected, _, _, _, _, _) = score_single_embedding(
-            &emb,
-            &mut ring,
-            Some(&classifier),
-            Some(&verifier),
-            &mut score_window,
-            None,
-            ADAPTIVE_K_DEFAULT,
-            Some(&mut candidate),
-        );
-        assert!(!detected, "detection should not fire on expiry frame");
-        assert!(
-            candidate.is_none(),
-            "candidate should be cleared after expiry (count={:?} -> CANDIDATE_MAX_EMBEDDINGS={})",
-            count_before_expiry,
-            CANDIDATE_MAX_EMBEDDINGS,
-        );
-
-        // ── Embedding after expiry: new candidate created ──────────
-        // The rolling sum is still above threshold (scores persist in
-        // the window), so a new candidate is created on the next frame.
-        let (detected, _, _, _, _, _) = score_single_embedding(
-            &emb,
-            &mut ring,
-            Some(&classifier),
-            Some(&verifier),
-            &mut score_window,
-            None,
-            ADAPTIVE_K_DEFAULT,
-            Some(&mut candidate),
-        );
-        assert!(!detected, "new candidate should also be blocked");
-        let c = candidate
-            .as_ref()
-            .expect("new candidate should be created after expiry");
-        assert_eq!(
-            c.embedding_count, 1,
-            "new candidate should start with count=1 (no cross-candidate contamination)"
-        );
-        assert!(
-            c.peak_verifier_score < DEFAULT_VERIFIER_THRESHOLD,
-            "new candidate's peak should be independent of previous cycle"
-        );
-    }
-
-    #[test]
-    fn bounded_candidate_confirms_detection() {
-        // Verifies that the bounded candidate model correctly fires
-        // detection when the verifier score exceeds the threshold.
-        // With warm-up scores preserved (mahbot-1002), the rolling sum
-        // crosses the threshold at the warm-up→active transition on
-        // embedding 4, so the candidate confirms immediately.
-        let classifier = classifier_always_score(0.8);
-        let verifier = verifier_always_accept();
-        let emb = vec![0.5; EMBEDDING_DIM];
-        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
-        let mut score_window = Vec::new();
-        let mut candidate: Option<ClassifierCandidate> = None;
-
-        // ── Embeddings 1-3: warm-up ────────────────────────────────
-        for i in 0..VERIFIER_WARMUP_EMBEDDINGS - 1 {
-            let (detected, _, _, _, _, _) = score_single_embedding(
-                &emb,
-                &mut ring,
-                Some(&classifier),
-                Some(&verifier),
-                &mut score_window,
-                None,
-                ADAPTIVE_K_DEFAULT,
-                Some(&mut candidate),
-            );
-            assert!(!detected, "warm-up should suppress detection at {i}");
-            assert!(candidate.is_none(), "no candidate during warm-up at {i}");
-        }
-
-        // ── Embedding 4: threshold crossing → detection ────────────
-        // Warm-up scores (3 × 0.80) plus current frame = rolling sum 3.20
-        // >= 2.13.  Verifier accepts, so detection fires immediately.
-        let (detected, _, _, _, _, _) = score_single_embedding(
-            &emb,
-            &mut ring,
-            Some(&classifier),
-            Some(&verifier),
-            &mut score_window,
-            None,
-            ADAPTIVE_K_DEFAULT,
-            Some(&mut candidate),
-        );
-        assert!(
-            detected,
-            "bounded candidate should confirm at embedding 4 (warm-up scores preserved)"
-        );
-        // Candidate should still be populated (the lifecycle returns
-        // (true, ...) without clearing the candidate, so the caller
-        // can inspect instrumentation.
-        assert!(
-            candidate.is_some(),
-            "candidate should still exist after confirmed detection"
-        );
-        let c = candidate.unwrap();
-        assert!(
-            c.peak_verifier_score >= DEFAULT_VERIFIER_THRESHOLD,
-            "confirmed candidate's peak should be at or above threshold (got {})",
-            c.peak_verifier_score,
-        );
-    }
-
-    #[test]
-    fn test_verifier_classifier_window_alignment() {
-        // Integration test: verify that the verifier's stride-1 windows evaluated
-        // inside score_single_embedding include the same 3-frame window that the
-        // classifier scores (the last 3 embeddings in the ring buffer).  Both
-        // operate on the shared embedding_ring using fill_verifier_window, so the
-        // alignment is architecturally forced — but this test documents the
-        // invariant explicitly and catches regressions if indexing diverges.
-        //
-        // For a ring of N ≥ 6 post-warm-up embeddings:
-        //   - Classifier window: ring[N-3 .. N]  (last 3)
-        //   - Verifier start: N - (ROLLING_WINDOW_N + VERIFIER_WINDOW_SIZE - 1) = N-5
-        //   - Verifier stride-1 windows at indices: N-5, N-4, N-3
-        //   - Window at index N-3 = ring[N-3 .. N] — exactly the classifier's window
-        //
-        // After pushing 6 embeddings through score_single_embedding, we probe
-        // the ring buffer with fill_verifier_window to confirm alignment.
-        let classifier = classifier_always_half();
-        let verifier = verifier_always_reject();
-        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
-        let mut score_window = Vec::new();
-        let mut candidate: Option<ClassifierCandidate> = None;
-
-        // Push 6 embeddings with unique first-element markers.
-        // emb[i][0] = i as f32 → distinguishable per index.
-        for i in 0..6 {
-            let mut emb = vec![0.0f32; EMBEDDING_DIM];
-            emb[0] = i as f32;
-            score_single_embedding(
-                &emb,
-                &mut ring,
-                Some(&classifier),
-                Some(&verifier),
-                &mut score_window,
-                None,
-                ADAPTIVE_K_DEFAULT,
-                Some(&mut candidate),
-            );
-        }
-
-        assert_eq!(
-            ring.len(),
-            6,
-            "ring should hold 6 embeddings after 6 pushes"
-        );
-
-        // Alignment index: the verifier window whose right edge matches the
-        // classifier window (last 3 embeddings).  This is the stride-1 window
-        // at position ring.len() - VERIFIER_WINDOW_SIZE.
-        let alignment_index = ring.len() - VERIFIER_WINDOW_SIZE;
-        let mut window = [0.0f32; VERIFIER_INPUT_DIM];
-        crate::audio::voice_verifier::fill_verifier_window(&ring, alignment_index, &mut window);
-
-        // The 288-dim window at alignment_index concatenates ring[3], ring[4],
-        // ring[5].  Each embedding has emb[0] = its index as f32.
-        assert_eq!(
-            window[0], 3.0,
-            "verifier window start copies ring[3][0] = 3.0"
-        );
-        assert_eq!(
-            window[EMBEDDING_DIM], 4.0,
-            "verifier window middle copies ring[4][0] = 4.0"
-        );
-        assert_eq!(
-            window[2 * EMBEDDING_DIM],
-            5.0,
-            "verifier window end copies ring[5][0] = 5.0"
-        );
-
-        // Also verify stride-1 coverage: window at alignment_index - 1
-        // uses ring[2], ring[3], ring[4] (preceding stride-1 window).
-        let mut prev_window = [0.0f32; VERIFIER_INPUT_DIM];
-        crate::audio::voice_verifier::fill_verifier_window(
-            &ring,
-            alignment_index - 1,
-            &mut prev_window,
-        );
-        assert_eq!(
-            prev_window[0], 2.0,
-            "stride-1 window at index 2 uses ring[2][0] = 2.0"
-        );
-        assert_eq!(
-            prev_window[EMBEDDING_DIM], 3.0,
-            "stride-1 window at index 2 uses ring[3][0] = 3.0"
-        );
-        assert_eq!(
-            prev_window[2 * EMBEDDING_DIM],
-            4.0,
-            "stride-1 window at index 2 uses ring[4][0] = 4.0"
-        );
-    }
-
     // ── Voice metrics snapshot tests (mahbot-912) ────────────────────────────
     // These test the atomic counters, rolling average computation, and edge
     // cases (division by zero on empty snapshots).  The statics are preserved
@@ -12395,76 +10870,6 @@ mod tests {
 
     // ── PersistedModel versioning & compatibility tests (mahbot-898) ──────
 
-    /// Create a deterministic test model with all hash-relevant fields populated.
-    fn test_model() -> PersistedModel {
-        PersistedModel {
-            created_at: "2026-07-26T12:00:00+00:00".to_string(),
-            trained_at: "2026-07-26T12:00:00+00:00".to_string(),
-            model_hash: String::new(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn model_hash_is_deterministic() {
-        let a = test_model();
-        let b = test_model();
-        let hash1 = compute_model_hash(&a);
-        let hash2 = compute_model_hash(&b);
-        assert_eq!(hash1, hash2, "hash must be deterministic");
-        assert!(!hash1.is_empty(), "hash must not be empty");
-        assert_eq!(hash1.len(), 64, "SHA-256 hex must be 64 chars");
-    }
-
-    #[test]
-    fn model_hash_excludes_itself() {
-        // The hash should be the same whether model_hash is empty or set,
-        // because compute_model_hash removes it from the canonical form.
-        let hash_empty = compute_model_hash(&test_model());
-
-        let model_with_hash = PersistedModel {
-            model_hash: "abc123".to_string(),
-            ..test_model()
-        };
-        let hash_with_value = compute_model_hash(&model_with_hash);
-
-        assert_eq!(
-            hash_empty, hash_with_value,
-            "hash must be independent of model_hash field value"
-        );
-    }
-
-    #[test]
-    fn model_hash_changes_when_any_field_changes() {
-        // (Consolidated from three per-field tests in mahbot-1029 — the
-        // hash must change when ANY canonical field changes.)
-        let hash_base = compute_model_hash(&test_model());
-        assert_ne!(
-            compute_model_hash(&PersistedModel {
-                phrase: "hey mahbot".to_string(),
-                ..test_model()
-            }),
-            hash_base,
-            "phrase change must affect hash"
-        );
-        assert_ne!(
-            compute_model_hash(&PersistedModel {
-                training_seeds: vec![0, 1, 2],
-                ..test_model()
-            }),
-            hash_base,
-            "training_seeds change must affect hash"
-        );
-        assert_ne!(
-            compute_model_hash(&PersistedModel {
-                embedding_dim: 128,
-                ..test_model()
-            }),
-            hash_base,
-            "embedding_dim change must affect hash"
-        );
-    }
-
     #[test]
     fn check_compatibility_accepts_current_version() {
         let model = PersistedModel {
@@ -12530,41 +10935,6 @@ mod tests {
     }
 
     #[test]
-    fn verify_hash_passes_when_hash_is_empty() {
-        let model = PersistedModel {
-            model_hash: String::new(),
-            ..Default::default()
-        };
-        assert!(
-            verify_model_hash(&model).is_ok(),
-            "empty hash must pass verification (legacy compat)"
-        );
-    }
-
-    #[test]
-    fn verify_hash_passes_when_hash_matches() {
-        let mut model = PersistedModel {
-            created_at: "t1".to_string(),
-            trained_at: "t2".to_string(),
-            ..Default::default()
-        };
-        let correct_hash = compute_model_hash(&model);
-        model.model_hash = correct_hash;
-        assert!(verify_model_hash(&model).is_ok(), "matching hash must pass");
-    }
-
-    #[test]
-    fn verify_hash_fails_when_hash_does_not_match() {
-        let model = PersistedModel {
-            created_at: "t1".to_string(),
-            trained_at: "t2".to_string(),
-            model_hash: "deadbeef".to_string(), // clearly wrong
-            ..Default::default()
-        };
-        assert!(verify_model_hash(&model).is_err(), "wrong hash must fail");
-    }
-
-    #[test]
     fn deserialize_classifier_opt_handles_array() {
         // Round-trip through serde_json to test the full deserialization path
         let json = r#"{
@@ -12626,10 +10996,8 @@ mod tests {
             training_seeds: Vec::new(),
             created_at: String::new(),
             trained_at: String::new(),
-            model_hash: String::new(),
             classifier: Some(vec![ClassifierWeights::default()]),
             val_losses: None,
-            verifier: None,
         };
 
         migrate_legacy_model(&mut model);
@@ -12657,28 +11025,11 @@ mod tests {
             !model.trained_at.is_empty(),
             "trained_at must be filled during migration"
         );
-        assert!(
-            !model.model_hash.is_empty(),
-            "model_hash must be computed during migration"
-        );
 
-        // Verify the hash is valid
-        assert_eq!(
-            compute_model_hash(&model),
-            model.model_hash,
-            "stored hash must be correct after migration"
-        );
-
-        // Run a second migration — should be idempotent (fields already set)
         migrate_legacy_model(&mut model);
-        assert_eq!(
-            compute_model_hash(&model),
-            model.model_hash,
-            "hash must still be valid after second migration"
-        );
         // Fields should be unchanged (idempotent: schema_version != 0 so migration
         // returns early; phrase, embedding_dim, window_size, created_at,
-        // trained_at, and model_hash all retain their first-migration values).
+        // trained_at all retain their first-migration values).
         assert!(
             !model.phrase.is_empty() && model.embedding_dim > 0 && model.window_size > 0,
             "fields must survive idempotent re-migration"
@@ -12710,10 +11061,6 @@ mod tests {
             model.embedding_dim,
             u32::try_from(EMBEDDING_DIM).unwrap(),
             "embedding_dim must retain default (unchanged)"
-        );
-        assert!(
-            model.model_hash.is_empty(),
-            "model_hash must not be computed for null-classifier model"
         );
     }
 

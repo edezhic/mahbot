@@ -1064,8 +1064,6 @@ pub(crate) fn apply_gain(pcm: &[f32], gain_db: f32) -> Vec<f32> {
 pub(crate) enum NoiseType {
     /// White noise (uniform spectral density).
     White,
-    /// Pink noise (1/f spectral density — more natural).
-    Pink,
 }
 
 /// Compute the RMS (root mean square) of audio samples.
@@ -1088,55 +1086,13 @@ pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
 /// (mahbot-1043).
 ///
 /// `z1 = sqrt(-2 ln u1) cos(2π u2)`, `z2 = sqrt(-2 ln u1) sin(2π u2)`.
-/// This is the shared math behind the five former duplicate samplers; the
-/// draw policy (zero-rejection vs EPSILON-clamp) lives in the two wrappers
-/// below so each site's exact RNG draw sequence is preserved.
+/// Shared math for the bench's EPSILON-clamp pair sampler below.
 #[must_use]
 #[inline]
 pub(crate) fn gaussian_pair_from_uniforms(u1: f32, u2: f32) -> (f32, f32) {
     let r = (-2.0 * u1.ln()).sqrt();
     let theta = 2.0 * core::f32::consts::PI * u2;
     (r * theta.cos(), r * theta.sin())
-}
-
-/// Draw a standard-normal pair via Box-Muller with zero-rejection semantics
-/// (2 draws per sample; callers needing one sample use `.0` and discard the
-/// sin branch, preserving the verifier family's historical draw rate).
-///
-/// Draws are re-rolled while either uniform is `0.0` (rejection loop), exactly
-/// matching the former `voice_verifier` copies.  `tts.rs`'s deliberately
-/// custom xorshift generator is a separate concern and is NOT routed through
-/// this helper.
-pub(crate) fn sample_gaussian_pair(rng: &mut impl rand::Rng) -> (f32, f32) {
-    loop {
-        let u1: f32 = rng.random();
-        let u2: f32 = rng.random();
-        if u1 > 0.0 && u2 > 0.0 {
-            return gaussian_pair_from_uniforms(u1, u2);
-        }
-    }
-}
-
-/// Draw a single standard-normal value with the verifier-family zero-rejection
-/// loop, folding a scale factor into the cos branch in the exact historical
-/// operation order (`scale * r * cos(theta)` evaluates as `(scale * r) *
-/// cos(theta)`, matching the pre-extraction test helpers byte-for-byte).
-///
-/// The sin branch is discarded.  This is the "per-family thin wrapper over
-/// shared math" the mahbot-1043 manager pin allowed — the draw sequence is
-/// identical to [`sample_gaussian_pair`], only the returned expression shape
-/// differs.  Only the verifier test helpers use it, so it is test-gated.
-#[cfg(test)]
-pub(crate) fn sample_gaussian_scaled(rng: &mut impl rand::Rng, scale: f32) -> f32 {
-    loop {
-        let u1: f32 = rng.random();
-        let u2: f32 = rng.random();
-        if u1 > 0.0 && u2 > 0.0 {
-            let r = (-2.0 * u1.ln()).sqrt();
-            let theta = 2.0 * core::f32::consts::PI * u2;
-            return scale * r * theta.cos();
-        }
-    }
 }
 
 /// Draw a standard-normal pair via Box-Muller with EPSILON-clamped draws
@@ -1163,7 +1119,7 @@ pub(crate) fn sample_gaussian_pair_clamped(rng: &mut impl rand::Rng) -> (f32, f3
 /// * `samples` — Clean audio PCM f32 in [-1.0, 1.0].
 /// * `snr_db` — Desired signal-to-noise ratio in dB (typical: 10-25).
 ///   Lower values = more noise. Must be finite.
-/// * `noise_type` — [`NoiseType::White`] or [`NoiseType::Pink`].
+/// * `noise_type` — [`NoiseType::White`].
 /// * `rng_seed` — Optional seed for deterministic RNG. `Some(seed)` produces
 ///   reproducible noise; `None` uses entropy-based seeding.
 ///
@@ -1176,8 +1132,7 @@ pub(crate) fn sample_gaussian_pair_clamped(rng: &mut impl rand::Rng) -> (f32, f3
 /// This is the former `tts_data_gen::add_noise` (4-arg) relocated unchanged.
 /// It is a DIFFERENT implementation from the 3-arg [`add_noise`] above
 /// (different RNG consumption and degenerate-signal behavior); both feed
-/// the bench's seeded cross-speaker negative embeddings, so they must
-/// never be merged.
+/// the bench's seeded embeddings, so they must never be merged.
 #[must_use]
 #[cfg(feature = "voice-tests")]
 pub(crate) fn add_noise_white_pink(
@@ -1190,8 +1145,7 @@ pub(crate) fn add_noise_white_pink(
         return samples.to_vec();
     }
 
-    // Create a seeded or entropy-based RNG, matching the canonical
-    // Option<u64> → StdRng pattern (voice_verifier.rs, mahbot-906).
+    // Create a seeded or entropy-based RNG.
     // When None, we seed from rand::random() rather than using the
     // thread-local generator directly, isolating RNG state.
     let mut rng: rand::rngs::StdRng = match rng_seed {
@@ -1199,17 +1153,13 @@ pub(crate) fn add_noise_white_pink(
         None => rand::rngs::StdRng::seed_from_u64(rand::random()),
     };
 
-    // Generate noise using the single RNG for both white and pink branches.
+    // Generate noise using the single RNG.
     let noise: Vec<f32> = match noise_type {
         NoiseType::White => {
             // Uniform white noise in [-1.0, 1.0]
             (0..samples.len())
                 .map(|_| rng.random::<f32>() * 2.0 - 1.0)
                 .collect()
-        }
-        NoiseType::Pink => {
-            // Voss-McCartney pink noise via the canonical seeded implementation
-            generate_pink_noise(samples.len(), &mut rng)
         }
     };
 
@@ -1514,46 +1464,14 @@ mod audio_util_tests {
 // ── Shared Gaussian sampler seeded-sequence equivalence (mahbot-1043) ─────
 // MANDATORY verification from the manager pin: the extraction must consume
 // exactly the same RNG draws at every site so seeded outputs stay byte-identical.
-// These tests prove the shared helpers reproduce the pre-extraction inline
-// formulas (zero-rejection verifier family and EPSILON-clamp bench family)
-// over ~8000 seeded draw pairs.
+// These tests prove the shared helper reproduces the pre-extraction inline
+// EPSILON-clamp bench-family formula over ~8000 seeded draw pairs.
 
 #[cfg(test)]
 mod gaussian_sampler_tests {
-    use super::{
-        gaussian_pair_from_uniforms, sample_gaussian_pair, sample_gaussian_pair_clamped,
-        sample_gaussian_scaled,
-    };
+    use super::{gaussian_pair_from_uniforms, sample_gaussian_pair_clamped};
     use rand::RngExt;
     use rand::SeedableRng;
-
-    /// Reference: the verifier family's pre-extraction zero-rejection loop
-    /// (2 draws per sample, cos-only, sin discarded).
-    fn reference_verifier_sample(rng: &mut impl rand::Rng) -> f32 {
-        loop {
-            let u1: f32 = rng.random();
-            let u2: f32 = rng.random();
-            if u1 > 0.0 && u2 > 0.0 {
-                let r = (-2.0 * u1.ln()).sqrt();
-                let theta = 2.0 * std::f32::consts::PI * u2;
-                break r * theta.cos();
-            }
-        }
-    }
-
-    /// Reference: the verifier test-helper family's pre-extraction loop with a
-    /// scale folded in the historical operation order `(scale * r) * cos`.
-    fn reference_verifier_scaled(rng: &mut impl rand::Rng, scale: f32) -> f32 {
-        loop {
-            let u1: f32 = rng.random();
-            let u2: f32 = rng.random();
-            if u1 > 0.0 && u2 > 0.0 {
-                let r = (-2.0 * u1.ln()).sqrt();
-                let theta = 2.0 * std::f32::consts::PI * u2;
-                break scale * r * theta.cos();
-            }
-        }
-    }
 
     /// Reference: the bench's pre-extraction EPSILON-clamp pair sampler
     /// (2 draws per 2 samples, cos+sin).
@@ -1563,35 +1481,6 @@ mod gaussian_sampler_tests {
         let z1 = (-2.0 * u1.ln()).sqrt() * (2.0 * core::f32::consts::PI * u2).cos();
         let z2 = (-2.0 * u1.ln()).sqrt() * (2.0 * core::f32::consts::PI * u2).sin();
         (z1, z2)
-    }
-
-    #[test]
-    fn seeded_verifier_sequence_byte_identical() {
-        // Bench seed 43, ~8000 draw pairs with the verifier-family draw pattern.
-        const DRAW_PAIRS: usize = 8000;
-        let mut shared_rng = rand::rngs::StdRng::seed_from_u64(43);
-        let mut ref_rng = rand::rngs::StdRng::seed_from_u64(43);
-        for i in 0..DRAW_PAIRS {
-            let (shared_z1, _) = sample_gaussian_pair(&mut shared_rng);
-            let ref_z1 = reference_verifier_sample(&mut ref_rng);
-            assert_eq!(shared_z1, ref_z1, "z1 divergence at pair {i}");
-        }
-    }
-
-    #[test]
-    fn seeded_verifier_scaled_sequence_byte_identical() {
-        // Scale-folding variant (verifier test helpers) — draw sequence and
-        // `(scale * r) * cos(theta)` operation order must match byte-for-byte.
-        const DRAW_PAIRS: usize = 8000;
-        for &scale in &[0.3_f32, 0.6_f32] {
-            let mut shared_rng = rand::rngs::StdRng::seed_from_u64(43);
-            let mut ref_rng = rand::rngs::StdRng::seed_from_u64(43);
-            for i in 0..DRAW_PAIRS {
-                let shared = sample_gaussian_scaled(&mut shared_rng, scale);
-                let reference = reference_verifier_scaled(&mut ref_rng, scale);
-                assert_eq!(shared, reference, "scaled({scale}) divergence at pair {i}");
-            }
-        }
     }
 
     #[test]
