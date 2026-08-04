@@ -243,6 +243,22 @@ impl ClassifierWeights {
         ]
     }
 
+    /// Mutable twin of [`all_trainable_slices`] — same canonical order.
+    fn all_trainable_slices_mut(&mut self) -> [&mut [f32]; 10] {
+        [
+            &mut self.conv1_weight,
+            &mut self.conv1_bias,
+            &mut self.bn1_gamma,
+            &mut self.bn1_beta,
+            &mut self.conv2_weight,
+            &mut self.conv2_bias,
+            &mut self.bn2_gamma,
+            &mut self.bn2_beta,
+            &mut self.fc_weight,
+            &mut self.fc_bias,
+        ]
+    }
+
     pub fn validate(&self) -> Result<()> {
         let ks = self.arch.kernel_size;
         let c1 = self.arch.conv1_out;
@@ -752,7 +768,7 @@ pub fn train_classifier(
                 *gv += l2 * wv;
             }
             // Adam step
-            opt.step(&mut weights, &g, lr);
+            opt.step(&mut weights, &mut g, lr);
             epoch_loss += batch_loss / nf;
             n_batches += 1;
         }
@@ -918,12 +934,15 @@ pub(crate) fn to_channels_first(x: &[f32], cin: usize, lin: usize) -> Vec<f32> {
 
 // ── Manual backprop ─────────────────────────────────────────────────────
 //
-// NOTE: Adding a new weight tensor to `ClassifierWeights` requires updating
-// all ~7 touch points below: GradientBuffer fields + `new` + `all_mut`,
-// AdamStateGroup fields + `new` + `step`, L2 regularization loop in
-// `train_classifier`, `validate()`, `Default for ClassifierWeights`, and
-// `param_count` (used in tests).  Missing any one causes silent gradient
-// omission.  This is inherent to manual backprop without autograd.
+// NOTE: Adding a new weight tensor requires updating the canonical
+// enumerations (ClassifierWeights `all_trainable_slices`/_mut, GradientBuffer
+// and AdamStateGroup `all_mut`) plus named-field consumers (`validate()`,
+// `Default for ClassifierWeights`, `param_count`, L2 loops).  `new`/`step`
+// consume the accessors positionally — arity-checked destructuring turns a
+// field-count drift into a compile error instead of silent gradient omission,
+// at the cost of one 10-field enumeration per accessor (net +37 lines vs the
+// old duplicated sites).  `step` borrows `g` mutably only to reuse the single
+// GradientBuffer accessor; the gradients themselves are read-only there.
 
 struct GradientBuffer {
     conv1_w: Vec<f32>,
@@ -939,21 +958,23 @@ struct GradientBuffer {
 }
 impl GradientBuffer {
     fn new(w: &ClassifierWeights) -> Self {
+        let [c1, c2, c3, c4, c5, c6, c7, c8, c9, c10] = w.all_trainable_slices();
         Self {
-            conv1_w: vec![0.0; w.conv1_weight.len()],
-            conv1_b: vec![0.0; w.conv1_bias.len()],
-            bn1_gamma: vec![0.0; w.bn1_gamma.len()],
-            bn1_beta: vec![0.0; w.bn1_beta.len()],
-            conv2_w: vec![0.0; w.conv2_weight.len()],
-            conv2_b: vec![0.0; w.conv2_bias.len()],
-            bn2_gamma: vec![0.0; w.bn2_gamma.len()],
-            bn2_beta: vec![0.0; w.bn2_beta.len()],
-            fc_w: vec![0.0; w.fc_weight.len()],
-            fc_b: vec![0.0; w.fc_bias.len()],
+            conv1_w: vec![0.0; c1.len()],
+            conv1_b: vec![0.0; c2.len()],
+            bn1_gamma: vec![0.0; c3.len()],
+            bn1_beta: vec![0.0; c4.len()],
+            conv2_w: vec![0.0; c5.len()],
+            conv2_b: vec![0.0; c6.len()],
+            bn2_gamma: vec![0.0; c7.len()],
+            bn2_beta: vec![0.0; c8.len()],
+            fc_w: vec![0.0; c9.len()],
+            fc_b: vec![0.0; c10.len()],
         }
     }
-    fn all_mut(&mut self) -> Vec<&mut [f32]> {
-        vec![
+    /// Single enumeration of the 10 trainable gradient buffers (canonical order).
+    fn all_mut(&mut self) -> [&mut [f32]; 10] {
+        [
             &mut self.conv1_w,
             &mut self.conv1_b,
             &mut self.bn1_gamma,
@@ -982,30 +1003,49 @@ struct AdamStateGroup {
 }
 impl AdamStateGroup {
     fn new(w: &ClassifierWeights) -> Self {
+        let [c1, c2, c3, c4, c5, c6, c7, c8, c9, c10] = w.all_trainable_slices();
         Self {
-            conv1_w: AdamState::new(w.conv1_weight.len()),
-            conv1_b: AdamState::new(w.conv1_bias.len()),
-            bn1_gamma: AdamState::new(w.bn1_gamma.len()),
-            bn1_beta: AdamState::new(w.bn1_beta.len()),
-            conv2_w: AdamState::new(w.conv2_weight.len()),
-            conv2_b: AdamState::new(w.conv2_bias.len()),
-            bn2_gamma: AdamState::new(w.bn2_gamma.len()),
-            bn2_beta: AdamState::new(w.bn2_beta.len()),
-            fc_w: AdamState::new(w.fc_weight.len()),
-            fc_b: AdamState::new(w.fc_bias.len()),
+            conv1_w: AdamState::new(c1.len()),
+            conv1_b: AdamState::new(c2.len()),
+            bn1_gamma: AdamState::new(c3.len()),
+            bn1_beta: AdamState::new(c4.len()),
+            conv2_w: AdamState::new(c5.len()),
+            conv2_b: AdamState::new(c6.len()),
+            bn2_gamma: AdamState::new(c7.len()),
+            bn2_beta: AdamState::new(c8.len()),
+            fc_w: AdamState::new(c9.len()),
+            fc_b: AdamState::new(c10.len()),
         }
     }
-    fn step(&mut self, w: &mut ClassifierWeights, g: &GradientBuffer, lr: f32) {
-        self.conv1_w.update(&mut w.conv1_weight, &g.conv1_w, lr);
-        self.conv1_b.update(&mut w.conv1_bias, &g.conv1_b, lr);
-        self.bn1_gamma.update(&mut w.bn1_gamma, &g.bn1_gamma, lr);
-        self.bn1_beta.update(&mut w.bn1_beta, &g.bn1_beta, lr);
-        self.conv2_w.update(&mut w.conv2_weight, &g.conv2_w, lr);
-        self.conv2_b.update(&mut w.conv2_bias, &g.conv2_b, lr);
-        self.bn2_gamma.update(&mut w.bn2_gamma, &g.bn2_gamma, lr);
-        self.bn2_beta.update(&mut w.bn2_beta, &g.bn2_beta, lr);
-        self.fc_w.update(&mut w.fc_weight, &g.fc_w, lr);
-        self.fc_b.update(&mut w.fc_bias, &g.fc_b, lr);
+    /// Single enumeration of the 10 Adam states (canonical order).
+    fn all_mut(&mut self) -> [&mut AdamState; 10] {
+        [
+            &mut self.conv1_w,
+            &mut self.conv1_b,
+            &mut self.bn1_gamma,
+            &mut self.bn1_beta,
+            &mut self.conv2_w,
+            &mut self.conv2_b,
+            &mut self.bn2_gamma,
+            &mut self.bn2_beta,
+            &mut self.fc_w,
+            &mut self.fc_b,
+        ]
+    }
+    fn step(&mut self, w: &mut ClassifierWeights, g: &mut GradientBuffer, lr: f32) {
+        let [s1, s2, s3, s4, s5, s6, s7, s8, s9, s10] = self.all_mut();
+        let [w1, w2, w3, w4, w5, w6, w7, w8, w9, w10] = w.all_trainable_slices_mut();
+        let [g1, g2, g3, g4, g5, g6, g7, g8, g9, g10] = g.all_mut();
+        s1.update(w1, g1, lr);
+        s2.update(w2, g2, lr);
+        s3.update(w3, g3, lr);
+        s4.update(w4, g4, lr);
+        s5.update(w5, g5, lr);
+        s6.update(w6, g6, lr);
+        s7.update(w7, g7, lr);
+        s8.update(w8, g8, lr);
+        s9.update(w9, g9, lr);
+        s10.update(w10, g10, lr);
     }
 }
 
