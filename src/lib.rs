@@ -118,21 +118,14 @@ impl DiagnosticsCommands {
     /// as [`Self::commands`]). Empty strings become `None` — skip during execution.
     #[must_use]
     pub fn from_buffers(buffers: &[String; Self::COMMAND_COUNT]) -> Self {
-        fn take_non_empty(s: &str) -> Option<String> {
-            if s.is_empty() {
-                None
-            } else {
-                Some(s.to_string())
-            }
-        }
         Self {
-            format: take_non_empty(&buffers[0]),
-            format_check: take_non_empty(&buffers[1]),
-            lint_fix: take_non_empty(&buffers[2]),
-            lint: take_non_empty(&buffers[3]),
-            type_check: take_non_empty(&buffers[4]),
-            build: take_non_empty(&buffers[5]),
-            unit_test: take_non_empty(&buffers[6]),
+            format: crate::util::none_if_empty(&buffers[0]),
+            format_check: crate::util::none_if_empty(&buffers[1]),
+            lint_fix: crate::util::none_if_empty(&buffers[2]),
+            lint: crate::util::none_if_empty(&buffers[3]),
+            type_check: crate::util::none_if_empty(&buffers[4]),
+            build: crate::util::none_if_empty(&buffers[5]),
+            unit_test: crate::util::none_if_empty(&buffers[6]),
         }
     }
 

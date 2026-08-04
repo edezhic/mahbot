@@ -723,6 +723,18 @@ pub fn render_tree_children<'a, Message>(
         .collect()
 }
 
+/// Dispatch a file-tree node to its dir or file renderer.
+///
+/// Shared by the editor and diff file trees so the `is_dir` branching lives
+/// in one place; exactly one of the two closures is invoked.
+pub fn render_tree_node<'a, Message>(
+    is_dir: bool,
+    render_dir: impl FnOnce() -> Element<'a, Message>,
+    render_file: impl FnOnce() -> Element<'a, Message>,
+) -> Element<'a, Message> {
+    if is_dir { render_dir() } else { render_file() }
+}
+
 /// Check whether a tree node at the given path is currently focused
 /// in the file tree's keyboard navigation.
 #[must_use]

@@ -100,6 +100,18 @@ pub fn truncate(input: &str, max_chars: usize) -> String {
     }
 }
 
+/// Convert a string reference to `None` if empty, otherwise `Some(s.to_string())`.
+///
+/// Useful when building query structs where empty filters mean "no filter".
+#[must_use]
+pub(crate) fn none_if_empty(s: &str) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
 /// Current Unix timestamp in milliseconds since the epoch.
 ///
 /// Returns `0` if the system clock is set before the Unix epoch (January 1, 1970).

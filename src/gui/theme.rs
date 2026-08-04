@@ -535,12 +535,11 @@ pub fn button_secondary(
     }
 }
 
-/// Text-only danger button (Cancel in modals, delete triggers). Like [`button_text`]
-/// but with red text. No colored background, subtle hover highlight, red text only.
-#[must_use]
-pub fn button_text_danger(
-    _: &iced::Theme,
+/// Shared text-button factory: hover/pressed background plus an enabled
+/// text color that differs between the normal and danger variants.
+fn button_text_style(
     status: iced::widget::button::Status,
+    enabled_color: Color,
 ) -> iced::widget::button::Style {
     let bg = match status {
         iced::widget::button::Status::Hovered => HOVER,
@@ -549,7 +548,7 @@ pub fn button_text_danger(
     };
     let text = match status {
         iced::widget::button::Status::Disabled => TEXT_MUTED,
-        _ => STATUS_ERROR,
+        _ => enabled_color,
     };
     iced::widget::button::Style {
         background: Some(iced::Background::Color(bg)),
@@ -561,36 +560,42 @@ pub fn button_text_danger(
         },
         ..iced::widget::button::Style::default()
     }
+}
+
+/// Text-only danger button (Cancel in modals, delete triggers). Like [`button_text`]
+/// but with red text. No colored background, subtle hover highlight, red text only.
+#[must_use]
+pub fn button_text_danger(
+    _theme: &iced::Theme,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
+    button_text_style(status, STATUS_ERROR)
 }
 
 /// Text-only button (sidebar nav items, inline actions). Minimal Flexoki styling.
 #[must_use]
 pub fn button_text(
-    _: &iced::Theme,
+    _theme: &iced::Theme,
     status: iced::widget::button::Status,
 ) -> iced::widget::button::Style {
-    let bg = match status {
-        iced::widget::button::Status::Hovered => HOVER,
-        iced::widget::button::Status::Pressed => HOVER_STRONG,
-        _ => Color::TRANSPARENT,
-    };
-    let text = match status {
-        iced::widget::button::Status::Disabled => TEXT_MUTED,
-        _ => TEXT_PRIMARY,
-    };
-    iced::widget::button::Style {
-        background: Some(iced::Background::Color(bg)),
-        text_color: text,
-        border: iced::Border {
-            radius: 4.0.into(),
-            width: 0.0,
-            color: Color::TRANSPARENT,
-        },
-        ..iced::widget::button::Style::default()
-    }
+    button_text_style(status, TEXT_PRIMARY)
 }
 
-// ── Tooltip container style ──────────────────────────────────────
+// ── Container styles ─────────────────────────────────────────────
+
+/// Shared container style factory: background fill plus border parameters.
+/// Public wrappers below delegate here so the six variants stay in one place.
+fn container_style(bg: Color, radius: f32, width: f32, border_color: Color) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(bg)),
+        border: iced::Border {
+            radius: radius.into(),
+            width,
+            color: border_color,
+        },
+        ..container::Style::default()
+    }
+}
 
 /// Style for tooltip containers: elevated background with subtle rounded
 /// corners and a hairline border, matching the `dialog_container_style`
@@ -601,15 +606,7 @@ pub fn button_text(
 /// underneath it.
 #[must_use]
 pub fn tooltip_style(_theme: &iced::Theme) -> container::Style {
-    container::Style {
-        background: Some(iced::Background::Color(BG_ELEVATED)),
-        border: iced::Border {
-            radius: 6.0.into(),
-            width: 1.0,
-            color: BORDER_STRONG,
-        },
-        ..container::Style::default()
-    }
+    container_style(BG_ELEVATED, 6.0, 1.0, BORDER_STRONG)
 }
 
 /// Style for chat message bubbles and the typing indicator.
@@ -638,15 +635,7 @@ pub fn bubble_style(
 /// Flat elevated background with zero-radius border.
 #[must_use]
 pub fn container_bar(_theme: &iced::Theme) -> container::Style {
-    container::Style {
-        background: Some(iced::Background::Color(BG_ELEVATED)),
-        border: iced::Border {
-            radius: 0.0.into(),
-            width: 0.0,
-            color: iced::Color::TRANSPARENT,
-        },
-        ..container::Style::default()
-    }
+    container_style(BG_ELEVATED, 0.0, 0.0, Color::TRANSPARENT)
 }
 
 /// Style for surface cards: surface background with a 1px border and
@@ -654,15 +643,7 @@ pub fn container_bar(_theme: &iced::Theme) -> container::Style {
 /// log entries, and session transcript messages.
 #[must_use]
 pub fn surface_card_style(_theme: &iced::Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(BG_SURFACE)),
-        border: iced::Border {
-            radius: 4.0.into(),
-            width: 1.0,
-            color: BORDER,
-        },
-        ..container::Style::default()
-    }
+    container_style(BG_SURFACE, 4.0, 1.0, BORDER)
 }
 
 /// Style for modal dialog containers: elevated background, 8px rounded
@@ -671,35 +652,21 @@ pub fn surface_card_style(_theme: &iced::Theme) -> container::Style {
 /// modals, etc.).
 #[must_use]
 pub fn dialog_container_style(_theme: &iced::Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(BG_ELEVATED)),
-        border: iced::Border {
-            radius: 8.0.into(),
-            width: 1.0,
-            color: BORDER_STRONG,
-        },
-        ..container::Style::default()
-    }
+    container_style(BG_ELEVATED, 8.0, 1.0, BORDER_STRONG)
 }
 
 /// Style for the base page background: just the BG_BASE fill with no border.
 /// Used as the outermost container on most pages (home, sessions, logs).
 #[must_use]
 pub fn base_container_style(_theme: &iced::Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(BG_BASE)),
-        ..container::Style::default()
-    }
+    container_style(BG_BASE, 0.0, 0.0, Color::TRANSPARENT)
 }
 
 /// Style for surface-only containers: surface background with no border.
 /// Used for sidebar panels, tab bars, and filter bars.
 #[must_use]
 pub fn surface_container_style(_theme: &iced::Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(BG_SURFACE)),
-        ..container::Style::default()
-    }
+    container_style(BG_SURFACE, 0.0, 0.0, Color::TRANSPARENT)
 }
 
 /// Style for role badge pills: a pill-shaped container with a translucent
@@ -789,5 +756,90 @@ mod tests {
         assert_eq!(role_badge_color("ANALYST"), analyst_color);
         assert_eq!(role_badge_color("Analyst"), analyst_color);
         assert_eq!(role_badge_color("ANALYST_1"), analyst_color);
+    }
+
+    /// Locks the pre-consolidation values of the six container factories and
+    /// the button_text/button_text_danger pair so parameterization cannot
+    /// silently change any rendered style.
+    #[test]
+    fn style_factory_values_unchanged() {
+        let theme = iced::Theme::Dark;
+        let bg = |c: iced::Color| Some(iced::Background::Color(c));
+        let border = |r: f32, w: f32, c: iced::Color| iced::Border {
+            radius: r.into(),
+            width: w,
+            color: c,
+        };
+
+        assert_eq!(
+            tooltip_style(&theme),
+            iced::widget::container::Style {
+                background: bg(BG_ELEVATED),
+                border: border(6.0, 1.0, BORDER_STRONG),
+                ..iced::widget::container::Style::default()
+            }
+        );
+        assert_eq!(
+            container_bar(&theme),
+            iced::widget::container::Style {
+                background: bg(BG_ELEVATED),
+                border: border(0.0, 0.0, iced::Color::TRANSPARENT),
+                ..iced::widget::container::Style::default()
+            }
+        );
+        assert_eq!(
+            surface_card_style(&theme),
+            iced::widget::container::Style {
+                background: bg(BG_SURFACE),
+                border: border(4.0, 1.0, BORDER),
+                ..iced::widget::container::Style::default()
+            }
+        );
+        assert_eq!(
+            dialog_container_style(&theme),
+            iced::widget::container::Style {
+                background: bg(BG_ELEVATED),
+                border: border(8.0, 1.0, BORDER_STRONG),
+                ..iced::widget::container::Style::default()
+            }
+        );
+        assert_eq!(
+            base_container_style(&theme),
+            iced::widget::container::Style {
+                background: bg(BG_BASE),
+                ..iced::widget::container::Style::default()
+            }
+        );
+        assert_eq!(
+            surface_container_style(&theme),
+            iced::widget::container::Style {
+                background: bg(BG_SURFACE),
+                ..iced::widget::container::Style::default()
+            }
+        );
+
+        for status in [
+            iced::widget::button::Status::Active,
+            iced::widget::button::Status::Hovered,
+            iced::widget::button::Status::Pressed,
+            iced::widget::button::Status::Disabled,
+        ] {
+            let expected = |enabled: iced::Color| iced::widget::button::Style {
+                background: bg(match status {
+                    iced::widget::button::Status::Hovered => HOVER,
+                    iced::widget::button::Status::Pressed => HOVER_STRONG,
+                    _ => iced::Color::TRANSPARENT,
+                }),
+                text_color: if status == iced::widget::button::Status::Disabled {
+                    TEXT_MUTED
+                } else {
+                    enabled
+                },
+                border: border(4.0, 0.0, iced::Color::TRANSPARENT),
+                ..iced::widget::button::Style::default()
+            };
+            assert_eq!(button_text(&theme, status), expected(TEXT_PRIMARY));
+            assert_eq!(button_text_danger(&theme, status), expected(STATUS_ERROR));
+        }
     }
 }

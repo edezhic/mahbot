@@ -36,9 +36,12 @@ pub struct DisplayMessage {
     /// Database row ID (Some for history-loaded, None for live arrivals).
     pub id: Option<i64>,
     pub message_id: String,
-    #[expect(
-        dead_code,
-        reason = "Carried in DisplayMessage for future display use; currently not read"
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Carried in DisplayMessage for future display use; currently not read"
+        )
     )]
     pub user_name: String,
     pub content: String,
@@ -1328,35 +1331,15 @@ impl HomeState {
 
 /// Stream producer for chat events from CHAT_BROADCAST.
 fn chat_stream_producer() -> impl futures_util::Stream<Item = HomeMessage> {
-    iced::stream::channel(
-        16,
-        move |mut output: iced::futures::channel::mpsc::Sender<HomeMessage>| async move {
-            let Some(rx) = crate::CHAT_BROADCAST.get().and_then(|tx| {
-                if tx.receiver_count() > 100 {
-                    None
-                } else {
-                    Some(tx.subscribe())
-                }
-            }) else {
-                return;
-            };
-
-            let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);
-            loop {
-                match tokio_stream::StreamExt::next(&mut stream).await {
-                    Some(Ok(event)) => {
-                        let _ = output.send(HomeMessage::ChatEvent(event)).await;
-                    }
-                    Some(Err(
-                        tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_n),
-                    )) => {
-                        let _ = output.send(HomeMessage::StreamLagged).await;
-                    }
-                    None => break,
-                }
-            }
-        },
-    )
+    super::common::broadcast_stream_producer(16, &crate::CHAT_BROADCAST, |output, item| {
+        let msg = match item {
+            Some(event) => HomeMessage::ChatEvent(event),
+            None => HomeMessage::StreamLagged,
+        };
+        Box::pin(async move {
+            let _ = output.send(msg).await;
+        })
+    })
 }
 
 /// Emit `TypingTick` every 500ms for the typing indicator animation.

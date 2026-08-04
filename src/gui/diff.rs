@@ -925,11 +925,11 @@ impl DiffState {
         ancestor_mask: u64,
         is_last: bool,
     ) -> Element<'a, DiffMessage> {
-        if node.is_dir {
-            self.render_dir_node(node, depth, ancestor_mask, is_last)
-        } else {
-            self.render_file_node(node, depth, ancestor_mask, is_last)
-        }
+        widgets::render_tree_node(
+            node.is_dir,
+            || self.render_dir_node(node, depth, ancestor_mask, is_last),
+            || self.render_file_node(node, depth, ancestor_mask, is_last),
+        )
     }
 
     fn render_dir_node<'a>(

@@ -31,37 +31,20 @@ pub enum LogsTab {
 }
 
 fn log_stream_producer() -> impl futures_util::Stream<Item = LogMessage> {
-    iced::stream::channel(
-        1,
-        move |mut output: iced::futures::channel::mpsc::Sender<LogMessage>| async move {
-            let Some(rx) = super::LOG_BROADCAST.get().and_then(|tx| {
-                if tx.receiver_count() > 100 {
-                    None
-                } else {
-                    Some(tx.subscribe())
+    super::common::broadcast_stream_producer(1, &super::LOG_BROADCAST, |output, item| {
+        Box::pin(async move {
+            match item {
+                Some(json) => {
+                    if let Ok(entry) = serde_json::from_str::<LogEntry>(&json) {
+                        let _ = output.try_send(LogMessage::LiveEntry(entry));
+                    }
                 }
-            }) else {
-                return;
-            };
-
-            let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);
-            loop {
-                match tokio_stream::StreamExt::next(&mut stream).await {
-                    Some(Ok(json)) => {
-                        if let Ok(entry) = serde_json::from_str::<LogEntry>(&json) {
-                            let _ = output.try_send(LogMessage::LiveEntry(entry));
-                        }
-                    }
-                    Some(Err(
-                        tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_n),
-                    )) => {
-                        let _ = output.try_send(LogMessage::StreamLagged);
-                    }
-                    None => break,
+                None => {
+                    let _ = output.try_send(LogMessage::StreamLagged);
                 }
             }
-        },
-    )
+        })
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -184,10 +167,10 @@ impl LogsState {
         LogQuery {
             level,
             target: None,
-            search: super::common::none_if_empty(&self.search_filter),
+            search: crate::util::none_if_empty(&self.search_filter),
             agent_id: None,
-            agent_role: super::common::none_if_empty(&self.role_filter),
-            workspace: super::common::none_if_empty(&self.workspace_filter),
+            agent_role: crate::util::none_if_empty(&self.role_filter),
+            workspace: crate::util::none_if_empty(&self.workspace_filter),
             since: None,
             until: None,
             limit: Some(self.pagination.page_size),

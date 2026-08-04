@@ -272,9 +272,12 @@ impl EditorBuffer {
 
     /// Return the text of a specific line (0-based), or `None` if the line
     /// index is out of range.
-    #[expect(
-        dead_code,
-        reason = "Public accessor; kept for API completeness, not currently called"
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Public accessor; kept for API completeness, not currently called"
+        )
     )]
     pub fn line(&self, index: usize) -> Option<String> {
         self.buffer
@@ -465,9 +468,12 @@ impl EditorBuffer {
     /// Replace the entire buffer content with new text. Resets cursor and
     /// selection to the start. Re-applies syntax highlighting if a language
     /// is configured.
-    #[expect(
-        dead_code,
-        reason = "Public setter; kept for API completeness, not currently called"
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Public setter; kept for API completeness, not currently called"
+        )
     )]
     pub fn set_text(&self, new_text: &str) {
         let language = self.language;

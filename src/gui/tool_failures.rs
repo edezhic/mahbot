@@ -49,9 +49,9 @@ impl ToolFailuresState {
 
     fn build_query(role_filter: &str, workspace_filter: &str, search: &str) -> ToolErrorQuery {
         ToolErrorQuery {
-            role_filter: super::common::none_if_empty(role_filter),
-            workspace_filter: super::common::none_if_empty(workspace_filter),
-            search: super::common::none_if_empty(search),
+            role_filter: crate::util::none_if_empty(role_filter),
+            workspace_filter: crate::util::none_if_empty(workspace_filter),
+            search: crate::util::none_if_empty(search),
         }
     }
 

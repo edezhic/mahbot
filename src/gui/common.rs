@@ -2,6 +2,8 @@
 
 use iced::Task;
 use iced::widget::text_editor;
+use std::future::Future;
+use std::pin::Pin;
 
 /// Pagination state shared by dashboard pages that display paginated data.
 ///
@@ -307,18 +309,55 @@ impl UndoStack {
     }
 }
 
-// ── String helpers ──────────────────────────────────────────────────
-
-/// Convert a string reference to `None` if empty, otherwise
-/// `Some(s.to_string())`.
+/// Shared broadcast-stream producer skeleton used by the chat and logs pages.
 ///
-/// Useful when building query structs where empty filters mean "no filter".
-pub(crate) fn none_if_empty(s: &str) -> Option<String> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(s.to_string())
-    }
+/// Subscribes to `source` (skipped when it already has >100 receivers), wraps
+/// the receiver in a [`BroadcastStream`], and forwards events through `emit` —
+/// called with `Some(item)` for received items and `None` for lagged slots.
+/// `emit` decides how to publish (awaited send vs. try_send), so each page
+/// keeps its own backpressure semantics.
+pub(crate) fn broadcast_stream_producer<Msg, T, E>(
+    capacity: usize,
+    source: &'static std::sync::OnceLock<tokio::sync::broadcast::Sender<T>>,
+    mut emit: E,
+) -> impl futures_util::Stream<Item = Msg>
+where
+    Msg: Send + 'static,
+    T: Clone + Send + 'static,
+    E: FnMut(
+            &mut iced::futures::channel::mpsc::Sender<Msg>,
+            Option<T>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>
+        + Send
+        + 'static,
+{
+    iced::stream::channel(
+        capacity,
+        move |mut output: iced::futures::channel::mpsc::Sender<Msg>| async move {
+            let Some(rx) = source.get().and_then(|tx| {
+                if tx.receiver_count() > 100 {
+                    None
+                } else {
+                    Some(tx.subscribe())
+                }
+            }) else {
+                return;
+            };
+
+            let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);
+            loop {
+                match tokio_stream::StreamExt::next(&mut stream).await {
+                    Some(Ok(event)) => emit(&mut output, Some(event)).await,
+                    Some(Err(
+                        tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_n),
+                    )) => {
+                        emit(&mut output, None).await;
+                    }
+                    None => break,
+                }
+            }
+        },
+    )
 }
 
 #[cfg(test)]
