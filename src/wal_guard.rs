@@ -134,27 +134,34 @@ pub(crate) fn parse_tshm_header(tshm_path: &Path) -> Option<TshmHeader> {
     })
 }
 
-/// Classify the file set of one store under `root/db/`.
+/// Classify the file set of one store given its main database file path.
 ///
+/// The store name is derived from the file name (`board.db` → `board`).
 /// This is a pure filesystem inspection — it never opens the database, so it
 /// is safe to run against live stores and is unit-testable with synthetic
 /// file states.
 #[must_use]
-pub fn inspect_store(root: &Path, name: &str) -> StoreArtifactStatus {
-    let db_dir = root.join("db");
-    let wal_path = db_dir.join(format!("{name}.db-wal"));
-    let tshm_path = db_dir.join(format!("{name}.db-tshm"));
-
-    let tshm = parse_tshm_header(&tshm_path);
-    let wal_size = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
+pub fn inspect_store_at(db_path: &Path) -> StoreArtifactStatus {
+    let sidecars = crate::turso::store_sidecars(db_path);
+    let tshm = parse_tshm_header(&sidecars.tshm);
+    let wal_size = std::fs::metadata(&sidecars.wal).map_or(0, |m| m.len());
     let orphaned_wal = is_orphaned_wal(tshm, wal_size);
-
+    let store = db_path.file_stem().map_or_else(
+        || db_path.display().to_string(),
+        |s| s.to_string_lossy().into_owned(),
+    );
     StoreArtifactStatus {
-        store: name.to_string(),
+        store,
         tshm,
         wal_size,
         orphaned_wal,
     }
+}
+
+/// Classify the file set of one store under `root/db/`.
+#[must_use]
+pub fn inspect_store(root: &Path, name: &str) -> StoreArtifactStatus {
+    inspect_store_at(&crate::turso::store_db_path(root, name))
 }
 
 /// Inspect every checkpointable store under `root/db/`.

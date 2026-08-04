@@ -258,10 +258,9 @@ impl ConfigStore {
         E: std::fmt::Display + Send + Sync + 'static,
     {
         let sql = format!("SELECT {columns} FROM {table} ORDER BY {order_by}");
-        let rows = self.conn.query_map(&sql, turso::params![], parser).await?;
-        Ok(rows
-            .into_iter()
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+        self.conn
+            .query_map_strict(&sql, turso::params![], parser)
+            .await
     }
 }
 

@@ -481,6 +481,24 @@ impl Connection {
         Ok(map_rows(&rows, map))
     }
 
+    /// Map every row, failing on the first per-row error (unlike
+    /// [`Self::query_map`], which returns per-row results).
+    pub async fn query_map_strict<T, E>(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        map: impl FnMut(&Row) -> std::result::Result<T, E> + Send + 'static,
+    ) -> anyhow::Result<Vec<T>>
+    where
+        T: Send + 'static,
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        let rows = self.query_map(sql, params, map).await?;
+        rows.into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// Execute a query that returns exactly one row.
     /// Acquires the mutex so reads are serialized with writes.
     pub async fn query_row<T, E>(
@@ -602,14 +620,11 @@ impl Connection {
             .query("PRAGMA quick_check;", ())
             .await
             .context("Failed to execute PRAGMA quick_check")?;
-
-        for row in &rows {
-            match row.get_value(0)? {
-                Value::Text(s) if s == "ok" => {}
-                Value::Text(s) if s.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE) => {}
-                Value::Text(s) => anyhow::bail!("Database integrity check failed: {s}"),
-                _ => anyhow::bail!("Unexpected result from PRAGMA quick_check"),
-            }
+        if let Some(problem) = scan_integrity_rows(&rows, "quick_check")?
+            .into_iter()
+            .next()
+        {
+            anyhow::bail!("Database integrity check failed: {problem}");
         }
         Ok(())
     }
@@ -637,18 +652,24 @@ impl Connection {
             .query("PRAGMA integrity_check;", ())
             .await
             .context("Failed to execute PRAGMA integrity_check")?;
-
-        let mut problems: Vec<String> = Vec::new();
-        for row in &rows {
-            match row.get_value(0)? {
-                Value::Text(s) if s == "ok" => { /* healthy, skip */ }
-                Value::Text(s) if s.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE) => {}
-                Value::Text(s) => problems.push(s),
-                _ => anyhow::bail!("Unexpected result from PRAGMA integrity_check"),
-            }
-        }
-        Ok(problems)
+        scan_integrity_rows(&rows, "integrity_check")
     }
+}
+
+/// Collect problem rows from `PRAGMA quick_check`/`integrity_check` (skipping
+/// `"ok"` and the known FTS index-cardinality false positive). Shared by
+/// [`Connection::quick_check`] (bails) and [`Connection::integrity_check`] (collects).
+fn scan_integrity_rows(rows: &[Row], pragma_name: &str) -> anyhow::Result<Vec<String>> {
+    let mut problems: Vec<String> = Vec::new();
+    for row in rows {
+        match row.get_value(0)? {
+            Value::Text(s) if s == "ok" => {}
+            Value::Text(s) if s.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE) => {}
+            Value::Text(s) => problems.push(s),
+            _ => anyhow::bail!("Unexpected result from PRAGMA {pragma_name}"),
+        }
+    }
+    Ok(problems)
 }
 
 /// Outcome of `PRAGMA wal_checkpoint`, parsed from its 3-column result row
@@ -778,6 +799,25 @@ pub(crate) async fn read_schema_version(conn: &Connection) -> anyhow::Result<i64
         .unwrap_or(0))
 }
 
+/// Shared tail of versioned migration blocks: bump `PRAGMA user_version`, then
+/// checkpoint so the bump persists immediately. Callers keep their completion
+/// `info!` log after this call, preserving per-block log ordering.
+pub(crate) async fn bump_schema_version(
+    conn: &Connection,
+    version: i64,
+    after_label: &str,
+) -> anyhow::Result<()> {
+    conn.execute(&format!("PRAGMA user_version = {version}"), ())
+        .await
+        .context(format!(
+            "Schema migration failed: unable to set PRAGMA user_version to {version}"
+        ))?;
+    conn.checkpoint().await.context(format!(
+        "Schema migration failed: unable to checkpoint {after_label}"
+    ))?;
+    Ok(())
+}
+
 /// Check whether `table` has a column named `column` (via `PRAGMA table_info`).
 pub(crate) async fn column_exists(
     conn: &Connection,
@@ -852,6 +892,31 @@ pub(crate) async fn open_with_schema(db_path: &Path, schema: &str) -> anyhow::Re
     Ok(conn)
 }
 
+/// Absolute path to `<root>/db/<name>.db` — single source of truth for store
+/// file naming across the debug CLI, WAL guard, and logs quarantine.
+#[must_use]
+pub(crate) fn store_db_path(root: &Path, name: &str) -> std::path::PathBuf {
+    root.join("db").join(format!("{name}.db"))
+}
+
+/// Sidecar files (`-wal`, `-shm`, `-tshm`) beside a store's database file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoreSidecars {
+    pub wal: std::path::PathBuf,
+    pub shm: std::path::PathBuf,
+    pub tshm: std::path::PathBuf,
+}
+
+#[must_use]
+pub(crate) fn store_sidecars(db_path: &Path) -> StoreSidecars {
+    let base = db_path.display().to_string();
+    StoreSidecars {
+        wal: std::path::PathBuf::from(format!("{base}-wal")),
+        shm: std::path::PathBuf::from(format!("{base}-shm")),
+        tshm: std::path::PathBuf::from(format!("{base}-tshm")),
+    }
+}
+
 /// Open a store database under `<root>/db/<name>.db`.
 ///
 /// Creates parent directories if needed and runs the provided `schema` via
@@ -863,7 +928,7 @@ pub(crate) async fn open_store(
     name: &str,
     schema: &str,
 ) -> anyhow::Result<Connection> {
-    let db_path = root.join("db").join(format!("{name}.db"));
+    let db_path = store_db_path(root, name);
     open_with_schema(&db_path, schema).await
 }
 

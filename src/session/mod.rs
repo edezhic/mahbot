@@ -266,6 +266,39 @@ where
         .collect()
 }
 
+/// Run the session-listing query body (metadata + message count join) with an
+/// optional `WHERE` fragment. Shared by [`SessionStore::list_sessions_with_metadata`]
+/// and [`SessionStore::list_sessions_with_metadata_excluding`].
+async fn list_sessions_where(
+    conn: &turso::Connection,
+    where_clause: &str,
+    params: impl IntoParams + Send + 'static,
+    warn_context: &str,
+) -> Vec<SessionMetadata> {
+    query_map_collect(
+        conn,
+        &format!(
+            "SELECT {SESSION_LIST_COLUMNS} \
+             FROM session_metadata sm \
+             LEFT JOIN sessions s ON s.agent_id = sm.agent_id \
+             {where_clause} \
+             GROUP BY sm.agent_id \
+             ORDER BY sm.last_activity DESC",
+        ),
+        params,
+        |row| {
+            Ok::<_, anyhow::Error>(session_metadata_from_row(
+                &row.get::<String>(COL_SL_AGENT_ID)?,
+                &row.get::<String>(COL_SL_LAST_ACTIVITY)?,
+                row.get::<i64>(COL_SL_MESSAGE_COUNT)?,
+            ))
+        },
+        warn_context,
+        None,
+    )
+    .await
+}
+
 // ── Methods — callable on the static ──────────────────────────
 
 impl SessionStore {
@@ -393,27 +426,7 @@ impl SessionStore {
     }
 
     pub(crate) async fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
-        query_map_collect(
-            &self.conn,
-            &format!(
-                "SELECT {SESSION_LIST_COLUMNS} \
-                 FROM session_metadata sm \
-                 LEFT JOIN sessions s ON s.agent_id = sm.agent_id \
-                 GROUP BY sm.agent_id \
-                 ORDER BY sm.last_activity DESC",
-            ),
-            (),
-            |row| {
-                Ok::<_, anyhow::Error>(session_metadata_from_row(
-                    &row.get::<String>(COL_SL_AGENT_ID)?,
-                    &row.get::<String>(COL_SL_LAST_ACTIVITY)?,
-                    row.get::<i64>(COL_SL_MESSAGE_COUNT)?,
-                ))
-            },
-            "list sessions",
-            None,
-        )
-        .await
+        list_sessions_where(&self.conn, "", (), "list sessions").await
     }
 
     /// Like [`list_sessions_with_metadata`], but excludes sessions whose
@@ -442,26 +455,11 @@ impl SessionStore {
             .map(|p| turso::Value::Text(format!("{p}%")))
             .collect();
 
-        query_map_collect(
+        list_sessions_where(
             &self.conn,
-            &format!(
-                "SELECT {SESSION_LIST_COLUMNS} \
-                 FROM session_metadata sm \
-                 LEFT JOIN sessions s ON s.agent_id = sm.agent_id \
-                 WHERE {where_clause} \
-                 GROUP BY sm.agent_id \
-                 ORDER BY sm.last_activity DESC",
-            ),
+            &format!("WHERE {where_clause}"),
             params,
-            |row| {
-                Ok::<_, anyhow::Error>(session_metadata_from_row(
-                    &row.get::<String>(COL_SL_AGENT_ID)?,
-                    &row.get::<String>(COL_SL_LAST_ACTIVITY)?,
-                    row.get::<i64>(COL_SL_MESSAGE_COUNT)?,
-                ))
-            },
             "list sessions (excluding prefixes)",
-            None,
         )
         .await
     }
@@ -573,13 +571,7 @@ async fn run_session_migrations(conn: &turso::Connection) -> anyhow::Result<()> 
 
         // PRAGMA user_version is NOT transaction-atomic in SQLite — set it
         // after the ALTER TABLE (which has already auto-committed).
-        conn.execute("PRAGMA user_version = 1", ())
-            .await
-            .context("Schema migration failed: unable to set PRAGMA user_version to 1")?;
-
-        conn.checkpoint().await.context(
-            "Schema migration failed: unable to checkpoint after renaming session_key columns",
-        )?;
+        turso::bump_schema_version(conn, 1, "after renaming session_key columns").await?;
 
         if has_session_key || meta_has_session_key {
             tracing::info!(
@@ -618,13 +610,7 @@ async fn run_session_migrations(conn: &turso::Connection) -> anyhow::Result<()> 
             }
         }
 
-        conn.execute("PRAGMA user_version = 2", ())
-            .await
-            .context("Schema migration failed: unable to set PRAGMA user_version to 2")?;
-
-        conn.checkpoint().await.context(
-            "Schema migration failed: unable to checkpoint after adding context columns",
-        )?;
+        turso::bump_schema_version(conn, 2, "after adding context columns").await?;
 
         tracing::info!(
             "Schema migration complete: added context columns to session_metadata (version 2)"

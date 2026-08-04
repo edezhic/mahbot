@@ -271,7 +271,7 @@ async fn open_verified_logs_store(root: &Path) -> Result<crate::turso::Connectio
     let conn = match open {
         Ok(Ok(conn)) => conn,
         Ok(Err(e)) => {
-            let db_path = root.join("db").join("logs.db");
+            let db_path = turso::store_db_path(root, "logs");
             // A store that exists but cannot be opened at all is corrupt —
             // quarantine so boot can proceed with a fresh store. A missing
             // file (first boot) opens fine, so this path implies an existing
@@ -345,7 +345,8 @@ fn is_corruption_class(e: &anyhow::Error) -> bool {
 /// guarantees uniqueness across multiple quarantines within the same second.
 fn quarantine_logs_artifacts(root: &Path) {
     static QUARANTINE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let db_dir = root.join("db");
+    let db_path = turso::store_db_path(root, "logs");
+    let sidecars = turso::store_sidecars(&db_path);
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
     let seq = QUARANTINE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let base = if seq == 0 {
@@ -353,13 +354,17 @@ fn quarantine_logs_artifacts(root: &Path) {
     } else {
         format!("logs.db.quarantine-{stamp}-{seq}")
     };
-    for suffix in ["", "-wal", "-shm", "-tshm"] {
-        let src = db_dir.join(format!("logs.db{suffix}"));
+    for (src, suffix) in [
+        (&db_path, ""),
+        (&sidecars.wal, "-wal"),
+        (&sidecars.shm, "-shm"),
+        (&sidecars.tshm, "-tshm"),
+    ] {
         if !src.exists() {
             continue;
         }
-        let dst = db_dir.join(format!("{base}{suffix}"));
-        if let Err(e) = std::fs::rename(&src, &dst) {
+        let dst = db_path.with_file_name(format!("{base}{suffix}"));
+        if let Err(e) = std::fs::rename(src, &dst) {
             warn!(
                 error = %e,
                 from = %src.display(),
@@ -908,20 +913,12 @@ fn log_writer_panic_backoff(consecutive: u32) -> std::time::Duration {
 /// Rate-limited stderr warning (stderr bypasses tracing, so this cannot
 /// recurse into the writer task).
 fn emit_stderr_warning(count: u64, message: &str, kind: &str) {
-    let now_ms = unix_millis();
+    let now_ms = crate::util::unix_millis();
     let last_warn_ms = LOG_WRITE_LAST_STDERR_WARN_MS.load(Ordering::SeqCst);
     if now_ms.saturating_sub(last_warn_ms) >= LOG_WRITE_STDERR_WARN_INTERVAL_MS {
         LOG_WRITE_LAST_STDERR_WARN_MS.store(now_ms, Ordering::SeqCst);
         eprintln!("[mahbot] log store {kind} #{count}: {message}");
     }
-}
-
-/// Current Unix time in milliseconds.
-fn unix_millis() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
-        d.as_secs().saturating_mul(1_000) + u64::from(d.subsec_millis())
-    })
 }
 
 /// Extract a string field from a JSON value, defaulting to `""`.
@@ -1507,7 +1504,7 @@ mod tests {
 
         // Corrupt a b-tree page in the main DB file (zero page 2; the header
         // page 1 stays intact so the file still opens).
-        let db_path = root.join("db").join("logs.db");
+        let db_path = turso::store_db_path(root, "logs");
         let bytes = std::fs::read(&db_path).expect("read db file");
         assert!(bytes.len() > 8192, "test needs a multi-page db file");
         let mut corrupted = bytes.clone();
@@ -1567,7 +1564,7 @@ mod tests {
         // Zero the header's page-size field (big-endian u16 at byte offset 16)
         // so the file cannot be opened at all — Limbo bails with a corruption
         // error ("invalid page size in database header") rather than an IO error.
-        let db_path = root.join("db").join("logs.db");
+        let db_path = turso::store_db_path(root, "logs");
         let mut bytes = std::fs::read(&db_path).expect("read db file");
         bytes[16] = 0;
         bytes[17] = 0;

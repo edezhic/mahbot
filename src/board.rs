@@ -639,14 +639,7 @@ async fn run_schema_migrations(conn: &turso::Connection) -> anyhow::Result<()> {
         // PRAGMA user_version is NOT transaction-atomic in SQLite — set it
         // after the ALTER TABLE (which has already auto-committed) to avoid
         // a version-schema mismatch if a crash occurs between the two.
-        conn.execute("PRAGMA user_version = 1", ())
-            .await
-            .context("Schema migration failed: unable to set PRAGMA user_version to 1")?;
-
-        // Persist immediately via WAL checkpoint.
-        conn.checkpoint().await.context(
-            "Schema migration failed: unable to checkpoint after renaming tickets.status",
-        )?;
+        turso::bump_schema_version(conn, 1, "after renaming tickets.status").await?;
 
         if has_status_column {
             info!("Schema migration complete: tickets.status renamed to tickets.phase (version 1)");
@@ -668,13 +661,7 @@ async fn run_schema_migrations(conn: &turso::Connection) -> anyhow::Result<()> {
             .context("Schema migration failed: unable to add tickets.priority")?;
         }
 
-        conn.execute("PRAGMA user_version = 2", ())
-            .await
-            .context("Schema migration failed: unable to set PRAGMA user_version to 2")?;
-
-        conn.checkpoint().await.context(
-            "Schema migration failed: unable to checkpoint after adding tickets.priority",
-        )?;
+        turso::bump_schema_version(conn, 2, "after adding tickets.priority").await?;
 
         if !has_priority {
             info!("Schema migration complete: added tickets.priority column (version 2)");
@@ -712,13 +699,7 @@ async fn run_schema_migrations(conn: &turso::Connection) -> anyhow::Result<()> {
             }
         }
 
-        conn.execute("PRAGMA user_version = 3", ())
-            .await
-            .context("Schema migration failed: unable to set PRAGMA user_version to 3")?;
-
-        conn.checkpoint().await.context(
-            "Schema migration failed: unable to checkpoint after adding reviewed-base columns",
-        )?;
+        turso::bump_schema_version(conn, 3, "after adding reviewed-base columns").await?;
 
         if !added.is_empty() {
             info!("Schema migration complete: added {added:?} columns (version 3)");
@@ -1191,15 +1172,16 @@ impl BoardStore {
 
     /// Get a ticket's phase by id — lightweight, no comments loaded.
     pub async fn get_ticket_phase(&self, ticket_id: &str) -> Result<Option<TicketPhase>> {
-        let sql = "SELECT phase FROM tickets WHERE id = ?1";
-        let rows = self.conn.query(sql, turso::params![ticket_id]).await?;
-        match rows.into_iter().next() {
-            Some(row) => {
-                let phase: String = row.get(0)?;
-                Ok(Some(phase.parse()?))
-            }
-            None => Ok(None),
-        }
+        self.conn
+            .query_optional(
+                "SELECT phase FROM tickets WHERE id = ?1",
+                turso::params![ticket_id],
+                |row| {
+                    let phase: String = row.get(0)?;
+                    phase.parse()
+                },
+            )
+            .await
     }
 
     /// Get a ticket's priority by id — lightweight, no comments loaded.

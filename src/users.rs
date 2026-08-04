@@ -124,18 +124,18 @@ impl UserStore {
     }
 
     /// Fetch a single nullable column from the user's row, if the user exists.
+    ///
+    /// A NULL column and a missing row both yield `None` (NULL-vs-missing
+    /// conflation preserved from the pre-helper implementation).
     async fn user_column(&self, column: &str, user_name: &str) -> Result<Option<String>> {
-        let rows = self
-            .conn
-            .query(
+        self.conn
+            .query_optional(
                 &format!("SELECT {column} FROM users WHERE name = ?1"),
                 turso::params![user_name],
+                |row| row.get::<Option<String>>(0),
             )
-            .await?;
-        match rows.into_iter().next() {
-            Some(row) => Ok(row.get::<Option<String>>(0)?),
-            None => Ok(None),
-        }
+            .await
+            .map(Option::flatten)
     }
 
     /// Get the selected workspace name for a user, if any.
@@ -210,37 +210,30 @@ impl UserStore {
         channel: &str,
         identifier: &str,
     ) -> Result<Option<String>> {
-        let rows = self
-            .conn
-            .query(
+        self.conn
+            .query_optional(
                 "SELECT user_name FROM user_channels WHERE channel = ?1 AND identifier = ?2",
                 turso::params![channel, identifier],
+                |row| row.get::<String>(0),
             )
-            .await?;
-        match rows.into_iter().next() {
-            Some(row) => Ok(Some(row.get::<String>(0)?)),
-            None => Ok(None),
-        }
+            .await
     }
 
     /// Get all channel bindings for a user.
     pub async fn get_user_channels(&self, user_name: &str) -> Result<Vec<ChannelBinding>> {
-        let rows = self
-            .conn
-            .query(
+        self.conn
+            .query_map_strict(
                 &format!("SELECT {USER_CHANNEL_COLUMNS} FROM user_channels WHERE user_name = ?1"),
                 turso::params![user_name],
+                |row| {
+                    Ok::<_, ::turso::Error>(ChannelBinding {
+                        channel: row.get::<String>(COL_UC_CHANNEL)?,
+                        identifier: row.get::<String>(COL_UC_IDENTIFIER)?,
+                        reply_target: row.get::<Option<String>>(COL_UC_REPLY_TARGET)?,
+                    })
+                },
             )
-            .await?;
-        let mut bindings = Vec::new();
-        for row in rows {
-            bindings.push(ChannelBinding {
-                channel: row.get::<String>(COL_UC_CHANNEL)?,
-                identifier: row.get::<String>(COL_UC_IDENTIFIER)?,
-                reply_target: row.get::<Option<String>>(COL_UC_REPLY_TARGET)?,
-            });
-        }
-        Ok(bindings)
+            .await
     }
 
     /// Convert a `users` table row into a [`UserRecord`], loading channel bindings.
@@ -257,24 +250,30 @@ impl UserStore {
 
     // ── Lookup / listing ──────────────────────────────────────
 
-    /// Find all users whose `selected_workspace` matches the given name
-    /// (shared workspaces only — personal workspace users with NULL are excluded).
-    pub async fn find_by_workspace(&self, workspace_name: &str) -> Result<Vec<UserRecord>> {
-        let rows = self
-            .conn
-            .query(
-                &format!(
-                    "SELECT {USERS_COLUMNS} \
-                 FROM users WHERE selected_workspace = ?1"
-                ),
-                turso::params![workspace_name],
-            )
-            .await?;
-        let mut users = Vec::new();
+    /// Shared listing body: run `suffix` (everything after `FROM users`) and
+    /// collect full [`UserRecord`]s with channel bindings.
+    async fn list_users_where(
+        &self,
+        suffix: &str,
+        params: impl turso::IntoParams + Send + 'static,
+    ) -> Result<Vec<UserRecord>> {
+        let sql = format!("SELECT {USERS_COLUMNS} FROM users {suffix}");
+        let rows = self.conn.query(&sql, params).await?;
+        let mut users = Vec::with_capacity(rows.len());
         for row in rows {
             users.push(self.user_record_from_row(&row).await?);
         }
         Ok(users)
+    }
+
+    /// Find all users whose `selected_workspace` matches the given name
+    /// (shared workspaces only — personal workspace users with NULL are excluded).
+    pub async fn find_by_workspace(&self, workspace_name: &str) -> Result<Vec<UserRecord>> {
+        self.list_users_where(
+            "WHERE selected_workspace = ?1",
+            turso::params![workspace_name],
+        )
+        .await
     }
 
     /// Find a single user by exact name, returning their full record with channel bindings.
@@ -295,18 +294,7 @@ impl UserStore {
 
     /// List all users.
     pub async fn list_users(&self) -> Result<Vec<UserRecord>> {
-        let rows = self
-            .conn
-            .query(
-                &format!("SELECT {USERS_COLUMNS} FROM users"),
-                turso::params![],
-            )
-            .await?;
-        let mut users = Vec::new();
-        for row in rows {
-            users.push(self.user_record_from_row(&row).await?);
-        }
-        Ok(users)
+        self.list_users_where("", turso::params![]).await
     }
 
     /// Atomically update user preferences (role, workspace, permissions) in a single

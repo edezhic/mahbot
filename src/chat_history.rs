@@ -145,14 +145,16 @@ impl ChatHistoryStore {
         Ok(())
     }
 
-    /// Load the most recent messages for a user + workspace pair,
-    /// returned in chronological order (oldest first).
-    /// Returns `(entries, has_more)` where `has_more` is `true` if older
-    /// entries exist beyond the loaded window.
-    pub async fn load_for_user(
+    /// Shared paging body for [`Self::load_for_user`] and
+    /// [`Self::load_older_for_user`]. `before_id = None` loads the most recent
+    /// page; `Some(id)` loads only messages older than `id`. The
+    /// `(?3 IS NULL OR id < ?3)` predicate keeps the placeholder indexes
+    /// stable across both callers.
+    async fn load_page(
         &self,
         user_name: &str,
         workspace: &str,
+        before_id: Option<i64>,
     ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
         #[allow(clippy::cast_possible_wrap)]
         let query_limit = HISTORY_LIMIT as i64 + 1; // fetch one extra to detect has_more
@@ -162,14 +164,26 @@ impl ChatHistoryStore {
                 &format!(
                     "SELECT {CHAT_HISTORY_COLUMNS} \
                      FROM chat_history \
-                     WHERE user_name = ?1 AND workspace = ?2 \
+                     WHERE user_name = ?1 AND workspace = ?2 AND (?3 IS NULL OR id < ?3) \
                      ORDER BY id DESC \
-                     LIMIT ?3",
+                     LIMIT ?4",
                 ),
-                turso::params![user_name, workspace, query_limit],
+                turso::params![user_name, workspace, before_id, query_limit],
             )
             .await?;
         rows_to_page(rows)
+    }
+
+    /// Load the most recent messages for a user + workspace pair,
+    /// returned in chronological order (oldest first).
+    /// Returns `(entries, has_more)` where `has_more` is `true` if older
+    /// entries exist beyond the loaded window.
+    pub async fn load_for_user(
+        &self,
+        user_name: &str,
+        workspace: &str,
+    ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
+        self.load_page(user_name, workspace, None).await
     }
 
     /// Load messages older than `before_id` for a user + workspace pair.
@@ -182,22 +196,7 @@ impl ChatHistoryStore {
         workspace: &str,
         before_id: i64,
     ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
-        #[allow(clippy::cast_possible_wrap)]
-        let query_limit = HISTORY_LIMIT as i64 + 1; // fetch one extra to detect has_more
-        let rows = self
-            .conn
-            .query(
-                &format!(
-                    "SELECT {CHAT_HISTORY_COLUMNS} \
-                     FROM chat_history \
-                     WHERE user_name = ?1 AND workspace = ?2 AND id < ?3 \
-                     ORDER BY id DESC \
-                     LIMIT ?4",
-                ),
-                turso::params![user_name, workspace, before_id, query_limit],
-            )
-            .await?;
-        rows_to_page(rows)
+        self.load_page(user_name, workspace, Some(before_id)).await
     }
 
     /// Insert a divider marker row into chat history to indicate where a

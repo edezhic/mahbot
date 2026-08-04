@@ -57,7 +57,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::time::sleep;
 
 use crate::turso as turso_mod;
-use crate::wal_guard::{is_orphaned_wal, parse_tshm_header};
+use crate::wal_guard;
 
 /// Row limit per query to prevent unbounded output.
 const ROW_LIMIT: usize = 10_000;
@@ -174,15 +174,13 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
     // Validate SQL is read-only before touching any database
     validate_read_only(sql)?;
 
-    let db_list = resolve_db_list(db_name)?;
+    let db_list = resolve_db_list(db_name, &mahbot_home)?;
 
     let mut failures = 0usize;
-    for (label, db_filename) in &db_list {
+    for (label, file_path) in &db_list {
         if db_name == "all" {
             println!("=== {label} ===");
         }
-
-        let file_path = mahbot_home.join(db_filename);
 
         // Pre-existence check: the read-only open fails on a non-existent
         // file, but we check existence upfront for a better error message.
@@ -198,7 +196,7 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
             bail!("database file not found: {}", file_path.display());
         }
 
-        match query_one_store(&file_path, sql).await {
+        match query_one_store(file_path, sql).await {
             Ok(()) => {}
             Err(e) => {
                 if db_name == "all" {
@@ -243,8 +241,7 @@ async fn query_one_store(file_path: &Path, sql: &str) -> Result<()> {
     // Snapshot copies have no `-tshm`; they are static, so a torn-frame
     // failure cannot be transient there. Only live stores (which the daemon
     // keeps writing to) get the bounded retry that spans write windows.
-    let tshm_path = PathBuf::from(format!("{}-tshm", file_path.display()));
-    let is_live = tshm_path.exists();
+    let is_live = turso_mod::store_sidecars(file_path).tshm.exists();
 
     // Open + query with bounded retry on torn-frame failures. Retrying
     // spans short write windows (e.g. the daemon mid-checkpoint); the
@@ -292,16 +289,11 @@ async fn query_one_store(file_path: &Path, sql: &str) -> Result<()> {
 /// is absent (healthy stores, or affected stores in a quiet window right after
 /// a checkpoint, where `max_frame` reads 0 and a read would actually succeed).
 fn detect_live_artifact(db_path: &Path) -> Option<String> {
-    let tshm_path = PathBuf::from(format!("{}-tshm", db_path.display()));
-    let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
-    let header = parse_tshm_header(&tshm_path);
-    let wal_size = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
-    // Shared with the wal-guard (`wal_guard::is_orphaned_wal`) so the central
-    // business rule cannot drift between the guard and the CLI.
-    if !is_orphaned_wal(header, wal_size) {
-        return None;
+    if wal_guard::inspect_store_at(db_path).orphaned_wal {
+        Some(artifact_error_message(db_path))
+    } else {
+        None
     }
-    Some(artifact_error_message(db_path))
 }
 
 /// Build the explicit artifact error message for a store.
@@ -328,7 +320,7 @@ fn artifact_error_message(db_path: &Path) -> String {
 /// not retried). Never includes the raw engine error: its text is itself a
 /// torn-frame signature.
 fn corruption_error_message(db_path: &Path, retries: usize) -> String {
-    let tshm_path = PathBuf::from(format!("{}-tshm", db_path.display()));
+    let tshm_path = turso_mod::store_sidecars(db_path).tshm;
     if tshm_path.exists() {
         format!(
             "database corruption/inconsistency: cannot read '{}' — the read \
@@ -480,16 +472,19 @@ fn is_torn_frame_error(err: &anyhow::Error) -> bool {
     TORN_FRAME_SIGNATURES.iter().any(|sig| msg.contains(sig))
 }
 
-/// Map a `--db` argument to a list of `(label, filename)` pairs.
-fn resolve_db_list(name: &str) -> Result<Vec<(String, String)>> {
+/// Map a `--db` argument to a list of `(label, absolute db path)` pairs.
+fn resolve_db_list(name: &str, root: &Path) -> Result<Vec<(String, PathBuf)>> {
     let names = turso_mod::store_names();
     if name == "all" {
         Ok(names
             .iter()
-            .map(|n| (n.to_string(), format!("db/{n}.db")))
+            .map(|n| (n.to_string(), turso_mod::store_db_path(root, n)))
             .collect())
     } else if names.contains(&name) {
-        Ok(vec![(name.to_string(), format!("db/{name}.db"))])
+        Ok(vec![(
+            name.to_string(),
+            turso_mod::store_db_path(root, name),
+        )])
     } else {
         let valid = names.join(", ");
         bail!("invalid database name '{name}'. Valid names: {valid}, all");
@@ -555,18 +550,8 @@ fn format_core_value(val: &turso::core::Value) -> String {
             f.to_string()
         }
         turso::core::Value::Text(t) => t.as_str().to_string(),
-        turso::core::Value::Blob(b) => hex_encode(b),
+        turso::core::Value::Blob(b) => crate::util::hex_string(b),
     }
-}
-
-/// Encode a byte slice as a lowercase hex string.
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }
 
 /// Format a truncation sentinel row that matches the column count.

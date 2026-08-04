@@ -663,17 +663,13 @@ impl WorkspaceStore {
 
     /// List all workspaces ordered by name.
     pub async fn list(&self) -> Result<Vec<Workspace>> {
-        let rows = self
-            .conn
-            .query_map(
+        self.conn
+            .query_map_strict(
                 &format!("SELECT {WORKSPACE_COLUMNS} FROM workspaces ORDER BY name"),
                 turso::params![],
                 workspace_from_row,
             )
-            .await?;
-        Ok(rows
-            .into_iter()
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+            .await
     }
 
     /// Lightweight fetch of only name, paused, and maintenance_enabled columns.
@@ -824,21 +820,20 @@ impl WorkspaceStore {
 
     /// Retrieve discovered diagnostics commands for a workspace.
     pub async fn get_diagnostics(&self, name: &str) -> Result<Option<crate::DiagnosticsCommands>> {
-        match self
+        // query_optional + flatten preserves the NULL-vs-missing conflation:
+        // a NULL diagnostics column and a missing row both yield None.
+        let json: Option<String> = self
             .conn
-            .query_row(
+            .query_optional(
                 "SELECT diagnostics FROM workspaces WHERE name = ?1",
                 turso::params![name],
                 |row| row.get::<Option<String>>(0),
             )
-            .await
-        {
-            Ok(Some(json)) => {
-                let cmds: crate::DiagnosticsCommands = serde_json::from_str(&json)?;
-                Ok(Some(cmds))
-            }
-            Ok(None) | Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+            .await?
+            .flatten();
+        match json {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
         }
     }
 
