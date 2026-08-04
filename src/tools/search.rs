@@ -221,9 +221,17 @@ impl SearchTool {
         offset: usize,
         constraints: &[Constraint<'_>],
     ) -> anyhow::Result<String> {
-        let paths = Self::find_file_path_list(entry, query, max_results, offset)?;
+        let (paths, total_matched, total_files) =
+            Self::fuzzy_file_search(entry, query, max_results, offset)?;
         if paths.is_empty() {
-            return Self::format_files_zero_result(entry, query, offset, max_results, constraints);
+            return Ok(Self::format_files_zero_result(
+                query,
+                max_results,
+                offset,
+                constraints,
+                total_matched,
+                total_files,
+            ));
         }
 
         let mut output = paths.join("\n");
@@ -232,13 +240,15 @@ impl SearchTool {
         Ok(output)
     }
 
-    fn format_files_zero_result(
+    /// Run a single fuzzy file search, returning owned relative paths and
+    /// match/file counts. Path mapping happens inside because `SearchResult`
+    /// borrows from the picker behind the lock guard.
+    fn fuzzy_file_search(
         entry: &search_engine::SearchEngineEntry,
         query: &str,
         max_results: usize,
         offset: usize,
-        constraints: &[Constraint<'_>],
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(Vec<String>, usize, usize)> {
         let fff_query = parse_grep_query(query);
         let search_opts = FuzzySearchOptions {
             max_threads: 4,
@@ -258,19 +268,29 @@ impl SearchTool {
         let qt_guard = entry.query_tracker.read().unwrap();
         let qt_ref = qt_guard.as_ref();
         let result = picker.fuzzy_search(&fff_query, qt_ref, search_opts);
+        let paths = result
+            .items
+            .iter()
+            .map(|file| file.relative_path(picker))
+            .collect();
+        Ok((paths, result.total_matched, result.total_files))
+    }
 
+    fn format_files_zero_result(
+        query: &str,
+        max_results: usize,
+        offset: usize,
+        constraints: &[Constraint<'_>],
+        total_matched: usize,
+        total_files: usize,
+    ) -> String {
         let mut diag = format!("No files matching '{query}' found in workspace.\nTotal: 0 files");
-        let pagination_past_end = result.total_matched > 0 && result.total_matched <= offset;
+        let pagination_past_end = total_matched > 0 && total_matched <= offset;
         diag.push_str("\n── diagnostics ──\n");
+        let _ = writeln!(diag, "  total_files: {total_files} (files in index)");
         let _ = writeln!(
             diag,
-            "  total_files: {} (files in index)",
-            result.total_files
-        );
-        let _ = writeln!(
-            diag,
-            "  total_matched: {} (matches before pagination)",
-            result.total_matched
+            "  total_matched: {total_matched} (matches before pagination)"
         );
         let _ = writeln!(diag, "  offset: {offset}  limit: {max_results}");
         if !constraints.is_empty() {
@@ -279,50 +299,16 @@ impl SearchTool {
         if pagination_past_end {
             let _ = writeln!(
                 diag,
-                "  ⚠ offset={offset} exceeds total prefiltered files ({matched}) — no files to search. Try offset=0.",
-                matched = result.total_matched
+                "  ⚠ offset={offset} exceeds total prefiltered files ({total_matched}) — no files to search. Try offset=0."
             );
-        } else if result.total_files == 0 {
+        } else if total_files == 0 {
             diag.push_str("  ⚠ index has 0 files — workspace may not be scanned yet\n");
-        } else if result.total_matched == 0 {
+        } else if total_matched == 0 {
             diag.push_str(
                 "  ℹ 0 files matched before pagination — try broader query or remove constraints\n",
             );
         }
-        Ok(diag)
-    }
-
-    /// Return relative file paths matching a fuzzy/glob query (for read recovery).
-    fn find_file_path_list(
-        entry: &search_engine::SearchEngineEntry,
-        query: &str,
-        max_results: usize,
-        offset: usize,
-    ) -> anyhow::Result<Vec<String>> {
-        let fff_query = parse_grep_query(query);
-        let search_opts = FuzzySearchOptions {
-            max_threads: 4,
-            current_file: None,
-            project_path: None,
-            combo_boost_score_multiplier: 10,
-            min_combo_count: 2,
-            pagination: fff_search::PaginationArgs {
-                offset,
-                limit: max_results,
-            },
-        };
-        let guard = entry.picker.read().unwrap();
-        let Some(picker) = guard.as_ref() else {
-            anyhow::bail!("Search engine not yet initialized.")
-        };
-        let qt_guard = entry.query_tracker.read().unwrap();
-        let qt_ref = qt_guard.as_ref();
-        let result = picker.fuzzy_search(&fff_query, qt_ref, search_opts);
-        Ok(result
-            .items
-            .iter()
-            .map(|file| file.relative_path(picker))
-            .collect())
+        diag
     }
 
     /// Workspace file search helper for other tools (e.g. read path recovery).
@@ -337,7 +323,8 @@ impl SearchTool {
         let entry = Self::resolve_engine(ws)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
-        Self::find_file_path_list(&entry, query, max_results, 0)
+        let (paths, _, _) = Self::fuzzy_file_search(&entry, query, max_results, 0)?;
+        Ok(paths)
     }
 
     fn search_greps(
@@ -1358,5 +1345,38 @@ mod tests {
         for c in &cases {
             assert_resolve(&c.input, c.expected, c.name);
         }
+    }
+
+    // ── format_files_zero_result ───────────────────────────────────────
+
+    /// Lock the zero-result diagnostics format (byte-identical output).
+    #[test]
+    fn format_files_zero_result_diagnostics() {
+        let constraints = [Constraint::Extension("rs")];
+        let diag = SearchTool::format_files_zero_result("foo", 50, 0, &constraints, 0, 123);
+        assert_eq!(
+            diag,
+            "No files matching 'foo' found in workspace.\n\
+             Total: 0 files\n\
+             ── diagnostics ──\n  \
+             total_files: 123 (files in index)\n  \
+             total_matched: 0 (matches before pagination)\n  \
+             offset: 0  limit: 50\n  \
+             constraints: *.rs\n  \
+             ℹ 0 files matched before pagination — try broader query or remove constraints\n"
+        );
+
+        // Pagination-past-end branch: offset past the pre-pagination matches.
+        let diag = SearchTool::format_files_zero_result("bar", 50, 40, &[], 30, 200);
+        assert_eq!(
+            diag,
+            "No files matching 'bar' found in workspace.\n\
+             Total: 0 files\n\
+             ── diagnostics ──\n  \
+             total_files: 200 (files in index)\n  \
+             total_matched: 30 (matches before pagination)\n  \
+             offset: 40  limit: 50\n  \
+             ⚠ offset=40 exceeds total prefiltered files (30) — no files to search. Try offset=0.\n"
+        );
     }
 }
