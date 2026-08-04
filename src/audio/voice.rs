@@ -2140,7 +2140,7 @@ struct VoicePipelineState {
     /// Per-utterance embeddings extracted via the full-utterance mel pipeline
     /// with dense stride-8 sliding window (used for both Conv1D classifier and
     /// classifier training after mahbot-923).  Streaming buffer was removed
-    /// — both models now train on the same dense embedding distribution.
+    /// — inference and training now share the same dense embedding distribution.
     enrollment_buffer: Vec<EmbeddingSequence>,
     /// Raw audio chunks collected during non-wake-word periods of enrollment
     /// (pre-enrollment ambient noise and inter-utterance silence).  These are
@@ -4287,7 +4287,7 @@ pub(crate) fn finalize_enrollment(
 /// for centroid cosine-similarity analysis.  Returns an empty `Vec` when
 /// `embeddings` is empty.
 #[must_use]
-pub fn mean_pool_embeddings(embeddings: &[Vec<f32>]) -> Vec<f32> {
+pub(crate) fn mean_pool_embeddings(embeddings: &[Vec<f32>]) -> Vec<f32> {
     if embeddings.is_empty() {
         return Vec::new();
     }
@@ -4742,8 +4742,8 @@ impl AdaptiveThresholdState {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// mahbot-1012: per-frame scoring geometry / adaptive-mode / candidate-state
-// instrumentation for the training-vs-streaming same-audio comparison
+// mahbot-1012: per-frame scoring geometry / adaptive-mode instrumentation
+// for the training-vs-streaming same-audio comparison
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Geometry class of a single scored embedding window (mahbot-1012 §1).
@@ -4800,11 +4800,6 @@ impl WindowGeometry {
 /// - [`SegmentEndPass`](WindowSource::SegmentEndPass) — the segment-boundary
 ///   fallback pass.
 /// - [`MainStride`](WindowSource::MainStride) — the main stride-8 loop.
-///   In the enrolled phase this is the PRIMARY expected path when it
-///   confirms a burst-created candidate mid-utterance (the report
-///   reclassifies it to "burst_continuation"); it is a genuine
-///   unexpected-path signal only when the main loop created its own
-///   candidate (no burst-created candidate to continue).
 ///
 /// Not feature-gated: the enum appears in the production
 /// [`score_stride8_window`] signature.  Its per-frame recording in
@@ -4824,14 +4819,9 @@ impl WindowSource {
     /// Stable snake_case label for report output (mahbot-1023).
     ///
     /// The labels follow the acceptance taxonomy (mahbot-1024 re-scope):
-    /// "burst" and "segment_end_pass" are the two dedicated scoring paths.
-    /// "other" (the main stride-8 loop — a core production path) is the
-    /// PRIMARY expected detection path when it confirms a burst-created
-    /// candidate mid-utterance (the enrolled-phase report reclassifies it
-    /// to "burst_continuation" via the instrumentation's
-    /// `candidate_created_path`); it is a genuine unexpected-path signal
-    /// ONLY when the main loop created AND confirmed its own candidate
-    /// (no burst-created candidate to continue).
+    /// "burst" and "segment_end_pass" are the two dedicated scoring paths;
+    /// "other" (the main stride-8 loop) is the primary expected detection
+    /// path.
     #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -4873,7 +4863,7 @@ pub(crate) fn burst_positions_to_score(buffer_len: usize, burst_sweep_done: bool
 /// the same trained start-0-aligned geometry.  Positions at or past the
 /// buffer end are never scored: a position beyond the buffer end must never
 /// be re-scored on later calls (a re-scored ≤17-real-frame window ~0.01
-/// mid-utterance resets the rolling window and expires an active candidate).
+/// mid-utterance resets the rolling window).
 pub(crate) fn start_aligned_positions(buffer_len: usize) -> Vec<usize> {
     (0..BURST_MAX_POSITIONS * BURST_STRIDE)
         .step_by(BURST_STRIDE)
@@ -5343,7 +5333,7 @@ pub(crate) struct PipelineCtx {
     ///   burst time must never be re-scored on later calls);
     /// - the short-buffer padded fallback is suppressed (a re-scored
     ///   ≤17-real-frame window ~0.01 mid-utterance would reset the rolling
-    ///   window and expire an active candidate).
+    ///   window).
     ///
     /// It does NOT gate the segment-end pass (a failed burst must not
     /// suppress the boundary fallback).
@@ -5534,12 +5524,9 @@ impl PipelineCtx {
                 // vad_threshold, last_wake_word_detection cooldown,
                 // auto_start_pending, is_recording, and global enrollment accumulators.
                 self.audio_preprocessor.clear_buffer();
-                // Clear any active candidate (mahbot-895).  A stale candidate
-                // from the previous detection session would carry cross-candidate
-                // cross-utterance contamination across Soft pipeline resets (which occur
-                // during the detection→recording handoff).  The candidate will
-                // be re-created naturally when the rolling sum next crosses the
-                // threshold.
+                // Clear rolling-window detection state so stale scores cannot
+                // carry cross-utterance contamination across Soft pipeline
+                // resets (which occur during the detection→recording handoff).
                 // Reset stride-8 window position so the next utterance starts
                 // from the first mel frame (mahbot-923).
                 self.next_window_start = 0;
@@ -5678,14 +5665,14 @@ impl PipelineCtx {
             // longer utterances (replicating today's accidental flush at
             // starts 0/8/16 with 68/60/52 real frames), full accumulated
             // buffer for shorter ones — at start-aligned positions with
-            // padded geometry.  This pass can CONFIRM exactly like the cold
-            // burst (the ring-4 sample fires at position 24),
-            // fires at position 24), so it is the overrun safety net for the
-            // deferred burst.  (The ticket's original "must confirm before
-            // the misaligned re-score" hazard does not manifest at live
-            // geometry: the trigger lands at B=76 and the B=79 → start-3
-            // re-score scores ~0.99 — mahbot-1023 runs 5–7 — but the pass
-            // stays the safety net if a below-reset re-score ever does clear
+            // padded geometry.  This pass scores exactly like the cold burst
+            // (the ring-4 sample fires at position 24), so it is the overrun
+            // safety net for the deferred burst.  (The ticket's original
+            // "must not re-score the misaligned leading edge" hazard does
+            // not manifest at live geometry: the trigger lands at B=76 and
+            // the B=79 → start-3 re-score scores ~0.99 — mahbot-1023 runs
+            // 5–7 — but the pass stays the safety net if a below-reset
+            // re-score ever does clear
             // the rolling window.)  It is
             // UNCONDITIONAL at the boundary for non-recording segments with
             // content — a failed burst must NOT suppress it (F1's only
@@ -5712,8 +5699,8 @@ impl PipelineCtx {
                 // Score from start-aligned position 0 with padded geometry —
                 // NOT from a stale window start.  The shared
                 // `start_aligned_positions` grid covers the burst-equivalent
-                // positions, so the ring-4 sample at position 24 can
-                // confirm exactly like the cold burst (manager pin 3).  The
+                // positions, so the ring-4 sample at position 24 scores
+                // exactly like the cold burst (manager pin 3).  The
                 // pass gate does NOT consult the `burst_sweep_done` latch (a
                 // failed burst must not suppress the boundary fallback) —
                 // the latch is structurally absent from the position grid
@@ -6047,8 +6034,7 @@ fn schedule_listening_transition(ctx: &mut PipelineCtx) {
 /// negative weights (ambient → owner-negative → unrelated → confusable).
 ///
 /// Extracted from the original training block in `handle_enrollment_sample`
-/// and extended with owner-negative embedding extraction and 4-tier weight
-/// construction (mahbot-913).
+/// and extended with owner-negative embedding extraction (mahbot-913).
 ///
 /// Called by the main loop after Phase 3 (owner-negative collection) completes
 /// or times out.  Returns `true` on success (model trained and persisted),
@@ -7420,7 +7406,7 @@ fn flush_voice_batch(voice_batch: &mut Vec<f32>, mel_frame_buffer: &mut Vec<Vec<
 /// original "a misaligned mid-pass position scores ~0.2651 and resets the
 /// rolling window" hazard was measured NOT to manifest at live geometry —
 /// mahbot-1023 runs 5–7: the B=79 → start-3 continuation scores ~0.99 and
-/// is the enabling mechanism for mid-utterance confirmation; the rolling
+/// is the enabling mechanism for mid-utterance continuation; the rolling
 /// reset stays guarded by the per-segment burst latch and the boundary
 /// pass.)
 ///
@@ -7579,7 +7565,7 @@ fn score_stride8_window(
             ctx.instrumentation.detection_path = Some(source.as_str());
         }
         // First classifier-trigger frame index.  `rolling_sum >= effective_threshold`
-        // mirrors the pre-suppression `detected` computed by process_wake_word_score
+        // mirrors the `detected` computed by process_wake_word_score
         // inside score_single_embedding (the adaptive override is exactly
         // `effective_threshold`), so this is the frame the classifier fired on.
         if ctx.instrumentation.first_trigger_frame_idx.is_none()
@@ -7797,8 +7783,8 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     // with 2–16 real frames (~0.027) and never re-scored it — a single scored
     // window structurally cannot trigger the 3-consecutive-window gate.  The
     // short-buffer padded fallback is superseded: mid-utterance re-scoring of
-    // ≤17-real-frame windows (~0.01) resets the rolling window and would kill
-    // an active candidate.  Short utterances (< 68 frames) are covered by the
+    // ≤17-real-frame windows (~0.01) resets the rolling window and would wipe
+    // a valid detection.  Short utterances (< 68 frames) are covered by the
     // segment-end pass at the boundary.
     if !ctx.is_recording {
         // No-op flush prevention: skip if buffer hasn't advanced by at least
@@ -7820,18 +7806,13 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
             // channel absorbs the one-shot ~44–135 ms stall (measured as
             // `burst_wall_clock_ms` under voice-tests).
             //
-            // Confirmation-slack note (measured, not assumed): the ticket's
-            // design constraint was that the sweep must confirm before gap
+            // Note (measured, not assumed): the sweep must finish before gap
             // recovery re-anchors to a MISALIGNED leading edge whose
             // static-gate score was 0.2651 < NO_MATCH_RESET_THRESHOLD
-            // (rolling-window reset / candidate expiry).  Live measurement
-            // (runs 5–7) shows the B=79 → start-3 re-score scores ~0.99 at
-            // the live geometry — the hazard does not manifest, and that
-            // same re-anchored continuation is what updates the burst-created
-            // candidate to confirmation mid-utterance.  mahbot-1024: this
-            // burst-created-candidate → main-loop-continuation path is the
-            // PRIMARY expected detection mechanism (the enrolled report
-            // reclassifies the raw "other" source to "burst_continuation");
+            // (rolling-window reset).  Live measurement (runs 5–7) shows the
+            // B=79 → start-3 re-score scores ~0.99 at the live geometry —
+            // the hazard does not manifest.  The main stride-8 loop carries
+            // the wake after the sweep (the primary expected mechanism);
             // the segment-end pass remains the overrun safety net if a
             // below-reset re-score ever does clear the rolling window.
             let mut burst_swept_this_call = false;
@@ -7859,7 +7840,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
                 // main loop would re-score the IDENTICAL full-76 window the
                 // burst just scored at position 0 — a wasted embedding and a
                 // double-counted rolling score (the ring-order-only flip that
-                // let some failed bursts confirm via a misattributed 'other'
+                // let some failed bursts fire via a misattributed 'other'
                 // path).  The burst already covered the leading edge, so the
                 // main loop resumes from the position after the swept grid on
                 // later calls.
@@ -7867,7 +7848,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
                 // Latch the per-segment "burst sweep done" state — cleared
                 // only by the segment resets.  Prevents the sweep from
                 // re-running and mid-utterance trailing re-scoring from
-                // killing an active candidate.  Does NOT gate the segment-end
+                // wiping a valid detection.  Does NOT gate the segment-end
                 // pass (a failed burst must not suppress the boundary
                 // fallback).
                 ctx.burst_sweep_done = true;
@@ -7976,7 +7957,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     //      command-start) — the consumed/unconsumed distinction is irrelevant
     //      because ASR tolerates the extra wake-word overlap
     //   2. Reset pipeline state (Soft): clears command_buffer, detection buffers
-    //      (embedding_ring, score_window, candidate, next_window_start, etc.)
+    //      (embedding_ring, score_window, next_window_start, etc.)
     //   3. Re-populate command_buffer with the saved audio
     //   4. Clear stale local copies (voice_batch, mel_frame_buffer) so the
     //      write-back below (lines 7125-7127) restores empty Vecs
@@ -9687,10 +9668,9 @@ mod tests {
         assert_eq!(ctx.last_wake_word_detection, saved_cooldown);
         assert_eq!(ctx.auto_start_pending, saved_auto_start);
         assert_eq!(ctx.is_recording, saved_recording);
-        // Soft resets candidate (mahbot-895) but preserves peak_score
-        // (which is only reset on Full/Cancel alongside the wider acoustic state).
-        // The candidate will be re-created naturally when the rolling sum next
-        // crosses the threshold.
+        // Soft clears rolling-window detection state (mahbot-895) but
+        // preserves peak_score (which is only reset on Full/Cancel alongside
+        // the wider acoustic state).
         assert_eq!(ctx.peak_score, saved_peak_score);
 
         // Global enrollment accumulators preserved.
@@ -9737,7 +9717,7 @@ mod tests {
         // Cancel preserves handler-managed flags (unlike Full).
         assert_eq!(ctx.auto_start_pending, saved_auto_start);
         assert_eq!(ctx.is_recording, saved_recording);
-        // Cancel resets peak_score and candidate.
+        // Cancel resets peak_score.
         assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset on Cancel");
 
         // Global enrollment accumulators cleared (unlike Soft).
@@ -9799,7 +9779,7 @@ mod tests {
 
     // ── handle_segment_boundary tests (mahbot-894) ──────────────────────
     // Tests the extracted segment boundary check logic.  The public-API test
-    // (handle_segment_boundary) is the canonical reset-contract verifier and
+    // (handle_segment_boundary) is the canonical reset-contract reference and
     // supersedes the removed internal reset_detection_segment test.
 
     #[test]
@@ -9961,8 +9941,8 @@ mod tests {
         // burst_rolling_window_reset_protection): once the sweep is done,
         // positions beyond the buffer end at sweep time are NEVER re-scored
         // on later calls (a re-scored ≤17-real-frame window ~0.01
-        // mid-utterance would reset the rolling window and expire an active
-        // candidate).  The latch returns an empty position set for ANY later
+        // mid-utterance would reset the rolling window).  The latch returns
+        // an empty position set for ANY later
         // buffer length.
         for later_b in BURST_TRIGGER_FRAMES..=120 {
             assert!(
@@ -9998,8 +9978,8 @@ mod tests {
     fn segment_end_pass_uses_burst_grid_latch_independently() {
         // mahbot-1023 item 8 + manager pin 3: the boundary pass must cover
         // the burst-equivalent grid (so the ring-4 sample at
-        // position 24 can confirm exactly like the cold burst) AND be
-        // latch-independent — a burst that fired without confirming
+        // position 24 scores exactly like the cold burst) AND be
+        // latch-independent — a burst sweep that ran without detecting
         // (burst_sweep_done == true) must NOT suppress the boundary fallback
         // (F1's only current detection path is the trailing boundary
         // re-score).  Both properties are structural in the shared
@@ -10028,8 +10008,8 @@ mod tests {
                 "pass grid must never exceed {BURST_MAX_POSITIONS} positions"
             );
             if b >= BURST_TRIGGER_FRAMES {
-                // Burst-equivalent grid: the pass can confirm exactly like
-                // the cold burst.
+                // Burst-equivalent grid: the pass scores the same grid the
+                // burst swept.
                 assert_eq!(
                     pass,
                     burst_positions_to_score(b, false),
@@ -10059,14 +10039,14 @@ mod tests {
                 );
             }
         }
-        // Full-grid invariants at the measured confirmable lengths.
+        // Full-grid invariants at the measured detection lengths.
         assert_eq!(
             start_aligned_positions(BURST_TRIGGER_FRAMES),
             vec![0, 8, 16, 24],
             "pass positions at the burst-trigger length"
         );
         // Trailing-68 trimmed state (longer utterances): 68/60/52/44 real
-        // frames at positions 0/8/16/24 — the measured confirmable family.
+        // frames at positions 0/8/16/24 — the measured detection family.
         assert_eq!(
             start_aligned_positions(EMBEDDING_WINDOW_FRAMES.saturating_sub(BURST_STRIDE)),
             vec![0, 8, 16, 24],
@@ -10865,8 +10845,8 @@ mod tests {
     }
 
     // ── Activation trace buffer tests (mahbot-897) ──────────────────────────
-    // These test the pure ActivationTraceBuffer FIFO eviction, iteration,
-    // and candidate ID logic without any pipeline state.
+    // These test the pure ActivationTraceBuffer FIFO eviction and iteration
+    // without any pipeline state.
 
     // ── PersistedModel versioning & compatibility tests (mahbot-898) ──────
 

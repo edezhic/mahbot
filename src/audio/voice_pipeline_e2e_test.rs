@@ -35,9 +35,9 @@
 //!
 //! NOTE: `[profile.bench]` is release-like (opt-level 2, codegen-units 32,
 //! no LTO, incremental off) — the bench is a production-performance proxy, so
-//! release codegen is the faithful target.  Classifier fingerprints
-//! and sanity anchors are report-only measurements: nothing gates on them,
-//! codegen shifts are expected, and there is no re-baseline ceremony.
+//! release codegen is the faithful target.  Sanity anchors are report-only
+//! measurements: nothing gates on them, codegen shifts are expected, and
+//! there is no re-baseline ceremony.
 //!
 //! First run populates the TTS audio cache (~14-17 min); subsequent runs
 //! complete in ~33-40 s (bench body — Phase 13's cooldown probes add ~6.5 s of
@@ -1263,6 +1263,7 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
     // contaminate the test utterance's per-variant metrics (silence/noise
     // negatives would report "classifier triggers" from warm-up speech).
     ctx.instrumentation = super::DetectionInstrumentation::new();
+    ctx.instrumentation.test_start_ring_len = ctx.embedding_ring.len();
     ctx.peak_score = 0.0;
 
     // ── Fresh AGC/NS state for the test utterance (mahbot-1006 A) ─────────
@@ -2373,10 +2374,9 @@ fn build_per_variant_result(
 
 /// Exhaustive per-variant verdict for positive (wake word) test variants.
 ///
-/// Replaces the old 3-way bucket (classifier / adaptive_threshold / verifier)
-/// which collapsed at least four distinct failure modes into a single
-/// "verifier" label and mis-bucketed zero-embedding misses (VAD never fired)
-/// as "classifier".
+/// Replaces the old 3-way bucket which collapsed at least four distinct
+/// failure modes into a single label and mis-bucketed zero-embedding misses
+/// (VAD never fired) as "classifier".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MissVerdict {
     /// Wake word detected on this variant.
@@ -2444,13 +2444,6 @@ fn classify_miss(pv: &PerVariantResult) -> MissVerdict {
     // classifier trigger without detection means the adaptive threshold never
     // came down to meet the rolling sum.
     MissVerdict::AdaptiveThresholdBlocked
-}
-
-/// Normalize a raw detection source ("burst" / "segment_end_pass" / "other")
-/// to the report label.  Without the verifier/candidate machinery the raw
-/// source is the final mechanism — no reclassification is needed.
-fn reclassify_detection_path(detection_source: Option<&str>) -> Option<String> {
-    detection_source.map(str::to_string)
 }
 
 /// Extract the maximum rolling sum from per-frame score triples.
@@ -3115,8 +3108,6 @@ struct EnrolledVariantResult {
     /// Scoring path that produced the detection (raw source: "burst" /
     /// "segment_end_pass" / "other").  None when not detected.
     detection_path: Option<String>,
-    /// Raw detection source kept for report transparency.
-    detection_source: Option<String>,
     /// Detection latency ms (CPU wall-clock of the feed loop; None when not
     /// detected).  NOTE: the feed loop processes faster than real-time, so
     /// this is a processing-cost proxy — the AUDIO position of the detection
@@ -3162,8 +3153,7 @@ fn run_enrolled_cold_variant(label: &str, pcm: &[f32]) -> EnrolledVariantResult 
     EnrolledVariantResult {
         variant: label.to_string(),
         detected: result.detected,
-        detection_path: reclassify_detection_path(pv.detection_path.as_deref()),
-        detection_source: pv.detection_path.clone(),
+        detection_path: pv.detection_path.clone(),
         latency_ms: result.latency_ms,
         per_frame_scores: pv.per_frame_scores.clone(),
         per_frame_window_start: pv.per_frame_window_start.clone(),
@@ -3298,8 +3288,8 @@ fn run_enrolled_speaker_phase(
 
     // ── Near-miss canaries (mahbot-1024 item 5) ────────────────────────────
     // Investigation triggers, NOT hard gates: firing means the run deserves
-    // review, never an automatic pass/fail.  Without a verifier the canary is
-    // the classifier gate: a held-out recall variant that crossed the
+    // review, never an automatic pass/fail.  The canary is the classifier
+    // gate: a held-out recall variant that crossed the
     // classifier gate (max_rolling_sum >= MIN_CLASSIFIER_THRESHOLD) but was
     // NOT detected end-to-end.
     let mut canaries_fired: Vec<&'static str> = Vec::new();
@@ -3324,7 +3314,6 @@ fn run_enrolled_speaker_phase(
                 "variant": v.variant,
                 "detected": v.detected,
                 "detection_path": v.detection_path,
-                "detection_source": v.detection_source,
                 "latency_ms": v.latency_ms,
                 "classifier_window_scores": v.per_frame_scores,
                 "per_frame_window_start": v.per_frame_window_start,
@@ -3454,7 +3443,7 @@ fn run_enrolled_speaker_phase(
             "segment_end_pass": pass_path,
             "other": other_path,
             "primary_mechanism": primary_mechanism,
-            "note": "Raw detection sources (no candidate/verifier reclassification): \
+            "note": "Raw detection sources (no reclassification): \
                      burst = deferred burst sweep fired; other = main-loop stride-8 \
                      window fired; segment_end_pass = boundary fallback pass fired.  \
                      Acceptance requires mean TP >= 4/5 across >= 3 fresh runs via the \
@@ -6552,7 +6541,7 @@ pub(crate) fn run_internal() {
     // ── FAPH section (mahbot-1057, env-gated additive key) ───────────────
     // Only present when MAHBOT_FAPH=1 (ran or documented-skipped).  Standard
     // runs leave `faph_report` as None → the report surface is byte-identical
-    // to the pre-change baseline (fingerprint / key-set contract).
+    // to the pre-change baseline (key-set contract).
     let mut json = json;
     // Phase 0 additive default-run keys (added post-macro — the main json!
     // block is already at serde_json's recursion limit).

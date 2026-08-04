@@ -303,8 +303,7 @@ pub struct ConfigData {
     /// optimal English pronunciation, or to your language's code for better
     /// results in that language.
     pub tts_language: Option<String>,
-    /// JSON-serialized wake word classifier weights + verifier for voice assistant.
-    /// Stored as a JSON object with `classifier` and `verifier` fields.
+    /// JSON-serialized wake word classifier weights for the voice assistant.
     pub wake_word_templates: Option<String>,
     /// Enable noise suppression for voice input (default: `"true"`).
     /// Uses the WebRTC-based `sonora-ns` denoiser before mel extraction.
@@ -1658,7 +1657,7 @@ mod tests {
         let reload = ConfigReload::const_new();
 
         // Simulate: templates were enrolled (persist_model_state updated CONFIG).
-        let template_json = r#"{"classifier":null,"verifier":{"is_trained":false,"threshold":0.0,"conv_weight":[],"conv_bias":[],"fc_weight":[],"fc_bias":[]}}"#;
+        let template_json = r#"{"classifier":null}"#;
         let mut enrolled = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(enrolled.set_string_field("wake_word_templates", template_json));
         reload.swap(enrolled);
