@@ -44,7 +44,7 @@ use crate::tools::shell::{ShellMode, ShellTool};
 use crate::turso::TxGuard;
 use crate::util::panic_message;
 
-use crate::{DiagnosticsCommands, Role, Workspace};
+use crate::{Agent, DiagnosticsCommands, Role, Workspace};
 
 /// Number of parallel agents spawned per verification phase (Analyst, Reviewer, QA).
 const PARALLEL_AGENT_COUNT: usize = 3;
@@ -239,23 +239,6 @@ enum NotifyPolicy {
     Buffer,
 }
 
-/// Notification side-effect after a successful ticket transition. Parameters
-/// follow the `(source, target)` convention; `source` feeds the transition log
-/// and the buffer entry.
-async fn dispatch_notification(
-    ticket: &Ticket,
-    source: TicketPhase,
-    target: TicketPhase,
-    notify: NotifyPolicy,
-) {
-    match notify {
-        NotifyPolicy::Notify => notify_ticket(ticket, source, target).await,
-        NotifyPolicy::Buffer => {
-            ticket_buffer::push(&ticket.workspace_name, &ticket.id, source, target);
-        }
-    }
-}
-
 /// The transition context for [`comment_and_transition`] and [`with_comment_and_transition`].
 ///
 /// Encapsulates the ticket, source/target phases, notify policy, and log label
@@ -336,7 +319,17 @@ where
         return false;
     }
 
-    dispatch_notification(ctx.ticket, ctx.source, ctx.target, ctx.notify).await;
+    match ctx.notify {
+        NotifyPolicy::Notify => notify_ticket(ctx.ticket, ctx.source, ctx.target).await,
+        NotifyPolicy::Buffer => {
+            ticket_buffer::push(
+                &ctx.ticket.workspace_name,
+                &ctx.ticket.id,
+                ctx.source,
+                ctx.target,
+            );
+        }
+    }
     true
 }
 
@@ -1045,6 +1038,35 @@ async fn run_claim_pipeline(ws: &Workspace) {
     }
 }
 
+/// Run a single pre-registered agent and unregister it from the message router
+/// when done. Registration stays in the caller (before prompt evaluation /
+/// assignment) so mid-work comment delivery is unaffected.
+async fn run_single_agent(
+    agent_id: String,
+    role: Role,
+    ws: &Workspace,
+    ticket: &Ticket,
+    message: &str,
+    incoming_rx: tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>,
+) -> (Agent, Option<String>) {
+    // run_agent consumes the ID — unregister uses a clone.
+    let agent_id_for_unregister = agent_id.clone();
+    let result = run_agent(
+        agent_id,
+        role,
+        ws,
+        Some(ticket),
+        message,
+        String::new(),
+        String::new(),
+        Some(incoming_rx),
+    )
+    .await;
+
+    message_router::unregister_agent(&agent_id_for_unregister);
+    result
+}
+
 /// Run an Engineer agent to implement the ticket.
 ///
 /// Gathers feedback comments from all roles since the last engineer run and
@@ -1086,21 +1108,15 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         );
     }
 
-    let agent_id_for_unregister = agent_id.clone();
-    let (_agent, response) = run_agent(
+    let (_agent, response) = run_single_agent(
         agent_id,
         Role::Engineer,
         &ws,
-        Some(&ticket),
+        &ticket,
         &message,
-        String::new(),
-        String::new(),
-        Some(incoming_rx),
+        incoming_rx,
     )
     .await;
-
-    // Unregister from the message router — agent is done.
-    message_router::unregister_agent(&agent_id_for_unregister);
 
     // Post-run check still needed for race conditions during agent execution.
     if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InDevelopment).await {
@@ -1602,21 +1618,15 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         ],
     );
 
-    let agent_id_for_unregister = agent_id.clone();
-    let (agent, response) = run_agent(
+    let (agent, response) = run_single_agent(
         agent_id,
         Role::Sanitation,
         &ws,
-        Some(&ticket),
+        &ticket,
         &prompt,
-        String::new(),
-        String::new(),
-        Some(incoming_rx),
+        incoming_rx,
     )
     .await;
-
-    // Unregister from the message router — agent is done.
-    message_router::unregister_agent(&agent_id_for_unregister);
 
     // Post-run phase check — bail if ticket was moved externally.
     if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InSanitation).await {
