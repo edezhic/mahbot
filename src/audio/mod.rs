@@ -1,5 +1,5 @@
 //! Audio/voice subsystem — wake word detection, voice command pipeline,
-//! local transcription (Qwen3-ASR), text-to-speech, and speaker verification.
+//! local transcription (Qwen3-ASR), and text-to-speech.
 //!
 //! All audio-related modules are consolidated here under `crate::audio::*`.
 

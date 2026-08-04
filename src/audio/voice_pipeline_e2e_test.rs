@@ -40,13 +40,16 @@
 //! there is no re-baseline ceremony.
 //!
 //! First run populates the TTS audio cache (~14-17 min); subsequent runs
-//! complete in ~33-40 s (bench body — Phase 13's cooldown probes add ~6.5 s of
+//! complete in ~30-40 s (bench body — Phase 13's cooldown probes add ~6.5 s of
 //! excluded-from-timing sleeps: 2.5 s suppression + 3.5 s recovery probes both
 //! measured from Detection 1's timestamp (overlapping, max ≈ 3.5 s); the
 //! Phase-1 held-out recall set + cross-speaker probe matrix land warm runs at
 //! ~36 s) plus the build time; the exact figure is auditable from the
 //! top-level `total_wall_time_ms` key (whole run, report-assembly window
-//! included).
+//! included).  The first run after a recipe change is a cold
+//! embedding cache (versioned keys all miss) — the budget is verified on that
+//! cold run, and the one-time TTS synthesis for new owner-negative phrases is
+//! paid outside the warm budget.
 //! The bench-leanness cleanup removed the report-only same-audio (8b),
 //! B-sweep (8c), volume-sweep, mid-utterance, cooldown boundary-probe, B2
 //! synthetic-fallback probe, train/test-alignment cosine diagnostics, and the
@@ -231,11 +234,11 @@ fn read_deployed_wake_phrase() -> Option<String> {
 
 /// Number of enrollment variants to generate (mahbot-932 Fix 5).
 ///
-/// Production generates ~45-50 positive training sequences from 10 utterances
-/// × 5 PCM variants (minus SpeedUp skip for short utterances).  We target
-/// ~10 TTS enrollment variants to match this.  Since the re-scope all 10 clips
-/// come from ONE TTS voice (the enrolled speaker) with guided-prompt DSP
-/// conditioning.
+/// Production generates ~110-120 positive training sequences from 10
+/// utterances × the full 12-cell recipe (minus SpeedUp skip for
+/// short utterances).  We target ~10 TTS enrollment variants to match this.
+/// Since the re-scope all 10 clips come from ONE TTS voice (the enrolled
+/// speaker) with guided-prompt DSP conditioning.
 const NUM_ENROLLMENT_VARIANTS: usize = 10;
 
 /// Owner-negative (non-wake-word) phrases for classifier training
@@ -256,6 +259,12 @@ const OWNER_NEGATIVE_PHRASES: &[&str] = &[
     "where are my keys",
     "the meeting starts soon",
     "let me check the weather",
+    // Disjoint non-wake phrases, collision-free seeds.
+    "remind me to call the dentist",
+    "what should we have for dinner",
+    "the wifi keeps disconnecting",
+    "i need to buy new shoes",
+    "turn down the music please",
 ];
 
 /// Single-voice allocation for the bench.
@@ -358,10 +367,14 @@ impl GuidedPromptGroup {
 ///
 /// Report-only target: the enrolled-speaker held-out recall (unseen
 /// renderings of the enrolled voice) is compared against this in the report
-/// banner; the 0.2 granularity reflects the 24-clip held-out recall set
-/// (16 wake-only + 8 embedded) where each miss costs roughly 4 percentage
-/// points.
+/// banner; the 0.2 granularity reflects the 16-clip wake-only held-out recall
+/// set, where each miss costs roughly 6 percentage points.
 const MIN_DETECTION_RATE: f64 = 0.60;
+
+/// Acceptance-basis prefix for the current report series.
+/// `cross_run_summary` filters archives by this so v2 wake-only runs never mix
+/// with v1 24-clip archives in the ≥3-run spread.
+const ACCEPTANCE_BASIS_PREFIX: &str = "held_out_recall_v2";
 
 // Per-category false accept limits are now dynamic by tier — see
 // [`tier_limits`] and [`BenchTier`] (mahbot-871).
@@ -707,29 +720,15 @@ fn generate_enrollment_variants_cached(
     variants
 }
 
-/// Sentence templates with the wake phrase embedded mid-utterance
-/// (coarticulation / mid-utterance detection).  `{wake}` is
-/// replaced by the resolved wake phrase at runtime; the templates are fixed so
-/// the TTS rendering is deterministic.
-const EMBEDDED_WAKE_TEMPLATES: &[&str] = &[
-    "please {wake} set a timer for me",
-    "can you {wake} turn off the lights",
-    "when I say {wake} you should wake up",
-    "okay {wake} stop right there",
-    "everyone say {wake} together now",
-    "I said {wake} and nothing happened",
-    "now {wake} please",
-    "listen carefully {wake} is the command",
-];
-
 /// Wake-only held-out recall clip count (seeds 3000..3000+N).
 const HELD_OUT_WAKE_ONLY_CLIPS: usize = 16;
 
 /// Generate the held-out recall set: unseen renderings of the ENROLLED voice
 /// at collision-free seeds (3000+ — avoids 100-109 enrollment, 800+ detection
-/// variants, 947 warmup, 1000+ owner/confusable training, 2000+ unrelated
-/// training).  Wake phrase alone plus embedded in sentences.  Generated
-/// strictly after training and never added to any training pool.
+/// variants, 947 warmup, 9000+ owner training, 2000+ unrelated training).
+/// Generated strictly after training and never added to any training pool.
+/// Wake phrase alone only — embedded-in-sentence detection is not a product
+/// requirement and is not measured.
 fn generate_held_out_recall_clips_cached(
     enrolled_style: &str,
     model_hash: &str,
@@ -747,20 +746,6 @@ fn generate_held_out_recall_clips_cached(
             cache_dir,
         ) {
             clips.push((pcm, format!("{enrolled_style}_heldout_wake_s{seed}")));
-        }
-    }
-    for (i, template) in EMBEDDED_WAKE_TEMPLATES.iter().enumerate() {
-        let seed = 3000 + HELD_OUT_WAKE_ONLY_CLIPS as u64 + i as u64;
-        let text = template.replace("{wake}", wake_word());
-        if let Some(pcm) = synthesize_wake_word_variant_cached(
-            &text,
-            enrolled_style,
-            seed,
-            TARGET_SAMPLE_RATE,
-            model_hash,
-            cache_dir,
-        ) {
-            clips.push((pcm, format!("{enrolled_style}_heldout_embedded_s{seed}")));
         }
     }
     clips
@@ -1326,24 +1311,34 @@ fn ensure_voice_models_loaded() -> Result<(), String> {
 
 /// Apply PCM transforms to enrollment variants (mahbot-932 Fix 5).
 ///
-/// For each raw TTS enrollment variant, produces up to 5 sequences:
-/// original, speed-down (0.95×), speed-up (1.05×, conditional on ≥500ms),
-/// volume-down (-3dB), and pink noise (25dB SNR).  Matches the production
-/// pipeline in [`prewarm_phrase_embeddings`](super::prewarm_phrase_embeddings)
-/// via the shared [`super::augment_pcm_variants`] helper (mahbot-1045 A1).
+/// For each raw TTS enrollment variant, produces the full 12-cell recipe:
+/// original, speed-down (0.95×/0.90×), speed-up (1.05×, conditional on
+/// ≥500ms), volume-down (-3dB), pink noise (25dB SNR), and white/pink/brown
+/// noise at 10/5 dB SNR.  Matches the production pipeline in
+/// [`prewarm_phrase_embeddings`](super::prewarm_phrase_embeddings) via the
+/// shared [`super::augment_pcm_variants`] helper (mahbot-1045 A1).
 fn pcm_augment_enrollment_variants(variants: &[(Vec<f32>, String)]) -> Vec<(Vec<f32>, String)> {
     let mut all = Vec::new();
     for (i, (pcm, label)) in variants.iter().enumerate() {
         // Noise seed = loop index, gate input = raw TTS PCM, canonical push
-        // order (speed-up 3rd) — preserved verbatim from the pre-dedup code.
-        for variant in super::augment_pcm_variants(pcm, TARGET_SAMPLE_RATE, i as u64) {
+        // order — preserved verbatim from the pre-dedup code.
+        for variant in
+            super::augment_pcm_variants(pcm, TARGET_SAMPLE_RATE, i as u64, super::AugmentSet::Full)
+        {
             let suffix = match variant.variant_index {
                 0 => "original",
                 1 => "speed_down",
                 2 => "speed_up",
                 3 => "vol_down",
                 4 => "noise",
-                _ => unreachable!("augment_pcm_variants yields only indices 0..=4"),
+                5 => "speed_down_090",
+                6 => "noise_white_10db",
+                7 => "noise_pink_10db",
+                8 => "noise_brown_10db",
+                9 => "noise_white_5db",
+                10 => "noise_pink_5db",
+                11 => "noise_brown_5db",
+                _ => unreachable!("augment_pcm_variants yields only indices 0..=11"),
             };
             all.push((variant.pcm, format!("{label}_{suffix}")));
         }
@@ -1352,17 +1347,10 @@ fn pcm_augment_enrollment_variants(variants: &[(Vec<f32>, String)]) -> Vec<(Vec<
 }
 
 /// Locate the enrolled-speaker training clip (label `{style}_enroll0` — the
-/// voice derived from [`allocate_voices`]) and build its five raw-level PCM
-/// augmentation variants (original / speed-down / speed-up / vol-down /
-/// noise) — the canonical construction used by the enrolled-speaker phase
-/// (mahbot-1023 Phase 8d) and the Phase 13 cooldown re-point (mahbot-1052).
-/// `None` when the enrolled clip is absent from `train_clips`.
-///
-/// NOTE (mahbot-1052 reviewer_3): the same find+augment chain appears inline
-/// in `run_enrolled_speaker_phase`.  That site additionally uses
-/// the RAW `enrolled_pcm` (for the streaming-layout mel) and iterates ALL
-/// five variants, so it cannot consume this helper's `_original` selection
-/// directly.  New construction sites should use this helper.
+/// voice derived from [`allocate_voices`]) and build its full 12-cell
+/// augmentation variants — the canonical construction used by the Phase 13
+/// cooldown re-point (mahbot-1052).  `None` when the enrolled clip is absent
+/// from `train_clips`.
 fn enrolled_clip_variants(
     train_clips: &[(Vec<f32>, String)],
     enrolled_label: &str,
@@ -1436,15 +1424,13 @@ fn enrollment_quality_probe(enrollment_variants: &[(Vec<f32>, String)]) -> serde
 ///    VAD-positive hops produce mel frames and windows anchor at speech onset.
 /// 3. Dense stride-8 embeddings from the streaming-layout mel frames.
 ///
-/// Divergence from production's `prewarm_phrase_embeddings`: this emits only
-/// **variant 0** — production additionally derives 4 augmented PCM variants
-/// (speed-down, speed-up, volume-down, noise) from the speech-only audio and
-/// embeds each.  The benchmark deliberately omits them: owner negatives stand
-/// in for real Phase 3 mic captures (raw, not TTS-augmented), so the single
-/// VAD-gated original keeps the surrogate representative without inventing
-/// augmented data production never collects.  The shared variant-0 path is
-/// structurally identical (same preprocessor, same `vad_gate_streaming_mel`
-/// wrapper over `process_streaming_frames_inner`, same embeddings helper).
+/// Divergence from production's `prewarm_phrase_embeddings`: production
+/// prewarm embeds the bounded 2-cell negative recipe (original + pink 25 dB);
+/// the bench emits the VAD-gated original here plus one bounded low-SNR cell
+/// (brown-10) — the owner/ambient negative stand-in for real Phase 3 mic
+/// captures.  The shared variant-0 path is structurally identical (same
+/// preprocessor, same `vad_gate_streaming_mel` wrapper over
+/// `process_streaming_frames_inner`, same embeddings helper).
 ///
 /// The config comes from CONFIG (mahbot-1006 L) — identical to
 /// `PreprocessorConfig::default()` under default settings, differs only when
@@ -1460,10 +1446,10 @@ fn generate_owner_negative_sequences(
 
     for (i, &phrase) in OWNER_NEGATIVE_PHRASES.iter().enumerate() {
         for seed in 0..3 {
-            // Enrolled voice only; seed formula unchanged
-            // (1000-1014, collision-free vs enrollment 100-109 and the
-            // held-out 3000+ ranges).
-            let seed_val = 1000 + i as u64 * 3 + seed as u64;
+            // Fresh collision-free range (9000+) — the old 1000-1014 range
+            // overlapped the confusable base (1000+); 7000/7100 are taken by
+            // the cross-speaker probe matrix's noise seed bases.
+            let seed_val = 9000 + i as u64 * 3 + seed as u64;
             if let Some(pcm) = super::synthesize_with_pcm_cache(
                 phrase,
                 enrolled_style,
@@ -1483,10 +1469,9 @@ fn generate_owner_negative_sequences(
                 // windows anchor at speech onset (matches the streaming path,
                 // mahbot-1009).
                 let mut detector = Detector::default();
-                let (mel_frames, _speech_audio) =
-                    super::vad_gate_streaming_mel(&agc_audio, |hop| {
-                        super::is_speech_with_detector(hop, &mut detector, super::VAD_THRESHOLD)
-                    });
+                let (mel_frames, speech_audio) = super::vad_gate_streaming_mel(&agc_audio, |hop| {
+                    super::is_speech_with_detector(hop, &mut detector, super::VAD_THRESHOLD)
+                });
                 if mel_frames.is_empty() {
                     // Same guard as production prewarm_phrase_embeddings: no
                     // VAD-positive speech ⇒ no mel frames ⇒ skip the clip
@@ -1516,6 +1501,35 @@ fn generate_owner_negative_sequences(
                         ));
                     }
                     _ => warn!("Owner-negative '{phrase}' seed {seed}: no embeddings"),
+                }
+                // Bounded low-SNR augmentation: brown noise at
+                // 10 dB on the VAD-gated speech — the enrolled voice under
+                // noise must not trigger.  Single cell, cheap.
+                if !speech_audio.is_empty() {
+                    let noisy = crate::util::add_noise_color(
+                        &speech_audio,
+                        10.0,
+                        crate::util::NoiseColor::Brown,
+                        seed_val,
+                    );
+                    match super::extract_embeddings_from_audio(
+                        super::ONNX_MODELS
+                            .get()
+                            .expect("ONNX models must be loaded by the benchmark"),
+                        &noisy,
+                    ) {
+                        Ok(embs) if !embs.is_empty() => {
+                            sequences.push(EmbeddingSequence::new(
+                                UtteranceId {
+                                    sequence_index: i * 3 + seed,
+                                    variant_index: 8,
+                                },
+                                Source::Owner,
+                                embs,
+                            ));
+                        }
+                        _ => warn!("Owner-negative '{phrase}' seed {seed}: no brown-10 embeddings"),
+                    }
                 }
             }
         }
@@ -1709,7 +1723,12 @@ fn generate_restricted_phrase_negatives(
             push_seq(dense_embs, 0);
             // 4. Augment AFTER VAD gating (production ordering); variant 0 was
             // already pushed above.
-            for variant in super::augment_pcm_variants(&speech_audio, TARGET_SAMPLE_RATE, seed) {
+            for variant in super::augment_pcm_variants(
+                &speech_audio,
+                TARGET_SAMPLE_RATE,
+                seed,
+                super::AugmentSet::Negatives,
+            ) {
                 if variant.variant_index == 0 {
                     continue;
                 }
@@ -1932,10 +1951,11 @@ fn enrollment_preprocessor_config() -> crate::audio::audio_preprocessor::Preproc
 ///    (mahbot-886 rationale, kept).
 /// 2. Concatenates the AGC'd **originals** with 2.0 s silence gaps and
 ///    VAD-segments them (only originals, matching `handle_enrollment_audio`).
-/// 3. Derives the 4 augmented variants (speed-down, speed-up conditional,
-///    volume-down, noise) from each **AGC'd** utterance audio — exactly the
-///    `handle_enrollment_sample` variant set (mahbot-878) — then extracts
-///    embeddings from the original and all 4 variants.
+/// 3. Derives the shared 12-cell recipe (original, speed-down 0.95/0.90,
+///    speed-up conditional, volume-down, pink 25 dB, white/pink/brown noise
+///    at 10/5 dB) from each **AGC'd** utterance audio via
+///    [`super::augment_pcm_variants`] — the same variant set as production's
+///    `handle_enrollment_sample` — then extracts embeddings from every variant.
 ///
 /// Returns dense-only EmbeddingSequences (stride-8) for classifier
 /// training.  The old streaming path was removed in mahbot-923.
@@ -1994,20 +2014,26 @@ fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<Emb
 
     // ── Augment AFTER segmentation, then extract embeddings (mahbot-1006 B) ──
     // Each VAD utterance is treated like production's `handle_enrollment_sample`
-    // input: the 4 augmented PCM variants are derived from the AGC'd utterance
-    // audio, and all 5 variants are embedded.  Every variant is always included
+    // input: the full 12-cell recipe is derived from the AGC'd utterance
+    // audio and every variant is embedded.  Every variant is always included
     // — none can be silently dropped by VAD (which only gated the original).
     let mut dense_sequences: Vec<EmbeddingSequence> = Vec::new();
 
     for (i, utterance) in utterances.iter().enumerate() {
         // Noise seed = utterance index, gate input = VAD-gated utterance
-        // slice, canonical push order (speed-up 3rd) — preserved verbatim
-        // from the pre-dedup code via the shared helper (mahbot-1045 A1).
-        let augmented = super::augment_pcm_variants(utterance, TARGET_SAMPLE_RATE, i as u64);
+        // slice, canonical push order — preserved verbatim from the pre-dedup
+        // code via the shared helper (mahbot-1045 A1).
+        let augmented = super::augment_pcm_variants(
+            utterance,
+            TARGET_SAMPLE_RATE,
+            i as u64,
+            super::AugmentSet::Full,
+        );
         let has_speed_up = augmented.iter().any(|v| v.variant_index == 2);
 
         info!(
-            "Utterance {i}: {} samples ({:.2}s) → original + speed_down + {} + vol_down + noise",
+            "Utterance {i}: {} samples ({:.2}s) → original + speed_down + {} + vol_down + noise + \
+             speed_down_090 + color-noise cells",
             utterance.len(),
             utterance.len() as f64 / f64::from(super::SAMPLE_RATE),
             if has_speed_up {
@@ -2047,8 +2073,8 @@ fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<Emb
         for variant in augmented {
             let source = match variant.variant_index {
                 0 => Source::Enrollment,
-                1..=4 => Source::Augmentation,
-                _ => unreachable!("augment_pcm_variants yields only indices 0..=4"),
+                1..=11 => Source::Augmentation,
+                _ => unreachable!("augment_pcm_variants yields only indices 0..=11"),
             };
             push_variant(
                 variant.variant_index,
@@ -2060,7 +2086,7 @@ fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<Emb
     }
 
     info!(
-        "VAD-gated enrollment (mahbot-1006 B): {} dense embeddings from {} sequences ({} utterances × ~5 variants)",
+        "VAD-gated enrollment (mahbot-1006 B): {} dense embeddings from {} sequences ({} utterances × full recipe)",
         dense_sequences
             .iter()
             .map(|s| s.embeddings.len())
@@ -2697,18 +2723,29 @@ fn deciles(scores: &[f32]) -> Option<[f32; 10]> {
 }
 
 /// Identify the PCM augmentation type from a variant label (mahbot-1005 §6).
-/// Labels are produced by [`pcm_augment_enrollment_variants`] with one of five
-/// suffixes: `_original`, `_speed_down`, `_speed_up`, `_vol_down`, `_noise`.
+/// Labels are produced by [`pcm_augment_enrollment_variants`]; each label ends
+/// with exactly one suffix (specific cells like `_noise_white_10db` are listed
+/// before the generic `_noise` fallback).
 fn augmentation_type(label: &str) -> &'static str {
-    if label.ends_with("_speed_down") {
-        "speed_down"
-    } else if label.ends_with("_speed_up") {
-        "speed_up"
-    } else if label.ends_with("_vol_down") {
-        "vol_down"
-    } else if label.ends_with("_noise") {
-        "noise"
-    } else if label.ends_with("_original") {
+    const SUFFIXES: [(&str, &str); 11] = [
+        ("_speed_down_090", "speed_down_090"),
+        ("_noise_white_10db", "noise_white_10db"),
+        ("_noise_pink_10db", "noise_pink_10db"),
+        ("_noise_brown_10db", "noise_brown_10db"),
+        ("_noise_white_5db", "noise_white_5db"),
+        ("_noise_pink_5db", "noise_pink_5db"),
+        ("_noise_brown_5db", "noise_brown_5db"),
+        ("_speed_down", "speed_down"),
+        ("_speed_up", "speed_up"),
+        ("_vol_down", "vol_down"),
+        ("_noise", "noise"),
+    ];
+    for (suffix, aug) in SUFFIXES {
+        if label.ends_with(suffix) {
+            return aug;
+        }
+    }
+    if label.ends_with("_original") {
         "original"
     } else {
         "other"
@@ -3174,47 +3211,24 @@ fn run_enrolled_cold_variant(label: &str, pcm: &[f32]) -> EnrolledVariantResult 
 
 /// Enrolled-speaker phase (mahbot-1023 Phase 8d, re-scoped).
 ///
-/// The acceptance basis is the HELD-OUT recall set: unseen renderings of the
-/// enrolled voice (new seeds in a collision-free range; wake phrase alone and
-/// embedded in sentences), measured through the real streaming cold pass
-/// (deferred burst + segment-end pass + adaptive bootstrap).  Generated
-/// strictly after training and never added to any training pool.  The F1
-/// training-clip 5-augmentation control is kept as a report-only diagnostic
-/// sub-section (it powers f1_original_detected).
-///
-/// `enrolled_label` is the enrolled clip's label (`{style}_enroll0`, derived
-/// from [`allocate_voices`]) — the control clip lookup flows from the voice
-/// allocation so a non-F1 enrolled voice never silently no-ops this phase.
+/// The acceptance basis is the HELD-OUT wake-only recall set: unseen
+/// renderings of the enrolled voice (new seeds in a collision-free range,
+/// wake phrase alone — embedded-in-sentence detection is not a product
+/// requirement and is not measured), measured through the real streaming cold
+/// pass (deferred burst + segment-end pass + adaptive bootstrap).  Generated
+/// strictly after training and never added to any training pool.  All 10
+/// enrollment clips are training data, so the in-sample F1 control is
+/// removed; detection control is entirely this held-out recall set.
 #[expect(clippy::too_many_lines)]
 fn run_enrolled_speaker_phase(
-    train_clips: &[(Vec<f32>, String)],
     held_out_clips: &[(Vec<f32>, String)],
     classifier: &WakeWordClassifier,
-    enrolled_label: &str,
 ) -> Option<serde_json::Value> {
     let start = Instant::now();
-    let (enrolled_pcm, _) = train_clips.iter().find(|(_, l)| l == enrolled_label)?;
-    let enrolled_variants =
-        pcm_augment_enrollment_variants(&[(enrolled_pcm.clone(), enrolled_label.to_string())]);
 
     // Set the classifier in global state (the streaming pipeline reads it
     // from voice_state).
     super::set_classifier_weights(classifier.weights_ref().clone());
-
-    // ── F1 training-clip control (5 raw-level augmentations, in-sample) ──
-    let mut variants: Vec<EnrolledVariantResult> = Vec::new();
-    for (variant_pcm, variant_label) in &enrolled_variants {
-        let v = run_enrolled_cold_variant(variant_label, variant_pcm);
-        info!(
-            "  F1 control variant {}: {} — {} (source: {}, latency: {:?}ms)",
-            variants.len() + 1,
-            variant_label,
-            if v.detected { "DETECTED" } else { "miss" },
-            v.detection_path.as_deref().unwrap_or("n/a"),
-            v.latency_ms,
-        );
-        variants.push(v);
-    }
 
     // ── Held-out recall pass (cold, per clip) — the acceptance basis ─────
     let mut recall_variants: Vec<EnrolledVariantResult> = Vec::new();
@@ -3232,19 +3246,11 @@ fn run_enrolled_speaker_phase(
     }
 
     // ── Aggregate acceptance metrics ────────────────────────────────────────
-    // re-scope: the acceptance basis is the HELD-OUT recall set
-    // (`recall_variants`), not the F1 training-clip control (`variants`).
     let total = recall_variants.len();
     let detected_live = recall_variants.iter().filter(|v| v.detected).count();
     // Wilson 95% confidence interval for the held-out recall proportion
     // (binomial; report-only).
     let recall_ci = wilson_ci(detected_live, total);
-    // F1 no-regression control (acceptance criterion 2): the original
-    // enrolled training clip must be detected in every fresh run.
-    let enrolled_original_detected = variants
-        .iter()
-        .find(|v| v.variant.ends_with("_original"))
-        .is_some_and(|v| v.detected);
     let burst_path = recall_variants
         .iter()
         .filter(|v| v.detection_path.as_deref() == Some("burst"))
@@ -3336,36 +3342,6 @@ fn run_enrolled_speaker_phase(
             })
         })
         .collect();
-    // The F1 training-clip control (5 raw-level augmentations) as a
-    // report-only diagnostic sub-section (re-scope — the
-    // acceptance basis is the held-out recall set above).
-    let enrolled_control_json: Vec<serde_json::Value> = variants
-        .iter()
-        .map(|v| {
-            serde_json::json!({
-                "variant": v.variant,
-                "detected": v.detected,
-                "detection_path": v.detection_path,
-            })
-        })
-        .collect();
-    // Held-out recall breakdown: wake-phrase-alone vs embedded-in-sentence.
-    let recall_wake = recall_variants
-        .iter()
-        .filter(|v| v.variant.contains("_heldout_wake_"))
-        .count();
-    let recall_wake_detected = recall_variants
-        .iter()
-        .filter(|v| v.variant.contains("_heldout_wake_") && v.detected)
-        .count();
-    let recall_embedded = recall_variants
-        .iter()
-        .filter(|v| v.variant.contains("_heldout_embedded_"))
-        .count();
-    let recall_embedded_detected = recall_variants
-        .iter()
-        .filter(|v| v.variant.contains("_heldout_embedded_") && v.detected)
-        .count();
 
     let phase_ms = start.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
@@ -3381,44 +3357,28 @@ fn run_enrolled_speaker_phase(
     }
 
     Some(serde_json::json!({
-        "note": "HELD-OUT RECALL (re-scope) — the acceptance basis moved \
-                 from the F1 training clip's 5 augmentations (in-sample control) to \
+        "note": "HELD-OUT WAKE-ONLY RECALL — the acceptance basis is \
                  unseen renderings of the ENROLLED voice: new seeds in a collision-free \
-                 range, wake phrase alone and embedded in sentences, generated strictly \
-                 after training and never added to any training pool.  Measures \
-                 end-to-end detection through the REAL streaming cold pass: fresh \
-                 PipelineCtx per clip, no warm-up, fresh adaptive bootstrap.  The F1 \
-                 training-clip control (f1_control sub-section) is report-only.",
-        "f1_clip": enrolled_label,
+                 range (3000+), wake phrase alone (embedded-in-sentence detection is not \
+                 a product requirement and is not measured), generated strictly after \
+                 training and never added to any training pool.  All 10 enrollment clips \
+                 are training data, so the in-sample F1 control is removed; detection \
+                 control is entirely this held-out recall set.  Measures end-to-end \
+                 detection through the REAL streaming cold pass: fresh PipelineCtx per \
+                 clip, no warm-up, fresh adaptive bootstrap.",
         "phase_ms": phase_ms,
         "held_out_recall": {
             "n_clips": total,
             "detected": detected_live,
-            "wake_only": {
-                "n": recall_wake,
-                "detected": recall_wake_detected,
-            },
-            "embedded_in_sentence": {
-                "n": recall_embedded,
-                "detected": recall_embedded_detected,
-            },
-            "note": "Embedded-in-sentence clips exercise coarticulation / \
-                     mid-utterance detection (the wake phrase rendered adjacent to \
-                     other words); wake-only clips are isolated renderings.",
-        },
-        "f1_control": {
-            "variants": enrolled_control_json,
-            "note": "F1 training-clip 5-augmentation control (in-sample; the clip is the \
-                     guided-prompt-conditioned enrollment PCM — the '_original' variant is \
-                     NOT raw TTS) — report-only diagnostic powering f1_original_detected; \
-                     NOT the acceptance basis.",
+            "note": "Wake-only clips (isolated renderings) only.",
         },
         "acceptance": {
             "basis": format!(
-                "held_out_recall_v1 — {} unseen enrolled-voice clips ({} wake-only + {} \
-                 embedded), seeds 3000+; the Phase-0 in-sample F1 5-augmentation control \
-                 lives in f1_control and is NOT this basis",
-                total, recall_wake, recall_embedded,
+                "held_out_recall_v2 — {} unseen enrolled-voice wake-only clips, seeds \
+                 3000+; embedded-in-sentence detection removed (not a product \
+                 requirement); the in-sample F1 control is removed (all enrollment clips \
+                 are training data)",
+                total,
             ),
             "total_variants": total,
             "detected_live": detected_live,
@@ -3427,16 +3387,15 @@ fn run_enrolled_speaker_phase(
                 serde_json::json!({"low": lo, "high": hi, "note": "Wilson score interval \
                     for the held-out recall binomial proportion."})
             }),
-            "f1_original_detected": enrolled_original_detected,
             "target": format!(
                 "mean held-out recall >= {:.0}% (MIN_DETECTION_RATE) across >= 3 FRESH runs \
                  of the final staged code — per-run end-to-end detection (detected_live) on \
-                 unseen enrolled-voice renderings (wake-alone + embedded)",
+                 unseen enrolled-voice wake-only renderings",
                 MIN_DETECTION_RATE * 100.0,
             ),
             "note": "detected_live = end-to-end through the real cold pass (the \
-                     acceptance metric).  f1_original_detected = F1 no-regression control \
-                     (criterion 2: must be detected in every fresh run).",
+                     acceptance metric).  Bumped to v2 (16 wake-only clips): never \
+                     compared against v1 24-clip archives.",
         },
         "paths": {
             "burst": burst_path,
@@ -3684,7 +3643,9 @@ fn numeric_distribution(values: &[f64]) -> serde_json::Value {
 /// current run's archive is written after this summary is computed) so the
 /// default-run budget is unaffected — 3 × ~3 MB JSON parses, tens of ms.
 /// Corrupt/unreadable archives are skipped (the count says how many were
-/// usable).
+/// usable).  Archives are additionally filtered by acceptance basis
+/// ([`ACCEPTANCE_BASIS_PREFIX`]) so v2 wake-only runs never mix with v1
+/// 24-clip archives in the ≥3-run spread.
 fn cross_run_summary() -> serde_json::Value {
     let Ok(report_dir) = crate::config::default_config_dir() else {
         return serde_json::json!({"archives_found": 0, "note": "report dir unavailable"});
@@ -3730,6 +3691,15 @@ fn cross_run_summary() -> serde_json::Value {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
         };
+        let basis = v
+            .pointer("/enrolled_speaker/acceptance/basis")
+            .and_then(serde_json::Value::as_str);
+        // Basis filter: only archives from the current acceptance
+        // series enter the ≥3-run spread — v2 wake-only runs never mix with v1
+        // 24-clip archives.
+        if !basis.is_some_and(|b| b.starts_with(ACCEPTANCE_BASIS_PREFIX)) {
+            continue;
+        }
         let frac = v
             .pointer("/enrolled_speaker/acceptance/detected_live_frac")
             .and_then(serde_json::Value::as_f64);
@@ -3742,9 +3712,6 @@ fn cross_run_summary() -> serde_json::Value {
             .and_then(serde_json::Value::as_bool);
         let phrase = v
             .pointer("/reproducibility/wake_phrase/used")
-            .and_then(serde_json::Value::as_str);
-        let basis = v
-            .pointer("/enrolled_speaker/acceptance/basis")
             .and_then(serde_json::Value::as_str);
         if let Some(f) = frac {
             fracs.push(f);
@@ -3784,9 +3751,11 @@ fn cross_run_summary() -> serde_json::Value {
             }),
         },
         "note": "Last 3 pre-existing timestamped archives (bounded so the default-run \
-                 budget holds).  The >=3-run acceptance protocol reads the spread here.  \
-                 Missing keys degrade gracefully: pre-1104 archives were deleted, so this \
-                 covers only 1104+ reports.",
+                 budget holds) filtered to the current acceptance basis \
+                 (ACCEPTANCE_BASIS_PREFIX) — v2 wake-only runs never mix with v1 \
+                 24-clip archives in the >=3-run spread.  The v2 \
+                 series starts fresh: until 3 v2 runs accumulate, the spread is \
+                 partial.",
     })
 }
 
@@ -4588,37 +4557,18 @@ pub(crate) fn run_internal() {
         voice_allocation.enrolled,
     );
 
-    // ── Train/test split at the CLIP level (mahbot-932 Fix 5, mahbot-1006 B/I) ──
-    // The split strategy is unchanged (2/3 : 1/3 by enrollment-list order,
-    // tail = test).  It now happens on the raw enrollment clips BEFORE AGC/VAD/
-    // augmentation because the augmentation itself moved inside the per-clip
-    // processing (production order: AGC → VAD → augment; mahbot-1006 B/I).
-    // Splitting the clips (rather than the 5× augmented list) also removes the
-    // previous leakage where augmented variants of the same raw clip spanned
-    // the train/test boundary.
-    //
-    // - Train clips → vad_segment_and_enroll (AGC → VAD → augment → embeddings).
-    // - Test clips → raw-level PCM augmentation (original + speed/volume/noise
-    //   applied to the raw TTS audio), fed through the streaming detection path
-    //   which applies AGC exactly like production's live mic loop.
-    // Since the re-scope the enrollment is single-voice, so the test split is
-    // the SAME speaker as the train split — the Phase-8 positive detection set
-    // (the former M2-M5 cross-speaker test clips moved to dedicated canary /
-    // held-out probe pools).
-    let n_train_clips = (enrollment_variants.len() * 2 / 3).max(1);
-    let mut all_clips = enrollment_variants;
-    let test_clips = all_clips.split_off(n_train_clips);
-    let train_clips = all_clips;
-
-    // Test-set raw-level PCM augmentation (mahbot-932 Fix 5 semantics kept:
-    // the detection test covers all 5 augmentation types at the raw level).
-    let test_variants = pcm_augment_enrollment_variants(&test_clips);
+    // ── All 10 enrollment clips are training data ────────────────────────
+    // The old 2/3 : 1/3 clip-level split is gone: every raw clip feeds
+    // vad_segment_and_enroll (AGC → VAD → augment → embeddings).  Detection
+    // control re-bases onto the 16 held-out wake-only recall clips (Phase 7d),
+    // generated strictly after training at unseen seeds (3000+).
+    let train_clips = enrollment_variants;
     info!(
-        "PCM augmentation (test clips): {} clips -> {} raw-level test variants (original + \
-         speed-down + speed-up + vol-down + noise per clip)",
-        test_clips.len(),
-        test_variants.len(),
+        "All {} enrollment clips train (no test split) — detection control is the held-out \
+         wake-only recall set",
+        train_clips.len(),
     );
+
     // Trained-in canary clips (M2/M3) — generated here so the in-distribution
     // canary matrix can test the SAME clips.
     let canary_clips = generate_canary_clips_cached(
@@ -4632,14 +4582,8 @@ pub(crate) fn run_internal() {
     );
     phase_times[P_ENROLLMENT_AUDIO] = phase_end_ms!();
 
-    // ── Phase 2: VAD-gated enrollment (train clips) ─────────────────────
+    // ── Phase 2: VAD-gated enrollment (all clips) ────────────────────────
     phase_start!("Phase 2: VAD-gated enrollment");
-
-    info!(
-        "Train/test split (clip level): {} train clips, {} test clips (mahbot-932)",
-        train_clips.len(),
-        test_clips.len()
-    );
 
     let pos_sequences = vad_segment_and_enroll(&train_clips);
     if pos_sequences.is_empty() {
@@ -5019,14 +4963,6 @@ pub(crate) fn run_internal() {
     // The timing will be near-zero, which is expected.
     phase_times[P_STREAMING_SETUP] = phase_end_ms!();
 
-    // Collect held-out positive wake variants for detection testing (mahbot-911).
-    // These are the remaining variants after the PCM-augmented train/test split
-    // (mahbot-932 Fix 5), NOT the variants used for classifier training.
-    // Since the re-scope the enrollment is single-voice, so this is the SAME
-    // speaker's test-split clips (the former M2-M5 cross-speaker clips moved to
-    // dedicated canary/reserved pools).
-    let pos_test_variants = test_variants;
-
     // ── Detection phases (skipped entirely if classifier is degenerate) ─
     //
     // Initialize output vars to empty defaults — filled in below only when
@@ -5059,10 +4995,10 @@ pub(crate) fn run_internal() {
     let mut cooldown_suppressed: Option<bool> = None;
     let mut cooldown_after_recovered: Option<bool> = None;
     // mahbot-1052: additive cooldown.* report keys.  The phase was re-pointed
-    // at the enrolled-speaker F1 original variant (the M2–M5 held-out clips
+    // at the enrolled-speaker original variant (the M2–M5 held-out clips
     // are rejected under single-speaker semantics, so the old precondition
     // could never hold).  All keys stay `None` on the degenerate-classifier
-    // path and on a visible skip (F1 clip missing / first detection failed) —
+    // path and on a visible skip (first detection failed) —
     // the report emits them as `null` with `skip_reason` set, never panics.
     let mut cooldown_source_variant: Option<String> = None;
     let mut cooldown_skip_reason: Option<String> = None;
@@ -5075,7 +5011,7 @@ pub(crate) fn run_internal() {
 
     // mahbot-1023: enrolled-speaker benchmark phase (Phase 7d).  Declared
     // here so the JSON report can emit a note even when the classifier is
-    // degenerate or the F1 clip is unavailable.
+    // degenerate.
     let mut enrolled_report: Option<serde_json::Value> = None;
 
     if !degenerate {
@@ -5111,21 +5047,44 @@ pub(crate) fn run_internal() {
             &cache_dir_path,
         );
         info!(
-            "Held-out sets (generated after training): {} recall clips \
-             (enrolled voice, seeds 3000+, wake-alone + embedded) + {} cross-speaker \
-             probe clips (reserved voices {:?}, seeds 5000+/5100+)",
+            "Held-out sets (generated after training): {} wake-only recall clips \
+             (enrolled voice, seeds 3000+) + {} cross-speaker probe clips (reserved \
+             voices {:?}, seeds 5000+/5100+)",
             held_out_recall_clips.len(),
             cross_speaker_probe_clips.len(),
             voice_allocation.reserved,
         );
 
-        // ── Phase 7: Detection — Positive cases ───────────────────────────
-        phase_start!("Phase 7: Positive (wake word) variants");
-        // Warm pass (existing behavior): consume_warmup + shared pre-warmed
-        // adaptive state.  Measures the optimistic production scenario where
-        // the background audio has already filled the ring.
+        // ── Phase 7: Held-out augmented diagnostics ───────────────────────
+        // The old test-split positive phase is gone (all 10 clips
+        // are training data).  Detection control is the held-out wake-only
+        // recall set (Phase 7d, raw clips — the acceptance basis).  This phase
+        // adds bounded per-augmentation diagnostics over a subset of the
+        // held-out wake-only clips: {speed_down 0.95, speed_down 0.90,
+        // white-10, brown-10} on the first 4 clips (16 variants), warm + cold
+        // passes.  Kept separate from the raw-clip acceptance recall.
+        phase_start!("Phase 7: Held-out augmented diagnostics");
+        let aug_diag_clips: Vec<(Vec<f32>, String)> =
+            held_out_recall_clips.iter().take(4).cloned().collect();
+        let aug_diag_variants: Vec<(Vec<f32>, String)> =
+            pcm_augment_enrollment_variants(&aug_diag_clips)
+                .into_iter()
+                .filter(|(_, l)| {
+                    matches!(
+                        augmentation_type(l),
+                        "speed_down" | "speed_down_090" | "noise_white_10db" | "noise_brown_10db"
+                    )
+                })
+                .collect();
+        info!(
+            "Held-out augmented diagnostics: {} variants from {} held-out wake-only clips \
+             (speed_down / speed_down_090 / white-10 / brown-10)",
+            aug_diag_variants.len(),
+            aug_diag_clips.len(),
+        );
+        // Warm pass (shared adaptive state).
         test_detection_samples(
-            &pos_test_variants,
+            &aug_diag_variants,
             &classifier,
             &mut pos_metrics,
             |m, _| m.detected += 1,
@@ -5133,32 +5092,19 @@ pub(crate) fn run_internal() {
             false, // warm pass
         );
         info!(
-            "Enrolled-speaker test-split detection (warm): {}/{} ({:.1}%) — since \
-              the pos_test_variants are the SAME speaker's held-out \
-             enrollment-split clips (the former M2-M5 cross-speaker clips moved to \
-             canary/reserved pools); HIGH detection is the healthy reading",
+            "Held-out augmented diagnostics (warm): {}/{} ({:.1}%)",
             pos_metrics.detected,
             pos_metrics.total,
             pos_metrics.detection_rate() * 100.0,
         );
 
         // ── Cold-start pass (mahbot-1006 D) ─────────────────────────────
-        // Production has no warm-up: after ≥SEGMENT_TIMEOUT_HOPS of silence the
-        // segment boundary resets the ring.  A short wake word therefore has
-        // only a few scorable embeddings.  The warm pass cannot measure this —
-        // it pre-warms the AGC and the classifier window.
-        //
-        // The cold pass re-runs the positive variants with a fresh PipelineCtx
-        // per variant, no consume_warmup, and a fresh AdaptiveThresholdState
-        // that bootstraps from the first real frames (mahbot-1006 F).  Scoped
-        // to positive variants only: the negative phases measure false accepts
-        // (which the cold start does not materially change) and doubling every
-        // phase would roughly double benchmark runtime for marginal benefit.
-        // NOTE: reuses the outer `cold_metrics` (declared with pos_metrics
-        // above) — a shadowing `let` here would leave the JSON report reading
-        // the empty outer binding (analyst review, mahbot-1006).
+        // Fresh PipelineCtx per variant, no warm-up, fresh adaptive bootstrap
+        // (production's post-silence start).  The raw-clip cold measurement
+        // lives in the enrolled-speaker phase (Phase 7d) — this pass covers
+        // the augmented diagnostics.
         test_detection_samples(
-            &pos_test_variants,
+            &aug_diag_variants,
             &classifier,
             &mut cold_metrics,
             |m, _| m.detected += 1,
@@ -5166,9 +5112,7 @@ pub(crate) fn run_internal() {
             true, // cold start
         );
         info!(
-            "Enrolled-speaker test-split detection (cold): {}/{} ({:.1}%) — same-speaker \
-             held-out enrollment-split clips; HIGH detection is the healthy \
-             reading",
+            "Held-out augmented diagnostics (cold): {}/{} ({:.1}%)",
             cold_metrics.detected,
             cold_metrics.total,
             cold_metrics.detection_rate() * 100.0,
@@ -5176,22 +5120,18 @@ pub(crate) fn run_internal() {
         phase_times[P_POSITIVE_VARIANTS] = phase_end_ms!();
 
         // ── Phase 7d: Enrolled-speaker benchmark (held-out recall) ─────────
-        // End-to-end detection of the HELD-OUT recall set (unseen enrolled-voice
-        // renderings, wake-alone + embedded, generated after training) through
-        // the REAL streaming cold pass (deferred burst + segment-end pass +
-        // adaptive bootstrap).  The F1 training-clip 5-augmentation control is
-        // kept as a report-only diagnostic.  Measurement-only — the report is
-        // not pass/fail gated (mahbot-953), but the acceptance protocol judges
-        // the mean across ≥ 3 runs.
+        // End-to-end detection of the HELD-OUT wake-only recall set (unseen
+        // enrolled-voice renderings, seeds 3000+, generated after training)
+        // through the REAL streaming cold pass (deferred burst + segment-end
+        // pass + adaptive bootstrap).  The acceptance basis:
+        // all 10 enrollment clips train, so detection control is entirely this
+        // held-out recall set.  Measurement-only — the report is not pass/fail
+        // gated (mahbot-953), but the acceptance protocol judges the mean
+        // across ≥ 3 runs.
         eprintln!("─── Phase 7d: enrolled-speaker benchmark (held-out recall) ───");
         info!("─── Phase 7d: enrolled-speaker benchmark (held-out recall) ───");
         let enrolled_start = Instant::now();
-        enrolled_report = run_enrolled_speaker_phase(
-            &train_clips,
-            &held_out_recall_clips,
-            &classifier,
-            &enrolled_label,
-        );
+        enrolled_report = run_enrolled_speaker_phase(&held_out_recall_clips, &classifier);
         let enrolled_ms = enrolled_start.elapsed().as_secs_f64() * 1000.0;
         eprintln!("  Enrolled-speaker phase completed in {enrolled_ms:.0}ms");
         // ── Phase 8: Detection — Confusable phrases ──────────────────────
@@ -5294,16 +5234,11 @@ pub(crate) fn run_internal() {
 
         // ── Phase 12: Cooldown verification ──────────────────────────────
         // mahbot-1052: re-pointed at the ENROLLED-SPEAKER original variant
-        // (Phase 7d's construction: enrolled-voice `_enroll0` lookup +
-        // pcm_augment_enrollment_variants, _original pinned — 85/85 reliable;
-        // speed_down/noise fail ~4–6% historically).  The previous source,
-        // pos_test_variants.first(), is an M2–M5 held-out CROSS-SPEAKER clip —
-        // rejected under single-speaker semantics, so its "first detection
-        // should fire" precondition could never hold and the whole assertion
-        // block silently skipped.  The enrolled-speaker positive measurement
-        // moved to Phase 7d but the cooldown phase was never re-pointed; this
-        // phase restores the cooldown verification the mahbot-770/802/818 bugs
-        // motivated.
+        // (enrolled-voice `_enroll0` lookup + pcm_augment_enrollment_variants,
+        // _original pinned — 85/85 reliable; speed_down/noise fail ~4–6%
+        // historically).  The enrolled clip is training data, so
+        // its `_original` fires reliably — the in-sample precondition the
+        // cooldown semantics need.
         //
         // Cooldown semantics under test (production, unchanged):
         //   - WAKE_WORD_COOLDOWN (3.0 s) gate in handle_wake_word_detection;
@@ -5331,13 +5266,11 @@ pub(crate) fn run_internal() {
         // beyond any plausible thread::sleep drift).  Detection 2 keeps the
         // pre-existing soft `cooldown_suppressed_redetection` report key.
         info!("─── {}. Cooldown verification ───", P_COOLDOWN + 1);
-        // Variant CONSTRUCTION only — mirrors run_enrolled_speaker_phase's
-        // enrolled-voice lookup + augmentation WITHOUT re-running the phase
-        // (mahbot-1052 manager pin).  `_original` is pinned:
+        // Variant CONSTRUCTION only — the enrolled clip's 12-cell augmented
+        // set, WITHOUT re-running the enrolled-speaker phase (mahbot-1052
+        // manager pin).  `_original` is pinned:
         // speed_down/noise fail ~4–6% of runs historically (reviewer_3).
-        // The shared find+augment chain lives in [`enrolled_clip_variants`];
-        // run_enrolled_speaker_phase keeps its inline copy (it needs the raw
-        // enrolled PCM and ALL five variants — see the helper's NOTE).
+        // The shared find+augment chain lives in [`enrolled_clip_variants`].
         let enrolled_cooldown_variant: Option<(Vec<f32>, String)> =
             enrolled_clip_variants(&train_clips, &enrolled_label)
                 .and_then(|variants| variants.into_iter().find(|(_, l)| l.ends_with("_original")));
@@ -5666,12 +5599,11 @@ pub(crate) fn run_internal() {
     );
 
     // Enrolled-speaker detection counts — the single-speaker POSITIVE class
-    // (re-scope: Phase-8 pos_test_variants are now the SAME
-    // speaker's enrollment-split clips, and the acceptance basis is the
-    // held-out recall set in enrolled_speaker.acceptance).  Shared by the
-    // report banner, the threshold-status block, and the catastrophic
-    // regression guard.  Falls back to Phase-8 counts when the enrolled phase
-    // did not run (degenerate classifier / F1 clip unavailable).
+    // (the acceptance basis is the held-out wake-only recall set in
+    // enrolled_speaker.acceptance).  Shared by the report banner,
+    // the threshold-status block, and the catastrophic regression guard.
+    // Falls back to the Phase-7 positive-variant counts when the enrolled
+    // phase did not run (degenerate classifier).
     let (enrolled_detected, enrolled_total): (usize, usize) =
         if let Some(acc) = enrolled_report.as_ref().and_then(|r| r.get("acceptance")) {
             let d = acc
@@ -5687,12 +5619,11 @@ pub(crate) fn run_internal() {
             (pos_metrics.detected, pos_metrics.total)
         };
     // Whether the enrolled-speaker phase (Phase 7d) actually ran.  When it did
-    // not (degenerate classifier / F1 clip unavailable), enrolled_detected/
-    // enrolled_total fall back to Phase-7 counts (the same-speaker
-    // enrollment-split clips under the re-scope).  The MIN_DETECTION_RATE
-    // suggestion and the ratchet guard are skipped in that case so a
-    // degenerate run cannot print a ratchet-to-zero 0.0 suggestion (mahbot-1008
-    // ratchet guard).
+    // not (degenerate classifier), enrolled_detected/
+    // enrolled_total fall back to the Phase-7 positive variants.  The
+    // MIN_DETECTION_RATE suggestion and the ratchet guard are skipped in that
+    // case so a degenerate run cannot print a ratchet-to-zero 0.0 suggestion
+    // (mahbot-1008 ratchet guard).
     let enrolled_phase_ran = enrolled_report
         .as_ref()
         .and_then(|r| r.get("acceptance"))
@@ -5942,9 +5873,8 @@ pub(crate) fn run_internal() {
     };
 
     // ── Per-augmentation detection rates (§6) ──
-    // Discloses whether the tail-of-list 2/3-1/3 split (by list order) biases
-    // specific augmentation types.  Labels carry `_original/_speed_down/...`
-    // suffixes from pcm_augment_enrollment_variants.
+    // Labels carry `_original/_speed_down/...` suffixes from
+    // pcm_augment_enrollment_variants.
     let mut aug_counts: std::collections::BTreeMap<&'static str, (usize, usize)> =
         std::collections::BTreeMap::new();
     for pv in &pos_metrics.per_variant {
@@ -6038,7 +5968,7 @@ pub(crate) fn run_internal() {
 
     // B5: embedding cache hit↔miss equivalence (mahbot-1045, bounded probe).
     // A full-cache miss recompute is NOT attempted (ONNX for ~200 utterances ×
-    // 5 variants would run minutes — near the 30-min harness budget — and the
+    // 2 variants would run minutes — near the 30-min harness budget — and the
     // prewarm's OnceLock fast-path makes a second in-process prewarm a no-op).
     // Instead the probe locks the write→read cache-format equivalence on ONE
     // representative utterance: the miss path writes exactly these bytes and
@@ -6151,31 +6081,28 @@ pub(crate) fn run_internal() {
         "enrollment_quality": enrollment_quality_probe_value,
         "vad_feed_cross_check": vad_feed_cross_check_probe_value,
         "train_test_split": {
+            "note": format!(
+                "No split: all {} enrollment clips are training \
+                 data; detection control is the held-out wake-only recall set \
+                 (enrolled_speaker.acceptance)",
+                train_clips.len(),
+            ),
             "n_train_clips": train_clips.len(),
-            "n_test_clips": test_clips.len(),
             "n_train": pos_sequences.len(),
-            "n_test": pos_test_variants.len(),
-            "split": "2/3 : 1/3 by enrollment-clip list order (tail = test); \
-                      clips are split BEFORE AGC/VAD/augmentation (mahbot-1006 B/I), \
-                      so no augmented variant of a training clip leaks into the test set; \
-                      per-augmentation rates are structurally biased toward \
-                      later list positions and are disclosed, not corrected",
             "train_clips": train_clips.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>(),
-            "test_clips": test_clips.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>(),
-            "test_variants": pos_test_variants.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>(),
         },
     });
 
     // ── JSON sub-objects (built separately to stay under serde_json's json!
     // macro recursion limit — the main report object nests several levels) ──
 
-    // Detection summary: warm (pos_metrics) + cold-start (cold_metrics, mahbot-1006 D).
-    // The Phase-8 "positive" variants are now the SAME speaker's
-    // held-out enrollment-split clips (the 1/3 test split of the single-voice
-    // enrollment — the former M2-M5 cross-speaker clips moved to dedicated
-    // canary/reserved pools).  A healthy pipeline's warm/cold detection rate
-    // here is HIGH.  The held-out recall acceptance basis (unseen seeds,
-    // wake-alone + embedded) is reported in enrolled_speaker.acceptance.
+    // Detection summary: warm (pos_metrics) + cold-start (cold_metrics,
+    // mahbot-1006 D) over the held-out augmented diagnostics (Phase 7 —
+    // bounded {speed_down, speed_down_090, white-10, brown-10} variants of a
+    // held-out wake-only subset).  A healthy pipeline's warm/cold
+    // detection rate here is HIGH.  The raw-clip held-out recall acceptance
+    // basis (unseen seeds, wake-only) is reported in
+    // enrolled_speaker.acceptance.
     let detection_json = serde_json::json!({
         "rate": if pos_metrics.total > 0 {
             serde_json::Value::from(pos_metrics.detection_rate())
@@ -6185,14 +6112,15 @@ pub(crate) fn run_internal() {
         "detected": pos_metrics.detected,
         "total_positive": pos_metrics.total,
         "no_tests_ran": pos_metrics.total == 0,
-        "note": "Since the re-scope these are the ENROLLED speaker's held-out \
-                 enrollment-split clips (same voice, the 1/3 test split of the \
-                 single-voice enrollment) — HIGH detection is the healthy reading.  \
-                 The trained-in cross-speaker canaries live in \
+        "note": "Held-out augmented diagnostics: bounded \
+                 per-augmentation variants (speed_down / speed_down_090 / \
+                 white-10 / brown-10) over a subset of the held-out wake-only \
+                 clips — HIGH detection is the healthy reading.  The trained-in \
+                 cross-speaker canaries live in \
                  noise_overlap.in_distribution_canaries (M2/M3) and the honest \
                  held-out probes in noise_overlap.held_out_probes (M4/M5).  The \
-                 held-out recall acceptance basis (unseen seeds, wake-alone + \
-                 embedded) is reported in enrolled_speaker.acceptance.",
+                 raw-clip held-out recall acceptance basis (unseen seeds, \
+                 wake-only) is reported in enrolled_speaker.acceptance.",
         "miss_verdicts": verdict_counts,
         "total_misses": pos_metrics.total - pos_metrics.detected,
         // mahbot-1006 D: cold-start pass — fresh PipelineCtx per variant,
@@ -6344,9 +6272,9 @@ pub(crate) fn run_internal() {
     // The safety gate measures the false-positive impact of the deferred
     // in-distribution windows (burst + boundary double-scoring) on the
     // negative/confusable set; baseline 9/59 gate crossings / 0 FAs.
-    let enrolled_json = enrolled_report.unwrap_or_else(|| {
-        serde_json::json!({"note": "Enrolled-speaker phase skipped (degenerate classifier or F1 clip unavailable)"})
-    });
+    let enrolled_json = enrolled_report.unwrap_or_else(
+        || serde_json::json!({"note": "Enrolled-speaker phase skipped (degenerate classifier)"}),
+    );
     let safety_gate_json = safety_gate(&all_neg_pv);
 
     // Total wall time — the whole run (start → report emission), report-
@@ -6389,16 +6317,29 @@ pub(crate) fn run_internal() {
              enrolled speaker is ONE TTS voice with guided-prompt DSP \
              conditioning instead of 10 rotated voices — all detection/FA \
              numbers re-baseline, expected); the enrolled-speaker acceptance \
-             basis is a HELD-OUT recall set (unseen enrolled-voice renderings, \
-             wake-alone + embedded, Wilson CI reported); the M4/M5 reserved \
-             voices are absent from every training path and probed at unseen \
-             seeds as diagnostics; the confusable/unrelated negative pools \
-             are built bench-locally over the negative-pool styles \
+             basis is a HELD-OUT WAKE-ONLY recall set (16 unseen \
+              enrolled-voice renderings, seeds 3000+, Wilson CI reported — \
+              embedded-in-sentence detection removed); the M4/M5 \
+             reserved voices are absent from every training path and probed at \
+             unseen seeds as diagnostics; the confusable/unrelated negative \
+             pools are built bench-locally over the negative-pool styles \
              (production's all-voice prewarm would train the reserved voices \
-             in); the benchmark-local embedding cache keys match production's, \
-             so warm-run cost is unchanged.  First run after the change pays \
-             one-time TTS synthesis for the new held-out/probe/canary clips \
-             (outside the warm budget)."
+             in); the benchmark-local embedding cache keys match production's \
+              (plus the recipe version), so warm-run cost is \
+             unchanged after the one-time cold-embedding recompute.  First run \
+             after the change pays one-time TTS synthesis for the new \
+             held-out/probe/canary clips (outside the warm budget).  The \
+             negative training pools (production prewarm + bench \
+             confusable/unrelated) use the bounded 2-cell recipe (original + \
+             pink 25 dB) instead of the old 5-cell set — a deliberate budget \
+             tradeoff: the 12-cell positive recipe's cold embedding recompute \
+             over the full 5-cell negatives measured ~68 s (archive \
+             20260804-155415) and ~84 s with the final owner pool (A/B run) — \
+             both over the 39 s bound — so the speed/volume negative cells \
+             were dropped.  The \
+             low-SNR negative cell (brown-10) lives on the owner/ambient \
+             path.  The deterministic easy-tier confusable FA (if present) is \
+             measured under this bounded negative recipe."
         ),
         "total_false_accepts": total_false_accepts,
         // additive: single-voice enrollment disclosure — voice
@@ -6605,21 +6546,11 @@ pub(crate) fn run_internal() {
     if let Ok(report_dir) = crate::config::default_config_dir() {
         let report_path = report_dir.join("voice_pipeline_e2e_report.json");
         // ── Per-run timestamped archive (mahbot-1023, manager pin 5) ──────
-        // The ≥3-run acceptance protocol computes spread from ACTUAL runs,
-        // which the old single .prior.json scheme cannot support (a 3rd run
-        // would overwrite run 1's archive).  Every run is archived with a
-        // UTC timestamp before the main report path is overwritten, so the
-        // acceptance review has all runs' reports.  The .prior.json copy is
-        // retained for backward compatibility with existing tooling.
-        if report_path.exists() {
-            let prior_path = report_dir.join("voice_pipeline_e2e_report.prior.json");
-            if let Err(e) = std::fs::copy(&report_path, &prior_path) {
-                warn!(
-                    "Could not preserve prior benchmark report to {}: {e}",
-                    prior_path.display()
-                );
-            }
-        }
+        // The ≥3-run acceptance protocol computes spread from ACTUAL runs.
+        // Every run is archived with a UTC timestamp before the main report
+        // path is overwritten, so the acceptance review has all runs' reports.
+        // No .prior.json copy is written: the old copy
+        // was byte-identical to a timestamped archive and misled comparisons.
         let archive_stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
         let archive_path =
             report_dir.join(format!("voice_pipeline_e2e_report.{archive_stamp}.json"));
@@ -6953,8 +6884,8 @@ mod tests {
 
     #[test]
     fn pcm_augment_enrollment_variants_matches_golden() {
-        // Fixed input + loop-index seed → byte-identical output to the
-        // pre-dedup inline code (golden captured at HEAD 0d1a074).
+        // Fixed input + loop-index seed → byte-identical output (golden
+        // captured at the current recipe).
         let variants = vec![(fixture_pcm(16000), "wake".to_string())];
         let out = pcm_augment_enrollment_variants(&variants);
         let h = hash_labeled_variants(&out);
@@ -6965,20 +6896,20 @@ mod tests {
         let hs = hash_labeled_variants(&short_out);
         println!("GOLDEN P-site: short={hs}");
 
-        assert_eq!(out.len(), 5, "long input → all 5 variants");
-        // captured from pre-dedup HEAD 0d1a074:
+        assert_eq!(out.len(), 12, "long input → all 12 recipe cells");
+        // captured at the current recipe:
         assert_eq!(
-            h, "713c6c657d2b9852ffba67e09919d82171c14002726abb391dff6bbaeb63e85c",
+            h, "c9b0482b4eb9936abfd3cbba38e99ecc74078ad0128754d749b12f29357571a7",
             "long-input golden drifted"
         );
 
-        assert_eq!(short_out.len(), 4, "short input → speed-up skipped");
+        assert_eq!(short_out.len(), 11, "short input → speed-up skipped");
         assert!(
             short_out.iter().all(|(_, l)| !l.ends_with("speed_up")),
             "short input must not contain a speed-up variant"
         );
         assert_eq!(
-            hs, "90e1d139ed23e4ffcd13476a35d91d35b06d2b7e4e5f89eb7d20174c47249494",
+            hs, "ce92008745a2336498eee830fa09054ec46605b0e9ddfa3bdebb05999074b23c",
             "short-input golden drifted"
         );
     }
@@ -7088,10 +7019,10 @@ mod tests {
         // the noise floor, and the morning group's 0.92× resample is longer.
         let mixed: Vec<f32> = (0..sample_rate as usize / 2)
             .map(|i| {
-                (0.5 * (2.0 * core::f32::consts::PI * 220.0 * i as f32 / sample_rate as f32).sin()
+                0.5 * (2.0 * core::f32::consts::PI * 220.0 * i as f32 / sample_rate as f32).sin()
                     + 0.3
                         * (2.0 * core::f32::consts::PI * 4000.0 * i as f32 / sample_rate as f32)
-                            .sin())
+                            .sin()
             })
             .collect();
         for clip_idx in 0..10 {
@@ -7116,14 +7047,14 @@ mod tests {
     #[test]
     fn wilson_ci_sanity() {
         assert!(wilson_ci(0, 0).is_none(), "empty sample → None");
-        let (lo, hi) = wilson_ci(24, 24).expect("full recall");
-        assert!(lo > 0.80 && hi >= 1.0, "24/24 → CI [{lo:.3}, {hi:.3}]");
-        let (lo0, hi0) = wilson_ci(0, 24).expect("zero recall");
-        assert!(lo0 == 0.0 && hi0 < 0.15, "0/24 → CI [{lo0:.3}, {hi0:.3}]");
-        let (lo_half, hi_half) = wilson_ci(12, 24).expect("half recall");
+        let (lo, hi) = wilson_ci(16, 16).expect("full recall");
+        assert!(lo > 0.78 && hi >= 1.0, "16/16 → CI [{lo:.3}, {hi:.3}]");
+        let (lo0, hi0) = wilson_ci(0, 16).expect("zero recall");
+        assert!(lo0 == 0.0 && hi0 < 0.21, "0/16 → CI [{lo0:.3}, {hi0:.3}]");
+        let (lo_half, hi_half) = wilson_ci(8, 16).expect("half recall");
         assert!(
             lo_half < 0.5 && 0.5 < hi_half,
-            "12/24 → CI must straddle 0.5"
+            "8/16 → CI must straddle 0.5"
         );
     }
 

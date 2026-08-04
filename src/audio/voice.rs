@@ -445,19 +445,39 @@ pub(crate) const UNRELATED_SEED_BASE: u64 = 2000;
 
 /// One PCM variant produced by [`augment_pcm_variants`].
 ///
-/// `variant_index` always carries the mahbot-878 index (0 = original,
-/// 1 = speed-down, 2 = speed-up, 3 = volume-down, 4 = pink noise) regardless
-/// of the push order the caller requested.
+/// `variant_index` always carries the recipe index (0 = original,
+/// 1 = speed-down 0.95, 2 = speed-up, 3 = volume-down, 4 = pink noise 25 dB,
+/// 5 = speed-down 0.90, 6-8 = white/pink/brown noise 10 dB,
+/// 9-11 = white/pink/brown noise 5 dB) regardless of the push order the
+/// caller requested.
 #[derive(Debug, Clone)]
 pub(crate) struct AugmentedPcmVariant {
-    /// mahbot-878 variant index (see struct doc).
+    /// Recipe variant index (see struct doc).
     pub variant_index: usize,
     pub pcm: Vec<f32>,
 }
 
-/// Deterministic 5-variant PCM augmentation of one input clip (mahbot-878).
+/// Which variant set [`augment_pcm_variants`] yields for a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AugmentSet {
+    /// Full positive-training recipe: original, speed-down 0.95/0.90,
+    /// speed-up (gated), volume-down, pink 25 dB, white/pink/brown noise at
+    /// 10/5 dB.  Used by enrollment and bench positive paths.
+    Full,
+    /// Bounded negative-pool recipe: original + pink 25 dB.  Deliberate
+    /// product tradeoff: the old speed/volume negative cells are dropped so
+    /// the expanded 12-cell positive recipe's cold embedding recompute fits
+    /// the 39 s bench budget (the full 5-cell negative set measured ~68 s
+    /// cold — bench archive 20260804-155415; ~84 s with the final owner
+    /// pool — both over budget); disclosed in the bench report.  Low-SNR
+    /// negative coverage lives on the owner/ambient path (owner negatives
+    /// get a brown-10 variant).
+    Negatives,
+}
+
+/// Deterministic PCM augmentation of one input clip (mahbot-878).
 ///
-/// Produces up to 5 PCM variants from `input`:
+/// Produces the [`AugmentSet::Full`] variant list from `input`:
 ///
 ///   0: original (unmodified clone of the input)
 ///   1: speed-down 0.95×
@@ -465,100 +485,103 @@ pub(crate) struct AugmentedPcmVariant {
 ///      length minus 2×[`CONTEXT_PADDING_SAMPLES`]) is ≥ 500 ms
 ///   3: volume-down −3 dB
 ///   4: pink noise at 25 dB SNR, seeded by `noise_seed`
+///   5: speed-down 0.90× (the known warm-miss target)
+///   6: white noise at 10 dB SNR
+///   7: pink noise at 10 dB SNR
+///   8: brown noise at 10 dB SNR
+///   9: white noise at 5 dB SNR
+///  10: pink noise at 5 dB SNR
+///  11: brown noise at 5 dB SNR
+///
+/// [`AugmentSet::Negatives`] yields a bounded subset: 0, 4.
 ///
 /// The `input` is the caller's pre-pad gate input (raw TTS PCM, VAD-gated
 /// speech, or a VAD-segmented utterance slice — as each call site passes
 /// today).  `noise_seed` is passed through verbatim (utterance count / TTS
 /// phrase seed / loop index / constant, per site).  All arithmetic is
 /// deterministic — the only RNG is the seeded noise generator inside
-/// [`crate::util::add_noise`].
+/// [`crate::util::add_noise`] / [`crate::util::add_noise_color`].
 ///
 /// # Push order
 ///
-/// Variants are returned in canonical order 0,1,2,3,4 (speed-up 3rd) — the
-/// push order every call site uses.  The returned `variant_index` is
-/// unaffected by the push order.
+/// Variants are returned in index order (speed-up 3rd, gated) — the push
+/// order every call site uses.  The returned `variant_index` is unaffected
+/// by the push order.
 pub(crate) fn augment_pcm_variants(
     input: &[f32],
     sample_rate: u32,
     noise_seed: u64,
+    set: AugmentSet,
 ) -> Vec<AugmentedPcmVariant> {
-    let speed_down = crate::util::speed_perturbation(input, sample_rate, 0.95);
+    use crate::util::NoiseColor;
     let pre_pad_samples = input.len().saturating_sub(2 * CONTEXT_PADDING_SAMPLES);
     let pre_pad_ms = (pre_pad_samples as u64 * 1000) / u64::from(sample_rate);
-    let speed_up = if pre_pad_ms >= 500 {
-        Some(crate::util::speed_perturbation(input, sample_rate, 1.05))
-    } else {
-        None
-    };
-    let volume_down = crate::util::apply_gain(input, -3.0);
-    let noise = crate::util::add_noise(input, 25.0, noise_seed);
-
-    let mut variants = Vec::with_capacity(5);
+    let mut variants = Vec::with_capacity(12);
     variants.push(AugmentedPcmVariant {
         variant_index: 0,
         pcm: input.to_vec(),
     });
-    variants.push(AugmentedPcmVariant {
-        variant_index: 1,
-        pcm: speed_down,
-    });
-    if let Some(sp) = speed_up {
-        variants.push(AugmentedPcmVariant {
-            variant_index: 2,
-            pcm: sp,
-        });
+    match set {
+        AugmentSet::Negatives => {
+            variants.push(AugmentedPcmVariant {
+                variant_index: 4,
+                pcm: crate::util::add_noise(input, 25.0, noise_seed),
+            });
+        }
+        AugmentSet::Full => {
+            variants.push(AugmentedPcmVariant {
+                variant_index: 1,
+                pcm: crate::util::speed_perturbation(input, sample_rate, 0.95),
+            });
+            if pre_pad_ms >= 500 {
+                variants.push(AugmentedPcmVariant {
+                    variant_index: 2,
+                    pcm: crate::util::speed_perturbation(input, sample_rate, 1.05),
+                });
+            }
+            variants.push(AugmentedPcmVariant {
+                variant_index: 3,
+                pcm: crate::util::apply_gain(input, -3.0),
+            });
+            variants.push(AugmentedPcmVariant {
+                variant_index: 4,
+                pcm: crate::util::add_noise(input, 25.0, noise_seed),
+            });
+            variants.push(AugmentedPcmVariant {
+                variant_index: 5,
+                pcm: crate::util::speed_perturbation(input, sample_rate, 0.90),
+            });
+            for (idx, (color, snr)) in [
+                (NoiseColor::White, 10.0),
+                (NoiseColor::Pink, 10.0),
+                (NoiseColor::Brown, 10.0),
+                (NoiseColor::White, 5.0),
+                (NoiseColor::Pink, 5.0),
+                (NoiseColor::Brown, 5.0),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                variants.push(AugmentedPcmVariant {
+                    variant_index: 6 + idx,
+                    pcm: crate::util::add_noise_color(input, snr, color, noise_seed),
+                });
+            }
+        }
     }
-    variants.push(AugmentedPcmVariant {
-        variant_index: 3,
-        pcm: volume_down,
-    });
-    variants.push(AugmentedPcmVariant {
-        variant_index: 4,
-        pcm: noise,
-    });
     variants
 }
 
 #[cfg(test)]
 mod augment_tests {
-    //! mahbot-1045 A1: fixture tests locking the shared 5-variant PCM
-    //! augmentation helper to the semantics of the 4 pre-dedup inline sites
-    //! (`pcm_augment_enrollment_variants`, `vad_segment_and_enroll`,
-    //! `prewarm_phrase_embeddings`, `handle_enrollment_sample`).  Pure
-    //! arithmetic — no models, no I/O.  The former B-sweep training-path
-    //! site was removed in the bench-leanness cleanup (its speed-up-LAST
-    //! ordering coverage is gone with it — report-only).
+    //! Fixture tests locking the shared PCM augmentation helper to the
+    //! recipe contract: the Full set (original, speed-down
+    //! 0.95/0.90, gated speed-up, volume-down, pink 25 dB, white/pink/brown
+    //! noise at 10/5 dB) and the bounded Negatives set (original + pink
+    //! 25 dB).  Pure arithmetic — no models, no I/O.  Golden hashes pin the
+    //! byte-stable report surfaces.
 
     use super::*;
-
-    /// Reference implementation of the pre-dedup inline augmentation,
-    /// transcribed verbatim from the 4 call sites at HEAD 0d1a074 (mahbot-1045
-    /// A1).  All sites shared the identical formula — same speed-up gate
-    /// (`pre_pad_ms >= 500`), same variant order — differing only in
-    /// sample-rate constant (numerically equal), gate input, and noise seed.
-    fn inline_augment(input: &[f32], sample_rate: u32, noise_seed: u64) -> Vec<(usize, Vec<f32>)> {
-        let speed_down = crate::util::speed_perturbation(input, sample_rate, 0.95);
-        let pre_pad_samples = input.len().saturating_sub(2 * CONTEXT_PADDING_SAMPLES);
-        let pre_pad_ms = (pre_pad_samples as u64 * 1000) / u64::from(sample_rate);
-        let speed_up = if pre_pad_ms >= 500 {
-            Some(crate::util::speed_perturbation(input, sample_rate, 1.05))
-        } else {
-            None
-        };
-        let volume_down = crate::util::apply_gain(input, -3.0);
-        let noise = crate::util::add_noise(input, 25.0, noise_seed);
-
-        let mut out = Vec::with_capacity(5);
-        out.push((0, input.to_vec()));
-        out.push((1, speed_down));
-        if let Some(sp) = speed_up {
-            out.push((2, sp));
-        }
-        out.push((3, volume_down));
-        out.push((4, noise));
-        out
-    }
 
     /// Deterministic fixed input PCM (no RNG): 220 Hz + 440 Hz sine ramp that
     /// decays over the clip — exercises the augmentation's time-domain paths.
@@ -587,85 +610,65 @@ mod augment_tests {
         format!("{:x}", hasher.finalize())
     }
 
-    /// Per-site fixture configurations.  `len` is the gate-input length in
-    /// samples (16000 = 1.0 s: pre-pad 800 ms → speed-up present; 4000 =
-    /// 250 ms: pre-pad 50 ms → speed-up skipped).
-    const SITES: [(&str, u64); 4] = [
-        // (site, noise seed source)
-        ("pcm_augment_enrollment_variants", 3), // seed = loop index
-        ("vad_segment_and_enroll", 2),          // seed = utterance index
-        ("prewarm_phrase_embeddings", 7),       // seed = TTS phrase seed
-        ("handle_enrollment_sample", 5),        // seed = enrolled_utterance_count
-    ];
-
-    fn run_site(len: usize, seed: u64) -> Vec<(usize, Vec<f32>)> {
+    fn run_set(len: usize, seed: u64, set: AugmentSet) -> Vec<(usize, Vec<f32>)> {
         let input = fixed_pcm(len);
-        augment_pcm_variants(&input, SAMPLE_RATE, seed)
+        augment_pcm_variants(&input, SAMPLE_RATE, seed, set)
             .into_iter()
             .map(|v| (v.variant_index, v.pcm))
             .collect()
     }
 
     #[test]
-    fn helper_matches_pre_dedup_inline_semantics() {
-        for &(site, seed) in &SITES {
-            for len in [16000usize, 4000usize] {
-                let input = fixed_pcm(len);
-                let expected = inline_augment(&input, SAMPLE_RATE, seed);
-                let actual = run_site(len, seed);
-                assert_eq!(
-                    expected, actual,
-                    "site {site} (len {len}): helper diverged from pre-dedup inline semantics"
-                );
-                // Both paths must be exercised: long input → speed-up present,
-                // short input → speed-up skipped.
-                let has_speed_up = actual.iter().any(|(idx, _)| *idx == 2);
-                assert_eq!(
-                    has_speed_up,
-                    len == 16000,
-                    "site {site} len {len}: gate flipped"
-                );
-            }
-        }
+    fn full_set_shape_and_speed_up_gate() {
+        // Long input → all 12 cells; short input → speed-up (2) skipped.
+        let long = run_set(16000, 5, AugmentSet::Full);
+        assert_eq!(
+            long.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            "Full set must yield the 12-cell recipe in index order"
+        );
+        let short = run_set(4000, 5, AugmentSet::Full);
+        assert_eq!(
+            short.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            "short input must skip speed-up (variant 2)"
+        );
     }
 
-    /// Golden hashes captured from the pre-dedup inline code at HEAD 0d1a074
-    /// (via [`inline_augment`], which was verified against the real
-    /// `pcm_augment_enrollment_variants` output in the voice-tests module).
-    /// Any change to the helper's arithmetic, gate, or push order breaks
-    /// these — protecting the byte-stable report surfaces.
-    const GOLDEN_LONG: [&str; 4] = [
-        // (site, seed) — len 16000
-        "51ea4567dbab1cbf5303beb19e0221264b53d6804f16c7f490451da67be10437", // pcm_augment_enrollment_variants
-        "84e296d09e5061505500cafc5e432456ef33afceda952442913c43d47d8f3682", // vad_segment_and_enroll
-        "e6dfdcf2ceb254ff96ac77693c8e597820bd149185b2b692bf20436ebe338aa8", // prewarm_phrase_embeddings
-        "5387f8afe5fdbd923e884e4e17941560bcc299b3fa1b3f99ee6560edd0467ca8", // handle_enrollment_sample
+    #[test]
+    fn negatives_set_is_bounded() {
+        let set = run_set(16000, 5, AugmentSet::Negatives);
+        assert_eq!(
+            set.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0, 4],
+            "Negatives set must yield original + pink-25 only"
+        );
+    }
+
+    /// Golden hashes captured at the current recipe (seed 5, fixed_pcm).
+    /// Any change to the recipe's arithmetic, cells, gate, or push order
+    /// breaks these — protecting the byte-stable report surfaces.
+    const GOLDEN_LONG: [&str; 2] = [
+        "6ae2faba828c7138bdaf0b4672c0e06ea521c849ca168be44bd64a56b05ba766", // Full
+        "31362caa70d9da6ad5e8264a341603986459f8ca716d0dadd48342d4786161e8", // Negatives
     ];
-    const GOLDEN_SHORT: [&str; 4] = [
-        // len 4000 (speed-up skipped)
-        "4a82e959bf332c0d0166e77aefb983b059a9e0b57ddca8c2882ad9bca566903a", // pcm_augment_enrollment_variants
-        "10f5278d1e25375c0b7531e949b08ebdc0b6dd068f9c948b9e45a47838d77758", // vad_segment_and_enroll
-        "7b6d27fc60589fa2e400d1f8721ed8962ef3acc87223c0726d271aba8464e798", // prewarm_phrase_embeddings
-        "deca375b26a0d02b62caf34deb18d4b7aafe50102ac027c3ffc667258b808da3", // handle_enrollment_sample
+    const GOLDEN_SHORT: [&str; 2] = [
+        "25cfcf720f1524a58c413fa6005c8357643ba5968721094a0be9ef7114daec87", // Full
+        "63889638dea4b8e54acee6fec6cd4e2b90acfea7c2a9f192fc10a93aa909c0d3", // Negatives
     ];
 
     #[test]
     fn helper_hash_stability() {
         // Printed once to capture the goldens (see GOLDEN_LONG/SHORT).
-        let mut collected = Vec::new();
-        for (i, &(site, seed)) in SITES.iter().enumerate() {
-            let long = variant_list_hash(&run_site(16000, seed));
-            let short = variant_list_hash(&run_site(4000, seed));
-            println!("GOLDEN site {i} ({site}): long={long} short={short}");
-            collected.push((long, short));
-        }
-        for (i, (long, short)) in collected.iter().enumerate() {
-            let (site, _) = SITES[i];
-            assert_eq!(*long, GOLDEN_LONG[i], "site {site} long-input hash drifted");
-            assert_eq!(
-                *short, GOLDEN_SHORT[i],
-                "site {site} short-input hash drifted"
-            );
+        for (i, set) in [AugmentSet::Full, AugmentSet::Negatives]
+            .into_iter()
+            .enumerate()
+        {
+            let long = variant_list_hash(&run_set(16000, 5, set));
+            let short = variant_list_hash(&run_set(4000, 5, set));
+            println!("GOLDEN set {i} ({set:?}): long={long} short={short}");
+            assert_eq!(long, GOLDEN_LONG[i], "set {i} long-input golden drifted");
+            assert_eq!(short, GOLDEN_SHORT[i], "set {i} short-input golden drifted");
         }
     }
 }
@@ -1274,9 +1277,16 @@ async fn prewarm_phrase_embeddings(
                 // Variant generation is shared with the E2E bench via
                 // [`augment_pcm_variants`] (mahbot-1045 A1): noise seed = the
                 // TTS phrase seed, gate input = VAD-gated speech, canonical
-                // push order (speed-up 3rd).  Variant 0 (original) is pushed
-                // above from the streaming mel frames.
-                for variant in augment_pcm_variants(&speech_audio, SAMPLE_RATE, seed) {
+                // push order (speed-up 3rd).  The negative pool deliberately
+                // uses the bounded [`AugmentSet::Negatives`] set (original +
+                // pink 25 dB): the old speed/volume cells were dropped to
+                // keep the 12-cell positive recipe's cold embedding recompute
+                // inside the 39 s bench budget (see `AugmentSet::Negatives`).
+                // Variant 0 (original) is pushed above from the streaming mel
+                // frames.
+                for variant in
+                    augment_pcm_variants(&speech_audio, SAMPLE_RATE, seed, AugmentSet::Negatives)
+                {
                     if variant.variant_index == 0 {
                         continue; // original already pushed above
                     }
@@ -2159,10 +2169,10 @@ struct VoicePipelineState {
     /// reads this flag to initiate the Phase 2→3 transition
     /// (`transition_to_phase3`).  Cleared on Cancel (via `reset_enrollment`).
     utterances_collected: bool,
-    /// Number of user utterances enrolled so far (mahbot-878).
+    /// Number of user utterances enrolled so far.
     ///
-    /// Unlike [`enrollment_buffer`] which may contain 5× entries due to PCM
-    /// augmentation (original + 4 variants per utterance), this counter tracks
+    /// Unlike [`enrollment_buffer`] which may contain up to 12× entries due to
+    /// PCM augmentation (12-cell recipe), this counter tracks
     /// only the actual user utterances.  The UI counter and finalization trigger
     /// use this field, not the buffer length.
     ///
@@ -3200,7 +3210,7 @@ pub(crate) fn voice_cache_dir() -> Option<PathBuf> {
 // The per-utterance (phrase × style × seed) dense embeddings produced by
 // `prewarm_phrase_embeddings` are deterministic: fixed TTS seeds, cached
 // PCM, deterministic earshot VAD + ONNX inference.  Yet every cold process
-// recomputes them (~200 utterances × 5 variants of ONNX work, the dominant
+// recomputes them (~200 utterances × 2 variants of ONNX work, the dominant
 // bench Phase 3 cost).  This disk cache stores the per-utterance variant
 // embeddings so warm runs (and warm app starts) skip the ONNX extraction.
 //
@@ -3210,6 +3220,15 @@ pub(crate) fn voice_cache_dir() -> Option<PathBuf> {
 // silently reuse stale embeddings after a voice ONNX model swap.
 
 const EMBEDDING_CACHE_SUBDIR: &str = "embeddings_cache";
+
+/// Recipe identity baked into embedding-cache keys AND file headers.  Bump
+/// whenever the augmentation recipe changes (variant set / cells / noise
+/// semantics) so stale-variant cached embeddings are never silently reused.
+///
+/// Numbering starts at 6: the pre-versioning cache format led with the
+/// variant count (≤ 5 cells), so a header value ≤ 5 could alias an old
+/// format's count and let a stale file survive the version sweep.
+const AUGMENT_RECIPE_VERSION: u32 = 6;
 
 /// Sub-directory of the voice cache used for the embedding cache.
 fn embedding_cache_dir() -> Option<PathBuf> {
@@ -3236,10 +3255,11 @@ fn onnx_models_hash() -> Option<&'static str> {
 /// Deterministic cache key for one prewarm utterance.
 ///
 /// Covers: the existing PCM cache key (phrase + style + seed + sample rate +
-/// TTS model hash), the preprocessor NS/AGC toggles, and SHA-256 of both
-/// ONNX model files.  A key missing the ONNX hashes would silently reuse
-/// stale embeddings after a voice ONNX model swap; a key missing the TTS
-/// model hash would reuse stale embeddings after a TTS model swap.
+/// TTS model hash), the preprocessor NS/AGC toggles, SHA-256 of both
+/// ONNX model files, and [`AUGMENT_RECIPE_VERSION`].  A key missing the ONNX
+/// hashes would silently reuse stale embeddings after a voice ONNX model
+/// swap; a key missing the recipe version would replay old-variant cached
+/// lists after a recipe change.
 fn embedding_cache_key(
     phrase_type: &str,
     phrase: &str,
@@ -3258,13 +3278,24 @@ fn embedding_cache_key(
     hasher.update([u8::from(pre_config.noise_suppression)]);
     hasher.update([u8::from(pre_config.agc)]);
     hasher.update(onnx_hash.as_bytes());
+    hasher.update(AUGMENT_RECIPE_VERSION.to_le_bytes());
     Some(hex_string(&hasher.finalize()))
 }
 
 /// Read a cached per-utterance variant list: `(variant_index, embeddings)`.
+///
+/// The file starts with the recipe version header; a mismatch (old recipe or
+/// pre-version file) deletes the entry and reports a miss.
 fn read_embedding_cache(dir: &Path, key: &str) -> Option<Vec<(u8, Vec<Vec<f32>>)>> {
-    let data = std::fs::read(dir.join(key)).ok()?;
+    let path = dir.join(key);
+    let data = std::fs::read(&path).ok()?;
     let mut cur = 0usize;
+    let version = u32::from_le_bytes(data.get(cur..cur + 4)?.try_into().ok()?);
+    cur += 4;
+    if version != AUGMENT_RECIPE_VERSION {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
     let n_variants = u32::from_le_bytes(data.get(cur..cur + 4)?.try_into().ok()?) as usize;
     cur += 4;
     let mut variants: Vec<(u8, Vec<Vec<f32>>)> = Vec::with_capacity(n_variants);
@@ -3293,8 +3324,12 @@ fn read_embedding_cache(dir: &Path, key: &str) -> Option<Vec<(u8, Vec<Vec<f32>>)
 /// Write a per-utterance variant list to the embedding cache (best-effort).
 #[allow(clippy::cast_possible_truncation)]
 fn write_embedding_cache(dir: &Path, key: &str, variants: &[(u8, Vec<Vec<f32>>)]) {
+    // One-time per-process sweep of THIS directory: version-stale entries +
+    // config-bounded size (tests writing tempdirs never touch the real cache).
+    evict_embedding_cache(dir);
     let _ = std::fs::create_dir_all(dir);
     let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(&AUGMENT_RECIPE_VERSION.to_le_bytes());
     data.extend_from_slice(&(variants.len() as u32).to_le_bytes());
     for (vi, embs) in variants {
         data.push(*vi);
@@ -3312,6 +3347,50 @@ fn write_embedding_cache(dir: &Path, key: &str, variants: &[(u8, Vec<Vec<f32>>)]
     if std::fs::write(&tmp_path, &data).is_ok() {
         let _ = std::fs::rename(&tmp_path, &path);
     }
+}
+
+/// One-shot guard for the per-write [`evict_embedding_cache`] sweep.
+static EMBEDDING_EVICTION_RAN: AtomicBool = AtomicBool::new(false);
+
+/// Bounded sweep of the embeddings cache directory.
+///
+/// Runs once per process on the first cache write, scoped to the directory
+/// being written (so unit tests sweeping tempdirs never touch the real
+/// cache).  Deletes entries whose recipe-version header differs from
+/// [`AUGMENT_RECIPE_VERSION`] (stale recipe — unreachable via the versioned
+/// key, but cleaning them bounds the directory), then applies the same
+/// config-driven age/size limits as the PCM cache.  The bench's first
+/// post-recipe run is cold by definition (all keys miss); this keeps that
+/// one-time recompute from leaving stale garbage.
+fn evict_embedding_cache(dir: &Path) {
+    if EMBEDDING_EVICTION_RAN.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    evict_embedding_cache_dir(dir);
+}
+
+/// Directory-scoped sweep body (also called by tests against tempdirs).
+fn evict_embedding_cache_dir(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return; // directory doesn't exist yet
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+            continue;
+        }
+        // Read only the 4-byte version header.
+        let version = std::fs::File::open(&path).ok().and_then(|mut f| {
+            use std::io::Read;
+            let mut hdr = [0u8; 4];
+            f.read_exact(&mut hdr).ok()?;
+            Some(u32::from_le_bytes(hdr))
+        });
+        if version != Some(AUGMENT_RECIPE_VERSION) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    evict_pcm_cache(dir);
 }
 
 /// Write PCM f32 samples to the disk cache atomically.
@@ -3959,6 +4038,12 @@ fn estimate_snr_energy(samples: &[f32]) -> f32 {
 ///
 /// An utterance "triggers" if the rolling window sum exceeds the detection
 /// threshold at any point.
+///
+/// NOTE: with the 12-cell enrollment recipe the evaluated set is up to ~120
+/// sequences (10 utterances × 12 cells, 5 dB noise cells included) versus
+/// ~50 at the old 5-cell recipe — the ≥80% gate is deliberately stricter
+/// (the bench voice passes 108/120; marginal real enrollments may reject
+/// more often in noisy environments).
 ///
 /// Returns `Ok(())` if the self-test passes, or `Err` with a descriptive
 /// message if too many utterances fail to trigger detection.
@@ -6690,7 +6775,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     // Compute utterance duration before moving `samples` into the closure.
     let duration_ms = (samples.len() as u64 * 1000) / u64::from(SAMPLE_RATE);
 
-    // ── Generate 4 deterministic PCM augmented variants (mahbot-878) ──
+    // ── Generate deterministic PCM augmented variants (mahbot-878) ──
     // The original is kept as-is.  All variants are processed in a single
     // spawn_blocking below, avoiding redundant ONNX model lookups and
     // reducing thread spawn overhead.
@@ -6702,6 +6787,9 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     // duration gate (100 ms of context padding at each end; speed-up is
     // viable only when the unpadded duration is ≥ 500 ms) lives inside the
     // helper — very short utterances would otherwise become unintelligible.
+    // The full positive recipe ([`AugmentSet::Full`]) trains the classifier
+    // on the low-SNR color cells (white/pink/brown at 10/5 dB) so noisy
+    // enrollment is in-distribution at inference.
 
     // Seed for noise from current utterance count (read before incrementing).
     let noise_seed = {
@@ -6710,73 +6798,38 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     };
 
     // Generate variants — all deterministic, no RNG dependency except the
-    // seeded noise generator.  The helper yields the canonical push order
-    // 0,1,2?,3,4 — variant 2 (speed-up) is absent when the pre-pad duration
-    // gate fails, so the remaining length tells us whether the next element
-    // is variant 2 or 3.
+    // seeded noise generator.  The helper yields index order 0,1,2?,3..11 —
+    // variant 2 (speed-up) is absent when the pre-pad duration gate fails.
+    let variants = augment_pcm_variants(&samples, SAMPLE_RATE, noise_seed, AugmentSet::Full);
     let original = samples.clone();
-    let mut augmented = augment_pcm_variants(&samples, SAMPLE_RATE, noise_seed).into_iter();
-    let _original = augmented
-        .next()
-        .expect("augment_pcm_variants always yields variant 0 (original)");
-    let speed_down = augmented
-        .next()
-        .expect("augment_pcm_variants always yields variant 1 (speed-down)")
-        .pcm;
-    // None when pre-pad < 500 ms (skip_speed_up): the iterator then holds
-    // [3, 4] instead of [2, 3, 4], so 3 remaining elements ⇔ variant 2 present.
-    let speed_up = if augmented.len() == 3 {
-        Some(
-            augmented
-                .next()
-                .expect("augment_pcm_variants always yields variant 2 (speed-up)")
-                .pcm,
-        )
-    } else {
-        None
-    };
-    let volume_down = augmented
-        .next()
-        .expect("augment_pcm_variants always yields variant 3 (volume-down)")
-        .pcm;
-    let noise = augmented
-        .next()
-        .expect("augment_pcm_variants always yields variant 4 (noise)")
-        .pcm;
+    let variant_indices: Vec<usize> = variants.iter().map(|v| v.variant_index).collect();
 
     // Clone for quality computation (use the original for quality check).
     let samples_for_quality = original.clone();
 
-    // Run ONNX inference for ALL 5 variants in a SINGLE spawn_blocking
+    // Run ONNX inference for ALL variants in a SINGLE spawn_blocking
     let results = tokio::task::spawn_blocking(move || {
-        // Process the original
-        let orig = process_enrollment_sample(&original);
-
-        // Process speed-down variant
-        let spd_down = process_enrollment_sample(&speed_down);
-
-        // Process speed-up variant (if enabled)
-        let spd_up = speed_up.as_ref().map(|s| process_enrollment_sample(s));
-
-        // Process volume-down variant
-        let vol_down = process_enrollment_sample(&volume_down);
-
-        // Process noise variant
-        let noise = process_enrollment_sample(&noise);
-
-        (orig, spd_down, spd_up, vol_down, noise)
+        variants
+            .into_iter()
+            .map(|v| process_enrollment_sample(&v.pcm))
+            .collect::<Vec<_>>()
     })
     .await
     .unwrap_or_else(|e| {
         let make_err = || Err::<Vec<Vec<f32>>, _>(anyhow!("Blocking task failed: {e}"));
-        (make_err(), make_err(), None, make_err(), make_err())
+        (0..variant_indices.len()).map(|_| make_err()).collect()
     });
 
     // ── Dense embeddings (original — used for min-length check) ──
-    let original_old = match results.0 {
-        Ok(ref e) => e.clone(),
-        Err(ref e) => {
+    // Variant 0 (original) is always the first element.
+    let original_old = match results.first() {
+        Some(Ok(e)) => e.clone(),
+        Some(Err(e)) => {
             warn!("Original enrollment embedding failed: {e}");
+            return;
+        }
+        None => {
+            warn!("No enrollment variants produced");
             return;
         }
     };
@@ -6788,7 +6841,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
         return;
     }
 
-    // ── Push all 5 variants to buffer ──
+    // ── Push all variants to buffer ──
     // Read enrollment index (current count before increment) so each variant
     // gets the correct sequence_index (mahbot-902).
     let enrollment_index = voice_state()
@@ -6799,45 +6852,35 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     // Collect results into a single EmbeddingSequence buffer.  After mahbot-923,
     // the classifier trains on the same dense stride-8 embedding
     // distribution — streaming extraction was removed.
-    let mut old_results: Vec<EmbeddingSequence> = Vec::with_capacity(5);
+    let mut old_results: Vec<EmbeddingSequence> = Vec::with_capacity(results.len());
 
-    // Helper macro: push variant embeddings if extraction succeeded.
-    // After mahbot-923, each variant yields a single EmbeddingSequence (dense).
-    macro_rules! push_variant {
-        ($variant_index:expr, $source:expr, $dense:expr) => {
-            match $dense {
-                Ok(embs) => {
-                    let id = UtteranceId {
-                        sequence_index: enrollment_index,
-                        variant_index: $variant_index,
-                    };
-                    old_results.push(EmbeddingSequence::new(id, $source, embs));
-                }
-                Err(ref e) => {
-                    warn!(
-                        "Variant {} embedding extraction failed: {e} — skipping variant",
-                        $variant_index,
-                    );
-                }
+    // Original (variant 0) — filed under Source::Enrollment; all augmented
+    // variants (1..=11) under Source::Augmentation.
+    for (vi, res) in variant_indices.iter().zip(results) {
+        match res {
+            Ok(embs) => {
+                let id = UtteranceId {
+                    sequence_index: enrollment_index,
+                    variant_index: *vi,
+                };
+                old_results.push(EmbeddingSequence::new(
+                    id,
+                    if *vi == 0 {
+                        Source::Enrollment
+                    } else {
+                        Source::Augmentation
+                    },
+                    embs,
+                ));
             }
-        };
-        ($variant_index:expr, $source:expr, $dense:expr, optional) => {
-            if let Some(dense_res) = $dense {
-                push_variant!($variant_index, $source, dense_res);
+            Err(ref e) => {
+                warn!(
+                    "Variant {} embedding extraction failed: {e} — skipping variant",
+                    *vi,
+                );
             }
-        };
+        }
     }
-
-    // Original (variant 0) — file under Source::Enrollment, no augmentation
-    push_variant!(0, Source::Enrollment, results.0);
-    // Speed-down (variant 1)
-    push_variant!(1, Source::Augmentation, results.1);
-    // Speed-up (variant 2, optional — skipped when utterance <500ms unpadded duration)
-    push_variant!(2, Source::Augmentation, results.2, optional);
-    // Volume-down (variant 3)
-    push_variant!(3, Source::Augmentation, results.3);
-    // Noise (variant 4)
-    push_variant!(4, Source::Augmentation, results.4);
 
     let (utterance_count, count, quality) = {
         let mut state = voice_state().write().unwrap_poison();
@@ -10574,6 +10617,38 @@ mod tests {
     }
 
     #[test]
+    fn embedding_cache_version_mismatch_misses_and_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "test_key_stale";
+        // Version-0 header (≠ AUGMENT_RECIPE_VERSION) — stale recipe file.
+        std::fs::write(dir.path().join(key), &[0u8; 20]).unwrap();
+        assert!(read_embedding_cache(dir.path(), key).is_none());
+        assert!(
+            !dir.path().join(key).exists(),
+            "stale-version cache file must be deleted"
+        );
+    }
+
+    #[test]
+    fn embedding_cache_eviction_sweeps_stale_version_and_keeps_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        // Version-0 header (≠ AUGMENT_RECIPE_VERSION) — stale recipe file.
+        let stale = dir.path().join("stale_key");
+        std::fs::write(&stale, &[0u8; 20]).unwrap();
+        let tmp = dir.path().join("in_progress.tmp");
+        std::fs::write(&tmp, &[0u8; 8]).unwrap();
+        let variants: Vec<(u8, Vec<Vec<f32>>)> = vec![(0, vec![vec![1.0f32; 96]])];
+        write_embedding_cache(dir.path(), "fresh_key", &variants);
+        evict_embedding_cache_dir(dir.path());
+        assert!(
+            dir.path().join("fresh_key").exists(),
+            "fresh-version entry must survive"
+        );
+        assert!(!stale.exists(), "stale-version entry must be evicted");
+        assert!(tmp.exists(), "in-progress .tmp must survive the sweep");
+    }
+
+    #[test]
     fn embedding_cache_key_changes_with_preprocessor_and_pcm_key() {
         // Graceful-skip when the ONNX models are absent (fresh machine).
         if onnx_models_hash().is_none() {
@@ -10660,11 +10735,11 @@ mod tests {
     #[test]
     fn test_enrolled_utterance_count_vs_buffer_size() {
         // Verify that enrolled_utterance_count tracks user utterances while
-        // enrollment_buffer may hold up to 5× entries due to augmentation.
+        // enrollment_buffer may hold up to 12× entries due to augmentation.
         // This models the production flow in handle_enrollment_sample where
-        // each utterance produces 5 embedding entries (original + 4 variants).
+        // each utterance produces up to 12 embedding entries (12-cell recipe).
 
-        // ── Helper: simulate adding one utterance with all 5 variants ──
+        // ── Helper: simulate adding one utterance with all 12 variants ──
         fn simulate_utterance(
             state: &mut VoicePipelineState,
             // Each variant produces some number of per-window embeddings.
@@ -10699,10 +10774,10 @@ mod tests {
             cmd_tx: None,
         };
 
-        // ── Simulate 2 utterances with all 5 variants succeeding ──
-        // Each utterance produces 5 entries (original + 4 augmented).
+        // ── Simulate 2 utterances with all 12 variants succeeding ──
+        // Each utterance produces 12 entries (original + 11 augmented).
         for _ in 0..2 {
-            simulate_utterance(&mut state, &[3, 3, 3, 3, 3]);
+            simulate_utterance(&mut state, &[3; 12]);
         }
 
         assert_eq!(
@@ -10711,21 +10786,21 @@ mod tests {
         );
         assert_eq!(
             state.enrollment_buffer.len(),
-            10,
-            "2 utterances × 5 variants = 10 buffer entries"
+            24,
+            "2 utterances × 12 variants = 24 buffer entries"
         );
 
         // ── Simulate 3 more utterances (total 5) with speed-up skipped ──
-        // Speed-up is skipped when pre-padding < 500ms, so only 4 variants.
+        // Speed-up is skipped when pre-padding < 500ms, so only 11 variants.
         for _ in 0..3 {
-            simulate_utterance(&mut state, &[3, 3, 3, 3]); // 4 variants, no speed-up
+            simulate_utterance(&mut state, &[3; 11]); // 11 variants, no speed-up
         }
 
         assert_eq!(state.enrolled_utterance_count, 5, "5 utterances total");
         assert_eq!(
             state.enrollment_buffer.len(),
-            10 + 3 * 4, // 10 from first 2 + 12 from next 3
-            "buffer entries: 2×5 + 3×4 = 22"
+            24 + 3 * 11, // 24 from first 2 + 33 from next 3
+            "buffer entries: 2×12 + 3×11 = 57"
         );
 
         // ── Verify the invariant: buffer entries >= utterance count ──
@@ -11193,13 +11268,15 @@ mod tests {
     /// Set config fields for the duration of a test, restoring defaults on drop.
     /// Acquires [`EVICTION_TEST_LOCK`] so that parallel tests do not race on the
     /// global CONFIG singleton.
-    struct EvictionConfigGuard(MutexGuard<'static, ()>);
+    struct EvictionConfigGuard {
+        _guard: MutexGuard<'static, ()>,
+    }
     impl EvictionConfigGuard {
         fn set(size_mb: &str, age_days: &str) -> Self {
             let lock = EVICTION_TEST_LOCK.lock().unwrap();
             let _ = crate::config::CONFIG.set_string_field("voice_cache_max_size_mb", size_mb);
             let _ = crate::config::CONFIG.set_string_field("voice_cache_max_age_days", age_days);
-            EvictionConfigGuard(lock)
+            EvictionConfigGuard { _guard: lock }
         }
     }
     impl Drop for EvictionConfigGuard {

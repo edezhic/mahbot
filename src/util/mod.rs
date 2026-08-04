@@ -1015,37 +1015,10 @@ pub(crate) fn generate_pink_noise(len: usize, mut rng: impl rand::Rng) -> Vec<f3
     noise
 }
 
-/// Add pink noise to PCM audio at the given SNR (mahbot-878).
-///
-/// Uses seeded pink noise for reproducible augmentation.  The noise is
-/// scaled to match the desired signal-to-noise ratio in dB.
-#[allow(clippy::cast_precision_loss)]
+/// Pink-noise alias of [`add_noise_color`] — kept for the recipe's variant-4
+/// call sites; the SNR-scaling/clamp arithmetic lives in one place.
 pub(crate) fn add_noise(pcm: &[f32], snr_db: f32, seed: u64) -> Vec<f32> {
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-
-    // Compute signal RMS
-    let signal_rms = compute_rms(pcm).max(1e-10);
-
-    // Generate pink noise
-    let mut noise = generate_pink_noise(pcm.len(), &mut rng);
-
-    // Scale noise to desired SNR: noise_rms = signal_rms * 10^(-snr_db/20)
-    let noise_rms_target = signal_rms * 10.0_f32.powf(-snr_db / 20.0);
-    let noise_rms_current = compute_rms(&noise).max(1e-10);
-    let scale = noise_rms_target / noise_rms_current;
-    for s in &mut noise {
-        *s *= scale;
-    }
-
-    // Mix signal + noise, clamped to prevent numeric overflow from
-    // high-amplitude signal+noise sums (defense-in-depth, matching the
-    // prior tts_data_gen::add_noise behavior).  At typical SNR values
-    // (25dB for enrollment augmentation) clamping is a no-op for normal
-    // speech levels, but provides robustness for edge-case inputs.
-    pcm.iter()
-        .zip(noise.iter())
-        .map(|(&signal, &n)| (signal + n).clamp(-1.0, 1.0))
-        .collect()
+    add_noise_color(pcm, snr_db, NoiseColor::Pink, seed)
 }
 
 /// Apply a fixed gain to PCM audio.
@@ -1064,6 +1037,48 @@ pub(crate) fn apply_gain(pcm: &[f32], gain_db: f32) -> Vec<f32> {
 pub(crate) enum NoiseType {
     /// White noise (uniform spectral density).
     White,
+}
+
+/// Noise colors supported by the shared augmentation recipe (ungated —
+/// production enrollment trains on these cells).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoiseColor {
+    White,
+    Pink,
+    Brown,
+}
+
+/// Add color noise to PCM audio at the given SNR (deterministic, seeded).
+///
+/// Mirrors [`add_noise`]'s arithmetic (unit-RMS noise scaled to the SNR
+/// target, clamped mix) with the color selector.  `Brown` is a leaky
+/// integration of white noise (DC-free-ish, low-frequency dominant).
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn add_noise_color(pcm: &[f32], snr_db: f32, color: NoiseColor, seed: u64) -> Vec<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let signal_rms = compute_rms(pcm).max(1e-10);
+    let noise: Vec<f32> = match color {
+        NoiseColor::White => (0..pcm.len())
+            .map(|_| rng.random::<f32>() * 2.0 - 1.0)
+            .collect(),
+        NoiseColor::Pink => generate_pink_noise(pcm.len(), &mut rng),
+        NoiseColor::Brown => {
+            let mut acc = 0.0f32;
+            (0..pcm.len())
+                .map(|_| {
+                    acc = 0.999 * acc + (rng.random::<f32>() * 2.0 - 1.0);
+                    acc
+                })
+                .collect()
+        }
+    };
+    let noise_rms_target = signal_rms * 10.0_f32.powf(-snr_db / 20.0);
+    let noise_rms_current = compute_rms(&noise).max(1e-10);
+    let scale = noise_rms_target / noise_rms_current;
+    pcm.iter()
+        .zip(noise.iter())
+        .map(|(&s, &n)| (s + n * scale).clamp(-1.0, 1.0))
+        .collect()
 }
 
 /// Compute the RMS (root mean square) of audio samples.
