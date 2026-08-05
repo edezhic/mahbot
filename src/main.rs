@@ -21,7 +21,7 @@ use mahbot::config::CONFIG;
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
 use mahbot::message_router;
 use mahbot::parse_bot_command;
-use mahbot::session::{Session, resolve_agent_id};
+use mahbot::session::clear_session;
 use mahbot::util::UnwrapPoison;
 use mahbot::{BotCommand, Channel, ChannelMessage, Role, Workspace};
 /// JetBrainsMono-Regular.ttf embedded for Iced dashboard default font.
@@ -638,8 +638,7 @@ async fn handle_clear_command(msg: &ChannelMessage) {
         resolve_workspace_for_user(msg),
         mahbot::users::resolve_active_role(&msg.user_name),
     );
-    let agent_id = resolve_agent_id(&msg.channel, &msg.user_name, role.as_str(), &ws.name);
-    let reply = Session::delete(&agent_id).await;
+    let reply = clear_session(&msg.channel, &msg.user_name, role.as_str(), &ws.name).await;
     send_channel_reply(reply, msg, None).await;
 }
 
@@ -749,8 +748,7 @@ async fn handle_action_callback(msg: ChannelMessage) {
                 resolve_workspace_for_user(&msg),
                 mahbot::users::resolve_active_role(&msg.user_name),
             );
-            let agent_id = resolve_agent_id(&msg.channel, &msg.user_name, role.as_str(), &ws.name);
-            let reply = Session::delete(&agent_id).await;
+            let reply = clear_session(&msg.channel, &msg.user_name, role.as_str(), &ws.name).await;
             send_channel_reply(reply, &msg, None).await;
         }
         _ => {

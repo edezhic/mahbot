@@ -652,6 +652,11 @@ pub fn resolve_agent_id(channel: &str, user_name: &str, role: &str, ws_name: &st
     }
 }
 
+/// Clear the session for a channel/user/role/workspace, returning the result message.
+pub async fn clear_session(channel: &str, user_name: &str, role: &str, ws_name: &str) -> String {
+    Session::delete(&resolve_agent_id(channel, user_name, role, ws_name)).await
+}
+
 /// Construct an agent ID for Maintainer agents (workspace-scoped, unique per run).
 ///
 /// Format: `maintainer_{ws_name}_{suffix}`

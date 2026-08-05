@@ -899,8 +899,7 @@ impl HomeState {
                             .flatten()
                             .unwrap_or(Role::Manager.as_str().to_string());
                         // Clear the session.
-                        let agent_id = crate::session::resolve_agent_id("gui", &sender, &role, &ws);
-                        let _ = crate::session::Session::delete(&agent_id).await;
+                        let _ = crate::session::clear_session("gui", &sender, &role, &ws).await;
                         // Insert a divider marker instead of deleting history.
                         let store = crate::chat_history::store();
                         match store.insert_divider(&sender, "gui", &ws).await {
