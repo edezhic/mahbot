@@ -647,16 +647,17 @@ impl WorkspaceStore {
         let canonical = canonicalize_workspace_path(path).map_err(|e| anyhow::anyhow!("{e}"))?;
         let path = ensure_trailing_slash(&canonical);
         let now = turso::now();
+        let analyzing = WorkspaceStatus::Analyzing.to_string();
         self.conn
             .execute(
-                "INSERT INTO workspaces (name, path, created_at, updated_at, paused) VALUES (?1, ?2, ?3, ?4, ?5)",
-                turso::params![name, path.clone(), now.clone(), now.clone(), 1],
+                "INSERT INTO workspaces (name, path, status, created_at, updated_at, paused) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                turso::params![name, path.clone(), analyzing, now.clone(), now.clone(), 1],
             )
             .await?;
         let ws = Workspace {
             name: name.to_string(),
             path: path.clone(),
-            status: WorkspaceStatus::Pending,
+            status: WorkspaceStatus::Analyzing,
             created_at: now.clone(),
             updated_at: now.clone(),
             maintenance_enabled: false,
@@ -667,7 +668,6 @@ impl WorkspaceStore {
             notes: String::new(),
             last_analyzed_commit: None,
         };
-        let _ = self.set_status(name, &WorkspaceStatus::Analyzing).await;
         // New workspace: discovery_generation defaults to 0 in the schema.
         // Generation 0 means "the first discovery" — if rediscover() bumps
         // the generation before this task finishes, the task's context/
