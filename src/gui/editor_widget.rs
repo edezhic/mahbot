@@ -7,6 +7,7 @@ use cosmic_text::Scroll;
 use iced::advanced::graphics::text::cosmic_text;
 use iced::advanced::input_method;
 use iced::mouse::ScrollDelta;
+use iced::widget::text_editor;
 
 use super::highlight::{self, FileHighlights, HighlightLanguage};
 use super::text_rendering::{
@@ -1407,6 +1408,24 @@ impl EditorBuffer {
             fix_line_endings(&mut lines, had_trailing, default_ending);
             (reassemble_lines(&lines), Some((start_line + 1, 0)))
         });
+    }
+}
+
+impl super::common::UndoableText for EditorBuffer {
+    fn text(&self) -> String {
+        EditorBuffer::text(self)
+    }
+
+    fn cursor(&self) -> text_editor::Cursor {
+        let c = EditorBuffer::cursor(self);
+        text_editor::Cursor {
+            position: text_editor::Position {
+                line: c.line,
+                column: c.column,
+            },
+            // Editor's undo stack never stored selections, so drop it.
+            selection: None,
+        }
     }
 }
 

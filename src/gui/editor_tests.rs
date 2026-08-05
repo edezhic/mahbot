@@ -270,63 +270,6 @@ fn test_byte_offset_to_cursor_pos() {
     }
 }
 
-// ── UndoStack ───────────────────────────────────────────────
-
-fn setup_undo_stack(text: &str) -> (EditorBuffer, UndoStack) {
-    (EditorBuffer::with_text(text, None), UndoStack::new())
-}
-
-#[test]
-fn test_undo_stack_snap_and_undo() {
-    let (content, mut stack) = setup_undo_stack("original");
-    stack.snap_before_edit(&content);
-
-    // Simulate edit
-    let modified = EditorBuffer::with_text("modified", None);
-    let snapshot = stack.undo(&modified).unwrap();
-    assert_eq!(snapshot.text, "original");
-}
-
-#[test]
-fn test_undo_stack_redo() {
-    let (content, mut stack) = setup_undo_stack("original");
-    stack.snap_before_edit(&content);
-
-    let modified = EditorBuffer::with_text("modified", None);
-    let _ = stack.undo(&modified);
-
-    let snapshot = stack.redo(&modified).unwrap();
-    assert_eq!(snapshot.text, "modified");
-}
-
-#[test]
-fn test_undo_stack_new_edit_clears_redo() {
-    let (content, mut stack) = setup_undo_stack("v1");
-    stack.snap_before_edit(&content);
-
-    let v2 = EditorBuffer::with_text("v2", None);
-    let _ = stack.undo(&v2);
-
-    // New edit after undo should clear redo.
-    let v3 = EditorBuffer::with_text("v3", None);
-    stack.snap_before_edit(&v3);
-
-    assert!(stack.redo(&v3).is_none());
-}
-
-#[test]
-fn test_undo_stack_cursor_restoration() {
-    let (content, mut stack) = setup_undo_stack("line1\nline2\nline3");
-    // Move cursor to (1, 2) — line 1, column 2 ("ne2")
-    content.move_to(1, 2);
-    stack.snap_before_edit(&content);
-
-    let modified = EditorBuffer::with_text("changed", None);
-    let snapshot = stack.undo(&modified).unwrap();
-    assert_eq!(snapshot.cursor_line, 1);
-    assert_eq!(snapshot.cursor_col, 2);
-}
-
 // ── Tree keyboard navigation focus state tests ──────────────────
 
 /// Helper to create a minimal EditorState with a simple tree.

@@ -240,6 +240,25 @@ impl DebounceState {
 
 // ── Undo/Redo stack ─────────────────────────────────────────────────
 
+/// Content accessor for the shared undo stack. Implemented for
+/// [`text_editor::Content`] (chat composers) and `editor_widget::EditorBuffer`
+/// (the code editor); `cursor` returns a full [`text_editor::Cursor`] so
+/// selection anchors survive undo/redo where the underlying buffer has them.
+pub(crate) trait UndoableText {
+    fn text(&self) -> String;
+    fn cursor(&self) -> text_editor::Cursor;
+}
+
+impl UndoableText for text_editor::Content {
+    fn text(&self) -> String {
+        text_editor::Content::text(self)
+    }
+
+    fn cursor(&self) -> text_editor::Cursor {
+        text_editor::Content::cursor(self)
+    }
+}
+
 /// Snapshot-based undo/redo stack for a text input editor.
 ///
 /// Stores `(String, Cursor)` pairs because [`text_editor::Content`] does not
@@ -263,6 +282,7 @@ pub(crate) struct UndoSnapshot {
 
 impl UndoStack {
     const MAX_UNDO_DEPTH: usize = 100;
+    const LARGE_FILE_UNDO_THRESHOLD: usize = 100_000;
 
     pub(crate) const fn new() -> Self {
         Self {
@@ -271,14 +291,21 @@ impl UndoStack {
         }
     }
 
-    /// Take a snapshot before an edit is performed.
-    pub(crate) fn snap_before_edit(&mut self, content: &text_editor::Content) {
+    /// Take a snapshot before an edit is performed. Content larger than
+    /// [`Self::LARGE_FILE_UNDO_THRESHOLD`] halves the depth cap to bound memory.
+    pub(crate) fn snap_before_edit(&mut self, content: &impl UndoableText) {
+        let text = content.text();
+        let max_depth = if text.len() > Self::LARGE_FILE_UNDO_THRESHOLD {
+            Self::MAX_UNDO_DEPTH / 2
+        } else {
+            Self::MAX_UNDO_DEPTH
+        };
         self.redo.clear();
         self.undo.push(UndoSnapshot {
-            text: content.text(),
+            text,
             cursor: content.cursor(),
         });
-        if self.undo.len() > Self::MAX_UNDO_DEPTH {
+        if self.undo.len() > max_depth {
             self.undo.remove(0);
         }
     }
@@ -286,7 +313,7 @@ impl UndoStack {
     fn push_and_pop(
         dst: &mut Vec<UndoSnapshot>,
         src: &mut Vec<UndoSnapshot>,
-        content: &text_editor::Content,
+        content: &impl UndoableText,
     ) -> Option<UndoSnapshot> {
         dst.push(UndoSnapshot {
             text: content.text(),
@@ -296,12 +323,12 @@ impl UndoStack {
     }
 
     /// Pop the most recent snapshot, saving current state to the redo stack.
-    pub(crate) fn undo(&mut self, content: &text_editor::Content) -> Option<UndoSnapshot> {
+    pub(crate) fn undo(&mut self, content: &impl UndoableText) -> Option<UndoSnapshot> {
         Self::push_and_pop(&mut self.redo, &mut self.undo, content)
     }
 
     /// Pop the most recent undone snapshot, saving current state to the undo stack.
-    pub(crate) fn redo(&mut self, content: &text_editor::Content) -> Option<UndoSnapshot> {
+    pub(crate) fn redo(&mut self, content: &impl UndoableText) -> Option<UndoSnapshot> {
         Self::push_and_pop(&mut self.undo, &mut self.redo, content)
     }
 

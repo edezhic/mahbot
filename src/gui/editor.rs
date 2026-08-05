@@ -34,6 +34,7 @@ use super::context_menu::{ContextMenu, MenuItem};
 use crate::git_commands::{is_git_repo, run_git_check_ignore, run_git_output, run_git_status};
 use crate::util::unquote_c_style;
 
+use super::common::{UndoSnapshot, UndoStack};
 use super::editor_widget::{LineEnding, detect_line_ending, has_trailing_newline};
 use crate::tools::MAX_FILE_SIZE_BYTES as MAX_FILE_SIZE;
 
@@ -202,83 +203,6 @@ fn make_tab_and_data(
         .and_then(|meta| meta.modified().ok());
 
     (tab, tab_data, mtime)
-}
-
-// ── Undo/Redo ──────────────────────────────────────────────────────
-
-/// Snapshot-based undo/redo stack. Stores full-content snapshots
-/// with cursor positions. Bounded to [`Self::MAX_UNDO_DEPTH`] entries.
-#[derive(Debug, Clone)]
-struct UndoStack {
-    /// Previous states, newest last.
-    undo: Vec<UndoSnapshot>,
-    /// Undone states, cleared on new edit.
-    redo: Vec<UndoSnapshot>,
-}
-
-/// A single undo snapshot.
-#[derive(Debug, Clone)]
-struct UndoSnapshot {
-    text: String,
-    cursor_line: usize,
-    cursor_col: usize,
-}
-
-impl UndoStack {
-    const MAX_UNDO_DEPTH: usize = 100;
-    const LARGE_FILE_UNDO_THRESHOLD: usize = 100_000;
-
-    #[must_use]
-    const fn new() -> Self {
-        Self {
-            undo: Vec::new(),
-            redo: Vec::new(),
-        }
-    }
-
-    /// Take a snapshot before an edit is performed.
-    fn snap_before_edit(&mut self, content: &super::editor_widget::EditorBuffer) {
-        let text = content.text();
-        let cursor = content.cursor();
-        let max_depth = if text.len() > Self::LARGE_FILE_UNDO_THRESHOLD {
-            Self::MAX_UNDO_DEPTH / 2
-        } else {
-            Self::MAX_UNDO_DEPTH
-        };
-        self.redo.clear();
-        self.undo.push(UndoSnapshot {
-            text,
-            cursor_line: cursor.line,
-            cursor_col: cursor.column,
-        });
-        if self.undo.len() > max_depth {
-            self.undo.remove(0);
-        }
-    }
-
-    fn push_and_pop(
-        dst: &mut Vec<UndoSnapshot>,
-        src: &mut Vec<UndoSnapshot>,
-        content: &super::editor_widget::EditorBuffer,
-    ) -> Option<UndoSnapshot> {
-        let cursor = content.cursor();
-        dst.push(UndoSnapshot {
-            text: content.text(),
-            cursor_line: cursor.line,
-            cursor_col: cursor.column,
-        });
-        src.pop()
-    }
-
-    #[must_use]
-    fn undo(&mut self, content: &super::editor_widget::EditorBuffer) -> Option<UndoSnapshot> {
-        Self::push_and_pop(&mut self.redo, &mut self.undo, content)
-    }
-
-    #[must_use]
-    fn redo(&mut self, content: &super::editor_widget::EditorBuffer) -> Option<UndoSnapshot> {
-        Self::push_and_pop(&mut self.undo, &mut self.redo, content)
-    }
 }
 
 // ── Find/Replace ───────────────────────────────────────────────────
@@ -2036,9 +1960,10 @@ impl EditorState {
             // Clear find/replace state — match byte ranges are now stale.
             tab_data.find_replace_state = None;
             tab_data.content = EditorBuffer::from_file(&snapshot.text, &path);
-            tab_data
-                .content
-                .move_to(snapshot.cursor_line, snapshot.cursor_col);
+            tab_data.content.move_to(
+                snapshot.cursor.position.line,
+                snapshot.cursor.position.column,
+            );
         }
         update_dirty_flag(&mut self.tabs, &self.tab_contents, idx, &path);
     }
