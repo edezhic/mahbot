@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use mahbot::channels::telegram::{
     CLEAR_COMMAND_DESC, MODELS_COMMAND_DESC, decode_action, decode_callback,
 };
-use mahbot::channels::{broadcast_incoming_message, persist_incoming_message, send_channel_reply};
+use mahbot::channels::{broadcast_and_persist_incoming_message, send_channel_reply};
 use mahbot::config::CONFIG;
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
 use mahbot::message_router;
@@ -864,23 +864,7 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     // URI images renderable).  Persist original content to chat_history (no
     // data URI bloat).  Mirror original content to Telegram (media markers
     // stripped by the mirror function).
-    //
-    // A single message_id and timestamp are generated here so the broadcast
-    // event and chat_history record share both values — consistent with how
-    // BroadcastPersistEntry generates shared IDs and timestamps for agent
-    // responses.  Broadcast is synchronous (non-blocking send to broadcast
-    // channel) so it runs outside the join.
-    let message_id = mahbot::generate_id();
-    let timestamp = mahbot::turso::now();
-    broadcast_incoming_message(&msg, &msg.content, &message_id, &timestamp);
-    tokio::join!(
-        persist_incoming_message(&msg, &original_content, &message_id, &timestamp),
-        async {
-            let mut mirror_msg = msg.clone();
-            mirror_msg.content = original_content.clone();
-            mahbot::channels::mirror_gui_message_to_telegram(&mirror_msg).await;
-        },
-    );
+    broadcast_and_persist_incoming_message(&msg, &msg.content, &original_content).await;
 
     // ── Link enrichment (URL summaries for agent context) ─────────────
     // Runs after broadcast so AI-generated summaries don't appear in the

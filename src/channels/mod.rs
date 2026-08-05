@@ -173,61 +173,58 @@ pub(crate) fn broadcast_chat_event(
     }
 }
 
-/// Broadcast an incoming user message to CHAT_BROADCAST for immediate GUI display,
-/// without persisting to chat_history. Use [`persist_incoming_message`] to persist
-/// separately — this allows broadcasting enriched content while persisting the original
-/// (e.g. to avoid storing large data URIs in chat_history).
+/// Broadcast an incoming user message to the GUI and persist it to chat_history,
+/// mirroring it to Telegram in parallel. `broadcast_content` is the enriched text
+/// sent to the GUI (e.g. audio transcriptions, renderable data URIs), while
+/// `persist_content` is the original text stored in chat_history and mirrored to
+/// Telegram (no data-URI bloat, no raw media markers). The GUI bubble is broadcast
+/// synchronously before the async persist + mirror join begins.
 ///
-/// The `message_id` and `timestamp` should be the same values used in the corresponding
-/// [`persist_incoming_message`] call so the broadcast event and chat_history record are
-/// correlated.
-pub fn broadcast_incoming_message(
+/// Forwards [`ChannelMessage::optimistic_id`] so the GUI can replace its optimistic
+/// bubble with the real one.
+pub async fn broadcast_and_persist_incoming_message(
     msg: &ChannelMessage,
-    content: &str,
-    message_id: &str,
-    timestamp: &str,
+    broadcast_content: &str,
+    persist_content: &str,
 ) {
+    let message_id = crate::generate_id();
+    let timestamp = turso::now();
+
     broadcast_chat_event(
-        message_id,
+        &message_id,
         &msg.user_name,
-        content,
+        broadcast_content,
         ChatDirection::User,
         &msg.channel,
         None,
         &msg.workspace,
         msg.optimistic_id.clone(),
-        timestamp,
+        &timestamp,
     );
-}
 
-/// Persist an incoming user message to chat_history, without broadcasting to GUI.
-/// Use [`broadcast_incoming_message`] to broadcast separately — this allows persisting
-/// the original content while broadcasting enriched content (e.g. to avoid storing
-/// large data URIs in chat_history).
-///
-/// The `message_id` and `timestamp` should be the same values used in the corresponding
-/// [`broadcast_incoming_message`] call so the chat_history record and broadcast event are
-/// correlated.
-pub async fn persist_incoming_message(
-    msg: &ChannelMessage,
-    content: &str,
-    message_id: &str,
-    timestamp: &str,
-) {
-    let store = crate::chat_history::store();
-    let _ = store
-        .insert(&ChatHistoryInsert {
-            message_id: message_id.to_string(),
-            user_name: msg.user_name.clone(),
-            channel: msg.channel.clone(),
-            role: "user".to_string(),
-            direction: "user".to_string(),
-            content: content.to_string(),
-            agent_role: None,
-            workspace: msg.workspace.clone(),
-            created_at: timestamp.to_string(),
-        })
-        .await;
+    tokio::join!(
+        async {
+            let store = crate::chat_history::store();
+            let _ = store
+                .insert(&ChatHistoryInsert {
+                    message_id,
+                    user_name: msg.user_name.clone(),
+                    channel: msg.channel.clone(),
+                    role: "user".to_string(),
+                    direction: "user".to_string(),
+                    content: persist_content.to_string(),
+                    agent_role: None,
+                    workspace: msg.workspace.clone(),
+                    created_at: timestamp,
+                })
+                .await;
+        },
+        async {
+            let mut mirror_msg = msg.clone();
+            mirror_msg.content = persist_content.to_string();
+            mirror_gui_message_to_telegram(&mirror_msg).await;
+        },
+    );
 }
 
 /// Send a reply through a channel.

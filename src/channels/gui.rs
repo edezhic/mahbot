@@ -79,26 +79,6 @@ impl Channel for GuiChannel {
         self
     }
 
-    async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
-        use crate::ChatEvent;
-
-        if let Some(tx) = crate::CHAT_BROADCAST.get() {
-            // KNOWN LIMITATION: This path lacks workspace context because the
-            // Channel trait's `start_typing` does not carry workspace info.
-            // The broadcast_typing path (per-agent consumer loop) covers ~95% of typing
-            // events with correct workspace scoping. An empty workspace string
-            // means this typing indicator will be filtered out by the GUI handler's
-            // workspace check — safe but invisible. Deferred: add workspace to
-            // Channel::start_typing signature.
-            let _ = tx.send(ChatEvent::Typing {
-                user_name: recipient.to_string(),
-                is_typing: true,
-                workspace: String::new(),
-            });
-        }
-        Ok(())
-    }
-
     /// GUI users are addressed by sender name.
     fn resolve_recipient(&self, user_name: &str, _reply_target: &str) -> Option<String> {
         Some(user_name.to_string())
