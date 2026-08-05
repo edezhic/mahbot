@@ -138,8 +138,7 @@ fn set_transcriber_ready(tc: QwenLocalTranscriber) {
 
 /// Resolve the local model directory (`~/.mahbot/models/qwen3-asr-0.6b/`).
 fn model_dir() -> Option<PathBuf> {
-    let root = crate::config::CONFIG.try_storage_root()?;
-    Some(root.join("models").join(MODEL_DIR_NAME))
+    crate::util::models_dir().map(|dir| dir.join(MODEL_DIR_NAME))
 }
 
 /// The Qwen3-ASR local transcriber.
@@ -818,7 +817,7 @@ pub async fn try_init_from_cache() -> bool {
 
 /// True if the local transcriber is loaded and ready for use.
 pub fn is_loaded() -> bool {
-    STATE.load(Ordering::Acquire) == ModelState::Ready
+    STATE.is_ready()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────

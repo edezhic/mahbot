@@ -200,6 +200,17 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Resolve the shared `~/.mahbot/models/` directory via the CONFIG storage root.
+///
+/// Returns `None` if the storage root hasn't been initialized yet.  Per-model
+/// subdirectories are joined by each consumer (e.g. `audio::voice::model_dir`).
+#[must_use]
+pub(crate) fn models_dir() -> Option<PathBuf> {
+    crate::config::CONFIG
+        .try_storage_root()
+        .map(|root| root.join("models"))
+}
+
 /// Run a blocking I/O operation with awareness of the current Tokio runtime.
 ///
 /// - **Multi-threaded runtime:** wraps the call in

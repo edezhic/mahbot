@@ -673,41 +673,68 @@ mod augment_tests {
 
 // ── Confusable phrase list for negative training ──
 
-/// Canonical confusable near-miss phrases for negative training.
-pub(crate) const CONFUSABLE_PHRASES: &[&str] = &[
-    // ── Direct phonetic substitutions (wake-word-like) ──────────────
-    "hey madbot",
-    "hey map bot",
-    "day mahbot",
-    "hey nab it",
-    "hey man",
-    "hey mabot",
-    "hey mahbott",
-    "hey mat",
-    "hey max",
-    "pay mabot",
-    // ── Rhythmic/melodic confusables ─────────────────────────────────
-    "hay map pot",
-    "huh mahbot",
-    "eh mad bot",
-    "hey maybott",
-    "they mad bot",
-    "haymaker",
-    // ── Embedded wake-word sounds ────────────────────────────────────
-    "hey maybe not",
-    "play mah jong",
-    "hey matter of fact",
-    "a day with mahbot",
-    // ── Short phonetic near-misses ──────────────────────────────────
-    "madbot",
-    "mat bot",
-    "bad bot",
-    "mad lot",
-    "mad pot",
-    "med bot",
-    "my bot",
-    "may bot",
-];
+/// Canonical confusable near-miss phrases for negative training, split into
+/// difficulty tiers.  `CONFUSABLE_PHRASES` is the single source of truth — the
+/// tier tables are emitted from this macro so they can never drift apart.
+/// Tier ordering is load-bearing: each phrase must stay in its tier's section.
+macro_rules! confusable_phrase_tiers {
+    (
+        $(
+            $(#[$meta:meta])*
+            $tier:ident: [$($phrase:literal),* $(,)?]
+        ),* $(,)?
+    ) => {
+        pub(crate) const CONFUSABLE_PHRASES: &[&str] = &[ $($($phrase),* ,)* ];
+        $(
+            $(#[$meta])*
+            #[cfg(feature = "voice-tests")]
+            pub(crate) const $tier: &[&str] = &[ $($phrase),* ];
+        )*
+    };
+}
+
+confusable_phrase_tiers! {
+    /// Hard-tier confusable phrases — direct phonetic substitutions (wake-word-like).
+    /// These are the most acoustically similar to the wake word.
+    /// Only compiled when `voice-tests` feature is enabled (used by E2E benchmark).
+    CONFUSABLE_HARD: [
+        // ── Direct phonetic substitutions (wake-word-like) ──────────────
+        "hey madbot",
+        "hey map bot",
+        "day mahbot",
+        "hey nab it",
+        "hey man",
+        "hey mabot",
+        "hey mahbott",
+        "hey mat",
+        "hey max",
+        "pay mabot",
+    ],
+    /// Medium-tier confusable phrases — rhythmic/melodic confusables and embedded
+    /// wake-word sounds. Moderately difficult to distinguish from the wake word.
+    /// Only compiled when `voice-tests` feature is enabled (used by E2E benchmark).
+    CONFUSABLE_MEDIUM: [
+        // ── Rhythmic/melodic confusables ─────────────────────────────────
+        "hay map pot",
+        "huh mahbot",
+        "eh mad bot",
+        "hey maybott",
+        "they mad bot",
+        "haymaker",
+        // ── Embedded wake-word sounds ────────────────────────────────────
+        "hey maybe not",
+        "play mah jong",
+        "hey matter of fact",
+        "a day with mahbot",
+    ],
+    /// Easy-tier confusable phrases — short phonetic near-misses.
+    /// These are single-phoneme substitutions that are relatively easy to reject.
+    /// Only compiled when `voice-tests` feature is enabled (used by E2E benchmark).
+    CONFUSABLE_EASY: [
+        // ── Short phonetic near-misses ──────────────────────────────────
+        "madbot", "mat bot", "bad bot", "mad lot", "mad pot", "med bot", "my bot", "may bot",
+    ],
+}
 
 /// Unrelated speech phrases for negative training.
 ///
@@ -740,48 +767,6 @@ pub(crate) const UNRELATED_PHRASES: &[&str] = &[
     "bonjour comment allez vous aujourd hui",
     "buenos días cómo estás",
     "guten morgen wie geht es dir",
-];
-
-/// Hard-tier confusable phrases — direct phonetic substitutions (wake-word-like).
-/// These are the most acoustically similar to the wake word.
-/// Only compiled when `voice-tests` feature is enabled (used by E2E benchmark).
-#[cfg(feature = "voice-tests")]
-pub(crate) const CONFUSABLE_HARD: &[&str] = &[
-    "hey madbot",
-    "hey map bot",
-    "day mahbot",
-    "hey nab it",
-    "hey man",
-    "hey mabot",
-    "hey mahbott",
-    "hey mat",
-    "hey max",
-    "pay mabot",
-];
-
-/// Medium-tier confusable phrases — rhythmic/melodic confusables and embedded
-/// wake-word sounds. Moderately difficult to distinguish from the wake word.
-/// Only compiled when `voice-tests` feature is enabled (used by E2E benchmark).
-#[cfg(feature = "voice-tests")]
-pub(crate) const CONFUSABLE_MEDIUM: &[&str] = &[
-    "hay map pot",
-    "huh mahbot",
-    "eh mad bot",
-    "hey maybott",
-    "they mad bot",
-    "haymaker",
-    "hey maybe not",
-    "play mah jong",
-    "hey matter of fact",
-    "a day with mahbot",
-];
-
-/// Easy-tier confusable phrases — short phonetic near-misses.
-/// These are single-phoneme substitutions that are relatively easy to reject.
-/// Only compiled when `voice-tests` feature is enabled (used by E2E benchmark).
-#[cfg(feature = "voice-tests")]
-pub(crate) const CONFUSABLE_EASY: &[&str] = &[
-    "madbot", "mat bot", "bad bot", "mad lot", "mad pot", "med bot", "my bot", "may bot",
 ];
 
 /// Cache for pre-computed confusable phrase dense embeddings.
@@ -1969,8 +1954,7 @@ impl AtomicModelState {
 static MODELS_STATE: AtomicModelState = AtomicModelState::new(ModelState::Uninit);
 
 fn model_dir() -> Option<PathBuf> {
-    let root = CONFIG.try_storage_root()?;
-    Some(root.join("models").join(MODEL_DIR_NAME))
+    crate::util::models_dir().map(|dir| dir.join(MODEL_DIR_NAME))
 }
 
 /// Check whether voice models are ready for inference.
@@ -2793,15 +2777,10 @@ fn vad_gate_streaming_mel(
     (mel_frame_buffer, speech_audio)
 }
 
-fn is_speech(samples: &[f32]) -> bool {
-    let detector = VAD_DETECTOR.get_or_init(|| std::sync::Mutex::new(earshot::Detector::default()));
-    let mut detector = detector.lock().unwrap_poison();
-    is_speech_with_detector(samples, &mut detector, VAD_THRESHOLD)
-}
-
 /// Inner VAD check using an explicit detector reference and configurable
-/// threshold.  Used by [`is_speech`] (with [`VAD_THRESHOLD`]) and by tests
-/// that want to supply their own detector to avoid cross-test contamination.
+/// threshold.  Used by [`is_speech_with_threshold`] (with [`VAD_THRESHOLD`])
+/// and by tests that want to supply their own detector to avoid cross-test
+/// contamination.
 ///
 /// Processes ALL 256-sample chunks through the detector to keep its internal
 /// state (ring buffer + pre-emphasis filter) synchronized with the audio
@@ -2895,36 +2874,6 @@ fn is_mic_permission_error(err: &anyhow::Error) -> bool {
         || msg.contains("permission")
         || msg.contains("denied")
         || msg.to_lowercase().contains("access denied")
-}
-
-#[allow(clippy::cast_possible_truncation)]
-fn samples_to_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
-    let header_size = 44;
-    let data_size = samples.len() * 2;
-    let total_size = header_size + data_size;
-    let mut wav = Vec::with_capacity(total_size);
-
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&(total_size as u32 - 8).to_le_bytes());
-    wav.extend_from_slice(b"WAVE");
-    wav.extend_from_slice(b"fmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes());
-    wav.extend_from_slice(&sample_rate.to_le_bytes());
-    wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
-    wav.extend_from_slice(&2u16.to_le_bytes());
-    wav.extend_from_slice(&16u16.to_le_bytes());
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&(data_size as u32).to_le_bytes());
-
-    for &sample in samples {
-        let clamped = sample.clamp(-1.0, 1.0);
-        let int_sample = (clamped * f32::from(i16::MAX)) as i16;
-        wav.extend_from_slice(&int_sample.to_le_bytes());
-    }
-
-    wav
 }
 
 // Model download
@@ -3812,7 +3761,7 @@ fn start_microphone() -> Result<(mpsc::Receiver<Vec<f32>>, cpal::Stream)> {
 // Transcription via existing Qwen3-ASR
 
 async fn transcribe_audio(samples: &[f32]) -> Result<String> {
-    let wav_bytes = samples_to_wav(samples, SAMPLE_RATE);
+    let wav_bytes = crate::audio::tts::render_wav(samples, SAMPLE_RATE)?;
     let tmp_dir = std::env::temp_dir().join("mahbot_voice");
 
     // Pre-clean any stale files left from a prior crash so they don't
@@ -7733,7 +7682,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     let segment_silence_hops = std::sync::atomic::AtomicUsize::new(ctx.segment_silence_hops);
 
     let is_speech_fn = |frame: &[f32]| -> bool {
-        let result = is_speech(frame);
+        let result = is_speech_with_threshold(frame, VAD_THRESHOLD);
         if result {
             segment_silence_hops.store(0, std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "voice-tests")]
@@ -10482,53 +10431,6 @@ mod tests {
             "expected success with 8/10 passing: {:?}",
             result,
         );
-    }
-
-    /// Validate that every entry in `CONFUSABLE_PHRASES` appears in exactly one
-    /// tier array (`CONFUSABLE_HARD`, `CONFUSABLE_MEDIUM`, `CONFUSABLE_EASY`),
-    /// and that there are no overlaps between tier arrays (mahbot-871).
-    ///
-    /// This test is only run when `voice-tests` is enabled, because the tier
-    /// constants are gated behind that feature flag.
-    #[cfg(feature = "voice-tests")]
-    #[test]
-    fn tier_arrays_completely_cover_confusable_phrases() {
-        // Collect tiers into a list for iteration.
-        let tiers: &[(&[&str], &str)] = &[
-            (CONFUSABLE_HARD, "CONFUSABLE_HARD"),
-            (CONFUSABLE_MEDIUM, "CONFUSABLE_MEDIUM"),
-            (CONFUSABLE_EASY, "CONFUSABLE_EASY"),
-        ];
-
-        // Every phrase in CONFUSABLE_PHRASES must appear in exactly one tier.
-        for phrase in CONFUSABLE_PHRASES {
-            let matches: Vec<&str> = tiers
-                .iter()
-                .filter(|(arr, _)| arr.contains(phrase))
-                .map(|(_, name)| *name)
-                .collect();
-
-            assert_eq!(
-                matches.len(),
-                1,
-                "Confusable phrase '{phrase}' appears in {} tier arrays (need exactly 1): {:?}",
-                matches.len(),
-                matches,
-            );
-        }
-
-        // No phrase should appear in more than one tier (redundant with above
-        // but explicit for clarity and to catch cross-tier duplicates).
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for (arr, name) in tiers {
-            for phrase in *arr {
-                assert!(
-                    seen.insert(phrase),
-                    "Confusable phrase '{phrase}' appears in multiple tier arrays \
-                     (already seen in a previous tier, now also in {name})",
-                );
-            }
-        }
     }
 
     // ── PCM cache key tests (mahbot-872) ────────────────────────────────────

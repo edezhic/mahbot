@@ -37,7 +37,7 @@ use candle_nn::{Embedding, Module};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::RwLock;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -185,8 +185,8 @@ fn ensure_embedder() -> bool {
     // ── Sync load from cache ──────────────────────────────────────────
     // No panic-catching needed: OOM aborts the process regardless, and
     // Candle-internal panics are code bugs that should fail loud and fast.
-    let models_dir =
-        models_dir().expect("CONFIG must be initialized before embedder initialization");
+    let models_dir = crate::util::models_dir()
+        .expect("CONFIG must be initialized before embedder initialization");
     let model_path = models_dir.join(MODEL_FILENAME);
     let tokenizer_path = models_dir.join(TOKENIZER_FILENAME);
 
@@ -287,8 +287,8 @@ where
 async fn download_retry_loop() {
     // Transitions Loading→Failed on drop if the loop is cancelled or panics.
     let _guard = ModelLoadGuard::new(&STATE);
-    let models_dir =
-        models_dir().expect("CONFIG must be initialized before embedder initialization");
+    let models_dir = crate::util::models_dir()
+        .expect("CONFIG must be initialized before embedder initialization");
     std::fs::create_dir_all(&models_dir).ok();
 
     let model_dest = models_dir.join(MODEL_FILENAME);
@@ -478,16 +478,6 @@ async fn download_file(
 
     info!(path = %dest.display(), size = downloaded, "Downloaded model file");
     Ok(())
-}
-
-// ── Model paths ──────────────────────────────────────────────────────
-
-/// Returns the `~/.mahbot/models/` directory via CONFIG, or `None` if CONFIG
-/// storage root hasn't been initialized yet.
-fn models_dir() -> Option<PathBuf> {
-    crate::config::CONFIG
-        .try_storage_root()
-        .map(|root| root.join("models"))
 }
 
 // ── GGUF metadata helpers ────────────────────────────────────────────

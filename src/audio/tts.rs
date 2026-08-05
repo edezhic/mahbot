@@ -258,18 +258,13 @@ struct TtsEngine {
 /// ```json
 /// {
 ///   "data": [[[ ... ]]],   // 3D array: [batch, rows, cols]
-///   "dims": [1, 8, 16],    // shape description
-///   "type": "float32"       // data type
+///   "dims": [1, 8, 16],    // shape description (ignored by serde)
+///   "type": "float32"       // data type (ignored by serde)
 /// }
 /// ```
 #[derive(Debug, Deserialize)]
 struct StyleEntry {
     data: Vec<Vec<Vec<f32>>>,
-    #[allow(dead_code)]
-    dims: Vec<usize>,
-    #[allow(dead_code)]
-    #[serde(rename = "type")]
-    data_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,7 +296,7 @@ pub fn is_enabled() -> bool {
 
 #[must_use]
 pub fn models_ready() -> bool {
-    STATE.load(Ordering::Acquire) == ModelState::Ready
+    STATE.is_ready()
 }
 
 /// Returns `true` if the audio output device was successfully initialized.
@@ -743,12 +738,7 @@ pub fn spawn_or_retry_download() {
 // ── Internal helpers ─────────────────────────────────────────────────
 
 pub(crate) fn model_dir() -> Option<PathBuf> {
-    Some(
-        CONFIG
-            .try_storage_root()?
-            .join("models")
-            .join(MODEL_DIR_NAME),
-    )
+    crate::util::models_dir().map(|dir| dir.join(MODEL_DIR_NAME))
 }
 
 fn set_engine_ready(engine: TtsEngine) {
@@ -1632,7 +1622,8 @@ fn split_at_sentence_boundaries(text: &str, max_len: usize) -> Vec<String> {
 /// Returns the complete WAV file bytes, including RIFF header and sample data.
 /// This replaces the old `write_wav` which wrote to a temp file — rodio can
 /// play directly from a `Cursor<Vec<u8>>`, eliminating ephemeral file I/O.
-fn render_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
+/// Shared with `audio::voice` (transcription temp files).
+pub(crate) fn render_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
     let channels: u16 = 1;
     let bps: u16 = 16;
     let byte_rate = sample_rate * u32::from(channels) * u32::from(bps / 8);

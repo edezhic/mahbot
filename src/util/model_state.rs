@@ -62,6 +62,12 @@ impl AtomicModelState {
         self.0.store(state as u8, order);
     }
 
+    /// Returns `true` if the state is [`ModelState::Ready`].
+    #[must_use]
+    pub(crate) fn is_ready(&self) -> bool {
+        self.load(Ordering::Acquire) == ModelState::Ready
+    }
+
     /// Atomically compare-and-exchange the current state.
     ///
     /// See [`AtomicU8::compare_exchange`] for ordering semantics.
