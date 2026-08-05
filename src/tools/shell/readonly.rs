@@ -459,7 +459,6 @@ fn emit_herestring(chars: &[(usize, char)], i: usize, out: &mut String) -> usize
 /// skipped. Returns `true` when at least one span was emitted.
 fn emit_body_substitutions(line: &str, out: &mut String) -> bool {
     let mut emitted = false;
-    let bytes = line.as_bytes();
     let mut j = 0;
     while j < line.len() {
         let c = line[j..].chars().next().expect("j < line.len()");
@@ -472,15 +471,7 @@ fn emit_body_substitutions(line: &str, out: &mut String) -> bool {
             }
             continue;
         }
-        if c == '$' && bytes.get(j + 1) == Some(&b'(') {
-            let (_, next) = find_substitution_end(line, j + 2);
-            out.push_str(&line[j..next]);
-            j = next;
-            emitted = true;
-            continue;
-        }
-        if c == '`' {
-            let (_, next) = find_backtick_end(line, j + 1);
+        if let Some((_, next)) = substitution_span(line, j) {
             out.push_str(&line[j..next]);
             j = next;
             emitted = true;
@@ -541,14 +532,10 @@ fn has_disallowed_redirect(segment: &str, state: &ValidationState) -> Result<(),
         // `` "`...`" ``), so detect their starts before the quote-state skip
         // below. Inside single quotes `$(`/backticks are literal; a preceding
         // escape backslash makes them literal too.
-        if !escaped && !in_single && (c == '$' && bytes.get(i + 1) == Some(&b'(') || c == '`') {
-            let next = if c == '$' {
-                let (_, next) = find_substitution_end(segment, i + 2);
-                next
-            } else {
-                let (_, next) = find_backtick_end(segment, i + 1);
-                next
-            };
+        if !escaped
+            && !in_single
+            && let Some((_, next)) = substitution_span(segment, i)
+        {
             i = next;
             continue;
         }
@@ -1211,13 +1198,8 @@ fn scan_list(
         // validated by the substitution scan with subshell semantics).
         if !escaped
             && !in_single
-            && (c == '$' && s.as_bytes().get(i + 1) == Some(&b'(') || c == '`')
+            && let Some((_, next)) = substitution_span(s, i)
         {
-            let next = if c == '$' {
-                find_substitution_end(s, i + 2).1
-            } else {
-                find_backtick_end(s, i + 1).1
-            };
             current.push_str(&s[i..next]);
             i = next;
             continue;
@@ -1626,13 +1608,8 @@ fn read_word_at(s: &str, i: usize) -> (String, usize) {
         }
         if !escaped
             && !in_single
-            && (c == '$' && s.as_bytes().get(k + 1) == Some(&b'(') || c == '`')
+            && let Some((_, next)) = substitution_span(s, k)
         {
-            let next = if c == '$' {
-                find_substitution_end(s, k + 2).1
-            } else {
-                find_backtick_end(s, k + 1).1
-            };
             word.push_str(&s[k..next]);
             k = next;
             continue;
@@ -2039,13 +2016,8 @@ fn scan_case_pattern(s: &str, i: usize) -> Result<(String, usize), String> {
         }
         if !escaped
             && !in_single
-            && (c == '$' && s.as_bytes().get(k + 1) == Some(&b'(') || c == '`')
+            && let Some((_, next)) = substitution_span(s, k)
         {
-            let next = if c == '$' {
-                find_substitution_end(s, k + 2).1
-            } else {
-                find_backtick_end(s, k + 1).1
-            };
             pat.push_str(&s[k..next]);
             k = next;
             continue;
@@ -2198,24 +2170,18 @@ fn scan_substitutions(s: &str, state: &mut ValidationState) -> Result<(), String
         // inside single quotes or after an escape backslash.
         if !escaped
             && !in_single
-            && (c == '$' && s.as_bytes().get(i + 1) == Some(&b'(') || c == '`')
+            && let Some((content, next)) = substitution_span(s, i)
         {
-            if c == '$' {
-                let (inner, next) = find_substitution_end(s, i + 2);
-                // `$((...))` arithmetic expansion: the expression is not a
-                // command, but nested substitutions inside it execute and
-                // must be validated (e.g. `$(( $(touch x) + 1 ))`).
-                if s.as_bytes().get(i + 2) == Some(&b'(') {
-                    scan_substitutions(inner, state)?;
-                } else {
-                    validate_substitution_content(inner, state)?;
-                }
-                i = next;
+            // `$((...))` arithmetic expansion: the expression is not a
+            // command, but nested substitutions inside it execute and
+            // must be validated (e.g. `$(( $(touch x) + 1 ))`). The `$(` gate
+            // excludes backtick bodies starting with `(` (a subshell command).
+            if c == '$' && content.starts_with('(') {
+                scan_substitutions(content, state)?;
             } else {
-                let (inner, next) = find_backtick_end(s, i + 1);
-                validate_substitution_content(inner, state)?;
-                i = next;
+                validate_substitution_content(content, state)?;
             }
+            i = next;
             continue;
         }
         if !super::track_char_context(c, &mut in_single, &mut in_double, &mut escaped) {
@@ -2310,6 +2276,21 @@ fn find_backtick_end(s: &str, start: usize) -> (&str, usize) {
         i += c.len_utf8();
     }
     (&s[start..], s.len())
+}
+
+/// Span of a command substitution whose introducer is at byte `i` (`$(` or
+/// backtick). Returns `(content, index_after_close)` — `content` starts
+/// AFTER the introducer (`i + 2` / `i + 1`), not at `i`; slice `s[i..next]`
+/// for the full span.
+fn substitution_span(s: &str, i: usize) -> Option<(&str, usize)> {
+    let b = s.as_bytes();
+    if b.get(i) == Some(&b'$') && b.get(i + 1) == Some(&b'(') {
+        Some(find_substitution_end(s, i + 2))
+    } else if b.get(i) == Some(&b'`') {
+        Some(find_backtick_end(s, i + 1))
+    } else {
+        None
+    }
 }
 
 /// Validate a substitution body as a nested command against a snapshot of the
@@ -2689,15 +2670,7 @@ fn cp_destination_under_temp(segment: &str, state: &ValidationState) -> bool {
 /// standalone `$(cmd)` commands).
 fn is_bare_substitution_segment(s: &str) -> bool {
     let s = s.trim();
-    if s.starts_with("$(") {
-        let (_, next) = find_substitution_end(s, 2);
-        return next == s.len();
-    }
-    if s.starts_with('`') {
-        let (_, next) = find_backtick_end(s, 1);
-        return next == s.len();
-    }
-    false
+    substitution_span(s, 0).is_some_and(|(_, next)| next == s.len())
 }
 
 /// Classification of a command verb word: provably literal (possibly with
@@ -3388,7 +3361,6 @@ fn bind_assignment_word(w: &str, state: &mut ValidationState) {
 /// backtick substitutions whole — their bodies may contain spaces, and
 /// `NAME=$(mktemp -d)` must stay one assignment word.
 fn split_words_keeping_substitutions(s: &str) -> Vec<&str> {
-    let bytes = s.as_bytes();
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
@@ -3399,14 +3371,10 @@ fn split_words_keeping_substitutions(s: &str) -> Vec<&str> {
         let c = s[i..].chars().next().expect("i < len");
         // Substitution starts are recognized inside double quotes too, but are
         // literal inside single quotes or after an escape backslash.
-        if !escaped && !in_single && (c == '$' && bytes.get(i + 1) == Some(&b'(') || c == '`') {
-            let next = if c == '$' {
-                let (_, next) = find_substitution_end(s, i + 2);
-                next
-            } else {
-                let (_, next) = find_backtick_end(s, i + 1);
-                next
-            };
+        if !escaped
+            && !in_single
+            && let Some((_, next)) = substitution_span(s, i)
+        {
             i = next;
             continue;
         }
