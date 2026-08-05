@@ -2368,8 +2368,8 @@ const FLAG_CHECKS: &[FlagCheck] = &[
     FlagCheck {
         verb: "sed",
         predicate: has_sed_mutation,
-        rejection: "`sed -i` is not allowed outside temp directories — it modifies files in-place.",
-        suggestion: "use `sed` without `-i` to output to stdout, e.g. `sed 's/a/b/' file`, or use `-i` with a path under /tmp.",
+        rejection: "`sed` in-place editing (`-i`/`-I`/`--in-place`) is not allowed outside temp directories — it modifies files in-place.",
+        suggestion: "use `sed` without in-place flags to output to stdout, e.g. `sed 's/a/b/' file`, or use `-i` with a path under /tmp.",
     },
     FlagCheck {
         verb: "awk",
@@ -4169,16 +4169,51 @@ fn output_flag_value<'a>(
         .or_else(|| equals_prefix.and_then(|p| flag_value_equals(parts, p)))
 }
 
-/// Check if `sed` has `-i` in a way that mutates files outside temp.
-/// When all file operands after `-i` are under temp, returns `false` (allow).
+/// Approximate the argv word sed receives after shell parsing: `$'...'`/`$"..."`
+/// drop the `$`, then all quotes and backslashes are removed
+/// (`\'` → `'`, `\i` → `i`, `'-i'x` → `-ix`). Tokens whose escape semantics
+/// cannot be resolved this way are handled by [`is_unprovable_inplace_flag`].
+fn shell_word(word: &str) -> String {
+    let word = word
+        .strip_prefix('$')
+        .filter(|rest| rest.starts_with(['\'', '"']))
+        .unwrap_or(word);
+    word.replace(['\'', '"', '\\'], "")
+}
+
+/// `$'...'`/`$"..."` tokens with backslash escapes are unprovable: escape
+/// semantics are shell/version-dependent (`$'\x2di'` → `-i`), so treat them
+/// as in-place flag candidates — mirroring [`classify_verb_word`]'s Unprovable
+/// verdict for `$`/`\`-words. Over-rejects `$'\\x2di'`/`$"\x2di"` (delivered as
+/// literal backslashes), an accepted fail-closed contract. `${...}`/`$var` are
+/// deliberately not treated as unprovable: they also appear in legit read-only
+/// scripts (`sed "s/a/$var/" file`), and their values are not decodable anyway.
+fn is_unprovable_inplace_flag(part: &str) -> bool {
+    (part.starts_with("$'") || part.starts_with("$\"")) && part.contains('\\')
+}
+
+/// Check if `sed` has an in-place flag in a way that mutates files outside temp.
+/// When all file operands after the flag are under temp, returns `false` (allow).
 fn has_sed_mutation(command: &str, state: &ValidationState) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
-    // Find the -i flag position (including -i.bak, -iSUFFIX)
-    let i_pos = parts
-        .iter()
-        .position(|p| *p == "-i" || p.starts_with("-i."));
+    // In-place flag position: any single-dash flag containing `i`/`I`
+    // (-i, -iSUFFIX, -I, -nix/-Ei clusters; no other sed short flag has
+    // i/I), or the GNU long form `--in-place[=SUFFIX]` at any unique
+    // abbreviation (`--i` is the shortest; no other GNU sed long option
+    // starts with `i`). Over-rejection is intentional (fail-closed):
+    // attached `-e`/`-f`/`-l` args containing `i` (e.g. `-e's/x/i/'`) and
+    // operands literally named like a flag (`sed -- -info.txt`) are
+    // rejected too. Tokens are normalized as the shell delivers them
+    // ([`shell_word`]), and `$'...'`/`$"..."` tokens with escapes are
+    // unprovable flag candidates ([`is_unprovable_inplace_flag`]).
+    let i_pos = parts.iter().position(|part| {
+        let p = shell_word(part);
+        (p.starts_with('-') && !p.starts_with("--") && p.contains(['i', 'I']))
+            || p.starts_with("--i")
+            || is_unprovable_inplace_flag(part)
+    });
     let Some(i_pos) = i_pos else {
-        return false; // no -i flag → not a sed mutation
+        return false; // no in-place flag → not a sed mutation
     };
 
     // Collect file operands after -i.
@@ -4186,6 +4221,12 @@ fn has_sed_mutation(command: &str, state: &ValidationState) -> bool {
     // Sed expressions and backup extensions are non-absolute tokens before the
     // first absolute-path file operand. Once we've seen a file operand, all
     // subsequent non-flag tokens are treated as file operands (multi-file).
+    // The absolute check normalizes via [`shell_word`], so quoted/escaped
+    // paths (e.g. '/etc/passwd') count as operands — which also classifies
+    // `/`-addressed scripts (e.g. '/pat/d') as operands, an accepted fail-closed
+    // over-rejection matching the unquoted behavior. Unprovable `$'...'`/`$"..."`
+    // tokens with escapes ([`is_unprovable_inplace_flag`]) also count as
+    // operands — they may resolve to a workspace path.
     let mut file_operands: Vec<&str> = Vec::new();
     let mut seen_file_operand = false;
 
@@ -4200,8 +4241,7 @@ fn has_sed_mutation(command: &str, state: &ValidationState) -> bool {
         }
         // Before the first file operand: skip non-absolute tokens (sed expression
         // like 's/a/b/' or backup extension like .bak for `-i .bak`).
-        let p = Path::new(part);
-        if p.is_absolute() {
+        if Path::new(&shell_word(part)).is_absolute() || is_unprovable_inplace_flag(part) {
             seen_file_operand = true;
             file_operands.push(part);
         }
@@ -4209,7 +4249,7 @@ fn has_sed_mutation(command: &str, state: &ValidationState) -> bool {
     }
 
     if file_operands.is_empty() {
-        return true; // `sed -i` without file operand → reject (conservative)
+        return true; // in-place flag without file operand → reject (conservative)
     }
 
     file_operands.iter().any(|p| writes_outside_temp(p, state))
@@ -5175,6 +5215,49 @@ mod tests {
             // sed -i with separate backup extension
             ("sed -i .bak 's/a/b/' /tmp/file", true),
             ("sed -i .bak 's/a/b/' /etc/passwd", false),
+            // sed in-place family: attached suffix, clusters, uppercase -I
+            ("sed -ix 's/a/b/' /tmp/file", true),
+            ("sed -ix 's/a/b/' /etc/passwd", false),
+            ("sed -nix 's/a/b/' /etc/passwd", false),
+            ("sed -I 's/a/b/' /tmp/file", true),
+            ("sed -I 's/a/b/' /etc/passwd", false),
+            ("sed -nIx 's/a/b/' /etc/passwd", false),
+            // GNU long form --in-place (token-level; behavioral check needs GNU sed)
+            ("sed --in-place 's/a/b/' /tmp/file", true),
+            ("sed --in-place=bak 's/a/b/' /tmp/file", true),
+            ("sed --in-place 's/a/b/' /etc/passwd", false),
+            ("sed --in-place=bak 's/a/b/' /etc/passwd", false),
+            // GNU getopt_long abbreviations (--i is the shortest unique prefix)
+            ("sed --i 's/a/b/' /etc/passwd", false),
+            // Quote-wrapped / concatenated flags (shell strips quotes)
+            ("sed '-i' 's/a/b/' /tmp/file", true),
+            ("sed '-i' 's/a/b/' /etc/passwd", false),
+            ("sed '-i'x 's/a/b/' /tmp/file", true), // concatenates to -ix
+            ("sed '-i'x 's/a/b/' /etc/passwd", false),
+            ("sed '-nix' 's/a/b/' /etc/passwd", false),
+            ("sed --'in-place' 's/a/b/' /tmp/file", true), // → --in-place
+            ("sed --'in-place' 's/a/b/' /etc/passwd", false),
+            // Backslash-escaped and ANSI-C-quoted flags (shell delivers -i/-ix)
+            ("sed \\-ix 's/a/b/' /tmp/file", true),
+            ("sed \\-ix 's/a/b/' /etc/passwd", false),
+            ("sed \\--in-place 's/a/b/' /etc/passwd", false),
+            ("sed $'-ix' 's/a/b/' /etc/passwd", false),
+            // $'...'/$"..." tokens with escapes are unprovable flag candidates
+            ("sed $'\\x2di' 's/a/b/' /tmp/file", true), // → -i; temp still allowed
+            ("sed $'\\x2di' 's/a/b/' /etc/passwd", false),
+            ("sed $'\\055i' 's/a/b/' /etc/passwd", false), // octal escape
+            ("sed $'\\x2dix' 's/a/b/' /etc/passwd", false), // → -ix
+            ("sed $'\\u002di' 's/a/b/' /etc/passwd", false), // any escape → unprovable
+            ("sed $'\\\\x2di' 's/a/b/' /etc/passwd", false), // literal backslash → over-rejected
+            ("sed $\"\\x2di\" 's/a/b/' /etc/passwd", false), // locale quoting → over-rejected
+            // $'...' operands with escapes count as operands (may be a path)
+            ("sed -i 's/a/b/' $'\\x2fetc\\x2fpasswd' /tmp/file", false),
+            // Documented over-rejections (fail-closed contract)
+            ("sed -e's/x/i/' file", false), // attached -e script arg
+            ("sed -- -info.txt", false),    // operand literally named like a -i flag
+            // Quote-wrapped operands (normalized for the absolute check)
+            ("sed -i 's/a/b/' '/tmp/file'", true),
+            ("sed -i 's/a/b/' '/etc/passwd' /tmp/file", false), // mixed
             // dd of= to temp → allowed
             ("dd if=/dev/zero of=/tmp/out bs=1024 count=1", true),
             ("dd of=/tmp/out", true),
