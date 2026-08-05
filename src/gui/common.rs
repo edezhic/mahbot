@@ -5,6 +5,9 @@ use iced::widget::text_editor;
 use std::future::Future;
 use std::pin::Pin;
 
+/// Maximum characters allowed in a chat message / comment input.
+pub(crate) const MAX_INPUT_CHARS: usize = 100_000;
+
 /// Pagination state shared by dashboard pages that display paginated data.
 ///
 /// Groups `page`, `page_size`, and `total` into a single struct with helper
@@ -358,6 +361,78 @@ where
             }
         },
     )
+}
+
+/// Map a keyboard event for a chat composer: modifier changes plus
+/// Cmd+Z / Cmd+Shift+Z undo/redo. `mods_changed`, `undo`, `redo` are the
+/// consuming page's message constructors (passed as `fn` pointers so the
+/// per-page `filter_map` closures stay non-capturing).
+pub(crate) fn composer_keyboard_event<M>(
+    event: iced::keyboard::Event,
+    mods_changed: fn(iced::keyboard::Modifiers) -> M,
+    undo: fn() -> M,
+    redo: fn() -> M,
+) -> Option<M> {
+    match event {
+        iced::keyboard::Event::ModifiersChanged(modifiers) => Some(mods_changed(modifiers)),
+        iced::keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            physical_key,
+            ..
+        } => {
+            let km = super::detect_keyboard_mods(modifiers);
+            // Cmd+Z / Ctrl+Z → undo. Check shift first so Cmd+Shift+Z → redo.
+            if km.is_shortcut_platform_mod() && key.to_latin(physical_key) == Some('z') {
+                if modifiers.shift() {
+                    return Some(redo());
+                }
+                return Some(undo());
+            }
+            None
+        }
+        iced::keyboard::Event::KeyReleased { .. } => None,
+    }
+}
+
+/// Guard a chat send: trim-empty noop, then the in-flight noop and the
+/// over-limit toast in per-page order (`in_flight_first` — home checks
+/// in-flight before the limit, board after). Returns the trimmed text when
+/// the send may proceed.
+pub(crate) fn send_guard<M: 'static>(
+    text: &str,
+    sending: bool,
+    in_flight_first: bool,
+    over_limit: impl Fn(usize) -> Task<M>,
+) -> Result<&str, Task<M>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(Task::none());
+    }
+    let over_limit_task = || {
+        let count = trimmed.chars().count();
+        if count > MAX_INPUT_CHARS {
+            Some(over_limit(count))
+        } else {
+            None
+        }
+    };
+    if in_flight_first {
+        if sending {
+            return Err(Task::none());
+        }
+        if let Some(task) = over_limit_task() {
+            return Err(task);
+        }
+    } else {
+        if let Some(task) = over_limit_task() {
+            return Err(task);
+        }
+        if sending {
+            return Err(Task::none());
+        }
+    }
+    Ok(trimmed)
 }
 
 #[cfg(test)]

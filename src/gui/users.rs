@@ -14,6 +14,26 @@ pub(crate) fn user_store() -> Result<&'static UserStore, String> {
         .ok_or_else(|| "User store not initialized".to_string())
 }
 
+/// Run a single-field `update_user`, mapping an empty value to
+/// [`FieldUpdate::Clear`]. `is_role` selects which column is updated.
+async fn update_user_field(sender: String, value: String, is_role: bool) -> Result<(), String> {
+    let store = user_store()?;
+    let val = if value.is_empty() {
+        FieldUpdate::Clear
+    } else {
+        FieldUpdate::Set(&value)
+    };
+    let (role, ws) = if is_role {
+        (val, FieldUpdate::Unchanged)
+    } else {
+        (FieldUpdate::Unchanged, val)
+    };
+    store
+        .update_user(&sender, role, ws, FieldUpdate::Unchanged)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Debug, Clone)]
 pub enum UsersMessage {
     Refreshed(Vec<UserRecord>, Vec<super::widgets::PickOption>),
@@ -144,33 +164,11 @@ impl UsersState {
                 Task::none()
             }
             UsersMessage::UpdateRole(sender, role) => Task::perform(
-                async move {
-                    let store = user_store()?;
-                    let val = if role.is_empty() {
-                        FieldUpdate::Clear
-                    } else {
-                        FieldUpdate::Set(&role)
-                    };
-                    store
-                        .update_user(&sender, val, FieldUpdate::Unchanged, FieldUpdate::Unchanged)
-                        .await
-                        .map_err(|e| e.to_string())
-                },
+                async move { update_user_field(sender, role, true).await },
                 UsersMessage::UpdateResult,
             ),
             UsersMessage::UpdateWorkspace(sender, ws) => Task::perform(
-                async move {
-                    let store = user_store()?;
-                    let val = if ws.is_empty() {
-                        FieldUpdate::Clear
-                    } else {
-                        FieldUpdate::Set(&ws)
-                    };
-                    store
-                        .update_user(&sender, FieldUpdate::Unchanged, val, FieldUpdate::Unchanged)
-                        .await
-                        .map_err(|e| e.to_string())
-                },
+                async move { update_user_field(sender, ws, false).await },
                 UsersMessage::UpdateResult,
             ),
             UsersMessage::UpdateResult(Ok(())) => Task::batch([

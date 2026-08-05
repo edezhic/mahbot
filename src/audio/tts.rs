@@ -170,14 +170,6 @@ pub enum TtsDownloadEvent {
 /// Broadcast channel for TTS download progress events (GUI subscription).
 pub static DOWNLOAD_EVENTS: OnceLock<broadcast::Sender<TtsDownloadEvent>> = OnceLock::new();
 
-/// Subscribe to TTS download progress events for the GUI subscription.
-pub fn subscribe_download_events() -> broadcast::Receiver<TtsDownloadEvent> {
-    DOWNLOAD_EVENTS
-        .get()
-        .expect("DOWNLOAD_EVENTS initialized before subscribe")
-        .subscribe()
-}
-
 /// Wrapper around rodio's audio output that is `Send` on all platforms.
 ///
 /// `rodio::OutputStream` is `!Send` on macOS because of a phantom

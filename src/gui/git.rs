@@ -9,7 +9,6 @@
 //! at the Dashboard level.
 
 use super::theme;
-use super::widget_helpers;
 
 use iced::widget::{Column, Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Element, Length, Task};
@@ -277,14 +276,11 @@ impl GitState {
                 self.syncing = true;
                 let ws_path = self.workspace_path.clone();
                 Task::perform(
-                    async move {
-                        match ws_path {
-                            Some(path) => crate::git_commands::run_git_sync(&path)
-                                .await
-                                .map_err(|e| e.to_string()),
-                            None => Err("No workspace path".to_string()),
-                        }
-                    },
+                    with_ws_path(ws_path, |path: PathBuf| async move {
+                        crate::git_commands::run_git_sync(&path)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }),
                     GitMessage::SyncResult,
                 )
             }
@@ -314,38 +310,19 @@ impl GitState {
                 let ws_path = self.workspace_path.clone();
                 let branch_clone = branch;
                 Task::perform(
-                    async move {
-                        match ws_path {
-                            Some(path) => {
-                                crate::git_commands::run_git_command(
-                                    &path,
-                                    &["switch", branch_clone.as_str()],
-                                )
-                                .await
-                                .map_err(|e| e.to_string())?;
-                                Ok(())
-                            }
-                            None => Err("No workspace path".to_string()),
-                        }
-                    },
+                    with_ws_path(ws_path, |path: PathBuf| async move {
+                        crate::git_commands::run_git_command(
+                            &path,
+                            &["switch", branch_clone.as_str()],
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        Ok(())
+                    }),
                     GitMessage::SwitchResult,
                 )
             }
-            GitMessage::SwitchResult(result) => {
-                self.syncing = false;
-                match result {
-                    Ok(()) => {
-                        self.show_branch_modal = false;
-                        Task::done(GitMessage::Toast(super::ToastMessage::SuccessMsg(
-                            "Switched branch".to_string(),
-                        )))
-                    }
-                    Err(e) => {
-                        self.branch_error = Some(e);
-                        Task::none()
-                    }
-                }
-            }
+            GitMessage::SwitchResult(result) => self.finish_branch_op(result, "Switched branch"),
 
             // ── Create branch ──────────────────────────────────
             GitMessage::Create => {
@@ -361,37 +338,20 @@ impl GitState {
                 let branch_clone = branch.trim().to_string();
                 self.syncing = true;
                 Task::perform(
-                    async move {
-                        match ws_path {
-                            Some(path) => {
-                                crate::git_commands::run_git_command(
-                                    &path,
-                                    &["switch", "-c", branch_clone.as_str()],
-                                )
-                                .await
-                                .map_err(|e| e.to_string())?;
-                                Ok(())
-                            }
-                            None => Err("No workspace path".to_string()),
-                        }
-                    },
+                    with_ws_path(ws_path, |path: PathBuf| async move {
+                        crate::git_commands::run_git_command(
+                            &path,
+                            &["switch", "-c", branch_clone.as_str()],
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        Ok(())
+                    }),
                     GitMessage::CreateBranchResult,
                 )
             }
             GitMessage::CreateBranchResult(result) => {
-                self.syncing = false;
-                match result {
-                    Ok(()) => {
-                        self.show_branch_modal = false;
-                        Task::done(GitMessage::Toast(super::ToastMessage::SuccessMsg(
-                            "Created and switched to new branch".to_string(),
-                        )))
-                    }
-                    Err(e) => {
-                        self.branch_error = Some(e);
-                        Task::none()
-                    }
-                }
+                self.finish_branch_op(result, "Created and switched to new branch")
             }
             GitMessage::NewBranchNameChanged(name) => {
                 self.new_branch_name = name;
@@ -402,6 +362,28 @@ impl GitState {
             GitMessage::Toast(_) => {
                 // Dashboard intercepts this variant before it reaches
                 // us — this arm is unreachable in practice.
+                Task::none()
+            }
+        }
+    }
+
+    /// Handle a branch switch/create result: clear syncing, close the modal
+    /// on success (with toast), record the error on failure.
+    fn finish_branch_op(
+        &mut self,
+        result: Result<(), String>,
+        success_msg: &str,
+    ) -> Task<GitMessage> {
+        self.syncing = false;
+        match result {
+            Ok(()) => {
+                self.show_branch_modal = false;
+                Task::done(GitMessage::Toast(super::ToastMessage::SuccessMsg(
+                    success_msg.to_string(),
+                )))
+            }
+            Err(e) => {
+                self.branch_error = Some(e);
                 Task::none()
             }
         }
@@ -433,13 +415,7 @@ impl GitState {
     /// create section). Does **not** wrap in a `modal_overlay` — that is
     /// done by the Dashboard so the close message is consistent with the
     /// rest of the overlay stack.
-    ///
-    /// Returns an empty element when the modal is closed.
     pub fn view(&self) -> Element<'_, GitMessage> {
-        if !self.show_branch_modal {
-            return widget_helpers::empty_stack_placeholder();
-        }
-
         let search_input = text_input("Search branches…", &self.branch_search_query)
             .on_input(GitMessage::BranchQueryChanged)
             .padding(8)
@@ -518,13 +494,19 @@ impl GitState {
     }
 }
 
-impl Default for GitState {
-    fn default() -> Self {
-        Self::new()
+// ── Private helpers ──────────────────────────────────────────────
+
+/// Run `op` against the workspace path, mapping a missing path to the
+/// standard error used by all git operations.
+async fn with_ws_path<T>(
+    ws_path: Option<PathBuf>,
+    op: impl AsyncFnOnce(PathBuf) -> Result<T, String>,
+) -> Result<T, String> {
+    match ws_path {
+        Some(path) => op(path).await,
+        None => Err("No workspace path".to_string()),
     }
 }
-
-// ── Private helpers ──────────────────────────────────────────────
 
 impl GitState {
     /// Spawn three parallel async tasks to refresh diff stats, current

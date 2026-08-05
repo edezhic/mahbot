@@ -10,18 +10,15 @@ use crate::chat_history::ChatHistoryEntry;
 use futures_util::SinkExt;
 use iced::widget::rule;
 use iced::widget::{
-    Column, Id, Space, button, column, container, row, scrollable, stack, text, text_editor,
+    Column, Id, Space, button, column, container, row, scrollable, text, text_editor,
 };
 use iced::{Alignment, Element, Length, Task, keyboard};
-use iced_fonts::lucide;
 use std::collections::HashSet;
 
 use super::ToastMessage;
+use super::common::MAX_INPUT_CHARS;
 use super::theme;
 use super::widgets::PickOption;
-
-/// Maximum characters allowed in pasted/large text input.
-const MAX_INPUT_CHARS: usize = 100_000;
 
 /// Maximum number of message IDs to keep in the dedup set before pruning.
 const DEDUP_PRUNE_THRESHOLD: usize = 500;
@@ -54,12 +51,12 @@ pub struct DisplayMessage {
     pub is_optimistic: bool,
 }
 
-/// Construct a non-optimistic `DisplayMessage` with parsed markdown.
-///
-/// Takes `message_id` by value so the caller can clone when they need to
-/// retain ownership (e.g. for dedup tracking on the optimistic-replacement
-/// path in `update()`).
-fn build_chat_message(
+/// Build a [`DisplayMessage`] from raw parts. Media-preprocesses content and
+/// parses markdown; divider directions skip markdown (rendered as rules).
+/// `id` is `Some` for history-loaded entries, `None` for live/optimistic
+/// messages.
+fn display_message(
+    id: Option<i64>,
     message_id: String,
     user_name: String,
     content: String,
@@ -68,10 +65,14 @@ fn build_chat_message(
     is_optimistic: bool,
 ) -> DisplayMessage {
     use iced::widget::markdown;
-    let processed = super::media_markers::preprocess(&content);
-    let md_items: Vec<markdown::Item> = markdown::parse(&processed).collect();
+    let md_items: Vec<markdown::Item> = if direction == ChatDirection::Divider {
+        Vec::new()
+    } else {
+        let processed = super::media_markers::preprocess(&content);
+        markdown::parse(&processed).collect()
+    };
     DisplayMessage {
-        id: None,
+        id,
         message_id,
         user_name,
         content,
@@ -82,29 +83,25 @@ fn build_chat_message(
     }
 }
 
-/// Convert a [`ChatHistoryEntry`] into a [`DisplayMessage`] for rendering.
-///
-/// Unlike [`build_chat_message`] which takes raw parts with `id: None`, this
-/// uses the entry's database ID (`id: Some(entry.id)`) and always creates a
-/// non-optimistic message.
-fn entry_to_display_message(entry: ChatHistoryEntry) -> DisplayMessage {
-    use iced::widget::markdown;
-    let md_items: Vec<markdown::Item> = if entry.direction == ChatDirection::Divider {
-        // Dividers are rendered as horizontal rules — no markdown needed.
-        Vec::new()
-    } else {
-        let processed = super::media_markers::preprocess(&entry.content);
-        markdown::parse(&processed).collect()
-    };
-    DisplayMessage {
-        id: Some(entry.id),
-        message_id: entry.message_id,
-        user_name: entry.user_name,
-        content: entry.content,
-        direction: entry.direction,
-        agent_role: entry.agent_role,
-        md_items,
-        is_optimistic: false,
+impl From<ChatHistoryEntry> for DisplayMessage {
+    fn from(entry: ChatHistoryEntry) -> Self {
+        let ChatHistoryEntry {
+            id,
+            message_id,
+            user_name,
+            content,
+            direction,
+            agent_role,
+        } = entry;
+        display_message(
+            Some(id),
+            message_id,
+            user_name,
+            content,
+            direction,
+            agent_role,
+            false,
+        )
     }
 }
 
@@ -373,7 +370,7 @@ impl HomeState {
     /// Push a new chat message to the display. Returns the message's ID for dedup tracking.
     fn push_message(&mut self, entry: ChatHistoryEntry) -> String {
         let msg_id = entry.message_id.clone();
-        self.messages.push(entry_to_display_message(entry));
+        self.messages.push(entry.into());
         msg_id
     }
 
@@ -385,6 +382,14 @@ impl HomeState {
         self.loading_older = false;
         self.auto_scroll_enabled = true;
         self.pagination_gen = self.pagination_gen.wrapping_add(1);
+    }
+
+    /// Clear chat display state: messages, dedup set, history flag, pagination.
+    fn reset_chat_state(&mut self) {
+        self.messages.clear();
+        self.seen_ids.clear();
+        self.history_loaded = false;
+        self.reset_pagination_state();
     }
 
     /// Produce a snap-to-end task if auto-scroll is enabled.
@@ -419,7 +424,8 @@ impl HomeState {
                 .iter()
                 .position(|m| m.is_optimistic && m.message_id == *opt_id)
             {
-                self.messages[pos] = build_chat_message(
+                self.messages[pos] = display_message(
+                    None,
                     message_id.to_string(),
                     user_name.to_string(),
                     content.to_string(),
@@ -518,8 +524,8 @@ impl HomeState {
             return;
         }
 
-        self.messages.push(build_chat_message(
-            message_id, user_name, content, direction, agent_role, false,
+        self.messages.push(display_message(
+            None, message_id, user_name, content, direction, agent_role, false,
         ));
     }
 
@@ -700,100 +706,15 @@ impl HomeState {
         };
 
         // ── Input area ───────────────────────────────────────────
-        let input_editor = text_editor(&self.editor_content)
-            .on_action(HomeMessage::InputChanged)
-            .placeholder("Type a message... (Enter to send, Shift+Enter for newline)")
-            .min_height(66.0_f32)
-            .max_height(330.0_f32)
-            .style(|_theme: &iced::Theme, status| {
-                let is_focused = matches!(status, text_editor::Status::Focused { .. });
-                text_editor::Style {
-                    background: iced::Background::Color(theme::BG_ELEVATED),
-                    border: iced::Border {
-                        radius: 8.0.into(),
-                        width: if is_focused { 1.0 } else { 0.0 },
-                        color: if is_focused {
-                            theme::ACCENT
-                        } else {
-                            iced::Color::TRANSPARENT
-                        },
-                    },
-                    placeholder: theme::TEXT_MUTED,
-                    value: theme::TEXT_PRIMARY,
-                    selection: theme::ACCENT_DIM,
-                }
-            })
-            .key_binding(|key_press| {
-                // Intercept Cmd+Z / Cmd+Shift+Z — handled by keyboard subscription.
-                // Return None to prevent the default handler from processing
-                // (e.g. treating 'z' as an Insert character).
-                // On macOS, only Cmd+Z (not Ctrl+Z) triggers undo; Ctrl+Z is
-                // the terminal SUSP character and should insert 'z'.
-                let km = super::detect_keyboard_mods(key_press.modifiers);
-                let is_intercept_z = km.is_shortcut_platform_mod();
-                if is_intercept_z {
-                    if matches!(
-                        &key_press.key,
-                        keyboard::Key::Character(c) if c == "z"
-                    ) {
-                        return None;
-                    }
-                }
-                if key_press.key == keyboard::Key::Named(keyboard::key::Named::Enter)
-                    && !key_press.modifiers.shift()
-                {
-                    Some(text_editor::Binding::Custom(HomeMessage::SendMessage))
-                } else {
-                    text_editor::Binding::from_key_press(key_press)
-                }
-            });
-
-        let send_btn = button(
-            lucide::send::<iced::Theme, iced::Renderer>()
-                .size(14)
-                .color(if self.sending {
-                    theme::TEXT_MUTED
-                } else {
-                    theme::ACCENT
-                }),
-        )
-        .style(move |_t: &iced::Theme, status| {
-            use iced::widget::button;
-            let bg = match status {
-                button::Status::Hovered => theme::HOVER_STRONG,
-                button::Status::Pressed => theme::ACCENT_DIM,
-                _ => iced::Color::TRANSPARENT,
-            };
-            button::Style {
-                background: Some(iced::Background::Color(bg)),
-                border: iced::Border {
-                    radius: 6.0.into(),
-                    width: 0.0,
-                    color: iced::Color::TRANSPARENT,
-                },
-                ..button::Style::default()
-            }
-        })
-        .on_press_maybe(if self.sending {
-            None
-        } else {
-            Some(HomeMessage::SendMessage)
-        })
-        .padding(4);
-
-        // Stack the editor with the send button overlaid at bottom-right
-        let input_area = container(stack([
-            input_editor.into(),
-            container(send_btn)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(Alignment::End)
-                .align_y(Alignment::End)
-                .padding(iced::Padding::default().right(8.0).bottom(8.0))
-                .into(),
-        ]))
-        .padding(8)
-        .style(theme::base_container_style);
+        let input_area = super::widgets::chat_composer(
+            &self.editor_content,
+            HomeMessage::InputChanged,
+            HomeMessage::SendMessage,
+            "Type a message... (Enter to send, Shift+Enter for newline)",
+            self.sending,
+            66.0,
+            330.0,
+        );
 
         // ── Full layout ──────────────────────────────────────────
         column![chat_area, input_area,]
@@ -812,29 +733,12 @@ impl HomeState {
         // Keyboard shortcuts: Cmd+Z → undo, Cmd+Shift+Z → redo.
         // Also track modifier changes for shift+click text selection.
         subs.push(keyboard::listen().filter_map(|event| {
-            use keyboard::Event;
-            match event {
-                Event::ModifiersChanged(modifiers) => {
-                    Some(HomeMessage::ModifiersChanged(modifiers))
-                }
-                Event::KeyPressed {
-                    key,
-                    modifiers,
-                    physical_key,
-                    ..
-                } => {
-                    let km = super::detect_keyboard_mods(modifiers);
-                    // Cmd+Z / Ctrl+Z → undo.  Check shift first so Cmd+Shift+Z → redo.
-                    if km.is_shortcut_platform_mod() && key.to_latin(physical_key) == Some('z') {
-                        if modifiers.shift() {
-                            return Some(HomeMessage::Redo);
-                        }
-                        return Some(HomeMessage::Undo);
-                    }
-                    None
-                }
-                Event::KeyReleased { .. } => None,
-            }
+            super::common::composer_keyboard_event(
+                event,
+                HomeMessage::ModifiersChanged,
+                || HomeMessage::Undo,
+                || HomeMessage::Redo,
+            )
         }));
 
         // Reset keyboard modifiers when the window loses focus, preventing
@@ -863,10 +767,7 @@ impl HomeState {
                     return Task::none();
                 }
                 self.selected_user = Some(user.clone());
-                self.messages.clear();
-                self.seen_ids.clear();
-                self.history_loaded = false;
-                self.reset_pagination_state();
+                self.reset_chat_state();
 
                 Task::perform(
                     Self::resolve_user_workspace_sync(user, self.selected_workspace.clone()),
@@ -875,10 +776,7 @@ impl HomeState {
             }
             HomeMessage::WorkspaceChanged(ws_name) => {
                 self.selected_workspace.clone_from(&ws_name);
-                self.messages.clear();
-                self.seen_ids.clear();
-                self.history_loaded = false;
-                self.reset_pagination_state();
+                self.reset_chat_state();
 
                 // When a user is already selected, refresh history immediately.
                 // Otherwise defer — `ResolveUserSelected` will pick it up once
@@ -938,10 +836,7 @@ impl HomeState {
                 // Clear stale state now before loading history.
                 if self.pending_workspace_refresh {
                     self.pending_workspace_refresh = false;
-                    self.messages.clear();
-                    self.seen_ids.clear();
-                    self.history_loaded = false;
-                    self.reset_pagination_state();
+                    self.reset_chat_state();
                 }
                 self.refresh_history()
             }
@@ -1167,7 +1062,7 @@ impl HomeState {
                 // Prepend entries to the beginning of messages.
                 let mut prepended: Vec<DisplayMessage> = display_entries
                     .into_iter()
-                    .map(entry_to_display_message)
+                    .map(DisplayMessage::from)
                     .collect();
                 // Track seen_ids for the prepended messages.
                 for msg in &prepended {
@@ -1223,26 +1118,14 @@ impl HomeState {
     /// Construct and send the user's message through the GUI channel.
     fn send_message(&mut self) -> Task<HomeMessage> {
         let text = self.editor_content.text();
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return Task::none();
-        }
-
-        // Guard against double-sending (Enter key bypasses the button's
-        // on_press_maybe guard — see view() Send button construction).
-        if self.sending {
-            return Task::none();
-        }
-
-        // Reject messages that exceed the maximum character limit instead of
-        // silently truncating. The editor content is preserved so the user
-        // can edit it down.
-        if trimmed.chars().count() > MAX_INPUT_CHARS {
-            let count = trimmed.chars().count();
-            return Task::done(HomeMessage::Toast(ToastMessage::Warning(format!(
+        let trimmed = match super::common::send_guard(&text, self.sending, true, |count| {
+            Task::done(HomeMessage::Toast(ToastMessage::Warning(format!(
                 "Message too long: {count} characters (maximum {MAX_INPUT_CHARS}). Please shorten your message and try again."
-            ))));
-        }
+            ))))
+        }) {
+            Ok(t) => t,
+            Err(task) => return task,
+        };
 
         let content = trimmed.to_string();
 
@@ -1278,7 +1161,8 @@ impl HomeState {
         // Push optimistic message immediately so the user sees their own
         // message without waiting for the pipeline round-trip.
         if let Some(ref opt_id) = optimistic_id {
-            self.messages.push(build_chat_message(
+            self.messages.push(display_message(
+                None,
                 opt_id.clone(),
                 sender.clone(),
                 content.clone(),
@@ -1659,7 +1543,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_entry_to_display_message_user() {
+    fn test_display_message_from_user() {
         let entry = ChatHistoryEntry {
             id: 1,
             message_id: "msg-1".to_string(),
@@ -1668,7 +1552,7 @@ mod tests {
             direction: ChatDirection::User,
             agent_role: None,
         };
-        let msg = entry_to_display_message(entry);
+        let msg = DisplayMessage::from(entry);
 
         assert_eq!(msg.id, Some(1));
         assert_eq!(msg.direction, ChatDirection::User);
@@ -1681,7 +1565,7 @@ mod tests {
     }
 
     #[test]
-    fn test_entry_to_display_message_divider() {
+    fn test_display_message_divider() {
         let entry = ChatHistoryEntry {
             id: 42,
             message_id: "divider-1".to_string(),
@@ -1690,7 +1574,7 @@ mod tests {
             direction: ChatDirection::Divider,
             agent_role: None,
         };
-        let msg = entry_to_display_message(entry);
+        let msg = DisplayMessage::from(entry);
 
         assert_eq!(msg.id, Some(42));
         assert_eq!(msg.direction, ChatDirection::Divider);

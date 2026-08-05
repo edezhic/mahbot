@@ -1639,6 +1639,17 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
         .into()
 }
 
+/// Hint line for empty/loading ticket-list states.
+fn section_hint(label: &str) -> Element<'_, Message> {
+    column![
+        Space::new().height(8),
+        text(label).size(12).color(theme::TEXT_MUTED),
+    ]
+    .spacing(4)
+    .padding([8, 0])
+    .into()
+}
+
 /// Render the normal ticket list partitioned into groups (In Progress,
 /// Ready, Pending, Completed).
 fn render_normal_ticket_list(board_state: &board::BoardState) -> Element<'_, Message> {
@@ -1658,21 +1669,9 @@ fn render_normal_ticket_list(board_state: &board::BoardState) -> Element<'_, Mes
     let is_empty = pending.is_empty() && pipeline.is_empty() && completed.is_empty();
 
     if !board_state.load_state.has_loaded() {
-        column![
-            Space::new().height(8),
-            text("Loading…").size(12).color(theme::TEXT_MUTED),
-        ]
-        .spacing(4)
-        .padding([8, 0])
-        .into()
+        section_hint("Loading…")
     } else if is_empty {
-        column![
-            Space::new().height(8),
-            text("No tickets").size(12).color(theme::TEXT_MUTED),
-        ]
-        .spacing(4)
-        .padding([8, 0])
-        .into()
+        section_hint("No tickets")
     } else {
         let mut groups = Column::new().spacing(8);
         if !pinned.is_empty() {
@@ -1698,15 +1697,7 @@ fn render_normal_ticket_list(board_state: &board::BoardState) -> Element<'_, Mes
 /// Render FTS search results as ticket cards in a scrollable list.
 fn render_search_results(board_state: &board::BoardState) -> Element<'_, Message> {
     if board_state.search_results.is_empty() {
-        column![
-            Space::new().height(8),
-            text("No matching tickets")
-                .size(12)
-                .color(theme::TEXT_MUTED),
-        ]
-        .spacing(4)
-        .padding([8, 0])
-        .into()
+        section_hint("No matching tickets")
     } else {
         let mut cards = Column::new().spacing(2);
         for ticket in &board_state.search_results {
@@ -1828,25 +1819,25 @@ fn shutdown_subscription() -> impl futures_util::Stream<Item = Message> {
 
 /// Subscription that emits [`crate::audio::tts::TtsDownloadEvent`]s from the global
 /// TTS download broadcast channel, forwarded as [`Message::TtsDownloadEvent`].
+///
+/// Unlike the hand-rolled channel loop this replaces, an uninitialized
+/// `DOWNLOAD_EVENTS` source yields an empty stream instead of panicking
+/// (unreachable in practice — `tts::init_global` precedes GUI startup).
 fn tts_download_subscription()
 -> impl futures_util::Stream<Item = crate::audio::tts::TtsDownloadEvent> {
     use iced::futures::channel::mpsc;
-    iced::stream::channel(
+    common::broadcast_stream_producer(
         1,
-        |mut output: mpsc::Sender<crate::audio::tts::TtsDownloadEvent>| async move {
-            let mut rx = crate::audio::tts::subscribe_download_events();
-            loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        // Best-effort delivery: drop events if GUI channel is full
-                        let _ = output.try_send(event);
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Progress events were dropped — next event is current state
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        &crate::audio::tts::DOWNLOAD_EVENTS,
+        |output: &mut mpsc::Sender<crate::audio::tts::TtsDownloadEvent>,
+         event: Option<crate::audio::tts::TtsDownloadEvent>| {
+            Box::pin(async move {
+                // Best-effort delivery: drop events if the GUI channel is full;
+                // lagged progress slots are dropped (next event is current state).
+                if let Some(event) = event {
+                    let _ = output.try_send(event);
                 }
-            }
+            })
         },
     )
 }

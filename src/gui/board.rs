@@ -9,16 +9,14 @@ use crate::board::{Ticket, TicketPhase};
 use crate::git_commands::{parse_numstat_lines, run_git_output};
 
 use iced::widget::{
-    Column, Row, Space, button, column, container, markdown, row, scrollable, stack, text,
-    text_editor, tooltip,
+    Column, Row, Space, button, column, container, markdown, row, scrollable, text, text_editor,
+    tooltip,
 };
 use iced::{Alignment, Element, Length, Task, keyboard};
 
 use iced_fonts::lucide;
 
-/// Maximum characters allowed in a comment.
-const MAX_INPUT_CHARS: usize = 100_000;
-
+use super::common::MAX_INPUT_CHARS;
 use super::theme;
 use super::widget_helpers;
 use super::widgets::{diff_stats_row, selectable_text};
@@ -237,27 +235,13 @@ impl BoardState {
         // comment input, and handle Cmd+Z / Cmd+Shift+Z for undo/redo,
         // mirroring the Home chat input pattern.
         use iced::keyboard;
-        keyboard::listen().filter_map(|event| match event {
-            keyboard::Event::ModifiersChanged(modifiers) => {
-                Some(BoardMessage::CommentModifiersChanged(modifiers))
-            }
-            keyboard::Event::KeyPressed {
-                key,
-                modifiers,
-                physical_key,
-                ..
-            } => {
-                let km = super::detect_keyboard_mods(modifiers);
-                // Cmd+Z / Ctrl+Z → undo.  Check shift first so Cmd+Shift+Z → redo.
-                if km.is_shortcut_platform_mod() && key.to_latin(physical_key) == Some('z') {
-                    if modifiers.shift() {
-                        return Some(BoardMessage::Redo);
-                    }
-                    return Some(BoardMessage::Undo);
-                }
-                None
-            }
-            keyboard::Event::KeyReleased { .. } => None,
+        keyboard::listen().filter_map(|event| {
+            super::common::composer_keyboard_event(
+                event,
+                BoardMessage::CommentModifiersChanged,
+                || BoardMessage::Undo,
+                || BoardMessage::Redo,
+            )
         })
     }
 
@@ -596,26 +580,16 @@ impl BoardState {
             }
             BoardMessage::SendComment => {
                 let text = self.comment_input.text();
-                let trimmed = text.trim().to_string();
-
-                if trimmed.is_empty() {
-                    return Task::none();
-                }
-
-                // Reject messages that exceed the maximum character limit.
-                if trimmed.chars().count() > MAX_INPUT_CHARS {
-                    let count = trimmed.chars().count();
-                    return Task::done(BoardMessage::Toast(super::ToastMessage::Warning(format!(
-                        "Comment too long: {count} characters (maximum {MAX_INPUT_CHARS}). \
-                             Please shorten your comment."
-                    ))));
-                }
-
-                // Guard against double-send (Enter key bypasses the button's
-                // on_press_maybe guard).
-                if self.sending_comment {
-                    return Task::none();
-                }
+                let trimmed =
+                    match super::common::send_guard(&text, self.sending_comment, false, |count| {
+                        Task::done(BoardMessage::Toast(super::ToastMessage::Warning(format!(
+                            "Comment too long: {count} characters (maximum {MAX_INPUT_CHARS}). \
+                                 Please shorten your comment."
+                        ))))
+                    }) {
+                        Ok(t) => t.to_string(),
+                        Err(task) => return task,
+                    };
 
                 let Some(ref user_name) = self.current_user_name else {
                     return Task::done(BoardMessage::Toast(super::ToastMessage::Warning(
@@ -1470,101 +1444,15 @@ impl BoardState {
     /// Render the comment input widget (text editor + send button) pinned at
     /// the bottom of the ticket detail modal.
     fn render_comment_input(&self) -> Element<'_, BoardMessage> {
-        let input_editor = text_editor(&self.comment_input)
-            .on_action(BoardMessage::CommentInputChanged)
-            .placeholder("Add a comment… (Enter to send, Shift+Enter for newline)")
-            .min_height(44.0_f32)
-            .max_height(132.0_f32)
-            .style(|_theme: &iced::Theme, status| {
-                let is_focused = matches!(status, text_editor::Status::Focused { .. });
-                text_editor::Style {
-                    background: iced::Background::Color(theme::BG_ELEVATED),
-                    border: iced::Border {
-                        radius: 8.0.into(),
-                        width: if is_focused { 1.0 } else { 0.0 },
-                        color: if is_focused {
-                            theme::ACCENT
-                        } else {
-                            iced::Color::TRANSPARENT
-                        },
-                    },
-                    placeholder: theme::TEXT_MUTED,
-                    value: theme::TEXT_PRIMARY,
-                    selection: theme::ACCENT_DIM,
-                }
-            })
-            .key_binding(|key_press| {
-                // Return None for Cmd+Z / Cmd+Shift+Z so the key event is
-                // NOT consumed by the text_editor's default handler (which
-                // would treat 'z' as an Insert character). The keyboard
-                // subscription in subscription() catches the event and
-                // emits BoardMessage::Undo / BoardMessage::Redo.
-                let km = super::detect_keyboard_mods(key_press.modifiers);
-                let is_intercept_z = km.is_shortcut_platform_mod();
-                if is_intercept_z {
-                    if matches!(
-                        &key_press.key,
-                        keyboard::Key::Character(c) if c == "z"
-                    ) {
-                        return None;
-                    }
-                }
-                if key_press.key == keyboard::Key::Named(keyboard::key::Named::Enter)
-                    && !key_press.modifiers.shift()
-                {
-                    Some(text_editor::Binding::Custom(BoardMessage::SendComment))
-                } else {
-                    text_editor::Binding::from_key_press(key_press)
-                }
-            });
-
-        let send_btn = button(
-            lucide::send::<iced::Theme, iced::Renderer>()
-                .size(14)
-                .color(if self.sending_comment {
-                    theme::TEXT_MUTED
-                } else {
-                    theme::ACCENT
-                }),
-        )
-        .style(move |_t: &iced::Theme, status| {
-            use iced::widget::button;
-            let bg = match status {
-                button::Status::Hovered => theme::HOVER_STRONG,
-                button::Status::Pressed => theme::ACCENT_DIM,
-                _ => iced::Color::TRANSPARENT,
-            };
-            button::Style {
-                background: Some(iced::Background::Color(bg)),
-                border: iced::Border {
-                    radius: 6.0.into(),
-                    width: 0.0,
-                    color: iced::Color::TRANSPARENT,
-                },
-                ..button::Style::default()
-            }
-        })
-        .on_press_maybe(if self.sending_comment {
-            None
-        } else {
-            Some(BoardMessage::SendComment)
-        })
-        .padding(4);
-
-        container(
-            container(stack([
-                input_editor.into(),
-                container(send_btn)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .align_x(Alignment::End)
-                    .align_y(Alignment::End)
-                    .padding(iced::Padding::default().right(8.0).bottom(8.0))
-                    .into(),
-            ]))
-            .padding(8)
-            .style(theme::base_container_style),
-        )
+        container(super::widgets::chat_composer(
+            &self.comment_input,
+            BoardMessage::CommentInputChanged,
+            BoardMessage::SendComment,
+            "Add a comment… (Enter to send, Shift+Enter for newline)",
+            self.sending_comment,
+            44.0,
+            132.0,
+        ))
         .width(Length::Fill)
         .into()
     }

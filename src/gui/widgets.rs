@@ -5,14 +5,17 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
+use iced::keyboard;
 use iced::widget::{
-    self, Row, Space, button, column, container, pick_list, scrollable, text, text_input,
+    self, Row, Space, button, column, container, pick_list, scrollable, stack, text, text_editor,
+    text_input,
 };
 use iced::{Alignment, Color, Element, Length, Padding, Task};
 
 use iced_selection;
 
 use super::theme;
+use iced_fonts::lucide;
 
 /// An option for [`fn@pick_list`] with separate value and display label.
 ///
@@ -124,6 +127,111 @@ pub fn selectable_text<'a>(
         color: Some(color),
         ..Default::default()
     })
+}
+
+/// Shared chat composer: text editor with Enter-to-send and Cmd+Z intercept,
+/// a floating send button, and the overlay stack. `on_action`/`send_msg`
+/// parameterize the page's messages; callers supply the placeholder, editor
+/// min/max heights, and the sending flag.
+#[must_use]
+pub fn chat_composer<'a, M: Clone + 'a>(
+    content: &'a text_editor::Content,
+    on_action: impl Fn(text_editor::Action) -> M + 'a,
+    send_msg: M,
+    placeholder: &'a str,
+    sending: bool,
+    min_height: f32,
+    max_height: f32,
+) -> Element<'a, M> {
+    let send_msg_btn = send_msg.clone();
+    let input_editor = text_editor(content)
+        .on_action(on_action)
+        .placeholder(placeholder)
+        .min_height(min_height)
+        .max_height(max_height)
+        .style(|_theme: &iced::Theme, status| {
+            let is_focused = matches!(status, text_editor::Status::Focused { .. });
+            text_editor::Style {
+                background: iced::Background::Color(theme::BG_ELEVATED),
+                border: iced::Border {
+                    radius: 8.0.into(),
+                    width: if is_focused { 1.0 } else { 0.0 },
+                    color: if is_focused {
+                        theme::ACCENT
+                    } else {
+                        iced::Color::TRANSPARENT
+                    },
+                },
+                placeholder: theme::TEXT_MUTED,
+                value: theme::TEXT_PRIMARY,
+                selection: theme::ACCENT_DIM,
+            }
+        })
+        .key_binding(move |key_press| {
+            // Intercept Cmd+Z / Cmd+Shift+Z — handled by the keyboard
+            // subscription; on macOS only Cmd+Z triggers undo (Ctrl+Z is the
+            // terminal SUSP character and should insert 'z').
+            let km = super::detect_keyboard_mods(key_press.modifiers);
+            if km.is_shortcut_platform_mod()
+                && matches!(
+                    &key_press.key,
+                    keyboard::Key::Character(c) if c == "z"
+                )
+            {
+                return None;
+            }
+            if key_press.key == keyboard::Key::Named(keyboard::key::Named::Enter)
+                && !key_press.modifiers.shift()
+            {
+                Some(text_editor::Binding::Custom(send_msg.clone()))
+            } else {
+                text_editor::Binding::from_key_press(key_press)
+            }
+        });
+
+    let send_btn = button(
+        lucide::send::<iced::Theme, iced::Renderer>()
+            .size(14)
+            .color(if sending {
+                theme::TEXT_MUTED
+            } else {
+                theme::ACCENT
+            }),
+    )
+    .style(move |_t: &iced::Theme, status| {
+        use iced::widget::button;
+        let bg = match status {
+            button::Status::Hovered => theme::HOVER_STRONG,
+            button::Status::Pressed => theme::ACCENT_DIM,
+            _ => iced::Color::TRANSPARENT,
+        };
+        button::Style {
+            background: Some(iced::Background::Color(bg)),
+            border: iced::Border {
+                radius: 6.0.into(),
+                width: 0.0,
+                color: iced::Color::TRANSPARENT,
+            },
+            ..button::Style::default()
+        }
+    })
+    .on_press_maybe(if sending { None } else { Some(send_msg_btn) })
+    .padding(4);
+
+    // Stack the editor with the send button overlaid at bottom-right.
+    container(stack([
+        input_editor.into(),
+        container(send_btn)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::End)
+            .align_y(Alignment::End)
+            .padding(iced::Padding::default().right(8.0).bottom(8.0))
+            .into(),
+    ]))
+    .padding(8)
+    .style(theme::base_container_style)
+    .into()
 }
 
 /// Render formatted diff stats (+X/−Y) matching ticket card style.
