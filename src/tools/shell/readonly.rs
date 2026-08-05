@@ -2181,19 +2181,17 @@ fn scan_substitutions(s: &str, state: &mut ValidationState) -> Result<(), String
     Ok(())
 }
 
-/// Find the matching close paren for a `$(` substitution whose content starts
-/// at byte `start`. Quote-aware and nesting-aware: every unquoted paren counts
-/// (the second `(` of a `$((` arithmetic span, subshell parens, and nested
-/// `$(` all nest), so `$(( (a) * (b) ))` and `$( (echo hi) )` end at the
-/// correct close. Returns `(content, index_after_close)`. When unterminated,
-/// the rest of the string is returned as content (it still gets validated —
-/// fail-closed).
-fn find_substitution_end(s: &str, start: usize) -> (&str, usize) {
-    let mut depth = 1usize;
+/// Scan from byte `from` for the close paren that brings `initial_depth` to 0.
+/// Quote- and escape-aware (via track_char_context); every unquoted paren
+/// nests — `$((` arithmetic spans, subshell parens, and nested `$(` alike —
+/// so `$(( (a) * (b) ))` and `$( (echo hi) )` close correctly. Returns the
+/// byte index AFTER the closing paren, or None when unterminated (fail-closed).
+fn find_paren_close(s: &str, from: usize, initial_depth: usize) -> Option<usize> {
+    let mut depth = initial_depth;
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
-    let mut i = start;
+    let mut i = from;
     while i < s.len() {
         let c = s[i..].chars().next().expect("i < s.len()");
         if !super::track_char_context(c, &mut in_single, &mut in_double, &mut escaped) {
@@ -2205,42 +2203,28 @@ fn find_substitution_end(s: &str, start: usize) -> (&str, usize) {
         } else if c == ')' {
             depth -= 1;
             if depth == 0 {
-                return (&s[start..i], i + 1);
+                return Some(i + 1);
             }
         }
         i += c.len_utf8();
     }
-    (&s[start..], s.len())
+    None
+}
+
+/// Find the matching close paren for a `$(` substitution whose content starts
+/// at byte `start`. Returns `(content, index_after_close)`; unterminated
+/// substitutions return the rest as content (still validated — fail-closed).
+fn find_substitution_end(s: &str, start: usize) -> (&str, usize) {
+    match find_paren_close(s, start, 1) {
+        Some(end) => (&s[start..end - 1], end),
+        None => (&s[start..], s.len()),
+    }
 }
 
 /// Skip a bare `((...))` arithmetic span whose first `(` is at byte `i`.
 /// Returns the index after the closing `))`, or `s.len()` when unterminated.
-/// Quote-aware and paren-nesting-aware (`(( (a+b) * (c+d) ))`).
 fn find_arithmetic_end(s: &str, i: usize) -> usize {
-    let mut depth = 2usize;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-    let mut j = i + 2;
-    while j < s.len() {
-        let c = s[j..].chars().next().expect("j < s.len()");
-        if !super::track_char_context(c, &mut in_single, &mut in_double, &mut escaped) {
-            j += c.len_utf8();
-            continue;
-        }
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return j + 1;
-                }
-            }
-            _ => {}
-        }
-        j += c.len_utf8();
-    }
-    s.len()
+    find_paren_close(s, i + 2, 2).unwrap_or(s.len())
 }
 
 /// Find the closing backtick for a command substitution starting at byte
