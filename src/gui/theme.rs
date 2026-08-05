@@ -443,6 +443,31 @@ pub fn button_transparent(
     }
 }
 
+/// Tab-button style for editor/shell tab bars: active tabs use [`BG_ELEVATED`],
+/// hovered [`HOVER`], otherwise [`BG_SURFACE`], with a zero-radius border.
+pub fn tab_button_style(
+    is_active: bool,
+) -> impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style {
+    move |_: &iced::Theme, status| {
+        let bg = if is_active {
+            BG_ELEVATED
+        } else if status == iced::widget::button::Status::Hovered {
+            HOVER
+        } else {
+            BG_SURFACE
+        };
+        iced::widget::button::Style {
+            background: Some(Background::Color(bg)),
+            border: iced::Border {
+                radius: 0.0.into(),
+                width: 0.0,
+                color: Color::TRANSPARENT,
+            },
+            ..Default::default()
+        }
+    }
+}
+
 /// Primary action button (Save, Submit, Confirm). Uses Flexoki accent green.
 #[must_use]
 pub fn button_primary(

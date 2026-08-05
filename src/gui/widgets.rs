@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use iced::keyboard;
 use iced::widget::{
-    self, Row, Space, button, column, container, pick_list, scrollable, stack, text, text_editor,
-    text_input,
+    self, Row, Space, button, column, container, pick_list, row, scrollable, stack, text,
+    text_editor, text_input,
 };
 use iced::{Alignment, Color, Element, Length, Padding, Task};
 
@@ -132,6 +132,48 @@ pub fn selectable_text<'a>(
         color: Some(color),
         ..Default::default()
     })
+}
+
+/// Close button for editor/shell tab bars: a 12px lucide X colored by tab
+/// active state (secondary vs faint text).
+#[must_use]
+pub fn tab_close_button<'a, Message: Clone + 'a>(
+    is_active: bool,
+    on_press: Message,
+) -> widget::Button<'a, Message> {
+    widget::button(
+        lucide::x::<iced::Theme, iced::Renderer>()
+            .size(12)
+            .color(if is_active {
+                theme::TEXT_SECONDARY
+            } else {
+                theme::TEXT_FAINT
+            }),
+    )
+    .on_press(on_press)
+    .style(theme::button_transparent)
+    .padding(0)
+}
+
+/// Wrap a tab strip in the shared scrollable + surface-container chrome.
+/// `scroll_id` is optional — the editor passes one for scroll-to-active-tab.
+#[must_use]
+pub fn tab_scrollable<'a, Message: 'a>(
+    tab_buttons: Vec<Element<'a, Message>>,
+    scroll_id: Option<widget::Id>,
+) -> Element<'a, Message> {
+    let mut sc = scrollable(row(tab_buttons).spacing(0).width(Length::Fill))
+        .direction(theme::horizontal_scrollbar())
+        .style(theme::scrollbar_style)
+        .width(Length::Fill)
+        .height(Length::Shrink);
+    if let Some(id) = scroll_id {
+        sc = sc.id(id);
+    }
+    container(sc)
+        .style(theme::surface_container_style)
+        .width(Length::Fill)
+        .into()
 }
 
 /// Shared chat composer: text editor with Enter-to-send and Cmd+Z intercept,

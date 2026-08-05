@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{Space, button, column, container, row, text, text_input};
 use iced::{
     Alignment, Element, Length, Subscription, Task,
     keyboard::{self},
@@ -4886,7 +4886,6 @@ impl EditorState {
         col.height(Length::Fill).into()
     }
 
-    #[allow(clippy::too_many_lines)]
     fn build_tab_bar(&self) -> Element<'_, EditorMessage> {
         let mut tab_buttons: Vec<Element<'_, EditorMessage>> = Vec::new();
 
@@ -4912,43 +4911,18 @@ impl EditorState {
             };
             let name_text = text(&tab.file_name).size(12).color(name_color);
 
-            let close_btn = button(lucide::x::<iced::Theme, iced::Renderer>().size(12).color(
-                if is_active {
-                    theme::TEXT_SECONDARY
-                } else {
-                    theme::TEXT_FAINT
-                },
-            ))
-            .on_press(EditorMessage::TabClosed(i))
-            .style(theme::button_transparent)
-            .padding(0);
-
             let mut tab_row = row![].spacing(2).align_y(Alignment::Center);
             if let Some(dot) = dirty_dot {
                 tab_row = tab_row.push(dot);
             }
-            tab_row = tab_row.push(name_text).push(close_btn);
+            tab_row = tab_row.push(name_text).push(widgets::tab_close_button(
+                is_active,
+                EditorMessage::TabClosed(i),
+            ));
 
             let tab_btn = button(tab_row.padding([8, 8]))
                 .on_press(EditorMessage::TabSelected(i))
-                .style(move |_t: &iced::Theme, status| {
-                    let bg = if is_active {
-                        theme::BG_ELEVATED
-                    } else if status == button::Status::Hovered {
-                        theme::HOVER
-                    } else {
-                        theme::BG_SURFACE
-                    };
-                    button::Style {
-                        background: Some(iced::Background::Color(bg)),
-                        border: iced::Border {
-                            radius: 0.0.into(),
-                            width: 0.0,
-                            color: iced::Color::TRANSPARENT,
-                        },
-                        ..Default::default()
-                    }
-                })
+                .style(theme::tab_button_style(is_active))
                 .padding(0);
 
             let tab_abs_path = tab.path.clone();
@@ -4982,19 +4956,7 @@ impl EditorState {
             tab_buttons.push(ctx_menu.into());
         }
 
-        let scrollable_content = row(tab_buttons).spacing(0).width(Length::Fill);
-
-        container(
-            scrollable(scrollable_content)
-                .id(self.tab_scroll_id.clone())
-                .direction(theme::horizontal_scrollbar())
-                .style(theme::scrollbar_style)
-                .width(Length::Fill)
-                .height(Length::Shrink),
-        )
-        .style(theme::surface_container_style)
-        .width(Length::Fill)
-        .into()
+        widgets::tab_scrollable(tab_buttons, Some(self.tab_scroll_id.clone()))
     }
 
     fn build_find_replace_bar(&self) -> Option<Element<'_, EditorMessage>> {

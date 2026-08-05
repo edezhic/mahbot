@@ -9,13 +9,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use iced::widget::{Space, button, column, container, row, scrollable, text};
+use iced::widget::{Space, button, column, container, row, text};
 use iced::{Alignment, Element, Length, Size, Subscription, Task};
 use iced_fonts::lucide;
 use iced_term::{BackendCommand, TerminalView};
 
 use super::context_menu::{ContextMenu, MenuItem};
 use super::theme;
+use super::widgets;
 
 // ── Constants ─────────────────────────────────────────────────────────
 
@@ -335,42 +336,17 @@ impl ShellState {
             };
             let name_text = text(&tab.label).size(12).color(name_color);
 
-            let close_btn = button(lucide::x::<iced::Theme, iced::Renderer>().size(12).color(
-                if is_active {
-                    theme::TEXT_SECONDARY
-                } else {
-                    theme::TEXT_FAINT
-                },
-            ))
-            .on_press(ShellMessage::TabClosed(i))
-            .style(theme::button_transparent)
-            .padding(0);
-
-            let tab_row = row![name_text, close_btn]
-                .spacing(2)
-                .align_y(Alignment::Center)
-                .padding([8, 8]);
+            let tab_row = row![
+                name_text,
+                widgets::tab_close_button(is_active, ShellMessage::TabClosed(i))
+            ]
+            .spacing(2)
+            .align_y(Alignment::Center)
+            .padding([8, 8]);
 
             let tab_btn = button(tab_row)
                 .on_press(ShellMessage::TabSelected(i))
-                .style(move |_t: &iced::Theme, status| {
-                    let bg = if is_active {
-                        theme::BG_ELEVATED
-                    } else if status == button::Status::Hovered {
-                        theme::HOVER
-                    } else {
-                        theme::BG_SURFACE
-                    };
-                    button::Style {
-                        background: Some(iced::Background::Color(bg)),
-                        border: iced::Border {
-                            radius: 0.0.into(),
-                            width: 0.0,
-                            color: iced::Color::TRANSPARENT,
-                        },
-                        ..Default::default()
-                    }
-                })
+                .style(theme::tab_button_style(is_active))
                 .padding(0);
 
             tab_buttons.push(tab_btn.into());
@@ -387,19 +363,7 @@ impl ShellState {
 
         tab_buttons.push(new_tab_btn.into());
 
-        let scrollable_content = row(tab_buttons).spacing(0).width(Length::Fill);
-
-        container(
-            scrollable(scrollable_content)
-                .direction(theme::horizontal_scrollbar())
-                .style(theme::scrollbar_style)
-                .width(Length::Fill)
-                .height(Length::Shrink),
-        )
-        .style(theme::surface_container_style)
-        .width(Length::Fill)
-        .height(Length::Shrink)
-        .into()
+        widgets::tab_scrollable(tab_buttons, None)
     }
 
     // ── Update ───────────────────────────────────────────────────────
