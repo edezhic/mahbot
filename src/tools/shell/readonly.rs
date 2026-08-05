@@ -2889,7 +2889,7 @@ fn check_segment(segment: &str, state: &mut ValidationState, negated: bool) -> R
     let words: Vec<&str> = split_words_keeping_substitutions(trimmed);
     let (verb_idx, verb) = match resolve_verb(&words, negated) {
         VerbResolution::Informational | VerbResolution::None => {
-            apply_env_bindings(trimmed, state, negated);
+            apply_env_bindings(trimmed, state, negated)?;
             return Ok(());
         }
         VerbResolution::Verb {
@@ -2908,7 +2908,7 @@ fn check_segment(segment: &str, state: &mut ValidationState, negated: bool) -> R
                     "write the command name literally (e.g. `cd`, `rm`) so it can be validated.",
                 );
             }
-            apply_env_bindings(trimmed, state, negated);
+            apply_env_bindings(trimmed, state, negated)?;
             return Ok(());
         }
         VerbResolution::Verb {
@@ -2938,7 +2938,7 @@ fn check_segment(segment: &str, state: &mut ValidationState, negated: bool) -> R
     // `export X=...`, plain `X=...` segments, and env-prefix forms
     // (`TMPDIR=/tmp cmd`) bind the temp variables; a non-temp binding poisons
     // the variable, a temp-root binding clears the poison.
-    apply_env_bindings(trimmed, state, negated);
+    apply_env_bindings(trimmed, state, negated)?;
 
     // Extract the effective command by stripping shell prefixes and
     // environment variable assignments.
@@ -3294,13 +3294,42 @@ fn record_mkdir_targets(segment: &str, state: &mut ValidationState) {
 /// `"TMPDIR"=/etc` bind by their unquoted name). Non-forwarding prefixes
 /// (`env export`, `sudo export`) run in a child shell — the export never
 /// reaches the parent, so nothing binds there.
-fn apply_env_bindings(segment: &str, state: &mut ValidationState, negated: bool) {
+/// Reject `GIT_*` env bindings (quote-stripped) except the documented
+/// `GIT_PAGER` carve-out — git only paginates on a TTY and the shell tool
+/// captures via pipes, so a pager binding can never spawn. Covers
+/// GIT_EXTERNAL_DIFF, GIT_SSH_COMMAND, GIT_CONFIG_*, GIT_DIR, GIT_EXEC_PATH,
+/// GIT_TRACE*, GIT_ASKPASS — all invisible to the subcommand allowlist.
+/// Also fires on non-git commands (`GIT_DIR=/tmp ls`): fail-closed trade-off
+/// closing transitive git invocation (make/cargo inheriting GIT_*).
+fn check_git_env_binding(segment: &str, word: &str) -> Result<(), String> {
+    let w = strip_outer_quotes(word).map_or(word, |(c, _)| c);
+    if let Some((name, _)) = w.split_once('=')
+        && name.starts_with("GIT_")
+        && name != "GIT_PAGER"
+    {
+        return reject(
+            segment,
+            &format!(
+                "`{name}` environment bindings are not allowed — git env vars can execute programs (GIT_EXTERNAL_DIFF, GIT_SSH_COMMAND, ...)."
+            ),
+            "run git without GIT_* environment assignments.",
+        );
+    }
+    Ok(())
+}
+
+fn apply_env_bindings(
+    segment: &str,
+    state: &mut ValidationState,
+    negated: bool,
+) -> Result<(), String> {
     let words = split_words_keeping_substitutions(segment);
     let first_non_assign = words
         .iter()
         .position(|w| !super::is_env_assignment(w))
         .unwrap_or(words.len());
     for w in &words[..first_non_assign] {
+        check_git_env_binding(segment, w)?;
         bind_assignment_word(w, state);
     }
     // The verb search uses the full word list (not the assignment-stripped
@@ -3314,9 +3343,11 @@ fn apply_env_bindings(segment: &str, state: &mut ValidationState, negated: bool)
         && v == "export"
     {
         for w in &words[idx + 1..] {
+            check_git_env_binding(segment, w)?;
             bind_assignment_word(w, state);
         }
     }
+    Ok(())
 }
 
 /// Bind a single `NAME=value` assignment word, stripping balanced surrounding
@@ -3817,11 +3848,144 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
     }
 }
 
+/// Reject git invocations that can execute programs via flag/config/env
+/// channels invisible to the subcommand allowlist. Runs FIRST in
+/// [`check_git_segment`] — before [`check_git_read_only_extensions`], whose
+/// allowlisted forms (`git stash show --textconv`, `git push --dry-run
+/// --exec=`) would otherwise bypass the scan. Fail-closed: repo-redirect
+/// globals (`-C`/`--git-dir`/`--work-tree`) are rejected too, so an
+/// agent-written hostile repo config cannot be reached.
+fn check_git_exec_vectors(trimmed: &str, subcommand: &str) -> Result<(), String> {
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    let Some(git_idx) = super::find_first_command_word_index(&words) else {
+        return Ok(());
+    };
+    // Env bindings before `git` — catches `env`/`sudo`-wrapped forms that the
+    // binding layer (which only sees current-shell segments) cannot.
+    for w in &words[..git_idx] {
+        if super::is_env_assignment(w) {
+            check_git_env_binding(trimmed, w)?;
+        }
+    }
+    // Global-region flags between `git` and the subcommand. Position-sensitive:
+    // `git log -c` / `git diff -c` (combined diff) live in the subcommand
+    // region and stay allowed. `-c` injects config that executes programs;
+    // `-C` redirects the repo (attached/clustered forms `-cfoo`, `-pc`, `-pC`
+    // included). Long globals redirect the repo or inject config.
+    let sub_idx = words.len() - subcommand.split_whitespace().count();
+    for w in &words[git_idx + 1..sub_idx] {
+        let wq = shell_word(w);
+        if wq.starts_with('-') && !wq.starts_with("--") && wq[1..].contains(['c', 'C']) {
+            return reject(
+                trimmed,
+                "`-c`/`-C` git global options are not allowed in read-only mode — they inject config or redirect the repository, both of which can execute programs.",
+                "run git without global `-c`/`-C` options (use `cd` to change directory).",
+            );
+        }
+        for opt in [
+            "--git-dir",
+            "--work-tree",
+            "--config-env",
+            "--config-file",
+            "--exec-path",
+        ] {
+            if wq == opt || wq.starts_with(&format!("{opt}=")) {
+                return reject(
+                    trimmed,
+                    &format!(
+                        "`{opt}` is not allowed in read-only mode — it redirects the repository or injects config, enabling program execution."
+                    ),
+                    "run git against the workspace repository without repo-redirect or config-injection options.",
+                );
+            }
+        }
+    }
+    check_git_exec_flags(trimmed, &words)?;
+    check_git_scoped_flags(trimmed, subcommand, &words)
+}
+
+/// Exact-token exec-flag blocks applied across the whole command (fail-closed:
+/// a `--`-separated pathname literally named like a flag is rejected too).
+/// `--no-*` disabling forms stay allowed. ANSI-C `$'...\...'` spans (standalone
+/// or embedded like `--format=$'%h\t%s'`) are unprovable flag candidates —
+/// same contract as [`is_unprovable_flag_token`].
+fn check_git_exec_flags(trimmed: &str, words: &[&str]) -> Result<(), String> {
+    for w in words {
+        if w.contains("$'") && w.contains('\\') {
+            return reject(
+                trimmed,
+                "ANSI-C quoted git arguments with backslash escapes cannot be proven safe.",
+                "write git flags and arguments literally.",
+            );
+        }
+        let wq = shell_word(w);
+        // `git grep -e '--ext-diff'` (literal pattern) is over-rejected too —
+        // accepted fail-closed asymmetry with the spared `--regexp=` form.
+        for flag in [
+            "--ext-diff",
+            "--textconv",
+            "--show-signature",
+            "--filters",
+            "--upload-pack",
+            "--exec",
+        ] {
+            if wq == flag || wq.starts_with(&format!("{flag}=")) {
+                return reject(
+                    trimmed,
+                    &format!(
+                        "`{flag}` is not allowed in read-only mode — it executes external programs."
+                    ),
+                    "drop the flag; the corresponding git feature stays disabled without it.",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Subcommand-scoped exec flags. `-O`/`--open-files-in-pager` (grep only:
+/// runs the program per matched file — `git log -O<orderfile>` is a benign
+/// file read, `grep -o`/`-c`/`-C3` are only-matching) and `--web`/`-w` (help
+/// only: launches a browser — `git diff -w` is ignore-whitespace).
+/// Case-sensitive short-flag matches: uppercase `O`, lowercase `w`.
+fn check_git_scoped_flags(trimmed: &str, subcommand: &str, words: &[&str]) -> Result<(), String> {
+    let base = subcommand.split_whitespace().next().unwrap_or("");
+    for w in words {
+        let wq = shell_word(w);
+        let is_scoped = match base {
+            "grep" => {
+                wq.starts_with("--open-files-in-pager")
+                    || (wq.starts_with('-') && !wq.starts_with("--") && wq[1..].contains('O'))
+            }
+            "help" => {
+                wq.starts_with("--web")
+                    || (wq.starts_with('-') && !wq.starts_with("--") && wq[1..].contains('w'))
+            }
+            _ => false,
+        };
+        if is_scoped {
+            return reject(
+                trimmed,
+                &format!(
+                    "`{wq}` on `git {base}` is not allowed in read-only mode — it runs an external program."
+                ),
+                "drop the flag.",
+            );
+        }
+    }
+    Ok(())
+}
+
 fn check_git_segment(segment: &str) -> Result<(), String> {
     let trimmed = segment.trim();
 
     // Extract the git subcommand by skipping "git" and global flags
     let subcommand = extract_git_subcommand(trimmed);
+
+    // Exec-vector scan FIRST — before the extension allowlist and the
+    // empty-subcommand early return (`git --git-dir=/tmp/evil` bare still
+    // rejects the repo redirect).
+    check_git_exec_vectors(trimmed, &subcommand)?;
 
     if subcommand.is_empty() || subcommand == "git" {
         return Ok(());
@@ -4002,14 +4166,17 @@ fn extract_git_subcommand(segment: &str) -> String {
 
     // Skip shell prefixes, env assignments, and flags to find "git"
     // (e.g., GIT_DIR=/tmp git push, sudo git push, env git push). A
-    // balanced-quoted `"git"` is the same command (normalized).
+    // balanced-quoted `"git"` is the same command (normalized). Basename
+    // match so `/usr/bin/git push` can't bypass the git allowlist
+    // (mirrors `first_command_word`).
     let git_idx = super::find_first_command_word_index(&words);
-    if git_idx
-        .is_none_or(|idx| strip_outer_quotes(words[idx]).map_or(words[idx], |(c, _)| c) != "git")
-    {
+    let Some(git_idx) = git_idx else {
+        return String::new();
+    };
+    let git_word = strip_outer_quotes(words[git_idx]).map_or(words[git_idx], |(c, _)| c);
+    if git_word.rsplit('/').next().unwrap_or("") != "git" {
         return String::new();
     }
-    let git_idx = git_idx.unwrap();
 
     // Use shared helper to skip git global flags and other flags,
     // then take all remaining words as the subcommand verbatim.
@@ -4172,7 +4339,7 @@ fn output_flag_value<'a>(
 /// Approximate the argv word sed receives after shell parsing: `$'...'`/`$"..."`
 /// drop the `$`, then all quotes and backslashes are removed
 /// (`\'` → `'`, `\i` → `i`, `'-i'x` → `-ix`). Tokens whose escape semantics
-/// cannot be resolved this way are handled by [`is_unprovable_inplace_flag`].
+/// cannot be resolved this way are handled by [`is_unprovable_flag_token`].
 fn shell_word(word: &str) -> String {
     let word = word
         .strip_prefix('$')
@@ -4183,12 +4350,13 @@ fn shell_word(word: &str) -> String {
 
 /// `$'...'`/`$"..."` tokens with backslash escapes are unprovable: escape
 /// semantics are shell/version-dependent (`$'\x2di'` → `-i`), so treat them
-/// as in-place flag candidates — mirroring [`classify_verb_word`]'s Unprovable
-/// verdict for `$`/`\`-words. Over-rejects `$'\\x2di'`/`$"\x2di"` (delivered as
-/// literal backslashes), an accepted fail-closed contract. `${...}`/`$var` are
-/// deliberately not treated as unprovable: they also appear in legit read-only
-/// scripts (`sed "s/a/$var/" file`), and their values are not decodable anyway.
-fn is_unprovable_inplace_flag(part: &str) -> bool {
+/// as unprovable flag candidates — mirroring [`classify_verb_word`]'s
+/// Unprovable verdict for `$`/`\`-words. Used by the sed in-place gate and
+/// the git exec-vector scan (`git log --format=$'%h\t%s'` is over-rejected,
+/// an accepted fail-closed contract). `${...}`/`$var` are deliberately not
+/// treated as unprovable: they also appear in legit read-only scripts
+/// (`sed "s/a/$var/" file`), and their values are not decodable anyway.
+fn is_unprovable_flag_token(part: &str) -> bool {
     (part.starts_with("$'") || part.starts_with("$\"")) && part.contains('\\')
 }
 
@@ -4205,12 +4373,12 @@ fn has_sed_mutation(command: &str, state: &ValidationState) -> bool {
     // operands literally named like a flag (`sed -- -info.txt`) are
     // rejected too. Tokens are normalized as the shell delivers them
     // ([`shell_word`]), and `$'...'`/`$"..."` tokens with escapes are
-    // unprovable flag candidates ([`is_unprovable_inplace_flag`]).
+    // unprovable flag candidates ([`is_unprovable_flag_token`]).
     let i_pos = parts.iter().position(|part| {
         let p = shell_word(part);
         (p.starts_with('-') && !p.starts_with("--") && p.contains(['i', 'I']))
             || p.starts_with("--i")
-            || is_unprovable_inplace_flag(part)
+            || is_unprovable_flag_token(part)
     });
     let Some(i_pos) = i_pos else {
         return false; // no in-place flag → not a sed mutation
@@ -4225,7 +4393,7 @@ fn has_sed_mutation(command: &str, state: &ValidationState) -> bool {
     // paths (e.g. '/etc/passwd') count as operands — which also classifies
     // `/`-addressed scripts (e.g. '/pat/d') as operands, an accepted fail-closed
     // over-rejection matching the unquoted behavior. Unprovable `$'...'`/`$"..."`
-    // tokens with escapes ([`is_unprovable_inplace_flag`]) also count as
+    // tokens with escapes ([`is_unprovable_flag_token`]) also count as
     // operands — they may resolve to a workspace path.
     let mut file_operands: Vec<&str> = Vec::new();
     let mut seen_file_operand = false;
@@ -4241,7 +4409,7 @@ fn has_sed_mutation(command: &str, state: &ValidationState) -> bool {
         }
         // Before the first file operand: skip non-absolute tokens (sed expression
         // like 's/a/b/' or backup extension like .bak for `-i .bak`).
-        if Path::new(&shell_word(part)).is_absolute() || is_unprovable_inplace_flag(part) {
+        if Path::new(&shell_word(part)).is_absolute() || is_unprovable_flag_token(part) {
             seen_file_operand = true;
             file_operands.push(part);
         }
@@ -5007,13 +5175,133 @@ mod tests {
             // VAR=val stripping
             ("FOO=bar rm file", false),
             ("VAR=val sudo rm -rf /", false),
-            ("GIT_DIR=/tmp git status", true),
+            ("GIT_DIR=/tmp git status", false), // GIT_* env rejected (exec vector)
         ];
 
         run_cases(&cases);
     }
 
-    // ── Script interpreters & container tools: read-only usage (not blocked) ─
+    /// Git exec vectors: flags/config/env channels that run programs are
+    /// rejected, even on allowlisted subcommands. Includes the analyst-flagged
+    /// gaps (repo redirect, --config-env/--config-file, export channel,
+    /// env/sudo-wrapped forms) and documented fail-closed over-rejections.
+    #[test]
+    fn git_exec_vectors_rejected() {
+        let cases = [
+            // ── GIT_* env bindings (current-shell, export, and wrapped) ──
+            ("GIT_DIR=/tmp git status", false),
+            ("GIT_EXTERNAL_DIFF=/bin/echo git diff", false),
+            ("GIT_SSH_COMMAND=/bin/echo git ls-remote origin", false),
+            ("GIT_CONFIG_COUNT=1 git log", false),
+            ("GIT_EXEC_PATH=/tmp/evil git request-pull", false),
+            ("GIT_ASKPASS=/bin/echo git ls-remote origin", false),
+            ("GIT_TRACE=/tmp/trace git status", false),
+            ("export GIT_EXTERNAL_DIFF=/bin/echo && git diff", false),
+            (
+                "export GIT_SSH_COMMAND=/bin/echo; git ls-remote origin",
+                false,
+            ),
+            ("env GIT_EXTERNAL_DIFF=/bin/echo git diff", false),
+            ("sudo GIT_DIR=/tmp git status", false),
+            ("GIT_PAGER=/bin/echo git log", true), // carve-out: no TTY → pager never spawns
+            // ── -c/-C global options (position-sensitive: log/diff -c stay allowed) ──
+            ("git -c diff.external=/bin/echo diff", false),
+            ("git -c core.fsmonitor=/bin/echo status", false),
+            ("git -c user.name=me log", false),
+            ("git -cfoo=bar status", false), // attached form
+            ("git -pc status", false),       // cluster
+            ("git -C /tmp/repo status", false),
+            ("git -C/tmp/repo diff", false),   // attached form
+            ("git -pC /tmp/repo diff", false), // cluster
+            // ── repo-redirect / config-injection long globals ──
+            ("git --git-dir=/tmp/evil/.git diff", false),
+            ("git --git-dir /tmp/evil status", false),
+            ("git --work-tree=/tmp/evil status", false),
+            ("git --config-env=core.fsmonitor=F status", false),
+            ("git --config-file=/tmp/evil status", false),
+            ("git --exec-path=/tmp/evil request-pull", false),
+            // ── exec flags (anywhere in the command; --no-* forms stay allowed) ──
+            ("git diff --ext-diff", false),
+            ("git diff --no-index --ext-diff /tmp/a /tmp/b", false),
+            ("git log -p --textconv", false),
+            ("git log --show-signature", false),
+            ("git cat-file --filters HEAD:src/lib.rs", false),
+            ("git ls-remote --upload-pack=/bin/echo origin", false),
+            ("git ls-remote --upload-pack /bin/echo origin", false),
+            ("git push --dry-run --exec=/bin/echo origin", false), // extension bypass
+            ("git stash show --textconv", false),                  // extension bypass
+            // ── grep -O / --open-files-in-pager ──
+            ("git grep -O /bin/echo pattern", false),
+            ("git grep -O/bin/echo pattern", false),
+            ("git grep -nO /bin/echo pattern", false),
+            ("git grep -IO /bin/echo pattern", false),
+            ("git grep --open-files-in-pager=/bin/echo pattern", false),
+            ("git grep --open-files-in-pager pattern", false),
+            // ── help --web / -w ──
+            ("git help --web", false),
+            ("git help -w", false),
+            ("git help -aw", false),
+            // ── full-path git (basename allowlist bypass) ──
+            ("/usr/bin/git push", false),
+            ("/usr/bin/git -C /tmp status", false),
+            // ── documented fail-closed over-rejections ──
+            ("git grep -e '--ext-diff' pattern", false), // literal pattern
+            ("git grep -e '-Ofoo' pattern", false),      // literal pattern
+            ("git log --format=$'%h\\t%s'", false),      // ANSI-C unprovable token
+            ("git log -- --ext-diff", false),            // pathname named like a flag
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// Positive controls for the exec-vector scan: ordinary read-only git and
+    /// the legitimate spellings that must NOT be caught (position/subcommand
+    /// scoping, --no-* disabling forms, GIT_PAGER carve-out).
+    #[test]
+    fn git_exec_vector_positives() {
+        let cases = [
+            // Ordinary read-only git still passes
+            ("git status", true),
+            ("git log", true),
+            ("git diff", true),
+            ("git show HEAD", true),
+            ("git blame src/lib.rs", true),
+            // Position-sensitive: -c after the subcommand is combined diff
+            ("git log -c", true),
+            ("git diff -c", true),
+            ("git log --oneline -c", true),
+            // -w on diff/log is ignore-whitespace (help-scoped -w only)
+            ("git diff -w", true),
+            ("git log -w", true),
+            // -O on log is a benign order-file read (grep-scoped -O only)
+            ("git log -Oorderfile", true),
+            // grep short flags without uppercase -O
+            ("git grep -o pattern", true),
+            ("git grep -n pattern", true),
+            ("git grep -I pattern", true),
+            ("git grep -c pattern", true),
+            ("git grep -C3 pattern", true),
+            ("git grep --regexp=-Ofoo pattern", true), // long form spared
+            // --no-* disabling forms stay allowed
+            ("git diff --no-ext-diff", true),
+            ("git diff --no-textconv", true),
+            ("git log --no-show-signature", true),
+            // help without the web flag
+            ("git help", true),
+            ("git help -a", true),
+            ("git help --all", true),
+            // paginate globals (no c/C)
+            ("git -p log", true),
+            ("git -P log", true),
+            // GIT_PAGER carve-out (pager never spawns on piped stdout)
+            ("GIT_PAGER=less git log", true),
+            // quoted args that only look like flags (no backslash escapes)
+            ("git log --format=$'%h'", true),
+            ("git log --grep=--ext-diff", true),
+        ];
+
+        run_cases(&cases);
+    }
 
     #[test]
     fn script_and_container_tools() {
