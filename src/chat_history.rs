@@ -211,26 +211,18 @@ impl ChatHistoryStore {
     ) -> Result<()> {
         let message_id = crate::generate_id();
         let created_at = turso::now();
-        self.conn
-            .execute(
-                "INSERT INTO chat_history \
-                 (message_id, user_name, channel, role, direction, \
-                  content, agent_role, workspace, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                turso::params![
-                    message_id,
-                    user_name,
-                    channel,
-                    "divider",          // role
-                    "divider",          // direction
-                    created_at.clone(), // content — stores the timestamp
-                    None::<String>,     // agent_role
-                    workspace,
-                    created_at,
-                ],
-            )
-            .await?;
-        Ok(())
+        self.insert(&ChatHistoryInsert {
+            message_id,
+            user_name: user_name.to_string(),
+            channel: channel.to_string(),
+            role: "divider".to_string(),
+            direction: "divider".to_string(),
+            content: created_at.clone(),
+            agent_role: None,
+            workspace: workspace.to_string(),
+            created_at,
+        })
+        .await
     }
 }
 
