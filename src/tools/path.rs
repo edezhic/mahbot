@@ -338,20 +338,15 @@ pub(crate) fn format_spill_filename() -> String {
     format!("spill_{:04x}.txt", rand::random::<u16>())
 }
 
-/// Check if a filename matches the spill file naming convention
-/// (`spill_XXXX.txt` where XXXX is a 4-digit hex number).
-pub(crate) fn is_spill_filename(name: &str) -> bool {
-    name.strip_prefix("spill_")
-        .and_then(|s| s.strip_suffix(".txt"))
-        .is_some_and(|hex| hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()))
-}
-
-/// Whether `path` is a mahbot shell spill/full log under an OS temp directory.
+/// Whether `name` is a mahbot shell spill/full log name: `spill_XXXX.txt`
+/// (4-digit hex) or a `.full.log` suffix.
 fn is_mahbot_spill_filename(name: &str) -> bool {
     if name.ends_with(".full.log") {
         return true;
     }
-    is_spill_filename(name)
+    name.strip_prefix("spill_")
+        .and_then(|s| s.strip_suffix(".txt"))
+        .is_some_and(|hex| hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// Whether `path` has the spill filename and `.agent` parent layout (ignoring temp root).

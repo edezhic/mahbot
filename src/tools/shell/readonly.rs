@@ -1489,15 +1489,6 @@ fn validate_unit(
     }
 }
 
-/// Construct a read-only rejection message (the `Err` payload).
-fn reject_msg(cmd: &str, why: &str, suggestion: &str) -> String {
-    format!(
-        "⚠️ Read-only mode: {why}\n\
-         Command: `{cmd}`\n\
-         Suggestion: {suggestion}"
-    )
-}
-
 /// What to do with a token at command position.
 enum ConstructAction {
     /// A compound construct was consumed and validated; continue after the
@@ -1558,11 +1549,11 @@ fn handle_construct(
         "function" => Ok(ConstructAction::Consumed(parse_function(s, i, base)?)),
         // Stray terminators at command position — the construct they close is
         // not open here (fail-closed; bash treats them as syntax errors).
-        "fi" | "done" | "esac" | "then" | "do" | "elif" | "else" | "}" | ")" => Err(reject_msg(
+        "fi" | "done" | "esac" | "then" | "do" | "elif" | "else" | "}" | ")" => reject(
             &s[i..],
             "a shell control keyword appears without its matching construct.",
             "remove the stray keyword, or complete the construct it belongs to.",
-        )),
+        ),
         _ => {
             let c = s[i..].chars().next().expect("i < len");
             if c == '{' && is_brace_group_start(s, i) {
@@ -1669,11 +1660,11 @@ fn find_do_keyword(s: &str, mut i: usize) -> Result<usize, String> {
             i += s[i..].chars().next().expect("i < len").len_utf8();
         }
         if i >= s.len() {
-            return Err(reject_msg(
+            return reject(
                 s,
                 "a for/while/until/select construct is missing its `do` keyword.",
                 "write the construct with its closing `done`.",
-            ));
+            );
         }
         let c = s[i..].chars().next().expect("i < len");
         if matches!(c, ';' | '\n') {
@@ -1684,11 +1675,11 @@ fn find_do_keyword(s: &str, mut i: usize) -> Result<usize, String> {
     }
     match read_keyword_at(s, i) {
         Some(w) if w == "do" => Ok(i + 2),
-        _ => Err(reject_msg(
+        _ => reject(
             s,
             "a for/while/until/select construct is missing its `do` keyword.",
             "write the construct with its closing `done`.",
-        )),
+        ),
     }
 }
 
@@ -1776,11 +1767,11 @@ fn parse_if(s: &str, i: usize, base: &mut ValidationState) -> Result<usize, Stri
             }
             Some("fi") => return Ok(after_part),
             _ => {
-                return Err(reject_msg(
+                return reject(
                     s,
                     "an if construct is missing its closing `fi`.",
                     "write the construct with its closing `fi`.",
-                ));
+                );
             }
         }
     }
@@ -1796,21 +1787,21 @@ fn parse_while_until(s: &str, i: usize, base: &mut ValidationState) -> Result<us
     let do_idx = scan_list(s, after_kw, &["do"], &[], &mut cond, true)?;
     note_part_cd(&cond, base);
     if stop_keyword_at(s, do_idx) != Some("do") {
-        return Err(reject_msg(
+        return reject(
             s,
             "a while/until construct is missing its `do` keyword.",
             "write the construct with its closing `done`.",
-        ));
+        );
     }
     let mut body = base.snapshot();
     let done_idx = scan_list(s, do_idx, &["done"], &[], &mut body, false)?;
     note_part_cd(&body, base);
     if stop_keyword_at(s, done_idx) != Some("done") {
-        return Err(reject_msg(
+        return reject(
             s,
             "a while/until construct is missing its closing `done`.",
             "write the construct with its closing `done`.",
-        ));
+        );
     }
     Ok(done_idx)
 }
@@ -1836,20 +1827,20 @@ fn parse_for(s: &str, i: usize, base: &mut ValidationState) -> Result<usize, Str
         let done_idx = scan_list(s, do_idx, &["done"], &[], &mut body, false)?;
         note_part_cd(&body, base);
         if stop_keyword_at(s, done_idx) != Some("done") {
-            return Err(reject_msg(
+            return reject(
                 s,
                 "a for/select construct is missing its closing `done`.",
                 "write the construct with its closing `done`.",
-            ));
+            );
         }
         return Ok(done_idx);
     }
     if name.is_empty() {
-        return Err(reject_msg(
+        return reject(
             s,
             "a for/select construct is missing its loop variable.",
             "write `for name in ...; do ...; done`.",
-        ));
+        );
     }
     let mut words: Vec<String> = Vec::new();
     let mut pos = after_name;
@@ -1873,11 +1864,11 @@ fn parse_for(s: &str, i: usize, base: &mut ValidationState) -> Result<usize, Str
             }
             if ch == '(' && s.as_bytes().get(pos + 1) == Some(&b'(') {
                 // A bare `((` inside the word list is malformed — reject.
-                return Err(reject_msg(
+                return reject(
                     s,
                     "a for/select header contains an unexpected arithmetic span.",
                     "write the header as `for name in words; do ...; done`.",
-                ));
+                );
             }
             let (word, after_word) = read_word_at(s, pos);
             if word.is_empty() {
@@ -1907,11 +1898,11 @@ fn parse_for(s: &str, i: usize, base: &mut ValidationState) -> Result<usize, Str
     let done_idx = scan_list(s, do_idx, &["done"], &[], &mut body, false)?;
     note_part_cd(&body, base);
     if stop_keyword_at(s, done_idx) != Some("done") {
-        return Err(reject_msg(
+        return reject(
             s,
             "a for/select construct is missing its closing `done`.",
             "write the construct with its closing `done`.",
-        ));
+        );
     }
     Ok(done_idx)
 }
@@ -1950,11 +1941,11 @@ fn parse_case(s: &str, i: usize, base: &mut ValidationState) -> Result<usize, St
     let after_case = i + 4;
     let (subject, mut k) = read_word_at(s, after_case);
     if subject.is_empty() {
-        return Err(reject_msg(
+        return reject(
             s,
             "a case construct is missing its subject word.",
             "write `case word in pattern) body ;; esac`.",
-        ));
+        );
     }
     let mut subj_state = base.snapshot();
     scan_substitutions(&subject, &mut subj_state)?;
@@ -1964,11 +1955,11 @@ fn parse_case(s: &str, i: usize, base: &mut ValidationState) -> Result<usize, St
             k += s[k..].chars().next().expect("k < len").len_utf8();
         }
         if k >= s.len() {
-            return Err(reject_msg(
+            return reject(
                 s,
                 "a case construct is missing its `in` keyword.",
                 "write `case word in ... esac`.",
-            ));
+            );
         }
         let c = s[k..].chars().next().expect("k < len");
         if matches!(c, ';' | '\n') {
@@ -1979,11 +1970,11 @@ fn parse_case(s: &str, i: usize, base: &mut ValidationState) -> Result<usize, St
     }
     let in_word = read_keyword_at(s, k);
     if in_word.as_deref() != Some("in") {
-        return Err(reject_msg(
+        return reject(
             s,
             "a case construct is missing its `in` keyword.",
             "write `case word in ... esac`.",
-        ));
+        );
     }
     k += 2;
     // Pattern/body loop.
@@ -2035,11 +2026,11 @@ fn scan_case_pattern(s: &str, i: usize) -> Result<(String, usize), String> {
         let c = s[k..].chars().next().expect("k < len");
         if c == '\\' && !in_single {
             let Some(next) = s[k + c.len_utf8()..].chars().next() else {
-                return Err(reject_msg(
+                return reject(
                     s,
                     "a case pattern is unterminated.",
                     "write `case word in pattern) body ;; esac`.",
-                ));
+                );
             };
             pat.push(c);
             pat.push(next);
@@ -2070,11 +2061,11 @@ fn scan_case_pattern(s: &str, i: usize) -> Result<(String, usize), String> {
         pat.push(c);
         k += c.len_utf8();
     }
-    Err(reject_msg(
+    reject(
         s,
         "a case pattern is unterminated.",
         "write `case word in pattern) body ;; esac`.",
-    ))
+    )
 }
 
 /// `{` opens a brace group only as a reserved word — bash requires it to be
@@ -2099,11 +2090,11 @@ fn parse_brace(s: &str, i: usize, state: &mut ValidationState) -> Result<usize, 
     let entry_count = state.cd_count;
     let after_body = scan_list(s, body_start, &[], &["}"], state, false)?;
     if stop_keyword_at(s, after_body) != Some("}") {
-        return Err(reject_msg(
+        return reject(
             s,
             "a brace group is missing its closing `}`.",
             "write `{ ...; }` with the closing brace.",
-        ));
+        );
     }
     // A `cd`/`pushd`/`popd` executed in the group — including one hidden in a
     // quoted eval body (`{ eval 'cd /tmp'; }`) — moves the real CWD behind the
@@ -2121,11 +2112,11 @@ fn parse_subshell(s: &str, i: usize, base: &ValidationState) -> Result<usize, St
     let mut body = base.snapshot();
     let after_body = scan_list(s, i + 1, &[], &[")"], &mut body, false)?;
     if stop_keyword_at(s, after_body) != Some(")") {
-        return Err(reject_msg(
+        return reject(
             s,
             "a subshell is missing its closing `)`.",
             "write `( ... )` with the closing parenthesis.",
-        ));
+        );
     }
     Ok(after_body)
 }
@@ -2143,11 +2134,11 @@ fn parse_function(s: &str, i: usize, base: &ValidationState) -> Result<usize, St
     // Read the function name.
     let (name, after_name) = read_word_at(s, k);
     if name.is_empty() {
-        return Err(reject_msg(
+        return reject(
             s,
             "a function definition is missing its name.",
             "write `name() { ...; }`.",
-        ));
+        );
     }
     k = after_name;
     // Optional `()` between the name and the body.
@@ -2169,11 +2160,11 @@ fn parse_function(s: &str, i: usize, base: &ValidationState) -> Result<usize, St
         let mut body = base.snapshot();
         scan_list(s, k + 1, &[], &[")"], &mut body, false)?
     } else {
-        return Err(reject_msg(
+        return reject(
             s,
             "a function definition is missing its body.",
             "write `name() { ...; }`.",
-        ));
+        );
     };
     Ok(after_body)
 }
@@ -2329,8 +2320,9 @@ fn validate_substitution_content(inner: &str, state: &mut ValidationState) -> Re
     validate_string(inner, &mut snapshot)
 }
 
-/// Construct a read-only rejection error with consistent formatting.
-fn reject(cmd: &str, why: &str, suggestion: &str) -> Result<(), String> {
+/// Construct a read-only rejection error with consistent formatting. The Ok
+/// type is generic so any `Result<T, String>` validator can return it.
+fn reject<T>(cmd: &str, why: &str, suggestion: &str) -> Result<T, String> {
     Err(format!(
         "⚠️ Read-only mode: {why}\n\
          Command: `{cmd}`\n\
@@ -3250,11 +3242,11 @@ fn handle_eval_body(body_words: &[&str], state: &mut ValidationState) -> Result<
     if let Some(first) = toks.first()
         && matches!(classify_verb_word(first), VerbClass::Unprovable)
     {
-        return Err(reject_msg(
+        return reject(
             &joined,
             "the eval body's command verb cannot be proven safe (concatenated quotes, escapes, or substitution-formed).",
             "write the command name literally (e.g. `cd`, `rm`) so it can be validated.",
-        ));
+        );
     }
     let Some((ti, tv)) = toks.iter().enumerate().find_map(|(i, w)| {
         let u = strip_outer_quotes(w).map_or(*w, |(c, _)| c);
@@ -3749,23 +3741,13 @@ const GIT_ALWAYS_MUTATE: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// True when the command has a git dry-run token: `-n`, `--dry-run`, or a
-/// combined short flag containing `n` (e.g. `clean -ndx`). Long flags are
-/// excluded so `--name-only`-style tokens don't count.
-fn has_dry_run_token(command: &str) -> bool {
+/// True when the command has a git token: the long flag (`--dry-run`/`--force`)
+/// or a combined short flag containing its char (`clean -ndx`, `push -fn`).
+/// Long flags are excluded so `--name-only`-style tokens don't count.
+fn has_token(command: &str, long: &str, short: char) -> bool {
     command.split_whitespace().any(|w| {
-        w == "--dry-run"
-            || (w.starts_with('-') && !w.starts_with("--") && w.len() > 1 && w[1..].contains('n'))
-    })
-}
-
-/// True when the command has a git force token: `-f`, `--force`, or a
-/// combined short flag containing `f` (e.g. `clean -fd`, `push -fn`).
-/// Any force token blocks dry-run clean/push (decision 3).
-fn has_force_token(command: &str) -> bool {
-    command.split_whitespace().any(|w| {
-        w == "--force"
-            || (w.starts_with('-') && !w.starts_with("--") && w.len() > 1 && w[1..].contains('f'))
+        w == long
+            || (w.starts_with('-') && !w.starts_with("--") && w.len() > 1 && w[1..].contains(short))
     })
 }
 
@@ -3857,7 +3839,7 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
         // git push --dry-run (-n/--dry-run) performs a network read with no
         // local mutation; any force token in the same command blocks it
         // (decision 3).
-        if has_dry_run_token(subcommand) && !has_force_token(subcommand) {
+        if has_token(subcommand, "--dry-run", 'n') && !has_token(subcommand, "--force", 'f') {
             Some(Ok(()))
         } else {
             Some(reject(
@@ -3869,7 +3851,7 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
     } else if subcommand.starts_with("clean") {
         // git clean -n/--dry-run previews removals; any force token blocks it
         // (decision 3).
-        if has_dry_run_token(subcommand) && !has_force_token(subcommand) {
+        if has_token(subcommand, "--dry-run", 'n') && !has_token(subcommand, "--force", 'f') {
             Some(Ok(()))
         } else {
             Some(reject(

@@ -272,30 +272,19 @@ fn update_search_index_after_write(ws: &Workspace, file_path: &std::path::Path) 
         return;
     };
 
-    // This is a parking_lot RwLock (non-poisoning) held for microseconds.
-    // The synchronous I/O inside handle_create_or_modify (stat, binary
-    // detection read) is acceptable — the hold time is negligible.
-    match entry.picker.write() {
-        Ok(mut guard) => {
-            if let Some(ref mut picker) = *guard
-                && picker.handle_create_or_modify(file_path).is_none()
-            {
-                tracing::warn!(
-                    workspace = ws.name,
-                    path = %file_path.display(),
-                    "Search index capacity exhausted after file write — \
-                     background rescan needed"
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                workspace = ws.name,
-                path = %file_path.display(),
-                error = %e,
-                "Failed to acquire search index write lock after file write"
-            );
-        }
+    // parking_lot RwLock is non-poisoning — write() cannot fail. Held for
+    // microseconds; the synchronous I/O inside handle_create_or_modify
+    // (stat, binary detection read) is acceptable.
+    if let Ok(mut guard) = entry.picker.write()
+        && let Some(ref mut picker) = *guard
+        && picker.handle_create_or_modify(file_path).is_none()
+    {
+        tracing::warn!(
+            workspace = ws.name,
+            path = %file_path.display(),
+            "Search index capacity exhausted after file write — \
+             background rescan needed"
+        );
     }
 }
 
