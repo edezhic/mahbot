@@ -1478,15 +1478,26 @@ enum ConstructAction {
     NotConstruct,
 }
 
+/// Advance `i` past leading whitespace (Unicode, including newlines — a
+/// construct keyword may follow a newline: `if true\n then`). Returns `i`
+/// unchanged at end of input.
+fn skip_ws(s: &str, i: usize) -> usize {
+    let mut k = i;
+    while let Some(c) = s[k..].chars().next() {
+        if !c.is_whitespace() {
+            break;
+        }
+        k += c.len_utf8();
+    }
+    k
+}
+
 /// Read the next shell word at `i` (skipping leading whitespace, including
 /// newlines — construct keywords can follow a newline: `if true\n then`).
 /// Returns `None` when the word is quoted (a quoted keyword is a literal
 /// command name, not a keyword) or when there is no word.
 fn read_keyword_at(s: &str, i: usize) -> Option<String> {
-    let mut k = i;
-    while k < s.len() && s[k..].chars().next().expect("k < len").is_whitespace() {
-        k += s[k..].chars().next().expect("k < len").len_utf8();
-    }
+    let mut k = skip_ws(s, i);
     let mut word = String::new();
     while k < s.len() {
         let c = s[k..].chars().next().expect("k < len");
@@ -1571,19 +1582,14 @@ fn looks_like_function_def(s: &str, i: usize) -> bool {
     if name_len == 0 {
         return false;
     }
-    while k < s.len() && s[k..].chars().next().is_some_and(char::is_whitespace) {
-        k += s[k..].chars().next().expect("k < len").len_utf8();
-    }
+    k = skip_ws(s, k);
     s[k..].starts_with("()")
 }
 
 /// Read one shell word at `i` (quote/substitution aware, skipping leading
 /// whitespace). Returns `(word_text, index_after)`.
 fn read_word_at(s: &str, i: usize) -> (String, usize) {
-    let mut k = i;
-    while k < s.len() && s[k..].chars().next().expect("k < len").is_whitespace() {
-        k += s[k..].chars().next().expect("k < len").len_utf8();
-    }
+    let mut k = skip_ws(s, i);
     let mut word = String::new();
     let mut in_single = false;
     let mut in_double = false;
@@ -1628,9 +1634,7 @@ fn read_word_at(s: &str, i: usize) -> (String, usize) {
 /// the header is unterminated.
 fn find_do_keyword(s: &str, mut i: usize) -> Result<usize, String> {
     loop {
-        while i < s.len() && s[i..].chars().next().expect("i < len").is_whitespace() {
-            i += s[i..].chars().next().expect("i < len").len_utf8();
-        }
+        i = skip_ws(s, i);
         if i >= s.len() {
             return reject(
                 s,
@@ -1824,9 +1828,7 @@ fn parse_for(s: &str, i: usize, base: &mut ValidationState) -> Result<usize, Str
         pos = after_first;
         // Collect the word list until `;`/newline (the `do` follows).
         loop {
-            while pos < s.len() && s[pos..].chars().next().expect("pos < len").is_whitespace() {
-                pos += s[pos..].chars().next().expect("pos < len").len_utf8();
-            }
+            pos = skip_ws(s, pos);
             if pos >= s.len() {
                 break;
             }
@@ -1923,9 +1925,7 @@ fn parse_case(s: &str, i: usize, base: &mut ValidationState) -> Result<usize, St
     scan_substitutions(&subject, &mut subj_state)?;
     // Find the `in` keyword at command position.
     loop {
-        while k < s.len() && s[k..].chars().next().expect("k < len").is_whitespace() {
-            k += s[k..].chars().next().expect("k < len").len_utf8();
-        }
+        k = skip_ws(s, k);
         if k >= s.len() {
             return reject(
                 s,
@@ -1973,10 +1973,7 @@ fn parse_case(s: &str, i: usize, base: &mut ValidationState) -> Result<usize, St
         if stop_keyword_at(s, after_body) == Some("esac") {
             return Ok(after_body);
         }
-        let mut j = after_body;
-        while j < s.len() && s[j..].chars().next().expect("j < len").is_whitespace() {
-            j += s[j..].chars().next().expect("j < len").len_utf8();
-        }
+        let j = skip_ws(s, after_body);
         if read_keyword_at(s, j).as_deref() == Some("esac") {
             return Ok(j + 4);
         }
@@ -2109,16 +2106,12 @@ fn parse_function(s: &str, i: usize, base: &ValidationState) -> Result<usize, St
     }
     k = after_name;
     // Optional `()` between the name and the body.
-    while k < s.len() && s[k..].chars().next().expect("k < len").is_whitespace() {
-        k += s[k..].chars().next().expect("k < len").len_utf8();
-    }
+    k = skip_ws(s, k);
     if s[k..].starts_with("()") {
         k += 2;
     }
     // The body opens with `{` (or `(` — a subshell-bodied function).
-    while k < s.len() && s[k..].chars().next().expect("k < len").is_whitespace() {
-        k += s[k..].chars().next().expect("k < len").len_utf8();
-    }
+    k = skip_ws(s, k);
     let c = s[k..].chars().next().expect("k < len");
     let after_body = if c == '{' {
         let mut body = base.snapshot();
