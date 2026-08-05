@@ -4442,7 +4442,10 @@ async fn route_to_agent(text: String) {
         let ws = resolve_workspace_for_voice(&user_name).await;
         let role = resolve_effective_role_for_voice(role, &ws.name);
 
-        info!("Voice command -> {role} (user: {user_name}, workspace: {}): {text}", ws.name);
+        info!(
+            "Voice command -> {role} (user: {user_name}, workspace: {}): {text}",
+            ws.name
+        );
 
         // Broadcast before routing so the transcript appears immediately
         // while the agent is still working.
