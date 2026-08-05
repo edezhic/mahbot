@@ -1559,27 +1559,11 @@ const _: () = assert!(
      the ring is non-empty when the tiling fallback is reached"
 );
 
-/// Compile-time invariant: the adaptive threshold floor (hard minimum) must
-/// not exceed the safe harbor (primary lower bound tracking the static
-/// threshold).  The safe harbor is always at least as high as the floor
-/// given current constants (FLOOR=1.35, SAFE_HARBOR=1.35).
-const _: () = assert!(
-    ADAPTIVE_FLOOR <= ADAPTIVE_SAFE_HARBOR,
-    "ADAPTIVE_FLOOR must be <= ADAPTIVE_SAFE_HARBOR"
-);
-
 /// Compile-time invariant: the adaptive threshold safe harbor must not exceed
 /// the absolute ceiling (upper bound).  Guarantees the clamp range is valid.
 const _: () = assert!(
     ADAPTIVE_SAFE_HARBOR <= ADAPTIVE_CEILING,
     "ADAPTIVE_SAFE_HARBOR must be <= ADAPTIVE_CEILING"
-);
-
-/// Compile-time invariant: the adaptive threshold absolute floor must not
-/// exceed the absolute ceiling (upper bound).
-const _: () = assert!(
-    ADAPTIVE_FLOOR <= ADAPTIVE_CEILING,
-    "ADAPTIVE_FLOOR must be <= ADAPTIVE_CEILING"
 );
 
 /// Factor applied to `ROLLING_WINDOW_N` to compute the detection threshold.
@@ -1615,18 +1599,6 @@ const ADAPTIVE_K_MIN: f32 = 1.0;
 
 /// Maximum allowed adaptive k value (user-configurable range).
 const ADAPTIVE_K_MAX: f32 = 4.0;
-
-/// Absolute floor — the adaptive threshold must never drop below this value.
-/// Calibrated for dense stride-8 embeddings.  The 1.58× multiplier
-/// (old streaming floor 1.35 → 2.13) accounts for the higher per-frame scores
-/// from stride-8 dense embeddings versus stride-1 streaming embeddings.
-///
-/// Computed from the same expression as ADAPTIVE_SAFE_HARBOR so the two
-/// values produce the exact same f32 bit pattern, satisfying the compile-time
-/// invariant ADAPTIVE_FLOOR <= ADAPTIVE_SAFE_HARBOR without floating-point
-/// rounding differences.
-#[expect(clippy::cast_precision_loss)]
-const ADAPTIVE_FLOOR: f32 = (ROLLING_WINDOW_N as f32) * MATCH_THRESHOLD_FACTOR;
 
 /// Absolute ceiling — the adaptive threshold must never exceed this value.
 /// Calibrated for dense stride-8 embeddings.  Set to 4.503
@@ -4541,8 +4513,8 @@ unsafe impl Send for SendMicStream {}
 /// the rolling sum range, making the feature structurally a no-op.
 ///
 /// The result is then clamped to the safeguard range: at least
-/// [`ADAPTIVE_SAFE_HARBOR`] (matching the static [`match_threshold()`]), never
-/// below [`ADAPTIVE_FLOOR`], and never above [`ADAPTIVE_CEILING`].  During the
+/// [`ADAPTIVE_SAFE_HARBOR`] (matching the static [`match_threshold()`]) and
+/// never above [`ADAPTIVE_CEILING`].  During the
 /// first [`ADAPTIVE_BOOTSTRAP_FRAMES`] frames the function returns `None`,
 /// telling the caller to use the static threshold while the window fills.
 #[derive(Debug, Clone)]
@@ -4575,9 +4547,9 @@ impl AdaptiveThresholdState {
     /// where the detection comparison lives.  Returns `None` during the
     /// bootstrap period (first [`ADAPTIVE_BOOTSTRAP_FRAMES`] frames) to tell
     /// the caller to use the static threshold.  After bootstrap returns
-    /// `Some(threshold)` where `threshold` is already clamped to the full
-    /// safeguard range ([`ADAPTIVE_FLOOR`], [`ADAPTIVE_CEILING`],
-    /// [`ADAPTIVE_SAFE_HARBOR`]) in rolling-sum space.
+    /// `Some(threshold)` where `threshold` is already clamped to the safeguard
+    /// range ([`ADAPTIVE_SAFE_HARBOR`], [`ADAPTIVE_CEILING`]) in rolling-sum
+    /// space.
     pub(crate) fn feed(&mut self, score: f32, k: f32) -> Option<f32> {
         // ── Update rolling window statistics ──
         if self.scores.len() >= ADAPTIVE_WINDOW_N {
@@ -4604,7 +4576,7 @@ impl AdaptiveThresholdState {
     /// Compute the clamped adaptive threshold from current window statistics.
     ///
     /// Assumes the window is non-empty (caller must check).  Returns the
-    /// clamped threshold in rolling-sum space (range [`ADAPTIVE_FLOOR`,
+    /// clamped threshold in rolling-sum space (range [`ADAPTIVE_SAFE_HARBOR`,
     /// [`ADAPTIVE_CEILING`]]).
     ///
     /// Shared by [`feed`](Self::feed) and [`peek`](Self::peek) to avoid
@@ -4624,15 +4596,11 @@ impl AdaptiveThresholdState {
         let adaptive = (mean + k * std) * ROLLING_WINDOW_N as f32;
 
         // ── Safeguards ──
-        // Two lower bounds (safe harbor then absolute floor) and one upper
-        // bound (absolute ceiling).  The `max(SAFE_HARBOR)` ensures the
-        // threshold never drops below the static detection threshold; the
-        // `clamp(FLOOR, CEILING)` provides the hard safeguard range.
-        // Since ADAPTIVE_FLOOR <= ADAPTIVE_SAFE_HARBOR (compile-time invariant),
-        // the safe harbor dominates the lower bound in the clamp.
-        adaptive
-            .max(ADAPTIVE_SAFE_HARBOR)
-            .clamp(ADAPTIVE_FLOOR, ADAPTIVE_CEILING)
+        // Lower bound is the safe harbor (static detection threshold), upper
+        // bound is the ceiling.  Note: clamp() propagates NaN while the old
+        // max() chain returned the harbor for NaN input — unreachable with
+        // finite scores, but the semantics differ.
+        adaptive.clamp(ADAPTIVE_SAFE_HARBOR, ADAPTIVE_CEILING)
     }
 
     /// Return the current adaptive threshold without updating statistics.
@@ -4683,7 +4651,7 @@ impl AdaptiveThresholdState {
     /// initialized with negative-distribution-mean scores.  Used by the E2E
     /// benchmark so the adaptive threshold is active from the start of
     /// detection testing.  The seed value (NEGATIVE_DISTRIBUTION_MEAN = 0.033)
-    /// ensures the threshold immediately clamps to the safe harbor (1.35),
+    /// ensures the threshold immediately clamps to the safe harbor (2.13),
     /// matching production behavior where real audio starts from silence.
     #[cfg(any(test, feature = "voice-tests"))]
     pub(crate) fn warmed() -> Self {
@@ -8638,7 +8606,7 @@ mod tests {
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             state.feed(0.1, ADAPTIVE_K_DEFAULT);
         }
-        // adaptive = (0.1 + 2.5 × 0.0) × 3 = 0.3 → well below safe harbor (1.35)
+        // adaptive = (0.1 + 2.5 × 0.0) × 3 = 0.3 → well below safe harbor (2.13)
         let result = state.feed(0.1, ADAPTIVE_K_DEFAULT);
         let threshold = result.expect("should return Some after bootstrap");
         assert!(
@@ -8674,89 +8642,6 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_safeguard_chain_correctness() {
-        // Verify the safeguard chain produces correct results independent of
-        // the specific constant values.  The chain in feed() is:
-        //   result = max(adaptive, SAFE_HARBOR, FLOOR).min(CEILING)
-        //
-        // We test several scenarios:
-        // 1. Below both lower bounds → result = max(SAFE_HARBOR, FLOOR)
-        // 2. Between lower bounds → result = max(adaptive, SAFE_HARBOR, FLOOR)
-        // 3. Above ceiling → result = CEILING
-        // 4. At ceiling → result = CEILING
-
-        let chain = |adaptive: f32| -> f32 {
-            adaptive
-                .max(ADAPTIVE_SAFE_HARBOR)
-                .max(ADAPTIVE_FLOOR)
-                .min(ADAPTIVE_CEILING)
-        };
-
-        // Case 1: adaptive below both lower bounds
-        assert_eq!(
-            chain(0.0),
-            ADAPTIVE_SAFE_HARBOR,
-            "below both lower bounds should yield safe harbor",
-        );
-        // Since ADAPTIVE_FLOOR <= ADAPTIVE_SAFE_HARBOR (compile-time invariant),
-        // the result is always safe harbor, not floor.  This documents that the
-        // floor is a dominated safeguard with current constants.
-
-        // Case 2: adaptive between FLOOR and SAFE_HARBOR (if such range exists)
-        let mid = (ADAPTIVE_FLOOR + ADAPTIVE_SAFE_HARBOR) / 2.0;
-        assert!(
-            chain(mid) >= ADAPTIVE_SAFE_HARBOR,
-            "adaptive={mid} between floor and safe_harbor should yield ≥safe_harbor",
-        );
-
-        // Case 3: far above ceiling
-        assert_eq!(
-            chain(10.0),
-            ADAPTIVE_CEILING,
-            "above ceiling should yield ceiling",
-        );
-
-        // Case 4: exactly at ceiling
-        assert_eq!(
-            chain(ADAPTIVE_CEILING),
-            ADAPTIVE_CEILING,
-            "at ceiling should yield ceiling",
-        );
-    }
-
-    #[test]
-    fn adaptive_floor_is_hard_minimum() {
-        // This test verifies that the floor clamp is structurally present and
-        // correctly ordered in the safeguard chain.  With current constants,
-        // ADAPTIVE_FLOOR (1.35) == ADAPTIVE_SAFE_HARBOR (1.35), so both bounds
-        // produce the same result.  This documents that with current constants
-        // the floor and safe harbor are equal (mahbot-860).
-        //
-        // We prove the floor is reachable by demonstrating that even with
-        // completely zero input (k=0, score=0), the threshold respects ALL
-        // lower bounds:
-        let mut state = AdaptiveThresholdState::new();
-        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            state.feed(0.0, 0.0); // k=0, score=0 → adaptive = 0.0 * 3 = 0.0
-        }
-        let result = state.feed(0.0, 0.0);
-        let threshold = result.expect("should return Some after bootstrap");
-        // With k=0, score=0: adaptive = (0.0 + 0.0) × 3 = 0.0
-        // Chain: max(0.0, SAFE_HARBOR=1.35) = 1.35, max(1.35, FLOOR=1.35) = 1.35
-        assert!(
-            threshold >= ADAPTIVE_FLOOR && threshold >= ADAPTIVE_SAFE_HARBOR,
-            "threshold {threshold} should respect both floor {} and safe harbor {}",
-            ADAPTIVE_FLOOR,
-            ADAPTIVE_SAFE_HARBOR,
-        );
-        // Additionally, verify the floor constant is structurally valid:
-        assert!(
-            ADAPTIVE_FLOOR <= ADAPTIVE_SAFE_HARBOR,
-            "floor should not exceed safe harbor (compile-time invariant also enforces this)",
-        );
-    }
-
-    #[test]
     fn adaptive_reset_clears_state() {
         let mut state = AdaptiveThresholdState::new();
         // Advance past bootstrap.
@@ -8779,7 +8664,7 @@ mod tests {
     fn adaptive_warmed_clamps_to_safe_harbor() {
         // warmed() initializes with NEGATIVE_DISTRIBUTION_MEAN (~0.033).
         // The computed adaptive threshold (0.033 + 2.5 × 0.0) × 3 = 0.099
-        // should be clamped to the safe harbor (1.35), matching production
+        // should be clamped to the safe harbor (2.13), matching production
         // where the threshold is fed real silence/background scores.
         // Regression test for mahbot-891.
         let mut state = AdaptiveThresholdState::warmed();
@@ -8792,7 +8677,7 @@ mod tests {
             ADAPTIVE_SAFE_HARBOR,
         );
         // Verify that all bootstrap frames were fed NEGATIVE_DISTRIBUTION_MEAN
-        // and not 0.5 (which would produce threshold ~1.5 instead of 1.35).
+        // and not 0.5 (which would produce threshold ~1.5 instead of 2.13).
         assert_eq!(state.len(), ADAPTIVE_BOOTSTRAP_FRAMES + 1);
     }
 
@@ -8817,13 +8702,10 @@ mod tests {
             + 1.0 / ADAPTIVE_WINDOW_N as f32;
         let result = state.feed(1.0, 0.0); // k=0 so adaptive = mean × ROLLING_WINDOW_N
         let threshold = result.expect("should return Some");
-        // After eviction: mean ≈ 0.533, adaptive = 0.533 * 3 = 1.6, well above safe harbor 1.35
+        // After eviction: mean ≈ 0.533, adaptive = 0.533 * 3 = 1.6, well above safe harbor 2.13
         // But we can still verify the internal mean indirectly.
         let expected_raw = expected_mean * ROLLING_WINDOW_N as f32;
-        let clamped = expected_raw
-            .max(ADAPTIVE_SAFE_HARBOR)
-            .max(ADAPTIVE_FLOOR)
-            .min(ADAPTIVE_CEILING);
+        let clamped = expected_raw.clamp(ADAPTIVE_SAFE_HARBOR, ADAPTIVE_CEILING);
         assert!(
             (threshold - clamped).abs() < 0.001,
             "threshold {threshold} should match expected clamped value {clamped} (raw={expected_raw})",
@@ -8869,7 +8751,7 @@ mod tests {
         // After bootstrap completes, peek() should return a threshold.
         let mut state = AdaptiveThresholdState::new();
         // Use low scores (0.1) so the computed adaptive value (~0.3) stays
-        // below the safe harbor (1.35), verifying that peek() produces a
+        // below the safe harbor (2.13), verifying that peek() produces a
         // clamped threshold rather than a raw adaptive value (mahbot-860).
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             state.feed(0.1, ADAPTIVE_K_DEFAULT);
@@ -8954,9 +8836,9 @@ mod tests {
         for k in [0.0, 1.0, ADAPTIVE_K_DEFAULT, 4.0] {
             let threshold = state.peek(k).expect("peek should return Some");
             assert!(
-                threshold >= ADAPTIVE_FLOOR,
-                "k={k}: peek threshold {threshold} should be >= floor {}",
-                ADAPTIVE_FLOOR,
+                threshold >= ADAPTIVE_SAFE_HARBOR,
+                "k={k}: peek threshold {threshold} should be >= safe harbor {}",
+                ADAPTIVE_SAFE_HARBOR,
             );
             assert!(
                 threshold <= ADAPTIVE_CEILING,
@@ -9045,7 +8927,7 @@ mod tests {
         );
 
         // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.316) → window appended.
-        // Rolling sum 0.5 < match_threshold (1.35) → detection does NOT fire.
+        // Rolling sum 0.5 < match_threshold (2.13) → detection does NOT fire.
         assert!(
             !detected,
             "single embedding should not trigger detection (rolling sum < threshold)",
@@ -9105,7 +8987,7 @@ mod tests {
         );
         assert!(
             !detected,
-            "two embeddings should not trigger detection (rolling sum < 1.35)",
+            "two embeddings should not trigger detection (rolling sum < 2.13)",
         );
         assert!(
             !score_window.is_empty(),
@@ -9201,7 +9083,7 @@ mod tests {
         // With an adaptive state, score_single_embedding should complete
         // the bootstrap phase after ADAPTIVE_BOOTSTRAP_FRAMES embeddings.
         // Uses a classifier that produces ~0.3 per frame so the rolling sum
-        // stays below the detection threshold (0.3 × 3 = 0.9 < 1.35).
+        // stays below the detection threshold (0.3 × 3 = 0.9 < 2.13).
         // Updated from classifier_always_half() (~0.5 per frame) after the
         // mahbot-860 threshold lowering (1.65 → 1.35) made 3 × 0.5 = 1.5 ≥ 1.35
         // trigger detection during the test.
@@ -9222,7 +9104,7 @@ mod tests {
                 ADAPTIVE_K_DEFAULT,
                 false,
             );
-            // None of these should detect (rolling sum ~0.9 < 1.35).
+            // None of these should detect (rolling sum ~0.9 < 2.13).
             assert!(!detected, "frame {i} should not detect wake word");
         }
 

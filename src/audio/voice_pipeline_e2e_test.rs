@@ -2609,8 +2609,9 @@ impl MissVerdict {
 /// 5. `adaptive_threshold_blocked` — reached the hard floor (2.13) but never
 ///    reached the per-frame effective adaptive threshold.  "Hard floor" here is
 ///    [`MIN_CLASSIFIER_THRESHOLD`] (the classifier-trigger condition), NOT
-///    [`ADAPTIVE_FLOOR`](super::ADAPTIVE_FLOOR) (the adaptive threshold's own
-///    clamp floor, which is an internal detail of the adaptive state).
+///    [`ADAPTIVE_SAFE_HARBOR`](super::ADAPTIVE_SAFE_HARBOR) (the adaptive
+///    threshold's own clamp floor, which is an internal detail of the adaptive
+///    state).
 fn classify_miss(pv: &PerVariantResult) -> MissVerdict {
     if pv.detected {
         return MissVerdict::Detected;
