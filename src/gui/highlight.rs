@@ -29,6 +29,7 @@ use tree_sitter_ruby::HIGHLIGHTS_QUERY as RUBY_HIGHLIGHTS_QUERY;
 use tree_sitter_sequel::HIGHLIGHTS_QUERY as SQL_HIGHLIGHTS_QUERY;
 use tree_sitter_toml_ng::HIGHLIGHTS_QUERY as TOML_HIGHLIGHTS_QUERY;
 
+use super::text_rendering::MAX_HIGHLIGHT_SIZE;
 use super::theme;
 
 // ── Compiled query cache — avoids re-parsing query patterns per line ───
@@ -139,6 +140,19 @@ impl HighlightClass {
             HighlightClass::SearchCurrent => Color::from_rgb(1.0, 0.8, 0.2),
         }
     }
+}
+
+/// Parse file highlights with a fresh tree-sitter parser, unless the
+/// content exceeds [`super::text_rendering::MAX_HIGHLIGHT_SIZE`]
+/// (returns `None` so callers fall back to plain text rendering).
+/// Shared entry point for the editor and diff widgets.
+#[must_use]
+pub(crate) fn parse_highlights(content: &str, lang: HighlightLanguage) -> Option<FileHighlights> {
+    if content.len() > MAX_HIGHLIGHT_SIZE {
+        return None;
+    }
+    let mut parser = Parser::new();
+    Some(parse_file_highlights(&mut parser, content, lang))
 }
 
 /// Parse an entire source file and return per-line highlight spans.

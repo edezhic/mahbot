@@ -25,8 +25,6 @@ pub enum ToolFailuresMessage {
     PrevPage,
     /// Go to next page.
     NextPage,
-    /// Dismiss modals/panels (Escape key).
-    Escape,
 }
 
 pub struct ToolFailuresState {
@@ -100,9 +98,7 @@ impl ToolFailuresState {
             }
             // PrevPage and NextPage are handled by LogsState which passes
             // filter parameters directly via prev_page()/next_page() methods.
-            ToolFailuresMessage::Escape
-            | ToolFailuresMessage::PrevPage
-            | ToolFailuresMessage::NextPage => Task::none(),
+            ToolFailuresMessage::PrevPage | ToolFailuresMessage::NextPage => Task::none(),
         }
     }
 

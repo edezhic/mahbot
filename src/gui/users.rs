@@ -20,7 +20,6 @@ pub enum UsersMessage {
     RefreshError(String),
     UpdateRole(String, String),
     UpdateWorkspace(String, String),
-    UpdatePermissions(String, String),
     UpdateResult(Result<(), String>),
     DeleteUser(String),
     ConfirmDelete(String),
@@ -169,21 +168,6 @@ impl UsersState {
                     };
                     store
                         .update_user(&sender, FieldUpdate::Unchanged, val, FieldUpdate::Unchanged)
-                        .await
-                        .map_err(|e| e.to_string())
-                },
-                UsersMessage::UpdateResult,
-            ),
-            UsersMessage::UpdatePermissions(sender, perms) => Task::perform(
-                async move {
-                    let store = user_store()?;
-                    let val = if perms.is_empty() {
-                        FieldUpdate::Clear
-                    } else {
-                        FieldUpdate::Set(&perms)
-                    };
-                    store
-                        .update_user(&sender, FieldUpdate::Unchanged, FieldUpdate::Unchanged, val)
                         .await
                         .map_err(|e| e.to_string())
                 },

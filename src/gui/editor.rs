@@ -5657,11 +5657,8 @@ fn byte_offset_to_line_byte_col(text: &str, offset: usize) -> Option<(usize, usi
     if offset > text.len() {
         return None;
     }
-    let prefix = &text[..offset];
-    let line = prefix.bytes().filter(|&b| b == b'\n').count();
-    let line_start = prefix.rfind('\n').map_or(0, |p| p + 1);
-    let byte_col = offset - line_start;
-    Some((line, byte_col, line_start))
+    let (line, line_start) = super::text_rendering::byte_line_and_start(text, offset);
+    Some((line, offset - line_start, line_start))
 }
 
 /// Auto-jump the cursor to the first find match and reset the match index to 0.

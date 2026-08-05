@@ -10,9 +10,9 @@ use iced::mouse::ScrollDelta;
 
 use super::highlight::{self, FileHighlights, HighlightLanguage};
 use super::text_rendering::{
-    GUTTER_FONT_SIZE, MAX_HIGHLIGHT_SIZE, compute_total_height, cursor_to_buffer_coords,
-    draw_highlight_background, font_metrics, gutter_clip_rect, iced_color_to_cosmic, push_or_merge,
-    reshape_and_shape, text_area_rect, with_font_system,
+    GUTTER_FONT_SIZE, byte_line_and_start, compute_total_height, cursor_to_buffer_coords,
+    draw_background, draw_buffer_text, draw_run_highlights, fill_rich_spans, font_metrics,
+    gutter_clip_rect, iced_color_to_cosmic, reshape_and_shape, text_area_rect, with_font_system,
 };
 use crate::util::UnwrapPoison;
 
@@ -34,22 +34,6 @@ pub struct CursorState {
     pub column: usize,
     /// The other end of a selection range, if any.
     pub selection: Option<Box<CursorState>>,
-}
-
-impl CursorState {
-    /// Create a new cursor state at the given position with no selection.
-    #[must_use]
-    #[expect(
-        dead_code,
-        reason = "Public constructor; kept for API completeness, not currently called"
-    )]
-    pub const fn new(line: usize, column: usize) -> Self {
-        Self {
-            line,
-            column,
-            selection: None,
-        }
-    }
 }
 
 // ── CursorMove ───────────────────────────────────────────────────────
@@ -202,7 +186,7 @@ pub struct EditorBuffer {
     sel_col: Cell<usize>,
     has_selection: Cell<bool>,
     /// Language for syntax highlighting. When `Some` and text is within
-    /// [`MAX_HIGHLIGHT_SIZE`], tree-sitter highlighting is applied when
+    /// `MAX_HIGHLIGHT_SIZE`, tree-sitter highlighting is applied when
     /// setting text.
     language: Option<HighlightLanguage>,
     /// File extension for fallback comment prefix lookup (e.g., `"yaml"`,
@@ -212,12 +196,6 @@ pub struct EditorBuffer {
 }
 
 impl EditorBuffer {
-    /// Create an empty buffer with no language (no syntax highlighting).
-    #[must_use]
-    pub fn new() -> Self {
-        Self::with_text("", None)
-    }
-
     /// Create a buffer pre-populated with the given text.
     ///
     /// When `language` is `Some` and the text is within
@@ -270,36 +248,9 @@ impl EditorBuffer {
         buffer_text(&self.buffer.borrow())
     }
 
-    /// Return the text of a specific line (0-based), or `None` if the line
-    /// index is out of range.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Public accessor; kept for API completeness, not currently called"
-        )
-    )]
-    pub fn line(&self, index: usize) -> Option<String> {
-        self.buffer
-            .borrow()
-            .lines
-            .get(index)
-            .map(|l| l.text().to_string())
-    }
-
     /// Return the number of lines in the buffer.
     pub fn line_count(&self) -> usize {
         self.buffer.borrow().lines.len()
-    }
-
-    /// Return the associated highlight language, if any.
-    #[must_use]
-    #[expect(
-        dead_code,
-        reason = "Public accessor; kept for API completeness, not currently called"
-    )]
-    pub const fn language(&self) -> Option<HighlightLanguage> {
-        self.language
     }
 
     // ── Cursor ────────────────────────────────────────────────────
@@ -465,27 +416,6 @@ impl EditorBuffer {
         }
     }
 
-    /// Replace the entire buffer content with new text. Resets cursor and
-    /// selection to the start. Re-applies syntax highlighting if a language
-    /// is configured.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Public setter; kept for API completeness, not currently called"
-        )
-    )]
-    pub fn set_text(&self, new_text: &str) {
-        let language = self.language;
-        with_font_system(|font_sys| {
-            let mut buffer = self.buffer.borrow_mut();
-            Self::set_buffer_text_highlighted(&mut buffer, font_sys, new_text, language);
-        });
-        self.cursor_line.set(0);
-        self.cursor_col.set(0);
-        self.has_selection.set(false);
-    }
-
     // ── Expose inner buffer for widget rendering ──────────────────
 
     /// Borrow the underlying [`cosmic_text::Buffer`] for drawing.
@@ -513,7 +443,7 @@ impl EditorBuffer {
     /// syntax highlighting.
     ///
     /// When `language` is `Some` and `text` is within
-    /// [`MAX_HIGHLIGHT_SIZE`], parses the text with tree-sitter and
+    /// `MAX_HIGHLIGHT_SIZE`, parses the text with tree-sitter and
     /// uses [`cosmic_text::Buffer::set_rich_text`] to apply per-span
     /// colors. Falls back to plain `set_text` otherwise.
     fn set_buffer_text_highlighted(
@@ -523,8 +453,7 @@ impl EditorBuffer {
         language: Option<HighlightLanguage>,
     ) {
         if let Some(lang) = language {
-            if text.len() <= MAX_HIGHLIGHT_SIZE {
-                let highlights = Self::compute_highlights(text, lang);
+            if let Some(highlights) = highlight::parse_highlights(text, lang) {
                 let base_attrs =
                     cosmic_text::Attrs::new().family(cosmic_text::Family::Name("JetBrains Mono"));
                 let spans = build_rich_spans(text, &highlights, &base_attrs);
@@ -570,15 +499,6 @@ impl EditorBuffer {
             cosmic_text::Shaping::Advanced,
             None,
         );
-    }
-
-    /// Run tree-sitter highlighting on the given text.
-    /// Returns per-line highlight spans.
-    /// Delegates to [`highlight::parse_file_highlights`] which handles
-    /// both standard languages and Markdown's dual-grammar approach.
-    fn compute_highlights(text: &str, lang: HighlightLanguage) -> FileHighlights {
-        let mut parser = tree_sitter::Parser::new();
-        highlight::parse_file_highlights(&mut parser, text, lang)
     }
 
     /// Return the normalised selection range (start before end).
@@ -1490,12 +1410,6 @@ impl EditorBuffer {
     }
 }
 
-impl Default for EditorBuffer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Maximum number of characters to scan in each direction when finding
 /// matching brackets. Prevents frame drops on large files.
 const BRACKET_SCAN_LIMIT: usize = 20_000;
@@ -1635,7 +1549,7 @@ fn build_rich_spans<'a>(
     highlights: &FileHighlights,
     base_attrs: &cosmic_text::Attrs<'a>,
 ) -> Vec<(&'a str, cosmic_text::Attrs<'a>)> {
-    let mut result: Vec<(&str, cosmic_text::Attrs)> = Vec::new();
+    let mut spans = Vec::new();
     let mut byte_pos = 0usize;
 
     for line_spans in &highlights.spans {
@@ -1646,39 +1560,19 @@ fn build_rich_spans<'a>(
             .find('\n')
             .map_or(text.len(), |nl| byte_pos + nl + 1);
 
-        let mut cursor = line_start;
-
         for span in line_spans {
             let s = line_start + span.start;
             let e = (line_start + span.end).min(line_end);
-
-            if s > cursor {
-                // Gap before this span — fill with base attrs
-                push_or_merge(text, &mut result, &text[cursor..s], base_attrs.clone());
-            }
-
             if e > s {
                 let color = iced_color_to_cosmic(span.highlight_class.color());
-                let attrs = base_attrs.clone().color(color);
-                push_or_merge(text, &mut result, &text[s..e], attrs);
-                cursor = e;
+                spans.push((s, e, base_attrs.clone().color(color)));
             }
-        }
-
-        // Fill any remaining text on this line with base attrs
-        if cursor < line_end {
-            push_or_merge(
-                text,
-                &mut result,
-                &text[cursor..line_end],
-                base_attrs.clone(),
-            );
         }
 
         byte_pos = line_end;
     }
 
-    result
+    fill_rich_spans(text, spans, base_attrs)
 }
 
 /// Extract full text from a [`cosmic_text::Buffer`] by joining lines with
@@ -1848,11 +1742,8 @@ fn fix_line_endings(
 /// character-based (not byte-based).
 pub(crate) fn byte_offset_to_line_col(text: &str, offset: usize) -> (usize, usize) {
     let offset = offset.min(text.len());
-    let prefix = &text[..offset];
-    let line = prefix.bytes().filter(|&b| b == b'\n').count();
-    let last_newline = prefix.rfind('\n').map_or(0, |p| p + 1);
-    let col = prefix[last_newline..].chars().count();
-    (line, col)
+    let (line, line_start) = byte_line_and_start(text, offset);
+    (line, text[line_start..offset].chars().count())
 }
 
 /// Convert a character-based column on a single line to a byte offset within
@@ -2020,7 +1911,7 @@ fn word_bounds_at(text: &str, byte_offset: usize) -> (usize, usize) {
 
 use std::sync::Arc;
 
-use iced::advanced::graphics::text::{self as graphics_text, Raw as TextRaw};
+use iced::advanced::graphics::text::{self as graphics_text};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::mouse;
 use iced::advanced::renderer;
@@ -2298,9 +2189,13 @@ where
         state.gutter_width = gutter_width;
 
         // ── Compute text area after gutter ─────────────────────────────
-        let text_x = self.padding + gutter_width + 4.0; // 4px gap between gutter and text
-        let text_area_width = (bounds.width - text_x - self.padding).max(0.0);
-        let text_area_height = (bounds.height - self.padding * 2.0).max(0.0);
+        let text_rect = text_area_rect(
+            Rectangle::new(Point::ORIGIN, bounds),
+            self.padding,
+            gutter_width,
+        );
+        let text_area_width = text_rect.width;
+        let text_area_height = text_rect.height;
 
         // ── Shape the buffer with current scroll ───────────────────────
         let mut guard = graphics_text::font_system().write().unwrap_poison();
@@ -2443,7 +2338,12 @@ where
         );
         draw_bracket_match_highlights(renderer, &buffer_for_draw, &text_geo, self.bracket_pair);
         draw_selection(renderer, &buffer_for_draw, &text_geo, self.buffer);
-        draw_text(renderer, &buffer_for_draw, &text_geo);
+        draw_buffer_text(
+            renderer,
+            &buffer_for_draw,
+            Point::new(text_geo.x, text_geo.y),
+            text_geo.clip,
+        );
         draw_cursor(renderer, &buffer_for_draw, &text_geo, state, self.buffer);
     }
 
@@ -2488,9 +2388,9 @@ where
                 // layout() jumps the viewport to that wrong line.
                 {
                     let bounds = layout.bounds();
-                    let text_x = self.padding + state.gutter_width + 4.0;
-                    let text_area_width = (bounds.width - text_x - self.padding).max(0.0);
-                    let text_area_height = (bounds.height - self.padding * 2.0).max(0.0);
+                    let text_rect = text_area_rect(bounds, self.padding, state.gutter_width);
+                    let text_area_width = text_rect.width;
+                    let text_area_height = text_rect.height;
 
                     let scroll_y = state.scroll_y;
                     with_font_system(|font_sys| {
@@ -2739,10 +2639,9 @@ where
                         // Shape the buffer with current scroll so layout runs
                         // reflect the viewport (same as mouse click handler).
                         let bounds = layout.bounds();
-                        let text_x_offset = self.padding + state.gutter_width + 4.0;
-                        let text_area_width =
-                            (bounds.width - text_x_offset - self.padding).max(0.0);
-                        let text_area_height = (bounds.height - self.padding * 2.0).max(0.0);
+                        let text_rect = text_area_rect(bounds, self.padding, state.gutter_width);
+                        let text_area_width = text_rect.width;
+                        let text_area_height = text_rect.height;
 
                         let scroll_y = state.scroll_y;
                         let result = with_font_system(|font_sys| {
@@ -2857,10 +2756,9 @@ where
                     if is_cmd_left || is_cmd_right {
                         // Shape the buffer so layout runs reflect the viewport.
                         let bounds = layout.bounds();
-                        let text_x_offset = self.padding + state.gutter_width + 4.0;
-                        let text_area_width =
-                            (bounds.width - text_x_offset - self.padding).max(0.0);
-                        let text_area_height = (bounds.height - self.padding * 2.0).max(0.0);
+                        let text_rect = text_area_rect(bounds, self.padding, state.gutter_width);
+                        let text_area_width = text_rect.width;
+                        let text_area_height = text_rect.height;
 
                         let scroll_y = state.scroll_y;
                         let result = with_font_system(|font_sys| {
@@ -3105,21 +3003,6 @@ struct TextGeometry {
     y: f32,
 }
 
-/// Fill the widget background.
-fn draw_background<Renderer>(renderer: &mut Renderer, bounds: Rectangle)
-where
-    Renderer: iced::advanced::Renderer,
-{
-    renderer.fill_quad(
-        renderer::Quad {
-            bounds,
-            border: iced::Border::default(),
-            ..renderer::Quad::default()
-        },
-        theme::BG_BASE,
-    );
-}
-
 /// Draw line numbers in the gutter area.
 fn draw_line_numbers<Renderer>(
     renderer: &mut Renderer,
@@ -3189,32 +3072,15 @@ fn draw_find_match_highlights<Renderer>(
             } else {
                 theme::FIND_MATCH_DIM
             };
-            for run in buffer.layout_runs() {
-                if run.line_i != match_line {
-                    continue;
-                }
-                // Use cosmic_text::Cursor with byte-offset indices to
-                // compute the pixel span of this match within the line.
-                if let Some(hl) = run.highlight(
-                    cosmic_text::Cursor {
-                        line: match_line,
-                        index: col_start,
-                        ..cosmic_text::Cursor::default()
-                    },
-                    cosmic_text::Cursor {
-                        line: match_line,
-                        index: col_end,
-                        ..cosmic_text::Cursor::default()
-                    },
-                ) {
-                    draw_highlight_background(
-                        renderer, geo.clip, geo.x, geo.y, &run, hl.0, hl.1, color,
-                    );
-                }
-                // Match may span multiple visual runs on soft-wrapped
-                // lines — don't break, continue checking all runs for
-                // this logical line.
-            }
+            // Match may span multiple visual runs on soft-wrapped lines —
+            // scan all runs for this logical line.
+            let filter = move |run: &cosmic_text::LayoutRun| {
+                (run.line_i == match_line)
+                    .then_some(((match_line, col_start), (match_line, col_end)))
+            };
+            draw_run_highlights(
+                renderer, buffer, geo.clip, geo.x, geo.y, color, false, filter,
+            );
         }
     }
 }
@@ -3230,40 +3096,24 @@ fn draw_bracket_match_highlights<Renderer>(
 {
     // Draw a subtle background under both the opening and closing bracket.
     if let Some(((open_line, open_col), (close_line, close_col))) = bracket_pair {
-        let bracket_color = theme::BRACKET_MATCH;
         for &(b_line, b_col) in &[(open_line, open_col), (close_line, close_col)] {
             let line_text = buffer.lines.get(b_line).map_or("", |l| l.text());
             let (byte_start, byte_end) = char_col_to_byte_range_in_line(line_text, b_col);
-            for run in buffer.layout_runs() {
-                if run.line_i != b_line {
-                    continue;
-                }
-                // Highlight one character at the bracket position.
-                if let Some(hl) = run.highlight(
-                    cosmic_text::Cursor {
-                        line: b_line,
-                        index: byte_start,
-                        ..cosmic_text::Cursor::default()
-                    },
-                    cosmic_text::Cursor {
-                        line: b_line,
-                        index: byte_end,
-                        ..cosmic_text::Cursor::default()
-                    },
-                ) {
-                    draw_highlight_background(
-                        renderer,
-                        geo.clip,
-                        geo.x,
-                        geo.y,
-                        &run,
-                        hl.0,
-                        hl.1,
-                        bracket_color,
-                    );
-                }
-                break;
-            }
+            // Highlight one character at the bracket position; break after
+            // the first matching run (the char lives in a single run).
+            let filter = move |run: &cosmic_text::LayoutRun| {
+                (run.line_i == b_line).then_some(((b_line, byte_start), (b_line, byte_end)))
+            };
+            draw_run_highlights(
+                renderer,
+                buffer,
+                geo.clip,
+                geo.x,
+                geo.y,
+                theme::BRACKET_MATCH,
+                true,
+                filter,
+            );
         }
     }
 }
@@ -3278,8 +3128,7 @@ fn draw_selection<Renderer>(
     Renderer: iced::advanced::Renderer,
 {
     let cursor_state = editor_buffer.cursor();
-
-    if let Some(ref anchor) = cursor_state.selection {
+    if let Some(anchor) = cursor_state.selection.as_ref() {
         let start = (cursor_state.line, cursor_state.column);
         let end = (anchor.line, anchor.column);
         let (sel_start, sel_end) = if start < end {
@@ -3296,48 +3145,20 @@ fn draw_selection<Renderer>(
             .get(sel_end.0)
             .map_or(0, |l| char_col_to_byte_offset_in_line(l.text(), sel_end.1));
 
-        for run in buffer.layout_runs() {
-            if let Some(highlight) = run.highlight(
-                cosmic_text::Cursor {
-                    line: sel_start.0,
-                    index: sel_start_byte,
-                    ..cosmic_text::Cursor::default()
-                },
-                cosmic_text::Cursor {
-                    line: sel_end.0,
-                    index: sel_end_byte,
-                    ..cosmic_text::Cursor::default()
-                },
-            ) {
-                draw_highlight_background(
-                    renderer,
-                    geo.clip,
-                    geo.x,
-                    geo.y,
-                    &run,
-                    highlight.0,
-                    highlight.1,
-                    theme::ACCENT_DIM,
-                );
-            }
-        }
+        let filter = move |_run: &cosmic_text::LayoutRun| {
+            Some(((sel_start.0, sel_start_byte), (sel_end.0, sel_end_byte)))
+        };
+        draw_run_highlights(
+            renderer,
+            buffer,
+            geo.clip,
+            geo.x,
+            geo.y,
+            theme::ACCENT_DIM,
+            false,
+            filter,
+        );
     }
-}
-
-/// Draw the text glyphs via `fill_raw` for syntax-coloured output.
-fn draw_text<Renderer>(
-    renderer: &mut Renderer,
-    buffer: &Arc<cosmic_text::Buffer>,
-    geo: &TextGeometry,
-) where
-    Renderer: iced::advanced::graphics::text::Renderer,
-{
-    renderer.fill_raw(TextRaw {
-        buffer: Arc::downgrade(buffer),
-        position: Point::new(geo.x, geo.y),
-        color: iced::Color::WHITE, // neutral multiplier preserves per-glyph colors
-        clip_bounds: geo.clip,
-    });
 }
 
 /// Draw the blinking cursor caret when no selection is active.

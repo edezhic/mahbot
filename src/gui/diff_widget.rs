@@ -21,7 +21,6 @@
 
 use std::sync::Arc;
 
-use iced::advanced::graphics::text::Raw as TextRaw;
 use iced::advanced::graphics::text::cosmic_text;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::text;
@@ -34,9 +33,9 @@ use iced::{Color, Event, Length, Point, Rectangle, Size};
 use crate::diff_parse::{DiffFileStatus, DiffLineKind};
 
 use super::text_rendering::{
-    GUTTER_FONT_SIZE, compute_total_height, cursor_to_buffer_coords, draw_highlight_background,
-    font_metrics, gutter_clip_rect, iced_color_to_cosmic, push_or_merge, text_area_rect,
-    with_font_system,
+    GUTTER_FONT_SIZE, compute_total_height, cursor_to_buffer_coords, draw_background,
+    draw_buffer_text, draw_run_highlights, fill_rich_spans, font_metrics, gutter_clip_rect,
+    iced_color_to_cosmic, text_area_rect, with_font_system,
 };
 use super::theme;
 
@@ -260,8 +259,12 @@ where
         let gutter_width = gutter_width_from_digits(self.data.gutter_digits);
         state.gutter_width = gutter_width;
 
-        let text_x = self.padding + gutter_width + 4.0; // 4px gap
-        let text_area_width = (bounds.width - text_x - self.padding).max(0.0);
+        let text_area_width = text_area_rect(
+            Rectangle::new(Point::ORIGIN, bounds),
+            self.padding,
+            gutter_width,
+        )
+        .width;
 
         // No content — collapse to zero height
         if self.data.text.is_empty() {
@@ -279,27 +282,14 @@ where
                 .family(cosmic_text::Family::Name("JetBrains Mono"))
                 .color(iced_color_to_cosmic(theme::TEXT_PRIMARY));
 
-            let mut rich_spans: Vec<(&str, cosmic_text::Attrs)> = Vec::new();
-            let mut byte_pos = 0usize;
-            for &(start, end, color) in &self.data.span_data {
-                if start > byte_pos {
-                    push_or_merge(
-                        text,
-                        &mut rich_spans,
-                        &text[byte_pos..start],
-                        base_attrs.clone(),
-                    );
-                }
-                if end > start {
-                    let attrs = base_attrs.clone().color(iced_color_to_cosmic(color));
-                    push_or_merge(text, &mut rich_spans, &text[start..end], attrs);
-                    byte_pos = end;
-                }
-            }
-            // Cover any remaining text after the last span
-            if byte_pos < text.len() {
-                push_or_merge(text, &mut rich_spans, &text[byte_pos..], base_attrs.clone());
-            }
+            let spans = self.data.span_data.iter().map(|&(start, end, color)| {
+                (
+                    start,
+                    end,
+                    base_attrs.clone().color(iced_color_to_cosmic(color)),
+                )
+            });
+            let rich_spans = fill_rich_spans(text, spans, &base_attrs);
 
             buffer.set_rich_text(
                 font_sys,
@@ -346,14 +336,7 @@ where
         let gutter_width = state.gutter_width;
 
         // ── 0. Fill background ──
-        renderer.fill_quad(
-            renderer::Quad {
-                bounds,
-                border: iced::Border::default(),
-                ..renderer::Quad::default()
-            },
-            theme::BG_BASE,
-        );
+        draw_background(renderer, bounds);
 
         let text_rect = text_area_rect(bounds, self.padding, gutter_width);
         let text_x = text_rect.x;
@@ -480,30 +463,31 @@ where
             };
             let start_cur = global_byte_to_cursor(&buffer_for_draw, start);
             let end_cur = global_byte_to_cursor(&buffer_for_draw, end);
-
-            for run in buffer_for_draw.layout_runs() {
-                if let Some((x_offset, width)) = run.highlight(start_cur, end_cur) {
-                    draw_highlight_background(
-                        renderer,
-                        text_clip,
-                        text_x,
-                        text_y,
-                        &run,
-                        x_offset,
-                        width,
-                        SELECTION_COLOR,
-                    );
-                }
-            }
+            let filter = move |_run: &cosmic_text::LayoutRun| {
+                Some((
+                    (start_cur.line, start_cur.index),
+                    (end_cur.line, end_cur.index),
+                ))
+            };
+            draw_run_highlights(
+                renderer,
+                &buffer_for_draw,
+                text_clip,
+                text_x,
+                text_y,
+                SELECTION_COLOR,
+                false,
+                filter,
+            );
         }
 
         // ── 4. Draw text via fill_raw ───────────────────────────────
-        renderer.fill_raw(TextRaw {
-            buffer: Arc::downgrade(&buffer_for_draw),
-            position: Point::new(text_x, text_y),
-            color: Color::WHITE, // neutral multiplier preserves per-glyph colors
-            clip_bounds: text_clip,
-        });
+        draw_buffer_text(
+            renderer,
+            &buffer_for_draw,
+            Point::new(text_x, text_y),
+            text_clip,
+        );
     }
 
     fn update(

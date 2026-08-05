@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn test_new_empty() {
-    let buf = EditorBuffer::new();
+    let buf = EditorBuffer::with_text("", None);
     assert_eq!(buf.text(), "");
     assert_eq!(buf.line_count(), 1);
     let cursor = buf.cursor();
@@ -16,15 +16,6 @@ fn test_with_text() {
     let buf = EditorBuffer::with_text("hello\nworld", None);
     assert_eq!(buf.text(), "hello\nworld");
     assert_eq!(buf.line_count(), 2);
-    assert_eq!(buf.line(0).as_deref(), Some("hello"));
-    assert_eq!(buf.line(1).as_deref(), Some("world"));
-}
-
-#[test]
-fn test_line_out_of_bounds() {
-    let buf = EditorBuffer::with_text("hello", None);
-    assert!(buf.line(1).is_none());
-    assert!(buf.line(usize::MAX).is_none());
 }
 
 #[test]
@@ -60,16 +51,6 @@ fn test_select_all_and_selection() {
 fn test_no_selection() {
     let buf = EditorBuffer::with_text("hello", None);
     assert!(buf.selection().is_none());
-}
-
-#[test]
-fn test_set_text() {
-    let buf = EditorBuffer::with_text("hello", None);
-    buf.set_text("world");
-    assert_eq!(buf.text(), "world");
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 0);
-    assert_eq!(cursor.column, 0);
 }
 
 #[test]
@@ -357,7 +338,7 @@ fn test_multi_byte_character() {
 
 #[test]
 fn test_select_all_empty() {
-    let buf = EditorBuffer::new();
+    let buf = EditorBuffer::with_text("", None);
     buf.select_all();
     assert!(buf.selection().is_none());
 }

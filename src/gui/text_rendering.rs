@@ -6,12 +6,16 @@
 //!
 //! All items are `pub(crate)` except [`font_metrics`] which is `pub`.
 
+use std::sync::Arc;
+
+use iced::advanced::graphics::text::Raw as TextRaw;
 use iced::advanced::graphics::text::cosmic_text;
 use iced::advanced::layout::Layout;
 use iced::advanced::mouse;
 use iced::advanced::renderer;
-use iced::{Color, Rectangle};
+use iced::{Color, Point, Rectangle};
 
+use super::theme;
 use crate::util::UnwrapPoison;
 
 // ── Constants ───────────────────────────────────────────────────────
@@ -139,6 +143,16 @@ pub(crate) fn text_area_rect(bounds: Rectangle, padding: f32, gutter_width: f32)
     }
 }
 
+/// Compute `(line, line_start_byte)` for a byte offset within `text`.
+/// `offset` must be ≤ `text.len()`. Shared core for the char-column and
+/// byte-column variants used by the editor and find/replace helpers.
+pub(crate) fn byte_line_and_start(text: &str, offset: usize) -> (usize, usize) {
+    let prefix = &text[..offset];
+    let line = prefix.bytes().filter(|&b| b == b'\n').count();
+    let line_start = prefix.rfind('\n').map_or(0, |p| p + 1);
+    (line, line_start)
+}
+
 /// Transform a cursor position into buffer-relative coordinates.
 ///
 /// Returns `Some((buf_x, buf_y))` with coordinates relative to the text
@@ -226,6 +240,85 @@ pub(crate) fn draw_highlight_background<Renderer>(
     }
 }
 
+/// Fill the widget background. Byte-identical in the editor and diff widgets.
+pub(crate) fn draw_background<Renderer>(renderer: &mut Renderer, bounds: Rectangle)
+where
+    Renderer: iced::advanced::Renderer,
+{
+    renderer.fill_quad(
+        renderer::Quad {
+            bounds,
+            border: iced::Border::default(),
+            ..renderer::Quad::default()
+        },
+        theme::BG_BASE,
+    );
+}
+
+/// Draw buffer glyphs via `fill_raw` for syntax-coloured output.
+/// A white neutral multiplier preserves per-glyph colors.
+pub(crate) fn draw_buffer_text<Renderer>(
+    renderer: &mut Renderer,
+    buffer: &Arc<cosmic_text::Buffer>,
+    position: Point,
+    clip_bounds: Rectangle,
+) where
+    Renderer: iced::advanced::graphics::text::Renderer,
+{
+    renderer.fill_raw(TextRaw {
+        buffer: Arc::downgrade(buffer),
+        position,
+        color: Color::WHITE,
+        clip_bounds,
+    });
+}
+
+/// Draw highlight backgrounds for layout runs selected by `filter`.
+///
+/// `filter` maps a run to the highlight cursor pair (as `(line, byte_index)`
+/// tuples) to pass to [`LayoutRun::highlight`], or `None` to skip the run.
+/// When `stop_after_first` is set, scanning stops after the first drawn
+/// highlight (used by the bracket-match path, which must break after the
+/// first run of a logical line).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_run_highlights<Renderer, F>(
+    renderer: &mut Renderer,
+    buffer: &cosmic_text::Buffer,
+    text_clip: Rectangle,
+    text_x: f32,
+    text_y: f32,
+    color: Color,
+    stop_after_first: bool,
+    mut filter: F,
+) where
+    Renderer: iced::advanced::Renderer,
+    F: FnMut(&cosmic_text::LayoutRun) -> Option<((usize, usize), (usize, usize))>,
+{
+    for run in buffer.layout_runs() {
+        let Some(((start_line, start_idx), (end_line, end_idx))) = filter(&run) else {
+            continue;
+        };
+        let start = cosmic_text::Cursor {
+            line: start_line,
+            index: start_idx,
+            ..cosmic_text::Cursor::default()
+        };
+        let end = cosmic_text::Cursor {
+            line: end_line,
+            index: end_idx,
+            ..cosmic_text::Cursor::default()
+        };
+        if let Some((x_offset, width)) = run.highlight(start, end) {
+            draw_highlight_background(
+                renderer, text_clip, text_x, text_y, &run, x_offset, width, color,
+            );
+            if stop_after_first {
+                break;
+            }
+        }
+    }
+}
+
 // ── Colour conversion ───────────────────────────────────────────────
 
 /// Convert an [`iced::Color`] (f32 RGBA components, 0.0–1.0) to
@@ -283,6 +376,40 @@ pub(crate) fn push_or_merge<'a>(
         }
     }
     result.push((new_text, new_attrs));
+}
+
+/// Build rich spans covering every byte of `text`, filling gaps between
+/// `spans` with `base_attrs` and applying per-span attrs.
+///
+/// `spans` must be sorted by start byte and non-overlapping (the diff
+/// widget sorts its `span_data` before calling; the editor emits per-line
+/// spans in order). Shared by [`super::editor_widget`] and
+/// [`super::diff_widget`]; both previously inlined this loop.
+pub(crate) fn fill_rich_spans<'a>(
+    text: &'a str,
+    spans: impl IntoIterator<Item = (usize, usize, cosmic_text::Attrs<'a>)>,
+    base_attrs: &cosmic_text::Attrs<'a>,
+) -> Vec<(&'a str, cosmic_text::Attrs<'a>)> {
+    let mut result: Vec<(&str, cosmic_text::Attrs)> = Vec::new();
+    let mut byte_pos = 0usize;
+    for (start, end, attrs) in spans {
+        if start > byte_pos {
+            push_or_merge(
+                text,
+                &mut result,
+                &text[byte_pos..start],
+                base_attrs.clone(),
+            );
+        }
+        if end > start {
+            push_or_merge(text, &mut result, &text[start..end], attrs);
+            byte_pos = end;
+        }
+    }
+    if byte_pos < text.len() {
+        push_or_merge(text, &mut result, &text[byte_pos..], base_attrs.clone());
+    }
+    result
 }
 
 #[cfg(test)]

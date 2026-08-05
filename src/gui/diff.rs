@@ -11,8 +11,7 @@
 //!
 //! Auto-refreshes every 5 seconds when a workspace is selected.
 use super::diff_widget::{self, DiffBufferWidget, DiffFileBuffer};
-use super::highlight::{FileHighlights, HighlightLanguage, parse_file_highlights};
-use super::text_rendering::MAX_HIGHLIGHT_SIZE;
+use super::highlight::{FileHighlights, HighlightLanguage, parse_highlights};
 
 use crate::diff_parse::{
     DiffContent, DiffFileStatus, DiffLineKind, make_untracked_diff_file, parse_git_diff,
@@ -1451,7 +1450,7 @@ async fn compute_old_highlights(
     let show_ref = commit_ref.map(|hash| format!("{hash}~1"));
     let content = run_git_show(ws_path, old_path, show_ref.as_deref()).await?;
 
-    compute_highlights_for_content(&content, lang)
+    parse_highlights(&content, lang)
 }
 
 async fn compute_new_highlights(
@@ -1475,20 +1474,7 @@ async fn compute_new_highlights(
         tokio::fs::read_to_string(&full_path).await.ok()?
     };
 
-    compute_highlights_for_content(&content, lang)
-}
-
-/// Compute tree-sitter highlights for a given content string.
-/// Returns `None` if the content exceeds the maximum highlight size.
-fn compute_highlights_for_content(
-    content: &str,
-    lang: HighlightLanguage,
-) -> Option<FileHighlights> {
-    if content.len() > MAX_HIGHLIGHT_SIZE {
-        return None;
-    }
-    let mut parser = tree_sitter::Parser::new();
-    Some(parse_file_highlights(&mut parser, content, lang))
+    parse_highlights(&content, lang)
 }
 
 /// Build a directory tree from the list of diff files.
