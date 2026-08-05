@@ -581,10 +581,11 @@ impl RetryLoop {
         self.failures.push(rec);
     }
 
-    /// Sleep between attempts, honoring the schedule / Retry-After but never
-    /// past the operation deadline — the wall cap cannot be overshot by a
-    /// backoff. Returns `Err(FailureClass::Shutdown)` when the global
-    /// shutdown token fires during the sleep.
+    /// Sleep between attempts, honoring the schedule / Retry-After and
+    /// reaching the operation deadline when the schedule would exceed it —
+    /// the wall cap cannot be overshot by a backoff. Returns
+    /// `Err(FailureClass::Shutdown)` when the global shutdown token fires
+    /// during the sleep.
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) async fn sleep_between(&self, attempt: u32) -> Result<(), FailureClass> {
         if attempt >= self.policy.max_attempts {
@@ -592,8 +593,11 @@ impl RetryLoop {
         }
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         let schedule_ms = self.backoffs[(attempt - 1) as usize];
-        let sleep_ms =
-            compute_sleep_ms(schedule_ms, self.last_retry_after).min(remaining.as_millis() as u64);
+        // Round the remaining budget up so the sleep reaches the deadline —
+        // `as_millis()` truncation would undersleep by up to 1 ms, letting
+        // extra attempts run before the next `expired()` check binds.
+        let remaining_ms = remaining.as_millis() as u64 + u64::from(remaining.subsec_nanos() > 0);
+        let sleep_ms = compute_sleep_ms(schedule_ms, self.last_retry_after).min(remaining_ms);
         if !crate::shutdown::sleep_or_shutdown(Duration::from_millis(sleep_ms)).await {
             return Err(FailureClass::Shutdown);
         }
