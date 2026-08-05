@@ -6408,24 +6408,10 @@ pub async fn run_voice_pipeline() {
             if target_met || timed_out {
                 // Finalize any residual audio in phase3_audio_buf.
                 if !ctx.phase3_audio_buf.is_empty() {
-                    let chunk = std::mem::take(&mut ctx.phase3_audio_buf);
-                    let mut state = voice_state().write().unwrap_poison();
-                    let total_samples: usize = state
-                        .owner_negative_chunks
-                        .iter()
-                        .map(std::vec::Vec::len)
-                        .sum();
-                    if total_samples + chunk.len() <= MAX_OWNER_NEGATIVE_SAMPLES {
-                        state.owner_negative_chunks.push(chunk);
-                    } else {
-                        warn!(
-                            "owner_negative_chunks at capacity ({} samples): \
-                             dropping residual chunk of {} samples",
-                            MAX_OWNER_NEGATIVE_SAMPLES,
-                            chunk.len(),
-                        );
-                    }
-                    drop(state);
+                    push_owner_negative_chunk(
+                        std::mem::take(&mut ctx.phase3_audio_buf),
+                        "residual",
+                    );
                 }
 
                 // Cap is ~1.4M at 16kHz, well within f64 mantissa precision.
@@ -8104,6 +8090,28 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
 
 // Phase 3 owner-negative audio processing
 
+/// Append an owner-negative chunk under the [`MAX_OWNER_NEGATIVE_SAMPLES`]
+/// memory cap (dropping with a warning otherwise).  `label` distinguishes the
+/// final residual buffer from silence-bounded speech segments in the warning.
+fn push_owner_negative_chunk(chunk: Vec<f32>, label: &str) {
+    let mut state = voice_state().write().unwrap_poison();
+    let total_samples: usize = state
+        .owner_negative_chunks
+        .iter()
+        .map(std::vec::Vec::len)
+        .sum();
+    if total_samples + chunk.len() <= MAX_OWNER_NEGATIVE_SAMPLES {
+        state.owner_negative_chunks.push(chunk);
+    } else {
+        warn!(
+            "owner_negative_chunks at capacity ({} samples): \
+             dropping {label} chunk of {} samples",
+            MAX_OWNER_NEGATIVE_SAMPLES,
+            chunk.len(),
+        );
+    }
+}
+
 /// Process incoming audio for Phase 3 owner-negative collection.
 ///
 /// Duplicates the VAD frame iteration pattern from [`handle_enrollment_audio`]
@@ -8124,9 +8132,8 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
 /// as enrollment utterance end.
 ///
 /// Audio chunks are finalized into `voice_state().owner_negative_chunks` (not
-/// `PipelineCtx` — matches ambient negative pattern and survives mic resets).
-/// Memory cap is enforced: chunks that would exceed [`MAX_OWNER_NEGATIVE_SAMPLES`]
-/// are dropped.
+/// `PipelineCtx` — matches ambient negative pattern and survives mic resets),
+/// via [`push_owner_negative_chunk`] which enforces the memory cap.
 ///
 /// Updates `negatives_speech_samples` counter with the VAD-positive frames
 /// detected this call.
@@ -8160,25 +8167,10 @@ fn handle_negative_collection_audio(samples: &[f32], ctx: &mut PipelineCtx) {
             if ctx.phase3_silence_samples >= ENROLLMENT_SILENCE_THRESHOLD_SAMPLES {
                 let chunk_end = consumed.saturating_sub(ctx.phase3_silence_samples);
                 if chunk_end > segment_start {
-                    let chunk = ctx.phase3_audio_buf[segment_start..chunk_end].to_vec();
-                    let mut state = voice_state().write().unwrap_poison();
-                    // Memory cap: drop chunks that would exceed MAX_OWNER_NEGATIVE_SAMPLES.
-                    let total_samples: usize = state
-                        .owner_negative_chunks
-                        .iter()
-                        .map(std::vec::Vec::len)
-                        .sum();
-                    if total_samples + chunk.len() <= MAX_OWNER_NEGATIVE_SAMPLES {
-                        state.owner_negative_chunks.push(chunk);
-                    } else {
-                        warn!(
-                            "owner_negative_chunks at capacity ({} samples): dropping chunk \
-                             of {} samples",
-                            MAX_OWNER_NEGATIVE_SAMPLES,
-                            chunk.len(),
-                        );
-                    }
-                    drop(state);
+                    push_owner_negative_chunk(
+                        ctx.phase3_audio_buf[segment_start..chunk_end].to_vec(),
+                        "speech",
+                    );
                 }
                 // Advance segment_start past the silence boundary so the next
                 // segment starts after this silence region.
