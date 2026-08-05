@@ -26,6 +26,13 @@ pub struct HttpError {
     /// The response body text.
     pub body: String,
     /// Optional Retry-After duration in milliseconds (from the response header).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Read via parse_retry_after_ms (tests); production passes headers directly"
+        )
+    )]
     pub retry_after_ms: Option<u64>,
     /// Provider or operation name for display purposes.
     pub context: String,

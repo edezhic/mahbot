@@ -681,11 +681,6 @@ impl OpenAiCompatibleProvider {
         self.attach_auth_header(builder)
     }
 
-    /// Build the HTTP request for the default (non-scoped) client.
-    fn build_http_request(&self, request: &ProviderChatRequest) -> RequestBuilder {
-        self.build_http_request_with_client(self.http_client(), request)
-    }
-
     /// Attach the `Authorization: Bearer` header if a credential is configured.
     /// Returns the builder (with or without the header added) for chaining.
     fn attach_auth_header(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -814,43 +809,6 @@ fn envelope_telemetry(body: &str) -> (Option<String>, Option<u64>) {
 
 #[async_trait]
 impl Provider for OpenAiCompatibleProvider {
-    async fn chat(&self, request: ProviderChatRequest) -> anyhow::Result<ProviderChatResponse> {
-        let req_builder = self.build_http_request(&request);
-        let model = request.model;
-
-        let response = crate::shutdown::race_shutdown(req_builder.send())
-            .await
-            .map_err(|_| anyhow::anyhow!("shutdown during request"))?
-            .map_err(|e| {
-                anyhow::Error::from(e).context(format!("{} transport error", self.name))
-            })?;
-
-        if !response.status().is_success() {
-            let http_err = HttpError::from_response(response, &self.name).await;
-            return Err(anyhow::Error::from(http_err));
-        }
-
-        let body = crate::shutdown::race_shutdown(response.text())
-            .await
-            .map_err(|_| anyhow::anyhow!("shutdown during response body read"))?
-            .map_err(|e| {
-                anyhow::Error::from(e).context(format!("{} error reading response body", self.name))
-            })?;
-
-        let native_response: ApiChatResponse = serde_json::from_str(&body).map_err(|e| {
-            anyhow::anyhow!(
-                "{} chat completions parse error: {e}; body ({}): {:.500}",
-                self.name,
-                body.len(),
-                body
-            )
-        })?;
-
-        self.finalize_response(&model, native_response, || {
-            anyhow::anyhow!("No response from {}", self.name)
-        })
-    }
-
     async fn warmup(&self) -> anyhow::Result<()> {
         // Hit the chat completions URL with a GET to establish the connection pool.
         // The server will likely return 405 Method Not Allowed, which is fine -

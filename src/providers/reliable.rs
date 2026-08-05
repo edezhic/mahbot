@@ -1,7 +1,4 @@
-use super::Provider;
 use crate::util::error::HttpError;
-use crate::{ChatRequest, ChatResponse};
-use async_trait::async_trait;
 
 // ── Error Classification ─────────────────────────────────────────────────
 // Errors are split into retryable (transient server/network failures) and
@@ -120,64 +117,19 @@ pub(crate) fn classify_err(err: &anyhow::Error) -> ErrorClass {
 /// **Note for future providers**: if a new [`Provider`] implementation returns
 /// errors with Retry-After information that do NOT wrap [`HttpError`],
 /// a string-based fallback path may need to be added here.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Extracts Retry-After from plain errors; exercised by tests"
+    )
+)]
 pub(crate) fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
     // ── Typed path: extract from structured HttpError ──
     if let Some(http_err) = err.downcast_ref::<HttpError>() {
         return http_err.retry_after_ms;
     }
     None
-}
-
-// ── Provider Wrapper ─────────────────────────────────────────────────────
-// Retry orchestration lives in crate::retry (the single retry authority);
-// this wrapper only forwards chat calls to the scoped single-attempt path.
-
-/// Provider wrapper delegating chat to the scoped single-attempt path.
-///
-/// The outer retry loops in [`crate::retry`] are the single retry authority —
-/// this wrapper's `chat` is a thin passthrough to [`Self::chat_scoped`]
-/// required by the [`Provider`] trait, and does not retry.
-pub(crate) struct ReliableProvider {
-    provider: Box<dyn Provider>,
-}
-
-impl ReliableProvider {
-    #[must_use]
-    pub fn new(provider: Box<dyn Provider>) -> Self {
-        Self { provider }
-    }
-}
-
-#[async_trait]
-impl Provider for ReliableProvider {
-    async fn warmup(&self) -> anyhow::Result<()> {
-        self.provider.warmup().await
-    }
-
-    /// Thin passthrough to the scoped single-attempt path, required by the
-    /// [`Provider`] trait. Synthesizes the standard scoped timeouts; no
-    /// provider-internal retries — the outer loops in [`crate::retry`] are
-    /// the single retry authority.
-    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        let deadline = std::time::Instant::now() + crate::retry::DEFAULT_OPERATION_TIMEOUT;
-        self.chat_scoped(request, crate::retry::DEFAULT_IDLE_TIMEOUT, deadline)
-            .await
-            .map_err(|e| e.inner)
-    }
-
-    /// Scoped single-attempt chat: delegates to the inner provider. The outer
-    /// retry loops in [`crate::retry`] are the single retry authority for
-    /// scoped calls.
-    async fn chat_scoped(
-        &self,
-        request: ChatRequest,
-        idle_timeout: std::time::Duration,
-        deadline: std::time::Instant,
-    ) -> Result<ChatResponse, super::ScopedCallError> {
-        self.provider
-            .chat_scoped(request, idle_timeout, deadline)
-            .await
-    }
 }
 
 #[cfg(test)]
@@ -188,38 +140,6 @@ mod tests {
     /// retry_after=None, reducing boilerplate in error-classification tests.
     fn test_err(status: u16, body: &str) -> anyhow::Error {
         anyhow::Error::from(HttpError::new(status, "test", body, None))
-    }
-
-    /// Test double for warmup propagation tests.
-    struct TestProvider {
-        warmup_fails: bool,
-    }
-
-    impl TestProvider {
-        fn new() -> Self {
-            Self {
-                warmup_fails: false,
-            }
-        }
-
-        fn with_warmup_fail(mut self) -> Self {
-            self.warmup_fails = true;
-            self
-        }
-    }
-
-    #[async_trait]
-    impl Provider for TestProvider {
-        async fn chat(&self, _request: ChatRequest) -> anyhow::Result<ChatResponse> {
-            Ok(ChatResponse::default())
-        }
-
-        async fn warmup(&self) -> anyhow::Result<()> {
-            if self.warmup_fails {
-                anyhow::bail!("warmup failed");
-            }
-            Ok(())
-        }
     }
 
     // ── Error classification unit tests ───────────────────────
@@ -301,27 +221,6 @@ mod tests {
             classify_err(&test_err(502, "upstream model not found")),
             ErrorClass::Retryable
         );
-    }
-
-    #[tokio::test]
-    async fn warmup_propagates_inner_error() {
-        let inner = TestProvider::new().with_warmup_fail();
-        let provider = ReliableProvider::new(Box::new(inner) as Box<dyn Provider>);
-        let err = provider
-            .warmup()
-            .await
-            .expect_err("warmup should propagate error");
-        assert!(
-            err.to_string().contains("warmup failed"),
-            "expected 'warmup failed', got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn warmup_ok_when_inner_succeeds() {
-        let inner = TestProvider::new();
-        let provider = ReliableProvider::new(Box::new(inner) as Box<dyn Provider>);
-        provider.warmup().await.expect("warmup should succeed");
     }
 
     // ── Context window error handling ─────────────────────────

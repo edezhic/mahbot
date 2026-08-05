@@ -1294,7 +1294,23 @@ pub(crate) type ExtractionValidator<T> = dyn Fn(&T) -> Result<(), String> + Send
 #[async_trait]
 pub(crate) trait Provider: Send + Sync {
     /// Send a chat request using the model specified in the request.
-    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse>;
+    ///
+    /// The default implementation delegates to [`Self::chat_scoped`] with the
+    /// standard scoped timeouts (used by test doubles and any provider that
+    /// only implements the scoped path).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Default kept for test doubles; production dispatches chat_scoped"
+        )
+    )]
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let deadline = std::time::Instant::now() + crate::retry::DEFAULT_OPERATION_TIMEOUT;
+        self.chat_scoped(request, crate::retry::DEFAULT_IDLE_TIMEOUT, deadline)
+            .await
+            .map_err(|e| e.inner)
+    }
 
     /// Single-attempt chat for the outer retry paths.
     ///
@@ -1312,29 +1328,13 @@ pub(crate) trait Provider: Send + Sync {
     ///   diagnostics (response metadata, body head/tail) for the durable
     ///   `retry_failures` table.
     ///
-    /// The default implementation delegates to [`Self::chat`] with a plain
-    /// (metadata-less) failure record — used by non-wrapping providers (and
-    /// test doubles).
-    ///
-    /// **Contract caveat**: this fallback does NOT honor the guarantees above
-    /// (no provider-internal retries, idle-timeout / remaining-budget bounds).
-    /// Any provider used by the scoped retry paths (verdict extraction /
-    /// diagnostics discovery / analyst consolidation) MUST override this
-    /// method; [`crate::providers::compatible::OpenAiCompatibleProvider`]
-    /// (via `ReliableProvider`) and the test double do.
+    /// Real providers must implement this method (or override [`Self::chat`]).
     async fn chat_scoped(
         &self,
         request: ChatRequest,
         idle_timeout: std::time::Duration,
         deadline: std::time::Instant,
-    ) -> Result<ChatResponse, crate::providers::ScopedCallError> {
-        let started = std::time::Instant::now();
-        let _ = (idle_timeout, deadline);
-        match self.chat(request).await {
-            Ok(resp) => Ok(resp),
-            Err(e) => Err(crate::providers::ScopedCallError::from_plain(e, started)),
-        }
-    }
+    ) -> Result<ChatResponse, crate::providers::ScopedCallError>;
 
     async fn warmup(&self) -> anyhow::Result<()> {
         Ok(())

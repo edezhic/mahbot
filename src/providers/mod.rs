@@ -49,7 +49,6 @@ pub(crate) use crate::providers::transcribe::ImageTranscriber;
 
 use crate::retry::{FailureClass, RetryFailureRecord};
 use compatible::OpenAiCompatibleProvider;
-use reliable::ReliableProvider;
 
 // ── Scoped call error ────────────────────────────────────
 
@@ -79,24 +78,6 @@ impl ScopedCallError {
             class,
         }
     }
-
-    /// Build from a plain error with no HTTP metadata (default trait-impl
-    /// path / test doubles). Classification reuses the provider error
-    /// classifier; Retry-After is extracted when the error wraps an
-    /// [`HttpError`](crate::util::error::HttpError).
-    #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn from_plain(inner: anyhow::Error, started: Instant) -> Self {
-        let class = classify_failure(&inner);
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        let retry_after_ms = reliable::parse_retry_after_ms(&inner);
-        let record = RetryFailureRecord::new_simple(0, class, &inner, elapsed_ms, retry_after_ms);
-        Self {
-            inner,
-            record,
-            class,
-        }
-    }
 }
 
 impl std::fmt::Display for ScopedCallError {
@@ -118,13 +99,6 @@ pub(crate) fn failure_class(class: reliable::ErrorClass, truncated: bool) -> Fai
         reliable::ErrorClass::Retryable if truncated => FailureClass::TruncatedEnvelope,
         reliable::ErrorClass::Retryable => FailureClass::Transport,
     }
-}
-
-/// Map a plain error to a granular [`FailureClass`] using the provider error
-/// classifier (retryable vs non-retryable).
-#[must_use]
-pub(crate) fn classify_failure(err: &anyhow::Error) -> FailureClass {
-    failure_class(reliable::classify_err(err), false)
 }
 
 /// Ensure a base URL includes the `/chat/completions` path segment.
@@ -157,8 +131,8 @@ pub(crate) fn ensure_base_url(endpoint: &str) -> String {
 ///
 /// Splits `order` on commas, trims whitespace, and filters empty strings.
 /// Returns `None` when the resulting provider list is empty, so callers can
-/// skip inserting the routing block entirely (matching the pre-existing
-/// behaviour in [`compatible::build_http_request`]).
+/// skip inserting the routing block entirely (matching the behaviour of the
+/// OpenAI-compatible request builder).
 ///
 /// This works for both comma-separated provider lists (chat completions) and
 /// single-provider strings (transcription) — a single slug survives the
@@ -395,8 +369,8 @@ pub(crate) fn restore_provider_for_test(previous: Option<Arc<dyn Provider>>) {
 /// `provider_endpoint` overrides the base URL — the same headers are still sent (most
 /// providers ignore them harmlessly).
 ///
-/// Returns a provider wrapping an [`OpenAiCompatibleProvider`]; retry
-/// orchestration lives in [`crate::retry`].
+/// Returns an [`OpenAiCompatibleProvider`]; retry orchestration lives in
+/// [`crate::retry`].
 #[allow(clippy::unnecessary_wraps)]
 pub(crate) fn create_provider(
     api_key: Option<&str>,
@@ -418,7 +392,7 @@ pub(crate) fn create_provider(
     let base = OpenAiCompatibleProvider::new("OpenRouter", base_url.as_str(), resolved_key)
         .with_extra_headers(extra_headers);
 
-    Ok(Box::new(ReliableProvider::new(Box::new(base))))
+    Ok(Box::new(base))
 }
 
 /// Generic helper to build a transcriber from flat config options.

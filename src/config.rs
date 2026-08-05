@@ -64,8 +64,7 @@
 //! [`ConfigReload::model_routing`]. When no entry exists, all fields on the
 //! returned [`ModelRouting`] — `provider_order` and `allow_fallbacks` — are `None`.
 //! The provider layer (in [`crate::providers`]) resolves these `None` values at
-//! request time (see `build_http_request` in
-//! [`crate::providers::compatible`]).
+//! request time when building the OpenAI-compatible chat request.
 //!
 //! # Persistence layer
 //!
@@ -96,8 +95,8 @@
 //!
 //! * [`crate::config_db`] — database persistence for all three chains.
 //! * [`crate::role`] — [`crate::role::RoleInfo`] definitions with per-role defaults.
-//! * `build_http_request` in [`crate::providers::compatible`] — where `None` routing
-//!   fields are resolved at the provider layer.
+//! * [`crate::providers::compatible`] — where `None` routing fields are resolved
+//!   at the provider layer.
 
 use crate::Role;
 use crate::config_db::ConfigStore;
