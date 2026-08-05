@@ -1710,26 +1710,24 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
 
     let extraction_prompt = crate::prompt::load_prompt("extraction/sanitation.md");
 
-    let verdict: crate::SanitationVerdict = match agent
-        .extract_verdict(&extraction_prompt, Some(&validate_sanitation_verdict))
-        .await
-    {
-        Ok(v) => v,
-        Err(failure) => {
-            warn!(
-                ticket = %ticket.id,
-                error = %failure,
-                "Failed to extract sanitation verdict — clearing assigned_to for retry"
-            );
-            record_sanitation_failure(
-                &ticket.id,
-                format!("verdict extraction error: {failure}"),
-                Some(&failure),
-            )
-            .await;
-            return;
-        }
-    };
+    let verdict: crate::SanitationVerdict =
+        match agent.extract_verdict(&extraction_prompt, None).await {
+            Ok(v) => v,
+            Err(failure) => {
+                warn!(
+                    ticket = %ticket.id,
+                    error = %failure,
+                    "Failed to extract sanitation verdict — clearing assigned_to for retry"
+                );
+                record_sanitation_failure(
+                    &ticket.id,
+                    format!("verdict extraction error: {failure}"),
+                    Some(&failure),
+                )
+                .await;
+                return;
+            }
+        };
 
     process_sanitation_verdict(&ticket, verdict).await;
 }
@@ -2078,13 +2076,6 @@ fn validate_verdict_score(v: &crate::Verdict) -> Result<(), String> {
     } else {
         Err(format!("verdict score {} out of range [0,10]", v.score))
     }
-}
-
-/// Sanitation verdicts carry a `bool` pass flag — nothing to range-check.
-/// The `Result` signature is required by [`crate::ExtractionValidator`].
-#[allow(clippy::unnecessary_wraps)]
-fn validate_sanitation_verdict(_v: &crate::SanitationVerdict) -> Result<(), String> {
-    Ok(())
 }
 
 /// Run [`PARALLEL_AGENT_COUNT`] agents of the same role in parallel, then extract structured verdicts
