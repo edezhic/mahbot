@@ -362,9 +362,8 @@ impl WorkspacesState {
                 let name_clone = name.clone();
                 Task::perform(
                     async move {
-                        let timestamp = crate::turso::now();
                         crate::workspace::store()
-                            .set_diagnostics(&name_clone, &cmds, &timestamp)
+                            .set_diagnostics(&name_clone, &cmds)
                             .await
                             .map_err(|e| e.to_string())
                     },

@@ -181,6 +181,14 @@ pub async fn run_dead_session_recovery_loop() {
 
 // ── Core detection + recovery logic ─────────────────────────────────────────
 
+/// Agent-ID prefixes excluded from dead-session recovery: `manager_` plus all
+/// [`TRANSIENT_AGENT_ID_PREFIXES`]. `manager_` stays out of the slice itself
+/// (Manager sessions must survive and keep their shared context) — this
+/// builds the union from it without duplicating the prefix list.
+fn excluded_agent_id_prefixes() -> impl Iterator<Item = &'static str> {
+    std::iter::once("manager_").chain(TRANSIENT_AGENT_ID_PREFIXES.iter().copied())
+}
+
 /// Check all sessions for dead direct user-agent sessions and route recovery
 /// jobs where needed.
 async fn recover_dead_sessions() -> anyhow::Result<()> {
@@ -191,11 +199,7 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
     // per-session `get_last_message_role` queries below are lightweight
     // (indexed `ORDER BY id DESC LIMIT 1`) and only run for eligible sessions.
     let sessions = crate::session::store()
-        .list_sessions_with_metadata_excluding(
-            &std::iter::once("manager_")
-                .chain(TRANSIENT_AGENT_ID_PREFIXES.iter().copied())
-                .collect::<Vec<&str>>(),
-        )
+        .list_sessions_with_metadata_excluding(&excluded_agent_id_prefixes().collect::<Vec<&str>>())
         .await;
 
     for session in &sessions {
@@ -295,12 +299,7 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
 /// retained for test coverage and as documentation of the exclusion criteria.
 #[cfg(test)]
 fn is_excluded_agent_id(agent_id: &str) -> bool {
-    if agent_id.starts_with("manager_") {
-        return true;
-    }
-    TRANSIENT_AGENT_ID_PREFIXES
-        .iter()
-        .any(|p| agent_id.starts_with(p))
+    excluded_agent_id_prefixes().any(|p| agent_id.starts_with(p))
 }
 
 /// Route a recovery job for a dead session with validated context.
@@ -347,12 +346,11 @@ fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::TRANSIENT_AGENT_ID_PREFIXES;
 
     #[test]
     fn test_is_excluded_agent_id_transient_prefixes() {
         // Must match the union of TRANSIENT_AGENT_ID_PREFIXES + manager_.
-        for prefix in std::iter::once(&"manager_").chain(TRANSIENT_AGENT_ID_PREFIXES.iter()) {
+        for prefix in excluded_agent_id_prefixes() {
             let id = format!("{prefix}suffix");
             assert!(
                 is_excluded_agent_id(&id),

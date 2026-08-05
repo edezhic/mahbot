@@ -166,7 +166,7 @@ async fn test_unconditional_transition_clears_assignment() {
 
     // Set assigned_to explicitly (matching production dispatch_engineer behavior)
     store
-        .set_assigned_to(&claimed.id, Some(Role::Engineer.as_str()))
+        .set_assigned_to_no_cancel(&claimed.id, Some(Role::Engineer.as_str()))
         .await
         .expect("set_assigned_to");
     let ticket = store
@@ -1757,7 +1757,7 @@ async fn test_claim_diagnostics() {
 
         if matches!(case.scenario, Scenario::AlreadyAssigned) {
             store
-                .set_assigned_to(&id, Some(DIAGNOSTICS_ROLE))
+                .set_assigned_to_no_cancel(&id, Some(DIAGNOSTICS_ROLE))
                 .await
                 .expect("set_assigned_to");
         }
@@ -1962,14 +1962,14 @@ async fn test_set_assigned_to_none() {
     let (store, _tmp, id) = setup().await;
 
     store
-        .set_assigned_to(&id, Some(DIAGNOSTICS_ROLE))
+        .set_assigned_to_no_cancel(&id, Some(DIAGNOSTICS_ROLE))
         .await
         .expect("set_assigned_to");
     let ticket = crate::util::test::expect_ticket(&store, &id).await;
     assert_eq!(ticket.assigned_to.as_deref(), Some(DIAGNOSTICS_ROLE));
 
     store
-        .set_assigned_to(&id, None)
+        .set_assigned_to_no_cancel(&id, None)
         .await
         .expect("set_assigned_to(None) should clear assignee");
     let ticket = crate::util::test::expect_ticket(&store, &id).await;
@@ -1977,13 +1977,13 @@ async fn test_set_assigned_to_none() {
 
     // Idempotent: clearing an already-None assignee succeeds
     store
-        .set_assigned_to(&id, None)
+        .set_assigned_to_no_cancel(&id, None)
         .await
         .expect("second set_assigned_to(None) should also succeed");
 
     // Non-existent ticket fails
     let (store2, _tmp2) = open_test_store().await;
-    let result = store2.set_assigned_to("nonexistent", None).await;
+    let result = store2.set_assigned_to_no_cancel("nonexistent", None).await;
     assert!(
         result.is_err(),
         "set_assigned_to(None) on nonexistent ticket should fail"
@@ -2071,7 +2071,7 @@ async fn test_ticket_roundtrip_all_fields() {
 
     // ── Mutated ticket (assigned_to + commit info) ──────────────────────
     store
-        .set_assigned_to(&id, Some("test_assignee"))
+        .set_assigned_to_no_cancel(&id, Some("test_assignee"))
         .await
         .expect("set_assigned_to");
 

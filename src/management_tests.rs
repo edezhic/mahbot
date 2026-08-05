@@ -1314,7 +1314,7 @@ async fn dispatch_diagnostics_cases() {
 
         if let Some(cmds) = &case.commands {
             crate::workspace::store()
-                .set_diagnostics(case.ws_suffix, cmds, &crate::turso::now())
+                .set_diagnostics(case.ws_suffix, cmds)
                 .await
                 .expect("set diagnostics");
         }

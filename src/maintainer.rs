@@ -282,7 +282,6 @@ mod tests {
             maintainer_debounce_mins: debounce_mins,
             maintainer_last_run_at: last_run_at.map(String::from),
             diagnostics: None,
-            diagnostics_updated_at: None,
             notes: String::new(),
             last_analyzed_commit: None,
         }

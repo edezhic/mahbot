@@ -7,6 +7,7 @@ use crate::Role;
 use crate::Workspace;
 use crate::WorkspaceStatus;
 use crate::agent::run_agent;
+use crate::role::DIAGNOSTICS_ROLE;
 use crate::session::discovery_agent_id;
 use crate::turso::{self};
 use anyhow::{Context, Result};
@@ -81,7 +82,6 @@ crate::columns! {
         MAINTAINER_DEBOUNCE_MINS => "maintainer_debounce_mins",
         MAINTAINER_LAST_RUN_AT  => "maintainer_last_run_at",
         DIAGNOSTICS           => "diagnostics",
-        DIAGNOSTICS_UPDATED_AT => "diagnostics_updated_at",
         NOTES                  => "notes",
         LAST_ANALYZED_COMMIT   => "last_analyzed_commit",
     }
@@ -242,7 +242,7 @@ async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) 
 
     tracing::info!(workspace_name = ws.name, "Starting diagnostics discovery");
 
-    let agent_id = discovery_agent_id(&ws.name, "diagnostics");
+    let agent_id = discovery_agent_id(&ws.name, DIAGNOSTICS_ROLE);
 
     // Load the diagnostics discovery prompt directly (not a role-specific discovery prompt).
     let prompt = crate::prompt::load_prompt("discovery/diagnostics.md");
@@ -280,15 +280,14 @@ async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) 
         &ws.name,
         diagnostics_generation,
         GenerationColumn::DIAGNOSTICS,
-        "diagnostics",
+        DIAGNOSTICS_ROLE,
     )
     .await
     {
         return Ok(());
     }
 
-    let now = turso::now();
-    storage.set_diagnostics(&ws.name, &cmds, &now).await?;
+    storage.set_diagnostics(&ws.name, &cmds).await?;
 
     tracing::info!(
         workspace_name = ws.name,
@@ -356,8 +355,8 @@ async fn finalize_discovery(
         if let Err(e) = storage
             .conn
             .execute(
-                "UPDATE workspaces SET status = 'ready', paused = 0, last_analyzed_commit = ?1, updated_at = ?2 WHERE name = ?3",
-                turso::params![commit_hash.as_deref(), now, ws_name],
+                "UPDATE workspaces SET status = ?1, paused = 0, last_analyzed_commit = ?2, updated_at = ?3 WHERE name = ?4",
+                turso::params![WorkspaceStatus::Ready.to_string(), commit_hash.as_deref(), now, ws_name],
             )
             .await
         {
@@ -601,7 +600,6 @@ fn workspace_from_row(row: &turso::Row) -> anyhow::Result<Workspace> {
         maintainer_debounce_mins: row.get::<i64>(COL_WS_MAINTAINER_DEBOUNCE_MINS)?,
         maintainer_last_run_at: row.get::<Option<String>>(COL_WS_MAINTAINER_LAST_RUN_AT)?,
         diagnostics: row.get::<Option<String>>(COL_WS_DIAGNOSTICS)?,
-        diagnostics_updated_at: row.get::<Option<String>>(COL_WS_DIAGNOSTICS_UPDATED_AT)?,
         notes: row.get::<String>(COL_WS_NOTES)?,
         last_analyzed_commit: row.get::<Option<String>>(COL_WS_LAST_ANALYZED_COMMIT)?,
     })
@@ -647,7 +645,6 @@ impl WorkspaceStore {
             maintainer_debounce_mins: 5,
             maintainer_last_run_at: None,
             diagnostics: None,
-            diagnostics_updated_at: None,
             notes: String::new(),
             last_analyzed_commit: None,
         };
@@ -811,13 +808,12 @@ impl WorkspaceStore {
         &self,
         name: &str,
         commands: &crate::DiagnosticsCommands,
-        timestamp: &str,
     ) -> Result<()> {
         let json = serde_json::to_string(commands)?;
         self.conn
             .execute(
-                "UPDATE workspaces SET diagnostics = ?1, diagnostics_updated_at = ?2, diagnostics_generation = diagnostics_generation + 1, updated_at = ?3 WHERE name = ?4",
-                turso::params![json, timestamp, turso::now(), name],
+                "UPDATE workspaces SET diagnostics = ?1, diagnostics_generation = diagnostics_generation + 1, updated_at = ?2 WHERE name = ?3",
+                turso::params![json, turso::now(), name],
             )
             .await?;
         Ok(())
@@ -908,8 +904,8 @@ impl WorkspaceStore {
         // diagnostics survive re-analysis.
         self.conn
             .execute(
-                "UPDATE workspaces SET discovery_generation = discovery_generation + 1, status = 'analyzing', paused = 1, updated_at = ?1 WHERE name = ?2",
-                turso::params![now, name],
+                "UPDATE workspaces SET discovery_generation = discovery_generation + 1, status = ?2, paused = 1, updated_at = ?1 WHERE name = ?3",
+                turso::params![now, WorkspaceStatus::Analyzing.to_string(), name],
             )
             .await?;
 
@@ -949,7 +945,7 @@ impl WorkspaceStore {
         // discovery_generation — role discovery is unaffected.
         self.conn
             .execute(
-                "UPDATE workspaces SET diagnostics_generation = diagnostics_generation + 1, diagnostics = NULL, diagnostics_updated_at = NULL, updated_at = ?1 WHERE name = ?2",
+                "UPDATE workspaces SET diagnostics_generation = diagnostics_generation + 1, diagnostics = NULL, updated_at = ?1 WHERE name = ?2",
                 turso::params![now, name],
             )
             .await?;
@@ -1372,7 +1368,6 @@ mod tests {
             maintainer_debounce_mins: 5,
             maintainer_last_run_at: None,
             diagnostics: None,
-            diagnostics_updated_at: None,
             notes: String::new(),
             last_analyzed_commit: None,
         }
@@ -1820,9 +1815,8 @@ mod tests {
             lint: Some("cargo clippy -- -D warnings".into()),
             ..Default::default()
         };
-        let now = crate::turso::now();
         store
-            .set_diagnostics("diag_test", &cmds, &now)
+            .set_diagnostics("diag_test", &cmds)
             .await
             .expect("set_diagnostics");
 
@@ -1861,9 +1855,8 @@ mod tests {
         insert_direct(&store, "bump_test", "/tmp/bump_test", false, false, 0, 0).await;
 
         let cmds = crate::DiagnosticsCommands::default();
-        let now = crate::turso::now();
         store
-            .set_diagnostics("bump_test", &cmds, &now)
+            .set_diagnostics("bump_test", &cmds)
             .await
             .expect("set_diagnostics");
 
@@ -1887,9 +1880,8 @@ mod tests {
             build: Some("cargo build".into()),
             ..Default::default()
         };
-        let now = crate::turso::now();
         store
-            .set_diagnostics("redia_test", &cmds, &now)
+            .set_diagnostics("redia_test", &cmds)
             .await
             .expect("set_diagnostics");
         assert!(
@@ -1954,9 +1946,8 @@ mod tests {
             format: Some("cargo fmt".into()),
             ..Default::default()
         };
-        let now = crate::turso::now();
         store
-            .set_diagnostics("diag_stale", &cmds, &now)
+            .set_diagnostics("diag_stale", &cmds)
             .await
             .expect("set_diagnostics");
 

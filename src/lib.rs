@@ -329,9 +329,6 @@ pub struct Workspace {
     /// JSON blob of discovered dev commands (format, lint, build, test, etc.).
     /// `None` before the first diagnostics discovery run.
     pub diagnostics: Option<String>,
-    /// RFC 3339 timestamp of the last completed diagnostics discovery run.
-    /// `None` before the first diagnostics discovery run.
-    pub diagnostics_updated_at: Option<String>,
     /// Freeform user-curated context notes appended to every agent's
     /// system prompt. Empty by default. Max 4000 characters.
     /// Persisted in the `workspaces.notes` column.
@@ -356,7 +353,6 @@ impl Default for Workspace {
             maintainer_debounce_mins: 5,
             maintainer_last_run_at: Option::default(),
             diagnostics: Option::default(),
-            diagnostics_updated_at: Option::default(),
             notes: String::default(),
             last_analyzed_commit: Option::default(),
         }

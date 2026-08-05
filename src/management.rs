@@ -70,9 +70,9 @@ fn board() -> &'static BoardStore {
 /// transitioning the ticket. Errors are logged but not propagated —
 /// callers are already on an error path and should not fail again here.
 ///
-/// Uses [`BoardStore::clear_assigned_to_no_cancel`] — unlike
-/// [`BoardStore::set_assigned_to`], this does NOT cancel any running agent.
-/// All call sites are post-agent so there is no agent to cancel.
+/// Uses [`BoardStore::set_assigned_to_no_cancel`] with `None` — the
+/// non-cancelling assignment variant. All call sites are post-agent so there
+/// is no agent to cancel.
 ///
 /// ## TOCTOU race
 ///
@@ -80,7 +80,7 @@ fn board() -> &'static BoardStore {
 /// clear. That's very low probability and the same race is accepted in
 /// [`record_sanitation_failure`].
 async fn clear_assigned_to_no_cancel(ticket_id: &str, context: &str) {
-    if let Err(e) = board().clear_assigned_to_no_cancel(ticket_id).await {
+    if let Err(e) = board().set_assigned_to_no_cancel(ticket_id, None).await {
         warn!(
             ticket = %ticket_id,
             error = %e,
@@ -349,6 +349,31 @@ async fn comment_and_transition(ctx: TransitionCtx<'_>, role: &str, text: &str) 
         Ok(())
     })
     .await
+}
+
+/// Shared finalizer for post-agent comment-and-transition sites.
+///
+/// Runs [`comment_and_transition`] and, on success, logs `message` with the
+/// ticket ID and, when given, the `target` phase field — both are parameters
+/// so existing log output is preserved exactly across call sites. On failure
+/// `comment_and_transition` already logs the warning, so nothing more is
+/// emitted here. Must be the caller's final step.
+async fn comment_and_transition_or_bail(
+    ctx: TransitionCtx<'_>,
+    role: &str,
+    text: &str,
+    message: &str,
+    target: Option<&TicketPhase>,
+) {
+    let ticket_id = &ctx.ticket.id;
+    if !comment_and_transition(ctx, role, text).await {
+        return;
+    }
+    if let Some(target) = target {
+        info!(ticket = %ticket_id, target = %target, "{message}");
+    } else {
+        info!(ticket = %ticket_id, "{message}");
+    }
 }
 
 /// Resolve a workspace from a ticket's stored `workspace_name`.
@@ -834,31 +859,6 @@ where
     .await;
 }
 
-/// Dispatch unassigned tickets in the given phase.
-///
-/// Both DiagnosticsCheck and SanitationCheck use this pattern because the
-/// ticket stays in its current phase while the agent runs (rather than
-/// transitioning via the claim loop). We list tickets for the phase directly
-/// and guard against re-dispatch via \`assigned_to IS NULL\` — tickets that
-/// already have an \`assigned_to\` value are mid-execution and should not be
-/// re-dispatched.
-///
-/// Transient DB listing errors are safe: tickets stay in their current phase
-/// and are re-dispatched on the next poll cycle (~1s).
-async fn dispatch_unassigned_in_phase(
-    phase: TicketPhase,
-    dispatch_phase: PollPhase,
-    ws: &Workspace,
-) {
-    for_each_ticket_in_phase(phase, &ws.name, |ticket| {
-        if ticket.assigned_to.is_some() {
-            return;
-        }
-        spawn_dispatch(dispatch_phase, ticket, ws.clone());
-    })
-    .await;
-}
-
 /// Run one poll round: claim actionable tickets and dispatch agents.
 ///
 /// Workspaces are processed concurrently via [`tokio::spawn`] so that a
@@ -936,9 +936,17 @@ async fn process_single_workspace(ws: Workspace) {
     run_claim_pipeline(&ws).await;
 
     // 2. DiagnosticsCheck — diagnostics keeps the ticket in InDiagnostics
-    // while running, so the claim loop isn't applicable.
-    dispatch_unassigned_in_phase(TicketPhase::InDiagnostics, PollPhase::DiagnosticsCheck, &ws)
-        .await;
+    // while running, so the claim loop isn't applicable. Tickets that already
+    // have assigned_to set are mid-execution and must not be re-dispatched;
+    // transient DB listing errors are safe — tickets stay in phase and are
+    // re-dispatched on the next poll cycle (~1s).
+    spawn_for_each_ticket_in_phase(TicketPhase::InDiagnostics, &ws, |ticket, ws| async move {
+        if ticket.assigned_to.is_some() {
+            return;
+        }
+        spawn_dispatch(PollPhase::DiagnosticsCheck, ticket, ws);
+    })
+    .await;
 
     // 3. SanitationPassed → Done (auto-commit), following the same pattern
     // as the QaPassed→Done commit flow.
@@ -978,10 +986,16 @@ async fn process_single_workspace(ws: Workspace) {
 
     // 5. SanitationCheck — handle_qa_passed (step 4) runs in spawned tasks concurrent
     //    with this step. It may: (a) claim QaPassed→InSanitation with assigned_to set,
-    //    or (b) commit the ticket directly to Done. dispatch_unassigned_in_phase skips
-    //    tickets whose assigned_to.is_some() is true — neither path races with this
-    //    step because the ticket is either in a different phase or already assigned.
-    dispatch_unassigned_in_phase(TicketPhase::InSanitation, PollPhase::SanitationCheck, &ws).await;
+    //    or (b) commit the ticket directly to Done. Tickets that already have
+    //    assigned_to set are mid-execution and are skipped — neither path races with
+    //    this step because the ticket is either in a different phase or already assigned.
+    spawn_for_each_ticket_in_phase(TicketPhase::InSanitation, &ws, |ticket, ws| async move {
+        if ticket.assigned_to.is_some() {
+            return;
+        }
+        spawn_dispatch(PollPhase::SanitationCheck, ticket, ws);
+    })
+    .await;
 }
 
 /// Claim for each pipeline phase in a workspace.
@@ -1110,7 +1124,12 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     let agent_id = ticket_agent_id(&ticket.id, Role::Engineer.as_str());
 
     // Register in the message router so comments can be delivered mid-work.
-    let incoming_rx = message_router::register_agent(&agent_id);
+    let incoming_rx = register_agent_and_assign(
+        &ticket.id,
+        &agent_id,
+        "Failed to persist assigned_to — stale agent already cancelled at dispatch, proceeding without DB assignment",
+    )
+    .await;
 
     let last_eng_pos = ticket
         .comments
@@ -1131,14 +1150,6 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
             &[("{{feedback}}", &feedback.join("\n---\n"))],
         )
     };
-
-    if let Err(e) = board().set_assigned_to(&ticket.id, Some(&agent_id)).await {
-        warn!(
-            ticket = %ticket.id,
-            error = %e,
-            "Failed to persist assigned_to — stale agent already cancelled at dispatch, proceeding without DB assignment",
-        );
-    }
 
     let (agent, response) = run_single_agent(
         agent_id,
@@ -1178,7 +1189,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         )
     };
 
-    if !comment_and_transition(
+    comment_and_transition_or_bail(
         TransitionCtx {
             ticket: &ticket,
             source: TicketPhase::InDevelopment,
@@ -1188,17 +1199,10 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         },
         Role::Engineer.as_str(),
         comment_text,
-    )
-    .await
-    {
-        return;
-    }
-
-    info!(
-        ticket = %ticket.id,
-        target = %target_phase,
         "Engineer finished — transitioned ticket",
-    );
+        Some(&target_phase),
+    )
+    .await;
 }
 
 /// Determine whether to notify immediately or buffer the Done transition.
@@ -1537,6 +1541,49 @@ async fn record_sanitation_failure(
     }
 }
 
+/// Register an agent in the message router and persist the SAME ID in the
+/// ticket's `assigned_to` so mid-run comments route to it.
+///
+/// Returns the agent's inbox receiver, ready for [`run_agent`].
+///
+/// # Ordering invariant (register-before-set)
+///
+/// The router registration MUST happen before `assigned_to` is updated —
+/// routing looks the stored ID up in the router, so persisting an ID that is
+/// not yet registered would create a drop window.
+///
+/// Uses [`BoardStore::set_assigned_to_no_cancel`] (the non-cancelling
+/// variant): the cancel-variant side-effect `AGENT_REGISTRY.cancel_by_ticket_id`
+/// would kill a concurrently running agent for this ticket. That cancel is a
+/// no-op at this point anyway —
+/// no agent for this ticket is in `AGENT_REGISTRY` yet (agents enter it only
+/// inside [`run_agent`], after assignment) and stale agents were already
+/// cancelled pre-flight by [`spawn_dispatch`].
+///
+/// The warn message is a parameter because call sites describe the failure
+/// differently.
+async fn register_agent_and_assign(
+    ticket_id: &str,
+    agent_id: &str,
+    warn_message: &str,
+) -> tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob> {
+    // Register in the message router so comments can be delivered mid-work.
+    let incoming_rx = message_router::register_agent(agent_id);
+
+    if let Err(e) = board()
+        .set_assigned_to_no_cancel(ticket_id, Some(agent_id))
+        .await
+    {
+        warn!(
+            ticket = ticket_id,
+            error = %e,
+            "{warn_message}",
+        );
+    }
+
+    incoming_rx
+}
+
 /// Register a sanitation agent in the message router and persist the SAME
 /// suffixed agent ID in the ticket's `assigned_to`.
 ///
@@ -1561,19 +1608,7 @@ async fn record_sanitation_failure(
 /// cancelling the agent every cycle until the sanitation circuit breaker
 /// trips).
 ///
-/// # Ordering invariant (register-before-set)
-///
-/// The router registration MUST happen before `assigned_to` is updated —
-/// routing looks the stored ID up in the router, so persisting an ID that is
-/// not yet registered would create a drop window.
-///
-/// Uses [`BoardStore::set_assigned_to_no_cancel`] (NOT the cancel variant
-/// [`BoardStore::set_assigned_to`]): the cancel variant calls
-/// `AGENT_REGISTRY.cancel_by_ticket_id`, which would kill a concurrently
-/// running agent for this ticket — orphaning the just-registered router
-/// entry. This mirrors the register-before-set ordering of
-/// [`dispatch_engineer`] and the no-cancel assignment of
-/// [`run_parallel_agents`].
+/// Delegates registration + assignment to [`register_agent_and_assign`].
 async fn register_sanitation_agent(
     ticket_id: &str,
 ) -> (
@@ -1586,19 +1621,12 @@ async fn register_sanitation_agent(
         crate::generate_suffix()
     );
 
-    // Register in the message router so comments can be delivered mid-work.
-    let incoming_rx = message_router::register_agent(&agent_id);
-
-    if let Err(e) = board()
-        .set_assigned_to_no_cancel(ticket_id, Some(&agent_id))
-        .await
-    {
-        warn!(
-            ticket = ticket_id,
-            error = %e,
-            "Failed to persist assigned_to for sanitation agent — mid-run comments may not route",
-        );
-    }
+    let incoming_rx = register_agent_and_assign(
+        ticket_id,
+        &agent_id,
+        "Failed to persist assigned_to for sanitation agent — mid-run comments may not route",
+    )
+    .await;
 
     (agent_id, incoming_rx)
 }
@@ -1731,7 +1759,7 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
             "🧹 Sanitation passed{passed_suffix}: {rationale}",
             rationale = verdict.rationale
         );
-        if !comment_and_transition(
+        comment_and_transition_or_bail(
             TransitionCtx {
                 ticket,
                 source: TicketPhase::InSanitation,
@@ -1741,16 +1769,10 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
             },
             Role::Sanitation.as_str(),
             &comment,
-        )
-        .await
-        {
-            return;
-        }
-
-        info!(
-            ticket = %ticket.id,
             "Sanitation passed — transitioned to SanitationPassed",
-        );
+            None,
+        )
+        .await;
     } else {
         let garbage_list = verdict.garbage_files.join("\n- ");
         let comment = substitute(
@@ -1995,7 +2017,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
             }
         };
 
-    if !comment_and_transition(
+    comment_and_transition_or_bail(
         TransitionCtx {
             ticket: &ticket,
             source: TicketPhase::InDiagnostics,
@@ -2005,17 +2027,10 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
         },
         DIAGNOSTICS_ROLE,
         &comment_body,
-    )
-    .await
-    {
-        return;
-    }
-
-    info!(
-        ticket = %ticket.id,
-        target = %target_phase,
         "Diagnostics finished — transitioned ticket",
-    );
+        Some(&target_phase),
+    )
+    .await;
 }
 
 // ── Parallel agent helpers (shared) ─────────────────────────────────────
@@ -2181,7 +2196,7 @@ async fn run_parallel_agents(
     };
 
     // ── Cleanup: clear assigned_to (no cancel, agents already done) ────
-    if let Err(e) = board().clear_assigned_to_no_cancel(&ticket.id).await {
+    if let Err(e) = board().set_assigned_to_no_cancel(&ticket.id, None).await {
         warn!(
             ticket = %ticket.id,
             error = %e,
@@ -2619,9 +2634,9 @@ async fn try_trip_circuit_breaker(
 ) -> bool {
     let comments = if ticket.comments.is_empty() {
         // Comments are only pre-loaded for claim-pipeline tickets
-        // (LoadComments::Yes via claim_ticket_in_workspace). Tickets from
-        // dispatch_unassigned_in_phase (list_all_tickets with LoadComments::No)
-        // have an empty vec — fetch from DB.
+        // (LoadComments::Yes via claim_ticket_in_workspace). Tickets listed by
+        // the poll loop's in-phase dispatchers (LoadComments::No) have an empty
+        // vec — fetch from DB.
         match board().get_comments(&ticket.id).await {
             Ok(c) => c,
             Err(e) => {

@@ -1045,7 +1045,7 @@ impl BoardStore {
     /// reservation so the cleared slot is available for other tickets.
     /// Callers that require agent-level assignment
     /// (single-owner dispatches like the Engineer) should call
-    /// [`set_assigned_to`](Self::set_assigned_to) after claiming. Parallel-agent
+    /// [`set_assigned_to_no_cancel`](Self::set_assigned_to_no_cancel) after claiming. Parallel-agent
     /// dispatches (analysts, verifiers) intentionally leave `assigned_to` NULL.
     pub(crate) async fn claim_ticket_in_workspace(
         &self,
@@ -1318,54 +1318,16 @@ impl BoardStore {
         Ok(())
     }
 
-    /// Set or clear the assignee for a ticket (does not change phase).
+    /// Set or clear the assignee for a ticket **without** cancelling any running
+    /// agent.
     ///
     /// When `assigned_to` is `Some(value)`, sets the `assigned_to` column to that
     /// value. When `None`, clears the assignee (sets `assigned_to = NULL`).
     ///
-    /// Cancels any running agents registered on this ticket as a safety-in-depth
-    /// measure against stale assignments. For set operations, callers typically
-    /// set the assignee before spawning an agent, so the cancel is normally a
-    /// no-op.
-    ///
-    /// ## When to use [`clear_assigned_to_no_cancel`](Self::clear_assigned_to_no_cancel)
-    ///
-    /// If you are clearing the assignee (`assigned_to = None`) and know that no
-    /// agent is running (e.g., post-agent cleanup), prefer
-    /// [`clear_assigned_to_no_cancel`](Self::clear_assigned_to_no_cancel) to avoid
-    /// the misleading cancellation side-effect.
-    pub async fn set_assigned_to(&self, ticket_id: &str, assigned_to: Option<&str>) -> Result<()> {
-        let prepared = Self::build_ticket_update_with_updated_at(
-            "assigned_to = ?",
-            vec![Value::from(assigned_to)],
-            ticket_id,
-        );
-        prepared.execute_and_cancel(&self.conn).await
-    }
-
-    /// Clear the assignee for a ticket **without** cancelling any running agent.
-    ///
-    /// This is the safe choice for post-agent operations (e.g., after an agent
-    /// has already finished) where no agent is running and the cancellation
-    /// side-effect of [`set_assigned_to`](Self::set_assigned_to) would be
-    /// misleading.
-    ///
-    /// To set a new assignee (with stale-agent cancellation), use
-    /// [`set_assigned_to`](Self::set_assigned_to).
-    pub async fn clear_assigned_to_no_cancel(&self, ticket_id: &str) -> Result<()> {
-        let prepared = Self::build_ticket_update_with_updated_at(
-            "assigned_to = ?",
-            vec![Value::from(None::<&str>)],
-            ticket_id,
-        );
-        prepared.execute_no_cancel(&self.conn).await
-    }
-
-    /// Set the assignee for a ticket **without** cancelling any running agent.
-    ///
     /// This is the safe choice for parallel agent phases (analysis, review, QA)
     /// where multiple agents are registered and should NOT be cancelled by the
-    /// assignment update.
+    /// assignment update, and for all post-agent cleanup (no agent is running,
+    /// so the cancellation side-effect would be misleading).
     pub async fn set_assigned_to_no_cancel(
         &self,
         ticket_id: &str,
@@ -1406,7 +1368,7 @@ impl BoardStore {
     /// atomic SQL guard that prevents the TOCTOU race between the poll
     /// listing pre-filter and the subsequent claim. The assignee set and phase
     /// check are fused into one UPDATE; callers do not need a separate
-    /// `set_assigned_to` after claiming.
+    /// assignment after claiming.
     ///
     /// Returns `Ok(true)` if a row was updated (claim succeeded), `Ok(false)`
     /// if no row matched (already claimed by another dispatch or ticket moved
