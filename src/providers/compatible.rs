@@ -1048,7 +1048,6 @@ async fn scoped_http_error(
     let http_err = HttpError {
         status,
         body: body.clone(),
-        retry_after_ms,
         context: provider.name.clone(),
     };
     let inner = anyhow::Error::from(http_err);

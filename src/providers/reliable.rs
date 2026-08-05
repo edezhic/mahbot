@@ -107,39 +107,18 @@ pub(crate) fn classify_err(err: &anyhow::Error) -> ErrorClass {
     ErrorClass::Retryable
 }
 
-/// Try to extract a Retry-After value (in milliseconds) from an error.
-///
-/// Extracts from the typed [`HttpError::retry_after_ms`] field when the
-/// error wraps a [`HttpError`]. Returns `None` for non-structured errors
-/// (transport errors, JSON parse errors, etc.) since those never carry a
-/// Retry-After value.
-///
-/// **Note for future providers**: if a new [`Provider`] implementation returns
-/// errors with Retry-After information that do NOT wrap [`HttpError`],
-/// a string-based fallback path may need to be added here.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Extracts Retry-After from plain errors; exercised by tests"
-    )
-)]
-pub(crate) fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
-    // ── Typed path: extract from structured HttpError ──
-    if let Some(http_err) = err.downcast_ref::<HttpError>() {
-        return http_err.retry_after_ms;
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Wrapper around [`HttpError::new`] that sets context="test" and
-    /// retry_after=None, reducing boilerplate in error-classification tests.
+    /// Builds an [`HttpError`] with context="test", reducing boilerplate in
+    /// error-classification tests.
     fn test_err(status: u16, body: &str) -> anyhow::Error {
-        anyhow::Error::from(HttpError::new(status, "test", body, None))
+        anyhow::Error::from(HttpError {
+            status,
+            body: body.into(),
+            context: "test".into(),
+        })
     }
 
     // ── Error classification unit tests ───────────────────────
@@ -167,20 +146,6 @@ mod tests {
         assert!(!is_non_retryable(&anyhow::anyhow!(
             "model overloaded, try again later"
         )));
-    }
-
-    // ── Retry-After parsing ──
-
-    #[test]
-    fn parse_retry_after_ms_extracts_typed_value() {
-        let with_retry = HttpError::new(429, "test", "rate limited", Some(5000));
-        assert_eq!(
-            parse_retry_after_ms(&anyhow::Error::from(with_retry)),
-            Some(5000)
-        );
-
-        let no_retry = test_err(429, "rate limit");
-        assert_eq!(parse_retry_after_ms(&no_retry), None);
     }
 
     #[test]

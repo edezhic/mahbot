@@ -1,8 +1,8 @@
 //! Structured error type preserving HTTP metadata from HTTP API calls.
 //!
 //! Wraps HTTP error details so downstream error classification can extract
-//! typed fields (status code, response body, Retry-After header) instead of
-//! relying solely on string-parsing of formatted error messages.
+//! typed fields (status code, response body) instead of relying solely on
+//! string-parsing of formatted error messages.
 //!
 //! Construct at the HTTP boundary — the point where a `reqwest::Response`
 //! is available — so the typed data is captured before being lost to
@@ -13,9 +13,9 @@ use std::time::Duration;
 
 /// Structured error preserving HTTP metadata from API calls.
 ///
-/// Once constructed, the [`HttpError::status`], [`HttpError::body`], and
-/// [`HttpError::retry_after_ms`] fields are available to error classifiers
-/// via `err.downcast_ref::<HttpError>()`.
+/// Once constructed, the [`HttpError::status`] and [`HttpError::body`]
+/// fields are available to error classifiers via
+/// `err.downcast_ref::<HttpError>()`.
 ///
 /// Errors from third-party code or non-HTTP sources arrive without this
 /// wrapper and are classified as retryable by default.
@@ -25,50 +25,17 @@ pub struct HttpError {
     pub status: u16,
     /// The response body text.
     pub body: String,
-    /// Optional Retry-After duration in milliseconds (from the response header).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Read via parse_retry_after_ms (tests); production passes headers directly"
-        )
-    )]
-    pub retry_after_ms: Option<u64>,
     /// Provider or operation name for display purposes.
     pub context: String,
 }
 
 impl HttpError {
-    /// Create a new [`HttpError`] with the given fields.
-    #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Public constructor; kept for API completeness, not currently called"
-        )
-    )]
-    pub fn new(
-        status: u16,
-        context: impl Into<String>,
-        body: impl Into<String>,
-        retry_after_ms: Option<u64>,
-    ) -> Self {
-        Self {
-            status,
-            context: context.into(),
-            body: body.into(),
-            retry_after_ms,
-        }
-    }
-
     /// Build a [`HttpError`] from a `reqwest::Response`, consuming it.
     ///
-    /// Extracts HTTP status, response body, and the `Retry-After` header.
+    /// Extracts HTTP status and response body.
     pub async fn from_response(response: reqwest::Response, context: impl Into<String>) -> Self {
         let context: String = context.into();
         let status = response.status().as_u16();
-        let retry_after_ms = retry_after_header(response.headers());
         let body = response.text().await.unwrap_or_else(|e| {
             tracing::warn!(
                 ?e,
@@ -81,7 +48,6 @@ impl HttpError {
         Self {
             status,
             body,
-            retry_after_ms,
             context,
         }
     }
@@ -135,7 +101,11 @@ mod tests {
 
     #[test]
     fn http_error_display_format() {
-        let err = HttpError::new(429, "OpenAI", "Rate limit exceeded", None);
+        let err = HttpError {
+            status: 429,
+            body: "Rate limit exceeded".into(),
+            context: "OpenAI".into(),
+        };
         let msg = err.to_string();
         assert!(msg.contains("OpenAI API error (429)"));
         assert!(msg.contains("Rate limit exceeded"));
@@ -143,19 +113,16 @@ mod tests {
 
     #[test]
     fn http_error_downcast() {
-        let err = anyhow::Error::from(HttpError::new(400, "test", "bad request body", None));
+        let err = anyhow::Error::from(HttpError {
+            status: 400,
+            body: "bad request body".into(),
+            context: "test".into(),
+        });
         assert_eq!(err.downcast_ref::<HttpError>().map(|e| e.status), Some(400),);
 
         // Non-structured error should not downcast
         let plain_err = anyhow::anyhow!("some other error");
         assert!(plain_err.downcast_ref::<HttpError>().is_none());
-    }
-
-    #[test]
-    fn http_error_retry_after_extraction() {
-        let err = HttpError::new(429, "test", "rate limited", Some(5000));
-        assert_eq!(err.retry_after_ms, Some(5000));
-        assert_eq!(err.status, 429);
     }
 
     #[test]
