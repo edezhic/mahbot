@@ -3854,7 +3854,11 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
 /// allowlisted forms (`git stash show --textconv`, `git push --dry-run
 /// --exec=`) would otherwise bypass the scan. Fail-closed: repo-redirect
 /// globals (`-C`/`--git-dir`/`--work-tree`) are rejected too, so an
-/// agent-written hostile repo config cannot be reached.
+/// agent-written hostile repo config cannot be reached via redirect.
+/// Accepted residual: a repo with pre-existing hostile config (`.git/config`
+/// diff.external/filter.*/core.fsmonitor, .gitattributes textconv, global
+/// LFS filters) can still exec drivers from plain `git diff`/`status` —
+/// trusted-workspace model, out of scope here.
 fn check_git_exec_vectors(trimmed: &str, subcommand: &str) -> Result<(), String> {
     let words: Vec<&str> = trimmed.split_whitespace().collect();
     let Some(git_idx) = super::find_first_command_word_index(&words) else {
@@ -3904,11 +3908,24 @@ fn check_git_exec_vectors(trimmed: &str, subcommand: &str) -> Result<(), String>
     check_git_scoped_flags(trimmed, subcommand, &words)
 }
 
-/// Exact-token exec-flag blocks applied across the whole command (fail-closed:
-/// a `--`-separated pathname literally named like a flag is rejected too).
-/// `--no-*` disabling forms stay allowed. ANSI-C `$'...\...'` spans (standalone
-/// or embedded like `--format=$'%h\t%s'`) are unprovable flag candidates —
-/// same contract as [`is_unprovable_flag_token`].
+/// Exec-flag blocks applied across the whole command. Git abbreviates
+/// unambiguous long-option prefixes (`--upload-p=` == `--upload-pack=`), so
+/// any token that is a prefix of a blocked flag is rejected — except exact
+/// `--filter`, a legit flag on rev-list/log/ls-tree/cat-file that shadows
+/// the `--filters` prefix. `--no-*` disabling forms stay allowed; a
+/// `--`-separated pathname literally named like a flag is over-rejected
+/// (accepted fail-closed). ANSI-C `$'...\...'` spans (standalone or embedded
+/// like `--format=$'%h\t%s'`) are unprovable flag candidates — same contract
+/// as [`is_unprovable_flag_token`].
+const GIT_EXEC_LONG_FLAGS: &[&str] = &[
+    "--ext-diff",
+    "--textconv",
+    "--show-signature",
+    "--filters",
+    "--upload-pack",
+    "--exec",
+];
+
 fn check_git_exec_flags(trimmed: &str, words: &[&str]) -> Result<(), String> {
     for w in words {
         if w.contains("$'") && w.contains('\\') {
@@ -3919,25 +3936,17 @@ fn check_git_exec_flags(trimmed: &str, words: &[&str]) -> Result<(), String> {
             );
         }
         let wq = shell_word(w);
+        let opt = wq.split('=').next().unwrap_or(&wq);
         // `git grep -e '--ext-diff'` (literal pattern) is over-rejected too —
         // accepted fail-closed asymmetry with the spared `--regexp=` form.
-        for flag in [
-            "--ext-diff",
-            "--textconv",
-            "--show-signature",
-            "--filters",
-            "--upload-pack",
-            "--exec",
-        ] {
-            if wq == flag || wq.starts_with(&format!("{flag}=")) {
-                return reject(
-                    trimmed,
-                    &format!(
-                        "`{flag}` is not allowed in read-only mode — it executes external programs."
-                    ),
-                    "drop the flag; the corresponding git feature stays disabled without it.",
-                );
-            }
+        if opt != "--filter" && GIT_EXEC_LONG_FLAGS.iter().any(|f| f.starts_with(opt)) {
+            return reject(
+                trimmed,
+                &format!(
+                    "`{opt}` is not allowed in read-only mode — it selects a git feature that executes external programs."
+                ),
+                "drop the flag; the corresponding git feature stays disabled without it.",
+            );
         }
     }
     Ok(())
@@ -3945,21 +3954,28 @@ fn check_git_exec_flags(trimmed: &str, words: &[&str]) -> Result<(), String> {
 
 /// Subcommand-scoped exec flags. `-O`/`--open-files-in-pager` (grep only:
 /// runs the program per matched file — `git log -O<orderfile>` is a benign
-/// file read, `grep -o`/`-c`/`-C3` are only-matching) and `--web`/`-w` (help
-/// only: launches a browser — `git diff -w` is ignore-whitespace).
-/// Case-sensitive short-flag matches: uppercase `O`, lowercase `w`.
+/// file read, `grep -o`/`-c`/`-C3` are only-matching) and the help viewers
+/// `-w/--web`, `-m/--man`, `-i/--info` (each execs an external program —
+/// `git diff -w` is ignore-whitespace). Long-option prefixes are blocked
+/// (git abbreviates; `--open-files-in-p=` == `--open-files-in-pager=`);
+/// short-flag matches are case-sensitive: uppercase `O`, lowercase `w`/`m`/`i`.
 fn check_git_scoped_flags(trimmed: &str, subcommand: &str, words: &[&str]) -> Result<(), String> {
     let base = subcommand.split_whitespace().next().unwrap_or("");
     for w in words {
         let wq = shell_word(w);
+        let opt = wq.split('=').next().unwrap_or(&wq);
         let is_scoped = match base {
             "grep" => {
-                wq.starts_with("--open-files-in-pager")
+                "--open-files-in-pager".starts_with(opt)
                     || (wq.starts_with('-') && !wq.starts_with("--") && wq[1..].contains('O'))
             }
             "help" => {
-                wq.starts_with("--web")
-                    || (wq.starts_with('-') && !wq.starts_with("--") && wq[1..].contains('w'))
+                ["--web", "--man", "--info"]
+                    .iter()
+                    .any(|f| f.starts_with(opt))
+                    || (wq.starts_with('-')
+                        && !wq.starts_with("--")
+                        && wq[1..].contains(['w', 'm', 'i']))
             }
             _ => false,
         };
@@ -5230,6 +5246,19 @@ mod tests {
             ("git ls-remote --upload-pack /bin/echo origin", false),
             ("git push --dry-run --exec=/bin/echo origin", false), // extension bypass
             ("git stash show --textconv", false),                  // extension bypass
+            // ── git abbreviated long-option prefixes (--upload-p= == --upload-pack=) ──
+            ("git ls-remote --upload-p=/bin/echo origin", false),
+            ("git ls-remote --upload-pa /bin/echo origin", false),
+            ("git ls-remote --exe=/bin/echo origin", false),
+            ("git push --dry-run --exe=/bin/echo origin", false),
+            ("git push --dry-run --exe /bin/echo origin", false),
+            ("git grep --open-files-in-p=/bin/echo pattern", false),
+            ("git grep --open-files-in-p /bin/echo pattern", false),
+            // defense-in-depth (this git build rejects these spellings itself)
+            ("git diff --ext-d", false),
+            ("git log --textc", false),
+            ("git log --show-signat", false),
+            ("git cat-file --filt HEAD:src/lib.rs", false), // ambiguous in git, blocked anyway
             // ── grep -O / --open-files-in-pager ──
             ("git grep -O /bin/echo pattern", false),
             ("git grep -O/bin/echo pattern", false),
@@ -5237,10 +5266,15 @@ mod tests {
             ("git grep -IO /bin/echo pattern", false),
             ("git grep --open-files-in-pager=/bin/echo pattern", false),
             ("git grep --open-files-in-pager pattern", false),
-            // ── help --web / -w ──
+            // ── help viewers (web/info/man all exec external programs) ──
             ("git help --web", false),
             ("git help -w", false),
             ("git help -aw", false),
+            ("git help -m git", false),
+            ("git help -i git", false),
+            ("git help --man git", false),
+            ("git help --info git", false),
+            ("git help --m git", false),
             // ── full-path git (basename allowlist bypass) ──
             ("/usr/bin/git push", false),
             ("/usr/bin/git -C /tmp status", false),
@@ -5286,10 +5320,19 @@ mod tests {
             ("git diff --no-ext-diff", true),
             ("git diff --no-textconv", true),
             ("git log --no-show-signature", true),
-            // help without the web flag
+            // --filter exact stays allowed (legit flag shadowing --filters)
+            ("git log --filter=blob:none", true),
+            ("git rev-list --filter=blob:none HEAD", true),
+            ("git cat-file --filter blob:none HEAD", true),
+            // help non-viewer flags and topics
             ("git help", true),
             ("git help -a", true),
             ("git help --all", true),
+            ("git help -g", true),
+            ("git help -c core.pager", true),
+            ("git help --config", true),
+            // regular ls-remote flags stay allowed
+            ("git ls-remote --heads origin", true),
             // paginate globals (no c/C)
             ("git -p log", true),
             ("git -P log", true),
