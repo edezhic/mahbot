@@ -34,7 +34,6 @@ use candle_core::quantized::{QMatMul, gguf_file};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::rotary_emb::rope_slow;
 use candle_nn::{Embedding, Module};
-use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
@@ -416,67 +415,18 @@ async fn download_file(
     dest: &Path,
     expected_sha256: Option<&str>,
 ) -> Result<()> {
-    use sha2::{Digest, Sha256};
-
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .context("Failed to send download request")?;
-
-    let status = response.status();
-    if !status.is_success() {
-        anyhow::bail!("HTTP {status} from {url}");
-    }
-
-    let total_size = response.content_length();
-
-    // Download to temporary file, then atomically rename
-    let tmp_path = dest.with_extension("tmp");
-    let mut file = tokio::fs::File::create(&tmp_path)
-        .await
-        .context("Failed to create temp file")?;
-
-    let mut downloaded: u64 = 0;
-    let mut hasher = expected_sha256.map(|_| Sha256::new());
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("Download stream error")?;
-        let len = chunk.len() as u64;
-        downloaded += len;
-        if let Some(ref mut h) = hasher {
-            h.update(&chunk);
-        }
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-            .await
-            .context("Failed to write download chunk")?;
-    }
-
-    // Verify file size against Content-Length header
-    if let Some(expected) = total_size
-        && downloaded != expected
-    {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        anyhow::bail!("Download size mismatch: expected {expected} bytes, got {downloaded} bytes");
-    }
-
-    // Verify SHA256 checksum if requested (computed during download stream above)
-    if let Some(expected_hex) = expected_sha256
-        && let Some(hasher) = hasher
-    {
-        let actual_hash = format!("{:x}", hasher.finalize());
-        if actual_hash != expected_hex {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            anyhow::bail!("SHA256 mismatch: expected {expected_hex}, got {actual_hash}");
-        }
-    }
-
-    // Atomic rename
-    tokio::fs::rename(&tmp_path, dest)
-        .await
-        .context("Failed to rename temp file to final path")?;
-
-    info!(path = %dest.display(), size = downloaded, "Downloaded model file");
+    let mut size = 0u64;
+    crate::util::http::download_verified(
+        client,
+        url,
+        dest,
+        expected_sha256.unwrap_or(""),
+        None,
+        crate::util::http::DownloadSizeCheck::Exact,
+        |downloaded, _| size = downloaded,
+    )
+    .await?;
+    info!(path = %dest.display(), size, "Downloaded model file");
     Ok(())
 }
 

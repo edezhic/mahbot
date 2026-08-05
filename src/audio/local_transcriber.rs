@@ -40,7 +40,6 @@
 use crate::util::UnwrapPoison;
 use crate::util::model_state::{AtomicModelState, ModelState};
 use anyhow::{Context, Result};
-use futures_util::StreamExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -524,58 +523,28 @@ async fn download_file(client: &reqwest::Client, file: &ModelFile, dest: &Path) 
         (downloaded as f64 / total_size as f64 * 100.0).min(100.0)
     }
 
-    use sha2::{Digest, Sha256};
-    use tokio::io::AsyncWriteExt;
-
-    let resp = client
-        .get(file.url.clone())
-        .timeout(file.timeout)
-        .send()
-        .await
-        .with_context(|| format!("Failed to download {}", file.filename))?;
-
-    let total_size = resp.content_length().unwrap_or(0);
-
-    let mut hasher = Sha256::new();
-    let mut stream = resp.bytes_stream();
-    let mut downloaded: u64 = 0;
-
-    let mut file_handle = tokio::fs::File::create(dest)
-        .await
-        .context("Failed to create model file")?;
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("Download stream error")?;
-        hasher.update(&chunk);
-        file_handle.write_all(&chunk).await?;
-        downloaded += chunk.len() as u64;
-        if total_size > 0 {
-            let pct = calc_pct(downloaded, total_size);
-            debug!(
-                "Downloading {}: {:.0}% ({}/{} MB)",
-                file.filename,
-                pct,
-                downloaded / 1_048_576,
-                total_size / 1_048_576,
-            );
-        }
-    }
-
-    file_handle.flush().await?;
-    file_handle.sync_all().await?;
-    drop(file_handle);
-
-    let actual_sha256 = crate::util::hex_string(&hasher.finalize());
-    if actual_sha256 != file.expected_sha256 {
-        // Remove corrupted file.
-        tokio::fs::remove_file(dest).await.ok();
-        anyhow::bail!(
-            "SHA256 mismatch for {}: expected {}, got {}. File removed.",
-            file.filename,
-            file.expected_sha256,
-            actual_sha256,
-        );
-    }
+    crate::util::http::download_verified(
+        client,
+        &file.url,
+        dest,
+        file.expected_sha256,
+        Some(file.timeout),
+        crate::util::http::DownloadSizeCheck::None,
+        |downloaded, total_size| {
+            if total_size > 0 {
+                let pct = calc_pct(downloaded, total_size);
+                debug!(
+                    "Downloading {}: {:.0}% ({}/{} MB)",
+                    file.filename,
+                    pct,
+                    downloaded / 1_048_576,
+                    total_size / 1_048_576,
+                );
+            }
+        },
+    )
+    .await
+    .with_context(|| format!("Failed to download {}", file.filename))?;
 
     info!("Downloaded {} ({})", file.filename, file.expected_sha256);
     Ok(())

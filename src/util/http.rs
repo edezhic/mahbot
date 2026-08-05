@@ -5,6 +5,7 @@
 //! and reused — it maintains an internal connection pool, caches DNS
 //! resolutions, and reuses TLS sessions.
 
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -225,6 +226,121 @@ pub fn build_http_client(timeout: Duration) -> reqwest::Client {
         .connect_timeout(Duration::from_secs(10))
         .build()
         .expect("Failed to build HTTP client (TLS initialization failure)")
+}
+
+/// Size-check policy applied after a streaming download completes.
+pub(crate) enum DownloadSizeCheck {
+    /// Require downloaded bytes to equal the Content-Length header (when present).
+    Exact,
+    /// Require at least `min_bytes` downloaded (for servers that omit Content-Length).
+    Min(u64),
+    /// No size validation.
+    None,
+}
+
+/// Stream a file download with on-the-fly SHA256 verification and atomic
+/// tmp+rename — the single canonical path for model downloads.
+///
+/// * `expected_sha256` — empty skips verification (same semantics as
+///   `verify_sha256`).
+/// * `timeout` — per-request timeout; `None` defers to the client's.
+/// * `progress` — invoked `progress(0, total)` before the first byte
+///   ("started"), then per chunk; callers throttle as needed. `total` is 0
+///   when the server omits Content-Length.
+///
+/// On failure the temp file is removed; on success it is atomically renamed
+/// into place. (The bench-only sync downloader in `voice_pipeline_e2e_test.rs`
+/// stays separate.)
+pub(crate) async fn download_verified(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    expected_sha256: &str,
+    timeout: Option<Duration>,
+    size_check: DownloadSizeCheck,
+    mut progress: impl FnMut(u64, u64),
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use futures_util::StreamExt;
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncWriteExt;
+
+    let mut request = client.get(url);
+    if let Some(t) = timeout {
+        request = request.timeout(t);
+    }
+    let response = request
+        .send()
+        .await
+        .context("Failed to send download request")?;
+    if !response.status().is_success() {
+        anyhow::bail!("HTTP {} from {url}", response.status());
+    }
+
+    let content_length = response.content_length();
+    let total_size = content_length.unwrap_or(0);
+
+    // "Started" signal before the first byte is streamed.
+    progress(0, total_size);
+
+    let tmp = dest.with_extension("tmp");
+    let mut file = tokio::fs::File::create(&tmp)
+        .await
+        .context("Failed to create temp file")?;
+
+    let mut hasher = (!expected_sha256.is_empty()).then_some(Sha256::new());
+    let mut downloaded: u64 = 0;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Download stream error")?;
+        let len = chunk.len() as u64;
+        downloaded += len;
+        if let Some(h) = &mut hasher {
+            h.update(&chunk);
+        }
+        file.write_all(&chunk)
+            .await
+            .context("Failed to write download chunk")?;
+        progress(downloaded, total_size);
+    }
+
+    file.flush().await?;
+    file.sync_all().await?;
+    drop(file);
+
+    match size_check {
+        DownloadSizeCheck::Exact => {
+            if let Some(expected) = content_length
+                && downloaded != expected
+            {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                anyhow::bail!(
+                    "Download size mismatch: expected {expected} bytes, got {downloaded} bytes"
+                );
+            }
+        }
+        DownloadSizeCheck::Min(min) if downloaded < min => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            anyhow::bail!("Downloaded file too small: {downloaded} bytes");
+        }
+        DownloadSizeCheck::Min(_) | DownloadSizeCheck::None => {}
+    }
+
+    if let Some(h) = hasher {
+        let actual_hash = format!("{:x}", h.finalize());
+        if actual_hash != expected_sha256 {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            anyhow::bail!(
+                "SHA256 mismatch for {}: expected {expected_sha256}, got {actual_hash}",
+                dest.display()
+            );
+        }
+    }
+
+    tokio::fs::rename(&tmp, dest)
+        .await
+        .with_context(|| format!("Failed to rename temp file to {}", dest.display()))?;
+    Ok(())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

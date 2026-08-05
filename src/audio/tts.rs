@@ -43,10 +43,8 @@ use crate::util::model_state::{AtomicModelState, ModelLoadGuard, ModelState};
 use anyhow::{Context, Result, anyhow};
 use candle_core::{Device, Tensor};
 use candle_onnx::simple_eval;
-use futures_util::StreamExt;
 use rodio::{OutputStream, OutputStreamHandle, Sink};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -55,7 +53,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
@@ -1018,89 +1015,47 @@ async fn download_file(url: &str, dest: &Path, expected_hash: &str) -> Result<()
         .build()
         .context("Failed to build HTTP client")?;
 
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .context("Failed to start download")?;
-
-    let status = response.status();
-    if !status.is_success() {
-        anyhow::bail!("HTTP {status} from {url}");
-    }
-
-    let total_size = response.content_length().unwrap_or(0);
     let file_name = dest
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
 
-    // Emit FileStarted with the file name and total size (if known)
-    emit_download_event(TtsDownloadEvent::FileStarted {
-        name: file_name.clone(),
-        total_bytes: total_size,
-    });
-
-    // Stream download to a temporary file, computing SHA256 on the fly
-    let tmp = dest.with_extension("tmp");
-    let mut file = tokio::fs::File::create(&tmp)
-        .await
-        .context("Failed to create temp file")?;
-
-    let compute_hash = !expected_hash.is_empty();
-    let mut hasher = compute_hash.then(Sha256::new);
     let mut downloaded: u64 = 0;
+    let mut started = false;
     let mut last_reported_bytes: u64 = 0;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("Download stream error")?;
-        let len = chunk.len() as u64;
-        downloaded += len;
-        if let Some(ref mut h) = hasher {
-            h.update(&chunk);
-        }
-        file.write_all(&chunk)
-            .await
-            .context("Failed to write download chunk")?;
-
-        // Throttle: emit progress at ~1% granularity to avoid broadcast pressure
-        if total_size > 0 {
-            let threshold = (total_size / 100).max(1);
-            if downloaded - last_reported_bytes >= threshold || downloaded >= total_size {
-                last_reported_bytes = downloaded;
-                emit_download_event(TtsDownloadEvent::FileProgress {
+    crate::util::http::download_verified(
+        &client,
+        url,
+        dest,
+        expected_hash,
+        None,
+        crate::util::http::DownloadSizeCheck::Min(100),
+        |d, total_size| {
+            downloaded = d;
+            // First call (pre-stream) carries total_bytes → FileStarted.
+            if !started {
+                started = true;
+                emit_download_event(TtsDownloadEvent::FileStarted {
                     name: file_name.clone(),
-                    bytes_downloaded: downloaded,
                     total_bytes: total_size,
                 });
             }
-        }
-    }
-
-    file.flush().await?;
-    drop(file);
-
-    if downloaded < 100 {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        anyhow::bail!("Downloaded file too small: {downloaded} bytes");
-    }
-
-    // Verify hash BEFORE renaming to final path
-    if let Some(h) = hasher {
-        let actual_hash = format!("{:x}", h.finalize());
-        if actual_hash != expected_hash {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            anyhow::bail!(
-                "SHA256 verification failed for {}: expected {expected_hash}, got {actual_hash}",
-                dest.display()
-            );
-        }
-    }
-
-    tokio::fs::rename(&tmp, dest)
-        .await
-        .with_context(|| format!("Failed to rename temp file to {}", dest.display()))?;
+            // Throttle: emit progress at ~1% granularity to avoid broadcast pressure.
+            if total_size > 0 {
+                let threshold = (total_size / 100).max(1);
+                if downloaded - last_reported_bytes >= threshold || downloaded >= total_size {
+                    last_reported_bytes = downloaded;
+                    emit_download_event(TtsDownloadEvent::FileProgress {
+                        name: file_name.clone(),
+                        bytes_downloaded: downloaded,
+                        total_bytes: total_size,
+                    });
+                }
+            }
+        },
+    )
+    .await?;
 
     let hash_str = if expected_hash.is_empty() {
         String::new()
@@ -1114,7 +1069,6 @@ async fn download_file(url: &str, dest: &Path, expected_hash: &str) -> Result<()
         hash_str,
         downloaded as f64 / 1_048_576.0
     );
-
     emit_download_event(TtsDownloadEvent::FileCompleted { name: file_name });
     Ok(())
 }
