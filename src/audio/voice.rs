@@ -1345,6 +1345,10 @@ const EMBED_MODEL_FILENAME: &str = "embedding_model.onnx";
 const EMBED_MODEL_URL: &str =
     "https://huggingface.co/littlebearlabs/openwakeword-features/resolve/main/embedding_model.onnx";
 
+/// (filename, url, sha256) download spec for each voice model.
+const MEL_MODEL: (&str, &str, &str) = (MEL_MODEL_FILENAME, MEL_MODEL_URL, MEL_MODEL_SHA256);
+const EMBED_MODEL: (&str, &str, &str) = (EMBED_MODEL_FILENAME, EMBED_MODEL_URL, EMBED_MODEL_SHA256);
+
 /// Subdirectory under `~/.mahbot/models/` for voice models.
 const MODEL_DIR_NAME: &str = "openwakeword";
 
@@ -3278,7 +3282,44 @@ pub(crate) fn synthesize_with_pcm_cache(
 /// at most once per process.
 static PCM_EVICTION_RAN: AtomicBool = AtomicBool::new(false);
 
+/// Ensure a model file exists with a valid SHA256, re-downloading it otherwise.
 #[allow(clippy::cast_precision_loss)]
+async fn ensure_model_file(
+    client: &reqwest::Client,
+    dir: &Path,
+    model: (&str, &str, &str),
+    label: &str,
+) -> Result<()> {
+    let (filename, url, sha256) = model;
+    let path = dir.join(filename);
+    if path.exists()
+        && let Err(e) = crate::util::verify_sha256(&path, sha256)
+    {
+        warn!("{label} model corrupt, re-downloading: {e}");
+        tokio::fs::remove_file(&path).await?;
+    }
+    if !path.exists() {
+        info!("Downloading {label} model...");
+        let mut size = 0u64;
+        crate::util::http::download_verified(
+            client,
+            url,
+            &path,
+            sha256,
+            Some(MODEL_DOWNLOAD_TIMEOUT),
+            crate::util::http::DownloadSizeCheck::Min(1000),
+            |downloaded, _| size = downloaded,
+        )
+        .await?;
+        info!(
+            "Downloaded {} ({:.1} MB)",
+            path.display(),
+            size as f64 / 1_048_576.0
+        );
+    }
+    Ok(())
+}
+
 async fn ensure_models_downloaded() -> Result<PathBuf> {
     let dir = model_dir()
         .ok_or_else(|| anyhow!("Cannot resolve model directory (storage root not set)"))?;
@@ -3291,59 +3332,8 @@ async fn ensure_models_downloaded() -> Result<PathBuf> {
         .build()
         .context("Failed to build HTTP client for model download")?;
 
-    let mel_path = dir.join(MEL_MODEL_FILENAME);
-    if mel_path.exists()
-        && let Err(e) = crate::util::verify_sha256(&mel_path, MEL_MODEL_SHA256)
-    {
-        warn!("Mel spectrogram model corrupt, re-downloading: {e}");
-        tokio::fs::remove_file(&mel_path).await?;
-    }
-    if !mel_path.exists() {
-        info!("Downloading mel spectrogram model...");
-        let mut size = 0u64;
-        crate::util::http::download_verified(
-            &client,
-            MEL_MODEL_URL,
-            &mel_path,
-            MEL_MODEL_SHA256,
-            Some(MODEL_DOWNLOAD_TIMEOUT),
-            crate::util::http::DownloadSizeCheck::Min(1000),
-            |downloaded, _| size = downloaded,
-        )
-        .await?;
-        info!(
-            "Downloaded {} ({:.1} MB)",
-            mel_path.display(),
-            size as f64 / 1_048_576.0
-        );
-    }
-
-    let embed_path = dir.join(EMBED_MODEL_FILENAME);
-    if embed_path.exists()
-        && let Err(e) = crate::util::verify_sha256(&embed_path, EMBED_MODEL_SHA256)
-    {
-        warn!("Embedding model corrupt, re-downloading: {e}");
-        tokio::fs::remove_file(&embed_path).await?;
-    }
-    if !embed_path.exists() {
-        info!("Downloading embedding model...");
-        let mut size = 0u64;
-        crate::util::http::download_verified(
-            &client,
-            EMBED_MODEL_URL,
-            &embed_path,
-            EMBED_MODEL_SHA256,
-            Some(MODEL_DOWNLOAD_TIMEOUT),
-            crate::util::http::DownloadSizeCheck::Min(1000),
-            |downloaded, _| size = downloaded,
-        )
-        .await?;
-        info!(
-            "Downloaded {} ({:.1} MB)",
-            embed_path.display(),
-            size as f64 / 1_048_576.0
-        );
-    }
+    ensure_model_file(&client, &dir, MEL_MODEL, "Mel spectrogram").await?;
+    ensure_model_file(&client, &dir, EMBED_MODEL, "Embedding").await?;
 
     Ok(dir)
 }
@@ -5857,6 +5847,37 @@ fn schedule_listening_transition(ctx: &mut PipelineCtx) {
     });
 }
 
+/// Extract per-chunk dense negative embedding sequences for classifier training.
+async fn extract_negative_sequences(
+    chunks: Vec<Vec<f32>>,
+    source: Source,
+    what: &'static str,
+) -> Vec<EmbeddingSequence> {
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+    tokio::task::spawn_blocking(move || {
+        let _models = ONNX_MODELS.get().expect("ONNX_MODELS checked above");
+        let mut seqs: Vec<EmbeddingSequence> = Vec::new();
+        for (ci, chunk) in chunks.iter().enumerate() {
+            let chunk_id = UtteranceId {
+                sequence_index: ci,
+                variant_index: 0,
+            };
+            match process_enrollment_sample(chunk) {
+                Ok(embs) => seqs.push(EmbeddingSequence::new(chunk_id, source, embs)),
+                Err(e) => warn!(
+                    "Failed to extract dense {what} ({} samples): {e}",
+                    chunk.len(),
+                ),
+            }
+        }
+        seqs
+    })
+    .await
+    .unwrap_or_default()
+}
+
 /// Finalize the enrollment pipeline: train the classifier with
 /// negative weights (ambient → owner-negative → unrelated → confusable).
 ///
@@ -5879,82 +5900,41 @@ async fn finalize_enrollment_pipeline() -> bool {
         return false;
     }
 
-    // ── Clone positive embeddings (dense-only) ──
-    let enrollment_buffer = {
+    // ── Snapshot enrollment buffers (positive + ambient/owner negatives) ──
+    let (enrollment_buffer, negative_audio_chunks, owner_negative_chunks) = {
         let state = voice_state().read().unwrap_poison();
-        state.enrollment_buffer.clone()
+        (
+            state.enrollment_buffer.clone(),
+            state.negative_audio_chunks.clone(),
+            state.owner_negative_chunks.clone(),
+        )
     };
-
-    // ── Clone negative audio chunks (ambient + owner-negative) ──
-    let (negative_audio_chunks, used_real_negatives) = {
-        let state = voice_state().read().unwrap_poison();
-        let chunks = state.negative_audio_chunks.clone();
-        let should_use = chunks.len() >= 2 && ONNX_MODELS.get().is_some();
-        (chunks, should_use)
-    };
-    let owner_negative_chunks = {
-        let state = voice_state().read().unwrap_poison();
-        state.owner_negative_chunks.clone()
-    };
+    let used_real_negatives = negative_audio_chunks.len() >= 2 && ONNX_MODELS.get().is_some();
+    let use_owner_negatives = !owner_negative_chunks.is_empty() && ONNX_MODELS.get().is_some();
 
     // ── Extract ambient negatives (per-chunk EmbeddingSequences) ──
-    let negative_sequences: Vec<EmbeddingSequence> = if used_real_negatives {
-        tokio::task::spawn_blocking(move || {
-            let _models = ONNX_MODELS.get().expect("ONNX_MODELS checked above");
-            let mut neg_seqs: Vec<EmbeddingSequence> = Vec::new();
-            for (ci, chunk) in negative_audio_chunks.iter().enumerate() {
-                let chunk_id = UtteranceId {
-                    sequence_index: ci,
-                    variant_index: 0,
-                };
-                match process_enrollment_sample(chunk) {
-                    Ok(embs) => {
-                        neg_seqs.push(EmbeddingSequence::new(chunk_id, Source::Ambient, embs));
-                    }
-                    Err(e) => warn!(
-                        "Failed to extract dense negative embedding \
-                         from ambient audio chunk ({} samples): {e}",
-                        chunk.len(),
-                    ),
-                }
-            }
-            neg_seqs
-        })
-        .await
-        .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let negative_sequences = extract_negative_sequences(
+        if used_real_negatives {
+            negative_audio_chunks
+        } else {
+            Vec::new()
+        },
+        Source::Ambient,
+        "negative embedding from ambient audio chunk",
+    )
+    .await;
 
     // ── Extract owner-negative embeddings ──
-    let use_owner_negatives = !owner_negative_chunks.is_empty() && ONNX_MODELS.get().is_some();
-    let owner_negative_sequences: Vec<EmbeddingSequence> = if use_owner_negatives {
-        tokio::task::spawn_blocking(move || {
-            let _models = ONNX_MODELS.get().expect("ONNX_MODELS checked above");
-            let mut owner_seqs: Vec<EmbeddingSequence> = Vec::new();
-            for (ci, chunk) in owner_negative_chunks.iter().enumerate() {
-                let chunk_id = UtteranceId {
-                    sequence_index: ci,
-                    variant_index: 0,
-                };
-                match process_enrollment_sample(chunk) {
-                    Ok(embs) => {
-                        owner_seqs.push(EmbeddingSequence::new(chunk_id, Source::Owner, embs));
-                    }
-                    Err(e) => warn!(
-                        "Failed to extract dense owner-negative embedding \
-                         from Phase 3 chunk ({} samples): {e}",
-                        chunk.len(),
-                    ),
-                }
-            }
-            owner_seqs
-        })
-        .await
-        .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let owner_negative_sequences = extract_negative_sequences(
+        if use_owner_negatives {
+            owner_negative_chunks
+        } else {
+            Vec::new()
+        },
+        Source::Owner,
+        "owner-negative embedding from Phase 3 chunk",
+    )
+    .await;
 
     // ── Clear chunk buffers from global state ──
     {
