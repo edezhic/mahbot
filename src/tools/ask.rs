@@ -12,7 +12,7 @@ use crate::message_router::{self, AgentJob, JobKind};
 use crate::prompt::{load_prompt, substitute};
 use crate::session::{ask_agent_id, direct_agent_id, manager_agent_id};
 use crate::tools::Tool;
-use crate::{Agent, ChatMessage, ChatRequest, DEFAULT_MAX_TOKENS, Role, Workspace};
+use crate::{ChatMessage, ChatRequest, DEFAULT_MAX_TOKENS, Role, Workspace};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::future::join_all;
@@ -183,34 +183,41 @@ fn build_async_ask_message(result: anyhow::Result<String>) -> String {
     }
 }
 
-/// Shared sub-agent runner — creates and executes a sub-agent for the given
-/// role and ask. Used by both sync and async paths of [`AskTool::execute`].
+/// Shared sub-agent runner — delegates to [`run_agent`] for the given role
+/// and ask. Used by both sync and async paths of [`AskTool::execute`].
 ///
 /// For [`Role::Analyst`], spawns 3 parallel analysts and consolidates their
 /// responses via a single LLM synthesis call. For all other roles, dispatches a
-/// single agent (existing behaviour).
+/// single agent.
 async fn run_sub_agent(ws: &Workspace, role: Role, ask: &str) -> Result<String> {
     if role == Role::Analyst {
         return run_parallel_analysts_and_consolidate(ws, ask).await;
     }
 
-    // Existing single-agent path for non-Analyst roles
+    // Single-agent path for non-Analyst roles — delegate lifecycle to run_agent.
     let agent_id = ask_agent_id(&ws.name, role.as_str());
+    let (agent, response) = run_agent(
+        agent_id,
+        role,
+        ws,
+        None,
+        ask,
+        String::new(),
+        String::new(),
+        None,
+    )
+    .await;
 
-    let mut agent = Agent::new(agent_id, role, ws, None, String::new(), String::new());
-    let cancel = agent.cancel_token();
-
-    let response = tokio::select! {
-        () = cancel.cancelled() => {
-            anyhow::bail!("Sub-agent cancelled");
-        }
-        result = agent.work(ask) => match result {
-            Ok(response) => response,
-            Err(e) => anyhow::bail!("Sub-agent failed: {e}"),
-        },
-    };
-
-    Ok(response)
+    if let Some(response) = response {
+        Ok(response)
+    } else if agent.is_cancelled() || crate::shutdown::shutdown_token().is_cancelled() {
+        anyhow::bail!("Sub-agent cancelled");
+    } else {
+        anyhow::bail!(
+            "Sub-agent failed: {}",
+            agent.failure.as_deref().unwrap_or("unknown error")
+        );
+    }
 }
 
 /// Spawn 3 parallel analyst agents, then consolidate their responses into a
