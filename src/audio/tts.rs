@@ -328,8 +328,8 @@ pub fn download_failed() -> bool {
 /// Try to load TTS engine from cache — returns `Ok(())` if models are
 /// ready after the call, or an error message explaining how to resolve.
 ///
-/// This is the shared utility for both production and benchmark code
-/// (mahbot-932).  It checks [`models_ready()`] first (fast path), then
+/// This is the shared utility for both production and benchmark code.
+/// It checks [`models_ready()`] first (fast path), then
 /// [`try_load_cached()`] (loads from disk if available), and only fails
 /// if neither succeeds.
 pub fn ensure_ready() -> Result<(), String> {

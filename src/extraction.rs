@@ -30,7 +30,7 @@ use crate::{ChatMessage, ChatRequest, ExtractionValidator};
 /// `provider_allow_fallbacks`) must be byte-identical to the original agent call
 /// so the provider can reuse the cached prefix.
 ///
-/// NOTE (mahbot-1066): this legacy function keeps EXACTLY its current behavior
+/// NOTE: this legacy function keeps EXACTLY its current behavior
 /// and is used only by workspace diagnostics discovery (out of scope).
 /// Verdict extraction uses [`retry_extract_structured_scoped`].
 pub(crate) async fn retry_extract_structured<T: DeserializeOwned>(
@@ -77,7 +77,7 @@ pub(crate) async fn retry_extract_structured<T: DeserializeOwned>(
     )
 }
 
-// ── Scoped retry extraction (mahbot-1066 — verdict paths) ────────────────
+// ── Scoped retry extraction (verdict paths) ────────────────
 
 /// Scoped structured extraction with the hardened outer retry loop:
 /// 13 attempts, backoff 5/10/20/40/60/60… s

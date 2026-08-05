@@ -765,8 +765,7 @@ impl Agent {
         .await
     }
 
-    /// Extract a structured verdict with the hardened scoped retry loop
-    /// (mahbot-1066).
+    /// Extract a structured verdict with the hardened scoped retry loop.
     ///
     /// KV-cache requirements: identical to [`Self::extract_structured`] — the
     /// params come from [`Self::build_chat_request`] so all attempts are

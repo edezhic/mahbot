@@ -2210,7 +2210,7 @@ impl SettingsState {
             crate::audio::voice::VoiceStatus::LoadingModels => Text::new("Loading models…").into(),
             crate::audio::voice::VoiceStatus::ModelError => {
                 // Show retry button inline so the user can trigger recovery
-                // without toggling voice off/on (ticket mahbot-757).
+                // without toggling voice off/on.
                 let retry_btn = iced::widget::button(Text::new("   Retry   ").size(13))
                     .on_press(SettingsMessage::RetryVoiceModels)
                     .style(theme::button_danger)
@@ -2429,7 +2429,7 @@ impl SettingsState {
             .push(phrase_input)
             .push(enroll_btn);
 
-        // Adaptive threshold k slider (mahbot-845)
+        // Adaptive threshold k slider
         let current_k: f32 = self
             .config
             .adaptive_k

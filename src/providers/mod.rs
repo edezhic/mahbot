@@ -51,7 +51,7 @@ use crate::retry::{FailureClass, RetryFailureRecord};
 use compatible::OpenAiCompatibleProvider;
 use reliable::ReliableProvider;
 
-// ── Scoped call error (mahbot-1066) ────────────────────────────────────
+// ── Scoped call error ────────────────────────────────────
 
 /// Error from a scoped (single-attempt) provider call.
 ///

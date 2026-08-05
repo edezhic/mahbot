@@ -141,7 +141,7 @@ pub(crate) fn hex_string(bytes: &[u8]) -> String {
         })
 }
 
-/// Verify a file's SHA256 hash matches the expected hex string (mahbot-1043).
+/// Verify a file's SHA256 hash matches the expected hex string.
 ///
 /// Shared model-integrity verifier extracted from the three near-identical
 /// private streaming copies in `audio::tts`, `audio::local_transcriber`, and
@@ -966,9 +966,7 @@ mod unescape_c_style_tests {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Audio utility functions (canonical implementations, mahbot-878)
-// ═══════════════════════════════════════════════════════════════════════════
+// Audio utility functions (canonical implementations)
 
 /// Generate pink noise (1/f spectrum) using the Voss-McCartney algorithm.
 ///
@@ -1087,7 +1085,7 @@ pub(crate) fn add_noise_color(pcm: &[f32], snr_db: f32, color: NoiseColor, seed:
 
 /// Compute the RMS (root mean square) of audio samples.
 ///
-/// Returns `0.0` for empty input.  Ungated in mahbot-1043 so production hot
+/// Returns `0.0` for empty input.  Ungated so production hot
 /// paths (AGC, noise generation, utterance quality) share one implementation
 /// instead of hand-rolling `sum(x²)/n → sqrt`.  Callers that need a
 /// divide-by-zero floor for degenerate all-zero input apply `.max(1e-10)` at
@@ -1101,8 +1099,7 @@ pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
     (sum_sq / samples.len() as f32).sqrt()
 }
 
-/// Compute both Box-Muller branches from two uniform draws in `(0, 1]`
-/// (mahbot-1043).
+/// Compute both Box-Muller branches from two uniform draws in `(0, 1]`.
 ///
 /// `z1 = sqrt(-2 ln u1) cos(2π u2)`, `z2 = sqrt(-2 ln u1) sin(2π u2)`.
 /// Shared math for the bench's EPSILON-clamp pair sampler below.
@@ -1255,7 +1252,7 @@ mod strip_ansi_escapes_tests {
     }
 }
 
-// ── Shared model-integrity verifier (mahbot-1043) ─────────────────────────
+// ── Shared model-integrity verifier ─────────────────────────
 // Tests consolidated from the three former private copies (tts,
 // local_transcriber, voice).  The file-not-found error path is covered with a
 // NON-empty expected hash because the shared empty-hash skip returns Ok before
@@ -1313,7 +1310,7 @@ mod verify_sha256_tests {
     }
 }
 
-// ── Audio utility regression tests (mahbot-1043) ──────────────────────────
+// ── Audio utility regression tests ──────────────────────────
 // Moved verbatim from voice.rs (post-1029 stranded util tests) so the util
 // module has an in-place regression net for speed perturbation, gain, noise,
 // and pink noise.
@@ -1480,7 +1477,7 @@ mod audio_util_tests {
     }
 }
 
-// ── Shared Gaussian sampler seeded-sequence equivalence (mahbot-1043) ─────
+// ── Shared Gaussian sampler seeded-sequence equivalence ─────
 // MANDATORY verification from the manager pin: the extraction must consume
 // exactly the same RNG draws at every site so seeded outputs stay byte-identical.
 // These tests prove the shared helper reproduces the pre-extraction inline

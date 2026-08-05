@@ -250,7 +250,7 @@ impl StatsStore {
         Ok(())
     }
 
-    /// Persist a per-attempt retry failure diagnostic (mahbot-1066) to the
+    /// Persist a per-attempt retry failure diagnostic to the
     /// dedicated `retry_failures` table. Called from [`crate::retry`]'s outer
     /// loops — never fails the calling operation (callers treat errors as
     /// best-effort).

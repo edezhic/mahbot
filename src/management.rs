@@ -1502,7 +1502,7 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
 /// Record a sanitation failure: add a [`SANITATION_ROLE`] comment for the circuit breaker
 /// and clear assigned_to so the ticket can be re-dispatched.
 ///
-/// `raw_dump` (mahbot-1066 Amendment B): when the failure is a verdict
+/// `raw_dump`: when the failure is a verdict
 /// extraction failure, the last-attempt raw response is dumped into the
 /// comment the same way the parallel verdict path does.
 async fn record_sanitation_failure(
@@ -1544,7 +1544,7 @@ async fn record_sanitation_failure(
 /// Returns the registered agent ID and its inbox receiver, ready for
 /// [`run_agent`].
 ///
-/// # Why the stored ID must equal the registered ID (mahbot-1035)
+/// # Why the stored ID must equal the registered ID
 ///
 /// [`BoardStore::add_comment`] routes mid-work comments to the agent(s)
 /// listed in `assigned_to` via an exact-match lookup in the message router
@@ -2022,7 +2022,6 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 // ── Parallel agent helpers (shared) ─────────────────────────────────────
 //
 // Why `process_analyst_verdicts` and `process_verifier_verdicts` are separate
-// -----------------------------------------------------------------------
 // Both follow the same skeleton (record comments -> classify -> transition)
 // but differ in four ways that make a single unified function awkward:
 //
@@ -2053,14 +2052,14 @@ enum ParallelVerdict {
     /// Agent produced a response but structured verdict extraction failed
     /// after exhausting the hardened retry loop. Carries the
     /// [`crate::retry::RetryExhausted`] so the raw last-attempt response can be
-    /// dumped into the ticket comment (mahbot-1066 Amendment B).
+    /// dumped into the ticket comment.
     ParseFailed(crate::retry::RetryExhausted),
     /// Agent produced a successfully-parsed verdict.
     Verdict(crate::Verdict),
 }
 
 /// Reject verdict scores outside [0,10] — a garbage score must never pass any
-/// gate (mahbot-1066 item 5). Runs fail-closed inside the extraction retry
+/// gate. Runs fail-closed inside the extraction retry
 /// loop: rejection is a parse failure and triggers the re-prompt.
 fn validate_verdict_score(v: &crate::Verdict) -> Result<(), String> {
     if v.score <= 10 {
@@ -2160,12 +2159,12 @@ async fn run_parallel_agents(
                     // to the original verifier agent call — the provider can reuse the
                     // cached prefix.
                     //
-                    // mahbot-1066: hardened outer retry loop (13 attempts,
-                    // backoff 5/10/20/40/60/60 s, 720 s wall cap) with
+                    // The hardened outer retry loop (13 attempts,
+                    // backoff 5/10/20/40/60/60 s, 720 s wall cap) enforces
                     // fail-closed score validation. On terminal
                     // failure the RetryExhausted (carrying the last-attempt raw
                     // text) flows into ParallelVerdict::ParseFailed for the ticket
-                    // comment (Amendment B).
+                    // comment.
                     let verdict = agent
                         .extract_verdict::<crate::Verdict>(
                             &extraction_prompt,
@@ -2227,7 +2226,7 @@ enum VerdictFilter {
 }
 
 /// Byte cap for the raw last-attempt response dump in verdict-failure
-/// comments (mahbot-1066 Amendment B). No comment-size limit exists in the
+/// comments. No comment-size limit exists in the
 /// store, but every downstream agent reads all comments verbatim and the
 /// failure notification embeds the last comment — so cap the dump using the
 /// sandwich-truncation pattern (head + explicit "(N bytes omitted)" marker +
@@ -2244,7 +2243,7 @@ const VERDICT_RAW_DUMP_CAP: usize = 24_000;
 ///
 /// No scrubbing/markdown-escaping is applied — analyst reports are already
 /// written unescaped on the comment path (pre-existing condition, out of
-/// scope for mahbot-1066).
+/// scope).
 fn raw_response_dump_section(failure: &crate::retry::RetryExhausted) -> String {
     match failure.last_raw.as_deref() {
         Some(text) if !text.trim().is_empty() => format!(

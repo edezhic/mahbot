@@ -60,9 +60,7 @@ use tokio_util::sync::CancellationToken;
 use crate::session::Session;
 use crate::util::UnwrapPoison;
 
-// ---------------------------------------------------------------------------
 // Diagnostics commands — discovered dev tooling
-// ---------------------------------------------------------------------------
 
 /// Discovered diagnostic commands for a workspace.
 ///
@@ -166,9 +164,7 @@ impl DiagnosticsCommands {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Diagnostics command normalization — clippy gate safety net
-// ---------------------------------------------------------------------------
 
 /// Detect the gate-breaking `clippy --fix … -- -D warnings` compound
 /// (rust-clippy#17444): a single clippy invocation that combines the auto-fix
@@ -265,9 +261,7 @@ fn is_lint_gate_flag(tok: &str) -> bool {
     tok.starts_with("-D") || tok == "--deny" || tok.starts_with("--deny=")
 }
 
-// ---------------------------------------------------------------------------
 // Core type: Workspace
-// ---------------------------------------------------------------------------
 
 /// Lifecycle status of a workspace.
 ///
@@ -515,7 +509,7 @@ pub struct ChannelMessage {
 ///
 /// The `reply_markup` field carries Telegram inline_keyboard JSON. Non-Telegram
 /// channels ignore it. Inline keyboard construction happens in `main.rs`
-/// (e.g. `build_start_keyboard`) — other channels receive empty or harmless
+/// (e.g. `build_models_keyboard`) — other channels receive empty or harmless
 /// payloads. The self-update path stores `reply_target` (via
 /// `ChannelMessage::reply_target`) into `recipient` for admin Telegram
 /// notifications during the update process — see the channel's
@@ -1295,7 +1289,7 @@ pub(crate) struct ChatRequest {
     pub provider_allow_fallbacks: Option<bool>,
 }
 
-/// Validator callback for scoped structured extraction (mahbot-1066): rejects
+/// Validator callback for scoped structured extraction: rejects
 /// a parsed value (e.g. verdict score ∉ [0,10]). A rejection is treated as a
 /// parse failure inside the extraction retry loop (re-prompted, fail-closed).
 /// Must be `Send + Sync` because extraction runs inside `join_all` futures.

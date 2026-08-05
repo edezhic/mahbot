@@ -326,7 +326,7 @@ fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) {
         // reply_target is not available from session metadata — the recovery
         // response will be persisted to chat_history and broadcast via the
         // GUI channel, but may not be deliverable via Telegram to unregistered
-        // users.  This is an accepted limitation (see mahbot-986).
+        // users.  This is an accepted limitation.
         reply_target: None,
     };
 

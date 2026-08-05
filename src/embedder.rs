@@ -92,7 +92,7 @@ static GLOBAL_EMBEDDER: RwLock<Option<Embedder>> = RwLock::new(None);
 
 /// Atomic state tracker to coordinate lazy initialization.
 ///
-/// Embedder state machine (shared wrapper extracted in mahbot-1043:
+/// Embedder state machine (shared wrapper extracted in
 /// [`crate::util::model_state::ModelState`]).
 ///
 /// # States

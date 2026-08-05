@@ -3,7 +3,7 @@
 //! Architecture: Conv1D(96→4, k=3) + BN + ReLU → Conv1D(4→4, k=3) + BN + ReLU
 //! → AdaptiveAvgPool1d → Linear(4→1) + Sigmoid.
 //!
-//! ~1.2K parameters (mahbot-931).  The 5-member ensemble with diverse
+//! ~1.2K parameters.  The 5-member ensemble with diverse
 //! architectures was removed — a single small Conv1D trained on ~99 positive
 //! windows captures temporal convolution patterns without ensemble overhead.
 //!
@@ -11,7 +11,7 @@
 //! acting as a learned per-channel affine transform — identical at train
 //! and inference time.  This was found to be correct for a network where
 //! per-sample normalization over only WINDOW_SIZE=3 spatial positions
-//! destroys the magnitude differences learned by Conv1D layers (mahbot-849).
+//! destroys the magnitude differences learned by Conv1D layers.
 //!
 //! Inference uses pure Rust. Training uses manual backprop + Adam.
 
@@ -48,7 +48,7 @@ const CONV2_OUT: usize = 4;
 const KERNEL_SIZE: usize = 3;
 const FC_OUT: usize = 1;
 
-/// Minimal architecture config — single member with ~1.2K params (mahbot-931).
+/// Minimal architecture config — single member with ~1.2K params.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ArchConfig {
     pub conv1_out: usize,
@@ -75,7 +75,7 @@ impl Default for ArchConfig {
 
 /// L2 regularization strength (lambda).
 ///
-/// Set to 0.0001 (mahbot-835).  The 829 baseline of 0.001 caused the
+/// Set to 0.0001.  The 829 baseline of 0.001 caused the
 /// Conv1D classifier to underfit with the expanded negative dataset
 /// (2093 embeddings from 20 confusable + 20 unrelated × 3 seeds).
 /// Even at 0.0005 the classifier still produced sub-0.80 per-frame
@@ -140,7 +140,7 @@ pub struct ClassifierWeights {
     pub fc_weight: Vec<f32>, // [1, conv2_out]
     pub fc_bias: Vec<f32>,   // [1]
     pub bn_eps: f32,
-    /// Architecture configuration for this classifier (mahbot-848).
+    /// Architecture configuration for this classifier.
     /// Defines conv1_out, conv2_out, and kernel_size that were used during
     /// training.  Uses `#[serde(default)]` so legacy enrollment data (which
     /// predates this field) deserializes with the baseline architecture,
@@ -157,19 +157,19 @@ impl Default for ClassifierWeights {
 
 impl ClassifierWeights {
     /// Initialize classifier weights using a seeded RNG for deterministic training
-    /// and the given architecture configuration (mahbot-848).
+    /// and the given architecture configuration.
     /// Used by [`train_classifier`] when a seed is configured, replacing the
     /// non-deterministic `Default` path.
     pub fn from_rng(rng: &mut (impl rand::Rng + ?Sized), arch: &ArchConfig) -> Self {
         let ks = arch.kernel_size;
         let c1 = arch.conv1_out;
         let c2 = arch.conv2_out;
-        // Xavier/Glorot uniform initialization corrected for Conv1D
-        // (mahbot-846).  fan_in and fan_out must include kernel_size.
+        // Xavier/Glorot uniform initialization corrected for Conv1D.
+        // fan_in and fan_out must include kernel_size.
         // Formula: scale = sqrt(6 / (fan_in + fan_out))
         //   fan_in = in_channels * kernel_size
         //   fan_out = out_channels * kernel_size
-        // Multiplied by 1.7 (mahbot-851) — the "correct" Xavier scale
+        // Multiplied by 1.7 — the "correct" Xavier scale
         // produces weights too small for this tiny dataset (~99 positive
         // windows) to escape the flat region of the loss landscape.
         // The oversized init was used pre-846 and is required for learning.
@@ -295,7 +295,7 @@ impl ClassifierWeights {
 // ── Classifier ──────────────────────────────────────────────────────────
 
 pub struct WakeWordClassifier {
-    /// Single Conv1D weight set (mahbot-931).  The 5-member ensemble was
+    /// Single Conv1D weight set.  The 5-member ensemble was
     /// removed — a single small Conv1D (~1.2K params) captures temporal
     /// convolution patterns without ensemble overhead.
     weights: ClassifierWeights,
@@ -490,7 +490,7 @@ pub struct ClassifierTrainingResult {
     #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub neg_scores_max: f32,
     /// Per-epoch training loss (cross-entropy over the training split),
-    /// one entry per epoch actually trained (mahbot-1005 §5).
+    /// one entry per epoch actually trained.
     #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub per_epoch_train_loss: Vec<f32>,
     /// Per-epoch validation loss, one entry per epoch actually trained.
@@ -509,12 +509,11 @@ pub struct ClassifierTrainingResult {
     /// Number of validation windows (after the random train/val split).
     #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub n_val_windows: usize,
-    /// Decile boundaries of the training-set positive-window scores
-    /// (mahbot-1005 §3).  `None` when no positive windows existed.
+    /// Decile boundaries of the training-set positive-window scores.
+    /// `None` when no positive windows existed.
     #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub pos_scores_deciles: Option<[f32; 10]>,
-    /// Decile boundaries of the training-set negative-window scores
-    /// (mahbot-1005 §3).
+    /// Decile boundaries of the training-set negative-window scores.
     #[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
     pub neg_scores_deciles: Option<[f32; 10]>,
 }
@@ -533,7 +532,7 @@ pub struct TrainingConfig {
     /// `rand::rng()` (non-deterministic).  When `Some(seed)`, uses
     /// `StdRng::seed_from_u64(seed)` for weight init and data shuffling.
     pub rng_seed: Option<u64>,
-    /// Architecture configuration for this classifier (mahbot-848).
+    /// Architecture configuration for this classifier.
     /// Defines conv1_out, conv2_out, and kernel_size for the Conv1D layers.
     /// When `ArchConfig::default()` (baseline, 4/4/k3), behaviour matches
     /// the pre-848 single-architecture training.
@@ -571,7 +570,7 @@ fn build_windows(sequences: &[EmbeddingSequence]) -> Vec<Vec<f32>> {
             }
         } else {
             // Short sequence (< WINDOW_SIZE embeddings): simulate the
-            // streaming cold-start ring-buffer accumulation (mahbot-1001 Fix 4).
+            // streaming cold-start ring-buffer accumulation.
             //
             // Streaming inference in score_single_embedding builds the classifier
             // window by tiling the current ring buffer with repeat-last:
@@ -666,7 +665,7 @@ pub fn train_classifier(
         }
     }
 
-    // Train/val split — random 80/20 split (k-fold was removed in mahbot-851
+    // Train/val split — random 80/20 split (k-fold was removed
     // because it reduced training data by 20% on a tiny ~99-window dataset,
     // preventing the model from learning).
     let n = all_x.len();
@@ -705,7 +704,7 @@ pub fn train_classifier(
 
     let mut opt = AdamStateGroup::new(&weights);
     let mut epochs_trained = 0;
-    // Per-epoch diagnostics (mahbot-1005 §5) — previously computed and logged
+    // Per-epoch diagnostics — previously computed and logged
     // but discarded.  The vectors cap at `cfg.max_epochs` (100) entries.
     let mut per_epoch_train_loss: Vec<f32> = Vec::new();
     let mut per_epoch_val_loss: Vec<f32> = Vec::new();
@@ -726,7 +725,7 @@ pub fn train_classifier(
             let mut g = GradientBuffer::new(&weights);
             let mut batch_loss = 0.0;
             for &i in chunk {
-                // Data augmentation removed in mahbot-851 — Gaussian noise
+                // Data augmentation removed — Gaussian noise
                 // makes the learning problem harder on this tiny dataset
                 // (~99 positive windows).  Train on raw windows.
                 let x_cf = to_channels_first(&tr_x[i], cin, lin);
@@ -792,7 +791,7 @@ pub fn train_classifier(
         };
 
         // Validation accuracy: fraction of val windows where pred > 0.5
-        // matches the label (mahbot-1005 §5).
+        // matches the label.
         let val_accuracy = if va_x.is_empty() {
             0.0
         } else {
@@ -899,7 +898,7 @@ fn compute_score_stats(scores: &[f32]) -> (f32, f32, f32) {
 }
 
 /// Decile boundaries of a score distribution (`None` for empty input).
-/// Added for benchmark training-score diagnostics (mahbot-1005 §3).
+/// Added for benchmark training-score diagnostics.
 fn score_deciles(scores: &[f32]) -> Option<[f32; 10]> {
     if scores.is_empty() {
         return None;

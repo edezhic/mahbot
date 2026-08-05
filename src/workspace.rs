@@ -915,7 +915,7 @@ impl WorkspaceStore {
         let generation = self
             .get_generation(name, GenerationColumn::DISCOVERY)
             .await?;
-        // Skip diagnostics discovery — see Part 1 of mahbot-726.
+        // Skip diagnostics discovery so user-managed diagnostics survive re-analysis.
         spawn_workspace_discovery(&ws, generation, false);
 
         Ok(())
@@ -1297,9 +1297,7 @@ pub async fn run_nightly_check_loop() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Test helpers
-// ---------------------------------------------------------------------------
 
 /// Create a minimal [`Workspace`] from a path for testing.
 /// The name is derived from the path's file name.
@@ -1320,9 +1318,7 @@ pub fn test_ws_named(path: &str, name: &str) -> Workspace {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

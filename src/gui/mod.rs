@@ -2323,8 +2323,7 @@ impl Dashboard {
             .into()
     }
 
-    /// Render a compact voice status indicator in the footer bar (mahbot-812,
-    /// mahbot-921).
+    /// Render a compact voice status indicator in the footer bar.
     ///
     /// Shows a compact indicator for every [`VoiceStatus`] variant except
     /// [`VoiceStatus::Disabled`] (which is hidden — voice is off).

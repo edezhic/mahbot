@@ -281,7 +281,7 @@ fn format_analyst_reports_markdown(escaped: &[String]) -> String {
 /// - 1 valid response → returned directly (no consolidation call)
 /// - 2–3 valid responses → consolidated via [`crate::retry::retry_chat`]
 ///
-/// Fail-open (mahbot-1066 Amendment A): when consolidation fails after all
+/// Fail-open: when consolidation fails after all
 /// retries (or on any immediate non-retryable error), the raw VALID analyst
 /// reports are delivered with an explicit "unconsolidated" marker instead of
 /// an error — findings are never lost. The result is free-form text consumed

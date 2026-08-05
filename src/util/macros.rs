@@ -5,9 +5,7 @@
 //! constants. Instead of 3–4 separate locations to update per column set,
 //! a single `columns!` invocation serves as the single source of truth.
 
-// ---------------------------------------------------------------------------
 // Helper: join literals with ", " — used internally by columns!
-// ---------------------------------------------------------------------------
 
 /// Join literal strings with `", "` separator.
 ///
@@ -21,9 +19,7 @@ macro_rules! __columns_join {
     };
 }
 
-// ---------------------------------------------------------------------------
 // Helper: generate COL_* index constants — used internally by columns!
-// ---------------------------------------------------------------------------
 
 /// Generate `COL_{prefix}_{name}` index constants with positional indices.
 ///
@@ -46,9 +42,7 @@ macro_rules! __columns_gen {
     };
 }
 
-// ---------------------------------------------------------------------------
 // Public macro: columns!
-// ---------------------------------------------------------------------------
 
 /// Generate a column-string constant and matching column-index constants from
 /// a single source-of-truth list.
@@ -102,9 +96,7 @@ macro_rules! columns {
     };
 }
 
-// ---------------------------------------------------------------------------
 // Declarative macro: define_store!
-// ---------------------------------------------------------------------------
 
 /// Generate a DB-backed store struct, its `open()` constructor, and a global
 /// singleton (via [`crate::global_store!`]).

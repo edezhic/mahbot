@@ -781,9 +781,7 @@ impl Drop for TxGuard<'_> {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────
 // Schema / index management
-// ─────────────────────────────────────────────────────────────────────
 
 /// Read the current schema version from `PRAGMA user_version`.
 ///

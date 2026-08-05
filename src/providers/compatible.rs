@@ -34,7 +34,7 @@ pub(crate) struct OpenAiCompatibleProvider {
     /// Cached HTTP client with connection reuse across all API calls.
     /// Initialized lazily on first `http_client()` call.
     http_client: OnceLock<Client>,
-    /// Cached HTTP client for scoped calls (mahbot-1066): NO total request
+    /// Cached HTTP client for scoped calls: NO total request
     /// timeout — per-attempt total is enforced by the scoped caller against
     /// the remaining operation budget, and idle timeouts reset while data
     /// flows. Initialized lazily on first `http_client_scoped()` call.
@@ -847,7 +847,7 @@ impl Provider for OpenAiCompatibleProvider {
         Ok(())
     }
 
-    /// Scoped single-attempt chat (mahbot-1066): one HTTP request, no
+    /// Scoped single-attempt chat: one HTTP request, no
     /// provider-internal retries, idle-timeout body reads, per-attempt total
     /// bounded by the remaining operation deadline.
     #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]

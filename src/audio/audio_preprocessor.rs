@@ -130,7 +130,7 @@ pub struct AudioPreprocessor {
     config: PreprocessorConfig,
     /// Running RMS level estimate for asymmetric EMA-based AGC.
     ///
-    /// Initialised to 0.0 (mahbot-856).  On the first non-zero chunk,
+    /// Initialised to 0.0.  On the first non-zero chunk,
     /// [`apply_agc()`] sets this directly to the chunk RMS so the gain
     /// immediately reflects the actual audio level.  Lazy init eliminates
     /// the ~3.6s convergence delay that occurred with [`TARGET_RMS`]
@@ -140,7 +140,7 @@ pub struct AudioPreprocessor {
     /// - Slow release (0.02) when chunk RMS is below running estimate
     ///
     /// Reset to 0.0 on [`clear_buffer()`] and [`reset()`] so the AGC
-    /// lazily initialises on the next speech frame (mahbot-856).
+    /// lazily initialises on the next speech frame.
     /// Without this reset, stale gain history from a different acoustic
     /// environment (e.g. enrollment) could produce incorrect gain during
     /// live detection in a quieter/louder setting.
@@ -176,7 +176,7 @@ impl AudioPreprocessor {
             read_pos: 0,
             config,
             // Initialise to 0.0 so the AGC lazily initialises on the first
-            // non-zero frame (mahbot-856).  Initialising to TARGET_RMS caused
+            // non-zero frame.  Initialising to TARGET_RMS caused
             // the gain to start at 1.0× for quiet audio (e.g. volume-reduced
             // variants at -3dB) and take ~114 frames (~3.6s) to converge to
             // the correct level via slow release — the utterance was already
@@ -236,13 +236,13 @@ impl AudioPreprocessor {
     /// the suppressor has built up over time.
     ///
     /// Also resets the EMA running RMS to 0.0 so the AGC lazily initialises
-    /// on the next non-zero speech frame (mahbot-856).  Without this reset,
+    /// on the next non-zero speech frame.  Without this reset,
     /// stale gain history from a different acoustic environment (e.g.
     /// enrollment) could produce incorrect gain during live detection.
     ///
     /// # Convergence cost
     /// Resets the running RMS to 0.0 so the AGC lazily initialises on the
-    /// next non-zero speech frame (mahbot-856).  Convergence is instantaneous
+    /// next non-zero speech frame.  Convergence is instantaneous
     /// — the gain on the first speech frame directly reflects TARGET_RMS /
     /// chunk_rms.  Unlike the old TARGET_RMS initialisation which required
     /// ~114 chunks (~3.6s) to converge from TARGET_RMS down to quiet audio,
@@ -251,7 +251,7 @@ impl AudioPreprocessor {
         self.ns_buffer.clear();
         self.read_pos = 0;
         // Reset to 0.0 (lazy initialisation on next speech frame) instead of
-        // TARGET_RMS, matching the constructor (mahbot-856).  Without this,
+        // TARGET_RMS, matching the constructor.  Without this,
         // a pipeline reset after loud enrollment would leave running_rms at
         // TARGET_RMS while the next speech is quiet (or vice versa), causing
         // the same slow-convergence issue as the original TARGET_RMS init.
@@ -270,7 +270,7 @@ impl AudioPreprocessor {
     /// AGC-active frame count) so [`agc_converged`](Self::agc_converged)
     /// reflects only the post-reset audio — `reset()` is used at production
     /// segment boundaries and by the E2E benchmark between warm-up and test
-    /// utterance (mahbot-1006 A); carrying the pre-reset history into the
+    /// utterance; carrying the pre-reset history into the
     /// convergence report would mix two acoustic states.
     pub fn reset(&mut self) {
         self.ns_buffer.clear();
@@ -321,7 +321,7 @@ impl AudioPreprocessor {
             self.ns_buffer.drain(..self.read_pos);
             self.read_pos = 0;
         }
-        // Scale back to [-1.0, 1.0] in place (mahbot-1029 D6 — avoids a
+        // Scale back to [-1.0, 1.0] in place (avoids a
         // second allocation on every chunk; identical float division).
         for s in &mut output {
             *s /= 32768.0;
@@ -356,7 +356,7 @@ impl AudioPreprocessor {
             return samples;
         }
 
-        // Shared RMS helper (mahbot-1043); empty input already returned above.
+        // Shared RMS helper; empty input already returned above.
         let chunk_rms = crate::util::compute_rms(&samples);
 
         if chunk_rms == 0.0 {
@@ -384,7 +384,7 @@ impl AudioPreprocessor {
 
         // Lazy initialisation: on the first non-zero chunk (pure silence
         // returns above), set running_rms directly to the chunk RMS so the
-        // gain immediately reflects the actual audio level (mahbot-856).
+        // gain immediately reflects the actual audio level.
         // Without this, a fresh AGC starting at 0.0 would need the EMA to
         // converge from zero upward — fast attack (0.20) reaches 90% in ~10
         // frames, which is acceptable but still introduces a momentary gain
@@ -477,21 +477,21 @@ impl AudioPreprocessor {
     }
 }
 
-// ── Shared fresh-AGC feed helper (mahbot-1045 A2) ───────────────────────
+// ── Shared fresh-AGC feed helper ───────────────────────
 
 /// Feed `pcm` through a fresh [`AudioPreprocessor`] in `chunk_size` frames,
 /// returning the concatenated processed audio.
 ///
 /// Shared by the E2E bench (7 sites) and the production prewarm path
 /// (`prewarm_phrase_embeddings`) so the per-segment fresh-AGC distribution
-/// cannot drift (mahbot-1009 / mahbot-1006 B/L).  A fresh preprocessor per
+/// cannot drift.  A fresh preprocessor per
 /// segment matches the streaming pipeline's per-segment reset — a shared
 /// preprocessor would process the Nth clip with AGC adapted to N−1 prior
 /// clips, an artifact streaming never produces.
 ///
 /// Chunks are fed as-is (no zero-padding): the NS stage buffers incomplete
 /// frames internally and the next chunk completes them — matching the
-/// streaming pipeline's tail accumulation (mahbot-1006 G).
+/// streaming pipeline's tail accumulation.
 ///
 /// NOTE: the ambient-negative bench path (`generate_ambient_noise_sequences`)
 /// deliberately does NOT use this helper — it routes noise profiles through a

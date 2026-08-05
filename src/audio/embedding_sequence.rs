@@ -30,7 +30,7 @@ pub enum Source {
     Ambient,
     /// Owner-general speech collected during Phase 3 enrollment (non-wake-word
     /// speech from the user, used as additional negative examples for the
-    /// classifier; mahbot-932).
+    /// classifier).
     Owner,
 }
 
@@ -65,7 +65,7 @@ impl EmbeddingSequence {
 
 /// Test-support helper: wrap flat embeddings into a single sequence with the
 /// canonical enrollment provenance used by the wake-word classifier test
-/// module (mahbot-1043).
+/// module.
 #[cfg(test)]
 pub(crate) fn make_test_sequence(embs: Vec<Vec<f32>>) -> EmbeddingSequence {
     EmbeddingSequence {

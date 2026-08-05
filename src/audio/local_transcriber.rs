@@ -122,7 +122,7 @@ static GLOBAL_TRANSCRIBER: Mutex<Option<QwenLocalTranscriber>> = Mutex::new(None
 /// Atomic state tracker to coordinate lazy initialization.
 ///
 /// Model-loading lifecycle for the transcriber (Uninit → Loading → Ready /
-/// Failed).  Shared wrapper extracted in mahbot-1043:
+/// Failed).  Shared wrapper extracted in
 /// [`crate::util::model_state::ModelState`].  Failed is terminal — a restart
 /// is required to retry (the [`transcribe_file_async`] error path returns an
 /// `[Audio: filename attached]` placeholder).
@@ -266,7 +266,7 @@ pub async fn transcribe_file_async(path: &Path, inference_timeout: Duration) -> 
 /// Supports WAV (directly via qwen-asr's parser for maximum compatibility),
 /// OGG/Opus (Telegram voice messages), MP3, and raw audio.
 ///
-/// `pub(crate)` (mahbot-1053): the voice-tests E2E benchmark's real-audio
+/// `pub(crate)`: the voice-tests E2E benchmark's real-audio
 /// FAPH phase reuses this decoder for the pinned corpus (WAV/OGG/MP3 only —
 /// the corpus format pin), so the bench binary needs no new decoder crates.
 pub(crate) fn decode_audio_to_mono_f32(path: &Path) -> Result<Vec<f32>> {

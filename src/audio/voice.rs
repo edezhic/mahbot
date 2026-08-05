@@ -65,9 +65,7 @@ pub fn run_voice_pipeline_benchmark() {
     voice_pipeline_e2e_test::run_internal();
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
 // Constants
-// ═══════════════════════════════════════════════════════════════════════════
 
 /// Target sample rate: 16 kHz mono.
 pub const SAMPLE_RATE: u32 = 16_000;
@@ -78,7 +76,7 @@ pub(crate) const FRAME_LENGTH: usize = 512;
 /// Hop length between frames (256 samples at 16 kHz).  This constant controls
 /// VAD frame iteration stride and silence tracking in the application code.
 /// The ONNX mel spectrogram model uses its own internal stride (160 samples =
-/// 10ms) — HOP_LENGTH does NOT affect mel frame spacing (mahbot-772).
+/// 10ms) — HOP_LENGTH does NOT affect mel frame spacing.
 pub(crate) const HOP_LENGTH: usize = 256;
 
 /// Number of mel bands in the spectrogram.
@@ -91,7 +89,7 @@ const NUM_MEL_BANDS: usize = 32;
 ///
 /// This constant is used to align voice batch overlap boundaries with the
 /// model's internal stride so that mel frames across consecutive batches
-/// have consistent temporal positions (mahbot-799).  See [`flush_voice_batch`]
+/// have consistent temporal positions.  See [`flush_voice_batch`]
 /// for details.
 const MEL_STRIDE: usize = 160;
 
@@ -103,14 +101,14 @@ const MEL_STRIDE: usize = 160;
 /// consecutive batch boundaries.
 ///
 /// Using 2× provides two full-context crossing frames at the batch boundary.
-/// See [`flush_voice_batch`] for the detailed rationale (mahbot-799).
+/// See [`flush_voice_batch`] for the detailed rationale.
 const VOICE_BATCH_OVERLAP: usize = MEL_STRIDE * 2;
 
 /// Embedding window: 76 consecutive mel frames (~760ms with the ONNX mel
 /// model's 10ms internal stride, not 16ms — see HOP_LENGTH note above).
 const EMBEDDING_WINDOW_FRAMES: usize = 76;
 
-/// Deferred burst trigger (mahbot-1023): the stride-8 scorer HOLDS position 0
+/// Deferred burst trigger: the stride-8 scorer HOLDS position 0
 /// until the accumulated mel-frame buffer reaches this many frames, then
 /// sweeps the start-aligned positions 0/8/16/24 in one synchronous burst with
 /// the trained start-0-aligned padded geometry.
@@ -121,7 +119,7 @@ const EMBEDDING_WINDOW_FRAMES: usize = 76;
 const BURST_TRIGGER_FRAMES: usize = 68;
 
 /// Stride of the deferred burst / segment-end pass position grid
-/// (start-aligned positions 0, 8, 16, 24 — mahbot-1023).
+/// (start-aligned positions 0, 8, 16, 24).
 const BURST_STRIDE: usize = 8;
 
 /// Maximum number of positions in the burst sweep / segment-end pass
@@ -142,8 +140,8 @@ pub(crate) const SILENCE_THRESHOLD_SAMPLES: usize =
 
 /// Enrollment/segmentation silence threshold (~304ms = 19 hops × 256 samples).
 /// Aligned to streaming detection's [`SEGMENT_TIMEOUT_HOPS`] so that utterance
-/// boundaries are detected consistently between training and inference
-/// (mahbot-1001 Fix 7).  Previously used [`SILENCE_THRESHOLD_SAMPLES`] (~1.5s),
+/// boundaries are detected consistently between training and inference.
+/// Previously used [`SILENCE_THRESHOLD_SAMPLES`] (~1.5s),
 /// which meant utterances with pauses were segmented differently between
 /// enrollment training and streaming inference, contributing to out-of-
 /// distribution classifier inputs.
@@ -196,12 +194,12 @@ const SILENCE_UI_GATE_SAMPLES: usize = 200 * SAMPLE_RATE as usize / 1000;
 /// # See also
 ///
 /// * [`start_microphone`] — channel creation
-/// * ticket mahbot-804 — unbounded queue growth root cause
+/// * unbounded queue growth root cause
 const MIC_CHANNEL_CAPACITY: usize = 32;
 
 /// Duration of non-VAD audio before showing "speak louder" warning during
 /// enrollment (~5s).  Derived from SAMPLE_RATE and HOP_LENGTH so the threshold
-/// stays correct if frame/hop sizes are adjusted (mahbot-765).
+/// stays correct if frame/hop sizes are adjusted.
 const ENROLLMENT_NO_SPEECH_DURATION: Duration = Duration::from_secs(5);
 
 /// Consecutive non-VAD frame threshold for enrollment no-speech warning.
@@ -223,8 +221,8 @@ pub(crate) const DEFAULT_WAKE_WORD_PHRASE: &str = "mahbot";
 /// Returns `true` if `phrase` (already normalized via [`normalize_phrase`]) is
 /// the Mahbot wake word or its "hey" variant.
 ///
-/// Only these two exact forms trigger Mahbot-specific confusable inclusion
-/// (mahbot-909).  Unnormalized input, diacritics ("mähbot"), partial-word
+/// Only these two exact forms trigger Mahbot-specific confusable inclusion.
+/// Unnormalized input, diacritics ("mähbot"), partial-word
 /// matches ("mahbotics"), or other variants return `false`.
 ///
 /// # Quality implications for non-Mahbot wake words
@@ -239,7 +237,7 @@ pub(crate) const DEFAULT_WAKE_WORD_PHRASE: &str = "mahbot";
 /// negatives do not teach the model to reject phonetic near-misses (e.g., "pay
 /// mabot" sounds similar to "hey mahbot"). The model will likely false-accept
 /// more wake-word-like sounds until a general-purpose phonetic near-miss generator
-/// is implemented (future work, mahbot-909 scope note).
+/// is implemented (future work).
 ///
 /// Additionally, the ~2-minute TTS prewarm of confusable embeddings runs on every
 /// startup regardless of the enrolled phrase (accepted technical debt — see
@@ -303,7 +301,7 @@ const COOLDOWN_ACCUMULATION_CAP: usize = FRAME_LENGTH * 2;
 /// 19 hops ≈ 304 ms.  When this many consecutive silence hops are observed
 /// across calls to [`handle_wake_word_detection`], the current detection
 /// segment is considered ended and per-segment state is reset to prevent
-/// cross-utterance score accumulation (mahbot-894).
+/// cross-utterance score accumulation.
 ///
 /// ## Value justification
 /// Natural intra-phrase pauses (syllable boundaries, stop consonants) in
@@ -319,11 +317,11 @@ const SEGMENT_TIMEOUT_HOPS: usize = 19;
 /// and arrives every ~128ms, keeping ~19 embeddings = ~2.4 seconds of context.
 const EMBEDDING_RING_MAX: usize = 19;
 
-/// Number of enrollment samples required (mahbot-765).
+/// Number of enrollment samples required.
 const NUM_ENROLLMENT_SAMPLES: usize = 10;
 
 /// Minimum length (in audio samples at 16kHz) for a collected ambient audio
-/// chunk to be used as a negative training example (mahbot-797).
+/// chunk to be used as a negative training example.
 ///
 /// Set to 0.5s of audio, which produces ~31 mel frames (padded to 76 for the
 /// embedding model).  Chunks shorter than this are discarded — they would be
@@ -333,10 +331,10 @@ const MIN_NEGATIVE_AUDIO_LEN: usize = SAMPLE_RATE as usize / 2;
 /// Maximum number of ambient noise chunks to retain for negative training.
 /// If training repeatedly fails (ONNX not loaded, <2 chunks, or empty
 /// embeddings), this cap prevents unbounded memory growth in the voice
-/// pipeline state (mahbot-800).
+/// pipeline state.
 const MAX_NEGATIVE_AUDIO_CHUNKS: usize = 100;
 
-// ── Phase 3 (owner-negative) enrollment constants (mahbot-913) ────────────
+// ── Phase 3 (owner-negative) enrollment constants ────────────
 
 /// Target VAD-positive speech duration for owner-negative Phase 3 collection.
 /// ~60 seconds of VAD-positive general speech from the user, used alongside
@@ -364,7 +362,7 @@ pub(crate) const ENROLLMENT_QUALITY_DURATION_MIN_MS: u64 = 400;
 pub(crate) const ENROLLMENT_QUALITY_DURATION_MAX_MS: u64 = 2000;
 
 /// Fraction of enrollment utterances that must trigger detection in the
-/// blocking self-test (mahbot-898) — rejects model deployment on failure.
+/// blocking self-test — rejects model deployment on failure.
 const ENROLLMENT_QUALITY_SELF_TEST_MIN_FRACTION: f32 = 0.8;
 
 /// Minimum cosine similarity between an utterance's mean embedding and the
@@ -372,7 +370,7 @@ const ENROLLMENT_QUALITY_SELF_TEST_MIN_FRACTION: f32 = 0.8;
 /// starting value — the enrollment prompts intentionally diversify
 /// (distance, angle, voice quality) which can lower cross-utterance
 /// similarity.  Verified for streaming-pipeline embeddings via the E2E
-/// benchmark (mahbot-856): all 13/13 enrollment utterances (5 enrolled +
+/// benchmark: all 13/13 enrollment utterances (5 enrolled +
 /// 8 augmented variants) passed with ≥0.65 cosine similarity to centroid
 /// across multiple benchmark runs.  The denser but temporally-averaged
 /// streaming embeddings produce similar utterance-level similarities to
@@ -386,7 +384,7 @@ const ENROLLMENT_CONSISTENCY_MIN_SIMILARITY: f32 = 0.65;
 /// utterances get a higher bar to compensate for the smaller sample.
 const ENROLLMENT_CONSISTENCY_MIN_FRACTION: f32 = 0.7;
 
-/// Enrollment prompts for multi-position guidance (mahbot-778).
+/// Enrollment prompts for multi-position guidance.
 /// Each entry is (prompt_text, count_of_samples_for_this_prompt).
 const ENROLLMENT_PROMPTS: &[(&str, usize)] = &[
     ("Say it normally", 3),
@@ -407,8 +405,8 @@ pub(crate) const RAW_RING_MAX: usize = SAMPLE_RATE as usize / 5;
 /// decisions (e.g., `pre_pad_samples = samples.len() - 2 * CONTEXT_PADDING_SAMPLES`
 /// in [`handle_enrollment_sample`] and [`prewarm_phrase_embeddings`]).
 ///
-/// ⚠ Context padding is no longer used for VAD utterance segmentation
-/// (mahbot-1001 Fix 3).  The VAD threshold is now unified to 0.5 for both
+/// ⚠ Context padding is no longer used for VAD utterance segmentation.
+/// The VAD threshold is now unified to 0.5 for both
 /// enrollment and streaming, so the asymmetry that context padding was
 /// designed to mitigate (0.60 enrollment threshold vs 0.50 detection
 /// threshold) no longer exists.  The [`DEFAULT_VAD_SEGMENTATION_CONFIG`]
@@ -420,28 +418,28 @@ const CONTEXT_PADDING_MS: usize = 100;
 pub(crate) const CONTEXT_PADDING_SAMPLES: usize =
     (CONTEXT_PADDING_MS * SAMPLE_RATE as usize) / 1000;
 
-// ── Voice PCM disk cache (mahbot-872) ─────────────────────────────────
+// ── Voice PCM disk cache ─────────────────────────────────
 
 /// Name of the directory under the storage root for PCM audio cache.
 const VOICE_CACHE_DIR: &str = "voice_cache";
 
-/// Number of TTS seeds per confusable phrase for prosodic diversity (mahbot-872).
+/// Number of TTS seeds per confusable phrase for prosodic diversity.
 pub(crate) const CONFUSABLE_SEEDS_PER_PHRASE: usize = 5;
 
-/// Number of TTS seeds per unrelated phrase for prosodic diversity (mahbot-872).
+/// Number of TTS seeds per unrelated phrase for prosodic diversity.
 pub(crate) const UNRELATED_SEEDS_PER_PHRASE: usize = 3;
 
-/// Seed base offset for confusable phrase synthesis (mahbot-872).
+/// Seed base offset for confusable phrase synthesis.
 /// Each phrase i with seed j (0..CONFUSABLE_SEEDS_PER_PHRASE) uses:
 ///   seed = CONFUSABLE_SEED_BASE + i * CONFUSABLE_SEEDS_PER_PHRASE + j
 pub(crate) const CONFUSABLE_SEED_BASE: u64 = 1000;
 
-/// Seed base offset for unrelated phrase synthesis (mahbot-872).
+/// Seed base offset for unrelated phrase synthesis.
 /// Each phrase i with seed j (0..UNRELATED_SEEDS_PER_PHRASE) uses:
 ///   seed = UNRELATED_SEED_BASE + i * UNRELATED_SEEDS_PER_PHRASE + j
 pub(crate) const UNRELATED_SEED_BASE: u64 = 2000;
 
-// ── Shared PCM augmentation (mahbot-1045 A1) ─────────────────────────────
+// ── Shared PCM augmentation ─────────────────────────────
 
 /// One PCM variant produced by [`augment_pcm_variants`].
 ///
@@ -475,7 +473,7 @@ pub(crate) enum AugmentSet {
     Negatives,
 }
 
-/// Deterministic PCM augmentation of one input clip (mahbot-878).
+/// Deterministic PCM augmentation of one input clip.
 ///
 /// Produces the [`AugmentSet::Full`] variant list from `input`:
 ///
@@ -673,10 +671,9 @@ mod augment_tests {
     }
 }
 
-// ── Confusable phrase list for negative training (mahbot-859) ──
+// ── Confusable phrase list for negative training ──
 
-/// Canonical confusable near-miss phrases for negative training
-/// (mahbot-859).
+/// Canonical confusable near-miss phrases for negative training.
 pub(crate) const CONFUSABLE_PHRASES: &[&str] = &[
     // ── Direct phonetic substitutions (wake-word-like) ──────────────
     "hey madbot",
@@ -712,7 +709,7 @@ pub(crate) const CONFUSABLE_PHRASES: &[&str] = &[
     "may bot",
 ];
 
-/// Unrelated speech phrases for negative training (mahbot-872).
+/// Unrelated speech phrases for negative training.
 ///
 /// These are phonetically and semantically unrelated to the wake word, and
 /// cover short commands, medium phrases, long utterances, and non-English
@@ -787,14 +784,14 @@ pub(crate) const CONFUSABLE_EASY: &[&str] = &[
     "madbot", "mat bot", "bad bot", "mad lot", "mad pot", "med bot", "my bot", "may bot",
 ];
 
-/// Cache for pre-computed confusable phrase dense embeddings (mahbot-878, mahbot-923).
+/// Cache for pre-computed confusable phrase dense embeddings.
 ///
 /// Populated asynchronously during startup (see [`prewarm_confusable_embeddings`])
 /// after voice ONNX models and TTS models are ready, so enrollment never blocks
 /// on TTS synthesis (~2 minutes for 28 phrases).  Uses AGC pre-processing to
-/// match the production inference distribution (mahbot-859 Fix 2).
+/// match the production inference distribution.
 ///
-/// After the dense-stride-8 alignment (mahbot-923), this is the single cache used
+/// After the dense-stride-8 alignment, this is the single cache used
 /// for classifier training — the streaming cache was removed.
 ///
 /// The embeddings are used during classifier training to teach the
@@ -806,11 +803,11 @@ pub(crate) const CONFUSABLE_EASY: &[&str] = &[
 /// classifier trains on ambient negatives only.
 static CONFUSABLE_EMBEDDINGS_CACHE: OnceLock<Vec<EmbeddingSequence>> = OnceLock::new();
 
-/// Get the pre-computed confusable phrase dense embeddings for classifier negative training (mahbot-923).
+/// Get the pre-computed confusable phrase dense embeddings for classifier negative training.
 ///
 /// Returns a cached slice of dense-stride-8 embedding vectors pre-computed
 /// during startup via [`prewarm_confusable_embeddings`].  After the
-/// dense-stride-8 alignment (mahbot-923), the same cache serves the
+/// dense-stride-8 alignment, the same cache serves the
 /// classifier — the streaming cache was removed.
 ///
 /// If the pre-warm has not completed yet or models are not available, returns
@@ -823,14 +820,14 @@ pub(crate) fn confusable_dense_embeddings() -> &'static [EmbeddingSequence] {
     }
 }
 
-/// Cache for pre-computed unrelated speech dense embeddings (mahbot-872, mahbot-923).
+/// Cache for pre-computed unrelated speech dense embeddings.
 ///
 /// Populated asynchronously during startup (see [`prewarm_unrelated_embeddings`])
 /// after voice ONNX models and TTS models are ready.  Uses the same PCM disk
 /// caching strategy as confusable embeddings so TTS model updates
 /// automatically invalidate cached audio.
 ///
-/// After the dense-stride-8 alignment (mahbot-923), this is the single cache used
+/// After the dense-stride-8 alignment, this is the single cache used
 /// for classifier training — the streaming cache was removed.
 ///
 /// The embeddings are used during classifier training to teach the
@@ -839,11 +836,11 @@ pub(crate) fn confusable_dense_embeddings() -> &'static [EmbeddingSequence] {
 /// Once set, the cache is immutable — a new process is needed to regenerate.
 static UNRELATED_EMBEDDINGS_CACHE: OnceLock<Vec<EmbeddingSequence>> = OnceLock::new();
 
-/// Get the pre-computed unrelated speech dense embeddings for classifier negative training (mahbot-923).
+/// Get the pre-computed unrelated speech dense embeddings for classifier negative training.
 ///
 /// Returns a cached slice of dense-stride-8 embedding vectors pre-computed
 /// during startup via [`prewarm_unrelated_embeddings`].  After the
-/// dense-stride-8 alignment (mahbot-923), the same cache serves the
+/// dense-stride-8 alignment, the same cache serves the
 /// classifier — the streaming cache was removed.
 ///
 /// If the pre-warm has not completed yet or models are not available, returns
@@ -856,14 +853,14 @@ pub(crate) fn unrelated_dense_embeddings() -> &'static [EmbeddingSequence] {
     }
 }
 
-/// Poll for TTS voice styles to become available (mahbot-859 Fix 3).
+/// Poll for TTS voice styles to become available.
 ///
 /// TTS model download (~400 MB) may still be in progress when voice ONNX
 /// models (~2.4 MB) finish loading.  We poll with a 30-second interval,
 /// racing against the global shutdown token, so the prewarm succeeds on
 /// first startup even on slow connections.
 ///
-/// Starting from mahbot-932, this function is decoupled from the TTS playback
+/// This function is decoupled from the TTS playback
 /// toggle (`tts_enabled` config) — confusable/unrelated phrase embeddings are
 /// needed for classifier training regardless of whether audio
 /// playback is enabled.  If TTS models are not yet loaded, a download is
@@ -881,12 +878,12 @@ const MAX_TTS_STYLE_POLLS: u32 = 10;
 
 async fn wait_for_tts_styles() -> Option<Vec<String>> {
     // Trigger TTS model download if not already available (decoupled from
-    // the playback toggle — mahbot-932).  This ensures confusable/unrelated
+    // the playback toggle).  This ensures confusable/unrelated
     // phrase embeddings are generated for classifier training
     // regardless of whether audio playback is enabled.
     //
     // Note: try_load_cached() now attempts disk loading even when STATE is
-    // LOADING (Fix 4, mahbot-939), recovering from orphaned download tasks.
+    // LOADING, recovering from orphaned download tasks.
     if !crate::audio::tts::models_ready() && !crate::audio::tts::try_load_cached() {
         info!(
             "TTS models not cached — triggering download on demand (~400 MB) \
@@ -958,7 +955,7 @@ async fn wait_for_tts_styles() -> Option<Vec<String>> {
     None
 }
 
-/// Pre-warm the confusable phrase embedding cache (mahbot-859, mahbot-872).
+/// Pre-warm the confusable phrase embedding cache.
 ///
 /// Runs asynchronously at startup after voice ONNX models and TTS are ready.
 /// For each confusable phrase at 5 seeds each:
@@ -967,10 +964,10 @@ async fn wait_for_tts_styles() -> Option<Vec<String>> {
 ///    re-synthesis; on miss, synthesises via TTS and writes to cache.
 /// 2. Applies AGC preprocessing via a **fresh** [`AudioPreprocessor`] per
 ///    phrase × seed in FRAME_LENGTH chunks (no zero-padding) to match the
-///    production inference distribution (mahbot-1009).
+///    production inference distribution.
 /// 3. VAD-gates the AGC'd audio through a dedicated earshot detector,
 ///    producing the exact streaming mel layout (silence discarded, windows
-///    anchored at speech onset — mahbot-1009).
+///    anchored at speech onset).
 /// 4. Derives the 4 PCM augmentation variants from the VAD-gated speech-only
 ///    audio (AGC → VAD → augment ordering, matching enrollment).
 /// 5. Extracts dense stride-8 embeddings via the ONNX pipeline.
@@ -981,8 +978,8 @@ async fn wait_for_tts_styles() -> Option<Vec<String>> {
 /// embeddings are extracted from cached PCM on the next startup.
 ///
 /// The resulting embeddings are stored in [`CONFUSABLE_EMBEDDINGS_CACHE`] and
-/// later used during classifier training (single cache serves both,
-/// mahbot-923).  If TTS models or voice ONNX models
+/// later used during classifier training (single cache serves both).
+/// If TTS models or voice ONNX models
 /// are not available, the function returns without populating the cache and
 /// both models train on ambient negatives only.
 ///
@@ -1020,14 +1017,14 @@ pub(crate) async fn prewarm_confusable_embeddings() {
     }
 }
 
-/// Shared pre-warm logic for phrase-based negative embeddings (mahbot-872, mahbot-923).
+/// Shared pre-warm logic for phrase-based negative embeddings.
 ///
 /// Runs TTS synthesis (with PCM caching), AGC preprocessing, VAD gating, PCM
 /// augmentation, and ONNX dense embedding extraction for each phrase × seed
 /// combination.  Used by both [`prewarm_confusable_embeddings`] and
 /// [`prewarm_unrelated_embeddings`] to avoid code duplication.
 ///
-/// ## Streaming-pipeline alignment (mahbot-1009)
+/// ## Streaming-pipeline alignment
 ///
 /// The negative training cache must be representative of what the classifier
 /// sees during streaming inference, so each phrase × seed is processed with
@@ -1049,7 +1046,7 @@ pub(crate) async fn prewarm_confusable_embeddings() {
 ///    speed-up, volume-down, noise) are derived from the speech-only audio,
 ///    matching enrollment's `AGC → VAD → augment` ordering.
 ///
-/// After the dense-stride-8 alignment (mahbot-923), only dense embeddings are
+/// After the dense-stride-8 alignment, only dense embeddings are
 /// produced — streaming extraction was removed.
 ///
 /// Returns extracted dense embeddings, or an empty vec if pre-warming
@@ -1086,7 +1083,7 @@ async fn prewarm_phrase_embeddings(
         return Vec::new();
     }
 
-    // Wait for TTS voice styles to become available by polling (mahbot-859 Fix 3).
+    // Wait for TTS voice styles to become available by polling.
     let Some(available_styles) = wait_for_tts_styles().await else {
         return Vec::new();
     };
@@ -1111,7 +1108,7 @@ async fn prewarm_phrase_embeddings(
     // and ONNX embedding extraction in a blocking thread to avoid starving the
     // async runtime.
     //
-    // Pipeline (mahbot-1009): raw TTS PCM → fresh AGC per phrase × seed →
+    // Pipeline: raw TTS PCM → fresh AGC per phrase × seed →
     // VAD-gate (streaming mel layout) → augment speech-only audio → embeddings.
     // This matches the streaming detection path (fresh per-segment AGC, VAD-
     // gated mel frames, windows anchored at speech onset) so the negative
@@ -1124,7 +1121,7 @@ async fn prewarm_phrase_embeddings(
 
         // Preprocessor config from the same CONFIG flags the live-mic
         // streaming pipeline uses (`preprocessor_config_from_config`, the
-        // config `PipelineCtx::new()` builds — mahbot-1006 L).  The negative
+        // config `PipelineCtx::new()` builds).  The negative
         // embeddings must match the streaming inference distribution, which is
         // governed by the deployment's NS/AGC toggles.
         let pre_config = preprocessor_config_from_config();
@@ -1132,8 +1129,8 @@ async fn prewarm_phrase_embeddings(
 
         for (i, &phrase) in phrases.iter().enumerate() {
             for seed_idx in 0..seeds_per_phrase {
-                // Rotate through available voice styles for acoustic diversity
-                // (mahbot-859 Fix 1). Distribute seeds round-robin across styles.
+                // Rotate through available voice styles for acoustic diversity.
+                // Distribute seeds round-robin across styles.
                 let style_idx = (i * seeds_per_phrase + seed_idx) % num_styles;
                 let style = &available_styles[style_idx];
                 let seed = seed_base + i as u64 * seeds_per_phrase as u64 + seed_idx as u64;
@@ -1143,7 +1140,7 @@ async fn prewarm_phrase_embeddings(
                     _ => Source::Unrelated,
                 };
 
-                // ── Embedding-level cache (mahbot-1029 D1) ──
+                // ── Embedding-level cache ──
                 // The per-utterance dense embeddings are deterministic, so a
                 // warm run can skip AGC + VAD + ONNX entirely.  The cached
                 // variants are pushed through the same helper the miss path
@@ -1200,24 +1197,23 @@ async fn prewarm_phrase_embeddings(
                     continue;
                 };
 
-                // ── 1. Fresh AGC per phrase × seed (mahbot-1009) ──
+                // ── 1. Fresh AGC per phrase × seed ──
                 // The streaming pipeline starts each detection segment with a
-                // fresh AudioPreprocessor (`reset_detection_segment`,
-                // mahbot-1001 Fix 5).  A shared preprocessor would process the
+                // fresh AudioPreprocessor (`reset_detection_segment`).
+                // A shared preprocessor would process the
                 // Nth phrase with AGC adapted to N−1 prior phrases — an
                 // artifact streaming never produces.  Chunks are fed as-is (no
-                // zero-padding), matching the mic stream (mahbot-1006 G): the
+                // zero-padding), matching the mic stream: the
                 // NS stage buffers incomplete frames internally and the next
                 // chunk completes them.  Shared with the E2E bench via
-                // [`crate::audio::audio_preprocessor::agc_feed_fresh`]
-                // (mahbot-1045 A2).
+                // [`crate::audio::audio_preprocessor::agc_feed_fresh`].
                 let agc_audio = crate::audio::audio_preprocessor::agc_feed_fresh(
                     &pcm,
                     FRAME_LENGTH,
                     pre_config,
                 );
 
-                // ── 2. VAD-gate (mahbot-1009) ──
+                // ── 2. VAD-gate ──
                 // Fresh earshot detector per phrase × seed: the prewarm must
                 // not reuse the global VAD_DETECTOR (would contaminate the
                 // live pipeline's noise-floor state) and must not carry VAD
@@ -1244,14 +1240,14 @@ async fn prewarm_phrase_embeddings(
                 }
 
                 // ── 3. Original — embeddings from the streaming mel frames ──
-                // (mahbot-1009) Windows are anchored at the first speech frame
+                // Windows are anchored at the first speech frame
                 // (mel frame 0 = first VAD-positive hop), not at TTS sample 0
                 // with its silence preamble.
                 let dense_embs =
                     embeddings_from_mel_frames(models, &mel_frames).unwrap_or_default();
                 push_seq(dense_embs, 0);
 
-                // ── 4. Augment AFTER VAD gating (mahbot-1009) ──
+                // ── 4. Augment AFTER VAD gating ──
                 // Variants are derived from the speech-only audio (no silence
                 // preamble), matching enrollment's AGC → VAD → augment ordering.
                 // No variant is re-gated by VAD (only the original was).  The
@@ -1275,7 +1271,7 @@ async fn prewarm_phrase_embeddings(
                 // framing differs slightly.
                 //
                 // Variant generation is shared with the E2E bench via
-                // [`augment_pcm_variants`] (mahbot-1045 A1): noise seed = the
+                // [`augment_pcm_variants`]: noise seed = the
                 // TTS phrase seed, gate input = VAD-gated speech, canonical
                 // push order (speed-up 3rd).  The negative pool deliberately
                 // uses the bounded [`AugmentSet::Negatives`] set (original +
@@ -1295,7 +1291,7 @@ async fn prewarm_phrase_embeddings(
                     push_seq(dense_embs, variant.variant_index);
                 }
 
-                // ── Persist the per-utterance embedding cache (mahbot-1029 D1) ──
+                // ── Persist the per-utterance embedding cache ──
                 // Best-effort: a write failure only costs a recompute on the
                 // next run.  Nothing is written when no variant produced
                 // embeddings (e.g. no VAD-positive speech) — the miss path
@@ -1314,7 +1310,7 @@ async fn prewarm_phrase_embeddings(
     .unwrap_or_default()
 }
 
-/// Pre-warm unrelated speech embedding cache (mahbot-872).
+/// Pre-warm unrelated speech embedding cache.
 ///
 /// Synthesises each [`UNRELATED_PHRASES`] entry with
 /// [`UNRELATED_SEEDS_PER_PHRASE`] TTS seeds, applies AGC, and extracts
@@ -1373,36 +1369,34 @@ const MODEL_DIR_NAME: &str = "openwakeword";
 /// Timeout for model download (5 minutes for ~2.4 MB total).
 const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(5);
 
-/// Post-detection cooldown period to prevent rapid consecutive false triggers
-/// (mahbot-770 Fix 2).  After a wake word detection, no further detection is
+/// Post-detection cooldown period to prevent rapid consecutive false triggers.
+/// After a wake word detection, no further detection is
 /// attempted for this duration.  Industry reference: Rhasspy Raven uses
 /// `refractory_sec=2.0`, openWakeWord uses patience counters.
 const WAKE_WORD_COOLDOWN: Duration = Duration::from_secs(3);
 
 /// Mean of the negative (non-wake-word) per-frame soft score distribution,
-/// measured during the mahbot-859 benchmark on confusable and unrelated
-/// speech.  Used as the seed value for [`AdaptiveThresholdState::warmed()`]
-/// (mahbot-891).  The safe harbor clamp (2.13) means the precise value is
+/// measured during the benchmark on confusable and unrelated
+/// speech.  Used as the seed value for [`AdaptiveThresholdState::warmed()`].
+/// The safe harbor clamp (2.13) means the precise value is
 /// unimportant as long as it is well below 2.13; this constant documents
 /// the measured value for future reference.
 ///
-/// Calibrated for dense stride-8 embeddings (mahbot-923).  The 1.58×
+/// Calibrated for dense stride-8 embeddings.  The 1.58×
 /// multiplier relative to the old streaming distribution means the safe
-/// harbor clamp increased from 1.35 to 2.13.  See §7 in mahbot-923 for
-/// the full calibration table and rationale.
+/// harbor clamp increased from 1.35 to 2.13.  See the
+/// full calibration table and rationale.
 #[cfg(any(test, feature = "voice-tests"))]
 const NEGATIVE_DISTRIBUTION_MEAN: f32 = 0.033;
 
 /// Minimum per-frame soft score below which the rolling window is reset
-/// entirely (mahbot-923).  Set to 0.316 (calibrated for dense stride-8
+/// entirely.  Set to 0.316 (calibrated for dense stride-8
 /// embeddings, 1.58× multiplier over old streaming value 0.20).  The 1.58×
 /// multiplier accounts for the higher per-frame scores from stride-8 dense
-/// embeddings and is derived from benchmark calibration (mahbot-923).
+/// embeddings and is derived from benchmark calibration.
 const NO_MATCH_RESET_THRESHOLD: f32 = 0.316;
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Voice pipeline metrics — always-on atomic counters (mahbot-912)
-// ═══════════════════════════════════════════════════════════════════════════
+// Voice pipeline metrics — always-on atomic counters
 
 /// Total audio chunks received from the microphone channel by the pipeline
 /// loop (incremented after each successful `rx.recv()`).
@@ -1460,7 +1454,7 @@ static EMBEDDING_LATENCY_RING: [AtomicU64; EMBEDDING_LATENCY_RING_SIZE] =
 /// `min(writes, EMBEDDING_LATENCY_RING_SIZE)`.
 static EMBEDDING_LATENCY_RING_WRITES: AtomicU64 = AtomicU64::new(0);
 
-/// Snapshot of voice pipeline metrics for diagnostics and logging (mahbot-912).
+/// Snapshot of voice pipeline metrics for diagnostics and logging.
 ///
 /// Returned by [`get_voice_metrics()`].  All fields are atomically-sampled
 /// Relaxed reads — not guaranteed to be mutually consistent across fields in
@@ -1554,8 +1548,8 @@ pub(crate) fn get_voice_metrics() -> VoiceMetricsSnapshot {
     }
 }
 
-/// A single embedding decision recorded in the activation trace (mahbot-897).
-/// (mahbot-773).  Each frame represents ~128ms of voiced audio, so N=3
+/// A single embedding decision recorded in the activation trace.
+/// Each frame represents ~128ms of voiced audio, so N=3
 /// covers ~384ms — matching the original temporal window but using
 /// accumulated weight instead of a strict consecutive binary counter.
 const ROLLING_WINDOW_N: usize = 3;
@@ -1603,15 +1597,15 @@ const _: () = assert!(
     "ADAPTIVE_FLOOR must be <= ADAPTIVE_CEILING"
 );
 
-/// Factor applied to `ROLLING_WINDOW_N` to compute the detection threshold
-/// (mahbot-923).  At 0.71 (threshold 2.13), calibrated for dense stride-8
+/// Factor applied to `ROLLING_WINDOW_N` to compute the detection threshold.
+/// At 0.71 (threshold 2.13), calibrated for dense stride-8
 /// embeddings.  The 1.58× multiplier over the old streaming value (0.45)
 /// accounts for the higher per-frame scores produced by stride-8 dense
-/// embeddings versus stride-1 streaming embeddings.  Benchmark data from
-/// mahbot-923 established this calibration.
+/// embeddings versus stride-1 streaming embeddings, based on benchmark
+/// calibration data.
 const MATCH_THRESHOLD_FACTOR: f32 = 0.71;
 
-/// Detection threshold for the rolling sum of soft scores (mahbot-923).
+/// Detection threshold for the rolling sum of soft scores.
 /// Computed as: `ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR`
 /// (= `3 × 0.71 = 2.13`).  Calibrated for dense stride-8 embeddings using
 /// the 1.58× multiplier (old streaming threshold 1.35 → 2.13).  The higher
@@ -1622,7 +1616,7 @@ fn match_threshold() -> f32 {
     (ROLLING_WINDOW_N as f32) * MATCH_THRESHOLD_FACTOR
 }
 
-// ── Adaptive threshold (mahbot-845) ──────────────────────────────────────
+// ── Adaptive threshold ──────────────────────────────────────
 
 /// Number of recent per-frame scores to track for adaptive threshold
 /// statistics. At ~128ms per frame, N=15 covers ~2 seconds of context.
@@ -1638,7 +1632,7 @@ const ADAPTIVE_K_MIN: f32 = 1.0;
 const ADAPTIVE_K_MAX: f32 = 4.0;
 
 /// Absolute floor — the adaptive threshold must never drop below this value.
-/// Calibrated for dense stride-8 embeddings (mahbot-923).  The 1.58× multiplier
+/// Calibrated for dense stride-8 embeddings.  The 1.58× multiplier
 /// (old streaming floor 1.35 → 2.13) accounts for the higher per-frame scores
 /// from stride-8 dense embeddings versus stride-1 streaming embeddings.
 ///
@@ -1650,7 +1644,7 @@ const ADAPTIVE_K_MAX: f32 = 4.0;
 const ADAPTIVE_FLOOR: f32 = (ROLLING_WINDOW_N as f32) * MATCH_THRESHOLD_FACTOR;
 
 /// Absolute ceiling — the adaptive threshold must never exceed this value.
-/// Calibrated for dense stride-8 embeddings (mahbot-923).  Set to 4.503
+/// Calibrated for dense stride-8 embeddings.  Set to 4.503
 /// (old streaming ceiling 2.85 × 1.58).  If E2E benchmarks show this ceiling
 /// is too aggressive (excessive false rejects), escalate to 5.5, then 6.0.
 /// The escalation trigger is when per-utterance adaptive threshold trajectory
@@ -1661,7 +1655,7 @@ const ADAPTIVE_CEILING: f32 = 4.503;
 /// Safe harbor — the adaptive threshold must never drop below this value,
 /// which matches the current static [`match_threshold()`]
 /// (ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR = 3 × 0.71 = 2.13).
-/// Calibrated for dense stride-8 embeddings (mahbot-923).  The 1.58× multiplier
+/// Calibrated for dense stride-8 embeddings.  The 1.58× multiplier
 /// over the old streaming value (1.35 → 2.13) accounts for the higher
 /// per-frame scores from stride-8 dense embeddings.
 /// Derived from the same constants as [`match_threshold()`] so the two values
@@ -1671,20 +1665,20 @@ const ADAPTIVE_CEILING: f32 = 4.503;
 const ADAPTIVE_SAFE_HARBOR: f32 = (ROLLING_WINDOW_N as f32) * MATCH_THRESHOLD_FACTOR;
 
 /// Number of bootstrap frames to use the static threshold while the adaptive
-/// window fills.  Calibrated for dense stride-8 embeddings (mahbot-923).
+/// window fills.  Calibrated for dense stride-8 embeddings.
 /// The 1.58× multiplier relative to the old streaming pipeline is derived
 /// from benchmark calibration and accounts for the higher per-frame scores
 /// produced by stride-8 dense embeddings.
 const ADAPTIVE_BOOTSTRAP_FRAMES: usize = 5;
 
 /// Process a per-frame soft score through the rolling window and determine
-/// whether wake word detection should fire (mahbot-773, mahbot-860).
+/// whether wake word detection should fire.
 ///
 /// Returns `true` when the rolling sum of recent scores meets or exceeds
 /// `match_threshold()`.  When the incoming score is below
 /// [`NO_MATCH_RESET_THRESHOLD`], the window is cleared entirely to prevent
 /// slow accumulation from noise — unless `preserve_window_on_reset` is set
-/// (deferred-burst path only, mahbot-1104): a low-scoring burst frame
+/// (deferred-burst path only): a low-scoring burst frame
 /// contributes nothing to the score and must not wipe an in-progress wake
 /// mid-detection.  On detection the score window is NOT cleared here — the
 /// caller is responsible for full pipeline cleanup.
@@ -1700,7 +1694,7 @@ fn process_wake_word_score(
 ) -> (bool, f32) {
     if total_score < NO_MATCH_RESET_THRESHOLD {
         // Far from matching — reset the entire rolling window to prevent
-        // slow accumulation from noise.  Burst-path frames (mahbot-1104)
+        // slow accumulation from noise.  Burst-path frames
         // never clear: they contribute nothing to the score, and a mid-wake
         // wipe would kill an otherwise-valid detection that started near the
         // utterance beginning.
@@ -1757,7 +1751,7 @@ fn process_wake_word_score(
 /// feeds/peeks the adaptive threshold, and applies rolling window scoring via
 /// [`process_wake_word_score`].  Detection fires immediately when the rolling
 /// sum crosses the effective threshold — the pipeline is speaker-blind with
-/// no second-stage gate (mahbot-1104).
+/// no second-stage gate.
 ///
 /// # Returns
 /// - `(true, rolling_sum, total_score, effective_threshold)` — the embedding
@@ -1786,7 +1780,7 @@ fn process_wake_word_score(
 ///   term (passed to [`AdaptiveThresholdState::next_threshold`]).
 /// - `burst_path` — true when scored by the deferred-burst sweep
 ///   (start-aligned positions).  Burst-path frames never clear the rolling
-///   window on a below-reset score (mahbot-1104): they contribute nothing to
+///   window on a below-reset score: they contribute nothing to
 ///   the score, and a mid-wake wipe would kill a valid detection that started
 ///   near the utterance beginning.
 #[allow(clippy::too_many_lines)]
@@ -1827,14 +1821,14 @@ pub(crate) fn score_single_embedding(
 
     // Feed only background (non-wake-word) scores to the adaptive threshold
     // so it learns the noise-floor distribution without being contaminated
-    // by the high scores it's trying to detect (mahbot-852).  Scores below
+    // by the high scores it's trying to detect.  Scores below
     // NO_MATCH_RESET_THRESHOLD are clearly "not wake word" and represent
     // the background acoustic environment.  For wake-word-like frames we
     // call peek() which returns the current threshold without updating
     // statistics, preventing the self-defeating loop where high scores
     // inflate the threshold and block detection.
     //
-    // mahbot-1023 (bootstrap feed fix): the SAME feed/peek rule applies
+    // the SAME feed/peek rule applies
     // during bootstrap — the old unconditional bootstrap feed
     // (`is_bootstrapping() || total_score < NO_MATCH_RESET_THRESHOLD`)
     // inflated the adaptive threshold with wake-word-like burst scores
@@ -1857,11 +1851,11 @@ pub(crate) fn score_single_embedding(
     // ── Effective threshold (adaptive post-bootstrap, static otherwise) ──
     let effective_threshold = adaptive_override.unwrap_or_else(match_threshold);
 
-    // ── Rolling window gate (mahbot-773) ─────────────────────────────
+    // ── Rolling window gate ─────────────────────────────
     let (detected, rolling_sum) =
         process_wake_word_score(total_score, score_window, adaptive_override, burst_path);
 
-    // ── Voice debug logging (mahbot-850) ─────────────────────────────
+    // ── Voice debug logging ─────────────────────────────
     // When the `voice-debug` feature is enabled, log every per-frame
     // total_score along with whether it passed the reset threshold and
     // the resulting rolling sum.  The feature gate ensures zero overhead
@@ -1882,7 +1876,7 @@ pub(crate) fn score_single_embedding(
         );
     }
 
-    // Immediate-fire (mahbot-1104): no second-stage gate — a threshold
+    // Immediate-fire: no second-stage gate — a threshold
     // crossing fires detection on this frame (speaker-blind pipeline).
     if detected {
         (true, rolling_sum, total_score, effective_threshold)
@@ -1892,25 +1886,23 @@ pub(crate) fn score_single_embedding(
 }
 
 /// VAD threshold: scores >= this are considered speech.
-/// Unified to 0.5 for both enrollment and streaming detection (mahbot-1001).
+/// Unified to 0.5 for both enrollment and streaming detection.
 /// Previously enrollment used `ENROLLMENT_VAD_THRESHOLD = 0.60`, causing a
 /// systematic training/inference mismatch: frames scoring 0.50–0.59 were
 /// included in streaming but never seen during enrollment training.
 /// The Conv1D classifier had no representation of these acoustic patterns,
-/// resulting in a 0.0% detection rate during streaming (mahbot-1001 Fix 1).
+/// resulting in a 0.0% detection rate during streaming.
 const VAD_THRESHOLD: f32 = 0.5;
 
 /// Minimum consecutive VAD-positive frames before setting utterance_had_speech
 /// during enrollment (~0ms at 16ms/frame).  Set to 1 to match streaming
 /// detection behavior, which starts accumulating at the first VAD-positive
-/// frame (mahbot-1001 Fix 2).  Previously was 3, which meant enrollment
+/// frame.  Previously was 3, which meant enrollment
 /// consumed VAD decisions differently from streaming, producing misaligned
 /// utterance boundaries and embedding window positions.
 pub(crate) const ENROLLMENT_VAD_CONSECUTIVE_REQUIRED: usize = 1;
 
-// ═══════════════════════════════════════════════════════════════════════════
 // Neural VAD (Earshot) — replaces RMS-based `is_speech`
-// ═══════════════════════════════════════════════════════════════════════════
 
 /// Global Earshot VAD detector instance. Thread-safe behind a mutex because
 /// `predict_f32` completes in ~5-6 µs, so lock contention is negligible.
@@ -1919,10 +1911,8 @@ pub(crate) const ENROLLMENT_VAD_CONSECUTIVE_REQUIRED: usize = 1;
 /// Created once in [`init_global`].
 static VAD_DETECTOR: OnceLock<std::sync::Mutex<earshot::Detector>> = OnceLock::new();
 
-// VAD_THRESHOLD is defined above with a unified doc comment (mahbot-1001).
-// ═══════════════════════════════════════════════════════════════════════════
+// VAD_THRESHOLD is defined above with a unified doc comment.
 // Model loading state machine
-// ═══════════════════════════════════════════════════════════════════════════
 
 /// Model loading state with type-safe atomic access.
 #[repr(u8)]
@@ -1988,9 +1978,7 @@ pub fn models_ready() -> bool {
     MODELS_STATE.load(Ordering::Acquire) == ModelState::Ready
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
 // Voice pipeline status (shared between pipeline task and GUI)
-// ═══════════════════════════════════════════════════════════════════════════
 
 /// Voice pipeline status.
 #[derive(Debug, Clone)]
@@ -2024,7 +2012,7 @@ pub enum VoiceStatus {
         total: usize,
     },
     /// Collecting owner-general speech as negative examples
-    /// (Phase 3 enrollment, mahbot-913).  `accumulated_secs` is the
+    /// (Phase 3 enrollment).  `accumulated_secs` is the
     /// VAD-positive speech time collected so far, `target_secs` is the
     /// target (typically 60), `wall_clock_elapsed` is the wall-clock
     /// seconds since Phase 3 started.
@@ -2037,9 +2025,7 @@ pub enum VoiceStatus {
     Error(String),
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Enrollment quality scoring (mahbot-778)
-// ═══════════════════════════════════════════════════════════════════════════
+// Enrollment quality scoring
 
 /// Quality level for a single enrollment utterance.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2094,9 +2080,7 @@ pub struct UtteranceQuality {
     pub snr_db: f32,
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
 // Global state
-// ═══════════════════════════════════════════════════════════════════════════
 
 static VOICE_PIPELINE: OnceLock<RwLock<VoicePipelineState>> = OnceLock::new();
 
@@ -2142,23 +2126,23 @@ struct VoicePipelineState {
     enabled: bool,
     status: VoiceStatus,
     /// Trained Conv1D classifier weights (None before enrollment).
-    /// Contains a single weight set (mahbot-931, removing the 5-member ensemble).
+    /// Contains a single weight set (removing the 5-member ensemble).
     classifier_weights: Option<ClassifierWeights>,
     /// Cached classifier for inference (avoids per-frame clone of weights).
     /// Recreated when [`classifier_weights`] changes.
     classifier: Option<WakeWordClassifier>,
     /// Per-utterance embeddings extracted via the full-utterance mel pipeline
     /// with dense stride-8 sliding window (used for both Conv1D classifier and
-    /// classifier training after mahbot-923).  Streaming buffer was removed
+    /// classifier training).  Streaming buffer was removed
     /// — inference and training now share the same dense embedding distribution.
     enrollment_buffer: Vec<EmbeddingSequence>,
     /// Raw audio chunks collected during non-wake-word periods of enrollment
     /// (pre-enrollment ambient noise and inter-utterance silence).  These are
     /// processed through the ONNX embedding model at training time to
-    /// produce real (non-synthetic) negative examples (mahbot-797).
+    /// produce real (non-synthetic) negative examples.
     negative_audio_chunks: Vec<Vec<f32>>,
-    /// Owner-negative audio chunks collected during Phase 3 enrollment
-    /// (mahbot-913).  ~60 seconds of VAD-positive general speech from the user,
+    /// Owner-negative audio chunks collected during Phase 3 enrollment.
+    /// ~60 seconds of VAD-positive general speech from the user,
     /// stored as audio chunks for embedding extraction at training time.
     /// Preserved across Full/Soft pipeline resets (same as `negative_audio_chunks`)
     /// but cleared on Cancel (via `reset_enrollment`).
@@ -2304,9 +2288,7 @@ pub fn send_command(cmd: VoiceCommand) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
 // ONNX model loading and execution
-// ═══════════════════════════════════════════════════════════════════════════
 
 struct OnnxModels {
     mel_model: candle_onnx::onnx::ModelProto,
@@ -2528,7 +2510,7 @@ fn compute_embedding(models: &OnnxModels, mel_frames: &[Vec<f32>]) -> Result<Vec
 /// by appending a **tapered fade-out** toward silence instead of constant-value
 /// silence frames.
 ///
-/// # Problem (mahbot-798)
+/// # Problem
 ///
 /// The previous implementation appended identical `spec_transform(0.0) = 2.0`
 /// frames for all padding.  This produced an embedding tail that was **identical
@@ -2562,7 +2544,7 @@ fn compute_embedding(models: &OnnxModels, mel_frames: &[Vec<f32>]) -> Result<Vec
 /// as a shared helper to avoid duplicating the padding logic in both
 /// [`extract_embeddings_from_audio`] and the stride-8 sliding-window fallback
 /// in [`handle_wake_word_detection`], which passes subslices at arbitrary
-/// `next_window_start` positions (mahbot-927).
+/// `next_window_start` positions.
 #[allow(clippy::cast_precision_loss)]
 fn pad_mel_frames_to_window(frames: &[Vec<f32>]) -> Vec<Vec<f32>> {
     if frames.len() >= EMBEDDING_WINDOW_FRAMES {
@@ -2609,8 +2591,8 @@ fn extract_embeddings_from_audio(models: &OnnxModels, samples: &[f32]) -> Result
 /// Extract stride-8 dense embeddings from a pre-computed mel frame buffer.
 ///
 /// Shared by [`extract_embeddings_from_audio`] (whole-audio mel) and the
-/// prewarm negative path ([`vad_gate_streaming_mel`] + this function,
-/// mahbot-1009) so both produce the identical stride-8 windowing over mel
+/// prewarm negative path ([`vad_gate_streaming_mel`] + this function)
+/// so both produce the identical stride-8 windowing over mel
 /// frames.
 ///
 /// If the buffer has fewer than [`EMBEDDING_WINDOW_FRAMES`] frames, pads with
@@ -2662,12 +2644,12 @@ fn embeddings_from_mel_frames(
 /// the current frame's [`HOP_LENGTH`], matching the original early-return
 /// behaviour in [`handle_wake_word_detection`].
 ///
-/// After mahbot-923, the live detection pipeline uses this function only for
+/// Now, the live detection pipeline uses this function only for
 /// VAD-gated mel frame accumulation — streaming embedding extraction (which
 /// previously used this via `on_flush`) was removed.  The `on_flush` callback
 /// still exists but is used only to detect early exit (wake word detection
 /// during stride-8 scoring, which now happens after this loop).
-/// [`vad_gate_streaming_mel`] (mahbot-1009) additionally wraps this function
+/// [`vad_gate_streaming_mel`] additionally wraps this function
 /// for the offline negative-prewarm path, so the training mel layout is
 /// produced by the same loop as live inference.
 ///
@@ -2707,7 +2689,7 @@ fn process_streaming_frames_inner(
         // feeding the full frame would duplicate the second half of the
         // previous frame's 256 samples — corrupting earshot's ring buffer,
         // pre-emphasis filter, and 3-frame feature context with duplicated
-        // data (mahbot-900).
+        // data.
         if is_speech_fn(&frame[..HOP_LENGTH]) {
             // Add only the NEW samples (HOP_LENGTH per frame) to avoid
             // duplicating overlapping audio.  Each frame overlaps the previous
@@ -2753,12 +2735,12 @@ fn process_streaming_frames_inner(
     consumed
 }
 
-/// VAD-gate audio into streaming-layout mel frames + speech-only audio (mahbot-1009).
+/// VAD-gate audio into streaming-layout mel frames + speech-only audio.
 ///
 /// Thin wrapper over the canonical streaming loop
 /// [`process_streaming_frames_inner`]: it delegates the entire VAD-gating /
 /// batch-accumulation loop — feeding only each frame's NEW [`HOP_LENGTH`]
-/// samples to the VAD decision function (mahbot-900), flushing the voice batch
+/// samples to the VAD decision function, flushing the voice batch
 /// to mel frames at [`VOICE_BATCH_SIZE`] / silence transitions via
 /// [`flush_voice_batch`], and flushing any trailing batch (`trailing_flush =
 /// true`, since offline extraction always receives the full phrase) — so the
@@ -2790,8 +2772,7 @@ fn vad_gate_streaming_mel(
     // Accumulate VAD-positive hops into speech_audio inside the decision
     // closure: the loop logic (hop feeding, batching, flushing) then exists in
     // exactly one place — process_streaming_frames_inner — so the prewarm mel
-    // layout cannot drift from the streaming path (mahbot-900 hop-feeding
-    // included).
+    // layout cannot drift from the streaming path (hop-feeding included).
     let mut gated = |hop: &[f32]| {
         let is_speech = is_speech_fn(hop);
         if is_speech {
@@ -2824,7 +2805,7 @@ fn is_speech(samples: &[f32]) -> bool {
 ///
 /// Processes ALL 256-sample chunks through the detector to keep its internal
 /// state (ring buffer + pre-emphasis filter) synchronized with the audio
-/// stream, even when speech is detected early in the frame (mahbot-771 Fix 2).
+/// stream, even when speech is detected early in the frame.
 pub(crate) fn is_speech_with_detector(
     samples: &[f32],
     detector: &mut earshot::Detector,
@@ -2839,7 +2820,7 @@ pub(crate) fn is_speech_with_detector(
     // Clamp audio samples to [-1, 1] before feeding to the VAD detector.
     // TTS-generated audio and microphone capture can produce samples slightly
     // outside this range due to floating-point overflow, which triggers
-    // earshot's debug_assert! in debug/test builds (mahbot-835).
+    // earshot's debug_assert! in debug/test builds.
     let clamp_frame = |frame: &[f32]| -> [f32; 256] {
         let mut clamped = [0.0f32; 256];
         for (i, &s) in frame.iter().enumerate() {
@@ -2946,9 +2927,7 @@ fn samples_to_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     wav
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
 // Model download
-// ═══════════════════════════════════════════════════════════════════════════
 
 #[allow(clippy::cast_precision_loss)]
 async fn download_model(
@@ -3008,9 +2987,9 @@ async fn download_model(
     Ok(())
 }
 
-// ── Voice PCM disk cache helpers (mahbot-872) ─────────────────────────────
+// ── Voice PCM disk cache helpers ─────────────────────────────
 //
-// Cache bounding (mahbot-910): two-phase eviction — age-based (stale entries
+// Cache bounding: two-phase eviction — age-based (stale entries
 // older than voice_cache_max_age_days) followed by size-based (oldest-first
 // via mtime, FIFO, when total exceeds voice_cache_max_size_mb).  Eviction runs
 // at startup and before each cache write.  Best-effort: errors are logged but
@@ -3205,7 +3184,7 @@ pub(crate) fn voice_cache_dir() -> Option<PathBuf> {
     Some(root.join(VOICE_CACHE_DIR))
 }
 
-// ── Embedding-level cache for the deterministic prewarm path (mahbot-1029 D1) ──
+// ── Embedding-level cache for the deterministic prewarm path ──
 //
 // The per-utterance (phrase × style × seed) dense embeddings produced by
 // `prewarm_phrase_embeddings` are deterministic: fixed TTS seeds, cached
@@ -3467,7 +3446,7 @@ pub(crate) fn synthesize_with_pcm_cache(
     let key = pcm_cache_key(text, style, seed, sample_rate, model_hash);
     let cache_path = cache_dir.join(&key);
 
-    // Allow manual cache invalidation without deleting files (mahbot-999).
+    // Allow manual cache invalidation without deleting files.
     // When set, every read is treated as a miss, forcing re-synthesis.
     let cache_bust = std::env::var("MAHBOT_TEST_CACHE_BUST").as_deref() == Ok("1");
 
@@ -3504,7 +3483,7 @@ pub(crate) fn synthesize_with_pcm_cache(
     // the cache, so these per-write scans are strictly redundant — they provide
     // a correctness safety net for any future code path that writes to the
     // cache without going through prewarming (e.g., from agent tools).
-    // The scan is gated to run ONCE per process (mahbot-1029): the prewarm
+    // The scan is gated to run ONCE per process: the prewarm
     // pass already bounds the cache, and per-miss scans only add ~30 ms × N
     // of directory I/O to the enrollment/benchmark burst.  The first miss in
     // each process still evicts, preserving the safety net.
@@ -3518,7 +3497,7 @@ pub(crate) fn synthesize_with_pcm_cache(
 }
 
 /// One-shot guard for the per-miss [`evict_pcm_cache`] scan in
-/// [`synthesize_with_pcm_cache`] (mahbot-1029 D6).  See the comment at the
+/// [`synthesize_with_pcm_cache`].  See the comment at the
 /// call site — the scan is strictly redundant after prewarming, so it runs
 /// at most once per process.
 static PCM_EVICTION_RAN: AtomicBool = AtomicBool::new(false);
@@ -3592,8 +3571,8 @@ async fn download_retry_loop() {
                         MODELS_STATE.store(ModelState::Ready, Ordering::Release);
                         info!("Voice models loaded successfully");
                         // Pre-warm confusable and unrelated dense embeddings in
-                        // background so enrollment never blocks on TTS synthesis
-                        // (mahbot-923).  Ran sequentially within
+                        // background so enrollment never blocks on TTS synthesis.
+                        // Ran sequentially within
                         // a single task to avoid ONNX model thread-safety concerns.
                         tokio::spawn(async {
                             prewarm_confusable_embeddings().await;
@@ -3665,9 +3644,7 @@ fn retry_model_loading() -> bool {
     true
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
 // Microphone capture
-// ═══════════════════════════════════════════════════════════════════════════
 
 /// Convert raw audio samples to mono f32 and send to the pipeline.
 ///
@@ -3832,16 +3809,14 @@ fn start_microphone() -> Result<(mpsc::Receiver<Vec<f32>>, cpal::Stream)> {
     Ok((rx, stream))
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
 // Transcription via existing Qwen3-ASR
-// ═══════════════════════════════════════════════════════════════════════════
 
 async fn transcribe_audio(samples: &[f32]) -> Result<String> {
     let wav_bytes = samples_to_wav(samples, SAMPLE_RATE);
     let tmp_dir = std::env::temp_dir().join("mahbot_voice");
 
     // Pre-clean any stale files left from a prior crash so they don't
-    // accumulate (ticket mahbot-760).  This is best-effort — if the
+    // accumulate.  This is best-effort — if the
     // directory doesn't exist yet, remove_dir_all returns Ok(()).
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 
@@ -3860,7 +3835,7 @@ async fn transcribe_audio(samples: &[f32]) -> Result<String> {
     // Remove the entire temp directory (including any leftover files from
     // prior crashes that weren't cleaned).  Uses remove_dir_all instead of
     // remove_dir so that ENOTEMPTY errors from orphaned files don't cause
-    // unbounded accumulation (ticket mahbot-760).
+    // unbounded accumulation.
     if let Err(e) = tokio::fs::remove_dir_all(&tmp_dir).await {
         warn!("Failed to remove temp transcription directory: {e}");
     }
@@ -3868,9 +3843,7 @@ async fn transcribe_audio(samples: &[f32]) -> Result<String> {
     result
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
 // Enrollment helpers
-// ═══════════════════════════════════════════════════════════════════════════
 
 /// Process raw audio samples into embedding sequences (for enrollment).
 pub fn process_enrollment_sample(samples: &[f32]) -> Result<Vec<Vec<f32>>> {
@@ -3880,9 +3853,7 @@ pub fn process_enrollment_sample(samples: &[f32]) -> Result<Vec<Vec<f32>>> {
     extract_embeddings_from_audio(models, samples)
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Enrollment quality scoring (mahbot-778)
-// ═══════════════════════════════════════════════════════════════════════════
+// Enrollment quality scoring
 
 /// Compute a per-utterance quality score from the raw audio.
 ///
@@ -3899,7 +3870,7 @@ pub fn process_enrollment_sample(samples: &[f32]) -> Result<Vec<Vec<f32>>> {
 /// # Parameters
 /// - `samples`: raw audio samples of the utterance.
 /// - `noise_rms`: pre-speech ambient noise RMS captured at the moment of
-///   first sustained speech detection (mahbot-782).  `None` falls back to
+///   first sustained speech detection.  `None` falls back to
 ///   energy-based SNR estimation.
 #[expect(clippy::cast_precision_loss)]
 pub(crate) fn compute_utterance_quality(
@@ -3918,9 +3889,9 @@ pub(crate) fn compute_utterance_quality(
     // ring at the moment of first sustained speech, compute actual SNR as
     // 20*log10(speech_rms / noise_rms).  Otherwise fall back to energy-based
     // heuristic (estimate_snr_energy) which measures speech dynamic range
-    // rather than true SNR (mahbot-782).
+    // rather than true SNR.
     let snr_db = if let Some(noise_rms) = noise_rms {
-        // Shared RMS helper (mahbot-1043).  Empty-input NaN → 0.0 via
+        // Shared RMS helper.  Empty-input NaN → 0.0 via
         // compute_rms is branch-equivalent to the old inline formula (the
         // `speech_rms > noise_rms` guard yields 0.0 in both cases).
         let speech_rms = crate::util::compute_rms(samples);
@@ -3995,7 +3966,7 @@ fn estimate_snr_energy(samples: &[f32]) -> f32 {
         if chunk.len() < FRAME_LENGTH / 2 {
             continue; // Skip partial trailing frames
         }
-        // Shared RMS helper (mahbot-1043).  `chunk.len().min(FRAME_LENGTH)`
+        // Shared RMS helper.  `chunk.len().min(FRAME_LENGTH)`
         // was always `chunk.len()` here (chunks ≤ FRAME_LENGTH and the
         // half-frame skip above), so this is bit-identical.
         frame_rms.push(crate::util::compute_rms(chunk));
@@ -4064,7 +4035,7 @@ fn run_enrollment_self_test(
 
     for seq in enrollment_sequences {
         // Fresh simulation for each utterance: no cross-utterance state.
-        // Uses `score_single_embedding` (mahbot-811) which encapsulates the
+        // Uses `score_single_embedding` which encapsulates the
         // same ring-buffer + Conv1D classifier + rolling window logic as the
         // live detection pipeline and the E2E integration test.
         let mut embedding_ring: Vec<Vec<f32>> = Vec::with_capacity(EMBEDDING_RING_MAX);
@@ -4134,14 +4105,14 @@ pub(crate) struct VadSegmentationConfig {
     /// Frame stride in samples (typically [`HOP_LENGTH`] = 256).
     hop_length: usize,
     /// Min consecutive VAD-positive frames to confirm sustained speech
-    /// (typically [`ENROLLMENT_VAD_CONSECUTIVE_REQUIRED`] = 1 after mahbot-1001).
+    /// (typically [`ENROLLMENT_VAD_CONSECUTIVE_REQUIRED`] = 1 after the threshold unification).
     consecutive_required: usize,
     /// Silence duration in samples before utterance ends
     /// (typically [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] = 4 864 ≈ 304 ms
-    /// after mahbot-1001 Fix 7, aligned to streaming's segment timeout).
+    /// aligned to streaming's segment timeout).
     silence_threshold_samples: usize,
     /// Samples of pre/post speech context to include
-    /// (0 after mahbot-1001 — enrollment now matches streaming detection
+    /// (0 — enrollment now matches streaming detection
     /// by not adding context padding).
     context_padding_samples: usize,
     /// Max samples in the internal raw-audio ring buffer
@@ -4153,14 +4124,14 @@ pub(crate) struct VadSegmentationConfig {
 /// standard voice-pipeline constants.
 ///
 /// Context padding is intentionally 0 to match the streaming detection path,
-/// which does not add context padding (mahbot-1001 Fix 3).  Previously the
+/// which does not add context padding.  Previously the
 /// padding (~100ms) caused the embedding windows during enrollment training
 /// to include ambient audio before the VAD onset, creating a temporal
 /// misalignment with streaming inference where embeddings start at the first
 /// VAD-positive frame without prepended context.
 ///
 /// Silence threshold uses [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] (~304ms)
-/// aligned to streaming detection's [`SEGMENT_TIMEOUT_HOPS`] (mahbot-1001 Fix 7).
+/// aligned to streaming detection's [`SEGMENT_TIMEOUT_HOPS`].
 pub(crate) const DEFAULT_VAD_SEGMENTATION_CONFIG: VadSegmentationConfig = VadSegmentationConfig {
     frame_length: FRAME_LENGTH,
     hop_length: HOP_LENGTH,
@@ -4186,7 +4157,7 @@ pub(crate) const DEFAULT_VAD_SEGMENTATION_CONFIG: VadSegmentationConfig = VadSeg
 ///    **sustained speech**.  On this transition the function may prepend
 ///    pre-speech context from the raw-audio ring buffer (if
 ///    `config.context_padding_samples > 0`) to capture onset phonemes
-///    excluded by a strict VAD threshold.  Post-mahbot-1001 the default
+///    excluded by a strict VAD threshold.  The default
 ///    config sets `context_padding_samples: 0` so both enrollment and
 ///    streaming start at VAD onset with matching temporal alignment.
 /// 4. After speech, `config.silence_threshold_samples` of consecutive
@@ -4353,7 +4324,7 @@ pub(crate) fn finalize_enrollment(
     // Step 1: Consistency check — gates on utterance quality before training
     validate_enrollment_consistency(positive_sequences)?;
 
-    // Step 2: Train a single Conv1D classifier (mahbot-931).
+    // Step 2: Train a single Conv1D classifier.
     // The 5-member ensemble was removed — a single small Conv1D (~1.2K params)
     // captures temporal convolution patterns without ensemble overhead.
     let config = wake_word_classifier::TrainingConfig {
@@ -4458,9 +4429,7 @@ pub(crate) fn validate_enrollment_consistency(sequences: &[EmbeddingSequence]) -
     Ok(())
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
 // Routing to active agent
-// ═══════════════════════════════════════════════════════════════════════════
 
 /// Broadcast a voice transcript to the GUI chat view.
 ///
@@ -4495,7 +4464,7 @@ async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace
 /// configured personal workspace if no active workspace is set.
 ///
 /// This mirrors the resolution pattern used by [`route_to_agent`] and the
-/// error-broadcast path in [`handle_recording_audio`] (mahbot-812).
+/// error-broadcast path in [`handle_recording_audio`].
 async fn resolve_workspace_for_voice(user_name: &str) -> String {
     let ws = active_workspace_name();
     if ws.is_empty() {
@@ -4601,9 +4570,7 @@ async fn route_to_agent(text: String) {
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
 // Voice pipeline background task
-// ═══════════════════════════════════════════════════════════════════════════
 
 /// Safe wrapper around `Option<cpal::Stream>` to ensure `Send` on macOS.
 ///
@@ -4642,9 +4609,7 @@ impl SendMicStream {
 
 unsafe impl Send for SendMicStream {}
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Adaptive threshold state (mahbot-845)
-// ═══════════════════════════════════════════════════════════════════════════
+// Adaptive threshold state
 
 /// Tracks running mean and standard deviation of recent per-frame classifier scores
 /// for adaptive threshold computation.
@@ -4661,8 +4626,7 @@ unsafe impl Send for SendMicStream {}
 /// per-frame score space [0,1] into rolling-sum space [0, ROLLING_WINDOW_N],
 /// matching the detection comparison in [`process_wake_word_score`].  Without
 /// this scaling the adaptive threshold (max ~1.0 + k × std) could never reach
-/// the rolling sum range, making the feature structurally a no-op (mahbot-845
-/// fix, reviewer_2 report).
+/// the rolling sum range, making the feature structurally a no-op.
 ///
 /// The result is then clamped to the safeguard range: at least
 /// [`ADAPTIVE_SAFE_HARBOR`] (matching the static [`match_threshold()`]), never
@@ -4732,7 +4696,7 @@ impl AdaptiveThresholdState {
     /// [`ADAPTIVE_CEILING`]]).
     ///
     /// Shared by [`feed`](Self::feed) and [`peek`](Self::peek) to avoid
-    /// duplicating the computation and clamping chain (mahbot-852).
+    /// duplicating the computation and clamping chain.
     #[expect(clippy::cast_precision_loss)]
     fn compute_threshold(&self, k: f32) -> f32 {
         let n = self.scores.len() as f32;
@@ -4743,7 +4707,7 @@ impl AdaptiveThresholdState {
 
         // Scale from per-frame [0,1] space to rolling-sum [0,ROLLING_WINDOW_N]
         // space so the threshold is comparable to the rolling sum used in
-        // process_wake_word_score (mahbot-845 fix).
+        // process_wake_word_score.
         #[expect(clippy::cast_precision_loss)]
         let adaptive = (mean + k * std) * ROLLING_WINDOW_N as f32;
 
@@ -4768,7 +4732,7 @@ impl AdaptiveThresholdState {
     /// range as [`feed`](Self::feed).
     ///
     /// This is used to avoid contaminating the background statistics with
-    /// wake-word-like frames (mahbot-852).
+    /// wake-word-like frames.
     pub(crate) fn peek(&self, k: f32) -> Option<f32> {
         if self.bootstrap_count < ADAPTIVE_BOOTSTRAP_FRAMES {
             return None;
@@ -4781,14 +4745,14 @@ impl AdaptiveThresholdState {
 
     /// Returns `true` while the tracker is still in the bootstrap phase
     /// (first [`ADAPTIVE_BOOTSTRAP_FRAMES`] below-reset frames since the
-    /// score-only feed rule, mahbot-1023).  During bootstrap the caller
+    /// score-only feed rule).  During bootstrap the caller
     /// feeds below-reset background scores (which populate the window and
     /// advance the bootstrap counter) and peeks wake-word-like scores —
     /// [`peek`](Self::peek) returns `None` during bootstrap, so the static
-    /// [`match_threshold()`] stays in effect (mahbot-852 / mahbot-1023).
+    /// [`match_threshold()`] stays in effect.
     ///
     /// Production callers no longer consult this method (the feed/peek rule
-    /// is score-only since mahbot-1023); it exists for unit tests and the
+    /// is now score-only); it exists for unit tests and the
     /// voice-tests instrumentation mirror.
     #[cfg(any(test, feature = "voice-tests"))]
     pub(crate) fn is_bootstrapping(&self) -> bool {
@@ -4808,8 +4772,7 @@ impl AdaptiveThresholdState {
     /// benchmark so the adaptive threshold is active from the start of
     /// detection testing.  The seed value (NEGATIVE_DISTRIBUTION_MEAN = 0.033)
     /// ensures the threshold immediately clamps to the safe harbor (1.35),
-    /// matching production behavior where real audio starts from silence
-    /// (mahbot-891).
+    /// matching production behavior where real audio starts from silence.
     #[cfg(any(test, feature = "voice-tests"))]
     pub(crate) fn warmed() -> Self {
         let mut state = Self::new();
@@ -4826,10 +4789,8 @@ impl AdaptiveThresholdState {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// mahbot-1012: per-frame scoring geometry / adaptive-mode instrumentation
+// per-frame scoring geometry / adaptive-mode instrumentation
 // for the training-vs-streaming same-audio comparison
-// ═══════════════════════════════════════════════════════════════════════════
 
 /// Geometry class of a single scored embedding window (mahbot-1012 §1).
 ///
@@ -4875,7 +4836,7 @@ impl WindowGeometry {
     }
 }
 
-/// Scoring path that produced a scored window / detection (mahbot-1023).
+/// Scoring path that produced a scored window / detection.
 ///
 /// Carried through [`score_stride8_window`] so the enrolled-speaker benchmark
 /// can attribute every detection to exactly one path:
@@ -4901,9 +4862,9 @@ pub(crate) enum WindowSource {
 }
 
 impl WindowSource {
-    /// Stable snake_case label for report output (mahbot-1023).
+    /// Stable snake_case label for report output.
     ///
-    /// The labels follow the acceptance taxonomy (mahbot-1024 re-scope):
+    /// The labels follow the acceptance taxonomy:
     /// "burst" and "segment_end_pass" are the two dedicated scoring paths;
     /// "other" (the main stride-8 loop) is the primary expected detection
     /// path.
@@ -4917,7 +4878,7 @@ impl WindowSource {
     }
 }
 
-// Pure decision helpers for the deferred-burst state machine (mahbot-1023).
+// Pure decision helpers for the deferred-burst state machine.
 //
 // Extracted so the hold / burst / segment-end-pass / per-segment-flag
 // lifecycle is unit-testable WITHOUT ONNX models (`ONNX_MODELS` is `None`
@@ -4929,7 +4890,7 @@ impl WindowSource {
 ///
 /// Returns an empty list while holding (buffer below
 /// [`BURST_TRIGGER_FRAMES`], or the per-segment sweep already ran) — the
-/// incremental per-chunk scoring bug (mahbot-1023) is exactly the old code
+/// incremental per-chunk scoring bug is exactly the old code
 /// scoring position 0 with 2–16 frames per chunk.  When triggered, returns
 /// the start-aligned positions 0/8/16/24 (each strictly below `buffer_len`;
 /// a position at or past the buffer end is never scored — positions beyond
@@ -4942,7 +4903,7 @@ pub(crate) fn burst_positions_to_score(buffer_len: usize, burst_sweep_done: bool
 }
 
 /// The start-aligned position grid 0/8/16/24, each strictly below
-/// `buffer_len` (mahbot-1023).
+/// `buffer_len`.
 ///
 /// Shared by the deferred burst sweep and the segment-end pass — both score
 /// the same trained start-0-aligned geometry.  Positions at or past the
@@ -5098,9 +5059,7 @@ fn embedding_l2_norm(embedding: &[f32]) -> f32 {
     embedding.iter().map(|v| v * v).sum::<f32>().sqrt()
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
 // Pipeline context
-// ═══════════════════════════════════════════════════════════════════════════
 
 /// Per-variant instrumentation collected by the wake word detection benchmark
 /// (mahbot-886).  Feature-gated behind `voice-tests` — zero production overhead.
@@ -5245,7 +5204,7 @@ pub(crate) struct PipelineCtx {
     command_buffer: Vec<f32>,
     /// Track silence duration by audio sample count rather than wall-clock
     /// time, so that system load / processing delays don't affect recording
-    /// cutoff consistency (ticket mahbot-760).
+    /// cutoff consistency.
     silence_sample_count: usize,
     enrollment_mode: bool,
     /// Accumulated VAD decisions across all frames processed this enrollment
@@ -5267,21 +5226,21 @@ pub(crate) struct PipelineCtx {
     utterance_silence_samples: usize,
     /// Counter of consecutive non-VAD frames during enrollment.
     /// Used to detect when the user has not spoken for too long
-    /// and show a "speak louder" warning (mahbot-765).
+    /// and show a "speak louder" warning.
     enrollment_no_speech_frame_count: usize,
     /// Consecutive VAD-positive frame counter for enrollment sustained-speech
-    /// confirmation (mahbot-772).  After mahbot-1001, accumulation starts on
+    /// confirmation.  Now, accumulation starts on
     /// the first VAD-positive frame ([`ENROLLMENT_VAD_CONSECUTIVE_REQUIRED`] = 1),
     /// matching streaming detection's first-positive behavior.
     vad_positives_in_a_row: usize,
     /// VAD threshold for the current mode.  Unified to [`VAD_THRESHOLD`] for
-    /// both detection and enrollment (mahbot-1001).  Previously used separate
+    /// both detection and enrollment.  Previously used separate
     /// thresholds (0.60 for enrollment, 0.50 for detection), which caused the
     /// Conv1D classifier to receive out-of-distribution inputs during
     /// streaming inference (frames scoring 0.50–0.59 were included during
     /// detection but never seen during enrollment training).
     vad_threshold: f32,
-    /// Separate Earshot VAD detector instance for enrollment mode (mahbot-1001 Fix 6).
+    /// Separate Earshot VAD detector instance for enrollment mode.
     ///
     /// The streaming detection path uses the global [`VAD_DETECTOR`] singleton
     /// to maintain continuous noise-floor and ring-buffer state across the
@@ -5306,27 +5265,27 @@ pub(crate) struct PipelineCtx {
     /// processes them through [`handle_enrollment_sample`].  Using a queue
     /// (rather than a single `Option`) ensures that if multiple utterances
     /// complete within a single mic frame, all are preserved — no utterance is
-    /// silently dropped (mahbot-823).
+    /// silently dropped.
     enrollment_pending: VecDeque<Vec<f32>>,
     auto_start_pending: bool,
     /// Timestamp of the last automatic model retry attempt.  Used to debounce
     /// so we don't spam the retry loop every 1-second tick when models are in
     /// [`ModelState::Failed`] (the periodic wake-up checks the state).
     last_model_retry: Option<Instant>,
-    /// Timestamp of the last wake word detection (mahbot-770 Fix 2).
+    /// Timestamp of the last wake word detection.
     /// Used to enforce a cooldown period after detection to prevent rapid
     /// consecutive false triggers.
     pub(crate) last_wake_word_detection: Option<Instant>,
     /// Pre-speech noise RMS captured at the moment of first sustained speech
     /// detection during enrollment.  Computed from the pre-AGC audio ring
     /// ([`pre_agc_ring`]) so AGC's asymmetric gain (4× on silence, ~1-2× on
-    /// speech) does not artificially lower the SNR estimate (mahbot-785).
+    /// speech) does not artificially lower the SNR estimate.
     /// Used for real SNR estimation in [`compute_utterance_quality`] instead
-    /// of the fake SNR computed from speech dynamic range (mahbot-782).
+    /// of the fake SNR computed from speech dynamic range.
     /// Reset to `None` after the utterance is consumed by
     /// [`handle_enrollment_sample`].
     noise_rms_estimate: Option<f32>,
-    // ── Phase 3 (owner-negative) enrollment state (mahbot-913) ────────────
+    // ── Phase 3 (owner-negative) enrollment state ────────────
     /// Whether the pipeline is actively collecting owner-negative general speech
     /// during Phase 3 enrollment.  Set by `transition_to_phase3()` when the
     /// user has completed all 10 wake word utterances.
@@ -5336,7 +5295,7 @@ pub(crate) struct PipelineCtx {
     phase3_audio_buf: Vec<f32>,
     /// Silence tracking for Phase 3 chunk boundary detection.  Uses
     /// [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] (same constant as enrollment
-    /// utterance end, aligned to streaming's segment timeout — mahbot-1001 Fix 7)
+    /// utterance end, aligned to streaming's segment timeout)
     /// to detect chunk boundaries — see the constant definition for coupling docs.
     phase3_silence_samples: usize,
     /// Accumulated VAD-positive speech samples collected during Phase 3.
@@ -5348,7 +5307,7 @@ pub(crate) struct PipelineCtx {
     /// was collected.
     phase3_start_time: Option<Instant>,
     /// Rolling window of per-frame confidence scores from the Conv1D
-    /// classifier (mahbot-810).  Each element is the classifier confidence (0.0–1.0)
+    /// classifier.  Each element is the classifier confidence (0.0–1.0)
     /// for one 3-embedding window (~384ms of speech).  Detection fires when
     /// the sum over this window reaches [`match_threshold`].  Cleared entirely
     /// when a frame's score drops below [`NO_MATCH_RESET_THRESHOLD`] to
@@ -5359,26 +5318,26 @@ pub(crate) struct PipelineCtx {
     /// ~200ms capacity ([`RAW_RING_MAX`] samples).  Used exclusively for noise RMS estimation at first sustained
     /// speech detection — AGC amplifies silence (up to 4×) more than speech
     /// (~1-2×), so noise RMS from post-AGC audio produces an artificially low
-    /// SNR estimate (mahbot-785).
+    /// SNR estimate.
     pre_agc_ring: Vec<f32>,
     /// Audio pre-processor for noise suppression and AGC.
     /// Applied to every incoming audio chunk before VAD / mel extraction.
     audio_preprocessor: crate::audio::audio_preprocessor::AudioPreprocessor,
     /// Accumulates non-VAD audio frames during enrollment for use as negative
-    /// training examples (mahbot-797).  Collected between utterances (pre-enrollment
+    /// training examples.  Collected between utterances (pre-enrollment
     /// ambient noise, inter-utterance silence/background) and saved as chunks
     /// when sustained speech begins.
     negative_audio_buf: Vec<f32>,
     /// Timestamp until which the pipeline stays in [`VoiceStatus::Error`]
-    /// before returning to [`VoiceStatus::Listening`] (mahbot-812).
+    /// before returning to [`VoiceStatus::Listening`].
     /// Set on transcription failure as a non-blocking replacement for the
     /// old 2-second sleep.
     refractory_until: Option<Instant>,
     /// Timestamp of the most recent error chat message, for rate-limiting
-    /// repeated transcription failure notifications (mahbot-812).
+    /// repeated transcription failure notifications.
     /// At most one error message per 10-second window.
     last_error_message_time: Option<Instant>,
-    /// Adaptive threshold tracker (mahbot-845).
+    /// Adaptive threshold tracker.
     /// Maintains running mean/std of recent per-frame classifier scores for
     /// dynamic threshold computation.
     adaptive_threshold: AdaptiveThresholdState,
@@ -5391,7 +5350,7 @@ pub(crate) struct PipelineCtx {
     peak_score: f32,
 
     /// Consecutive VAD-negative frame hops since the last VAD-positive frame,
-    /// accumulated across calls to [`handle_wake_word_detection`] (mahbot-894).
+    /// accumulated across calls to [`handle_wake_word_detection`].
     /// Tracked via an [`AtomicUsize`] side channel from the `is_speech_fn`
     /// closure inside the VAD-gating frame loop.  Reset to 0 on any
     /// VAD-positive frame.  When this reaches [`SEGMENT_TIMEOUT_HOPS`]
@@ -5400,14 +5359,14 @@ pub(crate) struct PipelineCtx {
     /// accumulation.
     segment_silence_hops: usize,
 
-    /// Start frame index for the next stride-8 sliding window (mahbot-923).
+    /// Start frame index for the next stride-8 sliding window.
     /// Tracks position in `mel_frame_buffer` so the stride-8 loop only
     /// processes new mel frames since the last call.  Reset to 0 on
     /// pipeline resets (Soft, Full) and segment boundary resets so each
     /// utterance starts from the first mel frame.
     next_window_start: usize,
 
-    /// Per-segment deferred-burst latch (mahbot-1023).
+    /// Per-segment deferred-burst latch.
     ///
     /// `true` once the start-aligned burst sweep (positions 0/8/16/24) has
     /// run for the current detection segment.  Cleared ONLY by the per-segment
@@ -5454,7 +5413,7 @@ enum ResetLevel {
 ///
 /// Shared by [`PipelineCtx::new()`] and the voice-tests E2E benchmark so the
 /// benchmark's enrollment/training preprocessing cannot silently diverge from
-/// production when a deployment disables either stage (mahbot-1006 L).
+/// production when a deployment disables either stage.
 pub(crate) fn preprocessor_config_from_config()
 -> crate::audio::audio_preprocessor::PreprocessorConfig {
     use crate::audio::audio_preprocessor::PreprocessorConfig;
@@ -5559,8 +5518,7 @@ impl PipelineCtx {
         self.negative_audio_buf.clear();
         self.segment_silence_hops = 0;
         // Per-segment deferred-burst latch: every reset level starts a fresh
-        // segment, so a new utterance must be allowed a new burst sweep
-        // (mahbot-1023).
+        // segment, so a new utterance must be allowed a new burst sweep.
         self.burst_sweep_done = false;
 
         // ── Enrollment detection/accumulator state (cleared by all levels) ──
@@ -5583,7 +5541,7 @@ impl PipelineCtx {
 
         // ── Enrollment VAD detector (cleared by all levels) ──
         // Separate VAD instance prevents state contamination between
-        // enrollment and streaming modes (mahbot-1001 Fix 6).
+        // enrollment and streaming modes.
         self.enrollment_vad = None;
 
         match level {
@@ -5600,7 +5558,7 @@ impl PipelineCtx {
 
                 // Full does NOT clear global enrollment accumulators — those
                 // survive mic stop/start cycles so mid-enrollment progress is
-                // preserved across toggle-off/on (mahbot-800, mahbot-819).
+                // preserved across toggle-off/on.
                 // Only ResetLevel::Cancel (explicit cancel or start-fresh)
                 // clears the global enrollment buffer and negative audio chunks.
             }
@@ -5613,7 +5571,7 @@ impl PipelineCtx {
                 // carry cross-utterance contamination across Soft pipeline
                 // resets (which occur during the detection→recording handoff).
                 // Reset stride-8 window position so the next utterance starts
-                // from the first mel frame (mahbot-923).
+                // from the first mel frame.
                 self.next_window_start = 0;
             }
             ResetLevel::Cancel => {
@@ -5630,8 +5588,8 @@ impl PipelineCtx {
         }
     }
 
-    /// Reset all per-segment detection state at a VAD-driven utterance boundary
-    /// (mahbot-894).  Called when [`SEGMENT_TIMEOUT_HOPS`] (~300 ms) of
+    /// Reset all per-segment detection state at a VAD-driven utterance boundary.
+    /// Called when [`SEGMENT_TIMEOUT_HOPS`] (~300 ms) of
     /// consecutive VAD-negative hops have been observed since the last
     /// VAD-positive frame.
     ///
@@ -5687,21 +5645,21 @@ impl PipelineCtx {
         self.segment_silence_hops = 0;
 
         // ── Reset stride-8 window position so the next utterance ──
-        // starts from the first mel frame (mahbot-923).
+        // starts from the first mel frame.
         self.next_window_start = 0;
 
-        // ── Clear the per-segment deferred-burst latch (mahbot-1023) ──
+        // ── Clear the per-segment deferred-burst latch ──
         // The segment reset is the ONLY place that clears it (besides
         // reset_pipeline_state, which also starts a fresh segment): a new
         // utterance must be allowed a new burst sweep, and mid-utterance
         // trailing re-scoring must never re-run a finished sweep.
         self.burst_sweep_done = false;
 
-        // ── Reset AGC state (mahbot-1001 Fix 5, mahbot-1009) ──
+        // ── Reset AGC state ──
         // Reset the AudioPreprocessor so that each detection segment starts with
         // a fresh AGC state, matching the training distribution (confusable/
         // unrelated embeddings are processed through a fresh AudioPreprocessor
-        // per phrase × seed in prewarm_phrase_embeddings — mahbot-1009).  Without
+        // per phrase × seed in prewarm_phrase_embeddings).  Without
         // this reset, the Conv1D classifier could exploit AGC adaptation state as
         // a spurious feature: enrollment positives use the room-adapted persistent
         // AGC while confusable negatives use a fresh TTS-adapted AGC, creating a
@@ -5710,8 +5668,7 @@ impl PipelineCtx {
         self.audio_preprocessor.reset();
     }
 
-    /// Handle the segment boundary check at the end of a detection call
-    /// (mahbot-894).
+    /// Handle the segment boundary check at the end of a detection call.
     ///
     /// Called from [`handle_wake_word_detection`] after
     /// [`process_streaming_frames_inner`] returns, with the accumulated
@@ -5743,7 +5700,7 @@ impl PipelineCtx {
         mel_frame_buffer: &mut Vec<Vec<f32>>,
     ) {
         if hop_count >= SEGMENT_TIMEOUT_HOPS {
-            // ── Segment-end pass (mahbot-1023) — no-regression fallback ──
+            // ── Segment-end pass — no-regression fallback ──
             // If no detection fired this segment (not recording), models are
             // loaded, and the buffer has content, score the buffer as it
             // stands at the boundary — trailing-68-frame trimmed state for
@@ -5755,9 +5712,8 @@ impl PipelineCtx {
             // safety net for the deferred burst.  (The ticket's original
             // "must not re-score the misaligned leading edge" hazard does
             // not manifest at live geometry: the trigger lands at B=76 and
-            // the B=79 → start-3 re-score scores ~0.99 — mahbot-1023 runs
-            // 5–7 — but the pass stays the safety net if a below-reset
-            // re-score ever does clear
+            // the B=79 → start-3 re-score scores ~0.99 — but the pass stays the
+            // safety net if a below-reset re-score ever does clear
             // the rolling window.)  It is
             // UNCONDITIONAL at the boundary for non-recording segments with
             // content — a failed burst must NOT suppress it (F1's only
@@ -5814,7 +5770,7 @@ impl PipelineCtx {
     }
 
     /// Check whether the refractory period has elapsed and transition back
-    /// to [`VoiceStatus::Listening`] if so (mahbot-812).
+    /// to [`VoiceStatus::Listening`] if so.
     ///
     /// Called once per main-loop iteration.  When the pipeline is in
     /// [`VoiceStatus::Error`] after a transcription failure, the refractory
@@ -5836,7 +5792,7 @@ impl PipelineCtx {
     }
 
     /// Check whether the 10-second rate-limit has elapsed since the last
-    /// transcription-error chat message (mahbot-812).
+    /// transcription-error chat message.
     ///
     /// Returns `true` if no prior error occurred, or if at least 10 seconds
     /// have passed since the last one.  The caller broadcasts the error
@@ -5865,7 +5821,7 @@ impl PipelineCtx {
             //
             // If models have previously failed (ModelError trap state),
             // trigger a retry immediately so the user doesn't need to
-            // restart the app (ticket mahbot-757).
+            // restart the app.
             if MODELS_STATE.load(Ordering::Acquire) == ModelState::Failed {
                 warn!("Voice models previously failed — triggering retry...");
                 self.try_retry_models();
@@ -5904,10 +5860,9 @@ impl PipelineCtx {
         // Full reset: the mic stream is being torn down, so the old noise
         // profile and VAD state are no longer representative of the next
         // acoustic environment.  Full level uses audio_preprocessor.reset()
-        // (new NoiseSuppressor) and reset_vad() (mahbot-800, mahbot-805).
+        // (new NoiseSuppressor) and reset_vad().
         // Global enrollment accumulators are preserved across mic stop/start
-        // so mid-enrollment progress survives toggle-off/on (mahbot-800,
-        // mahbot-819).
+        // so mid-enrollment progress survives toggle-off/on.
         self.reset_pipeline_state(ResetLevel::Full);
         self.is_listening = false;
         self.enrollment_mode = false;
@@ -5931,20 +5886,20 @@ impl PipelineCtx {
         // global enrollment_buffer from the interrupted session is intact).
         // When starting fresh (existing_utterances == 0), use Cancel-level
         // reset to clear stale buffers while preserving VAD/NS continuity
-        // (same mic stream, same acoustic environment) — mahbot-805.
+        // (same mic stream, same acoustic environment).
         //
         // Use enrolled_utterance_count (not enrollment_buffer.len()) because
         // augmentation inflates the buffer to ~5× the utterance count,
         // making the buffer-based check always >0 and the UI display
-        // nonsensical (mahbot-878 fix).
+        // nonsensical.
         let existing_utterances = voice_state()
             .read()
             .unwrap_poison()
             .enrolled_utterance_count;
 
         if existing_utterances == 0 {
-            // vad_threshold stays at VAD_THRESHOLD after unification
-            // (mahbot-1001 Fix 1).  Previously set to ENROLLMENT_VAD_THRESHOLD
+            // vad_threshold stays at VAD_THRESHOLD after unification.
+            // Previously set to ENROLLMENT_VAD_THRESHOLD
             // here, but that created a training/inference mismatch.
             self.reset_pipeline_state(ResetLevel::Cancel);
         } else {
@@ -5963,11 +5918,11 @@ impl PipelineCtx {
         self.enrollment_mode = true;
         // Initialize a separate VAD detector for this enrollment session
         // to prevent state contamination between enrollment and streaming
-        // modes (mahbot-1001 Fix 6).
+        // modes.
         self.enrollment_vad = Some(earshot::Detector::default());
         // vad_threshold is intentionally NOT changed here — it stays at
-        // VAD_THRESHOLD (0.5) for both enrollment and streaming detection
-        // (mahbot-1001 Fix 1).  Previously used ENROLLMENT_VAD_THRESHOLD
+        // VAD_THRESHOLD (0.5) for both enrollment and streaming detection.
+        // Previously used ENROLLMENT_VAD_THRESHOLD
         // (0.60), which caused frames scoring 0.50-0.59 to be included in
         // streaming but never seen during enrollment training.
         set_status(VoiceStatus::Enrolling {
@@ -5995,16 +5950,16 @@ impl PipelineCtx {
     }
 
     /// Transition the pipeline from Phase 2 (wake word utterance collection)
-    /// to Phase 3 (owner-negative general speech collection, mahbot-913).
+    /// to Phase 3 (owner-negative general speech collection).
     ///
     /// Called by the main loop when `utterances_collected` is true and
     /// `collecting_negatives` is false.  VAD threshold is already unified to
-    /// [`VAD_THRESHOLD`] (mahbot-1001 Fix 1), so no threshold switch occurs.
+    /// [`VAD_THRESHOLD`], so no threshold switch occurs.
     /// Drains any stale enrollment pending queue, clears the negative audio
     /// buffer and silence counters, and sets the Phase 3 state flags.
     fn transition_to_phase3(&mut self) {
         // VAD threshold is already unified to VAD_THRESHOLD (0.5) — no longer
-        // toggled between enrollment and detection (mahbot-1001 Fix 1).
+        // toggled between enrollment and detection.
 
         // Drain any stale enrollment_pending queue (should be empty, but be safe).
         if !self.enrollment_pending.is_empty() {
@@ -6081,15 +6036,15 @@ impl PipelineCtx {
 /// Schedule a transition back to [`VoiceStatus::Listening`] after enrollment
 /// finalization completes successfully.
 ///
-/// Extracted from the existing cleanup at lines ~5616-5636 of the main loop
-/// (mahbot-913).  Runs [`reset_pipeline_state(Cancel)`](PipelineCtx::reset_pipeline_state),
+/// Extracted from the existing cleanup at lines ~5616-5636 of the main loop.
+/// Runs [`reset_pipeline_state(Cancel)`](PipelineCtx::reset_pipeline_state),
 /// sets `enrollment_mode = false`, and spawns a 1.5-second delayed task that
 /// transitions to [`VoiceStatus::Listening`] (respecting the global shutdown
 /// token so it does not write stale state after pipeline exit).
 ///
 /// Called from both:
 /// - The Phase 2→4 direct finalization path (existing behavior)
-/// - The Phase 3→4 path (new owner-negative collection path, mahbot-913)
+/// - The Phase 3→4 path (new owner-negative collection path)
 fn schedule_listening_transition(ctx: &mut PipelineCtx) {
     // Clear all audio buffers BEFORE resetting enrollment_mode to prevent
     // stale audio from leaking into detection mode during the ~1.5s delay.
@@ -6119,7 +6074,7 @@ fn schedule_listening_transition(ctx: &mut PipelineCtx) {
 /// negative weights (ambient → owner-negative → unrelated → confusable).
 ///
 /// Extracted from the original training block in `handle_enrollment_sample`
-/// and extended with owner-negative embedding extraction (mahbot-913).
+/// and extended with owner-negative embedding extraction.
 ///
 /// Called by the main loop after Phase 3 (owner-negative collection) completes
 /// or times out.  Returns `true` on success (model trained and persisted),
@@ -6137,7 +6092,7 @@ async fn finalize_enrollment_pipeline() -> bool {
         return false;
     }
 
-    // ── Clone positive embeddings (dense-only after mahbot-923) ──
+    // ── Clone positive embeddings (dense-only) ──
     let enrollment_buffer = {
         let state = voice_state().read().unwrap_poison();
         state.enrollment_buffer.clone()
@@ -6223,7 +6178,7 @@ async fn finalize_enrollment_pipeline() -> bool {
         state.owner_negative_chunks.clear();
     }
 
-    // ── Read wake word phrase for confusable gating (mahbot-909) ──
+    // ── Read wake word phrase for confusable gating ──
     let enrolled_phrase = voice_state()
         .read()
         .unwrap_poison()
@@ -6239,7 +6194,7 @@ async fn finalize_enrollment_pipeline() -> bool {
         );
     }
 
-    // ── Build positive sequences for training (dense-only after mahbot-923) ──
+    // ── Build positive sequences for training (dense-only) ──
     let mut pos_sequences: Vec<EmbeddingSequence> = Vec::with_capacity(enrollment_buffer.len());
     pos_sequences.extend(enrollment_buffer.clone());
 
@@ -6280,7 +6235,7 @@ async fn finalize_enrollment_pipeline() -> bool {
     }
 
     // Note: class-balanced weights
-    // — this is an intentional design difference (mahbot-932).
+    // this is an intentional design difference.
 
     // ── Classifier training via finalize_enrollment ──
     let classifier_result = tokio::task::spawn_blocking({
@@ -6310,7 +6265,7 @@ async fn finalize_enrollment_pipeline() -> bool {
 
     let self_test_seqs = enrollment_buffer;
 
-    // ── Cancel guard: check before persisting (mahbot-913) ──
+    // ── Cancel guard: check before persisting ──
     if crate::shutdown::shutdown_token().is_cancelled() {
         warn!(
             "finalize_enrollment_pipeline: cancelled during async training, \
@@ -6319,7 +6274,7 @@ async fn finalize_enrollment_pipeline() -> bool {
         return false;
     }
 
-    // ── Blocking self-test (mahbot-898) ──
+    // ── Blocking self-test ──
     let classifier = WakeWordClassifier::new(weights.clone());
     if let Err(e) = run_enrollment_self_test(&self_test_seqs, &classifier) {
         warn!("Enrollment self-test failed — model rejected: {e}.  Re-enrollment required.");
@@ -6363,7 +6318,7 @@ pub async fn run_voice_pipeline() {
     // Load persisted wake word classifier weights from config on startup
     if let Some(json) = CONFIG.wake_word_templates() {
         // Try PersistedModel format (handles both new versioned and legacy
-        // single-object classifier via custom deserializer, mahbot-898).
+        // single-object classifier via custom deserializer).
         let loaded = if let Ok(mut model) = serde_json::from_str::<PersistedModel>(&json) {
             // ── Legacy migration (schema_version == 0) ──────────────
             // If the loaded model has no schema_version (pre-v1 format),
@@ -6450,7 +6405,7 @@ pub async fn run_voice_pipeline() {
     // for the select! timeout on the first iteration).
     ctx.check_auto_start();
 
-    // Periodic metrics log via tokio::time::Interval (mahbot-912).  Fires
+    // Periodic metrics log via tokio::time::Interval.  Fires
     // every 60 seconds on wall-clock time regardless of audio activity.
     // Replaces the earlier ad-hoc tick counter which only fired when audio
     // chunks arrived and used non-standard block-scoped statics.
@@ -6500,7 +6455,7 @@ pub async fn run_voice_pipeline() {
 
                 CHUNKS_RECEIVED.fetch_add(1, Ordering::Relaxed);
 
-                // ── TTS playback gate (mahbot-896) ──
+                // ── TTS playback gate ──
                 // If TTS audio is actively playing through the speakers, skip ALL
                 // audio processing for this chunk, including the pre-AGC ring buffer,
                 // noise suppressor, AGC, VAD, mel extraction, wake word detection,
@@ -6517,7 +6472,7 @@ pub async fn run_voice_pipeline() {
                     continue;
                 }
 
-                // ── Pre-AGC ring buffer (mahbot-785) ──
+                // ── Pre-AGC ring buffer ──
                 // Capture raw audio before AGC processing for noise RMS
                 // estimation.  AGC amplifies silence (up to 4×) more than
                 // speech (~1-2×), so noise RMS computed from post-AGC audio
@@ -6544,7 +6499,7 @@ pub async fn run_voice_pipeline() {
                         let state = voice_state().read().unwrap_poison();
                         // Use enrolled_utterance_count (not enrollment_buffer.len())
                         // because the buffer may have up to 5× entries due to PCM
-                        // augmentation (mahbot-878).  The intermediate status fields
+                        // augmentation.  The intermediate status fields
                         // are currently ignored by the GUI (static text), but using
                         // the utterance count keeps the data model correct.
                         (state.enrolled_utterance_count, NUM_ENROLLMENT_SAMPLES)
@@ -6563,7 +6518,7 @@ pub async fn run_voice_pipeline() {
             // post-select section below so we don't duplicate it here.
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
 
-            // Periodic metrics log every ~60 seconds (mahbot-912).  This
+            // Periodic metrics log every ~60 seconds.  This
             // branch fires on wall-clock time regardless of audio activity,
             // unlike the earlier ad-hoc tick counter which only incremented
             // when audio chunks arrived.
@@ -6594,7 +6549,7 @@ pub async fn run_voice_pipeline() {
             ctx.try_retry_models();
         }
 
-        // ── Phase 2→3 transition (mahbot-913) ──
+        // ── Phase 2→3 transition ──
         // After all 10 enrollment utterances are collected, automatically
         // transition to owner-negative speech collection (Phase 3).
         let utterances_collected = voice_state().read().unwrap_poison().utterances_collected;
@@ -6602,7 +6557,7 @@ pub async fn run_voice_pipeline() {
             ctx.transition_to_phase3();
         }
 
-        // ── Phase 3→4 transition (mahbot-913) ──
+        // ── Phase 3→4 transition ──
         // When the target VAD-positive speech time is reached (or wall-clock
         // timeout), finalize residual audio, train the model, and clean up.
         if ctx.collecting_negatives {
@@ -6680,7 +6635,7 @@ pub async fn run_voice_pipeline() {
         // Process any pending enrollment utterances (accumulated inline to avoid
         // race conditions with the command channel).  Using a VecDeque so all
         // completed utterances are preserved even if multiple complete within a
-        // single mic frame — each is popped one per tick (mahbot-823).
+        // single mic frame — each is popped one per tick.
         // ONNX inference inside handle_enrollment_sample uses spawn_blocking
         // so it doesn't block.  Only processes during Phase 2 (before
         // utterances_collected), since Phase 3 handles audio independently.
@@ -6690,7 +6645,7 @@ pub async fn run_voice_pipeline() {
         }
 
         // Transition from Error to Listening after the refractory period
-        // has elapsed (mahbot-812).  This replaces the old 2-second blocking
+        // has elapsed.  This replaces the old 2-second blocking
         // sleep with a non-blocking check in the main loop.
         ctx.check_refractory_period();
 
@@ -6709,10 +6664,10 @@ pub async fn run_voice_pipeline() {
 /// speech_embedding/1 model produces exactly 1 embedding from any 76-frame
 /// window — a single embedding is the model's full 96-dim output, not
 /// "incomplete".  The 400ms floor is well above the ~760ms window that a
-/// typical wake word needs, so any real utterance passes (mahbot-772).
+/// typical wake word needs, so any real utterance passes.
 ///
 /// This is extracted as a separate function so it can be unit-tested without
-/// requiring ONNX model inference (mahbot-770 Fix 3).
+/// requiring ONNX model inference.
 fn check_enrollment_utterance_length(
     embeddings_len: usize,
     duration_ms: u64,
@@ -6724,7 +6679,7 @@ fn check_enrollment_utterance_length(
             "Utterance produced no embeddings ({duration_ms}ms) — speak longer"
         ));
     }
-    // Duration floor: reject noise blips and coughs (mahbot-772) using the
+    // Duration floor: reject noise blips and coughs using the
     // same threshold as the quality scoring pipeline.  Single-embedding
     // utterances are accepted — the Google speech_embedding/1 model produces
     // exactly 1 embedding from any 76-frame window, which is its full output.
@@ -6737,24 +6692,21 @@ fn check_enrollment_utterance_length(
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// PCM augmentation (mahbot-878)
-// ═══════════════════════════════════════════════════════════════════════════
+// PCM augmentation
 
 /// Speed perturbation via [`crate::util::speed_perturbation`] (anti-alias safe).
 ///
 /// Delegates to [`crate::util::resample_audio`] for proper anti-aliasing
-/// filtering and f64-precision interpolation (mahbot-878).  A `rate` of 1.0
+/// filtering and f64-precision interpolation.  A `rate` of 1.0
 /// returns the original unchanged.  `rate < 1.0` slows down (adds samples),
 /// `rate > 1.0` speeds up (removes samples).  The ticket uses 0.95 (slow down)
 /// and 1.05 (speed up).
 ///
-// ═══════════════════════════════════════════════════════════════════════════
 // Implementation note: `apply_gain`, `generate_pink_noise`, and `add_noise`
-// are defined in `crate::util` (mahbot-878 canonical implementations).
+// are defined in `crate::util` (canonical implementations).
 //
 /// Extracts dense stride-8 embeddings for the Conv1D classifier
-/// training (mahbot-856, mahbot-923).  After mahbot-923, only dense stride-8
+/// training.  Now, only dense stride-8
 /// embeddings are used — streaming extraction was removed.  Dense embeddings
 /// provide a strong learning signal (many windows per utterance) and the same
 /// distribution is used for classifier training.
@@ -6763,7 +6715,7 @@ fn check_enrollment_utterance_length(
 /// It runs on a blocking thread via `spawn_blocking` to avoid starving
 /// the async pipeline during enrollment.
 ///
-/// Implements minimum utterance length check (mahbot-772): utterances
+/// Implements minimum utterance length check: utterances
 /// shorter than 400ms are rejected to reject noise blips and coughs.
 #[allow(clippy::too_many_lines)]
 async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
@@ -6775,13 +6727,13 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     // Compute utterance duration before moving `samples` into the closure.
     let duration_ms = (samples.len() as u64 * 1000) / u64::from(SAMPLE_RATE);
 
-    // ── Generate deterministic PCM augmented variants (mahbot-878) ──
+    // ── Generate deterministic PCM augmented variants ──
     // The original is kept as-is.  All variants are processed in a single
     // spawn_blocking below, avoiding redundant ONNX model lookups and
     // reducing thread spawn overhead.
     //
     // Variant generation is shared with the E2E bench via
-    // [`augment_pcm_variants`] (mahbot-1045 A1): noise seed = the enrolled
+    // [`augment_pcm_variants`]: noise seed = the enrolled
     // utterance count read below, gate input = the raw VAD-segmented mic
     // utterance, canonical push order (speed-up 3rd).  The pre-padding
     // duration gate (100 ms of context padding at each end; speed-up is
@@ -6834,7 +6786,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
         }
     };
 
-    // ── Minimum utterance length check (mahbot-772) ──
+    // ── Minimum utterance length check ──
     if let Err(msg) = check_enrollment_utterance_length(original_old.len(), duration_ms) {
         warn!("{msg}");
         set_status(VoiceStatus::Error(msg));
@@ -6843,13 +6795,13 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
 
     // ── Push all variants to buffer ──
     // Read enrollment index (current count before increment) so each variant
-    // gets the correct sequence_index (mahbot-902).
+    // gets the correct sequence_index.
     let enrollment_index = voice_state()
         .read()
         .unwrap_poison()
         .enrolled_utterance_count;
 
-    // Collect results into a single EmbeddingSequence buffer.  After mahbot-923,
+    // Collect results into a single EmbeddingSequence buffer.  Now,
     // the classifier trains on the same dense stride-8 embedding
     // distribution — streaming extraction was removed.
     let mut old_results: Vec<EmbeddingSequence> = Vec::with_capacity(results.len());
@@ -6889,7 +6841,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
         // the real utterance, not augmented variants).
         let quality = Some(compute_utterance_quality(&samples_for_quality, noise_rms));
 
-        // Push all variant embeddings (dense-only after mahbot-923)
+        // Push all variant embeddings (dense-only)
         state.enrollment_buffer.extend(old_results);
 
         // Increment utterance counter (one user utterance generates multiple
@@ -6911,7 +6863,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
         // the pipeline should transition to Phase 3 (owner-negative collection)
         // or proceed directly to finalization.
         // The training block is deferred to `finalize_enrollment_pipeline()`
-        // which is called after Phase 3 completes or on timeout (mahbot-913).
+        // which is called after Phase 3 completes or on timeout.
         voice_state().write().unwrap_poison().utterances_collected = true;
         // Keep the current Enrolling status until transition_to_phase3 fires.
         // The status will be updated to EnrollingNegatives by the main loop.
@@ -6940,7 +6892,7 @@ pub(crate) const MODEL_SCHEMA_VERSION: u32 = 1;
 /// - `embedding_dim` does not match the runtime `EMBEDDING_DIM` (96).
 /// - `window_size` does not match the runtime `WINDOW_SIZE` (3).
 ///
-/// # Legacy Migration (mahbot-898)
+/// # Legacy Migration
 ///
 /// Models without `schema_version` (pre-v1, `schema_version` default 0 via
 /// `#[serde(default)]`) are migrated to v1 on first successful load. The
@@ -6979,7 +6931,7 @@ struct PersistedModel {
     /// persisted models.
     #[serde(default, deserialize_with = "deserialize_classifier_opt")]
     classifier: Option<Vec<ClassifierWeights>>,
-    /// Per-member validation losses from pre-mahbot-904 persisted models.
+    /// Per-member validation losses from older persisted models.
     /// Kept for backward compatible deserialization only — always None in
     /// newly persisted models and never read on load (uniform averaging).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7158,7 +7110,7 @@ impl Default for PersistedModel {
 /// CONFIG update succeeded. Callers use the return value to gate their own
 /// success logging.
 /// Used by both [`persist_model_state`] (post-training) and the migration
-/// write-back path (legacy migration, mahbot-898).
+/// write-back path (legacy migration).
 async fn persist_wake_word_model(model: &PersistedModel) -> bool {
     let Ok(json) = serde_json::to_string(model) else {
         warn!("Failed to serialize wake word model for persistence");
@@ -7221,7 +7173,7 @@ async fn persist_model_state() {
         },
         trained_at: now,
         classifier: weights.map(|w| vec![w]),
-        val_losses: None, // mahbot-904: no longer stored (uniform averaging)
+        val_losses: None, // no longer stored (uniform averaging)
     };
 
     if persist_wake_word_model(&model).await {
@@ -7238,8 +7190,7 @@ async fn persist_model_state() {
 /// Handle recording audio: accumulate buffer and check for silence/duration limits.
 ///
 /// Silence duration is measured in audio samples (not wall-clock time) so that
-/// system load / processing delays don't affect recording cutoff consistency
-/// (ticket mahbot-760).
+/// system load / processing delays don't affect recording cutoff consistency.
 #[allow(clippy::cast_precision_loss)]
 async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
     ctx.command_buffer.extend_from_slice(&samples);
@@ -7292,8 +7243,7 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
                 // voice_batch, score_window, command_buffer,
                 // pre_agc_ring, negative_audio_buf) while
                 // preserving VAD state, NS noise profile, vad_threshold, and the
-                // wake-word cooldown timestamp to prevent immediate re-triggering
-                // (mahbot-805).
+                // wake-word cooldown timestamp to prevent immediate re-triggering.
                 ctx.reset_pipeline_state(ResetLevel::Soft);
                 ctx.is_recording = false;
                 set_status(VoiceStatus::Listening);
@@ -7304,7 +7254,7 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
 
                 // Broadcast an error chat message (rate-limited: at most one
                 // per 10 seconds) so the user sees a persistent indicator
-                // instead of a flash that disappears after 2s (mahbot-812).
+                // instead of a flash that disappears after 2s.
                 if ctx.should_send_error_message() {
                     let user_name = active_user_name();
                     if !user_name.is_empty() {
@@ -7327,13 +7277,13 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
 
                 // Enforce a 3-second refractory period before returning to
                 // Listening (replaces the old 2-second blocking sleep with a
-                // non-blocking alternative, mahbot-812).
+                // non-blocking alternative).
                 ctx.refractory_until = Some(Instant::now() + Duration::from_secs(3));
 
                 // Cleanup the recording state.
                 // Soft reset clears recording/detection buffers while preserving
                 // VAD/NS continuity so the noise floor estimate survives the
-                // refractory period (mahbot-805).
+                // refractory period.
                 ctx.reset_pipeline_state(ResetLevel::Soft);
                 ctx.is_recording = false;
                 // Do NOT set status to Listening here — the refractory delay
@@ -7351,7 +7301,7 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
 /// overlap starts on the mel frame grid.  Without this alignment,
 /// [`HOP_LENGTH`] (256) not being a multiple of [`MEL_STRIDE`] (160) would
 /// cause ~80 % of batch boundaries to land off-grid, producing mel frames
-/// that the classifier never sees during training (mahbot-924).
+/// that the classifier never sees during training.
 ///
 /// The actual retained overlap may be up to [`MEL_STRIDE`] − 1 samples larger
 /// than [`VOICE_BATCH_OVERLAP`].  This is harmless — the extra samples merely
@@ -7394,7 +7344,7 @@ fn trim_voice_batch(voice_batch: &mut Vec<f32>) {
 /// After a successful ONNX call, [`trim_voice_batch`] trims `voice_batch` to
 /// retain only the last [`VOICE_BATCH_OVERLAP`] samples as overlap context
 /// for the next batch.  This ensures mel frame positions are aligned across
-/// batch boundaries (mahbot-799).  Removing this call would create a
+/// batch boundaries.  Removing this call would create a
 /// regression gap — the test suite cannot verify the call site because ONNX
 /// models are unavailable in unit tests (see [`trim_voice_batch`]'s
 /// `# Caution` note).
@@ -7421,21 +7371,20 @@ fn flush_voice_batch(voice_batch: &mut Vec<f32>, mel_frame_buffer: &mut Vec<Vec<
             // trim_voice_batch retains overlap context across batch boundaries.
             // The mel frame buffer trim is now at the end of
             // handle_wake_word_detection after the stride-8 sliding window
-            // loop (mahbot-923), ensuring the sliding window sees the full
+            // loop, ensuring the sliding window sees the full
             // accumulated buffer before trimming.
             trim_voice_batch(voice_batch);
         }
         Err(e) => {
             warn!("Mel spectrogram failed: {e}");
             // Clear the batch so it doesn't grow unbounded when the
-            // ONNX model is consistently failing (ticket mahbot-760).
+            // ONNX model is consistently failing.
             voice_batch.clear();
         }
     }
 }
 
-/// Score a batch of start-aligned positions with padded geometry
-/// (mahbot-1023).
+/// Score a batch of start-aligned positions with padded geometry.
 ///
 /// Shared by the deferred burst sweep and the segment-end pass — both score
 /// the same start-aligned grid (0/8/16/24 below the buffer end) with the
@@ -7448,7 +7397,7 @@ fn flush_voice_batch(voice_batch: &mut Vec<f32>, mel_frame_buffer: &mut Vec<Vec<
 /// geometry is never perturbed by a stale window start.  (The ticket's
 /// original "a misaligned mid-pass position scores ~0.2651 and resets the
 /// rolling window" hazard was measured NOT to manifest at live geometry —
-/// mahbot-1023 runs 5–7: the B=79 → start-3 continuation scores ~0.99 and
+/// the B=79 → start-3 continuation scores ~0.99 and
 /// is the enabling mechanism for mid-utterance continuation; the rolling
 /// reset stays guarded by the per-segment burst latch and the boundary
 /// pass.)
@@ -7487,8 +7436,7 @@ fn score_start_aligned_positions(
     }
 }
 
-/// Score a single mel frame window through the embedding + classifier pipeline
-/// (mahbot-923 stride-8 helper).
+/// Score a single mel frame window through the embedding + classifier pipeline.
 ///
 /// Computes the dense embedding from `mel_window` via ONNX, passes it through
 /// [`score_single_embedding`] with the current classifier, records
@@ -7497,7 +7445,7 @@ fn score_start_aligned_positions(
 ///
 /// # Returns
 /// `true` if wake word was detected (caller should stop processing and return).
-// Clippy: the instrumentation block (mahbot-1005) plus the read-lock scoping
+// Clippy: the instrumentation block plus the read-lock scoping
 // pushes this past 100 lines in both feature configurations (104 default,
 // 141 voice-tests); the body is a single linear pipeline and not worth
 // splitting.
@@ -7507,16 +7455,16 @@ fn score_stride8_window(
     mel_window: &[Vec<f32>],
     models: &OnnxModels,
     ctx: &mut PipelineCtx,
-    // mahbot-1012: whether this window was produced by padding a short real
+    // whether this window was produced by padding a short real
     // slice (tapered fade-out tail) rather than a full 76-frame window from
     // the main stride-8 loop.  Only read under `voice-tests` (geometry
     // reporting); all call sites pass a value so production builds see a
     // constant.
     padded_window: bool,
-    // mahbot-1012: mel frame buffer length at this scoring step.  Only read
+    // mel frame buffer length at this scoring step.  Only read
     // under `voice-tests`; the value is a pure observation of pipeline state.
     mel_buffer_len: usize,
-    // mahbot-1023: scoring path that produced this window (deferred burst /
+    // scoring path that produced this window (deferred burst /
     // segment-end pass / main stride-8 loop).  Read under `voice-tests` for
     // the detection-path report; the value is a pure label.
     source: WindowSource,
@@ -7551,7 +7499,7 @@ fn score_stride8_window(
     // std::sync::RwLock (which does not support read→write upgrades).
     //
     // Historical context: commit da06926 fixed a double-read-lock in this
-    // same function but missed this read→write upgrade path (mahbot-946).
+    // same function but missed this read→write upgrade path.
     // Do NOT rely on NLL early-drop — always scope the guard explicitly.
     // ── Capture pre-call ring length for geometry instrumentation ──
     #[cfg(feature = "voice-tests")]
@@ -7689,18 +7637,18 @@ fn score_stride8_window(
 ///
 /// Batching reduces ONNX inference calls from ~62/sec (per-frame) to ~8/sec.
 ///
-/// Implements cooldown (mahbot-770 Fix 2) and soft-scoring + rolling window
-/// detection (mahbot-773) via the `last_wake_word_detection` and
+/// Implements cooldown and soft-scoring + rolling window
+/// detection via the `last_wake_word_detection` and
 /// `score_window` fields.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
-    // ── Cooldown check (mahbot-770 Fix 2) ──
+    // ── Cooldown check ──
     // If we recently detected the wake word, skip ALL processing for this
     // chunk to prevent rapid consecutive false triggers.  During cooldown
-    // audio accumulates into audio_buffer with a cap (mahbot-802) so that
+    // audio accumulates into audio_buffer with a cap so that
     // when the cooldown expires the pipeline has data to process immediately;
     // intermediate detection buffers are cleared to prevent stale data from
-    // the previous utterance causing false triggers (mahbot-770 Fix 2).
+    // the previous utterance causing false triggers.
     if let Some(last) = ctx.last_wake_word_detection
         && last.elapsed() < WAKE_WORD_COOLDOWN
     {
@@ -7709,7 +7657,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
             last.elapsed().as_millis()
         );
         // Accumulate audio during cooldown so the pipeline has data
-        // when cooldown expires — don't discard it entirely (mahbot-802).
+        // when cooldown expires — don't discard it entirely.
         // See [`COOLDOWN_ACCUMULATION_CAP`] for the frame-processing
         // arithmetic that justifies the cap value (2 frames = 1024 samples).
         //
@@ -7717,7 +7665,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
         // cooldown is_recording is false, so audio is routed to
         // handle_wake_word_detection, not to handle_recording_audio.
         // command_buffer is only populated after detection transitions to
-        // recording mode (mahbot-802 deviation from ticket §2).
+        // recording mode.
         //
         // Invariant: audio_buffer is empty or within COOLDOWN_ACCUMULATION_CAP at
         // cooldown entry.  The handoff block in this function clears it at the
@@ -7738,17 +7686,16 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
         // VAD is intentionally NOT reset here: the accumulated audio_buffer
         // naturally refills Earshot's internal ring buffer when processing
         // resumes after cooldown expiry.  A manual reset_vad() would lose
-        // the noise floor estimate (mahbot-802).
+        // the noise floor estimate.
         ctx.reset_detection_segment();
         return;
     }
 
     ctx.audio_buffer.extend_from_slice(samples);
 
-    // ═══════════════════════════════════════════════════════════════════════
     // VAD-gating / batch-accumulation frame loop
     //
-    // Produces mel frames via flush_voice_batch.  After mahbot-923, the
+    // Produces mel frames via flush_voice_batch.  Now, the
     // callback is a no-op — embeddings are extracted via a stride-8 sliding
     // window over the accumulated mel frame buffer AFTER the VAD loop.
     // This ensures ALL accumulated mel frames are scored with dense stride-8
@@ -7761,8 +7708,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     //
     // When detection fires during the stride-8 loop, score_stride8_window
     // sets is_recording = true but defers the full transition to this
-    // function — see the handoff block below (mahbot-919).
-    // ═══════════════════════════════════════════════════════════════════════
+    // function — see the handoff block below.
     let mut audio_buf = std::mem::take(&mut ctx.audio_buffer);
     let mut voice_batch = std::mem::take(&mut ctx.voice_batch);
     let mut mel_frame_buffer = std::mem::take(&mut ctx.mel_frame_buffer);
@@ -7781,7 +7727,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     #[cfg(feature = "voice-tests")]
     let mut per_hop_vad: Vec<bool> = Vec::new();
 
-    // Side-channel for consecutive VAD-negative hop tracking (mahbot-894).
+    // Side-channel for consecutive VAD-negative hop tracking.
     // Seeded with the accumulated count from previous calls so the counter
     // is continuous across `process_streaming_frames_inner` invocations.
     let segment_silence_hops = std::sync::atomic::AtomicUsize::new(ctx.segment_silence_hops);
@@ -7807,19 +7753,19 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
         is_speech_fn,
         false, // no trailing flush — audio_buffer accumulates across calls
         |_mel_frames| {
-            // No-op callback — after mahbot-923, stride-8 sliding window
+            // No-op callback — stride-8 sliding window
             // extraction runs after the VAD loop over the full mel frame buffer.
             false
         },
     );
 
-    // ── Stride-8 sliding window embedding extraction (mahbot-923) ──
+    // ── Stride-8 sliding window embedding extraction ──
     // After the VAD-gating loop, iterate over the accumulated mel frame buffer
     // with stride 8, extracting dense embeddings at each position and scoring
     // through the Conv1D classifier pipeline.  This replaces the old
     // streaming approach that extracted one embedding per batch flush.
     //
-    // mahbot-1023 (deferred burst scoring): position 0 is HELD until the
+    // position 0 is HELD until the
     // buffer reaches BURST_TRIGGER_FRAMES (68), then scored ONCE at the
     // start-aligned positions 0/8/16/24 with the trained start-0-aligned
     // padded geometry.  The old incremental per-chunk scoring scored position 0
@@ -7839,7 +7785,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
                 return;
             };
 
-            // ── Deferred burst sweep (mahbot-1023) ──
+            // ── Deferred burst sweep ──
             // Fires once per segment on the first call where the buffer
             // reaches BURST_TRIGGER_FRAMES (68).  Live mel-flush granularity
             // lands the trigger at B=76 (not the measured B=68 grid cell) —
@@ -7907,7 +7853,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
             // The main stride-8 loop is skipped when the burst just fired a
             // detection (is_recording true → handoff below).
             if !ctx.is_recording {
-                // ── Blinded gap recovery (mahbot-1002) ──
+                // ── Blinded gap recovery ──
                 // After warm-up or any pipeline action that advances
                 // next_window_start past the leading edge of real audio, the
                 // main stride-8 loop may be unable to fire because
@@ -7918,7 +7864,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
                 // that previously caused 0% detection on test utterances
                 // following warm-up.
                 //
-                // mahbot-1023 review fix: the re-anchor is skipped in the
+                // the re-anchor is skipped in the
                 // same call as the deferred burst — the burst already scored
                 // the leading edge (positions 0/8/16/24), so re-anchoring to
                 // it would re-score the identical position-0 window.
@@ -7948,9 +7894,9 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
                     }
                     ctx.next_window_start += BURST_STRIDE;
                 }
-                // NOTE: the short-buffer padded fallback (mahbot-927) is
+                // NOTE: the short-buffer padded fallback is
                 // intentionally GONE.  Its incremental per-chunk scoring is
-                // exactly the mahbot-1023 bug (position 0 scored with 2–16
+                // exactly the bug (position 0 scored with 2–16
                 // frames per chunk, never re-scored), and after the deferred
                 // burst the fallback's ≤17-real-frame windows (~0.01) would
                 // reset the rolling window mid-utterance.  Short buffers are
@@ -7973,7 +7919,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
         // decision in processing order).
         ctx.instrumentation.per_hop_vad.extend(per_hop_vad);
     }
-    // ── Bounded detection segment check (mahbot-894) ───────────────────────
+    // ── Bounded detection segment check ───────────────────────
     // If we've accumulated enough consecutive VAD-negative hops since the
     // last VAD-positive frame, declare a segment boundary and reset
     // per-segment detection state.  This prevents classifier scores, rolling
@@ -7983,19 +7929,19 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     // If detection fired during the frame loop, the pipeline transitioned to
     // recording mode and `reset_pipeline_state(Soft)` already cleared
     // `ctx.segment_silence_hops` and all per-segment buffers — skip the
-    // stale writeback that would overwrite the clean state (reviewer mahbot-894).
+    // stale writeback that would overwrite the clean state (per reviewer feedback).
     if !ctx.is_recording {
         let hop_count = segment_silence_hops.load(std::sync::atomic::Ordering::Relaxed);
         ctx.handle_segment_boundary(hop_count, &mut voice_batch, &mut mel_frame_buffer);
     }
 
-    // ── Detection→recording handoff (mahbot-919) ──────────────────────────
+    // ── Detection→recording handoff ──────────────────────────
     // When detection fires, score_stride8_window sets is_recording = true.
     // We complete the transition here where all state (audio_buf, voice_batch,
     // mel_frame_buffer) is available as local variables (moved out of ctx at
     // lines 6960-6962 to avoid borrow conflicts with the VAD closure).
     //
-    // The transition sequence (matching mahbot-802 design):
+    // The transition sequence (matching the documented design):
     //   1. Take ALL of audio_buf (processed wake-word tail + unprocessed
     //      command-start) — the consumed/unconsumed distinction is irrelevant
     //      because ASR tolerates the extra wake-word overlap
@@ -8020,7 +7966,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
         consumed = 0; // Prevent drain panic on now-empty audio_buf
     }
 
-    // ── Mel frame buffer trim (moved from flush_voice_batch, mahbot-923) ──
+    // ── Mel frame buffer trim (moved from flush_voice_batch) ──
     // After the stride-8 loop, keep the last EMBEDDING_WINDOW_FRAMES - 8 mel
     // frames (overlap for continuity with the next batch).  The overlap of 8
     // frames matches the BURST_STRIDE window so the next call has valid
@@ -8056,27 +8002,27 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
 /// detection.  Newly completed utterances are queued in `enrollment_pending`
 /// (a `VecDeque`) for the main loop to process one per tick (avoids race
 /// conditions with the command channel).  Using a queue ensures no utterance
-/// is dropped if multiple complete within a single mic frame (mahbot-823).  The frame loop maintains lightweight inline state only for
+/// is dropped if multiple complete within a single mic frame.  The frame loop maintains lightweight inline state only for
 /// side-effect gating (noise RMS capture, negative audio collection, UI
 /// status) — utterance construction itself is delegated to the extracted
-/// function (mahbot-823).
+/// function.
 ///
-/// **Negative collection** (mahbot-797): Non-VAD frames captured
+/// **Negative collection**: Non-VAD frames captured
 /// before the first detected speech (pre-enrollment ambient noise) and during
 /// inter-utterance silence (audio between wake word utterances) are accumulated
 /// into `ctx.negative_audio_buf`. On the first transition to sustained speech,
 /// this buffer is saved as a chunk in `voice_state().negative_audio_chunks`.
 /// These real (non-synthetic) negative examples are later used to train the
 /// classifier at enrollment finalization, replacing the old synthetic
-/// Gaussian noise that caused false triggers (mahbot-797 Fix 4).
+/// Gaussian noise that caused false triggers.
 ///
-/// **VAD symmetry** (mahbot-765): Only VAD-positive frames are accumulated
+/// **VAD symmetry**: Only VAD-positive frames are accumulated
 /// by the extracted function into utterances, mirroring the detection pipeline
 /// ([`handle_wake_word_detection`]). This eliminates the asymmetry where
 /// enrollment built templates on audio that the detector never processes.
 /// Utterance end is detected after [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`]
 /// consecutive non-VAD-positive frames (~304ms), matching the detection-side
-/// segment timeout (mahbot-1001 Fix 7).
+/// segment timeout.
 ///
 /// If no speech has been detected for a prolonged period (~5s), a warning
 /// status is set to prompt the user to speak louder or move closer to the mic.
@@ -8109,11 +8055,11 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
         // VAD detector.  Each frame overlaps the previous by 50%
         // (= HOP_LENGTH), so feeding the full frame duplicates 256 samples,
         // corrupting earshot's internal ring buffer, pre-emphasis filter,
-        // and feature context (mahbot-900).  This must match the VAD call
+        // and feature context.  This must match the VAD call
         // pattern in process_streaming_frames_inner to maintain train-
         // inference consistency across the detection and enrollment paths.
         //
-        // Uses the context-specific enrollment VAD detector (mahbot-1001 Fix 6)
+        // Uses the context-specific enrollment VAD detector
         // to prevent mode-transition state contamination.  Falls back to the
         // global detector if the enrollment VAD is not initialized (defensive).
         let is_speech = if let Some(ref mut det) = ctx.enrollment_vad {
@@ -8131,14 +8077,14 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
             if ctx.vad_positives_in_a_row >= ENROLLMENT_VAD_CONSECUTIVE_REQUIRED {
                 // Sustained speech confirmed: perform inline side-effect gating.
                 // The extracted [`segment_utterances_by_vad`] function handles
-                // utterance-boundary detection and construction (mahbot-823);
+                // utterance-boundary detection and construction;
                 // the inline code below only gates real-time side effects that
-                // must happen during the frame loop: noise RMS capture (mahbot-785),
-                // negative audio collection (mahbot-797), and UI status updates.
+                // must happen during the frame loop: noise RMS capture,
+                // negative audio collection, and UI status updates.
 
                 let was_waiting_for_silence = ctx.utterance_silence_samples > 0;
 
-                // ── Capture noise RMS from pre-AGC ring (mahbot-785) ──
+                // ── Capture noise RMS from pre-AGC ring ──
                 // On the FIRST transition from silence to sustained speech,
                 // capture the ambient noise RMS from the pre-AGC audio ring.
                 // The pre_agc_ring stores raw mic audio before AGC gain is
@@ -8146,10 +8092,10 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                 // 4×) disproportionately to speech (~1-2×), so post-AGC noise
                 // RMS would produce an SNR estimate 6-12 dB lower than the
                 // true room SNR, triggering a false low-SNR warning even in
-                // quiet environments (mahbot-782 used raw_audio_ring which
-                // contains post-AGC audio, causing this false-positive).
+                // quiet environments (raw_audio_ring contains post-AGC audio, causing
+                // this false-positive).
                 let already_had_speech = ctx.utterance_had_speech;
-                // ── Save collected ambient audio for negatives (mahbot-797) ──
+                // ── Save collected ambient audio for negatives ──
                 // On the FIRST transition from silence to sustained speech,
                 // save the accumulated non-wake-word audio (pre-enrollment
                 // ambient noise or inter-utterance silence) as a potential
@@ -8176,7 +8122,7 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                     let speech_boundary = ENROLLMENT_VAD_CONSECUTIVE_REQUIRED * HOP_LENGTH;
                     let pre_speech_end = ctx.pre_agc_ring.len().saturating_sub(speech_boundary);
                     if pre_speech_end > 0 {
-                        // Shared RMS helper (mahbot-1043); the statement-level
+                        // Shared RMS helper; the statement-level
                         // #[expect(clippy::cast_precision_loss)] was removed
                         // because compute_rms carries its own allow.
                         let rms = crate::util::compute_rms(&ctx.pre_agc_ring[..pre_speech_end]);
@@ -8204,7 +8150,7 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
             if ctx.utterance_had_speech {
                 // After speech: track silence duration to detect utterance end.
                 // Track by sample count (not wall-clock time) so that system load
-                // / processing delays don't affect cutoff consistency (mahbot-760).
+                // / processing delays don't affect cutoff consistency.
                 //
                 // NOTE: We accumulate HOP_LENGTH per frame iteration (not the raw
                 // chunk size) because each loop iteration processes exactly
@@ -8219,12 +8165,11 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                 // Inline silence threshold reset: partially duplicates the
                 // extracted function's boundary logic but is needed so that
                 // post-utterance silence within the same chunk accumulates
-                // into negative_audio_buf rather than being discarded
-                // (mahbot-797, mahbot-823).
+                // into negative_audio_buf rather than being discarded.
                 // Snapshot before reset so the UI status gate uses the
                 // pre-reset value — after utterance completion the silence
                 // samples are 0, which would spuriously trigger the "waiting
-                // for silence" status for one frame (mahbot-823).
+                // for silence" status for one frame.
                 let silence_ui_check = ctx.utterance_silence_samples;
 
                 if ctx.utterance_silence_samples >= ENROLLMENT_SILENCE_THRESHOLD_SAMPLES {
@@ -8242,7 +8187,7 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                     set_status(VoiceStatus::WaitingForSilenceDuringEnrollment { sample, total });
                 }
             } else if !ctx.utterance_had_speech {
-                // Accumulate non-VAD audio for negatives (mahbot-797):
+                // Accumulate non-VAD audio for negatives:
                 // pre-enrollment ambient noise, inter-utterance silence, or
                 // any non-wake-word audio between utterances.  Each frame
                 // contributes HOP_LENGTH new samples.
@@ -8252,12 +8197,12 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                 // Pre-speech silence: increment no-speech counter.  When the
                 // count reaches ENROLLMENT_NO_SPEECH_TIMEOUT_FRAMES (~5 seconds
                 // of non-VAD audio), show a warning so the user knows to speak
-                // louder or move closer (mahbot-765 VAD symmetry mitigation).
+                // louder or move closer (VAD symmetry mitigation).
                 ctx.enrollment_no_speech_frame_count += 1;
                 // Warn after the derived frame threshold.  The constant is
                 // computed from ENROLLMENT_NO_SPEECH_DURATION × SAMPLE_RATE /
                 // HOP_LENGTH, so the threshold stays correct if frame/hop sizes
-                // are adjusted (mahbot-765).
+                // are adjusted.
                 if ctx.enrollment_no_speech_frame_count >= ENROLLMENT_NO_SPEECH_TIMEOUT_FRAMES {
                     set_status(VoiceStatus::Error(
                         "No speech detected — try speaking louder or move closer to microphone"
@@ -8314,14 +8259,12 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
             // Note: noise_rms_estimate is intentionally NOT reset here.
             // It is consumed by the main loop alongside enrollment_pending.
             // Reset is handled by reset_pipeline_state(Cancel) for
-            // cancellation/completion safety (mahbot-782).
+            // cancellation/completion safety.
         }
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Phase 3 owner-negative audio processing (mahbot-913)
-// ═══════════════════════════════════════════════════════════════════════════
+// Phase 3 owner-negative audio processing
 
 /// Process incoming audio for Phase 3 owner-negative collection.
 ///
@@ -8339,7 +8282,7 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
 /// Phase 3).
 ///
 /// Uses [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] for chunk boundary detection —
-/// aligned to streaming's segment timeout (mahbot-1001 Fix 7), same constant
+/// aligned to streaming's segment timeout, same constant
 /// as enrollment utterance end.
 ///
 /// Audio chunks are finalized into `voice_state().owner_negative_chunks` (not
@@ -8374,7 +8317,7 @@ fn handle_negative_collection_audio(samples: &[f32], ctx: &mut PipelineCtx) {
         } else {
             ctx.phase3_silence_samples += HOP_LENGTH;
             // Check for chunk boundary: when silence exceeds ENROLLMENT_SILENCE_THRESHOLD_SAMPLES
-            // (aligned to streaming's ~304ms, mahbot-1001 Fix 7) after sustained speech,
+            // (aligned to streaming's ~304ms) after sustained speech,
             // finalize the current segment as a chunk.
             if ctx.phase3_silence_samples >= ENROLLMENT_SILENCE_THRESHOLD_SAMPLES {
                 let chunk_end = consumed.saturating_sub(ctx.phase3_silence_samples);

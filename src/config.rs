@@ -80,7 +80,7 @@
 //! # Orphaned database keys
 //!
 //! The following keys may still exist in the `config_kv` table from before the
-//! API audio transcription was removed (mahbot-735), but are **silently
+//! API audio transcription was removed, but are **silently
 //! ignored** — they have no corresponding field in [`ConfigData`] and are never
 //! read:
 //!

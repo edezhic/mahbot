@@ -40,7 +40,6 @@ pub(crate) fn load_prompt(asset_key: &str) -> String {
 }
 
 // Utils
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// Append a named file section to the context string, with a markdown header
 /// and truncated content. Skips empty content.
