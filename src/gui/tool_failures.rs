@@ -96,9 +96,9 @@ impl ToolFailuresState {
                 self.load_state.set_has_loaded();
                 Task::none()
             }
-            // PrevPage and NextPage are handled by LogsState which passes
-            // filter parameters directly via prev_page()/next_page() methods.
-            ToolFailuresMessage::PrevPage | ToolFailuresMessage::NextPage => Task::none(),
+            // PrevPage and NextPage are intercepted by LogsState, which calls
+            // prev_page()/next_page() directly with filter parameters.
+            _ => Task::none(),
         }
     }
 

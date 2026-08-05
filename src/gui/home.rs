@@ -33,14 +33,6 @@ pub struct DisplayMessage {
     /// Database row ID (Some for history-loaded, None for live arrivals).
     pub id: Option<i64>,
     pub message_id: String,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Carried in DisplayMessage for future display use; currently not read"
-        )
-    )]
-    pub user_name: String,
     pub content: String,
     pub direction: ChatDirection,
     pub agent_role: Option<String>,
@@ -58,7 +50,6 @@ pub struct DisplayMessage {
 fn display_message(
     id: Option<i64>,
     message_id: String,
-    user_name: String,
     content: String,
     direction: ChatDirection,
     agent_role: Option<String>,
@@ -74,7 +65,6 @@ fn display_message(
     DisplayMessage {
         id,
         message_id,
-        user_name,
         content,
         direction,
         agent_role,
@@ -88,20 +78,12 @@ impl From<ChatHistoryEntry> for DisplayMessage {
         let ChatHistoryEntry {
             id,
             message_id,
-            user_name,
             content,
             direction,
             agent_role,
+            ..
         } = entry;
-        display_message(
-            Some(id),
-            message_id,
-            user_name,
-            content,
-            direction,
-            agent_role,
-            false,
-        )
+        display_message(Some(id), message_id, content, direction, agent_role, false)
     }
 }
 
@@ -413,7 +395,6 @@ impl HomeState {
         &mut self,
         optimistic_id: Option<&str>,
         message_id: &str,
-        user_name: &str,
         content: &str,
         direction: ChatDirection,
         agent_role: Option<&str>,
@@ -427,7 +408,6 @@ impl HomeState {
                 self.messages[pos] = display_message(
                     None,
                     message_id.to_string(),
-                    user_name.to_string(),
                     content.to_string(),
                     direction,
                     agent_role.map(std::string::ToString::to_string),
@@ -501,7 +481,7 @@ impl HomeState {
     ///
     /// Does nothing when `user_name` is not the selected user, or when
     /// `workspace` does not match [`resolve_workspace_name()`](Self::resolve_workspace_name).
-    /// Takes ownership of the string fields so the caller avoids extra
+    /// Takes ownership of the message fields so the caller avoids extra
     /// clones on the common (append) path.
     ///
     /// The caller should call [`maybe_snap()`](Self::maybe_snap)
@@ -510,14 +490,14 @@ impl HomeState {
     #[allow(clippy::too_many_arguments)]
     fn append_message(
         &mut self,
-        user_name: String,
+        user_name: &str,
         workspace: &str,
         message_id: String,
         content: String,
         direction: ChatDirection,
         agent_role: Option<String>,
     ) {
-        if Some(user_name.as_str()) != self.selected_user.as_deref() {
+        if Some(user_name) != self.selected_user.as_deref() {
             return;
         }
         if Some(workspace) != self.resolve_workspace_name().as_deref() {
@@ -525,7 +505,7 @@ impl HomeState {
         }
 
         self.messages.push(display_message(
-            None, message_id, user_name, content, direction, agent_role, false,
+            None, message_id, content, direction, agent_role, false,
         ));
     }
 
@@ -951,7 +931,6 @@ impl HomeState {
                     if let Some(task) = self.replace_optimistic(
                         optimistic_id.as_deref(),
                         &message_id,
-                        &user_name,
                         &content,
                         direction,
                         agent_role.as_deref(),
@@ -969,7 +948,7 @@ impl HomeState {
 
                     // 4. Append the message (filtered by selected user + workspace).
                     self.append_message(
-                        user_name, &workspace, message_id, content, direction, agent_role,
+                        &user_name, &workspace, message_id, content, direction, agent_role,
                     );
 
                     self.maybe_snap()
@@ -1163,7 +1142,6 @@ impl HomeState {
             self.messages.push(display_message(
                 None,
                 opt_id.clone(),
-                sender.clone(),
                 content.clone(),
                 ChatDirection::User,
                 None,
@@ -1257,7 +1235,6 @@ mod tests {
 
     fn make_msg(
         message_id: &str,
-        user_name: &str,
         content: &str,
         direction: ChatDirection,
         agent_role: Option<&str>,
@@ -1266,7 +1243,6 @@ mod tests {
         DisplayMessage {
             id: None,
             message_id: message_id.to_string(),
-            user_name: user_name.to_string(),
             content: content.to_string(),
             direction,
             agent_role: agent_role.map(String::from),
@@ -1284,7 +1260,6 @@ mod tests {
         let mut state = make_home_state("alice", "ws1");
         state.messages.push(make_msg(
             "opt-1",
-            "alice",
             "(placeholder)",
             ChatDirection::User,
             None,
@@ -1294,7 +1269,6 @@ mod tests {
         let task = state.replace_optimistic(
             Some("opt-1"),
             "real-42",
-            "alice",
             "Hello!",
             ChatDirection::User,
             None,
@@ -1318,7 +1292,6 @@ mod tests {
         let mut state = make_home_state("alice", "ws1");
         state.messages.push(make_msg(
             "opt-1",
-            "alice",
             "(placeholder)",
             ChatDirection::User,
             None,
@@ -1329,7 +1302,6 @@ mod tests {
         let task = state.replace_optimistic(
             Some("wrong-opt"),
             "real-42",
-            "alice",
             "Hello!",
             ChatDirection::User,
             None,
@@ -1347,14 +1319,7 @@ mod tests {
     fn test_replace_optimistic_no_opt_id() {
         let mut state = make_home_state("alice", "ws1");
 
-        let task = state.replace_optimistic(
-            None,
-            "real-42",
-            "alice",
-            "Hello!",
-            ChatDirection::User,
-            None,
-        );
+        let task = state.replace_optimistic(None, "real-42", "Hello!", ChatDirection::User, None);
 
         assert!(task.is_none(), "expected None when optimistic_id is None");
     }
@@ -1388,7 +1353,6 @@ mod tests {
         for i in 0..200u32 {
             state.messages.push(make_msg(
                 &format!("old-{i}"),
-                "alice",
                 "",
                 ChatDirection::User,
                 None,
@@ -1465,7 +1429,7 @@ mod tests {
         assert_eq!(state.messages.len(), 0);
 
         state.append_message(
-            "alice".to_string(),
+            "alice",
             "ws1",
             "msg-1".to_string(),
             "Hello!".to_string(),
@@ -1476,7 +1440,6 @@ mod tests {
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].message_id, "msg-1");
         assert_eq!(state.messages[0].content, "Hello!");
-        assert_eq!(state.messages[0].user_name, "alice");
     }
 
     #[test]
@@ -1484,7 +1447,7 @@ mod tests {
         let mut state = make_home_state("alice", "ws1");
 
         state.append_message(
-            "bob".to_string(),
+            "bob",
             "ws1",
             "msg-1".to_string(),
             "Hello!".to_string(),
@@ -1504,7 +1467,7 @@ mod tests {
         let mut state = make_home_state("alice", "ws1");
 
         state.append_message(
-            "alice".to_string(),
+            "alice",
             "ws2",
             "msg-1".to_string(),
             "Hello!".to_string(),
@@ -1524,7 +1487,7 @@ mod tests {
         let mut state = make_home_state("alice", "ws1");
 
         state.append_message(
-            "alice".to_string(),
+            "alice",
             "ws1",
             "msg-agent".to_string(),
             "Agent answer".to_string(),

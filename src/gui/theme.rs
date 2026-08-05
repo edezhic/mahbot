@@ -46,14 +46,6 @@ pub const BRACKET_MATCH: Color = Color::from_rgba(0.357, 0.749, 0.710, 0.35);
 pub const HOVER: Color = Color::from_rgba(0.808, 0.804, 0.765, 0.05);
 pub const HOVER_STRONG: Color = Color::from_rgba(0.808, 0.804, 0.765, 0.08);
 
-/// Semi-transparent black used for modal backdrops that capture clicks.
-/// Shared by board.rs, settings.rs, mod.rs, and editor.rs.
-#[expect(
-    dead_code,
-    reason = "Named color constant available for modal/sheet backdrop use; not currently referenced"
-)]
-pub const BACKDROP_COLOR: Color = Color::from_rgba(0.0, 0.0, 0.0, 0.5);
-
 // ── Status colors ─────────────────────────────────────────────────
 
 pub const STATUS_SUCCESS: Color = Color::from_rgb(0.0, 0.902, 0.541); // #00e68a

@@ -474,21 +474,6 @@ impl FileTree {
         }
     }
 
-    /// Clear all tree state (nodes, expanded dirs, visible list, focus).
-    #[expect(
-        dead_code,
-        reason = "Public method kept for API completeness; not currently called"
-    )]
-    pub fn clear(&mut self) {
-        self.nodes.clear();
-        self.expanded_dirs.clear();
-        self.tree_focused = false;
-        self.tree_focus_index = 0;
-        self.visible_tree_nodes.clear();
-        self.scroll_y = 0.0;
-        self.viewport_h = None;
-    }
-
     /// Set the focus index to the visible-tree position of `path`, if found.
     ///
     /// Returns the found position, or [`None`] if `path` is not in the visible tree.
