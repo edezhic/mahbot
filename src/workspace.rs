@@ -9,7 +9,7 @@ use crate::WorkspaceStatus;
 use crate::agent::run_agent;
 use crate::role::DIAGNOSTICS_ROLE;
 use crate::session::discovery_agent_id;
-use crate::turso::{self};
+use crate::turso::{self, Value};
 use anyhow::{Context, Result};
 use chrono::Timelike;
 use futures_util::future::join_all;
@@ -351,12 +351,14 @@ async fn finalize_discovery(
         .ok()
         .map(|h| h.trim().to_string());
 
-        let now = turso::now();
         if let Err(e) = storage
-            .conn
-            .execute(
-                "UPDATE workspaces SET status = ?1, paused = 0, last_analyzed_commit = ?2, updated_at = ?3 WHERE name = ?4",
-                turso::params![WorkspaceStatus::Ready.to_string(), commit_hash.as_deref(), now, ws_name],
+            .exec_update_with_updated_at(
+                "status = ?, paused = 0, last_analyzed_commit = ?",
+                vec![
+                    Value::from(WorkspaceStatus::Ready.to_string()),
+                    Value::from(commit_hash.as_deref()),
+                ],
+                ws_name,
             )
             .await
         {
@@ -619,6 +621,23 @@ impl WorkspaceStore {
             .await
     }
 
+    /// Run an UPDATE on `workspaces` that sets `set_clause` plus
+    /// `updated_at = now` for a single named row — mirrors the ticket-update
+    /// helper in `board.rs` to keep placeholder numbering uniform.
+    async fn exec_update_with_updated_at(
+        &self,
+        set_clause: &str,
+        set_params: Vec<turso::Value>,
+        name: &str,
+    ) -> Result<()> {
+        let sql = format!("UPDATE workspaces SET {set_clause}, updated_at = ? WHERE name = ?");
+        let mut params = set_params;
+        params.push(Value::from(turso::now()));
+        params.push(Value::from(name));
+        self.conn.execute(&sql, params).await?;
+        Ok(())
+    }
+
     /// Insert a new workspace and kick off analysis.
     pub async fn add(&self, name: &str, path: &str) -> Result<Workspace> {
         // Validate the workspace name.
@@ -715,36 +734,25 @@ impl WorkspaceStore {
 
     /// Update the status of a workspace.
     pub async fn set_status(&self, name: &str, status: &WorkspaceStatus) -> Result<()> {
-        let now = turso::now();
-        self.conn
-            .execute(
-                "UPDATE workspaces SET status = ?1, updated_at = ?2 WHERE name = ?3",
-                turso::params![status.to_string(), now.clone(), name],
-            )
-            .await?;
-        Ok(())
+        self.exec_update_with_updated_at("status = ?", vec![Value::from(status.to_string())], name)
+            .await
     }
 
     /// Set or clear the maintenance toggle for a workspace.
     pub async fn set_maintenance_enabled(&self, name: &str, enabled: bool) -> Result<()> {
-        let now = turso::now();
         let val: i64 = i64::from(enabled);
         if enabled {
             // Reset debounce state so the maintainer runs on the very next
             // 1-minute poll cycle (last_run_at = NULL bypasses the debounce
             // gate), regardless of how long the previous interval was.
-            self.conn
-                .execute(
-                    "UPDATE workspaces SET maintenance = ?1, maintainer_debounce_mins = 5, maintainer_last_run_at = NULL, updated_at = ?2 WHERE name = ?3",
-                    turso::params![val, now, name],
-                )
-                .await?;
+            self.exec_update_with_updated_at(
+                "maintenance = ?, maintainer_debounce_mins = 5, maintainer_last_run_at = NULL",
+                vec![Value::from(val)],
+                name,
+            )
+            .await?;
         } else {
-            self.conn
-                .execute(
-                    "UPDATE workspaces SET maintenance = ?1, updated_at = ?2 WHERE name = ?3",
-                    turso::params![val, now, name],
-                )
+            self.exec_update_with_updated_at("maintenance = ?", vec![Value::from(val)], name)
                 .await?;
             // Cancel any running maintainer agent for this workspace so it
             // doesn't continue creating tickets after maintenance was disabled.
@@ -763,13 +771,8 @@ impl WorkspaceStore {
 
     /// Set or clear the pipeline pause toggle for a workspace.
     pub async fn set_paused(&self, name: &str, paused: bool) -> Result<()> {
-        let now = turso::now();
         let val: i64 = i64::from(paused);
-        self.conn
-            .execute(
-                "UPDATE workspaces SET paused = ?1, updated_at = ?2 WHERE name = ?3",
-                turso::params![val, now, name],
-            )
+        self.exec_update_with_updated_at("paused = ?", vec![Value::from(val)], name)
             .await?;
         if paused {
             tracing::info!(workspace = name, "Workspace pipeline paused");
@@ -789,14 +792,12 @@ impl WorkspaceStore {
         debounce_mins: i64,
         last_run_at: &str,
     ) -> Result<()> {
-        let now = turso::now();
-        self.conn
-            .execute(
-                "UPDATE workspaces SET maintainer_debounce_mins = ?1, maintainer_last_run_at = ?2, updated_at = ?3 WHERE name = ?4",
-                turso::params![debounce_mins, last_run_at, now.clone(), name],
-            )
-            .await?;
-        Ok(())
+        self.exec_update_with_updated_at(
+            "maintainer_debounce_mins = ?, maintainer_last_run_at = ?",
+            vec![Value::from(debounce_mins), Value::from(last_run_at)],
+            name,
+        )
+        .await
     }
 
     /// Store discovered diagnostics commands for a workspace.
@@ -810,13 +811,12 @@ impl WorkspaceStore {
         commands: &crate::DiagnosticsCommands,
     ) -> Result<()> {
         let json = serde_json::to_string(commands)?;
-        self.conn
-            .execute(
-                "UPDATE workspaces SET diagnostics = ?1, diagnostics_generation = diagnostics_generation + 1, updated_at = ?2 WHERE name = ?3",
-                turso::params![json, turso::now(), name],
-            )
-            .await?;
-        Ok(())
+        self.exec_update_with_updated_at(
+            "diagnostics = ?, diagnostics_generation = diagnostics_generation + 1",
+            vec![Value::from(json)],
+            name,
+        )
+        .await
     }
 
     /// Retrieve discovered diagnostics commands for a workspace.
@@ -846,13 +846,8 @@ impl WorkspaceStore {
         // Safe UTF-8 char-level truncation — must not use byte slicing
         // which would panic on multi-byte characters at the boundary.
         let notes: String = notes.chars().take(4000).collect();
-        self.conn
-            .execute(
-                "UPDATE workspaces SET notes = ?1, updated_at = ?2 WHERE name = ?3",
-                turso::params![notes, turso::now(), name],
-            )
-            .await?;
-        Ok(())
+        self.exec_update_with_updated_at("notes = ?", vec![Value::from(notes)], name)
+            .await
     }
 
     /// Clear all per-role workspace contexts for a workspace.
@@ -895,19 +890,17 @@ impl WorkspaceStore {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Workspace {name} not found"))?;
 
-        let now = turso::now();
-
         // Atomically increment the discovery generation counter so any
         // still-running discovery task from a previous rediscover will
         // see a generation mismatch and skip its writes.
         // NOTE: diagnostics is deliberately NOT cleared — user-managed
         // diagnostics survive re-analysis.
-        self.conn
-            .execute(
-                "UPDATE workspaces SET discovery_generation = discovery_generation + 1, status = ?2, paused = 1, updated_at = ?1 WHERE name = ?3",
-                turso::params![now, WorkspaceStatus::Analyzing.to_string(), name],
-            )
-            .await?;
+        self.exec_update_with_updated_at(
+            "discovery_generation = discovery_generation + 1, status = ?, paused = 1",
+            vec![Value::from(WorkspaceStatus::Analyzing.to_string())],
+            name,
+        )
+        .await?;
 
         // Clear stale per-role context entries so that old discovery tasks
         // that beat the generation check cannot leave partial data behind.
@@ -937,18 +930,16 @@ impl WorkspaceStore {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Workspace {name} not found"))?;
 
-        let now = turso::now();
-
         // Bump diagnostics_generation and clear diagnostics so the fresh
         // discovery starts from scratch. The generation bump also cancels
         // any in-flight diagnostics discovery tasks. Does NOT touch
         // discovery_generation — role discovery is unaffected.
-        self.conn
-            .execute(
-                "UPDATE workspaces SET diagnostics_generation = diagnostics_generation + 1, diagnostics = NULL, updated_at = ?1 WHERE name = ?2",
-                turso::params![now, name],
-            )
-            .await?;
+        self.exec_update_with_updated_at(
+            "diagnostics_generation = diagnostics_generation + 1, diagnostics = NULL",
+            vec![],
+            name,
+        )
+        .await?;
 
         let generation = self
             .get_generation(name, GenerationColumn::DIAGNOSTICS)
@@ -1612,13 +1603,8 @@ mod tests {
 
         // Bump the generation behind the scenes (simulates a concurrent
         // rediscover() call).
-        let now = crate::turso::now();
         store
-            .conn
-            .execute(
-                "UPDATE workspaces SET discovery_generation = 1, updated_at = ?1 WHERE name = ?2",
-                crate::turso::params![now, "stale"],
-            )
+            .exec_update_with_updated_at("discovery_generation = 1", vec![], "stale")
             .await
             .expect("bump generation");
 
