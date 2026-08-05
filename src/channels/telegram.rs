@@ -260,6 +260,10 @@ struct AttachmentMeta {
     form_field: &'static str,
     default_filename: &'static str,
     label: &'static str,
+    /// Send `disable_content_type_detection=true` with the multipart form so
+    /// Telegram does not re-classify image uploads as photos (which would
+    /// re-encode them despite the sendDocument path).
+    disable_content_type_detection: bool,
 }
 
 impl TelegramAttachmentKind {
@@ -279,31 +283,53 @@ impl TelegramAttachmentKind {
                 form_field: "photo",
                 default_filename: "photo.jpg",
                 label: "Image",
+                disable_content_type_detection: false,
             },
             Self::Document => AttachmentMeta {
                 api_method: "sendDocument",
                 form_field: "document",
                 default_filename: "file",
                 label: "Document",
+                disable_content_type_detection: false,
             },
             Self::Video => AttachmentMeta {
                 api_method: "sendVideo",
                 form_field: "video",
                 default_filename: "video.mp4",
                 label: "Video",
+                disable_content_type_detection: false,
             },
             Self::Audio => AttachmentMeta {
                 api_method: "sendAudio",
                 form_field: "audio",
                 default_filename: "audio.mp3",
                 label: "Audio",
+                disable_content_type_detection: false,
             },
             Self::Voice => AttachmentMeta {
                 api_method: "sendVoice",
                 form_field: "voice",
                 default_filename: "voice.ogg",
                 label: "Voice",
+                disable_content_type_detection: false,
             },
+        }
+    }
+
+    /// Metadata for local-file sends. Image files use the general-file path
+    /// (sendDocument) so recipients get the original bytes — sendPhoto always
+    /// re-encodes server-side. URL sends keep `meta()` (sendDocument-by-URL
+    /// only accepts .PDF/.ZIP), so this routing must not touch that path.
+    const fn file_meta(self) -> AttachmentMeta {
+        match self {
+            Self::Image => AttachmentMeta {
+                api_method: "sendDocument",
+                form_field: "document",
+                default_filename: "image",
+                label: "Image",
+                disable_content_type_detection: true,
+            },
+            _ => self.meta(),
         }
     }
 }
@@ -1389,23 +1415,21 @@ impl TelegramChannel {
     async fn send_media(
         &self,
         chat_id: &str,
-        kind: TelegramAttachmentKind,
+        api_method: &'static str,
         request: reqwest::RequestBuilder,
         label: &str,
     ) -> anyhow::Result<()> {
         let resp = request.send().await?;
         if !resp.status().is_success() {
             let err = resp.text().await?;
-            anyhow::bail!("Telegram {} failed: {err}", kind.meta().api_method);
+            anyhow::bail!("Telegram {api_method} failed: {err}");
         }
-        tracing::info!(
-            "Telegram {} sent to {chat_id}: {label}",
-            kind.meta().api_method
-        );
+        tracing::info!("Telegram {api_method} sent to {chat_id}: {label}");
         Ok(())
     }
 
-    /// Send a media file (photo/document/video/audio/voice) to a Telegram chat.
+    /// Send a media file (image-as-file/document/video/audio/voice) to a
+    /// Telegram chat.
     async fn send_media_file(
         &self,
         chat_id: &str,
@@ -1413,17 +1437,22 @@ impl TelegramChannel {
         kind: TelegramAttachmentKind,
         file_path: &Path,
     ) -> anyhow::Result<()> {
+        let meta = kind.file_meta();
         let file_name = file_path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or_else(|| kind.meta().default_filename);
+            .unwrap_or(meta.default_filename);
 
         let file_bytes = tokio::fs::read(file_path).await?;
         let part = Part::bytes(file_bytes).file_name(file_name.to_string());
 
         let mut form = Form::new()
             .text("chat_id", chat_id.to_string())
-            .part(kind.meta().form_field, part);
+            .part(meta.form_field, part);
+
+        if meta.disable_content_type_detection {
+            form = form.text("disable_content_type_detection", "true");
+        }
 
         if let Some(tid) = thread_id {
             form = form.text("message_thread_id", tid.to_string());
@@ -1431,10 +1460,11 @@ impl TelegramChannel {
 
         let request = self
             .http_client()
-            .post(self.api_url(kind.meta().api_method))
+            .post(self.api_url(meta.api_method))
             .multipart(form);
 
-        self.send_media(chat_id, kind, request, file_name).await
+        self.send_media(chat_id, meta.api_method, request, file_name)
+            .await
     }
 
     /// Send a file by URL (Telegram will download it).
@@ -1445,17 +1475,19 @@ impl TelegramChannel {
         kind: TelegramAttachmentKind,
         url: &str,
     ) -> anyhow::Result<()> {
+        let meta = kind.meta();
         let mut body = serde_json::json!({ "chat_id": chat_id });
-        body[kind.meta().form_field] = serde_json::Value::String(url.to_string());
+        body[meta.form_field] = serde_json::Value::String(url.to_string());
 
         set_thread_id_on_json(&mut body, thread_id);
 
         let request = self
             .http_client()
-            .post(self.api_url(kind.meta().api_method))
+            .post(self.api_url(meta.api_method))
             .json(&body);
 
-        self.send_media(chat_id, kind, request, url).await
+        self.send_media(chat_id, meta.api_method, request, url)
+            .await
     }
 }
 
