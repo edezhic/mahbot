@@ -88,6 +88,16 @@ struct ExaSearchResponse {
     results: Vec<ExaResult>,
 }
 
+// ── Shared result formatting ────────────────────────────────────────────
+
+/// A normalized search result shared by both backends.
+struct SearchRow {
+    title: Option<String>,
+    url: String,
+    text: Option<String>,
+    description: Option<String>,
+}
+
 // ── Cache ────────────────────────────────────────────────────────────────────────
 
 /// A cached search result with full text content.
@@ -395,37 +405,26 @@ impl WebSearchTool {
             .await?;
 
         let res = check_search_error(res).await?;
-
         let search_resp = res.json::<SearchResponse>().await?;
 
-        if !search_resp.success || search_resp.data.web.is_empty() {
-            return Ok(format!("No results found for: {query}"));
-        }
+        // `success` can be false with results present — render no results.
+        let rows: Vec<SearchRow> = if search_resp.success {
+            search_resp
+                .data
+                .web
+                .into_iter()
+                .map(|r| SearchRow {
+                    title: r.title,
+                    url: r.url,
+                    text: r.markdown,
+                    description: r.description,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-        let mut lines: Vec<String> = Vec::new();
-        lines.push(format!("Search results for: {query}"));
-
-        for (i, result) in search_resp.data.web.iter().enumerate() {
-            let title = result.title.as_deref().unwrap_or("(no title)").to_string();
-            let description = result.description.as_deref().unwrap_or("");
-
-            let id = self
-                .cache
-                .cache_result(
-                    title.clone(),
-                    result.url.clone(),
-                    result.markdown.clone().unwrap_or_default(),
-                )
-                .await;
-
-            lines.push(format!("{}. [{title}]({url})", i + 1, url = result.url));
-            if !description.is_empty() {
-                lines.push(format!("   > {description}"));
-            }
-            lines.push(format!("   `expand` id: `{id}`"));
-        }
-
-        Ok(lines.join("\n"))
+        Ok(self.format_search_output(query, &rows).await)
     }
 
     async fn exa_search(&self, query: &str) -> anyhow::Result<String> {
@@ -443,17 +442,32 @@ impl WebSearchTool {
             .await?;
 
         let res = check_search_error(res).await?;
-
         let search_resp = res.json::<ExaSearchResponse>().await?;
 
-        if search_resp.results.is_empty() {
-            return Ok(format!("No results found for: {query}"));
+        let rows: Vec<SearchRow> = search_resp
+            .results
+            .into_iter()
+            .map(|r| SearchRow {
+                title: r.title,
+                url: r.url,
+                text: r.text,
+                description: None,
+            })
+            .collect();
+
+        Ok(self.format_search_output(query, &rows).await)
+    }
+
+    /// Render rows as the agent-facing search output: no-results message,
+    /// header, then one entry per row (caching full text for `expand`).
+    async fn format_search_output(&self, query: &str, rows: &[SearchRow]) -> String {
+        if rows.is_empty() {
+            return format!("No results found for: {query}");
         }
 
-        let mut lines: Vec<String> = Vec::new();
-        lines.push(format!("Search results for: {query}"));
+        let mut lines = vec![format!("Search results for: {query}")];
 
-        for (i, result) in search_resp.results.iter().enumerate() {
+        for (i, result) in rows.iter().enumerate() {
             let title = result.title.as_deref().unwrap_or("(no title)").to_string();
 
             let id = self
@@ -466,10 +480,13 @@ impl WebSearchTool {
                 .await;
 
             lines.push(format!("{}. [{title}]({url})", i + 1, url = result.url));
+            if let Some(description) = result.description.as_deref().filter(|d| !d.is_empty()) {
+                lines.push(format!("   > {description}"));
+            }
             lines.push(format!("   `expand` id: `{id}`"));
         }
 
-        Ok(lines.join("\n"))
+        lines.join("\n")
     }
 }
 
