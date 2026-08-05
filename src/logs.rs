@@ -99,7 +99,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_agent_id ON logs(agent_id);
 CREATE INDEX IF NOT EXISTS idx_logs_workspace ON logs(workspace);";
 
 impl LogStore {
-    /// Open (or create) the log database at `root/db/logs.db` and run schema migrations.
+    /// Open (or create) the log database at `root/db/logs.db`.
     ///
     /// `pub(crate)` (matching every other store's generated `open`) so tests in
     /// other modules can create a real log store via [`crate::open_test_store!`].

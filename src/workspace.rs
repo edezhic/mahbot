@@ -1063,64 +1063,19 @@ impl WorkspaceStore {
 }
 
 impl WorkspaceStore {
-    /// Post-open setup: run schema migrations for the workspaces table.
+    /// Post-open setup: reject legacy schemas.
+    ///
+    /// Checks only the `notes` canary; intermediate historical states missing
+    /// `diagnostics_generation`/`last_analyzed_commit` pass and fail later.
     async fn after_open(&self) -> anyhow::Result<()> {
-        run_workspace_migrations(&self.conn).await
-    }
-}
-
-/// (column, ddl) migrations applied when the column is missing.
-const MIGRATIONS: &[(&str, &str)] = &[
-    (
-        "notes",
-        "ALTER TABLE workspaces ADD COLUMN notes TEXT NOT NULL DEFAULT ''",
-    ),
-    // Used by the generation-guard mechanism to protect user-edited
-    // diagnostics from being overwritten by stale discovery tasks.
-    (
-        "diagnostics_generation",
-        "ALTER TABLE workspaces ADD COLUMN diagnostics_generation INTEGER NOT NULL DEFAULT 0",
-    ),
-    // Stores the git HEAD commit hash captured after the last successful
-    // discovery, used by the nightly re-analysis check to detect new commits.
-    // NULL for non-git workspaces or workspaces with no commits.
-    (
-        "last_analyzed_commit",
-        "ALTER TABLE workspaces ADD COLUMN last_analyzed_commit TEXT",
-    ),
-];
-
-/// Run schema migrations for the `workspaces` table.
-///
-/// Uses `PRAGMA table_info` existence checks for each expected column
-/// rather than `PRAGMA user_version` versioning. Each migration is
-/// idempotent — it only runs if the column is missing.
-async fn run_workspace_migrations(conn: &turso::Connection) -> anyhow::Result<()> {
-    let table_info = conn
-        .query("PRAGMA table_info('workspaces')", ())
-        .await
-        .context("Failed to read PRAGMA table_info for workspaces table")?;
-
-    for (column, ddl) in MIGRATIONS {
-        let has = table_info
-            .iter()
-            .any(|row| row.get::<String>(1).ok().as_deref() == Some(*column));
-
-        if !has {
-            tracing::info!("Schema migration: adding workspaces.{column} column");
-            conn.execute(ddl, ()).await.with_context(|| {
-                format!("Schema migration failed: unable to add workspaces.{column}")
-            })?;
-            conn.checkpoint().await.with_context(|| {
-                format!(
-                    "Schema migration failed: unable to checkpoint after adding workspaces.{column}"
-                )
-            })?;
-            tracing::info!("Schema migration complete: added workspaces.{column} column");
+        if !turso::column_exists(&self.conn, "workspaces", "notes").await? {
+            anyhow::bail!(
+                "workspaces.db has a legacy schema (workspaces.notes missing); migrations \
+                 were removed — restore a backup created by a current mahbot version"
+            );
         }
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// A single editor tab record for persistence.

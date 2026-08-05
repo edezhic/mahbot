@@ -612,108 +612,19 @@ pub(crate) enum LoadComments {
     No,
 }
 
-/// One-time schema migrations for backward compatibility.
-///
-/// These run only for databases created with older versions.
-/// Can be safely removed once all active databases have been migrated.
-#[allow(clippy::too_many_lines)] // linear sequence of versioned migration blocks
-async fn run_schema_migrations(conn: &turso::Connection) -> anyhow::Result<()> {
-    // ── schema migration: rename `status` column to `phase` ───────────
-    let current_version = turso::read_schema_version(conn).await?;
-
-    if current_version < 1 {
-        // Check whether the old `status` column still exists (migration needed).
-        let has_status_column = turso::column_exists(conn, "tickets", "status").await?;
-
-        if has_status_column {
-            info!("Schema migration: renaming tickets.status to tickets.phase");
-            conn.execute("ALTER TABLE tickets RENAME COLUMN status TO phase", ())
-                .await
-                .context(
-                    "Schema migration failed: unable to rename tickets.status to tickets.phase",
-                )?;
-            // ALTER TABLE auto-commits in SQLite/libSQL, so the rename is
-            // already persisted. Continue to update the schema version.
-        }
-
-        // PRAGMA user_version is NOT transaction-atomic in SQLite — set it
-        // after the ALTER TABLE (which has already auto-committed) to avoid
-        // a version-schema mismatch if a crash occurs between the two.
-        turso::bump_schema_version(conn, 1, "after renaming tickets.status").await?;
-
-        if has_status_column {
-            info!("Schema migration complete: tickets.status renamed to tickets.phase (version 1)");
-        }
-    }
-
-    // ── schema migration: add `priority` column ────────────────────
-    if current_version < 2 {
-        // Check whether the `priority` column already exists (idempotency).
-        let has_priority = turso::column_exists(conn, "tickets", "priority").await?;
-
-        if !has_priority {
-            info!("Schema migration: adding tickets.priority column");
-            conn.execute(
-                "ALTER TABLE tickets ADD COLUMN priority INTEGER NOT NULL DEFAULT 1",
-                (),
-            )
-            .await
-            .context("Schema migration failed: unable to add tickets.priority")?;
-        }
-
-        turso::bump_schema_version(conn, 2, "after adding tickets.priority").await?;
-
-        if !has_priority {
-            info!("Schema migration complete: added tickets.priority column (version 2)");
-        }
-    }
-
-    // ── schema migration: add reviewed-base columns ─────────────────
-    if current_version < 3 {
-        let table_info = conn
-            .query("PRAGMA table_info('tickets')", ())
-            .await
-            .context("Failed to read PRAGMA table_info for tickets table")?;
-
-        let col_names: Vec<String> = table_info
-            .iter()
-            .filter_map(|row| row.get::<String>(1).ok())
-            .collect();
-        let mut added = Vec::new();
-        for (col, ddl) in [
-            (
-                "reviewed_head",
-                "ALTER TABLE tickets ADD COLUMN reviewed_head TEXT",
-            ),
-            (
-                "reviewed_tree",
-                "ALTER TABLE tickets ADD COLUMN reviewed_tree TEXT",
-            ),
-        ] {
-            if !col_names.iter().any(|n| n == col) {
-                info!("Schema migration: adding tickets.{col} column");
-                conn.execute(ddl, ()).await.with_context(|| {
-                    format!("Schema migration failed: unable to add tickets.{col}")
-                })?;
-                added.push(col);
-            }
-        }
-
-        turso::bump_schema_version(conn, 3, "after adding reviewed-base columns").await?;
-
-        if !added.is_empty() {
-            info!("Schema migration complete: added {added:?} columns (version 3)");
-        }
-    }
-    Ok(())
-}
-
 impl BoardStore {
-    /// Post-open setup: run schema migrations, then create FTS index.
+    /// Post-open setup: reject legacy schemas, then create the FTS index.
     async fn after_open(&self) -> anyhow::Result<()> {
-        run_schema_migrations(&self.conn).await?;
+        // Legacy-format DBs (pre-migration) fail fast with an actionable error
+        // instead of failing later on no-such-column queries.
+        if turso::column_exists(&self.conn, "tickets", "status").await? {
+            anyhow::bail!(
+                "board.db has a legacy schema (tickets.status present); migrations \
+                 were removed — restore a backup created by a current mahbot version"
+            );
+        }
 
-        // ── FTS index setup (must run after migration) ────────────────────
+        // ── FTS index setup ────────────────────────────────────────────────
         crate::turso::ensure_fts_index(
             &self.conn,
             TICKETS_FTS_INDEX_NAME,
