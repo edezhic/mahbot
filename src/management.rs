@@ -862,9 +862,9 @@ where
 /// Run one poll round: claim actionable tickets and dispatch agents.
 ///
 /// Workspaces are processed concurrently via [`tokio::spawn`] so that a
-/// slow or panicking workspace does not delay others. Per-workspace steps
-/// within a single workspace remain serial (they share the same git tree and
-/// board-phase sequencing).
+/// slow or panicking workspace does not delay others. The five per-workspace
+/// steps are issued in order; safety comes from atomic claim transitions
+/// (per-ticket work runs in detached tasks, not serially).
 ///
 /// The five per-workspace steps (see [`process_single_workspace`]) are:
 ///
@@ -928,9 +928,9 @@ async fn poll_round() {
 
 /// Process all five pipeline steps for a single workspace.
 ///
-/// Steps are performed serially within the workspace because they share the
-/// same git working tree and board-phase sequencing (claims must be ordered).
-/// Across workspaces this function is called concurrently by [`poll_round`].
+/// Steps are issued in order because claims must be ordered and the git tree
+/// is shared; per-ticket work runs concurrently in detached tasks. Across
+/// workspaces this function is called concurrently by [`poll_round`].
 async fn process_single_workspace(ws: Workspace) {
     // 1. Pipeline claims — atomic source→target transitions
     run_claim_pipeline(&ws).await;
@@ -979,10 +979,7 @@ async fn process_single_workspace(ws: Workspace) {
     // Spawned via tokio::spawn (inside spawn_for_each_ticket_in_phase) to prevent
     // git operations from blocking the poll loop. The ticket stays in QaPassed
     // until either the claim or the commit succeeds, so re-dispatch is harmless.
-    spawn_for_each_ticket_in_phase(TicketPhase::QaPassed, &ws, |ticket, ws| {
-        handle_qa_passed(ticket, ws)
-    })
-    .await;
+    spawn_for_each_ticket_in_phase(TicketPhase::QaPassed, &ws, handle_qa_passed).await;
 
     // 5. SanitationCheck — handle_qa_passed (step 4) runs in spawned tasks concurrent
     //    with this step. It may: (a) claim QaPassed→InSanitation with assigned_to set,
@@ -2638,7 +2635,7 @@ async fn try_trip_circuit_breaker(
         // the poll loop's in-phase dispatchers (LoadComments::No) have an empty
         // vec — fetch from DB.
         match board().get_comments(&ticket.id).await {
-            Ok(c) => c,
+            Ok(c) => std::borrow::Cow::Owned(c),
             Err(e) => {
                 warn!(
                     ticket = %ticket.id,
@@ -2649,7 +2646,7 @@ async fn try_trip_circuit_breaker(
             }
         }
     } else {
-        ticket.comments.clone()
+        std::borrow::Cow::Borrowed(ticket.comments.as_slice())
     };
 
     let Some((count, max_count)) = kind.should_trip(&comments) else {

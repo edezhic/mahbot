@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
-use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::providers::plaintext_for_display;
@@ -118,7 +117,7 @@ impl Agent {
     ///
     /// Tools are derived from [`crate::Role`] via [`crate::Role::tools`].
     /// Automatically registers with [`crate::registry::AGENT_REGISTRY`] and creates an
-    /// internal [`CancellationToken`]. The agent is deregistered on [`Drop`].
+    /// internal [`tokio_util::sync::CancellationToken`]. The agent is deregistered on [`Drop`].
     #[must_use]
     pub fn new(
         agent_id: String,
@@ -215,13 +214,6 @@ impl Agent {
         }
 
         self.session.finalize(&self.agent_id).await
-    }
-
-    /// Return a clone of the cancellation token for external use
-    /// (e.g., `tokio::select!` racing, typing task ownership).
-    #[must_use]
-    pub fn cancel_token(&self) -> CancellationToken {
-        self.cancel_token.clone()
     }
 
     /// Check whether cancellation has been triggered on this agent.
