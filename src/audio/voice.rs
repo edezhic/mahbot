@@ -42,8 +42,6 @@ use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
-use std::fs::File;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -1341,12 +1339,10 @@ pub(crate) async fn prewarm_unrelated_embeddings() {
 const MEL_MODEL_FILENAME: &str = "melspectrogram.onnx";
 const MEL_MODEL_URL: &str =
     "https://huggingface.co/littlebearlabs/openwakeword-features/resolve/main/melspectrogram.onnx";
-const MEL_MODEL_SIZE: u64 = 1_090_000;
 
 const EMBED_MODEL_FILENAME: &str = "embedding_model.onnx";
 const EMBED_MODEL_URL: &str =
     "https://huggingface.co/littlebearlabs/openwakeword-features/resolve/main/embedding_model.onnx";
-const EMBED_MODEL_SIZE: u64 = 1_330_000;
 
 /// Subdirectory under `~/.mahbot/models/` for voice models.
 const MODEL_DIR_NAME: &str = "openwakeword";
@@ -2826,66 +2822,6 @@ fn is_mic_permission_error(err: &anyhow::Error) -> bool {
         || msg.to_lowercase().contains("access denied")
 }
 
-// Model download
-
-#[allow(clippy::cast_precision_loss)]
-async fn download_model(
-    url: &str,
-    path: &Path,
-    expected_size: u64,
-    expected_hash: &str,
-) -> Result<()> {
-    let response = reqwest::Client::new()
-        .get(url)
-        .timeout(MODEL_DOWNLOAD_TIMEOUT)
-        .send()
-        .await
-        .context("Failed to start model download")?;
-
-    let bytes = response
-        .bytes()
-        .await
-        .context("Failed to download model file")?;
-
-    if bytes.len() < 1000 {
-        anyhow::bail!("Downloaded model file is too small: {} bytes", bytes.len());
-    }
-
-    // Validate against expected size (allow 5% tolerance for minor variations)
-    let size = bytes.len() as u64;
-    let min_size = expected_size * 95 / 100;
-    let max_size = expected_size * 105 / 100;
-    if size < min_size || size > max_size {
-        anyhow::bail!(
-            "Downloaded model size mismatch: got {size} bytes, expected ~{expected_size} bytes",
-        );
-    }
-
-    let tmp_path = path.with_extension("tmp");
-    {
-        let mut file = File::create(&tmp_path)?;
-        file.write_all(&bytes)?;
-        file.flush()?;
-    }
-
-    // Verify hash BEFORE renaming to final path. If verification fails the
-    // .tmp file remains (it will be overwritten on retry) rather than leaving
-    // a corrupt file at the final path that passes the exists() check.
-    if !expected_hash.is_empty() {
-        crate::util::verify_sha256(&tmp_path, expected_hash)
-            .with_context(|| format!("SHA256 verification failed for {}", path.display()))?;
-    }
-
-    std::fs::rename(&tmp_path, path)?;
-
-    info!(
-        "Downloaded {} ({:.1} MB)",
-        path.display(),
-        bytes.len() as f64 / 1_048_576.0
-    );
-    Ok(())
-}
-
 // ── Voice PCM disk cache helpers ─────────────────────────────
 //
 // Cache bounding: two-phase eviction — age-based (stale entries
@@ -3401,11 +3337,18 @@ pub(crate) fn synthesize_with_pcm_cache(
 /// at most once per process.
 static PCM_EVICTION_RAN: AtomicBool = AtomicBool::new(false);
 
+#[allow(clippy::cast_precision_loss)]
 async fn ensure_models_downloaded() -> Result<PathBuf> {
     let dir = model_dir()
         .ok_or_else(|| anyhow!("Cannot resolve model directory (storage root not set)"))?;
 
     tokio::fs::create_dir_all(&dir).await?;
+
+    let client = reqwest::Client::builder()
+        .timeout(MODEL_DOWNLOAD_TIMEOUT)
+        .connect_timeout(Duration::from_secs(30))
+        .build()
+        .context("Failed to build HTTP client for model download")?;
 
     let mel_path = dir.join(MEL_MODEL_FILENAME);
     if mel_path.exists()
@@ -3416,7 +3359,22 @@ async fn ensure_models_downloaded() -> Result<PathBuf> {
     }
     if !mel_path.exists() {
         info!("Downloading mel spectrogram model...");
-        download_model(MEL_MODEL_URL, &mel_path, MEL_MODEL_SIZE, MEL_MODEL_SHA256).await?;
+        let mut size = 0u64;
+        crate::util::http::download_verified(
+            &client,
+            MEL_MODEL_URL,
+            &mel_path,
+            MEL_MODEL_SHA256,
+            Some(MODEL_DOWNLOAD_TIMEOUT),
+            crate::util::http::DownloadSizeCheck::Min(1000),
+            |downloaded, _| size = downloaded,
+        )
+        .await?;
+        info!(
+            "Downloaded {} ({:.1} MB)",
+            mel_path.display(),
+            size as f64 / 1_048_576.0
+        );
     }
 
     let embed_path = dir.join(EMBED_MODEL_FILENAME);
@@ -3428,13 +3386,22 @@ async fn ensure_models_downloaded() -> Result<PathBuf> {
     }
     if !embed_path.exists() {
         info!("Downloading embedding model...");
-        download_model(
+        let mut size = 0u64;
+        crate::util::http::download_verified(
+            &client,
             EMBED_MODEL_URL,
             &embed_path,
-            EMBED_MODEL_SIZE,
             EMBED_MODEL_SHA256,
+            Some(MODEL_DOWNLOAD_TIMEOUT),
+            crate::util::http::DownloadSizeCheck::Min(1000),
+            |downloaded, _| size = downloaded,
         )
         .await?;
+        info!(
+            "Downloaded {} ({:.1} MB)",
+            embed_path.display(),
+            size as f64 / 1_048_576.0
+        );
     }
 
     Ok(dir)
