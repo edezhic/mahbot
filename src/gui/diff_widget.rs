@@ -549,11 +549,8 @@ where
                 physical_key,
                 ..
             }) => {
-                #[cfg(target_os = "macos")]
-                let is_clipboard_mod = modifiers.command() && !modifiers.control();
-                #[cfg(not(target_os = "macos"))]
                 let is_clipboard_mod =
-                    (modifiers.command() || modifiers.control()) && !modifiers.alt();
+                    super::detect_keyboard_mods(*modifiers).is_text_platform_mod();
 
                 if is_clipboard_mod
                     && key_press.to_latin(*physical_key) == Some('c')
