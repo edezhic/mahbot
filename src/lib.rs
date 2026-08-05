@@ -1323,9 +1323,9 @@ pub(crate) trait Provider: Send + Sync {
     /// **Contract caveat**: this fallback does NOT honor the guarantees above
     /// (no provider-internal retries, idle-timeout / remaining-budget bounds).
     /// Any provider used by the scoped retry paths (verdict extraction /
-    /// analyst consolidation) MUST override this method;
-    /// [`crate::providers::compatible::OpenAiCompatibleProvider`] (via
-    /// `ReliableProvider`) and the test double do.
+    /// diagnostics discovery / analyst consolidation) MUST override this
+    /// method; [`crate::providers::compatible::OpenAiCompatibleProvider`]
+    /// (via `ReliableProvider`) and the test double do.
     async fn chat_scoped(
         &self,
         request: ChatRequest,

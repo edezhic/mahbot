@@ -1749,8 +1749,7 @@ fn raw_response_dump_section_covers_sanitation_shape() {
 #[test]
 fn engineer_failure_comment_classifies_causes() {
     // LLM retry exhaustion — provider/attempt/status detail preserved.
-    // The agent-loop marker ("exhausted retry budget") replaces the legacy
-    // ReliableProvider "All attempts failed" marker.
+    // Matched via the agent-loop marker ("exhausted retry budget").
     let err = "LLM step failed at iteration 3: LLM call exhausted retry budget: \
                12 attempt(s) failed (last: transport): OpenRouter API error (503): \
                Service is too busy";

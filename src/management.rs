@@ -1090,10 +1090,9 @@ fn engineer_failure_comment(shutdown: bool, cancelled: bool, error: Option<&str>
     };
     let detail = crate::util::scrub_credentials(detail);
     let detail = crate::util::truncate_sandwich(&detail, VERDICT_RAW_DUMP_CAP, "engineer failure");
-    // Matches the agent-loop exhaustion marker ("exhausted retry budget") and
-    // the legacy ReliableProvider marker ("All attempts failed") so retry
-    // exhaustion keeps its dedicated classification.
-    if detail.contains("exhausted retry budget") || detail.contains("All attempts failed") {
+    // Matches the agent-loop exhaustion marker ("exhausted retry budget") so
+    // retry exhaustion keeps its dedicated classification.
+    if detail.contains("exhausted retry budget") {
         format!("Engineer failed: LLM provider retry exhaustion.\n\n{detail}")
     } else {
         format!("Engineer failed.\n\n{detail}")

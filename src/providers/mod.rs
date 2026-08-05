@@ -2,7 +2,7 @@
 //!
 //! This module implements the factory pattern for AI model providers. Each provider
 //! implements the [`Provider`] trait. Currently only OpenAI-compatible providers
-//! are supported, wrapped with automatic retry logic.
+//! are supported; the outer retry orchestration lives in [`crate::retry`].
 
 pub(crate) mod compatible;
 pub(crate) mod reasoning;
@@ -351,21 +351,8 @@ pub(crate) fn image_transcriber() -> Option<ImageTranscriber> {
     IMAGE_TRANSCRIBER.read().unwrap_poison().clone()
 }
 
-/// Delegate `Provider` trait for the global static.
-///
-/// # Panics
-/// Panics if the provider has not been initialized.
-pub(crate) async fn chat(request: ChatRequest) -> anyhow::Result<ChatResponse> {
-    let provider = PROVIDER
-        .read()
-        .unwrap_poison()
-        .clone()
-        .expect("PROVIDER not initialized");
-    provider.chat(request).await
-}
-
 /// Single-attempt scoped chat for the outer retry loops — agent-loop LLM
-/// calls, verdict extraction, consolidation.
+/// calls, verdict extraction, diagnostics discovery, consolidation.
 ///
 /// Suppresses provider-internal retries (the outer loop is the single retry
 /// authority), applies idle-timeout semantics, and bounds the attempt by the
@@ -408,7 +395,8 @@ pub(crate) fn restore_provider_for_test(previous: Option<Arc<dyn Provider>>) {
 /// `provider_endpoint` overrides the base URL — the same headers are still sent (most
 /// providers ignore them harmlessly).
 ///
-/// Returns a reliable provider wrapping an [`OpenAiCompatibleProvider`].
+/// Returns a provider wrapping an [`OpenAiCompatibleProvider`]; retry
+/// orchestration lives in [`crate::retry`].
 #[allow(clippy::unnecessary_wraps)]
 pub(crate) fn create_provider(
     api_key: Option<&str>,
@@ -430,15 +418,7 @@ pub(crate) fn create_provider(
     let base = OpenAiCompatibleProvider::new("OpenRouter", base_url.as_str(), resolved_key)
         .with_extra_headers(extra_headers);
 
-    let provider: Box<dyn Provider> = Box::new(base);
-
-    let reliable: Box<dyn Provider> = Box::new(ReliableProvider::new(
-        "openrouter".to_string(),
-        provider,
-        4,
-        500,
-    ));
-    Ok(reliable)
+    Ok(Box::new(ReliableProvider::new(Box::new(base))))
 }
 
 /// Generic helper to build a transcriber from flat config options.

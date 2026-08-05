@@ -2,7 +2,6 @@ use super::Provider;
 use crate::util::error::HttpError;
 use crate::{ChatRequest, ChatResponse};
 use async_trait::async_trait;
-use std::time::Duration;
 
 // ── Error Classification ─────────────────────────────────────────────────
 // Errors are split into retryable (transient server/network failures) and
@@ -17,15 +16,6 @@ pub(crate) enum ErrorClass {
     /// A non-retryable client error (auth, invalid model, billing/quota exhausted,
     /// tool schema validation failure, etc.).
     NonRetryable,
-}
-
-impl ErrorClass {
-    pub(crate) const fn reason_label(self) -> &'static str {
-        match self {
-            Self::Retryable => "retryable",
-            Self::NonRetryable => "non_retryable",
-        }
-    }
 }
 
 /// Body-text hints that indicate the error is retryable even when other
@@ -138,48 +128,23 @@ pub(crate) fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
     None
 }
 
-// ── Resilient Provider Wrapper ────────────────────────────────────────────
-// Retry loop with exponential backoff, respecting Retry-After headers.
-// Loop invariant: `failures` accumulates every failed attempt so the final
-// error message gives operators a complete diagnostic trail.
+// ── Provider Wrapper ─────────────────────────────────────────────────────
+// Retry orchestration lives in crate::retry (the single retry authority);
+// this wrapper only forwards chat calls to the scoped single-attempt path.
 
-/// Provider wrapper with retry logic.
+/// Provider wrapper delegating chat to the scoped single-attempt path.
+///
+/// The outer retry loops in [`crate::retry`] are the single retry authority —
+/// this wrapper's `chat` is a thin passthrough to [`Self::chat_scoped`]
+/// required by the [`Provider`] trait, and does not retry.
 pub(crate) struct ReliableProvider {
-    name: String,
     provider: Box<dyn Provider>,
-    max_retries: u32,
-    base_backoff_ms: u64,
 }
 
 impl ReliableProvider {
     #[must_use]
-    pub fn new(
-        name: String,
-        provider: Box<dyn Provider>,
-        max_retries: u32,
-        base_backoff_ms: u64,
-    ) -> Self {
-        Self {
-            name,
-            provider,
-            max_retries,
-            base_backoff_ms: base_backoff_ms.max(50),
-        }
-    }
-
-    /// Compute backoff duration, respecting Retry-After if present.
-    /// When no Retry-After header exists, jitter is applied within
-    /// ±25% of base to prevent thundering herd when multiple agents
-    /// retry simultaneously on transient errors (5xx, timeouts, etc.).
-    pub(crate) fn compute_backoff(base: u64, err: &anyhow::Error) -> u64 {
-        if let Some(retry_after) = parse_retry_after_ms(err) {
-            // Retry-After is authoritative — follow it precisely,
-            // clamped to [base, RETRY_AFTER_MAX_MS] (unified with the
-            // scoped retry paths in src/retry.rs).
-            retry_after.min(crate::retry::RETRY_AFTER_MAX_MS).max(base)
-        } else {
-            crate::retry::jittered_backoff_ms(base)
-        }
+    pub fn new(provider: Box<dyn Provider>) -> Self {
+        Self { provider }
     }
 }
 
@@ -189,106 +154,20 @@ impl Provider for ReliableProvider {
         self.provider.warmup().await
     }
 
+    /// Thin passthrough to the scoped single-attempt path, required by the
+    /// [`Provider`] trait. Synthesizes the standard scoped timeouts; no
+    /// provider-internal retries — the outer loops in [`crate::retry`] are
+    /// the single retry authority.
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        let mut failures = Vec::new();
-        let mut backoff_ms = self.base_backoff_ms;
-
-        for attempt in 0..=self.max_retries {
-            match self.provider.chat(request.clone()).await {
-                Ok(resp) => {
-                    if attempt > 0 {
-                        tracing::info!(
-                            provider = self.name,
-                            attempt,
-                            "Provider recovered after retry"
-                        );
-                    }
-                    return Ok(resp);
-                }
-                Err(e) => {
-                    let class = classify_err(&e);
-                    let error_detail = e.to_string();
-                    let reason = class.reason_label();
-
-                    failures.push(format!(
-                        "provider={} attempt {}/{}: {}; error={}",
-                        self.name,
-                        attempt + 1,
-                        self.max_retries + 1,
-                        reason,
-                        error_detail,
-                    ));
-
-                    let can_retry = class == ErrorClass::Retryable;
-
-                    // When a 429 body doesn't match any known non-retryable
-                    // hint, classify_err falls through to Retryable silently.
-                    // Log the body at debug so operators can detect provider-side
-                    // error-format changes (e.g., "quota_exhausted" → "credit_limit_reached").
-                    if can_retry
-                        && let Some(http_err) = e.downcast_ref::<HttpError>()
-                        && http_err.status == 429
-                    {
-                        tracing::debug!(
-                            provider = self.name,
-                            status = http_err.status,
-                            body = %http_err.body,
-                            "HTTP 429 body did not match any non-retryable \
-                             hint — treating as retryable"
-                        );
-                    }
-
-                    if can_retry && attempt < self.max_retries {
-                        let wait = Self::compute_backoff(backoff_ms, &e);
-
-                        // sleep_or_shutdown returns false immediately if the
-                        // global shutdown token is already cancelled, or when
-                        // it fires during sleep — no separate pre-check needed.
-                        if !crate::shutdown::sleep_or_shutdown(Duration::from_millis(wait)).await {
-                            tracing::info!(
-                                provider = self.name,
-                                attempt = attempt + 1,
-                                "Provider shutting down — aborting retry loop"
-                            );
-                            break;
-                        }
-
-                        tracing::warn!(
-                            provider = self.name,
-                            attempt = attempt + 1,
-                            reason,
-                            error = %error_detail,
-                            "Provider call failed, retrying"
-                        );
-                        // Doubling is capped at the unified 60 s backoff cap
-                        // (same value as the scoped paths' default max backoff).
-                        backoff_ms = backoff_ms
-                            .saturating_mul(2)
-                            .min(crate::retry::DEFAULT_RETRY_MAX_BACKOFF_MS);
-                    } else {
-                        let log_msg = match class {
-                            ErrorClass::NonRetryable => "Non-retryable error, aborting",
-                            ErrorClass::Retryable => "Exhausted retries",
-                        };
-                        tracing::warn!(
-                            provider = self.name,
-                            attempt = attempt + 1,
-                            reason,
-                            error = %error_detail,
-                            "{log_msg}"
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-
-        anyhow::bail!("All attempts failed.\n{}", failures.join("\n"))
+        let deadline = std::time::Instant::now() + crate::retry::DEFAULT_OPERATION_TIMEOUT;
+        self.chat_scoped(request, crate::retry::DEFAULT_IDLE_TIMEOUT, deadline)
+            .await
+            .map_err(|e| e.inner)
     }
 
-    /// Scoped single-attempt chat: delegates to the inner
-    /// provider, bypassing this wrapper's retry loop — the outer retry loops
-    /// in [`crate::retry`] are the single retry authority for scoped calls.
+    /// Scoped single-attempt chat: delegates to the inner provider. The outer
+    /// retry loops in [`crate::retry`] are the single retry authority for
+    /// scoped calls.
     async fn chat_scoped(
         &self,
         request: ChatRequest,
@@ -304,10 +183,6 @@ impl Provider for ReliableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ChatMessage;
-    use crate::providers::test_request;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Wrapper around [`HttpError::new`] that sets context="test" and
     /// retry_after=None, reducing boilerplate in error-classification tests.
@@ -315,124 +190,28 @@ mod tests {
         anyhow::Error::from(HttpError::new(status, "test", body, None))
     }
 
-    /// Unified test mock. Covers all failure modes: simple retry gating,
-    /// model-specific failures, context overflow, upstream rate limits with
-    /// embedded billing codes, and native tool calls.
+    /// Test double for warmup propagation tests.
     struct TestProvider {
-        calls: Arc<AtomicUsize>,
-        fail_until_attempt: usize,
-        response_text: &'static str,
-        error: &'static str,
-        context_overflow: bool,
-        tool_schema_error: bool,
-        /// When true, returns an HTTP 429 whose body mimics an OpenRouter proxy
-        /// forwarding a transient upstream rate limit — the body contains both
-        /// a retryable override signal ("temporarily rate-limited") and a
-        /// non-retryable hint ("insufficient_quota") in metadata, which
-        /// exercises the RETRYABLE_OVERRIDES classifier logic.
-        upstream_rate_limit: bool,
-        tool_calls: Vec<crate::ToolCall>,
         warmup_fails: bool,
     }
 
     impl TestProvider {
-        fn new(response_text: &'static str) -> Self {
+        fn new() -> Self {
             Self {
-                calls: Arc::new(AtomicUsize::new(0)),
-                fail_until_attempt: 0,
-                response_text,
-                error: "mock error",
-                context_overflow: false,
-                tool_schema_error: false,
-                upstream_rate_limit: false,
-                tool_calls: Vec::new(),
                 warmup_fails: false,
             }
-        }
-
-        fn with_fail(mut self, until_attempt: usize, error: &'static str) -> Self {
-            self.fail_until_attempt = until_attempt;
-            self.error = error;
-            self
-        }
-
-        fn with_context_overflow(mut self, fail_until: usize) -> Self {
-            self.context_overflow = true;
-            self.fail_until_attempt = fail_until;
-            self
-        }
-
-        fn with_tool_schema_error(mut self, fail_until: usize) -> Self {
-            self.tool_schema_error = true;
-            self.fail_until_attempt = fail_until;
-            self
-        }
-
-        fn with_upstream_rate_limit(mut self, fail_until: usize) -> Self {
-            self.upstream_rate_limit = true;
-            self.fail_until_attempt = fail_until;
-            self
-        }
-
-        fn with_calls(mut self, calls: Arc<AtomicUsize>) -> Self {
-            self.calls = calls;
-            self
         }
 
         fn with_warmup_fail(mut self) -> Self {
             self.warmup_fails = true;
             self
         }
-
-        fn make_error(&self) -> String {
-            if self.context_overflow {
-                "request (8968 tokens) exceeds the available context size (8448 tokens), try increasing it".to_string()
-            } else if self.tool_schema_error {
-                "tool call validation failed: attempted to call tool 'recall' which was not in request".to_string()
-            } else if self.upstream_rate_limit {
-                // Simulate OpenRouter forwarding a transient upstream rate limit.
-                // The body contains both a retryable override signal
-                // ("temporarily rate-limited") and a non-retryable billing hint
-                // ("insufficient_quota" in metadata.provider_error_code).
-                r#"{"error":{"code":429,"message":"Provider returned error","metadata":{"provider_name":"Qwen","provider_error_code":"insufficient_quota","raw":"upstream error: temporarily rate-limited upstream, please retry"}}}"#.to_string()
-            } else {
-                self.error.to_string()
-            }
-        }
-
-        fn check_fail(&self, attempt: usize) -> bool {
-            attempt <= self.fail_until_attempt
-        }
     }
 
     #[async_trait]
     impl Provider for TestProvider {
         async fn chat(&self, _request: ChatRequest) -> anyhow::Result<ChatResponse> {
-            let call = self.calls.fetch_add(1, Ordering::SeqCst);
-
-            if self.check_fail(call + 1) {
-                // Context-overflow and tool-schema errors reach classify_err
-                // via HttpError with status 400, so they are correctly classified
-                // as NonRetryable by the status-code check (step 3).
-                if self.context_overflow {
-                    return Err(test_err(400, &self.make_error()));
-                }
-                if self.tool_schema_error {
-                    return Err(test_err(400, &self.make_error()));
-                }
-                // Upstream rate-limit errors reach classify_err via HttpError
-                // with status 429, exercising the RETRYABLE_OVERRIDES logic.
-                if self.upstream_rate_limit {
-                    return Err(test_err(429, &self.make_error()));
-                }
-                anyhow::bail!("{}", self.make_error());
-            }
-
-            Ok(ChatResponse {
-                text: Some(self.response_text.to_string()),
-                tool_calls: self.tool_calls.clone(),
-                ..Default::default()
-            })
+            Ok(ChatResponse::default())
         }
 
         async fn warmup(&self) -> anyhow::Result<()> {
@@ -470,34 +249,10 @@ mod tests {
         )));
     }
 
-    #[tokio::test]
-    async fn chat_retries_then_recovers() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = ReliableProvider::new(
-            "primary".into(),
-            Box::new(
-                TestProvider::new("history ok")
-                    .with_fail(1, "temporary")
-                    .with_calls(calls.clone()),
-            ) as Box<dyn Provider>,
-            2,
-            50,
-        );
-
-        let messages = vec![ChatMessage::system("system"), ChatMessage::user("hello")];
-        let result = provider
-            .chat(test_request(messages.clone(), None))
-            .await
-            .unwrap();
-        assert_eq!(result.text.as_deref(), Some("history ok"));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
     // ── Retry-After parsing ──
 
     #[test]
-    fn backoff_and_retry_after() {
-        // ── parse_retry_after_ms unit tests ──
+    fn parse_retry_after_ms_extracts_typed_value() {
         let with_retry = HttpError::new(429, "test", "rate limited", Some(5000));
         assert_eq!(
             parse_retry_after_ms(&anyhow::Error::from(with_retry)),
@@ -506,27 +261,6 @@ mod tests {
 
         let no_retry = test_err(429, "rate limit");
         assert_eq!(parse_retry_after_ms(&no_retry), None);
-
-        // ── compute_backoff: respects retry-after ──
-        let structured =
-            anyhow::Error::from(HttpError::new(429, "test", "rate limited", Some(3_000)));
-        assert_eq!(ReliableProvider::compute_backoff(500, &structured), 3_000);
-
-        // ── compute_backoff: clamps retry-after to MAX_BACKOFF (60s) ──
-        let with_long_retry =
-            anyhow::Error::from(HttpError::new(429, "test", "rate limit", Some(120_000)));
-        assert_eq!(
-            ReliableProvider::compute_backoff(500, &with_long_retry),
-            60_000
-        );
-
-        // ── compute_backoff: jittered fallback when no retry-after ──
-        let no_header = test_err(500, "error");
-        let backoff = ReliableProvider::compute_backoff(500, &no_header);
-        assert!(
-            (375..625).contains(&backoff),
-            "expected backoff in [375, 625), got {backoff}"
-        );
     }
 
     #[test]
@@ -570,33 +304,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_returns_aggregated_error_when_all_retries_exhausted() {
-        let provider = ReliableProvider::new(
-            "p1".into(),
-            Box::new(TestProvider::new("never").with_fail(usize::MAX, "p1 chat error"))
-                as Box<dyn Provider>,
-            0,
-            1,
-        );
-
-        let messages = vec![ChatMessage::user("hello")];
-        let request = test_request(messages.clone(), None);
-        let err = provider
-            .chat(request)
-            .await
-            .expect_err("all attempts should fail");
-        let msg = err.to_string();
-        assert!(msg.contains("All attempts failed"));
-        assert!(msg.contains("provider=p1"));
-        assert!(msg.contains("error=p1 chat error"));
-        assert!(msg.contains("retryable"));
-    }
-
-    #[tokio::test]
     async fn warmup_propagates_inner_error() {
-        let inner = TestProvider::new("unused").with_warmup_fail();
-        let provider =
-            ReliableProvider::new("test".into(), Box::new(inner) as Box<dyn Provider>, 0, 1);
+        let inner = TestProvider::new().with_warmup_fail();
+        let provider = ReliableProvider::new(Box::new(inner) as Box<dyn Provider>);
         let err = provider
             .warmup()
             .await
@@ -609,9 +319,8 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_ok_when_inner_succeeds() {
-        let inner = TestProvider::new("ok");
-        let provider =
-            ReliableProvider::new("test".into(), Box::new(inner) as Box<dyn Provider>, 0, 1);
+        let inner = TestProvider::new();
+        let provider = ReliableProvider::new(Box::new(inner) as Box<dyn Provider>);
         provider.warmup().await.expect("warmup should succeed");
     }
 
@@ -636,33 +345,6 @@ mod tests {
         )));
         // 4xx errors are still non-retryable via status code
         assert!(is_non_retryable(&test_err(401, "Unauthorized")));
-    }
-
-    #[tokio::test]
-    async fn chat_context_window_exceeded_is_not_retried() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = ReliableProvider::new(
-            "primary".into(),
-            Box::new(
-                TestProvider::new("ok after overflow")
-                    .with_context_overflow(2)
-                    .with_calls(calls.clone()),
-            ) as Box<dyn Provider>,
-            3,
-            1,
-        );
-
-        let messages = vec![ChatMessage::user("test")];
-        let result = provider.chat(test_request(messages.clone(), None)).await;
-        assert!(
-            result.is_err(),
-            "context window errors are non-retryable, should fail immediately"
-        );
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "should not retry context overflow"
-        );
     }
 
     // ── Tool schema error detection tests ───────────────────────────────
@@ -768,37 +450,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn chat_upstream_rate_limit_is_retried() {
-        // Integration test: a provider returning HTTP 429 with both
-        // "insufficient_quota" (in metadata) and "temporarily rate-limited"
-        // (in raw upstream text) must be retried, not aborted at attempt 1.
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = ReliableProvider::new(
-            "primary".into(),
-            Box::new(
-                TestProvider::new("ok after upstream rate limit")
-                    .with_upstream_rate_limit(1)
-                    .with_calls(calls.clone()),
-            ) as Box<dyn Provider>,
-            2,
-            1,
-        );
-
-        let messages = vec![ChatMessage::user("test")];
-        let result = provider.chat(test_request(messages.clone(), None)).await;
-        assert!(
-            result.is_ok(),
-            "upstream rate-limit 429 with retryable override should recover after retry"
-        );
-        assert_eq!(
-            result.unwrap().text.as_deref(),
-            Some("ok after upstream rate limit"),
-        );
-        // Should have failed once (upstream rate limit) then recovered
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
     #[test]
     fn retryable_overrides_do_not_affect_non_429() {
         // Retryable override signals in non-429/5xx contexts must not change
@@ -808,33 +459,6 @@ mod tests {
         assert!(
             matches!(classify_err(&err), ErrorClass::NonRetryable),
             "400 with override text should still be NonRetryable"
-        );
-    }
-
-    #[tokio::test]
-    async fn chat_tool_schema_error_is_not_retried() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = ReliableProvider::new(
-            "primary".into(),
-            Box::new(
-                TestProvider::new("unused")
-                    .with_tool_schema_error(10)
-                    .with_calls(calls.clone()),
-            ) as Box<dyn Provider>,
-            3,
-            1,
-        );
-
-        let messages = vec![ChatMessage::user("test")];
-        let result = provider.chat(test_request(messages.clone(), None)).await;
-        assert!(
-            result.is_err(),
-            "tool schema errors are non-retryable, should fail immediately"
-        );
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "should not retry tool schema errors"
         );
     }
 }

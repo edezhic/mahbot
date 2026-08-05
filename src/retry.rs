@@ -1,12 +1,14 @@
 //! Outer retry orchestration for LLM operations.
 //!
-//! Three expensive code paths use this module:
+//! Four expensive code paths use this module:
 //!
 //! 1. **Agent-loop LLM calls** — every chat call an agent makes while working
 //!    (`src/agent.rs`).
 //! 2. **Verdict extraction** — structured pass/fail verdicts from Analyst /
 //!    Reviewer / QA / Sanitation agents (`src/extraction.rs`).
-//! 3. **Analyst consolidation** — the synthesis of the 3 parallel analyst
+//! 3. **Diagnostics discovery** — workspace diagnostics command extraction
+//!    (`src/workspace.rs`).
+//! 4. **Analyst consolidation** — the synthesis of the 3 parallel analyst
 //!    reports in the ask tool (`src/tools/ask.rs`).
 //!
 //! # Single retry authority
@@ -14,7 +16,8 @@
 //! The outer loop in this module is the **single retry authority**: on these
 //! calls provider-internal retries are suppressed (see [`Provider::chat_scoped`]),
 //! so total provider HTTP calls per operation are explicitly bounded:
-//! 13 per agent LLM call, 13 per verdict extraction, 13 per consolidation.
+//! 13 per agent LLM call, 13 per verdict extraction, 13 per diagnostics
+//! discovery, 13 per consolidation.
 //!
 //! # Byte-identical retry parameters
 //!
@@ -71,8 +74,8 @@ pub(crate) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Lower clamp for Retry-After honoring.
 const RETRY_AFTER_MIN_MS: u64 = 5_000;
-/// Upper clamp for Retry-After honoring — unified at 60 s across the agent
-/// loop and the scoped paths (ReliableProvider's legacy chat path uses it too).
+/// Upper clamp for Retry-After honoring — unified at 60 s across all scoped
+/// retry paths.
 pub(crate) const RETRY_AFTER_MAX_MS: u64 = 60_000;
 
 // ── RetryPolicy — snapshot of tunables at operation start ────────────────
@@ -924,8 +927,7 @@ mod tests {
     async fn agent_chat_rides_out_sustained_outage_and_recovers() {
         let _guard = crate::util::test::retry_tests_lock();
         // The binding agent-loop budget (13 attempts): the first 12 attempts
-        // hit a sustained 503-style outage, the 13th recovers. The old
-        // ReliableProvider budget (5 attempts) would have died at attempt 5.
+        // hit a sustained 503-style outage, the 13th recovers.
         let policy = RetryPolicy {
             max_attempts: 13,
             base_backoff_ms: 1,

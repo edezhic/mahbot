@@ -716,7 +716,7 @@ impl Agent {
     /// during the original agent call.  Any deviation (including dropping
     /// tools) forces the provider to recompute the entire KV-cache prefix.
     ///
-    /// [`Self::extract_structured`] calls this method internally to derive its
+    /// [`Self::extract_verdict`] calls this method internally to derive its
     /// parameter set.  [`Self::summarize`] calls this method directly.
     fn build_chat_request(
         &self,
@@ -741,38 +741,16 @@ impl Agent {
 
     // ── Extraction / summarisation ──
 
-    /// Extract a structured `T` from the agent's session history.
-    ///
-    /// KV-cache requirements: uses the same parameter sources as
-    /// [`Self::build_chat_request`] (model, temperature, reasoning_effort,
-    /// tools, provider routing), obtained by calling that method and passing
-    /// the resulting [`ChatRequest`] to
-    /// [`crate::extraction::retry_extract_structured`].
-    pub(crate) async fn extract_structured<T: serde::de::DeserializeOwned>(
-        &self,
-        extraction_prompt: &str,
-        max_attempts: usize,
-    ) -> anyhow::Result<T> {
-        // Build a params-only ChatRequest (messages will be substituted by
-        // retry_extract_structured with the extraction history).
-        let params = self.build_chat_request(vec![], false);
-        crate::extraction::retry_extract_structured(
-            self.session.history(),
-            extraction_prompt,
-            &params,
-            max_attempts,
-        )
-        .await
-    }
-
     /// Extract a structured verdict with the hardened scoped retry loop.
     ///
-    /// KV-cache requirements: identical to [`Self::extract_structured`] — the
-    /// params come from [`Self::build_chat_request`] so all attempts are
-    /// byte-identical except the parse-failure re-prompt.
+    /// KV-cache requirements: the params come from [`Self::build_chat_request`]
+    /// (model, temperature, reasoning_effort, tools, provider routing) so all
+    /// attempts are byte-identical except the parse-failure re-prompt.
     ///
     /// `validate` runs fail-closed on the parsed value (e.g. score ∈ [0,10]):
     /// a rejected value is treated as a parse failure and re-prompted.
+    /// Pass `validate = None` for plain structured extraction (diagnostics
+    /// discovery).
     pub(crate) async fn extract_verdict<T: serde::de::DeserializeOwned>(
         &self,
         extraction_prompt: &str,

@@ -226,7 +226,8 @@ async fn run_workspace_discovery(
 ///
 /// Runs a Discovery agent (using `Role::Discovery`'s tools: shell, read, search)
 /// to scan build files and identify commands for format, lint, type-check, build,
-/// and unit-test categories. Extracts structured output via [`crate::extraction::retry_extract_structured`].
+/// and unit-test categories. Extracts structured output via the agent's scoped
+/// extraction ([`crate::agent::Agent::extract_verdict`] with no validation).
 ///
 /// `diagnostics_generation` guards against stale writes — if a newer
 /// [`WorkspaceStore::rediscover_diagnostics`] or [`WorkspaceStore::set_diagnostics`]
@@ -259,15 +260,19 @@ async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) 
     .await;
     response.context("Diagnostics discovery agent returned no response (cancelled or failed)")?;
 
-    // Keep the Agent alive after run_agent() for retry_extract_structured —
+    // Keep the Agent alive after run_agent() for extract_verdict —
     // it needs agent.session.history() and agent.tool_specs.
     let extraction_prompt = crate::prompt::load_prompt("extraction/diagnostics.md");
 
-    // KV-cache preservation: `agent.extract_structured` uses the agent's own
+    // KV-cache preservation: `agent.extract_verdict` uses the agent's own
     // parameters (model, temperature, reasoning_effort, tools, provider routing)
     // so the extraction call is byte-identical to the original Discovery agent
-    // call — the provider can reuse the cached prefix.
-    let cmds: crate::DiagnosticsCommands = agent.extract_structured(&extraction_prompt, 3).await?;
+    // call — the provider can reuse the cached prefix. Retry exhaustion
+    // (RetryExhausted) surfaces the scoped loop's failure trail.
+    let cmds: crate::DiagnosticsCommands = agent
+        .extract_verdict(&extraction_prompt, None)
+        .await
+        .map_err(anyhow::Error::from)?;
 
     // Guard against stale writes.
     if !check_generation(
