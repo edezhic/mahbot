@@ -688,11 +688,8 @@ async fn retry_chat_with(
             }
         }
 
-        if let Err(class) = loop_state.sleep_between(attempt).await {
-            return Err(match class {
-                FailureClass::Shutdown => RetryExhausted::shutdown(loop_state.into_failures()),
-                _ => RetryExhausted::wall_clock(loop_state.into_failures()),
-            });
+        if let Err(FailureClass::Shutdown) = loop_state.sleep_between(attempt).await {
+            return Err(RetryExhausted::shutdown(loop_state.into_failures()));
         }
     }
 

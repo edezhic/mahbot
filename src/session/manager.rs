@@ -98,7 +98,7 @@ impl Session {
                 // (see doc comment above). The session DB caches the full
                 // first-turn message set. The only rebuild path is
                 // `apply_summary` below.
-                let user_msg = user_msg_with_datetime(msg);
+                let user_msg = crate::session::user_msg_with_datetime(msg);
                 // Append the user message and update session context atomically.
                 crate::session::store()
                     .append_with_context(
@@ -174,7 +174,7 @@ impl Session {
         let prefix = load_prompt("summary_prefix.md");
         compacted.push(ChatMessage::system(format!("{prefix}{summary_text}")));
         if !msg.is_empty() {
-            compacted.push(user_msg_with_datetime(msg));
+            compacted.push(crate::session::user_msg_with_datetime(msg));
         }
 
         // Persist compacted history (system prompt + summary only).
@@ -315,7 +315,7 @@ impl Session {
         ticket: Option<&crate::board::Ticket>,
     ) -> Vec<ChatMessage> {
         let mut msgs = Self::build_context_messages(ws, role, ticket).await;
-        msgs.push(user_msg_with_datetime(msg));
+        msgs.push(crate::session::user_msg_with_datetime(msg));
         msgs
     }
 }
@@ -333,7 +333,7 @@ async fn build_board_context(ws: &Workspace, role: &Role) -> Option<String> {
     let tickets = board.list_all_tickets(Some(&ws.name), None).await.ok()?;
     let active: Vec<_> = tickets
         .into_iter()
-        .filter(|t| !t.is_archived && !t.phase.is_unblocking())
+        .filter(|t| !t.phase.is_unblocking())
         .collect();
     if active.is_empty() {
         return None;
@@ -354,15 +354,4 @@ async fn build_board_context(ws: &Workspace, role: &Role) -> Option<String> {
 async fn lookup_workspace_context(ws: &Workspace, role: &Role) -> Option<String> {
     let workspaces = crate::workspace::store();
     workspaces.get_context(&ws.name, role.as_str()).await.ok()?
-}
-
-/// Build a user message with the current datetime prepended.
-fn user_msg_with_datetime(content: &str) -> ChatMessage {
-    let now = chrono::Local::now();
-    ChatMessage::user(format!(
-        "<timestamp>{} ({})</timestamp>\n\n{}",
-        now.format("%Y-%m-%d %H:%M:%S"),
-        now.format("%Z"),
-        content
-    ))
 }

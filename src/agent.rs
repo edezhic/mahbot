@@ -648,13 +648,7 @@ impl Agent {
                         }
                         _ => job.content,
                     };
-                    let now = chrono::Local::now();
-                    messages.push(crate::ChatMessage::user(format!(
-                        "<timestamp>{} ({})</timestamp>\n\n{}",
-                        now.format("%Y-%m-%d %H:%M:%S"),
-                        now.format("%Z"),
-                        content,
-                    )));
+                    messages.push(crate::session::user_msg_with_datetime(&content));
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {

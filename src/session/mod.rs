@@ -45,6 +45,18 @@ pub(crate) fn estimate_tokens(messages: &[ChatMessage]) -> usize {
         .sum()
 }
 
+/// Build a user message with the current datetime prepended.
+#[must_use]
+pub(crate) fn user_msg_with_datetime(content: &str) -> ChatMessage {
+    let now = chrono::Local::now();
+    ChatMessage::user(format!(
+        "<timestamp>{} ({})</timestamp>\n\n{}",
+        now.format("%Y-%m-%d %H:%M:%S"),
+        now.format("%Z"),
+        content
+    ))
+}
+
 crate::define_store! {
     /// Global session store.
     pub(crate) static SESSIONS: SessionStore,
