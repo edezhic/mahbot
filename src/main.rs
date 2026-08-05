@@ -13,10 +13,10 @@ use std::borrow::Cow;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use mahbot::channels::broadcast_and_persist_incoming_message;
 use mahbot::channels::telegram::{
     CLEAR_COMMAND_DESC, MODELS_COMMAND_DESC, decode_action, decode_callback,
 };
-use mahbot::channels::{broadcast_and_persist_incoming_message, send_channel_reply};
 use mahbot::config::CONFIG;
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
 use mahbot::message_router;
@@ -56,6 +56,17 @@ async fn resolve_workspace_for_user(msg: &ChannelMessage) -> Workspace {
 fn personal_workspace(msg: &ChannelMessage) -> Workspace {
     let path = mahbot::users::personal_workspace_path(&msg.user_name);
     mahbot::users::personal_workspace_struct(&msg.user_name, &path)
+}
+
+/// Personal workspaces do not support the Manager agent — no board pipeline,
+/// no maintainer. If the role is Manager and we're in a personal workspace,
+/// fall back to Analyst.
+fn resolve_effective_role(role: Role, ws_name: &str) -> Role {
+    if role == Role::Manager && mahbot::users::is_personal_workspace(ws_name) {
+        Role::Analyst
+    } else {
+        role
+    }
 }
 
 /// Handle a dynamic option callback (prefixed `__opt__`).
@@ -607,7 +618,7 @@ async fn handle_bot_command(msg: &ChannelMessage) -> bool {
 
     match cmd {
         BotCommand::Start => handle_start_command(msg).await,
-        BotCommand::Clear => handle_clear_command(msg).await,
+        BotCommand::Clear => handle_clear_session(msg).await,
         BotCommand::Models => handle_models_command(msg).await,
     }
     true
@@ -632,14 +643,36 @@ async fn handle_start_command(msg: &ChannelMessage) {
     }
 }
 
-/// Handle `/clear` command for Telegram — deletes the current session.
-async fn handle_clear_command(msg: &ChannelMessage) {
+/// Handle session clearing for `/clear` and the "Clear session" inline button —
+/// deletes the current session and confirms via the canonical delivery path.
+async fn handle_clear_session(msg: &ChannelMessage) {
     let (ws, role) = tokio::join!(
         resolve_workspace_for_user(msg),
         mahbot::users::resolve_active_role(&msg.user_name),
     );
     let reply = clear_session(&msg.channel, &msg.user_name, role.as_str(), &ws.name).await;
-    send_channel_reply(reply, msg, None).await;
+    deliver_clear_reply(&reply, msg, &ws, role).await;
+}
+
+/// Deliver a session-clear confirmation via the router's raw `reply_target`
+/// path (broadcast + persist + transport), attributing it to the user's
+/// effective role so the bubble matches agent responses.
+async fn deliver_clear_reply(reply: &str, msg: &ChannelMessage, ws: &Workspace, role: Role) {
+    let effective_role = resolve_effective_role(role, &ws.name);
+    message_router::deliver_unregistered_user_response(
+        reply,
+        &message_router::AgentJob {
+            content: reply.to_string(),
+            workspace_name: ws.name.clone(),
+            user_name: msg.user_name.clone(),
+            channel: msg.channel.clone(),
+            kind: message_router::JobKind::UserMessage,
+            role: effective_role,
+            reply_target: Some(msg.reply_target.clone()),
+        },
+        &effective_role,
+    )
+    .await;
 }
 
 /// Handle `/models` command for Telegram — shows model selection keyboard
@@ -652,8 +685,8 @@ async fn handle_models_command(msg: &ChannelMessage) {
         reply_markup: Some(reply_markup),
     };
     // Send directly through the channel so the inline_keyboard structure
-    // (rows of buttons) is preserved exactly — send_channel_reply does not
-    // support inline keyboards, so this path bypasses it for multi-row
+    // (rows of buttons) is preserved exactly — the router delivery path
+    // has no inline-keyboard support, so this bypasses it for multi-row
     // replies like the /models menu.
     if let Some(channel) = mahbot::channel_registry().get(&msg.channel) {
         let _ = channel.send(&reply).await;
@@ -742,14 +775,7 @@ async fn handle_action_callback(msg: ChannelMessage) {
         "clear_session" => {
             // Acknowledge callback silently first (dismiss spinner)
             answer_telegram_callback(&msg, None).await;
-
-            // Resolve workspace and role in parallel, then reset session
-            let (ws, role) = tokio::join!(
-                resolve_workspace_for_user(&msg),
-                mahbot::users::resolve_active_role(&msg.user_name),
-            );
-            let reply = clear_session(&msg.channel, &msg.user_name, role.as_str(), &ws.name).await;
-            send_channel_reply(reply, &msg, None).await;
+            handle_clear_session(&msg).await;
         }
         _ => {
             // Always acknowledge callback queries to dismiss the Telegram
@@ -823,20 +849,10 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     );
 
     // Populate workspace on the message so downstream broadcasts and
-    // chat_history writes carry the correct workspace (non-Manager agent
-    // responses go through send_channel_reply, which reads
-    // msg.workspace for broadcast filtering).
+    // chat_history writes carry the correct workspace.
     msg.workspace = ws.name.clone();
 
-    // Personal workspaces do not support the Manager agent — no board
-    // pipeline, no maintainer. If the role is Manager and we're in a
-    // personal workspace, fall back to Analyst.
-    let effective_role = if role == Role::Manager && mahbot::users::is_personal_workspace(&ws.name)
-    {
-        Role::Analyst
-    } else {
-        role
-    };
+    let effective_role = resolve_effective_role(role, &ws.name);
 
     // Save original content before enrichment so we persist the raw
     // user-typed text to chat_history (avoids storing large data URIs from

@@ -7,7 +7,7 @@ pub use telegram::mirror_gui_message_to_telegram;
 
 use crate::chat_history::ChatHistoryInsert;
 use crate::turso;
-use crate::{ChannelMessage, ChatDirection, SendMessage};
+use crate::{ChannelMessage, ChatDirection};
 use tokio_util::sync::CancellationToken;
 
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
@@ -80,9 +80,8 @@ impl BroadcastPersistEntry {
 
 /// Broadcast an agent response to CHAT_BROADCAST for live GUI display and
 /// persist it to chat_history. This is the canonical entry point for all
-/// agent responses — both the non-Manager path
-/// ([`send_channel_reply`]) and the per-agent consumer loop
-/// in [`crate::message_router`].
+/// agent responses — used by the per-agent consumer loop in
+/// [`crate::message_router`] and by the raw reply-target delivery path.
 ///
 /// TTS audio playback is handled separately by [`crate::audio::tts::init_listener()`],
 /// which subscribes to [`CHAT_BROADCAST`](crate::CHAT_BROADCAST) and triggers
@@ -90,7 +89,7 @@ impl BroadcastPersistEntry {
 /// any TTS logic.
 ///
 /// Takes explicit `user_name` (canonical user name), `channel` (e.g. "telegram", "gui"),
-/// and primitive fields — does **not** depend on [`SendMessage`], so it can be used
+/// and primitive fields — does **not** depend on [`crate::SendMessage`], so it can be used
 /// from the per-agent consumer loop which works from [`crate::users::UserRecord`].
 pub(crate) async fn broadcast_and_persist_agent_response(
     user_name: &str,
@@ -225,39 +224,6 @@ pub async fn broadcast_and_persist_incoming_message(
             mirror_gui_message_to_telegram(&mirror_msg).await;
         },
     );
-}
-
-/// Send a reply through a channel.
-pub async fn send_channel_reply(content: String, msg: &ChannelMessage, agent_role: Option<String>) {
-    // ── Broadcast agent response for live GUI display and chat_history ──
-    // Must happen before the channel registry check -- broadcast_and_persist
-    // does not depend on the channel object, only on fields from `msg`.
-    broadcast_and_persist_agent_response(
-        &msg.user_name,
-        &msg.channel,
-        &content,
-        agent_role,
-        &msg.workspace,
-    )
-    .await;
-
-    let Some(channel) = crate::channel_registry().get(&msg.channel) else {
-        tracing::warn!(
-            channel = %msg.channel,
-            "Channel not found in registry -- reply not delivered via transport (already broadcast & persisted)"
-        );
-        return;
-    };
-
-    let reply = SendMessage {
-        content,
-        recipient: msg.reply_target.clone(),
-        reply_markup: None,
-    };
-
-    if let Err(e) = channel.send(&reply).await {
-        tracing::error!("Failed to reply on {}: {e}", channel.name());
-    }
 }
 
 #[must_use]

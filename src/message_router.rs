@@ -639,8 +639,8 @@ async fn deliver_manager_response(response: &str, users: &[UserRecord], job: &Ag
 /// Delivery is scoped to the originating channel type (`job.channel`), then
 /// further scoped to the specific `reply_target` when one is available on the
 /// job (e.g. Telegram chat_id).  This makes registered-user delivery
-/// consistent with the unregistered-user fallback and matches the pre-router
-/// `send_channel_reply` behaviour which sent only to `msg.reply_target`.
+/// consistent with the unregistered-user fallback, which sends only to the
+/// original message's reply target.
 ///
 /// Without `reply_target` (non-user-facing jobs like ticket notifications or
 /// AskTool results), all matching channel bindings receive the response.
@@ -679,8 +679,7 @@ async fn deliver_single_user_response(
         // When the original message had a specific reply target (e.g. Telegram
         // chat_id), scope delivery to only the binding whose reply_target
         // matches — this makes registered-user delivery consistent with the
-        // unregistered-user fallback and matches the pre-router
-        // `send_channel_reply` behaviour.
+        // unregistered-user fallback.
         if let Some(ref target) = job.reply_target
             && binding.reply_target.as_deref() != Some(target.as_str())
         {
@@ -704,14 +703,16 @@ async fn deliver_single_user_response(
 /// Deliver a response to an unregistered user (no [`UserRecord`] in the users DB).
 ///
 /// Falls back to the originating channel using `job.reply_target` (when
-/// available) or `job.user_name` as the reply target. This matches the
-/// pre-router behaviour of [`send_channel_reply`](crate::channels::send_channel_reply),
-/// which worked for any user regardless of registration status and preserved
-/// the original message's reply target (e.g. Telegram chat_id).
+/// available) or `job.user_name` as the reply target. Works for any user
+/// regardless of registration status and preserves the original message's
+/// reply target (e.g. Telegram chat_id).
+///
+/// Also used directly by the binary for inline confirmations (e.g. Telegram
+/// session-clear replies) via raw `reply_target` passthrough.
 ///
 /// The response is always broadcast + persisted first (so it appears in the
 /// GUI chat history even if the channel transport delivery fails).
-async fn deliver_unregistered_user_response(response: &str, job: &AgentJob, role: &Role) {
+pub async fn deliver_unregistered_user_response(response: &str, job: &AgentJob, role: &Role) {
     let ch = job.channel.as_str();
 
     // Broadcast + persist (works with just strings, no UserRecord needed).
@@ -730,9 +731,7 @@ async fn deliver_unregistered_user_response(response: &str, job: &AgentJob, role
     };
 
     // Use reply_target from the original message when available (e.g. Telegram
-    // chat_id), falling back to user_name.  This matches the pre-router
-    // behaviour of `send_channel_reply` which preserved the original
-    // `msg.reply_target`.
+    // chat_id), falling back to user_name.
     let reply_target = job.reply_target.as_deref().unwrap_or(&job.user_name);
     match deliver_on_channel(chan.as_ref(), &job.user_name, reply_target, response).await {
         DeliverOutcome::Unresolvable => warn!(
