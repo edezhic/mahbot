@@ -3875,8 +3875,12 @@ fn check_git_exec_vectors(trimmed: &str, subcommand: &str) -> Result<(), String>
     // `git log -c` / `git diff -c` (combined diff) live in the subcommand
     // region and stay allowed. `-c` injects config that executes programs;
     // `-C` redirects the repo (attached/clustered forms `-cfoo`, `-pc`, `-pC`
-    // included). Long globals redirect the repo or inject config.
-    let sub_idx = words.len() - subcommand.split_whitespace().count();
+    // included). Long globals redirect the repo or inject config. The
+    // subcommand start is derived with the same shared helper
+    // `extract_git_subcommand` uses, so the global region always ends where
+    // the subcommand begins.
+    let sub_idx = super::find_first_non_flag_index(&words[git_idx + 1..], true)
+        .map_or(words.len(), |i| git_idx + 1 + i);
     for w in &words[git_idx + 1..sub_idx] {
         let wq = shell_word(w);
         if wq.starts_with('-') && !wq.starts_with("--") && wq[1..].contains(['c', 'C']) {
@@ -3904,19 +3908,24 @@ fn check_git_exec_vectors(trimmed: &str, subcommand: &str) -> Result<(), String>
             }
         }
     }
-    check_git_exec_flags(trimmed, &words)?;
+    check_git_exec_flags(trimmed, subcommand, &words)?;
     check_git_scoped_flags(trimmed, subcommand, &words)
 }
 
 /// Exec-flag blocks applied across the whole command. Git abbreviates
 /// unambiguous long-option prefixes (`--upload-p=` == `--upload-pack=`), so
-/// any token that is a prefix of a blocked flag is rejected — except exact
-/// `--filter`, a legit flag on rev-list/log/ls-tree/cat-file that shadows
-/// the `--filters` prefix. `--no-*` disabling forms stay allowed; a
-/// `--`-separated pathname literally named like a flag is over-rejected
-/// (accepted fail-closed). ANSI-C `$'...\...'` spans (standalone or embedded
-/// like `--format=$'%h\t%s'`) are unprovable flag candidates — same contract
-/// as [`is_unprovable_flag_token`].
+/// any token of length > 2 that is a prefix of a blocked flag is rejected
+/// (bare `--` is the path separator, never an option). Exact `--filter` and
+/// `--text` are exempted where git resolves them to benign flags — `--filter`
+/// shadows `--filters`; `--text` is the `-a` flag on the diff family + grep
+/// (per `GIT_TEXT_BENIGN_SUBCOMMANDS`), while elsewhere git abbreviates it to
+/// `--textconv` (e.g. `git cat-file --text` execs the driver), so it stays
+/// blocked there. `--no-*` disabling forms stay allowed. Fail-closed
+/// over-rejections: pathnames literally named like a blocked flag
+/// (`git log -- --ext-diff`) and literal grep patterns (`git grep -e
+/// '--ext-diff'`). ANSI-C `$'...\...'` spans (standalone or embedded like
+/// `--format=$'%h\t%s'`) are unprovable flag candidates — same contract as
+/// [`is_unprovable_flag_token`].
 const GIT_EXEC_LONG_FLAGS: &[&str] = &[
     "--ext-diff",
     "--textconv",
@@ -3926,7 +3935,29 @@ const GIT_EXEC_LONG_FLAGS: &[&str] = &[
     "--exec",
 ];
 
-fn check_git_exec_flags(trimmed: &str, words: &[&str]) -> Result<(), String> {
+/// Subcommands where git resolves exact `--text` to the benign `-a/--text`
+/// flag (diff family, grep, and shortlog/rev-list which take diff options).
+/// On all other safe subcommands `--text` is either invalid or — like
+/// `cat-file` — abbreviates to `--textconv`, an exec vector.
+const GIT_TEXT_BENIGN_SUBCOMMANDS: &[&str] = &[
+    "grep",
+    "diff",
+    "log",
+    "show",
+    "blame",
+    "annotate",
+    "diff-files",
+    "diff-index",
+    "diff-tree",
+    "whatchanged",
+    "shortlog",
+    "rev-list",
+    "range-diff",
+    "stash",
+];
+
+fn check_git_exec_flags(trimmed: &str, subcommand: &str, words: &[&str]) -> Result<(), String> {
+    let base = subcommand.split_whitespace().next().unwrap_or("");
     for w in words {
         if w.contains("$'") && w.contains('\\') {
             return reject(
@@ -3937,9 +3968,18 @@ fn check_git_exec_flags(trimmed: &str, words: &[&str]) -> Result<(), String> {
         }
         let wq = shell_word(w);
         let opt = wq.split('=').next().unwrap_or(&wq);
+        // Bare `-`/`--` are never options — `--` is the path separator and git
+        // abbreviates only long options of the form `--x...`.
+        if opt.len() <= 2 {
+            continue;
+        }
         // `git grep -e '--ext-diff'` (literal pattern) is over-rejected too —
         // accepted fail-closed asymmetry with the spared `--regexp=` form.
-        if opt != "--filter" && GIT_EXEC_LONG_FLAGS.iter().any(|f| f.starts_with(opt)) {
+        let text_benign = opt == "--text" && GIT_TEXT_BENIGN_SUBCOMMANDS.contains(&base);
+        if opt != "--filter"
+            && !text_benign
+            && GIT_EXEC_LONG_FLAGS.iter().any(|f| f.starts_with(opt))
+        {
             return reject(
                 trimmed,
                 &format!(
@@ -3966,13 +4006,14 @@ fn check_git_scoped_flags(trimmed: &str, subcommand: &str, words: &[&str]) -> Re
         let opt = wq.split('=').next().unwrap_or(&wq);
         let is_scoped = match base {
             "grep" => {
-                "--open-files-in-pager".starts_with(opt)
+                (opt.len() > 2 && "--open-files-in-pager".starts_with(opt))
                     || (wq.starts_with('-') && !wq.starts_with("--") && wq[1..].contains('O'))
             }
             "help" => {
-                ["--web", "--man", "--info"]
-                    .iter()
-                    .any(|f| f.starts_with(opt))
+                (opt.len() > 2
+                    && ["--web", "--man", "--info"]
+                        .iter()
+                        .any(|f| f.starts_with(opt)))
                     || (wq.starts_with('-')
                         && !wq.starts_with("--")
                         && wq[1..].contains(['w', 'm', 'i']))
@@ -5242,6 +5283,7 @@ mod tests {
             ("git log -p --textconv", false),
             ("git log --show-signature", false),
             ("git cat-file --filters HEAD:src/lib.rs", false),
+            ("git cat-file --text HEAD:a.txt", false), // abbrev of --textconv: execs the driver
             ("git ls-remote --upload-pack=/bin/echo origin", false),
             ("git ls-remote --upload-pack /bin/echo origin", false),
             ("git push --dry-run --exec=/bin/echo origin", false), // extension bypass
@@ -5290,7 +5332,8 @@ mod tests {
 
     /// Positive controls for the exec-vector scan: ordinary read-only git and
     /// the legitimate spellings that must NOT be caught (position/subcommand
-    /// scoping, --no-* disabling forms, GIT_PAGER carve-out).
+    /// scoping, the bare `--` path separator, the benign `--text` flag,
+    /// --no-* disabling forms, GIT_PAGER carve-out).
     #[test]
     fn git_exec_vector_positives() {
         let cases = [
@@ -5300,6 +5343,17 @@ mod tests {
             ("git diff", true),
             ("git show HEAD", true),
             ("git blame src/lib.rs", true),
+            // bare `--` path separator is never an option
+            ("git log -- src/lib.rs", true),
+            ("git log --oneline -- path", true),
+            ("git diff -- file", true),
+            ("git show HEAD -- file", true),
+            ("git grep -- pattern", true),
+            // exact `--text` is the benign -a flag where git has it
+            ("git grep --text pattern", true),
+            ("git diff --text", true),
+            ("git log --text", true),
+            ("git blame --text src/lib.rs", true),
             // Position-sensitive: -c after the subcommand is combined diff
             ("git log -c", true),
             ("git diff -c", true),
