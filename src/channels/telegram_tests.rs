@@ -248,22 +248,56 @@ async fn parse_update_message_uses_chat_id_as_reply_target() {
 
 #[test]
 fn parse_attachment_markers_tests() {
-    let (cleaned, att) =
-        parse_attachment_markers("Here are files [IMAGE:/tmp/a.png] and [AUDIO:/tmp/voice.ogg]");
+    let dir = tempfile::tempdir().unwrap();
+    let png = dir.path().join("a.png");
+    let ogg = dir.path().join("voice.ogg");
+    let vid = dir.path().join("vid.mp4");
+    std::fs::write(&png, b"fake-png").unwrap();
+    std::fs::write(&ogg, b"fake-ogg").unwrap();
+    std::fs::write(&vid, b"fake-mp4").unwrap();
+
+    // Placeholder/inexistent targets stay as literal text (AC 1).
+    let (cleaned, att) = parse_attachment_markers("use `[IMAGE:path]` or `[VIDEO:...]`");
+    assert_eq!(cleaned, "use `[IMAGE:path]` or `[VIDEO:...]`");
+    assert!(att.is_empty());
+    // Directory targets are not regular files → prose.
+    let (cleaned, att) = parse_attachment_markers(&format!("[IMAGE:{}]", dir.path().display()));
+    assert_eq!(cleaned, format!("[IMAGE:{}]", dir.path().display()));
+    assert!(att.is_empty());
+
+    // Existing files become attachments (AC 2).
+    let (cleaned, att) = parse_attachment_markers(&format!(
+        "Here are files [IMAGE:{}] and [AUDIO:{}]",
+        png.display(),
+        ogg.display()
+    ));
     assert_eq!(cleaned, "Here are files  and");
     assert_eq!(att.len(), 2);
     assert_eq!(att[0].kind, TelegramAttachmentKind::Image);
     assert_eq!(att[1].kind, TelegramAttachmentKind::Audio);
-    // invalid markers kept as text
+
+    // http(s) URLs become attachments (AC 2).
+    let (cleaned, att) = parse_attachment_markers("See [VIDEO:https://example.com/vid.mp4]");
+    assert_eq!(cleaned, "See");
+    assert_eq!(att.len(), 1);
+    assert_eq!(att[0].kind, TelegramAttachmentKind::Video);
+    assert_eq!(att[0].target, "https://example.com/vid.mp4");
+
+    // A bad marker doesn't abort valid ones in the same message (AC 3).
+    let (cleaned, att) =
+        parse_attachment_markers(&format!("[IMAGE:missing.png] ok [VIDEO:{}]", vid.display()));
+    assert_eq!(cleaned, "[IMAGE:missing.png] ok");
+    assert_eq!(att.len(), 1);
+    assert_eq!(att[0].kind, TelegramAttachmentKind::Video);
+
+    // Unknown markers kept as text; case-insensitive matching with a real file.
     let (cleaned, att) = parse_attachment_markers("Report [UNKNOWN:/tmp/a.bin]");
     assert_eq!(cleaned, "Report [UNKNOWN:/tmp/a.bin]");
     assert!(att.is_empty());
-    // case-insensitive matching
-    let (cleaned, att) = parse_attachment_markers("[image:path.png] and [VIDEO:/tmp/vid.mp4]");
-    assert_eq!(cleaned, "and");
-    assert_eq!(att.len(), 2);
+    let (cleaned, att) = parse_attachment_markers(&format!("[image:{}]", png.display()));
+    assert_eq!(cleaned, "");
+    assert_eq!(att.len(), 1);
     assert_eq!(att[0].kind, TelegramAttachmentKind::Image);
-    assert_eq!(att[1].kind, TelegramAttachmentKind::Video);
 }
 
 #[test]

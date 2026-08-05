@@ -438,7 +438,10 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
 /// (with markers removed) and extracted attachments.
 ///
 /// Uses the case-insensitive [`TELEGRAM_MEDIA_MARKER_RE`] to match markers.
-/// Unknown or unrecognized markers are left intact in the cleaned text.
+/// Markers whose target is neither an http(s) URL nor an existing regular
+/// file are kept as literal text — prose quoting the syntax never aborts
+/// delivery. Known limitation: prose referencing a real existing file still
+/// delivers as an attachment. Unknown or unrecognized markers are left intact.
 fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) {
     let mut attachments: Vec<TelegramAttachment> = Vec::new();
 
@@ -447,10 +450,11 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
             let (kind_str, path) = parse_media_marker(caps);
             let path = path.trim();
 
-            // Preserve markers with whitespace-only paths (e.g. `[IMAGE: ]`)
-            // as original text, mirroring the old hand-rolled parser's behavior
-            // where `target.is_empty()` after trim caused the marker to be kept.
-            if path.is_empty() {
+            // Preserve markers whose target is not an http(s) URL and does not
+            // resolve to an existing regular file as original text — prose
+            // quoting the marker syntax must stay visible and never abort the
+            // send of other attachments in the same message.
+            if path.is_empty() || (!is_http_url(path) && !Path::new(path).is_file()) {
                 return caps.get_match().as_str().to_string();
             }
 
