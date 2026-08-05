@@ -928,13 +928,10 @@ impl SettingsState {
 
         let mut rows = Column::new().spacing(4);
 
-        if let Some(err) = ws.load_state.error() {
-            rows = rows.push(widgets::error_banner(err));
-            rows = rows.push(Space::new().height(8));
-        }
+        rows = widgets::push_error_banner(rows, ws.load_state.error());
 
         if ws.load_state.loading() && !ws.load_state.has_loaded() {
-            rows = rows.push(text("Loading...").size(13).color(theme::TEXT_MUTED));
+            rows = rows.push(widgets::loading_text());
         } else if ws.workspaces.is_empty() {
             rows = rows.push(
                 text("No workspaces configured. Add one below.")
@@ -1241,7 +1238,7 @@ impl SettingsState {
             let title = format!("Context for {role}");
 
             let body: Element<'_, SettingsMessage> = match md_items_opt {
-                None => container(text("Loading...").size(13).color(theme::TEXT_MUTED))
+                None => container(widgets::loading_text())
                     .width(Length::Fill)
                     .into(),
                 Some(items) => {
@@ -1314,13 +1311,10 @@ impl SettingsState {
 
         let mut rows = Column::new().spacing(4);
 
-        if let Some(err) = us.load_state.error() {
-            rows = rows.push(widgets::error_banner(err));
-            rows = rows.push(Space::new().height(8));
-        }
+        rows = widgets::push_error_banner(rows, us.load_state.error());
 
         if us.load_state.loading() && !us.load_state.has_loaded() {
-            rows = rows.push(text("Loading...").size(13).color(theme::TEXT_MUTED));
+            rows = rows.push(widgets::loading_text());
         } else if us.users.is_empty() {
             rows = rows.push(
                 text("No users configured. Add one below.")

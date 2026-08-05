@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use iced::keyboard;
 use iced::widget::{
-    self, Row, Space, button, column, container, pick_list, row, scrollable, stack, text,
+    self, Column, Row, Space, button, column, container, pick_list, row, scrollable, stack, text,
     text_editor, text_input,
 };
 use iced::{Alignment, Color, Element, Length, Padding, Task};
@@ -84,6 +84,25 @@ pub fn error_banner<'a, Message: 'a>(err: &'a str) -> Element<'a, Message> {
         .padding(8)
         .style(theme::pill_style(theme::STATUS_ERROR.scale_alpha(0.08)))
         .into()
+}
+
+/// Standardized "Loading..." placeholder label for load-state scaffolding.
+#[must_use]
+pub fn loading_text<'a, Message: 'a>() -> Element<'a, Message> {
+    text("Loading...").size(14).color(theme::TEXT_MUTED).into()
+}
+
+/// Push an [`error_banner`] plus trailing 8px spacer onto `col` when `err` is present.
+#[must_use]
+pub fn push_error_banner<'a, Message: 'a>(
+    mut col: Column<'a, Message>,
+    err: Option<&'a str>,
+) -> Column<'a, Message> {
+    if let Some(err) = err {
+        col = col.push(error_banner(err));
+        col = col.push(Space::new().height(8));
+    }
+    col
 }
 
 /// Render a centered empty-state placeholder with a lucide icon and label.

@@ -242,16 +242,6 @@ impl HomeState {
         }
     }
 
-    /// The global workspace selection changed — refresh history for the new workspace.
-    #[expect(
-        dead_code,
-        reason = "Handler reserved for future workspace selection UI"
-    )]
-    pub fn workspace_selected(&mut self, name: Option<String>) -> Task<HomeMessage> {
-        self.selected_workspace = name;
-        self.refresh_history()
-    }
-
     /// Load users for the user picker.
     #[allow(clippy::unused_self)]
     pub fn load_users(&self) -> Task<HomeMessage> {
