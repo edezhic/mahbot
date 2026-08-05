@@ -220,6 +220,15 @@ pub(crate) fn backoff_sequence(policy: &RetryPolicy) -> Vec<u64> {
     seq
 }
 
+/// ±25% jitter around `base_ms`: random within [75%, 125%) of base so
+/// parallel agents retrying on the same transient error don't synchronize.
+/// Jitter touches the SLEEP ONLY, never the request bytes.
+/// The modulo guard keeps 0/1 ms schedules (test policies) division-safe.
+#[must_use]
+pub(crate) fn jittered_backoff_ms(base_ms: u64) -> u64 {
+    base_ms - base_ms / 4 + (rand::random::<u64>() % (base_ms / 2).max(1))
+}
+
 /// Compute the actual sleep for one inter-attempt gap.
 ///
 /// Retry-After (when present) is authoritative and followed precisely, clamped
@@ -230,8 +239,7 @@ pub(crate) fn compute_sleep_ms(schedule_ms: u64, retry_after_ms: Option<u64>) ->
     if let Some(ra) = retry_after_ms {
         ra.clamp(RETRY_AFTER_MIN_MS, RETRY_AFTER_MAX_MS)
     } else {
-        let half = schedule_ms / 2;
-        schedule_ms - schedule_ms / 4 + (rand::random::<u64>() % half.max(1))
+        jittered_backoff_ms(schedule_ms)
     }
 }
 

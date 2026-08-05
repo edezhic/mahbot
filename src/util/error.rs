@@ -61,11 +61,7 @@ impl HttpError {
     pub async fn from_response(response: reqwest::Response, context: impl Into<String>) -> Self {
         let context: String = context.into();
         let status = response.status().as_u16();
-        let retry_after_ms = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_retry_after_value);
+        let retry_after_ms = retry_after_header(response.headers());
         let body = response.text().await.unwrap_or_else(|e| {
             tracing::warn!(
                 ?e,
@@ -95,6 +91,14 @@ impl fmt::Display for HttpError {
 }
 
 impl std::error::Error for HttpError {}
+
+/// Extract the `Retry-After` response header value in milliseconds, if present.
+pub(crate) fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_retry_after_value)
+}
 
 /// Parse a `Retry-After` header value into milliseconds.
 ///

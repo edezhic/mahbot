@@ -178,11 +178,7 @@ impl ReliableProvider {
             // scoped retry paths in src/retry.rs).
             retry_after.min(crate::retry::RETRY_AFTER_MAX_MS).max(base)
         } else {
-            // Jitter: randomize within [75%, 125%) of base so parallel agents
-            // retrying on the same transient error don't synchronize.
-            let half_range = base / 2;
-
-            base - base / 4 + (rand::random::<u64>() % half_range)
+            crate::retry::jittered_backoff_ms(base)
         }
     }
 }

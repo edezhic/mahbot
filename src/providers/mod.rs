@@ -107,14 +107,24 @@ impl std::fmt::Display for ScopedCallError {
 
 impl std::error::Error for ScopedCallError {}
 
+/// Map a provider [`ErrorClass`] to a granular [`FailureClass`]. Retryable
+/// errors refine to [`FailureClass::TruncatedEnvelope`] when the response
+/// envelope was truncated mid-read (the defect class this hardening targets);
+/// a non-retryable status (auth, quota) still aborts immediately.
+#[must_use]
+pub(crate) fn failure_class(class: reliable::ErrorClass, truncated: bool) -> FailureClass {
+    match class {
+        reliable::ErrorClass::NonRetryable => FailureClass::NonRetryable,
+        reliable::ErrorClass::Retryable if truncated => FailureClass::TruncatedEnvelope,
+        reliable::ErrorClass::Retryable => FailureClass::Transport,
+    }
+}
+
 /// Map a plain error to a granular [`FailureClass`] using the provider error
 /// classifier (retryable vs non-retryable).
 #[must_use]
 pub(crate) fn classify_failure(err: &anyhow::Error) -> FailureClass {
-    match reliable::classify_err(err) {
-        reliable::ErrorClass::NonRetryable => FailureClass::NonRetryable,
-        reliable::ErrorClass::Retryable => FailureClass::Transport,
-    }
+    failure_class(reliable::classify_err(err), false)
 }
 
 /// Ensure a base URL includes the `/chat/completions` path segment.

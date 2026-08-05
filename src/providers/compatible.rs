@@ -5,7 +5,7 @@
 use crate::providers::reasoning_roundtrip;
 use crate::providers::{ScopedCallError, ensure_chat_completions_url, provider_routing_json};
 use crate::retry::{FailureClass, RetryFailureRecord};
-use crate::util::error::HttpError;
+use crate::util::error::{HttpError, retry_after_header};
 use crate::util::json::try_repair_json;
 use crate::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -598,6 +598,40 @@ impl OpenAiCompatibleProvider {
         }
     }
 
+    /// Shared success tail of [`Provider::chat`] and [`Provider::chat_scoped`]:
+    /// usage mapping, first-choice extraction, native-response parsing, and the
+    /// tool-turn debug log. `no_response` builds the error when no choice exists.
+    fn finalize_response<E>(
+        &self,
+        model: &str,
+        native_response: ApiChatResponse,
+        no_response: impl FnOnce() -> E,
+    ) -> Result<ProviderChatResponse, E> {
+        let usage = native_response.usage.map(|u| ProviderUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            cached_input_tokens: None,
+        });
+        let message = native_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|choice| choice.message)
+            .ok_or_else(no_response)?;
+
+        let result = Self::parse_native_response(message, usage);
+
+        if !result.tool_calls.is_empty() && result.reasoning.is_none() {
+            tracing::debug!(
+                provider = %self.name,
+                model,
+                "tool turn: parsed response has no reasoning fields",
+            );
+        }
+
+        Ok(result)
+    }
+
     /// Build the HTTP request for [`Provider::chat`] / [`Provider::chat_scoped`].
     /// This function itself is synchronous; the caller sends the request asynchronously.
     ///
@@ -812,29 +846,9 @@ impl Provider for OpenAiCompatibleProvider {
             )
         })?;
 
-        let usage = native_response.usage.map(|u| ProviderUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            cached_input_tokens: None,
-        });
-        let message = native_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|choice| choice.message)
-            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
-
-        let result = Self::parse_native_response(message, usage);
-
-        if !result.tool_calls.is_empty() && result.reasoning.is_none() {
-            tracing::debug!(
-                provider = %self.name,
-                model,
-                "tool turn: parsed response has no reasoning fields",
-            );
-        }
-
-        Ok(result)
+        self.finalize_response(&model, native_response, || {
+            anyhow::anyhow!("No response from {}", self.name)
+        })
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -886,36 +900,15 @@ impl Provider for OpenAiCompatibleProvider {
                 } else {
                     FailureClass::Transport
                 };
-                let record = RetryFailureRecord::new_simple(
-                    0,
-                    class,
-                    &err,
-                    started.elapsed().as_millis() as u64,
-                    None,
-                );
-                return Err(ScopedCallError::new(err, record, class));
+                return Err(scoped_simple_error(err, class, started));
             }
             Ok(Err(_)) => {
                 let err = anyhow::anyhow!("shutdown during request");
-                let record = RetryFailureRecord::new_simple(
-                    0,
-                    FailureClass::Shutdown,
-                    &err,
-                    started.elapsed().as_millis() as u64,
-                    None,
-                );
-                return Err(ScopedCallError::new(err, record, FailureClass::Shutdown));
+                return Err(scoped_simple_error(err, FailureClass::Shutdown, started));
             }
             Ok(Ok(Err(e))) => {
                 let err = anyhow::Error::from(e).context(format!("{} transport error", self.name));
-                let record = RetryFailureRecord::new_simple(
-                    0,
-                    FailureClass::Transport,
-                    &err,
-                    started.elapsed().as_millis() as u64,
-                    None,
-                );
-                return Err(ScopedCallError::new(err, record, FailureClass::Transport));
+                return Err(scoped_simple_error(err, FailureClass::Transport, started));
             }
             Ok(Ok(Ok(resp))) => resp,
         };
@@ -964,23 +957,18 @@ impl Provider for OpenAiCompatibleProvider {
 
         if let Some((read_msg, class)) = read_failure {
             let err = anyhow::anyhow!("{} error reading response body: {read_msg}", self.name);
-            let (finish_reason, completion_tokens) = envelope_telemetry(&body_str);
-            let record = RetryFailureRecord::with_metadata(
-                0,
+            return Err(scoped_metadata_error(
+                err,
                 class,
-                &err,
-                started.elapsed().as_millis() as u64,
+                started,
                 http_version.clone(),
                 content_length,
-                Some(actual_len),
+                actual_len,
                 content_encoding.clone(),
                 transfer_encoding.clone(),
                 &body_str,
-                finish_reason,
-                completion_tokens,
                 None,
-            );
-            return Err(ScopedCallError::new(err, record, class));
+            ));
         }
 
         let native_response: ApiChatResponse = match serde_json::from_str(&body_str) {
@@ -1001,61 +989,74 @@ impl Provider for OpenAiCompatibleProvider {
                     body_str.len(),
                     body_str
                 );
-                let (finish_reason, completion_tokens) = envelope_telemetry(&body_str);
-                let record = RetryFailureRecord::with_metadata(
-                    0,
+                return Err(scoped_metadata_error(
+                    err,
                     class,
-                    &err,
-                    started.elapsed().as_millis() as u64,
+                    started,
                     http_version,
                     content_length,
-                    Some(actual_len),
+                    actual_len,
                     content_encoding,
                     transfer_encoding,
                     &body_str,
-                    finish_reason,
-                    completion_tokens,
                     None,
-                );
-                return Err(ScopedCallError::new(err, record, class));
+                ));
             }
         };
 
-        let usage = native_response.usage.map(|u| ProviderUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            cached_input_tokens: None,
-        });
-        let message = native_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|choice| choice.message)
-            .ok_or_else(|| {
-                let err = anyhow::anyhow!("No response from {}", self.name);
-                let class = FailureClass::NoResponse;
-                let record = RetryFailureRecord::new_simple(
-                    0,
-                    class,
-                    &err,
-                    started.elapsed().as_millis() as u64,
-                    None,
-                );
-                ScopedCallError::new(err, record, class)
-            })?;
-
-        let result = Self::parse_native_response(message, usage);
-
-        if !result.tool_calls.is_empty() && result.reasoning.is_none() {
-            tracing::debug!(
-                provider = %self.name,
-                model,
-                "tool turn: parsed response has no reasoning fields",
-            );
-        }
-
-        Ok(result)
+        self.finalize_response(&model, native_response, || {
+            scoped_simple_error(
+                anyhow::anyhow!("No response from {}", self.name),
+                FailureClass::NoResponse,
+                started,
+            )
+        })
     }
+}
+
+/// Build a scoped-call error with no HTTP metadata (send-phase failures).
+#[allow(clippy::cast_possible_truncation)]
+fn scoped_simple_error(
+    err: anyhow::Error,
+    class: FailureClass,
+    started: Instant,
+) -> ScopedCallError {
+    let record =
+        RetryFailureRecord::new_simple(0, class, &err, started.elapsed().as_millis() as u64, None);
+    ScopedCallError::new(err, record, class)
+}
+
+/// Build a scoped-call error with full response metadata.
+#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
+fn scoped_metadata_error(
+    err: anyhow::Error,
+    class: FailureClass,
+    started: Instant,
+    http_version: Option<String>,
+    content_length: Option<u64>,
+    actual_len: usize,
+    content_encoding: Option<String>,
+    transfer_encoding: Option<String>,
+    body: &str,
+    retry_after_ms: Option<u64>,
+) -> ScopedCallError {
+    let (finish_reason, completion_tokens) = envelope_telemetry(body);
+    let record = RetryFailureRecord::with_metadata(
+        0,
+        class,
+        &err,
+        started.elapsed().as_millis() as u64,
+        http_version,
+        content_length,
+        Some(actual_len),
+        content_encoding,
+        transfer_encoding,
+        body,
+        finish_reason,
+        completion_tokens,
+        retry_after_ms,
+    );
+    ScopedCallError::new(err, record, class)
 }
 
 /// Build a [`ScopedCallError`] from an HTTP error response (non-2xx).
@@ -1063,7 +1064,7 @@ impl Provider for OpenAiCompatibleProvider {
 /// Reads the error body with idle-timeout semantics so a stalled error-body
 /// read cannot hang past the operation deadline, and classifies via the
 /// provider error classifier.
-#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
+#[allow(clippy::too_many_arguments)]
 async fn scoped_http_error(
     provider: &OpenAiCompatibleProvider,
     response: reqwest::Response,
@@ -1076,11 +1077,7 @@ async fn scoped_http_error(
     deadline: Instant,
 ) -> ScopedCallError {
     let status = response.status().as_u16();
-    let retry_after_ms = response
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(crate::util::error::parse_retry_after_value);
+    let retry_after_ms = retry_after_header(response.headers());
     let (body_bytes, message) = match read_body_idle(response, idle_timeout, deadline).await {
         BodyReadOutcome::Complete(bytes) => (bytes, None),
         BodyReadOutcome::Failed {
@@ -1106,34 +1103,22 @@ async fn scoped_http_error(
         )),
     };
 
-    let class = match crate::providers::reliable::classify_err(&inner) {
-        crate::providers::reliable::ErrorClass::NonRetryable => FailureClass::NonRetryable,
-        // The error body itself was truncated mid-read — preserve the
-        // truncation distinction (the defect class this hardening targets)
-        // when the status classification would otherwise be retryable. A
-        // non-retryable status (auth, quota) still aborts immediately.
-        crate::providers::reliable::ErrorClass::Retryable if body_read_failed => {
-            FailureClass::TruncatedEnvelope
-        }
-        crate::providers::reliable::ErrorClass::Retryable => FailureClass::Transport,
-    };
-    let (finish_reason, completion_tokens) = envelope_telemetry(&body);
-    let record = RetryFailureRecord::with_metadata(
-        0,
+    let class = crate::providers::failure_class(
+        crate::providers::reliable::classify_err(&inner),
+        body_read_failed,
+    );
+    scoped_metadata_error(
+        inner,
         class,
-        &inner,
-        started.elapsed().as_millis() as u64,
+        started,
         http_version,
         content_length,
-        Some(actual_len),
+        actual_len,
         content_encoding,
         transfer_encoding,
         &body,
-        finish_reason,
-        completion_tokens,
         retry_after_ms,
-    );
-    ScopedCallError::new(inner, record, class)
+    )
 }
 
 #[cfg(test)]
