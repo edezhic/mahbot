@@ -770,21 +770,12 @@ impl HomeState {
                 }
             }
             HomeMessage::InputChanged(action) => {
-                // When shift is held and the user clicks, convert to a Drag action
-                // which extends the selection anchored at the current cursor position
-                // (shift+click selection semantics).
-                let action = match action {
-                    text_editor::Action::Click(pos) if self.modifiers.shift() => {
-                        text_editor::Action::Drag(pos)
-                    }
-                    other => other,
-                };
-
-                // Snapshot before edit actions for undo/redo.
-                if action.is_edit() {
-                    self.undo_stack.snap_before_edit(&self.editor_content);
-                }
-                self.editor_content.perform(action);
+                super::common::apply_editor_action(
+                    &mut self.editor_content,
+                    &mut self.undo_stack,
+                    action,
+                    self.modifiers.shift(),
+                );
                 Task::none()
             }
             HomeMessage::ModifiersChanged(modifiers) => {
@@ -792,17 +783,13 @@ impl HomeState {
                 Task::none()
             }
             HomeMessage::Undo => {
-                if let Some(snapshot) = self.undo_stack.undo(&self.editor_content) {
-                    self.editor_content = text_editor::Content::with_text(&snapshot.text);
-                    self.editor_content.move_to(snapshot.cursor);
-                }
+                let snapshot = self.undo_stack.undo(&self.editor_content);
+                super::common::restore_undo_snapshot(&mut self.editor_content, snapshot);
                 Task::none()
             }
             HomeMessage::Redo => {
-                if let Some(snapshot) = self.undo_stack.redo(&self.editor_content) {
-                    self.editor_content = text_editor::Content::with_text(&snapshot.text);
-                    self.editor_content.move_to(snapshot.cursor);
-                }
+                let snapshot = self.undo_stack.redo(&self.editor_content);
+                super::common::restore_undo_snapshot(&mut self.editor_content, snapshot);
                 Task::none()
             }
             HomeMessage::ResolveUserSelected(workspace) => {

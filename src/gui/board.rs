@@ -515,39 +515,22 @@ impl BoardState {
             BoardMessage::CommentInputChanged(action) => {
                 // Any interaction means the input is focused.
                 self.comment_focused = true;
-                // When Shift is held and the user clicks, convert to a Drag
-                // action which extends the selection anchored at the current
-                // cursor position (Shift+Click selection semantics).
-                // Matches the Home chat input pattern (home.rs:966-974).
-                let action = match action {
-                    text_editor::Action::Click(pos) if self.modifiers.shift() => {
-                        text_editor::Action::Drag(pos)
-                    }
-                    other => other,
-                };
-                // Snapshot before edit actions for undo/redo.
-                if action.is_edit() {
-                    self.undo_stack.snap_before_edit(&self.comment_input);
-                }
-                // perform() must be called unconditionally for every action
-                // (cursor movement, click positioning, edit). The Iced
-                // text_editor widget does not call perform() itself — it
-                // relies entirely on the application to do so.
-                self.comment_input.perform(action);
+                super::common::apply_editor_action(
+                    &mut self.comment_input,
+                    &mut self.undo_stack,
+                    action,
+                    self.modifiers.shift(),
+                );
                 Task::none()
             }
             BoardMessage::Undo => {
-                if let Some(snapshot) = self.undo_stack.undo(&self.comment_input) {
-                    self.comment_input = text_editor::Content::with_text(&snapshot.text);
-                    self.comment_input.move_to(snapshot.cursor);
-                }
+                let snapshot = self.undo_stack.undo(&self.comment_input);
+                super::common::restore_undo_snapshot(&mut self.comment_input, snapshot);
                 Task::none()
             }
             BoardMessage::Redo => {
-                if let Some(snapshot) = self.undo_stack.redo(&self.comment_input) {
-                    self.comment_input = text_editor::Content::with_text(&snapshot.text);
-                    self.comment_input.move_to(snapshot.cursor);
-                }
+                let snapshot = self.undo_stack.redo(&self.comment_input);
+                super::common::restore_undo_snapshot(&mut self.comment_input, snapshot);
                 Task::none()
             }
             BoardMessage::CommentModifiersChanged(modifiers) => {

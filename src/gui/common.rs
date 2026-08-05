@@ -395,6 +395,39 @@ pub(crate) fn composer_keyboard_event<M>(
     }
 }
 
+/// Apply a text-editor action to the composer content: shift+click becomes a
+/// drag (extending the selection), and edit actions snapshot the pre-edit
+/// state for undo. `perform()` must be called unconditionally for every
+/// action (cursor movement, click positioning, edit) — the Iced text_editor
+/// widget does not call it itself.
+pub(crate) fn apply_editor_action(
+    content: &mut text_editor::Content,
+    undo_stack: &mut UndoStack,
+    action: text_editor::Action,
+    shift: bool,
+) {
+    let action = match action {
+        text_editor::Action::Click(pos) if shift => text_editor::Action::Drag(pos),
+        other => other,
+    };
+    if action.is_edit() {
+        undo_stack.snap_before_edit(content);
+    }
+    content.perform(action);
+}
+
+/// Restore an undo/redo snapshot into the composer content (`None`, i.e. an
+/// empty stack, is a no-op).
+pub(crate) fn restore_undo_snapshot(
+    content: &mut text_editor::Content,
+    snapshot: Option<UndoSnapshot>,
+) {
+    if let Some(snapshot) = snapshot {
+        *content = text_editor::Content::with_text(&snapshot.text);
+        content.move_to(snapshot.cursor);
+    }
+}
+
 /// Guard a chat send: trim-empty noop, then the in-flight noop and the
 /// over-limit toast in per-page order (`in_flight_first` — home checks
 /// in-flight before the limit, board after). Returns the trimmed text when
