@@ -18,9 +18,8 @@
 //! Memory-ordering semantics are preserved exactly from the original copies:
 //! `Acquire` loads, `Release` stores, `AcqRel`/`Acquire` compare-exchange.
 //!
-//! Note: `audio::voice` has its own local `ModelState`/`AtomicModelState`
-//! (voice.rs) which is deliberately NOT migrated — the naming overlap is
-//! intentional and scoped.
+//! All consumers (`audio::voice`, `audio::tts`, `audio::local_transcriber`,
+//! `embedder`) use this shared copy; no module-local duplicates remain.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 

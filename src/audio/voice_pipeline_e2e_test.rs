@@ -1460,7 +1460,7 @@ fn ensure_voice_models_loaded() -> Result<(), String> {
         "ONNX_MODELS already set by another test — cannot re-initialize".to_string()
     })?;
     super::MODELS_STATE.store(
-        super::ModelState::Ready,
+        crate::util::model_state::ModelState::Ready,
         std::sync::atomic::Ordering::Release,
     );
 

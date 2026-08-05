@@ -37,13 +37,14 @@ use crate::config::CONFIG;
 use crate::turso;
 use crate::util::UnwrapPoison;
 use crate::util::hex_string;
+use crate::util::model_state::{AtomicModelState, ModelState};
 use crate::vector::cosine_similarity;
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -1858,58 +1859,6 @@ static VAD_DETECTOR: OnceLock<std::sync::Mutex<earshot::Detector>> = OnceLock::n
 
 // VAD_THRESHOLD is defined above with a unified doc comment.
 // Model loading state machine
-
-/// Model loading state with type-safe atomic access.
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd)]
-enum ModelState {
-    Uninit = 0,
-    Loading = 1,
-    Ready = 2,
-    Failed = 3,
-}
-
-/// Atomic wrapper around [`ModelState`] that provides lock-free access.
-struct AtomicModelState(AtomicU8);
-
-impl AtomicModelState {
-    const fn new(state: ModelState) -> Self {
-        Self(AtomicU8::new(state as u8))
-    }
-
-    fn load(&self, order: Ordering) -> ModelState {
-        Self::from_u8(self.0.load(order))
-    }
-
-    fn store(&self, state: ModelState, order: Ordering) {
-        self.0.store(state as u8, order);
-    }
-
-    /// Atomically compare-and-exchange the current state.
-    ///
-    /// See [`AtomicU8::compare_exchange`] for ordering semantics.
-    fn compare_exchange(
-        &self,
-        expected: ModelState,
-        new: ModelState,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<ModelState, ModelState> {
-        self.0
-            .compare_exchange(expected as u8, new as u8, success, failure)
-            .map(Self::from_u8)
-            .map_err(Self::from_u8)
-    }
-
-    fn from_u8(v: u8) -> ModelState {
-        match v {
-            1 => ModelState::Loading,
-            2 => ModelState::Ready,
-            3 => ModelState::Failed,
-            _ => ModelState::Uninit,
-        }
-    }
-}
 
 static MODELS_STATE: AtomicModelState = AtomicModelState::new(ModelState::Uninit);
 
