@@ -4447,19 +4447,13 @@ async fn route_to_agent(text: String) {
         // while the agent is still working.
         broadcast_voice_transcript(&text, &user_name, &ws_name).await;
 
-        let agent_id =
-            crate::session::resolve_agent_id("voice", &user_name, role.as_str(), &ws_name);
-        crate::message_router::route(
-            &agent_id,
-            crate::message_router::AgentJob {
-                content: text,
-                workspace_name: ws_name,
-                user_name,
-                channel: "voice".to_string(),
-                kind: crate::message_router::JobKind::UserMessage,
-                role,
-                reply_target: None,
-            },
+        crate::message_router::route_user_message(
+            text,
+            ws_name,
+            user_name,
+            "voice".to_string(),
+            role,
+            None,
         );
         return;
     }
@@ -4469,18 +4463,13 @@ async fn route_to_agent(text: String) {
         info!("Voice command -> Manager (active workspace: {active}): {text}");
         broadcast_voice_transcript(&text, "", &active).await;
 
-        let agent_id = crate::session::manager_agent_id(&active);
-        crate::message_router::route(
-            &agent_id,
-            crate::message_router::AgentJob {
-                content: text,
-                workspace_name: active,
-                user_name: String::new(),
-                channel: "voice".to_string(),
-                kind: crate::message_router::JobKind::UserMessage,
-                role: crate::Role::Manager,
-                reply_target: None,
-            },
+        crate::message_router::route_user_message(
+            text,
+            active,
+            String::new(),
+            "voice".to_string(),
+            crate::Role::Manager,
+            None,
         );
         return;
     }
@@ -4504,18 +4493,13 @@ async fn route_to_agent(text: String) {
     );
     broadcast_voice_transcript(&text, "", &ws.name).await;
 
-    let agent_id = crate::session::manager_agent_id(&ws.name);
-    crate::message_router::route(
-        &agent_id,
-        crate::message_router::AgentJob {
-            content: text,
-            workspace_name: ws.name,
-            user_name: String::new(),
-            channel: "voice".to_string(),
-            kind: crate::message_router::JobKind::UserMessage,
-            role: crate::Role::Manager,
-            reply_target: None,
-        },
+    crate::message_router::route_user_message(
+        text,
+        ws.name,
+        String::new(),
+        "voice".to_string(),
+        crate::Role::Manager,
+        None,
     );
 }
 

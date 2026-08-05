@@ -8,7 +8,7 @@
 //! # Producer paths
 //!
 //! Three sources feed into [`route`]:
-//! - **User messages**: chat messages from users → enqueue
+//! - **User messages**: chat messages from users → enqueue via [`route_user_message`]
 //! - **Ticket notifications**: ticket transitions → enqueue
 //! - **AskTool results**: async sub-agent results → enqueue
 //!
@@ -201,6 +201,36 @@ pub fn route(agent_id: &str, job: AgentJob) {
     }
 
     guard.insert(agent_id.to_string(), tx);
+}
+
+/// Route a user message to the agent for the given role in a workspace.
+///
+/// Computes the agent ID via [`crate::session::resolve_agent_id`] (Manager
+/// role → `manager_{ws_name}`, others → channel-scoped direct ID) and enqueues
+/// a [`JobKind::UserMessage`] job. Surrounding per-site pipelines (broadcast,
+/// persistence, enrichment) remain at the call sites.
+pub fn route_user_message(
+    content: String,
+    workspace_name: String,
+    user_name: String,
+    channel: String,
+    role: Role,
+    reply_target: Option<String>,
+) {
+    let agent_id =
+        crate::session::resolve_agent_id(&channel, &user_name, role.as_str(), &workspace_name);
+    route(
+        &agent_id,
+        AgentJob {
+            content,
+            workspace_name,
+            user_name,
+            channel,
+            kind: JobKind::UserMessage,
+            role,
+            reply_target,
+        },
+    );
 }
 
 /// Register an agent in the router table without spawning a consumer loop.

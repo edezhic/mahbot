@@ -19,9 +19,9 @@ use mahbot::channels::telegram::{
 use mahbot::channels::{broadcast_incoming_message, persist_incoming_message, send_channel_reply};
 use mahbot::config::CONFIG;
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
-use mahbot::message_router::{self, AgentJob, JobKind};
+use mahbot::message_router;
 use mahbot::parse_bot_command;
-use mahbot::session::{Session, manager_agent_id, resolve_agent_id};
+use mahbot::session::{Session, resolve_agent_id};
 use mahbot::util::UnwrapPoison;
 use mahbot::{BotCommand, Channel, ChannelMessage, Role, Workspace};
 /// JetBrainsMono-Regular.ttf embedded for Iced dashboard default font.
@@ -78,18 +78,13 @@ async fn handle_option_callback(mut msg: ChannelMessage) {
 
     // Route directly to Manager session, bypassing resolve_active_role.
     // Enrichment is skipped — synthetic callback text has no media markers or URLs.
-    let agent_id = manager_agent_id(&ws.name);
-    message_router::route(
-        &agent_id,
-        AgentJob {
-            content: msg.content,
-            workspace_name: ws.name,
-            user_name: msg.user_name,
-            channel: msg.channel,
-            kind: JobKind::UserMessage,
-            role: Role::Manager,
-            reply_target: None,
-        },
+    message_router::route_user_message(
+        msg.content,
+        ws.name,
+        msg.user_name,
+        msg.channel,
+        Role::Manager,
+        None,
     );
 }
 
@@ -904,22 +899,12 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     // Every message resolves to a deterministic agent ID and routes
     // through the per-agent consumer loop.  Different agent IDs get
     // different consumer loops = true parallelism.
-    let agent_id = resolve_agent_id(
-        &msg.channel,
-        &msg.user_name,
-        effective_role.as_str(),
-        &ws.name,
-    );
-    message_router::route(
-        &agent_id,
-        AgentJob {
-            content: msg.content,
-            workspace_name: ws.name,
-            user_name: msg.user_name,
-            channel: msg.channel,
-            kind: JobKind::UserMessage,
-            role: effective_role,
-            reply_target: Some(msg.reply_target),
-        },
+    message_router::route_user_message(
+        msg.content,
+        ws.name,
+        msg.user_name,
+        msg.channel,
+        effective_role,
+        Some(msg.reply_target),
     );
 }
