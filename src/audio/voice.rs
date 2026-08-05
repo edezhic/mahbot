@@ -1577,7 +1577,7 @@ const MATCH_THRESHOLD_FACTOR: f32 = 0.71;
 /// threshold accounts for the higher per-frame scores from stride-8 dense
 /// embeddings versus stride-1 streaming embeddings.
 #[expect(clippy::cast_precision_loss)]
-fn match_threshold() -> f32 {
+const fn match_threshold() -> f32 {
     (ROLLING_WINDOW_N as f32) * MATCH_THRESHOLD_FACTOR
 }
 
@@ -1605,17 +1605,9 @@ const ADAPTIVE_K_MAX: f32 = 4.0;
 /// limiting factor on detection rate.
 const ADAPTIVE_CEILING: f32 = 4.503;
 
-/// Safe harbor — the adaptive threshold must never drop below this value,
-/// which matches the current static [`match_threshold()`]
-/// (ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR = 3 × 0.71 = 2.13).
-/// Calibrated for dense stride-8 embeddings.  The 1.58× multiplier
-/// over the old streaming value (1.35 → 2.13) accounts for the higher
-/// per-frame scores from stride-8 dense embeddings.
-/// Derived from the same constants as [`match_threshold()`] so the two values
-/// are always in sync.  Prevents a feedback loop where false accepts push
-/// the threshold lower.
-#[expect(clippy::cast_precision_loss)]
-const ADAPTIVE_SAFE_HARBOR: f32 = (ROLLING_WINDOW_N as f32) * MATCH_THRESHOLD_FACTOR;
+/// Safe harbor floor for the adaptive threshold, equal to [`match_threshold()`]
+/// (2.13); prevents a feedback loop where false accepts push the threshold lower.
+const ADAPTIVE_SAFE_HARBOR: f32 = match_threshold();
 
 /// Number of bootstrap frames to use the static threshold while the adaptive
 /// window fills.  Calibrated for dense stride-8 embeddings.
