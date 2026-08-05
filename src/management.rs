@@ -801,62 +801,36 @@ const CLAIM_PHASES: &[(TicketPhase, PollPhase)] = &[
     (TicketPhase::Reviewed, PollPhase::VerifierCheck(QA_VI)),
 ];
 
-/// Run the given action for each ticket in `phase` for the named workspace.
+/// Spawn a background task per ticket in `phase` for the workspace.
 ///
-/// Lists tickets via [`BoardStore::list_all_tickets`] with both filters set.
-/// Does NOT load comments — lightweight enough for poll loops.
+/// Lists tickets via [`BoardStore::list_all_tickets`] with both filters set;
+/// does NOT load comments — lightweight enough for poll loops. On DB errors,
+/// logs and returns; tickets stay in phase and are re-picked next poll cycle.
 ///
-/// On DB errors, logs the error and returns without calling `action`. This is
-/// safe because tickets stay in their current phase and will be picked up again
-/// on the next poll cycle (~1s).
-async fn for_each_ticket_in_phase(
-    phase: TicketPhase,
-    workspace_name: &str,
-    mut action: impl FnMut(Ticket),
-) {
-    match board()
-        .list_all_tickets(Some(workspace_name), Some(phase))
-        .await
-    {
-        Ok(tickets) => {
-            for ticket in tickets {
-                action(ticket);
-            }
-        }
-        Err(e) => {
-            error!(workspace = workspace_name, phase = %phase, error = %e, "Phase listing failed");
-        }
-    }
-}
-
-/// Spawn background tasks for each ticket in the given phase.
-///
-/// Wraps [`for_each_ticket_in_phase`] with a `tokio::spawn` for each ticket, so
-/// each ticket is processed concurrently and independently. The ticket stays
-/// in its current phase until processing completes — transient failures cause
-/// a re-dispatch on the next poll cycle rather than a transition to `Failed`.
-///
-/// Raw `tokio::spawn` is used here instead of `spawn_dispatch` because:
-/// - There is no claim transition — the ticket stays in its phase until the
-///   operation succeeds, so transient failures are harmless (re-dispatched
-///   on the next poll cycle).
-/// - `spawn_dispatch`'s panic-recovery moves tickets to `Failed`, but the
-///   correct behavior here is to stay in the current phase for retry.
-/// - No `Arc` wrapping is needed because `Ticket` is moved by value into
-///   the spawned task.
+/// Raw `tokio::spawn` is used instead of `spawn_dispatch` because there is no
+/// claim transition — the ticket stays in its phase until the operation
+/// succeeds, so transient failures (and panics, which `spawn_dispatch` would
+/// move to `Failed`) are harmless: the ticket is re-dispatched on the next
+/// poll cycle. `Ticket` is moved by value, so no `Arc` wrapping is needed.
 async fn spawn_for_each_ticket_in_phase<F, Fut>(phase: TicketPhase, ws: &Workspace, f: F)
 where
     F: Fn(Ticket, Workspace) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    for_each_ticket_in_phase(phase, &ws.name, |ticket| {
-        let f = f.clone();
-        let ws = ws.clone();
-        tokio::spawn(async move {
-            f(ticket, ws).await;
-        });
-    })
-    .await;
+    match board().list_all_tickets(Some(&ws.name), Some(phase)).await {
+        Ok(tickets) => {
+            for ticket in tickets {
+                let f = f.clone();
+                let ws = ws.clone();
+                tokio::spawn(async move {
+                    f(ticket, ws).await;
+                });
+            }
+        }
+        Err(e) => {
+            error!(workspace = %ws.name, phase = %phase, error = %e, "Phase listing failed");
+        }
+    }
 }
 
 /// Run one poll round: claim actionable tickets and dispatch agents.

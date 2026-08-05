@@ -1442,8 +1442,8 @@ impl BoardStore {
             to: TicketPhase::QaPassed,
             pipeline_reservation: true,
             // Note: pipeline_reservation = true on InSanitation → QaPassed is inert —
-            // QaPassed uses list-based dispatch (for_each_ticket_in_phase), not the claim
-            // loop where pipeline_reservation provides ordering. Set `true` to match
+            // QaPassed uses list-based dispatch (spawn_for_each_ticket_in_phase), not the
+            // claim loop where pipeline_reservation provides ordering. Set `true` to match
             // the production-side convention (sanitation is substantive work, like
             // development and diagnostics); the flag is harmless for list-based dispatch.
         },
