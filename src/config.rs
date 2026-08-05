@@ -116,6 +116,7 @@ pub(crate) const DEFAULT_PROVIDER_ENDPOINT: &str = "https://openrouter.ai/api/v1
 
 const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-3.1-flash-image-preview";
 const DEFAULT_VIDEO_GEN_MODEL: &str = "google/veo-3.1-lite";
+const DEFAULT_VIDEO_EDIT_MODEL: &str = "runway/aleph-2";
 pub(crate) const DEFAULT_IMAGE_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.6-plus";
 pub(crate) const DEFAULT_TTS_LANGUAGE: &str = "na";
 
@@ -267,6 +268,10 @@ pub struct ConfigData {
     pub video_gen_model: Option<String>,
     /// Newline-separated list of available video generation models (for selection UI).
     pub video_gen_models: Option<String>,
+    /// Video edit model.
+    pub video_edit_model: Option<String>,
+    /// Newline-separated list of available video edit models (for selection UI).
+    pub video_edit_models: Option<String>,
     /// Firecrawl API key for web search.
     pub firecrawl_key: Option<String>,
     /// Exa API key for web search (alternative to Firecrawl).
@@ -549,6 +554,8 @@ string_config_fields! {
     image_gen_models [list_or(fallback = image_gen_model, default = DEFAULT_IMAGE_GEN_MODEL)],
     video_gen_model [or(DEFAULT_VIDEO_GEN_MODEL)],
     video_gen_models [list_or(fallback = video_gen_model, default = DEFAULT_VIDEO_GEN_MODEL)],
+    video_edit_model [or(DEFAULT_VIDEO_EDIT_MODEL)],
+    video_edit_models [list_or(fallback = video_edit_model, default = DEFAULT_VIDEO_EDIT_MODEL)],
     firecrawl_key [non_empty],
     exa_key [non_empty],
     web_search_provider [non_empty],

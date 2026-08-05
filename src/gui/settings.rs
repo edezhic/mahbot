@@ -188,6 +188,7 @@ fn model_picker_list<'a>(
 pub enum ModelPickerTarget {
     ImageGen,
     VideoGen,
+    VideoEdit,
 }
 
 impl ModelPickerTarget {
@@ -195,6 +196,7 @@ impl ModelPickerTarget {
         match self {
             ModelPickerTarget::ImageGen => 0,
             ModelPickerTarget::VideoGen => 1,
+            ModelPickerTarget::VideoEdit => 2,
         }
     }
 }
@@ -217,6 +219,9 @@ fn picker_config_fields<'a>(
     match t {
         ModelPickerTarget::ImageGen => (&mut config.image_gen_models, &mut config.image_gen_model),
         ModelPickerTarget::VideoGen => (&mut config.video_gen_models, &mut config.video_gen_model),
+        ModelPickerTarget::VideoEdit => {
+            (&mut config.video_edit_models, &mut config.video_edit_model)
+        }
     }
 }
 
@@ -2011,6 +2016,19 @@ impl SettingsState {
                     self.config.video_gen_model.as_deref(),
                     self.model_picker_inputs[ModelPickerTarget::VideoGen.idx()].as_str(),
                     "model name (e.g. google/veo-...)",
+                ),
+                Space::new().height(12),
+                text("Video Edit")
+                    .size(13)
+                    .font(iced::Font::MONOSPACE)
+                    .color(theme::ACCENT),
+                Space::new().height(2),
+                model_picker_list(
+                    ModelPickerTarget::VideoEdit,
+                    self.config.video_edit_models.as_deref(),
+                    self.config.video_edit_model.as_deref(),
+                    self.model_picker_inputs[ModelPickerTarget::VideoEdit.idx()].as_str(),
+                    "model name (e.g. runway/aleph-2)",
                 ),
             ],
         )

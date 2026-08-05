@@ -258,7 +258,7 @@ use crate::config::CONFIG;
 use crate::tools::{
     AddCommentTool, AskTool, BrowserTool, CreateTicketTool, DispatchMode, EditTool, GetTicketTool,
     ImageGenTool, ListTicketsTool, ReadTool, SearchArchivedTicketsTool, SearchTool, ShellMode,
-    ShellTool, UpdateTicketTool, VideoGenTool, WebSearchBackend, WebSearchTool,
+    ShellTool, UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend, WebSearchTool,
 };
 
 impl Role {
@@ -326,6 +326,7 @@ impl Role {
                     Box::new(SearchTool),
                     Box::new(ImageGenTool),
                     Box::new(VideoGenTool),
+                    Box::new(VideoEditTool),
                 ]
             }
             Role::Maintainer => {

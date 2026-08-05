@@ -12,6 +12,7 @@ pub(crate) mod search;
 pub(crate) mod search_archived_tickets;
 pub(crate) mod shell;
 pub(crate) mod ticket;
+pub(crate) mod video_edit;
 pub(crate) mod video_gen;
 pub(crate) mod web_search;
 
@@ -59,6 +60,7 @@ pub(crate) use shell::{ShellMode, ShellTool};
 pub(crate) use ticket::{
     AddCommentTool, CreateTicketTool, GetTicketTool, ListTicketsTool, UpdateTicketTool,
 };
+pub(crate) use video_edit::VideoEditTool;
 pub(crate) use video_gen::VideoGenTool;
 pub(crate) use web_search::{WebSearchBackend, WebSearchTool};
 
@@ -409,9 +411,10 @@ mod tests {
     // ── media_marker coverage ────────────────────────────────────────
     fn all_media_tools_implement_media_marker() {
         // Each media-generation tool must return Some from media_marker()
-        let tools: [(&str, Box<dyn Tool>); 2] = [
+        let tools: [(&str, Box<dyn Tool>); 3] = [
             ("ImageGenTool", Box::new(ImageGenTool)),
             ("VideoGenTool", Box::new(VideoGenTool)),
+            ("VideoEditTool", Box::new(VideoEditTool)),
         ];
         for (name, tool) in &tools {
             let marker = tool.media_marker();

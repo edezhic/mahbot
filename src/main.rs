@@ -727,6 +727,14 @@ async fn build_models_keyboard(msg: &ChannelMessage) -> serde_json::Value {
             "__act__set_video_model",
         );
 
+        // Video edit model buttons — each on its own row
+        build_model_button_rows(
+            &mut rows,
+            &CONFIG.video_edit_models(),
+            &CONFIG.video_edit_model(),
+            "__act__set_video_edit_model",
+        );
+
         rows.push(clear_session_btn);
         rows
     } else {
@@ -771,6 +779,9 @@ async fn handle_action_callback(msg: ChannelMessage) {
         }
         "set_video_model" => {
             handle_set_model_action(&msg, &payload, "video_gen_model", "Video").await;
+        }
+        "set_video_edit_model" => {
+            handle_set_model_action(&msg, &payload, "video_edit_model", "Video edit").await;
         }
         "clear_session" => {
             // Acknowledge callback silently first (dismiss spinner)
