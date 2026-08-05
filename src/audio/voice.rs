@@ -872,7 +872,7 @@ async fn wait_for_tts_styles() -> Option<Vec<String>> {
     if !crate::audio::tts::models_ready() && !crate::audio::tts::try_load_cached() {
         info!(
             "TTS models not cached — triggering download on demand (~400 MB) \
-                 for confusable/unrelated embedding pre-warm (mahbot-932)"
+                 for confusable/unrelated embedding pre-warm"
         );
         crate::audio::tts::spawn_or_retry_download();
     }
@@ -992,7 +992,7 @@ pub(crate) async fn prewarm_confusable_embeddings() {
 
     if count > 0 {
         info!(
-            "Pre-warmed {count} confusable phrase dense embedding(s)              from {} phrases × {CONFUSABLE_SEEDS_PER_PHRASE} seeds              for negative training (mahbot-923)",
+            "Pre-warmed {count} confusable phrase dense embedding(s)              from {} phrases × {CONFUSABLE_SEEDS_PER_PHRASE} seeds              for negative training",
             CONFUSABLE_PHRASES.len(),
         );
     } else {
@@ -1325,7 +1325,7 @@ pub(crate) async fn prewarm_unrelated_embeddings() {
 
     if count > 0 {
         info!(
-            "Pre-warmed {count} unrelated phrase dense embedding(s)              from {} phrases × {UNRELATED_SEEDS_PER_PHRASE} seeds              for negative training (mahbot-923)",
+            "Pre-warmed {count} unrelated phrase dense embedding(s)              from {} phrases × {UNRELATED_SEEDS_PER_PHRASE} seeds              for negative training",
             UNRELATED_PHRASES.len(),
         );
     } else {
@@ -4672,7 +4672,7 @@ impl AdaptiveThresholdState {
 // per-frame scoring geometry / adaptive-mode instrumentation
 // for the training-vs-streaming same-audio comparison
 
-/// Geometry class of a single scored embedding window (mahbot-1012 §1).
+/// Geometry class of a single scored embedding window.
 ///
 /// Every scored window is classified into exactly one of four classes so the
 /// benchmark can attribute score deficits to the known structural divergences
@@ -4705,7 +4705,7 @@ pub(crate) enum WindowGeometry {
 
 #[cfg(feature = "voice-tests")]
 impl WindowGeometry {
-    /// Stable snake_case label for JSON output (mahbot-1012).
+    /// Stable snake_case label for JSON output.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::ColdStartTiled => "cold_start_tiled",
@@ -4797,7 +4797,7 @@ pub(crate) fn start_aligned_positions(buffer_len: usize) -> Vec<usize> {
         .collect()
 }
 
-/// Classify the geometry of one scored window (mahbot-1012 §1).
+/// Classify the geometry of one scored window.
 ///
 /// Pure function so the classification is unit-testable without pipeline
 /// state.  The four classes are decided in precedence order:
@@ -4819,11 +4819,11 @@ pub(crate) fn start_aligned_positions(buffer_len: usize) -> Vec<usize> {
 ///    deferred burst sweep or the segment-end pass score start-aligned
 ///    positions with synthetic fade-out padding when the buffer is shorter
 ///    than [`EMBEDDING_WINDOW_FRAMES`] (the old incremental per-chunk
-///    short-buffer fallback was removed in mahbot-1023; the padding class
+///    short-buffer fallback was removed; the padding class
 ///    name is kept for report stability).
 /// 4. **TrueSliding** — a genuine stride-8 sliding window.
 ///
-/// # Ring-capacity correctness (mahbot-1012 reviewer)
+/// # Ring-capacity correctness
 ///
 /// The tiled check uses the PRE-push ring length exactly as
 /// [`score_single_embedding`] sees it (post-push `len() >= WINDOW_SIZE`
@@ -4856,11 +4856,11 @@ pub(crate) fn classify_window_geometry(
     }
 }
 
-/// Per-frame adaptive-threshold mode (mahbot-1012 §1).  Mirrors the
+/// Per-frame adaptive-threshold mode.  Mirrors the
 /// feed/peek/bootstrap decision inside [`score_single_embedding`]: the
 /// feed/peek rule is score-based ONLY (scores below `NO_MATCH_RESET_THRESHOLD`
 /// `feed` the background statistics; wake-word-like scores only `peek`),
-/// including during bootstrap (mahbot-1023).  The label is STATE-based for
+/// including during bootstrap.  The label is STATE-based for
 /// bootstrap frames (`Bootstrap` while the state has not completed its
 /// bootstrap window, regardless of the feed/peek action taken this frame —
 /// a high-scoring bootstrap frame peeks and still labels `Bootstrap`) and
@@ -4884,7 +4884,7 @@ pub(crate) enum AdaptiveFrameMode {
 
 #[cfg(feature = "voice-tests")]
 impl AdaptiveFrameMode {
-    /// Stable snake_case label for JSON output (mahbot-1012).
+    /// Stable snake_case label for JSON output.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Bootstrap => "bootstrap",
@@ -4894,8 +4894,7 @@ impl AdaptiveFrameMode {
     }
 }
 
-/// Deterministic 64-bit hash of an embedding for cross-path comparison
-/// (mahbot-1012 §1).
+/// Deterministic 64-bit hash of an embedding for cross-path comparison.
 ///
 /// FNV-1a over the f32 bit patterns with `-0.0` canonicalised to `+0.0` and
 /// NaN payloads canonicalised to a single quiet NaN, so the hash is stable
@@ -4931,7 +4930,7 @@ fn embedding_hash(embedding: &[f32]) -> u64 {
     hash
 }
 
-/// L2 norm of an embedding (mahbot-1012 §1).  Reported alongside the hash so
+/// L2 norm of an embedding.  Reported alongside the hash so
 /// the dual-path comparison can quantify embedding drift (the manager's lead
 /// measured L2 deltas of 15-30% of the vector norm between paths).
 #[cfg(feature = "voice-tests")]
@@ -4941,8 +4940,8 @@ fn embedding_l2_norm(embedding: &[f32]) -> f32 {
 
 // Pipeline context
 
-/// Per-variant instrumentation collected by the wake word detection benchmark
-/// (mahbot-886).  Feature-gated behind `voice-tests` — zero production overhead.
+/// Per-variant instrumentation collected by the wake word detection benchmark.
+/// Feature-gated behind `voice-tests` — zero production overhead.
 #[cfg(feature = "voice-tests")]
 #[derive(Debug, Clone)]
 pub(crate) struct DetectionInstrumentation {
@@ -4952,14 +4951,14 @@ pub(crate) struct DetectionInstrumentation {
     /// (adaptive threshold post-bootstrap, or static match_threshold()
     /// during bootstrap / when no adaptive state is configured).  Used by
     /// the benchmark's miss-classification logic to distinguish
-    /// adaptive-threshold blocks (mahbot-891).
+    /// adaptive-threshold blocks.
     pub per_frame_scores: Vec<[f32; 3]>,
     /// Count of frames where `total_score < NO_MATCH_RESET_THRESHOLD` (0.316).
     pub n_frames_below_reset: usize,
     /// Count of VAD-positive 512-sample frames during streaming detection.
     pub vad_speech_frames: usize,
     /// Peak rolling-sum score across all segments in this detection session
-    /// (mahbot-894).  Preserved across segment-end resets by capturing from
+    /// Preserved across segment-end resets by capturing from
     /// [`ctx.peak_score`](PipelineCtx::peak_score) before
     /// [`reset_detection_segment`] clears the main field, via max-tracking
     /// conditionals at both the [`reset_detection_segment`] and
@@ -4968,7 +4967,7 @@ pub(crate) struct DetectionInstrumentation {
     /// maximum peak across all segments so the E2E benchmark reports an
     /// accurate value.
     pub peak_score: f32,
-    /// Per-frame adaptive threshold trajectory (mahbot-923 §7).
+    /// Per-frame adaptive threshold trajectory.
     /// Records the effective threshold value (`per_frame_scores[i][2]`) at each
     /// embedding frame so the two-tier ADAPTIVE_CEILING escalation plan
     /// (4.503 → 5.5 → 6.0) can be data-driven: if the ceiling is consistently
@@ -4981,10 +4980,10 @@ pub(crate) struct DetectionInstrumentation {
     /// Index into [`per_frame_scores`](Self::per_frame_scores) of the first
     /// frame where the rolling sum reached the effective threshold (classifier
     /// trigger).  `None` if the classifier never triggered on test-utterance
-    /// frames (mahbot-1005 §2 evidence).
+    /// frames.
     pub first_trigger_frame_idx: Option<usize>,
 
-    // ── mahbot-1012 per-frame scoring geometry ────────────────────────────
+    // ── per-frame scoring geometry ─────────────────────────────────────────
     // All `per_frame_*` arrays below are parallel to
     // [`per_frame_scores`](Self::per_frame_scores): entry `i` describes the
     // embedding scored at frame `i`.
@@ -5024,7 +5023,7 @@ pub(crate) struct DetectionInstrumentation {
     /// the ~1.6-hop-per-mel-frame ratio (mel stride 160 samples at 16 kHz).
     pub per_hop_vad: Vec<bool>,
 
-    // ── mahbot-1023 deferred-burst instrumentation ────────────────────────
+    // ── deferred-burst instrumentation ─────────────────────────────────────
     /// Whether the deferred burst sweep ran in this segment.  Cleared with
     /// [`PipelineCtx`] per-segment state (segment resets), NOT per call.
     pub burst_sweep_fired: bool,
@@ -5264,7 +5263,7 @@ pub(crate) struct PipelineCtx {
     burst_sweep_done: bool,
 
     /// Instrumentation accumulators for wake word detection benchmarking
-    /// (mahbot-886).  Feature-gated behind `voice-tests` — zero production
+    /// Feature-gated behind `voice-tests` — zero production
     /// overhead.  Populated by `handle_wake_word_detection` and
     /// `handle_wake_word_detection`, read by the E2E benchmark after
     /// `run_streaming_detection` returns.
@@ -6069,7 +6068,7 @@ async fn finalize_enrollment_pipeline() -> bool {
     if !use_mahbot_confusables {
         info!(
             "Skipping Mahbot-specific confusable phrases for wake word \
-             '{enrolled_phrase}' (mahbot-909); see is_mahbot_wake_word() \
+             '{enrolled_phrase}'; see is_mahbot_wake_word() \
              docs for quality implications",
         );
     }
@@ -6086,7 +6085,7 @@ async fn finalize_enrollment_pipeline() -> bool {
     if n_ambient_classifier > 0 {
         info!(
             "Adding {n_ambient_classifier} dense ambient negative \
-             sequences to classifier negative set (mahbot-923)",
+             sequences to classifier negative set",
         );
         neg_sequences.extend(negative_sequences.clone());
     }
@@ -6094,21 +6093,21 @@ async fn finalize_enrollment_pipeline() -> bool {
     if n_owner_classifier > 0 {
         info!(
             "Adding {n_owner_classifier} owner-negative dense sequences \
-             to classifier negative set (mahbot-932)",
+             to classifier negative set",
         );
         neg_sequences.extend(owner_negative_sequences.clone());
     }
     if use_mahbot_confusables && !confusable_dense.is_empty() {
         info!(
             "Adding {} confusable dense sequences to classifier negative set \
-             for Mahbot wake word '{enrolled_phrase}' (mahbot-909)",
+             for Mahbot wake word '{enrolled_phrase}'",
             confusable_dense.len(),
         );
         neg_sequences.extend_from_slice(confusable_dense);
     }
     if !unrelated_dense.is_empty() {
         info!(
-            "Adding {} unrelated dense sequences to classifier negative set (mahbot-878)",
+            "Adding {} unrelated dense sequences to classifier negative set",
             unrelated_dense.len(),
         );
         neg_sequences.extend_from_slice(unrelated_dense);
@@ -6462,7 +6461,7 @@ pub async fn run_voice_pipeline() {
                     } else {
                         warn!(
                             "owner_negative_chunks at capacity ({} samples): \
-                             dropping residual chunk of {} samples (mahbot-913)",
+                             dropping residual chunk of {} samples",
                             MAX_OWNER_NEGATIVE_SAMPLES,
                             chunk.len(),
                         );
@@ -7384,7 +7383,7 @@ fn score_stride8_window(
     // ── Capture pre-call ring length for geometry instrumentation ──
     #[cfg(feature = "voice-tests")]
     let ring_len_before = ctx.embedding_ring.len();
-    // mahbot-1012: capture the adaptive bootstrap state BEFORE the call —
+    // Capture the adaptive bootstrap state BEFORE the call —
     // `feed()` advances the bootstrap counter, so post-call `is_bootstrapping()`
     // cannot distinguish the last bootstrap frame from a post-bootstrap frame.
     #[cfg(feature = "voice-tests")]
@@ -7406,7 +7405,7 @@ fn score_stride8_window(
     // ── Instrumentation (voice-tests only) ──
     #[cfg(feature = "voice-tests")]
     {
-        // mahbot-1012: number of test-pass frames scored before this window
+        // Number of test-pass frames scored before this window
         // (pre-push — the push below appends this window's score).  Used by
         // classify_window_geometry's WarmMixed test: the Conv1D window spans
         // the last WINDOW_SIZE pushed embeddings, so it contains a warm-up
@@ -7430,7 +7429,7 @@ fn score_stride8_window(
         if effective_threshold >= ADAPTIVE_CEILING {
             ctx.instrumentation.ceiling_limited_frames += 1;
         }
-        // mahbot-1023: record the scoring path that produced the detection
+        // Record the scoring path that produced the detection
         // (raw source: "burst" / "segment_end_pass" / "other").
         if detected && ctx.instrumentation.detection_path.is_none() {
             ctx.instrumentation.detection_path = Some(source.as_str());
@@ -7446,7 +7445,7 @@ fn score_stride8_window(
                 Some(ctx.instrumentation.per_frame_scores.len() - 1);
         }
 
-        // ── mahbot-1012: per-frame scoring geometry (parallel to
+        // ── per-frame scoring geometry (parallel to
         //    per_frame_scores) ─────────────────────────────────────────────
         // The caller-provided mel-window geometry (padded fallback vs main
         // stride-8 loop) is combined with the classifier-ring-derived geometry
@@ -7461,7 +7460,7 @@ fn score_stride8_window(
         // Mirror of the feed/peek decision inside score_single_embedding
         // (voice.rs, adaptive_override): the feed/peek rule is score-based
         // ONLY (below-reset scores feed; wake-word-like scores peek) including
-        // during bootstrap (mahbot-1023).  The label is state-based for
+        // during bootstrap.  The label is state-based for
         // bootstrap frames (Bootstrap while bootstrapping, regardless of the
         // feed/peek action) and action-based after bootstrap (Feed / Peek) —
         // see AdaptiveFrameMode.  `adaptive_bootstrapping_before` is captured
@@ -7593,7 +7592,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     let mut voice_batch = std::mem::take(&mut ctx.voice_batch);
     let mut mel_frame_buffer = std::mem::take(&mut ctx.mel_frame_buffer);
 
-    // VAD counting for instrumentation (mahbot-886).  Uses an `AtomicUsize`
+    // VAD counting for instrumentation.  Uses an `AtomicUsize`
     // captured by shared reference in the closure to avoid a borrow conflict
     // with `on_flush` (which captures `ctx` by `&mut`).  `AtomicUsize::fetch_add`
     // takes `&self`, so the closure captures `&AtomicUsize` — no `&mut` needed.
@@ -7601,7 +7600,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     #[cfg(feature = "voice-tests")]
     let vad_count = std::sync::atomic::AtomicUsize::new(0);
 
-    // mahbot-1012: per-hop VAD decision sequence.  Captured by the closure
+    // Per-hop VAD decision sequence.  Captured by the closure
     // (moved into `process_streaming_frames_inner` by value, then transferred
     // into instrumentation after the loop — same pattern as `vad_count`).
     #[cfg(feature = "voice-tests")]
@@ -7786,16 +7785,16 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
         }
     }
 
-    // Transfer VAD count into instrumentation (mahbot-886).
+    // Transfer VAD count into instrumentation.
     // Accumulate (`+=`) instead of overwriting (`=`): handle_wake_word_detection
     // is called once per audio chunk, and the VAD count is per-call.  The old
     // overwrite kept only the LAST call's count (~0 after the silence flush),
-    // making the benchmark's vad_speech_frames evidence unreliable (mahbot-1005).
+    // making the benchmark's vad_speech_frames evidence unreliable.
     #[cfg(feature = "voice-tests")]
     {
         ctx.instrumentation.vad_speech_frames +=
             vad_count.load(std::sync::atomic::Ordering::Relaxed);
-        // mahbot-1012: per-hop VAD decision sequence (one entry per VAD
+        // Per-hop VAD decision sequence (one entry per VAD
         // decision in processing order).
         ctx.instrumentation.per_hop_vad.extend(per_hop_vad);
     }
@@ -7986,7 +7985,7 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                         if state.negative_audio_chunks.len() >= MAX_NEGATIVE_AUDIO_CHUNKS {
                             warn!(
                                 "negative_audio_chunks at max ({}): discarding oldest chunk \
-                                 to cap memory growth (mahbot-800)",
+                                 to cap memory growth",
                                 MAX_NEGATIVE_AUDIO_CHUNKS,
                             );
                             state.negative_audio_chunks.remove(0);
@@ -8215,7 +8214,7 @@ fn handle_negative_collection_audio(samples: &[f32], ctx: &mut PipelineCtx) {
                     } else {
                         warn!(
                             "owner_negative_chunks at capacity ({} samples): dropping chunk \
-                             of {} samples (mahbot-913)",
+                             of {} samples",
                             MAX_OWNER_NEGATIVE_SAMPLES,
                             chunk.len(),
                         );
@@ -8250,9 +8249,8 @@ mod tests {
 
     /// Test config with a shorter silence threshold (10 frames ≈ 2560 samples
     /// instead of the default 94 frames ≈ 24000 samples) so tests don't need
-    /// prohibitively long audio buffers.  Context padding is 0 per mahbot-1001
-    /// Fix 3 — matches streaming detection which does not prepend/append
-    /// context padding.
+    /// prohibitively long audio buffers.  Context padding is 0 — matches
+    /// streaming detection which does not prepend/append context padding.
     const TEST_VAD_CONFIG: VadSegmentationConfig = VadSegmentationConfig {
         frame_length: FRAME_LENGTH,
         hop_length: HOP_LENGTH,
@@ -8328,7 +8326,7 @@ mod tests {
         );
     }
 
-    // ── VAD-gated streaming mel extraction tests (mahbot-1009) ───────────
+    // ── VAD-gated streaming mel extraction tests ─────────────────────────
     // These test [`vad_gate_streaming_mel`] with deterministic VAD decisions.
     // The mel-frame half requires ONNX models (unavailable in unit tests —
     // `flush_voice_batch` returns early when `ONNX_MODELS` is unset), so these
@@ -8572,7 +8570,7 @@ mod tests {
         assert!(!ctx.should_send_error_message());
     }
 
-    // ── AdaptiveThresholdState tests (mahbot-845) ─────────────────────────
+    // ── AdaptiveThresholdState tests ──────────────────────────────────────
     // Pure unit tests for the z-score adaptive threshold tracker.  Uses
     // synthetic per-frame scores — no ONNX models or voice pipeline state.
     // Covers bootstrap phase, mean/std computation, all safeguards, and reset.
@@ -8666,7 +8664,6 @@ mod tests {
         // The computed adaptive threshold (0.033 + 2.5 × 0.0) × 3 = 0.099
         // should be clamped to the safe harbor (2.13), matching production
         // where the threshold is fed real silence/background scores.
-        // Regression test for mahbot-891.
         let mut state = AdaptiveThresholdState::warmed();
         let threshold = state
             .feed(NEGATIVE_DISTRIBUTION_MEAN, ADAPTIVE_K_DEFAULT)
@@ -8712,7 +8709,7 @@ mod tests {
         );
     }
 
-    // ── AdaptiveThresholdState::peek() tests (mahbot-852) ─────────────────
+    // ── AdaptiveThresholdState::peek() tests ──────────────────────────────
     // Tests for the peek() method which returns the current threshold without
     // updating statistics.  Covers bootstrap guard, empty-window check,
     // threshold correctness, and the no-mutation invariant.
@@ -8752,7 +8749,7 @@ mod tests {
         let mut state = AdaptiveThresholdState::new();
         // Use low scores (0.1) so the computed adaptive value (~0.3) stays
         // below the safe harbor (2.13), verifying that peek() produces a
-        // clamped threshold rather than a raw adaptive value (mahbot-860).
+        // clamped threshold rather than a raw adaptive value.
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             state.feed(0.1, ADAPTIVE_K_DEFAULT);
         }
@@ -8880,7 +8877,7 @@ mod tests {
         );
     }
 
-    // ── score_single_embedding tiling fallback tests (mahbot-825) ──────────
+    // ── score_single_embedding tiling fallback tests ───────────────────────
     // Tests that when the embedding ring has fewer than WINDOW_SIZE (3) entries,
     // the available embeddings are tiled to fill the window instead of returning
     // a hard-coded 0.0.  These exercise the pure detection logic without ONNX
@@ -9069,13 +9066,13 @@ mod tests {
         );
     }
 
-    // ── score_single_embedding with adaptive state (mahbot-852) ────────────
+    // ── score_single_embedding with adaptive state ─────────────────────────
     // Tests that the feed/peek branching logic in score_single_embedding is
     // exercised: adaptive_state is passed as Some(...) so the code path that
     // conditionally calls feed() (for background scores) or peek() (for
-    // wake-word-like scores) is actually executed.  Since mahbot-1023 the
-    // feed/peek rule is score-based ONLY, including during bootstrap (below-
-    // reset scores feed; wake-word-like scores peek) — see
+    // wake-word-like scores) is actually executed.  The feed/peek rule is
+    // score-based ONLY, including during bootstrap (below-reset scores feed;
+    // wake-word-like scores peek) — see
     // score_single_with_adaptive_state_feeds_background_only.
 
     #[test]
@@ -9085,7 +9082,7 @@ mod tests {
         // Uses a classifier that produces ~0.3 per frame so the rolling sum
         // stays below the detection threshold (0.3 × 3 = 0.9 < 2.13).
         // Updated from classifier_always_half() (~0.5 per frame) after the
-        // mahbot-860 threshold lowering (1.65 → 1.35) made 3 × 0.5 = 1.5 ≥ 1.35
+        // threshold lowering (1.65 → 1.35) made 3 × 0.5 = 1.5 ≥ 1.35
         // trigger detection during the test.
         let classifier = classifier_always_score(0.3);
         let embedding = vec![0.5; EMBEDDING_DIM];
@@ -9124,7 +9121,7 @@ mod tests {
     fn score_single_with_adaptive_state_feeds_background_only() {
         // Verify that score_single_embedding feeds ONLY background scores
         // (below NO_MATCH_RESET_THRESHOLD) to the adaptive state — INCLUDING
-        // during bootstrap (mahbot-1023 bootstrap feed fix).  High scores go
+        // during bootstrap.  High scores go
         // through peek() instead, so a high-scoring utterance never
         // contaminates the adaptive statistics and can legitimately keep the
         // bootstrap alive for its whole duration (the static
@@ -9153,7 +9150,7 @@ mod tests {
         }
         // The bootstrap must NOT have completed and no statistics accumulated:
         // the old unconditional bootstrap feed would have completed it with
-        // 5 wake-word-like scores (the mahbot-1023 contamination).
+        // 5 wake-word-like scores (the bootstrap-feed contamination).
         assert!(
             adaptive.is_bootstrapping(),
             "high scores must not complete the bootstrap (peek during bootstrap)",
@@ -9208,7 +9205,7 @@ mod tests {
         );
     }
 
-    // ── PipelineCtx adaptive_k clamping (mahbot-845) ──────────────────────
+    // ── PipelineCtx adaptive_k clamping ───────────────────────────────────
     // PipelineCtx::new() reads adaptive_k from CONFIG and clamps it to
     // [ADAPTIVE_K_MIN, ADAPTIVE_K_MAX].  Verify this works for out-of-range
     // config values.
@@ -9254,7 +9251,7 @@ mod tests {
         );
     }
 
-    // ── reset_pipeline_state level tests (mahbot-805) ─────────────────────
+    // ── reset_pipeline_state level tests ──────────────────────────────────
     // These test the three ResetLevel variants against a PipelineCtx with
     // non-default field values.  Tests that touch global voice state (Full,
     // Cancel) use #[serial_test::serial(voice)].
@@ -9327,13 +9324,13 @@ mod tests {
         assert!(ctx.enrollment_pending.is_empty());
         assert!(ctx.noise_rms_estimate.is_none());
 
-        // Segment boundary tracking (mahbot-894).
+        // Segment boundary tracking.
         assert_eq!(
             ctx.segment_silence_hops, 0,
             "segment_silence_hops must be cleared by all reset levels"
         );
 
-        // Phase 3 owner-negative state (mahbot-913).
+        // Phase 3 owner-negative state.
         assert!(
             !ctx.collecting_negatives,
             "collecting_negatives must be false after reset"
@@ -9389,7 +9386,7 @@ mod tests {
 
         // Global enrollment accumulators PRESERVED by Full — they survive
         // mic stop/start cycles so mid-enrollment progress is not lost on
-        // toggle-off/on (mahbot-800, mahbot-819).
+        // toggle-off/on.
         let state = voice_state().read().unwrap_poison();
         assert_eq!(state.enrollment_buffer.len(), 1);
         assert_eq!(state.negative_audio_chunks.len(), 1);
@@ -9448,7 +9445,7 @@ mod tests {
         assert_eq!(ctx.last_wake_word_detection, saved_cooldown);
         assert_eq!(ctx.auto_start_pending, saved_auto_start);
         assert_eq!(ctx.is_recording, saved_recording);
-        // Soft clears rolling-window detection state (mahbot-895) but
+        // Soft clears rolling-window detection state but
         // preserves peak_score (which is only reset on Full/Cancel alongside
         // the wider acoustic state).
         assert_eq!(ctx.peak_score, saved_peak_score);
@@ -9530,7 +9527,7 @@ mod tests {
         }
     }
 
-    // ── reset_detection_segment tests (mahbot-894) ────────────────────────
+    // ── reset_detection_segment tests ─────────────────────────────────────
     // Verifies that the bounded-segment reset clears per-segment detection
     // state (embedding_ring, score_window, adaptive_threshold, peaks) while
     // preserving session-level state (VAD, audio_preprocessor, is_recording,
@@ -9557,7 +9554,7 @@ mod tests {
         }
     }
 
-    // ── handle_segment_boundary tests (mahbot-894) ──────────────────────
+    // ── handle_segment_boundary tests ───────────────────────────────────
     // Tests the extracted segment boundary check logic.  The public-API test
     // (handle_segment_boundary) is the canonical reset-contract reference and
     // supersedes the removed internal reset_detection_segment test.
@@ -9661,7 +9658,7 @@ mod tests {
         );
     }
 
-    // ── Deferred burst state machine (mahbot-1023, ONNX-free) ─────────────
+    // ── Deferred burst state machine (ONNX-free) ───────────────────────
     // The hold / burst-sweep / segment-end-pass / per-segment-flag lifecycle
     // is extracted into pure helpers (burst_positions_to_score /
     // start_aligned_positions) plus the PipelineCtx burst_sweep_done latch.
@@ -9673,7 +9670,7 @@ mod tests {
         // The burst must HOLD position 0 until the buffer reaches
         // BURST_TRIGGER_FRAMES (68): incremental per-chunk scoring of
         // positions 0/8/16/24 with 2–16 frames per chunk is exactly the
-        // mahbot-1023 bug (a ~10-real-frame window scores ~0.027 and never
+        // bug (a ~10-real-frame window scores ~0.027 and never
         // re-scores).
         for b in 0..BURST_TRIGGER_FRAMES {
             assert!(
@@ -9756,7 +9753,7 @@ mod tests {
 
     #[test]
     fn segment_end_pass_uses_burst_grid_latch_independently() {
-        // mahbot-1023 item 8 + manager pin 3: the boundary pass must cover
+        // The boundary pass must cover
         // the burst-equivalent grid (so the ring-4 sample at
         // position 24 scores exactly like the cold burst) AND be
         // latch-independent — a burst sweep that ran without detecting
@@ -10010,7 +10007,7 @@ mod tests {
         // VAD-positive frames: counter resets to 0 via store().
         // VAD-negative frames: counter increments via fetch_add().
         // Both operations happen inside the is_speech_fn closure — the same pattern
-        // used by handle_wake_word_detection (mahbot-894).
+        // used by handle_wake_word_detection.
         use std::sync::atomic::Ordering;
 
         const SPEECH_FRAMES_1: usize = 3;
@@ -10278,7 +10275,7 @@ mod tests {
         );
     }
 
-    // ── PCM cache key tests (mahbot-872) ────────────────────────────────────
+    // ── PCM cache key tests ─────────────────────────────────────────────────
 
     #[test]
     fn test_pcm_cache_key_determinism() {
@@ -10288,7 +10285,7 @@ mod tests {
         assert_eq!(a, b, "same inputs must produce same cache key");
     }
 
-    // ── Embedding cache roundtrip (mahbot-1029 D1) ─────────────────────────
+    // ── Embedding cache roundtrip ──────────────────────────────────────────
 
     #[test]
     fn embedding_cache_roundtrip_preserves_embeddings_exactly() {
@@ -10538,7 +10535,7 @@ mod tests {
         );
     }
 
-    // ── Voice metrics snapshot tests (mahbot-912) ────────────────────────────
+    // ── Voice metrics snapshot tests ─────────────────────────────────────────
     // These test the atomic counters, rolling average computation, and edge
     // cases (division by zero on empty snapshots).  The statics are preserved
     // between tests within a single process, so order-dependent tests must
@@ -10609,11 +10606,11 @@ mod tests {
         assert_eq!(snap.lifetime_avg_embedding_latency_ns(), 100_000);
     }
 
-    // ── Activation trace buffer tests (mahbot-897) ──────────────────────────
+    // ── Activation trace buffer tests ───────────────────────────────────────
     // These test the pure ActivationTraceBuffer FIFO eviction and iteration
     // without any pipeline state.
 
-    // ── PersistedModel versioning & compatibility tests (mahbot-898) ──────
+    // ── PersistedModel versioning & compatibility tests ───────────────────
 
     #[test]
     fn check_compatibility_accepts_current_version() {
@@ -10787,7 +10784,7 @@ mod tests {
         // (the classifier.is_none() guard prevents accidental migration of bare
         // ClassifierWeights or old WakeWordTemplates that deserialize as
         // PersistedModel with null classifier, which would overwrite the
-        // original data in the DB — mahbot-898 data-loss bug).
+        // original data in the DB — the data-loss bug).
         let mut model = PersistedModel {
             schema_version: 0,
             classifier: None,
@@ -10848,7 +10845,7 @@ mod tests {
         assert_eq!(normalize_phrase("\t\n"), DEFAULT_WAKE_WORD_PHRASE);
     }
 
-    // ── Mahbot wake word detection tests (mahbot-909) ─────────────────
+    // ── Mahbot wake word detection tests ──────────────────────────────
 
     #[test]
     fn is_mahbot_wake_word_accepts_exact_matches() {
@@ -10936,7 +10933,7 @@ mod tests {
         );
     }
 
-    // ── PCM cache eviction tests (mahbot-910) ────────────────────────────
+    // ── PCM cache eviction tests ─────────────────────────────────────────
     // These test the pure file-system eviction logic with a temp directory.
     // They do not require voice ONNX models or TTS.
     //
@@ -11218,7 +11215,7 @@ mod tests {
         );
     }
 
-    // ── Mel stride alignment test (mahbot-924) ────────────────────────────
+    // ── Mel stride alignment test ─────────────────────────────────────────
     // Validates that trim_voice_batch drains to a MEL_STRIDE-aligned boundary,
     // ensuring mel frame grid consistency between enrollment and inference.
 
@@ -11357,7 +11354,7 @@ mod tests {
         }
     }
 
-    // ── mahbot-1012: embedding hash + L2 norm tests ───────────────────────
+    // ── embedding hash + L2 norm tests ────────────────────────────────────
     // The dual-path same-audio comparison relies on the embedding hash being
     // deterministic and canonicalising floating-point edge cases: equal values
     // must hash equal (-0.0 == +0.0, NaN payloads collapse to one quiet NaN).
@@ -11389,7 +11386,7 @@ mod tests {
         assert_eq!(embedding_l2_norm(&[]), 0.0);
     }
 
-    // ── mahbot-1012: window geometry classification ─────────────────────────
+    // ── window geometry classification ──────────────────────────────────────
     // classify_window_geometry is a pure function; these tests pin the
     // precedence order and the ring-capacity (front-eviction) correctness that
     // the old inline WarmMixed proxy got wrong.
@@ -11417,7 +11414,7 @@ mod tests {
     #[cfg(feature = "voice-tests")]
     #[test]
     fn geometry_ring_wrap_warm_mixed_only_first_two_test_frames() {
-        // Regression for the mahbot-1012 reviewer finding: with the ring at
+        // Regression: with the ring at
         // capacity (EMBEDDING_RING_MAX = 19) the OLD proxy
         // `ring_len_before + 1 - WINDOW_SIZE < test_start_ring_len` pinned at
         // 17 < 19 forever, mislabeling EVERY later window as WarmMixed.  The
@@ -11509,14 +11506,14 @@ mod tests {
         );
     }
 
-    // ── Padded-window geometry tests (mahbot-927 / mahbot-1023) ───────────
+    // ── Padded-window geometry tests ──────────────────────────────────────
     // These test `pad_mel_frames_to_window`, the core padding function used
     // by the deferred burst sweep and the segment-end pass
     // (`score_start_aligned_positions`) to build start-aligned windows
     // shorter than EMBEDDING_WINDOW_FRAMES.  The full stride-8 scoring loop
     // cannot be tested without ONNX models, but the padding transformation
     // itself is isolated and fully testable.  The old incremental
-    // short-buffer fallback (mahbot-927) was removed in mahbot-1023; the
+    // short-buffer fallback was removed; the
     // padding semantics it introduced are preserved for the burst/pass.
 
     /// Helper: create a mel frame with identical values across all bands.

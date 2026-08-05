@@ -435,7 +435,7 @@ pub fn is_playback_active() -> bool {
     PLAYBACK_ACTIVE.load(Ordering::Acquire) > 0
 }
 
-/// Test-only hook (mahbot-1045 B1): force the playback-active refcount to a
+/// Test-only hook: force the playback-active refcount to a
 /// known state so the E2E bench can probe the TTS-echo gate without real
 /// playback.
 ///
@@ -2566,7 +2566,7 @@ mod tests {
         STATE.store(prev_state, Ordering::Release);
     }
 
-    // ── Playback-active flag tests (mahbot-896) ────────────────────────
+    // ── Playback-active flag tests ──────────────────────────────────────
 
     #[test]
     #[serial_test::serial(tts)]
@@ -2583,7 +2583,7 @@ mod tests {
     #[test]
     #[serial_test::serial(tts)]
     fn test_playback_reverb_tail_within_range() {
-        // Per ticket mahbot-896: reverb tail must be 200-400ms.
+        // Reverb tail must be 200-400ms.
         assert!(
             (200..=400).contains(&PLAYBACK_REVERB_TAIL_MS),
             "PLAYBACK_REVERB_TAIL_MS={} must be between 200 and 400",
@@ -2612,7 +2612,7 @@ mod tests {
     #[test]
     #[serial_test::serial(tts)]
     fn test_playback_counter_multi_chunk_no_leak() {
-        // Critical regression test (mahbot-896 review round 3):
+        // Critical regression test:
         // The counter is incremented ONCE per speak_async() call (when
         // the first chunk plays), NOT once per chunk.  After N chunks
         // and one decrement, the counter must return to 0.
@@ -2788,7 +2788,7 @@ mod tests {
         //
         // Point the CONFIG storage root at the home cache so
         // `try_init_from_cache()` resolves the same directory that was
-        // pre-flight checked above (mahbot-1029: `try_init_from_dir` was
+        // pre-flight checked above (`try_init_from_dir` was
         // removed as dead code — its only caller was this test).
 
         crate::config::CONFIG.set_storage_root(std::path::PathBuf::from(&home_dir).join(".mahbot"));

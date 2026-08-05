@@ -548,7 +548,7 @@ mod tests {
         );
     }
 
-    // ── mahbot-1066 Amendment A: consolidation fail-open ────────────────
+    // ── consolidation fail-open ────────────────────────────────────────
 
     /// Helper: run consolidation with the given fake provider outcomes
     /// scripted, returning the consolidation result.

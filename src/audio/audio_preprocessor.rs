@@ -147,7 +147,7 @@ pub struct AudioPreprocessor {
     pub(crate) running_rms: f32,
 
     /// History of `running_rms` values for AGC convergence detection
-    /// (mahbot-886).  Bounded to the last 10 AGC-active frames.  Only
+    /// Bounded to the last 10 AGC-active frames.  Only
     /// compiled in `voice-tests` builds — zero production overhead.
     #[cfg(feature = "voice-tests")]
     running_rms_history: VecDeque<f32>,
@@ -185,7 +185,7 @@ impl AudioPreprocessor {
             // actual frame level and applies the correct gain from frame 1.
             running_rms: 0.0,
 
-            // Instrumentation fields for AGC convergence tracking (mahbot-886).
+            // Instrumentation fields for AGC convergence tracking.
             // Feature-gated — zero runtime overhead in production builds.
             #[cfg(feature = "voice-tests")]
             running_rms_history: VecDeque::with_capacity(10),
@@ -374,7 +374,7 @@ impl AudioPreprocessor {
             return samples;
         }
 
-        // Count AGC-active frames (mahbot-886).  Placed after the silence
+        // Count AGC-active frames.  Placed after the silence
         // guard so only non-silent chunks (where the AGC state actually
         // evolves) are counted.  Feature-gated — zero overhead in production.
         #[cfg(feature = "voice-tests")]
@@ -402,7 +402,7 @@ impl AudioPreprocessor {
             self.running_rms = alpha * chunk_rms + (1.0 - alpha) * self.running_rms;
         }
 
-        // Record running_rms for AGC convergence detection (mahbot-886).
+        // Record running_rms for AGC convergence detection.
         // Feature-gated — zero overhead in production.
         #[cfg(feature = "voice-tests")]
         {
@@ -446,7 +446,7 @@ impl AudioPreprocessor {
     /// (i.e., `chunk_rms > 0.0`).  Silence frames are excluded from the count
     /// because they don't update `running_rms`.
     ///
-    /// Used by the benchmark (mahbot-886) to correlate detection misses with
+    /// Used by the benchmark to correlate detection misses with
     /// convergence state.
     #[cfg(feature = "voice-tests")]
     #[allow(clippy::cast_precision_loss)]
@@ -583,7 +583,7 @@ mod tests {
 
     /// Test that EMA-based AGC normalises volume across multiple chunks.
     ///
-    /// With lazy initialisation (running_rms = 0.0, mahbot-856), the first
+    /// With lazy initialisation (running_rms = 0.0), the first
     /// non-zero chunk immediately sets running_rms to the chunk RMS, giving
     /// full gain from frame 1.  This test feeds 200 quiet chunks followed by
     /// 30 loud chunks (each with a fresh AGC state) and verifies that after
@@ -610,7 +610,7 @@ mod tests {
         // from frame 1.  After 200 EMA iterations at the same level, the
         // running_rms stabilises at 0.25 × TARGET_RMS.  This produces the
         // same steady-state output as the old TARGET_RMS init but without
-        // the ~3.6s convergence ramp (mahbot-856).
+        // the ~3.6s convergence ramp.
         let amp_quiet = target_rms * 0.25 * sqrt2;
         for _ in 0..200 {
             let chunk = sine_tone(amp_quiet, chunk_len, 16_000);
@@ -631,7 +631,7 @@ mod tests {
         // (MIN_GAIN) from frame 1.  After 30 EMA iterations the running_rms
         // stays at ~4.0 × TARGET_RMS, maintaining gain at 0.25× and output
         // ≈ TARGET_RMS — converged from frame 1 rather than ramping over 30
-        // chunks as with the old TARGET_RMS init (mahbot-856).
+        // chunks as with the old TARGET_RMS init.
         let mut pre = AudioPreprocessor::new(PreprocessorConfig {
             noise_suppression: false,
             agc: true,
@@ -667,7 +667,7 @@ mod tests {
     /// changes monotonically within each segment and the output RMS does not
     /// oscillate between extremes.
     ///
-    /// Phase 1 (quiet) starts with lazy init (mahbot-856): running_rms = 0.0,
+    /// Phase 1 (quiet) starts with lazy init: running_rms = 0.0,
     /// set to chunk_rms = 0.25 × TARGET_RMS on the first non-zero frame,
     /// giving gain = 4.0× immediately.  This validates that lazy init produces
     /// a stable plateau without overshoot.  Phases 2→3 exercise the EMA release
@@ -788,7 +788,7 @@ mod tests {
     ///
     /// Uses higher-amplitude noise (0.20) so the input RMS after NS is near
     /// TARGET_RMS, keeping the output within the 0.5–1.5× range despite the
-    /// EMA attack dynamics.  With lazy init (mahbot-856), AGC converges in a
+    /// EMA attack dynamics.  With lazy init, AGC converges in a
     /// single frame, so the test margin is more than sufficient even during
     /// the first few NS-adaptation chunks.
     #[test]
@@ -843,10 +843,10 @@ mod tests {
     }
 
     // ── Helpers ──────────────────────────────────────────────────
-    // (`compute_rms` shared via `crate::util::compute_rms` — mahbot-1029.)
+    // (`compute_rms` shared via `crate::util::compute_rms`.)
 
     /// Test that the silence-first guard prevents division by zero when the
-    /// very first chunk is pure silence (mahbot-856 lazy init).
+    /// very first chunk is pure silence (lazy init).
     ///
     /// With running_rms = 0.0 and a zero-RMS first chunk, the lazy-init
     /// branch is NOT entered (running_rms stays 0.0 after the early return
@@ -890,7 +890,7 @@ mod tests {
     /// apply `cleanup` (which resets `running_rms` to 0.0 via [`clear_buffer`]
     /// or [`reset`]).  Phase 3: feed another quiet chunk — lazy init should
     /// fire and apply [`MAX_GAIN`] immediately.  With noise suppression
-    /// disabled both cleanup paths are functionally equivalent (mahbot-856).
+    /// disabled both cleanup paths are functionally equivalent.
     fn run_lazy_init_after_cleanup_test(cleanup: fn(&mut AudioPreprocessor)) {
         let mut pre = AudioPreprocessor::new(PreprocessorConfig {
             noise_suppression: false,
@@ -927,20 +927,20 @@ mod tests {
         );
     }
     /// Test that clear_buffer() resets running_rms to 0.0 so the next speech
-    /// chunk triggers lazy init (mahbot-856).
+    /// chunk triggers lazy init.
     #[test]
     fn test_lazy_init_after_clear_buffer() {
         run_lazy_init_after_cleanup_test(|pre| pre.clear_buffer());
     }
     /// Test that reset() resets running_rms to 0.0 so the next speech chunk
-    /// triggers lazy init (mahbot-856).  reset() also reinitialises the noise
+    /// triggers lazy init.  reset() also reinitialises the noise
     /// suppressor's internal state (not relevant when NS is disabled).
     #[test]
     fn test_lazy_init_after_reset() {
         run_lazy_init_after_cleanup_test(|pre| pre.reset());
     }
 
-    // ── mahbot-1045 A2: shared fresh-AGC feed helper ──────────────────────
+    // ── shared fresh-AGC feed helper ──────────────────────────────────────
 
     /// `agc_feed_fresh` must be deterministic and byte-identical to the
     /// pre-dedup inline fresh-preprocessor chunk loop (same chunk size).

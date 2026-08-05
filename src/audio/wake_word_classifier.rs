@@ -1272,7 +1272,7 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
-    // Shared test fixture (mahbot-1043): single authoritative make_seq body
+    // Shared test fixture: single authoritative make_seq body
     // lives next to the EmbeddingSequence type; local builders drifted once.
     use crate::audio::embedding_sequence::make_test_sequence as make_seq;
     #[test]
@@ -1312,7 +1312,7 @@ mod tests {
         assert!(build_windows(&[]).is_empty());
 
         // Short array (< WINDOW_SIZE embeddings) produces tiled windows
-        // matching streaming inference behavior (mahbot-1001 Fix 4).
+        // matching streaming inference behavior.
         // 2 embeddings → 2 tiled windows: [e0, e0, e0] and [e0, e1, e1]
         let short_embs: Vec<Vec<f32>> = (0..2).map(|i| vec![i as f32; EMBEDDING_DIM]).collect();
         let short_seq = make_seq(short_embs);
@@ -1331,7 +1331,7 @@ mod tests {
         let seqs = [make_seq(embs1), make_seq(embs2)];
         assert!(
             !build_windows(&seqs).is_empty(),
-            "short sequences now produce tiled windows (mahbot-1001)"
+            "short sequences now produce tiled windows"
         );
 
         // Two sequences each exactly WINDOW_SIZE → 2 windows (1 per sequence).
@@ -1361,8 +1361,8 @@ mod tests {
         // Legacy JSON without BN running stats fields and without the arch
         // field — these must be absent so that #[serde(default)] kicks in,
         // verifying backward compatibility with enrollment data serialized
-        // before mahbot-846 added the four BN running-stat fields and
-        // mahbot-848 added the per-member architecture configuration.
+        // before the four BN running-stat fields and the per-member
+        // architecture configuration were added.
         let c1_def = CONV1_OUT;
         let c2_def = CONV2_OUT;
         let ks_def = KERNEL_SIZE;
@@ -1426,7 +1426,7 @@ mod tests {
         };
 
         // 60 windows each = 180 embeddings (WINDOW_SIZE per window).
-        // (Reduced from 100 windows / 300 embeddings in mahbot-1029 — the
+        // (Reduced from 100 windows / 300 embeddings — the
         // separable clusters converge with a wide margin at these sizes.)
         let n_wins = 60;
         let n_embs = n_wins * WINDOW_SIZE;
@@ -1437,7 +1437,7 @@ mod tests {
         let neg_seqs = [make_seq(neg_embs)];
 
         let cfg = TrainingConfig {
-            // Reduced from 80 in mahbot-1029 — convergence margin validated
+            // Reduced from 80 — convergence margin validated
             // at this size (well-separated ±0.3 clusters).
             max_epochs: 50,
             rng_seed: Some(42),

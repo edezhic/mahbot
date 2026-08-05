@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(total, 0, "other-ws should have 0 errors");
     }
 
-    /// `retry_failures` insert round-trip (mahbot-1066) — verifies the schema
+    /// `retry_failures` insert round-trip — verifies the schema
     /// and the parameterized insert are valid against a real store.
     #[tokio::test]
     async fn record_retry_failure_round_trip() {

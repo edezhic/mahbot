@@ -1139,7 +1139,7 @@ pub(crate) fn sample_gaussian_pair_clamped(rng: &mut impl rand::Rng) -> (f32, f3
 /// When `rng_seed` is `Some(seed)`, uses a deterministic seeded RNG for
 /// reproducible output. When `None`, uses an entropy-seeded RNG (current
 /// non-deterministic behavior). The deterministic path is used by the
-/// benchmark to ensure stable training data across re-runs (mahbot-906).
+/// benchmark to ensure stable training data across re-runs.
 ///
 /// # Arguments
 ///
@@ -1154,7 +1154,7 @@ pub(crate) fn sample_gaussian_pair_clamped(rng: &mut impl rand::Rng) -> (f32, f3
 ///
 /// Noisy audio PCM f32 in [-1.0, 1.0] (clamped).
 ///
-/// # Note (mahbot-1029)
+/// # Note
 ///
 /// This is the former `tts_data_gen::add_noise` (4-arg) relocated unchanged.
 /// It is a DIFFERENT implementation from the 3-arg [`add_noise`] above
