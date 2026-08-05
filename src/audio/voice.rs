@@ -2068,35 +2068,16 @@ pub struct UtteranceQuality {
 
 static VOICE_PIPELINE: OnceLock<RwLock<VoicePipelineState>> = OnceLock::new();
 
-/// The name of the currently active workspace, updated by the GUI when the
-/// user switches workspaces. Used by [`route_to_agent`] to route transcribed
-/// commands to the correct workspace.
-static LAST_ACTIVE_WORKSPACE: OnceLock<RwLock<String>> = OnceLock::new();
-
 /// The name of the currently active user, updated by the GUI when the
 /// selected user changes. Used by [`route_to_agent`] to route transcribed
 /// voice commands to the correct user's active role.
 static LAST_ACTIVE_USER: OnceLock<RwLock<String>> = OnceLock::new();
-
-/// Set the currently active workspace name (called from GUI on workspace switch).
-pub fn set_active_workspace_name(name: &str) {
-    if let Some(state) = LAST_ACTIVE_WORKSPACE.get() {
-        *state.write().unwrap_poison() = name.to_string();
-    }
-}
 
 /// Set the currently active user name (called from GUI on user switch).
 pub fn set_active_user_name(name: &str) {
     if let Some(state) = LAST_ACTIVE_USER.get() {
         *state.write().unwrap_poison() = name.to_string();
     }
-}
-
-fn active_workspace_name() -> String {
-    LAST_ACTIVE_WORKSPACE
-        .get()
-        .map(|s| s.read().unwrap_poison().clone())
-        .unwrap_or_default()
 }
 
 fn active_user_name() -> String {
@@ -2200,9 +2181,6 @@ fn voice_state() -> &'static RwLock<VoicePipelineState> {
 pub fn init_global() -> Result<()> {
     VAD_DETECTOR.get_or_init(|| std::sync::Mutex::new(earshot::Detector::default()));
 
-    LAST_ACTIVE_WORKSPACE
-        .set(RwLock::new(String::new()))
-        .map_err(|_| anyhow!("LAST_ACTIVE_WORKSPACE already initialized"))?;
     LAST_ACTIVE_USER
         .set(RwLock::new(String::new()))
         .map_err(|_| anyhow!("LAST_ACTIVE_USER already initialized"))?;
@@ -4409,28 +4387,50 @@ async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace
     }
 }
 
-/// Resolve the workspace for a voice operation, falling back to the user's
-/// configured personal workspace if no active workspace is set.
-///
-/// This mirrors the resolution pattern used by [`route_to_agent`] and the
-/// error-broadcast path in [`handle_recording_audio`].
-async fn resolve_workspace_for_voice(user_name: &str) -> String {
-    let ws = active_workspace_name();
-    if ws.is_empty() {
-        if let Ok(Some(ws)) = crate::users::get_workspace(user_name).await {
-            ws.name
-        } else {
-            let path = crate::users::personal_workspace_path(user_name);
-            crate::users::personal_workspace_struct(user_name, &path).name
+/// Resolve the workspace for a voice operation from the acting user's DB
+/// record, falling back to the user's personal workspace on missing or
+/// stale values — mirrors the chat-side resolution pattern (DB workspace,
+/// warning + personal fallback).
+async fn resolve_workspace_for_voice(user_name: &str) -> crate::Workspace {
+    match crate::users::get_workspace(user_name).await {
+        Ok(Some(ws)) => ws,
+        Ok(None) => {
+            warn!(
+                user_name = %user_name,
+                "workspace resolution: selected_workspace points to non-existent workspace; \
+                 falling back to personal workspace",
+            );
+            personal_workspace_for_voice(user_name)
         }
+        Err(e) => {
+            warn!(
+                user_name = %user_name,
+                error = %e,
+                "workspace resolution: database error; falling back to personal workspace",
+            );
+            personal_workspace_for_voice(user_name)
+        }
+    }
+}
+
+fn personal_workspace_for_voice(user_name: &str) -> crate::Workspace {
+    let path = crate::users::personal_workspace_path(user_name);
+    crate::users::personal_workspace_struct(user_name, &path)
+}
+
+/// Personal workspaces have no board pipeline — Manager falls back to
+/// Analyst, matching the chat-side role resolution.
+fn resolve_effective_role_for_voice(role: crate::Role, ws_name: &str) -> crate::Role {
+    if role == crate::Role::Manager && crate::users::is_personal_workspace(ws_name) {
+        crate::Role::Analyst
     } else {
-        ws
+        role
     }
 }
 
 /// Route a transcribed voice command to the appropriate agent.
 ///
-/// Resolves the active user's role and computes the deterministic agent ID,
+/// Resolves the active user's role and workspace from the user's DB record,
 /// then routes through the agent-ID message router.
 ///
 /// Falls back to the Manager router if no active user can be determined.
@@ -4439,17 +4439,18 @@ async fn route_to_agent(text: String) {
     let user_name = active_user_name();
     if !user_name.is_empty() {
         let role = crate::users::resolve_active_role(&user_name).await;
-        let ws_name = resolve_workspace_for_voice(&user_name).await;
+        let ws = resolve_workspace_for_voice(&user_name).await;
+        let role = resolve_effective_role_for_voice(role, &ws.name);
 
-        info!("Voice command -> {role} (user: {user_name}, workspace: {ws_name}): {text}",);
+        info!("Voice command -> {role} (user: {user_name}, workspace: {}): {text}", ws.name);
 
         // Broadcast before routing so the transcript appears immediately
         // while the agent is still working.
-        broadcast_voice_transcript(&text, &user_name, &ws_name).await;
+        broadcast_voice_transcript(&text, &user_name, &ws.name).await;
 
         crate::message_router::route_user_message(
             text,
-            ws_name,
+            ws.name,
             user_name,
             "voice".to_string(),
             role,
@@ -4458,34 +4459,9 @@ async fn route_to_agent(text: String) {
         return;
     }
 
-    let active = active_workspace_name();
-    if !active.is_empty() {
-        info!("Voice command -> Manager (active workspace: {active}): {text}");
-        broadcast_voice_transcript(&text, "", &active).await;
-
-        crate::message_router::route_user_message(
-            text,
-            active,
-            String::new(),
-            "voice".to_string(),
-            crate::Role::Manager,
-            None,
-        );
-        return;
-    }
-
-    let ws = match crate::users::get_workspace("admin").await {
-        Ok(Some(ws)) => ws,
-        Ok(None) => {
-            let path = crate::users::personal_workspace_path("admin");
-            crate::users::personal_workspace_struct("admin", &path)
-        }
-        Err(e) => {
-            warn!("Failed to get admin workspace: {e}; using personal workspace");
-            let path = crate::users::personal_workspace_path("admin");
-            crate::users::personal_workspace_struct("admin", &path)
-        }
-    };
+    // No active user: fall back to the admin user's DB workspace (same
+    // warning + personal fallback as the active-user path).
+    let ws = resolve_workspace_for_voice("admin").await;
 
     info!(
         "Voice command -> Manager (workspace: {}): {}",
@@ -7195,14 +7171,14 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
 
                         // Resolve workspace with fallback via the shared helper
                         // (matching the route_to_agent pattern).
-                        let workspace = resolve_workspace_for_voice(&user_name).await;
+                        let ws = resolve_workspace_for_voice(&user_name).await;
 
                         crate::channels::broadcast_and_persist_agent_response(
                             &user_name,
                             "voice",
                             "*Voice: transcription failed — try again*",
                             Some("voice".to_string()),
-                            &workspace,
+                            &ws.name,
                         )
                         .await;
                     }
