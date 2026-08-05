@@ -449,6 +449,73 @@ impl SettingsState {
             .find(|rc| rc.role == key)
     }
 
+    /// Mirror a toggle in both config snapshots: `"true"`/`""` (the empty
+    /// string keeps the [non_empty] accessor collapsing to None = disabled),
+    /// plus the global CONFIG so refresh() can't revert the change.
+    fn set_toggle(&mut self, key: &str, enabled: bool) {
+        let val = if enabled { "true" } else { "" };
+        let _ = self.config.set_string_field(key, val);
+        let _ = crate::config::CONFIG.set_string_field(key, val);
+    }
+
+    /// Shared voice/TTS toggle arm: mirror the new state, fire the per-toggle
+    /// side effect, bump the generation counter, then persist to the DB.
+    fn run_toggle(
+        &mut self,
+        key: &'static str,
+        enabled: bool,
+        bump_gen: fn(&mut SettingsState) -> u64,
+        make_result: fn(u64, Result<(), String>) -> SettingsMessage,
+        on_toggle: fn(bool),
+    ) -> Task<SettingsMessage> {
+        self.set_toggle(key, enabled);
+        on_toggle(enabled);
+        // Bump generation so stale results from a previous toggle are ignored.
+        let toggle_gen = bump_gen(self);
+
+        // Persist async; delete the key on disable so it's absent (None on reload).
+        Task::perform(
+            async move {
+                let store = crate::config_db::store();
+                if enabled {
+                    store.set_kv(key, "true").await.map_err(|e| e.to_string())
+                } else {
+                    store.delete_kv(key).await.map_err(|e| e.to_string())
+                }
+            },
+            move |result| make_result(toggle_gen, result),
+        )
+    }
+
+    /// Shared voice/TTS result arm: ignore stale generations; on DB error
+    /// revert both config snapshots and the pipeline via `on_revert`.
+    fn handle_toggle_result(
+        &mut self,
+        key: &str,
+        g: u64,
+        result: Result<(), String>,
+        get_gen: fn(&SettingsState) -> u64,
+        get_enabled: fn(&ConfigData) -> &Option<String>,
+        on_revert: fn(bool),
+    ) -> Task<SettingsMessage> {
+        // Ignore results from a superseded toggle (user toggled again mid-write).
+        if g != get_gen(self) {
+            return Task::none();
+        }
+        match result {
+            Ok(()) => Task::none(),
+            Err(e) => {
+                self.error = Some(e);
+                // Revert both snapshots so the toggle isn't shown enabled but lost on restart.
+                let current_enabled = get_enabled(&self.config).as_deref() == Some("true");
+                let target_state = !current_enabled;
+                self.set_toggle(key, target_state);
+                on_revert(target_state);
+                Task::none()
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: SettingsMessage) -> Task<SettingsMessage> {
         match msg {
@@ -529,140 +596,48 @@ impl SettingsState {
             }
 
             // ── Voice assistant ─────────────────────────────────
-            SettingsMessage::VoiceToggle(enabled) => {
-                // Update in-memory config snapshot so the UI reflects the change.
-                // When disabling, use an empty string so that the [non_empty]
-                // accessor collapses it to None (absent = disabled).
-                let val = if enabled { "true" } else { "" };
-                let _ = self.config.set_string_field("voice_enabled", val);
-                // Update global CONFIG so refresh() doesn't revert.
-                let _ = crate::config::CONFIG.set_string_field("voice_enabled", val);
-
-                // Activate/deactivate the pipeline immediately.
-                sync_voice_state(enabled);
-
-                // Bump generation so stale VoiceToggleResult from a
-                // previous toggle is detected and ignored.
-                self.voice_toggle_gen += 1;
-                let toggle_gen = self.voice_toggle_gen;
-
-                // Persist to DB asynchronously, reporting errors via VoiceToggleResult.
-                // When disabled, delete the key so it's truly absent (None on reload).
-                Task::perform(
-                    async move {
-                        let store = crate::config_db::store();
-                        let result = if enabled {
-                            store
-                                .set_kv("voice_enabled", "true")
-                                .await
-                                .map_err(|e| e.to_string())
-                        } else {
-                            store
-                                .delete_kv("voice_enabled")
-                                .await
-                                .map_err(|e| e.to_string())
-                        };
-                        (toggle_gen, result)
-                    },
-                    |(g, result)| SettingsMessage::VoiceToggleResult(g, result),
-                )
-            }
-            SettingsMessage::VoiceToggleResult(g, result) => {
-                // Stale result from a previous toggle?  The user toggled
-                // again before the DB write completed — ignore the stale
-                // response to avoid reverting to the wrong state.
-                if g != self.voice_toggle_gen {
-                    return Task::none();
-                }
-                match result {
-                    Ok(()) => Task::none(),
-                    Err(e) => {
-                        self.error = Some(e);
-
-                        // DB write failed — revert the in-memory state so the UI and
-                        // pipeline stay consistent with the persisted config.
-                        // Without this, the toggle appears Enabled but the change is
-                        // lost on restart because it was never persisted.
-                        let current_enabled = self.config.voice_enabled.as_deref() == Some("true");
-                        let target_state = !current_enabled;
-                        let val = if target_state { "true" } else { "" };
-                        let _ = self.config.set_string_field("voice_enabled", val);
-                        let _ = crate::config::CONFIG.set_string_field("voice_enabled", val);
-                        sync_voice_state(target_state);
-
-                        Task::none()
+            SettingsMessage::VoiceToggle(enabled) => self.run_toggle(
+                "voice_enabled",
+                enabled,
+                |s| {
+                    s.voice_toggle_gen += 1;
+                    s.voice_toggle_gen
+                },
+                SettingsMessage::VoiceToggleResult,
+                sync_voice_state,
+            ),
+            SettingsMessage::VoiceToggleResult(g, result) => self.handle_toggle_result(
+                "voice_enabled",
+                g,
+                result,
+                |s| s.voice_toggle_gen,
+                |c| &c.voice_enabled,
+                sync_voice_state,
+            ),
+            SettingsMessage::TtsToggle(enabled) => self.run_toggle(
+                "tts_enabled",
+                enabled,
+                |s| {
+                    s.tts_toggle_gen += 1;
+                    s.tts_toggle_gen
+                },
+                SettingsMessage::TtsToggleResult,
+                |enabled| {
+                    // Toggle ON with uncached models triggers download (handles
+                    // ModelState::Failed retries too, matching voice's auto-retry).
+                    if enabled && !crate::audio::tts::try_load_cached() {
+                        crate::audio::tts::spawn_or_retry_download();
                     }
-                }
-            }
-            SettingsMessage::TtsToggle(enabled) => {
-                // Update in-memory config snapshot so the UI reflects the change.
-                // When disabling, use an empty string so that the [non_empty]
-                // accessor collapses it to None (absent = disabled).
-                let val = if enabled { "true" } else { "" };
-                let _ = self.config.set_string_field("tts_enabled", val);
-                // Update global CONFIG so refresh() doesn't revert.
-                let _ = crate::config::CONFIG.set_string_field("tts_enabled", val);
-
-                // Bump generation so stale TtsToggleResult from a
-                // previous toggle is detected and ignored.
-                self.tts_toggle_gen += 1;
-                let toggle_gen = self.tts_toggle_gen;
-
-                // When toggling ON with uncached models, trigger download.
-                // Uses spawn_or_retry_download to handle both ModelState::Uninit
-                // (initial download) and ModelState::Failed (retry after previous
-                // permanent failure), matching voice's auto-retry behaviour.
-                if enabled && !crate::audio::tts::try_load_cached() {
-                    crate::audio::tts::spawn_or_retry_download();
-                }
-
-                // Persist to DB asynchronously, reporting errors via TtsToggleResult.
-                // When disabled, delete the key so it's truly absent (None on reload).
-                Task::perform(
-                    async move {
-                        let store = crate::config_db::store();
-                        let result = if enabled {
-                            store
-                                .set_kv("tts_enabled", "true")
-                                .await
-                                .map_err(|e| e.to_string())
-                        } else {
-                            store
-                                .delete_kv("tts_enabled")
-                                .await
-                                .map_err(|e| e.to_string())
-                        };
-                        (toggle_gen, result)
-                    },
-                    |(g, result)| SettingsMessage::TtsToggleResult(g, result),
-                )
-            }
-            SettingsMessage::TtsToggleResult(g, result) => {
-                // Stale result from a previous toggle?  The user toggled
-                // again before the DB write completed — ignore the stale
-                // response to avoid reverting to the wrong state.
-                if g != self.tts_toggle_gen {
-                    return Task::none();
-                }
-                match result {
-                    Ok(()) => Task::none(),
-                    Err(e) => {
-                        self.error = Some(e);
-
-                        // DB write failed — revert the in-memory state so the UI
-                        // stays consistent with the persisted config.
-                        // Without this, the toggle appears Enabled but the change is
-                        // lost on restart because it was never persisted.
-                        let current_enabled = self.config.tts_enabled.as_deref() == Some("true");
-                        let target_state = !current_enabled;
-                        let val = if target_state { "true" } else { "" };
-                        let _ = self.config.set_string_field("tts_enabled", val);
-                        let _ = crate::config::CONFIG.set_string_field("tts_enabled", val);
-
-                        Task::none()
-                    }
-                }
-            }
+                },
+            ),
+            SettingsMessage::TtsToggleResult(g, result) => self.handle_toggle_result(
+                "tts_enabled",
+                g,
+                result,
+                |s| s.tts_toggle_gen,
+                |c| &c.tts_enabled,
+                |_| {},
+            ),
             SettingsMessage::TtsRetryModels => {
                 let _ = crate::audio::tts::retry_download();
                 Task::none()

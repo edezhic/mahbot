@@ -116,6 +116,27 @@ pub fn empty_state_placeholder<'a, Message: 'a>(
     .into()
 }
 
+/// Badge pill with an opaque background; `colors` is a `(background, text)` tuple.
+#[must_use]
+pub fn badge_pill<'a, Message: 'a>(
+    label: String,
+    colors: (Color, Color),
+    text_size: u32,
+    padding: [u16; 2],
+) -> Element<'a, Message> {
+    container(text(label).size(text_size).color(colors.1))
+        .padding(padding)
+        .style(move |_theme: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(colors.0)),
+            border: iced::Border {
+                radius: 4.0.into(),
+                ..iced::Border::default()
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
 /// Create a selectable text widget with the given color.
 ///
 /// Accepts both borrowed (`&str`) and owned (`String`) text content.

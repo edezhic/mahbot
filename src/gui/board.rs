@@ -19,7 +19,7 @@ use iced_fonts::lucide;
 use super::common::MAX_INPUT_CHARS;
 use super::theme;
 use super::widget_helpers;
-use super::widgets::{diff_stats_row, selectable_text};
+use super::widgets::{badge_pill, diff_stats_row, selectable_text};
 
 /// Per-file stat from `git show --numstat`.
 #[derive(Debug, Clone)]
@@ -324,48 +324,24 @@ impl BoardState {
         icon_row
     }
 
-    /// Build a phase badge pill for a ticket phase.
-    /// Used on ticket cards and in the modal detail header.
-    /// Derives badge colours from [`theme::ticket_phase_color`].
+    /// Phase badge pill (ticket cards, modal header); colors from [`theme::ticket_phase_color`].
     fn phase_badge<'a>(
         phase: TicketPhase,
         text_size: u32,
         padding: [u16; 2],
     ) -> Element<'a, BoardMessage> {
-        let (badge_bg, badge_text) = theme::ticket_phase_color(phase);
-        container(text(phase.display_name()).size(text_size).color(badge_text))
-            .padding(padding)
-            .style(move |_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(badge_bg)),
-                border: iced::Border {
-                    radius: 4.0.into(),
-                    ..iced::Border::default()
-                },
-                ..container::Style::default()
-            })
-            .into()
+        let (bg, fg) = theme::ticket_phase_color(phase);
+        badge_pill(phase.display_name(), (bg, fg), text_size, padding)
     }
 
-    /// Build a priority chip pill for a ticket priority level.
-    /// Uses Flexoki muted colors from [`theme::ticket_priority_color`].
+    /// Priority chip pill; colors from [`theme::ticket_priority_color`].
     fn priority_badge<'a>(
         priority: i64,
         text_size: u32,
         padding: [u16; 2],
     ) -> Element<'a, BoardMessage> {
-        let label = format!("P{priority}");
-        let (badge_bg, badge_text) = theme::ticket_priority_color(priority);
-        container(text(label).size(text_size).color(badge_text))
-            .padding(padding)
-            .style(move |_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(badge_bg)),
-                border: iced::Border {
-                    radius: 4.0.into(),
-                    ..iced::Border::default()
-                },
-                ..container::Style::default()
-            })
-            .into()
+        let (bg, fg) = theme::ticket_priority_color(priority);
+        badge_pill(format!("P{priority}"), (bg, fg), text_size, padding)
     }
 
     /// Compute how many of this ticket's prerequisites are still unfulfilled.
