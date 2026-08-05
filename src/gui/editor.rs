@@ -5067,15 +5067,7 @@ impl EditorState {
                 .width(Length::Fill)
                 .height(Length::Shrink),
         )
-        .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(theme::BG_SURFACE)),
-            border: iced::Border {
-                radius: 0.0.into(),
-                width: 0.0,
-                color: iced::Color::TRANSPARENT,
-            },
-            ..Default::default()
-        })
+        .style(theme::surface_container_style)
         .width(Length::Fill)
         .into()
     }
@@ -5298,10 +5290,7 @@ impl EditorState {
         container(mapped)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|_t: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_BASE)),
-                ..Default::default()
-            })
+            .style(theme::base_container_style)
             .into()
     }
 

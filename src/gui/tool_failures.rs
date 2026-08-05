@@ -183,10 +183,7 @@ impl ToolFailuresState {
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(24)
-            .style(|_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_BASE)),
-                ..container::Style::default()
-            })
+            .style(theme::base_container_style)
             .into()
     }
 
@@ -195,42 +192,26 @@ impl ToolFailuresState {
     ///   Line 2: error message (selectable monospace text)
     /// Build the metadata badge row for a tool error entry.
     fn render_metadata_row(entry: &ToolErrorEntry) -> iced::widget::Row<'_, ToolFailuresMessage> {
-        let (fg, bg) = theme::role_badge_color(&entry.role);
+        let fg = theme::role_badge_color(&entry.role).0;
 
         let timestamp = theme::format_hhmmss(&entry.recorded_at);
 
         let duration_label = format!("{}ms", entry.duration_ms);
-
-        let badge_style = |_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(theme::HOVER)),
-            border: iced::Border {
-                radius: 3.0.into(),
-                ..iced::Border::default()
-            },
-            ..container::Style::default()
-        };
 
         row![
             text(timestamp).size(10).color(theme::TEXT_MUTED),
             Space::new().width(8),
             container(text(&entry.tool_name).size(10).color(theme::TEXT_SECONDARY))
                 .padding([1, 6])
-                .style(badge_style),
+                .style(theme::pill_style(theme::HOVER)),
             Space::new().width(4),
             container(text(duration_label).size(10).color(theme::TEXT_MUTED))
                 .padding([1, 6])
-                .style(badge_style),
+                .style(theme::pill_style(theme::HOVER)),
             Space::new().width(4),
             container(text(&entry.role).size(10).color(fg))
                 .padding([1, 6])
-                .style(move |_t: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(bg)),
-                    border: iced::Border {
-                        radius: 3.0.into(),
-                        ..iced::Border::default()
-                    },
-                    ..container::Style::default()
-                }),
+                .style(move |t: &iced::Theme| theme::role_badge_pill_style(t, fg)),
             Space::new().width(Length::Fill),
             if !entry.workspace.is_empty() {
                 text(&entry.workspace).size(10).color(theme::TEXT_MUTED)
@@ -293,15 +274,7 @@ impl ToolFailuresState {
 
         container(row_content)
             .padding(6)
-            .style(|_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                border: iced::Border {
-                    radius: 4.0.into(),
-                    width: 1.0,
-                    color: theme::BORDER,
-                },
-                ..container::Style::default()
-            })
+            .style(theme::surface_card_style)
             .into()
     }
 }

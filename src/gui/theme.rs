@@ -576,8 +576,14 @@ pub fn button_text(
 // ── Container styles ─────────────────────────────────────────────
 
 /// Shared container style factory: background fill plus border parameters.
-/// Public wrappers below delegate here so the six variants stay in one place.
-fn container_style(bg: Color, radius: f32, width: f32, border_color: Color) -> container::Style {
+/// Public wrappers below delegate here so the variants stay in one place.
+/// Callers with a one-off combination may use this directly.
+pub(crate) fn container_style(
+    bg: Color,
+    radius: f32,
+    width: f32,
+    border_color: Color,
+) -> container::Style {
     container::Style {
         background: Some(Background::Color(bg)),
         border: iced::Border {
@@ -638,6 +644,13 @@ pub fn surface_card_style(_theme: &iced::Theme) -> container::Style {
     container_style(BG_SURFACE, 4.0, 1.0, BORDER)
 }
 
+/// Style for elevated cards: elevated background with a 1px border and
+/// 4px rounded corners. Used for ticket board cards and session round cards.
+#[must_use]
+pub fn elevated_card_style(_theme: &iced::Theme) -> container::Style {
+    container_style(BG_ELEVATED, 4.0, 1.0, BORDER)
+}
+
 /// Style for modal dialog containers: elevated background, 8px rounded
 /// corners, and a strong border. Shared by all modal overlays across the
 /// dashboard (board detail, settings dialogs, editor overlays, diff/branch
@@ -661,20 +674,23 @@ pub fn surface_container_style(_theme: &iced::Theme) -> container::Style {
     container_style(BG_SURFACE, 0.0, 0.0, Color::TRANSPARENT)
 }
 
+/// Style for badge pills: a rounded container with the given background and
+/// no border (canonical 4px radius). Used for log level tags, tool badges,
+/// workspace status pills, and notes panels.
+pub fn pill_style(bg: Color) -> impl Fn(&iced::Theme) -> container::Style {
+    move |_theme: &iced::Theme| container_style(bg, 4.0, 0.0, Color::TRANSPARENT)
+}
+
 /// Style for role badge pills: a pill-shaped container with a translucent
 /// version of the role's color and 4px rounded corners.
 #[must_use]
 pub fn role_badge_pill_style(_theme: &iced::Theme, color: Color) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(Color::from_rgba(
-            color.r, color.g, color.b, 0.1,
-        ))),
-        border: iced::Border {
-            radius: 4.0.into(),
-            ..iced::Border::default()
-        },
-        ..container::Style::default()
-    }
+    container_style(
+        Color::from_rgba(color.r, color.g, color.b, 0.1),
+        4.0,
+        0.0,
+        Color::TRANSPARENT,
+    )
 }
 
 #[cfg(test)]
@@ -750,7 +766,7 @@ mod tests {
         assert_eq!(role_badge_color("ANALYST_1"), analyst_color);
     }
 
-    /// Locks the pre-consolidation values of the six container factories and
+    /// Locks the pre-consolidation values of the container factories and
     /// the button_text/button_text_danger pair so parameterization cannot
     /// silently change any rendered style.
     #[test]
@@ -784,6 +800,30 @@ mod tests {
             iced::widget::container::Style {
                 background: bg(BG_SURFACE),
                 border: border(4.0, 1.0, BORDER),
+                ..iced::widget::container::Style::default()
+            }
+        );
+        assert_eq!(
+            elevated_card_style(&theme),
+            iced::widget::container::Style {
+                background: bg(BG_ELEVATED),
+                border: border(4.0, 1.0, BORDER),
+                ..iced::widget::container::Style::default()
+            }
+        );
+        assert_eq!(
+            pill_style(BG_ELEVATED)(&theme),
+            iced::widget::container::Style {
+                background: bg(BG_ELEVATED),
+                border: border(4.0, 0.0, iced::Color::TRANSPARENT),
+                ..iced::widget::container::Style::default()
+            }
+        );
+        assert_eq!(
+            role_badge_pill_style(&theme, ACCENT),
+            iced::widget::container::Style {
+                background: bg(iced::Color::from_rgba(0.227, 0.663, 0.624, 0.1)),
+                border: border(4.0, 0.0, iced::Color::TRANSPARENT),
                 ..iced::widget::container::Style::default()
             }
         );

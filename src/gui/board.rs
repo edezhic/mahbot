@@ -1004,15 +1004,7 @@ impl BoardState {
             .width(Length::Fill);
 
         container(card)
-            .style(|_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-                border: iced::Border {
-                    radius: 4.0.into(),
-                    width: 1.0,
-                    color: theme::BORDER,
-                },
-                ..container::Style::default()
-            })
+            .style(theme::elevated_card_style)
             .width(Length::Fill)
             .into()
     }

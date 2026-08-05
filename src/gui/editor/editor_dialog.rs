@@ -20,6 +20,15 @@ use super::{
 
 // ── Overlay helpers ────────────────────────────────────────────────
 
+/// Style for a search/quick-open result row: transparent by default,
+/// highlighted when selected.
+fn result_entry_style(bg: Color) -> impl Fn(&iced::Theme) -> container::Style {
+    move |_t: &iced::Theme| container::Style {
+        background: Some(iced::Background::Color(bg)),
+        ..Default::default()
+    }
+}
+
 /// Wrap any dialog element in a centered overlay with a semi-transparent
 /// backdrop that closes the dialog on click.
 ///
@@ -91,12 +100,10 @@ pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'static, 
             } else {
                 theme::TEXT_SECONDARY
             });
-            let entry = container(label).padding([4, 12]).width(Length::Fill).style(
-                move |_t: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(bg)),
-                    ..Default::default()
-                },
-            );
+            let entry = container(label)
+                .padding([4, 12])
+                .width(Length::Fill)
+                .style(result_entry_style(bg));
             button(entry)
                 .on_press(EditorMessage::QuickOpenSelect(i))
                 .style(theme::button_transparent)
@@ -497,10 +504,7 @@ pub(super) fn build_global_search_overlay(
             let entry = container(entry_content)
                 .padding([4, 12])
                 .width(Length::Fill)
-                .style(move |_t: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(bg)),
-                    ..Default::default()
-                });
+                .style(result_entry_style(bg));
 
             button(entry)
                 .on_press(EditorMessage::GlobalSearchSelect(i))

@@ -82,16 +82,7 @@ pub fn text_input_style(_theme: &iced::Theme, _status: text_input::Status) -> te
 pub fn error_banner<'a, Message: 'a>(err: &'a str) -> Element<'a, Message> {
     container(text(err).size(13).color(theme::STATUS_ERROR))
         .padding(8)
-        .style(|_theme: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgba(
-                1.0, 0.267, 0.4, 0.08,
-            ))),
-            border: iced::Border {
-                radius: 4.0.into(),
-                ..iced::Border::default()
-            },
-            ..container::Style::default()
-        })
+        .style(theme::pill_style(theme::STATUS_ERROR.scale_alpha(0.08)))
         .into()
 }
 
@@ -126,14 +117,7 @@ pub fn badge_pill<'a, Message: 'a>(
 ) -> Element<'a, Message> {
     container(text(label).size(text_size).color(colors.1))
         .padding(padding)
-        .style(move |_theme: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(colors.0)),
-            border: iced::Border {
-                radius: 4.0.into(),
-                ..iced::Border::default()
-            },
-            ..container::Style::default()
-        })
+        .style(theme::pill_style(colors.0))
         .into()
 }
 
@@ -731,15 +715,7 @@ pub fn build_tree_panel<'a, Message: 'a>(
     let tree_inner: Element<'_, Message> = container(tree_body)
         .width(Length::Fixed(260.0))
         .height(Length::Fill)
-        .style(|_t: &iced::Theme| container::Style {
-            background: Some(iced::Background::Color(theme::BG_SURFACE)),
-            border: iced::Border {
-                radius: 0.0.into(),
-                width: 0.0,
-                color: iced::Color::TRANSPARENT,
-            },
-            ..Default::default()
-        })
+        .style(theme::surface_container_style)
         .into();
 
     if file_tree.tree_focused {

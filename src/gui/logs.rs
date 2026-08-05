@@ -443,12 +443,7 @@ impl LogsState {
             .style(theme::button_text)
             .on_press(LogMessage::TabSelected(tab));
         if is_active {
-            container(b)
-                .style(|_t: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-                    ..container::Style::default()
-                })
-                .into()
+            container(b).style(theme::container_bar).into()
         } else {
             container(b).into()
         }
@@ -539,13 +534,8 @@ impl LogsState {
         )
         .width(Length::Fill)
         .padding([4, 8])
-        .style(|_theme: &iced::Theme| container::Style {
-            border: iced::Border {
-                radius: 4.0.into(),
-                width: 1.0,
-                color: theme::STATUS_WARNING,
-            },
-            ..container::Style::default()
+        .style(|_| {
+            theme::container_style(iced::Color::TRANSPARENT, 4.0, 1.0, theme::STATUS_WARNING)
         })
         .into()
     }
@@ -563,14 +553,7 @@ impl LogsState {
                     .width(Length::Fixed(160.0)),
             )
             .padding(2)
-            .style(|_theme: &iced::Theme| container::Style {
-                border: iced::Border {
-                    radius: 4.0.into(),
-                    width: 1.0,
-                    color: theme::ACCENT,
-                },
-                ..container::Style::default()
-            })
+            .style(|_| theme::container_style(iced::Color::TRANSPARENT, 4.0, 1.0, theme::ACCENT))
             .into()
         } else {
             text_input("search", &self.search_filter)
@@ -756,31 +739,14 @@ impl LogsState {
                 Space::new().width(8),
                 container(text(&entry.level).size(10).color(level_color))
                     .padding([1, 6])
-                    .style(move |_theme: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(level_bg)),
-                        border: iced::Border {
-                            radius: 3.0.into(),
-                            ..iced::Border::default()
-                        },
-                        ..container::Style::default()
-                    }),
+                    .style(theme::pill_style(level_bg)),
                 Space::new().width(8),
                 if !entry.agent_role.is_empty() {
                     row![
                         container(text(&entry.agent_role).size(10).color(role_color))
                             .padding([1, 6])
-                            .style(move |_theme: &iced::Theme| container::Style {
-                                background: Some(iced::Background::Color(iced::Color::from_rgba(
-                                    role_color.r,
-                                    role_color.g,
-                                    role_color.b,
-                                    0.1,
-                                ),)),
-                                border: iced::Border {
-                                    radius: 3.0.into(),
-                                    ..iced::Border::default()
-                                },
-                                ..container::Style::default()
+                            .style(move |t: &iced::Theme| {
+                                theme::role_badge_pill_style(t, role_color)
                             }),
                         Space::new().width(4),
                     ]
@@ -826,14 +792,7 @@ impl LogsState {
                                 .color(theme::TEXT_MUTED),
                         )
                         .padding([1, 4])
-                        .style(|_theme: &iced::Theme| container::Style {
-                            background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-                            border: iced::Border {
-                                radius: 3.0.into(),
-                                ..iced::Border::default()
-                            },
-                            ..container::Style::default()
-                        }),
+                        .style(theme::pill_style(theme::BG_ELEVATED)),
                     );
                 }
                 if has_tags {

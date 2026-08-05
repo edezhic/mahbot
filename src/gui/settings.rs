@@ -909,10 +909,7 @@ impl SettingsState {
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(24)
-            .style(|_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::BG_BASE)),
-                ..container::Style::default()
-            })
+            .style(theme::base_container_style)
             .into()
     }
 
@@ -969,16 +966,7 @@ impl SettingsState {
                                     text(ws_item.status.as_ref()).size(11).color(status_color)
                                 )
                                 .padding([2, 8])
-                                .style(
-                                    move |_theme: &iced::Theme| container::Style {
-                                        background: Some(iced::Background::Color(status_bg)),
-                                        border: iced::Border {
-                                            radius: 4.0.into(),
-                                            ..iced::Border::default()
-                                        },
-                                        ..container::Style::default()
-                                    }
-                                ),
+                                .style(theme::pill_style(status_bg)),
                             )
                             .width(Length::FillPortion(10))
                             .align_x(Alignment::Start)
@@ -1103,15 +1091,7 @@ impl SettingsState {
                     .spacing(4),
                 )
                 .padding(8)
-                .style(|_theme: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                    border: iced::Border {
-                        radius: 4.0.into(),
-                        width: 1.0,
-                        color: theme::BORDER,
-                    },
-                    ..container::Style::default()
-                });
+                .style(theme::surface_card_style);
 
                 // Wrap with mouse_area for right-click context menu
                 let row_with_ctx =
@@ -1154,14 +1134,8 @@ impl SettingsState {
                         .spacing(4)
                         .padding([2, 8]),
                     )
-                    .style(|_t: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-                        border: iced::Border {
-                            radius: 4.0.into(),
-                            width: 1.0,
-                            color: theme::BORDER_STRONG,
-                        },
-                        ..container::Style::default()
+                    .style(|_| {
+                        theme::container_style(theme::BG_ELEVATED, 4.0, 1.0, theme::BORDER_STRONG)
                     });
                     rows = rows.push(ctx_actions);
                 }
@@ -1236,14 +1210,7 @@ impl SettingsState {
                         .spacing(4),
                     )
                     .padding([4, 8])
-                    .style(|_theme: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-                        border: iced::Border {
-                            radius: 4.0.into(),
-                            ..iced::Border::default()
-                        },
-                        ..container::Style::default()
-                    });
+                    .style(theme::pill_style(theme::BG_ELEVATED));
 
                     rows = rows.push(notes_section);
                 }
@@ -1276,20 +1243,7 @@ impl SettingsState {
                     let mut view_col = column![];
 
                     if let Some(ref err) = ws.context_view_error {
-                        view_col = view_col.push(
-                            container(text(err).size(12).color(theme::STATUS_ERROR))
-                                .padding(8)
-                                .style(|_theme: &iced::Theme| container::Style {
-                                    background: Some(iced::Background::Color(
-                                        iced::Color::from_rgba(1.0, 0.267, 0.4, 0.08),
-                                    )),
-                                    border: iced::Border {
-                                        radius: 4.0.into(),
-                                        ..iced::Border::default()
-                                    },
-                                    ..container::Style::default()
-                                }),
-                        );
+                        view_col = view_col.push(widgets::error_banner(err));
                         view_col = view_col.push(Space::new().height(8));
                     }
 
@@ -1309,14 +1263,8 @@ impl SettingsState {
                             container(scrollable(md).direction(theme::vertical_scrollbar()))
                                 .padding(4)
                                 .height(Length::Fixed(300.0))
-                                .style(|_theme: &iced::Theme| container::Style {
-                                    background: Some(iced::Background::Color(theme::BG_BASE)),
-                                    border: iced::Border {
-                                        radius: 4.0.into(),
-                                        width: 1.0,
-                                        color: theme::BORDER,
-                                    },
-                                    ..Default::default()
+                                .style(|_| {
+                                    theme::container_style(theme::BG_BASE, 4.0, 1.0, theme::BORDER)
                                 }),
                         );
                     }
@@ -1631,15 +1579,7 @@ impl SettingsState {
                     .spacing(4),
                 )
                 .padding(8)
-                .style(|_theme: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                    border: iced::Border {
-                        radius: 4.0.into(),
-                        width: 1.0,
-                        color: theme::BORDER,
-                    },
-                    ..container::Style::default()
-                });
+                .style(theme::surface_card_style);
 
                 rows = rows.push(user_row);
             }
@@ -1753,20 +1693,7 @@ impl SettingsState {
 
         // Error banner
         if let Some(err) = error {
-            rows_col = rows_col.push(
-                container(text(err).size(12).color(theme::STATUS_ERROR))
-                    .padding(8)
-                    .style(|_theme: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(
-                            theme::STATUS_ERROR.scale_alpha(0.1),
-                        )),
-                        border: iced::Border {
-                            radius: 4.0.into(),
-                            ..iced::Border::default()
-                        },
-                        ..container::Style::default()
-                    }),
-            );
+            rows_col = rows_col.push(widgets::error_banner(err));
         }
 
         for (i, label) in labels.iter().enumerate() {

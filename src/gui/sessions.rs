@@ -639,15 +639,7 @@ impl SessionsState {
                                     .spacing(2),
                                 )
                                 .padding([4, 8])
-                                .style(|_theme: &iced::Theme| container::Style {
-                                    background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                                    border: iced::Border {
-                                        radius: 3.0.into(),
-                                        width: 1.0,
-                                        color: theme::BORDER,
-                                    },
-                                    ..container::Style::default()
-                                }),
+                                .style(theme::surface_card_style),
                             );
                         }
 
@@ -724,15 +716,7 @@ impl SessionsState {
                             0
                         }))
                         .padding(8)
-                        .style(|_theme: &iced::Theme| container::Style {
-                            background: Some(iced::Background::Color(theme::BG_ELEVATED)),
-                            border: iced::Border {
-                                radius: 4.0.into(),
-                                width: 1.0,
-                                color: theme::BORDER,
-                            },
-                            ..container::Style::default()
-                        });
+                        .style(theme::elevated_card_style);
 
                     items = items.push(round_card);
                     i = j;
@@ -796,32 +780,23 @@ impl SessionsState {
                     if let Some(ref t) = thinking {
                         let is_thinking_expanded = expanded_thinking.contains(&i);
 
-                        let thinking_header =
-                            button(
-                                container(
-                                    row![
-                                        text("🧠 Thinking").size(11).color(theme::TEXT_MUTED),
-                                        Space::new().width(Length::Fill),
-                                        text(if is_thinking_expanded { "▼" } else { "▶" })
-                                            .size(9)
-                                            .color(theme::TEXT_MUTED),
-                                    ]
-                                    .align_y(Alignment::Center),
-                                )
-                                .padding([4, 8])
-                                .width(Length::Fill)
-                                .style(|_theme: &iced::Theme| container::Style {
-                                    background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                                    border: iced::Border {
-                                        radius: 3.0.into(),
-                                        width: 1.0,
-                                        color: theme::BORDER,
-                                    },
-                                    ..container::Style::default()
-                                }),
+                        let thinking_header = button(
+                            container(
+                                row![
+                                    text("🧠 Thinking").size(11).color(theme::TEXT_MUTED),
+                                    Space::new().width(Length::Fill),
+                                    text(if is_thinking_expanded { "▼" } else { "▶" })
+                                        .size(9)
+                                        .color(theme::TEXT_MUTED),
+                                ]
+                                .align_y(Alignment::Center),
                             )
-                            .style(theme::button_text)
-                            .on_press(SessionsMessage::ToggleThinkingBlock(i));
+                            .padding([4, 8])
+                            .width(Length::Fill)
+                            .style(theme::surface_card_style),
+                        )
+                        .style(theme::button_text)
+                        .on_press(SessionsMessage::ToggleThinkingBlock(i));
 
                         msg_col = msg_col.push(thinking_header);
 
@@ -829,17 +804,7 @@ impl SessionsState {
                             msg_col = msg_col.push(
                                 container(text(t.clone()).size(11).color(theme::TEXT_MUTED))
                                     .padding([4, 8])
-                                    .style(|_theme: &iced::Theme| container::Style {
-                                        background: Some(iced::Background::Color(
-                                            theme::BG_SURFACE,
-                                        )),
-                                        border: iced::Border {
-                                            radius: 3.0.into(),
-                                            width: 1.0,
-                                            color: theme::BORDER,
-                                        },
-                                        ..container::Style::default()
-                                    }),
+                                    .style(theme::surface_card_style),
                             );
                         }
                     }

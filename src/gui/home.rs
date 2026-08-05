@@ -543,20 +543,17 @@ impl HomeState {
                         .center_x(Length::Fill)
                         .into();
 
+                        let divider_rule = |_: &iced::Theme| rule::Style {
+                            color: theme::TEXT_MUTED,
+                            radius: 0.0.into(),
+                            fill_mode: rule::FillMode::Padded(0),
+                            snap: true,
+                        };
+
                         let divider = column![
-                            rule::horizontal(1).style(|_: &iced::Theme| rule::Style {
-                                color: theme::TEXT_MUTED,
-                                radius: 0.0.into(),
-                                fill_mode: rule::FillMode::Padded(0),
-                                snap: true,
-                            }),
+                            rule::horizontal(1).style(divider_rule),
                             label,
-                            rule::horizontal(1).style(|_: &iced::Theme| rule::Style {
-                                color: theme::TEXT_MUTED,
-                                radius: 0.0.into(),
-                                fill_mode: rule::FillMode::Padded(0),
-                                snap: true,
-                            }),
+                            rule::horizontal(1).style(divider_rule),
                         ]
                         .spacing(4)
                         .padding(8)
