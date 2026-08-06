@@ -1,10 +1,11 @@
+use crate::tools::image_catalog::{ImageCatalog, ImageModelInfo, ImageOutput};
 use crate::{Tool, Workspace};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::json;
 use std::path::Path;
 
-/// Tool for generating images via OpenRouter's chat completions API.
+/// Tool for generating images via OpenRouter's dedicated Image API.
 ///
 /// Supports text-to-image and image-to-image generation. Accepts multiple
 /// reference images on input. Returns the path to the generated file so the
@@ -49,109 +50,209 @@ impl Tool for ImageGenTool {
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
         let prompt = super::get_str(&args, "prompt")?;
-
         let model = crate::config::CONFIG.image_gen_model();
-
-        let aspect_ratio = super::get_opt_str(&args, "aspect_ratio");
+        let aspect_ratio_arg = super::get_opt_str(&args, "aspect_ratio");
         let size = super::get_opt_str(&args, "size");
-
         let images: Vec<String> = super::get_str_array(&args, "images");
 
-        let messages = if images.is_empty() {
-            json!([{
-                "role": "user",
-                "content": prompt
-            }])
-        } else {
-            let mut content_parts = Vec::new();
-            content_parts.push(json!({
-                "type": "text",
-                "text": prompt
-            }));
-
-            for img_path in &images {
-                let data_uri = crate::util::load_reference_image(
+        // Load reference images before any request so count validation and
+        // file errors surface deterministically.
+        let mut reference_uris = Vec::with_capacity(images.len());
+        for img_path in &images {
+            reference_uris.push(
+                crate::util::load_reference_image(
                     Path::new(img_path),
                     super::MAX_REFERENCE_IMAGE_BYTES,
                 )
-                .await?;
-                content_parts.push(json!({
-                    "type": "image_url",
-                    "image_url": { "url": data_uri }
-                }));
-            }
+                .await?,
+            );
+        }
 
-            json!([{
-                "role": "user",
-                "content": content_parts
-            }])
+        // Capability and parameter decisions come from the catalog; a catalog
+        // outage degrades to minimal user-provided parameters (fail-open).
+        let catalog = crate::tools::image_catalog::get_catalog().await;
+        let info = match &catalog {
+            Some(catalog) => Some(check_image_capability(&model, catalog)?),
+            None => None,
         };
 
-        let mut body = json!({
-            "model": model,
-            "messages": messages,
-            "modalities": ["image", "text"],
-            "max_tokens": 4096,
-        });
-
-        // Auto-detect aspect ratio from the first reference image when one is
-        // provided and the agent has not explicitly set `aspect_ratio`.
-        let resolved_aspect_ratio: String = match aspect_ratio {
-            Some(ar) => ar.into(),
-            None if !images.is_empty() => {
-                if let Some(ratio) = detect_aspect_ratio_from_image(Path::new(&images[0])) {
-                    tracing::debug!(
-                        "Auto-detected aspect ratio {ratio} from reference image `{}`",
-                        images[0],
-                    );
-                    ratio.into()
-                } else {
-                    tracing::debug!(
-                        "Could not detect aspect ratio from reference image `{}`, falling back to 9:16",
-                        images[0],
-                    );
-                    "9:16".into()
-                }
-            }
-            None => "9:16".into(),
+        // Fail-open sends only an explicitly user-provided aspect ratio.
+        let resolved_aspect_ratio = match info {
+            Some(_) => Some(resolve_aspect_ratio(aspect_ratio_arg, &images)),
+            None => aspect_ratio_arg.map(String::from),
         };
 
-        body["image_config"] = json!({
-            "aspect_ratio": resolved_aspect_ratio,
-            "image_size": size.unwrap_or("2k"),
-        });
+        let body = build_request_body(
+            &model,
+            prompt,
+            resolved_aspect_ratio.as_deref(),
+            size,
+            &reference_uris,
+            info,
+        )?;
 
-        let endpoint = crate::config::CONFIG.provider_endpoint();
-        let chat_url = crate::providers::ensure_chat_completions_url(&endpoint);
-
+        let api_base =
+            crate::providers::ensure_base_url(&crate::config::CONFIG.provider_endpoint());
+        let images_url = format!("{api_base}/images");
         let response_body =
-            crate::util::http::post_json_to_provider(&chat_url, &body, "Image generation").await?;
+            crate::util::http::post_json_to_provider(&images_url, &body, "Image generation")
+                .await?;
 
-        // Extract from choices[0].message.images[].image_url.url (OpenRouter format)
-        let parts = extract_response_parts(&response_body);
-        let Some(image_data) = parts.image_data else {
-            anyhow::bail!("Image generation response did not contain image data in message.images");
+        let Some((b64_json, media_type)) = extract_response_image(&response_body) else {
+            anyhow::bail!("Image generation response did not contain image data (data[].b64_json)");
         };
 
-        let model_text = parts.text_content;
+        let bytes = STANDARD.decode(b64_json.as_bytes()).map_err(|e| {
+            anyhow::anyhow!("Failed to decode base64 image data from response: {e}")
+        })?;
 
-        let Some(bytes) = decode_data_uri(&image_data) else {
-            anyhow::bail!("Failed to decode image data from response (expected base64 data URI)");
-        };
-
-        let output_path = super::save_generated_file(ws, &bytes, "image", "png").await?;
+        let output_path = super::save_generated_file(
+            ws,
+            &bytes,
+            "image",
+            extension_for_media_type(media_type.as_deref()),
+        )
+        .await?;
 
         let path_str = output_path.to_string_lossy();
         let marker_prefix = self
             .media_marker()
             .expect("ImageGenTool always has a media marker");
-        let output = match &model_text {
-            Some(text) => format!("{text}\n\n{marker_prefix}{path_str}]"),
-            None => format!("{marker_prefix}{path_str}]"),
-        };
-
-        Ok(output)
+        Ok(format!("{marker_prefix}{path_str}]"))
     }
+}
+
+/// Default aspect ratio: supported by every model in the image-models catalog.
+const DEFAULT_ASPECT_RATIO: &str = "9:16";
+
+/// Reject models that cannot generate images on the dedicated surface:
+/// unknown model ids or models that explicitly declare text-only output.
+/// Returns the model's catalog info for request building; models whose
+/// catalog entry lacks output modalities (shape drift) are allowed through.
+/// Catalog-driven — no per-model branches.
+///
+/// # Errors
+///
+/// - The model is absent from the catalog or explicitly declares no image output.
+fn check_image_capability<'a>(
+    model: &str,
+    catalog: &'a ImageCatalog,
+) -> anyhow::Result<&'a ImageModelInfo> {
+    let Some(info) = catalog.find(model) else {
+        anyhow::bail!(
+            "Model `{model}` cannot generate images: it is not in the OpenRouter \
+             image-models catalog. Set an image-capable model in Settings → \
+             Image Generation and retry."
+        );
+    };
+    if info.image_output == ImageOutput::TextOnly {
+        anyhow::bail!(
+            "Model `{model}` cannot generate images: the OpenRouter image-models catalog \
+             does not list image output for it. Set an image-capable model in \
+             Settings → Image Generation and retry."
+        );
+    }
+    Ok(info)
+}
+
+/// Build the dedicated Image API request body from tool args and (when
+/// available) the model's declared capabilities. `info` is `Some` exactly
+/// when the catalog is available and the model passed the capability check;
+/// `None` means the catalog is unavailable (fail-open) — only explicitly
+/// user-provided parameters are sent.
+///
+/// # Errors
+///
+/// - Reference-image count exceeds the model's declared `input_references` cap.
+/// - Reference images provided for a model that does not declare `input_references`.
+fn build_request_body(
+    model: &str,
+    prompt: &str,
+    aspect_ratio: Option<&str>,
+    size: Option<&str>,
+    reference_uris: &[String],
+    info: Option<&ImageModelInfo>,
+) -> anyhow::Result<serde_json::Value> {
+    let mut body = json!({
+        "model": model,
+        "prompt": prompt,
+    });
+
+    if let Some(info) = info {
+        if info.declares("aspect_ratio")
+            && let Some(ratio) = aspect_ratio
+        {
+            // "auto" is only valid where the model declares it; otherwise
+            // fall back to the safe default.
+            let ratio = if ratio == "auto" && !info.enum_contains("aspect_ratio", "auto") {
+                DEFAULT_ASPECT_RATIO
+            } else {
+                ratio
+            };
+            body["aspect_ratio"] = json!(ratio);
+        }
+
+        if let Some(s) = size {
+            if s.contains(['x', 'X', '×']) {
+                if info.declares("size") {
+                    body["size"] = json!(s);
+                } else {
+                    tracing::debug!("size `{s}` dropped — model `{model}` does not declare `size`");
+                }
+            } else if info.declares("resolution") {
+                // Catalog resolution enums are uppercase ("1K", "2K", "4K", "512").
+                body["resolution"] = json!(s.to_uppercase());
+            } else {
+                tracing::debug!(
+                    "size `{s}` dropped — model `{model}` does not declare `resolution`"
+                );
+            }
+        }
+
+        if !reference_uris.is_empty() {
+            match info.range_max("input_references") {
+                #[allow(clippy::cast_possible_wrap)]
+                Some(max) if reference_uris.len() as i64 > max => anyhow::bail!(
+                    "Model `{model}` supports at most {max} reference image(s), \
+                     got {}. Retry with fewer images.",
+                    reference_uris.len(),
+                ),
+                Some(_) => {}
+                None => anyhow::bail!(
+                    "Model `{model}` does not support reference images. \
+                     Retry without the `images` parameter."
+                ),
+            }
+            body["input_references"] = reference_json(reference_uris);
+        }
+    } else {
+        // Fail-open: send only what the user explicitly provided.
+        if let Some(ratio) = aspect_ratio {
+            body["aspect_ratio"] = json!(ratio);
+        }
+        if let Some(s) = size {
+            tracing::debug!(
+                "size `{s}` dropped — catalog unavailable, only user-provided parameters are sent"
+            );
+        }
+        if !reference_uris.is_empty() {
+            body["input_references"] = reference_json(reference_uris);
+        }
+    }
+
+    Ok(body)
+}
+
+/// Build the `input_references` array (image_url entries) for the dedicated surface.
+fn reference_json(uris: &[String]) -> serde_json::Value {
+    json!(
+        uris.iter()
+            .map(|uri| json!({
+                "type": "image_url",
+                "image_url": { "url": uri }
+            }))
+            .collect::<Vec<_>>()
+    )
 }
 
 /// All canonical aspect ratios supported by OpenRouter, mapped to their float
@@ -180,6 +281,31 @@ static CANONICAL_ASPECT_RATIOS: &[(&str, f64)] = &[
     ("9:20", 9.0 / 20.0),
     ("20:9", 20.0 / 9.0),
 ];
+
+/// Resolve the effective aspect ratio: the user-provided value, the closest
+/// canonical ratio detected from the first reference image, or the
+/// [`DEFAULT_ASPECT_RATIO`] default.
+fn resolve_aspect_ratio(aspect_ratio: Option<&str>, images: &[String]) -> String {
+    match aspect_ratio {
+        Some(ar) => ar.to_string(),
+        None if !images.is_empty() => {
+            if let Some(ratio) = detect_aspect_ratio_from_image(Path::new(&images[0])) {
+                tracing::debug!(
+                    "Auto-detected aspect ratio {ratio} from reference image `{}`",
+                    images[0],
+                );
+                ratio.to_string()
+            } else {
+                tracing::debug!(
+                    "Could not detect aspect ratio from reference image `{}`, falling back to {DEFAULT_ASPECT_RATIO}",
+                    images[0],
+                );
+                DEFAULT_ASPECT_RATIO.to_string()
+            }
+        }
+        None => DEFAULT_ASPECT_RATIO.to_string(),
+    }
+}
 
 /// Detect the closest canonical aspect ratio from an image file.
 ///
@@ -217,227 +343,261 @@ fn find_closest_aspect_ratio(width: usize, height: usize) -> Option<&'static str
         .map(|(name, _)| *name)
 }
 
-/// The parts extracted from an image generation response.
-///
-/// - `image_data`: the first non-empty `choices[0].message.images[].image_url.url`
-/// - `text_content`: the optional text from `choices[0].message.content`
-#[derive(Debug, PartialEq)]
-pub(crate) struct ImageGenResponse {
-    pub(crate) image_data: Option<String>,
-    pub(crate) text_content: Option<String>,
-}
-
-/// Extract both image data and text content from an OpenRouter image generation
-/// response via a single traversal of `body["choices"][0]["message"]`.
-///
-/// Images are in `choices[0].message.images[].image_url.url` (OpenRouter format).
-/// Text content is in `choices[0].message.content` (Gemini-class models return both).
-fn extract_response_parts(body: &serde_json::Value) -> ImageGenResponse {
-    let message = body["choices"]
-        .as_array()
-        .and_then(|arr| arr.first())
-        .and_then(|c| c.get("message"));
-
-    let image_data = message
-        .and_then(|msg| msg.get("images"))
-        .and_then(|imgs| imgs.as_array())
-        .and_then(|arr| {
-            for img in arr {
-                if let Some(url) = img["image_url"]["url"].as_str()
-                    && !url.is_empty()
-                {
-                    return Some(url.to_string());
-                }
-            }
-            None
-        });
-
-    let text_content = message
-        .and_then(|msg| msg.get("content"))
-        .and_then(|v| v.as_str())
-        .filter(|t| !t.is_empty())
-        .map(ToString::to_string);
-
-    ImageGenResponse {
-        image_data,
-        text_content,
+/// Extract the first non-empty `data[].b64_json` payload and its optional
+/// `media_type` from a dedicated Image API response. `b64_json` is raw
+/// base64 (not a data URI); `media_type` may be absent (PNG default).
+fn extract_response_image(body: &serde_json::Value) -> Option<(String, Option<String>)> {
+    let data = body.get("data")?.as_array()?;
+    for entry in data {
+        if let Some(b64) = entry.get("b64_json").and_then(|v| v.as_str())
+            && !b64.is_empty()
+        {
+            let media_type = entry
+                .get("media_type")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            return Some((b64.to_string(), media_type));
+        }
     }
+    None
 }
 
-/// Decode a base64 data URI like `data:image/png;base64,...`
-fn decode_data_uri(data_uri: &str) -> Option<Vec<u8>> {
-    let base64_part = data_uri.split(";base64,").nth(1)?;
-    STANDARD.decode(base64_part).ok()
+/// Map a response media type to a file extension; PNG when absent or unknown.
+#[must_use]
+fn extension_for_media_type(media_type: Option<&str>) -> &'static str {
+    match media_type {
+        Some("image/jpeg") => "jpg",
+        Some("image/webp") => "webp",
+        Some("image/svg+xml") => "svg",
+        _ => "png",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::tools::image_catalog::{ImageCatalog, parse_catalog};
 
-    /// Helper to build a minimal response body matching the OpenRouter image gen format.
-    fn make_response(image_url: Option<&str>, text_content: Option<&str>) -> serde_json::Value {
-        let msg = match image_url {
-            Some(url) => {
-                let images = json!([{"image_url": {"url": url}}]);
-                match text_content {
-                    Some(t) => json!({"images": images, "content": t}),
-                    None => json!({"images": images}),
+    /// Fixture catalog covering a hybrid image model (resolution + reference
+    /// caps), a recraft-like model (aspect ratio only, declares "auto"), and a
+    /// text-only model.
+    fn fixture_catalog() -> ImageCatalog {
+        parse_catalog(&json!({
+            "data": [
+                {
+                    "id": "qwen/qwen-image-3-pro",
+                    "architecture": { "output_modalities": ["image"] },
+                    "supported_parameters": {
+                        "resolution": { "type": "enum", "values": ["1K", "2K"] },
+                        "aspect_ratio": { "type": "enum", "values": ["1:1", "9:16"] },
+                        "input_references": { "type": "range", "min": 0, "max": 4 }
+                    }
+                },
+                {
+                    "id": "recraft/recraft-v4.1",
+                    "architecture": { "output_modalities": ["image"] },
+                    "supported_parameters": {
+                        "aspect_ratio": { "type": "enum", "values": ["1:1", "9:16", "auto"] },
+                        "input_references": { "type": "range", "min": 0, "max": 1 }
+                    }
+                },
+                {
+                    "id": "text-only/model",
+                    "architecture": { "output_modalities": ["text"] },
+                    "supported_parameters": {}
                 }
-            }
-            None => match text_content {
-                Some(t) => json!({"content": t}),
-                None => json!({}),
-            },
-        };
-        json!({
-            "choices": [{"message": msg}]
-        })
+            ]
+        }))
+        .expect("valid fixture")
+    }
+
+    fn refs(n: usize) -> Vec<String> {
+        vec!["data:image/png;base64,a".to_string(); n]
     }
 
     #[test]
-    fn test_extract_response_parts_variants() {
-        // Table-driven tests covering normal variants of extract_response_parts.
-        //
-        // - Empty text content → None (empty-string guard in extract_response_parts).
-        struct Case {
-            image_url: Option<&'static str>,
-            text_content: Option<&'static str>,
-            expected_image_data: Option<&'static str>,
-            expected_text_content: Option<&'static str>,
-            label: &'static str,
-        }
+    fn test_build_request_body_catalog_driven() {
+        let catalog = fixture_catalog();
+        let qwen = catalog.find("qwen/qwen-image-3-pro");
 
-        let cases: Vec<Case> = vec![
-            Case {
-                image_url: Some("data:image/png;base64,abc123"),
-                text_content: Some("Here is your generated image"),
-                expected_image_data: Some("data:image/png;base64,abc123"),
-                expected_text_content: Some("Here is your generated image"),
-                label: "image_and_text",
-            },
-            Case {
-                image_url: Some("data:image/png;base64,def456"),
-                text_content: None,
-                expected_image_data: Some("data:image/png;base64,def456"),
-                expected_text_content: None,
-                label: "image_only",
-            },
-            Case {
-                image_url: None,
-                text_content: Some("Just text, no image"),
-                expected_image_data: None,
-                expected_text_content: Some("Just text, no image"),
-                label: "text_only",
-            },
-            Case {
-                image_url: Some("data:image/png;base64,ghi789"),
-                text_content: Some(""),
-                expected_image_data: Some("data:image/png;base64,ghi789"),
-                expected_text_content: None,
-                label: "empty_content — empty text yields None",
-            },
-        ];
-        for case in &cases {
-            let body = make_response(case.image_url, case.text_content);
-            let result = extract_response_parts(&body);
-            assert_eq!(
-                result.image_data,
-                case.expected_image_data.map(ToString::to_string),
-                "{}: image_data mismatch",
-                case.label,
-            );
-            assert_eq!(
-                result.text_content,
-                case.expected_text_content.map(ToString::to_string),
-                "{}: text_content mismatch",
-                case.label,
-            );
-        }
+        // size "2k" → resolution "2K" (catalog case); 9:16; two references.
+        let body = build_request_body(
+            "qwen/qwen-image-3-pro",
+            "a cat",
+            Some("9:16"),
+            Some("2k"),
+            &refs(2),
+            qwen,
+        )
+        .unwrap();
+        assert_eq!(body["model"], "qwen/qwen-image-3-pro");
+        assert_eq!(body["prompt"], "a cat");
+        assert_eq!(body["resolution"], "2K");
+        assert_eq!(body["aspect_ratio"], "9:16");
+        assert_eq!(body["input_references"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            body["input_references"][0]["image_url"]["url"],
+            "data:image/png;base64,a"
+        );
+        assert!(body.get("size").is_none());
+        assert!(body.get("n").is_none());
     }
 
     #[test]
-    fn test_extract_response_parts_graceful_empty() {
-        // All these empty/missing response structures should yield (None, None)
-        let cases: Vec<(&str, serde_json::Value)> = vec![
-            ("empty image URL", make_response(Some(""), None)),
-            (
-                "null fields",
-                json!({
-                    "choices": [{
-                        "message": {
-                            "images": null,
-                            "content": null,
-                        }
-                    }]
-                }),
-            ),
-            ("empty choices array", json!({"choices": []})),
-            ("missing choices key", json!({})),
-        ];
-        for (label, body) in &cases {
-            let result = extract_response_parts(body);
-            assert_eq!(
-                result.image_data, None,
-                "{label}: expected image_data to be None",
-            );
-            assert_eq!(
-                result.text_content, None,
-                "{label}: expected text_content to be None",
-            );
-        }
+    fn test_build_request_body_omits_undeclared_and_validates_caps() {
+        let catalog = fixture_catalog();
+        let recraft = catalog.find("recraft/recraft-v4.1");
+        let qwen = catalog.find("qwen/qwen-image-3-pro");
+
+        // No declared resolution → size dropped entirely.
+        let body = build_request_body(
+            "recraft/recraft-v4.1",
+            "p",
+            Some("9:16"),
+            Some("2K"),
+            &[],
+            recraft,
+        )
+        .unwrap();
+        assert!(body.get("resolution").is_none());
+        assert_eq!(body["aspect_ratio"], "9:16");
+
+        // '1024X1024' (uppercase separator) with no declared `size` → dropped,
+        // never sent as a bogus resolution.
+        let body = build_request_body(
+            "qwen/qwen-image-3-pro",
+            "p",
+            None,
+            Some("1024X1024"),
+            &[],
+            qwen,
+        )
+        .unwrap();
+        assert!(body.get("resolution").is_none());
+        assert!(body.get("size").is_none());
+
+        // "auto" not declared by qwen → falls back to the 9:16 default.
+        let body = build_request_body("qwen/qwen-image-3-pro", "p", Some("auto"), None, &[], qwen)
+            .unwrap();
+        assert_eq!(body["aspect_ratio"], "9:16");
+
+        // recraft declares "auto" → passed through.
+        let body = build_request_body(
+            "recraft/recraft-v4.1",
+            "p",
+            Some("auto"),
+            None,
+            &[],
+            recraft,
+        )
+        .unwrap();
+        assert_eq!(body["aspect_ratio"], "auto");
+
+        // Reference overflow → error, not truncation.
+        let err = build_request_body("qwen/qwen-image-3-pro", "p", None, None, &refs(5), qwen)
+            .unwrap_err();
+        assert!(err.to_string().contains("at most 4 reference image(s)"));
+
+        // Model without input_references → error when images provided.
+        let text_only = catalog.find("text-only/model");
+        let err = build_request_body("text-only/model", "p", None, None, &refs(1), text_only)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not support reference images")
+        );
     }
 
     #[test]
-    fn test_extract_response_parts_first_valid_image() {
-        // Both cases should return the first non-empty image_url.url
-        let cases: Vec<(&str, serde_json::Value, &str)> = vec![
-            (
-                "first of two valid URLs",
-                json!({
-                    "choices": [{
-                        "message": {
-                            "images": [
-                                {"image_url": {"url": "data:image/png;base64,first"}},
-                                {"image_url": {"url": "data:image/png;base64,second"}}
-                            ]
-                        }
-                    }]
-                }),
-                "data:image/png;base64,first",
-            ),
-            (
-                "skip empty, pick next valid",
-                json!({
-                    "choices": [{
-                        "message": {
-                            "images": [
-                                {"image_url": {"url": ""}},
-                                {"image_url": {"url": "data:image/png;base64,valid"}}
-                            ]
-                        }
-                    }]
-                }),
-                "data:image/png;base64,valid",
-            ),
-        ];
-        for (label, body, expected_url) in &cases {
-            let result = extract_response_parts(body);
-            assert_eq!(result.image_data, Some(expected_url.to_string()), "{label}");
-            assert_eq!(result.text_content, None, "{label}");
-        }
+    fn test_build_request_body_fail_open_minimal() {
+        // info = None (catalog unavailable): only user-provided params are sent.
+        let body =
+            build_request_body("any/model", "p", Some("16:9"), Some("2k"), &refs(1), None).unwrap();
+        assert_eq!(body["model"], "any/model");
+        assert_eq!(body["prompt"], "p");
+        assert_eq!(body["aspect_ratio"], "16:9");
+        assert_eq!(body["input_references"].as_array().unwrap().len(), 1);
+        assert!(body.get("resolution").is_none());
+
+        // No aspect ratio provided → not sent at all (no default in fail-open).
+        let body = build_request_body("any/model", "p", None, None, &[], None).unwrap();
+        assert!(body.get("aspect_ratio").is_none());
+        assert!(body.get("input_references").is_none());
     }
 
     #[test]
-    fn test_decode_data_uri_valid() {
-        let result = decode_data_uri("data:image/png;base64,aGVsbG8=");
-        assert_eq!(result, Some(b"hello".to_vec()));
+    fn test_check_image_capability_rejects_unsupported_models() {
+        let catalog = fixture_catalog();
+        assert!(check_image_capability("qwen/qwen-image-3-pro", &catalog).is_ok());
+        let err = check_image_capability("unknown/model", &catalog).unwrap_err();
+        assert!(err.to_string().contains("cannot generate images"));
+        assert!(
+            err.to_string()
+                .contains("not in the OpenRouter image-models catalog")
+        );
+        let err = check_image_capability("text-only/model", &catalog).unwrap_err();
+        assert!(err.to_string().contains("cannot generate images"));
+        assert!(err.to_string().contains("does not list image output"));
     }
 
     #[test]
-    fn test_decode_data_uri_invalid() {
-        let result = decode_data_uri("not-a-data-uri");
-        assert_eq!(result, None);
+    fn test_check_image_capability_fail_open_on_shape_drift() {
+        // Missing output_modalities (shape drift) is tolerated; explicitly
+        // text-only models are still rejected.
+        let catalog = parse_catalog(&json!({
+            "data": [
+                { "id": "drift/model", "supported_parameters": {} },
+                {
+                    "id": "text-only/model",
+                    "architecture": { "output_modalities": ["text"] },
+                    "supported_parameters": {}
+                }
+            ]
+        }))
+        .expect("valid");
+        assert!(check_image_capability("drift/model", &catalog).is_ok());
+        assert!(check_image_capability("text-only/model", &catalog).is_err());
+    }
+
+    #[test]
+    fn test_extract_response_image_variants() {
+        // b64_json is raw base64; media_type present.
+        let body = json!({
+            "data": [{ "b64_json": "aGVsbG8=", "media_type": "image/jpeg" }],
+            "usage": { "cost": 0.001 }
+        });
+        let (b64, media_type) = extract_response_image(&body).expect("image");
+        assert_eq!(b64, "aGVsbG8=");
+        assert_eq!(media_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(STANDARD.decode(b64.as_bytes()).unwrap(), b"hello");
+
+        // First non-empty entry wins; media_type absent.
+        let body = json!({
+            "data": [
+                { "b64_json": "" },
+                { "b64_json": "d29ybGQ=" }
+            ]
+        });
+        let (b64, media_type) = extract_response_image(&body).expect("image");
+        assert_eq!(b64, "d29ybGQ=");
+        assert_eq!(media_type, None);
+
+        // Empty/missing data → None.
+        assert!(extract_response_image(&json!({"data": []})).is_none());
+        assert!(extract_response_image(&json!({})).is_none());
+    }
+
+    #[test]
+    fn test_extension_for_media_type() {
+        assert_eq!(extension_for_media_type(Some("image/png")), "png");
+        assert_eq!(extension_for_media_type(Some("image/jpeg")), "jpg");
+        assert_eq!(extension_for_media_type(Some("image/webp")), "webp");
+        assert_eq!(extension_for_media_type(Some("image/svg+xml")), "svg");
+        assert_eq!(extension_for_media_type(None), "png");
+        assert_eq!(
+            extension_for_media_type(Some("application/octet-stream")),
+            "png"
+        );
     }
 
     // ── find_closest_aspect_ratio tests ──────────────────────────────

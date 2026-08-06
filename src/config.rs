@@ -114,7 +114,7 @@ use tracing::warn;
 
 pub(crate) const DEFAULT_PROVIDER_ENDPOINT: &str = "https://openrouter.ai/api/v1";
 
-const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-3.1-flash-image-preview";
+const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-3.1-flash-image";
 const DEFAULT_VIDEO_GEN_MODEL: &str = "google/veo-3.1-lite";
 const DEFAULT_VIDEO_EDIT_MODEL: &str = "minimax/hailuo-3";
 pub(crate) const DEFAULT_IMAGE_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.6-plus";
