@@ -10,6 +10,12 @@ const MAX_INSTRUCTION_CHARS: usize = 1000;
 /// upload path against unbounded reads (hailuo-3's own model bound is 50 MB).
 const MAX_INPUT_BYTES: u64 = 50 * 1024 * 1024;
 
+/// Input image size cap (provider-declared 30 MB bound for hailuo-3).
+const MAX_IMAGE_BYTES: u64 = 30 * 1024 * 1024;
+
+/// Maximum reference images per request (native hailuo-3 limit of 9).
+const MAX_REFERENCE_IMAGES: usize = 9;
+
 /// Per-model video edit capability classification, driving validation and the
 /// tool description. The active model is user-switchable via
 /// `video_edit_model` in the config.
@@ -69,13 +75,75 @@ fn validate_params(spec: VideoEditModel, duration: Option<i64>) -> anyhow::Resul
     Ok(())
 }
 
-/// Validate a canonicalized local clip path before upload: it must live under
-/// the workspace `uploads/` directory (where received video attachments are
-/// saved) and carry a recognized video extension. Arbitrary daemon-readable
-/// files must never reach the anonymous upload host.
-fn check_local_clip(
+/// Input mode of a video_edit request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditMode {
+    /// Video clip edit, optionally guided by reference images.
+    VideoRef,
+    /// Image-to-video from first/last frame anchors (no video or reference
+    /// images — frame and reference roles are mutually exclusive).
+    FrameAnchor,
+}
+
+/// Validate the input-mode combination and the per-model image gate. Frame
+/// anchors (first/last frame) take precedence over references on the
+/// provider, which silently drops the losing inputs while still billing —
+/// so any mixed-mode request is rejected client-side. aleph-2 declares no
+/// image support; unknown models stay permissive.
+fn validate_mode(
+    spec: VideoEditModel,
+    video_url: Option<&str>,
+    images: &[String],
+    first_frame: Option<&str>,
+    last_frame: Option<&str>,
+) -> anyhow::Result<EditMode> {
+    let has_anchors = first_frame.is_some() || last_frame.is_some();
+    if spec == VideoEditModel::Aleph2 && (!images.is_empty() || has_anchors) {
+        anyhow::bail!(
+            "aleph-2 does not support image inputs (reference images or frame \
+             anchors). Retry without images or switch to hailuo-3."
+        );
+    }
+    if has_anchors {
+        if video_url.is_some() {
+            anyhow::bail!(
+                "Frame anchors are mutually exclusive with a video reference — a \
+                 request cannot mix frame and reference roles. Remove video_url and retry."
+            );
+        }
+        if !images.is_empty() {
+            anyhow::bail!(
+                "Frame anchors are mutually exclusive with reference images — a \
+                 request cannot mix frame and reference roles. Remove images and retry."
+            );
+        }
+        Ok(EditMode::FrameAnchor)
+    } else {
+        if video_url.is_none() {
+            anyhow::bail!(
+                "Missing required field: video_url. Provide a video to edit \
+                 (optionally with reference images), or use first_frame/last_frame \
+                 for image-to-video."
+            );
+        }
+        if images.len() > MAX_REFERENCE_IMAGES {
+            anyhow::bail!(
+                "At most {MAX_REFERENCE_IMAGES} reference images are supported, got {}. \
+                 Reduce the number of reference images and retry.",
+                images.len()
+            );
+        }
+        Ok(EditMode::VideoRef)
+    }
+}
+
+/// Validate that a canonicalized local path lives under the workspace
+/// `uploads/` directory (where received media attachments are saved).
+/// Arbitrary daemon-readable files must never reach the anonymous upload host.
+fn check_local_containment(
     canonical: &std::path::Path,
     uploads_root: &std::path::Path,
+    kind: &str,
 ) -> anyhow::Result<()> {
     let canonical_root = std::fs::canonicalize(uploads_root).with_context(|| {
         format!(
@@ -85,11 +153,22 @@ fn check_local_clip(
     })?;
     if !super::path::is_path_under_roots(canonical, &[canonical_root]) {
         anyhow::bail!(
-            "Local clip must be inside the workspace uploads directory \
-             (received video attachments are saved there), got: {}",
+            "Local {kind} must be inside the workspace uploads directory \
+             (received media attachments are saved there), got: {}",
             canonical.display()
         );
     }
+    Ok(())
+}
+
+/// Validate a canonicalized local clip path before upload: it must live under
+/// the workspace `uploads/` directory (where received video attachments are
+/// saved) and carry a recognized video extension.
+fn check_local_clip(
+    canonical: &std::path::Path,
+    uploads_root: &std::path::Path,
+) -> anyhow::Result<()> {
+    check_local_containment(canonical, uploads_root, "clip")?;
     if !crate::util::is_video_extension(canonical) {
         anyhow::bail!(
             "Local clip must have a recognized video extension (mp4, mov, mkv, avi, webm), got: {}",
@@ -97,6 +176,72 @@ fn check_local_clip(
         );
     }
     Ok(())
+}
+
+/// Validate a canonicalized local image path before upload: it must live under
+/// the workspace `uploads/` directory (where received images are saved) and
+/// carry a recognized image extension (jpg, jpeg, png, webp, heic, heif).
+fn check_local_image(
+    canonical: &std::path::Path,
+    uploads_root: &std::path::Path,
+) -> anyhow::Result<()> {
+    check_local_containment(canonical, uploads_root, "image")?;
+    if !crate::util::is_image_extension(canonical) {
+        anyhow::bail!(
+            "Local image must have a recognized image extension \
+             (jpg, jpeg, png, webp, heic, heif), got: {}",
+            canonical.display()
+        );
+    }
+    Ok(())
+}
+
+/// Resolve the video reference: public URL as-is, local file → upload bridge.
+async fn resolve_video_source(video_url: &str, ws: &crate::Workspace) -> anyhow::Result<String> {
+    if video_url.starts_with("https://") || video_url.starts_with("http://") {
+        return Ok(video_url.to_string());
+    }
+    // Only clips saved into the workspace uploads dir by enrichment may be
+    // uploaded — arbitrary local files are an exfiltration risk.
+    let path = std::path::Path::new(video_url);
+    let canonical = tokio::fs::canonicalize(path)
+        .await
+        .with_context(|| format!("Local clip not found: {video_url}"))?;
+    check_local_clip(&canonical, &ws.as_path().join("uploads"))?;
+    let len = tokio::fs::metadata(&canonical).await?.len();
+    if len > MAX_INPUT_BYTES {
+        anyhow::bail!("Source clip is limited to 50 MB, got {len} bytes. Trim the clip and retry.");
+    }
+    super::upload_bridge::upload_video_ephemeral(&canonical).await
+}
+
+/// Resolve an image input: public URL (GET-validated — a broken image
+/// reference bills anyway on the provider) or a local file in workspace
+/// uploads (uploaded to an ephemeral host). `label` names the input in
+/// error messages ("reference image", "first-frame anchor", ...).
+async fn resolve_image_input(
+    input: &str,
+    ws: &crate::Workspace,
+    label: &str,
+) -> anyhow::Result<String> {
+    if input.starts_with("https://") || input.starts_with("http://") {
+        super::upload_bridge::verify_media_url(input, "image/")
+            .await
+            .with_context(|| format!("Failed to validate {label} URL {input}"))?;
+        return Ok(input.to_string());
+    }
+    let path = std::path::Path::new(input);
+    let canonical = tokio::fs::canonicalize(path)
+        .await
+        .with_context(|| format!("Local {label} not found: {input}"))?;
+    check_local_image(&canonical, &ws.as_path().join("uploads"))?;
+    let len = tokio::fs::metadata(&canonical).await?.len();
+    if len > MAX_IMAGE_BYTES {
+        anyhow::bail!(
+            "{label} is limited to 30 MB, got {len} bytes. Use a smaller image and retry."
+        );
+    }
+    super::upload_bridge::upload_image_ephemeral(&canonical).await
 }
 
 /// Tool for editing an existing video clip via OpenRouter's async videos API.
@@ -126,7 +271,7 @@ impl Tool for VideoEditTool {
             &json!({
                 "video_url": {
                     "type": "string",
-                    "description": "Public HTTPS URL, or the path of a received video clip (shown as [Saved video: /path] in the chat) to edit"
+                    "description": "Public HTTPS URL, or the path of a received video clip (shown as [Saved video: /path] in the chat) to edit. Required unless first_frame/last_frame are used for image-to-video"
                 },
                 "instruction": {
                     "type": "string",
@@ -135,20 +280,58 @@ impl Tool for VideoEditTool {
                 "duration": {
                     "type": "integer",
                     "description": "Output duration in seconds (5–15s)"
+                },
+                "images": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "maxItems": 9,
+                    "description": "Paths or public HTTPS URLs of reference images guiding style/subject (max 9; billed at $0.04 each). Requires video_url; mutually exclusive with first_frame/last_frame"
+                },
+                "first_frame": {
+                    "type": "string",
+                    "description": "Path or public HTTPS URL of an image to use as the exact first frame (image-to-video). Mutually exclusive with video_url and images"
+                },
+                "last_frame": {
+                    "type": "string",
+                    "description": "Path or public HTTPS URL of an image to use as the exact last frame (image-to-video). Mutually exclusive with video_url and images"
                 }
             }),
-            &["video_url", "instruction"],
+            &["instruction"],
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
         ws: &crate::Workspace,
         args: serde_json::Value,
     ) -> anyhow::Result<String> {
-        let video_url = super::get_str(&args, "video_url")?;
+        // Empty strings are treated as absent optionals (a blank field carries
+        // no intent and must not trigger mode/exclusivity validation).
+        let video_url = super::get_opt_str(&args, "video_url").filter(|s| !s.is_empty());
         let instruction = super::get_str(&args, "instruction")?;
         let duration = super::get_opt_i64(&args, "duration");
+        // Reject a malformed `images` value (bare string or non-string
+        // elements) instead of silently omitting the reference — silent
+        // input drops are exactly what the exclusivity rules exist to
+        // prevent. Null is treated as absent, like the other optionals.
+        if let Some(v) = args.get("images")
+            && !v.is_null()
+            && !v
+                .as_array()
+                .is_some_and(|a| a.iter().all(serde_json::Value::is_string))
+        {
+            anyhow::bail!(
+                "images must be an array of image paths or URLs, got: {}",
+                crate::util::truncate(&v.to_string(), 200)
+            );
+        }
+        let images: Vec<String> = super::get_str_array(&args, "images")
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+        let first_frame = super::get_opt_str(&args, "first_frame").filter(|s| !s.is_empty());
+        let last_frame = super::get_opt_str(&args, "last_frame").filter(|s| !s.is_empty());
 
         let model = crate::config::CONFIG.video_edit_model();
         let spec = classify_model(&model);
@@ -167,41 +350,63 @@ impl Tool for VideoEditTool {
         // ── Per-model parameter validation (fail fast, before any upload) ──
         validate_params(spec, duration)?;
 
-        // ── Resolve the source: https URL as-is, local file → upload bridge ──
-        let source_url = if video_url.starts_with("https://") || video_url.starts_with("http://") {
-            video_url.to_string()
-        } else {
-            // Only clips saved into the workspace uploads dir by enrichment
-            // may be uploaded — arbitrary local files are an exfiltration risk.
-            let path = std::path::Path::new(video_url);
-            let canonical = tokio::fs::canonicalize(path)
-                .await
-                .with_context(|| format!("Local clip not found: {video_url}"))?;
-            check_local_clip(&canonical, &ws.as_path().join("uploads"))?;
-            let len = tokio::fs::metadata(&canonical).await?.len();
-            if len > MAX_INPUT_BYTES {
-                anyhow::bail!(
-                    "Source clip is limited to 50 MB, got {len} bytes. Trim the clip and retry."
-                );
-            }
-            super::upload_bridge::upload_video_ephemeral(&canonical).await?
-        };
+        // ── Mode validation: frame anchors vs references, model image gate ──
+        let mode = validate_mode(spec, video_url, &images, first_frame, last_frame)?;
 
-        // ── Build and submit the edit job ────────────────────────────────
-        let endpoint = crate::config::CONFIG.provider_endpoint();
-        let api_base = crate::providers::ensure_base_url(&endpoint);
-
+        // ── Resolve sources and build the request body ────────────────────
         let mut body = json!({
             "model": model,
             "prompt": instruction,
-            "input_references": [{
-                "type": "video_url",
-                "video_url": { "url": source_url }
-            }],
         });
+
+        match mode {
+            EditMode::FrameAnchor => {
+                let mut frame_images: Vec<serde_json::Value> = Vec::new();
+                if let Some(first) = first_frame {
+                    let url = resolve_image_input(first, ws, "first-frame anchor").await?;
+                    frame_images.push(json!({
+                        "type": "image_url",
+                        "image_url": { "url": url },
+                        "frame_type": "first_frame"
+                    }));
+                }
+                if let Some(last) = last_frame {
+                    let url = resolve_image_input(last, ws, "last-frame anchor").await?;
+                    frame_images.push(json!({
+                        "type": "image_url",
+                        "image_url": { "url": url },
+                        "frame_type": "last_frame"
+                    }));
+                }
+                body["frame_images"] = json!(frame_images);
+            }
+            EditMode::VideoRef => {
+                // validate_mode guarantees a video reference in this mode; the
+                // defensive error keeps this panic-free if that ever changes.
+                let video_url = video_url
+                    .ok_or_else(|| anyhow::anyhow!("video_url is required for a video edit"))?;
+                let source_url = resolve_video_source(video_url, ws).await?;
+                let mut references = vec![json!({
+                    "type": "video_url",
+                    "video_url": { "url": source_url }
+                })];
+                for img in &images {
+                    let url = resolve_image_input(img, ws, "reference image").await?;
+                    references.push(json!({
+                        "type": "image_url",
+                        "image_url": { "url": url }
+                    }));
+                }
+                body["input_references"] = json!(references);
+            }
+        }
+
         if let Some(d) = duration {
             body["duration"] = json!(d);
         }
+
+        let endpoint = crate::config::CONFIG.provider_endpoint();
+        let api_base = crate::providers::ensure_base_url(&endpoint);
 
         let video_bytes =
             super::fetch_async_video(&api_base, &body, super::VideoJobLabels::EDIT).await?;
@@ -234,7 +439,92 @@ mod tests {
     }
 
     #[test]
-    fn check_local_clip_requires_workspace_uploads_containment() {
+    fn validate_mode_enforces_exclusivity_and_model_gate() {
+        let none: Vec<String> = Vec::new();
+        // Video-only flow (unchanged) and video + reference images.
+        assert_eq!(
+            validate_mode(VideoEditModel::Hailuo3, Some("clip.mp4"), &none, None, None).unwrap(),
+            EditMode::VideoRef
+        );
+        assert_eq!(
+            validate_mode(
+                VideoEditModel::Hailuo3,
+                Some("clip.mp4"),
+                &["ref.png".to_string()],
+                None,
+                None
+            )
+            .unwrap(),
+            EditMode::VideoRef
+        );
+        // Pure frame-anchor image-to-video.
+        assert_eq!(
+            validate_mode(VideoEditModel::Hailuo3, None, &none, Some("f.png"), None).unwrap(),
+            EditMode::FrameAnchor
+        );
+        assert_eq!(
+            validate_mode(VideoEditModel::Hailuo3, None, &none, None, Some("l.png")).unwrap(),
+            EditMode::FrameAnchor
+        );
+        // Mixed modes are rejected (provider silently drops one while billing).
+        assert!(
+            validate_mode(
+                VideoEditModel::Hailuo3,
+                Some("clip.mp4"),
+                &none,
+                Some("f.png"),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            validate_mode(
+                VideoEditModel::Hailuo3,
+                None,
+                &["ref.png".to_string()],
+                Some("f.png"),
+                None
+            )
+            .is_err()
+        );
+        // Reference-image cap.
+        let ten: Vec<String> = (0..10).map(|i| format!("r{i}.png")).collect();
+        assert!(
+            validate_mode(VideoEditModel::Hailuo3, Some("clip.mp4"), &ten, None, None).is_err()
+        );
+        // aleph-2 rejects image inputs; unknown models stay permissive.
+        assert!(
+            validate_mode(
+                VideoEditModel::Aleph2,
+                Some("clip.mp4"),
+                &["ref.png".to_string()],
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert!(validate_mode(VideoEditModel::Aleph2, None, &none, Some("f.png"), None).is_err());
+        assert_eq!(
+            validate_mode(VideoEditModel::Aleph2, Some("clip.mp4"), &none, None, None).unwrap(),
+            EditMode::VideoRef
+        );
+        assert_eq!(
+            validate_mode(
+                VideoEditModel::Unknown,
+                Some("clip.mp4"),
+                &["ref.png".to_string()],
+                None,
+                None
+            )
+            .unwrap(),
+            EditMode::VideoRef
+        );
+        // No mode selected at all.
+        assert!(validate_mode(VideoEditModel::Hailuo3, None, &none, None, None).is_err());
+    }
+
+    #[test]
+    fn check_local_media_requires_workspace_uploads_containment() {
         let tmp = tempfile::tempdir().unwrap();
         let uploads = tmp.path().join("uploads");
         std::fs::create_dir_all(&uploads).unwrap();
@@ -253,5 +543,12 @@ mod tests {
         std::fs::write(&txt, b"text").unwrap();
         let canonical_txt = std::fs::canonicalize(&txt).unwrap();
         assert!(check_local_clip(&canonical_txt, &uploads).is_err());
+        // Images: accepted extensions pass, non-image extensions are rejected.
+        let img = uploads.join("photo.heic");
+        std::fs::write(&img, b"image").unwrap();
+        let canonical_img = std::fs::canonicalize(&img).unwrap();
+        assert!(check_local_image(&canonical_img, &uploads).is_ok());
+        assert!(check_local_image(&canonical_outside, &uploads).is_err());
+        assert!(check_local_image(&canonical_txt, &uploads).is_err());
     }
 }

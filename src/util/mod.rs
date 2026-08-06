@@ -378,6 +378,13 @@ pub(crate) async fn load_reference_image(
 /// Telegram routing and the video_edit local-clip guard).
 pub(crate) const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "avi", "webm"];
 
+/// Recognized image file extensions for video_edit image inputs (reference
+/// images and frame anchors), matching the provider-declared formats. This is
+/// narrower than the Telegram routing list (`telegram::IMAGE_EXTENSIONS`,
+/// which also accepts gif/bmp) — those are routable attachments but not
+/// provider-accepted edit inputs.
+pub(crate) const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "heic", "heif"];
+
 /// Daemon-owned subdir under the system temp dir where inbound Telegram
 /// attachments are downloaded before enrichment. Enrichment only copies
 /// video clips from here into workspace uploads — the containment root for
@@ -392,8 +399,16 @@ pub(crate) fn is_video_extension(path: &std::path::Path) -> bool {
         .is_some_and(|ext| VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
 }
 
+/// Check whether a file path has a recognized image extension.
+#[must_use]
+pub(crate) fn is_image_extension(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
 /// Map a file path's extension to a MIME type string.
-fn mime_for_extension(path: &std::path::Path) -> &'static str {
+pub(crate) fn mime_for_extension(path: &std::path::Path) -> &'static str {
     match path
         .extension()
         .and_then(|e| e.to_str())
@@ -405,6 +420,8 @@ fn mime_for_extension(path: &std::path::Path) -> &'static str {
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
         Some("bmp") => "image/bmp",
+        Some("heic") => "image/heic",
+        Some("heif") => "image/heif",
         _ => "application/octet-stream",
     }
 }

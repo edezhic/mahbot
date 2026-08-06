@@ -335,7 +335,10 @@ impl TelegramAttachmentKind {
     }
 }
 
-/// Recognized image file extensions.
+/// Recognized image file extensions for Telegram receive-path routing.
+/// Deliberately wider than `crate::util::IMAGE_EXTENSIONS` (video_edit's
+/// provider-accepted list): gif/bmp arrive as Telegram images but are not
+/// accepted edit inputs.
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 
 /// Check whether a file path has a recognized image extension.

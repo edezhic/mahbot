@@ -1,9 +1,11 @@
-//! Ephemeral anonymous video upload bridge (video_edit local-clip support).
+//! Ephemeral anonymous media upload bridge (video_edit local-clip and
+//! image-input support).
 //!
-//! Uploads a local clip to the first available host in a fallback chain and
-//! returns a GET-verified public HTTPS URL suitable for OpenRouter
+//! Uploads a local media file to the first available host in a fallback chain
+//! and returns a GET-verified public HTTPS URL suitable for OpenRouter
 //! `input_references`. All uploads are ephemeral by design; the caller owns
-//! cleanup of the local temp file.
+//! cleanup of the local temp file. Video uploads must be served back as
+//! `video/*`; image uploads as `image/*` — verification stays per-kind.
 //!
 //! Chain: tmpfile.link (7-day) → uguu.se (3-h) → 0807.st (PoW + one 302) →
 //! catbox.moe (hash-deduped, GET-validate) → x0.at (HEAD-404 trap — GET only).
@@ -22,42 +24,81 @@ const POW_MAX_ATTEMPTS: u64 = 1 << 26;
 /// 0807.st's live challenge is 13 bits.
 const POW_MAX_BITS: u32 = 24;
 
-/// An ephemeral-host uploader: takes the clip bytes + file name and returns
-/// a verified public HTTPS URL.
-type Uploader<'a> =
-    fn(&'a [u8], &'a str) -> futures_util::future::BoxFuture<'a, anyhow::Result<String>>;
+/// Parameters for one ephemeral upload: the bytes, the file name presented to
+/// the host, the MIME declared in the multipart form, and the content-type
+/// prefix the verified URL must be served with ("video/" or "image/").
+struct UploadRequest<'a> {
+    bytes: &'a [u8],
+    file_name: &'a str,
+    mime: &'a str,
+    expected_prefix: &'a str,
+}
 
-/// Upload `bytes` to the first working ephemeral host and return the verified
-/// public HTTPS URL. Each host's URL is GET-validated (status, `video/*`
-/// Content-Type, non-empty body) before being accepted.
+/// An ephemeral-host uploader: takes the upload parameters and returns a
+/// verified public HTTPS URL.
+type Uploader<'a> =
+    fn(&'a UploadRequest<'a>) -> futures_util::future::BoxFuture<'a, anyhow::Result<String>>;
+
+/// Upload a video clip to the first working ephemeral host.
 pub(crate) async fn upload_video_ephemeral(path: &std::path::Path) -> anyhow::Result<String> {
+    upload_ephemeral(path, "video/mp4", "video/").await
+}
+
+/// Upload an image to the first working ephemeral host.
+pub(crate) async fn upload_image_ephemeral(path: &std::path::Path) -> anyhow::Result<String> {
+    let mime = crate::util::mime_for_extension(path);
+    upload_ephemeral(path, mime, "image/").await
+}
+
+/// Upload `path` to the first working ephemeral host and return the verified
+/// public HTTPS URL. Each host's URL is GET-validated (status, expected
+/// content-type prefix, non-empty body) before being accepted.
+async fn upload_ephemeral(
+    path: &std::path::Path,
+    mime: &str,
+    expected_prefix: &str,
+) -> anyhow::Result<String> {
+    // Unreachable in practice (canonicalized files always have a file name),
+    // but keep the fallback extension-bearing so hosts see a sane name.
+    let fallback_name = if mime.starts_with("image/") {
+        format!("image.{}", mime.trim_start_matches("image/"))
+    } else {
+        "clip.mp4".to_string()
+    };
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
         .filter(|n| !n.is_empty())
-        .unwrap_or("clip.mp4")
+        .unwrap_or(&fallback_name)
         .to_string();
     let bytes = tokio::fs::read(path)
         .await
-        .with_context(|| format!("Failed to read video clip {}", path.display()))?;
+        .with_context(|| format!("Failed to read media file {}", path.display()))?;
+
+    let req = UploadRequest {
+        bytes: &bytes,
+        file_name: &file_name,
+        mime,
+        expected_prefix,
+    };
 
     let uploaders: [Uploader; 5] = [
-        |b, n| Box::pin(upload_tmpfile_link(b, n)),
-        |b, n| Box::pin(upload_uguu(b, n)),
-        |b, n| Box::pin(upload_0807_st(b, n)),
-        |b, n| Box::pin(upload_catbox(b, n)),
-        |b, n| Box::pin(upload_x0_at(b, n)),
+        |r| Box::pin(upload_tmpfile_link(r)),
+        |r| Box::pin(upload_uguu(r)),
+        |r| Box::pin(upload_0807_st(r)),
+        |r| Box::pin(upload_catbox(r)),
+        |r| Box::pin(upload_x0_at(r)),
     ];
 
     let mut last_error: Option<anyhow::Error> = None;
     for upload in uploaders {
-        match upload(&bytes, &file_name).await {
+        match upload(&req).await {
             Ok(url) => {
-                tracing::info!(%url, "Video clip uploaded to ephemeral host");
+                tracing::info!(%url, "Media uploaded to ephemeral host");
                 return Ok(url);
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Ephemeral video upload failed; trying next host");
+                tracing::warn!(error = %e, "Ephemeral media upload failed; trying next host");
                 last_error = Some(e);
             }
         }
@@ -66,12 +107,13 @@ pub(crate) async fn upload_video_ephemeral(path: &std::path::Path) -> anyhow::Re
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No ephemeral upload host available")))
 }
 
-/// GET-validate an uploaded video URL: 2xx status, `video/*` Content-Type,
-/// non-empty body. Every hop must pass this before its URL reaches OpenRouter.
-/// The body is streamed and discarded — only the first chunk is inspected.
-/// This is a served-type/bytes check only, not MP4 magic-byte validation —
-/// a mislabeled container still reaches OpenRouter, which rejects it at job time.
-async fn verify_uploaded_url(url: &str) -> anyhow::Result<()> {
+/// GET-validate a media URL: 2xx status, expected content-type prefix,
+/// non-empty body. Used to verify ephemeral-host uploads and user-supplied
+/// public image URLs before they reach a billed request. The body is streamed
+/// and discarded — only the first chunk is inspected. This is a served-type
+/// check only, not magic-byte validation — a mislabeled container still
+/// reaches OpenRouter, which rejects it at job time.
+pub(crate) async fn verify_media_url(url: &str, expected_prefix: &str) -> anyhow::Result<()> {
     let resp = crate::util::http::media_http_client()
         .get(url)
         .send()
@@ -87,8 +129,8 @@ async fn verify_uploaded_url(url: &str) -> anyhow::Result<()> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    if !content_type.starts_with("video/") {
-        anyhow::bail!("Host served {url} as {content_type}, expected video/*");
+    if !content_type.starts_with(expected_prefix) {
+        anyhow::bail!("Expected {expected_prefix}* content type from {url}, got {content_type}");
     }
     match resp.bytes_stream().next().await {
         Some(Ok(first)) if !first.is_empty() => Ok(()),
@@ -97,11 +139,12 @@ async fn verify_uploaded_url(url: &str) -> anyhow::Result<()> {
     }
 }
 
-/// Multipart helper: one file part with the given field name and video MIME.
-fn file_part(field: &str, bytes: &[u8], file_name: &str) -> anyhow::Result<Form> {
-    let part = Part::bytes(bytes.to_vec())
-        .file_name(file_name.to_string())
-        .mime_str("video/mp4")?;
+/// Multipart helper: one file part with the given field name and the
+/// request's declared MIME.
+fn file_part(field: &str, req: &UploadRequest<'_>) -> anyhow::Result<Form> {
+    let part = Part::bytes(req.bytes.to_vec())
+        .file_name(req.file_name.to_string())
+        .mime_str(req.mime)?;
     Ok(Form::new().part(field.to_string(), part))
 }
 
@@ -139,10 +182,10 @@ async fn expect_url(resp: reqwest::Response, host: &str) -> anyhow::Result<Strin
 }
 
 /// tmpfile.link — global Cloudflare/R2 CDN, 7-day lifetime, zero redirects.
-/// The MIME declaration is required; without `video/mp4` the served type
+/// The MIME declaration is required; without a correct `mime` the served type
 /// degrades to `application/octet-stream`.
-async fn upload_tmpfile_link(bytes: &[u8], file_name: &str) -> anyhow::Result<String> {
-    let form = file_part("file", bytes, file_name)?;
+async fn upload_tmpfile_link(req: &UploadRequest<'_>) -> anyhow::Result<String> {
+    let form = file_part("file", req)?;
     let resp = crate::util::http::media_http_client()
         .post("https://tmpfile.link/api/upload")
         .multipart(form)
@@ -155,14 +198,14 @@ async fn upload_tmpfile_link(bytes: &[u8], file_name: &str) -> anyhow::Result<St
         .or_else(|| json.get("downloadLinkEncoded"))
         .and_then(serde_json::Value::as_str)
         .context("tmpfile.link response missing downloadLink")?;
-    verify_uploaded_url(url).await?;
+    verify_media_url(url, req.expected_prefix).await?;
     Ok(url.to_string())
 }
 
 /// uguu.se — EU direct, 3-hour lifetime, zero redirects. Field is exactly
 /// `files[]`; the server sniffs the MIME itself.
-async fn upload_uguu(bytes: &[u8], file_name: &str) -> anyhow::Result<String> {
-    let form = file_part("files[]", bytes, file_name)?;
+async fn upload_uguu(req: &UploadRequest<'_>) -> anyhow::Result<String> {
+    let form = file_part("files[]", req)?;
     let resp = crate::util::http::media_http_client()
         .post("https://uguu.se/upload")
         .multipart(form)
@@ -180,14 +223,14 @@ async fn upload_uguu(bytes: &[u8], file_name: &str) -> anyhow::Result<String> {
         .and_then(|f| f.get("url"))
         .and_then(serde_json::Value::as_str)
         .context("uguu.se response missing files[0].url")?;
-    verify_uploaded_url(url).await?;
+    verify_media_url(url, req.expected_prefix).await?;
     Ok(url.to_string())
 }
 
 /// 0807.st — global CDN, requires a hashcash proof-of-work and follows exactly
 /// one 302 to a signed download URL. The signed URL must be verified at upload
 /// time; OpenRouter follows the same redirect at job time.
-async fn upload_0807_st(bytes: &[u8], file_name: &str) -> anyhow::Result<String> {
+async fn upload_0807_st(req: &UploadRequest<'_>) -> anyhow::Result<String> {
     let client = crate::util::http::media_http_client();
 
     // 1. Fetch the PoW challenge.
@@ -233,9 +276,9 @@ async fn upload_0807_st(bytes: &[u8], file_name: &str) -> anyhow::Result<String>
         .with_context(|| format!("0807.st PoW unsolved at declared {declared_bits} bits"))?;
 
     // 3. Upload with the solved proof. expiry=24 keeps the clip ephemeral.
-    let part = Part::bytes(bytes.to_vec())
-        .file_name(file_name.to_string())
-        .mime_str("video/mp4")?;
+    let part = Part::bytes(req.bytes.to_vec())
+        .file_name(req.file_name.to_string())
+        .mime_str(req.mime)?;
     let form = Form::new()
         .part("file", part)
         .text("expiry", "24")
@@ -255,14 +298,14 @@ async fn upload_0807_st(bytes: &[u8], file_name: &str) -> anyhow::Result<String>
         .get("url")
         .and_then(serde_json::Value::as_str)
         .context("0807.st response missing url")?;
-    verify_uploaded_url(url).await?;
+    verify_media_url(url, req.expected_prefix).await?;
     Ok(url.to_string())
 }
 
 /// catbox.moe — US origin, hash-deduped: always GET-validate the returned URL
 /// (a dedup hit may point at an existing upload).
-async fn upload_catbox(bytes: &[u8], file_name: &str) -> anyhow::Result<String> {
-    let part = Part::bytes(bytes.to_vec()).file_name(file_name.to_string());
+async fn upload_catbox(req: &UploadRequest<'_>) -> anyhow::Result<String> {
+    let part = Part::bytes(req.bytes.to_vec()).file_name(req.file_name.to_string());
     let form = Form::new()
         .text("reqtype", "fileupload")
         .part("fileToUpload", part);
@@ -273,14 +316,14 @@ async fn upload_catbox(bytes: &[u8], file_name: &str) -> anyhow::Result<String> 
         .await
         .context("catbox.moe upload request failed")?;
     let url = expect_url(resp, "catbox.moe").await?;
-    verify_uploaded_url(&url).await?;
+    verify_media_url(&url, req.expected_prefix).await?;
     Ok(url)
 }
 
 /// x0.at — EU last resort. HEAD requests 404 even though GET works, so the
 /// post-upload verification must use GET (which it does).
-async fn upload_x0_at(bytes: &[u8], file_name: &str) -> anyhow::Result<String> {
-    let form = file_part("file", bytes, file_name)?;
+async fn upload_x0_at(req: &UploadRequest<'_>) -> anyhow::Result<String> {
+    let form = file_part("file", req)?;
     let resp = crate::util::http::media_http_client()
         .post("https://x0.at/")
         .multipart(form)
@@ -288,7 +331,7 @@ async fn upload_x0_at(bytes: &[u8], file_name: &str) -> anyhow::Result<String> {
         .await
         .context("x0.at upload request failed")?;
     let url = expect_url(resp, "x0.at").await?;
-    verify_uploaded_url(&url).await?;
+    verify_media_url(&url, req.expected_prefix).await?;
     Ok(url)
 }
 
