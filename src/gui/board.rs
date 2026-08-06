@@ -923,7 +923,8 @@ impl BoardState {
         }
 
         // Sort: pending and pipeline by priority (ASC), then oldest-first (ASC);
-        // completed newest-first (DESC).
+        // completed: Done tickets newest-done_first (DESC), then Cancelled
+        // newest-first (DESC) below them.
         // Priority is an integer — 0 = highest, so ASC puts urgent tickets first.
         // Ticket created_at is an ISO 8601 string, so lexical sort = chronological sort
         pending.sort_by(|a, b| {
@@ -936,9 +937,25 @@ impl BoardState {
                 .cmp(&b.priority)
                 .then(a.created_at.cmp(&b.created_at))
         });
-        completed.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        completed.sort_by(|a, b| {
+            let (a_done, b_done) = (a.phase == TicketPhase::Done, b.phase == TicketPhase::Done);
+            match (a_done, b_done) {
+                // Done first, newest completion on top (created_at fallback
+                // for Done tickets with no done_at, e.g. test-created ones).
+                (true, true) => Self::done_sort_key(b).cmp(Self::done_sort_key(a)),
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (false, false) => b.created_at.cmp(&a.created_at),
+            }
+        });
 
         (pending, pipeline, completed)
+    }
+
+    /// Completion ordering key for a completed-column ticket: its exact done
+    /// timestamp, falling back to creation time when `done_at` is absent.
+    fn done_sort_key(ticket: &Ticket) -> &str {
+        ticket.done_at.as_deref().unwrap_or(&ticket.created_at)
     }
 
     /// Render a single ticket card: clickable title, ID, phase badge, and action icons.
@@ -1582,6 +1599,7 @@ mod tests {
             priority: 0,
             reviewed_head: None,
             reviewed_tree: None,
+            done_at: None,
         });
         state
     }
@@ -1765,6 +1783,7 @@ mod tests {
             priority: 0,
             reviewed_head: None,
             reviewed_tree: None,
+            done_at: None,
         };
         let _task = state.update(BoardMessage::TicketDetails(Box::new(ticket)));
 
@@ -1814,6 +1833,7 @@ mod tests {
             priority: 0,
             reviewed_head: None,
             reviewed_tree: None,
+            done_at: None,
         });
 
         // First Escape: focused → blur (clear flag), modal stays open
@@ -1952,6 +1972,7 @@ mod tests {
             priority: 0,
             reviewed_head: None,
             reviewed_tree: None,
+            done_at: None,
         }];
         state.search_generation = 5;
 
@@ -2007,6 +2028,7 @@ mod tests {
                 priority: 0,
                 reviewed_head: None,
                 reviewed_tree: None,
+                done_at: None,
             }],
             50,
         ));
@@ -2046,6 +2068,7 @@ mod tests {
                 priority: 0,
                 reviewed_head: None,
                 reviewed_tree: None,
+                done_at: None,
             }],
             42,
         ));
@@ -2080,6 +2103,7 @@ mod tests {
             priority: 0,
             reviewed_head: None,
             reviewed_tree: None,
+            done_at: None,
         }];
         state.search_generation = 7;
 
@@ -2088,5 +2112,52 @@ mod tests {
         assert!(state.search_query.is_empty());
         assert!(state.search_results.is_empty());
         assert_eq!(state.search_generation, 8);
+    }
+
+    // ── Completed-column ordering ──────────────────────────────────
+
+    /// Build a ticket for sort tests from the shared base literal.
+    fn test_ticket(
+        id: &str,
+        phase: TicketPhase,
+        created_at: &str,
+        done_at: Option<&str>,
+    ) -> Ticket {
+        let base = make_board_state().selected_ticket.unwrap();
+        Ticket {
+            id: id.into(),
+            phase,
+            created_at: created_at.into(),
+            done_at: done_at.map(str::to_string),
+            ..base
+        }
+    }
+
+    #[test]
+    fn test_partition_completed_sorts_done_then_cancelled() {
+        let tickets = vec![
+            test_ticket("c3", TicketPhase::Cancelled, "2026-01-01T00:00:00Z", None),
+            test_ticket(
+                "d2",
+                TicketPhase::Done,
+                "2026-01-01T00:00:00Z",
+                Some("2026-06-02T00:00:00Z"),
+            ),
+            test_ticket(
+                "d1",
+                TicketPhase::Done,
+                "2026-01-01T00:00:00Z",
+                Some("2026-06-03T00:00:00Z"),
+            ),
+            test_ticket("d3", TicketPhase::Done, "2026-01-02T00:00:00Z", None),
+            test_ticket("c1", TicketPhase::Cancelled, "2026-01-03T00:00:00Z", None),
+            test_ticket("c2", TicketPhase::Cancelled, "2026-01-02T00:00:00Z", None),
+        ];
+        let (_, _, completed) = BoardState::partition_tickets(&tickets);
+        let ids: Vec<&str> = completed.iter().map(|t| t.id.as_str()).collect();
+        // Done first (newest done_at, created_at fallback), then cancelled
+        // (newest created_at). A cancelled ticket's stale done_at must not
+        // promote it into the done block.
+        assert_eq!(ids, ["d1", "d2", "d3", "c1", "c2", "c3"]);
     }
 }

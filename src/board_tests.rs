@@ -2066,6 +2066,7 @@ async fn test_ticket_roundtrip_all_fields() {
             priority: 1,
             reviewed_head: None,
             reviewed_tree: None,
+            done_at: None,
         },
     );
 
@@ -2127,6 +2128,7 @@ async fn test_ticket_roundtrip_all_fields() {
             priority: 1,
             reviewed_head: Some("reviewed-head-hash".into()),
             reviewed_tree: Some("reviewed-tree-hash".into()),
+            done_at: None,
         },
     );
 
@@ -2174,7 +2176,180 @@ async fn test_ticket_roundtrip_all_fields() {
             priority: 1,
             reviewed_head: Some("reviewed-head-hash".into()),
             reviewed_tree: Some("reviewed-tree-hash".into()),
+            done_at: None,
         },
+    );
+}
+
+// ── done_at completion timestamp ────────────────────────────────────
+
+/// done_at is stamped on transition to Done, survives later comments, is
+/// cleared when the ticket leaves Done, and is re-stamped on re-completion.
+#[tokio::test]
+async fn test_done_at_transition_semantics() {
+    let (store, _tmp) = open_test_store().await;
+    let ws = crate::workspace::test_ws_named("/test_ws", "test_workspace");
+    let id = TicketBuilder::new(&store, &ws)
+        .title("Done timestamp")
+        .create()
+        .await
+        .expect("create_ticket");
+
+    store
+        .transition_to(&id, None, TicketPhase::Done, None)
+        .await
+        .expect("transition to done");
+    let done = store.get_ticket(&id).await.expect("get").expect("ticket");
+    let first_done_at = done.done_at.expect("done_at set on completion");
+    assert!(
+        done.created_at < first_done_at,
+        "done_at should be later than creation"
+    );
+
+    // Later activity (comments) must not move the completion timestamp.
+    store
+        .add_comment(&id, "manager", "nice work")
+        .await
+        .expect("add_comment");
+    let commented = store.get_ticket(&id).await.expect("get").expect("ticket");
+    assert_eq!(commented.done_at.as_deref(), Some(first_done_at.as_str()));
+    assert!(
+        commented.updated_at > first_done_at,
+        "comment should bump updated_at but not done_at"
+    );
+
+    // Leaving Done clears the stamp; re-completion re-stamps it.
+    store
+        .transition_to(&id, Some(TicketPhase::Done), TicketPhase::Backlog, None)
+        .await
+        .expect("reopen");
+    let reopened = store.get_ticket(&id).await.expect("get").expect("ticket");
+    assert_eq!(reopened.done_at, None, "done_at cleared when leaving Done");
+
+    store
+        .transition_to(&id, Some(TicketPhase::Backlog), TicketPhase::Done, None)
+        .await
+        .expect("re-complete");
+    let redone = store.get_ticket(&id).await.expect("get").expect("ticket");
+    assert!(
+        redone.done_at.as_deref().unwrap() > first_done_at.as_str(),
+        "re-completion re-stamps done_at with the new moment"
+    );
+}
+
+/// Board schema before the done_at migration (tickets table without the
+/// column) — simulates a live database created by an older mahbot version.
+const LEGACY_TICKETS_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS tickets (
+    id              TEXT PRIMARY KEY,
+    title           TEXT NOT NULL,
+    description     TEXT NOT NULL,
+    phase          TEXT NOT NULL DEFAULT 'backlog',
+    assigned_to     TEXT,
+    workspace_name  TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    prerequisites   TEXT NOT NULL DEFAULT '[]',
+    supersedes      TEXT,
+    superseded_by   TEXT,
+    commit_hash     TEXT,
+    lines_added     INTEGER,
+    lines_removed   INTEGER,
+    reporter        TEXT NOT NULL DEFAULT '',
+    is_archived     INTEGER NOT NULL DEFAULT 0,
+    embedding       BLOB,
+    pipeline_reservation INTEGER NOT NULL DEFAULT 0,
+    priority        INTEGER NOT NULL DEFAULT 1,
+    reviewed_head   TEXT,
+    reviewed_tree   TEXT
+);
+CREATE TABLE IF NOT EXISTS ticket_comments (
+    id          TEXT PRIMARY KEY,
+    ticket_id   TEXT NOT NULL,
+    role        TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (ticket_id) REFERENCES tickets(id)
+);
+CREATE INDEX IF NOT EXISTS idx_ticket_comments_ticket_id ON ticket_comments(ticket_id);
+CREATE TABLE IF NOT EXISTS ticket_counters (
+    workspace_name TEXT PRIMARY KEY,
+    next_id        INTEGER NOT NULL DEFAULT 1
+);";
+
+/// Opening a pre-done_at board database adds the column and backfills done
+/// tickets from their last-modification timestamp; re-opening is a no-op
+/// (idempotent migration).
+#[tokio::test]
+async fn test_done_at_migration_backfills_existing_done_tickets() {
+    let tmp = TempDir::new().expect("temp dir");
+    {
+        let legacy = crate::turso::open_store(tmp.path(), "board", LEGACY_TICKETS_SCHEMA)
+            .await
+            .expect("open legacy board");
+        for (id, phase, updated) in [
+            ("t-done", "done", "2026-06-01T00:00:00+00:00"),
+            ("t-cancelled", "cancelled", "2026-06-02T00:00:00+00:00"),
+            ("t-backlog", "backlog", "2026-06-03T00:00:00+00:00"),
+        ] {
+            legacy
+                .execute(
+                    "INSERT INTO tickets (id, title, description, phase, workspace_name, \
+                     created_at, updated_at) VALUES (?1, 't', 'd', ?2, 'ws', \
+                     '2026-01-01T00:00:00+00:00', ?3)",
+                    crate::turso::params![id, phase, updated],
+                )
+                .await
+                .expect("insert legacy ticket");
+        }
+    }
+
+    let store = BoardStore::open(tmp.path()).await.expect("migrated open");
+    let done = store
+        .get_ticket("t-done")
+        .await
+        .expect("get")
+        .expect("ticket");
+    assert_eq!(
+        done.done_at.as_deref(),
+        Some("2026-06-01T00:00:00+00:00"),
+        "done ticket backfilled from updated_at"
+    );
+    assert_eq!(
+        store
+            .get_ticket("t-cancelled")
+            .await
+            .expect("get")
+            .expect("ticket")
+            .done_at,
+        None,
+        "cancelled tickets get no done_at"
+    );
+    assert_eq!(
+        store
+            .get_ticket("t-backlog")
+            .await
+            .expect("get")
+            .expect("ticket")
+            .done_at,
+        None,
+        "non-done tickets get no done_at"
+    );
+
+    // Re-open: migration is idempotent and leaves backfilled values intact.
+    drop(store);
+    let reopened = BoardStore::open(tmp.path())
+        .await
+        .expect("idempotent reopen");
+    let done_again = reopened
+        .get_ticket("t-done")
+        .await
+        .expect("get")
+        .expect("ticket");
+    assert_eq!(
+        done_again.done_at.as_deref(),
+        Some("2026-06-01T00:00:00+00:00"),
+        "re-open must not disturb backfilled done_at"
     );
 }
 

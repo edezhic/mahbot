@@ -68,7 +68,8 @@ CREATE TABLE IF NOT EXISTS tickets (
     pipeline_reservation INTEGER NOT NULL DEFAULT 0,
     priority        INTEGER NOT NULL DEFAULT 1,
     reviewed_head   TEXT,
-    reviewed_tree   TEXT
+    reviewed_tree   TEXT,
+    done_at         TEXT
 );
 CREATE TABLE IF NOT EXISTS ticket_comments (
     id          TEXT PRIMARY KEY,
@@ -112,6 +113,7 @@ crate::columns! {
         PRIORITY               => "priority",
         REVIEWED_HEAD          => "reviewed_head",
         REVIEWED_TREE          => "reviewed_tree",
+        DONE_AT                => "done_at",
     }
 }
 
@@ -279,6 +281,10 @@ pub struct Ticket {
     /// [`reviewed_head`](Self::reviewed_head) and a clean porcelain this
     /// identifies the exact content reviewers saw.
     pub reviewed_tree: Option<String>,
+    /// Exact completion timestamp: set on transition to Done, cleared when the
+    /// ticket leaves Done. Backfilled from `updated_at` for pre-migration
+    /// tickets. `None` for never-done or not-currently-done tickets.
+    pub done_at: Option<String>,
 }
 
 impl Ticket {
@@ -613,7 +619,7 @@ pub(crate) enum LoadComments {
 }
 
 impl BoardStore {
-    /// Post-open setup: reject legacy schemas, then create the FTS index.
+    /// Post-open setup: reject legacy schemas, evolve schema, then create the FTS index.
     async fn after_open(&self) -> anyhow::Result<()> {
         // Legacy-format DBs (pre-migration) fail fast with an actionable error
         // instead of failing later on no-such-column queries.
@@ -623,6 +629,26 @@ impl BoardStore {
                  were removed — restore a backup created by a current mahbot version"
             );
         }
+
+        // ── done_at schema evolution ──────────────────────────────────────
+        // First post-migration-removal schema change. The ALTER is guarded by
+        // column existence and the backfill by `done_at IS NULL`, so repeated
+        // boots and partial failures self-heal; the single-instance flock
+        // makes the check-then-ALTER race-free in production.
+        if !turso::column_exists(&self.conn, "tickets", "done_at").await? {
+            self.conn
+                .execute("ALTER TABLE tickets ADD COLUMN done_at TEXT", ())
+                .await
+                .context("Failed to add done_at column to tickets")?;
+        }
+        self.conn
+            .execute(
+                "UPDATE tickets SET done_at = updated_at \
+                 WHERE phase = 'done' AND done_at IS NULL",
+                (),
+            )
+            .await
+            .context("Failed to backfill done_at from updated_at")?;
 
         // ── FTS index setup ────────────────────────────────────────────────
         crate::turso::ensure_fts_index(
@@ -839,7 +865,7 @@ impl BoardStore {
         let cancelled_rows = tx
             .execute(
                 "UPDATE tickets SET phase = ?1, updated_at = ?2, assigned_to = NULL, \
-                 superseded_by = ?4, is_archived = 1 WHERE id = ?3",
+                 superseded_by = ?4, is_archived = 1, done_at = NULL WHERE id = ?3",
                 turso::params![
                     TicketPhase::Cancelled.as_ref(),
                     now,
@@ -914,6 +940,7 @@ impl BoardStore {
             priority: row.get::<i64>(COL_TICKET_PRIORITY)?,
             reviewed_head: row.get(COL_TICKET_REVIEWED_HEAD)?,
             reviewed_tree: row.get(COL_TICKET_REVIEWED_TREE)?,
+            done_at: row.get(COL_TICKET_DONE_AT)?,
         })
     }
 
@@ -1151,9 +1178,15 @@ impl BoardStore {
     ///
     /// Note: this does **not** use [`Self::build_ticket_update_with_updated_at`]
     /// because it has extra SET columns (`assigned_to = NULL`,
-    /// `pipeline_reservation = COALESCE(?5, pipeline_reservation)`) and an
+    /// `pipeline_reservation = COALESCE(?5, pipeline_reservation)`,
+    /// `done_at = CASE ...`) and an
     /// additional WHERE condition (`AND (?4 IS NULL OR phase = ?4)`) that
     /// don't fit the helper's fixed pattern.
+    ///
+    /// `done_at` is set to `?2` (now) when the target is `done` — overwriting
+    /// on re-completion — and cleared when the ticket leaves `done`, so the
+    /// column holds a timestamp iff the ticket is currently in the Done phase.
+    /// Later non-transition activity (comments, archive) never touches it.
     fn build_transition_sql(
         ticket_id: &str,
         expected_phase: Option<TicketPhase>,
@@ -1163,7 +1196,10 @@ impl BoardStore {
         let now = turso::now();
         let guard: Option<&str> = expected_phase.as_ref().map(TicketPhase::as_ref);
         let sql = "UPDATE tickets SET phase = ?1, assigned_to = NULL, updated_at = ?2, \
-                    pipeline_reservation = COALESCE(?5, pipeline_reservation) \
+                    pipeline_reservation = COALESCE(?5, pipeline_reservation), \
+                    done_at = CASE WHEN ?1 = 'done' THEN ?2 \
+                                   WHEN phase = 'done' THEN NULL \
+                                   ELSE done_at END \
                     WHERE id = ?3 AND (?4 IS NULL OR phase = ?4)";
         let params: Vec<turso::Value> = vec![
             Value::from(target_phase.as_ref()),
