@@ -3589,6 +3589,7 @@ fn mktemp_binding(value: &str, state: &ValidationState) -> Option<VarBinding> {
 ///
 /// NOTE: `-f`/`--force` bypasses safety checks (force-create / force-delete).
 ///       `-u`/`--set-upstream-to` sets upstream tracking (requires force with `-f`).
+///       `-t` sets upstream tracking; `--unset-upstream` removes it (config write).
 ///       `--set-upstream-to=value` notation is also caught via prefix matching.
 ///       `--track`/`--no-track` create tracking branches or override config.
 const GIT_BRANCH_MUTATIONS: &[&str] = &[
@@ -3601,7 +3602,9 @@ const GIT_BRANCH_MUTATIONS: &[&str] = &[
     "-f",
     "--force",
     "-u",
+    "-t",
     "--set-upstream-to",
+    "--unset-upstream",
     "--track",
     "--no-track",
     "--delete",
@@ -4198,7 +4201,7 @@ fn check_git_subcommand_mutation(
         .copied()
         .partition(|t| t.starts_with('-'));
 
-    // Short mutation chars derived from the constant (branch: d/D/m/M/c/C/f/u,
+    // Short mutation chars derived from the constant (branch: d/D/m/M/c/C/f/u/t,
     // tag: d/a/s/u/f/m/F/e). Every value-taking short flag for these two
     // subcommands (-u for branch; -m/-F/-u for tag) is itself a mutation char,
     // so no attached value can hide a mutation char inside a cluster
@@ -4918,9 +4921,11 @@ mod tests {
             ("git tag --force v1.0", false),
             ("git branch -u origin/main", false),
             ("git branch --set-upstream-to=origin/main", false),
-            // --track bypass (flag as first arg, not in name-creation check)
+            // branch mutation flags as first arg (bypasses name-creation check)
             ("git branch --track feature", false),
             ("git branch --no-track feature", false),
+            ("git branch -t", false),
+            ("git branch --unset-upstream", false),
             // tag message flag bypasses
             ("git tag -m msg v1.0", false),
             ("git tag --message msg v1.0", false),
