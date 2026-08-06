@@ -26,25 +26,7 @@ cd mahbot
 cargo run --release
 ```
 
-Then run `mahbot` to start the dashboard and configure your OpenRouter key in **Settings**. OpenRouter API key and the [`chrome-use`](https://github.com/leeguooooo/chrome-use) CLI (browser tool and link enrichment) are needed for full functionality — see [Prerequisites](#prerequisites) below. Also, the same binary can be run with `mahbot debug ...` to execute read-only SQL queries over the service's DBs, which is particularly useful for agents working on mahbot itself. Read-only safety is enforced at the file-open level (`O_RDONLY` for the DB/WAL files — no statement can mutate them; a present `-tshm` is memory-mapped read-write for reader-slot bookkeeping only, never touching DB/WAL contents); on live stores it may report the explicit "live instance artifact" error. In that case, query a snapshot copy instead:
-
-```bash
-# Copy the store files into a temporary HOME's db/ dir, then run mahbot debug
-# with that HOME. The snapshot may lag live state by up to one checkpoint
-# interval (5 min). Omit -tshm files: a missing -tshm makes mahbot debug read
-# the on-disk WAL + main DB consistently, while a copied live -tshm may
-# advertise frames for a stale WAL and make the snapshot unreadable.
-SNAP=$(mktemp -d)
-mkdir -p "$SNAP/.mahbot/db"
-for db in ~/.mahbot/db/*.db; do
-  cp "$db"     "$SNAP/.mahbot/db/"
-  cp "$db-wal" "$SNAP/.mahbot/db/" 2>/dev/null || true
-done
-HOME="$SNAP" mahbot debug --db sessions "SELECT COUNT(*) FROM messages"
-rm -rf "$SNAP"
-```
-
-Prevention rule: never open live `~/.mahbot/db/*.db` with stock `sqlite3` — it cannot read Limbo's WAL format, and deleting/recreating `-wal`/`-shm` files under a running daemon orphans the daemon's WAL file descriptor (checkpoint data loss).
+Then run `mahbot` to start the dashboard and configure your OpenRouter key in **Settings**. OpenRouter API key and the [`chrome-use`](https://github.com/leeguooooo/chrome-use) CLI (browser tool and link enrichment) are needed for full functionality — see [Prerequisites](#prerequisites) below. Also, the same binary can be run with `mahbot debug ...` to execute read-only SQL queries over the service's DBs, which is particularly useful for agents working on mahbot itself.
 
 As of now mahbot is only regularly tested on macos, so it might have unexpected bugs on other platforms. However, all the core components are cross-platform so it should work just fine on windows & linux in the future.
 

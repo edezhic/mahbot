@@ -41,7 +41,6 @@ fn classify_model(model: &str) -> VideoEditModel {
 fn validate_params(
     spec: VideoEditModel,
     duration: Option<i64>,
-    seed: Option<i64>,
 ) -> anyhow::Result<()> {
     match spec {
         VideoEditModel::Hailuo3 => {
@@ -53,9 +52,6 @@ fn validate_params(
                      Retry with a duration in that range."
                 );
             }
-            if seed.is_some() {
-                anyhow::bail!("hailuo-3 does not support a seed parameter. Remove it and retry.");
-            }
         }
         VideoEditModel::Aleph2 => {
             if duration.is_some() {
@@ -64,7 +60,6 @@ fn validate_params(
                      parameter is not supported. Remove it and retry."
                 );
             }
-            // seed is accepted best-effort (passed through below).
         }
         VideoEditModel::Unknown => {
             if let Some(d) = duration
@@ -126,14 +121,7 @@ impl Tool for VideoEditTool {
     }
 
     fn description(&self) -> String {
-        // The description must match the active model (switchable via config).
-        // The default `tool/video_edit.md` describes hailuo-3; aleph-2 differs
-        // in every capability axis and lives in a non-tool/* prompt asset.
-        match classify_model(&crate::config::CONFIG.video_edit_model()) {
-            VideoEditModel::Aleph2 => crate::prompt::load_prompt("video_edit_aleph2.md"),
-            VideoEditModel::Hailuo3 => crate::prompt::load_prompt("tool/video_edit.md"),
-            VideoEditModel::Unknown => crate::prompt::load_prompt("video_edit_unknown.md"),
-        }
+        crate::prompt::load_prompt("tool/video_edit.md")
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -149,11 +137,7 @@ impl Tool for VideoEditTool {
                 },
                 "duration": {
                     "type": "integer",
-                    "description": "Output duration in seconds (hailuo-3: 5–15; not supported by aleph-2)"
-                },
-                "seed": {
-                    "type": "integer",
-                    "description": "Seed for reproducibility (aleph-2 best-effort; not supported by hailuo-3)"
+                    "description": "Output duration in seconds (5–15s)"
                 }
             }),
             &["video_url", "instruction"],
@@ -168,7 +152,6 @@ impl Tool for VideoEditTool {
         let video_url = super::get_str(&args, "video_url")?;
         let instruction = super::get_str(&args, "instruction")?;
         let duration = super::get_opt_i64(&args, "duration");
-        let seed = super::get_opt_i64(&args, "seed");
 
         let model = crate::config::CONFIG.video_edit_model();
         let spec = classify_model(&model);
@@ -185,7 +168,7 @@ impl Tool for VideoEditTool {
         }
 
         // ── Per-model parameter validation (fail fast, before any upload) ──
-        validate_params(spec, duration, seed)?;
+        validate_params(spec, duration)?;
 
         // ── Resolve the source: https URL as-is, local file → upload bridge ──
         let source_url = if video_url.starts_with("https://") || video_url.starts_with("http://") {
@@ -222,9 +205,7 @@ impl Tool for VideoEditTool {
         if let Some(d) = duration {
             body["duration"] = json!(d);
         }
-        if let Some(s) = seed {
-            body["seed"] = json!(s);
-        }
+ 
 
         let video_bytes =
             super::fetch_async_video(&api_base, &body, super::VideoJobLabels::EDIT).await?;
@@ -254,24 +235,6 @@ mod tests {
             VideoEditModel::Aleph2
         );
         assert_eq!(classify_model("some/other-model"), VideoEditModel::Unknown);
-    }
-
-    #[test]
-    fn validate_params_enforces_per_model_rules() {
-        // hailuo-3: duration 5–15, no seed
-        assert!(validate_params(VideoEditModel::Hailuo3, Some(10), None).is_ok());
-        assert!(validate_params(VideoEditModel::Hailuo3, None, None).is_ok());
-        assert!(validate_params(VideoEditModel::Hailuo3, Some(4), None).is_err());
-        assert!(validate_params(VideoEditModel::Hailuo3, Some(16), None).is_err());
-        assert!(validate_params(VideoEditModel::Hailuo3, Some(10), Some(42)).is_err());
-        // aleph-2: no duration, seed best-effort
-        assert!(validate_params(VideoEditModel::Aleph2, None, None).is_ok());
-        assert!(validate_params(VideoEditModel::Aleph2, None, Some(7)).is_ok());
-        assert!(validate_params(VideoEditModel::Aleph2, Some(5), None).is_err());
-        // unknown: permissive, positive duration only
-        assert!(validate_params(VideoEditModel::Unknown, Some(30), Some(1)).is_ok());
-        assert!(validate_params(VideoEditModel::Unknown, Some(0), None).is_err());
-        assert!(validate_params(VideoEditModel::Unknown, Some(-3), None).is_err());
     }
 
     #[test]

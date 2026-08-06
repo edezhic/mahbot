@@ -1,5 +1,0 @@
-Edit an existing video clip using the configured AI video editing model (video_edit_model). Provide the source clip as a public HTTPS URL or a local file path (received video attachments appear in the chat as "[Saved video: /path]" annotations — pass that path) and a text instruction (max 1000 chars) describing the edit to apply. Local clips are uploaded to an anonymous ephemeral file host at job time — let the user know their clip is sent to an anonymous host for processing.
-
-Parameter support and constraints depend on the active model — the tool validates the duration and seed parameters against the model's capabilities and returns an error for unsupported combinations. Source clips are limited to 50 MB.
-
-Each invocation bills a paid job and takes ~3–4 minutes to complete. Never retry a timed-out edit — that bills a second job; instead report the timeout to the user. Returns the path to the edited video file — use [VIDEO:path] in your reply to send it to the user.
