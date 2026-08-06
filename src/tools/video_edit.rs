@@ -38,10 +38,7 @@ fn classify_model(model: &str) -> VideoEditModel {
 }
 
 /// Per-model parameter validation, run before any upload or billing.
-fn validate_params(
-    spec: VideoEditModel,
-    duration: Option<i64>,
-) -> anyhow::Result<()> {
+fn validate_params(spec: VideoEditModel, duration: Option<i64>) -> anyhow::Result<()> {
     match spec {
         VideoEditModel::Hailuo3 => {
             if let Some(d) = duration
@@ -205,7 +202,6 @@ impl Tool for VideoEditTool {
         if let Some(d) = duration {
             body["duration"] = json!(d);
         }
- 
 
         let video_bytes =
             super::fetch_async_video(&api_base, &body, super::VideoJobLabels::EDIT).await?;
