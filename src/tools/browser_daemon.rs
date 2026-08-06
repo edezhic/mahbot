@@ -12,12 +12,18 @@
 //! versa.
 //!
 //! Probe hygiene: the daemon round-trip runs on a dedicated `__mahbot_probe`
-//! session and that session is stopped immediately afterwards (`session stop`
-//! closes the daemon and the scratch tab it created). A healthy host therefore
-//! has zero probe tabs, and repeated probes never accumulate any. This also
-//! means the probe no longer keeps a daemon (or its Chrome instance) resident —
-//! the old watchdog left its probe daemon (and scratch tab) running forever;
-//! now every probe stops it.
+//! session and that session's tabs are closed by a verified sweep immediately
+//! afterwards. A bare `session stop` is not enough — it SIGTERMs the daemon,
+//! waits ~1 s, then force-kills, so when the extension relay is slow or wedged
+//! the daemon's graceful tab close cannot finish inside that window and the
+//! scratch tab is orphaned forever (no other mechanism ever reclaims it). The
+//! sweep instead closes each tab through the CLI, then re-enumerates the group
+//! to verify closure (round-over-round convergence); a leftover that cannot be
+//! closed is retried by the next probe/startup once the browser is reachable
+//! again. A healthy host therefore has zero probe tabs, and repeated probes
+//! never accumulate any. This also means the probe no longer keeps a daemon
+//! (or its Chrome instance) resident — the old watchdog left its probe daemon
+//! (and scratch tab) running forever; now every probe stops it.
 //!
 //! Trade-offs:
 //! - Each probe briefly spawns the probe daemon and its background scratch tab
@@ -40,8 +46,8 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
-/// Fixed session name used by the liveness probe. The probe's daemon is stopped
-/// after every probe so its scratch tab never persists.
+/// Fixed session name used by the liveness probe. The probe's scratch tab is
+/// closed and verified by a sweep after every probe so it never persists.
 const PROBE_SESSION: &str = "__mahbot_probe";
 
 // ── Bounds (pinned for deterministic recovery) ────────────────────────────
@@ -74,6 +80,19 @@ const HALT_COOLDOWN: Duration = Duration::from_mins(30);
 /// `daemon restart` on a relay-drop — the MV3 service worker revives on its
 /// keepalive (~30 s) and only then writes the relay endpoint back.
 const RELAY_REVIVE_WAIT: Duration = Duration::from_secs(40);
+
+// ── Verified-close sweep bounds (pinned for deterministic recovery) ──────
+/// Total budget for one sweep invocation, starting before the service-state
+/// skip gate (the probe path reuses the classification it already took, so its
+/// budget starts after that call). Every CLI call checks the deadline before
+/// spawning (one call may overshoot by at most [`PROBE_TIMEOUT`] — the
+/// in-flight bound). On expiry the sweep defers: leftover tabs are retried by
+/// the next probe/startup (self-healing), never a permanent orphan.
+const SWEEP_TOTAL_BUDGET: Duration = Duration::from_secs(15);
+/// Convergence rounds before a sweep gives up for this invocation. The budget
+/// is the hard cap; this only bounds the number of enumerate/close/stop cycles
+/// (a healthy host converges in 3 rounds; a retried failed close needs 4–5).
+const SWEEP_MAX_ROUNDS: u32 = 5;
 
 /// Classified cause for a failed health probe. Drives cause-specific warnings
 /// and decides whether auto-recovery can help at all.
@@ -321,23 +340,47 @@ pub(crate) fn ensure_browser_env(cmd: &mut Command) {
     cmd.env("AGENT_BROWSER_RELAY_REVIVE_SECS", "0");
 }
 
-/// Run a chrome-use CLI command that emits a `--json` response and parse it.
-/// Bounded by [`PROBE_TIMEOUT`]; returns `None` on timeout, spawn failure,
-/// non-zero exit, or unparseable output (callers degrade to the daemon
-/// round-trip, which does not depend on the JSON commands).
-async fn run_cli_json(args: &[&str]) -> Option<Value> {
+/// Spawn a chrome-use CLI call with the browser env, `--json`, and an optional
+/// `--session`, bounded by [`PROBE_TIMEOUT`] — a wedged daemon hangs inside the
+/// CLI's own ~152 s retry loop, so every call must be bounded.
+async fn run_cli_bounded(args: &[&str], session: Option<&str>) -> Option<std::process::Output> {
     let mut cmd = Command::new(browser_bin());
     ensure_browser_env(&mut cmd);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.args(args).arg("--json");
+    if let Some(session) = session {
+        cmd.args(["--session", session]);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     cmd.kill_on_drop(true);
-    let out = tokio::time::timeout(PROBE_TIMEOUT, cmd.output())
+    tokio::time::timeout(PROBE_TIMEOUT, cmd.output())
         .await
         .ok()?
-        .ok()?;
+        .ok()
+}
+
+/// Run a chrome-use CLI command with `--json` (and optional `--session`),
+/// bounded by [`PROBE_TIMEOUT`] — a wedged daemon would otherwise hang the
+/// CLI's own ~152 s retry loop inside the health/recovery path. `Ok(value)` on
+/// success; `Err(Some(msg))` when the CLI answered with a structured error
+/// (the message survives for signature detection); `Err(None)` on
+/// timeout/spawn/parse failure.
+async fn run_cli_json_opt(args: &[&str], session: Option<&str>) -> Result<Value, Option<String>> {
+    let out = run_cli_bounded(args, session).await.ok_or(None)?;
     if !out.status.success() {
-        return None;
+        return Err(extract_error(&out.stdout));
     }
-    serde_json::from_slice(&out.stdout).ok()
+    let v: Value = serde_json::from_slice(&out.stdout).map_err(|_| None)?;
+    if v.get("success").and_then(Value::as_bool) != Some(true) {
+        return Err(extract_error(&out.stdout));
+    }
+    Ok(v)
+}
+
+/// Non-session variant for daemon-free commands (`status`, `extension
+/// status`): errors are dropped — callers degrade to the daemon round-trip,
+/// which does not depend on the JSON commands.
+async fn run_cli_json(args: &[&str]) -> Option<Value> {
+    run_cli_json_opt(args, None).await.ok()
 }
 
 /// Daemon-free service-state snapshot: `status --json` classifies extension /
@@ -345,7 +388,7 @@ async fn run_cli_json(args: &[&str]) -> Option<Value> {
 /// classified failure when the service is unusable; `None` when it looks
 /// healthy (the caller then runs the daemon round-trip).
 async fn service_state() -> Option<ProbeFailure> {
-    let Some(status) = run_cli_json(&["status", "--json"]).await else {
+    let Some(status) = run_cli_json(&["status"]).await else {
         // Status unavailable (old CLI or broken binary) — fall through to the
         // round-trip, which only needs the socket protocol.
         return None;
@@ -374,7 +417,7 @@ async fn service_state() -> Option<ProbeFailure> {
 /// (daemon-free; reads Chrome's Secure Preferences). Non-empty `disableReasons`
 /// means the extension is genuinely disabled.
 async fn extension_disabled() -> bool {
-    let Some(status) = run_cli_json(&["extension", "status", "--json"]).await else {
+    let Some(status) = run_cli_json(&["extension", "status"]).await else {
         return false; // Unknown → treat as a transient relay drop, not disabled.
     };
     status
@@ -418,18 +461,398 @@ async fn round_trip_probe() -> ProbeOutcome {
 
 /// Full health probe: service-state classification first (daemon-free, no tab),
 /// then a bounded daemon round-trip when the service looks healthy. The probe
-/// session is stopped on every path so its scratch tab never persists.
+/// session's tabs are closed by a verified sweep on every path (success and
+/// failure) so the scratch tab never persists — see [`sweep_session`].
 async fn probe_daemon() -> ProbeOutcome {
     // Serialized with the startup cleanup and other probes (see probe_session_lock).
     let _guard = probe_session_lock().await;
-    let outcome = match service_state().await {
+    // One daemon-free classification shared by the probe and the sweep's skip
+    // gate — the sweep would otherwise re-run `status` while holding the lock.
+    let service = service_state().await;
+    let outcome = match service {
         Some(failure) => ProbeOutcome::Down(failure),
         None => round_trip_probe().await,
     };
-    // Stop the probe daemon (closing its scratch tab) on both success and
-    // failure paths — a leftover from a previous probe is cleaned here too.
-    let _ = run_cli(&["session", "stop", PROBE_SESSION]).await;
+    // Verified close of the probe scratch tab (and any orphaned leftovers) on
+    // both success and failure paths — a bare `session stop` can orphan the tab
+    // when the relay close cannot finish inside its ~1 s force-kill window.
+    sweep_session_impl(PROBE_SESSION, SweepService::Known(service)).await;
     outcome
+}
+
+/// One tab in a session's tab group, from `tab list --json`. The `active` flag
+/// is deliberately not tracked: a fresh daemon pins adopted leftovers exactly
+/// like its own scratch, so it cannot tell the two apart (see the pinned
+/// chrome-use behaviors below). Identity is `target_id` — the stable CDP id
+/// that survives daemon restarts — while `tab_id` (`t<N>`) is the ref the
+/// `close` command resolves.
+struct SweepTab {
+    tab_id: String,
+    target_id: String,
+}
+
+// chrome-use CLI behaviors this sweep relies on (pinned against v1.5.87;
+// live-verified against the 1.5.86 binary):
+// - `tab list --session <name>` enumerates only that session's tab group (the
+//   relay scopes `Target.getTargets` per announced group, issue #40). When the
+//   session has no daemon the CLI spawns one: an empty group makes it create a
+//   fresh scratch tab; a non-empty group makes it ADOPT the existing tabs
+//   without marking them created (`created_targets` stays empty).
+// - Both the created scratch and adopted leftovers are pinned, so `active: true`
+//   does NOT identify the daemon's own tab — the sweep tracks its own scratch
+//   by stable `targetId` instead.
+// - `close <ref>` closes one tab through the relay; it refuses to close the
+//   last tab of a session ("Cannot close the last tab"), so the sweep creates
+//   its own scratch first to keep the count ≥ 2 until every listed tab is
+//   closed. The daemon discards the closeTarget result, so even a successful
+//   JSON response is not proof of closure — only re-enumeration is, and a
+//   failed close REAPPEARS in the next same-daemon `tab list` (resync adopts
+//   still-open tabs again), which is the convergence loop.
+// - `session stop` SIGTERMs the daemon (its shutdown handler closes its
+//   created tabs best-effort through the relay), waits ≤ 1 s, then SIGKILLs.
+//   Its exit code / JSON success are NOT proof of closure, and adopted tabs
+//   are never closed at shutdown.
+//
+// Residual limits (accepted): the probe's scratch tab is about:blank and the
+// extension refuses to re-attach `about:` URLs (its `eligible()`/`SKIP_URL`
+// filter). An orphan that lost its attach while the daemon kept a stale
+// binding (relay blip, kill during an outage) fails every command with the
+// unreachable-tab signatures — the sweep logs the 'close it by hand in
+// Chrome' signal and retries each probe; live orphans whose attach survived
+// heal automatically. An orphan the extension fully dropped (Chrome
+// service-worker restart unmarks ineligible about: tabs and never re-attaches
+// them; the relay's group is fed only by attach announcements) is invisible
+// to every CLI path: `tab list` succeeds with only the fresh scratch and the
+// sweep converges to Clean with no log. That case is undetectable by design —
+// no CLI path can enumerate a tab the extension no longer announces; it stays
+// in Chrome until closed by hand. Dead-daemon link-enricher orphans are
+// similarly not enumerable (their session names are per-message and the
+// daemon inventory drops dead pids) — documented residual.
+/// Close every tab in a mahbot-owned session's tab group except the sweep's own
+/// scratch, verifying closure by round-over-round re-enumeration. Shared by the
+/// probe, the startup sweep, and the link-enricher per-fetch close. Callers
+/// that sweep the probe session must already hold [`probe_session_lock`] (this
+/// helper never takes it — it is non-reentrant).
+pub(crate) async fn sweep_session(name: &str) {
+    sweep_session_impl(name, SweepService::Check).await;
+}
+
+/// Whether the sweep's service skip-gate is already classified by the caller.
+/// The probe path classifies the service once and reuses it, so the probe lock
+/// is not held across a second daemon-free `status` round-trip.
+enum SweepService {
+    /// Not classified — the sweep runs its own daemon-free `status` check
+    /// (counted against the total budget).
+    Check,
+    /// Pre-classified: `Some(failure)` = service down (skip), `None` = healthy.
+    Known(Option<ProbeFailure>),
+}
+
+async fn sweep_session_impl(name: &str, service: SweepService) {
+    if !is_mahbot_session_name(name) {
+        warn!(
+            session = name,
+            "tab sweep refused: not a mahbot-owned session (user/default/other-agent sessions are never touched)"
+        );
+        return;
+    }
+    // Skip on known service outage: no close is possible while the relay is
+    // down, and every CLI call would cost the full step timeout for nothing.
+    // Tabs stay until the browser is reachable again (next probe/startup). The
+    // deadline starts before the skip gate so the gate counts against the
+    // total budget.
+    let deadline = Instant::now() + SWEEP_TOTAL_BUDGET;
+    let down = match service {
+        SweepService::Check => service_state().await,
+        SweepService::Known(s) => s,
+    };
+    if let Some(failure) = down {
+        debug!(
+            session = name,
+            ?failure,
+            "tab sweep skipped — browser service unavailable"
+        );
+        return;
+    }
+    // The sweep's own scratch tab — the ONE tab it creates via `tab new` and
+    // tracks by stable targetId; everything else in the group is a leftover
+    // that must be closed. `stopped` marks the round after a daemon stop: the
+    // enumeration then spawned a fresh daemon, so a lone tab is provably that
+    // daemon's own scratch (clean) unless it is our tracked scratch that
+    // survived the stop (close it again — it was adopted, not owned).
+    let mut scratch: Option<String> = None;
+    let mut stopped = false;
+    for _round in 1..=SWEEP_MAX_ROUNDS {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Some(tabs) = session_tab_list(name, deadline).await else {
+            return; // warning already emitted by the enumerator
+        };
+        if tabs.is_empty() {
+            // Live daemon whose tabs were all closed externally — nothing to
+            // close; stop it so the next round spawns a fresh daemon (which
+            // creates its own scratch).
+            let _ = stop_session_daemon(name, deadline).await;
+            stopped = true;
+            scratch = None;
+            continue;
+        }
+        if stopped {
+            // Verification round: the previous stop either closed our scratch
+            // (the fresh daemon created its own → clean) or failed to (our
+            // scratch survives, now adopted → must be closed again).
+            if tabs.len() == 1 && scratch.as_deref() != Some(tabs[0].target_id.as_str()) {
+                // Clean: the group holds only the fresh daemon's own scratch.
+                clear_sweep_warn();
+                let _ = stop_session_daemon(name, deadline).await;
+                return;
+            }
+            stopped = false;
+            scratch = None; // adopted by the fresh daemon — no longer owned
+        }
+        if tabs.len() == 1 && scratch.as_deref() == Some(tabs[0].target_id.as_str()) {
+            // Only our owned scratch remains — every listed leftover is closed
+            // and verified (same-daemon re-enumeration). Stop closes it.
+            let _ = stop_session_daemon(name, deadline).await;
+            stopped = true;
+            continue;
+        }
+        // Close cycle: ensure an owned scratch exists, then close every other
+        // listed tab. Closing our own scratch is refused (last-tab rule) only
+        // once all leftovers are gone — handled by the stop branch above.
+        if scratch.is_none() {
+            let Some(target_id) = session_tab_new_scratch(name, deadline).await else {
+                return; // every None path already emitted its SweepWarn
+            };
+            scratch = Some(target_id);
+        }
+        for tab in &tabs {
+            if tab.target_id == *scratch.as_deref().unwrap_or_default() {
+                continue; // never close our own scratch
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            // Per-tab errors are swallowed by the CLI close path — the next
+            // round's same-daemon enumeration is the only proof of closure.
+            let _ = session_close_tab(name, &tab.tab_id, deadline).await;
+        }
+    }
+    sweep_warn_transition(SweepWarn::Deferred);
+}
+
+/// Only mahbot-owned session names may be swept — user, default, and other
+/// agents' sessions must never be touched (strict-scope rule).
+fn is_mahbot_session_name(name: &str) -> bool {
+    name == PROBE_SESSION || name.starts_with("link-enricher-")
+}
+
+/// Causes the sweep warns about — warn once per cause transition so a
+/// persistent orphan does not spam every probe interval, and warn again after
+/// a healthy sweep cleared the previous cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepWarn {
+    /// Leftover tab the daemon can no longer re-drive (stale binding on an
+    /// about:blank tab the extension never re-attaches) — manual intervention
+    /// required. Only fires while a command still errors; an orphan the
+    /// extension fully dropped is invisible (see the pinned-behaviors note).
+    UnreachableTab,
+    /// Relay/daemon unreachable mid-sweep; retried next probe/startup.
+    CannotEnumerate,
+    /// Budget exhausted without convergence; retried next probe/startup.
+    Deferred,
+}
+
+/// Last-cause anti-spam state, global across sessions: a clean sweep in one
+/// session clears it for all, so a persistent orphan in another session can
+/// re-warn once after that convergence — acceptable tradeoff, no per-session
+/// map needed.
+static LAST_SWEEP_WARN: OnceLock<Mutex<Option<SweepWarn>>> = OnceLock::new();
+
+fn sweep_warn_transition(cause: SweepWarn) {
+    let mut last = LAST_SWEEP_WARN
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_poison();
+    if *last == Some(cause) {
+        return;
+    }
+    *last = Some(cause);
+    match cause {
+        SweepWarn::UnreachableTab => warn!(
+            "tab sweep: a leftover tab is unreachable (the extension lost its debugger attach; \
+             about:blank tabs are never re-attached) — close the leftover tab in Chrome to \
+             unblock this session; the sweep keeps retrying on every probe"
+        ),
+        SweepWarn::CannotEnumerate => warn!(
+            "tab sweep: cannot enumerate session tabs (relay/daemon unreachable or malformed \
+             response) — deferring to next probe/startup"
+        ),
+        SweepWarn::Deferred => {
+            warn!("tab sweep: group not clean within budget — deferring to next probe/startup");
+        }
+    }
+}
+
+fn clear_sweep_warn() {
+    *LAST_SWEEP_WARN
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_poison() = None;
+}
+
+/// Bounded `tab list --json` on a session. `None` on timeout, CLI failure, an
+/// error response, or a malformed entry (a missing tabId/targetId makes the
+/// count unreliable — defer rather than risk a false-clean verdict). Every
+/// `None` path emits its [`SweepWarn`], so a deferral is never silent.
+async fn session_tab_list(name: &str, deadline: Instant) -> Option<Vec<SweepTab>> {
+    if Instant::now() >= deadline {
+        sweep_warn_transition(SweepWarn::Deferred);
+        return None;
+    }
+    let v = match run_session_cli_json(&["tab", "list"], name).await {
+        Ok(v) => v,
+        Err(err) => {
+            let msg = err.as_deref().unwrap_or_default();
+            if is_unreachable_tab_error(msg) {
+                tracing::debug!(
+                    session = name,
+                    error = msg,
+                    "tab sweep: unreachable-tab detail"
+                );
+                sweep_warn_transition(SweepWarn::UnreachableTab);
+            } else {
+                sweep_warn_transition(SweepWarn::CannotEnumerate);
+            }
+            return None;
+        }
+    };
+    let Some(tabs) = v
+        .get("data")
+        .and_then(|d| d.get("tabs"))
+        .and_then(Value::as_array)
+    else {
+        sweep_warn_transition(SweepWarn::CannotEnumerate);
+        return None;
+    };
+    let parsed: Option<Vec<SweepTab>> = tabs
+        .iter()
+        .map(|t| {
+            Some(SweepTab {
+                tab_id: t.get("tabId")?.as_str()?.to_string(),
+                target_id: t.get("targetId")?.as_str()?.to_string(),
+            })
+        })
+        .collect();
+    parsed.or_else(|| {
+        sweep_warn_transition(SweepWarn::CannotEnumerate);
+        None
+    })
+}
+
+/// Error signatures of a leftover probe tab the daemon can no longer re-drive:
+/// its binding went stale (relay blip, kill during an outage) while the
+/// extension keeps the attach. The probe's scratch tab is about:blank and the
+/// extension never re-attaches `about:` URLs (its `eligible()` filter), so
+/// only closing the tab by hand unblocks the session — the sweep logs this
+/// signal and keeps retrying. An orphan the extension fully dropped
+/// (service-worker restart) never produces these; it is invisible to every CLI
+/// path (see the sweep's pinned-behaviors note).
+fn is_unreachable_tab_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("can no longer be resolved")
+        || lower.contains("owns no resolvable tab")
+        || lower.contains("no attached tab")
+        || lower.contains("its tab is gone")
+        || lower.contains("stale session")
+        || lower.contains("unknown session")
+}
+
+/// Create a scratch tab and return its stable targetId, matched by the `t<N>`
+/// ref from the `tab new` response in the next enumeration (same daemon, so
+/// refs are stable until a stop). Every `None` path emits its [`SweepWarn`]
+/// (or the re-enumeration's `session_tab_list` already did), so callers return
+/// without re-warning and never override a more specific cause.
+async fn session_tab_new_scratch(name: &str, deadline: Instant) -> Option<String> {
+    if Instant::now() >= deadline {
+        sweep_warn_transition(SweepWarn::Deferred);
+        return None;
+    }
+    let resp = match run_session_cli_json(&["tab", "new"], name).await {
+        Ok(v) => v,
+        Err(err) => {
+            let msg = err.as_deref().unwrap_or_default();
+            if is_unreachable_tab_error(msg) {
+                tracing::debug!(
+                    session = name,
+                    error = msg,
+                    "tab sweep: unreachable-tab detail"
+                );
+                sweep_warn_transition(SweepWarn::UnreachableTab);
+            } else {
+                sweep_warn_transition(SweepWarn::CannotEnumerate);
+            }
+            return None;
+        }
+    };
+    let Some(tab_id) = resp
+        .get("data")
+        .and_then(|d| d.get("tabId"))
+        .and_then(Value::as_str)
+        .map(String::from)
+    else {
+        sweep_warn_transition(SweepWarn::CannotEnumerate);
+        return None;
+    };
+    let after = session_tab_list(name, deadline).await?; // warns on None
+    after
+        .iter()
+        .find(|t| t.tab_id == tab_id)
+        .map(|t| t.target_id.clone())
+        .or_else(|| {
+            sweep_warn_transition(SweepWarn::CannotEnumerate);
+            None
+        })
+}
+
+async fn session_close_tab(name: &str, tab_id: &str, deadline: Instant) -> Option<()> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+    run_session_cli_json(&["close", tab_id], name)
+        .await
+        .ok()
+        .map(|_| ())
+}
+
+/// Bounded `session stop` — its exit code is never trusted as proof of closure
+/// (re-enumeration is), and it is skipped when the sweep is already over
+/// budget (the daemon idles out on its own and the next probe retries). The
+/// session is named by the helper's `--session` flag alone.
+async fn stop_session_daemon(name: &str, deadline: Instant) -> Option<()> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+    run_session_cli_json(&["session", "stop"], name)
+        .await
+        .ok()
+        .map(|_| ())
+}
+
+/// Session-scoped variant — the structured error message survives for
+/// signature detection.
+async fn run_session_cli_json(args: &[&str], session: &str) -> Result<Value, Option<String>> {
+    run_cli_json_opt(args, Some(session)).await
+}
+
+/// Extract the `error` message from a CLI error response, if any.
+fn extract_error(stdout: &[u8]) -> Option<String> {
+    let v: Value = serde_json::from_slice(stdout).unwrap_or_default();
+    v.get("error")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .filter(|s| !s.is_empty())
 }
 
 fn set_health(outcome: ProbeOutcome) {
@@ -596,22 +1019,24 @@ pub async fn run_watchdog() {
 }
 
 /// One-time cleanup of stale mahbot-owned browser-session artifacts at watchdog
-/// start: the probe session and leftover link-enricher sessions get stopped so
-/// their tab groups don't accumulate. `session stop` is idempotent and
-/// dead-session safe, and only ever closes the target session's own tabs —
-/// sessions owned by other agents or the user (explicit tabs, `default`, any
-/// non-mahbot name) are never touched.
+/// start: the probe session and leftover link-enricher sessions get swept so
+/// their tab groups don't accumulate. Each sweep is verified (round-over-round
+/// convergence) and only ever closes the target session's own tabs — sessions
+/// owned by other agents or the user (explicit tabs, `default`, any non-mahbot
+/// name) are never touched. Dead-daemon link-enricher orphans are not
+/// enumerable (no pid file; the session names are per-message) and stay until
+/// the tab is closed by hand — a documented residual limit.
 async fn cleanup_stale_sessions() {
-    // Serialized with probes — stopping the probe session tears its daemon out
+    // Serialized with probes — sweeping the probe session tears its daemon out
     // from under a concurrent in-flight probe (see probe_session_lock).
     let _guard = probe_session_lock().await;
-    let _ = run_cli(&["session", "stop", PROBE_SESSION]).await;
+    sweep_session(PROBE_SESSION).await;
     let Some(sessions) = registered_sessions().await else {
         return;
     };
     for name in sessions {
         if name.starts_with("link-enricher-") {
-            let _ = run_cli(&["session", "stop", &name]).await;
+            sweep_session(&name).await;
         }
     }
 }
@@ -619,7 +1044,7 @@ async fn cleanup_stale_sessions() {
 /// Names of currently registered session daemons (from the daemon-free
 /// `status --json` snapshot).
 async fn registered_sessions() -> Option<Vec<String>> {
-    let status = run_cli_json(&["status", "--json"]).await?;
+    let status = run_cli_json(&["status"]).await?;
     Some(
         status
             .get("data")?
@@ -644,7 +1069,7 @@ async fn wait_for_relay(budget: Duration) {
 }
 
 async fn relay_up() -> Option<bool> {
-    let status = run_cli_json(&["status", "--json"]).await?;
+    let status = run_cli_json(&["status"]).await?;
     status
         .get("data")?
         .get("extension")?
@@ -921,6 +1346,29 @@ mod tests {
         assert_eq!(h.gate_restart(t3 + HALT_COOLDOWN), RestartGate::Allowed(1));
         assert_eq!(h.restart_attempts, 1);
         assert!(!h.halted);
+    }
+
+    #[test]
+    fn unreachable_tab_error_signature_detected() {
+        for msg in [
+            "the tab this session was driving can no longer be resolved (it was closed, or a flaky relay dropped it)",
+            "this session owns no resolvable tab in its group. Refusing to run on a tab this session does not drive",
+            "stale sessionId ... its tab is gone",
+            "unknown sessionId ...",
+            "no attached tab ...",
+        ] {
+            assert!(is_unreachable_tab_error(msg), "should detect: {msg}");
+        }
+        for msg in [
+            // Relay-side outage — owned by is_relay_unavailable_error, and the
+            // sweep's service_state skip gate already covers it.
+            "Auto-launch failed: Could not drive your Chrome through the ab-connect extension.",
+            // Daemon socket / page-level failures — not tab-attach problems.
+            "Failed to read: Resource temporarily unavailable (os error 35)",
+            "chrome-use error: Element not found",
+        ] {
+            assert!(!is_unreachable_tab_error(msg), "should NOT detect: {msg}");
+        }
     }
 
     #[test]

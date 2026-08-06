@@ -157,14 +157,21 @@ impl BrowserTool {
         Ok(text)
     }
 
-    /// Close a browser session tab by name (best-effort).
+    /// Close a browser session tab by name — verified: the session's tab group
+    /// is swept (enumerate → close → re-enumerate convergence) so a leftover
+    /// cannot be orphaned silently by a kill-based close. Only the target
+    /// session's own tabs are touched. Non-mahbot session names (e.g. the
+    /// agent-facing `default` tab) are refused by the sweep's strict-scope
+    /// rule — the tab then persists until the daemon's idle timeout.
     pub async fn close_session(&self, tab: &str) {
-        let _ = self.run_command(&["close"], Some(tab)).await;
+        super::browser_daemon::sweep_session(tab).await;
     }
 
     /// If the response shows the tab still on the scratch `about:blank` page,
-    /// the navigation never committed — close the session (best-effort) and
-    /// fail with the cause. No-op when the navigation committed.
+    /// the navigation never committed — close the session (verified sweep) and
+    /// fail with the cause. The close is refused for non-mahbot session names
+    /// (strict-scope rule), leaving the tab to the daemon's idle timeout. No-op
+    /// when the navigation committed.
     async fn bail_on_blank_navigation(
         &self,
         tab: &str,
