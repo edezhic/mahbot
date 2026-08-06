@@ -274,6 +274,7 @@ impl BoardState {
             ],
             TicketPhase::Planning => vec![
                 ("✅ Ready for Dev", TicketPhase::ReadyForDevelopment),
+                ("↩ Back to Backlog", TicketPhase::Backlog),
                 ("🛑 Cancel", TicketPhase::Cancelled),
             ],
             TicketPhase::Done | TicketPhase::Cancelled => {
@@ -291,6 +292,7 @@ impl BoardState {
             l if l.contains("QA") => lucide::shield_check(),
             l if l.contains("Pause") => lucide::pause(),
             l if l.contains("Dev") => lucide::play(),
+            l if l.contains("Backlog") => lucide::rotate_ccw(),
             _ => lucide::circle_check(),
         }
     }
