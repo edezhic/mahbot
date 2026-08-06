@@ -21,10 +21,10 @@
 //!
 //! # Byte-identical retry parameters
 //!
-//! All request parameters (model, messages, tools, max_tokens, temperature,
-//! reasoning_effort, provider routing) are byte-identical across ALL attempts —
-//! temperature is a compile-time constant, reasoning_effort is FIXED (prefix
-//! cache preservation — never lower it), no escalation of any kind. The only
+//! All request parameters (model, messages, tools, max_tokens, reasoning_effort,
+//! provider routing) are byte-identical across ALL attempts — reasoning_effort
+//! is FIXED (prefix cache preservation — never lower it), no escalation of any
+//! kind. The only
 //! permitted change is the parse-failure re-prompt in the extraction path
 //! (appended messages), which extends the cached prefix.
 //!

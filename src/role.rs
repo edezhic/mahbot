@@ -55,8 +55,6 @@ pub(crate) const SANITATION_ROLE: &str = "sanitation_admin";
 pub struct RoleInfo {
     /// Whether this role has a discovery prompt for workspace exploration.
     pub has_discovery: bool,
-    /// Model temperature for LLM calls for this role.
-    pub temperature: f32,
     /// Whether this role requires a vision-capable (multimodal) model.
     ///
     /// Controls two downstream behaviors:
@@ -90,7 +88,6 @@ pub struct RoleInfo {
 /// concise and make future field additions cheap.
 const BASE_ROLE_INFO: RoleInfo = RoleInfo {
     has_discovery: true,
-    temperature: 0.1,
     requires_multimodal: false,
     badge_fg: (0.0, 0.0, 0.0),
     default_model: "deepseek/deepseek-v4-flash",
@@ -107,7 +104,6 @@ const BASE_ROLE_INFO: RoleInfo = RoleInfo {
 pub const fn role_info(role: &Role) -> &'static RoleInfo {
     match role {
         Role::Manager => &RoleInfo {
-            temperature: 0.01,
             badge_fg: (0.816, 0.635, 0.082),
             default_model: "deepseek/deepseek-v4-pro",
             display_label: "Manager",
@@ -119,25 +115,21 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
             ..BASE_ROLE_INFO
         },
         Role::Analyst => &RoleInfo {
-            temperature: 0.3,
             badge_fg: (0.263, 0.522, 0.745),
             display_label: "Analyst",
             ..BASE_ROLE_INFO
         },
         Role::Coder => &RoleInfo {
-            temperature: 0.01,
             badge_fg: (0.353, 0.604, 0.416),
             display_label: "Coder",
             ..BASE_ROLE_INFO
         },
         Role::Qa => &RoleInfo {
-            temperature: 0.4,
             badge_fg: (0.545, 0.494, 0.784),
             display_label: "QA",
             ..BASE_ROLE_INFO
         },
         Role::Reviewer => &RoleInfo {
-            temperature: 0.2,
             badge_fg: (0.431, 0.494, 0.784),
             display_label: "Reviewer",
             ..BASE_ROLE_INFO
@@ -155,10 +147,8 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
             default_model: "qwen/qwen3.6-plus",
             default_reasoning_effort: "medium",
             display_label: "Artist",
-            ..BASE_ROLE_INFO
         },
         Role::Maintainer => &RoleInfo {
-            temperature: 0.5,
             badge_fg: (0.753, 0.376, 0.502),
             display_label: "Maintainer",
             ..BASE_ROLE_INFO

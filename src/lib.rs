@@ -1267,7 +1267,6 @@ pub(crate) struct ChatRequest {
     pub tools: Option<Vec<ToolSpec>>,
     pub model: String,
     pub allow_image_parts: bool,
-    pub temperature: f32,
     /// Maximum tokens for the model to generate.
     /// When `Some(n)`, sent as `max_tokens` in the API request body.
     /// When `None`, the parameter is omitted (provider defaults apply).

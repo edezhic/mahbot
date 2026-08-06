@@ -153,8 +153,8 @@ impl Session {
     /// handles only the history rebuild and persistence.
     ///
     /// KV-cache preservation: called by Agent after producing a summary
-    /// with byte-identical parameters (model, temperature, reasoning_effort,
-    /// tools, provider routing) so the provider can reuse the cached prefix.
+    /// with byte-identical parameters (model, reasoning_effort, tools,
+    /// provider routing) so the provider can reuse the cached prefix.
     ///
     /// On persist failure, the full in-memory history is preserved — the
     /// next turn reloads from DB and retries (self-healing).

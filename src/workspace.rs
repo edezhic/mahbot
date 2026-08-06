@@ -265,7 +265,7 @@ async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) 
     let extraction_prompt = crate::prompt::load_prompt("extraction/diagnostics.md");
 
     // KV-cache preservation: `agent.extract_verdict` uses the agent's own
-    // parameters (model, temperature, reasoning_effort, tools, provider routing)
+    // parameters (model, reasoning_effort, tools, provider routing)
     // so the extraction call is byte-identical to the original Discovery agent
     // call — the provider can reuse the cached prefix. Retry exhaustion
     // (RetryExhausted) surfaces the scoped loop's failure trail.

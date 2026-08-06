@@ -2122,8 +2122,8 @@ async fn run_parallel_agents(
                         return ParallelVerdict::NoResponse;
                     }
                     // KV cache preservation: `agent.extract_verdict` uses the
-                    // agent's own parameters (model, temperature, reasoning_effort,
-                    // tools, provider routing) so the extraction call is byte-identical
+                    // agent's own parameters (model, reasoning_effort, tools,
+                    // provider routing) so the extraction call is byte-identical
                     // to the original verifier agent call — the provider can reuse the
                     // cached prefix.
                     //

@@ -687,8 +687,8 @@ impl Agent {
     }
 
     /// Build a [`ChatRequest`] from the given messages and image-parts flag,
-    /// using the agent's current model, tools, temperature, reasoning-effort,
-    /// and provider-routing settings.
+    /// using the agent's current model, tools, reasoning-effort, and
+    /// provider-routing settings.
     ///
     /// All parameter sources are lazily resolved each call so that runtime
     /// hot-reload (model, routing, reasoning-effort) is reflected immediately.
@@ -697,8 +697,8 @@ impl Agent {
     ///
     /// Every call site that produces a chat request for the same logical
     /// conversation *must* use exactly the same parameter sources — model,
-    /// temperature, reasoning_effort, tools (critically tools!), and provider
-    /// routing — so that the provider can reuse the cached prefix computed
+    /// reasoning_effort, tools (critically tools!), and provider routing — so
+    /// that the provider can reuse the cached prefix computed
     /// during the original agent call.  Any deviation (including dropping
     /// tools) forces the provider to recompute the entire KV-cache prefix.
     ///
@@ -716,8 +716,6 @@ impl Agent {
             tools: Some(self.tool_specs.clone()),
             model,
             allow_image_parts,
-            // temperature is a compile-time constant from role metadata — not hot-reloadable
-            temperature: crate::role::role_info(&self.role).temperature,
             max_tokens: Some(crate::DEFAULT_MAX_TOKENS),
             reasoning_effort: Some(crate::config::CONFIG.role_reasoning_effort(self.role)),
             provider_order: routing.provider_order,
@@ -730,7 +728,7 @@ impl Agent {
     /// Extract a structured verdict with the hardened scoped retry loop.
     ///
     /// KV-cache requirements: the params come from [`Self::build_chat_request`]
-    /// (model, temperature, reasoning_effort, tools, provider routing) so all
+    /// (model, reasoning_effort, tools, provider routing) so all
     /// attempts are byte-identical except the parse-failure re-prompt.
     ///
     /// `validate` runs fail-closed on the parsed value (e.g. score ∈ [0,10]):

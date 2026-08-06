@@ -193,7 +193,6 @@ mod tests {
             tools: None,
             model: "test-model".to_string(),
             allow_image_parts: false,
-            temperature: 0.1,
             max_tokens: None,
             reasoning_effort: None,
             provider_order: None,

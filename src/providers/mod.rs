@@ -22,7 +22,7 @@ use crate::ChatMessage;
 /// Helper for tests that constructs a `ChatRequest` with sensible defaults.
 /// Callers override specific fields via struct update syntax:
 /// ```ignore
-/// let req = ChatRequest { model: "test-model".into(), temperature: 0.7, ..test_request(messages, None) };
+/// let req = ChatRequest { model: "test-model".into(), ..test_request(messages, None) };
 /// ```
 #[cfg(test)]
 pub(crate) fn test_request(
@@ -34,7 +34,6 @@ pub(crate) fn test_request(
         tools,
         model: "test".to_string(),
         allow_image_parts: false,
-        temperature: 0.1,
         max_tokens: None,
         reasoning_effort: None,
         provider_order: None,

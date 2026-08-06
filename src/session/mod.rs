@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 
 // The summarization LLM call lives in `crate::Agent::summarize` so that all
-// parameters (model, temperature, reasoning_effort, tools, provider routing)
+// parameters (model, reasoning_effort, tools, provider routing)
 // are byte-identical to the agent's work loop.  This section keeps only the
 // constants and helpers used by `Session::apply_summary`.
 

@@ -119,7 +119,6 @@ impl OpenAiCompatibleProvider {
 struct ChatCompletionRequest {
     model: String,
     messages: Vec<NativeMessage>,
-    temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -669,7 +668,6 @@ impl OpenAiCompatibleProvider {
         let payload = ChatCompletionRequest {
             model: request.model.clone(),
             messages: native,
-            temperature: f64::from(request.temperature),
             max_tokens: request.max_tokens,
             tool_choice: tool_specs.as_ref().map(|_| "auto".to_string()),
             tools: tool_specs,
@@ -1456,7 +1454,6 @@ mod tests {
         let req = ChatCompletionRequest {
             model: "test-model".to_string(),
             messages: vec![NativeMessage::user("What is the weather?")],
-            temperature: 0.7,
             max_tokens: Some(32000),
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
