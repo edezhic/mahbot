@@ -174,7 +174,7 @@ impl Drop for Agent {
 }
 
 impl Agent {
-    /// Flush accumulated tool stats to `stats.db`, then persist the final
+    /// Flush accumulated tool stats to the logs store, then persist the final
     /// assistant message via `session.finalize(&self.agent_id)`. Flush failures are logged
     /// but do not abort finalization.
     pub async fn finalize_session(&mut self) -> anyhow::Result<()> {
@@ -184,7 +184,8 @@ impl Agent {
             std::mem::take(&mut *guard)
         };
         if !stats.is_empty()
-            && let Err(e) = crate::stats::store()
+            && let Some(store) = crate::logs::LOG_STORE.get()
+            && let Err(e) = store
                 .flush_batch(
                     &self.agent_id,
                     self.role.as_str(),

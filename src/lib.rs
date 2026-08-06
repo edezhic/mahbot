@@ -711,12 +711,12 @@ pub enum Role {
 
 // ── Agent ───────────────────────────────────────────────────────
 
-/// A single tool call record, stored per-call in the stats database.
+/// A single tool call record, stored per-call in the logs database.
 ///
 /// Each tool invocation produces one record with its full serialized
 /// arguments, execution duration, and success/failure outcome.
 /// Records are accumulated in-memory in the agent and flushed to
-/// `stats.db` on session finalization.
+/// the logs store on session finalization.
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCallRecord {
     /// The tool's name.
@@ -756,7 +756,7 @@ pub struct Agent {
     /// safe deregistration. 0 means not registered (e.g. test agents).
     generation: u64,
     /// Per-call tool stats accumulated during this agent's work loop.
-    /// Flushed to `stats.db` on [`Agent::finalize_session`]; silently
+    /// Flushed to the logs store on [`Agent::finalize_session`]; silently
     /// lost if the agent is dropped without finalization.
     tool_stats: std::sync::Mutex<Vec<crate::ToolCallRecord>>,
     /// The user who triggered this agent run — used by tools (e.g. AskTool)

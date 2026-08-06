@@ -233,7 +233,10 @@ async fn is_maintainer_pipeline_full(ws: &Workspace) -> bool {
 /// - If `create_ticket` was called → reset to 1.
 /// - If no `create_ticket` calls → double (clamped to `[5, Workspace::MAX_MAINTAINER_DEBOUNCE_MINS]`, capped at `Workspace::MAX_MAINTAINER_DEBOUNCE_MINS`).
 async fn compute_debounce(agent_id: &str, current: i64, ws_name: &str) -> i64 {
-    let store = crate::stats::store();
+    // Fail-open: no logs store (test contexts) advances the debounce.
+    let Some(store) = crate::logs::LOG_STORE.get() else {
+        return advance_debounce(current);
+    };
 
     match store.query_tool_usage(agent_id, "create_ticket").await {
         Ok(call_count) if call_count > 0 => {

@@ -304,9 +304,9 @@ mod tests {
         assert_eq!(s.tshm.unwrap().max_frame, 356);
 
         // Active write on a healthy store: max_frame > 0, wal non-empty → not orphaned.
-        write(&dir.join("db/stats.db-tshm"), &tshm_bytes(120, 0, 3));
-        write(&dir.join("db/stats.db-wal"), &[0u8; 4096]);
-        let s = inspect_store(&dir, "stats");
+        write(&dir.join("db/users.db-tshm"), &tshm_bytes(120, 0, 3));
+        write(&dir.join("db/users.db-wal"), &[0u8; 4096]);
+        let s = inspect_store(&dir, "users");
         assert!(!s.orphaned_wal);
 
         let _ = std::fs::remove_dir_all(&dir);

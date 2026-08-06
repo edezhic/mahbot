@@ -1,61 +1,18 @@
-//! Per-agent tool call statistics stored in `stats.db`.
+//! Per-agent tool call statistics, consolidated into the logs database.
 //!
 //! Each tool invocation is recorded as an individual row with its full
 //! serialized arguments, execution duration, and success/failure outcome.
 //! Stats accumulate in-memory in each [`crate::Agent`] via a
-//! `std::sync::Mutex<Vec<ToolCallRecord>>` and are flushed to
-//! the database on session finalization via [`StatsStore::flush_batch`].
+//! `std::sync::Mutex<Vec<ToolCallRecord>>` and are flushed to the logs
+//! store on session finalization via [`crate::logs::LogStore::flush_batch`].
+//!
+//! The `tool_calls` / `retry_failures` tables (and their indexes) are created
+//! by the logs store's schema (`LOGS_SCHEMA` in `logs.rs`), so a logs-store
+//! quarantine recreate also recreates them. Consumers access the tables
+//! through [`crate::logs::LOG_STORE`] with fail-open accessors.
 
 use crate::turso::{self};
 use anyhow::Result;
-
-crate::define_store! {
-    /// Global stats store.
-    pub(crate) static STATS_STORE: StatsStore,
-    db_name = "stats",
-    schema = SCHEMA,
-    expect = "STATS_STORE not initialized — call init_global() first",
-}
-
-const SCHEMA: &str = "\
-CREATE TABLE IF NOT EXISTS tool_calls (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id       TEXT NOT NULL,
-    role           TEXT NOT NULL,
-    tool_name      TEXT NOT NULL,
-    arguments      TEXT NOT NULL DEFAULT '{}',
-    duration_ms    INTEGER NOT NULL DEFAULT 0,
-    success        INTEGER NOT NULL DEFAULT 1,
-    error_message  TEXT,
-    workspace      TEXT NOT NULL DEFAULT '',
-    recorded_at    TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_agent_id ON tool_calls(agent_id);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_role ON tool_calls(role);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_name ON tool_calls(tool_name);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_recorded_at ON tool_calls(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_workspace ON tool_calls(workspace);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_error_message ON tool_calls(error_message);
-CREATE TABLE IF NOT EXISTS retry_failures (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    attempt           INTEGER NOT NULL,
-    failure_class     TEXT NOT NULL,
-    error_chain       TEXT NOT NULL,
-    http_version      TEXT,
-    content_length    INTEGER,
-    actual_body_len   INTEGER,
-    content_encoding  TEXT,
-    transfer_encoding TEXT,
-    elapsed_ms        INTEGER NOT NULL,
-    body_head         TEXT NOT NULL DEFAULT '',
-    body_tail         TEXT NOT NULL DEFAULT '',
-    finish_reason     TEXT,
-    completion_tokens INTEGER,
-    retry_after_ms    INTEGER,
-    recorded_at       TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_retry_failures_recorded_at ON retry_failures(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_retry_failures_class ON retry_failures(failure_class);";
 
 // Column definitions for tool_error SELECT queries.
 crate::columns! {
@@ -84,7 +41,7 @@ pub struct ToolErrorEntry {
     pub recorded_at: String,
 }
 
-/// Query filters for [`StatsStore::query_tool_errors`] / [`StatsStore::count_tool_errors`].
+/// Query filters for [`crate::logs::LogStore::query_tool_errors`] / [`crate::logs::LogStore::count_tool_errors`].
 ///
 /// All fields are optional — `None` means no filter is applied.
 #[derive(Debug, Clone, Default)]
@@ -97,11 +54,11 @@ pub struct ToolErrorQuery {
     pub search: Option<String>,
 }
 
-impl StatsStore {
+impl crate::logs::LogStore {
     /// Query the count of tool calls for a given agent and tool.
     ///
     /// Uses `COUNT(*)` which always returns a row.
-    pub async fn query_tool_usage(&self, agent_id: &str, tool_name: &str) -> Result<i64> {
+    pub(crate) async fn query_tool_usage(&self, agent_id: &str, tool_name: &str) -> Result<i64> {
         self.conn
             .query_optional(
                 "SELECT COUNT(*) FROM tool_calls \
@@ -113,43 +70,10 @@ impl StatsStore {
             .map(|opt| opt.unwrap_or(0))
     }
 
-    /// Build a parameterized WHERE clause and params for tool error (failure) queries.
-    ///
-    /// Returns `(where_clause, params)` where `where_clause` does NOT include
-    /// the leading `WHERE` keyword — it is a set of `AND`-joined expressions
-    /// suitable for embedding directly into SQL.  All placeholders use unnamed
-    /// `?` — pass a `Vec<turso::Value>` to bind params positionally (it
-    /// implements [`IntoParams`](crate::turso::IntoParams)).
-    ///
-    /// This is an associated function (no `&self`) so it can be used without
-    /// a store instance if needed.
-    #[must_use]
-    pub fn build_tool_error_filter(query: &ToolErrorQuery) -> (String, Vec<turso::Value>) {
-        let mut clauses = vec!["error_message IS NOT NULL".to_string()];
-        let mut params = Vec::new();
-
-        if let Some(ref role) = query.role_filter {
-            params.push(turso::Value::Text(role.clone()));
-            clauses.push("role = ?".to_string());
-        }
-
-        if let Some(ref workspace) = query.workspace_filter {
-            params.push(turso::Value::Text(workspace.clone()));
-            clauses.push("workspace = ?".to_string());
-        }
-
-        if let Some(ref search) = query.search {
-            params.push(turso::Value::Text(format!("%{search}%")));
-            clauses.push("error_message LIKE ?".to_string());
-        }
-
-        (clauses.join(" AND "), params)
-    }
-
     /// Count the total number of tool call error rows matching the optional
     /// query filters.
-    pub async fn count_tool_errors(&self, query: &ToolErrorQuery) -> Result<usize> {
-        let (where_clause, params) = Self::build_tool_error_filter(query);
+    pub(crate) async fn count_tool_errors(&self, query: &ToolErrorQuery) -> Result<usize> {
+        let (where_clause, params) = build_tool_error_filter(query);
         let sql = format!("SELECT COUNT(*) FROM tool_calls WHERE {where_clause}");
         self.conn
             .query_optional(&sql, params, |row| row.get::<i64>(0))
@@ -165,7 +89,7 @@ impl StatsStore {
     ///
     /// Returns `(entries, total_count)` where each entry corresponds to a
     /// single failed tool call (error_message IS NOT NULL).
-    pub async fn query_tool_errors(
+    pub(crate) async fn query_tool_errors(
         &self,
         query: &ToolErrorQuery,
         limit: usize,
@@ -176,7 +100,7 @@ impl StatsStore {
             return Ok((vec![], 0));
         }
 
-        let (where_clause, filter_params) = Self::build_tool_error_filter(query);
+        let (where_clause, filter_params) = build_tool_error_filter(query);
         let limit_val = i64::try_from(limit)
             .expect("query_tool_errors limit overflowed i64; limit must be <= i64::MAX");
         let offset_val = i64::try_from(offset)
@@ -214,7 +138,7 @@ impl StatsStore {
     }
 
     /// Write a batch of per-call tool records for a single agent flush.
-    pub async fn flush_batch(
+    pub(crate) async fn flush_batch(
         &self,
         agent_id: &str,
         role: &str,
@@ -254,7 +178,10 @@ impl StatsStore {
     /// dedicated `retry_failures` table. Called from [`crate::retry`]'s outer
     /// loops — never fails the calling operation (callers treat errors as
     /// best-effort).
-    pub async fn record_retry_failure(&self, rec: &crate::retry::RetryFailureRecord) -> Result<()> {
+    pub(crate) async fn record_retry_failure(
+        &self,
+        rec: &crate::retry::RetryFailureRecord,
+    ) -> Result<()> {
         self.conn
             .execute(
                 "INSERT INTO retry_failures \
@@ -285,6 +212,36 @@ impl StatsStore {
     }
 }
 
+/// Build a parameterized WHERE clause and params for tool error (failure) queries.
+///
+/// Returns `(where_clause, params)` where `where_clause` does NOT include
+/// the leading `WHERE` keyword — it is a set of `AND`-joined expressions
+/// suitable for embedding directly into SQL.  All placeholders use unnamed
+/// `?` — pass a `Vec<turso::Value>` to bind params positionally (it
+/// implements [`IntoParams`](crate::turso::IntoParams)).
+#[must_use]
+fn build_tool_error_filter(query: &ToolErrorQuery) -> (String, Vec<turso::Value>) {
+    let mut clauses = vec!["error_message IS NOT NULL".to_string()];
+    let mut params = Vec::new();
+
+    if let Some(ref role) = query.role_filter {
+        params.push(turso::Value::Text(role.clone()));
+        clauses.push("role = ?".to_string());
+    }
+
+    if let Some(ref workspace) = query.workspace_filter {
+        params.push(turso::Value::Text(workspace.clone()));
+        clauses.push("workspace = ?".to_string());
+    }
+
+    if let Some(ref search) = query.search {
+        params.push(turso::Value::Text(format!("%{search}%")));
+        clauses.push("error_message LIKE ?".to_string());
+    }
+
+    (clauses.join(" AND "), params)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,7 +249,7 @@ mod tests {
     /// All 8 combinations of optional filters in [`ToolErrorQuery`].
     ///
     /// Each case verifies the exact SQL clause string and param values produced
-    /// by [`StatsStore::build_tool_error_filter`].
+    /// by [`build_tool_error_filter`].
     #[allow(clippy::too_many_lines)]
     #[test]
     fn build_tool_error_filter_all_combinations() {
@@ -396,7 +353,7 @@ mod tests {
         ];
 
         for case in &cases {
-            let (clause, params) = StatsStore::build_tool_error_filter(&case.query);
+            let (clause, params) = build_tool_error_filter(&case.query);
             assert_eq!(clause, case.expected_clause, "case: {}", case.name);
             assert_eq!(params, case.expected_params, "case: {}", case.name);
         }
@@ -404,10 +361,11 @@ mod tests {
 
     /// Integration test: write per-call records via flush_batch, then verify
     /// they can be read back via query_tool_usage and query_tool_errors.
+    /// Uses the logs store (the consolidated home of the stats tables).
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn flush_and_query_round_trip() {
-        let (store, _tmp) = crate::open_test_store!(StatsStore, "stats");
+        let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
 
         let records = vec![
             crate::ToolCallRecord {
@@ -549,7 +507,7 @@ mod tests {
     /// and the parameterized insert are valid against a real store.
     #[tokio::test]
     async fn record_retry_failure_round_trip() {
-        let (store, _tmp) = crate::open_test_store!(StatsStore, "stats");
+        let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
         let rec = crate::retry::RetryFailureRecord::with_metadata(
             3,
             crate::retry::FailureClass::TruncatedEnvelope,

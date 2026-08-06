@@ -1,4 +1,4 @@
-//! Tool Failures dashboard page — browse flattened tool call errors from stats.db.
+//! Tool Failures dashboard page — browse flattened tool call errors from the logs store.
 //!
 //! Two-line row layout with role badges and HH:MM:SS timestamps, matching the
 //! Logs page style. Filter bar is shared with the Logs page via [`super::logs`].
@@ -53,7 +53,7 @@ impl ToolFailuresState {
         }
     }
 
-    /// Request a refresh from the stats store.
+    /// Request a refresh from the logs store.
     ///
     /// Delegates to `AsyncLoadState::start_loading`.
     pub fn refresh(
@@ -68,7 +68,10 @@ impl ToolFailuresState {
         let page_size = self.pagination.page_size;
         Task::perform(
             async move {
-                let store = crate::stats::store();
+                // Fail-open: no logs store → empty result, not a panic.
+                let Some(store) = crate::logs::LOG_STORE.get() else {
+                    return Ok((Vec::new(), 0));
+                };
                 store
                     .query_tool_errors(&query, page_size, page * page_size)
                     .await

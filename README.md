@@ -101,7 +101,7 @@ flowchart TD
 - **Channels** — GUI and Telegram share one message pipeline and channel registry (`src/channels/`, `src/main.rs`).
 - **Agent queue** — user messages, ticket notifications, and async `ask` results are routed through per-agent-ID channels for true instance-level parallelism (`src/message_router.rs`).
 - **Board poller** — `management.rs` claims tickets per workspace and dispatches agents by phase.
-- **Persistence** — under configurable storage root (`~/.mahbot/`): config, sessions, board, workspaces, users, stats, logs, chat history (`src/turso.rs`, module stores).
+- **Persistence** — under configurable storage root (`~/.mahbot/`): config, sessions, board, workspaces, users, logs, chat history (`src/turso.rs`, module stores; tool-call and retry-failure stats live in the logs store).
 - **Search** — per-workspace `fff-search` index with persistent query boosting; archived tickets use FTS + embeddings (`src/search_engine.rs`, `src/embedder.rs`).
 - **Prompts** — role, tool, discovery, and summarization prompts embedded in the binary (`src/prompt/`, `rust-embed`).
 

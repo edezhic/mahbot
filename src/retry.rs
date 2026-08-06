@@ -46,8 +46,10 @@
 //! # Telemetry
 //!
 //! Every failed attempt produces a [`RetryFailureRecord`] persisted to the
-//! dedicated `retry_failures` table in the stats store (`stats.db`) — the logs
-//! store is not a reliable sink (corrupt since 2026-07-31).
+//! dedicated `retry_failures` table in the logs store (consolidated with the
+//! tool-call stats tables). Persistence is best-effort: the logs store's
+//! quarantine heals corruption only at boot, so mid-run logs corruption fails
+//! consolidated stats writes too.
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -303,7 +305,7 @@ impl FailureClass {
 /// Bytes of the response body head/tail captured on failure (each side).
 pub(crate) const BODY_SNIPPET_BYTES: usize = 200;
 
-/// Per-attempt failure diagnostics, persisted to `stats.db.retry_failures`.
+/// Per-attempt failure diagnostics, persisted to the logs store's `retry_failures` table.
 ///
 /// Captured as close to the HTTP boundary as possible so response metadata
 /// survives stringification into the `anyhow` error trail.
@@ -421,11 +423,12 @@ pub(crate) fn body_head_tail(body: &str) -> (String, String) {
     (head, tail)
 }
 
-/// Persist a failure record to `stats.db.retry_failures` (best-effort).
+/// Persist a failure record to the logs store's `retry_failures` table
+/// (best-effort).
 ///
 /// Never fails the operation — persistence failures are logged at debug.
 pub(crate) async fn record_retry_failure(record: &RetryFailureRecord) {
-    let Some(store) = crate::stats::STATS_STORE.get() else {
+    let Some(store) = crate::logs::LOG_STORE.get() else {
         return;
     };
     if let Err(e) = store.record_retry_failure(record).await {

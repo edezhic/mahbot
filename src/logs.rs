@@ -96,7 +96,48 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
 CREATE INDEX IF NOT EXISTS idx_logs_target ON logs(target);
 CREATE INDEX IF NOT EXISTS idx_logs_agent_role ON logs(agent_role);
 CREATE INDEX IF NOT EXISTS idx_logs_agent_id ON logs(agent_id);
-CREATE INDEX IF NOT EXISTS idx_logs_workspace ON logs(workspace);";
+CREATE INDEX IF NOT EXISTS idx_logs_workspace ON logs(workspace);
+-- Consolidated tool-call / retry-failure stats (formerly stats.db). Both the
+-- normal open path and the quarantine-recreate branch execute this schema, so
+-- a quarantine silently recreates the stats tables too.
+CREATE TABLE IF NOT EXISTS tool_calls (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id       TEXT NOT NULL,
+    role           TEXT NOT NULL,
+    tool_name      TEXT NOT NULL,
+    arguments      TEXT NOT NULL DEFAULT '{}',
+    duration_ms    INTEGER NOT NULL DEFAULT 0,
+    success        INTEGER NOT NULL DEFAULT 1,
+    error_message  TEXT,
+    workspace      TEXT NOT NULL DEFAULT '',
+    recorded_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_agent_id ON tool_calls(agent_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_role ON tool_calls(role);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_name ON tool_calls(tool_name);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_recorded_at ON tool_calls(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_workspace ON tool_calls(workspace);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_error_message ON tool_calls(error_message);
+CREATE TABLE IF NOT EXISTS retry_failures (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    attempt           INTEGER NOT NULL,
+    failure_class     TEXT NOT NULL,
+    error_chain       TEXT NOT NULL,
+    http_version      TEXT,
+    content_length    INTEGER,
+    actual_body_len   INTEGER,
+    content_encoding  TEXT,
+    transfer_encoding TEXT,
+    elapsed_ms        INTEGER NOT NULL,
+    body_head         TEXT NOT NULL DEFAULT '',
+    body_tail         TEXT NOT NULL DEFAULT '',
+    finish_reason     TEXT,
+    completion_tokens INTEGER,
+    retry_after_ms    INTEGER,
+    recorded_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_retry_failures_recorded_at ON retry_failures(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_retry_failures_class ON retry_failures(failure_class);";
 
 impl LogStore {
     /// Open (or create) the log database at `root/db/logs.db`.
@@ -1519,6 +1560,22 @@ mod tests {
             .await
             .expect("fresh store query");
         assert_eq!(total, 0, "fresh store must be empty");
+        // The consolidated stats tables are part of the logs schema — a
+        // quarantine recreate must recreate them too (not silently discard).
+        let stats_tables: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='table' AND name IN ('tool_calls','retry_failures')",
+                params![],
+                |row| row.get::<i64>(0),
+            )
+            .await
+            .expect("count consolidated stats tables");
+        assert_eq!(
+            stats_tables, 2,
+            "consolidated stats tables must exist after quarantine recreate"
+        );
         let quarantined: Vec<_> = std::fs::read_dir(root.join("db"))
             .expect("read db dir")
             .filter_map(std::result::Result::ok)
