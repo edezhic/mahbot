@@ -1546,84 +1546,30 @@ mod tests {
         state
     }
 
-    // ── SendComment: empty rejection ──────────────────────────────
-
-    #[test]
-    fn test_comment_empty_is_noop() {
-        let mut state = make_board_state();
-        // Empty content
-        state.comment_input = text_editor::Content::new();
-        let _task = state.update(BoardMessage::SendComment);
-        assert!(!state.sending_comment);
-        assert!(state.comment_input.text().is_empty());
-
-        // Whitespace-only should also be treated as empty.
-        state.comment_input = text_editor::Content::with_text("   ");
-        let _task = state.update(BoardMessage::SendComment);
-        assert!(!state.sending_comment);
-    }
-
-    // ── SendComment: character limit ──────────────────────────────
+    // ── SendComment: accepted-send smoke ──────────────────────────
 
     #[test]
     fn test_comment_within_limit_clears_input() {
         let mut state = make_board_state();
         state.comment_input = text_editor::Content::with_text("hello world");
         let _task = state.update(BoardMessage::SendComment);
-        // Editor must be cleared on accepted message
+        // Editor must be cleared on accepted message.
         assert!(
             state.comment_input.text().is_empty(),
             "input should be cleared after accepting a within-limit comment"
         );
-    }
-
-    #[test]
-    fn test_comment_at_limit_sends() {
-        let mut state = make_board_state();
-        let text = "a".repeat(MAX_INPUT_CHARS);
-        state.comment_input = text_editor::Content::with_text(&text);
-        let _task = state.update(BoardMessage::SendComment);
-        // Exactly at the limit: should be accepted (editor cleared).
-        assert!(
-            state.comment_input.text().is_empty(),
-            "input should be cleared when comment is exactly at the limit"
-        );
-    }
-
-    #[test]
-    fn test_comment_exceeds_limit_preserves_content() {
-        let mut state = make_board_state();
-        let long_text = "a".repeat(MAX_INPUT_CHARS + 1);
-        state.comment_input = text_editor::Content::with_text(&long_text);
-        let _task = state.update(BoardMessage::SendComment);
-        // Editor content must be preserved — user needs to edit it down.
-        assert_eq!(
-            state.comment_input.text(),
-            long_text,
-            "input must be preserved when comment exceeds character limit"
-        );
-        assert!(
-            !state.sending_comment,
-            "sending_comment should remain false after rejected comment"
-        );
-    }
-
-    // ── SendComment: double-send guard ────────────────────────────
-
-    #[test]
-    fn test_comment_double_send_guard() {
-        let mut state = make_board_state();
-        state.sending_comment = true;
-        state.comment_input = text_editor::Content::with_text("hello");
-        let _task = state.update(BoardMessage::SendComment);
-        // When sending_comment is true, the message should not be processed.
-        assert!(
-            !state.comment_input.text().is_empty(),
-            "input should not be cleared when double-send guard prevents sending"
-        );
+        // Optimistic push + sending_comment are synchronous — no tx dependency.
         assert!(
             state.sending_comment,
-            "sending_comment should remain true when guard was active"
+            "sending_comment should be set after accept"
+        );
+        assert_eq!(
+            state
+                .selected_ticket
+                .as_ref()
+                .map_or(0, |t| t.comments.len()),
+            1,
+            "comment should be optimistically pushed to the selected ticket"
         );
     }
 

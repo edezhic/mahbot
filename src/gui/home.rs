@@ -1618,51 +1618,13 @@ mod tests {
             state.editor_content.text().is_empty(),
             "editor should be cleared after accepting a within-limit message"
         );
-    }
-
-    #[test]
-    fn test_send_message_at_limit_sends() {
-        let mut state = make_home_state("alice", "ws1");
-        let text = "a".repeat(MAX_INPUT_CHARS);
-        state.editor_content = text_editor::Content::with_text(&text);
-        let _task = state.send_message();
-        // Exactly at the limit: message should be accepted (editor cleared).
+        // Assert the optimistic push, not `sending` — GUI_MESSAGE_TX is uninitialized in tests.
         assert!(
-            state.editor_content.text().is_empty(),
-            "editor should be cleared when message is exactly at the limit"
+            state
+                .messages
+                .iter()
+                .any(|m| m.is_optimistic && m.content == "hello world"),
+            "optimistic message should be pushed for accepted non-command text"
         );
-    }
-
-    #[test]
-    fn test_send_message_exceeds_limit_preserves_content() {
-        let mut state = make_home_state("alice", "ws1");
-        let long_text = "a".repeat(MAX_INPUT_CHARS + 1);
-        state.editor_content = text_editor::Content::with_text(&long_text);
-        let _task = state.send_message();
-        // Editor content must be preserved — user needs to edit it down.
-        assert_eq!(
-            state.editor_content.text(),
-            long_text,
-            "editor content must be preserved when message exceeds character limit"
-        );
-        // sending must remain false — the message was not sent.
-        assert!(
-            !state.sending,
-            "sending should remain false after rejected message"
-        );
-    }
-
-    #[test]
-    fn test_send_message_double_send_guard() {
-        let mut state = make_home_state("alice", "ws1");
-        state.sending = true;
-        state.editor_content = text_editor::Content::with_text("hello");
-        let _task = state.send_message();
-        // When sending is true, the message should not be processed at all.
-        assert!(
-            !state.editor_content.text().is_empty(),
-            "editor should not be cleared when double-send guard prevents sending"
-        );
-        assert!(state.sending, "sending should remain true (unchanged)");
     }
 }

@@ -498,6 +498,7 @@ pub(crate) fn send_guard<M: 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     /// Stack with one snapshot of `text` taken before any edit.
     fn stack_with_snapshot(text: &str) -> UndoStack {
@@ -552,5 +553,46 @@ mod tests {
         let snapshot = stack.undo(&modified).unwrap();
         assert_eq!(snapshot.cursor.position.line, 1);
         assert_eq!(snapshot.cursor.position.column, 2);
+    }
+
+    /// Run `send_guard`, recording whether `over_limit` fired (task never run).
+    fn run_guard(
+        text: &str,
+        sending: bool,
+        in_flight_first: bool,
+    ) -> (bool, Result<&str, Task<()>>) {
+        let fired = Cell::new(false);
+        let result = send_guard(text, sending, in_flight_first, |_| {
+            fired.set(true);
+            Task::none()
+        });
+        (fired.get(), result)
+    }
+
+    #[test]
+    fn send_guard_rejects_empty_and_trims() {
+        let (fired, result) = run_guard(" \t ", false, true);
+        assert!(result.is_err() && !fired, "empty input is a silent noop");
+        let (_, result) = run_guard("  hello  ", false, true);
+        assert_eq!(result.unwrap(), "hello");
+    }
+
+    #[test]
+    fn send_guard_limit_boundary() {
+        let at_limit = "a".repeat(MAX_INPUT_CHARS);
+        let (fired, result) = run_guard(&at_limit, false, true);
+        assert!(result.is_ok() && !fired, "at-limit text is accepted");
+        let over_limit = "a".repeat(MAX_INPUT_CHARS + 1);
+        let (fired, result) = run_guard(&over_limit, false, true);
+        assert!(result.is_err() && fired, "over-limit text is rejected");
+    }
+
+    #[test]
+    fn send_guard_combined_in_flight_and_over_limit() {
+        let text = "a".repeat(MAX_INPUT_CHARS + 1);
+        let (fired, result) = run_guard(&text, true, true);
+        assert!(result.is_err() && !fired, "in-flight first: silent noop");
+        let (fired, result) = run_guard(&text, true, false);
+        assert!(result.is_err() && fired, "toast fires over-limit first");
     }
 }
