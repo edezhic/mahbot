@@ -354,8 +354,7 @@ async fn comment_and_transition(ctx: TransitionCtx<'_>, role: &str, text: &str) 
 /// Shared finalizer for post-agent comment-and-transition sites.
 ///
 /// Runs [`comment_and_transition`] and, on success, logs `message` with the
-/// ticket ID and, when given, the `target` phase field — both are parameters
-/// so existing log output is preserved exactly across call sites. On failure
+/// ticket ID and the `target` phase field from `ctx`. On failure
 /// `comment_and_transition` already logs the warning, so nothing more is
 /// emitted here. Must be the caller's final step.
 async fn comment_and_transition_or_bail(
@@ -363,17 +362,13 @@ async fn comment_and_transition_or_bail(
     role: &str,
     text: &str,
     message: &str,
-    target: Option<&TicketPhase>,
 ) {
     let ticket_id = &ctx.ticket.id;
+    let target = ctx.target;
     if !comment_and_transition(ctx, role, text).await {
         return;
     }
-    if let Some(target) = target {
-        info!(ticket = %ticket_id, target = %target, "{message}");
-    } else {
-        info!(ticket = %ticket_id, "{message}");
-    }
+    info!(ticket = %ticket_id, target = %target, "{message}");
 }
 
 /// Resolve a workspace from a ticket's stored `workspace_name`.
@@ -1171,7 +1166,6 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         Role::Engineer.as_str(),
         comment_text,
         "Engineer finished — transitioned ticket",
-        Some(&target_phase),
     )
     .await;
 }
@@ -1739,7 +1733,6 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
             Role::Sanitation.as_str(),
             &comment,
             "Sanitation passed — transitioned to SanitationPassed",
-            None,
         )
         .await;
     } else {
@@ -1997,7 +1990,6 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
         DIAGNOSTICS_ROLE,
         &comment_body,
         "Diagnostics finished — transitioned ticket",
-        Some(&target_phase),
     )
     .await;
 }
