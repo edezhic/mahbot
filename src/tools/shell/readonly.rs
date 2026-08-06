@@ -2891,7 +2891,7 @@ fn check_segment(segment: &str, state: &mut ValidationState, negated: bool) -> R
     let words: Vec<&str> = split_words_keeping_substitutions(trimmed);
     let (verb_idx, verb) = match resolve_verb(&words, negated) {
         VerbResolution::Informational | VerbResolution::None => {
-            apply_env_bindings(trimmed, state, negated)?;
+            apply_env_bindings(&words, state, negated)?;
             return Ok(());
         }
         VerbResolution::Verb {
@@ -2910,7 +2910,7 @@ fn check_segment(segment: &str, state: &mut ValidationState, negated: bool) -> R
                     "write the command name literally (e.g. `cd`, `rm`) so it can be validated.",
                 );
             }
-            apply_env_bindings(trimmed, state, negated)?;
+            apply_env_bindings(&words, state, negated)?;
             return Ok(());
         }
         VerbResolution::Verb {
@@ -2919,7 +2919,7 @@ fn check_segment(segment: &str, state: &mut ValidationState, negated: bool) -> R
         } => (idx, v),
     };
     if matches!(verb, "cd" | "pushd" | "popd") {
-        update_cwd_for_cd(trimmed, state, negated);
+        process_cd_words(&words, verb_idx, verb, state);
         return Ok(());
     }
     if verb == "eval" {
@@ -2940,7 +2940,7 @@ fn check_segment(segment: &str, state: &mut ValidationState, negated: bool) -> R
     // `export X=...`, plain `X=...` segments, and env-prefix forms
     // (`TMPDIR=/tmp cmd`) bind the temp variables; a non-temp binding poisons
     // the variable, a temp-root binding clears the poison.
-    apply_env_bindings(trimmed, state, negated)?;
+    apply_env_bindings(&words, state, negated)?;
 
     // Extract the effective command by stripping shell prefixes and
     // environment variable assignments.
@@ -3023,41 +3023,6 @@ fn check_segment(segment: &str, state: &mut ValidationState, negated: bool) -> R
     }
 
     Ok(())
-}
-
-/// Update the tracked CWD for a `cd`/`pushd`/`popd` segment (decision 7).
-///
-/// A literal absolute `cd` into a temp-root path tracks only when the
-/// directory exists at validation time or was provably created by `mkdir`
-/// earlier in the same command chain: a nonexistent target fails the `cd` at
-/// runtime, leaving the real CWD in place, so tracking it would approve a
-/// chained write that actually lands elsewhere (or escapes a `..` chain past
-/// the temp root when the tracked depth does not match). A literal absolute
-/// `cd` elsewhere tracks only when the directory exists. Every other form —
-/// relative `cd` whose target does not provably resolve to an existing or
-/// created temp dir, `cd ..`, `cd -`, bare `cd`, `cd $VAR`, `cd ~`,
-/// pushd/popd — resets tracking to fail-closed (`None` → relative paths
-/// reject). `cd` option flags (`-P`/`-L`/`--`) are skipped before the target
-/// is resolved; a flag-only form (`cd -P`) targets `$HOME` and an invalid
-/// option (`-e`, `-@`, …) errors at runtime, so both reset fail-closed.
-/// Relative targets are expanded against the tracked state before tracking,
-/// so `$VAR`, `~`, `-` and `$OLDPWD` cannot smuggle a non-temp location past
-/// the guard. The verb is located by [`resolve_verb`], so forwarding
-/// prefixes (`command`/`builtin`, plus `time` as the unquoted first word
-/// outside condition heads), quoted verbs (`"cd"`) and env assignments are
-/// handled before the target is resolved. `negated` (`!` before the
-/// segment) demotes `time` to the external command — a timed `cd` then runs
-/// in a child and must not track.
-fn update_cwd_for_cd(segment: &str, state: &mut ValidationState, negated: bool) {
-    let words: Vec<&str> = split_words_keeping_substitutions(segment);
-    let VerbResolution::Verb {
-        idx: verb_idx,
-        class: VerbClass::Literal(verb),
-    } = resolve_verb(&words, negated)
-    else {
-        return;
-    };
-    process_cd_words(&words, verb_idx, verb, state);
 }
 
 /// Resolve the target of a `cd`/`pushd`/`popd` verb at `cd_idx` (shared by
@@ -3303,14 +3268,14 @@ fn record_mkdir_targets(segment: &str, state: &mut ValidationState) {
 /// GIT_TRACE*, GIT_ASKPASS — all invisible to the subcommand allowlist.
 /// Also fires on non-git commands (`GIT_DIR=/tmp ls`): fail-closed trade-off
 /// closing transitive git invocation (make/cargo inheriting GIT_*).
-fn check_git_env_binding(segment: &str, word: &str) -> Result<(), String> {
+fn check_git_env_binding(word: &str) -> Result<(), String> {
     let w = strip_outer_quotes(word).map_or(word, |(c, _)| c);
     if let Some((name, _)) = w.split_once('=')
         && name.starts_with("GIT_")
         && name != "GIT_PAGER"
     {
         return reject(
-            segment,
+            word,
             &format!(
                 "`{name}` environment bindings are not allowed — git env vars can execute programs (GIT_EXTERNAL_DIFF, GIT_SSH_COMMAND, ...)."
             ),
@@ -3321,17 +3286,16 @@ fn check_git_env_binding(segment: &str, word: &str) -> Result<(), String> {
 }
 
 fn apply_env_bindings(
-    segment: &str,
+    words: &[&str],
     state: &mut ValidationState,
     negated: bool,
 ) -> Result<(), String> {
-    let words = split_words_keeping_substitutions(segment);
     let first_non_assign = words
         .iter()
         .position(|w| !super::is_env_assignment(w))
         .unwrap_or(words.len());
     for w in &words[..first_non_assign] {
-        check_git_env_binding(segment, w)?;
+        check_git_env_binding(w)?;
         bind_assignment_word(w, state);
     }
     // The verb search uses the full word list (not the assignment-stripped
@@ -3341,11 +3305,11 @@ fn apply_env_bindings(
     if let VerbResolution::Verb {
         idx,
         class: VerbClass::Literal(v),
-    } = resolve_verb(&words, negated)
+    } = resolve_verb(words, negated)
         && v == "export"
     {
         for w in &words[idx + 1..] {
-            check_git_env_binding(segment, w)?;
+            check_git_env_binding(w)?;
             bind_assignment_word(w, state);
         }
     }
@@ -3877,7 +3841,7 @@ fn check_git_exec_vectors(trimmed: &str, subcommand: &str) -> Result<(), String>
     // binding layer (which only sees current-shell segments) cannot.
     for w in &words[..git_idx] {
         if super::is_env_assignment(w) {
-            check_git_env_binding(trimmed, w)?;
+            check_git_env_binding(w)?;
         }
     }
     // Global-region flags between `git` and the subcommand. Position-sensitive:
