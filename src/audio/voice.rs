@@ -69,6 +69,13 @@ pub fn run_voice_pipeline_benchmark() {
 /// Target sample rate: 16 kHz mono.
 pub const SAMPLE_RATE: u32 = 16_000;
 
+/// Convert a sample count to milliseconds (truncating integer division —
+/// callers rely on exact threshold semantics).
+#[must_use]
+fn samples_to_ms(len: usize, rate: u32) -> u64 {
+    (len as u64 * 1000) / u64::from(rate)
+}
+
 /// Frame size for mel spectrogram (512 samples = 32ms at 16kHz).
 pub(crate) const FRAME_LENGTH: usize = 512;
 
@@ -512,7 +519,7 @@ pub(crate) fn augment_pcm_variants(
 ) -> Vec<AugmentedPcmVariant> {
     use crate::util::NoiseColor;
     let pre_pad_samples = input.len().saturating_sub(2 * CONTEXT_PADDING_SAMPLES);
-    let pre_pad_ms = (pre_pad_samples as u64 * 1000) / u64::from(sample_rate);
+    let pre_pad_ms = samples_to_ms(pre_pad_samples, sample_rate);
     let mut variants = Vec::with_capacity(12);
     variants.push(AugmentedPcmVariant {
         variant_index: 0,
@@ -3674,7 +3681,7 @@ pub(crate) fn compute_utterance_quality(
     samples: &[f32],
     noise_rms: Option<f32>,
 ) -> UtteranceQuality {
-    let duration_ms = (samples.len() as u64 * 1000) / u64::from(SAMPLE_RATE);
+    let duration_ms = samples_to_ms(samples.len(), SAMPLE_RATE);
 
     // ── Clipping detection ───────────────────────────────────────────
     let clipping_detected = samples
@@ -6477,8 +6484,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
         return;
     }
 
-    // Compute utterance duration before moving `samples` into the closure.
-    let duration_ms = (samples.len() as u64 * 1000) / u64::from(SAMPLE_RATE);
+    let duration_ms = samples_to_ms(samples.len(), SAMPLE_RATE);
 
     // ── Generate deterministic PCM augmented variants ──
     // The original is kept as-is.  All variants are processed in a single
@@ -6506,11 +6512,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     // seeded noise generator.  The helper yields index order 0,1,2?,3..11 —
     // variant 2 (speed-up) is absent when the pre-pad duration gate fails.
     let variants = augment_pcm_variants(&samples, SAMPLE_RATE, noise_seed, AugmentSet::Full);
-    let original = samples.clone();
     let variant_indices: Vec<usize> = variants.iter().map(|v| v.variant_index).collect();
-
-    // Clone for quality computation (use the original for quality check).
-    let samples_for_quality = original.clone();
 
     // Run ONNX inference for ALL variants in a SINGLE spawn_blocking
     let results = tokio::task::spawn_blocking(move || {
@@ -6592,7 +6594,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
 
         // Compute quality on the original samples (quality check is only for
         // the real utterance, not augmented variants).
-        let quality = Some(compute_utterance_quality(&samples_for_quality, noise_rms));
+        let quality = Some(compute_utterance_quality(&samples, noise_rms));
 
         // Push all variant embeddings (dense-only)
         state.enrollment_buffer.extend(old_results);
