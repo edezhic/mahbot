@@ -291,6 +291,167 @@ async fn save_generated_file(
     Ok(output_path)
 }
 
+// ── Async video jobs (video_gen / video_edit) ───────────────────────────
+
+/// Number of polling attempts (10 min timeout = 20 attempts × 30s).
+const MAX_POLL_ATTEMPTS: u32 = 20;
+
+/// Kind-dependent labels for an OpenRouter async-video job.
+///
+/// Fields stay separate so every user-facing string is byte-identical with the
+/// pre-refactor tools (e.g. gen's download context is bare "Video download",
+/// not "Video generation download").
+struct VideoJobLabels {
+    /// "Video generation" / "Video edit" — submission/poll HTTP contexts,
+    /// tracing, "failed" and timeout bails.
+    label: &'static str,
+    /// "generation" / "editing" — the 402 credits bail.
+    gerund: &'static str,
+    /// "Video download" / "Video edit download" — download context + MP4 bail.
+    download: &'static str,
+}
+
+impl VideoJobLabels {
+    const GENERATION: Self = Self {
+        label: "Video generation",
+        gerund: "generation",
+        download: "Video download",
+    };
+    const EDIT: Self = Self {
+        label: "Video edit",
+        gerund: "editing",
+        download: "Video edit download",
+    };
+}
+
+/// Submit an OpenRouter async-video job (exactly one POST — no retry; each
+/// submission is a billable job and the endpoint has no idempotency key),
+/// poll for completion (~10 min timeout), download the result, and validate
+/// it is a real MP4. Returns the video bytes; callers save the file and
+/// format the media marker.
+#[allow(clippy::too_many_lines)]
+async fn fetch_async_video(
+    api_base: &str,
+    body: &serde_json::Value,
+    labels: VideoJobLabels,
+) -> anyhow::Result<Vec<u8>> {
+    // ── Step 1: Submit video job (exactly one POST — no retry) ─────────
+    // Each submission is a billable job; the endpoint has no idempotency key.
+    let submit_url = format!("{api_base}/videos");
+    let submit_body: serde_json::Value = match crate::util::http::post_json_to_provider(
+        &submit_url,
+        body,
+        &format!("{} submission", labels.label),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            if e.downcast_ref::<crate::util::error::HttpError>()
+                .map(|e| e.status)
+                == Some(402)
+            {
+                anyhow::bail!(
+                    "Insufficient OpenRouter credits for video {} (HTTP 402). \
+                     Please add credits to your OpenRouter account and try again.",
+                    labels.gerund,
+                );
+            }
+            return Err(e);
+        }
+    };
+
+    // OpenRouter returns: { id, polling_url, status, ... }
+    let job_id = match submit_body.get("id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            anyhow::bail!("No job ID in submission response: {submit_body}");
+        }
+    };
+
+    let polling_url = match submit_body.get("polling_url").and_then(|v| v.as_str()) {
+        Some(url) => url.to_string(),
+        None => format!("{api_base}/videos/{job_id}"),
+    };
+
+    tracing::info!(%job_id, "{} job submitted", labels.label);
+
+    // ── Step 2: Poll for completion (~10 min timeout) ───────────────────
+    let mut result_url: Option<String> = None;
+
+    for attempt in 1..=MAX_POLL_ATTEMPTS {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+        let poll_body = match crate::util::http::get_json_from_provider(
+            &polling_url,
+            &format!("{} poll", labels.label),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(%job_id, attempt, error = %e, "Poll failed");
+                continue;
+            }
+        };
+
+        let status = poll_body
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        tracing::info!(%job_id, %status, attempt, "{} poll", labels.label);
+
+        if status == "completed" {
+            // Download URL: OpenRouter provides unsigned_urls array or
+            // a content endpoint at /api/v1/videos/{jobId}/content?index=0
+            result_url = poll_body
+                .get("unsigned_urls")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| {
+                    // Fallback: use content endpoint
+                    Some(format!("{api_base}/videos/{job_id}/content?index=0"))
+                });
+            break;
+        }
+
+        if status == "failed" || status == "cancelled" || status == "expired" {
+            let err_msg = poll_body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error");
+            anyhow::bail!("{} failed: {err_msg}", labels.label);
+        }
+    }
+
+    let Some(download_url) = result_url else {
+        anyhow::bail!(
+            "{} did not complete within the 10-minute timeout period",
+            labels.label
+        );
+    };
+
+    // ── Step 3: Download the video ──────────────────────────────────────
+    // The result URL requires the bearer key despite the "unsigned" name.
+    let video_bytes =
+        crate::util::http::get_bytes_from_provider(&download_url, labels.download).await?;
+
+    // Validate the payload is a real MP4 (no Content-Length on the response;
+    // an error page would slip through otherwise).
+    if video_bytes.len() <= 100_000 || &video_bytes[4..8] != b"ftyp" {
+        anyhow::bail!(
+            "{} returned an invalid file ({} bytes, no ftyp header)",
+            labels.download,
+            video_bytes.len(),
+        );
+    }
+
+    Ok(video_bytes)
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]

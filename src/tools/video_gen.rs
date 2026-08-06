@@ -3,9 +3,6 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::path::Path;
 
-/// Number of polling attempts (10 min timeout = 20 attempts × 30s).
-const MAX_POLL_ATTEMPTS: u32 = 20;
-
 /// Tool for generating videos via OpenRouter's async videos API.
 ///
 /// Submits a video generation job, polls for completion, downloads the
@@ -14,7 +11,6 @@ const MAX_POLL_ATTEMPTS: u32 = 20;
 pub struct VideoGenTool;
 
 #[async_trait]
-#[allow(clippy::too_many_lines)]
 impl Tool for VideoGenTool {
     fn name(&self) -> &'static str {
         "video_gen"
@@ -89,7 +85,7 @@ impl Tool for VideoGenTool {
         let endpoint = crate::config::CONFIG.provider_endpoint();
         let api_base = crate::providers::ensure_base_url(&endpoint);
 
-        // ── Step 1: Submit video generation job ─────────────────────────
+        // ── Build the video generation request body ─────────────────────
         let mut body = json!({
             "model": model,
             "prompt": prompt,
@@ -149,105 +145,10 @@ impl Tool for VideoGenTool {
             }
         }
 
-        let videos_url = format!("{api_base}/videos");
-        let submit_body: serde_json::Value = match crate::util::http::post_json_to_provider(
-            &videos_url,
-            &body,
-            "Video generation submission",
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                if e.downcast_ref::<crate::util::error::HttpError>()
-                    .map(|e| e.status)
-                    == Some(402)
-                {
-                    anyhow::bail!(
-                        "Insufficient OpenRouter credits for video generation (HTTP 402). \
-                             Please add credits to your OpenRouter account and try again."
-                    );
-                }
-                return Err(e);
-            }
-        };
-
-        // OpenRouter returns: { id, polling_url, status, ... }
-        let job_id = match submit_body.get("id").and_then(|v| v.as_str()) {
-            Some(id) => id.to_string(),
-            None => {
-                anyhow::bail!("No job ID in submission response: {submit_body}");
-            }
-        };
-
-        let polling_url = match submit_body.get("polling_url").and_then(|v| v.as_str()) {
-            Some(url) => url.to_string(),
-            None => format!("{api_base}/videos/{job_id}"),
-        };
-
-        tracing::info!(%job_id, "Video generation job submitted");
-
-        // ── Step 2: Poll for completion (~10 min timeout) ───────────────
-        let mut result_url: Option<String> = None;
-
-        for attempt in 1..=MAX_POLL_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-
-            let poll_body = match crate::util::http::get_json_from_provider(
-                &polling_url,
-                "Video generation poll",
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::debug!(%job_id, attempt, error = %e, "Poll failed");
-                    continue;
-                }
-            };
-
-            let status = poll_body
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-
-            tracing::info!(%job_id, %status, attempt, "Video generation poll");
-
-            if status == "completed" {
-                // Download URL: OpenRouter provides unsigned_urls array or
-                // a content endpoint at /api/v1/videos/{jobId}/content?index=0
-                result_url = poll_body
-                    .get("unsigned_urls")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .or_else(|| {
-                        // Fallback: use content endpoint
-                        Some(format!("{api_base}/videos/{job_id}/content?index=0"))
-                    });
-                break;
-            }
-
-            if status == "failed" || status == "cancelled" || status == "expired" {
-                let err_msg = poll_body
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown error");
-                anyhow::bail!("Video generation failed: {err_msg}");
-            }
-        }
-
-        let download_url = result_url;
-        let Some(download_url) = download_url else {
-            anyhow::bail!("Video generation did not complete within the 10-minute timeout period");
-        };
-
-        // ── Step 3: Download the video ──────────────────────────────────
         let video_bytes =
-            crate::util::http::get_bytes_from_provider(&download_url, "Video download").await?;
+            super::fetch_async_video(&api_base, &body, super::VideoJobLabels::GENERATION).await?;
 
-        // ── Step 4: Save to workspace/generated/ ────────────────────────
+        // Save to workspace/generated/ and format the media marker.
         let output_path = super::save_generated_file(ws, &video_bytes, "video", "mp4").await?;
 
         let path_str = output_path.to_string_lossy();
