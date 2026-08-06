@@ -4040,6 +4040,28 @@ fn check_git_scoped_flags(trimmed: &str, subcommand: &str, words: &[&str]) -> Re
     Ok(())
 }
 
+/// Reject `--output` on any git subcommand — it writes the command's output
+/// to a file (`--output=<file>` / `--output <file>`; blame/annotate/rev-list
+/// truncate the target to 0 bytes). Runs before
+/// [`check_git_read_only_extensions`], whose read forms (`git stash show
+/// --output=...`) would otherwise bypass it. Exact token (not [`flag_value`]:
+/// git takes dash filenames, `git diff --output -1`); `--output-indicator-*`
+/// do not write. Fail-closed over-rejection: `--output` as a value of
+/// `-S`/`-G`/`-e` (`git log -S --output`) is a literal read-only search.
+fn check_git_output_flag(trimmed: &str, subcommand: &str) -> Result<(), String> {
+    if subcommand.split_whitespace().any(|w| {
+        let w = shell_word(w);
+        w == "--output" || w.starts_with("--output=")
+    }) {
+        return reject(
+            trimmed,
+            "`--output` is not allowed in read-only mode — it writes the git output to a file.",
+            "drop the flag; use a shell redirect like `git diff > /tmp/out` to save output to the OS temp directory.",
+        );
+    }
+    Ok(())
+}
+
 fn check_git_segment(segment: &str) -> Result<(), String> {
     let trimmed = segment.trim();
 
@@ -4054,6 +4076,9 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
     if subcommand.is_empty() || subcommand == "git" {
         return Ok(());
     }
+
+    // `--output` file-write vector — before the extension allowlist (stash read forms bypass it).
+    check_git_output_flag(trimmed, &subcommand)?;
 
     // Phase-3 read-only allowlist rules (stash/config/rebase/push/clean/
     // submodule). These run BEFORE the general safe-list match because the
@@ -4086,7 +4111,7 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
         ));
     }
 
-    // Additional mutation-flag checks for branch/tag/remote/hash-object/reflog
+    // Additional mutation-flag checks for branch/tag/remote/hash-object/reflog/fsck
     match matched_safe {
         Some("branch") => {
             check_git_subcommand_mutation(&subcommand, "branch", GIT_BRANCH_MUTATIONS)?;
@@ -4124,6 +4149,23 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
                     "use `git reflog show` or bare `git reflog` to view reflog entries.",
                 );
             }
+        }
+        // `git fsck --lost-found` writes dangling objects into `.git/lost-found/`.
+        // Git abbreviates unambiguous long options, so any token starting with
+        // `--l` triggers it (no other fsck long option starts with `l`);
+        // `--no-lost-found` (starts with `--n`) disables the write and stays
+        // allowed. shell_word strips quotes/backslashes, closing the
+        // quoted/escaped forms.
+        Some("fsck")
+            if subcommand
+                .split_whitespace()
+                .any(|w| shell_word(w).starts_with("--l")) =>
+        {
+            return reject(
+                trimmed,
+                "`git fsck --lost-found` is not allowed — it writes dangling objects to `.git/lost-found/`.",
+                "drop the flag; dangling objects are still listed on stdout without `--lost-found`.",
+            );
         }
         _ => {}
     }
@@ -4940,6 +4982,26 @@ mod tests {
             ("git reflog show HEAD", true),
             ("git reflog expire --all", false),
             ("git reflog delete HEAD@{0}", false),
+            // fsck: --lost-found writes dangling objects into .git/lost-found/
+            // (git abbreviates long options, so --lost/--l trigger it too;
+            // quotes are stripped by shell_word);
+            // --no-lost-found and the read-only flags stay allowed
+            ("git fsck", true),
+            ("git fsck --strict --full", true),
+            ("git fsck --no-lost-found", true),
+            ("git fsck --lost-found", false),
+            ("git fsck \"--lost-found\"", false),
+            ("git fsck --lost", false),
+            ("git fsck --l", false),
+            // --output file-write vector (diff/log family writes the file;
+            // blame-class truncates the target to 0 bytes; dash values are
+            // valid filenames)
+            ("git diff --output=/tmp/x", false),
+            ("git show --output /tmp/x", false),
+            ("git log -p --output=/tmp/x", false),
+            ("git blame --output=src/lib.rs", false),
+            ("git diff-tree --output=/tmp/x", false),
+            ("git diff --output -1", false),
         ];
 
         run_cases(&cases);
@@ -6560,6 +6622,13 @@ mod tests {
             ("git clean -ndx", true),
             ("git --version 2>&1", true),
             ("git status 2>&1", true),
+            // --output-indicator-* share the --output prefix but do not write
+            ("git diff --output-indicator-new=+", true),
+            ("git diff --output-indicator-old=-", true),
+            (
+                "git diff --output-indicator-new=+ --output-indicator-old=-",
+                true,
+            ),
             // Mutating siblings stay blocked.
             ("git config user.name Egor", false),
             ("git config --global user.name Egor", false),
@@ -6590,6 +6659,9 @@ mod tests {
             ("git stash store 0123abcd \"stash show\"", false),
             ("git stash show --stat stash@{0}", true),
             ("git stash list --oneline", true),
+            // --output writes a file even on read forms (stash show/list)
+            ("git stash show --output=/tmp/x", false),
+            ("git stash list --output=/tmp/x", false),
             ("git submodule foreach", false),
             ("git submodule update", false),
             ("git submodule add https://example.com/repo.git", false),
