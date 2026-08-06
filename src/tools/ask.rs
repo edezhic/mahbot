@@ -10,7 +10,7 @@ use crate::agent::run_agent;
 use crate::config::CONFIG;
 use crate::message_router::{self, AgentJob, JobKind};
 use crate::prompt::{load_prompt, substitute};
-use crate::session::{ask_agent_id, direct_agent_id, manager_agent_id};
+use crate::session::{ask_agent_id, resolve_agent_id};
 use crate::tools::Tool;
 use crate::{ChatMessage, ChatRequest, DEFAULT_MAX_TOKENS, Role, Workspace};
 use anyhow::Result;
@@ -139,13 +139,8 @@ impl Tool for AskTool {
                 let message = build_async_ask_message(run_sub_agent(&ws, role, &ask).await);
 
                 // Route result to the caller's agent channel.
-                // Manager callers route to `manager_{ws_name}`.
-                // Assistant callers route to `{channel}_{user_name}_{ws_name}_assistant`.
-                let target_agent_id = if caller_role == Role::Manager {
-                    manager_agent_id(&ws.name)
-                } else {
-                    direct_agent_id(&channel, &user_name, caller_role.as_str(), &ws.name)
-                };
+                let target_agent_id =
+                    resolve_agent_id(&channel, &user_name, caller_role.as_str(), &ws.name);
                 message_router::route(
                     &target_agent_id,
                     AgentJob {
