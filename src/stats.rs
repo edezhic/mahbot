@@ -210,6 +210,157 @@ impl crate::logs::LogStore {
             .await?;
         Ok(())
     }
+
+    /// Persist one per-operation LLM request stat to the dedicated
+    /// `llm_requests` table. Metadata only — no request inputs/outputs.
+    pub(crate) async fn record_llm_request(&self, rec: &LlmRequestRecord) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO llm_requests \
+                 (recorded_at, purpose, agent_id, role, workspace, ticket_id, model, routing, \
+                  input_tokens, output_tokens, cached_input_tokens, cache_miss_tokens, \
+                  duration_ms, retry_attempts, finish_reason, failure_class, success) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                turso::params![
+                    rec.recorded_at.clone(),
+                    rec.purpose,
+                    rec.agent_id.clone(),
+                    rec.role.clone(),
+                    rec.workspace.clone(),
+                    rec.ticket_id.clone(),
+                    rec.model.clone(),
+                    rec.routing.clone(),
+                    rec.input_tokens.map(i64::try_from).transpose()?,
+                    rec.output_tokens.map(i64::try_from).transpose()?,
+                    rec.cached_input_tokens.map(i64::try_from).transpose()?,
+                    rec.cache_miss_tokens.map(i64::try_from).transpose()?,
+                    i64::try_from(rec.duration_ms)?,
+                    i64::from(rec.retry_attempts),
+                    rec.finish_reason.clone(),
+                    rec.failure_class.clone(),
+                    i64::from(rec.success),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+/// One per-operation LLM request stat row (the `llm_requests` table).
+///
+/// One row per completed LLM operation (agent iteration, extraction,
+/// summarization, consolidation) — retry attempts are aggregated into
+/// [`LlmRequestRecord::retry_attempts`]; per-attempt failure detail lives in
+/// `retry_failures`. Metadata only: no request inputs or outputs.
+#[derive(Debug, Clone)]
+pub(crate) struct LlmRequestRecord {
+    pub purpose: &'static str,
+    pub agent_id: String,
+    pub role: String,
+    pub workspace: String,
+    pub ticket_id: Option<String>,
+    pub model: String,
+    /// Requested provider routing (provider_order); "default" when unset.
+    /// OpenRouter responses do not reveal the serving upstream, so only the
+    /// requested routing can be recorded.
+    pub routing: String,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub cache_miss_tokens: Option<u64>,
+    pub duration_ms: u64,
+    /// Total HTTP attempts made by the operation (1 = no retries).
+    pub retry_attempts: u32,
+    pub finish_reason: Option<String>,
+    pub failure_class: Option<String>,
+    pub success: bool,
+    pub recorded_at: String,
+}
+
+/// Emit one per-operation LLM request stat row (best-effort, fail-open).
+///
+/// Skips when the request carries no metadata (context-free calls — test
+/// doubles, ad-hoc requests) and when the logs store is not yet open.
+pub(crate) async fn record_llm_operation(
+    request: &crate::ChatRequest,
+    duration_ms: u64,
+    attempts: u32,
+    usage: Option<&crate::ProviderUsage>,
+    finish_reason: Option<&str>,
+    failure_class: Option<&'static str>,
+) {
+    let Some(meta) = request.meta.as_ref() else {
+        return;
+    };
+    let rec = LlmRequestRecord {
+        purpose: meta.purpose,
+        agent_id: meta.agent_id.clone(),
+        role: meta.role.clone(),
+        workspace: meta.workspace.clone(),
+        ticket_id: meta.ticket_id.clone(),
+        model: request.model.clone(),
+        routing: request
+            .provider_order
+            .as_deref()
+            .unwrap_or("default")
+            .to_string(),
+        input_tokens: usage.and_then(|u| u.input_tokens),
+        output_tokens: usage.and_then(|u| u.output_tokens),
+        cached_input_tokens: usage.and_then(|u| u.cached_input_tokens),
+        cache_miss_tokens: usage.and_then(|u| u.cache_miss_tokens),
+        duration_ms,
+        retry_attempts: attempts,
+        finish_reason: finish_reason.map(str::to_string),
+        failure_class: failure_class.map(str::to_string),
+        success: failure_class.is_none(),
+        recorded_at: crate::turso::now(),
+    };
+    let Some(store) = crate::logs::LOG_STORE.get() else {
+        return;
+    };
+    if let Err(e) = store.record_llm_request(&rec).await {
+        tracing::debug!(error = %e, "Failed to persist LLM request stat");
+    }
+}
+
+/// Emit a success LLM request stat for a completed operation.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) async fn record_llm_success(
+    request: &crate::ChatRequest,
+    started: std::time::Instant,
+    attempt: u32,
+    response: &crate::ChatResponse,
+) {
+    record_llm_operation(
+        request,
+        started.elapsed().as_millis() as u64,
+        attempt,
+        response.usage.as_ref(),
+        response.finish_reason.as_deref(),
+        None,
+    )
+    .await;
+}
+
+/// Emit a failure LLM request stat for an exhausted operation.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) async fn record_llm_failure(
+    request: &crate::ChatRequest,
+    started: std::time::Instant,
+    exhausted: &crate::retry::RetryExhausted,
+) {
+    record_llm_operation(
+        request,
+        started.elapsed().as_millis() as u64,
+        exhausted.failures.len() as u32,
+        None,
+        exhausted
+            .failures
+            .last()
+            .and_then(|r| r.finish_reason.as_deref()),
+        Some(exhausted.final_class.label()),
+    )
+    .await;
 }
 
 /// Build a parameterized WHERE clause and params for tool error (failure) queries.
@@ -582,6 +733,81 @@ mod tests {
             row.get::<Option<i64>>(13).expect("retry_after"),
             Some(7_500)
         );
+        assert!(rows.next().is_none(), "only one row expected");
+    }
+
+    /// `llm_requests` insert round-trip — verifies the schema (including
+    /// auto-creation on an existing store via LOGS_SCHEMA) and the
+    /// parameterized insert are valid against a real store.
+    #[tokio::test]
+    async fn record_llm_request_round_trip() {
+        let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
+        let rec = LlmRequestRecord {
+            purpose: "agent",
+            agent_id: "gui_alice_ws1_engineer".to_string(),
+            role: "engineer".to_string(),
+            workspace: "ws1".to_string(),
+            ticket_id: Some("42".to_string()),
+            model: "deepseek/deepseek-v4-flash-0731".to_string(),
+            routing: "deepseek".to_string(),
+            input_tokens: Some(1_000),
+            output_tokens: Some(200),
+            cached_input_tokens: Some(600),
+            cache_miss_tokens: Some(400),
+            duration_ms: 1_234,
+            retry_attempts: 2,
+            finish_reason: Some("stop".to_string()),
+            failure_class: None,
+            success: true,
+            recorded_at: crate::turso::now(),
+        };
+
+        store
+            .record_llm_request(&rec)
+            .await
+            .expect("insert llm request");
+
+        let rows = store
+            .conn
+            .query(
+                "SELECT purpose, agent_id, role, workspace, ticket_id, model, routing, \
+                        input_tokens, output_tokens, cached_input_tokens, cache_miss_tokens, \
+                        duration_ms, retry_attempts, finish_reason, failure_class, success \
+                 FROM llm_requests WHERE agent_id = ?1",
+                crate::turso::params!["gui_alice_ws1_engineer"],
+            )
+            .await
+            .expect("query llm request");
+        let mut rows = rows.into_iter();
+        let row = rows.next().expect("row must exist");
+        assert_eq!(row.get::<String>(0).expect("purpose"), "agent");
+        assert_eq!(
+            row.get::<String>(1).expect("agent_id"),
+            "gui_alice_ws1_engineer"
+        );
+        assert_eq!(row.get::<String>(2).expect("role"), "engineer");
+        assert_eq!(row.get::<String>(3).expect("workspace"), "ws1");
+        assert_eq!(
+            row.get::<Option<String>>(4).expect("ticket_id"),
+            Some("42".to_string())
+        );
+        assert_eq!(
+            row.get::<String>(5).expect("model"),
+            "deepseek/deepseek-v4-flash-0731"
+        );
+        assert_eq!(row.get::<String>(6).expect("routing"), "deepseek");
+        assert_eq!(row.get::<Option<i64>>(7).expect("input"), Some(1_000));
+        assert_eq!(row.get::<Option<i64>>(8).expect("output"), Some(200));
+        assert_eq!(row.get::<Option<i64>>(9).expect("cached"), Some(600));
+        assert_eq!(row.get::<Option<i64>>(10).expect("miss"), Some(400));
+        assert_eq!(row.get::<i64>(11).expect("duration"), 1_234);
+        assert_eq!(row.get::<i64>(12).expect("attempts"), 2);
+        assert_eq!(
+            row.get::<Option<String>>(13).expect("finish"),
+            Some("stop".to_string())
+        );
+        assert_eq!(row.get::<Option<String>>(14).expect("failure_class"), None);
+        assert_eq!(row.get::<i64>(15).expect("success"), 1);
         assert!(rows.next().is_none(), "only one row expected");
     }
 }

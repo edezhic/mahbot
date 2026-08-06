@@ -137,7 +137,35 @@ CREATE TABLE IF NOT EXISTS retry_failures (
     recorded_at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_retry_failures_recorded_at ON retry_failures(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_retry_failures_class ON retry_failures(failure_class);";
+CREATE INDEX IF NOT EXISTS idx_retry_failures_class ON retry_failures(failure_class);
+-- Per-operation LLM request stats (all purposes: agent runs, verdict
+-- extraction, summarization, consolidation). Metadata only — no request
+-- inputs/outputs are stored. Auto-created on existing databases at next
+-- store open (CREATE TABLE IF NOT EXISTS), including quarantine recreation.
+CREATE TABLE IF NOT EXISTS llm_requests (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at         TEXT NOT NULL,
+    purpose             TEXT NOT NULL,
+    agent_id            TEXT NOT NULL DEFAULT '',
+    role                TEXT NOT NULL DEFAULT '',
+    workspace           TEXT NOT NULL DEFAULT '',
+    ticket_id           TEXT,
+    model               TEXT NOT NULL,
+    routing             TEXT NOT NULL DEFAULT '',
+    input_tokens        INTEGER,
+    output_tokens       INTEGER,
+    cached_input_tokens INTEGER,
+    cache_miss_tokens   INTEGER,
+    duration_ms         INTEGER NOT NULL,
+    retry_attempts      INTEGER NOT NULL,
+    finish_reason       TEXT,
+    failure_class       TEXT,
+    success             INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_llm_requests_recorded_at ON llm_requests(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_llm_requests_agent_id ON llm_requests(agent_id);
+CREATE INDEX IF NOT EXISTS idx_llm_requests_model ON llm_requests(model);
+CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);";
 
 impl LogStore {
     /// Open (or create) the log database at `root/db/logs.db`.

@@ -90,7 +90,7 @@ const BASE_ROLE_INFO: RoleInfo = RoleInfo {
     has_discovery: true,
     requires_multimodal: false,
     badge_fg: (0.0, 0.0, 0.0),
-    default_model: "deepseek/deepseek-v4-flash",
+    default_model: "deepseek/deepseek-v4-flash-0731",
     default_reasoning_effort: "xhigh",
     display_label: "",
 };

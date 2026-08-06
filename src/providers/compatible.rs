@@ -142,6 +142,21 @@ struct UsageInfo {
     prompt_tokens: Option<u64>,
     #[serde(default)]
     completion_tokens: Option<u64>,
+    /// OpenRouter-normalized shape: `usage.prompt_tokens_details.cached_tokens`.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+    /// DeepSeek-native shape: `usage.prompt_cache_hit_tokens` /
+    /// `usage.prompt_cache_miss_tokens` (sum equals `prompt_tokens`).
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_cache_miss_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -567,10 +582,33 @@ fn make_provider_tool_call(id: Option<String>, name: String, arguments: &str) ->
     }
 }
 
+/// Normalize provider-reported cache tokens into `(cached, miss)`.
+///
+/// OpenRouter reports only the hit side (`prompt_tokens_details.cached_tokens`;
+/// the miss side is computed as `prompt_tokens − cached`), while DeepSeek
+/// reports both sides natively (`prompt_cache_hit_tokens` /
+/// `prompt_cache_miss_tokens`). Native miss wins; otherwise the computed
+/// miss is used when both operands are known.
+#[must_use]
+fn normalize_cache_tokens(
+    cached_tokens: Option<u64>,
+    hit_tokens: Option<u64>,
+    miss_tokens: Option<u64>,
+    prompt_tokens: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    let cached = cached_tokens.or(hit_tokens);
+    let miss = miss_tokens.or_else(|| match (cached, prompt_tokens) {
+        (Some(c), Some(p)) => p.checked_sub(c),
+        _ => None,
+    });
+    (cached, miss)
+}
+
 impl OpenAiCompatibleProvider {
     fn parse_native_response(
         message: ResponseMessage,
         usage: Option<ProviderUsage>,
+        finish_reason: Option<String>,
     ) -> ProviderChatResponse {
         let text = message.effective_content_optional();
         let reasoning = Reasoning::from_optional_parts(
@@ -594,31 +632,45 @@ impl OpenAiCompatibleProvider {
             tool_calls,
             usage,
             reasoning,
+            finish_reason,
         }
     }
 
     /// Shared success tail of [`Provider::chat`] and [`Provider::chat_scoped`]:
-    /// usage mapping, first-choice extraction, native-response parsing, and the
-    /// tool-turn debug log. `no_response` builds the error when no choice exists.
+    /// usage mapping (incl. provider-reported cache tokens), first-choice
+    /// extraction, native-response parsing, and the tool-turn debug log.
+    /// `no_response` builds the error when no choice exists.
     fn finalize_response<E>(
         &self,
         model: &str,
         native_response: ApiChatResponse,
         no_response: impl FnOnce() -> E,
     ) -> Result<ProviderChatResponse, E> {
-        let usage = native_response.usage.map(|u| ProviderUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            cached_input_tokens: None,
+        let usage = native_response.usage.map(|u| {
+            let (cached, miss) = normalize_cache_tokens(
+                u.prompt_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.cached_tokens),
+                u.prompt_cache_hit_tokens,
+                u.prompt_cache_miss_tokens,
+                u.prompt_tokens,
+            );
+            ProviderUsage {
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
+                cached_input_tokens: cached,
+                cache_miss_tokens: miss,
+            }
         });
-        let message = native_response
+        let choice = native_response
             .choices
             .into_iter()
             .next()
-            .map(|choice| choice.message)
             .ok_or_else(no_response)?;
+        let finish_reason = choice.finish_reason;
+        let message = choice.message;
 
-        let result = Self::parse_native_response(message, usage);
+        let result = Self::parse_native_response(message, usage, finish_reason);
 
         if !result.tool_calls.is_empty() && result.reasoning.is_none() {
             tracing::debug!(
@@ -663,6 +715,16 @@ impl OpenAiCompatibleProvider {
             .filter(|e| !e.is_empty())
         {
             extra.insert("reasoning_effort".to_string(), serde_json::json!(effort));
+        }
+
+        // JSON object output mode (verdict extraction). Request-level
+        // parameter only — message content is untouched, so provider-side
+        // KV-cache prefix reuse is preserved.
+        if request.response_format_json_object {
+            extra.insert(
+                "response_format".to_string(),
+                serde_json::json!({"type": "json_object"}),
+            );
         }
 
         let payload = ChatCompletionRequest {
@@ -1225,7 +1287,7 @@ mod tests {
             reasoning_details: None,
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message, None);
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message, None, None);
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].id, "call_123");
         assert_eq!(parsed.tool_calls[0].name, "shell");
@@ -1564,6 +1626,38 @@ mod tests {
     }
 
     #[test]
+    fn cache_tokens_normalized_for_both_provider_shapes() {
+        // OpenRouter: only cached_tokens reported — miss is computed.
+        let (cached, miss) = normalize_cache_tokens(Some(90), None, None, Some(150));
+        assert_eq!(cached, Some(90));
+        assert_eq!(miss, Some(60));
+        // DeepSeek: both sides native — no computation needed.
+        let (cached, miss) = normalize_cache_tokens(None, Some(90), Some(60), Some(150));
+        assert_eq!(cached, Some(90));
+        assert_eq!(miss, Some(60));
+        // Unknown prompt total — miss stays unknown.
+        let (cached, miss) = normalize_cache_tokens(Some(90), None, None, None);
+        assert_eq!(cached, Some(90));
+        assert_eq!(miss, None);
+    }
+
+    #[test]
+    fn api_response_parses_cached_tokens() {
+        // OpenRouter-shaped usage with prompt_tokens_details.cached_tokens.
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 150,
+                "completion_tokens": 60,
+                "prompt_tokens_details": {"cached_tokens": 90}
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.prompt_tokens_details.unwrap().cached_tokens, Some(90));
+    }
+
+    #[test]
     fn api_response_parses_without_usage() {
         let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
@@ -1594,7 +1688,7 @@ mod tests {
             }]),
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message, None);
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message, None, None);
         let rc = parsed
             .reasoning
             .as_ref()
@@ -1614,7 +1708,7 @@ mod tests {
             tool_calls: None,
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message, None);
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message, None, None);
         assert!(parsed.reasoning.is_none());
         assert_eq!(parsed.text.as_deref(), Some("hello"));
     }

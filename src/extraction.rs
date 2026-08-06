@@ -47,6 +47,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
     validate: Option<&ExtractionValidator<T>>,
 ) -> Result<T, crate::retry::RetryExhausted> {
     let mut extraction_history = history.to_vec();
+    let operation_started = Instant::now();
 
     // Only push the extraction prompt if non-empty — caller may have embedded it
     if !extraction_prompt.is_empty() {
@@ -60,17 +61,20 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
 
     for attempt in 1..=policy.max_attempts {
         if loop_state.expired() {
-            return Err(crate::retry::RetryExhausted::with_last_raw(
+            let exhausted = crate::retry::RetryExhausted::with_last_raw(
                 loop_state.into_failures(),
                 FailureClass::WallClockExceeded,
                 last_raw,
-            ));
+            );
+            crate::stats::record_llm_failure(params, operation_started, &exhausted).await;
+            return Err(exhausted);
         }
 
         let attempt_started = Instant::now();
         let request = ChatRequest {
             messages: extraction_history.clone(),
             allow_image_parts: false, // extractions never need image parts
+            response_format_json_object: true,
             ..params.clone()
         };
 
@@ -94,6 +98,13 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                                     format!("extracted value rejected by validation: {msg}"),
                                 )
                             } else {
+                                crate::stats::record_llm_success(
+                                    params,
+                                    operation_started,
+                                    attempt,
+                                    &response,
+                                )
+                                .await;
                                 return Ok(result);
                             }
                         }
@@ -136,32 +147,38 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                 let non_retryable = !scoped_err.class.is_retryable();
                 loop_state.record(attempt, scoped_err.record).await;
                 if non_retryable {
-                    return Err(crate::retry::RetryExhausted::with_last_raw(
+                    let exhausted = crate::retry::RetryExhausted::with_last_raw(
                         loop_state.into_failures(),
                         scoped_err.class,
                         last_raw,
-                    ));
+                    );
+                    crate::stats::record_llm_failure(params, operation_started, &exhausted).await;
+                    return Err(exhausted);
                 }
             }
         }
 
         if let Err(class) = loop_state.sleep_between(attempt).await {
-            return Err(crate::retry::RetryExhausted::with_last_raw(
+            let exhausted = crate::retry::RetryExhausted::with_last_raw(
                 loop_state.into_failures(),
                 class,
                 last_raw,
-            ));
+            );
+            crate::stats::record_llm_failure(params, operation_started, &exhausted).await;
+            return Err(exhausted);
         }
     }
 
     // Exhausted — report the last failure's class so operators see e.g.
     // out-of-range-score (never a garbage pass) rather than a generic class.
     let final_class = loop_state.final_class();
-    Err(crate::retry::RetryExhausted::with_last_raw(
+    let exhausted = crate::retry::RetryExhausted::with_last_raw(
         loop_state.into_failures(),
         final_class,
         last_raw,
-    ))
+    );
+    crate::stats::record_llm_failure(params, operation_started, &exhausted).await;
+    Err(exhausted)
 }
 
 #[cfg(test)]
@@ -197,6 +214,8 @@ mod tests {
             reasoning_effort: None,
             provider_order: None,
             provider_allow_fallbacks: None,
+            response_format_json_object: false,
+            meta: None,
         }
     }
 
@@ -373,6 +392,14 @@ mod tests {
 
         let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
         assert_eq!(fingerprints.len(), 3);
+        // Every extraction request must request JSON object output mode —
+        // request-level parameter, present on all attempts.
+        assert!(
+            fingerprints
+                .iter()
+                .all(|f| f.contains("response_format_json_object: true")),
+            "extraction requests must carry json_object mode"
+        );
         // Attempt 1 → 2: transport retry — byte-identical (no re-prompt).
         assert_eq!(
             fingerprints[0], fingerprints[1],

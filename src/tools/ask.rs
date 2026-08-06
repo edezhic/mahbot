@@ -221,7 +221,7 @@ async fn run_parallel_analysts_and_consolidate(ws: &Workspace, ask: &str) -> Res
     const PARALLEL_ANALYST_COUNT: usize = 3;
 
     let responses = run_parallel_analysts(ws, ask, PARALLEL_ANALYST_COUNT).await;
-    consolidate_analyst_responses(ask, responses).await
+    consolidate_analyst_responses(ws, ask, responses).await
 }
 
 /// Run `count` parallel analyst agents, returning their responses.
@@ -289,6 +289,7 @@ fn format_analyst_reports_markdown(escaped: &[String]) -> String {
 /// an error — findings are never lost. The result is free-form text consumed
 /// only by LLMs; nothing parses it.
 async fn consolidate_analyst_responses(
+    ws: &Workspace,
     ask: &str,
     responses: Vec<Option<String>>,
 ) -> Result<String> {
@@ -342,6 +343,14 @@ async fn consolidate_analyst_responses(
                 reasoning_effort: Some("xhigh".to_owned()),
                 provider_order: routing.provider_order,
                 provider_allow_fallbacks: routing.allow_fallbacks,
+                response_format_json_object: false,
+                meta: Some(crate::ChatRequestMeta {
+                    purpose: "consolidate",
+                    agent_id: format!("ask_{}_consolidation", ws.name),
+                    role: Role::Analyst.as_str().to_string(),
+                    workspace: ws.name.clone(),
+                    ticket_id: None,
+                }),
             };
 
             // Hardened outer retry loop: the
@@ -493,7 +502,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_consolidate_zero_responses_returns_error() {
-        let result = consolidate_analyst_responses("test question", vec![None, None, None]).await;
+        let ws = test_ws("/tmp/test_ws");
+        let result =
+            consolidate_analyst_responses(&ws, "test question", vec![None, None, None]).await;
         assert!(result.is_err(), "0 responses should error");
         assert!(
             result
@@ -506,7 +517,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_consolidate_one_response_returned_directly() {
+        let ws = test_ws("/tmp/test_ws");
         let result = consolidate_analyst_responses(
+            &ws,
             "test question",
             vec![Some("only answer".to_string()), None, None],
         )
@@ -522,7 +535,9 @@ mod tests {
     #[tokio::test]
     async fn test_consolidate_empty_responses_filtered() {
         // Empty/whitespace-only strings should be filtered the same as None
+        let ws = test_ws("/tmp/test_ws");
         let result = consolidate_analyst_responses(
+            &ws,
             "test question",
             vec![
                 Some("valid".to_string()),
@@ -552,7 +567,8 @@ mod tests {
     ) -> anyhow::Result<String> {
         let provider: Arc<dyn crate::Provider> = Arc::new(fake);
         let _guard = install_fake_provider(provider);
-        consolidate_analyst_responses("test question", responses).await
+        let ws = test_ws("/tmp/test_ws");
+        consolidate_analyst_responses(&ws, "test question", responses).await
     }
 
     #[tokio::test]

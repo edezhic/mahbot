@@ -1242,6 +1242,9 @@ pub(crate) struct ProviderUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
+    /// Prompt tokens not served from cache (prompt_tokens − cached when the
+    /// provider reports only the hit side).
+    pub cache_miss_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1250,6 +1253,8 @@ pub(crate) struct ChatResponse {
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<ProviderUsage>,
     pub reasoning: Option<Reasoning>,
+    /// `choices[0].finish_reason` from the provider envelope (stop/length/tool_calls/…).
+    pub finish_reason: Option<String>,
 }
 
 impl ChatResponse {
@@ -1268,6 +1273,20 @@ pub(crate) const DEFAULT_MAX_TOKENS: u32 = 32_000;
 
 /// Dimensionality of the per-frame embedding vectors (96-dim).
 pub(crate) const EMBEDDING_DIM: usize = 96;
+
+/// Operation metadata for per-request LLM stats logging (`llm_requests` table
+/// in logs.db). Attached by call sites with agent/ticket context; requests
+/// without metadata (test doubles, ad-hoc calls) are not logged.
+#[derive(Debug, Clone)]
+pub(crate) struct ChatRequestMeta {
+    /// Purpose tag: "agent" (agent loop incl. direct chat / discovery /
+    /// sub-agents / maintainer), "extraction", "summarize", "consolidate".
+    pub purpose: &'static str,
+    pub agent_id: String,
+    pub role: String,
+    pub workspace: String,
+    pub ticket_id: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ChatRequest {
@@ -1290,6 +1309,13 @@ pub(crate) struct ChatRequest {
     /// Provider routing: allow fallbacks when provider_order is set.
     /// When `None` (and provider_order is set), defaults to `false`.
     pub provider_allow_fallbacks: Option<bool>,
+    /// Request `response_format: {"type": "json_object"}` from the provider.
+    /// Request-level parameter — does not alter message content, so KV-cache
+    /// prefix reuse is preserved. Used by verdict extraction (guaranteed-valid
+    /// JSON output); the parse/repair/retry loop remains as defense-in-depth.
+    pub response_format_json_object: bool,
+    /// Optional operation metadata for per-request LLM stats logging.
+    pub meta: Option<ChatRequestMeta>,
 }
 
 /// Validator callback for scoped structured extraction: rejects

@@ -658,10 +658,13 @@ async fn retry_chat_with(
     is_success: impl Fn(&ChatResponse) -> bool + Send,
 ) -> Result<ChatResponse, RetryExhausted> {
     let mut loop_state = RetryLoop::new(policy);
+    let operation_started = Instant::now();
 
     for attempt in 1..=policy.max_attempts {
         if loop_state.expired() {
-            return Err(RetryExhausted::wall_clock(loop_state.into_failures()));
+            let exhausted = RetryExhausted::wall_clock(loop_state.into_failures());
+            crate::stats::record_llm_failure(&request, operation_started, &exhausted).await;
+            return Err(exhausted);
         }
 
         let attempt_started = Instant::now();
@@ -674,6 +677,8 @@ async fn retry_chat_with(
         {
             Ok(resp) => {
                 if is_success(&resp) {
+                    crate::stats::record_llm_success(&request, operation_started, attempt, &resp)
+                        .await;
                     return Ok(resp);
                 }
                 let elapsed = attempt_started.elapsed().as_millis() as u64;
@@ -690,19 +695,25 @@ async fn retry_chat_with(
                 let non_retryable = !err.class.is_retryable();
                 loop_state.record(attempt, err.record).await;
                 if non_retryable {
-                    return Err(RetryExhausted::new(loop_state.into_failures(), err.class));
+                    let exhausted = RetryExhausted::new(loop_state.into_failures(), err.class);
+                    crate::stats::record_llm_failure(&request, operation_started, &exhausted).await;
+                    return Err(exhausted);
                 }
             }
         }
 
         if let Err(FailureClass::Shutdown) = loop_state.sleep_between(attempt).await {
-            return Err(RetryExhausted::shutdown(loop_state.into_failures()));
+            let exhausted = RetryExhausted::shutdown(loop_state.into_failures());
+            crate::stats::record_llm_failure(&request, operation_started, &exhausted).await;
+            return Err(exhausted);
         }
     }
 
     // Exhausted — report the last failure's class.
     let final_class = loop_state.final_class();
-    Err(RetryExhausted::new(loop_state.into_failures(), final_class))
+    let exhausted = RetryExhausted::new(loop_state.into_failures(), final_class);
+    crate::stats::record_llm_failure(&request, operation_started, &exhausted).await;
+    Err(exhausted)
 }
 
 #[cfg(test)]

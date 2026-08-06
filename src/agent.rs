@@ -540,6 +540,7 @@ impl Agent {
         let request = self.build_chat_request(
             self.session.history().to_vec(),
             self.role.requires_multimodal(),
+            "agent",
         );
 
         let policy = crate::retry::RetryPolicy::current();
@@ -709,6 +710,7 @@ impl Agent {
         &self,
         messages: Vec<ChatMessage>,
         allow_image_parts: bool,
+        purpose: &'static str,
     ) -> ChatRequest {
         let model = crate::config::CONFIG.role_model(self.role);
         let routing = crate::config::CONFIG.model_routing(&model);
@@ -721,6 +723,14 @@ impl Agent {
             reasoning_effort: Some(crate::config::CONFIG.role_reasoning_effort(self.role)),
             provider_order: routing.provider_order,
             provider_allow_fallbacks: routing.allow_fallbacks,
+            response_format_json_object: false,
+            meta: Some(crate::ChatRequestMeta {
+                purpose,
+                agent_id: self.agent_id.clone(),
+                role: self.role.as_str().to_string(),
+                workspace: self.workspace.name.clone(),
+                ticket_id: self.ticket.as_ref().map(|t| t.id.clone()),
+            }),
         }
     }
 
@@ -741,7 +751,7 @@ impl Agent {
         extraction_prompt: &str,
         validate: Option<&crate::ExtractionValidator<T>>,
     ) -> Result<T, crate::retry::RetryExhausted> {
-        let params = self.build_chat_request(vec![], false);
+        let params = self.build_chat_request(vec![], false, "extraction");
         crate::extraction::retry_extract_structured_scoped(
             self.session.history(),
             extraction_prompt,
@@ -759,9 +769,12 @@ impl Agent {
         history.push(crate::ChatMessage::user(self.role.summary_prompt()));
 
         let policy = crate::retry::RetryPolicy::current();
-        let chat_resp = crate::retry::agent_chat(self.build_chat_request(history, false), &policy)
-            .await
-            .with_context(|| "summarization LLM call exhausted retry budget")?;
+        let chat_resp = crate::retry::agent_chat(
+            self.build_chat_request(history, false, "summarize"),
+            &policy,
+        )
+        .await
+        .with_context(|| "summarization LLM call exhausted retry budget")?;
 
         if let Some(ref u) = chat_resp.usage {
             tracing::debug!(

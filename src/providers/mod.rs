@@ -38,6 +38,8 @@ pub(crate) fn test_request(
         reasoning_effort: None,
         provider_order: None,
         provider_allow_fallbacks: None,
+        response_format_json_object: false,
+        meta: None,
     }
 }
 
