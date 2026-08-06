@@ -3909,6 +3909,7 @@ const GIT_EXEC_LONG_FLAGS: &[&str] = &[
     "--filters",
     "--upload-pack",
     "--exec",
+    "--receive-pack",
 ];
 
 /// Subcommands where git resolves exact `--text` to the benign `-a/--text`
@@ -5555,12 +5556,24 @@ mod tests {
             ("git ls-remote --upload-pack /bin/echo origin", false),
             ("git push --dry-run --exec=/bin/echo origin", false), // extension bypass
             ("git stash show --textconv", false),                  // extension bypass
+            (
+                "git push --dry-run --receive-pack=/bin/echo origin main",
+                false,
+            ),
+            (
+                "git push --dry-run --receive-pack /bin/echo origin main",
+                false,
+            ),
             // ── git abbreviated long-option prefixes (--upload-p= == --upload-pack=) ──
             ("git ls-remote --upload-p=/bin/echo origin", false),
             ("git ls-remote --upload-pa /bin/echo origin", false),
             ("git ls-remote --exe=/bin/echo origin", false),
             ("git push --dry-run --exe=/bin/echo origin", false),
             ("git push --dry-run --exe /bin/echo origin", false),
+            (
+                "git push --dry-run --receive-p=/bin/echo origin main",
+                false,
+            ),
             ("git grep --open-files-in-p=/bin/echo pattern", false),
             ("git grep --open-files-in-p /bin/echo pattern", false),
             // defense-in-depth (this git build rejects these spellings itself)
