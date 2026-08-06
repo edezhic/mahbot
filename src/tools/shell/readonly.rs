@@ -3681,14 +3681,74 @@ const GIT_ALWAYS_MUTATE: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// True when the command has a git token: the long flag (`--dry-run`/`--force`)
-/// or a combined short flag containing its char (`clean -ndx`, `push -fn`).
-/// Long flags are excluded so `--name-only`-style tokens don't count.
-fn has_token(command: &str, long: &str, short: char) -> bool {
-    command.split_whitespace().any(|w| {
-        w == long
-            || (w.starts_with('-') && !w.starts_with("--") && w.len() > 1 && w[1..].contains(short))
-    })
+/// Value-aware dry-run/force scan for `git push`/`git clean`. The caller
+/// passes the value-taking options: push `-o`/`--push-option` and `--repo`,
+/// clean `-e`/`--exclude`. A value-taking option consumes dry-run/force-looking
+/// tokens as its value (`git push -o --dry-run`, `git push --repo --dry-run`
+/// are real pushes), so the scan skips those values: attached (`-onope`),
+/// `=`-form (`-o=n`, `--repo=--dry-run`), and the token following a bare
+/// value-taking option, even dash-leading (`-o -n`, `--exclude --dry-run`).
+/// Long dry-run/force tokens match exactly on the raw token — normalizing
+/// would let a quoted value masquerade as a flag (`-o "--dry-run"`) — while
+/// short clusters are scanned on the shell-normalized token (`'-o'` is
+/// value-taking). `-u` is boolean `--set-upstream`, never value-taking
+/// (`-nu`/`-un` stay dry-runs). Long prefixes of the value-taking options are
+/// value-taking too (git abbreviates; ambiguous prefixes fail closed). A
+/// standalone `--` (quote-normalized) ends the scan; a `--` consumed as an
+/// option value does not. Returns `(has_dry_run, has_force)`.
+fn scan_push_clean_tokens(
+    subcommand: &str,
+    value_short: char,
+    value_longs: &[&str],
+) -> (bool, bool) {
+    let words = split_words_keeping_substitutions(subcommand);
+    let mut dry = false;
+    let mut force = false;
+    let mut i = 1; // words[0] is the subcommand name
+    while i < words.len() {
+        let raw = words[i];
+        let wq = shell_word(raw);
+        if wq == "--" {
+            break; // path separator; a consumed `--` never reaches here
+        }
+        if wq.starts_with("--") {
+            if raw == "--dry-run" {
+                dry = true;
+            } else if raw == "--force" {
+                force = true;
+            } else if value_longs
+                .iter()
+                .any(|l| l.starts_with(wq.split('=').next().unwrap_or(&wq)))
+            {
+                // `=`-form carries its value; bare form consumes the next token
+                if !wq.contains('=') {
+                    i += 1;
+                }
+            }
+        } else if wq.starts_with('-') && wq.len() > 1 {
+            let b = wq.as_bytes();
+            let mut k = 1;
+            while k < b.len() {
+                let c = b[k] as char;
+                if c == 'n' {
+                    dry = true;
+                } else if c == 'f' {
+                    force = true;
+                } else if c == value_short {
+                    // rest of token is the attached value; a trailing
+                    // value_short consumes the next token instead
+                    if k + 1 < b.len() {
+                        break;
+                    }
+                    i += 1;
+                    break;
+                }
+                k += 1;
+            }
+        }
+        i += 1;
+    }
+    (dry, force)
 }
 
 /// Phase-3 read-only git allowlist rules (contract decisions 3/4 and the
@@ -3785,8 +3845,14 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
     } else if subcommand.starts_with("push") {
         // git push --dry-run (-n/--dry-run) performs a network read with no
         // local mutation; any force token in the same command blocks it
-        // (decision 3).
-        if has_token(subcommand, "--dry-run", 'n') && !has_token(subcommand, "--force", 'f') {
+        // (decision 3). Value-aware: `-o`/`--push-option` and `--repo`
+        // consume dry-run/force-looking values, so a real push can't
+        // masquerade. (Other push value-takers self-block: `--recurse-
+        // submodules` validates its value, `--signed`/`--force-with-lease`
+        // take optional `=`-only args; `--exec`/`--receive-pack` are closed
+        // by the exec-vector layer.)
+        let (dry, force) = scan_push_clean_tokens(subcommand, 'o', &["--push-option", "--repo"]);
+        if dry && !force {
             Some(Ok(()))
         } else {
             Some(reject(
@@ -3797,8 +3863,10 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
         }
     } else if subcommand.starts_with("clean") {
         // git clean -n/--dry-run previews removals; any force token blocks it
-        // (decision 3).
-        if has_token(subcommand, "--dry-run", 'n') && !has_token(subcommand, "--force", 'f') {
+        // (decision 3). Value-aware: `-e`/`--exclude` consumes
+        // dry-run/force-looking values, so a real clean can't masquerade.
+        let (dry, force) = scan_push_clean_tokens(subcommand, 'e', &["--exclude"]);
+        if dry && !force {
             Some(Ok(()))
         } else {
             Some(reject(
@@ -6741,6 +6809,69 @@ mod tests {
             ("git submodule foreach", false),
             ("git submodule update", false),
             ("git submodule add https://example.com/repo.git", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// Value-aware dry-run/force detection for `git push`/`git clean`: a
+    /// value-taking `-o`/`--push-option` (push) or `-e`/`--exclude` (clean)
+    /// consumes dry-run/force-looking values, so a real mutation can never
+    /// masquerade as a preview.
+    #[test]
+    fn git_push_clean_value_aware_pins() {
+        let cases = [
+            // short attached value
+            ("git push -onope origin main", false),
+            ("git push -o=n origin main", false),
+            ("git clean -e.nope", false),
+            ("git clean -en", false),
+            ("git clean -e=n", false),
+            // short separated value (next token consumed even if dash-leading)
+            ("git push -o -nope origin main", false),
+            ("git push -o --dry-run origin main", false),
+            ("git push -o -nu origin main", false),
+            ("git push -o -fn origin main", false),
+            ("git push -o -n -f origin main", false),
+            ("git clean -e -n", false),
+            ("git clean -e --dry-run", false),
+            // long separated value + unambiguous abbreviations
+            ("git push --push-option --dry-run origin main", false),
+            ("git push --push-opti --dry-run origin main", false),
+            ("git clean --exclude -n", false),
+            ("git clean --excl -n", false),
+            // `--repo` value-taker (positional later wins; verified real push)
+            ("git push --repo --dry-run origin main", false),
+            ("git push --rep --dry-run origin main", false),
+            ("git push --repo=--dry-run origin main", false),
+            // ambiguous long prefix fails closed (value-taking)
+            ("git push --p --dry-run origin main", false),
+            // quoted forms
+            ("git push -o \"x -n\" origin main", false),
+            ("git push -o \"x --dry-run\" origin main", false),
+            ("git push -o \"--dry-run\" origin main", false),
+            ("git push '-o' --dry-run origin main", false),
+            ("git clean '-e' -n", false),
+            // `--` pathspec / separator
+            ("git clean -- -n", false),
+            ("git clean '--' -n", false),
+            // pre-satisfied lock-in
+            ("git push -o nope origin main", false),
+            // documented fail-closed over-rejection: quoted genuine dry-run
+            ("git push '--dry-run' origin main", false),
+            // `git clean --e -n` is covered by the exec-flag layer (`--e` is a
+            // prefix of `--ext-diff`), shadowing the scanner's abbrev rule.
+            ("git clean --e -n", false),
+            // genuine dry-runs stay allowed (value consumed, no force)
+            ("git push --dry-run -onope origin main", true),
+            ("git push -o nope --dry-run origin main", true),
+            ("git push --push-option nope --dry-run origin main", true),
+            ("git push -nu origin main", true),
+            ("git push --dry-run -of origin main", true),
+            ("git push -o -f -n origin main", true),
+            ("git push --repo=origin --dry-run origin main", true),
+            ("git clean -e nope -n", true),
+            ("git clean -e -f -n", true),
         ];
 
         run_cases(&cases);
