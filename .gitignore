@@ -1,3 +1,7 @@
 .DS_Store
 /target
 rust_out
+
+# Tool-owned ephemeral media directories inside workspaces
+generated/
+uploads/

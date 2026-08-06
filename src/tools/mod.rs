@@ -12,6 +12,7 @@ pub(crate) mod search;
 pub(crate) mod search_archived_tickets;
 pub(crate) mod shell;
 pub(crate) mod ticket;
+pub(crate) mod upload_bridge;
 pub(crate) mod video_edit;
 pub(crate) mod video_gen;
 pub(crate) mod web_search;

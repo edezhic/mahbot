@@ -738,6 +738,33 @@ fn test_parse_attachment_metadata() {
     assert_eq!(att.kind, IncomingAttachmentKind::Audio);
     assert_eq!(att.file_id, "v");
     assert!(att.file_name.is_none());
+    // Video message
+    let att = TelegramChannel::parse_attachment_metadata(&serde_json::json!({
+        "video": {"file_id": "vid", "file_name": "clip.mp4", "file_size": 12345, "mime_type": "video/mp4", "duration": 4}
+    }))
+    .unwrap();
+    assert_eq!(att.kind, IncomingAttachmentKind::Video);
+    assert_eq!(att.file_id, "vid");
+    assert_eq!(att.file_name.as_deref(), Some("clip.mp4"));
+    assert_eq!(att.file_size, Some(12345));
+    assert_eq!(att.mime_type.as_deref(), Some("video/mp4"));
+    // Video note (no file_name/mime_type)
+    let att = TelegramChannel::parse_attachment_metadata(
+        &serde_json::json!({"video_note": {"file_id": "vn", "duration": 3, "file_size": 999}}),
+    )
+    .unwrap();
+    assert_eq!(att.kind, IncomingAttachmentKind::Video);
+    assert_eq!(att.file_id, "vn");
+    assert!(att.file_name.is_none());
+    assert!(att.mime_type.is_none());
+    // Animation (GIF)
+    let att = TelegramChannel::parse_attachment_metadata(&serde_json::json!({
+        "animation": {"file_id": "anim", "file_name": "sticker.gif", "mime_type": "video/mp4"}
+    }))
+    .unwrap();
+    assert_eq!(att.kind, IncomingAttachmentKind::Video);
+    assert_eq!(att.file_id, "anim");
+    assert_eq!(att.file_name.as_deref(), Some("sticker.gif"));
     // Audio message
     let att = TelegramChannel::parse_attachment_metadata(
         &serde_json::json!({"audio": {"file_id": "a", "file_name": "song.mp3", "file_size": 999}}),
@@ -759,6 +786,7 @@ fn test_parse_attachment_metadata() {
 // ── Attachment content format tests ──────────────────────────────
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn attachment_content_format_rules() {
     // photo → [IMAGE:]
     let c = format_attachment_content(
@@ -853,6 +881,38 @@ fn attachment_content_format_rules() {
         Some("audio/mpeg"),
     );
     assert_eq!(c, "[AUDIO:/tmp/workspace/song.mp3]");
+    // Video kind produces [VIDEO:] marker
+    let c = format_attachment_content(
+        IncomingAttachmentKind::Video,
+        "clip.mp4",
+        std::path::Path::new("/tmp/workspace/clip.mp4"),
+        None,
+    );
+    assert_eq!(c, "[VIDEO:/tmp/workspace/clip.mp4]");
+    // Document kind + video extension → [VIDEO:] (like image extension routing)
+    let c = format_attachment_content(
+        IncomingAttachmentKind::Document,
+        "clip.mp4",
+        std::path::Path::new("/tmp/workspace/clip.mp4"),
+        None,
+    );
+    assert_eq!(c, "[VIDEO:/tmp/workspace/clip.mp4]");
+    // Document kind + no extension + mime_type "video/mp4" → [VIDEO:] (mime fallback)
+    let c = format_attachment_content(
+        IncomingAttachmentKind::Document,
+        "clip_no_ext",
+        std::path::Path::new("/tmp/workspace/clip_no_ext"),
+        Some("video/mp4"),
+    );
+    assert_eq!(c, "[VIDEO:/tmp/workspace/clip_no_ext]");
+    // Video kind with a non-video extension falls back to [Document:]
+    let c = format_attachment_content(
+        IncomingAttachmentKind::Video,
+        "notes.txt",
+        std::path::Path::new("/tmp/workspace/notes.txt"),
+        None,
+    );
+    assert_eq!(c, "[Document: notes.txt] /tmp/workspace/notes.txt");
 }
 
 #[test]
@@ -872,6 +932,20 @@ fn attachment_multimodal_and_helpers() {
     for p in ["file.md", "file.txt", "file.pdf", "file.csv", "file"] {
         assert!(!is_image_extension(std::path::Path::new(p)));
     }
+    // is_video_extension
+    for p in [
+        "clip.mp4",
+        "clip.mov",
+        "clip.mkv",
+        "clip.avi",
+        "clip.webm",
+        "CLIP.MP4",
+    ] {
+        assert!(crate::util::is_video_extension(std::path::Path::new(p)));
+    }
+    for p in ["file.md", "file.png", "file", "clip.mpg"] {
+        assert!(!crate::util::is_video_extension(std::path::Path::new(p)));
+    }
     // photo with caption
     let content = format!(
         "[IMAGE:{}]\n\nLook at this screenshot",
@@ -880,6 +954,56 @@ fn attachment_multimodal_and_helpers() {
     assert_eq!(
         content,
         "[IMAGE:/tmp/workspace/photo.jpg]\n\nLook at this screenshot"
+    );
+}
+
+#[test]
+fn video_filename_normalization() {
+    // GIF-picker animations: ".gif" file_name, H.264 MP4 bytes → mp4 extension
+    assert_eq!(
+        normalize_video_filename(
+            IncomingAttachmentKind::Video,
+            "tenor.gif",
+            Some("video/mp4")
+        ),
+        "tenor.mp4"
+    );
+    // Recognized video extensions pass through untouched
+    assert_eq!(
+        normalize_video_filename(
+            IncomingAttachmentKind::Video,
+            "clip.webm",
+            Some("video/webm")
+        ),
+        "clip.webm"
+    );
+    // No-extension names gain .mp4
+    assert_eq!(
+        normalize_video_filename(IncomingAttachmentKind::Video, "video_123_45", None),
+        "video_123_45.mp4"
+    );
+    // Documents without a video MIME keep their name
+    assert_eq!(
+        normalize_video_filename(IncomingAttachmentKind::Document, "tenor.gif", None),
+        "tenor.gif"
+    );
+    // Documents with a video MIME and a non-video extension get a video
+    // extension derived from the MIME (webm not mislabeled as mp4)
+    assert_eq!(
+        normalize_video_filename(
+            IncomingAttachmentKind::Document,
+            "clip.xyz",
+            Some("video/mp4")
+        ),
+        "clip.mp4"
+    );
+    assert_eq!(
+        normalize_video_filename(
+            IncomingAttachmentKind::Document,
+            "clip.xyz",
+            Some("video/webm")
+        ),
+        "clip.webm"
     );
 }
 

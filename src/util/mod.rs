@@ -374,6 +374,24 @@ pub(crate) async fn load_reference_image(
     local_image_to_data_uri(path).await
 }
 
+/// Recognized video file extensions (single source of truth for inbound
+/// Telegram routing and the video_edit local-clip guard).
+pub(crate) const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "avi", "webm"];
+
+/// Daemon-owned subdir under the system temp dir where inbound Telegram
+/// attachments are downloaded before enrichment. Enrichment only copies
+/// video clips from here into workspace uploads — the containment root for
+/// the video-edit flow.
+pub(crate) const TELEGRAM_FILES_DIR: &str = "mahbot_telegram_files";
+
+/// Check whether a file path has a recognized video extension.
+#[must_use]
+pub(crate) fn is_video_extension(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
 /// Map a file path's extension to a MIME type string.
 fn mime_for_extension(path: &std::path::Path) -> &'static str {
     match path

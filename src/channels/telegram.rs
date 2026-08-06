@@ -91,11 +91,12 @@ struct IncomingAttachment {
     mime_type: Option<String>,
 }
 
-/// The kind of incoming attachment (document, photo, or audio).
+/// The kind of incoming attachment (document, photo, video, or audio).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IncomingAttachmentKind {
     Document,
     Photo,
+    Video,
     Audio,
 }
 /// Split a message into chunks that respect Telegram's 4096 character limit.
@@ -364,6 +365,9 @@ fn format_sender_label(from: &serde_json::Value) -> String {
 /// multimodal pipeline can validate vision capability.  When the extension
 /// is not recognized the optional `mime_type` is consulted as a secondary
 /// signal (e.g. Document + no extension + "image/jpeg" → still `[IMAGE:]`).
+/// Videos (native `video`/`video_note`/`animation` messages, or documents
+/// with a video MIME/extension) use `[VIDEO:/path]` so enrichment can copy
+/// them into the workspace uploads and route them into the video-edit flow.
 /// Voice and audio messages use `[AUDIO:/path]`. Other attachment types use
 /// `[Document: name] /path`.
 fn format_attachment_content(
@@ -374,9 +378,14 @@ fn format_attachment_content(
 ) -> String {
     let is_image =
         is_image_extension(local_path) || mime_type.is_some_and(|m| m.starts_with("image/"));
+    let is_video = crate::util::is_video_extension(local_path)
+        || mime_type.is_some_and(|m| m.starts_with("video/"));
     match kind {
         IncomingAttachmentKind::Photo | IncomingAttachmentKind::Document if is_image => {
             format!("[IMAGE:{}]", local_path.display())
+        }
+        IncomingAttachmentKind::Video | IncomingAttachmentKind::Document if is_video => {
+            format!("[VIDEO:{}]", local_path.display())
         }
         IncomingAttachmentKind::Audio => {
             format!("[AUDIO:{}]", local_path.display())
@@ -384,6 +393,37 @@ fn format_attachment_content(
         _ => {
             format!("[Document: {}] {}", local_filename, local_path.display())
         }
+    }
+}
+
+/// Normalize a Video-kind or video-MIME attachment's filename to a
+/// recognized video extension. Telegram's GIF picker sends animations as
+/// H.264 MP4 bytes under a ".gif" file_name, which would bounce at
+/// video_edit's extension guard after enrichment copies the clip into
+/// workspace uploads. Documents with a `video/*` MIME get the same
+/// treatment so routing and the guard see the same signal.
+fn normalize_video_filename(
+    kind: IncomingAttachmentKind,
+    filename: &str,
+    mime_type: Option<&str>,
+) -> String {
+    let is_video =
+        kind == IncomingAttachmentKind::Video || mime_type.is_some_and(|m| m.starts_with("video/"));
+    if is_video && !crate::util::is_video_extension(std::path::Path::new(filename)) {
+        let stem = std::path::Path::new(filename)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(filename);
+        // Derive the extension from the declared MIME when available so a
+        // video/webm document isn't mislabeled as mp4.
+        let ext = match mime_type {
+            Some("video/webm") => "webm",
+            Some("video/quicktime") => "mov",
+            _ => "mp4",
+        };
+        format!("{stem}.{ext}")
+    } else {
+        filename.to_string()
     }
 }
 
@@ -401,7 +441,7 @@ fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentK
 
     match extension.as_str() {
         ext if IMAGE_EXTENSIONS.contains(&ext) => Some(TelegramAttachmentKind::Image),
-        "mp4" | "mov" | "mkv" | "avi" | "webm" => Some(TelegramAttachmentKind::Video),
+        ext if crate::util::VIDEO_EXTENSIONS.contains(&ext) => Some(TelegramAttachmentKind::Video),
         "mp3" | "m4a" | "wav" | "flac" => Some(TelegramAttachmentKind::Audio),
         "ogg" | "oga" | "opus" => Some(TelegramAttachmentKind::Voice),
         "pdf" | "txt" | "md" | "csv" | "json" | "zip" | "tar" | "gz" | "doc" | "docx" | "xls"
@@ -1053,8 +1093,9 @@ impl TelegramChannel {
     /// Extract attachment metadata from an incoming Telegram message.
     ///
     /// Handles `document`, `photo` (array — takes last element for highest
-    /// resolution), `audio`, and `voice`.  Both map to [`IncomingAttachmentKind::Audio`]
-    /// since there's no separate variant for each.  Returns `None` for text‑only
+    /// resolution), `video`, `video_note`, `animation`, `audio`, and `voice`.
+    /// Both `audio` and `voice` map to [`IncomingAttachmentKind::Audio`] since
+    /// there's no separate variant for each.  Returns `None` for text‑only
     /// and other unsupported message types.
     fn parse_attachment_metadata(message: &serde_json::Value) -> Option<IncomingAttachment> {
         // Document
@@ -1066,6 +1107,21 @@ impl TelegramChannel {
         if let Some(photos) = message.get("photo").and_then(serde_json::Value::as_array) {
             let best = photos.last()?;
             return Self::build_attachment(best, message, IncomingAttachmentKind::Photo);
+        }
+
+        // Video message
+        if let Some(video) = message.get("video") {
+            return Self::build_attachment(video, message, IncomingAttachmentKind::Video);
+        }
+
+        // Video note (round video — has duration/length, no file_name/mime_type)
+        if let Some(video_note) = message.get("video_note") {
+            return Self::build_attachment(video_note, message, IncomingAttachmentKind::Video);
+        }
+
+        // Animation (GIF-like, usually webm/mp4)
+        if let Some(animation) = message.get("animation") {
+            return Self::build_attachment(animation, message, IncomingAttachmentKind::Video);
         }
 
         // Audio — maps to Audio kind (same variant handles both audio and voice)
@@ -1143,7 +1199,7 @@ impl TelegramChannel {
         let ctx = self.extract_message_context(message).await?;
 
         // Save to system temp directory — cleaned up by enrich_message
-        let save_dir = std::env::temp_dir().join("mahbot_telegram_files");
+        let save_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
         if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
             tracing::warn!("Failed to create telegram_files directory: {e}");
             return None;
@@ -1173,9 +1229,25 @@ impl TelegramChannel {
             let ext = Path::new(&tg_file_path)
                 .extension()
                 .and_then(|e| e.to_str())
-                .unwrap_or("jpg");
-            format!("photo_{}_{}.{ext}", ctx.chat_id, ctx.message_id)
+                .unwrap_or(match attachment.kind {
+                    // video_note has no file_name/mime_type — a ".jpg" default
+                    // would misroute it out of the video flow.
+                    IncomingAttachmentKind::Video => "mp4",
+                    _ => "jpg",
+                });
+            let prefix = match attachment.kind {
+                IncomingAttachmentKind::Photo => "photo",
+                IncomingAttachmentKind::Video => "video",
+                IncomingAttachmentKind::Audio => "audio",
+                IncomingAttachmentKind::Document => "file",
+            };
+            format!("{prefix}_{}_{}.{ext}", ctx.chat_id, ctx.message_id)
         };
+        let local_filename = normalize_video_filename(
+            attachment.kind,
+            &local_filename,
+            attachment.mime_type.as_deref(),
+        );
 
         let local_path = save_dir.join(&local_filename);
         if let Err(e) = tokio::fs::write(&local_path, &file_data).await {

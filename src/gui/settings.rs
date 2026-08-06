@@ -2022,7 +2022,7 @@ impl SettingsState {
                     self.config.video_edit_models.as_deref(),
                     self.config.video_edit_model.as_deref(),
                     self.model_picker_inputs[ModelPickerTarget::VideoEdit.idx()].as_str(),
-                    "model name (e.g. runway/aleph-2)",
+                    "model name (e.g. minimax/hailuo-3)",
                 ),
             ],
         )

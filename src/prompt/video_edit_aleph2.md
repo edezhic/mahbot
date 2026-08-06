@@ -1,0 +1,5 @@
+Edit an existing video clip using runway/aleph-2. Provide the source clip as a public HTTPS URL or a local file path (received video attachments appear in the chat as "[Saved video: /path]" annotations — pass that path) and a text instruction (1–1000 chars) describing the edit to apply. Local clips are uploaded to an anonymous ephemeral file host at job time (lifetime up to 7 days, less on fallback hosts) — let the user know their clip is sent to an anonymous host for processing.
+
+Model constraints (aleph-2): the output mirrors the input clip (source up to 30 seconds, 20 MB cap for clips received via Telegram) with its audio preserved; no duration or resolution parameters; seed is accepted best-effort for reproducibility.
+
+Each invocation bills a paid job (~$0.28 per second of output, $0.56 minimum) and takes ~3–4 minutes to complete. Never retry a timed-out edit — that bills a second job; instead report the timeout to the user. Returns the path to the edited video file — use [VIDEO:path] in your reply to send it to the user.
