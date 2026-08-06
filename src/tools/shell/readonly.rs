@@ -2401,8 +2401,8 @@ const FLAG_CHECKS: &[FlagCheck] = &[
     FlagCheck {
         verb: "base64",
         predicate: has_base64_mutation,
-        rejection: "`base64 -d` with `-o` is not allowed outside temp directories — it writes decoded output to a file.",
-        suggestion: "use `base64 -d` without `-o` to output to stdout, or use `-o /tmp/...` to write to temp.",
+        rejection: "`base64` with `-o`/`--output` is not allowed outside temp directories — it writes output to a file.",
+        suggestion: "use `base64` without `-o` to output to stdout, or use `-o /tmp/...` to write to temp.",
     },
     FlagCheck {
         verb: "wget",
@@ -3761,16 +3761,18 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
         let words: Vec<&str> = subcommand.split_whitespace().collect();
         let rest = &words[1..];
         if rest.iter().any(|w| {
+            let w = shell_word(w);
             matches!(
-                *w,
+                w.as_str(),
                 "--list" | "-l" | "--get" | "--get-all" | "--get-regexp" | "--name-only"
             )
         }) {
             return Some(Ok(()));
         }
         if rest.iter().any(|w| {
+            let w = shell_word(w);
             matches!(
-                *w,
+                w.as_str(),
                 "--add"
                     | "--unset"
                     | "--unset-all"
@@ -3779,7 +3781,12 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
                     | "--rename-section"
                     | "--replace-all"
             )
-        }) {
+        }) || has_cluster_char(&rest.join(" "), &['e'], &['f'])
+        {
+            // Long write/edit forms match after shell normalization (quoted
+            // `--'edit'` delivers `--edit`); the short `-e` (edit) form matches
+            // inside combined clusters with `-f` value-taking arity
+            // (`-fe` is `-f e`, not edit).
             return Some(reject(
                 trimmed,
                 "`git config` write/edit forms are not allowed — they modify repository or global config.",
@@ -4091,11 +4098,15 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
         Some("hash-object") => {
             // git hash-object -w writes the object to the database; without -w
             // it only computes and outputs the hash (read-only). The -w flag can
-            // appear anywhere in the argument list, so we search the full command.
-            if has_flag(trimmed, "w") {
+            // appear anywhere in the argument list, alone or in a combined
+            // cluster (`-wt blob <file>`). `-t` is value-taking and consumes the
+            // rest of its token (`-tw` is `-t w`, not `-w`). `-wt <file>` (no
+            // type) is over-rejected — `-t` would consume the file, so no write
+            // happens — an accepted fail-closed contract.
+            if has_cluster_char(trimmed, &['w'], &['t']) {
                 return reject(
                     trimmed,
-                    "`git hash-object -w` is not allowed — it writes objects to the object database.",
+                    "`git hash-object` with `-w` is not allowed — it writes objects to the object database.",
                     "use `git hash-object` without `-w` to compute the hash without storing the object.",
                 );
             }
@@ -4171,17 +4182,36 @@ fn check_git_subcommand_mutation(
         .copied()
         .partition(|t| t.starts_with('-'));
 
+    // Short mutation chars derived from the constant (branch: d/D/m/M/c/C/f/u,
+    // tag: d/a/s/u/f/m/F/e). Every value-taking short flag for these two
+    // subcommands (-u for branch; -m/-F/-u for tag) is itself a mutation char,
+    // so no attached value can hide a mutation char inside a cluster
+    // (`-uorigin/main`, `-am`, `-cv`).
+    let short_chars: Vec<char> = flag_tokens
+        .iter()
+        .filter_map(|t| {
+            let b = t.as_bytes();
+            (b.len() == 2 && b[0] == b'-').then(|| b[1] as char)
+        })
+        .collect();
+
     // ── Flag-based mutation token check (all positions) ──
     // Tokens starting with `-` are safe to check in every argument position
     // because flags like `-d` or `--delete` can never be legitimate names.
+    // Long flags match exactly (including `flag=value`); single-dash flags
+    // match any mutation char inside the combined cluster (`-df`, `-mv`,
+    // `-am`), with quote/backslash normalization (`'-df'`).
     for arg in words.iter().skip(1) {
-        if !arg.starts_with('-') {
+        let a = shell_word(arg);
+        if !a.starts_with('-') {
             continue;
         }
-        let is_mutating = flag_tokens.contains(arg)
-            || flag_tokens
-                .iter()
-                .any(|t| arg.starts_with(&format!("{t}=")));
+        let is_mutating = if a.starts_with("--") {
+            flag_tokens.contains(&a.as_str())
+                || flag_tokens.iter().any(|t| a.starts_with(&format!("{t}=")))
+        } else {
+            short_chars.iter().any(|c| a[1..].contains(*c))
+        };
         if is_mutating {
             return Err(format!(
                 "⚠️ Read-only mode: `git {subcommand}` is not allowed — it mutates.\n\
@@ -4341,20 +4371,6 @@ fn check_cargo_segment(segment: &str) -> Result<(), String> {
 
 // ── Flag detection helpers ────────────────────────────────────────────────
 
-/// Check if the command has the given short flag (e.g., `-i`, including `-i.bak` variant).
-fn has_flag(command: &str, flag: &str) -> bool {
-    let dash_flag = format!("-{flag}");
-    let dash_flag_dot = format!("-{flag}.");
-    command
-        .split_whitespace()
-        .any(|part| part == dash_flag || part.starts_with(&dash_flag_dot))
-}
-
-/// Check if the command has any of the given exact-match flags.
-fn has_any_flag(command: &str, flags: &[&str]) -> bool {
-    command.split_whitespace().any(|part| flags.contains(&part))
-}
-
 /// Return the value of a flag that takes a separate word as its argument.
 /// e.g., for `curl -o /tmp/file URL`, calling `flag_value(parts, "-o")` returns `Some("/tmp/file")`.
 /// Returns `None` when the flag is not found, is the last token, or its value starts with `-`.
@@ -4381,7 +4397,7 @@ fn flag_value_equals<'a>(parts: &'a [&'a str], prefix: &str) -> Option<&'a str> 
 
 /// Value of the first of `flags` found in space-separated form, falling back
 /// to the `=` form of `equals_prefix` when set. `None` when no flag is
-/// present. The `=` fallback is opt-in per tool: base64 has no `=` form.
+/// present.
 fn output_flag_value<'a>(
     parts: &'a [&'a str],
     flags: &[&str],
@@ -4415,6 +4431,34 @@ fn shell_word(word: &str) -> String {
 /// (`sed "s/a/$var/" file`), and their values are not decodable anyway.
 fn is_unprovable_flag_token(part: &str) -> bool {
     (part.starts_with("$'") || part.starts_with("$\"")) && part.contains('\\')
+}
+
+/// True when any single-dash token in `command` contains a char from
+/// `mutation`, combined-cluster aware (`-df`, `-wt`, quoted `'-do'`).
+/// `value_taking` chars consume the rest of their token (attached value), so
+/// later chars are never misread as flags (`-tw` is `-t w`, `-dio` is
+/// `-d -i 'o'`). Long flags and tokens without a leading dash never match.
+/// Tokens are normalized as the shell delivers them ([`shell_word`]).
+fn has_cluster_char(command: &str, mutation: &[char], value_taking: &[char]) -> bool {
+    command.split_whitespace().any(|w| {
+        let p = shell_word(w);
+        if !p.starts_with('-') || p.starts_with("--") {
+            return false;
+        }
+        let b = p.as_bytes();
+        let mut k = 1;
+        while k < b.len() {
+            let c = b[k] as char;
+            if mutation.contains(&c) {
+                return true;
+            }
+            if value_taking.contains(&c) {
+                return false; // value-taking flag: rest of token is its value
+            }
+            k += 1;
+        }
+        false
+    })
 }
 
 /// Check if `sed` has an in-place flag in a way that mutates files outside temp.
@@ -4496,23 +4540,120 @@ fn has_dd_mutation(command: &str, state: &ValidationState) -> bool {
     false
 }
 
-/// Check if curl has output flags that write outside temp.
-/// `-o <path>` / `--output <path>` is allowed when path is under temp.
-/// `-O` / `--remote-name` is always blocked (writes to CWD with URL filename).
-fn has_curl_mutation(command: &str, state: &ValidationState) -> bool {
+/// Curl short flags that take an attached or separate value. Their attached
+/// values consume the rest of the token, so `-do` (data "o") and
+/// `-HContent-Type:o` are never misread as `-o`, and `-dO` is never misread
+/// as `-O`. `-h` (help) takes an optional attached subject (`-ho` is help for
+/// "o", not `-o`). `-o` itself is handled by [`has_output_mutation`], not
+/// listed here.
+const CURL_VALUE_TAKING: &[char] = &[
+    'A', 'b', 'c', 'C', 'd', 'D', 'e', 'E', 'F', 'H', 'h', 'K', 'm', 'P', 'Q', 'r', 't', 'T', 'u',
+    'U', 'w', 'x', 'X', 'y', 'Y', 'z',
+];
+
+/// Output-flag family for one tool: single-dash chars that unconditionally
+/// write to CWD (`-O`), the temp-gated `-o` output char, value-taking chars,
+/// and long flags that unconditionally write to CWD.
+struct OutputFlagSpec {
+    always_blocked_short: &'static [char],
+    output_short: char,
+    value_taking: &'static [char],
+    always_blocked_long: &'static [&'static str],
+}
+
+const CURL_OUTPUT_FLAGS: OutputFlagSpec = OutputFlagSpec {
+    always_blocked_short: &['O'],
+    output_short: 'o',
+    value_taking: CURL_VALUE_TAKING,
+    always_blocked_long: &["--remote-name", "--remote-name-all"],
+};
+
+const BASE64_OUTPUT_FLAGS: OutputFlagSpec = OutputFlagSpec {
+    always_blocked_short: &[],
+    output_short: 'o',
+    value_taking: &['i', 'b'],
+    always_blocked_long: &[],
+};
+
+/// Check if a curl/base64-style command has output flags that write outside
+/// temp. Every output flag is evaluated — no early return on a temp-gated one:
+/// curl takes the first `-o`/`--output` and adds a CWD write per URL with `-O`,
+/// while base64 takes the last `-o`/`--output`, so an outside-temp write
+/// anywhere is fail-closed regardless of which flag ultimately wins.
+/// `-O`/`--remote-name`/`--remote-name-all` always write to CWD; `-o`/`--output`
+/// (space and `=` forms) are temp-gated with attached or next-token values;
+/// value-taking chars consume the rest of their token (`-do` is data "o",
+/// `-dio` is `-d -i 'o'`). Long flags and `=`-forms match after shell
+/// normalization ([`shell_word`]), so quoted spellings (`'-so'`, `--'output'`)
+/// are seen; `$'...'`/`$"..."` tokens with escapes are unprovable flag
+/// candidates — same fail-closed contract as the sed gate.
+fn has_output_mutation(command: &str, state: &ValidationState, spec: &OutputFlagSpec) -> bool {
     let parts: Vec<&str> = command.split_whitespace().collect();
 
-    // -O/--remote-name are always blocked (writes to CWD with URL filename)
-    if has_any_flag(command, &["-O", "--remote-name"]) {
+    for (i, part) in parts.iter().enumerate() {
+        let w = shell_word(part);
+        if spec.always_blocked_long.contains(&w.as_str()) {
+            return true;
+        }
+        if let Some(path) = w.strip_prefix("--output=") {
+            if writes_outside_temp(path, state) {
+                return true;
+            }
+        } else if w == "--output"
+            && let Some(next) = parts.get(i + 1)
+            && writes_outside_temp(next, state)
+        {
+            return true;
+        }
+    }
+    // ANSI-C `$'...'`/`$"..."` tokens with escapes are unprovable flag
+    // candidates (`$'\x2do'` delivers `-o`) — same fail-closed contract as
+    // the sed gate.
+    if parts.iter().any(|p| is_unprovable_flag_token(p)) {
         return true;
     }
 
-    // -o/--output (space and = forms): blocked unless the path is under temp
-    if let Some(path) = output_flag_value(&parts, &["-o", "--output"], Some("--output=")) {
-        return writes_outside_temp(path, state);
+    // Single-dash forms, standalone or in a combined cluster (`-so`, `-sO`,
+    // `-OJ`, `-LO`, `-so/tmp/x`, quoted `'-so'`).
+    for (i, part) in parts.iter().enumerate() {
+        let p = shell_word(part);
+        if !p.starts_with('-') || p.starts_with("--") || p.len() < 2 {
+            continue;
+        }
+        let b = p.as_bytes();
+        let mut k = 1;
+        while k < b.len() {
+            let c = b[k] as char;
+            if spec.always_blocked_short.contains(&c) {
+                return true;
+            }
+            if c == spec.output_short {
+                let path = if k + 1 < b.len() {
+                    &p[k + 1..]
+                } else {
+                    parts.get(i + 1).copied().unwrap_or("")
+                };
+                if !path.is_empty() && writes_outside_temp(path, state) {
+                    return true;
+                }
+                break; // -o value consumed (attached or next token)
+            }
+            if spec.value_taking.contains(&c) {
+                break; // value-taking flag: rest of token is its value
+            }
+            k += 1;
+        }
     }
 
     false
+}
+
+/// Check if curl has output flags that write outside temp (see
+/// [`has_output_mutation`]). `-o <path>`/`--output <path>` is allowed when the
+/// path is under temp; `-O`/`--remote-name`/`--remote-name-all` always write
+/// to CWD and are blocked, standalone or in a cluster (`-sO`, `-OJ`, `-LO`).
+fn has_curl_mutation(command: &str, state: &ValidationState) -> bool {
+    has_output_mutation(command, state, &CURL_OUTPUT_FLAGS)
 }
 
 /// Check if `wget` output flags write outside temp.
@@ -4613,23 +4754,12 @@ fn is_tar_mutating(command: &str, _state: &ValidationState) -> bool {
     !is_tar_list_only(command)
 }
 
-/// Check if `base64 -d -o` writes outside temp.
-/// When `-o`/`--output` points to a temp path, returns `false` (allow).
+/// Check if `base64` writes output outside temp (see [`has_output_mutation`]).
+/// The decode gate is deliberately absent: `-o` writes a file in encode mode
+/// too. `-i`/`-b` are value-taking on BSD/macOS (`-dio` is `-d -i 'o'`, not an
+/// output flag); GNU base64 has no `-o`/`-i` at all, so no write happens there.
 fn has_base64_mutation(command: &str, state: &ValidationState) -> bool {
-    if !has_any_flag(command, &["-d", "--decode"]) {
-        return false; // not decoding → not a mutation
-    }
-
-    let parts: Vec<&str> = command.split_whitespace().collect();
-
-    // -o/--output (space form only — base64 has no `=` form): blocked unless
-    // the path is under temp
-    if let Some(path) = output_flag_value(&parts, &["-o", "--output"], None) {
-        return writes_outside_temp(path, state);
-    }
-
-    // No -o/--output flag → output to stdout, not mutating
-    false
+    has_output_mutation(command, state, &BASE64_OUTPUT_FLAGS)
 }
 
 /// Check if `cargo clippy` has `--fix` before `--`.
@@ -4865,6 +4995,63 @@ mod tests {
         run_cases(&cases);
     }
 
+    /// Combined single-dash flag clusters: mutation chars inside a cluster
+    /// (`git branch -df`, `-mv`, `git tag -am`, `git hash-object -wt blob`,
+    /// `git config -e`) are detected, while read-only clusters (`-vv`, `-a`,
+    /// `-n1`) and quoted spellings stay correctly classified.
+    #[test]
+    fn git_combined_short_flag_clusters() {
+        let cases = [
+            // branch: delete/force clusters
+            ("git branch -df feature", false),
+            ("git branch -fd feature", false),
+            ("git branch -Dd feature", false),
+            ("git branch '-df' feature", false),
+            ("git branch -v '-df' feature", false), // quoted cluster after a safe flag
+            // branch: move/copy/force clusters
+            ("git branch -mv old new", false),
+            ("git branch -cv old new", false),
+            ("git branch -fv main origin/main", false),
+            // branch: attached -u upstream value
+            ("git branch -uorigin/main", false),
+            // tag: annotate/force/message clusters
+            ("git tag -am 'msg' v1.0", false),
+            ("git tag -afm 'msg' v1.0", false),
+            ("git tag -fam 'msg' v1.0", false),
+            ("git tag -ma v1.0", false),
+            ("git tag -mprobe-msg v1.0", false),
+            ("git tag -F/file v1.0", false),
+            ("git tag '-am' 'msg' v1.0", false),
+            ("git tag -n '-am' 'msg' v1.0", false), // quoted cluster after a safe flag
+            // hash-object: -w inside a cluster with the -t type flag
+            ("git hash-object -wt blob a.txt", false),
+            ("git hash-object -wtblob a.txt", false),
+            ("git hash-object '-wt' blob a.txt", false),
+            ("git hash-object -w -t blob a.txt", false),
+            // config: -e edit short form (single and quoted)
+            ("git config -e", false),
+            ("git config '-e'", false),
+            ("git config -f /tmp/cfg -e", false),
+            // config: quoted long write forms (shell-stripped quotes deliver
+            // --edit/--unset); quoted read forms stay allowed
+            ("git config --'edit'", false),
+            ("git config --'unset' key", false),
+            ("git config --'list'", true),
+            // read-only clusters stay allowed
+            ("git branch -v", true),
+            ("git branch -vv", true),
+            ("git branch -a", true),
+            ("git branch -r", true),
+            ("git tag -n", true),
+            ("git tag -n1", true),
+            ("git hash-object -t blob a.txt", true),
+            ("git hash-object --stdin", true),
+            ("git config -l", true),
+        ];
+
+        run_cases(&cases);
+    }
+
     // ── Unconditional rejections ──────────────────────────────────
 
     /// Tests that ALL entries in the production [`MUTATING_COMMANDS`] constant
@@ -4985,6 +5172,29 @@ mod tests {
             ("curl https://example.com", true),
             ("curl -o file https://example.com", false),
             ("curl -O https://example.com/file", false),
+            // curl combined short-flag clusters
+            ("curl -so out URL", false),
+            ("curl -sO URL", false),
+            ("curl -OJ URL", false),
+            ("curl -LO URL", false),
+            ("curl '-so' out URL", false),
+            ("curl -so/tmp/x URL", true),
+            ("curl -do out URL", true), // -d consumes 'o' (data), not output
+            ("curl -HContent-Type:o URL", true), // -H value contains 'o'
+            ("curl -ho URL", true),     // -h help subject 'o', not output
+            ("curl $'\\x2do' /etc/passwd URL", false), // unprovable → -o delivered
+            // curl: every output flag evaluated — -O/--remote-name* write to
+            // CWD even after a temp-gated -o/--output (no early return), and a
+            // later outside-temp flag rejects even when curl would first-wins
+            // (fail-closed over-rejection)
+            ("curl -O --output /tmp/x URL", false),
+            ("curl -o out --output /tmp/x URL", false),
+            ("curl -o /tmp/x --output out URL", false),
+            ("curl -o /tmp/x --output /tmp/y URL", true),
+            ("curl --output=/tmp/x URL", true),
+            ("curl --output=out URL", false),
+            ("curl --'output' out URL", false), // quoted long form
+            ("curl --remote-name-all URL", false), // per-URL CWD writes
             // tar
             ("tar -tf archive.tar.gz", true),
             ("tar -xzf archive.tar.gz", false),
@@ -4994,6 +5204,20 @@ mod tests {
             ("base64 -d file.txt", true),
             ("base64 -d -o out.bin file.txt", false),
             ("base64 --decode --output out.bin file.txt", false),
+            // base64 combined short-flag clusters
+            ("base64 -do out", false),
+            ("base64 '-do' out", false),
+            ("base64 -do/tmp/x", true),
+            ("base64 -o out file", false), // encode-mode output write
+            ("base64 -dio out", true),     // -i consumes 'o' (input file) on BSD
+            ("base64 $'\\x2do' /etc/passwd", false), // unprovable → -o delivered
+            // base64: last output flag wins — any outside-temp write rejects
+            // (also covers the --output= form)
+            ("base64 --output /tmp/x -o out file", false),
+            ("base64 -o out --output /tmp/x file", false), // fail-closed over-rejection
+            ("base64 -o /tmp/x --output /tmp/y file", true),
+            ("base64 --output=/tmp/x file", true),
+            ("base64 --output=out file", false),
         ];
 
         run_cases(&cases);
@@ -5655,7 +5879,7 @@ mod tests {
             ("base64 -d --output /etc/passwd input.txt", false),
             // base64 -d without -o → stdout, always allowed
             ("base64 -d input.txt", true),
-            // base64 with -o but without -d → no mutation
+            // base64 -o to temp → allowed (encode or decode mode)
             ("base64 -o /tmp/out input.txt", true),
             // ── Multiple path arguments (security bypass) ──
             // Multiple path args under temp → should be allowed
