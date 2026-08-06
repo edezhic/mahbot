@@ -149,7 +149,7 @@ pub fn selectable_text<'a>(
 ) -> iced_selection::text::Text<'a, iced::Theme, iced::Renderer> {
     iced_selection::text::Text::new(content).style(move |_theme| iced_selection::text::Style {
         color: Some(color),
-        ..Default::default()
+        selection: theme::ACCENT_DIM,
     })
 }
 

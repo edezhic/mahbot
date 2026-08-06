@@ -6,12 +6,11 @@ use crate::logs::{LogEntry, LogQuery, LogStore};
 
 use strum::IntoEnumIterator;
 
+use iced::advanced::text::Span;
 use iced::widget::{
-    Column, Row, Space, button, column, container, pick_list, row, scrollable, text, text_input,
-    tooltip,
+    Column, Space, button, column, container, pick_list, row, scrollable, text, text_input, tooltip,
 };
 use iced::{Alignment, Element, Length, Subscription, Task, window};
-
 use iced_anim::Animated;
 use iced_anim::transition::Easing;
 use std::time::{Duration, Instant};
@@ -20,7 +19,6 @@ use iced_fonts::lucide;
 
 use super::theme;
 use super::widgets;
-use super::widgets::selectable_text;
 
 /// Tabs within the Logs page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -722,89 +720,98 @@ impl LogsState {
     #[allow(clippy::too_many_lines)]
     fn render_log_entry(entry: &LogEntry, fade_progress: f32) -> Element<'_, LogMessage> {
         let (level_color, level_bg) = theme::log_level_color(&entry.level);
-        let role_color = if entry.agent_role.is_empty() {
-            theme::TEXT_MUTED
-        } else {
-            theme::role_badge_color(&entry.agent_role).0
-        };
 
-        let timestamp = theme::format_hhmmss(&entry.timestamp);
+        // One selectable Rich widget per entry so a whole log line can be
+        // copied in a single drag. Pills are emulated with span highlights.
+        let mut spans: Vec<Span<'_, (), iced::Font>> = vec![
+            Span::new(theme::format_hhmmss(&entry.timestamp))
+                .size(10)
+                .color(theme::TEXT_MUTED),
+            Span::new("  ").size(10),
+            Span::new(&entry.level)
+                .size(10)
+                .color(level_color)
+                .background(level_bg)
+                .border(iced::border::rounded(4))
+                .padding([1, 6]),
+            Span::new("  ").size(10),
+        ];
+        if !entry.agent_role.is_empty() {
+            let role_color = theme::role_badge_color(&entry.agent_role).0;
+            spans.push(
+                Span::new(&entry.agent_role)
+                    .size(10)
+                    .color(role_color)
+                    .background(iced::Color::from_rgba(
+                        role_color.r,
+                        role_color.g,
+                        role_color.b,
+                        0.1,
+                    ))
+                    .border(iced::border::rounded(4))
+                    .padding([1, 6]),
+            );
+            spans.push(Span::new("  ").size(10));
+        }
+        spans.push(
+            Span::new(&entry.target)
+                .size(11)
+                .color(theme::TEXT_SECONDARY),
+        );
+        if !entry.workspace.is_empty() {
+            spans.push(Span::new("  ").size(10));
+            spans.push(
+                Span::new(&entry.workspace)
+                    .size(10)
+                    .color(theme::TEXT_MUTED),
+            );
+        }
 
-        let mut entry_view = column![
-            row![
-                text(timestamp).size(10).color(theme::TEXT_MUTED),
-                Space::new().width(8),
-                container(text(&entry.level).size(10).color(level_color))
-                    .padding([1, 6])
-                    .style(theme::pill_style(level_bg)),
-                Space::new().width(8),
-                if !entry.agent_role.is_empty() {
-                    row![
-                        container(text(&entry.agent_role).size(10).color(role_color))
-                            .padding([1, 6])
-                            .style(move |t: &iced::Theme| {
-                                theme::role_badge_pill_style(t, role_color)
-                            }),
-                        Space::new().width(4),
-                    ]
-                } else {
-                    row![]
-                },
-                text(&entry.target).size(11).color(theme::TEXT_SECONDARY),
-                Space::new().width(Length::Fill),
-                if !entry.workspace.is_empty() {
-                    text(&entry.workspace).size(10).color(theme::TEXT_MUTED)
-                } else {
-                    text("")
-                },
-            ]
-            .align_y(Alignment::Center)
-            .spacing(2),
-            Space::new().height(2),
-            selectable_text(&entry.message, theme::TEXT_PRIMARY)
+        spans.push(Span::new("\n").size(10));
+        spans.push(
+            Span::new(&entry.message)
                 .size(13)
-                .font(super::JETBRAINS_MONO)
-                .width(Length::Fill),
-        ]
-        .spacing(1);
+                .color(theme::TEXT_PRIMARY)
+                .font(super::JETBRAINS_MONO),
+        );
 
         // Extra fields as key-value tags
-        if entry.fields != serde_json::Value::Null {
-            if let Some(obj) = entry.fields.as_object() {
-                let mut tags = Row::new().spacing(4);
-                let mut has_tags = false;
-                for (key, value) in obj {
-                    if key == "message" {
-                        continue;
-                    }
-                    has_tags = true;
-                    let val_str = match value {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    // Cap the tag text so long fields (e.g. error_chain) render
-                    // as readable tags instead of overflowing the row; the full
-                    // value stays queryable in the log store.
-                    let val_str = crate::util::truncate(&val_str, 200);
-                    tags = tags.push(
-                        container(
-                            text(format!("{key}: {val_str}"))
-                                .size(10)
-                                .color(theme::TEXT_MUTED),
-                        )
-                        .padding([1, 4])
-                        .style(theme::pill_style(theme::BG_ELEVATED)),
-                    );
+        if let Some(obj) = entry.fields.as_object() {
+            for (key, value) in obj {
+                if key == "message" {
+                    continue;
                 }
-                if has_tags {
-                    entry_view = column![entry_view, Space::new().height(2), tags];
-                }
+                let val_str = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                // Cap the tag text so long fields (e.g. error_chain) render
+                // as readable tags instead of overflowing the row; the full
+                // value stays queryable in the log store.
+                let val_str = crate::util::truncate(&val_str, 200);
+                spans.push(Span::new("\n").size(10));
+                spans.push(
+                    Span::new(format!("{key}: {val_str}"))
+                        .size(10)
+                        .color(theme::TEXT_MUTED)
+                        .background(theme::BG_ELEVATED)
+                        .border(iced::border::rounded(4))
+                        .padding([1, 4]),
+                );
             }
         }
 
+        let rich: iced_selection::text::Rich<'_, (), LogMessage, iced::Theme, iced::Renderer> =
+            iced_selection::text::Rich::from_iter(spans)
+                .style(|_t| iced_selection::text::Style {
+                    color: None,
+                    selection: theme::ACCENT_DIM,
+                })
+                .width(Length::Fill);
+
         if fade_progress < 1.0 {
             // Fade-in: interpolate background/border alpha from 0.6 → 1.0
-            container(entry_view)
+            container(rich)
                 .padding(6)
                 .style(move |_theme: &iced::Theme| container::Style {
                     background: Some(iced::Background::Color(iced::Color::from_rgba(
@@ -827,7 +834,7 @@ impl LogsState {
                 })
                 .into()
         } else {
-            container(entry_view)
+            container(rich)
                 .padding(6)
                 .style(theme::surface_card_style)
                 .into()

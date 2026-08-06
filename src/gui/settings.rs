@@ -1254,7 +1254,7 @@ impl SettingsState {
                             .push(text("Not yet discovered").size(13).color(theme::TEXT_MUTED));
                     } else {
                         let md: Element<'_, SettingsMessage> =
-                            iced::widget::markdown::view(items, theme::markdown_settings()).map(
+                            iced_selection::markdown::view(items, theme::markdown_settings()).map(
                                 |url| {
                                     SettingsMessage::WorkspaceMsg(
                                         workspaces::WorkspacesMessage::LinkClicked(url),

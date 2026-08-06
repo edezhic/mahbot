@@ -621,7 +621,7 @@ impl SessionsState {
                             && !tc.is_empty()
                         {
                             expanded_col = expanded_col.push(
-                                container(text(tc.clone()).size(11).color(theme::TEXT_MUTED))
+                                container(selectable_text(tc.clone(), theme::TEXT_MUTED).size(11))
                                     .padding([2, 4]),
                             );
                         }
@@ -633,8 +633,8 @@ impl SessionsState {
                             expanded_col = expanded_col.push(
                                 container(
                                     column![
-                                        text("🧠 Thinking").size(11).color(theme::TEXT_MUTED),
-                                        text(rt.clone()).size(11).color(theme::TEXT_MUTED),
+                                        selectable_text("🧠 Thinking", theme::TEXT_MUTED).size(11),
+                                        selectable_text(rt.clone(), theme::TEXT_MUTED).size(11),
                                     ]
                                     .spacing(2),
                                 )
@@ -729,7 +729,7 @@ impl SessionsState {
                     // Stray tool result (no preceding tool call) — render as regular message
                     let mut msg_col = Column::new().spacing(2);
                     msg_col = msg_col.push(
-                        container(text(dm_role.clone()).size(11).color(dm_role_color))
+                        container(selectable_text(dm_role.clone(), dm_role_color).size(11))
                             .padding([1, 6])
                             .style(move |t| theme::role_badge_pill_style(t, dm_role_color)),
                     );
@@ -740,10 +740,9 @@ impl SessionsState {
                                 SessionsMessage,
                                 iced::Theme,
                                 iced::Renderer,
-                            > = markdown::view_with(
+                            > = super::media_markers::selectable_markdown_view(
                                 &md_items[i],
                                 theme::markdown_settings(),
-                                &super::media_markers::MEDIA_VIEWER,
                             )
                             .map(SessionsMessage::LinkClicked);
                             md
@@ -772,7 +771,7 @@ impl SessionsState {
 
                     let mut msg_col = Column::new().spacing(2);
                     msg_col = msg_col.push(
-                        container(text(dm_role).size(11).color(dm_role_color))
+                        container(selectable_text(dm_role, dm_role_color).size(11))
                             .padding([1, 6])
                             .style(move |t| theme::role_badge_pill_style(t, dm_role_color)),
                     );
@@ -802,7 +801,7 @@ impl SessionsState {
 
                         if is_thinking_expanded {
                             msg_col = msg_col.push(
-                                container(text(t.clone()).size(11).color(theme::TEXT_MUTED))
+                                container(selectable_text(t.clone(), theme::TEXT_MUTED).size(11))
                                     .padding([4, 8])
                                     .style(theme::surface_card_style),
                             );
@@ -815,10 +814,9 @@ impl SessionsState {
                                 SessionsMessage,
                                 iced::Theme,
                                 iced::Renderer,
-                            > = markdown::view_with(
+                            > = super::media_markers::selectable_markdown_view(
                                 &md_items[i],
                                 theme::markdown_settings(),
-                                &super::media_markers::MEDIA_VIEWER,
                             )
                             .map(SessionsMessage::LinkClicked);
                             md

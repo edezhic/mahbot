@@ -26,8 +26,7 @@
 use std::sync::LazyLock;
 
 use iced::advanced::{image as advanced_image, text};
-use iced::widget::image;
-use iced::widget::markdown;
+use iced::widget::{image, markdown};
 use iced::{ContentFit, Element, Font, Length};
 
 use crate::util::{MEDIA_MARKER_RE, parse_media_marker};
@@ -85,24 +84,27 @@ fn path_filename(path: &str) -> String {
         .map_or_else(|| path.to_string(), ToString::to_string)
 }
 
-// ── Custom markdown Viewer for inline image rendering ──────────────
+// ── Selectable markdown Viewer (iced_selection + inline images) ────
 
-/// A markdown `Viewer` that renders `![Image](path)` items as actual
-/// image widgets.  Audio and video markers are already converted to plain
-/// text by [`preprocess`], so only images reach this viewer.
-///
-/// The viewer uses `Uri` (= `String`) as its message type, identical to
-/// the built-in [`DefaultViewer`], so callers can use `.map(…)` to
-/// convert link-click events into their own message type.
-pub(crate) struct MediaViewer;
+/// A markdown `Viewer` rendering text through `iced_selection` (selectable,
+/// copyable) while keeping the inline-image rendering of the previous viewer.
+pub(crate) struct SelectableMediaViewer;
 
-/// Singleton instance of [`MediaViewer`] for use with `markdown::view_with()`.
-pub(crate) const MEDIA_VIEWER: MediaViewer = MediaViewer;
+/// Render markdown items as selectable text with inline image support.
+pub(crate) fn selectable_markdown_view(
+    items: &[markdown::Item],
+    settings: impl Into<markdown::Settings>,
+) -> Element<'_, markdown::Uri, iced::Theme, iced::Renderer> {
+    markdown::view_with(items, settings, &SelectableMediaViewer)
+}
 
-impl<'a, Theme, Renderer> markdown::Viewer<'a, markdown::Uri, Theme, Renderer> for MediaViewer
+impl<'a, Theme, Renderer> markdown::Viewer<'a, markdown::Uri, Theme, Renderer>
+    for SelectableMediaViewer
 where
-    Theme: markdown::Catalog + 'a,
-    Renderer: text::Renderer<Font = Font> + advanced_image::Renderer<Handle = image::Handle> + 'a,
+    Theme: markdown::Catalog + iced_selection::text::Catalog + 'a,
+    Renderer: text::Renderer<Paragraph = iced::advanced::graphics::text::Paragraph, Font = Font>
+        + advanced_image::Renderer<Handle = image::Handle>
+        + 'a,
 {
     fn on_link_click(url: markdown::Uri) -> markdown::Uri {
         url
@@ -138,6 +140,51 @@ where
                 .size(settings.text_size)
                 .into()
         }
+    }
+
+    fn heading(
+        &self,
+        settings: markdown::Settings,
+        level: &'a markdown::HeadingLevel,
+        text: &'a markdown::Text,
+        index: usize,
+    ) -> Element<'a, markdown::Uri, Theme, Renderer> {
+        iced_selection::markdown::heading(settings, level, text, index, |url| url)
+    }
+
+    fn paragraph(
+        &self,
+        settings: markdown::Settings,
+        text: &markdown::Text,
+    ) -> Element<'a, markdown::Uri, Theme, Renderer> {
+        iced_selection::markdown::paragraph(settings, text, |url| url)
+    }
+
+    fn code_block(
+        &self,
+        settings: markdown::Settings,
+        _language: Option<&'a str>,
+        _code: &'a str,
+        lines: &'a [markdown::Text],
+    ) -> Element<'a, markdown::Uri, Theme, Renderer> {
+        iced_selection::markdown::code_block(settings, lines, |url| url)
+    }
+
+    fn unordered_list(
+        &self,
+        settings: markdown::Settings,
+        bullets: &'a [markdown::Bullet],
+    ) -> Element<'a, markdown::Uri, Theme, Renderer> {
+        iced_selection::markdown::unordered_list(self, settings, bullets)
+    }
+
+    fn ordered_list(
+        &self,
+        settings: markdown::Settings,
+        start: u64,
+        bullets: &'a [markdown::Bullet],
+    ) -> Element<'a, markdown::Uri, Theme, Renderer> {
+        iced_selection::markdown::ordered_list(self, settings, start, bullets)
     }
 }
 

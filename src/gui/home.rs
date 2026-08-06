@@ -560,10 +560,9 @@ impl HomeState {
                             .size(13)
                             .into()
                     } else {
-                        iced::widget::markdown::view_with(
+                        super::media_markers::selectable_markdown_view(
                             &msg.md_items,
                             theme::markdown_settings(),
-                            &super::media_markers::MEDIA_VIEWER,
                         )
                         .map(HomeMessage::LinkClicked)
                     };
