@@ -4296,16 +4296,22 @@ fn extract_git_subcommand(segment: &str) -> String {
     let words: Vec<&str> = segment.split_whitespace().collect();
 
     // Skip shell prefixes, env assignments, and flags to find "git"
-    // (e.g., GIT_DIR=/tmp git push, sudo git push, env git push). A
-    // balanced-quoted `"git"` is the same command (normalized). Basename
-    // match so `/usr/bin/git push` can't bypass the git allowlist
-    // (mirrors `first_command_word`).
+    // (e.g., GIT_DIR=/tmp git push, sudo git push, env git push). Basename
+    // first, then strip balanced quotes — the same normalization order as
+    // dispatch (`first_command_word` → `classify_verb_word`) — so
+    // `/usr/bin/git`, `'git'`, and `/usr/bin/'git'` (incl. prefix-forwarded
+    // forms like `sudo /usr/bin/'git' push`) all resolve to git and can't
+    // bypass the git allowlist.
     let git_idx = super::find_first_command_word_index(&words);
     let Some(git_idx) = git_idx else {
         return String::new();
     };
-    let git_word = strip_outer_quotes(words[git_idx]).map_or(words[git_idx], |(c, _)| c);
-    if git_word.rsplit('/').next().unwrap_or("") != "git" {
+    let git_word = words[git_idx]
+        .rsplit('/')
+        .next()
+        .expect("rsplit always yields at least one element");
+    let git_word = strip_outer_quotes(git_word).map_or(git_word, |(c, _)| c);
+    if git_word != "git" {
         return String::new();
     }
 
@@ -5688,6 +5694,38 @@ mod tests {
         run_cases(&cases);
     }
 
+    /// Path-spelled git invocations route to the git layer exactly like plain
+    /// `git`: basename dispatch + basename-matched subcommand extraction, so
+    /// mutating forms reject and read-only forms stay allowed. Per-spelling
+    /// extraction output is pinned by `test_extract_git_subcommand`; this
+    /// matrix pins the end-to-end routing per spelling shape.
+    #[test]
+    fn git_path_spelled_invocations() {
+        let cases = [
+            // absolute / relative paths
+            ("/usr/bin/git init", false),
+            ("/usr/bin/git status", true),
+            ("./git init", false),
+            ("./git log", true),
+            // quoted git and quotes inside the final path component are
+            // rejected fail-closed: bare forms at the verb gate, prefix-
+            // forwarded forms via git-layer validation
+            ("'git' init", false),
+            ("/usr/bin/'git' init", false),
+            ("sudo /usr/bin/'git' reset --hard", false),
+            ("env /usr/bin/'git' commit -m x", false),
+            ("sudo /usr/bin/'git' status", true),
+            // prefixes in front of the path
+            ("sudo /usr/bin/git init", false),
+            ("sudo /usr/bin/git status", true),
+            ("env /usr/bin/git push", false),
+            // combined short-flag cluster through the same gate
+            ("/usr/bin/git branch -df feature", false),
+        ];
+
+        run_cases(&cases);
+    }
+
     #[test]
     fn script_and_container_tools() {
         let cases = [
@@ -5789,6 +5827,41 @@ mod tests {
                 name: "with sudo skipped",
                 input: "sudo git status",
                 expected: "status",
+            },
+            Case {
+                name: "absolute path",
+                input: "/usr/bin/git status",
+                expected: "status",
+            },
+            Case {
+                name: "absolute path with global flag",
+                input: "/opt/homebrew/bin/git -C /repo diff",
+                expected: "diff",
+            },
+            Case {
+                name: "prefixed absolute path",
+                input: "sudo /usr/bin/git push",
+                expected: "push",
+            },
+            Case {
+                name: "relative path",
+                input: "./git log",
+                expected: "log",
+            },
+            Case {
+                name: "quoted git",
+                input: "'git' branch -d feature",
+                expected: "branch -d feature",
+            },
+            Case {
+                name: "quotes in final path component",
+                input: "/usr/bin/'git' status",
+                expected: "status",
+            },
+            Case {
+                name: "prefixed quotes in final path component",
+                input: "sudo /usr/bin/'git' push",
+                expected: "push",
             },
             Case {
                 name: "with env skipped",
