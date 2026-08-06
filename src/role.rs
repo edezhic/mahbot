@@ -244,6 +244,7 @@ impl Role {
 // ── Tool set factory ──────────────────────────────────────────────────────
 
 use crate::Tool;
+use crate::Workspace;
 use crate::config::CONFIG;
 use crate::tools::{
     AddCommentTool, AskTool, BrowserTool, CreateTicketTool, DispatchMode, EditTool, GetTicketTool,
@@ -274,9 +275,12 @@ impl Role {
     }
 
     /// Build the tool set for this role.
+    ///
+    /// Ticket tools are bound to `ws` at construction time — all their
+    /// operations are confined to that workspace.
     #[must_use]
     #[allow(clippy::trivially_copy_pass_by_ref)]
-    pub(crate) fn tools(&self) -> Vec<Box<dyn Tool>> {
+    pub(crate) fn tools(&self, ws: &Workspace) -> Vec<Box<dyn Tool>> {
         let mut tools: Vec<Box<dyn Tool>> = match self {
             Role::Engineer => {
                 let mut t = Self::full_core_tools();
@@ -289,12 +293,12 @@ impl Role {
             }
             Role::Manager => {
                 vec![
-                    Box::new(CreateTicketTool::new("manager")),
-                    Box::new(UpdateTicketTool),
-                    Box::new(ListTicketsTool),
-                    Box::new(GetTicketTool),
-                    Box::new(AddCommentTool),
-                    Box::new(SearchArchivedTicketsTool),
+                    Box::new(CreateTicketTool::new("manager", ws)),
+                    Box::new(UpdateTicketTool::new(ws)),
+                    Box::new(ListTicketsTool::new(ws)),
+                    Box::new(GetTicketTool::new(ws)),
+                    Box::new(AddCommentTool::new(ws)),
+                    Box::new(SearchArchivedTicketsTool::new(ws)),
                     Box::new(AskTool::new(
                         vec![Role::Analyst],
                         DispatchMode::Async,
@@ -326,7 +330,7 @@ impl Role {
                     DispatchMode::Sync,
                     Role::Maintainer,
                 )));
-                t.push(Box::new(CreateTicketTool::new("maintainer")));
+                t.push(Box::new(CreateTicketTool::new("maintainer", ws)));
                 t
             }
             Role::Assistant => {
@@ -475,7 +479,7 @@ mod tests {
         // missing arms in the match, but cannot catch an arm that returns
         // vec![]. Every role needs at least one tool to function.
         for role in Role::iter() {
-            let tools = role.tools();
+            let tools = role.tools(&crate::workspace::test_ws("test"));
             assert!(
                 !tools.is_empty(),
                 "{}: Role::tools() must not be empty — every role needs at least one tool",

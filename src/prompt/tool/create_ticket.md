@@ -9,6 +9,8 @@ Parameters:
 - `supersede`: optional ticket ID to replace
 - `priority` (Manager only): optional priority level (0 = highest urgency, 1 default, 2, 3, ... higher = lower). Maintainer must NOT include this parameter.
 
+Ticket IDs may be given as a bare number (e.g. `123`) or the fully prefixed form (e.g. `mahbot-123`); both refer to tickets in the current workspace only. IDs from other workspaces are rejected.
+
 When `supersede` is provided, the old ticket is cancelled, this ticket is created as its replacement, and dependent prerequisites are rewired to the new ticket.
 
 Constraints:

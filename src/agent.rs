@@ -127,7 +127,7 @@ impl Agent {
         user_name: String,
         channel: String,
     ) -> Self {
-        let tools = role.tools();
+        let tools = role.tools(ws);
         let tools: Vec<Box<dyn Tool>> = tools.into_iter().filter(|t| t.is_advertised()).collect();
         let tool_specs = tools.iter().map(|t| t.spec()).collect();
 

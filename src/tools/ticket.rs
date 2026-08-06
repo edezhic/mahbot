@@ -13,26 +13,61 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
 
+// ── Ticket ID resolution ─────────────────────────────────────────
+
+/// Resolve a raw ticket ID argument against the tool's bound workspace.
+///
+/// Accepts either a bare number (resolved to `{ws}-{number}`) or the fully
+/// prefixed form for the bound workspace. Prefixed IDs from any other
+/// workspace are rejected with a clear error.
+fn resolve_ticket_id(ws_name: &str, raw: &str) -> Result<String> {
+    let id = raw.trim();
+    anyhow::ensure!(!id.is_empty(), "Ticket ID must not be empty");
+    let seq_ok = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    // Bare number → bound workspace ticket.
+    if seq_ok(id) {
+        return Ok(format!("{ws_name}-{id}"));
+    }
+    // Prefixed form `{workspace}-{seq}` — only the bound workspace is accepted.
+    // The prefix shape mirrors workspace::validate_name ([a-zA-Z_]+ starting with
+    // a letter); keep the two grammars in sync.
+    if let Some((prefix, seq)) = id.rsplit_once('-') {
+        let prefix_ok = prefix.starts_with(|c: char| c.is_ascii_alphabetic())
+            && prefix.chars().all(|c| c.is_ascii_alphabetic() || c == '_');
+        if prefix_ok && seq_ok(seq) {
+            if prefix == ws_name {
+                return Ok(id.to_string());
+            }
+            anyhow::bail!(
+                "Ticket '{id}' belongs to a different workspace — ticket tools only manage \
+                 tickets from workspace '{ws_name}'"
+            );
+        }
+    }
+    anyhow::bail!("Invalid ticket ID '{id}' — expected a bare number or '{ws_name}-<number>'");
+}
+
 // ── CreateTicketTool ─────────────────────────────────────────────
 
 /// Tool for creating tickets. The `reporter` field is set at construction
 /// time based on which role is using the tool — invisible to the agent,
-/// no parameter to pass.
+/// no parameter to pass. Bound to a single workspace at construction time.
 pub struct CreateTicketTool {
     reporter: String,
+    ws_name: String,
 }
 
 impl CreateTicketTool {
-    pub fn new(reporter: impl Into<String>) -> Self {
+    pub fn new(reporter: impl Into<String>, ws: &Workspace) -> Self {
         Self {
             reporter: reporter.into(),
+            ws_name: ws.name.clone(),
         }
     }
 
     /// Build a [`TicketParams`] from the shared fields used by both creation branches.
     fn build_params(
         &self,
-        ws: &Workspace,
         title: &str,
         description: &str,
         prerequisites: &[String],
@@ -42,7 +77,7 @@ impl CreateTicketTool {
         TicketParams {
             title: title.to_string(),
             description: description.to_string(),
-            workspace_name: ws.name.clone(),
+            workspace_name: self.ws_name.clone(),
             phase: TicketPhase::Backlog,
             prerequisites: prerequisites.to_vec(),
             reporter: self.reporter.clone(),
@@ -107,15 +142,20 @@ impl Tool for CreateTicketTool {
         super::tool_params_schema(&serde_json::Value::Object(props), &["title", "description"])
     }
 
-    async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
+    async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
         let title = super::get_str(&args, "title")?;
         let description = super::get_str(&args, "description")?;
 
         let prerequisites: Vec<String> = match args.get("prerequisites") {
             Some(serde_json::Value::Array(arr)) => arr
                 .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect(),
+                .map(|v| {
+                    let s = v.as_str().ok_or_else(|| {
+                        anyhow::anyhow!("prerequisites must contain ticket ID strings, got {v}")
+                    })?;
+                    resolve_ticket_id(&self.ws_name, s)
+                })
+                .collect::<Result<_>>()?,
             Some(_) => {
                 anyhow::bail!("prerequisites must be an array of ticket ID strings");
             }
@@ -123,7 +163,7 @@ impl Tool for CreateTicketTool {
         };
 
         let supersede_id: Option<String> = match args.get("supersede") {
-            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(serde_json::Value::String(s)) => Some(resolve_ticket_id(&self.ws_name, s)?),
             Some(_) => anyhow::bail!("supersede must be a ticket ID string"),
             None => None,
         };
@@ -171,7 +211,6 @@ impl Tool for CreateTicketTool {
         };
 
         let params = self.build_params(
-            ws,
             title,
             description,
             &prerequisites,
@@ -194,7 +233,17 @@ impl Tool for CreateTicketTool {
 
 // ── UpdateTicketTool ─────────────────────────────────────────────
 
-pub struct UpdateTicketTool;
+pub struct UpdateTicketTool {
+    ws_name: String,
+}
+
+impl UpdateTicketTool {
+    pub fn new(ws: &Workspace) -> Self {
+        Self {
+            ws_name: ws.name.clone(),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for UpdateTicketTool {
@@ -219,7 +268,7 @@ impl Tool for UpdateTicketTool {
     }
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        let ticket_id = super::get_str(&args, "ticket_id")?;
+        let ticket_id = resolve_ticket_id(&self.ws_name, super::get_str(&args, "ticket_id")?)?;
         let new_phase = super::get_str(&args, "phase")?;
 
         let parsed_phase = new_phase.parse::<TicketPhase>()?;
@@ -227,10 +276,10 @@ impl Tool for UpdateTicketTool {
         let store = board_store();
 
         // Guard: refuse to update a ticket that is in a pipeline-blocking phase.
-        guard_not_pipeline_blocking(store, ticket_id).await?;
+        guard_not_pipeline_blocking(store, &ticket_id).await?;
 
         store
-            .transition_to(ticket_id, None, parsed_phase, None)
+            .transition_to(&ticket_id, None, parsed_phase, None)
             .await?;
 
         Ok(format!("Ticket {ticket_id} phase updated to '{new_phase}'"))
@@ -239,7 +288,17 @@ impl Tool for UpdateTicketTool {
 
 // ── ListTicketsTool ─────────────────────────────────────────────
 
-pub struct ListTicketsTool;
+pub struct ListTicketsTool {
+    ws_name: String,
+}
+
+impl ListTicketsTool {
+    pub fn new(ws: &Workspace) -> Self {
+        Self {
+            ws_name: ws.name.clone(),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for ListTicketsTool {
@@ -263,7 +322,7 @@ impl Tool for ListTicketsTool {
         false // read-only board query
     }
 
-    async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
+    async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
         let raw_phase = super::get_opt_str(&args, "phase");
 
         // "archived" is no longer a phase — redirect to search_archived_tickets
@@ -286,7 +345,9 @@ impl Tool for ListTicketsTool {
 
         let store = board_store();
 
-        let mut tickets = store.list_all_tickets(Some(&ws.name), phase_filter).await?;
+        let mut tickets = store
+            .list_all_tickets(Some(&self.ws_name), phase_filter)
+            .await?;
 
         // Default: exclude unblocking phases. When an explicit phase filter
         // is provided, respect it as-is.
@@ -309,7 +370,17 @@ impl Tool for ListTicketsTool {
 
 // ── GetTicketTool ───────────────────────────────────────────────
 
-pub struct GetTicketTool;
+pub struct GetTicketTool {
+    ws_name: String,
+}
+
+impl GetTicketTool {
+    pub fn new(ws: &Workspace) -> Self {
+        Self {
+            ws_name: ws.name.clone(),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for GetTicketTool {
@@ -341,11 +412,11 @@ impl Tool for GetTicketTool {
     }
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        let ticket_id = super::get_str(&args, "ticket_id")?;
+        let ticket_id = resolve_ticket_id(&self.ws_name, super::get_str(&args, "ticket_id")?)?;
 
         let store = board_store();
 
-        match store.get_ticket(ticket_id).await? {
+        match store.get_ticket(&ticket_id).await? {
             Some(ticket) => Ok(ticket.detailed_display()),
             None => anyhow::bail!("Ticket {ticket_id} not found"),
         }
@@ -354,7 +425,17 @@ impl Tool for GetTicketTool {
 
 // ── AddCommentTool ──────────────────────────────────────────────
 
-pub struct AddCommentTool;
+pub struct AddCommentTool {
+    ws_name: String,
+}
+
+impl AddCommentTool {
+    pub fn new(ws: &Workspace) -> Self {
+        Self {
+            ws_name: ws.name.clone(),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for AddCommentTool {
@@ -379,13 +460,13 @@ impl Tool for AddCommentTool {
     }
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        let ticket_id = super::get_str(&args, "ticket_id")?;
+        let ticket_id = resolve_ticket_id(&self.ws_name, super::get_str(&args, "ticket_id")?)?;
         let content = super::get_str(&args, "content")?;
 
         let store = board_store();
 
         store
-            .add_comment(ticket_id, Role::Manager.as_str(), content)
+            .add_comment(&ticket_id, Role::Manager.as_str(), content)
             .await?;
 
         Ok(format!("Comment added to ticket {ticket_id}"))
@@ -424,8 +505,8 @@ mod tests {
     async fn test_create_ticket_tool() {
         crate::util::test::init_test_stores().await;
 
-        let tool = CreateTicketTool::new("test");
         let ws = test_ws("/tmp/test_ws");
+        let tool = CreateTicketTool::new("test", &ws);
         let args = json!({
             "title": "Test ticket",
             "description": "A test description",
@@ -438,20 +519,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_ticket_rejects_non_string_prerequisite() {
+        crate::util::test::init_test_stores().await;
+
+        let ws = test_ws("/tmp/test_ws");
+        let tool = CreateTicketTool::new("test", &ws);
+        let args = json!({
+            "title": "Test",
+            "description": "desc",
+            "prerequisites": [123],
+        });
+        let err = tool.execute(&ws, args).await.unwrap_err();
+        assert!(
+            format!("{err}").contains("ticket ID strings"),
+            "non-string prerequisite should be rejected: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_update_ticket_tool() {
         crate::util::test::init_test_stores().await;
 
         let store = board_store();
-        let id = make_ticket(
-            store,
-            &test_ws("/ws"),
-            "Test",
-            crate::board::TicketPhase::Backlog,
-        )
-        .await;
+        let ws = test_ws("/ws");
+        let id = make_ticket(store, &ws, "Test", crate::board::TicketPhase::Backlog).await;
 
-        let tool = UpdateTicketTool;
-        let ws = test_ws("/tmp");
+        let tool = UpdateTicketTool::new(&ws);
         let args = json!({
             "ticket_id": id,
             "phase": "in_qa"
@@ -490,7 +583,7 @@ mod tests {
             .await
             .expect("transition to cancelled");
 
-        let tool = ListTicketsTool;
+        let tool = ListTicketsTool::new(&ws);
 
         // Default (no filter): excludes done and cancelled — only A should appear
         let args = json!({});
@@ -542,7 +635,7 @@ mod tests {
         crate::util::test::init_test_stores().await;
 
         let ws = crate::workspace::test_ws("/tmp");
-        let tool = ListTicketsTool;
+        let tool = ListTicketsTool::new(&ws);
         let args = json!({"phase": "bogus_phase"});
         let result = tool.execute(&ws, args).await;
         assert!(result.is_err(), "Invalid phase should fail");
@@ -553,7 +646,8 @@ mod tests {
         crate::util::test::init_test_stores().await;
 
         let store = board_store();
-        let id = TicketBuilder::new(store, &test_ws("/ws"))
+        let ws = test_ws("/ws");
+        let id = TicketBuilder::new(store, &ws)
             .title("GetTest")
             .desc("get me")
             .create()
@@ -564,8 +658,7 @@ mod tests {
         let ticket = crate::util::test::expect_ticket(store, &id).await;
         let expected = ticket.detailed_display();
 
-        let tool = GetTicketTool;
-        let ws = test_ws("/tmp");
+        let tool = GetTicketTool::new(&ws);
         let args = json!({"ticket_id": id});
         let result = tool.execute(&ws, args).await.expect("execute");
         assert_eq!(
@@ -579,15 +672,15 @@ mod tests {
         crate::util::test::init_test_stores().await;
 
         let store = board_store();
-        let id = TicketBuilder::new(store, &test_ws("/ws"))
+        let ws = test_ws("/ws");
+        let id = TicketBuilder::new(store, &ws)
             .title("CommentTest")
             .desc("add a comment")
             .create()
             .await
             .expect("create");
 
-        let tool = AddCommentTool;
-        let ws = test_ws("/tmp");
+        let tool = AddCommentTool::new(&ws);
         let args = json!({
             "ticket_id": id,
             "content": "This is a test comment",
@@ -607,16 +700,10 @@ mod tests {
         crate::util::test::init_test_stores().await;
 
         let store = board_store();
-        let id = make_ticket(
-            store,
-            &test_ws("/ws"),
-            "Test",
-            crate::board::TicketPhase::Backlog,
-        )
-        .await;
+        let ws = test_ws("/ws");
+        let id = make_ticket(store, &ws, "Test", crate::board::TicketPhase::Backlog).await;
 
-        let tool = UpdateTicketTool;
-        let ws = test_ws("/tmp");
+        let tool = UpdateTicketTool::new(&ws);
         let args = json!({
             "ticket_id": id,
             "phase": "invalid_phase"
@@ -686,11 +773,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_ticket_blocked_by_pipeline() {
         let id = create_blocking_ticket().await;
-        let result = UpdateTicketTool
-            .execute(
-                &test_ws("/tmp"),
-                json!({"ticket_id": id, "phase": "backlog"}),
-            )
+        let ws = test_ws("/ws");
+        let result = UpdateTicketTool::new(&ws)
+            .execute(&ws, json!({"ticket_id": id, "phase": "backlog"}))
             .await;
         assert!(
             result.is_err(),
@@ -701,9 +786,10 @@ mod tests {
     #[tokio::test]
     async fn test_create_ticket_supersede_blocked_by_pipeline() {
         let id = create_blocking_ticket().await;
-        let result = CreateTicketTool::new("test")
+        let ws = test_ws("/ws");
+        let result = CreateTicketTool::new("test", &ws)
             .execute(
-                &test_ws("/ws"),
+                &ws,
                 json!({"title": "Replacement", "description": "trying to supersede", "supersede": id}),
             )
             .await;
@@ -729,7 +815,7 @@ mod tests {
             .expect("create old ticket");
 
         // Supersede without specifying priority — should inherit priority 0.
-        let tool = CreateTicketTool::new("manager");
+        let tool = CreateTicketTool::new("manager", &ws);
         let args = json!({
             "title": "Replacement",
             "description": "superseding the urgent ticket",
@@ -773,7 +859,7 @@ mod tests {
 
         // Supersede with explicit priority — should use the explicit value,
         // not inherit the old ticket's priority.
-        let tool = CreateTicketTool::new("manager");
+        let tool = CreateTicketTool::new("manager", &ws);
         let args = json!({
             "title": "Replacement",
             "description": "superseding with explicit priority",
@@ -802,15 +888,77 @@ mod tests {
     #[tokio::test]
     async fn test_add_comment_allowed_on_pipeline_blocking() {
         let id = create_blocking_ticket().await;
-        let result = AddCommentTool
+        let ws = test_ws("/ws");
+        let result = AddCommentTool::new(&ws)
             .execute(
-                &test_ws("/tmp"),
+                &ws,
                 json!({"ticket_id": id, "content": "This should be allowed now"}),
             )
             .await;
         assert!(
             result.is_ok(),
             "Comments should be allowed on pipeline-blocking tickets"
+        );
+    }
+
+    #[test]
+    fn test_resolve_ticket_id() {
+        // Bare numbers resolve against the bound workspace.
+        assert_eq!(resolve_ticket_id("ws", "123").unwrap(), "ws-123");
+        assert_eq!(resolve_ticket_id("ws", "  7 ").unwrap(), "ws-7");
+        // Fully prefixed form for the bound workspace is accepted.
+        assert_eq!(resolve_ticket_id("ws", "ws-123").unwrap(), "ws-123");
+        assert_eq!(resolve_ticket_id("my_ws", "my_ws-42").unwrap(), "my_ws-42");
+        // Foreign workspace prefixes are rejected.
+        let err = format!("{}", resolve_ticket_id("ws", "other-123").unwrap_err());
+        assert!(
+            err.contains("different workspace"),
+            "foreign prefix should be rejected: {err}"
+        );
+        // Malformed IDs are rejected.
+        for bad in [
+            "", "abc", "-5", "ws-abc", "123-456", "ws-", "ws-12-34", "___-123",
+        ] {
+            assert!(
+                resolve_ticket_id("ws", bad).is_err(),
+                "malformed ID '{bad}' should be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_ticket_workspace_binding() {
+        crate::util::test::init_test_stores().await;
+
+        let store = board_store();
+        let ws = test_ws("/ws");
+        let id = TicketBuilder::new(store, &ws)
+            .title("Bound")
+            .desc("binding test")
+            .create()
+            .await
+            .expect("create");
+
+        let ticket = crate::util::test::expect_ticket(store, &id).await;
+        let expected = ticket.detailed_display();
+
+        // Bare numeric ID resolves against the bound workspace.
+        let seq = id.strip_prefix("ws-").expect("prefixed id");
+        let result = GetTicketTool::new(&ws)
+            .execute(&ws, json!({"ticket_id": seq}))
+            .await
+            .expect("bare number should resolve");
+        assert_eq!(result, expected);
+
+        // A tool bound to another workspace rejects the foreign ticket.
+        let foreign = test_ws("/other");
+        let err = GetTicketTool::new(&foreign)
+            .execute(&foreign, json!({"ticket_id": id}))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("different workspace"),
+            "foreign ticket should be rejected: {err}"
         );
     }
 }

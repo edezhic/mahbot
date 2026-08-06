@@ -340,7 +340,7 @@ mod tests {
 
         let mut expected: HashSet<String> = HashSet::new();
         for role in Role::iter() {
-            for tool in role.tools() {
+            for tool in role.tools(&crate::workspace::test_ws("test")) {
                 expected.insert(tool.name().to_string());
             }
         }

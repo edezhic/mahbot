@@ -1946,7 +1946,7 @@ impl BoardStore {
     // The board owns the schema (`ngram` tokenizer, FTS index name, blob format)
     // and the tool layer owns the hybrid RRF merge logic.
 
-    /// Search archived tickets by FTS keyword match.
+    /// Search archived tickets by FTS keyword match, scoped to a workspace.
     ///
     /// Sanitizes the input query (strips non-alphanumeric characters) before
     /// matching against the `ngram`-tokenized FTS index on `title`.
@@ -1959,26 +1959,33 @@ impl BoardStore {
         &self,
         query: &str,
         limit: usize,
+        workspace_name: &str,
     ) -> Result<Vec<(String, f64)>> {
         let sanitized = crate::turso::sanitize_fts_query(query);
         if sanitized.is_empty() {
             return Ok(Vec::new());
         }
 
+        // Param order mirrors search_active_by_fts: ?1 = workspace, ?2 = query.
         let sql = format!(
-            "SELECT t.id, fts_score(t.title, ?1) AS score \
+            "SELECT t.id, fts_score(t.title, ?2) AS score \
              FROM tickets t \
              WHERE t.is_archived = 1 \
-               AND t.title MATCH ?1 \
+               AND t.workspace_name = ?1 \
+               AND t.title MATCH ?2 \
              ORDER BY score DESC LIMIT {limit}"
         );
         match self
             .conn
-            .query_map(&sql, turso::params![sanitized.clone()], |row| {
-                let id: String = row.get(0)?;
-                let score: f64 = row.get(1)?;
-                Ok::<_, anyhow::Error>((id, score))
-            })
+            .query_map(
+                &sql,
+                turso::params![workspace_name, sanitized.clone()],
+                |row| {
+                    let id: String = row.get(0)?;
+                    let score: f64 = row.get(1)?;
+                    Ok::<_, anyhow::Error>((id, score))
+                },
+            )
             .await
         {
             Ok(items) => Ok(items
@@ -2058,7 +2065,8 @@ impl BoardStore {
         }
     }
 
-    /// List archived tickets with non-NULL embeddings, deserialized.
+    /// List archived tickets with non-NULL embeddings, deserialized, scoped to
+    /// a workspace.
     ///
     /// Returns `(id, embedding)` pairs for all archived tickets that have
     /// a stored embedding blob. Embeddings are deserialized from the
@@ -2069,13 +2077,16 @@ impl BoardStore {
     /// LIMIT because the caller (the tool layer) needs all candidates for
     /// cosine-similarity ranking, and the archive size is bounded in practice
     /// by the total ticket volume of the installation.
-    pub async fn list_archived_with_embeddings(&self) -> Result<Vec<(String, Vec<f32>)>> {
+    pub async fn list_archived_with_embeddings(
+        &self,
+        workspace_name: &str,
+    ) -> Result<Vec<(String, Vec<f32>)>> {
         let rows = self
             .conn
             .query(
                 "SELECT id, embedding FROM tickets \
-                 WHERE is_archived = 1 AND embedding IS NOT NULL",
-                turso::params![],
+                 WHERE is_archived = 1 AND workspace_name = ?1 AND embedding IS NOT NULL",
+                turso::params![workspace_name],
             )
             .await?;
 

@@ -1304,7 +1304,7 @@ async fn test_create_ticket_tool_with_prerequisites() {
     // Create a prerequisite via the store directly
     let p_id = make_ticket(store, &ws, "Pre", TicketPhase::Backlog).await;
 
-    let tool = crate::tools::CreateTicketTool::new("test");
+    let tool = crate::tools::CreateTicketTool::new("test", &ws);
     let args = serde_json::json!({
         "title": "Test with prereqs",
         "description": "depends on something",
@@ -1483,7 +1483,7 @@ async fn test_supersede_tool() {
     // Create old ticket
     let old_id = make_ticket(store, &ws, "Old", TicketPhase::Backlog).await;
 
-    let tool = crate::tools::CreateTicketTool::new("test");
+    let tool = crate::tools::CreateTicketTool::new("test", &ws);
     let args = serde_json::json!({
         "title": "Refined",
         "description": "refined desc",
@@ -2198,7 +2198,7 @@ async fn test_search_archived_by_fts_finds_matching_title() {
     let id = create_archived_ticket(&store, "Fix network timeout bug", "ws1").await;
 
     let results = store
-        .search_archived_by_fts("network timeout", 10)
+        .search_archived_by_fts("network timeout", 10, "ws1")
         .await
         .expect("FTS search");
     assert!(!results.is_empty(), "should find the ticket");
@@ -2223,7 +2223,7 @@ async fn test_search_archived_by_fts_excludes_non_archived() {
     .await;
 
     let results = store
-        .search_archived_by_fts("active", 10)
+        .search_archived_by_fts("active", 10, "ws2")
         .await
         .expect("FTS search");
     assert!(results.is_empty(), "non-archived ticket should not appear");
@@ -2233,7 +2233,7 @@ async fn test_search_archived_by_fts_excludes_non_archived() {
 async fn test_search_archived_by_fts_punctuation_only() {
     let (store, _tmp) = open_test_store().await;
     let results = store
-        .search_archived_by_fts("!@#$%", 10)
+        .search_archived_by_fts("!@#$%", 10, "ws")
         .await
         .expect("FTS search");
     assert!(
@@ -2548,7 +2548,10 @@ async fn test_list_archived_with_embeddings_returns_deserialized() {
 
     // Empty DB returns empty
     {
-        let candidates = store.list_archived_with_embeddings().await.expect("list");
+        let candidates = store
+            .list_archived_with_embeddings("ws")
+            .await
+            .expect("list");
         assert!(candidates.is_empty(), "no tickets at all");
     }
 
@@ -2567,7 +2570,10 @@ async fn test_list_archived_with_embeddings_returns_deserialized() {
         .expect("create_ticket with embedding");
     store.set_archived(&id).await.expect("archive");
 
-    let candidates = store.list_archived_with_embeddings().await.expect("list");
+    let candidates = store
+        .list_archived_with_embeddings("ws")
+        .await
+        .expect("list");
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].0, id);
     assert_eq!(candidates[0].1, vec![1.0, 2.0]);

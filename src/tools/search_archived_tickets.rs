@@ -17,7 +17,19 @@ use tracing::debug;
 ///
 /// Uses the board's FTS index (`BoardStore::search_archived_by_fts`) and local
 /// embeddings (`embedder::embed_query()`) with RRF merge (`vector::hybrid_merge`).
-pub struct SearchArchivedTicketsTool;
+/// Bound to a single workspace at construction time — search never crosses
+/// workspace boundaries.
+pub struct SearchArchivedTicketsTool {
+    ws_name: String,
+}
+
+impl SearchArchivedTicketsTool {
+    pub fn new(ws: &Workspace) -> Self {
+        Self {
+            ws_name: ws.name.clone(),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for SearchArchivedTicketsTool {
@@ -46,8 +58,8 @@ impl Tool for SearchArchivedTicketsTool {
         let board = crate::board::store();
 
         let (fts_results, vector_results) = tokio::join!(
-            Self::fts_search(board, query),
-            Self::vector_search(board, query),
+            Self::fts_search(board, &self.ws_name, query),
+            Self::vector_search(board, &self.ws_name, query),
         );
         let fts_results = fts_results?;
         let vector_results = vector_results?;
@@ -70,9 +82,12 @@ impl SearchArchivedTicketsTool {
     /// empty vec (fall through to vector search).
     async fn fts_search(
         board: &crate::board::BoardStore,
+        workspace_name: &str,
         query: &str,
     ) -> Result<Vec<(String, f32)>> {
-        let results = board.search_archived_by_fts(query, 50).await?;
+        let results = board
+            .search_archived_by_fts(query, 50, workspace_name)
+            .await?;
         Ok(results
             .into_iter()
             .map(|(id, score)| {
@@ -86,6 +101,7 @@ impl SearchArchivedTicketsTool {
     /// embeddings by cosine similarity.
     async fn vector_search(
         board: &crate::board::BoardStore,
+        workspace_name: &str,
         query: &str,
     ) -> Result<Vec<(String, f32)>> {
         let Some(q_emb) = crate::embedder::embed_query(query) else {
@@ -93,7 +109,7 @@ impl SearchArchivedTicketsTool {
             return Ok(Vec::new());
         };
 
-        let candidates = board.list_archived_with_embeddings().await?;
+        let candidates = board.list_archived_with_embeddings(workspace_name).await?;
 
         if candidates.is_empty() {
             debug!("All archived tickets have NULL embeddings — vector search skipped");
@@ -157,9 +173,10 @@ mod tests {
         .await;
         store.set_archived(&id).await.expect("archive");
 
-        let results = super::SearchArchivedTicketsTool::fts_search(&store, "UniqueSearchable")
-            .await
-            .expect("fts_search");
+        let results =
+            super::SearchArchivedTicketsTool::fts_search(&store, "ws", "UniqueSearchable")
+                .await
+                .expect("fts_search");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, id);
         // f64→f32 conversion should succeed without precision loss for scores
