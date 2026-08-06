@@ -21,6 +21,21 @@ use super::theme;
 use super::widget_helpers;
 use super::widgets::{badge_pill, diff_stats_row, selectable_text};
 
+/// Phases where an agent is actively running on the ticket. Cancelling a
+/// ticket in one of these phases aborts an in-flight agent run — the
+/// technical-failure auto-pause trigger (see `PerformAction`). The phase
+/// alone is a coarse proxy: `assigned_to` must also be set, so queued
+/// tickets in an agent phase with no running agent are not treated as
+/// in-flight cancels.
+const AGENT_RUNNING_PHASES: &[TicketPhase] = &[
+    TicketPhase::Analysis,
+    TicketPhase::InDevelopment,
+    TicketPhase::InDiagnostics,
+    TicketPhase::InReview,
+    TicketPhase::InQa,
+    TicketPhase::InSanitation,
+];
+
 /// Per-file stat from `git show --numstat`.
 #[derive(Debug, Clone)]
 pub struct FileStat {
@@ -482,6 +497,31 @@ impl BoardState {
                         let phase: TicketPhase = new_phase
                             .parse()
                             .map_err(|_| format!("Invalid phase: {new_phase}"))?;
+                        // Cancelling a ticket with an agent mid-flight aborts the
+                        // run — pause the workspace so queued development tickets
+                        // don't cascade. Supersede auto-cancels and Manager-tool
+                        // cancels don't go through here; shutdown and
+                        // already-paused are handled inside the helper.
+                        if phase == TicketPhase::Cancelled
+                            && let Ok(Some(ticket)) = board.get_ticket(&ticket_id).await
+                            && AGENT_RUNNING_PHASES.contains(&ticket.phase)
+                            && ticket.assigned_to.is_some()
+                        {
+                            let notice = crate::management::pause_workspace_on_failure(
+                                &ticket,
+                                "user cancelled the ticket while an agent was running",
+                            )
+                            .await;
+                            if !notice.is_empty() {
+                                let _ = board
+                                    .add_comment(
+                                        &ticket_id,
+                                        crate::role::SYSTEM_ROLE,
+                                        notice.trim(),
+                                    )
+                                    .await;
+                            }
+                        }
                         board
                             .transition_to(&ticket_id, None, phase, None)
                             .await

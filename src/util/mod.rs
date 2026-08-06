@@ -287,6 +287,12 @@ pub(crate) fn log_join_failures(
     }
 }
 
+/// Byte cap for failure-detail dumps (error chains, raw verdict responses).
+/// Retry-exhaustion chains embed up to 13 per-attempt errors, and comment
+/// dumps are read verbatim by downstream agents — the sandwich truncation
+/// keeps the head (outermost context) and tail (last attempt's cause).
+pub(crate) const FAILURE_DETAIL_CAP: usize = 24_000;
+
 /// Truncate a string to at most `max_bytes` bytes using a head/tail
 /// "sandwich" strategy: keeps the first ~2/3 and last ~1/3, inserting an
 /// omission marker between them. Returns the input unchanged if it fits

@@ -585,7 +585,7 @@ fn fail_verdict() -> crate::Verdict {
 
 /// Helper: a `ParallelVerdict` with no response.
 fn no_verdict() -> ParallelVerdict {
-    ParallelVerdict::NoResponse
+    ParallelVerdict::NoResponse("agent produced no response".into())
 }
 
 /// Add a failure comment for circuit breaker testing, matching the
@@ -735,6 +735,82 @@ async fn process_verifier_verdicts_cases() {
             case.name, case.expected_pipeline_reservation, ticket.pipeline_reservation,
         );
     }
+}
+
+/// Regression guard for the auto-pause trigger boundaries:
+///
+/// - A technical failure (all verifier agents failing) pauses the workspace.
+/// - A circuit-breaker trip does NOT pause (it keeps its drain-to-Planning
+///   handling) — the pause must be site-gated, not a generic Failed hook.
+#[tokio::test]
+async fn technical_failure_pauses_workspace_but_circuit_breaker_does_not() {
+    init_management_test_stores().await;
+
+    // ── Circuit-breaker trip must NOT pause the workspace ──────────────
+    let ws_breaker = create_test_workspace("/tmp/pause_breaker_ws", "ws_pause_breaker").await;
+    let breaker_id = make_ticket(board(), &ws_breaker, "Breaker Trip", TicketPhase::InReview).await;
+    for i in 0..=CircuitBreakerKind::TotalComments.max_count() {
+        board()
+            .add_comment(&breaker_id, "user", &format!("Comment {i}"))
+            .await
+            .expect("add breaker comment");
+    }
+    let ticket = expect_ticket(board(), &breaker_id).await;
+    assert!(
+        try_trip_circuit_breaker(
+            &ticket,
+            TicketPhase::InReview,
+            CircuitBreakerKind::TotalComments,
+            "TotalComments",
+        )
+        .await,
+        "breaker should trip"
+    );
+    let ws = crate::workspace::store()
+        .get_by_name("ws_pause_breaker")
+        .await
+        .expect("get workspace")
+        .expect("workspace exists");
+    assert!(
+        !ws.paused,
+        "circuit-breaker trip must NOT pause the workspace"
+    );
+
+    // ── Verifier all-failed must pause the workspace ───────────────────
+    let ws_verifier = create_test_workspace("/tmp/pause_verifier_ws", "ws_pause_verifier").await;
+    let verifier_id = make_ticket(
+        board(),
+        &ws_verifier,
+        "Verifier All Failed",
+        TicketPhase::InReview,
+    )
+    .await;
+    let ticket = expect_ticket(board(), &verifier_id).await;
+    let transitioned =
+        process_verifier_verdicts(&ticket, &vec![no_verdict(); 3], REVIEWER_VI).await;
+    assert!(
+        transitioned,
+        "all-failed round should transition the ticket"
+    );
+    let ws = crate::workspace::store()
+        .get_by_name("ws_pause_verifier")
+        .await
+        .expect("get workspace")
+        .expect("workspace exists");
+    assert!(ws.paused, "verifier all-failed must pause the workspace");
+
+    // The failure comment must carry the pause notice + a per-agent reason.
+    let comments = board()
+        .get_comments(&verifier_id)
+        .await
+        .expect("get comments");
+    let last = comments
+        .last()
+        .expect("failure comment written")
+        .content
+        .clone();
+    assert!(last.contains("Workspace paused"), "{last}");
+    assert!(last.contains("agent produced no response"), "{last}");
 }
 
 // ── process_analyst_verdicts — analyst scoring and transitions ─────────

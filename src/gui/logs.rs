@@ -782,6 +782,10 @@ impl LogsState {
                         serde_json::Value::String(s) => s.clone(),
                         other => other.to_string(),
                     };
+                    // Cap the tag text so long fields (e.g. error_chain) render
+                    // as readable tags instead of overflowing the row; the full
+                    // value stays queryable in the log store.
+                    let val_str = crate::util::truncate(&val_str, 200);
                     tags = tags.push(
                         container(
                             text(format!("{key}: {val_str}"))

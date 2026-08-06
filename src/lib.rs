@@ -317,6 +317,14 @@ pub struct Workspace {
     /// Whether development dispatch is paused for this workspace (blocks
     /// ready_for_development → in_development). All other pipeline phases
     /// (analysis, review, QA, diagnostics, sanitation, maintainer) run normally.
+    ///
+    /// Automatically set to `true` on technical/agent failures (dispatch panic,
+    /// agent run failure, all verifiers failing, user cancelling an in-flight
+    /// run) so queued development tickets aren't claimed and don't cascade.
+    /// Lifted via the normal unpause path (GUI toggle or rediscovery; the
+    /// nightly loop skips paused workspaces). A discovery already in flight
+    /// when the pause lands can still clear it on completion — residual race,
+    /// see `finalize_discovery`.
     pub paused: bool,
     /// Minutes until the next maintainer run.
     /// Reset to 1 when a run creates tickets; doubled on empty runs

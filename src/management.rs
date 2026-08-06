@@ -255,6 +255,14 @@ struct TransitionCtx<'a> {
     target: TicketPhase,
     notify: NotifyPolicy,
     log_label: &'a str,
+    /// True when this Failed transition was a circuit-breaker drain — the
+    /// failure notification then describes the drain instead of the
+    /// auto-pause. Read only on Failed transitions; the readers are the
+    /// circuit-breaker trip (`true`) and the technical-failure sites —
+    /// dispatch panic, engineer failure, verifier all-failed (`false`).
+    /// Every Failed site must set it explicitly so the notification renders
+    /// the sentence matching the mechanism that ran.
+    breaker_trip: bool,
 }
 
 /// Unified helper for combining comment writes + phase transition + notification.
@@ -320,7 +328,9 @@ where
     }
 
     match ctx.notify {
-        NotifyPolicy::Notify => notify_ticket(ctx.ticket, ctx.source, ctx.target).await,
+        NotifyPolicy::Notify => {
+            notify_ticket(ctx.ticket, ctx.source, ctx.target, ctx.breaker_trip).await;
+        }
         NotifyPolicy::Buffer => {
             ticket_buffer::push(
                 &ctx.ticket.workspace_name,
@@ -403,14 +413,95 @@ async fn resolve_ticket_workspace(ticket: &Ticket, log_label: &str) -> Option<cr
     }
 }
 
+/// Wording shared by the failure-comment pause note and the Manager
+/// notification: the pause gate blocks ReadyForDevelopment→InDevelopment
+/// claims only (see [`run_claim_pipeline`]), so the consequence must be scoped
+/// to development — earlier-phase queues (Backlog→Analysis) still run.
+/// Single-sourced so the two sites cannot drift.
+fn paused_workspace_sentence() -> &'static str {
+    "new development claims are blocked until the workspace is resumed"
+}
+
+/// Pause the workspace after a technical/agent failure so queued development
+/// tickets are not claimed and don't cascade through the pipeline failing
+/// identically one after another.
+///
+/// Returns a notice string to append to the ticket's failure comment, or an
+/// empty string when the workspace was not paused (already paused, or the
+/// service is shutting down — a shutdown-interrupted run must never pause).
+///
+/// # Orphaned-pause corner
+///
+/// Runs before the caller's Failed transition: if that transition fails (DB
+/// error), the workspace stays paused with no failure comment or
+/// notification. Rare and recoverable via the normal GUI unpause.
+///
+/// # Circuit-breaker exclusion
+///
+/// This is intentionally NOT called from [`try_trip_circuit_breaker`] — breaker
+/// trips keep their existing drain-to-Planning handling and must not pause.
+/// Callers are the four technical-failure sites: dispatch panic, engineer
+/// agent failure, all verifier agents failing, and the GUI cancel of an
+/// in-flight agent run.
+///
+/// # Scope
+///
+/// Sanitation/diagnostics agent failures never reach this helper: they retry,
+/// then trip their circuit breaker (which must not pause). Analyst failures
+/// never fail the ticket (analysts always advance to Planning), and mixed
+/// verifier rounds (some failures + a sub-threshold verdict) bounce to
+/// ReadyForDevelopment without pausing. Ask-tool sub-agent failures (parallel
+/// analysts/engineers under [`AskTool`](crate::tools::AskTool)) likewise never
+/// reach this helper — they are tool calls inside a caller's run, not
+/// ticket-level failures. The pause gate itself only blocks
+/// ReadyForDevelopment→InDevelopment claims, so a dispatch panic in an earlier
+/// phase still cascades through queued tickets until one reaches the Engineer.
+pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) -> String {
+    if crate::shutdown::shutdown_token().is_cancelled() {
+        return String::new();
+    }
+    let Some(ws) = resolve_ticket_workspace(ticket, "auto-pause skipped").await else {
+        return String::new();
+    };
+    if ws.paused {
+        return String::new();
+    }
+    match crate::workspace::store().set_paused(&ws.name, true).await {
+        Ok(()) => {
+            info!(
+                ticket = %ticket.id,
+                workspace = %ws.name,
+                reason,
+                "Workspace auto-paused after failure"
+            );
+            format!(
+                "\n\n⚠️ Workspace paused: {reason} — {}.",
+                paused_workspace_sentence()
+            )
+        }
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                workspace = %ws.name,
+                reason,
+                error = %e,
+                "Failed to auto-pause workspace after technical failure",
+            );
+            String::new()
+        }
+    }
+}
+
 /// Enqueue a notification for the Manager about a ticket transition.
 ///
 /// Renders a template with the ticket ID, title, target phase, transition log,
 /// and the workspace's buffered non-critical transitions (see "Side effects"
 /// below), then routes the result through the message router.
 ///
-/// This function does NOT pause the workspace — the Manager handles failed
-/// tickets autonomously via the triage prompt.
+/// This function does NOT pause the workspace — technical-failure pause
+/// happens at the trigger sites (dispatch panic, engineer failure, verifier
+/// all-failed, GUI cancel) before the transition that fires this notification.
+/// The Manager handles failed tickets via the triage prompt.
 ///
 /// # Side effects
 ///
@@ -432,7 +523,12 @@ async fn resolve_ticket_workspace(ticket: &Ticket, log_label: &str) -> Option<cr
 /// must see both notification context and user conversation history in a unified
 /// session. Do NOT change this ID or add `manager_` to `TRANSIENT_AGENT_ID_PREFIXES`
 /// — it would either break context continuity or nuke user conversation history.
-async fn notify_ticket(ticket: &Ticket, source: TicketPhase, target_phase: TicketPhase) {
+async fn notify_ticket(
+    ticket: &Ticket,
+    source: TicketPhase,
+    target_phase: TicketPhase,
+    breaker_trip: bool,
+) {
     let Some(ws) = resolve_ticket_workspace(ticket, "skipping notification").await else {
         error!(
             ticket = %ticket.id,
@@ -482,9 +578,28 @@ async fn notify_ticket(ticket: &Ticket, source: TicketPhase, target_phase: Ticke
             Err(_) => "(unknown failure reason)".to_string(),
         };
 
+        // The workspace_status sentence is chosen from the failure MECHANISM,
+        // not from `ws.paused` alone: a circuit-breaker drain moved tickets
+        // back to Planning (regardless of pause state), while a technical
+        // failure auto-pauses when `ws.paused` is set. When a technical
+        // failure could not pause (set_paused error), neither claim is made.
+        let workspace_status = if breaker_trip {
+            "Beware that all the other tickets have been moved back from Ready for Dev \
+             to Planning."
+                .to_string()
+        } else if ws.paused {
+            format!("The workspace is paused — {}.", paused_workspace_sentence())
+        } else {
+            "The workspace was not paused — remaining queued tickets may still be claimed."
+                .to_string()
+        };
+
         let warning = substitute(
             &load_prompt("failure_notification.md"),
-            &[("{{failure_details}}", &failure_details)],
+            &[
+                ("{{failure_details}}", &failure_details),
+                ("{{workspace_status}}", &workspace_status),
+            ],
         );
         message.push_str("\n\n");
         message.push_str(&warning);
@@ -617,15 +732,21 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
         .await;
 
         if let Err(payload) = result {
-            let msg = panic_message(&*payload);
+            // Panic payloads can embed credential-bearing content (paths, env,
+            // tool output) — scrub before the log and the failure comment.
+            let msg = crate::util::scrub_credentials(&panic_message(&*payload));
             error!(
                 ticket = %ticket_for_failure.id,
                 panic = %msg,
                 "Dispatch panicked — transitioning ticket to Failed",
             );
+            // Pause before the Failed transition so the failure notification
+            // reflects the paused workspace. Shutdown is excluded inside the helper.
+            let pause_note =
+                pause_workspace_on_failure(&ticket_for_failure, "dispatch panic").await;
             // Best-effort transition: the ticket may have been moved
             // externally while the dispatch was running.
-            let panic_comment = format!("❌ Dispatch panicked: {msg}");
+            let panic_comment = format!("❌ Dispatch panicked: {msg}{pause_note}");
             let _ = comment_and_transition(
                 TransitionCtx {
                     ticket: &ticket_for_failure,
@@ -633,6 +754,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
                     target: TicketPhase::Failed,
                     notify: NotifyPolicy::Notify,
                     log_label: "dispatch panic",
+                    breaker_trip: false,
                 },
                 SYSTEM_ROLE,
                 &panic_comment,
@@ -1045,7 +1167,7 @@ async fn run_single_agent(
 /// (LLM retry exhaustion, process shutdown, user cancellation, concrete agent
 /// errors) stop looking identical in ticket history. The generic template is
 /// retained only for genuinely-unknown causes. Error detail is credential-
-/// scrubbed then sandwich-truncated to [`VERDICT_RAW_DUMP_CAP`].
+/// scrubbed then sandwich-truncated to [`crate::util::FAILURE_DETAIL_CAP`].
 ///
 /// Classification order matters: the global shutdown token fires on SIGTERM/
 /// SIGINT and dashboard close, the per-agent token on /stop and dashboard
@@ -1069,7 +1191,11 @@ fn engineer_failure_comment(shutdown: bool, cancelled: bool, error: Option<&str>
         return load_prompt("engineer_failed.md");
     };
     let detail = crate::util::scrub_credentials(detail);
-    let detail = crate::util::truncate_sandwich(&detail, VERDICT_RAW_DUMP_CAP, "engineer failure");
+    let detail = crate::util::truncate_sandwich(
+        &detail,
+        crate::util::FAILURE_DETAIL_CAP,
+        "engineer failure",
+    );
     // Matches the agent-loop exhaustion marker ("exhausted retry budget") so
     // retry exhaustion keeps its dedicated classification.
     if detail.contains("exhausted retry budget") {
@@ -1143,13 +1269,21 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     );
     let (comment_text, target_phase, notify) = if let Some(ref text) = response {
         (
-            text.as_str(),
+            text.clone(),
             TicketPhase::InDiagnostics,
             NotifyPolicy::Buffer,
         )
     } else {
+        // Pause before the Failed transition so the failure notification
+        // reflects the paused workspace. Shutdown is excluded inside the helper.
+        let pause_reason = if agent.is_cancelled() {
+            "user cancelled the agent run"
+        } else {
+            "engineer agent failure"
+        };
+        let pause_note = pause_workspace_on_failure(&ticket, pause_reason).await;
         (
-            failure_comment.as_str(),
+            format!("{failure_comment}{pause_note}"),
             TicketPhase::Failed,
             NotifyPolicy::Notify,
         )
@@ -1162,9 +1296,10 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
             target: target_phase,
             notify,
             log_label: "Engineer",
+            breaker_trip: false,
         },
         Role::Engineer.as_str(),
-        comment_text,
+        &comment_text,
         "Engineer finished — transitioned ticket",
     )
     .await;
@@ -1220,6 +1355,7 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
             target: TicketPhase::Done,
             notify: notify_policy,
             log_label,
+            breaker_trip: false,
         },
         SYSTEM_ROLE,
         comment,
@@ -1370,6 +1506,7 @@ async fn finalize_commit_and_transition(
             target: TicketPhase::Done,
             notify: notify_policy,
             log_label: &log_label,
+            breaker_trip: false,
         },
         async |tx| {
             BoardStore::set_commit_info_tx(
@@ -1729,6 +1866,7 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
                 target: TicketPhase::SanitationPassed,
                 notify: NotifyPolicy::Buffer,
                 log_label: "Sanitation",
+                breaker_trip: false,
             },
             Role::Sanitation.as_str(),
             &comment,
@@ -1767,6 +1905,7 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
                 target: TicketPhase::ReadyForDevelopment,
                 notify: NotifyPolicy::Buffer,
                 log_label: "Sanitation",
+                breaker_trip: false,
             },
             async |tx| {
                 BoardStore::add_comment_tx(
@@ -1986,6 +2125,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
             target: target_phase,
             notify: NotifyPolicy::Buffer,
             log_label: "Diagnostics",
+            breaker_trip: false,
         },
         DIAGNOSTICS_ROLE,
         &comment_body,
@@ -2023,7 +2163,9 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 #[derive(Clone)]
 enum ParallelVerdict {
     /// Agent failed to produce any response (crashed, timed out, empty output).
-    NoResponse,
+    /// Carries the collapsed failure reason (scrubbed) so the cause survives
+    /// through to the ticket failure record and the log.
+    NoResponse(String),
     /// Agent produced a response but structured verdict extraction failed
     /// after exhausting the hardened retry loop. Carries the
     /// [`crate::retry::RetryExhausted`] so the raw last-attempt response can be
@@ -2119,7 +2261,22 @@ async fn run_parallel_agents(
 
                     let response = response.unwrap_or_default();
                     if response.is_empty() {
-                        return ParallelVerdict::NoResponse;
+                        // Preserve the failure reason (full chain, scrubbed) so
+                        // the all-failed record and log carry the real cause
+                        // instead of a generic "no response".
+                        let reason = if crate::shutdown::shutdown_token().is_cancelled() {
+                            "service shutting down".to_string()
+                        } else if agent.is_cancelled() {
+                            "agent cancelled by user".to_string()
+                        } else {
+                            agent
+                                .failure
+                                .clone()
+                                .unwrap_or_else(|| "agent produced no response".to_string())
+                        };
+                        return ParallelVerdict::NoResponse(crate::util::scrub_credentials(
+                            &reason,
+                        ));
                     }
                     // KV cache preservation: `agent.extract_verdict` uses the
                     // agent's own parameters (model, reasoning_effort, tools,
@@ -2193,14 +2350,6 @@ enum VerdictFilter {
     FailingOnly,
 }
 
-/// Byte cap for the raw last-attempt response dump in verdict-failure
-/// comments. No comment-size limit exists in the
-/// store, but every downstream agent reads all comments verbatim and the
-/// failure notification embeds the last comment — so cap the dump using the
-/// sandwich-truncation pattern (head + explicit "(N bytes omitted)" marker +
-/// tail — the tail shows where a mid-JSON cut landed).
-const VERDICT_RAW_DUMP_CAP: usize = 24_000;
-
 /// Build the raw-response dump section for a verdict-extraction failure
 /// comment.
 ///
@@ -2216,7 +2365,11 @@ fn raw_response_dump_section(failure: &crate::retry::RetryExhausted) -> String {
     match failure.last_raw.as_deref() {
         Some(text) if !text.trim().is_empty() => format!(
             "Raw agent response (last attempt):\n```\n{}\n```",
-            crate::util::truncate_sandwich(text, VERDICT_RAW_DUMP_CAP, "verdict response")
+            crate::util::truncate_sandwich(
+                text,
+                crate::util::FAILURE_DETAIL_CAP,
+                "verdict response"
+            )
         ),
         Some(_) => "Final attempt was a tool call — no text response produced.".to_string(),
         None => format!(
@@ -2271,12 +2424,23 @@ fn format_verdict_comment(
                 &load_prompt("verdict_parse_failed.md"),
                 &[("{{comment_role}}", comment_role)],
             );
-            Some(format!("{base}\n\n{}", raw_response_dump_section(failure)))
+            let dump = crate::util::scrub_credentials(&raw_response_dump_section(failure));
+            Some(format!("{base}\n\n{dump}"))
         }
-        ParallelVerdict::NoResponse => Some(substitute(
-            &load_prompt("verdict_no_response.md"),
-            &[("{{comment_role}}", comment_role)],
-        )),
+        ParallelVerdict::NoResponse(reason) => {
+            let base = substitute(
+                &load_prompt("verdict_no_response.md"),
+                &[("{{comment_role}}", comment_role)],
+            );
+            // Preserve the collapsed failure reason (scrubbed + capped) so the
+            // ticket record says WHY the agent produced no response.
+            let reason = crate::util::truncate_sandwich(
+                &crate::util::scrub_credentials(reason),
+                crate::util::FAILURE_DETAIL_CAP,
+                "agent failure",
+            );
+            Some(format!("{base}\n\n{reason}"))
+        }
     }
 }
 
@@ -2358,7 +2522,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
     let nonempty_count = results
         .iter()
-        .filter(|r| !matches!(r, ParallelVerdict::NoResponse))
+        .filter(|r| !matches!(r, ParallelVerdict::NoResponse(_)))
         .count();
     let total = results.len();
     let mut lgtm = 0usize;
@@ -2375,7 +2539,9 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
             }
             ParallelVerdict::Verdict(v) if v.score >= ANALYST_PASS_THRESHOLD => minor_issues += 1,
             ParallelVerdict::Verdict(_) => potential_blockers += 1,
-            ParallelVerdict::NoResponse | ParallelVerdict::ParseFailed(_) => missing_analysis += 1,
+            ParallelVerdict::NoResponse(_) | ParallelVerdict::ParseFailed(_) => {
+                missing_analysis += 1;
+            }
         }
     }
 
@@ -2401,6 +2567,7 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
             target: TicketPhase::Planning,
             notify: NotifyPolicy::Notify,
             log_label: "Analyst",
+            breaker_trip: false,
         },
         async |tx| {
             record_verdict_comments_tx(
@@ -2628,6 +2795,7 @@ async fn try_trip_circuit_breaker(
             target: TicketPhase::Failed,
             notify: NotifyPolicy::Notify,
             log_label: &breaker_label,
+            breaker_trip: true,
         },
         SYSTEM_ROLE,
         &msg,
@@ -2643,6 +2811,40 @@ async fn try_trip_circuit_breaker(
     }
 
     true
+}
+
+/// Aggregate per-agent failure reasons for a failed verifier round.
+///
+/// `NoResponse` entries carry the collapsed agent-failure reason; `ParseFailed`
+/// entries carry their [`RetryExhausted`] detail INCLUDING the raw last-attempt
+/// response dump (the primary extraction-failure diagnostic). Each reason is
+/// capped at a per-agent share of [`crate::util::FAILURE_DETAIL_CAP`] so the
+/// shares are fair — the caller's outer `truncate_sandwich` still re-caps the
+/// aggregate, so in multi-agent all-ParseFailed rounds the middle dumps may
+/// still be trimmed. Only called from the all-failed branch, where every
+/// result is `NoResponse` or `ParseFailed`.
+fn verifier_failure_reasons(results: &[ParallelVerdict]) -> String {
+    let per_agent_cap = crate::util::FAILURE_DETAIL_CAP / results.len().max(1);
+    let reasons: Vec<String> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| match r {
+            ParallelVerdict::NoResponse(reason) => Some(format!("{}. {reason}", i + 1)),
+            ParallelVerdict::ParseFailed(f) => Some(format!(
+                "{}. verdict extraction failed: {}",
+                i + 1,
+                crate::util::truncate_sandwich(
+                    &raw_response_dump_section(f),
+                    per_agent_cap,
+                    "agent failure",
+                )
+            )),
+            // Unreachable at the only call site (all_failed) — required for
+            // match exhaustiveness.
+            ParallelVerdict::Verdict(_) => None,
+        })
+        .collect();
+    format!("\n\nPer-agent failures:\n{}", reasons.join("\n"))
 }
 
 /// Process parallel verifier results: add failing comments, determine pass/fail,
@@ -2696,6 +2898,30 @@ async fn process_verifier_verdicts(
         (verifier.success_phase, NotifyPolicy::Buffer)
     };
 
+    // Preserve the per-agent failure reasons (previously collapsed into a
+    // generic "no response") and auto-pause the workspace BEFORE the Failed
+    // transition so the failure notification reflects the paused workspace.
+    // Shutdown is excluded inside the pause helper.
+    let (failure_comment, reasons) = if all_failed {
+        let pause_note =
+            pause_workspace_on_failure(ticket, "all verifier agents failed to produce verdicts")
+                .await;
+        let reasons = verifier_failure_reasons(results);
+        let header = substitute(
+            &load_prompt("verifiers_all_failed.md"),
+            &[("{{agent_type}}", verifier.log_label)],
+        );
+        let body = format!("{reasons}{pause_note}");
+        let failure_comment = crate::util::truncate_sandwich(
+            &crate::util::scrub_credentials(&format!("{header}\n{body}")),
+            crate::util::FAILURE_DETAIL_CAP,
+            "verifier failure",
+        );
+        (failure_comment, reasons)
+    } else {
+        (String::new(), String::new())
+    };
+
     if !with_comment_and_transition(
         TransitionCtx {
             ticket,
@@ -2703,22 +2929,24 @@ async fn process_verifier_verdicts(
             target,
             notify,
             log_label: verifier.log_label,
+            breaker_trip: false,
         },
         async |tx| {
-            record_verdict_comments_tx(
-                tx,
-                &ticket.id,
-                results,
-                verifier.role.as_str(),
-                VerdictFilter::FailingOnly,
-            )
-            .await?;
+            // All-failed rounds skip the per-agent comments — the failure
+            // comment below already aggregates every agent's reason, so
+            // writing both would double-report the same failures.
+            if !all_failed {
+                record_verdict_comments_tx(
+                    tx,
+                    &ticket.id,
+                    results,
+                    verifier.role.as_str(),
+                    VerdictFilter::FailingOnly,
+                )
+                .await?;
+            }
 
             if all_failed {
-                let failure_comment = substitute(
-                    &load_prompt("verifiers_all_failed.md"),
-                    &[("{{agent_type}}", verifier.log_label)],
-                );
                 BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, &failure_comment).await?;
             }
 
@@ -2733,6 +2961,11 @@ async fn process_verifier_verdicts(
     if all_failed {
         info!(
             ticket = %ticket.id,
+            reasons = %crate::util::truncate_sandwich(
+                &crate::util::scrub_credentials(&reasons),
+                crate::util::FAILURE_DETAIL_CAP,
+                "verifier failure",
+            ),
             "{log_label}: all verifier agents failed to produce verdicts — ticket moved to Failed",
             log_label = verifier.log_label,
         );
@@ -2838,6 +3071,7 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
                         target: TicketPhase::Reviewed,
                         notify: NotifyPolicy::Buffer,
                         log_label: vi.log_label,
+                        breaker_trip: false,
                     },
                     SYSTEM_ROLE,
                     "Content is identical to the reviewed base recorded for this ticket \

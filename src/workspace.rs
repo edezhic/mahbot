@@ -310,12 +310,21 @@ async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) 
 ///
 /// ## Invariants
 ///
-/// - If `all_ok`: sets status to `ready` and always unpauses the workspace.
-///   A successful discovery — whether initial or rediscovery — brings the
-///   workspace back to life.
+/// - If `all_ok`: sets status to `ready` and unpauses the workspace. The
+///   discovery flow itself set the analysis pause (`add`/`rediscover` write
+///   `paused = 1` alongside `status = Analyzing`), and rediscovery is the
+///   documented unpause path — so a successful discovery clears it.
 /// - If **not** `all_ok`: sets status to `failed` and leaves `paused` untouched.
 /// - Before any write, checks the generation guard: if a newer [`WorkspaceStore::rediscover`]
 ///   bumped the generation while discovery was in flight, the writes are skipped.
+///
+/// ## Known limitation
+///
+/// A pause that lands mid-flight (failure auto-pause or manual toggle after the
+/// user unpaused an analyzing workspace) is indistinguishable from the
+/// discovery's own analysis pause — the paused column carries no owner or
+/// timestamp. The nightly loop skips paused workspaces, which closes the
+/// scheduled path; the residual window requires a manual unpause mid-analysis.
 async fn finalize_discovery(
     storage: &WorkspaceStore,
     ws_name: &str,
@@ -1160,7 +1169,10 @@ pub async fn run_nightly_check_loop() {
                 break;
             }
 
-            if ws.status != WorkspaceStatus::Ready {
+            if ws.status != WorkspaceStatus::Ready || ws.paused {
+                // Paused workspaces are skipped: a pause (including an automatic
+                // technical-failure pause) is only lifted via the normal unpause
+                // path — nightly rediscovery must not silently resume it.
                 continue;
             }
 

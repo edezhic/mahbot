@@ -1020,24 +1020,45 @@ fn extract_agent_fields(span: &serde_json::Value) -> (String, String, String) {
 ///
 /// `tracing-subscriber` JSON format puts the current span's fields under
 /// `span.agent_id`, `span.role`, and `span.workspace` (or `spans[last].*`).
+/// The three sources are merged per-component — the event's own fields win
+/// where present, the span fills the gaps — so every corner attributes
+/// correctly:
+///
+/// - full event fields (e.g. `run_agent`'s "Agent failed" entry, ask-tool
+///   sub-agent failures) name the failing agent directly, beating the
+///   inherited caller span;
+/// - workspace-only events (e.g. "Search index capacity exhausted") keep the
+///   span's agent attribution;
+/// - agent_id-only events (e.g. session-persistence warnings) keep the span's
+///   role/workspace attribution.
 fn extract_agent_from_span(val: &serde_json::Value) -> (String, String, String) {
-    // Prefer the innermost span (direct `span` key)
-    if let Some(span) = val.get("span") {
-        let (id, role, ws) = extract_agent_fields(span);
-        if !id.is_empty() || !role.is_empty() || !ws.is_empty() {
-            return (id, role, ws);
+    let mut agent_id = String::new();
+    let mut role = String::new();
+    let mut workspace = String::new();
+    for candidate in std::iter::once(val.get("fields"))
+        .chain(std::iter::once(val.get("span")))
+        .chain(std::iter::once(
+            val.get("spans")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.last()),
+        ))
+        .flatten()
+    {
+        let (id, r, ws) = extract_agent_fields(candidate);
+        if agent_id.is_empty() {
+            agent_id = id;
+        }
+        if role.is_empty() {
+            role = r;
+        }
+        if workspace.is_empty() {
+            workspace = ws;
+        }
+        if !agent_id.is_empty() && !role.is_empty() && !workspace.is_empty() {
+            break;
         }
     }
-
-    // Fall back to the last entry in the `spans` array
-    if let Some(spans) = val.get("spans").and_then(|v| v.as_array())
-        && let Some(last_span) = spans.last()
-    {
-        let (id, role, ws) = extract_agent_fields(last_span);
-        return (id, role, ws);
-    }
-
-    (String::new(), String::new(), String::new())
+    (agent_id, role, workspace)
 }
 
 #[cfg(test)]
@@ -1082,22 +1103,62 @@ mod tests {
         assert_eq!(entry.workspace, "");
     }
 
+    /// Agent-attribution corners for `parse_tracing_json`: the event's own
+    /// fields win where present, the span fills the gaps, and the `spans`
+    /// array is the last resort. Each case: (name, line, agent_id, role,
+    /// workspace).
     #[test]
-    fn test_parse_tracing_json_with_span_agent() {
-        let line = r#"{"timestamp":"...","level":"INFO","target":"test","span":{"name":"agent","agent_id":"abc-123","role":"analyst"},"fields":{"message":"researching"}}"#;
-        let entry = parse_tracing_json(line).unwrap();
-        assert_eq!(entry.agent_id, "abc-123");
-        assert_eq!(entry.agent_role, "analyst");
-        assert_eq!(entry.workspace, "");
-    }
-
-    #[test]
-    fn test_parse_tracing_json_with_spans_array() {
-        let line = r#"{"timestamp":"...","level":"INFO","target":"test","spans":[{"name":"parent"},{"name":"agent","agent_id":"xyz-456","role":"coder","workspace":"/ws"}],"fields":{"message":"writing code"}}"#;
-        let entry = parse_tracing_json(line).unwrap();
-        assert_eq!(entry.agent_id, "xyz-456");
-        assert_eq!(entry.agent_role, "coder");
-        assert_eq!(entry.workspace, "/ws");
+    fn test_parse_tracing_json_agent_attribution() {
+        let cases = [
+            (
+                "span only",
+                r#"{"timestamp":"...","level":"INFO","target":"test","span":{"name":"agent","agent_id":"abc-123","role":"analyst"},"fields":{"message":"researching"}}"#,
+                "abc-123",
+                "analyst",
+                "",
+            ),
+            (
+                "spans array",
+                r#"{"timestamp":"...","level":"INFO","target":"test","spans":[{"name":"parent"},{"name":"agent","agent_id":"xyz-456","role":"coder","workspace":"/ws"}],"fields":{"message":"writing code"}}"#,
+                "xyz-456",
+                "coder",
+                "/ws",
+            ),
+            (
+                "event fields without span",
+                r#"{"timestamp":"...","level":"ERROR","target":"mahbot::agent","fields":{"message":"Agent failed","agent_id":"ticket_123_engineer","role":"engineer","workspace":"my-ws","classification":"transport"}}"#,
+                "ticket_123_engineer",
+                "engineer",
+                "my-ws",
+            ),
+            (
+                "event beats inherited span",
+                r#"{"timestamp":"...","level":"ERROR","target":"mahbot::agent","span":{"name":"agent","agent_id":"caller_42","role":"engineer","workspace":"parent-ws"},"fields":{"message":"Agent failed","agent_id":"ask_ws_1_2_analyst","role":"analyst","workspace":"my-ws","classification":"runtime"}}"#,
+                "ask_ws_1_2_analyst",
+                "analyst",
+                "my-ws",
+            ),
+            (
+                "workspace-only event keeps span agent",
+                r#"{"timestamp":"...","level":"WARN","target":"mahbot::tools::edit","span":{"name":"agent","agent_id":"ticket_7_engineer","role":"engineer","workspace":"my-ws"},"fields":{"message":"Search index capacity exhausted","workspace":"my-ws","path":"src/a.rs"}}"#,
+                "ticket_7_engineer",
+                "engineer",
+                "my-ws",
+            ),
+            (
+                "agent_id-only event merges span role/workspace",
+                r#"{"timestamp":"...","level":"WARN","target":"mahbot::agent","span":{"name":"agent","agent_id":"ticket_7_engineer","role":"engineer","workspace":"my-ws"},"fields":{"message":"Failed to persist incoming messages to session DB","agent_id":"ticket_7_engineer","error":"io"}}"#,
+                "ticket_7_engineer",
+                "engineer",
+                "my-ws",
+            ),
+        ];
+        for (name, line, id, role, ws) in cases {
+            let entry = parse_tracing_json(line).unwrap();
+            assert_eq!(entry.agent_id, id, "{name}: agent_id");
+            assert_eq!(entry.agent_role, role, "{name}: agent_role");
+            assert_eq!(entry.workspace, ws, "{name}: workspace");
+        }
     }
 
     /// Create a temporary LogStore for tests.

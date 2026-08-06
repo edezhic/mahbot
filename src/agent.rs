@@ -545,7 +545,7 @@ impl Agent {
         let policy = crate::retry::RetryPolicy::current();
         crate::retry::agent_chat(request, &policy)
             .await
-            .map_err(|e| anyhow::anyhow!("LLM call exhausted retry budget: {e}"))
+            .with_context(|| "LLM call exhausted retry budget")
     }
 
     /// Log tool-call notifications
@@ -761,7 +761,7 @@ impl Agent {
         let policy = crate::retry::RetryPolicy::current();
         let chat_resp = crate::retry::agent_chat(self.build_chat_request(history, false), &policy)
             .await
-            .map_err(|e| anyhow::anyhow!("summarization LLM call exhausted retry budget: {e}"))?;
+            .with_context(|| "summarization LLM call exhausted retry budget")?;
 
         if let Some(ref u) = chat_resp.usage {
             tracing::debug!(
@@ -802,7 +802,14 @@ impl Agent {
                         .await;
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "Summarization failed — continuing with full history");
+                    tracing::warn!(
+                        error_chain = %crate::util::truncate_sandwich(
+                            &crate::util::scrub_credentials(&format!("{e:#}")),
+                            crate::util::FAILURE_DETAIL_CAP,
+                            "summarization failure",
+                        ),
+                        "Summarization failed — continuing with full history"
+                    );
                 }
             }
         }
@@ -891,6 +898,14 @@ pub(crate) async fn run_agent(
     // before we checked, discard the result to prevent overwriting of
     // externally-set cancelled status in downstream code.
     if agent.is_cancelled() {
+        tracing::debug!(
+            agent_id = %agent.agent_id,
+            workspace = %ws.name,
+            role = %role,
+            ticket = ticket.map(|t| t.id.as_str()),
+            classification = failure_classification(&agent, None),
+            "Agent cancelled"
+        );
         return (agent, None);
     }
 
@@ -900,29 +915,68 @@ pub(crate) async fn run_agent(
             // Capture the real cause (full chain) so ticket dispatchers can
             // persist it in failure comments instead of a generic placeholder.
             agent.failure = Some(format!("{e:#}"));
-            // During global (SIGTERM/SIGINT) shutdown, every in-flight agent
-            // hits the `tokio::select!` shutdown branch in work() and returns
-            // an error — this is expected, not a real failure. Log at debug!
+            let classification = failure_classification(&agent, Some(&e));
+            let error_chain = crate::util::truncate_sandwich(
+                &crate::util::scrub_credentials(&format!("{e:#}")),
+                crate::util::FAILURE_DETAIL_CAP,
+                "agent failure log",
+            );
+            // During global (SIGTERM/SIGINT) shutdown, in-flight agents return
+            // errors from work() — expected, not real failures. The global
+            // token fires before `shutdown_all()` cancels per-agent tokens, so
+            // either path resolves to classification "shutdown". Log at debug
             // level to avoid misleading ERROR noise on clean shutdown.
-            if crate::shutdown::shutdown_token().is_cancelled() {
+            if classification == "shutdown" {
                 tracing::debug!(
+                    agent_id = %agent.agent_id,
                     workspace = %ws.name,
                     role = %role,
                     ticket = ticket.map(|t| t.id.as_str()),
-                    error = %e,
+                    classification,
+                    error_chain,
                     "Agent failed during shutdown"
                 );
             } else {
                 tracing::error!(
+                    agent_id = %agent.agent_id,
                     workspace = %ws.name,
                     role = %role,
                     ticket = ticket.map(|t| t.id.as_str()),
-                    error = %e,
+                    classification,
+                    error_chain,
                     "Agent failed"
                 );
             }
             (agent, None)
         }
+    }
+}
+
+/// Stable failure classification for the agent-failure log.
+///
+/// Order matters: the global shutdown token fires on SIGTERM/SIGINT and
+/// dashboard close, the per-agent token on /stop — check the global token
+/// first so shutdown isn't mislabeled as a user cancel. The global token also
+/// cancels every per-agent token via
+/// [`crate::registry::AgentRegistry::shutdown_all`], so the cancelled branch
+/// is only a user cancel when the global token has not fired. `error` is
+/// `None` on the cancelled early-return path (no error exists to classify);
+/// otherwise [`RetryExhausted`] (kept as an error source by
+/// [`llm_call`]/[`summarize`]) carries the granular
+/// [`crate::retry::FailureClass`]; everything else (I/O, tool errors, panics)
+/// falls back to `runtime`.
+fn failure_classification(agent: &Agent, error: Option<&anyhow::Error>) -> &'static str {
+    if crate::shutdown::shutdown_token().is_cancelled() {
+        "shutdown"
+    } else if agent.is_cancelled() {
+        "cancelled"
+    } else if let Some(exhausted) = error.and_then(|e| {
+        e.chain()
+            .find_map(|cause| cause.downcast_ref::<crate::retry::RetryExhausted>())
+    }) {
+        exhausted.final_class.label()
+    } else {
+        "runtime"
     }
 }
 
@@ -995,6 +1049,46 @@ mod tests {
     #[tokio::test]
     async fn tool_with_scrub_disabled_preserves_output() {
         assert_scrubbed(false).await;
+    }
+
+    #[test]
+    fn failure_classification_recovers_retry_exhaustion() {
+        // Mirror llm_call's error construction: the RetryExhausted must
+        // survive as a source (via .context, not string flattening) so the
+        // granular FailureClass is recoverable from the chain.
+        let exhausted = crate::retry::RetryExhausted::with_last_raw(
+            vec![],
+            crate::retry::FailureClass::NonRetryable,
+            None,
+        );
+        let err = anyhow::Error::new(exhausted).context("LLM call exhausted retry budget");
+        // The {:#} chain must keep the marker engineer_failure_comment matches.
+        assert!(format!("{err:#}").contains("exhausted retry budget"));
+
+        let agent = make_agent(vec![]);
+        assert_eq!(
+            failure_classification(&agent, Some(&err)),
+            "non_retryable",
+            "RetryExhausted final_class must be recovered from the chain",
+        );
+
+        // Non-retry-loop errors (I/O, tool, panic) fall back to runtime.
+        let runtime_err = anyhow::anyhow!("tool panicked");
+        assert_eq!(
+            failure_classification(&agent, Some(&runtime_err)),
+            "runtime"
+        );
+
+        // User cancellation (per-agent token) is distinct from shutdown.
+        let cancelled = make_agent(vec![]);
+        cancelled.cancel_token.cancel();
+        assert_eq!(
+            failure_classification(&cancelled, Some(&runtime_err)),
+            "cancelled"
+        );
+
+        // The cancelled early-return path classifies with no error present.
+        assert_eq!(failure_classification(&cancelled, None), "cancelled");
     }
 
     /// Shared helper: create an agent with a TestTool, execute_tool it, and assert scrubbing behavior.
