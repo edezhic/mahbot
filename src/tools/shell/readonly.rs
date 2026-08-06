@@ -587,12 +587,7 @@ fn has_disallowed_redirect(segment: &str, state: &ValidationState) -> Result<(),
 
         if target.is_empty() {
             // No target — bare redirect, reject
-            return Err(format!(
-                "⚠️ Read-only mode: command contains a disallowed output redirect.\n\
-                 Command: `{segment}`\n\
-                 Redirects are only allowed to /dev/null, 2>&1, 1>&2, or paths under /tmp, /var/tmp, or the OS temp directory.\n\
-                 Suggestion: pipe to a pager (e.g., `| less`) or use `| head` to limit output."
-            ));
+            return Err(disallowed_redirect_err(segment));
         }
 
         // Allowed targets
@@ -602,16 +597,21 @@ fn has_disallowed_redirect(segment: &str, state: &ValidationState) -> Result<(),
 
         if writes_outside_temp(target, state) {
             // Absolute/relative non-temp non-devnull = disallowed
-            return Err(format!(
-                "⚠️ Read-only mode: command contains a disallowed output redirect.\n\
-                 Command: `{segment}`\n\
-                 Redirects are only allowed to /dev/null, 2>&1, 1>&2, or paths under /tmp, /var/tmp, or the OS temp directory.\n\
-                 Suggestion: pipe to a pager (e.g., `| less`) or use `| head` to limit output."
-            ));
+            return Err(disallowed_redirect_err(segment));
         }
     }
 
     Ok(())
+}
+
+/// Rejection message for any disallowed output redirect (bare or non-temp).
+fn disallowed_redirect_err(segment: &str) -> String {
+    format!(
+        "⚠️ Read-only mode: command contains a disallowed output redirect.\n\
+         Command: `{segment}`\n\
+         Redirects are only allowed to /dev/null, 2>&1, 1>&2, or paths under /tmp, /var/tmp, or the OS temp directory.\n\
+         Suggestion: pipe to a pager (e.g., `| less`) or use `| head` to limit output."
+    )
 }
 
 /// Resolve a path word (mutator argument, redirect target, or flag value)
@@ -4175,6 +4175,14 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// True when `word` is a mutation token or the `token=value` form of one.
+fn matches_mutation_token(word: &str, tokens: &[&str]) -> bool {
+    tokens.contains(&word)
+        || tokens
+            .iter()
+            .any(|t| word.strip_prefix(t).is_some_and(|r| r.starts_with('=')))
+}
+
 /// For a matched git subcommand, check for mutation flags/verbs across all
 /// argument positions.
 ///
@@ -4251,8 +4259,7 @@ fn check_git_subcommand_mutation(
             continue;
         }
         let is_mutating = if a.starts_with("--") {
-            flag_tokens.contains(&a.as_str())
-                || flag_tokens.iter().any(|t| a.starts_with(&format!("{t}=")))
+            matches_mutation_token(&a, &flag_tokens)
         } else {
             short_chars.iter().any(|c| a[1..].contains(*c))
         };
@@ -4272,10 +4279,7 @@ fn check_git_subcommand_mutation(
     if !bare_tokens.is_empty()
         && let Some(first_non_flag_arg) = words.iter().skip(1).find(|w| !w.starts_with('-'))
     {
-        let is_mutating = bare_tokens.contains(first_non_flag_arg)
-            || bare_tokens
-                .iter()
-                .any(|t| first_non_flag_arg.starts_with(&format!("{t}=")));
+        let is_mutating = matches_mutation_token(first_non_flag_arg, &bare_tokens);
         if is_mutating {
             return Err(format!(
                 "⚠️ Read-only mode: `git {subcommand}` is not allowed — it mutates.\n\
