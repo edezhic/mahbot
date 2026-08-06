@@ -712,7 +712,9 @@ fn expand_vars(word: &str, single_quoted: bool, state: &ValidationState) -> Opti
         let rest = &word[i..];
         // Escaped dollar/backslash/backtick: literal character, no expansion.
         if let Some(next) = rest.strip_prefix('\\') {
-            let c = next.chars().next().expect("non-empty after backslash");
+            // Word-final backslash cannot resolve to a concrete path —
+            // fail closed instead of panicking.
+            let c = next.chars().next()?;
             if matches!(c, '$' | '\\' | '`') {
                 out.push(c);
             } else {
@@ -5983,6 +5985,21 @@ mod tests {
         ];
 
         run_cases(&cases);
+    }
+
+    // ── Trailing-backslash token (regression: panic in expand_vars) ──
+    // A word-final lone `\` must fail closed (reject), never panic dispatch.
+    #[test]
+    fn trailing_backslash_token_fails_closed() {
+        for cmd in [
+            // Exact dispatch trigger: split_whitespace() turns `./-\ 1` into
+            // the word `./-\`, whose trailing backslash cannot resolve.
+            "rm -f /tmp/outtest/-1 ./-\\ 1 2>/dev/null",
+            "rm /tmp/scratch-\\",
+            "touch /tmp/ok \\",
+        ] {
+            assert_rejected(cmd);
+        }
     }
 
     /// Tests that ALL entries in [`TEMP_MUTATORS`] are allowed with temp paths
