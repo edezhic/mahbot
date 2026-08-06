@@ -861,10 +861,8 @@ const fn track_char_context(
 ///
 /// Command substitutions (`$(...)`, backticks) are kept whole: separators
 /// inside a substitution body are part of the substitution, not command
-/// separators. Splitting inside a substitution would fragment it across
-/// segments, breaking the read-only guard's per-segment substitution
-/// validation (the fragments would be scanned as ordinary commands with
-/// the outer state, losing the subshell snapshot semantics).
+/// separators. Mis-splitting flips `is_chained` in [`process_shell_output`]
+/// and disables standalone-only output transforms.
 fn extract_command_segments(command: &str) -> Vec<String> {
     // Heredoc bodies are excluded from command scanning (see decision 10 of
     // the read-only shell guard contract): body text must never be segmented
@@ -925,10 +923,8 @@ fn extract_command_segments_stripped(stripped: &str) -> Vec<String> {
         if check_outside_quotes(c, &mut in_single, &mut in_double) {
             // ── Command substitution `$(...)` — keep the whole body in the
             // current segment. Separators inside it (`;`, `&&`, newline) are
-            // part of the substitution, not command separators; splitting
-            // there would fragment the body across segments and lose the
-            // subshell state when the read-only guard validates each
-            // substitution as a nested command.
+            // part of the substitution, not command separators; mis-splitting
+            // flips `is_chained` and disables standalone-only output transforms.
             if c == '$' && chars.peek() == Some(&'(') {
                 current.push(c);
                 current.push(chars.next().expect("peeked '('"));
@@ -936,16 +932,15 @@ fn extract_command_segments_stripped(stripped: &str) -> Vec<String> {
                 let mut sub_single = false;
                 let mut sub_double = false;
                 let mut sub_escaped = false;
-                while let Some(c2) = chars.next() {
+                for c2 in chars.by_ref() {
                     current.push(c2);
                     if !track_char_context(c2, &mut sub_single, &mut sub_double, &mut sub_escaped) {
                         continue;
                     }
-                    if c2 == '$' && chars.peek() == Some(&'(') {
+                    // Every unquoted paren nests — mirrors readonly::find_paren_close.
+                    if c2 == '(' {
                         depth += 1;
-                        continue;
-                    }
-                    if c2 == ')' {
+                    } else if c2 == ')' {
                         depth -= 1;
                         if depth == 0 {
                             break;
@@ -3057,8 +3052,8 @@ mod tests {
             ("echo hi >| /tmp/force", &["echo hi >| /tmp/force"]),
             // ── Command substitutions stay whole ────────────────────
             // Separators inside `$(...)` are part of the substitution, not
-            // command separators (splitting would fragment the body across
-            // segments and break per-segment substitution validation).
+            // command separators (mis-splitting flips is_chained and skips
+            // standalone-only output transforms).
             ("echo $(echo hi; touch x)", &["echo $(echo hi; touch x)"]),
             ("echo $(echo hi) ; touch x", &["echo $(echo hi)", "touch x"]),
             ("echo `echo hi; touch x`", &["echo `echo hi; touch x`"]),
@@ -3068,6 +3063,26 @@ mod tests {
             ),
             // Nested substitution stays inside the outer one.
             ("echo $(echo $(ls; pwd))", &["echo $(echo $(ls; pwd))"]),
+            // Nested `$(` adds exactly one paren; a real `;` after it splits.
+            (
+                "echo $(echo $(echo hi)) ; touch x",
+                &["echo $(echo $(echo hi))", "touch x"],
+            ),
+            // Plain parens inside a substitution nest too: the `;` is body.
+            (
+                "echo $( (echo hi) ; echo more) tail",
+                &["echo $( (echo hi) ; echo more) tail"],
+            ),
+            // Arithmetic with parens: `&&` inside `$((...))` is body content.
+            (
+                "echo $(( (a) && (b) )) tail",
+                &["echo $(( (a) && (b) )) tail"],
+            ),
+            // `$((...))` nested inside `$(...)`.
+            (
+                "echo $(echo $((a+1)); echo x)",
+                &["echo $(echo $((a+1)); echo x)"],
+            ),
             // Substitution with newline inside stays whole.
             ("echo $(echo hi\necho bye)", &["echo $(echo hi\necho bye)"]),
             // Heredoc body with a substitution: the body substitution is
