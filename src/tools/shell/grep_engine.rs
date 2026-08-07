@@ -380,44 +380,7 @@ fn split_segments(command: &str) -> Vec<(String, String)> {
             continue;
         }
         if track_quotes(c, &mut in_single, &mut in_double) {
-            if c == '$' && chars.peek() == Some(&'(') {
-                current.push(c);
-                current.push(chars.next().expect("peeked ("));
-                let mut depth = 1usize;
-                let mut ss = false;
-                let mut sd = false;
-                let mut se = false;
-                for c2 in chars.by_ref() {
-                    current.push(c2);
-                    if !track_quotes(c2, &mut ss, &mut sd) {
-                        if se {
-                            se = false;
-                            continue;
-                        }
-                        if c2 == '\\' {
-                            se = true;
-                        }
-                        continue;
-                    }
-                    if c2 == '(' {
-                        depth += 1;
-                    } else if c2 == ')' {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                }
-                continue;
-            }
-            if c == '`' {
-                current.push(c);
-                for c2 in chars.by_ref() {
-                    current.push(c2);
-                    if c2 == '`' {
-                        break;
-                    }
-                }
+            if super::consume_substitution(c, &mut chars, &mut current) {
                 continue;
             }
             match c {
@@ -701,44 +664,7 @@ fn grep_tokenize(segment: &str) -> Result<Vec<GrepWord>, Fallback> {
             continue;
         }
         if track_quotes(c, &mut in_single, &mut in_double) {
-            if c == '$' && chars.peek() == Some(&'(') {
-                current.push(c);
-                current.push(chars.next().expect("peeked ("));
-                let mut depth = 1usize;
-                let mut ss = false;
-                let mut sd = false;
-                let mut se = false;
-                for c2 in chars.by_ref() {
-                    current.push(c2);
-                    if !track_quotes(c2, &mut ss, &mut sd) {
-                        if se {
-                            se = false;
-                            continue;
-                        }
-                        if c2 == '\\' {
-                            se = true;
-                        }
-                        continue;
-                    }
-                    if c2 == '(' {
-                        depth += 1;
-                    } else if c2 == ')' {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                }
-                continue;
-            }
-            if c == '`' {
-                current.push(c);
-                for c2 in chars.by_ref() {
-                    current.push(c2);
-                    if c2 == '`' {
-                        break;
-                    }
-                }
+            if super::consume_substitution(c, &mut chars, &mut current) {
                 continue;
             }
             if c.is_whitespace() {
@@ -2574,11 +2500,30 @@ mod parity_tests {
             "! grep x a.txt",                          // negation
             "sudo grep x a.txt",                       // env prefix
             "grep -w 'foo\\|bar' a.txt b.txt",         // -w + alternation (word_safe)
-            "echo hello && echo world",                // no grep at all
+            "echo $(echo \\) ; grep x a.txt", // unterminated $(...) — escape-aware span stays open
+            "echo hello && echo world",       // no grep at all
         ];
         for row in rows {
             assert_falls_back(row, &ws, &home);
         }
+    }
+
+    #[test]
+    fn substitution_escape_resegments() {
+        // Escape-aware substitution scans (consume_substitution) change
+        // segmentation: an escaped backtick no longer truncates a backtick
+        // span, so the trailing grep is a real separate member and gets served
+        // (the old scan swallowed it into an unterminated span → fallback).
+        // The serve→fallback direction of the same fix is a fallback_triggers
+        // row (`echo $(echo \) ; grep x a.txt`).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&ws).expect("ws");
+        fs::create_dir_all(&home).expect("home");
+        build_fixture(&ws, &home);
+        analyze_command("echo `a\\`b` ; grep x a.txt b.txt", &ws, &home, true)
+            .expect("escaped backtick: trailing grep is a separate served member");
     }
 
     #[test]

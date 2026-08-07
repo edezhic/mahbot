@@ -907,6 +907,60 @@ const fn track_char_context(
     check_outside_quotes(c, in_single, in_double)
 }
 
+/// Consume a `$(...)` or backtick command substitution (delimiters included)
+/// into `current` when `c` starts one; returns whether one was consumed.
+/// Escape- and quote-aware via [`track_char_context`]: separators inside the
+/// body are substitution content, not command separators — mis-splitting
+/// flips `is_chained` in [`process_shell_output`] and disables
+/// standalone-only output transforms. Paren depth mirrors
+/// readonly::find_paren_close.
+fn consume_substitution(
+    c: char,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    current: &mut String,
+) -> bool {
+    if c == '$' && chars.peek() == Some(&'(') {
+        current.push(c);
+        current.push(chars.next().expect("peeked '('"));
+        let mut depth = 1usize;
+        let mut sub_single = false;
+        let mut sub_double = false;
+        let mut sub_escaped = false;
+        for c2 in chars.by_ref() {
+            current.push(c2);
+            if !track_char_context(c2, &mut sub_single, &mut sub_double, &mut sub_escaped) {
+                continue;
+            }
+            // Every unquoted paren nests — mirrors readonly::find_paren_close.
+            if c2 == '(' {
+                depth += 1;
+            } else if c2 == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
+        return true;
+    }
+    if c == '`' {
+        current.push(c);
+        let mut sub_escaped = false;
+        for c2 in chars.by_ref() {
+            current.push(c2);
+            if sub_escaped {
+                sub_escaped = false;
+            } else if c2 == '\\' {
+                sub_escaped = true;
+            } else if c2 == '`' {
+                break;
+            }
+        }
+        return true;
+    }
+    false
+}
+
 /// Split a shell command string into logical segments at shell operators.
 /// Respects single and double quotes, treats newlines as command separators
 /// (with backslash-newline line continuation), and removes heredoc bodies
@@ -974,48 +1028,8 @@ fn extract_command_segments_stripped(stripped: &str) -> Vec<String> {
         }
 
         if check_outside_quotes(c, &mut in_single, &mut in_double) {
-            // ── Command substitution `$(...)` — keep the whole body in the
-            // current segment. Separators inside it (`;`, `&&`, newline) are
-            // part of the substitution, not command separators; mis-splitting
-            // flips `is_chained` and disables standalone-only output transforms.
-            if c == '$' && chars.peek() == Some(&'(') {
-                current.push(c);
-                current.push(chars.next().expect("peeked '('"));
-                let mut depth = 1usize;
-                let mut sub_single = false;
-                let mut sub_double = false;
-                let mut sub_escaped = false;
-                for c2 in chars.by_ref() {
-                    current.push(c2);
-                    if !track_char_context(c2, &mut sub_single, &mut sub_double, &mut sub_escaped) {
-                        continue;
-                    }
-                    // Every unquoted paren nests — mirrors readonly::find_paren_close.
-                    if c2 == '(' {
-                        depth += 1;
-                    } else if c2 == ')' {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                }
-                continue;
-            }
-            // ── Backtick command substitution — same treatment ──────
-            if c == '`' {
-                current.push(c);
-                let mut sub_escaped = false;
-                for c2 in chars.by_ref() {
-                    current.push(c2);
-                    if sub_escaped {
-                        sub_escaped = false;
-                    } else if c2 == '\\' {
-                        sub_escaped = true;
-                    } else if c2 == '`' {
-                        break;
-                    }
-                }
+            // ── Command substitutions (`$(...)`, backticks) stay whole ──
+            if consume_substitution(c, &mut chars, &mut current) {
                 continue;
             }
             match c {
@@ -3157,6 +3171,21 @@ mod tests {
             (
                 "echo \"`echo hi; touch x`\"",
                 &["echo \"`echo hi; touch x`\""],
+            ),
+            // Escape-aware: `\)` is body content, not a substitution closer.
+            (
+                "echo $(echo \\)) ; touch x",
+                &["echo $(echo \\))", "touch x"],
+            ),
+            // Escaped backticks inside a backtick substitution don't close it.
+            (
+                "echo `echo \\`hi\\`` ; touch x",
+                &["echo `echo \\`hi\\``", "touch x"],
+            ),
+            // `\'` inside `$(...)`: the closing quote is not swallowed.
+            (
+                "echo $(echo 'a\\') ; touch x",
+                &["echo $(echo 'a\\')", "touch x"],
             ),
         ];
         for (input, expected) in cases {
