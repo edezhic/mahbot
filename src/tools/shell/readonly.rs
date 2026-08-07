@@ -407,9 +407,6 @@ fn consume_heredoc_marker(
         i += 1; // fd-prefixed heredoc (`3<<EOF`)
     }
     i += 2;
-    if i >= chars.len() {
-        return None; // dangling `<<` at end of input — nothing to strip
-    }
     while i < chars.len() && chars[i].1.is_whitespace() {
         i += 1;
     }
@@ -420,6 +417,9 @@ fn consume_heredoc_marker(
     }
     while i < chars.len() && chars[i].1.is_whitespace() {
         i += 1;
+    }
+    if i >= chars.len() {
+        return None; // dangling `<<` at end of input — nothing to strip
     }
     let (delimiter, delim_end, quoted) = parse_heredoc_delimiter(command, chars[i].0);
     queue.push((delimiter, strip_tabs, !quoted));
@@ -6583,6 +6583,14 @@ mod tests {
             // Body substitution under a temp cd — allowed (state at the
             // heredoc's position in the chain applies).
             ("cd /tmp && cat <<EOF\n$(touch rel)\nEOF", true),
+            // Dangling `<<` markers (no delimiter): bash errors on these and
+            // executes nothing, so they are non-mutating — must not panic.
+            ("cat <<", true),
+            ("cat << ", true),
+            ("cat <<-", true),
+            ("cat <<- ", true),
+            ("3<< ", true),
+            ("3<<-", true),
         ];
 
         run_cases(&cases);
