@@ -1955,12 +1955,11 @@ impl BoardStore {
         workspace_name: Option<&str>,
     ) -> Result<u64> {
         let now = turso::now();
-        let done_cancelled = [TicketPhase::Done, TicketPhase::Cancelled];
         let sql = format!(
             "UPDATE tickets SET is_archived = 1, updated_at = ?1 \
              WHERE phase IN ({}) AND assigned_to IS NULL AND is_archived = 0 \
              AND (?2 IS NULL OR workspace_name = ?2)",
-            phase_list_sql_fragment(&done_cancelled),
+            phase_list_sql_fragment(UNBLOCKING_PHASES),
         );
         let updated = self
             .conn
@@ -1977,9 +1976,10 @@ impl BoardStore {
     // the GUI column rendering and the Telegram listing both use them.
 
     /// Partition tickets into the three kanban columns, in the same order the
-    /// GUI board displays them: pending (backlog/planning/failed), pipeline
-    /// (ready for dev → qa passed), completed (done/cancelled). Archived
-    /// tickets are excluded.
+    /// GUI board displays them: completed ([`TicketPhase::is_unblocking`]),
+    /// pipeline ([`TicketPhase::is_pipeline_blocking`] plus
+    /// `ReadyForDevelopment`), pending (everything else — the safe fallback
+    /// for unclassified phases). Archived tickets are excluded.
     ///
     /// Non-completed tickets sort by priority ASC (0 = highest) then
     /// created_at ASC; completed tickets sort Done-first by exact done
@@ -1997,22 +1997,16 @@ impl BoardStore {
             if ticket.is_archived {
                 continue; // hidden from board
             }
-            match ticket.phase {
-                TicketPhase::Backlog
-                | TicketPhase::Analysis
-                | TicketPhase::Planning
-                | TicketPhase::Failed => pending.push(ticket),
-                TicketPhase::ReadyForDevelopment
-                | TicketPhase::InDevelopment
-                | TicketPhase::InDiagnostics
-                | TicketPhase::DiagnosticsDone
-                | TicketPhase::InSanitation
-                | TicketPhase::SanitationPassed
-                | TicketPhase::InReview
-                | TicketPhase::Reviewed
-                | TicketPhase::InQa
-                | TicketPhase::QaPassed => pipeline.push(ticket),
-                TicketPhase::Done | TicketPhase::Cancelled => completed.push(ticket),
+            if ticket.phase.is_unblocking() {
+                completed.push(ticket);
+            } else if ticket.phase.is_pipeline_blocking()
+                || ticket.phase == TicketPhase::ReadyForDevelopment
+            {
+                pipeline.push(ticket);
+            } else {
+                // Unknown future phases silently default to pending — the
+                // safe bucket for unclassified phases.
+                pending.push(ticket);
             }
         }
 
