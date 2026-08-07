@@ -248,8 +248,9 @@ use crate::Workspace;
 use crate::config::CONFIG;
 use crate::tools::{
     AddCommentTool, AskTool, BrowserTool, CreateTicketTool, DispatchMode, EditTool, GetTicketTool,
-    ImageGenTool, ListTicketsTool, ReadTool, SearchArchivedTicketsTool, SearchTool, ShellMode,
-    ShellTool, UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend, WebSearchTool,
+    ImageGenTool, ListTicketsTool, ReadTool, ResearchTool, SearchArchivedTicketsTool, SearchTool,
+    ShellMode, ShellTool, UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend,
+    WebSearchTool,
 };
 
 impl Role {
@@ -304,6 +305,7 @@ impl Role {
                         DispatchMode::Async,
                         Role::Manager,
                     )),
+                    Box::new(ResearchTool::new(Role::Manager)),
                 ]
             }
             Role::Analyst => {

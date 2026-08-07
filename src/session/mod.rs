@@ -119,7 +119,7 @@ crate::columns! {
 /// If a new agent role is added that can talk to users directly, its agent ID prefix
 /// must also be excluded from this list.
 pub(crate) const TRANSIENT_AGENT_ID_PREFIXES: &[&str] =
-    &["ticket_", "ask_", "maintainer_", "discovery_"];
+    &["ticket_", "ask_", "research_", "maintainer_", "discovery_"];
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionMetadata {
@@ -688,6 +688,20 @@ pub(crate) fn ask_agent_id(ws_name: &str, role: &str) -> String {
     format!("ask_{}_{}_{}", ws_name, crate::generate_suffix(), role)
 }
 
+/// Construct an agent ID for a deep-research sub-agent (decomposers,
+/// round-1 researchers, gap-round analysts, verification analysts).
+///
+/// Format: `research_{ws_name}_{suffix}_{label}`
+#[must_use]
+pub(crate) fn research_agent_id(ws_name: &str, label: &str) -> String {
+    format!(
+        "research_{}_{}_{}",
+        ws_name,
+        crate::generate_suffix(),
+        label
+    )
+}
+
 /// Construct an agent ID for workspace role discovery.
 ///
 /// Format: `discovery_{ws_name}_{suffix}_{role}`
@@ -1027,6 +1041,11 @@ mod transient_prefix_tests {
             &ask_agent_id("ws", "coder"),
             "ask_",
             "ask_agent_id('ws', 'coder')",
+        );
+        assert_transient_key(
+            &research_agent_id("ws", "decomposer"),
+            "research_",
+            "research_agent_id('ws', 'decomposer')",
         );
         assert_transient_key(
             &maintainer_agent_id("ws"),

@@ -65,6 +65,9 @@ pub enum JobKind {
     /// Result from an async AskTool sub-agent, injected back into the caller's
     /// agent session.
     AskToolResult,
+    /// Result from an async deep research run (ResearchTool), injected back
+    /// into the Manager's agent session. Exactly one envelope per run.
+    ResearchResult,
     /// Comment added to a ticket while an agent is working on it.
     /// Delivered mid-work via the agent's inbox (not a consumer loop).
     TicketComment,
@@ -448,7 +451,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         let Some(response) = response else {
             // Send emoji error only for UserMessage jobs where the agent truly
             // failed (not cancelled by user or shutdown). Internal job kinds
-            // (TicketNotify, AskToolResult) get no feedback.
+            // (TicketNotify, AskToolResult, ResearchResult) get no feedback.
             //
             // We check both the agent-specific token (user /stop) AND the
             // global shutdown token because during SIGTERM/SIGINT the global
