@@ -975,7 +975,7 @@ impl Dashboard {
             Message::CloseRequested(_) => self.save_and_exit(true),
             Message::Shutdown => self.save_and_exit(false),
             Message::CheckpointAndExit => iced::exit(),
-            Message::WindowEvent(id, event) => match event {
+            Message::WindowEvent(_, event) => match event {
                 window::Event::Resized(new_size) => {
                     self.last_size = new_size;
                     Task::none()
@@ -984,7 +984,6 @@ impl Dashboard {
                     self.last_position = new_pos;
                     Task::none()
                 }
-                window::Event::Opened { .. } => disable_macos_text_services(id),
                 _ => Task::none(),
             },
             Message::CloseDiffModal => {
@@ -1745,22 +1744,18 @@ fn group_section<'a>(
 
 impl Dashboard {
     pub fn subscription(&self) -> iced::Subscription<Message> {
-        // Window events are subscribed from the start, before boot completes:
-        // the macOS text-services disable fires on Opened, which happens during
-        // the loading phase — gating it behind `ready` loses the event
-        // permanently (iced does not replay missed window events). Only window
-        // events are un-gated; close-request handling stays behind the
-        // readiness gate so the shutdown/checkpoint path never runs before
-        // stores are initialized.
+        // Window events are subscribed from the start, before boot completes.
+        // Pre-boot Resized/Moved events update last_size/last_position, which
+        // are persisted to window-state.json on close — without them, closing
+        // a never-resized window would overwrite the restored geometry with
+        // the hardcoded defaults (iced does not replay missed window events).
+        // Close-request handling stays behind the readiness gate so the
+        // shutdown/checkpoint path never runs before stores are initialized.
         let window_events = iced::Subscription::batch([
             window::resize_events()
                 .map(|(id, size)| Message::WindowEvent(id, window::Event::Resized(size))),
             window::events().filter_map(|(id, event)| {
-                matches!(
-                    &event,
-                    window::Event::Moved(_) | window::Event::Opened { .. }
-                )
-                .then_some(Message::WindowEvent(id, event))
+                matches!(&event, window::Event::Moved(_)).then_some(Message::WindowEvent(id, event))
             }),
         ]);
         if !self.ready {
@@ -2614,212 +2609,4 @@ fn resolve_dashboard_workspace_path(
         );
         (String::new(), None)
     }
-}
-
-/// Register the AutoFill heuristic-controller suppression before the run loop
-/// starts. `NSAutoFillHeuristicControllerEnabled` is an undocumented AppKit
-/// default (found via disassembly; also used by Chromium, Ghostty, Electron)
-/// that stops the heuristic AutoFill controller (one-time codes, contact
-/// data) from engaging for this app — closing the window between open and
-/// the async trait disable. Effective on macOS 26.0-26.1 only (the key was
-/// removed in 26.2); harmless no-op elsewhere. Registered in the ephemeral
-/// registration domain; no persisted preferences are written.
-#[cfg(target_os = "macos")]
-pub fn register_macos_startup_defaults() {
-    use objc2::rc::{Id, Retained};
-    use objc2::runtime::{AnyObject, ProtocolObject};
-    use objc2_foundation::{NSCopying, NSDictionary, NSNumber, NSString, NSUserDefaults};
-
-    let key = NSString::from_str("NSAutoFillHeuristicControllerEnabled");
-    let value = NSNumber::new_bool(false);
-    // SAFETY: `dictionaryWithObject:forKey:` is safe to call with a valid
-    // NSString key and NSNumber value.
-    let dict = unsafe {
-        NSDictionary::<NSString, NSNumber>::dictionaryWithObject_forKey(
-            &value,
-            ProtocolObject::<dyn NSCopying>::from_ref(&*key),
-        )
-    };
-    // SAFETY: `NSDictionary<NSString, NSNumber>` and
-    // `NSDictionary<NSString, AnyObject>` are the same ObjC class; the
-    // generic parameters are compile-time-only.
-    let dict: Retained<NSDictionary<NSString, AnyObject>> = unsafe { Id::cast(dict) };
-    // SAFETY: `standardUserDefaults` returns a valid shared instance.
-    let defaults = unsafe { NSUserDefaults::standardUserDefaults() };
-    // SAFETY: `dict` is a valid dictionary of defaults.
-    unsafe { defaults.registerDefaults(&dict) };
-}
-
-/// ObjC text-input-traits getter IMP ABI (self, _cmd) -> trait value.
-#[cfg(target_os = "macos")]
-type TraitGetter = unsafe extern "C" fn(*mut std::ffi::c_void, objc2::runtime::Sel) -> isize;
-
-/// Trait selector pairs with the getter returning the "disabled" value.
-/// Covers the `NSTextInputTraits` set (disabled = `NSTextInputTraitType::No`)
-/// plus the macOS 26+ additions absent from the objc2-app-kit 0.2 headers:
-/// Writing Tools behavior (`NSWritingToolsBehavior::None` = -1) and
-/// math-expression completion.
-#[cfg(target_os = "macos")]
-const TEXT_INPUT_TRAITS: &[(&str, &str, TraitGetter)] = &[
-    (
-        "autocorrectionType",
-        "setAutocorrectionType:",
-        trait_getter_no,
-    ),
-    (
-        "spellCheckingType",
-        "setSpellCheckingType:",
-        trait_getter_no,
-    ),
-    (
-        "grammarCheckingType",
-        "setGrammarCheckingType:",
-        trait_getter_no,
-    ),
-    ("smartQuotesType", "setSmartQuotesType:", trait_getter_no),
-    ("smartDashesType", "setSmartDashesType:", trait_getter_no),
-    (
-        "smartInsertDeleteType",
-        "setSmartInsertDeleteType:",
-        trait_getter_no,
-    ),
-    (
-        "textReplacementType",
-        "setTextReplacementType:",
-        trait_getter_no,
-    ),
-    (
-        "dataDetectionType",
-        "setDataDetectionType:",
-        trait_getter_no,
-    ),
-    (
-        "linkDetectionType",
-        "setLinkDetectionType:",
-        trait_getter_no,
-    ),
-    (
-        "textCompletionType",
-        "setTextCompletionType:",
-        trait_getter_no,
-    ),
-    (
-        "inlinePredictionType",
-        "setInlinePredictionType:",
-        trait_getter_no,
-    ),
-    (
-        "mathExpressionCompletionType",
-        "setMathExpressionCompletionType:",
-        trait_getter_no,
-    ),
-    (
-        "writingToolsBehavior",
-        "setWritingToolsBehavior:",
-        trait_getter_none,
-    ),
-];
-
-/// Getter returning `NSTextInputTraitType::No` (traits disabled).
-#[cfg(target_os = "macos")]
-unsafe extern "C" fn trait_getter_no(_: *mut std::ffi::c_void, _: objc2::runtime::Sel) -> isize {
-    1
-}
-
-/// Getter returning `NSWritingToolsBehavior::None` (Writing Tools off).
-#[cfg(target_os = "macos")]
-unsafe extern "C" fn trait_getter_none(_: *mut std::ffi::c_void, _: objc2::runtime::Sel) -> isize {
-    -1
-}
-
-/// No-op setter — traits stay disabled regardless of what AppKit sets.
-#[cfg(target_os = "macos")]
-unsafe extern "C" fn trait_setter_noop(_: *mut std::ffi::c_void, _: objc2::runtime::Sel, _: isize) {
-}
-
-/// Register text-input-traits getters/setters on the view's runtime class.
-///
-/// The winit view is a plain NSView subclass implementing only the
-/// text-input-client protocol; it does not implement the text-input-traits
-/// selectors, so messaging them directly would crash (unrecognized selector).
-/// Getters return the "disabled" value, setters are no-ops; registration is
-/// idempotent (`class_addMethod` fails when the class already has an own
-/// implementation). Conformance is added only for `NSTextInputTraits`
-/// (all-optional) — never `NSTextCheckingClient`, whose required methods
-/// would crash if invoked.
-#[cfg(target_os = "macos")]
-fn register_view_trait_disables(ns_view: *mut std::ffi::c_void) {
-    use objc2::ffi;
-    use objc2::runtime::Sel;
-
-    // Setter IMP ABI (self, _cmd, value); getters come from TEXT_INPUT_TRAITS.
-    type TraitSetter = unsafe extern "C" fn(*mut std::ffi::c_void, Sel, isize);
-
-    let getter_types = c"q@:";
-    let setter_types = c"v@:q";
-
-    // SAFETY: `ns_view` is a live NSView (the window just opened); the
-    // returned class is valid for the process lifetime.
-    let cls = unsafe { ffi::object_getClass(ns_view.cast()) }.cast_mut();
-    if cls.is_null() {
-        return;
-    }
-
-    let setter_noop: TraitSetter = trait_setter_noop;
-
-    unsafe {
-        for &(getter, setter, getter_fn) in TEXT_INPUT_TRAITS {
-            let getter_imp: ffi::IMP = Some(std::mem::transmute::<
-                TraitGetter,
-                unsafe extern "C" fn(),
-            >(getter_fn));
-            let getter_sel = Sel::register(getter);
-            ffi::class_addMethod(cls, getter_sel.as_ptr(), getter_imp, getter_types.as_ptr());
-
-            let setter_imp: ffi::IMP = Some(std::mem::transmute::<
-                TraitSetter,
-                unsafe extern "C" fn(),
-            >(setter_noop));
-            let setter_sel = Sel::register(setter);
-            ffi::class_addMethod(cls, setter_sel.as_ptr(), setter_imp, setter_types.as_ptr());
-        }
-
-        // Conform to the all-optional text-input-traits protocol so AppKit
-        // queries the registered getters.
-        let proto = ffi::objc_getProtocol(c"NSTextInputTraits".as_ptr());
-        if !proto.is_null() {
-            ffi::class_addProtocol(cls, proto);
-        }
-    }
-}
-
-/// Disable unwanted macOS text services (autocorrect, AutoFill, smart quotes,
-/// etc.) on the winit view.  No-op on non-macOS platforms.
-///
-/// Uses [`iced::window::run`] to get the native `NSView` handle and registers
-/// disabled trait values on its runtime class — see
-/// [`register_view_trait_disables`].
-///
-/// This does **not** disable IME (CJK / emoji input) — that flows through the
-/// input-method path, which is orthogonal to these traits.
-#[cfg(target_os = "macos")]
-fn disable_macos_text_services(window_id: window::Id) -> Task<Message> {
-    use raw_window_handle::RawWindowHandle;
-
-    window::run(window_id, |handle| {
-        // SAFETY: `HasWindowHandle::window_handle` is implemented for the
-        // window; the returned handle is valid.
-        if let Ok(handle) = handle.window_handle() {
-            if let RawWindowHandle::AppKit(appkit) = handle.as_raw() {
-                register_view_trait_disables(appkit.ns_view.as_ptr());
-            }
-        }
-    })
-    .map(|()| Message::Nop)
-}
-
-/// No-op on non-macOS platforms.
-#[cfg(not(target_os = "macos"))]
-fn disable_macos_text_services(_window_id: window::Id) -> Task<Message> {
-    Task::none()
 }
