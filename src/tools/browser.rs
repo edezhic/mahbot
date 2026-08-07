@@ -196,8 +196,8 @@ impl BrowserTool {
     }
 
     /// Fail with an actionable error when the chrome-use CLI is missing or the
-    /// daemon is down, distinguishing the two causes. One CLI probe; the daemon
-    /// check is cached.
+    /// daemon is down, distinguishing the two causes. One CLI check; the
+    /// daemon-health evaluation is cached.
     async fn ensure_available() -> anyhow::Result<()> {
         if !super::browser_daemon::cli_available().await {
             anyhow::bail!(
@@ -293,7 +293,14 @@ impl BrowserTool {
     /// mark the daemon unhealthy (wakes the auto-recovery watchdog) and return
     /// the actionable guidance immediately — the CLI already retried
     /// internally, so adding more retries would only burn more time.
+    /// Unreachable-tab errors are their own state: the daemon and relay are up,
+    /// only the session's tab is orphaned — fail fast with hand-close guidance
+    /// and leave health untouched (recovery cannot fix a Chrome-side orphan,
+    /// and hiding the daemon would block other sessions for UNHEALTHY_TTL).
     fn fail_fast_if_daemon_down(error: &str, code: Option<&str>) -> anyhow::Result<()> {
+        if super::browser_daemon::is_unreachable_tab_error(error) {
+            anyhow::bail!("{}", super::browser_daemon::unreachable_tab_message(error));
+        }
         if super::browser_daemon::is_daemon_unavailable_error(error)
             || super::browser_daemon::is_daemon_unavailable_code(code)
         {
@@ -1858,6 +1865,22 @@ mod tests {
     #[tokio::test]
     async fn fail_fast_returns_guidance_without_retrying() {
         let _guard = crate::tools::browser_daemon::with_health_test_lock().await;
+        // An orphaned-tab error (even envelope-wrapped with the auto-connect
+        // and daemon-wrapper text) fails fast with hand-close guidance but
+        // does NOT mark the daemon unhealthy — the relay and daemon are up, so
+        // recovery must not wake for it.
+        let err = BrowserTool::fail_fast_if_daemon_down(
+            "Auto-launch failed: Could not drive your Chrome through the ab-connect extension. \
+             The tab this session was driving can no longer be resolved (it was closed, or a \
+             flaky relay dropped it)",
+            Some("browser_not_launched"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("close the leftover tab in Chrome"),
+            "expected hand-close guidance, got: {err}"
+        );
+        assert!(crate::tools::browser_daemon::is_advertised());
         // Daemon-unavailable signature → actionable guidance, daemon marked
         // unhealthy (wakes the auto-recovery watchdog).
         let err = BrowserTool::fail_fast_if_daemon_down(

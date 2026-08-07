@@ -3,40 +3,30 @@
 //! The chrome-use CLI talks to a per-session background daemon that drives
 //! Chrome through the extension relay. When the daemon or relay dies, CLI
 //! commands hang inside its own 5-retry loop (~152 s) instead of failing fast.
-//! This module tracks daemon health with a two-stage probe — a daemon-free
-//! `status` snapshot that classifies the cause (extension disabled, relay down,
-//! host missing, …) plus a bounded daemon round-trip that detects wedges — and
-//! auto-restarts the daemon with bounded backoff and thrash protection. It also
+//! This module classifies health from a daemon-free `status` snapshot
+//! (extension disabled, relay down, host missing, …) and auto-restarts the
+//! daemon with bounded backoff and thrash protection. Real wedge detection is
+//! per-call: a browser command that fails with the daemon-unavailable signature
+//! marks the daemon unhealthy and wakes the watchdog, which recovers from that
+//! stored classification — the daemon-free status cannot see a wedged daemon,
+//! so the watchdog never re-evaluates over a fail-fast classification. It also
 //! owns the chrome-use CLI invocation primitives (binary name, env setup,
 //! `--version` check) so the browser tool depends on this module and not vice
 //! versa.
 //!
-//! Probe hygiene: the daemon round-trip runs on a dedicated `__mahbot_probe`
-//! session and that session's tabs are closed by a verified sweep immediately
-//! afterwards. A bare `session stop` is not enough — it SIGTERMs the daemon,
-//! waits ~1 s, then force-kills, so when the extension relay is slow or wedged
-//! the daemon's graceful tab close cannot finish inside that window and the
-//! scratch tab is orphaned forever (no other mechanism ever reclaims it). The
-//! sweep instead closes each tab through the CLI, then re-enumerates the group
-//! to verify closure (round-over-round convergence); a leftover that cannot be
-//! closed is retried by the next probe/startup once the browser is reachable
-//! again. A healthy host therefore has zero probe tabs, and repeated probes
-//! never accumulate any. This also means the probe no longer keeps a daemon
-//! (or its Chrome instance) resident — the old watchdog left its probe daemon
-//! (and scratch tab) running forever; now every probe stops it.
+//! Verified tab-sweep: mahbot-owned session tab groups (`link-enricher-*`) are
+//! closed through the CLI and verified by round-over-round re-enumeration. A
+//! bare `session stop` is not enough — it SIGTERMs the daemon, waits ~1 s, then
+//! force-kills, so when the extension relay is slow or wedged the daemon's
+//! graceful tab close cannot finish inside that window and the scratch tab is
+//! orphaned forever (no other mechanism ever reclaims it).
 //!
 //! Trade-offs:
-//! - Each probe briefly spawns the probe daemon and its background scratch tab
-//!   (~1–2 s per probe, in the collapsed `__mahbot_probe` tab group) — the
-//!   cost of a real socket round-trip with zero persistent tabs.
+//! - A genuine daemon wedge surfaces on the first real browser call, which pays
+//!   the CLI's ~152 s internal retry before fail-fast marks it unhealthy (worst
+//!   case, rare, and self-healing — the restart clears the wedge).
 //! - `daemon restart` destroys all session state; recovery guidance notes that
 //!   existing browser sessions are reset.
-//! - Residual latency: a whole-daemon wedge is normally caught by the next
-//!   probe (watchdog or per-call) at 8 s. The CLI's ~152 s retry loop is only
-//!   paid when the daemon dies inside the 10 s healthy-probe cache window (the
-//!   call's own run_command is the first to notice) or when the wedge is
-//!   session-specific so the probe session stays healthy. Either way the error
-//!   signature then marks the daemon unhealthy and subsequent calls fail fast.
 
 use crate::util::UnwrapPoison;
 use serde_json::Value;
@@ -46,28 +36,32 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
-/// Fixed session name used by the liveness probe. The probe's scratch tab is
-/// closed and verified by a sweep after every probe so it never persists.
-const PROBE_SESSION: &str = "__mahbot_probe";
-
 // ── Bounds (pinned for deterministic recovery) ────────────────────────────
-/// How long a probe command may take before the daemon is considered wedged.
-/// A healthy daemon answers in milliseconds; a wedged one hangs for the CLI's
-/// internal 45s read timeouts × 5 retries.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
-/// Cache TTL for a healthy probe result (fresh enough for per-call checks).
+/// How long a CLI health/sweep command may take before it is considered
+/// wedged. A healthy daemon answers in milliseconds; a wedged one hangs for
+/// the CLI's internal 45s read timeouts × 5 retries.
+const CLI_TIMEOUT: Duration = Duration::from_secs(8);
+/// Cache TTL for a healthy evaluation (fresh enough for per-call checks).
 const HEALTH_TTL: Duration = Duration::from_secs(10);
 /// Longer TTL for a confirmed-down result, so repeated browser calls fail fast
-/// instead of re-probing (and re-paying the 8s timeout) on every invocation.
+/// instead of re-evaluating on every invocation.
 const UNHEALTHY_TTL: Duration = Duration::from_mins(1);
-/// Watchdog cadence between automatic health probes.
+/// Watchdog cadence between automatic health evaluations.
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 /// How often the watchdog re-verifies CLI presence on hosts where it was
 /// found — the binary can be uninstalled while the daemon runs, but checking
-/// every probe interval would spawn `--version` needlessly.
+/// every watchdog interval would spawn `--version` needlessly.
 const CLI_RECHECK: Duration = Duration::from_mins(5);
 /// Consecutive failed restarts before auto-recovery halts (thrash protection).
 const MAX_RESTART_ATTEMPTS: u32 = 3;
+/// Sustained-health window: the restart-attempt counter resets only after the
+/// daemon-free status has been healthy for this long (≥2 watchdog intervals).
+/// A transient healthy right after a restart must not reopen a bounded cycle
+/// early, or a runaway restart loop can never trip the halt. Daemon-free
+/// status cannot see wedges — for a persistent wedge the budget keeps
+/// resetting between sparse real calls, so the halt engages only for
+/// service-level causes (accepted with per-call wedge detection).
+const SUSTAINED_HEALTHY_WINDOW: Duration = Duration::from_mins(1);
 /// Backoff between restart attempts (30s → 2min → 10min).
 const RESTART_BACKOFF: [Duration; 3] = [
     Duration::from_secs(30),
@@ -83,18 +77,17 @@ const RELAY_REVIVE_WAIT: Duration = Duration::from_secs(40);
 
 // ── Verified-close sweep bounds (pinned for deterministic recovery) ──────
 /// Total budget for one sweep invocation, starting before the service-state
-/// skip gate (the probe path reuses the classification it already took, so its
-/// budget starts after that call). Every CLI call checks the deadline before
-/// spawning (one call may overshoot by at most [`PROBE_TIMEOUT`] — the
+/// skip gate. Every CLI call checks the deadline before
+/// spawning (one call may overshoot by at most [`CLI_TIMEOUT`] — the
 /// in-flight bound). On expiry the sweep defers: leftover tabs are retried by
-/// the next probe/startup (self-healing), never a permanent orphan.
+/// the next sweep/startup (self-healing), never a permanent orphan.
 const SWEEP_TOTAL_BUDGET: Duration = Duration::from_secs(15);
 /// Convergence rounds before a sweep gives up for this invocation. The budget
 /// is the hard cap; this only bounds the number of enumerate/close/stop cycles
 /// (a healthy host converges in 3 rounds; a retried failed close needs 4–5).
 const SWEEP_MAX_ROUNDS: u32 = 5;
 
-/// Classified cause for a failed health probe. Drives cause-specific warnings
+/// Classified cause for a failed health check. Drives cause-specific warnings
 /// and decides whether auto-recovery can help at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeFailure {
@@ -106,11 +99,14 @@ enum ProbeFailure {
     ExtensionDisabled,
     /// Extension enabled but the relay is down — transient, self-heals.
     RelayDown,
+    /// The session's tab lost its debugger attach (orphaned) — the daemon and
+    /// relay are up; only closing the tab by hand unblocks the session.
+    UnreachableTab,
     /// The daemon socket hung or errored (daemon-side wedge).
     DaemonWedge,
 }
 
-/// Result of a health probe: healthy, or down with a classified cause.
+/// Result of a health evaluation: healthy, or down with a classified cause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeOutcome {
     Healthy,
@@ -136,7 +132,10 @@ impl ProbeFailure {
     fn is_unfixable(self) -> bool {
         matches!(
             self,
-            ProbeFailure::NotInstalled | ProbeFailure::HostBroken | ProbeFailure::ExtensionDisabled
+            ProbeFailure::NotInstalled
+                | ProbeFailure::HostBroken
+                | ProbeFailure::ExtensionDisabled
+                | ProbeFailure::UnreachableTab
         )
     }
 }
@@ -149,12 +148,16 @@ struct DaemonHealth {
     next_restart_at: Option<Instant>,
     halted: bool,
     halted_until: Option<Instant>,
-    /// Last classified probe failure — surfaces the cause in LLM-facing
+    /// Last classified failure — surfaces the cause in LLM-facing
     /// messages and drives transition-based warning logging.
     last_failure: Option<ProbeFailure>,
     /// The failure cause the last transition-based warning named — reset on
     /// recovery so the same cause warns again after a healthy spell.
     last_cause_warned: Option<ProbeFailure>,
+    /// Start of the current sustained-healthy streak — the restart budget
+    /// resets only once this reaches [`SUSTAINED_HEALTHY_WINDOW`]; any failure
+    /// aborts the streak.
+    healthy_since: Option<Instant>,
 }
 
 /// Decision from [`DaemonHealth::gate_restart`].
@@ -200,15 +203,45 @@ impl DaemonHealth {
             Some(now + RESTART_BACKOFF[(attempt as usize - 1).min(RESTART_BACKOFF.len() - 1)]);
         RestartGate::Allowed(attempt)
     }
+
+    /// Apply a health observation. A healthy result opens the sustained-healthy
+    /// window ([`SUSTAINED_HEALTHY_WINDOW`]); the restart budget resets only
+    /// after the window completes, so a transient healthy right after a restart
+    /// (the post-restart verification — `seed_window = false` — or a single
+    /// watchdog interval) cannot reopen a bounded cycle early. Any failure
+    /// aborts the window.
+    fn apply_outcome(&mut self, outcome: ProbeOutcome, now: Instant, seed_window: bool) {
+        let healthy = outcome.is_healthy();
+        if healthy {
+            if self
+                .healthy_since
+                .is_some_and(|since| now.duration_since(since) >= SUSTAINED_HEALTHY_WINDOW)
+            {
+                // Sustained health — open a fresh bounded cycle.
+                self.restart_attempts = 0;
+                self.next_restart_at = None;
+                self.halted = false;
+                self.halted_until = None;
+                self.last_cause_warned = None;
+            }
+            if seed_window && self.healthy_since.is_none() {
+                self.healthy_since = Some(now);
+            }
+        } else {
+            self.healthy_since = None;
+        }
+        // A cause change never resets the restart budget — flapping causes (e.g.
+        // RelayDown ↔ DaemonWedge) must not evade the attempt halt. Only
+        // sustained health (or the cooldown expiry in gate_restart) opens a
+        // fresh cycle.
+        self.last_failure = outcome.failure();
+        self.healthy = Some(healthy);
+        self.last_probe = Some(now);
+    }
 }
 
 static HEALTH: OnceLock<Mutex<DaemonHealth>> = OnceLock::new();
 static WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
-/// Serializes health probes — a probe ends by stopping the probe session's
-/// daemon, which would tear the daemon out from under a concurrent in-flight
-/// command and misclassify it as a wedge on a healthy host. Concurrent
-/// callers (is_available, watchdog, recovery) queue on this one lock.
-static PROBE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 fn health() -> &'static Mutex<DaemonHealth> {
     HEALTH.get_or_init(|| Mutex::new(DaemonHealth::default()))
@@ -216,16 +249,6 @@ fn health() -> &'static Mutex<DaemonHealth> {
 
 fn wake() -> &'static tokio::sync::Notify {
     WAKE.get_or_init(tokio::sync::Notify::new)
-}
-
-/// Serialize probe-session mutation — a `session stop` tears the probe daemon
-/// out from under a concurrent in-flight probe command, which would misclassify
-/// a healthy host as wedged. Held by probes and the startup cleanup.
-async fn probe_session_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    PROBE_LOCK
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await
 }
 
 /// Detect the daemon-unavailable signature chrome-use produces when its
@@ -260,12 +283,18 @@ fn is_relay_unavailable_error(msg: &str) -> bool {
         || lower.contains("could not drive your chrome")
 }
 
-/// Classify a fast CLI failure text into a probe cause. The relay signature is
-/// the more specific symptom (auto-connect failures name the relay as the
-/// cause), so it wins over the daemon wrapper it is wrapped in — both the
-/// probe and the fail-fast path must agree on the cause.
+/// Classify a fast CLI failure text into a health cause. Unreachable-tab
+/// errors are their own state — the daemon and relay are up, only the
+/// session's tab is orphaned, so recovery must NOT run for them. The signature
+/// also appears wrapped inside the auto-connect envelope ('Could not drive your
+/// Chrome…') and the daemon wrapper ('Auto-launch failed'), so it wins over
+/// both. The relay signature is more specific than the daemon wrapper it is
+/// wrapped in — both the watchdog and the fail-fast path must agree on the
+/// cause.
 fn classify_failure_text(msg: &str) -> Option<ProbeFailure> {
-    if is_relay_unavailable_error(msg) {
+    if is_unreachable_tab_error(msg) {
+        Some(ProbeFailure::UnreachableTab)
+    } else if is_relay_unavailable_error(msg) {
         Some(ProbeFailure::RelayDown)
     } else if is_daemon_unavailable_error(msg) {
         Some(ProbeFailure::DaemonWedge)
@@ -322,8 +351,8 @@ pub(crate) fn ensure_browser_env(cmd: &mut Command) {
     cmd.env("AGENT_BROWSER_DEFAULT_TIMEOUT", "15000");
     // 5-minute idle timeout — the chrome-use daemon shuts down after
     // 5 minutes of inactivity, closing the tabs it created. The watchdog no
-    // longer keeps a probe daemon resident (it stops after every probe), so
-    // browser sessions idle out on this bound naturally.
+    // longer keeps any daemon resident, so browser sessions idle out on this
+    // bound naturally.
     cmd.env("AGENT_BROWSER_IDLE_TIMEOUT_MS", "300000");
     // Enable human-like interaction speed for bot-detection avoidance.
     // chrome-use supports the same env vars as agent-browser for backward
@@ -335,13 +364,13 @@ pub(crate) fn ensure_browser_env(cmd: &mut Command) {
     // The watchdog owns recovery. Without these, a browser command issued while
     // the relay is down makes the CLI kill session daemons / the native host
     // and wait up to 45s for a relay revive — racing the watchdog's own
-    // cause-aware recovery and turning a probe into a 45s stall.
+    // cause-aware recovery and turning a health check into a 45s stall.
     cmd.env("AGENT_BROWSER_NO_AUTO_RECONNECT", "1");
     cmd.env("AGENT_BROWSER_RELAY_REVIVE_SECS", "0");
 }
 
 /// Spawn a chrome-use CLI call with the browser env, `--json`, and an optional
-/// `--session`, bounded by [`PROBE_TIMEOUT`] — a wedged daemon hangs inside the
+/// `--session`, bounded by [`CLI_TIMEOUT`] — a wedged daemon hangs inside the
 /// CLI's own ~152 s retry loop, so every call must be bounded.
 async fn run_cli_bounded(args: &[&str], session: Option<&str>) -> Option<std::process::Output> {
     let mut cmd = Command::new(browser_bin());
@@ -352,14 +381,14 @@ async fn run_cli_bounded(args: &[&str], session: Option<&str>) -> Option<std::pr
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     cmd.kill_on_drop(true);
-    tokio::time::timeout(PROBE_TIMEOUT, cmd.output())
+    tokio::time::timeout(CLI_TIMEOUT, cmd.output())
         .await
         .ok()?
         .ok()
 }
 
 /// Run a chrome-use CLI command with `--json` (and optional `--session`),
-/// bounded by [`PROBE_TIMEOUT`] — a wedged daemon would otherwise hang the
+/// bounded by [`CLI_TIMEOUT`] — a wedged daemon would otherwise hang the
 /// CLI's own ~152 s retry loop inside the health/recovery path. `Ok(value)` on
 /// success; `Err(Some(msg))` when the CLI answered with a structured error
 /// (the message survives for signature detection); `Err(None)` on
@@ -377,8 +406,8 @@ async fn run_cli_json_opt(args: &[&str], session: Option<&str>) -> Result<Value,
 }
 
 /// Non-session variant for daemon-free commands (`status`, `extension
-/// status`): errors are dropped — callers degrade to the daemon round-trip,
-/// which does not depend on the JSON commands.
+/// status`): errors are dropped — callers treat an unavailable status as
+/// healthy (the per-call fail-fast path still catches wedges).
 async fn run_cli_json(args: &[&str]) -> Option<Value> {
     run_cli_json_opt(args, None).await.ok()
 }
@@ -386,11 +415,13 @@ async fn run_cli_json(args: &[&str]) -> Option<Value> {
 /// Daemon-free service-state snapshot: `status --json` classifies extension /
 /// native-host / relay problems without spawning a daemon or tab. Returns a
 /// classified failure when the service is unusable; `None` when it looks
-/// healthy (the caller then runs the daemon round-trip).
+/// healthy. Note: pre-1.5.86 CLIs whose `status` lacks extension data fall
+/// through to `None` (healthy) — wedge detection for those hosts relies
+/// entirely on the per-call fail-fast path.
 async fn service_state() -> Option<ProbeFailure> {
     let Some(status) = run_cli_json(&["status"]).await else {
-        // Status unavailable (old CLI or broken binary) — fall through to the
-        // round-trip, which only needs the socket protocol.
+        // Status unavailable (old CLI or broken binary) — treat as healthy;
+        // the per-call fail-fast path still catches wedges.
         return None;
     };
     let ext = status.get("data")?.get("extension")?;
@@ -428,56 +459,15 @@ async fn extension_disabled() -> bool {
         .is_some_and(|reasons| !reasons.is_empty())
 }
 
-/// Real daemon round-trip on the probe session. `get url` spawns a probe
-/// daemon (with its background scratch tab) if none is running and proves the
-/// socket answers within the bound. A wedged daemon — or one bound to a dead
-/// relay — hangs here (the `url` action is a live CDP eval through the relay).
-/// The caller stops the probe session afterwards so the scratch tab never
-/// persists.
-async fn round_trip_probe() -> ProbeOutcome {
-    let mut cmd = Command::new(browser_bin());
-    ensure_browser_env(&mut cmd);
-    cmd.args(["get", "url", "--json"])
-        .args(["--session", PROBE_SESSION]);
-    cmd.kill_on_drop(true);
-    match tokio::time::timeout(PROBE_TIMEOUT, cmd.output()).await {
-        // Timed out (wedged or dead relay) or failed to spawn — daemon-side.
-        Err(_) | Ok(Err(_)) => ProbeOutcome::Down(ProbeFailure::DaemonWedge),
-        Ok(Ok(out)) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let combined = format!("{stdout} {stderr}");
-            if out.status.success() {
-                return ProbeOutcome::Healthy;
-            }
-            if let Some(failure) = classify_failure_text(&combined) {
-                return ProbeOutcome::Down(failure);
-            }
-            // Any other fast response proves the daemon socket round-tripped.
-            ProbeOutcome::Healthy
-        }
-    }
-}
-
-/// Full health probe: service-state classification first (daemon-free, no tab),
-/// then a bounded daemon round-trip when the service looks healthy. The probe
-/// session's tabs are closed by a verified sweep on every path (success and
-/// failure) so the scratch tab never persists — see [`sweep_session`].
-async fn probe_daemon() -> ProbeOutcome {
-    // Serialized with the startup cleanup and other probes (see probe_session_lock).
-    let _guard = probe_session_lock().await;
-    // One daemon-free classification shared by the probe and the sweep's skip
-    // gate — the sweep would otherwise re-run `status` while holding the lock.
-    let service = service_state().await;
-    let outcome = match service {
+/// Classify daemon health from the daemon-free `status` snapshot. Wedges are
+/// invisible to this check by design — a real browser call that fails with the
+/// daemon-unavailable signature marks the daemon unhealthy via [`note_unhealthy`]
+/// (fail-fast) and wakes the watchdog, which recovers from that stored cause.
+async fn evaluate_health() -> ProbeOutcome {
+    match service_state().await {
         Some(failure) => ProbeOutcome::Down(failure),
-        None => round_trip_probe().await,
-    };
-    // Verified close of the probe scratch tab (and any orphaned leftovers) on
-    // both success and failure paths — a bare `session stop` can orphan the tab
-    // when the relay close cannot finish inside its ~1 s force-kill window.
-    sweep_session_impl(PROBE_SESSION, SweepService::Known(service)).await;
-    outcome
+        None => ProbeOutcome::Healthy,
+    }
 }
 
 /// One tab in a session's tab group, from `tab list --json`. The `active` flag
@@ -513,12 +503,12 @@ struct SweepTab {
 //   Its exit code / JSON success are NOT proof of closure, and adopted tabs
 //   are never closed at shutdown.
 //
-// Residual limits (accepted): the probe's scratch tab is about:blank and the
+// Residual limits (accepted): the sweep's scratch tab is about:blank and the
 // extension refuses to re-attach `about:` URLs (its `eligible()`/`SKIP_URL`
 // filter). An orphan that lost its attach while the daemon kept a stale
 // binding (relay blip, kill during an outage) fails every command with the
 // unreachable-tab signatures — the sweep logs the 'close it by hand in
-// Chrome' signal and retries each probe; live orphans whose attach survived
+// Chrome' signal and keeps retrying; live orphans whose attach survived
 // heal automatically. An orphan the extension fully dropped (Chrome
 // service-worker restart unmarks ineligible about: tabs and never re-attaches
 // them; the relay's group is fed only by attach announcements) is invisible
@@ -530,25 +520,8 @@ struct SweepTab {
 // daemon inventory drops dead pids) — documented residual.
 /// Close every tab in a mahbot-owned session's tab group except the sweep's own
 /// scratch, verifying closure by round-over-round re-enumeration. Shared by the
-/// probe, the startup sweep, and the link-enricher per-fetch close. Callers
-/// that sweep the probe session must already hold [`probe_session_lock`] (this
-/// helper never takes it — it is non-reentrant).
+/// startup sweep and the link-enricher per-fetch close.
 pub(crate) async fn sweep_session(name: &str) {
-    sweep_session_impl(name, SweepService::Check).await;
-}
-
-/// Whether the sweep's service skip-gate is already classified by the caller.
-/// The probe path classifies the service once and reuses it, so the probe lock
-/// is not held across a second daemon-free `status` round-trip.
-enum SweepService {
-    /// Not classified — the sweep runs its own daemon-free `status` check
-    /// (counted against the total budget).
-    Check,
-    /// Pre-classified: `Some(failure)` = service down (skip), `None` = healthy.
-    Known(Option<ProbeFailure>),
-}
-
-async fn sweep_session_impl(name: &str, service: SweepService) {
     if !is_mahbot_session_name(name) {
         warn!(
             session = name,
@@ -558,15 +531,11 @@ async fn sweep_session_impl(name: &str, service: SweepService) {
     }
     // Skip on known service outage: no close is possible while the relay is
     // down, and every CLI call would cost the full step timeout for nothing.
-    // Tabs stay until the browser is reachable again (next probe/startup). The
+    // Tabs stay until the browser is reachable again (next sweep/startup). The
     // deadline starts before the skip gate so the gate counts against the
     // total budget.
     let deadline = Instant::now() + SWEEP_TOTAL_BUDGET;
-    let down = match service {
-        SweepService::Check => service_state().await,
-        SweepService::Known(s) => s,
-    };
-    if let Some(failure) = down {
+    if let Some(failure) = service_state().await {
         debug!(
             session = name,
             ?failure,
@@ -645,11 +614,11 @@ async fn sweep_session_impl(name: &str, service: SweepService) {
 /// Only mahbot-owned session names may be swept — user, default, and other
 /// agents' sessions must never be touched (strict-scope rule).
 fn is_mahbot_session_name(name: &str) -> bool {
-    name == PROBE_SESSION || name.starts_with("link-enricher-")
+    name.starts_with("link-enricher-")
 }
 
 /// Causes the sweep warns about — warn once per cause transition so a
-/// persistent orphan does not spam every probe interval, and warn again after
+/// persistent orphan does not spam every sweep, and warn again after
 /// a healthy sweep cleared the previous cause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SweepWarn {
@@ -658,9 +627,9 @@ enum SweepWarn {
     /// required. Only fires while a command still errors; an orphan the
     /// extension fully dropped is invisible (see the pinned-behaviors note).
     UnreachableTab,
-    /// Relay/daemon unreachable mid-sweep; retried next probe/startup.
+    /// Relay/daemon unreachable mid-sweep; retried next sweep/startup.
     CannotEnumerate,
-    /// Budget exhausted without convergence; retried next probe/startup.
+    /// Budget exhausted without convergence; retried next sweep/startup.
     Deferred,
 }
 
@@ -683,14 +652,14 @@ fn sweep_warn_transition(cause: SweepWarn) {
         SweepWarn::UnreachableTab => warn!(
             "tab sweep: a leftover tab is unreachable (the extension lost its debugger attach; \
              about:blank tabs are never re-attached) — close the leftover tab in Chrome to \
-             unblock this session; the sweep keeps retrying on every probe"
+             unblock this session; the sweep keeps retrying"
         ),
         SweepWarn::CannotEnumerate => warn!(
             "tab sweep: cannot enumerate session tabs (relay/daemon unreachable or malformed \
-             response) — deferring to next probe/startup"
+             response) — deferring to the next sweep"
         ),
         SweepWarn::Deferred => {
-            warn!("tab sweep: group not clean within budget — deferring to next probe/startup");
+            warn!("tab sweep: group not clean within budget — deferring to the next sweep");
         }
     }
 }
@@ -751,15 +720,19 @@ async fn session_tab_list(name: &str, deadline: Instant) -> Option<Vec<SweepTab>
     })
 }
 
-/// Error signatures of a leftover probe tab the daemon can no longer re-drive:
-/// its binding went stale (relay blip, kill during an outage) while the
-/// extension keeps the attach. The probe's scratch tab is about:blank and the
-/// extension never re-attaches `about:` URLs (its `eligible()` filter), so
-/// only closing the tab by hand unblocks the session — the sweep logs this
-/// signal and keeps retrying. An orphan the extension fully dropped
-/// (service-worker restart) never produces these; it is invisible to every CLI
-/// path (see the sweep's pinned-behaviors note).
-fn is_unreachable_tab_error(msg: &str) -> bool {
+/// Error signatures of a leftover tab the daemon can no longer re-drive: its
+/// binding went stale (relay blip, kill during an outage) while the extension
+/// keeps the attach. The sweep's scratch tab is about:blank and the extension
+/// never re-attaches `about:` URLs (its `eligible()` filter), so only closing
+/// the tab by hand unblocks the session — the sweep logs this signal and keeps
+/// retrying. An orphan the extension fully dropped (service-worker restart)
+/// never produces these; it is invisible to every CLI path (see the sweep's
+/// pinned-behaviors note). Real browser calls hitting this state fail fast
+/// with the same guidance without marking the daemon unhealthy — see
+/// [`unreachable_tab_message`]. The "or the relay lost it" variant is a
+/// permanent orphan (the relay dropped the attach); "navigated across
+/// processes" is a recoverable OAuth/SSO retarget and must stay OUT.
+pub(crate) fn is_unreachable_tab_error(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     lower.contains("can no longer be resolved")
         || lower.contains("owns no resolvable tab")
@@ -767,6 +740,20 @@ fn is_unreachable_tab_error(msg: &str) -> bool {
         || lower.contains("its tab is gone")
         || lower.contains("stale session")
         || lower.contains("unknown session")
+        || lower.contains("the relay lost it")
+}
+
+/// Actionable error for a real call that hit an orphaned tab: the daemon and
+/// relay are up, only the session's tab is unreachable (the extension never
+/// re-attaches about:blank tabs). Fail fast with hand-close guidance instead of
+/// paying the CLI's ~152 s retry loop, and do NOT mark the daemon unhealthy —
+/// recovery cannot fix a Chrome-side orphan.
+pub(crate) fn unreachable_tab_message(error: &str) -> String {
+    format!(
+        "{error}. The chrome-use extension lost its debugger attach to this tab and never \
+         re-attaches about:blank tabs — close the leftover tab in Chrome to unblock this \
+         session (the browser daemon itself is healthy)."
+    )
 }
 
 /// Create a scratch tab and return its stable targetId, matched by the `t<N>`
@@ -828,7 +815,7 @@ async fn session_close_tab(name: &str, tab_id: &str, deadline: Instant) -> Optio
 
 /// Bounded `session stop` — its exit code is never trusted as proof of closure
 /// (re-enumeration is), and it is skipped when the sweep is already over
-/// budget (the daemon idles out on its own and the next probe retries). The
+/// budget (the daemon idles out on its own and the next sweep retries). The
 /// session is named by the helper's `--session` flag alone.
 async fn stop_session_daemon(name: &str, deadline: Instant) -> Option<()> {
     if Instant::now() >= deadline {
@@ -857,28 +844,22 @@ fn extract_error(stdout: &[u8]) -> Option<String> {
 
 fn set_health(outcome: ProbeOutcome) {
     let mut h = health().lock().unwrap_poison();
-    let healthy = outcome.is_healthy();
-    let failure = outcome.failure();
-    if healthy {
-        // Natural recovery — restart attempts count consecutive failures only.
-        h.restart_attempts = 0;
-        h.next_restart_at = None;
-        h.halted = false;
-        h.halted_until = None;
-        h.last_cause_warned = None;
-    }
-    // A cause change never resets the restart budget — flapping causes (e.g.
-    // RelayDown ↔ DaemonWedge) must not evade the attempt halt. Only a healthy
-    // probe (or the cooldown expiry in gate_restart) opens a fresh cycle.
-    h.last_failure = failure;
-    h.healthy = Some(healthy);
-    h.last_probe = Some(Instant::now());
+    h.apply_outcome(outcome, Instant::now(), true);
 }
 
-/// Async availability for call paths: uses a fresh cached probe when possible,
-/// otherwise runs a real probe (bounded) and caches the result. A fresh
-/// down-result wakes the watchdog so recovery starts without waiting for the
-/// next interval.
+/// Health update for the verification right after a restart. Healthy here
+/// must NOT seed the sustained-healthy window — the window counts consecutive
+/// watchdog interval evaluations after recovery, not the immediate
+/// verification.
+fn set_health_after_restart(outcome: ProbeOutcome) {
+    let mut h = health().lock().unwrap_poison();
+    h.apply_outcome(outcome, Instant::now(), false);
+}
+
+/// Async availability for call paths: uses a fresh cached evaluation when
+/// possible, otherwise re-evaluates the daemon-free status (bounded) and
+/// caches the result. A fresh down-result wakes the watchdog so recovery
+/// starts without waiting for the next interval.
 pub(crate) async fn is_available() -> bool {
     let cached = {
         let h = health().lock().unwrap_poison();
@@ -894,7 +875,7 @@ pub(crate) async fn is_available() -> bool {
     if let Some(Some(healthy)) = cached {
         return healthy;
     }
-    let outcome = probe_daemon().await;
+    let outcome = evaluate_health().await;
     let healthy = outcome.is_healthy();
     set_health(outcome);
     if !healthy {
@@ -903,19 +884,21 @@ pub(crate) async fn is_available() -> bool {
     healthy
 }
 
-/// Sync availability for tool advertisement (never probes — uses the last
+/// Sync availability for tool advertisement (never evaluates — uses the last
 /// known state). Unknown → advertise optimistically; only a confirmed-down
-/// probe hides the tool.
+/// evaluation hides the tool.
 pub(crate) fn is_advertised() -> bool {
     health().lock().unwrap_poison().healthy != Some(false)
 }
 
 /// Mark the daemon unhealthy immediately (fail-fast path) with the cause the
 /// error text points to, and wake the watchdog so recovery starts without
-/// waiting for the next interval.
+/// waiting for the next interval. Unreachable-tab errors never reach this path
+/// — the browser tool's fail-fast guard bails with hand-close guidance first
+/// (recovery cannot fix a Chrome-side orphan, so none is attempted).
 pub(crate) fn note_unhealthy(error: &str) {
-    // Same classification as the probe path — the two detection paths must
-    // agree on the cause.
+    // Same classification as the watchdog's health evaluation — the two
+    // detection paths must agree on the cause.
     set_health(ProbeOutcome::Down(
         classify_failure_text(error).unwrap_or(ProbeFailure::DaemonWedge),
     ));
@@ -947,6 +930,11 @@ pub(crate) fn daemon_down_message() -> String {
              Auto-recovery restarts the session daemons and waits for the extension to \
              reconnect."
         }
+        Some(ProbeFailure::UnreachableTab) => {
+            "A browser tab the session was driving is unreachable (the extension lost its \
+             debugger attach; about:blank tabs are never re-attached) — close the leftover \
+             tab in Chrome to unblock the session."
+        }
         Some(ProbeFailure::DaemonWedge) | None => {
             "The chrome-use browser daemon is down or unresponsive."
         }
@@ -967,17 +955,22 @@ pub(crate) fn daemon_down_message() -> String {
     )
 }
 
-/// Background watchdog: probe daemon health, auto-restart with bounded backoff
-/// when down, and halt after repeated crashes to avoid a restart loop. Stands
-/// down on hosts without the chrome-use CLI (nothing to monitor or restart).
-/// CLI presence is cached after the first success and re-verified every
-/// [`CLI_RECHECK`] so healthy hosts don't spawn `--version` per interval.
+/// Background watchdog: evaluate daemon health from the daemon-free status,
+/// auto-restart with bounded backoff when down, and halt after repeated crashes
+/// to avoid a restart loop. Stands down on hosts without the chrome-use CLI
+/// (nothing to monitor or restart). CLI presence is cached after the first
+/// success and re-verified every [`CLI_RECHECK`] so healthy hosts don't spawn
+/// `--version` per interval.
 pub async fn run_watchdog() {
     let mut cli_present: Option<bool> = None;
     let mut last_cli_check = Instant::now();
     // One-time sweep of leaked mahbot-owned session artifacts from crashed runs
     // or older versions (see cleanup_stale_sessions).
     let mut cleaned = false;
+    // Whether the last wait ended in an early wake from the fail-fast path —
+    // recovery then consumes the stored classification instead of re-evaluating
+    // (the daemon-free status cannot see a wedged daemon and would clobber it).
+    let mut woken = false;
     loop {
         let cli_due = last_cli_check.elapsed() >= CLI_RECHECK;
         if cli_present != Some(true) || cli_due {
@@ -992,7 +985,7 @@ pub async fn run_watchdog() {
                 let shutdown = crate::shutdown::shutdown_token();
                 tokio::select! {
                     () = tokio::time::sleep(CLI_RECHECK) => {}
-                    () = wake().notified() => {}
+                    () = wake().notified() => woken = true,
                     () = shutdown.cancelled() => break,
                 }
                 continue;
@@ -1003,34 +996,44 @@ pub async fn run_watchdog() {
             cleaned = true;
             cleanup_stale_sessions().await;
         }
-        let outcome = probe_daemon().await;
-        set_health(outcome);
-        if let ProbeOutcome::Down(failure) = outcome {
+        // A fail-fast classification from a real call is the freshest signal —
+        // recover from it directly (the daemon-free status cannot see a wedged
+        // daemon and would clobber the cause). On interval ticks (or a wake
+        // without a stored failure), run the daemon-free evaluation and recover
+        // from a service-level failure it finds.
+        let failure = if woken {
+            health().lock().unwrap_poison().last_failure
+        } else {
+            None
+        };
+        if let Some(failure) = failure {
             attempt_recovery(failure).await;
+        } else {
+            let outcome = evaluate_health().await;
+            set_health(outcome);
+            if let ProbeOutcome::Down(failure) = outcome {
+                attempt_recovery(failure).await;
+            }
         }
         // Wait for the next interval or an early wake from the fail-fast path.
         let shutdown = crate::shutdown::shutdown_token();
-        tokio::select! {
-            () = tokio::time::sleep(WATCHDOG_INTERVAL) => {}
-            () = wake().notified() => {}
+        woken = tokio::select! {
+            () = tokio::time::sleep(WATCHDOG_INTERVAL) => false,
+            () = wake().notified() => true,
             () = shutdown.cancelled() => break,
-        }
+        };
     }
 }
 
 /// One-time cleanup of stale mahbot-owned browser-session artifacts at watchdog
-/// start: the probe session and leftover link-enricher sessions get swept so
-/// their tab groups don't accumulate. Each sweep is verified (round-over-round
-/// convergence) and only ever closes the target session's own tabs — sessions
-/// owned by other agents or the user (explicit tabs, `default`, any non-mahbot
-/// name) are never touched. Dead-daemon link-enricher orphans are not
-/// enumerable (no pid file; the session names are per-message) and stay until
-/// the tab is closed by hand — a documented residual limit.
+/// start: leftover link-enricher sessions get swept so their tab groups don't
+/// accumulate. Each sweep is verified (round-over-round convergence) and only
+/// ever closes the target session's own tabs — sessions owned by other agents
+/// or the user (explicit tabs, `default`, any non-mahbot name) are never
+/// touched. Dead-daemon link-enricher orphans are not enumerable (no pid file;
+/// the session names are per-message) and stay until the tab is closed by hand
+/// — a documented residual limit.
 async fn cleanup_stale_sessions() {
-    // Serialized with probes — sweeping the probe session tears its daemon out
-    // from under a concurrent in-flight probe (see probe_session_lock).
-    let _guard = probe_session_lock().await;
-    sweep_session(PROBE_SESSION).await;
     let Some(sessions) = registered_sessions().await else {
         return;
     };
@@ -1078,7 +1081,7 @@ async fn relay_up() -> Option<bool> {
 }
 
 /// Warn once per cause transition — an ongoing failure does not spam every
-/// probe interval, but the same cause warns again after a healthy spell.
+/// watchdog interval, but the same cause warns again after a healthy spell.
 fn warn_transition(failure: ProbeFailure) {
     let mut h = health().lock().unwrap_poison();
     if h.last_cause_warned == Some(failure) {
@@ -1106,6 +1109,11 @@ fn warn_transition(failure: ProbeFailure) {
              for the extension to reconnect and restarting session daemons to clear \
              stale relay bindings."
         ),
+        ProbeFailure::UnreachableTab => warn!(
+            "a browser tab the session was driving is unreachable (the extension lost its \
+             debugger attach; about:blank tabs are never re-attached) — close the leftover \
+             tab in Chrome to unblock the session"
+        ),
         ProbeFailure::DaemonWedge => {
             warn!("browser daemon is unresponsive — restarting it (bounded backoff).");
         }
@@ -1114,9 +1122,10 @@ fn warn_transition(failure: ProbeFailure) {
 
 /// Bounded auto-recovery: restart session daemons with backoff between attempts
 /// and a halt after MAX_RESTART_ATTEMPTS failures. Causes that a restart cannot
-/// fix — extension disabled, not installed, broken host — are reported with
-/// their concrete fix and never consume restart attempts. A transient relay
-/// drop is waited out first and consumes no attempt if it self-heals.
+/// fix — extension disabled, not installed, broken host, unreachable tab — are
+/// reported with their concrete fix and never consume restart attempts. A
+/// transient relay drop is waited out first and consumes no attempt if it
+/// self-heals.
 async fn attempt_recovery(mut failure: ProbeFailure) {
     warn_transition(failure);
     // Unfixable causes stop here — they never consume restart attempts.
@@ -1125,7 +1134,7 @@ async fn attempt_recovery(mut failure: ProbeFailure) {
     }
     // While a recovery timer (restart backoff or halt cooldown) is pending, the
     // timer IS the wait — don't poll the relay for up to RELAY_REVIVE_WAIT on
-    // top of it. The next watchdog cycle re-probes and re-enters recovery.
+    // top of it. The next watchdog cycle re-evaluates and re-enters recovery.
     let now = Instant::now();
     let throttled = {
         let h = health().lock().unwrap_poison();
@@ -1139,7 +1148,7 @@ async fn attempt_recovery(mut failure: ProbeFailure) {
     // that self-heals consumes no restart attempt.
     if failure == ProbeFailure::RelayDown {
         wait_for_relay(RELAY_REVIVE_WAIT).await;
-        let outcome = probe_daemon().await;
+        let outcome = evaluate_health().await;
         set_health(outcome);
         match outcome {
             ProbeOutcome::Healthy => {
@@ -1195,8 +1204,11 @@ async fn attempt_recovery(mut failure: ProbeFailure) {
         wait_for_relay(RELAY_REVIVE_WAIT).await;
     }
 
-    let outcome = probe_daemon().await;
-    set_health(outcome);
+    let outcome = evaluate_health().await;
+    // Post-restart verification must not seed the sustained-healthy window —
+    // the restart budget resets only after consecutive watchdog intervals of
+    // genuine health, so a run that keeps failing cannot reopen a fresh cycle.
+    set_health_after_restart(outcome);
     if outcome.is_healthy() {
         info!("browser daemon: recovered after restart");
     } else {
@@ -1258,68 +1270,69 @@ mod tests {
         assert!(is_advertised());
     }
 
-    #[tokio::test]
-    async fn healthy_probe_resets_restart_attempts() {
-        let _guard = with_health_test_lock().await;
-        {
-            let mut h = health().lock().unwrap_poison();
-            h.restart_attempts = 2;
-            h.next_restart_at = Some(Instant::now());
-            h.halted = true;
-            h.halted_until = Some(Instant::now());
-        }
-        // Natural recovery (a healthy probe landing between two incidents)
-        // resets the cycle so attempts count consecutive failures only.
-        set_health(ProbeOutcome::Healthy);
-        {
-            let h = health().lock().unwrap_poison();
-            assert_eq!(h.restart_attempts, 0);
-            assert_eq!(h.next_restart_at, None);
-            assert!(!h.halted);
-            assert!(h.halted_until.is_none());
-            assert_eq!(h.last_failure, None);
-        }
-        // Restore pristine state like the sibling tests.
-        reset_health();
+    #[test]
+    fn sustained_health_resets_restart_attempts() {
+        let now = Instant::now();
+        let mut h = DaemonHealth {
+            restart_attempts: 2,
+            next_restart_at: Some(now),
+            halted: true,
+            halted_until: Some(now),
+            ..DaemonHealth::default()
+        };
+        // A transient healthy result (e.g. the post-restart verification probe)
+        // must not reset the budget — a runaway cycle would otherwise reopen a
+        // fresh bounded cycle on every restart.
+        h.apply_outcome(ProbeOutcome::Healthy, now, false);
+        assert_eq!(h.restart_attempts, 2);
+        assert!(h.halted);
+        // The first watchdog healthy seeds the sustained-healthy window…
+        h.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL, true);
+        assert_eq!(h.restart_attempts, 2);
+        assert!(h.healthy_since.is_some());
+        // …but a second healthy before the window elapses still does not reset.
+        h.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL * 2, true);
+        assert_eq!(h.restart_attempts, 2);
+        assert!(h.halted);
+        // Only sustained health across the window opens a fresh bounded cycle.
+        h.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL * 3, true);
+        assert_eq!(h.restart_attempts, 0);
+        assert_eq!(h.next_restart_at, None);
+        assert!(!h.halted);
+        assert!(h.halted_until.is_none());
+        assert_eq!(h.last_failure, None);
     }
 
-    #[tokio::test]
-    async fn cause_flapping_does_not_reset_restart_budget() {
-        let _guard = with_health_test_lock().await;
-        // A wedge failure with accumulated attempts.
-        {
-            let mut h = health().lock().unwrap_poison();
-            h.restart_attempts = 2;
-            h.next_restart_at = Some(Instant::now());
-            h.last_failure = Some(ProbeFailure::DaemonWedge);
-        }
+    #[test]
+    fn cause_flapping_and_transient_health_do_not_reset_restart_budget() {
+        let now = Instant::now();
+        let mut h = DaemonHealth {
+            restart_attempts: 2,
+            next_restart_at: Some(now),
+            last_failure: Some(ProbeFailure::DaemonWedge),
+            ..DaemonHealth::default()
+        };
         // A cause flip (wedge → relay-down) must NOT reset the budget —
         // alternating causes must not evade the 3-attempt halt.
-        set_health(ProbeOutcome::Down(ProbeFailure::RelayDown));
-        {
-            let h = health().lock().unwrap_poison();
-            assert_eq!(h.last_failure, Some(ProbeFailure::RelayDown));
-            assert_eq!(h.restart_attempts, 2);
-            assert!(h.next_restart_at.is_some());
-        }
+        h.apply_outcome(ProbeOutcome::Down(ProbeFailure::RelayDown), now, true);
+        assert_eq!(h.last_failure, Some(ProbeFailure::RelayDown));
+        assert_eq!(h.restart_attempts, 2);
+        assert!(h.next_restart_at.is_some());
         // Flapping back and forth accumulates — never resets.
-        set_health(ProbeOutcome::Down(ProbeFailure::DaemonWedge));
-        set_health(ProbeOutcome::Down(ProbeFailure::RelayDown));
-        {
-            let h = health().lock().unwrap_poison();
-            assert_eq!(h.last_failure, Some(ProbeFailure::RelayDown));
-            assert_eq!(h.restart_attempts, 2);
-        }
-        // Only a healthy probe opens a fresh bounded cycle.
-        set_health(ProbeOutcome::Healthy);
-        {
-            let h = health().lock().unwrap_poison();
-            assert_eq!(h.last_failure, None);
-            assert_eq!(h.restart_attempts, 0);
-            assert_eq!(h.next_restart_at, None);
-            assert!(!h.halted);
-        }
-        reset_health();
+        h.apply_outcome(ProbeOutcome::Down(ProbeFailure::DaemonWedge), now, true);
+        h.apply_outcome(ProbeOutcome::Down(ProbeFailure::RelayDown), now, true);
+        assert_eq!(h.last_failure, Some(ProbeFailure::RelayDown));
+        assert_eq!(h.restart_attempts, 2);
+        // A transient healthy result does not reset either — only sustained
+        // health across the window opens a fresh bounded cycle.
+        h.apply_outcome(ProbeOutcome::Healthy, now, true);
+        assert_eq!(h.restart_attempts, 2);
+        assert!(h.next_restart_at.is_some());
+        h.apply_outcome(ProbeOutcome::Healthy, now + SUSTAINED_HEALTHY_WINDOW, true);
+        assert_eq!(h.last_failure, None);
+        assert_eq!(h.restart_attempts, 0);
+        assert_eq!(h.next_restart_at, None);
+        assert!(!h.halted);
     }
 
     #[test]
@@ -1352,6 +1365,7 @@ mod tests {
     fn unreachable_tab_error_signature_detected() {
         for msg in [
             "the tab this session was driving can no longer be resolved (it was closed, or a flaky relay dropped it)",
+            "the tab this command was driving is gone — it may have been closed, or the relay lost it",
             "this session owns no resolvable tab in its group. Refusing to run on a tab this session does not drive",
             "stale sessionId ... its tab is gone",
             "unknown sessionId ...",
@@ -1363,6 +1377,9 @@ mod tests {
             // Relay-side outage — owned by is_relay_unavailable_error, and the
             // sweep's service_state skip gate already covers it.
             "Auto-launch failed: Could not drive your Chrome through the ab-connect extension.",
+            // Recoverable CLI retarget (OAuth/SSO navigation), NOT a permanent
+            // orphan — must stay out of the unreachable-tab matcher.
+            "the tab this command was driving is gone — it navigated across processes",
             // Daemon socket / page-level failures — not tab-attach problems.
             "Failed to read: Resource temporarily unavailable (os error 35)",
             "chrome-use error: Element not found",
@@ -1431,10 +1448,22 @@ mod tests {
 
     #[test]
     fn failure_text_classification_is_shared_between_detection_paths() {
-        // Auto-connect failure names the relay as the cause (its body points at
-        // `chrome-use extension connect`) — the relay signature wins over the
-        // daemon wrapper it is wrapped in, in both the probe and fail-fast
-        // paths, so they never disagree on the cause.
+        // The captured combined error (stale tab wrapped in the auto-connect
+        // envelope AND the daemon wrapper) classifies as unreachable-tab, NOT
+        // relay-down or wedge — recovery must not fire for an orphaned tab on
+        // an otherwise-healthy relay.
+        assert_eq!(
+            classify_failure_text(
+                "Auto-launch failed: Could not drive your Chrome through the ab-connect \
+                 extension. The tab this session was driving can no longer be resolved (it \
+                 was closed, or a flaky relay dropped it)"
+            ),
+            Some(ProbeFailure::UnreachableTab)
+        );
+        // Auto-connect failure alone names the relay as the cause (its body
+        // points at `chrome-use extension connect`) — the relay signature wins
+        // over the daemon wrapper it is wrapped in, in both the watchdog and
+        // fail-fast paths, so they never disagree on the cause.
         assert_eq!(
             classify_failure_text(
                 "Auto-launch failed: Could not drive your Chrome through the ab-connect extension."

@@ -263,9 +263,10 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::search_engine::init_all_engines(),
     );
 
-    // Browser daemon health watchdog: probes chrome-use daemon liveness and
-    // auto-restarts it with bounded backoff when it dies (browser relay daemon
-    // only — never the mahbot service itself).
+    // Browser daemon health watchdog: classifies chrome-use health from the
+    // daemon-free status and auto-restarts with bounded backoff when it is
+    // down; wedges surface on real browser calls (fail-fast) and wake this
+    // watchdog (browser relay daemon only — never the mahbot service itself).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
