@@ -5086,11 +5086,11 @@ impl EditorState {
             .find_replace_state
             .as_ref()
             .map(|state| {
+                let text = tab_data.content.text();
                 let tuples: Vec<(usize, usize, usize)> = state
                     .matches
                     .iter()
                     .filter_map(|range| {
-                        let text = tab_data.content.text();
                         let (line, byte_col_start, line_start) =
                             byte_offset_to_line_byte_col(&text, range.start)?;
                         let byte_col_end = range.end.saturating_sub(line_start);
