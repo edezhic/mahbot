@@ -2076,10 +2076,6 @@ pub struct EditorWidget<'a> {
     /// Index of the currently-focused match within `matches`.
     /// Used to render the current match with a stronger highlight color.
     match_current_idx: usize,
-    /// Blink tick counter from the editor state.
-    /// Incremented on each `BlinkTick` subscription event to force Iced
-    /// to redraw the widget even when no other state has changed.
-    blink_tick: u64,
     /// Matching bracket pair to highlight, if any.
     /// Each element is `(line, col)`.
     bracket_pair: Option<((usize, usize), (usize, usize))>,
@@ -2097,7 +2093,6 @@ impl<'a> EditorWidget<'a> {
             ignore_keyboard: false,
             matches: None,
             match_current_idx: 0,
-            blink_tick: 0,
             bracket_pair: None,
             buffer_key: None,
         }
@@ -2132,15 +2127,6 @@ impl<'a> EditorWidget<'a> {
             Some(matches)
         };
         self.match_current_idx = current_idx;
-        self
-    }
-
-    /// Set the blink tick counter.
-    /// This is passed from the editor state's `BlinkTick` handler to force
-    /// Iced to detect a widget change and schedule a redraw on each tick.
-    #[must_use]
-    pub const fn blink_tick(mut self, blink_tick: u64) -> Self {
-        self.blink_tick = blink_tick;
         self
     }
 
@@ -2258,9 +2244,6 @@ where
                     state.scroll_y = (est_y - text_area_height + metrics.line_height).max(0.0);
                 }
             }
-            // Re-enable for subsequent frames so cursor tracking resumes
-            // after this one-shot adjustment
-            state.auto_scroll_enabled = true;
         }
 
         // ── Compute max scroll range ───────────────────────────────────

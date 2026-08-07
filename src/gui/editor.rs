@@ -35,7 +35,7 @@ use crate::git_commands::{is_git_repo, run_git_check_ignore, run_git_output, run
 use crate::util::unquote_c_style;
 
 use super::common::{UndoSnapshot, UndoStack};
-use super::editor_widget::{LineEnding, detect_line_ending, has_trailing_newline};
+use super::editor_widget::{LineEnding, detect_line_ending};
 use crate::tools::MAX_FILE_SIZE_BYTES as MAX_FILE_SIZE;
 
 use super::editor_widget::EditorBuffer;
@@ -141,8 +141,6 @@ struct Tab {
     file_name: String,
     /// Whether the file has unsaved changes.
     is_dirty: bool,
-    /// Whether the file ends with a newline.
-    has_trailing_newline: bool,
     /// Detected line ending convention.
     line_ending: LineEnding,
 }
@@ -173,7 +171,6 @@ fn hash_text(text: &str) -> u64 {
 fn make_tab_and_data(
     path: &str,
     text: &str,
-    has_trailing_newline: bool,
     line_ending: LineEnding,
     is_dirty: bool,
     saved_text_hash: u64,
@@ -187,7 +184,6 @@ fn make_tab_and_data(
         path: path.to_string(),
         file_name,
         is_dirty,
-        has_trailing_newline,
         line_ending,
     };
 
@@ -267,8 +263,6 @@ struct GlobalSearchState {
     selected_index: usize,
     /// Current search status.
     status: GlobalSearchStatus,
-    /// Generation counter for stale-result prevention.
-    search_gen: u64,
 }
 
 use std::ops::Range;
@@ -330,7 +324,6 @@ enum TabDirection {
 pub struct FileLoadData {
     path: String,
     text: String,
-    has_trailing_newline: bool,
     line_ending: LineEnding,
 }
 
@@ -362,7 +355,6 @@ pub struct SavedTabData {
     file_path: String,
     text: String,
     was_dirty: bool,
-    has_trailing_newline: bool,
     line_ending: LineEnding,
     /// Whether this tab was the active one when saved.
     is_active: bool,
@@ -883,7 +875,6 @@ async fn load_file_data(full_path: String, r#gen: u64) -> EditorMessage {
 
     let data = FileLoadData {
         path: full_path,
-        has_trailing_newline: has_trailing_newline(&text),
         line_ending: detect_line_ending(&text),
         text,
     };
@@ -2363,13 +2354,11 @@ impl EditorState {
                     };
 
                     if let Some(text) = loaded_text {
-                        let has_trailing = has_trailing_newline(&text);
                         let line_ending = detect_line_ending(&text);
                         loaded.push(SavedTabData {
                             file_path,
                             text,
                             was_dirty: record.is_dirty,
-                            has_trailing_newline: has_trailing,
                             line_ending,
                             is_active: record.is_active,
                         });
@@ -2444,7 +2433,6 @@ impl EditorState {
             let (tab, td, mtime) = make_tab_and_data(
                 &saved.file_path,
                 &saved.text,
-                saved.has_trailing_newline,
                 saved.line_ending,
                 saved.was_dirty,
                 saved_hash,
@@ -2529,14 +2517,8 @@ impl EditorState {
         match result {
             Ok(data) => {
                 let saved_hash = hash_text(&data.text);
-                let (tab, tab_data, mtime) = make_tab_and_data(
-                    &data.path,
-                    &data.text,
-                    data.has_trailing_newline,
-                    data.line_ending,
-                    false,
-                    saved_hash,
-                );
+                let (tab, tab_data, mtime) =
+                    make_tab_and_data(&data.path, &data.text, data.line_ending, false, saved_hash);
                 self.insert_tab(data.path, tab, tab_data, mtime);
                 self.active_tab_index = self.tabs.len().saturating_sub(1);
                 self.session_initialized = true;
@@ -2596,10 +2578,6 @@ impl EditorState {
                 }
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.path == path) {
                     tab.is_dirty = false;
-                    if let Some(tab_data) = self.tab_contents.get(path) {
-                        let text = tab_data.content.text();
-                        tab.has_trailing_newline = has_trailing_newline(&text);
-                    }
                 }
                 if let Some(tab_data) = self.tab_contents.get_mut(path) {
                     tab_data.saved_text_hash = saved_hash;
@@ -2746,7 +2724,6 @@ impl EditorState {
             results: Vec::new(),
             selected_index: 0,
             status: GlobalSearchStatus::Idle,
-            search_gen: gs_gen,
         }));
 
         // Start scanning the search engine and show readiness status.
@@ -3129,7 +3106,6 @@ impl EditorState {
             state.selected_index = 0;
             // Increment generation to cancel any in-flight searches.
             self.global_search_gen = self.global_search_gen.wrapping_add(1);
-            state.search_gen = self.global_search_gen;
             return Task::none();
         }
 
@@ -3146,7 +3122,6 @@ impl EditorState {
 
         self.global_search_gen = self.global_search_gen.wrapping_add(1);
         let gs_gen = self.global_search_gen;
-        state.search_gen = gs_gen;
 
         Task::perform(run_global_search(ws_path, ws_name, query, gs_gen), |msg| {
             msg
@@ -3845,10 +3820,6 @@ impl EditorState {
                     // Auto-jump to first match.
                     auto_jump_to_first_match(&tab_data.content, &mut state);
                 }
-                // Close go-to-line when opening find bar (mutually exclusive).
-                if matches!(self.active_modal, Some(ModalKind::GotoLine(_))) {
-                    self.active_modal = None;
-                }
                 tab_data.find_replace_state = Some(state);
             }
             // Already open — re-focus the search input (no state change needed).
@@ -4250,13 +4221,11 @@ impl EditorState {
 
         let task = match result {
             Ok(text) => {
-                let has_trailing = has_trailing_newline(&text);
                 let line_ending = detect_line_ending(&text);
 
                 // Update tab metadata.
                 if let Some(tab) = self.tabs.get_mut(idx) {
                     tab.is_dirty = false;
-                    tab.has_trailing_newline = has_trailing;
                     tab.line_ending = line_ending;
                 }
 
@@ -5148,7 +5117,6 @@ impl EditorState {
             ignore_keyboard,
             match_tuples,
             match_current_idx,
-            self.blink_tick,
             bracket_pair,
         )
     }
@@ -5161,14 +5129,12 @@ impl EditorState {
         ignore_keyboard: bool,
         matches: Vec<(usize, usize, usize)>,
         match_current_idx: usize,
-        blink_tick: u64,
         bracket_pair: Option<super::editor_widget::BracketPair>,
     ) -> Element<'a, EditorMessage> {
         let editor = super::editor_widget::EditorWidget::new(content)
             .padding(8.0)
             .ignore_keyboard(ignore_keyboard)
             .matches(matches, match_current_idx)
-            .blink_tick(blink_tick)
             .bracket_pair(bracket_pair)
             .buffer_key(buffer_key);
         let element = iced::Element::new(editor);

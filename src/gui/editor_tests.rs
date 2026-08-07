@@ -151,7 +151,6 @@ fn test_build_tab_records_persists_dirty_content() {
         path: "/tmp/foo.md".to_string(),
         file_name: "foo.md".to_string(),
         is_dirty: true,
-        has_trailing_newline: true,
         line_ending: LineEnding::Lf,
     }];
     let mut tab_contents = HashMap::new();
@@ -177,7 +176,6 @@ fn test_build_tab_records_clears_dirty_content_when_clean() {
         path: "/tmp/foo.md".to_string(),
         file_name: "foo.md".to_string(),
         is_dirty: false,
-        has_trailing_newline: false,
         line_ending: LineEnding::Lf,
     }];
     let records = build_tab_records(&tabs, 0, &HashMap::new());
@@ -192,7 +190,6 @@ fn test_save_result_ignores_stale_save() {
         path: path.clone(),
         file_name: "stale.md".to_string(),
         is_dirty: true,
-        has_trailing_newline: false,
         line_ending: LineEnding::Lf,
     });
     state.tab_contents.insert(
@@ -958,7 +955,6 @@ fn make_editor_with_find_state(
         path: "/test.rs".to_string(),
         file_name: "test.rs".to_string(),
         is_dirty: false,
-        has_trailing_newline: true,
         line_ending: LineEnding::Lf,
     });
     state.active_tab_index = 0;
@@ -1218,7 +1214,6 @@ fn make_editor_with_single_tab(text: &str) -> EditorState {
         path: "/test.rs".to_string(),
         file_name: "test.rs".to_string(),
         is_dirty: false,
-        has_trailing_newline: true,
         line_ending: LineEnding::Lf,
     });
     state.active_tab_index = 0;
@@ -1973,7 +1968,6 @@ fn make_editor_with_tabs(count: usize, active: usize) -> EditorState {
             path: format!("/tmp/test_{i}.rs"),
             file_name: format!("test_{i}.rs"),
             is_dirty: false,
-            has_trailing_newline: true,
             line_ending: LineEnding::Lf,
         });
         state.tab_contents.insert(
