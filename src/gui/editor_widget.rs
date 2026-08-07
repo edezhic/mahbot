@@ -412,8 +412,8 @@ impl EditorBuffer {
             EditorAction::JumpToMatchingBracket => self.do_jump_to_matching_bracket(),
             EditorAction::DeleteLine => self.do_delete_line(),
             EditorAction::DuplicateLine => self.do_duplicate_line(),
-            EditorAction::MoveLineUp => self.do_move_line_up(),
-            EditorAction::MoveLineDown => self.do_move_line_down(),
+            EditorAction::MoveLineUp => self.do_move_line(true),
+            EditorAction::MoveLineDown => self.do_move_line(false),
         }
     }
 
@@ -1335,9 +1335,10 @@ impl EditorBuffer {
         });
     }
 
-    /// Move the current line (or selected lines) up by one.
-    /// At the first line boundary, this is a no-op.
-    fn do_move_line_up(&self) {
+    /// Move the current line (or selected lines) up or down by one.
+    /// No-op at the buffer boundaries; the cursor lands on the moved
+    /// block's first line in both directions.
+    fn do_move_line(&self, up: bool) {
         let line_count = self.line_count();
         if line_count <= 1 {
             return;
@@ -1347,47 +1348,18 @@ impl EditorBuffer {
             return;
         };
 
-        if start_line == 0 {
-            return; // Already at top.
-        }
-
-        let swap_line = start_line.saturating_sub(1);
-
-        self.edit_text(|text| {
-            let default_ending = detect_line_ending(text);
-            let had_trailing = has_trailing_newline(text);
-            let mut lines = logical_lines(text);
-            if swap_line >= lines.len() || end_line >= lines.len() {
-                return (text.to_string(), None);
+        let (swap_line, insert_at) = if up {
+            if start_line == 0 {
+                return; // Already at top.
             }
-            if start_line == end_line {
-                swap_lines_with_endings(&mut lines, swap_line, start_line);
-            } else {
-                let block: Vec<_> = lines.drain(start_line..=end_line).collect();
-                lines.splice(swap_line..swap_line, block);
+            let above = start_line.saturating_sub(1);
+            (above, above)
+        } else {
+            if end_line + 1 >= line_count {
+                return; // Already at bottom.
             }
-            fix_line_endings(&mut lines, had_trailing, default_ending);
-            (reassemble_lines(&lines), Some((swap_line, 0)))
-        });
-    }
-
-    /// Move the current line (or selected lines) down by one.
-    /// At the last line boundary, this is a no-op.
-    fn do_move_line_down(&self) {
-        let line_count = self.line_count();
-        if line_count <= 1 {
-            return;
-        }
-
-        let Some((start_line, end_line)) = self.selected_line_range() else {
-            return;
+            (end_line + 1, start_line + 1)
         };
-
-        if end_line + 1 >= line_count {
-            return; // Already at bottom.
-        }
-
-        let swap_line = end_line + 1;
 
         self.edit_text(|text| {
             let default_ending = detect_line_ending(text);
@@ -1399,14 +1371,11 @@ impl EditorBuffer {
             if start_line == end_line {
                 swap_lines_with_endings(&mut lines, start_line, swap_line);
             } else {
-                let below = lines.remove(swap_line);
                 let block: Vec<_> = lines.drain(start_line..=end_line).collect();
-                lines.splice(start_line..start_line, std::iter::once(below));
-                let block_insert_at = start_line + 1;
-                lines.splice(block_insert_at..block_insert_at, block);
+                lines.splice(insert_at..insert_at, block);
             }
             fix_line_endings(&mut lines, had_trailing, default_ending);
-            (reassemble_lines(&lines), Some((start_line + 1, 0)))
+            (reassemble_lines(&lines), Some((insert_at, 0)))
         });
     }
 }

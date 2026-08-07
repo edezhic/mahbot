@@ -679,6 +679,18 @@ fn test_move_line_down_at_bottom() {
 }
 
 #[test]
+fn test_move_selected_lines_down() {
+    let buf = EditorBuffer::with_text("a\nb\nc\nd", None);
+    buf.move_to(1, 0);
+    buf.perform_action(EditorAction::SelectTo { line: 2, col: 0 });
+    buf.perform_action(EditorAction::MoveLineDown);
+    assert_eq!(buf.text(), "a\nd\nb\nc");
+    let cursor = buf.cursor();
+    assert_eq!(cursor.line, 2); // First line of the moved block
+    assert_eq!(cursor.column, 0);
+}
+
+#[test]
 fn test_has_trailing_newline() {
     assert!(has_trailing_newline("hello\n"));
     assert!(!has_trailing_newline("hello"));
