@@ -209,56 +209,61 @@ fn test_save_result_ignores_stale_save() {
     );
 }
 
-// ── byte_offset_to_cursor_pos ───────────────────────────────
+// ── byte_offset_to_line_col ────────────────────────────────
 
 #[test]
-fn test_byte_offset_to_cursor_pos() {
+fn test_byte_offset_to_line_col() {
     struct Case {
         text: &'static str,
         byte_offset: usize,
-        expected: Option<(usize, usize)>,
+        expected: (usize, usize),
     }
     let cases: &[Case] = &[
         // Unicode multi-byte chars
         Case {
             text: "Привет мир",
             byte_offset: 13, // start of "м"
-            expected: Some((0, 7)),
+            expected: (0, 7),
         },
         // Start of content
         Case {
             text: "hello\nworld",
             byte_offset: 0,
-            expected: Some((0, 0)),
+            expected: (0, 0),
         },
         // Second line
         Case {
             text: "hello\nworld",
             byte_offset: 6, // after "hello\n"
-            expected: Some((1, 0)),
+            expected: (1, 0),
         },
         // Middle of a line
         Case {
             text: "hello\nworld",
             byte_offset: 8, // "wo"
-            expected: Some((1, 2)),
+            expected: (1, 2),
         },
-        // Beyond text length
+        // Beyond text length — clamps to end
         Case {
             text: "hello",
             byte_offset: 100,
-            expected: None,
+            expected: (0, 5),
         },
         // Empty content
         Case {
             text: "",
             byte_offset: 0,
-            expected: Some((0, 0)),
+            expected: (0, 0),
+        },
+        // Empty content with out-of-bounds offset — clamps to start
+        Case {
+            text: "",
+            byte_offset: 100,
+            expected: (0, 0),
         },
     ];
     for case in cases {
-        let content = EditorBuffer::with_text(case.text, None);
-        let pos = byte_offset_to_cursor_pos(&content, case.byte_offset);
+        let pos = byte_offset_to_line_col(case.text, case.byte_offset);
         assert_eq!(
             pos, case.expected,
             "text={:?} offset={}",

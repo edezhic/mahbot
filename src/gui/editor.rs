@@ -38,7 +38,7 @@ use super::common::{UndoSnapshot, UndoStack};
 use super::editor_widget::{LineEnding, detect_line_ending};
 use crate::tools::MAX_FILE_SIZE_BYTES as MAX_FILE_SIZE;
 
-use super::editor_widget::EditorBuffer;
+use super::editor_widget::{EditorBuffer, byte_offset_to_line_col};
 use super::theme;
 use super::widget_helpers;
 use super::widgets::{self, FileTree};
@@ -1406,11 +1406,6 @@ pub struct EditorState {
     git_ignore_cache: HashSet<String>,
     /// Guard against concurrent git ignore refresh operations.
     git_ignore_loading: bool,
-    /// Monotonically incrementing blink tick counter.
-    /// Incremented on each `BlinkTick` to force Iced to redraw the editor
-    /// widget, keeping the cursor blink alive even if the `RedrawRequested`
-    /// chain breaks.
-    blink_tick: u64,
     /// Shared atomic counter used by async save tasks for pre-write staleness
     /// checking.  Written to on every save initiation; read by in-flight tasks
     /// to determine if a newer save has superseded them.
@@ -1494,7 +1489,6 @@ impl EditorState {
             git_status_loading: false,
             git_ignore_cache: HashSet::new(),
             git_ignore_loading: false,
-            blink_tick: 0,
             tab_save_counter: Arc::new(AtomicU64::new(0)),
             file_mtimes: HashMap::new(),
             deleted_file_toasted: HashSet::new(),
@@ -2238,7 +2232,9 @@ impl EditorState {
 
             EditorMessage::Tick => self.tick(),
 
-            EditorMessage::BlinkTick => self.blink_tick(),
+            EditorMessage::BlinkTick | EditorMessage::RevealDone | EditorMessage::Toast(_) => {
+                Task::none()
+            }
 
             EditorMessage::GitStatusLoaded { r#gen, result } => {
                 self.git_status_loaded(r#gen, result)
@@ -2256,8 +2252,6 @@ impl EditorState {
                 cursor_line,
                 cursor_col,
             } => self.file_reloaded(path, result, cursor_line, cursor_col),
-
-            EditorMessage::RevealDone | EditorMessage::Toast(_) => Task::none(),
         }
     }
 
@@ -3818,7 +3812,7 @@ impl EditorState {
                     let text = tab_data.content.text();
                     state.matches = compute_text_matches(&text, &state.query, state.case_sensitive);
                     // Auto-jump to first match.
-                    auto_jump_to_first_match(&tab_data.content, &mut state);
+                    auto_jump_to_first_match(&text, &tab_data.content, &mut state);
                 }
                 tab_data.find_replace_state = Some(state);
             }
@@ -3838,7 +3832,7 @@ impl EditorState {
                 state.query = query;
                 let text = tab_data.content.text();
                 state.matches = compute_text_matches(&text, &state.query, state.case_sensitive);
-                auto_jump_to_first_match(&tab_data.content, state);
+                auto_jump_to_first_match(&text, &tab_data.content, state);
             }
         }
         Task::none()
@@ -3929,21 +3923,15 @@ impl EditorState {
                     state.current_match_idx = next_idx;
                     // Position cursor at the new match.
                     if let Some(r) = state.matches.get(next_idx) {
-                        if let Some((line, col)) =
-                            byte_offset_to_cursor_pos(&tab_data.content, r.start)
-                        {
-                            tab_data.content.move_to(line, col);
-                        }
+                        let (line, col) = byte_offset_to_line_col(&new_text, r.start);
+                        tab_data.content.move_to(line, col);
                     }
                 } else {
                     state.current_match_idx = 0;
                     // No remaining matches — place cursor at end of
                     // the replacement, not at buffer start.
-                    if let Some((line, col)) =
-                        byte_offset_to_cursor_pos(&tab_data.content, replace_end)
-                    {
-                        tab_data.content.move_to(line, col);
-                    }
+                    let (line, col) = byte_offset_to_line_col(&new_text, replace_end);
+                    tab_data.content.move_to(line, col);
                 }
             }
         }
@@ -3963,7 +3951,7 @@ impl EditorState {
                 // Recompute matches with new case sensitivity.
                 let text = tab_data.content.text();
                 state.matches = compute_text_matches(&text, &state.query, state.case_sensitive);
-                auto_jump_to_first_match(&tab_data.content, state);
+                auto_jump_to_first_match(&text, &tab_data.content, state);
             }
         }
         Task::none()
@@ -4076,18 +4064,6 @@ impl EditorState {
         } else {
             Task::none()
         }
-    }
-
-    /// Handle blink-tick — increments the blink tick counter.
-    fn blink_tick(&mut self) -> Task<EditorMessage> {
-        // Increment the blink tick counter to force Iced
-        // to redraw the editor widget. Iced 0.14 may skip redrawing
-        // unchanged widgets when only request_redraw_at is used;
-        // this counter ensures the widget is re-evaluated on each
-        // BlinkTick (every 100 ms), keeping the cursor blink alive
-        // even if the RedrawRequested chain breaks.
-        self.blink_tick = self.blink_tick.wrapping_add(1);
-        Task::none()
     }
 
     /// Handle git-status-loaded — updates the git status cache.
@@ -4279,11 +4255,9 @@ impl EditorState {
                     };
                     state.current_match_idx = new_idx;
                     if let Some(range) = state.matches.get(new_idx) {
-                        if let Some((line, col)) =
-                            byte_offset_to_cursor_pos(&tab_data.content, range.start)
-                        {
-                            tab_data.content.move_to(line, col);
-                        }
+                        let (line, col) =
+                            byte_offset_to_line_col(&tab_data.content.text(), range.start);
+                        tab_data.content.move_to(line, col);
                     }
                 }
             }
@@ -5479,20 +5453,6 @@ fn map_editor_shortcut(event: keyboard::Event) -> Option<EditorMessage> {
 
 // ── Find/Replace helpers ───────────────────────────────────────────
 
-/// Convert a byte offset in the editor content to a (line, character column) pair.
-/// Returns `None` if the offset is out of range.
-#[must_use]
-fn byte_offset_to_cursor_pos(
-    content: &super::editor_widget::EditorBuffer,
-    offset: usize,
-) -> Option<(usize, usize)> {
-    let text = content.text();
-    if offset > text.len() {
-        return None;
-    }
-    Some(super::editor_widget::byte_offset_to_line_col(&text, offset))
-}
-
 /// Convert a byte offset to (line, byte column within line, line byte start).
 #[must_use]
 fn byte_offset_to_line_byte_col(text: &str, offset: usize) -> Option<(usize, usize, usize)> {
@@ -5505,14 +5465,14 @@ fn byte_offset_to_line_byte_col(text: &str, offset: usize) -> Option<(usize, usi
 
 /// Auto-jump the cursor to the first find match and reset the match index to 0.
 fn auto_jump_to_first_match(
+    text: &str,
     content: &super::editor_widget::EditorBuffer,
     state: &mut FindReplaceState,
 ) {
     state.current_match_idx = 0;
     if let Some(range) = state.matches.first() {
-        if let Some((line, col)) = byte_offset_to_cursor_pos(content, range.start) {
-            content.move_to(line, col);
-        }
+        let (line, col) = byte_offset_to_line_col(text, range.start);
+        content.move_to(line, col);
     }
 }
 
