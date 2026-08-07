@@ -45,6 +45,51 @@ pub(crate) fn estimate_tokens(messages: &[ChatMessage]) -> usize {
         .sum()
 }
 
+/// Number of latest user messages / assistant answers retained per side
+/// after summarization compaction.
+pub(crate) const RETENTION_PER_SIDE: usize = 3;
+
+/// Assistant messages carrying tool-call payloads are tool traffic — never
+/// counted toward the retention window. Mirrors the app-wide history-rendering
+/// discriminator ([`decode_native_history_message`]).
+fn is_tool_call_frame(msg: &ChatMessage) -> bool {
+    matches!(
+        decode_native_history_message(msg),
+        Some(DecodedNativeHistoryMessage::Assistant {
+            tool_calls: Some(_),
+            ..
+        })
+    )
+}
+
+/// Select the latest [`RETENTION_PER_SIDE`] user messages and assistant answers
+/// from `history`, merged in chronological order. Tool-call frames and tool
+/// results are excluded from both sides. The triggering (in-flight) user
+/// message is the newest entry, so it always lands last — callers must not
+/// re-append it separately.
+#[must_use]
+pub(crate) fn select_retention_window(history: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut users: Vec<(usize, &ChatMessage)> = Vec::new();
+    let mut assistants: Vec<(usize, &ChatMessage)> = Vec::new();
+    for (idx, msg) in history.iter().enumerate().rev() {
+        match msg.role {
+            ChatRole::User if users.len() < RETENTION_PER_SIDE => users.push((idx, msg)),
+            ChatRole::Assistant
+                if !is_tool_call_frame(msg) && assistants.len() < RETENTION_PER_SIDE =>
+            {
+                assistants.push((idx, msg));
+            }
+            _ => {}
+        }
+        if users.len() == RETENTION_PER_SIDE && assistants.len() == RETENTION_PER_SIDE {
+            break;
+        }
+    }
+    let mut selected: Vec<(usize, &ChatMessage)> = users.into_iter().chain(assistants).collect();
+    selected.sort_by_key(|(idx, _)| *idx);
+    selected.into_iter().map(|(_, m)| m.clone()).collect()
+}
+
 /// Build a user message with the current datetime prepended.
 #[must_use]
 pub(crate) fn user_msg_with_datetime(content: &str) -> ChatMessage {
@@ -943,6 +988,123 @@ mod tests {
             len_after_real,
             "empty message must not append to session history",
         );
+    }
+
+    // ── Retention-window selection ───────────────────────────────────
+
+    fn tool_call_frame() -> ChatMessage {
+        let tc = ToolCall {
+            id: "t1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({}),
+        };
+        ChatMessage::assistant(
+            crate::providers::reasoning_roundtrip::assistant_replay_payload(
+                Some("prologue"),
+                std::slice::from_ref(&tc),
+                None,
+            )
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn retention_window_keeps_latest_per_side_excluding_tools() {
+        let frame = tool_call_frame();
+        let messages = vec![
+            ChatMessage::system("prompt"),
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("a1"),
+            ChatMessage::user("u2"),
+            frame.clone(),
+            ChatMessage::tool_result("t1", "file contents"),
+            ChatMessage::assistant("a2"),
+            ChatMessage::user("u3"), // in-flight — newest, always retained
+        ];
+        let window = select_retention_window(&messages);
+        let contents: Vec<&str> = window.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, vec!["u1", "a1", "u2", "a2", "u3"]);
+        // In-flight message appears exactly once — no duplicate re-append.
+        assert_eq!(contents.iter().filter(|c| **c == "u3").count(), 1);
+    }
+
+    #[test]
+    fn retention_window_drops_oldest_beyond_three() {
+        let messages: Vec<ChatMessage> = (0..5)
+            .flat_map(|i| {
+                vec![
+                    ChatMessage::user(format!("u{i}")),
+                    ChatMessage::assistant(format!("a{i}")),
+                ]
+            })
+            .collect();
+        let window = select_retention_window(&messages);
+        let contents: Vec<&str> = window.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, vec!["u2", "a2", "u3", "a3", "u4", "a4"]);
+    }
+
+    #[test]
+    fn retention_window_short_history_and_json_answers() {
+        // First turn: no assistant answers → users only.
+        let window = select_retention_window(&[ChatMessage::user("u1")]);
+        assert_eq!(window.len(), 1);
+        assert_eq!(window[0].content, "u1");
+
+        // Reasoning-only JSON payloads and JSON-looking plain answers are
+        // answers, not tool traffic.
+        let reasoning = Reasoning {
+            reasoning: Some("thinking".into()),
+            reasoning_content: None,
+            reasoning_details: None,
+        };
+        let reasoning_msg = ChatMessage::assistant(
+            crate::providers::reasoning_roundtrip::assistant_replay_payload(
+                Some(""),
+                &[],
+                Some(&reasoning),
+            )
+            .to_string(),
+        );
+        let window =
+            select_retention_window(&[reasoning_msg, ChatMessage::assistant("{\"result\": 42}")]);
+        assert_eq!(window.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn finalize_appends_only_new_assistant_answer() {
+        crate::util::test::init_test_stores().await;
+        let k = unique_key();
+        // Persisted history ending with an assistant answer (e.g. a compacted
+        // session whose retained window ends with one).
+        store()
+            .batch_append(
+                &k,
+                &[
+                    ChatMessage::system("prompt"),
+                    ChatMessage::user("u1"),
+                    ChatMessage::assistant("a1"),
+                ],
+            )
+            .await
+            .unwrap();
+        let ws = crate::workspace::test_ws_named("/_test_finalize_guard", "finalize_test");
+        let mut session = Session::default();
+        session
+            .init(&k, "", &ws, &crate::Role::Assistant, None, "gui", "tester")
+            .await
+            .unwrap();
+
+        // No new assistant output this turn → the persisted trailing answer
+        // must not be re-appended.
+        session.finalize(&k).await.unwrap();
+        assert_eq!(store().load(&k).await.len(), 3);
+
+        // A genuinely new answer IS appended.
+        session.push_assistant("a2".to_string());
+        session.finalize(&k).await.unwrap();
+        let msgs = store().load(&k).await;
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[3].content, "a2");
     }
 }
 

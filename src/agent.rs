@@ -239,7 +239,7 @@ impl Agent {
             )
             .await?;
 
-        self.maybe_summarize(msg).await;
+        self.maybe_summarize().await;
 
         let shutdown = crate::shutdown::shutdown_token();
         let response_result = tokio::select! {
@@ -798,7 +798,7 @@ impl Agent {
     ///
     /// KV-cache preservation: [`Agent::summarize`] keeps all parameters identical
     /// (see [`Agent::build_chat_request`]) so the cached prefix is reusable.
-    async fn maybe_summarize(&mut self, msg: &str) {
+    async fn maybe_summarize(&mut self) {
         let history_tokens = crate::session::estimate_tokens(self.session.history());
         if history_tokens > crate::session::SUMMARIZATION_THRESHOLD {
             match self.summarize().await {
@@ -806,7 +806,6 @@ impl Agent {
                     self.session
                         .apply_summary(
                             &self.agent_id,
-                            msg,
                             &summary,
                             &self.workspace,
                             &self.role,

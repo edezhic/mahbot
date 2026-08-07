@@ -27,6 +27,10 @@ pub struct Session {
     /// In-memory history for the current turn (includes system prompt,
     /// conversation, and the latest user message).
     history: Vec<ChatMessage>,
+    /// Number of leading `history` entries already persisted to the store.
+    /// [`Session::finalize`] only appends beyond this prefix, so a trailing
+    /// assistant answer retained by compaction is never duplicated.
+    persisted_len: usize,
 }
 
 impl Session {
@@ -119,6 +123,10 @@ impl Session {
         // already persisted atomically alongside the messages above —
         // no separate write needed.
 
+        // All loaded/appended history above is persisted — record the prefix
+        // so finalize only appends genuinely new assistant output.
+        self.persisted_len = self.history.len();
+
         Ok(())
     }
 
@@ -139,14 +147,17 @@ impl Session {
     /// Bulk-append messages to in-memory history.
     /// Operates on in-memory history only, not the session store.
     pub(crate) fn push_messages(&mut self, messages: &[ChatMessage]) {
+        self.persisted_len += messages.len();
         self.history.extend_from_slice(messages);
     }
 
     // ── Summarization — apply summary produced by Agent ─────────────────
 
     /// Replace the in-memory and persisted history with a compacted version
-    /// containing a fresh system prompt (via `build_context_messages`) and
-    /// the given `summary_text` + current user `msg`.
+    /// containing a fresh system prompt (via `build_context_messages`), the
+    /// given `summary_text`, and the latest [`crate::session::RETENTION_PER_SIDE`]
+    /// user messages + assistant answers from the pre-compaction history
+    /// (tool traffic excluded — see [`crate::session::select_retention_window`]).
     ///
     /// The LLM call to produce the summary text is the responsibility of
     /// [`crate::Agent::summarize`] — this method
@@ -161,7 +172,6 @@ impl Session {
     pub(crate) async fn apply_summary(
         &mut self,
         agent_id: &str,
-        msg: &str,
         summary_text: &str,
         ws: &Workspace,
         role: &Role,
@@ -170,14 +180,14 @@ impl Session {
         // Build fresh system prompt (may have changed since session start).
         let mut compacted = Self::build_context_messages(ws, role, ticket).await;
 
-        // Append conversation summary + current user request
+        // Append conversation summary, then the retained latest turns in
+        // chronological order. The in-flight user message is already among
+        // them (newest user message) — no separate re-append here.
         let prefix = load_prompt("summary_prefix.md");
         compacted.push(ChatMessage::system(format!("{prefix}{summary_text}")));
-        if !msg.is_empty() {
-            compacted.push(crate::session::user_msg_with_datetime(msg));
-        }
+        compacted.extend(crate::session::select_retention_window(&self.history));
 
-        // Persist compacted history (system prompt + summary only).
+        // Persist compacted history (system prompt + summary + retained window).
         // On success, update in-memory history to match. On failure, keep the
         // full in-memory history — next turn reloads from DB and retries.
         if let Err(e) = crate::session::store()
@@ -191,6 +201,7 @@ impl Session {
             );
         } else {
             self.history = compacted;
+            self.persisted_len = self.history.len();
         }
     }
 
@@ -198,13 +209,18 @@ impl Session {
 
     /// Persist the final assistant message (last assistant entry in history)
     /// to the session store.
+    ///
+    /// Only appends beyond the already-persisted prefix — after compaction
+    /// the retained window may end with a persisted assistant answer, which
+    /// must not be duplicated.
     pub(crate) async fn finalize(&self, agent_id: &str) -> Result<()> {
         let Some(final_msg) = self
             .history
-            .last()
+            .get(self.persisted_len..)
+            .and_then(|tail| tail.last())
             .filter(|m| m.role == ChatRole::Assistant)
         else {
-            tracing::warn!("finalize called but no assistant message in history");
+            tracing::warn!("finalize called but no new assistant message in history");
             return Ok(());
         };
         crate::session::store().append(agent_id, final_msg).await?;
