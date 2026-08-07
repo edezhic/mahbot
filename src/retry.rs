@@ -457,7 +457,7 @@ pub(crate) async fn record_retry_failure(record: &RetryFailureRecord) {
 pub(crate) struct RetryExhausted {
     pub failures: Vec<RetryFailureRecord>,
     pub final_class: FailureClass,
-    /// Last-attempt raw text (verdict-extraction Amendment B dumps). See the
+    /// Last-attempt raw text (verdict-extraction ticket-comment dumps). See the
     /// type docs for the precise "last completed attempt" semantics.
     pub last_raw: Option<String>,
     /// Human-readable terminal reason (identical to `Display`).

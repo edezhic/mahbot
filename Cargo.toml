@@ -214,7 +214,7 @@ debug = false
 # recompile of qwen-asr per clean test run) without any runtime benefit — tests
 # exercise the same optimized code — and could regress warm test-cache reuse.
 # The dependency-compilation behavior of per-package test overrides was verified
-# empirically on cargo 1.97.1 (mahbot-1046); the dev override already covers
+# empirically on cargo 1.97.1; the dev override already covers
 # tests, so no test override is added.
 [profile.dev.package.qwen-asr]
 opt-level = 3

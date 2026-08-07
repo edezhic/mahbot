@@ -1,4 +1,4 @@
-//! E2E integration test / benchmark for the full voice pipeline (mahbot-811, mahbot-844).
+//! E2E integration test / benchmark for the full voice pipeline.
 //!
 //! This test exercises the **enrollment-to-detection cycle with realistic
 //! TTS-generated speech audio**.  It uses the TTS engine to synthesize wake
@@ -94,7 +94,7 @@ const ROLLING_SUM_IDX: usize = 1;
 /// Index of the effective threshold field in per_frame_scores `[total_score, rolling_sum, threshold]` triples.
 const THRESHOLD_IDX: usize = 2;
 /// Index of the total (classifier) score field in per_frame_scores
-/// `[total_score, rolling_sum, threshold]` triples (mahbot-1045 B7 — the
+/// `[total_score, rolling_sum, threshold]` triples (the
 /// layout is shared with production's scoring pipeline, so a production
 /// layout change must not silently corrupt miss classification).
 const TOTAL_SCORE_IDX: usize = 0;
@@ -103,21 +103,21 @@ const TOTAL_SCORE_IDX: usize = 0;
 ///
 /// The classifier rolling sum must reach at least this value for the
 /// classifier to have fired.  Below this threshold, misses are attributed
-/// to the classifier (mahbot-882).
+/// to the classifier.
 ///
-/// Updated for mahbot-923's unified dense stride-8 embeddings (1.58× multiplier
+/// Updated for the unified dense stride-8 embeddings (1.58× multiplier
 /// vs the old mixed old-style + streaming distribution): 2.13 = 1.35 * 1.58.
 const MIN_CLASSIFIER_THRESHOLD: f32 = 2.13;
 
 /// Number of samples in the warm-up audio prepended before each test
-/// utterance (mahbot-922, mahbot-926).
+/// utterance.
 ///
 /// ~1.28 s of background audio at 16 kHz fed through the pipeline before the
 /// test utterance so the warm pass exercises the AGC-adapted, ring-primed
 /// path (production background silence/noise before anyone speaks).
 const WARMUP_PREPEND_SAMPLES: usize = 20480; // 1.28s × 16 kHz
 
-/// TTS phrase for warm-up audio (mahbot-947).
+/// TTS phrase for warm-up audio.
 ///
 /// A short non-wake-word phrase synthesised via the already-loaded TTS engine.
 /// Speech-like harmonics guarantee the Earshot neural VAD triggers, producing
@@ -132,7 +132,7 @@ const WARMUP_TTS_PHRASE: &str = "testing one two three";
 /// Unlike the original `WARMUP_NOISE_CACHE`, this caches ONLY the TTS
 /// result — if TTS is unavailable on the first call, a fresh pink-noise
 /// fallback is returned (no caching), so TTS is re-evaluated on subsequent
-/// calls (mahbot-947, reviewer feedback on cache poisoning).
+/// calls (reviewer feedback on cache poisoning).
 static WARMUP_TTS_CACHE: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
 
 /// Resolved wake word phrase for this benchmark run (phrase alignment).
@@ -232,7 +232,7 @@ fn read_deployed_wake_phrase() -> Option<String> {
     Some(super::normalize_phrase(phrase))
 }
 
-/// Number of enrollment variants to generate (mahbot-932 Fix 5).
+/// Number of enrollment variants to generate.
 ///
 /// Production generates ~110-120 positive training sequences from 10
 /// utterances × the full 12-cell recipe (minus SpeedUp skip for
@@ -242,7 +242,7 @@ fn read_deployed_wake_phrase() -> Option<String> {
 const NUM_ENROLLMENT_VARIANTS: usize = 10;
 
 /// Owner-negative (non-wake-word) phrases for classifier training
-/// (mahbot-932 Fix 6, re-scoped).
+/// (re-scoped).
 ///
 /// These are generated via TTS from the ENROLLED voice only (the owner's own
 /// non-wake-word speech), tagged as `Source::Owner`, and used to help the
@@ -278,7 +278,7 @@ const OWNER_NEGATIVE_PHRASES: &[&str] = &[
 ///   styles.  Production rotates ALL voices; the canary+reserved voices are
 ///   dropped so they never train in.
 /// - canaries: indices 6..8 (M2, M3) — the in-distribution canary matrix
-///   (kept from mahbot-1025).
+///   (kept from an earlier bench).
 /// - reserved: indices 8..10 (M4, M5) — held-out cross-speaker probes.
 struct VoiceAllocation {
     enrolled: String,
@@ -377,19 +377,19 @@ const MIN_DETECTION_RATE: f64 = 0.60;
 const ACCEPTANCE_BASIS_PREFIX: &str = "held_out_recall_v3";
 
 // Per-category false accept limits are now dynamic by tier — see
-// [`tier_limits`] and [`BenchTier`] (mahbot-871).
+// [`tier_limits`] and [`BenchTier`].
 
-/// Confusable near-miss phrases for negative detection testing (mahbot-834).
+/// Confusable near-miss phrases for negative detection testing.
 ///
-/// Uses the canonical list from the parent `voice` module (mahbot-859).
+/// Uses the canonical list from the parent `voice` module.
 const CONFUSABLE_PHRASES: &[&str] = super::CONFUSABLE_PHRASES;
 const CONFUSABLE_HARD: &[&str] = super::CONFUSABLE_HARD;
 const CONFUSABLE_MEDIUM: &[&str] = super::CONFUSABLE_MEDIUM;
 const CONFUSABLE_EASY: &[&str] = super::CONFUSABLE_EASY;
 
-/// Unrelated speech phrases for negative detection testing (mahbot-834).
+/// Unrelated speech phrases for negative detection testing.
 ///
-/// Uses the canonical list from the parent `voice` module (mahbot-872).
+/// Uses the canonical list from the parent `voice` module.
 const UNRELATED_PHRASES: &[&str] = super::UNRELATED_PHRASES;
 
 /// Silence durations for the negative silence matrix: three
@@ -403,7 +403,7 @@ const SILENCE_DURATIONS: &[(&str, usize)] = &[
 /// Noise audio length in samples (1 second at 16 kHz).
 const NOISE_LEN: usize = 16_000;
 
-/// Noise profiles for negative detection testing (mahbot-834).
+/// Noise profiles for negative detection testing.
 ///
 /// Each noise profile is a (label, generator_fn) pair.  The generator
 /// produces PCM f32 samples at 16 kHz.
@@ -453,7 +453,7 @@ const DEFAULT_TTS_STYLE: &str = "M1.json";
 /// Cache directory relative to storage root.
 const TEST_CACHE_DIR: &str = "test_cache/voice_e2e";
 
-/// SNR levels for the noise-overlapped detection test (mahbot-845).
+/// SNR levels for the noise-overlapped detection test.
 /// Each entry is (label, snr_db).  Clean = infinity dB (no noise added).
 const NOISE_OVERLAP_SNRS: &[(&str, f32)] = &[
     ("clean", f32::INFINITY),
@@ -464,7 +464,7 @@ const NOISE_OVERLAP_SNRS: &[(&str, f32)] = &[
 ];
 
 /// Noise types to use for noise-overlapped detection tests.
-/// White (uniform), Pink, and Brown noise (mahbot-845).
+/// White (uniform), Pink, and Brown noise.
 const NOISE_OVERLAP_TYPES: &[(&str, NoiseGenerator)] = &[
     ("white", generate_white_uniform_noise),
     ("pink", generate_pink_noise),
@@ -487,7 +487,7 @@ const BABBLE_SEED_BASE: u64 = 9500;
 /// SNR levels for the wake-over-babble cells (dB).
 const BABBLE_SNRS: &[(&str, f32)] = &[("10dB", 10.0), ("5dB", 5.0), ("0dB", 0.0)];
 
-// ── Tiered benchmark configuration (mahbot-871) ────────────────────────────
+// ── Tiered benchmark configuration ────────────────────────────
 
 /// Difficulty tiers for confusable phrase testing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -606,10 +606,10 @@ fn tier_for_phrase(phrase: &str) -> BenchTier {
     }
 }
 
-// ── TTS audio cache (mahbot-844 Part 1) ─────────────────────────────────────
+// ── TTS audio cache ─────────────────────────────────────
 
 // Compute a deterministic model version hash from TTS compile-time SHA-256
-// constants (mahbot-844 Part 1).
+// constants.
 //
 // Hashes the concatenation of all TTS model SHA-256 digests and the voice
 // style directory hash.  These constants are updated in `tts.rs` whenever
@@ -752,7 +752,7 @@ fn condition_enrollment_clip(pcm: &[f32], clip_index: usize) -> Vec<f32> {
 /// is synthesized once per clip at seeds 100-109; the guided-prompt DSP
 /// conditioning (3 normal / 3 distance / 2 angle / 2 morning) derives ALL
 /// acoustic variation from the cached PCM.  The former multi-voice rotation
-/// (`style = available_styles[i % num_styles]`, mahbot-932) is gone — it was
+/// (`style = available_styles[i % num_styles]`) is gone — it was
 /// the single largest representativeness gap (the "enrolled speaker" was 6
 /// different voices and the model failed production's own enrollment gate).
 fn generate_enrollment_variants_cached(
@@ -904,7 +904,7 @@ fn generate_babble_overlay_cached(
 ///
 /// Encapsulates the three related seed parameters that control deterministic
 /// TTS synthesis of phrase variants with different seeds and style rotations.
-/// Bundled into a struct for call-site clarity (mahbot-872 reviewer feedback).
+/// Bundled into a struct for call-site clarity (reviewer feedback).
 #[derive(Clone, Copy)]
 struct SeedConfig {
     /// Base seed for deterministic TTS synthesis of the phrase list.
@@ -931,7 +931,7 @@ fn generate_phrase_variants_cached(
 
     for (i, &phrase) in phrases.iter().enumerate() {
         // Use the same round-robin style distribution as production
-        // (mahbot-872 per-phrase seed formula): rotate styles across
+        // (per-phrase seed formula): rotate styles across
         // (phrase × seed_variant) combos.
         let style_idx = (i * seed.num_variants + seed.seed_variant) % num_styles;
         let style = if available_styles.is_empty() {
@@ -939,7 +939,7 @@ fn generate_phrase_variants_cached(
         } else {
             &available_styles[style_idx]
         };
-        // Production seed formula (mahbot-872):
+        // Production seed formula:
         //   seed = base_seed + i * num_variants + seed_variant
         let seed_val =
             seed.base_seed + i as u64 * seed.num_variants as u64 + seed.seed_variant as u64;
@@ -975,7 +975,7 @@ fn generate_white_gaussian_noise() -> Vec<f32> {
     let mut samples = Vec::with_capacity(NOISE_LEN);
     let mut i = 0;
     while i < NOISE_LEN {
-        // Shared EPSILON-clamp pair sampler (mahbot-1043) — preserves the
+        // Shared EPSILON-clamp pair sampler — preserves the
         // bench's exact draw sequence (2 draws per 2 samples, cos+sin).
         let (z1, z2) = crate::util::sample_gaussian_pair_clamped(&mut rng);
         // Clamp to [-1.0, 1.0] — Gaussian has tails beyond [-3, 3] but
@@ -1172,19 +1172,19 @@ fn generate_pulsed_broadband_noise() -> Vec<f32> {
 /// Generate warm-up audio that reliably triggers the Earshot neural VAD.
 ///
 /// Attempts TTS synthesis first (guaranteed speech-like harmonics), falling
-/// back to pink noise + 200 Hz tone if TTS is unavailable (mahbot-947).
+/// back to pink noise + 200 Hz tone if TTS is unavailable.
 ///
 /// Returns a [`Cow`] that either borrows from the TTS cache (once populated)
 /// or owns freshly-generated pink noise (not cached, so TTS is re-evaluated
-/// on the next call if it becomes available — mahbot-947, reviewer feedback).
+/// on the next call if it becomes available — reviewer feedback).
 ///
 /// ## Determinism
-/// TTS synthesis uses a fixed seed (947 = ticket number), producing the same
+/// TTS synthesis uses a fixed seed (947), producing the same
 /// PCM output on every call (barring TTS model changes).  The result is cached
 /// in [`WARMUP_TTS_CACHE`] so subsequent calls are zero-cost.
 ///
 /// ## Fallback rationale
-/// The pink noise + 200 Hz tone was the original warm-up signal (mahbot-922/926),
+/// The pink noise + 200 Hz tone was the original warm-up signal,
 /// but its lack of speech-like harmonic structure causes the Earshot neural VAD
 /// to reject it as non-speech, producing 0 embeddings and an unprimed ring.
 fn generate_warmup_noise() -> Cow<'static, [f32]> {
@@ -1222,7 +1222,7 @@ fn try_warmup_tts() -> Option<Vec<f32>> {
     let pcm = match crate::audio::tts::synthesize(
         WARMUP_TTS_PHRASE,
         DEFAULT_TTS_STYLE,
-        947, // seed = ticket number for determinism
+        947, // fixed seed for determinism
         TARGET_SAMPLE_RATE,
     ) {
         Ok(p) => p,
@@ -1253,14 +1253,14 @@ fn try_warmup_tts() -> Option<Vec<f32>> {
     }
 }
 
-/// Generate the original pink noise + 200 Hz tone warm-up signal (mahbot-922).
+/// Generate the original pink noise + 200 Hz tone warm-up signal.
 ///
 /// Retained as a fallback when TTS models are not cached.  Properties:
 /// 1. **VAD-inactive**: low probability of triggering the Earshot neural VAD
 ///    (no speech harmonics), which is the whole reason we now prefer TTS.
 /// 2. **No false detection**: classifier scores are near-zero because pink
 ///    noise + 200 Hz tone does not resemble the "hey mahbot" embedding.
-/// 3. **Deterministic**: RNG seed 922 (= original ticket number).
+/// 3. **Deterministic**: RNG seed 922 (= the original warm-up signal seed).
 /// 4. **Aperiodic noise floor**: pink noise avoids periodic artefacts that
 ///    could bias the AGC steady state.
 fn generate_warmup_noise_fallback() -> Vec<f32> {
@@ -1285,7 +1285,7 @@ fn generate_warmup_noise_fallback() -> Vec<f32> {
 /// [`super::handle_wake_word_detection`]), matching the per-frame processing in
 /// [`run_streaming_detection`].
 ///
-/// Partial chunks are passed through **without zero-padding** (mahbot-1006 G):
+/// Partial chunks are passed through **without zero-padding**:
 /// production feeds raw mic chunks as-is, and both the NS stage (which buffers
 /// incomplete 160-sample frames internally) and `handle_wake_word_detection`
 /// (which accumulates partial tails in `ctx.audio_buffer` until the next real
@@ -1299,7 +1299,7 @@ fn generate_warmup_noise_fallback() -> Vec<f32> {
 /// is what production's mic delivers.
 ///
 /// Extracted as a shared helper to eliminate the structural near-duplicate
-/// between `feed_audio` and `run_streaming_detection` (mahbot-922, reviewer
+/// between `feed_audio` and `run_streaming_detection` (reviewer
 /// feedback).
 fn process_frame(samples: &[f32], ctx: &mut super::PipelineCtx) {
     let processed = ctx.audio_preprocessor.process(samples.to_vec());
@@ -1311,7 +1311,7 @@ fn process_frame(samples: &[f32], ctx: &mut super::PipelineCtx) {
 /// remaining voice batch — matching the processing pattern in [`run_streaming_detection`].
 ///
 /// This is used to pre-warm the pipeline (AGC) before the actual test utterance,
-/// without contaminating latency measurements (mahbot-922).
+/// without contaminating latency measurements.
 fn feed_audio(samples: &[f32], ctx: &mut super::PipelineCtx) {
     for chunk in samples.chunks(super::FRAME_LENGTH) {
         process_frame(chunk, ctx);
@@ -1321,22 +1321,22 @@ fn feed_audio(samples: &[f32], ctx: &mut super::PipelineCtx) {
     // FRAME_LENGTH chunks, NOT empty Vecs: production's mic keeps delivering
     // 512-sample chunks of silence after speech, and the NS stage buffers
     // incomplete frames internally — an empty chunk would never produce a
-    // complete frame for the detection loop (mahbot-1006 G).
+    // complete frame for the detection loop.
     for _ in 0..3 {
         process_frame(&vec![0.0; super::FRAME_LENGTH], ctx);
     }
 }
 
 /// Feed the warm-up audio through [`feed_audio`] so the warm pass starts the
-/// test utterance with a ring-primed, AGC-adapted path (mahbot-922, mahbot-926).
+/// test utterance with a ring-primed, AGC-adapted path.
 ///
 /// ## Diagnostics
 ///
 /// If the warm-up noise triggered a false detection, a `warn!()` is emitted and
 /// the detection state is restored to prevent cooldown from corrupting subsequent
-/// benchmark measurements (mahbot-922).
+/// benchmark measurements.
 ///
-/// ## Residue clearing (mahbot-1003, mahbot-1006)
+/// ## Residue clearing
 ///
 /// After feeding warm-up audio, this function clears warm-up residues that would
 /// otherwise contaminate the subsequent test utterance's detection pipeline:
@@ -1349,18 +1349,18 @@ fn feed_audio(samples: &[f32], ctx: &mut super::PipelineCtx) {
 ///   the first test embedding's rolling sum.
 /// - **`segment_silence_hops`** — reset to 0 so the test utterance starts a fresh
 ///   segment (the warm-up flush's VAD-negative hops must not shorten the test
-///   utterance's trailing-silence window, mahbot-1006 H).
-/// - **`burst_sweep_done`** — cleared (mahbot-1023): warm-up audio passes through
+///   utterance's trailing-silence window).
+/// - **`burst_sweep_done`** — cleared: warm-up audio passes through
 ///   the full scoring pipeline and would otherwise suppress the test utterance's
 ///   own burst sweep.
-/// - **`audio_preprocessor`** — `reset()` (mahbot-1006 A): the warm-up drives the
+/// - **`audio_preprocessor`** — `reset()`: the warm-up drives the
 ///   AGC to a speech-adapted gain and the NS to a speech-adapted profile; both
 ///   must be fresh for the test utterance, matching training's lazy-init AGC and
 ///   production's `reset_detection_segment()` at segment boundaries.
 ///
 /// **Preserved**: `embedding_ring` (warm-up embeddings prime the classifier's
 /// first Conv1D windows), `adaptive_threshold` (preserves warm-up-adapted state —
-/// see mahbot-1006 F; the cold-start pass instead uses a fresh
+/// see the cold-start pass, which instead uses a fresh
 /// [`AdaptiveThresholdState::new`]).
 fn consume_warmup(ctx: &mut super::PipelineCtx) {
     let before_detection = ctx.last_wake_word_detection;
@@ -1371,7 +1371,7 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
 
     // Guard: warm-up noise should not trigger a false detection.  If it does,
     // restore the pre-warm-up state so cooldown doesn't suppress all subsequent
-    // benchmark measurements (reviewer feedback, mahbot-922).  We must also
+    // benchmark measurements (reviewer feedback).  We must also
     // reset `is_recording` because detection sets it to `true`, which would
     // suppress stride-8 scoring for the entire benchmark variant.
     if ctx.last_wake_word_detection != before_detection {
@@ -1383,7 +1383,7 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
         ctx.is_recording = false;
     }
 
-    // ── Clear warm-up residues before test utterance processing (mahbot-1003) ──
+    // ── Clear warm-up residues before test utterance processing ──
     // Warm-up audio produces mel frames and classifier scores.  These residues
     // must be cleared so the test utterance starts with a clean detection slate:
     // the first stride-8 windows would otherwise span warm-up remnants + test
@@ -1394,13 +1394,13 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
     ctx.next_window_start = 0;
     ctx.score_window.clear();
     ctx.segment_silence_hops = 0;
-    // Clear the per-segment deferred-burst latch (mahbot-1023): warm-up audio
+    // Clear the per-segment deferred-burst latch: warm-up audio
     // passes through the FULL scoring pipeline and triggers the deferred burst
     // sweep on the warm-up noise; without clearing the latch here, the test
     // utterance's own burst sweep would be suppressed.
     ctx.burst_sweep_done = false;
 
-    // ── Reset instrumentation (mahbot-1005 §1) ─────────────────────────────
+    // ── Reset instrumentation ─────────────────────────────
     // Warm-up audio passes through the full scoring pipeline and records into
     // ctx.instrumentation: per_frame_scores, peak_score, VAD counts, and the
     // adaptive threshold trajectory.  Without a reset, warm-up-only scores
@@ -1410,7 +1410,7 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
     ctx.instrumentation.test_start_ring_len = ctx.embedding_ring.len();
     ctx.peak_score = 0.0;
 
-    // ── Fresh AGC/NS state for the test utterance (mahbot-1006 A) ─────────
+    // ── Fresh AGC/NS state for the test utterance ─────────
     // The warm-up audio drives the AGC's asymmetric EMA to a speech-adapted
     // gain (~1× for ~1.28 s of TTS speech).  Production starts each detection
     // segment from a fresh AGC (reset_detection_segment calls
@@ -1420,7 +1420,7 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
     // the first few seconds (AGC release α=0.02, ~3.6 s to converge), biasing
     // exactly the volume-robustness variants this benchmark probes.
     //
-    // reset() (not clear_buffer()): the critique on mahbot-1006 noted the two
+    // reset() (not clear_buffer()): the critique noted the two
     // differ in NS-profile preservation, and production segment boundaries use
     // reset() — the warm-up TTS speech should not seed the noise suppressor's
     // adapted profile for the test utterance either.  The warm-up source is
@@ -1468,14 +1468,14 @@ fn ensure_voice_models_loaded() -> Result<(), String> {
     Ok(())
 }
 
-/// Apply PCM transforms to enrollment variants (mahbot-932 Fix 5).
+/// Apply PCM transforms to enrollment variants.
 ///
 /// For each raw TTS enrollment variant, produces the full 12-cell recipe:
 /// original, speed-down (0.95×/0.90×), speed-up (1.05×, conditional on
 /// ≥500ms), volume-down (-3dB), pink noise (25dB SNR), and white/pink/brown
 /// noise at 10/5 dB SNR.  Matches the production pipeline in
 /// [`prewarm_phrase_embeddings`](super::prewarm_phrase_embeddings) via the
-/// shared [`super::augment_pcm_variants`] helper (mahbot-1045 A1).
+/// shared [`super::augment_pcm_variants`] helper.
 fn pcm_augment_enrollment_variants(variants: &[(Vec<f32>, String)]) -> Vec<(Vec<f32>, String)> {
     let mut all = Vec::new();
     for (i, (pcm, label)) in variants.iter().enumerate() {
@@ -1508,7 +1508,7 @@ fn pcm_augment_enrollment_variants(variants: &[(Vec<f32>, String)]) -> Vec<(Vec<
 /// Locate the enrolled-speaker training clip (label `{style}_enroll0` — the
 /// voice derived from [`allocate_voices`]) and build its full 12-cell
 /// augmentation variants — the canonical construction used by the Phase 13
-/// cooldown re-point (mahbot-1052).  `None` when the enrolled clip is absent
+/// cooldown re-point.  `None` when the enrolled clip is absent
 /// from `train_clips`.
 fn enrolled_clip_variants(
     train_clips: &[(Vec<f32>, String)],
@@ -1521,7 +1521,7 @@ fn enrolled_clip_variants(
     )]))
 }
 
-/// mahbot-1045 B3 (report-only): quality scoring of the bench's enrollment
+/// Report-only: quality scoring of the bench's enrollment
 /// clips via production's compute_utterance_quality.  The bench clips have no
 /// pre-AGC ring → noise_rms is None → SNR is the estimate_snr_energy
 /// heuristic — labelled as such (NOT real-room SNR).
@@ -1558,8 +1558,8 @@ fn enrollment_quality_probe(enrollment_variants: &[(Vec<f32>, String)]) -> serde
     })
 }
 
-/// Generate owner-negative sequences (non-wake-word TTS phrases, mahbot-932
-/// Fix 6, re-scoped).
+/// Generate owner-negative sequences (non-wake-word TTS phrases,
+/// re-scoped).
 ///
 /// These are TTS-synthesised phrases tagged as `Source::Owner` for use in
 /// classifier training.  Since the re-scope the owner is the
@@ -1567,7 +1567,7 @@ fn enrollment_quality_probe(enrollment_variants: &[(Vec<f32>, String)]) -> serde
 /// speech); the multi-voice style rotation is gone.  Documented limitation:
 /// TTS speech cannot match the distribution of real human Phase 3 speech.
 ///
-/// ## Preprocessing alignment (mahbot-1006 C/L, mahbot-1009)
+/// ## Preprocessing alignment
 ///
 /// Production captures owner negatives as real post-AGC/post-NS mic audio
 /// (Phase 3 collection).  The benchmark's TTS surrogates are therefore routed
@@ -1575,7 +1575,7 @@ fn enrollment_quality_probe(enrollment_variants: &[(Vec<f32>, String)]) -> serde
 /// TTS-negative path so the classifier does not train on a raw-TTS
 /// distribution that production never produces:
 ///
-/// 1. **Fresh [`AudioPreprocessor`] per phrase × seed** (mahbot-1009) — fed in
+/// 1. **Fresh [`AudioPreprocessor`] per phrase × seed** — fed in
 ///    [`FRAME_LENGTH`](super::FRAME_LENGTH) chunks as-is (no zero-padding),
 ///    matching the per-segment fresh-AGC distribution of the streaming path.
 /// 2. **VAD gating** through a dedicated earshot detector per clip (never the
@@ -1591,7 +1591,7 @@ fn enrollment_quality_probe(enrollment_variants: &[(Vec<f32>, String)]) -> serde
 /// preprocessor, same `vad_gate_streaming_mel` wrapper over
 /// `process_streaming_frames_inner`, same embeddings helper).
 ///
-/// The config comes from CONFIG (mahbot-1006 L) — identical to
+/// The config comes from CONFIG — identical to
 /// `PreprocessorConfig::default()` under default settings, differs only when
 /// a deployment disables NS/AGC.
 fn generate_owner_negative_sequences(
@@ -1619,14 +1619,12 @@ fn generate_owner_negative_sequences(
             ) {
                 // AGC/NS the TTS PCM through a fresh per-clip preprocessor,
                 // fed in FRAME_LENGTH chunks as-is (matches
-                // prewarm_phrase_embeddings, mahbot-1009; shared helper
-                // mahbot-1045 A2).
+                // prewarm_phrase_embeddings; shared helper).
                 let agc_audio =
                     crate::audio::audio_preprocessor::agc_feed_fresh(&pcm, chunk_size, config);
                 // VAD-gate with a dedicated detector (never the global
                 // VAD_DETECTOR) — only VAD-positive hops produce mel frames,
-                // windows anchor at speech onset (matches the streaming path,
-                // mahbot-1009).
+                // windows anchor at speech onset (matches the streaming path).
                 let mut detector = Detector::default();
                 let (mel_frames, speech_audio) = super::vad_gate_streaming_mel(&agc_audio, |hop| {
                     super::is_speech_with_detector(hop, &mut detector, super::VAD_THRESHOLD)
@@ -1696,12 +1694,12 @@ fn generate_owner_negative_sequences(
     sequences
 }
 
-/// Generate ambient noise sequences for negative training (mahbot-932 Fix 7).
+/// Generate ambient noise sequences for negative training.
 ///
 /// Produces `EmbeddingSequence` values tagged as [`Source::Ambient`] from noise
 /// profiles at 2 SNR levels each.
 ///
-/// ## Preprocessing alignment (mahbot-1006 C/L)
+/// ## Preprocessing alignment
 ///
 /// Production captures real ambient negatives as post-AGC/post-NS mic audio
 /// collected during Phase 3.  The benchmark's synthetic noise profiles are
@@ -1767,7 +1765,7 @@ fn generate_ambient_noise_sequences() -> Vec<EmbeddingSequence> {
 /// Bench-local restricted-style confusable/unrelated negative embeddings
 ///
 /// Production's prewarm rotates ALL 10 TTS voices into the training negatives,
-/// which would train the reserved cross-speaker voices (M4/M5) in — the ticket
+/// which would train the reserved cross-speaker voices (M4/M5) in — the bench
 /// requires them absent from EVERY training path.  This replicates production's
 /// `prewarm_phrase_embeddings` pipeline (fresh AGC → VAD-gated streaming mel →
 /// embeddings → PCM augmentation) over a restricted style list, reusing the
@@ -1913,9 +1911,9 @@ fn generate_restricted_phrase_negatives(
 ///   Process audio variants through a given embedding extraction function.
 ///
 /// Shared helper that eliminates the duplicated per-variant loop
-/// (mahbot-855 review).  Callers supply the extraction function — typically
+/// (review).  Callers supply the extraction function — typically
 /// [`super::process_enrollment_sample`] for dense stride-8 embeddings.
-/// The old streaming path was removed in mahbot-923; the benchmark now uses
+/// The old streaming path was removed; the benchmark now uses
 /// dense-only embeddings throughout.
 ///
 /// Each variant becomes one [`EmbeddingSequence`] with the given `source`.
@@ -1939,7 +1937,7 @@ fn compute_vad_segments(audio: &[f32]) -> (Vec<bool>, Vec<Vec<f32>>) {
         // would duplicate 256 samples, corrupting earshot's ring buffer.
         // This must match the production VAD call pattern in both
         // process_streaming_frames_inner and handle_enrollment_audio
-        // to maintain train-inference consistency (mahbot-900).
+        // to maintain train-inference consistency.
         vad_decisions.push(super::is_speech_with_detector(
             &frame[..super::HOP_LENGTH],
             &mut detector,
@@ -1954,10 +1952,10 @@ fn compute_vad_segments(audio: &[f32]) -> (Vec<bool>, Vec<Vec<f32>>) {
     (vad_decisions, utterances)
 }
 
-/// mahbot-1045 B6 (report-only): regression-guard the mahbot-900 VAD feed
+/// Report-only: regression-guard the VAD feed
 /// contract on the BENCH side.
 ///
-/// Production's VAD feed pattern (voice.rs mic arm, mahbot-900) feeds ONLY
+/// Production's VAD feed pattern (voice.rs mic arm) feeds ONLY
 /// the new [`HOP_LENGTH`](super::HOP_LENGTH) samples per hop through a
 /// streaming earshot detector — never the full overlapping
 /// [`FRAME_LENGTH`](super::FRAME_LENGTH) window (double-feeding corrupts
@@ -1971,7 +1969,7 @@ fn compute_vad_segments(audio: &[f32]) -> (Vec<bool>, Vec<Vec<f32>>) {
 /// this cannot detect drift in the production arm itself — it locks the
 /// bench's transcription of the contract.  To prove the comparison is
 /// sensitive (not vacuous), a NEGATIVE control feeds the full overlapping
-/// `FRAME_LENGTH` window per hop (the exact violation mahbot-900 forbids);
+/// `FRAME_LENGTH` window per hop (the exact violation the feed contract forbids);
 /// its mismatch count is reported under `negative_control`.
 fn vad_feed_cross_check_probe(audio: &[f32]) -> serde_json::Value {
     if audio.len() < super::FRAME_LENGTH {
@@ -1987,7 +1985,7 @@ fn vad_feed_cross_check_probe(audio: &[f32]) -> serde_json::Value {
 
     let n_frames = audio.len().saturating_sub(super::FRAME_LENGTH) / super::HOP_LENGTH + 1;
 
-    // Reference replay of production's feed pattern (mahbot-900): a FRESH
+    // Reference replay of production's feed pattern: a FRESH
     // detector fed EXACTLY the new HOP_LENGTH samples per hop.  The two
     // detectors are independent — the comparison is decisions-vs-decisions
     // on the same audio, not shared state.
@@ -2005,7 +2003,7 @@ fn vad_feed_cross_check_probe(audio: &[f32]) -> serde_json::Value {
 
     // NEGATIVE control: a fresh detector fed the full OVERLAPPING
     // FRAME_LENGTH window per hop — double-feeding the 256-sample overlap,
-    // the exact feed-pattern violation mahbot-900 forbids.  If the correct
+    // the exact feed-pattern violation the feed contract forbids.  If the correct
     // and violated feeds produce the same decisions on this audio
     // (feed_pattern_sensitive == false), the main comparison would be
     // vacuous and the report says so honestly instead of overclaiming.
@@ -2066,7 +2064,7 @@ fn vad_feed_cross_check_probe(audio: &[f32]) -> serde_json::Value {
 }
 
 /// Build the audio preprocessor configuration from the same CONFIG flags that
-/// production uses (mahbot-1006 L).
+/// production uses.
 ///
 /// `PipelineCtx::new()` constructs the live-mic preprocessor from
 /// `CONFIG.voice_noise_suppression()` / `CONFIG.voice_agc()` (both default to
@@ -2082,7 +2080,7 @@ fn enrollment_preprocessor_config() -> crate::audio::audio_preprocessor::Preproc
 }
 
 /// Process enrollment clips through VAD-gated utterance segmentation with the
-/// **production ordering** (mahbot-1006 B/I/L).
+/// **production ordering**.
 ///
 /// Production's enrollment path (live mic loop → `handle_enrollment_audio` →
 /// `handle_enrollment_sample`) is:
@@ -2096,18 +2094,18 @@ fn enrollment_preprocessor_config() -> crate::audio::audio_preprocessor::Preproc
 /// - AGC partially normalized away the volume-down variant (re-amplifying it
 ///   back toward target) and NS partially removed the noise variant's added
 ///   noise, making those variants less challenging than production's
-///   equivalents (mahbot-1006 B);
+///   equivalents;
 /// - VAD segmentation ran on the concatenated *augmented* variants, so a
 ///   variant could be silently dropped when VAD didn't fire on it, whereas
 ///   production runs VAD only on the original mic utterance and always includes
-///   the augmented variants (mahbot-1006 I).
+///   the augmented variants.
 ///
 /// This function instead:
 /// 1. Applies AGC/NS to each raw TTS clip through a **fresh**
 ///    [`AudioPreprocessor`] built from the CONFIG-driven
 ///    [`enrollment_preprocessor_config`] — per-clip fresh state matches
 ///    production's `reset_detection_segment()` fresh-AGC distribution
-///    (mahbot-886 rationale, kept).
+///    (rationale, kept).
 /// 2. Concatenates the AGC'd **originals** with 2.0 s silence gaps and
 ///    VAD-segments them (only originals, matching `handle_enrollment_audio`).
 /// 3. Derives the shared 12-cell recipe (original, speed-down 0.95/0.90,
@@ -2117,13 +2115,13 @@ fn enrollment_preprocessor_config() -> crate::audio::audio_preprocessor::Preproc
 ///    `handle_enrollment_sample` — then extracts embeddings from every variant.
 ///
 /// Returns dense-only EmbeddingSequences (stride-8) for classifier
-/// training.  The old streaming path was removed in mahbot-923.
+/// training.  The old streaming path was removed.
 #[allow(clippy::too_many_lines)]
 fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<EmbeddingSequence> {
     let chunk_size = super::FRAME_LENGTH;
     let config = enrollment_preprocessor_config();
 
-    // ── Per-clip AGC (mahbot-886, mahbot-1006 B) ──
+    // ── Per-clip AGC ──
     // Each clip processed through a fresh AudioPreprocessor (both AGC and
     // noise suppressor), matching the production detection path.  Shared-AGC
     // approach (concatenating variants then applying AGC) created a different
@@ -2132,7 +2130,7 @@ fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<Emb
     // the same training-inference mismatch.  Chunks are fed as-is (no
     // zero-padding): the NS buffers incomplete frames internally and the next
     // chunk (or the silence gap) completes them, matching production's tail
-    // accumulation (mahbot-1006 G).
+    // accumulation.
     let mut per_clip_agc: Vec<Vec<f32>> = Vec::with_capacity(enrollment_variants.len());
     for (samples, _label) in enrollment_variants {
         let processed =
@@ -2141,8 +2139,8 @@ fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<Emb
     }
 
     // ── Concatenate AGC'd originals with 2.0s silence gaps ──
-    // 2.0s well exceeds ENROLLMENT_SILENCE_THRESHOLD_SAMPLES (~304ms after
-    // mahbot-1001 Fix 7) for clean boundaries.
+    // 2.0s well exceeds ENROLLMENT_SILENCE_THRESHOLD_SAMPLES (~304ms)
+    // for clean boundaries.
     let silence_gap_samples = (2.0 * f64::from(super::SAMPLE_RATE)) as usize;
     let silence: Vec<f32> = vec![0.0f32; silence_gap_samples];
 
@@ -2163,7 +2161,7 @@ fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<Emb
         enrollment_variants.len(),
     );
 
-    // ── VAD segmentation on the ORIGINALS only (mahbot-1006 I) ──
+    // ── VAD segmentation on the ORIGINALS only ──
     let (_vad_decisions, utterances) = compute_vad_segments(&combined_audio);
     info!(
         "VAD segmentation: {} utterances from {} concatenated originals",
@@ -2171,7 +2169,7 @@ fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<Emb
         enrollment_variants.len(),
     );
 
-    // ── Augment AFTER segmentation, then extract embeddings (mahbot-1006 B) ──
+    // ── Augment AFTER segmentation, then extract embeddings ──
     // Each VAD utterance is treated like production's `handle_enrollment_sample`
     // input: the full 12-cell recipe is derived from the AGC'd utterance
     // audio and every variant is embedded.  Every variant is always included
@@ -2181,7 +2179,7 @@ fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<Emb
     for (i, utterance) in utterances.iter().enumerate() {
         // Noise seed = utterance index, gate input = VAD-gated utterance
         // slice, canonical push order — preserved verbatim from the pre-dedup
-        // code via the shared helper (mahbot-1045 A1).
+        // code via the shared helper.
         let augmented = super::augment_pcm_variants(
             utterance,
             TARGET_SAMPLE_RATE,
@@ -2202,7 +2200,7 @@ fn vad_segment_and_enroll(enrollment_variants: &[(Vec<f32>, String)]) -> Vec<Emb
             },
         );
 
-        // Helper closure: push one variant's embeddings (mahbot-878 naming:
+        // Helper closure: push one variant's embeddings (naming:
         // variant 0 = original, 1 = speed-down, 2 = speed-up, 3 = volume-down,
         // 4 = noise).
         let push_variant = |variant_index: usize,
@@ -2268,16 +2266,15 @@ struct DetectionResult {
     /// AGC convergence state captured at the end of the test utterance (before
     /// the trailing silence flush).  `None` when insufficient AGC-active
     /// frames.  Captured pre-flush so a segment boundary fired during the
-    /// trailing silence cannot erase the utterance's convergence evidence
-    /// (mahbot-1006 A/H).
+    /// trailing silence cannot erase the utterance's convergence evidence.
     agc_converged: Option<bool>,
     /// Adaptive threshold state captured at the end of the test utterance
     /// (before the trailing silence flush).  A segment boundary fired during
     /// the flush calls `reset_detection_segment`, which resets
     /// `ctx.adaptive_threshold` to bootstrap; carrying this pre-flush snapshot
-    /// forward lets the benchmark's shared-state design (mahbot-845) preserve
+    /// forward lets the benchmark's shared-state design preserve
     /// the adaptation accumulated from the utterance's frames instead of
-    /// re-bootstrapping per variant (mahbot-1006 F).
+    /// re-bootstrapping per variant.
     adaptive_state_pre_flush: super::AdaptiveThresholdState,
 }
 
@@ -2301,7 +2298,7 @@ fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> Det
 
     // Feed audio in FRAME_LENGTH chunks, processing each through the
     // audio preprocessor (AGC + noise suppression) to match the production
-    // pipeline (mahbot-856).  Without AGC, quiet variants like
+    // pipeline.  Without AGC, quiet variants like
     // M3.json_aug4_volume (-6dB reduction) are too faint for VAD to trigger,
     // producing false 0.00 detection scores.
     for chunk in samples.chunks(super::FRAME_LENGTH) {
@@ -2320,7 +2317,7 @@ fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> Det
         }
     }
 
-    // ── Trailing silence flush (mahbot-1006 H) ───────────────────────────
+    // ── Trailing silence flush ───────────────────────────
     // Production continues on natural silence after the utterance and
     // detection can still fire for up to SEGMENT_TIMEOUT_HOPS (19) VAD-negative
     // hops before the segment-boundary reset clears the ring and per-segment
@@ -2329,13 +2326,13 @@ fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> Det
     // production window (~304 ms).
     //
     // The AGC convergence evidence is captured BEFORE the flush: a segment
-    // boundary fired during the flush resets the preprocessor (mahbot-1006 A)
+    // boundary fired during the flush resets the preprocessor
     // and its voice-tests instrumentation, which would otherwise erase the
     // utterance's convergence history from `agc_converged()`.  The adaptive
     // threshold state is captured for the same reason — the boundary resets it
-    // to bootstrap, and the benchmark's shared-state design (mahbot-845) wants
+    // to bootstrap, and the benchmark's shared-state design wants
     // the adapted state to survive the boundary rather than re-bootstrapping
-    // per variant (mahbot-1006 F).
+    // per variant.
     let agc_converged = ctx.audio_preprocessor.agc_converged();
     let adaptive_state_pre_flush = ctx.adaptive_threshold.clone();
     //
@@ -2388,7 +2385,7 @@ fn run_streaming_detection(samples: &[f32], ctx: &mut super::PipelineCtx) -> Det
 /// (`score_stride8_window` → `ctx.last_wake_word_detection = Some(now)`), so
 /// returning from `run_streaming_detection` adds a variable detection-to-return
 /// delta.  Sleeping relative to the timestamp itself avoids that jitter when
-/// probing the cooldown gate at specific elapsed times (mahbot-1052).
+/// probing the cooldown gate at specific elapsed times.
 ///
 /// When the timestamp is absent (should not happen mid-Phase-13), no sleep
 /// occurs — the caller's probes rely on the timestamp being present after a
@@ -2421,10 +2418,9 @@ struct PerVariantResult {
     /// Maximum rolling sum (sum of 3 consecutive total_scores with decay)
     /// achieved during processing. Derived from per_frame_scores.
     max_rolling_sum: f32,
-    /// Number of embeddings produced during streaming detection (mahbot-886).
+    /// Number of embeddings produced during streaming detection.
     /// This is the length of the embedding ring buffer after processing, which
-    /// directly reflects how many mel frames passed through the embedding model
-    /// (mahbot-922).
+    /// directly reflects how many mel frames passed through the embedding model.
     n_embeddings: usize,
     /// Number of frames where total_score < NO_MATCH_RESET_THRESHOLD (0.316).
     n_frames_below_reset: usize,
@@ -2435,7 +2431,7 @@ struct PerVariantResult {
     /// Count of VAD-positive 512-sample frames during streaming detection.
     vad_speech_frames: usize,
     /// Per-frame `[total_score, rolling_sum, threshold]` triples from classifier
-    /// scoring (mahbot-891).  Use `ROLLING_SUM_IDX` / `THRESHOLD_IDX` for named
+    /// scoring.  Use `ROLLING_SUM_IDX` / `THRESHOLD_IDX` for named
     /// access to the rolling sum and effective threshold fields respectively.
     per_frame_scores: Vec<[f32; 3]>,
     /// Index of the first classifier-trigger frame within `per_frame_scores`.
@@ -2447,19 +2443,18 @@ struct PerVariantResult {
     /// which includes the intentionally preserved warm-up embeddings and can be
     /// cleared by a segment boundary), this counts only test-utterance frames.
     n_test_embeddings: usize,
-    /// Per-frame adaptive threshold trajectory (parallel to `per_frame_scores`,
-    /// mahbot-1005 §8).  Previously collected in `DetectionInstrumentation`
+    /// Per-frame adaptive threshold trajectory (parallel to `per_frame_scores`).
+    /// Previously collected in `DetectionInstrumentation`
     /// but never emitted in the benchmark report.
     adaptive_threshold_trajectory: Vec<f32>,
-    /// Count of frames where the effective threshold hit ADAPTIVE_CEILING
-    /// (mahbot-1005 §8).
+    /// Count of frames where the effective threshold hit ADAPTIVE_CEILING.
     ceiling_limited_frames: usize,
     /// Detection latency in ms for this variant (only meaningful when
     /// `detected` is true; `None` otherwise).  Emitted per-variant so latency
-    /// outliers can be root-caused (mahbot-1005 §8).
+    /// outliers can be root-caused.
     latency_ms: Option<f64>,
 
-    // ── mahbot-1012 per-frame scoring geometry (parallel to per_frame_scores)
+    // ── Per-frame scoring geometry (parallel to per_frame_scores)
     /// Stable hash of each scored embedding (FNV-1a over f32 bit patterns).
     per_frame_embedding_hashes: Vec<u64>,
     /// L2 norm of each scored embedding.
@@ -2478,7 +2473,7 @@ struct PerVariantResult {
     /// in processing order).
     per_hop_vad: Vec<bool>,
 
-    // ── mahbot-1023 deferred-burst / acceptance-floor fields ──────────────
+    // ── Deferred-burst / acceptance-floor fields ──────────────
     /// Scoring path that produced the detection (raw source: "burst" /
     /// "segment_end_pass" / "other").  `None` when not detected.
     detection_path: Option<String>,
@@ -2491,7 +2486,7 @@ struct PerVariantResult {
     /// session.
     segment_end_pass_fired: bool,
     /// Whether the adaptive threshold was still bootstrapping at the end of
-    /// the test utterance (mahbot-1023 score-only feed rule: a full
+    /// the test utterance (score-only feed rule: a full
     /// high-scoring utterance can keep the bootstrap alive for its whole
     /// duration — the effective threshold then stays at the static hard
     /// floor, and miss verdicts must not misread this as an adaptive block).
@@ -2501,7 +2496,7 @@ struct PerVariantResult {
 /// Build a [`PerVariantResult`] from a completed [`run_streaming_detection`]
 /// session.  Shared by `test_detection_samples` and `run_noise_overlap_test`
 /// so the instrumentation-derived fields are populated identically everywhere
-/// (mahbot-1005 §9: negatives must carry the same detail as positives).
+/// (negatives must carry the same detail as positives).
 fn build_per_variant_result(
     label: &str,
     result: &DetectionResult,
@@ -2510,7 +2505,7 @@ fn build_per_variant_result(
     let peak = ctx.instrumentation.peak_score;
     let max_rs = max_rolling_sum(&ctx.instrumentation.per_frame_scores);
     // Test-utterance embedding count.  `per_frame_scores` is reset at the end
-    // of consume_warmup (mahbot-1005 §1) and grows one entry per scored
+    // of consume_warmup and grows one entry per scored
     // embedding, so its length IS the test-utterance embedding count.  The
     // alternative (ring length minus warm-up) is unreliable because a segment
     // boundary during/after the test clears the embedding ring.
@@ -2522,7 +2517,7 @@ fn build_per_variant_result(
         max_rolling_sum: max_rs,
         n_embeddings: ctx.embedding_ring.len(),
         n_frames_below_reset: ctx.instrumentation.n_frames_below_reset,
-        // Captured pre-flush in run_streaming_detection (mahbot-1006 A/H) —
+        // Captured pre-flush in run_streaming_detection —
         // reading ctx.audio_preprocessor.agc_converged() here could report
         // None for a miss whose segment boundary reset the preprocessor.
         agc_converged: result.agc_converged,
@@ -2533,7 +2528,7 @@ fn build_per_variant_result(
         adaptive_threshold_trajectory: ctx.instrumentation.adaptive_threshold_trajectory.clone(),
         ceiling_limited_frames: ctx.instrumentation.ceiling_limited_frames,
         latency_ms: result.latency_ms,
-        // mahbot-1012 per-frame geometry (copied from instrumentation; the
+        // Per-frame geometry (copied from instrumentation; the
         // enum arrays are cloned as-is — JSON conversion happens in pv_to_json).
         per_frame_embedding_hashes: ctx.instrumentation.per_frame_embedding_hashes.clone(),
         per_frame_embedding_l2_norms: ctx.instrumentation.per_frame_embedding_l2_norms.clone(),
@@ -2542,7 +2537,7 @@ fn build_per_variant_result(
         per_frame_geometry: ctx.instrumentation.per_frame_geometry.clone(),
         per_frame_adaptive_mode: ctx.instrumentation.per_frame_adaptive_mode.clone(),
         per_hop_vad: ctx.instrumentation.per_hop_vad.clone(),
-        // mahbot-1023: deferred-burst / acceptance-floor evidence.
+        // Deferred-burst / acceptance-floor evidence.
         detection_path: ctx.instrumentation.detection_path.map(str::to_string),
         burst_sweep_fired: ctx.instrumentation.burst_sweep_fired,
         burst_sweep_buffer_len: ctx.instrumentation.burst_sweep_buffer_len,
@@ -2555,7 +2550,7 @@ fn build_per_variant_result(
     }
 }
 
-// ── Exhaustive per-variant miss verdicts (mahbot-1005 §2) ─────────────────
+// ── Exhaustive per-variant miss verdicts ─────────────────
 
 /// Exhaustive per-variant verdict for positive (wake word) test variants.
 ///
@@ -2592,7 +2587,7 @@ impl MissVerdict {
     }
 }
 
-/// Classify a positive variant into an exhaustive verdict (mahbot-1005 §2).
+/// Classify a positive variant into an exhaustive verdict.
 ///
 /// ## Decision procedure (precedence, highest first)
 ///
@@ -2650,7 +2645,7 @@ struct DetectionMetrics {
     total: usize,
     detected: usize,
     false_accepts: Vec<String>,
-    /// Per-variant detail for positive detection logging (mahbot-845).
+    /// Per-variant detail for positive detection logging.
     per_variant: Vec<PerVariantResult>,
 }
 
@@ -2664,7 +2659,7 @@ impl DetectionMetrics {
     }
 }
 
-// ── Classifier trigger metrics (mahbot-952) ─────────────────────────────────
+// ── Classifier trigger metrics ─────────────────────────────────
 
 /// Classifier-only trigger metrics for a set of negative variants.
 ///
@@ -2715,8 +2710,8 @@ fn ct_to_json(ct: &ClassifierTriggerMetrics) -> serde_json::Value {
     })
 }
 
-/// Full per-variant diagnostics for BOTH positive and negative variants
-/// (mahbot-1005 §9).  Negatives historically omitted per-frame scores, VAD/AGC
+/// Full per-variant diagnostics for BOTH positive and negative variants.
+/// Negatives historically omitted per-frame scores, VAD/AGC
 /// detail and trigger-frame info — false-accept root-causing was impossible
 /// without them.  For positives (`category: None`) the exhaustive miss verdict
 /// and trigger-point evidence are added.
@@ -2759,7 +2754,7 @@ fn pv_to_json(pv: &PerVariantResult, category: Option<&str>) -> serde_json::Valu
         "per_frame_scores".to_string(),
         serde_json::json!(pv.per_frame_scores),
     );
-    // mahbot-1012: per-frame scoring geometry — parallel to per_frame_scores.
+    // Per-frame scoring geometry — parallel to per_frame_scores.
     obj.insert(
         "per_frame_embedding_hashes".to_string(),
         serde_json::json!(pv.per_frame_embedding_hashes),
@@ -2800,7 +2795,7 @@ fn pv_to_json(pv: &PerVariantResult, category: Option<&str>) -> serde_json::Valu
         serde_json::json!(pv.first_trigger_frame_idx),
     );
     obj.insert("latency_ms".to_string(), serde_json::json!(pv.latency_ms));
-    // mahbot-1023: deferred-burst / acceptance-floor evidence (all variants).
+    // Deferred-burst / acceptance-floor evidence (all variants).
     obj.insert(
         "detection_path".to_string(),
         serde_json::json!(pv.detection_path),
@@ -2821,11 +2816,11 @@ fn pv_to_json(pv: &PerVariantResult, category: Option<&str>) -> serde_json::Valu
         "adaptive_bootstrap_persisted".to_string(),
         serde_json::json!(pv.adaptive_bootstrap_persisted),
     );
-    // Positive-only miss evidence (mahbot-1005 §2/§3, mahbot-1012 §4).
+    // Positive-only miss evidence.
     if category.is_none() {
         let verdict = classify_miss(pv);
         obj.insert("verdict".to_string(), serde_json::json!(verdict.as_str()));
-        // Trigger-point evidence (mahbot-1005 §3): the classifier's score at the
+        // Trigger-point evidence: the classifier's score at the
         // first trigger frame and where in the utterance it occurred.  VAD is
         // binary (is_speech), so "noise burst" vs "silence" at the trigger
         // cannot be distinguished by VAD alone — the frame's total_score vs
@@ -2864,10 +2859,10 @@ fn pv_to_json(pv: &PerVariantResult, category: Option<&str>) -> serde_json::Valu
     serde_json::Value::Object(obj)
 }
 
-// ── Distribution helpers (mahbot-1005 §3/§4) ──────────────────────────────
+// ── Distribution helpers ──────────────────────────────
 
 /// Decile boundaries of a score distribution (10 values, min→max inclusive of
-/// each 10% quantile).  Returns `None` for empty input (mahbot-1005 §3).
+/// each 10% quantile).  Returns `None` for empty input.
 fn deciles(scores: &[f32]) -> Option<[f32; 10]> {
     if scores.is_empty() {
         return None;
@@ -2882,7 +2877,7 @@ fn deciles(scores: &[f32]) -> Option<[f32; 10]> {
     Some(out)
 }
 
-/// Identify the PCM augmentation type from a variant label (mahbot-1005 §6).
+/// Identify the PCM augmentation type from a variant label.
 /// Labels are produced by [`pcm_augment_enrollment_variants`]; each label ends
 /// with exactly one suffix (specific cells like `_noise_white_10db` are listed
 /// before the generic `_noise` fallback).
@@ -2947,12 +2942,12 @@ fn test_detection_samples(
         let mut ctx = super::PipelineCtx::new();
         // Clone the shared adaptive state into this variant's ctx so the
         // adaptive threshold is active from the first frame, simulating a
-        // continuous pipeline (mahbot-845, reviewer_3).  Without this the
+        // continuous pipeline (reviewer_3).  Without this the
         // adaptive state never exits its 5-frame bootstrap because each
         // variant gets a fresh ctx, keeping all benchmark metrics measured
         // against the static threshold.
         //
-        // Cold start (mahbot-1006 D/F): production bootstraps the adaptive
+        // Cold start: production bootstraps the adaptive
         // threshold from the first 5 real per-frame scores of actual background
         // audio after each segment boundary.  The cold pass therefore uses a
         // fresh AdaptiveThresholdState::new() per variant (no shared-state
@@ -2961,7 +2956,7 @@ fn test_detection_samples(
             ctx.adaptive_threshold = state.clone();
         }
         // Warm pass: feed warm-up audio so the latency timer measures only the
-        // wake word and the ring is primed (mahbot-922).  The cold pass skips
+        // wake word and the ring is primed.  The cold pass skips
         // consume_warmup — production has no warm-up after a silence boundary.
         if !cold_start {
             consume_warmup(&mut ctx);
@@ -2974,14 +2969,13 @@ fn test_detection_samples(
         // the ring was cleared — reset_detection_segment is the only
         // non-detection path that empties the warm pass's ring), the boundary
         // resets ctx.adaptive_threshold back to bootstrap.  Propagating that
-        // bootstrap state would defeat the shared-state design (mahbot-845)
+        // bootstrap state would defeat the shared-state design
         // which keeps the adaptive code path active across variants to avoid
-        // measuring everything against the static threshold — and with item
-        // H's extended flush every non-detecting variant fires the boundary.
+        // measuring everything against the static threshold — and with the
+        // extended flush every non-detecting variant fires the boundary.
         // Instead, carry the pre-flush snapshot captured at the end of the
         // utterance so the shared state keeps adapting to each variant's
-        // frames.  The cold pass measures the bootstrap behavior separately
-        // (mahbot-1006 F).
+        // frames.  The cold pass measures the bootstrap behavior separately.
         if !cold_start && let Some(ref mut state) = adaptive_state {
             let boundary_fired = !result.detected && ctx.embedding_ring.is_empty();
             if boundary_fired {
@@ -2994,8 +2988,8 @@ fn test_detection_samples(
         if result.detected {
             on_detection(metrics, label);
         }
-        // Record per-variant result (mahbot-845) and per-variant
-        // instrumentation (mahbot-886, mahbot-1005).
+        // Record per-variant result and per-variant
+        // instrumentation.
         metrics
             .per_variant
             .push(build_per_variant_result(label, &result, &ctx));
@@ -3013,7 +3007,7 @@ fn test_detection_samples(
     }
 }
 
-// ── Noise-overlapped detection test (mahbot-845) ─────────────────────────
+// ── Noise-overlapped detection test ─────────────────────────
 
 /// Mix speech and noise at a given SNR (in dB).
 ///
@@ -3024,7 +3018,7 @@ fn mix_at_snr(speech: &[f32], noise: &[f32], snr_db: f32) -> Vec<f32> {
     if !snr_db.is_finite() {
         return speech.to_vec();
     }
-    // Shared RMS helper (mahbot-1043) — the bench's former byte-identical
+    // Shared RMS helper — the bench's former byte-identical
     // `rms` copy was deleted; the 1e-10 degenerate-signal guard stays here
     // as an early return (it is NOT part of compute_rms).
     let speech_rms = crate::util::compute_rms(speech);
@@ -3070,7 +3064,7 @@ enum CellMix {
 /// cross-speaker-probe matrices.  One warmed adaptive state is carried across
 /// all cells (with the boundary-fire guard from `test_detection_samples`),
 /// each clip gets a fresh `PipelineCtx`, and the warm-up audio is consumed
-/// so the latency timer starts at the utterance (mahbot-922).  Returns
+/// so the latency timer starts at the utterance.  Returns
 /// per-cell `(key, rate, detected, detail)`.
 fn run_detection_matrix(
     clips: &[(Vec<f32>, String)],
@@ -3083,7 +3077,7 @@ fn run_detection_matrix(
     // but we inline the loop to share adaptive state across variants).
     super::set_classifier_weights(classifier.weights_ref().clone());
     // Pre-warm a shared adaptive threshold state so the benchmark actually
-    // exercises the adaptive code path (reviewer_2, mahbot-845).  Without
+    // exercises the adaptive code path (reviewer_2).  Without
     // this, test_detection_samples — which creates a fresh PipelineCtx per
     // variant — never exits the 5-frame bootstrap, so all measurements use
     // the static threshold.
@@ -3125,20 +3119,20 @@ fn run_detection_matrix(
             // adaptive_k is already set by PipelineCtx::new() from config.
 
             // Consume warm-up so the latency timer starts at the
-            // utterance (mahbot-922).
+            // utterance.
             consume_warmup(&mut ctx);
             let result = run_streaming_detection(&mixed_pcm, &mut ctx);
 
             // Persist the updated adaptive state for the next variant,
-            // with the same boundary-fire guard as test_detection_samples
-            // (mahbot-1006 F): when the trailing silence fired a segment
+            // with the same boundary-fire guard as test_detection_samples:
+            // when the trailing silence fired a segment
             // boundary (`!detected` AND the ring was cleared), the
             // boundary reset ctx.adaptive_threshold to bootstrap.
             // Propagating that bootstrap state would defeat the
-            // shared-state design (mahbot-845) — and with item H's
-            // extended flush every non-detecting variant fires the
-            // boundary, so the phase would otherwise re-bootstrap per
-            // variant and measure mostly against the static threshold.
+            // shared-state design — and with the extended flush every
+            // non-detecting variant fires the boundary, so the phase would
+            // otherwise re-bootstrap per variant and measure mostly against
+            // the static threshold.
             // Carry the pre-flush snapshot instead so the shared state
             // keeps adapting to each variant's frames.
             let boundary_fired = !result.detected && ctx.embedding_ring.is_empty();
@@ -3179,7 +3173,7 @@ fn run_detection_matrix(
 /// variants with the noise and test detection.  Returns the
 /// `(key, rate, detected, per_variant_detail)` cell shape of
 /// [`run_detection_matrix`] so callers get the per-cell detection count
-/// without re-parsing the per-variant detail (mahbot-1005 §8).
+/// without re-parsing the per-variant detail.
 fn run_noise_overlap_test(
     positive_variants: &[(Vec<f32>, String)],
     classifier: &WakeWordClassifier,
@@ -3313,10 +3307,10 @@ fn cell_json(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// mahbot-1023: enrolled-speaker benchmark phase (Phase 8d)
+// Enrolled-speaker benchmark phase
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Per-variant enrolled-speaker result (mahbot-1023 item 6).
+/// Per-variant enrolled-speaker result.
 #[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
 struct EnrolledVariantResult {
@@ -3390,7 +3384,7 @@ fn run_enrolled_cold_variant(label: &str, pcm: &[f32]) -> EnrolledVariantResult 
     }
 }
 
-/// Enrolled-speaker phase (mahbot-1023 Phase 8d, re-scoped).
+/// Enrolled-speaker phase (re-scoped).
 ///
 /// The acceptance basis is the HELD-OUT wake-only recall set: unseen
 /// renderings of the enrolled voice (new seeds in a collision-free range,
@@ -3473,7 +3467,7 @@ fn run_enrolled_speaker_phase(
         }
     };
 
-    // ── Near-miss canaries (mahbot-1024 item 5) ────────────────────────────
+    // ── Near-miss canaries ────────────────────────────
     // Investigation triggers, NOT hard gates: firing means the run deserves
     // review, never an automatic pass/fail.  The canary is the classifier
     // gate: a held-out recall variant that crossed the
@@ -3639,11 +3633,11 @@ fn run_enrolled_speaker_phase(
     }))
 }
 
-/// Compute the mahbot-1023 safety gate over the negative/confusable set.
+/// Compute the safety gate over the negative/confusable set.
 ///
 /// The deferral adds in-distribution deferred windows (burst + boundary
 /// double-scoring) whose false-positive impact must be MEASURED, not assumed.
-/// Baseline (mahbot-1022): 9/59 classifier gate crossings, 0 end-to-end false
+/// Baseline: 9/59 classifier gate crossings, 0 end-to-end false
 /// accepts.  The classifier gate crossing count is measured per run; true
 /// false accepts (end-to-end detections) are counted separately.
 fn safety_gate(all_neg_pv: &[(&PerVariantResult, String)]) -> serde_json::Value {
@@ -3657,7 +3651,7 @@ fn safety_gate(all_neg_pv: &[(&PerVariantResult, String)]) -> serde_json::Value 
         .filter(|(pv, _)| pv.detected)
         .map(|(pv, cat)| (pv.variant.as_str(), cat.clone()))
         .collect();
-    // mahbot-1024 near-miss canaries (investigation triggers, not hard gates).
+    // Near-miss canaries (investigation triggers, not hard gates).
     let mut neg_canaries_fired: Vec<&'static str> = Vec::new();
     if gate_crossings > 0 {
         neg_canaries_fired.push("classifier_gate_crossing_on_negative_corpus");
@@ -3951,7 +3945,7 @@ fn cross_run_summary() -> serde_json::Value {
     })
 }
 
-/// Env-gated FAPH phase (mahbot-1057, honest methodology mahbot-1081):
+/// Env-gated FAPH phase (honest methodology):
 /// real-audio false-acceptance-per-hour bench.
 ///
 /// Feeds the pinned corpus (`faph_corpus_manifest.json` — alexwengg/musan_mini,
@@ -3961,8 +3955,8 @@ fn cross_run_summary() -> serde_json::Value {
 /// [`FRAME_LENGTH`](super::FRAME_LENGTH) chunks via [`process_frame`], no
 /// early exit) and counts false-accept events.
 ///
-/// # FA-counting semantics (pinned by mahbot-1053 planning gate, honest
-/// methodology mahbot-1081)
+/// # FA-counting semantics (pinned by the planning gate, honest
+/// methodology)
 ///
 /// - **Event-based**: each fresh detection event (a new
 ///   `last_wake_word_detection` timestamp) counts as 1 FA.
@@ -4316,7 +4310,7 @@ fn faph_sha256_file(path: &std::path::Path) -> std::io::Result<String> {
 /// Downloads `url` to `dest` (creating parent dirs), verifies the SHA-256
 /// against the manifest pin, and only then writes the file.  Uses its own
 /// local current-thread tokio runtime — deliberately NOT the embedder.rs
-/// download precedent (mahbot-1041 gated embedder/providers out of the bench
+/// download precedent (gated embedder/providers out of the bench
 /// surface), and no new runtime dependency for the standard bench run.
 fn faph_download_file(
     url: &str,
@@ -4575,7 +4569,7 @@ pub(crate) fn run_internal() {
     const P_TEARDOWN: usize = 13;
     const NUM_PHASES: usize = 14;
 
-    // ── Heartbeat drop guard (mahbot-944) ──────────────────────────────
+    // ── Heartbeat drop guard ──────────────────────────────
     // Defined as an item (before any statements) so it satisfies Clippy's
     // items_after_statements requirement.  Used by the heartbeat thread to
     // ensure the stop flag is set even on panic unwind.
@@ -4604,7 +4598,7 @@ pub(crate) fn run_internal() {
         ($name:literal) => {{
             // Both stderr (for live visibility) and info! (for tracing/logs.db).
             // Stderr ensures output is visible even if the tracing subscriber is
-            // not initialized or buffers messages (mahbot-944).
+            // not initialized or buffers messages.
             eprintln!("─── {}. {} ───", phase_starts.len() + 1, $name);
             info!("─── {}. {} ───", phase_starts.len() + 1, $name);
             phase_starts.push(($name, Instant::now()));
@@ -4627,7 +4621,7 @@ pub(crate) fn run_internal() {
 
     info!("Benchmark tier: all three tiers tested (Easy FA≤0, Medium FA≤1, Hard FA≤2)");
 
-    // ── Heartbeat thread (mahbot-944) ──────────────────────────────────
+    // ── Heartbeat thread ──────────────────────────────────
     // Prints a pulse every 60 s so the operator can confirm the benchmark
     // is alive and making progress (vs. parked threads from nested runtime
     // hangs).
@@ -4807,7 +4801,7 @@ pub(crate) fn run_internal() {
     // Bench-local restricted-style confusable/unrelated generation
     // Production's prewarm rotates ALL 10 TTS voices into the
     // training negatives, which would train the reserved cross-speaker voices
-    // (M4/M5) in — the ticket requires them absent from EVERY training path.
+    // (M4/M5) in — the bench requires them absent from EVERY training path.
     // The bench drives production's own pipeline (fresh AGC → VAD-gated
     // streaming mel → embeddings → PCM augmentation) over the negative-pool
     // styles (F1..M1), reusing the production embedding cache (identical keys),
@@ -4858,7 +4852,7 @@ pub(crate) fn run_internal() {
          silently train a weaker model"
     );
 
-    // Generate ambient noise sequences (mahbot-932 Fix 7) — replaces synthetic negatives.
+    // Generate ambient noise sequences — replaces synthetic negatives.
     let ambient_sequences = generate_ambient_noise_sequences();
     info!(
         "Generated {} ambient noise sequences from {} noise profiles × 2 SNR levels (mahbot-932)",
@@ -4866,12 +4860,12 @@ pub(crate) fn run_internal() {
         NOISE_PROFILES.len(),
     );
 
-    // ── Bench-local restricted pools (mahbot-880, mahbot-923) ──
-    // After mahbot-923 the pipeline uses dense stride-8 embeddings throughout.
-    // Ambient + owner-negative replace the old synthetic negatives (mahbot-932).
+    // ── Bench-local restricted pools ──
+    // Now the pipeline uses dense stride-8 embeddings throughout.
+    // Ambient + owner-negative replace the old synthetic negatives.
 
-    // Build classifier negative sequences: ambient → owner → confusable → unrelated
-    // (mahbot-932 Fix 7, Fix 8).  No synthetic negatives — production uses zero
+    // Build classifier negative sequences: ambient → owner → confusable → unrelated.
+    // No synthetic negatives — production uses zero
     // synthetic embedding-space negatives.
     let mut classifier_neg_sequences: Vec<EmbeddingSequence> = Vec::new();
     classifier_neg_sequences.extend(ambient_sequences);
@@ -4892,7 +4886,7 @@ pub(crate) fn run_internal() {
     classifier_neg_sequences.extend(confusable_neg_seqs.clone());
     classifier_neg_sequences.extend(unrelated_neg_seqs.clone());
 
-    // ── Regression assertions (mahbot-932) ──
+    // ── Regression assertions ──
     assert!(
         classifier_neg_sequences
             .iter()
@@ -4910,7 +4904,7 @@ pub(crate) fn run_internal() {
 
     // ── Phase 4: finalize_enrollment (consistency check + classifier training) ──
     phase_start!("Phase 4: finalize_enrollment");
-    // After mahbot-923, pos_sequences contains dense stride-8 embeddings
+    // Now, pos_sequences contains dense stride-8 embeddings
     // from vad_segment_and_enroll (no streaming separate path).
     // Both positives and negatives use dense-only EmbeddingSequence.
     // NO hard gate: production's consistency check is reported via the
@@ -4961,7 +4955,7 @@ pub(crate) fn run_internal() {
             }
         };
 
-    // ── Degenerate solution detection (mahbot-844) ──
+    // ── Degenerate solution detection ──
     // A missing training result (both paths failed above) is degenerate by
     // definition; otherwise flag a near-zero-weight all-zero solution.
     let (degenerate, near_zero_frac) = match &training_result {
@@ -5085,9 +5079,9 @@ pub(crate) fn run_internal() {
         );
     }
 
-    // ── Informational self-test (mahbot-1006 J) ──
+    // ── Informational self-test ──
     // Production treats the self-test as GATING: if it fails, the model is
-    // rejected and enrollment fails.  The benchmark is report-only (mahbot-953),
+    // rejected and enrollment fails.  The benchmark is report-only,
     // so it does not abort — but a failure is surfaced as a prominent warning
     // AND recorded in the JSON so consumers know the reported detection/FA
     // numbers come from a model production would refuse to deploy.
@@ -5163,7 +5157,7 @@ pub(crate) fn run_internal() {
     // to 0 directly, while `phase_start!`/`phase_end_ms!` are only called
     // for executed phases.
     let mut pos_metrics = DetectionMetrics::default();
-    // Cold-start detection metrics (mahbot-1006 D) — populated in Phase 8
+    // Cold-start detection metrics — populated in Phase 8
     // alongside the warm pass.  Stays default when degenerate.
     let mut cold_metrics = DetectionMetrics::default();
     let mut conf_metrics = DetectionMetrics::default();
@@ -5175,19 +5169,18 @@ pub(crate) fn run_internal() {
     // reported separately from the trained-in canary matrix.
     let mut probe_overlap_results: Vec<(String, f64, usize, Vec<serde_json::Value>)> = Vec::new();
     let mut probe_fa_count: usize = 0;
-    // Per-tier confusable fa tracking (mahbot-871). Populated after Phase 9.
+    // Per-tier confusable fa tracking. Populated after Phase 9.
     let mut conf_fa_by_tier: [Vec<String>; 3] = [Vec::new(), Vec::new(), Vec::new()];
 
     // Cooldown-phase detection time — hoisted from the detection block so the
-    // JSON report can emit it even when the classifier is degenerate
-    // (mahbot-1005 §8).
+    // JSON report can emit it even when the classifier is degenerate.
     let mut cooldown_detection_time_ms = 0.0f64;
     // Cooldown test outcomes (None = test skipped).  Emitted in the JSON
-    // report so cooldown behaviour is observable (mahbot-1005 §8).
+    // report so cooldown behaviour is observable.
     let mut cooldown_first_detected: Option<bool> = None;
     let mut cooldown_suppressed: Option<bool> = None;
     let mut cooldown_after_recovered: Option<bool> = None;
-    // mahbot-1052: additive cooldown.* report keys.  The phase was re-pointed
+    // Additive cooldown.* report keys.  The phase was re-pointed
     // at the enrolled-speaker original variant (the M2–M5 held-out clips
     // are rejected under single-speaker semantics, so the old precondition
     // could never hold).  All keys stay `None` on the degenerate-classifier
@@ -5202,7 +5195,7 @@ pub(crate) fn run_internal() {
     // Per-variant metrics for noise profiles (collected across all profiles).
     let mut noise_metrics: Vec<DetectionMetrics> = Vec::new();
 
-    // mahbot-1023: enrolled-speaker benchmark phase (Phase 7d).  Declared
+    // Enrolled-speaker benchmark phase (Phase 7d).  Declared
     // here so the JSON report can emit a note even when the classifier is
     // degenerate.
     let mut enrolled_report: Option<serde_json::Value> = None;
@@ -5216,12 +5209,12 @@ pub(crate) fn run_internal() {
     if !degenerate {
         // Create a pre-warmed adaptive threshold state shared across all
         // detection phases so the adaptive code path is exercised end-to-end
-        // (mahbot-845, reviewer_3).  Without this, test_detection_samples
+        // (reviewer_3).  Without this, test_detection_samples
         // creates a fresh PipelineCtx per variant, keeping the adaptive state
         // in perpetual 5-frame bootstrap and measuring all metrics against the
         // static threshold.
         //
-        // Note (mahbot-852): The adaptive threshold no longer feeds high
+        // Note: The adaptive threshold no longer feeds high
         // classifier scores into its statistics — only background frames
         // (below NO_MATCH_RESET_THRESHOLD) update the running statistics.
         // Positive variants therefore no longer inflate the adaptive
@@ -5297,7 +5290,7 @@ pub(crate) fn run_internal() {
             pos_metrics.detection_rate() * 100.0,
         );
 
-        // ── Cold-start pass (mahbot-1006 D) ─────────────────────────────
+        // ── Cold-start pass ─────────────────────────────
         // Fresh PipelineCtx per variant, no warm-up, fresh adaptive bootstrap
         // (production's post-silence start).  The raw-clip cold measurement
         // lives in the enrolled-speaker phase (Phase 7d) — this pass covers
@@ -5307,7 +5300,7 @@ pub(crate) fn run_internal() {
             &classifier,
             &mut cold_metrics,
             |m, _| m.detected += 1,
-            None, // fresh adaptive state per variant (item F)
+            None, // fresh adaptive state per variant
             true, // cold start
         );
         info!(
@@ -5325,7 +5318,7 @@ pub(crate) fn run_internal() {
         // pass + adaptive bootstrap).  The acceptance basis:
         // all 10 enrollment clips train, so detection control is entirely this
         // held-out recall set.  Measurement-only — the report is not pass/fail
-        // gated (mahbot-953), but the acceptance protocol judges the mean
+        // gated, but the acceptance protocol judges the mean
         // across ≥ 3 runs.
         eprintln!("─── Phase 7d: enrolled-speaker benchmark (held-out recall) ───");
         info!("─── Phase 7d: enrolled-speaker benchmark (held-out recall) ───");
@@ -5375,7 +5368,7 @@ pub(crate) fn run_internal() {
             Some(&mut shared_adaptive),
             false, // warm pass only (negative phase)
         );
-        // Split false accepts by tier for per-tier tracking (mahbot-871).
+        // Split false accepts by tier for per-tier tracking.
         for label in &conf_metrics.false_accepts {
             let phrase = confusable_phrase(label);
             let tier_idx = tier_for_phrase(phrase).index();
@@ -5530,7 +5523,7 @@ pub(crate) fn run_internal() {
         }
 
         // ── Phase 12: Cooldown verification ──────────────────────────────
-        // mahbot-1052: re-pointed at the ENROLLED-SPEAKER original variant
+        // Re-pointed at the ENROLLED-SPEAKER original variant
         // (enrolled-voice `_enroll0` lookup + pcm_augment_enrollment_variants,
         // _original pinned — 85/85 reliable; speed_down/noise fail ~4–6%
         // historically).  The enrolled clip is training data, so
@@ -5541,11 +5534,11 @@ pub(crate) fn run_internal() {
         //   - WAKE_WORD_COOLDOWN (3.0 s) gate in handle_wake_word_detection;
         //   - audio fed during cooldown is BUFFERED (not discarded) into
         //     ctx.audio_buffer up to COOLDOWN_ACCUMULATION_CAP (1024 samples =
-        //     2 frames, mahbot-802) and processed when the gate expires;
+        //     2 frames) and processed when the gate expires;
         //   - the stride-8 burst/main loop is gated on `!is_recording`, which
         //     stays true after a detection fires (Soft reset preserves it) —
         //     the bench must reset `is_recording` between detections or the
-        //     recovery probe cannot fire (mahbot-1052, analyst review).
+        //     recovery probe cannot fire (analyst review).
         //
         // Probe schedule (all sleeps EXCLUDED from phase timing):
         //   Detection 1  t≈0      warm pass — must fire
@@ -5554,7 +5547,7 @@ pub(crate) fn run_internal() {
         //   Detection 4  ~3.5 s   gate expired — fires (natural expiry, NO
         //                          manual last_wake_word_detection clear)
         //
-        // Gate vs report (mahbot-1052 pin 4, reviewer_3): Detections 3 and 4
+        // Gate vs report (reviewer_3): Detections 3 and 4
         // ARE the gate — HARD assertions, so a production cooldown regression
         // (e.g. halved WAKE_WORD_COOLDOWN) fails the bench instead of only
         // warning.  Slack margins (2.5 s / 3.5 s) are deliberate: wall-clock
@@ -5564,8 +5557,8 @@ pub(crate) fn run_internal() {
         // pre-existing soft `cooldown_suppressed_redetection` report key.
         info!("─── {}. Cooldown verification ───", P_COOLDOWN + 1);
         // Variant CONSTRUCTION only — the enrolled clip's 12-cell augmented
-        // set, WITHOUT re-running the enrolled-speaker phase (mahbot-1052
-        // manager pin).  `_original` is pinned:
+        // set, WITHOUT re-running the enrolled-speaker phase.
+        // `_original` is pinned:
         // speed_down/noise fail ~4–6% of runs historically (reviewer_3).
         // The shared find+augment chain lives in [`enrolled_clip_variants`].
         let enrolled_cooldown_variant: Option<(Vec<f32>, String)> =
@@ -5579,11 +5572,11 @@ pub(crate) fn run_internal() {
             ctx.adaptive_threshold = shared_adaptive.clone();
 
             // Detection 1: should fire (consume warm-up audio first so latency
-            // measures only the wake word — mahbot-922).
+            // measures only the wake word).
             // NOTE: this is a WARM pass (consume_warmup + warmed shared
             // adaptive state), unlike Phase 7d's cold pass — the acceptance
             // criterion "assertions actually fire" carries residual risk until
-            // measured across ≥3 warm runs (mahbot-1052 manager pin 10); a
+            // measured across ≥3 warm runs; a
             // failure here becomes a VISIBLE skip (skip_reason), never silent.
             consume_warmup(&mut ctx);
             let t0 = Instant::now();
@@ -5605,17 +5598,16 @@ pub(crate) fn run_internal() {
                 // Detection set is_recording = true + last_wake_word_detection
                 // (score_stride8_window).  The stride-8 burst/main loop is
                 // gated on !is_recording, and Soft reset preserves it — reset
-                // it between detections or the recovery probe cannot fire
-                // (mahbot-1052).
+                // it between detections or the recovery probe cannot fire.
                 ctx.is_recording = false;
 
                 // Detection 2: should NOT fire during cooldown (gate closed,
                 // t≈0).  Also the accumulation-cap probe: the full F1 feed is
                 // far larger than COOLDOWN_ACCUMULATION_CAP, so the cooldown
-                // path must have buffered exactly `cap` samples (mahbot-802
-                // semantics: audio fed during cooldown is buffered, not
-                // discarded).  Asserted DURING cooldown because the expiry
-                // handoff consumes/clears the buffer (mahbot-1052 pin 6).
+                // path must have buffered exactly `cap` samples (audio fed
+                // during cooldown is buffered, not discarded).  Asserted
+                // DURING cooldown because the expiry handoff consumes/clears
+                // the buffer.
                 let before_cooldown = ctx.last_wake_word_detection;
                 let t1 = Instant::now();
                 let silenced = run_streaming_detection(&enrolled_original, &mut ctx);
@@ -5649,9 +5641,9 @@ pub(crate) fn run_internal() {
                 // STILL be closed (2.5 s < WAKE_WORD_COOLDOWN 3.0 s).  The old
                 // code cleared last_wake_word_detection before this probe,
                 // bypassing production's real gate; the natural expiry is the
-                // production behavior under test (mahbot-1052).
+                // production behavior under test.
                 //
-                // GATE (mahbot-1052 pin 4, reviewer_3): HARD assertion, not
+                // GATE (reviewer_3): HARD assertion, not
                 // warn-soft — a production cooldown regression (e.g. halved or
                 // removed WAKE_WORD_COOLDOWN) must FAIL the bench.  The 500 ms
                 // slack margin (2.5 s vs 3.0 s) is jitter-safe, and the
@@ -5676,15 +5668,15 @@ pub(crate) fn run_internal() {
 
                 // Detection 4: recovery probe at ~3.5 s — the gate has expired
                 // naturally, so detection must fire again (the old fixed 3.1 s
-                // sleep is restructured into this probe schedule, mahbot-1052
-                // pin 5).  is_recording was left true by Detection 1 and the
+                // sleep is restructured into this probe schedule).
+                // is_recording was left true by Detection 1 and the
                 // suppressed probes never clear it — reset it so the stride-8
                 // burst/main loop runs.
                 //
-                // GATE (mahbot-1052 pin 4): HARD assertion like Detection 3
+                // GATE: HARD assertion like Detection 3
                 // (500 ms slack past the 3.0 s boundary — jitter-safe).
                 //
-                // Buffered-audio-processed evidence (reviewer_3, mahbot-1052):
+                // Buffered-audio-processed evidence (reviewer_3):
                 // the post-firing state `audio_buffer.is_empty() &&
                 // !command_buffer.is_empty()` alone is TAUTOLOGICAL — the
                 // mem::take at the start of every non-cooldown
@@ -5799,12 +5791,12 @@ pub(crate) fn run_internal() {
                      total_false_accepts.",
         }));
 
-        // ── Noise-overlapped detection + cross-speaker probes (mahbot-845,
-        //    restructured) ──────────────────────────────────────
+        // ── Noise-overlapped detection + cross-speaker probes
+        //    (restructured) ──────────────────────────────────────
         // Two matrices under the same phase (both report-only diagnostics —
         // cross-speaker detections are correct speaker-blind behaviour):
         //   1. in_distribution_canaries — the trained-in M2/M3 clips under the
-        //      full 13-cell noise matrix (kept from mahbot-1025; any detection
+        //      full 13-cell noise matrix (kept from an earlier bench; any detection
         //      is a trained-in canary diagnostic).  The canary clips are fed
         //      ORIGINAL-only: the 13-cell noise-condition vocabulary IS the
         //      canary test's defining structure.  The 5-augmentation dimension
@@ -5869,9 +5861,9 @@ pub(crate) fn run_internal() {
         phase_times[P_NOISE_PROFILES] = 0;
         phase_times[P_COOLDOWN] = 0;
         phase_times[P_NOISE_OVERLAP] = 0;
-        // mahbot-1052 pin 8: on the degenerate path the cooldown.* keys stay
+        // On the degenerate path the cooldown.* keys stay
         // null (hoisted vars), but the skip must be VISIBLE — emit the reason
-        // so the report never silently lacks it (mirrors the mahbot-1005
+        // so the report never silently lacks it (mirrors the earlier
         // hoisting pattern; the F1-missing / warm-pass-failure skip reasons
         // are set inside the Phase 13 block above).
         let reason = "degenerate classifier (near-zero weights) — all detection phases, \
@@ -5881,13 +5873,13 @@ pub(crate) fn run_internal() {
         cooldown_skip_reason = Some(reason);
     }
 
-    // ── Env-gated FAPH phase (mahbot-1057) ────────────────────────────────
+    // ── Env-gated FAPH phase ────────────────────────────────
     // Real-audio false-acceptance-per-hour bench phase.  Runs AFTER the
     // existing phases (reuses the bench's flock + 30-min timeout); the
     // standard-run report surface is untouched because the report section is
     // only added to the JSON when the env gate is on (None → no key).
     //
-    // Corpus sizing (recorded on mahbot-1057 before this phase was built):
+    // Corpus sizing (recorded before this phase was built):
     // measured detection-path throughput on the idle machine (2026-08-02)
     // was ~47.8× real-time (speech) / ~60.7× (noise), blended ~51.8× for the
     // corpus's 3.85 h speech + 2.14 h noise mix → the full 5.99 h pinned
@@ -5945,7 +5937,7 @@ pub(crate) fn run_internal() {
     // Total false accept (across all tiers and categories)
     let total_false_accepts = conf_fa_counts.iter().sum::<usize>() + shared_fa_count;
 
-    // ── Classifier trigger metrics for negative phases (mahbot-952) ────────
+    // ── Classifier trigger metrics for negative phases ────────
     let conf_classifier = ClassifierTriggerMetrics::compute(&conf_metrics.per_variant);
     let unrel_classifier = ClassifierTriggerMetrics::compute(&unrelated_metrics.per_variant);
     let silence_classifier = ClassifierTriggerMetrics::compute(&silence_metric.per_variant);
@@ -6007,7 +5999,7 @@ pub(crate) fn run_internal() {
     // enrolled_total fall back to the Phase-7 positive variants.  The
     // MIN_DETECTION_RATE suggestion and the ratchet guard are skipped in that
     // case so a degenerate run cannot print a ratchet-to-zero 0.0 suggestion
-    // (mahbot-1008 ratchet guard).
+    // (ratchet guard).
     let enrolled_phase_ran = enrolled_report
         .as_ref()
         .and_then(|r| r.get("acceptance"))
@@ -6082,7 +6074,7 @@ pub(crate) fn run_internal() {
         info!("  False triggers: {:?}", noise_false_accepts);
     }
 
-    // ── Classifier trigger report (mahbot-952) ──────────────────────────
+    // ── Classifier trigger report ──────────────────────────
     info!("──────────────────────────────────────────────");
     info!("  Classifier trigger metrics (negative phases):");
 
@@ -6152,16 +6144,16 @@ pub(crate) fn run_internal() {
         false,
     );
 
-    // NOTE: all pass/fail gating was removed in mahbot-953.  Threshold checks
+    // NOTE: all pass/fail gating was removed.  Threshold checks
     // emit warnings above but never abort the benchmark.  Run data is reported
     // in both JSON (below) and this stderr report.  See the threshold assertion
     // conversion section after the report for details (each now warns instead of
     // asserting).
 
     // Build the JSON output
-    // Build per-variant negative diagnostics with FULL per-variant detail
-    // (mahbot-1005 §9).  Confusable variants are always tier-qualified
-    // (mahbot-871).  The flat list is reused for score distributions below.
+    // Build per-variant negative diagnostics with FULL per-variant detail.
+    // Confusable variants are always tier-qualified.
+    // The flat list is reused for score distributions below.
     let mut all_neg_pv: Vec<(&PerVariantResult, String)> = Vec::new();
     for pv in &conf_metrics.per_variant {
         let phrase = confusable_phrase(&pv.variant);
@@ -6207,11 +6199,11 @@ pub(crate) fn run_internal() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // mahbot-1005 diagnostics: verdicts, distributions, train/test alignment,
+    // Diagnostics: verdicts, distributions, train/test alignment,
     // and reproducibility metadata
     // ═══════════════════════════════════════════════════════════════════════
 
-    // ── Exhaustive per-variant verdicts for positives (§2) ──
+    // ── Exhaustive per-variant verdicts for positives ──
     let mut verdict_counts: std::collections::BTreeMap<&'static str, usize> =
         std::collections::BTreeMap::new();
     for pv in &pos_metrics.per_variant {
@@ -6220,8 +6212,8 @@ pub(crate) fn run_internal() {
             .or_insert(0) += 1;
     }
 
-    // ── Classifier discrimination evidence (§3) ──
-    // Peak-score distributions (warm-up excluded after the §1 instrumentation
+    // ── Classifier discrimination evidence ──
+    // Peak-score distributions (warm-up excluded after the instrumentation
     // reset) plus per-frame threshold crossing fractions.
     let pos_peak_scores: Vec<f32> = pos_metrics
         .per_variant
@@ -6257,7 +6249,7 @@ pub(crate) fn run_internal() {
         (total_frames, above_threshold)
     };
 
-    // ── Per-augmentation detection rates (§6) ──
+    // ── Per-augmentation detection rates ──
     // Labels carry `_original/_speed_down/...` suffixes from
     // pcm_augment_enrollment_variants.
     let mut aug_counts: std::collections::BTreeMap<&'static str, (usize, usize)> =
@@ -6286,20 +6278,20 @@ pub(crate) fn run_internal() {
             .collect(),
     );
 
-    // ── Reproducibility metadata (§10) ──
+    // ── Reproducibility metadata ──
     let warmup_source = if WARMUP_TTS_CACHE.get().is_some() {
         "tts"
     } else {
         "pink_noise_fallback"
     };
 
-    // ── Phase-B alignment probes (mahbot-1045, report-only) ──
+    // ── Phase-B alignment probes (report-only) ──
 
-    // B1: TTS-echo gate probe.  The offline bench never runs the mic loop,
+    // TTS-echo gate probe.  The offline bench never runs the mic loop,
     // so the probe locks the voice-tests setter → is_playback_active()
     // predicate roundtrip — the exact predicate the production mic arm
     // consults to drop the WHOLE chunk (pre-AGC ring included) while
-    // playback is active (voice.rs mic-chunk arm, mahbot-896).  The actual
+    // playback is active (voice.rs mic-chunk arm).  The actual
     // chunk-drop behavior is exercised only by that production arm, which
     // the offline bench cannot drive; zero production change.
     let tts_echo_gate_probe = {
@@ -6321,8 +6313,8 @@ pub(crate) fn run_internal() {
         })
     };
 
-    // B4: production metrics snapshot — the only production diagnostics
-    // surface with zero bench coverage before mahbot-1045.  The offline bench
+    // Production metrics snapshot — the only production diagnostics
+    // surface with zero bench coverage.  The offline bench
     // never runs the mic loop (chunks_received/dropped_chunks stay 0); the
     // plausibility contract is: embeddings WERE computed by the production
     // streaming path (the enrolled-speaker phase / main detection phases) and
@@ -6351,7 +6343,7 @@ pub(crate) fn run_internal() {
         })
     };
 
-    // B5: embedding cache hit↔miss equivalence (mahbot-1045, bounded probe).
+    // Embedding cache hit↔miss equivalence (bounded probe).
     // A full-cache miss recompute is NOT attempted (ONNX for ~200 utterances ×
     // 2 variants would run minutes — near the 30-min harness budget — and the
     // prewarm's OnceLock fast-path makes a second in-process prewarm a no-op).
@@ -6359,7 +6351,7 @@ pub(crate) fn run_internal() {
     // representative utterance: the miss path writes exactly these bytes and
     // the hit path reads them back through the same push helper, so a
     // byte-identical read-back proves a warm run reproduces the cold run's
-    // training data — the mahbot-1029 cache win.  The probe now
+    // training data — the embedding-cache win.  The probe now
     // reads the bench-local restricted confusable pool (the production
     // prewarm caches are no longer populated by the bench).
     let embedding_cache_probe = {
@@ -6403,13 +6395,13 @@ pub(crate) fn run_internal() {
         }
     };
 
-    // B3: enrollment-quality scoring (mahbot-1045, report-only).  The bench's
+    // Enrollment-quality scoring (report-only).  The bench's
     // clips have no pre-AGC ring → heuristic SNR (estimate_snr_energy).
     let enrollment_quality_probe_value = enrollment_quality_probe(&train_clips);
 
-    // B6: VAD feed-contract cross-check (mahbot-1045, report-only).  Replays
+    // VAD feed-contract cross-check (report-only).  Replays
     // production's feed pattern (only NEW hop samples) vs the bench's VAD
-    // segmentation on the same audio — the mahbot-900 contract guard.
+    // segmentation on the same audio — the VAD feed-contract guard.
     let vad_feed_cross_check_probe_value =
         vad_feed_cross_check_probe(train_clips.first().map_or(&[], |(pcm, _)| &pcm[..]));
 
@@ -6452,14 +6444,14 @@ pub(crate) fn run_internal() {
             "warmup_tts_cached": WARMUP_TTS_CACHE.get().is_some(),
             "cache_dir": cache_dir_path.display().to_string(),
         },
-        // mahbot-1045 B7: ring lengths the bench sets and production reads for
+        // Ring lengths the bench sets and production reads for
         // geometry classification (previously invisible to the report).
         "geometry_constants": {
             "window_size": crate::audio::wake_word_classifier::WINDOW_SIZE,
             "embedding_ring_max": super::EMBEDDING_RING_MAX,
         },
         "warmup_source": warmup_source,
-        // mahbot-1045 Phase B alignment probes (report-only, additive).
+        // Phase-B alignment probes (report-only, additive).
         "tts_echo_gate": tts_echo_gate_probe,
         "production_metrics": production_metrics_probe,
         "embedding_cache": embedding_cache_probe,
@@ -6481,8 +6473,8 @@ pub(crate) fn run_internal() {
     // ── JSON sub-objects (built separately to stay under serde_json's json!
     // macro recursion limit — the main report object nests several levels) ──
 
-    // Detection summary: warm (pos_metrics) + cold-start (cold_metrics,
-    // mahbot-1006 D) over the held-out augmented diagnostics (Phase 7 —
+    // Detection summary: warm (pos_metrics) + cold-start (cold_metrics)
+    // over the held-out augmented diagnostics (Phase 7 —
     // bounded {speed_down, speed_down_090, white-10, brown-10} variants of a
     // held-out wake-only subset).  A healthy pipeline's warm/cold
     // detection rate here is HIGH.  The raw-clip held-out recall acceptance
@@ -6508,7 +6500,7 @@ pub(crate) fn run_internal() {
                  wake-only) is reported in enrolled_speaker.acceptance.",
         "miss_verdicts": verdict_counts,
         "total_misses": pos_metrics.total - pos_metrics.detected,
-        // mahbot-1006 D: cold-start pass — fresh PipelineCtx per variant,
+        // Cold-start pass — fresh PipelineCtx per variant,
         // no consume_warmup, fresh AdaptiveThresholdState::new() bootstrap.
         // Measures production's post-silence start.
         "cold_rate": if cold_metrics.total > 0 {
@@ -6521,8 +6513,8 @@ pub(crate) fn run_internal() {
         "cold_no_tests_ran": cold_metrics.total == 0,
     });
 
-    // mahbot-1006 J: production gates enrollment on this self-test; the
-    // benchmark is report-only (mahbot-953) so it records the outcome
+    // Production gates enrollment on this self-test; the
+    // benchmark is report-only so it records the outcome
     // instead.  When "passed" is false, the reported detection/FA numbers
     // come from a model production would refuse to deploy.
     let self_test_json = serde_json::json!({
@@ -6638,7 +6630,7 @@ pub(crate) fn run_internal() {
         ),
     });
 
-    // mahbot-1023: enrolled-speaker phase (Phase 7d) + safety gate (item 7).
+    // Enrolled-speaker phase (Phase 7d) + safety gate.
     // The safety gate measures the false-positive impact of the deferred
     // in-distribution windows (burst + boundary double-scoring) on the
     // negative/confusable set; baseline 9/59 gate crossings / 0 FAs.
@@ -6808,13 +6800,13 @@ pub(crate) fn run_internal() {
                 .map(|pv| pv_to_json(pv, None))
                 .collect()
         ),
-        // mahbot-1006 D: cold-start pass per-variant detail (same schema as
+        // Cold-start pass per-variant detail (same schema as
         // per_variant_results, but measured without consume_warmup / fresh
         // adaptive bootstrap).  Empty when the classifier is degenerate.
-        // mahbot-1023: measured under the deferred-burst pipeline — the cold
+        // Measured under the deferred-burst pipeline — the cold
         // pass exercises the burst sweep (buffer >= 68 frames) or the
         // segment-end pass for short utterances, so these numbers reflect
-        // the fix, not the mahbot-1022 0/20 baseline.  The enrolled-speaker
+        // the fix, not the 0/20 baseline.  The enrolled-speaker
         // phase (enrolled_speaker section) is the acceptance-relevant
         // in-sample measurement; this section is the same pipeline over the
         // full 20-variant positive test set.
@@ -6834,7 +6826,7 @@ pub(crate) fn run_internal() {
             "first_detection_fired": cooldown_first_detected,
             "cooldown_suppressed_redetection": cooldown_suppressed,
             "detection_recovered_after_cooldown": cooldown_after_recovered,
-            // mahbot-1052: additive keys (re-point at the enrolled-speaker F1
+            // Additive keys (re-point at the enrolled-speaker F1
             // original variant; visible skip via skip_reason, never silent).
             "source_variant": cooldown_source_variant,
             "skip_reason": cooldown_skip_reason,
@@ -6847,11 +6839,11 @@ pub(crate) fn run_internal() {
                      detection_time_ms (mahbot-1052).",
         },
         "reproducibility": reproducibility,
-        // mahbot-1023: enrolled-speaker benchmark phase (Phase 7d) — F1's 5
+        // Enrolled-speaker benchmark phase (Phase 7d) — F1's 5
         // raw-level augmentation variants through the real streaming cold
         // pass (in-sample / training-side control, NOT generalization).
         "enrolled_speaker": enrolled_json,
-        // mahbot-1023 item 7: false-positive impact of the deferred
+        // False-positive impact of the deferred
         // in-distribution windows on the negative/confusable set.
         "safety_gate": safety_gate_json,
         "config": {
@@ -6860,7 +6852,7 @@ pub(crate) fn run_internal() {
         }
     });
 
-    // ── FAPH section (mahbot-1057, env-gated additive key) ───────────────
+    // ── FAPH section (env-gated additive key) ───────────────
     // Only present when MAHBOT_FAPH=1 (ran or documented-skipped).  Standard
     // runs leave `faph_report` as None → the report surface is byte-identical
     // to the pre-change baseline (key-set contract).
@@ -6929,7 +6921,7 @@ pub(crate) fn run_internal() {
     println!("{json_text}");
     println!("--- BENCHMARK_JSON_END ---");
 
-    // ── Persist the report for post-run analysis (mahbot-1012 reviewer) ────
+    // ── Persist the report for post-run analysis (reviewer) ────
     // The report is emitted to stdout for CI, but a hard 30-minute harness
     // timeout with end-only emission can lose it entirely.  Mirror the JSON to
     // ~/.mahbot/voice_pipeline_e2e_report.json (the same directory as the
@@ -6937,7 +6929,7 @@ pub(crate) fn run_internal() {
     // process ends, and a final ticket comment can cite exact numbers.
     if let Ok(report_dir) = crate::config::default_config_dir() {
         let report_path = report_dir.join("voice_pipeline_e2e_report.json");
-        // ── Per-run timestamped archive (mahbot-1023, manager pin 5) ──────
+        // ── Per-run timestamped archive ──────
         // The ≥3-run acceptance protocol computes spread from ACTUAL runs.
         // Every run is archived with a UTC timestamp before the main report
         // path is overwritten, so the acceptance review has all runs' reports.
@@ -6967,7 +6959,7 @@ pub(crate) fn run_internal() {
         warn!("Could not resolve ~/.mahbot/ for benchmark report persistence");
     }
 
-    // ── Human-readable report (stderr, mahbot-871) ────────────────────────
+    // ── Human-readable report (stderr) ────────────────────────
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     // The headline detection rate is the ENROLLED-speaker
     // HELD-OUT recall (the single-speaker positive class on unseen
@@ -6978,8 +6970,8 @@ pub(crate) fn run_internal() {
         0.0
     };
     // NOTE: checkmarks are informational only — benchmark is report-only, no
-    // pass/fail gating (mahbot-953).  The marks now reflect the ACTUAL limits
-    // instead of being unconditional ✓ (mahbot-1005 §7).
+    // pass/fail gating.  The marks now reflect the ACTUAL limits
+    // instead of being unconditional ✓.
     let mk = |pass: bool| if pass { '✓' } else { '✗' };
     let dr_pass = if enrolled_total > 0 && dr >= MIN_DETECTION_RATE {
         '✓'
@@ -7057,7 +7049,7 @@ pub(crate) fn run_internal() {
         hard_limit = tier_limits(BenchTier::Hard).total,
     );
 
-    // ── Classifier trigger summary (mahbot-952) ────────────────────────
+    // ── Classifier trigger summary ────────────────────────
     let ct_stderr = |ct: &ClassifierTriggerMetrics| -> String {
         format!(
             "{}/{} triggers, fa={}",
@@ -7124,8 +7116,8 @@ pub(crate) fn run_internal() {
 
     // Catastrophic regression guard: at least 1 positive detection must occur.
     // Without this, a pipeline that detects nothing would pass all FA assertions
-    // (zero detections = zero false accepts) (mahbot-911).
-    // NOTE: report-only — warns instead of asserting (mahbot-953).
+    // (zero detections = zero false accepts).
+    // NOTE: report-only — warns instead of asserting.
     // The positive class is the enrolled speaker's wake word,
     // measured end-to-end by the Phase-7d held-out recall phase (detected_live).
     let (positive_detected, positive_total): (u64, u64) =
@@ -7166,8 +7158,8 @@ pub(crate) fn run_internal() {
          probes {probe_fa_count}/{probe_total_variants}",
     );
 
-    // Per-tier confusable false-accept checks (mahbot-871)
-    // NOTE: report-only — warns instead of asserting (mahbot-953).
+    // Per-tier confusable false-accept checks
+    // NOTE: report-only — warns instead of asserting.
     for (i, tier_name, bench_tier) in &[
         (0, "easy", BenchTier::Easy),
         (1, "medium", BenchTier::Medium),
@@ -7189,7 +7181,7 @@ pub(crate) fn run_internal() {
     }
 
     // Per-category false accept checks (non-tiered categories)
-    // NOTE: report-only — warns instead of asserting (mahbot-953).
+    // NOTE: report-only — warns instead of asserting.
     if !unrelated_metrics.false_accepts.is_empty() {
         warn!(
             "Too many unrelated false accepts: {} — need ≤0",
@@ -7210,7 +7202,7 @@ pub(crate) fn run_internal() {
         );
     }
 
-    // Classifier degeneracy check — report-only (mahbot-953).
+    // Classifier degeneracy check — report-only.
     // If the classifier is degenerate, the benchmark still completes and reports
     // so we can diagnose.
     if degenerate {
@@ -7223,10 +7215,10 @@ pub(crate) fn run_internal() {
     }
 
     // Noise-overlap warnings already occurred at the check site above (line ~2843).
-    // No pass/fail gating — report-only (mahbot-953).
+    // No pass/fail gating — report-only.
 
     // ── Final result ──
-    // All threshold checks above emit warnings on violation — no pass/fail gating (mahbot-953).
+    // All threshold checks above emit warnings on violation — no pass/fail gating.
     info!("═══ E2E Voice Pipeline benchmark complete (report-only — no pass/fail gating) ═══");
 
     // Stop heartbeat thread and wait for it to exit.
@@ -7234,7 +7226,7 @@ pub(crate) fn run_internal() {
     let _ = heartbeat_handle.join();
 }
 
-// ── mahbot-1045 A1 fixture tests ─────────────────────────────────────────
+// ── Fixture tests ─────────────────────────────────────────
 // Compile under `cargo test --features voice-tests` (the bench module is
 // feature-gated; `#[cfg(test)]` keeps these out of the harness=false bench
 // binary).  Locks the real `pcm_augment_enrollment_variants` site (the
@@ -7306,7 +7298,7 @@ mod tests {
         );
     }
 
-    // ── mahbot-1057: FAPH Poisson CI helpers ──────────────────────────────
+    // ── FAPH Poisson CI helpers ──────────────────────────────
 
     /// Wilson–Hilferty χ² quantile vs published values (df = 2(k+1) for the
     /// Poisson 95% upper bound).  Tolerances are generous (~1%): the bound is

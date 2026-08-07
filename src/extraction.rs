@@ -37,7 +37,7 @@ use crate::{ChatMessage, ChatRequest, ExtractionValidator};
 /// `Send + Sync` because extraction runs inside `join_all` futures.
 ///
 /// Terminal failure is [`crate::retry::RetryExhausted`] — it carries the
-/// last-attempt raw text (`last_raw`, for Amendment B ticket comments) plus
+/// last-attempt raw text (`last_raw`, for verdict-extraction ticket comments) plus
 /// the per-attempt diagnostics trail.
 #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
@@ -142,7 +142,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
             Err(scoped_err) => {
                 // The final attempt died before producing text (transport /
                 // truncation / budget) — clear any earlier text so the
-                // Amendment B comment never labels it 'last attempt'.
+                // ticket comment never labels it 'last attempt'.
                 last_raw = None;
                 let non_retryable = !scoped_err.class.is_retryable();
                 loop_state.record(attempt, scoped_err.record).await;
@@ -326,7 +326,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn transport_final_failure_clears_earlier_text_from_last_raw() {
         // Mixed sequence: an early attempt produces text (parse failure), then
-        // later attempts die on transport. Amendment B must NOT label the
+        // later attempts die on transport. The ticket comment must NOT label the
         // earlier text as 'last attempt' — last_raw must be None because the
         // final attempt died before producing text.
         let _guard = retry_tests_lock();

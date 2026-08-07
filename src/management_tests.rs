@@ -1002,10 +1002,10 @@ async fn handle_qa_passed_untracked_files_to_insanitation() {
     );
 }
 
-// ── Sanitation agent registration / comment routing wiring (mahbot-1035) ──
+// ── Sanitation agent registration / comment routing wiring ──
 
 /// Sanitation dispatch must persist the SAME suffixed agent ID it registers
-/// with the message router — the mahbot-1035 contract.
+/// with the message router — the routing contract.
 ///
 /// The board routes mid-work comments to the exact ID stored in
 /// `assigned_to` (`route_comment_to_agents` → `try_route`).
@@ -1057,7 +1057,7 @@ async fn sanitation_register_persists_registered_id() {
     message_router::unregister_agent(&agent_id);
 }
 
-/// Pin the mahbot-1035 mismatch shape: an unsuffixed `assigned_to` (the
+/// Pin the mismatch shape: an unsuffixed `assigned_to` (the
 /// `claim_sanitation` placeholder) does NOT match the suffixed agent ID a
 /// sanitation run registers — comments are silently dropped.
 ///
@@ -1719,7 +1719,7 @@ fn should_skip_review_decision_matrix() {
     }
 }
 
-// ── mahbot-1066 Amendment B: verdict raw-response comments ───────────────
+// ── Verdict raw-response comments ───────────────
 
 /// Build a [`crate::retry::RetryExhausted`] with the given last-attempt raw text.
 fn retry_exhausted_with_raw(last_raw: Option<String>) -> crate::retry::RetryExhausted {

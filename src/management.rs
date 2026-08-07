@@ -2432,7 +2432,7 @@ fn format_verdict_comment(
             Some(comment)
         }
         ParallelVerdict::ParseFailed(failure) => {
-            // Amendment B: the ticket comment carries the raw last-attempt
+            // The ticket comment carries the raw last-attempt
             // response (diagnosability only — gates stay fail-closed).
             let base = substitute(
                 &load_prompt("verdict_parse_failed.md"),

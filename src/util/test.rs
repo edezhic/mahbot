@@ -42,7 +42,7 @@ pub fn env_lock() -> &'static std::sync::Mutex<()> {
 }
 
 /// Shared lock serializing tests that install the retry-policy override and /
-/// or the fake provider (mahbot-1066 scoped-retry tests).
+/// or the fake provider (scoped-retry tests).
 ///
 /// Both [`crate::retry::swap_test_retry_policy`] (via
 /// [`install_test_retry_policy`]) and
@@ -63,7 +63,7 @@ pub fn retry_tests_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-// ── Retry-policy guard for scoped-retry tests (mahbot-1066) ──────────────
+// ── Retry-policy guard for scoped-retry tests ──────────────
 
 /// RAII guard restoring the previous test retry-policy override on drop.
 ///
@@ -92,7 +92,7 @@ pub(crate) fn install_test_retry_policy(policy: crate::retry::RetryPolicy) -> Re
     RetryPolicyGuard { previous }
 }
 
-// ── Fake provider for scoped-retry tests (mahbot-1066) ──────────────────
+// ── Fake provider for scoped-retry tests ──────────────────
 
 /// Scripted [`crate::Provider`] test double for the scoped retry loops.
 ///
