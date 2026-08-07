@@ -208,6 +208,12 @@ impl Role {
         role_info(self).requires_multimodal
     }
 
+    /// Human-readable display label (e.g. `"QA"` for [`Role::Qa`]).
+    #[must_use]
+    pub const fn display_label(&self) -> &'static str {
+        role_info(self).display_label
+    }
+
     /// Role description loaded from embedded prompt files.
     #[must_use]
     pub fn role_description(&self) -> String {

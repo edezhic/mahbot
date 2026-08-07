@@ -21,9 +21,10 @@ use crate::Workspace;
 use crate::WorkspaceStatus;
 use crate::git_commands::run_git_output;
 use crate::turso::{self, TxGuard};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use strum::IntoEnumIterator;
 use tracing::warn;
 
 crate::define_store! {
@@ -31,7 +32,7 @@ crate::define_store! {
     pub(crate) static USER_STORE: UserStore,
     db_name = "users",
     schema = SCHEMA,
-    post_open = ensure_admin_user,
+    post_open = after_open,
     expect = "USER_STORE not initialized — call init_global() first",
 }
 
@@ -40,7 +41,8 @@ CREATE TABLE IF NOT EXISTS users (
     name                TEXT PRIMARY KEY,
     permissions         TEXT,
     selected_workspace  TEXT,
-    selected_role       TEXT
+    selected_role       TEXT,
+    role_pool_initialized INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS user_channels (
     user_name   TEXT NOT NULL REFERENCES users(name),
@@ -48,6 +50,11 @@ CREATE TABLE IF NOT EXISTS user_channels (
     identifier  TEXT NOT NULL,
     reply_target TEXT,
     UNIQUE(channel, identifier)
+);
+CREATE TABLE IF NOT EXISTS user_roles (
+    user_name   TEXT NOT NULL REFERENCES users(name),
+    role        TEXT NOT NULL,
+    PRIMARY KEY (user_name, role)
 );";
 
 // ── Column index constants ──────────────────────────────────
@@ -72,6 +79,51 @@ crate::columns! {
 }
 
 impl UserStore {
+    /// Post-open setup: evolve schema, auto-create the admin user, and
+    /// backfill legacy users' role pools.
+    async fn after_open(&self) -> Result<()> {
+        if !turso::column_exists(&self.conn, "users", "role_pool_initialized").await? {
+            self.conn
+                .execute(
+                    "ALTER TABLE users ADD COLUMN role_pool_initialized INTEGER NOT NULL DEFAULT 0",
+                    (),
+                )
+                .await
+                .context("Failed to add role_pool_initialized column to users")?;
+        }
+        self.ensure_admin_user().await?;
+
+        // One-time backfill: users created before the role pool shipped get
+        // the full role set so their previous switching freedom is preserved.
+        // Users created after the release carry `role_pool_initialized = 1`
+        // (set by add_user / set_user_roles) and are never re-seeded.
+        let legacy = self
+            .conn
+            .query_map_strict(
+                "SELECT name FROM users WHERE role_pool_initialized = 0",
+                turso::params![],
+                |row| row.get::<String>(0),
+            )
+            .await?;
+        for name in legacy {
+            let tx = self.conn.begin_tx().await?;
+            for role in Role::iter() {
+                tx.execute(
+                    "INSERT OR IGNORE INTO user_roles (user_name, role) VALUES (?1, ?2)",
+                    turso::params![name.clone(), role.as_str()],
+                )
+                .await?;
+            }
+            tx.execute(
+                "UPDATE users SET role_pool_initialized = 1 WHERE name = ?1",
+                turso::params![name],
+            )
+            .await?;
+            tx.commit().await?;
+        }
+        Ok(())
+    }
+
     /// Auto-create the admin user if this is a fresh database.
     async fn ensure_admin_user(&self) -> Result<()> {
         let rows = self
@@ -79,29 +131,64 @@ impl UserStore {
             .query("SELECT 1 FROM users WHERE name = 'admin'", turso::params![])
             .await?;
         if rows.is_empty() {
-            self.conn
-                .execute(
-                    "INSERT INTO users (name, permissions) VALUES ('admin', 'full')",
-                    turso::params![],
-                )
-                .await?;
-            // Also create the admin's personal workspace directory.
-            init_personal_workspace_dir("admin").await;
+            // Analyst first so add_user seeds the pre-pool default active
+            // role in the same transaction — no two-step reset with a
+            // Manager-default crash window on fresh installs.
+            let mut roles = vec![Role::Analyst];
+            roles.extend(Role::iter().filter(|r| *r != Role::Analyst));
+            self.add_user("admin", Some("full"), &roles).await?;
         }
         Ok(())
     }
 
     // ── User CRUD ─────────────────────────────────────────────
 
-    /// Create a new user. Also creates their personal workspace directory
-    /// under `~/.mahbot/userspaces/<name>/` with `git init` (non-fatal on failure).
-    pub async fn add_user(&self, name: &str, permissions: Option<&str>) -> Result<()> {
-        self.conn
+    /// Create a new user with the given role pool. The active role is set to
+    /// the first pool role. Also creates their personal workspace directory
+    /// under `~/.mahbot/userspaces/<name>/` with `git init` (non-fatal on
+    /// failure). Idempotent — re-adding an existing user preserves their
+    /// stored preferences and adds the given roles to their pool. The
+    /// `role_pool_initialized` marker is set unconditionally so a re-added
+    /// legacy user is never re-seeded by the `after_open` backfill.
+    pub async fn add_user(
+        &self,
+        name: &str,
+        permissions: Option<&str>,
+        roles: &[Role],
+    ) -> Result<()> {
+        let inserted = self
+            .conn
             .execute(
-                "INSERT OR IGNORE INTO users (name, permissions) VALUES (?1, ?2)",
+                "INSERT OR IGNORE INTO users (name, permissions, role_pool_initialized) \
+                 VALUES (?1, ?2, 1)",
                 turso::params![name, permissions],
             )
             .await?;
+        let tx = self.conn.begin_tx().await?;
+        for role in roles {
+            tx.execute(
+                "INSERT OR IGNORE INTO user_roles (user_name, role) VALUES (?1, ?2)",
+                turso::params![name, role.as_str()],
+            )
+            .await?;
+        }
+        if inserted > 0
+            && let Some(first) = roles.first()
+        {
+            tx.execute(
+                "UPDATE users SET selected_role = ?1 WHERE name = ?2",
+                turso::params![first.as_str(), name],
+            )
+            .await?;
+        }
+        // Mark the pool as initialized even when the INSERT OR IGNORE
+        // no-op'd for an existing legacy (marker=0) user.
+        tx.execute(
+            "UPDATE users SET role_pool_initialized = 1 WHERE name = ?1",
+            turso::params![name],
+        )
+        .await?;
+        tx.commit().await?;
 
         // Create personal workspace directory.
         init_personal_workspace_dir(name).await;
@@ -109,9 +196,79 @@ impl UserStore {
         Ok(())
     }
 
-    /// Delete a user and all their channel bindings (cascading).
+    /// Replace a user's role pool. The active role stays in the pool when
+    /// possible; a removed selection falls back to the first remaining role,
+    /// and an emptied pool clears the selection (no routing until reassigned).
+    pub async fn set_user_roles(&self, name: &str, roles: &[Role]) -> Result<()> {
+        let tx = self.conn.begin_tx().await?;
+        tx.execute(
+            "DELETE FROM user_roles WHERE user_name = ?1",
+            turso::params![name],
+        )
+        .await?;
+        for role in roles {
+            tx.execute(
+                "INSERT INTO user_roles (user_name, role) VALUES (?1, ?2)",
+                turso::params![name, role.as_str()],
+            )
+            .await?;
+        }
+        tx.execute(
+            "UPDATE users SET role_pool_initialized = 1 WHERE name = ?1",
+            turso::params![name],
+        )
+        .await?;
+        let selected: Option<String> = tx
+            .query_row(
+                "SELECT selected_role FROM users WHERE name = ?1",
+                turso::params![name],
+                |row| row.get::<Option<String>>(0),
+            )
+            .await
+            .context("Failed to read selected_role while updating role pool")?;
+        match selected {
+            Some(cur) if roles.iter().any(|r| r.as_str() == cur) => {}
+            Some(_) => {
+                // Current selection was removed — fall back to the first
+                // remaining pool role (or clear when the pool is empty).
+                let fallback = roles.first().map(|r| r.as_str().to_string());
+                tx.execute(
+                    "UPDATE users SET selected_role = ?1 WHERE name = ?2",
+                    turso::params![fallback, name],
+                )
+                .await?;
+            }
+            None => {}
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// List the roles in a user's pool, in canonical [`Role`] iteration order.
+    pub async fn get_user_roles(&self, user_name: &str) -> Result<Vec<Role>> {
+        let rows = self
+            .conn
+            .query_map_strict(
+                "SELECT role FROM user_roles WHERE user_name = ?1",
+                turso::params![user_name],
+                |row| row.get::<String>(0),
+            )
+            .await?;
+        let parsed: Vec<Role> = rows.iter().filter_map(|s| s.parse::<Role>().ok()).collect();
+        Ok(Role::iter().filter(|r| parsed.contains(r)).collect())
+    }
+
+    /// Delete a user and all their child rows (channel bindings, role pool).
+    /// The role-pool rows must be removed explicitly — `user_roles` has a
+    /// NO-ACTION FK to `users`, so the parent DELETE would fail under
+    /// `PRAGMA foreign_keys = ON` otherwise.
     pub async fn delete_user(&self, name: &str) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
+        tx.execute(
+            "DELETE FROM user_roles WHERE user_name = ?1",
+            turso::params![name],
+        )
+        .await?;
         tx.execute(
             "DELETE FROM user_channels WHERE user_name = ?1",
             turso::params![name],
@@ -273,11 +430,13 @@ impl UserStore {
     /// Convert a `users` table row into a [`UserRecord`], loading channel bindings.
     async fn user_record_from_row(&self, row: &turso::Row) -> Result<UserRecord> {
         let name: String = row.get(COL_USERS_NAME)?;
+        let roles = self.get_user_roles(&name).await.unwrap_or_default();
         Ok(UserRecord {
             name: name.clone(),
             permissions: row.get::<Option<String>>(COL_USERS_PERMISSIONS)?,
             selected_workspace: row.get::<Option<String>>(COL_USERS_SELECTED_WORKSPACE)?,
             selected_role: row.get::<Option<String>>(COL_USERS_SELECTED_ROLE)?,
+            roles: roles.iter().map(|r| r.as_str().to_string()).collect(),
             channels: self.get_user_channels(&name).await.unwrap_or_default(),
         })
     }
@@ -407,8 +566,11 @@ pub struct UserRecord {
     pub permissions: Option<String>,
     /// Selected shared workspace name, NULL = personal workspace.
     pub selected_workspace: Option<String>,
-    /// Selected active role, NULL = default (analyst).
+    /// Selected active role, NULL = pool-dependent default (Analyst when in
+    /// the pool, else the first pool role). Empty pool → no routing.
     pub selected_role: Option<String>,
+    /// The role pool — role names the user is allowed to use.
+    pub roles: Vec<String>,
     /// Channel bindings for this user (Telegram, etc.).
     pub channels: Vec<ChannelBinding>,
 }
@@ -529,11 +691,102 @@ pub async fn get_active_role(user_name: &str) -> Result<Option<String>> {
     store().get_active_role(user_name).await
 }
 
-/// Resolve the active role for a user. Defaults to Analyst when unset.
-pub async fn resolve_active_role(user_name: &str) -> Role {
-    match get_active_role(user_name).await {
-        Ok(Some(name)) => name.parse::<Role>().unwrap_or(Role::Analyst),
-        _ => Role::Analyst,
+/// Fail-closed pool read for routing: returns `(pool, read_failed)` so the
+/// caller can distinguish a genuinely empty pool from a transient store
+/// error (and avoid a misleading 'no active role' user notice on the
+/// latter). The warning is logged here — a single warn site shared with
+/// [`role_pool`].
+pub async fn role_pool_status(user_name: &str) -> (Vec<Role>, bool) {
+    match store().get_user_roles(user_name).await {
+        Ok(pool) => (pool, false),
+        Err(e) => {
+            tracing::warn!(error = %e, user_name, "Failed to read role pool");
+            (Vec::new(), true)
+        }
+    }
+}
+
+/// The role pool for a user — the roles they are allowed to use.
+/// Empty when the user has no roles assigned, or when the store read fails
+/// (fail closed with a warning — an operator log distinguishes a transient
+/// DB error from a genuinely empty pool).
+pub async fn role_pool(user_name: &str) -> Vec<Role> {
+    role_pool_status(user_name).await.0
+}
+
+/// Persist a user's active role. Callers must ensure `role` is in the
+/// user's pool (see [`role_pool`]).
+pub async fn switch_active_role(user_name: &str, role: Role) -> Result<()> {
+    store()
+        .update_user(
+            user_name,
+            FieldUpdate::Set(role.as_str()),
+            FieldUpdate::Unchanged,
+            FieldUpdate::Unchanged,
+        )
+        .await
+}
+
+/// Resolve the active role for a user from their role pool.
+///
+/// Returns `None` when the user has no roles assigned (empty pool) — the
+/// caller must not route messages to any agent.
+///
+/// A stored selection is honoured when it is still in the pool; a selection
+/// outside the pool (e.g. after a pool edit) falls back to the first pool
+/// role. Without a stored selection, Analyst is used when available (the
+/// pre-pool default), otherwise the first pool role.
+pub async fn resolve_active_role(user_name: &str) -> Option<Role> {
+    let pool = role_pool(user_name).await;
+    resolve_active_role_from_pool(user_name, &pool).await
+}
+
+/// Resolve the active role from an already-fetched pool — avoids a second
+/// `user_roles` read when the caller needs the pool anyway (e.g. the
+/// Telegram command menu). Fails closed on a `selected_role` read error
+/// (warn + no routing), matching the pool-read failure policy.
+pub async fn resolve_active_role_from_pool(user_name: &str, pool: &[Role]) -> Option<Role> {
+    if pool.is_empty() {
+        return None;
+    }
+    let selected = match store().get_active_role(user_name).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, user_name, "Failed to read selected role");
+            return None;
+        }
+    };
+    match selected {
+        Some(name) => name
+            .parse::<Role>()
+            .ok()
+            .filter(|r| pool.contains(r))
+            .or_else(|| pool.first().copied()),
+        None if pool.contains(&Role::Analyst) => Some(Role::Analyst),
+        None => pool.first().copied(),
+    }
+}
+
+/// The role that answers for a user in a workspace: personal workspaces do
+/// not support the Manager agent (no board pipeline), so Manager falls back
+/// to Analyst. The fallback stays inside the user's pool — when Analyst is
+/// not in the pool (e.g. a Manager-only pool), the Manager selection is kept
+/// (the active-role invariant — the routed role is always one of the pool
+/// roles — takes precedence over the pipeline fallback). Product note: this
+/// is a deliberate shift from the pre-pool rule (Manager→Analyst
+/// unconditionally on personal workspaces); an admin can restore the old
+/// fallback for a user by adding Analyst to their pool. Canonical home for
+/// the chat and voice routing paths.
+#[must_use]
+pub fn resolve_effective_role(role: Role, ws_name: &str, pool: &[Role]) -> Role {
+    if role == Role::Manager && is_personal_workspace(ws_name) {
+        if pool.contains(&Role::Analyst) {
+            Role::Analyst
+        } else {
+            role
+        }
+    } else {
+        role
     }
 }
 
@@ -613,12 +866,13 @@ pub(crate) mod test_util {
         // bindings.  Both `add_user` (INSERT OR IGNORE) and `bind_channel`
         // (INSERT OR REPLACE) are idempotent.
         if let Some(store) = USER_STORE.get() {
+            let all_roles = Role::iter().collect::<Vec<_>>();
             store
-                .add_user("alice", Some("full"))
+                .add_user("alice", Some("full"), &all_roles)
                 .await
                 .expect("failed to add alice to test USER_STORE");
             store
-                .add_user("bob", None)
+                .add_user("bob", None, &all_roles)
                 .await
                 .expect("failed to add bob to test USER_STORE");
             store
@@ -630,5 +884,140 @@ pub(crate) mod test_util {
                 .await
                 .expect("failed to bind bob telegram");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn role_pool_lifecycle() {
+        crate::util::test::init_test_stores().await;
+        let store = store();
+
+        // add_user seeds the active role from the first pool role.
+        store
+            .add_user("pool_user", None, &[Role::Analyst, Role::Coder])
+            .await
+            .unwrap();
+        assert_eq!(resolve_active_role("pool_user").await, Some(Role::Analyst));
+
+        // Removing the active role from the pool falls back to the first
+        // remaining role.
+        store
+            .set_user_roles("pool_user", &[Role::Coder])
+            .await
+            .unwrap();
+        assert_eq!(resolve_active_role("pool_user").await, Some(Role::Coder));
+
+        // A selection outside the pool (defensive) falls back to the first
+        // pool role instead of routing to an unallowed role.
+        store
+            .update_user(
+                "pool_user",
+                FieldUpdate::Set("engineer"),
+                FieldUpdate::Unchanged,
+                FieldUpdate::Unchanged,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolve_active_role("pool_user").await, Some(Role::Coder));
+
+        // Emptying the pool stops routing.
+        store.set_user_roles("pool_user", &[]).await.unwrap();
+        assert_eq!(resolve_active_role("pool_user").await, None);
+
+        // Re-adding a role restores routing; an unset selection keeps the
+        // pre-pool Analyst default when it is in the pool.
+        store
+            .set_user_roles("pool_user", &[Role::Analyst])
+            .await
+            .unwrap();
+        assert_eq!(resolve_active_role("pool_user").await, Some(Role::Analyst));
+    }
+
+    #[tokio::test]
+    async fn legacy_backfill_grants_all_roles_once() {
+        crate::util::test::init_test_stores().await;
+        let store = store();
+
+        // Simulate a user created before the role pool shipped (marker unset).
+        store
+            .conn
+            .execute(
+                "INSERT INTO users (name, permissions, role_pool_initialized) \
+                 VALUES ('legacy', NULL, 0)",
+                crate::turso::params![],
+            )
+            .await
+            .unwrap();
+
+        // Re-running after_open performs the one-time backfill and is
+        // idempotent for already-initialized users.
+        store.after_open().await.unwrap();
+        assert_eq!(
+            store.get_user_roles("legacy").await.unwrap().len(),
+            Role::iter().count()
+        );
+
+        // A user created after the release keeps a restricted pool — the
+        // backfill never re-seeds it.
+        store
+            .add_user("restricted", None, &[Role::Coder])
+            .await
+            .unwrap();
+        store.after_open().await.unwrap();
+        assert_eq!(
+            store.get_user_roles("restricted").await.unwrap(),
+            vec![Role::Coder]
+        );
+
+        // A restricted pool survives a re-add: add_user is additive (grants,
+        // never removes) and keeps the marker set, so after_open never
+        // re-seeds the full role set over the restriction.
+        store
+            .set_user_roles("legacy", &[Role::Coder])
+            .await
+            .unwrap();
+        store
+            .add_user("legacy", None, &[Role::Analyst])
+            .await
+            .unwrap();
+        store.after_open().await.unwrap();
+        assert_eq!(
+            store.get_user_roles("legacy").await.unwrap(),
+            vec![Role::Analyst, Role::Coder]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_user_removes_role_pool_rows() {
+        crate::util::test::init_test_stores().await;
+        let store = store();
+
+        // add_user + backfill give the user role rows; deleting them must not
+        // trip the NO-ACTION FK on user_roles.user_name.
+        store
+            .add_user("doomed", None, &[Role::Analyst, Role::Coder])
+            .await
+            .unwrap();
+        store.delete_user("doomed").await.unwrap();
+        assert!(
+            store
+                .conn
+                .query(
+                    "SELECT 1 FROM user_roles WHERE user_name = 'doomed'",
+                    crate::turso::params![],
+                )
+                .await
+                .unwrap()
+                .is_empty(),
+            "user_roles rows must be deleted with the user"
+        );
+        assert_eq!(
+            store.get_user_roles("doomed").await.unwrap(),
+            Vec::<Role>::new()
+        );
     }
 }

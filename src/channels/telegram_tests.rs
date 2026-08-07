@@ -1,5 +1,7 @@
 use super::*;
 
+use strum::IntoEnumIterator;
+
 /// Create a Telegram Update JSON with sensible defaults, then apply
 /// shallow top-level overrides for test-specific fields.
 ///
@@ -129,6 +131,57 @@ fn test_markdown_to_telegram_html() {
     // Tag with trailing space inside: <blockquote > should NOT pass through
     let r = markdown_to_telegram_html("<blockquote >");
     assert_eq!(r, "&lt;blockquote &gt;");
+}
+
+/// The `/board` listing formats each ticket via [`format_board_line`] and
+/// converts the joined text through `markdown_to_telegram_html` line-by-line.
+/// A title with markdown-special characters must never corrupt other lines'
+/// formatting or leave unbalanced HTML tags (which would make Telegram reject
+/// the whole message).
+#[test]
+fn board_listing_isolates_hostile_titles() {
+    // Pin the production format string — if `handle_board_listing`'s helper
+    // drifts, this test fails instead of silently covering a stale fixture.
+    assert_eq!(
+        format_board_line(
+            &crate::board::TicketPhase::InDevelopment,
+            "mahbot-123",
+            "Title",
+        ),
+        "• **in development** `mahbot-123` Title"
+    );
+
+    let state = crate::board::TicketPhase::InDevelopment;
+    let lines = vec![
+        format_board_line(&state, "mahbot-1", "Fix * unclosed italic"),
+        format_board_line(&state, "mahbot-2", "Use `git status` and *pair* ok"),
+        format_board_line(&state, "mahbot-3", "<script>alert(1)</script> & tags"),
+        format_board_line(&state, "mahbot-4", "Bold **crash** inside title"),
+        format_board_line(&state, "mahbot-5", "[link](https://example.com/x?y=1&z=2)"),
+        format_board_line(&state, "mahbot-6", "backtick ` unclosed"),
+        format_board_line(&state, "mahbot-7", "Normal ticket"),
+    ];
+    let listing = lines.join("\n");
+    let html = markdown_to_telegram_html(&listing);
+
+    // Every line keeps its bold state and monospace ID.
+    for line in html.split('\n') {
+        assert!(line.starts_with("• <b>"), "state formatting lost: {line:?}");
+        assert!(
+            line.contains("</b> <code>") && line.contains("</code> "),
+            "id formatting lost: {line:?}"
+        );
+    }
+    // No unbalanced tags anywhere — an unclosed marker in a title must be
+    // escaped, not emitted as a dangling tag (that would degrade the whole
+    // listing to plain text via Telegram's HTML parse failure fallback).
+    for (open, close) in [("<b>", "</b>"), ("<i>", "</i>"), ("<code>", "</code>")] {
+        assert_eq!(
+            html.matches(open).count(),
+            html.matches(close).count(),
+            "unbalanced {open}/{close} in: {html}"
+        );
+    }
 }
 
 // ── Inline formatting tests ──────────────────────────────────────
@@ -1551,8 +1604,9 @@ fn setup_spy_channel() -> &'static Arc<Mutex<Vec<SendMessage>>> {
 async fn setup_user_with_telegram_binding(user_name: &str, reply_target: &str) {
     use crate::users::store;
     let store = store();
+    let all_roles = crate::Role::iter().collect::<Vec<_>>();
     store
-        .add_user(user_name, Some("full"))
+        .add_user(user_name, Some("full"), &all_roles)
         .await
         .expect("add_user");
     store
@@ -1648,7 +1702,10 @@ async fn skip_user_with_no_bindings() {
     let (sent, _lock) = setup_mirror_test_env().await;
     // Create user but DO NOT bind a Telegram channel.
     let store = crate::users::store();
-    store.add_user("no_binding", None).await.expect("add_user");
+    store
+        .add_user("no_binding", None, &[])
+        .await
+        .expect("add_user");
 
     // Use the user's name as the recipient filter — no bindings means
     // no messages should be sent for this user at all.
@@ -1665,7 +1722,10 @@ async fn skip_binding_without_reply_target() {
     let (sent, _lock) = setup_mirror_test_env().await;
     // Bind a Telegram channel but don't set reply_target.
     let store = crate::users::store();
-    store.add_user("no_target", None).await.expect("add_user");
+    store
+        .add_user("no_target", None, &[])
+        .await
+        .expect("add_user");
     store
         .bind_channel("no_target", "telegram", "no_target")
         .await
@@ -1728,7 +1788,10 @@ async fn sends_blockquote_to_single_binding() {
 async fn sends_to_multiple_telegram_bindings() {
     let (sent, _lock) = setup_mirror_test_env().await;
     let store = crate::users::store();
-    store.add_user("multi_user", None).await.expect("add_user");
+    store
+        .add_user("multi_user", None, &[])
+        .await
+        .expect("add_user");
     // Bind two Telegram accounts with unique recipients.
     store
         .bind_channel("multi_user", "telegram", "multi_user_1")
@@ -1839,21 +1902,54 @@ async fn preserves_markdown_formatting_in_blockquote() {
 
 #[tokio::test]
 async fn user_command_entries_reflect_role_and_admin() {
+    // Serialized with the sibling mirror tests: this test mutates the
+    // shared user/workspace stores (alice's workspace + role, menu_ws
+    // INSERT), so it must not run concurrently with other store users.
+    let _lock = acquire_mirror_lock().await;
     crate::users::test_util::init_test_store().await;
     let store = crate::users::store();
 
-    // alice: admin (full permissions), default Analyst role.
+    // Give alice a shared workspace so state-aware admin entries appear.
+    crate::util::test::create_test_workspace("/tmp/mahbot_test_ws_menu", "menu_ws").await;
+    store
+        .update_user(
+            "alice",
+            crate::users::FieldUpdate::Unchanged,
+            crate::users::FieldUpdate::Set("menu_ws"),
+            crate::users::FieldUpdate::Unchanged,
+        )
+        .await
+        .unwrap();
+
+    // alice: admin (full permissions), pool = all roles → role commands,
+    // Artist commands, and state-aware admin commands.
     let alice = user_command_entries("alice").await;
-    let cmds: Vec<&str> = alice.iter().map(|(c, _)| *c).collect();
+    let cmds: Vec<&str> = alice.iter().map(|(c, _)| c.as_str()).collect();
     assert!(cmds.contains(&"board"));
-    assert!(cmds.contains(&"maintenance"));
-    assert!(!cmds.contains(&"image_models"));
+    // State-aware pairs reflect the workspace state: not paused →
+    // /pause, maintenance disabled → /maintenance_on.
+    assert!(cmds.contains(&"pause"));
+    assert!(!cmds.contains(&"unpause"));
+    assert!(cmds.contains(&"maintenance_on"));
+    assert!(!cmds.contains(&"maintenance_off"));
+    // Pool roles are direct commands.
+    assert!(cmds.contains(&"engineer"));
+    assert!(cmds.contains(&"artist"));
+    // Artist is in the pool → model commands present.
+    assert!(cmds.contains(&"image_models"));
+    assert!(cmds.contains(&"video_models"));
+    assert_eq!(cmds[0], "clear");
 
-    // bob: restricted user.
-    let bob = user_command_entries("bob").await;
-    assert_eq!(bob, vec![("clear", CLEAR_COMMAND_DESC)]);
+    // The active role's entry is marked. add_user seeds the selection to the
+    // first pool role (Manager in Role::iter order).
+    let manager_desc = alice
+        .iter()
+        .find(|(c, _)| c == "manager")
+        .map(|(_, d)| d.as_str())
+        .unwrap();
+    assert!(manager_desc.contains("current"));
 
-    // alice as Artist: image/video model commands plus admin commands.
+    // Switching the active role moves the marker.
     store
         .update_user(
             "alice",
@@ -1863,13 +1959,43 @@ async fn user_command_entries_reflect_role_and_admin() {
         )
         .await
         .unwrap();
-    let cmds: Vec<&str> = user_command_entries("alice")
-        .await
+    let entries = user_command_entries("alice").await;
+    let artist_desc = entries
         .iter()
-        .map(|(c, _)| *c)
-        .collect();
-    assert!(cmds.contains(&"image_models"));
-    assert!(cmds.contains(&"video_models"));
-    assert!(cmds.contains(&"board"));
-    assert_eq!(cmds[0], "clear");
+        .find(|(c, _)| c == "artist")
+        .map(|(_, d)| d.as_str())
+        .unwrap();
+    assert!(artist_desc.contains("current"));
+    let analyst_desc = entries
+        .iter()
+        .find(|(c, _)| c == "analyst")
+        .map(|(_, d)| d.as_str())
+        .unwrap();
+    assert!(!analyst_desc.contains("current"));
+
+    // Flipping the workspace state reverses the pairs (the ticket's
+    // headline criterion): paused → /unpause, maintenance on →
+    // /maintenance_off.
+    crate::workspace::store()
+        .set_paused("menu_ws", true)
+        .await
+        .unwrap();
+    crate::workspace::store()
+        .set_maintenance_enabled("menu_ws", true)
+        .await
+        .unwrap();
+    let flipped = user_command_entries("alice").await;
+    let flipped_cmds: Vec<&str> = flipped.iter().map(|(c, _)| c.as_str()).collect();
+    assert!(flipped_cmds.contains(&"unpause"));
+    assert!(!flipped_cmds.contains(&"pause"));
+    assert!(flipped_cmds.contains(&"maintenance_off"));
+    assert!(!flipped_cmds.contains(&"maintenance_on"));
+
+    // bob: restricted user — pool commands but no admin commands.
+    let bob = user_command_entries("bob").await;
+    let cmds: Vec<&str> = bob.iter().map(|(c, _)| c.as_str()).collect();
+    assert!(!cmds.contains(&"board"));
+    assert!(!cmds.contains(&"pause"));
+    assert!(!cmds.contains(&"unpause"));
+    assert!(cmds.contains(&"engineer"));
 }

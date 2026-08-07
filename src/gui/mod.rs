@@ -278,8 +278,13 @@ pub enum Message {
     OpenDiffModal(Option<String>),
     /// Close the diff modal.
     CloseDiffModal,
-    /// Set the selected user's role for the role switcher indicator.
-    SetSelectedRole(Option<Role>),
+    /// Set the selected user's active role + pool for the role switcher
+    /// indicator. Fetched together (single task, single pool read) to
+    /// avoid a double `user_roles` query.
+    RoleAndPoolLoaded {
+        role: Option<Role>,
+        pool: Vec<Role>,
+    },
     /// TTS model download progress event.
     TtsDownloadEvent(crate::audio::tts::TtsDownloadEvent),
 }
@@ -456,6 +461,9 @@ pub struct Dashboard {
     /// Cached selected role for the current user, used by the role switcher
     /// context menu to visually indicate which role is active.
     selected_user_role: Option<Role>,
+    /// Cached role pool for the current user — the switchable roles shown in
+    /// the chat context menu.
+    selected_user_roles: Vec<Role>,
     /// Whether a self-update is available or in progress.
     /// Controls button visibility/disabled state.
     update_status: UpdateStatus,
@@ -503,6 +511,7 @@ impl Dashboard {
             selected_workspace_name: None,
             selected_user_name: None,
             selected_user_role: None,
+            selected_user_roles: Vec::new(),
             update_status: if update_available {
                 UpdateStatus::Available
             } else {
@@ -634,17 +643,8 @@ impl Dashboard {
             self.home_state.selected_user = Some(user_name.clone());
             crate::audio::voice::set_active_user_name(user_name);
         }
-        // Load the selected user's role for the role switcher indicator.
-        let role_task = self
-            .selected_user_name
-            .as_ref()
-            .map_or(Task::none(), |user| {
-                let user = user.clone();
-                Task::perform(
-                    async move { crate::users::resolve_active_role(&user).await },
-                    |role| Message::SetSelectedRole(Some(role)),
-                )
-            });
+        // Load the selected user's role and role pool for the role switcher.
+        let role_cache = self.refresh_selected_user_role_cache();
 
         let load_users = self.home_state.load_users().map(Message::Home);
 
@@ -657,7 +657,7 @@ impl Dashboard {
             restored_name.to_owned()
         };
         Task::batch([
-            role_task,
+            role_cache,
             self.propagate_workspace_selection(&ws_name),
             load_users,
         ])
@@ -858,6 +858,27 @@ impl Dashboard {
         }
     }
 
+    /// Load the selected user's active role + role pool into the cached
+    /// role-switcher state (Home context-menu pool guard and 'current'
+    /// marker). Called at boot, on user switch, and after Settings edits
+    /// that touch the selected user's role or pool.
+    fn refresh_selected_user_role_cache(&self) -> Task<Message> {
+        let Some(ref user) = self.selected_user_name else {
+            return Task::none();
+        };
+        let user = user.clone();
+        // Single task, single pool read: resolve the role from the
+        // already-fetched pool instead of re-querying `user_roles`.
+        Task::perform(
+            async move {
+                let pool = crate::users::role_pool(&user).await;
+                let role = crate::users::resolve_active_role_from_pool(&user, &pool).await;
+                Message::RoleAndPoolLoaded { role, pool }
+            },
+            std::convert::identity,
+        )
+    }
+
     /// Process a Settings message, intercepting user-related messages for
     /// cross-page side effects (user switching, workspace switching,
     /// deletion recovery) and optionally reloading workspace options when
@@ -891,6 +912,15 @@ impl Dashboard {
                     if self.selected_user_name.as_deref() == Some(sender.as_str()) =>
                 {
                     intercept_task = Some(self.select_workspace(ws));
+                }
+                // A pool edit or active-role change in Settings leaves the
+                // Dashboard's cached role/pool stale (context-menu guard and
+                // 'current' marker) — refresh them for the selected user.
+                // Workspace changes are handled by the UpdateWorkspace arm
+                // above and need no role/pool refresh.
+                users::UsersMessage::PoolEditResult(Ok(()))
+                | users::UsersMessage::RoleUpdateResult(Ok(())) => {
+                    intercept_task = Some(self.refresh_selected_user_role_cache());
                 }
                 _ => {}
             }
@@ -991,46 +1021,47 @@ impl Dashboard {
                     self.selected_user_name = Some(user.clone());
                     self.board_state.current_user_name = Some(user.clone());
                     self.selected_user_role = None; // reset until loaded
+                    self.selected_user_roles = Vec::new();
                     crate::audio::voice::set_active_user_name(user);
                     self.persist_window_state();
-                    let user = user.clone();
-                    let role_task = Task::perform(
-                        async move { crate::users::resolve_active_role(&user).await },
-                        |role| Message::SetSelectedRole(Some(role)),
-                    );
+                    let role_cache = self.refresh_selected_user_role_cache();
                     return Task::batch([
-                        role_task,
+                        role_cache,
                         self.home_state.update(msg.clone()).map(Message::Home),
                     ]);
                 }
                 // Intercept SwitchRole: user selected a new role from the
-                // chat context menu — persist it and show a toast.
+                // chat context menu — persist it and show a toast. The menu
+                // is built from the cached pool, so the pool check is
+                // synchronous against that same list.
                 if let home::HomeMessage::SwitchRole(ref user_name, ref role) = msg {
+                    if !self.selected_user_roles.contains(role) {
+                        return Task::done(Message::Home(home::HomeMessage::Toast(
+                            ToastMessage::Error(format!(
+                                "Role '{}' is not in {}'s allowed roles.",
+                                role.as_str(),
+                                user_name
+                            )),
+                        )));
+                    }
                     self.selected_user_role = Some(*role);
                     let user = user_name.clone();
                     let role = *role;
                     return Task::perform(
                         async move {
-                            if let Some(store) = crate::users::USER_STORE.get() {
-                                use crate::users::FieldUpdate;
-                                let _ = store
-                                    .update_user(
-                                        &user,
-                                        FieldUpdate::Set(role.as_str()),
-                                        FieldUpdate::Unchanged,
-                                        FieldUpdate::Unchanged,
-                                    )
-                                    .await;
-                            }
-                            role
+                            crate::users::switch_active_role(&user, role)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            Ok(role)
                         },
-                        |role| {
-                            Message::Home(home::HomeMessage::Toast(ToastMessage::SuccessMsg(
-                                format!(
+                        |res| {
+                            Message::Home(home::HomeMessage::Toast(match res {
+                                Ok(role) => ToastMessage::SuccessMsg(format!(
                                     "Switched to {} role",
                                     crate::role::role_info(&role).display_label
-                                ),
-                            )))
+                                )),
+                                Err(e) => ToastMessage::Error(e),
+                            }))
                         },
                     );
                 }
@@ -1146,8 +1177,9 @@ impl Dashboard {
                 Task::none()
             }
             Message::Nop => Task::none(),
-            Message::SetSelectedRole(role) => {
+            Message::RoleAndPoolLoaded { role, pool } => {
                 self.selected_user_role = role;
+                self.selected_user_roles = pool;
                 Task::none()
             }
             Message::TtsDownloadEvent(event) => self.handle_tts_download_event(event),
@@ -1388,23 +1420,18 @@ impl Dashboard {
                         Message::Home(home::HomeMessage::ClearChat),
                     )];
 
-                // Add role switcher section if a user is selected.
-                // The current role is disabled/grayed out in the menu.
-                // Labels are derived from the canonical role_info().display_label
-                // to prevent drift from the single source of truth.
-                if self.selected_user_name.is_some() {
+                // Add role switcher section if a user is selected and has a
+                // non-empty role pool. The current role is disabled/grayed out
+                // in the menu. Labels are derived from the canonical
+                // role_info().display_label to prevent drift from the single
+                // source of truth.
+                if self.selected_user_name.is_some() && !self.selected_user_roles.is_empty() {
                     chat_items.push(context_menu::MenuItem::disabled("── Role ──".into()));
-                    let switch_roles: [crate::Role; 5] = [
-                        crate::Role::Engineer,
-                        crate::Role::Assistant,
-                        crate::Role::Manager,
-                        crate::Role::Analyst,
-                        crate::Role::Artist,
-                    ];
                     let user_name = self.selected_user_name.clone().unwrap_or_default();
-                    for role in &switch_roles {
-                        let label = crate::role::role_info(role).display_label;
-                        let is_current = self.selected_user_role.as_ref() == Some(role);
+                    let pool = self.selected_user_roles.clone();
+                    for role in pool {
+                        let label = crate::role::role_info(&role).display_label;
+                        let is_current = self.selected_user_role.as_ref() == Some(&role);
                         if is_current {
                             chat_items.push(context_menu::MenuItem::disabled(label.to_string()));
                         } else {
@@ -1412,7 +1439,7 @@ impl Dashboard {
                                 label.to_string(),
                                 Message::Home(home::HomeMessage::SwitchRole(
                                     user_name.clone(),
-                                    *role,
+                                    role,
                                 )),
                             ));
                         }

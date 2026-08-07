@@ -1,6 +1,6 @@
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
 use crate::util::{TELEGRAM_MEDIA_MARKER_RE, parse_media_marker};
-use crate::{Channel, ChannelMessage, SendMessage};
+use crate::{Channel, ChannelMessage, Role, SendMessage};
 use anyhow::Context;
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
@@ -29,8 +29,10 @@ pub const ARCHIVE_COMMAND_DESC: &str = "Archive done & cancelled tickets";
 pub const PAUSE_COMMAND_DESC: &str = "Pause the workspace pipeline";
 /// Description for the `/unpause` command (admin).
 pub const UNPAUSE_COMMAND_DESC: &str = "Resume the workspace pipeline";
-/// Description for the `/maintenance` command (admin).
-pub const MAINTENANCE_COMMAND_DESC: &str = "Toggle workspace maintenance (on|off)";
+/// Description for the `/maintenance_on` command (admin, menu form).
+pub const MAINTENANCE_ON_COMMAND_DESC: &str = "Enable workspace maintenance";
+/// Description for the `/maintenance_off` command (admin, menu form).
+pub const MAINTENANCE_OFF_COMMAND_DESC: &str = "Disable workspace maintenance";
 
 // ── Telegram callback/action button decoding ─────────────────────────
 
@@ -2221,23 +2223,81 @@ async fn post_set_my_commands(
     }
 }
 
-/// (command, description) entries for a user's Telegram command menu,
-/// derived from their current role and admin status. Shared by the
-/// per-chat `setMyCommands` refresh and the `/start` welcome message.
+/// Format one `/board` listing line: bold state, monospace ticket ID, then
+/// the title. Shared by the Telegram `/board` handler and its tests so the
+/// format cannot silently drift between them.
 #[must_use]
-pub async fn user_command_entries(user_name: &str) -> Vec<(&'static str, &'static str)> {
-    let mut entries: Vec<(&'static str, &'static str)> = vec![("clear", CLEAR_COMMAND_DESC)];
-    let role = crate::users::resolve_active_role(user_name).await;
-    if role == crate::Role::Artist {
-        entries.push(("image_models", IMAGE_MODELS_COMMAND_DESC));
-        entries.push(("video_models", VIDEO_MODELS_COMMAND_DESC));
+pub fn format_board_line(phase: &crate::board::TicketPhase, id: &str, title: &str) -> String {
+    format!("• **{}** `{}` {}", phase.display_name(), id, title)
+}
+
+/// (command, description) entries for a user's Telegram command menu,
+/// derived from their role pool, active role, admin status, and the state of
+/// their selected shared workspace. Shared by the per-chat `setMyCommands`
+/// refresh and the `/start` welcome message.
+///
+/// State-aware entries: exactly one of `/pause` or `/unpause` appears (the
+/// one matching the workspace's paused state), and exactly one of
+/// `/maintenance_on` or `/maintenance_off`. Admins without a selected shared
+/// workspace get neither pair (there is no workspace state to reflect).
+#[must_use]
+pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> =
+        vec![("clear".to_string(), CLEAR_COMMAND_DESC.to_string())];
+
+    let pool = crate::users::role_pool(user_name).await;
+    let active_role = crate::users::resolve_active_role_from_pool(user_name, &pool).await;
+
+    // Artist model-selection commands are available whenever Artist is in the
+    // user's pool (they can switch to Artist and use them).
+    if pool.contains(&Role::Artist) {
+        entries.push((
+            "image_models".to_string(),
+            IMAGE_MODELS_COMMAND_DESC.to_string(),
+        ));
+        entries.push((
+            "video_models".to_string(),
+            VIDEO_MODELS_COMMAND_DESC.to_string(),
+        ));
     }
+
+    // Each pool role is a direct command; the active role's entry is marked.
+    for role in &pool {
+        let label = crate::role::role_info(role).display_label;
+        let desc = if Some(*role) == active_role {
+            format!("{label} (current)")
+        } else {
+            label.to_string()
+        };
+        entries.push((role.as_str().to_string(), desc));
+    }
+
     if crate::users::is_admin(user_name).await {
-        entries.push(("board", BOARD_COMMAND_DESC));
-        entries.push(("archive", ARCHIVE_COMMAND_DESC));
-        entries.push(("pause", PAUSE_COMMAND_DESC));
-        entries.push(("unpause", UNPAUSE_COMMAND_DESC));
-        entries.push(("maintenance", MAINTENANCE_COMMAND_DESC));
+        entries.push(("board".to_string(), BOARD_COMMAND_DESC.to_string()));
+        entries.push(("archive".to_string(), ARCHIVE_COMMAND_DESC.to_string()));
+
+        // Workspace-state entries follow the selected shared workspace; a
+        // personal workspace (or lookup failure) omits both pairs.
+        if let Ok(Some(ws_name)) = crate::users::get_raw_selected_workspace(user_name).await
+            && let Ok(Some(ws)) = crate::workspace::get_by_name(&ws_name).await
+        {
+            if ws.paused {
+                entries.push(("unpause".to_string(), UNPAUSE_COMMAND_DESC.to_string()));
+            } else {
+                entries.push(("pause".to_string(), PAUSE_COMMAND_DESC.to_string()));
+            }
+            if ws.maintenance_enabled {
+                entries.push((
+                    "maintenance_off".to_string(),
+                    MAINTENANCE_OFF_COMMAND_DESC.to_string(),
+                ));
+            } else {
+                entries.push((
+                    "maintenance_on".to_string(),
+                    MAINTENANCE_ON_COMMAND_DESC.to_string(),
+                ));
+            }
+        }
     }
     entries
 }

@@ -58,17 +58,6 @@ fn personal_workspace(msg: &ChannelMessage) -> Workspace {
     mahbot::users::personal_workspace_struct(&msg.user_name, &path)
 }
 
-/// Personal workspaces do not support the Manager agent — no board pipeline,
-/// no maintainer. If the role is Manager and we're in a personal workspace,
-/// fall back to Analyst.
-fn resolve_effective_role(role: Role, ws_name: &str) -> Role {
-    if role == Role::Manager && mahbot::users::is_personal_workspace(ws_name) {
-        Role::Analyst
-    } else {
-        role
-    }
-}
-
 /// Handle a dynamic option callback (prefixed `__opt__`).
 ///
 /// Parses the callback data, constructs an injected user message
@@ -635,9 +624,12 @@ async fn handle_bot_command(msg: &ChannelMessage) -> bool {
     match cmd {
         BotCommand::Start => handle_start_command(msg).await,
         BotCommand::Clear => handle_clear_session(msg).await,
-        // Artist-gated commands: denial for non-Artist users.
+        // Artist-gated commands: denial when Artist is not in the user's pool.
         BotCommand::ImageModels | BotCommand::VideoModels => {
-            if mahbot::users::resolve_active_role(&msg.user_name).await == Role::Artist {
+            if mahbot::users::role_pool(&msg.user_name)
+                .await
+                .contains(&Role::Artist)
+            {
                 handle_models_command(msg, cmd == BotCommand::ImageModels).await;
             } else {
                 send_telegram_reply(
@@ -647,12 +639,16 @@ async fn handle_bot_command(msg: &ChannelMessage) -> bool {
                 .await;
             }
         }
+        // Role-switch commands: pool-gated.
+        BotCommand::SwitchRole(role) => handle_role_switch(msg, role).await,
         // Admin-gated commands: denial for non-admin users.
         BotCommand::Board
         | BotCommand::Archive
         | BotCommand::Pause
         | BotCommand::Unpause
-        | BotCommand::Maintenance => {
+        | BotCommand::Maintenance
+        | BotCommand::MaintenanceOn
+        | BotCommand::MaintenanceOff => {
             if mahbot::users::is_admin(&msg.user_name).await {
                 handle_admin_command(msg, cmd).await;
             } else {
@@ -680,6 +676,35 @@ async fn send_telegram_reply(msg: &ChannelMessage, content: String) {
     }
 }
 
+/// Handle a role-switch command (`/role_name`) — pool-gated, persists the
+/// new active role and confirms after a successful switch.
+async fn handle_role_switch(msg: &ChannelMessage, role: Role) {
+    if !mahbot::users::role_pool(&msg.user_name)
+        .await
+        .contains(&role)
+    {
+        send_telegram_reply(
+            msg,
+            format!(
+                "Role '{}' is not in your allowed roles — ask an admin to add it.",
+                role.as_str()
+            ),
+        )
+        .await;
+        return;
+    }
+    match mahbot::users::switch_active_role(&msg.user_name, role).await {
+        Ok(()) => {
+            send_telegram_reply(
+                msg,
+                format!("Active role switched to {}.", role.display_label()),
+            )
+            .await;
+        }
+        Err(e) => send_telegram_reply(msg, format!("Failed to switch role: {e}")).await,
+    }
+}
+
 /// Handle `/start` command for Telegram — sends a per-user welcome message
 /// listing the commands available to the current role/admin state (no inline
 /// keyboard).
@@ -701,19 +726,32 @@ async fn handle_start_command(msg: &ChannelMessage) {
 /// Handle session clearing for `/clear` and the "Clear session" inline button —
 /// deletes the current session and confirms via the canonical delivery path.
 async fn handle_clear_session(msg: &ChannelMessage) {
-    let (ws, role) = tokio::join!(
+    let (ws, pool) = tokio::join!(
         resolve_workspace_for_user(msg),
-        mahbot::users::resolve_active_role(&msg.user_name),
+        mahbot::users::role_pool(&msg.user_name),
     );
+    // Analyst fallback: an empty-pool user has no agent session to clear, so
+    // the clear is a harmless no-op on a non-existent session.
+    let role = mahbot::users::resolve_active_role_from_pool(&msg.user_name, &pool)
+        .await
+        .unwrap_or(Role::Analyst);
     let reply = clear_session(&msg.channel, &msg.user_name, role.as_str(), &ws.name).await;
-    deliver_clear_reply(&reply, msg, &ws, role).await;
+    deliver_clear_reply(&reply, msg, &ws, role, &pool).await;
 }
 
 /// Deliver a session-clear confirmation via the router's raw `reply_target`
 /// path (broadcast + persist + transport), attributing it to the user's
-/// effective role so the bubble matches agent responses.
-async fn deliver_clear_reply(reply: &str, msg: &ChannelMessage, ws: &Workspace, role: Role) {
-    let effective_role = resolve_effective_role(role, &ws.name);
+/// effective role so the bubble matches agent responses. The personal-
+/// workspace Manager→Analyst fallback is pool-clamped (same invariant as
+/// `process_channel_message`).
+async fn deliver_clear_reply(
+    reply: &str,
+    msg: &ChannelMessage,
+    ws: &Workspace,
+    role: Role,
+    pool: &[Role],
+) {
+    let effective_role = mahbot::users::resolve_effective_role(role, &ws.name, pool);
     message_router::deliver_unregistered_user_response(
         reply,
         &message_router::AgentJob {
@@ -885,6 +923,8 @@ async fn handle_admin_command(msg: &ChannelMessage, cmd: mahbot::BotCommand) {
         (BotCommand::Maintenance, Some(enable)) => {
             toggle_workspace_state(msg, &ws_name, enable, true).await;
         }
+        (BotCommand::MaintenanceOn, _) => toggle_workspace_state(msg, &ws_name, true, true).await,
+        (BotCommand::MaintenanceOff, _) => toggle_workspace_state(msg, &ws_name, false, true).await,
         // Impossible: invalid /maintenance args returned early above, and the
         // non-admin commands never reach this handler.
         _ => unreachable!(),
@@ -938,10 +978,12 @@ async fn handle_board_listing(msg: &ChannelMessage, ws_name: &str) {
     }
     // `•` bullet instead of `*` — the listing is rendered through Telegram's
     // markdown→HTML conversion, where a leading `*` would pair with a `*` in
-    // a ticket title and swallow the status/id into an italic span.
+    // a ticket title and swallow the status/id into an italic span. State is
+    // bold, the ticket ID is monospace; each line converts independently, so
+    // markdown-special characters in a title cannot corrupt other lines.
     let listing = ordered
         .iter()
-        .map(|t| format!("• {} {} {}", t.phase.as_ref(), t.id, t.title))
+        .map(|t| mahbot::channels::telegram::format_board_line(&t.phase, &t.id, &t.title))
         .collect::<Vec<_>>()
         .join("\n");
     send_telegram_reply(msg, listing).await;
@@ -1053,16 +1095,20 @@ async fn process_channel_message(mut msg: ChannelMessage) {
         mahbot::util::truncate(&msg.content, 80)
     );
 
-    let (ws, role) = tokio::join!(
+    let (ws, (pool, pool_read_failed)) = tokio::join!(
         resolve_workspace_for_user(&msg),
-        mahbot::users::resolve_active_role(&msg.user_name),
+        mahbot::users::role_pool_status(&msg.user_name),
     );
+    let role = mahbot::users::resolve_active_role_from_pool(&msg.user_name, &pool).await;
 
     // Populate workspace on the message so downstream broadcasts and
     // chat_history writes carry the correct workspace.
     msg.workspace = ws.name.clone();
 
-    let effective_role = resolve_effective_role(role, &ws.name);
+    // Personal workspaces map Manager→Analyst; the pool-clamped helper keeps
+    // the routed role inside the user's pool (a pool without Analyst keeps
+    // Manager — the active role is always one of the pool roles).
+    let effective_role = role.map(|r| mahbot::users::resolve_effective_role(r, &ws.name, &pool));
 
     // Save original content before enrichment so we persist the raw
     // user-typed text to chat_history (avoids storing large data URIs from
@@ -1074,7 +1120,7 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     // of raw `[AUDIO:path]` markers.  Link enrichment runs separately AFTER
     // broadcast to avoid showing AI-generated URL summaries in the user's
     // own message bubble.
-    let strategy = if effective_role.requires_multimodal() {
+    let strategy = if effective_role.is_some_and(|r| r.requires_multimodal()) {
         mahbot::channels::EnrichmentStrategy::Multimodal {
             workspace_path: Some(ws.as_path().to_path_buf()),
         }
@@ -1104,6 +1150,24 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     }
 
     // ── Route through the agent-ID message router ─────────────────
+    // An empty role pool means no role is allowed — the message was still
+    // broadcast/persisted above, but no agent answers. The user notice
+    // fires only for a genuinely empty pool; a transient store read
+    // failure (pool or selected role) drops silently — operator warns
+    // are already logged, and the notice would be misleading.
+    let Some(effective_role) = effective_role else {
+        if msg.channel == "telegram" && !pool_read_failed && pool.is_empty() {
+            send_telegram_reply(
+                &msg,
+                "You have no active role assigned — ask an admin to assign roles \
+                 in Settings → Users."
+                    .to_string(),
+            )
+            .await;
+        }
+        return;
+    };
+
     // Every message resolves to a deterministic agent ID and routes
     // through the per-agent consumer loop.  Different agent IDs get
     // different consumer loops = true parallelism.

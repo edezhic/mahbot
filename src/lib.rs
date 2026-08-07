@@ -66,6 +66,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
+use strum::IntoEnumIterator;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -488,6 +489,12 @@ pub enum BotCommand {
     Unpause,
     /// `/maintenance on|off` — toggle the active workspace's maintainer (admin).
     Maintenance,
+    /// `/maintenance_on` — enable the workspace maintainer (admin, menu form).
+    MaintenanceOn,
+    /// `/maintenance_off` — disable the workspace maintainer (admin, menu form).
+    MaintenanceOff,
+    /// `/role_name` — switch the user's active role (pool-gated).
+    SwitchRole(Role),
 }
 
 /// Parse a Telegram bot text command from message content.
@@ -509,7 +516,14 @@ pub fn parse_bot_command(content: &str) -> Option<BotCommand> {
         "/pause" => Some(BotCommand::Pause),
         "/unpause" => Some(BotCommand::Unpause),
         "/maintenance" => Some(BotCommand::Maintenance),
-        _ => None,
+        "/maintenance_on" => Some(BotCommand::MaintenanceOn),
+        "/maintenance_off" => Some(BotCommand::MaintenanceOff),
+        other => {
+            let name = other.strip_prefix('/')?;
+            Role::iter()
+                .find(|r| r.as_str() == name)
+                .map(BotCommand::SwitchRole)
+        }
     }
 }
 
@@ -1696,6 +1710,28 @@ mod tests {
             ("/maintenance", Some(Maintenance)),
             ("/maintenance on", Some(Maintenance)),
             ("/maintenance off", Some(Maintenance)),
+            // Menu-form maintenance commands (distinct from the typed form)
+            ("/maintenance_on", Some(MaintenanceOn)),
+            ("/MAINTENANCE_ON", Some(MaintenanceOn)),
+            ("/maintenance_on ", Some(MaintenanceOn)),
+            ("/maintenance_off", Some(MaintenanceOff)),
+            ("/Maintenance_Off", Some(MaintenanceOff)),
+            ("/maintenance_off foo", Some(MaintenanceOff)),
+            // Role-switch commands: each pool role is a direct command
+            ("/manager", Some(SwitchRole(Role::Manager))),
+            ("/engineer", Some(SwitchRole(Role::Engineer))),
+            ("/analyst", Some(SwitchRole(Role::Analyst))),
+            ("/coder", Some(SwitchRole(Role::Coder))),
+            ("/qa", Some(SwitchRole(Role::Qa))),
+            ("/reviewer", Some(SwitchRole(Role::Reviewer))),
+            ("/discovery", Some(SwitchRole(Role::Discovery))),
+            ("/artist", Some(SwitchRole(Role::Artist))),
+            ("/maintainer", Some(SwitchRole(Role::Maintainer))),
+            ("/sanitation", Some(SwitchRole(Role::Sanitation))),
+            ("/assistant", Some(SwitchRole(Role::Assistant))),
+            ("/ARTIST", Some(SwitchRole(Role::Artist))),
+            ("/engineer foo", Some(SwitchRole(Role::Engineer))),
+            ("  /coder  ", Some(SwitchRole(Role::Coder))),
             // Negative: partial /-prefix matches
             ("/", None),
             ("/s", None),
@@ -1707,6 +1743,11 @@ mod tests {
             ("/image", None),
             ("/video", None),
             ("/boardx", None),
+            ("/maintenance_onn", None),
+            ("/maintenance_o", None),
+            ("/engineerr", None),
+            ("/managr", None),
+            ("/artiste", None),
             ("/ reset", None),
             // Negative: missing slash or empty
             ("start", None),

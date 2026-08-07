@@ -15,8 +15,8 @@ use crate::config::{CONFIG, ConfigData, ModelRouting, RoleConfig};
 use strum::{EnumCount, IntoEnumIterator};
 
 use iced::widget::{
-    Column, Row, Space, button, column, container, mouse_area, pick_list, row, scrollable, slider,
-    stack, text, text_editor, text_input, toggler, tooltip,
+    Checkbox, Column, Row, Space, button, column, container, mouse_area, pick_list, row,
+    scrollable, slider, stack, text, text_editor, text_input, toggler, tooltip,
 };
 use iced::{Alignment, Element, Length, Task};
 
@@ -289,6 +289,8 @@ pub enum SettingsMessage {
     /// Add-user modal fields.
     AddUserSender(String),
     AddUserPermissions(String),
+    /// Toggle a role checkbox in the add-user modal (index into [`Role::iter`]).
+    AddUserRoleToggle(usize),
     /// Submit the add-user modal.
     SubmitAddUser,
     /// Result of user add.
@@ -373,6 +375,8 @@ pub struct SettingsState {
     add_user_sender: String,
     /// Permissions field in the add-user modal.
     add_user_permissions: String,
+    /// Role checkboxes in the add-user modal, indexed by [`Role::iter`].
+    add_user_roles: Vec<bool>,
     /// Whether the add-user operation is in flight.
     add_user_adding: bool,
 
@@ -427,6 +431,7 @@ impl SettingsState {
             show_add_user_modal: false,
             add_user_sender: String::new(),
             add_user_permissions: String::new(),
+            add_user_roles: Vec::new(),
             add_user_adding: false,
             model_picker_inputs: [const { String::new() }; ModelPickerTarget::COUNT],
             voice_toggle_gen: 0,
@@ -454,6 +459,7 @@ impl SettingsState {
         self.show_add_user_modal = false;
         self.add_user_sender.clear();
         self.add_user_permissions.clear();
+        self.add_user_roles.clear();
         self.add_user_adding = false;
     }
 
@@ -754,7 +760,10 @@ impl SettingsState {
 
             SettingsMessage::ToggleAddUserModal => {
                 self.show_add_user_modal = !self.show_add_user_modal;
-                if !self.show_add_user_modal {
+                if self.show_add_user_modal {
+                    // Fresh checkbox state: all unchecked.
+                    self.add_user_roles = Role::iter().map(|_| false).collect();
+                } else {
                     self.close_add_user_modal();
                 }
                 Task::none()
@@ -767,10 +776,21 @@ impl SettingsState {
                 self.add_user_permissions = v;
                 Task::none()
             }
+            SettingsMessage::AddUserRoleToggle(idx) => {
+                if let Some(checked) = self.add_user_roles.get_mut(idx) {
+                    *checked = !*checked;
+                }
+                Task::none()
+            }
             SettingsMessage::SubmitAddUser => {
                 if self.add_user_sender.is_empty() {
                     return Task::none();
                 }
+                let roles: Vec<Role> = Role::iter()
+                    .zip(self.add_user_roles.iter())
+                    .filter(|(_, checked)| **checked)
+                    .map(|(r, _)| r)
+                    .collect();
                 self.add_user_adding = true;
                 let sender = self.add_user_sender.clone();
                 let permissions = if self.add_user_permissions.is_empty() {
@@ -782,7 +802,7 @@ impl SettingsState {
                     async move {
                         let store = users::user_store()?;
                         store
-                            .add_user(&sender, permissions.as_deref())
+                            .add_user(&sender, permissions.as_deref(), &roles)
                             .await
                             .map_err(|e| e.to_string())?;
                         Ok(())
@@ -1492,25 +1512,65 @@ impl SettingsState {
                                 .align_x(Alignment::Start)
                                 .align_y(Alignment::Center)
                             },
-                            // Role column (FillPortion: 15)
+                            // Role column (FillPortion: 15) — active role
+                            // picker (pool-restricted) + pool editor button
                             {
-                                let role_selected = user
-                                    .selected_role
-                                    .as_ref()
-                                    .and_then(|name| {
-                                        us.role_options.iter().find(|o| o.value == *name)
-                                    })
-                                    .cloned();
+                                let role_picker: Element<'_, SettingsMessage> =
+                                    match us.active_role_options.get(&user.name) {
+                                        Some(options) if !options.is_empty() => {
+                                            let role_selected = user
+                                                .selected_role
+                                                .as_ref()
+                                                .and_then(|name| {
+                                                    options.iter().find(|o| o.value == *name)
+                                                })
+                                                .cloned()
+                                                .or_else(|| {
+                                                    // No (or stale) stored selection —
+                                                    // mirror resolve_active_role's default:
+                                                    // Analyst when in the pool, else the
+                                                    // first pool role.
+                                                    options
+                                                        .iter()
+                                                        .find(|o| o.value == "analyst")
+                                                        .or_else(|| options.first())
+                                                        .cloned()
+                                                });
+                                            pick_list(options.as_slice(), role_selected, |opt| {
+                                                SettingsMessage::UserMsg(
+                                                    users::UsersMessage::UpdateRole(
+                                                        user.name.clone(),
+                                                        opt.value,
+                                                    ),
+                                                )
+                                            })
+                                            .style(widgets::pick_list_style)
+                                            .padding([4, 8])
+                                            .width(Length::Fixed(150.0))
+                                            .into()
+                                        }
+                                        _ => text("none").size(12).color(theme::TEXT_MUTED).into(),
+                                    };
                                 container(
-                                    pick_list(us.role_options.as_slice(), role_selected, |opt| {
-                                        SettingsMessage::UserMsg(users::UsersMessage::UpdateRole(
-                                            user.name.clone(),
-                                            opt.value,
-                                        ))
-                                    })
-                                    .style(widgets::pick_list_style)
-                                    .padding([4, 8])
-                                    .width(Length::Fixed(200.0)),
+                                    row![
+                                        role_picker,
+                                        Space::new().width(4),
+                                        button(
+                                            lucide::pencil_line::<iced::Theme, iced::Renderer>()
+                                                .size(15)
+                                                .color(theme::TEXT_MUTED),
+                                        )
+                                        .style(theme::button_text)
+                                        .padding(2)
+                                        .on_press(
+                                            SettingsMessage::UserMsg(
+                                                users::UsersMessage::OpenPoolEdit(
+                                                    user.name.clone()
+                                                ),
+                                            )
+                                        ),
+                                    ]
+                                    .align_y(Alignment::Center),
                                 )
                                 .width(Length::FillPortion(15))
                                 .align_x(Alignment::Start)
@@ -1677,6 +1737,12 @@ impl SettingsState {
         } else if self.show_add_user_modal {
             let dialog = self.add_user_dialog();
             modal_with_backdrop(dialog, SettingsMessage::ToggleAddUserModal)
+        } else if let Some(ref pool_user) = self.users_state.pool_edit_target {
+            let dialog = self.pool_edit_dialog(pool_user);
+            modal_with_backdrop(
+                dialog,
+                SettingsMessage::UserMsg(users::UsersMessage::ClosePoolEdit),
+            )
         } else if let Some(ref diag_ws_name) = self.workspaces_state.diagnostics_modal {
             let dialog = self.diagnostics_dialog(diag_ws_name);
             modal_with_backdrop(
@@ -1687,6 +1753,62 @@ impl SettingsState {
             // Keep Stack widget type stable
             iced::widget::stack([widget_helpers::empty_stack_placeholder()]).into()
         }
+    }
+
+    /// Build the role-pool editor modal for a user.
+    fn pool_edit_dialog(&self, user_name: &str) -> Element<'_, SettingsMessage> {
+        let checked = &self.users_state.pool_edit_checked;
+        let mut col = Column::new().padding(24);
+        col = col.push(
+            text(format!("Edit roles — {user_name}"))
+                .size(16)
+                .color(theme::TEXT_PRIMARY)
+                .font(theme::FONT_BOLD),
+        );
+        col = col.push(Space::new().height(16));
+        col = col.push(
+            text("Unchecking every role stops agent answers until a role is assigned.")
+                .size(12)
+                .color(theme::TEXT_MUTED),
+        );
+        col = col.push(Space::new().height(8));
+
+        let role_checks: Vec<Element<'_, SettingsMessage>> = Role::iter()
+            .enumerate()
+            .map(|(i, role)| {
+                let is_checked = checked.get(i).copied().unwrap_or(false);
+                let label = crate::role::role_info(&role).display_label;
+                Checkbox::new(is_checked)
+                    .label(label)
+                    .on_toggle(move |_| {
+                        SettingsMessage::UserMsg(users::UsersMessage::TogglePoolRole(i))
+                    })
+                    .into()
+            })
+            .collect();
+        col = col.push(Row::with_children(role_checks).spacing(6).wrap());
+
+        col = col.push(Space::new().height(16));
+        col = col.push(
+            row![
+                Space::new().width(Length::Fill),
+                button(text("Cancel").size(13))
+                    .style(theme::button_secondary)
+                    .on_press(SettingsMessage::UserMsg(users::UsersMessage::ClosePoolEdit)),
+                Space::new().width(8),
+                button(text("Save").size(13))
+                    .style(theme::button_primary)
+                    .on_press(SettingsMessage::UserMsg(
+                        users::UsersMessage::SubmitPoolEdit(user_name.to_string(),)
+                    )),
+            ]
+            .align_y(Alignment::Center),
+        );
+
+        container(col)
+            .width(Length::Fixed(620.0))
+            .style(theme::dialog_container_style)
+            .into()
     }
 
     /// Build the add-workspace modal dialog content.
@@ -1716,27 +1838,90 @@ impl SettingsState {
 
     /// Build the add-user modal dialog content.
     fn add_user_dialog(&self) -> Element<'_, SettingsMessage> {
-        modal_dialog(
-            "Add User",
-            &[
-                DialogField {
-                    label: "Name",
-                    placeholder: "user name",
-                    value: &self.add_user_sender,
-                    on_input: SettingsMessage::AddUserSender,
-                },
-                DialogField {
-                    label: "Permissions",
-                    placeholder: "optional",
-                    value: &self.add_user_permissions,
-                    on_input: SettingsMessage::AddUserPermissions,
-                },
-            ],
-            self.add_user_adding,
-            !self.add_user_sender.is_empty(),
-            SettingsMessage::ToggleAddUserModal,
-            SettingsMessage::SubmitAddUser,
-        )
+        let any_role_checked = self.add_user_roles.iter().any(|c| *c);
+        let mut col = Column::new().padding(24);
+
+        col = col.push(
+            text("Add User")
+                .size(16)
+                .color(theme::TEXT_PRIMARY)
+                .font(theme::FONT_BOLD),
+        );
+        col = col.push(Space::new().height(16));
+        col = col.push(field_row(
+            "Name",
+            text_input("user name", &self.add_user_sender)
+                .on_input(SettingsMessage::AddUserSender)
+                .style(widgets::text_input_style)
+                .width(Length::Fixed(375.0))
+                .into(),
+            None,
+        ));
+        col = col.push(Space::new().height(8));
+        col = col.push(field_row(
+            "Permissions",
+            text_input("optional", &self.add_user_permissions)
+                .on_input(SettingsMessage::AddUserPermissions)
+                .style(widgets::text_input_style)
+                .width(Length::Fixed(375.0))
+                .into(),
+            None,
+        ));
+
+        // Role pool checkboxes — at least one must be checked.
+        col = col.push(Space::new().height(16));
+        col = col.push(
+            text("Allowed roles (at least one required)")
+                .size(12)
+                .color(theme::TEXT_MUTED),
+        );
+        let role_checks: Vec<Element<'_, SettingsMessage>> = Role::iter()
+            .enumerate()
+            .map(|(i, role)| {
+                let checked = self.add_user_roles.get(i).copied().unwrap_or(false);
+                let label = crate::role::role_info(&role).display_label;
+                Checkbox::new(checked)
+                    .label(label)
+                    .on_toggle(move |_| SettingsMessage::AddUserRoleToggle(i))
+                    .into()
+            })
+            .collect();
+        col = col.push(Row::with_children(role_checks).spacing(6).wrap());
+        col = col.push(Space::new().height(8));
+
+        col = col.push(Space::new().height(16));
+        col = col.push(
+            row![
+                Space::new().width(Length::Fill),
+                button(text("Cancel").size(13))
+                    .style(theme::button_secondary)
+                    .on_press(SettingsMessage::ToggleAddUserModal),
+                Space::new().width(8),
+                button(
+                    text(if self.add_user_adding {
+                        "Adding..."
+                    } else {
+                        "Add"
+                    })
+                    .size(13),
+                )
+                .style(theme::button_primary)
+                .on_press_maybe(
+                    if self.add_user_adding || self.add_user_sender.is_empty() || !any_role_checked
+                    {
+                        None
+                    } else {
+                        Some(SettingsMessage::SubmitAddUser)
+                    }
+                ),
+            ]
+            .align_y(Alignment::Center),
+        );
+
+        container(col)
+            .width(Length::Fixed(620.0))
+            .style(theme::dialog_container_style)
+            .into()
     }
 
     /// Build the diagnostics modal dialog content for the given workspace.

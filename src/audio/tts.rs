@@ -519,8 +519,9 @@ pub fn init_listener() {
                     content,
                     ..
                 }) if is_enabled() => {
-                    let active_role = crate::users::resolve_active_role(&user_name).await;
-                    if active_role.as_str() == role_name.as_str() {
+                    if let Some(active_role) = crate::users::resolve_active_role(&user_name).await
+                        && active_role.as_str() == role_name.as_str()
+                    {
                         speak(&content);
                     }
                 }
@@ -1834,6 +1835,8 @@ async fn wait_for_sink(sink: &Sink, cancel_rx: Option<&mut broadcast::Receiver<(
 mod tests {
     use super::*;
 
+    use strum::IntoEnumIterator;
+
     #[test]
     fn test_has_ending_punctuation() {
         // Sentence-ending punctuation detected
@@ -2441,8 +2444,17 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(tts)]
     async fn test_init_listener_dispatches_speak() {
-        // Initialize test stores so resolve_active_role defaults are available
+        // Initialize test stores and give the broadcast user a role pool
+        // with Analyst active (matching the broadcast event below).
         crate::util::test::init_test_stores().await;
+        let all_roles = crate::Role::iter().collect::<Vec<_>>();
+        crate::users::store()
+            .add_user("testuser", None, &all_roles)
+            .await
+            .expect("add_user");
+        crate::users::switch_active_role("testuser", crate::Role::Analyst)
+            .await
+            .expect("switch_active_role");
 
         // Set up CHAT_BROADCAST (idempotent — safe to call from parallel tests)
         crate::CHAT_BROADCAST.get_or_init(|| {
