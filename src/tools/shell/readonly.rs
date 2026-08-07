@@ -3585,55 +3585,169 @@ fn mktemp_binding(value: &str, state: &ValidationState) -> Option<VarBinding> {
 
 // ── Git-specific checks ──────────────────────────────────────────────────
 
-/// Mutation flags/verbs for `git branch` (any of these makes the command mutating).
-///
-/// NOTE: `-f`/`--force` bypasses safety checks (force-create / force-delete).
-///       `-u`/`--set-upstream-to` sets upstream tracking (requires force with `-f`).
-///       `-t` sets upstream tracking; `--unset-upstream` removes it (config write).
-///       `--set-upstream-to=value` notation is also caught via prefix matching.
-///       `--track`/`--no-track` create tracking branches or override config.
-const GIT_BRANCH_MUTATIONS: &[&str] = &[
-    "-d",
-    "-D",
-    "-m",
-    "-M",
-    "-c",
-    "-C",
-    "-f",
-    "--force",
-    "-u",
-    "-t",
-    "--set-upstream-to",
-    "--unset-upstream",
-    "--track",
-    "--no-track",
-    "--delete",
-    "--move",
-    "--copy",
-    "--edit-description",
+/// Classification of a single `git branch`/`git tag` option (tables verified
+/// against git 2.50.1). Unknown/ambiguous long prefixes and unknown short
+/// flags fail closed: they are treated as [`RefOpt::Plain`] (create-active),
+/// so a bare word after them is a ref name and rejects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefOpt {
+    /// No value; does not trigger list mode. A bare word after it is a ref name.
+    Plain,
+    /// Optional `=value` only — a space-separated value is NOT consumed and
+    /// becomes a bare ref name. Does not trigger list mode.
+    OptVal,
+    /// Required value — consumes the next token unconditionally (even when
+    /// dash-prefixed). Does not trigger list mode.
+    Val,
+    /// List-mode trigger — positionals become patterns (no name check).
+    List,
+    /// Required value + list-mode trigger.
+    ListVal,
+    /// List-mode trigger with an OPTIONAL attached value (`tag -n5`); a
+    /// space value is NOT consumed.
+    ListOptVal,
+    /// Tag verify mode — positionals are read-only verify targets.
+    Verify,
+    /// Mutates a ref — rejected regardless of position or list mode.
+    Mutation,
+}
+
+/// `git branch` long options (git 2.50.1). Negated forms of value-taking
+/// options consume no value (verified: `--no-sort foo` creates `foo`), so
+/// they classify as [`RefOpt::Plain`] except the real `--no-merged`/
+/// `--no-contains` flags. The deprecated `--set-upstream` alias is covered by
+/// prefix-abbreviation to `--set-upstream-to` (git rejects it at runtime).
+const GIT_BRANCH_OPTS: &[(&str, RefOpt)] = &[
+    ("--verbose", RefOpt::Plain),
+    ("--no-verbose", RefOpt::Plain),
+    ("--quiet", RefOpt::Plain),
+    ("--no-quiet", RefOpt::Plain),
+    ("--track", RefOpt::Mutation),
+    ("--no-track", RefOpt::Plain),
+    ("--set-upstream-to", RefOpt::Mutation),
+    ("--no-set-upstream-to", RefOpt::Plain),
+    ("--unset-upstream", RefOpt::Mutation),
+    ("--no-unset-upstream", RefOpt::Plain),
+    ("--color", RefOpt::OptVal),
+    ("--no-color", RefOpt::Plain),
+    ("--remotes", RefOpt::Plain),
+    ("--contains", RefOpt::ListVal),
+    ("--no-contains", RefOpt::ListVal),
+    ("--abbrev", RefOpt::OptVal),
+    ("--no-abbrev", RefOpt::Plain),
+    ("--all", RefOpt::Plain),
+    ("--delete", RefOpt::Mutation),
+    ("--no-delete", RefOpt::Plain),
+    ("--move", RefOpt::Mutation),
+    ("--no-move", RefOpt::Plain),
+    ("--omit-empty", RefOpt::Plain),
+    ("--no-omit-empty", RefOpt::Plain),
+    ("--copy", RefOpt::Mutation),
+    ("--no-copy", RefOpt::Plain),
+    ("--list", RefOpt::List),
+    ("--no-list", RefOpt::Plain),
+    ("--show-current", RefOpt::Plain),
+    ("--no-show-current", RefOpt::Plain),
+    ("--create-reflog", RefOpt::Plain),
+    ("--no-create-reflog", RefOpt::Plain),
+    ("--edit-description", RefOpt::Mutation),
+    ("--no-edit-description", RefOpt::Plain),
+    ("--force", RefOpt::Mutation),
+    ("--no-force", RefOpt::Plain),
+    ("--merged", RefOpt::ListVal),
+    ("--no-merged", RefOpt::ListVal),
+    ("--column", RefOpt::OptVal),
+    ("--no-column", RefOpt::Plain),
+    ("--sort", RefOpt::Val),
+    ("--no-sort", RefOpt::Plain),
+    ("--points-at", RefOpt::ListVal),
+    ("--no-points-at", RefOpt::Plain),
+    ("--ignore-case", RefOpt::Plain),
+    ("--no-ignore-case", RefOpt::Plain),
+    ("--recurse-submodules", RefOpt::Plain),
+    ("--no-recurse-submodules", RefOpt::Plain),
+    ("--format", RefOpt::Val),
+    ("--no-format", RefOpt::Plain),
 ];
 
-/// Mutation flags for `git tag` (any of these makes the command mutating).
-///
-/// NOTE: `-f`/`--force` bypasses safety checks (force-create / force-delete / force-replace).
-///       `-m`/`--message`, `-F`/`--file`, and `-e`/`--edit` attach or edit tag messages.
-const GIT_TAG_MUTATIONS: &[&str] = &[
-    "-d",
-    "--delete",
-    "-a",
-    "-s",
-    "-u",
-    "-f",
-    "--force",
-    "-m",
-    "--message",
-    "-F",
-    "--file",
-    "-e",
-    "--edit",
-    "--annotate",
-    "--sign",
-    "--local-user",
+/// `git branch` short flags (git 2.50.1).
+const GIT_BRANCH_SHORTS: &[(char, RefOpt)] = &[
+    ('v', RefOpt::Plain),    // verbose — create-active
+    ('q', RefOpt::Plain),    // quiet
+    ('t', RefOpt::Mutation), // track
+    ('u', RefOpt::Mutation), // set-upstream-to
+    ('r', RefOpt::Plain),    // remotes — list-only, create-active with a name
+    ('a', RefOpt::Plain),    // all
+    ('d', RefOpt::Mutation),
+    ('D', RefOpt::Mutation),
+    ('m', RefOpt::Mutation),
+    ('M', RefOpt::Mutation),
+    ('c', RefOpt::Mutation),
+    ('C', RefOpt::Mutation),
+    ('l', RefOpt::List),
+    ('f', RefOpt::Mutation),
+    ('i', RefOpt::Plain), // ignore-case
+];
+
+/// `git tag` long options (git 2.50.1). `--no-message`/`--no-list` are unknown
+/// in git (fail-closed Plain); every accepted `--no-*` negation consumes no
+/// value and is create-active.
+const GIT_TAG_OPTS: &[(&str, RefOpt)] = &[
+    ("--list", RefOpt::List),
+    ("--verify", RefOpt::Verify),
+    ("--annotate", RefOpt::Mutation),
+    ("--no-annotate", RefOpt::Plain),
+    ("--message", RefOpt::Mutation),
+    ("--file", RefOpt::Mutation),
+    ("--no-file", RefOpt::Plain),
+    ("--trailer", RefOpt::Mutation),
+    ("--edit", RefOpt::Mutation),
+    ("--no-edit", RefOpt::Plain),
+    ("--sign", RefOpt::Mutation),
+    ("--no-sign", RefOpt::Plain),
+    ("--cleanup", RefOpt::Mutation),
+    ("--no-cleanup", RefOpt::Plain),
+    ("--local-user", RefOpt::Mutation),
+    ("--no-local-user", RefOpt::Plain),
+    ("--force", RefOpt::Mutation),
+    ("--no-force", RefOpt::Plain),
+    ("--create-reflog", RefOpt::Plain),
+    ("--no-create-reflog", RefOpt::Plain),
+    ("--column", RefOpt::OptVal),
+    ("--no-column", RefOpt::Plain),
+    ("--contains", RefOpt::ListVal),
+    ("--no-contains", RefOpt::ListVal),
+    ("--merged", RefOpt::ListVal),
+    ("--no-merged", RefOpt::ListVal),
+    ("--omit-empty", RefOpt::Plain),
+    ("--no-omit-empty", RefOpt::Plain),
+    ("--sort", RefOpt::Val),
+    ("--no-sort", RefOpt::Plain),
+    ("--points-at", RefOpt::ListVal),
+    ("--no-points-at", RefOpt::Plain),
+    ("--format", RefOpt::Val),
+    ("--no-format", RefOpt::Plain),
+    ("--color", RefOpt::OptVal),
+    ("--no-color", RefOpt::Plain),
+    ("--ignore-case", RefOpt::Plain),
+    ("--no-ignore-case", RefOpt::Plain),
+    ("--delete", RefOpt::Mutation),
+];
+
+/// `git tag` short flags (git 2.50.1).
+const GIT_TAG_SHORTS: &[(char, RefOpt)] = &[
+    ('l', RefOpt::List),
+    ('n', RefOpt::ListOptVal),
+    ('d', RefOpt::Mutation),
+    ('v', RefOpt::Verify),
+    ('a', RefOpt::Mutation),
+    ('m', RefOpt::Mutation),
+    ('F', RefOpt::Mutation),
+    ('e', RefOpt::Mutation),
+    ('s', RefOpt::Mutation),
+    ('u', RefOpt::Mutation),
+    ('f', RefOpt::Mutation),
+    ('i', RefOpt::Plain),
 ];
 
 /// Mutation verbs for `git remote` (any of these makes the command mutating).
@@ -4151,10 +4265,8 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
 
     // Additional mutation-flag checks for branch/tag/remote/hash-object/reflog/fsck
     match matched_safe {
-        Some("branch") => {
-            check_git_subcommand_mutation(&subcommand, "branch", GIT_BRANCH_MUTATIONS)?;
-        }
-        Some("tag") => check_git_subcommand_mutation(&subcommand, "tag", GIT_TAG_MUTATIONS)?,
+        Some("branch") => check_git_ref_subcommand(&subcommand, "branch")?,
+        Some("tag") => check_git_ref_subcommand(&subcommand, "tag")?,
         Some("remote") => {
             check_git_subcommand_mutation(&subcommand, "remote", GIT_REMOTE_MUTATIONS)?;
         }
@@ -4219,50 +4331,164 @@ fn matches_mutation_token(word: &str, tokens: &[&str]) -> bool {
             .any(|t| word.strip_prefix(t).is_some_and(|r| r.starts_with('=')))
 }
 
-/// For a matched git subcommand, check for mutation flags/verbs across all
-/// argument positions.
+/// Resolve a long branch/tag option token (with optional `=value`) against
+/// `table`, honoring git's unambiguous-prefix abbreviation. Returns `None`
+/// for unknown or ambiguous prefixes (fail closed — create-active).
+fn resolve_ref_long_opt(token: &str, table: &[(&str, RefOpt)]) -> Option<RefOpt> {
+    let base = token.split('=').next().unwrap_or(token);
+    let mut matches = table.iter().filter(|(name, _)| name.starts_with(base));
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None; // ambiguous abbreviation — git errors; fail closed
+    }
+    Some(first.1)
+}
+
+/// True when `word` (shell-normalized) is a branch/tag mutation token: a
+/// long option resolving to [`RefOpt::Mutation`] (exact, `=value`, or
+/// unambiguous abbreviation), or a single-dash cluster containing a mutation
+/// short char. Runs on every token regardless of option-value consumption
+/// (`git branch --merged -d` must still reject; `git branch --sort -d foo`
+/// likewise).
+fn is_ref_mutation_word(word: &str, table: &[(&str, RefOpt)], shorts: &[(char, RefOpt)]) -> bool {
+    if let Some(stripped) = word.strip_prefix("--") {
+        return !stripped.is_empty() && resolve_ref_long_opt(word, table) == Some(RefOpt::Mutation);
+    }
+    if word.len() > 1 && word.starts_with('-') {
+        return shorts
+            .iter()
+            .any(|(c, kind)| *kind == RefOpt::Mutation && word[1..].contains(*c));
+    }
+    false
+}
+
+/// Check a `git branch`/`git tag` subcommand against the git 2.50.1 option
+/// tables for ref mutations and ref-name creation.
 ///
-/// **Flag-based tokens** (those starting with `-`) are checked in all argument
-/// positions — a flag like `-d` or `--delete` can never appear as a legitimate
-/// branch or tag name.
+/// Single left-to-right pass over the tokens (mirroring the
+/// [`scan_push_clean_tokens`] value-consumption pattern):
+/// - Every token is scanned for mutation tokens first — even when git
+///   consumes it as an option value (`git branch --merged -d` must reject).
+/// - Required-value options consume the next token unconditionally (even
+///   dash-prefixed); a consumed token never triggers list mode
+///   (`git branch --sort --list foo` creates `foo`).
+/// - Optional-value options consume only their `=value` form; a space value
+///   becomes a bare ref name (`git branch --abbrev 10` creates `10`).
+/// - `--` and `--end-of-options` end option parsing; remaining tokens are
+///   positionals (patterns under list/verify mode, ref names otherwise).
+/// - At the end: verify mode, list mode, or no bare positional → read-only;
+///   otherwise a bare positional is a ref name → reject.
+fn check_git_ref_subcommand(subcommand: &str, sub: &str) -> Result<(), String> {
+    let (table, shorts) = match sub {
+        "branch" => (GIT_BRANCH_OPTS, GIT_BRANCH_SHORTS),
+        _ => (GIT_TAG_OPTS, GIT_TAG_SHORTS),
+    };
+    // Quote-aware like scan_push_clean_tokens: `--format "%(refname) %(objectname)"`
+    // must stay one value token, not split mid-value into a fake ref name.
+    let words = split_words_keeping_substitutions(subcommand);
+    let mut list = false;
+    let mut verify = false;
+    let mut saw_name = false;
+    let mut after_sep = false;
+    let mut consume_next = false;
+    for raw in words.iter().skip(1) {
+        let w = shell_word(raw);
+        if is_ref_mutation_word(&w, table, shorts) {
+            return Err(format!(
+                "⚠️ Read-only mode: `git {subcommand}` is not allowed — it mutates.\n\
+                 Suggestion: use `git {sub}` without mutation flags to list/inspect."
+            ));
+        }
+        if consume_next {
+            consume_next = false;
+            continue; // git consumes this token as an option value
+        }
+        if after_sep {
+            saw_name = true;
+            continue; // post-separator tokens are positionals (still mutation-scanned above)
+        }
+        if w == "--" || w == "--end-of-options" {
+            after_sep = true;
+            continue;
+        }
+        if let Some(kind) = resolve_ref_long_opt(&w, table) {
+            match kind {
+                RefOpt::Plain | RefOpt::OptVal => {}
+                RefOpt::Val => {
+                    if !w.contains('=') {
+                        consume_next = true;
+                    }
+                }
+                RefOpt::List | RefOpt::ListOptVal => list = true, // ListOptVal is short-only
+                RefOpt::ListVal => {
+                    list = true;
+                    if !w.contains('=') {
+                        consume_next = true;
+                    }
+                }
+                RefOpt::Verify => verify = true,
+                RefOpt::Mutation => unreachable!("mutation scan rejects mutation tokens first"),
+            }
+        } else if w.starts_with("--") {
+            // Unknown/ambiguous long option — git errors at runtime; fail
+            // closed: no list mode, no value consumption, so a following bare
+            // word is a ref name.
+        } else if w.starts_with('-') && w.len() > 1 {
+            let b = w.as_bytes();
+            let mut k = 1;
+            while k < b.len() {
+                let c = b[k] as char;
+                match shorts
+                    .iter()
+                    .find(|(ch, _)| *ch == c)
+                    .map(|(_, kind)| *kind)
+                {
+                    Some(RefOpt::List) => list = true,
+                    Some(RefOpt::ListOptVal) => {
+                        list = true;
+                        if k + 1 < b.len() {
+                            break; // rest of token is the attached value
+                        }
+                    }
+                    Some(RefOpt::Verify) => verify = true,
+                    Some(RefOpt::Mutation) => {
+                        unreachable!("mutation scan rejects mutation tokens first")
+                    }
+                    _ => {} // Plain or unknown short — fail closed (create-active)
+                }
+                k += 1;
+            }
+        } else {
+            saw_name = true;
+        }
+    }
+    if verify || list || !saw_name {
+        return Ok(());
+    }
+    Err(format!(
+        "⚠️ Read-only mode: `git {subcommand}` is not allowed — it would create a {sub}.\n\
+         Suggestion: use `git {sub} --list` or `git {sub} --merged` to list existing ones."
+    ))
+}
+
+/// For a matched git subcommand, check for mutation verbs across all
+/// argument positions (used for `git remote`).
 ///
-/// **Bare-word tokens** (remote verbs like `add`, `remove`, `prune`) are checked
-/// only at the first non-flag argument position. They cannot be safely checked
-/// in all positions because they can collide with legitimate names — e.g.,
-/// `git remote show add` is a valid read-only command where `add` is a remote
-/// name, not a mutation verb.
-///
-/// For `branch` and `tag`: also rejects any bare (non-flag) first argument
-/// (e.g., `git branch my-feature` or `git tag v1.0`), since these create
-/// branches/tags rather than listing them.
-///
-/// Handles both exact flag matches and `flag=value` notation (e.g.,
-/// `--set-upstream-to=origin/main`).
+/// **Bare-word tokens** (remote verbs like `add`, `remove`, `prune`) are
+/// checked only at the first non-flag argument position. They cannot be
+/// safely checked in all positions because they can collide with legitimate
+/// names — e.g., `git remote show add` is a valid read-only command where
+/// `add` is a remote name, not a mutation verb.
 ///
 /// `subcommand` is the pre-extracted subcommand from [`extract_git_subcommand`]
-/// (e.g., `"branch -d feature"`).
+/// (e.g., `"remote -v update"`).
 fn check_git_subcommand_mutation(
     subcommand: &str,
     subcommand_name: &str,
     mutation_tokens: &[&str],
 ) -> Result<(), String> {
     let words: Vec<&str> = subcommand.split_whitespace().collect();
-    // words[0] is the subcommand name (e.g., "branch")
-
-    // ── Name-creation check (branch/tag only) ──
-    // Check if the first argument creates a new branch/tag by name.
-    // This check stays on the first argument only — a bare name like
-    // "feature" always creates, regardless of later positions.
-    if let Some(first_arg) = words.get(1) {
-        let is_name_creation = (subcommand_name == "branch" || subcommand_name == "tag")
-            && !first_arg.starts_with('-');
-        if is_name_creation {
-            return Err(format!(
-                "⚠️ Read-only mode: `git {subcommand}` is not allowed — it would create a {subcommand_name}.\n\
-                 Suggestion: use `git {subcommand_name} --list` or `git {subcommand_name} --merged` to list existing ones."
-            ));
-        }
-    }
+    // words[0] is the subcommand name (e.g., "remote")
 
     // Partition mutation tokens into flag-based and bare-word.
     let (flag_tokens, bare_tokens): (Vec<&str>, Vec<&str>) = mutation_tokens
@@ -4270,11 +4496,6 @@ fn check_git_subcommand_mutation(
         .copied()
         .partition(|t| t.starts_with('-'));
 
-    // Short mutation chars derived from the constant (branch: d/D/m/M/c/C/f/u/t,
-    // tag: d/a/s/u/f/m/F/e). Every value-taking short flag for these two
-    // subcommands (-u for branch; -m/-F/-u for tag) is itself a mutation char,
-    // so no attached value can hide a mutation char inside a cluster
-    // (`-uorigin/main`, `-am`, `-cv`).
     let short_chars: Vec<char> = flag_tokens
         .iter()
         .filter_map(|t| {
@@ -4284,11 +4505,6 @@ fn check_git_subcommand_mutation(
         .collect();
 
     // ── Flag-based mutation token check (all positions) ──
-    // Tokens starting with `-` are safe to check in every argument position
-    // because flags like `-d` or `--delete` can never be legitimate names.
-    // Long flags match exactly (including `flag=value`); single-dash flags
-    // match any mutation char inside the combined cluster (`-df`, `-mv`,
-    // `-am`), with quote/backslash normalization (`'-df'`).
     for arg in words.iter().skip(1) {
         let a = shell_word(arg);
         if !a.starts_with('-') {
@@ -5176,20 +5392,40 @@ mod tests {
         assert_all_rejected(MUTATING_COMMANDS, |cmd| format!("{cmd} /etc/blocked_test"));
     }
 
-    /// Tests that all git branch mutation flags are rejected via
-    /// [`check_git_subcommand_mutation`].
+    /// Tests that all git branch mutation options (long + short, from the
+    /// git 2.50.1 table) are rejected via [`check_git_ref_subcommand`],
+    /// including their `=value` forms.
     #[test]
     fn git_branch_mutation_flags_rejected() {
-        assert_all_rejected(GIT_BRANCH_MUTATIONS, |flag| {
-            format!("git branch {flag} feature")
-        });
+        for &(flag, kind) in GIT_BRANCH_OPTS {
+            if kind == RefOpt::Mutation {
+                assert_rejected(&format!("git branch {flag} feature"));
+                assert_rejected(&format!("git branch {flag}=x feature"));
+            }
+        }
+        for &(flag, kind) in GIT_BRANCH_SHORTS {
+            if kind == RefOpt::Mutation {
+                assert_rejected(&format!("git branch -{flag} feature"));
+            }
+        }
     }
 
-    /// Tests that all git tag mutation flags are rejected via
-    /// [`check_git_subcommand_mutation`].
+    /// Tests that all git tag mutation options (long + short, from the
+    /// git 2.50.1 table) are rejected via [`check_git_ref_subcommand`],
+    /// including their `=value` forms.
     #[test]
     fn git_tag_mutation_flags_rejected() {
-        assert_all_rejected(GIT_TAG_MUTATIONS, |flag| format!("git tag {flag} v1.0"));
+        for &(flag, kind) in GIT_TAG_OPTS {
+            if kind == RefOpt::Mutation {
+                assert_rejected(&format!("git tag {flag} v1.0"));
+                assert_rejected(&format!("git tag {flag}=x v1.0"));
+            }
+        }
+        for &(flag, kind) in GIT_TAG_SHORTS {
+            if kind == RefOpt::Mutation {
+                assert_rejected(&format!("git tag -{flag} v1.0"));
+            }
+        }
     }
 
     /// Tests that all git remote mutation verbs are rejected via
@@ -5225,6 +5461,27 @@ mod tests {
             ("git branch --contains abc123", true),
             ("git branch --points-at abc123", true),
             ("git branch --format='%(refname)'", true),
+            // branch: value-consuming space forms (value consumed, no bare name)
+            ("git branch --format %(refname)", true),
+            ("git branch --sort committerdate", true),
+            // branch/tag: quoted multi-word values stay one consumed token
+            ("git branch --format \"%(refname) %(objectname)\"", true),
+            ("git branch --format=\"%(refname) %(objectname)\"", true),
+            ("git tag --format \"%(refname) %(objectname)\"", true),
+            ("git tag --format=\"%(refname) %(objectname)\"", true),
+            // branch: optional-value `=`-forms (read-only without a name)
+            ("git branch --abbrev=10", true),
+            ("git branch --color=always", true),
+            ("git branch --column=dense", true),
+            // branch: unambiguous long-option abbreviations of list filters
+            ("git branch --mer main", true),
+            ("git branch --con HEAD", true),
+            ("git branch --no-contains HEAD", true),
+            ("git branch --no-merged main", true),
+            // branch: --list after a bare word turns it into a pattern (loosening)
+            ("git branch feature --list", true),
+            // branch: listing-only actions without a name
+            ("git branch --show-current", true),
             // tag: no args (list tags)
             ("git tag", true),
             // tag: standard listing flags
@@ -5235,6 +5492,71 @@ mod tests {
             ("git tag --merged main", true),
             ("git tag --points-at abc123", true),
             ("git tag -n", true),
+            ("git tag -v v1.0", true), // verify mode: positionals are verify targets
+            ("git tag --verify v1.0", true),
+            ("git tag -n 1", true), // -n optional value NOT consumed → pattern
+            ("git tag feature --list", true), // list after bare word → pattern
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// Tests that every branch/tag name-creation and mutation vector from the
+    /// git 2.50.1 tables is rejected: optional-value space forms, separators,
+    /// unambiguous long abbreviations, consumed-token ordering, and negated
+    /// flags that leave a bare ref name.
+    #[test]
+    fn git_branch_tag_creation_bypass_rejected() {
+        let cases = [
+            // optional-value space forms leave a bare ref name → create
+            ("git branch --abbrev 10", false),
+            ("git branch --color always", false),
+            ("git branch --column dense", false),
+            // separators end option parsing — a bare name still creates
+            ("git branch -- foo", false),
+            ("git branch --end-of-options foo", false),
+            ("git tag --end-of-options foo", false),
+            // negated flags are create-active (no value, no list mode)
+            ("git branch --no-list foo", false),
+            ("git branch --no-verbose foo", false),
+            ("git branch --no-delete foo", false),
+            ("git branch --no-move foo", false),
+            ("git branch --no-force foo", false),
+            ("git branch --no-points-at foo", false),
+            ("git tag --no-annotate foo", false),
+            ("git tag --no-force foo", false),
+            // unambiguous long-option abbreviations of mutation flags
+            ("git branch --forc foo", false),
+            ("git branch --tr foo", false),
+            ("git branch --uns foo", false),
+            ("git branch --mov foo", false),
+            ("git branch --del foo", false),
+            ("git branch --edit-d foo", false),
+            ("git tag --mes foo", false),
+            // unknown long/short flags fail closed → bare word is a name
+            ("git branch --mes foo", false),
+            ("git branch --bogus foo", false),
+            // consumed tokens never trigger list mode
+            ("git branch --sort --merged foo", false),
+            ("git branch --sort --list foo", false),
+            ("git branch --format %(refname) foo", false),
+            ("git tag --sort --list foo", false),
+            // quoted value consumed; a trailing bare word is still a name
+            (
+                "git branch --format \"%(refname) %(objectname)\" foo",
+                false,
+            ),
+            ("git tag --format \"%(refname) %(objectname)\" foo", false),
+            // mutation tokens still reject when git consumes them as values
+            ("git branch --merged -d", false),
+            ("git branch --sort -d foo", false),
+            // `-a`/`-r` are list-only: a bare name after them is rejected
+            ("git branch -a foo", false),
+            ("git branch -r foo", false),
+            // tag: create-active flags without list mode
+            ("git tag -i foo", false),
+            ("git tag --column foo", false),
+            ("git tag --sort=key foo", false),
         ];
 
         run_cases(&cases);
