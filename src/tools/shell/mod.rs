@@ -14,6 +14,8 @@ use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
 use crate::util::scrub_credentials;
 use crate::util::strip_ansi_escapes;
 
+#[cfg(unix)]
+pub(crate) mod grep_engine;
 mod profiles;
 mod readonly;
 
@@ -456,6 +458,7 @@ impl ShellTool {
     /// The `formatted_output` includes the `[exit status: N]` annotation for
     /// non-zero exits and signal termination (same format as [`execute()`]).
     /// Credentials are already scrubbed from the returned output.
+    #[allow(clippy::too_many_lines)] // orchestration: validation, engine hook, containment
     pub(crate) async fn execute_with_status(
         &self,
         ws: &Workspace,
@@ -463,18 +466,29 @@ impl ShellTool {
     ) -> anyhow::Result<(String, Option<i32>)> {
         let command_str = super::get_str(&args, "command")?;
 
-        // Read-only mode: validate command before execution
+        // Read-only mode: validate command before execution.
+        // The grep engine interception also runs here (read-only mode only).
+        let mut exec_str = command_str.to_string();
         if self.mode == ShellMode::ReadOnly {
             let ctx = self::readonly::CheckContext::for_workspace(ws.as_path());
             if let Err(rejection) = check_command(command_str, &ctx) {
                 anyhow::bail!("{rejection}");
             }
+            #[cfg(unix)]
+            if let Some(rewritten) = grep_engine::try_serve_command(command_str, ws.as_path()) {
+                // The engine verb is an unlisted literal and passes validation;
+                // on the off chance it does not, keep the original command.
+                if check_command(&rewritten, &ctx).is_ok() {
+                    exec_str = rewritten;
+                }
+            }
         }
 
-        // Execute with timeout to prevent hanging commands.
-        // Use the ORIGINAL command string (not the stripped version) so that
-        // `cd workspace/subdir && cargo build` actually navigates the shell.
-        let mut cmd = build_shell_command(command_str, ws.as_path());
+        // Execute with timeout to prevent hanging commands. `exec_str` may be
+        // the grep-engine rewrite; the ORIGINAL `command_str` is what
+        // `process_shell_output` sees below, so the grep output profile keeps
+        // matching (and `cd … &&` chains still navigate the shell).
+        let mut cmd = build_shell_command(&exec_str, ws.as_path());
 
         // Allow agent to override the default timeout via `timeout_secs`.
         // Capped at MAX_SHELL_TIMEOUT_SECS to prevent absurdly long runs.
@@ -485,6 +499,45 @@ impl ShellTool {
         let timeout = Duration::from_secs(timeout_secs);
 
         let result = run_command_with_timeout(&mut cmd, timeout).await;
+
+        // Grep-engine failure containment: the sentinel exit code means the
+        // engine could neither serve nor exec the real grep — re-run the
+        // original command so the agent sees the authentic result. A stale
+        // self-update binary (one lacking the hidden subcommand) runs full
+        // main() and dies at instance-lock with the lock message; that
+        // signature re-runs too. Residual: a mid-search panic after output
+        // was streamed exits sentinel-3, but a pipe/chain member's exit
+        // status (e.g. `grep | head`, `grep … || echo`) masks it, so the
+        // agent sees the partial output.
+        #[cfg(unix)]
+        let result = if exec_str != command_str
+            && matches!(
+                &result,
+                ShellRunResult::Completed { status, stderr, .. }
+                    if status.code() == Some(grep_engine::ENGINE_FAILED_EXIT)
+                        || stderr
+                            .windows(grep_engine::STALE_BINARY_LOCK_MSG.len())
+                            .any(|w| w == grep_engine::STALE_BINARY_LOCK_MSG.as_bytes())
+            ) {
+            let mut original = build_shell_command(command_str, ws.as_path());
+            run_command_with_timeout(&mut original, timeout).await
+        } else {
+            result
+        };
+
+        // Criterion 11: record the served invocation's exit code (the
+        // served-vs-fallback decision + reason are logged in grep_engine).
+        if exec_str != command_str {
+            let exit_code = match &result {
+                ShellRunResult::Completed { status, .. } => status.code(),
+                _ => None,
+            };
+            tracing::debug!(
+                command = command_str,
+                ?exit_code,
+                "grep engine: served exit"
+            );
+        }
 
         match result {
             ShellRunResult::Completed {

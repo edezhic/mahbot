@@ -26,6 +26,10 @@ voice-debug = []
 # Gates the two-writer checkpoint-race repro harness (benches/wal_race_repro.rs),
 # a discovery/regression instrument — not part of default bench builds.
 wal-repro = []
+# Gates the grep-engine subprocess end-to-end harness (benches/grep_engine_e2e.rs):
+# the parent rewrites commands and spawns `sh -c` with the bench binary acting as
+# the hidden engine subcommand, then diffs against the real system grep.
+grep-engine-e2e = []
 
 [[bin]]
 name = "mahbot"
@@ -99,6 +103,16 @@ regex = "1.10"
 
 # Fast file/content search for the tools
 fff-search = "0.10"
+
+# Transparent grep interception engine (shell tool, read-only mode): the
+# ripgrep substrate (grep-regex/grep-searcher/grep-matcher) plus the ignore
+# crate for rg-default exclusion semantics on recursive walks. grep-searcher
+# pulls in encoding_rs/encoding_rs_io unconditionally — WHATWG-derived tables,
+# BSD-3-Clause-licensed, permissive (same family as ripgrep itself).
+grep-regex = "0.1"
+grep-searcher = "0.1"
+grep-matcher = "0.1"
+ignore = "0.4"
 
 # SHA256 checksum verification for model downloads
 sha2 = "0.10"
@@ -176,6 +190,11 @@ required-features = ["voice-tests"]
 name = "wal_race_repro"
 harness = false
 required-features = ["wal-repro"]
+
+[[bench]]
+name = "grep_engine_e2e"
+harness = false
+required-features = ["grep-engine-e2e"]
 
 [profile.dev]
 incremental = true

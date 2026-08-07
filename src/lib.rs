@@ -49,6 +49,18 @@ pub(crate) mod vector;
 pub mod wal_guard;
 pub mod workspace;
 
+/// Hidden grep-engine subcommand entry (dispatched from `main()` before the
+/// instance lock; the shell tool's read-only grep interception rewrites
+/// served invocations to this subcommand of the current binary).
+#[cfg(unix)]
+pub use tools::shell::grep_engine::run_engine as run_grep_engine;
+
+/// Test/subprocess-harness rewrite entry with an explicit home (fixture `~`
+/// operands); production single-file gate. Only compiled for the e2e harness.
+#[cfg(all(unix, feature = "grep-engine-e2e"))]
+#[doc(hidden)]
+pub use tools::shell::grep_engine::try_serve_command_for_test as grep_engine_rewrite_for_test;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
