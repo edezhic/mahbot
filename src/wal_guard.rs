@@ -13,7 +13,7 @@
 //! - [`parse_tshm_header`] — parse the fixed `-tshm` coordination header
 //!   (magic `TSHMWAL\0`, `max_frame`/`nbackfills`/`transaction_count` at
 //!   byte offsets 56/64/72 per the `#[repr(C)]`
-//!   `SharedWalCoordinationMapHeader` layout in turso_core 0.7.0).
+//!   `SharedWalCoordinationMapHeader` layout in turso_core 0.7.2).
 //! - [`inspect_store`] / [`check_all_stores`] — classify each store's file
 //!   set into an [`StoreArtifactStatus`] without opening the database.
 //! - [`run_wal_guard_loop`] — background task that periodically inspects the
@@ -35,7 +35,7 @@ use std::time::Duration;
 use tracing::warn;
 
 /// Magic bytes at the start of every `.tshm` coordination file
-/// (`SHARED_WAL_COORDINATION_MAGIC` in turso_core 0.7.0).
+/// (`SHARED_WAL_COORDINATION_MAGIC` in turso_core 0.7.2).
 pub(crate) const TSHM_MAGIC: [u8; 8] = *b"TSHMWAL\0";
 
 /// Version of the `.tshm` coordination header (`SHARED_WAL_COORDINATION_VERSION`).

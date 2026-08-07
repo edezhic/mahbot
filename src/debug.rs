@@ -464,7 +464,7 @@ fn execute_query_readonly(
 /// True when the error chain looks like a torn-frame / WAL-inconsistency read.
 ///
 /// Matches on the stringified error because engine variants are stringified at
-/// the error boundary; the signatures mirror turso_core 0.7.0's
+/// the error boundary; the signatures mirror turso_core 0.7.2's
 /// `CompletionError::ShortReadWalFrame` / `ShortRead` / `ChecksumMismatch` /
 /// `WalFramePageMismatch` display texts.
 fn is_torn_frame_error(err: &anyhow::Error) -> bool {

@@ -94,7 +94,9 @@ rand = "0.10"
 unicode-normalization = "0.1"
 
 # Memory / persistence
-turso = { version = "0.7.0", default-features = false, features = ["fts"] }
+# Pinned exactly: the wal_race_repro bench is the escalation artifact for the
+# turso two-writer WAL defect, so the storage layer must not drift under it.
+turso = { version = "=0.7.2", default-features = false, features = ["fts"] }
 
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 

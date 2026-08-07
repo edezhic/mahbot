@@ -25,56 +25,22 @@
 //! attempt: the patch must make the harness stop reproducing the signature.
 //!
 //! Run with: `cargo bench --no-default-features --features wal-repro --bench wal_race_repro`
-use std::fs::{self, File, OpenOptions};
-use std::path::{Path, PathBuf};
+//!
+//! Mahbot-independent by design: only `turso` and `tempfile` are used, so a
+//! copy of this file in a fresh project (deps `turso = "=0.7.2"`, `tempfile`;
+//! `harness = false`) builds and runs unchanged — the escalation artifact.
+//! Each run uses a fresh disposable database, so no single-instance lock is
+//! needed; concurrent runs cannot interfere.
+use std::fs;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use turso::core::{Database, DatabaseOpts, OpenFlags, PlatformIO};
 
-use mahbot::lock_utils::try_flock;
-
 const PANIC_SIGNATURE: &str = "shared WAL frame ids must increase monotonically";
 const DEFAULT_RUN_SECS: u64 = 15;
-
-// ── Single-instance lock (mirrors the voice bench) ────────────────────────
-
-fn lock_file_path() -> PathBuf {
-    mahbot::config::default_config_dir()
-        .expect("Cannot resolve ~/.mahbot/ for lock file")
-        .join("wal_race_repro.lock")
-}
-
-fn acquire_bench_lock() -> File {
-    let lock_path = lock_file_path();
-    if let Some(parent) = lock_path.parent() {
-        fs::create_dir_all(parent).expect("failed to create ~/.mahbot/ for benchmark lock");
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .expect("failed to open benchmark lock file");
-    loop {
-        match try_flock(&file) {
-            Ok(true) => return file,
-            Ok(false) => {
-                eprintln!(
-                    "Another wal-race harness is already running (lock: {}) — waiting...",
-                    lock_path.display()
-                );
-                std::thread::sleep(Duration::from_secs(5));
-            }
-            Err(e) => panic!(
-                "flock on benchmark lock {} failed: {e}",
-                lock_path.display()
-            ),
-        }
-    }
-}
 
 // ── Shared DB helpers ─────────────────────────────────────────────────────
 
@@ -162,8 +128,15 @@ fn child_main(db_dir: &Path) {
 
 // ── Parent: TRUNCATE-checkpointing writer ─────────────────────────────────
 
+/// Remove the per-run database and exit with `code`. The parent terminates via
+/// `process::exit`, which skips destructors, so the temp dir is removed
+/// explicitly instead of relying on `TempDir::drop`.
+fn exit_after_cleanup(tmp: &tempfile::TempDir, code: i32) -> ! {
+    let _ = fs::remove_dir_all(tmp.path());
+    std::process::exit(code);
+}
+
 fn parent_main() {
-    let _lock = acquire_bench_lock();
     let run_secs: u64 = std::env::var("MAHBOT_WAL_RACE_DURATION_SECS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
@@ -215,9 +188,7 @@ fn parent_main() {
     let child_output = child.wait_with_output().expect("wait for child");
     let child_stderr = String::from_utf8_lossy(&child_output.stderr).to_string();
 
-    let parent_msg = parent_panic
-        .err()
-        .map(|payload| mahbot::util::panic_message(&*payload).to_string());
+    let parent_msg = parent_panic.err().map(|payload| panic_message(&*payload));
     if let Some(msg) = &parent_msg {
         eprintln!("parent panicked: {msg}");
     }
@@ -236,7 +207,7 @@ fn parent_main() {
             successful_truncates,
             child_output.status.code()
         );
-        std::process::exit(0);
+        exit_after_cleanup(&tmp, 0);
     }
 
     eprintln!(
@@ -244,7 +215,19 @@ fn parent_main() {
          {run_secs}s); increase MAHBOT_WAL_RACE_DURATION_SECS and retry",
         inserts, checkpoints, successful_truncates,
     );
-    std::process::exit(1);
+    exit_after_cleanup(&tmp, 1);
+}
+
+/// Inline replacement for the daemon's panic-payload stringifier, keeping this
+/// file free of mahbot imports.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(msg) = payload.downcast_ref::<&str>() {
+        msg.to_string()
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 fn main() {
