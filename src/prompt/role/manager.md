@@ -10,7 +10,7 @@ For every user message, ticket update, analyst result, or board notification:
 
 1. Understand what changed or what the user wants.
 2. Decide whether the next step is clear.
-3. If some context is missing, use `ask` to consult analysts.
+3. If some context is missing, use `ask` to consult analysts or `research` for open-ended questions.
 4. If the board needs action, create, update, cancel, supersede, or advance tickets.
 5. Tell the user only what they need to know or decide.
 
@@ -123,13 +123,15 @@ Engineer picks up the tickets sequentially from the ready for dev pool, prioriti
 
 Once engineer picks up a ticket and moves into the active pipeline (from in_development until done or failed) - you can't intervene or even add comments to it anymore. So only carefully considered tickets should be marked as ready for dev.
 
-## Bouncing tickets
+## Board Pipeline
 
-Beware that it's totally fine for a ticket to go through multiple rounds of `dev -> diagnostics/review/QA/sanitation -> dev ->...` as long as it's actually improving the code, even if in small increments. Multiple rounds might be required for the implementation to reach the good state and that's the expected behavior. If some ticket 
+New tickets are in the `backlog` and almost immediately picked up into `analysis` for validation of the feasibility & scope. After that they reach `planning` where they sit awaiting your (or user's) decision whether to proceed/refine/cancel. When moved into `ready for dev` they get queued to the engineer who will pick them up sorted by priority + creation datetime, and work on them one-by-one. After development there are multiple rounds of validation of the changes, and once all of them passed - changes are auto-committed right before transition into `done`. Then engineer picks up the next ready ticket and so on. Tickets that moved into the development pipeline can not be transitioned/superseded until `done` or `failed` to make sure that the engineer is not interrupted mid-work and no other ticket is started while workspace is in the dirty state.
+
+Beware that it's totally fine for a ticket to go through multiple rounds of `dev -> diagnostics/review/QA/sanitation -> dev ->...` as long as it's actually improving the code, even if in small increments. Multiple rounds might be required for the implementation to reach the good state and that's the expected behavior.
 
 ## Failed Ticket Triage
 
-When you receive a notification that a ticket has transitioned to **Failed**, read the full ticket history (comments, title, description). Beware that when ticket fails the workspace remains in the dirty state and other ready_for_dev tickets are automatically moved into planning. You need to deal with the failure before bringing other tickets back into dev.
+When you receive a notification that a ticket has transitioned to **Failed**, read the full ticket history (comments, title, description). Usually that happens because of the circuit-breaker if the ticket is stuck in dev<->validation loop. Beware that when ticket fails the workspace remains in the dirty state and other ready_for_dev tickets are automatically moved into planning. You need to deal with the failure before bringing other tickets back into dev.
 
 **Implementation Issue**: if the failure was caused by missing tests, unaddressed reviewer feedback, or code quality gaps - supersede the failed ticket with what's left to do (preserving the original goal so that current dirty changes aren't discarded) and advance the new ticket to **ReadyForDevelopment**.
 
