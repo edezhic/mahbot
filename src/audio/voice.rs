@@ -1414,8 +1414,8 @@ pub(crate) static TOTAL_EMBEDDING_TIME_NS: AtomicU64 = AtomicU64::new(0);
 
 // ── Rolling average ring buffer for embedding latency ────────────────────
 //
-// The ticket requested "rolling average (last N frames)" for AC2 (processing
-// latency).  Rather than an exponential moving average (which is an
+// The design calls for "rolling average (last N frames)" of processing
+// latency.  Rather than an exponential moving average (which is an
 // approximation) or a lifetime cumulative average (which becomes diagnostically
 // inert as embeddings accumulate), we use a lock-free ring buffer of the most
 // recent 100 embedding computation times.  N=100 covers ~3.2 seconds of audio
@@ -2203,6 +2203,22 @@ fn load_onnx_models(dir: &Path) -> Result<OnnxModels> {
     })
 }
 
+fn onnx_input_name(model: &candle_onnx::onnx::ModelProto) -> String {
+    model
+        .graph
+        .as_ref()
+        .and_then(|g| g.input.first())
+        .map_or_else(|| "input".to_string(), |i| i.name.clone())
+}
+
+fn onnx_output_name(model: &candle_onnx::onnx::ModelProto) -> String {
+    model
+        .graph
+        .as_ref()
+        .and_then(|g| g.output.first())
+        .map_or_else(|| "output".to_string(), |o| o.name.clone())
+}
+
 /// Scale audio samples from float [-1, 1] range to approximate int16 range
 /// using the 32768.0 multiplier from the OpenWakeWord reference.
 ///
@@ -2238,28 +2254,14 @@ fn compute_mel_spectrogram(models: &OnnxModels, samples: &[f32]) -> Result<Vec<V
     let scaled = scale_to_int16_range(samples);
     let input_tensor = Tensor::from_slice(&scaled, (1, sample_len), &models.device)?;
 
-    let input_name = models
-        .mel_model
-        .graph
-        .as_ref()
-        .and_then(|g| g.input.first())
-        .map_or_else(|| "input".to_string(), |i| i.name.clone());
-
     let mut inputs = HashMap::new();
-    inputs.insert(input_name, input_tensor);
+    inputs.insert(onnx_input_name(&models.mel_model), input_tensor);
 
     let mut outputs = candle_onnx::simple_eval(&models.mel_model, inputs)
         .context("Mel spectrogram inference failed")?;
 
-    let output_name = models
-        .mel_model
-        .graph
-        .as_ref()
-        .and_then(|g| g.output.first())
-        .map_or_else(|| "output".to_string(), |o| o.name.clone());
-
     let output_tensor = outputs
-        .remove(&output_name)
+        .remove(&onnx_output_name(&models.mel_model))
         .context("Mel spectrogram model produced no output")?;
 
     let shape = output_tensor.dims();
@@ -2352,28 +2354,14 @@ fn compute_embedding(models: &OnnxModels, mel_frames: &[Vec<f32>]) -> Result<Vec
         &models.device,
     )?;
 
-    let input_name = models
-        .embed_model
-        .graph
-        .as_ref()
-        .and_then(|g| g.input.first())
-        .map_or_else(|| "input".to_string(), |i| i.name.clone());
-
     let mut inputs = HashMap::new();
-    inputs.insert(input_name, input_tensor);
+    inputs.insert(onnx_input_name(&models.embed_model), input_tensor);
 
     let mut outputs = candle_onnx::simple_eval(&models.embed_model, inputs)
         .context("Embedding model inference failed")?;
 
-    let output_name = models
-        .embed_model
-        .graph
-        .as_ref()
-        .and_then(|g| g.output.first())
-        .map_or_else(|| "output".to_string(), |o| o.name.clone());
-
     let output_tensor = outputs
-        .remove(&output_name)
+        .remove(&onnx_output_name(&models.embed_model))
         .context("Embedding model produced no output")?;
 
     let embedding: Vec<f32> = output_tensor.flatten_all()?.to_vec1()?;
@@ -2634,7 +2622,7 @@ fn process_streaming_frames_inner(
 /// so callers can derive augmentation variants from speech-only audio,
 /// matching enrollment's `AGC → VAD → augment` ordering.  Because the loop
 /// itself is the canonical one, the prewarm path cannot drift from streaming
-/// inference — the train/inference divergence class this ticket exists to fix.
+/// inference — preventing the train/inference divergence class.
 ///
 /// # VAD decision ownership
 ///
@@ -5493,7 +5481,7 @@ impl PipelineCtx {
             // buffer for shorter ones — at start-aligned positions with
             // padded geometry.  This pass scores exactly like the cold burst
             // (the ring-4 sample fires at position 24), so it is the overrun
-            // safety net for the deferred burst.  (The ticket's original
+            // safety net for the deferred burst.  (The original
             // "must not re-score the misaligned leading edge" hazard does
             // not manifest at live geometry: the trigger lands at B=76 and
             // the B=79 → start-3 re-score scores ~0.99 — but the pass stays the
@@ -5599,8 +5587,8 @@ impl PipelineCtx {
         }
         if !models_ready() {
             // Models are still loading — mark pending so check_auto_start
-            // retries when they become ready (satisfies ticket req #2:
-            // auto-start when models transition to Ready). This is NOT set
+            // retries when they become ready (auto-start when models
+            // transition to Ready). This is NOT set
             // on mic failure, preventing a continuous retry loop.
             //
             // If models have previously failed (ModelError trap state),
@@ -6454,29 +6442,11 @@ fn check_enrollment_utterance_length(
 
 // PCM augmentation
 
-/// Speed perturbation via [`crate::util::speed_perturbation`] (anti-alias safe).
-///
-/// Delegates to [`crate::util::resample_audio`] for proper anti-aliasing
-/// filtering and f64-precision interpolation.  A `rate` of 1.0
-/// returns the original unchanged.  `rate < 1.0` slows down (adds samples),
-/// `rate > 1.0` speeds up (removes samples).  The ticket uses 0.95 (slow down)
-/// and 1.05 (speed up).
-///
-// Implementation note: `apply_gain`, `generate_pink_noise`, and `add_noise`
-// are defined in `crate::util` (canonical implementations).
-//
-/// Extracts dense stride-8 embeddings for the Conv1D classifier
-/// training.  Now, only dense stride-8
-/// embeddings are used — streaming extraction was removed.  Dense embeddings
-/// provide a strong learning signal (many windows per utterance) and the same
-/// distribution is used for classifier training.
-///
-/// ONNX inference is CPU-bound (mel spectrogram + embedding computation).
-/// It runs on a blocking thread via `spawn_blocking` to avoid starving
-/// the async pipeline during enrollment.
-///
-/// Implements minimum utterance length check: utterances
-/// shorter than 400ms are rejected to reject noise blips and coughs.
+/// Validate utterance length, generate deterministic PCM augmented variants,
+/// then run ONNX inference for all variants in a single `spawn_blocking`
+/// (CPU-bound mel + embedding computation) to avoid starving the async
+/// pipeline during enrollment.  Enforces the 400ms minimum utterance length
+/// floor to reject noise blips and coughs.
 #[allow(clippy::too_many_lines)]
 async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     if !models_ready() {
@@ -7149,8 +7119,8 @@ fn flush_voice_batch(voice_batch: &mut Vec<f32>, mel_frame_buffer: &mut Vec<Vec<
 /// first detection, leaving `next_window_start` at the detecting position.
 ///
 /// Re-anchors `next_window_start` to position 0 first so the trained
-/// geometry is never perturbed by a stale window start.  (The ticket's
-/// original "a misaligned mid-pass position scores ~0.2651 and resets the
+/// geometry is never perturbed by a stale window start.  (The original
+/// "a misaligned mid-pass position scores ~0.2651 and resets the
 /// rolling window" hazard was measured NOT to manifest at live geometry —
 /// the B=79 → start-3 continuation scores ~0.99 and
 /// is the enabling mechanism for mid-utterance continuation; the rolling
