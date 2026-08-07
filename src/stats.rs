@@ -244,6 +244,31 @@ impl crate::logs::LogStore {
             .await?;
         Ok(())
     }
+
+    /// Persist one image-generation call stat to the dedicated
+    /// `image_gen_calls` table. Recorded at call time by the image_gen tool
+    /// (not at session finalize) so records survive agent cancel/crash.
+    /// Best-effort — never fails the calling operation.
+    pub(crate) async fn record_image_gen_call(&self, rec: &ImageGenCallRecord) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO image_gen_calls \
+                 (recorded_at, model, workspace, duration_ms, success, attempts, failure_class, error_message) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                turso::params![
+                    rec.recorded_at.clone(),
+                    rec.model.clone(),
+                    rec.workspace.clone(),
+                    rec.duration_ms,
+                    i64::from(rec.success),
+                    i64::from(rec.attempts),
+                    rec.failure_class.clone(),
+                    rec.error_message.clone(),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 /// One per-operation LLM request stat row (the `llm_requests` table).
@@ -274,6 +299,26 @@ pub(crate) struct LlmRequestRecord {
     pub finish_reason: Option<String>,
     pub failure_class: Option<String>,
     pub success: bool,
+    pub recorded_at: String,
+}
+
+/// One image-generation call stat row (the `image_gen_calls` table).
+///
+/// Recorded by the image_gen tool at call time — every generation attempt
+/// (including retries and billed-error responses) with the model, duration,
+/// and true failure cause, so analytics never lose image calls to session
+/// cancel/crash.
+#[derive(Debug, Clone)]
+pub(crate) struct ImageGenCallRecord {
+    pub model: String,
+    pub workspace: String,
+    pub duration_ms: i64,
+    pub success: bool,
+    /// Total POST attempts made (1 = no retry needed).
+    pub attempts: u32,
+    /// Stable failure-class label (e.g. "timeout", "http_429", "billed_error").
+    pub failure_class: Option<String>,
+    pub error_message: Option<String>,
     pub recorded_at: String,
 }
 

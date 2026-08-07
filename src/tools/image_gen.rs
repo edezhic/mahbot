@@ -1,9 +1,14 @@
-use crate::tools::image_catalog::{ImageCatalog, ImageModelInfo, ImageOutput};
+use crate::retry::RETRY_AFTER_MAX_MS;
+use crate::tools::image_catalog::{ImageModelInfo, check_image_capability};
+use crate::util::error::retry_after_header;
+use crate::util::http::{bearer_auth_header, read_error_body};
 use crate::{Tool, Workspace};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::json;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 /// Tool for generating images via OpenRouter's dedicated Image API.
 ///
@@ -94,25 +99,133 @@ impl Tool for ImageGenTool {
         let api_base =
             crate::providers::ensure_base_url(&crate::config::CONFIG.provider_endpoint());
         let images_url = format!("{api_base}/images");
-        let response_body =
-            crate::util::http::post_json_to_provider(&images_url, &body, "Image generation")
-                .await?;
-
-        let Some((b64_json, media_type)) = extract_response_image(&response_body) else {
-            anyhow::bail!("Image generation response did not contain image data (data[].b64_json)");
-        };
-
-        let bytes = STANDARD.decode(b64_json.as_bytes()).map_err(|e| {
-            anyhow::anyhow!("Failed to decode base64 image data from response: {e}")
+        let auth = bearer_auth_header().ok_or_else(|| {
+            anyhow::anyhow!("Image generation: provider API key is not configured")
         })?;
 
-        let output_path = super::save_generated_file(
+        // Bounded retry loop over the dedicated 10-minute client; the loop is
+        // also raced against global shutdown so a long generation cannot
+        // block process teardown. Every call is recorded to telemetry at
+        // call time (survives agent cancel/crash).
+        let started = Instant::now();
+        let shutdown = crate::shutdown::shutdown_token();
+        // Publish the in-flight attempt so a shutdown-abort record reports
+        // how many POSTs were actually made (the loop is mid-flight when the
+        // shutdown branch fires).
+        let attempt_counter = AtomicU32::new(0);
+        let result = tokio::select! {
+            () = shutdown.cancelled() => {
+                // Record the actual elapsed time — the POST may have been in
+                // flight for a long time before shutdown arrived.
+                let elapsed_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(0);
+                record_image_gen_call(
+                    &model, &ws.path, elapsed_ms, false,
+                    attempt_counter.load(Ordering::Relaxed), Some("shutdown"),
+                    Some("shutdown during image generation"),
+                ).await;
+                anyhow::bail!("Shutting down — image generation aborted");
+            }
+            result = generate_image_with_retries(&images_url, &body, &auth, &attempt_counter) => result,
+        };
+        let elapsed_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(0);
+
+        let (response_body, attempts, first_failure_class) = match result {
+            Ok(outcome) => (outcome.body, outcome.attempts, outcome.first_failure_class),
+            Err(failure) => {
+                record_image_gen_call(
+                    &model,
+                    &ws.path,
+                    elapsed_ms,
+                    false,
+                    failure.attempts,
+                    Some(&failure.class),
+                    Some(&failure.message),
+                )
+                .await;
+                anyhow::bail!("{}", failure.message);
+            }
+        };
+
+        let (b64_json, media_type) = match extract_response_image(&response_body) {
+            Ok(x) => x,
+            Err(err) => {
+                // A 2xx body carrying a provider error (or no image data)
+                // means the attempt completed and was billed — never retried.
+                // The variant drives the telemetry class.
+                let class = match &err {
+                    ExtractImageError::Provider { .. } => "billed_error",
+                    ExtractImageError::NoImageData => "no_image_data",
+                };
+                record_image_gen_call(
+                    &model,
+                    &ws.path,
+                    elapsed_ms,
+                    false,
+                    attempts,
+                    Some(class),
+                    Some(&err.to_string()),
+                )
+                .await;
+                anyhow::bail!("Image generation response error: {err}");
+            }
+        };
+
+        let bytes = match STANDARD.decode(b64_json.as_bytes()) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // Provider returned malformed base64 — a response-processing
+                // failure, recorded as such rather than as a success.
+                record_image_gen_call(
+                    &model,
+                    &ws.path,
+                    elapsed_ms,
+                    false,
+                    attempts,
+                    Some("decode"),
+                    Some(&format!("Failed to decode base64 image data: {e}")),
+                )
+                .await;
+                anyhow::bail!("Failed to decode base64 image data from response: {e}");
+            }
+        };
+
+        // Success is recorded only after the file is written, so a disk
+        // failure is never recorded as a successful generation. For
+        // retried-then-successful calls the first failure's class is carried
+        // so analytics see the trigger cause, not just the retry count.
+        let output_path = match super::save_generated_file(
             ws,
             &bytes,
             "image",
             extension_for_media_type(media_type.as_deref()),
         )
-        .await?;
+        .await
+        {
+            Ok(path) => path,
+            Err(e) => {
+                record_image_gen_call(
+                    &model,
+                    &ws.path,
+                    elapsed_ms,
+                    false,
+                    attempts,
+                    Some("file_write"),
+                    Some(&e.to_string()),
+                )
+                .await;
+                return Err(e);
+            }
+        };
+        record_image_gen_call(
+            &model,
+            &ws.path,
+            elapsed_ms,
+            true,
+            attempts,
+            first_failure_class.as_deref(),
+            None,
+        )
+        .await;
 
         let path_str = output_path.to_string_lossy();
         let marker_prefix = self
@@ -125,34 +238,345 @@ impl Tool for ImageGenTool {
 /// Default aspect ratio: supported by every model in the image-models catalog.
 const DEFAULT_ASPECT_RATIO: &str = "9:16";
 
-/// Reject models that cannot generate images on the dedicated surface:
-/// unknown model ids or models that explicitly declare text-only output.
-/// Returns the model's catalog info for request building; models whose
-/// catalog entry lacks output modalities (shape drift) are allowed through.
-/// Catalog-driven — no per-model branches.
-///
-/// # Errors
-///
-/// - The model is absent from the catalog or explicitly declares no image output.
-fn check_image_capability<'a>(
-    model: &str,
-    catalog: &'a ImageCatalog,
-) -> anyhow::Result<&'a ImageModelInfo> {
-    let Some(info) = catalog.find(model) else {
-        anyhow::bail!(
-            "Model `{model}` cannot generate images: it is not in the OpenRouter \
-             image-models catalog. Set an image-capable model in Settings → \
-             Image Generation and retry."
-        );
-    };
-    if info.image_output == ImageOutput::TextOnly {
-        anyhow::bail!(
-            "Model `{model}` cannot generate images: the OpenRouter image-models catalog \
-             does not list image output for it. Set an image-capable model in \
-             Settings → Image Generation and retry."
-        );
+// ── Generation request: dedicated client, bounded retries, true causes ───
+
+/// Total POST attempts (first attempt + 1 retry).
+const IMAGE_GEN_MAX_ATTEMPTS: u32 = 2;
+
+/// Retry only failures that surface within this window. Observed generations
+/// complete in 92–99 s, so a failure inside this window is a prompt
+/// transport/availability failure, not a cut-off generation — per OpenRouter's
+/// all-or-nothing billing a generation that never completes is not billed,
+/// making the retry safe. Never retry a near-full-timeout attempt: it may
+/// have completed server-side (billed) with the response lost in transit.
+const IMAGE_GEN_QUICK_FAILURE_MS: u64 = 60_000;
+
+/// Backoff before the retry when the response carries no Retry-After header.
+const IMAGE_GEN_BACKOFF_MS: u64 = 5_000;
+
+/// Classification of one image-generation attempt failure, captured at the
+/// HTTP boundary so the true cause survives into the surfaced error and
+/// telemetry (a reqwest error's top-level `Display` hides the source chain,
+/// e.g. "operation timed out").
+enum AttemptFailure {
+    /// Client-side timeout. `connect` distinguishes a connection timeout (the
+    /// request never reached the provider — safe to retry) from the full
+    /// 10-minute request timeout (the generation may have completed server-side).
+    Timeout { elapsed_ms: u64, connect: bool },
+    /// Transport-level failure (connection refused/reset, no HTTP response).
+    Transport { elapsed_ms: u64 },
+    /// Non-2xx HTTP response (provider error).
+    Http {
+        status: u16,
+        body: String,
+        retry_after_ms: Option<u64>,
+        elapsed_ms: u64,
+    },
+    /// 2xx response whose body could not be read — the generation may have
+    /// completed and been billed server-side; never retried.
+    BodyRead,
+    /// 2xx body that did not parse as JSON.
+    Parse { message: String },
+}
+
+impl AttemptFailure {
+    /// Whether this failure may be retried: prompt, transient failures only.
+    /// Body-read and parse failures are never retried (billable-ambiguous or
+    /// non-transient).
+    fn retryable(&self) -> bool {
+        match self {
+            Self::Timeout {
+                elapsed_ms,
+                connect,
+            } => {
+                // Only connect timeouts are safe to retry — the request never
+                // reached the provider. The elapsed guard is defensive: the
+                // 10s connect cap keeps genuine connect timeouts well inside
+                // the quick-failure window, while a full request timeout is a
+                // possible hang and never retried.
+                *connect && *elapsed_ms < IMAGE_GEN_QUICK_FAILURE_MS
+            }
+            Self::Transport { elapsed_ms } => *elapsed_ms < IMAGE_GEN_QUICK_FAILURE_MS,
+            Self::Http {
+                status, elapsed_ms, ..
+            } => {
+                matches!(status, 429 | 502 | 503 | 524 | 529)
+                    && *elapsed_ms < IMAGE_GEN_QUICK_FAILURE_MS
+            }
+            Self::BodyRead | Self::Parse { .. } => false,
+        }
     }
-    Ok(info)
+
+    fn retry_after_ms(&self) -> Option<u64> {
+        match self {
+            Self::Http { retry_after_ms, .. } => *retry_after_ms,
+            _ => None,
+        }
+    }
+
+    /// Stable short label for telemetry.
+    fn class_label(&self) -> String {
+        match self {
+            Self::Timeout { .. } => "timeout".to_string(),
+            Self::Transport { .. } => "transport".to_string(),
+            Self::Http { status, .. } => format!("http_{status}"),
+            Self::BodyRead => "body_read".to_string(),
+            Self::Parse { .. } => "parse".to_string(),
+        }
+    }
+}
+
+/// Successful image-generation request: the parsed 2xx body, the number of
+/// POST attempts made (1 = no retry needed), and — when a retry was needed —
+/// the class of the first failed attempt, so telemetry records the trigger
+/// cause of retried-then-successful calls.
+struct ImageGenOutcome {
+    body: serde_json::Value,
+    attempts: u32,
+    first_failure_class: Option<String>,
+}
+
+/// Terminal request failure carrying the true cause for the surfaced error
+/// and telemetry.
+struct ImageGenFailure {
+    class: String,
+    attempts: u32,
+    message: String,
+}
+
+/// POST the image-generation request with bounded retries.
+///
+/// Retry policy: auto-retry ONLY prompt failures — transport errors and HTTP
+/// 429/502/503/524/529 — with backoff (Retry-After when present, else 5 s)
+/// and at most one retry. Never retry: full-timeout hangs, any 4xx (402 =
+/// insufficient credits), body-read failures after a 2xx (may have been
+/// billed), or 200-with-error bodies (completed and billed).
+async fn generate_image_with_retries(
+    url: &str,
+    body: &serde_json::Value,
+    auth: &str,
+    attempt_counter: &AtomicU32,
+) -> Result<ImageGenOutcome, ImageGenFailure> {
+    let mut failures: Vec<AttemptFailure> = Vec::new();
+    for attempt in 1..=IMAGE_GEN_MAX_ATTEMPTS {
+        attempt_counter.store(attempt, Ordering::Relaxed);
+        match attempt_image_generation(url, body, auth).await {
+            Ok(body) => {
+                return Ok(ImageGenOutcome {
+                    body,
+                    attempts: attempt,
+                    first_failure_class: failures.first().map(AttemptFailure::class_label),
+                });
+            }
+            Err(failure) => {
+                let retryable = failure.retryable();
+                failures.push(failure);
+                if !retryable || attempt == IMAGE_GEN_MAX_ATTEMPTS {
+                    let last = failures.last().expect("just pushed");
+                    return Err(ImageGenFailure {
+                        class: last.class_label(),
+                        attempts: attempt,
+                        message: build_terminal_message(&failures),
+                    });
+                }
+                let sleep_ms = failures
+                    .last()
+                    .and_then(AttemptFailure::retry_after_ms)
+                    .map_or(IMAGE_GEN_BACKOFF_MS, |ms| {
+                        ms.clamp(IMAGE_GEN_BACKOFF_MS, RETRY_AFTER_MAX_MS)
+                    });
+                if !crate::shutdown::sleep_or_shutdown(Duration::from_millis(sleep_ms)).await {
+                    return Err(ImageGenFailure {
+                        class: "shutdown".to_string(),
+                        attempts: attempt,
+                        message: "Shutting down — image generation aborted".to_string(),
+                    });
+                }
+            }
+        }
+    }
+    unreachable!("loop is bounded by IMAGE_GEN_MAX_ATTEMPTS")
+}
+
+/// One image-generation POST attempt with the dedicated 10-minute client.
+/// Returns the parsed 2xx body, or a classified failure.
+async fn attempt_image_generation(
+    url: &str,
+    body: &serde_json::Value,
+    auth: &str,
+) -> Result<serde_json::Value, AttemptFailure> {
+    let started = Instant::now();
+    let client = crate::util::http::image_gen_http_client();
+    let response = match client
+        .post(url)
+        .header("Authorization", auth)
+        .json(body)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
+            return Err(if e.is_timeout() {
+                AttemptFailure::Timeout {
+                    elapsed_ms,
+                    // A connect timeout never reached the provider (safe to
+                    // retry); the full request timeout may have completed
+                    // server-side. `is_connect()` covers DNS and TCP-level
+                    // connect failures.
+                    connect: e.is_connect(),
+                }
+            } else {
+                tracing::debug!(error = %e, "Image generation transport error");
+                AttemptFailure::Transport { elapsed_ms }
+            });
+        }
+    };
+
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let retry_after_ms = retry_after_header(response.headers());
+        let body = read_error_body(response, "Image generation").await;
+        return Err(AttemptFailure::Http {
+            status,
+            body,
+            retry_after_ms,
+            elapsed_ms,
+        });
+    }
+
+    let body_text = match response.text().await {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to read image generation response body");
+            return Err(AttemptFailure::BodyRead);
+        }
+    };
+    let parsed =
+        crate::util::http::parse_json_response(&body_text, "Image generation").map_err(|e| {
+            AttemptFailure::Parse {
+                message: e.to_string(),
+            }
+        })?;
+    Ok(parsed)
+}
+
+/// Build the user-visible terminal error from the failure trail, stating the
+/// actual cause (timeout vs HTTP status vs transport vs billable-ambiguous).
+fn build_terminal_message(failures: &[AttemptFailure]) -> String {
+    let last = failures.last().expect("at least one failure");
+    let cause = match last {
+        // Parse failures already carry a fully-formed message (error context
+        // plus a raw-body preview) — used verbatim.
+        AttemptFailure::Parse { message } => message.clone(),
+        AttemptFailure::Timeout {
+            elapsed_ms,
+            connect,
+        } => {
+            let secs = elapsed_ms / 1000;
+            // Only two combinations are reachable given the client's fixed
+            // timeouts (10s connect cap, 10-min total): a connect timeout
+            // fires inside the connect cap, a request timeout at the full cap.
+            if *connect {
+                format!(
+                    "connection timed out after {secs} s — the request never reached \
+                     the provider"
+                )
+            } else {
+                format!(
+                    "request timed out after {secs} s (client-side 10-minute limit) — \
+                     the provider may still complete the generation server-side; \
+                     not auto-retried"
+                )
+            }
+        }
+        AttemptFailure::Transport { elapsed_ms } => {
+            if *elapsed_ms >= IMAGE_GEN_QUICK_FAILURE_MS {
+                format!(
+                    "transport error after {} s — the connection was lost mid-flight; the \
+                     generation may have completed and been billed server-side; verify \
+                     before retrying",
+                    elapsed_ms / 1000,
+                )
+            } else {
+                "transport error — the request did not reach the provider or no response \
+                 was received"
+                    .to_string()
+            }
+        }
+        AttemptFailure::Http { status, body, .. } => describe_http_failure(*status, body),
+        AttemptFailure::BodyRead => {
+            "received a 2xx response but the body could not be read — the generation may \
+             have completed and been billed server-side; verify before retrying"
+                .to_string()
+        }
+    };
+    let attempts = failures.len();
+    let prefix = if attempts > 1 {
+        format!("Image generation failed after {attempts} attempt(s): ")
+    } else if matches!(last, AttemptFailure::Parse { .. }) {
+        // A single-attempt parse failure keeps its fully-formed message
+        // without an extra "Image generation failed: " prefix.
+        String::new()
+    } else {
+        "Image generation failed: ".to_string()
+    };
+    format!("{prefix}{cause}")
+}
+
+/// Map an HTTP status to the typed provider error description, including the
+/// provider's embedded error message when the body is parseable JSON.
+fn describe_http_failure(status: u16, body: &str) -> String {
+    let typed = match status {
+        400 => "content policy violation or refusal (HTTP 400)".to_string(),
+        402 => "insufficient credits — add credits to the provider account and retry (HTTP 402)"
+            .to_string(),
+        429 => "rate limit exceeded (HTTP 429)".to_string(),
+        502 => "provider unavailable (HTTP 502)".to_string(),
+        503 => "provider overloaded (HTTP 503)".to_string(),
+        504 => "provider timeout (HTTP 504)".to_string(),
+        524 | 529 => format!("edge timeout or overload (HTTP {status})"),
+        _ => format!("HTTP {status}"),
+    };
+    let provider_msg = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").cloned())
+        .and_then(|e| e.get("message").and_then(|m| m.as_str()).map(String::from));
+    match provider_msg {
+        Some(msg) => format!("{typed}: {msg}"),
+        None => typed,
+    }
+}
+
+/// Record one image-generation call in the logs store. Best-effort and at
+/// call time so records survive agent cancel/crash (the session-finalize
+/// flush drops stats when an agent is dropped without finalization).
+async fn record_image_gen_call(
+    model: &str,
+    workspace: &str,
+    duration_ms: i64,
+    success: bool,
+    attempts: u32,
+    failure_class: Option<&str>,
+    error_message: Option<&str>,
+) {
+    let Some(store) = crate::logs::LOG_STORE.get() else {
+        return;
+    };
+    let rec = crate::stats::ImageGenCallRecord {
+        model: model.to_string(),
+        workspace: workspace.to_string(),
+        duration_ms,
+        success,
+        attempts,
+        failure_class: failure_class.map(String::from),
+        error_message: error_message.map(String::from),
+        recorded_at: crate::turso::now(),
+    };
+    if let Err(e) = store.record_image_gen_call(&rec).await {
+        tracing::debug!(error = %e, "Failed to record image-gen call stat");
+    }
 }
 
 /// Build the dedicated Image API request body from tool args and (when
@@ -343,11 +767,54 @@ fn find_closest_aspect_ratio(width: usize, height: usize) -> Option<&'static str
         .map(|(name, _)| *name)
 }
 
+/// Why a 2xx image response could not be turned into an image. Both cases
+/// mean the attempt completed and was billed server-side — never retried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExtractImageError {
+    /// The body carries a provider `error` object (a billed 200-with-error).
+    Provider { err_type: String, message: String },
+    /// The body has no usable `data[].b64_json` payload.
+    NoImageData,
+}
+
+impl std::fmt::Display for ExtractImageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Provider { err_type, message } => write!(f, "{err_type}: {message}"),
+            Self::NoImageData => {
+                write!(f, "response did not contain image data (data[].b64_json)")
+            }
+        }
+    }
+}
+
 /// Extract the first non-empty `data[].b64_json` payload and its optional
 /// `media_type` from a dedicated Image API response. `b64_json` is raw
 /// base64 (not a data URI); `media_type` may be absent (PNG default).
-fn extract_response_image(body: &serde_json::Value) -> Option<(String, Option<String>)> {
-    let data = body.get("data")?.as_array()?;
+///
+/// Returns `Err` when the body carries a provider `error` object (surfacing
+/// the embedded type/message — a billed 200-with-error response) or lacks
+/// image data entirely; the variant drives the telemetry class.
+fn extract_response_image(
+    body: &serde_json::Value,
+) -> Result<(String, Option<String>), ExtractImageError> {
+    if let Some(err) = body.get("error") {
+        let err_type = err
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("provider error");
+        let message = err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("no details");
+        return Err(ExtractImageError::Provider {
+            err_type: err_type.to_string(),
+            message: message.to_string(),
+        });
+    }
+    let Some(data) = body.get("data").and_then(|v| v.as_array()) else {
+        return Err(ExtractImageError::NoImageData);
+    };
     for entry in data {
         if let Some(b64) = entry.get("b64_json").and_then(|v| v.as_str())
             && !b64.is_empty()
@@ -356,10 +823,10 @@ fn extract_response_image(body: &serde_json::Value) -> Option<(String, Option<St
                 .get("media_type")
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            return Some((b64.to_string(), media_type));
+            return Ok((b64.to_string(), media_type));
         }
     }
-    None
+    Err(ExtractImageError::NoImageData)
 }
 
 /// Map a response media type to a file extension; PNG when absent or unknown.
@@ -582,9 +1049,24 @@ mod tests {
         assert_eq!(b64, "d29ybGQ=");
         assert_eq!(media_type, None);
 
-        // Empty/missing data → None.
-        assert!(extract_response_image(&json!({"data": []})).is_none());
-        assert!(extract_response_image(&json!({})).is_none());
+        // Empty/missing data → NoImageData.
+        assert_eq!(
+            extract_response_image(&json!({"data": []})).unwrap_err(),
+            ExtractImageError::NoImageData
+        );
+        assert_eq!(
+            extract_response_image(&json!({})).unwrap_err(),
+            ExtractImageError::NoImageData
+        );
+
+        // A 200-with-error body surfaces the embedded type/message instead of
+        // the generic "no image data" bail, as a distinct variant.
+        let err_body = json!({
+            "error": { "type": "provider_error", "message": "upstream refused" }
+        });
+        let err = extract_response_image(&err_body).unwrap_err();
+        assert_eq!(err.to_string(), "provider_error: upstream refused");
+        assert!(matches!(err, ExtractImageError::Provider { .. }));
     }
 
     #[test]
@@ -684,5 +1166,142 @@ mod tests {
     fn test_detect_aspect_ratio_missing_file() {
         let result = detect_aspect_ratio_from_image(Path::new("/nonexistent/image.png"));
         assert_eq!(result, None);
+    }
+
+    // ── Retry policy and true-cause reporting tests ────────────────────
+
+    #[test]
+    fn test_attempt_failure_retryable_decisions() {
+        // Quick transport/timeout failures are retried (not billed per
+        // OpenRouter all-or-nothing billing).
+        assert!(AttemptFailure::Transport { elapsed_ms: 5_000 }.retryable());
+        assert!(
+            AttemptFailure::Timeout {
+                elapsed_ms: 5_000,
+                connect: true
+            }
+            .retryable()
+        );
+        // A near-full-timeout attempt is a hang — never retried.
+        assert!(
+            !AttemptFailure::Timeout {
+                elapsed_ms: 600_000,
+                connect: false
+            }
+            .retryable()
+        );
+        // A non-connect timeout is treated as a possible hang even when quick
+        // (defensive; request timeouts only fire at the full cap in practice).
+        assert!(
+            !AttemptFailure::Timeout {
+                elapsed_ms: 5_000,
+                connect: false
+            }
+            .retryable()
+        );
+
+        // Transient provider statuses are retried; other statuses are not.
+        for status in [429, 502, 503, 524, 529] {
+            let f = AttemptFailure::Http {
+                status,
+                body: String::new(),
+                retry_after_ms: None,
+                elapsed_ms: 10_000,
+            };
+            assert!(f.retryable(), "status {status} should be retryable");
+        }
+        for status in [400, 401, 402, 404, 413, 500, 504] {
+            let f = AttemptFailure::Http {
+                status,
+                body: String::new(),
+                retry_after_ms: None,
+                elapsed_ms: 10_000,
+            };
+            assert!(!f.retryable(), "status {status} should not be retryable");
+        }
+
+        // Billed-ambiguous and non-transient failures are never retried.
+        assert!(!AttemptFailure::BodyRead.retryable());
+        assert!(
+            !AttemptFailure::Parse {
+                message: "x".into()
+            }
+            .retryable()
+        );
+    }
+
+    #[test]
+    fn test_describe_http_failure_typed_codes() {
+        let msg = describe_http_failure(402, "{}");
+        assert!(msg.contains("insufficient credits"));
+
+        // Provider body message is surfaced when the body is JSON.
+        let msg = describe_http_failure(503, r#"{"error":{"message":"upstream busy"}}"#);
+        assert!(msg.contains("provider overloaded (HTTP 503)"));
+        assert!(msg.contains("upstream busy"));
+
+        let msg = describe_http_failure(504, "plain text");
+        assert!(msg.contains("provider timeout (HTTP 504)"));
+        assert_eq!(describe_http_failure(418, "{}"), "HTTP 418");
+    }
+
+    #[test]
+    fn test_build_terminal_message_states_true_cause() {
+        // Full-cap request timeout: explicitly not auto-retried.
+        let msg = build_terminal_message(&[AttemptFailure::Timeout {
+            elapsed_ms: 600_000,
+            connect: false,
+        }]);
+        assert!(msg.contains("timed out after 600 s"));
+        assert!(msg.contains("not auto-retried"));
+
+        // Retried quick failures: the attempt-count prefix carries the retry
+        // context — the cause itself does not claim a retry.
+        let msg = build_terminal_message(&[
+            AttemptFailure::Timeout {
+                elapsed_ms: 30_000,
+                connect: true,
+            },
+            AttemptFailure::Timeout {
+                elapsed_ms: 45_000,
+                connect: true,
+            },
+        ]);
+        assert!(msg.contains("failed after 2 attempt(s)"));
+        assert!(msg.contains("connection timed out"));
+
+        // A connect timeout is honest about never reaching the provider, and
+        // never claims a retry it did not make.
+        let msg = build_terminal_message(&[AttemptFailure::Timeout {
+            elapsed_ms: 10_000,
+            connect: true,
+        }]);
+        assert!(msg.contains("never reached the provider"));
+        assert!(!msg.contains("retried"));
+
+        // HTTP cause with provider message.
+        let msg = build_terminal_message(&[AttemptFailure::Http {
+            status: 503,
+            body: r#"{"error":{"message":"down"}}"#.into(),
+            retry_after_ms: None,
+            elapsed_ms: 1_000,
+        }]);
+        assert!(msg.contains("provider overloaded (HTTP 503)"));
+
+        // A long mid-flight transport failure warns about possible billing.
+        let msg = build_terminal_message(&[AttemptFailure::Transport {
+            elapsed_ms: 300_000,
+        }]);
+        assert!(msg.contains("may have completed and been billed"));
+
+        // A retry followed by a parse failure keeps the attempt context.
+        let msg = build_terminal_message(&[
+            AttemptFailure::Transport { elapsed_ms: 5_000 },
+            AttemptFailure::Parse {
+                message: "Image generation response parse error: bad".into(),
+            },
+        ]);
+        assert!(msg.contains("failed after 2 attempt(s)"));
+        assert!(msg.contains("parse error"));
     }
 }

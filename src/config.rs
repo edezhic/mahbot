@@ -1024,6 +1024,26 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
 
     validate_config(&config)?;
 
+    // Write-time validation of the active image-generation model: fail fast
+    // when the catalog is available and the model cannot generate images.
+    // Runs when the effective active model changes OR the provider endpoint
+    // does (the catalog is endpoint-keyed, so an endpoint switch can silently
+    // invalidate the active model), and validates against the endpoint being
+    // saved. A cleared model field falls back to the default — the model that
+    // would actually be used — so it is validated too. Fail-open when the
+    // catalog is unreachable (matches the generation tool's semantics).
+    let endpoint = config
+        .provider_endpoint
+        .as_deref()
+        .unwrap_or(DEFAULT_PROVIDER_ENDPOINT);
+    let model = config
+        .image_gen_model
+        .as_deref()
+        .unwrap_or(DEFAULT_IMAGE_GEN_MODEL);
+    if model != CONFIG.image_gen_model() || endpoint != CONFIG.provider_endpoint() {
+        crate::tools::image_catalog::validate_image_model_for_endpoint(model, endpoint).await?;
+    }
+
     // Capture old Telegram token BEFORE we mutate DB so we can detect
     // changes and trigger hot-reload after persistence succeeds.
     let old_token = CONFIG.telegram_bot_token();

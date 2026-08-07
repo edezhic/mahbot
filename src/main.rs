@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::FutureExt;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::task::spawn;
 use tracing::{debug, error, info, warn};
@@ -594,10 +594,12 @@ async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMe
             continue;
         }
 
-        // Handle action callbacks (__act__ prefix) — route to inline handler
-        // that updates config / clears session without involving the Manager agent.
+        // Handle action callbacks (__act__ prefix) — route to a handler that
+        // updates config / clears session without involving the Manager agent.
+        // Spawned (like __opt__ callbacks) so a slow catalog validation in
+        // set_image_model never stalls the shared dispatch loop.
         if decode_action(&msg.content).is_some() {
-            handle_action_callback(msg).await;
+            spawn(handle_action_callback(msg));
             continue;
         }
 
@@ -754,21 +756,25 @@ fn build_models_keyboard(is_image: bool) -> serde_json::Value {
     let mut rows: Vec<serde_json::Value> = Vec::new();
 
     // Model buttons — each on its own row
-    if is_image {
-        build_model_button_rows(
-            &mut rows,
-            &CONFIG.image_gen_models(),
-            &CONFIG.image_gen_model(),
+    let (mut models, active, action_prefix) = if is_image {
+        (
+            CONFIG.image_gen_models(),
+            CONFIG.image_gen_model(),
             "__act__set_image_model",
-        );
+        )
     } else {
-        build_model_button_rows(
-            &mut rows,
-            &CONFIG.video_models(),
-            &CONFIG.video_model(),
+        (
+            CONFIG.video_models(),
+            CONFIG.video_model(),
             "__act__set_video_model",
-        );
+        )
+    };
+    // Merge the active model into the rendered list when the list omits it,
+    // so the ✓ indicator unambiguously shows the active model.
+    if !models.iter().any(|m| m == &active) {
+        models.push(active.clone());
     }
+    build_model_button_rows(&mut rows, &models, &active, action_prefix);
 
     rows.push(serde_json::json!([{
         "text": "Clear session",
@@ -947,10 +953,11 @@ async fn handle_action_callback(msg: ChannelMessage) {
 
     match action.as_str() {
         "set_image_model" => {
-            handle_set_model_action(&msg, &payload, "image_gen_model", "Image generation").await;
+            handle_set_model_action(&msg, &payload, "image_gen_model", "Image generation", true)
+                .await;
         }
         "set_video_model" => {
-            handle_set_model_action(&msg, &payload, "video_model", "Video").await;
+            handle_set_model_action(&msg, &payload, "video_model", "Video", false).await;
         }
         "clear_session" => {
             // Acknowledge callback silently first (dismiss spinner)
@@ -970,15 +977,37 @@ async fn handle_action_callback(msg: ChannelMessage) {
 ///
 /// Validates payload, writes to `config_kv` table, updates the in-memory
 /// config, and acknowledges the callback with a toast.
+///
+/// The write spans a DB write plus an in-memory update as separate steps, and
+/// handlers are spawned (the dispatch loop must stay non-blocking), so a lock
+/// preserves the previous inline ordering — interleaved writes would leave
+/// `config_kv` and `CONFIG` divergent. Acquired before validation so rapid
+/// taps apply in tap order.
+static MODEL_WRITE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
 async fn handle_set_model_action(
     msg: &ChannelMessage,
     payload: &str,
     config_key: &str,
     display_name: &str,
+    validate_image: bool,
 ) {
+    let _guard = MODEL_WRITE_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     if payload.is_empty() {
         tracing::warn!(config_key, "{config_key} action with empty payload");
         answer_telegram_callback(msg, Some("No model specified.".to_string())).await;
+        return;
+    }
+    // Write-time validation: reject image models that cannot generate images
+    // (fail-open when the catalog is unavailable — matching the generation
+    // tool's semantics).
+    if validate_image
+        && let Err(e) = mahbot::tools::image_catalog::validate_image_model(payload).await
+    {
+        answer_telegram_callback(msg, Some(format!("Invalid image model: {e}"))).await;
         return;
     }
     // Direct-write to config_kv table (bypasses save_and_reload which

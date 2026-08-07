@@ -73,10 +73,11 @@ fn remove_model_from_list(model: &str, list: &mut Option<String>, active: &mut O
 /// Render a model picker with a list of model entries, active indicator,
 /// remove buttons per entry, and an add-model row (text input + "Add" button).
 ///
-/// If the models list is empty but an active model is set, the active model
-/// is shown as the sole entry so it remains visible.
-/// Accepts a `target` to build the correct parameterized `SettingsMessage::ModelPicker`
-/// values internally, avoiding the need for callers to pass closures.
+/// The active model is always merged into the rendered list (it may have been
+/// set independently of the list, e.g. via Telegram), so the active indicator
+/// is unambiguous even when the list omits it; merged entries render without
+/// a remove button. Accepts a `target` to build the correct parameterized
+/// `SettingsMessage::ModelPicker` values internally.
 #[allow(clippy::too_many_lines)]
 fn model_picker_list<'a>(
     target: ModelPickerTarget,
@@ -102,13 +103,16 @@ fn model_picker_list<'a>(
         action: ModelPickerAction::SetActive(m),
     };
     let mut models = parse_models(models_field);
+    let original_models = models.clone();
     let active = active_field;
 
-    // If the list is empty but an active model exists, show it as the sole entry.
-    if models.is_empty() {
-        if let Some(active_model) = active {
-            models.push(active_model.to_string());
-        }
+    // Always merge the active model into the rendered list so the active
+    // indicator is unambiguous even when the list omits it (the active model
+    // may have been set independently of the list, e.g. via Telegram).
+    if !models.iter().any(|m| Some(m.as_str()) == active)
+        && let Some(active_model) = active
+    {
+        models.push(active_model.to_string());
     }
 
     let items: Vec<Element<'a, SettingsMessage>> = if models.is_empty() {
@@ -123,6 +127,10 @@ fn model_picker_list<'a>(
             .iter()
             .map(|model| {
                 let is_active = Some(model.as_str()) == active;
+                // A merged display-only entry (active model absent from the
+                // list) must not offer removal — it is not in the list to
+                // remove, and removing it would silently repoint the active.
+                let is_merged = is_active && !original_models.iter().any(|m| m == model);
                 let indicator = if is_active {
                     lucide::circle_check::<iced::Theme, iced::Renderer>()
                         .size(12)
@@ -148,14 +156,15 @@ fn model_picker_list<'a>(
                 }
                 model_btn = model_btn.on_press(on_set_active(model.clone()));
 
-                let remove_btn = button(text("×").size(12))
-                    .padding(2)
-                    .style(theme::button_text_danger)
-                    .on_press(on_remove(model.clone()));
-
-                row![model_btn, Space::new().width(4), remove_btn]
-                    .align_y(Alignment::Center)
-                    .into()
+                let mut entry = row![model_btn];
+                if !is_merged {
+                    let remove_btn = button(text("×").size(12))
+                        .padding(2)
+                        .style(theme::button_text_danger)
+                        .on_press(on_remove(model.clone()));
+                    entry = entry.push(Space::new().width(4)).push(remove_btn);
+                }
+                entry.align_y(Alignment::Center).into()
             })
             .collect()
     };
@@ -291,6 +300,13 @@ pub enum SettingsMessage {
     ModelPicker {
         target: ModelPickerTarget,
         action: ModelPickerAction,
+    },
+    /// Result of an async model-picker add: validated against the image-models
+    /// catalog before the model is appended to the list.
+    ModelPickerAddResult {
+        target: ModelPickerTarget,
+        model: String,
+        ok: Result<(), String>,
     },
     // ── Voice assistant messages ──────────────────────────
     /// Toggle voice assistant on/off (immediately activates/deactivates the pipeline).
@@ -791,26 +807,86 @@ impl SettingsState {
             }
 
             // ── Model picker messages ─────────────────────────
-            SettingsMessage::ModelPicker { target, action } => match (target, action) {
-                (t, ModelPickerAction::AddInput(v)) => {
-                    self.model_picker_inputs[t.idx()] = v;
-                    Task::none()
+            SettingsMessage::ModelPicker { target, action } => {
+                match (target, action) {
+                    (t, ModelPickerAction::AddInput(v)) => {
+                        self.model_picker_inputs[t.idx()] = v;
+                        Task::none()
+                    }
+                    (t, ModelPickerAction::AddModel) => match t {
+                        // Image-gen additions are validated against the catalog
+                        // (fail-open when it is unavailable) before the list is
+                        // mutated; the input buffer is kept on rejection so the
+                        // user can correct it. Validation uses the endpoint being
+                        // drafted — the committed global may differ when the user
+                        // changed the endpoint in this unsaved session.
+                        ModelPickerTarget::ImageGen => {
+                            let model = self.model_picker_inputs[t.idx()].trim().to_string();
+                            if model.is_empty() {
+                                return Task::none();
+                            }
+                            let endpoint = self
+                                .config
+                                .provider_endpoint
+                                .as_deref()
+                                .unwrap_or(crate::config::DEFAULT_PROVIDER_ENDPOINT)
+                                .to_string();
+                            Task::perform(
+                                async move {
+                                    let ok = crate::tools::image_catalog::
+                                        validate_image_model_for_endpoint(&model, &endpoint)
+                                        .await
+                                        .map_err(|e| e.to_string());
+                                    (t, model, ok)
+                                },
+                                |(target, model, ok)| SettingsMessage::ModelPickerAddResult {
+                                    target,
+                                    model,
+                                    ok,
+                                },
+                            )
+                        }
+                        ModelPickerTarget::Video => {
+                            let (models, _active) = picker_config_fields(&t, &mut self.config);
+                            add_model_to_list(&mut self.model_picker_inputs[t.idx()], models);
+                            Task::none()
+                        }
+                    },
+                    (t, ModelPickerAction::RemoveModel(model)) => {
+                        let (models, active) = picker_config_fields(&t, &mut self.config);
+                        remove_model_from_list(&model, models, active);
+                        Task::none()
+                    }
+                    (t, ModelPickerAction::SetActive(model)) => {
+                        let (_models, active) = picker_config_fields(&t, &mut self.config);
+                        *active = Some(model);
+                        Task::none()
+                    }
                 }
-                (t, ModelPickerAction::AddModel) => {
-                    let (models, _active) = picker_config_fields(&t, &mut self.config);
-                    add_model_to_list(&mut self.model_picker_inputs[t.idx()], models);
-                    Task::none()
+            }
+
+            SettingsMessage::ModelPickerAddResult { target, model, ok } => match ok {
+                Ok(()) => {
+                    // Append the validated model directly — never route through
+                    // the input buffer, which may hold text the user typed while
+                    // the catalog validation was in flight.
+                    let (models, _active) = picker_config_fields(&target, &mut self.config);
+                    let mut list = parse_models(models.as_deref());
+                    if !list.contains(&model) {
+                        list.push(model.clone());
+                        *models = Some(list.join("\n"));
+                    }
+                    // Clear the input only when it still holds the added model
+                    // (modulo whitespace); anything the user typed meanwhile
+                    // must survive.
+                    if self.model_picker_inputs[target.idx()].trim() == model {
+                        self.model_picker_inputs[target.idx()].clear();
+                    }
+                    Task::done(SettingsMessage::Toast(super::ToastMessage::Saved))
                 }
-                (t, ModelPickerAction::RemoveModel(model)) => {
-                    let (models, active) = picker_config_fields(&t, &mut self.config);
-                    remove_model_from_list(&model, models, active);
-                    Task::none()
-                }
-                (t, ModelPickerAction::SetActive(model)) => {
-                    let (_models, active) = picker_config_fields(&t, &mut self.config);
-                    *active = Some(model);
-                    Task::none()
-                }
+                Err(e) => Task::done(SettingsMessage::Toast(super::ToastMessage::Error(format!(
+                    "Model `{model}` rejected: {e}"
+                )))),
             },
 
             SettingsMessage::Toast(_) => {

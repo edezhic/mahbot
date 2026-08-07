@@ -207,12 +207,17 @@ fn lookup(endpoint: &str) -> CatalogLookup {
     }
 }
 
-/// Return the cached catalog for the configured endpoint if fresh, otherwise
-/// fetch it (single-flight). Returns `None` (fail-open) when the catalog is
-/// unavailable — retried after a short negative-cache backoff.
+/// Return the cached catalog for the currently configured provider endpoint.
 pub(crate) async fn get_catalog() -> Option<Arc<ImageCatalog>> {
     let endpoint = crate::config::CONFIG.provider_endpoint();
-    let base = crate::providers::ensure_base_url(&endpoint);
+    get_catalog_for_endpoint(&endpoint).await
+}
+
+/// Return the cached catalog for `endpoint` if fresh, otherwise fetch it
+/// (single-flight). Returns `None` (fail-open) when the catalog is
+/// unavailable — retried after a short negative-cache backoff.
+async fn get_catalog_for_endpoint(endpoint: &str) -> Option<Arc<ImageCatalog>> {
+    let base = crate::providers::ensure_base_url(endpoint);
     match lookup(&base) {
         CatalogLookup::Fresh(catalog) => return Some(catalog),
         CatalogLookup::Backoff => return None,
@@ -257,6 +262,68 @@ fn store_failure(endpoint: String) {
         fetched_at: Instant::now(),
         catalog: None,
     });
+}
+
+/// Reject models that cannot generate images on the dedicated surface:
+/// unknown model ids or models that explicitly declare text-only output.
+/// Returns the model's catalog info for request building; models whose
+/// catalog entry lacks output modalities (shape drift) are allowed through.
+/// Catalog-driven — no per-model branches.
+///
+/// # Errors
+///
+/// - The model is absent from the catalog or explicitly declares no image output.
+pub(crate) fn check_image_capability<'a>(
+    model: &str,
+    catalog: &'a ImageCatalog,
+) -> anyhow::Result<&'a ImageModelInfo> {
+    let Some(info) = catalog.find(model) else {
+        anyhow::bail!(
+            "Model `{model}` cannot generate images: it is not in the OpenRouter \
+             image-models catalog. Set an image-capable model in Settings → \
+             Image Generation and retry."
+        );
+    };
+    if info.image_output == ImageOutput::TextOnly {
+        anyhow::bail!(
+            "Model `{model}` cannot generate images: the OpenRouter image-models catalog \
+             does not list image output for it. Set an image-capable model in \
+             Settings → Image Generation and retry."
+        );
+    }
+    Ok(info)
+}
+
+/// Write-time validation that `model` can generate images, using the catalog
+/// when available. Fail-open: when the catalog is unavailable the check passes
+/// (with a warning) — consistent with the generation tool's fail-open
+/// semantics, so a catalog outage never blocks settings writes.
+///
+/// Used by the settings save path, the GUI model picker, and the Telegram
+/// model commands.
+///
+/// # Errors
+///
+/// - Catalog available and the model is absent from it or text-only.
+pub async fn validate_image_model(model: &str) -> anyhow::Result<()> {
+    let endpoint = crate::config::CONFIG.provider_endpoint();
+    validate_image_model_for_endpoint(model, &endpoint).await
+}
+
+/// Like [`validate_image_model`], but against the catalog for `endpoint`
+/// rather than the currently configured one — the settings save path uses
+/// this when a save may switch providers.
+pub(crate) async fn validate_image_model_for_endpoint(
+    model: &str,
+    endpoint: &str,
+) -> anyhow::Result<()> {
+    let Some(catalog) = get_catalog_for_endpoint(endpoint).await else {
+        tracing::warn!(
+            "Image-models catalog unavailable — skipping write-time model validation (fail-open)"
+        );
+        return Ok(());
+    };
+    check_image_capability(model, &catalog).map(|_| ())
 }
 
 #[cfg(test)]

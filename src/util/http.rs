@@ -9,8 +9,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// HTTP client shared by [`crate::tools::image_gen::ImageGenTool`],
-/// [`crate::tools::video_gen::VideoGenTool`],
+/// HTTP client shared by [`crate::tools::video_gen::VideoGenTool`],
 /// [`crate::tools::web_search::WebSearchTool`], and
 /// [`crate::providers::transcribe::MediaTranscriber`] — all call their
 /// respective APIs with a 2-minute timeout.
@@ -19,6 +18,12 @@ use std::time::Duration;
 /// simply remove this static and re-add separate `OnceLock` statics in the
 /// relevant files (a trivial change — exactly the original pattern).
 static MEDIA_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+/// Dedicated HTTP client for image-generation POSTs — a 10-minute request
+/// timeout (generations routinely take 92–99 s and load spikes push further).
+/// Kept separate from [`MEDIA_HTTP_CLIENT`] so the 2-minute cap of the other
+/// media consumers (search, video, transcribe, catalog) is never raised.
+static IMAGE_GEN_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 /// Return a Bearer Authorization header value built from the configured
 /// provider API key.
@@ -200,13 +205,27 @@ pub async fn get_bytes_from_provider(url: &str, error_context: &str) -> anyhow::
 /// Return the shared media-generation HTTP client, initialising it on first
 /// call with a 2-minute request timeout and a 10-second connection timeout.
 ///
-/// Used by [`crate::tools::image_gen::ImageGenTool`], [`crate::tools::video_gen::VideoGenTool`], [`crate::tools::web_search::WebSearchTool`] (web search APIs),
-/// and `MediaTranscriber` — all of which need the same timeout.  If a future
-/// consumer requires a different timeout it should call
-/// [`build_http_client`] directly with the appropriate duration.
+/// Used by [`crate::tools::video_gen::VideoGenTool`], [`crate::tools::web_search::WebSearchTool`] (web search APIs),
+/// and `MediaTranscriber` — all of which need the same timeout.  Image
+/// generation uses its own dedicated 10-minute client
+/// ([`image_gen_http_client`]).  If a future consumer requires a different
+/// timeout it should call [`build_http_client`] directly with the
+/// appropriate duration.
 #[must_use]
 pub fn media_http_client() -> &'static reqwest::Client {
     MEDIA_HTTP_CLIENT.get_or_init(|| build_http_client(Duration::from_mins(2)))
+}
+
+/// Return the dedicated image-generation HTTP client with a 10-minute request
+/// timeout and a 10-second connection timeout.
+///
+/// Used exclusively by [`crate::tools::image_gen::ImageGenTool`]'s POST — slow
+/// generations routinely take 92–99 s, so the shared 2-minute media client
+/// would cut valid in-flight requests short. The image tool performs its own
+/// retry/error handling on top of this client (see `image_gen.rs`).
+#[must_use]
+pub fn image_gen_http_client() -> &'static reqwest::Client {
+    IMAGE_GEN_HTTP_CLIENT.get_or_init(|| build_http_client(Duration::from_mins(10)))
 }
 
 /// Build a configured `reqwest::Client` with the given request `timeout` and a

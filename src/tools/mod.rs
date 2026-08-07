@@ -5,7 +5,7 @@ pub(crate) mod ask;
 pub mod browser;
 pub mod browser_daemon;
 pub(crate) mod edit;
-pub(crate) mod image_catalog;
+pub mod image_catalog;
 pub(crate) mod image_gen;
 pub(crate) mod path;
 pub(crate) mod read;
