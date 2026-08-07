@@ -2891,7 +2891,8 @@ fn check_segment(segment: &str, state: &mut ValidationState, negated: bool) -> R
     let words: Vec<&str> = split_words_keeping_substitutions(trimmed);
     let (verb_idx, verb) = match resolve_verb(&words, negated) {
         VerbResolution::Informational | VerbResolution::None => {
-            apply_env_bindings(&words, state, negated)?;
+            // No literal verb here, so the export branch can't fire.
+            apply_env_bindings(&words, state, None)?;
             return Ok(());
         }
         VerbResolution::Verb {
@@ -2910,7 +2911,8 @@ fn check_segment(segment: &str, state: &mut ValidationState, negated: bool) -> R
                     "write the command name literally (e.g. `cd`, `rm`) so it can be validated.",
                 );
             }
-            apply_env_bindings(&words, state, negated)?;
+            // Same: unprovable verbs can't be a literal `export` — pass None.
+            apply_env_bindings(&words, state, None)?;
             return Ok(());
         }
         VerbResolution::Verb {
@@ -2940,7 +2942,14 @@ fn check_segment(segment: &str, state: &mut ValidationState, negated: bool) -> R
     // `export X=...`, plain `X=...` segments, and env-prefix forms
     // (`TMPDIR=/tmp cmd`) bind the temp variables; a non-temp binding poisons
     // the variable, a temp-root binding clears the poison.
-    apply_env_bindings(&words, state, negated)?;
+    //
+    // The export verb is the FULL word-list resolution (not the assignment-
+    // stripped slice): `time` is a forwarding prefix only at position 0, so
+    // `TMPDIR=/tmp time export X=...` resolves the external `time` and must
+    // not bind the export — a slice-relative head would wrongly bind it.
+    // Only this Literal-verb call site can fire that branch; the two earlier
+    // arms pass None.
+    apply_env_bindings(&words, state, Some((verb_idx, verb)))?;
 
     // Extract the effective command by stripping shell prefixes and
     // environment variable assignments.
@@ -3288,7 +3297,7 @@ fn check_git_env_binding(word: &str) -> Result<(), String> {
 fn apply_env_bindings(
     words: &[&str],
     state: &mut ValidationState,
-    negated: bool,
+    export_verb: Option<(usize, &str)>,
 ) -> Result<(), String> {
     let first_non_assign = words
         .iter()
@@ -3298,14 +3307,7 @@ fn apply_env_bindings(
         check_git_env_binding(w)?;
         bind_assignment_word(w, state);
     }
-    // The verb search uses the full word list (not the assignment-stripped
-    // slice): `time` is a forwarding prefix only at segment position 0, so
-    // `TMPDIR=/tmp time export X=...` must resolve the external `time` — a
-    // slice-relative head would wrongly forward and bind the export.
-    if let VerbResolution::Verb {
-        idx,
-        class: VerbClass::Literal(v),
-    } = resolve_verb(words, negated)
+    if let Some((idx, v)) = export_verb
         && v == "export"
     {
         for w in &words[idx + 1..] {
