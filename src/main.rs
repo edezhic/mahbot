@@ -519,6 +519,11 @@ fn main() -> Result<()> {
     // Read persisted window state (sync, before Iced runtime starts).
     let window_state = mahbot::gui::read_window_state();
 
+    // Suppress the macOS AutoFill heuristic before the run loop begins — the
+    // text-services disable itself runs on window open, after this point.
+    #[cfg(target_os = "macos")]
+    mahbot::gui::register_macos_startup_defaults();
+
     iced::application(
         move || {
             (

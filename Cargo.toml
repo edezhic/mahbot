@@ -169,7 +169,7 @@ windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage
 candle-nn = { version = "0.10.2", features = ["accelerate"] }
 qwen-asr = { version = "0.9.0", default-features = false, features = ["blas", "vdsp"] }
 objc2 = "0.5"
-objc2-app-kit = { version = "0.2", features = ["NSTextCheckingClient"] }
+objc2-foundation = { version = "0.2", features = ["NSUserDefaults", "NSObject", "NSValue"] }
 raw-window-handle = "0.6"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
