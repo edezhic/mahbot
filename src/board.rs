@@ -842,7 +842,7 @@ impl BoardStore {
         // between validation and cancellation.
         let rows = tx
             .query(
-                "SELECT workspace_name, phase FROM tickets WHERE id = ?1",
+                "SELECT workspace_name FROM tickets WHERE id = ?1",
                 turso::params![supersede_id],
             )
             .await?;
@@ -858,8 +858,6 @@ impl BoardStore {
              Cross-workspace supersede is not allowed.",
             params.workspace_name,
         );
-        let phase_str: String = row.get(1)?;
-        let old_phase: TicketPhase = phase_str.parse()?;
 
         let now = turso::now();
         let cancelled_rows = tx
@@ -888,14 +886,11 @@ impl BoardStore {
         // cancelled unnecessarily but will be re-registered on re-dispatch.
         crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(supersede_id);
 
+        // No ticket_buffer push for the cancellation: supersede is only reachable
+        // through agent tools (Manager or Maintainer CreateTicketTool) and agent
+        // actions are intentionally silent — the GUI board path is the user
+        // surface that notifies the Manager.
         tx.commit().await?;
-
-        crate::ticket_buffer::push(
-            &params.workspace_name,
-            supersede_id,
-            old_phase,
-            TicketPhase::Cancelled,
-        );
 
         Ok(new_id)
     }

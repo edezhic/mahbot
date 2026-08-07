@@ -337,6 +337,7 @@ where
                 &ctx.ticket.id,
                 ctx.source,
                 ctx.target,
+                ticket_buffer::TransitionOrigin::Pipeline,
             );
         }
     }
@@ -538,12 +539,18 @@ async fn notify_ticket(
         return;
     };
 
+    // Immediate notifications are only ever fired by pipeline code paths
+    // (never by user actions — those are buffered), so the origin marker is
+    // the constant Pipeline variant, rendered inline for symmetry with
+    // drained buffer entries. The enum's Display impl is the single source
+    // of truth for the user-visible wording.
     let transition_log = format!(
-        "[{}] {}: {} → {}",
+        "[{}] {}: {} → {} ({})",
         ticket.reporter,
         ticket.id,
         source.as_ref(),
-        target_phase.as_ref()
+        target_phase.as_ref(),
+        ticket_buffer::TransitionOrigin::Pipeline
     );
 
     // Drain buffered non-critical transitions before rendering the
@@ -1114,7 +1121,13 @@ async fn run_claim_pipeline(ws: &Workspace) {
                 // Buffer the claim transition. The returned ticket already
                 // has phase = info.expected_phase (from SQL RETURNING), so record
                 // the transition from source.
-                ticket_buffer::push(&ws.name, &t.id, source, t.phase);
+                ticket_buffer::push(
+                    &ws.name,
+                    &t.id,
+                    source,
+                    t.phase,
+                    ticket_buffer::TransitionOrigin::Pipeline,
+                );
                 t
             }
             Ok(None) => continue,
@@ -1598,6 +1611,7 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
             &ticket.id,
             TicketPhase::QaPassed,
             TicketPhase::InSanitation,
+            ticket_buffer::TransitionOrigin::Pipeline,
         );
 
         spawn_dispatch(PollPhase::SanitationCheck, ticket, ws);

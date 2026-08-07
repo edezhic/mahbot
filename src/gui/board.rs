@@ -499,13 +499,18 @@ impl BoardState {
                         let phase: TicketPhase = new_phase
                             .parse()
                             .map_err(|_| format!("Invalid phase: {new_phase}"))?;
+                        let ticket = board
+                            .get_ticket(&ticket_id)
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .ok_or_else(|| format!("Ticket {ticket_id} not found"))?;
+                        let source = ticket.phase;
                         // Cancelling a ticket with an agent mid-flight aborts the
                         // run — pause the workspace so queued development tickets
                         // don't cascade. Supersede auto-cancels and Manager-tool
                         // cancels don't go through here; shutdown and
                         // already-paused are handled inside the helper.
                         if phase == TicketPhase::Cancelled
-                            && let Ok(Some(ticket)) = board.get_ticket(&ticket_id).await
                             && AGENT_RUNNING_PHASES.contains(&ticket.phase)
                             && ticket.assigned_to.is_some()
                         {
@@ -527,7 +532,21 @@ impl BoardState {
                         board
                             .transition_to(&ticket_id, None, phase, None)
                             .await
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| e.to_string())?;
+                        // Skip the hop when the ticket already reached the
+                        // requested phase between render and click — the
+                        // transition was a no-op and a self-transition entry
+                        // would be a bogus hop.
+                        if source != phase {
+                            crate::ticket_buffer::push(
+                                &ticket.workspace_name,
+                                &ticket_id,
+                                source,
+                                phase,
+                                crate::ticket_buffer::TransitionOrigin::User,
+                            );
+                        }
+                        Ok(())
                     },
                     BoardMessage::ActionResult,
                 )

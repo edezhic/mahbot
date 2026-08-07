@@ -6,6 +6,9 @@
 //! Manager message. This ensures the Manager sees all ticket state changes
 //! without requiring a fresh `build_board_context` snapshot on every turn.
 //!
+//! Every entry carries its transition timestamp and origin (pipeline flow
+//! vs user action). On drain the Manager receives the full chronological
+//! sequence accumulated since the last drain — every hop, never coalesced.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write;
@@ -14,23 +17,43 @@ use std::sync::{Mutex, OnceLock};
 use crate::board::TicketPhase;
 use crate::util::UnwrapPoison;
 
+/// Who caused a ticket phase transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransitionOrigin {
+    /// Automated board pipeline (poller, dispatch, verdict machinery).
+    Pipeline,
+    /// A user action (GUI board actions).
+    User,
+}
+
+impl std::fmt::Display for TransitionOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransitionOrigin::Pipeline => f.write_str("pipeline flow"),
+            TransitionOrigin::User => f.write_str("user action"),
+        }
+    }
+}
+
 /// A single buffered ticket phase transition entry.
 #[derive(Debug)]
 struct Entry {
     id: String,
     source: TicketPhase,
     target: TicketPhase,
+    at: String,
+    origin: TransitionOrigin,
 }
 
 /// Global ticket transition buffer, keyed by workspace name.
 static TICKET_BUFFER: OnceLock<Mutex<HashMap<String, VecDeque<Entry>>>> = OnceLock::new();
 
 /// Initialize the global ticket buffer. Must be called during startup.
+///
+/// Idempotent — uses [`OnceLock::get_or_init`] so tests that reset the
+/// buffer and production bootstrap cannot race each other's initialization.
 pub fn init_global() {
-    TICKET_BUFFER
-        .set(Mutex::new(HashMap::new()))
-        .map_err(|_| "TICKET_BUFFER already initialized")
-        .expect("TICKET_BUFFER already initialized");
+    TICKET_BUFFER.get_or_init(|| Mutex::new(HashMap::new()));
 }
 
 /// Access the underlying mutex, panicking if the buffer is not initialized.
@@ -42,16 +65,26 @@ fn buffer() -> &'static Mutex<HashMap<String, VecDeque<Entry>>> {
 
 /// Push a non-critical ticket transition into the buffer.
 ///
+/// The entry is timestamped at push time and tagged with its origin.
+///
 /// # Panics
 ///
 /// Panics if the buffer has not been initialized via [`init_global`].
-pub(crate) fn push(workspace_name: &str, id: &str, source: TicketPhase, target: TicketPhase) {
+pub(crate) fn push(
+    workspace_name: &str,
+    id: &str,
+    source: TicketPhase,
+    target: TicketPhase,
+    origin: TransitionOrigin,
+) {
     let mut map = buffer().lock().unwrap_poison();
     let deque = map.entry(workspace_name.to_string()).or_default();
     deque.push_back(Entry {
         id: id.to_string(),
         source,
         target,
+        at: crate::turso::now(),
+        origin,
     });
 }
 
@@ -67,8 +100,8 @@ pub(crate) fn push(workspace_name: &str, id: &str, source: TicketPhase, target: 
 /// Format:
 /// ```text
 /// Ticket updates:
-/// • mahbot-1: in_development → in_diagnostics
-/// • mahbot-2: in_diagnostics → diagnostics_done
+/// • mahbot-1: in_development → in_diagnostics (pipeline flow, 2026-08-07T11:00:00+00:00)
+/// • mahbot-2: in_diagnostics → diagnostics_done (user action, 2026-08-07T11:05:00+00:00)
 /// ```
 #[must_use]
 pub(crate) fn drain(workspace_name: &str) -> String {
@@ -78,7 +111,11 @@ pub(crate) fn drain(workspace_name: &str) -> String {
     };
     let mut out = String::from("Ticket updates:\n");
     for entry in entries {
-        let _ = writeln!(out, "• {}: {} → {}", entry.id, entry.source, entry.target);
+        let _ = writeln!(
+            out,
+            "• {}: {} → {} ({}, {})",
+            entry.id, entry.source, entry.target, entry.origin, entry.at
+        );
     }
     out
 }
@@ -86,14 +123,8 @@ pub(crate) fn drain(workspace_name: &str) -> String {
 /// Reset all buffers for test isolation.
 #[cfg(test)]
 pub fn reset() {
-    match TICKET_BUFFER.get() {
-        Some(mutex) => {
-            mutex.lock().unwrap_poison().clear();
-        }
-        None => {
-            let _ = TICKET_BUFFER.set(Mutex::new(HashMap::new()));
-        }
-    }
+    init_global();
+    buffer().lock().unwrap_poison().clear();
 }
 
 #[cfg(test)]
@@ -107,11 +138,15 @@ mod tests {
     /// mutates the buffer must hold this lock.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    fn push_entry(ws: &str, id: &str, source: TicketPhase, target: TicketPhase) {
+        push(ws, id, source, target, TransitionOrigin::Pipeline);
+    }
+
     #[test]
     fn push_and_drain_ordered() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset();
-        push(
+        push_entry(
             "ws-a",
             "mahbot-1",
             TicketPhase::Backlog,
@@ -122,8 +157,9 @@ mod tests {
             "mahbot-2",
             TicketPhase::Analysis,
             TicketPhase::Planning,
+            TransitionOrigin::User,
         );
-        push(
+        push_entry(
             "ws-a",
             "mahbot-3",
             TicketPhase::InDevelopment,
@@ -137,6 +173,27 @@ mod tests {
         let pos2 = result.find("mahbot-2").unwrap();
         let pos3 = result.find("mahbot-3").unwrap();
         assert!(pos1 < pos2 && pos2 < pos3);
+
+        // Each line renders its origin and a strict RFC 3339 timestamp.
+        let lines: Vec<&str> = result.lines().skip(1).collect();
+        assert_eq!(lines.len(), 3);
+        for (i, line) in lines.iter().enumerate() {
+            let expected_origin = if i == 1 {
+                "user action"
+            } else {
+                "pipeline flow"
+            };
+            let (_, ts_paren) = line.rsplit_once(", ").unwrap();
+            assert!(
+                line.contains(&format!("({expected_origin}, ")),
+                "origin missing on line: {line}"
+            );
+            let ts = ts_paren.trim_end_matches(')');
+            assert!(
+                crate::turso::parse_utc_timestamp(ts).is_ok(),
+                "invalid RFC 3339 timestamp on line: {line}"
+            );
+        }
     }
 
     #[test]
@@ -150,13 +207,13 @@ mod tests {
     fn workspace_isolation() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset();
-        push(
+        push_entry(
             "ws-a",
             "mahbot-1",
             TicketPhase::Backlog,
             TicketPhase::Analysis,
         );
-        push(
+        push_entry(
             "ws-b",
             "mahbot-2",
             TicketPhase::ReadyForDevelopment,
@@ -174,7 +231,7 @@ mod tests {
     fn drain_consumes_entries() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset();
-        push(
+        push_entry(
             "ws-a",
             "mahbot-1",
             TicketPhase::Backlog,
