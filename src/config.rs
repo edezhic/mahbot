@@ -115,8 +115,7 @@ use tracing::warn;
 pub(crate) const DEFAULT_PROVIDER_ENDPOINT: &str = "https://openrouter.ai/api/v1";
 
 const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-3.1-flash-image";
-const DEFAULT_VIDEO_GEN_MODEL: &str = "google/veo-3.1-lite";
-const DEFAULT_VIDEO_EDIT_MODEL: &str = "minimax/hailuo-3";
+const DEFAULT_VIDEO_MODEL: &str = "minimax/hailuo-3";
 pub(crate) const DEFAULT_IMAGE_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.6-plus";
 pub(crate) const DEFAULT_TTS_LANGUAGE: &str = "na";
 
@@ -264,14 +263,10 @@ pub struct ConfigData {
     pub image_gen_model: Option<String>,
     /// Newline-separated list of available image generation models (for selection UI).
     pub image_gen_models: Option<String>,
-    /// Video generation model.
-    pub video_gen_model: Option<String>,
-    /// Newline-separated list of available video generation models (for selection UI).
-    pub video_gen_models: Option<String>,
-    /// Video edit model.
-    pub video_edit_model: Option<String>,
-    /// Newline-separated list of available video edit models (for selection UI).
-    pub video_edit_models: Option<String>,
+    /// Video model — shared by the video_gen and video_edit tools.
+    pub video_model: Option<String>,
+    /// Newline-separated list of available video models (for selection UI).
+    pub video_models: Option<String>,
     /// Firecrawl API key for web search.
     pub firecrawl_key: Option<String>,
     /// Exa API key for web search (alternative to Firecrawl).
@@ -552,10 +547,8 @@ string_config_fields! {
     image_transcription_provider [non_empty],
     image_gen_model [or(DEFAULT_IMAGE_GEN_MODEL)],
     image_gen_models [list_or(fallback = image_gen_model, default = DEFAULT_IMAGE_GEN_MODEL)],
-    video_gen_model [or(DEFAULT_VIDEO_GEN_MODEL)],
-    video_gen_models [list_or(fallback = video_gen_model, default = DEFAULT_VIDEO_GEN_MODEL)],
-    video_edit_model [or(DEFAULT_VIDEO_EDIT_MODEL)],
-    video_edit_models [list_or(fallback = video_edit_model, default = DEFAULT_VIDEO_EDIT_MODEL)],
+    video_model [or(DEFAULT_VIDEO_MODEL)],
+    video_models [list_or(fallback = video_model, default = DEFAULT_VIDEO_MODEL)],
     firecrawl_key [non_empty],
     exa_key [non_empty],
     web_search_provider [non_empty],
@@ -944,6 +937,19 @@ pub async fn reload_from_db() -> Result<()> {
     for (key, value) in &kvs {
         if !config.set_string_field(key, value) {
             tracing::debug!(key, "Unknown config key, ignoring");
+        }
+    }
+
+    // Migrate the legacy split video config keys into the unified video_model
+    // field: the old video-edit value takes precedence over the old video-gen
+    // value. The legacy keys remain as orphaned config_kv rows (harmless; a
+    // downgrade would resurrect them — accepted).
+    if config.video_model.is_none() {
+        for legacy in ["video_edit_model", "video_gen_model"] {
+            if let Some((_, value)) = kvs.iter().find(|(k, _)| k.as_str() == legacy) {
+                config.video_model = Some(value.clone());
+                break;
+            }
         }
     }
 

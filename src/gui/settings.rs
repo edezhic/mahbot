@@ -187,16 +187,14 @@ fn model_picker_list<'a>(
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, EnumCount)]
 pub enum ModelPickerTarget {
     ImageGen,
-    VideoGen,
-    VideoEdit,
+    Video,
 }
 
 impl ModelPickerTarget {
     fn idx(self) -> usize {
         match self {
             ModelPickerTarget::ImageGen => 0,
-            ModelPickerTarget::VideoGen => 1,
-            ModelPickerTarget::VideoEdit => 2,
+            ModelPickerTarget::Video => 1,
         }
     }
 }
@@ -218,10 +216,7 @@ fn picker_config_fields<'a>(
 ) -> (&'a mut Option<String>, &'a mut Option<String>) {
     match t {
         ModelPickerTarget::ImageGen => (&mut config.image_gen_models, &mut config.image_gen_model),
-        ModelPickerTarget::VideoGen => (&mut config.video_gen_models, &mut config.video_gen_model),
-        ModelPickerTarget::VideoEdit => {
-            (&mut config.video_edit_models, &mut config.video_edit_model)
-        }
+        ModelPickerTarget::Video => (&mut config.video_models, &mut config.video_model),
     }
 }
 
@@ -1323,7 +1318,7 @@ impl SettingsState {
             );
         } else {
             for user in &us.users {
-                let is_admin = user.name == "admin";
+                let is_admin = user.is_admin();
                 let is_active = active_user == Some(user.name.as_str());
 
                 // Switch-user icon column: clickable when not the active user
@@ -2005,23 +2000,10 @@ impl SettingsState {
                     .color(theme::ACCENT),
                 Space::new().height(2),
                 model_picker_list(
-                    ModelPickerTarget::VideoGen,
-                    self.config.video_gen_models.as_deref(),
-                    self.config.video_gen_model.as_deref(),
-                    self.model_picker_inputs[ModelPickerTarget::VideoGen.idx()].as_str(),
-                    "model name (e.g. google/veo-...)",
-                ),
-                Space::new().height(12),
-                text("Video Edit")
-                    .size(13)
-                    .font(iced::Font::MONOSPACE)
-                    .color(theme::ACCENT),
-                Space::new().height(2),
-                model_picker_list(
-                    ModelPickerTarget::VideoEdit,
-                    self.config.video_edit_models.as_deref(),
-                    self.config.video_edit_model.as_deref(),
-                    self.model_picker_inputs[ModelPickerTarget::VideoEdit.idx()].as_str(),
+                    ModelPickerTarget::Video,
+                    self.config.video_models.as_deref(),
+                    self.config.video_model.as_deref(),
+                    self.model_picker_inputs[ModelPickerTarget::Video.idx()].as_str(),
                     "model name (e.g. minimax/hailuo-3)",
                 ),
             ],

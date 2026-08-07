@@ -32,7 +32,7 @@ pub(crate) mod widget_helpers;
 pub(crate) mod widgets;
 pub(crate) mod workspaces;
 
-use crate::board::{Ticket, TicketPhase};
+use crate::board::Ticket;
 use crate::logs::LogStore;
 
 use iced::keyboard;
@@ -1649,20 +1649,11 @@ fn section_hint(label: &str) -> Element<'_, Message> {
 /// Render the normal ticket list partitioned into groups (In Progress,
 /// Ready, Pending, Completed).
 fn render_normal_ticket_list(board_state: &board::BoardState) -> Element<'_, Message> {
-    let (pending, pipeline, completed) = board::BoardState::partition_tickets(&board_state.tickets);
+    let [in_progress, ready, pending, completed] =
+        board::BoardState::board_sections(&board_state.tickets);
 
-    let pinned: Vec<&Ticket> = pipeline
-        .iter()
-        .filter(|t| t.phase != TicketPhase::ReadyForDevelopment)
-        .copied()
-        .collect();
-    let ready: Vec<&Ticket> = pipeline
-        .iter()
-        .filter(|t| t.phase == TicketPhase::ReadyForDevelopment)
-        .copied()
-        .collect();
-
-    let is_empty = pending.is_empty() && pipeline.is_empty() && completed.is_empty();
+    let is_empty =
+        in_progress.is_empty() && ready.is_empty() && pending.is_empty() && completed.is_empty();
 
     if !board_state.load_state.has_loaded() {
         section_hint("Loading…")
@@ -1670,8 +1661,8 @@ fn render_normal_ticket_list(board_state: &board::BoardState) -> Element<'_, Mes
         section_hint("No tickets")
     } else {
         let mut groups = Column::new().spacing(8);
-        if !pinned.is_empty() {
-            groups = groups.push(group_section("In Progress", &pinned, board_state));
+        if !in_progress.is_empty() {
+            groups = groups.push(group_section("In Progress", &in_progress, board_state));
         }
         if !ready.is_empty() {
             groups = groups.push(group_section("Ready", &ready, board_state));

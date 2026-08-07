@@ -148,6 +148,40 @@ impl UserStore {
         self.user_column("selected_role", user_name).await
     }
 
+    /// Get the permissions value for a user (NULL = restricted, "full" = admin).
+    pub async fn get_permissions(&self, user_name: &str) -> Result<Option<String>> {
+        self.user_column("permissions", user_name).await
+    }
+
+    /// Find the first user whose channel binding for `channel` has a
+    /// `reply_target` matching `target` (exact, or `target:thread`). Used for
+    /// reverse lookup of the recipient of an outbound message — first match
+    /// wins when multiple users share a chat (group chats).
+    pub async fn resolve_user_by_reply_target(
+        &self,
+        channel: &str,
+        target: &str,
+    ) -> Result<Option<String>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT user_name, reply_target FROM user_channels WHERE channel = ?1",
+                turso::params![channel],
+            )
+            .await?;
+        let thread_prefix = format!("{target}:");
+        for row in rows {
+            let user_name: String = row.get(0)?;
+            let reply_target: Option<String> = row.get(1)?;
+            if let Some(t) = reply_target
+                && (t == target || t.starts_with(&thread_prefix))
+            {
+                return Ok(Some(user_name));
+            }
+        }
+        Ok(None)
+    }
+
     // ── Channel bindings ──────────────────────────────────────
 
     /// Bind a channel to a user. `channel` is e.g. `"telegram"`, `identifier`
@@ -297,6 +331,13 @@ impl UserStore {
         self.list_users_where("", turso::params![]).await
     }
 
+    /// Find the user with admin (full) permissions, if any.
+    pub async fn find_admin(&self) -> Result<Option<UserRecord>> {
+        self.list_users_where("WHERE permissions = ?1", turso::params!["full"])
+            .await
+            .map(|users| users.into_iter().next())
+    }
+
     /// Atomically update user preferences (role, workspace, permissions) in a single
     /// transaction. Use [`FieldUpdate::Unchanged`] to leave a column as-is or
     /// [`FieldUpdate::Clear`] to explicitly clear it to NULL.
@@ -370,6 +411,20 @@ pub struct UserRecord {
     pub selected_role: Option<String>,
     /// Channel bindings for this user (Telegram, etc.).
     pub channels: Vec<ChannelBinding>,
+}
+
+impl UserRecord {
+    /// Whether this user has admin (full) permissions.
+    #[must_use]
+    pub fn is_admin(&self) -> bool {
+        is_admin_permissions(self.permissions.as_deref())
+    }
+}
+
+/// Whether a permissions value grants admin rights (`"full"`).
+#[must_use]
+pub fn is_admin_permissions(permissions: Option<&str>) -> bool {
+    permissions == Some("full")
 }
 
 /// A single channel binding for a user.
@@ -493,6 +548,35 @@ pub async fn resolve_user_by_channel(channel: &str, identifier: &str) -> Option<
             tracing::warn!(error = %e, ?channel, ?identifier, "Failed to resolve user by channel");
             None
         })
+}
+
+/// Resolve the canonical user name whose channel binding's `reply_target`
+/// matches the given outbound recipient (exact or `target:thread`).
+/// First match wins for group chats shared by multiple users.
+pub async fn resolve_user_by_reply_target(channel: &str, target: &str) -> Option<String> {
+    let store = USER_STORE.get()?;
+    store
+        .resolve_user_by_reply_target(channel, target)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, ?channel, ?target, "Failed to resolve user by reply target");
+            None
+        })
+}
+
+/// Whether the named user has admin (full) permissions. Users without a row
+/// or with NULL permissions are not admins.
+pub async fn is_admin(user_name: &str) -> bool {
+    match USER_STORE.get() {
+        Some(store) => match store.get_permissions(user_name).await {
+            Ok(perms) => is_admin_permissions(perms.as_deref()),
+            Err(e) => {
+                tracing::warn!(error = %e, user_name, "Failed to read permissions");
+                false
+            }
+        },
+        None => false,
+    }
 }
 
 /// Update reply_target for a channel binding (called on every incoming message).

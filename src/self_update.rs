@@ -478,16 +478,18 @@ async fn run_cargo_build(manifest_dir: &Path, admin_target: Option<&str>) -> Res
     }
 }
 
-/// Look up the admin user's Telegram reply target.
+/// Look up an admin user's Telegram reply target.
 ///
-/// Returns `Some(reply_target)` if the "admin" user has a Telegram channel
-/// binding with a non-null `reply_target` and a bot token is configured.
-/// Returns `None` otherwise.
+/// Returns `Some(reply_target)` if an admin user (permissions == "full") has
+/// a Telegram channel binding with a non-null `reply_target` and a bot token
+/// is configured. Returns `None` otherwise. With multiple admins, the first
+/// bound one wins.
 pub async fn resolve_admin_telegram_target() -> Option<String> {
     let _ = crate::config::CONFIG.telegram_bot_token()?;
 
     let store = crate::users::store();
-    let bindings = store.get_user_channels("admin").await.ok()?;
+    let admin = store.find_admin().await.ok()??;
+    let bindings = store.get_user_channels(&admin.name).await.ok()?;
     bindings
         .into_iter()
         .find(|b| b.channel == "telegram" && b.reply_target.is_some())

@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use mahbot::channels::broadcast_and_persist_incoming_message;
 use mahbot::channels::telegram::{
-    CLEAR_COMMAND_DESC, MODELS_COMMAND_DESC, decode_action, decode_callback,
+    CLEAR_COMMAND_DESC, decode_action, decode_callback, user_command_entries,
 };
 use mahbot::config::CONFIG;
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
@@ -609,9 +609,9 @@ async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMe
     }
 }
 
-/// Handle Telegram bot text commands (`/start`, `/clear`, `/models`).
-/// Returns `true` if the message was handled (loop should `continue`),
-/// `false` if it should be processed by the agent pipeline.
+/// Handle Telegram bot text commands. Returns `true` if the message was
+/// handled (loop should `continue`), `false` if it should be processed by
+/// the agent pipeline.
 ///
 /// Only Telegram gets command handling; GUI and other channels route
 /// these messages as normal text (returns false to fall through to
@@ -628,28 +628,67 @@ async fn handle_bot_command(msg: &ChannelMessage) -> bool {
     match cmd {
         BotCommand::Start => handle_start_command(msg).await,
         BotCommand::Clear => handle_clear_session(msg).await,
-        BotCommand::Models => handle_models_command(msg).await,
+        // Artist-gated commands: denial for non-Artist users.
+        BotCommand::ImageModels | BotCommand::VideoModels => {
+            if mahbot::users::resolve_active_role(&msg.user_name).await == Role::Artist {
+                handle_models_command(msg, cmd == BotCommand::ImageModels).await;
+            } else {
+                send_telegram_reply(
+                    msg,
+                    "This command is only available to Artist users.".to_string(),
+                )
+                .await;
+            }
+        }
+        // Admin-gated commands: denial for non-admin users.
+        BotCommand::Board
+        | BotCommand::Archive
+        | BotCommand::Pause
+        | BotCommand::Unpause
+        | BotCommand::Maintenance => {
+            if mahbot::users::is_admin(&msg.user_name).await {
+                handle_admin_command(msg, cmd).await;
+            } else {
+                send_telegram_reply(
+                    msg,
+                    "This command is only available to admin users.".to_string(),
+                )
+                .await;
+            }
+        }
     }
     true
 }
 
-/// Handle `/start` command for Telegram — sends a minimal welcome message
-/// listing available commands (no inline keyboard).
-async fn handle_start_command(msg: &ChannelMessage) {
+/// Send a plain-text reply directly on the message's channel (no router
+/// broadcast/persist — used for command responses, not agent replies).
+async fn send_telegram_reply(msg: &ChannelMessage, content: String) {
     let reply = mahbot::SendMessage {
-        content: format!(
-            "\u{1F916} Welcome to MahBot!\n\n\
-             Available commands:\n\
-             /start — Show this message\n\
-             /clear — {CLEAR_COMMAND_DESC}\n\
-             /models — {MODELS_COMMAND_DESC}"
-        ),
+        content,
         recipient: msg.reply_target.clone(),
         reply_markup: None,
     };
     if let Some(channel) = mahbot::channel_registry().get(&msg.channel) {
         let _ = channel.send(&reply).await;
     }
+}
+
+/// Handle `/start` command for Telegram — sends a per-user welcome message
+/// listing the commands available to the current role/admin state (no inline
+/// keyboard).
+async fn handle_start_command(msg: &ChannelMessage) {
+    let mut lines = vec![
+        "\u{1F916} Welcome to MahBot!\n\nAvailable commands:".to_string(),
+        "/start — Show this message".to_string(),
+        format!("/clear — {CLEAR_COMMAND_DESC}"),
+    ];
+    for (cmd, desc) in user_command_entries(&msg.user_name).await {
+        if cmd == "clear" {
+            continue; // already listed above
+        }
+        lines.push(format!("/{cmd} — {desc}"));
+    }
+    send_telegram_reply(msg, lines.join("\n")).await;
 }
 
 /// Handle session clearing for `/clear` and the "Clear session" inline button —
@@ -684,71 +723,57 @@ async fn deliver_clear_reply(reply: &str, msg: &ChannelMessage, ws: &Workspace, 
     .await;
 }
 
-/// Handle `/models` command for Telegram — shows model selection keyboard
-/// (image and video models for Artist, clear session button for other roles).
-async fn handle_models_command(msg: &ChannelMessage) {
-    let reply_markup = build_models_keyboard(msg).await;
+/// Handle `/image_models` / `/video_models` commands for Telegram — shows
+/// the image or video model selection keyboard (Artist role).
+async fn handle_models_command(msg: &ChannelMessage, is_image: bool) {
+    let reply_markup = build_models_keyboard(is_image);
     let reply = mahbot::SendMessage {
-        content: "Select a model:".to_string(),
+        content: if is_image {
+            "Select an image model:".to_string()
+        } else {
+            "Select a video model:".to_string()
+        },
         recipient: msg.reply_target.clone(),
         reply_markup: Some(reply_markup),
     };
     // Send directly through the channel so the inline_keyboard structure
     // (rows of buttons) is preserved exactly — the router delivery path
     // has no inline-keyboard support, so this bypasses it for multi-row
-    // replies like the /models menu.
+    // replies like the model menus.
     if let Some(channel) = mahbot::channel_registry().get(&msg.channel) {
         let _ = channel.send(&reply).await;
     }
 }
 
-/// Build inline keyboard for model selection based on the user's current role.
+/// Build inline keyboard for image or video model selection.
 ///
 /// Returns the full Telegram `inline_keyboard` JSON array, where each element
-/// is a row (list of buttons in that row). Each button gets its own row.
-///
-/// For Artist: shows image model selection, video model selection, and clear session.
-/// For other roles: shows only clear session.
-async fn build_models_keyboard(msg: &ChannelMessage) -> serde_json::Value {
-    let role = mahbot::users::resolve_active_role(&msg.user_name).await;
+/// is a row (list of buttons in that row). Each button gets its own row,
+/// followed by a clear-session button.
+fn build_models_keyboard(is_image: bool) -> serde_json::Value {
+    let mut rows: Vec<serde_json::Value> = Vec::new();
 
-    let clear_session_btn = serde_json::json!([{
-        "text": "Clear session",
-        "callback_data": "__act__clear_session|",
-    }]);
-
-    let rows = if role == Role::Artist {
-        let mut rows: Vec<serde_json::Value> = Vec::new();
-
-        // Image model buttons — each on its own row
+    // Model buttons — each on its own row
+    if is_image {
         build_model_button_rows(
             &mut rows,
             &CONFIG.image_gen_models(),
             &CONFIG.image_gen_model(),
             "__act__set_image_model",
         );
-
-        // Video model buttons — each on its own row
+    } else {
         build_model_button_rows(
             &mut rows,
-            &CONFIG.video_gen_models(),
-            &CONFIG.video_gen_model(),
+            &CONFIG.video_models(),
+            &CONFIG.video_model(),
             "__act__set_video_model",
         );
+    }
 
-        // Video edit model buttons — each on its own row
-        build_model_button_rows(
-            &mut rows,
-            &CONFIG.video_edit_models(),
-            &CONFIG.video_edit_model(),
-            "__act__set_video_edit_model",
-        );
-
-        rows.push(clear_session_btn);
-        rows
-    } else {
-        vec![clear_session_btn]
-    };
+    rows.push(serde_json::json!([{
+        "text": "Clear session",
+        "callback_data": "__act__clear_session|",
+    }]));
 
     serde_json::json!({ "inline_keyboard": rows })
 }
@@ -773,6 +798,144 @@ fn build_model_button_rows(
     }
 }
 
+// ── Admin commands (board / archive / pause / unpause / maintenance) ─────
+
+/// Resolve the user's shared active workspace for admin commands. Returns
+/// `None` when the user has no shared workspace selected (personal or
+/// undefined) — mirroring the GUI's "no active workspace" guard.
+async fn resolve_admin_workspace(msg: &ChannelMessage) -> Result<Option<String>, String> {
+    let selected = mahbot::users::get_raw_selected_workspace(&msg.user_name)
+        .await
+        .map_err(|e| format!("Failed to read workspace selection: {e}"))?;
+    match selected {
+        Some(name) if !name.trim().is_empty() => {
+            let ws = mahbot::workspace::get_by_name(&name)
+                .await
+                .map_err(|e| format!("Failed to look up workspace: {e}"))?;
+            match ws {
+                Some(_) => Ok(Some(name)),
+                None => Err(format!("Active workspace '{name}' no longer exists.")),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Handle admin-gated commands (`/board`, `/archive`, `/pause`, `/unpause`,
+/// `/maintenance`). All reuse the same store methods the GUI calls so the
+/// two surfaces can never diverge.
+async fn handle_admin_command(msg: &ChannelMessage, cmd: mahbot::BotCommand) {
+    // `/maintenance` validates its on|off argument before anything else —
+    // a missing/invalid arg gets a usage response regardless of workspace
+    // state. Lowercased first: command recognition is case-insensitive.
+    let maintenance_arg = if cmd == BotCommand::Maintenance {
+        let arg = msg.content.trim().to_ascii_lowercase();
+        match arg.strip_prefix("/maintenance").map_or("", str::trim) {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => {
+                send_telegram_reply(msg, "Usage: /maintenance on|off".to_string()).await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let ws_name = match resolve_admin_workspace(msg).await {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            send_telegram_reply(
+                msg,
+                "No active workspace — select a shared workspace in Settings → Users.".to_string(),
+            )
+            .await;
+            return;
+        }
+        Err(e) => {
+            send_telegram_reply(msg, e).await;
+            return;
+        }
+    };
+
+    match (cmd, maintenance_arg) {
+        (BotCommand::Board, _) => handle_board_listing(msg, &ws_name).await,
+        (BotCommand::Archive, _) => {
+            let count = mahbot::board::store()
+                .archive_all_done_and_cancelled(Some(&ws_name))
+                .await;
+            match count {
+                Ok(n) => send_telegram_reply(msg, format!("Archived {n} tickets.")).await,
+                Err(e) => send_telegram_reply(msg, format!("Failed to archive tickets: {e}")).await,
+            }
+        }
+        (BotCommand::Pause, _) => toggle_workspace_state(msg, &ws_name, true, false).await,
+        (BotCommand::Unpause, _) => toggle_workspace_state(msg, &ws_name, false, false).await,
+        (BotCommand::Maintenance, Some(enable)) => {
+            toggle_workspace_state(msg, &ws_name, enable, true).await;
+        }
+        // Impossible: invalid /maintenance args returned early above, and the
+        // non-admin commands never reach this handler.
+        _ => unreachable!(),
+    }
+}
+
+/// Apply a pause or maintenance toggle via the workspace store (the same
+/// method the GUI toggle uses) and confirm the requested state.
+async fn toggle_workspace_state(
+    msg: &ChannelMessage,
+    ws_name: &str,
+    enable: bool,
+    is_maintenance: bool,
+) {
+    let store = mahbot::workspace::store();
+    let result = if is_maintenance {
+        store.set_maintenance_enabled(ws_name, enable).await
+    } else {
+        store.set_paused(ws_name, enable).await
+    };
+    if let Err(e) = result {
+        send_telegram_reply(msg, format!("Failed to update workspace '{ws_name}': {e}")).await;
+        return;
+    }
+    let verb = match (is_maintenance, enable) {
+        (true, true) => "Maintenance enabled",
+        (true, false) => "Maintenance disabled",
+        (false, true) => "Workspace pipeline paused",
+        (false, false) => "Workspace pipeline resumed",
+    };
+    send_telegram_reply(msg, format!("{verb} for '{ws_name}'.")).await;
+}
+
+/// Handle `/board` — list the active workspace's non-archived tickets in the
+/// exact order the GUI board column shows them (shared ordering helper).
+async fn handle_board_listing(msg: &ChannelMessage, ws_name: &str) {
+    let tickets = match mahbot::board::store()
+        .list_all_tickets(Some(ws_name), None)
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            send_telegram_reply(msg, format!("Failed to load board: {e}")).await;
+            return;
+        }
+    };
+    let ordered = mahbot::board::BoardStore::board_display_order(&tickets);
+    if ordered.is_empty() {
+        send_telegram_reply(msg, "No tickets.".to_string()).await;
+        return;
+    }
+    // `•` bullet instead of `*` — the listing is rendered through Telegram's
+    // markdown→HTML conversion, where a leading `*` would pair with a `*` in
+    // a ticket title and swallow the status/id into an italic span.
+    let listing = ordered
+        .iter()
+        .map(|t| format!("• {} {} {}", t.phase.as_ref(), t.id, t.title))
+        .collect::<Vec<_>>()
+        .join("\n");
+    send_telegram_reply(msg, listing).await;
+}
+
 /// Handle an action callback (`__act__` prefix).
 ///
 /// Actions are processed inline without involving the Manager agent queue.
@@ -784,13 +947,10 @@ async fn handle_action_callback(msg: ChannelMessage) {
 
     match action.as_str() {
         "set_image_model" => {
-            handle_set_model_action(&msg, &payload, "image_gen_model", "Image").await;
+            handle_set_model_action(&msg, &payload, "image_gen_model", "Image generation").await;
         }
         "set_video_model" => {
-            handle_set_model_action(&msg, &payload, "video_gen_model", "Video").await;
-        }
-        "set_video_edit_model" => {
-            handle_set_model_action(&msg, &payload, "video_edit_model", "Video edit").await;
+            handle_set_model_action(&msg, &payload, "video_model", "Video").await;
         }
         "clear_session" => {
             // Acknowledge callback silently first (dismiss spinner)
@@ -832,11 +992,7 @@ async fn handle_set_model_action(
     // Lightweight in-memory update — no DB read, no provider warmup
     let _ = CONFIG.set_string_field(config_key, payload);
 
-    answer_telegram_callback(
-        msg,
-        Some(format!("{display_name} generation model set to: {payload}")),
-    )
-    .await;
+    answer_telegram_callback(msg, Some(format!("{display_name} model set to: {payload}"))).await;
 }
 
 /// Acknowledge a Telegram callback query with an optional toast message.

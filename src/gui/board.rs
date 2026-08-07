@@ -894,70 +894,8 @@ impl BoardState {
     }
 
     /// Partition tickets into the three kanban columns.
-    pub(crate) fn partition_tickets(
-        tickets: &[Ticket],
-    ) -> (Vec<&Ticket>, Vec<&Ticket>, Vec<&Ticket>) {
-        let mut pending = Vec::new();
-        let mut pipeline = Vec::new();
-        let mut completed = Vec::new();
-
-        for ticket in tickets {
-            if ticket.is_archived {
-                continue; // hidden from board
-            }
-            match ticket.phase {
-                TicketPhase::Backlog
-                | TicketPhase::Analysis
-                | TicketPhase::Planning
-                | TicketPhase::Failed => pending.push(ticket),
-                TicketPhase::ReadyForDevelopment
-                | TicketPhase::InDevelopment
-                | TicketPhase::InDiagnostics
-                | TicketPhase::DiagnosticsDone
-                | TicketPhase::InSanitation
-                | TicketPhase::SanitationPassed
-                | TicketPhase::InReview
-                | TicketPhase::Reviewed
-                | TicketPhase::InQa
-                | TicketPhase::QaPassed => pipeline.push(ticket),
-                TicketPhase::Done | TicketPhase::Cancelled => completed.push(ticket),
-            }
-        }
-
-        // Sort: pending and pipeline by priority (ASC), then oldest-first (ASC);
-        // completed: Done tickets newest-done_first (DESC), then Cancelled
-        // newest-first (DESC) below them.
-        // Priority is an integer — 0 = highest, so ASC puts urgent tickets first.
-        // Ticket created_at is an ISO 8601 string, so lexical sort = chronological sort
-        pending.sort_by(|a, b| {
-            a.priority
-                .cmp(&b.priority)
-                .then(a.created_at.cmp(&b.created_at))
-        });
-        pipeline.sort_by(|a, b| {
-            a.priority
-                .cmp(&b.priority)
-                .then(a.created_at.cmp(&b.created_at))
-        });
-        completed.sort_by(|a, b| {
-            let (a_done, b_done) = (a.phase == TicketPhase::Done, b.phase == TicketPhase::Done);
-            match (a_done, b_done) {
-                // Done first, newest completion on top (created_at fallback
-                // for Done tickets with no done_at, e.g. test-created ones).
-                (true, true) => Self::done_sort_key(b).cmp(Self::done_sort_key(a)),
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                (false, false) => b.created_at.cmp(&a.created_at),
-            }
-        });
-
-        (pending, pipeline, completed)
-    }
-
-    /// Completion ordering key for a completed-column ticket: its exact done
-    /// timestamp, falling back to creation time when `done_at` is absent.
-    fn done_sort_key(ticket: &Ticket) -> &str {
-        ticket.done_at.as_deref().unwrap_or(&ticket.created_at)
+    pub(crate) fn board_sections(tickets: &[Ticket]) -> [Vec<&Ticket>; 4] {
+        crate::board::BoardStore::board_sections(tickets)
     }
 
     /// Render a single ticket card: clickable title, ID, phase badge, and action icons.
@@ -2156,7 +2094,7 @@ mod tests {
             test_ticket("c1", TicketPhase::Cancelled, "2026-01-03T00:00:00Z", None),
             test_ticket("c2", TicketPhase::Cancelled, "2026-01-02T00:00:00Z", None),
         ];
-        let (_, _, completed) = BoardState::partition_tickets(&tickets);
+        let [_, _, _, completed] = BoardState::board_sections(&tickets);
         let ids: Vec<&str> = completed.iter().map(|t| t.id.as_str()).collect();
         // Done first (newest done_at, created_at fallback), then cancelled
         // (newest created_at). A cancelled ticket's stale done_at must not

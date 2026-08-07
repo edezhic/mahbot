@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 
 crate::define_store! {
     /// Global board store.
-    pub(crate) static BOARD: BoardStore,
+    pub static BOARD: BoardStore,
     db_name = "board",
     schema = SCHEMA,
     post_open = after_open,
@@ -1973,6 +1973,119 @@ impl BoardStore {
             .await
             .context("Failed to archive done/cancelled tickets")?;
         Ok(updated)
+    }
+
+    // ── Board display ordering (shared with the GUI) ─────────────────────
+    //
+    // The GUI board and the Telegram `/board` command must show tickets in
+    // exactly the same order. These helpers are the single source of truth —
+    // the GUI column rendering and the Telegram listing both use them.
+
+    /// Partition tickets into the three kanban columns, in the same order the
+    /// GUI board displays them: pending (backlog/planning/failed), pipeline
+    /// (ready for dev → qa passed), completed (done/cancelled). Archived
+    /// tickets are excluded.
+    ///
+    /// Non-completed tickets sort by priority ASC (0 = highest) then
+    /// created_at ASC; completed tickets sort Done-first by exact done
+    /// timestamp DESC (created_at fallback), then Cancelled by created_at
+    /// DESC.
+    #[must_use]
+    pub fn partition_board_tickets(
+        tickets: &[Ticket],
+    ) -> (Vec<&Ticket>, Vec<&Ticket>, Vec<&Ticket>) {
+        let mut pending = Vec::new();
+        let mut pipeline = Vec::new();
+        let mut completed = Vec::new();
+
+        for ticket in tickets {
+            if ticket.is_archived {
+                continue; // hidden from board
+            }
+            match ticket.phase {
+                TicketPhase::Backlog
+                | TicketPhase::Analysis
+                | TicketPhase::Planning
+                | TicketPhase::Failed => pending.push(ticket),
+                TicketPhase::ReadyForDevelopment
+                | TicketPhase::InDevelopment
+                | TicketPhase::InDiagnostics
+                | TicketPhase::DiagnosticsDone
+                | TicketPhase::InSanitation
+                | TicketPhase::SanitationPassed
+                | TicketPhase::InReview
+                | TicketPhase::Reviewed
+                | TicketPhase::InQa
+                | TicketPhase::QaPassed => pipeline.push(ticket),
+                TicketPhase::Done | TicketPhase::Cancelled => completed.push(ticket),
+            }
+        }
+
+        // Sort: pending and pipeline by priority (ASC), then oldest-first (ASC);
+        // completed: Done tickets newest-done_first (DESC), then Cancelled
+        // newest-first (DESC) below them.
+        // Priority is an integer — 0 = highest, so ASC puts urgent tickets first.
+        // Ticket created_at is an ISO 8601 string, so lexical sort = chronological sort
+        pending.sort_by(|a, b| {
+            a.priority
+                .cmp(&b.priority)
+                .then(a.created_at.cmp(&b.created_at))
+        });
+        pipeline.sort_by(|a, b| {
+            a.priority
+                .cmp(&b.priority)
+                .then(a.created_at.cmp(&b.created_at))
+        });
+        completed.sort_by(|a, b| {
+            let (a_done, b_done) = (a.phase == TicketPhase::Done, b.phase == TicketPhase::Done);
+            match (a_done, b_done) {
+                // Done first, newest completion on top (created_at fallback
+                // for Done tickets with no done_at, e.g. test-created ones).
+                (true, true) => Self::board_done_sort_key(b).cmp(Self::board_done_sort_key(a)),
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (false, false) => b.created_at.cmp(&a.created_at),
+            }
+        });
+
+        (pending, pipeline, completed)
+    }
+
+    /// The four board sections in display order: In Progress (pipeline minus
+    /// ReadyForDevelopment), Ready, Pending, Completed. Shared by the GUI
+    /// column rendering and the Telegram `/board` listing so the two surfaces
+    /// can never diverge. Empty sections are included (callers skip them).
+    #[must_use]
+    pub fn board_sections(tickets: &[Ticket]) -> [Vec<&Ticket>; 4] {
+        let (pending, pipeline, completed) = Self::partition_board_tickets(tickets);
+        let in_progress = pipeline
+            .iter()
+            .filter(|t| t.phase != TicketPhase::ReadyForDevelopment)
+            .copied()
+            .collect();
+        let ready = pipeline
+            .iter()
+            .filter(|t| t.phase == TicketPhase::ReadyForDevelopment)
+            .copied()
+            .collect();
+        [in_progress, ready, pending, completed]
+    }
+
+    /// Flatten [`Self::board_sections`] into a single display-order list —
+    /// the exact order the GUI board shows them. Used by the Telegram
+    /// `/board` command so its listing can never diverge from the GUI.
+    #[must_use]
+    pub fn board_display_order(tickets: &[Ticket]) -> Vec<&Ticket> {
+        Self::board_sections(tickets)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// Completion ordering key for a completed-column ticket: its exact done
+    /// timestamp, falling back to creation time when `done_at` is absent.
+    fn board_done_sort_key(ticket: &Ticket) -> &str {
+        ticket.done_at.as_deref().unwrap_or(&ticket.created_at)
     }
 
     // ── Archived ticket search methods ────────────────────────────────────

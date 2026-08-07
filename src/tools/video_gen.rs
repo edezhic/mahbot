@@ -72,7 +72,7 @@ impl Tool for VideoGenTool {
     ) -> anyhow::Result<String> {
         let prompt = super::get_str(&args, "prompt")?;
 
-        let model = crate::config::CONFIG.video_gen_model();
+        let model = crate::config::CONFIG.video_model();
 
         let duration = super::get_opt_i64(&args, "duration");
         let resolution = super::get_opt_str(&args, "resolution");

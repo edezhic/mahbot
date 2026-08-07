@@ -474,16 +474,27 @@ pub enum BotCommand {
     Start,
     /// `/clear` — reset the user's current session.
     Clear,
-    /// `/models` — show model selection keyboard.
-    Models,
+    /// `/image_models` — show image model selection keyboard (Artist).
+    ImageModels,
+    /// `/video_models` — show video model selection keyboard (Artist).
+    VideoModels,
+    /// `/board` — list the active workspace's tickets (admin).
+    Board,
+    /// `/archive` — archive done & cancelled tickets (admin).
+    Archive,
+    /// `/pause` — pause the active workspace's pipeline (admin).
+    Pause,
+    /// `/unpause` — resume the active workspace's pipeline (admin).
+    Unpause,
+    /// `/maintenance on|off` — toggle the active workspace's maintainer (admin).
+    Maintenance,
 }
 
 /// Parse a Telegram bot text command from message content.
 ///
-/// Returns `Some(BotCommand)` if the content is a recognised command
-/// (`/start`, `/clear`, or `/models`), case-insensitive. Returns `None`
-/// for all other content, including other `/`-prefixed text which is
-/// routed to the agent pipeline.
+/// Returns `Some(BotCommand)` if the content is a recognised command,
+/// case-insensitive. Returns `None` for all other content, including other
+/// `/`-prefixed text which is routed to the agent pipeline.
 #[must_use]
 pub fn parse_bot_command(content: &str) -> Option<BotCommand> {
     let content = content.trim();
@@ -491,7 +502,13 @@ pub fn parse_bot_command(content: &str) -> Option<BotCommand> {
     match cmd.to_ascii_lowercase().as_str() {
         "/start" => Some(BotCommand::Start),
         "/clear" => Some(BotCommand::Clear),
-        "/models" => Some(BotCommand::Models),
+        "/image_models" => Some(BotCommand::ImageModels),
+        "/video_models" => Some(BotCommand::VideoModels),
+        "/board" => Some(BotCommand::Board),
+        "/archive" => Some(BotCommand::Archive),
+        "/pause" => Some(BotCommand::Pause),
+        "/unpause" => Some(BotCommand::Unpause),
+        "/maintenance" => Some(BotCommand::Maintenance),
         _ => None,
     }
 }
@@ -1657,11 +1674,28 @@ mod tests {
             ("/CLEAR", Some(Clear)),
             ("/clear session", Some(Clear)),
             ("  /clear  ", Some(Clear)),
-            // /models
-            ("/models", Some(Models)),
-            ("/Models", Some(Models)),
-            ("/models foo", Some(Models)),
-            ("  /models  ", Some(Models)),
+            // /image_models
+            ("/image_models", Some(ImageModels)),
+            ("/IMAGE_MODELS", Some(ImageModels)),
+            ("/image_models foo", Some(ImageModels)),
+            ("  /image_models  ", Some(ImageModels)),
+            // /video_models
+            ("/video_models", Some(VideoModels)),
+            ("/Video_Models", Some(VideoModels)),
+            ("/video_models foo", Some(VideoModels)),
+            // admin commands
+            ("/board", Some(Board)),
+            ("/BOARD", Some(Board)),
+            ("/board foo", Some(Board)),
+            ("/archive", Some(Archive)),
+            ("/archive foo", Some(Archive)),
+            ("/pause", Some(Pause)),
+            ("/pause foo", Some(Pause)),
+            ("/unpause", Some(Unpause)),
+            ("/unpause foo", Some(Unpause)),
+            ("/maintenance", Some(Maintenance)),
+            ("/maintenance on", Some(Maintenance)),
+            ("/maintenance off", Some(Maintenance)),
             // Negative: partial /-prefix matches
             ("/", None),
             ("/s", None),
@@ -1669,6 +1703,10 @@ mod tests {
             ("/started", None),
             ("/cleared", None),
             ("/model", None),
+            ("/models", None), // removed — falls through to the agent pipeline
+            ("/image", None),
+            ("/video", None),
+            ("/boardx", None),
             ("/ reset", None),
             // Negative: missing slash or empty
             ("start", None),

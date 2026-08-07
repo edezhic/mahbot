@@ -1836,3 +1836,40 @@ async fn preserves_markdown_formatting_in_blockquote() {
         "<blockquote>\n**bold** and `code` and *italic*\n</blockquote>"
     );
 }
+
+#[tokio::test]
+async fn user_command_entries_reflect_role_and_admin() {
+    crate::users::test_util::init_test_store().await;
+    let store = crate::users::store();
+
+    // alice: admin (full permissions), default Analyst role.
+    let alice = user_command_entries("alice").await;
+    let cmds: Vec<&str> = alice.iter().map(|(c, _)| *c).collect();
+    assert!(cmds.contains(&"board"));
+    assert!(cmds.contains(&"maintenance"));
+    assert!(!cmds.contains(&"image_models"));
+
+    // bob: restricted user.
+    let bob = user_command_entries("bob").await;
+    assert_eq!(bob, vec![("clear", CLEAR_COMMAND_DESC)]);
+
+    // alice as Artist: image/video model commands plus admin commands.
+    store
+        .update_user(
+            "alice",
+            crate::users::FieldUpdate::Set("artist"),
+            crate::users::FieldUpdate::Unchanged,
+            crate::users::FieldUpdate::Unchanged,
+        )
+        .await
+        .unwrap();
+    let cmds: Vec<&str> = user_command_entries("alice")
+        .await
+        .iter()
+        .map(|(c, _)| *c)
+        .collect();
+    assert!(cmds.contains(&"image_models"));
+    assert!(cmds.contains(&"video_models"));
+    assert!(cmds.contains(&"board"));
+    assert_eq!(cmds[0], "clear");
+}

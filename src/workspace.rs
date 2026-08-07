@@ -19,7 +19,7 @@ use tracing::warn;
 
 crate::define_store! {
     /// Global workspace store.
-    pub(crate) static WORKSPACES: WorkspaceStore,
+    pub static WORKSPACES: WorkspaceStore,
     db_name = "workspaces",
     schema = SCHEMA,
     post_open = after_open,
@@ -814,7 +814,7 @@ impl WorkspaceStore {
     /// Also bumps `diagnostics_generation` so any in-flight diagnostics
     /// discovery task will see a generation mismatch and skip its stale write
     /// (see [`check_generation`]).
-    pub async fn set_diagnostics(
+    pub(crate) async fn set_diagnostics(
         &self,
         name: &str,
         commands: &crate::DiagnosticsCommands,
@@ -829,7 +829,10 @@ impl WorkspaceStore {
     }
 
     /// Retrieve discovered diagnostics commands for a workspace.
-    pub async fn get_diagnostics(&self, name: &str) -> Result<Option<crate::DiagnosticsCommands>> {
+    pub(crate) async fn get_diagnostics(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::DiagnosticsCommands>> {
         // query_optional + flatten preserves the NULL-vs-missing conflation:
         // a NULL diagnostics column and a missing row both yield None.
         let json: Option<String> = self

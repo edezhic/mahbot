@@ -17,8 +17,20 @@ const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 
 /// Description for the `/clear` command — used in `setMyCommands` API and `/start` welcome message.
 pub const CLEAR_COMMAND_DESC: &str = "Reset your session";
-/// Description for the `/models` command — used in `setMyCommands` API and `/start` welcome message.
-pub const MODELS_COMMAND_DESC: &str = "Select generation models";
+/// Description for the `/image_models` command (Artist role).
+pub const IMAGE_MODELS_COMMAND_DESC: &str = "Select image generation model";
+/// Description for the `/video_models` command (Artist role).
+pub const VIDEO_MODELS_COMMAND_DESC: &str = "Select video model";
+/// Description for the `/board` command (admin).
+pub const BOARD_COMMAND_DESC: &str = "List active workspace tickets";
+/// Description for the `/archive` command (admin).
+pub const ARCHIVE_COMMAND_DESC: &str = "Archive done & cancelled tickets";
+/// Description for the `/pause` command (admin).
+pub const PAUSE_COMMAND_DESC: &str = "Pause the workspace pipeline";
+/// Description for the `/unpause` command (admin).
+pub const UNPAUSE_COMMAND_DESC: &str = "Resume the workspace pipeline";
+/// Description for the `/maintenance` command (admin).
+pub const MAINTENANCE_COMMAND_DESC: &str = "Toggle workspace maintenance (on|off)";
 
 // ── Telegram callback/action button decoding ─────────────────────────
 
@@ -517,6 +529,14 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
 /// Telegram Bot API maximum file download size (20 MB).
 const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 
+/// Change-detection state for a chat's per-user command menu refresh.
+enum ChatMenuState {
+    /// Last successfully registered command payload (`None` = never registered).
+    Registered(Option<String>),
+    /// A refresh is already in flight — skip until it completes.
+    InFlight,
+}
+
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
     bot_token: String,
@@ -535,6 +555,12 @@ pub struct TelegramChannel {
     /// instances during hot-reload so the new listener doesn't replay old
     /// updates from Telegram's server.
     offset: std::sync::Arc<std::sync::atomic::AtomicI64>,
+
+    /// Per-chat command menu state — change detection + in-flight coalescing
+    /// for the per-user `setMyCommands` refresh, so outbound message floods
+    /// (manager broadcasts, parallel agent responses) don't trip Telegram's
+    /// rate limiting. Menu refreshes are fire-and-forget and fail-open.
+    menu_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, ChatMenuState>>>,
 }
 
 /// Extract chat_id and reply_target from a Telegram message sub-object
@@ -787,6 +813,9 @@ impl TelegramChannel {
             api_base: "https://api.telegram.org".to_string(),
             cancel: std::sync::Arc::new(tokio_util::sync::CancellationToken::new()),
             offset,
+            menu_cache: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
         }
     }
 
@@ -972,47 +1001,111 @@ impl TelegramChannel {
         self.cancel.cancel();
     }
 
-    /// Register the bot's commands via Telegram's `setMyCommands` API.
-    ///
-    /// This populates the `/` command menu in Telegram clients so users can
-    /// discover available commands. The call is idempotent — calling it
-    /// multiple times just re-registers the same commands.
+    /// Register the bot's global (unscoped) commands via Telegram's
+    /// `setMyCommands` API. Only `/clear` is global — per-user commands are
+    /// registered per chat via [`Self::spawn_menu_refresh`].
     ///
     /// Failure is logged as a warning and does not block the caller.
     pub async fn set_my_commands(&self) {
-        let commands = serde_json::json!({
+        let body = serde_json::json!({
             "commands": [
                 {"command": "clear", "description": CLEAR_COMMAND_DESC},
-                {"command": "models", "description": MODELS_COMMAND_DESC},
             ]
         });
+        post_set_my_commands(self.http_client(), &self.api_url("setMyCommands"), &body).await;
+    }
 
-        match self
-            .http_client()
-            .post(self.api_url("setMyCommands"))
-            .json(&commands)
-            .send()
-            .await
+    /// Spawn a per-user command menu refresh for a chat, triggered after
+    /// every outbound message. Fire-and-forget and fail-open: any failure
+    /// (DB lookup, API error) is logged and never affects message delivery.
+    ///
+    /// Everything except a cheap in-flight check runs in the spawned task:
+    /// the reverse-lookup of the chat's bound user (first match wins for
+    /// group chats), the command payload computed from their current
+    /// role/admin state, and the scoped `setMyCommands` registration when
+    /// it differs from the last successful one (change detection) with
+    /// in-flight coalescing.
+    fn spawn_menu_refresh(&self, chat_id: &str) {
+        // Cheap inline coalescing: skip spawning when a refresh for this
+        // chat is already in flight.
         {
-            Ok(resp) if resp.status().is_success() => {
-                tracing::info!("Telegram bot commands registered successfully");
-            }
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                tracing::warn!(
-                    status = %status,
-                    body = %body,
-                    "Telegram setMyCommands returned unsuccessful status"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to call Telegram setMyCommands"
-                );
+            let cache = match self.menu_cache.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if matches!(cache.get(chat_id), Some(ChatMenuState::InFlight)) {
+                return;
             }
         }
+
+        let bot_token = self.bot_token.clone();
+        let http_client = self.http_client.clone();
+        let api_base = self.api_base.clone();
+        let cache = std::sync::Arc::clone(&self.menu_cache);
+        let chat_id = chat_id.to_string();
+        tokio::spawn(async move {
+            let Some(user_name) =
+                crate::users::resolve_user_by_reply_target("telegram", &chat_id).await
+            else {
+                return;
+            };
+            let entries = user_command_entries(&user_name).await;
+            let payload = serde_json::json!({
+                "commands": entries
+                    .iter()
+                    .map(|(cmd, desc)| serde_json::json!({ "command": cmd, "description": desc }))
+                    .collect::<Vec<_>>(),
+            });
+            let payload_str = payload.to_string();
+
+            let should_send = {
+                let mut cache = match cache.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                match cache.get(&chat_id) {
+                    Some(ChatMenuState::Registered(last))
+                        if last.as_deref() == Some(&payload_str) =>
+                    {
+                        false
+                    }
+                    Some(ChatMenuState::InFlight) => false,
+                    _ => {
+                        cache.insert(chat_id.clone(), ChatMenuState::InFlight);
+                        true
+                    }
+                }
+            };
+            if !should_send {
+                return;
+            }
+
+            let url = format!("{api_base}/bot{bot_token}/setMyCommands");
+            let body = serde_json::json!({
+                "scope": {
+                    "type": "chat",
+                    "chat_id": chat_id.parse::<i64>().map_or_else(
+                        |_| serde_json::Value::String(chat_id.clone()),
+                        serde_json::Value::from,
+                    ),
+                },
+                "commands": payload["commands"].clone(),
+            });
+            let ok = post_set_my_commands(&http_client, &url, &body).await;
+            let mut cache = match cache.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            cache.insert(
+                chat_id,
+                if ok {
+                    ChatMenuState::Registered(Some(payload_str))
+                } else {
+                    // Reset so the next message retries.
+                    ChatMenuState::Registered(None)
+                },
+            );
+        });
     }
 
     /// Validate a Telegram bot token by calling the `getMe` endpoint.
@@ -1796,6 +1889,10 @@ impl Channel for TelegramChannel {
         // Parse recipient: "chat_id" or "chat_id:thread_id" format
         let (chat_id, thread_id) = parse_recipient(&message.recipient);
 
+        // Per-user command menu refresh — fire-and-forget, fail-open; never
+        // blocks or affects message delivery.
+        self.spawn_menu_refresh(chat_id);
+
         // Look for inline attachment markers like [IMAGE:path/to/file.png]
         let (text_without_markers, attachments) = parse_attachment_markers(content);
 
@@ -2092,6 +2189,57 @@ pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
             );
         }
     }
+}
+
+/// POST a `setMyCommands` request. Returns `true` on success; failures are
+/// logged (warn) and reported as `false` so callers can reset their
+/// change-detection state and retry on the next message.
+async fn post_set_my_commands(
+    client: &reqwest::Client,
+    url: &str,
+    body: &serde_json::Value,
+) -> bool {
+    match client.post(url).json(body).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::info!("Telegram bot commands registered successfully");
+            true
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = %status,
+                body = %body,
+                "Telegram setMyCommands returned unsuccessful status"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to call Telegram setMyCommands");
+            false
+        }
+    }
+}
+
+/// (command, description) entries for a user's Telegram command menu,
+/// derived from their current role and admin status. Shared by the
+/// per-chat `setMyCommands` refresh and the `/start` welcome message.
+#[must_use]
+pub async fn user_command_entries(user_name: &str) -> Vec<(&'static str, &'static str)> {
+    let mut entries: Vec<(&'static str, &'static str)> = vec![("clear", CLEAR_COMMAND_DESC)];
+    let role = crate::users::resolve_active_role(user_name).await;
+    if role == crate::Role::Artist {
+        entries.push(("image_models", IMAGE_MODELS_COMMAND_DESC));
+        entries.push(("video_models", VIDEO_MODELS_COMMAND_DESC));
+    }
+    if crate::users::is_admin(user_name).await {
+        entries.push(("board", BOARD_COMMAND_DESC));
+        entries.push(("archive", ARCHIVE_COMMAND_DESC));
+        entries.push(("pause", PAUSE_COMMAND_DESC));
+        entries.push(("unpause", UNPAUSE_COMMAND_DESC));
+        entries.push(("maintenance", MAINTENANCE_COMMAND_DESC));
+    }
+    entries
 }
 
 #[cfg(test)]
