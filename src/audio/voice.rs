@@ -805,10 +805,9 @@ static CONFUSABLE_EMBEDDINGS_CACHE: OnceLock<Vec<EmbeddingSequence>> = OnceLock:
 /// an empty slice — the classifier trains on ambient negatives only as a
 /// graceful fallback.
 pub(crate) fn confusable_dense_embeddings() -> &'static [EmbeddingSequence] {
-    match CONFUSABLE_EMBEDDINGS_CACHE.get() {
-        Some(cache) => &cache[..],
-        None => &[],
-    }
+    CONFUSABLE_EMBEDDINGS_CACHE
+        .get()
+        .map_or(&[], |cache| &cache[..])
 }
 
 /// Cache for pre-computed unrelated speech dense embeddings.
@@ -838,11 +837,46 @@ static UNRELATED_EMBEDDINGS_CACHE: OnceLock<Vec<EmbeddingSequence>> = OnceLock::
 /// an empty slice — the classifier trains on ambient + confusable negatives only
 /// as a graceful fallback.
 pub(crate) fn unrelated_dense_embeddings() -> &'static [EmbeddingSequence] {
-    match UNRELATED_EMBEDDINGS_CACHE.get() {
-        Some(cache) => &cache[..],
-        None => &[],
-    }
+    UNRELATED_EMBEDDINGS_CACHE
+        .get()
+        .map_or(&[], |cache| &cache[..])
 }
+
+/// Per-cache parameters for phrase-negative pre-warm (see [`prewarm_phrase_embeddings`]).
+struct PhrasePrewarmSpec {
+    /// Cache the resulting dense embeddings are stored in.
+    cache: &'static OnceLock<Vec<EmbeddingSequence>>,
+    /// Phrase-type label for logs and embedding provenance ("confusable"/"unrelated").
+    phrase_type: &'static str,
+    /// Phrases to synthesise.
+    phrases: &'static [&'static str],
+    /// Number of TTS seed variants per phrase.
+    seeds_per_phrase: usize,
+    /// Base offset for the per-phrase×seed TTS seed formula.
+    seed_base: u64,
+    /// What the classifier falls back to if pre-warm fails (for logs).
+    fallback_info: &'static str,
+}
+
+/// Confusable-phrase negative pre-warm bundle: cache, phrase table, and seed parameters.
+const CONFUSABLE_PREWARM: PhrasePrewarmSpec = PhrasePrewarmSpec {
+    cache: &CONFUSABLE_EMBEDDINGS_CACHE,
+    phrase_type: "confusable",
+    phrases: CONFUSABLE_PHRASES,
+    seeds_per_phrase: CONFUSABLE_SEEDS_PER_PHRASE,
+    seed_base: CONFUSABLE_SEED_BASE,
+    fallback_info: "ambient negatives only",
+};
+
+/// Unrelated-phrase negative pre-warm bundle: cache, phrase table, and seed parameters.
+const UNRELATED_PREWARM: PhrasePrewarmSpec = PhrasePrewarmSpec {
+    cache: &UNRELATED_EMBEDDINGS_CACHE,
+    phrase_type: "unrelated",
+    phrases: UNRELATED_PHRASES,
+    seeds_per_phrase: UNRELATED_SEEDS_PER_PHRASE,
+    seed_base: UNRELATED_SEED_BASE,
+    fallback_info: "ambient + confusable negatives only",
+};
 
 /// Poll for TTS voice styles to become available.
 ///
@@ -977,42 +1011,15 @@ async fn wait_for_tts_styles() -> Option<Vec<String>> {
 /// This function is safe to call multiple times — [`OnceLock::set`] is a no-op
 /// if the cache is already populated.
 pub(crate) async fn prewarm_confusable_embeddings() {
-    // Fast path: already pre-warmed.  OnceLock::get is lock-free after init.
-    if CONFUSABLE_EMBEDDINGS_CACHE.get().is_some() {
-        return;
-    }
-
-    let dense = prewarm_phrase_embeddings(
-        "confusable",
-        CONFUSABLE_PHRASES,
-        CONFUSABLE_SEEDS_PER_PHRASE,
-        CONFUSABLE_SEED_BASE,
-        "ambient negatives only",
-    )
-    .await;
-
-    let count = dense.len();
-
-    // OnceLock::set is a no-op if already set (race-safe).
-    let _ = CONFUSABLE_EMBEDDINGS_CACHE.set(dense);
-
-    if count > 0 {
-        info!(
-            "Pre-warmed {count} confusable phrase dense embedding(s)              from {} phrases × {CONFUSABLE_SEEDS_PER_PHRASE} seeds              for negative training",
-            CONFUSABLE_PHRASES.len(),
-        );
-    } else {
-        warn!(
-            "No confusable phrase embeddings could be generated —              models will train on ambient negatives only"
-        );
-    }
+    prewarm_phrase_embeddings(CONFUSABLE_PREWARM).await;
 }
 
 /// Shared pre-warm logic for phrase-based negative embeddings.
 ///
 /// Runs TTS synthesis (with PCM caching), AGC preprocessing, VAD gating, PCM
 /// augmentation, and ONNX dense embedding extraction for each phrase × seed
-/// combination.  Used by both [`prewarm_confusable_embeddings`] and
+/// combination, then stores the result in the spec's cache and logs the
+/// outcome.  Used by both [`prewarm_confusable_embeddings`] and
 /// [`prewarm_unrelated_embeddings`] to avoid code duplication.
 ///
 /// ## Streaming-pipeline alignment
@@ -1040,265 +1047,296 @@ pub(crate) async fn prewarm_confusable_embeddings() {
 /// After the dense-stride-8 alignment, only dense embeddings are
 /// produced — streaming extraction was removed.
 ///
-/// Returns extracted dense embeddings, or an empty vec if pre-warming
-/// cannot proceed (models not available, no TTS styles, etc.).
+/// Stores the result in the spec's cache and logs the outcome; the cache is
+/// left empty if pre-warming cannot proceed (models not available, no TTS
+/// styles, etc.).
 ///
 /// # Parameters
 ///
-/// * `phrase_type` — human-readable label for log messages ("confusable"/"unrelated").
-/// * `phrases` — the list of phrases to synthesise.
-/// * `seeds_per_phrase` — number of TTS seed variants per phrase.
-/// * `seed_base` — base offset for seed calculation (see seed formula below).
-/// * `fallback_info` — what the models fall back to if this prewarm fails (for logs).
+/// * `spec` — per-cache bundle of cache, phrase table, seed parameters, and
+///   fallback label (see [`PhrasePrewarmSpec`]).
 ///
 /// # Seed formula
 ///
-/// For phrase index `i` and seed variant `j` (0..`seeds_per_phrase`):
+/// For phrase index `i` and seed variant `j` (0..`spec.seeds_per_phrase`):
 ///
 /// ```text
-/// seed = seed_base + i * seeds_per_phrase + j
+/// seed = spec.seed_base + i * spec.seeds_per_phrase + j
 /// ```
 #[allow(clippy::too_many_lines)]
-async fn prewarm_phrase_embeddings(
-    phrase_type: &'static str,
-    phrases: &'static [&'static str],
-    seeds_per_phrase: usize,
-    seed_base: u64,
-    fallback_info: &'static str,
-) -> Vec<EmbeddingSequence> {
+async fn prewarm_phrase_embeddings(spec: PhrasePrewarmSpec) {
+    let PhrasePrewarmSpec {
+        cache,
+        phrase_type,
+        phrases,
+        seeds_per_phrase,
+        seed_base,
+        fallback_info,
+    } = spec;
+
+    // Fast path: already pre-warmed.  OnceLock::get is lock-free after init.
+    if cache.get().is_some() {
+        return;
+    }
+
     // Need voice ONNX models.
-    if ONNX_MODELS.get().is_none() {
+    let dense = if ONNX_MODELS.get().is_none() {
         info!(
             "Voice ONNX models not ready yet — {phrase_type} negative embeddings              pre-warm skipped (models train on {fallback_info})"
         );
-        return Vec::new();
-    }
+        Vec::new()
+    } else if let Some(available_styles) = wait_for_tts_styles().await {
+        // Resolve PCM cache directory; if it can't be resolved, skip caching
+        // (synthesis still works without it, just slower).
+        let cache_dir = voice_cache_dir();
+        if let Some(ref d) = cache_dir
+            && let Err(e) = std::fs::create_dir_all(d)
+        {
+            warn!("PCM cache directory creation failed: {e} — proceeding without cache");
+        }
+        // Run startup eviction to clean stale/oversized cache before prewarming
+        if let Some(ref d) = cache_dir {
+            evict_pcm_cache(d);
+        }
+        let model_hash = tts_model_version_hash();
 
-    // Wait for TTS voice styles to become available by polling.
-    let Some(available_styles) = wait_for_tts_styles().await else {
-        return Vec::new();
-    };
+        let num_styles = available_styles.len();
 
-    // Resolve PCM cache directory; if it can't be resolved, skip caching
-    // (synthesis still works without it, just slower).
-    let cache_dir = voice_cache_dir();
-    if let Some(ref d) = cache_dir
-        && let Err(e) = std::fs::create_dir_all(d)
-    {
-        warn!("PCM cache directory creation failed: {e} — proceeding without cache");
-    }
-    // Run startup eviction to clean stale/oversized cache before prewarming
-    if let Some(ref d) = cache_dir {
-        evict_pcm_cache(d);
-    }
-    let model_hash = tts_model_version_hash();
+        // Runs TTS synthesis (with PCM caching), AGC, VAD gating, augmentation,
+        // and ONNX embedding extraction in a blocking thread to avoid starving the
+        // async runtime.
+        //
+        // Pipeline: raw TTS PCM → fresh AGC per phrase × seed →
+        // VAD-gate (streaming mel layout) → augment speech-only audio → embeddings.
+        // This matches the streaming detection path (fresh per-segment AGC, VAD-
+        // gated mel frames, windows anchored at speech onset) so the negative
+        // training distribution is representative of what the classifier sees
+        // during live inference.
+        tokio::task::spawn_blocking(move || {
+            let Some(models) = ONNX_MODELS.get() else {
+                return Vec::new();
+            };
 
-    let num_styles = available_styles.len();
+            // Preprocessor config from the same CONFIG flags the live-mic
+            // streaming pipeline uses (`preprocessor_config_from_config`, the
+            // config `PipelineCtx::new()` builds).  The negative
+            // embeddings must match the streaming inference distribution, which is
+            // governed by the deployment's NS/AGC toggles.
+            let pre_config = preprocessor_config_from_config();
+            let mut dense_sequences: Vec<EmbeddingSequence> = Vec::new();
 
-    // Runs TTS synthesis (with PCM caching), AGC, VAD gating, augmentation,
-    // and ONNX embedding extraction in a blocking thread to avoid starving the
-    // async runtime.
-    //
-    // Pipeline: raw TTS PCM → fresh AGC per phrase × seed →
-    // VAD-gate (streaming mel layout) → augment speech-only audio → embeddings.
-    // This matches the streaming detection path (fresh per-segment AGC, VAD-
-    // gated mel frames, windows anchored at speech onset) so the negative
-    // training distribution is representative of what the classifier sees
-    // during live inference.
-    tokio::task::spawn_blocking(move || {
-        let Some(models) = ONNX_MODELS.get() else {
-            return Vec::new();
-        };
+            for (i, &phrase) in phrases.iter().enumerate() {
+                for seed_idx in 0..seeds_per_phrase {
+                    // Rotate through available voice styles for acoustic diversity.
+                    // Distribute seeds round-robin across styles.
+                    let style_idx = (i * seeds_per_phrase + seed_idx) % num_styles;
+                    let style = &available_styles[style_idx];
+                    let seed = seed_base + i as u64 * seeds_per_phrase as u64 + seed_idx as u64;
+                    let phrase_index_for_id: usize = i * seeds_per_phrase + seed_idx;
+                    let source = match phrase_type {
+                        "confusable" => Source::Confusable,
+                        _ => Source::Unrelated,
+                    };
 
-        // Preprocessor config from the same CONFIG flags the live-mic
-        // streaming pipeline uses (`preprocessor_config_from_config`, the
-        // config `PipelineCtx::new()` builds).  The negative
-        // embeddings must match the streaming inference distribution, which is
-        // governed by the deployment's NS/AGC toggles.
-        let pre_config = preprocessor_config_from_config();
-        let mut dense_sequences: Vec<EmbeddingSequence> = Vec::new();
-
-        for (i, &phrase) in phrases.iter().enumerate() {
-            for seed_idx in 0..seeds_per_phrase {
-                // Rotate through available voice styles for acoustic diversity.
-                // Distribute seeds round-robin across styles.
-                let style_idx = (i * seeds_per_phrase + seed_idx) % num_styles;
-                let style = &available_styles[style_idx];
-                let seed = seed_base + i as u64 * seeds_per_phrase as u64 + seed_idx as u64;
-                let phrase_index_for_id: usize = i * seeds_per_phrase + seed_idx;
-                let source = match phrase_type {
-                    "confusable" => Source::Confusable,
-                    _ => Source::Unrelated,
-                };
-
-                // ── Embedding-level cache ──
-                // The per-utterance dense embeddings are deterministic, so a
-                // warm run can skip AGC + VAD + ONNX entirely.  The cached
-                // variants are pushed through the same helper the miss path
-                // uses, guaranteeing byte-identical sequences.
-                let cache_key =
-                    embedding_cache_key(phrase_type, phrase, style, seed, &model_hash, pre_config);
-                let emb_cache_dir = embedding_cache_dir();
-                let mut utterance_variants: Vec<(u8, Vec<Vec<f32>>)> = Vec::new();
-                let mut push_seq = |embs: Vec<Vec<f32>>, vi: usize| {
-                    if !embs.is_empty() {
-                        dense_sequences.push(EmbeddingSequence::new(
-                            UtteranceId {
-                                sequence_index: phrase_index_for_id,
-                                variant_index: vi,
-                            },
-                            source,
-                            embs.clone(),
-                        ));
-                        // Variant indices are 0..=4 by construction.
-                        utterance_variants
-                            .push((u8::try_from(vi).expect("variant index fits in u8"), embs));
-                    }
-                };
-                if let (Some(dir), Some(key)) = (&emb_cache_dir, &cache_key)
-                    && let Some(variants) = read_embedding_cache(dir, key)
-                {
-                    for (vi, embs) in variants {
-                        push_seq(embs, usize::from(vi));
-                    }
-                    continue;
-                }
-
-                // Load PCM — from disk cache (preferred) or synthesise fresh.
-                let pcm = if let Some(ref cache_dir) = cache_dir {
-                    synthesize_with_pcm_cache(
+                    // ── Embedding-level cache ──
+                    // The per-utterance dense embeddings are deterministic, so a
+                    // warm run can skip AGC + VAD + ONNX entirely.  The cached
+                    // variants are pushed through the same helper the miss path
+                    // uses, guaranteeing byte-identical sequences.
+                    let cache_key = embedding_cache_key(
+                        phrase_type,
                         phrase,
                         style,
                         seed,
-                        SAMPLE_RATE,
                         &model_hash,
-                        cache_dir,
-                    )
-                } else {
-                    match crate::audio::tts::synthesize(phrase, style, seed, SAMPLE_RATE) {
-                        Ok(p) => Some(p),
-                        Err(e) => {
-                            warn!("TTS synthesis failed for {phrase_type} phrase '{phrase}': {e}");
-                            None
-                        }
-                    }
-                };
-
-                let Some(pcm) = pcm else {
-                    continue;
-                };
-
-                // ── 1. Fresh AGC per phrase × seed ──
-                // The streaming pipeline starts each detection segment with a
-                // fresh AudioPreprocessor (`reset_detection_segment`).
-                // A shared preprocessor would process the
-                // Nth phrase with AGC adapted to N−1 prior phrases — an
-                // artifact streaming never produces.  Chunks are fed as-is (no
-                // zero-padding), matching the mic stream: the
-                // NS stage buffers incomplete frames internally and the next
-                // chunk completes them.  Shared with the E2E bench via
-                // [`crate::audio::audio_preprocessor::agc_feed_fresh`].
-                let agc_audio = crate::audio::audio_preprocessor::agc_feed_fresh(
-                    &pcm,
-                    FRAME_LENGTH,
-                    pre_config,
-                );
-
-                // ── 2. VAD-gate ──
-                // Fresh earshot detector per phrase × seed: the prewarm must
-                // not reuse the global VAD_DETECTOR (would contaminate the
-                // live pipeline's noise-floor state) and must not carry VAD
-                // state across phrases (the same shared-state artifact as the
-                // shared AGC).  Produces the exact streaming mel layout
-                // (VAD-gated, speech-onset-anchored) plus the speech-only
-                // audio used for augmentation below.
-                let mut detector = earshot::Detector::default();
-                let (mel_frames, speech_audio) = vad_gate_streaming_mel(&agc_audio, |hop| {
-                    is_speech_with_detector(hop, &mut detector, VAD_THRESHOLD)
-                });
-
-                if mel_frames.is_empty() {
-                    // Matches streaming: no VAD-positive speech ⇒ no mel frames
-                    // ⇒ no embeddings.  A phrase with zero VAD-positive audio is
-                    // dropped from the negative set rather than trained on
-                    // silence-laden audio the streaming path never produces.
-                    warn!(
-                        "{phrase_type} phrase '{phrase}' (seed {seed}) produced no \
-                         VAD-positive speech — skipping (matches streaming: no \
-                         speech ⇒ no embeddings)"
+                        pre_config,
                     );
-                    continue;
-                }
-
-                // ── 3. Original — embeddings from the streaming mel frames ──
-                // Windows are anchored at the first speech frame
-                // (mel frame 0 = first VAD-positive hop), not at TTS sample 0
-                // with its silence preamble.
-                let dense_embs =
-                    embeddings_from_mel_frames(models, &mel_frames).unwrap_or_default();
-                push_seq(dense_embs, 0);
-
-                // ── 4. Augment AFTER VAD gating ──
-                // Variants are derived from the speech-only audio (no silence
-                // preamble), matching enrollment's AGC → VAD → augment ordering.
-                // No variant is re-gated by VAD (only the original was).  The
-                // only conditional variant is speed-up, dropped when the
-                // speech-only duration is too short (< 500 ms pre-pad) to stay
-                // intelligible — the same gate enrollment applies to its
-                // VAD-segmented utterance.  Note that this gate now evaluates
-                // the VAD-gated speech duration (not the full TTS audio), so
-                // short phrases drop the speed-up variant more often than the
-                // pre-fix pipeline did — a direct consequence of the alignment.
-                //
-                // Layout note: variants 1–4 are embedded via
-                // `extract_embeddings_from_audio` (whole-audio mel over the raw
-                // hop-concatenated speech_audio), so their mel layout lacks the
-                // batch-flush boundary handling (`trim_voice_batch` overlap at
-                // VOICE_BATCH_SIZE boundaries) that variant 0's streaming mel
-                // matches exactly.  This is acceptable for perturbations and
-                // matches how enrollment derives its own augmented variants
-                // (`process_enrollment_sample` → whole-audio mel): the speech
-                // content is identical VAD-gated audio; only the batch-boundary
-                // framing differs slightly.
-                //
-                // Variant generation is shared with the E2E bench via
-                // [`augment_pcm_variants`]: noise seed = the
-                // TTS phrase seed, gate input = VAD-gated speech, canonical
-                // push order (speed-up 3rd).  The negative pool deliberately
-                // uses the bounded [`AugmentSet::Negatives`] set (original +
-                // pink 25 dB): the old speed/volume cells were dropped to
-                // keep the 12-cell positive recipe's cold embedding recompute
-                // inside the 39 s bench budget (see `AugmentSet::Negatives`).
-                // Variant 0 (original) is pushed above from the streaming mel
-                // frames.
-                for variant in
-                    augment_pcm_variants(&speech_audio, SAMPLE_RATE, seed, AugmentSet::Negatives)
-                {
-                    if variant.variant_index == 0 {
-                        continue; // original already pushed above
+                    let emb_cache_dir = embedding_cache_dir();
+                    let mut utterance_variants: Vec<(u8, Vec<Vec<f32>>)> = Vec::new();
+                    let mut push_seq = |embs: Vec<Vec<f32>>, vi: usize| {
+                        if !embs.is_empty() {
+                            dense_sequences.push(EmbeddingSequence::new(
+                                UtteranceId {
+                                    sequence_index: phrase_index_for_id,
+                                    variant_index: vi,
+                                },
+                                source,
+                                embs.clone(),
+                            ));
+                            // Variant indices are 0..=4 by construction.
+                            utterance_variants
+                                .push((u8::try_from(vi).expect("variant index fits in u8"), embs));
+                        }
+                    };
+                    if let (Some(dir), Some(key)) = (&emb_cache_dir, &cache_key)
+                        && let Some(variants) = read_embedding_cache(dir, key)
+                    {
+                        for (vi, embs) in variants {
+                            push_seq(embs, usize::from(vi));
+                        }
+                        continue;
                     }
-                    let dense_embs =
-                        extract_embeddings_from_audio(models, &variant.pcm).unwrap_or_default();
-                    push_seq(dense_embs, variant.variant_index);
-                }
 
-                // ── Persist the per-utterance embedding cache ──
-                // Best-effort: a write failure only costs a recompute on the
-                // next run.  Nothing is written when no variant produced
-                // embeddings (e.g. no VAD-positive speech) — the miss path
-                // would reproduce the same empty result.
-                if !utterance_variants.is_empty()
-                    && let (Some(dir), Some(key)) = (&emb_cache_dir, &cache_key)
-                {
-                    write_embedding_cache(dir, key, &utterance_variants);
+                    // Load PCM — from disk cache (preferred) or synthesise fresh.
+                    let pcm = if let Some(ref cache_dir) = cache_dir {
+                        synthesize_with_pcm_cache(
+                            phrase,
+                            style,
+                            seed,
+                            SAMPLE_RATE,
+                            &model_hash,
+                            cache_dir,
+                        )
+                    } else {
+                        match crate::audio::tts::synthesize(phrase, style, seed, SAMPLE_RATE) {
+                            Ok(p) => Some(p),
+                            Err(e) => {
+                                warn!(
+                                    "TTS synthesis failed for {phrase_type} phrase '{phrase}': {e}"
+                                );
+                                None
+                            }
+                        }
+                    };
+
+                    let Some(pcm) = pcm else {
+                        continue;
+                    };
+
+                    // ── 1. Fresh AGC per phrase × seed ──
+                    // The streaming pipeline starts each detection segment with a
+                    // fresh AudioPreprocessor (`reset_detection_segment`).
+                    // A shared preprocessor would process the
+                    // Nth phrase with AGC adapted to N−1 prior phrases — an
+                    // artifact streaming never produces.  Chunks are fed as-is (no
+                    // zero-padding), matching the mic stream: the
+                    // NS stage buffers incomplete frames internally and the next
+                    // chunk completes them.  Shared with the E2E bench via
+                    // [`crate::audio::audio_preprocessor::agc_feed_fresh`].
+                    let agc_audio = crate::audio::audio_preprocessor::agc_feed_fresh(
+                        &pcm,
+                        FRAME_LENGTH,
+                        pre_config,
+                    );
+
+                    // ── 2. VAD-gate ──
+                    // Fresh earshot detector per phrase × seed: the prewarm must
+                    // not reuse the global VAD_DETECTOR (would contaminate the
+                    // live pipeline's noise-floor state) and must not carry VAD
+                    // state across phrases (the same shared-state artifact as the
+                    // shared AGC).  Produces the exact streaming mel layout
+                    // (VAD-gated, speech-onset-anchored) plus the speech-only
+                    // audio used for augmentation below.
+                    let mut detector = earshot::Detector::default();
+                    let (mel_frames, speech_audio) = vad_gate_streaming_mel(&agc_audio, |hop| {
+                        is_speech_with_detector(hop, &mut detector, VAD_THRESHOLD)
+                    });
+
+                    if mel_frames.is_empty() {
+                        // Matches streaming: no VAD-positive speech ⇒ no mel frames
+                        // ⇒ no embeddings.  A phrase with zero VAD-positive audio is
+                        // dropped from the negative set rather than trained on
+                        // silence-laden audio the streaming path never produces.
+                        warn!(
+                            "{phrase_type} phrase '{phrase}' (seed {seed}) produced no \
+                             VAD-positive speech — skipping (matches streaming: no \
+                             speech ⇒ no embeddings)"
+                        );
+                        continue;
+                    }
+
+                    // ── 3. Original — embeddings from the streaming mel frames ──
+                    // Windows are anchored at the first speech frame
+                    // (mel frame 0 = first VAD-positive hop), not at TTS sample 0
+                    // with its silence preamble.
+                    let dense_embs =
+                        embeddings_from_mel_frames(models, &mel_frames).unwrap_or_default();
+                    push_seq(dense_embs, 0);
+
+                    // ── 4. Augment AFTER VAD gating ──
+                    // Variants are derived from the speech-only audio (no silence
+                    // preamble), matching enrollment's AGC → VAD → augment ordering.
+                    // No variant is re-gated by VAD (only the original was).  The
+                    // only conditional variant is speed-up, dropped when the
+                    // speech-only duration is too short (< 500 ms pre-pad) to stay
+                    // intelligible — the same gate enrollment applies to its
+                    // VAD-segmented utterance.  Note that this gate now evaluates
+                    // the VAD-gated speech duration (not the full TTS audio), so
+                    // short phrases drop the speed-up variant more often than the
+                    // pre-fix pipeline did — a direct consequence of the alignment.
+                    //
+                    // Layout note: variants 1–4 are embedded via
+                    // `extract_embeddings_from_audio` (whole-audio mel over the raw
+                    // hop-concatenated speech_audio), so their mel layout lacks the
+                    // batch-flush boundary handling (`trim_voice_batch` overlap at
+                    // VOICE_BATCH_SIZE boundaries) that variant 0's streaming mel
+                    // matches exactly.  This is acceptable for perturbations and
+                    // matches how enrollment derives its own augmented variants
+                    // (`process_enrollment_sample` → whole-audio mel): the speech
+                    // content is identical VAD-gated audio; only the batch-boundary
+                    // framing differs slightly.
+                    //
+                    // Variant generation is shared with the E2E bench via
+                    // [`augment_pcm_variants`]: noise seed = the
+                    // TTS phrase seed, gate input = VAD-gated speech, canonical
+                    // push order (speed-up 3rd).  The negative pool deliberately
+                    // uses the bounded [`AugmentSet::Negatives`] set (original +
+                    // pink 25 dB): the old speed/volume cells were dropped to
+                    // keep the 12-cell positive recipe's cold embedding recompute
+                    // inside the 39 s bench budget (see `AugmentSet::Negatives`).
+                    // Variant 0 (original) is pushed above from the streaming mel
+                    // frames.
+                    for variant in augment_pcm_variants(
+                        &speech_audio,
+                        SAMPLE_RATE,
+                        seed,
+                        AugmentSet::Negatives,
+                    ) {
+                        if variant.variant_index == 0 {
+                            continue; // original already pushed above
+                        }
+                        let dense_embs =
+                            extract_embeddings_from_audio(models, &variant.pcm).unwrap_or_default();
+                        push_seq(dense_embs, variant.variant_index);
+                    }
+
+                    // ── Persist the per-utterance embedding cache ──
+                    // Best-effort: a write failure only costs a recompute on the
+                    // next run.  Nothing is written when no variant produced
+                    // embeddings (e.g. no VAD-positive speech) — the miss path
+                    // would reproduce the same empty result.
+                    if !utterance_variants.is_empty()
+                        && let (Some(dir), Some(key)) = (&emb_cache_dir, &cache_key)
+                    {
+                        write_embedding_cache(dir, key, &utterance_variants);
+                    }
                 }
             }
-        }
 
-        dense_sequences
-    })
-    .await
-    .unwrap_or_default()
+            dense_sequences
+        })
+        .await
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let count = dense.len();
+
+    // OnceLock::set is a no-op if already set (race-safe).
+    let _ = cache.set(dense);
+
+    if count > 0 {
+        info!(
+            "Pre-warmed {count} {phrase_type} phrase dense embedding(s)              from {} phrases × {seeds_per_phrase} seeds              for negative training",
+            phrases.len(),
+        );
+    } else {
+        warn!(
+            "No {phrase_type} phrase embeddings could be generated — \
+             models will train on {fallback_info}"
+        );
+    }
 }
 
 /// Pre-warm unrelated speech embedding cache.
@@ -1311,35 +1349,7 @@ async fn prewarm_phrase_embeddings(
 /// If the cache is already populated (from a previous call), this is a
 /// no-op.  Safe to call multiple times.
 pub(crate) async fn prewarm_unrelated_embeddings() {
-    // Fast path: already pre-warmed.
-    if UNRELATED_EMBEDDINGS_CACHE.get().is_some() {
-        return;
-    }
-
-    let dense = prewarm_phrase_embeddings(
-        "unrelated",
-        UNRELATED_PHRASES,
-        UNRELATED_SEEDS_PER_PHRASE,
-        UNRELATED_SEED_BASE,
-        "ambient + confusable negatives only",
-    )
-    .await;
-
-    let count = dense.len();
-
-    let _ = UNRELATED_EMBEDDINGS_CACHE.set(dense);
-
-    if count > 0 {
-        info!(
-            "Pre-warmed {count} unrelated phrase dense embedding(s)              from {} phrases × {UNRELATED_SEEDS_PER_PHRASE} seeds              for negative training",
-            UNRELATED_PHRASES.len(),
-        );
-    } else {
-        warn!(
-            "No unrelated phrase embeddings could be generated — \
-             models will train on ambient + confusable negatives only"
-        );
-    }
+    prewarm_phrase_embeddings(UNRELATED_PREWARM).await;
 }
 
 // ── Model URLs and filenames ────────────────────────────
