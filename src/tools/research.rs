@@ -28,7 +28,6 @@ use crate::tools::ask::{
     dispatch_verifiers, escape_fences, extract_query_telemetry, load_analyst_angles,
     max_confidence, normalize_claim,
 };
-use crate::util::UnwrapPoison;
 use crate::{ChatMessage, ChatRequest, ChatRequestMeta, DEFAULT_MAX_TOKENS, Role, Workspace};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -37,7 +36,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::sync::{LazyLock, RwLock};
 use std::time::{Duration, Instant};
 
 // ── Constants (module-local defaults) ────────────────────────────────────
@@ -176,36 +174,6 @@ impl ResearchBudget {
     }
 }
 
-// ── Per-workspace in-flight guard ────────────────────────────────────────
-
-/// One active deep run per workspace (atomic check-and-set). The guard is
-/// moved into the spawned orchestrator task and released on completion.
-static ACTIVE_RUNS: LazyLock<RwLock<HashSet<String>>> =
-    LazyLock::new(|| RwLock::new(HashSet::new()));
-
-struct ResearchRunGuard {
-    ws_name: String,
-}
-
-impl ResearchRunGuard {
-    fn try_start(ws_name: &str) -> Option<Self> {
-        let mut guard = ACTIVE_RUNS.write().unwrap_poison();
-        if guard.contains(ws_name) {
-            return None;
-        }
-        guard.insert(ws_name.to_string());
-        Some(Self {
-            ws_name: ws_name.to_string(),
-        })
-    }
-}
-
-impl Drop for ResearchRunGuard {
-    fn drop(&mut self) {
-        ACTIVE_RUNS.write().unwrap_poison().remove(&self.ws_name);
-    }
-}
-
 // ── Tool ─────────────────────────────────────────────────────────────────
 
 pub struct ResearchTool {
@@ -249,16 +217,6 @@ impl Tool for ResearchTool {
         // Manager's set exclusively.
         let question = super::get_str(&args, "question")?;
 
-        // Per-workspace in-flight guard (atomic check-and-set): a second deep
-        // run in the same workspace is rejected with a clear error.
-        let Some(run_guard) = ResearchRunGuard::try_start(&ws.name) else {
-            anyhow::bail!(
-                "A deep research run is already active for workspace '{}'. \
-                 Wait for the current run to finish before starting another.",
-                ws.name
-            );
-        };
-
         // Read user context from task-locals BEFORE tokio::spawn so the
         // single result envelope carries the correct user identity.
         let ws = ws.clone();
@@ -272,8 +230,6 @@ impl Tool for ResearchTool {
             .unwrap_or_default();
 
         tokio::spawn(async move {
-            // The guard lives for the whole orchestrator run.
-            let _run_guard = run_guard;
             let message = build_async_research_message(run_deep_research(&ws, &question).await);
 
             // Route exactly one final envelope to the Manager's agent channel.
@@ -2085,25 +2041,6 @@ mod tests {
         );
         assert_eq!(budget.spent, RESEARCH_MAX_ANALYSTS);
         assert!(budget.is_exhausted());
-    }
-
-    #[test]
-    fn test_run_guard_one_active_run_per_workspace() {
-        let g1 = ResearchRunGuard::try_start("ws");
-        assert!(g1.is_some());
-        assert!(
-            ResearchRunGuard::try_start("ws").is_none(),
-            "second run in the same workspace must be rejected"
-        );
-        assert!(
-            ResearchRunGuard::try_start("other").is_some(),
-            "a different workspace is unaffected"
-        );
-        drop(g1);
-        assert!(
-            ResearchRunGuard::try_start("ws").is_some(),
-            "released after the run completes"
-        );
     }
 
     #[test]
