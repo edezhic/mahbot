@@ -25,6 +25,7 @@
 //!   originating channel (scoped to `job.channel`).
 
 use futures_util::FutureExt;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{OnceLock, RwLock};
 use tokio::sync::mpsc;
@@ -51,6 +52,46 @@ use crate::{Channel, ChatEvent, Role, SendMessage, Workspace};
 /// - Voice channel: TTS speaks this as "robot warning retry" (acceptable for now).
 /// - Emoji rendering varies across terminals and clients.
 const AGENT_FAILURE_EMOJI: &str = "🤖⚠️🔄";
+
+/// Per-role attribution emoji for Telegram deliveries — mirrors the GUI role
+/// icons ([`crate::gui::theme::role_icon`]) per the product spec.
+fn telegram_role_emoji(role: Role) -> &'static str {
+    match role {
+        Role::Manager => "🤖",
+        Role::Engineer => "🔧",
+        Role::Analyst => "🔍",
+        Role::Coder => "💻",
+        Role::Qa => "🔨",
+        Role::Reviewer => "✅",
+        Role::Discovery => "🔎",
+        Role::Artist => "🎨",
+        Role::Maintainer => "⚙️",
+        Role::Sanitation => "🧼",
+        Role::Assistant => "💬",
+    }
+}
+
+/// Telegram agent responses carry a first-line role attribution
+/// (`"{emoji} {label}:\n"`) when the recipient can switch between multiple
+/// roles. Other channels pass the response through unchanged (borrowed, no
+/// allocation).
+#[must_use]
+fn telegram_delivery_content<'a>(
+    channel: &str,
+    role: Role,
+    recipient_roles: &[String],
+    response: &'a str,
+) -> Cow<'a, str> {
+    if channel != "telegram" || recipient_roles.len() < 2 {
+        return Cow::Borrowed(response);
+    }
+    Cow::Owned(format!(
+        "{} {}:\n{}",
+        telegram_role_emoji(role),
+        crate::role::role_info(&role).display_label,
+        response
+    ))
+}
 
 /// Semantic category of a queue job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -617,10 +658,12 @@ async fn deliver_manager_response(response: &str, users: &[UserRecord], job: &Ag
 
     for (channel_name, channel) in &channels {
         for user in users {
+            let content =
+                telegram_delivery_content(channel_name, Role::Manager, &user.roles, response);
             for binding in &user.channels {
                 let reply_target = binding.reply_target.as_deref().unwrap_or(&user.name);
                 if let DeliverOutcome::Failed(e) =
-                    deliver_on_channel(channel.as_ref(), &user.name, reply_target, response).await
+                    deliver_on_channel(channel.as_ref(), &user.name, reply_target, &content).await
                 {
                     error!(
                         channel = %channel_name,
@@ -673,6 +716,8 @@ async fn deliver_single_user_response(
         return;
     };
 
+    let content = telegram_delivery_content(channel, *role, &user.roles, response);
+
     for binding in &user.channels {
         // Only send on the channel that matches the job's origin
         if binding.channel != channel {
@@ -691,7 +736,7 @@ async fn deliver_single_user_response(
 
         let target_addr = binding.reply_target.as_deref().unwrap_or(&user.name);
         if let DeliverOutcome::Failed(e) =
-            deliver_on_channel(chan.as_ref(), &user.name, target_addr, response).await
+            deliver_on_channel(chan.as_ref(), &user.name, target_addr, &content).await
         {
             error!(
                 channel = %channel,
@@ -1307,6 +1352,58 @@ mod tests {
         assert!(
             AGENT_FAILURE_EMOJI.chars().count() >= 3,
             "emoji should be at least 3 characters"
+        );
+    }
+
+    // ── Telegram role attribution tests ──────────────────────────────────
+
+    /// The attribution prefix fires only for Telegram + 2+ role pools, and
+    /// pins the concrete emoji/label table from the spec.
+    #[test]
+    fn test_telegram_delivery_content() {
+        let response = "plain answer";
+
+        // 0-1 roles → response passed through unchanged (borrowed, no prefix).
+        let content = telegram_delivery_content("telegram", Role::Manager, &[], response);
+        assert_eq!(content, "plain answer");
+        assert!(
+            matches!(content, Cow::Borrowed(_)),
+            "no-prefix deliveries must not allocate"
+        );
+        let content = telegram_delivery_content(
+            "telegram",
+            Role::Manager,
+            &["manager".to_string()],
+            response,
+        );
+        assert_eq!(content, "plain answer");
+        assert!(
+            matches!(content, Cow::Borrowed(_)),
+            "no-prefix deliveries must not allocate"
+        );
+
+        // Non-Telegram channels never get a prefix, even with 2+ roles.
+        let multi = ["manager".to_string(), "artist".to_string()];
+        let content = telegram_delivery_content("gui", Role::Manager, &multi, response);
+        assert_eq!(content, "plain answer");
+        assert!(
+            matches!(content, Cow::Borrowed(_)),
+            "gui/voice deliveries must not allocate"
+        );
+
+        // 2+ roles on Telegram → first-line attribution pins the spec table.
+        assert_eq!(
+            telegram_delivery_content("telegram", Role::Manager, &multi, response),
+            "🤖 Manager:\nplain answer"
+        );
+        assert_eq!(
+            telegram_delivery_content(
+                "telegram",
+                Role::Qa,
+                &["qa".to_string(), "coder".to_string()],
+                response,
+            ),
+            "🔨 QA:\nplain answer"
         );
     }
 
