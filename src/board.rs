@@ -69,7 +69,9 @@ CREATE TABLE IF NOT EXISTS tickets (
     priority        INTEGER NOT NULL DEFAULT 1,
     reviewed_head   TEXT,
     reviewed_tree   TEXT,
-    done_at         TEXT
+    done_at         TEXT,
+    bounce_count    INTEGER NOT NULL DEFAULT 0,
+    review_base_count INTEGER
 );
 CREATE TABLE IF NOT EXISTS ticket_comments (
     id          TEXT PRIMARY KEY,
@@ -83,7 +85,8 @@ CREATE INDEX IF NOT EXISTS idx_ticket_comments_ticket_id ON ticket_comments(tick
 CREATE TABLE IF NOT EXISTS ticket_counters (
     workspace_name TEXT PRIMARY KEY,
     next_id        INTEGER NOT NULL DEFAULT 1
-);";
+);
+";
 
 const TICKETS_FTS_INDEX_NAME: &str = "idx_tickets_title_fts";
 const TICKETS_FTS_INDEX_DDL: &str = "\
@@ -114,6 +117,8 @@ crate::columns! {
         REVIEWED_HEAD          => "reviewed_head",
         REVIEWED_TREE          => "reviewed_tree",
         DONE_AT                => "done_at",
+        BOUNCE_COUNT           => "bounce_count",
+        REVIEW_BASE_COUNT      => "review_base_count",
     }
 }
 
@@ -285,6 +290,14 @@ pub struct Ticket {
     /// ticket leaves Done. Backfilled from `updated_at` for pre-migration
     /// tickets. `None` for never-done or not-currently-done tickets.
     pub done_at: Option<String>,
+    /// Number of times this ticket bounced back from review/QA into
+    /// development. Drives the bounce-based circuit breaker (max 5) and the
+    /// reviewer-count +1 adjustment.
+    pub bounce_count: i64,
+    /// Reviewer-count base computed from the ORIGINAL first-review dispatch
+    /// signals (working-tree churn at the first InReview round). Frozen so
+    /// rework-grown diffs cannot escalate reviewer counts on later rounds.
+    pub review_base_count: Option<i64>,
 }
 
 impl Ticket {
@@ -650,6 +663,30 @@ impl BoardStore {
             .await
             .context("Failed to backfill done_at from updated_at")?;
 
+        // ── bounce_count + review_base_count schema evolution ────────────
+        // Bounce counter (drives the bounce-based circuit breaker and the
+        // reviewer-count +1 adjustment) and the frozen first-review base count
+        // (prevents rework-grown diffs from escalating reviewer counts).
+        // Guarded ALTERs follow the done_at precedent.
+        if !turso::column_exists(&self.conn, "tickets", "bounce_count").await? {
+            self.conn
+                .execute(
+                    "ALTER TABLE tickets ADD COLUMN bounce_count INTEGER NOT NULL DEFAULT 0",
+                    (),
+                )
+                .await
+                .context("Failed to add bounce_count column to tickets")?;
+        }
+        if !turso::column_exists(&self.conn, "tickets", "review_base_count").await? {
+            self.conn
+                .execute(
+                    "ALTER TABLE tickets ADD COLUMN review_base_count INTEGER",
+                    (),
+                )
+                .await
+                .context("Failed to add review_base_count column to tickets")?;
+        }
+
         // ── FTS index setup ────────────────────────────────────────────────
         crate::turso::ensure_fts_index(
             &self.conn,
@@ -936,6 +973,8 @@ impl BoardStore {
             reviewed_head: row.get(COL_TICKET_REVIEWED_HEAD)?,
             reviewed_tree: row.get(COL_TICKET_REVIEWED_TREE)?,
             done_at: row.get(COL_TICKET_DONE_AT)?,
+            bounce_count: row.get(COL_TICKET_BOUNCE_COUNT)?,
+            review_base_count: row.get(COL_TICKET_REVIEW_BASE_COUNT)?,
         })
     }
 
@@ -1435,6 +1474,67 @@ impl BoardStore {
             ticket_id,
         );
         prepared.execute_no_cancel(&self.conn).await
+    }
+
+    /// Increment the ticket's bounce counter inside an existing transaction.
+    ///
+    /// Called atomically with the review/QA bounce-back transition so the
+    /// counter can never drift from the transitions that produce it.
+    pub(crate) async fn increment_bounce_count_tx(
+        tx: &TxGuard<'_>,
+        ticket_id: &str,
+    ) -> Result<i64> {
+        let rows = tx
+            .query(
+                "UPDATE tickets SET bounce_count = bounce_count + 1, updated_at = ?1 \
+                 WHERE id = ?2 RETURNING bounce_count",
+                turso::params![turso::now(), ticket_id],
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        match rows.into_iter().next() {
+            Some(row) => row.get::<i64>(0).map_err(anyhow::Error::from),
+            None => Err(anyhow::anyhow!(
+                "ticket {ticket_id} not found — bounce counter not incremented"
+            )),
+        }
+    }
+
+    /// Freeze the reviewer-count base computed from the first-review dispatch
+    /// signals. Written once; later rounds reuse it so rework-grown diffs
+    /// cannot escalate reviewer counts (bounce adjustment is a flat +1).
+    pub(crate) async fn set_review_base_count(&self, ticket_id: &str, count: i64) -> Result<()> {
+        let prepared = Self::build_ticket_update_with_updated_at(
+            "review_base_count = ?",
+            vec![Value::from(count)],
+            ticket_id,
+        );
+        prepared.execute_no_cancel(&self.conn).await
+    }
+
+    /// Manual "Redo Dev" bounce-back: transition a Reviewed ticket back to
+    /// ReadyForDevelopment and increment its bounce counter atomically, so
+    /// manual bounce-backs consume the same breaker budget and +1 reviewer
+    /// adjustment as pipeline bounce-backs. Sets `pipeline_reservation` for
+    /// rework priority (matching pipeline bounce-backs). Cancels any
+    /// registered agent only after the transition succeeds — a failed CAS
+    /// guard (ticket moved externally) must not cancel a just-claimed agent.
+    pub(crate) async fn bounce_back_to_dev(&self, ticket_id: &str) -> Result<()> {
+        crate::turso::with_tx(&self.conn, ticket_id, "bounce back to dev", async |tx| {
+            Self::transition_to_tx(
+                tx,
+                ticket_id,
+                Some(TicketPhase::Reviewed),
+                TicketPhase::ReadyForDevelopment,
+                Some(true),
+            )
+            .await?;
+            Self::increment_bounce_count_tx(tx, ticket_id).await?;
+            Ok(())
+        })
+        .await?;
+        crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(ticket_id);
+        Ok(())
     }
 
     /// Transition pairs for crash/restart recovery (extracted so tests can verify

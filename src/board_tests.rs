@@ -2067,6 +2067,8 @@ async fn test_ticket_roundtrip_all_fields() {
             reviewed_head: None,
             reviewed_tree: None,
             done_at: None,
+            bounce_count: 0,
+            review_base_count: None,
         },
     );
 
@@ -2129,6 +2131,8 @@ async fn test_ticket_roundtrip_all_fields() {
             reviewed_head: Some("reviewed-head-hash".into()),
             reviewed_tree: Some("reviewed-tree-hash".into()),
             done_at: None,
+            bounce_count: 0,
+            review_base_count: None,
         },
     );
 
@@ -2177,6 +2181,8 @@ async fn test_ticket_roundtrip_all_fields() {
             reviewed_head: Some("reviewed-head-hash".into()),
             reviewed_tree: Some("reviewed-tree-hash".into()),
             done_at: None,
+            bounce_count: 0,
+            review_base_count: None,
         },
     );
 }
@@ -2870,4 +2876,45 @@ async fn test_route_comment_to_agents_uses_commenter_role() {
     assert_eq!(received.user_name, "engineer");
 
     crate::message_router::unregister_agent(agent_id);
+}
+
+/// Manual "Redo Dev" bounce-back transitions Reviewed → ReadyForDevelopment
+/// and increments the bounce counter atomically (so manual bounces consume
+/// the same breaker budget and +1 reviewer adjustment as pipeline bounces).
+#[tokio::test]
+async fn test_bounce_back_to_dev_transitions_and_increments_counter() {
+    let (store, _tmp) = open_test_store().await;
+    let ws = crate::workspace::test_ws("/tmp/test_bounce_back_to_dev");
+    let id = make_ticket(&store, &ws, "Redo Dev", TicketPhase::Reviewed).await;
+
+    store
+        .bounce_back_to_dev(&id)
+        .await
+        .expect("bounce-back succeeds");
+
+    let ticket = expect_ticket(&store, &id).await;
+    assert_eq!(ticket.phase, TicketPhase::ReadyForDevelopment);
+    assert_eq!(ticket.bounce_count, 1, "manual bounce must count");
+
+    // A second Redo Dev from Reviewed (e.g. after a fresh review pass)
+    // increments again; bouncing from a non-Reviewed phase is rejected.
+    store
+        .transition_to(&id, None, TicketPhase::Reviewed, None)
+        .await
+        .expect("move back to Reviewed for a second round");
+    store
+        .bounce_back_to_dev(&id)
+        .await
+        .expect("second bounce-back succeeds");
+    let ticket = expect_ticket(&store, &id).await;
+    assert_eq!(ticket.bounce_count, 2);
+
+    store
+        .transition_to(&id, None, TicketPhase::InQa, None)
+        .await
+        .expect("move to InQa");
+    assert!(
+        store.bounce_back_to_dev(&id).await.is_err(),
+        "bounce-back from a non-Reviewed phase must fail (fail-closed)"
+    );
 }

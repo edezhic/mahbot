@@ -24,6 +24,7 @@ pub(crate) mod embedder;
 pub(crate) mod extraction;
 pub(crate) mod git_commands;
 pub mod gui;
+pub(crate) mod joint_verdict;
 pub mod lock_utils;
 pub mod logs;
 pub mod maintainer;

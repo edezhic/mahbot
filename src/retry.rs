@@ -71,6 +71,15 @@ pub(crate) const DEFAULT_RETRY_BASE_BACKOFF_MS: u64 = 5_000;
 pub(crate) const DEFAULT_RETRY_MAX_BACKOFF_MS: u64 = 60_000;
 pub(crate) const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_mins(12);
 
+/// Dedicated joint-verdict synthesis retry schedule: 3 attempts, 30–45 s
+/// backoff band (base 30 s, cap 45 s, ±25% jitter on sleeps).
+pub(crate) const DEFAULT_SYNTHESIS_MAX_ATTEMPTS_STR: &str = "3";
+pub(crate) const DEFAULT_SYNTHESIS_BASE_BACKOFF_MS_STR: &str = "30000";
+pub(crate) const DEFAULT_SYNTHESIS_MAX_BACKOFF_MS_STR: &str = "45000";
+pub(crate) const DEFAULT_SYNTHESIS_MAX_ATTEMPTS: u32 = 3;
+pub(crate) const DEFAULT_SYNTHESIS_BASE_BACKOFF_MS: u64 = 30_000;
+pub(crate) const DEFAULT_SYNTHESIS_MAX_BACKOFF_MS: u64 = 45_000;
+
 /// Idle (read) timeout for scoped calls — resets while data flows.
 pub(crate) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
@@ -152,6 +161,48 @@ impl RetryPolicy {
             return p.clone();
         }
         Self::from_config()
+    }
+
+    /// Build the joint-verdict synthesis policy from the dedicated config
+    /// keys (`synthesis_max_attempts`, `synthesis_base_backoff_ms`,
+    /// `synthesis_max_backoff_ms`), falling back to defaults on invalid
+    /// values. The synthesis loop is deliberately bounded (3 attempts,
+    /// 30–45 s backoff) so a bad grouping pass degrades to the deterministic
+    /// fallback comment instead of burning minutes of wall time.
+    ///
+    /// Like [`Self::current`], a test override installed via
+    /// [`swap_test_retry_policy`] takes precedence so synthesis tests run
+    /// fast.
+    #[must_use]
+    pub(crate) fn synthesis_from_config() -> Self {
+        #[cfg(test)]
+        if let Ok(guard) = TEST_POLICY_OVERRIDE.read()
+            && let Some(p) = guard.as_ref()
+        {
+            return p.clone();
+        }
+        Self {
+            max_attempts: parse_cfg_u64(
+                "synthesis_max_attempts",
+                &CONFIG.synthesis_max_attempts(),
+                u64::from(DEFAULT_SYNTHESIS_MAX_ATTEMPTS),
+            )
+            .clamp(1, 20) as u32,
+            base_backoff_ms: parse_cfg_u64(
+                "synthesis_base_backoff_ms",
+                &CONFIG.synthesis_base_backoff_ms(),
+                DEFAULT_SYNTHESIS_BASE_BACKOFF_MS,
+            )
+            .clamp(1, 3_600_000),
+            max_backoff_ms: parse_cfg_u64(
+                "synthesis_max_backoff_ms",
+                &CONFIG.synthesis_max_backoff_ms(),
+                DEFAULT_SYNTHESIS_MAX_BACKOFF_MS,
+            )
+            .clamp(1, 3_600_000),
+            operation_timeout: Duration::from_mins(10),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+        }
     }
 }
 

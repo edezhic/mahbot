@@ -92,15 +92,24 @@ pub const fn role_badge_color_for(role: &crate::Role) -> (Color, Color) {
 
 /// Returns the badge (foreground, background) color for a role name string.
 ///
-/// Accepts canonical names (e.g. `"analyst"`) and derivative names with a
-/// numeric suffix (e.g. `"analyst_1"`, `"analyst_2"`). Unknown strings
-/// (including LLM API roles like `"user"`, `"assistant"`, `"system"`, `"tool"`)
-/// fall back to a muted grey.
+/// Accepts canonical names (e.g. `"analyst"`), derivative names with a
+/// numeric suffix (e.g. `"analyst_1"`, `"analyst_2"`), and the joint-comment
+/// stage roles ("Analysis"/"Review"/"QA" — the comment role is the stage
+/// name, per the joint-verdict pipeline). Unknown strings (including LLM API
+/// roles like `"user"`, `"assistant"`, `"system"`, `"tool"`) fall back to a
+/// muted grey.
 ///
 /// Delegates to [`role_badge_color_for`] after resolving the string, which
 /// reads colors from [`crate::role::role_info()`] as the single source of truth.
 #[must_use]
 pub fn role_badge_color(role: &str) -> (Color, Color) {
+    // Stage-name comment roles from the joint-verdict pipeline ("Analysis"/
+    // "Review"/"QA" — the comment role is the stage name). Resolved via the
+    // shared inverse mapping so it can't drift from management::stage_name.
+    if let Some(r) = crate::management::stage_role(role) {
+        return role_badge_color_for(&r);
+    }
+
     // Try exact match first (handles canonical names like "analyst")
     if let Ok(r) = role.parse::<crate::Role>() {
         return role_badge_color_for(&r);
@@ -766,6 +775,25 @@ mod tests {
     fn non_numeric_suffix_is_unknown() {
         assert_eq!(role_badge_color("analyst_final"), (TEXT_MUTED, HOVER));
         assert_eq!(role_badge_color("coder_abc"), (TEXT_MUTED, HOVER));
+    }
+
+    #[test]
+    fn joint_comment_stage_roles_get_their_role_colors() {
+        // The joint-verdict pipeline writes comments with the STAGE NAME as the
+        // comment role ("Analysis"/"Review"/"QA") — they must render with the
+        // corresponding role color, not the muted-grey fallback.
+        assert_eq!(
+            role_badge_color("Analysis"),
+            role_badge_color_for(&crate::Role::Analyst)
+        );
+        assert_eq!(
+            role_badge_color("Review"),
+            role_badge_color_for(&crate::Role::Reviewer)
+        );
+        assert_eq!(
+            role_badge_color("QA"),
+            role_badge_color_for(&crate::Role::Qa)
+        );
     }
 
     #[test]

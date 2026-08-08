@@ -181,7 +181,21 @@ CREATE TABLE IF NOT EXISTS image_gen_calls (
     error_message TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_image_gen_calls_recorded_at ON image_gen_calls(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_image_gen_calls_model ON image_gen_calls(model);";
+CREATE INDEX IF NOT EXISTS idx_image_gen_calls_model ON image_gen_calls(model);
+-- Shadow-instrumentation rows for the joint-verdict pipeline: per-agent
+-- verdict scores per stage round, so inter-agent agreement can be
+-- re-measured and the dynamic-count formula validated after launch.
+CREATE TABLE IF NOT EXISTS verdict_scores (
+    id          TEXT PRIMARY KEY,
+    ticket_id   TEXT NOT NULL,
+    stage       TEXT NOT NULL,
+    agent_index INTEGER NOT NULL,
+    score       INTEGER NOT NULL,
+    issues      TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_verdict_scores_ticket_id ON verdict_scores(ticket_id);
+CREATE INDEX IF NOT EXISTS idx_verdict_scores_created_at ON verdict_scores(created_at);";
 
 impl LogStore {
     /// Open (or create) the log database at `root/db/logs.db`.
@@ -299,6 +313,45 @@ impl LogStore {
             .await
             .context("Failed to delete old log entries")?;
         Ok(n)
+    }
+
+    /// Persist a single per-agent verdict score (shadow instrumentation for
+    /// the joint-verdict pipeline). Best-effort — callers log and swallow
+    /// failures; the verdict pipeline must never block on instrumentation.
+    /// Written outside the comment+transition transaction so the store write
+    /// lock is never held for it.
+    #[allow(clippy::cast_possible_wrap)]
+    pub(crate) async fn record_verdict_score(
+        &self,
+        ticket_id: &str,
+        stage: &str,
+        agent_index: usize,
+        score: u8,
+        issues: &[String],
+    ) -> anyhow::Result<()> {
+        let id = format!(
+            "{ticket_id}_{stage}_{}_{agent_index}",
+            crate::generate_suffix()
+        );
+        let now = crate::turso::now();
+        let issues_json = serde_json::to_string(issues)?;
+        self.conn
+            .execute(
+                "INSERT INTO verdict_scores (id, ticket_id, stage, agent_index, score, issues, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id,
+                    ticket_id,
+                    stage,
+                    agent_index as i64,
+                    i64::from(score),
+                    issues_json,
+                    now,
+                ],
+            )
+            .await
+            .context("Failed to record verdict score")?;
+        Ok(())
     }
 
     /// Query log entries with optional filters.

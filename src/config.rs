@@ -328,6 +328,26 @@ pub struct ConfigData {
     /// Default: `"5000"` (canonical schedule 5/10/20/40/60/60… s). Invalid
     /// values fall back to the default.
     pub retry_base_backoff_ms: Option<String>,
+    /// Joint-verdict LLM synthesis retry loop max attempts.
+    /// Default: `"3"`. Invalid values fall back to the default.
+    pub synthesis_max_attempts: Option<String>,
+    /// Joint-verdict LLM synthesis retry base backoff in milliseconds.
+    /// Default: `"30000"` (30–45 s band per spec). Invalid values fall back
+    /// to the default.
+    pub synthesis_base_backoff_ms: Option<String>,
+    /// Joint-verdict LLM synthesis retry backoff cap in milliseconds.
+    /// Default: `"45000"`. Invalid values fall back to the default.
+    pub synthesis_max_backoff_ms: Option<String>,
+    /// Reviewer-count calibration coefficient: total working-tree churn
+    /// (lines) below which a round gets 2 reviewers (with zero added files).
+    /// Default: `"50"`.
+    pub review_count_low_churn: Option<String>,
+    /// Reviewer-count calibration coefficient: total (or max per-file) churn
+    /// (lines) at/above which a round gets 4 reviewers. Default: `"400"`.
+    pub review_count_high_churn: Option<String>,
+    /// Calibration fit date for the review-count coefficients (ISO date
+    /// string). Written when the coefficients are re-fit; informational only.
+    pub review_count_coeff_fit_date: Option<String>,
     /// Retry loop backoff cap in milliseconds for LLM operations.
     /// Default: `"60000"`. Invalid values fall back to the default.
     pub retry_max_backoff_ms: Option<String>,
@@ -567,6 +587,12 @@ string_config_fields! {
     retry_base_backoff_ms [or(crate::retry::DEFAULT_RETRY_BASE_BACKOFF_MS_STR)],
     retry_max_backoff_ms [or(crate::retry::DEFAULT_RETRY_MAX_BACKOFF_MS_STR)],
     operation_timeout_secs [or(crate::retry::DEFAULT_OPERATION_TIMEOUT_SECS_STR)],
+    synthesis_max_attempts [or(crate::retry::DEFAULT_SYNTHESIS_MAX_ATTEMPTS_STR)],
+    synthesis_base_backoff_ms [or(crate::retry::DEFAULT_SYNTHESIS_BASE_BACKOFF_MS_STR)],
+    synthesis_max_backoff_ms [or(crate::retry::DEFAULT_SYNTHESIS_MAX_BACKOFF_MS_STR)],
+    review_count_low_churn [or(crate::joint_verdict::DEFAULT_REVIEW_COUNT_LOW_CHURN_STR)],
+    review_count_high_churn [or(crate::joint_verdict::DEFAULT_REVIEW_COUNT_HIGH_CHURN_STR)],
+    review_count_coeff_fit_date [non_empty],
 }
 
 impl ConfigData {

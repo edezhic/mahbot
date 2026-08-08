@@ -6,32 +6,22 @@ use crate::util::test::{
     init_test_stores,
 };
 use crate::workspace::test_ws_named;
-use strum::IntoEnumIterator;
 
-/// All non-TotalComments circuit breaker variants must have a `max_count` strictly
-/// less than [`CircuitBreakerKind::TotalComments`]'s `max_count`.
-///
-/// ## Rationale
-///
-/// - **Sanitation breaker** (`max_count = 3`): must trip before the TotalComments
-///   breaker (`max_count = 30`), otherwise a ticket could accumulate 30+
-///   comments during repeated sanitation loops without tripping.
-/// - **Diagnostics breaker** (`max_count = 4`): must also trip before the
-///   TotalComments breaker. This is a conservative approximation — the TotalComments
-///   breaker counts *all* comments (not just diagnostics), but guaranteeing
-///   that diagnostics-only chatter cannot bypass the TotalComments breaker prevents
-///   pathological ticket growth from repeated diagnostic cycles.
-
+/// The bounce-based breaker allows exactly [`MAX_BOUNCES`] bounces — the 6th
+/// bounce fails the ticket. The comment-based breakers (Sanitation,
+/// Diagnostics) must trip before the bounce budget so repeated agent
+/// failures never ride on the bounce budget.
 #[test]
-fn all_non_total_comments_circuit_breakers_trip_before_total_comments() {
-    let total_comments_max = CircuitBreakerKind::TotalComments.max_count();
-    for kind in CircuitBreakerKind::iter() {
-        if kind == CircuitBreakerKind::TotalComments {
-            continue;
-        }
+fn bounce_breaker_max_is_five_and_comment_breakers_trip_before() {
+    let bounce_max = crate::joint_verdict::MAX_BOUNCES;
+    assert_eq!(bounce_max, 5, "MAX_BOUNCES must be 5");
+    for kind in [
+        CircuitBreakerKind::Sanitation,
+        CircuitBreakerKind::Diagnostics,
+    ] {
         assert!(
-            kind.max_count() < total_comments_max,
-            "{kind:?}.max_count() ({}) must be less than TotalComments.max_count() ({total_comments_max})",
+            kind.max_count() < bounce_max,
+            "{kind:?}.max_count() ({}) must be less than the bounce budget ({bounce_max})",
             kind.max_count(),
         );
     }
@@ -51,7 +41,6 @@ fn all_non_total_comments_circuit_breakers_trip_before_total_comments() {
 /// |---------|-------------|----------------|
 /// | **Sanitation** | `SYSTEM_ROLE` ≠ `SANITATION_ROLE` ✅ | content does **not** contain `sanitation_failed.md` ✅ |
 /// | **Diagnostics** | `SYSTEM_ROLE` ≠ `DIAGNOSTICS_ROLE` ✅ | content does **not** contain `diagnostics_failed.md` ✅ |
-/// | **TotalComments** | — | — (terminal `Failed` phase prevents re-evaluation) |
 ///
 /// Both Sanitation and Diagnostics breakers now have role-based protection:
 /// trip comments (written with `SYSTEM_ROLE`) are structurally excluded from
@@ -62,8 +51,10 @@ fn all_non_total_comments_circuit_breakers_trip_before_total_comments() {
 /// — by feeding [`CircuitBreakerKind::should_trip`] with a [`TicketComment`]
 /// constructed from the actual trip message — that the full filtering logic
 /// would not count a trip comment (the 100% case).
-#[test]
-fn circuit_breaker_self_counting_prevention() {
+#[tokio::test]
+async fn circuit_breaker_self_counting_prevention() {
+    init_test_stores().await;
+
     // ── Sanitation breaker: dual role + content exclusion ──
     {
         let msg = CircuitBreakerKind::Sanitation.trip_message(99, 3);
@@ -153,13 +144,11 @@ async fn circuit_breaker_moves_other_ready_for_development_tickets_to_planning()
     )
     .await;
 
-    // Add comments to ticket A so the circuit breaker has something to count
-    // (CircuitBreakerKind::TotalComments.max_count() + 1 = 31 comments, enough to trip).
-    for i in 0..=CircuitBreakerKind::TotalComments.max_count() {
-        board()
-            .add_comment(&trip_id, SYSTEM_ROLE, &format!("Comment {i}"))
-            .await
-            .expect("add_comment to A");
+    // Trip ticket A's circuit breaker: 4 cumulative sanitation failures
+    // (max 3) — the drain behavior is breaker-agnostic, and the bounce
+    // breaker has no pre-flight arm (it is enforced mid-round).
+    for _ in 0..4 {
+        add_breaker_failure(CircuitBreakerKind::Sanitation, &trip_id).await;
     }
 
     // Fetch ticket A and trip the circuit breaker.
@@ -168,7 +157,7 @@ async fn circuit_breaker_moves_other_ready_for_development_tickets_to_planning()
     let tripped = try_trip_circuit_breaker(
         &ticket_a,
         TicketPhase::ReadyForDevelopment,
-        CircuitBreakerKind::TotalComments,
+        Some(CircuitBreakerKind::Sanitation),
         "test",
     )
     .await;
@@ -208,120 +197,6 @@ async fn circuit_breaker_moves_other_ready_for_development_tickets_to_planning()
             "ticket C in different workspace must not be moved"
         );
     }
-}
-
-/// Verify that `record_verdict_comments_tx` correctly writes comments
-/// based on verdict filter.
-#[tokio::test]
-async fn record_verdict_comments_filtering() {
-    init_test_stores().await;
-
-    let ticket_id = make_ticket(
-        board(),
-        &test_ws_named("/tmp/test", "test"),
-        "Test",
-        TicketPhase::Backlog,
-    )
-    .await;
-
-    // ── FailingOnly with all-passing verdicts ──
-    // Should produce 0 comments (nothing to write).
-    let results = vec![pass_result()];
-    crate::turso::with_tx(
-        &board().conn,
-        &ticket_id,
-        "test verdict comments",
-        async |tx| {
-            record_verdict_comments_tx(
-                tx,
-                &ticket_id,
-                &results,
-                Role::Reviewer.as_str(),
-                VerdictFilter::FailingOnly,
-            )
-            .await
-        },
-    )
-    .await
-    .expect("record_verdict_comments_tx should succeed");
-
-    let comments = board()
-        .get_comments(&ticket_id)
-        .await
-        .expect("get_comments");
-    assert_eq!(
-        comments.len(),
-        0,
-        "passing verdicts with FailingOnly filter should produce 0 comments"
-    );
-
-    // ── FailingOnly with a failing verdict ──
-    // Should produce 1 comment.
-    let results = vec![fail_result()];
-    crate::turso::with_tx(
-        &board().conn,
-        &ticket_id,
-        "test verdict comments",
-        async |tx| {
-            record_verdict_comments_tx(
-                tx,
-                &ticket_id,
-                &results,
-                Role::Reviewer.as_str(),
-                VerdictFilter::FailingOnly,
-            )
-            .await
-        },
-    )
-    .await
-    .expect("record_verdict_comments_tx should succeed");
-
-    let comments = board()
-        .get_comments(&ticket_id)
-        .await
-        .expect("get_comments");
-    assert_eq!(
-        comments.len(),
-        1,
-        "failing verdict should create one comment"
-    );
-    assert_eq!(comments[0].role, "reviewer_1");
-
-    // ── All filter (analyst path) ──
-    // Should produce 2 comments (both verdicts recorded).
-    let results = vec![
-        analyst_verdict(10, "Excellent analysis.", &[]),
-        analyst_verdict(4, "Needs more research.", &["Missing citations"]),
-    ];
-    crate::turso::with_tx(
-        &board().conn,
-        &ticket_id,
-        "test verdict comments",
-        async |tx| {
-            record_verdict_comments_tx(
-                tx,
-                &ticket_id,
-                &results,
-                Role::Analyst.as_str(),
-                VerdictFilter::All,
-            )
-            .await
-        },
-    )
-    .await
-    .expect("record_verdict_comments_tx should succeed");
-
-    let comments = board()
-        .get_comments(&ticket_id)
-        .await
-        .expect("get_comments");
-    assert_eq!(
-        comments.len(),
-        3,
-        "All filter should write both verdicts (total 3)"
-    );
-    assert_eq!(comments[1].role, "analyst_1");
-    assert_eq!(comments[2].role, "analyst_2");
 }
 
 // ── transition_ticket_to_done — conditional notification ─────────
@@ -464,13 +339,6 @@ async fn breaker_counts_failures() {
             log_label: "Diagnostics",
             ws_suffix: "diag_breaker_test",
         },
-        BreakerCase {
-            name: "TotalComments",
-            kind: CircuitBreakerKind::TotalComments,
-            source_phase: TicketPhase::InReview,
-            log_label: "TotalComments",
-            ws_suffix: "tc_breaker_test",
-        },
     ];
 
     for case in &cases {
@@ -494,7 +362,8 @@ async fn breaker_counts_failures() {
         let ticket = expect_ticket(board(), &ticket_id).await;
 
         assert!(
-            !try_trip_circuit_breaker(&ticket, case.source_phase, case.kind, case.log_label,).await,
+            !try_trip_circuit_breaker(&ticket, case.source_phase, Some(case.kind), case.log_label,)
+                .await,
             "case {}: should NOT trip with {} failures (max: {})",
             case.name,
             below_max,
@@ -525,7 +394,8 @@ async fn breaker_counts_failures() {
         let ticket = expect_ticket(board(), &ticket_id).await;
 
         let tripped =
-            try_trip_circuit_breaker(&ticket, case.source_phase, case.kind, case.log_label).await;
+            try_trip_circuit_breaker(&ticket, case.source_phase, Some(case.kind), case.log_label)
+                .await;
         assert!(
             tripped,
             "case {}: should trip with {} failures (max: {}, {} > {})",
@@ -618,10 +488,6 @@ async fn add_breaker_failure(kind: CircuitBreakerKind, ticket_id: &str) {
                 load_prompt("diagnostics_failed.md"),
             ),
         ),
-        CircuitBreakerKind::TotalComments => (
-            "user",
-            "Comment — circuit breaker boundary test".to_string(),
-        ),
     };
     let _ = board().add_comment(ticket_id, role, &comment).await;
 }
@@ -645,14 +511,40 @@ fn analyst_verdict(score: u8, critique: &str, issues: &[&str]) -> ParallelVerdic
     })
 }
 
+/// Install the process-global test seams needed by the joint-verdict
+/// synthesis path: a tiny retry policy (fast synthesis exhaustion) and a
+/// scripted fake provider. Returns the guard RAII handles.
+///
+/// Without a fake provider, `providers::chat_scoped` panics on the unset
+/// global — every test that drives an any-failed / partial round (which
+/// triggers synthesis) must install these.
+#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
+async fn install_synthesis_test_seams(
+    fake: crate::util::test::FakeProvider,
+) -> (
+    std::sync::MutexGuard<'static, ()>,
+    crate::util::test::RetryPolicyGuard,
+    crate::util::test::FakeProviderGuard,
+) {
+    let lock = crate::util::test::retry_tests_lock();
+    let policy_guard =
+        crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+    let provider_guard = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+    (lock, policy_guard, provider_guard)
+}
+
 // ── process_verifier_verdicts — verdict processing ─────────────────────
 
 /// Verify all verdict-processing outcomes:
 /// - All failed → Failed
-/// - Any failed → bounce-back to ReadyForDevelopment with pipeline reservation
+/// - Any failed → bounce-back to ReadyForDevelopment with pipeline
+///   reservation, a single joint comment (role = stage name), and a bumped
+///   bounce counter
+/// - The 6th bounce → Failed (bounce circuit breaker)
 /// - All passed (Reviewer) → Reviewed
 /// - All passed (QA) → QaPassed
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
 async fn process_verifier_verdicts_cases() {
     struct Case {
         name: &'static str,
@@ -663,9 +555,13 @@ async fn process_verifier_verdicts_cases() {
         vi: VerifierInfo,
         expected_phase: TicketPhase,
         expected_pipeline_reservation: bool,
+        /// Expected bounce_count after processing (0 for non-bounce cases).
+        expected_bounce_count: i64,
     }
 
     init_management_test_stores().await;
+    let (_lock, _policy_guard, _provider_guard) =
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
 
     let cases = vec![
         Case {
@@ -677,6 +573,7 @@ async fn process_verifier_verdicts_cases() {
             vi: REVIEWER_VI,
             expected_phase: TicketPhase::Failed,
             expected_pipeline_reservation: false,
+            expected_bounce_count: 0,
         },
         Case {
             name: "any failed -> bounce-back with pipeline reservation",
@@ -687,6 +584,7 @@ async fn process_verifier_verdicts_cases() {
             vi: REVIEWER_VI,
             expected_phase: TicketPhase::ReadyForDevelopment,
             expected_pipeline_reservation: true,
+            expected_bounce_count: 1,
         },
         Case {
             name: "all passed -> Reviewed",
@@ -697,6 +595,7 @@ async fn process_verifier_verdicts_cases() {
             vi: REVIEWER_VI,
             expected_phase: TicketPhase::Reviewed,
             expected_pipeline_reservation: false,
+            expected_bounce_count: 0,
         },
         Case {
             name: "all passed (QA) -> QaPassed",
@@ -707,6 +606,7 @@ async fn process_verifier_verdicts_cases() {
             vi: QA_VI,
             expected_phase: TicketPhase::QaPassed,
             expected_pipeline_reservation: false,
+            expected_bounce_count: 0,
         },
     ];
 
@@ -734,7 +634,106 @@ async fn process_verifier_verdicts_cases() {
             "case {}: expected pipeline_reservation={}, got {}",
             case.name, case.expected_pipeline_reservation, ticket.pipeline_reservation,
         );
+        assert_eq!(
+            ticket.bounce_count, case.expected_bounce_count,
+            "case {}: expected bounce_count={}, got {}",
+            case.name, case.expected_bounce_count, ticket.bounce_count,
+        );
+
+        // The any-failed case writes exactly ONE joint comment (role = stage
+        // name), replacing the three per-agent comments.
+        let comments = board()
+            .get_comments(&ticket_id)
+            .await
+            .expect("get comments");
+        let verdict_comments: Vec<&TicketComment> = comments
+            .iter()
+            .filter(|c| c.role == stage_name(case.vi.role))
+            .collect();
+        if case.expected_phase == TicketPhase::ReadyForDevelopment {
+            assert_eq!(
+                verdict_comments.len(),
+                1,
+                "case {}: one joint comment expected, got {}",
+                case.name,
+                verdict_comments.len(),
+            );
+            let joint = &verdict_comments[0];
+            assert!(
+                joint.content.contains("round"),
+                "case {}: joint comment must carry the stage title: {}",
+                case.name,
+                joint.content,
+            );
+            assert!(
+                joint.content.contains("threshold 9/10"),
+                "case {}: joint comment must carry the code-computed threshold line: {}",
+                case.name,
+                joint.content,
+            );
+        } else {
+            assert!(
+                verdict_comments.is_empty(),
+                "case {}: no per-stage comments expected for non-bounce rounds",
+                case.name,
+            );
+        }
     }
+}
+
+/// The bounce circuit breaker: a ticket already at [`MAX_BOUNCES`] bounces
+/// fails on the next failed round instead of bouncing again.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+async fn sixth_bounce_fails_ticket() {
+    init_management_test_stores().await;
+    let (_lock, _policy_guard, _provider_guard) =
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
+
+    let ws = test_ws_named("/tmp/test", "sixth_bounce");
+    let ticket_id = make_ticket(board(), &ws, "Sixth Bounce", TicketPhase::InReview).await;
+    board()
+        .conn
+        .execute(
+            "UPDATE tickets SET bounce_count = ?1 WHERE id = ?2",
+            turso::params![crate::joint_verdict::MAX_BOUNCES as i64, ticket_id.as_str()],
+        )
+        .await
+        .expect("set bounce_count to max");
+
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    let transitioned = process_verifier_verdicts(
+        &ticket,
+        &vec![pass_result(), fail_result(), pass_result()],
+        REVIEWER_VI,
+    )
+    .await;
+    assert!(
+        transitioned,
+        "6th-bounce round should transition the ticket"
+    );
+
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    assert_eq!(
+        ticket.phase,
+        TicketPhase::Failed,
+        "6th bounce must fail the ticket"
+    );
+    assert_eq!(
+        ticket.bounce_count,
+        crate::joint_verdict::MAX_BOUNCES as i64,
+        "bounce counter stays at the max — the failing bounce is not counted"
+    );
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get comments");
+    assert!(
+        comments
+            .iter()
+            .any(|c| c.content.contains("circuit breaker")),
+        "the bounce breaker must leave an explicit trip comment",
+    );
 }
 
 /// Regression guard for the auto-pause trigger boundaries:
@@ -748,20 +747,23 @@ async fn technical_failure_pauses_workspace_but_circuit_breaker_does_not() {
 
     // ── Circuit-breaker trip must NOT pause the workspace ──────────────
     let ws_breaker = create_test_workspace("/tmp/pause_breaker_ws", "ws_pause_breaker").await;
-    let breaker_id = make_ticket(board(), &ws_breaker, "Breaker Trip", TicketPhase::InReview).await;
-    for i in 0..=CircuitBreakerKind::TotalComments.max_count() {
-        board()
-            .add_comment(&breaker_id, "user", &format!("Comment {i}"))
-            .await
-            .expect("add breaker comment");
+    let breaker_id = make_ticket(
+        board(),
+        &ws_breaker,
+        "Breaker Trip",
+        TicketPhase::InSanitation,
+    )
+    .await;
+    for _ in 0..4 {
+        add_breaker_failure(CircuitBreakerKind::Sanitation, &breaker_id).await;
     }
     let ticket = expect_ticket(board(), &breaker_id).await;
     assert!(
         try_trip_circuit_breaker(
             &ticket,
-            TicketPhase::InReview,
-            CircuitBreakerKind::TotalComments,
-            "TotalComments",
+            TicketPhase::InSanitation,
+            Some(CircuitBreakerKind::Sanitation),
+            "Sanitation",
         )
         .await,
         "breaker should trip"
@@ -815,25 +817,31 @@ async fn technical_failure_pauses_workspace_but_circuit_breaker_does_not() {
 
 // ── process_analyst_verdicts — analyst scoring and transitions ─────────
 
-/// Verify process_analyst_verdicts across all outcomes:
-/// - All analysts pass → Planning with "All LGTM" summary
-/// - Partial fail → Planning with "blockers" summary
-/// - No verdicts → Planning with "no analysis" summary
+/// Verify process_analyst_verdicts across all outcomes (fail-open):
+/// - All analysts pass → Planning with NO comment (fully passing analysis
+///   leaves no comment)
+/// - Partial fail → Planning with one joint comment (role "Analysis")
+/// - No verdicts → Planning with a joint comment carrying the failure dumps
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
 async fn process_analyst_verdicts_cases() {
     struct Case {
         name: &'static str,
         ws_suffix: &'static str,
         title: &'static str,
         results: Vec<ParallelVerdict>,
-        expected_comment_substring: &'static str,
+        /// Substring that must appear in the joint comment (None for the
+        /// all-pass round, which writes no comment).
+        expected_comment_substring: Option<&'static str>,
     }
 
     init_management_test_stores().await;
+    let (_lock, _policy_guard, _provider_guard) =
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
 
     let cases = vec![
         Case {
-            name: "all pass -> Planning with LGTM",
+            name: "all pass -> Planning with no comment",
             ws_suffix: "an_all_pass",
             title: "Analyst All Pass",
             results: vec![
@@ -841,10 +849,10 @@ async fn process_analyst_verdicts_cases() {
                 analyst_verdict(9, "Solid work.", &[]),
                 analyst_verdict(8, "Good analysis.", &[]),
             ],
-            expected_comment_substring: "All LGTM",
+            expected_comment_substring: None,
         },
         Case {
-            name: "partial fail -> Planning with blockers",
+            name: "partial fail -> Planning with joint comment",
             ws_suffix: "an_partial",
             title: "Analyst Partial Fail",
             results: vec![
@@ -852,14 +860,14 @@ async fn process_analyst_verdicts_cases() {
                 analyst_verdict(3, "Poor analysis.", &["Missing data"]),
                 analyst_verdict(8, "Decent.", &["Minor issue"]),
             ],
-            expected_comment_substring: "blockers",
+            expected_comment_substring: Some("flagged potential blockers"),
         },
         Case {
-            name: "no verdicts -> Planning with no analysis",
+            name: "no verdicts -> Planning with failure dumps",
             ws_suffix: "an_no_v",
             title: "Analyst No Verdicts",
             results: vec![no_verdict(); 3],
-            expected_comment_substring: "no analysis",
+            expected_comment_substring: Some("Agent failures"),
         },
     ];
 
@@ -880,7 +888,7 @@ async fn process_analyst_verdicts_cases() {
         assert_eq!(
             phase,
             TicketPhase::Planning,
-            "case {}: expected Planning, got {:?}",
+            "case {}: analysis is fail-open — expected Planning, got {:?}",
             case.name,
             phase,
         );
@@ -889,19 +897,85 @@ async fn process_analyst_verdicts_cases() {
             .get_comments(&ticket_id)
             .await
             .expect("get_comments");
-
-        let system = comments
+        let verdict_comments: Vec<&TicketComment> = comments
             .iter()
-            .find(|c| c.role == SYSTEM_ROLE)
-            .unwrap_or_else(|| panic!("case {}: system summary comment should exist", case.name));
-        assert!(
-            system.content.contains(case.expected_comment_substring),
-            "case {}: system comment should contain {:?}, got: {}",
-            case.name,
-            case.expected_comment_substring,
-            system.content,
-        );
+            .filter(|c| c.role == stage_name(Role::Analyst))
+            .collect();
+        match case.expected_comment_substring {
+            None => {
+                assert!(
+                    verdict_comments.is_empty(),
+                    "case {}: all-pass round must leave no analyst comment, got {}",
+                    case.name,
+                    verdict_comments.len(),
+                );
+            }
+            Some(substring) => {
+                assert_eq!(
+                    verdict_comments.len(),
+                    1,
+                    "case {}: exactly one joint comment expected, got {}",
+                    case.name,
+                    verdict_comments.len(),
+                );
+                assert!(
+                    verdict_comments[0].content.contains(substring),
+                    "case {}: joint comment should contain {:?}, got: {}",
+                    case.name,
+                    substring,
+                    verdict_comments[0].content,
+                );
+            }
+        }
     }
+}
+
+/// Fail-open integration: a round where the joint-comment synthesis is
+/// unavailable (provider scripted to fail) still advances the ticket with a
+/// deterministic fallback comment — never a fabricated one.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+async fn analyst_round_fails_open_with_fallback_comment() {
+    init_management_test_stores().await;
+    // Script every synthesis attempt as a transport failure → exhaustion →
+    // deterministic fallback.
+    let fake = crate::util::test::FakeProvider::new()
+        .err(crate::retry::FailureClass::Transport, "synthesis down")
+        .err(crate::retry::FailureClass::Transport, "synthesis down")
+        .err(crate::retry::FailureClass::Transport, "synthesis down");
+    let (_lock, _policy_guard, _provider_guard) = install_synthesis_test_seams(fake).await;
+
+    let ws = test_ws_named("/tmp/test", "an_fail_open");
+    let ticket_id = make_ticket(board(), &ws, "Fail Open", TicketPhase::Analysis).await;
+
+    let results = vec![
+        analyst_verdict(10, "Great.", &[]),
+        analyst_verdict(3, "Poor analysis.", &["Missing data"]),
+    ];
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    process_analyst_verdicts(&ticket, &results).await;
+
+    let phase = expect_ticket_phase(board(), &ticket_id).await;
+    assert_eq!(phase, TicketPhase::Planning, "fail-open must advance");
+
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get comments");
+    let joint = comments
+        .iter()
+        .find(|c| c.role == stage_name(Role::Analyst))
+        .expect("joint comment written");
+    assert!(
+        joint.content.contains("LLM grouping unavailable"),
+        "fallback marker must be explicit: {}",
+        joint.content,
+    );
+    assert!(
+        joint.content.contains("Missing data"),
+        "deterministic issues must render: {}",
+        joint.content,
+    );
 }
 
 // ── handle_qa_passed — QA → Done path ───────────────────────────────
@@ -1719,7 +1793,7 @@ fn should_skip_review_decision_matrix() {
     }
 }
 
-// ── Verdict raw-response comments ───────────────
+// ── Joint-comment raw dumps ────────────────────────────────────────────
 
 /// Build a [`crate::retry::RetryExhausted`] with the given last-attempt raw text.
 fn retry_exhausted_with_raw(last_raw: Option<String>) -> crate::retry::RetryExhausted {
@@ -1737,77 +1811,51 @@ fn retry_exhausted_with_raw(last_raw: Option<String>) -> crate::retry::RetryExha
     )
 }
 
+/// The joint comment's "Agent failures" appendix carries the raw last-attempt
+/// response for parse-failed agents and the collapsed reason for no-response
+/// agents — replacing the old per-agent failure comments.
 #[test]
-fn parse_failed_comment_carries_raw_last_attempt_response() {
+fn joint_comment_includes_failed_agent_dumps() {
     let raw = r#"{"score": 9, "critique": "solid", "issues": []}"#;
-    let pv = ParallelVerdict::ParseFailed(retry_exhausted_with_raw(Some(raw.to_string())));
-    let comment = format_verdict_comment(&pv, "analyst_1", VerdictFilter::All)
-        .expect("parse-failed must produce a comment");
-    assert!(comment.contains("verdict extraction failed"), "{comment}");
-    assert!(comment.contains("Raw agent response"), "{comment}");
+    let round = crate::joint_verdict::JointRound {
+        stage: "Review",
+        dispatched: 2,
+        verdicts: vec![],
+        failures: vec![
+            crate::joint_verdict::JointFailure {
+                agent_index: 0,
+                dump: crate::util::scrub_credentials(&raw_response_dump_section(
+                    &retry_exhausted_with_raw(Some(raw.to_string())),
+                )),
+            },
+            crate::joint_verdict::JointFailure {
+                agent_index: 1,
+                dump: "agent produced no response".to_string(),
+            },
+        ],
+        header: "0 of 0 valid verdicts failed.".to_string(),
+        threshold: 9,
+    };
+    let comment = crate::joint_verdict::render_joint_comment(
+        &round,
+        &crate::joint_verdict::SynthesisOutcome::Fallback,
+    );
+    assert!(
+        comment.contains("Raw agent response"),
+        "parse-failed dump marker must appear: {comment}"
+    );
     assert!(
         comment.contains(raw),
         "raw text must be in the comment: {comment}"
     );
-    // The template's role attribution is preserved.
-    assert!(comment.contains("analyst_1"), "{comment}");
-}
-
-#[test]
-fn parse_failed_comment_sandwich_truncates_large_raw() {
-    // 30_000-byte raw dump exceeds the 24_000-byte cap → sandwich marker.
-    let big = format!("HEAD{}", "x".repeat(30_000));
-    let pv = ParallelVerdict::ParseFailed(retry_exhausted_with_raw(Some(big)));
-    let comment =
-        format_verdict_comment(&pv, "reviewer_2", VerdictFilter::FailingOnly).expect("comment");
     assert!(
-        comment.contains("bytes omitted at verdict response truncation"),
-        "sandwich marker must appear: {}",
-        &comment[..comment.len().min(300)]
+        comment.contains("agent produced no response"),
+        "no-response reason must appear: {comment}"
     );
-    assert!(comment.contains("HEAD"), "head must be preserved");
+    assert!(comment.contains("### Agent failures"), "{comment}");
     assert!(
-        comment.contains(&"x".repeat(8_000)),
-        "tail must be preserved (shows where a mid-JSON cut landed)"
-    );
-    assert!(
-        comment.len() < 26_000,
-        "comment must be capped near the dump cap, got {}",
-        comment.len()
-    );
-}
-
-#[test]
-fn parse_failed_comment_tool_call_final_attempt_note() {
-    // Some(empty) — the final attempt was a tool call, no text.
-    let pv = ParallelVerdict::ParseFailed(retry_exhausted_with_raw(Some(String::new())));
-    let comment = format_verdict_comment(&pv, "qa_3", VerdictFilter::FailingOnly).expect("comment");
-    assert!(
-        comment
-            .to_lowercase()
-            .contains("final attempt was a tool call"),
-        "{comment}"
-    );
-}
-
-#[test]
-fn parse_failed_comment_transport_failure_carries_trail() {
-    // None — the final attempt died before producing text (transport).
-    let mut failure = retry_exhausted_with_raw(None);
-    failure.final_class = crate::retry::FailureClass::TruncatedEnvelope;
-    let pv = ParallelVerdict::ParseFailed(failure);
-    let comment = format_verdict_comment(&pv, "analyst_2", VerdictFilter::All).expect("comment");
-    assert!(comment.contains("truncated_envelope"), "{comment}");
-    assert!(comment.contains("1 attempt(s)"), "{comment}");
-}
-
-#[test]
-fn no_response_keeps_existing_template() {
-    let comment = format_verdict_comment(&no_verdict(), "analyst_1", VerdictFilter::All)
-        .expect("no-response must produce a comment");
-    assert!(
-        comment.contains("failed to produce a response"),
-        "{comment}"
+        comment.contains("Agent 2"),
+        "agent indices are 1-based: {comment}"
     );
 }
 

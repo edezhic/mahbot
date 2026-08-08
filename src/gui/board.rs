@@ -529,10 +529,23 @@ impl BoardState {
                                     .await;
                             }
                         }
-                        board
-                            .transition_to(&ticket_id, None, phase, None)
-                            .await
-                            .map_err(|e| e.to_string())?;
+                        // Manual "Redo Dev" (Reviewed → ReadyForDevelopment)
+                        // is a bounce-back from review into development — it
+                        // must consume the same breaker budget and +1 reviewer
+                        // adjustment as pipeline bounce-backs.
+                        if source == TicketPhase::Reviewed
+                            && phase == TicketPhase::ReadyForDevelopment
+                        {
+                            board
+                                .bounce_back_to_dev(&ticket_id)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        } else {
+                            board
+                                .transition_to(&ticket_id, None, phase, None)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        }
                         // Skip the hop when the ticket already reached the
                         // requested phase between render and click — the
                         // transition was a no-op and a self-transition entry
@@ -1560,6 +1573,8 @@ mod tests {
             reviewed_head: None,
             reviewed_tree: None,
             done_at: None,
+            bounce_count: 0,
+            review_base_count: None,
         });
         state
     }
@@ -1744,6 +1759,8 @@ mod tests {
             reviewed_head: None,
             reviewed_tree: None,
             done_at: None,
+            bounce_count: 0,
+            review_base_count: None,
         };
         let _task = state.update(BoardMessage::TicketDetails(Box::new(ticket)));
 
@@ -1794,6 +1811,8 @@ mod tests {
             reviewed_head: None,
             reviewed_tree: None,
             done_at: None,
+            bounce_count: 0,
+            review_base_count: None,
         });
 
         // First Escape: focused → blur (clear flag), modal stays open
@@ -1933,6 +1952,8 @@ mod tests {
             reviewed_head: None,
             reviewed_tree: None,
             done_at: None,
+            bounce_count: 0,
+            review_base_count: None,
         }];
         state.search_generation = 5;
 
@@ -1989,6 +2010,8 @@ mod tests {
                 reviewed_head: None,
                 reviewed_tree: None,
                 done_at: None,
+                bounce_count: 0,
+                review_base_count: None,
             }],
             50,
         ));
@@ -2029,6 +2052,8 @@ mod tests {
                 reviewed_head: None,
                 reviewed_tree: None,
                 done_at: None,
+                bounce_count: 0,
+                review_base_count: None,
             }],
             42,
         ));
@@ -2064,6 +2089,8 @@ mod tests {
             reviewed_head: None,
             reviewed_tree: None,
             done_at: None,
+            bounce_count: 0,
+            review_base_count: None,
         }];
         state.search_generation = 7;
 

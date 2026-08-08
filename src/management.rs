@@ -1,11 +1,11 @@
 //! Board poller — picks up tickets from the board and dispatches agents.
 //!
 //! Poll phases — dispatches agents based on ticket phase:
-//! - Backlog → spawn Analyst agents (`PARALLEL_AGENT_COUNT` parallel)
+//! - Backlog → spawn Analyst agents (3 parallel; escalates to 5 on unanimous blockers)
 //! - ReadyForDevelopment → spawn Engineer agent
 //! - InDiagnostics → dispatch diagnostics runner (shell commands)
-//! - DiagnosticsDone → spawn Reviewer agents (`PARALLEL_AGENT_COUNT` parallel)
-//! - Reviewed → spawn QA agents (`PARALLEL_AGENT_COUNT` parallel)
+//! - DiagnosticsDone → spawn Reviewer agents (calibrated dynamic count)
+//! - Reviewed → spawn QA agents (3 parallel)
 //! - QaPassed → check for untracked files; if found, claim to InSanitation and
 //!   dispatch Sanitation agent, otherwise commit and transition to Done
 //! - InSanitation → dispatch Sanitation agent (via `assigned_to` re-dispatch guard)
@@ -33,7 +33,8 @@ use crate::agent::run_agent;
 use crate::board::{BOARD, BoardStore, PipelineCheck, Ticket, TicketComment, TicketPhase};
 use crate::git_commands::{
     has_unstaged_changes, list_new_or_untracked_files, parse_new_files_from_porcelain,
-    run_git_add_all, run_git_head, run_git_status, run_git_write_tree,
+    parse_numstat_lines, run_git_add_all, run_git_command, run_git_head, run_git_status,
+    run_git_write_tree,
 };
 use crate::message_router;
 use crate::prompt::{load_prompt, substitute};
@@ -46,14 +47,15 @@ use crate::util::panic_message;
 
 use crate::{Agent, DiagnosticsCommands, Role, Workspace};
 
-/// Number of parallel agents spawned per verification phase (Analyst, Reviewer, QA).
-const PARALLEL_AGENT_COUNT: usize = 3;
+/// Default number of parallel analysts/QA agents per round. Reviewers use a
+/// calibrated dynamic count (see [`crate::joint_verdict::review_agent_count`]).
+pub(crate) const DEFAULT_PARALLEL_AGENT_COUNT: usize = 3;
 
 /// Prefix for all auto-diagnostics comments on tickets.
 const DIAGNOSTICS_COMMENT_PREFIX: &str = "🔍 Auto-diagnostics";
 
 /// Minimum acceptable verification score (0-10) for analyst verdicts.
-const ANALYST_PASS_THRESHOLD: u8 = 7;
+pub(crate) const ANALYST_PASS_THRESHOLD: u8 = 7;
 
 /// Minimum acceptable verification score (0-10) for review and QA phases.
 const REVIEW_QA_THRESHOLD: u8 = 9;
@@ -93,11 +95,8 @@ async fn clear_assigned_to_no_cancel(ticket_id: &str, context: &str) {
 
 /// Identifies which circuit breaker variant to use for phase-guard checks
 /// and trip logic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CircuitBreakerKind {
-    /// Total-comments breaker: trips when the total number of comments
-    /// exceeds 30.
-    TotalComments,
     /// Sanitation-failure breaker: trips when cumulative sanitation failures
     /// exceed 3.
     Sanitation,
@@ -112,7 +111,6 @@ impl CircuitBreakerKind {
     /// `Some` (the count exceeds this maximum).
     const fn max_count(self) -> usize {
         match self {
-            Self::TotalComments => 30,
             Self::Sanitation => 3,
             Self::Diagnostics => 4,
         }
@@ -120,14 +118,12 @@ impl CircuitBreakerKind {
 
     /// Determine whether this breaker variant should trip.
     ///
-    /// Counts failures matching this variant's criteria from the ticket comments.
-    /// If the count exceeds the variant's `max_count`, returns
-    /// `Some((count, max_count))`. Returns `None` if the breaker
-    /// should not trip (count ≤ max_count).
+    /// Counts failures matching this variant's criteria. If the count exceeds
+    /// the variant's `max_count`, returns `Some((count, max_count))`. Returns
+    /// `None` if the breaker should not trip (count ≤ max_count).
     fn should_trip(self, comments: &[TicketComment]) -> Option<(usize, usize)> {
         let max_count = self.max_count();
         let count = match self {
-            Self::TotalComments => comments.len(),
             Self::Sanitation => count_matching_comments(
                 comments,
                 SANITATION_ROLE,
@@ -150,11 +146,6 @@ impl CircuitBreakerKind {
     /// Format the trip message for this breaker variant.
     fn trip_message(self, count: usize, max_count: usize) -> String {
         match self {
-            Self::TotalComments => format!(
-                "Failed after {count} comments — ticket has accumulated too many comments \
-                 (circuit breaker, max: {max_count}). \
-                 Ticket failed — Manager will triage."
-            ),
             Self::Sanitation => format!(
                 "❌ Sanitation circuit breaker tripped after {count} cumulative failures. \
                  (max: {max_count})",
@@ -692,6 +683,9 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
         // Adding a new PollPhase variant requires adding a row in
         // PollPhase::info() which now also carries the circuit_breaker_kind
         // and log_label fields (enforced by the single match in info()).
+        // The bounce breaker is not pre-flight (it is enforced mid-round in
+        // process_verifier_verdicts) — phases without a pre-flight breaker
+        // pass `None` and try_trip_circuit_breaker returns false immediately.
         //
         // The post-agent phase_changed_and_clear_assignment check in each dispatch function is
         // a separate concern (race-condition guard) and is preserved there.
@@ -700,8 +694,9 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
         }
         if try_trip_circuit_breaker(&ticket, expected_phase, kind, log_label).await {
             // Circuit breaker tripped — unconditionally drain the development
-            // pipeline regardless of which breaker type fired (TotalComments,
-            // Sanitation, Diagnostics). This is a deliberate invariant:
+            // pipeline regardless of which breaker type fired (Sanitation,
+            // Diagnostics, or the mid-round bounce breaker). This is a
+            // deliberate invariant:
             //
             //   Any breaker trip signals a potentially dirty workspace. If the
             //   drain were narrowed to only some breaker types, the Engineer
@@ -834,7 +829,9 @@ struct PollPhaseInfo {
     /// [`Skip`](PipelineCheck::Skip) allows concurrent claims.
     pipeline_check: PipelineCheck,
     /// Which circuit breaker variant to use for phase-guard checks.
-    circuit_breaker_kind: CircuitBreakerKind,
+    /// `None` for phases without a pre-flight breaker — the bounce breaker
+    /// has no pre-flight arm (it is enforced mid-round).
+    circuit_breaker_kind: Option<CircuitBreakerKind>,
     /// Human-readable label used in logs and circuit-breaker messages.
     /// PascalCase for roles ("Engineer", "Analyst"), "QA" for the QA verifier.
     log_label: &'static str,
@@ -842,12 +839,12 @@ struct PollPhaseInfo {
 
 impl PollPhaseInfo {
     /// Create a new [`PollPhaseInfo`] with standard defaults:
-    /// [`PipelineCheck::Skip`] and [`CircuitBreakerKind::TotalComments`].
+    /// [`PipelineCheck::Skip`] and no pre-flight circuit breaker (`None`).
     const fn new(expected_phase: TicketPhase, log_label: &'static str) -> Self {
         Self {
             expected_phase,
             pipeline_check: PipelineCheck::Skip,
-            circuit_breaker_kind: CircuitBreakerKind::TotalComments,
+            circuit_breaker_kind: None,
             log_label,
         }
     }
@@ -881,11 +878,11 @@ impl PollPhase {
                 // SanitationCheck is excluded from CLAIM_PHASES since the
                 // actual QaPassed→InSanitation transition happens via
                 // claim_sanitation in handle_qa_passed.
-                circuit_breaker_kind: CircuitBreakerKind::Sanitation,
+                circuit_breaker_kind: Some(CircuitBreakerKind::Sanitation),
                 ..PollPhaseInfo::new(TicketPhase::InSanitation, "Sanitation")
             },
             Self::DiagnosticsCheck => PollPhaseInfo {
-                circuit_breaker_kind: CircuitBreakerKind::Diagnostics,
+                circuit_breaker_kind: Some(CircuitBreakerKind::Diagnostics),
                 ..PollPhaseInfo::new(TicketPhase::InDiagnostics, "Diagnostics")
             },
             Self::VerifierCheck(vi) => PollPhaseInfo::new(vi.active_phase, vi.log_label),
@@ -2151,20 +2148,18 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 // ── Parallel agent helpers (shared) ─────────────────────────────────────
 //
 // Why `process_analyst_verdicts` and `process_verifier_verdicts` are separate
-// Both follow the same skeleton (record comments -> classify -> transition)
-// but differ in four ways that make a single unified function awkward:
+// Both follow the same skeleton (joint comment -> classify -> transition)
+// but differ in three ways that make a single unified function awkward:
 //
 //   * Classification — analysts use 4 categories
 //     (lgtm/minor_issues/potential_blockers/missing_analysis) that feed
 //     `format_analyst_summary`; reviewers/QA use a binary pass/fail via
 //     `verdict_passes` against `REVIEW_QA_THRESHOLD`.
 //   * Transition policy — analysts always advance to `Planning` regardless
-//     of outcome (even failures proceed, just with a comment listing the
-//     counts). Reviewers/QA have a 3-way outcome: all-failed -> Failed,
-//     any-failed -> bounce back to development, all-pass -> success phase.
-//   * Comment recording — analysts record all verdicts
-//     (`VerdictFilter::All`); reviewers/QA record only failing verdicts
-//     (`VerdictFilter::FailingOnly`).
+//     of outcome (fail-open; the joint comment gives the Manager depth).
+//     Reviewers/QA have a 3-way outcome: all-failed -> Failed,
+//     any-failed -> bounce back to development (bounce counter bumped,
+//     6th bounce fails), all-pass -> success phase.
 //   * Signature — analysts need only `&Ticket` and `&[ParallelVerdict]`;
 //     reviewers/QA need the `VerifierInfo` struct to drive the 3-way
 //     transition (success phase, active phase, role label). This structural
@@ -2175,7 +2170,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 /// Three mutually-exclusive states — the type system guarantees
 /// that "no response" and "parse failure" cannot be confused.
 #[derive(Clone)]
-enum ParallelVerdict {
+pub(crate) enum ParallelVerdict {
     /// Agent failed to produce any response (crashed, timed out, empty output).
     /// Carries the collapsed failure reason (scrubbed) so the cause survives
     /// through to the ticket failure record and the log.
@@ -2200,7 +2195,114 @@ fn validate_verdict_score(v: &crate::Verdict) -> Result<(), String> {
     }
 }
 
-/// Run [`PARALLEL_AGENT_COUNT`] agents of the same role in parallel, then extract structured verdicts
+/// Human-readable stage name for a parallel-verdict role (used in the joint
+/// comment title and the comment role).
+#[must_use]
+fn stage_name(role: Role) -> &'static str {
+    match role {
+        Role::Analyst => "Analysis",
+        Role::Reviewer => "Review",
+        Role::Qa => "QA",
+        // Only the three parallel-verdict roles reach this function (all call
+        // sites pass Analyst/Reviewer/Qa).
+        _ => unreachable!("stage_name called with a non-verdict role"),
+    }
+}
+
+/// Inverse of [`stage_name`]: resolve a stage-name comment role back to the
+/// verdict role (used by the GUI to color joint-comment badges).
+#[must_use]
+pub(crate) fn stage_role(name: &str) -> Option<Role> {
+    match name {
+        "Analysis" => Some(Role::Analyst),
+        "Review" => Some(Role::Reviewer),
+        "QA" => Some(Role::Qa),
+        _ => None,
+    }
+}
+
+/// Build the joint comment for a round: deterministic merge + single LLM
+/// synthesis pass (stage role's own model) + rendering. Runs entirely before
+/// any board transaction — the synthesis must never hold the board write lock.
+async fn build_joint_comment(
+    stage: &str,
+    results: &[ParallelVerdict],
+    threshold: u8,
+    role: Role,
+    header: &str,
+) -> String {
+    let mut verdicts: Vec<crate::joint_verdict::JointVerdict<'_>> = Vec::new();
+    let mut failures: Vec<crate::joint_verdict::JointFailure> = Vec::new();
+    for (i, r) in results.iter().enumerate() {
+        match r {
+            ParallelVerdict::Verdict(v) => verdicts.push(crate::joint_verdict::JointVerdict {
+                agent_index: i,
+                verdict: v,
+            }),
+            ParallelVerdict::NoResponse(reason) => {
+                failures.push(crate::joint_verdict::JointFailure {
+                    agent_index: i,
+                    dump: reason.clone(),
+                });
+            }
+            ParallelVerdict::ParseFailed(f) => failures.push(crate::joint_verdict::JointFailure {
+                agent_index: i,
+                dump: crate::util::scrub_credentials(&raw_response_dump_section(f)),
+            }),
+        }
+    }
+    let round = crate::joint_verdict::JointRound {
+        stage,
+        dispatched: results.len(),
+        verdicts,
+        failures,
+        header: header.to_string(),
+        threshold,
+    };
+    if round
+        .verdicts
+        .iter()
+        .all(|v| v.verdict.issues_detected.is_empty())
+    {
+        // No issues to merge: either all agents failed (no response / parse
+        // failure) or every valid verdict passed clean while others failed.
+        // A synthesis pass over zero issues would waste a provider call and
+        // could produce a misleading "no issues" summary on a round that
+        // actually bounced. Render the deterministic fallback (raw dumps +
+        // explicit marker) instead.
+        crate::joint_verdict::render_joint_comment(
+            &round,
+            &crate::joint_verdict::SynthesisOutcome::Fallback,
+        )
+    } else {
+        crate::joint_verdict::build_joint_comment(&round, role).await
+    }
+}
+
+/// Persist per-agent verdict scores (shadow instrumentation for re-measuring
+/// inter-agent agreement per stage). Best-effort: failures are logged, never
+/// propagated — the verdict pipeline must not block on instrumentation. Rows
+/// live in the logs store (the project's stats store), not the board store.
+async fn persist_verdict_scores(ticket: &Ticket, stage: &str, results: &[ParallelVerdict]) {
+    let Some(store) = crate::logs::LOG_STORE.get() else {
+        return;
+    };
+    for (i, r) in results.iter().enumerate() {
+        if let ParallelVerdict::Verdict(v) = r
+            && let Err(e) = store
+                .record_verdict_score(&ticket.id, stage, i, v.score, &v.issues_detected)
+                .await
+        {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to persist verdict score (instrumentation)",
+            );
+        }
+    }
+}
+
+/// Run `count` agents of the same role in parallel, then extract structured verdicts
 /// from their responses.
 ///
 /// Agent IDs are formatted as `ticket_{ticket.id}_{i}_{suffix}_{role}`
@@ -2217,9 +2319,9 @@ async fn run_parallel_agents(
     role: Role,
     prompt: &str,
     extraction_prompt: &str,
+    count: usize,
 ) -> Vec<ParallelVerdict> {
     let suffix = crate::generate_suffix();
-    let count = PARALLEL_AGENT_COUNT;
 
     // ── Register all agents in the message router BEFORE spawning ──────
     // This allows the board's comment-routing to deliver mid-work comments
@@ -2333,37 +2435,11 @@ async fn run_parallel_agents(
 }
 
 /// Check whether a review or QA verdict passes (score at or above
-/// [`REVIEW_QA_THRESHOLD`]). Returns `false` when the verdict is missing
-/// or the score is below threshold.
+/// [`REVIEW_QA_THRESHOLD`]).
 #[must_use]
-fn verdict_passes(verdict: Option<&crate::Verdict>) -> bool {
-    verdict.is_some_and(|v| v.score >= REVIEW_QA_THRESHOLD)
+fn verdict_passes(verdict: &crate::Verdict) -> bool {
+    verdict.score >= REVIEW_QA_THRESHOLD
 }
-
-/// Format a Verdict's critique and issues into a comment body string
-/// using bullet-list style: critique followed by "Issues:\n- item1\n- item2".
-fn format_verdict_body(verdict: &crate::Verdict) -> String {
-    let mut text = verdict.critique.clone().unwrap_or_default();
-    if !verdict.issues_detected.is_empty() {
-        if !text.is_empty() {
-            text.push_str("\n\n");
-        }
-        text.push_str("Issues:\n");
-        for issue in &verdict.issues_detected {
-            let _ = writeln!(text, "- {issue}");
-        }
-    }
-    text
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VerdictFilter {
-    /// Record ALL verdicts — passing and failing alike (used by analysts).
-    All,
-    /// Record only FAILING verdicts — passing verdicts are silently skipped (used by reviewers/QA).
-    FailingOnly,
-}
-
 /// Build the raw-response dump section for a verdict-extraction failure
 /// comment.
 ///
@@ -2395,96 +2471,15 @@ fn raw_response_dump_section(failure: &crate::retry::RetryExhausted) -> String {
     }
 }
 
-/// Determine whether a parallel verifier result warrants a comment,
-/// and format the comment string if so.
-///
-/// Behaviour depends on `filter`:
-/// - [`VerdictFilter::FailingOnly`]: returns `None` for passing verdicts
-///   (score ≥ [`REVIEW_QA_THRESHOLD`]). For failing verdicts with an empty body,
-///   a fallback message with the score is returned so engineers still get feedback.
-/// - [`VerdictFilter::All`]: returns a comment for ALL verdicts (passing and failing).
-///   For verdicts with an empty body, the same score fallback message is returned.
-///
-/// `comment_role` is used in the empty-response, extraction-failure, and
-/// empty-body fallback branches for human-readable role attribution.
-fn format_verdict_comment(
-    r: &ParallelVerdict,
-    comment_role: &str,
-    filter: VerdictFilter,
-) -> Option<String> {
-    match r {
-        ParallelVerdict::Verdict(v) => {
-            // Analysts want ALL verdicts recorded; verifiers only want failing ones.
-            if filter == VerdictFilter::FailingOnly && verdict_passes(Some(v)) {
-                return None; // passing verdict, verifier path only
-            }
-            let comment = format_verdict_body(v);
-            if comment.is_empty() {
-                let score_str = v.score.to_string();
-                return Some(substitute(
-                    &load_prompt("verdict_empty.md"),
-                    &[
-                        ("{{comment_role}}", comment_role),
-                        ("{{score}}", &score_str),
-                    ],
-                ));
-            }
-            Some(comment)
-        }
-        ParallelVerdict::ParseFailed(failure) => {
-            // The ticket comment carries the raw last-attempt
-            // response (diagnosability only — gates stay fail-closed).
-            let base = substitute(
-                &load_prompt("verdict_parse_failed.md"),
-                &[("{{comment_role}}", comment_role)],
-            );
-            let dump = crate::util::scrub_credentials(&raw_response_dump_section(failure));
-            Some(format!("{base}\n\n{dump}"))
-        }
-        ParallelVerdict::NoResponse(reason) => {
-            let base = substitute(
-                &load_prompt("verdict_no_response.md"),
-                &[("{{comment_role}}", comment_role)],
-            );
-            // Preserve the collapsed failure reason (scrubbed + capped) so the
-            // ticket record says WHY the agent produced no response.
-            let reason = crate::util::truncate_sandwich(
-                &crate::util::scrub_credentials(reason),
-                crate::util::FAILURE_DETAIL_CAP,
-                "agent failure",
-            );
-            Some(format!("{base}\n\n{reason}"))
-        }
-    }
-}
-
-/// Record per-agent verdict comments on a ticket (inside an existing transaction).
-///
-/// Analysts record ALL verdicts (passing + failing) so that every
-/// verdict is visible in the ticket discussion — this differs from
-/// verifiers (reviewers / QA), which only record failing comments.
-async fn record_verdict_comments_tx(
-    tx: &TxGuard<'_>,
-    ticket_id: &str,
-    results: &[ParallelVerdict],
-    role_str: &str,
-    filter: VerdictFilter,
-) -> anyhow::Result<()> {
-    for (i, r) in results.iter().enumerate() {
-        let role_label = format!("{role_str}_{}", i + 1);
-        if let Some(comment) = format_verdict_comment(r, &role_label, filter) {
-            BoardStore::add_comment_tx(tx, ticket_id, &role_label, &comment).await?;
-        }
-    }
-    Ok(())
-}
-
 // ── Backlog Analysis ──────────────────────────────────────────────────
 
-/// Spawn 3 parallel analyst agents to research a backlog ticket.
-/// All verdicts are recorded as comments, then the ticket transitions to:
+/// Spawn 3 parallel analyst agents (base) to research a backlog ticket,
+/// escalating to 5 when every dispatched analyst flags blockers. One joint
+/// comment (role = stage name "Analysis") replaces the per-agent comments and
+/// the system summary; the ticket then transitions to Planning:
 /// - Planning (notify) when ALL analysts pass (≥ `ANALYST_PASS_THRESHOLD`/10)
-/// - Planning (notify) when any analyst fails, with a comment listing the counts
+/// - Planning (notify) when any analyst fails, with the joint comment giving
+///   the Manager the depth (analysis is fail-open)
 ///
 /// The circuit-breaker guard is handled centrally by [`spawn_dispatch`].
 ///
@@ -2515,8 +2510,34 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
     };
     let message = load_prompt(prompt_key);
     let extraction_prompt = load_prompt("extraction/analyst.md");
-    let results =
-        run_parallel_agents(&ticket, &ws, Role::Analyst, &message, &extraction_prompt).await;
+    let mut results = run_parallel_agents(
+        &ticket,
+        &ws,
+        Role::Analyst,
+        &message,
+        &extraction_prompt,
+        DEFAULT_PARALLEL_AGENT_COUNT,
+    )
+    .await;
+
+    // Unanimous-blocker escalation: when every dispatched analyst flagged a
+    // blocker, add 2 more analysts (same model) for depth before the Manager
+    // decision. Analysis stays fail-open — the ticket always advances.
+    if crate::joint_verdict::analysis_escalation_needed(&results, DEFAULT_PARALLEL_AGENT_COUNT) {
+        // Re-check the phase before spending the second batch — the ticket
+        // may have been moved externally while the first batch ran.
+        if !is_ticket_in_phase(&ticket.id, TicketPhase::Analysis).await {
+            return;
+        }
+        info!(
+            ticket = %ticket.id,
+            "All analysts flagged blockers — escalating with 2 additional analysts",
+        );
+        let extra =
+            run_parallel_agents(&ticket, &ws, Role::Analyst, &message, &extraction_prompt, 2).await;
+        results.extend(extra);
+    }
+
     if !is_ticket_in_phase(&ticket.id, TicketPhase::Analysis).await {
         return;
     }
@@ -2526,10 +2547,11 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 
 /// Evaluate analyst verdicts and transition the ticket:
 ///
-/// Records per-analyst comments (if verdict exists), counts responses and
-/// extractions via post-loop iterators, then transitions:
-/// - to Planning (notify) if ALL analysts passed (≥ `ANALYST_PASS_THRESHOLD`/10)
-/// - to Planning (notify) if any analyst failed, with a comment listing the counts
+/// One joint comment (role = "Analysis", the stage name) replaces the
+/// per-agent comments and the system summary. No comment is written on
+/// all-pass rounds. Analysis is fail-open: the ticket always advances to
+/// Planning and the Manager decides; the joint comment gives the Manager the
+/// depth.
 ///
 /// See the "Parallel agent helpers (shared)" section for why this is separate
 /// from [`process_verifier_verdicts`].
@@ -2538,7 +2560,7 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
         .iter()
         .filter(|r| !matches!(r, ParallelVerdict::NoResponse(_)))
         .count();
-    let total = results.len();
+    let dispatched = results.len();
     let mut lgtm = 0usize;
     let mut minor_issues = 0usize;
     let mut potential_blockers = 0usize;
@@ -2560,19 +2582,41 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
     }
 
     let summary = format_analyst_summary(
-        total,
+        dispatched,
         lgtm,
         minor_issues,
         potential_blockers,
         missing_analysis,
     );
-    let extracted_count = total - missing_analysis;
+    let extracted_count = dispatched - missing_analysis;
     let passing_count = lgtm + minor_issues;
 
-    // Compare against PARALLEL_AGENT_COUNT (not extracted_count) intentionally:
-    // a missing/empty verdict is treated as non-passing — all dispatched
+    // Gate against the actually-dispatched count (N_gate), never a hard-coded
+    // 3: a missing/empty verdict is treated as non-passing — all dispatched
     // analysts must produce passing verdicts for the ticket to proceed.
-    let all_passed = passing_count == PARALLEL_AGENT_COUNT;
+    let all_passed = passing_count == dispatched;
+
+    // Persist per-agent verdict scores (shadow instrumentation, best-effort —
+    // never blocks the pipeline). Stage label uses the same spelling as the
+    // joint-comment role (stage_name) so both stores agree.
+    persist_verdict_scores(ticket, stage_name(Role::Analyst), results).await;
+
+    // Synthesis runs BEFORE the transition and never holds the board write
+    // lock (the comment+transition transaction serializes all board writes).
+    let joint_comment = if all_passed {
+        None
+    } else {
+        Some(
+            build_joint_comment(
+                stage_name(Role::Analyst),
+                results,
+                ANALYST_PASS_THRESHOLD,
+                Role::Analyst,
+                &summary,
+            )
+            .await,
+        )
+    };
 
     if !with_comment_and_transition(
         TransitionCtx {
@@ -2584,16 +2628,10 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
             breaker_trip: false,
         },
         async |tx| {
-            record_verdict_comments_tx(
-                tx,
-                &ticket.id,
-                results,
-                Role::Analyst.as_str(),
-                VerdictFilter::All,
-            )
-            .await?;
-
-            BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, &summary).await?;
+            if let Some(comment) = &joint_comment {
+                BoardStore::add_comment_tx(tx, &ticket.id, stage_name(Role::Analyst), comment)
+                    .await?;
+            }
             Ok(())
         },
     )
@@ -2614,7 +2652,7 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
             nonempty_count,
             extracted_count,
             passing_count,
-            "Backlog analysis incomplete — moved to planning ({nonempty_count}/{PARALLEL_AGENT_COUNT} responded, \
+            "Backlog analysis incomplete — moved to planning ({nonempty_count}/{dispatched} responded, \
              {extracted_count} extracted, {passing_count} passed)",
         );
     }
@@ -2668,7 +2706,7 @@ fn format_analyst_summary(
 /// # Critical invariant: all breaker types trigger the drain
 ///
 /// This function is called unconditionally after **any** circuit breaker trip
-/// (TotalComments, Sanitation, or Diagnostics). This is intentional and
+/// (Sanitation, Diagnostics, or the mid-round bounce breaker). This is intentional and
 /// conservative: any breaker trip signals that the workspace may be in a dirty
 /// or contaminated state. If the drain were narrowed to only some breaker
 /// types, an unrelated `ReadyForDevelopment` ticket could auto-start while the
@@ -2730,9 +2768,14 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 /// [`CircuitBreakerKind::trip_message`], add a system comment, then
 /// transition to [`TicketPhase::Failed`].
 ///
-/// All three concrete breakers (TotalComments, Sanitation, Diagnostics) delegate to this
-/// helper, supplying their variant logic via the [`CircuitBreakerKind`] enum. This
-/// eliminates ~80% structural duplication while preserving exact behavioral semantics.
+/// The two comment-based breakers (Sanitation, Diagnostics) delegate to this
+/// helper, supplying their variant logic via the [`CircuitBreakerKind`] enum.
+/// This eliminates ~80% structural duplication while preserving exact
+/// behavioral semantics. Phases without a pre-flight breaker pass `None` and
+/// this returns `false` immediately — the bounce breaker is not pre-flight:
+/// it is enforced mid-round in [`process_verifier_verdicts`], which fails the
+/// ticket atomically with the bounce-back when the counter is at
+/// [`MAX_BOUNCES`](crate::joint_verdict::MAX_BOUNCES).
 ///
 /// The Manager is notified when the ticket transitions to [`TicketPhase::Failed`].
 ///
@@ -2740,9 +2783,6 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 ///
 /// Each breaker variant naturally excludes its own trip comment from counting:
 ///
-/// * **TotalComments breaker** — counts all comments via `comments.len()`; it prevents
-///   re-dispatch by transitioning to the terminal `Failed` phase before the
-///   breaker could re-read the same trip comment.
 /// * **Sanitation breaker** — filters comments by role `"sanitation_admin"` and content
 ///   containing the value of the `sanitation_failed.md` prompt;
 ///   trip comments always use role `SYSTEM_ROLE` (set by this function), so they
@@ -2764,9 +2804,12 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 async fn try_trip_circuit_breaker(
     ticket: &Ticket,
     source_phase: TicketPhase,
-    kind: CircuitBreakerKind,
+    kind: Option<CircuitBreakerKind>,
     log_label: &str,
 ) -> bool {
+    let Some(kind) = kind else {
+        return false;
+    };
     let comments = if ticket.comments.is_empty() {
         // Comments are only pre-loaded for claim-pipeline tickets
         // (LoadComments::Yes via claim_ticket_in_workspace). Tickets listed by
@@ -2887,6 +2930,7 @@ fn verifier_failure_reasons(results: &[ParallelVerdict]) -> String {
 ///
 /// See the "Parallel agent helpers (shared)" section for why this is separate
 /// from [`process_analyst_verdicts`].
+#[allow(clippy::too_many_lines)]
 async fn process_verifier_verdicts(
     ticket: &Ticket,
     results: &[ParallelVerdict],
@@ -2895,19 +2939,38 @@ async fn process_verifier_verdicts(
     let all_failed = results
         .iter()
         .all(|r| !matches!(r, ParallelVerdict::Verdict(_)));
+    // Gate against the actually-dispatched count (N_gate): a no-response or
+    // parse failure counts as a failed agent, so a partial round bounces.
     let any_failed = results.iter().any(|r| match r {
-        ParallelVerdict::Verdict(v) => !verdict_passes(Some(v)),
+        ParallelVerdict::Verdict(v) => !verdict_passes(v),
         _ => true,
     });
 
+    // Persist per-agent verdict scores (shadow instrumentation, best-effort).
+    persist_verdict_scores(ticket, stage_name(verifier.role), results).await;
+
+    // Bounce-based circuit breaker: the 6th bounce fails the ticket. The
+    // counter is incremented atomically with the bounce-back transition.
+    let mut bounce_trip = false;
     // Determine transition parameters based on the three-way branch:
     //   all-failed → Failed (notify, with failure comment)
-    //   any-failed → ReadyForDevelopment (buffer, pipeline reservation)
+    //   any-failed → ReadyForDevelopment (buffer, pipeline reservation),
+    //                unless the bounce breaker trips → Failed
     //   all-passed → verifier.success_phase (buffer)
     let (target, notify) = if all_failed {
         (TicketPhase::Failed, NotifyPolicy::Notify)
     } else if any_failed {
-        (TicketPhase::ReadyForDevelopment, NotifyPolicy::Buffer)
+        // The ticket's counter is authoritative here: it was loaded at claim
+        // time and only the bounce-back transition (which happens AFTER this
+        // check) increments it, so no re-fetch can differ from it.
+        if usize::try_from(ticket.bounce_count).unwrap_or(usize::MAX)
+            >= crate::joint_verdict::MAX_BOUNCES
+        {
+            bounce_trip = true;
+            (TicketPhase::Failed, NotifyPolicy::Notify)
+        } else {
+            (TicketPhase::ReadyForDevelopment, NotifyPolicy::Buffer)
+        }
     } else {
         (verifier.success_phase, NotifyPolicy::Buffer)
     };
@@ -2915,7 +2978,8 @@ async fn process_verifier_verdicts(
     // Preserve the per-agent failure reasons (previously collapsed into a
     // generic "no response") and auto-pause the workspace BEFORE the Failed
     // transition so the failure notification reflects the paused workspace.
-    // Shutdown is excluded inside the pause helper.
+    // Shutdown is excluded inside the pause helper. The bounce breaker is
+    // excluded from pausing, like all other circuit-breaker trips.
     let (failure_comment, reasons) = if all_failed {
         let pause_note =
             pause_workspace_on_failure(ticket, "all verifier agents failed to produce verdicts")
@@ -2936,6 +3000,45 @@ async fn process_verifier_verdicts(
         (String::new(), String::new())
     };
 
+    // One joint comment replaces the per-agent failing comments. Synthesis
+    // runs BEFORE the transition (never holding the board write lock); the
+    // comment+transition transaction stays short.
+    let joint_comment = if all_failed || !any_failed {
+        None
+    } else {
+        let header = format!(
+            "{} of {} valid verdicts failed (threshold {REVIEW_QA_THRESHOLD}/10).",
+            results
+                .iter()
+                .filter(|r| matches!(r, ParallelVerdict::Verdict(v) if !verdict_passes(v)))
+                .count(),
+            results
+                .iter()
+                .filter(|r| matches!(r, ParallelVerdict::Verdict(_)))
+                .count(),
+        );
+        Some(
+            build_joint_comment(
+                stage_name(verifier.role),
+                results,
+                REVIEW_QA_THRESHOLD,
+                verifier.role,
+                &header,
+            )
+            .await,
+        )
+    };
+
+    let bounce_breaker_comment = bounce_trip.then(|| {
+        let max = crate::joint_verdict::MAX_BOUNCES;
+        // The ticket bounced `max` times and this failed round is the 6th —
+        // the message counts actual bounces, not rounds.
+        format!(
+            "Failed after {max} bounces — ticket bounced back from review/QA too many \
+             times (circuit breaker, max: {max}). Ticket failed — Manager will triage."
+        )
+    });
+
     if !with_comment_and_transition(
         TransitionCtx {
             ticket,
@@ -2943,33 +3046,35 @@ async fn process_verifier_verdicts(
             target,
             notify,
             log_label: verifier.log_label,
-            breaker_trip: false,
+            breaker_trip: bounce_trip,
         },
         async |tx| {
-            // All-failed rounds skip the per-agent comments — the failure
-            // comment below already aggregates every agent's reason, so
-            // writing both would double-report the same failures.
-            if !all_failed {
-                record_verdict_comments_tx(
-                    tx,
-                    &ticket.id,
-                    results,
-                    verifier.role.as_str(),
-                    VerdictFilter::FailingOnly,
-                )
-                .await?;
+            if let Some(comment) = &joint_comment {
+                BoardStore::add_comment_tx(tx, &ticket.id, stage_name(verifier.role), comment)
+                    .await?;
             }
-
+            if let Some(comment) = &bounce_breaker_comment {
+                BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, comment).await?;
+            }
             if all_failed {
                 BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, &failure_comment).await?;
             }
-
+            if target == TicketPhase::ReadyForDevelopment {
+                BoardStore::increment_bounce_count_tx(tx, &ticket.id).await?;
+            }
             Ok(())
         },
     )
     .await
     {
         return false;
+    }
+
+    // A bounce-breaker trip fails the ticket with a dirty workspace — drain
+    // ReadyForDevelopment siblings so the Engineer cannot pick up unrelated
+    // work on top of the failed tree (mirrors the pre-flight breaker drain).
+    if bounce_trip {
+        drain_ready_for_development_siblings(ticket).await;
     }
 
     if all_failed {
@@ -2982,6 +3087,12 @@ async fn process_verifier_verdicts(
             ),
             "{log_label}: all verifier agents failed to produce verdicts — ticket moved to Failed",
             log_label = verifier.log_label,
+        );
+    } else if bounce_trip {
+        info!(
+            ticket = %ticket.id,
+            "Bounce circuit breaker tripped ({MAX_BOUNCES} bounces) — ticket failed",
+            MAX_BOUNCES = crate::joint_verdict::MAX_BOUNCES,
         );
     } else if any_failed {
         info!(
@@ -3050,15 +3161,114 @@ async fn compute_review_skip(ticket: &Ticket, repo_path: &Path) -> anyhow::Resul
     ))
 }
 
+/// Gather the working-tree churn signals at review dispatch: total churn,
+/// max per-file churn, and added-file count (staged new files + untracked).
+/// The diff is computed against HEAD — no commit for this ticket exists yet
+/// (DB line stats are populated only at final done).
+async fn working_tree_churn(repo_path: &Path) -> anyhow::Result<(i64, i64, usize)> {
+    let numstat = run_git_command(repo_path, &["diff", "HEAD", "--numstat"]).await?;
+    let entries = parse_numstat_lines(&numstat);
+    let mut total: i64 = 0;
+    let mut max_per_file: i64 = 0;
+    for e in &entries {
+        let file_churn = e.additions.unwrap_or(0) + e.deletions.unwrap_or(0);
+        total += file_churn;
+        max_per_file = max_per_file.max(file_churn);
+    }
+    let added_staged = run_git_command(
+        repo_path,
+        &["diff", "HEAD", "--diff-filter=A", "--name-only"],
+    )
+    .await?
+    .lines()
+    .filter(|l| !l.trim().is_empty())
+    .count();
+    let porcelain = run_git_status(repo_path).await?;
+    let untracked = porcelain.lines().filter(|l| l.starts_with("??")).count();
+    Ok((total, max_per_file, added_staged + untracked))
+}
+
+/// Compute the reviewer count for a review round.
+///
+/// The base is computed from the ORIGINAL first-dispatch signals and frozen
+/// on the ticket (`review_base_count`); later rounds reuse it so rework-grown
+/// diffs cannot escalate reviewer counts. Bounced tickets get a flat +1
+/// (capped at 4). QA never passes through here (fixed 3).
+///
+/// Shadow instrumentation: the counterfactual signals are logged at info
+/// level so the formula can be validated against a cohort after launch.
+///
+/// Returns `(count, base_to_freeze)`: the count for this round and the base to
+/// persist on the ticket — `None` when the ticket already carries a frozen
+/// base. The caller freezes AFTER the round actually dispatched (phase
+/// re-check passed) so a false-start dispatch never freezes a base computed
+/// from a diff that was never reviewed.
+#[allow(clippy::too_many_lines)]
+async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> (usize, Option<i64>) {
+    let low: u64 = crate::config::CONFIG
+        .review_count_low_churn()
+        .parse()
+        .unwrap_or(crate::joint_verdict::DEFAULT_REVIEW_COUNT_LOW_CHURN);
+    let high: u64 = crate::config::CONFIG
+        .review_count_high_churn()
+        .parse()
+        .unwrap_or(crate::joint_verdict::DEFAULT_REVIEW_COUNT_HIGH_CHURN);
+    let low = i64::try_from(low).unwrap_or(i64::MAX);
+    let high = i64::try_from(high).unwrap_or(i64::MAX);
+
+    let (base, to_freeze) = if let Some(frozen) = ticket.review_base_count {
+        (usize::try_from(frozen).unwrap_or(3), None)
+    } else {
+        let (base, signals) = match working_tree_churn(repo_path).await {
+            Ok((total, max_per_file, added_files)) => (
+                crate::joint_verdict::review_base_from_signals(
+                    total,
+                    max_per_file,
+                    added_files,
+                    low,
+                    high,
+                ),
+                Some((total, max_per_file, added_files)),
+            ),
+            Err(e) => {
+                warn!(
+                    ticket = %ticket.id,
+                    error = %e,
+                    "Could not compute working-tree churn — reviewer base defaults to 3",
+                );
+                (3, None)
+            }
+        };
+        if let Some((total, max_per_file, added_files)) = signals {
+            info!(
+                ticket = %ticket.id,
+                total_churn = total,
+                max_per_file_churn = max_per_file,
+                added_files,
+                reviewer_base = base,
+                fit_date = %crate::config::CONFIG.review_count_coeff_fit_date().unwrap_or_default(),
+                "Reviewer count calibration (shadow): base {base} from churn signals",
+            );
+        }
+        (base, Some(i64::try_from(base).unwrap_or(3)))
+    };
+
+    let count =
+        crate::joint_verdict::review_agent_count(base, ticket.priority, ticket.bounce_count > 0);
+    (count, to_freeze)
+}
+
 /// Shared dispatch logic for parallel verifiers (reviewers and QA).
 /// Fetches the engineer's last comment, builds a prompt from the template,
-/// runs [`PARALLEL_AGENT_COUNT`] parallel verifiers of the given role, and processes the verdicts.
+/// runs parallel verifiers of the given role (reviewers use the calibrated
+/// dynamic count; QA is fixed at 3), and processes the verdicts.
 ///
 /// ## Note: no `clear_assigned_to_no_cancel` on post-run phase check
 ///
 /// See [`dispatch_backlog_analysts`] for the full rationale — the same
 /// structural reasons apply here (parallel agents via [`run_parallel_agents`],
 /// `assigned_to` set to `NULL` during the [`claim_ticket_in_workspace`] claim).
+#[allow(clippy::too_many_lines)]
 async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo) {
     // ── Skip-review check for Reviewers ──────────────────────────────
     // Skip ONLY when the current content is identical to the reviewed base
@@ -3121,9 +3331,36 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
     );
 
     let extraction_prompt = crate::prompt::load_prompt(vi.extraction_prompt_path);
-    let results = run_parallel_agents(&ticket, &ws, vi.role, &prompt, &extraction_prompt).await;
+    let (count, base_to_freeze) = if is_reviewer {
+        compute_reviewer_count(&ticket, repo_path).await
+    } else {
+        // QA calibration is infeasible from history — fixed at 3.
+        (DEFAULT_PARALLEL_AGENT_COUNT, None)
+    };
+    info!(
+        ticket = %ticket.id,
+        role = %vi.role.as_str(),
+        count,
+        "Dispatching {count} parallel verifier(s)",
+    );
+    let results =
+        run_parallel_agents(&ticket, &ws, vi.role, &prompt, &extraction_prompt, count).await;
     if !is_ticket_in_phase(&ticket.id, vi.active_phase).await {
         return;
+    }
+
+    // Freeze the reviewer base only after the round actually dispatched (the
+    // phase re-check above passed) — a false-start dispatch (phase moved
+    // externally in the window) must not persist a base computed from a diff
+    // that was never reviewed. Later rounds reuse the frozen base.
+    if let Some(base) = base_to_freeze
+        && let Err(e) = board().set_review_base_count(&ticket.id, base).await
+    {
+        warn!(
+            ticket = %ticket.id,
+            error = %e,
+            "Failed to freeze reviewer base count — later rounds may re-derive it",
+        );
     }
 
     let transitioned = process_verifier_verdicts(&ticket, &results, vi).await;

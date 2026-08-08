@@ -965,6 +965,8 @@ impl SettingsState {
             self.integrations_section(),
             Space::new().height(16),
             self.retry_section(),
+            Space::new().height(16),
+            self.calibration_section(),
         ];
 
         let mut content = column![
@@ -2233,6 +2235,77 @@ impl SettingsState {
                         .as_deref()
                         .unwrap_or_default(),
                     "operation_timeout_secs",
+                ),
+                Space::new().height(4),
+                text("Joint-verdict synthesis (LLM grouping pass)")
+                    .size(11)
+                    .color(theme::TEXT_SECONDARY),
+                Space::new().height(4),
+                config_text_input(
+                    "Synthesis Max Attempts",
+                    crate::retry::DEFAULT_SYNTHESIS_MAX_ATTEMPTS_STR,
+                    self.config
+                        .synthesis_max_attempts
+                        .as_deref()
+                        .unwrap_or_default(),
+                    "synthesis_max_attempts",
+                ),
+                config_text_input(
+                    "Synthesis Base Backoff (ms)",
+                    crate::retry::DEFAULT_SYNTHESIS_BASE_BACKOFF_MS_STR,
+                    self.config
+                        .synthesis_base_backoff_ms
+                        .as_deref()
+                        .unwrap_or_default(),
+                    "synthesis_base_backoff_ms",
+                ),
+                config_text_input(
+                    "Synthesis Max Backoff (ms)",
+                    crate::retry::DEFAULT_SYNTHESIS_MAX_BACKOFF_MS_STR,
+                    self.config
+                        .synthesis_max_backoff_ms
+                        .as_deref()
+                        .unwrap_or_default(),
+                    "synthesis_max_backoff_ms",
+                ),
+            ],
+        )
+    }
+
+    fn calibration_section(&self) -> Element<'_, SettingsMessage> {
+        section(
+            "Pipeline Calibration",
+            column![
+                text("Dynamic reviewer-count coefficients (churn thresholds)")
+                    .size(11)
+                    .color(theme::TEXT_SECONDARY),
+                Space::new().height(4),
+                config_text_input(
+                    "Low Churn (lines)",
+                    crate::joint_verdict::DEFAULT_REVIEW_COUNT_LOW_CHURN_STR,
+                    self.config
+                        .review_count_low_churn
+                        .as_deref()
+                        .unwrap_or_default(),
+                    "review_count_low_churn",
+                ),
+                config_text_input(
+                    "High Churn (lines)",
+                    crate::joint_verdict::DEFAULT_REVIEW_COUNT_HIGH_CHURN_STR,
+                    self.config
+                        .review_count_high_churn
+                        .as_deref()
+                        .unwrap_or_default(),
+                    "review_count_high_churn",
+                ),
+                config_text_input(
+                    "Coefficient Fit Date",
+                    "",
+                    self.config
+                        .review_count_coeff_fit_date
+                        .as_deref()
+                        .unwrap_or_default(),
+                    "review_count_coeff_fit_date",
                 ),
             ],
         )
