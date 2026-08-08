@@ -824,7 +824,7 @@ mod retry_policy_guard_tests {
     use super::*;
 
     /// The tiny test policy's `max_attempts` (3) — distinguishes it from the
-    /// production default (7) when asserting restore semantics.
+    /// production default (13) when asserting restore semantics.
     const TINY_MAX_ATTEMPTS: u32 = 3;
 
     #[test]

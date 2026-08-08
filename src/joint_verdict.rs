@@ -21,10 +21,8 @@ use std::fmt::Write as _;
 
 use crate::{ChatMessage, ChatRequest, ChatRequestMeta, Role, Workspace};
 
-// ── Config defaults (string + typed, lockstep pair) ─────────────────────
+// ── Hardcoded review-count calibration defaults (no config surface) ──────
 
-pub(crate) const DEFAULT_REVIEW_COUNT_LOW_CHURN_STR: &str = "50";
-pub(crate) const DEFAULT_REVIEW_COUNT_HIGH_CHURN_STR: &str = "400";
 pub(crate) const DEFAULT_REVIEW_COUNT_LOW_CHURN: u64 = 50;
 pub(crate) const DEFAULT_REVIEW_COUNT_HIGH_CHURN: u64 = 400;
 

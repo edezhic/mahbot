@@ -54,17 +54,9 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use crate::config::CONFIG;
 use crate::{ChatRequest, ChatResponse};
 
-// ── Config defaults (shared with the `string_config_fields!` macro) ──────
-// The string constants are referenced by config.rs's macro invocation
-// (`or(...)` annotations); the parsed defaults live here.
-
-pub(crate) const DEFAULT_RETRY_MAX_ATTEMPTS_STR: &str = "13";
-pub(crate) const DEFAULT_RETRY_BASE_BACKOFF_MS_STR: &str = "5000";
-pub(crate) const DEFAULT_RETRY_MAX_BACKOFF_MS_STR: &str = "60000";
-pub(crate) const DEFAULT_OPERATION_TIMEOUT_SECS_STR: &str = "720";
+// ── Hardcoded retry defaults (no config surface — fixed in code) ─────────
 
 pub(crate) const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 13;
 pub(crate) const DEFAULT_RETRY_BASE_BACKOFF_MS: u64 = 5_000;
@@ -75,9 +67,6 @@ pub(crate) const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_mins(12);
 /// synthesis + up to N-1 repair rounds; default 3 = the lower edge of the
 /// approved 3–5 band), 30–45 s backoff band (base 30 s, cap 45 s, ±25%
 /// jitter on sleeps).
-pub(crate) const DEFAULT_SYNTHESIS_MAX_ATTEMPTS_STR: &str = "3";
-pub(crate) const DEFAULT_SYNTHESIS_BASE_BACKOFF_MS_STR: &str = "30000";
-pub(crate) const DEFAULT_SYNTHESIS_MAX_BACKOFF_MS_STR: &str = "45000";
 pub(crate) const DEFAULT_SYNTHESIS_MAX_ATTEMPTS: u32 = 3;
 pub(crate) const DEFAULT_SYNTHESIS_BASE_BACKOFF_MS: u64 = 30_000;
 pub(crate) const DEFAULT_SYNTHESIS_MAX_BACKOFF_MS: u64 = 45_000;
@@ -114,37 +103,14 @@ pub(crate) struct RetryPolicy {
 }
 
 impl RetryPolicy {
-    /// Build from the global [`CONFIG`], falling back to defaults for invalid
-    /// or missing values.
+    /// Build the default policy from the hardcoded constants.
     #[must_use]
-    pub(crate) fn from_config() -> Self {
+    pub(crate) fn default() -> Self {
         Self {
-            max_attempts: parse_cfg_u64(
-                "retry_max_attempts",
-                &CONFIG.retry_max_attempts(),
-                u64::from(DEFAULT_RETRY_MAX_ATTEMPTS),
-            )
-            .clamp(1, 100) as u32,
-            base_backoff_ms: parse_cfg_u64(
-                "retry_base_backoff_ms",
-                &CONFIG.retry_base_backoff_ms(),
-                DEFAULT_RETRY_BASE_BACKOFF_MS,
-            )
-            .clamp(1, 3_600_000),
-            max_backoff_ms: parse_cfg_u64(
-                "retry_max_backoff_ms",
-                &CONFIG.retry_max_backoff_ms(),
-                DEFAULT_RETRY_MAX_BACKOFF_MS,
-            )
-            .clamp(1, 3_600_000),
-            operation_timeout: Duration::from_secs(
-                parse_cfg_u64(
-                    "operation_timeout_secs",
-                    &CONFIG.operation_timeout_secs(),
-                    DEFAULT_OPERATION_TIMEOUT.as_secs(),
-                )
-                .clamp(1, 86_400),
-            ),
+            max_attempts: DEFAULT_RETRY_MAX_ATTEMPTS,
+            base_backoff_ms: DEFAULT_RETRY_BASE_BACKOFF_MS,
+            max_backoff_ms: DEFAULT_RETRY_MAX_BACKOFF_MS,
+            operation_timeout: DEFAULT_OPERATION_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
     }
@@ -152,8 +118,8 @@ impl RetryPolicy {
     /// Resolve the policy for a scoped operation.
     ///
     /// In tests, an override installed via [`swap_test_retry_policy`] takes
-    /// precedence so retry-loop tests don't sleep for minutes; otherwise this
-    /// reads the global [`CONFIG`].
+    /// precedence so retry-loop tests don't sleep for minutes; otherwise the
+    /// hardcoded defaults apply.
     #[must_use]
     pub(crate) fn current() -> Self {
         #[cfg(test)]
@@ -162,13 +128,11 @@ impl RetryPolicy {
         {
             return p.clone();
         }
-        Self::from_config()
+        Self::default()
     }
 
-    /// Build the joint-verdict synthesis policy from the dedicated config
-    /// keys (`synthesis_max_attempts`, `synthesis_base_backoff_ms`,
-    /// `synthesis_max_backoff_ms`), falling back to defaults on invalid
-    /// values. `synthesis_max_attempts` is the TOTAL call count: 1 full
+    /// Build the joint-verdict synthesis policy from the hardcoded constants.
+    /// `synthesis_max_attempts` is the TOTAL call count: 1 full
     /// synthesis + up to N-1 repair rounds (default 3 — the lower edge of the
     /// approved 3–5 band). The synthesis loop is deliberately bounded so a
     /// bad grouping pass degrades to the deterministic fallback comment
@@ -178,7 +142,7 @@ impl RetryPolicy {
     /// [`swap_test_retry_policy`] takes precedence so synthesis tests run
     /// fast.
     #[must_use]
-    pub(crate) fn synthesis_from_config() -> Self {
+    pub(crate) fn synthesis() -> Self {
         #[cfg(test)]
         if let Ok(guard) = TEST_POLICY_OVERRIDE.read()
             && let Some(p) = guard.as_ref()
@@ -186,24 +150,9 @@ impl RetryPolicy {
             return p.clone();
         }
         Self {
-            max_attempts: parse_cfg_u64(
-                "synthesis_max_attempts",
-                &CONFIG.synthesis_max_attempts(),
-                u64::from(DEFAULT_SYNTHESIS_MAX_ATTEMPTS),
-            )
-            .clamp(1, 20) as u32,
-            base_backoff_ms: parse_cfg_u64(
-                "synthesis_base_backoff_ms",
-                &CONFIG.synthesis_base_backoff_ms(),
-                DEFAULT_SYNTHESIS_BASE_BACKOFF_MS,
-            )
-            .clamp(1, 3_600_000),
-            max_backoff_ms: parse_cfg_u64(
-                "synthesis_max_backoff_ms",
-                &CONFIG.synthesis_max_backoff_ms(),
-                DEFAULT_SYNTHESIS_MAX_BACKOFF_MS,
-            )
-            .clamp(1, 3_600_000),
+            max_attempts: DEFAULT_SYNTHESIS_MAX_ATTEMPTS,
+            base_backoff_ms: DEFAULT_SYNTHESIS_BASE_BACKOFF_MS,
+            max_backoff_ms: DEFAULT_SYNTHESIS_MAX_BACKOFF_MS,
             operation_timeout: Duration::from_mins(10),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
@@ -249,25 +198,10 @@ pub(crate) fn tiny_test_policy() -> RetryPolicy {
     }
 }
 
-/// Parse a numeric config value, logging and falling back on invalid input.
-fn parse_cfg_u64(key: &str, raw: &str, fallback: u64) -> u64 {
-    match raw.trim().parse::<u64>() {
-        Ok(v) if v > 0 => v,
-        _ => {
-            tracing::warn!(
-                key,
-                value = %raw,
-                "Invalid retry config value — falling back to default {fallback}"
-            );
-            fallback
-        }
-    }
-}
-
 /// Compute the canonical backoff sleep sequence (ms) for a policy.
 ///
 /// Pure doubling from `base_backoff_ms`, capped at `max_backoff_ms`. The
-/// default configuration (base 5000 / cap 60000) yields the binding agent-loop
+/// hardcoded defaults (base 5000 / cap 60000) yield the binding agent-loop
 /// schedule 5/10/20/40/60/60… s — total sleep 555 s over 13 attempts.
 #[must_use]
 pub(crate) fn backoff_sequence(policy: &RetryPolicy) -> Vec<u64> {
@@ -767,37 +701,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn string_defaults_match_typed_defaults() {
-        // The `_STR` constants feed config.rs's `string_config_fields!`
-        // macro (`or(...)` annotations); the typed constants drive the
-        // schedule. Keep them in lockstep.
-        assert_eq!(
-            DEFAULT_RETRY_MAX_ATTEMPTS_STR
-                .parse::<u32>()
-                .expect("max attempts str"),
-            DEFAULT_RETRY_MAX_ATTEMPTS
-        );
-        assert_eq!(
-            DEFAULT_RETRY_BASE_BACKOFF_MS_STR
-                .parse::<u64>()
-                .expect("base backoff str"),
-            DEFAULT_RETRY_BASE_BACKOFF_MS
-        );
-        assert_eq!(
-            DEFAULT_RETRY_MAX_BACKOFF_MS_STR
-                .parse::<u64>()
-                .expect("max backoff str"),
-            DEFAULT_RETRY_MAX_BACKOFF_MS
-        );
-        assert_eq!(
-            DEFAULT_OPERATION_TIMEOUT_SECS_STR
-                .parse::<u64>()
-                .expect("timeout secs str"),
-            DEFAULT_OPERATION_TIMEOUT.as_secs()
-        );
-    }
-
-    #[test]
     fn default_backoff_sequence_is_doubling_capped() {
         let p = RetryPolicy {
             max_attempts: DEFAULT_RETRY_MAX_ATTEMPTS,
@@ -916,71 +819,19 @@ mod tests {
     }
 
     #[test]
-    fn invalid_config_values_fall_back_to_defaults() {
+    fn defaults_are_hardcoded() {
         let _guard = crate::util::test::retry_tests_lock();
-        // Corrupt every retry tunable — from_config must fall back to defaults.
-        for key in [
-            "retry_max_attempts",
-            "retry_base_backoff_ms",
-            "retry_max_backoff_ms",
-            "operation_timeout_secs",
-        ] {
-            assert!(
-                crate::config::CONFIG.set_string_field(key, "garbage"),
-                "{key}"
-            );
-        }
-        let policy = RetryPolicy::from_config();
+        // No config surface exists — the policy must always be the
+        // hardcoded defaults regardless of any stray config_kv rows.
+        let policy = RetryPolicy::default();
         assert_eq!(policy.max_attempts, DEFAULT_RETRY_MAX_ATTEMPTS);
         assert_eq!(policy.base_backoff_ms, DEFAULT_RETRY_BASE_BACKOFF_MS);
         assert_eq!(policy.max_backoff_ms, DEFAULT_RETRY_MAX_BACKOFF_MS);
         assert_eq!(policy.operation_timeout, DEFAULT_OPERATION_TIMEOUT);
-
-        // Zero / negative are also invalid (parse_cfg_u64 rejects v == 0).
-        for key in [
-            "retry_max_attempts",
-            "retry_base_backoff_ms",
-            "retry_max_backoff_ms",
-            "operation_timeout_secs",
-        ] {
-            assert!(crate::config::CONFIG.set_string_field(key, "0"), "{key}");
-        }
-        let policy = RetryPolicy::from_config();
-        assert_eq!(policy.max_attempts, DEFAULT_RETRY_MAX_ATTEMPTS);
-
-        // Restore the global for other tests.
-        for key in [
-            "retry_max_attempts",
-            "retry_base_backoff_ms",
-            "retry_max_backoff_ms",
-            "operation_timeout_secs",
-        ] {
-            let _ = crate::config::CONFIG.set_string_field(key, "");
-        }
-    }
-
-    #[test]
-    fn custom_config_values_are_respected() {
-        let _guard = crate::util::test::retry_tests_lock();
-        assert!(crate::config::CONFIG.set_string_field("retry_max_attempts", "11"));
-        assert!(crate::config::CONFIG.set_string_field("retry_base_backoff_ms", "1234"));
-        assert!(crate::config::CONFIG.set_string_field("retry_max_backoff_ms", "99999"));
-        assert!(crate::config::CONFIG.set_string_field("operation_timeout_secs", "120"));
-
-        let policy = RetryPolicy::from_config();
-        assert_eq!(policy.max_attempts, 11);
-        assert_eq!(policy.base_backoff_ms, 1_234);
-        assert_eq!(policy.max_backoff_ms, 99_999);
-        assert_eq!(policy.operation_timeout, Duration::from_mins(2));
-
-        for key in [
-            "retry_max_attempts",
-            "retry_base_backoff_ms",
-            "retry_max_backoff_ms",
-            "operation_timeout_secs",
-        ] {
-            let _ = crate::config::CONFIG.set_string_field(key, "");
-        }
+        let synthesis = RetryPolicy::synthesis();
+        assert_eq!(synthesis.max_attempts, DEFAULT_SYNTHESIS_MAX_ATTEMPTS);
+        assert_eq!(synthesis.base_backoff_ms, DEFAULT_SYNTHESIS_BASE_BACKOFF_MS);
+        assert_eq!(synthesis.max_backoff_ms, DEFAULT_SYNTHESIS_MAX_BACKOFF_MS);
     }
 
     #[tokio::test]

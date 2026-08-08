@@ -626,8 +626,8 @@ Respond with ONLY a JSON object matching this REPAIR-DELTA schema (no extra fiel
 
 /// Run the repair-mode grouping pass (pipeline synthesis + ask
 /// consolidation): 1 full synthesis call + up to N-1 repair rounds (N =
-/// `synthesis_max_attempts`, default 3 = the lower edge of the approved 3–5
-/// band). Accepted groups freeze; repair rounds propose deltas for the
+/// hardcoded `DEFAULT_SYNTHESIS_MAX_ATTEMPTS`, 3 = the lower edge of the
+/// approved 3–5 band). Accepted groups freeze; repair rounds propose deltas for the
 /// remainder only. Termination — zero-progress (a repair round freezing no new
 /// groups) or budget exhaustion — places every remaining item
 /// deterministically in the ungrouped section. Fail-open fires only on
@@ -639,7 +639,7 @@ Respond with ONLY a JSON object matching this REPAIR-DELTA schema (no extra fiel
 /// transport-failure count, not the round number, so a validation-rejected
 /// round never advances the backoff slot). The 600 s operation cap stays
 /// binding (the synthesis policy hardcodes a 10-minute `operation_timeout`,
-/// independent of the general `operation_timeout_secs` config).
+/// independent of the general hardcoded `DEFAULT_OPERATION_TIMEOUT`).
 ///
 /// A round-1 parse failure permanently converts the run to the repair-delta
 /// schema — the model never gets a chance to emit a corrected full output.
@@ -678,7 +678,7 @@ pub(crate) async fn run_grouping_repair(
 ) -> RepairOutcome {
     let _call = crate::call_registry::NON_AGENT_CALLS.register(purpose, &ws.name);
     crate::prompt::prepend_general_context(&mut request.messages, ws).await;
-    let policy = RetryPolicy::synthesis_from_config();
+    let policy = RetryPolicy::synthesis();
     let mut loop_state = RetryLoop::new(&policy);
     let operation_started = Instant::now();
     let mut state = RepairState::new(items_by_agent);

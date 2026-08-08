@@ -1473,7 +1473,7 @@ async fn synthesize(
              State this clearly and explain what evidence would be needed."
         );
     }
-    let policy = crate::retry::RetryPolicy::synthesis_from_config();
+    let policy = crate::retry::RetryPolicy::synthesis();
     let mut loop_state = crate::retry::RetryLoop::new(&policy);
     let operation_started = Instant::now();
     let mut params = orchestrator_params(ws, "synthesize");

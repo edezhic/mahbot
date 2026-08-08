@@ -3237,16 +3237,10 @@ async fn working_tree_churn(repo_path: &Path) -> anyhow::Result<(i64, i64, usize
 /// from a diff that was never reviewed.
 #[allow(clippy::too_many_lines)]
 async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> (usize, Option<i64>) {
-    let low: u64 = crate::config::CONFIG
-        .review_count_low_churn()
-        .parse()
-        .unwrap_or(crate::joint_verdict::DEFAULT_REVIEW_COUNT_LOW_CHURN);
-    let high: u64 = crate::config::CONFIG
-        .review_count_high_churn()
-        .parse()
-        .unwrap_or(crate::joint_verdict::DEFAULT_REVIEW_COUNT_HIGH_CHURN);
-    let low = i64::try_from(low).unwrap_or(i64::MAX);
-    let high = i64::try_from(high).unwrap_or(i64::MAX);
+    let low =
+        i64::try_from(crate::joint_verdict::DEFAULT_REVIEW_COUNT_LOW_CHURN).unwrap_or(i64::MAX);
+    let high =
+        i64::try_from(crate::joint_verdict::DEFAULT_REVIEW_COUNT_HIGH_CHURN).unwrap_or(i64::MAX);
 
     let (base, to_freeze) = if let Some(frozen) = ticket.review_base_count {
         (usize::try_from(frozen).unwrap_or(3), None)
@@ -3278,7 +3272,6 @@ async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> (usize, Op
                 max_per_file_churn = max_per_file,
                 added_files,
                 reviewer_base = base,
-                fit_date = %crate::config::CONFIG.review_count_coeff_fit_date().unwrap_or_default(),
                 "Reviewer count calibration (shadow): base {base} from churn signals",
             );
         }
