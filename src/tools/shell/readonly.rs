@@ -4340,6 +4340,13 @@ fn is_ref_mutation_word(word: &str, table: &[(&str, RefOpt)], shorts: &[(char, R
     false
 }
 
+fn git_mutation_rejection(subcommand: &str, subcommand_name: &str) -> String {
+    format!(
+        "⚠️ Read-only mode: `git {subcommand}` is not allowed — it mutates.\n\
+         Suggestion: use `git {subcommand_name}` without mutation flags to list/inspect."
+    )
+}
+
 /// Check a `git branch`/`git tag` subcommand against the git 2.50.1 option
 /// tables for ref mutations and ref-name creation.
 ///
@@ -4372,10 +4379,7 @@ fn check_git_ref_subcommand(subcommand: &str, sub: &str) -> Result<(), String> {
     for raw in words.iter().skip(1) {
         let w = shell_word(raw);
         if is_ref_mutation_word(&w, table, shorts) {
-            return Err(format!(
-                "⚠️ Read-only mode: `git {subcommand}` is not allowed — it mutates.\n\
-                 Suggestion: use `git {sub}` without mutation flags to list/inspect."
-            ));
+            return Err(git_mutation_rejection(subcommand, sub));
         }
         if consume_next {
             consume_next = false;
@@ -4494,10 +4498,7 @@ fn check_git_subcommand_mutation(
             short_chars.iter().any(|c| a[1..].contains(*c))
         };
         if is_mutating {
-            return Err(format!(
-                "⚠️ Read-only mode: `git {subcommand}` is not allowed — it mutates.\n\
-                 Suggestion: use `git {subcommand_name}` without mutation flags to list/inspect."
-            ));
+            return Err(git_mutation_rejection(subcommand, subcommand_name));
         }
     }
 
@@ -4511,10 +4512,7 @@ fn check_git_subcommand_mutation(
     {
         let is_mutating = matches_mutation_token(first_non_flag_arg, &bare_tokens);
         if is_mutating {
-            return Err(format!(
-                "⚠️ Read-only mode: `git {subcommand}` is not allowed — it mutates.\n\
-                     Suggestion: use `git {subcommand_name}` without mutation flags to list/inspect."
-            ));
+            return Err(git_mutation_rejection(subcommand, subcommand_name));
         }
     }
 
