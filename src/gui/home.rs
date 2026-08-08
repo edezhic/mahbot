@@ -796,7 +796,7 @@ impl HomeState {
                 .collect();
             container(Column::with_children(items).spacing(2).padding(5))
                 .style(theme::surface_container_style)
-                .width(Length::Shrink)
+                .width(Length::Fixed(170.0))
                 .into()
         } else {
             Space::new().height(0).into()
