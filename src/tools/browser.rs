@@ -196,13 +196,38 @@ impl BrowserTool {
     }
 
     /// Fail with an actionable error when the chrome-use CLI is missing or the
-    /// daemon is down, distinguishing the two causes. One CLI check; the
-    /// daemon-health evaluation is cached.
+    /// daemon is down, distinguishing the two causes and never reporting a
+    /// transient probe failure (spawn EAGAIN/EMFILE, timeout) as "not
+    /// installed". One CLI probe; the daemon-health evaluation is cached.
     async fn ensure_available() -> anyhow::Result<()> {
-        if !super::browser_daemon::cli_available().await {
-            anyhow::bail!(
-                "chrome-use CLI is not available. Install with: curl -fsSL https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.sh | sh"
-            );
+        match super::browser_daemon::cli_probe().await {
+            super::browser_daemon::CliStatus::Available => {}
+            super::browser_daemon::CliStatus::Missing => {
+                anyhow::bail!(
+                    "chrome-use CLI is not available. {}",
+                    super::browser_daemon::CHROME_USE_INSTALL_HINT
+                );
+            }
+            super::browser_daemon::CliStatus::Transient(failure) => {
+                let msg = match failure {
+                    super::browser_daemon::CliProbeFailure::Spawn(reason) => format!(
+                        "chrome-use CLI check could not spawn the binary ({reason}) — a \
+                         temporary failure (e.g. system resource exhaustion), not a missing \
+                         install. Retry shortly."
+                    ),
+                    super::browser_daemon::CliProbeFailure::BadVersion(status) => format!(
+                        "chrome-use CLI is installed but its `--version` check failed \
+                         ({status}) — the install looks broken. {}",
+                        super::browser_daemon::CHROME_USE_INSTALL_HINT
+                    ),
+                    super::browser_daemon::CliProbeFailure::Timeout => {
+                        "chrome-use CLI probe timed out — the binary is present but \
+                         unresponsive. Retry shortly; if this persists the CLI may be wedged."
+                            .to_string()
+                    }
+                };
+                anyhow::bail!(msg);
+            }
         }
         if !super::browser_daemon::is_available().await {
             anyhow::bail!("{}", super::browser_daemon::daemon_down_message());
@@ -236,7 +261,12 @@ impl BrowserTool {
         args: &[&str],
         tab: Option<&str>,
     ) -> anyhow::Result<BrowserResponse> {
-        let mut cmd = Command::new(super::browser_daemon::browser_bin());
+        let mut cmd = Command::new(super::browser_daemon::cli_path().with_context(|| {
+            format!(
+                "chrome-use CLI is not available. {}",
+                super::browser_daemon::CHROME_USE_INSTALL_HINT
+            )
+        })?);
         super::browser_daemon::ensure_browser_env(&mut cmd);
         cmd.args(args);
         cmd.arg("--json");
@@ -428,10 +458,13 @@ pub async fn close_all_browser_sessions() {
 const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn close_all_browser_sessions_inner() {
-    let cmd = super::browser_daemon::browser_bin();
+    let Some(cmd) = super::browser_daemon::cli_path() else {
+        tracing::debug!("chrome-use not available, skipping browser cleanup");
+        return;
+    };
 
     // List active sessions
-    let mut list_cmd = Command::new(cmd);
+    let mut list_cmd = Command::new(&cmd);
     super::browser_daemon::ensure_browser_env(&mut list_cmd);
     list_cmd.kill_on_drop(true);
     let list_output = match list_cmd.args(["session", "list", "--json"]).output().await {
@@ -474,7 +507,9 @@ async fn close_all_browser_sessions_inner() {
     let close_futures: Vec<_> = sessions
         .iter()
         .map(|session_id| {
-            // session_id is &String, cmd is &'static str (Copy)
+            // Borrows of cmd/session_id are valid — the futures are awaited
+            // (join_all) inside this function's scope.
+            let cmd = &cmd;
             async move {
                 let mut close_cmd = Command::new(cmd);
                 super::browser_daemon::ensure_browser_env(&mut close_cmd);

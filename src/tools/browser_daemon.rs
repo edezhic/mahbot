@@ -30,6 +30,7 @@
 
 use crate::util::UnwrapPoison;
 use serde_json::Value;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -52,6 +53,10 @@ const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 /// found — the binary can be uninstalled while the daemon runs, but checking
 /// every watchdog interval would spawn `--version` needlessly.
 const CLI_RECHECK: Duration = Duration::from_mins(5);
+/// Consecutive definitive-missing CLI probes before the watchdog stands down —
+/// a single transient probe failure (spawn EAGAIN/EMFILE under process
+/// pressure) must not take the watchdog out of service.
+const CLI_MISSING_THRESHOLD: u32 = 2;
 /// Consecutive failed restarts before auto-recovery halts (thrash protection).
 const MAX_RESTART_ATTEMPTS: u32 = 3;
 /// Sustained-health window: the restart-attempt counter resets only after the
@@ -320,15 +325,159 @@ pub(crate) const fn browser_bin() -> &'static str {
     }
 }
 
-/// Whether the chrome-use CLI binary is installed and runs (--version check).
-pub(crate) async fn cli_available() -> bool {
-    Command::new(browser_bin())
-        .arg("--version")
+/// Result of a CLI availability probe — distinguishes definitive absence
+/// from transient failures so callers never report "not installed" for a
+/// resource-exhaustion or wedged-binary failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CliStatus {
+    /// `chrome-use --version` ran successfully.
+    Available,
+    /// Binary definitively absent (not on PATH, not in common install
+    /// locations, or the resolved binary vanished).
+    Missing,
+    /// Probe failed — the binary is present but could not be confirmed
+    /// working. Structured so user messages distinguish a transient spawn
+    /// failure from a deterministic broken-install or wedge.
+    Transient(CliProbeFailure),
+}
+
+/// Why a CLI probe of a present binary failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CliProbeFailure {
+    /// Spawn failed (EAGAIN/EMFILE/ENOMEM under process pressure, …) —
+    /// temporary; retry rather than standing down.
+    Spawn(String),
+    /// `--version` ran but exited non-zero — the install is broken.
+    BadVersion(String),
+    /// The bounded probe timed out — the binary may be wedged.
+    Timeout,
+}
+
+impl std::fmt::Display for CliProbeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CliProbeFailure::Spawn(reason) => write!(f, "spawn failed ({reason})"),
+            CliProbeFailure::BadVersion(status) => write!(f, "--version check failed ({status})"),
+            CliProbeFailure::Timeout => write!(f, "probe timed out"),
+        }
+    }
+}
+
+/// Install hint for the definitive not-found case — shared by every
+/// user-facing message that names the chrome-use CLI as missing.
+pub(crate) const CHROME_USE_INSTALL_HINT: &str = "Install with: curl -fsSL \
+     https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.sh | sh";
+
+/// Resolved absolute path of the chrome-use binary (PATH first, then common
+/// install locations), cached after the first probe. Re-resolves only when
+/// the cached path vanished or was never found, so a late installation is
+/// picked up by the next probe.
+static CLI_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+
+/// Absolute path of the chrome-use binary, or `None` when definitively not
+/// installed. Spawns must go through this (not the bare name) so PATH
+/// mutations and non-PATH install locations cannot break them.
+pub(crate) fn cli_path() -> Option<PathBuf> {
+    let mut cache = CLI_PATH
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_poison();
+    // Same executability predicate as the resolver, so a cached binary that
+    // loses its execute bit mid-run is re-resolved (a non-executable path
+    // would otherwise pin every probe in a permanent PermissionDenied).
+    if let Some(path) = cache.as_ref().filter(|p| crate::util::is_executable(p)) {
+        return Some(path.clone());
+    }
+    let found = find_cli_binary();
+    cache.clone_from(&found);
+    found
+}
+
+/// Locate the chrome-use binary: PATH lookup first, then the common install
+/// locations the curl installer targets (`~/.local/bin`, `~/.cargo/bin`,
+/// `/usr/local/bin`, `/opt/homebrew/bin` — the first two in the installer's
+/// order so a fresh curl install wins over a stale cargo one). Home
+/// resolution goes through [`crate::util::cargo_bin_dir`] and
+/// `directories::UserDirs` (not `$HOME`) so the fallback still works on
+/// HOME-less hosts (docker); when `CARGO_HOME` is set the literal
+/// `~/.cargo/bin` is probed too (belt-and-suspenders, mirroring the shell
+/// module's `extra_shell_path_prefixes`). Candidates must be executable
+/// (`execvp` would skip a non-executable PATH entry, so we do too).
+fn find_cli_binary() -> Option<PathBuf> {
+    let name = browser_bin();
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(name);
+            if crate::util::is_executable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    if !cfg!(target_os = "windows") {
+        let home = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf());
+        let literal_cargo_bin = match (std::env::var_os("CARGO_HOME"), home.as_deref()) {
+            (Some(cargo_home), Some(h)) if !cargo_home.is_empty() => Some(h.join(".cargo/bin")),
+            _ => None,
+        };
+        for base in [
+            home.as_deref().map(|h| h.join(".local/bin")),
+            crate::util::cargo_bin_dir(),
+            literal_cargo_bin,
+            Some(PathBuf::from("/usr/local/bin")),
+            Some(PathBuf::from("/opt/homebrew/bin")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let candidate = base.join(name);
+            if crate::util::is_executable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Classify a `--version` spawn failure: only a genuinely missing binary
+/// (`NotFound`) is definitive absence; every other spawn error (EAGAIN,
+/// EMFILE, ENOMEM, …) is a transient failure.
+fn classify_spawn_error(e: &std::io::Error) -> CliStatus {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        CliStatus::Missing
+    } else {
+        debug!("chrome-use CLI probe spawn failed: {e}");
+        CliStatus::Transient(CliProbeFailure::Spawn(e.to_string()))
+    }
+}
+
+/// Probe the chrome-use CLI: run `--version` via the resolved absolute path,
+/// bounded by [`CLI_TIMEOUT`], kill-on-drop, with the no-update-check browser
+/// env. Only definitive absence reports [`CliStatus::Missing`]; spawn errors,
+/// timeouts, and non-zero exits are [`CliStatus::Transient`].
+pub(crate) async fn cli_probe() -> CliStatus {
+    let Some(path) = cli_path() else {
+        return CliStatus::Missing;
+    };
+    let mut cmd = Command::new(&path);
+    ensure_browser_env(&mut cmd);
+    cmd.arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .await
-        .is_ok_and(|s| s.success())
+        .kill_on_drop(true);
+    let status = match tokio::time::timeout(CLI_TIMEOUT, cmd.status()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => return classify_spawn_error(&e),
+        Err(_) => {
+            debug!("chrome-use CLI probe timed out");
+            return CliStatus::Transient(CliProbeFailure::Timeout);
+        }
+    };
+    if status.success() {
+        CliStatus::Available
+    } else {
+        debug!("chrome-use CLI probe failed: --version exited with {status}");
+        CliStatus::Transient(CliProbeFailure::BadVersion(status.to_string()))
+    }
 }
 
 /// Set HOME, `CHROMIUM_FLAGS`, and default timeout env vars on the command
@@ -373,7 +522,7 @@ pub(crate) fn ensure_browser_env(cmd: &mut Command) {
 /// `--session`, bounded by [`CLI_TIMEOUT`] — a wedged daemon hangs inside the
 /// CLI's own ~152 s retry loop, so every call must be bounded.
 async fn run_cli_bounded(args: &[&str], session: Option<&str>) -> Option<std::process::Output> {
-    let mut cmd = Command::new(browser_bin());
+    let mut cmd = Command::new(cli_path()?);
     ensure_browser_env(&mut cmd);
     cmd.args(args).arg("--json");
     if let Some(session) = session {
@@ -958,12 +1107,27 @@ pub(crate) fn daemon_down_message() -> String {
 /// Background watchdog: evaluate daemon health from the daemon-free status,
 /// auto-restart with bounded backoff when down, and halt after repeated crashes
 /// to avoid a restart loop. Stands down on hosts without the chrome-use CLI
-/// (nothing to monitor or restart). CLI presence is cached after the first
-/// success and re-verified every [`CLI_RECHECK`] so healthy hosts don't spawn
-/// `--version` per interval.
+/// (nothing to monitor or restart) — but only after [`CLI_MISSING_THRESHOLD`]
+/// consecutive definitive-missing probes, so a transient spawn failure (EAGAIN
+/// under process pressure) never takes the watchdog out of service.
+///
+/// Probe cadence: healthy hosts re-verify CLI presence every [`CLI_RECHECK`]
+/// (5 min, no per-interval `--version` spawns); unknown hosts re-probe every
+/// [`WATCHDOG_INTERVAL`] (30 s); stood-down hosts re-check at [`CLI_RECHECK`]
+/// (5 min) in the steady state, and every [`WATCHDOG_INTERVAL`] while a
+/// transient persists — the deliberate price of never standing down on a
+/// single transient, bounded by the probe timeout. A transient verdict implies
+/// the binary resolved, so it resets the missing streak and re-enables
+/// recovery even on a stood-down host (the stand-down premise is stale). A
+/// deterministically broken install (`--version` exits non-zero) classifies as
+/// transient and thus never stands down, re-probing at the applicable cadence.
 pub async fn run_watchdog() {
     let mut cli_present: Option<bool> = None;
     let mut last_cli_check = Instant::now();
+    let mut cli_missing: u32 = 0;
+    // Last transient probe cause — warn only on change so a persistent
+    // transient leaves a trail without spamming the log.
+    let mut last_transient: Option<CliProbeFailure> = None;
     // One-time sweep of leaked mahbot-owned session artifacts from crashed runs
     // or older versions (see cleanup_stale_sessions).
     let mut cleaned = false;
@@ -972,53 +1136,89 @@ pub async fn run_watchdog() {
     // (the daemon-free status cannot see a wedged daemon and would clobber it).
     let mut woken = false;
     loop {
+        // How long to wait before the next iteration, and whether the health
+        // evaluation is skipped: a CLI-less host cannot run commands, and the
+        // status-unavailable-is-healthy fallback would mark its daemon Healthy.
+        let mut sleep = WATCHDOG_INTERVAL;
+        let mut skip_health = false;
         let cli_due = last_cli_check.elapsed() >= CLI_RECHECK;
         if cli_present != Some(true) || cli_due {
             last_cli_check = Instant::now();
-            if !cli_available().await {
-                if cli_present != Some(false) {
-                    cli_present = Some(false);
-                    warn!("chrome-use CLI not found — browser daemon watchdog standing down");
+            match cli_probe().await {
+                CliStatus::Available => {
+                    cli_present = Some(true);
+                    cli_missing = 0;
+                    last_transient = None;
                 }
-                // Re-check rarely on CLI-less hosts so the watchdog doesn't
-                // spawn `--version` every interval; an early wake re-checks.
-                let shutdown = crate::shutdown::shutdown_token();
-                tokio::select! {
-                    () = tokio::time::sleep(CLI_RECHECK) => {}
-                    () = wake().notified() => woken = true,
-                    () = shutdown.cancelled() => break,
+                CliStatus::Transient(failure) => {
+                    // Not definitive absence — the watchdog stays in service.
+                    // Healthy hosts re-probe at the CLI_RECHECK gate; unknown
+                    // and stood-down hosts re-probe next interval. Warn on
+                    // each distinct cause so a persistently wedged-but-present
+                    // CLI leaves a trail without spamming the log.
+                    if last_transient.as_ref() != Some(&failure) {
+                        warn!("chrome-use CLI probe transient: {failure}");
+                        last_transient = Some(failure);
+                    }
+                    cli_missing = 0;
                 }
-                continue;
+                CliStatus::Missing => {
+                    cli_missing += 1;
+                    last_transient = None;
+                    if cli_missing < CLI_MISSING_THRESHOLD {
+                        // First miss — confirm on the next interval before
+                        // standing down (and re-probe: the cached verdict is
+                        // no longer trustworthy).
+                        cli_present = None;
+                        skip_health = true;
+                    } else {
+                        if cli_present != Some(false) {
+                            cli_present = Some(false);
+                            warn!(
+                                "chrome-use CLI not found — browser daemon watchdog standing down"
+                            );
+                        }
+                        // Re-check rarely on CLI-less hosts so the watchdog
+                        // doesn't spawn `--version` every interval; an early
+                        // wake re-checks.
+                        sleep = CLI_RECHECK;
+                        skip_health = true;
+                    }
+                }
             }
-            cli_present = Some(true);
         }
-        if !cleaned {
-            cleaned = true;
-            cleanup_stale_sessions().await;
-        }
-        // A fail-fast classification from a real call is the freshest signal —
-        // recover from it directly (the daemon-free status cannot see a wedged
-        // daemon and would clobber the cause). On interval ticks (or a wake
-        // without a stored failure), run the daemon-free evaluation and recover
-        // from a service-level failure it finds.
-        let failure = if woken {
-            health().lock().unwrap_poison().last_failure
-        } else {
-            None
-        };
-        if let Some(failure) = failure {
-            attempt_recovery(failure).await;
-        } else {
-            let outcome = evaluate_health().await;
-            set_health(outcome);
-            if let ProbeOutcome::Down(failure) = outcome {
+        if !skip_health {
+            if !cleaned {
+                cleaned = true;
+                cleanup_stale_sessions().await;
+            }
+            // A fail-fast classification from a real call is the freshest signal —
+            // recover from it directly (the daemon-free status cannot see a wedged
+            // daemon and would clobber the cause). On interval ticks (or a wake
+            // without a stored failure), run the daemon-free evaluation and recover
+            // from a service-level failure it finds.
+            let failure = if woken {
+                health().lock().unwrap_poison().last_failure
+            } else {
+                None
+            };
+            if let Some(failure) = failure {
                 attempt_recovery(failure).await;
+            } else {
+                let outcome = evaluate_health().await;
+                set_health(outcome);
+                if let ProbeOutcome::Down(failure) = outcome {
+                    attempt_recovery(failure).await;
+                }
             }
         }
         // Wait for the next interval or an early wake from the fail-fast path.
+        // `woken` resets on every timeout, so a wake that is not consumed
+        // before a CLI stand-down is dropped instead of replayed after
+        // reinstall.
         let shutdown = crate::shutdown::shutdown_token();
         woken = tokio::select! {
-            () = tokio::time::sleep(WATCHDOG_INTERVAL) => false,
+            () = tokio::time::sleep(sleep) => false,
             () = wake().notified() => true,
             () = shutdown.cancelled() => break,
         };
@@ -1220,7 +1420,10 @@ async fn attempt_recovery(mut failure: ProbeFailure) {
 }
 
 async fn run_cli(args: &[&str]) -> bool {
-    let mut cmd = Command::new(browser_bin());
+    let Some(path) = cli_path() else {
+        return false;
+    };
+    let mut cmd = Command::new(path);
     ensure_browser_env(&mut cmd);
     cmd.args(args)
         .stdout(std::process::Stdio::null())
@@ -1481,5 +1684,30 @@ mod tests {
             classify_failure_text("chrome-use error: Element not found"),
             None
         );
+    }
+
+    #[test]
+    fn spawn_error_classification_distinguishes_missing_from_transient() {
+        // Only a genuinely missing binary (NotFound) is definitive absence;
+        // every other spawn error is transient and must never be reported as
+        // "not installed".
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(classify_spawn_error(&not_found), CliStatus::Missing);
+        for kind in [
+            std::io::ErrorKind::WouldBlock,  // EAGAIN — process-table exhaustion
+            std::io::ErrorKind::OutOfMemory, // ENOMEM
+            std::io::ErrorKind::PermissionDenied, // EACCES
+            std::io::ErrorKind::StorageFull, // ENOSPC
+            std::io::ErrorKind::TimedOut,
+        ] {
+            let err = std::io::Error::from(kind);
+            assert!(
+                matches!(
+                    classify_spawn_error(&err),
+                    CliStatus::Transient(CliProbeFailure::Spawn(_))
+                ),
+                "kind {kind:?} must classify as transient, not missing"
+            );
+        }
     }
 }

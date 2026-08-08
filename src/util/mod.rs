@@ -509,6 +509,26 @@ pub fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
+/// True when `path` can be executed: on Unix, a file with at least one
+/// execute bit set (owner, group, or other — `PermissionsExt::mode() &
+/// 0o111`); on Windows, a file with a `.exe` extension (Windows
+/// executability is determined by extension and content, not permission
+/// bits).
+pub(crate) fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.is_file() && std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    }
+}
+
 /// Resolve the cargo bin directory.
 ///
 /// Resolution order:

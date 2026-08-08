@@ -29,6 +29,7 @@
 //! directory — `CARGO_MANIFEST_DIR` is a compile-time constant embedded via
 //! `env!("CARGO_MANIFEST_DIR")`.
 
+use crate::util::is_executable;
 use anyhow::{Context, Result, anyhow};
 #[cfg(test)]
 use directories::UserDirs;
@@ -659,28 +660,6 @@ fn should_delete_build_artifact(
 /// permission denied).
 fn canonicalize_safe(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// Check whether a path points to an executable file.
-///
-/// On Unix: checks that the file exists and has at least one execute bit set
-/// (owner, group, or other). Uses `PermissionsExt::mode() & 0o111`.
-///
-/// On Windows: checks that the file exists and has a `.exe` extension.
-/// (Windows executability is determined by extension and content, not
-/// permission bits.)
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.is_file() && fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(windows)]
-fn is_executable(path: &Path) -> bool {
-    path.is_file()
-        && path
-            .extension()
-            .map_or(false, |ext| ext.eq_ignore_ascii_case("exe"))
 }
 
 /// Determine the spawn target path after a successful build and self_replace.

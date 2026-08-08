@@ -470,12 +470,14 @@ pub async fn enrich_links(content: &str) -> Cow<'_, str> {
 
     // Gate on the cached (non-probing) daemon advertisement first — the cheap
     // in-memory check short-circuits the `--version` spawn below while the
-    // daemon is confirmed down (the exact outage case this ticket targets). A
-    // stale/unknown state passes optimistically and the concurrent fetch tasks
-    // re-discover liveness (bounded by the probe timeout) without failing the
-    // message.
+    // daemon is confirmed down. A stale/unknown state passes optimistically
+    // and the concurrent fetch tasks re-discover liveness (bounded by the
+    // probe timeout) without failing the message.
     if !(crate::tools::browser_daemon::is_advertised()
-        && crate::tools::browser_daemon::cli_available().await)
+        && matches!(
+            crate::tools::browser_daemon::cli_probe().await,
+            crate::tools::browser_daemon::CliStatus::Available
+        ))
     {
         tracing::debug!("chrome-use not available, skipping link enrichment");
         return Cow::Borrowed(content);
