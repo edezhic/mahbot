@@ -611,17 +611,12 @@ async fn process_verifier_verdicts_cases() {
     ];
 
     for case in &cases {
-        let ticket_id = make_ticket(
-            board(),
-            &test_ws_named("/tmp/test", case.ws_suffix),
-            case.title,
-            case.phase,
-        )
-        .await;
+        let ws = test_ws_named("/tmp/test", case.ws_suffix);
+        let ticket_id = make_ticket(board(), &ws, case.title, case.phase).await;
 
         let ticket = expect_ticket(board(), &ticket_id).await;
 
-        process_verifier_verdicts(&ticket, &case.results, case.vi).await;
+        process_verifier_verdicts(&ws, &ticket, &case.results, case.vi).await;
 
         let ticket = expect_ticket(board(), &ticket_id).await;
         assert_eq!(
@@ -703,6 +698,7 @@ async fn sixth_bounce_fails_ticket() {
 
     let ticket = expect_ticket(board(), &ticket_id).await;
     let transitioned = process_verifier_verdicts(
+        &ws,
         &ticket,
         &vec![pass_result(), fail_result(), pass_result()],
         REVIEWER_VI,
@@ -789,7 +785,7 @@ async fn technical_failure_pauses_workspace_but_circuit_breaker_does_not() {
     .await;
     let ticket = expect_ticket(board(), &verifier_id).await;
     let transitioned =
-        process_verifier_verdicts(&ticket, &vec![no_verdict(); 3], REVIEWER_VI).await;
+        process_verifier_verdicts(&ws_verifier, &ticket, &vec![no_verdict(); 3], REVIEWER_VI).await;
     assert!(
         transitioned,
         "all-failed round should transition the ticket"
@@ -872,17 +868,12 @@ async fn process_analyst_verdicts_cases() {
     ];
 
     for case in &cases {
-        let ticket_id = make_ticket(
-            board(),
-            &test_ws_named("/tmp/test", case.ws_suffix),
-            case.title,
-            TicketPhase::Analysis,
-        )
-        .await;
+        let ws = test_ws_named("/tmp/test", case.ws_suffix);
+        let ticket_id = make_ticket(board(), &ws, case.title, TicketPhase::Analysis).await;
 
         let ticket = expect_ticket(board(), &ticket_id).await;
 
-        process_analyst_verdicts(&ticket, &case.results).await;
+        process_analyst_verdicts(&ws, &ticket, &case.results).await;
 
         let phase = expect_ticket_phase(board(), &ticket_id).await;
         assert_eq!(
@@ -953,7 +944,7 @@ async fn analyst_round_fails_open_with_fallback_comment() {
         analyst_verdict(3, "Poor analysis.", &["Missing data"]),
     ];
     let ticket = expect_ticket(board(), &ticket_id).await;
-    process_analyst_verdicts(&ticket, &results).await;
+    process_analyst_verdicts(&ws, &ticket, &results).await;
 
     let phase = expect_ticket_phase(board(), &ticket_id).await;
     assert_eq!(phase, TicketPhase::Planning, "fail-open must advance");
@@ -1838,7 +1829,7 @@ fn joint_comment_includes_failed_agent_dumps() {
     };
     let comment = crate::joint_verdict::render_joint_comment(
         &round,
-        &crate::joint_verdict::SynthesisOutcome::Fallback,
+        &crate::consensus::GroupingOutcome::Fallback,
     );
     assert!(
         comment.contains("Raw agent response"),

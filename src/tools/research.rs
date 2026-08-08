@@ -23,9 +23,9 @@ use crate::prompt::{load_prompt, substitute};
 use crate::session::resolve_agent_id;
 use crate::tools::Tool;
 use crate::tools::ask::{
-    AnalystFindings, Claim, ClaimKey, VerificationResult, VerificationTarget,
-    build_async_result_envelope, dispatch_verifiers, escape_fences, extract_query_telemetry,
-    load_analyst_angles, max_confidence, normalize_claim,
+    AnalystFindings, Claim, VerificationResult, VerificationTarget, build_async_result_envelope,
+    dispatch_verifiers, escape_fences, extract_query_telemetry, load_analyst_angles,
+    max_confidence, normalize_claim,
 };
 use crate::util::UnwrapPoison;
 use crate::{ChatMessage, ChatRequest, ChatRequestMeta, DEFAULT_MAX_TOKENS, Role, Workspace};
@@ -53,12 +53,16 @@ const GAP_ROUND_WIDTHS: &[usize] = &[4, 3, 2];
 /// Consecutive quiet rounds (no new URLs / novel claims) that trigger
 /// negative-evidence saturation.
 const QUIET_ROUNDS_TO_STOP: usize = 2;
-/// Embedding similarity threshold for claim novelty (0.85–0.90 band).
-const NOVELTY_SIMILARITY_THRESHOLD: f32 = 0.85;
 /// Marginal-gap saturation: >50% near-duplicate gaps = no-progress stop.
 const MARGINAL_GAP_SATURATION_PERCENT: usize = 50;
 /// Explicit marker when the orchestrator cannot determine the remaining gaps.
 const GAP_EXTRACTION_FAILED: &str = "gap extraction failed — remaining gaps unknown";
+/// Explicit marker when the plan merge fails — the run falls back to the
+/// first valid decomposition plan verbatim.
+const PLAN_MERGE_FAILED: &str = "plan merge failed — using first valid decomposition plan verbatim";
+/// Explicit marker when the claim annotation pass exhausts its retries — all
+/// pending claims are treated as novel.
+const CLAIM_ANNOTATION_FAILED: &str = "claim annotation failed — all new claims treated as novel";
 
 // ── Shared orchestration types ───────────────────────────────────────────
 
@@ -71,10 +75,39 @@ struct SubQuestion {
     risk: String,
 }
 
-/// Round-0 decomposition plan (one per decomposer, then one merged plan).
+/// Round-0 decomposition plan (one per decomposer).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DecompositionPlan {
     sub_questions: Vec<SubQuestion>,
+}
+
+/// A merged sub-question carrying provenance: the input plan it was copied
+/// from verbatim, plus every other plan containing the identical tuple.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MergedSubQuestion {
+    question: String,
+    evidence_needed: String,
+    risk: String,
+    /// Index of the input plan this sub-question is a verbatim copy of.
+    from_plan: usize,
+    /// Other input plans containing the identical verbatim tuple.
+    also_in_plans: Vec<usize>,
+}
+
+/// A round-0 plan item the merge explicitly dropped (never silently omitted).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DroppedSubQuestion {
+    question: String,
+    evidence_needed: String,
+    risk: String,
+    reason: String,
+}
+
+/// The merged round-0 plan with full coverage provenance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MergedPlan {
+    sub_questions: Vec<MergedSubQuestion>,
+    dropped: Vec<DroppedSubQuestion>,
 }
 
 /// One item in the interim gap list.
@@ -85,8 +118,8 @@ struct Gap {
     kind: String,
     /// The specific missing claim a fresh analyst could hunt for.
     item: String,
-    /// The round-0 sub-question this gap traces to.
-    traces_to: String,
+    /// 0-based index into the merged plan's sub_questions.
+    traces_to: usize,
     evidence_seen: String,
 }
 
@@ -291,9 +324,8 @@ struct EvidenceRound {
 #[derive(Debug, Default)]
 struct AccumulatedEvidence {
     urls: HashSet<String>,
-    /// Claim match keys (normalized text + optional embedding) for
-    /// near-duplicate detection across rounds.
-    claim_keys: Vec<ClaimKey>,
+    /// Claims accumulated across rounds; a claim's stable id is its index in
+    /// this vec (claims are only appended or merged in place, never removed).
     claims: Vec<Claim>,
     /// Deduplicated analysts' self-reported unanswered aspects.
     unanswered: Vec<String>,
@@ -303,64 +335,47 @@ struct AccumulatedEvidence {
     raw_reports: Vec<String>,
 }
 
+/// Per-claim verdict of the per-round annotation pass: is the new claim
+/// novel, a duplicate of an existing claim, or a direct contradiction?
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaimAnnotation {
+    /// 0-based index of the NEW claim within this round's pending claims.
+    new_id: usize,
+    /// "novel" | "duplicate" | "contradicts".
+    verdict: String,
+    /// Index into the EXISTING acc.claims for duplicate/contradicts.
+    existing_id: Option<usize>,
+    /// Verbatim text of the existing claim (proof).
+    proof: Option<String>,
+    /// For "contradicts": the contradiction note.
+    contradiction: Option<String>,
+}
+
+/// The full annotation pass over one round's pending claims.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnnotationPass {
+    annotations: Vec<ClaimAnnotation>,
+}
+
 impl AccumulatedEvidence {
-    /// Absorb a round's evidence, returning `(novel_urls, novel_claims)`
-    /// counts for the negative-evidence-saturation check. Claim novelty uses
-    /// embedding similarity (~0.85) when the local embedder is available and
-    /// degrades to deterministic exact-match comparison otherwise; claims
-    /// disagreeing on numeric literals are always novel (never deduped).
-    fn absorb(&mut self, round: &EvidenceRound) -> (usize, usize) {
+    /// Absorb a round's evidence, returning `(novel_urls, novel_unanswered,
+    /// pending_claims)`. URLs and unanswered aspects dedup exactly as before;
+    /// claims are collected into a pending list — novelty is decided by the
+    /// per-round LLM annotation pass, not embedding similarity.
+    fn absorb(&mut self, round: &EvidenceRound) -> (usize, usize, Vec<Claim>) {
         let novel_urls = round
             .urls
             .iter()
             .filter(|u| self.urls.insert((*u).clone()))
             .count();
-        let mut novel_claims = 0usize;
-        for claim in &round.claims {
-            let key = ClaimKey::new(&claim.claim);
-            if let Some(idx) = self
-                .claim_keys
-                .iter()
-                .position(|k| k.equivalent_to(&key, NOVELTY_SIMILARITY_THRESHOLD))
-            {
-                // Near-duplicate re-statement: preserve any new contradicting
-                // evidence and distinct source instead of dropping them —
-                // ask's merge_and_grade accumulates the same way. A later
-                // round re-stating the claim with higher confidence upgrades
-                // it; sources merge deduplicated across rounds (both sides
-                // may already be multi-source '; ' joins).
-                let existing = &mut self.claims[idx];
-                for c in &claim.contradictions {
-                    if !existing.contradictions.contains(c) {
-                        existing.contradictions.push(c.clone());
-                    }
-                }
-                existing.confidence = max_confidence(&existing.confidence, &claim.confidence);
-                if !claim.source.is_empty() {
-                    let mut merged: Vec<String> = existing
-                        .source
-                        .split("; ")
-                        .filter(|s| !s.trim().is_empty())
-                        .map(|s| s.trim().to_string())
-                        .collect();
-                    for s in claim.source.split("; ") {
-                        let s = s.trim();
-                        if !s.is_empty() && !merged.iter().any(|m| m == s) {
-                            merged.push(s.to_string());
-                        }
-                    }
-                    existing.source = merged.join("; ");
-                }
-                continue;
-            }
-            self.claim_keys.push(key);
-            self.claims.push(claim.clone());
-            novel_claims += 1;
-        }
+        let mut novel_unanswered = 0usize;
         for u in &round.unanswered {
             let key = normalize_claim(u);
             if !key.is_empty() && self.unanswered_keys.insert(key) {
                 self.unanswered.push(u.clone());
+                novel_unanswered += 1;
             }
         }
         for r in &round.raw_reports {
@@ -368,7 +383,73 @@ impl AccumulatedEvidence {
                 self.raw_reports.push(r.clone());
             }
         }
-        (novel_urls, novel_claims)
+        (novel_urls, novel_unanswered, round.claims.clone())
+    }
+
+    /// Apply an annotation pass over a round's pending claims (the validator
+    /// guarantees id completeness and in-range existing ids): novel claims
+    /// are appended, duplicates merge into the existing claim (sources joined
+    /// deduplicated, confidence upgraded, contradictions appended — never
+    /// dropped), and contradicting claims are appended AND linked to the
+    /// existing claim so the verification gate targets both sides. Returns
+    /// the number of novel claims (the saturation signal).
+    fn apply_annotations(&mut self, pass: &AnnotationPass, pending: &[Claim]) -> usize {
+        let mut novel = 0usize;
+        for a in &pass.annotations {
+            let pending_claim = &pending[a.new_id];
+            match a.verdict.as_str() {
+                "novel" => {
+                    self.claims.push(pending_claim.clone());
+                    novel += 1;
+                }
+                "duplicate" => {
+                    // Validator guarantees existing_id is Some and in range.
+                    let existing_id = a.existing_id.expect("duplicate cites an existing claim");
+                    let existing = &mut self.claims[existing_id];
+                    existing.confidence =
+                        max_confidence(&existing.confidence, &pending_claim.confidence);
+                    for c in &pending_claim.contradictions {
+                        if !existing.contradictions.contains(c) {
+                            existing.contradictions.push(c.clone());
+                        }
+                    }
+                    let mut merged: Vec<String> = existing
+                        .source
+                        .split("; ")
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| s.trim().to_string())
+                        .collect();
+                    for s in pending_claim.source.split("; ") {
+                        let s = s.trim();
+                        if !s.is_empty() && !merged.iter().any(|m| m == s) {
+                            merged.push(s.to_string());
+                        }
+                    }
+                    existing.source = merged.join("; ");
+                }
+                "contradicts" => {
+                    let existing_id = a.existing_id.expect("contradicts cites an existing claim");
+                    let note = a.contradiction.as_deref().unwrap_or_default();
+                    let existing = &mut self.claims[existing_id];
+                    if !existing.contradictions.iter().any(|c| c == note) {
+                        existing.contradictions.push(note.to_string());
+                    }
+                    // The new claim is kept and links back to the existing one.
+                    let mut new_claim = pending_claim.clone();
+                    if !new_claim
+                        .contradictions
+                        .iter()
+                        .any(|c| c == &existing.claim)
+                    {
+                        new_claim.contradictions.push(existing.claim.clone());
+                    }
+                    self.claims.push(new_claim);
+                    novel += 1;
+                }
+                _ => unreachable!("validator guarantees the verdict vocabulary"),
+            }
+        }
+        novel
     }
 }
 
@@ -627,8 +708,11 @@ async fn orchestrator_extract<T: serde::de::DeserializeOwned>(
 // ── Round 0: decomposition ───────────────────────────────────────────────
 
 /// Round 0: three independent decomposition plans merged into one
-/// consolidated plan via a single orchestrator LLM call. Budget: 3
-/// decomposers. The x3 redundancy lives here, at the steering decision.
+/// consolidated plan with provenance via a single orchestrator LLM call.
+/// Budget: 3 decomposers. The x3 redundancy lives here, at the steering
+/// decision. On merge failure the run falls back to the first valid plan
+/// verbatim with an explicit marker; only when ALL decomposers failed does
+/// the run error (no plan = no research).
 ///
 /// Asymmetry note: a parse-failed decomposer's raw response is intentionally
 /// NOT preserved (unlike `collect_evidence`, which keeps failed analysts'
@@ -640,7 +724,7 @@ async fn round0_decompose(
     question: &str,
     budget: &mut ResearchBudget,
     run_stats: &mut RunStats,
-) -> Result<DecompositionPlan> {
+) -> Result<(MergedPlan, Option<String>)> {
     budget
         .try_reserve(DECOMPOSE_FAN_OUT)
         .map_err(anyhow::Error::msg)?;
@@ -678,41 +762,143 @@ async fn round0_decompose(
     if valid.is_empty() {
         anyhow::bail!("all decomposition analysts failed — no research plan produced");
     }
-    merge_decomposition_plans(ws, question, &valid).await
+    if let Ok(plan) = merge_decomposition_plans(ws, question, &valid).await {
+        Ok((plan, None))
+    } else {
+        // Fail-open: a failed merge must never lose the run — fall back to
+        // the first valid plan verbatim with an explicit marker.
+        let first = &valid[0];
+        let plan = MergedPlan {
+            sub_questions: first
+                .sub_questions
+                .iter()
+                .map(|sq| MergedSubQuestion {
+                    question: sq.question.clone(),
+                    evidence_needed: sq.evidence_needed.clone(),
+                    risk: sq.risk.clone(),
+                    from_plan: 0,
+                    also_in_plans: Vec::new(),
+                })
+                .collect(),
+            dropped: Vec::new(),
+        };
+        Ok((plan, Some(PLAN_MERGE_FAILED.to_string())))
+    }
 }
 
-/// Merge 1–3 independent plans into one consolidated plan (orchestrator
-/// extraction call — not budgeted).
+/// Merge 1–3 independent plans into one consolidated plan with provenance
+/// (orchestrator extraction call — not budgeted).
 async fn merge_decomposition_plans(
     ws: &Workspace,
     question: &str,
     plans: &[DecompositionPlan],
-) -> Result<DecompositionPlan> {
+) -> Result<MergedPlan> {
     let plans_json = serde_json::to_string_pretty(plans)?;
     let prompt = substitute(
         &load_prompt("research/decompose_merge.md"),
         &[("{{question}}", question), ("{{plans}}", &plans_json)],
     );
-    orchestrator_extract::<DecompositionPlan>(
+    // The validator captures an owned copy of the input plans (the validator
+    // type is `'static`).
+    let plans_owned = plans.to_vec();
+    orchestrator_extract::<MergedPlan>(
         ws,
         "decompose_merge",
         &prompt,
-        Some(&validate_decomposition),
+        Some(&move |p| validate_merged_plan(p, &plans_owned)),
     )
     .await
 }
 
-/// Validate a merged decomposition plan: 4–6 sub-questions (fail-closed
+/// Validate a merged plan: 4–6 sub-questions, verbatim provenance against the
+/// cited input plans, and full coverage — every input plan item appears
+/// exactly once across merged sub-questions (as `from_plan` or
+/// `also_in_plans`) plus dropped. Silent dropout is rejected (fail-closed
 /// inside the extraction retry loop).
-fn validate_decomposition(plan: &DecompositionPlan) -> Result<(), String> {
+fn validate_merged_plan(
+    plan: &MergedPlan,
+    input_plans: &[DecompositionPlan],
+) -> Result<(), String> {
     let n = plan.sub_questions.len();
-    if (4..=6).contains(&n) {
-        Ok(())
-    } else {
-        Err(format!(
-            "decomposition plan has {n} sub-questions, expected 4-6"
-        ))
+    if !(4..=6).contains(&n) {
+        return Err(format!("merged plan has {n} sub-questions, expected 4-6"));
     }
+    let plan_has = |p: &DecompositionPlan, q: &str, e: &str, r: &str| {
+        p.sub_questions
+            .iter()
+            .position(|s| s.question == q && s.evidence_needed == e && s.risk == r)
+    };
+    // Coverage tally: every input item must be referenced exactly once.
+    let mut covered: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
+    let mut mark = |p_idx: usize, s_idx: usize| {
+        *covered.entry((p_idx, s_idx)).or_insert(0) += 1;
+    };
+    for sq in &plan.sub_questions {
+        if sq.from_plan >= input_plans.len() {
+            return Err(format!(
+                "merged sub-question '{}' cites from_plan {} but only {} plans exist",
+                sq.question,
+                sq.from_plan,
+                input_plans.len()
+            ));
+        }
+        for &i in &sq.also_in_plans {
+            if i >= input_plans.len() {
+                return Err(format!(
+                    "merged sub-question '{}' cites also_in_plans {i} but only {} plans exist",
+                    sq.question,
+                    input_plans.len()
+                ));
+            }
+        }
+        let (q, e, r) = (&sq.question, &sq.evidence_needed, &sq.risk);
+        let Some(s_idx) = plan_has(&input_plans[sq.from_plan], q, e, r) else {
+            return Err(format!(
+                "merged sub-question tuple not found verbatim in plan {}: ({q}, {e}, {r})",
+                sq.from_plan
+            ));
+        };
+        mark(sq.from_plan, s_idx);
+        for &i in &sq.also_in_plans {
+            let Some(s_idx) = plan_has(&input_plans[i], q, e, r) else {
+                return Err(format!(
+                    "merged sub-question tuple not found verbatim in plan {i}: ({q}, {e}, {r})"
+                ));
+            };
+            mark(i, s_idx);
+        }
+    }
+    for dropped in &plan.dropped {
+        for (p_idx, p) in input_plans.iter().enumerate() {
+            if let Some(s_idx) = plan_has(
+                p,
+                &dropped.question,
+                &dropped.evidence_needed,
+                &dropped.risk,
+            ) {
+                mark(p_idx, s_idx);
+            }
+        }
+    }
+    for (p_idx, p) in input_plans.iter().enumerate() {
+        for s_idx in 0..p.sub_questions.len() {
+            match covered.get(&(p_idx, s_idx)).copied().unwrap_or(0) {
+                1 => {}
+                0 => {
+                    return Err(format!(
+                        "silent dropout: input plan {p_idx} sub-question {s_idx} is never covered by the merged plan or dropped list"
+                    ));
+                }
+                k => {
+                    return Err(format!(
+                        "input plan {p_idx} sub-question {s_idx} is covered {k} times — every plan item must appear exactly once"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── Round 1: one analyst per sub-question ────────────────────────────────
@@ -723,7 +909,7 @@ fn validate_decomposition(plan: &DecompositionPlan) -> Result<(), String> {
 async fn round1_research(
     ws: &Workspace,
     question: &str,
-    plan: &DecompositionPlan,
+    plan: &MergedPlan,
     budget: &mut ResearchBudget,
     ledger: &mut QueryLedger,
     run_stats: &mut RunStats,
@@ -797,7 +983,7 @@ async fn extract_gap_list(
     ws: &Workspace,
     question: &str,
     acc: &AccumulatedEvidence,
-    plan: &DecompositionPlan,
+    plan: &MergedPlan,
 ) -> Option<GapList> {
     let evidence = render_accumulated_evidence(acc);
     let plan_json = serde_json::to_string(plan).unwrap_or_default();
@@ -809,31 +995,39 @@ async fn extract_gap_list(
             ("{{evidence}}", &evidence),
         ],
     );
-    orchestrator_extract::<GapList>(ws, "gap_extract", &prompt, None)
-        .await
-        .ok()
+    // The validator captures an owned copy of the plan (the validator type is
+    // `'static`).
+    let plan_owned = plan.clone();
+    orchestrator_extract::<GapList>(
+        ws,
+        "gap_extract",
+        &prompt,
+        Some(&move |g| validate_gap_list(g, &plan_owned)),
+    )
+    .await
+    .ok()
+}
+
+/// Validate the gap list: every gap's `traces_to` must be a 0-based index
+/// into the merged plan's sub-questions (fail-closed inside the extraction
+/// retry loop — index-range validation guarantees traceability).
+fn validate_gap_list(gaps: &GapList, plan: &MergedPlan) -> Result<(), String> {
+    for g in &gaps.gaps {
+        if g.traces_to >= plan.sub_questions.len() {
+            return Err(format!(
+                "gap '{}' traces to plan sub-question {} but the merged plan has only {} sub-questions",
+                g.item,
+                g.traces_to,
+                plan.sub_questions.len()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The gap items as plain strings (for the report's unresolved list).
 fn gap_items(gaps: &[Gap]) -> Vec<String> {
     gaps.iter().map(|g| g.item.clone()).collect()
-}
-
-/// Keep only gaps traceable to a round-0 sub-question (lenient bidirectional
-/// substring match on the sub-question text).
-fn triage_gaps(gap_list: &GapList, plan: &DecompositionPlan) -> Vec<Gap> {
-    gap_list
-        .gaps
-        .iter()
-        .filter(|g| {
-            plan.sub_questions.iter().any(|sq| {
-                let g_t = g.traces_to.trim().to_lowercase();
-                let sq_q = sq.question.trim().to_lowercase();
-                g_t.contains(&sq_q) || sq_q.contains(&g_t)
-            })
-        })
-        .cloned()
-        .collect()
 }
 
 /// Marginal-gap saturation: >50% of the traceable gaps are near-duplicates
@@ -876,7 +1070,7 @@ async fn run_gap_round(
                     (
                         "{{gaps}}",
                         &format!(
-                            "- [{}] {} (traces to: {})",
+                            "- [{}] {} (traces to: plan sub-question {})",
                             gap.kind, gap.item, gap.traces_to
                         ),
                     ),
@@ -904,14 +1098,16 @@ async fn run_gap_round(
 /// self-assessment: coverage completion, negative-evidence saturation (two
 /// consecutive quiet rounds), marginal-gap saturation, answerability
 /// abstention, budget exhaustion, and shutdown.
+#[allow(clippy::too_many_arguments)]
 async fn gap_rounds(
     ws: &Workspace,
     question: &str,
-    plan: &DecompositionPlan,
+    plan: &MergedPlan,
     budget: &mut ResearchBudget,
     ledger: &mut QueryLedger,
     acc: &mut AccumulatedEvidence,
     run_stats: &mut RunStats,
+    markers: &mut Vec<String>,
 ) -> GapRoundsOutcome {
     let mut outcome = GapRoundsOutcome {
         abstention: None,
@@ -935,48 +1131,202 @@ async fn gap_rounds(
             outcome.unresolved = gap_items(&gap_list.gaps);
             return outcome;
         }
-        let traceable = triage_gaps(&gap_list, plan);
-        if traceable.is_empty() {
+        // The gap list is validated (traces_to in range) — every gap is
+        // traceable, so it is used directly.
+        let gaps = &gap_list.gaps;
+        if gaps.is_empty() {
             // Coverage completion.
             return outcome;
         }
-        if is_marginal_gap_saturated(&traceable) {
-            outcome.unresolved = gap_items(&traceable);
+        if is_marginal_gap_saturated(gaps) {
+            outcome.unresolved = gap_items(gaps);
             return outcome;
         }
         let width = GAP_ROUND_WIDTHS[round_index.min(GAP_ROUND_WIDTHS.len() - 1)];
         round_index += 1;
-        let targeted: Vec<&Gap> = traceable.iter().take(width).collect();
+        let targeted: Vec<&Gap> = gaps.iter().take(width).collect();
         if budget.try_reserve(targeted.len()).is_err() {
-            outcome.unresolved = gap_items(&traceable);
+            outcome.unresolved = gap_items(gaps);
             return outcome;
         }
         let runs = run_gap_round(ws, question, &targeted, ledger).await;
         let round = collect_evidence(&runs, ledger, run_stats);
-        let (new_urls, new_claims) = acc.absorb(&round);
+        let (new_urls, _, pending) = acc.absorb(&round);
+        let novel_claims = annotate_round(ws, acc, &pending, markers).await;
         outcome.rounds_dispatched += 1;
         // A round whose analysts only re-asked already-asked queries counts
         // as no-progress toward saturation (repeat queries are never
         // pre-dispatch-droppable — concurrent analysts generate them live).
         let all_repeat_queries = round.queries > 0 && round.queries == round.repeat_queries;
-        if (new_urls == 0 && new_claims == 0) || all_repeat_queries {
+        if (new_urls == 0 && novel_claims == 0) || all_repeat_queries {
             quiet_rounds += 1;
             if quiet_rounds >= QUIET_ROUNDS_TO_STOP {
                 // Negative-evidence saturation: answerability abstain check.
                 outcome.abstention = check_answerability(ws, question, acc).await;
-                outcome.unresolved = gap_items(&traceable);
+                outcome.unresolved = gap_items(gaps);
                 return outcome;
             }
         } else {
             quiet_rounds = 0;
         }
-        // Refresh the gap list from the accumulated evidence (gaps shrink).
-        let Some(next_gap_list) = extract_gap_list(ws, question, acc, plan).await else {
-            outcome.incomplete = Some(GAP_EXTRACTION_FAILED.to_string());
-            outcome.unresolved = gap_items(&traceable);
-            return outcome;
+        // Refresh the gap list from the accumulated evidence only when the
+        // round produced progress; a quiet round reuses the current list.
+        if new_urls != 0 || novel_claims != 0 {
+            let Some(next_gap_list) = extract_gap_list(ws, question, acc, plan).await else {
+                outcome.incomplete = Some(GAP_EXTRACTION_FAILED.to_string());
+                outcome.unresolved = gap_items(gaps);
+                return outcome;
+            };
+            gap_list = next_gap_list;
+        }
+    }
+}
+
+/// Per-round claim annotation pass: classify each pending claim against the
+/// existing accumulated claims via a single orchestrator extraction call.
+/// The validator guarantees id completeness and verbatim proofs (fail-closed
+/// inside the extraction retry loop).
+async fn annotate_claims(
+    ws: &Workspace,
+    existing: &[Claim],
+    pending: &[Claim],
+) -> Result<AnnotationPass> {
+    let mut existing_claims = String::new();
+    for (i, c) in existing.iter().enumerate() {
+        let _ = writeln!(existing_claims, "{i}: {}", c.claim);
+    }
+    let mut pending_claims = String::new();
+    for (i, c) in pending.iter().enumerate() {
+        let _ = writeln!(pending_claims, "{i}: {}", c.claim);
+    }
+    let mut user = substitute(
+        &load_prompt("research/annotate.md"),
+        &[
+            ("{{existing_claims}}", &existing_claims),
+            ("{{pending_claims}}", &pending_claims),
+        ],
+    );
+    user.push_str("\n\n");
+    user.push_str(&load_prompt("extraction/annotate.md"));
+    // The validator captures owned copies (the validator type is `'static`).
+    let existing_owned = existing.to_vec();
+    let pending_owned = pending.to_vec();
+    orchestrator_extract::<AnnotationPass>(
+        ws,
+        "claim_annotate",
+        &user,
+        Some(&move |a| validate_annotations(a, &existing_owned, &pending_owned)),
+    )
+    .await
+}
+
+/// Validate an annotation pass: every pending claim annotated exactly once;
+/// `duplicate`/`contradicts` cite an in-range existing claim with a verbatim
+/// proof; `novel` cites nothing; the contradiction note is present exactly
+/// when the verdict is "contradicts".
+fn validate_annotations(
+    pass: &AnnotationPass,
+    existing: &[Claim],
+    pending: &[Claim],
+) -> Result<(), String> {
+    let mut ids: Vec<usize> = pass.annotations.iter().map(|a| a.new_id).collect();
+    ids.sort_unstable();
+    let expected: Vec<usize> = (0..pending.len()).collect();
+    if ids != expected {
+        return Err(format!(
+            "annotation pass must annotate every new claim exactly once: ids {ids:?} != 0..{}",
+            pending.len()
+        ));
+    }
+    for a in &pass.annotations {
+        let verdict = a.verdict.as_str();
+        if !matches!(verdict, "novel" | "duplicate" | "contradicts") {
+            return Err(format!(
+                "verdict '{verdict}' not in [novel, duplicate, contradicts]"
+            ));
+        }
+        let has_note = a
+            .contradiction
+            .as_deref()
+            .is_some_and(|c| !c.trim().is_empty());
+        if (verdict == "contradicts") != has_note {
+            return Err(format!(
+                "verdict '{verdict}' for new claim {} must carry the contradiction note exactly when it contradicts",
+                a.new_id
+            ));
+        }
+        if verdict == "novel" {
+            if a.existing_id.is_some() {
+                return Err(format!(
+                    "novel annotation for new claim {} must not cite an existing claim",
+                    a.new_id
+                ));
+            }
+            continue;
+        }
+        let Some(existing_id) = a.existing_id else {
+            return Err(format!(
+                "{verdict} annotation for new claim {} must cite an existing claim",
+                a.new_id
+            ));
         };
-        gap_list = next_gap_list;
+        if existing_id >= existing.len() {
+            return Err(format!(
+                "existing_id {existing_id} out of range ({} existing claims)",
+                existing.len()
+            ));
+        }
+        let Some(proof) = a.proof.as_deref().filter(|p| !p.trim().is_empty()) else {
+            return Err(format!(
+                "{verdict} annotation for new claim {} must carry a verbatim proof",
+                a.new_id
+            ));
+        };
+        // Verbatim proof check uses the shared core's case-preserving
+        // normalization (consistency with the grouping validator's membership
+        // invariant — a proof that folds case would be weaker than the
+        // consensus path it feeds).
+        if crate::consensus::normalize_item(proof)
+            != crate::consensus::normalize_item(&existing[existing_id].claim)
+        {
+            return Err(format!(
+                "proof for new claim {} does not match existing claim {existing_id} verbatim",
+                a.new_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Run the annotation pass over a round's pending claims and apply the
+/// results. Returns the number of novel claims (the saturation signal). On
+/// exhaustion every pending claim is treated as novel with an explicit
+/// marker — claims are never dropped.
+async fn annotate_round(
+    ws: &Workspace,
+    acc: &mut AccumulatedEvidence,
+    pending: &[Claim],
+    markers: &mut Vec<String>,
+) -> usize {
+    if pending.is_empty() {
+        return 0;
+    }
+    if acc.claims.is_empty() {
+        // First round: nothing to compare against — every pending claim is
+        // novel by construction. Skip the wasted orchestrator call (and with
+        // it the spurious failure marker an out-of-range existing_id would
+        // otherwise trigger).
+        acc.claims.extend(pending.iter().cloned());
+        return pending.len();
+    }
+    if let Ok(pass) = annotate_claims(ws, &acc.claims, pending).await {
+        acc.apply_annotations(&pass, pending)
+    } else {
+        acc.claims.extend(pending.iter().cloned());
+        if !markers.iter().any(|m| m == CLAIM_ANNOTATION_FAILED) {
+            markers.push(CLAIM_ANNOTATION_FAILED.to_string());
+        }
+        pending.len()
     }
 }
 
@@ -1089,6 +1439,8 @@ async fn research_verification_pass(
 
 /// Render the accumulated evidence as a compact numbered list for the
 /// orchestrator prompts, plus analysts' self-reported unanswered aspects.
+/// Claim ids are their stable 0-based indices in `acc.claims` — the
+/// annotation pass and final synthesis reference them by these ids.
 fn render_accumulated_evidence(acc: &AccumulatedEvidence) -> String {
     let mut out = String::new();
     for (i, c) in acc.claims.iter().enumerate() {
@@ -1099,10 +1451,8 @@ fn render_accumulated_evidence(acc: &AccumulatedEvidence) -> String {
         };
         let _ = writeln!(
             out,
-            "{}. [{}] {} — source: {source}",
-            i + 1,
-            c.confidence,
-            c.claim,
+            "{i}. [{}] {} — source: {source}",
+            c.confidence, c.claim,
         );
         if !c.contradictions.is_empty() {
             let _ = writeln!(out, "   contradictions: {}", c.contradictions.join("; "));
@@ -1138,6 +1488,7 @@ fn render_run_summary(
     abstention: Option<&str>,
     unresolved: &[String],
     incomplete: Option<&str>,
+    markers: &[String],
     wall: Duration,
 ) -> String {
     let mut out = String::new();
@@ -1145,6 +1496,12 @@ fn render_run_summary(
     let _ = writeln!(out, "- rounds used: {rounds_used}");
     if let Some(reason) = incomplete {
         let _ = writeln!(out, "- gap rounds incomplete: {reason}");
+    }
+    if !markers.is_empty() {
+        let _ = writeln!(out, "- markers:");
+        for m in markers {
+            let _ = writeln!(out, "  - {m}");
+        }
     }
     let _ = writeln!(out, "- agents spawned: {} / {}", budget.spent, budget.cap);
     let _ = writeln!(out, "- tool calls: {}", run_stats.tool_calls);
@@ -1234,10 +1591,16 @@ async fn run_deep_research(ws: &Workspace, question: &str) -> Result<String> {
     let mut ledger = QueryLedger::default();
     let mut acc = AccumulatedEvidence::default();
     let mut run_stats = RunStats::default();
+    let mut markers: Vec<String> = Vec::new();
 
     // Round 0 — three independent decomposition plans merged into one.
     let plan = match round0_decompose(ws, question, &mut budget, &mut run_stats).await {
-        Ok(plan) => plan,
+        Ok((plan, marker)) => {
+            if let Some(m) = marker {
+                markers.push(m);
+            }
+            plan
+        }
         Err(_) if crate::shutdown::shutdown_token().is_cancelled() => {
             return Ok(partial_report(
                 question,
@@ -1275,7 +1638,8 @@ async fn run_deep_research(ws: &Workspace, question: &str) -> Result<String> {
             "round 1 skipped — analyst budget exhausted",
         ));
     };
-    acc.absorb(&r1);
+    let (_, _, pending) = acc.absorb(&r1);
+    annotate_round(ws, &mut acc, &pending, &mut markers).await;
 
     // Interim consolidation + conditional gap rounds.
     let gap_outcome = gap_rounds(
@@ -1286,6 +1650,7 @@ async fn run_deep_research(ws: &Workspace, question: &str) -> Result<String> {
         &mut ledger,
         &mut acc,
         &mut run_stats,
+        &mut markers,
     )
     .await;
     let rounds_used = 2 + gap_outcome.rounds_dispatched;
@@ -1325,7 +1690,17 @@ async fn run_deep_research(ws: &Workspace, question: &str) -> Result<String> {
         research_verification_pass(ws, &acc, &mut budget, &mut ledger, &mut run_stats).await
     };
 
-    let mut report = synthesis;
+    // Fail-open markers survive delivery: head-placed so they survive the
+    // manager's sandwich truncation of long reports.
+    let mut report = String::new();
+    if !markers.is_empty() {
+        let _ = writeln!(report, "## Run markers");
+        for m in &markers {
+            let _ = writeln!(report, "- {m}");
+        }
+        let _ = writeln!(report);
+    }
+    report.push_str(&synthesis);
     if !verification.is_empty() {
         let _ = writeln!(report);
         let _ = writeln!(report, "## Verification");
@@ -1356,6 +1731,7 @@ async fn run_deep_research(ws: &Workspace, question: &str) -> Result<String> {
         gap_outcome.abstention.as_deref(),
         &gap_outcome.unresolved,
         gap_outcome.incomplete.as_deref(),
+        &markers,
         start.elapsed(),
     ));
     Ok(report)
@@ -1420,19 +1796,19 @@ mod tests {
             Gap {
                 kind: "unanswered".into(),
                 item: "price of X".into(),
-                traces_to: "sq1".into(),
+                traces_to: 0,
                 evidence_seen: String::new(),
             },
             Gap {
                 kind: "unanswered".into(),
                 item: "price  of x".into(),
-                traces_to: "sq1".into(),
+                traces_to: 0,
                 evidence_seen: String::new(),
             },
             Gap {
                 kind: "unanswered".into(),
                 item: "price of X".into(),
-                traces_to: "sq2".into(),
+                traces_to: 1,
                 evidence_seen: String::new(),
             },
         ];
@@ -1443,49 +1819,142 @@ mod tests {
     }
 
     #[test]
-    fn test_triage_gaps_traces_to_plan() {
-        let plan = DecompositionPlan {
+    fn test_validate_gap_list_traces_to_plan() {
+        let plan = MergedPlan {
             sub_questions: vec![
-                SubQuestion {
+                MergedSubQuestion {
                     question: "What is the price of X?".into(),
                     evidence_needed: "pricing page".into(),
                     risk: "low".into(),
+                    from_plan: 0,
+                    also_in_plans: vec![],
                 },
-                SubQuestion {
+                MergedSubQuestion {
                     question: "Who maintains X?".into(),
                     evidence_needed: "repo metadata".into(),
                     risk: "medium".into(),
+                    from_plan: 0,
+                    also_in_plans: vec![],
                 },
             ],
+            dropped: vec![],
         };
-        let list = GapList {
-            gaps: vec![
-                Gap {
-                    kind: "unanswered".into(),
-                    item: "exact price".into(),
-                    traces_to: "price of X".into(),
-                    evidence_seen: String::new(),
+        let in_range = GapList {
+            gaps: vec![Gap {
+                kind: "unanswered".into(),
+                item: "exact price".into(),
+                traces_to: 0,
+                evidence_seen: String::new(),
+            }],
+        };
+        assert!(validate_gap_list(&in_range, &plan).is_ok());
+        let out_of_range = GapList {
+            gaps: vec![Gap {
+                kind: "unanswered".into(),
+                item: "unrelated".into(),
+                traces_to: 5,
+                evidence_seen: String::new(),
+            }],
+        };
+        assert!(
+            validate_gap_list(&out_of_range, &plan).is_err(),
+            "out-of-range traces_to is rejected — index-range validation guarantees traceability"
+        );
+    }
+
+    #[test]
+    fn test_validate_merged_plan_coverage() {
+        let sq = |q: &str| SubQuestion {
+            question: q.into(),
+            evidence_needed: "e".into(),
+            risk: "low".into(),
+        };
+        let plans = vec![
+            DecompositionPlan {
+                sub_questions: vec![sq("q1"), sq("q2")],
+            },
+            DecompositionPlan {
+                sub_questions: vec![sq("q1"), sq("q3")],
+            },
+            DecompositionPlan {
+                sub_questions: vec![sq("q4"), sq("q5")],
+            },
+        ];
+        let base = |also: bool, dropped: bool| MergedPlan {
+            sub_questions: vec![
+                MergedSubQuestion {
+                    question: "q1".into(),
+                    evidence_needed: "e".into(),
+                    risk: "low".into(),
+                    from_plan: 0,
+                    also_in_plans: if also { vec![1] } else { vec![] },
                 },
-                Gap {
-                    kind: "unanswered".into(),
-                    item: "totally unrelated".into(),
-                    traces_to: "quantum physics".into(),
-                    evidence_seen: String::new(),
+                MergedSubQuestion {
+                    question: "q2".into(),
+                    evidence_needed: "e".into(),
+                    risk: "low".into(),
+                    from_plan: 0,
+                    also_in_plans: vec![],
+                },
+                MergedSubQuestion {
+                    question: "q3".into(),
+                    evidence_needed: "e".into(),
+                    risk: "low".into(),
+                    from_plan: 1,
+                    also_in_plans: vec![],
+                },
+                MergedSubQuestion {
+                    question: "q4".into(),
+                    evidence_needed: "e".into(),
+                    risk: "low".into(),
+                    from_plan: 2,
+                    also_in_plans: vec![],
                 },
             ],
+            dropped: if dropped {
+                vec![DroppedSubQuestion {
+                    question: "q5".into(),
+                    evidence_needed: "e".into(),
+                    risk: "low".into(),
+                    reason: "redundant".into(),
+                }]
+            } else {
+                vec![]
+            },
         };
-        let triaged = triage_gaps(&list, &plan);
-        assert_eq!(triaged.len(), 1);
-        assert_eq!(triaged[0].item, "exact price");
+        assert!(
+            validate_merged_plan(&base(true, true), &plans).is_ok(),
+            "full coverage via from_plan + also_in_plans + dropped"
+        );
+        assert!(
+            validate_merged_plan(&base(false, true), &plans).is_err(),
+            "silent dropout: plan 1's q1 is never covered"
+        );
+        assert!(
+            validate_merged_plan(&base(true, false), &plans).is_err(),
+            "silent dropout: q5 is never covered"
+        );
+        let mut bad = base(true, true);
+        bad.sub_questions[0].from_plan = 9;
+        assert!(
+            validate_merged_plan(&bad, &plans).is_err(),
+            "out-of-range from_plan is rejected"
+        );
+        let mut bad = base(true, true);
+        bad.sub_questions[3].question = "q9".into();
+        assert!(
+            validate_merged_plan(&bad, &plans).is_err(),
+            "a merged tuple not found verbatim in its cited plan is rejected"
+        );
     }
 
     // ── Orchestrator helpers (no provider needed) ───────────────────────
 
     #[test]
     fn test_evidence_absorb_counts_novelty() {
-        // ClaimKey skips embedding in test builds (cfg!(test)), so absorb
-        // deterministically exercises the exact-match novelty fallback with
-        // no process-global CONFIG/embedder mutation.
+        // URLs and unanswered aspects dedup inside absorb exactly as before;
+        // claims are returned as a pending list — novelty is decided by the
+        // annotation pass, never dropped here.
         let mut acc = AccumulatedEvidence::default();
         let round1 = EvidenceRound {
             urls: vec!["u1".into(), "u2".into()],
@@ -1506,8 +1975,8 @@ mod tests {
             unanswered: vec!["how beta relates to alpha".into()],
             ..Default::default()
         };
-        let (urls, claims) = acc.absorb(&round1);
-        assert_eq!((urls, claims), (2, 2));
+        let (urls, unanswered, pending) = acc.absorb(&round1);
+        assert_eq!((urls, unanswered, pending.len()), (2, 1, 2));
         let round2 = EvidenceRound {
             urls: vec!["u1".into(), "u3".into()],
             claims: vec![
@@ -1527,11 +1996,11 @@ mod tests {
             unanswered: vec!["how beta relates to alpha".into(), "delta timeline".into()],
             ..Default::default()
         };
-        let (urls, claims) = acc.absorb(&round2);
+        let (urls, unanswered, pending) = acc.absorb(&round2);
         assert_eq!(
-            (urls, claims),
-            (1, 1),
-            "only new URL (u3) and novel claim (gamma) count"
+            (urls, unanswered, pending.len()),
+            (1, 1, 2),
+            "only new URL (u3) and unanswered aspect count; every claim stays pending for annotation"
         );
         assert_eq!(
             acc.unanswered,
@@ -1541,71 +2010,86 @@ mod tests {
     }
 
     #[test]
-    fn test_absorb_keeps_numeric_contradictions() {
-        // Price-differing claims sharing a year are never near-duplicates —
-        // deduping them would silently drop the contradicted claim.
+    fn test_apply_annotations_contradicts_appends_and_links() {
+        // A contradicting claim is never deduped away: it is appended AND
+        // linked to the existing claim so the verification gate targets both
+        // sides of the dispute.
         let mut acc = AccumulatedEvidence::default();
-        let round = EvidenceRound {
-            claims: vec![
-                Claim {
-                    claim: "alpha costs $100 in 2024".into(),
-                    source: "u1".into(),
-                    confidence: "medium".into(),
-                    contradictions: vec![],
-                },
-                Claim {
-                    claim: "alpha costs $200 in 2024".into(),
-                    source: "u2".into(),
-                    confidence: "medium".into(),
-                    contradictions: vec![],
-                },
-            ],
-            ..Default::default()
+        acc.claims.push(Claim {
+            claim: "alpha costs $100 in 2024".into(),
+            source: "u1".into(),
+            confidence: "medium".into(),
+            contradictions: vec![],
+        });
+        let pending = vec![Claim {
+            claim: "alpha costs $200 in 2024".into(),
+            source: "u2".into(),
+            confidence: "high".into(),
+            contradictions: vec![],
+        }];
+        let pass = AnnotationPass {
+            annotations: vec![ClaimAnnotation {
+                new_id: 0,
+                verdict: "contradicts".into(),
+                existing_id: Some(0),
+                proof: Some("alpha costs $100 in 2024".into()),
+                contradiction: Some("price differs: $200 vs $100".into()),
+            }],
         };
-        let (_, novel) = acc.absorb(&round);
+        let novel = acc.apply_annotations(&pass, &pending);
+        assert_eq!(novel, 1, "a contradicting claim is new evidence");
         assert_eq!(
-            novel, 2,
-            "both price claims are novel — the contradiction is preserved"
+            acc.claims.len(),
+            2,
+            "the contradiction is preserved, never merged away"
         );
-        assert_eq!(acc.claims.len(), 2);
+        assert_eq!(
+            acc.claims[0].contradictions,
+            vec!["price differs: $200 vs $100"],
+            "the existing claim carries the contradiction note — the verification gate fires"
+        );
+        assert!(
+            acc.claims[1]
+                .contradictions
+                .contains(&"alpha costs $100 in 2024".to_string()),
+            "the new claim links back to the existing one"
+        );
     }
 
     #[test]
-    fn test_absorb_merges_sources_and_upgrades_confidence() {
-        // A later round re-stating a claim upgrades its confidence and merges
-        // sources deduplicated — including multi-source '; ' joins on both
-        // sides (duplicate entries must never appear in the merged list).
-        // `urls` mirrors collect_evidence, which pushes each claim source as
-        // a URL entry.
+    fn test_apply_annotations_merges_sources_and_upgrades_confidence() {
+        // A duplicate merges into the existing claim: confidence upgraded,
+        // sources joined deduplicated — including multi-source '; ' joins on
+        // both sides (duplicate entries must never appear in the merged list).
         let mut acc = AccumulatedEvidence::default();
-        let round1 = EvidenceRound {
-            urls: vec!["u1; u2".into()],
-            claims: vec![Claim {
-                claim: "alpha is true".into(),
-                source: "u1; u2".into(),
-                confidence: "low".into(),
-                contradictions: vec![],
+        acc.claims.push(Claim {
+            claim: "alpha is true".into(),
+            source: "u1; u2".into(),
+            confidence: "low".into(),
+            contradictions: vec![],
+        });
+        let pending = vec![Claim {
+            claim: "alpha is true".into(),
+            source: "u2; u3".into(),
+            confidence: "high".into(),
+            contradictions: vec![],
+        }];
+        let pass = AnnotationPass {
+            annotations: vec![ClaimAnnotation {
+                new_id: 0,
+                verdict: "duplicate".into(),
+                existing_id: Some(0),
+                proof: Some("alpha is true".into()),
+                contradiction: None,
             }],
-            ..Default::default()
         };
-        acc.absorb(&round1);
-        let round2 = EvidenceRound {
-            urls: vec!["u2; u3".into()],
-            claims: vec![Claim {
-                claim: "alpha is true".into(),
-                source: "u2; u3".into(),
-                confidence: "high".into(),
-                contradictions: vec![],
-            }],
-            ..Default::default()
-        };
-        let (urls, claims) = acc.absorb(&round2);
+        let novel = acc.apply_annotations(&pass, &pending);
+        assert_eq!(novel, 0, "a duplicate is never counted as novel");
         assert_eq!(
-            (urls, claims),
-            (1, 0),
-            "the round-2 source string is novel; the claim itself is a re-statement"
+            acc.claims.len(),
+            1,
+            "a duplicate is never dropped — it merges into the existing claim"
         );
-        assert_eq!(acc.claims.len(), 1);
         let c = &acc.claims[0];
         assert_eq!(
             c.confidence, "high",

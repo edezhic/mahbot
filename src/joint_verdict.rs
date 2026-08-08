@@ -1,24 +1,21 @@
 //! Joint verdict comments for pipeline stages (analysis, review, QA).
 //!
 //! Replaces the per-agent verdict comments with ONE comment per non-all-pass
-//! round. The merge backbone is deterministic: issues are merged by
-//! exact-normalized text match, every issue renders with a code-computed
-//! [n/N] bracket, and a single LLM synthesis pass groups related issues into
-//! prose. The LLM never produces numbers — brackets, counts, agreement and
-//! blocker/minor classification are all computed here from the actual
-//! verdicts.
+//! round. The merge backbone is the shared LLM grouping core ([`crate::consensus`]):
+//! a single synthesis pass groups the agents' exact issue statements, every
+//! group renders with a code-computed `[n/N]` bracket derived from distinct
+//! cited agent ids, and the DISPUTED marker appears only when the group carries
+//! a genuine contradiction (contradiction:true — never for solo findings).
+//! The LLM never produces counts — brackets are pure arithmetic here.
 //!
-//! Anti-fabrication: every synthesis group member must carry the verbatim
+//! Anti-fabrication: every group member must carry the verbatim
 //! (exact-normalized) issue text of a specific agent; any violation rejects
 //! the output and retries the synthesis, eventually falling back to a
-//! deterministic comment.
+//! deterministic raw member dump with an explicit marker.
 
-use serde::Deserialize;
 use std::fmt::Write as _;
-use std::time::Instant;
 
-use crate::retry::{FailureClass, RetryFailureRecord, RetryLoop, RetryPolicy};
-use crate::{ChatMessage, ChatRequest, ChatRequestMeta, Role};
+use crate::{ChatMessage, ChatRequest, ChatRequestMeta, Role, Workspace};
 
 // ── Config defaults (string + typed, lockstep pair) ─────────────────────
 
@@ -69,236 +66,62 @@ impl JointRound<'_> {
     }
 }
 
-// ── Deterministic merge backbone ────────────────────────────────────────
+// ── Per-agent issue lists (validation universe) ─────────────────────────
 
-/// Normalize an issue text for exact-match merging and validation:
-/// trim and collapse runs of whitespace to a single space. Case is
-/// preserved — merging must never silently fold distinct claims.
+/// Key the per-agent issue lists by the ORIGINAL dispatch index (the label
+/// the LLM sees in the input) — never a compacted 0..n_valid-1 space. A
+/// failed agent's slot stays empty, so a member referencing it is rejected.
+/// Per-agent duplicates (the same issue reported twice by one agent) are
+/// deduped: the validation universe and the LLM input both carry unique
+/// items, so an LLM citing the item once can never trip the double-count
+/// rejection nor fail the completeness check.
 #[must_use]
-pub(crate) fn normalize_issue_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// A distinct issue raised by one or more agents, merged by exact-normalized
-/// text match.
-pub(crate) struct MergedIssue {
-    /// Original (unnormalized) text from the first agent that raised it.
-    pub text: String,
-    /// Agent indices whose verdicts raised this issue.
-    pub agents: Vec<usize>,
-    /// Number of valid verdicts in the round (N).
-    pub n_valid: usize,
-    /// How many of the raising agents' verdicts scored below the threshold.
-    /// `> 0` ⇒ the issue renders as a blocker.
-    pub sources_below_threshold: usize,
-}
-
-/// Merge the issues of all valid verdicts by exact-normalized text.
-///
-/// An agent listing the same issue twice contributes one vote. Order is
-/// first-seen across agents. This is the deterministic backbone — it can
-/// never lie about consensus because it only merges byte-identical texts.
-#[must_use]
-pub(crate) fn merge_issues(round: &JointRound<'_>) -> Vec<MergedIssue> {
-    let n_valid = round.n_valid();
-    let mut issues: Vec<MergedIssue> = Vec::new();
+pub(crate) fn issues_by_agent(round: &JointRound<'_>) -> Vec<Vec<String>> {
+    let mut by_agent: Vec<Vec<String>> = vec![Vec::new(); round.dispatched];
     for v in &round.verdicts {
-        let mut seen_here: Vec<String> = Vec::new();
-        for issue in &v.verdict.issues_detected {
-            let norm = normalize_issue_text(issue);
-            if seen_here.contains(&norm) {
-                continue;
-            }
-            seen_here.push(norm.clone());
-            match issues
-                .iter_mut()
-                .find(|m| normalize_issue_text(&m.text) == norm)
-            {
-                Some(m) => {
-                    if !m.agents.contains(&v.agent_index) {
-                        m.agents.push(v.agent_index);
-                        if v.verdict.score < round.threshold {
-                            m.sources_below_threshold += 1;
-                        }
-                    }
-                }
-                None => issues.push(MergedIssue {
-                    text: issue.clone(),
-                    agents: vec![v.agent_index],
-                    n_valid,
-                    sources_below_threshold: usize::from(v.verdict.score < round.threshold),
-                }),
-            }
-        }
+        let mut seen = std::collections::HashSet::new();
+        by_agent[v.agent_index] = v
+            .verdict
+            .issues_detected
+            .iter()
+            .filter_map(|i| {
+                let n = crate::consensus::normalize_item(i);
+                seen.insert(n.clone()).then_some(n)
+            })
+            .collect();
     }
-    issues
+    by_agent
 }
 
-/// Render the bracket for a merged issue.
-///
-/// Semantics (per spec):
-/// - `[N/N]` when all valid agents agree (N > 1);
-/// - `DISPUTED` when exactly one valid verdict raised the issue (n == 1,
-///   N > 1) or `disputed` is set (synthesis surfaced a genuine contradiction);
-/// - `[1/1]` with an explicit "not cross-checked" note when N == 1;
-/// - `[n/N]` otherwise.
-#[must_use]
-pub(crate) fn bracket_label(issue: &MergedIssue, disputed: bool) -> String {
-    let n = issue.agents.len();
-    let n_valid = issue.n_valid;
-    if n_valid == 1 {
-        "[1/1] single-agent finding, not cross-checked".to_string()
-    } else if disputed || n == 1 {
-        "DISPUTED".to_string()
-    } else {
-        format!("[{n}/{n_valid}]")
-    }
-}
+// ── Synthesis request ──────────────────────────────────────────────────
 
-/// Classify whether two issue texts differ only in numeric details
-/// (line numbers, counts, ranges — locators/evidence, not property
-/// contradictions). Used to veto the LLM's "contradiction" flag: a group
-/// whose members differ only numerically is never a genuine disagreement.
-#[must_use]
-pub(crate) fn issues_differ_only_in_numeric_details(a: &str, b: &str) -> bool {
-    let stripped = |s: &str| -> String {
-        normalize_issue_text(
-            &s.chars()
-                .filter(|c| !(c.is_ascii_digit() || matches!(c, '-' | '–' | ',' | '.' | ':')))
-                .collect::<String>(),
-        )
-    };
-    stripped(a) == stripped(b)
-}
-
-// ── Synthesis output (strict schema — the LLM never produces numbers) ──
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SynthesisMember {
-    /// Agent index whose verbatim issue this member carries (subsumption label).
-    pub agent: usize,
-    /// Verbatim issue text from that agent's verdict list.
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SynthesisGroup {
-    pub heading: String,
-    /// Set by the LLM only for genuine contradictions between agents.
-    #[serde(default)]
-    pub contradiction: bool,
-    pub members: Vec<SynthesisMember>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SynthesisOutput {
-    /// Human-readable overall summary prose.
-    pub summary: String,
-    pub groups: Vec<SynthesisGroup>,
-}
-
-/// Outcome of the synthesis pass: grouped by the LLM, or the deterministic
-/// fallback when the synthesis exhausted its retry budget.
-pub(crate) enum SynthesisOutcome {
-    Grouped(SynthesisOutput),
-    Fallback,
-}
-
-/// Validate the synthesis output against the actual verdicts (membership
-/// evidence — the anti-fabrication invariant).
-///
-/// Rejects:
-/// - a member whose text does not exist verbatim-normalized in that agent's
-///   verdict issue list (fabricated consensus);
-/// - the same issue (by normalized text) appearing more than once across all
-///   groups — double-counting is rejected regardless of which agent's copy
-///   carries it;
-/// - an invalid agent index;
-/// - any number in LLM-authored prose (summary and group headings). Member
-///   text is exempt: it is a verbatim copy and the membership check is
-///   authoritative for it.
-pub(crate) fn validate_synthesis_output(
-    output: &SynthesisOutput,
-    issues_by_agent: &[Vec<String>],
-) -> Result<(), String> {
-    if output.summary.trim().is_empty() {
-        return Err("synthesis summary is empty".to_string());
-    }
-    // Numbers are banned in LLM-authored prose (summary + headings) — checked
-    // even when no groups are present.
-    if contains_number(&output.summary) {
-        return Err(format!(
-            "synthesis summary contains a number: {:?}",
-            output.summary
-        ));
-    }
-    // Each normalized issue text may appear at most once across all groups
-    // (a merged issue carries one member, whichever agent's copy the LLM
-    // chose; the bracket shows how many agents raised it).
-    let mut seen: Vec<String> = Vec::new();
-    for (group_idx, group) in output.groups.iter().enumerate() {
-        if group.heading.trim().is_empty() {
-            return Err(format!("group {group_idx} has an empty heading"));
-        }
-        if contains_number(&group.heading) {
-            return Err(format!(
-                "group {group_idx} heading contains a number: {:?}",
-                group.heading
-            ));
-        }
-        for member in &group.members {
-            let norm = normalize_issue_text(&member.text);
-            let agent = member.agent;
-            let Some(issues) = issues_by_agent.get(agent) else {
-                return Err(format!(
-                    "group {group_idx} references unknown agent index {agent}"
-                ));
-            };
-            if !issues.iter().any(|i| i == &norm) {
-                return Err(format!(
-                    "group {group_idx} member text not found verbatim in agent {agent}'s verdict: {norm:?}"
-                ));
-            }
-            if seen.contains(&norm) {
-                return Err(format!(
-                    "group {group_idx} double-counts the issue: {norm:?}"
-                ));
-            }
-            seen.push(norm);
-        }
-    }
-    Ok(())
-}
-
-/// Reject any number in LLM-authored prose (summary and group headings): the
-/// synthesis prompt forbids ALL numbers there — brackets, counts, scores,
-/// percentages, and standalone digits. Member text is exempt: it is a verbatim
-/// copy of an agent issue and the membership check is authoritative for it.
-fn contains_number(text: &str) -> bool {
-    static NUMBER: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"\d").expect("number regex is valid"));
-    NUMBER.is_match(text)
-}
-
-// ── Synthesis retry loop ────────────────────────────────────────────────
+/// Max output tokens for the pipeline grouping pass: raised above the old
+/// budget (8K) — probes truncated at 4K output on 36-issue rounds; 16K is the
+/// floor for claim-length rounds.
+const PIPELINE_GROUPING_MAX_TOKENS: u32 = 16_000;
 
 /// Build the synthesis chat request for a stage role (the stage role's own
 /// model, reasoning effort, and provider routing — no separate grouping
-/// model).
-fn synthesis_request(round: &JointRound<'_>, role: Role) -> ChatRequest {
-    let system = crate::prompt::load_prompt("synthesis.md");
+/// model). The shared contradiction package is appended to the system prompt;
+/// the general workspace context is prepended by [`consensus::run_grouping`].
+fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> ChatRequest {
+    let system = format!(
+        "{}\n\n{}",
+        crate::prompt::load_prompt("synthesis.md"),
+        crate::prompt::load_prompt("grouping_contradictions.md"),
+    );
     let mut material = String::new();
-    for v in &round.verdicts {
+    for (agent_idx, issues) in issues_by_agent(round).into_iter().enumerate() {
+        if issues.is_empty() {
+            continue;
+        }
         // Agent labels are ZERO-BASED and match the schema's `agent` field —
         // a faithful LLM can copy the label directly into the JSON. Scores are
         // deliberately NOT included: they are not needed for grouping, and a
-        // faithful LLM echoing one would be rejected (the LLM never produces
-        // numbers — the renderer adds scores from code).
-        let _ = std::fmt::write(&mut material, format_args!("Agent {}:\n", v.agent_index));
-        for issue in &v.verdict.issues_detected {
+        // faithful LLM echoing one would be rejected (the renderer adds
+        // scores/severity from code).
+        let _ = std::fmt::write(&mut material, format_args!("Agent {agent_idx}:\n"));
+        for issue in issues {
             let _ = writeln!(material, "- {issue}");
         }
     }
@@ -311,11 +134,11 @@ fn synthesis_request(round: &JointRound<'_>, role: Role) -> ChatRequest {
     let model = crate::config::CONFIG.role_model(role);
     let routing = crate::config::CONFIG.model_routing(&model);
     ChatRequest {
-        messages: vec![ChatMessage::system(system), ChatMessage::user(user)],
+        messages: vec![ChatMessage::system(&system), ChatMessage::user(&user)],
         tools: None,
         model,
         allow_image_parts: false,
-        max_tokens: Some(8_000),
+        max_tokens: Some(PIPELINE_GROUPING_MAX_TOKENS),
         reasoning_effort: Some(crate::config::CONFIG.role_reasoning_effort(role)),
         provider_order: routing.provider_order,
         provider_allow_fallbacks: routing.allow_fallbacks,
@@ -324,144 +147,51 @@ fn synthesis_request(round: &JointRound<'_>, role: Role) -> ChatRequest {
             purpose: "synthesis",
             agent_id: format!("joint_verdict_{}", crate::generate_suffix()),
             role: role.as_str().to_string(),
-            workspace: String::new(),
+            workspace: ws.name.clone(),
             ticket_id: None,
         }),
     }
-}
-
-/// Run the single LLM synthesis pass with the dedicated retry policy
-/// (3 attempts, 30–45 s backoff). Every failure — transport, unparseable
-/// output, or membership-validation rejection — retries; a validation
-/// rejection is fed back into the next attempt so the LLM can self-correct.
-/// Exhaustion yields the deterministic fallback (never a fabricated comment).
-#[allow(clippy::cast_possible_truncation)]
-pub(crate) async fn run_synthesis(
-    round: &JointRound<'_>,
-    role: Role,
-    ws_name: &str,
-) -> SynthesisOutcome {
-    let _call = crate::call_registry::NON_AGENT_CALLS.register("synthesis", ws_name);
-    let policy = RetryPolicy::synthesis_from_config();
-    let mut loop_state = RetryLoop::new(&policy);
-    let mut request = synthesis_request(round, role);
-    // Key the per-agent issue lists by the ORIGINAL dispatch index (the label
-    // the LLM sees in the input) — never a compacted 0..n_valid-1 space. A
-    // failed agent's slot stays empty, so a member referencing it is rejected.
-    let mut issues_by_agent: Vec<Vec<String>> = vec![Vec::new(); round.dispatched];
-    for v in &round.verdicts {
-        issues_by_agent[v.agent_index] = v
-            .verdict
-            .issues_detected
-            .iter()
-            .map(|i| normalize_issue_text(i))
-            .collect();
-    }
-
-    for attempt in 1..=policy.max_attempts {
-        if loop_state.expired() {
-            break;
-        }
-        let attempt_started = Instant::now();
-        match crate::providers::chat_scoped(
-            request.clone(),
-            policy.idle_timeout,
-            loop_state.deadline(),
-        )
-        .await
-        {
-            Ok(resp) => {
-                let raw = resp.text_or_empty();
-                match crate::util::json::parse_fenced_json::<SynthesisOutput>(raw) {
-                    Ok(output) => match validate_synthesis_output(&output, &issues_by_agent) {
-                        Ok(()) => {
-                            tracing::info!(
-                                stage = round.stage,
-                                agents = round.dispatched,
-                                groups = output.groups.len(),
-                                "Joint verdict synthesis succeeded",
-                            );
-                            return SynthesisOutcome::Grouped(output);
-                        }
-                        Err(msg) => {
-                            // Feed the rejection back so the next attempt can
-                            // self-correct instead of re-failing identically.
-                            if let Some(last) = request.messages.last_mut() {
-                                let _ = std::fmt::write(
-                                    &mut last.content,
-                                    format_args!(
-                                        "\n\nYour previous response was rejected: {msg}.\n\
-                                         Fix the violation and try again."
-                                    ),
-                                );
-                            }
-                            let err = anyhow::anyhow!("synthesis validation failed: {msg}");
-                            let rec = RetryFailureRecord::new_simple(
-                                attempt,
-                                FailureClass::Parse,
-                                &err,
-                                attempt_started.elapsed().as_millis() as u64,
-                                None,
-                            );
-                            loop_state.record(attempt, rec).await;
-                        }
-                    },
-                    Err(e) => {
-                        let rec = RetryFailureRecord::new_simple(
-                            attempt,
-                            FailureClass::Parse,
-                            &e,
-                            attempt_started.elapsed().as_millis() as u64,
-                            None,
-                        );
-                        loop_state.record(attempt, rec).await;
-                    }
-                }
-            }
-            Err(err) => {
-                let non_retryable = !err.class.is_retryable();
-                loop_state.record(attempt, err.record).await;
-                if non_retryable {
-                    break;
-                }
-            }
-        }
-        if let Err(FailureClass::Shutdown) = loop_state.sleep_between(attempt).await {
-            break;
-        }
-    }
-
-    tracing::warn!(
-        stage = round.stage,
-        agents = round.dispatched,
-        attempts = policy.max_attempts,
-        "Joint verdict synthesis exhausted — writing deterministic fallback comment",
-    );
-    SynthesisOutcome::Fallback
 }
 
 /// Convenience: run the synthesis pass and render the joint comment.
 pub(crate) async fn build_joint_comment(
     round: &JointRound<'_>,
     role: Role,
-    ws_name: &str,
+    ws: &Workspace,
 ) -> String {
-    let outcome = run_synthesis(round, role, ws_name).await;
+    let outcome = run_synthesis(round, role, ws).await;
     render_joint_comment(round, &outcome)
+}
+
+/// Run the single LLM grouping pass through the shared consensus core
+/// (3 attempts, 30–45 s backoff, rejection feedback, deterministic fail-open).
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) async fn run_synthesis(
+    round: &JointRound<'_>,
+    role: Role,
+    ws: &Workspace,
+) -> crate::consensus::GroupingOutcome {
+    let request = synthesis_request(round, role, ws);
+    let items = issues_by_agent(round);
+    crate::consensus::run_grouping(ws, "synthesis", request, &items).await
 }
 
 // ── Joint comment rendering ─────────────────────────────────────────────
 
 /// Render the joint comment for a round given the synthesis outcome.
 ///
-/// Structure: header (code-computed counts), issues with code-computed
-/// brackets (grouped by the LLM when synthesis succeeded, deterministic
-/// otherwise), per-agent critiques, the LLM summary prose (or an explicit
-/// "LLM grouping unavailable" marker), and a raw-dump appendix for failed
-/// agents.
+/// Structure: header (code-computed counts), groups with code-computed
+/// brackets from distinct cited agent ids (grouped by the LLM when synthesis
+/// succeeded, raw member dump otherwise), the LLM-attributed ungrouped list in
+/// a deterministic trailing section, per-agent critiques, the LLM summary
+/// prose (or an explicit "LLM grouping unavailable" marker), and a raw-dump
+/// appendix for failed agents.
 #[must_use]
 #[allow(clippy::too_many_lines)]
-pub(crate) fn render_joint_comment(round: &JointRound<'_>, outcome: &SynthesisOutcome) -> String {
+pub(crate) fn render_joint_comment(
+    round: &JointRound<'_>,
+    outcome: &crate::consensus::GroupingOutcome,
+) -> String {
     let mut out = String::new();
     let n_valid = round.n_valid();
     let _ = std::fmt::write(
@@ -477,69 +207,37 @@ pub(crate) fn render_joint_comment(round: &JointRound<'_>, outcome: &SynthesisOu
         let _ = write!(out, "\n{}", round.header);
     }
 
-    // Issues with brackets — grouped by the LLM when available. Only rendered
-    // when the round actually produced issues.
-    let issues = merge_issues(round);
-    if !issues.is_empty() {
-        // Normalized texts already placed in a group (issue-level: a merged
-        // issue is placed once, whichever agent's copy the LLM chose).
-        let mut used: Vec<String> = Vec::new();
-        if let SynthesisOutcome::Grouped(output) = outcome {
-            for group in &output.groups {
-                let mut lines: Vec<String> = Vec::new();
-                for member in &group.members {
-                    let norm = normalize_issue_text(&member.text);
-                    // Validation guarantees this member maps to a merged issue
-                    // (both derive from the same verdicts) — direct lookup.
-                    let issue = issues
-                        .iter()
-                        .find(|m| {
-                            normalize_issue_text(&m.text) == norm
-                                && m.agents.contains(&member.agent)
-                        })
-                        .expect("validated synthesis member maps to a merged issue");
-                    let other_texts: Vec<&str> = group
-                        .members
-                        .iter()
-                        .filter(|m| m.agent != member.agent)
-                        .map(|m| m.text.as_str())
-                        .collect();
-                    let numeric_only = !other_texts.is_empty()
-                        && other_texts
-                            .iter()
-                            .all(|t| issues_differ_only_in_numeric_details(&member.text, t));
-                    let disputed = group.contradiction && !numeric_only;
-                    lines.push(render_issue_line(issue, disputed));
-                    if !used.contains(&norm) {
-                        used.push(norm);
+    // Issues with brackets — grouped by the LLM when available.
+    let items = issues_by_agent(round);
+    let has_issues = items.iter().any(|list| !list.is_empty());
+    if has_issues {
+        match outcome {
+            crate::consensus::GroupingOutcome::Grouped(output) => {
+                for group in &output.groups {
+                    let n = crate::consensus::distinct_agents(group).len();
+                    let bracket = crate::consensus::bracket_label(n, n_valid, group.contradiction);
+                    let _ = write!(out, "\n\n**{}** {bracket}", group.heading);
+                    for member in &group.members {
+                        let _ = write!(out, "\n- {}", render_member_line(round, member));
                     }
                 }
-                if lines.is_empty() {
-                    continue;
-                }
-                let _ = write!(out, "\n\n**{}**", group.heading);
-                for line in &lines {
-                    let _ = write!(out, "\n- {line}");
-                }
-            }
-            // Deterministic catch-all for issues the LLM did not group.
-            let mut remaining: Vec<String> = Vec::new();
-            for issue in &issues {
-                let norm = normalize_issue_text(&issue.text);
-                if !used.contains(&norm) {
-                    remaining.push(render_issue_line(issue, false));
+                // LLM-attributed ungrouped list — deterministic trailing
+                // section (validation guarantees nothing was silently dropped).
+                if !output.ungrouped.is_empty() {
+                    out.push_str("\n\n**Ungrouped**");
+                    for member in &output.ungrouped {
+                        let _ = write!(out, "\n- {}", render_member_line(round, member));
+                    }
                 }
             }
-            if !remaining.is_empty() {
-                out.push_str("\n\n**Remaining issues**");
-                for line in remaining {
-                    let _ = write!(out, "\n- {line}");
+            crate::consensus::GroupingOutcome::Fallback => {
+                // Deterministic fail-open: raw per-agent issue dump + marker.
+                out.push_str("\n\n**Issues**");
+                for (agent_idx, list) in items.iter().enumerate() {
+                    for text in list {
+                        let _ = write!(out, "\n- Agent {agent_idx}: {text}");
+                    }
                 }
-            }
-        } else {
-            out.push_str("\n\n**Issues**");
-            for issue in &issues {
-                let _ = write!(out, "\n- {}", render_issue_line(issue, false));
             }
         }
     }
@@ -573,12 +271,14 @@ pub(crate) fn render_joint_comment(round: &JointRound<'_>, outcome: &SynthesisOu
 
     // LLM summary or explicit fallback marker.
     match outcome {
-        SynthesisOutcome::Grouped(output) => {
+        crate::consensus::GroupingOutcome::Grouped(output) => {
             out.push_str("\n\n### Summary");
             let _ = write!(out, "\n{}", output.summary.trim());
         }
-        SynthesisOutcome::Fallback => {
-            out.push_str("\n\n### Summary\nLLM grouping unavailable — deterministic merge only.");
+        crate::consensus::GroupingOutcome::Fallback => {
+            out.push_str(
+                "\n\n### Summary\nLLM grouping unavailable — deterministic member dump only.",
+            );
         }
     }
 
@@ -597,14 +297,16 @@ pub(crate) fn render_joint_comment(round: &JointRound<'_>, outcome: &SynthesisOu
     )
 }
 
-fn render_issue_line(issue: &MergedIssue, disputed: bool) -> String {
-    let bracket = bracket_label(issue, disputed);
-    let severity = if issue.sources_below_threshold > 0 {
-        "[blocker] "
-    } else {
-        ""
-    };
-    format!("{bracket} {severity}{}", issue.text)
+/// Render one member line: `Agent N: text` with a `[blocker]` prefix when the
+/// cited agent's verdict scored below the round threshold (code-computed
+/// severity — the LLM never produces it).
+fn render_member_line(round: &JointRound<'_>, member: &crate::consensus::GroupingMember) -> String {
+    let blocker = round
+        .verdicts
+        .iter()
+        .any(|v| v.agent_index == member.agent && v.verdict.score < round.threshold);
+    let severity = if blocker { "[blocker] " } else { "" };
+    format!("{severity}Agent {}: {}", member.agent, member.text)
 }
 
 // ── Calibrated dynamic agent counts ─────────────────────────────────────

@@ -7,10 +7,11 @@
 //! agent channel via [`crate::message_router::route`].
 //!
 //! Analyst batches run three decorrelated analysts (distinct research angles)
-//! that report structured claim-level findings; consolidation merges at claim
-//! level, grades per-claim agreement, and runs exactly one targeted
-//! verification pass for disputed claims or surfaced contradictions.
-//! Fail-open is preserved throughout: findings are never silently lost.
+//! that report structured claim-level findings; consolidation runs the shared
+//! LLM grouping pass ([`crate::consensus`]) — semantic grouping + contradiction
+//! judgment with code-computed agreement brackets. The verification pass for
+//! disputed claims lives in the deep research tool only. Fail-open is
+//! preserved throughout: findings are never silently lost.
 
 use crate::agent::run_agent;
 use crate::config::CONFIG;
@@ -18,9 +19,7 @@ use crate::message_router::{self, AgentJob, JobKind};
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::session::{ask_agent_id, resolve_agent_id};
 use crate::tools::Tool;
-use crate::{
-    Agent, ChatMessage, ChatRequest, ChatRequestMeta, DEFAULT_MAX_TOKENS, Role, Workspace,
-};
+use crate::{Agent, DEFAULT_MAX_TOKENS, Role, Workspace};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::future::join_all;
@@ -270,29 +269,6 @@ enum AnalystOutcome {
     ParseFailed { raw: String, failure: String },
 }
 
-/// A claim merged across analysts with per-claim agreement grading.
-#[derive(Debug, Clone)]
-struct MergedClaim {
-    claim: String,
-    /// Indices of the analysts (0-based) that stated this claim.
-    analysts: Vec<usize>,
-    sources: Vec<String>,
-    contradictions: Vec<String>,
-    confidence: String,
-}
-
-impl MergedClaim {
-    fn agreement(&self) -> usize {
-        self.analysts.len()
-    }
-
-    /// Disputed claims (1/3 agreement) or claims with surfaced contradictions
-    /// trigger the targeted verification pass.
-    fn is_disputed(&self) -> bool {
-        self.agreement() == 1 || !self.contradictions.is_empty()
-    }
-}
-
 /// Verdict of a single targeted claim verification. Shared with the deep
 /// research tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,13 +308,9 @@ pub(crate) fn validate_verification_verdict(v: &VerificationVerdict) -> Result<(
     }
 }
 
-/// Cap on verification analysts spawned per ask (exactly one pass, bounded).
-/// Also used by the deep research tool's verification gate.
+/// Cap on verification analysts spawned by the deep research tool's
+/// verification gate (exactly one pass, bounded).
 pub(crate) const VERIFY_MAX_ANALYSTS: usize = 4;
-
-/// Embedding similarity for claim-level merge (top of the 0.85–0.90 band —
-/// conservative so only clearly-equivalent claims merge into one graded claim).
-pub(crate) const CLAIM_MERGE_SIMILARITY_THRESHOLD: f32 = 0.90;
 
 // ── Parallel analyst batch ───────────────────────────────────────────────
 
@@ -400,7 +372,8 @@ async fn run_parallel_analysts(
 }
 
 /// Consolidate analyst runs: 0 valid → error, 1 valid → raw passthrough,
-/// ≥2 valid → extract findings, merge at claim level, verify, synthesize.
+/// ≥2 valid → extract findings and run the shared grouping pass (≥2 with
+/// parseable claims group; a single parseable source skips grouping).
 async fn consolidate_analyst_runs(
     ws: &Workspace,
     ask: &str,
@@ -467,198 +440,209 @@ async fn extract_findings(runs: Vec<(Agent, Option<String>)>) -> Vec<AnalystOutc
     join_all(futures).await
 }
 
-/// Merge findings at claim level and grade per-claim agreement (3/3, 2/3,
-/// 1/3). Claims are matched by [`ClaimKey`] — exact-normalized text first,
-/// then embedding similarity (numeric literals must not disagree), so
-/// similarly phrased claims from decorrelated analysts grade as agreement
-/// instead of fragmenting into artificial disputes. Contradictions are
-/// surfaced, never resolved by fiat.
-fn merge_and_grade(outcomes: &[AnalystOutcome]) -> (Vec<MergedClaim>, Vec<String>, Vec<String>) {
-    let mut coverage: Vec<String> = Vec::new();
-    let mut unanswered: Vec<String> = Vec::new();
-    let mut merged: Vec<(MergedClaim, ClaimKey)> = Vec::new();
-    for (i, outcome) in outcomes.iter().enumerate() {
-        let AnalystOutcome::Findings { findings, .. } = outcome else {
-            continue;
+/// Consolidate extracted outcomes: build the per-agent claim lists and run the
+/// shared LLM grouping pass (semantic grouping + contradiction judgment).
+/// ≥2 valid responses go through grouping; the output contract is
+/// summary + groups + optional ungrouped list, with brackets computed from
+/// distinct cited agent ids. Fail-open: on grouping exhaustion, deliver the
+/// flat claim list plus raw analyst dumps with an explicit marker — never a
+/// fabricated consensus.
+async fn consolidate_findings(
+    ws: &Workspace,
+    ask: &str,
+    outcomes: Vec<AnalystOutcome>,
+) -> Result<String> {
+    // Per-agent claim texts (agent index = outcome index; failed agents get an
+    // empty list so the label space matches the input material). Per-agent
+    // duplicates are deduped (raw + normalized in lockstep) so the LLM input
+    // and the validation universe both carry unique items.
+    let mut items_by_agent: Vec<Vec<String>> = Vec::with_capacity(outcomes.len());
+    let mut items: Vec<Vec<String>> = Vec::with_capacity(outcomes.len());
+    for o in &outcomes {
+        let claims = match o {
+            AnalystOutcome::Findings { findings, .. } => {
+                findings.claims.iter().map(|c| c.claim.clone()).collect()
+            }
+            _ => Vec::new(),
         };
-        coverage.extend(findings.coverage.iter().cloned());
-        unanswered.extend(findings.unanswered.iter().cloned());
-        for c in &findings.claims {
-            let key = ClaimKey::new(&c.claim);
-            if let Some((g, _)) = merged
-                .iter_mut()
-                .find(|(_, k)| key.equivalent_to(k, CLAIM_MERGE_SIMILARITY_THRESHOLD))
-            {
-                if !g.analysts.contains(&i) {
-                    g.analysts.push(i);
-                }
-                if !c.source.is_empty() && !g.sources.contains(&c.source) {
-                    g.sources.push(c.source.clone());
-                }
-                for x in &c.contradictions {
-                    if !g.contradictions.contains(x) {
-                        g.contradictions.push(x.clone());
-                    }
-                }
-                g.confidence = max_confidence(&g.confidence, &c.confidence);
-            } else {
-                merged.push((
-                    MergedClaim {
-                        claim: c.claim.trim().to_string(),
-                        analysts: vec![i],
-                        sources: if c.source.is_empty() {
-                            Vec::new()
-                        } else {
-                            vec![c.source.clone()]
-                        },
-                        contradictions: c.contradictions.clone(),
-                        confidence: c.confidence.clone(),
-                    },
-                    key,
-                ));
+        let mut seen = std::collections::HashSet::new();
+        let mut raw = Vec::new();
+        let mut norm = Vec::new();
+        for c in claims {
+            let n = crate::consensus::normalize_item(&c);
+            if seen.insert(n.clone()) {
+                raw.push(c);
+                norm.push(n);
+            }
+        }
+        items_by_agent.push(raw);
+        items.push(norm);
+    }
+    let n_valid = items_by_agent.iter().filter(|l| !l.is_empty()).count();
+    if n_valid == 0 {
+        // No valid response produced parseable claims — fail open with raw
+        // reports and the per-analyst reasons (nothing silently lost). The
+        // marker distinguishes extraction failures from zero-claim reports.
+        let has_parse_failures = outcomes
+            .iter()
+            .any(|o| matches!(o, AnalystOutcome::ParseFailed { .. }));
+        let raw_dump = render_raw_analyst_dump(&outcomes);
+        let failures = render_extraction_failures(&outcomes);
+        let marker = if has_parse_failures {
+            "unconsolidated — findings extraction failed"
+        } else {
+            "unconsolidated — no extractable claims from any analyst"
+        };
+        return Ok(format!(
+            "## Analyst Reports\n\n({marker})\n\n{failures}\n\n{raw_dump}"
+        ));
+    }
+    if n_valid == 1 {
+        // Only one analyst produced parseable claims — a grouping pass over a
+        // single source cannot produce agreement brackets or contradictions,
+        // so skip the provider call and deliver the flat claim list + raw
+        // dumps with an explicit marker.
+        tracing::info!("Single-analyst consolidation — skipping grouping pass");
+        let flat = render_flat_claim_list(&items_by_agent);
+        let raw_dump = render_raw_analyst_dump(&outcomes);
+        return Ok(format!(
+            "## Analyst Reports\n\n(only one analyst produced parseable claims — grouping skipped)\n\n{flat}\n\n{raw_dump}"
+        ));
+    }
+    // User material: numbered per-agent claims (verbatim — no source or
+    // confidence appended to member text).
+    let mut material = String::new();
+    for (agent_idx, claims) in items_by_agent.iter().enumerate() {
+        if claims.is_empty() {
+            continue;
+        }
+        let _ = writeln!(material, "Agent {agent_idx}:");
+        for (i, c) in claims.iter().enumerate() {
+            let _ = writeln!(material, "- {i}: {c}");
+        }
+    }
+    let user = format!("# Original Question\n\n{ask}\n\n# Agent Claims (verbatim)\n\n{material}");
+
+    let model = CONFIG.role_model(Role::Analyst);
+    let routing = CONFIG.model_routing(&model);
+    let system = format!(
+        "{}\n\n{}",
+        load_prompt("consolidate/analyst.md"),
+        load_prompt("grouping_contradictions.md"),
+    );
+    let request = crate::consensus::grouping_request(
+        ws,
+        "consolidate",
+        &system,
+        &user,
+        model,
+        Some(CONFIG.role_reasoning_effort(Role::Analyst)),
+        routing.provider_order,
+        routing.allow_fallbacks,
+        Some(DEFAULT_MAX_TOKENS),
+    );
+
+    match crate::consensus::run_grouping(ws, "consolidate", request, &items).await {
+        crate::consensus::GroupingOutcome::Grouped(output) => {
+            Ok(render_ask_groups(ask, &output, n_valid, &outcomes))
+        }
+        crate::consensus::GroupingOutcome::Fallback => {
+            // Fail-open deliverable: flat numbered claim list (the grouping
+            // input) + raw analyst dumps + explicit marker. The marker is
+            // head-placed so the sync path's 5 KB sandwich truncation keeps it.
+            tracing::warn!("Analyst consolidation failed — delivering raw claim list");
+            let flat = render_flat_claim_list(&items_by_agent);
+            let raw_dump = render_raw_analyst_dump(&outcomes);
+            Ok(format!(
+                "## Analyst Reports\n\n(unconsolidated — consolidation failed)\n\n{flat}\n\n{raw_dump}"
+            ))
+        }
+    }
+}
+
+/// Render the ask output contract: summary + groups (heading, contradiction
+/// flag, members citing agent+claim indices) + optional ungrouped list.
+/// Brackets [n/N] come from distinct cited agent ids; DISPUTED appears only
+/// when the group's contradiction flag is true. Self-reported caveats of a
+/// cited claim render as member metadata, never as contradictions.
+#[must_use]
+fn render_ask_groups(
+    ask: &str,
+    output: &crate::consensus::GroupingOutput,
+    n_valid: usize,
+    outcomes: &[AnalystOutcome],
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "{}", output.summary.trim());
+    for group in &output.groups {
+        let n = crate::consensus::distinct_agents(group).len();
+        let bracket = crate::consensus::bracket_label(n, n_valid, group.contradiction);
+        let _ = write!(out, "\n\n**{}** {bracket}", group.heading);
+        for member in &group.members {
+            let caveat = member_caveat(member, outcomes);
+            let _ = write!(out, "\n- {}", crate::consensus::render_member_line(member));
+            if let Some(c) = caveat {
+                let _ = write!(out, " — caveat: {c}");
             }
         }
     }
-    merged.sort_by(|(a, _), (b, _)| {
-        b.analysts
-            .len()
-            .cmp(&a.analysts.len())
-            .then_with(|| a.claim.to_lowercase().cmp(&b.claim.to_lowercase()))
-    });
-    let merged: Vec<MergedClaim> = merged.into_iter().map(|(g, _)| g).collect();
-    (
-        merged,
-        dedup_preserve_order(&coverage),
-        dedup_preserve_order(&unanswered),
-    )
+    if !output.ungrouped.is_empty() {
+        out.push_str("\n\n**Ungrouped**");
+        for member in &output.ungrouped {
+            let caveat = member_caveat(member, outcomes);
+            let _ = write!(out, "\n- {}", crate::consensus::render_member_line(member));
+            if let Some(c) = caveat {
+                let _ = write!(out, " — caveat: {c}");
+            }
+        }
+    }
+    // Original question for context (answers are delivered out of band).
+    let _ = write!(out, "\n\n_Original question: {ask}_");
+    out
 }
 
+/// Look up a cited member's self-reported caveats (the claim's own
+/// `contradictions` field — analyst self-report, NOT a group contradiction).
+fn member_caveat(
+    member: &crate::consensus::GroupingMember,
+    outcomes: &[AnalystOutcome],
+) -> Option<String> {
+    let AnalystOutcome::Findings { findings, .. } = outcomes.get(member.agent)? else {
+        return None;
+    };
+    let norm = crate::consensus::normalize_item(&member.text);
+    let claim = findings
+        .claims
+        .iter()
+        .find(|c| crate::consensus::normalize_item(&c.claim) == norm)?;
+    if claim.contradictions.is_empty() {
+        None
+    } else {
+        Some(claim.contradictions.join("; "))
+    }
+}
+
+/// Render the flat numbered claim list (the grouping-pass input) for the
+/// fail-open deliverable.
+#[must_use]
+fn render_flat_claim_list(items_by_agent: &[Vec<String>]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "### Claims (grouping input)");
+    for (agent_idx, claims) in items_by_agent.iter().enumerate() {
+        for (i, c) in claims.iter().enumerate() {
+            let _ = writeln!(out, "{}. [Agent {agent_idx}] {c}", i + 1);
+        }
+    }
+    out
+}
+
+/// Normalize a claim for deterministic comparisons (QueryLedger, marginal-gap
+/// saturation). Shared with the deep research tool.
 pub(crate) fn normalize_claim(s: &str) -> String {
     s.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
-}
-
-/// Claim match key: normalized text, lazily-computed embedding, and numeric
-/// literals. Exact-normalized equality wins (no embedding needed); otherwise
-/// embedding similarity must clear the caller's threshold AND the numeric
-/// literal sets must not disagree — "X costs $100 in 2024" and "X costs $200
-/// in 2024" never merge into a single claim, so contradictions surface
-/// instead of being averaged away. [`ClaimKey::equivalent_to`] short-circuits
-/// both those cases before computing embeddings, so the common all-agree case
-/// never touches the embedder. Shared with the deep research tool's novelty
-/// check (`research.rs`).
-#[derive(Debug)]
-pub(crate) struct ClaimKey {
-    norm: String,
-    embedding: std::sync::OnceLock<Option<Vec<f32>>>,
-    numeric: std::collections::HashSet<String>,
-}
-
-impl ClaimKey {
-    pub(crate) fn new(s: &str) -> Self {
-        Self {
-            norm: normalize_claim(s),
-            // Computed on first need — `equivalent_to` short-circuits exact
-            // matches and numeric conflicts before calling this, so the
-            // common all-agree case never touches the embedder. Test builds
-            // skip the embedder entirely (it races tests: panic on unset
-            // CONFIG, or spawn the download loop inside a tokio test
-            // runtime) and use the exact-match fallback.
-            embedding: std::sync::OnceLock::new(),
-            numeric: s
-                .split(|c: char| !c.is_ascii_digit())
-                .filter(|t| !t.is_empty())
-                .map(str::to_string)
-                .collect(),
-        }
-    }
-
-    fn embedding(&self) -> Option<&[f32]> {
-        self.embedding
-            .get_or_init(|| {
-                #[cfg(test)]
-                {
-                    None
-                }
-                #[cfg(not(test))]
-                {
-                    crate::embedder::embed_query(&self.norm)
-                }
-            })
-            .as_deref()
-    }
-
-    pub(crate) fn equivalent_to(&self, other: &ClaimKey, threshold: f32) -> bool {
-        // Exact matches and numeric conflicts decide without embeddings —
-        // short-circuit before touching the embedder (the common all-agree
-        // case never initializes it).
-        if let Some(decided) =
-            equivalence_short_circuit(&self.norm, &self.numeric, &other.norm, &other.numeric)
-        {
-            return decided;
-        }
-        match (self.embedding(), other.embedding()) {
-            (Some(a), Some(b)) => crate::vector::cosine_similarity(a, b) >= threshold,
-            _ => false,
-        }
-    }
-}
-
-/// Pure short-circuit shared by [`ClaimKey::equivalent_to`] and
-/// [`claims_equivalent`]: identical normalized text is equivalent; claims
-/// that both carry numeric literals but different ones never merge (a shared
-/// token like a year must not defeat the guard). `None` means the decision
-/// needs embedding similarity.
-fn equivalence_short_circuit(
-    norm_a: &str,
-    numbers_a: &std::collections::HashSet<String>,
-    norm_b: &str,
-    numbers_b: &std::collections::HashSet<String>,
-) -> Option<bool> {
-    if norm_a == norm_b {
-        Some(true)
-    } else if !numbers_a.is_empty() && !numbers_b.is_empty() && numbers_a != numbers_b {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-/// Pure claim-equivalence decision, the tested oracle for
-/// [`ClaimKey::equivalent_to`] (production goes through the method, which
-/// short-circuits before computing embeddings). Exact-normalized text wins;
-/// otherwise claims that both carry numeric literals but different ones
-/// never merge (contradictions surface instead of being averaged away) and
-/// embedding similarity must clear the threshold. Without embeddings the
-/// check degrades to exact-match-only.
-#[cfg(test)]
-pub(crate) fn claims_equivalent(
-    norm_a: &str,
-    numbers_a: &std::collections::HashSet<String>,
-    emb_a: Option<&[f32]>,
-    norm_b: &str,
-    numbers_b: &std::collections::HashSet<String>,
-    emb_b: Option<&[f32]>,
-    threshold: f32,
-) -> bool {
-    if let Some(decided) = equivalence_short_circuit(norm_a, numbers_a, norm_b, numbers_b) {
-        return decided;
-    }
-    match (emb_a, emb_b) {
-        (Some(a), Some(b)) => crate::vector::cosine_similarity(a, b) >= threshold,
-        _ => false,
-    }
-}
-
-fn dedup_preserve_order(items: &[String]) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    items
-        .iter()
-        .filter(|&s| seen.insert(s.clone()))
-        .cloned()
-        .collect()
 }
 
 /// Max of two confidence tiers ("low" < "medium" < "high"). Shared with the
@@ -676,59 +660,8 @@ pub(crate) fn max_confidence(a: &str, b: &str) -> String {
     }
 }
 
-/// Consolidate extracted outcomes: merge at claim level, run exactly one
-/// verification pass for disputed claims, then synthesize the final report.
-/// Fail-open at every step — findings are never silently lost.
-async fn consolidate_findings(
-    ws: &Workspace,
-    ask: &str,
-    outcomes: Vec<AnalystOutcome>,
-) -> Result<String> {
-    let (merged, coverage, unanswered) = merge_and_grade(&outcomes);
-    if merged.is_empty() {
-        // All valid responses failed extraction — fail open with raw reports.
-        let raw_dump = render_raw_analyst_dump(&outcomes);
-        return Ok(format!(
-            "## Analyst Reports\n\n(unconsolidated — findings extraction failed)\n\n{raw_dump}"
-        ));
-    }
-    let verification = run_verification_pass(ws, &merged).await;
-    synthesize_claim_report(
-        ws,
-        ask,
-        &merged,
-        &coverage,
-        &unanswered,
-        &verification,
-        &outcomes,
-    )
-    .await
-}
-
-/// Run exactly one targeted verification pass: a fresh analyst per disputed
-/// claim (1/3 agreement or surfaced contradictions), bounded by
-/// [`VERIFY_MAX_ANALYSTS`]. No recursion — anything still disputed after the
-/// pass is marked unresolved in the final report.
-async fn run_verification_pass(ws: &Workspace, merged: &[MergedClaim]) -> Vec<VerificationResult> {
-    let disputed: Vec<VerificationTarget> = merged
-        .iter()
-        .filter(|c| c.is_disputed())
-        .map(|c| {
-            VerificationTarget::new(
-                &c.claim,
-                &c.sources.join("; "),
-                &c.contradictions.join("; "),
-            )
-        })
-        .collect();
-    if disputed.is_empty() {
-        return Vec::new();
-    }
-    dispatch_verifiers(ws, &format!("ask_{}_verify", ws.name), &disputed, "").await
-}
-
-/// One claim targeted for verification plus the material fed into the fresh
-/// analyst's task.
+/// One claim targeted for verification by the deep research tool's
+/// verification gate, plus the material fed into the fresh analyst's task.
 pub(crate) struct VerificationTarget {
     pub(crate) claim: String,
     pub(crate) sources: String,
@@ -884,96 +817,6 @@ async fn run_claim_verifier(
     }
 }
 
-/// One-shot LLM synthesis over the deterministic claim-level report.
-///
-/// The synthesis input is the claim report (per-claim agreement grades,
-/// surfaced contradictions, verification results) — the LLM writes the final
-/// prose answer but cannot silently average away graded disagreements.
-/// Fail-open: synthesis failure delivers the claim report plus raw analyst
-/// reports with an explicit marker — findings are never lost.
-#[allow(clippy::too_many_arguments)]
-async fn synthesize_claim_report(
-    ws: &Workspace,
-    ask: &str,
-    merged: &[MergedClaim],
-    coverage: &[String],
-    unanswered: &[String],
-    verification: &[VerificationResult],
-    outcomes: &[AnalystOutcome],
-) -> Result<String> {
-    let _call = crate::call_registry::NON_AGENT_CALLS.register("consolidate", &ws.name);
-    let model = CONFIG.role_model(Role::Analyst);
-    let routing = CONFIG.model_routing(&model);
-    let prompt_template = load_prompt("consolidate/analyst.md");
-
-    // System messages: general workspace context first, then the filled
-    // template (instructions + original_ask only).
-    let mut messages = Vec::with_capacity(3);
-    crate::prompt::prepend_general_context(&mut messages, ws).await;
-    messages.push(ChatMessage::system(substitute(
-        &prompt_template,
-        &[("{{original_ask}}", ask)],
-    )));
-
-    // User message = deterministic claim-level report only.
-    let claim_report =
-        render_claim_report(ask, merged, coverage, unanswered, verification, outcomes);
-    let user_content = format!("## Claim-level Findings\n\n{claim_report}");
-    messages.push(ChatMessage::user(&user_content));
-
-    let request = ChatRequest {
-        messages,
-        tools: None,
-        model,
-        allow_image_parts: false,
-        max_tokens: Some(DEFAULT_MAX_TOKENS),
-        reasoning_effort: Some(CONFIG.role_reasoning_effort(Role::Analyst)),
-        provider_order: routing.provider_order,
-        provider_allow_fallbacks: routing.allow_fallbacks,
-        response_format_json_object: false,
-        meta: Some(ChatRequestMeta {
-            purpose: "consolidate",
-            agent_id: format!("ask_{}_consolidation", ws.name),
-            role: Role::Analyst.as_str().to_string(),
-            workspace: ws.name.clone(),
-            ticket_id: None,
-        }),
-    };
-
-    let policy = crate::retry::RetryPolicy::current();
-    match crate::retry::retry_chat(request, &policy).await {
-        // retry_chat only returns Ok with non-empty (trimmed) text —
-        // empty responses are classified as NoResponse and retried.
-        Ok(response) => Ok(response.text_or_empty().to_string()),
-        Err(exhausted) => {
-            // Fail-open: deliver the deterministic claim report plus the raw
-            // valid analyst reports with an explicit marker instead of
-            // discarding them. Findings are never lost.
-            tracing::warn!(
-                error = %exhausted,
-                "Analyst consolidation failed — delivering raw claim report"
-            );
-            let raw_dump = render_raw_analyst_dump(outcomes);
-            Ok(format!(
-                "## Analyst Reports\n\n(unconsolidated — consolidation failed: {exhausted})\n\n{claim_report}\n\n{raw_dump}"
-            ))
-        }
-    }
-}
-
-/// Wrap escaped analyst reports in the canonical markdown shape used by the
-/// fail-open raw dump: `### Report from Analyst N` sections joined by blank
-/// lines. Triple-backtick escaping is applied by the caller before this
-/// function.
-fn format_analyst_reports_markdown(escaped: &[String]) -> String {
-    let mut parts = Vec::new();
-    for (i, report) in escaped.iter().enumerate() {
-        parts.push(format!("### Report from Analyst {}", i + 1));
-        parts.push(report.clone());
-    }
-    parts.join("\n\n")
-}
-
 /// Escape triple-backtick code fences to prevent markdown-structure
 /// corruption in the consolidated output.
 pub(crate) fn escape_fences(s: &str) -> String {
@@ -982,161 +825,47 @@ pub(crate) fn escape_fences(s: &str) -> String {
 
 /// Render the fail-open raw dump: the raw response of every valid analyst
 /// (extraction success or failure) in `### Report from Analyst N` sections.
+/// No-response analysts render with their reason so nothing is silently lost.
 fn render_raw_analyst_dump(outcomes: &[AnalystOutcome]) -> String {
-    let escaped: Vec<String> = outcomes
-        .iter()
-        .filter_map(|o| match o {
+    let mut sections = Vec::new();
+    for (i, o) in outcomes.iter().enumerate() {
+        match o {
             AnalystOutcome::Findings { raw, .. } | AnalystOutcome::ParseFailed { raw, .. } => {
-                Some(escape_fences(raw))
+                sections.push(format!(
+                    "### Report from Analyst {}\n{}",
+                    i + 1,
+                    escape_fences(raw)
+                ));
             }
-            AnalystOutcome::NoResponse(_) => None,
-        })
-        .collect();
-    format_analyst_reports_markdown(&escaped)
+            AnalystOutcome::NoResponse(reason) => {
+                sections.push(format!(
+                    "### Report from Analyst {}\nno response: {reason}",
+                    i + 1
+                ));
+            }
+        }
+    }
+    sections.join("\n\n")
 }
 
-/// Render the deterministic claim-level report: agreement-graded claims,
-/// surfaced contradictions, verification results, and explicitly marked
-/// failed/unanswered items. This is both the synthesis input and the
-/// fail-open deliverable — load-bearing content (summary, grades, unresolved
-/// markers) sits at the top so it survives the sync-path 5 KB truncation.
-#[allow(clippy::too_many_lines)]
-fn render_claim_report(
-    ask: &str,
-    merged: &[MergedClaim],
-    coverage: &[String],
-    unanswered: &[String],
-    verification: &[VerificationResult],
-    outcomes: &[AnalystOutcome],
-) -> String {
+/// Render extraction-failure reasons for the fail-open marker (which analysts
+/// produced no parseable findings and why).
+#[must_use]
+fn render_extraction_failures(outcomes: &[AnalystOutcome]) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "## Research Findings");
-    let _ = writeln!(out);
-    let _ = writeln!(out, "**Question**: {ask}");
-    let _ = writeln!(out);
-
-    // Grade against the actual number of valid analyst responses (n=2 with a
-    // unanimous claim renders as [2/2], never an unreachable [3/3] bracket).
-    // A single valid response (total == 1) is never "unanimous" — every claim
-    // there is disputed (agreement == 1) and still goes through verification.
-    let total = outcomes
-        .iter()
-        .filter(|o| matches!(o, AnalystOutcome::Findings { .. }))
-        .count();
-    let full = merged
-        .iter()
-        .filter(|c| c.agreement() == total && total > 1 && !c.is_disputed())
-        .count();
-    let majority = merged
-        .iter()
-        .filter(|c| c.agreement() > 1 && c.agreement() < total && !c.is_disputed())
-        .count();
-    // Disputed = claims that triggered the verification pass: 1/{total}
-    // agreement or surfaced contradictions (a majority-agreement claim with
-    // contradictions is verified, so it is not labeled majority).
-    let disputed = merged.iter().filter(|c| c.is_disputed()).count();
-    let unresolved = verification
-        .iter()
-        .filter(|v| v.verdict == "unresolved")
-        .count()
-        + merged
-            .iter()
-            .filter(|c| {
-                c.is_disputed()
-                    && !verification
-                        .iter()
-                        .any(|v| normalize_claim(&v.claim) == normalize_claim(&c.claim))
-            })
-            .count();
-    let _ = writeln!(
-        out,
-        "**Summary**: {} claims — {full} unanimous, {majority} majority, {disputed} disputed; {unresolved} unresolved after verification.",
-        merged.len()
-    );
-    let _ = writeln!(out);
-
-    let _ = writeln!(out, "### Claims");
-    for c in merged {
-        // Disputed claims (1/n agreement, or any agreement level carrying
-        // surfaced contradictions) render with the DISPUTED bracket — the
-        // verification pass fires for them, so the grade can never say
-        // "unanimous" or bare majority.
-        let grade = if c.is_disputed() {
-            format!("[{}/{} · DISPUTED]", c.agreement(), total)
-        } else if c.agreement() == total && total > 1 {
-            format!("[{total}/{total}]")
-        } else {
-            format!("[{}/{}]", c.agreement(), total)
-        };
-        let sources = if c.sources.is_empty() {
-            "no source".to_string()
-        } else {
-            c.sources.join("; ")
-        };
-        let _ = writeln!(
-            out,
-            "- {grade} ({}) {} — source: {sources}",
-            c.confidence,
-            escape_fences(&c.claim),
-        );
-        if !c.contradictions.is_empty() {
-            let _ = writeln!(out, "  - contradictions: {}", c.contradictions.join("; "));
-        }
-    }
-
-    if !verification.is_empty() {
-        let _ = writeln!(out);
-        let _ = writeln!(out, "### Verification");
-        for v in verification {
-            let _ = writeln!(
-                out,
-                "- {} → **{}** — {}",
-                escape_fences(&v.claim),
-                v.verdict,
-                escape_fences(&v.evidence),
-            );
-        }
-    }
-
-    let has_failed = outcomes.iter().any(|o| {
-        matches!(
-            o,
-            AnalystOutcome::ParseFailed { .. } | AnalystOutcome::NoResponse(_)
-        )
-    });
-    if has_failed {
-        let _ = writeln!(out);
-        let _ = writeln!(out, "### Failed Analysts");
-        for (i, o) in outcomes.iter().enumerate() {
-            match o {
-                AnalystOutcome::NoResponse(reason) => {
-                    let _ = writeln!(out, "- Analyst {}: no response ({reason})", i + 1);
-                }
-                AnalystOutcome::ParseFailed { failure, .. } => {
-                    let _ = writeln!(
-                        out,
-                        "- Analyst {}: findings extraction failed ({failure})",
-                        i + 1
-                    );
-                }
-                AnalystOutcome::Findings { .. } => {}
+    for (i, o) in outcomes.iter().enumerate() {
+        match o {
+            AnalystOutcome::ParseFailed { failure, .. } => {
+                let _ = writeln!(
+                    out,
+                    "- Analyst {}: findings extraction failed ({failure})",
+                    i + 1
+                );
             }
-        }
-    }
-
-    if !unanswered.is_empty() {
-        let _ = writeln!(out);
-        let _ = writeln!(out, "### Unanswered Questions");
-        for u in unanswered {
-            let _ = writeln!(out, "- {}", escape_fences(u));
-        }
-    }
-
-    if !coverage.is_empty() {
-        let _ = writeln!(out);
-        let _ = writeln!(out, "### Coverage");
-        for c in coverage {
-            let _ = writeln!(out, "- {}", escape_fences(c));
+            AnalystOutcome::NoResponse(reason) => {
+                let _ = writeln!(out, "- Analyst {}: no response ({reason})", i + 1);
+            }
+            AnalystOutcome::Findings { .. } => {}
         }
     }
     out
@@ -1145,9 +874,7 @@ fn render_claim_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::test::{
-        FakeProvider, init_test_stores, install_fake_provider, retry_tests_lock,
-    };
+    use crate::util::test::{FakeProvider, install_fake_provider, retry_tests_lock};
     use crate::workspace::test_ws;
     use serde_json::json;
     use std::sync::Arc;
@@ -1349,10 +1076,10 @@ mod tests {
         );
     }
 
-    // ── Claim-level merge ────────────────────────────────────────────────
+    // ── Ask grouping renderer ────────────────────────────────────────────
 
     #[test]
-    fn test_claim_merge_grades_agreement() {
+    fn render_ask_groups_computes_brackets_from_distinct_agents() {
         let outcomes = vec![
             AnalystOutcome::Findings {
                 raw: "r1".into(),
@@ -1368,200 +1095,64 @@ mod tests {
                     ("gamma is true", "url3", "low"),
                 ]),
             },
-            AnalystOutcome::Findings {
-                raw: "r3".into(),
-                findings: findings(vec![("alpha is true", "url1", "high")]),
-            },
+            AnalystOutcome::NoResponse("analyst produced no response".into()),
         ];
-        let (merged, _, _) = merge_and_grade(&outcomes);
-        assert_eq!(merged.len(), 3);
-        let alpha = merged
-            .iter()
-            .find(|c| c.claim == "alpha is true")
-            .expect("alpha");
-        assert_eq!(alpha.agreement(), 3);
-        assert_eq!(alpha.analysts, vec![0, 1, 2]);
-        assert!(
-            !alpha.is_disputed(),
-            "3/3 with no contradictions is not disputed"
-        );
-        let beta = merged
-            .iter()
-            .find(|c| c.claim == "beta is true")
-            .expect("beta");
-        assert_eq!(beta.agreement(), 1);
-        assert!(beta.is_disputed(), "1/3 claim must be disputed");
-        let gamma = merged
-            .iter()
-            .find(|c| c.claim == "gamma is true")
-            .expect("gamma");
-        assert_eq!(gamma.agreement(), 1);
-    }
-
-    #[test]
-    fn test_claim_merge_surfaces_contradictions() {
-        let mut findings_a = findings(vec![("alpha is true", "url1", "high")]);
-        findings_a.claims[0].contradictions = vec!["source B says alpha is false".to_string()];
-        let outcomes = vec![
-            AnalystOutcome::Findings {
-                raw: "r1".into(),
-                findings: findings_a,
-            },
-            AnalystOutcome::Findings {
-                raw: "r2".into(),
-                findings: findings(vec![("alpha is true", "url1", "high")]),
-            },
-            AnalystOutcome::Findings {
-                raw: "r3".into(),
-                findings: findings(vec![("alpha is true", "url1", "high")]),
-            },
-        ];
-        let (merged, _, _) = merge_and_grade(&outcomes);
-        let alpha = merged
-            .iter()
-            .find(|c| c.claim == "alpha is true")
-            .expect("alpha");
-        // 3/3 agreement still disputes the claim because a contradiction surfaced.
-        assert_eq!(alpha.agreement(), 3);
-        assert!(alpha.is_disputed());
-        assert_eq!(alpha.contradictions, vec!["source B says alpha is false"]);
-    }
-
-    #[test]
-    fn test_claims_equivalent_rules() {
-        let nums = |tokens: &[&str]| {
-            tokens
-                .iter()
-                .map(|t| t.to_string())
-                .collect::<std::collections::HashSet<_>>()
+        let output = crate::consensus::GroupingOutput {
+            summary: "Two facts, one solo finding.".into(),
+            groups: vec![
+                crate::consensus::GroupingGroup {
+                    heading: "Alpha".into(),
+                    contradiction: false,
+                    members: vec![
+                        crate::consensus::GroupingMember {
+                            agent: 0,
+                            text: "alpha is true".into(),
+                        },
+                        crate::consensus::GroupingMember {
+                            agent: 1,
+                            text: "alpha is true".into(),
+                        },
+                    ],
+                },
+                crate::consensus::GroupingGroup {
+                    heading: "Beta".into(),
+                    contradiction: false,
+                    members: vec![crate::consensus::GroupingMember {
+                        agent: 0,
+                        text: "beta is true".into(),
+                    }],
+                },
+            ],
+            ungrouped: vec![crate::consensus::GroupingMember {
+                agent: 1,
+                text: "gamma is true".into(),
+            }],
         };
-        // Exact-normalized text wins without embeddings.
-        assert!(claims_equivalent(
-            "x is true",
-            &nums(&[]),
-            None,
-            "x is true",
-            &nums(&[]),
-            None,
-            0.9
-        ));
-        // Semantically similar claims (different phrasing, similar vectors)
-        // merge — the path that makes 2/3 and 3/3 agreement reachable.
-        let similar = |a: &[f32], b: &[f32]| {
-            claims_equivalent(
-                "one phrasing",
-                &nums(&[]),
-                Some(a),
-                "other phrasing",
-                &nums(&[]),
-                Some(b),
-                0.9,
-            )
-        };
-        assert!(similar(&[1.0, 0.0], &[0.95, 0.05]), "similar vectors merge");
+        let text = render_ask_groups("q", &output, 2, &outcomes);
         assert!(
-            !similar(&[1.0, 0.0], &[0.0, 1.0]),
-            "dissimilar vectors stay separate"
-        );
-        // Claims disagreeing on numbers never merge — a shared token (the
-        // year) must not defeat the guard.
-        let priced = |a: &[&str], b: &[&str]| {
-            claims_equivalent(
-                "alpha costs 100 in 2024",
-                &nums(a),
-                Some(&[1.0, 0.0][..]),
-                "alpha costs 200 in 2024",
-                &nums(b),
-                Some(&[1.0, 0.0][..]),
-                0.9,
-            )
-        };
-        assert!(
-            !priced(&["100", "2024"], &["200", "2024"]),
-            "price differs → never merge"
+            text.contains("**Alpha** [2/2]"),
+            "consensus group renders [2/2] from distinct cited agents: {text}"
         );
         assert!(
-            priced(&["100", "2024"], &["100", "2024"]),
-            "identical numeric content merges"
+            text.contains("**Beta** [1/2]"),
+            "solo group renders [1/2] without DISPUTED: {text}"
         );
-        // One-sided numbers defer to embedding — the strings match the sets
-        // (no price contradiction is being merged).
-        let one_sided = |a: &[&str], b: &[&str]| {
-            claims_equivalent(
-                "alpha costs 100 in 2024",
-                &nums(a),
-                Some(&[1.0, 0.0][..]),
-                "alpha is expensive",
-                &nums(b),
-                Some(&[1.0, 0.0][..]),
-                0.9,
-            )
-        };
         assert!(
-            one_sided(&["100", "2024"], &[]),
-            "one-sided numbers defer to embedding"
+            text.contains("**Ungrouped**"),
+            "ungrouped list renders: {text}"
         );
-        // Missing embeddings degrade to exact-match-only.
-        assert!(!claims_equivalent(
-            "one",
-            &nums(&[]),
-            None,
-            "two",
-            &nums(&[]),
-            None,
-            0.9
-        ));
-        // `ClaimKey::equivalent_to` wiring: same short-circuits, exercised
-        // through the method (embeddings are always None in test builds).
-        let k1 = ClaimKey::new("x is true");
-        assert!(k1.equivalent_to(&ClaimKey::new("x is true"), 0.9));
-        let k2 = ClaimKey::new("alpha costs 100 in 2024");
-        assert!(!k2.equivalent_to(&ClaimKey::new("alpha costs 200 in 2024"), 0.9));
-        assert!(!k1.equivalent_to(&ClaimKey::new("y is true"), 0.9));
-    }
-
-    #[test]
-    fn test_claim_merge_keeps_numeric_contradictions_separate() {
-        // Price-differing claims sharing a year must never merge into one
-        // claim — the contradiction would be silently averaged away.
-        let outcomes = vec![
-            AnalystOutcome::Findings {
-                raw: "r1".into(),
-                findings: findings(vec![("alpha costs $100 in 2024", "url1", "medium")]),
-            },
-            AnalystOutcome::Findings {
-                raw: "r2".into(),
-                findings: findings(vec![("alpha costs $200 in 2024", "url2", "medium")]),
-            },
-            AnalystOutcome::Findings {
-                raw: "r3".into(),
-                findings: findings(vec![("alpha costs $100 in 2024", "url1", "medium")]),
-            },
-        ];
-        let (merged, _, _) = merge_and_grade(&outcomes);
-        assert_eq!(merged.len(), 2, "price-differing claims stay separate");
-        let hundred = merged
-            .iter()
-            .find(|c| c.claim.contains("$100"))
-            .expect("the $100 claim");
-        assert_eq!(hundred.agreement(), 2);
-        let two_hundred = merged
-            .iter()
-            .find(|c| c.claim.contains("$200"))
-            .expect("the $200 claim");
-        assert_eq!(two_hundred.agreement(), 1);
         assert!(
-            two_hundred.is_disputed(),
-            "minority price is disputed → verification fires"
+            text.contains("- Agent 1: gamma is true"),
+            "ungrouped member attributes its source: {text}"
+        );
+        assert!(
+            !text.contains("DISPUTED"),
+            "no contradiction flag means no DISPUTED anywhere: {text}"
         );
     }
 
     #[test]
-    fn test_render_claim_report_disputed_bracket_on_contradictions() {
-        // A claim graded 3/3 (or majority 2/3) that carries surfaced
-        // contradictions must render with the DISPUTED bracket — the summary
-        // counts it as disputed and verification fires for it, so the grade
-        // can never say unanimous / bare majority.
+    fn render_ask_groups_disputed_only_on_contradiction() {
         let outcomes = vec![
             AnalystOutcome::Findings {
                 raw: "r1".into(),
@@ -1569,67 +1160,81 @@ mod tests {
             },
             AnalystOutcome::Findings {
                 raw: "r2".into(),
-                findings: findings(vec![
-                    ("alpha is true", "url1", "high"),
-                    ("beta is true", "url2", "medium"),
-                ]),
+                findings: findings(vec![("alpha is false", "url2", "high")]),
+            },
+        ];
+        let output = crate::consensus::GroupingOutput {
+            summary: "Agents disagree on alpha.".into(),
+            groups: vec![crate::consensus::GroupingGroup {
+                heading: "Alpha".into(),
+                contradiction: true,
+                members: vec![
+                    crate::consensus::GroupingMember {
+                        agent: 0,
+                        text: "alpha is true".into(),
+                    },
+                    crate::consensus::GroupingMember {
+                        agent: 1,
+                        text: "alpha is false".into(),
+                    },
+                ],
+            }],
+            ungrouped: vec![],
+        };
+        let text = render_ask_groups("q", &output, 2, &outcomes);
+        assert!(
+            text.contains("**Alpha** [2/2 · DISPUTED]"),
+            "contradiction group renders [2/2 · DISPUTED]: {text}"
+        );
+    }
+
+    #[test]
+    fn render_ask_groups_surfaces_member_caveats_as_metadata() {
+        let mut claims = findings(vec![("alpha is true", "url1", "high")]);
+        claims.claims[0].contradictions = vec!["source B says alpha may be false".into()];
+        let outcomes = vec![
+            AnalystOutcome::Findings {
+                raw: "r1".into(),
+                findings: claims,
             },
             AnalystOutcome::Findings {
-                raw: "r3".into(),
-                findings: findings(vec![
-                    ("alpha is true", "url1", "high"),
-                    ("beta is true", "url2", "medium"),
-                ]),
+                raw: "r2".into(),
+                findings: findings(vec![("alpha is true", "url1", "high")]),
             },
         ];
-        let merged = vec![
-            // 3/3 agreement but a contradiction surfaced — disputed, not
-            // unanimous.
-            MergedClaim {
-                claim: "alpha is true".into(),
-                analysts: vec![0, 1, 2],
-                sources: vec!["url1".into()],
-                contradictions: vec!["urlB says alpha is false".into()],
-                confidence: "high".into(),
-            },
-            // 2/3 majority with a contradiction — also disputed.
-            MergedClaim {
-                claim: "beta is true".into(),
-                analysts: vec![1, 2],
-                sources: vec!["url2".into()],
-                contradictions: vec!["urlC says beta is false".into()],
-                confidence: "medium".into(),
-            },
-            // 2/3 majority without contradictions — bare grade stays.
-            MergedClaim {
-                claim: "gamma is true".into(),
-                analysts: vec![0, 1],
-                sources: vec!["url3".into()],
-                contradictions: vec![],
-                confidence: "medium".into(),
-            },
-        ];
-        let report = render_claim_report("q", &merged, &[], &[], &[], &outcomes);
+        let output = crate::consensus::GroupingOutput {
+            summary: "alpha is agreed.".into(),
+            groups: vec![crate::consensus::GroupingGroup {
+                heading: "Alpha".into(),
+                contradiction: false,
+                members: vec![
+                    crate::consensus::GroupingMember {
+                        agent: 0,
+                        text: "alpha is true".into(),
+                    },
+                    crate::consensus::GroupingMember {
+                        agent: 1,
+                        text: "alpha is true".into(),
+                    },
+                ],
+            }],
+            ungrouped: vec![],
+        };
+        let text = render_ask_groups("q", &output, 2, &outcomes);
         assert!(
-            report.contains("[3/3 · DISPUTED]"),
-            "contradicted unanimous claim must render disputed: {report}"
+            text.contains("caveat: source B says alpha may be false"),
+            "self-reported caveat renders as member metadata: {text}"
         );
         assert!(
-            report.contains("[2/3 · DISPUTED]"),
-            "contradicted majority claim must render disputed: {report}"
-        );
-        assert!(
-            report.contains("[2/3] (medium) gamma is true"),
-            "clean majority keeps its bare grade: {report}"
+            !text.contains("DISPUTED"),
+            "a self-reported caveat is NOT a contradiction: {text}"
         );
     }
 
     // ── consolidation fail-open ────────────────────────────────────────
 
     /// Helper: run consolidation over the given extracted outcomes with the
-    /// given fake provider outcomes scripted. Disputed claims spawn real
-    /// verifier agents — call `init_test_stores()` first in that case (see
-    /// `test_verification_pass_marks_disputed_claims`).
+    /// given fake provider outcomes scripted.
     async fn consolidate_with_script(
         outcomes: Vec<AnalystOutcome>,
         fake: FakeProvider,
@@ -1640,8 +1245,7 @@ mod tests {
         consolidate_findings(&ws, "test question", outcomes).await
     }
 
-    /// Two analysts agreeing on one claim (2/3, no contradictions) — never
-    /// triggers the verification pass.
+    /// Two analysts agreeing on one claim (2/3, no contradictions).
     fn agreed_outcomes(raw_a: &str, raw_b: &str) -> Vec<AnalystOutcome> {
         vec![
             AnalystOutcome::Findings {
@@ -1688,7 +1292,10 @@ mod tests {
         assert!(text.contains("report one"), "{text}");
         assert!(text.contains("### Report from Analyst 2"), "{text}");
         assert!(text.contains("report two"), "{text}");
-        assert!(!text.contains("### Report from Analyst 3"), "{text}");
+        assert!(
+            text.contains("no response: analyst produced no response"),
+            "no-response analyst renders its reason — nothing silently lost: {text}"
+        );
     }
 
     #[tokio::test]
@@ -1733,13 +1340,53 @@ mod tests {
         let _guard = retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        let fake = FakeProvider::new().ok("synthesized answer");
-        let result = consolidate_with_script(agreed_outcomes("report a", "report b"), fake).await;
-        assert_eq!(
-            result.expect("success"),
-            "synthesized answer",
-            "successful consolidation output is the synthesis text"
+        // The grouping pass parses a strict GroupingOutput; a faithful model
+        // groups the two agreed claims and leaves nothing ungrouped.
+        let fake = FakeProvider::new().ok(
+            r#"{"summary":"alpha is true.","groups":[{"heading":"Alpha","contradiction":false,"members":[{"agent":0,"text":"alpha is true"},{"agent":1,"text":"alpha is true"}]}],"ungrouped":[]}"#,
         );
+        let result = consolidate_with_script(agreed_outcomes("report a", "report b"), fake).await;
+        let text = result.expect("success");
+        assert!(text.contains("alpha is true"), "{text}");
+        assert!(
+            !text.contains("unconsolidated"),
+            "successful consolidation must not hit the fail-open marker: {text}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    async fn test_consolidation_single_parseable_source_skips_grouping() {
+        let _guard = retry_tests_lock();
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // ≥2 valid responses but only one produced parseable claims: a
+        // grouping pass over a single source can't yield agreement brackets
+        // or contradictions — the flat claim list + raw dumps are delivered
+        // without calling the provider.
+        let fake = FakeProvider::new(); // no script — any provider call would fail
+        let provider: Arc<dyn crate::Provider> = Arc::new(fake);
+        let _provider_guard = install_fake_provider(provider);
+        let ws = test_ws("/tmp/test_ws");
+        let outcomes = vec![
+            AnalystOutcome::Findings {
+                raw: "sole report".into(),
+                findings: findings(vec![("alpha is true", "url1", "high")]),
+            },
+            AnalystOutcome::ParseFailed {
+                raw: "unparseable report".into(),
+                failure: "parse failed".into(),
+            },
+        ];
+        let result = consolidate_findings(&ws, "test question", outcomes).await;
+        let text = result.expect("single parseable source succeeds");
+        assert!(
+            text.contains("only one analyst produced parseable claims — grouping skipped"),
+            "skip marker must be present: {text}"
+        );
+        assert!(text.contains("alpha is true"), "{text}");
+        assert!(text.contains("### Report from Analyst 2"), "{text}");
+        assert!(text.contains("unparseable report"), "{text}");
     }
 
     #[tokio::test]
@@ -1748,8 +1395,8 @@ mod tests {
         let _guard = retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        // Mixed transport + NoResponse (empty text) failures exercise both
-        // retry_chat branches in one script; exhaustion still fails open.
+        // Mixed transport + empty-response failures exercise both failure
+        // arms of the grouping retry loop; exhaustion still fails open.
         // Script: transport error, then two empty responses.
         let fake = FakeProvider::new()
             .err(
@@ -1822,49 +1469,6 @@ mod tests {
         assert!(text.contains("report two"), "{text}");
     }
 
-    /// Disputed claims spawn exactly one verification pass with fresh
-    /// analysts; the verdict lands in the final report (observed via the
-    /// fail-open dump so the intermediate claim report is visible).
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
-    async fn test_verification_pass_marks_disputed_claims() {
-        let _lock = retry_tests_lock();
-        init_test_stores().await;
-        let _policy_guard =
-            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        // "beta is true" is stated by one analyst (1/3 → disputed); the
-        // verification pass spawns a fresh analyst for it.
-        let fake = FakeProvider::new()
-            .ok("verifier report") // verifier agent run
-            .ok(
-                r#"{"claim": "beta is true", "verdict": "contradicted", "evidence": "primary source says otherwise", "confidence": "high"}"#,
-            )
-            .err(crate::retry::FailureClass::Transport, "down")
-            .err(crate::retry::FailureClass::Transport, "down")
-            .err(crate::retry::FailureClass::Transport, "down");
-        let outcomes = vec![
-            AnalystOutcome::Findings {
-                raw: "r1".into(),
-                findings: findings(vec![("alpha is true", "url1", "high")]),
-            },
-            AnalystOutcome::Findings {
-                raw: "r2".into(),
-                findings: findings(vec![
-                    ("alpha is true", "url1", "high"),
-                    ("beta is true", "url2", "medium"),
-                ]),
-            },
-            AnalystOutcome::Findings {
-                raw: "r3".into(),
-                findings: findings(vec![("alpha is true", "url1", "high")]),
-            },
-        ];
-        let result = consolidate_with_script(outcomes, fake).await;
-        let text = result.expect("fail-open dump carries the claim report");
-        assert!(text.contains("### Verification"), "{text}");
-        assert!(text.contains("beta is true → **contradicted**"), "{text}");
-    }
-
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn test_consolidation_async_envelope_carries_marker() {
@@ -1908,6 +1512,31 @@ mod tests {
         assert!(
             envelope.ends_with("</ask-tool-result>"),
             "envelope must close: {envelope}"
+        );
+    }
+
+    /// The sync ask path truncates tool output via the 5 KB sandwich (head
+    /// 2/3 + tail 1/3) — the fail-open marker is head-placed so it survives
+    /// even when the consolidated output overflows the budget.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    async fn fail_open_marker_survives_sync_truncation() {
+        let _guard = retry_tests_lock();
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = FakeProvider::new()
+            .err(crate::retry::FailureClass::Transport, "down")
+            .err(crate::retry::FailureClass::Transport, "down")
+            .err(crate::retry::FailureClass::Transport, "down");
+        // A long raw report guarantees the output overflows the 5 KB budget.
+        let long_report = "lorem ipsum ".repeat(2_000);
+        let result = consolidate_with_script(agreed_outcomes(&long_report, "second"), fake).await;
+        let text = result.expect("fail-open must succeed");
+        // Simulate the sync path's tool-output truncation (Tool::format_output).
+        let truncated = crate::util::truncate_tool_output(&text);
+        assert!(
+            truncated.contains("unconsolidated — consolidation failed"),
+            "head-placed marker must survive 5 KB sandwich truncation: {truncated}"
         );
     }
 }

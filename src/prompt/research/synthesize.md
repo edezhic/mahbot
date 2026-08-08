@@ -16,3 +16,4 @@ Synthesize the accumulated research evidence below into a single comprehensive a
 4. Clearly mark anything that remains unresolved or unanswered.
 5. If the question is genuinely unanswerable with the accumulated evidence, say so explicitly and state what evidence would be needed.
 6. Do not invent facts beyond the evidence. Do not call any tools.
+7. Present both sides of every dispute explicitly — never average conflicting claims away. Numeric evidence is load-bearing; include exact values.

@@ -2230,7 +2230,7 @@ async fn build_joint_comment(
     threshold: u8,
     role: Role,
     header: &str,
-    ws_name: &str,
+    ws: &Workspace,
 ) -> String {
     let mut verdicts: Vec<crate::joint_verdict::JointVerdict<'_>> = Vec::new();
     let mut failures: Vec<crate::joint_verdict::JointFailure> = Vec::new();
@@ -2273,10 +2273,10 @@ async fn build_joint_comment(
         // explicit marker) instead.
         crate::joint_verdict::render_joint_comment(
             &round,
-            &crate::joint_verdict::SynthesisOutcome::Fallback,
+            &crate::consensus::GroupingOutcome::Fallback,
         )
     } else {
-        crate::joint_verdict::build_joint_comment(&round, role, ws_name).await
+        crate::joint_verdict::build_joint_comment(&round, role, ws).await
     }
 }
 
@@ -2570,7 +2570,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
         return;
     }
 
-    process_analyst_verdicts(&ticket, &results).await;
+    process_analyst_verdicts(&ws, &ticket, &results).await;
 }
 
 /// Evaluate analyst verdicts and transition the ticket:
@@ -2583,7 +2583,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 ///
 /// See the "Parallel agent helpers (shared)" section for why this is separate
 /// from [`process_verifier_verdicts`].
-async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) {
+async fn process_analyst_verdicts(ws: &Workspace, ticket: &Ticket, results: &[ParallelVerdict]) {
     let nonempty_count = results
         .iter()
         .filter(|r| !matches!(r, ParallelVerdict::NoResponse(_)))
@@ -2641,7 +2641,7 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
                 ANALYST_PASS_THRESHOLD,
                 Role::Analyst,
                 &summary,
-                &ticket.workspace_name,
+                ws,
             )
             .await,
         )
@@ -2961,6 +2961,7 @@ fn verifier_failure_reasons(results: &[ParallelVerdict]) -> String {
 /// from [`process_analyst_verdicts`].
 #[allow(clippy::too_many_lines)]
 async fn process_verifier_verdicts(
+    ws: &Workspace,
     ticket: &Ticket,
     results: &[ParallelVerdict],
     verifier: VerifierInfo,
@@ -3053,7 +3054,7 @@ async fn process_verifier_verdicts(
                 REVIEW_QA_THRESHOLD,
                 verifier.role,
                 &header,
-                &ticket.workspace_name,
+                ws,
             )
             .await,
         )
@@ -3393,7 +3394,7 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
         );
     }
 
-    let transitioned = process_verifier_verdicts(&ticket, &results, vi).await;
+    let transitioned = process_verifier_verdicts(&ws, &ticket, &results, vi).await;
 
     // ── Auto-stage + record reviewed base after review ───────────────
     // Stage all working tree changes so the index captures the reviewed

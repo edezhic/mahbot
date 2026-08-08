@@ -19,6 +19,7 @@ pub(crate) mod chat_history;
 pub mod checkpoint;
 pub mod config;
 pub mod config_db;
+pub(crate) mod consensus;
 pub mod debug;
 pub(crate) mod diff_parse;
 pub(crate) mod embedder;

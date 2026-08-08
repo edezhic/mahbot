@@ -1,5 +1,9 @@
 use super::*;
 use crate::Verdict;
+use crate::consensus::{
+    GroupingGroup, GroupingMember, GroupingOutcome, GroupingOutput, bracket_label, distinct_agents,
+    normalize_item, validate_grouping,
+};
 
 fn verdict(score: u8, issues: &[&str]) -> Verdict {
     Verdict {
@@ -37,162 +41,34 @@ fn round(
     }
 }
 
-fn issues_by_agent(round: &JointRound<'_>) -> Vec<Vec<String>> {
-    // Mirrors run_synthesis: keyed by ORIGINAL dispatch index (empty slots for
-    // failed agents), never a compacted 0..n_valid-1 space.
-    let mut by_agent: Vec<Vec<String>> = vec![Vec::new(); round.dispatched];
-    for v in &round.verdicts {
-        by_agent[v.agent_index] = v
-            .verdict
-            .issues_detected
-            .iter()
-            .map(|i| normalize_issue_text(i))
-            .collect();
+fn member(agent: usize, text: &str) -> GroupingMember {
+    GroupingMember {
+        agent,
+        text: text.to_string(),
     }
-    by_agent
 }
 
-// ── Deterministic merge + bracket semantics ─────────────────────────────
-
-#[test]
-fn merge_and_brackets_follow_spec_semantics() {
-    // Three valid verdicts; one issue raised by all three, one by two,
-    // one by a single agent.
-    let r = round(
-        "Review",
-        vec![
-            (0, verdict(4, &["No timeout check", "Missing retry"])),
-            (1, verdict(3, &["No timeout check", "Lock ordering"])),
-            (2, verdict(9, &["No timeout check"])),
-        ],
-        vec![],
-        "1 of 3 valid verdicts failed.",
-    );
-    let issues = merge_issues(&r);
-    assert_eq!(issues.len(), 3);
-    let bracket = |text: &str| -> String {
-        let issue = issues
-            .iter()
-            .find(|m| normalize_issue_text(&m.text) == text)
-            .expect("issue present");
-        bracket_label(issue, false)
-    };
-    assert_eq!(
-        bracket("No timeout check"),
-        "[3/3]",
-        "all valid agents agree"
-    );
-    assert_eq!(
-        bracket("Lock ordering"),
-        "DISPUTED",
-        "exactly one agent raised it"
-    );
-    assert_eq!(
-        bracket("Missing retry"),
-        "DISPUTED",
-        "exactly one agent raised it"
-    );
-
-    // Two agents raised the same issue.
-    let r = round(
-        "Review",
-        vec![
-            (0, verdict(4, &["Shared issue"])),
-            (1, verdict(3, &["Shared issue"])),
-            (2, verdict(9, &["Other"])),
-        ],
-        vec![],
-        "",
-    );
-    let issues = merge_issues(&r);
-    let shared = issues
-        .iter()
-        .find(|m| m.text == "Shared issue")
-        .expect("shared issue");
-    assert_eq!(bracket_label(shared, false), "[2/3]");
-
-    // Single-agent round renders [1/1] with the unverified note.
-    let r = round("Review", vec![(0, verdict(4, &["Solo issue"]))], vec![], "");
-    let issues = merge_issues(&r);
-    assert!(
-        bracket_label(&issues[0], false).contains("[1/1]"),
-        "single-agent bracket"
-    );
-    assert!(
-        bracket_label(&issues[0], false).contains("not cross-checked"),
-        "single-agent note"
-    );
-
-    // The synthesis contradiction flag forces DISPUTED even for multi-agent
-    // agreement.
-    let r = round(
-        "Review",
-        vec![
-            (0, verdict(4, &["Shared issue"])),
-            (1, verdict(3, &["Shared issue"])),
-        ],
-        vec![],
-        "",
-    );
-    let issues = merge_issues(&r);
-    assert_eq!(bracket_label(&issues[0], true), "DISPUTED");
+fn group(heading: &str, contradiction: bool, members: Vec<GroupingMember>) -> GroupingGroup {
+    GroupingGroup {
+        heading: heading.to_string(),
+        contradiction,
+        members,
+    }
 }
 
-#[test]
-fn merge_dedupes_within_an_agent() {
-    // The same agent listing the same issue twice contributes one vote.
-    let r = round(
-        "Review",
-        vec![(0, verdict(4, &["No timeout check", "No timeout check"]))],
-        vec![],
-        "",
-    );
-    let issues = merge_issues(&r);
-    assert_eq!(issues.len(), 1, "duplicate issue within an agent collapses");
-    assert_eq!(issues[0].agents, vec![0]);
-}
-
-// ── Numeric-semantics classifier ────────────────────────────────────────
-
-#[test]
-fn numeric_semantics_classifier() {
-    // Locators / evidence differences are NOT contradictions.
-    assert!(issues_differ_only_in_numeric_details(
-        "line 3281",
-        "line 6684–6715"
-    ));
-    assert!(issues_differ_only_in_numeric_details(
-        "8-9 lines",
-        "8-11 lines"
-    ));
-    assert!(issues_differ_only_in_numeric_details(
-        "config.0.timeout",
-        "config.1.timeout"
-    ));
-    // Identical texts are vacuously numeric-only (never a contradiction).
-    assert!(issues_differ_only_in_numeric_details(
-        "No timeout check",
-        "No timeout check"
-    ));
-    // Genuine property differences are NOT numeric-only.
-    assert!(!issues_differ_only_in_numeric_details(
-        "Missing error handling",
-        "Missing timeout handling"
-    ));
-    assert!(!issues_differ_only_in_numeric_details(
-        "Race in shutdown path",
-        "Deadlock in checkpoint path"
-    ));
-}
-
-// ── Validator invariants ────────────────────────────────────────────────
-
-fn output(summary: &str, groups: Vec<SynthesisGroup>) -> SynthesisOutput {
-    SynthesisOutput {
+fn output(
+    summary: &str,
+    groups: Vec<GroupingGroup>,
+    ungrouped: Vec<GroupingMember>,
+) -> GroupingOutput {
+    GroupingOutput {
         summary: summary.to_string(),
         groups,
+        ungrouped,
     }
 }
+
+// ── Shared-core validator invariants ────────────────────────────────────
 
 #[test]
 fn validator_accepts_verbatim_grouping() {
@@ -205,149 +81,139 @@ fn validator_accepts_verbatim_grouping() {
         vec![],
         "",
     );
+    let items = issues_by_agent(&r);
     let out = output(
         "The review found timeout handling gaps and a naming nit.",
-        vec![SynthesisGroup {
-            heading: "Timeouts".into(),
-            contradiction: false,
-            members: vec![SynthesisMember {
-                agent: 0,
-                text: "No timeout check".into(),
-            }],
-        }],
+        vec![group(
+            "Timeouts",
+            false,
+            vec![member(0, "No timeout check")],
+        )],
+        vec![member(0, "Missing retry"), member(1, "Naming nit")],
     );
-    assert_eq!(
-        validate_synthesis_output(&out, &issues_by_agent(&r)),
-        Ok(())
-    );
+    assert_eq!(validate_grouping(&out, &items), Ok(()));
 }
 
 #[test]
 fn validator_rejects_fabricated_consensus() {
-    // The LLM claims agent 1 reported an issue it never wrote — the
-    // anti-fabrication core: this must never reach a ticket comment.
     let r = round(
         "Review",
         vec![(0, verdict(4, &["No timeout check"]))],
         vec![],
         "",
     );
-    let out = output(
-        "Both agents agree on the timeout issue.",
-        vec![SynthesisGroup {
-            heading: "Timeouts".into(),
-            contradiction: false,
-            members: vec![SynthesisMember {
-                agent: 0,
-                text: "No timeout check".into(),
-            }],
-        }],
-    );
-    // Agent 0's issue is verbatim — accepted even though the summary
-    // overstates consensus (the pipeline renders its own brackets).
-    assert_eq!(
-        validate_synthesis_output(&out, &issues_by_agent(&r)),
-        Ok(())
-    );
+    let items = issues_by_agent(&r);
 
     // Fabricated text (not in agent 0's list) is rejected.
     let out = output(
         "summary",
-        vec![SynthesisGroup {
-            heading: "Timeouts".into(),
-            contradiction: false,
-            members: vec![SynthesisMember {
-                agent: 0,
-                text: "No timeout check AND missing retry".into(),
-            }],
-        }],
+        vec![group(
+            "Timeouts",
+            false,
+            vec![member(0, "No timeout check AND missing retry")],
+        )],
+        vec![],
     );
-    let err = validate_synthesis_output(&out, &issues_by_agent(&r)).expect_err("must reject");
+    let err = validate_grouping(&out, &items).expect_err("must reject");
     assert!(err.contains("not found verbatim"), "err: {err}");
 
     // Unknown agent index is rejected.
     let out = output(
         "summary",
-        vec![SynthesisGroup {
-            heading: "Timeouts".into(),
-            contradiction: false,
-            members: vec![SynthesisMember {
-                agent: 7,
-                text: "No timeout check".into(),
-            }],
-        }],
+        vec![group(
+            "Timeouts",
+            false,
+            vec![member(7, "No timeout check")],
+        )],
+        vec![],
     );
-    let err = validate_synthesis_output(&out, &issues_by_agent(&r)).expect_err("must reject");
+    let err = validate_grouping(&out, &items).expect_err("must reject");
     assert!(err.contains("unknown agent index"), "err: {err}");
 }
 
 #[test]
-fn validator_rejects_double_counted_issue() {
+fn validator_rejects_double_counting() {
+    let r = round(
+        "Review",
+        vec![
+            (0, verdict(4, &["No timeout check"])),
+            (1, verdict(3, &["Missing retry"])),
+        ],
+        vec![],
+        "",
+    );
+    let items = issues_by_agent(&r);
+    let out = output(
+        "summary",
+        vec![
+            group("A", false, vec![member(0, "No timeout check")]),
+            group("B", false, vec![member(0, "No timeout check")]),
+        ],
+        vec![],
+    );
+    let err = validate_grouping(&out, &items).expect_err("must reject");
+    assert!(err.contains("double-counts"), "err: {err}");
+}
+
+#[test]
+fn validator_rejects_contradiction_without_two_agents() {
     let r = round(
         "Review",
         vec![(0, verdict(4, &["No timeout check"]))],
         vec![],
         "",
     );
+    let items = issues_by_agent(&r);
     let out = output(
         "summary",
-        vec![
-            SynthesisGroup {
-                heading: "A".into(),
-                contradiction: false,
-                members: vec![SynthesisMember {
-                    agent: 0,
-                    text: "No timeout check".into(),
-                }],
-            },
-            SynthesisGroup {
-                heading: "B".into(),
-                contradiction: false,
-                members: vec![SynthesisMember {
-                    agent: 0,
-                    text: "No timeout check".into(),
-                }],
-            },
-        ],
+        vec![group("A", true, vec![member(0, "No timeout check")])],
+        vec![],
     );
-    let err = validate_synthesis_output(&out, &issues_by_agent(&r)).expect_err("must reject");
-    assert!(err.contains("double-counts"), "err: {err}");
+    let err = validate_grouping(&out, &items).expect_err("must reject");
+    assert!(
+        err.contains("without ≥2 distinct cited agents"),
+        "contradiction guardrail: {err}"
+    );
+}
 
-    // The same merged issue cited via DIFFERENT agents' copies in two groups
-    // must also be rejected — the double-count check is issue-level (keyed on
-    // normalized text), not per (agent, text) pair.
+#[test]
+fn validator_rejects_incomplete_coverage() {
     let r = round(
         "Review",
-        vec![
-            (0, verdict(4, &["No timeout check"])),
-            (1, verdict(3, &["No timeout check"])),
-        ],
+        vec![(0, verdict(4, &["No timeout check", "Missing retry"]))],
         vec![],
         "",
     );
+    let items = issues_by_agent(&r);
+    // "Missing retry" is silently dropped from groups AND ungrouped.
     let out = output(
         "summary",
-        vec![
-            SynthesisGroup {
-                heading: "A".into(),
-                contradiction: false,
-                members: vec![SynthesisMember {
-                    agent: 0,
-                    text: "No timeout check".into(),
-                }],
-            },
-            SynthesisGroup {
-                heading: "B".into(),
-                contradiction: false,
-                members: vec![SynthesisMember {
-                    agent: 1,
-                    text: "No timeout check".into(),
-                }],
-            },
-        ],
+        vec![group("A", false, vec![member(0, "No timeout check")])],
+        vec![],
     );
-    let err = validate_synthesis_output(&out, &issues_by_agent(&r)).expect_err("must reject");
-    assert!(err.contains("double-counts"), "err: {err}");
+    let err = validate_grouping(&out, &items).expect_err("must reject");
+    assert!(err.contains("missing from every group"), "err: {err}");
+}
+
+#[test]
+fn duplicate_issue_within_agent_is_deduped() {
+    // One agent reporting the same issue twice must not make the
+    // double-count/completeness pair unsatisfiable: the per-agent input list
+    // is deduped, so a single citation of the item validates and covers it.
+    let r = round(
+        "Review",
+        vec![(0, verdict(4, &["No timeout check", "No timeout check"]))],
+        vec![],
+        "",
+    );
+    let items = issues_by_agent(&r);
+    assert_eq!(items[0], vec!["No timeout check".to_string()]);
+    let out = output(
+        "summary",
+        vec![group("A", false, vec![member(0, "No timeout check")])],
+        vec![],
+    );
+    assert_eq!(validate_grouping(&out, &items), Ok(()));
 }
 
 #[test]
@@ -366,27 +232,19 @@ fn validator_uses_original_agent_indices_with_mid_round_failure() {
     );
     let out = output(
         "The review found a timeout gap and a missing retry.",
-        vec![SynthesisGroup {
-            heading: "Robustness".into(),
-            contradiction: false,
-            members: vec![
-                SynthesisMember {
-                    agent: 0,
-                    text: "No timeout check".into(),
-                },
-                SynthesisMember {
-                    agent: 2,
-                    text: "Missing retry".into(),
-                },
-            ],
-        }],
+        vec![group(
+            "Robustness",
+            false,
+            vec![member(0, "No timeout check"), member(2, "Missing retry")],
+        )],
+        vec![],
     );
     assert_eq!(
-        validate_synthesis_output(&out, &issues_by_agent(&r)),
+        validate_grouping(&out, &issues_by_agent(&r)),
         Ok(()),
         "original dispatch indices must pass validation"
     );
-    let text = render_joint_comment(&r, &SynthesisOutcome::Grouped(out));
+    let text = render_joint_comment(&r, &GroupingOutcome::Grouped(out));
     assert!(
         text.contains("Missing retry"),
         "member of agent 2 must render: {text}"
@@ -399,86 +257,32 @@ fn validator_uses_original_agent_indices_with_mid_round_failure() {
 }
 
 #[test]
-fn validator_rejects_count_literals() {
-    let r = round(
-        "Review",
-        vec![(0, verdict(4, &["[2/3] tests fail", "No timeout check"]))],
-        vec![],
-        "",
-    );
-    // A bracket count inside a MEMBER's text is exempt: it is a verbatim copy
-    // of the agent's issue (the agent wrote "[2/3] tests fail") — the
-    // membership check is authoritative for member text, not the prose rule.
-    let out = output(
-        "summary",
-        vec![SynthesisGroup {
-            heading: "A".into(),
-            contradiction: false,
-            members: vec![SynthesisMember {
-                agent: 0,
-                text: "[2/3] tests fail".into(),
-            }],
-        }],
-    );
+fn normalize_item_collapses_whitespace() {
     assert_eq!(
-        validate_synthesis_output(&out, &issues_by_agent(&r)),
-        Ok(()),
-        "verbatim member text containing a bracket count must pass"
-    );
-
-    // A bracket count in the LLM's own heading is a count position.
-    let out = output(
-        "summary",
-        vec![SynthesisGroup {
-            heading: "2/3 tests fail".into(),
-            contradiction: false,
-            members: vec![SynthesisMember {
-                agent: 0,
-                text: "No timeout check".into(),
-            }],
-        }],
-    );
-    let err = validate_synthesis_output(&out, &issues_by_agent(&r)).expect_err("must reject");
-    assert!(err.contains("contains a number"), "err: {err}");
-
-    // Standalone prose numbers in the summary ("2 of 3", "4/10", "3 files",
-    // "score 8") are rejected — the prompt forbids ALL numbers there.
-    for bad_summary in [
-        "2 of 3 agents flagged it",
-        "4/10 score",
-        "40% of issues",
-        "3 files affected",
-        "score 8",
-    ] {
-        let out = output(
-            bad_summary,
-            vec![SynthesisGroup {
-                heading: "A".into(),
-                contradiction: false,
-                members: vec![SynthesisMember {
-                    agent: 0,
-                    text: "No timeout check".into(),
-                }],
-            }],
-        );
-        let err = validate_synthesis_output(&out, &issues_by_agent(&r))
-            .expect_err("must reject prose number");
-        assert!(err.contains("contains a number"), "err: {err}");
-    }
-
-    // The summary check runs even when NO groups were produced.
-    let out = output("All 3 of 3 agents passed.", vec![]);
-    let err = validate_synthesis_output(&out, &issues_by_agent(&r)).expect_err("must reject");
-    assert!(err.contains("contains a number"), "err: {err}");
-}
-
-#[test]
-fn normalize_issue_text_collapses_whitespace() {
-    assert_eq!(
-        normalize_issue_text("  No   timeout\ncheck  "),
+        normalize_item("  No   timeout\ncheck  "),
         "No timeout check"
     );
-    assert_eq!(normalize_issue_text("a\tb c"), "a b c");
+    assert_eq!(normalize_item("a\tb c"), "a b c");
+}
+
+// ── Bracket arithmetic ─────────────────────────────────────────────────
+
+#[test]
+fn brackets_computed_from_distinct_cited_agents() {
+    let g = group(
+        "A",
+        false,
+        vec![member(0, "x"), member(2, "x"), member(2, "y")],
+    );
+    assert_eq!(distinct_agents(&g), vec![0, 2]);
+    // Solo [1/N] renders without DISPUTED.
+    assert_eq!(bracket_label(1, 3, false), "[1/3]");
+    // Contradiction renders [n/N · DISPUTED].
+    assert_eq!(bracket_label(2, 3, true), "[2/3 · DISPUTED]");
+    // Multi-agent consensus without contradiction stays plain.
+    assert_eq!(bracket_label(3, 3, false), "[3/3]");
+    // Single-valid round: [1/1] (no DISPUTED).
+    assert_eq!(bracket_label(1, 1, false), "[1/1]");
 }
 
 // ── Rendering ───────────────────────────────────────────────────────────
@@ -491,23 +295,22 @@ fn renderer_with_partial_failures() {
         vec![(2, "agent produced no response — crashed")],
         "1 of 2 valid verdicts failed (threshold 9/10).",
     );
-    let text = render_joint_comment(&r, &SynthesisOutcome::Fallback);
+    let text = render_joint_comment(&r, &GroupingOutcome::Fallback);
     assert!(text.contains("## Review round — 2/3 valid verdicts"));
     assert!(
-        text.contains("DISPUTED [blocker] No timeout check"),
-        "single-agent issue renders DISPUTED with blocker severity: {text}"
+        text.contains("- Agent 0: No timeout check"),
+        "fallback renders the raw per-agent member dump: {text}"
     );
     assert!(text.contains("### Agent failures"));
     assert!(text.contains("Agent 3: agent produced no response — crashed"));
-    assert!(text.contains("LLM grouping unavailable"), "fallback marker");
     assert!(
-        text.contains("[blocker]"),
-        "failing-source issue renders as blocker"
+        text.contains("LLM grouping unavailable"),
+        "fallback marker: {text}"
     );
 }
 
 #[test]
-fn renderer_with_synthesis_groups_and_contradiction_veto() {
+fn renderer_with_synthesis_groups_and_contradiction() {
     let r = round(
         "Review",
         vec![
@@ -519,74 +322,219 @@ fn renderer_with_synthesis_groups_and_contradiction_veto() {
     );
     let out = output(
         "The review found two distinct issues.",
-        vec![SynthesisGroup {
-            heading: "Robustness".into(),
-            contradiction: true,
-            members: vec![
-                SynthesisMember {
-                    agent: 0,
-                    text: "No timeout check".into(),
-                },
-                SynthesisMember {
-                    agent: 1,
-                    text: "Missing error handling".into(),
-                },
-            ],
-        }],
+        vec![
+            group("Robustness", false, vec![member(0, "No timeout check")]),
+            group(
+                "Safety",
+                true,
+                vec![
+                    member(0, "No timeout check"),
+                    member(1, "Missing error handling"),
+                ],
+            ),
+        ],
+        vec![],
     );
-    let text = render_joint_comment(&r, &SynthesisOutcome::Grouped(out));
-    assert!(text.contains("**Robustness**"));
+    let text = render_joint_comment(&r, &GroupingOutcome::Grouped(out));
     assert!(
-        text.contains("DISPUTED [blocker] No timeout check"),
-        "contradiction flag forces DISPUTED: {text}"
+        text.contains("**Robustness** [1/2]"),
+        "solo group renders [1/2] without DISPUTED: {text}"
     );
-    assert!(text.contains("DISPUTED [blocker] Missing error handling"));
-    assert!(text.contains("### Summary"));
-    assert!(text.contains("The review found two distinct issues."));
+    assert!(
+        text.contains("**Safety** [2/2 · DISPUTED]"),
+        "contradiction group renders [2/2 · DISPUTED]: {text}"
+    );
+    assert!(
+        text.contains("Agent 0: No timeout check"),
+        "member lines are attributed per source: {text}"
+    );
+}
 
-    // Numeric-only differences veto the contradiction flag: two agents wrote
-    // the SAME locator (merged to [2/3]) and one wrote a different locator.
-    // Because the difference is purely numeric (locators/evidence), the
-    // group's contradiction flag must NOT demote the [2/3] agreement.
+#[test]
+fn renderer_with_ungrouped_trailing_section() {
     let r = round(
         "Review",
         vec![
-            (0, verdict(4, &["Bug at line 3281"])),
-            (1, verdict(3, &["Bug at line 3281"])),
-            (2, verdict(5, &["Bug at line 6684–6715"])),
+            (0, verdict(4, &["No timeout check"])),
+            (1, verdict(9, &["Naming nit"])),
         ],
         vec![],
         "",
     );
     let out = output(
-        "The same bug appears at different line ranges.",
-        vec![SynthesisGroup {
-            heading: "Locator".into(),
-            contradiction: true,
-            members: vec![
-                SynthesisMember {
-                    agent: 0,
-                    text: "Bug at line 3281".into(),
-                },
-                SynthesisMember {
-                    agent: 2,
-                    text: "Bug at line 6684–6715".into(),
-                },
-            ],
-        }],
+        "One issue grouped, one left ungrouped.",
+        vec![group(
+            "Timeouts",
+            false,
+            vec![member(0, "No timeout check")],
+        )],
+        vec![member(1, "Naming nit")],
     );
-    let text = render_joint_comment(&r, &SynthesisOutcome::Grouped(out));
+    let text = render_joint_comment(&r, &GroupingOutcome::Grouped(out));
     assert!(
-        text.contains("[2/3] [blocker] Bug at line 3281"),
-        "numeric-only difference must NOT demote the [2/3] agreement: {text}"
+        text.contains("**Ungrouped**"),
+        "ungrouped section renders: {text}"
     );
     assert!(
-        text.contains("Bug at line 6684–6715"),
-        "both members render"
+        text.contains("- Agent 1: Naming nit"),
+        "ungrouped member renders deterministically: {text}"
+    );
+}
+
+#[test]
+fn renderer_marks_blocker_from_cited_agent_score() {
+    let r = round(
+        "Review",
+        vec![
+            (0, verdict(4, &["No timeout check"])),
+            (1, verdict(9, &["Naming nit"])),
+        ],
+        vec![],
+        "",
+    );
+    let out = output(
+        "summary",
+        vec![
+            group("A", false, vec![member(0, "No timeout check")]),
+            group("B", false, vec![member(1, "Naming nit")]),
+        ],
+        vec![],
+    );
+    let text = render_joint_comment(&r, &GroupingOutcome::Grouped(out));
+    assert!(
+        text.contains("[blocker] Agent 0: No timeout check"),
+        "below-threshold agent's member renders as blocker: {text}"
+    );
+    assert!(
+        !text.contains("[blocker] Agent 1"),
+        "passing agent's member is not a blocker: {text}"
+    );
+}
+
+// ── Prompt↔validator contract (zero-based agent labels) ────────────────
+
+#[test]
+fn synthesis_request_uses_zero_based_agent_labels() {
+    let r = round(
+        "Review",
+        vec![
+            (0, verdict(4, &["No timeout check"])),
+            (1, verdict(3, &["Missing retry"])),
+        ],
+        vec![],
+        "",
+    );
+    let ws = crate::workspace::test_ws("/tmp/test_ws");
+    let request = synthesis_request(&r, Role::Reviewer, &ws);
+    let system = &request.messages[0].content;
+    assert!(
+        system.contains("ZERO-BASED"),
+        "prompt must state the zero-based label contract: {system}"
+    );
+    let user = &request.messages[1].content;
+    assert!(
+        user.contains("Agent 0:"),
+        "input must label the first agent 'Agent 0': {user}"
+    );
+    assert!(
+        user.contains("Agent 1:"),
+        "input must label the second agent 'Agent 1': {user}"
+    );
+    assert!(
+        !user.contains("Agent 0 (score") && !user.contains("(score"),
+        "scores are not part of the synthesis input (the renderer adds them): {user}"
+    );
+    assert!(
+        !user.contains("Agent 2"),
+        "no agent index beyond the dispatch count: {user}"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
+async fn run_synthesis_end_to_end_zero_based_contract() {
+    let _lock = crate::util::test::retry_tests_lock();
+    let _policy = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+
+    // A faithful LLM copies the input labels (0-based) straight into the
+    // schema — this output must be accepted end-to-end.
+    let r = round(
+        "Review",
+        vec![
+            (0, verdict(4, &["No timeout check"])),
+            (1, verdict(3, &["Missing retry"])),
+        ],
+        vec![],
+        "",
+    );
+    let provider = crate::util::test::FakeProvider::new().ok(
+        r#"{"summary":"Two distinct issues.","groups":[{"heading":"Robustness","contradiction":false,"members":[{"agent":0,"text":"No timeout check"},{"agent":1,"text":"Missing retry"}]}],"ungrouped":[]}"#,
+    );
+    let _provider = crate::util::test::install_fake_provider(std::sync::Arc::new(provider));
+    let ws = crate::workspace::test_ws("/tmp/test_ws");
+    let outcome = run_synthesis(&r, Role::Reviewer, &ws).await;
+    match outcome {
+        GroupingOutcome::Grouped(out) => assert_eq!(out.groups.len(), 1),
+        GroupingOutcome::Fallback => panic!("valid zero-based output must not fall back"),
+    }
+
+    // A 1-based index (agent 2 in a 2-agent round — the pre-fix prompt
+    // contract) must be rejected and eventually fall back.
+    let r = round(
+        "Review",
+        vec![
+            (0, verdict(4, &["No timeout check"])),
+            (1, verdict(3, &["Missing retry"])),
+        ],
+        vec![],
+        "",
+    );
+    let fake = std::sync::Arc::new(crate::util::test::FakeProvider::new().ok(
+        r#"{"summary":"Two distinct issues.","groups":[{"heading":"Robustness","contradiction":false,"members":[{"agent":2,"text":"No timeout check"}]}],"ungrouped":[]}"#,
+    ));
+    let _provider = crate::util::test::install_fake_provider(fake.clone());
+    let outcome = run_synthesis(&r, Role::Reviewer, &ws).await;
+    assert!(
+        matches!(outcome, GroupingOutcome::Fallback),
+        "out-of-range 1-based index must exhaust synthesis into the fallback"
+    );
+    // The rejection must be fed back into the next attempt so the LLM can
+    // self-correct (never a byte-identical resend after a validation error).
+    let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
+    assert!(
+        fingerprints.len() >= 2 && fingerprints[1].contains("previous response was rejected"),
+        "validation rejection must be fed back: {fingerprints:?}"
     );
 }
 
 // ── Calibrated dynamic agent counts ─────────────────────────────────────
+
+#[test]
+fn review_base_from_signals_thresholds() {
+    // Low churn, no added files → 2.
+    assert_eq!(review_base_from_signals(10, 5, 0, 50, 400), 2);
+    // High churn → 4.
+    assert_eq!(review_base_from_signals(500, 10, 0, 50, 400), 4);
+    // Added files → 4 regardless of churn.
+    assert_eq!(review_base_from_signals(10, 5, 1, 50, 400), 4);
+    // Middle → 3.
+    assert_eq!(review_base_from_signals(60, 10, 0, 50, 400), 3);
+}
+
+#[test]
+fn review_agent_count_adjustments() {
+    assert_eq!(review_agent_count(2, 1, false), 2, "first round, no bounce");
+    assert_eq!(review_agent_count(2, 1, true), 3, "bounced before gets +1");
+    assert_eq!(review_agent_count(3, 1, true), 4, "bounce +1 from 3");
+    assert_eq!(review_agent_count(4, 1, true), 4, "capped at 4");
+    assert_eq!(review_agent_count(2, 0, false), 3, "P0 never gets 2");
+    assert_eq!(
+        review_agent_count(2, 0, true),
+        3,
+        "P0 floor 3 even with bounce"
+    );
+    assert_eq!(review_agent_count(3, 0, true), 4, "P0 with bounce from 3");
+}
 
 #[test]
 fn analysis_escalation_trigger() {
@@ -622,187 +570,4 @@ fn analysis_escalation_trigger() {
         &[v(3), v(5), v(6), v(4), v(2)],
         5
     ));
-}
-
-#[test]
-fn review_count_formula() {
-    let low = DEFAULT_REVIEW_COUNT_LOW_CHURN as i64;
-    let high = DEFAULT_REVIEW_COUNT_HIGH_CHURN as i64;
-
-    // 2 reviewers for low churn with zero added files.
-    assert_eq!(
-        review_base_from_signals(10, 10, 0, low, high),
-        2,
-        "low total churn"
-    );
-    assert_eq!(
-        review_base_from_signals(49, 49, 0, low, high),
-        2,
-        "at the low boundary"
-    );
-    // 4 for high churn OR any added file.
-    assert_eq!(
-        review_base_from_signals(400, 10, 0, low, high),
-        4,
-        "total at high"
-    );
-    assert_eq!(
-        review_base_from_signals(10, 400, 0, low, high),
-        4,
-        "per-file at high"
-    );
-    assert_eq!(
-        review_base_from_signals(10, 10, 1, low, high),
-        4,
-        "any added file"
-    );
-    // 3 otherwise.
-    assert_eq!(
-        review_base_from_signals(100, 100, 0, low, high),
-        3,
-        "middle band"
-    );
-    assert_eq!(
-        review_base_from_signals(50, 50, 0, low, high),
-        3,
-        "at the low boundary is not <"
-    );
-
-    // Adjustments: bounce +1 capped at 4; P0 floor 3; never 1.
-    assert_eq!(review_agent_count(2, 1, false), 2, "first round, no bounce");
-    assert_eq!(review_agent_count(2, 1, true), 3, "bounced before gets +1");
-    assert_eq!(review_agent_count(3, 1, true), 4, "bounce +1 from 3");
-    assert_eq!(review_agent_count(4, 1, true), 4, "capped at 4");
-    assert_eq!(review_agent_count(2, 0, false), 3, "P0 never gets 2");
-    assert_eq!(
-        review_agent_count(2, 0, true),
-        3,
-        "P0 floor 3 even with bounce"
-    );
-    assert_eq!(review_agent_count(3, 0, true), 4, "P0 with bounce from 3");
-}
-
-// ── Prompt↔validator contract (zero-based agent labels) ────────────────
-
-#[test]
-fn synthesis_request_uses_zero_based_agent_labels() {
-    let r = round(
-        "Review",
-        vec![
-            (0, verdict(4, &["No timeout check"])),
-            (1, verdict(3, &["Missing retry"])),
-        ],
-        vec![],
-        "",
-    );
-    let request = synthesis_request(&r, Role::Reviewer);
-    let system = &request.messages[0].content;
-    assert!(
-        system.contains("ZERO-BASED"),
-        "prompt must state the zero-based label contract: {system}"
-    );
-    let user = &request.messages[1].content;
-    assert!(
-        user.contains("Agent 0:"),
-        "input must label the first agent 'Agent 0': {user}"
-    );
-    assert!(
-        user.contains("Agent 1:"),
-        "input must label the second agent 'Agent 1': {user}"
-    );
-    assert!(
-        !user.contains("Agent 0 (score") && !user.contains("(score"),
-        "scores are not part of the synthesis input (the LLM never produces numbers): {user}"
-    );
-    assert!(
-        !user.contains("Agent 2"),
-        "no agent index beyond the dispatch count: {user}"
-    );
-}
-
-#[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
-async fn run_synthesis_end_to_end_zero_based_contract() {
-    let _lock = crate::util::test::retry_tests_lock();
-    let _policy = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-
-    // A faithful LLM copies the input labels (0-based) straight into the
-    // schema — this output must be accepted end-to-end.
-    let r = round(
-        "Review",
-        vec![
-            (0, verdict(4, &["No timeout check"])),
-            (1, verdict(3, &["Missing retry"])),
-        ],
-        vec![],
-        "",
-    );
-    let provider = crate::util::test::FakeProvider::new().ok(
-        r#"{"summary":"Two distinct issues.","groups":[{"heading":"Robustness","contradiction":false,"members":[{"agent":0,"text":"No timeout check"},{"agent":1,"text":"Missing retry"}]}]}"#,
-    );
-    let _provider = crate::util::test::install_fake_provider(std::sync::Arc::new(provider));
-    let outcome = run_synthesis(&r, Role::Reviewer, "test-workspace").await;
-    match outcome {
-        SynthesisOutcome::Grouped(out) => assert_eq!(out.groups.len(), 1),
-        SynthesisOutcome::Fallback => panic!("valid zero-based output must not fall back"),
-    }
-
-    // A 1-based index (agent 2 in a 2-agent round — the pre-fix prompt
-    // contract) must be rejected and eventually fall back.
-    let r = round(
-        "Review",
-        vec![
-            (0, verdict(4, &["No timeout check"])),
-            (1, verdict(3, &["Missing retry"])),
-        ],
-        vec![],
-        "",
-    );
-    let fake = std::sync::Arc::new(crate::util::test::FakeProvider::new().ok(
-        r#"{"summary":"Two distinct issues.","groups":[{"heading":"Robustness","contradiction":false,"members":[{"agent":2,"text":"No timeout check"}]}]}"#,
-    ));
-    let _provider = crate::util::test::install_fake_provider(fake.clone());
-    let outcome = run_synthesis(&r, Role::Reviewer, "test-workspace").await;
-    assert!(
-        matches!(outcome, SynthesisOutcome::Fallback),
-        "out-of-range 1-based index must exhaust synthesis into the fallback"
-    );
-    // The rejection must be fed back into the next attempt so the LLM can
-    // self-correct (never a byte-identical resend after a validation error).
-    let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
-    assert!(
-        fingerprints.len() >= 2 && fingerprints[1].contains("previous response was rejected"),
-        "validation rejection must be fed back into the retry: {fingerprints:?}"
-    );
-}
-
-#[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
-async fn run_synthesis_mid_round_failure_keeps_original_indices() {
-    let _lock = crate::util::test::retry_tests_lock();
-    let _policy = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-
-    // Agent 1 failed mid-round. The input labels the survivors by their
-    // ORIGINAL dispatch positions ("Agent 0"/"Agent 2") — a faithful LLM
-    // copying those labels must be accepted end-to-end and render both.
-    let r = round(
-        "Review",
-        vec![
-            (0, verdict(4, &["No timeout check"])),
-            (2, verdict(3, &["Missing retry"])),
-        ],
-        vec![(1, "agent crashed")],
-        "",
-    );
-    let provider = crate::util::test::FakeProvider::new().ok(
-        r#"{"summary":"Two distinct issues.","groups":[{"heading":"Robustness","contradiction":false,"members":[{"agent":0,"text":"No timeout check"},{"agent":2,"text":"Missing retry"}]}]}"#,
-    );
-    let _provider = crate::util::test::install_fake_provider(std::sync::Arc::new(provider));
-    let outcome = run_synthesis(&r, Role::Reviewer, "test-workspace").await;
-    match outcome {
-        SynthesisOutcome::Grouped(out) => assert_eq!(out.groups.len(), 1),
-        SynthesisOutcome::Fallback => {
-            panic!("mid-round-failure output with original indices must not fall back")
-        }
-    }
 }

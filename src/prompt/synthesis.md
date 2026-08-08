@@ -9,17 +9,12 @@ Hard rules:
   did not write it.
 - Every member must reference a specific agent number. Agent numbers are ZERO-BASED and
   match the input list exactly ("Agent 0" is the first agent, "Agent 1" the second, ...).
-  Use exactly the number shown next to that agent's issues in the input list.
+  Use the agent number shown in the input list.
 - An issue may appear in at most one group.
-- Do NOT write any numbers, counts, scores, brackets like [2/3], or percentages in the
-  summary or in group headings. Counts and agreement are computed by the pipeline from
-  the actual verdicts; you only state which issues belong together. Member text is a
-  verbatim copy of an agent's issue and may legitimately contain numbers (line numbers,
-  ranges, counts) — copy them exactly, never strip or alter them.
-- Set "contradiction": true on a group ONLY when agents genuinely disagree about the
-  same property (e.g. one says the change is safe, another says it is unsafe). Do NOT
-  flag groups whose issues differ only in line numbers, counts, or other numeric
-  details — those are locators/evidence, not contradictions.
+- Every issue from the input must appear exactly once: either as a member of a group or in
+  the "ungrouped" list. Never silently drop an issue.
+- When several agents raised the same fact, include one verbatim member per agent that
+  raised it — the agreement bracket is computed from the distinct agents you cite.
 
 Respond with ONLY a JSON object matching this exact schema (no extra fields):
 {
@@ -32,5 +27,8 @@ Respond with ONLY a JSON object matching this exact schema (no extra fields):
         {"agent": 0, "text": "<verbatim issue text from agent 0>"}
       ]
     }
+  ],
+  "ungrouped": [
+    {"agent": 1, "text": "<verbatim issue text that fit no group>"}
   ]
 }
