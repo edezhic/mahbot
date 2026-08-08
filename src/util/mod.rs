@@ -393,8 +393,8 @@ pub(crate) const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "he
 
 /// Daemon-owned subdir under the system temp dir where inbound Telegram
 /// attachments are downloaded before enrichment. Enrichment only copies
-/// video clips from here into workspace uploads — the containment root for
-/// the video-edit flow.
+/// video clips from here into workspace uploads — one of the containment
+/// roots for the video-edit flow (the other being `generated/`).
 pub(crate) const TELEGRAM_FILES_DIR: &str = "mahbot_telegram_files";
 
 /// Check whether a file path has a recognized video extension.
