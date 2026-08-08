@@ -15,7 +15,7 @@
 use crate::agent::run_agent;
 use crate::config::CONFIG;
 use crate::message_router::{self, AgentJob, JobKind};
-use crate::prompt::{load_prompt, substitute};
+use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::session::{ask_agent_id, resolve_agent_id};
 use crate::tools::Tool;
 use crate::{
@@ -355,11 +355,7 @@ async fn run_parallel_analysts_and_consolidate(ws: &Workspace, ask: &str) -> Res
 /// parallel analyst. Malformed or missing sections degrade to an empty angle
 /// (the plain ask is used, preserving the original single-question behavior).
 pub(crate) fn load_analyst_angles() -> Vec<String> {
-    load_prompt("ask/angles.md")
-        .split("\n---\n")
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
+    load_prompt_sections("ask/angles.md")
 }
 
 /// Run `count` parallel analyst agents with decorrelated research angles,

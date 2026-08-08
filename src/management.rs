@@ -37,7 +37,7 @@ use crate::git_commands::{
     run_git_write_tree,
 };
 use crate::message_router;
-use crate::prompt::{load_prompt, substitute};
+use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::role::{DIAGNOSTICS_ROLE, SANITATION_ROLE, SYSTEM_ROLE};
 use crate::session::{manager_agent_id, ticket_agent_id};
 use crate::ticket_buffer;
@@ -2302,12 +2302,30 @@ async fn persist_verdict_scores(ticket: &Ticket, stage: &str, results: &[Paralle
     }
 }
 
+/// Load per-agent angle supplements for a verifier role (review/angles.md,
+/// qa/angles.md). Missing or malformed assets degrade to no supplements —
+/// dispatch then uses today's identical shared prompt.
+fn load_verifier_angles(role: Role) -> Vec<String> {
+    match role {
+        Role::Reviewer => load_prompt_sections("review/angles.md"),
+        Role::Qa => load_prompt_sections("qa/angles.md"),
+        _ => Vec::new(),
+    }
+}
+
 /// Run `count` agents of the same role in parallel, then extract structured verdicts
 /// from their responses.
 ///
 /// Agent IDs are formatted as `ticket_{ticket.id}_{i}_{suffix}_{role}`
 /// where `suffix` is a unique 6-char NanoID for retry-cycle disambiguation.
 /// Each agent creates its own CancellationToken and auto-registers.
+///
+/// Verifier roles (Reviewer, QA) get per-agent angle supplements
+/// ([`load_verifier_angles`]) appended to the user message by index (`i % len`,
+/// cycling for counts beyond the asset's sections). KV-cache discipline: the
+/// variation is limited to the user message — model, reasoning effort, and
+/// tools stay identical across agents. Other roles load no angles, leaving the
+/// shared prompt untouched.
 ///
 /// Agents with empty responses get [`ParallelVerdict::NoResponse`]; agents that
 /// respond but fail to parse get [`ParallelVerdict::ParseFailed`]; successful
@@ -2322,6 +2340,7 @@ async fn run_parallel_agents(
     count: usize,
 ) -> Vec<ParallelVerdict> {
     let suffix = crate::generate_suffix();
+    let angles = load_verifier_angles(role);
 
     // ── Register all agents in the message router BEFORE spawning ──────
     // This allows the board's comment-routing to deliver mid-work comments
@@ -2354,18 +2373,26 @@ async fn run_parallel_agents(
         let futures: Vec<_> = agent_ids
             .into_iter()
             .zip(receivers)
-            .map(|(agent_id, rx)| {
+            .enumerate()
+            .map(|(i, (agent_id, rx))| {
                 let ticket = Arc::clone(ticket);
                 let prompt = prompt.to_string();
                 let ws = ws.clone();
                 let extraction_prompt = extraction_prompt.to_string();
+                // Angle supplement by agent index; `i % len` cycles for counts
+                // beyond the asset's sections (defensive — reviewers max at 4).
+                let agent_prompt = if angles.is_empty() {
+                    prompt
+                } else {
+                    format!("{prompt}\n\n{}", angles[i % angles.len()])
+                };
                 async move {
                     let (agent, response) = run_agent(
                         agent_id.clone(),
                         role,
                         &ws,
                         Some(&ticket),
-                        &prompt,
+                        &agent_prompt,
                         String::new(),
                         String::new(),
                         Some(rx),

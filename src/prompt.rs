@@ -39,6 +39,23 @@ pub(crate) fn load_prompt(asset_key: &str) -> String {
     }
 }
 
+/// Load a prompt asset and split it into `---`-delimited sections (trimmed,
+/// empty sections dropped). A missing asset yields an empty list — the
+/// "[PROMPT MISSING: ...]" fallback is never treated as a section.
+#[must_use]
+pub(crate) fn load_prompt_sections(asset_key: &str) -> Vec<String> {
+    let content = load_prompt(asset_key);
+    if content.starts_with("[PROMPT MISSING") {
+        return Vec::new();
+    }
+    content
+        .split("\n---\n")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 // Utils
 
 /// Append a named file section to the context string, with a markdown header
