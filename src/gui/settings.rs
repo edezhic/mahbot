@@ -344,7 +344,7 @@ pub enum SettingsMessage {
 
 // ── State ────────────────────────────────────────────────────────
 
-const REASONING_EFFORT_OPTIONS: &[&str] = &["off", "xhigh", "high", "medium", "low", "minimal"];
+const REASONING_EFFORT_OPTIONS: &[&str] = &["xhigh", "high", "medium", "low", "minimal"];
 
 pub struct SettingsState {
     /// Current editable snapshot, loaded from CONFIG each refresh.
@@ -554,11 +554,7 @@ impl SettingsState {
                 Task::none()
             }
             SettingsMessage::RoleReasoning { role, effort } => {
-                let effort_opt = if effort == "off" {
-                    None
-                } else {
-                    Some(effort).filter(|s| !s.is_empty())
-                };
+                let effort_opt = Some(effort).filter(|s| !s.is_empty());
                 RoleConfig::upsert(&mut self.config.per_role_configs, role, |c| {
                     c.reasoning_effort = effort_opt;
                 });
@@ -2110,11 +2106,7 @@ impl SettingsState {
                 .and_then(|rc| rc.reasoning_effort.clone())
                 .unwrap_or_else(|| default.to_string());
             let effort_buttons = Row::from_iter(REASONING_EFFORT_OPTIONS.iter().map(move |&opt| {
-                let is_active = if opt == "off" {
-                    current.is_empty()
-                } else {
-                    current == opt
-                };
+                let is_active = current == opt;
                 let mut btn = button(text(opt).size(11)).padding(2);
                 if is_active {
                     btn = btn.style(theme::button_primary);

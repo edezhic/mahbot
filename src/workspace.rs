@@ -2197,7 +2197,9 @@ mod tests {
             .unwrap();
             // Orphan rows for a deleted workspace — FK off so they can be inserted.
             // Migration must drop these; copying them fails under foreign_keys=ON.
-            conn.execute("PRAGMA foreign_keys = OFF;", ()).await.unwrap();
+            conn.execute("PRAGMA foreign_keys = OFF;", ())
+                .await
+                .unwrap();
             conn.execute(
                 "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) \
                  VALUES ('gone', 'Manager', 'orphan', 't')",
