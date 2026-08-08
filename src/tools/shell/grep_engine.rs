@@ -29,7 +29,10 @@ use crate::tools::shell::readonly::{strip_heredoc_bodies, strip_outer_quotes};
 /// Hidden subcommand name dispatched before lock acquisition (like `debug`).
 const ENGINE_VERB: &str = "__grep-engine";
 /// Spec JSON protocol version; mismatches make the engine fall back.
-const PROTOCOL_VERSION: u32 = 2;
+/// Bumped for the -c/-l GrepFlags fields: a spec from a swapped binary is
+/// caught here (both directions) and execs the real grep via the fallback
+/// argv, which carries the new flags.
+const PROTOCOL_VERSION: u32 = 3;
 /// NUL-detection window for binary files (FreeBSD grep reads 32 KiB).
 const BINARY_WINDOW: usize = 32 * 1024;
 /// Engine self-cap on written output; the shell pipe reader caps at the same.
@@ -575,6 +578,9 @@ enum MatchMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+// Lenient parse so a swapped binary's spec reaches the version check and
+// execs the real grep in place (the sentinel would need a parent re-run).
+#[serde(default)]
 #[allow(non_snake_case, clippy::struct_excessive_bools)] // flag-letter names, grep CLI surface
 struct GrepFlags {
     n: bool,
@@ -589,9 +595,20 @@ struct GrepFlags {
     r: bool,
     o: bool,
     null: bool,
+    c: bool,
+    l: bool,
     m: Option<u64>,
     before: usize,
     after: usize,
+}
+
+impl GrepFlags {
+    /// -c/-l select lines by count/name instead of printing them; -o becomes
+    /// inert and context flags are accepted but ignored, so the flag-surface
+    /// interaction gates don't apply.
+    fn count_mode(&self) -> bool {
+        self.c || self.l
+    }
 }
 
 /// A word from the grep segment: its unquoted value plus redirect metadata.
@@ -797,6 +814,10 @@ fn parse_grep_words(words: &[GrepWord], verb: &str) -> Result<ParsedGrep, Fallba
                 // Long options.
                 if rest == "null" {
                     flags.null = true;
+                } else if rest == "count" {
+                    flags.c = true;
+                } else if rest == "files-with-matches" {
+                    flags.l = true;
                 } else if let Some(v) = rest.strip_prefix("include=") {
                     filters.push((true, v.to_string()));
                 } else if let Some(v) = rest.strip_prefix("exclude=") {
@@ -831,6 +852,8 @@ fn parse_grep_words(words: &[GrepWord], verb: &str) -> Result<ParsedGrep, Fallba
                         's' => flags.s = true,
                         'r' | 'R' => flags.r = true,
                         'o' => flags.o = true,
+                        'c' => flags.c = true,
+                        'l' => flags.l = true,
                         'u' => {} // accepted no-op
                         'G' => mode = MatchMode::Basic,
                         'E' => mode = MatchMode::Extended,
@@ -892,17 +915,20 @@ fn parse_grep_words(words: &[GrepWord], verb: &str) -> Result<ParsedGrep, Fallba
         }
     }
 
-    // Flag-surface validation (criterion 9).
+    // Flag-surface validation (criterion 9). Under -c/-l, -o is inert and
+    // context flags are accepted but ignored, so their interaction gates
+    // don't apply.
     if flags.v {
         flags.o = false; // -v -o behaves as plain -v
     }
-    if flags.v && (flags.before > 0 || flags.after > 0) {
+    let count_mode = flags.count_mode();
+    if flags.v && (flags.before > 0 || flags.after > 0) && !count_mode {
         return Err(Fallback::UnsupportedFlag("-v+context".into()));
     }
-    if flags.o && (flags.before > 0 || flags.after > 0) {
+    if flags.o && (flags.before > 0 || flags.after > 0) && !count_mode {
         return Err(Fallback::UnsupportedFlag("-o+context".into()));
     }
-    if flags.o && flags.m.is_some() {
+    if flags.o && flags.m.is_some() && !count_mode {
         return Err(Fallback::UnsupportedFlag("-m+-o".into()));
     }
 
@@ -935,8 +961,13 @@ fn parse_grep_words(words: &[GrepWord], verb: &str) -> Result<ParsedGrep, Fallba
     }
     // `-o` + alternation: the engine (leftmost-first) diverges from BSD
     // (leftmost-longest) on match length — fail-closed. Fixed-string mode has
-    // no alternation operator, so a literal `|` stays servable.
-    if flags.o && mode != MatchMode::Fixed && engine_patterns.iter().any(|p| has_alternation(p)) {
+    // no alternation operator, so a literal `|` stays servable. -o is inert
+    // under -c/-l, so the divergence cannot surface there.
+    if flags.o
+        && !count_mode
+        && mode != MatchMode::Fixed
+        && engine_patterns.iter().any(|p| has_alternation(p))
+    {
         return Err(Fallback::UnsupportedFlag("-o+alternation".into()));
     }
     let matcher = build_matcher(&engine_patterns, mode, &flags)
@@ -969,6 +1000,8 @@ fn parse_grep_words(words: &[GrepWord], verb: &str) -> Result<ParsedGrep, Fallba
     push_flag(&mut fallback_prefix, flags.s, "-s");
     push_flag(&mut fallback_prefix, flags.r, "-r");
     push_flag(&mut fallback_prefix, flags.o, "-o");
+    push_flag(&mut fallback_prefix, flags.c, "-c");
+    push_flag(&mut fallback_prefix, flags.l, "-l");
     if flags.null {
         fallback_prefix.push("--null".into());
     }
@@ -1873,6 +1906,7 @@ fn search_file(
         binary: binary && !spec.flags.a,
         message_emitted: false,
         selected_any: false,
+        count: 0,
         matcher: &search_matcher,
         out,
     };
@@ -1882,10 +1916,11 @@ fn search_file(
         .invert_match(spec.flags.v)
         .binary_detection(grep_searcher::BinaryDetection::none())
         .heap_limit(Some(HEAP_LIMIT));
-    if spec.flags.before > 0 {
+    let count_mode = spec.flags.count_mode();
+    if !count_mode && spec.flags.before > 0 {
         sb.before_context(spec.flags.before);
     }
-    if spec.flags.after > 0 {
+    if !count_mode && spec.flags.after > 0 {
         sb.after_context(spec.flags.after);
     }
     if let Some(m) = spec.flags.m {
@@ -1895,6 +1930,9 @@ fn search_file(
     if let Err(e) = searcher.search_reader(matcher_for_search, &mut input, &mut sink) {
         emit_error(spec, out, display, &e.to_string());
         return OperandResult::Error;
+    }
+    if count_mode {
+        sink.finish_count();
     }
     if sink.selected_any {
         OperandResult::Match
@@ -1925,6 +1963,8 @@ struct GrepSink<'a> {
     binary: bool,
     message_emitted: bool,
     selected_any: bool,
+    /// Selected-line count for -c/-l (capped by -m, or at 1 by the -l stop).
+    count: u64,
     matcher: &'a SearchMatcher,
     out: &'a mut Output,
 }
@@ -1937,6 +1977,14 @@ impl grep_searcher::Sink for GrepSink<'_> {
         _searcher: &grep_searcher::Searcher,
         mat: &grep_searcher::SinkMatch<'_>,
     ) -> Result<bool, io::Error> {
+        if self.spec.flags.count_mode() {
+            // Count selected lines; -l stops at the first one. Binary files
+            // get the plain count/name (no "Binary file" message), and
+            // byte-oriented matching still counts invalid-UTF-8 lines.
+            self.selected_any = true;
+            self.count += 1;
+            return Ok(!self.spec.flags.l);
+        }
         if self.binary {
             if !self.message_emitted {
                 self.message_emitted = true;
@@ -1976,6 +2024,7 @@ impl grep_searcher::Sink for GrepSink<'_> {
         _searcher: &grep_searcher::Searcher,
         ctx: &grep_searcher::SinkContext<'_>,
     ) -> Result<bool, io::Error> {
+        // Count mode never configures context (search_file), so no events here.
         if self.binary {
             return Ok(true); // binary files only emit the message
         }
@@ -2013,6 +2062,28 @@ impl GrepSink<'_> {
             self.out.write_bytes(n.to_string().as_bytes());
             self.out.write_byte(if is_context { b'-' } else { b':' });
         }
+    }
+
+    /// Emit the -c count line and/or the -l name line after the scan. BSD
+    /// order: count first, then the name (combined -c -l). Zero-count files
+    /// always print their count; -l prints the name only when at least one
+    /// line was selected. --null NUL-terminates the name only; the count line
+    /// keeps the `path:count\n` shape.
+    fn finish_count(&mut self) {
+        if self.spec.flags.c {
+            if self.show_prefix {
+                self.out.write_bytes(self.display.as_bytes());
+                self.out.write_byte(b':');
+            }
+            self.out.write_bytes(self.count.to_string().as_bytes());
+            self.out.write_byte(b'\n');
+        }
+        if self.spec.flags.l && self.selected_any {
+            self.out.write_bytes(self.display.as_bytes());
+            self.out
+                .write_byte(if self.spec.flags.null { 0 } else { b'\n' });
+        }
+        self.out.flush();
     }
 }
 
@@ -2343,6 +2414,68 @@ mod parity_tests {
             "grep -m2 a m.txt c.txt",
             "grep -m1 -A1 a m.txt",
             "grep -m1 -B1 b m.txt",
+            // ── -c (count) ──
+            "grep -c foo a.txt",
+            "grep -c foo a.txt b.txt",
+            "grep -c zzz a.txt b.txt",  // zero counts still print, exit 1
+            "grep -ch foo a.txt b.txt", // -h suppresses -c prefixes
+            "grep -cH foo a.txt",       // -H forces the prefix
+            "grep -cn foo a.txt b.txt", // -n ignored under -c
+            "grep -c -A1 foo a.txt b.txt", // context accepted but ignored
+            "grep -cv -A1 foo a.txt b.txt", // -v+context gate relaxed under -c
+            "grep -co foo a.txt b.txt", // -o inert under -c
+            "grep -co -m2 foo a.txt b.txt", // -m+-o gate relaxed under -c
+            "grep -co 'foo\\|bar' a.txt b.txt", // -o+alternation gate relaxed under -c
+            "grep -ci FOO a.txt b.txt",
+            "grep -cw foo a.txt b.txt",
+            "grep -cx foo x1.txt a.txt",
+            "grep -c -e foo -e bar a.txt b.txt",
+            "egrep -c 'foo|bar' a.txt b.txt",
+            "fgrep -c 'a.b' br2.txt a.txt",
+            "grep -c -m2 a m.txt c.txt",    // -m caps the count
+            "grep -c -m10 foo a.txt b.txt", // -m above the match count: full count
+            "grep -c -m2 -v a m.txt",
+            "grep -cv foo a.txt b.txt",
+            "grep -cvo foo a.txt b.txt", // -v -o normalizes to plain -v under -c
+            "grep -c '' z2.txt a.txt",   // empty pattern matches all
+            "grep -c foo inv.txt",       // invalid-UTF-8 line silently non-matching
+            "grep -c bad inv.txt",
+            "grep -cv foo inv.txt",
+            "grep -cr x plain",
+            "grep -chr x plain", // -h on a recursive -c
+            "grep -crx x1 plain/a.txt plain/e.txt",
+            "grep -cr x plain missing.txt", // counts still print, exit 2
+            // ── -l (files-with-matches) ──
+            "grep -l foo a.txt",
+            "grep -l foo a.txt b.txt c.txt",
+            "grep -l zzz a.txt b.txt",  // no names, exit 1
+            "grep -lh foo a.txt b.txt", // -h has no effect on -l names
+            "grep -lH foo a.txt",
+            "grep -ln foo a.txt b.txt",
+            "grep -l -B1 foo a.txt b.txt", // context accepted but ignored
+            "grep -lw foo a.txt b.txt",
+            "grep -lv a m.txt b.txt",
+            "grep -lx foo x1.txt a.txt",
+            "grep -l -e foo -e bar a.txt b.txt",
+            "grep -lr x plain",
+            // ── combined -c -l (BSD: count capped at 1 + name) ──
+            "grep -cl foo a.txt",
+            "grep -cl foo a.txt b.txt c.txt",
+            "grep -cl zzz a.txt b.txt", // zero-count files print only the count
+            "grep -clH foo a.txt",
+            "grep -clv a m.txt b.txt",
+            "grep -cl -m5 a m.txt", // -l caps the combined count at 1
+            "grep -cla needle bindir/bin1.dat bindir/bin2.dat bindir/bin3.dat",
+            "grep -cl -e foo -e bar a.txt b.txt",
+            "grep -clr x plain",
+            "grep -clh --null foo a.txt b.txt",
+            // ── --null: NUL-terminates -l names only ──
+            "grep -l --null foo a.txt b.txt",
+            "grep -c --null foo a.txt b.txt",
+            "grep -cl --null foo a.txt b.txt",
+            "grep -lr --null x plain",
+            "grep -cr --null x plain",
+            "grep -clr --null x plain",
             // ── Errors and exit codes ──
             "grep x missing.txt a.txt",
             "grep -s x missing.txt a.txt",
@@ -2355,6 +2488,17 @@ mod parity_tests {
             "grep -rn -a needle bindir/bin1.dat bindir/bin4.dat",
             "grep -rn -v needle bindir",
             "grep -rn -o needle bindir",
+            // -c/-l on binary files: plain count/name, no "Binary file" message
+            "grep -c needle bindir/bin1.dat bindir/bin2.dat bindir/bin3.dat",
+            "grep -l needle bindir/bin1.dat bindir/bin2.dat bindir/bin3.dat",
+            "grep -cl needle bindir/bin1.dat bindir/bin2.dat bindir/bin3.dat",
+            "grep -cv needle bindir/bin1.dat bindir/bin2.dat bindir/bin3.dat",
+            "grep -clv --null needle bindir/bin1.dat bindir/bin2.dat bindir/bin3.dat",
+            "grep -ca needle bindir/bin1.dat bindir/bin2.dat bindir/bin3.dat",
+            "grep -cr needle bindir",
+            "grep -lr needle bindir",
+            "grep -clr needle bindir",
+            "grep -cs x missing.txt a.txt", // -s suppresses stderr, counts print, exit 2
             // Binary + invalid-UTF-8 match line: byte-oriented detection must
             // count the match (Binary message / exit 0), and -a must print the
             // raw line — the per-line UTF-8 gate must not poison it.
@@ -2434,8 +2578,6 @@ mod parity_tests {
             "grep x",                                  // stdin
             "echo hi | grep x",                        // piped stdin
             "grep x -",                                // - operand
-            "grep -c x a.txt",                         // -c
-            "grep -l x a.txt",                         // -l
             "grep -q x a.txt",                         // -q
             "grep -L x a.txt",                         // -L
             "grep -P x a.txt",                         // -P
@@ -2461,6 +2603,8 @@ mod parity_tests {
             "grep -o 'x\\(a\\|ab\\)' br.txt a.txt",    // -o + nested alternation
             "grep x *.rs",                             // unexpandable glob
             "grep x a.txt",                            // single file (perf gate)
+            "grep -c x a.txt",                         // single file, -c (perf gate)
+            "grep -l x a.txt",                         // single file, -l (perf gate)
             "grep -r x plain/e.txt",                   // single file, recursive
             "cat <<EOF\nfoo\nEOF\ngrep x a.txt b.txt", // heredoc feeds a non-grep member
             "git grep x",                              // git grep

@@ -58,6 +58,30 @@ fn run_matrix() -> i32 {
         "grep -v foo a.txt b.txt",
         "grep -m2 a m.txt c.txt",
         "grep -rn x plain | head -3",
+        // ── -c / -l ──
+        "grep -c foo a.txt b.txt",
+        "grep -c foo a.txt b.txt c.txt",
+        "grep -l foo a.txt b.txt c.txt",
+        "grep -cl foo a.txt b.txt c.txt",
+        "grep -ch foo a.txt b.txt",
+        "grep -cn foo a.txt b.txt",
+        "grep -co foo a.txt b.txt",
+        "grep -cv foo a.txt b.txt",
+        "grep -c -m2 a m.txt c.txt",
+        "grep -cl -m5 a m.txt c.txt",
+        "grep -cr x plain",
+        "grep -lr x plain",
+        "grep -clr x plain",
+        "grep -cr needle bindir",
+        "grep -lr needle bindir",
+        "grep -clr needle bindir",
+        "grep -cr needle sub",
+        "grep -c x missing.txt a.txt",
+        "grep -l --null foo a.txt b.txt",
+        "grep -c --null foo a.txt b.txt",
+        "grep -cl --null foo a.txt b.txt",
+        "grep -lr --null x plain",
+        "grep -cr --null x plain",
     ];
 
     let mut failures = 0;
@@ -165,14 +189,14 @@ fn check_exec_fallback(ws: &Path) -> Result<(), String> {
     // real grep, which then runs in the ACTUAL cwd.
     check_exec_case(
         ws,
-        r#"{"version":2,"verb":"grep","mode":"Basic","flags":{"n":true,"i":false,"v":false,"w":false,"x":false,"a":false,"h":false,"H":false,"s":false,"r":true,"o":false,"null":false,"m":null,"before":0,"after":0},"filters":[],"exclude_dir":[],"patterns":["x"],"operands":[{"display":".","resolved":"/nonexistent","trailing_slash":false}],"cwd":"/nonexistent","fallback":["grep","-rn","x","."]}"#,
+        r#"{"version":3,"verb":"grep","mode":"Basic","flags":{"n":true,"i":false,"v":false,"w":false,"x":false,"a":false,"h":false,"H":false,"s":false,"r":true,"o":false,"null":false,"c":false,"l":false,"m":null,"before":0,"after":0},"filters":[],"exclude_dir":[],"patterns":["x"],"operands":[{"display":".","resolved":"/nonexistent","trailing_slash":false}],"cwd":"/nonexistent","fallback":["grep","-rn","x","."]}"#,
         "grep -rn x .",
     )?;
     // A dash-prefixed operand must survive the exec'd grep via the `--`
     // separator the parent inserts into the fallback argv.
     let dash_abs = ws.join("-x1").to_string_lossy().into_owned();
     let json = format!(
-        r#"{{"version":2,"verb":"grep","mode":"Basic","flags":{{"n":false,"i":false,"v":false,"w":false,"x":false,"a":false,"h":false,"H":false,"s":false,"r":false,"o":false,"null":false,"m":null,"before":0,"after":0}},"filters":[],"exclude_dir":[],"patterns":["x"],"operands":[{{"display":"-x1","resolved":"{dash_abs}","trailing_slash":false}}],"cwd":"/nonexistent","fallback":["grep","-e","x","--","-x1"]}}"#
+        r#"{{"version":3,"verb":"grep","mode":"Basic","flags":{{"n":false,"i":false,"v":false,"w":false,"x":false,"a":false,"h":false,"H":false,"s":false,"r":false,"o":false,"null":false,"c":false,"l":false,"m":null,"before":0,"after":0}},"filters":[],"exclude_dir":[],"patterns":["x"],"operands":[{{"display":"-x1","resolved":"{dash_abs}","trailing_slash":false}}],"cwd":"/nonexistent","fallback":["grep","-e","x","--","-x1"]}}"#
     );
     check_exec_case(ws, &json, "grep -e x -- -x1")
 }
