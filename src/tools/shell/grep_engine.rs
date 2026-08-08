@@ -379,7 +379,7 @@ fn split_segments(command: &str) -> Vec<(String, String)> {
             }
             continue;
         }
-        if track_quotes(c, &mut in_single, &mut in_double) {
+        if super::check_outside_quotes(c, &mut in_single, &mut in_double) {
             if super::consume_substitution(c, &mut chars, &mut current) {
                 continue;
             }
@@ -419,28 +419,6 @@ fn split_segments(command: &str) -> Vec<(String, String)> {
     }
     flush(&mut current, &mut out, "");
     out
-}
-
-/// Quote-state tracking for the segmenter (backslash handled by the caller).
-fn track_quotes(c: char, in_single: &mut bool, in_double: &mut bool) -> bool {
-    if *in_single {
-        if c == '\'' {
-            *in_single = false;
-        }
-        return false;
-    }
-    if *in_double {
-        if c == '"' {
-            *in_double = false;
-        }
-        return false;
-    }
-    match c {
-        '\'' => *in_single = true,
-        '"' => *in_double = true,
-        _ => {}
-    }
-    true
 }
 
 /// First whitespace-delimited word of a segment (raw, quote-preserving).
@@ -663,7 +641,7 @@ fn grep_tokenize(segment: &str) -> Result<Vec<GrepWord>, Fallback> {
             }
             continue;
         }
-        if track_quotes(c, &mut in_single, &mut in_double) {
+        if super::check_outside_quotes(c, &mut in_single, &mut in_double) {
             if super::consume_substitution(c, &mut chars, &mut current) {
                 continue;
             }
