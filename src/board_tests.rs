@@ -2762,59 +2762,6 @@ async fn test_list_archived_with_embeddings_returns_deserialized() {
 
 // ── route_comment_to_agents tests ─────────────────────────────────────
 
-/// route_comment_to_agents dispatches a comment to a registered agent
-/// via the message router.
-#[tokio::test]
-async fn test_route_comment_to_agents_delivers_to_registered_agent() {
-    crate::util::test::init_management_test_stores().await;
-    let store = crate::board::store();
-    let ws = crate::workspace::test_ws("/tmp/test_route_comment");
-
-    // Create a ticket with assigned_to set
-    let ticket_id = crate::util::test::make_ticket(
-        store,
-        &ws,
-        "route-comment-test",
-        crate::board::TicketPhase::InDevelopment,
-    )
-    .await;
-
-    // Set assigned_to to a known agent ID
-    let agent_id = "_test_route_comment_agent";
-    store
-        .set_assigned_to_no_cancel(&ticket_id, Some(agent_id))
-        .await
-        .expect("set assigned_to");
-
-    // Register an agent in the router
-    let mut rx = crate::message_router::register_agent(agent_id);
-
-    // Add a comment — this should route to the registered agent
-    store
-        .add_comment(&ticket_id, "manager", "Hello from test")
-        .await
-        .expect("add_comment should succeed");
-
-    // The agent should receive the comment
-    let received = rx.try_recv().expect("should receive the routed comment");
-    assert_eq!(received.content, "Hello from test");
-    assert_eq!(received.kind, crate::message_router::JobKind::TicketComment,);
-    assert_eq!(received.user_name, "manager");
-    assert_eq!(
-        received.role,
-        crate::Role::Manager,
-        "role should be the commenter's role (manager)",
-    );
-
-    // No more messages
-    assert!(
-        rx.try_recv().is_err(),
-        "should not have additional messages",
-    );
-
-    crate::message_router::unregister_agent(agent_id);
-}
-
 /// route_comment_to_agents silently skips when no agents are assigned.
 #[tokio::test]
 async fn test_route_comment_to_agents_no_assignment() {
@@ -2838,44 +2785,57 @@ async fn test_route_comment_to_agents_no_assignment() {
         .expect("add_comment should succeed");
 }
 
-/// route_comment_to_agents uses the commenter's role in the AgentJob.
+/// route_comment_to_agents delivers a comment to the registered agent with
+/// the commenter's role in the AgentJob. The engineer row guards the
+/// Role::parse → Manager fallback — the manager row alone would pass silently.
 #[tokio::test]
-async fn test_route_comment_to_agents_uses_commenter_role() {
+async fn test_route_comment_to_agents_delivers_with_commenter_role() {
     crate::util::test::init_management_test_stores().await;
     let store = crate::board::store();
-    let ws = crate::workspace::test_ws("/tmp/test_route_comment_role");
 
-    let ticket_id = crate::util::test::make_ticket(
-        store,
-        &ws,
-        "role-test",
-        crate::board::TicketPhase::InDevelopment,
-    )
-    .await;
+    for (i, (commenter, content, expected_role)) in [
+        ("manager", "Hello from test", crate::Role::Manager),
+        ("engineer", "Code review feedback", crate::Role::Engineer),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ws = crate::workspace::test_ws(format!("/tmp/test_route_comment_{i}"));
+        let ticket_id = crate::util::test::make_ticket(
+            store,
+            &ws,
+            &format!("route-comment-test-{i}"),
+            crate::board::TicketPhase::InDevelopment,
+        )
+        .await;
 
-    let agent_id = "_test_route_comment_role_agent";
-    store
-        .set_assigned_to_no_cancel(&ticket_id, Some(agent_id))
-        .await
-        .expect("set assigned_to");
+        let agent_id = format!("_test_route_comment_agent_{i}");
+        store
+            .set_assigned_to_no_cancel(&ticket_id, Some(&agent_id))
+            .await
+            .expect("set assigned_to");
+        let mut rx = crate::message_router::register_agent(&agent_id);
 
-    let mut rx = crate::message_router::register_agent(agent_id);
+        store
+            .add_comment(&ticket_id, commenter, content)
+            .await
+            .expect("add_comment should succeed");
 
-    // Add a comment as "engineer" role
-    store
-        .add_comment(&ticket_id, "engineer", "Code review feedback")
-        .await
-        .expect("add_comment should succeed");
+        let received = rx.try_recv().expect("should receive the routed comment");
+        assert_eq!(received.content, content);
+        assert_eq!(received.kind, crate::message_router::JobKind::TicketComment);
+        assert_eq!(received.user_name, commenter);
+        assert_eq!(
+            received.role, expected_role,
+            "role should be the commenter's role ({commenter})",
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "should not have additional messages"
+        );
 
-    let received = rx.try_recv().expect("should receive the routed comment");
-    assert_eq!(
-        received.role,
-        crate::Role::Engineer,
-        "role should be engineer (not Manager)",
-    );
-    assert_eq!(received.user_name, "engineer");
-
-    crate::message_router::unregister_agent(agent_id);
+        crate::message_router::unregister_agent(&agent_id);
+    }
 }
 
 /// Manual "Redo Dev" bounce-back transitions Reviewed → ReadyForDevelopment
