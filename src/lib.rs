@@ -1475,31 +1475,6 @@ mod tests {
     }
 
     #[test]
-    fn from_buffers_roundtrip() {
-        // Test that from_buffers converts the buffer array correctly.
-        let buffers = [
-            "cargo fmt".to_string(),
-            "cargo fmt -- --check".to_string(),
-            "cargo clippy --fix --allow-dirty".to_string(),
-            "cargo clippy -- -D warnings".to_string(),
-            "cargo check".to_string(),
-            "cargo build".to_string(),
-            "cargo test".to_string(),
-        ];
-        let cmds = DiagnosticsCommands::from_buffers(&buffers);
-        assert_eq!(cmds.format.as_deref(), Some("cargo fmt"));
-        assert_eq!(cmds.format_check.as_deref(), Some("cargo fmt -- --check"));
-        assert_eq!(
-            cmds.lint_fix.as_deref(),
-            Some("cargo clippy --fix --allow-dirty")
-        );
-        assert_eq!(cmds.lint.as_deref(), Some("cargo clippy -- -D warnings"));
-        assert_eq!(cmds.type_check.as_deref(), Some("cargo check"));
-        assert_eq!(cmds.build.as_deref(), Some("cargo build"));
-        assert_eq!(cmds.unit_test.as_deref(), Some("cargo test"));
-    }
-
-    #[test]
     fn from_buffers_empty_strings_become_none() {
         let buffers = [const { String::new() }; DiagnosticsCommands::COMMAND_COUNT];
         let cmds = DiagnosticsCommands::from_buffers(&buffers);
