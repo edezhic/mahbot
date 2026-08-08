@@ -901,6 +901,7 @@ async fn synthesize_claim_report(
     verification: &[VerificationResult],
     outcomes: &[AnalystOutcome],
 ) -> Result<String> {
+    let _call = crate::call_registry::NON_AGENT_CALLS.register("consolidate", &ws.name);
     let model = CONFIG.role_model(Role::Analyst);
     let routing = CONFIG.model_routing(&model);
     let prompt_template = load_prompt("consolidate/analyst.md");

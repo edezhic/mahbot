@@ -336,7 +336,12 @@ fn synthesis_request(round: &JointRound<'_>, role: Role) -> ChatRequest {
 /// rejection is fed back into the next attempt so the LLM can self-correct.
 /// Exhaustion yields the deterministic fallback (never a fabricated comment).
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) async fn run_synthesis(round: &JointRound<'_>, role: Role) -> SynthesisOutcome {
+pub(crate) async fn run_synthesis(
+    round: &JointRound<'_>,
+    role: Role,
+    ws_name: &str,
+) -> SynthesisOutcome {
+    let _call = crate::call_registry::NON_AGENT_CALLS.register("synthesis", ws_name);
     let policy = RetryPolicy::synthesis_from_config();
     let mut loop_state = RetryLoop::new(&policy);
     let mut request = synthesis_request(round, role);
@@ -436,8 +441,12 @@ pub(crate) async fn run_synthesis(round: &JointRound<'_>, role: Role) -> Synthes
 }
 
 /// Convenience: run the synthesis pass and render the joint comment.
-pub(crate) async fn build_joint_comment(round: &JointRound<'_>, role: Role) -> String {
-    let outcome = run_synthesis(round, role).await;
+pub(crate) async fn build_joint_comment(
+    round: &JointRound<'_>,
+    role: Role,
+    ws_name: &str,
+) -> String {
+    let outcome = run_synthesis(round, role, ws_name).await;
     render_joint_comment(round, &outcome)
 }
 

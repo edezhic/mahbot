@@ -2268,7 +2268,8 @@ impl Dashboard {
     }
 
     /// Render the active agent icons in the right side of the footer.
-    fn render_active_agents() -> Element<'static, Message> {
+    /// Returns `None` when no agents are running.
+    fn render_active_agents() -> Option<Element<'static, Message>> {
         let handles = crate::registry::AGENT_REGISTRY.list();
         let mut role_counts: std::collections::BTreeMap<&str, usize> =
             std::collections::BTreeMap::new();
@@ -2276,7 +2277,7 @@ impl Dashboard {
             *role_counts.entry(h.role.as_str()).or_insert(0) += 1;
         }
         if role_counts.is_empty() {
-            return text("").into();
+            return None;
         }
         let mut icons: Vec<Element<'_, Message>> = Vec::new();
         for (role_str, count) in &role_counts {
@@ -2308,10 +2309,51 @@ impl Dashboard {
                 );
             }
         }
-        Row::with_children(icons)
-            .spacing(12)
-            .align_y(Alignment::Center)
-            .into()
+        Some(
+            Row::with_children(icons)
+                .spacing(12)
+                .align_y(Alignment::Center)
+                .into(),
+        )
+    }
+
+    /// Render the in-flight non-agent LLM call counter next to the agent
+    /// icons. Distinct marker (zap glyph in accent color); a tooltip lists
+    /// the in-flight call kinds. Returns `None` when none are in flight.
+    fn render_non_agent_calls() -> Option<Element<'static, Message>> {
+        let handles = crate::call_registry::NON_AGENT_CALLS.list();
+        if handles.is_empty() {
+            return None;
+        }
+        let color = theme::ACCENT;
+        let content = container(
+            row![
+                lucide::zap::<iced::Theme, iced::Renderer>()
+                    .size(24)
+                    .color(color),
+                text(format!("×{}", handles.len())).size(15).color(color),
+            ]
+            .spacing(3)
+            .align_y(Alignment::Center),
+        )
+        .padding(iced::Padding {
+            left: 3.0,
+            right: 3.0,
+            top: 0.0,
+            bottom: 0.0,
+        });
+        let mut kinds: Vec<&str> = handles.iter().map(|h| h.kind).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        Some(
+            tooltip(
+                content,
+                text(kinds.join(", ")).size(11),
+                tooltip::Position::Top,
+            )
+            .style(theme::tooltip_style)
+            .into(),
+        )
     }
 
     /// Render the TTS download progress indicator in the centre of the footer bar.
@@ -2405,7 +2447,14 @@ impl Dashboard {
         .spacing(8)
         .align_y(Alignment::Center);
 
-        let right = Self::render_active_agents();
+        let right = Row::with_children(
+            [Self::render_active_agents(), Self::render_non_agent_calls()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+        )
+        .spacing(12)
+        .align_y(Alignment::Center);
 
         let footer_row = row![left, center, Space::new().width(Length::Fill), right]
             .align_y(Alignment::Center)

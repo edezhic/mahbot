@@ -741,7 +741,7 @@ async fn run_synthesis_end_to_end_zero_based_contract() {
         r#"{"summary":"Two distinct issues.","groups":[{"heading":"Robustness","contradiction":false,"members":[{"agent":0,"text":"No timeout check"},{"agent":1,"text":"Missing retry"}]}]}"#,
     );
     let _provider = crate::util::test::install_fake_provider(std::sync::Arc::new(provider));
-    let outcome = run_synthesis(&r, Role::Reviewer).await;
+    let outcome = run_synthesis(&r, Role::Reviewer, "test-workspace").await;
     match outcome {
         SynthesisOutcome::Grouped(out) => assert_eq!(out.groups.len(), 1),
         SynthesisOutcome::Fallback => panic!("valid zero-based output must not fall back"),
@@ -762,7 +762,7 @@ async fn run_synthesis_end_to_end_zero_based_contract() {
         r#"{"summary":"Two distinct issues.","groups":[{"heading":"Robustness","contradiction":false,"members":[{"agent":2,"text":"No timeout check"}]}]}"#,
     ));
     let _provider = crate::util::test::install_fake_provider(fake.clone());
-    let outcome = run_synthesis(&r, Role::Reviewer).await;
+    let outcome = run_synthesis(&r, Role::Reviewer, "test-workspace").await;
     assert!(
         matches!(outcome, SynthesisOutcome::Fallback),
         "out-of-range 1-based index must exhaust synthesis into the fallback"
@@ -798,7 +798,7 @@ async fn run_synthesis_mid_round_failure_keeps_original_indices() {
         r#"{"summary":"Two distinct issues.","groups":[{"heading":"Robustness","contradiction":false,"members":[{"agent":0,"text":"No timeout check"},{"agent":2,"text":"Missing retry"}]}]}"#,
     );
     let _provider = crate::util::test::install_fake_provider(std::sync::Arc::new(provider));
-    let outcome = run_synthesis(&r, Role::Reviewer).await;
+    let outcome = run_synthesis(&r, Role::Reviewer, "test-workspace").await;
     match outcome {
         SynthesisOutcome::Grouped(out) => assert_eq!(out.groups.len(), 1),
         SynthesisOutcome::Fallback => {

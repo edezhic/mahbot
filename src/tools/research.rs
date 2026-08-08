@@ -592,6 +592,7 @@ fn orchestrator_params(ws: &Workspace, purpose: &'static str) -> ChatRequest {
 /// Free-form orchestrator LLM call via the hardened outer retry loop.
 /// The general workspace context is prepended as the leading system message.
 async fn orchestrator_chat(ws: &Workspace, purpose: &'static str, user: &str) -> Result<String> {
+    let _call = crate::call_registry::NON_AGENT_CALLS.register(purpose, &ws.name);
     let mut params = orchestrator_params(ws, purpose);
     let mut messages = Vec::with_capacity(2);
     crate::prompt::prepend_general_context(&mut messages, ws).await;
@@ -613,6 +614,7 @@ async fn orchestrator_extract<T: serde::de::DeserializeOwned>(
     prompt: &str,
     validate: Option<&crate::ExtractionValidator<T>>,
 ) -> Result<T> {
+    let _call = crate::call_registry::NON_AGENT_CALLS.register(purpose, &ws.name);
     let params = orchestrator_params(ws, purpose);
     let mut messages = Vec::with_capacity(2);
     crate::prompt::prepend_general_context(&mut messages, ws).await;

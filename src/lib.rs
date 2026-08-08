@@ -13,6 +13,7 @@
 pub(crate) mod agent;
 pub mod audio;
 pub mod board;
+pub(crate) mod call_registry;
 pub mod channels;
 pub(crate) mod chat_history;
 pub mod checkpoint;

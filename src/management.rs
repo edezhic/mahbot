@@ -2230,6 +2230,7 @@ async fn build_joint_comment(
     threshold: u8,
     role: Role,
     header: &str,
+    ws_name: &str,
 ) -> String {
     let mut verdicts: Vec<crate::joint_verdict::JointVerdict<'_>> = Vec::new();
     let mut failures: Vec<crate::joint_verdict::JointFailure> = Vec::new();
@@ -2275,7 +2276,7 @@ async fn build_joint_comment(
             &crate::joint_verdict::SynthesisOutcome::Fallback,
         )
     } else {
-        crate::joint_verdict::build_joint_comment(&round, role).await
+        crate::joint_verdict::build_joint_comment(&round, role, ws_name).await
     }
 }
 
@@ -2640,6 +2641,7 @@ async fn process_analyst_verdicts(ticket: &Ticket, results: &[ParallelVerdict]) 
                 ANALYST_PASS_THRESHOLD,
                 Role::Analyst,
                 &summary,
+                &ticket.workspace_name,
             )
             .await,
         )
@@ -3051,6 +3053,7 @@ async fn process_verifier_verdicts(
                 REVIEW_QA_THRESHOLD,
                 verifier.role,
                 &header,
+                &ticket.workspace_name,
             )
             .await,
         )
