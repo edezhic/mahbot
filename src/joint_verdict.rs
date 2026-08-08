@@ -10,12 +10,12 @@
 //! for solo findings). The LLM never produces counts — brackets are pure
 //! arithmetic here.
 //!
-//! Anti-fabrication: every group member must carry the verbatim
-//! (exact-normalized) issue text of a specific agent; any violation rejects
-//! the offending group (per-group acceptance — valid groups freeze), and
-//! termination deterministically places every remaining item in the ungrouped
-//! section, eventually falling back to a deterministic raw member dump with
-//! an explicit marker when nothing ever freezes.
+//! Items are referenced by stable numeric ids (global flat numbering across
+//! all agents); validation is strictly structural (id range, duplicate
+//! placement, completeness, contradiction ≥2 agents) and termination
+//! deterministically places every remaining item in the ungrouped section,
+//! eventually falling back to a deterministic raw member dump with an
+//! explicit marker when nothing ever freezes.
 
 use std::fmt::Write as _;
 
@@ -70,29 +70,17 @@ impl JointRound<'_> {
     }
 }
 
-// ── Per-agent issue lists (validation universe) ─────────────────────────
+// ── Per-agent issue lists (id universe) ─────────────────────────────────
 
-/// Key the per-agent issue lists by the ORIGINAL dispatch index (the label
-/// the LLM sees in the input) — never a compacted 0..n_valid-1 space. A
-/// failed agent's slot stays empty, so a member referencing it is rejected.
-/// Per-agent duplicates (the same issue reported twice by one agent) are
-/// deduped: the validation universe and the LLM input both carry unique
-/// items, so an LLM citing the item once can never trip the double-count
-/// rejection nor fail the completeness check.
+/// Key the per-agent issue lists by the ORIGINAL dispatch index. A failed
+/// agent's slot stays empty. Per-agent duplicates are NOT deduped: two
+/// identical issues from one agent are two distinct item ids in the global
+/// flat numbering, and the model places each exactly once.
 #[must_use]
 pub(crate) fn issues_by_agent(round: &JointRound<'_>) -> Vec<Vec<String>> {
     let mut by_agent: Vec<Vec<String>> = vec![Vec::new(); round.dispatched];
     for v in &round.verdicts {
-        let mut seen = std::collections::HashSet::new();
-        by_agent[v.agent_index] = v
-            .verdict
-            .issues_detected
-            .iter()
-            .filter_map(|i| {
-                let n = crate::consensus::normalize_item(i);
-                seen.insert(n.clone()).then_some(n)
-            })
-            .collect();
+        by_agent[v.agent_index].clone_from(&v.verdict.issues_detected);
     }
     by_agent
 }
@@ -117,22 +105,24 @@ fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> Chat
         crate::prompt::load_prompt("grouping_contradictions.md"),
     );
     let mut material = String::new();
+    // Global flat item ids across ALL agents: ids 0..N are assigned in
+    // (agent, issue) order and match the schema's `id` field — a faithful LLM
+    // can copy an id straight into the JSON. Scores are deliberately NOT
+    // included: they are not needed for grouping, and a faithful LLM echoing
+    // one would be rejected (the renderer adds scores/severity from code).
+    let mut id = 0usize;
     for (agent_idx, issues) in issues_by_agent(round).into_iter().enumerate() {
         if issues.is_empty() {
             continue;
         }
-        // Agent labels are ZERO-BASED and match the schema's `agent` field —
-        // a faithful LLM can copy the label directly into the JSON. Scores are
-        // deliberately NOT included: they are not needed for grouping, and a
-        // faithful LLM echoing one would be rejected (the renderer adds
-        // scores/severity from code).
         let _ = std::fmt::write(&mut material, format_args!("Agent {agent_idx}:\n"));
         for issue in issues {
-            let _ = writeln!(material, "- {issue}");
+            let _ = writeln!(material, "- {id}: {issue}");
+            id += 1;
         }
     }
     let user = format!(
-        "{}\n\nStage: {}\nAgent issues (verbatim):\n{}",
+        "{}\n\nStage: {}\nAgent issues (id-numbered):\n{}",
         crate::prompt::load_prompt("synthesis_input.md"),
         round.stage,
         material,
@@ -165,8 +155,9 @@ pub(crate) async fn build_joint_comment(
     role: Role,
     ws: &Workspace,
 ) -> String {
+    let items = issues_by_agent(round);
     let outcome = run_synthesis(round, role, ws).await;
-    render_joint_comment(round, &outcome)
+    render_joint_comment(round, &outcome, &crate::consensus::ItemTable::new(&items))
 }
 
 /// Run the repair-mode synthesis pass through the shared consensus core
@@ -200,6 +191,7 @@ pub(crate) async fn run_synthesis(
 pub(crate) fn render_joint_comment(
     round: &JointRound<'_>,
     outcome: &crate::consensus::RepairOutcome,
+    table: &crate::consensus::ItemTable<'_>,
 ) -> String {
     let mut out = String::new();
     let n_valid = round.n_valid();
@@ -217,17 +209,16 @@ pub(crate) fn render_joint_comment(
     }
 
     // Issues with brackets — grouped by the LLM when available.
-    let items = issues_by_agent(round);
-    let has_issues = items.iter().any(|list| !list.is_empty());
+    let has_issues = table.len() > 0;
     if has_issues {
         match outcome {
             crate::consensus::RepairOutcome::Repaired { output, references } => {
                 for group in &output.groups {
-                    let n = crate::consensus::distinct_agents(group).len();
+                    let n = crate::consensus::distinct_agents(group, table).len();
                     let bracket = crate::consensus::bracket_label(n, n_valid, group.contradiction);
                     let _ = write!(out, "\n\n**{}** {bracket}", group.heading);
                     for member in &group.members {
-                        let _ = write!(out, "\n- {}", render_member_line(round, member));
+                        let _ = write!(out, "\n- {}", render_member_line(round, member, table));
                     }
                 }
                 // Code-computed ungrouped remainder — deterministic trailing
@@ -235,12 +226,8 @@ pub(crate) fn render_joint_comment(
                 if !output.ungrouped.is_empty() {
                     out.push_str("\n\n**Ungrouped**");
                     for member in &output.ungrouped {
-                        let mut line = render_member_line(round, member);
-                        for reference in references.iter().filter(|r| {
-                            r.member.agent == member.agent
-                                && crate::consensus::normalize_item(&r.member.text)
-                                    == crate::consensus::normalize_item(&member.text)
-                        }) {
+                        let mut line = render_member_line(round, member, table);
+                        for reference in references.iter().filter(|r| r.member.id == member.id) {
                             if let Some(group) = output.groups.get(reference.group) {
                                 let _ = write!(
                                     line,
@@ -254,11 +241,12 @@ pub(crate) fn render_joint_comment(
                 }
             }
             crate::consensus::RepairOutcome::Fallback => {
-                // Deterministic fail-open: raw per-agent issue dump + marker.
+                // Deterministic fail-open: raw per-agent issue dump + marker
+                // (global flat id order = (agent, item) order).
                 out.push_str("\n\n**Issues**");
-                for (agent_idx, list) in items.iter().enumerate() {
-                    for text in list {
-                        let _ = write!(out, "\n- Agent {agent_idx}: {text}");
+                for id in 0..table.len() {
+                    if let Some((agent, text)) = table.resolve(id) {
+                        let _ = write!(out, "\n- Agent {agent}: {text}");
                     }
                 }
             }
@@ -327,14 +315,22 @@ pub(crate) fn render_joint_comment(
 
 /// Render one member line: `Agent N: text` with a `[blocker]` prefix when the
 /// cited agent's verdict scored below the round threshold (code-computed
-/// severity — the LLM never produces it).
-fn render_member_line(round: &JointRound<'_>, member: &crate::consensus::GroupingMember) -> String {
+/// severity — the LLM never produces it). The cited agent is resolved via the
+/// item table — no text equality.
+fn render_member_line(
+    round: &JointRound<'_>,
+    member: &crate::consensus::GroupingMember,
+    table: &crate::consensus::ItemTable<'_>,
+) -> String {
+    let Some((agent, text)) = table.resolve(member.id) else {
+        return format!("Agent ?: <unknown item id {}>", member.id);
+    };
     let blocker = round
         .verdicts
         .iter()
-        .any(|v| v.agent_index == member.agent && v.verdict.score < round.threshold);
+        .any(|v| v.agent_index == agent && v.verdict.score < round.threshold);
     let severity = if blocker { "[blocker] " } else { "" };
-    format!("{severity}Agent {}: {}", member.agent, member.text)
+    format!("{severity}Agent {agent}: {text}")
 }
 
 // ── Calibrated dynamic agent counts ─────────────────────────────────────

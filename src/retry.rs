@@ -310,7 +310,9 @@ pub(crate) fn compute_sleep_ms(schedule_ms: u64, retry_after_ms: Option<u64>) ->
 /// The `Membership`/`Completeness`/`ContradictionAgents`/`ValidationOther`
 /// variants carry repair-validation semantics on the shared provider-failure
 /// path (granular causes ride the existing failure-cause field); they are
-/// retryable and only ever produced by the grouping core.
+/// retryable and only ever produced by the grouping core. `TruncatedOutput`
+/// marks a provider output-token-limit truncation (finish_reason "length") —
+/// retryable with shorten/compress feedback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FailureClass {
     /// Network/transport error (connection reset, timeouts, 5xx, 429).
@@ -324,9 +326,9 @@ pub(crate) enum FailureClass {
     /// Parsed successfully but a validation hook rejected the value
     /// (e.g. verdict score outside [0,10]).
     OutOfRangeScore,
-    /// Repair-round group rejected: a member's text is not verbatim in the
-    /// cited agent's list, the agent index is out of range, or the member
-    /// was already placed in a frozen group.
+    /// Repair-round group rejected: a member's item id is out of range, or
+    /// the member was already placed in a frozen group / pinned by an
+    /// accepted contradiction reference.
     Membership,
     /// Repair-round proposal silently dropped unfrozen items (incomplete
     /// coverage).
@@ -336,6 +338,9 @@ pub(crate) enum FailureClass {
     /// A validation rejection outside the granular categories (empty
     /// heading/summary, malformed structure, out-of-range group reference).
     ValidationOther,
+    /// Provider returned text cut at its output-token limit (finish_reason
+    /// "length").
+    TruncatedOutput,
     /// Provider returned an empty text response.
     NoResponse,
     /// Permanent client error (auth, quota, invalid model, tool schema).
@@ -368,6 +373,7 @@ impl FailureClass {
             Self::Completeness => "completeness",
             Self::ContradictionAgents => "contradiction_agents",
             Self::ValidationOther => "validation_other",
+            Self::TruncatedOutput => "truncated_output",
             Self::NoResponse => "no_response",
             Self::NonRetryable => "non_retryable",
             Self::Shutdown => "shutdown",
@@ -604,7 +610,7 @@ impl std::error::Error for RetryExhausted {}
 /// Mutable per-operation state shared by the outer retry loops.
 ///
 /// Encapsulates the backoff schedule, the per-attempt failure trail,
-/// Retry-After stickiness, and the wall-clock deadline so [`retry_chat`] and
+/// Retry-After stickiness, and the wall-clock deadline so [`agent_chat`] and
 /// [`crate::extraction::retry_extract_structured_scoped`] cannot drift —
 /// schedule, sleep bounds, and trail mechanics live in exactly one place.
 pub(crate) struct RetryLoop {
@@ -699,45 +705,16 @@ impl RetryLoop {
     }
 }
 
-// ── The consolidation retry loop ─────────────────────────────────────────
+// ── The agent retry loop ────────────────────────────────────────────────
 
-/// Run a chat call with the outer retry loop (used by analyst consolidation).
-///
-/// The request is byte-identical across ALL attempts — there is no re-prompt
-/// here (consolidation has no target schema). Retryable conditions: provider
-/// failures of any retryable class AND empty response text.
-pub(crate) async fn retry_chat(
-    request: ChatRequest,
-    policy: &RetryPolicy,
-) -> Result<ChatResponse, RetryExhausted> {
-    retry_chat_with(request, policy, |r| {
-        r.text.as_deref().is_some_and(|t| !t.trim().is_empty())
-    })
-    .await
-}
-
-/// Agent-loop LLM call with the same outer retry loop.
+/// Agent-loop LLM call with the outer retry loop.
 ///
 /// Byte-identical request across ALL attempts; retries provider failures of
 /// any retryable class and honors the operation wall-clock cap. Any `Ok`
-/// response is accepted — empty text is a valid tool-call turn, so unlike
-/// consolidation there is no text contract.
+/// response is accepted — empty text is a valid tool-call turn.
 pub(crate) async fn agent_chat(
     request: ChatRequest,
     policy: &RetryPolicy,
-) -> Result<ChatResponse, RetryExhausted> {
-    retry_chat_with(request, policy, |_| true).await
-}
-
-/// Shared outer retry loop: at most `policy.max_attempts` single-attempt
-/// scoped calls, wall-clock-bounded, with per-attempt telemetry. `is_success`
-/// decides whether an `Ok` response ends the loop (empty-text handling differs
-/// between the agent path and consolidation).
-#[allow(clippy::cast_possible_truncation)]
-async fn retry_chat_with(
-    request: ChatRequest,
-    policy: &RetryPolicy,
-    is_success: impl Fn(&ChatResponse) -> bool + Send,
 ) -> Result<ChatResponse, RetryExhausted> {
     let mut loop_state = RetryLoop::new(policy);
     let operation_started = Instant::now();
@@ -749,7 +726,6 @@ async fn retry_chat_with(
             return Err(exhausted);
         }
 
-        let attempt_started = Instant::now();
         match crate::providers::chat_scoped(
             request.clone(),
             policy.idle_timeout,
@@ -758,20 +734,8 @@ async fn retry_chat_with(
         .await
         {
             Ok(resp) => {
-                if is_success(&resp) {
-                    crate::stats::record_llm_success(&request, operation_started, attempt, &resp)
-                        .await;
-                    return Ok(resp);
-                }
-                let elapsed = attempt_started.elapsed().as_millis() as u64;
-                let rec = RetryFailureRecord::new_simple(
-                    attempt,
-                    FailureClass::NoResponse,
-                    &anyhow::anyhow!("LLM returned empty response"),
-                    elapsed,
-                    None,
-                );
-                loop_state.record(attempt, rec).await;
+                crate::stats::record_llm_success(&request, operation_started, attempt, &resp).await;
+                return Ok(resp);
             }
             Err(err) => {
                 let non_retryable = !err.class.is_retryable();

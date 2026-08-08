@@ -1,20 +1,25 @@
 //! Shared LLM grouping/synthesis core for pipeline joint-verdict and ask
 //! consolidation.
 //!
-//! One LLM pass groups indexed per-member items (pipeline issues; ask claims)
-//! into thematic/semantic groups. The LLM never produces counts: brackets
-//! `[n/N]` and the DISPUTED marker are computed here from distinct cited
-//! member ids — pure arithmetic. Anti-fabrication comes from verbatim
-//! membership validation, index-arithmetic completeness, and a contradiction
-//! guardrail (contradiction:true requires ≥2 distinct cited agents).
+//! One LLM pass groups id-referenced items (pipeline issues; ask claims)
+//! into thematic/semantic groups. Every item gets a stable numeric id,
+//! assigned once per operation across the whole input (global flat numbering);
+//! the LLM refers to items by id only, and the system resolves id → (agent,
+//! text) via [`ItemTable`] for rendering. The LLM never produces counts:
+//! brackets `[n/N]` and the DISPUTED marker are computed here from distinct
+//! cited agent ids — pure arithmetic.
 //!
-//! Two retry modes share the schema/validation primitives:
-//! - [`run_grouping`] — full-regeneration feedback budget (ask consolidation):
-//!   every attempt restarts from zero with only the rejection reason fed back.
-//! - [`run_grouping_repair`] — progress-preserving repair (pipeline synthesis):
-//!   accepted groups freeze, repair rounds propose deltas for the remainder
-//!   only, and termination deterministically places every remaining item in
-//!   the ungrouped section.
+//! Validation is strictly structural: ids in range, no duplicate placement,
+//! set completeness (every item appears exactly once across placed ∪ pinned ∪
+//! remainder), and a contradiction guardrail (contradiction:true requires ≥2
+//! distinct cited agents). Text-based membership checks are gone everywhere —
+//! a wrong-but-valid id is accepted by design (semantic judgment is the LLM's;
+//! the gate only catches structural lies).
+//!
+//! The single retry mode is the progress-preserving repair
+//! ([`run_grouping_repair`]): accepted groups freeze, repair rounds propose
+//! deltas for the remainder only, and termination deterministically places
+//! every remaining item in the ungrouped section.
 
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -26,14 +31,14 @@ use crate::{ChatRequest, ChatRequestMeta, Workspace};
 
 // ── Schema (strict — unknown fields rejected) ──────────────────────────
 
-/// One member of a group: a verbatim item from one source (agent).
+/// One member of a group: a flat global item id (matches the `{id}: {text}`
+/// input list numbering). The source (agent) and text are resolved by the
+/// system via the operation's [`ItemTable`] — never by the model.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupingMember {
-    /// Zero-based source (agent) index — matches the input list labels.
-    pub agent: usize,
-    /// Verbatim item text from that source's list.
-    pub text: String,
+    /// Flat global item id, 0-based across all sources combined.
+    pub id: usize,
 }
 
 /// A group of related items plus the LLM's contradiction judgment.
@@ -89,14 +94,8 @@ pub(crate) struct GroupingReference {
     pub member: GroupingMember,
 }
 
-/// Outcome of the grouping pass: grouped by the LLM, or the deterministic
-/// fail-open (raw member dump + explicit marker) when retries exhausted.
-pub(crate) enum GroupingOutcome {
-    Grouped(GroupingOutput),
-    Fallback,
-}
-
-/// Outcome of the repair-mode grouping pass (pipeline synthesis only).
+/// Outcome of the repair-mode grouping pass (pipeline synthesis + ask
+/// consolidation).
 pub(crate) enum RepairOutcome {
     /// Frozen groups + first-accepted summary + a code-computed ungrouped
     /// remainder. `references` attach DISPUTED cross-references from
@@ -108,95 +107,78 @@ pub(crate) enum RepairOutcome {
     Fallback,
 }
 
-// ── Normalization ──────────────────────────────────────────────────────
+// ── Item id table (global flat numbering) ──────────────────────────────
 
-/// Normalize an item for verbatim membership validation: trim and collapse
-/// whitespace runs to a single space. Case is preserved — validation must
-/// never silently fold distinct items.
-#[must_use]
-pub(crate) fn normalize_item(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+/// Global flat id → (agent, item index) table for one grouping operation.
+/// Ids are assigned once per operation across the whole input: every item
+/// across all sources gets exactly one id, in (agent, item) order. The model
+/// refers to items by id only; the system resolves id → (agent, text) here
+/// for rendering and severity lookups.
+///
+/// A wrong-but-valid id is accepted by design: validation is structural only
+/// (range, duplicates, completeness, contradiction ≥2 agents), and the LLM's
+/// semantic judgment is the only correctness gate. Never re-add text-equality
+/// membership checks — they only create a false sense of safety.
+pub(crate) struct ItemTable<'a> {
+    /// id → (agent index, item index within that agent's list).
+    rows: Vec<(usize, usize)>,
+    items_by_agent: &'a [Vec<String>],
 }
 
-// ── Validation ─────────────────────────────────────────────────────────
+impl<'a> ItemTable<'a> {
+    #[must_use]
+    pub(crate) fn new(items_by_agent: &'a [Vec<String>]) -> Self {
+        let mut rows = Vec::new();
+        for (agent, items) in items_by_agent.iter().enumerate() {
+            for i in 0..items.len() {
+                rows.push((agent, i));
+            }
+        }
+        Self {
+            rows,
+            items_by_agent,
+        }
+    }
 
-/// Validate a grouping output against the actual per-agent item lists.
-///
-/// Rejects:
-/// - a member whose text does not exist verbatim-normalized in the cited
-///   agent's list (fabricated consensus);
-/// - the same (agent, normalized text) appearing more than once across groups
-///   and the ungrouped list (double-counting);
-/// - an out-of-range agent index;
-/// - a group flagged contradiction:true without ≥2 distinct cited agents;
-/// - incomplete coverage — every input item must appear exactly once across
-///   groups + ungrouped (index-arithmetic completeness; silent dropout is
-///   rejected and retried, never silently absorbed).
-pub(crate) fn validate_grouping(
-    output: &GroupingOutput,
-    items_by_agent: &[Vec<String>],
-) -> Result<(), String> {
-    if output.summary.trim().is_empty() {
-        return Err("grouping summary is empty".to_string());
+    /// Total item count across all sources.
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
     }
-    let mut seen: Vec<(usize, String)> = Vec::new();
-    let mut check_members = |members: &[GroupingMember], where_: &str| -> Result<(), String> {
-        for member in members {
-            let norm = normalize_item(&member.text);
-            let agent = member.agent;
-            let Some(items) = items_by_agent.get(agent) else {
-                return Err(format!("{where_}: unknown agent index {agent}"));
-            };
-            if !items.iter().any(|i| i == &norm) {
-                return Err(format!(
-                    "{where_}: member text not found verbatim in agent {agent}'s list: {norm:?}"
-                ));
-            }
-            if seen.contains(&(agent, norm.clone())) {
-                return Err(format!(
-                    "{where_}: double-counts agent {agent}'s item: {norm:?}"
-                ));
-            }
-            seen.push((agent, norm));
-        }
-        Ok(())
-    };
-    for (group_idx, group) in output.groups.iter().enumerate() {
-        if group.heading.trim().is_empty() {
-            return Err(format!("group {group_idx} has an empty heading"));
-        }
-        if group.contradiction {
-            let mut agents: Vec<usize> = group.members.iter().map(|m| m.agent).collect();
-            agents.sort_unstable();
-            agents.dedup();
-            if agents.len() < 2 {
-                return Err(format!(
-                    "group {group_idx} flagged contradiction without ≥2 distinct cited agents"
-                ));
-            }
-        }
-        check_members(&group.members, &format!("group {group_idx}"))?;
+
+    /// Resolve an id to its (agent, text) — `None` when out of range.
+    #[must_use]
+    pub(crate) fn resolve(&self, id: usize) -> Option<(usize, &str)> {
+        let (agent, item) = *self.rows.get(id)?;
+        let text = self.items_by_agent.get(agent)?.get(item)?;
+        Some((agent, text))
     }
-    check_members(&output.ungrouped, "ungrouped list")?;
-    // Index-arithmetic completeness: every input item appears exactly once.
-    for (agent, items) in items_by_agent.iter().enumerate() {
-        for item in items {
-            if !seen.contains(&(agent, item.clone())) {
-                return Err(format!(
-                    "agent {agent} item missing from every group and the ungrouped list: {item:?}"
-                ));
-            }
-        }
+
+    /// Resolve an id to its (agent, per-agent item index) — `None` when out
+    /// of range.
+    #[must_use]
+    pub(crate) fn resolve_index(&self, id: usize) -> Option<(usize, usize)> {
+        self.rows.get(id).copied()
     }
-    Ok(())
+
+    /// Agent index of an id — `None` when out of range.
+    #[must_use]
+    pub(crate) fn agent(&self, id: usize) -> Option<usize> {
+        self.rows.get(id).map(|r| r.0)
+    }
 }
 
 // ── Bracket arithmetic (pure code — never LLM-written counts) ───────────
 
-/// Distinct cited agent ids of a group, sorted.
+/// Distinct cited agent ids of a group, sorted (resolved via the item table;
+/// out-of-range ids are ignored — validation rejects them before rendering).
 #[must_use]
-pub(crate) fn distinct_agents(group: &GroupingGroup) -> Vec<usize> {
-    let mut agents: Vec<usize> = group.members.iter().map(|m| m.agent).collect();
+pub(crate) fn distinct_agents(group: &GroupingGroup, table: &ItemTable<'_>) -> Vec<usize> {
+    let mut agents: Vec<usize> = group
+        .members
+        .iter()
+        .filter_map(|m| table.agent(m.id))
+        .collect();
     agents.sort_unstable();
     agents.dedup();
     agents
@@ -217,150 +199,32 @@ pub(crate) fn bracket_label(n: usize, n_valid: usize, disputed: bool) -> String 
 
 // ── Rendering helpers (shared) ─────────────────────────────────────────
 
-/// Render one member line attributed to its source: `Agent N: text`.
+/// Render one member line attributed to its source: `Agent N: text`
+/// (resolved via the item table).
 #[must_use]
-pub(crate) fn render_member_line(member: &GroupingMember) -> String {
-    format!("Agent {}: {}", member.agent, member.text)
-}
-
-// ── Retry loop ─────────────────────────────────────────────────────────
-
-/// Run the grouping pass with the dedicated synthesis retry policy (3
-/// attempts, 30–45 s backoff). Every failure — transport, unparseable output,
-/// or validation rejection — retries; a validation rejection is fed back into
-/// the next attempt so the LLM can self-correct. Exhaustion yields the
-/// deterministic fail-open (never a fabricated grouping).
-///
-/// This is the full-regeneration feedback budget (ask consolidation): every
-/// attempt restarts from zero. The pipeline synthesis path uses
-/// [`run_grouping_repair`] instead — accepted groups freeze and repair rounds
-/// only touch the remainder.
-///
-/// The caller supplies the full request (system + user messages with the
-/// consumer's prompt, model, and max_tokens); the leading general workspace
-/// context message is prepended here so every consumer consumes it.
-#[allow(clippy::cast_possible_truncation)]
-pub(crate) async fn run_grouping(
-    ws: &Workspace,
-    purpose: &'static str,
-    mut request: ChatRequest,
-    items_by_agent: &[Vec<String>],
-) -> GroupingOutcome {
-    let _call = crate::call_registry::NON_AGENT_CALLS.register(purpose, &ws.name);
-    crate::prompt::prepend_general_context(&mut request.messages, ws).await;
-    let policy = RetryPolicy::synthesis_from_config();
-    let mut loop_state = RetryLoop::new(&policy);
-    let operation_started = Instant::now();
-
-    for attempt in 1..=policy.max_attempts {
-        if loop_state.expired() {
-            break;
-        }
-        let attempt_started = Instant::now();
-        match crate::providers::chat_scoped(
-            request.clone(),
-            policy.idle_timeout,
-            loop_state.deadline(),
-        )
-        .await
-        {
-            Ok(resp) => {
-                let raw = resp.text_or_empty();
-                match crate::util::json::parse_fenced_json::<GroupingOutput>(raw) {
-                    Ok(output) => match validate_grouping(&output, items_by_agent) {
-                        Ok(()) => {
-                            tracing::info!(
-                                purpose,
-                                workspace = %ws.name,
-                                groups = output.groups.len(),
-                                ungrouped = output.ungrouped.len(),
-                                "Grouping synthesis succeeded",
-                            );
-                            crate::stats::record_llm_success(
-                                &request,
-                                operation_started,
-                                attempt,
-                                &resp,
-                            )
-                            .await;
-                            return GroupingOutcome::Grouped(output);
-                        }
-                        Err(msg) => {
-                            // Feed the rejection back so the next attempt can
-                            // self-correct instead of re-failing identically.
-                            if let Some(last) = request.messages.last_mut() {
-                                let _ = std::fmt::write(
-                                    &mut last.content,
-                                    format_args!(
-                                        "\n\nYour previous response was rejected: {msg}.\n\
-                                         Fix the violation and try again."
-                                    ),
-                                );
-                            }
-                            let err = anyhow::anyhow!("grouping validation failed: {msg}");
-                            let rec = RetryFailureRecord::new_simple(
-                                attempt,
-                                FailureClass::Parse,
-                                &err,
-                                attempt_started.elapsed().as_millis() as u64,
-                                None,
-                            );
-                            loop_state.record(attempt, rec).await;
-                        }
-                    },
-                    Err(e) => {
-                        let rec = RetryFailureRecord::new_simple(
-                            attempt,
-                            FailureClass::Parse,
-                            &e,
-                            attempt_started.elapsed().as_millis() as u64,
-                            None,
-                        );
-                        loop_state.record(attempt, rec).await;
-                    }
-                }
-            }
-            Err(err) => {
-                let non_retryable = !err.class.is_retryable();
-                loop_state.record(attempt, err.record).await;
-                if non_retryable {
-                    break;
-                }
-            }
-        }
-        if let Err(FailureClass::Shutdown) = loop_state.sleep_between(attempt).await {
-            break;
-        }
+pub(crate) fn render_member_line(member: &GroupingMember, table: &ItemTable<'_>) -> String {
+    match table.resolve(member.id) {
+        Some((agent, text)) => format!("Agent {agent}: {text}"),
+        None => format!("Agent ?: <unknown item id {}>", member.id),
     }
-
-    tracing::warn!(
-        purpose,
-        workspace = %ws.name,
-        attempts = policy.max_attempts,
-        "Grouping synthesis exhausted — writing deterministic fail-open output",
-    );
-    let final_class = loop_state.final_class();
-    let exhausted =
-        crate::retry::RetryExhausted::with_last_raw(loop_state.into_failures(), final_class, None);
-    crate::stats::record_llm_failure(&request, operation_started, &exhausted).await;
-    GroupingOutcome::Fallback
 }
 
-// ── Repair-mode grouping (pipeline synthesis) ────────────────────────────
+// ── Repair-mode grouping (pipeline synthesis + ask consolidation) ───────
 
 /// Mutable state of the repair protocol across rounds.
-struct RepairState<'a> {
-    items_by_agent: &'a [Vec<String>],
+pub(crate) struct RepairState<'a> {
+    /// Global flat id table for this operation (id → agent, text).
+    table: ItemTable<'a>,
     /// Accepted (frozen) groups in order — indices are stable references.
     frozen_groups: Vec<GroupingGroup>,
-    /// Normalized (agent, text) of frozen-group members — placement bookkeeping.
-    placed: HashSet<(usize, String)>,
-    /// Accepted contradiction references (remainder item → frozen group idx).
+    /// Ids of frozen-group members — placement bookkeeping.
+    placed: HashSet<usize>,
+    /// Accepted contradiction references (remainder item id → frozen group idx).
     references: Vec<GroupingReference>,
-    /// Normalized (agent, text) of items pinned to the remainder by an
-    /// accepted reference — they can never be placed in a group, so the
-    /// DISPUTED render stays visible and `accepted_refs` never goes stale.
-    pinned: HashSet<(usize, String)>,
+    /// Ids of items pinned to the remainder by an accepted reference — they
+    /// can never be placed in a group, so the DISPUTED render stays visible
+    /// and `accepted_refs` never goes stale.
+    pinned: HashSet<usize>,
     /// Frozen groups already flagged contradiction — do-not-re-flag targets.
     flagged: HashSet<usize>,
     /// First accepted summary (never revised).
@@ -368,9 +232,9 @@ struct RepairState<'a> {
 }
 
 impl<'a> RepairState<'a> {
-    fn new(items_by_agent: &'a [Vec<String>]) -> Self {
+    pub(crate) fn new(items_by_agent: &'a [Vec<String>]) -> Self {
         Self {
-            items_by_agent,
+            table: ItemTable::new(items_by_agent),
             frozen_groups: Vec::new(),
             placed: HashSet::new(),
             references: Vec::new(),
@@ -380,77 +244,52 @@ impl<'a> RepairState<'a> {
         }
     }
 
-    /// Deterministic remainder: every non-placed item in (agent, input) order.
-    fn remainder(&self) -> Vec<(usize, String)> {
-        let mut out = Vec::new();
-        for (agent, items) in self.items_by_agent.iter().enumerate() {
-            for item in items {
-                if !self.placed.contains(&(agent, item.clone())) {
-                    out.push((agent, item.clone()));
-                }
-            }
-        }
-        out
+    /// Deterministic remainder: every non-placed item id in global order.
+    #[must_use]
+    pub(crate) fn remainder(&self) -> Vec<usize> {
+        (0..self.table.len())
+            .filter(|id| !self.placed.contains(id))
+            .collect()
     }
 
     /// True when every non-placed item is pinned by an accepted contradiction
     /// reference — nothing left to place (pinned items render in the ungrouped
     /// section), so the run terminates without a redundant empty round.
-    fn complete(&self) -> bool {
-        for (agent, items) in self.items_by_agent.iter().enumerate() {
-            for item in items {
-                if !self.placed.contains(&(agent, item.clone()))
-                    && !self.pinned.contains(&(agent, item.clone()))
-                {
-                    return false;
-                }
-            }
-        }
-        true
+    #[must_use]
+    pub(crate) fn complete(&self) -> bool {
+        (0..self.table.len()).all(|id| self.placed.contains(&id) || self.pinned.contains(&id))
     }
 }
 
 /// One round's proposal, parsed from the full schema (round 1) or the
 /// repair-delta schema (repair rounds).
-struct RoundInput {
-    summary: Option<String>,
-    groups: Vec<GroupingGroup>,
-    ungrouped: Vec<GroupingMember>,
-    references: Vec<GroupingReference>,
+pub(crate) struct RoundInput {
+    pub summary: Option<String>,
+    pub groups: Vec<GroupingGroup>,
+    pub ungrouped: Vec<GroupingMember>,
+    pub references: Vec<GroupingReference>,
 }
 
 /// Per-round acceptance result.
 #[derive(Default)]
-struct RoundOutcome {
+pub(crate) struct RoundOutcome {
     /// Round-level rejection (incomplete coverage) — nothing froze this round.
-    round_rejection: Option<String>,
+    pub round_rejection: Option<String>,
     /// Per-group/per-entry rejections fed to the next round, each with its
     /// typed cause (no substring classification of message wording).
-    rejections: Vec<(FailureClass, String)>,
+    pub rejections: Vec<(FailureClass, String)>,
     /// Newly frozen groups.
-    froze: usize,
+    pub froze: usize,
     /// Newly accepted contradiction references.
-    accepted_refs: usize,
+    pub accepted_refs: usize,
     /// A summary was accepted this round.
-    accepted_summary: bool,
+    pub accepted_summary: bool,
 }
 
-/// Verbatim-membership + agent-range check for one member (no placement check).
-fn member_material_error(
-    member: &GroupingMember,
-    items_by_agent: &[Vec<String>],
-) -> Option<String> {
-    let norm = normalize_item(&member.text);
-    let Some(items) = items_by_agent.get(member.agent) else {
-        return Some(format!("unknown agent index {}", member.agent));
-    };
-    if !items.iter().any(|i| i == &norm) {
-        return Some(format!(
-            "member text not found verbatim in agent {}'s list: {norm:?}",
-            member.agent
-        ));
-    }
-    None
+/// Id-range check for one member (no placement check). Text membership is
+/// deliberately NOT checked — ids are the only references (see [`ItemTable`]).
+fn member_range_error(member: &GroupingMember, table: &ItemTable<'_>) -> Option<String> {
+    (member.id >= table.len()).then(|| format!("unknown item id {}", member.id))
 }
 
 /// Push a typed rejection onto the outcome.
@@ -460,12 +299,14 @@ fn reject(outcome: &mut RoundOutcome, cause: FailureClass, msg: String) {
 
 /// Process one round's proposal: global checks first (completeness on the raw
 /// proposal — silent dropout rejects the round), then the summary (first
-/// accepted wins), then per-group acceptance (verbatim membership, agent
-/// range, no already-placed member), then ungrouped entries and contradiction
-/// references. Rejected groups are dropped with per-group reasons; accepted
-/// groups freeze immediately.
+/// accepted wins), then per-group acceptance (id range, no already-placed
+/// member), then ungrouped entries and contradiction references. Rejected
+/// groups are dropped with per-group reasons; accepted groups freeze
+/// immediately. Validation is strictly structural — ids in range, no
+/// duplicate placement, set completeness, contradiction ≥2 distinct agents
+/// (see [`ItemTable`] for the accepted wrong-but-valid-id risk).
 #[allow(clippy::too_many_lines)]
-fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome {
+pub(crate) fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome {
     let RoundInput {
         summary,
         groups,
@@ -474,32 +315,24 @@ fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome
     } = input;
     let mut outcome = RoundOutcome::default();
 
-    // Round-level completeness on the RAW proposal: every unfrozen item must
-    // appear in a proposed group or the ungrouped list.
-    let mut raw: HashSet<(usize, String)> = HashSet::new();
+    // Round-level completeness on the RAW proposal: every unfrozen item id
+    // must appear in a proposed group or the ungrouped list.
+    let mut raw: HashSet<usize> = HashSet::new();
     for g in &groups {
-        for m in &g.members {
-            raw.insert((m.agent, normalize_item(&m.text)));
+        raw.extend(g.members.iter().map(|m| m.id));
+    }
+    raw.extend(ungrouped.iter().map(|m| m.id));
+    for id in 0..state.table.len() {
+        // Placed (frozen-group) and pinned (accepted reference → committed
+        // to the remainder) items need not be re-proposed this round.
+        if state.placed.contains(&id) || state.pinned.contains(&id) {
+            continue;
         }
-    }
-    for m in &ungrouped {
-        raw.insert((m.agent, normalize_item(&m.text)));
-    }
-    for (agent, items) in state.items_by_agent.iter().enumerate() {
-        for item in items {
-            // Placed (frozen-group) and pinned (accepted reference → committed
-            // to the remainder) items need not be re-proposed this round.
-            if state.placed.contains(&(agent, item.clone()))
-                || state.pinned.contains(&(agent, item.clone()))
-            {
-                continue;
-            }
-            if !raw.contains(&(agent, item.clone())) {
-                outcome.round_rejection = Some(format!(
-                    "agent {agent} item missing from every proposed group and the ungrouped list: {item:?}"
-                ));
-                return outcome;
-            }
+        if !raw.contains(&id) {
+            outcome.round_rejection = Some(format!(
+                "item {id} missing from every proposed group and the ungrouped list"
+            ));
+            return outcome;
         }
     }
 
@@ -532,34 +365,31 @@ fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome
             reasons.push("empty heading".to_string());
             cause.get_or_insert(FailureClass::ValidationOther);
         }
-        if group.contradiction && distinct_agents(&group).len() < 2 {
+        if group.contradiction && distinct_agents(&group, &state.table).len() < 2 {
             reasons.push("contradiction without ≥2 distinct cited agents".to_string());
             cause.get_or_insert(FailureClass::ContradictionAgents);
         }
-        // Intra-group duplicates are rejected like validate_grouping does —
-        // the two validators stay consistent on the same input shape.
-        let mut seen: HashSet<(usize, String)> = HashSet::new();
+        // Intra-group duplicate ids are rejected (a member may be placed only
+        // once per round; already-placed/pinned members are rejected below).
+        let mut seen: HashSet<usize> = HashSet::new();
         for member in &group.members {
-            let norm = normalize_item(&member.text);
-            if !seen.insert((member.agent, norm.clone())) {
+            if !seen.insert(member.id) {
                 reasons.push("duplicate member within the group".to_string());
-            } else if state.pinned.contains(&(member.agent, norm.clone())) {
+            } else if state.pinned.contains(&member.id) {
                 reasons.push(
                     "member has an accepted contradiction reference and must remain ungrouped"
                         .to_string(),
                 );
-            } else if let Some(msg) = member_material_error(member, state.items_by_agent) {
+            } else if let Some(msg) = member_range_error(member, &state.table) {
                 reasons.push(msg);
-            } else if state.placed.contains(&(member.agent, norm)) {
+            } else if state.placed.contains(&member.id) {
                 reasons.push("member already placed in a frozen group".to_string());
             }
             cause.get_or_insert(FailureClass::Membership);
         }
         if reasons.is_empty() {
             for member in &group.members {
-                state
-                    .placed
-                    .insert((member.agent, normalize_item(&member.text)));
+                state.placed.insert(member.id);
             }
             if group.contradiction {
                 state.flagged.insert(state.frozen_groups.len());
@@ -577,11 +407,11 @@ fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome
         }
     }
 
-    // Ungrouped entries: per-member material validation; invalid entries are
+    // Ungrouped entries: per-member id-range validation; invalid entries are
     // dropped with reasons (the raw proposal already satisfied completeness).
     // Already-placed entries are dropped silently — the placement wins.
     for (i, member) in ungrouped.into_iter().enumerate() {
-        if let Some(msg) = member_material_error(&member, state.items_by_agent) {
+        if let Some(msg) = member_range_error(&member, &state.table) {
             reject(
                 &mut outcome,
                 FailureClass::Membership,
@@ -606,14 +436,14 @@ fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome
         if state.flagged.contains(&reference.group) {
             continue; // cosmetic duplicate — never a rejection
         }
-        if state.references.iter().any(|r| {
-            r.group == reference.group
-                && r.member.agent == reference.member.agent
-                && normalize_item(&r.member.text) == normalize_item(&reference.member.text)
-        }) {
+        if state
+            .references
+            .iter()
+            .any(|r| r.group == reference.group && r.member.id == reference.member.id)
+        {
             continue; // already accepted — cosmetic duplicate
         }
-        if let Some(msg) = member_material_error(&reference.member, state.items_by_agent) {
+        if let Some(msg) = member_range_error(&reference.member, &state.table) {
             reject(
                 &mut outcome,
                 FailureClass::Membership,
@@ -621,10 +451,7 @@ fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome
             );
             continue;
         }
-        if state.placed.contains(&(
-            reference.member.agent,
-            normalize_item(&reference.member.text),
-        )) {
+        if state.placed.contains(&reference.member.id) {
             reject(
                 &mut outcome,
                 FailureClass::Membership,
@@ -632,9 +459,11 @@ fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome
             );
             continue;
         }
-        let mut agents = distinct_agents(&state.frozen_groups[reference.group]);
-        if !agents.contains(&reference.member.agent) {
-            agents.push(reference.member.agent);
+        let mut agents = distinct_agents(&state.frozen_groups[reference.group], &state.table);
+        if let Some(agent) = state.table.agent(reference.member.id)
+            && !agents.contains(&agent)
+        {
+            agents.push(agent);
         }
         if agents.len() < 2 {
             reject(
@@ -644,10 +473,7 @@ fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome
             );
             continue;
         }
-        state.pinned.insert((
-            reference.member.agent,
-            normalize_item(&reference.member.text),
-        ));
+        state.pinned.insert(reference.member.id);
         state.references.push(reference);
         outcome.accepted_refs += 1;
     }
@@ -717,8 +543,8 @@ fn append_repair_instructions(
          historical and superseded.\n\
          {framing}\n\
          Accepted groups are FROZEN and must NEVER be re-proposed; repair \
-         ONLY the remaining items. The verbatim-copy rule still applies: every \
-         member text must be the EXACT original issue text.\n"
+         ONLY the remaining items. Reference every member by its item id from \
+         the input list — never by text.\n"
     );
     if !rejections.is_empty() {
         section.push_str("\nRejected proposals still outstanding (fix these):\n");
@@ -734,14 +560,14 @@ fn append_repair_instructions(
         section.push_str("- none\n");
     } else {
         for (i, g) in state.frozen_groups.iter().enumerate() {
-            let agents = distinct_agents(g)
+            let agents = distinct_agents(g, &state.table)
                 .iter()
                 .map(usize::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
             let representative = g.members.first().map_or_else(
                 || "—".to_string(),
-                |m| format!("Agent {}: {:?}", m.agent, m.text),
+                |m| format!("{} (id {})", render_member_line(m, &state.table), m.id),
             );
             let _ = writeln!(
                 section,
@@ -752,16 +578,18 @@ fn append_repair_instructions(
     }
     section.push_str(
         "\nRemaining items (place EVERY un-pinned one in a proposed group or the \
-         ungrouped list; pinned items must NOT be placed in a group):\n",
+         ungrouped list; pinned items must NOT be placed in a group). Reference \
+         each item by its id:\n",
     );
-    for (agent, item) in state.remainder() {
-        if state.pinned.contains(&(agent, item.clone())) {
+    for id in state.remainder() {
+        let line = render_member_line(&GroupingMember { id }, &state.table);
+        if state.pinned.contains(&id) {
             let _ = writeln!(
                 section,
-                "- Agent {agent}: {item} [pinned — accepted contradiction reference; do NOT place in a group]"
+                "- {id}: {line} [pinned — accepted contradiction reference; do NOT place in a group]"
             );
         } else {
-            let _ = writeln!(section, "- Agent {agent}: {item}");
+            let _ = writeln!(section, "- {id}: {line}");
         }
     }
     section.push_str(
@@ -774,15 +602,15 @@ Respond with ONLY a JSON object matching this REPAIR-DELTA schema (no extra fiel
       "heading": "short thematic heading",
       "contradiction": false,
       "members": [
-        {"agent": 0, "text": "<verbatim remaining item text from agent 0>"}
+        {"id": 0}
       ]
     }
   ],
   "ungrouped": [
-    {"agent": 2, "text": "<verbatim remaining item that fits no group>"}
+    {"id": 2}
   ],
   "references": [
-    {"group": 0, "member": {"agent": 2, "text": "<verbatim remaining item that contradicts frozen group 0>"}}
+    {"group": 0, "member": {"id": 2}}
   ]
 }
 "#,
@@ -796,14 +624,15 @@ Respond with ONLY a JSON object matching this REPAIR-DELTA schema (no extra fiel
     }
 }
 
-/// Run the repair-mode grouping pass (pipeline synthesis only): 1 full
-/// synthesis call + up to N-1 repair rounds (N = `synthesis_max_attempts`,
-/// default 3 = the lower edge of the approved 3–5 band). Accepted groups
-/// freeze; repair rounds propose deltas for the remainder only. Termination —
-/// zero-progress (a repair round freezing no new groups) or budget
-/// exhaustion — places every remaining item deterministically in the
-/// ungrouped section. Fail-open fires only on transport/parse/non-retryable
-/// exhaustion or an exhaustion with zero groups ever frozen.
+/// Run the repair-mode grouping pass (pipeline synthesis + ask
+/// consolidation): 1 full synthesis call + up to N-1 repair rounds (N =
+/// `synthesis_max_attempts`, default 3 = the lower edge of the approved 3–5
+/// band). Accepted groups freeze; repair rounds propose deltas for the
+/// remainder only. Termination — zero-progress (a repair round freezing no new
+/// groups) or budget exhaustion — places every remaining item
+/// deterministically in the ungrouped section. Fail-open fires only on
+/// transport/parse/non-retryable exhaustion or an exhaustion with zero groups
+/// ever frozen.
 ///
 /// Validation and parse rejections consume a round immediately (no backoff);
 /// transport failures keep the synthesis backoff schedule (indexed by the
@@ -1054,7 +883,7 @@ pub(crate) async fn run_grouping_repair(
     let ungrouped: Vec<GroupingMember> = state
         .remainder()
         .into_iter()
-        .map(|(agent, text)| GroupingMember { agent, text })
+        .map(|id| GroupingMember { id })
         .collect();
     tracing::info!(
         purpose,

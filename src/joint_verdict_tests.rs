@@ -1,8 +1,8 @@
 use super::*;
 use crate::Verdict;
 use crate::consensus::{
-    GroupingGroup, GroupingMember, GroupingOutput, RepairOutcome, bracket_label, distinct_agents,
-    normalize_item, validate_grouping,
+    GroupingGroup, GroupingMember, GroupingOutput, ItemTable, RepairOutcome, RepairState,
+    RoundInput, bracket_label, distinct_agents, process_round,
 };
 
 fn verdict(score: u8, issues: &[&str]) -> Verdict {
@@ -41,11 +41,8 @@ fn round(
     }
 }
 
-fn member(agent: usize, text: &str) -> GroupingMember {
-    GroupingMember {
-        agent,
-        text: text.to_string(),
-    }
+fn member(id: usize) -> GroupingMember {
+    GroupingMember { id }
 }
 
 fn group(heading: &str, contradiction: bool, members: Vec<GroupingMember>) -> GroupingGroup {
@@ -76,10 +73,27 @@ fn repaired(out: GroupingOutput) -> RepairOutcome {
     }
 }
 
-// ── Shared-core validator invariants ────────────────────────────────────
+/// Round-1 acceptance helper: run the repair-path validator over the output
+/// with an empty state (the round-1 surface — the sole structural validator).
+fn validate_round1(output: &GroupingOutput, items: &[Vec<String>]) -> Result<(), String> {
+    let mut state = RepairState::new(items);
+    let input = RoundInput {
+        summary: Some(output.summary.clone()),
+        groups: output.groups.clone(),
+        ungrouped: output.ungrouped.clone(),
+        references: Vec::new(),
+    };
+    let outcome = process_round(input, &mut state);
+    outcome
+        .round_rejection
+        .or_else(|| outcome.rejections.first().map(|(_, m)| m.clone()))
+        .map_or(Ok(()), Err)
+}
+
+// ── Shared-core validator invariants (structural, id-based) ─────────────
 
 #[test]
-fn validator_accepts_verbatim_grouping() {
+fn validator_accepts_id_based_grouping() {
     let r = round(
         "Review",
         vec![
@@ -90,20 +104,21 @@ fn validator_accepts_verbatim_grouping() {
         "",
     );
     let items = issues_by_agent(&r);
+    // Global flat ids: 0 = agent0 "No timeout check", 1 = agent0 "Missing
+    // retry", 2 = agent1 "Naming nit".
     let out = output(
         "The review found timeout handling gaps and a naming nit.",
-        vec![group(
-            "Timeouts",
-            false,
-            vec![member(0, "No timeout check")],
-        )],
-        vec![member(0, "Missing retry"), member(1, "Naming nit")],
+        vec![group("Timeouts", false, vec![member(0)])],
+        vec![member(1), member(2)],
     );
-    assert_eq!(validate_grouping(&out, &items), Ok(()));
+    assert_eq!(validate_round1(&out, &items), Ok(()));
 }
 
 #[test]
-fn validator_rejects_fabricated_consensus() {
+fn validator_rejects_out_of_range_id() {
+    // The old fabricated-text rejection is now the out-of-range-id rejection:
+    // the model can only cite existing ids, so an id beyond the table is the
+    // only way to reference something that does not exist.
     let r = round(
         "Review",
         vec![(0, verdict(4, &["No timeout check"]))],
@@ -111,36 +126,19 @@ fn validator_rejects_fabricated_consensus() {
         "",
     );
     let items = issues_by_agent(&r);
-
-    // Fabricated text (not in agent 0's list) is rejected.
-    let out = output(
-        "summary",
-        vec![group(
-            "Timeouts",
-            false,
-            vec![member(0, "No timeout check AND missing retry")],
-        )],
-        vec![],
-    );
-    let err = validate_grouping(&out, &items).expect_err("must reject");
-    assert!(err.contains("not found verbatim"), "err: {err}");
-
-    // Unknown agent index is rejected.
-    let out = output(
-        "summary",
-        vec![group(
-            "Timeouts",
-            false,
-            vec![member(7, "No timeout check")],
-        )],
-        vec![],
-    );
-    let err = validate_grouping(&out, &items).expect_err("must reject");
-    assert!(err.contains("unknown agent index"), "err: {err}");
+    for bad in [1usize, 99] {
+        let out = output(
+            "summary",
+            vec![group("Timeouts", false, vec![member(bad)])],
+            vec![member(0)],
+        );
+        let err = validate_round1(&out, &items).expect_err("must reject");
+        assert!(err.contains("unknown item id"), "err: {err}");
+    }
 }
 
 #[test]
-fn validator_rejects_double_counting() {
+fn validator_rejects_duplicate_placement() {
     let r = round(
         "Review",
         vec![
@@ -151,16 +149,17 @@ fn validator_rejects_double_counting() {
         "",
     );
     let items = issues_by_agent(&r);
+    // id 0 is placed in two groups — the second placement is rejected.
     let out = output(
         "summary",
         vec![
-            group("A", false, vec![member(0, "No timeout check")]),
-            group("B", false, vec![member(0, "No timeout check")]),
+            group("A", false, vec![member(0)]),
+            group("B", false, vec![member(0)]),
         ],
-        vec![],
+        vec![member(1)],
     );
-    let err = validate_grouping(&out, &items).expect_err("must reject");
-    assert!(err.contains("double-counts"), "err: {err}");
+    let err = validate_round1(&out, &items).expect_err("must reject");
+    assert!(err.contains("already placed"), "err: {err}");
 }
 
 #[test]
@@ -172,12 +171,8 @@ fn validator_rejects_contradiction_without_two_agents() {
         "",
     );
     let items = issues_by_agent(&r);
-    let out = output(
-        "summary",
-        vec![group("A", true, vec![member(0, "No timeout check")])],
-        vec![],
-    );
-    let err = validate_grouping(&out, &items).expect_err("must reject");
+    let out = output("summary", vec![group("A", true, vec![member(0)])], vec![]);
+    let err = validate_round1(&out, &items).expect_err("must reject");
     assert!(
         err.contains("without ≥2 distinct cited agents"),
         "contradiction guardrail: {err}"
@@ -193,21 +188,20 @@ fn validator_rejects_incomplete_coverage() {
         "",
     );
     let items = issues_by_agent(&r);
-    // "Missing retry" is silently dropped from groups AND ungrouped.
-    let out = output(
-        "summary",
-        vec![group("A", false, vec![member(0, "No timeout check")])],
-        vec![],
+    // id 1 ("Missing retry") is silently dropped from groups AND ungrouped.
+    let out = output("summary", vec![group("A", false, vec![member(0)])], vec![]);
+    let err = validate_round1(&out, &items).expect_err("must reject");
+    assert!(
+        err.contains("missing from every proposed group"),
+        "err: {err}"
     );
-    let err = validate_grouping(&out, &items).expect_err("must reject");
-    assert!(err.contains("missing from every group"), "err: {err}");
 }
 
 #[test]
-fn duplicate_issue_within_agent_is_deduped() {
-    // One agent reporting the same issue twice must not make the
-    // double-count/completeness pair unsatisfiable: the per-agent input list
-    // is deduped, so a single citation of the item validates and covers it.
+fn duplicate_issue_within_agent_gets_distinct_ids() {
+    // Per-agent dedup is removed: the same issue twice from one agent is TWO
+    // distinct ids, and the model places each exactly once. A single citation
+    // of the item is now incomplete coverage.
     let r = round(
         "Review",
         vec![(0, verdict(4, &["No timeout check", "No timeout check"]))],
@@ -215,20 +209,33 @@ fn duplicate_issue_within_agent_is_deduped() {
         "",
     );
     let items = issues_by_agent(&r);
-    assert_eq!(items[0], vec!["No timeout check".to_string()]);
+    assert_eq!(
+        items[0],
+        vec![
+            "No timeout check".to_string(),
+            "No timeout check".to_string()
+        ],
+        "identical texts stay distinct ids"
+    );
+    let out = output("summary", vec![group("A", false, vec![member(0)])], vec![]);
+    let err = validate_round1(&out, &items).expect_err("one citation is incomplete");
+    assert!(
+        err.contains("missing from every proposed group"),
+        "err: {err}"
+    );
     let out = output(
         "summary",
-        vec![group("A", false, vec![member(0, "No timeout check")])],
-        vec![],
+        vec![group("A", false, vec![member(0)])],
+        vec![member(1)],
     );
-    assert_eq!(validate_grouping(&out, &items), Ok(()));
+    assert_eq!(validate_round1(&out, &items), Ok(()));
 }
 
 #[test]
 fn validator_uses_original_agent_indices_with_mid_round_failure() {
-    // Agent 1 failed mid-round: the LLM sees "Agent 0" and "Agent 2" (original
-    // dispatch indices) in the input, never a compacted 0..n-1 space. A
-    // faithful LLM emitting agent:2 must pass validation AND render.
+    // Agent 1 failed mid-round: its slot stays empty. Ids follow the ORIGINAL
+    // dispatch order — id 1 belongs to the failed agent's (empty) slot, so a
+    // faithful LLM citing agent 2's issue uses id 1 and passes.
     let r = round(
         "Review",
         vec![
@@ -238,51 +245,46 @@ fn validator_uses_original_agent_indices_with_mid_round_failure() {
         vec![(1, "agent crashed")],
         "",
     );
+    let items = issues_by_agent(&r);
+    assert_eq!(
+        items[1],
+        Vec::<String>::new(),
+        "failed agent slot stays empty"
+    );
     let out = output(
         "The review found a timeout gap and a missing retry.",
-        vec![group(
-            "Robustness",
-            false,
-            vec![member(0, "No timeout check"), member(2, "Missing retry")],
-        )],
+        vec![group("Robustness", false, vec![member(0), member(1)])],
         vec![],
     );
     assert_eq!(
-        validate_grouping(&out, &issues_by_agent(&r)),
+        validate_round1(&out, &items),
         Ok(()),
-        "original dispatch indices must pass validation"
+        "original dispatch order must pass validation"
     );
-    let text = render_joint_comment(&r, &repaired(out));
+    let text = render_joint_comment(&r, &repaired(out), &ItemTable::new(&issues_by_agent(&r)));
     assert!(
-        text.contains("Missing retry"),
-        "member of agent 2 must render: {text}"
+        text.contains("Agent 2: Missing retry"),
+        "member of agent 2 must render via the id table: {text}"
     );
     assert!(
-        text.contains("No timeout check"),
-        "member of agent 0 must render: {text}"
+        text.contains("Agent 0: No timeout check"),
+        "member of agent 0 must render via the id table: {text}"
     );
     assert!(!text.contains("missing issue"), "no silent drops: {text}");
-}
-
-#[test]
-fn normalize_item_collapses_whitespace() {
-    assert_eq!(
-        normalize_item("  No   timeout\ncheck  "),
-        "No timeout check"
-    );
-    assert_eq!(normalize_item("a\tb c"), "a b c");
 }
 
 // ── Bracket arithmetic ─────────────────────────────────────────────────
 
 #[test]
 fn brackets_computed_from_distinct_cited_agents() {
-    let g = group(
-        "A",
-        false,
-        vec![member(0, "x"), member(2, "x"), member(2, "y")],
-    );
-    assert_eq!(distinct_agents(&g), vec![0, 2]);
+    let items = vec![
+        vec!["x".to_string()],
+        vec![],
+        vec!["x".to_string(), "y".to_string()],
+    ];
+    let table = ItemTable::new(&items);
+    let g = group("A", false, vec![member(0), member(1), member(2)]);
+    assert_eq!(distinct_agents(&g, &table), vec![0, 2]);
     // Solo [1/N] renders without DISPUTED.
     assert_eq!(bracket_label(1, 3, false), "[1/3]");
     // Contradiction renders [n/N · DISPUTED].
@@ -303,7 +305,11 @@ fn renderer_with_partial_failures() {
         vec![(2, "agent produced no response — crashed")],
         "1 of 2 valid verdicts failed (threshold 9/10).",
     );
-    let text = render_joint_comment(&r, &RepairOutcome::Fallback);
+    let text = render_joint_comment(
+        &r,
+        &RepairOutcome::Fallback,
+        &ItemTable::new(&issues_by_agent(&r)),
+    );
     assert!(text.contains("## Review round — 2/3 valid verdicts"));
     assert!(
         text.contains("- Agent 0: No timeout check"),
@@ -328,22 +334,17 @@ fn renderer_with_synthesis_groups_and_contradiction() {
         vec![],
         "",
     );
+    let items = issues_by_agent(&r);
+    let table = ItemTable::new(&items);
     let out = output(
         "The review found two distinct issues.",
         vec![
-            group("Robustness", false, vec![member(0, "No timeout check")]),
-            group(
-                "Safety",
-                true,
-                vec![
-                    member(0, "No timeout check"),
-                    member(1, "Missing error handling"),
-                ],
-            ),
+            group("Robustness", false, vec![member(0)]),
+            group("Safety", true, vec![member(0), member(1)]),
         ],
         vec![],
     );
-    let text = render_joint_comment(&r, &repaired(out));
+    let text = render_joint_comment(&r, &repaired(out), &table);
     assert!(
         text.contains("**Robustness** [1/2]"),
         "solo group renders [1/2] without DISPUTED: {text}"
@@ -369,16 +370,14 @@ fn renderer_with_ungrouped_trailing_section() {
         vec![],
         "",
     );
+    let items = issues_by_agent(&r);
+    let table = ItemTable::new(&items);
     let out = output(
         "One issue grouped, one left ungrouped.",
-        vec![group(
-            "Timeouts",
-            false,
-            vec![member(0, "No timeout check")],
-        )],
-        vec![member(1, "Naming nit")],
+        vec![group("Timeouts", false, vec![member(0)])],
+        vec![member(1)],
     );
-    let text = render_joint_comment(&r, &repaired(out));
+    let text = render_joint_comment(&r, &repaired(out), &table);
     assert!(
         text.contains("**Ungrouped**"),
         "ungrouped section renders: {text}"
@@ -400,15 +399,17 @@ fn renderer_marks_blocker_from_cited_agent_score() {
         vec![],
         "",
     );
+    let items = issues_by_agent(&r);
+    let table = ItemTable::new(&items);
     let out = output(
         "summary",
         vec![
-            group("A", false, vec![member(0, "No timeout check")]),
-            group("B", false, vec![member(1, "Naming nit")]),
+            group("A", false, vec![member(0)]),
+            group("B", false, vec![member(1)]),
         ],
         vec![],
     );
-    let text = render_joint_comment(&r, &repaired(out));
+    let text = render_joint_comment(&r, &repaired(out), &table);
     assert!(
         text.contains("[blocker] Agent 0: No timeout check"),
         "below-threshold agent's member renders as blocker: {text}"
@@ -419,10 +420,10 @@ fn renderer_marks_blocker_from_cited_agent_score() {
     );
 }
 
-// ── Prompt↔validator contract (zero-based agent labels) ────────────────
+// ── Prompt↔validator contract (global flat item ids) ───────────────────
 
 #[test]
-fn synthesis_request_uses_zero_based_agent_labels() {
+fn synthesis_request_uses_global_flat_item_ids() {
     let r = round(
         "Review",
         vec![
@@ -436,17 +437,17 @@ fn synthesis_request_uses_zero_based_agent_labels() {
     let request = synthesis_request(&r, Role::Reviewer, &ws);
     let system = &request.messages[0].content;
     assert!(
-        system.contains("ZERO-BASED"),
-        "prompt must state the zero-based label contract: {system}"
+        system.contains("id"),
+        "prompt must state the id-reference contract: {system}"
     );
     let user = &request.messages[1].content;
     assert!(
-        user.contains("Agent 0:"),
-        "input must label the first agent 'Agent 0': {user}"
+        user.contains("0: No timeout check") && user.contains("1: Missing retry"),
+        "input must number items with global flat ids: {user}"
     );
     assert!(
-        user.contains("Agent 1:"),
-        "input must label the second agent 'Agent 1': {user}"
+        user.contains("Agent 0:") && user.contains("Agent 1:"),
+        "agent labels remain visible: {user}"
     );
     assert!(
         !user.contains("Agent 0 (score") && !user.contains("(score"),
@@ -477,21 +478,21 @@ async fn run_synthesis_end_to_end_zero_based_contract() {
         "",
     );
     let provider = crate::util::test::FakeProvider::new().ok(
-        r#"{"summary":"Two distinct issues.","groups":[{"heading":"Robustness","contradiction":false,"members":[{"agent":0,"text":"No timeout check"},{"agent":1,"text":"Missing retry"}]}],"ungrouped":[]}"#,
+        r#"{"summary":"Two distinct issues.","groups":[{"heading":"Robustness","contradiction":false,"members":[{"id":0},{"id":1}]}],"ungrouped":[]}"#,
     );
     let _provider = crate::util::test::install_fake_provider(std::sync::Arc::new(provider));
     let ws = crate::workspace::test_ws("/tmp/test_ws");
     let outcome = run_synthesis(&r, Role::Reviewer, &ws).await;
     match outcome {
         RepairOutcome::Repaired { output, .. } => assert_eq!(output.groups.len(), 1),
-        RepairOutcome::Fallback => panic!("valid zero-based output must not fall back"),
+        RepairOutcome::Fallback => panic!("valid id-based output must not fall back"),
     }
 
-    // A 1-based index (agent 2 in a 2-agent round — the pre-fix prompt
-    // contract) must be rejected and eventually fall back. Round 1 is
-    // completeness-rejected (the raw proposal omits real items); rounds 2–3
-    // hit the unscripted-default parse failure (the script holds one
-    // response) — exhaustion is parse-failure + budget, not zero-progress.
+    // An out-of-range id (99 in a 2-item round) must be rejected and
+    // eventually fall back. Round 1 is completeness-rejected (the raw
+    // proposal omits real items); rounds 2–3 hit the unscripted-default
+    // parse failure (the script holds one response) — exhaustion is
+    // parse-failure + budget, not zero-progress.
     let r = round(
         "Review",
         vec![
@@ -502,13 +503,13 @@ async fn run_synthesis_end_to_end_zero_based_contract() {
         "",
     );
     let fake = std::sync::Arc::new(crate::util::test::FakeProvider::new().ok(
-        r#"{"summary":"Two distinct issues.","groups":[{"heading":"Robustness","contradiction":false,"members":[{"agent":2,"text":"No timeout check"}]}],"ungrouped":[]}"#,
+        r#"{"summary":"Two distinct issues.","groups":[{"heading":"Robustness","contradiction":false,"members":[{"id":99}]}],"ungrouped":[]}"#,
     ));
     let _provider = crate::util::test::install_fake_provider(fake.clone());
     let outcome = run_synthesis(&r, Role::Reviewer, &ws).await;
     assert!(
         matches!(outcome, RepairOutcome::Fallback),
-        "out-of-range 1-based index must exhaust synthesis into the fallback"
+        "out-of-range id must exhaust synthesis into the fallback"
     );
     // The rejection must be fed back into the next round so the LLM can
     // self-correct (never a byte-identical resend after a validation error).
@@ -525,8 +526,8 @@ async fn repair_rounds_freeze_groups_and_converge() {
     let _lock = crate::util::test::retry_tests_lock();
     let _policy = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
 
-    // Round 1: one valid group (freezes) + one fabricated group (dropped with
-    // a per-group reason) + ungrouped entries covering the remainder.
+    // Round 1: one valid group (freezes) + one out-of-range-id group (dropped
+    // with a per-group reason) + ungrouped entries covering the remainder.
     // Round 2: delta groups the remaining item. Round 3: delta leaves the
     // last item ungrouped → zero-progress stops the loop; the remainder
     // renders deterministically in the ungrouped section.
@@ -539,15 +540,17 @@ async fn repair_rounds_freeze_groups_and_converge() {
         vec![],
         "",
     );
+    // ids: 0 = agent0 "No timeout check", 1 = agent0 "Missing retry",
+    // 2 = agent1 "Naming nit".
     let fake = crate::util::test::FakeProvider::new()
         .ok(
-            r#"{"summary":"Two issues grouped, one left.","groups":[{"heading":"Robustness","contradiction":false,"members":[{"agent":0,"text":"No timeout check"}]},{"heading":"Fabricated","contradiction":false,"members":[{"agent":1,"text":"Invented text"}]}],"ungrouped":[{"agent":0,"text":"Missing retry"},{"agent":1,"text":"Naming nit"}]}"#,
+            r#"{"summary":"Two issues grouped, one left.","groups":[{"heading":"Robustness","contradiction":false,"members":[{"id":0}]},{"heading":"Fabricated","contradiction":false,"members":[{"id":99}]}],"ungrouped":[{"id":1},{"id":2}]}"#,
         )
         .ok(
-            r#"{"groups":[{"heading":"Retry","contradiction":false,"members":[{"agent":0,"text":"Missing retry"}]}],"ungrouped":[{"agent":1,"text":"Naming nit"}]}"#,
+            r#"{"groups":[{"heading":"Retry","contradiction":false,"members":[{"id":1}]}],"ungrouped":[{"id":2}]}"#,
         )
         .ok(
-            r#"{"groups":[],"ungrouped":[{"agent":1,"text":"Naming nit"}]}"#,
+            r#"{"groups":[],"ungrouped":[{"id":2}]}"#,
         );
     let fake = std::sync::Arc::new(fake);
     let _provider = crate::util::test::install_fake_provider(fake.clone());
@@ -563,7 +566,7 @@ async fn repair_rounds_freeze_groups_and_converge() {
     );
     assert_eq!(
         output.ungrouped,
-        vec![member(1, "Naming nit")],
+        vec![member(2)],
         "deterministic remainder placement"
     );
     assert_eq!(references.len(), 0);
@@ -575,8 +578,7 @@ async fn repair_rounds_freeze_groups_and_converge() {
     let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
     assert_eq!(fingerprints.len(), 3, "1 full + 2 repair rounds");
     assert!(
-        fingerprints[1].contains("REPAIR ROUND 2")
-            && fingerprints[1].contains("not found verbatim"),
+        fingerprints[1].contains("REPAIR ROUND 2") && fingerprints[1].contains("unknown item id"),
         "repair instructions + per-group rejection must reach the model: {}",
         fingerprints[1]
     );
@@ -601,12 +603,13 @@ async fn repair_zero_progress_with_no_frozen_groups_falls_back() {
         vec![],
         "",
     );
+    // ids: 0 = agent0 "No timeout check", 1 = agent1 "Missing retry".
     let fake = crate::util::test::FakeProvider::new()
         .ok(
-            r#"{"summary":"s","groups":[{"heading":"Bad","contradiction":false,"members":[{"agent":0,"text":"Invented"}]}],"ungrouped":[{"agent":0,"text":"No timeout check"},{"agent":1,"text":"Missing retry"}]}"#,
+            r#"{"summary":"s","groups":[{"heading":"Bad","contradiction":false,"members":[{"id":99}]}],"ungrouped":[{"id":0},{"id":1}]}"#,
         )
         .ok(
-            r#"{"groups":[{"heading":"Bad","contradiction":false,"members":[{"agent":1,"text":"Invented"}]}],"ungrouped":[{"agent":0,"text":"No timeout check"},{"agent":1,"text":"Missing retry"}]}"#,
+            r#"{"groups":[{"heading":"Bad","contradiction":false,"members":[{"id":98}]}],"ungrouped":[{"id":0},{"id":1}]}"#,
         );
     let fake = std::sync::Arc::new(fake);
     let _provider = crate::util::test::install_fake_provider(fake);
@@ -637,12 +640,13 @@ async fn repair_contradiction_reference_renders_disputed() {
         vec![],
         "",
     );
+    // ids: 0 = agent0 "Safe", 1 = agent1 "Actually unsafe".
     let fake = crate::util::test::FakeProvider::new()
         .ok(
-            r#"{"summary":"One consensus, one dispute.","groups":[{"heading":"Safety","contradiction":false,"members":[{"agent":0,"text":"Safe"}]}],"ungrouped":[{"agent":1,"text":"Actually unsafe"}]}"#,
+            r#"{"summary":"One consensus, one dispute.","groups":[{"heading":"Safety","contradiction":false,"members":[{"id":0}]}],"ungrouped":[{"id":1}]}"#,
         )
         .ok(
-            r#"{"groups":[],"ungrouped":[{"agent":1,"text":"Actually unsafe"}],"references":[{"group":0,"member":{"agent":1,"text":"Actually unsafe"}}]}"#,
+            r#"{"groups":[],"ungrouped":[{"id":1}],"references":[{"group":0,"member":{"id":1}}]}"#,
         );
     let fake = std::sync::Arc::new(fake);
     let _provider = crate::util::test::install_fake_provider(fake);
@@ -652,7 +656,11 @@ async fn repair_contradiction_reference_renders_disputed() {
         panic!("reference round must converge, got fallback");
     };
     assert_eq!(references.len(), 1, "contradiction reference accepted");
-    let text = render_joint_comment(&r, &RepairOutcome::Repaired { output, references });
+    let text = render_joint_comment(
+        &r,
+        &RepairOutcome::Repaired { output, references },
+        &ItemTable::new(&issues_by_agent(&r)),
+    );
     assert!(
         text.contains("Agent 1: Actually unsafe [DISPUTED — contradicts group 0 \"Safety\"]"),
         "reference must render with DISPUTED + cross-ref: {text}"
@@ -677,10 +685,10 @@ async fn repair_rejects_empty_member_group() {
     );
     let fake = crate::util::test::FakeProvider::new()
         .ok(
-            r#"{"summary":"s","groups":[{"heading":"Empty","contradiction":false,"members":[]},{"heading":"Safety","contradiction":false,"members":[{"agent":0,"text":"Safe"}]}],"ungrouped":[{"agent":1,"text":"Unsafe"}]}"#,
+            r#"{"summary":"s","groups":[{"heading":"Empty","contradiction":false,"members":[]},{"heading":"Safety","contradiction":false,"members":[{"id":0}]}],"ungrouped":[{"id":1}]}"#,
         )
         .ok(
-            r#"{"groups":[],"ungrouped":[{"agent":1,"text":"Unsafe"}]}"#,
+            r#"{"groups":[],"ungrouped":[{"id":1}]}"#,
         );
     let fake = std::sync::Arc::new(fake);
     let _provider = crate::util::test::install_fake_provider(fake.clone());

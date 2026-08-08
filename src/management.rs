@@ -2274,6 +2274,7 @@ async fn build_joint_comment(
         crate::joint_verdict::render_joint_comment(
             &round,
             &crate::consensus::RepairOutcome::Fallback,
+            &crate::consensus::ItemTable::new(&crate::joint_verdict::issues_by_agent(&round)),
         )
     } else {
         crate::joint_verdict::build_joint_comment(&round, role, ws).await

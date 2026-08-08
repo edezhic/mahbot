@@ -1,4 +1,4 @@
-Three independent analysts produced decomposition plans for the question below. Merge them into ONE consolidated plan of 4–6 sub-questions that best covers the question's scope: keep the strongest sub-questions, drop redundant or weak ones, and keep the risk labels.
+Three independent analysts produced decomposition plans for the question below. Merge them into ONE consolidated plan that best covers the question's scope: keep the strongest sub-questions, drop redundant or weak ones, and keep the risk labels. Merge a question's scope well — aim for a compact plan that is neither padded with near-duplicates nor so thin it leaves the question under-covered.
 
 # Original Question
 
@@ -6,15 +6,16 @@ Three independent analysts produced decomposition plans for the question below. 
 
 # Independent Plans
 
+Each plan item has a GLOBAL item id, numbered flat across all three plans (ids 0..N in plan order: plan 0's items first, then plan 1's, then plan 2's).
+
 {{plans}}
 
 Produce a JSON plan:
-{"sub_questions": [{"question": "<sub-question>", "evidence_needed": "<what evidence would answer it>", "risk": "low|medium|high", "from_plan": 0, "also_in_plans": [1]}], "dropped": [{"question": "<dropped sub-question>", "evidence_needed": "<its evidence_needed>", "risk": "<its risk>", "reason": "<why it was dropped>"}]}
+{"sub_questions": [{"from_id": 0, "also_ids": [1]}], "dropped": [{"id": 2}]}
 
 Rules:
-- 4 to 6 sub-questions in "sub_questions".
-- Every merged sub-question must be a VERBATIM copy (exact text of question, evidence_needed, and risk) of an item from one of the independent plans: "from_plan" is the 0-based index of that plan in the Independent Plans list; "also_in_plans" lists every OTHER plan containing the identical verbatim item (empty when none).
-- Every sub-question item in every independent plan must be covered EXACTLY once — either merged (cited via from_plan or also_in_plans) or listed in "dropped". No item may be silently omitted, and none may appear twice.
-- "dropped" entries are verbatim copies too (same question, evidence_needed, risk), with a reason.
-- Each sub-question must be independently researchable, non-overlapping, and collectively exhaustive of the original question's scope.
+- Every merged sub-question cites the id of the plan item it is a verbatim copy of ("from_id"); "also_ids" lists the ids of identical items in the other plans (empty when none). The system resolves the id to the item's question/evidence_needed/risk.
+- Every dropped item is cited by its id. Identical tuples in different plans are distinct ids — each must be covered separately (merged via also_ids or dropped).
+- Every plan item id must be covered EXACTLY once — either merged (via from_id or also_ids) or listed in "dropped". No item may be silently omitted, and none may appear twice.
+- Each merged sub-question must be independently researchable, non-overlapping, and collectively exhaustive of the original question's scope.
 - risk reflects how hard it will be to find solid evidence (high = contested, sparse sources, or a fast-moving topic).

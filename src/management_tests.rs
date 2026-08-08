@@ -1830,6 +1830,7 @@ fn joint_comment_includes_failed_agent_dumps() {
     let comment = crate::joint_verdict::render_joint_comment(
         &round,
         &crate::consensus::RepairOutcome::Fallback,
+        &crate::consensus::ItemTable::new(&crate::joint_verdict::issues_by_agent(&round)),
     );
     assert!(
         comment.contains("Raw agent response"),

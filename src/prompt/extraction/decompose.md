@@ -2,5 +2,5 @@ Based on your analysis above, provide your decomposition plan as a JSON object o
 
 {"sub_questions": [{"question": "<sub-question>", "evidence_needed": "<what evidence would answer it>", "risk": "low|medium|high"}]}
 
-- 4 to 6 sub-questions.
+- Cover the question's full scope — split it at its natural seams, neither padding with near-duplicates nor leaving parts under-covered.
 Output ONLY the JSON object. Do NOT call any tools.

@@ -441,23 +441,23 @@ async fn extract_findings(runs: Vec<(Agent, Option<String>)>) -> Vec<AnalystOutc
 }
 
 /// Consolidate extracted outcomes: build the per-agent claim lists and run the
-/// shared LLM grouping pass (semantic grouping + contradiction judgment).
-/// ≥2 valid responses go through grouping; the output contract is
-/// summary + groups + optional ungrouped list, with brackets computed from
-/// distinct cited agent ids. Fail-open: on grouping exhaustion, deliver the
-/// flat claim list plus raw analyst dumps with an explicit marker — never a
-/// fabricated consensus.
+/// shared repair-mode grouping pass (semantic grouping + contradiction
+/// judgment, frozen groups + deterministic remainder). ≥2 valid responses go
+/// through grouping; the output contract is summary + groups + optional
+/// ungrouped list, with brackets computed from distinct cited agent ids.
+/// Partial success (≥1 frozen group) is delivered as-is; only an exhaustion
+/// with zero groups ever frozen keeps the fail-open flat claim list plus raw
+/// analyst dumps with an explicit marker — never a fabricated consensus.
 async fn consolidate_findings(
     ws: &Workspace,
     ask: &str,
     outcomes: Vec<AnalystOutcome>,
 ) -> Result<String> {
     // Per-agent claim texts (agent index = outcome index; failed agents get an
-    // empty list so the label space matches the input material). Per-agent
-    // duplicates are deduped (raw + normalized in lockstep) so the LLM input
-    // and the validation universe both carry unique items.
+    // empty list so the id space matches the input material). Per-agent
+    // duplicates are NOT deduped: two identical claims are two distinct ids,
+    // and the model places each exactly once.
     let mut items_by_agent: Vec<Vec<String>> = Vec::with_capacity(outcomes.len());
-    let mut items: Vec<Vec<String>> = Vec::with_capacity(outcomes.len());
     for o in &outcomes {
         let claims = match o {
             AnalystOutcome::Findings { findings, .. } => {
@@ -465,18 +465,7 @@ async fn consolidate_findings(
             }
             _ => Vec::new(),
         };
-        let mut seen = std::collections::HashSet::new();
-        let mut raw = Vec::new();
-        let mut norm = Vec::new();
-        for c in claims {
-            let n = crate::consensus::normalize_item(&c);
-            if seen.insert(n.clone()) {
-                raw.push(c);
-                norm.push(n);
-            }
-        }
-        items_by_agent.push(raw);
-        items.push(norm);
+        items_by_agent.push(claims);
     }
     let n_valid = items_by_agent.iter().filter(|l| !l.is_empty()).count();
     if n_valid == 0 {
@@ -509,19 +498,22 @@ async fn consolidate_findings(
             "## Analyst Reports\n\n(only one analyst produced parseable claims — grouping skipped)\n\n{flat}\n\n{raw_dump}"
         ));
     }
-    // User material: numbered per-agent claims (verbatim — no source or
-    // confidence appended to member text).
+    // User material: global flat ids across ALL agents (each claim exactly one
+    // id, in (agent, claim) order) — the schema's `id` field matches.
     let mut material = String::new();
+    let mut id = 0usize;
     for (agent_idx, claims) in items_by_agent.iter().enumerate() {
         if claims.is_empty() {
             continue;
         }
         let _ = writeln!(material, "Agent {agent_idx}:");
-        for (i, c) in claims.iter().enumerate() {
-            let _ = writeln!(material, "- {i}: {c}");
+        for c in claims {
+            let _ = writeln!(material, "- {id}: {c}");
+            id += 1;
         }
     }
-    let user = format!("# Original Question\n\n{ask}\n\n# Agent Claims (verbatim)\n\n{material}");
+    let user =
+        format!("# Original Question\n\n{ask}\n\n# Agent Claims (id-numbered)\n\n{material}");
 
     let model = CONFIG.role_model(Role::Analyst);
     let routing = CONFIG.model_routing(&model);
@@ -542,11 +534,17 @@ async fn consolidate_findings(
         Some(DEFAULT_MAX_TOKENS),
     );
 
-    match crate::consensus::run_grouping(ws, "consolidate", request, &items).await {
-        crate::consensus::GroupingOutcome::Grouped(output) => {
-            Ok(render_ask_groups(ask, &output, n_valid, &outcomes))
-        }
-        crate::consensus::GroupingOutcome::Fallback => {
+    let table = crate::consensus::ItemTable::new(&items_by_agent);
+    match crate::consensus::run_grouping_repair(ws, "consolidate", request, &items_by_agent).await {
+        crate::consensus::RepairOutcome::Repaired { output, references } => Ok(render_ask_groups(
+            ask,
+            &output,
+            &references,
+            &table,
+            n_valid,
+            &outcomes,
+        )),
+        crate::consensus::RepairOutcome::Fallback => {
             // Fail-open deliverable: flat numbered claim list (the grouping
             // input) + raw analyst dumps + explicit marker. The marker is
             // head-placed so the sync path's 5 KB sandwich truncation keeps it.
@@ -561,26 +559,41 @@ async fn consolidate_findings(
 }
 
 /// Render the ask output contract: summary + groups (heading, contradiction
-/// flag, members citing agent+claim indices) + optional ungrouped list.
-/// Brackets [n/N] come from distinct cited agent ids; DISPUTED appears only
-/// when the group's contradiction flag is true. Self-reported caveats of a
-/// cited claim render as member metadata, never as contradictions.
+/// flag, members citing item ids) + ungrouped remainder + DISPUTED
+/// cross-references from remainder items to frozen groups. Brackets [n/N]
+/// come from distinct cited agent ids; DISPUTED appears only when the group's
+/// contradiction flag is true. Self-reported caveats of a cited claim render
+/// as member metadata, never as contradictions.
 #[must_use]
 fn render_ask_groups(
     ask: &str,
     output: &crate::consensus::GroupingOutput,
+    references: &[crate::consensus::GroupingReference],
+    table: &crate::consensus::ItemTable<'_>,
     n_valid: usize,
     outcomes: &[AnalystOutcome],
 ) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "{}", output.summary.trim());
+    let summary = output.summary.trim();
+    if summary.is_empty() {
+        let _ = writeln!(
+            out,
+            "LLM summary unavailable — deterministic member render."
+        );
+    } else {
+        let _ = writeln!(out, "{summary}");
+    }
     for group in &output.groups {
-        let n = crate::consensus::distinct_agents(group).len();
+        let n = crate::consensus::distinct_agents(group, table).len();
         let bracket = crate::consensus::bracket_label(n, n_valid, group.contradiction);
         let _ = write!(out, "\n\n**{}** {bracket}", group.heading);
         for member in &group.members {
-            let caveat = member_caveat(member, outcomes);
-            let _ = write!(out, "\n- {}", crate::consensus::render_member_line(member));
+            let caveat = member_caveat(member, table, outcomes);
+            let _ = write!(
+                out,
+                "\n- {}",
+                crate::consensus::render_member_line(member, table)
+            );
             if let Some(c) = caveat {
                 let _ = write!(out, " — caveat: {c}");
             }
@@ -589,8 +602,18 @@ fn render_ask_groups(
     if !output.ungrouped.is_empty() {
         out.push_str("\n\n**Ungrouped**");
         for member in &output.ungrouped {
-            let caveat = member_caveat(member, outcomes);
-            let _ = write!(out, "\n- {}", crate::consensus::render_member_line(member));
+            let mut line = crate::consensus::render_member_line(member, table);
+            for reference in references.iter().filter(|r| r.member.id == member.id) {
+                if let Some(group) = output.groups.get(reference.group) {
+                    let _ = write!(
+                        line,
+                        " [DISPUTED — contradicts group {} \"{}\"]",
+                        reference.group, group.heading
+                    );
+                }
+            }
+            let caveat = member_caveat(member, table, outcomes);
+            let _ = write!(out, "\n- {line}");
             if let Some(c) = caveat {
                 let _ = write!(out, " — caveat: {c}");
             }
@@ -603,18 +626,18 @@ fn render_ask_groups(
 
 /// Look up a cited member's self-reported caveats (the claim's own
 /// `contradictions` field — analyst self-report, NOT a group contradiction).
+/// The claim is resolved via the item table's (agent, per-agent index) — no
+/// text equality.
 fn member_caveat(
     member: &crate::consensus::GroupingMember,
+    table: &crate::consensus::ItemTable<'_>,
     outcomes: &[AnalystOutcome],
 ) -> Option<String> {
-    let AnalystOutcome::Findings { findings, .. } = outcomes.get(member.agent)? else {
+    let (agent, item) = table.resolve_index(member.id)?;
+    let AnalystOutcome::Findings { findings, .. } = outcomes.get(agent)? else {
         return None;
     };
-    let norm = crate::consensus::normalize_item(&member.text);
-    let claim = findings
-        .claims
-        .iter()
-        .find(|c| crate::consensus::normalize_item(&c.claim) == norm)?;
+    let claim = findings.claims.get(item)?;
     if claim.contradictions.is_empty() {
         None
     } else {
@@ -636,8 +659,8 @@ fn render_flat_claim_list(items_by_agent: &[Vec<String>]) -> String {
     out
 }
 
-/// Normalize a claim for deterministic comparisons (QueryLedger, marginal-gap
-/// saturation). Shared with the deep research tool.
+/// Normalize a claim for deterministic comparisons (QueryLedger, unanswered
+/// dedup). Shared with the deep research tool.
 pub(crate) fn normalize_claim(s: &str) -> String {
     s.split_whitespace()
         .collect::<Vec<_>>()
@@ -1097,6 +1120,18 @@ mod tests {
             },
             AnalystOutcome::NoResponse("analyst produced no response".into()),
         ];
+        // Global flat ids: 0 = a0 "alpha is true", 1 = a0 "beta is true",
+        // 2 = a1 "alpha is true", 3 = a1 "gamma is true".
+        let items: Vec<Vec<String>> = outcomes
+            .iter()
+            .map(|o| match o {
+                AnalystOutcome::Findings { findings, .. } => {
+                    findings.claims.iter().map(|c| c.claim.clone()).collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+        let table = crate::consensus::ItemTable::new(&items);
         let output = crate::consensus::GroupingOutput {
             summary: "Two facts, one solo finding.".into(),
             groups: vec![
@@ -1104,31 +1139,19 @@ mod tests {
                     heading: "Alpha".into(),
                     contradiction: false,
                     members: vec![
-                        crate::consensus::GroupingMember {
-                            agent: 0,
-                            text: "alpha is true".into(),
-                        },
-                        crate::consensus::GroupingMember {
-                            agent: 1,
-                            text: "alpha is true".into(),
-                        },
+                        crate::consensus::GroupingMember { id: 0 },
+                        crate::consensus::GroupingMember { id: 2 },
                     ],
                 },
                 crate::consensus::GroupingGroup {
                     heading: "Beta".into(),
                     contradiction: false,
-                    members: vec![crate::consensus::GroupingMember {
-                        agent: 0,
-                        text: "beta is true".into(),
-                    }],
+                    members: vec![crate::consensus::GroupingMember { id: 1 }],
                 },
             ],
-            ungrouped: vec![crate::consensus::GroupingMember {
-                agent: 1,
-                text: "gamma is true".into(),
-            }],
+            ungrouped: vec![crate::consensus::GroupingMember { id: 3 }],
         };
-        let text = render_ask_groups("q", &output, 2, &outcomes);
+        let text = render_ask_groups("q", &output, &[], &table, 2, &outcomes);
         assert!(
             text.contains("**Alpha** [2/2]"),
             "consensus group renders [2/2] from distinct cited agents: {text}"
@@ -1163,25 +1186,29 @@ mod tests {
                 findings: findings(vec![("alpha is false", "url2", "high")]),
             },
         ];
+        let items: Vec<Vec<String>> = outcomes
+            .iter()
+            .map(|o| match o {
+                AnalystOutcome::Findings { findings, .. } => {
+                    findings.claims.iter().map(|c| c.claim.clone()).collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+        let table = crate::consensus::ItemTable::new(&items);
         let output = crate::consensus::GroupingOutput {
             summary: "Agents disagree on alpha.".into(),
             groups: vec![crate::consensus::GroupingGroup {
                 heading: "Alpha".into(),
                 contradiction: true,
                 members: vec![
-                    crate::consensus::GroupingMember {
-                        agent: 0,
-                        text: "alpha is true".into(),
-                    },
-                    crate::consensus::GroupingMember {
-                        agent: 1,
-                        text: "alpha is false".into(),
-                    },
+                    crate::consensus::GroupingMember { id: 0 },
+                    crate::consensus::GroupingMember { id: 1 },
                 ],
             }],
             ungrouped: vec![],
         };
-        let text = render_ask_groups("q", &output, 2, &outcomes);
+        let text = render_ask_groups("q", &output, &[], &table, 2, &outcomes);
         assert!(
             text.contains("**Alpha** [2/2 · DISPUTED]"),
             "contradiction group renders [2/2 · DISPUTED]: {text}"
@@ -1202,25 +1229,29 @@ mod tests {
                 findings: findings(vec![("alpha is true", "url1", "high")]),
             },
         ];
+        let items: Vec<Vec<String>> = outcomes
+            .iter()
+            .map(|o| match o {
+                AnalystOutcome::Findings { findings, .. } => {
+                    findings.claims.iter().map(|c| c.claim.clone()).collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+        let table = crate::consensus::ItemTable::new(&items);
         let output = crate::consensus::GroupingOutput {
             summary: "alpha is agreed.".into(),
             groups: vec![crate::consensus::GroupingGroup {
                 heading: "Alpha".into(),
                 contradiction: false,
                 members: vec![
-                    crate::consensus::GroupingMember {
-                        agent: 0,
-                        text: "alpha is true".into(),
-                    },
-                    crate::consensus::GroupingMember {
-                        agent: 1,
-                        text: "alpha is true".into(),
-                    },
+                    crate::consensus::GroupingMember { id: 0 },
+                    crate::consensus::GroupingMember { id: 1 },
                 ],
             }],
             ungrouped: vec![],
         };
-        let text = render_ask_groups("q", &output, 2, &outcomes);
+        let text = render_ask_groups("q", &output, &[], &table, 2, &outcomes);
         assert!(
             text.contains("caveat: source B says alpha may be false"),
             "self-reported caveat renders as member metadata: {text}"
@@ -1340,10 +1371,11 @@ mod tests {
         let _guard = retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        // The grouping pass parses a strict GroupingOutput; a faithful model
-        // groups the two agreed claims and leaves nothing ungrouped.
+        // The grouping pass parses a strict id-based GroupingOutput; a
+        // faithful model groups the two agreed claims and leaves nothing
+        // ungrouped.
         let fake = FakeProvider::new().ok(
-            r#"{"summary":"alpha is true.","groups":[{"heading":"Alpha","contradiction":false,"members":[{"agent":0,"text":"alpha is true"},{"agent":1,"text":"alpha is true"}]}],"ungrouped":[]}"#,
+            r#"{"summary":"alpha is true.","groups":[{"heading":"Alpha","contradiction":false,"members":[{"id":0},{"id":1}]}],"ungrouped":[]}"#,
         );
         let result = consolidate_with_script(agreed_outcomes("report a", "report b"), fake).await;
         let text = result.expect("success");
@@ -1537,6 +1569,101 @@ mod tests {
         assert!(
             truncated.contains("unconsolidated — consolidation failed"),
             "head-placed marker must survive 5 KB sandwich truncation: {truncated}"
+        );
+    }
+
+    #[test]
+    fn render_ask_groups_renders_disputed_cross_references() {
+        // A remainder item that contradicts a frozen group renders with
+        // DISPUTED + a code-computed cross-reference (id-resolved — no text
+        // equality).
+        let outcomes = vec![
+            AnalystOutcome::Findings {
+                raw: "r1".into(),
+                findings: findings(vec![("safe", "url1", "high")]),
+            },
+            AnalystOutcome::Findings {
+                raw: "r2".into(),
+                findings: findings(vec![("actually unsafe", "url2", "high")]),
+            },
+        ];
+        let items: Vec<Vec<String>> = outcomes
+            .iter()
+            .map(|o| match o {
+                AnalystOutcome::Findings { findings, .. } => {
+                    findings.claims.iter().map(|c| c.claim.clone()).collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+        let table = crate::consensus::ItemTable::new(&items);
+        let output = crate::consensus::GroupingOutput {
+            summary: "One consensus, one dispute.".into(),
+            groups: vec![crate::consensus::GroupingGroup {
+                heading: "Safety".into(),
+                contradiction: false,
+                members: vec![crate::consensus::GroupingMember { id: 0 }],
+            }],
+            ungrouped: vec![crate::consensus::GroupingMember { id: 1 }],
+        };
+        let references = vec![crate::consensus::GroupingReference {
+            group: 0,
+            member: crate::consensus::GroupingMember { id: 1 },
+        }];
+        let text = render_ask_groups("q", &output, &references, &table, 2, &outcomes);
+        assert!(
+            text.contains("Agent 1: actually unsafe [DISPUTED — contradicts group 0 \"Safety\"]"),
+            "reference must render with DISPUTED + cross-ref: {text}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    async fn test_consolidation_partial_success_with_remainder() {
+        let _guard = retry_tests_lock();
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // Round 1 freezes one group and leaves one item ungrouped; round 2's
+        // delta leaves that item ungrouped → zero-progress stop. The frozen
+        // group + deterministic remainder are delivered (partial success —
+        // never the raw-dump fallback), and the round-1 summary is final.
+        let outcomes = vec![
+            AnalystOutcome::Findings {
+                raw: "r1".into(),
+                findings: findings(vec![
+                    ("alpha is true", "url1", "high"),
+                    ("beta is true", "url2", "medium"),
+                ]),
+            },
+            AnalystOutcome::Findings {
+                raw: "r2".into(),
+                findings: findings(vec![("alpha is true", "url1", "high")]),
+            },
+            AnalystOutcome::NoResponse("analyst produced no response".into()),
+        ];
+        // ids: 0 = a0 "alpha is true", 1 = a0 "beta is true", 2 = a1 "alpha is true".
+        let fake = FakeProvider::new()
+            .ok(
+                r#"{"summary":"alpha agreed, beta solo.","groups":[{"heading":"Alpha","contradiction":false,"members":[{"id":0},{"id":2}]}],"ungrouped":[{"id":1}]}"#,
+            )
+            .ok(r#"{"groups":[],"ungrouped":[{"id":1}]}"#);
+        let result = consolidate_with_script(outcomes, fake).await;
+        let text = result.expect("partial success must be delivered");
+        assert!(
+            text.contains("**Alpha** [2/2]"),
+            "frozen group with code-computed bracket renders: {text}"
+        );
+        assert!(
+            text.contains("**Ungrouped**") && text.contains("- Agent 0: beta is true"),
+            "deterministic remainder renders in the ungrouped section: {text}"
+        );
+        assert!(
+            text.contains("alpha agreed, beta solo."),
+            "round-1 summary is final: {text}"
+        );
+        assert!(
+            !text.contains("unconsolidated"),
+            "partial success replaces the raw-dump fallback: {text}"
         );
     }
 }

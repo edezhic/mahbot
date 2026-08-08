@@ -1,4 +1,4 @@
-Synthesize the accumulated research evidence below into a single comprehensive answer to the original question. This is the ONLY synthesis pass — the report is never regenerated.
+Synthesize the accumulated research evidence below into a single comprehensive answer to the original question. This pass runs at most three times: a truncated or empty attempt is retried with feedback to shorten/compress; the last produced output wins.
 
 # Original Question
 

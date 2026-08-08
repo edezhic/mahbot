@@ -1,4 +1,4 @@
-A research team has accumulated claims across multiple rounds. Classify each NEW claim from the latest round against the EXISTING claims below: is it novel, a duplicate of an existing claim, or a direct contradiction of one?
+A research team has accumulated claims across multiple rounds. Classify each NEW claim from the latest round against the EXISTING claims below: is it novel, a duplicate of an existing claim, or a direct contradiction of one? Judge semantic equivalence (restated facts), not textual similarity.
 
 # Existing Claims
 

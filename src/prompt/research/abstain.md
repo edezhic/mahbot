@@ -1,4 +1,4 @@
-A research team has spent multiple rounds trying to answer the question below and has stopped finding new evidence. Decide whether the question is genuinely answerable with the evidence gathered so far.
+The latest research round produced no new evidence (no new claims, no new sources). Decide whether the question is genuinely answerable with the evidence gathered so far.
 
 # Question
 

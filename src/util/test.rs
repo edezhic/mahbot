@@ -121,11 +121,19 @@ impl FakeProvider {
     /// Push a scripted successful response with the given text.
     #[must_use]
     pub(crate) fn ok(self, text: &str) -> Self {
+        self.ok_with_finish(text, None)
+    }
+
+    /// Push a scripted successful response with an explicit finish_reason
+    /// (e.g. "length" to simulate provider truncation).
+    #[must_use]
+    pub(crate) fn ok_with_finish(self, text: &str, finish_reason: Option<&str>) -> Self {
         self.script
             .lock()
             .unwrap()
             .push_back(Ok(crate::ChatResponse {
                 text: Some(text.to_string()),
+                finish_reason: finish_reason.map(str::to_string),
                 ..crate::ChatResponse::default()
             }));
         self

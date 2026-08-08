@@ -1,14 +1,14 @@
 //! ResearchTool — Manager-only deep multi-round research orchestrator.
 //!
 //! Unlike [`AskTool`](super::ask::AskTool) (one round of parallel analysts
-//! for quick clarification), `research` decomposes the question into 4–6
-//! sub-questions via three independent plans, runs one analyst per
-//! sub-question, then runs conditional gap rounds with fresh analysts
-//! targeting only the named gaps. Stopping is artifact-based — coverage
-//! completion, negative-evidence saturation, marginal-gap saturation,
-//! answerability abstention, a verification gate, and a hard agent-spawn cap
-//! (never agent self-assessment). Exactly one envelope is delivered
-//! asynchronously to the Manager; intermediate rounds never reach the user.
+//! for quick clarification), `research` decomposes the question into
+//! sub-questions via three independent plans (merged by id-based coverage),
+//! runs one analyst per sub-question, then runs conditional gap rounds with
+//! fresh analysts targeting only the named gaps. Stopping is artifact-based —
+//! coverage completion, answerability abstention (checked on every structural
+//! quiet round), a verification gate, and a hard agent-spawn cap (never agent
+//! self-assessment). Exactly one envelope is delivered asynchronously to the
+//! Manager; intermediate rounds never reach the user.
 //!
 //! Budgeting is by analysts spawned (decomposers, round-1 researchers,
 //! gap-round researchers, and verification analysts all count); orchestrator
@@ -20,6 +20,7 @@ use crate::agent::run_agent;
 use crate::config::CONFIG;
 use crate::message_router::{self, AgentJob, JobKind};
 use crate::prompt::{load_prompt, substitute};
+use crate::retry::FailureClass;
 use crate::session::resolve_agent_id;
 use crate::tools::Tool;
 use crate::tools::ask::{
@@ -50,11 +51,6 @@ const RESEARCH_MAX_ANALYSTS: usize = 20;
 const DECOMPOSE_FAN_OUT: usize = 3;
 /// Gap-round dispatch widths — rounds shrink as they progress.
 const GAP_ROUND_WIDTHS: &[usize] = &[4, 3, 2];
-/// Consecutive quiet rounds (no new URLs / novel claims) that trigger
-/// negative-evidence saturation.
-const QUIET_ROUNDS_TO_STOP: usize = 2;
-/// Marginal-gap saturation: >50% near-duplicate gaps = no-progress stop.
-const MARGINAL_GAP_SATURATION_PERCENT: usize = 50;
 /// Explicit marker when the orchestrator cannot determine the remaining gaps.
 const GAP_EXTRACTION_FAILED: &str = "gap extraction failed — remaining gaps unknown";
 /// Explicit marker when the plan merge fails — the run falls back to the
@@ -81,26 +77,33 @@ struct DecompositionPlan {
     sub_questions: Vec<SubQuestion>,
 }
 
-/// A merged sub-question carrying provenance: the input plan it was copied
-/// from verbatim, plus every other plan containing the identical tuple.
+/// A merged sub-question carrying provenance by global flat item id: the
+/// input-plan item it is a verbatim copy of, plus every other plan's item
+/// containing the identical tuple. question/evidence_needed/risk are resolved
+/// by the system from the cited item after validation — never trusted from
+/// the model's copy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MergedSubQuestion {
+    /// Global flat id of the input-plan item this sub-question copies
+    /// (ids are assigned in (plan, item) order across all plans).
+    from_id: usize,
+    /// Global flat ids of identical items in other plans.
+    #[serde(default)]
+    also_ids: Vec<usize>,
+    #[serde(default)]
     question: String,
+    #[serde(default)]
     evidence_needed: String,
+    #[serde(default)]
     risk: String,
-    /// Index of the input plan this sub-question is a verbatim copy of.
-    from_plan: usize,
-    /// Other input plans containing the identical verbatim tuple.
-    also_in_plans: Vec<usize>,
 }
 
-/// A round-0 plan item the merge explicitly dropped (never silently omitted).
+/// A round-0 plan item the merge explicitly dropped (never silently omitted),
+/// cited by its global flat id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DroppedSubQuestion {
-    question: String,
-    evidence_needed: String,
-    risk: String,
-    reason: String,
+    /// Global flat id of the dropped input-plan item.
+    id: usize,
 }
 
 /// The merged round-0 plan with full coverage provenance.
@@ -129,7 +132,7 @@ struct GapList {
     gaps: Vec<Gap>,
 }
 
-/// Answerability verdict after two stagnant rounds.
+/// Answerability verdict after a structural quiet round.
 #[derive(Debug, Clone, Deserialize)]
 struct AnswerabilityCheck {
     answerable: bool,
@@ -346,8 +349,6 @@ struct ClaimAnnotation {
     verdict: String,
     /// Index into the EXISTING acc.claims for duplicate/contradicts.
     existing_id: Option<usize>,
-    /// Verbatim text of the existing claim (proof).
-    proof: Option<String>,
     /// For "contradicts": the contradiction note.
     contradiction: Option<String>,
 }
@@ -670,22 +671,6 @@ fn orchestrator_params(ws: &Workspace, purpose: &'static str) -> ChatRequest {
     }
 }
 
-/// Free-form orchestrator LLM call via the hardened outer retry loop.
-/// The general workspace context is prepended as the leading system message.
-async fn orchestrator_chat(ws: &Workspace, purpose: &'static str, user: &str) -> Result<String> {
-    let _call = crate::call_registry::NON_AGENT_CALLS.register(purpose, &ws.name);
-    let mut params = orchestrator_params(ws, purpose);
-    let mut messages = Vec::with_capacity(2);
-    crate::prompt::prepend_general_context(&mut messages, ws).await;
-    messages.push(ChatMessage::user(user));
-    params.messages = messages;
-    let policy = crate::retry::RetryPolicy::current();
-    let response = crate::retry::retry_chat(params, &policy)
-        .await
-        .map_err(|e| anyhow::anyhow!("orchestrator call '{purpose}' failed: {e}"))?;
-    Ok(response.text_or_empty().to_string())
-}
-
 /// Structured orchestrator extraction via the hardened scoped retry loop.
 /// `prompt` embeds the JSON schema request. The general workspace context is
 /// prepended as the leading system message.
@@ -762,28 +747,51 @@ async fn round0_decompose(
     if valid.is_empty() {
         anyhow::bail!("all decomposition analysts failed — no research plan produced");
     }
-    if let Ok(plan) = merge_decomposition_plans(ws, question, &valid).await {
+    if let Ok(mut plan) = merge_decomposition_plans(ws, question, &valid).await {
+        resolve_merged_plan_ids(&mut plan, &valid);
         Ok((plan, None))
     } else {
         // Fail-open: a failed merge must never lose the run — fall back to
-        // the first valid plan verbatim with an explicit marker.
+        // the first valid plan verbatim with an explicit marker. Plan 0's
+        // items are the leading ids of the global flat numbering.
         let first = &valid[0];
         let plan = MergedPlan {
             sub_questions: first
                 .sub_questions
                 .iter()
-                .map(|sq| MergedSubQuestion {
+                .enumerate()
+                .map(|(i, sq)| MergedSubQuestion {
                     question: sq.question.clone(),
                     evidence_needed: sq.evidence_needed.clone(),
                     risk: sq.risk.clone(),
-                    from_plan: 0,
-                    also_in_plans: Vec::new(),
+                    from_id: i,
+                    also_ids: Vec::new(),
                 })
                 .collect(),
             dropped: Vec::new(),
         };
         Ok((plan, Some(PLAN_MERGE_FAILED.to_string())))
     }
+}
+
+/// Render the input plans with their global flat item ids for the merge
+/// prompt: `Plan N:` header per plan, one `- {id}: question [evidence, risk]`
+/// line per item, ids numbered flat across all plans in (plan, item) order.
+fn render_plans_with_ids(plans: &[DecompositionPlan]) -> String {
+    let mut out = String::new();
+    let mut id = 0usize;
+    for (p, plan) in plans.iter().enumerate() {
+        let _ = writeln!(out, "Plan {p}:");
+        for sq in &plan.sub_questions {
+            let _ = writeln!(
+                out,
+                "- {id}: {} [evidence: {}, risk: {}]",
+                sq.question, sq.evidence_needed, sq.risk
+            );
+            id += 1;
+        }
+    }
+    out
 }
 
 /// Merge 1–3 independent plans into one consolidated plan with provenance
@@ -793,13 +801,14 @@ async fn merge_decomposition_plans(
     question: &str,
     plans: &[DecompositionPlan],
 ) -> Result<MergedPlan> {
-    let plans_json = serde_json::to_string_pretty(plans)?;
     let prompt = substitute(
         &load_prompt("research/decompose_merge.md"),
-        &[("{{question}}", question), ("{{plans}}", &plans_json)],
+        &[
+            ("{{question}}", question),
+            ("{{plans}}", &render_plans_with_ids(plans)),
+        ],
     );
-    // The validator captures an owned copy of the input plans (the validator
-    // type is `'static`).
+    // The validator captures owned copies (the validator type is `'static`).
     let plans_owned = plans.to_vec();
     orchestrator_extract::<MergedPlan>(
         ws,
@@ -810,92 +819,64 @@ async fn merge_decomposition_plans(
     .await
 }
 
-/// Validate a merged plan: 4–6 sub-questions, verbatim provenance against the
-/// cited input plans, and full coverage — every input plan item appears
-/// exactly once across merged sub-questions (as `from_plan` or
-/// `also_in_plans`) plus dropped. Silent dropout is rejected (fail-closed
-/// inside the extraction retry loop).
-fn validate_merged_plan(
-    plan: &MergedPlan,
-    input_plans: &[DecompositionPlan],
-) -> Result<(), String> {
-    let n = plan.sub_questions.len();
-    if !(4..=6).contains(&n) {
-        return Err(format!("merged plan has {n} sub-questions, expected 4-6"));
+/// The input-plan items as the global flat id universe — id = (plan, item)
+/// order, matching `render_plans_with_ids` and the merge prompt's numbering.
+fn plan_item_table(plans: &[DecompositionPlan]) -> Vec<Vec<String>> {
+    plans
+        .iter()
+        .map(|p| p.sub_questions.iter().map(|s| s.question.clone()).collect())
+        .collect()
+}
+
+/// Fill in merged entries' tuple text from the cited input-plan items (the
+/// system resolves id → tuple via the global flat numbering — the model's
+/// copied text is never used).
+fn resolve_merged_plan_ids(plan: &mut MergedPlan, plans: &[DecompositionPlan]) {
+    let items = plan_item_table(plans);
+    let table = crate::consensus::ItemTable::new(&items);
+    for sq in &mut plan.sub_questions {
+        if let Some((p, i)) = table.resolve_index(sq.from_id) {
+            let src = &plans[p].sub_questions[i];
+            sq.question.clone_from(&src.question);
+            sq.evidence_needed.clone_from(&src.evidence_needed);
+            sq.risk.clone_from(&src.risk);
+        }
     }
-    let plan_has = |p: &DecompositionPlan, q: &str, e: &str, r: &str| {
-        p.sub_questions
-            .iter()
-            .position(|s| s.question == q && s.evidence_needed == e && s.risk == r)
+}
+
+/// Validate a merged plan by id-based coverage: every cited id in range, no
+/// duplicate placement, and full coverage — every input plan item id appears
+/// exactly once across merged sub-questions (as `from_id` or `also_ids`) plus
+/// dropped. Silent dropout is rejected (fail-closed inside the extraction
+/// retry loop). Structural only — tuple text is resolved by the system, never
+/// machine-checked against the plans.
+fn validate_merged_plan(plan: &MergedPlan, plans: &[DecompositionPlan]) -> Result<(), String> {
+    let items = plan_item_table(plans);
+    let table = crate::consensus::ItemTable::new(&items);
+    let mut covered = HashSet::new();
+    let mut mark = |id: usize, where_: &str| -> Result<(), String> {
+        if id >= table.len() {
+            return Err(format!("{where_}: out-of-range item id {id}"));
+        }
+        if !covered.insert(id) {
+            return Err(format!("{where_}: item {id} covered more than once"));
+        }
+        Ok(())
     };
-    // Coverage tally: every input item must be referenced exactly once.
-    let mut covered: std::collections::HashMap<(usize, usize), usize> =
-        std::collections::HashMap::new();
-    let mut mark = |p_idx: usize, s_idx: usize| {
-        *covered.entry((p_idx, s_idx)).or_insert(0) += 1;
-    };
-    for sq in &plan.sub_questions {
-        if sq.from_plan >= input_plans.len() {
-            return Err(format!(
-                "merged sub-question '{}' cites from_plan {} but only {} plans exist",
-                sq.question,
-                sq.from_plan,
-                input_plans.len()
-            ));
-        }
-        for &i in &sq.also_in_plans {
-            if i >= input_plans.len() {
-                return Err(format!(
-                    "merged sub-question '{}' cites also_in_plans {i} but only {} plans exist",
-                    sq.question,
-                    input_plans.len()
-                ));
-            }
-        }
-        let (q, e, r) = (&sq.question, &sq.evidence_needed, &sq.risk);
-        let Some(s_idx) = plan_has(&input_plans[sq.from_plan], q, e, r) else {
-            return Err(format!(
-                "merged sub-question tuple not found verbatim in plan {}: ({q}, {e}, {r})",
-                sq.from_plan
-            ));
-        };
-        mark(sq.from_plan, s_idx);
-        for &i in &sq.also_in_plans {
-            let Some(s_idx) = plan_has(&input_plans[i], q, e, r) else {
-                return Err(format!(
-                    "merged sub-question tuple not found verbatim in plan {i}: ({q}, {e}, {r})"
-                ));
-            };
-            mark(i, s_idx);
+    for (i, sq) in plan.sub_questions.iter().enumerate() {
+        mark(sq.from_id, &format!("merged sub-question {i}"))?;
+        for &id in &sq.also_ids {
+            mark(id, &format!("merged sub-question {i} also_ids"))?;
         }
     }
-    for dropped in &plan.dropped {
-        for (p_idx, p) in input_plans.iter().enumerate() {
-            if let Some(s_idx) = plan_has(
-                p,
-                &dropped.question,
-                &dropped.evidence_needed,
-                &dropped.risk,
-            ) {
-                mark(p_idx, s_idx);
-            }
-        }
+    for (i, d) in plan.dropped.iter().enumerate() {
+        mark(d.id, &format!("dropped entry {i}"))?;
     }
-    for (p_idx, p) in input_plans.iter().enumerate() {
-        for s_idx in 0..p.sub_questions.len() {
-            match covered.get(&(p_idx, s_idx)).copied().unwrap_or(0) {
-                1 => {}
-                0 => {
-                    return Err(format!(
-                        "silent dropout: input plan {p_idx} sub-question {s_idx} is never covered by the merged plan or dropped list"
-                    ));
-                }
-                k => {
-                    return Err(format!(
-                        "input plan {p_idx} sub-question {s_idx} is covered {k} times — every plan item must appear exactly once"
-                    ));
-                }
-            }
+    for id in 0..table.len() {
+        if !covered.contains(&id) {
+            return Err(format!(
+                "silent dropout: input plan item {id} is never covered by the merged plan or dropped list"
+            ));
         }
     }
     Ok(())
@@ -1030,22 +1011,6 @@ fn gap_items(gaps: &[Gap]) -> Vec<String> {
     gaps.iter().map(|g| g.item.clone()).collect()
 }
 
-/// Marginal-gap saturation: >50% of the traceable gaps are near-duplicates
-/// of each other → no-progress stop (deterministic normalized comparison).
-fn is_marginal_gap_saturated(gaps: &[Gap]) -> bool {
-    if gaps.len() < 2 {
-        return false;
-    }
-    let mut seen = HashSet::new();
-    let mut dups = 0usize;
-    for g in gaps {
-        if !seen.insert(normalize_claim(&g.item)) {
-            dups += 1;
-        }
-    }
-    dups * 100 > gaps.len() * MARGINAL_GAP_SATURATION_PERCENT
-}
-
 /// Run one gap round: fresh analysts, one per targeted gap (width-shrinking
 /// 4→3→2). Returns the round's analyst runs.
 async fn run_gap_round(
@@ -1095,9 +1060,9 @@ async fn run_gap_round(
 }
 
 /// Conditional gap rounds. Stopping is artifact-based, never agent
-/// self-assessment: coverage completion, negative-evidence saturation (two
-/// consecutive quiet rounds), marginal-gap saturation, answerability
-/// abstention, budget exhaustion, and shutdown.
+/// self-assessment: coverage completion, answerability abstention (checked on
+/// every structural quiet round — a non-abstain verdict continues, with the
+/// analyst budget as the hard bound), budget exhaustion, and shutdown.
 #[allow(clippy::too_many_arguments)]
 async fn gap_rounds(
     ws: &Workspace,
@@ -1120,7 +1085,6 @@ async fn gap_rounds(
         outcome.incomplete = Some(GAP_EXTRACTION_FAILED.to_string());
         return outcome;
     };
-    let mut quiet_rounds = 0usize;
     let mut round_index = 0usize;
     loop {
         if crate::shutdown::shutdown_token().is_cancelled() {
@@ -1138,10 +1102,6 @@ async fn gap_rounds(
             // Coverage completion.
             return outcome;
         }
-        if is_marginal_gap_saturated(gaps) {
-            outcome.unresolved = gap_items(gaps);
-            return outcome;
-        }
         let width = GAP_ROUND_WIDTHS[round_index.min(GAP_ROUND_WIDTHS.len() - 1)];
         round_index += 1;
         let targeted: Vec<&Gap> = gaps.iter().take(width).collect();
@@ -1155,19 +1115,19 @@ async fn gap_rounds(
         let novel_claims = annotate_round(ws, acc, &pending, markers).await;
         outcome.rounds_dispatched += 1;
         // A round whose analysts only re-asked already-asked queries counts
-        // as no-progress toward saturation (repeat queries are never
-        // pre-dispatch-droppable — concurrent analysts generate them live).
+        // as no-progress (repeat queries are never pre-dispatch-droppable —
+        // concurrent analysts generate them live).
         let all_repeat_queries = round.queries > 0 && round.queries == round.repeat_queries;
         if (new_urls == 0 && novel_claims == 0) || all_repeat_queries {
-            quiet_rounds += 1;
-            if quiet_rounds >= QUIET_ROUNDS_TO_STOP {
-                // Negative-evidence saturation: answerability abstain check.
-                outcome.abstention = check_answerability(ws, question, acc).await;
+            // Structural quiet-round signal: no new claims and no new sources.
+            // Answerability abstention stops the loop with an explicit marker;
+            // a non-abstain verdict continues — the analyst budget is the hard
+            // bound.
+            if let Some(reason) = check_answerability(ws, question, acc).await {
+                outcome.abstention = Some(reason);
                 outcome.unresolved = gap_items(gaps);
                 return outcome;
             }
-        } else {
-            quiet_rounds = 0;
         }
         // Refresh the gap list from the accumulated evidence only when the
         // round produced progress; a quiet round reuses the current list.
@@ -1184,8 +1144,8 @@ async fn gap_rounds(
 
 /// Per-round claim annotation pass: classify each pending claim against the
 /// existing accumulated claims via a single orchestrator extraction call.
-/// The validator guarantees id completeness and verbatim proofs (fail-closed
-/// inside the extraction retry loop).
+/// The validator guarantees id completeness and in-range existing ids
+/// (fail-closed inside the extraction retry loop).
 async fn annotate_claims(
     ws: &Workspace,
     existing: &[Claim],
@@ -1221,9 +1181,10 @@ async fn annotate_claims(
 }
 
 /// Validate an annotation pass: every pending claim annotated exactly once;
-/// `duplicate`/`contradicts` cite an in-range existing claim with a verbatim
-/// proof; `novel` cites nothing; the contradiction note is present exactly
-/// when the verdict is "contradicts".
+/// `duplicate`/`contradicts` cite an in-range existing claim; `novel` cites
+/// nothing; the contradiction note is present exactly when the verdict is
+/// "contradicts". Structural only — the verbatim-proof requirement is gone
+/// (id references + the LLM's semantic judgment are the only gates).
 fn validate_annotations(
     pass: &AnnotationPass,
     existing: &[Claim],
@@ -1276,24 +1237,6 @@ fn validate_annotations(
                 existing.len()
             ));
         }
-        let Some(proof) = a.proof.as_deref().filter(|p| !p.trim().is_empty()) else {
-            return Err(format!(
-                "{verdict} annotation for new claim {} must carry a verbatim proof",
-                a.new_id
-            ));
-        };
-        // Verbatim proof check uses the shared core's case-preserving
-        // normalization (consistency with the grouping validator's membership
-        // invariant — a proof that folds case would be weaker than the
-        // consensus path it feeds).
-        if crate::consensus::normalize_item(proof)
-            != crate::consensus::normalize_item(&existing[existing_id].claim)
-        {
-            return Err(format!(
-                "proof for new claim {} does not match existing claim {existing_id} verbatim",
-                a.new_id
-            ));
-        }
     }
     Ok(())
 }
@@ -1330,9 +1273,9 @@ async fn annotate_round(
     }
 }
 
-/// After two stagnant rounds: is the question genuinely unanswerable with the
-/// evidence gathered? `Some(abstention)` when it is (orchestrator call, not
-/// budgeted).
+/// After a structural quiet round (no new claims, no new sources): is the
+/// question genuinely unanswerable with the evidence gathered? `Some(abstention)`
+/// when it is (orchestrator call, not budgeted).
 async fn check_answerability(
     ws: &Workspace,
     question: &str,
@@ -1351,28 +1294,161 @@ async fn check_answerability(
 
 // ── Final synthesis + verification gate ──────────────────────────────────
 
-/// One-shot final synthesis from the accumulated evidence. The report is
-/// NEVER regenerated — this is the only synthesis pass.
+/// Marker surfaced in the head-placed `## Run markers` section when the final
+/// synthesis was delivered provider-truncated — never silent success.
+const SYNTHESIS_TRUNCATED_MARKER: &str =
+    "final synthesis truncated by the provider — last produced output delivered";
+
+/// Delivered synthesis: the report text plus an optional truncation marker.
+#[derive(Debug)]
+struct SynthesisOutput {
+    text: String,
+    marker: Option<String>,
+}
+
+/// Final synthesis from the accumulated evidence with the shared synthesis
+/// policy (≤3 informed attempts, transport-only backoff, hard time cap).
+/// A truncated, empty, or failed attempt counts toward the budget; the next
+/// attempt carries feedback to shorten/compress. The last produced output
+/// wins — a provider-truncated report is delivered with an explicit marker,
+/// never silent success. An exhaustion with no usable output at all (transport
+/// failures / empty responses) errors — the caller's partial-report fail-open
+/// path applies.
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
 async fn synthesize(
     ws: &Workspace,
     question: &str,
     acc: &AccumulatedEvidence,
     abstention: Option<&str>,
-) -> Result<String> {
+) -> Result<SynthesisOutput> {
+    let _call = crate::call_registry::NON_AGENT_CALLS.register("synthesize", &ws.name);
     let evidence = render_accumulated_evidence(acc);
-    let mut user = substitute(
+    let mut base_user = substitute(
         &load_prompt("research/synthesize.md"),
         &[("{{question}}", question), ("{{evidence}}", &evidence)],
     );
     if let Some(abstain) = abstention {
         let _ = writeln!(
-            user,
+            base_user,
             "\n\n# Answerability Note\n\nThe research team determined the question is not \
              answerable with the available evidence: {abstain}\n\
              State this clearly and explain what evidence would be needed."
         );
     }
-    orchestrator_chat(ws, "synthesize", &user).await
+    let policy = crate::retry::RetryPolicy::synthesis_from_config();
+    let mut loop_state = crate::retry::RetryLoop::new(&policy);
+    let operation_started = Instant::now();
+    let mut params = orchestrator_params(ws, "synthesize");
+    let mut prefix = Vec::with_capacity(2);
+    crate::prompt::prepend_general_context(&mut prefix, ws).await;
+    let mut last: Option<String> = None;
+    let mut last_truncated = false;
+    let mut any_truncated = false;
+    let mut feedback = String::new();
+    let mut transport_failures = 0u32;
+
+    for attempt in 1..=policy.max_attempts {
+        if loop_state.expired() {
+            break;
+        }
+        let mut user = base_user.clone();
+        if !feedback.is_empty() {
+            let _ = writeln!(user, "\n\n# Previous Attempt Feedback\n\n{feedback}");
+        }
+        let mut messages = prefix.clone();
+        messages.push(ChatMessage::user(&user));
+        params.messages = messages;
+        let attempt_started = Instant::now();
+        match crate::providers::chat_scoped(
+            params.clone(),
+            policy.idle_timeout,
+            loop_state.deadline(),
+        )
+        .await
+        {
+            Ok(resp) => {
+                let text = resp.text_or_empty().to_string();
+                let truncated = resp.finish_reason.as_deref() == Some("length");
+                if truncated {
+                    any_truncated = true;
+                    let err = anyhow::anyhow!(
+                        "synthesis truncated by the provider (finish_reason=length)"
+                    );
+                    let rec = crate::retry::RetryFailureRecord::new_simple(
+                        attempt,
+                        FailureClass::TruncatedOutput,
+                        &err,
+                        attempt_started.elapsed().as_millis() as u64,
+                        None,
+                    );
+                    loop_state.record(attempt, rec).await;
+                    feedback = "Your previous report was truncated by the output limit — \
+                                produce a SHORTER, more compressed version. Keep every \
+                                load-bearing claim and its source, but tighten the prose so \
+                                the whole report fits within the limit."
+                        .to_string();
+                    if !text.trim().is_empty() {
+                        last = Some(text);
+                        last_truncated = true;
+                    }
+                    continue;
+                }
+                if text.trim().is_empty() {
+                    let err = anyhow::anyhow!("synthesis attempt returned empty text");
+                    let rec = crate::retry::RetryFailureRecord::new_simple(
+                        attempt,
+                        FailureClass::NoResponse,
+                        &err,
+                        attempt_started.elapsed().as_millis() as u64,
+                        None,
+                    );
+                    loop_state.record(attempt, rec).await;
+                    feedback = "Your previous attempt returned an empty response — \
+                                produce the report now."
+                        .to_string();
+                    continue;
+                }
+                // Clean completion wins.
+                crate::stats::record_llm_success(&params, operation_started, attempt, &resp).await;
+                return Ok(SynthesisOutput { text, marker: None });
+            }
+            Err(err) => {
+                let non_retryable = !err.class.is_retryable();
+                loop_state.record(attempt, err.record).await;
+                if non_retryable {
+                    break;
+                }
+                transport_failures += 1;
+                if let Err(FailureClass::Shutdown) =
+                    loop_state.sleep_between(transport_failures).await
+                {
+                    break;
+                }
+            }
+        }
+    }
+    // Exhausted: the last produced output wins (marked when truncated); no
+    // usable output at all errors into the caller's partial-report fail-open.
+    let final_class = loop_state.final_class();
+    let exhausted = crate::retry::RetryExhausted::with_last_raw(
+        loop_state.into_failures(),
+        final_class,
+        last.clone(),
+    );
+    crate::stats::record_llm_failure(&params, operation_started, &exhausted).await;
+    if let Some(text) = last {
+        let marker = last_truncated.then(|| SYNTHESIS_TRUNCATED_MARKER.to_string());
+        Ok(SynthesisOutput { text, marker })
+    } else if any_truncated {
+        Err(anyhow::anyhow!(
+            "final synthesis truncated with no usable output: {SYNTHESIS_TRUNCATED_MARKER}"
+        ))
+    } else {
+        Err(anyhow::anyhow!(
+            "final synthesis produced no usable output after {} attempts",
+            policy.max_attempts
+        ))
+    }
 }
 
 /// Verification gate: fresh analysts verify the disputed / low-confidence
@@ -1661,11 +1737,17 @@ async fn run_deep_research(ws: &Workspace, question: &str) -> Result<String> {
         return Ok(partial_report(question, &acc, "shutdown during gap rounds"));
     }
 
-    // One-shot final synthesis (never regenerated). Fail-open: a synthesis
+    // Final synthesis (≤3 informed attempts; the last produced output wins,
+    // truncated reports carry an explicit marker). Fail-open: a synthesis
     // failure delivers the accumulated evidence with an explicit marker
     // instead of an error-only envelope — findings are never lost.
     let synthesis = match synthesize(ws, question, &acc, gap_outcome.abstention.as_deref()).await {
-        Ok(s) => s,
+        Ok(s) => {
+            if let Some(marker) = s.marker {
+                markers.push(marker);
+            }
+            s.text
+        }
         Err(_) if crate::shutdown::shutdown_token().is_cancelled() => {
             return Ok(partial_report(
                 question,
@@ -1790,32 +1872,59 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_marginal_gap_saturation() {
-        let gaps = vec![
-            Gap {
-                kind: "unanswered".into(),
-                item: "price of X".into(),
-                traces_to: 0,
-                evidence_seen: String::new(),
-            },
-            Gap {
-                kind: "unanswered".into(),
-                item: "price  of x".into(),
-                traces_to: 0,
-                evidence_seen: String::new(),
-            },
-            Gap {
-                kind: "unanswered".into(),
-                item: "price of X".into(),
-                traces_to: 1,
-                evidence_seen: String::new(),
-            },
-        ];
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn test_synthesis_truncated_output_is_marked_and_transport_fails_open() {
+        let _lock = crate::util::test::retry_tests_lock();
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let ws = crate::workspace::test_ws("/tmp/test_ws");
+        let acc = AccumulatedEvidence::default();
+
+        // Every attempt provider-truncated (finish_reason=length): the last
+        // produced output wins, marked — never silent success.
+        let fake = crate::util::test::FakeProvider::new()
+            .ok_with_finish("report part one", Some("length"))
+            .ok_with_finish("report part two", Some("length"))
+            .ok_with_finish("compressed final", Some("length"));
+        let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
+        let _provider_guard = crate::util::test::install_fake_provider(provider);
+        let out = synthesize(&ws, "q", &acc, None)
+            .await
+            .expect("last produced output must be delivered");
+        assert_eq!(out.text, "compressed final");
         assert!(
-            is_marginal_gap_saturated(&gaps),
-            "2/3 near-duplicate gaps exceed the 50% no-progress ratio"
+            out.marker
+                .as_deref()
+                .is_some_and(|m| m.contains("truncated")),
+            "truncated delivery must carry the explicit marker: {:?}",
+            out.marker
         );
+
+        // A clean (non-truncated) attempt wins immediately without a marker.
+        let fake = crate::util::test::FakeProvider::new()
+            .ok_with_finish("part one", Some("length"))
+            .ok("complete report");
+        let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
+        let _provider_guard = crate::util::test::install_fake_provider(provider);
+        let out = synthesize(&ws, "q", &acc, None)
+            .await
+            .expect("clean completion wins");
+        assert_eq!(out.text, "complete report");
+        assert!(out.marker.is_none(), "clean completion is unmarked");
+
+        // All transport failures → no usable output → Err (the caller's
+        // partial-report fail-open path).
+        let fake = crate::util::test::FakeProvider::new()
+            .err(crate::retry::FailureClass::Transport, "outage")
+            .err(crate::retry::FailureClass::Transport, "outage")
+            .err(crate::retry::FailureClass::Transport, "outage");
+        let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
+        let _provider_guard = crate::util::test::install_fake_provider(provider);
+        let err = synthesize(&ws, "q", &acc, None)
+            .await
+            .expect_err("transport exhaustion must error into the partial-report path");
+        assert!(err.to_string().contains("no usable output"), "{err}");
     }
 
     #[test]
@@ -1826,15 +1935,15 @@ mod tests {
                     question: "What is the price of X?".into(),
                     evidence_needed: "pricing page".into(),
                     risk: "low".into(),
-                    from_plan: 0,
-                    also_in_plans: vec![],
+                    from_id: 0,
+                    also_ids: vec![],
                 },
                 MergedSubQuestion {
                     question: "Who maintains X?".into(),
                     evidence_needed: "repo metadata".into(),
                     risk: "medium".into(),
-                    from_plan: 0,
-                    also_in_plans: vec![],
+                    from_id: 1,
+                    also_ids: vec![],
                 },
             ],
             dropped: vec![],
@@ -1880,71 +1989,67 @@ mod tests {
                 sub_questions: vec![sq("q4"), sq("q5")],
             },
         ];
+        // Global flat ids: plan 0: q1=0 q2=1; plan 1: q1=2 q3=3; plan 2: q4=4 q5=5.
         let base = |also: bool, dropped: bool| MergedPlan {
             sub_questions: vec![
                 MergedSubQuestion {
-                    question: "q1".into(),
-                    evidence_needed: "e".into(),
-                    risk: "low".into(),
-                    from_plan: 0,
-                    also_in_plans: if also { vec![1] } else { vec![] },
+                    question: String::new(),
+                    evidence_needed: String::new(),
+                    risk: String::new(),
+                    from_id: 0,
+                    also_ids: if also { vec![2] } else { vec![] },
                 },
                 MergedSubQuestion {
-                    question: "q2".into(),
-                    evidence_needed: "e".into(),
-                    risk: "low".into(),
-                    from_plan: 0,
-                    also_in_plans: vec![],
+                    question: String::new(),
+                    evidence_needed: String::new(),
+                    risk: String::new(),
+                    from_id: 1,
+                    also_ids: vec![],
                 },
                 MergedSubQuestion {
-                    question: "q3".into(),
-                    evidence_needed: "e".into(),
-                    risk: "low".into(),
-                    from_plan: 1,
-                    also_in_plans: vec![],
+                    question: String::new(),
+                    evidence_needed: String::new(),
+                    risk: String::new(),
+                    from_id: 3,
+                    also_ids: vec![],
                 },
                 MergedSubQuestion {
-                    question: "q4".into(),
-                    evidence_needed: "e".into(),
-                    risk: "low".into(),
-                    from_plan: 2,
-                    also_in_plans: vec![],
+                    question: String::new(),
+                    evidence_needed: String::new(),
+                    risk: String::new(),
+                    from_id: 4,
+                    also_ids: vec![],
                 },
             ],
             dropped: if dropped {
-                vec![DroppedSubQuestion {
-                    question: "q5".into(),
-                    evidence_needed: "e".into(),
-                    risk: "low".into(),
-                    reason: "redundant".into(),
-                }]
+                vec![DroppedSubQuestion { id: 5 }]
             } else {
                 vec![]
             },
         };
         assert!(
             validate_merged_plan(&base(true, true), &plans).is_ok(),
-            "full coverage via from_plan + also_in_plans + dropped"
+            "full coverage via from_id + also_ids + dropped"
         );
         assert!(
             validate_merged_plan(&base(false, true), &plans).is_err(),
-            "silent dropout: plan 1's q1 is never covered"
+            "silent dropout: plan 1's q1 (id 2) is never covered"
         );
         assert!(
             validate_merged_plan(&base(true, false), &plans).is_err(),
-            "silent dropout: q5 is never covered"
+            "silent dropout: q5 (id 5) is never covered"
         );
         let mut bad = base(true, true);
-        bad.sub_questions[0].from_plan = 9;
+        bad.sub_questions[0].from_id = 9;
         assert!(
             validate_merged_plan(&bad, &plans).is_err(),
-            "out-of-range from_plan is rejected"
+            "out-of-range from_id is rejected"
         );
         let mut bad = base(true, true);
-        bad.sub_questions[3].question = "q9".into();
+        bad.sub_questions[3].from_id = 0;
         assert!(
             validate_merged_plan(&bad, &plans).is_err(),
-            "a merged tuple not found verbatim in its cited plan is rejected"
+            "duplicate placement (id 0 twice) is rejected"
         );
     }
 
@@ -2032,7 +2137,6 @@ mod tests {
                 new_id: 0,
                 verdict: "contradicts".into(),
                 existing_id: Some(0),
-                proof: Some("alpha costs $100 in 2024".into()),
                 contradiction: Some("price differs: $200 vs $100".into()),
             }],
         };
@@ -2079,7 +2183,6 @@ mod tests {
                 new_id: 0,
                 verdict: "duplicate".into(),
                 existing_id: Some(0),
-                proof: Some("alpha is true".into()),
                 contradiction: None,
             }],
         };
