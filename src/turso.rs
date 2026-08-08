@@ -727,6 +727,11 @@ impl TxGuard<'_> {
         self.conn.execute(sql, params).await
     }
 
+    /// Execute multiple SQL statements (e.g. a schema) inside the transaction.
+    pub async fn execute_batch(&self, sql: &str) -> turso::Result<()> {
+        self.conn.execute_batch(sql).await
+    }
+
     /// Execute a query that returns exactly one row.
     pub async fn query_row<T, E>(
         &self,
@@ -795,6 +800,25 @@ pub(crate) async fn column_exists(
     Ok(rows
         .iter()
         .any(|row| row.get::<String>(1).ok().as_deref() == Some(column)))
+}
+
+/// Check whether `table` has a column with a NOT NULL constraint
+/// (via `PRAGMA table_info`).
+pub(crate) async fn column_not_null(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+) -> anyhow::Result<bool> {
+    let rows = conn
+        .query(&format!("PRAGMA table_info('{table}')"), ())
+        .await
+        .with_context(|| format!("Failed to read PRAGMA table_info for {table} table"))?;
+    Ok(rows.iter().any(|row| {
+        // Fail-closed on an unreadable notnull flag: treat the column as NOT
+        // NULL so the caller runs the (idempotent) migration instead of
+        // surfacing a constraint violation on a later insert.
+        row.get::<String>(1).ok().as_deref() == Some(column) && row.get::<i64>(3).unwrap_or(1) != 0
+    }))
 }
 
 /// Ensure a full-text search index exists with the correct tokenizer.

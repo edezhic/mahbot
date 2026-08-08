@@ -97,6 +97,50 @@ pub(crate) async fn build_workspace_context(workspace: &Path) -> String {
     out
 }
 
+/// Wrap workspace context content in a stable `<workspace-context>` block.
+/// Returns an empty string when `content` is blank.
+pub(crate) fn wrap_workspace_context(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    format!("\n<workspace-context>\n{trimmed}\n</workspace-context>\n")
+}
+
+/// Build the general (non-role) workspace context block for non-agent LLM
+/// calls, wrapped in a stable `<workspace-context>` block.
+///
+/// Uses the stored general context row (role = NULL) when discovery has
+/// produced one; otherwise falls back to the file-derived context builder
+/// (the same fallback role agents use). The block is stable per workspace —
+/// it does not vary between requests. Returns an empty string when no
+/// context source has content (no stored row and no context files).
+pub(crate) async fn build_general_workspace_context(ws: &crate::Workspace) -> String {
+    // Degrade to the file-derived fallback when the store is uninitialized
+    // (e.g. early tests) — never panic on a missing global.
+    let stored = match crate::workspace::WORKSPACES.get() {
+        Some(store) => store.get_general_context(&ws.name).await.ok().flatten(),
+        None => None,
+    };
+    let content = match stored {
+        Some(ctx) => ctx,
+        None => build_workspace_context(ws.as_path()).await,
+    };
+    wrap_workspace_context(&content)
+}
+
+/// Prepend the general workspace context to `messages` as the leading system
+/// message when a stored or file-derived context exists. No-op otherwise.
+pub(crate) async fn prepend_general_context(
+    messages: &mut Vec<crate::ChatMessage>,
+    ws: &crate::Workspace,
+) {
+    let context = build_general_workspace_context(ws).await;
+    if !context.is_empty() {
+        messages.insert(0, crate::ChatMessage::system(&context));
+    }
+}
+
 /// Format a ticket as a `<current-ticket>` block for injection as a
 /// separate system message (after memory context, before user message).
 pub(crate) fn format_ticket_block(ticket: &crate::board::Ticket) -> String {

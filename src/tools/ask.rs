@@ -905,19 +905,23 @@ async fn synthesize_claim_report(
     let routing = CONFIG.model_routing(&model);
     let prompt_template = load_prompt("consolidate/analyst.md");
 
-    // System message = filled template (instructions + original_ask only)
-    let system_content = substitute(&prompt_template, &[("{{original_ask}}", ask)]);
+    // System messages: general workspace context first, then the filled
+    // template (instructions + original_ask only).
+    let mut messages = Vec::with_capacity(3);
+    crate::prompt::prepend_general_context(&mut messages, ws).await;
+    messages.push(ChatMessage::system(substitute(
+        &prompt_template,
+        &[("{{original_ask}}", ask)],
+    )));
 
     // User message = deterministic claim-level report only.
     let claim_report =
         render_claim_report(ask, merged, coverage, unanswered, verification, outcomes);
     let user_content = format!("## Claim-level Findings\n\n{claim_report}");
+    messages.push(ChatMessage::user(&user_content));
 
     let request = ChatRequest {
-        messages: vec![
-            ChatMessage::system(&system_content),
-            ChatMessage::user(&user_content),
-        ],
+        messages,
         tools: None,
         model,
         allow_image_parts: false,

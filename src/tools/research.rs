@@ -564,7 +564,8 @@ fn collect_evidence(
 
 /// Build the orchestrator's chat params: cheap Analyst model (per-role
 /// overrides respected), constant model/effort/tools across all coordination
-/// calls of a run (KV-cache friendly — only user messages vary).
+/// calls of a run (KV-cache friendly — the leading general workspace context
+/// system message is constant too; only the user message varies).
 fn orchestrator_params(ws: &Workspace, purpose: &'static str) -> ChatRequest {
     let model = CONFIG.role_model(Role::Analyst);
     let routing = CONFIG.model_routing(&model);
@@ -589,9 +590,13 @@ fn orchestrator_params(ws: &Workspace, purpose: &'static str) -> ChatRequest {
 }
 
 /// Free-form orchestrator LLM call via the hardened outer retry loop.
+/// The general workspace context is prepended as the leading system message.
 async fn orchestrator_chat(ws: &Workspace, purpose: &'static str, user: &str) -> Result<String> {
     let mut params = orchestrator_params(ws, purpose);
-    params.messages = vec![ChatMessage::user(user)];
+    let mut messages = Vec::with_capacity(2);
+    crate::prompt::prepend_general_context(&mut messages, ws).await;
+    messages.push(ChatMessage::user(user));
+    params.messages = messages;
     let policy = crate::retry::RetryPolicy::current();
     let response = crate::retry::retry_chat(params, &policy)
         .await
@@ -600,7 +605,8 @@ async fn orchestrator_chat(ws: &Workspace, purpose: &'static str, user: &str) ->
 }
 
 /// Structured orchestrator extraction via the hardened scoped retry loop.
-/// `prompt` embeds the JSON schema request.
+/// `prompt` embeds the JSON schema request. The general workspace context is
+/// prepended as the leading system message.
 async fn orchestrator_extract<T: serde::de::DeserializeOwned>(
     ws: &Workspace,
     purpose: &'static str,
@@ -608,14 +614,12 @@ async fn orchestrator_extract<T: serde::de::DeserializeOwned>(
     validate: Option<&crate::ExtractionValidator<T>>,
 ) -> Result<T> {
     let params = orchestrator_params(ws, purpose);
-    crate::extraction::retry_extract_structured_scoped::<T>(
-        &[ChatMessage::user(prompt)],
-        "",
-        &params,
-        validate,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("orchestrator extraction '{purpose}' failed: {e}"))
+    let mut messages = Vec::with_capacity(2);
+    crate::prompt::prepend_general_context(&mut messages, ws).await;
+    messages.push(ChatMessage::user(prompt));
+    crate::extraction::retry_extract_structured_scoped::<T>(&messages, "", &params, validate)
+        .await
+        .map_err(|e| anyhow::anyhow!("orchestrator extraction '{purpose}' failed: {e}"))
 }
 
 // ── Round 0: decomposition ───────────────────────────────────────────────

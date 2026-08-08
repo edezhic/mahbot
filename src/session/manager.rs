@@ -263,12 +263,7 @@ impl Session {
             let mut ctx = String::new();
 
             // Auto-discovered workspace context block.
-            if !workspace_context.trim().is_empty() {
-                let _ = write!(
-                    ctx,
-                    "\n<workspace-context>\n{workspace_context}\n</workspace-context>\n"
-                );
-            }
+            ctx.push_str(&crate::prompt::wrap_workspace_context(&workspace_context));
 
             // User-curated manual notes block (survives rediscover).
             // NOTE: changes to ws.notes do not affect in-flight agent sessions

@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
 );
 CREATE TABLE IF NOT EXISTS workspace_contexts (
     workspace_name TEXT NOT NULL REFERENCES workspaces(name) ON DELETE CASCADE,
-    role           TEXT NOT NULL,
+    role           TEXT,
     content        TEXT NOT NULL,
     created_at     TEXT NOT NULL,
     UNIQUE(workspace_name, role)
@@ -170,16 +170,47 @@ async fn run_workspace_discovery(
     role: Role,
     discovery_generation: i64,
 ) -> Result<()> {
+    run_discovery_task(
+        ws,
+        role.discovery_prompt(),
+        discovery_generation,
+        Some(role.as_str()),
+    )
+    .await
+}
+
+/// Run general (non-role) workspace discovery — a project overview used by
+/// non-agent LLM calls. Stored as the NULL-role context row.
+async fn run_general_discovery(ws: &Workspace, discovery_generation: i64) -> Result<()> {
+    run_discovery_task(
+        ws,
+        crate::prompt::load_prompt("discovery/general.md"),
+        discovery_generation,
+        None,
+    )
+    .await
+}
+
+/// Shared discovery execution: run the Discovery agent on `prompt`, guard
+/// against stale writes, then persist the result. `role` is `None` for the
+/// general (non-role) context, `Some(name)` for a role-keyed context; the
+/// role string also serves as the task label (`"general"` when `None`).
+async fn run_discovery_task(
+    ws: &Workspace,
+    prompt: String,
+    discovery_generation: i64,
+    role: Option<&str>,
+) -> Result<()> {
+    let label = role.unwrap_or("general");
     let storage = WORKSPACES
         .get()
         .context("WORKSPACES not initialized")?
         .clone();
 
-    tracing::info!(workspace_name = ws.name, role = %role, "Starting workspace discovery");
+    tracing::info!(workspace_name = ws.name, role = %label, "Starting workspace discovery");
 
     // Create a Discovery agent pointed at the workspace
-    let agent_id = discovery_agent_id(&ws.name, role.as_str());
-    let prompt = role.discovery_prompt();
+    let agent_id = discovery_agent_id(&ws.name, label);
     let (_agent, response) = run_agent(
         agent_id,
         Role::Discovery,
@@ -196,7 +227,7 @@ async fn run_workspace_discovery(
 
     let content = response.trim().to_string();
     if content.is_empty() {
-        anyhow::bail!("Empty response for role '{role}'");
+        anyhow::bail!("Empty response for '{label}'");
     }
 
     // Guard against stale writes: if another rediscover has been triggered
@@ -213,12 +244,16 @@ async fn run_workspace_discovery(
         return Ok(());
     }
 
-    if let Err(e) = storage.set_context(&ws.name, role.as_str(), &content).await {
-        tracing::error!(workspace_name = ws.name, role = %role, error = %e, "Failed to store context");
+    let result = match role {
+        Some(r) => storage.set_context(&ws.name, r, &content).await,
+        None => storage.set_general_context(&ws.name, &content).await,
+    };
+    if let Err(e) = result {
+        tracing::error!(workspace_name = ws.name, role = %label, error = %e, "Failed to store context");
         return Err(e);
     }
 
-    tracing::info!(workspace_name = ws.name, role = %role, "Workspace discovery for {role} completed");
+    tracing::info!(workspace_name = ws.name, role = %label, "Workspace discovery for {label} completed");
     Ok(())
 }
 
@@ -417,11 +452,11 @@ async fn spawn_panic_guarded(
     }
 }
 
-/// Spawn a background task that runs workspace discovery (per-role context
-/// generation) and optionally diagnostics discovery.
+/// Spawn a background task that runs workspace discovery (per-role and
+/// general non-role context generation) and optionally diagnostics discovery.
 ///
 /// `discovery_generation` is the generation counter captured at spawn time.
-/// Both discovery functions use it to guard against stale writes.
+/// The discovery functions use it to guard against stale writes.
 ///
 /// When `discover_diagnostics` is `false` (e.g. during a re-analysis via
 /// [`WorkspaceStore::rediscover`]), diagnostics discovery is skipped so that
@@ -440,7 +475,8 @@ pub fn spawn_workspace_discovery(
         let ws_name_for_inner = ws_name.clone();
         let ws_path_for_finalize = ws_path.clone();
         let inner = async move {
-            // Build role discovery futures (always needed).
+            // Build role discovery futures (always needed). The general
+            // (non-role) project overview discovery runs alongside them.
             let role_futures: Vec<_> = Role::iter()
                 .filter(|r| crate::role::role_info(r).has_discovery)
                 .map(|role| {
@@ -449,8 +485,8 @@ pub fn spawn_workspace_discovery(
                 })
                 .collect();
 
-            // Run role discovery always, optionally with diagnostics.
-            let (role_results, diagnostics_result) = if discover_diagnostics {
+            // Run role discovery + general discovery always, optionally with diagnostics.
+            let (role_results, general_result, diagnostics_result) = if discover_diagnostics {
                 // Read diagnostics generation from DB for the generation guard.
                 // Separate from discovery_generation: both counters are independent
                 // (diagnostics is bumped by set_diagnostics/rediscover_diagnostics,
@@ -464,11 +500,15 @@ pub fn spawn_workspace_discovery(
                 };
                 tokio::join!(
                     join_all(role_futures),
+                    run_general_discovery(&ws, discovery_generation),
                     run_workspace_diagnostics(&ws, diag_gen),
                 )
             } else {
-                let roles = join_all(role_futures).await;
-                (roles, Ok(()))
+                let (roles, general) = tokio::join!(
+                    join_all(role_futures),
+                    run_general_discovery(&ws, discovery_generation),
+                );
+                (roles, general, Ok(()))
             };
 
             let mut all_ok = true;
@@ -482,6 +522,12 @@ pub fn spawn_workspace_discovery(
                         errors.push(e.to_string());
                     }
                 }
+            }
+
+            // General context failure is fatal.
+            if let Err(e) = general_result {
+                all_ok = false;
+                errors.push(e.to_string());
             }
 
             // Diagnostics failure is fatal.
@@ -862,7 +908,8 @@ impl WorkspaceStore {
             .await
     }
 
-    /// Clear all per-role workspace contexts for a workspace.
+    /// Clear all workspace context rows (role-keyed and the general NULL-role
+    /// row) for a workspace.
     /// Called by [`Self::rediscover`] before spawning a new discovery task so that
     /// stale context entries from a previous discovery don't persist.
     async fn clear_contexts(&self, name: &str) -> Result<()> {
@@ -985,6 +1032,32 @@ impl WorkspaceStore {
         Ok(())
     }
 
+    /// Get the general (non-role) workspace context, or `None` when discovery
+    /// has not produced one yet.
+    pub async fn get_general_context(&self, name: &str) -> Result<Option<String>> {
+        self.conn
+            .query_optional(
+                "SELECT content FROM workspace_contexts WHERE workspace_name = ?1 AND role IS NULL",
+                turso::params![name],
+                |row| row.get::<String>(0),
+            )
+            .await
+    }
+
+    /// Upsert the general (non-role) workspace context. The partial unique
+    /// index guarantees at most one NULL-role row per workspace.
+    pub async fn set_general_context(&self, name: &str, content: &str) -> Result<()> {
+        let now = turso::now();
+        self.conn
+            .execute(
+                "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) VALUES (?1, NULL, ?2, ?3) \
+                 ON CONFLICT(workspace_name) WHERE role IS NULL DO UPDATE SET content = excluded.content, created_at = excluded.created_at",
+                turso::params![name, content, now],
+            )
+            .await?;
+        Ok(())
+    }
+
     // ── Editor tab persistence ─────────────────────────────────
 
     /// Save the current set of open editor tabs for a workspace.
@@ -1077,6 +1150,47 @@ impl WorkspaceStore {
                  were removed — restore a backup created by a current mahbot version"
             );
         }
+        // General (non-role) context: stored as a role = NULL row. The legacy
+        // schema had role NOT NULL, so rebuild the table (atomically) to lift
+        // the constraint; existing role-keyed rows are preserved verbatim.
+        if turso::column_not_null(&self.conn, "workspace_contexts", "role").await? {
+            let tx = self.conn.begin_tx().await?;
+            tx.execute(
+                "ALTER TABLE workspace_contexts RENAME TO workspace_contexts_legacy",
+                (),
+            )
+            .await
+            .context("Failed to rename legacy workspace_contexts table")?;
+            // Re-run the SCHEMA (all CREATE TABLE IF NOT EXISTS): the renamed
+            // legacy table is recreated with the current definition, so this
+            // migration can never drift from SCHEMA.
+            tx.execute_batch(SCHEMA)
+                .await
+                .context("Failed to recreate workspace_contexts table")?;
+            tx.execute(
+                "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) \
+                 SELECT workspace_name, role, content, created_at FROM workspace_contexts_legacy",
+                (),
+            )
+            .await
+            .context("Failed to copy legacy workspace_contexts rows")?;
+            tx.execute("DROP TABLE workspace_contexts_legacy", ())
+                .await
+                .context("Failed to drop legacy workspace_contexts table")?;
+            tx.commit()
+                .await
+                .context("Failed to commit context migration")?;
+        }
+        // Exactly one general context row per workspace — partial unique index
+        // over the NULL-role rows only (role-keyed rows keep their own UNIQUE).
+        self.conn
+            .execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS workspace_contexts_null_role \
+                 ON workspace_contexts(workspace_name) WHERE role IS NULL",
+                (),
+            )
+            .await
+            .context("Failed to create NULL-role unique index")?;
         Ok(())
     }
 }
@@ -1941,6 +2055,178 @@ mod tests {
         )
         .await;
         assert!(is_ok, "check_generation should accept fresh generation");
+    }
+
+    // ── General (non-role) context tests ──────────────────────────
+
+    #[tokio::test]
+    async fn general_context_roundtrip_single_row_per_workspace() {
+        let (store, _tmp) = test_store().await;
+        insert_direct(&store, "gctx", "/tmp/gctx", true, false, 0, 0).await;
+
+        // No stored general context before discovery writes one.
+        assert_eq!(store.get_general_context("gctx").await.unwrap(), None);
+
+        store
+            .set_general_context("gctx", "overview v1")
+            .await
+            .unwrap();
+        store
+            .set_general_context("gctx", "overview v2")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_general_context("gctx").await.unwrap().as_deref(),
+            Some("overview v2")
+        );
+
+        // Partial unique index: a second NULL-role row must be rejected.
+        let err = store
+            .conn
+            .execute(
+                "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) \
+                 VALUES (?1, NULL, 'dup', ?2)",
+                crate::turso::params!["gctx", crate::turso::now()],
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("UNIQUE"), "got: {err}");
+
+        // Role-keyed rows stay distinct from the NULL-role row.
+        store.set_context("gctx", "Manager", "mgr").await.unwrap();
+        assert_eq!(
+            store.get_general_context("gctx").await.unwrap().as_deref(),
+            Some("overview v2")
+        );
+        assert_eq!(
+            store
+                .get_context("gctx", "Manager")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("mgr")
+        );
+
+        // A second workspace has its own NULL-role row.
+        insert_direct(&store, "gctx2", "/tmp/gctx2", true, false, 0, 0).await;
+        store
+            .set_general_context("gctx2", "other overview")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_general_context("gctx2").await.unwrap().as_deref(),
+            Some("other overview")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_context_schema_migrated_to_nullable_role() {
+        // Build a legacy DB (role NOT NULL) with existing role-keyed rows.
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        {
+            let conn = crate::turso::Connection::open(&db_dir.join("workspaces.db"))
+                .await
+                .unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;", ()).await.unwrap();
+            conn.execute(
+                "CREATE TABLE workspaces (
+                    name       TEXT PRIMARY KEY,
+                    path       TEXT NOT NULL UNIQUE,
+                    status     TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    maintenance INTEGER NOT NULL DEFAULT 0,
+                    paused      INTEGER NOT NULL DEFAULT 1,
+                    maintainer_debounce_mins INTEGER NOT NULL DEFAULT 5,
+                    maintainer_last_run_at TEXT,
+                    diagnostics TEXT,
+                    diagnostics_updated_at TEXT,
+                    diagnostics_generation INTEGER NOT NULL DEFAULT 0,
+                    notes TEXT NOT NULL DEFAULT '',
+                    last_analyzed_commit TEXT,
+                    discovery_generation INTEGER NOT NULL DEFAULT 0
+                )",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE workspace_contexts (
+                    workspace_name TEXT NOT NULL REFERENCES workspaces(name) ON DELETE CASCADE,
+                    role           TEXT NOT NULL,
+                    content        TEXT NOT NULL,
+                    created_at     TEXT NOT NULL,
+                    UNIQUE(workspace_name, role)
+                )",
+                (),
+            )
+            .await
+            .unwrap();
+            let now = crate::turso::now();
+            conn.execute(
+                "INSERT INTO workspaces (name, path, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                crate::turso::params!["ws1", "/ws1", now.clone(), now.clone()],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) \
+                 VALUES ('ws1', 'Manager', 'mgr ctx', 't'), ('ws1', 'Engineer', 'eng ctx', 't')",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.query("PRAGMA wal_checkpoint(TRUNCATE);", ())
+                .await
+                .unwrap();
+        }
+
+        // Reopen through the real open path — after_open must migrate.
+        let store = WorkspaceStore::open(tmp.path()).await.unwrap();
+
+        assert!(
+            !crate::turso::column_not_null(&store.conn, "workspace_contexts", "role")
+                .await
+                .unwrap(),
+            "role must be nullable after migration"
+        );
+
+        // Existing role-keyed rows preserved verbatim.
+        assert_eq!(
+            store
+                .get_context("ws1", "Manager")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("mgr ctx")
+        );
+        assert_eq!(
+            store
+                .get_context("ws1", "Engineer")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("eng ctx")
+        );
+
+        // General context write + single-row enforcement work post-migration.
+        store.set_general_context("ws1", "overview").await.unwrap();
+        assert_eq!(
+            store.get_general_context("ws1").await.unwrap().as_deref(),
+            Some("overview")
+        );
+        let err = store
+            .conn
+            .execute(
+                "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) \
+                 VALUES (?1, NULL, 'dup', ?2)",
+                crate::turso::params!["ws1", crate::turso::now()],
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("UNIQUE"), "got: {err}");
     }
 
     // ── is_nightly_check_hour — time-window boundary tests ────────
