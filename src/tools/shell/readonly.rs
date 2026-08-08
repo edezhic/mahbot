@@ -326,58 +326,34 @@ pub(super) fn strip_heredoc_bodies(command: &str) -> String {
         }
 
         // ── Delimiter-line tail ──────────────────────────────────
-        // After the heredoc marker, the rest of the delimiter line remains
-        // scanned (a redirect on the delimiter line is a real write target),
-        // and additional `<<` on the same line start further heredocs.
-        if !queue.is_empty() {
-            if chars[i].1 == '\n' {
-                out.push('\n');
-                i += 1;
-                skipping_body = true;
-                continue;
-            }
-            if !super::track_char_context(chars[i].1, &mut in_single, &mut in_double, &mut escaped)
-            {
-                out.push(chars[i].1);
-                i += 1;
-                continue;
-            }
-            if is_herestring_start(&chars, i) {
-                i = emit_herestring(&chars, i, &mut out);
-                continue;
-            }
-            if is_heredoc_start(&chars, i) {
-                match consume_heredoc_marker(command, &chars, i, &mut out, &mut queue) {
-                    Some(next) => i = next,
-                    None => break, // dangling `<<` at end of input
-                }
-                continue;
-            }
-            out.push(chars[i].1);
+        // After a heredoc marker, the rest of the delimiter line stays scanned
+        // (a redirect there is a real write target) and may declare further
+        // heredocs; once the line ends, switch to body-skipping. The newline
+        // branch is queue-conditional because only a pending heredoc has a
+        // delimiter-line tail to end.
+        if !queue.is_empty() && chars[i].1 == '\n' {
+            out.push('\n');
             i += 1;
+            skipping_body = true;
             continue;
         }
 
-        // ── Normal scanning (with heredoc detection) ─────────────
         if !super::track_char_context(chars[i].1, &mut in_single, &mut in_double, &mut escaped) {
             out.push(chars[i].1);
             i += 1;
             continue;
         }
-
         if is_herestring_start(&chars, i) {
             i = emit_herestring(&chars, i, &mut out);
             continue;
         }
-
         if is_heredoc_start(&chars, i) {
             match consume_heredoc_marker(command, &chars, i, &mut out, &mut queue) {
                 Some(next) => i = next,
-                None => break, // dangling `<<` at end of input — nothing to strip
+                None => break, // dangling `<<` at end of input
             }
             continue;
         }
-
         out.push(chars[i].1);
         i += 1;
     }
@@ -392,9 +368,9 @@ pub(super) fn strip_heredoc_bodies(command: &str) -> String {
 /// write target). Returns `Some(next_index)` or `None` for a dangling `<<`
 /// at end of input.
 ///
-/// Used by both the normal-scanning path and the delimiter-line-tail path so
-/// the marker grammar (fd prefix, `<<-` tabs, whitespace, quoted delimiter)
-/// lives in exactly one place.
+/// Shared by the scanner's single dispatch chain so the marker grammar (fd
+/// prefix, `<<-` tabs, whitespace, quoted delimiter) lives in exactly one
+/// place.
 fn consume_heredoc_marker(
     command: &str,
     chars: &[(usize, char)],
