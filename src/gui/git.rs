@@ -50,6 +50,10 @@ pub struct GitState {
     /// Whether git state was eagerly refreshed recently — skip the next
     /// Tick-based refresh to avoid double-firing after workspace switch.
     refresh_eagerly: bool,
+    /// Monotonic generation for git refreshes. Each refresh batch captures
+    /// the current value and results are only applied while it is current,
+    /// so stale/out-of-order results never overwrite newer state.
+    refresh_generation: u64,
 }
 
 /// Messages for the git sub-state.
@@ -60,12 +64,19 @@ pub struct GitState {
 #[derive(Debug, Clone)]
 pub enum GitMessage {
     // ── Refresh results ─────────────────────────────────────────
-    /// Result of `run_git_diff_stats`. `None` when not a git repo.
-    DiffStats(Option<(i64, i64)>),
-    /// Result of `run_git_current_branch`. `None` when not a git repo.
-    CurrentBranch(Option<String>),
-    /// Result of `run_git_behind_ahead`. `None` when not a git repo / no upstream.
-    BehindAhead(Option<(usize, usize)>),
+    /// Result of `run_git_diff_stats`. Carries the refresh generation;
+    /// results from a superseded generation are discarded. `Ok` on genuine
+    /// success (including a clean tree); `Err` on transient failure keeps
+    /// the cached last-known-good value.
+    DiffStats(u64, Result<(i64, i64), String>),
+    /// Result of `run_git_current_branch`. Same generation/staleness
+    /// semantics as [`GitMessage::DiffStats`].
+    CurrentBranch(u64, Result<String, String>),
+    /// Result of `run_git_behind_ahead`. `Ok((0, 0))` is a genuine
+    /// clean/no-upstream state (hides the sync button); `Err` keeps the
+    /// last-known-good counts. Same generation semantics as
+    /// [`GitMessage::DiffStats`].
+    BehindAhead(u64, Result<(usize, usize), String>),
 
     // ── Branch listing ──────────────────────────────────────────
     /// Result of listing local branches.
@@ -122,6 +133,7 @@ impl GitState {
             branch_error: None,
             new_branch_name: String::new(),
             refresh_eagerly: false,
+            refresh_generation: 0,
         }
     }
 
@@ -169,6 +181,8 @@ impl GitState {
     /// Clear all cached git info (diff stats, branch, behind/ahead, modal).
     /// Does **not** clear `workspace_path` or `refresh_eagerly` — those are
     /// managed explicitly by [`Self::set_workspace_path`] / [`Self::update_tick`].
+    /// Bumps `refresh_generation` so refresh results still in flight for the
+    /// previous state are discarded as stale.
     pub fn clear(&mut self) {
         self.diff_stats = None;
         self.current_branch = None;
@@ -179,6 +193,7 @@ impl GitState {
         self.show_branch_modal = false;
         self.new_branch_name.clear();
         self.syncing = false;
+        self.refresh_generation += 1;
         // Keep workspace_path — it's set explicitly via set_workspace_path.
         // Keep refresh_eagerly — it's managed by set_workspace_path / tick.
     }
@@ -193,13 +208,15 @@ impl GitState {
     /// Returns a batch of [`Task`]s that produce [`GitMessage`] results
     /// when the async operations complete.
     pub fn set_workspace_path(&mut self, path: Option<String>) -> Task<GitMessage> {
+        // clear() bumps refresh_generation — results still in flight from the
+        // previous workspace are discarded as stale.
         self.clear();
         self.workspace_path = path.map(PathBuf::from);
         // Signal the next tick to skip — the refresh tasks spawned below
         // already cover the initial load.
         self.refresh_eagerly = true;
         match &self.workspace_path {
-            Some(p) => Self::refresh_inner(p.clone()),
+            Some(p) => Self::refresh_inner(p.clone(), self.refresh_generation),
             None => Task::none(),
         }
     }
@@ -211,16 +228,32 @@ impl GitState {
     pub fn update(&mut self, msg: GitMessage) -> Task<GitMessage> {
         match msg {
             // ── Refresh results ─────────────────────────────────
-            GitMessage::DiffStats(stats) => {
-                self.diff_stats = stats;
+            GitMessage::DiffStats(generation, result) => {
+                // Only apply current-generation successes — a transient git
+                // failure (`Err`) keeps the last-known-good value so the
+                // footer controls don't flicker.
+                if generation == self.refresh_generation
+                    && let Ok(stats) = result
+                {
+                    self.diff_stats = Some(stats);
+                }
                 Task::none()
             }
-            GitMessage::CurrentBranch(branch) => {
-                self.current_branch = branch;
+            GitMessage::CurrentBranch(generation, result) => {
+                if generation == self.refresh_generation
+                    && let Ok(branch) = result
+                {
+                    self.current_branch = Some(branch);
+                }
                 Task::none()
             }
-            GitMessage::BehindAhead(ba) => {
-                self.behind_ahead = ba;
+            GitMessage::BehindAhead(generation, result) => {
+                if generation == self.refresh_generation
+                    && let Ok(ba) = result
+                {
+                    // Genuine clean/no-upstream state hides the sync button.
+                    self.behind_ahead = (ba.0 > 0 || ba.1 > 0).then_some(ba);
+                }
                 Task::none()
             }
 
@@ -404,7 +437,12 @@ impl GitState {
 
         // Use the stored workspace path.
         match &self.workspace_path {
-            Some(p) => Self::refresh_inner(p.clone()),
+            Some(p) => {
+                // Bump the generation so results still in flight from the
+                // previous tick are discarded when they arrive out of order.
+                self.refresh_generation += 1;
+                Self::refresh_inner(p.clone(), self.refresh_generation)
+            }
             None => Task::none(),
         }
     }
@@ -510,9 +548,11 @@ async fn with_ws_path<T>(
 
 impl GitState {
     /// Spawn three parallel async tasks to refresh diff stats, current
-    /// branch, and behind/ahead counts. Returns a batch of tasks that
-    /// produce [`GitMessage`] results.
-    fn refresh_inner(path: PathBuf) -> Task<GitMessage> {
+    /// branch, and behind/ahead counts. Results carry `generation` and are applied
+    /// by [`Self::update`] only while the generation is current — stale or
+    /// out-of-order results are dropped. Transient git failures surface as
+    /// `Err` and leave the cached last-known-good values untouched.
+    fn refresh_inner(path: PathBuf, generation: u64) -> Task<GitMessage> {
         if !crate::git_commands::is_git_repo(&path) {
             return Task::none();
         }
@@ -521,38 +561,105 @@ impl GitState {
         let stats_path = path.clone();
         let stats_task = Task::perform(
             async move {
-                match crate::git_commands::run_git_diff_stats(&stats_path).await {
-                    Ok(stats) => GitMessage::DiffStats(Some(stats)),
-                    Err(_) => GitMessage::DiffStats(None),
-                }
+                crate::git_commands::run_git_diff_stats(&stats_path)
+                    .await
+                    .map_err(|e| e.to_string())
             },
-            std::convert::identity,
+            move |res| GitMessage::DiffStats(generation, res),
         );
 
         // Current branch
         let branch_path = path.clone();
         let branch_task = Task::perform(
             async move {
-                match crate::git_commands::run_git_current_branch(&branch_path).await {
-                    Ok(b) => GitMessage::CurrentBranch(Some(b)),
-                    Err(_) => GitMessage::CurrentBranch(None),
-                }
+                crate::git_commands::run_git_current_branch(&branch_path)
+                    .await
+                    .map_err(|e| e.to_string())
             },
-            std::convert::identity,
+            move |res| GitMessage::CurrentBranch(generation, res),
         );
 
         // Behind/ahead
         let ahead_path = path;
         let ahead_task = Task::perform(
             async move {
-                match crate::git_commands::run_git_behind_ahead(&ahead_path).await {
-                    Ok(ba) if ba.0 > 0 || ba.1 > 0 => GitMessage::BehindAhead(Some(ba)),
-                    _ => GitMessage::BehindAhead(None),
-                }
+                crate::git_commands::run_git_behind_ahead(&ahead_path)
+                    .await
+                    .map_err(|e| e.to_string())
             },
-            std::convert::identity,
+            move |res| GitMessage::BehindAhead(generation, res),
         );
 
         Task::batch([stats_task, branch_task, ahead_task])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with_gen(generation: u64) -> GitState {
+        let mut s = GitState::new();
+        s.refresh_generation = generation;
+        s
+    }
+
+    // ── Refresh results: last-known-good + generation guard ───────
+
+    #[test]
+    fn test_refresh_success_applies_current_generation() {
+        let mut s = state_with_gen(7);
+        let _ = s.update(GitMessage::DiffStats(7, Ok((3, 1))));
+        let _ = s.update(GitMessage::CurrentBranch(7, Ok("main".into())));
+        let _ = s.update(GitMessage::BehindAhead(7, Ok((2, 5))));
+        assert_eq!(s.diff_stats(), Some((3, 1)));
+        assert_eq!(s.current_branch(), Some("main"));
+        assert_eq!(s.behind_ahead(), Some((2, 5)));
+    }
+
+    #[test]
+    fn test_refresh_error_keeps_last_known_good() {
+        let mut s = state_with_gen(7);
+        let _ = s.update(GitMessage::DiffStats(7, Ok((3, 1))));
+        let _ = s.update(GitMessage::CurrentBranch(7, Ok("main".into())));
+        let _ = s.update(GitMessage::BehindAhead(7, Ok((2, 5))));
+        // Transient failures — cached values must survive (no flicker).
+        let _ = s.update(GitMessage::DiffStats(7, Err("spawn failed".into())));
+        let _ = s.update(GitMessage::CurrentBranch(7, Err("spawn failed".into())));
+        let _ = s.update(GitMessage::BehindAhead(7, Err("spawn failed".into())));
+        assert_eq!(s.diff_stats(), Some((3, 1)));
+        assert_eq!(s.current_branch(), Some("main"));
+        assert_eq!(s.behind_ahead(), Some((2, 5)));
+    }
+
+    #[test]
+    fn test_genuine_clean_state_hides_sync() {
+        let mut s = state_with_gen(7);
+        let _ = s.update(GitMessage::BehindAhead(7, Ok((2, 5))));
+        // Genuine clean/no-upstream — sync button must hide.
+        let _ = s.update(GitMessage::BehindAhead(7, Ok((0, 0))));
+        assert_eq!(s.behind_ahead(), None);
+    }
+
+    #[test]
+    fn test_stale_generation_results_are_dropped() {
+        let mut s = state_with_gen(9);
+        // Results from a superseded generation must not overwrite newer state.
+        let _ = s.update(GitMessage::DiffStats(8, Ok((99, 99))));
+        let _ = s.update(GitMessage::CurrentBranch(8, Ok("old-branch".into())));
+        let _ = s.update(GitMessage::BehindAhead(8, Ok((99, 99))));
+        assert_eq!(s.diff_stats(), None);
+        assert_eq!(s.current_branch(), None);
+        assert_eq!(s.behind_ahead(), None);
+    }
+
+    #[test]
+    fn test_clear_invalidates_inflight_results() {
+        let mut s = state_with_gen(3);
+        let _ = s.update(GitMessage::DiffStats(3, Ok((3, 1))));
+        let _ = s.update(GitMessage::CurrentBranch(3, Ok("main".into())));
+        s.clear(); // bumps the generation — in-flight results become stale
+        let _ = s.update(GitMessage::DiffStats(3, Ok((7, 7))));
+        assert_eq!(s.diff_stats(), None);
     }
 }

@@ -539,10 +539,19 @@ pub async fn run_git_behind_ahead(repo_path: &Path) -> anyhow::Result<(usize, us
                 Ok((0, 0))
             }
         }
-        Err(e) if e.to_string().contains("no upstream") || e.to_string().contains("upstream") => {
-            Ok((0, 0))
+        Err(e) => {
+            // Only git's own "no upstream" verdicts are genuine empty results.
+            // The error string embeds the command args (`@{upstream}`), so a
+            // naive "contains upstream" match also swallows spawn/runtime
+            // failures — anchor on git's stderr wording instead.
+            let msg = e.to_string();
+            if msg.contains("fatal: no upstream") || msg.contains("HEAD does not point to a branch")
+            {
+                Ok((0, 0))
+            } else {
+                Err(e)
+            }
         }
-        Err(e) => Err(e),
     }
 }
 
