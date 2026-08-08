@@ -443,7 +443,7 @@ fn paused_workspace_sentence() -> &'static str {
 /// never fail the ticket (analysts always advance to Planning), and mixed
 /// verifier rounds (some failures + a sub-threshold verdict) bounce to
 /// ReadyForDevelopment without pausing. Ask-tool sub-agent failures (parallel
-/// analysts/engineers under [`AskTool`](crate::tools::AskTool)) likewise never
+/// analysts under [`AskTool`](crate::tools::AskTool)) likewise never
 /// reach this helper — they are tool calls inside a caller's run, not
 /// ticket-level failures. The pause gate itself only blocks
 /// ReadyForDevelopment→InDevelopment claims, so a dispatch panic in an earlier

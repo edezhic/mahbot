@@ -254,9 +254,9 @@ use crate::Workspace;
 use crate::config::CONFIG;
 use crate::tools::{
     AddCommentTool, AskTool, BrowserTool, CreateTicketTool, DispatchMode, EditTool, GetTicketTool,
-    ImageGenTool, ListTicketsTool, ReadTool, ResearchTool, SearchArchivedTicketsTool, SearchTool,
-    ShellMode, ShellTool, UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend,
-    WebSearchTool,
+    ImageGenTool, ImplementTool, ListTicketsTool, ReadTool, ResearchTool,
+    SearchArchivedTicketsTool, SearchTool, ShellMode, ShellTool, UpdateTicketTool, VideoEditTool,
+    VideoGenTool, WebSearchBackend, WebSearchTool,
 };
 
 impl Role {
@@ -291,11 +291,8 @@ impl Role {
         let mut tools: Vec<Box<dyn Tool>> = match self {
             Role::Engineer => {
                 let mut t = Self::full_core_tools();
-                t.push(Box::new(AskTool::new(
-                    vec![Role::Analyst, Role::Coder],
-                    DispatchMode::Sync,
-                    Role::Engineer,
-                )));
+                t.push(Box::new(AskTool::new(DispatchMode::Sync, Role::Engineer)));
+                t.push(Box::new(ImplementTool));
                 t
             }
             Role::Manager => {
@@ -306,11 +303,7 @@ impl Role {
                     Box::new(GetTicketTool::new(ws)),
                     Box::new(AddCommentTool::new(ws)),
                     Box::new(SearchArchivedTicketsTool::new(ws)),
-                    Box::new(AskTool::new(
-                        vec![Role::Analyst],
-                        DispatchMode::Async,
-                        Role::Manager,
-                    )),
+                    Box::new(AskTool::new(DispatchMode::Async, Role::Manager)),
                     Box::new(ResearchTool::new(Role::Manager)),
                 ]
             }
@@ -333,20 +326,12 @@ impl Role {
             }
             Role::Maintainer => {
                 let mut t = Self::readonly_core_tools();
-                t.push(Box::new(AskTool::new(
-                    vec![Role::Analyst],
-                    DispatchMode::Sync,
-                    Role::Maintainer,
-                )));
+                t.push(Box::new(AskTool::new(DispatchMode::Sync, Role::Maintainer)));
                 t.push(Box::new(CreateTicketTool::new("maintainer", ws)));
                 t
             }
             Role::Assistant => {
-                vec![Box::new(AskTool::new(
-                    vec![Role::Analyst],
-                    DispatchMode::Async,
-                    Role::Assistant,
-                ))]
+                vec![Box::new(AskTool::new(DispatchMode::Async, Role::Assistant))]
             }
         };
 

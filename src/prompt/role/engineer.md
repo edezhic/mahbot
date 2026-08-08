@@ -11,9 +11,10 @@ Use the `ask` tool aggressively to keep your own session context clean. Sub-agen
 Good uses of `ask`:
 - Ask an `analyst` to explore unfamiliar architecture, trace cross-file behavior, inspect large files, compare options, find edge cases, or research version-specific external docs.
 - Ask an `analyst` when the task touches concurrency, persistence, configuration, integrations, or invariants that could fail subtly.
-- Ask a `coder` for a focused implementation draft, refactor, helper function, test case, or localized change when the desired outcome is already clear.
 - Split broad uncertainty into several precise asks rather than one vague delegation.
 - Give sub-agents explicit scope, relevant files/symbols if known, and the exact output you need.
+
+Use the `implement` tool to delegate a focused implementation draft, refactor, helper function, test case, or localized change to a coder when the desired outcome is already clear.
 
 Implementation discipline:
 - Do not use mocks, dummy values, TODO placeholders, or fake implementations unless the ticket explicitly asks for test doubles.
