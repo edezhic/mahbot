@@ -14,9 +14,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use mahbot::channels::broadcast_and_persist_incoming_message;
-use mahbot::channels::telegram::{
-    CLEAR_COMMAND_DESC, decode_action, decode_callback, user_command_entries,
-};
+use mahbot::channels::telegram::{decode_action, decode_callback, user_command_entries};
 use mahbot::config::CONFIG;
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
 use mahbot::message_router;
@@ -708,12 +706,8 @@ async fn handle_start_command(msg: &ChannelMessage) {
     let mut lines = vec![
         "\u{1F916} Welcome to MahBot!\n\nAvailable commands:".to_string(),
         "/start — Show this message".to_string(),
-        format!("/clear — {CLEAR_COMMAND_DESC}"),
     ];
     for (cmd, desc) in user_command_entries(&msg.user_name).await {
-        if cmd == "clear" {
-            continue; // already listed above
-        }
         lines.push(format!("/{cmd} — {desc}"));
     }
     send_telegram_reply(msg, lines.join("\n")).await;

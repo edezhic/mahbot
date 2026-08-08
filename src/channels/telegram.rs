@@ -2239,26 +2239,13 @@ pub fn format_board_line(phase: &crate::board::TicketPhase, id: &str, title: &st
 /// workspace get neither pair (there is no workspace state to reflect).
 #[must_use]
 pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
-    let mut entries: Vec<(String, String)> =
-        vec![("clear".to_string(), CLEAR_COMMAND_DESC.to_string())];
+    let mut entries: Vec<(String, String)> = Vec::new();
 
     let pool = crate::users::role_pool(user_name).await;
     let active_role = crate::users::resolve_active_role_from_pool(user_name, &pool).await;
 
-    // Artist model-selection commands are available whenever Artist is in the
-    // user's pool (they can switch to Artist and use them).
-    if pool.contains(&Role::Artist) {
-        entries.push((
-            "image_models".to_string(),
-            IMAGE_MODELS_COMMAND_DESC.to_string(),
-        ));
-        entries.push((
-            "video_models".to_string(),
-            VIDEO_MODELS_COMMAND_DESC.to_string(),
-        ));
-    }
-
     // Each pool role is a direct command; the active role's entry is marked.
+    // Role switches lead the menu — the most frequent action.
     for role in &pool {
         let label = crate::role::role_info(role).display_label;
         let desc = if Some(*role) == active_role {
@@ -2296,6 +2283,22 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
             }
         }
     }
+
+    // Artist model-selection commands are available whenever Artist is in the
+    // user's pool (they can switch to Artist and use them).
+    if pool.contains(&Role::Artist) {
+        entries.push((
+            "image_models".to_string(),
+            IMAGE_MODELS_COMMAND_DESC.to_string(),
+        ));
+        entries.push((
+            "video_models".to_string(),
+            VIDEO_MODELS_COMMAND_DESC.to_string(),
+        ));
+    }
+
+    // Session clear is the least frequent action — keep it last.
+    entries.push(("clear".to_string(), CLEAR_COMMAND_DESC.to_string()));
     entries
 }
 

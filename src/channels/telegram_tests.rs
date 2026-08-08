@@ -1938,7 +1938,14 @@ async fn user_command_entries_reflect_role_and_admin() {
     // Artist is in the pool → model commands present.
     assert!(cmds.contains(&"image_models"));
     assert!(cmds.contains(&"video_models"));
-    assert_eq!(cmds[0], "clear");
+    assert_eq!(cmds[0], "manager");
+    // Menu order: role commands first, then board/admin, then model
+    // commands, with /clear last.
+    assert_eq!(cmds.last(), Some(&"clear"));
+    let pos = |cmd: &str| cmds.iter().position(|c| *c == cmd).unwrap();
+    assert!(pos("manager") < pos("board"));
+    assert!(pos("board") < pos("image_models"));
+    assert!(pos("image_models") < pos("clear"));
 
     // The active role's entry is marked. add_user seeds the selection to the
     // first pool role (Manager in Role::iter order).
