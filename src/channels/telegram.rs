@@ -240,7 +240,7 @@ struct MessageContext {
 }
 
 impl MessageContext {
-    fn into_channel_message(self, content: String) -> ChannelMessage {
+    fn into_channel_message(self, content: String, cq_id: Option<String>) -> ChannelMessage {
         ChannelMessage {
             user_name: self.user_name,
             reply_target: self.reply_target,
@@ -248,7 +248,7 @@ impl MessageContext {
             channel: "telegram".to_string(),
             workspace: String::new(),
             optimistic_id: None,
-            callback_query_id: None,
+            callback_query_id: cq_id,
         }
     }
 }
@@ -889,8 +889,7 @@ impl TelegramChannel {
             .and_then(serde_json::Value::as_str)
             .map(String::from);
 
-        // chat_id is intentionally unused here: callback queries don't need
-        // to route replies by chat context, only the reply_target is used.
+        // Auth is clicker-based (cq.from), never msg author; chat_id/message_id unused.
         let Some((user_name, _, reply_target)) = resolve_authorized_sender(cq, msg).await else {
             tracing::debug!(
                 "Telegram: ignoring callback query from unknown user '{}'",
@@ -899,15 +898,13 @@ impl TelegramChannel {
             return None;
         };
 
-        Some(ChannelMessage {
+        let ctx = MessageContext {
             user_name,
+            chat_id: String::new(),
+            message_id: 0,
             reply_target,
-            content: data.to_string(),
-            channel: "telegram".to_string(),
-            workspace: String::new(),
-            optimistic_id: None,
-            callback_query_id,
-        })
+        };
+        Some(ctx.into_channel_message(data.to_string(), callback_query_id))
     }
 
     fn extract_update_message_target(update: &serde_json::Value) -> Option<(String, i64)> {
@@ -1367,7 +1364,7 @@ impl TelegramChannel {
 
         let content = Self::prepend_reply_metadata(content, message);
 
-        Some(ctx.into_channel_message(content))
+        Some(ctx.into_channel_message(content, None))
     }
 
     /// Build a forwarding attribution prefix from Telegram forward fields.
@@ -1445,7 +1442,7 @@ impl TelegramChannel {
 
         let content = Self::prepend_reply_metadata(content, message);
 
-        Some(ctx.into_channel_message(content))
+        Some(ctx.into_channel_message(content, None))
     }
 
     /// Send one Telegram text message, with optional `parse_mode`.
