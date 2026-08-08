@@ -1,1 +1,1 @@
-[... truncated at {{max_chars}} chars — use `read` for full file]
+... [truncated at {{max_chars}} chars — use `read` for the full file]
