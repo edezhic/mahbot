@@ -184,16 +184,26 @@ pub async fn get_json_from_provider(
 /// binary response.
 ///
 /// Uses [`bearer_auth_header()`] for the Authorization header and
-/// [`media_http_client()`] for the HTTP client.  Useful for downloading
-/// generated media files or other binary content from provider endpoints.
+/// [`media_http_client()`] for the HTTP client. `request_timeout` overrides
+/// the client's 2-minute cap per request — the async-video tools pass the
+/// remaining job window so large downloads on slow connections are not cut
+/// short. Useful for downloading generated media files or other binary
+/// content from provider endpoints.
 ///
 /// # Errors
 ///
 /// - Transport errors: `"{error_context} request failed: {err}"`
 /// - Non-2xx status: returns a [`HttpError`](super::error::HttpError) with the status code and response body (first 500 chars), accessible via `err.downcast_ref::<HttpError>()`
 /// - Body read failure: `"{error_context} failed to read response body: {err}"`
-pub async fn get_bytes_from_provider(url: &str, error_context: &str) -> anyhow::Result<Vec<u8>> {
-    let response = provider_request(error_context, |client| client.get(url)).await?;
+pub async fn get_bytes_from_provider(
+    url: &str,
+    error_context: &str,
+    request_timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    let response = provider_request(error_context, |client| {
+        client.get(url).timeout(request_timeout)
+    })
+    .await?;
 
     response
         .bytes()

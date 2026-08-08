@@ -72,6 +72,7 @@ pub(crate) use web_search::{WebSearchBackend, WebSearchTool};
 
 use crate::{Tool, Workspace};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 // ── JSON helpers ─────────────────────────────────────────────────────────
 
@@ -299,8 +300,12 @@ async fn save_generated_file(
 
 // ── Async video jobs (video_gen / video_edit) ───────────────────────────
 
-/// Number of polling attempts (10 min timeout = 20 attempts × 30s).
-const MAX_POLL_ATTEMPTS: u32 = 20;
+/// Wall-clock deadline for an async-video job (1 hour) — shared by the
+/// video_gen and video_edit tools.
+const VIDEO_JOB_TIMEOUT: Duration = Duration::from_hours(1);
+
+/// Polling interval between video job status checks (30 s).
+const VIDEO_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Kind-dependent labels for an OpenRouter async-video job.
 ///
@@ -332,9 +337,9 @@ impl VideoJobLabels {
 
 /// Submit an OpenRouter async-video job (exactly one POST — no retry; each
 /// submission is a billable job and the endpoint has no idempotency key),
-/// poll for completion (~10 min timeout), download the result, and validate
-/// it is a real MP4. Returns the video bytes; callers save the file and
-/// format the media marker.
+/// poll for completion (1-hour wall-clock deadline), download the result, and
+/// validate it is a real MP4. Returns the video bytes; callers save the file
+/// and format the media marker.
 #[allow(clippy::too_many_lines)]
 async fn fetch_async_video(
     api_base: &str,
@@ -382,23 +387,40 @@ async fn fetch_async_video(
 
     tracing::info!(%job_id, "{} job submitted", labels.label);
 
-    // ── Step 2: Poll for completion (~10 min timeout) ───────────────────
+    // ── Step 2: Poll for completion (1-hour wall-clock deadline) ────────
+    let deadline = Instant::now() + VIDEO_JOB_TIMEOUT;
     let mut result_url: Option<String> = None;
+    let mut attempt: u32 = 0;
 
-    for attempt in 1..=MAX_POLL_ATTEMPTS {
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    while Instant::now() < deadline {
+        attempt += 1;
 
-        let poll_body = match crate::util::http::get_json_from_provider(
-            &polling_url,
-            &format!("{} poll", labels.label),
+        // Sleep the full interval, but never past the deadline.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(VIDEO_POLL_INTERVAL.min(remaining)).await;
+        if Instant::now() >= deadline {
+            break;
+        }
+
+        // Race the poll against the remaining window so a slow poll request
+        // cannot push the total wait past the hour.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let poll_body = match tokio::time::timeout(
+            remaining,
+            crate::util::http::get_json_from_provider(
+                &polling_url,
+                &format!("{} poll", labels.label),
+            ),
         )
         .await
         {
-            Ok(v) => v,
-            Err(e) => {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
                 tracing::debug!(%job_id, attempt, error = %e, "Poll failed");
                 continue;
             }
+            // Deadline elapsed while the poll request was in flight.
+            Err(_) => break,
         };
 
         let status = poll_body
@@ -435,15 +457,25 @@ async fn fetch_async_video(
 
     let Some(download_url) = result_url else {
         anyhow::bail!(
-            "{} did not complete within the 10-minute timeout period",
+            "{} did not complete within the 1-hour timeout period",
             labels.label
         );
     };
 
     // ── Step 3: Download the video ──────────────────────────────────────
     // The result URL requires the bearer key despite the "unsigned" name.
+    // The per-request timeout is the remaining job window, so large files on
+    // slow connections are not cut short by the shared client's 2-minute cap.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        anyhow::bail!(
+            "{} did not complete within the 1-hour timeout period",
+            labels.label
+        );
+    }
     let video_bytes =
-        crate::util::http::get_bytes_from_provider(&download_url, labels.download).await?;
+        crate::util::http::get_bytes_from_provider(&download_url, labels.download, remaining)
+            .await?;
 
     // Validate the payload is a real MP4 (no Content-Length on the response;
     // an error page would slip through otherwise).
