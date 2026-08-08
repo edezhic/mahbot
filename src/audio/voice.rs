@@ -11,7 +11,7 @@
 //! 4. **Neural embedding** — via `embedding_model.onnx` (candle-onnx), 96-dim vectors
 //! 5. **Wake word matching** — Conv1D classifier on a 3-embedding sliding window
 //!    with immediate-fire rolling-sum detection (speaker-blind).
-//! 6. **Command recording** — record speech until silence or 30s cap
+//! 6. **Command recording** — record speech until silence or 10 min cap
 //! 7. **Transcription** — via existing Qwen3-ASR local transcriber
 //! 8. **Routing** — transcribed text is routed to the user's active role via
 //!    [`route_to_agent`] (falls back to the Manager if no active user is determined).
@@ -132,8 +132,8 @@ const BURST_STRIDE: usize = 8;
 /// (4 positions × stride 8).
 const BURST_MAX_POSITIONS: usize = 4;
 
-/// Maximum command recording duration (30 seconds).
-const MAX_RECORD_SECS: usize = 30;
+/// Maximum command recording duration (10 minutes).
+const MAX_RECORD_SECS: usize = 600;
 
 /// Minimum silence duration before stopping command recording.
 pub(crate) const SILENCE_DURATION: Duration = Duration::from_millis(1500);
@@ -3674,9 +3674,13 @@ async fn transcribe_audio(samples: &[f32]) -> Result<String> {
     let tmp_path = tmp_dir.join(format!("cmd_{}.wav", crate::generate_id()));
     tokio::fs::write(&tmp_path, &wav_bytes).await?;
 
-    let result =
-        crate::audio::local_transcriber::transcribe_file_async(&tmp_path, Duration::from_secs(30))
-            .await;
+    // 10-minute inference timeout, shared with the enrichment path — long
+    // recordings (up to the 10-minute recording cap) must not time out.
+    let result = crate::audio::local_transcriber::transcribe_file_async(
+        &tmp_path,
+        crate::audio::local_transcriber::INFERENCE_TIMEOUT,
+    )
+    .await;
 
     // Remove the specific temp file.
     if let Err(e) = tokio::fs::remove_file(&tmp_path).await {
@@ -5820,7 +5824,7 @@ impl PipelineCtx {
 
         // A mic-button recording cannot coexist with enrollment: the audio
         // router gives enrollment priority, so the manual buffer would starve
-        // (its 30s auto-send cap never fires) and later resume as garbage.
+        // (its auto-send cap never fires) and later resume as garbage.
         // Abort the recording and discard its buffer.
         let aborted_recording = self.manual_recording;
         if aborted_recording {

@@ -88,15 +88,14 @@ const MODEL_SHA256: &str = "79d6cbd4c98c7bbffe9db2edac07f56cd6637d0d5944b27f6c2b
 const VOCAB_SHA256: &str = "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910";
 const MERGES_SHA256: &str = "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5";
 
-/// Default inference timeout for the enrichment path (10 minutes).
+/// Default inference timeout (10 minutes).
 ///
 /// Qwen3-ASR-0.6B inference on short audio clips (< 30s) completes in
 /// seconds.  Longer recordings (e.g. voice memos, meetings) may take
 /// several minutes.  This timeout prevents a hung inference from
 /// permanently occupying a tokio blocking thread.
 ///
-/// The voice pipeline uses a shorter 30-second timeout (see
-/// [`crate::audio::voice::transcribe_audio`]).
+/// Shared by the voice pipeline and the audio-enrichment path.
 pub(crate) const INFERENCE_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// Download timeout for the 1.88 GB model file (30 minutes).
@@ -166,6 +165,10 @@ impl QwenLocalTranscriber {
         let dir_str = dir.to_string_lossy().to_string();
         let mut ctx = qwen_asr::context::QwenCtx::load(&dir_str)?;
         ctx.want_language_detection = true;
+        // Split audio longer than ~30 s at low-energy boundaries. Without
+        // segmentation a single segment caps at 2048 decoded tokens, silently
+        // truncating long recordings (voice pipeline allows up to 10 minutes).
+        ctx.segment_sec = 30.0;
         Some(Self {
             ctx: Arc::new(Mutex::new(ctx)),
         })
@@ -195,10 +198,9 @@ impl QwenLocalTranscriber {
 /// # Timeout
 ///
 /// `inference_timeout` controls the maximum wall-clock time for the ONNX
-/// inference step (audio decoding is excluded from the timeout).  The voice
-/// pipeline (max 30 s recordings) should pass a short timeout like 30 s,
-/// while the enrichment path for arbitrarily long audio passes a longer
-/// timeout (e.g. 10 minutes).
+/// inference step (audio decoding is excluded from the timeout).  Both
+/// callers — the voice pipeline (recordings up to 10 minutes) and the
+/// enrichment path for attached audio — pass [`INFERENCE_TIMEOUT`].
 ///
 /// A shutdown guard races against the inference so that a stalled model
 /// cannot block pipeline exit.
