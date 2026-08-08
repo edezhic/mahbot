@@ -1167,6 +1167,23 @@ impl WorkspaceStore {
             tx.execute_batch(SCHEMA)
                 .await
                 .context("Failed to recreate workspace_contexts table")?;
+            // Orphans can exist when a workspace was removed while FKs were off
+            // (or when foreign_key_check is incomplete). Copying them into the
+            // new table fails under PRAGMA foreign_keys=ON and blocks startup.
+            let orphans = tx
+                .execute(
+                    "DELETE FROM workspace_contexts_legacy \
+                     WHERE workspace_name NOT IN (SELECT name FROM workspaces)",
+                    (),
+                )
+                .await
+                .context("Failed to prune orphaned legacy workspace_contexts rows")?;
+            if orphans > 0 {
+                tracing::warn!(
+                    orphans,
+                    "Dropped orphaned workspace_contexts rows during role-nullability migration"
+                );
+            }
             tx.execute(
                 "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) \
                  SELECT workspace_name, role, content, created_at FROM workspace_contexts_legacy",
@@ -2178,6 +2195,17 @@ mod tests {
             )
             .await
             .unwrap();
+            // Orphan rows for a deleted workspace — FK off so they can be inserted.
+            // Migration must drop these; copying them fails under foreign_keys=ON.
+            conn.execute("PRAGMA foreign_keys = OFF;", ()).await.unwrap();
+            conn.execute(
+                "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) \
+                 VALUES ('gone', 'Manager', 'orphan', 't')",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;", ()).await.unwrap();
             conn.query("PRAGMA wal_checkpoint(TRUNCATE);", ())
                 .await
                 .unwrap();
@@ -2209,6 +2237,12 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("eng ctx")
+        );
+        // Orphan for deleted workspace must not survive.
+        assert_eq!(
+            store.get_context("gone", "Manager").await.unwrap(),
+            None,
+            "orphaned legacy context must be pruned"
         );
 
         // General context write + single-row enforcement work post-migration.
