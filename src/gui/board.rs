@@ -1429,9 +1429,15 @@ impl BoardState {
             BoardMessage::CommentInputChanged,
             BoardMessage::SendComment,
             "Add a comment… (Enter to send, Shift+Enter for newline)",
-            self.sending_comment,
-            44.0,
-            132.0,
+            super::widgets::ChatComposerOptions {
+                sending: self.sending_comment,
+                min_height: 44.0,
+                max_height: 132.0,
+                controls: Vec::new(),
+                // Board comment input is out of ticket scope — keep its
+                // legacy always-active send button look.
+                grey_on_empty: false,
+            },
         ))
         .width(Length::Fill)
         .into()

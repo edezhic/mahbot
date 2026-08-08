@@ -285,6 +285,9 @@ pub enum Message {
         role: Option<Role>,
         pool: Vec<Role>,
     },
+    /// A role switch failed — refresh the role cache so the composer's
+    /// optimistic role icon reverts to the persisted active role.
+    RoleSwitchFailed(String),
     /// TTS model download progress event.
     TtsDownloadEvent(crate::audio::tts::TtsDownloadEvent),
 }
@@ -1046,23 +1049,33 @@ impl Dashboard {
                     self.selected_user_role = Some(*role);
                     let user = user_name.clone();
                     let role = *role;
-                    return Task::perform(
-                        async move {
-                            crate::users::switch_active_role(&user, role)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            Ok(role)
-                        },
-                        |res| {
-                            Message::Home(home::HomeMessage::Toast(match res {
-                                Ok(role) => ToastMessage::SuccessMsg(format!(
-                                    "Switched to {} role",
-                                    crate::role::role_info(&role).display_label
-                                )),
-                                Err(e) => ToastMessage::Error(e),
-                            }))
-                        },
-                    );
+                    return Task::batch([
+                        // Close the composer role dropdown (Home never sees
+                        // SwitchRole — it is intercepted here).
+                        Task::done(Message::Home(home::HomeMessage::RoleMenuClosed)),
+                        Task::perform(
+                            async move {
+                                crate::users::switch_active_role(&user, role)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                                Ok(role)
+                            },
+                            |res| {
+                                match res {
+                                    Ok(role) => Message::Home(home::HomeMessage::Toast(
+                                        ToastMessage::SuccessMsg(format!(
+                                            "Switched to {} role",
+                                            crate::role::role_info(&role).display_label
+                                        )),
+                                    )),
+                                    // On failure, refresh the role cache so the
+                                    // optimistic composer icon reverts to the
+                                    // persisted active role.
+                                    Err(e) => Message::RoleSwitchFailed(e),
+                                }
+                            },
+                        ),
+                    ]);
                 }
                 self.home_state.update(msg).map(Message::Home)
             }
@@ -1180,6 +1193,15 @@ impl Dashboard {
                 self.selected_user_role = role;
                 self.selected_user_roles = pool;
                 Task::none()
+            }
+            Message::RoleSwitchFailed(e) => {
+                // Revert the optimistic composer icon and surface the error.
+                Task::batch([
+                    Task::done(Message::Home(home::HomeMessage::Toast(
+                        ToastMessage::Error(e),
+                    ))),
+                    self.refresh_selected_user_role_cache(),
+                ])
             }
             Message::TtsDownloadEvent(event) => self.handle_tts_download_event(event),
         }
@@ -1410,7 +1432,10 @@ impl Dashboard {
         let footer = self.footer_view();
         let content = match self.page {
             Page::Home => {
-                let home_view = self.home_state.view().map(Message::Home);
+                let home_view = self
+                    .home_state
+                    .view(self.selected_user_role, &self.selected_user_roles)
+                    .map(Message::Home);
                 let sidebar = ticket_sidebar(&self.board_state);
                 // Wrap chat area in a right-click context menu with "Clear chat" and role switcher.
                 let mut chat_items: Vec<context_menu::MenuItem<Message>> =
@@ -2388,7 +2413,7 @@ impl Dashboard {
             VoiceStatus::LoadingModels => "🔊 Loading…".into(),
             VoiceStatus::ModelError => "🔊 ⚠ Model error".into(),
             VoiceStatus::Listening => "🔊 Listening".into(),
-            VoiceStatus::Recording => "🔊 Recording…".into(),
+            VoiceStatus::Recording | VoiceStatus::RecordingManual => "🔊 Recording…".into(),
             VoiceStatus::Transcribing => "🔊 Transcribing…".into(),
             VoiceStatus::MicPermissionDenied => "🔊 No mic access".into(),
             VoiceStatus::MicDisconnected => "🔊 Mic disconnected".into(),

@@ -2318,6 +2318,9 @@ impl SettingsState {
                 Text::new("Listening for wake word").into()
             }
             crate::audio::voice::VoiceStatus::Recording => Text::new("Recording command").into(),
+            crate::audio::voice::VoiceStatus::RecordingManual => {
+                Text::new("Recording voice message").into()
+            }
             crate::audio::voice::VoiceStatus::Transcribing => Text::new("Transcribing…").into(),
             crate::audio::voice::VoiceStatus::MicPermissionDenied => {
                 Text::new("Microphone permission denied").into()

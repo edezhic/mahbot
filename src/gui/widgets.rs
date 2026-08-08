@@ -195,26 +195,45 @@ pub fn tab_scrollable<'a, Message: 'a>(
         .into()
 }
 
+/// Options for [`chat_composer`] that differ between the Home and Board
+/// pages. Bundled so the shared signature does not grow with page-specific
+/// knobs.
+pub struct ChatComposerOptions<'a, M> {
+    /// A send is in flight — button disabled.
+    pub sending: bool,
+    /// Editor min/max heights in px.
+    pub min_height: f32,
+    pub max_height: f32,
+    /// Right-edge controls rendered above the send button (Home role/mic
+    /// column; empty for the plain Board composer).
+    pub controls: Vec<Element<'a, M>>,
+    /// Grey the send button while the input is empty/whitespace-only.
+    /// Home enables this (empty-input affordance); Board keeps its legacy
+    /// always-active look.
+    pub grey_on_empty: bool,
+}
+
 /// Shared chat composer: text editor with Enter-to-send and Cmd+Z intercept,
 /// a floating send button, and the overlay stack. `on_action`/`send_msg`
-/// parameterize the page's messages; callers supply the placeholder, editor
-/// min/max heights, and the sending flag.
+/// parameterize the page's messages; callers supply the placeholder and an
+/// [`ChatComposerOptions`] bundle (editor min/max heights, the sending flag,
+/// optional right-edge controls, and whether the send button greys on empty
+/// input).
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn chat_composer<'a, M: Clone + 'a>(
     content: &'a text_editor::Content,
     on_action: impl Fn(text_editor::Action) -> M + 'a,
     send_msg: M,
     placeholder: &'a str,
-    sending: bool,
-    min_height: f32,
-    max_height: f32,
+    options: ChatComposerOptions<'a, M>,
 ) -> Element<'a, M> {
     let send_msg_btn = send_msg.clone();
-    let input_editor = text_editor(content)
+    let mut input_editor = text_editor(content)
         .on_action(on_action)
         .placeholder(placeholder)
-        .min_height(min_height)
-        .max_height(max_height)
+        .min_height(options.min_height)
+        .max_height(options.max_height)
         .style(|_theme: &iced::Theme, status| {
             let is_focused = matches!(status, text_editor::Status::Focused { .. });
             text_editor::Style {
@@ -255,49 +274,52 @@ pub fn chat_composer<'a, M: Clone + 'a>(
             }
         });
 
+    // Keep the text clear of the right-edge control column when present.
+    // Preserve the text_editor's default 5px padding on the other edges.
+    if !options.controls.is_empty() {
+        input_editor = input_editor.padding(iced::Padding::new(5.0).right(38.0));
+    }
+
+    // Whitespace-only input counts as empty (greys the send button).
+    // The emptiness check is gated on grey_on_empty so Board (legacy look)
+    // never allocates content.text() per frame.
+    let send_disabled = options.sending
+        || (options.grey_on_empty && (content.is_empty() || content.text().trim().is_empty()));
     let send_btn = button(
         lucide::send::<iced::Theme, iced::Renderer>()
             .size(14)
-            .color(if sending {
+            .color(if send_disabled {
                 theme::TEXT_MUTED
             } else {
                 theme::ACCENT
             }),
     )
-    .style(move |_t: &iced::Theme, status| {
-        use iced::widget::button;
-        let bg = match status {
-            button::Status::Hovered => theme::HOVER_STRONG,
-            button::Status::Pressed => theme::ACCENT_DIM,
-            _ => iced::Color::TRANSPARENT,
-        };
-        button::Style {
-            background: Some(iced::Background::Color(bg)),
-            border: iced::Border {
-                radius: 6.0.into(),
-                width: 0.0,
-                color: iced::Color::TRANSPARENT,
-            },
-            ..button::Style::default()
-        }
+    .style(theme::icon_button_style(send_disabled))
+    .on_press_maybe(if send_disabled {
+        None
+    } else {
+        Some(send_msg_btn)
     })
-    .on_press_maybe(if sending { None } else { Some(send_msg_btn) })
     .padding(4);
 
+    // Right-edge overlay: controls column (when present) above the send button.
+    let mut col = Column::new().spacing(6).align_x(Alignment::End);
+    for c in options.controls {
+        col = col.push(c);
+    }
+    let overlay: Element<'_, M> = container(col.push(send_btn))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::End)
+        .align_y(Alignment::End)
+        .padding(iced::Padding::default().right(8.0).bottom(8.0))
+        .into();
+
     // Stack the editor with the send button overlaid at bottom-right.
-    container(stack([
-        input_editor.into(),
-        container(send_btn)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(Alignment::End)
-            .align_y(Alignment::End)
-            .padding(iced::Padding::default().right(8.0).bottom(8.0))
-            .into(),
-    ]))
-    .padding(8)
-    .style(theme::base_container_style)
-    .into()
+    container(stack([input_editor.into(), overlay]))
+        .padding(8)
+        .style(theme::base_container_style)
+        .into()
 }
 
 /// Render formatted diff stats (+X/−Y) matching ticket card style.

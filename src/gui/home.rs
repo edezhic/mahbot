@@ -13,6 +13,7 @@ use iced::widget::{
     Column, Id, Space, button, column, container, row, scrollable, text, text_editor,
 };
 use iced::{Alignment, Element, Length, Task, keyboard};
+use iced_fonts::lucide;
 use std::collections::HashSet;
 
 use super::ToastMessage;
@@ -171,6 +172,17 @@ pub enum HomeMessage {
     /// Keyboard modifiers changed (shift, ctrl, alt, etc.).
     /// Used to track shift state for shift+click selection in the text editor.
     ModifiersChanged(keyboard::Modifiers),
+    /// Mic button clicked — start a voice message recording to the active role.
+    StartVoiceRecording,
+    /// Recording popup: stop recording, transcribe, and send the voice message.
+    StopVoiceRecordingSend,
+    /// Recording popup: stop recording and discard the voice message.
+    StopVoiceRecordingDiscard,
+    /// Toggle the composer role dropdown open/closed.
+    RoleMenuToggled,
+    /// Close the composer role dropdown (on role selection, message send,
+    /// chat clear, or user switch).
+    RoleMenuClosed,
 }
 
 pub struct HomeState {
@@ -215,6 +227,8 @@ pub struct HomeState {
     /// Updated from `ModifiersChanged` events. Used to detect shift+click
     /// for extending text selection.
     modifiers: keyboard::Modifiers,
+    /// Whether the composer role dropdown is open.
+    role_menu_open: bool,
 }
 
 impl HomeState {
@@ -239,6 +253,7 @@ impl HomeState {
             pagination_gen: 0,
             undo_stack: super::common::UndoStack::new(),
             modifiers: keyboard::Modifiers::empty(),
+            role_menu_open: false,
         }
     }
 
@@ -361,6 +376,7 @@ impl HomeState {
         self.messages.clear();
         self.seen_ids.clear();
         self.history_loaded = false;
+        self.role_menu_open = false;
         self.reset_pagination_state();
     }
 
@@ -500,7 +516,7 @@ impl HomeState {
     }
 
     #[allow(clippy::too_many_lines)]
-    pub fn view(&self) -> Element<'_, HomeMessage> {
+    pub fn view(&self, active_role: Option<Role>, role_pool: &[Role]) -> Element<'_, HomeMessage> {
         // ── Chat message area ────────────────────────────────────
         let chat_area = if self.messages.is_empty() {
             let empty_hint = if self.selected_user.is_none() {
@@ -672,18 +688,171 @@ impl HomeState {
         };
 
         // ── Input area ───────────────────────────────────────────
+        let voice_status = crate::audio::voice::get_status();
+        let recording = matches!(
+            voice_status,
+            crate::audio::voice::VoiceStatus::RecordingManual
+        );
+        // The Transcribing status is shared between the manual and wake-word
+        // paths; only a mic-button recording shows the composer popup.
+        let transcribing = matches!(voice_status, crate::audio::voice::VoiceStatus::Transcribing)
+            && crate::audio::voice::is_manual_recording();
+        // The mic is busy while the pipeline owns the mic for any recording
+        // or ASR (manual or wake-word) — the button must not look active
+        // when a new recording would be rejected.
+        let mic_busy = matches!(
+            voice_status,
+            crate::audio::voice::VoiceStatus::Recording
+                | crate::audio::voice::VoiceStatus::RecordingManual
+                | crate::audio::voice::VoiceStatus::Transcribing
+        );
+
+        // Right-edge controls column: role selector + mic button.
+        let mut controls: Vec<Element<'_, HomeMessage>> = Vec::new();
+        let role_icon = match active_role {
+            Some(role) => {
+                let (fg, _) = theme::role_badge_color_for(&role);
+                theme::role_icon(&role).size(15).color(fg)
+            }
+            None => lucide::bot::<iced::Theme, iced::Renderer>()
+                .size(15)
+                .color(theme::TEXT_MUTED),
+        };
+        let role_btn = button(role_icon)
+            .on_press_maybe(
+                (self.selected_user.is_some() && !role_pool.is_empty())
+                    .then_some(HomeMessage::RoleMenuToggled),
+            )
+            .style(theme::icon_button_style(false))
+            .padding(3);
+        controls.push(role_btn.into());
+
+        let mic_btn = button(lucide::mic::<iced::Theme, iced::Renderer>().size(14).color(
+            if mic_busy {
+                theme::TEXT_MUTED
+            } else {
+                theme::TEXT_SECONDARY
+            },
+        ))
+        .on_press_maybe(
+            (self.selected_user.is_some() && !mic_busy).then_some(HomeMessage::StartVoiceRecording),
+        )
+        .style(theme::icon_button_style(mic_busy))
+        .padding(3);
+        controls.push(mic_btn.into());
+
         let input_area = super::widgets::chat_composer(
             &self.editor_content,
             HomeMessage::InputChanged,
             HomeMessage::SendMessage,
             "Type a message... (Enter to send, Shift+Enter for newline)",
-            self.sending,
-            66.0,
-            330.0,
+            super::widgets::ChatComposerOptions {
+                sending: self.sending,
+                // One line taller than the plain composer so the controls
+                // column (role + mic) fits above the send button.
+                min_height: 88.0,
+                max_height: 330.0,
+                controls,
+                grey_on_empty: true,
+            },
         );
 
+        // ── Role dropdown panel (in-flow, above the composer) ────
+        let role_panel: Element<'_, HomeMessage> = if self.role_menu_open && !role_pool.is_empty() {
+            let user = self.selected_user.clone().unwrap_or_default();
+            let items: Vec<Element<'_, HomeMessage>> = role_pool
+                .iter()
+                .map(|role| {
+                    let (fg, _) = theme::role_badge_color_for(role);
+                    let icon = theme::role_icon(role).size(13).color(fg);
+                    let is_current = active_role.as_ref() == Some(role);
+                    let label = text(crate::role::role_info(role).display_label)
+                        .size(13)
+                        .color(if is_current {
+                            theme::TEXT_PRIMARY
+                        } else {
+                            theme::TEXT_SECONDARY
+                        });
+                    let check: Element<'_, HomeMessage> = if is_current {
+                        lucide::check::<iced::Theme, iced::Renderer>()
+                            .size(12)
+                            .color(theme::ACCENT)
+                            .into()
+                    } else {
+                        Space::new().width(12).into()
+                    };
+                    let content = row![icon, label, check]
+                        .spacing(6)
+                        .align_y(Alignment::Center);
+                    button(content)
+                        .on_press_maybe(
+                            (!is_current).then_some(HomeMessage::SwitchRole(user.clone(), *role)),
+                        )
+                        .style(theme::menu_item_button_style())
+                        .width(Length::Fill)
+                        .padding(5)
+                        .into()
+                })
+                .collect();
+            container(Column::with_children(items).spacing(2).padding(5))
+                .style(theme::surface_container_style)
+                .width(Length::Shrink)
+                .into()
+        } else {
+            Space::new().height(0).into()
+        };
+
+        // ── Recording popup (stop + send / stop + discard) ───────
+        // While transcribing, the popup stays visible as a passive
+        // "Transcribing…" indicator (no stop controls — the ASR is finalizing).
+        let recording_popup: Element<'_, HomeMessage> = if recording {
+            let status_label = text("Recording voice message…")
+                .size(13)
+                .color(theme::STATUS_ERROR);
+            let send_btn = button(text("Stop + Send").size(12))
+                .on_press(HomeMessage::StopVoiceRecordingSend)
+                .style(theme::button_primary)
+                .padding(5);
+            let discard_btn = button(text("Stop + Discard").size(12))
+                .on_press(HomeMessage::StopVoiceRecordingDiscard)
+                .style(theme::button_secondary)
+                .padding(5);
+            container(
+                row![
+                    status_label,
+                    Space::new().width(Length::Fill),
+                    send_btn,
+                    discard_btn
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .padding(8)
+            .style(theme::surface_container_style)
+            .width(Length::Fill)
+            .into()
+        } else if transcribing {
+            container(
+                row![
+                    text("Transcribing voice message…")
+                        .size(13)
+                        .color(theme::TEXT_MUTED),
+                    Space::new().width(Length::Fill),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .padding(8)
+            .style(theme::surface_container_style)
+            .width(Length::Fill)
+            .into()
+        } else {
+            Space::new().height(0).into()
+        };
+
         // ── Full layout ──────────────────────────────────────────
-        column![chat_area, input_area,]
+        column![chat_area, role_panel, recording_popup, input_area,]
+            .align_x(Alignment::End)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -793,7 +962,10 @@ impl HomeState {
                 }
                 self.refresh_history()
             }
-            HomeMessage::SendMessage => self.send_message(),
+            HomeMessage::SendMessage => {
+                self.role_menu_open = false;
+                self.send_message()
+            }
             HomeMessage::HistoryLoaded(entries, has_more) => {
                 // Track oldest loaded ID and whether more exist for pagination.
                 self.oldest_loaded_id = entries.first().map(|e| e.id);
@@ -833,6 +1005,7 @@ impl HomeState {
                 self.sending = false;
                 self.typing = false;
                 self.typing_tick_state = 0;
+                self.role_menu_open = false;
                 self.reset_pagination_state();
 
                 // Build agent ID and schedule async cleanup.
@@ -1061,6 +1234,40 @@ impl HomeState {
                 if generation == self.sending_gen && self.sending {
                     self.sending = false;
                 }
+                Task::none()
+            }
+            HomeMessage::RoleMenuToggled => {
+                self.role_menu_open = !self.role_menu_open;
+                Task::none()
+            }
+            HomeMessage::RoleMenuClosed => {
+                self.role_menu_open = false;
+                Task::none()
+            }
+            HomeMessage::StartVoiceRecording => {
+                self.role_menu_open = false;
+                // Best-effort pre-flight check surfaced by the pipeline itself
+                // (single source of truth for the blocked-state mapping). The
+                // pipeline remains the authoritative guard — this predicate can
+                // drift on transient transitions but covers the common cases.
+                if let Some(msg) = crate::audio::voice::manual_recording_blocked_reason() {
+                    return Task::done(HomeMessage::Toast(ToastMessage::Warning(msg.to_string())));
+                }
+                crate::audio::voice::send_command(
+                    crate::audio::voice::VoiceCommand::StartRecording,
+                );
+                Task::none()
+            }
+            HomeMessage::StopVoiceRecordingSend => {
+                crate::audio::voice::send_command(
+                    crate::audio::voice::VoiceCommand::StopRecordingSend,
+                );
+                Task::none()
+            }
+            HomeMessage::StopVoiceRecordingDiscard => {
+                crate::audio::voice::send_command(
+                    crate::audio::voice::VoiceCommand::StopRecordingDiscard,
+                );
                 Task::none()
             }
         }

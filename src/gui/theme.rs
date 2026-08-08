@@ -452,6 +452,55 @@ pub fn button_transparent(
     }
 }
 
+/// Transparent-background button style with a hover/press highlight. Shared
+/// factory for the chat composer controls (role/mic, send button) and dropdown
+/// menu items — the two differ only in highlight colors and corner radius.
+#[must_use = "button style factory returns a style closure"]
+fn transparent_button_style(
+    hover: Color,
+    pressed: Color,
+    radius: f32,
+    disabled: bool,
+) -> impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style {
+    move |_: &iced::Theme, status| {
+        let bg = if disabled {
+            Color::TRANSPARENT
+        } else {
+            match status {
+                iced::widget::button::Status::Hovered => hover,
+                iced::widget::button::Status::Pressed => pressed,
+                _ => Color::TRANSPARENT,
+            }
+        };
+        iced::widget::button::Style {
+            background: Some(Background::Color(bg)),
+            border: iced::Border {
+                radius: radius.into(),
+                width: 0.0,
+                color: Color::TRANSPARENT,
+            },
+            ..Default::default()
+        }
+    }
+}
+
+/// Icon-only button with a subtle hover/press background (chat composer
+/// role/mic controls, send button). Pass `disabled: true` to suppress the
+/// highlight (used for the greyed send button on empty input).
+#[must_use = "button style factory returns a style closure"]
+pub fn icon_button_style(
+    disabled: bool,
+) -> impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style {
+    transparent_button_style(HOVER_STRONG, ACCENT_DIM, 6.0, disabled)
+}
+
+/// Dropdown menu item button: transparent background, hover highlight.
+#[must_use = "button style factory returns a style closure"]
+pub fn menu_item_button_style()
+-> impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style {
+    transparent_button_style(HOVER, HOVER_STRONG, 4.0, false)
+}
+
 /// Tab-button style for editor/shell tab bars: active tabs use [`BG_ELEVATED`],
 /// hovered [`HOVER`], otherwise [`BG_SURFACE`], with a zero-radius border.
 pub fn tab_button_style(
