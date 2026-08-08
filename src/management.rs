@@ -2273,7 +2273,7 @@ async fn build_joint_comment(
         // explicit marker) instead.
         crate::joint_verdict::render_joint_comment(
             &round,
-            &crate::consensus::GroupingOutcome::Fallback,
+            &crate::consensus::RepairOutcome::Fallback,
         )
     } else {
         crate::joint_verdict::build_joint_comment(&round, role, ws).await

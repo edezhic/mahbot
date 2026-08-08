@@ -16,7 +16,13 @@ Hard rules:
 - When several agents raised the same fact, include one verbatim member per agent that
   raised it — the agreement bracket is computed from the distinct agents you cite.
 
-Respond with ONLY a JSON object matching this exact schema (no extra fields):
+The output schema depends on the round:
+- First response: emit the FULL schema below (summary + groups + ungrouped).
+- Repair rounds: the user instructions describe a REPAIR-DELTA schema — propose
+  ONLY new groups for remaining items, an explicit ungrouped list, and optional
+  references to frozen groups. Never re-emit the full schema in a repair round.
+
+Respond with ONLY a JSON object matching the schema for the current round (no extra fields):
 {
   "summary": "one short paragraph (2-4 sentences) summarizing the round's findings",
   "groups": [

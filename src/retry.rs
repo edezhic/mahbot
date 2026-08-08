@@ -71,8 +71,10 @@ pub(crate) const DEFAULT_RETRY_BASE_BACKOFF_MS: u64 = 5_000;
 pub(crate) const DEFAULT_RETRY_MAX_BACKOFF_MS: u64 = 60_000;
 pub(crate) const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_mins(12);
 
-/// Dedicated joint-verdict synthesis retry schedule: 3 attempts, 30–45 s
-/// backoff band (base 30 s, cap 45 s, ±25% jitter on sleeps).
+/// Dedicated joint-verdict synthesis retry schedule: total calls (1 full
+/// synthesis + up to N-1 repair rounds; default 3 = the lower edge of the
+/// approved 3–5 band), 30–45 s backoff band (base 30 s, cap 45 s, ±25%
+/// jitter on sleeps).
 pub(crate) const DEFAULT_SYNTHESIS_MAX_ATTEMPTS_STR: &str = "3";
 pub(crate) const DEFAULT_SYNTHESIS_BASE_BACKOFF_MS_STR: &str = "30000";
 pub(crate) const DEFAULT_SYNTHESIS_MAX_BACKOFF_MS_STR: &str = "45000";
@@ -166,9 +168,11 @@ impl RetryPolicy {
     /// Build the joint-verdict synthesis policy from the dedicated config
     /// keys (`synthesis_max_attempts`, `synthesis_base_backoff_ms`,
     /// `synthesis_max_backoff_ms`), falling back to defaults on invalid
-    /// values. The synthesis loop is deliberately bounded (3 attempts,
-    /// 30–45 s backoff) so a bad grouping pass degrades to the deterministic
-    /// fallback comment instead of burning minutes of wall time.
+    /// values. `synthesis_max_attempts` is the TOTAL call count: 1 full
+    /// synthesis + up to N-1 repair rounds (default 3 — the lower edge of the
+    /// approved 3–5 band). The synthesis loop is deliberately bounded so a
+    /// bad grouping pass degrades to the deterministic fallback comment
+    /// instead of burning minutes of wall time.
     ///
     /// Like [`Self::current`], a test override installed via
     /// [`swap_test_retry_policy`] takes precedence so synthesis tests run
@@ -302,6 +306,11 @@ pub(crate) fn compute_sleep_ms(schedule_ms: u64, retry_after_ms: Option<u64>) ->
 // ── Failure classification ───────────────────────────────────────────────
 
 /// Granular failure classification for the retry/error trail.
+///
+/// The `Membership`/`Completeness`/`ContradictionAgents`/`ValidationOther`
+/// variants carry repair-validation semantics on the shared provider-failure
+/// path (granular causes ride the existing failure-cause field); they are
+/// retryable and only ever produced by the grouping core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FailureClass {
     /// Network/transport error (connection reset, timeouts, 5xx, 429).
@@ -315,6 +324,18 @@ pub(crate) enum FailureClass {
     /// Parsed successfully but a validation hook rejected the value
     /// (e.g. verdict score outside [0,10]).
     OutOfRangeScore,
+    /// Repair-round group rejected: a member's text is not verbatim in the
+    /// cited agent's list, the agent index is out of range, or the member
+    /// was already placed in a frozen group.
+    Membership,
+    /// Repair-round proposal silently dropped unfrozen items (incomplete
+    /// coverage).
+    Completeness,
+    /// A proposed contradiction/reference lacks ≥2 distinct cited agents.
+    ContradictionAgents,
+    /// A validation rejection outside the granular categories (empty
+    /// heading/summary, malformed structure, out-of-range group reference).
+    ValidationOther,
     /// Provider returned an empty text response.
     NoResponse,
     /// Permanent client error (auth, quota, invalid model, tool schema).
@@ -343,6 +364,10 @@ impl FailureClass {
             Self::TruncatedEnvelope => "truncated_envelope",
             Self::Parse => "parse",
             Self::OutOfRangeScore => "out_of_range_score",
+            Self::Membership => "membership",
+            Self::Completeness => "completeness",
+            Self::ContradictionAgents => "contradiction_agents",
+            Self::ValidationOther => "validation_other",
             Self::NoResponse => "no_response",
             Self::NonRetryable => "non_retryable",
             Self::Shutdown => "shutdown",
@@ -622,6 +647,12 @@ impl RetryLoop {
     #[must_use]
     pub(crate) fn into_failures(self) -> Vec<RetryFailureRecord> {
         self.failures
+    }
+
+    /// True when at least one failure was recorded this operation.
+    #[must_use]
+    pub(crate) fn has_failures(&self) -> bool {
+        !self.failures.is_empty()
     }
 
     /// Persist and record a failed attempt, stamping the attempt number and

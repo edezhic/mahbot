@@ -2,16 +2,20 @@
 //!
 //! Replaces the per-agent verdict comments with ONE comment per non-all-pass
 //! round. The merge backbone is the shared LLM grouping core ([`crate::consensus`]):
-//! a single synthesis pass groups the agents' exact issue statements, every
-//! group renders with a code-computed `[n/N]` bracket derived from distinct
-//! cited agent ids, and the DISPUTED marker appears only when the group carries
-//! a genuine contradiction (contradiction:true — never for solo findings).
-//! The LLM never produces counts — brackets are pure arithmetic here.
+//! a progress-preserving repair synthesis pass groups the agents' exact issue
+//! statements — accepted groups freeze, repair rounds only touch the
+//! remainder — and every group renders with a code-computed `[n/N]` bracket
+//! derived from distinct cited agent ids. The DISPUTED marker appears only
+//! when a group carries a genuine contradiction (contradiction:true — never
+//! for solo findings). The LLM never produces counts — brackets are pure
+//! arithmetic here.
 //!
 //! Anti-fabrication: every group member must carry the verbatim
 //! (exact-normalized) issue text of a specific agent; any violation rejects
-//! the output and retries the synthesis, eventually falling back to a
-//! deterministic raw member dump with an explicit marker.
+//! the offending group (per-group acceptance — valid groups freeze), and
+//! termination deterministically places every remaining item in the ungrouped
+//! section, eventually falling back to a deterministic raw member dump with
+//! an explicit marker when nothing ever freezes.
 
 use std::fmt::Write as _;
 
@@ -103,7 +107,9 @@ const PIPELINE_GROUPING_MAX_TOKENS: u32 = 16_000;
 /// Build the synthesis chat request for a stage role (the stage role's own
 /// model, reasoning effort, and provider routing — no separate grouping
 /// model). The shared contradiction package is appended to the system prompt;
-/// the general workspace context is prepended by [`consensus::run_grouping`].
+/// the general workspace context is prepended by the consensus core. The
+/// system prompt is byte-stable across rounds — repair-round schema selection
+/// lives in the appended user-section instructions.
 fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> ChatRequest {
     let system = format!(
         "{}\n\n{}",
@@ -163,34 +169,37 @@ pub(crate) async fn build_joint_comment(
     render_joint_comment(round, &outcome)
 }
 
-/// Run the single LLM grouping pass through the shared consensus core
-/// (3 attempts, 30–45 s backoff, rejection feedback, deterministic fail-open).
+/// Run the repair-mode synthesis pass through the shared consensus core
+/// (1 full call + up to N-1 repair rounds; frozen groups; per-group
+/// acceptance; deterministic remainder placement; narrowed fail-open).
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) async fn run_synthesis(
     round: &JointRound<'_>,
     role: Role,
     ws: &Workspace,
-) -> crate::consensus::GroupingOutcome {
+) -> crate::consensus::RepairOutcome {
     let request = synthesis_request(round, role, ws);
     let items = issues_by_agent(round);
-    crate::consensus::run_grouping(ws, "synthesis", request, &items).await
+    crate::consensus::run_grouping_repair(ws, "synthesis", request, &items).await
 }
 
 // ── Joint comment rendering ─────────────────────────────────────────────
 
-/// Render the joint comment for a round given the synthesis outcome.
+/// Render the joint comment for a round given the repair-mode synthesis
+/// outcome.
 ///
 /// Structure: header (code-computed counts), groups with code-computed
-/// brackets from distinct cited agent ids (grouped by the LLM when synthesis
-/// succeeded, raw member dump otherwise), the LLM-attributed ungrouped list in
-/// a deterministic trailing section, per-agent critiques, the LLM summary
-/// prose (or an explicit "LLM grouping unavailable" marker), and a raw-dump
-/// appendix for failed agents.
+/// brackets from distinct cited agent ids (frozen by the repair protocol when
+/// synthesis succeeded, raw member dump otherwise), the code-computed
+/// ungrouped remainder in a deterministic trailing section (DISPUTED
+/// cross-references for items that flag a contradiction against a frozen
+/// group), per-agent critiques, the first-accepted LLM summary prose (or an
+/// explicit marker), and a raw-dump appendix for failed agents.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub(crate) fn render_joint_comment(
     round: &JointRound<'_>,
-    outcome: &crate::consensus::GroupingOutcome,
+    outcome: &crate::consensus::RepairOutcome,
 ) -> String {
     let mut out = String::new();
     let n_valid = round.n_valid();
@@ -212,7 +221,7 @@ pub(crate) fn render_joint_comment(
     let has_issues = items.iter().any(|list| !list.is_empty());
     if has_issues {
         match outcome {
-            crate::consensus::GroupingOutcome::Grouped(output) => {
+            crate::consensus::RepairOutcome::Repaired { output, references } => {
                 for group in &output.groups {
                     let n = crate::consensus::distinct_agents(group).len();
                     let bracket = crate::consensus::bracket_label(n, n_valid, group.contradiction);
@@ -221,16 +230,30 @@ pub(crate) fn render_joint_comment(
                         let _ = write!(out, "\n- {}", render_member_line(round, member));
                     }
                 }
-                // LLM-attributed ungrouped list — deterministic trailing
-                // section (validation guarantees nothing was silently dropped).
+                // Code-computed ungrouped remainder — deterministic trailing
+                // section (every remaining item lands here exactly once).
                 if !output.ungrouped.is_empty() {
                     out.push_str("\n\n**Ungrouped**");
                     for member in &output.ungrouped {
-                        let _ = write!(out, "\n- {}", render_member_line(round, member));
+                        let mut line = render_member_line(round, member);
+                        for reference in references.iter().filter(|r| {
+                            r.member.agent == member.agent
+                                && crate::consensus::normalize_item(&r.member.text)
+                                    == crate::consensus::normalize_item(&member.text)
+                        }) {
+                            if let Some(group) = output.groups.get(reference.group) {
+                                let _ = write!(
+                                    line,
+                                    " [DISPUTED — contradicts group {} \"{}\"]",
+                                    reference.group, group.heading
+                                );
+                            }
+                        }
+                        let _ = write!(out, "\n- {line}");
                     }
                 }
             }
-            crate::consensus::GroupingOutcome::Fallback => {
+            crate::consensus::RepairOutcome::Fallback => {
                 // Deterministic fail-open: raw per-agent issue dump + marker.
                 out.push_str("\n\n**Issues**");
                 for (agent_idx, list) in items.iter().enumerate() {
@@ -269,13 +292,18 @@ pub(crate) fn render_joint_comment(
         }
     }
 
-    // LLM summary or explicit fallback marker.
+    // First-accepted LLM summary or explicit marker.
     match outcome {
-        crate::consensus::GroupingOutcome::Grouped(output) => {
+        crate::consensus::RepairOutcome::Repaired { output, .. } => {
             out.push_str("\n\n### Summary");
-            let _ = write!(out, "\n{}", output.summary.trim());
+            let summary = output.summary.trim();
+            if summary.is_empty() {
+                out.push_str("\nLLM summary unavailable — deterministic member render.");
+            } else {
+                let _ = write!(out, "\n{summary}");
+            }
         }
-        crate::consensus::GroupingOutcome::Fallback => {
+        crate::consensus::RepairOutcome::Fallback => {
             out.push_str(
                 "\n\n### Summary\nLLM grouping unavailable — deterministic member dump only.",
             );

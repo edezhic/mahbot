@@ -2242,7 +2242,7 @@ impl SettingsState {
                     .color(theme::TEXT_SECONDARY),
                 Space::new().height(4),
                 config_text_input(
-                    "Synthesis Max Attempts",
+                    "Synthesis Max Attempts (total calls: 1 full + repairs)",
                     crate::retry::DEFAULT_SYNTHESIS_MAX_ATTEMPTS_STR,
                     self.config
                         .synthesis_max_attempts

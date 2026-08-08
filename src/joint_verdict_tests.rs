@@ -1,7 +1,7 @@
 use super::*;
 use crate::Verdict;
 use crate::consensus::{
-    GroupingGroup, GroupingMember, GroupingOutcome, GroupingOutput, bracket_label, distinct_agents,
+    GroupingGroup, GroupingMember, GroupingOutput, RepairOutcome, bracket_label, distinct_agents,
     normalize_item, validate_grouping,
 };
 
@@ -65,6 +65,14 @@ fn output(
         summary: summary.to_string(),
         groups,
         ungrouped,
+    }
+}
+
+/// Repair-mode terminal with no contradiction references (renderer tests).
+fn repaired(out: GroupingOutput) -> RepairOutcome {
+    RepairOutcome::Repaired {
+        output: out,
+        references: vec![],
     }
 }
 
@@ -244,7 +252,7 @@ fn validator_uses_original_agent_indices_with_mid_round_failure() {
         Ok(()),
         "original dispatch indices must pass validation"
     );
-    let text = render_joint_comment(&r, &GroupingOutcome::Grouped(out));
+    let text = render_joint_comment(&r, &repaired(out));
     assert!(
         text.contains("Missing retry"),
         "member of agent 2 must render: {text}"
@@ -295,7 +303,7 @@ fn renderer_with_partial_failures() {
         vec![(2, "agent produced no response — crashed")],
         "1 of 2 valid verdicts failed (threshold 9/10).",
     );
-    let text = render_joint_comment(&r, &GroupingOutcome::Fallback);
+    let text = render_joint_comment(&r, &RepairOutcome::Fallback);
     assert!(text.contains("## Review round — 2/3 valid verdicts"));
     assert!(
         text.contains("- Agent 0: No timeout check"),
@@ -335,7 +343,7 @@ fn renderer_with_synthesis_groups_and_contradiction() {
         ],
         vec![],
     );
-    let text = render_joint_comment(&r, &GroupingOutcome::Grouped(out));
+    let text = render_joint_comment(&r, &repaired(out));
     assert!(
         text.contains("**Robustness** [1/2]"),
         "solo group renders [1/2] without DISPUTED: {text}"
@@ -370,7 +378,7 @@ fn renderer_with_ungrouped_trailing_section() {
         )],
         vec![member(1, "Naming nit")],
     );
-    let text = render_joint_comment(&r, &GroupingOutcome::Grouped(out));
+    let text = render_joint_comment(&r, &repaired(out));
     assert!(
         text.contains("**Ungrouped**"),
         "ungrouped section renders: {text}"
@@ -400,7 +408,7 @@ fn renderer_marks_blocker_from_cited_agent_score() {
         ],
         vec![],
     );
-    let text = render_joint_comment(&r, &GroupingOutcome::Grouped(out));
+    let text = render_joint_comment(&r, &repaired(out));
     assert!(
         text.contains("[blocker] Agent 0: No timeout check"),
         "below-threshold agent's member renders as blocker: {text}"
@@ -457,7 +465,8 @@ async fn run_synthesis_end_to_end_zero_based_contract() {
     let _policy = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
 
     // A faithful LLM copies the input labels (0-based) straight into the
-    // schema — this output must be accepted end-to-end.
+    // schema — this output must be accepted end-to-end (round 1 completes:
+    // every item is in a frozen group).
     let r = round(
         "Review",
         vec![
@@ -474,12 +483,15 @@ async fn run_synthesis_end_to_end_zero_based_contract() {
     let ws = crate::workspace::test_ws("/tmp/test_ws");
     let outcome = run_synthesis(&r, Role::Reviewer, &ws).await;
     match outcome {
-        GroupingOutcome::Grouped(out) => assert_eq!(out.groups.len(), 1),
-        GroupingOutcome::Fallback => panic!("valid zero-based output must not fall back"),
+        RepairOutcome::Repaired { output, .. } => assert_eq!(output.groups.len(), 1),
+        RepairOutcome::Fallback => panic!("valid zero-based output must not fall back"),
     }
 
     // A 1-based index (agent 2 in a 2-agent round — the pre-fix prompt
-    // contract) must be rejected and eventually fall back.
+    // contract) must be rejected and eventually fall back. Round 1 is
+    // completeness-rejected (the raw proposal omits real items); rounds 2–3
+    // hit the unscripted-default parse failure (the script holds one
+    // response) — exhaustion is parse-failure + budget, not zero-progress.
     let r = round(
         "Review",
         vec![
@@ -495,15 +507,198 @@ async fn run_synthesis_end_to_end_zero_based_contract() {
     let _provider = crate::util::test::install_fake_provider(fake.clone());
     let outcome = run_synthesis(&r, Role::Reviewer, &ws).await;
     assert!(
-        matches!(outcome, GroupingOutcome::Fallback),
+        matches!(outcome, RepairOutcome::Fallback),
         "out-of-range 1-based index must exhaust synthesis into the fallback"
     );
-    // The rejection must be fed back into the next attempt so the LLM can
+    // The rejection must be fed back into the next round so the LLM can
     // self-correct (never a byte-identical resend after a validation error).
     let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
     assert!(
         fingerprints.len() >= 2 && fingerprints[1].contains("previous response was rejected"),
         "validation rejection must be fed back: {fingerprints:?}"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
+async fn repair_rounds_freeze_groups_and_converge() {
+    let _lock = crate::util::test::retry_tests_lock();
+    let _policy = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+
+    // Round 1: one valid group (freezes) + one fabricated group (dropped with
+    // a per-group reason) + ungrouped entries covering the remainder.
+    // Round 2: delta groups the remaining item. Round 3: delta leaves the
+    // last item ungrouped → zero-progress stops the loop; the remainder
+    // renders deterministically in the ungrouped section.
+    let r = round(
+        "Review",
+        vec![
+            (0, verdict(4, &["No timeout check", "Missing retry"])),
+            (1, verdict(9, &["Naming nit"])),
+        ],
+        vec![],
+        "",
+    );
+    let fake = crate::util::test::FakeProvider::new()
+        .ok(
+            r#"{"summary":"Two issues grouped, one left.","groups":[{"heading":"Robustness","contradiction":false,"members":[{"agent":0,"text":"No timeout check"}]},{"heading":"Fabricated","contradiction":false,"members":[{"agent":1,"text":"Invented text"}]}],"ungrouped":[{"agent":0,"text":"Missing retry"},{"agent":1,"text":"Naming nit"}]}"#,
+        )
+        .ok(
+            r#"{"groups":[{"heading":"Retry","contradiction":false,"members":[{"agent":0,"text":"Missing retry"}]}],"ungrouped":[{"agent":1,"text":"Naming nit"}]}"#,
+        )
+        .ok(
+            r#"{"groups":[],"ungrouped":[{"agent":1,"text":"Naming nit"}]}"#,
+        );
+    let fake = std::sync::Arc::new(fake);
+    let _provider = crate::util::test::install_fake_provider(fake.clone());
+    let ws = crate::workspace::test_ws("/tmp/test_ws");
+    let outcome = run_synthesis(&r, Role::Reviewer, &ws).await;
+    let RepairOutcome::Repaired { output, references } = outcome else {
+        panic!("repair must converge, got fallback");
+    };
+    assert_eq!(
+        output.groups.len(),
+        2,
+        "frozen groups preserved across rounds"
+    );
+    assert_eq!(
+        output.ungrouped,
+        vec![member(1, "Naming nit")],
+        "deterministic remainder placement"
+    );
+    assert_eq!(references.len(), 0);
+    assert!(
+        output.summary.contains("Two issues grouped"),
+        "first-accepted summary is final: {}",
+        output.summary
+    );
+    let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
+    assert_eq!(fingerprints.len(), 3, "1 full + 2 repair rounds");
+    assert!(
+        fingerprints[1].contains("REPAIR ROUND 2")
+            && fingerprints[1].contains("not found verbatim"),
+        "repair instructions + per-group rejection must reach the model: {}",
+        fingerprints[1]
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
+async fn repair_zero_progress_with_no_frozen_groups_falls_back() {
+    let _lock = crate::util::test::retry_tests_lock();
+    let _policy = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+
+    // Round 1 freezes nothing (fabricated group dropped) — proceeds to a
+    // repair round (round-1 zero-frozen never terminates the loop). Round 2
+    // freezes nothing again → zero-progress with zero groups ever frozen →
+    // deterministic fail-open.
+    let r = round(
+        "Review",
+        vec![
+            (0, verdict(4, &["No timeout check"])),
+            (1, verdict(3, &["Missing retry"])),
+        ],
+        vec![],
+        "",
+    );
+    let fake = crate::util::test::FakeProvider::new()
+        .ok(
+            r#"{"summary":"s","groups":[{"heading":"Bad","contradiction":false,"members":[{"agent":0,"text":"Invented"}]}],"ungrouped":[{"agent":0,"text":"No timeout check"},{"agent":1,"text":"Missing retry"}]}"#,
+        )
+        .ok(
+            r#"{"groups":[{"heading":"Bad","contradiction":false,"members":[{"agent":1,"text":"Invented"}]}],"ungrouped":[{"agent":0,"text":"No timeout check"},{"agent":1,"text":"Missing retry"}]}"#,
+        );
+    let fake = std::sync::Arc::new(fake);
+    let _provider = crate::util::test::install_fake_provider(fake);
+    let ws = crate::workspace::test_ws("/tmp/test_ws");
+    let outcome = run_synthesis(&r, Role::Reviewer, &ws).await;
+    assert!(
+        matches!(outcome, RepairOutcome::Fallback),
+        "zero-progress with zero groups ever frozen must fall back"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
+async fn repair_contradiction_reference_renders_disputed() {
+    let _lock = crate::util::test::retry_tests_lock();
+    let _policy = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+
+    // Round 1 freezes a consensus group (contradiction:false). Round 2's
+    // delta references it from a remainder item → accepted (≥2 distinct
+    // agents: frozen group agent 0 + item agent 1) and rendered in the
+    // ungrouped section with DISPUTED + a cross-reference to the frozen group.
+    let r = round(
+        "Review",
+        vec![
+            (0, verdict(4, &["Safe"])),
+            (1, verdict(3, &["Actually unsafe"])),
+        ],
+        vec![],
+        "",
+    );
+    let fake = crate::util::test::FakeProvider::new()
+        .ok(
+            r#"{"summary":"One consensus, one dispute.","groups":[{"heading":"Safety","contradiction":false,"members":[{"agent":0,"text":"Safe"}]}],"ungrouped":[{"agent":1,"text":"Actually unsafe"}]}"#,
+        )
+        .ok(
+            r#"{"groups":[],"ungrouped":[{"agent":1,"text":"Actually unsafe"}],"references":[{"group":0,"member":{"agent":1,"text":"Actually unsafe"}}]}"#,
+        );
+    let fake = std::sync::Arc::new(fake);
+    let _provider = crate::util::test::install_fake_provider(fake);
+    let ws = crate::workspace::test_ws("/tmp/test_ws");
+    let outcome = run_synthesis(&r, Role::Reviewer, &ws).await;
+    let RepairOutcome::Repaired { output, references } = outcome else {
+        panic!("reference round must converge, got fallback");
+    };
+    assert_eq!(references.len(), 1, "contradiction reference accepted");
+    let text = render_joint_comment(&r, &RepairOutcome::Repaired { output, references });
+    assert!(
+        text.contains("Agent 1: Actually unsafe [DISPUTED — contradicts group 0 \"Safety\"]"),
+        "reference must render with DISPUTED + cross-ref: {text}"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
+async fn repair_rejects_empty_member_group() {
+    let _lock = crate::util::test::retry_tests_lock();
+    let _policy = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+
+    // Round 1 proposes an empty-member group (must NOT freeze as progress —
+    // it places nothing and would render a bogus [0/N] bracket) alongside a
+    // valid group; the rejection reaches the round-2 repair prompt. Round 2
+    // leaves the remainder ungrouped → zero-progress stop.
+    let r = round(
+        "Review",
+        vec![(0, verdict(4, &["Safe"])), (1, verdict(3, &["Unsafe"]))],
+        vec![],
+        "",
+    );
+    let fake = crate::util::test::FakeProvider::new()
+        .ok(
+            r#"{"summary":"s","groups":[{"heading":"Empty","contradiction":false,"members":[]},{"heading":"Safety","contradiction":false,"members":[{"agent":0,"text":"Safe"}]}],"ungrouped":[{"agent":1,"text":"Unsafe"}]}"#,
+        )
+        .ok(
+            r#"{"groups":[],"ungrouped":[{"agent":1,"text":"Unsafe"}]}"#,
+        );
+    let fake = std::sync::Arc::new(fake);
+    let _provider = crate::util::test::install_fake_provider(fake.clone());
+    let ws = crate::workspace::test_ws("/tmp/test_ws");
+    let outcome = run_synthesis(&r, Role::Reviewer, &ws).await;
+    let RepairOutcome::Repaired { output, .. } = outcome else {
+        panic!("empty-member rejection must not force a fallback");
+    };
+    assert_eq!(
+        output.groups.len(),
+        1,
+        "empty-member group must not freeze as progress"
+    );
+    let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
+    assert!(
+        fingerprints[1].contains("group has no members"),
+        "empty-member rejection must reach the repair prompt: {}",
+        fingerprints[1]
     );
 }
 
