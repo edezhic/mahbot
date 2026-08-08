@@ -324,6 +324,68 @@ fn renderer_with_partial_failures() {
 }
 
 #[test]
+fn renderer_no_issues_summary_respects_threshold() {
+    // Fully clean round: all verdicts clear the threshold.
+    let r = round(
+        "Review",
+        vec![(0, verdict(10, &[])), (1, verdict(9, &[]))],
+        vec![],
+        "All 2 valid verdicts passed (threshold 9/10).",
+    );
+    let text = render_joint_comment(
+        &r,
+        &RepairOutcome::Fallback,
+        &ItemTable::new(&issues_by_agent(&r)),
+    );
+    assert!(text.contains("## Review round — 2/2 valid verdicts"));
+    assert!(text.contains("All 2 valid verdicts passed (threshold 9/10)."));
+    assert!(
+        text.contains("all 2 agents passed clean"),
+        "clean-round summary must state the pass outcome: {text}"
+    );
+    assert!(
+        !text.contains("LLM grouping unavailable"),
+        "clean rounds must not imply the grouping step failed: {text}"
+    );
+
+    // Bounced round: a sub-threshold verdict with an empty issues list
+    // (reachable — extraction only validates the score range) must not
+    // claim a clean pass.
+    let bounced = round(
+        "Review",
+        vec![(0, verdict(8, &[])), (1, verdict(10, &[]))],
+        vec![],
+        "1 of 2 valid verdicts failed (threshold 9/10).",
+    );
+    let text = render_joint_comment(
+        &bounced,
+        &RepairOutcome::Fallback,
+        &ItemTable::new(&issues_by_agent(&bounced)),
+    );
+    assert!(
+        !text.contains("passed clean"),
+        "bounced round must not claim a clean pass: {text}"
+    );
+    assert!(
+        text.contains("No issues found by the responding agents."),
+        "bounced round keeps the neutral no-issues wording: {text}"
+    );
+
+    // All-failed round: zero valid verdicts — the summary must not imply
+    // that responding agents exist.
+    let all_failed = round("Review", vec![], vec![(0, "crashed"), (1, "crashed")], "");
+    let text = render_joint_comment(
+        &all_failed,
+        &RepairOutcome::Fallback,
+        &ItemTable::new(&issues_by_agent(&all_failed)),
+    );
+    assert!(
+        text.contains("no agents produced a verdict"),
+        "all-failed summary must not imply responders: {text}"
+    );
+}
+
+#[test]
 fn renderer_with_synthesis_groups_and_contradiction() {
     let r = round(
         "Review",

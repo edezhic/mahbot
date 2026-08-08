@@ -1,7 +1,8 @@
 //! Joint verdict comments for pipeline stages (analysis, review, QA).
 //!
-//! Replaces the per-agent verdict comments with ONE comment per non-all-pass
-//! round. The merge backbone is the shared LLM grouping core ([`crate::consensus`]):
+//! Replaces the per-agent verdict comments with ONE comment per round —
+//! written even on fully clean rounds so the audit trail is uniform. The
+//! merge backbone is the shared LLM grouping core ([`crate::consensus`]):
 //! a progress-preserving repair synthesis pass groups the agents' exact issue
 //! statements — accepted groups freeze, repair rounds only touch the
 //! remainder — and every group renders with a code-computed `[n/N]` bracket
@@ -290,9 +291,34 @@ pub(crate) fn render_joint_comment(
             }
         }
         crate::consensus::RepairOutcome::Fallback => {
-            out.push_str(
-                "\n\n### Summary\nLLM grouping unavailable — deterministic member dump only.",
-            );
+            if has_issues {
+                out.push_str(
+                    "\n\n### Summary\nLLM grouping unavailable — deterministic member dump only.",
+                );
+            } else {
+                // No issues existed to merge — the synthesis pass was
+                // deliberately skipped, so the summary must not imply it
+                // failed. "Passed clean" additionally requires every valid
+                // verdict to clear the round threshold: a sub-threshold
+                // verdict with an empty issues list still bounces the round.
+                let clean = round.failures.is_empty()
+                    && round
+                        .verdicts
+                        .iter()
+                        .all(|v| v.verdict.score >= round.threshold);
+                let summary = if clean {
+                    format!(
+                        "\n\n### Summary\nNo issues found — all {} agents passed clean.",
+                        round.n_valid()
+                    )
+                } else if round.n_valid() > 0 {
+                    "\n\n### Summary\nNo issues found by the responding agents.".to_string()
+                } else {
+                    "\n\n### Summary\nNo issues to merge — no agents produced a verdict."
+                        .to_string()
+                };
+                out.push_str(&summary);
+            }
         }
     }
 

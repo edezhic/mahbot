@@ -536,13 +536,13 @@ async fn install_synthesis_test_seams(
 // ── process_verifier_verdicts — verdict processing ─────────────────────
 
 /// Verify all verdict-processing outcomes:
-/// - All failed → Failed
+/// - All failed → Failed (SYSTEM_ROLE failure comment only — no joint comment)
 /// - Any failed → bounce-back to ReadyForDevelopment with pipeline
 ///   reservation, a single joint comment (role = stage name), and a bumped
 ///   bounce counter
 /// - The 6th bounce → Failed (bounce circuit breaker)
-/// - All passed (Reviewer) → Reviewed
-/// - All passed (QA) → QaPassed
+/// - All passed (Reviewer) → Reviewed with a joint comment
+/// - All passed (QA) → QaPassed with a joint comment
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
 async fn process_verifier_verdicts_cases() {
@@ -557,6 +557,8 @@ async fn process_verifier_verdicts_cases() {
         expected_pipeline_reservation: bool,
         /// Expected bounce_count after processing (0 for non-bounce cases).
         expected_bounce_count: i64,
+        /// Expected number of stage-role (joint) comments after the round.
+        expected_joint_comments: usize,
     }
 
     init_management_test_stores().await;
@@ -574,6 +576,7 @@ async fn process_verifier_verdicts_cases() {
             expected_phase: TicketPhase::Failed,
             expected_pipeline_reservation: false,
             expected_bounce_count: 0,
+            expected_joint_comments: 0,
         },
         Case {
             name: "any failed -> bounce-back with pipeline reservation",
@@ -585,6 +588,7 @@ async fn process_verifier_verdicts_cases() {
             expected_phase: TicketPhase::ReadyForDevelopment,
             expected_pipeline_reservation: true,
             expected_bounce_count: 1,
+            expected_joint_comments: 1,
         },
         Case {
             name: "all passed -> Reviewed",
@@ -596,6 +600,7 @@ async fn process_verifier_verdicts_cases() {
             expected_phase: TicketPhase::Reviewed,
             expected_pipeline_reservation: false,
             expected_bounce_count: 0,
+            expected_joint_comments: 1,
         },
         Case {
             name: "all passed (QA) -> QaPassed",
@@ -607,6 +612,7 @@ async fn process_verifier_verdicts_cases() {
             expected_phase: TicketPhase::QaPassed,
             expected_pipeline_reservation: false,
             expected_bounce_count: 0,
+            expected_joint_comments: 1,
         },
     ];
 
@@ -635,8 +641,9 @@ async fn process_verifier_verdicts_cases() {
             case.name, case.expected_bounce_count, ticket.bounce_count,
         );
 
-        // The any-failed case writes exactly ONE joint comment (role = stage
-        // name), replacing the three per-agent comments.
+        // Every non-all-failed round writes exactly ONE joint comment (role =
+        // stage name), replacing the three per-agent comments; all-failed
+        // rounds keep only the SYSTEM_ROLE failure comment.
         let comments = board()
             .get_comments(&ticket_id)
             .await
@@ -645,7 +652,7 @@ async fn process_verifier_verdicts_cases() {
             .iter()
             .filter(|c| c.role == stage_name(case.vi.role))
             .collect();
-        if case.expected_phase == TicketPhase::ReadyForDevelopment {
+        if case.expected_joint_comments == 1 {
             assert_eq!(
                 verdict_comments.len(),
                 1,
@@ -669,7 +676,7 @@ async fn process_verifier_verdicts_cases() {
         } else {
             assert!(
                 verdict_comments.is_empty(),
-                "case {}: no per-stage comments expected for non-bounce rounds",
+                "case {}: no per-stage comments expected for all-failed rounds",
                 case.name,
             );
         }
@@ -814,8 +821,7 @@ async fn technical_failure_pauses_workspace_but_circuit_breaker_does_not() {
 // ── process_analyst_verdicts — analyst scoring and transitions ─────────
 
 /// Verify process_analyst_verdicts across all outcomes (fail-open):
-/// - All analysts pass → Planning with NO comment (fully passing analysis
-///   leaves no comment)
+/// - All analysts pass → Planning with one joint comment (role "Analysis")
 /// - Partial fail → Planning with one joint comment (role "Analysis")
 /// - No verdicts → Planning with a joint comment carrying the failure dumps
 #[tokio::test]
@@ -826,9 +832,8 @@ async fn process_analyst_verdicts_cases() {
         ws_suffix: &'static str,
         title: &'static str,
         results: Vec<ParallelVerdict>,
-        /// Substring that must appear in the joint comment (None for the
-        /// all-pass round, which writes no comment).
-        expected_comment_substring: Option<&'static str>,
+        /// Substring that must appear in the joint comment.
+        expected_comment_substring: &'static str,
     }
 
     init_management_test_stores().await;
@@ -837,7 +842,7 @@ async fn process_analyst_verdicts_cases() {
 
     let cases = vec![
         Case {
-            name: "all pass -> Planning with no comment",
+            name: "all pass -> Planning with joint comment",
             ws_suffix: "an_all_pass",
             title: "Analyst All Pass",
             results: vec![
@@ -845,7 +850,7 @@ async fn process_analyst_verdicts_cases() {
                 analyst_verdict(9, "Solid work.", &[]),
                 analyst_verdict(8, "Good analysis.", &[]),
             ],
-            expected_comment_substring: None,
+            expected_comment_substring: "All LGTM",
         },
         Case {
             name: "partial fail -> Planning with joint comment",
@@ -856,14 +861,14 @@ async fn process_analyst_verdicts_cases() {
                 analyst_verdict(3, "Poor analysis.", &["Missing data"]),
                 analyst_verdict(8, "Decent.", &["Minor issue"]),
             ],
-            expected_comment_substring: Some("flagged potential blockers"),
+            expected_comment_substring: "flagged potential blockers",
         },
         Case {
             name: "no verdicts -> Planning with failure dumps",
             ws_suffix: "an_no_v",
             title: "Analyst No Verdicts",
             results: vec![no_verdict(); 3],
-            expected_comment_substring: Some("Agent failures"),
+            expected_comment_substring: "Agent failures",
         },
     ];
 
@@ -892,32 +897,22 @@ async fn process_analyst_verdicts_cases() {
             .iter()
             .filter(|c| c.role == stage_name(Role::Analyst))
             .collect();
-        match case.expected_comment_substring {
-            None => {
-                assert!(
-                    verdict_comments.is_empty(),
-                    "case {}: all-pass round must leave no analyst comment, got {}",
-                    case.name,
-                    verdict_comments.len(),
-                );
-            }
-            Some(substring) => {
-                assert_eq!(
-                    verdict_comments.len(),
-                    1,
-                    "case {}: exactly one joint comment expected, got {}",
-                    case.name,
-                    verdict_comments.len(),
-                );
-                assert!(
-                    verdict_comments[0].content.contains(substring),
-                    "case {}: joint comment should contain {:?}, got: {}",
-                    case.name,
-                    substring,
-                    verdict_comments[0].content,
-                );
-            }
-        }
+        assert_eq!(
+            verdict_comments.len(),
+            1,
+            "case {}: exactly one joint comment expected, got {}",
+            case.name,
+            verdict_comments.len(),
+        );
+        assert!(
+            verdict_comments[0]
+                .content
+                .contains(case.expected_comment_substring),
+            "case {}: joint comment should contain {:?}, got: {}",
+            case.name,
+            case.expected_comment_substring,
+            verdict_comments[0].content,
+        );
     }
 }
 

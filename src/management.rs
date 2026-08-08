@@ -2266,11 +2266,10 @@ async fn build_joint_comment(
         .all(|v| v.verdict.issues_detected.is_empty())
     {
         // No issues to merge: either all agents failed (no response / parse
-        // failure) or every valid verdict passed clean while others failed.
+        // failure) or every valid verdict reported an empty issues list.
         // A synthesis pass over zero issues would waste a provider call and
         // could produce a misleading "no issues" summary on a round that
-        // actually bounced. Render the deterministic fallback (raw dumps +
-        // explicit marker) instead.
+        // actually bounced. Render the deterministic no-issues form instead.
         crate::joint_verdict::render_joint_comment(
             &round,
             &crate::consensus::RepairOutcome::Fallback,
@@ -2577,10 +2576,10 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 /// Evaluate analyst verdicts and transition the ticket:
 ///
 /// One joint comment (role = "Analysis", the stage name) replaces the
-/// per-agent comments and the system summary. No comment is written on
-/// all-pass rounds. Analysis is fail-open: the ticket always advances to
-/// Planning and the Manager decides; the joint comment gives the Manager the
-/// depth.
+/// per-agent comments and the system summary — written after every round,
+/// including all-pass rounds (the audit trail is uniform). Analysis is
+/// fail-open: the ticket always advances to Planning and the Manager decides;
+/// the joint comment gives the Manager the depth.
 ///
 /// See the "Parallel agent helpers (shared)" section for why this is separate
 /// from [`process_verifier_verdicts`].
@@ -2632,21 +2631,17 @@ async fn process_analyst_verdicts(ws: &Workspace, ticket: &Ticket, results: &[Pa
 
     // Synthesis runs BEFORE the transition and never holds the board write
     // lock (the comment+transition transaction serializes all board writes).
-    let joint_comment = if all_passed {
-        None
-    } else {
-        Some(
-            build_joint_comment(
-                stage_name(Role::Analyst),
-                results,
-                ANALYST_PASS_THRESHOLD,
-                Role::Analyst,
-                &summary,
-                ws,
-            )
-            .await,
-        )
-    };
+    // Always written — the audit trail needs a per-round stage comment even
+    // on fully clean rounds.
+    let joint_comment = build_joint_comment(
+        stage_name(Role::Analyst),
+        results,
+        ANALYST_PASS_THRESHOLD,
+        Role::Analyst,
+        &summary,
+        ws,
+    )
+    .await;
 
     if !with_comment_and_transition(
         TransitionCtx {
@@ -2658,10 +2653,8 @@ async fn process_analyst_verdicts(ws: &Workspace, ticket: &Ticket, results: &[Pa
             breaker_trip: false,
         },
         async |tx| {
-            if let Some(comment) = &joint_comment {
-                BoardStore::add_comment_tx(tx, &ticket.id, stage_name(Role::Analyst), comment)
-                    .await?;
-            }
+            BoardStore::add_comment_tx(tx, &ticket.id, stage_name(Role::Analyst), &joint_comment)
+                .await?;
             Ok(())
         },
     )
@@ -3031,23 +3024,29 @@ async fn process_verifier_verdicts(
         (String::new(), String::new())
     };
 
-    // One joint comment replaces the per-agent failing comments. Synthesis
-    // runs BEFORE the transition (never holding the board write lock); the
-    // comment+transition transaction stays short.
-    let joint_comment = if all_failed || !any_failed {
+    // One joint comment replaces the per-agent failing comments — written
+    // after every round EXCEPT all-failed rounds (those keep their dedicated
+    // SYSTEM_ROLE failure comment; a joint comment would duplicate it).
+    // Synthesis runs BEFORE the transition (never holding the board write
+    // lock); the comment+transition transaction stays short.
+    let joint_comment = if all_failed {
         None
     } else {
-        let header = format!(
-            "{} of {} valid verdicts failed (threshold {REVIEW_QA_THRESHOLD}/10).",
-            results
-                .iter()
-                .filter(|r| matches!(r, ParallelVerdict::Verdict(v) if !verdict_passes(v)))
-                .count(),
-            results
-                .iter()
-                .filter(|r| matches!(r, ParallelVerdict::Verdict(_)))
-                .count(),
-        );
+        let valid = results
+            .iter()
+            .filter(|r| matches!(r, ParallelVerdict::Verdict(_)))
+            .count();
+        let header = if any_failed {
+            format!(
+                "{} of {valid} valid verdicts failed (threshold {REVIEW_QA_THRESHOLD}/10).",
+                results
+                    .iter()
+                    .filter(|r| matches!(r, ParallelVerdict::Verdict(v) if !verdict_passes(v)))
+                    .count(),
+            )
+        } else {
+            format!("All {valid} valid verdicts passed (threshold {REVIEW_QA_THRESHOLD}/10).")
+        };
         Some(
             build_joint_comment(
                 stage_name(verifier.role),
