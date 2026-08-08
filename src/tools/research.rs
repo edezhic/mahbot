@@ -59,6 +59,10 @@ const PLAN_MERGE_FAILED: &str = "plan merge failed — using first valid decompo
 /// Explicit marker when the claim annotation pass exhausts its retries — all
 /// pending claims are treated as novel.
 const CLAIM_ANNOTATION_FAILED: &str = "claim annotation failed — all new claims treated as novel";
+/// Explicit marker when the confirm pass over a round's mutating annotation
+/// links fails entirely — every mutating verdict is treated as weak.
+const CONFIRM_FAILED: &str =
+    "annotation link confirmation failed — mutating links treated as weak/unconfirmed";
 
 // ── Shared orchestration types ───────────────────────────────────────────
 
@@ -336,6 +340,28 @@ struct AccumulatedEvidence {
     /// Raw responses of analysts whose structured extraction failed — never
     /// silently lost.
     raw_reports: Vec<String>,
+    /// Research-local weak/unconfirmed annotation links (never consensus).
+    weak: WeakLinks,
+}
+
+/// Research-local weak/unconfirmed annotation links — the "keep weak, clarify
+/// later" side structure. Claim ids are stable indices into
+/// [`AccumulatedEvidence::claims`] (claims are only appended or merged in
+/// place, never removed), so hints never go stale. Weakness lives ONLY here:
+/// it never leaks into claim notes, consensus markers, or verifier prompts.
+/// Resolution is the verification gate — verifier verdicts are the feedback
+/// loop; this run-local record is intentionally never written back, so the
+/// weak count reflects the run's history, not post-verification status.
+#[derive(Debug, Default)]
+struct WeakLinks {
+    /// Weak duplicate hints: standalone claim id → the suspected duplicate
+    /// target's id. Recorded even when the confirm model rejected the link —
+    /// fail-open: a possible relation is never silently dropped.
+    duplicates: Vec<(usize, usize)>,
+    /// Weak contradiction hints: new claim id → existing claim id. Both sides
+    /// still carry their contradiction notes (verification qualifies them);
+    /// the unconfirmed relation is recorded here.
+    contradictions: Vec<(usize, usize)>,
 }
 
 /// Per-claim verdict of the per-round annotation pass: is the new claim
@@ -358,6 +384,35 @@ struct ClaimAnnotation {
 #[serde(deny_unknown_fields)]
 struct AnnotationPass {
     annotations: Vec<ClaimAnnotation>,
+}
+
+/// Per-pair re-judgment of one mutating annotation link (duplicate /
+/// contradicts) from the optional confirm pass.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmLink {
+    /// 0-based index of the NEW claim within this round's pending claims.
+    /// Pair identity is pinned by the annotation pass — the model never
+    /// re-transcribes the existing id (the transcription-error class this
+    /// pass exists to catch).
+    new_id: usize,
+    /// "confirm" | "reject" — uncertainty maps to reject (weak/unconfirmed).
+    verdict: String,
+}
+
+/// The confirm pass over one round's mutating annotation links.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmPass {
+    links: Vec<ConfirmLink>,
+}
+
+/// Outcome of the optional confirm pass: per-pair verdicts, or the whole
+/// call failed (every mutating verdict is weak). Typed so the two states can
+/// never be conflated.
+enum ConfirmOutcome {
+    Passed(ConfirmPass),
+    Failed,
 }
 
 impl AccumulatedEvidence {
@@ -389,12 +444,30 @@ impl AccumulatedEvidence {
 
     /// Apply an annotation pass over a round's pending claims (the validator
     /// guarantees id completeness and in-range existing ids): novel claims
-    /// are appended, duplicates merge into the existing claim (sources joined
-    /// deduplicated, confidence upgraded, contradictions appended — never
-    /// dropped), and contradicting claims are appended AND linked to the
-    /// existing claim so the verification gate targets both sides. Returns
-    /// the number of novel claims (the saturation signal).
-    fn apply_annotations(&mut self, pass: &AnnotationPass, pending: &[Claim]) -> usize {
+    /// are appended, confirmed duplicates merge into the existing claim
+    /// (sources joined deduplicated, confidence upgraded, contradictions
+    /// appended — never dropped), and contradicting claims are appended AND
+    /// linked to the existing claim so the verification gate targets both
+    /// sides. Weak (unconfirmed) mutating verdicts never merge: a weak
+    /// duplicate stays standalone with a side hint and does NOT count as
+    /// novel; a weak contradiction keeps the bidirectional notes but records
+    /// the unconfirmed relation in the side structure. Returns the number of
+    /// novel claims (the saturation signal).
+    fn apply_annotations(
+        &mut self,
+        pass: &AnnotationPass,
+        pending: &[Claim],
+        confirm: &ConfirmOutcome,
+    ) -> usize {
+        let confirmed: HashSet<usize> = match confirm {
+            ConfirmOutcome::Passed(p) => p
+                .links
+                .iter()
+                .filter(|l| l.verdict == "confirm")
+                .map(|l| l.new_id)
+                .collect(),
+            ConfirmOutcome::Failed => HashSet::new(),
+        };
         let mut novel = 0usize;
         for a in &pass.annotations {
             let pending_claim = &pending[a.new_id];
@@ -406,27 +479,36 @@ impl AccumulatedEvidence {
                 "duplicate" => {
                     // Validator guarantees existing_id is Some and in range.
                     let existing_id = a.existing_id.expect("duplicate cites an existing claim");
-                    let existing = &mut self.claims[existing_id];
-                    existing.confidence =
-                        max_confidence(&existing.confidence, &pending_claim.confidence);
-                    for c in &pending_claim.contradictions {
-                        if !existing.contradictions.contains(c) {
-                            existing.contradictions.push(c.clone());
+                    if confirmed.contains(&a.new_id) {
+                        let existing = &mut self.claims[existing_id];
+                        existing.confidence =
+                            max_confidence(&existing.confidence, &pending_claim.confidence);
+                        for c in &pending_claim.contradictions {
+                            if !existing.contradictions.contains(c) {
+                                existing.contradictions.push(c.clone());
+                            }
                         }
-                    }
-                    let mut merged: Vec<String> = existing
-                        .source
-                        .split("; ")
-                        .filter(|s| !s.trim().is_empty())
-                        .map(|s| s.trim().to_string())
-                        .collect();
-                    for s in pending_claim.source.split("; ") {
-                        let s = s.trim();
-                        if !s.is_empty() && !merged.iter().any(|m| m == s) {
-                            merged.push(s.to_string());
+                        let mut merged: Vec<String> = existing
+                            .source
+                            .split("; ")
+                            .filter(|s| !s.trim().is_empty())
+                            .map(|s| s.trim().to_string())
+                            .collect();
+                        for s in pending_claim.source.split("; ") {
+                            let s = s.trim();
+                            if !s.is_empty() && !merged.iter().any(|m| m == s) {
+                                merged.push(s.to_string());
+                            }
                         }
+                        existing.source = merged.join("; ");
+                    } else {
+                        // Weak duplicate: never merged, never novel — the
+                        // pending claim stays standalone with a hint in the
+                        // side structure ("keep weak, clarify later").
+                        let id = self.claims.len();
+                        self.claims.push(pending_claim.clone());
+                        self.weak.duplicates.push((id, existing_id));
                     }
-                    existing.source = merged.join("; ");
                 }
                 "contradicts" => {
                     let existing_id = a.existing_id.expect("contradicts cites an existing claim");
@@ -444,8 +526,16 @@ impl AccumulatedEvidence {
                     {
                         new_claim.contradictions.push(existing.claim.clone());
                     }
+                    let id = self.claims.len();
                     self.claims.push(new_claim);
                     novel += 1;
+                    if !confirmed.contains(&a.new_id) {
+                        // Weak contradiction: same bidirectional notes (both
+                        // sides qualify for verification), the unconfirmed
+                        // relation marked in the side structure — never in
+                        // the note text.
+                        self.weak.contradictions.push((id, existing_id));
+                    }
                 }
                 _ => unreachable!("validator guarantees the verdict vocabulary"),
             }
@@ -1120,9 +1210,11 @@ async fn gap_rounds(
         let all_repeat_queries = round.queries > 0 && round.queries == round.repeat_queries;
         if (new_urls == 0 && novel_claims == 0) || all_repeat_queries {
             // Structural quiet-round signal: no new claims and no new sources.
-            // Answerability abstention stops the loop with an explicit marker;
-            // a non-abstain verdict continues — the analyst budget is the hard
-            // bound.
+            // A weak-duplicate-only round also lands here (weak duplicates
+            // append standalone claims but never count as novel) — the
+            // answerability check fires and the gap list is not refreshed,
+            // which is the intended premature-saturation protection: gap-round
+            // criteria, not reclassification, decide saturation.
             if let Some(reason) = check_answerability(ws, question, acc).await {
                 outcome.abstention = Some(reason);
                 outcome.unresolved = gap_items(gaps);
@@ -1145,15 +1237,18 @@ async fn gap_rounds(
 /// Per-round claim annotation pass: classify each pending claim against the
 /// existing accumulated claims via a single orchestrator extraction call.
 /// The validator guarantees id completeness and in-range existing ids
-/// (fail-closed inside the extraction retry loop).
+/// (fail-closed inside the extraction retry loop). Weak hints render in the
+/// existing-claims listing so later rounds see them (never silent).
 async fn annotate_claims(
     ws: &Workspace,
     existing: &[Claim],
+    weak: &WeakLinks,
     pending: &[Claim],
 ) -> Result<AnnotationPass> {
     let mut existing_claims = String::new();
     for (i, c) in existing.iter().enumerate() {
         let _ = writeln!(existing_claims, "{i}: {}", c.claim);
+        existing_claims.push_str(&render_weak_hints(weak, i));
     }
     let mut pending_claims = String::new();
     for (i, c) in pending.iter().enumerate() {
@@ -1241,10 +1336,82 @@ fn validate_annotations(
     Ok(())
 }
 
-/// Run the annotation pass over a round's pending claims and apply the
-/// results. Returns the number of novel claims (the saturation signal). On
-/// exhaustion every pending claim is treated as novel with an explicit
-/// marker — claims are never dropped.
+/// Confirm pass over a round's mutating annotation links (duplicate /
+/// contradicts pairs only): ONE lightweight orchestrator extraction
+/// re-judging each pair, between the annotation pass and applying its
+/// results. Fail-closed completeness — every mutating pair judged exactly
+/// once with the {confirm, reject} vocabulary; the caller maps a failed call
+/// to all-weak + marker (never all-novel fallback, never dropped claims).
+async fn confirm_links(
+    ws: &Workspace,
+    existing: &[Claim],
+    pending: &[Claim],
+    pass: &AnnotationPass,
+) -> Result<ConfirmPass> {
+    let mut links = String::new();
+    for a in pass.annotations.iter().filter(|a| a.verdict != "novel") {
+        let existing_id = a
+            .existing_id
+            .expect("mutating verdict cites an existing claim");
+        let p = &pending[a.new_id];
+        let e = &existing[existing_id];
+        let _ = writeln!(
+            links,
+            "- new claim {}: \"{}\" [{}] ↔ existing claim {}: \"{}\" (annotation: {})",
+            a.new_id, p.claim, p.confidence, existing_id, e.claim, a.verdict
+        );
+    }
+    let mut user = substitute(
+        &load_prompt("research/confirm.md"),
+        &[("{{links}}", &links)],
+    );
+    user.push_str("\n\n");
+    user.push_str(&load_prompt("extraction/confirm.md"));
+    // The validator captures the mutating new_ids (the validator type is
+    // `'static`) — pair identity is pinned by the annotation pass, the model
+    // never re-transcribes existing ids.
+    let mutating: Vec<usize> = pass
+        .annotations
+        .iter()
+        .filter(|a| a.verdict != "novel")
+        .map(|a| a.new_id)
+        .collect();
+    orchestrator_extract::<ConfirmPass>(
+        ws,
+        "confirm_links",
+        &user,
+        Some(&move |c| validate_confirm(c, &mutating)),
+    )
+    .await
+}
+
+/// Validate a confirm pass: exactly the mutating links judged, each exactly
+/// once (set equality on new_ids), verdicts in [confirm, reject]. Structural
+/// only, like the annotation validator.
+fn validate_confirm(pass: &ConfirmPass, mutating: &[usize]) -> Result<(), String> {
+    let mut ids: Vec<usize> = pass.links.iter().map(|l| l.new_id).collect();
+    ids.sort_unstable();
+    let mut expected = mutating.to_vec();
+    expected.sort_unstable();
+    if ids != expected {
+        return Err(format!(
+            "confirm pass must judge exactly the mutating links (new_ids {expected:?}), got {ids:?}"
+        ));
+    }
+    for l in &pass.links {
+        if !matches!(l.verdict.as_str(), "confirm" | "reject") {
+            return Err(format!("verdict '{}' not in [confirm, reject]", l.verdict));
+        }
+    }
+    Ok(())
+}
+
+/// Run the annotation pass over a round's pending claims, then the optional
+/// confirm pass over its mutating links, and apply the results. Returns the
+/// number of novel claims (the saturation signal). On annotation exhaustion
+/// every pending claim is treated as novel with an explicit marker — claims
+/// are never dropped. A failed confirm call degrades every mutating verdict
+/// to weak/unconfirmed with an explicit marker — never all-novel fallback.
 async fn annotate_round(
     ws: &Workspace,
     acc: &mut AccumulatedEvidence,
@@ -1262,15 +1429,30 @@ async fn annotate_round(
         acc.claims.extend(pending.iter().cloned());
         return pending.len();
     }
-    if let Ok(pass) = annotate_claims(ws, &acc.claims, pending).await {
-        acc.apply_annotations(&pass, pending)
-    } else {
+    let Ok(pass) = annotate_claims(ws, &acc.claims, &acc.weak, pending).await else {
         acc.claims.extend(pending.iter().cloned());
         if !markers.iter().any(|m| m == CLAIM_ANNOTATION_FAILED) {
             markers.push(CLAIM_ANNOTATION_FAILED.to_string());
         }
-        pending.len()
-    }
+        return pending.len();
+    };
+    // Confirm pass over the mutating links only (one call per round). No
+    // mutating links → empty outcome, every verdict applies as-is.
+    let confirm = if pass.annotations.iter().any(|a| a.verdict != "novel") {
+        if let Ok(c) = confirm_links(ws, &acc.claims, pending, &pass).await {
+            ConfirmOutcome::Passed(c)
+        } else {
+            // Fail-open: every mutating verdict becomes weak/unconfirmed
+            // (never all-novel fallback, never dropped claims).
+            if !markers.iter().any(|m| m == CONFIRM_FAILED) {
+                markers.push(CONFIRM_FAILED.to_string());
+            }
+            ConfirmOutcome::Failed
+        }
+    } else {
+        ConfirmOutcome::Passed(ConfirmPass::default())
+    };
+    acc.apply_annotations(&pass, pending, &confirm)
 }
 
 /// After a structural quiet round (no new claims, no new sources): is the
@@ -1451,11 +1633,48 @@ async fn synthesize(
     }
 }
 
+/// Build the verification target list: primary targets (contradiction notes
+/// or low confidence) first, then weak-duplicate claims not already primary —
+/// filling only empty slots, never displacing higher-priority targets, never
+/// double-dispatching a claim that qualifies both ways (weak-contradiction
+/// claims are never appended here: they already carry notes and qualify via
+/// the primary filter). Returns `(targets, primary_count)` so the caller can
+/// bound the unresolved filler to primary targets only.
+fn verification_targets(acc: &AccumulatedEvidence) -> (Vec<VerificationTarget>, usize) {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+    for (i, c) in acc.claims.iter().enumerate() {
+        if !c.contradictions.is_empty() || c.confidence == "low" {
+            seen.insert(i);
+            targets.push(VerificationTarget::new(
+                &c.claim,
+                &c.source,
+                &c.contradictions.join("; "),
+            ));
+        }
+    }
+    let primary_count = targets.len();
+    // Weak duplicates fill only empty slots — appended AFTER primaries with a
+    // hint-free target (weakness never leaks toward verifiers). The verify
+    // schema has no "duplicate" verdict, so the verifier judges the standalone
+    // claim's truth and the duplicate-vs-novel ambiguity resolves indirectly:
+    // the claim stays visible as its own evidence entry, and the fresh
+    // analyst's web tools can surface the relation.
+    for &(claim_id, _) in &acc.weak.duplicates {
+        if seen.insert(claim_id) {
+            let c = &acc.claims[claim_id];
+            targets.push(VerificationTarget::new(&c.claim, &c.source, ""));
+        }
+    }
+    (targets, primary_count)
+}
+
 /// Verification gate: fresh analysts verify the disputed / low-confidence
-/// accumulated claims (budgeted, bounded). Anything still disputed stays
-/// marked unresolved in the final report. Verifier tool calls / searches /
-/// queries count toward the run summary and register in the query ledger
-/// (later rounds must not re-ask them) — repeats here inflate the summary's
+/// accumulated claims (budgeted, bounded), plus any weak-duplicate claims
+/// filling empty verifier slots. Anything still disputed stays marked
+/// unresolved in the final report. Verifier tool calls / searches / queries
+/// count toward the run summary and register in the query ledger (later
+/// rounds must not re-ask them) — repeats here inflate the summary's
 /// repeat-queries line but never the per-round saturation signal
 /// (`EvidenceRound::repeat_queries` is untouched).
 async fn research_verification_pass(
@@ -1465,12 +1684,7 @@ async fn research_verification_pass(
     ledger: &mut QueryLedger,
     run_stats: &mut RunStats,
 ) -> Vec<VerificationResult> {
-    let targets: Vec<VerificationTarget> = acc
-        .claims
-        .iter()
-        .filter(|c| !c.contradictions.is_empty() || c.confidence == "low")
-        .map(|c| VerificationTarget::new(&c.claim, &c.source, &c.contradictions.join("; ")))
-        .collect();
+    let (targets, primary_count) = verification_targets(acc);
     if targets.is_empty() {
         return Vec::new();
     }
@@ -1496,9 +1710,15 @@ async fn research_verification_pass(
             }
         }
     }
-    // Targets beyond the verified set are explicitly marked unresolved —
-    // never silently skipped.
-    for t in targets.iter().skip(results.len()) {
+    // Primary targets beyond the verified set are explicitly marked
+    // unresolved — never silently skipped. Appended weak-duplicate targets
+    // that did not fit are not (they fill only empty slots; their weak state
+    // stays visible in the evidence view and run summary).
+    for t in targets
+        .iter()
+        .skip(results.len())
+        .take(primary_count.saturating_sub(results.len()))
+    {
         results.push(VerificationResult {
             claim: t.claim.clone(),
             verdict: "unresolved".to_string(),
@@ -1512,6 +1732,31 @@ async fn research_verification_pass(
 }
 
 // ── Rendering ────────────────────────────────────────────────────────────
+
+/// Render the weak/unconfirmed hints involving claim `id` (one indented line
+/// per hint, empty when none). Shared by the accumulated-evidence view, the
+/// annotate listing, and the partial report — weakness is per-claim visible
+/// and never silent.
+fn render_weak_hints(weak: &WeakLinks, id: usize) -> String {
+    let mut out = String::new();
+    for &(claim, target) in &weak.duplicates {
+        if claim == id {
+            let _ = writeln!(
+                out,
+                "   weak: possibly duplicate of #{target} (unconfirmed)"
+            );
+        }
+    }
+    for &(claim, target) in &weak.contradictions {
+        if claim == id {
+            let _ = writeln!(out, "   weak: possibly contradicts #{target} (unconfirmed)");
+        }
+        if target == id {
+            let _ = writeln!(out, "   weak: possibly contradicts #{claim} (unconfirmed)");
+        }
+    }
+    out
+}
 
 /// Render the accumulated evidence as a compact numbered list for the
 /// orchestrator prompts, plus analysts' self-reported unanswered aspects.
@@ -1533,6 +1778,7 @@ fn render_accumulated_evidence(acc: &AccumulatedEvidence) -> String {
         if !c.contradictions.is_empty() {
             let _ = writeln!(out, "   contradictions: {}", c.contradictions.join("; "));
         }
+        out.push_str(&render_weak_hints(&acc.weak, i));
     }
     if !acc.unanswered.is_empty() {
         let _ = writeln!(out, "\nAnalysts reported these as still unanswered:");
@@ -1601,6 +1847,10 @@ fn render_run_summary(
         acc.claims.len(),
         acc.urls.len()
     );
+    let weak_links = acc.weak.duplicates.len() + acc.weak.contradictions.len();
+    if weak_links > 0 {
+        let _ = writeln!(out, "- weak/unconfirmed links: {weak_links}");
+    }
     if let Some(a) = abstention {
         let _ = writeln!(out, "- answerability: QUESTION ABSTAINED — {a}");
     }
@@ -1625,7 +1875,7 @@ fn partial_report(question: &str, acc: &AccumulatedEvidence, reason: &str) -> St
     if acc.claims.is_empty() {
         let _ = writeln!(out, "- none");
     } else {
-        for c in &acc.claims {
+        for (i, c) in acc.claims.iter().enumerate() {
             let source = if c.source.is_empty() {
                 "n/a"
             } else {
@@ -1633,10 +1883,11 @@ fn partial_report(question: &str, acc: &AccumulatedEvidence, reason: &str) -> St
             };
             let _ = writeln!(
                 out,
-                "- [{}] {} — source: {source}",
+                "- {i}. [{}] {} — source: {source}",
                 c.confidence,
                 escape_fences(&c.claim),
             );
+            out.push_str(&render_weak_hints(&acc.weak, i));
         }
     }
     if !acc.unanswered.is_empty() {
@@ -2140,7 +2391,13 @@ mod tests {
                 contradiction: Some("price differs: $200 vs $100".into()),
             }],
         };
-        let novel = acc.apply_annotations(&pass, &pending);
+        let confirm = ConfirmOutcome::Passed(ConfirmPass {
+            links: vec![ConfirmLink {
+                new_id: 0,
+                verdict: "confirm".into(),
+            }],
+        });
+        let novel = acc.apply_annotations(&pass, &pending, &confirm);
         assert_eq!(novel, 1, "a contradicting claim is new evidence");
         assert_eq!(
             acc.claims.len(),
@@ -2186,7 +2443,13 @@ mod tests {
                 contradiction: None,
             }],
         };
-        let novel = acc.apply_annotations(&pass, &pending);
+        let confirm = ConfirmOutcome::Passed(ConfirmPass {
+            links: vec![ConfirmLink {
+                new_id: 0,
+                verdict: "confirm".into(),
+            }],
+        });
+        let novel = acc.apply_annotations(&pass, &pending, &confirm);
         assert_eq!(novel, 0, "a duplicate is never counted as novel");
         assert_eq!(
             acc.claims.len(),
@@ -2201,6 +2464,235 @@ mod tests {
         assert_eq!(
             c.source, "u1; u2; u3",
             "sources merge across rounds without duplicates"
+        );
+    }
+
+    #[test]
+    fn test_apply_annotations_weak_duplicate_stays_standalone() {
+        // A weak duplicate (confirm pass rejected / unclear / failed) is never
+        // merged and never counts as novel: it stays standalone with a hint in
+        // the side structure — "keep weak, clarify later".
+        let mut acc = AccumulatedEvidence::default();
+        acc.claims.push(Claim {
+            claim: "alpha is true".into(),
+            source: "u1".into(),
+            confidence: "medium".into(),
+            contradictions: vec![],
+        });
+        let pending = vec![Claim {
+            claim: "alpha is true (restated)".into(),
+            source: "u2".into(),
+            confidence: "high".into(),
+            contradictions: vec![],
+        }];
+        let pass = AnnotationPass {
+            annotations: vec![ClaimAnnotation {
+                new_id: 0,
+                verdict: "duplicate".into(),
+                existing_id: Some(0),
+                contradiction: None,
+            }],
+        };
+        let confirm = ConfirmOutcome::Passed(ConfirmPass {
+            links: vec![ConfirmLink {
+                new_id: 0,
+                verdict: "reject".into(),
+            }],
+        });
+        let novel = acc.apply_annotations(&pass, &pending, &confirm);
+        assert_eq!(novel, 0, "a weak duplicate is never counted as novel");
+        assert_eq!(
+            acc.claims.len(),
+            2,
+            "the weak duplicate stays standalone — never merged"
+        );
+        assert_eq!(
+            acc.weak.duplicates,
+            vec![(1, 0)],
+            "the suspected relation is recorded in the side structure"
+        );
+        assert!(
+            acc.weak.contradictions.is_empty(),
+            "only duplicate hints apply here"
+        );
+    }
+
+    #[test]
+    fn test_apply_annotations_weak_contradiction_keeps_notes_marks_unconfirmed() {
+        // A weak contradiction keeps the bidirectional notes (both sides
+        // qualify for the verification gate) but records the unconfirmed
+        // relation in the side structure — never in the note text.
+        let mut acc = AccumulatedEvidence::default();
+        acc.claims.push(Claim {
+            claim: "alpha costs $100 in 2024".into(),
+            source: "u1".into(),
+            confidence: "medium".into(),
+            contradictions: vec![],
+        });
+        let pending = vec![Claim {
+            claim: "alpha costs $200 in 2024".into(),
+            source: "u2".into(),
+            confidence: "high".into(),
+            contradictions: vec![],
+        }];
+        let pass = AnnotationPass {
+            annotations: vec![ClaimAnnotation {
+                new_id: 0,
+                verdict: "contradicts".into(),
+                existing_id: Some(0),
+                contradiction: Some("price differs: $200 vs $100".into()),
+            }],
+        };
+        let confirm = ConfirmOutcome::Passed(ConfirmPass {
+            links: vec![ConfirmLink {
+                new_id: 0,
+                verdict: "reject".into(),
+            }],
+        });
+        let novel = acc.apply_annotations(&pass, &pending, &confirm);
+        assert_eq!(novel, 1, "a contradiction is new evidence even when weak");
+        assert_eq!(
+            acc.claims[0].contradictions,
+            vec!["price differs: $200 vs $100"],
+            "the existing claim keeps its contradiction note"
+        );
+        assert!(
+            acc.claims[1]
+                .contradictions
+                .contains(&"alpha costs $100 in 2024".to_string()),
+            "the new claim links back to the existing one"
+        );
+        assert_eq!(
+            acc.weak.contradictions,
+            vec![(1, 0)],
+            "the unconfirmed relation lives in the side structure"
+        );
+        assert!(
+            acc.claims
+                .iter()
+                .all(|c| c.contradictions.iter().all(|n| !n.contains("unconfirmed"))),
+            "weakness never leaks into note text"
+        );
+    }
+
+    #[test]
+    fn test_verification_targets_primaries_first_weak_dups_fill_empty_slots() {
+        let mut acc = AccumulatedEvidence::default();
+        acc.claims.push(Claim {
+            claim: "a".into(),
+            source: "u1".into(),
+            confidence: "low".into(),
+            contradictions: vec![],
+        });
+        acc.claims.push(Claim {
+            claim: "b".into(),
+            source: "u2".into(),
+            confidence: "high".into(),
+            contradictions: vec!["b vs c".into()],
+        });
+        // Weak duplicate of claim 0 — appended after primaries.
+        acc.claims.push(Claim {
+            claim: "a restated".into(),
+            source: "u3".into(),
+            confidence: "high".into(),
+            contradictions: vec![],
+        });
+        // Weak duplicate of claim 1 that is ALSO low confidence — already
+        // primary, must not be double-appended.
+        acc.claims.push(Claim {
+            claim: "b restated".into(),
+            source: "u4".into(),
+            confidence: "low".into(),
+            contradictions: vec![],
+        });
+        acc.weak.duplicates.push((2, 0));
+        acc.weak.duplicates.push((3, 1));
+        // A weak contradiction must NEVER be appended from the side structure
+        // — it already carries notes and qualifies via the primary filter.
+        acc.weak.contradictions.push((1, 2));
+        let (targets, primary_count) = verification_targets(&acc);
+        assert_eq!(
+            primary_count, 3,
+            "claims 0, 1 and 3 qualify as primary — the weak contradiction is not appended"
+        );
+        assert_eq!(targets.len(), 4, "claim 2 fills the only empty slot");
+        assert_eq!(targets[0].claim, "a");
+        assert_eq!(targets[1].claim, "b");
+        assert_eq!(targets[2].claim, "b restated", "primary targets come first");
+        assert_eq!(
+            targets[3].claim, "a restated",
+            "weak duplicate appended last"
+        );
+        assert_eq!(
+            targets[3].contradictions, "",
+            "weakness never leaks toward verifiers"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn test_annotate_round_confirm_failure_fail_open() {
+        // End-to-end fail-open: the annotation pass succeeds, the confirm pass
+        // fails entirely (transport) — every mutating verdict becomes weak
+        // with the CONFIRM_FAILED marker; claims are never dropped, never
+        // all-novel fallback.
+        let _lock = crate::util::test::retry_tests_lock();
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let ws = crate::workspace::test_ws("/tmp/test_ws");
+        let mut acc = AccumulatedEvidence::default();
+        acc.claims.push(Claim {
+            claim: "alpha is true".into(),
+            source: "u1".into(),
+            confidence: "medium".into(),
+            contradictions: vec![],
+        });
+        let pending = vec![
+            Claim {
+                claim: "alpha is true (restated)".into(),
+                source: "u2".into(),
+                confidence: "high".into(),
+                contradictions: vec![],
+            },
+            Claim {
+                claim: "beta contradicts alpha".into(),
+                source: "u3".into(),
+                confidence: "high".into(),
+                contradictions: vec![],
+            },
+        ];
+        // Script: annotation pass OK (pending 0 = duplicate, pending 1 =
+        // contradicts), then the confirm pass hits only transport failures.
+        let annotation_json = r#"{"annotations": [{"new_id": 0, "verdict": "duplicate", "existing_id": 0}, {"new_id": 1, "verdict": "contradicts", "existing_id": 0, "contradiction": "alpha vs beta differ"}]}"#;
+        let fake = crate::util::test::FakeProvider::new()
+            .ok(annotation_json)
+            .err(crate::retry::FailureClass::Transport, "confirm outage")
+            .err(crate::retry::FailureClass::Transport, "confirm outage")
+            .err(crate::retry::FailureClass::Transport, "confirm outage");
+        let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
+        let _provider_guard = crate::util::test::install_fake_provider(provider);
+        let mut markers = Vec::new();
+        let novel = annotate_round(&ws, &mut acc, &pending, &mut markers).await;
+        assert_eq!(
+            novel, 1,
+            "only the weak contradiction counts as novel — the weak duplicate never does"
+        );
+        assert_eq!(
+            acc.claims.len(),
+            3,
+            "both mutating claims stay standalone — never dropped"
+        );
+        assert_eq!(acc.weak.duplicates, vec![(1, 0)]);
+        assert_eq!(acc.weak.contradictions, vec![(2, 0)]);
+        assert!(
+            acc.claims[0]
+                .contradictions
+                .contains(&"alpha vs beta differ".to_string()),
+            "the weak contradiction keeps its note — verification still qualifies it"
+        );
+        assert!(
+            markers.iter().any(|m| m.contains("confirmation failed")),
+            "the confirm failure is never silent: {markers:?}"
         );
     }
 }
