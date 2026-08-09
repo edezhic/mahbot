@@ -2179,7 +2179,7 @@ mod tests {
 
     impl Drop for TtsLangGuard {
         fn drop(&mut self) {
-            CONFIG.set_string_field("tts_language", &self.saved);
+            let _ = CONFIG.set_string_field("tts_language", &self.saved);
         }
     }
 

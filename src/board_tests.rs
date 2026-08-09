@@ -2450,7 +2450,6 @@ async fn test_search_active_by_fts_finds_matching_title() {
 #[tokio::test]
 async fn test_search_active_by_fts_excludes_archived() {
     let (store, _tmp) = open_test_store().await;
-    let ws = test_ws("ws_active2");
     // Create an archived ticket — should not appear in active search
     create_archived_ticket(&store, "Still searching", "ws_active2").await;
 
@@ -2466,7 +2465,7 @@ async fn test_search_active_by_fts_scoped_to_workspace() {
     let (store, _tmp) = open_test_store().await;
     // Use test_ws (same as passing test_search_active_by_fts_finds_matching_title)
     let ws_a = test_ws("ws_scope_a");
-    let id_a = make_ticket(
+    make_ticket(
         &store,
         &ws_a,
         "Fix network timeout bug",

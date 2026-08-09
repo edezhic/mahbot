@@ -1651,7 +1651,7 @@ mod tests {
 
         // Cursor movement (non-edit action) must be passed to perform().
         // After a Click, the cursor position should reflect the click.
-        state.update(BoardMessage::CommentInputChanged(
+        let _ = state.update(BoardMessage::CommentInputChanged(
             text_editor::Action::Click(Point { x: 0.0, y: 0.0 }),
         ));
         // perform() was called — the editor state accepted the action
@@ -1676,7 +1676,7 @@ mod tests {
         // This is a behavioral contract — we can't easily assert the internal
         // conversion happened, but we can verify no crash and that the editor
         // state was updated.
-        state.update(BoardMessage::CommentInputChanged(
+        let _ = state.update(BoardMessage::CommentInputChanged(
             text_editor::Action::Click(Point { x: 0.0, y: 0.0 }),
         ));
         assert!(
@@ -1694,7 +1694,7 @@ mod tests {
         // No modifier — Click should remain as Click
         state.modifiers = keyboard::Modifiers::empty();
 
-        state.update(BoardMessage::CommentInputChanged(
+        let _ = state.update(BoardMessage::CommentInputChanged(
             text_editor::Action::Click(Point { x: 0.0, y: 0.0 }),
         ));
         // No crash — content unchanged.
@@ -1708,12 +1708,12 @@ mod tests {
         let mut state = make_board_state();
         assert_eq!(state.modifiers, keyboard::Modifiers::empty());
 
-        state.update(BoardMessage::CommentModifiersChanged(
+        let _ = state.update(BoardMessage::CommentModifiersChanged(
             keyboard::Modifiers::SHIFT,
         ));
         assert_eq!(state.modifiers, keyboard::Modifiers::SHIFT);
 
-        state.update(BoardMessage::CommentModifiersChanged(
+        let _ = state.update(BoardMessage::CommentModifiersChanged(
             keyboard::Modifiers::CTRL,
         ));
         assert_eq!(state.modifiers, keyboard::Modifiers::CTRL);

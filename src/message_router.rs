@@ -973,9 +973,7 @@ mod tests {
     async fn test_resolve_workspace_found() {
         crate::util::test::init_management_test_stores().await;
 
-        let ws =
-            crate::util::test::create_test_workspace("/tmp/test_resolve_ws", "test_resolve_ws")
-                .await;
+        crate::util::test::create_test_workspace("/tmp/test_resolve_ws", "test_resolve_ws").await;
 
         let result = resolve_workspace("test_resolve_ws").await;
         let resolved = result.expect("resolve should succeed for DB workspace");
