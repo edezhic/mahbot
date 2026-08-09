@@ -273,34 +273,6 @@ impl LogStore {
         Ok(())
     }
 
-    /// Build the data query with LIKE-based search using bind params.
-    fn build_query(filters: &LogQuery) -> (String, Vec<Value>) {
-        let (where_sql, mut values) = build_where_clause(filters);
-
-        let limit: i64 = i64::try_from(filters.limit.unwrap_or(100).min(1000))
-            .expect("log query limit overflowed i64; limit must be <= i64::MAX");
-        let offset: i64 = i64::try_from(filters.offset.unwrap_or(0))
-            .expect("log query offset overflowed i64; offset must be <= i64::MAX");
-        values.push(Value::Integer(limit));
-        values.push(Value::Integer(offset));
-
-        let sql = format!(
-            "SELECT {LOGS_COLUMNS} FROM logs {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?",
-        );
-
-        (sql, values)
-    }
-
-    /// Count matching rows.
-    async fn count_matching(&self, filters: &LogQuery) -> Result<usize, ::turso::Error> {
-        let (where_sql, values) = build_where_clause(filters);
-        let sql = format!("SELECT COUNT(*) FROM logs {where_sql}");
-        self.conn
-            .query_row(&sql, values, |row| row.get::<i64>(0))
-            .await
-            .map(|n| usize::try_from(n).unwrap_or(0))
-    }
-
     /// Delete log entries matching a given `level` whose `timestamp` is older than the given
     /// RFC 3339 `cutoff`. Returns the number of deleted rows.
     pub async fn delete_older_than(&self, level: &str, cutoff: &str) -> anyhow::Result<u64> {
@@ -361,12 +333,29 @@ impl LogStore {
     /// Returns `(entries, total_count)` where `entries` respects pagination
     /// and `total_count` is the total number of entries matching the same filters.
     pub async fn query(&self, filters: &LogQuery) -> anyhow::Result<(Vec<LogEntry>, usize)> {
-        let total = self.count_matching(filters).await?;
+        let (where_sql, values) = build_where_clause(filters);
+
+        let count_sql = format!("SELECT COUNT(*) FROM logs {where_sql}");
+        let total = self
+            .conn
+            .query_row(&count_sql, values.clone(), |row| row.get::<i64>(0))
+            .await
+            .map(|n| usize::try_from(n).unwrap_or(0))?;
         if total == 0 {
             return Ok((vec![], 0));
         }
 
-        let (data_sql, data_values) = Self::build_query(filters);
+        let limit: i64 = i64::try_from(filters.limit.unwrap_or(100).min(1000))
+            .expect("log query limit overflowed i64; limit must be <= i64::MAX");
+        let offset: i64 = i64::try_from(filters.offset.unwrap_or(0))
+            .expect("log query offset overflowed i64; offset must be <= i64::MAX");
+        let mut data_values = values;
+        data_values.push(Value::Integer(limit));
+        data_values.push(Value::Integer(offset));
+
+        let data_sql = format!(
+            "SELECT {LOGS_COLUMNS} FROM logs {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?",
+        );
         let rows = self
             .conn
             .query(&data_sql, data_values)
@@ -941,8 +930,16 @@ pub struct LogWriteErrorInfo {
 /// observe a consistent triple — a torn pair (timestamp from one failure with
 /// the message from the next) would be misleading on the observability
 /// surface.
-static LOG_WRITE_LAST_ERROR: std::sync::Mutex<Option<LogWriteErrorInfo>> =
-    std::sync::Mutex::new(None);
+static LOG_WRITE_LAST_ERROR: std::sync::Mutex<LogWriteErrorInfo> =
+    std::sync::Mutex::new(LogWriteErrorInfo {
+        count: 0,
+        last_timestamp: None,
+        last_message: None,
+        panic_state: LogWriterPanicState {
+            consecutive_panics: 0,
+            writer_stopped: false,
+        },
+    });
 
 /// Unix millis of the last stderr warning (rate limiter).
 static LOG_WRITE_LAST_STDERR_WARN_MS: AtomicU64 = AtomicU64::new(0);
@@ -954,11 +951,7 @@ static LOG_WRITE_LAST_STDERR_WARN_MS: AtomicU64 = AtomicU64::new(0);
 /// (no tracing involved), including from inside the writer task itself.
 #[must_use]
 pub fn log_write_error_info() -> LogWriteErrorInfo {
-    LOG_WRITE_LAST_ERROR
-        .lock()
-        .unwrap_poison()
-        .clone()
-        .unwrap_or_default()
+    LOG_WRITE_LAST_ERROR.lock().unwrap_poison().clone()
 }
 
 /// Record a failed log-batch insert on the observability surface.
@@ -1005,16 +998,15 @@ impl LogFailureKind {
 fn record_log_write_failure_impl(message: &str, kind: LogFailureKind) -> u32 {
     let (count, consecutive) = {
         let mut guard = LOG_WRITE_LAST_ERROR.lock().unwrap_poison();
-        let entry = guard.get_or_insert(LogWriteErrorInfo::default());
-        entry.count += 1;
-        entry.last_timestamp = Some(turso::now());
-        entry.last_message = Some(message.to_string());
+        guard.count += 1;
+        guard.last_timestamp = Some(turso::now());
+        guard.last_message = Some(message.to_string());
         let consecutive = if kind.records_panic() {
-            entry.panic_state.record_panic()
+            guard.panic_state.record_panic()
         } else {
-            entry.panic_state.consecutive_panics
+            guard.panic_state.consecutive_panics
         };
-        (entry.count, consecutive)
+        (guard.count, consecutive)
     };
     emit_stderr_warning(count, message, kind.label());
     consecutive
@@ -1024,9 +1016,7 @@ fn record_log_write_failure_impl(message: &str, kind: LogFailureKind) -> u32 {
 /// successful flush.
 fn reset_log_writer_panic_state() {
     let mut guard = LOG_WRITE_LAST_ERROR.lock().unwrap_poison();
-    if let Some(entry) = guard.as_mut() {
-        entry.panic_state.reset();
-    }
+    guard.panic_state.reset();
 }
 
 /// True once the writer has permanently stopped flushing (terminal banner).
@@ -1034,8 +1024,8 @@ fn log_writer_stopped() -> bool {
     LOG_WRITE_LAST_ERROR
         .lock()
         .unwrap_poison()
-        .as_ref()
-        .is_some_and(|e| e.panic_state.writer_stopped)
+        .panic_state
+        .writer_stopped
 }
 
 /// Backoff after the `n`-th consecutive storage panic: 500ms, 1s, 2s, … capped
