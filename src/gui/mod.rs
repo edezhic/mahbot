@@ -1905,16 +1905,15 @@ fn page_icon(page: Page, size: u32, color: Color) -> Element<'static, Message> {
 }
 
 /// Shared sidebar toggle wrapper — wraps an icon inside a centered,
-/// full-width button with a tooltip appearing above it.
+/// full-width button with a tooltip at the given `position`.
 ///
-/// Used by [`Dashboard::render_maintainer_toggle`] and
-/// [`Dashboard::render_pause_toggle`].
-/// Does **not** handle [`Dashboard::render_sidebar_nav`] which uses
-/// [`tooltip::Position::Right`] instead of [`tooltip::Position::Top`].
+/// Used by [`Dashboard::render_maintainer_toggle`],
+/// [`Dashboard::render_pause_toggle`] and [`Dashboard::render_sidebar_nav`].
 fn render_sidebar_toggle<'a>(
     icon: Element<'a, Message>,
-    tooltip_text: &'a str,
+    tooltip_text: impl text::IntoFragment<'a>,
     action: Option<Message>,
+    position: tooltip::Position,
 ) -> Element<'a, Message> {
     tooltip(
         button(
@@ -1928,7 +1927,7 @@ fn render_sidebar_toggle<'a>(
         .style(theme::button_text)
         .on_press_maybe(action),
         text(tooltip_text).size(11),
-        tooltip::Position::Top,
+        position,
     )
     .style(theme::tooltip_style)
     .into()
@@ -1954,10 +1953,8 @@ impl Dashboard {
 
     /// Sidebar navigation icons: Home, Editor, Shell (28px).
     ///
-    /// Nav buttons use position::Position::Right to avoid clipping off the left
-    /// edge of the 56px-wide sidebar container — Position::Top would overflow
-    /// the narrow column. The adjacent toggle buttons below use Position::Top
-    /// because they have more vertical room before reaching the sidebar top edge.
+    /// Uses Position::Right — iced snaps Top tooltips into the viewport,
+    /// overlapping the topmost sidebar button.
     fn render_sidebar_nav(&self) -> Element<'_, Message> {
         let mut col = Column::new().spacing(2);
         for page in Page::sidebar_pages() {
@@ -1975,28 +1972,21 @@ impl Dashboard {
             } else {
                 theme::TEXT_MUTED
             };
-            let icon: iced::Element<'_, Message> = page_icon(*page, 28, color);
-            let btn = button(
-                container(icon)
-                    .width(Length::Fill)
-                    .center_x(Length::Fill)
-                    .padding([4, 0]),
-            )
-            .width(Length::Fill)
-            .padding(0)
-            .style(theme::button_text)
-            .on_press_maybe(if disabled {
-                None
-            } else {
-                Some(Message::Navigation(*page))
-            });
             let tooltip_text = if disabled {
                 format!("Select a workspace to access {}", page.label())
             } else {
                 page.label().to_string()
             };
-            let nav_btn = tooltip(btn, text(tooltip_text).size(11), tooltip::Position::Right)
-                .style(theme::tooltip_style);
+            let nav_btn = render_sidebar_toggle(
+                page_icon(*page, 28, color),
+                tooltip_text,
+                if disabled {
+                    None
+                } else {
+                    Some(Message::Navigation(*page))
+                },
+                tooltip::Position::Right,
+            );
             col = col.push(nav_btn);
         }
         col.into()
@@ -2037,6 +2027,7 @@ impl Dashboard {
             } else {
                 None
             },
+            tooltip::Position::Top,
         )
     }
 
@@ -2072,6 +2063,7 @@ impl Dashboard {
             } else {
                 None
             },
+            tooltip::Position::Top,
         )
     }
 
