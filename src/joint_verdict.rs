@@ -31,8 +31,8 @@ use crate::{ChatMessage, ChatRequest, ChatRequestMeta, Role, Workspace};
 pub(crate) const DEFAULT_REVIEW_COUNT_LOW_CHURN: u64 = 50;
 pub(crate) const DEFAULT_REVIEW_COUNT_HIGH_CHURN: u64 = 400;
 
-/// Maximum tolerated bounces before the ticket fails (the 6th bounce fails).
-pub(crate) const MAX_BOUNCES: usize = 5;
+/// Maximum tolerated bounces before the ticket fails (the 9th bounce fails).
+pub(crate) const MAX_BOUNCES: usize = 8;
 
 // ── Round data ─────────────────────────────────────────────────────────
 

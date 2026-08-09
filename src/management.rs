@@ -2224,7 +2224,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 //     of outcome (fail-open; the joint comment gives the Manager depth).
 //     Reviewers/QA have a 3-way outcome: all-failed -> Failed,
 //     any-failed -> bounce back to development (bounce counter bumped,
-//     6th bounce fails), all-pass -> success phase.
+//     9th bounce fails), all-pass -> success phase.
 //   * Signature — analysts need only `&Ticket` and `&[ParallelVerdict]`;
 //     reviewers/QA need the `VerifierInfo` struct to drive the 3-way
 //     transition (success phase, active phase, role label). This structural
@@ -3039,7 +3039,7 @@ async fn process_verifier_verdicts(
     // Persist per-agent verdict scores (shadow instrumentation, best-effort).
     persist_verdict_scores(ticket, stage_name(verifier.role), results).await;
 
-    // Bounce-based circuit breaker: the 6th bounce fails the ticket. The
+    // Bounce-based circuit breaker: the 9th bounce fails the ticket. The
     // counter is incremented atomically with the bounce-back transition.
     let mut bounce_trip = false;
     // Determine transition parameters based on the three-way branch:
@@ -3113,7 +3113,7 @@ async fn process_verifier_verdicts(
 
     let bounce_breaker_comment = bounce_trip.then(|| {
         let max = crate::joint_verdict::MAX_BOUNCES;
-        // The ticket bounced `max` times and this failed round is the 6th —
+        // The ticket bounced `max` times and this failed round is the 9th —
         // the message counts actual bounces, not rounds.
         format!(
             "Failed after {max} bounces — ticket bounced back from review/QA too many \

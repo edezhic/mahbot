@@ -7,14 +7,14 @@ use crate::util::test::{
 };
 use crate::workspace::test_ws_named;
 
-/// The bounce-based breaker allows exactly [`MAX_BOUNCES`] bounces — the 6th
+/// The bounce-based breaker allows exactly [`MAX_BOUNCES`] bounces — the 9th
 /// bounce fails the ticket. The comment-based breakers (Sanitation,
 /// Diagnostics) must trip before the bounce budget so repeated agent
 /// failures never ride on the bounce budget.
 #[test]
-fn bounce_breaker_max_is_five_and_comment_breakers_trip_before() {
+fn bounce_breaker_max_is_eight_and_comment_breakers_trip_before() {
     let bounce_max = crate::joint_verdict::MAX_BOUNCES;
-    assert_eq!(bounce_max, 5, "MAX_BOUNCES must be 5");
+    assert_eq!(bounce_max, 8, "MAX_BOUNCES must be 8");
     for kind in [
         CircuitBreakerKind::Sanitation,
         CircuitBreakerKind::Diagnostics,
@@ -536,7 +536,7 @@ async fn install_synthesis_test_seams(
 /// - Any failed → bounce-back to ReadyForDevelopment with pipeline
 ///   reservation, a single joint comment (role = stage name), and a bumped
 ///   bounce counter
-/// - The 6th bounce → Failed (bounce circuit breaker)
+/// - The 9th bounce → Failed (bounce circuit breaker)
 /// - All passed (Reviewer) → Reviewed with a joint comment
 /// - All passed (QA) → QaPassed with a joint comment
 #[tokio::test]
@@ -684,13 +684,13 @@ async fn process_verifier_verdicts_cases() {
 /// fails on the next failed round instead of bouncing again.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
-async fn sixth_bounce_fails_ticket() {
+async fn ninth_bounce_fails_ticket() {
     init_management_test_stores().await;
     let (_lock, _policy_guard, _provider_guard) =
         install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
 
-    let ws = test_ws_named("/tmp/test", "sixth_bounce");
-    let ticket_id = make_ticket(board(), &ws, "Sixth Bounce", TicketPhase::InReview).await;
+    let ws = test_ws_named("/tmp/test", "ninth_bounce");
+    let ticket_id = make_ticket(board(), &ws, "Ninth Bounce", TicketPhase::InReview).await;
     board()
         .conn
         .execute(
@@ -710,14 +710,14 @@ async fn sixth_bounce_fails_ticket() {
     .await;
     assert!(
         transitioned,
-        "6th-bounce round should transition the ticket"
+        "9th-bounce round should transition the ticket"
     );
 
     let ticket = expect_ticket(board(), &ticket_id).await;
     assert_eq!(
         ticket.phase,
         TicketPhase::Failed,
-        "6th bounce must fail the ticket"
+        "9th bounce must fail the ticket"
     );
     assert_eq!(
         ticket.bounce_count,

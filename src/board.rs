@@ -291,7 +291,7 @@ pub struct Ticket {
     /// tickets. `None` for never-done or not-currently-done tickets.
     pub done_at: Option<String>,
     /// Number of times this ticket bounced back from review/QA into
-    /// development. Drives the bounce-based circuit breaker (max 5) and the
+    /// development. Drives the bounce-based circuit breaker (max 8) and the
     /// reviewer-count +1 adjustment.
     pub bounce_count: i64,
     /// Reviewer-count base computed from the ORIGINAL first-review dispatch
