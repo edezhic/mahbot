@@ -8,7 +8,7 @@
 //!
 //! The voice pipeline runs its own mic-capture loop independently;
 //! `listen()` is a no-op because incoming voice commands flow through
-//! [`crate::audio::voice::route_to_agent`], not through a channel listener.
+//! `crate::audio::voice::route_to_agent`, not through a channel listener.
 
 use crate::Channel;
 use crate::{ChannelMessage, SendMessage};

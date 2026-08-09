@@ -25,14 +25,14 @@ const MAX_PRE_DEV_TICKETS: i64 = 5;
 /// Runs a Maintainer agent per workspace with the investigation prompt.
 /// On success (agent produced a response), updates `maintainer_last_run_at`
 /// and adjusts debounce: resets to 1 min if tickets were created, advances
-/// otherwise (`advance_debounce`: clamps current to [`MAX_MAINTAINER_DEBOUNCE_MINS`],
+/// otherwise (`advance_debounce`: clamps current to [`MAX_MAINTAINER_DEBOUNCE_MINS`](crate::Workspace::MAX_MAINTAINER_DEBOUNCE_MINS),
 /// doubles, caps at that value — producing the sequence 1 → 10 → 20 → … → `MAX_MAINTAINER_DEBOUNCE_MINS`).
 /// On cancellation or error, debounce and last-run timestamp are left unchanged.
 ///
 /// ## Concurrency
 ///
 /// Workspaces are processed **concurrently** via `tokio::spawn` + `join_all`,
-/// matching the pattern used by [`poll_round`](crate::management::poll_round).
+/// matching the pattern used by `poll_round`.
 /// Each workspace's agent run is independent (disjoint agent IDs, no shared
 /// mutable state between runs) so concurrency is safe.
 ///
@@ -48,8 +48,8 @@ const MAX_PRE_DEV_TICKETS: i64 = 5;
 ///   cancellation before the LLM call. The original sequential loop's
 ///   immediate-break-on-cancellation is replaced by a cooperative per-task
 ///   check, which is consistent with the rest of the codebase (neither
-///   [`poll_round`](crate::management::poll_round) nor
-///   [`process_single_workspace`](crate::management::process_single_workspace)
+///   `poll_round` nor
+///   `process_single_workspace`
 ///   check cancellation mid-batch). Mid-execution cancellation within a
 ///   running agent is handled by the global `CancellationToken` inside
 ///   `Agent::work`.

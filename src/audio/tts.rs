@@ -487,7 +487,7 @@ pub fn init_global() -> Result<()> {
 /// responses aloud that match the TTS criteria.
 ///
 /// This is the TTS trigger mechanism — it replaces what was previously an
-/// ad-hoc conditional in [`broadcast_and_persist_agent_response`] with a
+/// ad-hoc conditional in `broadcast_and_persist_agent_response` with a
 /// clean observer pattern: the TTS module subscribes to chat events and
 /// decides for itself when to speak, rather than being invoked directly
 /// from shared infrastructure.
@@ -498,7 +498,7 @@ pub fn init_global() -> Result<()> {
 /// 3. The agent's role matches the user's currently-active GUI role
 ///
 /// Must be called **after** [`crate::CHAT_BROADCAST`] has been initialized
-/// (i.e. after [`init_message_pipeline`]).
+/// (i.e. after `init_message_pipeline`).
 pub fn init_listener() {
     let Some(tx) = crate::CHAT_BROADCAST.get() else {
         warn!("TTS: CHAT_BROADCAST not initialized — listener not started");

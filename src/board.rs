@@ -1322,7 +1322,7 @@ impl BoardStore {
         prepared.execute_no_cancel(&self.conn).await
     }
 
-    /// Transactional variant of [`set_assigned_to`](Self::set_assigned_to) —
+    /// Transactional variant of `set_assigned_to_no_cancel` —
     /// uses an existing transaction instead of opening its own.
     /// Does NOT cancel registered agents — the caller is responsible
     /// for cancelling stale agents **before** beginning the transaction
@@ -1735,8 +1735,8 @@ impl BoardStore {
     /// considered active to suppress Done notifications until the pipeline is
     /// fully drained).
     ///
-    /// Delegates to [`has_active_tickets_internal`]. The test-only
-    /// [`has_pipeline_blocker_for_workspace`] additionally requires
+    /// Delegates to `has_active_tickets_internal`. The test-only
+    /// `has_pipeline_blocker_for_workspace` additionally requires
     /// `pipeline_reservation = 1` for ReadyForDevelopment tickets.
     ///
     /// Non-active phases (not matched by the query): `Done`, `Cancelled`,

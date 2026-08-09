@@ -387,8 +387,8 @@ impl Workspace {
     /// Maximum allowed maintainer debounce in minutes (4 hours).
     ///
     /// Used as both the input-clamp upper bound before doubling and the
-    /// absolute output cap after doubling in [`advance_debounce`]; also
-    /// used as the cap in [`should_skip_maintainer_debounce`] and the
+    /// absolute output cap after doubling in `advance_debounce`; also
+    /// used as the cap in `should_skip_maintainer_debounce` and the
     /// GUI display. If these two semantics ever need to diverge, introduce
     /// a separate constant for the input-clamp bound.
     pub const MAX_MAINTAINER_DEBOUNCE_MINS: i64 = 240;

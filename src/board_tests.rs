@@ -116,7 +116,6 @@ fn test_ticket_phase_parse_and_roundtrip() {
     }
 
     // Error case — verify error message includes helpful details.
-    // Also verifies error message format (formerly test_ticket_phase_from_str_error_message).
     let err = "unknown_phase".parse::<TicketPhase>().unwrap_err();
     let msg = format!("{err}");
 
@@ -1223,7 +1222,6 @@ async fn test_archive_all_done_and_cancelled() {
     assert_eq!(backlog_ticket.phase, TicketPhase::Backlog);
 
     // After archiving, count_by_phase excludes archived tickets.
-    // Also verifies count_by_phase excludes archived tickets (formerly test_count_by_phase_excludes_archived).
     let count_done_after = store
         .count_by_phase(TicketPhase::Done, None)
         .await
@@ -1320,7 +1318,7 @@ async fn test_create_ticket_tool_with_prerequisites() {
 /// Supersede a live ticket (`Backlog` → `Cancelled`).
 ///
 /// This also implicitly covers superseding an already-cancelled ticket: the
-/// cancellation UPDATE (`supersede_and_create` line 797) has no phase guard
+/// cancellation UPDATE (in `supersede_and_create`) has no phase guard
 /// (`WHERE id = ?3` without `AND phase = ?`), so it runs identically
 /// regardless of the old ticket's current phase. A separate test with a
 /// `Cancelled` starting phase would exercise the exact same SQL path and
