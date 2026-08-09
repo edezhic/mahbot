@@ -87,6 +87,40 @@ fn run_matrix() -> i32 {
         "grep -rn needle 'weird dir' | wc -l", // quoted spaced operand through the pipe
         // Quoted `~` + unquoted glob: literal `sub/~` dir in cwd (no home-strip).
         "grep -rn needle 'sub/~'/*.txt a.txt",
+        // ── Producer-first pipelines: the first grep in a pipeline is served
+        //    from the producer's stdin, wherever it sits ──
+        "cat a.txt | grep foo", // the flipped negative oracle
+        "cat a.txt | grep -n foo | head -2",
+        "cat a.txt | grep -c foo | wc -l", // bare count through a tail
+        "cat a.txt | grep -l --null foo",  // NUL-terminated stdin name
+        "cat a.txt | grep -m1 foo | head -1", // -m stops consuming stdin
+        "cat a.txt | sort | grep foo",     // multi-member producer
+        "cd sub && cat s.txt | grep needle", // cd chain before the pipeline
+        "seq 1 100 | grep 5 | head -5",
+        "seq 1 100 | grep 5 | grep 5 | head -3", // grep-on-grep: second is preserved
+        "seq 1 100 | grep 5 | grep -v 5 | head -3", // -v on the preserved chain
+        "seq 1 100000 | grep -m3 5",             // early exit on an unbounded producer
+        "seq 1 1000000 | grep zzz",              // never-match full scan (reads to EOF)
+        // Real producers (deterministic): git log and pager-env.
+        "git log --oneline | grep Initial | head -1",
+        "GIT_PAGER=cat git log --oneline | grep Initial",
+        // 2>&1 merged-stderr ordering (producer-side, before the engine).
+        "ls /nonexistent-zzz 2>&1 | grep No",
+        "ls /nonexistent-aaa /nonexistent-bbb 2>&1 | grep -n No",
+        // Member-side 2>&1 on a stdin-fed member: the stream-size marker must
+        // be suppressed (it would corrupt the merged pipeline).
+        "cat a.txt | grep foo 2>&1 | wc -l",
+        // Shell-level `exec 2>&1` merge before the pipeline: the marker would
+        // leak into the agent-visible stdout, where the parent's strip cannot
+        // reach it — suppressed fail-closed (exec is POSIX; `|&` is not, and
+        // /bin/sh rejects it, so the connector-level merge is unreachable).
+        "exec 2>&1; cat a.txt | grep foo",
+        // Binary stdin: NUL in the 32 KiB window → the Binary message; NUL
+        // after the window → text mode, the NUL-containing line still matches.
+        "perl -e 'print \"\\0needle\\n\"' | grep needle",
+        "perl -e 'print \"x\" x 32768, \"\\0needle\\n\"' | grep needle",
+        // `>|` noclobber override preserved on a stdin-fed member.
+        "seq 1 100 | grep 5 >| /dev/null",
         // ── -c / -l ──
         "grep -c foo a.txt b.txt",
         "grep -c foo a.txt b.txt c.txt",
@@ -128,7 +162,9 @@ fn run_matrix() -> i32 {
     // command — a shell syntax error / a real grep pipeline — runs instead).
     for (label, row) in [
         ("empty pipeline member", "grep -rn needle bigdir | | wc -l"),
-        ("grep not first in pipeline", "cat a.txt | grep foo"),
+        ("stdin-fed with file operands", "cat a.txt | grep foo b.txt"),
+        ("stdin-fed -r without operands", "printf 'x' | grep -r foo"),
+        ("stdin-fed with a '-' operand", "cat a.txt | grep foo -"),
     ] {
         match check_fallback(row, &ws, &home) {
             Ok(()) => println!("PASS (fallback): {row}"),
@@ -156,6 +192,12 @@ fn run_matrix() -> i32 {
         (
             "SIGPIPE through a preserved grep",
             "grep -rn needle bigdir | grep needle | head -1",
+        ),
+        // Producer-first chain: the engine is the MIDDLE member — cat feeds it
+        // via stdin and must die on EPIPE when the engine dies under head.
+        (
+            "SIGPIPE chain with a real producer",
+            "cat bigdir/big.txt | grep needle | head -1",
         ),
     ] {
         match check_sigpipe(cmd, &ws, &home) {
@@ -221,6 +263,40 @@ fn build_fixture(ws: &Path, home: &Path) {
         "other\nneedle\n".repeat(50_000),
     )
     .unwrap();
+    // A real git repo with pinned identity + dates: `git log` output is
+    // deterministic across the two runs of every parity row.
+    git_fixture(ws);
+}
+
+/// Initialize a repo in `ws` with one commit (pinned author/committer dates
+/// make the log output deterministic).
+fn git_fixture(ws: &Path) {
+    let run = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(ws)
+            .env("GIT_AUTHOR_DATE", "2026-01-02T03:04:05Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-02T03:04:05Z")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&["init", "-q"]);
+    run(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.com",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "Initial commit",
+    ]);
 }
 
 fn check_row(row: &str, ws: &Path, home: &Path) -> Result<(), String> {
@@ -259,6 +335,14 @@ fn check_exec_fallback(ws: &Path) -> Result<(), String> {
     // real grep, which then runs in the ACTUAL cwd.
     check_exec_case(
         ws,
+        r#"{"version":5,"verb":"grep","mode":"Basic","flags":{"n":true,"i":false,"v":false,"w":false,"x":false,"a":false,"h":false,"H":false,"s":false,"r":true,"o":false,"null":false,"c":false,"l":false,"m":null,"before":0,"after":0},"filters":[],"exclude_dir":[],"patterns":["x"],"operands":[{"display":".","resolved":"/nonexistent","trailing_slash":false}],"cwd":"/nonexistent","fallback":["grep","-rn","x","."],"piped":false,"stdin":false,"report_stream_bytes":false}"#,
+        "grep -rn x .",
+    )?;
+    // A v4 spec (old parent binary after a self-update swap) into the v5
+    // engine: the version mismatch must exec the real grep in place — the
+    // fail-closed swap direction the rollout depends on.
+    check_exec_case(
+        ws,
         r#"{"version":4,"verb":"grep","mode":"Basic","flags":{"n":true,"i":false,"v":false,"w":false,"x":false,"a":false,"h":false,"H":false,"s":false,"r":true,"o":false,"null":false,"c":false,"l":false,"m":null,"before":0,"after":0},"filters":[],"exclude_dir":[],"patterns":["x"],"operands":[{"display":".","resolved":"/nonexistent","trailing_slash":false}],"cwd":"/nonexistent","fallback":["grep","-rn","x","."],"piped":false}"#,
         "grep -rn x .",
     )?;
@@ -266,7 +350,7 @@ fn check_exec_fallback(ws: &Path) -> Result<(), String> {
     // separator the parent inserts into the fallback argv.
     let dash_abs = ws.join("-x1").to_string_lossy().into_owned();
     let json = format!(
-        r#"{{"version":4,"verb":"grep","mode":"Basic","flags":{{"n":false,"i":false,"v":false,"w":false,"x":false,"a":false,"h":false,"H":false,"s":false,"r":false,"o":false,"null":false,"c":false,"l":false,"m":null,"before":0,"after":0}},"filters":[],"exclude_dir":[],"patterns":["x"],"operands":[{{"display":"-x1","resolved":"{dash_abs}","trailing_slash":false}}],"cwd":"/nonexistent","fallback":["grep","-e","x","--","-x1"],"piped":false}}"#
+        r#"{{"version":5,"verb":"grep","mode":"Basic","flags":{{"n":false,"i":false,"v":false,"w":false,"x":false,"a":false,"h":false,"H":false,"s":false,"r":false,"o":false,"null":false,"c":false,"l":false,"m":null,"before":0,"after":0}},"filters":[],"exclude_dir":[],"patterns":["x"],"operands":[{{"display":"-x1","resolved":"{dash_abs}","trailing_slash":false}}],"cwd":"/nonexistent","fallback":["grep","-e","x","--","-x1"],"piped":false,"stdin":false,"report_stream_bytes":false}}"#
     );
     check_exec_case(ws, &json, "grep -e x -- -x1")
 }

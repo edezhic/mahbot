@@ -30,10 +30,12 @@ use crate::tools::shell::readonly::{strip_heredoc_bodies, strip_outer_quotes};
 /// Hidden subcommand name dispatched before lock acquisition (like `debug`).
 const ENGINE_VERB: &str = "__grep-engine";
 /// Spec JSON protocol version; mismatches make the engine fall back.
-/// Bumped for the -c/-l GrepFlags fields and the `piped` field: a spec from
-/// a swapped binary is caught here (both directions) and execs the real grep
-/// via the fallback argv, which carries the new surface.
-const PROTOCOL_VERSION: u32 = 4;
+/// Bumped for the `stdin`/`report_stream_bytes` fields (producer-first stdin-fed
+/// serving): a spec from a swapped binary is caught here (both directions)
+/// and execs the real grep via the fallback argv, which carries the new
+/// surface. The version check runs before any stdin read, so the exec'd grep
+/// reads the producer's pipe authentically.
+const PROTOCOL_VERSION: u32 = 5;
 /// NUL-detection window for binary files (FreeBSD grep reads 32 KiB).
 const BINARY_WINDOW: usize = 32 * 1024;
 /// Engine self-cap on written output; the shell pipe reader caps at the same.
@@ -46,6 +48,13 @@ pub(super) const ENGINE_FAILED_EXIT: i32 = 3;
 /// its exit 1 is a legitimate grep no-match code, so the parent re-runs on
 /// this message instead. Mirrors `self_update::acquire_lock`'s error text.
 pub(super) const STALE_BINARY_LOCK_MSG: &str = "Another instance of mahbot is already running";
+/// Engine stderr marker carrying the byte count consumed from a stdin-fed
+/// stream (best-effort: -m/-l early stops report the consumed prefix,
+/// SIGPIPE-killed chains may flush nothing, and member-side/shell-level
+/// stderr merges suppress it). The shell tool strips the marker line from the
+/// agent-visible stderr and logs the count (per-call stream bytes are
+/// recorded nowhere else).
+pub(super) const STREAM_SIZE_MARKER: &str = "__mahbot_stream_bytes__";
 /// Specs larger than this fall back (argv-size hygiene).
 const MAX_SPEC_JSON: usize = 64 * 1024;
 /// Searcher line-buffer cap; exceeding it is a grep-style error (exit 2).
@@ -79,6 +88,15 @@ struct EngineSpec {
     /// downstream members see the full stream (byte-identity with grep).
     #[serde(default)] // lenient: a swapped-binary spec reaches the version check
     piped: bool,
+    /// The member is a non-first pipeline member fed by a producer's stdout
+    /// via stdin (no operands): read stdin instead of operands.
+    #[serde(default)]
+    stdin: bool,
+    /// Emit the stream-size marker to stderr (stdin serves without a
+    /// member-side or shell-level stderr merge; the shell tool strips and
+    /// logs it).
+    #[serde(default)]
+    report_stream_bytes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,12 +119,20 @@ pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> Option<
     let (specs, shapes, rewritten) = match analyze_command(command, workspace_root, &home, false) {
         Ok(v) => v,
         Err(reason) => {
-            // INFO only for the gate-relaxation class: pipeline-shape fallbacks
-            // of actual grep commands (the volume Part 2 measures). Commands
-            // without a grep member — including empty-member syntax errors like
-            // `cat f | | head` — stay DEBUG.
-            if matches!(reason, Fallback::PipelineShape | Fallback::SegmentEmpty)
-                && command.split_whitespace().any(is_grep_verb)
+            // INFO for the gate-relaxation classes: stdin-reject fallbacks of
+            // producer-first pipelines (the new serving surface), the
+            // nested-introducer and grep-first-stdin classes kept on fallback,
+            // and empty-member syntax errors. Commands without a grep member —
+            // including empty-member syntax errors like `cat f | | head` —
+            // stay DEBUG.
+            if matches!(
+                reason,
+                Fallback::SegmentEmpty
+                    | Fallback::StdinOperands
+                    | Fallback::StdinRecursive
+                    | Fallback::NestedGrep
+                    | Fallback::StdinMode
+            ) && command.split_whitespace().any(is_grep_verb)
             {
                 tracing::info!(command = command, %reason, "grep engine: fallback");
             } else {
@@ -124,7 +150,8 @@ pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> Option<
         }
     }
     // INFO for multi-member served pipelines (gate-relaxation volume
-    // telemetry); single greps stay DEBUG.
+    // telemetry); single greps stay DEBUG. The stdin field marks
+    // producer-first stdin-fed serves.
     if shapes.is_empty() {
         tracing::debug!(
             command = command,
@@ -132,11 +159,12 @@ pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> Option<
             "grep engine: served"
         );
     } else {
-        for (members, shape) in shapes {
+        for (members, shape, stdin) in shapes {
             tracing::info!(
                 command = command,
                 members,
                 shape = %shape,
+                stdin,
                 "grep engine: served"
             );
         }
@@ -172,6 +200,51 @@ fn pinned_home() -> Option<PathBuf> {
 /// Spec JSON must stay within the argv-size hygiene bound.
 fn spec_json_ok(spec: &EngineSpec) -> bool {
     serde_json::to_string(spec).is_ok_and(|j| j.len() <= MAX_SPEC_JSON)
+}
+
+/// Remove engine stream-size marker line(s) from stderr; returns the last
+/// reported byte count. Multi-pipeline `;`-joined commands emit several
+/// markers and only the last is logged — an accepted best-effort gap. The
+/// marker is engine-only telemetry and must never reach the agent's stderr.
+pub(super) fn strip_stream_size_marker(stderr: &mut Vec<u8>) -> Option<u64> {
+    // Common path (file-operand serves never emit the marker): skip the copy.
+    if !stderr
+        .windows(STREAM_SIZE_MARKER.len())
+        .any(|w| w == STREAM_SIZE_MARKER.as_bytes())
+    {
+        return None;
+    }
+    let mut last = None;
+    let mut cleaned = Vec::with_capacity(stderr.len());
+    let mut rest = &stderr[..];
+    while let Some(pos) = rest
+        .windows(STREAM_SIZE_MARKER.len())
+        .position(|w| w == STREAM_SIZE_MARKER.as_bytes())
+    {
+        let line_start = rest[..pos]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |p| p + 1);
+        let line_end = rest[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(rest.len(), |p| pos + p + 1);
+        cleaned.extend_from_slice(&rest[..line_start]);
+        if let Some(v) = std::str::from_utf8(&rest[pos + STREAM_SIZE_MARKER.len()..line_end])
+            .ok()
+            .and_then(|s| {
+                s.trim()
+                    .strip_prefix(':')
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+            })
+        {
+            last = Some(v);
+        }
+        rest = &rest[line_end..];
+    }
+    cleaned.extend_from_slice(rest);
+    *stderr = cleaned;
+    last
 }
 
 /// Per-process probe result (cached — a probe spawns the full binary, so it
@@ -239,7 +312,8 @@ enum Fallback {
     UnexpandableGlob,
     SingleFile,
     CdUntrackable,
-    PipelineShape,
+    StdinOperands,
+    StdinRecursive,
     SegmentEmpty,
 }
 
@@ -259,16 +333,17 @@ impl std::fmt::Display for Fallback {
             Fallback::UnexpandableGlob => write!(f, "unexpandable glob"),
             Fallback::SingleFile => write!(f, "single file"),
             Fallback::CdUntrackable => write!(f, "cd untrackable"),
-            Fallback::PipelineShape => write!(f, "pipeline shape"),
+            Fallback::StdinOperands => write!(f, "stdin with operands"),
+            Fallback::StdinRecursive => write!(f, "stdin with -r"),
             Fallback::SegmentEmpty => write!(f, "empty command or pipeline member"),
         }
     }
 }
 
 /// Analyze output: one spec per served grep, the shape of every served
-/// multi-member pipeline (members, verbs — grep-family normalized to "grep")
-/// for volume telemetry, and the rewritten command.
-type AnalyzeOutput = (Vec<EngineSpec>, Vec<(usize, String)>, String);
+/// multi-member pipeline (members, verbs — grep-family normalized to "grep",
+/// stdin-fed flag) for volume telemetry, and the rewritten command.
+type AnalyzeOutput = (Vec<EngineSpec>, Vec<(usize, String, bool)>, String);
 
 /// Analyze a full shell command: segment it, track cds, serve every grep
 /// member, keep everything else verbatim. Returns the analyze output or the
@@ -320,9 +395,13 @@ fn analyze_command(
     let mut cwd = canonical_or_lexical(workspace_root);
     let mut rewritten: Vec<(String, String)> = Vec::new();
     let mut specs: Vec<EngineSpec> = Vec::new();
-    let mut shapes: Vec<(usize, String)> = Vec::new();
-    // Members after a served first grep are preserved verbatim — real tools
-    // on a byte-identical uncapped stream, never analyzed.
+    let mut shapes: Vec<(usize, String, bool)> = Vec::new();
+    // A shell-level `exec` stderr redirect seen so far (greps after it cannot
+    // report the stream-size marker).
+    let mut exec_redirects_stderr = false;
+    // Members after a served grep are preserved verbatim — real tools on a
+    // byte-identical uncapped stream, never analyzed (only the first grep in
+    // a pipeline is served; later greps stay real).
     let mut tail_preserved = vec![false; n];
 
     for (idx, (seg, conn)) in segments.iter().enumerate() {
@@ -343,26 +422,31 @@ fn analyze_command(
             continue;
         }
         if is_grep_verb(verb) {
-            if pstart[idx] != idx {
-                // Only the first member of a pipeline can be served.
-                return Err(Fallback::PipelineShape);
-            }
-            let in_pipeline = pstart[idx] != pend[idx];
-            match serve_one_grep(seg, verb, &cwd, home, allow_single, in_pipeline) {
+            // The first grep in a pipeline is served wherever it sits; a
+            // non-first member is fed by the producer's stdout via stdin.
+            // Later greps (grep-on-grep chains) are preserved verbatim.
+            let ctx = PipelineCtx {
+                piped: pstart[idx] != pend[idx],
+                stdin_fed: pstart[idx] != idx,
+                // A shell-level `exec 2>&1` before this point merges the
+                // engine's stderr (the stream-size marker) into the tool's
+                // captured stdout, where the parent's strip cannot reach it.
+                marker_ok: !exec_redirects_stderr,
+            };
+            match serve_one_grep(seg, verb, &cwd, home, allow_single, ctx) {
                 Ok((spec, rewritten_seg)) => {
-                    if in_pipeline {
+                    if ctx.piped {
                         tail_preserved[idx + 1..=pend[idx]].fill(true);
-                        // Served-pipeline shape for volume telemetry (only
-                        // multi-member pipelines start with a served grep, so
-                        // every pipeline in a served command is reported).
-                        let verbs: Vec<&str> = segments[idx..=pend[idx]]
+                        // Served-pipeline shape for volume telemetry; spans
+                        // the full pipeline (producers, served grep, tail).
+                        let verbs: Vec<&str> = segments[pstart[idx]..=pend[idx]]
                             .iter()
                             .map(|(s, _)| {
                                 let v = first_word(s);
                                 if is_grep_verb(v) { "grep" } else { v }
                             })
                             .collect();
-                        shapes.push((verbs.len(), verbs.join("|")));
+                        shapes.push((verbs.len(), verbs.join("|"), spec.stdin));
                     }
                     rewritten.push((rewritten_seg, conn.clone()));
                     specs.push(spec);
@@ -371,16 +455,25 @@ fn analyze_command(
             }
             continue;
         }
-        // Non-grep member: verbatim, but indirect/compound grep invocations
-        // make the whole command fall back (fail-closed).
+        // Non-grep member: verbatim. In a pipeline it is a producer — the
+        // first grep in that pipeline is served from its stdout. Indirect/
+        // compound grep invocations (xargs grep, git grep, sh -c, sudo, for
+        // bodies) make the whole command fall back (fail-closed).
         if is_compound_segment(seg) || segment_contains_grep(seg, verb) {
             return Err(Fallback::NestedGrep);
         }
-        if pstart[idx] == pend[idx] {
-            rewritten.push((seg.clone(), conn.clone()));
-            continue;
+        if verb == "exec" && (seg.contains("2>") || seg.contains("&>")) {
+            // `exec 2>&1`/`exec 2>…`/`exec &>…` moves the shell's stderr for
+            // the rest of the command; fail-closed on the stream-size marker
+            // for the greps that follow (it would leak into stdout or a file).
+            // `exec 1>&2`/`exec 3>&2` don't move stderr off the capture and
+            // are intentionally not matched; digit-prefixed dups (`exec 12>&1`)
+            // match `2>` and suppress unnecessarily (telemetry loss only).
+            // Fail-open escapes (a stray marker line in stdout): env-prefixed
+            // `FOO=1 exec 2>&1` and space-split `exec 2 >&1` (valid POSIX sh).
+            exec_redirects_stderr = true;
         }
-        return Err(Fallback::PipelineShape);
+        rewritten.push((seg.clone(), conn.clone()));
     }
 
     Ok((specs, shapes, join_rewritten(&rewritten)))
@@ -459,8 +552,13 @@ fn split_segments(command: &str) -> Result<Vec<(String, String)>, Fallback> {
                     }
                     continue;
                 }
+                // `>|` is a single compound redirect operator, not a pipe
+                // separator. Splitting at the `|` would leave a bare `>`
+                // segment that the redirect scanner misreads as a target-less
+                // redirect.
                 '|' if current.trim_end().ends_with('>') => {
                     current.push(c);
+                    continue;
                 }
                 '|' => {
                     if chars.peek() == Some(&'&') {
@@ -849,6 +947,18 @@ fn is_digit_suffix_redirect(w: &str, op: u8) -> bool {
         && w.as_bytes()[0].is_ascii_digit()
         && w.as_bytes()[1] == op
         && w[2..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Member-side redirects that move stderr off the shell tool's captured fd 2
+/// (into the pipeline or a file): the stream-size marker would corrupt the
+/// pipeline output or pollute the file, so stdin serves with such redirects
+/// skip it. `1>&2`/`>&2` (stdout→stderr) and scratch-fd dups (`3>&1`) keep
+/// stderr captured and are not matched; `2>file` is broader than the
+/// pipe-corruption risk but the marker is uncapturable once fd 2 leaves the
+/// capture (and would pollute the file). Digit-fd dups like `12>&1` contain
+/// `2>` and suppress too — fail-closed, telemetry loss only.
+fn redirect_merges_stderr(r: &str) -> bool {
+    r.contains("2>") || r.contains("&>")
 }
 
 /// A parsed, validated grep invocation ready for operand resolution.
@@ -1379,15 +1489,32 @@ impl grep_matcher::Matcher for SearchMatcher {
 
 // ── Operand resolution and the serve gate ─────────────────────────────────
 
+/// Pipeline context for a served grep member.
+#[derive(Clone, Copy)]
+struct PipelineCtx {
+    /// The member feeds a pipeline tail: its stdout must not be capped, so
+    /// downstream members see the full stream (byte-identity with grep).
+    piped: bool,
+    /// The member is not the pipeline's first member: it is fed by the
+    /// producer's stdout via stdin.
+    stdin_fed: bool,
+    /// The member's stderr still reaches the shell tool's capture: no
+    /// shell-level `exec` stderr merge before it. When false, the stream-size
+    /// marker is suppressed (it would leak into the agent-visible stdout).
+    marker_ok: bool,
+}
+
 /// Serve one grep segment: parse, translate, resolve operands, apply the
-/// serve-worthiness gate, and build the spec + rewritten fragment.
+/// serve-worthiness gate, and build the spec + rewritten fragment. A
+/// non-first pipeline member (`ctx.stdin_fed`) is served from the producer's
+/// stdin when it has no operands and no -r (both stay on the fallback).
 fn serve_one_grep(
     segment: &str,
     verb: &str,
     cwd: &Path,
     home: &Path,
     allow_single: bool,
-    piped: bool,
+    ctx: PipelineCtx,
 ) -> Result<(EngineSpec, String), Fallback> {
     let mut words = grep_tokenize(segment)?;
     // The segment starts with the verb; the parser sees only its arguments.
@@ -1401,16 +1528,28 @@ fn serve_one_grep(
     let mut operands: Vec<Operand> = Vec::new();
     if parsed.operand_tokens.is_empty() {
         if parsed.flags.r {
+            if ctx.stdin_fed {
+                // `grep -r pat` with no operands walks the cwd and ignores
+                // stdin (BSD) — never stdin-feed it.
+                return Err(Fallback::StdinRecursive);
+            }
             // `grep -r pat` with no operands walks the cwd (BSD behavior).
             operands.push(Operand {
                 display: ".".into(),
                 resolved: cwd.to_string_lossy().into_owned(),
                 trailing_slash: false,
             });
+        } else if ctx.stdin_fed {
+            // Producer-fed stdin serve (no operands).
         } else {
             return Err(Fallback::StdinMode);
         }
     } else {
+        if ctx.stdin_fed {
+            // Non-first grep with file operands (incl. "-") is a deliberate
+            // scope cut — reject (BSD ignores stdin when operands exist).
+            return Err(Fallback::StdinOperands);
+        }
         for tok in &parsed.operand_tokens {
             if unquote_word(tok)? == "-" {
                 return Err(Fallback::StdinMode);
@@ -1425,13 +1564,16 @@ fn serve_one_grep(
 
     // Serve gate: recursive walks (the expensive case), or multi-file
     // invocations. Single-file lookups stay on the real grep (faster).
+    // stdin-fed serves bypass the gate (the stream size is unknowable and
+    // the ~6 ms engine tax is invisible against the producer's run).
     let mut dir_count = 0usize;
     for op in &operands {
         if fs::metadata(&op.resolved).is_ok_and(|m| m.is_dir()) {
             dir_count += 1;
         }
     }
-    let serve = allow_single
+    let serve = ctx.stdin_fed
+        || allow_single
         || (parsed.flags.r && (dir_count > 0 || operands.len() != 1))
         || operands.len() >= 2;
     if !serve {
@@ -1459,7 +1601,14 @@ fn serve_one_grep(
         operands,
         cwd: cwd.to_string_lossy().into_owned(),
         fallback,
-        piped,
+        piped: ctx.piped,
+        stdin: ctx.stdin_fed,
+        // The stream-size marker would leak into the tool's captured stdout
+        // (a shell-level `exec 2>&1` before the member) or corrupt/pollute a
+        // member-side stderr redirect — skip it then.
+        report_stream_bytes: ctx.stdin_fed
+            && ctx.marker_ok
+            && !parsed.redirects.iter().any(|r| redirect_merges_stderr(r)),
     };
 
     let mut rewritten = build_rewritten(&spec);
@@ -1673,14 +1822,15 @@ pub fn run_engine(args: &[String]) -> i32 {
         return exec_grep(&spec.fallback);
     }
     let fallback = spec.fallback.clone();
-    // `serve` itself reports panics: nothing-written panics return Err (exec
-    // grep in place); post-output panics return the sentinel. This outer
+    // `serve` itself reports panics: nothing-written-or-read panics return Err
+    // (exec grep in place); post-output panics return the sentinel. This outer
     // catch_unwind is the last-resort net for panics outside `serve`'s scope.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serve(&spec)));
     match result {
         Ok(Ok(code)) => code,
         // Err only from pre-output checks (cwd mismatch, matcher build, or a
-        // panic before anything was written) — exec'ing the real grep is clean.
+        // panic before anything was written or read) — exec'ing the real grep
+        // is clean.
         Ok(Err(())) => exec_grep(&fallback),
         // A panic escaped `serve` mid-search: partial output may have been
         // streamed; exec'ing grep would append to it (a false result). Exit
@@ -1690,8 +1840,11 @@ pub fn run_engine(args: &[String]) -> i32 {
 }
 
 /// Replace the engine process with the real grep (PID/PGID preserved, so the
-/// shell tool's process-group timeout kill still applies). Served invocations
-/// never read stdin, so re-exec is always sound.
+/// shell tool's process-group timeout kill still applies). Re-exec is sound
+/// only while stdin was not yet consumed — the cwd/version/matcher pre-checks
+/// run before any stdin read; after the stdin head read, the producer's pipe
+/// is partially drained, so the engine exits sentinel-3 instead (the parent
+/// discards and re-runs the original command).
 fn exec_grep(argv: &[String]) -> i32 {
     use std::os::unix::process::CommandExt;
     let Some(first) = argv.first() else {
@@ -1703,12 +1856,15 @@ fn exec_grep(argv: &[String]) -> i32 {
 }
 
 /// Serve one spec: verify the cwd, then process each operand in order with
-/// per-file grep semantics. Returns the aggregate exit code (0/1/2).
+/// per-file grep semantics (or read stdin for stdin-fed members). Returns the
+/// aggregate exit code (0/1/2).
 ///
-/// `Err(())` means nothing was written and the caller should exec the real
-/// grep in place (cwd divergence, matcher build failure, or a panic before
-/// any output). A panic after output started returns `Ok(ENGINE_FAILED_EXIT)`
-/// — exec'ing grep then would append a false result, so the parent re-runs.
+/// `Err(())` means nothing was written and stdin was not consumed, so the
+/// caller can exec the real grep in place (cwd divergence, matcher build
+/// failure, or a panic before any input/output). A panic after output started
+/// or after the stdin head read returns `Ok(ENGINE_FAILED_EXIT)` — exec'ing
+/// grep then would append a false result or read the drained pipe remainder,
+/// so the parent re-runs.
 fn serve(spec: &EngineSpec) -> Result<i32, ()> {
     let actual_cwd = std::env::current_dir().map_err(|_| ())?;
     if actual_cwd != Path::new(&spec.cwd) {
@@ -1721,20 +1877,22 @@ fn serve(spec: &EngineSpec) -> Result<i32, ()> {
         OutputSink::Stdout(io::BufWriter::with_capacity(16 * 1024, io::stdout())),
         if spec.piped { None } else { Some(OUTPUT_CAP) },
     );
+    let stdin_consumed = std::cell::Cell::new(false);
+    let stdin = io::stdin();
     let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        serve_into(spec, &matcher, &mut out)
+        serve_into(spec, &matcher, &mut out, stdin.lock(), &stdin_consumed)
     }));
     match code {
         Ok(code) => {
             out.finish();
             Ok(code)
         }
-        // A panic before anything was written: exec'ing the real grep is
-        // clean, and its exit code cannot be masked by a pipe member.
-        Err(_) if out.written == 0 => Err(()),
-        // A panic mid-search may have streamed partial output; exec'ing grep
-        // would append to it. Flush and return the sentinel: the parent
-        // discards this run and re-runs the original command.
+        // A panic before anything was written or read: exec'ing the real grep
+        // is clean, and its exit code cannot be masked by a pipe member.
+        Err(_) if out.written == 0 && !stdin_consumed.get() => Err(()),
+        // A panic mid-search may have streamed partial output or consumed the
+        // producer's pipe; exec'ing grep would append a false result. Flush
+        // and return the sentinel: the parent discards this run and re-runs.
         Err(_) => {
             out.finish();
             Ok(ENGINE_FAILED_EXIT)
@@ -1742,8 +1900,19 @@ fn serve(spec: &EngineSpec) -> Result<i32, ()> {
     }
 }
 
-/// Serve a spec writing into caller-owned buffers (testable in-process).
-fn serve_into(spec: &EngineSpec, matcher: &grep_regex::RegexMatcher, out: &mut Output) -> i32 {
+/// Serve a spec writing into caller-owned buffers (testable in-process). The
+/// stdin reader is injectable so in-process tests never touch the process's
+/// real stdin.
+fn serve_into<R: io::Read>(
+    spec: &EngineSpec,
+    matcher: &grep_regex::RegexMatcher,
+    out: &mut Output,
+    stdin: R,
+    stdin_consumed: &std::cell::Cell<bool>,
+) -> i32 {
+    if spec.stdin {
+        return serve_stdin(spec, matcher, out, stdin, stdin_consumed);
+    }
     let show_prefix = !spec.flags.h && (spec.flags.H || spec.flags.r || spec.operands.len() > 1);
     // `max` keeps Error over Match/NoMatch — any error yields exit 2 even when
     // matches were printed (BSD), mirroring walk_dir's aggregation.
@@ -1756,6 +1925,150 @@ fn serve_into(spec: &EngineSpec, matcher: &grep_regex::RegexMatcher, out: &mut O
         OperandResult::Match => 0,
         OperandResult::Error => 2,
     }
+}
+
+/// Byte-counting reader wrapper for stream-size telemetry.
+struct CountingReader<R> {
+    inner: R,
+    count: u64,
+}
+
+impl<R: io::Read> CountingReader<R> {
+    fn new(inner: R) -> Self {
+        CountingReader { inner, count: 0 }
+    }
+
+    fn count(&self) -> u64 {
+        self.count
+    }
+}
+
+impl<R: io::Read> io::Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+}
+
+/// Read the 32 KiB binary-window head (BSD's binary sniffing window), returned
+/// truncated to what was read, with the NUL verdict.
+fn read_binary_head<R: io::Read>(src: &mut R) -> io::Result<(Vec<u8>, bool)> {
+    let mut head = vec![0u8; BINARY_WINDOW];
+    let n = src.read(&mut head)?;
+    head.truncate(n);
+    let binary = head.contains(&0);
+    Ok((head, binary))
+}
+
+/// Searcher with the spec's matching surface. Context flags are suppressed in
+/// count modes; -m caps matches (stopping input consumption on streams).
+fn build_searcher(spec: &EngineSpec) -> (grep_searcher::Searcher, bool) {
+    let mut sb = grep_searcher::SearcherBuilder::new();
+    sb.line_number(spec.flags.n)
+        .invert_match(spec.flags.v)
+        .binary_detection(grep_searcher::BinaryDetection::none())
+        .heap_limit(Some(HEAP_LIMIT));
+    let count_mode = spec.flags.count_mode();
+    if !count_mode && spec.flags.before > 0 {
+        sb.before_context(spec.flags.before);
+    }
+    if !count_mode && spec.flags.after > 0 {
+        sb.after_context(spec.flags.after);
+    }
+    if let Some(m) = spec.flags.m {
+        sb.max_matches(Some(m));
+    }
+    (sb.build(), count_mode)
+}
+
+/// Search a (possibly non-seekable) stream with the spec's BSD sink; `binary`
+/// is the NUL-window verdict. Returns the search result and whether any line
+/// matched (count modes finish their count inside). The sink borrows `out`;
+/// the caller writes the stream-size marker after this returns — its stderr
+/// position relative to grep errors is irrelevant (the parent's strip scans
+/// the whole buffer).
+fn search_stream<R: io::Read>(
+    spec: &EngineSpec,
+    matcher: &grep_regex::RegexMatcher,
+    display: &str,
+    show_prefix: bool,
+    binary: bool,
+    input: &mut R,
+    out: &mut Output,
+) -> (Result<(), io::Error>, bool) {
+    let search_matcher = SearchMatcher {
+        inner: matcher.clone(),
+        validate_utf8: !binary,
+    };
+    let (mut searcher, count_mode) = build_searcher(spec);
+    let matcher_for_search = search_matcher.clone();
+    let (result, selected_any) = {
+        let mut sink = GrepSink {
+            spec,
+            display,
+            show_prefix,
+            binary: binary && !spec.flags.a,
+            message_emitted: false,
+            selected_any: false,
+            count: 0,
+            matcher: &search_matcher,
+            out,
+        };
+        let result = searcher.search_reader(matcher_for_search, input, &mut sink);
+        if count_mode {
+            sink.finish_count();
+        }
+        (result, sink.selected_any)
+    };
+    (result, selected_any)
+}
+
+/// Serve a stdin-fed grep member: read the producer's pipe with BSD binary
+/// semantics — a 32 KiB NUL-sniff buffer, filled by one partial read (a pipe
+/// yields only its available bytes, and BSD sniffs the same way), the
+/// "(standard input)" display name, --include/--exclude/--exclude-dir ignored
+/// on stdin, per-line flush, and -m stopping the read (grep-searcher's
+/// max_matches, matching BSD's instant exit).
+fn serve_stdin<R: io::Read>(
+    spec: &EngineSpec,
+    matcher: &grep_regex::RegexMatcher,
+    out: &mut Output,
+    mut stdin: R,
+    stdin_consumed: &std::cell::Cell<bool>,
+) -> i32 {
+    let (head, binary) = match read_binary_head(&mut stdin) {
+        Ok(v) => v,
+        Err(e) => {
+            emit_error(spec, out, "(standard input)", &e.to_string());
+            return 2;
+        }
+    };
+    stdin_consumed.set(true);
+    // Non-seekable stream: buffer the head, then read the remainder (the same
+    // pattern that serves FIFOs and /dev/* — BSD grep likewise never seeks).
+    let mut input = CountingReader::new(io::Cursor::new(&head).chain(stdin));
+    let (search, selected_any) = search_stream(
+        spec,
+        matcher,
+        "(standard input)",
+        spec.flags.H && !spec.flags.h,
+        binary,
+        &mut input,
+        out,
+    );
+    if spec.report_stream_bytes {
+        out.write_err(&format!(
+            "{}: {STREAM_SIZE_MARKER}: {}\n",
+            spec.verb,
+            input.count()
+        ));
+    }
+    if let Err(e) = search {
+        emit_error(spec, out, "(standard input)", &e.to_string());
+        return 2;
+    }
+    i32::from(!selected_any)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1998,60 +2311,24 @@ fn search_file(
             return OperandResult::Error;
         }
     };
-    let mut head = vec![0u8; BINARY_WINDOW];
-    let n = match file.read(&mut head) {
-        Ok(n) => n,
+    let (head, binary) = match read_binary_head(&mut file) {
+        Ok(v) => v,
         Err(e) => {
             emit_error(spec, out, display, &e.to_string());
             return OperandResult::Error;
         }
     };
-    let binary = head[..n].contains(&0);
     // Non-seekable operands (FIFOs, /dev/*) cannot be re-read; stream the
     // buffered head first, then the remainder — BSD grep likewise never seeks
     // (it reads the window and continues from the stream).
-    let mut input = io::Cursor::new(&head[..n]).chain(file);
-
-    let search_matcher = SearchMatcher {
-        inner: matcher.clone(),
-        validate_utf8: !binary,
-    };
-    let mut sink = GrepSink {
-        spec,
-        display,
-        show_prefix,
-        binary: binary && !spec.flags.a,
-        message_emitted: false,
-        selected_any: false,
-        count: 0,
-        matcher: &search_matcher,
-        out,
-    };
-    let matcher_for_search = search_matcher.clone();
-    let mut sb = grep_searcher::SearcherBuilder::new();
-    sb.line_number(spec.flags.n)
-        .invert_match(spec.flags.v)
-        .binary_detection(grep_searcher::BinaryDetection::none())
-        .heap_limit(Some(HEAP_LIMIT));
-    let count_mode = spec.flags.count_mode();
-    if !count_mode && spec.flags.before > 0 {
-        sb.before_context(spec.flags.before);
-    }
-    if !count_mode && spec.flags.after > 0 {
-        sb.after_context(spec.flags.after);
-    }
-    if let Some(m) = spec.flags.m {
-        sb.max_matches(Some(m));
-    }
-    let mut searcher = sb.build();
-    if let Err(e) = searcher.search_reader(matcher_for_search, &mut input, &mut sink) {
+    let mut input = io::Cursor::new(&head).chain(file);
+    let (search, selected_any) =
+        search_stream(spec, matcher, display, show_prefix, binary, &mut input, out);
+    if let Err(e) = search {
         emit_error(spec, out, display, &e.to_string());
         return OperandResult::Error;
     }
-    if count_mode {
-        sink.finish_count();
-    }
-    if sink.selected_any {
+    if selected_any {
         OperandResult::Match
     } else {
         OperandResult::NoMatch
@@ -2369,23 +2646,38 @@ mod parity_tests {
     }
 
     /// Run the engine in-process on one spec; returns (stdout, stderr, code).
+    /// stdin-fed specs get an empty reader — never the test process's stdin.
     fn engine_run(spec: &EngineSpec) -> (Vec<u8>, Vec<u8>, i32) {
+        let (out, err, code, _) = engine_run_with_stdin(spec, &[]);
+        (out, err, code)
+    }
+
+    /// Run the engine in-process feeding explicit stdin bytes (stdin-fed rows).
+    /// Returns (stdout, stderr, code, stripped stream-byte count): the last
+    /// pins the stream-size marker chain (None when no marker was emitted).
+    fn engine_run_with_stdin(
+        spec: &EngineSpec,
+        stdin: &[u8],
+    ) -> (Vec<u8>, Vec<u8>, i32, Option<u64>) {
         let matcher =
             build_matcher(&spec.patterns, spec.mode, &spec.flags).expect("matcher builds");
         let mut out = Output::new(
             OutputSink::Buffer(Vec::new()),
             if spec.piped { None } else { Some(OUTPUT_CAP) },
         );
-        let code = serve_into(spec, &matcher, &mut out);
+        let consumed = std::cell::Cell::new(false);
+        let code = serve_into(spec, &matcher, &mut out, io::Cursor::new(stdin), &consumed);
         let Output {
             sink: OutputSink::Buffer(buf),
-            err,
+            mut err,
             ..
         } = out
         else {
             unreachable!("buffered sink")
         };
-        (buf, err, code)
+        // The parent strips the stream-size marker from stderr; mirror that.
+        let stream_bytes = strip_stream_size_marker(&mut err);
+        (buf, err, code, stream_bytes)
     }
 
     /// Run the ORIGINAL command through a real shell (the authentic reference —
@@ -2409,22 +2701,79 @@ mod parity_tests {
     /// Run the real grep with the spec's fallback argv (the grep member only —
     /// used for pipeline rows, whose head member the e2e bench covers end-to-end).
     fn real_run_fallback(spec: &EngineSpec) -> (Vec<u8>, Vec<u8>, i32) {
+        real_run_fallback_with_stdin(spec, &[])
+    }
+
+    /// Run the real grep with explicit stdin bytes (stdin-fed parity rows).
+    fn real_run_fallback_with_stdin(spec: &EngineSpec, stdin: &[u8]) -> (Vec<u8>, Vec<u8>, i32) {
         let bin = match spec.verb.as_str() {
             "egrep" => "/usr/bin/egrep",
             "fgrep" => "/usr/bin/fgrep",
             _ => "/usr/bin/grep",
         };
-        let out = Command::new(bin)
+        let mut child = Command::new(bin)
             .args(&spec.fallback[1..])
             .current_dir(&spec.cwd)
             .env("LC_ALL", "C.UTF-8")
-            .output()
-            .expect("system grep runs");
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("system grep spawns");
+        let mut stdin_pipe = child.stdin.take().expect("stdin piped");
+        // Real grep may exit early (-m) and stop reading; a write error (EPIPE)
+        // is then the OS-native producer death, not a test failure. Dropping
+        // the handle delivers EOF for the full-scan case.
+        let _ = stdin_pipe.write_all(stdin);
+        drop(stdin_pipe);
+        let out = child.wait_with_output().expect("system grep runs");
         (
             out.stdout,
             out.stderr,
             out.status.code().expect("grep exits normally"),
         )
+    }
+
+    /// The full command prefix before the served grep member — pipeline
+    /// members plus any preceding `&&`/`||`/`;`-joined segments (all
+    /// preserved verbatim in the rewrite); `real_run_shell` captures the
+    /// stream from it. stdin-fed rows only.
+    fn producer_command(command: &str) -> String {
+        let segments = split_segments(command).expect("segments");
+        let gidx = segments
+            .iter()
+            .position(|(s, _)| {
+                let v = first_word(s);
+                is_grep_verb(v) || segment_contains_grep(s, v)
+            })
+            .expect("grep member");
+        let mut start = gidx;
+        // Walk back over any preceding segment (pipes, `&&`, `||`, `;`, blank
+        // lines): the rewrite preserves them verbatim, so the prefix assertion
+        // needs them in `out`. Rows with non-pipe segments before the producer
+        // are self-consistent (both parity sides get the same bytes) — their
+        // patterns must not match those segments' own output, which the
+        // authentic pipeline's grep never sees.
+        while start > 0
+            && matches!(
+                segments[start - 1].1.as_str(),
+                "|" | "|&" | "&&" | "||" | ";" | "\n"
+            )
+        {
+            start -= 1;
+        }
+        let mut out = String::new();
+        for (i, (seg, conn)) in segments[start..gidx].iter().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            out.push_str(seg);
+            if i + 1 < gidx - start {
+                out.push(' ');
+                out.push_str(conn);
+            }
+        }
+        out
     }
 
     /// The original command's text from its first `|`/`|&` connector on — the
@@ -2451,6 +2800,10 @@ mod parity_tests {
         let (specs, _, rewritten) = analyze_command(command, ws, home, true)
             .unwrap_or_else(|e| panic!("{command}: expected servable, got {e}"));
         assert_eq!(specs.len(), 1, "{command}: expected one grep member");
+        if specs[0].stdin {
+            assert_stdin_parity(command, &specs[0], &rewritten, ws, home);
+            return;
+        }
         let (eout, eerr, ecode) = engine_run(&specs[0]);
         let piped = command.split_whitespace().any(|w| w == "|" || w == "|&");
         let (rout, rerr, rcode) = if piped {
@@ -2463,6 +2816,77 @@ mod parity_tests {
         } else {
             real_run_shell(command, ws, home)
         };
+        assert_eq!(eout, rout, "stdout mismatch for {command}");
+        assert_eq!(eerr, rerr, "stderr mismatch for {command}");
+        assert_eq!(ecode, rcode, "exit mismatch for {command}");
+    }
+
+    /// The members after the served grep member, rejoined with their
+    /// connectors — must survive the rewrite verbatim (stdin-fed rows).
+    fn grep_tail(command: &str) -> Option<String> {
+        let segments = split_segments(command).ok()?;
+        let gidx = segments.iter().position(|(s, _)| {
+            let v = first_word(s);
+            is_grep_verb(v) || segment_contains_grep(s, v)
+        })?;
+        if gidx + 1 >= segments.len() {
+            return Some(String::new());
+        }
+        let mut out = format!(" {}", segments[gidx].1);
+        for (seg, conn) in &segments[gidx + 1..] {
+            out.push(' ');
+            out.push_str(seg);
+            if !conn.is_empty() {
+                out.push(' ');
+                out.push_str(conn);
+            }
+        }
+        Some(out)
+    }
+
+    /// stdin-fed parity: capture the producer's stream through a real shell,
+    /// then feed the same bytes to the engine and the real grep.
+    fn assert_stdin_parity(
+        command: &str,
+        spec: &EngineSpec,
+        rewritten: &str,
+        ws: &Path,
+        home: &Path,
+    ) {
+        let piped = command.split_whitespace().any(|w| w == "|" || w == "|&");
+        assert!(piped, "{command}: stdin serve requires a pipeline");
+        let producer = producer_command(command);
+        assert!(
+            !producer.is_empty() && rewritten.starts_with(&producer),
+            "{command}: producer not preserved verbatim (rewritten: {rewritten})"
+        );
+        let tail = grep_tail(command).unwrap_or_default();
+        assert!(
+            tail.is_empty() || rewritten.ends_with(&tail),
+            "{command}: pipeline tail not preserved verbatim (rewritten: {rewritten})"
+        );
+        let (stream, _, _) = real_run_shell(&producer, ws, home);
+        let (eout, eerr, ecode, stream_bytes) = engine_run_with_stdin(spec, &stream);
+        let (rout, rerr, rcode) = real_run_fallback_with_stdin(spec, &stream);
+        // Pins the stream-size marker chain: report_stream_bytes stdin serves
+        // must emit it. The count is the searcher's bytes through the
+        // CountingReader — the head is re-read through it, so an EOF read
+        // reports the exact stream length; only -m/-l early stops report a
+        // bounded prefix.
+        if spec.report_stream_bytes {
+            match stream_bytes {
+                Some(n) if stream.len() <= BINARY_WINDOW => {
+                    assert_eq!(n, stream.len() as u64, "stream-size marker for {command}")
+                }
+                Some(n) => assert!(
+                    n > 0 && n <= stream.len() as u64,
+                    "stream-size marker out of range for {command}"
+                ),
+                None => panic!("stream-size marker missing for {command}"),
+            }
+        } else {
+            assert_eq!(stream_bytes, None, "marker suppressed for {command}");
+        }
         assert_eq!(eout, rout, "stdout mismatch for {command}");
         assert_eq!(eerr, rerr, "stderr mismatch for {command}");
         assert_eq!(ecode, rcode, "exit mismatch for {command}");
@@ -2692,6 +3116,31 @@ mod parity_tests {
             // ── head pipeline (grep part parity) ──
             "grep -rn x plain | head -5",
             "grep -rn x plain | head",
+            // ── Producer-first pipelines: the first grep in a pipeline is
+            //    served from the producer's stdin (BSD stdin semantics) ──
+            "cat a.txt | grep foo",
+            "cat a.txt | grep -n foo | head -2",
+            "cat a.txt | grep -c foo",
+            "cat a.txt | grep -l foo",
+            "cat a.txt | grep -H foo",
+            "cat a.txt | grep -m1 foo",
+            "cat a.txt | grep -l --null foo",
+            "cat a.txt | grep -o foo | head -3",
+            "cat a.txt | grep -i FOO",
+            "cat a.txt | grep -v bar",
+            "cat a.txt | grep -cl foo",
+            "cat ctx.txt | grep -A1 -B1 d",
+            "cat a.txt | egrep 'foo|bar'",
+            "cat a.txt | fgrep foo",
+            "cat a.txt | grep foo | grep oo | head -3", // grep-on-grep: second preserved verbatim
+            "seq 1 100 | grep 5 | head -5",
+            "seq 1 100000 | grep -m1 5", // -m early stop on a >32 KiB stream (bounded marker branch)
+            "cat bindir/bin1.dat | grep needle", // binary stdin: NUL in the window
+            "echo hi | grep x",          // no-match stdin: exit 1, empty output
+            "cd sub && cat s.txt | grep needle", // cd-prefixed producer (stream captured from sub)
+            "cd sub && echo hi && cat s.txt | grep needle", // non-cd && segment before the producer
+            "false || cat a.txt | grep foo", // ||-joined producer (walk-back covers ||)
+            "cat a.txt | grep foo 2>&1 | wc -l", // member-side stderr merge: marker suppressed
             // ── Raw-token operands: quoted/escaped globs and ~ are literal ──
             "grep -rn needle '~'",
             "grep -rn needle '*.txt'",
@@ -2740,6 +3189,31 @@ mod parity_tests {
     }
 
     #[test]
+    fn stdin_m_early_stop_stops_consuming() {
+        // `seq 1 100000 | grep -m1 5`: the match sits inside the 32 KiB head,
+        // so a -m1 serve must stop reading once found (BSD instant-exit). The
+        // marker reports consumed bytes — well short of the full stream; a
+        // full scan would consume (and report) all of it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&ws).expect("ws");
+        fs::create_dir_all(&home).expect("home");
+        build_fixture(&ws, &home);
+        let (specs, _, _) =
+            analyze_command("seq 1 100000 | grep -m1 5", &ws, &home, true).expect("servable");
+        let (stream, _, _) = real_run_shell("seq 1 100000", &ws, &home);
+        assert!(stream.len() > BINARY_WINDOW, "fixture stream too small");
+        let (_, _, _, stream_bytes) = engine_run_with_stdin(&specs[0], &stream);
+        let n = stream_bytes.expect("marker emitted");
+        assert!(
+            n > 0 && (n as usize) < stream.len(),
+            "consumed {n} of {}: expected early stop",
+            stream.len()
+        );
+    }
+
+    #[test]
     fn fallback_triggers() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws = tmp.path().join("ws");
@@ -2749,9 +3223,8 @@ mod parity_tests {
         build_fixture(&ws, &home);
 
         let rows: &[&str] = &[
-            "grep x",                                  // stdin
-            "echo hi | grep x",                        // piped stdin
-            "grep x -",                                // - operand
+            "grep x",                                  // stdin (first member: tty-hang protection)
+            "grep x -",                                // - operand (first member)
             "grep -q x a.txt",                         // -q
             "grep -L x a.txt",                         // -L
             "grep -P x a.txt",                         // -P
@@ -2803,6 +3276,12 @@ mod parity_tests {
             "grep -w 'foo\\|bar' a.txt b.txt", // -w + alternation (word_safe)
             "echo $(echo \\) ; grep x a.txt", // unterminated $(...) — escape-aware span stays open
             "echo hello && echo world",    // no grep at all
+            // ── Producer-first stdin rejects: structural, not producer-based ──
+            "cat a.txt | grep foo b.txt", // non-first with file operands
+            "cat a.txt | grep foo -",     // non-first with a "-" operand
+            "printf 'x' | grep -r foo",   // non-first -r without operands (walks cwd)
+            "cat a.txt | sudo grep foo",  // nested introducer producer
+            "cat a.txt | xargs grep foo", // nested introducer producer
         ];
         for row in rows {
             assert_falls_back(row, &ws, &home);
@@ -2823,6 +3302,15 @@ mod parity_tests {
             "empty command or pipeline member",
         );
         assert_falls_back_reason("cat f | head", &ws, &home, "no grep");
+        // Producer-first stdin rejects: structural classes, not producer-based.
+        assert_falls_back_reason(
+            "cat a.txt | grep foo b.txt",
+            &ws,
+            &home,
+            "stdin with operands",
+        );
+        assert_falls_back_reason("cat a.txt | grep foo -", &ws, &home, "stdin with operands");
+        assert_falls_back_reason("printf 'x' | grep -r foo", &ws, &home, "stdin with -r");
         // Any-length pipelines with a single-file first grep fall back for the
         // perf gate, not the pipeline shape (their tails are preserved).
         assert_falls_back_reason("grep x a.txt | head -1 | wc -l", &ws, &home, "single file");
