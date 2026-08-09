@@ -277,6 +277,10 @@ impl BoardState {
                 ("↩ Back to Backlog", TicketPhase::Backlog),
                 ("🛑 Cancel", TicketPhase::Cancelled),
             ],
+            TicketPhase::Failed => vec![
+                ("✅ Ready for Dev", TicketPhase::ReadyForDevelopment),
+                ("🛑 Cancel", TicketPhase::Cancelled),
+            ],
             TicketPhase::Done | TicketPhase::Cancelled => {
                 vec![]
             }
