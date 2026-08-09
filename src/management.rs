@@ -51,9 +51,6 @@ use crate::{Agent, DiagnosticsCommands, Role, Workspace};
 /// calibrated dynamic count (see [`crate::joint_verdict::review_agent_count`]).
 pub(crate) const DEFAULT_PARALLEL_AGENT_COUNT: usize = 3;
 
-/// Prefix for all auto-diagnostics comments on tickets.
-const DIAGNOSTICS_COMMENT_PREFIX: &str = "🔍 Auto-diagnostics";
-
 /// Minimum acceptable verification score (0-10) for analyst verdicts.
 pub(crate) const ANALYST_PASS_THRESHOLD: u8 = 7;
 
@@ -150,10 +147,9 @@ impl CircuitBreakerKind {
                 "❌ Sanitation circuit breaker tripped after {count} cumulative failures. \
                  (max: {max_count})",
             ),
-            Self::Diagnostics => format!(
-                "{DIAGNOSTICS_COMMENT_PREFIX}\n\n❌ Circuit breaker: {count} prior diagnostic \
-                 failures. Failing ticket."
-            ),
+            Self::Diagnostics => {
+                format!("❌ Circuit breaker: {count} prior diagnostic failures. Failing ticket.")
+            }
         }
     }
 }
@@ -1215,6 +1211,61 @@ fn engineer_failure_comment(shutdown: bool, cancelled: bool, error: Option<&str>
     }
 }
 
+/// Extract a concise structured summary of the engineer's work for the ticket
+/// comment. Session-clean: the extraction runs on a local copy of the session
+/// history ([`Agent::extract_verdict`] never writes to the session store), so
+/// the session stays resumable without the extraction in it. The ticket comment
+/// is the authoritative record; on extraction failure or empty results the raw
+/// response is kept (fail-open — work is never silently dropped). Uses the
+/// short comment-only retry budget — a fail-open operation must not stall the
+/// pipeline behind the verdict-gate schedule. The fallback paths scrub without
+/// truncating (fail-open content is preserved; only the success path applies
+/// the 24 KB sandwich cap). The extraction widens the post-agent window
+/// (assigned_to still set, agent unregistered) to at most ~90 s: comments
+/// arriving then are persisted and picked up on the next engineer round,
+/// never lost.
+async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
+    let ticket_id = agent.ticket.as_ref().map_or("?", |t| t.id.as_str());
+    let policy = crate::retry::RetryPolicy::comment();
+    let extraction_prompt = load_prompt("extraction/engineer.md");
+    let summary = match agent
+        .extract_verdict::<crate::EngineerSummary>(&extraction_prompt, None, Some(&policy))
+        .await
+    {
+        Ok(summary) => summary,
+        Err(e) => {
+            warn!(
+                ticket = %ticket_id,
+                error = %e,
+                "Engineer summary extraction failed — using raw response for ticket comment"
+            );
+            return crate::util::scrub_credentials(raw);
+        }
+    };
+    let items: Vec<&str> = summary
+        .items
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    if items.is_empty() {
+        warn!(
+            ticket = %ticket_id,
+            "Engineer summary extraction returned no usable items — using raw response for ticket comment"
+        );
+        return crate::util::scrub_credentials(raw);
+    }
+    let mut out = String::from("Implemented / fixed / executed:");
+    for item in items {
+        let _ = write!(out, "\n- {}", item.replace('\n', " "));
+    }
+    crate::util::truncate_sandwich(
+        &crate::util::scrub_credentials(&out),
+        crate::util::FAILURE_DETAIL_CAP,
+        "engineer summary comment",
+    )
+}
+
 /// Run an Engineer agent to implement the ticket.
 ///
 /// Gathers feedback comments from all roles since the last engineer run and
@@ -1279,7 +1330,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     );
     let (comment_text, target_phase, notify) = if let Some(ref text) = response {
         (
-            text.clone(),
+            engineer_comment_text(&agent, text).await,
             TicketPhase::InDiagnostics,
             NotifyPolicy::Buffer,
         )
@@ -1827,7 +1878,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     let extraction_prompt = crate::prompt::load_prompt("extraction/sanitation.md");
 
     let verdict: crate::SanitationVerdict =
-        match agent.extract_verdict(&extraction_prompt, None).await {
+        match agent.extract_verdict(&extraction_prompt, None, None).await {
             Ok(v) => v,
             Err(failure) => {
                 warn!(
@@ -1969,10 +2020,10 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
 /// differently-configured `lint-fix` (e.g. `--all-targets`) is still run so
 /// its coverage is never dropped.
 ///
-/// Returns `(comment_text, all_passed)` where `comment_text` includes the
-/// [`DIAGNOSTICS_COMMENT_PREFIX`] header and the appropriate pass/fail marker.
+/// Returns `(comment_text, all_passed)` where `comment_text` carries the
+/// per-command lines and the appropriate pass/fail marker.
 async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) -> (String, bool) {
-    let mut comment = String::from(DIAGNOSTICS_COMMENT_PREFIX);
+    let mut comment = String::new();
     let mut all_passed = true;
     let mut failed_at: &str = "";
 
@@ -1995,13 +2046,24 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
         let normalized = crate::normalize_gate_breaking_clippy_compound(cmd);
         let cmd: &str = normalized.as_deref().unwrap_or(cmd);
 
-        let _ = write!(comment, "\n\n{label} ({cmd}):\n");
-
+        let started = std::time::Instant::now();
         match ShellTool::new(ShellMode::Full)
             .execute_with_status(ws, serde_json::json!({"command": cmd}))
             .await
         {
-            Ok((output, exit_code)) => {
+            Ok((_output, Some(0))) => {
+                // Successful commands carry a compact one-line summary — the
+                // full output is noise in the ticket.
+                let _ = write!(
+                    comment,
+                    "\n\n{label} ({cmd}): PASSED in {:.1}s",
+                    started.elapsed().as_secs_f64(),
+                );
+            }
+            Ok((output, _exit_code)) => {
+                // Failed command: keep the whole output exactly as before
+                // (including stderr and exit details).
+                let _ = write!(comment, "\n\n{label} ({cmd}):\n");
                 let display = if output.is_empty() {
                     "(no output)".to_string()
                 } else {
@@ -2010,15 +2072,13 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
                 // Output is already credential-scrubbed by ShellTool's output
                 // pipeline at pipeline entry, so no further scrubbing needed.
                 comment.push_str(&display);
-
-                if exit_code != Some(0) {
-                    all_passed = false;
-                    failed_at = label;
-                    break;
-                }
+                all_passed = false;
+                failed_at = label;
+                break;
             }
             Err(e) => {
                 // Timeout or process launch failure.
+                let _ = write!(comment, "\n\n{label} ({cmd}):\n");
                 comment.push_str(&e.to_string());
                 all_passed = false;
                 failed_at = label;
@@ -2038,7 +2098,9 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
         );
     }
 
-    (comment, all_passed)
+    // The removed "Auto-diagnostics" header would leave the first command's
+    // separator as leading blank lines — strip them.
+    (comment.trim_start_matches('\n').to_string(), all_passed)
 }
 
 /// Run diagnostics commands after the engineer completes development.
@@ -2438,6 +2500,7 @@ async fn run_parallel_agents(
                         .extract_verdict::<crate::Verdict>(
                             &extraction_prompt,
                             Some(&validate_verdict_score),
+                            None,
                         )
                         .await;
                     match verdict {
@@ -3032,28 +3095,13 @@ async fn process_verifier_verdicts(
     let joint_comment = if all_failed {
         None
     } else {
-        let valid = results
-            .iter()
-            .filter(|r| matches!(r, ParallelVerdict::Verdict(_)))
-            .count();
-        let header = if any_failed {
-            format!(
-                "{} of {valid} valid verdicts failed (threshold {REVIEW_QA_THRESHOLD}/10).",
-                results
-                    .iter()
-                    .filter(|r| matches!(r, ParallelVerdict::Verdict(v) if !verdict_passes(v)))
-                    .count(),
-            )
-        } else {
-            format!("All {valid} valid verdicts passed (threshold {REVIEW_QA_THRESHOLD}/10).")
-        };
         Some(
             build_joint_comment(
                 stage_name(verifier.role),
                 results,
                 REVIEW_QA_THRESHOLD,
                 verifier.role,
-                &header,
+                "",
                 ws,
             )
             .await,

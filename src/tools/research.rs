@@ -610,7 +610,7 @@ async fn run_structured_analyst<T: serde::de::DeserializeOwned>(
     }
     let (tool_calls, searches, queries) = extract_query_telemetry(&agent);
     match agent
-        .extract_verdict::<T>(extraction_prompt, validate)
+        .extract_verdict::<T>(extraction_prompt, validate, None)
         .await
     {
         Ok(value) => AnalystRun::Findings(AnalystRunOutcome {
@@ -731,7 +731,7 @@ async fn orchestrator_extract<T: serde::de::DeserializeOwned>(
     let mut messages = Vec::with_capacity(2);
     crate::prompt::prepend_general_context(&mut messages, ws).await;
     messages.push(ChatMessage::user(prompt));
-    crate::extraction::retry_extract_structured_scoped::<T>(&messages, "", &params, validate)
+    crate::extraction::retry_extract_structured_scoped::<T>(&messages, "", &params, validate, None)
         .await
         .map_err(|e| anyhow::anyhow!("orchestrator extraction '{purpose}' failed: {e}"))
 }

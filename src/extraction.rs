@@ -17,7 +17,13 @@ use crate::{ChatMessage, ChatRequest, ExtractionValidator};
 /// 13 attempts, backoff 5/10/20/40/60/60… s
 /// (doubling capped at 60 s), Retry-After honored, shutdown-abortable,
 /// 720 s wall-clock cap. Used by verdict extraction (Analyst / Reviewer /
-/// QA / Sanitation) and workspace diagnostics discovery.
+/// QA / Sanitation), workspace diagnostics discovery, and the engineer's
+/// comment-only summary extraction (the latter via
+/// [`crate::retry::RetryPolicy::comment`] — 3 attempts / 90 s).
+///
+/// `policy_override` supplies a shorter schedule for fail-open callers
+/// (e.g. comment-only extraction — [`crate::retry::RetryPolicy::comment`]);
+/// `None` uses the default 13-attempt/720 s policy.
 ///
 /// The outer loop is the SINGLE retry authority — provider-internal retries
 /// are suppressed via [`crate::providers::chat_scoped`], so total provider
@@ -45,6 +51,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
     extraction_prompt: &str,
     params: &ChatRequest,
     validate: Option<&ExtractionValidator<T>>,
+    policy_override: Option<&RetryPolicy>,
 ) -> Result<T, crate::retry::RetryExhausted> {
     let mut extraction_history = history.to_vec();
     let operation_started = Instant::now();
@@ -55,7 +62,9 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
     }
 
     let retry_prompt = load_prompt("extraction/retry.md");
-    let policy = RetryPolicy::current();
+    let policy = policy_override
+        .cloned()
+        .unwrap_or_else(RetryPolicy::current);
     let mut loop_state = RetryLoop::new(&policy);
     let mut last_raw: Option<String> = None;
 
@@ -233,6 +242,7 @@ mod tests {
             "return JSON verdict",
             &test_params(),
             Some(&score_validator),
+            None,
         )
         .await
     }

@@ -745,11 +745,13 @@ impl Agent {
     /// `validate` runs fail-closed on the parsed value (e.g. score ∈ [0,10]):
     /// a rejected value is treated as a parse failure and re-prompted.
     /// Pass `validate = None` for plain structured extraction (diagnostics
-    /// discovery).
+    /// discovery). `policy_override` supplies a shorter retry schedule for
+    /// fail-open callers; `None` uses the default verdict budget.
     pub(crate) async fn extract_verdict<T: serde::de::DeserializeOwned>(
         &self,
         extraction_prompt: &str,
         validate: Option<&crate::ExtractionValidator<T>>,
+        policy_override: Option<&crate::retry::RetryPolicy>,
     ) -> Result<T, crate::retry::RetryExhausted> {
         let params = self.build_chat_request(vec![], false, "extraction");
         crate::extraction::retry_extract_structured_scoped(
@@ -757,6 +759,7 @@ impl Agent {
             extraction_prompt,
             &params,
             validate,
+            policy_override,
         )
         .await
     }

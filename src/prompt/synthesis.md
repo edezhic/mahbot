@@ -10,7 +10,8 @@ Hard rules:
 - Every item id from the input must appear exactly once: either as a member of a group or in
   the "ungrouped" list. Never silently drop an issue.
 - When several agents raised the same fact, include one member id per item that raised it —
-  the agreement bracket is computed from the distinct agents the cited ids resolve to.
+  the affected-agent count is derived from the cited ids alone, so never cite an id twice
+  or state a count in the heading.
 
 The output schema depends on the round:
 - First response: emit the FULL schema below (summary + groups + ungrouped).

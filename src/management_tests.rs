@@ -439,7 +439,6 @@ async fn breaker_counts_failures() {
 fn pass_verdict() -> crate::Verdict {
     crate::Verdict {
         score: REVIEW_QA_THRESHOLD,
-        critique: Some("Good work.".into()),
         issues_detected: vec![],
     }
 }
@@ -448,7 +447,6 @@ fn pass_verdict() -> crate::Verdict {
 fn fail_verdict() -> crate::Verdict {
     crate::Verdict {
         score: 3,
-        critique: Some("Missing error handling.".into()),
         issues_detected: vec!["No timeout check".into()],
     }
 }
@@ -464,8 +462,7 @@ fn no_verdict() -> ParallelVerdict {
 /// For [`CircuitBreakerKind::Sanitation`], adds a [`SANITATION_ROLE`] comment
 /// composed from `sanitation_circuit_breaker_comment.md` using `sanitation_failed.md`.
 /// For [`CircuitBreakerKind::Diagnostics`], adds a [`DIAGNOSTICS_ROLE`] comment with
-/// [`DIAGNOSTICS_COMMENT_PREFIX`] and `diagnostics_failed.md` with
-/// `{{failed_at}}` = `"test_step"`.
+/// `diagnostics_failed.md` and `{{failed_at}}` = `"test_step"`.
 async fn add_breaker_failure(kind: CircuitBreakerKind, ticket_id: &str) {
     let (role, comment) = match kind {
         CircuitBreakerKind::Sanitation => (
@@ -483,10 +480,7 @@ async fn add_breaker_failure(kind: CircuitBreakerKind, ticket_id: &str) {
         ),
         CircuitBreakerKind::Diagnostics => (
             DIAGNOSTICS_ROLE,
-            format!(
-                "{DIAGNOSTICS_COMMENT_PREFIX}\n\n---\n{} test_step",
-                load_prompt("diagnostics_failed.md"),
-            ),
+            format!("---\n{} test_step", load_prompt("diagnostics_failed.md")),
         ),
     };
     let _ = board().add_comment(ticket_id, role, &comment).await;
@@ -502,11 +496,10 @@ fn fail_result() -> ParallelVerdict {
     ParallelVerdict::Verdict(fail_verdict())
 }
 
-/// Helper: construct an analyst verdict with explicit score / critique / issues.
-fn analyst_verdict(score: u8, critique: &str, issues: &[&str]) -> ParallelVerdict {
+/// Helper: construct an analyst verdict with explicit score / issues.
+fn analyst_verdict(score: u8, issues: &[&str]) -> ParallelVerdict {
     ParallelVerdict::Verdict(crate::Verdict {
         score,
-        critique: Some(critique.into()),
         issues_detected: issues.iter().map(|&s| s.into()).collect(),
     })
 }
@@ -662,14 +655,15 @@ async fn process_verifier_verdicts_cases() {
             );
             let joint = &verdict_comments[0];
             assert!(
-                joint.content.contains("round"),
-                "case {}: joint comment must carry the stage title: {}",
+                !joint.content.contains("valid verdicts")
+                    && !joint.content.contains("threshold 9/10"),
+                "case {}: verifier comments carry no round headline or threshold line: {}",
                 case.name,
                 joint.content,
             );
             assert!(
-                joint.content.contains("threshold 9/10"),
-                "case {}: joint comment must carry the code-computed threshold line: {}",
+                joint.content.contains("### Summary"),
+                "case {}: joint comment keeps the Summary section: {}",
                 case.name,
                 joint.content,
             );
@@ -846,9 +840,9 @@ async fn process_analyst_verdicts_cases() {
             ws_suffix: "an_all_pass",
             title: "Analyst All Pass",
             results: vec![
-                analyst_verdict(10, "Great analysis.", &[]),
-                analyst_verdict(9, "Solid work.", &[]),
-                analyst_verdict(8, "Good analysis.", &[]),
+                analyst_verdict(10, &[]),
+                analyst_verdict(9, &[]),
+                analyst_verdict(8, &[]),
             ],
             expected_comment_substring: "All LGTM",
         },
@@ -857,9 +851,9 @@ async fn process_analyst_verdicts_cases() {
             ws_suffix: "an_partial",
             title: "Analyst Partial Fail",
             results: vec![
-                analyst_verdict(10, "Great.", &[]),
-                analyst_verdict(3, "Poor analysis.", &["Missing data"]),
-                analyst_verdict(8, "Decent.", &["Minor issue"]),
+                analyst_verdict(10, &[]),
+                analyst_verdict(3, &["Missing data"]),
+                analyst_verdict(8, &["Minor issue"]),
             ],
             expected_comment_substring: "flagged potential blockers",
         },
@@ -935,8 +929,8 @@ async fn analyst_round_fails_open_with_fallback_comment() {
     let ticket_id = make_ticket(board(), &ws, "Fail Open", TicketPhase::Analysis).await;
 
     let results = vec![
-        analyst_verdict(10, "Great.", &[]),
-        analyst_verdict(3, "Poor analysis.", &["Missing data"]),
+        analyst_verdict(10, &[]),
+        analyst_verdict(3, &["Missing data"]),
     ];
     let ticket = expect_ticket(board(), &ticket_id).await;
     process_analyst_verdicts(&ws, &ticket, &results).await;
@@ -1345,8 +1339,8 @@ async fn process_sanitation_verdict_cases() {
 /// | Scenario | Commands | Expected Phase | Pipeline Reservation | Comment Contains |
 /// |---|---|---|---|---|
 /// | No diagnostics commands | None (unset) | DiagnosticsDone | false | "No diagnostics commands are configured" |
-/// | Diagnostics failure | `false` | ReadyForDevelopment | true | `DIAGNOSTICS_COMMENT_PREFIX` + `diagnostics_failed.md` |
-/// | Diagnostics pass | `true`, ... | DiagnosticsDone | false | `DIAGNOSTICS_COMMENT_PREFIX` + `diagnostics_passed.md` |
+/// | Diagnostics failure | `false` | ReadyForDevelopment | true | `diagnostics_failed.md` marker |
+/// | Diagnostics pass | `true`, ... | DiagnosticsDone | false | `diagnostics_passed.md` marker |
 /// | DB error (corrupt JSON) | N/A (corrupt) | DiagnosticsDone | false | "database error" |
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
@@ -1376,9 +1370,9 @@ async fn dispatch_diagnostics_cases() {
     const DB_ERR: &[&str] = &["database error"];
 
     let fail_comment_contains: &'static [&'static str] =
-        Box::leak(vec![DIAGNOSTICS_COMMENT_PREFIX, diagnostics_failed_marker].into_boxed_slice());
+        Box::leak(vec![diagnostics_failed_marker].into_boxed_slice());
     let pass_comment_contains: &'static [&'static str] =
-        Box::leak(vec![DIAGNOSTICS_COMMENT_PREFIX, diagnostics_passed_marker].into_boxed_slice());
+        Box::leak(vec![diagnostics_passed_marker, "PASSED in"].into_boxed_slice());
 
     let fail_cmds = DiagnosticsCommands {
         format: Some("false".to_string()),
@@ -1673,6 +1667,14 @@ async fn diagnostics_repaired_chain_passes_on_clean_crate() {
         comment.contains(&load_prompt("diagnostics_passed.md")),
         "the run should end with the pass marker, comment was:\n{comment}"
     );
+    assert!(
+        comment.contains("PASSED in"),
+        "successful commands render the compact PASSED line, comment was:\n{comment}"
+    );
+    assert!(
+        !comment.contains("[cargo"),
+        "successful command output is dropped from the comment, comment was:\n{comment}"
+    );
 }
 
 // ── dispatch_verifiers skip-review ──────────────────────────────
@@ -1819,13 +1821,17 @@ fn joint_comment_includes_failed_agent_dumps() {
                 dump: "agent produced no response".to_string(),
             },
         ],
-        header: "0 of 0 valid verdicts failed.".to_string(),
+        header: String::new(),
         threshold: 9,
     };
     let comment = crate::joint_verdict::render_joint_comment(
         &round,
         &crate::consensus::RepairOutcome::Fallback,
         &crate::consensus::ItemTable::new(&crate::joint_verdict::issues_by_agent(&round)),
+    );
+    assert!(
+        !comment.contains("valid verdicts"),
+        "verifier comments carry no verdict/threshold headline: {comment}"
     );
     assert!(
         comment.contains("Raw agent response"),
@@ -1918,4 +1924,77 @@ fn engineer_failure_comment_scrubs_and_truncates() {
         "{c}"
     );
     assert!(c.len() < 26_000, "comment capped, got {}", c.len());
+}
+
+/// The engineer's comment extraction is fail-open and scrubbed on every path:
+/// extraction failure and empty/blank item lists fall back to the raw response
+/// (credential-scrubbed), while a valid item list renders the compact bullet
+/// summary (also scrubbed).
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+async fn engineer_comment_text_fail_open_and_renders() {
+    use crate::util::test::{
+        FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
+    };
+
+    let _lock = retry_tests_lock();
+    let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+    let ws = test_ws_named("/tmp/test_ws", "eng_comment");
+    let raw = "raw response with secret=abcdefgh1234";
+    let new_agent = |suffix: &str| {
+        Agent::new(
+            format!("eng_comment_{suffix}_{}", crate::generate_suffix()),
+            Role::Engineer,
+            &ws,
+            None,
+            String::new(),
+            String::new(),
+        )
+    };
+
+    // Extraction failure → raw response kept (fail-open) and scrubbed.
+    let fake = FakeProvider::new()
+        .err(crate::retry::FailureClass::Transport, "boom")
+        .err(crate::retry::FailureClass::Transport, "boom")
+        .err(crate::retry::FailureClass::Transport, "boom");
+    let _provider = install_fake_provider(Arc::new(fake));
+    let comment = engineer_comment_text(&new_agent("err"), raw).await;
+    assert_eq!(
+        comment,
+        crate::util::scrub_credentials(raw),
+        "extraction failure keeps the raw response"
+    );
+    assert!(
+        comment.contains("[REDACTED]") && !comment.contains("abcdefgh1234"),
+        "fallback is scrubbed: {comment}"
+    );
+
+    // Empty item list → raw response kept.
+    let fake = FakeProvider::new().ok(r#"{"items": []}"#);
+    let _provider = install_fake_provider(Arc::new(fake));
+    let comment = engineer_comment_text(&new_agent("empty"), raw).await;
+    assert_eq!(
+        comment,
+        crate::util::scrub_credentials(raw),
+        "empty items fall back to raw"
+    );
+
+    // Blank-string items → raw response kept (degenerate model emission).
+    let fake = FakeProvider::new().ok(r#"{"items": [""]}"#);
+    let _provider = install_fake_provider(Arc::new(fake));
+    let comment = engineer_comment_text(&new_agent("blank"), raw).await;
+    assert_eq!(
+        comment,
+        crate::util::scrub_credentials(raw),
+        "blank items fall back to raw"
+    );
+
+    // Valid items → compact bullet list.
+    let fake = FakeProvider::new().ok(r#"{"items": ["implemented X", "fixed Y"]}"#);
+    let _provider = install_fake_provider(Arc::new(fake));
+    let comment = engineer_comment_text(&new_agent("ok"), raw).await;
+    assert_eq!(
+        comment, "Implemented / fixed / executed:\n- implemented X\n- fixed Y",
+        "valid items render the compact bullet list"
+    );
 }

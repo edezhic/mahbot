@@ -196,7 +196,6 @@ mod tests {
 ```"#;
         let result: Verdict = parse_fenced_json(text).unwrap();
         assert_eq!(result.score, 5);
-        assert_eq!(result.critique.as_deref(), Some("Problems found"));
         assert_eq!(result.issues_detected.len(), 2);
         assert!(
             result

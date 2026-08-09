@@ -8,7 +8,6 @@ use crate::consensus::{
 fn verdict(score: u8, issues: &[&str]) -> Verdict {
     Verdict {
         score,
-        critique: None,
         issues_detected: issues.iter().map(|&s| s.to_string()).collect(),
     }
 }
@@ -263,12 +262,20 @@ fn validator_uses_original_agent_indices_with_mid_round_failure() {
     );
     let text = render_joint_comment(&r, &repaired(out), &ItemTable::new(&issues_by_agent(&r)));
     assert!(
-        text.contains("Agent 2: Missing retry"),
+        text.contains("Missing retry"),
         "member of agent 2 must render via the id table: {text}"
     );
     assert!(
-        text.contains("Agent 0: No timeout check"),
+        text.contains("No timeout check"),
         "member of agent 0 must render via the id table: {text}"
+    );
+    assert!(
+        !text.contains("Agent 0: No timeout check") && !text.contains("Agent 2: Missing retry"),
+        "issue lines carry no agent prefixes: {text}"
+    );
+    assert!(
+        text.contains("Agent 2: agent crashed"),
+        "the failure appendix keeps its agent label: {text}"
     );
     assert!(!text.contains("missing issue"), "no silent drops: {text}");
 }
@@ -303,16 +310,19 @@ fn renderer_with_partial_failures() {
         "Review",
         vec![(0, verdict(4, &["No timeout check"])), (1, verdict(9, &[]))],
         vec![(2, "agent produced no response — crashed")],
-        "1 of 2 valid verdicts failed (threshold 9/10).",
+        "",
     );
     let text = render_joint_comment(
         &r,
         &RepairOutcome::Fallback,
         &ItemTable::new(&issues_by_agent(&r)),
     );
-    assert!(text.contains("## Review round — 2/3 valid verdicts"));
     assert!(
-        text.contains("- Agent 0: No timeout check"),
+        !text.contains("valid verdicts"),
+        "round headline and verdict counts are noise: {text}"
+    );
+    assert!(
+        text.contains("- No timeout check"),
         "fallback renders the raw per-agent member dump: {text}"
     );
     assert!(text.contains("### Agent failures"));
@@ -330,15 +340,17 @@ fn renderer_no_issues_summary_respects_threshold() {
         "Review",
         vec![(0, verdict(10, &[])), (1, verdict(9, &[]))],
         vec![],
-        "All 2 valid verdicts passed (threshold 9/10).",
+        "",
     );
     let text = render_joint_comment(
         &r,
         &RepairOutcome::Fallback,
         &ItemTable::new(&issues_by_agent(&r)),
     );
-    assert!(text.contains("## Review round — 2/2 valid verdicts"));
-    assert!(text.contains("All 2 valid verdicts passed (threshold 9/10)."));
+    assert!(
+        !text.contains("valid verdicts"),
+        "round headline and verdict counts are noise: {text}"
+    );
     assert!(
         text.contains("all 2 agents passed clean"),
         "clean-round summary must state the pass outcome: {text}"
@@ -355,7 +367,7 @@ fn renderer_no_issues_summary_respects_threshold() {
         "Review",
         vec![(0, verdict(8, &[])), (1, verdict(10, &[]))],
         vec![],
-        "1 of 2 valid verdicts failed (threshold 9/10).",
+        "",
     );
     let text = render_joint_comment(
         &bounced,
@@ -408,16 +420,16 @@ fn renderer_with_synthesis_groups_and_contradiction() {
     );
     let text = render_joint_comment(&r, &repaired(out), &table);
     assert!(
-        text.contains("**Robustness** [1/2]"),
-        "solo group renders [1/2] without DISPUTED: {text}"
+        text.contains("**Robustness**\n- No timeout check"),
+        "solo group renders without brackets or agent attribution: {text}"
     );
     assert!(
-        text.contains("**Safety** [2/2 · DISPUTED]"),
-        "contradiction group renders [2/2 · DISPUTED]: {text}"
+        text.contains("**Safety** — DISPUTED\n- No timeout check\n- Missing error handling"),
+        "contradiction group keeps its heading, both member issues, and the DISPUTED marker: {text}"
     );
     assert!(
-        text.contains("Agent 0: No timeout check"),
-        "member lines are attributed per source: {text}"
+        !text.contains("Agent 0:") && !text.contains('[') && !text.contains(']'),
+        "per-agent attribution and brackets are stripped: {text}"
     );
 }
 
@@ -445,13 +457,13 @@ fn renderer_with_ungrouped_trailing_section() {
         "ungrouped section renders: {text}"
     );
     assert!(
-        text.contains("- Agent 1: Naming nit"),
+        text.contains("- Naming nit"),
         "ungrouped member renders deterministically: {text}"
     );
 }
 
 #[test]
-fn renderer_marks_blocker_from_cited_agent_score() {
+fn renderer_strips_blocker_prefixes() {
     let r = round(
         "Review",
         vec![
@@ -473,12 +485,12 @@ fn renderer_marks_blocker_from_cited_agent_score() {
     );
     let text = render_joint_comment(&r, &repaired(out), &table);
     assert!(
-        text.contains("[blocker] Agent 0: No timeout check"),
-        "below-threshold agent's member renders as blocker: {text}"
+        text.contains("- No timeout check"),
+        "below-threshold agent's issue text is kept: {text}"
     );
     assert!(
-        !text.contains("[blocker] Agent 1"),
-        "passing agent's member is not a blocker: {text}"
+        !text.contains("[blocker]"),
+        "blocker severity prefixes are stripped: {text}"
     );
 }
 
@@ -513,7 +525,7 @@ fn synthesis_request_uses_global_flat_item_ids() {
     );
     assert!(
         !user.contains("Agent 0 (score") && !user.contains("(score"),
-        "scores are not part of the synthesis input (the renderer adds them): {user}"
+        "scores are not part of the synthesis input: {user}"
     );
     assert!(
         !user.contains("Agent 2"),
@@ -724,7 +736,7 @@ async fn repair_contradiction_reference_renders_disputed() {
         &ItemTable::new(&issues_by_agent(&r)),
     );
     assert!(
-        text.contains("Agent 1: Actually unsafe [DISPUTED — contradicts group 0 \"Safety\"]"),
+        text.contains("Actually unsafe [DISPUTED — contradicts group 0 \"Safety\"]"),
         "reference must render with DISPUTED + cross-ref: {text}"
     );
 }
@@ -736,7 +748,7 @@ async fn repair_rejects_empty_member_group() {
     let _policy = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
 
     // Round 1 proposes an empty-member group (must NOT freeze as progress —
-    // it places nothing and would render a bogus [0/N] bracket) alongside a
+    // it places nothing and would render an empty group heading) alongside a
     // valid group; the rejection reaches the round-2 repair prompt. Round 2
     // leaves the remainder ungrouped → zero-progress stop.
     let r = round(
@@ -807,7 +819,6 @@ fn analysis_escalation_trigger() {
     let v = |score: u8| {
         ParallelVerdict::Verdict(crate::Verdict {
             score,
-            critique: None,
             issues_detected: vec![],
         })
     };

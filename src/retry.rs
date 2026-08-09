@@ -1,6 +1,6 @@
 //! Outer retry orchestration for LLM operations.
 //!
-//! Four expensive code paths use this module:
+//! Five expensive code paths use this module:
 //!
 //! 1. **Agent-loop LLM calls** — every chat call an agent makes while working
 //!    (`src/agent.rs`).
@@ -10,6 +10,11 @@
 //!    (`src/workspace.rs`).
 //! 4. **Analyst consolidation** — the synthesis of the 3 parallel analyst
 //!    reports in the ask tool (`src/tools/ask.rs`).
+//! 5. **Comment-only extraction** — the engineer's ticket-comment summary runs
+//!    through the same verdict-extraction machinery with a short
+//!    3-attempt/90 s budget ([`RetryPolicy::comment`]) — the caller is
+//!    fail-open, so a long retry would stall the pipeline for a non-critical
+//!    operation.
 //!
 //! # Single retry authority
 //!
@@ -17,7 +22,7 @@
 //! calls provider-internal retries are suppressed (see [`Provider::chat_scoped`]),
 //! so total provider HTTP calls per operation are explicitly bounded:
 //! 13 per agent LLM call, 13 per verdict extraction, 13 per diagnostics
-//! discovery, 13 per consolidation.
+//! discovery, 13 per consolidation, 3 per comment-only extraction.
 //!
 //! # Byte-identical retry parameters
 //!
@@ -154,6 +159,30 @@ impl RetryPolicy {
             base_backoff_ms: DEFAULT_SYNTHESIS_BASE_BACKOFF_MS,
             max_backoff_ms: DEFAULT_SYNTHESIS_MAX_BACKOFF_MS,
             operation_timeout: Duration::from_mins(10),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+        }
+    }
+
+    /// Build the comment-only extraction policy for fail-open callers: the
+    /// caller falls back to raw text on failure, so a short budget avoids
+    /// stalling the pipeline for a non-critical operation (the
+    /// 13-attempt/720 s budget is for verdict gates).
+    ///
+    /// Like [`Self::current`], a test override installed via
+    /// [`swap_test_retry_policy`] takes precedence so tests run fast.
+    #[must_use]
+    pub(crate) fn comment() -> Self {
+        #[cfg(test)]
+        if let Ok(guard) = TEST_POLICY_OVERRIDE.read()
+            && let Some(p) = guard.as_ref()
+        {
+            return p.clone();
+        }
+        Self {
+            max_attempts: 3,
+            base_backoff_ms: DEFAULT_RETRY_BASE_BACKOFF_MS,
+            max_backoff_ms: DEFAULT_RETRY_MAX_BACKOFF_MS,
+            operation_timeout: Duration::from_secs(90),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
     }

@@ -4,7 +4,7 @@ Base your review on the actual changed code: read and search relevant files and 
 
 Use only non-mutating shell commands for investigations — DO NOT USE `git stash`, `git reset`, `git checkout` (branch switching), `git commit`, `git merge`, `git rebase`, or any command that mutates the workspace because there might be parallel agents working in the same workspace at the same time. Git staging is managed by the pipeline: both staged and unstaged working-tree changes are part of the work under review, and the pipeline stages and commits everything itself. Do not treat staged vs unstaged state as a signal about what belongs in the change.
 
-Automatic diagnostics (format, lint, type-check, build, unit tests) already ran before this review — see the Auto-diagnostics comment in the ticket. Do not re-run them wholesale; run extra commands only if you specifically need to verify something beyond what was already checked.
+Automatic diagnostics (format, lint, type-check, build, unit tests) already ran before this review — see the diagnostics comment in the ticket. Do not re-run them wholesale; run extra commands only if you specifically need to verify something beyond what was already checked.
 
 The pipeline commits automatically after review and QA pass. Do not check whether the changes are ready to commit unless the ticket explicitly asks for it.
 

@@ -305,7 +305,7 @@ async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) 
     // call — the provider can reuse the cached prefix. Retry exhaustion
     // (RetryExhausted) surfaces the scoped loop's failure trail.
     let cmds: crate::DiagnosticsCommands = agent
-        .extract_verdict(&extraction_prompt, None)
+        .extract_verdict(&extraction_prompt, None, None)
         .await
         .map_err(anyhow::Error::from)?;
 

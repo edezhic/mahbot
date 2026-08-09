@@ -359,7 +359,7 @@ async fn extract_findings(runs: Vec<(Agent, Option<String>)>) -> Vec<AnalystOutc
                 return AnalystOutcome::NoResponse("analyst produced no response".to_string());
             }
             match agent
-                .extract_verdict::<AnalystFindings>(&extraction_prompt, None)
+                .extract_verdict::<AnalystFindings>(&extraction_prompt, None, None)
                 .await
             {
                 Ok(findings) => AnalystOutcome::Findings { raw, findings },
@@ -749,6 +749,7 @@ async fn run_claim_verifier(
         .extract_verdict::<VerificationVerdict>(
             extraction_prompt,
             Some(&validate_verification_verdict),
+            None,
         )
         .await
     {

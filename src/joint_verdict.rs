@@ -5,11 +5,15 @@
 //! merge backbone is the shared LLM grouping core ([`crate::consensus`]):
 //! a progress-preserving repair synthesis pass groups the agents' exact issue
 //! statements — accepted groups freeze, repair rounds only touch the
-//! remainder — and every group renders with a code-computed `[n/N]` bracket
-//! derived from distinct cited agent ids. The DISPUTED marker appears only
-//! when a group carries a genuine contradiction (contradiction:true — never
-//! for solo findings). The LLM never produces counts — brackets are pure
-//! arithmetic here.
+//! remainder — contradiction groups carry a `— DISPUTED` marker on their
+//! heading. The DISPUTED cross-reference appears in the ungrouped section
+//! only when a member contradicts a frozen group (contradiction:true — never
+//! for solo findings). Per-agent attribution (brackets, "Agent N:" /
+//! "[blocker]" prefixes) and free-form critiques are stripped from comments —
+//! scores + issues are persisted in the verdict store instead. The Analysis
+//! stage shares this renderer, so analyst critiques are dropped too (the
+//! shared `Verdict` schema carries score + issues only — critiques were never
+//! persisted anywhere).
 //!
 //! Items are referenced by stable numeric ids (global flat numbering across
 //! all agents); validation is strictly structural (id range, duplicate
@@ -57,12 +61,14 @@ pub(crate) struct JointRound<'a> {
     /// Code-computed agreement summary line (counts/classification — never
     /// the LLM's numbers).
     pub header: String,
-    /// Pass threshold: issues from verdicts below this render as blockers.
+    /// Pass threshold: the clean-round summary only claims "passed clean" when
+    /// every valid verdict clears it (a sub-threshold verdict bounces the round
+    /// even with an empty issues list).
     pub threshold: u8,
 }
 
 impl JointRound<'_> {
-    /// Number of valid verdicts (N — bracket denominator).
+    /// Number of valid verdicts (responding agents with parseable verdicts).
     #[must_use]
     pub fn n_valid(&self) -> usize {
         self.verdicts.len()
@@ -107,8 +113,8 @@ fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> Chat
     // Global flat item ids across ALL agents: ids 0..N are assigned in
     // (agent, issue) order and match the schema's `id` field — a faithful LLM
     // can copy an id straight into the JSON. Scores are deliberately NOT
-    // included: they are not needed for grouping, and a faithful LLM echoing
-    // one would be rejected (the renderer adds scores/severity from code).
+    // included: grouping needs issue text only, and scores are persisted in the
+    // verdict store, never in the comment.
     let mut id = 0usize;
     for (agent_idx, issues) in issues_by_agent(round).into_iter().enumerate() {
         if issues.is_empty() {
@@ -178,13 +184,17 @@ pub(crate) async fn run_synthesis(
 /// Render the joint comment for a round given the repair-mode synthesis
 /// outcome.
 ///
-/// Structure: header (code-computed counts), groups with code-computed
-/// brackets from distinct cited agent ids (frozen by the repair protocol when
-/// synthesis succeeded, raw member dump otherwise), the code-computed
+/// Structure: optional stage header (analysis-only — verifier rounds pass an
+/// empty header), groups of issue statements (frozen by the repair protocol
+/// when synthesis succeeded, raw member dump otherwise; contradiction groups
+/// carry a `— DISPUTED` marker), the code-computed
 /// ungrouped remainder in a deterministic trailing section (DISPUTED
 /// cross-references for items that flag a contradiction against a frozen
-/// group), per-agent critiques, the first-accepted LLM summary prose (or an
-/// explicit marker), and a raw-dump appendix for failed agents.
+/// group), the first-accepted LLM summary prose (or an explicit marker), and a
+/// raw-dump appendix for failed agents. Per-agent attribution (brackets,
+/// "Agent N:" / "[blocker]" prefixes) and free-form critiques are noise and
+/// are not rendered — scores + issues are already persisted in the verdict
+/// store.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub(crate) fn render_joint_comment(
@@ -193,31 +203,25 @@ pub(crate) fn render_joint_comment(
     table: &crate::consensus::ItemTable<'_>,
 ) -> String {
     let mut out = String::new();
-    let n_valid = round.n_valid();
-    let _ = std::fmt::write(
-        &mut out,
-        format_args!(
-            "## {} round — {n_valid}/{} valid verdicts",
-            round.stage, round.dispatched
-        ),
-    );
 
-    // Code-computed agreement counts (never the LLM's numbers).
+    // Code-computed stage summary (analysis only — verifier rounds pass an
+    // empty header).
     if !round.header.is_empty() {
-        let _ = write!(out, "\n{}", round.header);
+        out.push_str(&round.header);
     }
 
-    // Issues with brackets — grouped by the LLM when available.
+    // Issues — grouped by the LLM when available.
     let has_issues = table.len() > 0;
     if has_issues {
         match outcome {
             crate::consensus::RepairOutcome::Repaired { output, references } => {
                 for group in &output.groups {
-                    let n = crate::consensus::distinct_agents(group, table).len();
-                    let bracket = crate::consensus::bracket_label(n, n_valid, group.contradiction);
-                    let _ = write!(out, "\n\n**{}** {bracket}", group.heading);
+                    let _ = write!(out, "\n\n**{}**", group.heading);
+                    if group.contradiction {
+                        out.push_str(" — DISPUTED");
+                    }
                     for member in &group.members {
-                        let _ = write!(out, "\n- {}", render_member_line(round, member, table));
+                        let _ = write!(out, "\n- {}", member_text(table, member));
                     }
                 }
                 // Code-computed ungrouped remainder — deterministic trailing
@@ -225,7 +229,7 @@ pub(crate) fn render_joint_comment(
                 if !output.ungrouped.is_empty() {
                     out.push_str("\n\n**Ungrouped**");
                     for member in &output.ungrouped {
-                        let mut line = render_member_line(round, member, table);
+                        let mut line = member_text(table, member);
                         for reference in references.iter().filter(|r| r.member.id == member.id) {
                             if let Some(group) = output.groups.get(reference.group) {
                                 let _ = write!(
@@ -244,37 +248,10 @@ pub(crate) fn render_joint_comment(
                 // (global flat id order = (agent, item) order).
                 out.push_str("\n\n**Issues**");
                 for id in 0..table.len() {
-                    if let Some((agent, text)) = table.resolve(id) {
-                        let _ = write!(out, "\n- Agent {agent}: {text}");
+                    if let Some((_, text)) = table.resolve(id) {
+                        let _ = write!(out, "\n- {text}");
                     }
                 }
-            }
-        }
-    }
-
-    // Critiques (per-agent, score from code).
-    let has_critiques = round.verdicts.iter().any(|v| {
-        v.verdict
-            .critique
-            .as_deref()
-            .is_some_and(|c| !c.trim().is_empty())
-    });
-    if has_critiques {
-        out.push_str("\n\n### Critiques");
-        for v in &round.verdicts {
-            if let Some(c) = v
-                .verdict
-                .critique
-                .as_deref()
-                .filter(|c| !c.trim().is_empty())
-            {
-                let _ = write!(
-                    out,
-                    "\n- Agent {} ({}/10): {}",
-                    v.agent_index + 1,
-                    v.verdict.score,
-                    c
-                );
             }
         }
     }
@@ -330,31 +307,25 @@ pub(crate) fn render_joint_comment(
         }
     }
 
+    // A removed stage header (verifier rounds) would leave the first section's
+    // separator as leading blank lines — strip them.
     crate::util::truncate_sandwich(
-        &crate::util::scrub_credentials(&out),
+        &crate::util::scrub_credentials(out.trim_start_matches('\n')),
         crate::util::FAILURE_DETAIL_CAP,
         "joint verdict comment",
     )
 }
 
-/// Render one member line: `Agent N: text` with a `[blocker]` prefix when the
-/// cited agent's verdict scored below the round threshold (code-computed
-/// severity — the LLM never produces it). The cited agent is resolved via the
-/// item table — no text equality.
-fn render_member_line(
-    round: &JointRound<'_>,
-    member: &crate::consensus::GroupingMember,
+/// Resolve a grouped member's issue text via the item table (no text
+/// equality). Unknown ids (defensive) render with an explicit marker.
+fn member_text(
     table: &crate::consensus::ItemTable<'_>,
+    member: &crate::consensus::GroupingMember,
 ) -> String {
-    let Some((agent, text)) = table.resolve(member.id) else {
-        return format!("Agent ?: <unknown item id {}>", member.id);
-    };
-    let blocker = round
-        .verdicts
-        .iter()
-        .any(|v| v.agent_index == agent && v.verdict.score < round.threshold);
-    let severity = if blocker { "[blocker] " } else { "" };
-    format!("{severity}Agent {agent}: {text}")
+    table.resolve(member.id).map_or_else(
+        || format!("<unknown item id {}>", member.id),
+        |(_, text)| text.to_string(),
+    )
 }
 
 // ── Calibrated dynamic agent counts ─────────────────────────────────────

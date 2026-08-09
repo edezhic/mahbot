@@ -837,8 +837,6 @@ pub(crate) struct Verdict {
     /// Quality score from 0 (worst) to 10 (best).
     #[serde(deserialize_with = "de_verdict_score")]
     pub score: u8,
-    /// Optional constructive critique from the verifier.
-    pub critique: Option<String>,
     /// List of specific issues detected in the response.
     #[serde(rename = "issues")]
     pub issues_detected: Vec<String>,
@@ -996,6 +994,15 @@ pub(crate) struct SanitationVerdict {
     pub garbage_files: Vec<String>,
     /// Rationale for the decision.
     pub rationale: String,
+}
+
+/// Concise structured summary of an engineer's completed work, extracted from
+/// the engineer's session for the ticket comment.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct EngineerSummary {
+    /// Concise bullet points of what was implemented / fixed / executed.
+    #[serde(default)]
+    pub items: Vec<String>,
 }
 
 // ── Tool trait + types ──────────────────────────────────────────
