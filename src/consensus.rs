@@ -209,6 +209,26 @@ pub(crate) fn render_member_line(member: &GroupingMember, table: &ItemTable<'_>)
     }
 }
 
+/// Render `Agent N:\n- id: text` input material for the grouping pass —
+/// global flat ids across all agents (id = (agent, item) order), matching the
+/// schema's `id` field. Empty agent slots are skipped.
+#[must_use]
+pub(crate) fn numbered_items_material(items_by_agent: &[Vec<String>]) -> String {
+    let mut material = String::new();
+    let mut id = 0usize;
+    for (agent_idx, items) in items_by_agent.iter().enumerate() {
+        if items.is_empty() {
+            continue;
+        }
+        let _ = writeln!(material, "Agent {agent_idx}:");
+        for item in items {
+            let _ = writeln!(material, "- {id}: {item}");
+            id += 1;
+        }
+    }
+    material
+}
+
 // ── Repair-mode grouping (pipeline synthesis + ask consolidation) ───────
 
 /// Mutable state of the repair protocol across rounds.

@@ -109,23 +109,9 @@ fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> Chat
         crate::prompt::load_prompt("synthesis/synthesis.md"),
         crate::prompt::load_prompt("synthesis/grouping_contradictions.md"),
     );
-    let mut material = String::new();
-    // Global flat item ids across ALL agents: ids 0..N are assigned in
-    // (agent, issue) order and match the schema's `id` field — a faithful LLM
-    // can copy an id straight into the JSON. Scores are deliberately NOT
-    // included: grouping needs issue text only, and scores are persisted in the
-    // verdict store, never in the comment.
-    let mut id = 0usize;
-    for (agent_idx, issues) in issues_by_agent(round).into_iter().enumerate() {
-        if issues.is_empty() {
-            continue;
-        }
-        let _ = std::fmt::write(&mut material, format_args!("Agent {agent_idx}:\n"));
-        for issue in issues {
-            let _ = writeln!(material, "- {id}: {issue}");
-            id += 1;
-        }
-    }
+    // Scores are deliberately NOT included: grouping needs issue text only —
+    // scores are persisted in the verdict store, never in the comment.
+    let material = crate::consensus::numbered_items_material(&issues_by_agent(round));
     let user = format!(
         "{}\n\nStage: {}\nAgent issues (id-numbered):\n{}",
         crate::prompt::load_prompt("synthesis/synthesis_input.md"),

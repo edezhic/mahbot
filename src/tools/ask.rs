@@ -433,18 +433,7 @@ async fn consolidate_findings(
     }
     // User material: global flat ids across ALL agents (each claim exactly one
     // id, in (agent, claim) order) — the schema's `id` field matches.
-    let mut material = String::new();
-    let mut id = 0usize;
-    for (agent_idx, claims) in items_by_agent.iter().enumerate() {
-        if claims.is_empty() {
-            continue;
-        }
-        let _ = writeln!(material, "Agent {agent_idx}:");
-        for c in claims {
-            let _ = writeln!(material, "- {id}: {c}");
-            id += 1;
-        }
-    }
+    let material = crate::consensus::numbered_items_material(&items_by_agent);
     let user =
         format!("# Original Question\n\n{ask}\n\n# Agent Claims (id-numbered)\n\n{material}");
 
