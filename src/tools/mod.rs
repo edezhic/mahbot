@@ -1,9 +1,11 @@
 //! Tool implementations for agent-callable capabilities.
 
 use anyhow::Context;
+pub(crate) mod active_models;
 pub(crate) mod ask;
 pub mod browser;
 pub mod browser_daemon;
+pub(crate) mod catalog_cache;
 pub(crate) mod edit;
 pub mod image_catalog;
 pub(crate) mod image_gen;
@@ -16,6 +18,7 @@ pub(crate) mod search_archived_tickets;
 pub(crate) mod shell;
 pub(crate) mod ticket;
 pub(crate) mod upload_bridge;
+pub(crate) mod video_catalog;
 pub(crate) mod video_edit;
 pub(crate) mod video_gen;
 pub(crate) mod web_search;

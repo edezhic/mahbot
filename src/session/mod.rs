@@ -126,7 +126,8 @@ CREATE TABLE IF NOT EXISTS session_metadata (
     channel       TEXT,
     user_name     TEXT,
     workspace_name TEXT,
-    role          TEXT
+    role          TEXT,
+    active_models TEXT
 );";
 
 // ── Column index constants ──────────────────────────────────
@@ -563,6 +564,52 @@ impl SessionStore {
             })
         })
     }
+
+    /// Persist the `<active-models-opts>` snapshot (rendered model ids) for
+    /// mid-session change detection; `None` clears the baseline (no block
+    /// rendered — fail-open). Upserts so a missing metadata row (e.g. a
+    /// session without a preceding message append) still records the baseline.
+    pub(crate) async fn set_active_models(
+        &self,
+        agent_id: &str,
+        snapshot: Option<&str>,
+    ) -> Result<()> {
+        let now = turso::now();
+        self.conn
+            .execute(
+                "INSERT INTO session_metadata (agent_id, created_at, last_activity, active_models) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(agent_id) DO UPDATE SET active_models = excluded.active_models",
+                params![agent_id, now.clone(), now, snapshot],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Read the last persisted `<active-models-opts>` snapshot, if any.
+    /// Returns `None` when no baseline exists (no block rendered, or a
+    /// session started before this feature).
+    pub(crate) async fn get_active_models(&self, agent_id: &str) -> Option<String> {
+        match self
+            .conn
+            .query_optional(
+                "SELECT active_models FROM session_metadata WHERE agent_id = ?1",
+                params![agent_id],
+                |row| row.get::<Option<String>>(0),
+            )
+            .await
+        {
+            // A NULL column and a missing metadata row both mean "no baseline".
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => None,
+            // A read failure silently disables change detection — log it so
+            // the outage is visible rather than looking like a missing block.
+            Err(e) => {
+                tracing::warn!(agent_id = %agent_id, error = %e, "Failed to read active-models snapshot");
+                None
+            }
+        }
+    }
 }
 
 impl SessionStore {
@@ -587,6 +634,19 @@ impl SessionStore {
             )
             .await
             .context("Failed to create sessions index")?;
+
+        // active_models stores the rendered <active-models-opts> snapshot
+        // (model ids) for mid-session change detection. Guarded ALTER follows
+        // the done_at/bounce_count precedents in board.rs.
+        if !turso::column_exists(&self.conn, "session_metadata", "active_models").await? {
+            self.conn
+                .execute(
+                    "ALTER TABLE session_metadata ADD COLUMN active_models TEXT",
+                    (),
+                )
+                .await
+                .context("Failed to add active_models column to session_metadata")?;
+        }
         Ok(())
     }
 }

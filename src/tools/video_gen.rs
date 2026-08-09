@@ -35,26 +35,24 @@ impl Tool for VideoGenTool {
                 },
                 "duration": {
                     "type": "integer",
-                    "description": "Duration in seconds (model-dependent, typically 4-15)"
+                    "description": "Duration in seconds (model-dependent; valid values come from the active model's capability block)"
                 },
                 "resolution": {
                     "type": "string",
-                    "enum": ["480p", "720p", "1080p", "1K", "2K", "4K"],
-                    "description": "Desired resolution for the generated video"
+                    "description": "Desired resolution for the generated video (model-dependent; valid values come from the active model's capability block)"
                 },
                 "aspect_ratio": {
                     "type": "string",
-                    "enum": ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "9:21"],
-                    "description": "Aspect ratio for the generated video"
+                    "description": "Aspect ratio for the generated video (model-dependent; valid values come from the active model's capability block)"
                 },
                 "size": {
                     "type": "string",
                     "pattern": "\\d+x\\d+",
-                    "description": "Exact size in WxH format (e.g. 1280x720)"
+                    "description": "Exact size in WxH format (e.g. 1280x720; model-dependent)"
                 },
                 "generate_audio": {
                     "type": "boolean",
-                    "description": "Whether to generate audio track (default: true)"
+                    "description": "Whether to generate an audio track (model-dependent)"
                 },
                 "seed": {
                     "type": "integer",

@@ -5,22 +5,15 @@
 //! parameter decision is driven by this data — never by model-name branches.
 //!
 //! Caching: fetched once (single-flight), keyed by the configured provider
-//! endpoint, and reused for [`CATALOG_TTL`]. A failed fetch is stored as a
-//! short-lived negative cache ([`CATALOG_RETRY_BACKOFF`]) and degrades to
+//! endpoint, and reused for 24h. A failed fetch — including a timeout — is
+//! stored as a short-lived negative cache (1-min backoff) and degrades to
 //! fail-open: [`get_catalog`] returns `None` and callers send minimal
-//! parameters instead of rejecting generation.
+//! parameters instead of rejecting generation. The cache machinery lives in
+//! [`crate::tools::catalog_cache`], shared with the video catalog.
 
-use crate::util::UnwrapPoison;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
-use std::time::{Duration, Instant};
-
-/// How long a fetched catalog is considered fresh.
-const CATALOG_TTL: Duration = Duration::from_hours(24);
-
-/// Backoff before retrying a failed catalog fetch (negative cache).
-const CATALOG_RETRY_BACKOFF: Duration = Duration::from_mins(1);
+use std::sync::Arc;
 
 /// Declared constraint for one image-generation parameter.
 #[derive(Debug, Clone)]
@@ -161,51 +154,12 @@ fn parse_constraint(v: &Value) -> ParameterConstraint {
 
 // ── Cached fetch (single-flight, endpoint-keyed, fail-open) ─────────
 
-struct CatalogCache {
-    endpoint: String,
-    fetched_at: Instant,
-    /// `None` = a failed fetch (negative cache for the backoff window).
-    catalog: Option<Arc<ImageCatalog>>,
-}
-
-enum CatalogLookup {
-    Fresh(Arc<ImageCatalog>),
-    Backoff,
-    Miss,
-}
-
-static CATALOG: OnceLock<RwLock<Option<CatalogCache>>> = OnceLock::new();
-/// Serializes concurrent fetches — one network call regardless of how many
-/// agents hit image_gen at once.
-static CATALOG_FETCH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-
-fn catalog_lock() -> &'static RwLock<Option<CatalogCache>> {
-    CATALOG.get_or_init(|| RwLock::new(None))
-}
-
-async fn fetch_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    CATALOG_FETCH_LOCK
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await
-}
-
-fn lookup(endpoint: &str) -> CatalogLookup {
-    let guard = catalog_lock().read().unwrap_poison();
-    let Some(cache) = guard.as_ref() else {
-        return CatalogLookup::Miss;
-    };
-    if cache.endpoint != endpoint {
-        return CatalogLookup::Miss;
-    }
-    match &cache.catalog {
-        Some(catalog) if cache.fetched_at.elapsed() < CATALOG_TTL => {
-            CatalogLookup::Fresh(catalog.clone())
-        }
-        None if cache.fetched_at.elapsed() < CATALOG_RETRY_BACKOFF => CatalogLookup::Backoff,
-        _ => CatalogLookup::Miss,
-    }
-}
+static CATALOG: crate::tools::catalog_cache::Catalog<ImageCatalog> =
+    crate::tools::catalog_cache::Catalog::new(
+        "/images/models",
+        "Image models catalog",
+        parse_catalog,
+    );
 
 /// Return the cached catalog for the currently configured provider endpoint.
 pub(crate) async fn get_catalog() -> Option<Arc<ImageCatalog>> {
@@ -216,52 +170,15 @@ pub(crate) async fn get_catalog() -> Option<Arc<ImageCatalog>> {
 /// Return the cached catalog for `endpoint` if fresh, otherwise fetch it
 /// (single-flight). Returns `None` (fail-open) when the catalog is
 /// unavailable — retried after a short negative-cache backoff.
-async fn get_catalog_for_endpoint(endpoint: &str) -> Option<Arc<ImageCatalog>> {
-    let base = crate::providers::ensure_base_url(endpoint);
-    match lookup(&base) {
-        CatalogLookup::Fresh(catalog) => return Some(catalog),
-        CatalogLookup::Backoff => return None,
-        CatalogLookup::Miss => {}
-    }
-    let _guard = fetch_lock().await;
-    match lookup(&base) {
-        CatalogLookup::Fresh(catalog) => return Some(catalog),
-        CatalogLookup::Backoff => return None,
-        CatalogLookup::Miss => {}
-    }
-
-    let url = format!("{base}/images/models");
-    match crate::util::http::get_json_from_provider(&url, "Image models catalog").await {
-        Ok(body) => match parse_catalog(&body) {
-            Ok(catalog) => {
-                let catalog = Arc::new(catalog);
-                *catalog_lock().write().unwrap_poison() = Some(CatalogCache {
-                    endpoint: base,
-                    fetched_at: Instant::now(),
-                    catalog: Some(catalog.clone()),
-                });
-                Some(catalog)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to parse image-models catalog — proceeding without capability checks");
-                store_failure(base);
-                None
-            }
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to fetch image-models catalog — proceeding without capability checks");
-            store_failure(base);
-            None
-        }
-    }
+pub(crate) async fn get_catalog_for_endpoint(endpoint: &str) -> Option<Arc<ImageCatalog>> {
+    CATALOG.get(endpoint).await
 }
 
-fn store_failure(endpoint: String) {
-    *catalog_lock().write().unwrap_poison() = Some(CatalogCache {
-        endpoint,
-        fetched_at: Instant::now(),
-        catalog: None,
-    });
+/// Test-only: seed the shared cache (no network).
+#[cfg(test)]
+pub(crate) fn seed_cache(catalog: Option<Arc<ImageCatalog>>) {
+    let endpoint = crate::providers::ensure_base_url(&crate::config::CONFIG.provider_endpoint());
+    CATALOG.seed(&endpoint, catalog);
 }
 
 /// Reject models that cannot generate images on the dedicated surface:
@@ -383,38 +300,5 @@ mod tests {
         }))
         .expect("tolerated");
         assert!(catalog.find("m1").is_some());
-    }
-
-    #[test]
-    fn test_lookup_endpoint_keyed_with_negative_backoff() {
-        let endpoint = "https://openrouter.ai/api/v1";
-        let other = "https://other.example/api/v1";
-
-        // Fresh catalog → Fresh; a different provider endpoint → Miss.
-        *catalog_lock().write().unwrap_poison() = Some(CatalogCache {
-            endpoint: endpoint.into(),
-            fetched_at: Instant::now(),
-            catalog: Some(Arc::new(ImageCatalog::default())),
-        });
-        assert!(matches!(lookup(endpoint), CatalogLookup::Fresh(_)));
-        assert!(matches!(lookup(other), CatalogLookup::Miss));
-
-        // Failed fetch → Backoff inside the window, Miss once it expires.
-        *catalog_lock().write().unwrap_poison() = Some(CatalogCache {
-            endpoint: endpoint.into(),
-            fetched_at: Instant::now(),
-            catalog: None,
-        });
-        assert!(matches!(lookup(endpoint), CatalogLookup::Backoff));
-        *catalog_lock().write().unwrap_poison() = Some(CatalogCache {
-            endpoint: endpoint.into(),
-            fetched_at: Instant::now()
-                .checked_sub(CATALOG_RETRY_BACKOFF + Duration::from_secs(1))
-                .expect("monotonic clock is past the backoff window"),
-            catalog: None,
-        });
-        assert!(matches!(lookup(endpoint), CatalogLookup::Miss));
-
-        *catalog_lock().write().unwrap_poison() = None;
     }
 }

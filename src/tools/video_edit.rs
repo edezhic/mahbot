@@ -284,13 +284,13 @@ impl Tool for VideoEditTool {
                 },
                 "duration": {
                     "type": "integer",
-                    "description": "Output duration in seconds (5–15s)"
+                    "description": "Output duration in seconds (model-dependent)"
                 },
                 "images": {
                     "type": "array",
                     "items": { "type": "string" },
                     "maxItems": 9,
-                    "description": "Paths or public HTTPS URLs of reference images guiding style/subject (max 9; billed at $0.04 each). Local paths are accepted from the workspace uploads dir (received attachments) or the generated dir (previously generated images). Requires video_url; mutually exclusive with first_frame/last_frame"
+                    "description": "Paths or public HTTPS URLs of reference images guiding style/subject (max 9). Local paths are accepted from the workspace uploads dir (received attachments) or the generated dir (previously generated images). Requires video_url; mutually exclusive with first_frame/last_frame"
                 },
                 "first_frame": {
                     "type": "string",
