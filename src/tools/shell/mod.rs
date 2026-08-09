@@ -507,8 +507,9 @@ impl ShellTool {
         // main() and dies at instance-lock with the lock message; that
         // signature re-runs too. Residual: a mid-search panic after output
         // was streamed exits sentinel-3, but a pipe/chain member's exit
-        // status (e.g. `grep | head`, `grep … || echo`) masks it, so the
-        // agent sees the partial output.
+        // status masks it — aggregation tails (`grep | wc -l`, `grep | sort`)
+        // are the worst case, turning the partial stream into authoritative-
+        // looking wrong answers — so the agent sees the partial output.
         #[cfg(unix)]
         let result = if exec_str != command_str
             && matches!(

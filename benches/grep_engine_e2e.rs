@@ -58,6 +58,23 @@ fn run_matrix() -> i32 {
         "grep -v foo a.txt b.txt",
         "grep -m2 a m.txt c.txt",
         "grep -rn x plain | head -3",
+        // ── Raw-token operands: quoted globs/~ stay literal (multi-operand,
+        //    so the production serve gate applies) ──
+        "grep -rn needle '*.txt' a.txt",
+        "grep -rn needle '~' a.txt",
+        "grep -rn needle 'a\"b.txt' a.txt",
+        // ── Relaxed pipeline gate: 2-member, any tail, >256 KiB stream ──
+        "grep -rn needle bigdir | wc -l",
+        "grep -rn needle bigdir | tail -1",
+        "grep -rn needle bigdir | sort",
+        "grep -rn needle bigdir | tee teeout.txt",
+        // 2>&1: benign ordering only (missing operand after matches; wc is
+        // order-insensitive). Engine stderr flushes at finish vs BSD at
+        // operand-open — missing.txt-first or sort tails diverge (accepted).
+        "grep -rn needle bigdir missing.txt 2>&1 | wc -l",
+        "grep -rn needle 'weird dir' | wc -l", // quoted spaced operand through the pipe
+        // Quoted `~` + unquoted glob: literal `sub/~` dir in cwd (no home-strip).
+        "grep -rn needle 'sub/~'/*.txt a.txt",
         // ── -c / -l ──
         "grep -c foo a.txt b.txt",
         "grep -c foo a.txt b.txt c.txt",
@@ -151,6 +168,17 @@ fn build_fixture(ws: &Path, home: &Path) {
     fs::write(ws.join("weird dir/need'le.txt"), "needle\n").unwrap();
     fs::write(ws.join("weird dir/do\"ll$ar.txt"), "needle\n").unwrap();
     fs::write(ws.join("weird dir/line\nbreak.txt"), "needle\n").unwrap();
+    // Literal filename operands: quoted/escaped glob and ~ are literal to BSD.
+    fs::write(ws.join("~"), "needle\n").unwrap();
+    fs::write(ws.join("*.txt"), "needle\n").unwrap();
+    fs::write(ws.join("a\"b.txt"), "needle\n").unwrap();
+    // Quoted `~` + unquoted glob: a literal `~` dir relative to cwd.
+    fs::create_dir_all(ws.join("sub/~")).unwrap();
+    fs::write(ws.join("sub/~/q.txt"), "needle\n").unwrap();
+    // >256 KiB of matches (200k lines): exercises the piped-member cap lift
+    // and the SIGPIPE path (>64 KiB pipe-buffer bound).
+    fs::create_dir_all(ws.join("bigdir")).unwrap();
+    fs::write(ws.join("bigdir/big.txt"), "needle\n".repeat(200_000)).unwrap();
 }
 
 fn check_row(row: &str, ws: &Path, home: &Path) -> Result<(), String> {
@@ -189,14 +217,14 @@ fn check_exec_fallback(ws: &Path) -> Result<(), String> {
     // real grep, which then runs in the ACTUAL cwd.
     check_exec_case(
         ws,
-        r#"{"version":3,"verb":"grep","mode":"Basic","flags":{"n":true,"i":false,"v":false,"w":false,"x":false,"a":false,"h":false,"H":false,"s":false,"r":true,"o":false,"null":false,"c":false,"l":false,"m":null,"before":0,"after":0},"filters":[],"exclude_dir":[],"patterns":["x"],"operands":[{"display":".","resolved":"/nonexistent","trailing_slash":false}],"cwd":"/nonexistent","fallback":["grep","-rn","x","."]}"#,
+        r#"{"version":4,"verb":"grep","mode":"Basic","flags":{"n":true,"i":false,"v":false,"w":false,"x":false,"a":false,"h":false,"H":false,"s":false,"r":true,"o":false,"null":false,"c":false,"l":false,"m":null,"before":0,"after":0},"filters":[],"exclude_dir":[],"patterns":["x"],"operands":[{"display":".","resolved":"/nonexistent","trailing_slash":false}],"cwd":"/nonexistent","fallback":["grep","-rn","x","."],"piped":false}"#,
         "grep -rn x .",
     )?;
     // A dash-prefixed operand must survive the exec'd grep via the `--`
     // separator the parent inserts into the fallback argv.
     let dash_abs = ws.join("-x1").to_string_lossy().into_owned();
     let json = format!(
-        r#"{{"version":3,"verb":"grep","mode":"Basic","flags":{{"n":false,"i":false,"v":false,"w":false,"x":false,"a":false,"h":false,"H":false,"s":false,"r":false,"o":false,"null":false,"c":false,"l":false,"m":null,"before":0,"after":0}},"filters":[],"exclude_dir":[],"patterns":["x"],"operands":[{{"display":"-x1","resolved":"{dash_abs}","trailing_slash":false}}],"cwd":"/nonexistent","fallback":["grep","-e","x","--","-x1"]}}"#
+        r#"{{"version":4,"verb":"grep","mode":"Basic","flags":{{"n":false,"i":false,"v":false,"w":false,"x":false,"a":false,"h":false,"H":false,"s":false,"r":false,"o":false,"null":false,"c":false,"l":false,"m":null,"before":0,"after":0}},"filters":[],"exclude_dir":[],"patterns":["x"],"operands":[{{"display":"-x1","resolved":"{dash_abs}","trailing_slash":false}}],"cwd":"/nonexistent","fallback":["grep","-e","x","--","-x1"],"piped":false}}"#
     );
     check_exec_case(ws, &json, "grep -e x -- -x1")
 }
@@ -223,9 +251,12 @@ fn check_exec_case(ws: &Path, json: &str, real_cmd: &str) -> Result<(), String> 
 }
 
 fn check_sigpipe(ws: &Path, home: &Path) -> Result<(), String> {
-    // A huge-output grep piped to head must terminate promptly (SIGPIPE).
-    let rewritten = mahbot::grep_engine_rewrite_for_test("grep -rn x plain | head -1", ws, home)
-        .ok_or_else(|| "not servable".to_string())?;
+    // A huge-output grep piped to head must terminate promptly (SIGPIPE):
+    // the >64 KiB fixture fills the pipe, so the engine must die on the
+    // closed pipe instead of scanning everything.
+    let rewritten =
+        mahbot::grep_engine_rewrite_for_test("grep -rn needle bigdir | head -1", ws, home)
+            .ok_or_else(|| "not servable".to_string())?;
     let start = std::time::Instant::now();
     let mut child = Command::new("sh")
         .arg("-c")

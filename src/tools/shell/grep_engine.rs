@@ -11,7 +11,8 @@
 //!
 //! Parity target: the host system grep (BSD grep on macOS) under the shell
 //! tool's pinned `LC_ALL=C.UTF-8` environment. The one approved behavioral
-//! delta: recursive walks skip hidden/gitignored content (rg defaults).
+//! delta: recursive walks skip hidden/gitignored content (rg defaults) — a
+//! served pipeline tail (`grep -rn … | wc -l`) sees that filtered stream.
 //! The differential matrix (macOS-gated) is the authoritative parity gate.
 
 use std::fs;
@@ -29,10 +30,10 @@ use crate::tools::shell::readonly::{strip_heredoc_bodies, strip_outer_quotes};
 /// Hidden subcommand name dispatched before lock acquisition (like `debug`).
 const ENGINE_VERB: &str = "__grep-engine";
 /// Spec JSON protocol version; mismatches make the engine fall back.
-/// Bumped for the -c/-l GrepFlags fields: a spec from a swapped binary is
-/// caught here (both directions) and execs the real grep via the fallback
-/// argv, which carries the new flags.
-const PROTOCOL_VERSION: u32 = 3;
+/// Bumped for the -c/-l GrepFlags fields and the `piped` field: a spec from
+/// a swapped binary is caught here (both directions) and execs the real grep
+/// via the fallback argv, which carries the new surface.
+const PROTOCOL_VERSION: u32 = 4;
 /// NUL-detection window for binary files (FreeBSD grep reads 32 KiB).
 const BINARY_WINDOW: usize = 32 * 1024;
 /// Engine self-cap on written output; the shell pipe reader caps at the same.
@@ -74,6 +75,10 @@ struct EngineSpec {
     cwd: String,
     /// Original post-expansion argv for the exec-in-place fallback.
     fallback: Vec<String>,
+    /// The member feeds a pipeline tail: its stdout must not be capped, so
+    /// downstream members see the full stream (byte-identity with grep).
+    #[serde(default)] // lenient: a swapped-binary spec reaches the version check
+    piped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,7 +101,17 @@ pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> Option<
     let (specs, rewritten) = match analyze_command(command, workspace_root, &home, false) {
         Ok(v) => v,
         Err(reason) => {
-            tracing::debug!(command = command, %reason, "grep engine: fallback");
+            // INFO only for the gate-relaxation class: pipeline-shape fallbacks
+            // of actual grep commands (the volume Part 2 measures). Commands
+            // without a grep member — including empty-member syntax errors like
+            // `cat f | | head` — stay DEBUG.
+            if matches!(reason, Fallback::PipelineShape | Fallback::SegmentEmpty)
+                && command.split_whitespace().any(is_grep_verb)
+            {
+                tracing::info!(command = command, %reason, "grep engine: fallback");
+            } else {
+                tracing::debug!(command = command, %reason, "grep engine: fallback");
+            }
             return None;
         }
     };
@@ -232,7 +247,7 @@ impl std::fmt::Display for Fallback {
             Fallback::SingleFile => write!(f, "single file"),
             Fallback::CdUntrackable => write!(f, "cd untrackable"),
             Fallback::PipelineShape => write!(f, "pipeline shape"),
-            Fallback::SegmentEmpty => write!(f, "empty command"),
+            Fallback::SegmentEmpty => write!(f, "empty command or pipeline member"),
         }
     }
 }
@@ -253,9 +268,18 @@ fn analyze_command(
         // leave a bare non-grep member reading inherited stdin — fail-closed.
         return Err(Fallback::Heredoc);
     }
-    let segments = split_segments(&stripped);
+    let segments = split_segments(&stripped)?;
     if segments.is_empty() {
         return Err(Fallback::SegmentEmpty);
+    }
+    // No grep member anywhere: not an interception candidate. Before the shape
+    // checks so non-grep pipelines (`cat f | head`) don't pollute the
+    // pipeline-shape telemetry class with a mislabeled reason.
+    if !segments.iter().any(|(seg, _)| {
+        let verb = first_word(seg);
+        is_grep_verb(verb) || segment_contains_grep(seg, verb)
+    }) {
+        return Err(Fallback::NoGrep);
     }
 
     // Pipeline grouping: consecutive segments joined by `|`/`|&`.
@@ -278,8 +302,8 @@ fn analyze_command(
     let mut cwd = canonical_or_lexical(workspace_root);
     let mut rewritten: Vec<(String, String)> = Vec::new();
     let mut specs: Vec<EngineSpec> = Vec::new();
-    // A served `grep | head` pipeline preserves its head member verbatim.
-    let mut head_preserved = vec![false; n];
+    // A served 2-member pipeline preserves its tail member verbatim.
+    let mut tail_preserved = vec![false; n];
 
     for (idx, (seg, conn)) in segments.iter().enumerate() {
         let verb = first_word(seg);
@@ -296,16 +320,17 @@ fn analyze_command(
                 // Only the first member of a pipeline can be served.
                 return Err(Fallback::PipelineShape);
             }
-            if pend[idx] != idx {
-                // In a pipeline: servable only as `grep … | head`.
-                if pend[idx] != idx + 1 || !is_head_segment(&segments[pend[idx]].0) {
-                    return Err(Fallback::PipelineShape);
-                }
+            if pend[idx] != idx && pend[idx] != idx + 1 {
+                // 2-member pipelines only: the tail runs on byte-identical
+                // input, and a static gate cannot prove a head bound below
+                // the cap for 3+ members (fail-closed).
+                return Err(Fallback::PipelineShape);
             }
-            match serve_one_grep(seg, verb, &cwd, home, allow_single) {
+            let in_pipeline = pstart[idx] != pend[idx];
+            match serve_one_grep(seg, verb, &cwd, home, allow_single, in_pipeline) {
                 Ok((spec, rewritten_seg)) => {
-                    if pstart[idx] != pend[idx] {
-                        head_preserved[pend[idx]] = true;
+                    if in_pipeline {
+                        tail_preserved[pend[idx]] = true;
                     }
                     rewritten.push((rewritten_seg, conn.clone()));
                     specs.push(spec);
@@ -314,24 +339,18 @@ fn analyze_command(
             }
             continue;
         }
-        if is_head_segment(seg) && head_preserved[idx] {
-            rewritten.push((seg.clone(), conn.clone()));
-            continue;
-        }
         // Non-grep member: verbatim, but indirect/compound grep invocations
         // make the whole command fall back (fail-closed).
         if is_compound_segment(seg) || segment_contains_grep(seg, verb) {
             return Err(Fallback::NestedGrep);
         }
-        if pstart[idx] != pend[idx] {
-            return Err(Fallback::PipelineShape);
+        if tail_preserved[idx] || pstart[idx] == pend[idx] {
+            rewritten.push((seg.clone(), conn.clone()));
+            continue;
         }
-        rewritten.push((seg.clone(), conn.clone()));
+        return Err(Fallback::PipelineShape);
     }
 
-    if specs.is_empty() {
-        return Err(Fallback::NoGrep);
-    }
     Ok((specs, join_rewritten(&rewritten)))
 }
 
@@ -353,21 +372,35 @@ fn join_rewritten(segments: &[(String, String)]) -> String {
 
 /// Split a command into (segment, following-connector) pairs. Connectors are
 /// `&&`, `||`, `;`, `|`, `|&`, `\n`, or `` (last). Quote- and
-/// substitution-aware, heredoc bodies already stripped.
+/// substitution-aware, heredoc bodies already stripped. Empty segments before
+/// a connector (or a trailing `|`/`|&`/`||`/`&&`) are shell syntax errors;
+/// the rewriting would silently drop them into a VALID executed pipeline —
+/// fail-closed on the whole class. Blank lines (`\n` between commands) are
+/// valid sh and stay allowed.
 #[allow(clippy::too_many_lines)] // quote/substitution state machine
-fn split_segments(command: &str) -> Vec<(String, String)> {
+fn split_segments(command: &str) -> Result<Vec<(String, String)>, Fallback> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
     let mut in_double = false;
+    // Inside a `case` statement (`;;` is only valid there; elsewhere an empty
+    // segment before `;` is a shell syntax error).
+    let mut in_case = false;
     let mut chars = command.chars().peekable();
 
-    let flush = |current: &mut String, out: &mut Vec<(String, String)>, conn: &str| {
+    let flush = |current: &mut String,
+                 out: &mut Vec<(String, String)>,
+                 conn: &str,
+                 in_case: &mut bool|
+     -> bool {
         let t = current.trim();
-        if !t.is_empty() {
+        let pushed = !t.is_empty();
+        if pushed {
             out.push((t.to_string(), conn.to_string()));
+            *in_case = segment_opens_case(t) || (*in_case && !segment_ends_case(t));
         }
         current.clear();
+        pushed
     };
 
     while let Some(c) = chars.next() {
@@ -389,7 +422,9 @@ fn split_segments(command: &str) -> Vec<(String, String)> {
             match c {
                 '&' if chars.peek() == Some(&'&') => {
                     chars.next();
-                    flush(&mut current, &mut out, "&&");
+                    if !flush(&mut current, &mut out, "&&", &mut in_case) {
+                        return Err(Fallback::SegmentEmpty);
+                    }
                     continue;
                 }
                 '|' if current.trim_end().ends_with('>') => {
@@ -398,21 +433,34 @@ fn split_segments(command: &str) -> Vec<(String, String)> {
                 '|' => {
                     if chars.peek() == Some(&'&') {
                         chars.next();
-                        flush(&mut current, &mut out, "|&");
+                        if !flush(&mut current, &mut out, "|&", &mut in_case) {
+                            return Err(Fallback::SegmentEmpty);
+                        }
                     } else if chars.peek() == Some(&'|') {
                         chars.next();
-                        flush(&mut current, &mut out, "||");
-                    } else {
-                        flush(&mut current, &mut out, "|");
+                        if !flush(&mut current, &mut out, "||", &mut in_case) {
+                            return Err(Fallback::SegmentEmpty);
+                        }
+                    } else if !flush(&mut current, &mut out, "|", &mut in_case) {
+                        return Err(Fallback::SegmentEmpty);
                     }
                     continue;
                 }
                 '\n' => {
-                    flush(&mut current, &mut out, "\n");
+                    flush(&mut current, &mut out, "\n", &mut in_case);
                     continue;
                 }
                 ';' => {
-                    flush(&mut current, &mut out, ";");
+                    if !flush(&mut current, &mut out, ";", &mut in_case) {
+                        return Err(Fallback::SegmentEmpty);
+                    }
+                    // `;;` is a valid case-arm terminator: consume the second
+                    // `;` — the compound check rejects the case statement
+                    // itself (fail-closed) instead of mislabeling the empty
+                    // member. Outside a case, `;;` stays a syntax error.
+                    if in_case && chars.peek() == Some(&';') {
+                        chars.next();
+                    }
                     continue;
                 }
                 _ => {}
@@ -420,8 +468,35 @@ fn split_segments(command: &str) -> Vec<(String, String)> {
         }
         current.push(c);
     }
-    flush(&mut current, &mut out, "");
-    out
+    flush(&mut current, &mut out, "", &mut in_case);
+    if out
+        .last()
+        .is_some_and(|(_, conn)| matches!(conn.as_str(), "|" | "|&" | "||" | "&&"))
+    {
+        return Err(Fallback::SegmentEmpty);
+    }
+    Ok(out)
+}
+
+/// True when the segment opens a `case` statement: `case` in command position
+/// (first word, or second after a block keyword that introduces commands).
+fn segment_opens_case(segment: &str) -> bool {
+    let mut words = segment.split_whitespace();
+    match words.next() {
+        Some("case") => true,
+        Some("do" | "then" | "else" | "elif" | "if") => words.next() == Some("case"),
+        _ => false,
+    }
+}
+
+/// True when the segment closes a `case` statement (`esac` in command position).
+fn segment_ends_case(segment: &str) -> bool {
+    let mut words = segment.split_whitespace();
+    match words.next() {
+        Some("esac") => true,
+        Some("do" | "then" | "else" | "elif" | "if") => words.next() == Some("esac"),
+        _ => false,
+    }
 }
 
 /// First whitespace-delimited word of a segment (raw, quote-preserving).
@@ -435,10 +510,6 @@ fn is_grep_verb(verb: &str) -> bool {
 
 fn is_cd_segment(verb: &str) -> bool {
     verb == "cd"
-}
-
-fn is_head_segment(segment: &str) -> bool {
-    first_word(segment) == "head"
 }
 
 /// Command-introducer verbs whose argument list may contain a nested grep
@@ -612,6 +683,7 @@ impl GrepFlags {
 }
 
 /// A word from the grep segment: its unquoted value plus redirect metadata.
+#[derive(Clone)]
 struct GrepWord {
     /// Unquoted value (expansions already rejected).
     value: String,
@@ -756,7 +828,7 @@ struct ParsedGrep {
     exclude_dir: Vec<String>,
     /// Translated engine-dialect patterns.
     engine_patterns: Vec<String>,
-    /// Unquoted operand tokens (pre-resolution).
+    /// Raw operand token spellings (quote/glob checks run on these).
     operand_tokens: Vec<String>,
     /// Redirect tokens preserved verbatim in the rewritten segment.
     redirects: Vec<String>,
@@ -772,7 +844,7 @@ struct ParsedGrep {
 fn parse_grep_words(words: &[GrepWord], verb: &str) -> Result<ParsedGrep, Fallback> {
     // Redirects (and their targets) are removed by the shell before grep sees
     // the argv; collect them verbatim for the rewrite.
-    let mut argv: Vec<String> = Vec::new();
+    let mut argv: Vec<GrepWord> = Vec::new();
     let mut redirects: Vec<String> = Vec::new();
     let mut i = 0;
     while i < words.len() {
@@ -783,7 +855,7 @@ fn parse_grep_words(words: &[GrepWord], verb: &str) -> Result<ParsedGrep, Fallba
                 i += 1;
             }
         } else {
-            argv.push(words[i].value.clone());
+            argv.push(words[i].clone());
         }
         i += 1;
     }
@@ -804,13 +876,13 @@ fn parse_grep_words(words: &[GrepWord], verb: &str) -> Result<ParsedGrep, Fallba
     let mut i = 0;
     while i < argv.len() {
         let tok = &argv[i];
-        if !options_ended && tok == "--" {
+        if !options_ended && tok.value == "--" {
             options_ended = true;
             i += 1;
             continue;
         }
-        if !options_ended && tok.starts_with('-') && tok.len() > 1 {
-            if let Some(rest) = tok.strip_prefix("--") {
+        if !options_ended && tok.value.starts_with('-') && tok.value.len() > 1 {
+            if let Some(rest) = tok.value.strip_prefix("--") {
                 // Long options.
                 if rest == "null" {
                     flags.null = true;
@@ -826,7 +898,10 @@ fn parse_grep_words(words: &[GrepWord], verb: &str) -> Result<ParsedGrep, Fallba
                     exclude_dir.push(v.to_string());
                 } else if rest == "include" || rest == "exclude" || rest == "exclude-dir" {
                     i += 1;
-                    let v = argv.get(i).ok_or(Fallback::MissingOptionValue)?;
+                    let v = argv
+                        .get(i)
+                        .map(|w| w.value.clone())
+                        .ok_or(Fallback::MissingOptionValue)?;
                     match rest {
                         "include" => filters.push((true, v.clone())),
                         "exclude" => filters.push((false, v.clone())),
@@ -837,7 +912,7 @@ fn parse_grep_words(words: &[GrepWord], verb: &str) -> Result<ParsedGrep, Fallba
                 }
             } else {
                 // Short option cluster; value-taking options consume the rest.
-                let chars: Vec<char> = tok[1..].chars().collect();
+                let chars: Vec<char> = tok.value[1..].chars().collect();
                 let mut j = 0;
                 while j < chars.len() {
                     match chars[j] {
@@ -862,7 +937,9 @@ fn parse_grep_words(words: &[GrepWord], verb: &str) -> Result<ParsedGrep, Fallba
                             let rest: String = chars[j + 1..].iter().collect();
                             let value = if rest.is_empty() {
                                 i += 1;
-                                argv.get(i).cloned().ok_or(Fallback::MissingOptionValue)?
+                                argv.get(i)
+                                    .map(|w| w.value.clone())
+                                    .ok_or(Fallback::MissingOptionValue)?
                             } else {
                                 rest
                             };
@@ -907,10 +984,10 @@ fn parse_grep_words(words: &[GrepWord], verb: &str) -> Result<ParsedGrep, Fallba
             }
             i += 1;
         } else if positional.is_none() && e_patterns.is_empty() {
-            positional = Some(tok.clone());
+            positional = Some(tok.value.clone());
             i += 1;
         } else {
-            operand_tokens.push(tok.clone());
+            operand_tokens.push(tok.raw.clone());
             i += 1;
         }
     }
@@ -1278,6 +1355,7 @@ fn serve_one_grep(
     cwd: &Path,
     home: &Path,
     allow_single: bool,
+    piped: bool,
 ) -> Result<(EngineSpec, String), Fallback> {
     let mut words = grep_tokenize(segment)?;
     // The segment starts with the verb; the parser sees only its arguments.
@@ -1302,7 +1380,7 @@ fn serve_one_grep(
         }
     } else {
         for tok in &parsed.operand_tokens {
-            if tok == "-" {
+            if unquote_word(tok)? == "-" {
                 return Err(Fallback::StdinMode);
             }
             let expanded = resolve_operand(tok, cwd, home)?;
@@ -1349,6 +1427,7 @@ fn serve_one_grep(
         operands,
         cwd: cwd.to_string_lossy().into_owned(),
         fallback,
+        piped,
     };
 
     let mut rewritten = build_rewritten(&spec);
@@ -1359,8 +1438,10 @@ fn serve_one_grep(
     Ok((spec, rewritten))
 }
 
-/// Resolve one operand token into concrete operands (tilde, glob expansion,
-/// relative-to-cwd). Unresolvable forms fall back.
+/// Resolve one raw operand token into concrete operands (tilde, glob
+/// expansion, relative-to-cwd). Quote/glob checks run on the token exactly
+/// as typed: quoted/escaped `~` and glob metacharacters are literal
+/// filenames to BSD grep and must not expand. Unresolvable forms fall back.
 fn resolve_operand(tok: &str, cwd: &Path, home: &Path) -> Result<Vec<Operand>, Fallback> {
     if tok == "~" {
         return Ok(vec![operand_from_path(
@@ -1374,9 +1455,16 @@ fn resolve_operand(tok: &str, cwd: &Path, home: &Path) -> Result<Vec<Operand>, F
         return Err(Fallback::UnresolvableOperand(tok.to_string()));
     }
     if has_unquoted_glob(tok) {
-        // Includes `~/…` globs: expand_glob strips the `~/` itself.
-        let pattern = unquote_word(tok)?;
-        let matches = expand_glob(&pattern, cwd, home)?;
+        let value = unquote_word(tok)?;
+        // `~/` expands to home only when the raw token opens with an unquoted
+        // `~/`; `"~"/*.txt` (quoted tilde + unquoted glob) is a literal
+        // cwd-relative path, and the unquoted value would wrongly home-strip.
+        let pattern = if tok.starts_with("~/") {
+            home.join(&value[2..]).to_string_lossy().into_owned()
+        } else {
+            value
+        };
+        let matches = expand_glob(&pattern, cwd)?;
         if matches.is_empty() {
             return Err(Fallback::UnexpandableGlob);
         }
@@ -1393,7 +1481,7 @@ fn resolve_operand(tok: &str, cwd: &Path, home: &Path) -> Result<Vec<Operand>, F
             .collect());
     }
     if let Some(rest) = tok.strip_prefix("~/") {
-        let expanded = home.join(rest);
+        let expanded = home.join(unquote_word(rest)?);
         return Ok(vec![operand_from_path(
             &expanded.to_string_lossy(),
             &expanded,
@@ -1449,15 +1537,9 @@ fn has_unquoted_glob(tok: &str) -> bool {
 
 /// Bash-style glob expansion for operand tokens: dotfile exclusion, bracket
 /// expressions, no-match → empty (the caller falls back). The returned
-/// display strings match what the shell would pass to grep.
-fn expand_glob(pattern: &str, cwd: &Path, home: &Path) -> Result<Vec<String>, Fallback> {
-    let pattern = if let Some(rest) = pattern.strip_prefix("~/") {
-        home.join(rest).to_string_lossy().into_owned()
-    } else if pattern == "~" {
-        home.to_string_lossy().into_owned()
-    } else {
-        pattern.to_string()
-    };
+/// display strings match what the shell would pass to grep. Home expansion of
+/// `~/…` is applied by the caller (only for an unquoted leading `~/`).
+fn expand_glob(pattern: &str, cwd: &Path) -> Result<Vec<String>, Fallback> {
     if pattern.ends_with('/') {
         return Err(Fallback::UnexpandableGlob);
     }
@@ -1603,7 +1685,10 @@ fn serve(spec: &EngineSpec) -> Result<i32, ()> {
         return Err(());
     }
     let matcher = build_matcher(&spec.patterns, spec.mode, &spec.flags).map_err(|_| ())?;
-    let mut out = Output::streaming();
+    let mut out = Output::new(
+        OutputSink::Stdout(io::BufWriter::with_capacity(16 * 1024, io::stdout())),
+        if spec.piped { None } else { Some(OUTPUT_CAP) },
+    );
     let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         serve_into(spec, &matcher, &mut out)
     }));
@@ -2093,17 +2178,20 @@ fn trim_line_terminator(b: &[u8]) -> &[u8] {
 
 // ── Output: bounded, self-capping writer ──────────────────────────────────
 
-/// Streams matched lines to stdout as they are produced (so `head` early-exit
-/// propagates via SIGPIPE like the real grep), self-capping at [`OUTPUT_CAP`]
-/// bytes after which writing stops but the search continues (exit codes stay
-/// correct for huge outputs). With SIGPIPE at its default disposition a write
-/// to a closed pipe kills the process — exactly like grep. Stderr is buffered
+/// Streams matched lines to stdout as they are produced (so an early-exit
+/// tail propagates via SIGPIPE like the real grep). Non-piped members
+/// self-cap at [`OUTPUT_CAP`] bytes after which writing stops but the search
+/// continues (exit codes stay correct for huge outputs); piped members are
+/// unbounded — the tail consumes the full stream, so truncation would be an
+/// invisible wrong answer. With SIGPIPE at its default disposition a write to
+/// a closed pipe kills the process — exactly like grep. Stderr is buffered
 /// (small, rare) and flushed on finish.
 struct Output {
     sink: OutputSink,
     err: Vec<u8>,
     written: usize,
-    capped: bool,
+    /// Cap on written stdout bytes; `None` = unbounded (piped member).
+    limit: Option<usize>,
 }
 
 enum OutputSink {
@@ -2114,32 +2202,22 @@ enum OutputSink {
 }
 
 impl Output {
-    /// Production sink: streams to the process stdout.
-    fn streaming() -> Self {
+    /// New sink with an optional stdout cap (`None` = unbounded piped member).
+    fn new(sink: OutputSink, limit: Option<usize>) -> Self {
         Output {
-            sink: OutputSink::Stdout(io::BufWriter::with_capacity(16 * 1024, io::stdout())),
+            sink,
             err: Vec::new(),
             written: 0,
-            capped: false,
-        }
-    }
-
-    /// In-memory sink for the differential parity tests.
-    #[cfg_attr(not(all(test, target_os = "macos")), allow(dead_code))]
-    fn buffered() -> Self {
-        Output {
-            sink: OutputSink::Buffer(Vec::new()),
-            err: Vec::new(),
-            written: 0,
-            capped: false,
+            limit,
         }
     }
 
     fn write_bytes(&mut self, b: &[u8]) {
-        if self.capped {
-            return;
-        }
-        let take = (OUTPUT_CAP - self.written).min(b.len());
+        let take = match self.limit {
+            Some(limit) if self.written < limit => (limit - self.written).min(b.len()),
+            Some(_) => return,
+            None => b.len(),
+        };
         match &mut self.sink {
             OutputSink::Stdout(w) => {
                 let _ = w.write_all(&b[..take]);
@@ -2147,9 +2225,6 @@ impl Output {
             OutputSink::Buffer(v) => v.extend_from_slice(&b[..take]),
         }
         self.written += take;
-        if self.written >= OUTPUT_CAP {
-            self.capped = true;
-        }
     }
 
     fn write_byte(&mut self, b: u8) {
@@ -2250,13 +2325,25 @@ mod parity_tests {
         // Subdirectory for cd chains.
         fs::create_dir_all(ws.join("sub")).unwrap();
         fs::write(ws.join("sub/s.txt"), "needle\n").unwrap();
+        // Literal filename operands for quoted/escaped glob and ~ forms:
+        // BSD grep searches these literally when the shell quotes/escapes
+        // the metacharacters.
+        fs::write(ws.join("~"), "needle\n").unwrap();
+        fs::write(ws.join("*.txt"), "needle\n").unwrap();
+        fs::write(ws.join("a\"b.txt"), "needle\n").unwrap();
+        // Quoted `~` + unquoted glob: a literal `~` dir relative to cwd.
+        fs::create_dir_all(ws.join("sub/~")).unwrap();
+        fs::write(ws.join("sub/~/q.txt"), "needle\n").unwrap();
     }
 
     /// Run the engine in-process on one spec; returns (stdout, stderr, code).
     fn engine_run(spec: &EngineSpec) -> (Vec<u8>, Vec<u8>, i32) {
         let matcher =
             build_matcher(&spec.patterns, spec.mode, &spec.flags).expect("matcher builds");
-        let mut out = Output::buffered();
+        let mut out = Output::new(
+            OutputSink::Buffer(Vec::new()),
+            if spec.piped { None } else { Some(OUTPUT_CAP) },
+        );
         let code = serve_into(spec, &matcher, &mut out);
         let Output {
             sink: OutputSink::Buffer(buf),
@@ -2318,7 +2405,7 @@ mod parity_tests {
         let (rout, rerr, rcode) = if piped {
             assert!(
                 rewritten.contains(" | "),
-                "{command}: head member not preserved"
+                "{command}: pipeline tail member not preserved"
             );
             real_run_fallback(&specs[0])
         } else {
@@ -2335,6 +2422,15 @@ mod parity_tests {
             analyze_command(command, ws, home, false).is_err(),
             "{command}: expected fallback, got served"
         );
+    }
+
+    /// Assert the command falls back with a specific reason (pins the labels
+    /// the empty-member gate and early NoGrep check changed).
+    fn assert_falls_back_reason(command: &str, ws: &Path, home: &Path, reason: &str) {
+        let err = analyze_command(command, ws, home, false)
+            .err()
+            .unwrap_or_else(|| panic!("{command}: expected fallback, got served"));
+        assert_eq!(err.to_string(), reason, "{command}");
     }
 
     #[test]
@@ -2544,6 +2640,26 @@ mod parity_tests {
             // ── head pipeline (grep part parity) ──
             "grep -rn x plain | head -5",
             "grep -rn x plain | head",
+            // ── Raw-token operands: quoted/escaped globs and ~ are literal ──
+            "grep -rn needle '~'",
+            "grep -rn needle '*.txt'",
+            "grep -rn needle \\*.txt",
+            "grep -rn needle 'a\"b.txt'",
+            "grep -rn needle '~/htree'", // literal path, no such file (stderr row)
+            "grep -rn needle '~user'",   // literal path, no such file (stderr row)
+            "grep -rn needle ~/\"htree\"", // mixed form: `~/` expands, quoted rest joins
+            // ── 2-member pipelines: any tail is served (grep member parity;
+            //    full-pipeline parity lives in the e2e bench). The 2>&1 row
+            //    covers the benign ordering only — engine stderr is buffered
+            //    to finish while BSD emits at operand-open, so missing-first
+            //    or order-sensitive tails diverge (accepted residual) ──
+            "grep -rn x plain | wc -l",
+            "grep -rn x plain | tail -2",
+            "grep -rn x plain | sort",
+            "grep -rn x plain missing.txt 2>&1 | wc -l",
+            // Quoted `~` + unquoted glob is a literal cwd-relative path
+            // (`"~"/*.txt` must not home-strip the tilde).
+            "grep -rn needle 'sub/~'/*.txt",
         ];
 
         let mut failures = Vec::new();
@@ -2606,28 +2722,50 @@ mod parity_tests {
             "grep -c x a.txt",                         // single file, -c (perf gate)
             "grep -l x a.txt",                         // single file, -l (perf gate)
             "grep -r x plain/e.txt",                   // single file, recursive
+            "grep -rn needle '~'", // quoted ~ is literal → single file → perf gate
             "cat <<EOF\nfoo\nEOF\ngrep x a.txt b.txt", // heredoc feeds a non-grep member
-            "git grep x",                              // git grep
-            "if grep x a.txt; then echo hi; fi",       // compound
-            "for x in a; do grep x a.txt; done",       // compound
-            "case $x in a) grep x a.txt;; esac",       // compound (case arm)
-            "( grep x a.txt b.txt )",                  // subshell group
-            "{ grep x a.txt; }",                       // brace group
-            "(cd sub && grep x a.txt b.txt)",          // subshell cd + group
-            "xargs grep x",                            // indirect
-            "sh -c 'grep x a.txt'",                    // indirect
-            "cd $HOME && grep x a.txt",                // cd untrackable
-            "cd - && grep x a.txt",                    // cd $OLDPWD
-            "grep x a.txt | head -1 | wc -l",          // pipeline shape
-            "! grep x a.txt",                          // negation
-            "sudo grep x a.txt",                       // env prefix
-            "grep -w 'foo\\|bar' a.txt b.txt",         // -w + alternation (word_safe)
+            "git grep x",          // git grep
+            "if grep x a.txt; then echo hi; fi", // compound
+            "for x in a; do grep x a.txt; done", // compound
+            "case $x in a) grep x a.txt;; esac", // compound (case arm)
+            "( grep x a.txt b.txt )", // subshell group
+            "{ grep x a.txt; }",   // brace group
+            "(cd sub && grep x a.txt b.txt)", // subshell cd + group
+            "xargs grep x",        // indirect
+            "sh -c 'grep x a.txt'", // indirect
+            "cd $HOME && grep x a.txt", // cd untrackable
+            "cd - && grep x a.txt", // cd $OLDPWD
+            "grep x a.txt | head -1 | wc -l", // 3+ member pipeline
+            "grep -rn x plain | grep -v x | head -5", // 3+ member pipeline
+            "grep x a.txt | grep y", // second grep member isn't first in the pipeline
+            "grep x a.txt | xargs grep y", // indirect grep in the tail
+            "grep x a.txt | | wc -l", // empty pipeline member
+            "grep x a.txt |",      // trailing pipe
+            "! grep x a.txt",      // negation
+            "sudo grep x a.txt",   // env prefix
+            "grep -w 'foo\\|bar' a.txt b.txt", // -w + alternation (word_safe)
             "echo $(echo \\) ; grep x a.txt", // unterminated $(...) — escape-aware span stays open
-            "echo hello && echo world",       // no grep at all
+            "echo hello && echo world", // no grep at all
         ];
         for row in rows {
             assert_falls_back(row, &ws, &home);
         }
+        // Pinned reason labels: `;;` is a case terminator (compound, not an
+        // empty member); empty pipeline members stay rejected; non-grep
+        // pipelines are "no grep", not "pipeline shape".
+        assert_falls_back_reason(
+            "case $x in a) grep x a.txt;; esac",
+            &ws,
+            &home,
+            "nested grep",
+        );
+        assert_falls_back_reason(
+            "grep x a.txt | | wc -l",
+            &ws,
+            &home,
+            "empty command or pipeline member",
+        );
+        assert_falls_back_reason("cat f | head", &ws, &home, "no grep");
     }
 
     #[test]
