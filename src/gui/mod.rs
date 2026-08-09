@@ -686,19 +686,43 @@ impl Dashboard {
             Page::Sessions => sessions::SessionsState::refresh().map(Message::Sessions),
             Page::Settings => {
                 self.settings_state.refresh();
-                let refresh_workspaces = self
-                    .settings_state
-                    .workspaces_state
-                    .refresh()
-                    .map(|msg| Message::Settings(settings::SettingsMessage::WorkspaceMsg(msg)));
-                let refresh_users = self
-                    .settings_state
-                    .users_state
-                    .refresh()
-                    .map(|msg| Message::Settings(settings::SettingsMessage::UserMsg(msg)));
-                Task::batch([refresh_workspaces, refresh_users])
+                self.refresh_settings_lists(false)
             }
         }
+    }
+
+    /// Refresh Settings workspace/user lists, gating each list independently
+    /// on its in-flight load. `gate_loading` is set by the per-second tick,
+    /// since refresh() does not self-gate; navigation passes `false` to keep
+    /// its original unconditional refresh (no load_state marking). Does not
+    /// absorb the config snapshot (`settings_state.refresh()`).
+    fn refresh_settings_lists(&mut self, gate_loading: bool) -> Task<Message> {
+        let ws = if gate_loading && self.settings_state.workspaces_state.load_state.loading() {
+            Task::none()
+        } else {
+            if gate_loading {
+                self.settings_state
+                    .workspaces_state
+                    .load_state
+                    .start_loading();
+            }
+            self.settings_state
+                .workspaces_state
+                .refresh()
+                .map(|msg| Message::Settings(settings::SettingsMessage::WorkspaceMsg(msg)))
+        };
+        let us = if gate_loading && self.settings_state.users_state.load_state.loading() {
+            Task::none()
+        } else {
+            if gate_loading {
+                self.settings_state.users_state.load_state.start_loading();
+            }
+            self.settings_state
+                .users_state
+                .refresh()
+                .map(|msg| Message::Settings(settings::SettingsMessage::UserMsg(msg)))
+        };
+        Task::batch([ws, us])
     }
 
     /// Toggle the selected workspace's pause or maintainer state.
@@ -782,33 +806,7 @@ impl Dashboard {
                 self.sessions_state.load_state.start_loading();
                 sessions::SessionsState::refresh().map(Message::Sessions)
             }
-            Page::Settings => {
-                // Refresh workspace and user lists when on Settings page
-                let ws_loading = self.settings_state.workspaces_state.load_state.loading();
-                let us_loading = self.settings_state.users_state.load_state.loading();
-                let ws = if !ws_loading {
-                    self.settings_state
-                        .workspaces_state
-                        .load_state
-                        .start_loading();
-                    self.settings_state
-                        .workspaces_state
-                        .refresh()
-                        .map(|msg| Message::Settings(settings::SettingsMessage::WorkspaceMsg(msg)))
-                } else {
-                    Task::none()
-                };
-                let us = if !us_loading {
-                    self.settings_state.users_state.load_state.start_loading();
-                    self.settings_state
-                        .users_state
-                        .refresh()
-                        .map(|msg| Message::Settings(settings::SettingsMessage::UserMsg(msg)))
-                } else {
-                    Task::none()
-                };
-                Task::batch([ws, us])
-            }
+            Page::Settings => self.refresh_settings_lists(true),
             _ => Task::none(),
         };
 
