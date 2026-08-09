@@ -124,12 +124,12 @@ impl CircuitBreakerKind {
             Self::Sanitation => count_matching_comments(
                 comments,
                 SANITATION_ROLE,
-                &load_prompt("sanitation_failed.md"),
+                &load_prompt("pipeline/sanitation_failed.md"),
             ),
             Self::Diagnostics => count_matching_comments(
                 comments,
                 DIAGNOSTICS_ROLE,
-                &load_prompt("diagnostics_failed.md"),
+                &load_prompt("pipeline/diagnostics_failed.md"),
             ),
         };
 
@@ -550,7 +550,7 @@ async fn notify_ticket(
     let drained = crate::ticket_buffer::drain(&ws.name);
 
     let mut message = substitute(
-        &load_prompt("notification.md"),
+        &load_prompt("pipeline/notification.md"),
         &[
             ("{{ticket_id}}", &ticket.id),
             ("{{ticket_title}}", &ticket.title),
@@ -589,7 +589,7 @@ async fn notify_ticket(
         };
 
         let warning = substitute(
-            &load_prompt("failure_notification.md"),
+            &load_prompt("pipeline/failure_notification.md"),
             &[
                 ("{{failure_details}}", &failure_details),
                 ("{{workspace_status}}", &workspace_status),
@@ -1194,7 +1194,7 @@ fn engineer_failure_comment(shutdown: bool, cancelled: bool, error: Option<&str>
         return "Engineer failed: cancelled by user.".to_string();
     }
     let Some(detail) = error else {
-        return load_prompt("engineer_failed.md");
+        return load_prompt("pipeline/engineer_failed.md");
     };
     let detail = crate::util::scrub_credentials(detail);
     let detail = crate::util::truncate_sandwich(
@@ -1299,7 +1299,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         load_prompt("implement.md")
     } else {
         substitute(
-            &load_prompt("bounce_feedback.md"),
+            &load_prompt("pipeline/bounce_feedback.md"),
             &[("{{feedback}}", &feedback.join("\n---\n"))],
         )
     };
@@ -1680,10 +1680,13 @@ async fn record_sanitation_failure(
     let reason_str = match raw_dump {
         Some(failure) => format!(
             "{} — {reason}\n\n{}",
-            load_prompt("sanitation_failed.md"),
+            load_prompt("pipeline/sanitation_failed.md"),
             raw_response_dump_section(failure)
         ),
-        None => format!("{} — {reason}", load_prompt("sanitation_failed.md")),
+        None => format!(
+            "{} — {reason}",
+            load_prompt("pipeline/sanitation_failed.md")
+        ),
     };
     if let Err(e) = crate::turso::with_tx(
         &board().conn,
@@ -1938,7 +1941,7 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
     } else {
         let garbage_list = verdict.garbage_files.join("\n- ");
         let comment = substitute(
-            &load_prompt("sanitation_failed_comment.md"),
+            &load_prompt("pipeline/sanitation_failed_comment.md"),
             &[
                 ("{{garbage_list}}", &garbage_list),
                 ("{{rationale}}", &verdict.rationale),
@@ -1947,11 +1950,11 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
         // Pre-build the system comment so we can pass it into the transaction.
         let count_str = verdict.garbage_files.len().to_string();
         let sys_comment = substitute(
-            &load_prompt("sanitation_circuit_breaker_comment.md"),
+            &load_prompt("pipeline/sanitation_circuit_breaker_comment.md"),
             &[
                 (
                     "{{sanitation_failed_marker}}",
-                    &load_prompt("sanitation_failed.md"),
+                    &load_prompt("pipeline/sanitation_failed.md"),
                 ),
                 ("{{count}}", &count_str),
             ],
@@ -2089,12 +2092,12 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 
     if all_passed {
         comment.push_str("\n\n---\n");
-        comment.push_str(&load_prompt("diagnostics_passed.md"));
+        comment.push_str(&load_prompt("pipeline/diagnostics_passed.md"));
     } else {
         let _ = write!(
             comment,
             "\n\n---\n{} {failed_at}",
-            load_prompt("diagnostics_failed.md"),
+            load_prompt("pipeline/diagnostics_failed.md"),
         );
     }
 
@@ -2365,13 +2368,13 @@ async fn persist_verdict_scores(ticket: &Ticket, stage: &str, results: &[Paralle
     }
 }
 
-/// Load per-agent angle supplements for a verifier role (review/angles.md,
-/// qa/angles.md). Missing or malformed assets degrade to no supplements —
+/// Load per-agent angle supplements for a verifier role (review_angles.md,
+/// qa_angles.md). Missing or malformed assets degrade to no supplements —
 /// dispatch then uses today's identical shared prompt.
 fn load_verifier_angles(role: Role) -> Vec<String> {
     match role {
-        Role::Reviewer => load_prompt_sections("review/angles.md"),
-        Role::Qa => load_prompt_sections("qa/angles.md"),
+        Role::Reviewer => load_prompt_sections("review_angles.md"),
+        Role::Qa => load_prompt_sections("qa_angles.md"),
         _ => Vec::new(),
     }
 }
@@ -3073,7 +3076,7 @@ async fn process_verifier_verdicts(
                 .await;
         let reasons = verifier_failure_reasons(results);
         let header = substitute(
-            &load_prompt("verifiers_all_failed.md"),
+            &load_prompt("pipeline/verifiers_all_failed.md"),
             &[("{{agent_type}}", verifier.log_label)],
         );
         let body = format!("{reasons}{pause_note}");

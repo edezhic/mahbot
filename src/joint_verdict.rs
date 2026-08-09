@@ -106,8 +106,8 @@ const PIPELINE_GROUPING_MAX_TOKENS: u32 = 16_000;
 fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> ChatRequest {
     let system = format!(
         "{}\n\n{}",
-        crate::prompt::load_prompt("synthesis.md"),
-        crate::prompt::load_prompt("grouping_contradictions.md"),
+        crate::prompt::load_prompt("synthesis/synthesis.md"),
+        crate::prompt::load_prompt("synthesis/grouping_contradictions.md"),
     );
     let mut material = String::new();
     // Global flat item ids across ALL agents: ids 0..N are assigned in
@@ -128,7 +128,7 @@ fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> Chat
     }
     let user = format!(
         "{}\n\nStage: {}\nAgent issues (id-numbered):\n{}",
-        crate::prompt::load_prompt("synthesis_input.md"),
+        crate::prompt::load_prompt("synthesis/synthesis_input.md"),
         round.stage,
         material,
     );

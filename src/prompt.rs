@@ -161,7 +161,7 @@ pub(crate) fn format_ticket_block(ticket: &crate::board::Ticket) -> String {
     }
 
     substitute(
-        &load_prompt("ticket.md"),
+        &load_prompt("context/ticket.md"),
         &[
             ("{{ticket_id}}", &ticket.id),
             ("{{ticket_title}}", &ticket.title),
@@ -198,7 +198,7 @@ fn push_truncated(out: &mut String, text: &str) {
             out,
             "\n\n{}\n",
             substitute(
-                &load_prompt("truncation_notice.md"),
+                &load_prompt("context/truncation_notice.md"),
                 &[("{{max_chars}}", &MAX_WORKSPACE_FILE_CHARS.to_string())],
             ),
         );
@@ -414,7 +414,10 @@ mod tests {
             // asset_key is Cow<'static, str> (from rust-embed).
             // Filter to only tool/*.md files and extract the tool name.
             if let Some(tool_name) = tool_name_from_asset_key(&asset_key) {
-                available.insert(tool_name.to_string());
+                // shell_readonly_banner.md is a banner asset, not a tool description.
+                if tool_name != "shell_readonly_banner" {
+                    available.insert(tool_name.to_string());
+                }
             }
         }
 

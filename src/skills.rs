@@ -159,7 +159,7 @@ pub fn skills_to_prompt(skills: &[Skill], ws: &crate::Workspace) -> String {
         let _ = writeln!(skills_xml, "  </skill>");
     }
     crate::prompt::substitute(
-        &crate::prompt::load_prompt("skills.md"),
+        &crate::prompt::load_prompt("context/skills.md"),
         &[("{{skills}}", skills_xml.trim())],
     )
 }

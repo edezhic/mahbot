@@ -183,7 +183,7 @@ impl Session {
         // Append conversation summary, then the retained latest turns in
         // chronological order. The in-flight user message is already among
         // them (newest user message) — no separate re-append here.
-        let prefix = load_prompt("summary_prefix.md");
+        let prefix = load_prompt("context/summary_prefix.md");
         compacted.push(ChatMessage::system(format!("{prefix}{summary_text}")));
         compacted.extend(crate::session::select_retention_window(&self.history));
 
@@ -234,7 +234,7 @@ impl Session {
     ///
     /// ```text
     /// role_description       — from src/prompt/role/{role}.md (always)
-    /// workspace boilerplate  — from src/prompt/workspace.md, substituted (always)
+    /// workspace boilerplate  — from src/prompt/context/workspace.md, substituted (always)
     /// skills                 — if any skills exist in the workspace
     /// board_context          — Manager role only, when active tickets exist
     /// ticket_block           — when a ticket is assigned to this session
@@ -280,7 +280,7 @@ impl Session {
         };
 
         let workspace_boilerplate = substitute(
-            &load_prompt("workspace.md"),
+            &load_prompt("context/workspace.md"),
             &[
                 ("{{operating_system}}", std::env::consts::OS),
                 ("{{workspace}}", &ws.as_path().display().to_string()),

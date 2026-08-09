@@ -452,8 +452,8 @@ async fn consolidate_findings(
     let routing = CONFIG.model_routing(&model);
     let system = format!(
         "{}\n\n{}",
-        load_prompt("consolidate/analyst.md"),
-        load_prompt("grouping_contradictions.md"),
+        load_prompt("synthesis/analyst.md"),
+        load_prompt("synthesis/grouping_contradictions.md"),
     );
     let request = crate::consensus::grouping_request(
         ws,

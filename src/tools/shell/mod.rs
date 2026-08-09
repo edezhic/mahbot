@@ -776,7 +776,7 @@ impl Tool for ShellTool {
     fn description(&self) -> String {
         match self.mode {
             ShellMode::ReadOnly => {
-                let banner = crate::prompt::load_prompt("shell_readonly_banner.md");
+                let banner = crate::prompt::load_prompt("tool/shell_readonly_banner.md");
                 let base = crate::prompt::load_prompt(&format!("tool/{}.md", self.name()));
                 format!("{banner}\n\n{base}")
             }

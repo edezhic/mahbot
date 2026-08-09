@@ -81,7 +81,7 @@ async fn circuit_breaker_self_counting_prevention() {
         let msg = CircuitBreakerKind::Diagnostics.trip_message(99, 4);
 
         // The trip message must NOT contain the diagnostics_failed.md marker string.
-        let failed_marker = load_prompt("diagnostics_failed.md");
+        let failed_marker = load_prompt("pipeline/diagnostics_failed.md");
         assert!(
             !msg.contains(failed_marker.as_str()),
             "Diagnostics trip message must not contain the diagnostics_failed.md marker string \
@@ -468,11 +468,11 @@ async fn add_breaker_failure(kind: CircuitBreakerKind, ticket_id: &str) {
         CircuitBreakerKind::Sanitation => (
             SANITATION_ROLE,
             substitute(
-                &load_prompt("sanitation_circuit_breaker_comment.md"),
+                &load_prompt("pipeline/sanitation_circuit_breaker_comment.md"),
                 &[
                     (
                         "{{sanitation_failed_marker}}",
-                        load_prompt("sanitation_failed.md").as_str(),
+                        load_prompt("pipeline/sanitation_failed.md").as_str(),
                     ),
                     ("{{count}}", "1"),
                 ],
@@ -480,7 +480,10 @@ async fn add_breaker_failure(kind: CircuitBreakerKind, ticket_id: &str) {
         ),
         CircuitBreakerKind::Diagnostics => (
             DIAGNOSTICS_ROLE,
-            format!("---\n{} test_step", load_prompt("diagnostics_failed.md")),
+            format!(
+                "---\n{} test_step",
+                load_prompt("pipeline/diagnostics_failed.md")
+            ),
         ),
     };
     let _ = board().add_comment(ticket_id, role, &comment).await;
@@ -1228,7 +1231,8 @@ async fn process_sanitation_verdict_cases() {
 
     init_management_test_stores().await;
 
-    let sanitation_failed_marker: &'static str = load_prompt("sanitation_failed.md").leak();
+    let sanitation_failed_marker: &'static str =
+        load_prompt("pipeline/sanitation_failed.md").leak();
     let sys_markers_val: &'static [&'static str] =
         Box::leak(vec![sanitation_failed_marker].into_boxed_slice());
 
@@ -1363,8 +1367,10 @@ async fn dispatch_diagnostics_cases() {
 
     init_management_test_stores().await;
 
-    let diagnostics_failed_marker: &'static str = load_prompt("diagnostics_failed.md").leak();
-    let diagnostics_passed_marker: &'static str = load_prompt("diagnostics_passed.md").leak();
+    let diagnostics_failed_marker: &'static str =
+        load_prompt("pipeline/diagnostics_failed.md").leak();
+    let diagnostics_passed_marker: &'static str =
+        load_prompt("pipeline/diagnostics_passed.md").leak();
 
     const NO_DIAG_CMDS: &[&str] = &["No diagnostics commands are configured"];
     const DB_ERR: &[&str] = &["database error"];
@@ -1624,7 +1630,7 @@ async fn diagnostics_repairs_gate_breaking_clippy_compound() {
         comment.contains("could not compile"),
         "the -D warnings gate must break the build on the warn-by-default lint, comment was:\n{comment}"
     );
-    let failed_marker = load_prompt("diagnostics_failed.md");
+    let failed_marker = load_prompt("pipeline/diagnostics_failed.md");
     assert!(
         comment.contains(&format!("{failed_marker} lint")),
         "failure attribution should name the lint slot, comment was:\n{comment}"
@@ -1664,7 +1670,7 @@ async fn diagnostics_repaired_chain_passes_on_clean_crate() {
         "the broken compound should still be repaired into a fix+gate chain, comment was:\n{comment}"
     );
     assert!(
-        comment.contains(&load_prompt("diagnostics_passed.md")),
+        comment.contains(&load_prompt("pipeline/diagnostics_passed.md")),
         "the run should end with the pass marker, comment was:\n{comment}"
     );
     assert!(
