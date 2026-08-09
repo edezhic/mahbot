@@ -203,9 +203,12 @@ fn spec_json_ok(spec: &EngineSpec) -> bool {
 }
 
 /// Remove engine stream-size marker line(s) from stderr; returns the last
-/// reported byte count. Multi-pipeline `;`-joined commands emit several
-/// markers and only the last is logged — an accepted best-effort gap. The
-/// marker is engine-only telemetry and must never reach the agent's stderr.
+/// reported byte count. Any line containing the marker token is removed —
+/// the count parse only gates the returned value, so a non-marker line that
+/// literally contains the token is lost too (accepted). Multi-pipeline
+/// `;`-joined commands emit several markers and only the last is logged — an
+/// accepted best-effort gap. The marker is engine-only telemetry and must
+/// never reach the agent's stderr.
 pub(super) fn strip_stream_size_marker(stderr: &mut Vec<u8>) -> Option<u64> {
     // Common path (file-operand serves never emit the marker): skip the copy.
     if !stderr
@@ -470,7 +473,8 @@ fn analyze_command(
             // are intentionally not matched; digit-prefixed dups (`exec 12>&1`)
             // match `2>` and suppress unnecessarily (telemetry loss only).
             // Fail-open escapes (a stray marker line in stdout): env-prefixed
-            // `FOO=1 exec 2>&1` and space-split `exec 2 >&1` (valid POSIX sh).
+            // `FOO=1 exec 2>&1` and escaped-verb `\exec 2>&1` both miss the
+            // `verb == "exec"` check.
             exec_redirects_stderr = true;
         }
         rewritten.push((seg.clone(), conn.clone()));

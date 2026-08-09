@@ -507,12 +507,13 @@ impl ShellTool {
         // consumed via a stderr marker; strip it from the agent-visible stderr
         // and log it (best-effort: -m/-l early stops undercount, SIGPIPE-killed
         // chains never flush, and member-side/shell-level stderr merges
-        // suppress it). Fail-open by design (the marker is stripped only when
-        // confidently recognized): the shell-level `exec` check misses an
-        // env-assignment-prefixed redirect (`FOO=1 exec 2>&1`) and a
-        // space-separated fd redirect (`exec 2 >&1`), so the marker lands in
-        // the agent-visible stdout or a file — beyond this strip's reach. Runs
-        // on timeout output too — the marker is flushed before the engine
+        // suppress it). The strip removes any line containing the marker
+        // token — the count parse only gates the logged value, so a non-marker
+        // stderr line that literally contains the token is lost too (accepted).
+        // The pre-flight `exec` check misses env-prefixed (`FOO=1 exec 2>&1`)
+        // and escaped-verb (`\exec 2>&1`) redirects, so the marker can leak
+        // into the agent-visible stdout or a file — beyond this strip's reach.
+        // Runs on timeout output too — the marker is flushed before the engine
         // exits, so a later-member hang would otherwise surface it. A discarded
         // engine run (sentinel-3 → the original re-runs below) still logs its
         // bytes — telemetry noise, accepted.
