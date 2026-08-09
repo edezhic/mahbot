@@ -227,11 +227,7 @@ impl Tool for ImageGenTool {
         )
         .await;
 
-        let path_str = output_path.to_string_lossy();
-        let marker_prefix = self
-            .media_marker()
-            .expect("ImageGenTool always has a media marker");
-        Ok(format!("{marker_prefix}{path_str}]"))
+        Ok(self.format_media_result(&output_path))
     }
 }
 

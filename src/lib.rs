@@ -1115,6 +1115,15 @@ pub(crate) trait Tool: Send + Sync {
         None
     }
 
+    /// Format the media output marker `[TYPE:path]` for a generated file.
+    /// Single source of the marker shape parsed by [`crate::util::MEDIA_MARKER_RE`].
+    fn format_media_result(&self, output_path: &Path) -> String {
+        let marker_prefix = self
+            .media_marker()
+            .expect("media tool must define a media marker");
+        format!("{marker_prefix}{}]", output_path.to_string_lossy())
+    }
+
     /// Format tool output for LLM consumption.
     ///
     /// Called when tool results are embedded into the conversation history

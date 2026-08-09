@@ -151,10 +151,6 @@ impl Tool for VideoGenTool {
         // Save to workspace/generated/ and format the media marker.
         let output_path = super::save_generated_file(ws, &video_bytes, "video", "mp4").await?;
 
-        let path_str = output_path.to_string_lossy();
-        let marker_prefix = self
-            .media_marker()
-            .expect("VideoGenTool always has a media marker");
-        Ok(format!("{marker_prefix}{path_str}]"))
+        Ok(self.format_media_result(&output_path))
     }
 }
