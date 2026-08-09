@@ -123,6 +123,17 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Get a single value by key; returns `None` when the key is absent.
+    pub async fn get_kv(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_optional(
+                "SELECT value FROM config_kv WHERE key = ?1",
+                turso::params![key],
+                |row| row.get::<String>(0),
+            )
+            .await
+    }
+
     /// Get all key-value pairs.
     pub async fn get_all_kv(&self) -> Result<Vec<(String, String)>> {
         self.get_all_rows(KV_COLUMNS, "config_kv", "key", kv_from_row)
@@ -414,32 +425,19 @@ mod tests {
 
     // ── config_kv lifecycle ──────────────────────────────────
     //
-    // KV storage uses the production set_kv/delete_kv/get_all_kv path.
-    // For individual value lookups we use an inline get_kv helper (defined below).
+    // KV storage uses the production set_kv/get_kv/delete_kv/get_all_kv path.
 
     #[tokio::test]
     async fn test_config_kv_lifecycle() {
-        // Inline helper for single-key lookup.
-        async fn get_kv(store: &ConfigStore, key: &str) -> Result<Option<String>> {
-            store
-                .conn
-                .query_optional(
-                    "SELECT value FROM config_kv WHERE key = ?1",
-                    ::turso::params![key],
-                    |row| row.get::<String>(0),
-                )
-                .await
-        }
-
         let (store, _dir) = setup().await;
 
         // 1. empty state
-        let val = get_kv(&store, "nonexistent").await.unwrap();
+        let val = store.get_kv("nonexistent").await.unwrap();
         assert!(val.is_none(), "get_kv should return None for missing key");
 
         // 2. insert
         store.set_kv("alpha", "first").await.unwrap();
-        let val = get_kv(&store, "alpha").await.unwrap();
+        let val = store.get_kv("alpha").await.unwrap();
         assert_eq!(
             val,
             Some("first".to_string()),
@@ -448,7 +446,7 @@ mod tests {
 
         // 3. overwrite
         store.set_kv("alpha", "updated").await.unwrap();
-        let val = get_kv(&store, "alpha").await.unwrap();
+        let val = store.get_kv("alpha").await.unwrap();
         assert_eq!(
             val,
             Some("updated".to_string()),
@@ -469,7 +467,7 @@ mod tests {
 
         // 5. delete
         store.delete_kv("alpha").await.unwrap();
-        let val = get_kv(&store, "alpha").await.unwrap();
+        let val = store.get_kv("alpha").await.unwrap();
         assert!(val.is_none(), "get_kv should return None after delete");
 
         // 6. delete non-existent key (no-op, must not error)
@@ -639,15 +637,7 @@ mod tests {
         tx.commit().await.unwrap();
 
         // Verify: wake_word_templates survived despite being None in config.
-        let saved = store
-            .conn
-            .query_optional(
-                "SELECT value FROM config_kv WHERE key = ?1",
-                ::turso::params!["wake_word_templates"],
-                |row| row.get::<String>(0),
-            )
-            .await
-            .unwrap();
+        let saved = store.get_kv("wake_word_templates").await.unwrap();
         assert_eq!(
             saved.as_deref(),
             Some(template_json),

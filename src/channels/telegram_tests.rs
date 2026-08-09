@@ -75,6 +75,50 @@ fn parse_recipient_handles_empty_string() {
 }
 
 #[test]
+fn classify_edit_failure_matches_stable_substrings() {
+    use EditMessageFailure::{CannotEdit, NotFound, NotModified, Other};
+    // Production feeds the raw error envelope (`read_error_body`); matching is
+    // on the embedded description, and envelope fields must not false-match.
+    assert!(matches!(
+        classify_edit_failure(
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: message to edit not found"}"#
+        ),
+        NotFound
+    ));
+    assert!(matches!(
+        classify_edit_failure(
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: message not found"}"#
+        ),
+        NotFound
+    ));
+    assert!(matches!(
+        classify_edit_failure(
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: message is not modified"}"#
+        ),
+        NotModified
+    ));
+    assert!(matches!(
+        classify_edit_failure(
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: message can't be edited"}"#
+        ),
+        CannotEdit
+    ));
+    assert!(matches!(
+        classify_edit_failure(
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: message cant be edited"}"#
+        ),
+        CannotEdit
+    ));
+    assert!(matches!(
+        classify_edit_failure(
+            r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 5"}"#
+        ),
+        Other
+    ));
+    assert!(matches!(classify_edit_failure(""), Other));
+}
+
+#[test]
 fn test_markdown_to_telegram_html() {
     // escapes quotes in link href
     let r = markdown_to_telegram_html("[click](https://example.com?q=\"x\"&a='b')");

@@ -689,11 +689,21 @@ async fn handle_role_switch(msg: &ChannelMessage, role: Role) {
     }
     match mahbot::users::switch_active_role(&msg.user_name, role).await {
         Ok(()) => {
-            send_telegram_reply(
-                msg,
-                format!("Active role switched to {}.", role.display_label()),
-            )
-            .await;
+            let text = format!("Active role switched to {}.", role.display_label());
+            // Telegram-only pin flow; detached so an unreachable API can't
+            // stall the dispatch loop — fire-and-forget, so a shutdown may
+            // drop the notification (the switch is already persisted).
+            let Some(channel) = mahbot::channel_registry().get("telegram") else {
+                return;
+            };
+            let reply_target = msg.reply_target.clone();
+            tokio::spawn(async move {
+                let tc = channel
+                    .as_any()
+                    .downcast_ref::<mahbot::channels::telegram::TelegramChannel>()
+                    .expect("registered telegram channel");
+                tc.send_role_switch_notification(&reply_target, &text).await;
+            });
         }
         Err(e) => send_telegram_reply(msg, format!("Failed to switch role: {e}")).await,
     }
