@@ -87,6 +87,12 @@
 //! * `audio_transcription_models` — previously the newline-separated model list.
 //! * `audio_transcription_provider` — previously the provider routing slug.
 //!
+//! The legacy image-transcription keys (`image_transcription_model`,
+//! `image_transcription_provider`) were **migrated** to
+//! `media_transcription_model`/`media_transcription_provider` in
+//! [`reload_from_db`]; their orphaned rows remain after the copy and are
+//! silently ignored, matching the video-model migration precedent.
+//!
 //! The retry/backoff, joint-verdict synthesis, and review-count calibration
 //! keys (`retry_max_attempts`, `retry_base_backoff_ms`, `retry_max_backoff_ms`,
 //! `operation_timeout_secs`, `synthesis_max_attempts`,
@@ -124,7 +130,7 @@ pub(crate) const DEFAULT_PROVIDER_ENDPOINT: &str = "https://openrouter.ai/api/v1
 
 const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-3.1-flash-image";
 const DEFAULT_VIDEO_MODEL: &str = "minimax/hailuo-3";
-pub(crate) const DEFAULT_IMAGE_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.6-plus";
+pub(crate) const DEFAULT_MEDIA_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.6-plus";
 pub(crate) const DEFAULT_TTS_LANGUAGE: &str = "na";
 
 /// Default adaptive k multiplier for wake word detection.
@@ -263,10 +269,10 @@ pub struct ConfigData {
     pub provider_key: Option<String>,
     /// Base URL for the OpenAI-compatible LLM provider.
     pub provider_endpoint: Option<String>,
-    /// Image transcription model.
-    pub image_transcription_model: Option<String>,
-    /// Image transcription provider routing.
-    pub image_transcription_provider: Option<String>,
+    /// Media transcription model (images and videos).
+    pub media_transcription_model: Option<String>,
+    /// Media transcription provider routing.
+    pub media_transcription_provider: Option<String>,
     /// Image generation model.
     pub image_gen_model: Option<String>,
     /// Newline-separated list of available image generation models (for selection UI).
@@ -526,8 +532,8 @@ macro_rules! string_config_fields {
 string_config_fields! {
     provider_key [non_empty],
     provider_endpoint [or(DEFAULT_PROVIDER_ENDPOINT)],
-    image_transcription_model [or(DEFAULT_IMAGE_TRANSCRIPTION_MODEL)],
-    image_transcription_provider [non_empty],
+    media_transcription_model [or(DEFAULT_MEDIA_TRANSCRIPTION_MODEL)],
+    media_transcription_provider [non_empty],
     image_gen_model [or(DEFAULT_IMAGE_GEN_MODEL)],
     image_gen_models [list_or(fallback = image_gen_model, default = DEFAULT_IMAGE_GEN_MODEL)],
     video_model [or(DEFAULT_VIDEO_MODEL)],
@@ -930,6 +936,24 @@ pub async fn reload_from_db() -> Result<()> {
                 break;
             }
         }
+    }
+
+    // Migrate the legacy image_transcription_* keys into media_transcription_*
+    // (the transcriber now handles images and videos). The legacy keys remain
+    // as orphaned config_kv rows (harmless; a downgrade would resurrect them).
+    if config.media_transcription_model.is_none()
+        && let Some((_, value)) = kvs
+            .iter()
+            .find(|(k, _)| k.as_str() == "image_transcription_model")
+    {
+        config.media_transcription_model = Some(value.clone());
+    }
+    if config.media_transcription_provider.is_none()
+        && let Some((_, value)) = kvs
+            .iter()
+            .find(|(k, _)| k.as_str() == "image_transcription_provider")
+    {
+        config.media_transcription_provider = Some(value.clone());
     }
 
     let roles = store.get_all_role_configs().await?;

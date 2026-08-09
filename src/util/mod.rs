@@ -9,6 +9,7 @@ pub(crate) mod model_state;
 #[cfg(test)]
 pub(crate) mod test;
 pub(crate) mod tree_sitter;
+pub(crate) mod upload_bridge;
 
 use directories::UserDirs;
 use regex::Regex;
@@ -384,6 +385,13 @@ pub(crate) async fn load_reference_image(
 /// Telegram routing and the video_edit local-clip guard).
 pub(crate) const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "avi", "webm"];
 
+/// Video formats the transcription provider accepts by URL — intentionally
+/// narrower than [`VIDEO_EXTENSIONS`] (which also admits mkv/avi for local
+/// editing); unsupported formats silently fall back to the plain annotation.
+/// The transcription path uploads with the extension-derived MIME, so every
+/// whitelisted format is served with its real content type.
+pub(crate) const TRANSCRIBABLE_VIDEO_EXTENSIONS: &[&str] = &["mp4", "mpeg", "mov", "webm"];
+
 /// Recognized image file extensions for video_edit image inputs (reference
 /// images and frame anchors), matching the provider-declared formats. This is
 /// narrower than the Telegram routing list (`telegram::IMAGE_EXTENSIONS`,
@@ -403,6 +411,17 @@ pub(crate) fn is_video_extension(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+/// Check whether a file path has a video extension the transcription provider
+/// accepts (OpenRouter chat-completions video input).
+#[must_use]
+pub(crate) fn is_transcribable_video(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            TRANSCRIBABLE_VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+        })
 }
 
 /// Check whether a file path has a recognized image extension.
@@ -428,6 +447,10 @@ pub(crate) fn mime_for_extension(path: &std::path::Path) -> &'static str {
         Some("bmp") => "image/bmp",
         Some("heic") => "image/heic",
         Some("heif") => "image/heif",
+        Some("mp4") => "video/mp4",
+        Some("mpeg") => "video/mpeg",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
         _ => "application/octet-stream",
     }
 }

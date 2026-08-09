@@ -1,0 +1,1 @@
+Describe this media in maximum detail: how it looks, the visual style, what is happening, the objects and their layout, any text, colors, lighting, motion, and every other observable detail. Be as thorough and specific as possible.

@@ -216,7 +216,7 @@ async fn resolve_video_source(video_url: &str, ws: &crate::Workspace) -> anyhow:
     if len > MAX_INPUT_BYTES {
         anyhow::bail!("Source clip is limited to 50 MB, got {len} bytes. Trim the clip and retry.");
     }
-    super::upload_bridge::upload_video_ephemeral(&canonical).await
+    crate::util::upload_bridge::upload_video_ephemeral(&canonical).await
 }
 
 /// Resolve an image input: public URL (GET-validated — a broken image
@@ -229,7 +229,7 @@ async fn resolve_image_input(
     label: &str,
 ) -> anyhow::Result<String> {
     if input.starts_with("https://") || input.starts_with("http://") {
-        super::upload_bridge::verify_media_url(input, "image/")
+        crate::util::upload_bridge::verify_media_url(input, "image/")
             .await
             .with_context(|| format!("Failed to validate {label} URL {input}"))?;
         return Ok(input.to_string());
@@ -245,7 +245,7 @@ async fn resolve_image_input(
             "{label} is limited to 30 MB, got {len} bytes. Use a smaller image and retry."
         );
     }
-    super::upload_bridge::upload_image_ephemeral(&canonical).await
+    crate::util::upload_bridge::upload_image_ephemeral(&canonical).await
 }
 
 /// Tool for editing an existing video clip via OpenRouter's async videos API.
@@ -265,6 +265,13 @@ impl Tool for VideoEditTool {
 
     fn media_marker(&self) -> Option<&'static str> {
         Some("[VIDEO:")
+    }
+
+    fn format_output(&self, output: &str) -> String {
+        // The result is a small marker plus a bounded transcription
+        // description — the default 5 KB truncation would elide the middle of
+        // the description the Artist needs to reason about its own output.
+        output.to_string()
     }
 
     fn description(&self) -> String {
@@ -416,10 +423,12 @@ impl Tool for VideoEditTool {
         let video_bytes =
             super::fetch_async_video(&api_base, &body, super::VideoJobLabels::EDIT).await?;
 
-        // Save to workspace/generated/ and format the media marker.
+        // Save to workspace/generated/ and format the media marker. The marker
+        // stays first; the transcription is appended for the Artist to reason
+        // about its own output (fail-open: marker-only on transcription failure).
         let output_path = super::save_generated_file(ws, &video_bytes, "video", "mp4").await?;
-
-        Ok(self.format_media_result(&output_path))
+        let marker = self.format_media_result(&output_path);
+        Ok(super::format_video_result(marker, &output_path).await)
     }
 }
 

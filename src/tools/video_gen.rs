@@ -20,6 +20,13 @@ impl Tool for VideoGenTool {
         Some("[VIDEO:")
     }
 
+    fn format_output(&self, output: &str) -> String {
+        // The result is a small marker plus a bounded transcription
+        // description — the default 5 KB truncation would elide the middle of
+        // the description the Artist needs to reason about its own output.
+        output.to_string()
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         super::tool_params_schema(
             &json!({
@@ -146,9 +153,11 @@ impl Tool for VideoGenTool {
         let video_bytes =
             super::fetch_async_video(&api_base, &body, super::VideoJobLabels::GENERATION).await?;
 
-        // Save to workspace/generated/ and format the media marker.
+        // Save to workspace/generated/ and format the media marker. The marker
+        // stays first; the transcription is appended for the Artist to reason
+        // about its own output (fail-open: marker-only on transcription failure).
         let output_path = super::save_generated_file(ws, &video_bytes, "video", "mp4").await?;
-
-        Ok(self.format_media_result(&output_path))
+        let marker = self.format_media_result(&output_path);
+        Ok(super::format_video_result(marker, &output_path).await)
     }
 }

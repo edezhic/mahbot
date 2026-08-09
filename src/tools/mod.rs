@@ -17,7 +17,6 @@ pub(crate) mod search;
 pub(crate) mod search_archived_tickets;
 pub(crate) mod shell;
 pub(crate) mod ticket;
-pub(crate) mod upload_bridge;
 pub(crate) mod video_catalog;
 pub(crate) mod video_edit;
 pub(crate) mod video_gen;
@@ -299,6 +298,17 @@ async fn save_generated_file(
         })?;
 
     Ok(output_path)
+}
+
+/// Format a video tool result: the `[VIDEO:path]` marker first (so the reply
+/// path and GUI keep working), then a "Video content:" description line when
+/// the shared video transcription succeeds. Fail-open: marker-only on any
+/// failure.
+pub(crate) async fn format_video_result(marker: String, output_path: &std::path::Path) -> String {
+    match crate::providers::transcribe_video_file(output_path).await {
+        Some(text) => format!("{marker}\n\nVideo content: {text}"),
+        None => marker,
+    }
 }
 
 // ── Async video jobs (video_gen / video_edit) ───────────────────────────

@@ -1,5 +1,5 @@
 //! Ephemeral anonymous media upload bridge (video_edit local-clip and
-//! image-input support).
+//! image-input support, video transcription transport).
 //!
 //! Uploads a local media file to the first available host in a fallback chain
 //! and returns a GET-verified public HTTPS URL suitable for OpenRouter
@@ -40,8 +40,26 @@ type Uploader<'a> =
     fn(&'a UploadRequest<'a>) -> futures_util::future::BoxFuture<'a, anyhow::Result<String>>;
 
 /// Upload a video clip to the first working ephemeral host.
+///
+/// The multipart form always declares `video/mp4` — every video_edit clip
+/// that uses this path is mp4. The GET-verified URL must be served back as
+/// `video/*` regardless of container.
 pub(crate) async fn upload_video_ephemeral(path: &std::path::Path) -> anyhow::Result<String> {
     upload_ephemeral(path, "video/mp4", "video/").await
+}
+
+/// Upload a video clip declaring the MIME derived from its extension (mp4
+/// fallback). Used by the video-transcription path so the whitelisted
+/// non-mp4 formats are served with their real content type instead of the
+/// video_edit form's hardcoded `video/mp4`.
+pub(crate) async fn upload_video_ephemeral_typed(path: &std::path::Path) -> anyhow::Result<String> {
+    let mime = crate::util::mime_for_extension(path);
+    let mime = if mime.starts_with("video/") {
+        mime
+    } else {
+        "video/mp4"
+    };
+    upload_ephemeral(path, mime, "video/").await
 }
 
 /// Upload an image to the first working ephemeral host.

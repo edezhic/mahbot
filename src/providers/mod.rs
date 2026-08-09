@@ -46,7 +46,7 @@ pub(crate) fn test_request(
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-pub(crate) use crate::providers::transcribe::ImageTranscriber;
+pub(crate) use crate::providers::transcribe::{MediaTranscriber, transcribe_video_file};
 
 use crate::retry::{FailureClass, RetryFailureRecord};
 use compatible::OpenAiCompatibleProvider;
@@ -175,8 +175,8 @@ pub(crate) fn provider_routing_json(
 /// Wrapped in `Arc` so we can clone-and-drop the lock before awaiting.
 static PROVIDER: RwLock<Option<Arc<dyn Provider>>> = RwLock::new(None);
 
-/// Global image transcriber (vision model for image descriptions).
-static IMAGE_TRANSCRIBER: RwLock<Option<ImageTranscriber>> = RwLock::new(None);
+/// Global media transcriber (vision model for image/video descriptions).
+static MEDIA_TRANSCRIBER: RwLock<Option<MediaTranscriber>> = RwLock::new(None);
 
 /// Controls whether warmup failure should propagate or be non-fatal.
 ///
@@ -192,9 +192,9 @@ enum WarmupMode {
 /// Shared provider and transcriber setup logic.
 ///
 /// Extracts config from the given [`ConfigData`], creates the provider and
-/// constructs the image transcriber (synchronous, no I/O), then optionally
+/// constructs the media transcriber (synchronous, no I/O), then optionally
 /// warms the provider up (async HTTP call). After warmup (or warmup
-/// skip/graceful failure), both globals — [`PROVIDER`], [`IMAGE_TRANSCRIBER`]
+/// skip/graceful failure), both globals — [`PROVIDER`], [`MEDIA_TRANSCRIBER`]
 /// — are swapped in together.
 ///
 /// Used by [`init_global`] (startup, non-fatal warmup) and [`recreate_all`]
@@ -212,18 +212,17 @@ async fn setup_provider_and_transcribers(
 
     // Construct transcribers early — purely synchronous CPU work with no I/O,
     // so there's no reason to wait until after the warmup HTTP call.
-    let image_transcriber = create_transcriber(
+    let media_transcriber = create_transcriber(
         Some(&endpoint_str),
         config.provider_key.as_deref(),
         Some(
             resolve_or(
-                config.image_transcription_model.clone(),
-                crate::config::DEFAULT_IMAGE_TRANSCRIPTION_MODEL,
+                config.media_transcription_model.clone(),
+                crate::config::DEFAULT_MEDIA_TRANSCRIPTION_MODEL,
             )
             .as_str(),
         ),
-        non_empty(config.image_transcription_provider.clone()).as_deref(),
-        ImageTranscriber::from_inner,
+        non_empty(config.media_transcription_provider.clone()).as_deref(),
     );
 
     // Now warm up the provider (costly HTTP round-trip).
@@ -240,7 +239,7 @@ async fn setup_provider_and_transcribers(
 
     // Atomically swap both globals after warmup verification.
     *PROVIDER.write().unwrap_poison() = Some(provider);
-    *IMAGE_TRANSCRIBER.write().unwrap_poison() = image_transcriber;
+    *MEDIA_TRANSCRIBER.write().unwrap_poison() = media_transcriber;
 
     Ok(())
 }
@@ -274,7 +273,7 @@ pub async fn init_global() -> anyhow::Result<()> {
 ///
 /// Returns `Ok(())` if the new API key, endpoint, and models are valid
 /// (the provider responds to a warmup request). Does **not** modify the
-/// global `PROVIDER` or `IMAGE_TRANSCRIBER`.
+/// global `PROVIDER` or `MEDIA_TRANSCRIBER`.
 /// Used by [`save_and_reload`](crate::config::save_and_reload) as a
 /// pre-commit validation step.
 pub(crate) async fn warmup_provider_from_config(
@@ -320,10 +319,10 @@ pub(crate) async fn recreate_all(config: &crate::config::ConfigData) -> anyhow::
     Ok(())
 }
 
-/// Get the global image transcriber, if a vision model is configured.
+/// Get the global media transcriber, if a vision model is configured.
 #[must_use]
-pub(crate) fn image_transcriber() -> Option<ImageTranscriber> {
-    IMAGE_TRANSCRIBER.read().unwrap_poison().clone()
+pub(crate) fn media_transcriber() -> Option<MediaTranscriber> {
+    MEDIA_TRANSCRIBER.read().unwrap_poison().clone()
 }
 
 /// Single-attempt scoped chat for the outer retry loops — agent-loop LLM
@@ -396,23 +395,21 @@ pub(crate) fn create_provider(
     Ok(Box::new(base))
 }
 
-/// Generic helper to build a transcriber from flat config options.
+/// Build the media transcriber from flat config options.
 #[must_use]
-fn create_transcriber<T>(
+fn create_transcriber(
     api_url: Option<&str>,
     api_key: Option<&str>,
     model: Option<&str>,
     provider: Option<&str>,
-    wrapper: impl FnOnce(transcribe::MediaTranscriber) -> T,
-) -> Option<T> {
+) -> Option<MediaTranscriber> {
     api_key.and_then(trimmed_or_none)?;
     let model = model.and_then(trimmed_or_none)?;
     let route = provider.and_then(trimmed_or_none);
     let base_url = api_url
         .unwrap_or(crate::config::DEFAULT_PROVIDER_ENDPOINT)
         .to_string();
-    let inner = transcribe::MediaTranscriber::new(base_url, model, route);
-    Some(wrapper(inner))
+    Some(MediaTranscriber::new(base_url, model, route))
 }
 
 // ── Tests ─────────────────────────────────────────────────────

@@ -4,8 +4,9 @@
 //! This module transforms [`ChannelMessage`] content before it reaches the
 //! agent pipeline. It handles:
 //! - **Media markers** (`[IMAGE: ...]`, `[AUDIO: ...]`, `[VIDEO: ...]`)
-//!   → transcription for audio, data URI conversion for images (multimodal
-//!   strategy) or strippping with annotation (non-multimodal strategy)
+//!   → transcription for audio and video, data URI conversion for images
+//!   (multimodal strategy) or strippping with annotation (non-multimodal
+//!   strategy)
 //! - **Link enrichment** → prepends webpage summaries for URLs in the message
 //! - **File operations** → downloading/saving images to workspace, cleaning
 //!   up temporary files
@@ -81,15 +82,23 @@ async fn transcribe_audio_marker(path: &str) -> (String, bool) {
     (format!("[Audio: {file_name} attached]"), false)
 }
 
+/// A media file copied into the workspace `uploads/` directory: the
+/// `[Saved {label}: path]` annotation for the message and the destination
+/// path for agent tool references.
+struct SavedMedia {
+    annotation: String,
+    dest: std::path::PathBuf,
+}
+
 /// Copy a media file (image/video) into the workspace `uploads/` directory so
-/// the agent can reference it via tool calls, returning a `[Saved {label}: path]`
-/// annotation. Returns `None` when no uploads dir is available or the copy fails.
+/// the agent can reference it via tool calls. Returns `None` when no uploads
+/// dir is available or the copy fails.
 async fn save_media_to_workspace(
     media_path: &std::path::Path,
     uploads_dir: Option<&std::path::Path>,
     label: &str,
     fallback_ext: &str,
-) -> Option<String> {
+) -> Option<SavedMedia> {
     let dir = uploads_dir?;
     tokio::fs::create_dir_all(dir).await.ok()?;
     let ext = media_path
@@ -100,7 +109,10 @@ async fn save_media_to_workspace(
     let dest_name = format!("upload_{timestamp}.{ext}");
     let dest_path = dir.join(&dest_name);
     tokio::fs::copy(media_path, &dest_path).await.ok()?;
-    Some(format!("[Saved {label}: {}]", dest_path.display()))
+    Some(SavedMedia {
+        annotation: format!("[Saved {label}: {}]", dest_path.display()),
+        dest: dest_path,
+    })
 }
 
 /// Strategy for message enrichment, determining how each media marker kind
@@ -110,9 +122,10 @@ pub enum EnrichmentStrategy {
     /// Multimodal mode:
     /// - IMAGE markers are converted to base64 data URIs (for vision model)
     /// - AUDIO markers are transcribed to text
-    /// - VIDEO markers are copied to workspace `uploads/` and replaced with a
-    ///   plain-text `[Saved video: path]` annotation so the Artist can feed the
-    ///   clip into the video-edit flow (no native video in chat completions)
+    /// - VIDEO markers are copied to workspace `uploads/`, replaced with a
+    ///   plain-text `[Saved video: path]` annotation, and transcribed to a
+    ///   text description (media transcriber) so the Artist can understand the
+    ///   clip and feed it into the video-edit flow
     ///
     /// When `workspace_path` is provided, copies of media files are saved to
     /// `uploads/` for agent tool references.
@@ -159,7 +172,9 @@ async fn handle_multimodal_image(
     }
 
     // Save a copy to workspace uploads so the agent can reference it
-    let saved = save_media_to_workspace(path_obj, uploads_dir, "image", "png").await;
+    let saved = save_media_to_workspace(path_obj, uploads_dir, "image", "png")
+        .await
+        .map(|saved| saved.annotation);
 
     // Convert to data URI for the API request
     let replacement = match crate::util::local_image_to_data_uri(path_obj).await {
@@ -192,46 +207,81 @@ async fn is_under_telegram_files(path: &std::path::Path) -> bool {
     crate::tools::path::is_path_under_roots(&canonical, &[canonical_root])
 }
 
-/// Handle a VIDEO marker in multimodal mode — replace it with a plain-text
-/// annotation and return `(replacement, delete_temp)` where `delete_temp`
-/// marks whether the source temp file was copied into the workspace uploads
-/// (so the Artist can feed the clip to the video-edit flow) and can be
-/// cleaned up. HTTP(S) URLs become plain-text references; missing files,
-/// out-of-scope paths, and copy failures degrade to annotations while
-/// preserving the source file.
+/// Outcome of processing a VIDEO marker in multimodal mode: the replacement
+/// text, whether the source temp file was copied into the workspace uploads
+/// (so the Artist can feed the clip to the video-edit flow) and can be cleaned
+/// up, and the optional "[Video transcription of <name>]: <text>" annotation
+/// (prepended as an annotation block by the caller). HTTP(S) URLs become
+/// plain-text references; missing files, out-of-scope paths, and copy failures
+/// degrade to annotations while preserving the source file.
+struct MultimodalVideoAction {
+    replacement: String,
+    delete_temp: bool,
+    transcription: Option<String>,
+}
+
+impl MultimodalVideoAction {
+    /// Plain annotation: no workspace copy, no transcription.
+    fn annotation(replacement: String) -> Self {
+        Self {
+            replacement,
+            delete_temp: false,
+            transcription: None,
+        }
+    }
+}
+
 async fn handle_multimodal_video(
     path: &str,
     path_obj: &std::path::Path,
     uploads_dir: Option<&std::path::Path>,
-) -> (String, bool) {
+) -> MultimodalVideoAction {
     if path.starts_with("http://") || path.starts_with("https://") {
-        return (format!("[Video: {path}]"), false);
+        return MultimodalVideoAction::annotation(format!("[Video: {path}]"));
     }
     if !path_obj.exists() || !path_obj.is_file() {
         tracing::warn!(%path, "Video file not found for multimodal enrichment");
-        return (format!("[Invalid video reference: {path}]"), false);
+        return MultimodalVideoAction::annotation(format!("[Invalid video reference: {path}]"));
     }
     if !is_under_telegram_files(path_obj).await {
         tracing::warn!(%path, "Video path outside telegram temp dir — annotating without copy");
-        return (
-            format!("[Video: {} attached]", extract_file_name(path)),
-            false,
-        );
+        return MultimodalVideoAction::annotation(format!(
+            "[Video: {} attached]",
+            extract_file_name(path)
+        ));
     }
-    if let Some(annotation) = save_media_to_workspace(path_obj, uploads_dir, "video", "mp4").await {
-        return (annotation, true);
+    if let Some(saved) = save_media_to_workspace(path_obj, uploads_dir, "video", "mp4").await {
+        // Transcribe the persistent workspace copy — never the temp file
+        // (deleted after a successful copy). The annotation keeps the original
+        // Telegram filename; fail-open: any failure degrades to the plain
+        // [Saved video: ...] annotation.
+        let transcription = transcribe_saved_video(&saved.dest, extract_file_name(path)).await;
+        return MultimodalVideoAction {
+            replacement: saved.annotation,
+            delete_temp: true,
+            transcription,
+        };
     }
     // Copy failed — annotate and preserve the temp file.
-    (
-        format!("[Video: {} attached]", extract_file_name(path)),
-        false,
-    )
+    MultimodalVideoAction::annotation(format!("[Video: {} attached]", extract_file_name(path)))
+}
+
+/// Transcribe a saved workspace video copy for the Artist, returning the
+/// "[Video transcription of <name>]: <text>" annotation (using the original
+/// source `file_name`). Fail-open: returns `None` (plain annotation) when the
+/// transcription fails (unavailable transcriber, unsupported format, upload
+/// or model error, timeout, empty output) — the overall timeout lives inside
+/// [`transcribe_video_file`](crate::providers::transcribe_video_file),
+/// bounding both callers.
+async fn transcribe_saved_video(path: &std::path::Path, file_name: &str) -> Option<String> {
+    let text = crate::providers::transcribe_video_file(path).await?;
+    Some(format!("[Video transcription of {file_name}]: {text}"))
 }
 
 /// Handle an IMAGE marker in non-multimodal mode — transcribe to text
 /// description or fall back to a generic attachment annotation.
 async fn handle_non_multimodal_image(path_obj: &std::path::Path, file_name: &str) -> String {
-    if let Some(ref transcriber) = crate::providers::image_transcriber() {
+    if let Some(ref transcriber) = crate::providers::media_transcriber() {
         match transcribe_image_file(path_obj, transcriber).await {
             Ok(description) => format!("[Image: {description}]"),
             Err(e) => {
@@ -260,13 +310,16 @@ fn extract_file_name(path: &str) -> &str {
 /// |------|-----------|---------------|
 /// | IMAGE | data URI conversion, workspace copy | text transcription |
 /// | AUDIO | transcription | transcription |
-/// | VIDEO | workspace copy + `[Saved video: path]` annotation | text annotation |
+/// | VIDEO | workspace copy + `[Saved video: path]` + transcription | text annotation |
 ///
 /// After processing, markers that were handled are stripped from the content
 /// and annotations are prepended. Temp files are preserved when their
 /// processing fails (e.g. audio transcription failure due to a transient
 /// HTTP error) so the file can be recovered; only successfully-processed
 /// markers have their temp files cleaned up.
+// Marker dispatch hub (3 kinds × 2 strategies); per-kind handling is extracted
+// into the handler functions above, keeping this loop flat on purpose.
+#[allow(clippy::too_many_lines)]
 pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrategy) {
     let mut annotations: Vec<String> = Vec::new();
     let mut result = msg.content.clone();
@@ -330,9 +383,15 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
             }
             "VIDEO" => match strategy {
                 EnrichmentStrategy::Multimodal { .. } => {
-                    let (replacement, delete_temp) =
-                        handle_multimodal_video(path, path_obj, uploads_dir.as_deref()).await;
+                    let MultimodalVideoAction {
+                        replacement,
+                        delete_temp,
+                        transcription,
+                    } = handle_multimodal_video(path, path_obj, uploads_dir.as_deref()).await;
                     result = result.replacen(whole.as_str(), &replacement, 1);
+                    if let Some(annotation) = transcription {
+                        annotations.push(annotation);
+                    }
                     if delete_temp {
                         files_to_delete.push(path_obj.to_path_buf());
                     }
@@ -424,7 +483,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
 /// Transcribe a local image file into a text description.
 async fn transcribe_image_file(
     path: &std::path::Path,
-    transcriber: &crate::providers::transcribe::ImageTranscriber,
+    transcriber: &crate::providers::transcribe::MediaTranscriber,
 ) -> anyhow::Result<String> {
     if !path.exists() || !path.is_file() {
         anyhow::bail!("image file not found: {}", path.display());

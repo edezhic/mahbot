@@ -35,7 +35,7 @@ static IMAGE_GEN_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 ///
 /// Used by [`crate::tools::image_gen::ImageGenTool`],
 /// [`crate::tools::video_gen::VideoGenTool`], and the
-/// [`ImageTranscriber`](crate::providers::transcribe::ImageTranscriber) — all
+/// [`MediaTranscriber`](crate::providers::transcribe::MediaTranscriber) — all
 /// OpenRouter-based tools that require this header.  Any future
 /// OpenRouter-based media tools should reuse this helper as well.
 #[must_use]

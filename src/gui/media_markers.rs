@@ -7,6 +7,7 @@
 //! - `[AUDIO:path]` → 🎵 emoji + filename (text)
 //! - `[VIDEO:path]` → 🎬 emoji + placeholder text
 //! - `[Audio transcription of ...]: text` → 🔊 emoji + transcribed text
+//! - `[Video transcription of ...]: text` → 🎬 emoji + transcribed text
 //!
 //! The pre-processing is applied **before** `markdown::parse()` so the
 //! standard markdown pipeline naturally produces `Item::Image` from the
@@ -33,9 +34,11 @@ use crate::util::{MEDIA_MARKER_RE, parse_media_marker};
 
 /// Pre-process a content string, converting media markers before markdown parsing.
 pub(crate) fn preprocess(content: &str) -> String {
-    // Order matters: the audio-transcription annotation contains the word "Audio"
-    // which overlaps with the raw `[AUDIO:...]` pattern.  Handle it first.
+    // Order matters: the transcription annotations contain the words "Audio"
+    // and "Video" which overlap with the raw `[AUDIO:...]`/`[VIDEO:...]`
+    // patterns.  Handle them first.
     let s = replace_audio_transcription(content);
+    let s = replace_video_transcription(&s);
     replace_media_markers(&s)
 }
 
@@ -44,13 +47,30 @@ pub(crate) fn preprocess(content: &str) -> String {
 /// This annotation is produced by `enrich_message` before user messages are
 /// broadcast to the GUI, so it now actively reaches the dashboard and is
 /// rendered as transcription text.  The handler also covers persisted messages
-/// (e.g., replayed from history) where the annotation might appear.
+/// (e.g., replayed from history) where the annotation might appear. Only the
+/// annotation header is replaced — multi-line transcriptions and any following
+/// message content are left untouched.
 fn replace_audio_transcription(s: &str) -> String {
     static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"\[Audio transcription of [^\]]+\]:\s*(.+)")
+        regex::Regex::new(r"\[Audio transcription of [^\]]+\]:\s*")
             .expect("audio transcription regex must compile")
     });
-    RE.replace_all(s, "🔊 $1").to_string()
+    RE.replace_all(s, "🔊 ").to_string()
+}
+
+/// `[Video transcription of {filename}]: {text}` → 🎬 text
+///
+/// Produced by `enrich_message` for the Artist's multimodal VIDEO markers;
+/// rendered like the audio-transcription annotation with the video emoji.
+/// Only the annotation header is replaced — the description (often multi-line
+/// with the maximally-detailed transcription prompt) and any following message
+/// content are left untouched.
+fn replace_video_transcription(s: &str) -> String {
+    static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\[Video transcription of [^\]]+\]:\s*")
+            .expect("video transcription regex must compile")
+    });
+    RE.replace_all(s, "🎬 ").to_string()
 }
 
 /// Convert all `[KIND:path]` markers (IMAGE, AUDIO, VIDEO) to their display form
@@ -248,6 +268,26 @@ mod tests {
             preprocess("[Audio transcription of voice.ogg]: Line one\nLine two"),
             "🔊 Line one\nLine two"
         );
+    }
+
+    #[test]
+    fn replace_video_transcription_multiline() {
+        // The maximally-detailed transcription prompt produces multi-line
+        // descriptions — every line must render under the 🎬 prefix, and
+        // following message content must stay untouched.
+        assert_eq!(
+            preprocess("[Video transcription of clip.mp4]: Line one\nLine two\n\nEdit this"),
+            "🎬 Line one\nLine two\n\nEdit this"
+        );
+    }
+
+    #[test]
+    fn video_transcription_prevents_overlap_with_video_marker() {
+        // The video-transcription format contains "Video" — the preprocess
+        // must handle it before the [VIDEO:...] pattern.
+        let result =
+            preprocess("[Video transcription of clip.mp4]: hi there [VIDEO:/tmp/other.mp4]");
+        assert_eq!(result, "🎬 hi there 🎬 Video: other.mp4");
     }
 
     #[test]

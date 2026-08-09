@@ -2149,22 +2149,22 @@ impl SettingsState {
                 ),
                 Space::new().height(8),
                 config_text_input(
-                    "Image Model",
+                    "Media Model",
                     "qwen/qwen3.6-plus",
                     self.config
-                        .image_transcription_model
+                        .media_transcription_model
                         .as_deref()
                         .unwrap_or_default(),
-                    "image_transcription_model",
+                    "media_transcription_model",
                 ),
                 config_text_input(
-                    "Image Provider",
+                    "Media Provider",
                     "",
                     self.config
-                        .image_transcription_provider
+                        .media_transcription_provider
                         .as_deref()
                         .unwrap_or_default(),
-                    "image_transcription_provider",
+                    "media_transcription_provider",
                 ),
             ],
         )
