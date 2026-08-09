@@ -3807,13 +3807,7 @@ impl EditorState {
                     current_match_idx: 0,
                     case_sensitive: false,
                 };
-                // Compute matches if query is non-empty.
-                if !state.query.is_empty() {
-                    let text = tab_data.content.text();
-                    state.matches = compute_text_matches(&text, &state.query, state.case_sensitive);
-                    // Auto-jump to first match.
-                    auto_jump_to_first_match(&text, &tab_data.content, &mut state);
-                }
+                state.recompute(&tab_data.content);
                 tab_data.find_replace_state = Some(state);
             }
             // Already open — re-focus the search input (no state change needed).
@@ -3830,9 +3824,7 @@ impl EditorState {
         if let Some(tab_data) = self.tab_contents.get_mut(&path) {
             if let Some(ref mut state) = tab_data.find_replace_state {
                 state.query = query;
-                let text = tab_data.content.text();
-                state.matches = compute_text_matches(&text, &state.query, state.case_sensitive);
-                auto_jump_to_first_match(&text, &tab_data.content, state);
+                state.recompute(&tab_data.content);
             }
         }
         Task::none()
@@ -3948,10 +3940,7 @@ impl EditorState {
         if let Some(tab_data) = self.tab_contents.get_mut(&path) {
             if let Some(ref mut state) = tab_data.find_replace_state {
                 state.case_sensitive = !state.case_sensitive;
-                // Recompute matches with new case sensitivity.
-                let text = tab_data.content.text();
-                state.matches = compute_text_matches(&text, &state.query, state.case_sensitive);
-                auto_jump_to_first_match(&text, &tab_data.content, state);
+                state.recompute(&tab_data.content);
             }
         }
         Task::none()
@@ -5452,6 +5441,15 @@ fn map_editor_shortcut(event: keyboard::Event) -> Option<EditorMessage> {
 }
 
 // ── Find/Replace helpers ───────────────────────────────────────────
+
+impl FindReplaceState {
+    /// Recompute matches against the current text and jump to the first match (or reset the index).
+    fn recompute(&mut self, content: &EditorBuffer) {
+        let text = content.text();
+        self.matches = compute_text_matches(&text, &self.query, self.case_sensitive);
+        auto_jump_to_first_match(&text, content, self);
+    }
+}
 
 /// Convert a byte offset to (line, byte column within line, line byte start).
 #[must_use]
