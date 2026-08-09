@@ -63,11 +63,23 @@ fn run_matrix() -> i32 {
         "grep -rn needle '*.txt' a.txt",
         "grep -rn needle '~' a.txt",
         "grep -rn needle 'a\"b.txt' a.txt",
-        // ── Relaxed pipeline gate: 2-member, any tail, >256 KiB stream ──
+        // ── Relaxed pipeline gate: any length, grep first, >256 KiB stream ──
         "grep -rn needle bigdir | wc -l",
         "grep -rn needle bigdir | tail -1",
         "grep -rn needle bigdir | sort",
         "grep -rn needle bigdir | tee teeout.txt",
+        // 3+ members and grep chains: every member after the served first
+        // grep is a real tool on the byte-identical uncapped stream.
+        "grep -rn needle bigdir | grep -v '^bigdir/big' | head -5",
+        "grep -rn needle bigdir | grep needle | grep needle | head -3",
+        "grep -rn needle bigdir | grep -c needle", // 2-member grep|grep
+        "grep -rn needle bigdir | sort | head -3",
+        "grep -rn needle bigdir | sort | uniq | head -3",
+        // Grep-introducer tails (triage: preserved verbatim — real tools on the
+        // byte-identical stream): xargs grep, sh -c, cd.
+        "grep -rln needle bigdir | xargs grep needle",
+        "grep -rn needle bigdir | sh -c 'grep -c needle'",
+        "grep -rn needle bigdir | cd /tmp | wc -l",
         // 2>&1: benign ordering only (missing operand after matches; wc is
         // order-insensitive). Engine stderr flushes at finish vs BSD at
         // operand-open — missing.txt-first or sort tails diverge (accepted).
@@ -112,6 +124,21 @@ fn run_matrix() -> i32 {
         }
     }
 
+    // Fail-closed rows: the parent must NOT rewrite these (the original
+    // command — a shell syntax error / a real grep pipeline — runs instead).
+    for (label, row) in [
+        ("empty pipeline member", "grep -rn needle bigdir | | wc -l"),
+        ("grep not first in pipeline", "cat a.txt | grep foo"),
+    ] {
+        match check_fallback(row, &ws, &home) {
+            Ok(()) => println!("PASS (fallback): {row}"),
+            Err(msg) => {
+                println!("FAIL: {label}: {row}: {msg}");
+                failures += 1;
+            }
+        }
+    }
+
     // The exec-in-place fallback: a spec whose expected cwd does not match
     // the process cwd must exec the real grep and produce ITS output.
     match check_exec_fallback(&ws) {
@@ -124,11 +151,19 @@ fn run_matrix() -> i32 {
 
     // SIGPIPE: a served grep piped to `head` must not hang (a Rust child
     // ignoring SIGPIPE would scan everything; the engine dies like grep).
-    match check_sigpipe(&ws, &home) {
-        Ok(()) => println!("PASS: SIGPIPE with head"),
-        Err(msg) => {
-            println!("FAIL: SIGPIPE with head: {msg}");
-            failures += 1;
+    for (label, cmd) in [
+        ("SIGPIPE with head", "grep -rn needle bigdir | head -1"),
+        (
+            "SIGPIPE through a preserved grep",
+            "grep -rn needle bigdir | grep needle | head -1",
+        ),
+    ] {
+        match check_sigpipe(cmd, &ws, &home) {
+            Ok(()) => println!("PASS: {label}"),
+            Err(msg) => {
+                println!("FAIL: {label}: {msg}");
+                failures += 1;
+            }
         }
     }
 
@@ -176,9 +211,16 @@ fn build_fixture(ws: &Path, home: &Path) {
     fs::create_dir_all(ws.join("sub/~")).unwrap();
     fs::write(ws.join("sub/~/q.txt"), "needle\n").unwrap();
     // >256 KiB of matches (200k lines): exercises the piped-member cap lift
-    // and the SIGPIPE path (>64 KiB pipe-buffer bound).
+    // and the SIGPIPE path (>64 KiB pipe-buffer bound). mixed.txt adds
+    // needle lines from a second path so grep-chain tails can filter on the
+    // path prefix.
     fs::create_dir_all(ws.join("bigdir")).unwrap();
     fs::write(ws.join("bigdir/big.txt"), "needle\n".repeat(200_000)).unwrap();
+    fs::write(
+        ws.join("bigdir/mixed.txt"),
+        "other\nneedle\n".repeat(50_000),
+    )
+    .unwrap();
 }
 
 fn check_row(row: &str, ws: &Path, home: &Path) -> Result<(), String> {
@@ -250,13 +292,19 @@ fn check_exec_case(ws: &Path, json: &str, real_cmd: &str) -> Result<(), String> 
     }
 }
 
-fn check_sigpipe(ws: &Path, home: &Path) -> Result<(), String> {
+fn check_fallback(row: &str, ws: &Path, home: &Path) -> Result<(), String> {
+    if mahbot::grep_engine_rewrite_for_test(row, ws, home).is_some() {
+        return Err("expected fallback, got served".to_string());
+    }
+    Ok(())
+}
+
+fn check_sigpipe(command: &str, ws: &Path, home: &Path) -> Result<(), String> {
     // A huge-output grep piped to head must terminate promptly (SIGPIPE):
     // the >64 KiB fixture fills the pipe, so the engine must die on the
     // closed pipe instead of scanning everything.
-    let rewritten =
-        mahbot::grep_engine_rewrite_for_test("grep -rn needle bigdir | head -1", ws, home)
-            .ok_or_else(|| "not servable".to_string())?;
+    let rewritten = mahbot::grep_engine_rewrite_for_test(command, ws, home)
+        .ok_or_else(|| "not servable".to_string())?;
     let start = std::time::Instant::now();
     let mut child = Command::new("sh")
         .arg("-c")

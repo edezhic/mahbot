@@ -98,7 +98,7 @@ struct Operand {
 /// caller); Unix only.
 pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> Option<String> {
     let home = pinned_home()?;
-    let (specs, rewritten) = match analyze_command(command, workspace_root, &home, false) {
+    let (specs, shapes, rewritten) = match analyze_command(command, workspace_root, &home, false) {
         Ok(v) => v,
         Err(reason) => {
             // INFO only for the gate-relaxation class: pipeline-shape fallbacks
@@ -123,11 +123,24 @@ pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> Option<
             return None;
         }
     }
-    tracing::debug!(
-        command = command,
-        greps = specs.len(),
-        "grep engine: served"
-    );
+    // INFO for multi-member served pipelines (gate-relaxation volume
+    // telemetry); single greps stay DEBUG.
+    if shapes.is_empty() {
+        tracing::debug!(
+            command = command,
+            greps = specs.len(),
+            "grep engine: served"
+        );
+    } else {
+        for (members, shape) in shapes {
+            tracing::info!(
+                command = command,
+                members,
+                shape = %shape,
+                "grep engine: served"
+            );
+        }
+    }
     Some(rewritten)
 }
 
@@ -141,7 +154,7 @@ pub fn try_serve_command_for_test(
     workspace_root: &Path,
     home: &Path,
 ) -> Option<String> {
-    let (specs, rewritten) = analyze_command(command, workspace_root, home, false).ok()?;
+    let (specs, _, rewritten) = analyze_command(command, workspace_root, home, false).ok()?;
     for spec in &specs {
         if !spec_json_ok(spec) {
             return None;
@@ -252,15 +265,20 @@ impl std::fmt::Display for Fallback {
     }
 }
 
+/// Analyze output: one spec per served grep, the shape of every served
+/// multi-member pipeline (members, verbs — grep-family normalized to "grep")
+/// for volume telemetry, and the rewritten command.
+type AnalyzeOutput = (Vec<EngineSpec>, Vec<(usize, String)>, String);
+
 /// Analyze a full shell command: segment it, track cds, serve every grep
-/// member, keep everything else verbatim. Returns the rewritten command plus
-/// one spec per served grep (in command order) or the first fallback reason.
+/// member, keep everything else verbatim. Returns the analyze output or the
+/// first fallback reason.
 fn analyze_command(
     command: &str,
     workspace_root: &Path,
     home: &Path,
     allow_single: bool,
-) -> Result<(Vec<EngineSpec>, String), Fallback> {
+) -> Result<AnalyzeOutput, Fallback> {
     let stripped = strip_heredoc_bodies(command);
     if stripped != command {
         // strip_heredoc_bodies drops the `<<` marker, body and terminator (they
@@ -302,10 +320,19 @@ fn analyze_command(
     let mut cwd = canonical_or_lexical(workspace_root);
     let mut rewritten: Vec<(String, String)> = Vec::new();
     let mut specs: Vec<EngineSpec> = Vec::new();
-    // A served 2-member pipeline preserves its tail member verbatim.
+    let mut shapes: Vec<(usize, String)> = Vec::new();
+    // Members after a served first grep are preserved verbatim — real tools
+    // on a byte-identical uncapped stream, never analyzed.
     let mut tail_preserved = vec![false; n];
 
     for (idx, (seg, conn)) in segments.iter().enumerate() {
+        // Preserved tails bypass all analysis (cd/grep/compound checks
+        // included): second/third greps and grep introducers (xargs grep,
+        // sh -c, cd) in tail positions are real tools on that stream.
+        if tail_preserved[idx] {
+            rewritten.push((seg.clone(), conn.clone()));
+            continue;
+        }
         let verb = first_word(seg);
         if is_cd_segment(verb) {
             if pstart[idx] != pend[idx] {
@@ -320,17 +347,22 @@ fn analyze_command(
                 // Only the first member of a pipeline can be served.
                 return Err(Fallback::PipelineShape);
             }
-            if pend[idx] != idx && pend[idx] != idx + 1 {
-                // 2-member pipelines only: the tail runs on byte-identical
-                // input, and a static gate cannot prove a head bound below
-                // the cap for 3+ members (fail-closed).
-                return Err(Fallback::PipelineShape);
-            }
             let in_pipeline = pstart[idx] != pend[idx];
             match serve_one_grep(seg, verb, &cwd, home, allow_single, in_pipeline) {
                 Ok((spec, rewritten_seg)) => {
                     if in_pipeline {
-                        tail_preserved[pend[idx]] = true;
+                        tail_preserved[idx + 1..=pend[idx]].fill(true);
+                        // Served-pipeline shape for volume telemetry (only
+                        // multi-member pipelines start with a served grep, so
+                        // every pipeline in a served command is reported).
+                        let verbs: Vec<&str> = segments[idx..=pend[idx]]
+                            .iter()
+                            .map(|(s, _)| {
+                                let v = first_word(s);
+                                if is_grep_verb(v) { "grep" } else { v }
+                            })
+                            .collect();
+                        shapes.push((verbs.len(), verbs.join("|")));
                     }
                     rewritten.push((rewritten_seg, conn.clone()));
                     specs.push(spec);
@@ -344,14 +376,14 @@ fn analyze_command(
         if is_compound_segment(seg) || segment_contains_grep(seg, verb) {
             return Err(Fallback::NestedGrep);
         }
-        if tail_preserved[idx] || pstart[idx] == pend[idx] {
+        if pstart[idx] == pend[idx] {
             rewritten.push((seg.clone(), conn.clone()));
             continue;
         }
         return Err(Fallback::PipelineShape);
     }
 
-    Ok((specs, join_rewritten(&rewritten)))
+    Ok((specs, shapes, join_rewritten(&rewritten)))
 }
 
 /// Join rewritten segments with their original connectors into one command.
@@ -2395,17 +2427,37 @@ mod parity_tests {
         )
     }
 
+    /// The original command's text from its first `|`/`|&` connector on — the
+    /// tail that must survive the rewrite verbatim (never analyzed).
+    fn pipeline_tail(command: &str) -> Option<String> {
+        let segments = split_segments(command).ok()?;
+        let first = segments
+            .iter()
+            .position(|(_, c)| matches!(c.as_str(), "|" | "|&"))?;
+        let mut out = format!(" {}", segments[first].1);
+        for (seg, conn) in &segments[first + 1..] {
+            out.push(' ');
+            out.push_str(seg);
+            if !conn.is_empty() {
+                out.push(' ');
+                out.push_str(conn);
+            }
+        }
+        Some(out)
+    }
+
     /// Assert the engine's output/exit are byte-identical to the real grep.
     fn assert_parity(command: &str, ws: &Path, home: &Path) {
-        let (specs, rewritten) = analyze_command(command, ws, home, true)
+        let (specs, _, rewritten) = analyze_command(command, ws, home, true)
             .unwrap_or_else(|e| panic!("{command}: expected servable, got {e}"));
         assert_eq!(specs.len(), 1, "{command}: expected one grep member");
         let (eout, eerr, ecode) = engine_run(&specs[0]);
-        let piped = command.split_whitespace().any(|w| w == "|");
+        let piped = command.split_whitespace().any(|w| w == "|" || w == "|&");
         let (rout, rerr, rcode) = if piped {
+            let tail = pipeline_tail(command).unwrap_or_default();
             assert!(
-                rewritten.contains(" | "),
-                "{command}: pipeline tail member not preserved"
+                !tail.is_empty() && rewritten.ends_with(&tail),
+                "{command}: pipeline tail not preserved verbatim (rewritten: {rewritten})"
             );
             real_run_fallback(&specs[0])
         } else {
@@ -2648,15 +2700,21 @@ mod parity_tests {
             "grep -rn needle '~/htree'", // literal path, no such file (stderr row)
             "grep -rn needle '~user'",   // literal path, no such file (stderr row)
             "grep -rn needle ~/\"htree\"", // mixed form: `~/` expands, quoted rest joins
-            // ── 2-member pipelines: any tail is served (grep member parity;
-            //    full-pipeline parity lives in the e2e bench). The 2>&1 row
-            //    covers the benign ordering only — engine stderr is buffered
-            //    to finish while BSD emits at operand-open, so missing-first
-            //    or order-sensitive tails diverge (accepted residual) ──
+            // ── any-length pipelines: any tail is served verbatim (grep
+            //    member parity; full-pipeline parity lives in the e2e bench).
+            //    The 2>&1 row covers the benign ordering only — engine stderr
+            //    is buffered to finish while BSD emits at operand-open, so
+            //    missing-first or order-sensitive tails diverge (accepted
+            //    residual). Tails are never analyzed: second greps, grep
+            //    introducers (xargs grep) and 3+ members are preserved ──
             "grep -rn x plain | wc -l",
             "grep -rn x plain | tail -2",
             "grep -rn x plain | sort",
             "grep -rn x plain missing.txt 2>&1 | wc -l",
+            "grep -rn x plain | grep -v 'plain/d1' | head -5", // 3+ member, second grep preserved
+            "grep foo a.txt | grep oo", // 2-member grep|grep (tail grep preserved)
+            "grep foo a.txt | xargs grep oo", // grep introducer preserved in the tail
+            "grep foo a.txt | head -1 | wc -l", // 3+ member, single-file first grep
             // Quoted `~` + unquoted glob is a literal cwd-relative path
             // (`"~"/*.txt` must not home-strip the tilde).
             "grep -rn needle 'sub/~'/*.txt",
@@ -2735,17 +2793,16 @@ mod parity_tests {
             "sh -c 'grep x a.txt'", // indirect
             "cd $HOME && grep x a.txt", // cd untrackable
             "cd - && grep x a.txt", // cd $OLDPWD
-            "grep x a.txt | head -1 | wc -l", // 3+ member pipeline
-            "grep -rn x plain | grep -v x | head -5", // 3+ member pipeline
-            "grep x a.txt | grep y", // second grep member isn't first in the pipeline
-            "grep x a.txt | xargs grep y", // indirect grep in the tail
-            "grep x a.txt | | wc -l", // empty pipeline member
-            "grep x a.txt |",      // trailing pipe
-            "! grep x a.txt",      // negation
-            "sudo grep x a.txt",   // env prefix
+            "grep x a.txt | head -1 | wc -l", // single-file first grep → perf gate (tail preserved)
+            "grep x a.txt | grep y", // single-file first grep → perf gate (tail grep preserved)
+            "grep x a.txt | xargs grep y", // single-file first grep → perf gate (xargs tail preserved)
+            "grep x a.txt | | wc -l",      // empty pipeline member
+            "grep x a.txt |",              // trailing pipe
+            "! grep x a.txt",              // negation
+            "sudo grep x a.txt",           // env prefix
             "grep -w 'foo\\|bar' a.txt b.txt", // -w + alternation (word_safe)
             "echo $(echo \\) ; grep x a.txt", // unterminated $(...) — escape-aware span stays open
-            "echo hello && echo world", // no grep at all
+            "echo hello && echo world",    // no grep at all
         ];
         for row in rows {
             assert_falls_back(row, &ws, &home);
@@ -2766,6 +2823,11 @@ mod parity_tests {
             "empty command or pipeline member",
         );
         assert_falls_back_reason("cat f | head", &ws, &home, "no grep");
+        // Any-length pipelines with a single-file first grep fall back for the
+        // perf gate, not the pipeline shape (their tails are preserved).
+        assert_falls_back_reason("grep x a.txt | head -1 | wc -l", &ws, &home, "single file");
+        assert_falls_back_reason("grep x a.txt | grep y", &ws, &home, "single file");
+        assert_falls_back_reason("grep x a.txt | xargs grep y", &ws, &home, "single file");
     }
 
     #[test]
@@ -2797,7 +2859,7 @@ mod parity_tests {
         fs::create_dir_all(&home).expect("home");
         build_fixture(&ws, &home);
 
-        let (specs, _) =
+        let (specs, _, _) =
             analyze_command("grep -r x ign", &ws, &home, true).expect("ign walk servable");
         let (eout, _, ecode) = engine_run(&specs[0]);
         let text = String::from_utf8_lossy(&eout).to_string();
@@ -2807,7 +2869,7 @@ mod parity_tests {
         assert!(!text.contains("skip.log"), "gitignored skipped: {text}");
 
         // Explicit file operands bypass the exclusion filters entirely.
-        let (specs, _) =
+        let (specs, _, _) =
             analyze_command("grep -r x ign/.hidden.txt ign/skip.log", &ws, &home, true)
                 .expect("explicit operands servable");
         let (eout, _, ecode) = engine_run(&specs[0]);
