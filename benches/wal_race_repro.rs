@@ -1,5 +1,5 @@
 //! Deterministic reproduction of the turso multiprocess-WAL crash: a hard
-//! `assert!` abort — `shared WAL frame ids must increase monotonically` — on
+//! `assert!` panic — `shared WAL frame ids must increase monotonically` — on
 //! the first append after a crash mid-transaction. Escalation artifact for
 //! the turso maintainers (version pin `=0.7.2`, deliberate; see "Version pin").
 //!
@@ -11,26 +11,36 @@
 //! # Defect
 //!
 //! turso_core's `.tshm` reopen path accepts the persisted shared frame index
-//! as trusted while validating only WAL-file facts and index structure — it
-//! never validates index contents against the WAL generation. A crash
-//! mid-transaction leaves un-published frame entries in the mmap'd index:
-//! every spilled page is recorded as a `(page_id, frame_id)` entry with
-//! `frame_index_len` bumped, but `max_frame` only advances at COMMIT, so all
-//! entries beyond `max_frame` sit in the index unseen. The first fresh append
-//! after reopen computes its frame id from the WAL header (`max_frame + 1`)
-//! and lands on a stale slot, tripping a plain `assert!` that aborts the whole
-//! process instead of rebuilding the index from the WAL:
+//! as trusted while validating only WAL-file facts and index structure; its
+//! index-content checks are bounded to `frame_id <= max_frame`, so the
+//! un-published region beyond `max_frame` is never validated against the WAL
+//! generation. A crash mid-transaction leaves un-published frame entries in
+//! the mmap'd index: every spilled page is recorded as a `(page_id, frame_id)`
+//! entry with `frame_index_len` bumped, but `max_frame` only advances at
+//! COMMIT, so all entries beyond `max_frame` sit in the index unseen. The
+//! first fresh append after reopen derives its next frame id from the
+//! coordination snapshot's `max_frame` (`max_frame + 1` — the durable `.tshm`
+//! header on the Trusted path, the rebuilt in-process WAL state on the
+//! RebuildFromDisk path) and lands on a stale slot, tripping a plain `assert!`
+//! that, under panic=unwind on a tokio worker thread, incapacitates the
+//! process (stuck writer byte-lock, dead workers) instead of rebuilding the
+//! index from the WAL:
 //!
 //! ```text
 //! shared WAL frame ids must increase monotonically: new_frame_id={},
 //! previous_frame_id={}, slot={}, shared_max_frame={}
 //! ```
 //!
-//! (Quote the message text, not a file:line — release builds inline the call
-//! site, so production reports show an address that differs from the source
-//! location.)
+//! (Quote the message text, not a file:line: the assert lives in
+//! `record_frame`, which is `#[track_caller]`, so production panic reports
+//! name the frame-caching call site — observed `turso_core-0.7.2/storage/
+//! wal.rs:2357:24` — not the assert site (`shared_wal_coordination.rs:2317`
+//! in 0.7.2), and those line numbers shift between versions, so the message
+//! text is the only stable identifier.)
 //!
-//! Both reopen outcomes end in the same abort:
+//! Both reopen outcomes end in the same panic (in production: process
+//! incapacitation; in this bench: a deterministic exit-code abort via the
+//! panic hook):
 //! - Trusted — the WAL facts match `max_frame`: the persisted index is kept
 //!   as-is.
 //! - RebuildFromDisk — the WAL facts mismatch: only the in-process WAL state
@@ -44,9 +54,13 @@
 //!
 //! # Production consequence
 //!
-//! The production daemon hard-crashed twice with this assert:
+//! The production daemon hit this assert twice, each time becoming
+//! incapacitated (stuck writer byte-lock, dead tokio workers) rather than
+//! aborting:
 //! - 2026-08-06 on turso 0.7.0 (ordinary pipeline dispatch).
-//! - 2026-08-07 on turso 0.7.2 — a fatal ~43-minute outage.
+//! - 2026-08-07 on turso 0.7.2 — a fatal outage on the order of tens of
+//!   minutes (approximate: not independently verifiable from retained data,
+//!   consistent with the surviving chat-history gap).
 //!
 //! These are NOT self-update handoffs: the update log is merely stderr
 //! capture, the single-instance file lock forbids a second daemon, and both
@@ -118,7 +132,11 @@
 //! The repo pins `turso = "=0.7.2"` deliberately so the storage layer cannot
 //! drift under this artifact. The defect is unfixed upstream: `main` and
 //! `0.8.0-pre.3` both carry the same assert, and no public issue or PR exists
-//! — this artifact is the first report.
+//! for this specific defect — this artifact is the first report. Two adjacent
+//! upstream changes in the same code area fix different bugs and do not cover
+//! this one: PR #7674 (WAL spill frame-slot reuse — merged, present in 0.7.2)
+//! and a separate proposed fix for a stale disk-scan clearing the shared
+//! frame index (not merged; absent from 0.7.2, `0.8.0-pre.3`, and `main`).
 //!
 //! # Suggested fix
 //!

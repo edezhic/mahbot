@@ -9,8 +9,10 @@
 //! Committed transactions are durable at COMMIT time: turso runs
 //! synchronous=FULL (default), fsyncing the WAL before reporting a transaction
 //! durable, so committed frames survive crash/SIGKILL without any checkpoint
-//! (stale `.tshm` state is rebuilt from the on-disk WAL on reopen). Checkpoints
-//! are hygiene, not the durability mechanism: they compact committed frames
+//! (the durable `.tshm` index is never rebuilt or trimmed on a crash reopen;
+//! only the exit-time TRUNCATE resets it — see the known-reopen defect
+//! below). Checkpoints are hygiene, not the durability mechanism: they compact
+//! committed frames
 //! from the WAL into the main DB file, reclaim WAL space, and reset the shared
 //! frame index. TRUNCATE at exit leaves a header-only WAL (clean store handoff;
 //! also avoids the stale shared-index reopen hazard). TRUNCATE is avoided under
