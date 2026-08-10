@@ -157,7 +157,7 @@ fn git_command() -> tokio::process::Command {
 
 /// Run a git command without any interpretation of the exit code.
 ///
-/// Shared by [`run_git_command`] and [`git_has_commits`] to avoid
+/// Shared by [`run_git_command`] and other raw-output callers to avoid
 /// duplicating the spawn + output + decode pattern. Returns the raw
 /// [`std::process::Output`] so each caller can interpret the exit
 /// status as appropriate.
@@ -380,18 +380,13 @@ pub async fn run_git_commit(repo_path: &Path, message: &str) -> anyhow::Result<C
 
     // Capture line stats via --numstat. Try HEAD~1..HEAD first.
     let (lines_added, lines_removed) =
-        if let Ok(stats) = parse_numstat(repo_path, &["diff", "--numstat", "HEAD~1..HEAD"]).await {
+        if let Ok(stats) = parse_numstat(repo_path, &["HEAD~1..HEAD"]).await {
             stats
         } else {
             // HEAD~1 doesn't exist (first commit) — fall back to the empty tree hash.
             parse_numstat(
                 repo_path,
-                &[
-                    "diff",
-                    "--numstat",
-                    "4b825dc642cb6eb9a060e54bf899dcee6a7b9e2a",
-                    "HEAD",
-                ],
+                &["4b825dc642cb6eb9a060e54bf899dcee6a7b9e2a", "HEAD"],
             )
             .await
             .unwrap_or((0, 0))
@@ -468,17 +463,29 @@ pub fn parse_numstat_lines(stdout: &str) -> Vec<NumstatEntry> {
     result
 }
 
-/// Run `git diff --numstat <args...>` and sum the line stats across all files.
+/// Run `git diff --numstat <range...>` and return the per-file entries.
+/// Callers pass only the range (e.g. `&["HEAD"]` or `&["4b825d…", "HEAD"]`).
+pub(crate) async fn run_git_diff_numstat(
+    repo_path: &Path,
+    range: &[&str],
+) -> anyhow::Result<Vec<NumstatEntry>> {
+    let mut args = vec!["diff", "--numstat"];
+    args.extend_from_slice(range);
+    let stdout = run_git_command(repo_path, &args).await?;
+    Ok(parse_numstat_lines(&stdout))
+}
+
+/// Run `git diff --numstat <range...>` and sum the line stats across all files.
 ///
 /// Returns `Ok((lines_added, lines_removed))` on success (even if the diff
 /// is empty). Returns the git error message on failure.
-async fn parse_numstat(repo_path: &Path, args: &[&str]) -> anyhow::Result<(i64, i64)> {
-    let stdout = run_git_command(repo_path, args).await?;
+async fn parse_numstat(repo_path: &Path, range: &[&str]) -> anyhow::Result<(i64, i64)> {
+    let entries = run_git_diff_numstat(repo_path, range).await?;
 
     let mut lines_added: i64 = 0;
     let mut lines_removed: i64 = 0;
 
-    for entry in parse_numstat_lines(&stdout) {
+    for entry in entries {
         // Binary files have None values — they contribute 0 lines.
         if let Some(added) = entry.additions {
             lines_added += added;
@@ -498,17 +505,9 @@ pub async fn git_is_installed() -> bool {
     cmd.output().await.is_ok_and(|o| o.status.success())
 }
 
-/// Check if a git repo has any commits.
-pub async fn git_has_commits(repo_path: &Path) -> anyhow::Result<bool> {
-    let output = run_git_output(repo_path, &["rev-list", "-n", "1", "HEAD"]).await?;
-
-    // If the command fails, there are no commits or something is wrong
-    if !output.status.success() {
-        return Ok(false);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(!stdout.trim().is_empty())
+/// Check if a git repo has any commits (spawn/git failures count as `false`).
+pub async fn git_has_commits(repo_path: &Path) -> bool {
+    run_git_head(repo_path).await.is_ok()
 }
 
 /// Get the current branch name (e.g. `main`, `feature/xyz`).
@@ -566,7 +565,7 @@ pub async fn run_git_behind_ahead(repo_path: &Path) -> anyhow::Result<(usize, us
 /// Delegates to `parse_numstat` for tracked file diffs and
 /// `parse_untracked_from_porcelain` for untracked file enumeration.
 pub async fn run_git_diff_stats(repo_path: &Path) -> anyhow::Result<(i64, i64)> {
-    let (mut added, removed) = parse_numstat(repo_path, &["diff", "--numstat", "HEAD"]).await?;
+    let (mut added, removed) = parse_numstat(repo_path, &["HEAD"]).await?;
 
     // Enumerate untracked files and count their lines.
     // `git diff HEAD` only considers tracked files, so new/untracked files are
@@ -783,7 +782,7 @@ mod tests {
     #[tokio::test]
     async fn test_git_has_commits_true() {
         let (_dir, repo_path) = init_temp_repo();
-        let has = git_has_commits(&repo_path).await.expect("git_has_commits");
+        let has = git_has_commits(&repo_path).await;
         assert!(has, "repo with initial commit should have commits");
     }
 
@@ -800,7 +799,7 @@ mod tests {
             .expect("git init");
         assert!(status.success());
 
-        let has = git_has_commits(&repo_path).await.expect("git_has_commits");
+        let has = git_has_commits(&repo_path).await;
         assert!(!has, "empty repo should not have commits");
     }
 

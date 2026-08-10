@@ -33,7 +33,7 @@ use crate::agent::{RETRY_EXHAUSTION_MARKER, run_agent};
 use crate::board::{BOARD, BoardStore, PipelineCheck, Ticket, TicketComment, TicketPhase};
 use crate::git_commands::{
     has_unstaged_changes, list_new_or_untracked_files, parse_new_files_from_porcelain,
-    parse_numstat_lines, run_git_add_all, run_git_command, run_git_head, run_git_status,
+    run_git_add_all, run_git_command, run_git_diff_numstat, run_git_head, run_git_status,
     run_git_write_tree,
 };
 use crate::message_router;
@@ -3244,8 +3244,7 @@ async fn compute_review_skip(ticket: &Ticket, repo_path: &Path) -> anyhow::Resul
 /// The diff is computed against HEAD — no commit for this ticket exists yet
 /// (DB line stats are populated only at final done).
 async fn working_tree_churn(repo_path: &Path) -> anyhow::Result<(i64, i64, usize)> {
-    let numstat = run_git_command(repo_path, &["diff", "HEAD", "--numstat"]).await?;
-    let entries = parse_numstat_lines(&numstat);
+    let entries = run_git_diff_numstat(repo_path, &["HEAD"]).await?;
     let mut total: i64 = 0;
     let mut max_per_file: i64 = 0;
     for e in &entries {

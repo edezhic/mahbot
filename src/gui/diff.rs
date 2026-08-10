@@ -1326,10 +1326,7 @@ async fn load_diff(
     if !is_git_repo(&ws_path) {
         return Err("This workspace is not a git repository.".to_string());
     }
-    if !git_has_commits(&ws_path)
-        .await
-        .map_err(|e| format!("Git error: {e}"))?
-    {
+    if !git_has_commits(&ws_path).await {
         return Err("No commits yet \u{2014} nothing to diff against.".to_string());
     }
 
