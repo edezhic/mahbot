@@ -1185,102 +1185,182 @@ fn consume_substitution(
     false
 }
 
-/// Split a shell command string into logical segments at shell operators.
-/// Respects single and double quotes, treats newlines as command separators
-/// (with backslash-newline line continuation), and removes heredoc bodies
-/// before splitting so body text is never treated as command text.
-///
-/// Command substitutions (`$(...)`, backticks) are kept whole: separators
-/// inside a substitution body are part of the substitution, not command
-/// separators. Mis-splitting flips `is_chained` in [`process_shell_output`]
-/// and disables standalone-only output transforms.
+/// Split a shell command string into logical segments at shell operators
+/// (quote- and substitution-aware, newlines separate, heredoc bodies
+/// stripped first). Mis-splitting flips `is_chained` in
+/// [`process_shell_output`] and disables standalone-only output transforms.
 fn extract_command_segments(command: &str) -> Vec<String> {
     // Heredoc bodies are excluded from command scanning (see decision 10 of
     // the read-only shell guard contract): body text must never be segmented
     // as commands, and redirect operators inside bodies must not be scanned.
     let scan = readonly::strip_heredoc_bodies(command);
-    extract_command_segments_stripped(&scan)
+    segment_command(&scan, SegmentMode::Profile)
+        .expect("profile segmentation never errors")
+        .into_iter()
+        .map(|(seg, _)| seg)
+        .collect()
 }
 
-/// Core segmentation on an already-heredoc-stripped string.
-///
-/// Kept separate from [`extract_command_segments`] so callers with an
-/// already-stripped string avoid a redundant second strip pass.
-fn extract_command_segments_stripped(stripped: &str) -> Vec<String> {
-    let mut segments = Vec::new();
+/// Splitting policy of the shared segmenter core ([`segment_command`]): the
+/// profile-selection and grep-interception splitters had already drifted
+/// apart silently (backslash handling); both run this core, and these two
+/// policies are the entire divergence. Unifying them is a separate decision.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SegmentMode {
+    /// Empty segments silently skipped; backslash dropped before ordinary chars.
+    Profile,
+    /// Empty segments before a connector are syntax errors, except blank
+    /// lines and `;;` case-arm terminators; backslash always preserved.
+    Grep,
+}
+
+/// Empty-segment handling at a flush: skip (profile) or hard error (grep).
+/// Grep's blank-line and case-`;;` allowances are structural, not policy
+/// variants: the `\n` flush skips; the `;` arm consumes the second `;`.
+#[derive(Clone, Copy)]
+pub(super) enum EmptySegPolicy {
+    Skip,
+    Error,
+}
+
+/// Escape-sensitive chars for the profile backslash policy: preserved so
+/// downstream scans see escaped operators, not real ones.
+const fn is_escape_sensitive(c: char) -> bool {
+    matches!(
+        c,
+        '\\' | '\'' | '"' | '>' | '<' | '&' | '|' | ';' | '$' | '`'
+    )
+}
+
+/// True when the segment opens a `case` statement: `case` in command position
+/// (first word, or second after a block keyword that introduces commands).
+fn segment_opens_case(segment: &str) -> bool {
+    let mut words = segment.split_whitespace();
+    match words.next() {
+        Some("case") => true,
+        Some("do" | "then" | "else" | "elif" | "if") => words.next() == Some("case"),
+        _ => false,
+    }
+}
+
+/// True when the segment closes a `case` statement (`esac` in command position).
+fn segment_ends_case(segment: &str) -> bool {
+    let mut words = segment.split_whitespace();
+    match words.next() {
+        Some("esac") => true,
+        Some("do" | "then" | "else" | "elif" | "if") => words.next() == Some("esac"),
+        _ => false,
+    }
+}
+
+/// Shared quote/substitution-aware segmenter core: split an already-heredoc-
+/// stripped command into (segment, connector) pairs. Returns `None` when a
+/// connector follows an empty segment in a mode that errors on it (grep;
+/// blank-line and case-arm `;;` exceptions apply).
+#[allow(clippy::too_many_lines)] // quote/substitution state machine
+pub(super) fn segment_command(command: &str, mode: SegmentMode) -> Option<Vec<(String, String)>> {
+    let mut out: Vec<(String, String)> = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
     let mut in_double = false;
-    let mut chars = stripped.chars().peekable();
+    let mut in_case = false;
+    let mut chars = command.chars().peekable();
 
-    let mut flush = |current: &mut String| {
-        if !current.trim().is_empty() {
-            segments.push(current.trim().to_string());
+    let flush = |current: &mut String,
+                 out: &mut Vec<(String, String)>,
+                 conn: &str,
+                 policy: EmptySegPolicy,
+                 in_case: &mut bool|
+     -> bool {
+        let t = current.trim();
+        let pushed = !t.is_empty();
+        if pushed {
+            out.push((t.to_string(), conn.to_string()));
+            *in_case = segment_opens_case(t) || (*in_case && !segment_ends_case(t));
         }
         current.clear();
+        pushed || matches!(policy, EmptySegPolicy::Skip)
+    };
+
+    let base = match mode {
+        SegmentMode::Profile => EmptySegPolicy::Skip,
+        SegmentMode::Grep => EmptySegPolicy::Error,
     };
 
     while let Some(c) = chars.next() {
-        // Handle backslash escape independently — must come before the shared
-        // quote state machine to preserve the caller's peek-ahead behavior
-        // and trailing-backslash push.  Because backslash never reaches
-        // [`check_outside_quotes`], there is no need for an `escaped` flag
-        // in the quote tracker; it only tracks single/double quote state.
         if c == '\\' && !in_single {
             match chars.next() {
-                // Backslash-newline: line continuation. Real shells join the
-                // logical line, so the newline is consumed without splitting
-                // and without emitting either character.
                 Some('\n') => continue,
-                // Preserve the backslash for quote/redirect-sensitive escapes
-                // (`\'`, `\"`, `\>`, `\<`, `\&`, `\|`, `\;`, `\$`, `` \` ``, `\\`)
-                // so downstream scans (per-segment redirect detection, quote
-                // tracking) can distinguish an escaped operator from a real one.
-                Some(next)
-                    if matches!(
-                        next,
-                        '\\' | '\'' | '"' | '>' | '<' | '&' | '|' | ';' | '$' | '`'
-                    ) =>
-                {
-                    current.push(c);
+                // Profile drops the backslash before ordinary chars; grep
+                // always preserves both (dropping `\*` makes a shell glob).
+                Some(next) if mode == SegmentMode::Profile && !is_escape_sensitive(next) => {
                     current.push(next);
                 }
-                Some(next) => current.push(next),
-                None => current.push(c), // trailing backslash preserved
+                Some(next) => {
+                    current.push('\\');
+                    current.push(next);
+                }
+                None => current.push('\\'),
             }
             continue;
         }
 
         if check_outside_quotes(c, &mut in_single, &mut in_double) {
-            // ── Command substitutions (`$(...)`, backticks) stay whole ──
             if consume_substitution(c, &mut chars, &mut current) {
                 continue;
             }
             match c {
                 '&' if chars.peek() == Some(&'&') => {
-                    chars.next(); // consume second &
-                    flush(&mut current);
+                    chars.next();
+                    if !flush(&mut current, &mut out, "&&", base, &mut in_case) {
+                        return None;
+                    }
                     continue;
                 }
-                // `>|` is a single compound redirect operator, not a pipe
-                // separator. Splitting at the `|` would leave a bare `>`
-                // segment that the redirect scanner misreads as a target-less
-                // redirect.
+                // `>|` is one compound redirect, not a pipe (bare `>` misread).
                 '|' if current.trim_end().ends_with('>') => {
                     current.push(c);
                     continue;
                 }
                 '|' => {
-                    if chars.peek() == Some(&'|') {
+                    // `|&` is one connector in grep mode; profile splits at `|`.
+                    if mode == SegmentMode::Grep && chars.peek() == Some(&'&') {
                         chars.next();
+                        if !flush(&mut current, &mut out, "|&", base, &mut in_case) {
+                            return None;
+                        }
+                    } else if chars.peek() == Some(&'|') {
+                        chars.next();
+                        if !flush(&mut current, &mut out, "||", base, &mut in_case) {
+                            return None;
+                        }
+                    } else if !flush(&mut current, &mut out, "|", base, &mut in_case) {
+                        return None;
                     }
-                    flush(&mut current);
                     continue;
                 }
-                // Newline as command separator: multi-line temp setup scripts
-                // must parse as separate commands.
-                '\n' | ';' => {
-                    flush(&mut current);
+                // Newlines separate commands; blank lines stay valid sh
+                // (grep's blank-line exception: this flush always skips).
+                '\n' => {
+                    flush(
+                        &mut current,
+                        &mut out,
+                        "\n",
+                        EmptySegPolicy::Skip,
+                        &mut in_case,
+                    );
+                    continue;
+                }
+                ';' => {
+                    if !flush(&mut current, &mut out, ";", base, &mut in_case) {
+                        return None;
+                    }
+                    // Case-arm `;;` (grep): consume the second `;` so no empty
+                    // flush happens for it. Outside a case, `;;` errors in grep
+                    // mode and is silently skipped in profile mode.
+                    if mode == SegmentMode::Grep && in_case && chars.peek() == Some(&';') {
+                        chars.next();
+                    }
                     continue;
                 }
                 _ => {}
@@ -1288,8 +1368,24 @@ fn extract_command_segments_stripped(stripped: &str) -> Vec<String> {
         }
         current.push(c);
     }
-    flush(&mut current);
-    segments
+    flush(
+        &mut current,
+        &mut out,
+        "",
+        EmptySegPolicy::Skip,
+        &mut in_case,
+    );
+    // Trailing pipe/`&&`/`||` would silently drop an empty member into a
+    // VALID executed pipeline — fail closed (grep policy only).
+    if mode == SegmentMode::Grep
+        && matches!(
+            out.last().map(|(_, c)| c.as_str()),
+            Some("|" | "|&" | "||" | "&&")
+        )
+    {
+        return None;
+    }
+    Some(out)
 }
 
 /// Find the index of the first non-flag word in a slice, skipping:

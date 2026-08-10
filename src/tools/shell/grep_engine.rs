@@ -506,131 +506,8 @@ fn join_rewritten(segments: &[(String, String)]) -> String {
 /// the rewriting would silently drop them into a VALID executed pipeline —
 /// fail-closed on the whole class. Blank lines (`\n` between commands) are
 /// valid sh and stay allowed.
-#[allow(clippy::too_many_lines)] // quote/substitution state machine
 fn split_segments(command: &str) -> Result<Vec<(String, String)>, Fallback> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    // Inside a `case` statement (`;;` is only valid there; elsewhere an empty
-    // segment before `;` is a shell syntax error).
-    let mut in_case = false;
-    let mut chars = command.chars().peekable();
-
-    let flush = |current: &mut String,
-                 out: &mut Vec<(String, String)>,
-                 conn: &str,
-                 in_case: &mut bool|
-     -> bool {
-        let t = current.trim();
-        let pushed = !t.is_empty();
-        if pushed {
-            out.push((t.to_string(), conn.to_string()));
-            *in_case = segment_opens_case(t) || (*in_case && !segment_ends_case(t));
-        }
-        current.clear();
-        pushed
-    };
-
-    while let Some(c) = chars.next() {
-        if c == '\\' && !in_single {
-            match chars.next() {
-                Some('\n') => continue,
-                Some(next) => {
-                    current.push('\\');
-                    current.push(next);
-                }
-                None => current.push('\\'),
-            }
-            continue;
-        }
-        if super::check_outside_quotes(c, &mut in_single, &mut in_double) {
-            if super::consume_substitution(c, &mut chars, &mut current) {
-                continue;
-            }
-            match c {
-                '&' if chars.peek() == Some(&'&') => {
-                    chars.next();
-                    if !flush(&mut current, &mut out, "&&", &mut in_case) {
-                        return Err(Fallback::SegmentEmpty);
-                    }
-                    continue;
-                }
-                // `>|` is a single compound redirect operator, not a pipe
-                // separator. Splitting at the `|` would leave a bare `>`
-                // segment that the redirect scanner misreads as a target-less
-                // redirect.
-                '|' if current.trim_end().ends_with('>') => {
-                    current.push(c);
-                    continue;
-                }
-                '|' => {
-                    if chars.peek() == Some(&'&') {
-                        chars.next();
-                        if !flush(&mut current, &mut out, "|&", &mut in_case) {
-                            return Err(Fallback::SegmentEmpty);
-                        }
-                    } else if chars.peek() == Some(&'|') {
-                        chars.next();
-                        if !flush(&mut current, &mut out, "||", &mut in_case) {
-                            return Err(Fallback::SegmentEmpty);
-                        }
-                    } else if !flush(&mut current, &mut out, "|", &mut in_case) {
-                        return Err(Fallback::SegmentEmpty);
-                    }
-                    continue;
-                }
-                '\n' => {
-                    flush(&mut current, &mut out, "\n", &mut in_case);
-                    continue;
-                }
-                ';' => {
-                    if !flush(&mut current, &mut out, ";", &mut in_case) {
-                        return Err(Fallback::SegmentEmpty);
-                    }
-                    // `;;` is a valid case-arm terminator: consume the second
-                    // `;` — the compound check rejects the case statement
-                    // itself (fail-closed) instead of mislabeling the empty
-                    // member. Outside a case, `;;` stays a syntax error.
-                    if in_case && chars.peek() == Some(&';') {
-                        chars.next();
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        current.push(c);
-    }
-    flush(&mut current, &mut out, "", &mut in_case);
-    if out
-        .last()
-        .is_some_and(|(_, conn)| matches!(conn.as_str(), "|" | "|&" | "||" | "&&"))
-    {
-        return Err(Fallback::SegmentEmpty);
-    }
-    Ok(out)
-}
-
-/// True when the segment opens a `case` statement: `case` in command position
-/// (first word, or second after a block keyword that introduces commands).
-fn segment_opens_case(segment: &str) -> bool {
-    let mut words = segment.split_whitespace();
-    match words.next() {
-        Some("case") => true,
-        Some("do" | "then" | "else" | "elif" | "if") => words.next() == Some("case"),
-        _ => false,
-    }
-}
-
-/// True when the segment closes a `case` statement (`esac` in command position).
-fn segment_ends_case(segment: &str) -> bool {
-    let mut words = segment.split_whitespace();
-    match words.next() {
-        Some("esac") => true,
-        Some("do" | "then" | "else" | "elif" | "if") => words.next() == Some("esac"),
-        _ => false,
-    }
+    super::segment_command(command, super::SegmentMode::Grep).ok_or(Fallback::SegmentEmpty)
 }
 
 /// First whitespace-delimited word of a segment (raw, quote-preserving).
@@ -3391,5 +3268,58 @@ mod parity_tests {
             assert_falls_back(row, &ws, &home);
         }
         assert_parity(rows[3], &ws, &home);
+    }
+}
+
+// ── Segmenter divergence pins (non-gated: pure parsing, both splitters) ──
+// Both splitters run the shared core (shell::segment_command); these rows
+// pin the two policies' deliberate divergence so a silent policy swap fails
+// loudly. Unifying the policies is a separate decision.
+
+#[cfg(test)]
+mod segmenter_pins {
+    use super::super::extract_command_segments;
+    use super::*;
+
+    #[test]
+    fn divergent_policies_stay_pinned() {
+        // (input, profile segments) — profile silently skips empty segments
+        // and drops a backslash before ordinary chars.
+        let profile_rows: &[(&str, &[&str])] = &[
+            // Unquoted backslash before an ordinary char: dropped (kept only
+            // before escape-sensitive chars).
+            ("echo \\a", &["echo a"]),
+            // `|&` is not a compound connector: the `&` starts its own segment.
+            ("a |& b", &["a", "& b"]),
+            // `;;` outside a case: two `;` separators, empty segment skipped.
+            ("echo a ;; echo b", &["echo a", "echo b"]),
+        ];
+        for (input, expected) in profile_rows {
+            let segs = extract_command_segments(input);
+            let got: Vec<&str> = segs.iter().map(String::as_str).collect();
+            assert_eq!(got, *expected, "profile: {input:?}");
+        }
+
+        // (input, grep (segment, connector) pairs) — grep errors on empty
+        // members (except blank lines and `;;` case-arm terminators) and
+        // always preserves backslashes.
+        let grep_ok: &[(&str, &[(&str, &str)])] = &[
+            // Backslash always preserved: dropping `\*` would turn the operand
+            // into a shell glob.
+            ("grep \\*.txt a.txt", &[("grep \\*.txt a.txt", "")]),
+            // `|&` is a single compound connector (stderr merge).
+            ("a |& grep x a.txt", &[("a", "|&"), ("grep x a.txt", "")]),
+        ];
+        for (input, expected) in grep_ok {
+            let got = split_segments(input).expect("expected segments");
+            let got: Vec<(&str, &str)> =
+                got.iter().map(|(s, c)| (s.as_str(), c.as_str())).collect();
+            assert_eq!(got.as_slice(), *expected, "grep: {input:?}");
+        }
+        // `;;` outside a case: empty segment before `;` is a syntax error.
+        assert!(
+            split_segments("echo a ;; echo b").is_err(),
+            "grep: ;; outside case"
+        );
     }
 }
