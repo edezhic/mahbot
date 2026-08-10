@@ -4246,7 +4246,7 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
         Some("branch") => check_git_ref_subcommand(&subcommand, "branch")?,
         Some("tag") => check_git_ref_subcommand(&subcommand, "tag")?,
         Some("remote") => {
-            check_git_subcommand_mutation(&subcommand, "remote", GIT_REMOTE_MUTATIONS)?;
+            check_git_subcommand_mutation(&subcommand, GIT_REMOTE_MUTATIONS)?;
         }
         Some("hash-object") => {
             // git hash-object -w writes the object to the database; without -w
@@ -4340,10 +4340,11 @@ fn is_ref_mutation_word(word: &str, table: &[(&str, RefOpt)], shorts: &[(char, R
     false
 }
 
-fn git_mutation_rejection(subcommand: &str, subcommand_name: &str) -> String {
+fn git_mutation_rejection(subcommand: &str) -> String {
     format!(
         "⚠️ Read-only mode: `git {subcommand}` is not allowed — it mutates.\n\
-         Suggestion: use `git {subcommand_name}` without mutation flags to list/inspect."
+         Suggestion: inspect state with read-only git commands instead \
+         (e.g. `git status`, `git log`, `git diff`, `git show`)."
     )
 }
 
@@ -4379,7 +4380,7 @@ fn check_git_ref_subcommand(subcommand: &str, sub: &str) -> Result<(), String> {
     for raw in words.iter().skip(1) {
         let w = shell_word(raw);
         if is_ref_mutation_word(&w, table, shorts) {
-            return Err(git_mutation_rejection(subcommand, sub));
+            return Err(git_mutation_rejection(subcommand));
         }
         if consume_next {
             consume_next = false;
@@ -4464,11 +4465,7 @@ fn check_git_ref_subcommand(subcommand: &str, sub: &str) -> Result<(), String> {
 ///
 /// `subcommand` is the pre-extracted subcommand from [`extract_git_subcommand`]
 /// (e.g., `"remote -v update"`).
-fn check_git_subcommand_mutation(
-    subcommand: &str,
-    subcommand_name: &str,
-    mutation_tokens: &[&str],
-) -> Result<(), String> {
+fn check_git_subcommand_mutation(subcommand: &str, mutation_tokens: &[&str]) -> Result<(), String> {
     let words: Vec<&str> = subcommand.split_whitespace().collect();
     // words[0] is the subcommand name (e.g., "remote")
 
@@ -4498,7 +4495,7 @@ fn check_git_subcommand_mutation(
             short_chars.iter().any(|c| a[1..].contains(*c))
         };
         if is_mutating {
-            return Err(git_mutation_rejection(subcommand, subcommand_name));
+            return Err(git_mutation_rejection(subcommand));
         }
     }
 
@@ -4512,7 +4509,7 @@ fn check_git_subcommand_mutation(
     {
         let is_mutating = matches_mutation_token(first_non_flag_arg, &bare_tokens);
         if is_mutating {
-            return Err(git_mutation_rejection(subcommand, subcommand_name));
+            return Err(git_mutation_rejection(subcommand));
         }
     }
 
@@ -4596,22 +4593,23 @@ fn check_cargo_segment(segment: &str) -> Result<(), String> {
             return reject(
                 trimmed,
                 "`cargo update` is not allowed — it modifies Cargo.lock.",
-                "switch to full shell mode to use `cargo update` \
-                 (or `cargo update --dry-run` to preview changes without modifying Cargo.lock).",
+                "use `cargo update --dry-run` to preview what would change without modifying anything; \
+                 if the real update is required, state that in your final response — it is outside read-only scope.",
             );
         }
         "generate-lockfile" => {
             return reject(
                 trimmed,
                 "`cargo generate-lockfile` is not allowed — it creates or overwrites Cargo.lock.",
-                "switch to full shell mode to use `cargo generate-lockfile`.",
+                "generating a lockfile is outside read-only scope; if it is required, state that in your final response.",
             );
         }
         "run" => {
             return reject(
                 trimmed,
-                "`cargo run` is not allowed — it executes the built binary, which may write files.",
-                "build with `cargo build` first, then invoke the built binary directly, e.g. `./target/debug/<bin> --help`.",
+                "`cargo run` is not allowed — it may write files.",
+                "use `cargo run --help` or `cargo run -h` to inspect the program's CLI without running it; \
+                 if running the program is actually required, state that in your final response — it is outside read-only scope.",
             );
         }
         _ => {}
@@ -7565,8 +7563,8 @@ mod tests {
     }
 
     /// Denial messages teach the recognized spelling: a literal temp path or
-    /// `NAME=$(mktemp -d)` for unresolvable variables, and `cargo build` +
-    /// direct binary invocation for `cargo run`.
+    /// `NAME=$(mktemp -d)` for unresolvable variables, and the help form for
+    /// `cargo run` without bypass guidance.
     #[test]
     fn denial_message_education() {
         let ctx = test_ctx();
@@ -7582,9 +7580,15 @@ mod tests {
         );
         let err = check_command("cargo run", &ctx).unwrap_err();
         assert!(
-            err.contains("cargo build") && err.contains("target/debug"),
-            "cargo run denial should teach the built-binary alternative: {err}"
+            err.contains("--help"),
+            "cargo run denial should suggest the help form: {err}"
         );
+        for banned in ["target/debug", "built binary", "full shell", "escalate"] {
+            assert!(
+                !err.contains(banned),
+                "cargo run denial must not teach a bypass: {err}"
+            );
+        }
     }
 
     #[test]

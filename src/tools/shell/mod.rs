@@ -588,8 +588,9 @@ fn format_drain_timeout_error(
         let _ = write!(msg, "\nkilled process group: {p}");
     }
     msg.push_str(
-        "\nhint: background processes must redirect their output \
-         (e.g. `nohup cmd >/dev/null 2>&1 &`) to release the tool's pipes.",
+        "\nhint: the tool does not support processes that outlive the command; \
+         keep launched processes inside the command's lifetime. \
+         If background execution is genuinely required, state that in your final response.",
     );
 
     append_output_tail(&mut msg, "stdout", stdout);
