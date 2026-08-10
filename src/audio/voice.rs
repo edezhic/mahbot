@@ -1188,15 +1188,7 @@ async fn prewarm_phrase_embeddings(spec: PhrasePrewarmSpec) {
                             cache_dir,
                         )
                     } else {
-                        match crate::audio::tts::synthesize(phrase, style, seed, SAMPLE_RATE) {
-                            Ok(p) => Some(p),
-                            Err(e) => {
-                                warn!(
-                                    "TTS synthesis failed for {phrase_type} phrase '{phrase}': {e}"
-                                );
-                                None
-                            }
-                        }
+                        crate::audio::tts::synthesize(phrase, style, seed, SAMPLE_RATE).ok()
                     };
 
                     let Some(pcm) = pcm else {
@@ -1237,11 +1229,6 @@ async fn prewarm_phrase_embeddings(spec: PhrasePrewarmSpec) {
                         // ⇒ no embeddings.  A phrase with zero VAD-positive audio is
                         // dropped from the negative set rather than trained on
                         // silence-laden audio the streaming path never produces.
-                        warn!(
-                            "{phrase_type} phrase '{phrase}' (seed {seed}) produced no \
-                             VAD-positive speech — skipping (matches streaming: no \
-                             speech ⇒ no embeddings)"
-                        );
                         continue;
                     }
 
@@ -3298,15 +3285,8 @@ pub(crate) fn synthesize_with_pcm_cache(
     }
 
     // Cache miss — synthesise via TTS
-    let pcm = match crate::audio::tts::synthesize(text, style, seed, sample_rate) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(
-                "TTS synthesis failed for '{text}' with {style} (seed={seed}): {e} \
-                 — skipping this variant"
-            );
-            return None;
-        }
+    let Ok(pcm) = crate::audio::tts::synthesize(text, style, seed, sample_rate) else {
+        return None;
     };
 
     // Evict stale/excess entries before writing to keep cache bounded.

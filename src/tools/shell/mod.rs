@@ -795,7 +795,7 @@ impl ShellTool {
                 pid,
                 elapsed,
             } => {
-                tracing::warn!(
+                tracing::info!(
                     command = command_str,
                     elapsed_secs = elapsed.as_secs_f64(),
                     drain_limit_secs = drain_limit.as_secs_f64(),

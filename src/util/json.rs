@@ -101,10 +101,6 @@ pub(crate) fn parse_fenced_json<T: DeserializeOwned>(text: &str) -> anyhow::Resu
     serde_json::from_str::<T>(json_str).or_else(|parse_err| {
         // Attempt JSON repair before giving up
         if let Some(value) = try_repair_json::<T>(json_str) {
-            tracing::warn!(
-                original_error = %parse_err,
-                "Repaired malformed JSON in fenced extraction"
-            );
             return Ok(value);
         }
         Err(anyhow::anyhow!("Failed to parse JSON: {parse_err}"))
