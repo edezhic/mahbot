@@ -43,7 +43,6 @@ CREATE TABLE IF NOT EXISTS workspaces (
     maintainer_debounce_mins INTEGER NOT NULL DEFAULT 5,
     maintainer_last_run_at TEXT,
     diagnostics TEXT,
-    diagnostics_updated_at TEXT,
     diagnostics_generation INTEGER NOT NULL DEFAULT 0,
     notes TEXT NOT NULL DEFAULT '',
     last_analyzed_commit TEXT,
@@ -387,13 +386,10 @@ async fn finalize_discovery(
         // Capture the current git HEAD commit hash for nightly re-analysis detection.
         // If the git command fails (not a git repo, no commits, or other error),
         // store NULL — this is not an error for the discovery itself.
-        let commit_hash = crate::git_commands::run_git_command(
-            std::path::Path::new(ws_path),
-            &["rev-parse", "HEAD"],
-        )
-        .await
-        .ok()
-        .map(|h| h.trim().to_string());
+        let commit_hash = crate::git_commands::run_git_head(std::path::Path::new(ws_path))
+            .await
+            .ok()
+            .flatten();
 
         if let Err(e) = storage
             .exec_update_with_updated_at(
@@ -2159,7 +2155,6 @@ mod tests {
                     maintainer_debounce_mins INTEGER NOT NULL DEFAULT 5,
                     maintainer_last_run_at TEXT,
                     diagnostics TEXT,
-                    diagnostics_updated_at TEXT,
                     diagnostics_generation INTEGER NOT NULL DEFAULT 0,
                     notes TEXT NOT NULL DEFAULT '',
                     last_analyzed_commit TEXT,
