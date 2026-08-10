@@ -926,6 +926,11 @@ fn resolved_shell_path() -> String {
     prepend_path_entries(base, &extra_shell_path_prefixes())
 }
 
+/// Baseline `TMPDIR` binding of the sanitized session environment.
+/// Single-sourced so the read-only validator's temp-variable model
+/// (see `baseline_env_value`) can't drift from the actual env.
+const TMPDIR_BASELINE: &str = "/tmp";
+
 fn baseline_env_value(name: &str) -> Option<String> {
     match name {
         "PATH" => Some(resolved_shell_path()),
@@ -941,7 +946,7 @@ fn baseline_env_value(name: &str) -> Option<String> {
         "TERM" => Some("dumb".into()),
         "LANG" | "LC_ALL" | "LC_CTYPE" => Some("C.UTF-8".into()),
         "SHELL" => Some("/bin/sh".into()),
-        "TMPDIR" => Some("/tmp".into()),
+        "TMPDIR" => Some(TMPDIR_BASELINE.into()),
         _ => {
             #[cfg(windows)]
             if let Some(val) = windows_baseline_env_value(name) {

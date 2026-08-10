@@ -908,9 +908,9 @@ pub(super) struct CheckContext {
     /// hermetic (kept distinct from the temp roots).
     temp_roots: Vec<std::path::PathBuf>,
     /// Baseline temp-variable bindings (TMPDIR/TMP/TEMP) of the session's
-    /// shell environment. The daemon's shell launcher sets `TMPDIR=/tmp`
-    /// (see `baseline_env_value`), so the production default is exactly that;
-    /// tests inject their own.
+    /// shell environment. The daemon's shell launcher sets `TMPDIR` from
+    /// [`super::TMPDIR_BASELINE`] (see `baseline_env_value`), so the
+    /// production default is exactly that; tests inject their own.
     temp_vars: Vec<(String, String)>,
 }
 
@@ -921,7 +921,7 @@ impl CheckContext {
         Self {
             workspace_root: workspace_root.to_path_buf(),
             temp_roots: crate::tools::path::allowed_temp_roots(),
-            temp_vars: vec![("TMPDIR".to_string(), "/tmp".to_string())],
+            temp_vars: vec![("TMPDIR".to_string(), super::TMPDIR_BASELINE.to_string())],
         }
     }
 }
@@ -5088,8 +5088,11 @@ mod tests {
         CheckContext {
             workspace_root: std::path::PathBuf::from("/__mahbot_readonly_test_ws__"),
             temp_roots: crate::tools::path::allowed_temp_roots(),
-            // Match the session shell environment (TMPDIR=/tmp); TMP/TEMP unset.
-            temp_vars: vec![("TMPDIR".to_string(), "/tmp".to_string())],
+            // Match the session shell env (TMPDIR = super::TMPDIR_BASELINE); TMP/TEMP unset.
+            temp_vars: vec![(
+                "TMPDIR".to_string(),
+                super::super::TMPDIR_BASELINE.to_string(),
+            )],
         }
     }
 
