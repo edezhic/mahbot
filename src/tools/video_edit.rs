@@ -3,8 +3,9 @@ use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::json;
 
-/// Maximum length of the edit instruction in characters.
-const MAX_INSTRUCTION_CHARS: usize = 1000;
+/// Maximum length of the edit instruction in characters (tool-level ceiling;
+/// per-model native limits lower than this surface via the model nuances).
+const MAX_INSTRUCTION_CHARS: usize = 5000;
 
 /// Input clip size cap for every video_edit model. Guards the local-file
 /// upload path against unbounded reads (hailuo-3's own model bound is 50 MB).
@@ -25,6 +26,9 @@ enum VideoEditModel {
     Hailuo3,
     /// runway/aleph-2: output mirrors input, preserves audio, seed best-effort.
     Aleph2,
+    /// bytedance/seedance-2.5: whole-frame restyle, 480p/720p via OpenRouter;
+    /// edit tasks require duration 'auto' (integer durations rejected).
+    Seedance,
     /// Any other configured model — permissive validation.
     Unknown,
 }
@@ -33,18 +37,56 @@ fn classify_model(model: &str) -> VideoEditModel {
     let m = model.to_ascii_lowercase();
     // Substring match (not exact) so vendor-prefixed IDs like
     // "minimax/hailuo-3" keep resolving; Unknown covers every other model
-    // permissively.
+    // permissively. seedance is pinned to 2.5 so seedance-2.0/1.5-pro do not
+    // inherit the edit-duration rule.
     if m.contains("hailuo") {
         VideoEditModel::Hailuo3
     } else if m.contains("aleph") {
         VideoEditModel::Aleph2
+    } else if m.contains("seedance") && m.contains("2.5") {
+        VideoEditModel::Seedance
     } else {
         VideoEditModel::Unknown
     }
 }
 
-/// Per-model parameter validation, run before any upload or billing.
-fn validate_params(spec: VideoEditModel, duration: Option<i64>) -> anyhow::Result<()> {
+/// Static per-model video-editing nuances for the `<active-models-opts>`
+/// block (surfaced on session start and on model switch). Informational
+/// facts only — never parameter-style: `video_edit` accepts no resolution or
+/// editing-mode argument, and the block is shared with `video_gen`. Keyed via
+/// [`classify_model`] so rendering can never drift from validation.
+pub(crate) fn video_edit_nuances(model: &str) -> Option<&'static str> {
+    match classify_model(model) {
+        VideoEditModel::Hailuo3 => Some(
+            "localized instruction edits + video-to-video motion transfer; 2K output; \
+             source style preserved by default",
+        ),
+        VideoEditModel::Seedance => Some(
+            "whole-frame restyle; output 480p/720p via OpenRouter; edit-mode duration \
+             is automatic ('auto') — the 4-30s duration range applies to generation, \
+             not edits",
+        ),
+        VideoEditModel::Aleph2 | VideoEditModel::Unknown => None,
+    }
+}
+
+/// Whether the request body must omit `duration`: seedance-2.5 edit-classified
+/// (video-reference) tasks natively require duration 'auto', and forwarding an
+/// explicit integer is provider-rejected. Omission is schema-valid and lets
+/// the provider default to 'auto'. Image-to-video (frame-anchor) keeps the
+/// catalog duration range.
+fn omit_duration(spec: VideoEditModel, mode: EditMode) -> bool {
+    matches!((spec, mode), (VideoEditModel::Seedance, EditMode::VideoRef))
+}
+
+/// Per-model parameter validation, run before any upload or billing. The
+/// seedance duration rule is mode-dependent, so this runs after
+/// [`validate_mode`].
+fn validate_params(
+    spec: VideoEditModel,
+    mode: EditMode,
+    duration: Option<i64>,
+) -> anyhow::Result<()> {
     match spec {
         VideoEditModel::Hailuo3 => {
             if let Some(d) = duration
@@ -64,6 +106,21 @@ fn validate_params(spec: VideoEditModel, duration: Option<i64>) -> anyhow::Resul
                 );
             }
         }
+        VideoEditModel::Seedance => match mode {
+            // Native edit tasks require duration 'auto' — the field is omitted
+            // at body build (see [`omit_duration`]), so any value is accepted.
+            EditMode::VideoRef => {}
+            EditMode::FrameAnchor => {
+                if let Some(d) = duration
+                    && !(4..=30).contains(&d)
+                {
+                    anyhow::bail!(
+                        "seedance-2.5 image-to-video duration must be 4–30 seconds, got {d}. \
+                         Retry with a duration in that range."
+                    );
+                }
+            }
+        },
         VideoEditModel::Unknown => {
             if let Some(d) = duration
                 && d <= 0
@@ -287,7 +344,7 @@ impl Tool for VideoEditTool {
                 },
                 "instruction": {
                     "type": "string",
-                    "description": "Text instruction describing the edit to apply (max 1000 chars)"
+                    "description": "Text instruction describing the edit to apply (max 5000 chars)"
                 },
                 "duration": {
                     "type": "integer",
@@ -359,11 +416,13 @@ impl Tool for VideoEditTool {
             );
         }
 
-        // ── Per-model parameter validation (fail fast, before any upload) ──
-        validate_params(spec, duration)?;
-
         // ── Mode validation: frame anchors vs references, model image gate ──
         let mode = validate_mode(spec, video_url, &images, first_frame, last_frame)?;
+
+        // ── Per-model parameter validation (fail fast, before any upload) ──
+        // Runs after mode validation — the seedance duration rule is
+        // mode-dependent (edit vs image-to-video).
+        validate_params(spec, mode, duration)?;
 
         // ── Resolve sources and build the request body ────────────────────
         let mut body = json!({
@@ -413,7 +472,12 @@ impl Tool for VideoEditTool {
             }
         }
 
-        if let Some(d) = duration {
+        // seedance-2.5 edit tasks natively require duration 'auto' — omit the
+        // field (schema-valid; provider defaults to auto) instead of
+        // forwarding a provider-rejected integer.
+        if let Some(d) = duration
+            && !omit_duration(spec, mode)
+        {
             body["duration"] = json!(d);
         }
 
@@ -445,7 +509,43 @@ mod tests {
             classify_model("runway/aleph-2-20260729"),
             VideoEditModel::Aleph2
         );
+        // seedance is pinned to 2.5 — earlier versions stay permissive.
+        assert_eq!(
+            classify_model("bytedance/seedance-2.5"),
+            VideoEditModel::Seedance
+        );
+        assert_eq!(
+            classify_model("bytedance/seedance-2.0"),
+            VideoEditModel::Unknown
+        );
+        assert_eq!(
+            classify_model("bytedance/seedance-1.5-pro"),
+            VideoEditModel::Unknown
+        );
         assert_eq!(classify_model("some/other-model"), VideoEditModel::Unknown);
+    }
+
+    #[test]
+    fn seedance_duration_rule_is_mode_dependent() {
+        // Edit-classified (video-reference) requests omit duration entirely —
+        // any value is accepted and dropped at body build.
+        assert!(omit_duration(VideoEditModel::Seedance, EditMode::VideoRef));
+        assert!(validate_params(VideoEditModel::Seedance, EditMode::VideoRef, Some(8)).is_ok());
+        assert!(validate_params(VideoEditModel::Seedance, EditMode::VideoRef, None).is_ok());
+        // Image-to-video (frame-anchor) keeps the catalog 4-30s range.
+        assert!(!omit_duration(
+            VideoEditModel::Seedance,
+            EditMode::FrameAnchor
+        ));
+        assert!(validate_params(VideoEditModel::Seedance, EditMode::FrameAnchor, Some(8)).is_ok());
+        assert!(validate_params(VideoEditModel::Seedance, EditMode::FrameAnchor, Some(3)).is_err());
+        assert!(
+            validate_params(VideoEditModel::Seedance, EditMode::FrameAnchor, Some(31)).is_err()
+        );
+        assert!(validate_params(VideoEditModel::Seedance, EditMode::FrameAnchor, None).is_ok());
+        // Other models never omit duration.
+        assert!(!omit_duration(VideoEditModel::Hailuo3, EditMode::VideoRef));
+        assert!(!omit_duration(VideoEditModel::Unknown, EditMode::VideoRef));
     }
 
     #[test]

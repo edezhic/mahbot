@@ -4,8 +4,11 @@
 //!
 //! The block is injected into Artist sessions at session start and re-emitted
 //! after compaction; only typed catalog fields are rendered — never raw model
-//! name/description strings. When a catalog is unavailable the block (or the
-//! affected section) is omitted (fail-open) and the static tool schema applies.
+//! name/description strings. Static per-model video-edit nuances (see
+//! [`crate::tools::video_edit::video_edit_nuances`]) render whenever the
+//! active video model matches, independently of catalog availability; the
+//! remaining sections are omitted (fail-open) when their catalog is
+//! unavailable and the static tool schema applies.
 
 use std::fmt::Write;
 
@@ -83,10 +86,11 @@ impl ModelKind {
 }
 
 /// Render the full `<active-models-opts>` block for the currently configured
-/// models, or `None` when no catalog is available. Image and video sections
-/// render independently — an unavailable catalog suppresses only its own
-/// section. The returned snapshot records exactly which model ids were
-/// rendered (the persisted baseline must never be re-derived from config).
+/// models, or `None` when no section renders. Image and video sections render
+/// independently — an unavailable catalog suppresses only its own section, and
+/// static video-edit nuances still render without a catalog entry. The
+/// returned snapshot records exactly which model ids were rendered (the
+/// persisted baseline must never be re-derived from config).
 pub(crate) async fn render_block() -> Option<(String, ModelSnapshot)> {
     let current = ModelSnapshot::from_config();
     let (image, video) = tokio::join!(
@@ -118,7 +122,8 @@ pub(crate) async fn render_block() -> Option<(String, ModelSnapshot)> {
 
 /// Render one model's section for the block, or `None` when the model is
 /// absent from the catalog / the catalog is unavailable / the model declares
-/// no renderable capability envelope (a header-only section would be noise).
+/// no renderable capability envelope and has no static edit nuances (a
+/// header-only section would be noise).
 async fn render_side(kind: ModelKind, model: Option<&str>) -> Option<(String, String)> {
     let model = model?;
     let section = render_section(kind, model).await?;
@@ -127,9 +132,9 @@ async fn render_side(kind: ModelKind, model: Option<&str>) -> Option<(String, St
 
 /// Render the capability section for one model (used by the session-start
 /// block and the mid-session change-info). Returns `None` when the model is
-/// absent from the catalog or the catalog is unavailable — callers fall back
-/// to a change-only line. The catalog fetch is timeout-bounded internally
-/// (see [`crate::tools::catalog_cache`]).
+/// absent from the catalog, the catalog is unavailable, and the model has no
+/// static edit nuances — callers fall back to a change-only line. The catalog
+/// fetch is timeout-bounded internally (see [`crate::tools::catalog_cache`]).
 pub(crate) async fn render_section(kind: ModelKind, model: &str) -> Option<String> {
     match kind {
         ModelKind::Image => {
@@ -139,10 +144,12 @@ pub(crate) async fn render_section(kind: ModelKind, model: &str) -> Option<Strin
                 .and_then(|info| render_image_section(model, info))
         }
         ModelKind::Video => {
-            let catalog = video_catalog::get_catalog().await?;
-            catalog
-                .find(model)
-                .and_then(|info| render_video_section(model, info))
+            // Catalog fields are optional: static per-model edit nuances render
+            // even when the catalog is unavailable (fail-open must not drop
+            // nuance text on model switch).
+            let catalog = video_catalog::get_catalog().await;
+            let info = catalog.as_ref().and_then(|c| c.find(model));
+            render_video_section(model, info)
         }
     }
 }
@@ -198,64 +205,71 @@ fn render_image_section(model: &str, info: &ImageModelInfo) -> Option<String> {
 }
 
 /// Render the declared video capabilities (typed catalog fields only; the
-/// field names match the `video_gen` tool schema). `None` when the model
-/// declares no capability fields (a header-only section would be noise).
-fn render_video_section(model: &str, info: &VideoModelInfo) -> Option<String> {
+/// field names match the `video_gen` tool schema) plus the static per-model
+/// video-edit nuances. `None` when the model declares no capability fields
+/// and no nuance data (a header-only section would be noise).
+fn render_video_section(model: &str, info: Option<&VideoModelInfo>) -> Option<String> {
     let mut out = format!("Video model: {model}\n");
     let mut rendered = false;
-    if let Some(resolutions) = &info.resolutions
-        && !resolutions.is_empty()
-    {
-        rendered = true;
-        let _ = writeln!(
-            out,
-            "- resolution: {}",
-            join_capped(resolutions, MAX_LIST_VALUES)
-        );
+    if let Some(info) = info {
+        if let Some(resolutions) = &info.resolutions
+            && !resolutions.is_empty()
+        {
+            rendered = true;
+            let _ = writeln!(
+                out,
+                "- resolution: {}",
+                join_capped(resolutions, MAX_LIST_VALUES)
+            );
+        }
+        if let Some(ratios) = &info.aspect_ratios
+            && !ratios.is_empty()
+        {
+            rendered = true;
+            let _ = writeln!(
+                out,
+                "- aspect_ratio: {}",
+                join_capped(ratios, MAX_LIST_VALUES)
+            );
+        }
+        if let Some(durations) = &info.durations
+            && !durations.is_empty()
+        {
+            rendered = true;
+            let _ = writeln!(out, "- duration: {} seconds", format_durations(durations));
+        }
+        if let Some(sizes) = &info.sizes
+            && !sizes.is_empty()
+        {
+            rendered = true;
+            let _ = writeln!(out, "- size: {}", join_capped(sizes, MAX_LIST_VALUES));
+        }
+        if let Some(frames) = &info.frame_images
+            && !frames.is_empty()
+        {
+            rendered = true;
+            let _ = writeln!(
+                out,
+                "- frame images: {}",
+                join_capped(frames, MAX_LIST_VALUES)
+            );
+        }
+        if let Some(audio) = info.generate_audio {
+            rendered = true;
+            let _ = writeln!(
+                out,
+                "- generate_audio: {}",
+                if audio { "yes" } else { "no" }
+            );
+        }
+        if let Some(seed) = info.seed {
+            rendered = true;
+            let _ = writeln!(out, "- seed: {}", if seed { "yes" } else { "no" });
+        }
     }
-    if let Some(ratios) = &info.aspect_ratios
-        && !ratios.is_empty()
-    {
+    if let Some(nuance) = crate::tools::video_edit::video_edit_nuances(model) {
         rendered = true;
-        let _ = writeln!(
-            out,
-            "- aspect_ratio: {}",
-            join_capped(ratios, MAX_LIST_VALUES)
-        );
-    }
-    if let Some(durations) = &info.durations
-        && !durations.is_empty()
-    {
-        rendered = true;
-        let _ = writeln!(out, "- duration: {} seconds", format_durations(durations));
-    }
-    if let Some(sizes) = &info.sizes
-        && !sizes.is_empty()
-    {
-        rendered = true;
-        let _ = writeln!(out, "- size: {}", join_capped(sizes, MAX_LIST_VALUES));
-    }
-    if let Some(frames) = &info.frame_images
-        && !frames.is_empty()
-    {
-        rendered = true;
-        let _ = writeln!(
-            out,
-            "- frame images: {}",
-            join_capped(frames, MAX_LIST_VALUES)
-        );
-    }
-    if let Some(audio) = info.generate_audio {
-        rendered = true;
-        let _ = writeln!(
-            out,
-            "- generate_audio: {}",
-            if audio { "yes" } else { "no" }
-        );
-    }
-    if let Some(seed) = info.seed {
-        rendered = true;
-        let _ = writeln!(out, "- seed: {}", if seed { "yes" } else { "no" });
+        let _ = writeln!(out, "- editing: {nuance}");
     }
     rendered.then_some(out)
 }
@@ -412,21 +426,21 @@ mod tests {
     #[test]
     fn video_section_skips_empty_and_uncapped_lists() {
         // Declared-but-empty lists must not render dangling lines — a model
-        // with no declared fields renders no envelope at all.
+        // with no declared fields and no nuance data renders no envelope at all.
         let empty = VideoModelInfo {
             resolutions: Some(vec![]),
             durations: Some(vec![]),
             frame_images: Some(vec![]),
             ..VideoModelInfo::default()
         };
-        assert!(render_video_section("minimax/hailuo-3", &empty).is_none());
+        assert!(render_video_section("no-nuance-model", Some(&empty)).is_none());
 
         // Long frame-image lists go through the cap like every other list.
         let many_frames = VideoModelInfo {
             frame_images: Some((0..20).map(|i| format!("frame{i}")).collect()),
             ..VideoModelInfo::default()
         };
-        let out = render_video_section("m", &many_frames).expect("envelope rendered");
+        let out = render_video_section("m", Some(&many_frames)).expect("envelope rendered");
         assert!(out.contains("- frame images: frame0, frame1, frame2, frame3, frame4, frame5, frame6, frame7, frame8, frame9, frame10, frame11, frame12, frame13, frame14, frame15, +4 more\n"));
     }
 
@@ -441,7 +455,7 @@ mod tests {
             generate_audio: Some(true),
             seed: Some(false),
         };
-        let out = render_video_section("minimax/hailuo-3", &info).expect("envelope rendered");
+        let out = render_video_section("minimax/hailuo-3", Some(&info)).expect("envelope rendered");
         assert!(out.starts_with("Video model: minimax/hailuo-3\n"));
         assert!(out.contains("- resolution: 2K\n"));
         assert!(!out.contains("aspect_ratio"));
@@ -450,5 +464,23 @@ mod tests {
         assert!(out.contains("- frame images: first_frame, last_frame\n"));
         assert!(out.contains("- generate_audio: yes\n"));
         assert!(out.contains("- seed: no\n"));
+        assert!(out.contains("- editing: localized instruction edits"));
+    }
+
+    #[test]
+    fn video_section_renders_edit_nuances_without_catalog() {
+        // Static per-model edit nuances render even with no catalog entry —
+        // fail-open must not drop nuance text when the catalog is unavailable.
+        let hailuo = render_video_section("minimax/hailuo-3", None).expect("nuance rendered");
+        assert!(hailuo.starts_with("Video model: minimax/hailuo-3\n"));
+        assert!(hailuo.contains("- editing: localized instruction edits"));
+        assert!(!hailuo.contains("- duration:"));
+        let seedance =
+            render_video_section("bytedance/seedance-2.5", None).expect("nuance rendered");
+        assert!(seedance.contains("- editing: whole-frame restyle"));
+        // Edit vs generation disambiguation: the catalog duration range is
+        // generation-only, so the Artist is not misled into passing it for edits.
+        assert!(seedance.contains("applies to generation, not edits"));
+        assert!(render_video_section("unknown/model", None).is_none());
     }
 }

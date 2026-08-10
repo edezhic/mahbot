@@ -337,7 +337,8 @@ impl Session {
 
         // Artist sessions carry the <active-models-opts> block: the active
         // image/video models' parameter envelope, rendered from the live
-        // catalogs. Fail-open — no block when the catalogs are unavailable.
+        // catalogs plus static per-model video-edit nuances. Fail-open — no
+        // block when nothing renders (catalogs unavailable, no nuances).
         let mut snapshot = ModelSnapshot::default();
         if matches!(role, Role::Artist)
             && let Some((block, rendered)) = crate::tools::active_models::render_block().await
@@ -484,8 +485,8 @@ impl Session {
     }
 
     /// Build a change-info block for one model: "old → new" plus the new
-    /// model's capabilities from the catalog; a change-only line when the
-    /// catalog is unavailable (fail-open — no capabilities to render).
+    /// model's capabilities from the catalog (or its static edit nuances when
+    /// the catalog is unavailable); a change-only line when neither renders.
     async fn model_change_block(kind: ModelKind, old: &str, new: &str) -> String {
         match crate::tools::active_models::render_section(kind, new).await {
             Some(section) => format!(
