@@ -640,6 +640,12 @@ impl RetryLoop {
     /// the wall cap cannot be overshot by a backoff. Returns
     /// `Err(FailureClass::Shutdown)` when the global shutdown token fires
     /// during the sleep.
+    ///
+    /// `attempt` is the backoff-schedule index (`attempt - 1`) and the guard
+    /// trigger (no sleep when `attempt >= max_attempts`), normally the 1-based
+    /// index of the attempt that just completed. Callers indexing by a
+    /// separate counter (e.g. consecutive transport failures) must add their
+    /// own round-based guard — the final-attempt skip does not fire for them.
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) async fn sleep_between(&self, attempt: u32) -> Result<(), FailureClass> {
         if attempt >= self.policy.max_attempts {

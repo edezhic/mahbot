@@ -1601,8 +1601,9 @@ async fn synthesize(
                     break;
                 }
                 transport_failures += 1;
-                if let Err(FailureClass::Shutdown) =
-                    loop_state.sleep_between(transport_failures).await
+                if attempt < policy.max_attempts
+                    && let Err(FailureClass::Shutdown) =
+                        loop_state.sleep_between(transport_failures).await
                 {
                     break;
                 }
