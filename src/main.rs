@@ -58,13 +58,11 @@ fn personal_workspace(msg: &ChannelMessage) -> Workspace {
 
 /// Handle a dynamic option callback (prefixed `__opt__`).
 ///
-/// Parses the callback data, constructs an injected user message
-/// (e.g. "mahbot-123 - A"), and routes it to the Manager session,
+/// Constructs an injected user message (e.g. "mahbot-123 - A") from the
+/// already-decoded callback data, and routes it to the Manager session,
 /// bypassing the user's currently active role.
-async fn handle_option_callback(mut msg: ChannelMessage) {
-    let Some((ticket_id, label)) = decode_callback(&msg.content) else {
-        return;
-    };
+async fn handle_option_callback(mut msg: ChannelMessage, decoded: (Option<String>, String)) {
+    let (ticket_id, label) = decoded;
 
     // Construct the injected user message
     msg.content = match &ticket_id {
@@ -578,8 +576,8 @@ async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMe
 
         // Handle dynamic option callbacks — route directly to Manager
         // session, bypassing the user's currently active role.
-        if decode_callback(&msg.content).is_some() {
-            spawn(handle_option_callback(msg));
+        if let Some(decoded) = decode_callback(&msg.content) {
+            spawn(handle_option_callback(msg, decoded));
             continue;
         }
 
@@ -587,8 +585,8 @@ async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMe
         // updates config / clears session without involving the Manager agent.
         // Spawned (like __opt__ callbacks) so a slow catalog validation in
         // set_image_model never stalls the shared dispatch loop.
-        if decode_action(&msg.content).is_some() {
-            spawn(handle_action_callback(msg));
+        if let Some(decoded) = decode_action(&msg.content) {
+            spawn(handle_action_callback(msg, decoded));
             continue;
         }
 
@@ -993,11 +991,8 @@ async fn handle_board_listing(msg: &ChannelMessage, ws_name: &str) {
 /// Handle an action callback (`__act__` prefix).
 ///
 /// Actions are processed inline without involving the Manager agent queue.
-async fn handle_action_callback(msg: ChannelMessage) {
-    let Some((action, payload)) = decode_action(&msg.content) else {
-        tracing::warn!("Malformed __act__ callback data: {}", &msg.content);
-        return;
-    };
+async fn handle_action_callback(msg: ChannelMessage, decoded: (String, String)) {
+    let (action, payload) = decoded;
 
     match action.as_str() {
         "set_image_model" => {
