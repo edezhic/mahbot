@@ -2393,6 +2393,25 @@ pub async fn restart_telegram_listener(new_token: Option<&str>) -> anyhow::Resul
     Ok(())
 }
 
+/// Send a message directly through the registered Telegram channel, bypassing
+/// the router (no broadcast/persist). Errors if the channel is missing from
+/// the registry or the transport send fails.
+pub async fn send_direct(
+    recipient: &str,
+    content: String,
+    reply_markup: Option<serde_json::Value>,
+) -> anyhow::Result<()> {
+    let Some(channel) = crate::channel_registry().get("telegram") else {
+        anyhow::bail!("Telegram channel not found in registry");
+    };
+    let reply = SendMessage {
+        content,
+        recipient: recipient.to_string(),
+        reply_markup,
+    };
+    channel.send(&reply).await
+}
+
 /// Mirror a GUI user's message to their Telegram chats as a blockquote, so conversation history is readable from both surfaces.
 ///
 /// This should be called before enrichment to preserve the original

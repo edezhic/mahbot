@@ -628,17 +628,10 @@ async fn handle_bot_command(msg: &ChannelMessage) -> bool {
     true
 }
 
-/// Send a plain-text reply directly on the message's channel (no router
+/// Send a plain-text reply directly on the Telegram channel (no router
 /// broadcast/persist — used for command responses, not agent replies).
 async fn send_telegram_reply(msg: &ChannelMessage, content: String) {
-    let reply = mahbot::SendMessage {
-        content,
-        recipient: msg.reply_target.clone(),
-        reply_markup: None,
-    };
-    if let Some(channel) = mahbot::channel_registry().get(&msg.channel) {
-        let _ = channel.send(&reply).await;
-    }
+    let _ = mahbot::channels::telegram::send_direct(&msg.reply_target, content, None).await;
 }
 
 /// Handle a role-switch command (`/role_name`) — pool-gated, persists the
@@ -743,22 +736,17 @@ async fn deliver_clear_reply(
 /// the image or video model selection keyboard (Artist role).
 async fn handle_models_command(msg: &ChannelMessage, is_image: bool) {
     let reply_markup = build_models_keyboard(is_image);
-    let reply = mahbot::SendMessage {
-        content: if is_image {
-            "Select an image model:".to_string()
-        } else {
-            "Select a video model:".to_string()
-        },
-        recipient: msg.reply_target.clone(),
-        reply_markup: Some(reply_markup),
+    let content = if is_image {
+        "Select an image model:".to_string()
+    } else {
+        "Select a video model:".to_string()
     };
     // Send directly through the channel so the inline_keyboard structure
     // (rows of buttons) is preserved exactly — the router delivery path
     // has no inline-keyboard support, so this bypasses it for multi-row
     // replies like the model menus.
-    if let Some(channel) = mahbot::channel_registry().get(&msg.channel) {
-        let _ = channel.send(&reply).await;
-    }
+    let _ = mahbot::channels::telegram::send_direct(&msg.reply_target, content, Some(reply_markup))
+        .await;
 }
 
 /// Build inline keyboard for image or video model selection.

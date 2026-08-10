@@ -503,18 +503,14 @@ pub async fn notify_admin(message: &str, target: Option<&str>) {
         return;
     };
 
-    let Some(channel) = crate::channel_registry().get("telegram") else {
+    if crate::channel_registry().get("telegram").is_none() {
         warn!("Telegram channel not found in registry — cannot send update notification");
         return;
-    };
+    }
 
-    let reply = crate::SendMessage {
-        content: message.to_string(),
-        recipient: recipient.to_string(),
-        reply_markup: None,
-    };
-
-    if let Err(e) = channel.send(&reply).await {
+    if let Err(e) =
+        crate::channels::telegram::send_direct(recipient, message.to_string(), None).await
+    {
         error!(error = %e, "Failed to send update notification to admin");
     }
 }
