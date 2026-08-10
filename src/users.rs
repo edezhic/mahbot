@@ -686,6 +686,32 @@ pub fn personal_workspace_struct(user_name: &str, path: &Path) -> Workspace {
     ws
 }
 
+/// Resolve the workspace for a user, falling back to a personal workspace
+/// if `get_workspace` fails or returns `None`.
+pub async fn resolve_workspace_for_user_name(user_name: &str) -> Workspace {
+    match get_workspace(user_name).await {
+        Ok(Some(ws)) => ws,
+        Ok(None) => {
+            warn!(
+                user_name = %user_name,
+                "workspace resolution: selected_workspace points to non-existent workspace; \
+                 falling back to personal workspace",
+            );
+            let path = personal_workspace_path(user_name);
+            personal_workspace_struct(user_name, &path)
+        }
+        Err(e) => {
+            warn!(
+                user_name = %user_name,
+                error = %e,
+                "workspace resolution: database error; falling back to personal workspace",
+            );
+            let path = personal_workspace_path(user_name);
+            personal_workspace_struct(user_name, &path)
+        }
+    }
+}
+
 /// Get the active role for a user, if any.
 pub async fn get_active_role(user_name: &str) -> Result<Option<String>> {
     store().get_active_role(user_name).await

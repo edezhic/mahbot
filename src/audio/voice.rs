@@ -4311,37 +4311,6 @@ async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace
     }
 }
 
-/// Resolve the workspace for a voice operation from the acting user's DB
-/// record, falling back to the user's personal workspace on missing or
-/// stale values — mirrors the chat-side resolution pattern (DB workspace,
-/// warning + personal fallback).
-async fn resolve_workspace_for_voice(user_name: &str) -> crate::Workspace {
-    match crate::users::get_workspace(user_name).await {
-        Ok(Some(ws)) => ws,
-        Ok(None) => {
-            warn!(
-                user_name = %user_name,
-                "workspace resolution: selected_workspace points to non-existent workspace; \
-                 falling back to personal workspace",
-            );
-            personal_workspace_for_voice(user_name)
-        }
-        Err(e) => {
-            warn!(
-                user_name = %user_name,
-                error = %e,
-                "workspace resolution: database error; falling back to personal workspace",
-            );
-            personal_workspace_for_voice(user_name)
-        }
-    }
-}
-
-fn personal_workspace_for_voice(user_name: &str) -> crate::Workspace {
-    let path = crate::users::personal_workspace_path(user_name);
-    crate::users::personal_workspace_struct(user_name, &path)
-}
-
 /// Route a transcribed voice command to the appropriate agent.
 ///
 /// Resolves the active user's role and workspace from the user's DB record,
@@ -4359,7 +4328,7 @@ async fn route_to_agent(text: String) {
             info!("Voice command dropped (no active role) (user: {user_name}): {text}");
             return;
         };
-        let ws = resolve_workspace_for_voice(&user_name).await;
+        let ws = crate::users::resolve_workspace_for_user_name(&user_name).await;
         // Personal-workspace Manager→Analyst fallback, pool-clamped (canonical
         // helper shared with the chat routing path).
         let role = crate::users::resolve_effective_role(role, &ws.name, &pool);
@@ -4389,7 +4358,7 @@ async fn route_to_agent(text: String) {
     // like the active-user path: an emptied admin pool drops the command,
     // and the routed role stays inside the pool — including the same
     // personal-workspace Manager→Analyst clamp.
-    let ws = resolve_workspace_for_voice("admin").await;
+    let ws = crate::users::resolve_workspace_for_user_name("admin").await;
     let admin_pool = crate::users::role_pool("admin").await;
     if admin_pool.is_empty() {
         info!("Voice command dropped (no active role) (user: admin): {text}");
@@ -5691,7 +5660,7 @@ impl PipelineCtx {
         if user_name.is_empty() {
             return;
         }
-        let ws = resolve_workspace_for_voice(&user_name).await;
+        let ws = crate::users::resolve_workspace_for_user_name(&user_name).await;
         crate::channels::broadcast_and_persist_agent_response(
             &user_name,
             "voice",

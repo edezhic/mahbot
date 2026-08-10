@@ -28,34 +28,6 @@ const JETBRAINS_MONO_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Regul
 /// JetBrainsMono-Bold.ttf embedded for header text in the Iced dashboard.
 const JETBRAINS_MONO_BOLD_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Bold.ttf");
 
-/// Resolve the workspace for a user, falling back to a personal workspace
-/// if `get_workspace` fails or returns `None`.
-async fn resolve_workspace_for_user(msg: &ChannelMessage) -> Workspace {
-    match mahbot::users::get_workspace(&msg.user_name).await {
-        Ok(Some(ws)) => return ws,
-        Ok(None) => {
-            tracing::warn!(
-                user_name = %msg.user_name,
-                "workspace resolution: selected_workspace points to non-existent workspace; \
-                 falling back to personal workspace",
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                user_name = %msg.user_name,
-                error = %e,
-                "workspace resolution: database error; falling back to personal workspace",
-            );
-        }
-    }
-    personal_workspace(msg)
-}
-
-fn personal_workspace(msg: &ChannelMessage) -> Workspace {
-    let path = mahbot::users::personal_workspace_path(&msg.user_name);
-    mahbot::users::personal_workspace_struct(&msg.user_name, &path)
-}
-
 /// Handle a dynamic option callback (prefixed `__opt__`).
 ///
 /// Constructs an injected user message (e.g. "mahbot-123 - A") from the
@@ -70,7 +42,7 @@ async fn handle_option_callback(mut msg: ChannelMessage, decoded: (Option<String
         None => label,
     };
 
-    let ws = resolve_workspace_for_user(&msg).await;
+    let ws = mahbot::users::resolve_workspace_for_user_name(&msg.user_name).await;
 
     // Route directly to Manager session, bypassing resolve_active_role.
     // Enrichment is skipped — synthetic callback text has no media markers or URLs.
@@ -726,7 +698,7 @@ async fn handle_start_command(msg: &ChannelMessage) {
 /// deletes the current session and confirms via the canonical delivery path.
 async fn handle_clear_session(msg: &ChannelMessage) {
     let (ws, pool) = tokio::join!(
-        resolve_workspace_for_user(msg),
+        mahbot::users::resolve_workspace_for_user_name(&msg.user_name),
         mahbot::users::role_pool(&msg.user_name),
     );
     // Analyst fallback: an empty-pool user has no agent session to clear, so
@@ -1092,7 +1064,7 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     );
 
     let (ws, (pool, pool_read_failed)) = tokio::join!(
-        resolve_workspace_for_user(&msg),
+        mahbot::users::resolve_workspace_for_user_name(&msg.user_name),
         mahbot::users::role_pool_status(&msg.user_name),
     );
     let role = mahbot::users::resolve_active_role_from_pool(&msg.user_name, &pool).await;
