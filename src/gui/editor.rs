@@ -3816,31 +3816,35 @@ impl EditorState {
         iced::widget::operation::focus::<EditorMessage>(Id::new(FIND_SEARCH_ID))
     }
 
-    /// Handle find-query-input — updates the search query and recomputes matches.
-    fn find_query_input(&mut self, query: String) -> Task<EditorMessage> {
+    /// Run a mutation against the active tab's find state, if any.
+    fn with_active_find_state(
+        &mut self,
+        f: impl FnOnce(&mut FindReplaceState, &EditorBuffer),
+    ) -> Task<EditorMessage> {
         let Some((_, path)) = self.active_tab() else {
             return Task::none();
         };
-        if let Some(tab_data) = self.tab_contents.get_mut(&path) {
-            if let Some(ref mut state) = tab_data.find_replace_state {
-                state.query = query;
-                state.recompute(&tab_data.content);
-            }
+        if let Some(tab_data) = self.tab_contents.get_mut(&path)
+            && let Some(state) = tab_data.find_replace_state.as_mut()
+        {
+            f(state, &tab_data.content);
         }
         Task::none()
     }
 
+    /// Handle find-query-input — updates the search query and recomputes matches.
+    fn find_query_input(&mut self, query: String) -> Task<EditorMessage> {
+        self.with_active_find_state(|state, content| {
+            state.query = query;
+            state.recompute(content);
+        })
+    }
+
     /// Handle find-replace-input — updates the replace text.
     fn find_replace_input(&mut self, replace: String) -> Task<EditorMessage> {
-        let Some((_, path)) = self.active_tab() else {
-            return Task::none();
-        };
-        if let Some(tab_data) = self.tab_contents.get_mut(&path) {
-            if let Some(ref mut state) = tab_data.find_replace_state {
-                state.replace = replace;
-            }
-        }
-        Task::none()
+        self.with_active_find_state(|state, _| {
+            state.replace = replace;
+        })
     }
 
     /// Handle find-replace — replaces the current match and advances to the next.
@@ -3934,16 +3938,10 @@ impl EditorState {
 
     /// Handle find-toggle-case-sensitivity — toggles case-sensitive search.
     fn find_toggle_case_sensitivity(&mut self) -> Task<EditorMessage> {
-        let Some((_, path)) = self.active_tab() else {
-            return Task::none();
-        };
-        if let Some(tab_data) = self.tab_contents.get_mut(&path) {
-            if let Some(ref mut state) = tab_data.find_replace_state {
-                state.case_sensitive = !state.case_sensitive;
-                state.recompute(&tab_data.content);
-            }
-        }
-        Task::none()
+        self.with_active_find_state(|state, content| {
+            state.case_sensitive = !state.case_sensitive;
+            state.recompute(content);
+        })
     }
 
     /// Handle refresh-file-tree — re-reads all expanded directories from disk.
@@ -4226,32 +4224,25 @@ impl EditorState {
     /// Navigate to the next or previous find match in the active tab.
     /// Returns silently if there is no active tab, no find state, or no matches.
     fn navigate_find_match(&mut self, direction: FindDirection) -> Task<EditorMessage> {
-        let Some((_, path)) = self.active_tab() else {
-            return Task::none();
-        };
-        if let Some(tab_data) = self.tab_contents.get_mut(&path) {
-            if let Some(ref mut state) = tab_data.find_replace_state {
-                if !state.matches.is_empty() {
-                    let new_idx = match direction {
-                        FindDirection::Next => (state.current_match_idx + 1) % state.matches.len(),
-                        FindDirection::Prev => {
-                            if state.current_match_idx == 0 {
-                                state.matches.len().saturating_sub(1)
-                            } else {
-                                state.current_match_idx - 1
-                            }
+        self.with_active_find_state(|state, content| {
+            if !state.matches.is_empty() {
+                let new_idx = match direction {
+                    FindDirection::Next => (state.current_match_idx + 1) % state.matches.len(),
+                    FindDirection::Prev => {
+                        if state.current_match_idx == 0 {
+                            state.matches.len().saturating_sub(1)
+                        } else {
+                            state.current_match_idx - 1
                         }
-                    };
-                    state.current_match_idx = new_idx;
-                    if let Some(range) = state.matches.get(new_idx) {
-                        let (line, col) =
-                            byte_offset_to_line_col(&tab_data.content.text(), range.start);
-                        tab_data.content.move_to(line, col);
                     }
+                };
+                state.current_match_idx = new_idx;
+                if let Some(range) = state.matches.get(new_idx) {
+                    let (line, col) = byte_offset_to_line_col(&content.text(), range.start);
+                    content.move_to(line, col);
                 }
             }
-        }
-        Task::none()
+        })
     }
 
     /// Shared helper for navigating search results — adjusts the selected index

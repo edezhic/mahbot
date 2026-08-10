@@ -3321,44 +3321,14 @@ fn map_key_to_action(
                 let ctrl = modifiers.control();
                 if ctrl && !modifiers.command() {
                     match latin {
-                        Some('f') => {
-                            return Some(EditorAction::Move {
-                                direction: CursorMove::Right,
-                                select: false,
-                            });
-                        }
-                        Some('b') => {
-                            return Some(EditorAction::Move {
-                                direction: CursorMove::Left,
-                                select: false,
-                            });
-                        }
-                        Some('a') => {
-                            return Some(EditorAction::Move {
-                                direction: CursorMove::Home,
-                                select: false,
-                            });
-                        }
-                        Some('e') => {
-                            return Some(EditorAction::Move {
-                                direction: CursorMove::End,
-                                select: false,
-                            });
-                        }
+                        Some('f') => return mv(CursorMove::Right, false),
+                        Some('b') => return mv(CursorMove::Left, false),
+                        Some('a') => return mv(CursorMove::Home, false),
+                        Some('e') => return mv(CursorMove::End, false),
                         Some('h') => return Some(EditorAction::Backspace),
                         Some('d') => return Some(EditorAction::Delete),
-                        Some('n') => {
-                            return Some(EditorAction::Move {
-                                direction: CursorMove::Down,
-                                select: false,
-                            });
-                        }
-                        Some('p') => {
-                            return Some(EditorAction::Move {
-                                direction: CursorMove::Up,
-                                select: false,
-                            });
-                        }
+                        Some('n') => return mv(CursorMove::Down, false),
+                        Some('p') => return mv(CursorMove::Up, false),
                         _ => {}
                     }
                 }
