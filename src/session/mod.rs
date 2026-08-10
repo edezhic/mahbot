@@ -200,29 +200,19 @@ pub(crate) struct SessionContext {
     pub role: String,
 }
 
-/// Parse an RFC 3339 timestamp string, falling back to `Utc::now()` on failure.
-///
-/// Logs a warning with the field name, the raw value, and the parse error
-/// when falling back.
-#[must_use]
-fn parse_ts_or_now(s: &str, label: &str) -> DateTime<Utc> {
-    turso::parse_utc_timestamp(s).unwrap_or_else(|e| {
-        tracing::warn!(
-            field = %label,
-            value = %s,
-            error = %e,
-            "Failed to parse timestamp {label}, falling back to Utc::now()",
-        );
-        Utc::now()
-    })
-}
-
-fn session_metadata_from_row(agent_id: &str, activity_str: &str, count: i64) -> SessionMetadata {
-    SessionMetadata {
+fn session_metadata_from_row(
+    agent_id: &str,
+    activity_str: &str,
+    count: i64,
+) -> Result<SessionMetadata> {
+    let last_activity = turso::parse_utc_timestamp(activity_str).with_context(|| {
+        format!("invalid last_activity {activity_str:?} for session {agent_id}")
+    })?;
+    Ok(SessionMetadata {
         agent_id: agent_id.to_string(),
-        last_activity: parse_ts_or_now(activity_str, "last_activity"),
+        last_activity,
         message_count: usize::try_from(count).unwrap_or(0),
-    }
+    })
 }
 
 /// Insert messages into `sessions` and upsert `session_metadata` within an existing transaction.
@@ -345,11 +335,11 @@ async fn list_sessions_where(
         ),
         params,
         |row| {
-            Ok::<_, anyhow::Error>(session_metadata_from_row(
+            session_metadata_from_row(
                 &row.get::<String>(COL_SL_AGENT_ID)?,
                 &row.get::<String>(COL_SL_LAST_ACTIVITY)?,
                 row.get::<i64>(COL_SL_MESSAGE_COUNT)?,
-            ))
+            )
         },
         warn_context,
         None,
@@ -1393,21 +1383,6 @@ mod transient_prefix_tests {
         assert_ne!(key, "manager_ws", "capital-M 'Manager' should NOT match");
         assert_eq!(key, "gui_carol_ws_Manager");
     }
-}
-
-#[test]
-fn parse_ts_or_now_invalid_fallback() {
-    let before = Utc::now();
-    let ts = parse_ts_or_now("garbage-input", "test_invalid");
-    let after = Utc::now();
-    assert!(
-        ts >= before - chrono::Duration::seconds(1),
-        "fallback ts {ts} should not be before {before}",
-    );
-    assert!(
-        ts <= after + chrono::Duration::seconds(1),
-        "fallback ts {ts} should not be after {after}",
-    );
 }
 
 // ── Native history decoding ────────────────────────────────────
