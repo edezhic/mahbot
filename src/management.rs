@@ -3289,7 +3289,6 @@ async fn working_tree_churn(repo_path: &Path) -> anyhow::Result<(i64, i64, usize
 /// base. The caller freezes AFTER the round actually dispatched (phase
 /// re-check passed) so a false-start dispatch never freezes a base computed
 /// from a diff that was never reviewed.
-#[allow(clippy::too_many_lines)]
 async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> (usize, Option<i64>) {
     let low =
         i64::try_from(crate::joint_verdict::DEFAULT_REVIEW_COUNT_LOW_CHURN).unwrap_or(i64::MAX);
