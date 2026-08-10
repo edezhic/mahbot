@@ -29,7 +29,7 @@ use tracing::{debug, error, info, warn};
 use futures_util::FutureExt;
 use futures_util::future::join_all;
 
-use crate::agent::run_agent;
+use crate::agent::{RETRY_EXHAUSTION_MARKER, run_agent};
 use crate::board::{BOARD, BoardStore, PipelineCheck, Ticket, TicketComment, TicketPhase};
 use crate::git_commands::{
     has_unstaged_changes, list_new_or_untracked_files, parse_new_files_from_porcelain,
@@ -1202,9 +1202,10 @@ fn engineer_failure_comment(shutdown: bool, cancelled: bool, error: Option<&str>
         crate::util::FAILURE_DETAIL_CAP,
         "engineer failure",
     );
-    // Matches the agent-loop exhaustion marker ("exhausted retry budget") so
-    // retry exhaustion keeps its dedicated classification.
-    if detail.contains("exhausted retry budget") {
+    // Matches the single-sourced agent-loop exhaustion marker
+    // (crate::agent::RETRY_EXHAUSTION_MARKER) so retry exhaustion keeps its
+    // dedicated classification.
+    if detail.contains(RETRY_EXHAUSTION_MARKER) {
         format!("Engineer failed: LLM provider retry exhaustion.\n\n{detail}")
     } else {
         format!("Engineer failed.\n\n{detail}")
@@ -2477,16 +2478,7 @@ async fn run_parallel_agents(
                         // Preserve the failure reason (full chain, scrubbed) so
                         // the all-failed record and log carry the real cause
                         // instead of a generic "no response".
-                        let reason = if crate::shutdown::shutdown_token().is_cancelled() {
-                            "service shutting down".to_string()
-                        } else if agent.is_cancelled() {
-                            "agent cancelled by user".to_string()
-                        } else {
-                            agent
-                                .failure
-                                .clone()
-                                .unwrap_or_else(|| "agent produced no response".to_string())
-                        };
+                        let reason = agent.failure_reason("agent produced no response");
                         return ParallelVerdict::NoResponse(crate::util::scrub_credentials(
                             &reason,
                         ));

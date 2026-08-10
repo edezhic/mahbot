@@ -68,6 +68,11 @@ const MAX_LLM_ITERATIONS: usize = 1000;
 /// Longer arguments are truncated at a UTF-8-safe boundary.
 const MAX_STATS_ARG_LENGTH: usize = 500;
 
+/// Retry-exhaustion marker shared by the producer contexts
+/// (`llm_call`/`summarize`) and the `engineer_failure_comment` match; drift is
+/// cosmetic-only (typed classification uses `RetryExhausted`).
+pub(crate) const RETRY_EXHAUSTION_MARKER: &str = "exhausted retry budget";
+
 /// Extract file paths from successful media-generation tool outcomes.
 ///
 /// Scans the zipped tool calls and outcomes for media-generation tools,
@@ -223,6 +228,20 @@ impl Agent {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancel_token.is_cancelled()
+    }
+
+    /// Human-readable failure reason with the same global-token-first ordering
+    /// as [`failure_classification`]: shutdown cancels every per-agent token,
+    /// so the global token must be checked before a user cancel is reported.
+    #[must_use]
+    pub(crate) fn failure_reason(&self, fallback: &str) -> String {
+        if crate::shutdown::shutdown_token().is_cancelled() {
+            "service shutting down".to_string()
+        } else if self.is_cancelled() {
+            "agent cancelled by user".to_string()
+        } else {
+            self.failure.clone().unwrap_or_else(|| fallback.to_string())
+        }
     }
 
     /// Run a complete agent turn: initialize session, work loop (with shutdown
@@ -547,7 +566,7 @@ impl Agent {
         let policy = crate::retry::RetryPolicy::current();
         crate::retry::agent_chat(request, &policy)
             .await
-            .with_context(|| "LLM call exhausted retry budget")
+            .with_context(|| format!("LLM call {RETRY_EXHAUSTION_MARKER}"))
     }
 
     /// Log tool-call notifications
@@ -783,7 +802,7 @@ impl Agent {
             &policy,
         )
         .await
-        .with_context(|| "summarization LLM call exhausted retry budget")?;
+        .with_context(|| format!("summarization LLM call {RETRY_EXHAUSTION_MARKER}"))?;
 
         if let Some(ref u) = chat_resp.usage {
             tracing::debug!(

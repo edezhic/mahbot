@@ -548,16 +548,7 @@ async fn extract_findings(runs: Vec<AskRun>, deadline: std::time::Instant) -> Ve
                     }
                 };
                 let Some(raw) = response else {
-                    let reason = if crate::shutdown::shutdown_token().is_cancelled() {
-                        "service shutting down".to_string()
-                    } else if agent.is_cancelled() {
-                        "agent cancelled by user".to_string()
-                    } else {
-                        agent
-                            .failure
-                            .clone()
-                            .unwrap_or_else(|| "analyst produced no response".to_string())
-                    };
+                    let reason = agent.failure_reason("analyst produced no response");
                     return AnalystOutcome::NoResponse(crate::util::scrub_credentials(&reason));
                 };
                 if raw.trim().is_empty() {
