@@ -167,6 +167,13 @@ const PIPELINE_BLOCKING_PHASES: &[TicketPhase] = &[
     TicketPhase::SanitationPassed,
 ];
 
+/// The sanitation pipeline — only one ticket per workspace may be in these
+/// phases at a time (serialization enforced by [`BoardStore::claim_sanitation`]).
+///
+/// Subset of [`PIPELINE_BLOCKING_PHASES`].
+const SANITATION_PIPELINE_PHASES: &[TicketPhase] =
+    &[TicketPhase::InSanitation, TicketPhase::SanitationPassed];
+
 /// Pipeline-blocking phases that are transitory handoff states — no agent is
 /// mid-execution in these phases, so they don't need a reset transition. The
 /// poller picks them up within seconds.
@@ -1432,8 +1439,7 @@ impl BoardStore {
     /// Atomically transitions the ticket from [`TicketPhase::QaPassed`] to
     /// [`TicketPhase::InSanitation`], sets `assigned_to` to the caller-provided
     /// value, and enforces the per-workspace serialization invariant: only one
-    /// ticket at a time may be in [`TicketPhase::InSanitation`] or
-    /// [`TicketPhase::SanitationPassed`].
+    /// ticket at a time may be in `SANITATION_PIPELINE_PHASES`.
     ///
     /// Returns `Ok(true)` if the claim succeeded, `Ok(false)` if:
     /// - The ticket is no longer in QaPassed (already claimed by another handler), or
@@ -1444,8 +1450,7 @@ impl BoardStore {
     /// with no running agent, so cancellation is unnecessary.
     pub async fn claim_sanitation(&self, ticket_id: &str, assigned_to: &str) -> Result<bool> {
         let now = turso::now();
-        let blocker =
-            phase_list_sql_fragment(&[TicketPhase::InSanitation, TicketPhase::SanitationPassed]);
+        let blocker = phase_list_sql_fragment(SANITATION_PIPELINE_PHASES);
         let sql = format!(
             "UPDATE tickets SET phase = ?1, assigned_to = ?2, updated_at = ?3 \
              WHERE id = ?4 AND phase = ?5 AND is_archived = 0 \
