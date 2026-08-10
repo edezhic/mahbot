@@ -355,13 +355,6 @@ impl TelegramAttachmentKind {
 /// accepted edit inputs.
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 
-/// Check whether a file path has a recognized image extension.
-fn is_image_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
-}
-
 /// Format a sender label for display: `@username` if a username is present,
 /// otherwise the display name (first_name, or `"unknown"` as ultimate fallback).
 #[must_use]
@@ -393,8 +386,8 @@ fn format_attachment_content(
     local_path: &Path,
     mime_type: Option<&str>,
 ) -> String {
-    let is_image =
-        is_image_extension(local_path) || mime_type.is_some_and(|m| m.starts_with("image/"));
+    let is_image = crate::util::has_extension(local_path, IMAGE_EXTENSIONS)
+        || mime_type.is_some_and(|m| m.starts_with("image/"));
     let is_video = crate::util::is_video_extension(local_path)
         || mime_type.is_some_and(|m| m.starts_with("video/"));
     match kind {

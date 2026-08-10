@@ -1014,7 +1014,7 @@ fn attachment_content_format_rules() {
 
 #[test]
 fn attachment_multimodal_and_helpers() {
-    // is_image_extension
+    // has_extension over telegram's receive-path IMAGE_EXTENSIONS
     for p in [
         "photo.png",
         "photo.jpg",
@@ -1024,10 +1024,16 @@ fn attachment_multimodal_and_helpers() {
         "photo.bmp",
         "PHOTO.PNG",
     ] {
-        assert!(is_image_extension(std::path::Path::new(p)));
+        assert!(crate::util::has_extension(
+            std::path::Path::new(p),
+            super::IMAGE_EXTENSIONS
+        ));
     }
     for p in ["file.md", "file.txt", "file.pdf", "file.csv", "file"] {
-        assert!(!is_image_extension(std::path::Path::new(p)));
+        assert!(!crate::util::has_extension(
+            std::path::Path::new(p),
+            super::IMAGE_EXTENSIONS
+        ));
     }
     // is_video_extension
     for p in [

@@ -735,31 +735,31 @@ pub(crate) const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "he
 /// roots for the video-edit flow (the other being `generated/`).
 pub(crate) const TELEGRAM_FILES_DIR: &str = "mahbot_telegram_files";
 
+/// Check whether a path's extension (case-insensitive) belongs to `table`.
+#[must_use]
+pub(crate) fn has_extension(path: &std::path::Path, table: &[&str]) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| table.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
 /// Check whether a file path has a recognized video extension.
 #[must_use]
 pub(crate) fn is_video_extension(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+    has_extension(path, VIDEO_EXTENSIONS)
 }
 
 /// Check whether a file path has a video extension the transcription provider
 /// accepts (OpenRouter chat-completions video input).
 #[must_use]
 pub(crate) fn is_transcribable_video(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| {
-            TRANSCRIBABLE_VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
-        })
+    has_extension(path, TRANSCRIBABLE_VIDEO_EXTENSIONS)
 }
 
 /// Check whether a file path has a recognized image extension.
 #[must_use]
 pub(crate) fn is_image_extension(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+    has_extension(path, IMAGE_EXTENSIONS)
 }
 
 /// Map a file path's extension to a MIME type string.
