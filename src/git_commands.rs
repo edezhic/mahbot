@@ -329,25 +329,25 @@ pub async fn run_git_add_all(repo_path: &Path) -> anyhow::Result<String> {
 
 /// Run `git rev-parse HEAD` and return the trimmed commit hash.
 ///
-/// Returns `None` when HEAD cannot be resolved (e.g. a repository with no
-/// commits yet). Callers must treat `None` as unknown — never as a match.
-pub async fn run_git_head(repo_path: &Path) -> anyhow::Result<Option<String>> {
-    match run_git_command(repo_path, &["rev-parse", "HEAD"]).await {
-        Ok(out) => Ok(Some(out.trim().to_string())),
-        Err(_) => Ok(None),
-    }
+/// Errors when HEAD cannot be resolved (e.g. a repository with no commits
+/// yet). Callers that need unknown-as-`None` semantics should use `.ok()`.
+pub async fn run_git_head(repo_path: &Path) -> anyhow::Result<String> {
+    Ok(run_git_command(repo_path, &["rev-parse", "HEAD"])
+        .await?
+        .trim()
+        .to_string())
 }
 
 /// Run `git write-tree` and return the trimmed index tree hash.
 ///
-/// The tree hash identifies the exact staged content (index). Returns `None`
-/// when the index cannot be written (e.g. unmerged entries). Callers must
-/// treat `None` as unknown — never as a match.
-pub async fn run_git_write_tree(repo_path: &Path) -> anyhow::Result<Option<String>> {
-    match run_git_command(repo_path, &["write-tree"]).await {
-        Ok(out) => Ok(Some(out.trim().to_string())),
-        Err(_) => Ok(None),
-    }
+/// The tree hash identifies the exact staged content (index). Errors when the
+/// index cannot be written (e.g. unmerged entries). Callers that need
+/// unknown-as-`None` semantics should use `.ok()`.
+pub async fn run_git_write_tree(repo_path: &Path) -> anyhow::Result<String> {
+    Ok(run_git_command(repo_path, &["write-tree"])
+        .await?
+        .trim()
+        .to_string())
 }
 
 /// Stage all changes and commit with the given message.
@@ -363,8 +363,8 @@ pub async fn run_git_commit(repo_path: &Path, message: &str) -> anyhow::Result<C
         .context("Failed to commit changes")?;
 
     // Capture the full 40-char SHA — reliable source, not abbreviated.
-    let hash = match run_git_command(repo_path, &["rev-parse", "HEAD"]).await {
-        Ok(out) => out.trim().to_string(),
+    let hash = match run_git_head(repo_path).await {
+        Ok(hash) => hash,
         Err(e) => {
             warn!(
                 error = %e,
@@ -807,25 +807,17 @@ mod tests {
     #[tokio::test]
     async fn test_run_git_head_and_write_tree_fingerprint() {
         let (_dir, repo_path) = init_temp_repo();
-        let head1 = run_git_head(&repo_path)
-            .await
-            .expect("head query")
-            .expect("repo has commits");
+        let head1 = run_git_head(&repo_path).await.expect("repo has commits");
         let tree1 = run_git_write_tree(&repo_path)
             .await
-            .expect("tree query")
             .expect("index writable");
 
         // Staged content change → new index tree, unchanged HEAD.
         std::fs::write(repo_path.join("test.txt"), b"line1\nline2\n").expect("write file");
         run_git_add_all(&repo_path).await.expect("git add");
-        let head2 = run_git_head(&repo_path)
-            .await
-            .expect("head query")
-            .expect("repo has commits");
+        let head2 = run_git_head(&repo_path).await.expect("repo has commits");
         let tree2 = run_git_write_tree(&repo_path)
             .await
-            .expect("tree query")
             .expect("index writable");
         assert_eq!(head1, head2, "staging must not change HEAD");
         assert_ne!(tree1, tree2, "staging must change the index tree");
@@ -843,7 +835,7 @@ mod tests {
             .expect("git init");
         assert!(status.success());
 
-        let head = run_git_head(&repo_path).await.expect("head query");
+        let head = run_git_head(&repo_path).await.ok();
         assert!(head.is_none(), "commit-less repo must not resolve HEAD");
     }
 

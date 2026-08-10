@@ -1710,11 +1710,9 @@ async fn dispatch_verifiers_skip_review_when_content_matches_base() {
     // (HEAD + index tree of the clean committed tree).
     let head = crate::git_commands::run_git_head(&repo_path)
         .await
-        .expect("head query")
         .expect("repo has commits");
     let tree = crate::git_commands::run_git_write_tree(&repo_path)
         .await
-        .expect("tree query")
         .expect("index writable");
     board()
         .set_reviewed_base(&ticket_id, Some(&head), Some(&tree))

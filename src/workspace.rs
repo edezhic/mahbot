@@ -388,8 +388,7 @@ async fn finalize_discovery(
         // store NULL — this is not an error for the discovery itself.
         let commit_hash = crate::git_commands::run_git_head(std::path::Path::new(ws_path))
             .await
-            .ok()
-            .flatten();
+            .ok();
 
         if let Err(e) = storage
             .exec_update_with_updated_at(
@@ -1309,20 +1308,18 @@ pub async fn run_nightly_check_loop() {
             let repo_path = std::path::Path::new(&ws.path);
 
             // Run git rev-parse HEAD to get the current commit.
-            let current_hash =
-                match crate::git_commands::run_git_command(repo_path, &["rev-parse", "HEAD"]).await
-                {
-                    Ok(h) => h.trim().to_string(),
-                    Err(e) => {
-                        // Non-git workspace, no commits, or git not available — skip.
-                        tracing::debug!(
-                            workspace = %ws.name,
-                            error = %e,
-                            "Nightly check: git rev-parse HEAD failed — skipping workspace",
-                        );
-                        continue;
-                    }
-                };
+            let current_hash = match crate::git_commands::run_git_head(repo_path).await {
+                Ok(hash) => hash,
+                Err(e) => {
+                    // Non-git workspace, no commits, or git not available — skip.
+                    tracing::debug!(
+                        workspace = %ws.name,
+                        error = %e,
+                        "Nightly check: git rev-parse HEAD failed — skipping workspace",
+                    );
+                    continue;
+                }
+            };
 
             // Compare with the stored hash.
             let should_rediscover =

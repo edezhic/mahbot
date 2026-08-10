@@ -3224,12 +3224,12 @@ fn should_skip_review(
 
 /// Compute the skip-review decision for a ticket: fetch the current content
 /// identity (porcelain, HEAD, index tree) and compare it against the ticket's
-/// recorded reviewed base. Errors propagate to the caller, which must default
-/// to running the full review.
+/// recorded reviewed base. Porcelain errors propagate to the caller (full
+/// review fallback); HEAD/tree failures yield `None` — never a skip.
 async fn compute_review_skip(ticket: &Ticket, repo_path: &Path) -> anyhow::Result<bool> {
     let porcelain = run_git_status(repo_path).await?;
-    let head = run_git_head(repo_path).await?;
-    let tree = run_git_write_tree(repo_path).await?;
+    let head = run_git_head(repo_path).await.ok();
+    let tree = run_git_write_tree(repo_path).await.ok();
     if (head.is_none() || tree.is_none()) && ticket.reviewed_head.is_some() {
         warn!(
             ticket = %ticket.id,
@@ -3461,8 +3461,8 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
                 "Failed to stage changes after review — reviewed base not recorded",
             );
         } else {
-            let head = run_git_head(repo_path).await.ok().flatten();
-            let tree = run_git_write_tree(repo_path).await.ok().flatten();
+            let head = run_git_head(repo_path).await.ok();
+            let tree = run_git_write_tree(repo_path).await.ok();
             if head.is_none() || tree.is_none() {
                 warn!(
                     ticket = %ticket.id,
