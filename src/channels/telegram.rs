@@ -1486,6 +1486,35 @@ impl TelegramChannel {
         Some(ctx.into_channel_message(content, None))
     }
 
+    /// POST a JSON body to a Telegram API method; returns the response on 2xx
+    /// or `(status, body)` on failure. Network/transport errors map to
+    /// BAD_GATEWAY (no HTTP response exists).
+    async fn post_telegram_json(
+        &self,
+        method: &str,
+        body: serde_json::Value,
+        err_label: &str,
+    ) -> Result<reqwest::Response, (reqwest::StatusCode, String)> {
+        let resp = self
+            .http_client()
+            .post(self.api_url(method))
+            .json(&body)
+            .send()
+            .await
+            // Network/transport errors (connection refused, DNS failure, timeout) produce
+            // no HTTP response, so we use BAD_GATEWAY as a sentinel — it signals an upstream
+            // communication failure, not an actual HTTP-level error from the Telegram API.
+            .map_err(|e| (reqwest::StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+        let status = resp.status();
+        if status.is_success() {
+            Ok(resp)
+        } else {
+            let err_body = crate::util::http::read_error_body(resp, err_label).await;
+            Err((status, err_body))
+        }
+    }
+
     /// Send one Telegram text message, with optional `parse_mode`. Returns
     /// the Telegram message id on success (`None` when the 2xx body omits it
     /// — the message was still delivered; only the pin flow needs the id), or
@@ -1513,21 +1542,10 @@ impl TelegramChannel {
         }
 
         let resp = self
-            .http_client()
-            .post(self.api_url("sendMessage"))
-            .json(&body)
-            .send()
-            .await
-            // Network/transport errors (connection refused, DNS failure, timeout) produce
-            // no HTTP response, so we use BAD_GATEWAY as a sentinel — it signals an upstream
-            // communication failure, not an actual HTTP-level error from the Telegram API.
-            .map_err(|e| (reqwest::StatusCode::BAD_GATEWAY, e.to_string()))?;
+            .post_telegram_json("sendMessage", body, "sendMessage error")
+            .await?;
 
         let status = resp.status();
-        if !status.is_success() {
-            let err_body = crate::util::http::read_error_body(resp, "sendMessage error").await;
-            return Err((status, err_body));
-        }
         // A 2xx body without a parseable message_id is still a delivered
         // message: the shared send path only checks the status, so this must
         // not be treated as a failure.
@@ -1631,21 +1649,9 @@ impl TelegramChannel {
             body["parse_mode"] = serde_json::Value::String(mode.to_string());
         }
 
-        let resp = self
-            .http_client()
-            .post(self.api_url("editMessageText"))
-            .json(&body)
-            .send()
+        self.post_telegram_json("editMessageText", body, "editMessageText error")
             .await
-            .map_err(|e| (reqwest::StatusCode::BAD_GATEWAY, e.to_string()))?;
-
-        let status = resp.status();
-        if status.is_success() {
-            Ok(())
-        } else {
-            let err_body = crate::util::http::read_error_body(resp, "editMessageText error").await;
-            Err((status, err_body))
-        }
+            .map(|_| ())
     }
 
     /// Pin a message in a chat. Pins are always silent in private chats;
@@ -1661,21 +1667,9 @@ impl TelegramChannel {
             "disable_notification": true,
         });
 
-        let resp = self
-            .http_client()
-            .post(self.api_url("pinChatMessage"))
-            .json(&body)
-            .send()
+        self.post_telegram_json("pinChatMessage", body, "pinChatMessage error")
             .await
-            .map_err(|e| (reqwest::StatusCode::BAD_GATEWAY, e.to_string()))?;
-
-        let status = resp.status();
-        if status.is_success() {
-            Ok(())
-        } else {
-            let err_body = crate::util::http::read_error_body(resp, "pinChatMessage error").await;
-            Err((status, err_body))
-        }
+            .map(|_| ())
     }
 
     /// Send the role-switch success notification in a Telegram private chat,
