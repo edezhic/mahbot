@@ -210,24 +210,11 @@ pub(crate) fn render_joint_comment(
                         let _ = write!(out, "\n- {}", member_text(table, member));
                     }
                 }
-                // Code-computed ungrouped remainder — deterministic trailing
-                // section (every remaining item lands here exactly once).
-                if !output.ungrouped.is_empty() {
-                    out.push_str("\n\n**Ungrouped**");
-                    for member in &output.ungrouped {
-                        let mut line = member_text(table, member);
-                        for reference in references.iter().filter(|r| r.member.id == member.id) {
-                            if let Some(group) = output.groups.get(reference.group) {
-                                let _ = write!(
-                                    line,
-                                    " [DISPUTED — contradicts group {} \"{}\"]",
-                                    reference.group, group.heading
-                                );
-                            }
-                        }
-                        let _ = write!(out, "\n- {line}");
-                    }
-                }
+                out.push_str(&crate::consensus::render_ungrouped_section(
+                    output,
+                    references,
+                    |member, disputed| member_text(table, member) + disputed,
+                ));
             }
             crate::consensus::RepairOutcome::Fallback => {
                 // Deterministic fail-open: raw per-agent issue dump + marker

@@ -229,6 +229,35 @@ pub(crate) fn numbered_items_material(items_by_agent: &[Vec<String>]) -> String 
     material
 }
 
+/// Render the ungrouped remainder section: header + per-member line with the
+/// code-computed DISPUTED cross-reference suffix ("" when none) handed to the renderer.
+/// Deterministic trailing section — every remaining item lands here exactly once.
+#[must_use]
+pub(crate) fn render_ungrouped_section(
+    output: &GroupingOutput,
+    references: &[GroupingReference],
+    render_member: impl Fn(&GroupingMember, &str) -> String,
+) -> String {
+    if output.ungrouped.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n\n**Ungrouped**");
+    for member in &output.ungrouped {
+        let mut disputed = String::new();
+        for reference in references.iter().filter(|r| r.member.id == member.id) {
+            if let Some(group) = output.groups.get(reference.group) {
+                let _ = write!(
+                    disputed,
+                    " [DISPUTED — contradicts group {} \"{}\"]",
+                    reference.group, group.heading
+                );
+            }
+        }
+        let _ = write!(out, "\n- {}", render_member(member, &disputed));
+    }
+    out
+}
+
 // ── Repair-mode grouping (pipeline synthesis + ask consolidation) ───────
 
 /// Mutable state of the repair protocol across rounds.

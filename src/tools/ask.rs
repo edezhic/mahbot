@@ -742,26 +742,18 @@ fn render_ask_groups(
             }
         }
     }
-    if !output.ungrouped.is_empty() {
-        out.push_str("\n\n**Ungrouped**");
-        for member in &output.ungrouped {
+    out.push_str(&crate::consensus::render_ungrouped_section(
+        output,
+        references,
+        |member, disputed| {
             let mut line = crate::consensus::render_member_line(member, table);
-            for reference in references.iter().filter(|r| r.member.id == member.id) {
-                if let Some(group) = output.groups.get(reference.group) {
-                    let _ = write!(
-                        line,
-                        " [DISPUTED — contradicts group {} \"{}\"]",
-                        reference.group, group.heading
-                    );
-                }
+            line.push_str(disputed);
+            if let Some(c) = member_caveat(member, table, outcomes) {
+                let _ = write!(line, " — caveat: {c}");
             }
-            let caveat = member_caveat(member, table, outcomes);
-            let _ = write!(out, "\n- {line}");
-            if let Some(c) = caveat {
-                let _ = write!(out, " — caveat: {c}");
-            }
-        }
-    }
+            line
+        },
+    ));
     // Original question for context (answers are delivered out of band).
     let _ = write!(out, "\n\n_Original question: {ask}_");
     out
