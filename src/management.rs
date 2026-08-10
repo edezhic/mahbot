@@ -1259,6 +1259,10 @@ async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
     for item in items {
         let _ = write!(out, "\n- {}", item.replace('\n', " "));
     }
+    let synopsis = summary.summary.as_deref().unwrap_or("").trim();
+    if !synopsis.is_empty() {
+        let _ = write!(out, "\n\n### Summary\n{synopsis}");
+    }
     crate::util::truncate_sandwich(
         &crate::util::scrub_credentials(&out),
         crate::util::FAILURE_DETAIL_CAP,
