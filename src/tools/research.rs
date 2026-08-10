@@ -597,6 +597,21 @@ struct AnalystRunOutcome<T> {
     queries: Vec<String>,
 }
 
+/// Collapse awaited round members into analyst runs — timed-out, panicked,
+/// and cancelled members map to [`AnalystRun::NoResponse`]. The distinction
+/// is still preserved in the warn logs inside [`await_round_members`].
+fn resolve_round_members<T>(members: Vec<RoundMember<AnalystRun<T>>>) -> Vec<AnalystRun<T>> {
+    members
+        .into_iter()
+        .map(|m| match m {
+            RoundMember::Done(run) => run,
+            RoundMember::TimedOut | RoundMember::Panicked | RoundMember::Cancelled => {
+                AnalystRun::NoResponse
+            }
+        })
+        .collect()
+}
+
 /// Run a single analyst agent on `task` and extract structured output `T`
 /// while the agent is alive (KV-cache reuse). Returns the extraction plus
 /// telemetry `(tool_calls, searches, queries)` from the session history.
@@ -797,16 +812,8 @@ async fn round0_decompose(
             })
         })
         .collect();
-    let plans: Vec<AnalystRun<DecompositionPlan>> = await_round_members(handles, deadline)
-        .await
-        .into_iter()
-        .map(|m| match m {
-            RoundMember::Done(run) => run,
-            RoundMember::TimedOut | RoundMember::Panicked | RoundMember::Cancelled => {
-                AnalystRun::NoResponse
-            }
-        })
-        .collect();
+    let plans: Vec<AnalystRun<DecompositionPlan>> =
+        resolve_round_members(await_round_members(handles, deadline).await);
     let mut valid = Vec::new();
     for run in plans {
         match run {
@@ -1023,16 +1030,8 @@ async fn round1_research(
             }));
         }
     }
-    let runs: Vec<AnalystRun<AnalystFindings>> = await_round_members(handles, deadline)
-        .await
-        .into_iter()
-        .map(|m| match m {
-            RoundMember::Done(run) => run,
-            RoundMember::TimedOut | RoundMember::Panicked | RoundMember::Cancelled => {
-                AnalystRun::NoResponse
-            }
-        })
-        .collect();
+    let runs: Vec<AnalystRun<AnalystFindings>> =
+        resolve_round_members(await_round_members(handles, deadline).await);
     Some(collect_evidence(&runs, ledger, run_stats))
 }
 
@@ -1139,16 +1138,7 @@ async fn run_gap_round(
             })
         })
         .collect();
-    await_round_members(handles, deadline)
-        .await
-        .into_iter()
-        .map(|m| match m {
-            RoundMember::Done(run) => run,
-            RoundMember::TimedOut | RoundMember::Panicked | RoundMember::Cancelled => {
-                AnalystRun::NoResponse
-            }
-        })
-        .collect()
+    resolve_round_members(await_round_members(handles, deadline).await)
 }
 
 /// Conditional gap rounds. Stopping is artifact-based, never agent
