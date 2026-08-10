@@ -435,8 +435,6 @@ pub enum EditorMessage {
     },
     /// Periodic tick — refreshes git status and gitignore for file tree coloring.
     Tick,
-    /// Fast tick (100 ms) — keeps the editor cursor blinking.
-    BlinkTick,
     /// Git status has been loaded for the current workspace's file tree.
     /// `r#gen` is captured at spawn time for stale-result prevention.
     GitStatusLoaded {
@@ -1668,10 +1666,6 @@ impl EditorState {
                 iced::time::every(Duration::from_secs(DIR_REFRESH_INTERVAL_SECS))
                     .map(|_| EditorMessage::RefreshFileTree),
             );
-            // Fast tick for cursor blinking — 100 ms ensures smooth blink.
-            subs.push(
-                iced::time::every(Duration::from_millis(100)).map(|_| EditorMessage::BlinkTick),
-            );
             // Auto-refresh tick for detecting external file changes on the
             // active tab.  Only the active (visible) tab is polled; dirty
             // tabs (unsaved edits) are never auto-reloaded.
@@ -2232,9 +2226,7 @@ impl EditorState {
 
             EditorMessage::Tick => self.tick(),
 
-            EditorMessage::BlinkTick | EditorMessage::RevealDone | EditorMessage::Toast(_) => {
-                Task::none()
-            }
+            EditorMessage::RevealDone | EditorMessage::Toast(_) => Task::none(),
 
             EditorMessage::GitStatusLoaded { r#gen, result } => {
                 self.git_status_loaded(r#gen, result)
