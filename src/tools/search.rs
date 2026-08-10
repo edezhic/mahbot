@@ -5,8 +5,8 @@
 //! All agents searching the same workspace share a single engine instance
 //! managed by [`crate::search_engine`]. Background scanning starts eagerly.
 
+use crate::Tool;
 use crate::search_engine;
-use crate::{Tool, ToolOutputPhase};
 use async_trait::async_trait;
 use fff_search::file_picker::FuzzySearchOptions;
 use fff_search::grep::{GrepMode, GrepSearchOptions};
@@ -622,80 +622,6 @@ impl Tool for SearchTool {
         }
 
         Ok(output)
-    }
-
-    fn debug_output(
-        &self,
-        phase: ToolOutputPhase,
-        args: &serde_json::Value,
-        outcome: Option<(&str, bool)>,
-    ) -> Option<String> {
-        match phase {
-            ToolOutputPhase::Before => None,
-            ToolOutputPhase::After => {
-                let mode = super::get_opt_str(args, "mode");
-
-                // Resolve the effective query using the same normalization as
-                // execute() — 'pattern' alias, path/ext constraint composition.
-                let query = resolve_query(args).unwrap_or("?".to_string());
-
-                let prefix = match mode {
-                    Some(m) => format!("{m}: "),
-                    None => String::new(),
-                };
-
-                let (output, success) = outcome?;
-                if success {
-                    // Detect zero results by checking for the `── diagnostics ──` marker.
-                    // Both zero-result output paths (`search_files()` and
-                    // `build_grep_zero_diag()`) append this structured block.
-                    // Using a structural delimiter avoids false-positives from file
-                    // paths or grep content that happen to start with "No ".
-                    let is_empty = output.contains("\n── diagnostics ──\n");
-                    if is_empty {
-                        // Enrich zero-result log entries with call arguments for
-                        // debugging — mode, path/ext constraints, offset, case_sensitivity.
-                        let mut details = Vec::new();
-
-                        if let Some(p) = super::get_opt_str(args, "path").filter(|p| !p.is_empty())
-                        {
-                            details.push(format!("path={p}"));
-                        }
-                        if let Some(e) = super::get_opt_str(args, "ext").filter(|e| !e.is_empty()) {
-                            details.push(format!("ext={e}"));
-                        }
-                        let offset_val = super::get_usize(args, "offset", 0);
-                        if offset_val > 0 {
-                            details.push(format!("offset={offset_val}"));
-                        }
-                        // Show case_sensitive only when non-default (explicitly false)
-                        if let Some(cs) = super::get_opt_bool(args, "case_sensitive")
-                            && !cs
-                        {
-                            details.push("case_sensitive=false".to_string());
-                        }
-
-                        let suffix = if details.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" [{}]", details.join(", "))
-                        };
-
-                        Some(format!("🔍 {prefix}{query} — 0 results{suffix}"))
-                    } else {
-                        Some(format!("🔍 {prefix}{query}"))
-                    }
-                } else {
-                    let output = output.trim();
-                    let err = if output.is_empty() {
-                        "unknown error"
-                    } else {
-                        output
-                    };
-                    Some(format!("🔍 {prefix}{query} — ❌ {err}"))
-                }
-            }
-        }
     }
 }
 

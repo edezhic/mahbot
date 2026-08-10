@@ -1,7 +1,7 @@
 //! Browser automation tool.
 
 use crate::util::UnwrapPoison;
-use crate::{Tool, ToolOutputPhase, Workspace};
+use crate::{Tool, Workspace};
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::future::join_all;
@@ -568,62 +568,6 @@ impl Tool for BrowserTool {
 
     fn is_advertised(&self) -> bool {
         super::browser_daemon::is_advertised()
-    }
-
-    fn debug_output(
-        &self,
-        phase: ToolOutputPhase,
-        args: &serde_json::Value,
-        outcome: Option<(&str, bool)>,
-    ) -> Option<String> {
-        let tab = args.get("tab").and_then(|v| v.as_str()).unwrap_or("?");
-        match phase {
-            ToolOutputPhase::Before => {
-                let action = args.get("action").and_then(|a| a.as_object());
-                let action_name = action
-                    .and_then(|m| m.keys().next())
-                    .map_or("?", String::as_str);
-                // Collect non-empty inner params for the action
-                let extra = action
-                    .and_then(|m| m.values().next())
-                    .and_then(|inner| inner.as_object())
-                    .map(|params| {
-                        let parts: Vec<String> = params
-                            .iter()
-                            .filter_map(|(k, v)| {
-                                let s = match v {
-                                    Value::String(s) if !s.is_empty() => s.clone(),
-                                    Value::Bool(b) => b.to_string(),
-                                    Value::Number(n) => n.to_string(),
-                                    _ => return None,
-                                };
-                                Some(format!("{k}: {s}"))
-                            })
-                            .collect();
-                        if parts.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" {}", parts.join(" "))
-                        }
-                    })
-                    .unwrap_or_default();
-                Some(format!("🌐 ({tab}) {action_name}{extra}"))
-            }
-            ToolOutputPhase::After => {
-                let (output, success) = outcome?;
-                if success {
-                    None
-                } else {
-                    let output = output.trim();
-                    let err = if output.is_empty() {
-                        "unknown error"
-                    } else {
-                        output
-                    };
-                    Some(format!("❌ ({tab}) {err}"))
-                }
-            }
-        }
     }
 
     fn parameters_schema(&self) -> Value {

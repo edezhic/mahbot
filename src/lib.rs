@@ -1137,49 +1137,6 @@ pub(crate) trait Tool: Send + Sync {
     fn format_output(&self, output: &str) -> String {
         crate::util::truncate_tool_output(output)
     }
-
-    /// Format a tool channel notification.
-    ///
-    /// Called twice per tool execution:
-    /// - `Before` — before the tool runs (`outcome` is `None`).
-    /// - `After`   — after the tool completes (`outcome` is `Some`).
-    ///
-    /// Return `None` to suppress the notification for this phase.
-    /// Return `Some(msg)` to send that exact message.
-    fn debug_output(
-        &self,
-        phase: ToolOutputPhase,
-        args: &serde_json::Value,
-        outcome: Option<(&str, bool)>,
-    ) -> Option<String> {
-        match phase {
-            ToolOutputPhase::Before => {
-                let args_preview = crate::util::summarize_args(args);
-                Some(format!("🔧 `{}`({})", self.name(), args_preview))
-            }
-            ToolOutputPhase::After => {
-                let (output, success) = outcome?;
-                let status = if success { "✅" } else { "❌" };
-                let name = self.name();
-                let preview: String = output.chars().take(600).collect();
-                let preview = preview.trim();
-                if preview.is_empty() {
-                    Some(format!("{status} `{name}`"))
-                } else {
-                    Some(format!("{status} `{name}` → {preview}"))
-                }
-            }
-        }
-    }
-}
-
-/// Phase of tool output notification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolOutputPhase {
-    /// Notification sent before tool execution.
-    Before,
-    /// Notification sent after tool execution completes.
-    After,
 }
 
 // ── Chat role enum ─────────────────────────────────────────────

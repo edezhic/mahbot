@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::tools::{ShellMode, ShellTool, search::SearchTool};
 use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
 use crate::util::tree_sitter::ALL_TREE_SITTER_EXTENSIONS;
-use crate::{Tool, ToolOutputPhase, Workspace};
+use crate::{Tool, Workspace};
 use async_trait::async_trait;
 use serde_json::json;
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator, Tree};
@@ -146,34 +146,6 @@ impl Tool for ReadTool {
         // Fallback (lossy binary output, etc.): standard head+tail truncation
         crate::util::truncate_tool_output(output)
     }
-
-    fn debug_output(
-        &self,
-        phase: ToolOutputPhase,
-        args: &serde_json::Value,
-        outcome: Option<(&str, bool)>,
-    ) -> Option<String> {
-        match phase {
-            ToolOutputPhase::Before => {
-                let path = super::get_opt_str(args, "path").unwrap_or("?");
-                let range = Self::format_range(args);
-                if range.is_empty() {
-                    Some(format!("👀 {path}"))
-                } else {
-                    Some(format!("👀 {path} ({range})"))
-                }
-            }
-            ToolOutputPhase::After => {
-                let (_output, success) = outcome?;
-                if success {
-                    None
-                } else {
-                    let path = super::get_opt_str(args, "path").unwrap_or("?");
-                    Some(format!("❌ Failed to read {path}"))
-                }
-            }
-        }
-    }
 }
 
 impl ReadTool {
@@ -285,18 +257,6 @@ impl ReadTool {
         }
 
         anyhow::bail!("{original_err}\nDid you mean:\n  {}", matches.join("\n  "))
-    }
-
-    fn format_range(args: &serde_json::Value) -> String {
-        match (
-            super::get_opt_u64(args, "offset"),
-            super::get_opt_u64(args, "limit"),
-        ) {
-            (None, None) => String::new(),
-            (Some(o), None) => format!("{o}:"),
-            (None, Some(l)) => format!("1:{}", l.max(1)),
-            (Some(o), Some(l)) => format!("{o}:{}", o.saturating_add(l.max(1) - 1)),
-        }
     }
 
     /// Execute the standard content read mode.

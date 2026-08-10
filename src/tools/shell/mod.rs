@@ -1,4 +1,4 @@
-use crate::{Tool, ToolOutputPhase, Workspace};
+use crate::{Tool, Workspace};
 use async_trait::async_trait;
 use directories::UserDirs;
 use regex::RegexSet;
@@ -662,40 +662,24 @@ impl ShellTool {
         #[cfg_attr(not(unix), allow(unused_mut))] // non-unix never mutates `result`
         let mut result = run_command_with_timeout(&mut cmd, timeout, drain_limit).await;
 
-        // Stream-size telemetry: the engine reports stdin-fed stream bytes
-        // consumed via a stderr marker; strip it from the agent-visible stderr
-        // and log it (best-effort: -m/-l early stops undercount, SIGPIPE-killed
-        // chains never flush, and member-side/shell-level stderr merges
-        // suppress it). The strip removes any line containing the marker
-        // token — the count parse only gates the logged value, so a non-marker
-        // stderr line that literally contains the token is lost too (accepted).
-        // The pre-flight `exec` check misses env-prefixed (`FOO=1 exec 2>&1`)
-        // and escaped-verb (`\exec 2>&1`) redirects, so the marker can leak
-        // into the agent-visible stdout or a file — beyond this strip's reach.
-        // Runs on timeout output too — the marker is flushed before the engine
-        // exits, so a later-member hang would otherwise surface it. A discarded
-        // engine run (sentinel-3 → the original re-runs below) still logs its
-        // bytes — telemetry noise, accepted.
+        // Stream-size marker: the engine reports stdin-fed stream bytes
+        // consumed via a stderr marker; strip it from the agent-visible stderr.
+        // The strip removes any line containing the marker token. The pre-flight
+        // `exec` check misses env-prefixed (`FOO=1 exec 2>&1`) and escaped-verb
+        // (`\exec 2>&1`) redirects, so the marker can leak into the agent-visible
+        // stdout or a file — beyond this strip's reach. Runs on timeout output
+        // too — the marker is flushed before the engine exits, so a later-member
+        // hang would otherwise surface it.
         #[cfg(unix)]
-        let stream_bytes = match &mut result {
+        match &mut result {
             ShellRunResult::Completed { stderr, .. }
             | ShellRunResult::TimedOut { stderr, .. }
             | ShellRunResult::DrainTimedOut { stderr, .. } => {
-                if exec_str == command_str {
-                    None
-                } else {
-                    grep_engine::strip_stream_size_marker(stderr)
+                if exec_str != command_str {
+                    grep_engine::strip_stream_size_marker(stderr);
                 }
             }
-            ShellRunResult::SpawnFailed(_) => None,
-        };
-        #[cfg(unix)]
-        if let Some(stream_bytes) = stream_bytes {
-            tracing::info!(
-                command = command_str,
-                stream_bytes,
-                "grep engine: stdin stream size"
-            );
+            ShellRunResult::SpawnFailed(_) => {}
         }
 
         // Grep-engine failure containment: the sentinel exit code means the
@@ -1045,28 +1029,6 @@ impl Tool for ShellTool {
         self.execute_with_status(ws, args)
             .await
             .map(|(output, _)| output)
-    }
-
-    fn debug_output(
-        &self,
-        phase: ToolOutputPhase,
-        args: &serde_json::Value,
-        outcome: Option<(&str, bool)>,
-    ) -> Option<String> {
-        match phase {
-            ToolOutputPhase::Before => {
-                let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("?");
-                Some(cmd.to_owned())
-            }
-            ToolOutputPhase::After => {
-                let (output, _success) = outcome?;
-                let trimmed = output.trim();
-                if trimmed.is_empty() {
-                    return None;
-                }
-                Some(crate::util::truncate_sandwich(trimmed, 2000, "debug"))
-            }
-        }
     }
 }
 

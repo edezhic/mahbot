@@ -13,7 +13,7 @@ use crate::tools::{
     scrub_tool_output,
 };
 use crate::util::{MEDIA_MARKER_RE, UnwrapPoison, parse_media_marker, scrub_credentials};
-use crate::{Agent, ChatMessage, ChatRequest, ChatResponse, Tool, ToolCall, ToolOutputPhase};
+use crate::{Agent, ChatMessage, ChatRequest, ChatResponse, Tool, ToolCall};
 
 // ── Per-tool-call user context ─────────────────────────────────────
 // Set by the Agent work loop before each tool execute(), read by tools
@@ -327,15 +327,7 @@ impl Agent {
                 // parallel within a group; side-effecting tools run one at a time.
                 // Groups execute sequentially in order — the original ordering is
                 // preserved in `all_outcomes`.
-                self.log_tool_notifications(&tool_calls, None, ToolOutputPhase::Before);
-
                 let all_outcomes = self.execute_tool_group(&tool_calls).await;
-
-                self.log_tool_notifications(
-                    &tool_calls,
-                    Some(&all_outcomes),
-                    ToolOutputPhase::After,
-                );
 
                 // Track media generation outcomes for marker fallback
                 accumulated_media_paths.extend(extract_media_from_outcomes(
@@ -567,41 +559,6 @@ impl Agent {
         crate::retry::agent_chat(request, &policy)
             .await
             .with_context(|| format!("LLM call {RETRY_EXHAUSTION_MARKER}"))
-    }
-
-    /// Log tool-call notifications
-    fn log_tool_notifications(
-        &self,
-        calls: &[ToolCall],
-        outcomes: Option<&[ToolExecutionOutcome]>,
-        phase: ToolOutputPhase,
-    ) {
-        let tools = &self.tools;
-        for (i, call) in calls.iter().enumerate() {
-            let outcome = outcomes.and_then(|o| o.get(i));
-            let msg = if let Some(tool) = find_tool(tools, &call.name) {
-                // Normalize before debug_output so tool implementations always
-                // receive canonical argument names (e.g. `file` → `path`).
-                let (_, normalized_args) = normalize_tool_call(&call.name, call.arguments.clone());
-                tool.debug_output(
-                    phase,
-                    &normalized_args,
-                    outcome.map(|o| (o.output.as_str(), o.success)),
-                )
-            } else {
-                let args_preview = crate::util::summarize_args(&call.arguments);
-                match outcome {
-                    None => Some(format!("🔧 `{}`({})", call.name, args_preview)),
-                    Some(outcome) => {
-                        let status = if outcome.success { "✅" } else { "❌" };
-                        Some(format!("{status} `{}`({})", call.name, args_preview))
-                    }
-                }
-            };
-            if let Some(msg) = msg {
-                tracing::info!("{msg}");
-            }
-        }
     }
 
     /// Persist tool results to the session store and push them into the in-memory

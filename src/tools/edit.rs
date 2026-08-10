@@ -1,4 +1,4 @@
-use crate::{Tool, ToolOutputPhase, Workspace};
+use crate::{Tool, Workspace};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
@@ -65,36 +65,9 @@ impl Tool for EditTool {
             }
         }
     }
-
-    fn debug_output(
-        &self,
-        phase: ToolOutputPhase,
-        args: &serde_json::Value,
-        outcome: Option<(&str, bool)>,
-    ) -> Option<String> {
-        match phase {
-            ToolOutputPhase::Before => None,
-            ToolOutputPhase::After => {
-                let (_output, success) = outcome?;
-                let new_string = super::get_opt_str(args, "new_string").unwrap_or("?");
-                if Self::is_write_mode(args) {
-                    Some(format_file_tool_result("Write", new_string, args, success))
-                } else {
-                    let old = super::get_opt_str(args, "old_string")?;
-                    let combined = format!("{old}\n-----------\n{new_string}");
-                    Some(format_file_tool_result("Edit", &combined, args, success))
-                }
-            }
-        }
-    }
 }
 
 impl EditTool {
-    /// Determine if this is a write (new file) operation rather than an edit.
-    fn is_write_mode(args: &serde_json::Value) -> bool {
-        super::get_opt_str(args, "old_string").is_none_or(str::is_empty)
-    }
-
     /// Write a new file with the given content.
     async fn execute_write(&self, ws: &Workspace, path: &str, new_string: &str) -> Result<String> {
         let resolved_target = super::path::resolve_write_target(ws.as_path(), path, true).await?;
@@ -230,25 +203,6 @@ impl EditTool {
             new_content.len()
         ))
     }
-}
-
-/// Result formatting for the edit tool's "After" phase.
-/// Handles truncation and either a code fence or expandable blockquote
-/// depending on content size.
-#[must_use]
-fn format_file_tool_result(
-    action: &str,
-    content: &str,
-    args: &serde_json::Value,
-    success: bool,
-) -> String {
-    let path = super::get_opt_str(args, "path").unwrap_or("?");
-    if !success {
-        return format!("❌ {action} attempted on {path}");
-    }
-
-    let block = crate::util::truncate_sandwich(content, 2000, "debug");
-    format!("✏️ {path}\n{block}")
 }
 
 // ── Whitespace-insensitive matching ───────────────────────────────

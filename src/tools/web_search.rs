@@ -538,14 +538,8 @@ impl Tool for WebSearchTool {
         }
 
         match &self.backend {
-            WebSearchBackend::Firecrawl { .. } => {
-                tracing::info!("Searching web (Firecrawl) for: {}", query);
-                self.firecrawl_search(query).await
-            }
-            WebSearchBackend::Exa { .. } => {
-                tracing::info!("Searching web (Exa) for: {}", query);
-                self.exa_search(query).await
-            }
+            WebSearchBackend::Firecrawl { .. } => self.firecrawl_search(query).await,
+            WebSearchBackend::Exa { .. } => self.exa_search(query).await,
         }
     }
 }
