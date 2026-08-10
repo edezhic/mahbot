@@ -17,6 +17,17 @@ pub(crate) fn contains_glob(s: &str, include_close_bracket: bool) -> bool {
     s.contains(['*', '?', '[']) || (include_close_bracket && s.contains(']'))
 }
 
+/// Shell-quote a string for safe interpolation into a POSIX shell command.
+///
+/// Wraps the value in single quotes; embedded `'` is escaped as `'\''`
+/// (terminate, insert escaped quote, resume). Single quotes suppress all
+/// expansion, so spaces, `$`, backticks, backslashes, and glob characters
+/// pass through literally.
+pub(crate) fn shell_quote(s: &str) -> String {
+    let escaped = s.replace('\'', "'\\''");
+    format!("'{escaped}'")
+}
+
 /// Canonicalize the parent directory of `path` and join the original file name.
 ///
 /// This is the common canonicalization strategy used by both

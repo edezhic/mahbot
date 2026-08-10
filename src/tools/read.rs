@@ -2,6 +2,7 @@ use std::path::Path;
 #[cfg(unix)]
 use std::time::Duration;
 
+use super::path::shell_quote;
 use crate::tools::{ShellMode, ShellTool, search::SearchTool};
 use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
 use crate::util::tree_sitter::ALL_TREE_SITTER_EXTENSIONS;
@@ -868,19 +869,6 @@ fn parse_header_line_count(header: &str) -> usize {
         }
     }
     0
-}
-
-/// Shell-quote a path for safe interpolation into a POSIX shell command.
-///
-/// Wraps the path in single quotes. Any embedded single quotes are escaped
-/// by terminating the single-quoted string, inserting an escaped literal
-/// quote, and resuming single-quoting (`'` → `'\''`). This handles paths
-/// containing spaces, `$`, backticks, backslashes, glob characters, and
-/// other special shell metacharacters, since single quotes suppress all
-/// expansion in POSIX shells.
-fn shell_quote(s: &str) -> String {
-    let escaped = s.replace('\'', "'\\''");
-    format!("'{escaped}'")
 }
 
 /// Delegate directory listing to [`ShellTool`] when [`ReadTool`] receives a

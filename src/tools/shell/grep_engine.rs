@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use grep_matcher::Matcher;
 use serde::{Deserialize, Serialize};
 
+use crate::tools::path::shell_quote;
 use crate::tools::shell::SHELL_PIPE_READ_CAP;
 use crate::tools::shell::readonly::{strip_heredoc_bodies, strip_outer_quotes};
 
@@ -282,21 +283,6 @@ fn build_rewritten(spec: &EngineSpec) -> String {
         ENGINE_VERB,
         shell_quote(&json)
     )
-}
-
-/// Lossless single-quote shell quoting (embedded `'` → `'\''`).
-fn shell_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
 }
 
 /// Why a command was not served (telemetry + fail-closed decisions).
