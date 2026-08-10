@@ -2,9 +2,22 @@
 //!
 //! MahBot uses `multiprocess_wal` mode (configured in [`crate::turso::EXPERIMENTAL_FEATURES`]),
 //! which relies on a `.tshm` shared-memory file for WAL coordination between
-//! connections. On process crash or hard exit (`std::process::exit(0)` or signal
-//! without cleanup), the `.tshm` file becomes stale and pending WAL frames are
-//! permanently lost.
+//! connections.
+//!
+//! # WAL checkpoint hygiene
+//!
+//! Committed transactions are durable at COMMIT time: turso runs
+//! synchronous=FULL (default), fsyncing the WAL before reporting a transaction
+//! durable, so committed frames survive crash/SIGKILL without any checkpoint
+//! (stale `.tshm` state is rebuilt from the on-disk WAL on reopen). Checkpoints
+//! are hygiene, not the durability mechanism: they compact committed frames
+//! from the WAL into the main DB file, reclaim WAL space, and reset the shared
+//! frame index. TRUNCATE at exit leaves a header-only WAL (clean store handoff;
+//! also avoids the stale shared-index reopen hazard). TRUNCATE is avoided under
+//! live writers because resetting the shared frame index is the documented
+//! two-writer corruption vector; the periodic loop uses PASSIVE below the
+//! 32 MiB cap instead. Only uncommitted in-flight transactions are lost on
+//! crash — normal DB semantics, independent of checkpoints.
 //!
 //! This module provides the canonical checkpoint entry points:
 //! [`checkpoint_all_databases`] (TRUNCATE, for controlled exit-time paths where
@@ -15,10 +28,10 @@
 //!
 //! # Why keep `multiprocess_wal`?
 //!
-//! `multiprocess_wal` (via Turso) forces `NoLock` on all connections, making
-//! explicit WAL checkpoints the only way to guarantee durability on exit
-//! (the root cause this module works around). Removing it would eliminate the
-//! data-loss mechanism entirely for normal (non-`exit(0)`) exits.
+//! `multiprocess_wal` (via Turso) forces `NoLock` on all connections, which
+//! affects locking, not fsync: committed data is durable at COMMIT regardless
+//! (see above). The exit-time TRUNCATE is retained for the clean store handoff
+//! (header-only WAL), not as a durability requirement.
 //!
 //! The feature is retained because `mahbot debug` (the CLI subcommand) opens
 //! the same `.db` files while the daemon is running. Without
@@ -27,10 +40,6 @@
 //! (all connections share a single WAL with `.tshm` coordination). A future
 //! refactor could eliminate the debug CLI's need to access live databases
 //! (e.g., via an IPC query endpoint), making `multiprocess_wal` removable.
-//!
-//! In the meantime, the checkpoint orchestration in this module (exit-time +
-//! periodic) ensures that under normal operation no writes are lost, and
-//! crash data loss is bounded to the auto-checkpoint interval (5 minutes).
 
 use futures_util::future::{FutureExt, join_all};
 use std::future::Future;
@@ -118,8 +127,8 @@ where
 /// Checkpoint all Turso database stores before hard process termination.
 ///
 /// `std::process::exit(0)` bypasses Rust destructors, so Turso WAL connections
-/// are never properly closed. Without this explicit checkpoint, pending WAL
-/// writes are silently lost and `.tshm` coordination files are left inconsistent.
+/// are never properly closed. The TRUNCATE leaves a header-only WAL for a clean
+/// store handoff; committed data is already fsync-durable at COMMIT.
 ///
 /// Always runs TRUNCATE checkpoints — this is the single-writer exit-time path
 /// (self-update handoff, GUI shutdown). Periodic checkpointing uses

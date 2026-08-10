@@ -323,11 +323,12 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         }
     });
 
-    // Periodic WAL checkpoint as defense-in-depth against data loss from
-    // crashes or missed shutdown-path checkpoints. Non-truncating (PASSIVE)
-    // below the WAL-size cap — TRUNCATE resets the shared WAL frame index,
-    // which is the two-writer corruption vector under live connections, so the
-    // periodic loop avoids it (see checkpoint::periodic_checkpoint_all_databases).
+    // Periodic WAL checkpoint as hygiene: compact committed frames and bound
+    // WAL growth/reopen cost (committed data is fsync-durable at COMMIT
+    // regardless of checkpoints). Non-truncating (PASSIVE) below the WAL-size
+    // cap — TRUNCATE resets the shared WAL frame index, which is the
+    // two-writer corruption vector under live connections, so the periodic
+    // loop avoids it (see checkpoint::periodic_checkpoint_all_databases).
     spawn_cancellable(&mut tasks, &shutdown_token, "auto-checkpoint", async {
         loop {
             if !mahbot::shutdown::sleep_or_shutdown(Duration::from_mins(5)).await {

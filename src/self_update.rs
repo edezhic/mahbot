@@ -14,10 +14,10 @@
 //! (the shell tool's `extra_shell_path_prefixes` includes both paths when
 //! they differ, so the single resolved path is always covered).
 //!
-//! The WAL checkpoint before `exit(0)` is critical: `std::process::exit(0)` bypasses
-//! all Rust destructors, so Turso connections are never properly closed. Without an
-//! explicit checkpoint, pending WAL writes are silently lost and `.tshm` coordination
-//! files are left inconsistent, causing data to reappear after restart.
+//! The WAL checkpoint before `exit(0)` is a clean store handoff:
+//! `std::process::exit(0)` bypasses all Rust destructors, so Turso connections
+//! are never properly closed. The TRUNCATE leaves a header-only WAL with the
+//! shared frame index reset; committed data is already fsync-durable at COMMIT.
 //!
 //! ## macOS Gatekeeper safety
 //!

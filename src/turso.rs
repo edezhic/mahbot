@@ -562,9 +562,9 @@ impl Connection {
     /// Force a WAL checkpoint with TRUNCATE mode.
     ///
     /// Writes all pending WAL content to the main database file and truncates
-    /// the WAL. This is critical before hard process termination
-    /// (e.g., [`std::process::exit`] in self-update) to prevent data loss from
-    /// unwritten WAL pages.
+    /// the WAL. Run before hard process termination (e.g.,
+    /// [`std::process::exit`] in self-update) for a clean store handoff;
+    /// committed data is already fsync-durable at COMMIT.
     ///
     /// Safe to call even if the database is not in WAL mode — non-WAL databases
     /// treat this as a no-op (the result row reports `log == checkpointed == -1`).
