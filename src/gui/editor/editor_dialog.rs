@@ -34,7 +34,7 @@ fn result_entry_style(bg: Color) -> impl Fn(&iced::Theme) -> container::Style {
 ///
 /// Delegates to the shared backdrop helper. The caller may specify a custom
 /// backdrop opacity; most dialogs use `0.5`, but lighter overlays (e.g.
-/// quick-open) use `0.3`.
+/// quick-open) use `0.4`.
 pub(super) fn overlay_dialog<'a>(
     dialog: impl Into<Element<'a, EditorMessage>>,
     on_backdrop: EditorMessage,

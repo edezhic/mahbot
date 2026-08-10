@@ -4329,7 +4329,7 @@ impl EditorState {
         let placeholder: Element<'_, EditorMessage> = widget_helpers::empty_stack_placeholder();
 
         let overlay: Element<'_, EditorMessage> = match &self.active_modal {
-            Some(ModalKind::CloseDialog(tab_idx)) => Self::build_close_modal(
+            Some(ModalKind::CloseDialog(tab_idx)) => editor_dialog::build_close_dialog(
                 EditorMessage::CloseDialog {
                     tab_index: *tab_idx,
                     action: CloseAction::Save,
@@ -4356,7 +4356,7 @@ impl EditorState {
                 } else {
                     format!("{dirty_count} files have unsaved changes. What would you like to do?")
                 };
-                Self::build_close_modal(
+                editor_dialog::build_close_dialog(
                     EditorMessage::CloseOthersDialog {
                         keep_idx: *keep_idx,
                         action: CloseAction::Save,
@@ -4372,48 +4372,17 @@ impl EditorState {
                     desc,
                 )
             }
-            Some(ModalKind::GlobalSearch(gs)) => editor_dialog::overlay_dialog(
-                editor_dialog::build_global_search_overlay(gs),
-                EditorMessage::Escape,
-                0.3,
-            ),
-            Some(ModalKind::QuickOpen(qo)) => editor_dialog::overlay_dialog(
-                editor_dialog::build_quick_open_overlay(qo),
-                EditorMessage::Escape,
-                0.3,
-            ),
-            Some(ModalKind::NewItem(target)) => editor_dialog::wrap_dialog(
-                editor_dialog::build_new_item_input(target),
-                400,
-                EditorMessage::Escape,
-                0.5,
-            ),
-            Some(ModalKind::DeleteConfirm(target)) => editor_dialog::wrap_dialog(
-                editor_dialog::build_delete_confirm_dialog(target),
-                400,
-                EditorMessage::CancelDelete,
-                0.5,
-            ),
+            Some(ModalKind::GlobalSearch(gs)) => editor_dialog::build_global_search_overlay(gs),
+            Some(ModalKind::QuickOpen(qo)) => editor_dialog::build_quick_open_overlay(qo),
+            Some(ModalKind::NewItem(target)) => editor_dialog::build_new_item_input(target),
+            Some(ModalKind::DeleteConfirm(target)) => {
+                editor_dialog::build_delete_confirm_dialog(target)
+            }
             // GotoLine and Rename are rendered inline (not as stack overlays).
             Some(ModalKind::GotoLine(_) | ModalKind::Rename(_)) | None => placeholder,
         };
 
         iced::widget::stack([body.into(), overlay]).into()
-    }
-
-    /// Build a close confirmation modal with consistent sizing and escape behavior.
-    fn build_close_modal(
-        save_msg: EditorMessage,
-        discard_msg: EditorMessage,
-        cancel_msg: EditorMessage,
-        desc: String,
-    ) -> Element<'static, EditorMessage> {
-        editor_dialog::wrap_dialog(
-            editor_dialog::build_close_dialog(save_msg, discard_msg, cancel_msg, desc),
-            420,
-            EditorMessage::Escape,
-            0.5,
-        )
     }
 
     // ── Tree panel ────────────────────────────────────────────────
