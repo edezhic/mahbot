@@ -657,6 +657,12 @@ fn workspace_from_row(row: &turso::Row) -> anyhow::Result<Workspace> {
     })
 }
 
+/// Max length of workspace notes in chars (char-level truncation — never
+/// byte-slice, which would panic on multi-byte characters at the boundary).
+/// Single source of truth shared by the DB layer, the prompt builder, and
+/// the GUI editors.
+pub(crate) const MAX_WORKSPACE_NOTES_CHARS: usize = 4000;
+
 impl WorkspaceStore {
     /// Run a query that returns zero-or-one workspace row, mapping the result to
     /// `Ok(Some(ws))` / `Ok(None)` / `Err`.
@@ -893,12 +899,10 @@ impl WorkspaceStore {
 
     /// Set freeform user-curated context notes for a workspace.
     ///
-    /// Truncates to 4000 characters (safe UTF-8) as defense-in-depth against
-    /// prompt bloat. Notes are appended to every agent's system prompt.
+    /// Truncates to `MAX_WORKSPACE_NOTES_CHARS` characters as defense-in-depth
+    /// against prompt bloat. Notes are appended to every agent's system prompt.
     pub async fn set_notes(&self, name: &str, notes: &str) -> Result<()> {
-        // Safe UTF-8 char-level truncation — must not use byte slicing
-        // which would panic on multi-byte characters at the boundary.
-        let notes: String = notes.chars().take(4000).collect();
+        let notes: String = notes.chars().take(MAX_WORKSPACE_NOTES_CHARS).collect();
         self.exec_update_with_updated_at("notes = ?", vec![Value::from(notes)], name)
             .await
     }
@@ -1591,8 +1595,8 @@ mod tests {
             "Notes update should round-trip correctly"
         );
 
-        // Verify 4000 char truncation
-        let long_notes = "x".repeat(5000);
+        // Verify truncation at the cap
+        let long_notes = "x".repeat(MAX_WORKSPACE_NOTES_CHARS + 1000);
         store
             .set_notes("notes_test", &long_notes)
             .await
@@ -1604,17 +1608,17 @@ mod tests {
             .expect("exists");
         assert_eq!(
             ws.notes.chars().count(),
-            4000,
-            "Notes should be truncated to 4000 chars"
+            MAX_WORKSPACE_NOTES_CHARS,
+            "Notes should be truncated to {MAX_WORKSPACE_NOTES_CHARS} chars"
         );
         assert_eq!(
             ws.notes,
-            "x".repeat(4000),
+            "x".repeat(MAX_WORKSPACE_NOTES_CHARS),
             "Notes content should match truncated"
         );
 
         // Verify UTF-8 safe truncation (multi-byte characters)
-        let multi_byte = "é".repeat(5000);
+        let multi_byte = "é".repeat(MAX_WORKSPACE_NOTES_CHARS + 1000);
         store
             .set_notes("notes_test", &multi_byte)
             .await
@@ -1626,12 +1630,12 @@ mod tests {
             .expect("exists");
         assert_eq!(
             ws.notes.chars().count(),
-            4000,
-            "Notes should be truncated to 4000 chars (multi-byte)"
+            MAX_WORKSPACE_NOTES_CHARS,
+            "Notes should be truncated to {MAX_WORKSPACE_NOTES_CHARS} chars (multi-byte)"
         );
         assert_eq!(
             ws.notes,
-            "é".repeat(4000),
+            "é".repeat(MAX_WORKSPACE_NOTES_CHARS),
             "Notes content should match truncated (multi-byte, no broken chars)"
         );
     }

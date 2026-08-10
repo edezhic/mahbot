@@ -1,6 +1,7 @@
 //! Workspaces dashboard page.
 
 use crate::Workspace;
+use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 
 use iced::Task;
 use iced::widget::{markdown, text_editor};
@@ -450,9 +451,9 @@ impl WorkspacesState {
                             .unwrap_or_default()
                     });
                 content.perform(action);
-                // Enforce 4000-char limit at the UI level
+                // Enforce cap at the UI level
                 let current = content.text().clone();
-                let truncated: String = current.chars().take(4000).collect();
+                let truncated: String = current.chars().take(MAX_WORKSPACE_NOTES_CHARS).collect();
                 if truncated.len() < current.len() {
                     *content = text_editor::Content::with_text(&truncated);
                 }

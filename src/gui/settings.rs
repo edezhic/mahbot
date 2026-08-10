@@ -12,6 +12,7 @@
 use crate::Role;
 use crate::Workspace;
 use crate::config::{CONFIG, ConfigData, ModelRouting, RoleConfig};
+use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
 use iced::widget::{
@@ -1236,7 +1237,7 @@ impl SettingsState {
                         .get(&ws_item.name)
                         .expect("notes editor content must exist when notes_open contains name");
                     let char_count = content.text().chars().count();
-                    let over_limit = char_count > 4000;
+                    let over_limit = char_count > MAX_WORKSPACE_NOTES_CHARS;
 
                     let editor = text_editor(content)
                         .on_action(move |action| {
@@ -1248,15 +1249,15 @@ impl SettingsState {
                             )
                         })
                         .placeholder(
-                            "Add manual context notes for all agents… (max 4000 characters)",
+                            format!("Add manual context notes for all agents… (max {MAX_WORKSPACE_NOTES_CHARS} characters)"),
                         )
                         .min_height(100.0)
                         .max_height(300.0);
 
                     let char_counter = text(if over_limit {
-                        format!("{char_count}/4000 — please trim")
+                        format!("{char_count}/{MAX_WORKSPACE_NOTES_CHARS} — please trim")
                     } else {
-                        format!("{char_count}/4000")
+                        format!("{char_count}/{MAX_WORKSPACE_NOTES_CHARS}")
                     })
                     .size(11)
                     .color(if over_limit {

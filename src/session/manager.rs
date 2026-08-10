@@ -18,6 +18,7 @@ use futures_util::future::join_all;
 
 use crate::board::BOARD;
 use crate::prompt::{build_workspace_context, format_ticket_block, load_prompt, substitute};
+use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 
 use crate::skills;
 use crate::tools::active_models::{ModelKind, ModelSnapshot};
@@ -334,9 +335,7 @@ impl Session {
             // until summarization compacts the history — identical to all other
             // system prompt changes (documented caching contract).
             if !ws.notes.trim().is_empty() {
-                // Safe UTF-8 char-level truncation — must not use byte slicing
-                // which would panic on multi-byte characters at the boundary.
-                let notes: String = ws.notes.chars().take(4000).collect();
+                let notes: String = ws.notes.chars().take(MAX_WORKSPACE_NOTES_CHARS).collect();
                 let _ = write!(ctx, "\n<user-notes>\n{notes}\n</user-notes>\n");
             }
 
