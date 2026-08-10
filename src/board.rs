@@ -18,12 +18,13 @@ crate::define_store! {
     expect = "BOARD not initialized — call init_global() first",
 }
 
-/// Background task: auto-archive cancelled tickets older than 1 hour.
+/// Background task: auto-archive cancelled tickets older than 1 hour and
+/// sweep stale terminal-phase pipeline reservations.
 ///
 /// Runs every 5 minutes, respects the global shutdown token via
 /// [`crate::shutdown::sleep_or_shutdown`] (same pattern as
 /// [`crate::maintainer::run_maintainer_loop`]).
-/// Logs per-ticket failures and continues — a ticket that was un-cancelled
+/// Logs per-pass failures and continues — a ticket that was un-cancelled
 /// between the SELECT and UPDATE is harmlessly skipped.
 pub async fn run_archive_cancelled_loop() {
     let interval = std::time::Duration::from_mins(5);
@@ -42,6 +43,12 @@ pub async fn run_archive_cancelled_loop() {
             Ok(n) if n > 0 => info!(count = n, "Archived stale cancelled tickets"),
             Ok(_) => debug!("Archive cancelled loop: no stale tickets"),
             Err(e) => warn!(error = %e, "Archive cancelled loop failed"),
+        }
+
+        match board.clear_terminal_reservations().await {
+            Ok(n) if n > 0 => info!(count = n, "Cleared stale terminal pipeline reservations"),
+            Ok(_) => debug!("Reservation sweep: no stale terminal reservations"),
+            Err(e) => warn!(error = %e, "Reservation sweep failed"),
         }
     }
 }
@@ -189,6 +196,20 @@ const TRANSITORY_HANDOFF_PHASES: &[TicketPhase] = &[
 /// needs to diverge from the unblocking set, this delegation must be
 /// broken explicitly.
 pub const UNBLOCKING_PHASES: &[TicketPhase] = &[TicketPhase::Done, TicketPhase::Cancelled];
+
+/// Terminal phases — a ticket in one of these can no longer be claimed.
+///
+/// [`TicketPhase::is_terminal`] delegates to this constant. Used to clear
+/// [`pipeline_reservation`](Ticket::pipeline_reservation) on terminal
+/// transitions and by the periodic reservation sweep.
+///
+/// Note: `Failed` is deliberately included here even though it is excluded
+/// from [`UNBLOCKING_PHASES`] (a failed ticket permanently blocks dependents).
+pub const TERMINAL_PHASES: &[TicketPhase] = &[
+    TicketPhase::Done,
+    TicketPhase::Cancelled,
+    TicketPhase::Failed,
+];
 
 /// Produces an SQL fragment listing phases as quoted, comma-separated
 /// strings — e.g. `'done', 'cancelled'`.
@@ -475,6 +496,17 @@ impl TicketPhase {
     #[must_use]
     pub fn is_unblocking(&self) -> bool {
         UNBLOCKING_PHASES.contains(self)
+    }
+
+    /// Returns `true` for terminal phases (`Done`, `Cancelled`, `Failed`) — a
+    /// ticket in one of these can no longer be claimed, so the rework-priority
+    /// reservation must be cleared.
+    ///
+    /// Delegates to [`TERMINAL_PHASES`] so the terminal set is authoritative
+    /// for both the transition-clearing clause and the reservation sweep.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        TERMINAL_PHASES.contains(self)
     }
 
     /// Returns `true` if the ticket is in a pipeline-blocking phase.
@@ -900,7 +932,8 @@ impl BoardStore {
         let cancelled_rows = tx
             .execute(
                 "UPDATE tickets SET phase = ?1, updated_at = ?2, assigned_to = NULL, \
-                 superseded_by = ?4, is_archived = 1, done_at = NULL WHERE id = ?3",
+                 superseded_by = ?4, is_archived = 1, done_at = NULL, pipeline_reservation = 0 \
+                 WHERE id = ?3",
                 turso::params![
                     TicketPhase::Cancelled.as_ref(),
                     now,
@@ -1221,6 +1254,10 @@ impl BoardStore {
     /// on re-completion — and cleared when the ticket leaves `done`, so the
     /// column holds a timestamp iff the ticket is currently in the Done phase.
     /// Later non-transition activity (comments, archive) never touches it.
+    ///
+    /// Terminal targets ([`TicketPhase::is_terminal`]) always clear
+    /// `pipeline_reservation` regardless of `reservation`: a ticket that can
+    /// no longer be claimed must not keep a stale rework-priority flag.
     fn build_transition_sql(
         ticket_id: &str,
         expected_phase: Option<TicketPhase>,
@@ -1229,6 +1266,11 @@ impl BoardStore {
     ) -> PreparedUpdate {
         let now = turso::now();
         let guard: Option<&str> = expected_phase.as_ref().map(TicketPhase::as_ref);
+        let reservation = if target_phase.is_terminal() {
+            Some(false)
+        } else {
+            reservation
+        };
         let sql = "UPDATE tickets SET phase = ?1, assigned_to = NULL, updated_at = ?2, \
                     pipeline_reservation = COALESCE(?5, pipeline_reservation), \
                     done_at = CASE WHEN ?1 = 'done' THEN ?2 \
@@ -1258,7 +1300,9 @@ impl BoardStore {
     /// transitions can set it atomically, and manual transitions leave stale
     /// reservations inert (claim/blocker queries filter by phase). When
     /// `Some(value)`, it's set in the same UPDATE to avoid a race on crash/restart
-    /// recovery or rework priority.
+    /// recovery or rework priority. Terminal targets
+    /// ([`TicketPhase::is_terminal`]) always clear the flag — see
+    /// [`build_transition_sql`](Self::build_transition_sql).
     ///
     /// # Errors
     ///
@@ -2047,6 +2091,30 @@ impl BoardStore {
             )
             .await
             .context("Failed to archive stale cancelled tickets")?;
+        Ok(updated)
+    }
+
+    /// Idempotently clear stale `pipeline_reservation` flags on
+    /// terminal-phase tickets ([`TERMINAL_PHASES`]).
+    ///
+    /// Terminal phases cannot be claimed, so a reservation left over from a
+    /// pre-terminal bounce is inert garbage. The sweep is a pure flag purge:
+    /// it does **not** bump `updated_at`/`done_at` (bumping `updated_at` would
+    /// delay stale-cancelled archival, which filters by `updated_at` cutoff)
+    /// and does **not** filter `is_archived` (archived terminal rows can still
+    /// carry the flag). Non-terminal reserved rows (e.g. ReadyForDevelopment
+    /// waiting for the pipeline) are deliberately left untouched.
+    pub(crate) async fn clear_terminal_reservations(&self) -> Result<u64> {
+        let sql = format!(
+            "UPDATE tickets SET pipeline_reservation = 0 \
+             WHERE phase IN ({}) AND pipeline_reservation = 1",
+            phase_list_sql_fragment(TERMINAL_PHASES),
+        );
+        let updated = self
+            .conn
+            .execute(&sql, turso::params![])
+            .await
+            .context("Failed to clear stale terminal pipeline reservations")?;
         Ok(updated)
     }
 

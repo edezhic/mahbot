@@ -433,6 +433,154 @@ async fn test_claim_prefers_reserved_ticket() {
 }
 
 #[tokio::test]
+async fn test_terminal_transition_clears_reservation() {
+    let (store, _tmp) = open_test_store().await;
+    let ws = test_ws_named("/ws", "ws");
+
+    // Reserve a ticket the way a bounce-back does.
+    let id = make_ticket(&store, &ws, "Bounced", TicketPhase::Backlog).await;
+    store
+        .transition_to(
+            &id,
+            Some(TicketPhase::Backlog),
+            TicketPhase::ReadyForDevelopment,
+            Some(true),
+        )
+        .await
+        .expect("reserve");
+    assert!(
+        expect_ticket(&store, &id).await.pipeline_reservation,
+        "bounce-back should set reservation"
+    );
+
+    // Terminal transition (done) clears the flag even with reservation = None.
+    store
+        .transition_to(&id, None, TicketPhase::Done, None)
+        .await
+        .expect("done");
+    let t = expect_ticket(&store, &id).await;
+    assert_eq!(t.phase, TicketPhase::Done);
+    assert!(
+        !t.pipeline_reservation,
+        "terminal transition must clear pipeline_reservation"
+    );
+
+    // Non-terminal control: a planning transition preserves the flag.
+    let ctl = make_ticket(&store, &ws, "Control", TicketPhase::Backlog).await;
+    store
+        .transition_to(
+            &ctl,
+            Some(TicketPhase::Backlog),
+            TicketPhase::ReadyForDevelopment,
+            Some(true),
+        )
+        .await
+        .expect("reserve control");
+    store
+        .transition_to(&ctl, None, TicketPhase::Planning, None)
+        .await
+        .expect("planning");
+    let ctl = expect_ticket(&store, &ctl).await;
+    assert_eq!(ctl.phase, TicketPhase::Planning);
+    assert!(
+        ctl.pipeline_reservation,
+        "non-terminal transition must preserve pipeline_reservation"
+    );
+}
+
+#[tokio::test]
+async fn test_supersede_clears_reservation() {
+    init_test_stores().await;
+    let store = crate::board::BOARD.get().unwrap();
+    let ws = test_ws_named("/ws", "ws");
+    let old_id = make_ticket(store, &ws, "Test", TicketPhase::Backlog).await;
+    store
+        .transition_to(
+            &old_id,
+            Some(TicketPhase::Backlog),
+            TicketPhase::ReadyForDevelopment,
+            Some(true),
+        )
+        .await
+        .expect("reserve");
+
+    TicketBuilder::new(store, &ws)
+        .title("New title")
+        .desc("New desc")
+        .supersede(&old_id)
+        .await
+        .expect("supersede");
+
+    let old = expect_ticket(store, &old_id).await;
+    assert_superseded_ticket(&old);
+    assert!(
+        !old.pipeline_reservation,
+        "supersede cancellation must clear pipeline_reservation"
+    );
+}
+
+#[tokio::test]
+async fn test_clear_terminal_reservations_sweep() {
+    let (store, _tmp) = open_test_store().await;
+    let ws = test_ws_named("/ws", "ws");
+
+    // Stale pre-fix rows: terminal-phase tickets carrying a reservation,
+    // including the archived shape (is_archived = 1, like the live stale row).
+    let done_id = make_ticket(&store, &ws, "Done", TicketPhase::Done).await;
+    let cancelled_id = make_ticket(&store, &ws, "Cancelled", TicketPhase::Cancelled).await;
+    let failed_id = make_ticket(&store, &ws, "Failed", TicketPhase::Failed).await;
+    let archived_id = make_ticket(&store, &ws, "Archived", TicketPhase::Done).await;
+    store.set_archived(&archived_id).await.expect("archive");
+    for id in [&done_id, &cancelled_id, &failed_id, &archived_id] {
+        store
+            .conn
+            .execute(
+                "UPDATE tickets SET pipeline_reservation = 1 WHERE id = ?1",
+                crate::turso::params![id.clone()],
+            )
+            .await
+            .expect("stale reservation");
+    }
+    let archived_before = expect_ticket(&store, &archived_id).await;
+
+    // Reserved non-terminal ticket must survive the sweep.
+    let reserved_id = make_ticket(&store, &ws, "Reserved", TicketPhase::ReadyForDevelopment).await;
+    store
+        .transition_to(
+            &reserved_id,
+            Some(TicketPhase::ReadyForDevelopment),
+            TicketPhase::ReadyForDevelopment,
+            Some(true),
+        )
+        .await
+        .expect("reserve");
+
+    assert_eq!(
+        store.clear_terminal_reservations().await.expect("sweep"),
+        4,
+        "sweep should clear all four stale terminal rows"
+    );
+
+    for id in [&done_id, &cancelled_id, &failed_id, &archived_id] {
+        assert!(
+            !expect_ticket(&store, id).await.pipeline_reservation,
+            "sweep must clear reservation on {id}"
+        );
+    }
+    let archived_after = expect_ticket(&store, &archived_id).await;
+    assert_eq!(
+        archived_after.updated_at, archived_before.updated_at,
+        "sweep must not bump updated_at"
+    );
+    assert!(
+        expect_ticket(&store, &reserved_id)
+            .await
+            .pipeline_reservation,
+        "sweep must not touch non-terminal reserved tickets"
+    );
+}
+
+#[tokio::test]
 async fn test_has_pipeline_blocker_reserved() {
     let (store, _tmp) = open_test_store().await;
     let ws = test_ws_named("/ws", "ws");
