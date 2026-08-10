@@ -2140,11 +2140,7 @@ impl Dashboard {
     fn render_git_branch(&self) -> Option<Element<'_, Message>> {
         let b = self.git_state.current_branch()?;
         let truncated = if b.len() > 20 {
-            let mut end = 19;
-            while !b.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!("{}…", &b[..end])
+            format!("{}…", crate::util::truncate_bytes(b, 19))
         } else {
             b.to_string()
         };

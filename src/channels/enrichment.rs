@@ -585,8 +585,7 @@ pub async fn enrich_links(content: &str) -> Cow<'_, str> {
                     continue;
                 }
                 let snippet = if body_text.len() > MAX_TEXT_LEN {
-                    let end = body_text.floor_char_boundary(MAX_TEXT_LEN);
-                    format!("{}…", &body_text[..end])
+                    format!("{}…", crate::util::truncate_bytes(&body_text, MAX_TEXT_LEN))
                 } else {
                     body_text
                 };

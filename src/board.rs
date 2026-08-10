@@ -229,7 +229,7 @@ fn phase_list_sql_fragment(phases: &[TicketPhase]) -> String {
 fn parse_prereqs(raw: &str) -> Result<Vec<String>> {
     serde_json::from_str(raw).with_context(|| {
         let preview = if raw.len() > 200 {
-            format!("{}…", &raw[..raw.floor_char_boundary(200)])
+            format!("{}…", crate::util::truncate_bytes(raw, 200))
         } else {
             raw.to_string()
         };

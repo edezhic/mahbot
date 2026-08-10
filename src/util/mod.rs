@@ -101,6 +101,16 @@ pub fn truncate(input: &str, max_chars: usize) -> String {
     }
 }
 
+/// Truncate to at most `max_bytes` bytes at a UTF-8 char boundary (no ellipsis).
+#[must_use]
+pub(crate) fn truncate_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        s
+    } else {
+        &s[..s.floor_char_boundary(max_bytes)]
+    }
+}
+
 /// Convert a string reference to `None` if empty, otherwise `Some(s.to_string())`.
 ///
 /// Useful when building query structs where empty filters mean "no filter".

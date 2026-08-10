@@ -320,11 +320,7 @@ pub fn format_timestamp(ts: &str) -> String {
         if !TIMESTAMP_PARSE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             tracing::warn!(timestamp = %ts, "Failed to parse timestamp, falling back to truncated string");
         }
-        if ts.len() > 16 {
-            ts[..ts.floor_char_boundary(16)].to_string()
-        } else {
-            ts.to_string()
-        }
+        crate::util::truncate_bytes(ts, 16).to_string()
     }
 }
 

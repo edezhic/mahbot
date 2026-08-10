@@ -229,9 +229,10 @@ impl ToolFailuresState {
             return None;
         }
         if entry.arguments.len() > 200 {
-            let mut s = entry.arguments[..entry.arguments.floor_char_boundary(200)].to_string();
-            s.push('…');
-            Some(s)
+            Some(format!(
+                "{}…",
+                crate::util::truncate_bytes(&entry.arguments, 200)
+            ))
         } else {
             Some(entry.arguments.clone())
         }

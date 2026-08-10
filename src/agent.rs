@@ -522,9 +522,8 @@ impl Agent {
             let args_str =
                 serde_json::to_string(&tool_arguments).expect("Value is always serializable");
             let args_scrubbed = scrub_credentials(&args_str);
-            let arguments = args_scrubbed
-                [..args_scrubbed.floor_char_boundary(MAX_STATS_ARG_LENGTH)]
-                .to_string();
+            let arguments =
+                crate::util::truncate_bytes(&args_scrubbed, MAX_STATS_ARG_LENGTH).to_string();
 
             let mut guard = self.tool_stats.lock().unwrap_poison();
             guard.push(crate::ToolCallRecord {
