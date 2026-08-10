@@ -382,11 +382,6 @@ impl SessionStore {
         .await
     }
 
-    pub(crate) async fn append(&self, agent_id: &str, message: &ChatMessage) -> Result<()> {
-        self.batch_append(agent_id, std::slice::from_ref(message))
-            .await
-    }
-
     async fn append_messages(
         &self,
         agent_id: &str,
@@ -839,7 +834,7 @@ mod tests {
         crate::util::test::init_test_stores().await;
         let k = unique_key();
         store()
-            .append(&k, &ChatMessage::user("hello"))
+            .batch_append(&k, &[ChatMessage::user("hello")])
             .await
             .unwrap();
         let msgs = store().load(&k).await;
@@ -851,7 +846,10 @@ mod tests {
     async fn session_store_replace_messages() {
         crate::util::test::init_test_stores().await;
         let k = unique_key();
-        store().append(&k, &ChatMessage::user("old")).await.unwrap();
+        store()
+            .batch_append(&k, &[ChatMessage::user("old")])
+            .await
+            .unwrap();
         store()
             .replace_messages(&k, &[ChatMessage::user("new")])
             .await
@@ -865,7 +863,10 @@ mod tests {
     async fn session_store_delete() {
         crate::util::test::init_test_stores().await;
         let k = unique_key();
-        store().append(&k, &ChatMessage::user("a")).await.unwrap();
+        store()
+            .batch_append(&k, &[ChatMessage::user("a")])
+            .await
+            .unwrap();
         assert!(store().delete(&k).await.unwrap());
         assert!(!store().delete(&k).await.unwrap());
     }
@@ -934,7 +935,7 @@ mod tests {
 
         // Append a user message → User.
         store()
-            .append(&agent_id, &ChatMessage::user("hello"))
+            .batch_append(&agent_id, &[ChatMessage::user("hello")])
             .await
             .unwrap();
         assert_eq!(
@@ -944,7 +945,7 @@ mod tests {
 
         // Append an assistant message → Assistant.
         store()
-            .append(&agent_id, &ChatMessage::assistant("world"))
+            .batch_append(&agent_id, &[ChatMessage::assistant("world")])
             .await
             .unwrap();
         assert_eq!(
@@ -1165,6 +1166,94 @@ mod tests {
         let msgs = store().load(&k).await;
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[3].content, "a2");
+    }
+
+    /// A failed incoming-message persist queues the gap; the next successful
+    /// persist (tool round) flushes it ahead of its own batch — no loss, no
+    /// duplicate frames.
+    #[tokio::test]
+    async fn failed_drain_gap_flushed_by_later_persist() {
+        crate::util::test::init_test_stores().await;
+        let k = unique_key();
+        store()
+            .batch_append(
+                &k,
+                &[
+                    ChatMessage::system("prompt"),
+                    ChatMessage::user("u1"),
+                    ChatMessage::assistant("a1"),
+                ],
+            )
+            .await
+            .unwrap();
+        let ws = crate::workspace::test_ws_named("/_test_gap_flush", "gap_flush");
+        let mut session = Session::default();
+        session
+            .init(&k, "", &ws, &crate::Role::Assistant, None, "gui", "tester")
+            .await
+            .unwrap();
+
+        // Failed drain: comment delivered to history only.
+        session.push_messages_unpersisted(&[ChatMessage::user("C1")]);
+
+        // Tool round: the gap must be flushed in the same transaction.
+        session
+            .persist_messages(
+                &k,
+                &[
+                    ChatMessage::assistant("A"),
+                    ChatMessage::tool_result("t1", "R1"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Final answer.
+        session.push_assistant("final".into());
+        session.finalize(&k).await.unwrap();
+
+        let msgs = store().load(&k).await;
+        let contents: Vec<&str> = msgs.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            [
+                "prompt",
+                "u1",
+                "a1",
+                "C1",
+                "A",
+                "{\"tool_call_id\":\"t1\",\"content\":\"R1\"}",
+                "final"
+            ]
+        );
+    }
+
+    /// An aborted turn (no final answer) still flushes the failed-drain gap
+    /// so delivered comments survive in the DB for a recovery retry.
+    #[tokio::test]
+    async fn failed_drain_gap_flushed_on_aborted_turn() {
+        crate::util::test::init_test_stores().await;
+        let k = unique_key();
+        store()
+            .batch_append(
+                &k,
+                &[ChatMessage::system("prompt"), ChatMessage::user("u1")],
+            )
+            .await
+            .unwrap();
+        let ws = crate::workspace::test_ws_named("/_test_gap_abort", "gap_abort");
+        let mut session = Session::default();
+        session
+            .init(&k, "", &ws, &crate::Role::Assistant, None, "gui", "tester")
+            .await
+            .unwrap();
+
+        session.push_messages_unpersisted(&[ChatMessage::user("C1")]);
+        session.finalize(&k).await.unwrap();
+
+        let msgs = store().load(&k).await;
+        let contents: Vec<&str> = msgs.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["prompt", "u1", "C1"]);
     }
 }
 

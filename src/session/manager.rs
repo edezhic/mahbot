@@ -7,7 +7,8 @@
 //! 1. `Session::default()` at turn start
 //! 2. `session.init(agent_id, msg, ws, role, ticket, channel, user_name)` — loads history, builds prompt
 //!    for new sessions, persists user message, stores history internally
-//! 3. Agent loop calls `session.push_assistant()`, `session.push_messages()`, etc. during tool rounds
+//! 3. Agent loop calls `session.push_assistant()`, `session.persist_messages()`,
+//!    `session.push_messages_unpersisted()`, etc. during tool rounds
 //! 4. `session.finalize(agent_id)` on success — persists the final assistant response
 
 use std::fmt::Write;
@@ -20,7 +21,7 @@ use crate::prompt::{build_workspace_context, format_ticket_block, load_prompt, s
 
 use crate::skills;
 use crate::tools::active_models::{ModelKind, ModelSnapshot};
-use crate::{ChatMessage, ChatRole, Role, Workspace};
+use crate::{ChatMessage, Role, Workspace};
 
 /// Coordinates session persistence and prompt building across a single
 /// agent turn.
@@ -29,9 +30,11 @@ pub struct Session {
     /// In-memory history for the current turn (includes system prompt,
     /// conversation, and the latest user message).
     history: Vec<ChatMessage>,
-    /// Number of leading `history` entries already persisted to the store.
-    /// [`Session::finalize`] only appends beyond this prefix, so a trailing
-    /// assistant answer retained by compaction is never duplicated.
+    /// Number of leading `history` entries already persisted to the store;
+    /// `history[..persisted_len]` mirrors the DB contents contiguously and
+    /// `history[persisted_len..]` is exactly the unpersisted tail (failed
+    /// appends, tool traffic awaiting commit, the final answer). Every
+    /// successful persist advances this prefix over the span it wrote.
     persisted_len: usize,
 }
 
@@ -165,10 +168,36 @@ impl Session {
         self.history.push(ChatMessage::assistant(content));
     }
 
-    /// Bulk-append messages to in-memory history.
-    /// Operates on in-memory history only, not the session store.
-    pub(crate) fn push_messages(&mut self, messages: &[ChatMessage]) {
-        self.persisted_len += messages.len();
+    /// Persist any unpersisted history tail plus `messages` in one
+    /// transaction, then deliver `messages` to in-memory history and advance
+    /// `persisted_len` over the whole persisted span. On failure nothing is
+    /// delivered — the caller aborts or delivers unpersisted via
+    /// [`Session::push_messages_unpersisted`].
+    ///
+    /// `messages` must not already be part of the unpersisted tail — they
+    /// would be written twice.
+    pub(crate) async fn persist_messages(
+        &mut self,
+        agent_id: &str,
+        messages: &[ChatMessage],
+    ) -> Result<()> {
+        debug_assert!(self.persisted_len <= self.history.len());
+        let mut batch =
+            Vec::with_capacity(self.history.len() - self.persisted_len + messages.len());
+        batch.extend_from_slice(&self.history[self.persisted_len..]);
+        batch.extend_from_slice(messages);
+        crate::session::store()
+            .batch_append(agent_id, &batch)
+            .await?;
+        self.persisted_len += batch.len();
+        self.history.extend_from_slice(messages);
+        Ok(())
+    }
+
+    /// Deliver `messages` to in-memory history without persisting them
+    /// (store append failed). They remain in the unpersisted tail; the next
+    /// successful persist flushes them in order.
+    pub(crate) fn push_messages_unpersisted(&mut self, messages: &[ChatMessage]) {
         self.history.extend_from_slice(messages);
     }
 
@@ -243,24 +272,18 @@ impl Session {
 
     // ── Lifecycle ────────────────────────────────────────────────────
 
-    /// Persist the final assistant message (last assistant entry in history)
-    /// to the session store.
-    ///
-    /// Only appends beyond the already-persisted prefix — after compaction
-    /// the retained window may end with a persisted assistant answer, which
-    /// must not be duplicated.
-    pub(crate) async fn finalize(&self, agent_id: &str) -> Result<()> {
-        let Some(final_msg) = self
-            .history
-            .get(self.persisted_len..)
-            .and_then(|tail| tail.last())
-            .filter(|m| m.role == ChatRole::Assistant)
-        else {
+    /// Flush any unpersisted history tail to the session store and advance
+    /// the persisted prefix — the final assistant answer, or just delivered
+    /// comments on aborted turns. No-op on an empty tail (e.g. after
+    /// compaction), so a retained assistant answer is never duplicated.
+    /// Skipped by the agent-level cancel path (see `finalize_session`).
+    pub(crate) async fn finalize(&mut self, agent_id: &str) -> Result<()> {
+        debug_assert!(self.persisted_len <= self.history.len());
+        if self.persisted_len == self.history.len() {
             tracing::warn!("finalize called but no new assistant message in history");
             return Ok(());
-        };
-        crate::session::store().append(agent_id, final_msg).await?;
-        Ok(())
+        }
+        self.persist_messages(agent_id, &[]).await
     }
 
     // ── Internals ────────────────────────────────────────────────────

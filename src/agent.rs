@@ -204,8 +204,10 @@ impl Agent {
 
         // When cancelled (by user /stop or by global shutdown), no assistant
         // message is expected — skip finalization to avoid the "finalize called
-        // but no assistant message" warning. Intermediate messages are already
-        // persisted via commit_tool_results inside llm_loop, so no data loss.
+        // but no assistant message" warning. Tool results were already
+        // persisted via commit_tool_results inside llm_loop; any unpersisted
+        // tail (failed drain) is in-memory only and dropped at the next init
+        // (comments remain recoverable from the board DB).
         if self.cancel_token.is_cancelled() || crate::shutdown::shutdown_token().is_cancelled() {
             tracing::debug!(
                 agent_id = %self.agent_id,
@@ -611,14 +613,12 @@ impl Agent {
             db_messages.push(ChatMessage::tool_result(&call.id, &output));
         }
 
-        // Batch-persist all messages in a single transaction.
-        crate::session::store()
-            .batch_append(&self.agent_id, &db_messages)
+        // Batch-persist all messages in a single transaction (preceded by
+        // any unpersisted history tail) and push them into in-memory history.
+        self.session
+            .persist_messages(&self.agent_id, &db_messages)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to persist tool results: {e}"))?;
-
-        // Push to in-memory history (infallible — error above aborts the turn).
-        self.session.push_messages(&db_messages);
 
         Ok(())
     }
@@ -629,6 +629,14 @@ impl Agent {
     /// Called at the start of each LLM loop iteration, before the LLM call.
     /// Messages are persisted to the session DB AND pushed to in-memory
     /// history so they survive crashes and are visible to the model.
+    ///
+    /// On persist failure the messages are still delivered to the in-memory
+    /// history (the model sees them this turn) and left in the unpersisted
+    /// tail; the next successful persist — tool round, later drain, or
+    /// finalize (which flushes the tail even on aborted turns) — writes
+    /// them, so nothing is lost once the turn is finalized. A cancel before
+    /// finalize drops the in-memory tail at the next turn — comments remain
+    /// in the board DB.
     ///
     /// This is a no-op when no receiver is configured (e.g., chat agents
     /// that use the consumer_loop instead).
@@ -669,8 +677,9 @@ impl Agent {
         // Persist to session DB — best-effort. The comment is already saved in
         // the board DB, so losing the session copy is recoverable. Log and
         // continue rather than aborting the LLM iteration.
-        if let Err(e) = crate::session::store()
-            .batch_append(&self.agent_id, &messages)
+        if let Err(e) = self
+            .session
+            .persist_messages(&self.agent_id, &messages)
             .await
         {
             tracing::warn!(
@@ -678,12 +687,10 @@ impl Agent {
                 error = %e,
                 "Failed to persist incoming messages to session DB — continuing without persistence",
             );
-            // Still push to in-memory history so the model sees the messages
-            // this iteration, even if they won't survive a crash.
+            // Still deliver to in-memory history so the model sees them this
+            // iteration; the unpersisted tail is flushed next persist.
+            self.session.push_messages_unpersisted(&messages);
         }
-
-        // Push to in-memory history
-        self.session.push_messages(&messages);
 
         Ok(())
     }
