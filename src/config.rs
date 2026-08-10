@@ -297,7 +297,8 @@ pub struct ConfigData {
     /// Audio never leaves the machine.
     ///
     /// Set to `"false"` to disable audio transcription entirely — audio markers
-    /// in messages are replaced with a "[Audio: filename attached]" placeholder.
+    /// are replaced with just the icon combo and the temp file is deleted, so
+    /// voice messages are not recoverable.
     pub audio_transcription_use_local: Option<String>,
     /// Enable voice assistant (wake word detection and voice commands).
     /// Set to `"true"` to enable voice mode.

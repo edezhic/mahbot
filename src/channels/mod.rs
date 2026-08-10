@@ -2,7 +2,7 @@ mod enrichment;
 pub mod gui;
 pub mod telegram;
 pub mod voice;
-pub use enrichment::{EnrichmentStrategy, enrich_links, enrich_message};
+pub use enrichment::{EnrichmentStrategy, enrich_links, enrich_message, has_only_audio_markers};
 pub use telegram::mirror_gui_message_to_telegram;
 
 use crate::chat_history::ChatHistoryInsert;
@@ -175,9 +175,11 @@ pub(crate) fn broadcast_chat_event(
 /// Broadcast an incoming user message to the GUI and persist it to chat_history,
 /// mirroring it to Telegram in parallel. `broadcast_content` is the enriched text
 /// sent to the GUI (e.g. audio transcriptions, renderable data URIs), while
-/// `persist_content` is the original text stored in chat_history and mirrored to
-/// Telegram (no data-URI bloat, no raw media markers). The GUI bubble is broadcast
-/// synchronously before the async persist + mirror join begins.
+/// `persist_content` is stored in chat_history and mirrored to Telegram — the raw
+/// original text (no data-URI bloat), except for audio-only messages which carry
+/// the enriched transcription (icon + text) so no temp file path is persisted.
+/// The GUI bubble is broadcast synchronously before the async persist + mirror
+/// join begins.
 ///
 /// Forwards [`ChannelMessage::optimistic_id`] so the GUI can replace its optimistic
 /// bubble with the real one.

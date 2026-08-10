@@ -34,8 +34,9 @@
 //!
 //! The [`transcribe_file_async`] function is called from
 //! [`crate::channels::enrichment::transcribe_audio_marker`].  When the local
-//! model is unavailable or disabled in config, the caller returns a
-//! `[Audio: filename attached]` placeholder — there is no API fallback.
+//! model is unavailable or disabled in config, the caller annotates the
+//! message with just the audio-transcription icon combo — there is no API
+//! fallback.
 
 use crate::util::UnwrapPoison;
 use crate::util::model_state::{AtomicModelState, ModelState};
@@ -122,8 +123,8 @@ static GLOBAL_TRANSCRIBER: Mutex<Option<QwenLocalTranscriber>> = Mutex::new(None
 /// Model-loading lifecycle for the transcriber (Uninit → Loading → Ready /
 /// Failed).  Shared wrapper extracted in
 /// [`crate::util::model_state::ModelState`].  Failed is terminal — a restart
-/// is required to retry (the [`transcribe_file_async`] error path returns an
-/// `[Audio: filename attached]` placeholder).
+/// is required to retry (the [`transcribe_file_async`] error path leaves the
+/// caller with an icon-only audio annotation).
 static STATE: AtomicModelState = AtomicModelState::new(ModelState::Uninit);
 
 /// Atomically store a ready transcriber and transition state to [`ModelState::Ready`].
@@ -205,8 +206,8 @@ impl QwenLocalTranscriber {
 /// A shutdown guard races against the inference so that a stalled model
 /// cannot block pipeline exit.
 ///
-/// Returns an error if the local model is unavailable; the caller should
-/// return a `[Audio: filename attached]` placeholder on failure.
+/// Returns an error if the local model is unavailable; the caller annotates
+/// the message with just the audio-transcription icon combo on failure.
 pub async fn transcribe_file_async(path: &Path, inference_timeout: Duration) -> Result<String> {
     let owned = path.to_owned();
 

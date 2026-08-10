@@ -44,12 +44,11 @@ pub(crate) fn preprocess(content: &str) -> String {
 
 /// `[Audio transcription of {filename}]: {text}` → 🔊 text
 ///
-/// This annotation is produced by `enrich_message` before user messages are
-/// broadcast to the GUI, so it now actively reaches the dashboard and is
-/// rendered as transcription text.  The handler also covers persisted messages
-/// (e.g., replayed from history) where the annotation might appear. Only the
-/// annotation header is replaced — multi-line transcriptions and any following
-/// message content are left untouched.
+/// Legacy annotation format from before the icon-combo switch — only rows
+/// already persisted in chat history / sessions carry it; new messages store
+/// the icon combo (`🔊✍️`) + transcription directly. Only the annotation
+/// header is replaced — multi-line transcriptions and any following message
+/// content are left untouched.
 fn replace_audio_transcription(s: &str) -> String {
     static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"\[Audio transcription of [^\]]+\]:\s*")

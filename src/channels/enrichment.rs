@@ -32,19 +32,14 @@ static URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).expect("URL regex must compile"));
 
 /// Transcribe an audio file referenced by a `[AUDIO:...]` marker and return
-/// the annotation text to embed in the message along with a success indicator.
+/// the content to embed in the message: the audio-transcription icon combo
+/// (`🔊✍️` — sound written into text) followed by the transcription text.
 ///
-/// Transcription strategy (in order):
-/// 1. **Local Qwen3-ASR** — if the local model is loaded and `audio_transcription_use_local`
-///    is enabled in config. Fully offline, no data leaves the machine.
-/// 2. **Fallback annotation** — if local transcription is unavailable, returns a plain
-///    `[Audio: filename attached]` placeholder.
-///
-/// Returns `(annotation, true)` on successful transcription, or
-/// `(fallback_text, false)` when transcription fails.  The caller uses
-/// the success flag to decide whether the temp file should be cleaned up.
-async fn transcribe_audio_marker(path: &str) -> (String, bool) {
-    let file_name = extract_file_name(path);
+/// The audio file is a pure intermediate artifact — the caller deletes it
+/// regardless of outcome (scoped to the Telegram temp dir), so the returned
+/// string never contains the file name or path. On failure just the icon
+/// combo is returned (no text).
+async fn transcribe_audio_marker(path: &str) -> String {
     let path_buf = std::path::PathBuf::from(path);
 
     // ── Step 1: Try local Qwen3-ASR transcription ────────────────────
@@ -65,21 +60,23 @@ async fn transcribe_audio_marker(path: &str) -> (String, bool) {
         .await
         {
             Ok(text) => {
-                tracing::debug!(%path, "Local audio transcription succeeded");
-                return (
-                    format!("[Audio transcription of {file_name}]: {text}"),
-                    true,
-                );
+                tracing::debug!("Local audio transcription succeeded");
+                let text = text.trim();
+                return if text.is_empty() {
+                    "🔊✍️".to_string()
+                } else {
+                    format!("🔊✍️ {text}")
+                };
             }
             Err(e) => {
-                tracing::warn!(%path, error = %e, "Local audio transcription failed");
+                tracing::warn!(error = %e, "Local audio transcription failed");
             }
         }
     }
 
-    // ── Step 2: Fallback annotation ───────────────────────────────────
-    tracing::warn!("Audio transcription unavailable — cannot transcribe {file_name}");
-    (format!("[Audio: {file_name} attached]"), false)
+    // ── Step 2: Icon-only fallback (no text, no filename) ────────────
+    tracing::warn!("Audio transcription unavailable");
+    "🔊✍️".to_string()
 }
 
 /// A media file copied into the workspace `uploads/` directory: the
@@ -191,11 +188,10 @@ async fn handle_multimodal_image(
     }
 }
 
-/// Whether a local video path resolves inside the daemon's Telegram
-/// attachment temp dir — the only legitimate source of inbound clips.
-/// Arbitrary marker paths must never be copied into workspace uploads:
-/// they would pass video_edit's extension guard and reach the anonymous
-/// upload host.
+/// Whether a local media path resolves inside the daemon's Telegram
+/// attachment temp dir — the only legitimate source of inbound media
+/// (video clips and voice messages). Arbitrary marker paths must never
+/// reach workspace uploads or be deleted.
 async fn is_under_telegram_files(path: &std::path::Path) -> bool {
     let Ok(canonical) = tokio::fs::canonicalize(path).await else {
         return false;
@@ -313,10 +309,9 @@ fn extract_file_name(path: &str) -> &str {
 /// | VIDEO | workspace copy + `[Saved video: path]` + transcription | text annotation |
 ///
 /// After processing, markers that were handled are stripped from the content
-/// and annotations are prepended. Temp files are preserved when their
-/// processing fails (e.g. audio transcription failure due to a transient
-/// HTTP error) so the file can be recovered; only successfully-processed
-/// markers have their temp files cleaned up.
+/// and annotations are prepended. Temp files are cleaned up after processing —
+/// audio unconditionally (temp-dir scoped), video once copied to the workspace
+/// — only the transcription (or icon) survives.
 // Marker dispatch hub (3 kinds × 2 strategies); per-kind handling is extracted
 // into the handler functions above, keeping this loop flat on purpose.
 #[allow(clippy::too_many_lines)]
@@ -327,9 +322,9 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
     // Only ever populated in Multimodal/IMAGE branch — always empty otherwise.
     let mut upload_annotations: Vec<String> = Vec::new();
 
-    // Tracks temp files that should be removed after the loop.
-    // Files are added only when the corresponding marker was processed
-    // successfully — on failure the file is preserved for recovery.
+    // Tracks temp files to remove after the loop; each kind decides its own
+    // cleanup. Audio is unconditional (temp-dir scoped) — the file is a pure
+    // intermediate artifact, only the transcription (or icon) survives.
     let mut files_to_delete: Vec<std::path::PathBuf> = Vec::new();
 
     let uploads_dir = match strategy {
@@ -373,11 +368,11 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
                 }
             },
             "AUDIO" => {
-                let (annotation, success) = transcribe_audio_marker(path).await;
-                annotations.push(annotation);
-                // Only delete audio temp files on successful transcription.
-                // On failure the file is preserved for potential recovery.
-                if success {
+                annotations.push(transcribe_audio_marker(path).await);
+                // Audio temp files are always cleaned up, scoped to the daemon's
+                // Telegram temp dir so user-typed [AUDIO:...] markers can never
+                // delete arbitrary local files.
+                if is_under_telegram_files(path_obj).await {
                     files_to_delete.push(path_obj.to_path_buf());
                 }
             }
@@ -417,8 +412,8 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
     }
 
     // ── File cleanup ────────────────────────────────────────────────
-    // Only files that were successfully processed are deleted.
-    // Failed transcriptions preserve the temp file for potential recovery.
+    // Temp files queued above are deleted here — per kind: audio
+    // unconditionally, video only after a successful workspace copy.
     // Deletion errors are logged (not silently discarded).
     for file_path in &files_to_delete {
         if let Err(e) = tokio::fs::remove_file(file_path).await {
@@ -478,6 +473,29 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
             format!("{prefix}\n\n{cleaned}")
         }
     };
+}
+
+/// Whether `content` carries `[AUDIO:...]` markers and no other media markers.
+///
+/// Used by the caller to decide when enriched content (icon + transcription)
+/// can be persisted to chat history instead of the raw original: audio-only
+/// messages never leak temp file paths (raw audio markers) or embed image
+/// data URIs (multimodal IMAGE markers). Mixed audio+image/audio+video
+/// messages fall back to the raw persist — the raw `[AUDIO:path]` marker
+/// still reaches chat history for those (data-URI avoidance takes precedence).
+/// Purely syntactic: a hand-typed `[AUDIO:<URL>]` marker qualifies too, so its
+/// icon-only enriched content is persisted and the URL is dropped.
+#[must_use]
+pub fn has_only_audio_markers(content: &str) -> bool {
+    let mut has_audio = false;
+    for caps in MEDIA_MARKER_RE.captures_iter(content) {
+        if parse_media_marker(&caps).0 == "AUDIO" {
+            has_audio = true;
+        } else {
+            return false;
+        }
+    }
+    has_audio
 }
 
 /// Transcribe a local image file into a text description.
@@ -676,14 +694,22 @@ mod tests {
             workspace_path: None,
         };
         enrich_message(&mut msg, &strategy).await;
-        // AUDIO marker stripped; annotation prepended (fallback since no audio transcriber)
+        // AUDIO marker stripped; annotation prepended (icon-only fallback since
+        // no audio transcriber is configured in the test environment)
         assert!(
-            msg.content.contains("[Audio:"),
-            "Audio annotation must be present"
+            msg.content.contains("🔊✍️"),
+            "Audio annotation must be present, got: {}",
+            msg.content
         );
         assert!(
             !msg.content.contains("[AUDIO:"),
             "AUDIO marker must be stripped"
+        );
+        // No file name may survive in any form
+        assert!(
+            !msg.content.contains("audio_xyz"),
+            "Audio temp file name must not appear, got: {}",
+            msg.content
         );
         // The original text is preserved
         assert!(msg.content.contains("Listen"), "Original text preserved");
@@ -935,7 +961,7 @@ mod tests {
         assert!(!msg.content.contains("[VIDEO:"));
         // Annotations for all three
         assert!(msg.content.contains("[Image:"), "Image annotation missing");
-        assert!(msg.content.contains("[Audio:"), "Audio annotation missing");
+        assert!(msg.content.contains("🔊✍️"), "Audio annotation missing");
         assert!(msg.content.contains("[Video:"), "Video annotation missing");
         // Original text preserved
         assert!(msg.content.contains("Check"));
@@ -944,23 +970,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_audio_file_preserved_on_failure() {
-        let tmp =
-            std::env::temp_dir().join(format!("test_enrich_audio_{}.mp3", std::process::id()));
+    async fn enrich_audio_file_deleted_on_failure() {
+        // Only files in the daemon's Telegram temp dir are eligible for
+        // cleanup (user-typed markers must never delete arbitrary files).
+        let tg_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
+        tokio::fs::create_dir_all(&tg_dir).await.unwrap();
+        let tmp = tg_dir.join(format!("test_enrich_audio_{}.mp3", std::process::id()));
         tokio::fs::write(&tmp, b"fake audio content").await.unwrap();
         let path_str = tmp.to_string_lossy().to_string();
 
         let mut msg = test_msg(&format!("Audio: [AUDIO:{path_str}]"));
         enrich_message(&mut msg, &EnrichmentStrategy::NonMultimodal).await;
 
-        // Temp file must NOT be deleted when transcription fails
-        // (no transcriber configured in test environment).
+        // Temp file must be deleted even when transcription fails — the audio
+        // file is a pure intermediate artifact (no transcriber in tests).
         assert!(
-            tmp.exists(),
-            "Audio temp file must be preserved on transcription failure"
+            !tmp.exists(),
+            "Audio temp file must be deleted on transcription failure"
         );
-
-        // Cleanup: remove file since we asserted it's preserved.
+        // Defensive cleanup in case the assertion above fails.
         let _ = tokio::fs::remove_file(&tmp).await;
     }
 
@@ -981,7 +1009,7 @@ mod tests {
         );
         // AUDIO marker stripped, annotation present
         assert!(
-            msg.content.contains("[Audio:"),
+            msg.content.contains("🔊✍️"),
             "Audio annotation must be present"
         );
         assert!(

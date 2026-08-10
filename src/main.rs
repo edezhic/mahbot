@@ -1132,9 +1132,17 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     // ── Broadcast, persist, and mirror ─────────────────────────────────
     // Broadcast enriched content to GUI (audio transcription visible, data
     // URI images renderable).  Persist original content to chat_history (no
-    // data URI bloat).  Mirror original content to Telegram (media markers
-    // stripped by the mirror function).
-    broadcast_and_persist_incoming_message(&msg, &msg.content, &original_content).await;
+    // data URI bloat), except audio-only messages which persist the enriched
+    // transcription (icon + text) so the temp file path never reaches chat
+    // history.  Mirror uses the same persist_content (media markers stripped by
+    // the mirror function) — for audio-only messages that is the enriched
+    // transcription (icon + text).
+    let persist_content = if mahbot::channels::has_only_audio_markers(&original_content) {
+        &msg.content
+    } else {
+        &original_content
+    };
+    broadcast_and_persist_incoming_message(&msg, &msg.content, persist_content).await;
 
     // ── Link enrichment (URL summaries for agent context) ─────────────
     // Runs after broadcast so AI-generated summaries don't appear in the
