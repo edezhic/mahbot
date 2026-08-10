@@ -120,7 +120,8 @@ impl Tool for VideoGenTool {
             body["seed"] = json!(s);
         }
 
-        // Optional: add reference image via input_references
+        // Optional: add reference image via input_references. Reference-load
+        // failures are hard errors — never silently degrade to text-to-video.
         let images: Vec<String> = super::get_str_array(&args, "images");
 
         if images.len() > 1 {
@@ -131,24 +132,21 @@ impl Tool for VideoGenTool {
             );
         }
 
+        let mut references: Vec<crate::util::ReferenceImage> = Vec::new();
         if let Some(img_path) = images.first() {
-            match crate::util::load_reference_image(
+            let reference = crate::util::load_reference_image(
                 Path::new(img_path),
                 super::MAX_REFERENCE_IMAGE_BYTES,
             )
-            .await
-            {
-                Ok(data_uri) => {
-                    body["input_references"] = json!([{
-                        "type": "image_url",
-                        "image_url": { "url": data_uri }
-                    }]);
-                }
-                Err(e) => {
-                    tracing::warn!(%img_path, error = %e, "Failed to load reference image for video gen");
-                }
-            }
+            .await?;
+            references.push(reference);
+            body[super::INPUT_REFERENCES_KEY] = super::reference_json(&references);
         }
+
+        // Aggregate body budget: a single reference at the per-image cap
+        // already approaches the ~2 MB body limit once base64 + JSON overhead
+        // is added, so verify the serialized body before submitting.
+        super::fit_request_body_budget(&mut body, &mut references, super::MAX_REQUEST_BODY_BYTES)?;
 
         let video_bytes =
             super::fetch_async_video(&api_base, &body, super::VideoJobLabels::GENERATION).await?;

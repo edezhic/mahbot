@@ -370,30 +370,335 @@ pub(crate) async fn local_image_to_data_uri(path: &std::path::Path) -> anyhow::R
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(&bytes)))
 }
 
-/// Load a reference image from disk, validate it does not exceed `max_bytes`,
-/// and return a base64 data URI suitable for multimodal model input.
-#[allow(clippy::cast_precision_loss)]
+// ── Reference-image loading & compression (image_gen / video_gen) ────────
+
+/// Input-size ceiling for the reference-image compression path (aligned with
+/// video_edit's 50 MB input cap). Over-cap files must be read fully before
+/// compression, so this keeps the path bounded on pathological inputs.
+const MAX_REFERENCE_INPUT_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Combined input-size ceiling across all references of one request: the
+/// per-image ceiling does not bound a multi-reference total, and the fail-open
+/// path (no catalog cap) would otherwise hold up to 16 × 50 MB of source bytes
+/// in memory before the body budget runs.
+pub(crate) const MAX_TOTAL_REFERENCE_INPUT_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Bound on a reference-image read: guards the narrow metadata→read window
+/// where a path swapped to a FIFO/special file could otherwise block forever
+/// (the is_file check runs on the pre-read metadata). The blocked read task
+/// lingers until the special file resolves, but the tool call itself errors
+/// visibly instead of hanging.
+const REFERENCE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// Data-URI prefix for ladder-compressed references (the ladder always
+/// produces JPEG).
+const JPEG_DATA_URI_PREFIX: &str = "data:image/jpeg;base64,";
+
+/// Compression ladder: (downscale factor, JPEG quality) steps, mildest first.
+/// A same-format PNG re-encode can GROW the file (verified: +3% on the exact
+/// failing image), so every step crosses to JPEG with alpha flattened onto
+/// white; later steps downscale. The ladder is a small fixed bound (~6 steps).
+const REFERENCE_COMPRESSION_LADDER: &[(f32, u8)] = &[
+    (1.0, 85),
+    (1.0, 70),
+    (1.0, 55),
+    (0.75, 70),
+    (0.5, 70),
+    (0.5, 45),
+];
+
+/// A validated reference image for a generation request: under-cap images pass
+/// through unchanged (original bytes, original format); over-cap images are
+/// compressed via the bounded ladder. Held in memory only — no disk artifacts.
+pub(crate) struct ReferenceImage {
+    data_uri: String,
+    /// Original file bytes kept for later ladder steps (aggregate body budget);
+    /// holding them avoids re-reading the file (no TOCTOU window).
+    source_bytes: Vec<u8>,
+    next_step: usize,
+    /// Terminal state after [`ReferenceImage::release_source_bytes`]: the
+    /// request body is final, so no further compression is possible.
+    released: bool,
+}
+
+impl ReferenceImage {
+    /// The base64 data URI to embed in the request.
+    #[must_use]
+    pub(crate) fn data_uri(&self) -> &str {
+        &self.data_uri
+    }
+
+    /// True while the compression ladder still has steps left.
+    #[must_use]
+    pub(crate) fn has_compression_left(&self) -> bool {
+        !self.released && self.next_step < REFERENCE_COMPRESSION_LADDER.len()
+    }
+
+    /// Apply the next compression step (used by the aggregate body budget).
+    /// Errors — loudly, not panicking — when no steps remain or the source
+    /// bytes were released, so a caller contract violation surfaces instead of
+    /// corrupting state. The guards are unreachable from the current
+    /// budget-loop caller (which filters on `has_compression_left` first);
+    /// they exist to bound any future caller.
+    pub(crate) fn compress_more(&mut self) -> anyhow::Result<()> {
+        if self.released {
+            anyhow::bail!("Reference image is final — its source bytes were released");
+        }
+        if self.next_step >= REFERENCE_COMPRESSION_LADDER.len() {
+            anyhow::bail!("Reference image compression ladder exhausted");
+        }
+        let out =
+            with_block_in_place(|| compress_reference_step(&self.source_bytes, self.next_step))?;
+        self.next_step += 1;
+        self.data_uri = format!("{JPEG_DATA_URI_PREFIX}{}", STANDARD.encode(&out));
+        Ok(())
+    }
+
+    /// Drop the retained original bytes once the request body is final — no
+    /// further compression is possible (or needed) after this point.
+    pub(crate) fn release_source_bytes(&mut self) {
+        self.released = true;
+        self.source_bytes = Vec::new();
+    }
+}
+
+/// Load a reference image for generation: validate existence, the input-size
+/// ceiling, and regular-file-ness via metadata BEFORE any read; then the
+/// format (PNG/JPEG/WebP by extension AND content sniff); compress over-cap
+/// images via the bounded ladder until they fit `max_bytes`.
 pub(crate) async fn load_reference_image(
     path: &std::path::Path,
     max_bytes: u64,
-) -> anyhow::Result<String> {
-    if !path.exists() {
-        anyhow::bail!("Reference image not found: {}", path.display());
-    }
-    let metadata = tokio::fs::metadata(path)
+) -> anyhow::Result<ReferenceImage> {
+    // Metadata-first: a missing file must report not-found (not a format
+    // error), pathological inputs are refused without being read, and special
+    // files (FIFOs etc.) are refused so the read below cannot block forever.
+    let meta = tokio::fs::metadata(path)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to read reference image {}: {e}", path.display()))?;
-    if metadata.len() > max_bytes {
-        let mb = max_bytes as f64 / (1024.0 * 1024.0);
+        .with_context(|| format!("Failed to access reference image {}", path.display()))?;
+    if !meta.is_file() {
         anyhow::bail!(
-            "Reference image {} is {} bytes, exceeds {:.1} MB limit. \
-             Use a smaller or compressed image.",
+            "Reference image {} is not a regular file — refusing to read it.",
             path.display(),
-            metadata.len(),
-            mb,
         );
     }
-    local_image_to_data_uri(path).await
+    if meta.len() > MAX_REFERENCE_INPUT_BYTES {
+        anyhow::bail!(
+            "Reference image {} is limited to 50 MB, got {} bytes. Use a smaller image.",
+            path.display(),
+            meta.len(),
+        );
+    }
+    // Extension gate before reading the file: HEIC/HEIF, GIF, BMP and unknown
+    // files are rejected without reading them (a 49 MB HEIC must not be read
+    // just to be refused).
+    check_reference_extension(path)?;
+    let bytes = tokio::time::timeout(REFERENCE_READ_TIMEOUT, tokio::fs::read(path))
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out reading reference image {}", path.display()))?
+        .map_err(|e| anyhow::anyhow!("Failed to read reference image {}: {e}", path.display()))?;
+
+    // Content sniff: catches mislabeled or undecodable files that the
+    // extension gate let through (the format gate rejects them up front
+    // instead of sending undecoded bytes to the provider).
+    let format = sniff_reference_content(path, &bytes)?;
+
+    // Under the cap → pass through unchanged (current behavior preserved).
+    if bytes.len() as u64 <= max_bytes {
+        return Ok(ReferenceImage {
+            data_uri: format!(
+                "data:{};base64,{}",
+                format.to_mime_type(),
+                STANDARD.encode(&bytes)
+            ),
+            source_bytes: bytes,
+            next_step: 0,
+            released: false,
+        });
+    }
+
+    // Over the cap → bounded compression ladder, in-memory only.
+    let mut step = 0;
+    loop {
+        if step >= REFERENCE_COMPRESSION_LADDER.len() {
+            // Exact bytes + decimal MB ("1500000 bytes (1.5 MB)") — errors
+            // must not confuse MiB with MB.
+            #[allow(clippy::cast_precision_loss)]
+            let cap = format!(
+                "{} bytes ({:.1} MB)",
+                max_bytes,
+                max_bytes as f64 / 1_000_000.0
+            );
+            anyhow::bail!(
+                "Reference image {} is {} bytes and cannot be compressed under the {} cap \
+                 after {} bounded steps. Use a smaller or simpler image.",
+                path.display(),
+                bytes.len(),
+                cap,
+                step,
+            );
+        }
+        let out = with_block_in_place(|| compress_reference_step(&bytes, step))?;
+        if out.len() as u64 <= max_bytes {
+            return Ok(ReferenceImage {
+                data_uri: format!("{JPEG_DATA_URI_PREFIX}{}", STANDARD.encode(&out)),
+                source_bytes: bytes,
+                next_step: step + 1,
+                released: false,
+            });
+        }
+        step += 1;
+    }
+}
+
+/// Pre-flight combined-size check for multi-reference requests: sums metadata
+/// lengths BEFORE any file is read, so a pathological total is refused without
+/// loading the references into memory (the per-image ceiling does not bound
+/// the sum).
+pub(crate) async fn check_reference_total_input(paths: &[PathBuf]) -> anyhow::Result<()> {
+    let mut total: u64 = 0;
+    for path in paths {
+        total += tokio::fs::metadata(path)
+            .await
+            .with_context(|| format!("Failed to access reference image {}", path.display()))?
+            .len();
+    }
+    if total > MAX_TOTAL_REFERENCE_INPUT_BYTES {
+        anyhow::bail!(
+            "Combined reference images are limited to 100 MB, got {total} bytes total. \
+             Use fewer or smaller images.",
+        );
+    }
+    Ok(())
+}
+
+/// Reject non-PNG/JPEG/WebP extensions before reading the file.
+fn check_reference_extension(path: &Path) -> anyhow::Result<()> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    if !matches!(ext.as_deref(), Some("png" | "jpg" | "jpeg" | "webp")) {
+        anyhow::bail!(
+            "Reference image {}: unsupported format ({}). Only PNG, JPEG, or WebP \
+             images are accepted.",
+            path.display(),
+            ext.as_deref().unwrap_or("unknown extension"),
+        );
+    }
+    Ok(())
+}
+
+/// Content-sniff the actual image format (via the in-tree `image` crate),
+/// accepting only PNG/JPEG/WebP.
+fn sniff_reference_content(path: &Path, bytes: &[u8]) -> anyhow::Result<image::ImageFormat> {
+    let format = image::guess_format(bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "Reference image {}: content is not a decodable image (PNG/JPEG/WebP). \
+             HEIC/HEIF and other unsupported formats are not accepted.",
+            path.display(),
+        )
+    })?;
+    match format {
+        image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP => Ok(format),
+        other => anyhow::bail!(
+            "Reference image {}: unsupported image format ({other:?}). Only PNG, JPEG, \
+             or WebP images are accepted.",
+            path.display(),
+        ),
+    }
+}
+
+/// One bounded compression step: decode, optionally downscale, flatten alpha
+/// onto white, and re-encode as JPEG at the ladder's quality.
+fn compress_reference_step(bytes: &[u8], step: usize) -> anyhow::Result<Vec<u8>> {
+    use image::GenericImageView;
+    // Both call sites guarantee `step < REFERENCE_COMPRESSION_LADDER.len()`.
+    let (scale, quality) = REFERENCE_COMPRESSION_LADDER[step];
+    let mut img = image::load_from_memory(bytes).context("Failed to decode reference image")?;
+    // EXIF orientation is metadata, not pixels: `load_from_memory` returns the
+    // stored pixels as-is, and the JPEG encoder below starts from an empty EXIF
+    // buffer — so over-cap phone JPEGs would otherwise be re-encoded silently
+    // rotated from the user's intent. Apply the tag before downscaling so the
+    // output dimensions reflect the true orientation.
+    if let Some(orientation) = exif_orientation(bytes) {
+        img.apply_orientation(orientation);
+    }
+    let img = if scale < 1.0 {
+        let (w, h) = img.dimensions();
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let nw = (w as f32 * scale).round().max(1.0) as u32;
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let nh = (h as f32 * scale).round().max(1.0) as u32;
+        img.resize(nw, nh, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let rgb = flatten_alpha_onto_white(&img);
+    let mut out = Vec::new();
+    {
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
+        encoder
+            .encode(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .context("Failed to encode compressed reference image")?;
+    }
+    Ok(out)
+}
+
+/// Read the EXIF orientation tag from a raw image without decoding pixels
+/// (header-only parse via the decoder's `orientation()`).
+fn exif_orientation(bytes: &[u8]) -> Option<image::metadata::Orientation> {
+    use image::ImageDecoder;
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut decoder = reader.into_decoder().ok()?;
+    match decoder.orientation().ok()? {
+        image::metadata::Orientation::NoTransforms => None,
+        orientation => Some(orientation),
+    }
+}
+
+/// Flatten any alpha channel onto a white background and return RGB pixels
+/// (JPEG has no alpha channel; user uploads may carry transparency).
+fn flatten_alpha_onto_white(img: &image::DynamicImage) -> image::RgbImage {
+    // Opaque sources (JPEG, WebP-without-alpha) need no flattening — a single
+    // copy instead of to_rgba8 + a second RgbImage pass.
+    if !img.color().has_alpha() {
+        return img.to_rgb8();
+    }
+    let rgba = img.to_rgba8();
+    let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
+    for (x, y, px) in rgba.enumerate_pixels() {
+        let [r, g, b, a] = px.0;
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let alpha = f32::from(a) / 255.0;
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let blend = |c: u8| (f32::from(c) * alpha + 255.0 * (1.0 - alpha)).round() as u8;
+        rgb.put_pixel(x, y, image::Rgb([blend(r), blend(g), blend(b)]));
+    }
+    rgb
 }
 
 /// Recognized video file extensions (single source of truth for inbound
@@ -1633,5 +1938,127 @@ mod gaussian_sampler_tests {
             assert_eq!(z1, r * theta.cos(), "z1 for ({u1}, {u2})");
             assert_eq!(z2, r * theta.sin(), "z2 for ({u1}, {u2})");
         }
+    }
+}
+
+// ── Reference-image loader (validation + compression ladder) ─────────────
+
+#[cfg(test)]
+mod reference_image_tests {
+    use super::*;
+    use crate::util::test::noisy_png;
+
+    #[tokio::test]
+    async fn under_cap_passes_through_unchanged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("small.png");
+        let bytes = noisy_png(64, 64);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let img = load_reference_image(&path, 1_500_000).await.unwrap();
+        assert_eq!(
+            img.data_uri(),
+            format!("data:image/png;base64,{}", STANDARD.encode(&bytes))
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::cast_possible_truncation)]
+    async fn over_cap_is_compressed_under_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("big.png");
+        let bytes = noisy_png(1376, 768);
+        assert!(
+            bytes.len() as u64 > 1_500_000,
+            "noise PNG should exceed the cap (got {} bytes)",
+            bytes.len()
+        );
+        std::fs::write(&path, &bytes).unwrap();
+
+        let img = load_reference_image(&path, 1_500_000).await.unwrap();
+        assert!(img.data_uri().starts_with("data:image/jpeg;base64,"));
+        let decoded = STANDARD
+            .decode(img.data_uri().split(',').nth(1).unwrap())
+            .unwrap();
+        assert!(decoded.len() as u64 <= 1_500_000);
+    }
+
+    #[tokio::test]
+    async fn unsupported_extension_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("photo.heic");
+        std::fs::write(&path, b"\x00\x00\x00\x18ftypheic").unwrap();
+        let Err(err) = load_reference_image(&path, 1_500_000).await else {
+            panic!("HEIC reference should be rejected");
+        };
+        assert!(err.to_string().contains("unsupported format"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn undecodable_content_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("fake.png");
+        std::fs::write(&path, b"this is not an image").unwrap();
+        let Err(err) = load_reference_image(&path, 1_500_000).await else {
+            panic!("undecodable reference should be rejected");
+        };
+        assert!(err.to_string().contains("not a decodable image"), "{err}");
+    }
+
+    /// Inject an EXIF orientation tag (0x0112 = 6 → Rotate90) into a JPEG right
+    /// after the SOI marker. The stored pixels stay unrotated; a viewer (or the
+    /// compression path) must rotate them per the tag.
+    fn jpeg_with_exif_orientation(jpeg: &[u8]) -> Vec<u8> {
+        assert!(jpeg.starts_with(&[0xFF, 0xD8]));
+        let mut out = jpeg[..2].to_vec();
+        // APP1: FF E1, length 0x0022 = 2 (len) + 6 ("Exif\0\0") + 26 (TIFF).
+        out.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x22]);
+        out.extend_from_slice(b"Exif\0\0");
+        // Little-endian TIFF: header (8) + IFD (2 count + 12 entry + 4 next).
+        out.extend_from_slice(&[
+            0x49, 0x49, 0x2A, 0x00, // "II", 42
+            0x08, 0x00, 0x00, 0x00, // IFD offset = 8
+            0x01, 0x00, // 1 entry
+            0x12, 0x01, 0x03, 0x00, // tag 0x0112, type SHORT
+            0x01, 0x00, 0x00, 0x00, // count = 1
+            0x06, 0x00, 0x00, 0x00, // value = 6 (Rotate90)
+            0x00, 0x00, 0x00, 0x00, // next IFD = none
+        ]);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    #[test]
+    fn over_cap_jpeg_exif_orientation_applied() {
+        use image::GenericImageView;
+        // 2x1 JPEG stored with EXIF orientation=6 (Rotate90): the compressed
+        // output must come out 1x2 — a silently-rotated reference is exactly
+        // the class of invisible corruption this pipeline exists to prevent.
+        let src = image::RgbImage::from_fn(2, 1, |x, _| {
+            if x == 0 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            }
+        });
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode_image(&image::DynamicImage::ImageRgb8(src))
+            .unwrap();
+        let oriented = jpeg_with_exif_orientation(&jpeg);
+
+        // Sanity: the crafted file's decoder reports the intended rotation.
+        use image::ImageDecoder;
+        let reader = image::ImageReader::new(std::io::Cursor::new(&oriented))
+            .with_guessed_format()
+            .unwrap();
+        assert_eq!(
+            reader.into_decoder().unwrap().orientation().unwrap(),
+            image::metadata::Orientation::Rotate90
+        );
+
+        let out = compress_reference_step(&oriented, 0).unwrap();
+        let decoded = image::load_from_memory(&out).unwrap();
+        assert_eq!(decoded.dimensions(), (1, 2));
     }
 }

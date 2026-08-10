@@ -879,3 +879,25 @@ mod retry_policy_guard_tests {
         let _lock = retry_tests_lock(); // must not panic despite poisoning
     }
 }
+
+/// Deterministic per-pixel noise that defeats PNG compression (used by the
+/// reference-image loader and body-budget tests to build reliably large files).
+pub fn noisy_png(width: u32, height: u32) -> Vec<u8> {
+    use image::{ImageBuffer, Rgb};
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(width, height, |x, y| {
+        let mut v = x.wrapping_mul(0x9E37_79B9) ^ y.wrapping_mul(0x85EB_CA6B);
+        v ^= v >> 13;
+        v ^= v << 17;
+        v ^= v >> 5;
+        Rgb([
+            (v & 0xFF) as u8,
+            ((v >> 8) & 0xFF) as u8,
+            ((v >> 16) & 0xFF) as u8,
+        ])
+    });
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .unwrap();
+    out
+}

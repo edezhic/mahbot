@@ -6,7 +6,7 @@ use crate::{Tool, Workspace};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -60,19 +60,6 @@ impl Tool for ImageGenTool {
         let size = super::get_opt_str(&args, "size");
         let images: Vec<String> = super::get_str_array(&args, "images");
 
-        // Load reference images before any request so count validation and
-        // file errors surface deterministically.
-        let mut reference_uris = Vec::with_capacity(images.len());
-        for img_path in &images {
-            reference_uris.push(
-                crate::util::load_reference_image(
-                    Path::new(img_path),
-                    super::MAX_REFERENCE_IMAGE_BYTES,
-                )
-                .await?,
-            );
-        }
-
         // Capability and parameter decisions come from the catalog; a catalog
         // outage degrades to minimal user-provided parameters (fail-open).
         let catalog = crate::tools::image_catalog::get_catalog().await;
@@ -81,20 +68,64 @@ impl Tool for ImageGenTool {
             None => None,
         };
 
+        // Pre-flight reference-count validation BEFORE loading any files: a
+        // too-many-refs error must not first read every reference into memory.
+        // The catalog declares the per-model cap; the fail-open path (catalog
+        // unavailable) falls back to the universal OpenRouter limit.
+        if let Some(info) = info
+            && !images.is_empty()
+        {
+            validate_reference_count(&model, info, images.len())?;
+        } else if images.len() > super::MAX_REFERENCE_IMAGES_PER_REQUEST {
+            anyhow::bail!(
+                "Image generation supports at most {} reference image(s), got {}. \
+                 Retry with fewer images.",
+                super::MAX_REFERENCE_IMAGES_PER_REQUEST,
+                images.len(),
+            );
+        }
+
+        // Combined-size pre-flight before loading any file: the per-image
+        // ceilings don't bound the total, and a pathological multi-reference
+        // request must be refused without reading everything into memory first.
+        if !images.is_empty() {
+            crate::util::check_reference_total_input(
+                &images.iter().map(PathBuf::from).collect::<Vec<_>>(),
+            )
+            .await?;
+        }
+
+        // Load reference images so file errors surface deterministically.
+        let mut references = Vec::with_capacity(images.len());
+        for img_path in &images {
+            references.push(
+                crate::util::load_reference_image(
+                    Path::new(img_path),
+                    super::MAX_REFERENCE_IMAGE_BYTES,
+                )
+                .await?,
+            );
+        }
+
         // Fail-open sends only an explicitly user-provided aspect ratio.
         let resolved_aspect_ratio = match info {
             Some(_) => Some(resolve_aspect_ratio(aspect_ratio_arg, &images)),
             None => aspect_ratio_arg.map(String::from),
         };
 
-        let body = build_request_body(
+        let mut body = build_request_body(
             &model,
             prompt,
             resolved_aspect_ratio.as_deref(),
             size,
-            &reference_uris,
+            &references,
             info,
-        )?;
+        );
+
+        // Aggregate body budget: per-image caps don't bound multi-reference
+        // totals, so compress references further until the serialized request
+        // fits the provider's ~2 MB body limit.
+        super::fit_request_body_budget(&mut body, &mut references, super::MAX_REQUEST_BODY_BYTES)?;
 
         let api_base =
             crate::providers::ensure_base_url(&crate::config::CONFIG.provider_endpoint());
@@ -581,18 +612,16 @@ async fn record_image_gen_call(
 /// `None` means the catalog is unavailable (fail-open) — only explicitly
 /// user-provided parameters are sent.
 ///
-/// # Errors
-///
-/// - Reference-image count exceeds the model's declared `input_references` cap.
-/// - Reference images provided for a model that does not declare `input_references`.
+/// Reference-count validation happens in `execute`'s pre-flight guard before
+/// any file is loaded; this builder trusts the caller's count.
 fn build_request_body(
     model: &str,
     prompt: &str,
     aspect_ratio: Option<&str>,
     size: Option<&str>,
-    reference_uris: &[String],
+    references: &[crate::util::ReferenceImage],
     info: Option<&ImageModelInfo>,
-) -> anyhow::Result<serde_json::Value> {
+) -> serde_json::Value {
     let mut body = json!({
         "model": model,
         "prompt": prompt,
@@ -629,21 +658,8 @@ fn build_request_body(
             }
         }
 
-        if !reference_uris.is_empty() {
-            match info.range_max("input_references") {
-                #[allow(clippy::cast_possible_wrap)]
-                Some(max) if reference_uris.len() as i64 > max => anyhow::bail!(
-                    "Model `{model}` supports at most {max} reference image(s), \
-                     got {}. Retry with fewer images.",
-                    reference_uris.len(),
-                ),
-                Some(_) => {}
-                None => anyhow::bail!(
-                    "Model `{model}` does not support reference images. \
-                     Retry without the `images` parameter."
-                ),
-            }
-            body["input_references"] = reference_json(reference_uris);
+        if !references.is_empty() {
+            body[super::INPUT_REFERENCES_KEY] = super::reference_json(references);
         }
     } else {
         // Fail-open: send only what the user explicitly provided.
@@ -655,24 +671,34 @@ fn build_request_body(
                 "size `{s}` dropped — catalog unavailable, only user-provided parameters are sent"
             );
         }
-        if !reference_uris.is_empty() {
-            body["input_references"] = reference_json(reference_uris);
+        if !references.is_empty() {
+            body[super::INPUT_REFERENCES_KEY] = super::reference_json(references);
         }
     }
 
-    Ok(body)
+    body
 }
 
-/// Build the `input_references` array (image_url entries) for the dedicated surface.
-fn reference_json(uris: &[String]) -> serde_json::Value {
-    json!(
-        uris.iter()
-            .map(|uri| json!({
-                "type": "image_url",
-                "image_url": { "url": uri }
-            }))
-            .collect::<Vec<_>>()
-    )
+/// Validate the reference count against the catalog's `input_references`
+/// range. Runs in execute's pre-flight guard, before any file is loaded.
+fn validate_reference_count(
+    model: &str,
+    info: &ImageModelInfo,
+    count: usize,
+) -> anyhow::Result<()> {
+    match info.range_max("input_references") {
+        #[allow(clippy::cast_possible_wrap)]
+        Some(max) if count as i64 > max => anyhow::bail!(
+            "Model `{model}` supports at most {max} reference image(s), \
+             got {count}. Retry with fewer images.",
+        ),
+        Some(_) => {}
+        None => anyhow::bail!(
+            "Model `{model}` does not support reference images. \
+             Retry without the `images` parameter."
+        ),
+    }
+    Ok(())
 }
 
 /// All canonical aspect ratios supported by OpenRouter, mapped to their float
@@ -874,40 +900,55 @@ mod tests {
         .expect("valid fixture")
     }
 
-    fn refs(n: usize) -> Vec<String> {
-        vec!["data:image/png;base64,a".to_string(); n]
+    /// Build `n` real validated reference images from one tiny PNG file.
+    async fn refs(n: usize) -> Vec<crate::util::ReferenceImage> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ref.png");
+        std::fs::write(&path, crate::util::test::noisy_png(1, 1)).unwrap();
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(
+                crate::util::load_reference_image(&path, super::super::MAX_REFERENCE_IMAGE_BYTES)
+                    .await
+                    .unwrap(),
+            );
+        }
+        out
     }
 
-    #[test]
-    fn test_build_request_body_catalog_driven() {
+    #[tokio::test]
+    async fn test_build_request_body_catalog_driven() {
         let catalog = fixture_catalog();
         let qwen = catalog.find("qwen/qwen-image-3-pro");
 
         // size "2k" → resolution "2K" (catalog case); 9:16; two references.
+        let refs = refs(2).await;
         let body = build_request_body(
             "qwen/qwen-image-3-pro",
             "a cat",
             Some("9:16"),
             Some("2k"),
-            &refs(2),
+            &refs,
             qwen,
-        )
-        .unwrap();
+        );
         assert_eq!(body["model"], "qwen/qwen-image-3-pro");
         assert_eq!(body["prompt"], "a cat");
         assert_eq!(body["resolution"], "2K");
         assert_eq!(body["aspect_ratio"], "9:16");
         assert_eq!(body["input_references"].as_array().unwrap().len(), 2);
-        assert_eq!(
-            body["input_references"][0]["image_url"]["url"],
-            "data:image/png;base64,a"
+        assert!(
+            body["input_references"][0]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,"),
+            "reference should be a data URI"
         );
         assert!(body.get("size").is_none());
         assert!(body.get("n").is_none());
     }
 
-    #[test]
-    fn test_build_request_body_omits_undeclared_and_validates_caps() {
+    #[tokio::test]
+    async fn test_build_request_body_omits_undeclared_and_validates_caps() {
         let catalog = fixture_catalog();
         let recraft = catalog.find("recraft/recraft-v4.1");
         let qwen = catalog.find("qwen/qwen-image-3-pro");
@@ -920,8 +961,7 @@ mod tests {
             Some("2K"),
             &[],
             recraft,
-        )
-        .unwrap();
+        );
         assert!(body.get("resolution").is_none());
         assert_eq!(body["aspect_ratio"], "9:16");
 
@@ -934,14 +974,12 @@ mod tests {
             Some("1024X1024"),
             &[],
             qwen,
-        )
-        .unwrap();
+        );
         assert!(body.get("resolution").is_none());
         assert!(body.get("size").is_none());
 
         // "auto" not declared by qwen → falls back to the 9:16 default.
-        let body = build_request_body("qwen/qwen-image-3-pro", "p", Some("auto"), None, &[], qwen)
-            .unwrap();
+        let body = build_request_body("qwen/qwen-image-3-pro", "p", Some("auto"), None, &[], qwen);
         assert_eq!(body["aspect_ratio"], "9:16");
 
         // recraft declares "auto" → passed through.
@@ -952,30 +990,28 @@ mod tests {
             None,
             &[],
             recraft,
-        )
-        .unwrap();
+        );
         assert_eq!(body["aspect_ratio"], "auto");
 
-        // Reference overflow → error, not truncation.
-        let err = build_request_body("qwen/qwen-image-3-pro", "p", None, None, &refs(5), qwen)
-            .unwrap_err();
+        // Reference overflow → error (count validated pre-flight, not
+        // truncated by the body builder).
+        let err = validate_reference_count("qwen/qwen-image-3-pro", qwen.unwrap(), 5).unwrap_err();
         assert!(err.to_string().contains("at most 4 reference image(s)"));
 
         // Model without input_references → error when images provided.
-        let text_only = catalog.find("text-only/model");
-        let err = build_request_body("text-only/model", "p", None, None, &refs(1), text_only)
-            .unwrap_err();
+        let text_only = catalog.find("text-only/model").unwrap();
+        let err = validate_reference_count("text-only/model", text_only, 1).unwrap_err();
         assert!(
             err.to_string()
                 .contains("does not support reference images")
         );
     }
 
-    #[test]
-    fn test_build_request_body_fail_open_minimal() {
+    #[tokio::test]
+    async fn test_build_request_body_fail_open_minimal() {
         // info = None (catalog unavailable): only user-provided params are sent.
-        let body =
-            build_request_body("any/model", "p", Some("16:9"), Some("2k"), &refs(1), None).unwrap();
+        let refs = refs(1).await;
+        let body = build_request_body("any/model", "p", Some("16:9"), Some("2k"), &refs, None);
         assert_eq!(body["model"], "any/model");
         assert_eq!(body["prompt"], "p");
         assert_eq!(body["aspect_ratio"], "16:9");
@@ -983,7 +1019,7 @@ mod tests {
         assert!(body.get("resolution").is_none());
 
         // No aspect ratio provided → not sent at all (no default in fail-open).
-        let body = build_request_body("any/model", "p", None, None, &[], None).unwrap();
+        let body = build_request_body("any/model", "p", None, None, &[], None);
         assert!(body.get("aspect_ratio").is_none());
         assert!(body.get("input_references").is_none());
     }

@@ -143,6 +143,10 @@ minimp3 = "0.5"
 
 imagesize = "0.14.0"
 
+# Image decode/re-encode for reference-image compression (already compiled via
+# iced's image feature; promoted to a direct dependency for the loader)
+image = "0.25"
+
 # Tree-sitter for code navigation
 tree-sitter = "0.26"
 tree-sitter-rust = "0.23"

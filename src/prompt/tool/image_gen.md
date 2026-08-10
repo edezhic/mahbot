@@ -1,1 +1,3 @@
 Generate an image using an AI image generation model. Supports text-to-image and image-to-image (when reference images are provided). Returns the path to the generated image file — reference it as [IMAGE:path] in your reply.
+
+Reference image limits: each reference must be a PNG, JPEG, or WebP file. References larger than 1.5 MB are automatically compressed (downscaled and re-encoded as JPEG) to fit, and multiple references may be compressed further so the total request stays within the provider's body limit. Missing, unreadable, or undecodable references are hard errors — fix or remove them and retry.

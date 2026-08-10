@@ -4061,6 +4061,7 @@ dependencies = [
  "iced_selection",
  "iced_term",
  "ignore",
+ "image",
  "imagesize",
  "jsonrepair-rs",
  "libc",

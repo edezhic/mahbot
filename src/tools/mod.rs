@@ -31,7 +31,29 @@ pub(crate) const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 /// Maximum size for a single reference image in bytes.
 /// OpenRouter enforces a ~2 MB request body limit; base64 adds ~33% overhead so
 /// we cap raw image data at 1.5 MB (1_500_000 bytes) to stay well under.
+/// Over-cap references are compressed by the loader (see `load_reference_image`).
+/// Note: the aggregate body budget (`MAX_REQUEST_BODY_BYTES`) re-encodes even
+/// under-cap references when the serialized request exceeds it, so literal
+/// pass-through holds up to ~1.499 MB per single reference (base64 of 1.5 MB
+/// already reaches the 2 MB budget once the data-URI prefix and JSON envelope
+/// are added).
 const MAX_REFERENCE_IMAGE_BYTES: u64 = 1_500_000;
+
+/// Aggregate budget for the serialized generation request body. The per-image
+/// cap does not bound the total body when multiple references are present, so
+/// the final serialized body is checked against this budget and references are
+/// compressed further until it fits. The 2 MB figure is a client-side sanity
+/// budget mirroring the pre-existing ~2 MB provider body-limit premise (not a
+/// documented OpenRouter number); the dev-time /videos acceptance test verified
+/// the common case against the live provider.
+const MAX_REQUEST_BODY_BYTES: usize = 2_000_000;
+
+/// Conservative cap on reference images per generation request, applied only
+/// when the model catalog is unavailable (fail-open). Per-model caps come from
+/// the catalog; provider acceptance of `input_references` varies, so this is a
+/// memory-bounding sanity limit — the aggregate body budget is the real
+/// backstop for what reaches the wire.
+pub(crate) const MAX_REFERENCE_IMAGES_PER_REQUEST: usize = 16;
 
 /// Canonical list of argument aliases for file path parameters.
 ///
@@ -51,6 +73,81 @@ fn check_file_size(meta: &std::fs::Metadata) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+// ── Generation request reference images ─────────────────────────────────
+
+/// Build the OpenRouter `input_references` array (image_url entries) for
+/// generation requests. Single source of truth for the reference request shape.
+fn reference_json(references: &[crate::util::ReferenceImage]) -> serde_json::Value {
+    serde_json::json!(
+        references
+            .iter()
+            .map(|r| serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": r.data_uri() }
+            }))
+            .collect::<Vec<_>>()
+    )
+}
+
+/// Key of the reference-image array in the generation request body.
+const INPUT_REFERENCES_KEY: &str = "input_references";
+
+/// Ensure the final serialized request body fits `max_body_bytes`, compressing
+/// references (largest first, falling through to the next-largest when a
+/// reference's ladder is exhausted) one step at a time until it does. The
+/// per-image cap does not bound the total body (N refs × cap), so this is the
+/// real guard against oversized generation requests.
+///
+/// The reference array is always (re)synced from the current reference state
+/// when references are present, so a caller cannot silently drop them; the
+/// loop rewrites it after each compression step.
+pub(crate) fn fit_request_body_budget(
+    body: &mut serde_json::Value,
+    references: &mut [crate::util::ReferenceImage],
+    max_body_bytes: usize,
+) -> anyhow::Result<()> {
+    if !references.is_empty() {
+        body[INPUT_REFERENCES_KEY] = reference_json(references);
+    }
+    loop {
+        if serde_json::to_vec(body)?.len() <= max_body_bytes {
+            // The request body is final — drop the retained source bytes so
+            // they don't sit in memory through the generation fetch/poll.
+            for r in references {
+                r.release_source_bytes();
+            }
+            return Ok(());
+        }
+        let Some(idx) = references
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.has_compression_left())
+            .max_by_key(|(_, r)| r.data_uri().len())
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
+        references[idx].compress_more()?;
+        body[INPUT_REFERENCES_KEY] = reference_json(references);
+    }
+    let body_len = serde_json::to_vec(body)?.len();
+    if references.is_empty() {
+        anyhow::bail!(
+            "Generation request body is too large ({body_len} bytes; limit {max_body_bytes} bytes). \
+             Shorten the prompt.",
+        );
+    }
+    let advice = if references.len() > 1 {
+        "Reduce the reference image size, the number of references, or the prompt length."
+    } else {
+        "Reduce the reference image size or shorten the prompt."
+    };
+    anyhow::bail!(
+        "Generation request body is too large ({body_len} bytes after compression; \
+         limit {max_body_bytes} bytes). {advice}",
+    );
 }
 
 // ── Re-exports ─────────────────────────────────────────────────────────
@@ -760,5 +857,76 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(tmp.path()).await;
+    }
+
+    // ── Reference-image body budget ─────────────────────────────────
+
+    #[tokio::test]
+    async fn reference_body_budget_compresses_further() {
+        const BUDGET: usize = 150_000;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ref.png");
+        std::fs::write(&path, crate::util::test::noisy_png(512, 512)).unwrap();
+        let mut refs = vec![
+            crate::util::load_reference_image(&path, MAX_REFERENCE_IMAGE_BYTES)
+                .await
+                .unwrap(),
+        ];
+        let original = refs[0].data_uri().to_string();
+        let mut body = serde_json::json!({
+            "model": "test",
+            "prompt": "test",
+            "input_references": reference_json(&refs),
+        });
+        // The per-image cap passes a 512×512 ref through unchanged (~1 MB
+        // base64 body); a small budget forces the aggregate ladder.
+        assert!(serde_json::to_vec(&body).unwrap().len() > BUDGET);
+        fit_request_body_budget(&mut body, &mut refs, BUDGET).unwrap();
+        assert!(serde_json::to_vec(&body).unwrap().len() <= BUDGET);
+        assert_ne!(
+            refs[0].data_uri(),
+            original,
+            "reference should be compressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_budget_falls_through_to_smaller_reference() {
+        // When the largest reference's ladder is exhausted, the loop must
+        // fall through to the next-largest instead of bailing.
+        let tmp = TempDir::new().unwrap();
+        let big = tmp.path().join("big.png");
+        let small = tmp.path().join("small.png");
+        std::fs::write(&big, crate::util::test::noisy_png(640, 640)).unwrap();
+        std::fs::write(&small, crate::util::test::noisy_png(128, 128)).unwrap();
+        let mut refs = vec![
+            crate::util::load_reference_image(&big, MAX_REFERENCE_IMAGE_BYTES)
+                .await
+                .unwrap(),
+            crate::util::load_reference_image(&small, MAX_REFERENCE_IMAGE_BYTES)
+                .await
+                .unwrap(),
+        ];
+        let small_original = refs[1].data_uri().to_string();
+        let mut body = serde_json::json!({
+            "model": "test",
+            "prompt": "test",
+            "input_references": reference_json(&refs),
+        });
+        // Exhaust the big reference's ladder, then measure the raw body so the
+        // budget can be pinned to a window that only the small reference can
+        // close — deterministically forcing the fall-through path.
+        while refs[0].has_compression_left() {
+            refs[0].compress_more().unwrap();
+        }
+        body[INPUT_REFERENCES_KEY] = reference_json(&refs);
+        let raw_body = serde_json::to_vec(&body).unwrap().len();
+        fit_request_body_budget(&mut body, &mut refs, raw_body - 1).unwrap();
+        assert!(serde_json::to_vec(&body).unwrap().len() < raw_body);
+        assert_ne!(
+            refs[1].data_uri(),
+            small_original,
+            "smaller reference should have been compressed"
+        );
     }
 }
