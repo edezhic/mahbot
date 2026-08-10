@@ -63,7 +63,7 @@ pub(crate) fn registry_initialized() -> bool {
 /// Created once per workspace (by [`get_or_init_engine`]), shared across all
 /// agents searching that workspace. The caller should ensure the background
 /// scan is complete (via [`ensure_scanned`]) before using the engine for
-/// searches — this is handled by the search tool's `resolve_engine` helper.
+/// searches — this is handled by [`resolve_engine`].
 #[derive(Debug)]
 pub(crate) struct SearchEngineEntry {
     /// Shared file picker used for both `files` and `grep` modes.
@@ -245,6 +245,25 @@ pub(crate) async fn ensure_scanned(entry: &SearchEngineEntry) -> Result<(), Stri
              Try searching again in a moment."
             .to_string())
     }
+}
+
+/// Get or init the engine for a workspace and ensure the background scan has
+/// finished — the shared entry point used by the search tool and the editor's
+/// global-search path.
+///
+/// `scan_error_prefix` is prepended to scan-readiness errors only; the
+/// editor's run path passes `"Search engine not ready: "` while other callers
+/// pass `""` to keep the raw error.
+pub(crate) async fn resolve_engine(
+    name: &str,
+    path: &str,
+    scan_error_prefix: &str,
+) -> Result<Arc<SearchEngineEntry>, String> {
+    let entry = get_or_init_engine(name, Path::new(path))?;
+    ensure_scanned(&entry)
+        .await
+        .map_err(|e| format!("{scan_error_prefix}{e}"))?;
+    Ok(entry)
 }
 
 // ── Lookup helpers for tools ───────────────────────────────────────────────

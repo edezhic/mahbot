@@ -1268,7 +1268,9 @@ async fn run_global_search(
 
     // Step 2: Get or init the search engine.
     let entry =
-        match crate::search_engine::get_or_init_engine(&ws_name, std::path::Path::new(&ws_path)) {
+        match crate::search_engine::resolve_engine(&ws_name, &ws_path, "Search engine not ready: ")
+            .await
+        {
             Ok(e) => e,
             Err(e) => {
                 return EditorMessage::GlobalSearchResults {
@@ -1278,13 +1280,6 @@ async fn run_global_search(
                 };
             }
         };
-    if let Err(e) = crate::search_engine::ensure_scanned(&entry).await {
-        return EditorMessage::GlobalSearchResults {
-            r#gen: gs_gen,
-            results: Vec::new(),
-            error: Some(format!("Search engine not ready: {e}")),
-        };
-    }
 
     // Step 3: Run grep on the blocking thread pool.
     let entry_for_blocking = Arc::clone(&entry);
@@ -2715,21 +2710,11 @@ impl EditorState {
         // Start scanning the search engine and show readiness status.
         let engine_task = Task::perform(
             async move {
-                match crate::search_engine::get_or_init_engine(
-                    &ws_name,
-                    std::path::Path::new(&ws_path),
-                ) {
-                    Ok(entry) => match crate::search_engine::ensure_scanned(&entry).await {
-                        Ok(()) => EditorMessage::GlobalSearchResults {
-                            r#gen: gs_gen,
-                            results: Vec::new(),
-                            error: None,
-                        },
-                        Err(e) => EditorMessage::GlobalSearchResults {
-                            r#gen: gs_gen,
-                            results: Vec::new(),
-                            error: Some(e),
-                        },
+                match crate::search_engine::resolve_engine(&ws_name, &ws_path, "").await {
+                    Ok(_) => EditorMessage::GlobalSearchResults {
+                        r#gen: gs_gen,
+                        results: Vec::new(),
+                        error: None,
                     },
                     Err(e) => EditorMessage::GlobalSearchResults {
                         r#gen: gs_gen,

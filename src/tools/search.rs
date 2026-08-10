@@ -14,7 +14,6 @@ use fff_search::parse_grep_query;
 use fff_search::{Constraint, GitStatusFilter};
 use serde_json::json;
 use std::fmt::Write;
-use std::sync::Arc;
 use std::sync::LazyLock;
 
 const DEFAULT_MAX_RESULTS: usize = 50;
@@ -201,19 +200,6 @@ fn resolve_query(args: &serde_json::Value) -> Option<String> {
 pub struct SearchTool;
 
 impl SearchTool {
-    /// Resolve the shared engine for a workspace and ensure the background
-    /// scan has finished.
-    ///
-    /// Returns an `Arc<SearchEngineEntry>` whose background scan is guaranteed
-    /// to be complete (or an error if the scan timed out).
-    async fn resolve_engine(
-        ws: &crate::Workspace,
-    ) -> Result<Arc<search_engine::SearchEngineEntry>, String> {
-        let entry = search_engine::get_or_init_engine(&ws.name, std::path::Path::new(&ws.path))?;
-        search_engine::ensure_scanned(&entry).await?;
-        Ok(entry)
-    }
-
     fn search_files(
         entry: &search_engine::SearchEngineEntry,
         query: &str,
@@ -320,7 +306,7 @@ impl SearchTool {
         if !crate::search_engine::registry_initialized() {
             return Ok(vec![]);
         }
-        let entry = Self::resolve_engine(ws)
+        let entry = search_engine::resolve_engine(&ws.name, &ws.path, "")
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
         let (paths, _, _) = Self::fuzzy_file_search(&entry, query, max_results, 0)?;
@@ -598,7 +584,7 @@ impl Tool for SearchTool {
 
         let offset = super::get_usize(&args, "offset", 0);
 
-        let entry = Self::resolve_engine(ws)
+        let entry = search_engine::resolve_engine(&ws.name, &ws.path, "")
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
