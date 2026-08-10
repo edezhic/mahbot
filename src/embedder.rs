@@ -294,11 +294,7 @@ async fn download_retry_loop() {
     let tokenizer_dest = models_dir.join(TOKENIZER_FILENAME);
 
     // Shared HTTP client reused across retries (avoids new TLS handshake per iteration).
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(MODEL_DOWNLOAD_TIMEOUT)
-        .connect_timeout(Duration::from_secs(30))
-        .build()
-    else {
+    let Ok(client) = crate::util::http::build_download_client(MODEL_DOWNLOAD_TIMEOUT) else {
         warn!("Embedder: failed to build HTTP client — background download cancelled");
         STATE.store(ModelState::Failed, Ordering::Release);
         return;

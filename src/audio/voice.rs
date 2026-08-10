@@ -3379,10 +3379,7 @@ async fn ensure_models_downloaded() -> Result<PathBuf> {
 
     tokio::fs::create_dir_all(&dir).await?;
 
-    let client = reqwest::Client::builder()
-        .timeout(MODEL_DOWNLOAD_TIMEOUT)
-        .connect_timeout(Duration::from_secs(30))
-        .build()
+    let client = crate::util::http::build_download_client(MODEL_DOWNLOAD_TIMEOUT)
         .context("Failed to build HTTP client for model download")?;
 
     ensure_model_file(&client, &dir, MEL_MODEL, "Mel spectrogram").await?;

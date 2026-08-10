@@ -257,6 +257,25 @@ pub fn build_http_client(timeout: Duration) -> reqwest::Client {
         .expect("Failed to build HTTP client (TLS initialization failure)")
 }
 
+/// Build an HTTP client for large model downloads: `total_timeout` per
+/// request plus a deliberate 30-second connect timeout.
+///
+/// The 30s connect timeout intentionally diverges from [`build_http_client`]'s
+/// 10s — model CDNs can be slow to accept connections, so a 10s fail-fast
+/// would abort large downloads. Do not "simplify" this back to 10s.
+///
+/// Returns `Result` so each caller keeps its own error handling (propagate via
+/// `?` or degrade gracefully). `total_timeout` is a per-site argument — the
+/// call sites' values are load-bearing (their retry loops wrap downloads in
+/// matching outer `tokio::time::timeout`) and must not be unified.
+pub(crate) fn build_download_client(total_timeout: Duration) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(total_timeout)
+        .connect_timeout(Duration::from_secs(30))
+        .build()
+        .map_err(anyhow::Error::from)
+}
+
 /// Size-check policy applied after a streaming download completes.
 pub(crate) enum DownloadSizeCheck {
     /// Require downloaded bytes to equal the Content-Length header (when present).

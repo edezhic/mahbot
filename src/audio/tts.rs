@@ -1010,10 +1010,7 @@ async fn ensure_file(f: &TtsFile) -> Result<()> {
 /// Download a single file with atomic write, SHA256 verification, and progress events.
 #[allow(clippy::cast_precision_loss)]
 async fn download_file(url: &str, dest: &Path, expected_hash: &str) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(MODEL_DOWNLOAD_TIMEOUT)
-        .connect_timeout(Duration::from_secs(30))
-        .build()
+    let client = crate::util::http::build_download_client(MODEL_DOWNLOAD_TIMEOUT)
         .context("Failed to build HTTP client")?;
 
     let file_name = dest

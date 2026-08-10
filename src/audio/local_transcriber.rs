@@ -554,6 +554,11 @@ async fn download_file(client: &reqwest::Client, file: &ModelFile, dest: &Path) 
 }
 
 /// Create a reqwest client with sensible defaults for model downloads.
+///
+/// Deliberately not [`crate::util::http::build_download_client`] — no client
+/// timeouts: per-request timeouts already bound each download (30 min model,
+/// 1 min small files) and the custom user-agent is kept. Connect-phase
+/// fail-fast is intentionally absent.
 fn download_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent("mahbot/0.3.0 (qwen-asr model downloader)")
