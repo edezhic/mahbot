@@ -72,6 +72,13 @@ const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 600;
 /// Absolute maximum allowed shell command timeout (1 hour).
 /// Prevents agents from setting absurdly long timeouts.
 const MAX_SHELL_TIMEOUT_SECS: u64 = 3600;
+/// Default bound on the post-exit output drain (seconds). After the main
+/// command exited, remaining output must drain within this bound — a leftover
+/// backgrounded process holding the pipes open otherwise blocks EOF forever.
+const DEFAULT_OUTPUT_DRAIN_TIMEOUT_SECS: u64 = 10;
+/// Grace window given to pipe readers to notice cancellation and return
+/// buffered partial output after a process-group kill.
+const DRAIN_CANCEL_GRACE: Duration = Duration::from_secs(2);
 /// Cap bytes collected from each pipe during command execution (including timeouts).
 ///
 /// # Truncation safety
@@ -182,6 +189,14 @@ enum ShellRunResult {
         pid: Option<u32>,
         elapsed: Duration,
     },
+    /// The main process exited but leftover processes kept the output pipes
+    /// open past the drain bound, so EOF never arrived.
+    DrainTimedOut {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        pid: Option<u32>,
+        elapsed: Duration,
+    },
     SpawnFailed(std::io::Error),
 }
 
@@ -245,14 +260,6 @@ fn spawn_pipe_reader(
     })
 }
 
-/// Await a pipe reader task that completed normally (no cancellation timeout).
-async fn await_pipe_reader(handle: tokio::task::JoinHandle<Vec<u8>>, label: &str) -> Vec<u8> {
-    handle.await.unwrap_or_else(|e| {
-        tracing::warn!(%e, "{label} reader task panicked");
-        Vec::new()
-    })
-}
-
 /// Await a pipe reader task with a grace timeout, used after killing a child
 /// process — the reader is given `cancellation_timeout` to notice cancellation
 /// and return whatever data it has buffered so far.
@@ -273,10 +280,121 @@ async fn await_pipe_reader_with_cancellation_timeout(
         })
 }
 
+/// Finish a pipe reader after a drain timeout: an already-completed reader
+/// (its output is `Some`) keeps its data — never re-awaited, tokio panics on
+/// JoinHandle re-poll — while a still-pending one gets the cancellation grace
+/// bound.
+async fn finish_partial_reader(
+    partial: Option<Vec<u8>>,
+    handle: tokio::task::JoinHandle<Vec<u8>>,
+    label: &str,
+) -> Vec<u8> {
+    match partial {
+        Some(data) => data,
+        None => {
+            await_pipe_reader_with_cancellation_timeout(handle, label, DRAIN_CANCEL_GRACE).await
+        }
+    }
+}
+
+/// Output-drain bound for [`run_command_with_timeout`]: after the main command
+/// exits, remaining output must drain within this bound. Overridable via env
+/// for tuning; tests pass explicit durations.
+fn output_drain_timeout() -> Duration {
+    crate::util::env_duration_secs(
+        "MAHBOT_SHELL_DRAIN_TIMEOUT_SECS",
+        DEFAULT_OUTPUT_DRAIN_TIMEOUT_SECS,
+    )
+}
+
+/// Kill the process group of a spawned shell (PGID == the child PID after
+/// `process_group(0)` in [`build_shell_command`]). Used when a leftover
+/// backgrounded process keeps the output pipes open after the main process
+/// exited (drain timeout) or was killed (command timeout) — prevents orphaned
+/// pipe-holding strays from accumulating.
+///
+/// Note on ordering: the timeout path deliberately kills before reaping the
+/// child (see [`run_command_with_timeout`]) to avoid a PID-reuse race; the
+/// drain path kills after `child.wait()` already reaped it, so the PID could
+/// in theory be recycled as a new group leader within the drain window —
+/// accepted risk, the kill is best-effort.
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    let pid_signed: libc::pid_t = pid.try_into().expect("PID fits in pid_t");
+    // SAFETY: kill(-pgid, SIGKILL) is the standard POSIX way to terminate an
+    // entire process group. The target PGID is our own child's PID (also its
+    // PGID after process_group(0)), so we own every process in the group.
+    let ret = unsafe { libc::kill(-pid_signed, libc::SIGKILL) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(
+            pid = pid,
+            err = %err,
+            "kill(-pgid, SIGKILL) failed — leftover processes may survive"
+        );
+    }
+}
+
+/// Result of draining both pipe readers within a bound.
+enum DrainOutcome {
+    /// Both readers hit EOF within the bound — full output.
+    Both(Vec<u8>, Vec<u8>),
+    /// The bound was exceeded (a leftover process holds a pipe open): each
+    /// field is `Some` only when that reader already completed. The caller
+    /// must not re-await a completed handle (tokio panics on re-poll); only
+    /// the `None` side is still pending.
+    Partial {
+        stdout: Option<Vec<u8>>,
+        stderr: Option<Vec<u8>>,
+    },
+}
+
+/// Drain both pipe readers with a bound — see [`DrainOutcome`].
+async fn drain_pipe_readers(
+    mut stdout_handle: &mut tokio::task::JoinHandle<Vec<u8>>,
+    mut stderr_handle: &mut tokio::task::JoinHandle<Vec<u8>>,
+    drain_limit: Duration,
+) -> DrainOutcome {
+    let drain = tokio::time::sleep(drain_limit);
+    tokio::pin!(drain);
+    let mut stdout_done = None;
+    let mut stderr_done = None;
+    loop {
+        tokio::select! {
+            biased;
+            r = &mut stdout_handle, if stdout_done.is_none() => {
+                stdout_done = Some(r.unwrap_or_else(|e| {
+                    tracing::warn!(%e, "stdout reader task panicked");
+                    Vec::new()
+                }));
+            }
+            r = &mut stderr_handle, if stderr_done.is_none() => {
+                stderr_done = Some(r.unwrap_or_else(|e| {
+                    tracing::warn!(%e, "stderr reader task panicked");
+                    Vec::new()
+                }));
+            }
+            () = &mut drain => break,
+        }
+        if stdout_done.is_some() && stderr_done.is_some() {
+            break;
+        }
+    }
+    match (stdout_done, stderr_done) {
+        (Some(stdout), Some(stderr)) => DrainOutcome::Both(stdout, stderr),
+        (stdout, stderr) => DrainOutcome::Partial { stdout, stderr },
+    }
+}
+
 /// Spawn `cmd`, read stdout/stderr concurrently, and enforce `timeout`.
+/// After the main process exits, remaining output must drain within
+/// `drain_limit` — a leftover backgrounded process holding the pipes open
+/// turns the drain into a bounded [`ShellRunResult::DrainTimedOut`] instead
+/// of an indefinite hang.
 async fn run_command_with_timeout(
     cmd: &mut tokio::process::Command,
     timeout: Duration,
+    drain_limit: Duration,
 ) -> ShellRunResult {
     let start = std::time::Instant::now();
 
@@ -293,19 +411,44 @@ async fn run_command_with_timeout(
     let stderr_pipe = child.stderr.take();
 
     let cancel = tokio_util::sync::CancellationToken::new();
-    let stdout_handle = spawn_pipe_reader(stdout_pipe, cancel.clone());
-    let stderr_handle = spawn_pipe_reader(stderr_pipe, cancel.clone());
+    let mut stdout_handle = spawn_pipe_reader(stdout_pipe, cancel.clone());
+    let mut stderr_handle = spawn_pipe_reader(stderr_pipe, cancel.clone());
 
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) => {
-            // Child exited naturally — readers get EOF and complete on their own.
-            let stdout = await_pipe_reader(stdout_handle, "stdout").await;
-            let stderr = await_pipe_reader(stderr_handle, "stderr").await;
-            ShellRunResult::Completed {
-                stdout,
-                stderr,
-                status,
-                elapsed: start.elapsed(),
+            // Child exited naturally — drain remaining output with a bound.
+            // A leftover backgrounded process that inherited the pipes prevents
+            // EOF; without the bound the drain would hang the tool forever.
+            match drain_pipe_readers(&mut stdout_handle, &mut stderr_handle, drain_limit).await {
+                DrainOutcome::Both(stdout, stderr) => ShellRunResult::Completed {
+                    stdout,
+                    stderr,
+                    status,
+                    elapsed: start.elapsed(),
+                },
+                DrainOutcome::Partial { stdout, stderr } => {
+                    // Drain bound exceeded: a leftover process still holds the
+                    // pipes. Kill its process group (mirroring the timeout
+                    // path), cancel the readers, and collect partial output so
+                    // the caller gets a visible, recoverable error instead of
+                    // a hang. Readers that already completed keep their output
+                    // (a completed JoinHandle must not be re-awaited).
+                    #[cfg(unix)]
+                    if let Some(pid) = pid {
+                        kill_process_group(pid);
+                    }
+                    cancel.cancel();
+                    let (stdout, stderr) = tokio::join!(
+                        finish_partial_reader(stdout, stdout_handle, "stdout"),
+                        finish_partial_reader(stderr, stderr_handle, "stderr"),
+                    );
+                    ShellRunResult::DrainTimedOut {
+                        stdout,
+                        stderr,
+                        pid,
+                        elapsed: start.elapsed(),
+                    }
+                }
             }
         }
         Ok(Err(e)) => ShellRunResult::SpawnFailed(e),
@@ -332,23 +475,7 @@ async fn run_command_with_timeout(
                 // Kill the entire process group.
                 // pgid == pid because build_shell_command calls
                 // process_group(0), making the child a PG leader.
-                let pid_signed: libc::pid_t = pid.try_into().expect("PID fits in pid_t");
-                // SAFETY: kill(-pgid, SIGKILL) is the standard POSIX way to
-                // terminate an entire process group. The target PGID is our
-                // own child's PID (which is also its PGID after
-                // process_group(0) in build_shell_command), so we have
-                // ownership over every process in the group. The unsafe is
-                // required by the libc crate's FFI interface.
-                let ret = unsafe { libc::kill(-pid_signed, libc::SIGKILL) };
-                if ret != 0 {
-                    let err = std::io::Error::last_os_error();
-                    tracing::warn!(
-                        pid = pid,
-                        err = %err,
-                        "kill(-pgid, SIGKILL) on timeout failed — \
-                         grandchildren may survive"
-                    );
-                }
+                kill_process_group(pid);
                 // Reap the child (now dead from one or both kills).
                 let _ = child.wait().await;
             }
@@ -365,13 +492,13 @@ async fn run_command_with_timeout(
             let stdout = await_pipe_reader_with_cancellation_timeout(
                 stdout_handle,
                 "stdout",
-                Duration::from_secs(2),
+                DRAIN_CANCEL_GRACE,
             )
             .await;
             let stderr = await_pipe_reader_with_cancellation_timeout(
                 stderr_handle,
                 "stderr",
-                Duration::from_secs(2),
+                DRAIN_CANCEL_GRACE,
             )
             .await;
             ShellRunResult::TimedOut {
@@ -430,6 +557,39 @@ fn format_timeout_error(
     msg.push_str("\nreason: command was killed after exceeding the timeout");
     msg.push_str(
         "\nhint: for known-long commands, pass a larger per-call timeout via the `timeout_secs` tool argument (max 3600s).",
+    );
+
+    append_output_tail(&mut msg, "stdout", stdout);
+    append_output_tail(&mut msg, "stderr", stderr);
+    msg
+}
+
+fn format_drain_timeout_error(
+    command: &str,
+    elapsed: Duration,
+    drain_limit: Duration,
+    pid: Option<u32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> String {
+    let mut msg = format!(
+        "Shell command output drain timed out.\n\
+         command: {command}\n\
+         elapsed: {:.1}s\n\
+         drain_limit: {:.0}s\n\
+         reason: the command exited but a leftover process kept the output \
+         pipes open past the drain limit, so EOF never arrived",
+        elapsed.as_secs_f64(),
+        drain_limit.as_secs_f64(),
+    );
+    if let Some(p) = pid {
+        // The main command's PID doubles as its process-group id; the group
+        // (not the already-reaped command) is what the drain timeout killed.
+        let _ = write!(msg, "\nkilled process group: {p}");
+    }
+    msg.push_str(
+        "\nhint: background processes must redirect their output \
+         (e.g. `nohup cmd >/dev/null 2>&1 &`) to release the tool's pipes.",
     );
 
     append_output_tail(&mut msg, "stdout", stdout);
@@ -497,11 +657,10 @@ impl ShellTool {
                 s.min(MAX_SHELL_TIMEOUT_SECS)
             });
         let timeout = Duration::from_secs(timeout_secs);
+        let drain_limit = output_drain_timeout();
 
-        #[cfg(unix)]
-        let mut result = run_command_with_timeout(&mut cmd, timeout).await;
-        #[cfg(not(unix))]
-        let result = run_command_with_timeout(&mut cmd, timeout).await;
+        #[cfg_attr(not(unix), allow(unused_mut))] // non-unix never mutates `result`
+        let mut result = run_command_with_timeout(&mut cmd, timeout, drain_limit).await;
 
         // Stream-size telemetry: the engine reports stdin-fed stream bytes
         // consumed via a stderr marker; strip it from the agent-visible stderr
@@ -519,7 +678,9 @@ impl ShellTool {
         // bytes — telemetry noise, accepted.
         #[cfg(unix)]
         let stream_bytes = match &mut result {
-            ShellRunResult::Completed { stderr, .. } | ShellRunResult::TimedOut { stderr, .. } => {
+            ShellRunResult::Completed { stderr, .. }
+            | ShellRunResult::TimedOut { stderr, .. }
+            | ShellRunResult::DrainTimedOut { stderr, .. } => {
                 if exec_str == command_str {
                     None
                 } else {
@@ -558,7 +719,7 @@ impl ShellTool {
                             .any(|w| w == grep_engine::STALE_BINARY_LOCK_MSG.as_bytes())
             ) {
             let mut original = build_shell_command(command_str, ws.as_path());
-            run_command_with_timeout(&mut original, timeout).await
+            run_command_with_timeout(&mut original, timeout, drain_limit).await
         } else {
             result
         };
@@ -626,6 +787,31 @@ impl ShellTool {
                 );
                 let msg =
                     format_timeout_error(command_str, elapsed, timeout, pid, &stdout, &stderr);
+                anyhow::bail!("{msg}");
+            }
+            ShellRunResult::DrainTimedOut {
+                stdout,
+                stderr,
+                pid,
+                elapsed,
+            } => {
+                tracing::warn!(
+                    command = command_str,
+                    elapsed_secs = elapsed.as_secs_f64(),
+                    drain_limit_secs = drain_limit.as_secs_f64(),
+                    ?pid,
+                    stdout_bytes = stdout.len(),
+                    stderr_bytes = stderr.len(),
+                    "Shell command output drain timed out — leftover process held the pipes"
+                );
+                let msg = format_drain_timeout_error(
+                    command_str,
+                    elapsed,
+                    drain_limit,
+                    pid,
+                    &stdout,
+                    &stderr,
+                );
                 anyhow::bail!("{msg}");
             }
             ShellRunResult::SpawnFailed(e) => anyhow::bail!(
@@ -2758,7 +2944,9 @@ mod tests {
     async fn run_command_with_timeout_kills_long_sleep() {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg("sleep 10");
-        let result = run_command_with_timeout(&mut cmd, Duration::from_secs(1)).await;
+        let result =
+            run_command_with_timeout(&mut cmd, Duration::from_secs(1), Duration::from_secs(10))
+                .await;
         match result {
             ShellRunResult::TimedOut { elapsed, .. } => {
                 assert!(
@@ -2775,7 +2963,9 @@ mod tests {
     async fn run_command_with_timeout_captures_partial_stdout() {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg("echo started; sleep 60");
-        let result = run_command_with_timeout(&mut cmd, Duration::from_secs(2)).await;
+        let result =
+            run_command_with_timeout(&mut cmd, Duration::from_secs(2), Duration::from_secs(10))
+                .await;
         match result {
             ShellRunResult::TimedOut { stdout, .. } => {
                 let s = String::from_utf8_lossy(&stdout);
@@ -2797,7 +2987,9 @@ mod tests {
     async fn shell_timeout_error_includes_diagnostics() {
         let tmp = TempDir::new().expect("tempdir");
         let mut cmd = build_shell_command("echo before-timeout; sleep 30", tmp.path());
-        let result = run_command_with_timeout(&mut cmd, Duration::from_secs(1)).await;
+        let result =
+            run_command_with_timeout(&mut cmd, Duration::from_secs(1), Duration::from_secs(10))
+                .await;
         let ShellRunResult::TimedOut {
             stdout,
             stderr,
@@ -2867,7 +3059,9 @@ mod tests {
         let cmd_str = format!("sleep 999 & echo $! > {pid_path_str}; wait");
         let mut cmd = build_shell_command(&cmd_str, dir.path());
 
-        let result = run_command_with_timeout(&mut cmd, Duration::from_secs(2)).await;
+        let result =
+            run_command_with_timeout(&mut cmd, Duration::from_secs(2), Duration::from_secs(10))
+                .await;
         assert!(
             matches!(result, ShellRunResult::TimedOut { .. }),
             "expected TimedOut, got {result:?}"
@@ -2895,6 +3089,116 @@ mod tests {
             err.raw_os_error(),
             Some(libc::ESRCH),
             "expected ESRCH (no such process) for grandchild pid={pid}, got: {err:?}"
+        );
+    }
+
+    /// A leftover backgrounded process holding the output pipes open must not
+    /// hang the drain after the main command exits — it errors within the
+    /// drain bound, and the leftover process group is killed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_drain_times_out_when_background_process_holds_pipes() {
+        let dir = TempDir::new().expect("tempdir");
+        let pid_path = dir.path().join("bg.pid");
+        let pid_path_str = pid_path.to_str().expect("valid utf-8 path");
+
+        // Main command exits immediately; `sleep 999 &` inherits
+        // stdout/stderr (no redirect), so EOF never arrives after sh exits.
+        let cmd_str = format!("echo before-drain; sleep 999 & echo $! > {pid_path_str}");
+        let mut cmd = build_shell_command(&cmd_str, dir.path());
+
+        let result = run_command_with_timeout(
+            &mut cmd,
+            Duration::from_secs(30),
+            Duration::from_millis(600),
+        )
+        .await;
+        let ShellRunResult::DrainTimedOut {
+            stdout,
+            stderr,
+            elapsed,
+            ..
+        } = result
+        else {
+            panic!("expected DrainTimedOut, got {result:?}");
+        };
+        let out = String::from_utf8_lossy(&stdout);
+        assert!(out.contains("before-drain"), "partial stdout: {out}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "drain should error within the bound: {elapsed:?}"
+        );
+
+        let msg = format_drain_timeout_error(
+            "test",
+            elapsed,
+            Duration::from_millis(600),
+            None,
+            &stdout,
+            &stderr,
+        );
+        assert!(msg.contains("drain"), "msg: {msg}");
+        assert!(msg.contains("before-drain"), "msg: {msg}");
+
+        // The leftover grandchild must be dead (PGID kill). Poll briefly —
+        // SIGKILL delivery + reap is immediate, but the kernel may lag under load.
+        let pid_content = std::fs::read_to_string(&pid_path)
+            .expect("grandchild PID file must exist — grandchild was launched");
+        let pid: i32 = pid_content.trim().parse().expect("valid PID from file");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut alive = true;
+        while std::time::Instant::now() < deadline {
+            // kill(pid, 0) checks existence without sending a real signal.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !alive,
+            "leftover (pid={pid}) should be dead after PGID kill"
+        );
+    }
+
+    /// Short-lived backgrounded jobs that finish within the drain bound keep
+    /// working — the drain completes normally.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_drain_completes_for_short_lived_background_job() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut cmd = build_shell_command("echo done; sleep 1 &", dir.path());
+        let result =
+            run_command_with_timeout(&mut cmd, Duration::from_secs(30), Duration::from_secs(5))
+                .await;
+        let ShellRunResult::Completed { stdout, .. } = result else {
+            panic!("expected Completed, got {result:?}");
+        };
+        assert!(String::from_utf8_lossy(&stdout).contains("done"));
+    }
+
+    /// A leftover process holding only ONE pipe (stdout EOFs, stderr hangs)
+    /// still drains the completed side and errors without re-polling the
+    /// completed reader (tokio panics on JoinHandle re-poll).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_drain_timeout_keeps_completed_side() {
+        let dir = TempDir::new().expect("tempdir");
+        // The backgrounded sleep redirects stdout (releasing the shell's
+        // stdout pipe → EOF) but inherits stderr, keeping it open forever.
+        let mut cmd = build_shell_command("echo out; sleep 999 >/dev/null &", dir.path());
+        let result = run_command_with_timeout(
+            &mut cmd,
+            Duration::from_secs(30),
+            Duration::from_millis(600),
+        )
+        .await;
+        let ShellRunResult::DrainTimedOut { stdout, .. } = result else {
+            panic!("expected DrainTimedOut, got {result:?}");
+        };
+        assert!(
+            String::from_utf8_lossy(&stdout).contains("out"),
+            "completed stdout side must be preserved: {stdout:?}"
         );
     }
 

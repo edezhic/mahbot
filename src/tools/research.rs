@@ -24,14 +24,14 @@ use crate::retry::FailureClass;
 use crate::session::resolve_agent_id;
 use crate::tools::Tool;
 use crate::tools::ask::{
-    AnalystFindings, Claim, VerificationResult, VerificationTarget, build_async_result_envelope,
-    dispatch_verifiers, escape_fences, extract_query_telemetry, load_analyst_angles,
-    max_confidence, normalize_claim,
+    AnalystFindings, Claim, RoundMember, VerificationResult, VerificationTarget,
+    await_round_members, build_async_result_envelope, dispatch_verifiers, escape_fences,
+    extract_query_telemetry, load_analyst_angles, max_confidence, normalize_claim, round_timeout,
 };
 use crate::{ChatMessage, ChatRequest, ChatRequestMeta, DEFAULT_MAX_TOKENS, Role, Workspace};
 use anyhow::Result;
 use async_trait::async_trait;
-use futures_util::future::join_all;
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
@@ -230,7 +230,23 @@ impl Tool for ResearchTool {
             .unwrap_or_default();
 
         tokio::spawn(async move {
-            let message = build_async_research_message(run_deep_research(&ws, &question).await);
+            // Catch panics so the Manager ALWAYS receives the single result
+            // envelope — a panic in the dispatch task would otherwise leave
+            // the caller waiting forever on a result that can never arrive.
+            let run =
+                std::panic::AssertUnwindSafe(async { run_deep_research(&ws, &question).await })
+                    .catch_unwind()
+                    .await;
+            let message = match run {
+                Ok(result) => build_async_research_message(result),
+                Err(panic) => {
+                    let panic = crate::util::panic_message(&*panic);
+                    tracing::error!(panic = %panic, "research dispatch panicked");
+                    build_async_research_message(Err(anyhow::anyhow!(
+                        "research dispatch panicked: {panic}"
+                    )))
+                }
+            };
 
             // Route exactly one final envelope to the Manager's agent channel.
             let target_agent_id =
@@ -755,20 +771,21 @@ async fn round0_decompose(
     question: &str,
     budget: &mut ResearchBudget,
     run_stats: &mut RunStats,
+    deadline: std::time::Instant,
 ) -> Result<(MergedPlan, Option<String>)> {
     budget
         .try_reserve(DECOMPOSE_FAN_OUT)
         .map_err(anyhow::Error::msg)?;
     let task_template = load_prompt("research/decompose.md");
     let extraction_prompt = load_prompt("extraction/decompose.md");
-    let futures: Vec<_> = (0..DECOMPOSE_FAN_OUT)
+    let handles: Vec<_> = (0..DECOMPOSE_FAN_OUT)
         .map(|i| {
             let ws = ws.clone();
             let question = question.to_string();
             let task = substitute(&task_template, &[("{{question}}", &question)]);
             let agent_id = crate::session::research_agent_id(&ws.name, &format!("decompose_{i}"));
             let extraction_prompt = extraction_prompt.clone();
-            async move {
+            tokio::spawn(async move {
                 run_structured_analyst::<DecompositionPlan>(
                     &ws,
                     &agent_id,
@@ -777,10 +794,19 @@ async fn round0_decompose(
                     None,
                 )
                 .await
+            })
+        })
+        .collect();
+    let plans: Vec<AnalystRun<DecompositionPlan>> = await_round_members(handles, deadline)
+        .await
+        .into_iter()
+        .map(|m| match m {
+            RoundMember::Done(run) => run,
+            RoundMember::TimedOut | RoundMember::Panicked | RoundMember::Cancelled => {
+                AnalystRun::NoResponse
             }
         })
         .collect();
-    let plans: Vec<AnalystRun<DecompositionPlan>> = join_all(futures).await;
     let mut valid = Vec::new();
     for run in plans {
         match run {
@@ -940,6 +966,7 @@ async fn round1_research(
     budget: &mut ResearchBudget,
     ledger: &mut QueryLedger,
     run_stats: &mut RunStats,
+    deadline: std::time::Instant,
 ) -> Option<EvidenceRound> {
     let spawn_count = plan.sub_questions.len()
         + plan
@@ -959,7 +986,7 @@ async fn round1_research(
     let extraction_prompt = load_prompt("extraction/findings.md");
     let angles = load_analyst_angles();
     let ledger_snapshot = ledger.render();
-    let mut futures = Vec::new();
+    let mut handles = Vec::new();
     let mut idx = 0usize;
     for sq in &plan.sub_questions {
         for k in 0..=usize::from(sq.risk == "high") {
@@ -984,7 +1011,7 @@ async fn round1_research(
             let agent_id = crate::session::research_agent_id(&ws.name, &format!("r1_{idx}"));
             idx += 1;
             let extraction_prompt = extraction_prompt.clone();
-            futures.push(async move {
+            handles.push(tokio::spawn(async move {
                 run_structured_analyst::<AnalystFindings>(
                     &ws,
                     &agent_id,
@@ -993,10 +1020,19 @@ async fn round1_research(
                     None,
                 )
                 .await
-            });
+            }));
         }
     }
-    let runs = join_all(futures).await;
+    let runs: Vec<AnalystRun<AnalystFindings>> = await_round_members(handles, deadline)
+        .await
+        .into_iter()
+        .map(|m| match m {
+            RoundMember::Done(run) => run,
+            RoundMember::TimedOut | RoundMember::Panicked | RoundMember::Cancelled => {
+                AnalystRun::NoResponse
+            }
+        })
+        .collect();
     Some(collect_evidence(&runs, ledger, run_stats))
 }
 
@@ -1064,11 +1100,12 @@ async fn run_gap_round(
     question: &str,
     gaps: &[&Gap],
     ledger: &QueryLedger,
+    deadline: std::time::Instant,
 ) -> Vec<AnalystRun<AnalystFindings>> {
     let task_template = load_prompt("research/gap.md");
     let extraction_prompt = load_prompt("extraction/findings.md");
     let ledger_snapshot = ledger.render();
-    let futures: Vec<_> = gaps
+    let handles: Vec<_> = gaps
         .iter()
         .enumerate()
         .map(|(i, gap)| {
@@ -1090,7 +1127,7 @@ async fn run_gap_round(
             );
             let agent_id = crate::session::research_agent_id(&ws.name, &format!("gap_{i}"));
             let extraction_prompt = extraction_prompt.clone();
-            async move {
+            tokio::spawn(async move {
                 run_structured_analyst::<AnalystFindings>(
                     &ws,
                     &agent_id,
@@ -1099,10 +1136,19 @@ async fn run_gap_round(
                     None,
                 )
                 .await
-            }
+            })
         })
         .collect();
-    join_all(futures).await
+    await_round_members(handles, deadline)
+        .await
+        .into_iter()
+        .map(|m| match m {
+            RoundMember::Done(run) => run,
+            RoundMember::TimedOut | RoundMember::Panicked | RoundMember::Cancelled => {
+                AnalystRun::NoResponse
+            }
+        })
+        .collect()
 }
 
 /// Conditional gap rounds. Stopping is artifact-based, never agent
@@ -1119,6 +1165,7 @@ async fn gap_rounds(
     acc: &mut AccumulatedEvidence,
     run_stats: &mut RunStats,
     markers: &mut Vec<String>,
+    deadline: std::time::Instant,
 ) -> GapRoundsOutcome {
     let mut outcome = GapRoundsOutcome {
         abstention: None,
@@ -1141,6 +1188,13 @@ async fn gap_rounds(
             outcome.unresolved = gap_items(&gap_list.gaps);
             return outcome;
         }
+        if std::time::Instant::now() >= deadline {
+            // Round-wide deadline expired: further rounds would be spawned
+            // and instantly aborted — stop instead of burning budget on
+            // no-progress work.
+            outcome.unresolved = gap_items(&gap_list.gaps);
+            return outcome;
+        }
         // The gap list is validated (traces_to in range) — every gap is
         // traceable, so it is used directly.
         let gaps = &gap_list.gaps;
@@ -1155,7 +1209,7 @@ async fn gap_rounds(
             outcome.unresolved = gap_items(gaps);
             return outcome;
         }
-        let runs = run_gap_round(ws, question, &targeted, ledger).await;
+        let runs = run_gap_round(ws, question, &targeted, ledger, deadline).await;
         let round = collect_evidence(&runs, ledger, run_stats);
         let (new_urls, _, pending) = acc.absorb(&round);
         let novel_claims = annotate_round(ws, acc, &pending, markers).await;
@@ -1639,6 +1693,7 @@ async fn research_verification_pass(
     budget: &mut ResearchBudget,
     ledger: &mut QueryLedger,
     run_stats: &mut RunStats,
+    deadline: std::time::Instant,
 ) -> Vec<VerificationResult> {
     let (targets, primary_count) = verification_targets(acc);
     if targets.is_empty() {
@@ -1649,13 +1704,16 @@ async fn research_verification_pass(
     // highest-priority targets instead of nothing.
     let n = cap.min(budget.cap.saturating_sub(budget.spent));
     let mut results = Vec::new();
-    if n > 0 && budget.try_reserve(n).is_ok() {
+    // Never spawn verifiers once the round-wide deadline expired — they
+    // would be aborted instantly; the primary targets are marked unresolved
+    // below instead (same shape as the budget-exhaustion path).
+    if n > 0 && std::time::Instant::now() < deadline && budget.try_reserve(n).is_ok() {
         let ledger_snapshot = ledger.render();
         let task_extra = format!(
             "\n# Queries Already Asked (do not repeat these verbatim)\n\n{ledger_snapshot}"
         );
         let prefix = format!("research_{}_verify", ws.name);
-        results = dispatch_verifiers(ws, &prefix, &targets[..n], &task_extra).await;
+        results = dispatch_verifiers(ws, &prefix, &targets[..n], &task_extra, deadline).await;
     }
     for v in &results {
         run_stats.tool_calls += v.tool_calls;
@@ -1678,7 +1736,8 @@ async fn research_verification_pass(
         results.push(VerificationResult {
             claim: t.claim.clone(),
             verdict: "unresolved".to_string(),
-            evidence: "verification skipped — analyst budget exhausted".to_string(),
+            evidence: "verification skipped — budget exhausted or round deadline expired"
+                .to_string(),
             tool_calls: 0,
             searches: 0,
             queries: Vec::new(),
@@ -1870,6 +1929,11 @@ fn partial_report(question: &str, acc: &AccumulatedEvidence, reason: &str) -> St
 #[allow(clippy::too_many_lines)]
 async fn run_deep_research(ws: &Workspace, question: &str) -> Result<String> {
     let start = Instant::now();
+    // One round-wide bound shared by every phase's member waits
+    // (decomposition, research rounds, verification): a stuck analyst is
+    // aborted at it, so no phase can hang the round. Sequential provider
+    // calls after the deadline finish within their own retry bounds.
+    let deadline = std::time::Instant::now() + round_timeout();
     let mut budget = ResearchBudget::new(RESEARCH_MAX_ANALYSTS);
     let mut ledger = QueryLedger::default();
     let mut acc = AccumulatedEvidence::default();
@@ -1877,7 +1941,7 @@ async fn run_deep_research(ws: &Workspace, question: &str) -> Result<String> {
     let mut markers: Vec<String> = Vec::new();
 
     // Round 0 — three independent decomposition plans merged into one.
-    let plan = match round0_decompose(ws, question, &mut budget, &mut run_stats).await {
+    let plan = match round0_decompose(ws, question, &mut budget, &mut run_stats, deadline).await {
         Ok((plan, marker)) => {
             if let Some(m) = marker {
                 markers.push(m);
@@ -1912,6 +1976,7 @@ async fn run_deep_research(ws: &Workspace, question: &str) -> Result<String> {
         &mut budget,
         &mut ledger,
         &mut run_stats,
+        deadline,
     )
     .await
     else {
@@ -1934,6 +1999,7 @@ async fn run_deep_research(ws: &Workspace, question: &str) -> Result<String> {
         &mut acc,
         &mut run_stats,
         &mut markers,
+        deadline,
     )
     .await;
     let rounds_used = 2 + gap_outcome.rounds_dispatched;
@@ -1976,7 +2042,8 @@ async fn run_deep_research(ws: &Workspace, question: &str) -> Result<String> {
     let verification = if crate::shutdown::shutdown_token().is_cancelled() {
         Vec::new()
     } else {
-        research_verification_pass(ws, &acc, &mut budget, &mut ledger, &mut run_stats).await
+        research_verification_pass(ws, &acc, &mut budget, &mut ledger, &mut run_stats, deadline)
+            .await
     };
 
     // Fail-open markers survive delivery: head-placed so they survive the

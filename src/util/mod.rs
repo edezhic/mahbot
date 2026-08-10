@@ -127,6 +127,21 @@ pub(crate) fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
+/// Parse an env var as a whole number of seconds, falling back to `default_secs`.
+///
+/// Shared by the bounded tool I/O waits (shell output drain, FIFO reads, round
+/// consolidation) so their env-override pattern stays in one place.
+/// A value of `0` produces an immediate timeout — deliberate for tests;
+/// operators should set a positive value.
+#[must_use]
+pub(crate) fn env_duration_secs(name: &str, default_secs: u64) -> std::time::Duration {
+    let secs = std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default_secs);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Format a byte slice as a lowercase hex string.
 ///
 /// Each byte is written as two hex digits, yielding a string of length

@@ -1,4 +1,6 @@
 use std::path::Path;
+#[cfg(unix)]
+use std::time::Duration;
 
 use crate::tools::{ShellMode, ShellTool, search::SearchTool};
 use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
@@ -189,6 +191,20 @@ impl ReadTool {
                     return list_directory(resolved_path, ws).await;
                 }
                 super::check_file_size(&meta)?;
+                // FIFOs are streams, not seekable files — read them with a
+                // bounded non-blocking wait so a missing writer cannot hang
+                // the tool (see read_fifo). Other modes (symbols/zoom) make no
+                // sense on a pipe, so content is always used.
+                #[cfg(unix)]
+                if std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()) {
+                    let bytes = read_fifo(resolved_path, fifo_read_timeout()).await?;
+                    let contents = String::from_utf8_lossy(&bytes);
+                    let body = format_content(&contents, args);
+                    return Ok(match recovery_note {
+                        Some(note) => format!("{note}\n{body}"),
+                        None => body,
+                    });
+                }
             }
             Err(e) => match e.kind() {
                 std::io::ErrorKind::NotFound => {
@@ -290,49 +306,7 @@ impl ReadTool {
         args: &serde_json::Value,
     ) -> anyhow::Result<String> {
         match tokio::fs::read_to_string(resolved_path).await {
-            Ok(contents) => {
-                let lines: Vec<&str> = contents.lines().collect();
-                let total = lines.len();
-
-                if total == 0 {
-                    return Ok(String::new());
-                }
-
-                let offset = super::get_opt_u64(args, "offset").map_or(0, |v| {
-                    usize::try_from(v.max(1))
-                        .unwrap_or(usize::MAX)
-                        .saturating_sub(1)
-                });
-                let start = offset.min(total);
-
-                let end = match super::get_opt_u64(args, "limit") {
-                    Some(l) => {
-                        let limit = usize::try_from(l).unwrap_or(usize::MAX);
-                        (start.saturating_add(limit)).min(total)
-                    }
-                    None => total,
-                };
-
-                if start >= end {
-                    return Ok(format!("[No lines in range, file has {total} lines]"));
-                }
-
-                let numbered: String = lines[start..end]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, line)| format!("{}: {}", start + i + 1, line))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                let partial = start > 0 || end < total;
-                let summary = if partial {
-                    format!("[Lines {}-{} of {total}]", start + 1, end)
-                } else {
-                    format!("[{total} lines total]")
-                };
-
-                Ok(format!("{summary}\n{numbered}"))
-            }
+            Ok(contents) => Ok(format_content(&contents, args)),
             Err(e) => {
                 // Not valid UTF-8 — read raw bytes and try to extract text
                 let bytes = tokio::fs::read(resolved_path).await.map_err(|ee| {
@@ -469,6 +443,160 @@ impl ReadTool {
         });
         names.truncate(8);
         names
+    }
+}
+
+/// Format file contents for content-mode output (line numbering + offset/limit).
+#[must_use]
+fn format_content(contents: &str, args: &serde_json::Value) -> String {
+    let lines: Vec<&str> = contents.lines().collect();
+    let total = lines.len();
+
+    if total == 0 {
+        return String::new();
+    }
+
+    let offset = super::get_opt_u64(args, "offset").map_or(0, |v| {
+        usize::try_from(v.max(1))
+            .unwrap_or(usize::MAX)
+            .saturating_sub(1)
+    });
+    let start = offset.min(total);
+
+    let end = match super::get_opt_u64(args, "limit") {
+        Some(l) => {
+            let limit = usize::try_from(l).unwrap_or(usize::MAX);
+            (start.saturating_add(limit)).min(total)
+        }
+        None => total,
+    };
+
+    if start >= end {
+        return format!("[No lines in range, file has {total} lines]");
+    }
+
+    let numbered: String = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{}: {}", start + i + 1, line))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let partial = start > 0 || end < total;
+    let summary = if partial {
+        format!("[Lines {}-{} of {total}]", start + 1, end)
+    } else {
+        format!("[{total} lines total]")
+    };
+
+    format!("{summary}\n{numbered}")
+}
+
+/// Default bound on FIFO (named pipe) reads: how long to wait for a writer
+/// before erroring. A FIFO with no writer must never hang the tool.
+#[cfg(unix)]
+const DEFAULT_FIFO_READ_TIMEOUT_SECS: u64 = 10;
+
+/// FIFO read bound for [`read_fifo`]. Overridable via env for tuning; tests
+/// pass explicit durations.
+#[cfg(unix)]
+fn fifo_read_timeout() -> Duration {
+    crate::util::env_duration_secs(
+        "MAHBOT_FIFO_READ_TIMEOUT_SECS",
+        DEFAULT_FIFO_READ_TIMEOUT_SECS,
+    )
+}
+
+/// Read all bytes from a FIFO with a bounded wait, so a missing writer errors
+/// instead of hanging forever.
+///
+/// The FIFO is opened `O_NONBLOCK` — the open itself never blocks on a
+/// missing writer (unlike a blocking open), and every read returns
+/// immediately (data, EOF, or `WouldBlock`). The loop polls with a sliding
+/// deadline: while no writer is open the reads return EOF (0 bytes), which is
+/// treated as "no data yet" and polled again — a live writer that opens after
+/// the reader still delivers its data (FIFOs are not sticky-EOF). A
+/// successful read resets the deadline, so a writer that keeps producing data
+/// keeps the read alive (capped by the size limit) — deliberate: only the
+/// no-data / no-EOF case must be bounded. A writer that wrote data then went
+/// idle past the bound still gets its buffered bytes delivered (fail-open);
+/// only a writer that produced nothing errors. No blocking thread is ever
+/// leaked — a bare `timeout` around a blocking read would pin a tokio
+/// blocking-pool thread for every hang.
+#[cfg(unix)]
+async fn read_fifo(path: &Path, timeout: Duration) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("Failed to open {}: {e}", path.display()))?;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut last_activity = std::time::Instant::now();
+    loop {
+        let remaining = timeout.saturating_sub(last_activity.elapsed());
+        if remaining.is_zero() {
+            if !buf.is_empty() {
+                // Data arrived before the bound — deliver it rather than
+                // discarding bytes the agent already received.
+                return Ok(buf);
+            }
+            // One final non-blocking read: a writer may have delivered bytes
+            // during the last inactivity sleep — deliver them instead of a
+            // spurious error (bytes stay in the FIFO buffer either way).
+            let timed_out = || {
+                anyhow::anyhow!(
+                    "Timed out after {:.0}s waiting for FIFO data on {} \
+                 (no writer appeared or a writer left the pipe open)",
+                    timeout.as_secs_f64(),
+                    path.display()
+                )
+            };
+            match file.read(&mut chunk) {
+                Ok(0) => return Err(timed_out()),
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    return Ok(buf);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(timed_out()),
+                Err(e) => {
+                    anyhow::bail!("Failed reading FIFO {}: {e}", path.display());
+                }
+            }
+        }
+        match file.read(&mut chunk) {
+            Ok(0) => {
+                // EOF with an empty buffer: no writer is open right now. A
+                // writer may still appear, so keep polling until the bound.
+                if buf.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                return Ok(buf); // writer finished — normal EOF
+            }
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() as u64 > super::MAX_FILE_SIZE_BYTES {
+                    anyhow::bail!(
+                        "FIFO {} output exceeded {} bytes",
+                        path.display(),
+                        super::MAX_FILE_SIZE_BYTES
+                    );
+                }
+                last_activity = std::time::Instant::now();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Writer present but idle — poll again shortly.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => {
+                anyhow::bail!("Failed reading FIFO {}: {e}", path.display());
+            }
+        }
     }
 }
 
@@ -1588,5 +1716,98 @@ impl Baz {}
         let world = symbols.iter().find(|s| s.name == "world").unwrap();
         assert_eq!(hello.start_line, 1, "hello starts at line 1");
         assert_eq!(world.start_line, 4, "world starts at line 4");
+    }
+
+    /// A FIFO with no writer must error within the bound, never hang. The
+    /// no-writer case is detected at the bound (empty EOF keeps polling).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_without_writer_errors_bounded() {
+        let dir = TempDir::new().unwrap();
+        let fifo_path = dir.path().join("nofifo.pipe");
+        let c_path = std::ffi::CString::new(fifo_path.as_os_str().as_encoded_bytes()).unwrap();
+        let ret = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(ret, 0, "mkfifo should succeed");
+
+        let result = read_fifo(&fifo_path, Duration::from_millis(300)).await;
+        let err = result.expect_err("no-writer FIFO must error");
+        assert!(
+            err.to_string().contains("no writer"),
+            "error should name the no-writer cause: {err}"
+        );
+
+        // The tool-level path also errors instead of hanging (bounded via env).
+        let _guard = crate::util::test::set_env_var("MAHBOT_FIFO_READ_TIMEOUT_SECS", Some("1"));
+        let ws = test_ws(dir.path());
+        let result = ReadTool
+            .execute(
+                &ws,
+                json!({"path": fifo_path.to_string_lossy().into_owned()}),
+            )
+            .await;
+        let err = result.expect_err("tool read of no-writer FIFO must error");
+        assert!(
+            err.to_string().contains("no writer"),
+            "tool error should name the no-writer cause: {err}"
+        );
+    }
+
+    /// A FIFO with a live writer keeps working — the bounded read returns the
+    /// written data instead of erroring. The writer opens after the reader
+    /// (read-fifo opens O_NONBLOCK and polls), proving late writers work.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_with_writer_reads_data() {
+        let dir = TempDir::new().unwrap();
+        let fifo_path = dir.path().join("wfifo.pipe");
+        let c_path = std::ffi::CString::new(fifo_path.as_os_str().as_encoded_bytes()).unwrap();
+        let ret = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(ret, 0, "mkfifo should succeed");
+
+        // Writer on the blocking pool: the write-open blocks until a reader
+        // appears, which must not pin the async executor.
+        let writer_path = fifo_path.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .expect("open FIFO for writing");
+            f.write_all(b"fifo data\n").expect("write to FIFO");
+        });
+
+        let result = read_fifo(&fifo_path, Duration::from_secs(5)).await;
+        writer.await.unwrap();
+        let bytes = result.expect("FIFO with writer should read data");
+        assert_eq!(bytes, b"fifo data\n");
+    }
+
+    /// A writer that wrote data then holds the pipe open idle past the bound:
+    /// the already-received bytes are delivered (fail-open), never discarded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_writer_idle_after_data_delivers_buffered_bytes() {
+        let dir = TempDir::new().unwrap();
+        let fifo_path = dir.path().join("idle.pipe");
+        let c_path = std::ffi::CString::new(fifo_path.as_os_str().as_encoded_bytes()).unwrap();
+        let ret = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(ret, 0, "mkfifo should succeed");
+
+        let writer_path = fifo_path.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .expect("open FIFO for writing");
+            f.write_all(b"buffered data\n").expect("write to FIFO");
+            // Hold the pipe open idle well past the reader's bound.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+
+        let result = read_fifo(&fifo_path, Duration::from_millis(300)).await;
+        writer.await.unwrap();
+        let bytes = result.expect("bytes written before the bound must be delivered");
+        assert_eq!(bytes, b"buffered data\n");
     }
 }

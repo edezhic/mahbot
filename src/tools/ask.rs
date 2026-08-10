@@ -23,10 +23,11 @@ use crate::tools::Tool;
 use crate::{Agent, DEFAULT_MAX_TOKENS, Role, Workspace};
 use anyhow::Result;
 use async_trait::async_trait;
-use futures_util::future::join_all;
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fmt::Write as _;
+use std::time::Duration;
 
 /// Controls sub-agent dispatch behaviour.
 ///
@@ -114,8 +115,24 @@ impl Tool for AskTool {
                 .unwrap_or_default();
 
             tokio::spawn(async move {
-                let message =
-                    build_async_ask_message(run_parallel_analysts_and_consolidate(&ws, &ask).await);
+                // Catch panics so the caller ALWAYS receives an envelope — a
+                // panic in the dispatch task would otherwise leave the Manager
+                // waiting forever on a result that can never arrive.
+                let round = std::panic::AssertUnwindSafe(async {
+                    run_parallel_analysts_and_consolidate(&ws, &ask).await
+                })
+                .catch_unwind()
+                .await;
+                let message = match round {
+                    Ok(result) => build_async_ask_message(result),
+                    Err(panic) => {
+                        let panic = crate::util::panic_message(&*panic);
+                        tracing::error!(panic = %panic, "ask round dispatch panicked");
+                        build_async_ask_message(Err(anyhow::anyhow!(
+                            "ask round dispatch panicked: {panic}"
+                        )))
+                    }
+                };
 
                 // Route result to the caller's agent channel.
                 let target_agent_id =
@@ -202,6 +219,144 @@ enum AnalystOutcome {
     ParseFailed { raw: String, failure: String },
 }
 
+/// Outcome of one member of a parallel round awaited with a deadline.
+#[derive(Debug)]
+pub(crate) enum RoundMember<T> {
+    Done(T),
+    /// Member was still running when the round deadline expired — aborted.
+    TimedOut,
+    /// Member task panicked — surfaced, never silent.
+    Panicked,
+    /// Member task was cancelled externally (e.g. runtime shutdown), not by
+    /// the round deadline — distinct from [`RoundMember::TimedOut`] so the
+    /// surfaced reason stays accurate.
+    Cancelled,
+}
+
+/// Await all round tasks with a single overall deadline. Members still
+/// pending at the deadline are aborted and reported [`RoundMember::TimedOut`]
+/// (warn-logged); panicked members are reported [`RoundMember::Panicked`] with
+/// their panic message logged. Completed members keep their results, so a
+/// stuck analyst never blocks the others' delivery.
+///
+/// Note: members are `tokio::spawn`ed (panic isolation), so if this future is
+/// dropped mid-await the member tasks run detached to self-termination rather
+/// than being cancelled — reachable only during process shutdown (tools run
+/// to completion on agent cancel), where the runtime ends anyway; the
+/// deadline covers the live-await path.
+pub(crate) async fn await_round_members<T: Send + 'static>(
+    handles: Vec<tokio::task::JoinHandle<T>>,
+    deadline: std::time::Instant,
+) -> Vec<RoundMember<T>> {
+    use futures_util::StreamExt;
+    use futures_util::stream::FuturesUnordered;
+
+    let start = std::time::Instant::now();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let mut pending: FuturesUnordered<_> = handles
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut handle)| {
+            let cancel = cancel.clone();
+            async move {
+                tokio::select! {
+                    biased;
+                    r = &mut handle => (i, match r {
+                        Ok(v) => RoundMember::Done(v),
+                        Err(e) if e.is_panic() => {
+                            let panic = crate::util::panic_message(&*e.into_panic());
+                            tracing::warn!(member = i, %panic, "round member task panicked");
+                            RoundMember::Panicked
+                        }
+                        Err(_) => {
+                            tracing::warn!(member = i, "round member task cancelled externally");
+                            RoundMember::Cancelled
+                        }
+                    }),
+                    () = cancel.cancelled() => {
+                        handle.abort();
+                        (i, RoundMember::TimedOut)
+                    }
+                }
+            }
+        })
+        .collect();
+
+    let mut out: Vec<Option<RoundMember<T>>> = (0..pending.len()).map(|_| None).collect();
+    let deadline_expired = loop {
+        if pending.is_empty() {
+            break false;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break true;
+        }
+        match tokio::time::timeout(remaining, pending.next()).await {
+            Ok(Some((i, member))) => out[i] = Some(member),
+            Ok(None) => break false,
+            Err(_) => break true,
+        }
+    };
+    if deadline_expired {
+        cancel.cancel();
+        while let Some((i, member)) = pending.next().await {
+            out[i] = Some(member);
+        }
+        // After the drain every slot is filled; a `TimedOut` slot is exactly a
+        // member that was still running at the deadline (aborted), while
+        // members that finished just before it resolve to their real outcome
+        // (biased select prefers the ready handle) — an accurate count.
+        let aborted = out
+            .iter()
+            .filter(|m| matches!(m, Some(RoundMember::TimedOut)))
+            .count();
+        tracing::warn!(
+            members_aborted = aborted,
+            elapsed_secs = start.elapsed().as_secs_f64(),
+            "round consolidation deadline expired — aborting stuck members"
+        );
+    }
+    // Every loop-exit path (pending empty, deadline-drain, Ok(None)) fills
+    // every slot exactly once — the invariant is enforced by construction.
+    out.into_iter()
+        .map(|m| m.expect("every round member resolves exactly once"))
+        .collect()
+}
+
+/// Default bound on a parallel round's consolidation wait. Hours-scale: only
+/// pathological stalls (a stuck analyst never completing) hit it; normal
+/// analyst work finishes in minutes.
+const DEFAULT_ROUND_TIMEOUT_SECS: u64 = 3 * 60 * 60;
+
+/// Round consolidation bound for [`await_round_members`]. Overridable via env
+/// for tuning.
+pub(crate) fn round_timeout() -> Duration {
+    crate::util::env_duration_secs("MAHBOT_ROUND_TIMEOUT_SECS", DEFAULT_ROUND_TIMEOUT_SECS)
+}
+
+/// One analyst's outcome in a parallel round. `Failed` covers members that
+/// never completed (stuck past the round deadline, panicked, or cancelled) —
+/// the reason is surfaced, never silent.
+#[allow(clippy::large_enum_variant)] // Agent is inherently large; the enum is transient
+enum AskRun {
+    Completed {
+        agent: Agent,
+        response: Option<String>,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
+impl AskRun {
+    fn response(&self) -> Option<&str> {
+        match self {
+            Self::Completed { response, .. } => response.as_deref(),
+            Self::Failed { .. } => None,
+        }
+    }
+}
+
 /// Verdict of a single targeted claim verification. Shared with the deep
 /// research tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,8 +407,13 @@ pub(crate) const VERIFY_MAX_ANALYSTS: usize = 4;
 async fn run_parallel_analysts_and_consolidate(ws: &Workspace, ask: &str) -> Result<String> {
     const PARALLEL_ANALYST_COUNT: usize = 3;
 
-    let runs = run_parallel_analysts(ws, ask, PARALLEL_ANALYST_COUNT).await;
-    consolidate_analyst_runs(ws, ask, runs).await
+    // One round-wide bound shared by the analyst and extraction member waits
+    // — a stuck analyst is aborted at it, so no phase can hang the round.
+    // The sequential consolidation call after the deadline finishes within
+    // its own retry bounds.
+    let deadline = std::time::Instant::now() + round_timeout();
+    let runs = run_parallel_analysts(ws, ask, PARALLEL_ANALYST_COUNT, deadline).await;
+    consolidate_analyst_runs(ws, ask, runs, deadline).await
 }
 
 /// Load the decorrelation angles asset — one distinct research angle per
@@ -264,16 +424,19 @@ pub(crate) fn load_analyst_angles() -> Vec<String> {
 }
 
 /// Run `count` parallel analyst agents with decorrelated research angles,
-/// returning the (still-alive) agent with its raw response so structured
-/// extraction can reuse the agent's KV-cache parameters.
+/// returning each member's outcome. The wait shares the round-wide `deadline`
+/// (see [`run_parallel_analysts_and_consolidate`]): a member still running at
+/// the deadline is aborted and reported as failed (with the reason) instead of
+/// stalling the round, and the completed members' results are still delivered.
 async fn run_parallel_analysts(
     ws: &Workspace,
     ask: &str,
     count: usize,
-) -> Vec<(Agent, Option<String>)> {
+    deadline: std::time::Instant,
+) -> Vec<AskRun> {
     let suffix = crate::generate_suffix();
     let angles = load_analyst_angles();
-    let futures: Vec<_> = (0..count)
+    let handles: Vec<_> = (0..count)
         .map(|i| {
             let ws = ws.clone();
             let suffix = suffix.clone();
@@ -286,7 +449,7 @@ async fn run_parallel_analysts(
             } else {
                 format!("{ask}\n\nResearch angle:\n{angle}")
             };
-            async move {
+            tokio::spawn(async move {
                 run_agent(
                     agent_id,
                     Role::Analyst,
@@ -298,79 +461,137 @@ async fn run_parallel_analysts(
                     None,
                 )
                 .await
-            }
+            })
         })
         .collect();
-    join_all(futures).await
+    await_round_members(handles, deadline)
+        .await
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| match m {
+            RoundMember::Done((agent, response)) => AskRun::Completed { agent, response },
+            RoundMember::TimedOut => AskRun::Failed {
+                reason: format!("analyst {i} still running when the round deadline expired"),
+            },
+            RoundMember::Panicked => AskRun::Failed {
+                reason: format!("analyst {i} task panicked"),
+            },
+            RoundMember::Cancelled => AskRun::Failed {
+                reason: format!("analyst {i} task was cancelled"),
+            },
+        })
+        .collect()
 }
 
 /// Consolidate analyst runs: 0 valid → error, 1 valid → raw passthrough,
 /// ≥2 valid → extract findings and run the shared grouping pass (≥2 with
-/// parseable claims group; a single parseable source skips grouping).
+/// parseable claims group; a single parseable source skips grouping). Failed
+/// members count as no-response, with their reasons surfaced in the error.
 async fn consolidate_analyst_runs(
     ws: &Workspace,
     ask: &str,
-    runs: Vec<(Agent, Option<String>)>,
+    runs: Vec<AskRun>,
+    deadline: std::time::Instant,
 ) -> Result<String> {
     let valid_count = runs
         .iter()
-        .filter(|(_, r)| r.as_deref().is_some_and(|t| !t.trim().is_empty()))
+        .filter(|r| r.response().is_some_and(|t| !t.trim().is_empty()))
         .count();
     match valid_count {
         0 => {
-            anyhow::bail!("All parallel analysts failed to produce a response");
+            let reasons: Vec<&str> = runs
+                .iter()
+                .filter_map(|r| match r {
+                    AskRun::Failed { reason } => Some(reason.as_str()),
+                    AskRun::Completed { .. } => None,
+                })
+                .collect();
+            let suffix = if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", reasons.join("; "))
+            };
+            anyhow::bail!("All parallel analysts failed to produce a response{suffix}");
         }
         1 => Ok(single_raw_response(&runs).expect("exactly one valid response")),
         _ => {
-            let outcomes = extract_findings(runs).await;
+            let outcomes = extract_findings(runs, deadline).await;
             consolidate_findings(ws, ask, outcomes).await
         }
     }
 }
 
-fn single_raw_response(runs: &[(Agent, Option<String>)]) -> Option<String> {
-    runs.iter()
-        .find_map(|(_, r)| r.clone().filter(|t| !t.trim().is_empty()))
+fn single_raw_response(runs: &[AskRun]) -> Option<String> {
+    runs.iter().find_map(|r| match r {
+        AskRun::Completed { response, .. } => response.clone().filter(|t| !t.trim().is_empty()),
+        AskRun::Failed { .. } => None,
+    })
 }
 
 /// Extract structured claim-level findings from each valid analyst response
 /// while the agent is still alive (see [`Agent::extract_verdict`] for the
 /// KV-cache rationale). Fail-open: parse failures keep the raw response and
-/// are never silently dropped.
-async fn extract_findings(runs: Vec<(Agent, Option<String>)>) -> Vec<AnalystOutcome> {
+/// are never silently dropped. The extraction wait shares the round-wide
+/// `deadline` — a stuck extraction is reported as no-response, not awaited
+/// forever.
+async fn extract_findings(runs: Vec<AskRun>, deadline: std::time::Instant) -> Vec<AnalystOutcome> {
     let extraction_prompt = load_prompt("extraction/findings.md");
-    let futures = runs.into_iter().map(|(agent, response)| {
-        let extraction_prompt = extraction_prompt.clone();
-        async move {
-            let Some(raw) = response else {
-                let reason = if crate::shutdown::shutdown_token().is_cancelled() {
-                    "service shutting down".to_string()
-                } else if agent.is_cancelled() {
-                    "agent cancelled by user".to_string()
-                } else {
-                    agent
-                        .failure
-                        .clone()
-                        .unwrap_or_else(|| "analyst produced no response".to_string())
+    let handles: Vec<_> = runs
+        .into_iter()
+        .map(|run| {
+            let extraction_prompt = extraction_prompt.clone();
+            tokio::spawn(async move {
+                let (agent, response) = match run {
+                    AskRun::Completed { agent, response } => (agent, response),
+                    AskRun::Failed { reason } => {
+                        return AnalystOutcome::NoResponse(crate::util::scrub_credentials(&reason));
+                    }
                 };
-                return AnalystOutcome::NoResponse(crate::util::scrub_credentials(&reason));
-            };
-            if raw.trim().is_empty() {
-                return AnalystOutcome::NoResponse("analyst produced no response".to_string());
+                let Some(raw) = response else {
+                    let reason = if crate::shutdown::shutdown_token().is_cancelled() {
+                        "service shutting down".to_string()
+                    } else if agent.is_cancelled() {
+                        "agent cancelled by user".to_string()
+                    } else {
+                        agent
+                            .failure
+                            .clone()
+                            .unwrap_or_else(|| "analyst produced no response".to_string())
+                    };
+                    return AnalystOutcome::NoResponse(crate::util::scrub_credentials(&reason));
+                };
+                if raw.trim().is_empty() {
+                    return AnalystOutcome::NoResponse("analyst produced no response".to_string());
+                }
+                match agent
+                    .extract_verdict::<AnalystFindings>(&extraction_prompt, None, None)
+                    .await
+                {
+                    Ok(findings) => AnalystOutcome::Findings { raw, findings },
+                    Err(e) => AnalystOutcome::ParseFailed {
+                        raw,
+                        failure: e.to_string(),
+                    },
+                }
+            })
+        })
+        .collect();
+    await_round_members(handles, deadline)
+        .await
+        .into_iter()
+        .map(|m| match m {
+            RoundMember::Done(outcome) => outcome,
+            RoundMember::TimedOut => AnalystOutcome::NoResponse(
+                "findings extraction still running when the round deadline expired".to_string(),
+            ),
+            RoundMember::Panicked => {
+                AnalystOutcome::NoResponse("findings extraction task panicked".to_string())
             }
-            match agent
-                .extract_verdict::<AnalystFindings>(&extraction_prompt, None, None)
-                .await
-            {
-                Ok(findings) => AnalystOutcome::Findings { raw, findings },
-                Err(e) => AnalystOutcome::ParseFailed {
-                    raw,
-                    failure: e.to_string(),
-                },
+            RoundMember::Cancelled => {
+                AnalystOutcome::NoResponse("findings extraction task was cancelled".to_string())
             }
-        }
-    });
-    join_all(futures).await
+        })
+        .collect()
 }
 
 /// Consolidate extracted outcomes: build the per-agent claim lists and run the
@@ -657,17 +878,19 @@ pub(crate) fn extract_query_telemetry(agent: &Agent) -> (usize, usize, Vec<Strin
 /// Dispatch one fresh Analyst per verification target (bounded by
 /// [`VERIFY_MAX_ANALYSTS`]) in parallel. `id_prefix` seeds the per-target
 /// agent IDs; `task_extra` is appended to every task (e.g. the query
-/// ledger). Shared with the deep research tool's verification gate.
+/// ledger). The wait shares the round-wide `deadline`. Shared with the deep
+/// research tool's verification gate.
 pub(crate) async fn dispatch_verifiers(
     ws: &Workspace,
     id_prefix: &str,
     targets: &[VerificationTarget],
     task_extra: &str,
+    deadline: std::time::Instant,
 ) -> Vec<VerificationResult> {
     let task_template = load_prompt("ask/verify.md");
     let extraction_prompt = load_prompt("extraction/verify.md");
     let suffix = crate::generate_suffix();
-    let futures: Vec<_> = targets
+    let handles: Vec<_> = targets
         .iter()
         .take(VERIFY_MAX_ANALYSTS)
         .enumerate()
@@ -685,12 +908,29 @@ pub(crate) async fn dispatch_verifiers(
             task.push_str(task_extra);
             let extraction_prompt = extraction_prompt.clone();
             let claim_text = t.claim.clone();
-            async move {
+            tokio::spawn(async move {
                 run_claim_verifier(&ws, &agent_id, &claim_text, &task, &extraction_prompt).await
-            }
+            })
         })
         .collect();
-    join_all(futures).await
+    await_round_members(handles, deadline)
+        .await
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| match m {
+            RoundMember::Done(v) => v,
+            RoundMember::TimedOut | RoundMember::Panicked | RoundMember::Cancelled => {
+                VerificationResult {
+                    claim: targets[i].claim.clone(),
+                    verdict: "unresolved".to_string(),
+                    evidence: "verifier never completed (round deadline or panic)".to_string(),
+                    tool_calls: 0,
+                    searches: 0,
+                    queries: Vec::new(),
+                }
+            }
+        })
+        .collect()
 }
 
 /// Run one claim verifier: a fresh Analyst researches the claim and returns
@@ -861,7 +1101,7 @@ mod tests {
 
     /// Build a bare analyst run for pipeline tests: a real `Agent` (no stores
     /// touched) plus an optional raw response.
-    fn test_analyst_run(ws: &Workspace, response: Option<&str>) -> (Agent, Option<String>) {
+    fn test_analyst_run(ws: &Workspace, response: Option<&str>) -> AskRun {
         let agent = Agent::new(
             format!("ask_test_{}", crate::generate_suffix()),
             Role::Analyst,
@@ -870,7 +1110,17 @@ mod tests {
             String::new(),
             String::new(),
         );
-        (agent, response.map(ToString::to_string))
+        AskRun::Completed {
+            agent,
+            response: response.map(ToString::to_string),
+        }
+    }
+
+    /// A failed round member (stuck past the deadline, panicked, cancelled).
+    fn test_failed_run(reason: &str) -> AskRun {
+        AskRun::Failed {
+            reason: reason.to_string(),
+        }
     }
 
     fn findings(claims: Vec<(&str, &str, &str)>) -> AnalystFindings {
@@ -897,7 +1147,13 @@ mod tests {
             test_analyst_run(&ws, None),
             test_analyst_run(&ws, None),
         ];
-        let result = consolidate_analyst_runs(&ws, "test question", runs).await;
+        let result = consolidate_analyst_runs(
+            &ws,
+            "test question",
+            runs,
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .await;
         assert!(result.is_err(), "0 responses should error");
         assert!(
             result
@@ -909,6 +1165,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_consolidate_zero_responses_surfaces_failure_reasons() {
+        let ws = test_ws("/tmp/test_ws");
+        let runs = vec![
+            test_failed_run("analyst 0 still running when the round deadline expired"),
+            test_failed_run("analyst 1 task panicked"),
+            test_analyst_run(&ws, None),
+        ];
+        let result = consolidate_analyst_runs(
+            &ws,
+            "test question",
+            runs,
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .await;
+        let err = result.expect_err("0 valid responses should error");
+        assert!(
+            err.to_string().contains("deadline expired"),
+            "error should surface the stuck-analyst reason: {err}"
+        );
+        assert!(
+            err.to_string().contains("panicked"),
+            "error should surface the panicked-analyst reason: {err}"
+        );
+    }
+
+    /// The round wait is bounded: a member that never completes is aborted at
+    /// the deadline and reported [`RoundMember::TimedOut`], while completed
+    /// members keep their results.
+    #[tokio::test]
+    async fn await_round_members_bounds_stuck_member() {
+        struct AbortDetector(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for AbortDetector {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let aborted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = aborted.clone();
+        let stuck = tokio::spawn(async move {
+            let _detector = AbortDetector(flag);
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        let done = tokio::spawn(async { 42u32 });
+        let deadline = std::time::Instant::now() + Duration::from_millis(300);
+        let members = await_round_members(vec![stuck, done], deadline).await;
+        assert!(matches!(members[0], RoundMember::TimedOut), "{members:?}");
+        assert!(matches!(members[1], RoundMember::Done(42)), "{members:?}");
+        // Aborting the task drops its locals — the detector fires.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            aborted.load(std::sync::atomic::Ordering::SeqCst),
+            "stuck member task should have been aborted at the deadline"
+        );
+    }
+
+    /// A panicking member is surfaced as [`RoundMember::Panicked`], never
+    /// silently dropped.
+    #[tokio::test]
+    async fn await_round_members_surfaces_panics() {
+        let panicking = tokio::spawn(async { panic!("boom") });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let members = await_round_members(vec![panicking], deadline).await;
+        assert!(matches!(members[0], RoundMember::Panicked), "{members:?}");
+    }
+
+    #[tokio::test]
     async fn test_consolidate_one_response_returned_directly() {
         let ws = test_ws("/tmp/test_ws");
         let runs = vec![
@@ -916,7 +1241,13 @@ mod tests {
             test_analyst_run(&ws, None),
             test_analyst_run(&ws, None),
         ];
-        let result = consolidate_analyst_runs(&ws, "test question", runs).await;
+        let result = consolidate_analyst_runs(
+            &ws,
+            "test question",
+            runs,
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .await;
         assert!(result.is_ok(), "1 response should succeed");
         assert_eq!(
             result.unwrap(),
@@ -934,7 +1265,13 @@ mod tests {
             test_analyst_run(&ws, Some("")),
             test_analyst_run(&ws, Some("   ")),
         ];
-        let result = consolidate_analyst_runs(&ws, "test question", runs).await;
+        let result = consolidate_analyst_runs(
+            &ws,
+            "test question",
+            runs,
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .await;
         assert!(
             result.is_ok(),
             "1 valid after filtering empty should succeed"
@@ -1336,7 +1673,13 @@ mod tests {
             test_analyst_run(&ws, Some("report two")),
             test_analyst_run(&ws, None),
         ];
-        let result = consolidate_analyst_runs(&ws, "test question", runs).await;
+        let result = consolidate_analyst_runs(
+            &ws,
+            "test question",
+            runs,
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .await;
         let text = result.expect("extraction fail-open must deliver raw reports");
         assert!(
             text.contains("unconsolidated — findings extraction failed"),
