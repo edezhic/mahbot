@@ -17,11 +17,18 @@
 //! live writers because resetting the shared frame index is the documented
 //! two-writer corruption vector; the periodic loop uses PASSIVE below the
 //! 32 MiB cap instead. Only uncommitted in-flight transactions are lost on
-//! crash — normal DB semantics, independent of checkpoints.
+//! crash — normal DB semantics, independent of checkpoints. One known turso
+//! reopen defect (tracked by the WAL-race harness): a crash mid-transaction can
+//! leave un-published frame-index entries that abort the next append ("shared
+//! WAL frame ids must increase monotonically") — a defect in turso's WAL
+//! reopen, not a loss of committed data; committed frames remain durable.
 //!
 //! This module provides the canonical checkpoint entry points:
-//! [`checkpoint_all_databases`] (TRUNCATE, for controlled exit-time paths where
-//! single-writer is guaranteed: self-update restart, GUI exit) and
+//! [`checkpoint_all_databases`] (TRUNCATE, for exit-time paths — self-update
+//! restart is single-writer (agents cancelled, browser sessions closed, shutdown
+//! signaled before the checkpoint); GUI exit runs while background writers are
+//! still live, but turso serializes via its checkpoint lock, so the practical
+//! effect is busy→warn, not corruption) and
 //! [`periodic_checkpoint_all_databases`] (non-truncating below the WAL-size
 //! cap, TRUNCATE above it — the auto-checkpoint loop spawned by the binary's
 //! background task set).
@@ -46,41 +53,27 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use tracing::{error, info, warn};
 
-/// Default cap on a store's on-disk `-wal` size (bytes) for the periodic
-/// checkpoint mode. Below the cap the periodic loop runs non-truncating
-/// (PASSIVE) checkpoints; a TRUNCATE runs only when the WAL exceeds the cap,
-/// bounding WAL-file growth while keeping the frame-index reset that TRUNCATE
-/// causes (the two-writer corruption vector) rare instead of every 5 minutes.
-const DEFAULT_WAL_CHECKPOINT_CAP_BYTES: u64 = 32 * 1024 * 1024;
-
-/// Revert gate for the non-truncating periodic mode: setting
-/// `MAHBOT_WAL_CHECKPOINT_CAP_BYTES=0` restores the previous always-TRUNCATE
-/// periodic behavior (used while the repro harness validates the new mode).
-fn periodic_checkpoint_cap_bytes() -> u64 {
-    std::env::var("MAHBOT_WAL_CHECKPOINT_CAP_BYTES")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(DEFAULT_WAL_CHECKPOINT_CAP_BYTES)
-}
+/// Cap on a store's on-disk `-wal` size (bytes) for the periodic checkpoint
+/// mode. Below the cap the periodic loop runs non-truncating (PASSIVE)
+/// checkpoints; a TRUNCATE runs only when the WAL exceeds the cap, bounding
+/// WAL-file growth while keeping the frame-index reset that TRUNCATE causes
+/// (the two-writer corruption vector) rare instead of every 5 minutes.
+const WAL_CHECKPOINT_CAP_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Which checkpoint mode a store uses.
 #[derive(Debug, Clone, Copy)]
 enum CheckpointPolicy {
-    /// TRUNCATE every checkpoint (controlled exit-time paths, single writer).
+    /// TRUNCATE every checkpoint (exit-time paths; any live writers are
+    /// serialized by turso's checkpoint lock → busy→warn, not corruption).
     Truncate,
     /// PASSIVE while the on-disk `-wal` stays under the cap; TRUNCATE above it.
     PassiveCapped(u64),
 }
 
 impl CheckpointPolicy {
-    /// The periodic-loop policy, honoring the revert gate.
+    /// The periodic-loop policy: PASSIVE below the cap, TRUNCATE above it.
     fn periodic() -> Self {
-        let cap = periodic_checkpoint_cap_bytes();
-        if cap == 0 {
-            Self::Truncate
-        } else {
-            Self::PassiveCapped(cap)
-        }
+        Self::PassiveCapped(WAL_CHECKPOINT_CAP_BYTES)
     }
 }
 
@@ -130,8 +123,10 @@ where
 /// are never properly closed. The TRUNCATE leaves a header-only WAL for a clean
 /// store handoff; committed data is already fsync-durable at COMMIT.
 ///
-/// Always runs TRUNCATE checkpoints — this is the single-writer exit-time path
-/// (self-update handoff, GUI shutdown). Periodic checkpointing uses
+/// Always runs TRUNCATE checkpoints — the exit-time path (self-update handoff
+/// is single-writer; GUI shutdown runs while background writers are still live,
+/// but turso's checkpoint lock serializes them, so the effect is busy→warn, not
+/// corruption). Periodic checkpointing uses
 /// [`periodic_checkpoint_all_databases`] instead, which avoids TRUNCATE under
 /// live writers.
 ///
@@ -146,13 +141,14 @@ pub async fn checkpoint_all_databases() {
     checkpoint_stores(CheckpointPolicy::Truncate).await;
 }
 
-/// Periodic defense-in-depth checkpoint (auto-checkpoint loop).
+/// Periodic WAL-size hygiene checkpoint (auto-checkpoint loop).
 ///
 /// Runs non-truncating (PASSIVE) checkpoints below the WAL-size cap and a
 /// TRUNCATE only when a store's on-disk `-wal` exceeds it — TRUNCATE resets
 /// the shared WAL frame index, which is the two-writer corruption vector when
 /// live connections append afterward, so it is avoided during normal operation.
-/// Set `MAHBOT_WAL_CHECKPOINT_CAP_BYTES=0` to revert to always-TRUNCATE.
+/// The TRUNCATE-above-cap branch is the only mechanism that shrinks the WAL
+/// file: turso's own auto-checkpoint is PASSIVE-only.
 pub async fn periodic_checkpoint_all_databases() {
     checkpoint_stores(CheckpointPolicy::periodic()).await;
 }
@@ -184,8 +180,9 @@ async fn checkpoint_stores(policy: CheckpointPolicy) {
                 CheckpointPolicy::PassiveCapped(cap) => {
                     // Safe default under uncertainty (root unresolvable) is
                     // PASSIVE — TRUNCATE is the corruption vector, and the
-                    // periodic path's job is defense-in-depth, not exit-time
-                    // durability.
+                    // periodic path's TRUNCATE-above-cap branch is the only
+                    // WAL-shrinking mechanism (turso's auto-checkpoint is
+                    // PASSIVE-only); durability is unaffected either way.
                     status.as_ref().is_some_and(|s| s.wal_size > cap)
                 }
             };
