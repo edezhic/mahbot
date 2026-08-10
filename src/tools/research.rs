@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 /// researchers, gap-round researchers, and verification analysts all count;
 /// orchestrator coordination LLM calls do not. Enforced at reservation time,
 /// never refunded.
-const RESEARCH_MAX_ANALYSTS: usize = 20;
+const RESEARCH_MAX_ANALYSTS: usize = 30;
 /// Round-0 decomposition fan-out (three independent plans).
 const DECOMPOSE_FAN_OUT: usize = 3;
 /// Gap-round dispatch widths — rounds shrink as they progress.
