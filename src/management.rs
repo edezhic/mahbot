@@ -2049,6 +2049,62 @@ async fn register_sanitation_agent(
     (agent_id, incoming_rx)
 }
 
+/// Absorb the post-run tail shared by dispatch and resume: the response-None
+/// failure block, verdict extraction with error handling, and the job
+/// terminalization. The drain-cut guard and outcome checkpoint stay at the
+/// call sites (resume has no checkpoint by design).
+async fn finalize_sanitation_round(
+    ticket: &Ticket,
+    agent: &Agent,
+    response: Option<&str>,
+    job_id: &str,
+    resumed: bool,
+) {
+    let resumed_suffix = if resumed { " (resumed)" } else { "" };
+    if response.is_none() {
+        // Agent failed or was cancelled — record failure and clear assigned_to
+        // for re-dispatch retry. The marker comment lets the sanitation circuit
+        // breaker detect repeated failures. (Drain-cut is handled at the call
+        // sites — response None here is a real failure.)
+        warn!(
+            ticket = %ticket.id,
+            "Sanitation agent returned no output{resumed_suffix} — clearing assigned_to for retry"
+        );
+        record_sanitation_failure(
+            &ticket.id,
+            format!("agent returned no output{resumed_suffix}"),
+            None,
+        )
+        .await;
+        complete_ticket_stage_job(job_id).await;
+        return;
+    }
+
+    let extraction_prompt = crate::prompt::load_prompt("extraction/sanitation.md");
+    match agent
+        .extract_verdict::<crate::SanitationVerdict>(&extraction_prompt, None, None)
+        .await
+    {
+        Ok(verdict) => process_sanitation_verdict(ticket, verdict).await,
+        Err(failure) => {
+            warn!(
+                ticket = %ticket.id,
+                error = %failure,
+                "Failed to extract sanitation verdict{resumed_suffix} — clearing assigned_to for retry"
+            );
+            record_sanitation_failure(
+                &ticket.id,
+                format!("verdict extraction error{resumed_suffix}: {failure}"),
+                Some(&failure),
+            )
+            .await;
+        }
+    }
+
+    // Completion tx AFTER the board transition+comment (ordering contract).
+    complete_ticket_stage_job(job_id).await;
+}
+
 /// Run the sanitation agent to inspect new/untracked files in the workspace.
 ///
 /// Called by [`PollPhase::SanitationCheck`] via [`spawn_dispatch`]. Runs a
@@ -2146,25 +2202,13 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         return;
     }
 
-    if response.is_none() {
-        // Agent failed or was cancelled — record failure and clear assigned_to
-        // for re-dispatch retry. The marker comment lets the sanitation circuit
-        // breaker detect repeated failures. During the graceful drain the job
-        // stays launched for boot resume (decision 20) — no failure record, no
-        // outcome checkpoint.
-        if crate::shutdown::aborting() {
-            info!(
-                ticket = %ticket.id,
-                "Sanitation round cut short by drain — job stays launched for boot resume",
-            );
-            return;
-        }
-        warn!(
+    // Drain-cut (decision 20): the job stays status='launched' for boot resume —
+    // no failure record, no outcome checkpoint.
+    if response.is_none() && crate::shutdown::aborting() {
+        info!(
             ticket = %ticket.id,
-            "Sanitation agent returned no output — clearing assigned_to for retry"
+            "Sanitation round cut short by drain — job stays launched for boot resume",
         );
-        record_sanitation_failure(&ticket.id, "agent returned no output", None).await;
-        complete_ticket_stage_job(&job_id).await;
         return;
     }
 
@@ -2184,32 +2228,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         warn!(job = %job_id, error = %e, "Failed to checkpoint sanitation outcome");
     }
 
-    let extraction_prompt = crate::prompt::load_prompt("extraction/sanitation.md");
-
-    let verdict: crate::SanitationVerdict =
-        match agent.extract_verdict(&extraction_prompt, None, None).await {
-            Ok(v) => v,
-            Err(failure) => {
-                warn!(
-                    ticket = %ticket.id,
-                    error = %failure,
-                    "Failed to extract sanitation verdict — clearing assigned_to for retry"
-                );
-                record_sanitation_failure(
-                    &ticket.id,
-                    format!("verdict extraction error: {failure}"),
-                    Some(&failure),
-                )
-                .await;
-                complete_ticket_stage_job(&job_id).await;
-                return;
-            }
-        };
-
-    process_sanitation_verdict(&ticket, verdict).await;
-
-    // Completion tx AFTER the board transition+comment (ordering contract).
-    complete_ticket_stage_job(&job_id).await;
+    finalize_sanitation_round(&ticket, &agent, response.as_deref(), &job_id, false).await;
 }
 
 /// Process the result of a sanitation agent inspection.
@@ -4423,33 +4442,11 @@ async fn resume_sanitation_round(job_id: &str, ticket: Ticket, ws: Workspace) {
         complete_ticket_stage_job(job_id).await;
         return;
     }
-    let Some(_) = response else {
-        if crate::shutdown::aborting() {
-            // Drain-cut: job stays status='launched' for boot resume.
-            return;
-        }
-        record_sanitation_failure(&ticket.id, "agent returned no output (resumed)", None).await;
-        complete_ticket_stage_job(job_id).await;
+    if response.is_none() && crate::shutdown::aborting() {
+        // Drain-cut: job stays status='launched' for boot resume.
         return;
-    };
-    let extraction_prompt = load_prompt("extraction/sanitation.md");
-    match agent
-        .extract_verdict::<crate::SanitationVerdict>(&extraction_prompt, None, None)
-        .await
-    {
-        Ok(verdict) => {
-            process_sanitation_verdict(&ticket, verdict).await;
-        }
-        Err(failure) => {
-            record_sanitation_failure(
-                &ticket.id,
-                format!("verdict extraction error (resumed): {failure}"),
-                Some(&failure),
-            )
-            .await;
-        }
     }
-    complete_ticket_stage_job(job_id).await;
+    finalize_sanitation_round(&ticket, &agent, response.as_deref(), job_id, true).await;
 }
 
 /// Read a job's stored task (the FINAL rendered prompt template).
