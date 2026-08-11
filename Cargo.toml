@@ -26,6 +26,10 @@ voice-debug = []
 # Gates the two-writer checkpoint-race repro harness (benches/wal_race_repro.rs),
 # a discovery/regression instrument — not part of default bench builds.
 wal-repro = []
+# Gates the orphaned-WAL repro harness (benches/wal_orphan_repro.rs): an
+# external sqlite3 closing a live multiprocess-wal db truncates the -wal and
+# strands the -tshm index (class-A incident escalation artifact).
+wal-orphan-repro = []
 # Gates the grep-engine subprocess end-to-end harness (benches/grep_engine_e2e.rs):
 # the parent rewrites commands and spawns `sh -c` with the bench binary acting as
 # the hidden engine subcommand, then diffs against the real system grep.
@@ -193,6 +197,11 @@ required-features = ["voice-tests"]
 name = "wal_race_repro"
 harness = false
 required-features = ["wal-repro"]
+
+[[bench]]
+name = "wal_orphan_repro"
+harness = false
+required-features = ["wal-orphan-repro"]
 
 [[bench]]
 name = "grep_engine_e2e"
