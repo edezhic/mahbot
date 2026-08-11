@@ -1755,63 +1755,34 @@ impl SettingsState {
     /// Build the role-pool editor modal for a user.
     fn pool_edit_dialog(&self, user_name: &str) -> Element<'_, SettingsMessage> {
         let checked = &self.users_state.pool_edit_checked;
-        let mut col = Column::new().padding(24);
-        col = col.push(
-            text(format!("Edit roles — {user_name}"))
-                .size(16)
-                .color(theme::TEXT_PRIMARY)
-                .font(theme::FONT_BOLD),
-        );
-        col = col.push(Space::new().height(16));
-        col = col.push(
-            text("Unchecking every role stops agent answers until a role is assigned.")
-                .size(12)
-                .color(theme::TEXT_MUTED),
-        );
-        col = col.push(Space::new().height(8));
-
-        let role_checks: Vec<Element<'_, SettingsMessage>> = Role::iter()
-            .enumerate()
-            .map(|(i, role)| {
-                let is_checked = checked.get(i).copied().unwrap_or(false);
-                let label = crate::role::role_info(&role).display_label;
-                Checkbox::new(is_checked)
-                    .label(label)
-                    .on_toggle(move |_| {
-                        SettingsMessage::UserMsg(users::UsersMessage::TogglePoolRole(i))
-                    })
-                    .into()
-            })
-            .collect();
-        col = col.push(Row::with_children(role_checks).spacing(6).wrap());
-
-        col = col.push(Space::new().height(16));
-        col = col.push(
-            row![
-                Space::new().width(Length::Fill),
-                button(text("Cancel").size(13))
-                    .style(theme::button_secondary)
-                    .on_press(SettingsMessage::UserMsg(users::UsersMessage::ClosePoolEdit)),
-                Space::new().width(8),
-                button(text("Save").size(13))
-                    .style(theme::button_primary)
-                    .on_press(SettingsMessage::UserMsg(
-                        users::UsersMessage::SubmitPoolEdit(user_name.to_string(),)
-                    )),
-            ]
-            .align_y(Alignment::Center),
-        );
-
-        container(col)
-            .width(Length::Fixed(620.0))
-            .style(theme::dialog_container_style)
-            .into()
+        modal_dialog(
+            format!("Edit roles — {user_name}"),
+            &[],
+            Some(
+                column![
+                    text("Unchecking every role stops agent answers until a role is assigned.")
+                        .size(12)
+                        .color(theme::TEXT_MUTED),
+                    Space::new().height(8),
+                    role_checkbox_row(
+                        |i| checked.get(i).copied().unwrap_or(false),
+                        move |i| SettingsMessage::UserMsg(users::UsersMessage::TogglePoolRole(i)),
+                    ),
+                ]
+                .into(),
+            ),
+            "Save",
+            false,
+            true,
+            SettingsMessage::UserMsg(users::UsersMessage::ClosePoolEdit),
+            SettingsMessage::UserMsg(users::UsersMessage::SubmitPoolEdit(user_name.to_string())),
+        )
     }
 
     /// Build the add-workspace modal dialog content.
     fn add_workspace_dialog(&self) -> Element<'_, SettingsMessage> {
         modal_dialog(
-            "Add Workspace",
+            "Add Workspace".to_string(),
             &[
                 DialogField {
                     label: "Name",
@@ -1826,6 +1797,8 @@ impl SettingsState {
                     on_input: SettingsMessage::AddWorkspacePath,
                 },
             ],
+            None,
+            "Add",
             self.add_workspace_adding,
             !self.add_workspace_name.is_empty() && !self.add_workspace_path.is_empty(),
             SettingsMessage::ToggleAddWorkspaceModal,
@@ -1836,89 +1809,41 @@ impl SettingsState {
     /// Build the add-user modal dialog content.
     fn add_user_dialog(&self) -> Element<'_, SettingsMessage> {
         let any_role_checked = self.add_user_roles.iter().any(|c| *c);
-        let mut col = Column::new().padding(24);
-
-        col = col.push(
-            text("Add User")
-                .size(16)
-                .color(theme::TEXT_PRIMARY)
-                .font(theme::FONT_BOLD),
-        );
-        col = col.push(Space::new().height(16));
-        col = col.push(field_row(
-            "Name",
-            text_input("user name", &self.add_user_sender)
-                .on_input(SettingsMessage::AddUserSender)
-                .style(widgets::text_input_style)
-                .width(Length::Fixed(375.0))
+        modal_dialog(
+            "Add User".to_string(),
+            &[
+                DialogField {
+                    label: "Name",
+                    placeholder: "user name",
+                    value: &self.add_user_sender,
+                    on_input: SettingsMessage::AddUserSender,
+                },
+                DialogField {
+                    label: "Permissions",
+                    placeholder: "optional",
+                    value: &self.add_user_permissions,
+                    on_input: SettingsMessage::AddUserPermissions,
+                },
+            ],
+            Some(
+                column![
+                    text("Allowed roles (at least one required)")
+                        .size(12)
+                        .color(theme::TEXT_MUTED),
+                    role_checkbox_row(
+                        |i| self.add_user_roles.get(i).copied().unwrap_or(false),
+                        SettingsMessage::AddUserRoleToggle,
+                    ),
+                    Space::new().height(8),
+                ]
                 .into(),
-            None,
-        ));
-        col = col.push(Space::new().height(8));
-        col = col.push(field_row(
-            "Permissions",
-            text_input("optional", &self.add_user_permissions)
-                .on_input(SettingsMessage::AddUserPermissions)
-                .style(widgets::text_input_style)
-                .width(Length::Fixed(375.0))
-                .into(),
-            None,
-        ));
-
-        // Role pool checkboxes — at least one must be checked.
-        col = col.push(Space::new().height(16));
-        col = col.push(
-            text("Allowed roles (at least one required)")
-                .size(12)
-                .color(theme::TEXT_MUTED),
-        );
-        let role_checks: Vec<Element<'_, SettingsMessage>> = Role::iter()
-            .enumerate()
-            .map(|(i, role)| {
-                let checked = self.add_user_roles.get(i).copied().unwrap_or(false);
-                let label = crate::role::role_info(&role).display_label;
-                Checkbox::new(checked)
-                    .label(label)
-                    .on_toggle(move |_| SettingsMessage::AddUserRoleToggle(i))
-                    .into()
-            })
-            .collect();
-        col = col.push(Row::with_children(role_checks).spacing(6).wrap());
-        col = col.push(Space::new().height(8));
-
-        col = col.push(Space::new().height(16));
-        col = col.push(
-            row![
-                Space::new().width(Length::Fill),
-                button(text("Cancel").size(13))
-                    .style(theme::button_secondary)
-                    .on_press(SettingsMessage::ToggleAddUserModal),
-                Space::new().width(8),
-                button(
-                    text(if self.add_user_adding {
-                        "Adding..."
-                    } else {
-                        "Add"
-                    })
-                    .size(13),
-                )
-                .style(theme::button_primary)
-                .on_press_maybe(
-                    if self.add_user_adding || self.add_user_sender.is_empty() || !any_role_checked
-                    {
-                        None
-                    } else {
-                        Some(SettingsMessage::SubmitAddUser)
-                    }
-                ),
-            ]
-            .align_y(Alignment::Center),
-        );
-
-        container(col)
-            .width(Length::Fixed(620.0))
-            .style(theme::dialog_container_style)
-            .into()
+            ),
+            "Add",
+            self.add_user_adding,
+            !self.add_user_sender.is_empty() && any_role_checked,
+            SettingsMessage::ToggleAddUserModal,
+            SettingsMessage::SubmitAddUser,
+        )
     }
 
     /// Build the diagnostics modal dialog content for the given workspace.
@@ -2773,6 +2698,25 @@ fn field_row<'a>(
     row_widget.into()
 }
 
+/// Role-pool checkbox row shared by the add-user and pool-edit modals.
+/// Only the row itself — surrounding spacing belongs to each dialog's middle.
+fn role_checkbox_row<'a>(
+    checked: impl Fn(usize) -> bool + Copy + 'a,
+    on_toggle: impl Fn(usize) -> SettingsMessage + Copy + 'a,
+) -> Element<'a, SettingsMessage> {
+    let role_checks: Vec<Element<'a, SettingsMessage>> = Role::iter()
+        .enumerate()
+        .map(|(i, role)| {
+            let label = crate::role::role_info(&role).display_label;
+            Checkbox::new(checked(i))
+                .label(label)
+                .on_toggle(move |_| on_toggle(i))
+                .into()
+        })
+        .collect();
+    Row::with_children(role_checks).spacing(6).wrap().into()
+}
+
 /// Password input — masked by default, eye button toggles visibility.
 fn password_input<'a>(
     placeholder: &str,
@@ -2905,13 +2849,18 @@ struct DialogField<'a> {
     on_input: fn(String) -> SettingsMessage,
 }
 
-/// Build a reusable add-item modal dialog with text fields, a Cancel button,
-/// and a conditionally-enabled Submit (Add) button.
+/// Build a reusable modal dialog: title, optional field rows, optional `middle`
+/// content, and a Cancel / submit footer. The submit button shows `Adding...`
+/// while in flight and is otherwise disabled unless `submit_enabled`.
 ///
-/// Layout: title, spacer(16), field rows (8 px between), spacer(16), Cancel / Add buttons.
+/// Layout: title, spacer(16), field rows (8 px between), spacer(16),
+/// middle (if any), spacer(16), footer.
+#[allow(clippy::too_many_arguments)]
 fn modal_dialog<'a>(
-    title: &'static str,
+    title: String,
     fields: &[DialogField<'a>],
+    middle: Option<Element<'a, SettingsMessage>>,
+    submit_label: &'static str,
     adding: bool,
     submit_enabled: bool,
     on_cancel: SettingsMessage,
@@ -2926,7 +2875,7 @@ fn modal_dialog<'a>(
             .font(theme::FONT_BOLD),
     );
 
-    if !fields.is_empty() {
+    if !fields.is_empty() || middle.is_some() {
         col = col.push(Space::new().height(16));
     }
 
@@ -2949,6 +2898,11 @@ fn modal_dialog<'a>(
         col = col.push(Space::new().height(16));
     }
 
+    if let Some(m) = middle {
+        col = col.push(m);
+        col = col.push(Space::new().height(16));
+    }
+
     col = col.push(
         row![
             Space::new().width(Length::Fill),
@@ -2956,7 +2910,7 @@ fn modal_dialog<'a>(
                 .style(theme::button_secondary)
                 .on_press(on_cancel),
             Space::new().width(8),
-            button(text(if adding { "Adding..." } else { "Add" }).size(13),)
+            button(text(if adding { "Adding..." } else { submit_label }).size(13))
                 .style(theme::button_primary)
                 .on_press_maybe(if adding || !submit_enabled {
                     None
