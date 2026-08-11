@@ -4241,10 +4241,16 @@ async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: 
         } else {
             let head = run_git_head(repo_path).await.ok();
             let tree = run_git_write_tree(repo_path).await.ok();
-            if let (Some(head), Some(tree)) = (head, tree)
-                && let Err(e) = board()
-                    .set_reviewed_base(&ticket_arc.id, Some(&head), Some(&tree))
-                    .await
+            if head.is_none() || tree.is_none() {
+                warn!(
+                    ticket = %ticket_arc.id,
+                    head = head.is_some(),
+                    tree = tree.is_some(),
+                    "Resume: could not compute content identity after review — reviewed base not recorded",
+                );
+            } else if let Err(e) = board()
+                .set_reviewed_base(&ticket_arc.id, head.as_deref(), tree.as_deref())
+                .await
             {
                 warn!(
                     ticket = %ticket_arc.id,
@@ -4329,7 +4335,12 @@ async fn resume_engineer_round(job_id: &str, ticket: Ticket, ws: Workspace) {
             agent.is_cancelled(),
             agent.failure.as_deref(),
         );
-        let pause_note = pause_workspace_on_failure(&ticket, "engineer agent failure").await;
+        let pause_reason = if agent.is_cancelled() {
+            "user cancelled the agent run"
+        } else {
+            "engineer agent failure"
+        };
+        let pause_note = pause_workspace_on_failure(&ticket, pause_reason).await;
         comment_and_transition_or_bail(
             TransitionCtx {
                 ticket: &ticket,
