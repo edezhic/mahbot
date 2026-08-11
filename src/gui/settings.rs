@@ -1728,21 +1728,23 @@ impl SettingsState {
     fn render_modal_overlay(&self) -> Element<'_, SettingsMessage> {
         if self.show_add_workspace_modal {
             let dialog = self.add_workspace_dialog();
-            modal_with_backdrop(dialog, SettingsMessage::ToggleAddWorkspaceModal)
+            widget_helpers::modal_backdrop(dialog, SettingsMessage::ToggleAddWorkspaceModal, 0.5)
         } else if self.show_add_user_modal {
             let dialog = self.add_user_dialog();
-            modal_with_backdrop(dialog, SettingsMessage::ToggleAddUserModal)
+            widget_helpers::modal_backdrop(dialog, SettingsMessage::ToggleAddUserModal, 0.5)
         } else if let Some(ref pool_user) = self.users_state.pool_edit_target {
             let dialog = self.pool_edit_dialog(pool_user);
-            modal_with_backdrop(
+            widget_helpers::modal_backdrop(
                 dialog,
                 SettingsMessage::UserMsg(users::UsersMessage::ClosePoolEdit),
+                0.5,
             )
         } else if let Some(ref diag_ws_name) = self.workspaces_state.diagnostics_modal {
             let dialog = self.diagnostics_dialog(diag_ws_name);
-            modal_with_backdrop(
+            widget_helpers::modal_backdrop(
                 dialog,
                 SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::Escape),
+                0.5,
             )
         } else {
             // Keep Stack widget type stable
@@ -2969,15 +2971,6 @@ fn modal_dialog<'a>(
         .width(Length::Fixed(620.0))
         .style(theme::dialog_container_style)
         .into()
-}
-
-/// Wrap a dialog element inside a semi-transparent backdrop, centered on screen.
-/// Uses the shared backdrop helper for consistent overlay behavior.
-fn modal_with_backdrop(
-    dialog: Element<'_, SettingsMessage>,
-    on_backdrop_click: SettingsMessage,
-) -> Element<'_, SettingsMessage> {
-    widget_helpers::modal_backdrop(dialog, on_backdrop_click, 0.5)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────

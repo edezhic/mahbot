@@ -1048,14 +1048,6 @@ impl BoardState {
         self.selected_ticket.is_some() || self.selected_loading || self.detail_error.is_some()
     }
 
-    /// Build a centered dialog with a semi-transparent backdrop that closes on click.
-    fn centered_dialog<'a>(
-        content: impl Into<Element<'a, BoardMessage>>,
-        on_backdrop: BoardMessage,
-    ) -> Element<'a, BoardMessage> {
-        widget_helpers::modal_backdrop(content, on_backdrop, 0.5)
-    }
-
     /// Render the modal overlay for ticket detail.
     /// Includes the empty-case placeholder for `Stack` widget type stability.
     #[must_use]
@@ -1078,7 +1070,7 @@ impl BoardState {
                 .padding(24)
                 .style(theme::dialog_container_style);
 
-                Self::centered_dialog(dialog, BoardMessage::CloseModal)
+                widget_helpers::modal_backdrop(dialog, BoardMessage::CloseModal, 0.5)
             } else if self.selected_ticket.is_none()
                 && let Some(ref err) = self.detail_error
             {
@@ -1105,7 +1097,7 @@ impl BoardState {
                 .padding(24)
                 .style(theme::dialog_container_style);
 
-                Self::centered_dialog(dialog, BoardMessage::CloseModal)
+                widget_helpers::modal_backdrop(dialog, BoardMessage::CloseModal, 0.5)
             } else {
                 let detail = self.modal_detail();
                 let dialog = container(detail)
@@ -1113,7 +1105,7 @@ impl BoardState {
                     .padding(24)
                     .style(theme::dialog_container_style);
 
-                Self::centered_dialog(dialog, BoardMessage::CloseModal)
+                widget_helpers::modal_backdrop(dialog, BoardMessage::CloseModal, 0.5)
             }
         } else {
             // Keep Stack widget type stable to prevent MouseArea state
