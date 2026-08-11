@@ -105,10 +105,6 @@ pub enum HighlightClass {
     Operator,
     /// Default — no special highlighting
     Text,
-    /// Search match highlight (find/replace)
-    Search,
-    /// Currently focused search match
-    SearchCurrent,
 }
 
 impl HighlightClass {
@@ -135,9 +131,6 @@ impl HighlightClass {
             HighlightClass::Operator => Color::from_rgb(0.949, 0.588, 0.408),
             // Default text — matches the dashboard's primary text color
             HighlightClass::Text => theme::TEXT_PRIMARY,
-            // Search/find highlights — kept as amber (editor navigation, not syntax)
-            HighlightClass::Search => Color::from_rgb(1.0, 0.667, 0.0),
-            HighlightClass::SearchCurrent => Color::from_rgb(1.0, 0.8, 0.2),
         }
     }
 }
@@ -390,7 +383,6 @@ const fn span_paint_priority(class: HighlightClass) -> u8 {
         HighlightClass::Keyword => 4,
         HighlightClass::Number => 5,
         HighlightClass::Comment => 6,
-        HighlightClass::Search | HighlightClass::SearchCurrent => 7,
         HighlightClass::Text => 255,
     }
 }
