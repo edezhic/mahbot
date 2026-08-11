@@ -3187,6 +3187,74 @@ async fn load_ticket_stage_slots(job_id: &str) -> anyhow::Result<Vec<TicketStage
 
 // ── Backlog Analysis ──────────────────────────────────────────────────
 
+/// Escalate a unanimous-blocker analysis round with 2 extra analysts on the
+/// SAME job, extending `results`. Returns false when the ticket left the
+/// Analysis phase — the job was already completed; the caller must return.
+///
+/// Roster gate: escalation is re-evaluated only at base roster size. One
+/// verdict per slot by construction of [`run_parallel_agents`], so
+/// `results.len() == slots.len()`; the base roster is
+/// `DEFAULT_PARALLEL_AGENT_COUNT` by construction of
+/// [`spawn_ticket_stage_round`]. On resume this guards against re-escalation
+/// after a crash between the base round and the escalation batch. Skipped
+/// during the graceful drain — no new jobs are spawned while draining.
+#[must_use]
+async fn maybe_escalate_analysis(
+    ticket: &Arc<Ticket>,
+    ws: &Workspace,
+    job_id: &str,
+    extraction_prompt: &str,
+    task: &str,
+    resume: bool,
+    results: &mut Vec<ParallelVerdict>,
+) -> bool {
+    if results.len() == DEFAULT_PARALLEL_AGENT_COUNT
+        && crate::joint_verdict::analysis_escalation_needed(results, DEFAULT_PARALLEL_AGENT_COUNT)
+        && !crate::shutdown::aborting()
+    {
+        // Re-check the phase before spending the second batch — the ticket
+        // may have been moved externally while the first batch ran.
+        if !is_ticket_in_phase(&ticket.id, TicketPhase::Analysis).await {
+            complete_ticket_stage_job(job_id).await;
+            return false;
+        }
+        if resume {
+            info!(ticket = %ticket.id, job = %job_id, "Resume: escalating with 2 additional analysts");
+        } else {
+            info!(ticket = %ticket.id, "All analysts flagged blockers — escalating with 2 additional analysts");
+        }
+        let extra_slots = match append_ticket_stage_slots(ticket, job_id, Role::Analyst, task, 2)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                if resume {
+                    warn!(job = %job_id, error = %e, "Resume: escalation slot append failed — proceeding");
+                } else {
+                    warn!(ticket = %ticket.id, error = %e, "Failed to append escalation slots — proceeding with base round");
+                }
+                Vec::new()
+            }
+        };
+        let extra = if extra_slots.is_empty() {
+            Vec::new()
+        } else {
+            run_parallel_agents(
+                ticket,
+                ws,
+                Role::Analyst,
+                extraction_prompt,
+                job_id,
+                &extra_slots,
+                resume,
+            )
+            .await
+        };
+        results.extend(extra);
+    }
+    true
+}
+
 /// Spawn 3 parallel analyst agents (base) to research a backlog ticket,
 /// escalating to 5 when every dispatched analyst flags blockers. One joint
 /// comment (role = stage name "Analysis") replaces the per-agent comments and
@@ -3227,7 +3295,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 
     // Spawn the durable analysis round (jobs + roster, one tx) BEFORE the
     // agents' first session writes — the roster is the round record.
-    let Ok((job_id, mut slots)) = spawn_ticket_stage_round(
+    let Ok((job_id, slots)) = spawn_ticket_stage_round(
         &ticket,
         &ws,
         "analysis",
@@ -3257,52 +3325,20 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
     .await;
 
     // Unanimous-blocker escalation: when every dispatched analyst flagged a
-    // blocker, add 2 more analysts (same model) for depth before the Manager
+    // blocker, 2 extra analysts (same model) join for depth before the Manager
     // decision. Analysis stays fail-open — the ticket always advances.
-    // Escalation appends slots 3,4 to the SAME job (re-evaluated only when
-    // roster size == 3 — matches analysis_escalation_needed). Skipped during
-    // the graceful drain — no new jobs are spawned while draining.
-    if crate::joint_verdict::analysis_escalation_needed(&results, DEFAULT_PARALLEL_AGENT_COUNT)
-        && !crate::shutdown::aborting()
+    if !maybe_escalate_analysis(
+        &ticket,
+        &ws,
+        &job_id,
+        &extraction_prompt,
+        &message,
+        false,
+        &mut results,
+    )
+    .await
     {
-        // Re-check the phase before spending the second batch — the ticket
-        // may have been moved externally while the first batch ran.
-        if !is_ticket_in_phase(&ticket.id, TicketPhase::Analysis).await {
-            complete_ticket_stage_job(&job_id).await;
-            return;
-        }
-        info!(
-            ticket = %ticket.id,
-            "All analysts flagged blockers — escalating with 2 additional analysts",
-        );
-        let extra_slots =
-            match append_ticket_stage_slots(&ticket, &job_id, Role::Analyst, &message, 2).await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        ticket = %ticket.id,
-                        error = %e,
-                        "Failed to append escalation slots — proceeding with base round",
-                    );
-                    Vec::new()
-                }
-            };
-        let extra = if extra_slots.is_empty() {
-            Vec::new()
-        } else {
-            run_parallel_agents(
-                &ticket,
-                &ws,
-                Role::Analyst,
-                &extraction_prompt,
-                &job_id,
-                &extra_slots,
-                false,
-            )
-            .await
-        };
-        slots.extend(extra_slots);
-        results.extend(extra);
+        return;
     }
 
     if !is_ticket_in_phase(&ticket.id, TicketPhase::Analysis).await {
@@ -4072,7 +4108,7 @@ async fn resume_analysis_round(job_id: &str, ticket: Ticket, ws: Workspace) {
         complete_ticket_stage_job(job_id).await;
         return;
     }
-    let Ok(mut slots) = load_ticket_stage_slots(job_id).await else {
+    let Ok(slots) = load_ticket_stage_slots(job_id).await else {
         complete_ticket_stage_job(job_id).await;
         return;
     };
@@ -4089,52 +4125,21 @@ async fn resume_analysis_round(job_id: &str, ticket: Ticket, ws: Workspace) {
     )
     .await;
 
-    // Escalation re-evaluated ONLY at roster size 3 (the crash may have hit
-    // between the base round and the escalation batch). Drain guard mirrors
-    // the fresh dispatch path — never append slots or spawn analysts during
-    // the graceful drain. The stored task is fetched lazily (only the
-    // escalation branch needs it).
-    if slots.len() == 3
-        && crate::joint_verdict::analysis_escalation_needed(&results, DEFAULT_PARALLEL_AGENT_COUNT)
-        && !crate::shutdown::aborting()
+    // Escalation re-evaluated ONLY at base roster size (the crash may have
+    // hit between the base round and the escalation batch) — see
+    // maybe_escalate_analysis. Drain guard mirrors the fresh dispatch path.
+    if !maybe_escalate_analysis(
+        &ticket_arc,
+        &ws,
+        job_id,
+        &extraction_prompt,
+        &job_task(job_id).await,
+        true,
+        &mut results,
+    )
+    .await
     {
-        let job_prompt = job_task(job_id).await;
-        if !is_ticket_in_phase(&ticket_arc.id, TicketPhase::Analysis).await {
-            complete_ticket_stage_job(job_id).await;
-            return;
-        }
-        info!(ticket = %ticket_arc.id, job = %job_id, "Resume: escalating with 2 additional analysts");
-        let extra_slots = match append_ticket_stage_slots(
-            &ticket_arc,
-            job_id,
-            Role::Analyst,
-            &job_prompt,
-            2,
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(job = %job_id, error = %e, "Resume: escalation slot append failed — proceeding");
-                Vec::new()
-            }
-        };
-        let extra = if extra_slots.is_empty() {
-            Vec::new()
-        } else {
-            run_parallel_agents(
-                &ticket_arc,
-                &ws,
-                Role::Analyst,
-                &extraction_prompt,
-                job_id,
-                &extra_slots,
-                true,
-            )
-            .await
-        };
-        slots.extend(extra_slots);
-        results.extend(extra);
+        return;
     }
 
     if !is_ticket_in_phase(&ticket_arc.id, TicketPhase::Analysis).await {
