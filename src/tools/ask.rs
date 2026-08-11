@@ -500,21 +500,15 @@ pub(crate) async fn resume_ask_round(job_id: &str, ws: &Workspace) {
         );
         return;
     }
-    // Terminalize into the durable envelope (the resumed orchestrator routes
-    // the same way a fresh dispatch would — to the stored caller). On pending
-    // INSERT failure the envelope still routes best-effort (never a silent
-    // drop — the INSERT-failure policy).
-    let envelope = crate::jobs::complete_durable_job(
+    complete_durable_job_and_route(
         job_id,
         build_async_ask_message(&result),
         JobKind::AskToolResult,
         caller_role,
-        &caller.user_name,
-        &caller.channel,
+        &caller,
         &ws.name,
     )
     .await;
-    crate::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
 }
 
 /// Boot-scan over-cap handling for ask jobs: the job exceeded
@@ -538,17 +532,15 @@ pub(crate) async fn ask_capped_envelope(job_id: &str, ws: &Workspace) {
          please re-issue the ask",
         crate::jobs::MAX_BOOT_REDISPATCH,
     )));
-    let envelope = crate::jobs::complete_durable_job(
+    complete_durable_job_and_route(
         job_id,
         build_async_ask_message(&result),
         JobKind::AskToolResult,
         caller_role,
-        &caller.user_name,
-        &caller.channel,
+        &caller,
         &ws.name,
     )
     .await;
-    crate::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
 }
 
 /// Build the `<ask-tool-result>` envelope message for an async ask dispatch.
@@ -571,6 +563,32 @@ pub(crate) fn build_async_result_envelope(result: &anyhow::Result<String>, tag: 
             format!("<{tag}>\n\nAn error occurred: {e}</{tag}>")
         }
     }
+}
+
+/// Shared tail of the 4 resume/capped paths: terminalize a durable
+/// ask/research job and route its envelope to the stored caller. Takes
+/// pre-built content so the caller's named wrapper keeps kind and tag
+/// paired; the INSERT-failure best-effort route lives inside
+/// [`crate::jobs::complete_durable_job`].
+pub(crate) async fn complete_durable_job_and_route(
+    job_id: &str,
+    content: String,
+    kind: JobKind,
+    caller_role: Role,
+    caller: &crate::jobs::JobCaller,
+    workspace_name: &str,
+) {
+    let envelope = crate::jobs::complete_durable_job(
+        job_id,
+        content,
+        kind,
+        caller_role,
+        &caller.user_name,
+        &caller.channel,
+        workspace_name,
+    )
+    .await;
+    crate::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
 }
 
 // ── Structured claim-level findings ──────────────────────────────────────

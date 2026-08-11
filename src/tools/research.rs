@@ -24,8 +24,9 @@ use crate::retry::FailureClass;
 use crate::tools::Tool;
 use crate::tools::ask::{
     AnalystFindings, Claim, RoundMember, VerificationResult, VerificationTarget,
-    await_round_members, build_async_result_envelope, dispatch_verifiers, escape_fences,
-    extract_query_telemetry, load_analyst_angles, max_confidence, normalize_claim, round_timeout,
+    await_round_members, build_async_result_envelope, complete_durable_job_and_route,
+    dispatch_verifiers, escape_fences, extract_query_telemetry, load_analyst_angles,
+    max_confidence, normalize_claim, round_timeout,
 };
 use crate::{ChatMessage, ChatRequest, ChatRequestMeta, DEFAULT_MAX_TOKENS, Role, Workspace};
 use anyhow::Result;
@@ -479,15 +480,6 @@ async fn dispatch_durable_research(
     (result, envelope)
 }
 
-/// Deliver a research result envelope to the job's stored caller (the
-/// consumer-confirmed pending row was created by
-/// [`crate::jobs::complete_durable_job`]).
-/// Routes UNCONDITIONALLY — on pending INSERT failure the envelope carries
-/// `pending_job_id: None` and still reaches the caller (never a silent drop).
-fn deliver_research_envelope(envelope: AgentJob) {
-    crate::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
-}
-
 /// Boot resume of a research run: re-enter the orchestrator at the
 /// checkpointed stage (retry_count capped by the boot scan), then terminalize
 /// into the durable envelope exactly like a fresh dispatch. Aborts quietly on
@@ -513,17 +505,15 @@ pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
         );
         return;
     }
-    let envelope = crate::jobs::complete_durable_job(
+    complete_durable_job_and_route(
         job_id,
         build_async_research_message(&result),
         JobKind::ResearchResult,
         caller_role,
-        &caller.user_name,
-        &caller.channel,
+        &caller,
         &ws.name,
     )
     .await;
-    deliver_research_envelope(envelope);
 }
 
 /// Boot-scan over-cap handling: the job exceeded MAX_BOOT_REDISPATCH — deliver
@@ -547,17 +537,15 @@ pub(crate) async fn research_capped_partial_report(job_id: &str, ws: &Workspace)
         &state.acc,
         "boot re-dispatch cap exceeded — partial report from last checkpoint",
     ));
-    let envelope = crate::jobs::complete_durable_job(
+    complete_durable_job_and_route(
         job_id,
         build_async_research_message(&result),
         JobKind::ResearchResult,
         caller_role,
-        &caller.user_name,
-        &caller.channel,
+        &caller,
         &ws.name,
     )
     .await;
-    deliver_research_envelope(envelope);
 }
 
 /// Build the `<research-result>` envelope message for the async research
