@@ -310,7 +310,7 @@ pub async fn route_user_message(
     let mut persisted = false;
     if job.role == Role::Manager {
         let id = crate::generate_id();
-        match persist_pending(&agent_id, &job, id.clone()).await {
+        match persist_pending(&job, id.clone()).await {
             Ok(()) => {
                 job.pending_job_id = Some(id);
                 persisted = true;
@@ -340,30 +340,18 @@ pub async fn route_user_message(
 
 /// Persist an envelope to `pending_jobs` (`started`/`attempts` are
 /// schema-locked write-only columns, DEFAULT 0 — omitted from the INSERT,
-/// consistent with [`crate::jobs::complete_job_with_envelope`]).
+/// consistent with [`crate::jobs::complete_job_with_envelope`]). The target
+/// agent id and kind are derived from the envelope by
+/// [`crate::jobs::pending_job_params`].
 /// Used by the durable producers (manager-bound messages here; ask/research
 /// use the source job id via [`crate::jobs::complete_job_with_envelope`]).
-async fn persist_pending(target_agent_id: &str, job: &AgentJob, id: String) -> anyhow::Result<()> {
+async fn persist_pending(job: &AgentJob, id: String) -> anyhow::Result<()> {
     let now = turso::now();
     crate::session::store()
         .conn
         .execute(
-            "INSERT INTO pending_jobs \
-             (id, target_agent_id, kind, envelope, workspace_name, user_name, channel, role, \
-              reply_target, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            crate::turso::params![
-                id,
-                target_agent_id,
-                job.kind.as_str(),
-                serde_json::to_string(job)?,
-                job.workspace_name.clone(),
-                job.user_name.clone(),
-                job.channel.clone(),
-                job.role.as_str(),
-                job.reply_target.clone().unwrap_or_default(),
-                now,
-            ],
+            crate::jobs::PENDING_JOB_INSERT_SQL,
+            crate::jobs::pending_job_params(&id, job, &now)?,
         )
         .await?;
     Ok(())

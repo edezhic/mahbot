@@ -3132,18 +3132,16 @@ async fn append_ticket_stage_slots(
         crate::session::store()
             .conn
             .execute(
-                "INSERT INTO agents \
-                 (job_id, agent_id, kind, idx, role, status, task, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'launched', ?6, ?7)",
-                crate::turso::params![
+                crate::jobs::AGENT_INSERT_SQL,
+                crate::jobs::agent_params(
                     job_id,
-                    agent_id.clone(),
-                    agent_kind_for_role(role).as_str(),
-                    i,
-                    role.as_str(),
-                    task.clone(),
-                    now.clone(),
-                ],
+                    &agent_id,
+                    agent_kind_for_role(role),
+                    Some(i),
+                    role,
+                    &task,
+                    &now,
+                ),
             )
             .await?;
         slots.push(TicketStageSlot {

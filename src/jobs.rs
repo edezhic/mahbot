@@ -11,7 +11,7 @@
 
 use crate::Role;
 use crate::message_router::{AgentJob, JobKind};
-use crate::turso::{self, Connection, Row, TxGuard, params};
+use crate::turso::{self, Connection, Row, TxGuard, Value, params};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -197,6 +197,66 @@ fn pending_row_from(row: &Row) -> anyhow::Result<PendingJobRow> {
     })
 }
 
+// ── Shared INSERT forms (one definition each) ───────────────────────────
+// Each durable INSERT form has two producers — one lock-acquiring (conn),
+// one lock-held (TxGuard). The SQL const + params builder is the single
+// source of truth for the column set; call sites keep their own executor
+// (never delegate a TxGuard call to conn.execute — the guard already holds
+// the mutex) and their own error contexts.
+
+/// pending_jobs envelope INSERT — producers: `message_router::persist_pending`
+/// and `complete_job_with_envelope`. `started`/`attempts` are schema-locked
+/// write-only columns (DEFAULT 0) — omitted by design.
+pub(crate) const PENDING_JOB_INSERT_SQL: &str = "INSERT INTO pending_jobs \
+     (id, target_agent_id, kind, envelope, workspace_name, user_name, channel, role, \
+      reply_target, created_at) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+
+/// Build the pending_jobs INSERT params from a durable envelope — the target
+/// agent id and kind are derived from the envelope (no kind parameter).
+pub(crate) fn pending_job_params(id: &str, envelope: &AgentJob, now: &str) -> Result<[Value; 10]> {
+    let envelope_json = serde_json::to_string(envelope)?;
+    Ok([
+        id.into(),
+        envelope_target(envelope).into(),
+        envelope.kind.as_str().into(),
+        envelope_json.into(),
+        envelope.workspace_name.clone().into(),
+        envelope.user_name.clone().into(),
+        envelope.channel.clone().into(),
+        envelope.role.as_str().into(),
+        envelope.reply_target.clone().unwrap_or_default().into(),
+        now.into(),
+    ])
+}
+
+/// agents roster INSERT — producers: `spawn_job` roster loop and
+/// `management::append_ticket_stage_slots`. Status is the literal 'launched'.
+pub(crate) const AGENT_INSERT_SQL: &str = "INSERT INTO agents \
+     (job_id, agent_id, kind, idx, role, status, task, created_at) \
+     VALUES (?1, ?2, ?3, ?4, ?5, 'launched', ?6, ?7)";
+
+/// Build the agents roster INSERT params (status is fixed by the SQL).
+pub(crate) fn agent_params(
+    job_id: &str,
+    agent_id: &str,
+    kind: AgentKind,
+    idx: Option<i64>,
+    role: Role,
+    task: &str,
+    now: &str,
+) -> [Value; 7] {
+    [
+        job_id.into(),
+        agent_id.into(),
+        kind.as_str().into(),
+        idx.into(),
+        role.as_str().into(),
+        task.into(),
+        now.into(),
+    ]
+}
+
 // ── Spawn (one tx) ──────────────────────────────────────────────────────
 
 /// Optional kind-specific child row inserted in the SAME tx as the job row
@@ -273,17 +333,8 @@ pub(crate) async fn spawn_job(
     .with_context(|| format!("failed to spawn job {id}"))?;
     for a in agents {
         tx.execute(
-            "INSERT INTO agents (job_id, agent_id, kind, idx, role, status, task, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 'launched', ?6, ?7)",
-            params![
-                id,
-                a.agent_id.clone(),
-                a.kind.as_str(),
-                a.idx,
-                a.role.as_str(),
-                a.task.clone(),
-                now.clone(),
-            ],
+            AGENT_INSERT_SQL,
+            agent_params(id, &a.agent_id, a.kind, a.idx, a.role, &a.task, &now),
         )
         .await
         .with_context(|| format!("failed to insert agent roster for job {id}"))?;
@@ -405,25 +456,9 @@ pub(crate) async fn complete_job_with_envelope(
 ) -> Result<()> {
     let now = turso::now();
     let tx = conn.begin_tx().await?;
-    // `started` is omitted — schema-locked write-only column (DEFAULT 0; the
-    // dedup check is the sole in-session discriminator).
     tx.execute(
-        "INSERT INTO pending_jobs \
-         (id, target_agent_id, kind, envelope, workspace_name, user_name, channel, role, \
-          reply_target, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![
-            job_id,
-            envelope_target(envelope),
-            envelope.kind.as_str(),
-            serde_json::to_string(envelope).context("serialize envelope")?,
-            envelope.workspace_name.clone(),
-            envelope.user_name.clone(),
-            envelope.channel.clone(),
-            envelope.role.as_str(),
-            envelope.reply_target.clone().unwrap_or_default(),
-            now,
-        ],
+        PENDING_JOB_INSERT_SQL,
+        pending_job_params(job_id, envelope, &now).context("serialize envelope")?,
     )
     .await
     .with_context(|| format!("failed to persist envelope for job {job_id}"))?;
