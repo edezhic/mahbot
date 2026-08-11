@@ -691,7 +691,8 @@ struct GrepWord {
 }
 
 /// Tokenize a grep segment (after the verb): quote-aware split, unquote,
-/// redirect classification. Expansions in any position fall back.
+/// redirect classification (delegated to the read-only guard's token
+/// classifier — single source of truth for redirect-token semantics).
 fn grep_tokenize(segment: &str) -> Result<Vec<GrepWord>, Fallback> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -705,7 +706,10 @@ fn grep_tokenize(segment: &str) -> Result<Vec<GrepWord>, Fallback> {
         }
         let raw = std::mem::take(current);
         let value = unquote_word(&raw)?;
-        let (redirect, needs_target) = classify_redirect(&raw);
+        let (redirect, needs_target) = match super::readonly::classify_shell_token(&raw) {
+            super::readonly::TokenKind::Regular => (false, false),
+            super::readonly::TokenKind::Redirect { needs_target } => (true, needs_target),
+        };
         out.push(GrepWord {
             value,
             raw,
@@ -779,41 +783,6 @@ fn unquote_word(raw: &str) -> Result<String, Fallback> {
         }
     }
     Ok(out)
-}
-
-/// Redirect-operator classification on the raw token (quoted redirects are
-/// literals). Mirrors the read-only guard's token classifier.
-fn classify_redirect(w: &str) -> (bool, bool) {
-    match w {
-        ">" | ">&" | ">>" | ">|" | "<" | "<&" | "<>" | "&>" | "&>>" => return (true, true),
-        "2>&1" | "1>&2" => return (true, false),
-        _ => {}
-    }
-    if w.starts_with("<<<")
-        || (w.len() > 3 && w.as_bytes()[0].is_ascii_digit() && w.ends_with("<<<"))
-    {
-        return (true, true);
-    }
-    if is_digit_suffix_redirect(w, b'>') || is_digit_suffix_redirect(w, b'<') {
-        return (true, true);
-    }
-    if w.starts_with('>') || w.starts_with('<') {
-        return (true, false);
-    }
-    if w.len() > 1 && w.as_bytes()[0].is_ascii_digit() && (w.contains('>') || w.contains('<')) {
-        return (true, false);
-    }
-    if w.contains("&>") {
-        return (true, false);
-    }
-    (false, false)
-}
-
-fn is_digit_suffix_redirect(w: &str, op: u8) -> bool {
-    w.len() > 1
-        && w.as_bytes()[0].is_ascii_digit()
-        && w.as_bytes()[1] == op
-        && w[2..].bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Member-side redirects that move stderr off the shell tool's captured fd 2
@@ -3254,6 +3223,38 @@ mod parity_tests {
             assert_falls_back(row, &ws, &home);
         }
         assert_parity(rows[3], &ws, &home);
+    }
+}
+
+// ── Redirect-consumption pins (non-gated: pure parsing) ───────────────
+// The token classifier is shared with the read-only guard (readonly.rs);
+// these rows pin the TokenKind→(redirect, needs_target) mapping for the
+// divergent redirect shapes so a wrong mapping fails loudly here.
+
+#[cfg(test)]
+mod redirect_token_pins {
+    use super::*;
+
+    fn redirects_of(segment: &str) -> (Vec<String>, Vec<String>) {
+        let mut words = grep_tokenize(segment).expect("tokenize");
+        if words.first().is_some_and(|w| w.value == "grep") {
+            words.remove(0);
+        }
+        let parsed = parse_grep_words(&words, "grep").expect("parse");
+        (parsed.redirects, parsed.operand_tokens)
+    }
+
+    #[test]
+    fn divergent_redirect_shapes_consume_targets_like_the_guard() {
+        // `10>` (multi-digit fd) expects a target word; `1>0` (fd + target
+        // merged) does not — the following word stays a grep operand.
+        let (redirects, operands) = redirects_of("grep foo a.txt 10> out.txt");
+        assert_eq!(redirects, ["10>", "out.txt"], "10> must consume its target");
+        assert_eq!(operands, ["a.txt"]);
+
+        let (redirects, operands) = redirects_of("grep foo a.txt 1>0 out.txt");
+        assert_eq!(redirects, ["1>0"], "1>0 is self-contained");
+        assert_eq!(operands, ["a.txt", "out.txt"], "out.txt stays an operand");
     }
 }
 

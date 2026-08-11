@@ -2459,7 +2459,7 @@ fn is_digit_suffix_redirect(w: &str, op: u8) -> bool {
 
 /// Result of classifying a whitespace-split shell token.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum TokenKind {
+pub(super) enum TokenKind {
     /// Not a redirect or heredoc — pass through.
     Regular,
     /// A redirect operator.  When `needs_target`, the caller should skip
@@ -2496,11 +2496,12 @@ enum TokenKind {
 ///
 /// # Design note
 ///
-/// This is a **token-level** classifier used by [`non_flag_path_args`].  It is
-/// NOT used by [`has_disallowed_redirect`], which operates at a different
+/// This is a **token-level** classifier shared by [`non_flag_path_args`] and
+/// the grep engine's rewrite path (which re-creates redirect tokens verbatim).
+/// It is NOT used by [`has_disallowed_redirect`], which operates at a different
 /// abstraction level (character-based with quote-state awareness).  Those two
 /// functions have distinct semantics and are deliberately kept separate.
-fn classify_shell_token(w: &str) -> TokenKind {
+pub(super) fn classify_shell_token(w: &str) -> TokenKind {
     // ── Exact-match redirect operators ────────────────────────────
     // NOTE: `>&` and `&>`/`&>>` are checked via exact `match` BEFORE the
     // pattern-based checks below (see ordering invariants in doc comment).
@@ -5678,6 +5679,7 @@ mod tests {
             // ── Digit-prefixed standalone (expects target) ─────────
             ("2>", TokenKind::Redirect { needs_target: true }),
             ("10>", TokenKind::Redirect { needs_target: true }),
+            ("12>", TokenKind::Redirect { needs_target: true }),
             ("3<", TokenKind::Redirect { needs_target: true }),
             // ── Self-contained fd-merge (no target) ────────────────
             ("2>&1", NO_TARGET),
@@ -5705,6 +5707,11 @@ mod tests {
             ("2>/dev/null", NO_TARGET),
             ("1>/tmp/out", NO_TARGET),
             ("3</dev/null", NO_TARGET),
+            // {digit}{op}{digit} shapes: fd + target merged, no separate word
+            ("1>0", NO_TARGET),
+            ("2>1", NO_TARGET),
+            ("2>0", NO_TARGET),
+            ("3<4", NO_TARGET),
             ("&>/dev/null", NO_TARGET),
             ("&>>file", NO_TARGET),
             (">&2", NO_TARGET),
