@@ -22,7 +22,7 @@ crate::define_store! {
 /// sweep stale terminal-phase pipeline reservations.
 ///
 /// Runs every 5 minutes, respects the global shutdown token via
-/// [`crate::shutdown::sleep_or_shutdown`] (same pattern as
+/// [`crate::shutdown::sleep_or_shutdown_or_drain`] (same pattern as
 /// [`crate::maintainer::run_maintainer_loop`]).
 /// Logs per-pass failures and continues.
 pub async fn run_archive_cancelled_loop() {

@@ -166,8 +166,8 @@ pub(crate) static DEAD_SESSION_TRACKER: std::sync::LazyLock<DeadSessionTracker> 
 /// Run the dead-session recovery poller loop.
 ///
 /// Follows the established background-task pattern: cooperative shutdown via
-/// [`crate::shutdown::sleep_or_shutdown`], single-failure isolation via
-/// `tracing::warn!`.
+/// [`crate::shutdown::sleep_or_shutdown_or_drain`], single-failure isolation
+/// via `tracing::warn!`.
 pub async fn run_dead_session_recovery_loop() {
     loop {
         if !crate::shutdown::sleep_or_shutdown_or_drain(POLL_INTERVAL).await {
