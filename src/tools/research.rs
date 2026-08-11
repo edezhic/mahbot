@@ -693,22 +693,20 @@ enum ConfirmOutcome {
 }
 
 impl AccumulatedEvidence {
-    /// Absorb a round's evidence, returning `(novel_urls, novel_unanswered,
-    /// pending_claims)`. URLs and unanswered aspects dedup exactly as before;
-    /// claims are collected into a pending list — novelty is decided by the
-    /// per-round LLM annotation pass, not embedding similarity.
-    fn absorb(&mut self, round: &EvidenceRound) -> (usize, usize, Vec<Claim>) {
+    /// Absorb a round's evidence, returning `(novel_urls, pending_claims)`.
+    /// URLs and unanswered aspects dedup exactly as before; claims are
+    /// collected into a pending list — novelty is decided by the per-round
+    /// LLM annotation pass, not embedding similarity.
+    fn absorb(&mut self, round: &EvidenceRound) -> (usize, Vec<Claim>) {
         let novel_urls = round
             .urls
             .iter()
             .filter(|u| self.urls.insert((*u).clone()))
             .count();
-        let mut novel_unanswered = 0usize;
         for u in &round.unanswered {
             let key = normalize_claim(u);
             if !key.is_empty() && self.unanswered_keys.insert(key) {
                 self.unanswered.push(u.clone());
-                novel_unanswered += 1;
             }
         }
         for r in &round.raw_reports {
@@ -716,7 +714,7 @@ impl AccumulatedEvidence {
                 self.raw_reports.push(r.clone());
             }
         }
-        (novel_urls, novel_unanswered, round.claims.clone())
+        (novel_urls, round.claims.clone())
     }
 
     /// Apply an annotation pass over a round's pending claims (the validator
@@ -926,7 +924,6 @@ async fn run_structured_analyst<T: serde::de::DeserializeOwned>(
     agent_id: &str,
     task: &str,
     extraction_prompt: &str,
-    validate: Option<&crate::ExtractionValidator<T>>,
 ) -> AnalystRun<T> {
     let (agent, response) = run_agent(
         agent_id.to_string(),
@@ -948,7 +945,7 @@ async fn run_structured_analyst<T: serde::de::DeserializeOwned>(
     }
     let (tool_calls, searches, queries) = extract_query_telemetry(&agent);
     match agent
-        .extract_verdict::<T>(extraction_prompt, validate, None)
+        .extract_verdict::<T>(extraction_prompt, None, None)
         .await
     {
         Ok(value) => AnalystRun::Findings(AnalystRunOutcome {
@@ -1113,7 +1110,6 @@ async fn round0_decompose(
                     &agent_id,
                     &task,
                     &extraction_prompt,
-                    None,
                 )
                 .await
             })
@@ -1326,14 +1322,8 @@ async fn round1_research(
             idx += 1;
             let extraction_prompt = extraction_prompt.clone();
             handles.push(tokio::spawn(async move {
-                run_structured_analyst::<AnalystFindings>(
-                    &ws,
-                    &agent_id,
-                    &task,
-                    &extraction_prompt,
-                    None,
-                )
-                .await
+                run_structured_analyst::<AnalystFindings>(&ws, &agent_id, &task, &extraction_prompt)
+                    .await
             }));
         }
     }
@@ -1434,14 +1424,8 @@ async fn run_gap_round(
             let agent_id = crate::session::research_agent_id(&ws.name, &format!("gap_{i}"));
             let extraction_prompt = extraction_prompt.clone();
             tokio::spawn(async move {
-                run_structured_analyst::<AnalystFindings>(
-                    &ws,
-                    &agent_id,
-                    &task,
-                    &extraction_prompt,
-                    None,
-                )
-                .await
+                run_structured_analyst::<AnalystFindings>(&ws, &agent_id, &task, &extraction_prompt)
+                    .await
             })
         })
         .collect();
@@ -1517,7 +1501,7 @@ async fn gap_rounds(
         }
         let runs = run_gap_round(ws, question, &targeted, &state.ledger, deadline).await;
         let round = collect_evidence(&runs, &mut state.ledger, run_stats);
-        let (new_urls, _, pending) = state.acc.absorb(&round);
+        let (new_urls, pending) = state.acc.absorb(&round);
         let novel_claims = annotate_round(ws, &mut state.acc, &pending, &mut state.markers).await;
         outcome.rounds_dispatched += 1;
         // A round whose analysts only re-asked already-asked queries counts
@@ -2333,7 +2317,7 @@ async fn run_deep_research(ws: &Workspace, question: &str, job_id: &str) -> Resu
                 "round 1 skipped — analyst budget exhausted",
             ));
         };
-        let (_, _, pending) = state.acc.absorb(&r1);
+        let (_, pending) = state.acc.absorb(&r1);
         annotate_round(ws, &mut state.acc, &pending, &mut state.markers).await;
         state.budget_spent = budget.spent;
         state.stage = ResearchStage::GapRounds;
@@ -2958,8 +2942,8 @@ mod tests {
             unanswered: vec!["how beta relates to alpha".into()],
             ..Default::default()
         };
-        let (urls, unanswered, pending) = acc.absorb(&round1);
-        assert_eq!((urls, unanswered, pending.len()), (2, 1, 2));
+        let (urls, pending) = acc.absorb(&round1);
+        assert_eq!((urls, pending.len()), (2, 2));
         let round2 = EvidenceRound {
             urls: vec!["u1".into(), "u3".into()],
             claims: vec![
@@ -2979,11 +2963,11 @@ mod tests {
             unanswered: vec!["how beta relates to alpha".into(), "delta timeline".into()],
             ..Default::default()
         };
-        let (urls, unanswered, pending) = acc.absorb(&round2);
+        let (urls, pending) = acc.absorb(&round2);
         assert_eq!(
-            (urls, unanswered, pending.len()),
-            (1, 1, 2),
-            "only new URL (u3) and unanswered aspect count; every claim stays pending for annotation"
+            (urls, pending.len()),
+            (1, 2),
+            "only new URL (u3); every claim stays pending for annotation"
         );
         assert_eq!(
             acc.unanswered,

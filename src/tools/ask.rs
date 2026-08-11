@@ -590,7 +590,6 @@ pub(crate) struct Claim {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AnalystFindings {
     pub claims: Vec<Claim>,
-    pub coverage: Vec<String>,
     pub unanswered: Vec<String>,
 }
 
@@ -1526,7 +1525,6 @@ mod tests {
                     contradictions: Vec::new(),
                 })
                 .collect(),
-            coverage: Vec::new(),
             unanswered: Vec::new(),
         }
     }
