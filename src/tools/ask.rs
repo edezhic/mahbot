@@ -306,13 +306,7 @@ async fn run_ask_with_job(
         let mut slots: Vec<AskSlot> = Vec::with_capacity(PARALLEL_ANALYST_COUNT);
         let mut agents: Vec<crate::jobs::NewAgent> = Vec::with_capacity(PARALLEL_ANALYST_COUNT);
         for i in 0..PARALLEL_ANALYST_COUNT {
-            let agent_id = format!("ask_{}_{}_{}_analyst", ws.name, suffix, i);
-            let angle = angles.get(i).cloned().unwrap_or_default();
-            let task = if angle.is_empty() {
-                ask.to_string()
-            } else {
-                format!("{ask}\n\nResearch angle:\n{angle}")
-            };
+            let (agent_id, task) = analyst_slot(ws, &angles, &suffix, i, ask);
             agents.push(crate::jobs::NewAgent {
                 agent_id: agent_id.clone(),
                 kind: crate::jobs::AgentKind::Analyst,
@@ -834,6 +828,25 @@ pub(crate) fn load_analyst_angles() -> Vec<String> {
     load_prompt_sections("ask/angles.md")
 }
 
+/// Compose an analyst's agent id and task (angle appended to the ask).
+/// KV-cache discipline: vary ONLY the user message (the research
+/// angle) — never per-analyst model/effort/tools.
+fn analyst_slot(
+    ws: &Workspace,
+    angles: &[String],
+    suffix: &str,
+    i: usize,
+    ask: &str,
+) -> (String, String) {
+    let angle = angles.get(i).cloned().unwrap_or_default();
+    let task = if angle.is_empty() {
+        ask.to_string()
+    } else {
+        format!("{ask}\n\nResearch angle:\n{angle}")
+    };
+    (format!("ask_{}_{}_{}_analyst", ws.name, suffix, i), task)
+}
+
 /// Run `count` parallel analyst agents with decorrelated research angles,
 /// returning each member's outcome. The wait shares the round-wide `deadline`
 /// (see [`run_parallel_analysts_and_consolidate`]): a member still running at
@@ -851,15 +864,7 @@ async fn run_parallel_analysts(
         .map(|i| {
             let ws = ws.clone();
             let suffix = suffix.clone();
-            let angle = angles.get(i).cloned().unwrap_or_default();
-            let agent_id = format!("ask_{}_{}_{}_analyst", ws.name, suffix, i);
-            // KV-cache discipline: vary ONLY the user message (the research
-            // angle) — never per-analyst model/effort/tools.
-            let analyst_ask = if angle.is_empty() {
-                ask.to_string()
-            } else {
-                format!("{ask}\n\nResearch angle:\n{angle}")
-            };
+            let (agent_id, analyst_ask) = analyst_slot(&ws, &angles, &suffix, i, ask);
             tokio::spawn(async move {
                 run_agent(
                     agent_id,
