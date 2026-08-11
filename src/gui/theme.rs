@@ -52,6 +52,15 @@ pub const STATUS_SUCCESS: Color = Color::from_rgb(0.0, 0.902, 0.541); // #00e68a
 pub const STATUS_WARNING: Color = Color::from_rgb(1.0, 0.667, 0.0); // #ffaa00
 pub const STATUS_ERROR: Color = Color::from_rgb(1.0, 0.267, 0.4); // #ff4466
 
+// ── Diff widget tints (derived from STATUS_* palette) ─────────────
+
+pub const DIFF_ADDED_TINT: Color =
+    Color::from_rgba(STATUS_SUCCESS.r, STATUS_SUCCESS.g, STATUS_SUCCESS.b, 0.10);
+pub const DIFF_REMOVED_TINT: Color =
+    Color::from_rgba(STATUS_ERROR.r, STATUS_ERROR.g, STATUS_ERROR.b, 0.10);
+pub const DIFF_FILE_HEADER_BG: Color =
+    Color::from_rgba(STATUS_WARNING.r, STATUS_WARNING.g, STATUS_WARNING.b, 0.06);
+
 // ── Log level colors ──────────────────────────────────────────────
 
 #[must_use]

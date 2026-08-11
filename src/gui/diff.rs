@@ -1198,9 +1198,7 @@ impl DiffState {
                 .width(Length::Fill)
                 .padding([6, 12])
                 .style(move |_t: &iced::Theme| iced::widget::container::Style {
-                    background: Some(iced::Background::Color(iced::Color::from_rgba(
-                        1.0, 0.667, 0.0, 0.06,
-                    ))),
+                    background: Some(iced::Background::Color(theme::DIFF_FILE_HEADER_BG)),
                     ..Default::default()
                 })
                 .into(),

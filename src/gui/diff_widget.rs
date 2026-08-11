@@ -361,8 +361,8 @@ where
             }
 
             let bg_color = match self.data.line_kinds[run.line_i] {
-                Some(DiffLineKind::Added) => Some(Color::from_rgba(0.0, 0.902, 0.541, 0.10)),
-                Some(DiffLineKind::Removed) => Some(Color::from_rgba(1.0, 0.267, 0.4, 0.10)),
+                Some(DiffLineKind::Added) => Some(theme::DIFF_ADDED_TINT),
+                Some(DiffLineKind::Removed) => Some(theme::DIFF_REMOVED_TINT),
                 _ => None, // context or hunk header — no tint
             };
 
