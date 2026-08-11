@@ -386,7 +386,7 @@ pub async fn run_git_commit(repo_path: &Path, message: &str) -> anyhow::Result<C
             // HEAD~1 doesn't exist (first commit) — fall back to the empty tree hash.
             parse_numstat(
                 repo_path,
-                &["4b825dc642cb6eb9a060e54bf899dcee6a7b9e2a", "HEAD"],
+                &["4b825dc642cb6eb9a060e54bf8d69288fbee4904", "HEAD"],
             )
             .await
             .unwrap_or((0, 0))
