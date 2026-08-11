@@ -238,8 +238,16 @@ async fn setup_ticket(
 /// Verify the Buffer → Notify + drain sequence across two QaPassed tickets
 /// via `transition_ticket_to_done`: the first one buffers, the last one
 /// notifies and drains the buffer.
+///
+/// Serialized with the reset_inflight_tickets tests (shared global board)
+/// and holds retry_tests_lock: the Notify path routes a Manager notification
+/// whose consumer loop runs a Manager agent that reads the process-global
+/// provider (project convention: retry_tests_lock).
 #[tokio::test]
+#[serial_test::serial(reset_inflight)]
+#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
 async fn transition_ticket_to_done_buffer_and_notify() {
+    let _lock = crate::util::test::retry_tests_lock();
     let ws = setup_db_workspace("drains_buffer").await;
 
     // Two QaPassed tickets in the same workspace
