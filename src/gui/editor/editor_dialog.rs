@@ -10,6 +10,7 @@ use iced::{Alignment, Color, Element, Length, widget::Id};
 use iced_fonts::lucide;
 
 use crate::gui::theme;
+use crate::gui::widget_helpers;
 use crate::gui::widgets;
 
 use super::{
@@ -29,20 +30,6 @@ fn result_entry_style(bg: Color) -> impl Fn(&iced::Theme) -> container::Style {
     }
 }
 
-/// Wrap any dialog element in a centered overlay with a semi-transparent
-/// backdrop that closes the dialog on click.
-///
-/// Delegates to the shared backdrop helper. The caller may specify a custom
-/// backdrop opacity; most dialogs use `0.5`, but lighter overlays (e.g.
-/// quick-open) use `0.4`.
-pub(super) fn overlay_dialog<'a>(
-    dialog: impl Into<Element<'a, EditorMessage>>,
-    on_backdrop: EditorMessage,
-    opacity: f32,
-) -> Element<'a, EditorMessage> {
-    super::super::widget_helpers::modal_backdrop(dialog, on_backdrop, opacity)
-}
-
 /// Wrap dialog content in the shared dialog container and overlay it.
 /// All standard dialogs use this to ensure consistent container dimensions,
 /// padding, style, and backdrop behavior.
@@ -52,7 +39,7 @@ pub(super) fn wrap_dialog<'a>(
     cancel_msg: EditorMessage,
     opacity: f32,
 ) -> Element<'a, EditorMessage> {
-    overlay_dialog(
+    widget_helpers::modal_backdrop(
         container(content)
             .width(width)
             .padding(24)
@@ -152,7 +139,7 @@ pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'static, 
         .padding(12)
         .style(theme::dialog_container_style);
 
-    overlay_dialog(dialog, EditorMessage::Escape, 0.4)
+    widget_helpers::modal_backdrop(dialog, EditorMessage::Escape, 0.4)
 }
 
 // ── Close dialog ──────────────────────────────────────────────────
@@ -538,5 +525,5 @@ pub(super) fn build_global_search_overlay(
         .padding(12)
         .style(theme::dialog_container_style);
 
-    overlay_dialog(dialog, EditorMessage::Escape, 0.4)
+    widget_helpers::modal_backdrop(dialog, EditorMessage::Escape, 0.4)
 }

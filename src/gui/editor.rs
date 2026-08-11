@@ -1248,6 +1248,31 @@ async fn load_git_ignore(
     Ok(ignored)
 }
 
+/// Handle git-status/git-ignore-loaded — updates the corresponding cache.
+/// Discards stale results via the shared `git_status_gen` counter.
+fn finish_git_load<T: Default>(
+    loading: &mut bool,
+    current_gen: u64,
+    r#gen: u64,
+    result: Result<T, String>,
+    cache: &mut T,
+    label: &str,
+) -> Task<EditorMessage> {
+    *loading = false;
+    // Stale result from a previous workspace or refresh? Discard.
+    if r#gen != current_gen {
+        return Task::none();
+    }
+    match result {
+        Ok(value) => *cache = value,
+        Err(e) => {
+            tracing::warn!("Failed to load {label}: {e}");
+            *cache = T::default();
+        }
+    }
+    Task::none()
+}
+
 // ── Global search helpers ──────────────────────────────────────────
 
 /// Run a global (find-in-files) grep search with debounce.
@@ -2223,13 +2248,23 @@ impl EditorState {
 
             EditorMessage::RevealDone | EditorMessage::Toast(_) => Task::none(),
 
-            EditorMessage::GitStatusLoaded { r#gen, result } => {
-                self.git_status_loaded(r#gen, result)
-            }
+            EditorMessage::GitStatusLoaded { r#gen, result } => finish_git_load(
+                &mut self.git_status_loading,
+                self.git_status_gen,
+                r#gen,
+                result,
+                &mut self.git_status_cache,
+                "git status",
+            ),
 
-            EditorMessage::GitIgnoredLoaded { r#gen, result } => {
-                self.git_ignored_loaded(r#gen, result)
-            }
+            EditorMessage::GitIgnoredLoaded { r#gen, result } => finish_git_load(
+                &mut self.git_ignore_loading,
+                self.git_status_gen,
+                r#gen,
+                result,
+                &mut self.git_ignore_cache,
+                "git ignore status",
+            ),
 
             EditorMessage::CheckFileChanges => self.check_file_changes(),
 
@@ -4028,48 +4063,6 @@ impl EditorState {
         } else {
             Task::none()
         }
-    }
-
-    /// Handle git-status-loaded — updates the git status cache.
-    fn git_status_loaded(
-        &mut self,
-        r#gen: u64,
-        result: Result<HashMap<String, GitFileStatus>, String>,
-    ) -> Task<EditorMessage> {
-        self.git_status_loading = false;
-        // Stale result from a previous workspace or refresh? Discard.
-        if r#gen != self.git_status_gen {
-            return Task::none();
-        }
-        match result {
-            Ok(cache) => self.git_status_cache = cache,
-            Err(e) => {
-                tracing::warn!("Failed to load git status: {e}");
-                self.git_status_cache.clear();
-            }
-        }
-        Task::none()
-    }
-
-    /// Handle git-ignored-loaded — updates the git ignore cache.
-    fn git_ignored_loaded(
-        &mut self,
-        r#gen: u64,
-        result: Result<HashSet<String>, String>,
-    ) -> Task<EditorMessage> {
-        self.git_ignore_loading = false;
-        // Stale result from a previous workspace or refresh? Discard.
-        if r#gen != self.git_status_gen {
-            return Task::none();
-        }
-        match result {
-            Ok(cache) => self.git_ignore_cache = cache,
-            Err(e) => {
-                tracing::warn!("Failed to load git ignore status: {e}");
-                self.git_ignore_cache.clear();
-            }
-        }
-        Task::none()
     }
 
     /// Handle check-file-changes — detects external file modifications and reloads.
