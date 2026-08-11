@@ -339,7 +339,7 @@ impl NativeMessage {
 /// Non‑IMAGE markers (e.g. `[AUDIO:…]`) are left untouched in the cleaned text.
 /// Empty `[IMAGE:]` markers are preserved verbatim.
 #[must_use]
-fn parse_image_markers(content: &str) -> (String, Vec<String>) {
+pub(crate) fn parse_image_markers(content: &str) -> (String, Vec<String>) {
     let mut refs: Vec<String> = Vec::new();
 
     let cleaned = crate::util::MEDIA_MARKER_RE
@@ -387,6 +387,8 @@ pub(crate) struct ImageUrlPart {
 /// (e.g. `[IMAGE:data:image/png;base64,...]`) are parsed into [`MessagePart::ImageUrl`]
 /// entries alongside the cleaned text. Otherwise the raw content is returned as
 /// [`MessageContent::Text`].
+///
+/// Mirrored by [`crate::session::estimate_tokens`] — keep marker handling in sync.
 pub(crate) fn to_message_content(
     role: ChatRole,
     content: &str,

@@ -262,14 +262,14 @@ impl Agent {
 
         // Pre-maybe_summarize drain check: a fresh dispatch that starts during
         // the graceful drain (or a fired shutdown token) must not destructively
-        // compact a >200k-token accumulated session before the llm_loop drain
+        // compact an over-threshold session before the llm_loop drain
         // check fires. The round is cut before any LLM work; boot resume
         // continues the session.
         if crate::shutdown::aborting() {
             anyhow::bail!("Agent round cut short by shutdown/drain — resumes at boot");
         }
 
-        // Mandatory: destructive >200k-token compaction is SKIPPED on resumed
+        // Mandatory: destructive over-threshold compaction is SKIPPED on resumed
         // turns — the pre-crash trail the resume was meant to preserve must
         // survive (the design's resume-flag rule; do NOT infer resume from an
         // empty message — RecoveryRetry semantics are unchanged).
@@ -778,7 +778,7 @@ impl Agent {
 
         let policy = crate::retry::RetryPolicy::current();
         let chat_resp = crate::retry::agent_chat(
-            self.build_chat_request(history, false, "summarize"),
+            self.build_chat_request(history, self.role.requires_multimodal(), "summarize"),
             &policy,
         )
         .await
@@ -807,8 +807,24 @@ impl Agent {
     /// KV-cache preservation: [`Agent::summarize`] keeps all parameters identical
     /// (see [`Agent::build_chat_request`]) so the cached prefix is reusable.
     async fn maybe_summarize(&mut self) {
-        let history_tokens = crate::session::estimate_tokens(self.session.history());
+        let history_tokens = crate::session::estimate_tokens(
+            self.session.history(),
+            &self.tool_specs,
+            self.role.requires_multimodal(),
+        );
+        tracing::debug!(
+            agent_id = %self.agent_id,
+            role = %self.role,
+            estimate_tokens = history_tokens,
+            "Session token estimate",
+        );
         if history_tokens > crate::session::SUMMARIZATION_THRESHOLD {
+            tracing::info!(
+                agent_id = %self.agent_id,
+                role = %self.role,
+                estimate_tokens = history_tokens,
+                "Session exceeded summarization threshold",
+            );
             match self.summarize().await {
                 Ok(summary) => {
                     self.session

@@ -5,9 +5,11 @@ pub mod manager;
 pub use manager::Session;
 
 use crate::turso::{self, IntoParams, Row, TxGuard, Value, params};
-use crate::{ChatMessage, ChatRole, Reasoning, ToolCall, ToolResultPayload};
+use crate::{ChatMessage, ChatRole, Reasoning, ToolCall, ToolResultPayload, ToolSpec};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
+use regex::Regex;
+use std::sync::LazyLock;
 
 // The summarization LLM call lives in `crate::Agent::summarize` so that all
 // parameters (model, reasoning_effort, tools, provider routing)
@@ -15,33 +17,192 @@ use chrono::{DateTime, Utc};
 
 /// History-length threshold (in estimated tokens) that triggers summarization.
 ///
-/// This is a conservative default chosen to work across models with varying
-/// context window sizes (250K–1M). The value of **200,000** estimated tokens
-/// translates to roughly 800K characters of message content under the rough
-/// `estimate_tokens` formula (~4 chars/token + 4 tokens per-message overhead).
+/// Estimated via [`estimate_tokens`], a weighted, content-aware estimate:
+/// image parts at a fixed per-image cost, base64 data-URI payloads at base64
+/// density, code/JSON at code density, prose at prose density, plus the tool
+/// schemas injected into every chat request (previously uncounted).
 ///
-/// ## Why 200K?
-///
-/// The actual token consumption at request time can be higher than `estimate_tokens`
-/// suggests for several reasons:
-///
-/// * **Tokenization ratio** — Code- and JSON-heavy agent conversations (tool
-///   calls, structured outputs) can tokenize at ~2.5 chars/token rather than
-///   the estimate's 4 chars/token.
-/// * **Tool schemas** — The tool definitions injected by `build_chat_request`
-///   consume ~10–20K actual tokens that are **not** counted by `estimate_tokens`
-///   (they live in the `tools` field of the request, not in `messages`).
-///
-/// Every modern model (as of 2026) supports 250K+ context windows making 200K safe.
+/// **200,000** is a conservative default chosen to work across models with
+/// varying context window sizes (250K–1M). The estimator carries a slight
+/// underestimate bias on prose so the first compaction of an average session
+/// lands at ~200–220K real tokens rather than before the threshold.
 pub(crate) const SUMMARIZATION_THRESHOLD: usize = 200_000;
 
-/// Rough token count for history (~4 chars/token + 4 tokens per-message overhead)
+/// Estimated tokens consumed by one image part (vision input cost). A single
+/// constant across models — model-specific per-image pricing is out of scope.
+const IMAGE_TOKENS: usize = 4_000;
+
+/// Prose density — characters per token. The Manager's Cyrillic-prose mix
+/// measured ~4.38; rounding up keeps the slight-underestimate bias.
+const PROSE_CHARS_PER_TOKEN: f64 = 4.4;
+
+/// Code/JSON density — characters per token.
+const CODE_CHARS_PER_TOKEN: f64 = 2.5;
+
+/// Base64 text density — characters per token (measured 1.3–1.5).
+const BASE64_CHARS_PER_TOKEN: f64 = 1.4;
+
+/// Per-message overhead tokens (role line, framing, separators).
+const PER_MESSAGE_TOKENS: usize = 4;
+
+/// Per-tool overhead tokens — JSON wrapper `{"type":"function","function":{...}}`
+/// (≈33 chars at code density; name/description/parameters counted separately).
+const PER_TOOL_SCHEMA_TOKENS: usize = 12;
+
+/// Data-URI base64 payload: `data:<mime>;base64,<payload>`.
+static DATA_URI_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"data:[a-zA-Z0-9./+-]+;base64,[A-Za-z0-9+/]+={0,2}")
+        .expect("DATA_URI_RE must compile")
+});
+
+/// Weighted token estimate for a session's messages plus the tool schemas the
+/// provider injects into every request. Mirrors what the provider actually
+/// sends ([`crate::providers::compatible::to_message_content`]): with
+/// `allow_image_parts` user `[IMAGE:...]` markers become fixed-cost image
+/// parts, otherwise the raw marker stays text and its data-URI payload is
+/// charged at base64 density; native assistant frames contribute content +
+/// tool-call arguments + reasoning, tool results their decoded content.
 #[must_use]
-pub(crate) fn estimate_tokens(messages: &[ChatMessage]) -> usize {
-    messages
+pub(crate) fn estimate_tokens(
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+    allow_image_parts: bool,
+) -> usize {
+    let history: usize = messages
         .iter()
-        .map(|m| m.content.len().div_ceil(4) + 4)
+        .map(|msg| estimate_message_tokens(msg, allow_image_parts))
+        .sum();
+    history + estimate_tool_schema_tokens(tools)
+}
+
+fn estimate_message_tokens(msg: &ChatMessage, allow_image_parts: bool) -> usize {
+    let content_tokens = match decode_native_history_message(msg) {
+        Some(DecodedNativeHistoryMessage::Assistant {
+            content,
+            tool_calls,
+            reasoning,
+        }) => {
+            let text = content.as_deref().map_or(0, estimate_text_tokens);
+            let calls =
+                tool_calls.map_or(0, |calls| calls.iter().map(estimate_tool_call_tokens).sum());
+            // The provider may synthesize a reasoning_content copy from
+            // reasoning/details (native_reasoning_triple_for_replay) — counted
+            // once here, a slight undercount within the best-effort envelope.
+            let reasoning_tokens = reasoning.map_or(0, |r| {
+                r.reasoning.as_deref().map_or(0, estimate_text_tokens)
+                    + r.reasoning_content
+                        .as_deref()
+                        .map_or(0, estimate_text_tokens)
+                    + r.reasoning_details.as_ref().map_or(0, |d| {
+                        estimate_text_tokens(&serde_json::to_string(d).unwrap_or_default())
+                    })
+            });
+            text + calls + reasoning_tokens
+        }
+        Some(DecodedNativeHistoryMessage::ToolResult { content, .. }) => {
+            estimate_text_tokens(&content)
+        }
+        None if msg.role == ChatRole::User => {
+            if allow_image_parts && msg.content.contains("[IMAGE:") {
+                // Image markers become image parts at request time — charge the
+                // fixed per-image cost and drop the (possibly base64) marker text.
+                // Fast path mirrors to_message_content: skip the marker regex
+                // scan when the message carries no image markers.
+                let (cleaned, refs) =
+                    crate::providers::compatible::parse_image_markers(&msg.content);
+                refs.len() * IMAGE_TOKENS + estimate_text_tokens(&cleaned)
+            } else {
+                // Without image parts the raw marker stays text (e.g. ticket
+                // comments bypassing enrichment) — count it like any other text.
+                estimate_text_tokens(&msg.content)
+            }
+        }
+        None => estimate_text_tokens(&msg.content),
+    };
+    content_tokens + PER_MESSAGE_TOKENS
+}
+
+/// Tool-call arguments are JSON text in the request — the provider never
+/// converts tool-call fields into image parts, so data-URI references in them
+/// stay text and are charged at base64 density.
+fn estimate_tool_call_tokens(call: &ToolCall) -> usize {
+    let args = serde_json::to_string(&call.arguments).unwrap_or_default();
+    estimate_text_tokens(&call.name) + estimate_text_tokens(&args)
+}
+
+/// Tool schemas are real request tokens (`tools` field) that the old estimator
+/// ignored (~5–7K for the Manager's 8-tool set).
+fn estimate_tool_schema_tokens(tools: &[ToolSpec]) -> usize {
+    tools
+        .iter()
+        .map(|t| {
+            estimate_text_tokens(&t.name)
+                + estimate_text_tokens(&t.description)
+                + estimate_text_tokens(&serde_json::to_string(&t.parameters).unwrap_or_default())
+                + PER_TOOL_SCHEMA_TOKENS
+        })
         .sum()
+}
+
+/// Estimate a raw text blob: data-URI base64 payloads are charged at base64
+/// density, everything else at code or prose density by structural content.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn estimate_text_tokens(text: &str) -> usize {
+    let mut total = 0usize;
+    let mut last = 0usize;
+    for caps in DATA_URI_RE.captures_iter(text) {
+        let m = caps.get(0).expect("DATA_URI_RE match carries group 0");
+        total += plain_text_token_count(&text[last..m.start()]);
+        let uri = m.as_str();
+        let (prefix, payload) = uri
+            .split_once(";base64,")
+            .expect("DATA_URI_RE match always contains ;base64,");
+        total += (payload.chars().count() as f64 / BASE64_CHARS_PER_TOKEN) as usize;
+        total += plain_text_token_count(prefix);
+        last = m.end();
+    }
+    total + plain_text_token_count(&text[last..])
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn plain_text_token_count(text: &str) -> usize {
+    let chars = text.chars().count();
+    if chars == 0 {
+        return 0;
+    }
+    (chars as f64 / classify_density(text)) as usize
+}
+
+/// Choose a density from the punctuation share: code/JSON is punctuation-dense,
+/// prose is letter-dense (digits are neutral — dates and numbers appear in
+/// prose too). Best-effort: bare base64 without a `data:` prefix is ~3%
+/// punctuation and lands in prose (~3× undercount) — real base64 arrives as
+/// data URIs, which [`estimate_text_tokens`] charges at base64 density.
+#[allow(clippy::cast_precision_loss)]
+fn classify_density(text: &str) -> f64 {
+    let mut punctuation = 0u64;
+    let mut alphabetic = 0u64;
+    for ch in text.chars() {
+        if ch.is_ascii_punctuation() {
+            punctuation += 1;
+        } else if ch.is_alphabetic() {
+            alphabetic += 1;
+        }
+    }
+    let total = punctuation + alphabetic;
+    if total > 0 && punctuation as f64 / total as f64 > 0.3 {
+        CODE_CHARS_PER_TOKEN
+    } else {
+        PROSE_CHARS_PER_TOKEN
+    }
 }
 
 /// Number of latest user messages / assistant answers retained per side
@@ -1357,6 +1518,158 @@ mod tests {
         let msgs = store().load(&k).await;
         let contents: Vec<&str> = msgs.iter().map(|m| m.content.as_str()).collect();
         assert_eq!(contents, ["prompt", "u1", "C1"]);
+    }
+}
+
+#[cfg(test)]
+mod estimate_tests {
+    use super::*;
+
+    /// Realistic base64 payload for a 1×1 PNG (valid charset, `==` padding).
+    const PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn image_markers_charge_fixed_cost_regardless_of_payload_size() {
+        let small = format!("[IMAGE:data:image/png;base64,{PNG_BASE64}]");
+        let huge = format!("[IMAGE:data:image/png;base64,{}]", "A".repeat(200_000));
+        let est_small = estimate_tokens(&[ChatMessage::user(&small)], &[], true);
+        let est_huge = estimate_tokens(&[ChatMessage::user(&huge)], &[], true);
+        assert_eq!(
+            est_small, est_huge,
+            "image cost must not scale with base64 payload size"
+        );
+        assert_eq!(est_small, IMAGE_TOKENS + PER_MESSAGE_TOKENS);
+    }
+
+    #[test]
+    fn cyrillic_prose_charged_by_chars_not_bytes() {
+        let prose = "Проверь статус задачи и обнови описание по результатам обсуждения";
+        let est = estimate_tokens(&[ChatMessage::user(prose)], &[], false);
+        // UTF-8 Cyrillic is 2 bytes/char — the old bytes/4 formula estimated
+        // ~1.5× higher for the Manager's mix, compacting prematurely.
+        assert!(
+            est < prose.len() / 4,
+            "estimate {est} must stay below the byte-based formula {}",
+            prose.len() / 4
+        );
+    }
+
+    #[test]
+    fn code_and_json_estimate_denser_than_prose() {
+        let json = ChatMessage::user(r#"{"ticket_id":"t-1045","phase":"InReview","lines":42}"#);
+        let prose = ChatMessage::user("Проверь статус задачи и обнови описание по результатам");
+        let json_est = estimate_tokens(&[json], &[], false);
+        let prose_est = estimate_tokens(&[prose], &[], false);
+        assert!(
+            json_est > prose_est,
+            "JSON ({json_est}) must beat prose ({prose_est})"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    fn bare_data_uri_in_text_charges_base64_density() {
+        // A data URI outside an image marker stays text (e.g. inside tool-call
+        // JSON) — the payload is charged at base64 density, not prose density.
+        let text = format!("image ref: data:image/png;base64,{PNG_BASE64}");
+        let est = estimate_tokens(&[ChatMessage::assistant(&text)], &[], false);
+        let payload_tokens = (PNG_BASE64.chars().count() as f64 / BASE64_CHARS_PER_TOKEN) as usize;
+        assert!(
+            est > payload_tokens && est < payload_tokens + 20,
+            "base64 payload should dominate the estimate (est {est}, payload {payload_tokens})"
+        );
+    }
+
+    #[test]
+    fn tool_schemas_add_to_estimate() {
+        let spec = ToolSpec {
+            name: "search_files".into(),
+            description: "Search workspace files by pattern and return matches".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        };
+        let msg = ChatMessage::user("x");
+        let with_tools = estimate_tokens(std::slice::from_ref(&msg), &[spec], false);
+        let without = estimate_tokens(std::slice::from_ref(&msg), &[], false);
+        assert!(with_tools > without, "tool schemas must be counted");
+    }
+
+    #[test]
+    fn assistant_tool_call_frame_counts_content_and_arguments() {
+        let replay = crate::providers::reasoning_roundtrip::assistant_replay_payload;
+        let empty = replay(None, &[], None).to_string();
+        let content = replay(
+            Some("Проверю статус тикета и вернусь с результатом"),
+            &[],
+            None,
+        )
+        .to_string();
+        let with_call = replay(
+            Some("Проверю статус тикета и вернусь с результатом"),
+            &[ToolCall {
+                id: "call_1".into(),
+                name: "get_ticket".into(),
+                arguments: serde_json::json!({"ticket_id": "t-1045", "phase": "InReview"}),
+            }],
+            None,
+        )
+        .to_string();
+        let est = |s: &str| estimate_tokens(&[ChatMessage::assistant(s)], &[], false);
+        assert!(
+            est(&content) > est(&empty),
+            "assistant content must be counted"
+        );
+        assert!(
+            est(&with_call) > est(&content),
+            "tool-call arguments must be counted"
+        );
+    }
+
+    #[test]
+    fn retained_image_messages_do_not_re_trigger_summarization() {
+        // Post-compaction retention keeps the 3 newest Artist user messages —
+        // full base64 data URIs must stay far below the compaction threshold.
+        let history: Vec<ChatMessage> = (0..3)
+            .map(|_| {
+                ChatMessage::user(format!(
+                    "[IMAGE:data:image/png;base64,{}] keep this style",
+                    "A".repeat(140_000)
+                ))
+            })
+            .collect();
+        let est = estimate_tokens(&history, &[], true);
+        assert!(
+            est < SUMMARIZATION_THRESHOLD / 10,
+            "retained image messages must not re-trigger compaction (est {est})"
+        );
+    }
+
+    #[test]
+    fn artist_session_estimates_near_target_band() {
+        // ~50 images at the fixed per-image cost plus prose turns must land just
+        // above the threshold — the old formula estimated ~1.5M for the same
+        // history, compacting at real 578–598K tokens.
+        let mut history: Vec<ChatMessage> = (0..50)
+            .map(|_| {
+                ChatMessage::user(format!(
+                    "[IMAGE:data:image/png;base64,{}]",
+                    "A".repeat(120_000)
+                ))
+            })
+            .collect();
+        for i in 0..10 {
+            history.push(ChatMessage::assistant(format!(
+                "Изображение {i} готово, путь сохранён в workspace"
+            )));
+        }
+        let est = estimate_tokens(&history, &[], true);
+        assert!(
+            (SUMMARIZATION_THRESHOLD..=SUMMARIZATION_THRESHOLD + 20_000).contains(&est),
+            "Artist estimate {est} must trigger in the 200–220K band"
+        );
     }
 }
 
