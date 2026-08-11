@@ -398,12 +398,10 @@ pub(crate) async fn write_agent_outcome(
 /// path (bounded: one extra envelope, deduped by the consumer only in the
 /// common at-most-once sense; the design's insert-failure policy trades the
 /// rare duplicate for the never-silent-drop guarantee).
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn complete_job_with_envelope(
     conn: &Connection,
     job_id: &str,
     envelope: &AgentJob,
-    kind: JobKind,
 ) -> Result<()> {
     let now = turso::now();
     let tx = conn.begin_tx().await?;
@@ -417,7 +415,7 @@ pub(crate) async fn complete_job_with_envelope(
         params![
             job_id,
             envelope_target(envelope),
-            kind.as_str(),
+            envelope.kind.as_str(),
             serde_json::to_string(envelope).context("serialize envelope")?,
             envelope.workspace_name.clone(),
             envelope.user_name.clone(),
@@ -432,6 +430,42 @@ pub(crate) async fn complete_job_with_envelope(
     delete_job_tx(&tx, job_id).await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// COMPLETE a durable ask/research job: one tx — INSERT pending_jobs
+/// (envelope, id = job id) + DELETE jobs row (exactly-once boundary; the tx
+/// detail lives on [`complete_job_with_envelope`]). Returns the envelope with
+/// `pending_job_id` set when the row persisted, cleared on INSERT failure so
+/// the caller falls back to a best-effort route: the result still reaches the
+/// caller (never a silent drop — the envelope is the caller's only result
+/// path), the pending row is simply absent.
+pub(crate) async fn complete_durable_job(
+    job_id: &str,
+    content: String,
+    kind: JobKind,
+    caller_role: Role,
+    user_name: &str,
+    channel: &str,
+    workspace_name: &str,
+) -> AgentJob {
+    let mut envelope = AgentJob {
+        content,
+        workspace_name: workspace_name.to_string(),
+        user_name: user_name.to_string(),
+        channel: channel.to_string(),
+        kind,
+        role: caller_role,
+        reply_target: None,
+        pending_job_id: Some(job_id.to_string()),
+    };
+    // INSERT-failure policy: fall back to a non-durable best-effort route.
+    if complete_job_with_envelope(&crate::session::store().conn, job_id, &envelope)
+        .await
+        .is_err()
+    {
+        envelope.pending_job_id = None;
+    }
+    envelope
 }
 
 /// Terminalize a ticket_stage job (no pending row — TicketNotify flows via
@@ -1466,7 +1500,7 @@ mod tests {
             reply_target: None,
             pending_job_id: Some("j1".to_string()),
         };
-        complete_job_with_envelope(conn, "j1", &envelope, JobKind::AskToolResult)
+        complete_job_with_envelope(conn, "j1", &envelope)
             .await
             .unwrap();
         // Pending row exists with the envelope; jobs row gone; roster cascaded.

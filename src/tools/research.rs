@@ -447,51 +447,22 @@ async fn dispatch_durable_research(
         Ok(()) => run_deep_research(ws, question, &job_id).await,
         Err(e) => Err(e),
     };
-    let (_env_ok, envelope) =
-        complete_research_job(&job_id, &result, caller_role, &user_name, &channel, ws).await;
+    let envelope = crate::jobs::complete_durable_job(
+        &job_id,
+        build_async_research_message(&result),
+        JobKind::ResearchResult,
+        caller_role,
+        &user_name,
+        &channel,
+        &ws.name,
+    )
+    .await;
     (result, envelope)
 }
 
-/// COMPLETE a research job: one tx — INSERT pending_jobs (envelope, id =
-/// job id) + DELETE jobs row (exactly-once boundary). Returns (persisted?,
-/// the envelope) — the envelope carries `pending_job_id` set when the row
-/// persisted, cleared on INSERT failure so the caller routes best-effort.
-async fn complete_research_job(
-    job_id: &str,
-    result: &anyhow::Result<String>,
-    caller_role: Role,
-    user_name: &str,
-    channel: &str,
-    ws: &Workspace,
-) -> (bool, AgentJob) {
-    let mut envelope = AgentJob {
-        content: build_async_research_message(result),
-        workspace_name: ws.name.clone(),
-        user_name: user_name.to_string(),
-        channel: channel.to_string(),
-        kind: JobKind::ResearchResult,
-        role: caller_role,
-        reply_target: None,
-        pending_job_id: Some(job_id.to_string()),
-    };
-    let ok = crate::jobs::complete_job_with_envelope(
-        &crate::session::store().conn,
-        job_id,
-        &envelope,
-        JobKind::ResearchResult,
-    )
-    .await
-    .is_ok();
-    if !ok {
-        // INSERT-failure policy: fall back to a non-durable route — never
-        // drop the result silently (the Manager's only result path).
-        envelope.pending_job_id = None;
-    }
-    (ok, envelope)
-}
-
 /// Deliver a research result envelope to the job's stored caller (the
-/// consumer-confirmed pending row was created by [`complete_research_job`]).
+/// consumer-confirmed pending row was created by
+/// [`crate::jobs::complete_durable_job`]).
 /// Routes UNCONDITIONALLY — on pending INSERT failure the envelope carries
 /// `pending_job_id: None` and still reaches the caller (never a silent drop).
 fn deliver_research_envelope(envelope: AgentJob) {
@@ -524,13 +495,14 @@ pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
         );
         return;
     }
-    let (_env_ok, envelope) = complete_research_job(
+    let envelope = crate::jobs::complete_durable_job(
         job_id,
-        &result,
+        build_async_research_message(&result),
+        JobKind::ResearchResult,
         caller_role,
         &caller.user_name,
         &caller.channel,
-        ws,
+        &ws.name,
     )
     .await;
     deliver_research_envelope(envelope);
@@ -558,13 +530,14 @@ pub(crate) async fn research_capped_partial_report(job_id: &str, ws: &Workspace)
         &state.acc,
         "boot re-dispatch cap exceeded — partial report from last checkpoint",
     ));
-    let (_env_ok, envelope) = complete_research_job(
+    let envelope = crate::jobs::complete_durable_job(
         job_id,
-        &result,
+        build_async_research_message(&result),
+        JobKind::ResearchResult,
         caller_role,
         &caller.user_name,
         &caller.channel,
-        ws,
+        &ws.name,
     )
     .await;
     deliver_research_envelope(envelope);

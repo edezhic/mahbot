@@ -228,16 +228,32 @@ async fn dispatch_durable_ask(
             None
         }
         Ok(AskRunOutcome::Result(result)) => {
-            let (_env_ok, envelope) =
-                complete_ask_job(&job_id, &result, caller_role, &user_name, &channel, ws).await;
+            let envelope = crate::jobs::complete_durable_job(
+                &job_id,
+                build_async_ask_message(&result),
+                JobKind::AskToolResult,
+                caller_role,
+                &user_name,
+                &channel,
+                &ws.name,
+            )
+            .await;
             Some(envelope)
         }
         Err(e) => {
             // Envelope always routes (errors wrapped); terminalize the job so
             // a failed ask never blocks boot recovery.
             let outcome = Err(e);
-            let (_env_ok, envelope) =
-                complete_ask_job(&job_id, &outcome, caller_role, &user_name, &channel, ws).await;
+            let envelope = crate::jobs::complete_durable_job(
+                &job_id,
+                build_async_ask_message(&outcome),
+                JobKind::AskToolResult,
+                caller_role,
+                &user_name,
+                &channel,
+                &ws.name,
+            )
+            .await;
             Some(envelope)
         }
     }
@@ -446,44 +462,6 @@ async fn run_ask_slots(
         .collect()
 }
 
-/// COMPLETE: one tx — INSERT pending_jobs (envelope, id = job id) + DELETE
-/// jobs row. Returns (persisted?, the envelope) — the envelope carries
-/// `pending_job_id` set when the row persisted, cleared on INSERT failure so
-/// the caller can fall back to a best-effort route (never drop silently).
-async fn complete_ask_job(
-    job_id: &str,
-    result: &anyhow::Result<String>,
-    caller_role: Role,
-    user_name: &str,
-    channel: &str,
-    ws: &Workspace,
-) -> (bool, AgentJob) {
-    let mut envelope = AgentJob {
-        content: build_async_ask_message(result),
-        workspace_name: ws.name.clone(),
-        user_name: user_name.to_string(),
-        channel: channel.to_string(),
-        kind: JobKind::AskToolResult,
-        role: caller_role,
-        reply_target: None,
-        pending_job_id: Some(job_id.to_string()),
-    };
-    let ok = crate::jobs::complete_job_with_envelope(
-        &crate::session::store().conn,
-        job_id,
-        &envelope,
-        JobKind::AskToolResult,
-    )
-    .await
-    .is_ok();
-    if !ok {
-        // INSERT-failure policy: fall back to a non-durable route (the caller
-        // still gets the result; the pending row is simply absent).
-        envelope.pending_job_id = None;
-    }
-    (ok, envelope)
-}
-
 /// Boot resume of an ask round (decision 8): re-run not-done roster slots with
 /// their stored tasks, reconstruct done slots from stored outcomes, then
 /// re-consolidate. The consolidated result is terminalized into a pending
@@ -543,13 +521,14 @@ pub(crate) async fn resume_ask_round(job_id: &str, ws: &Workspace) {
     // the same way a fresh dispatch would — to the stored caller). On pending
     // INSERT failure the envelope still routes best-effort (never a silent
     // drop — the INSERT-failure policy).
-    let (_env_ok, envelope) = complete_ask_job(
+    let envelope = crate::jobs::complete_durable_job(
         job_id,
-        &result,
+        build_async_ask_message(&result),
+        JobKind::AskToolResult,
         caller_role,
         &caller.user_name,
         &caller.channel,
-        ws,
+        &ws.name,
     )
     .await;
     crate::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
@@ -577,13 +556,14 @@ pub(crate) async fn ask_capped_envelope(job_id: &str, ws: &Workspace) {
          please re-issue the ask",
         crate::jobs::MAX_BOOT_REDISPATCH,
     )));
-    let (_env_ok, envelope) = complete_ask_job(
+    let envelope = crate::jobs::complete_durable_job(
         job_id,
-        &result,
+        build_async_ask_message(&result),
+        JobKind::AskToolResult,
         caller_role,
         &caller.user_name,
         &caller.channel,
-        ws,
+        &ws.name,
     )
     .await;
     crate::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
