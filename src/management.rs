@@ -1411,6 +1411,79 @@ async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
     )
 }
 
+/// Shared engineer post-run tail: failure comment, pause, transition, and job
+/// terminalization. Diagnostics are dispatched by the poll loop as a separate
+/// `PollPhase::DiagnosticsCheck` (see `poll_round`) — the success path only
+/// transitions to InDiagnostics. The drain-cut guard and the outcome
+/// checkpoint stay at the call sites (dispatch's drain-before-checkpoint
+/// ordering and resume's no-checkpoint semantics are enforced there, not
+/// here). `resumed` selects the observability log strings.
+async fn finalize_engineer_round(
+    ticket: &Ticket,
+    agent: &Agent,
+    response: Option<&str>,
+    job_id: &str,
+    resumed: bool,
+) {
+    let failure_comment = engineer_failure_comment(
+        crate::shutdown::shutdown_token().is_cancelled(),
+        agent.is_cancelled(),
+        agent.failure.as_deref(),
+    );
+
+    // The drain-cut case is handled at the call sites — response None here is
+    // a real failure.
+    let (comment_text, target_phase, notify, log_message) = if let Some(text) = response {
+        (
+            engineer_comment_text(agent, text).await,
+            TicketPhase::InDiagnostics,
+            NotifyPolicy::Buffer,
+            if resumed {
+                "Resumed engineer finished — transitioned ticket"
+            } else {
+                "Engineer finished — transitioned ticket"
+            },
+        )
+    } else {
+        // Pause before the Failed transition so the failure notification
+        // reflects the paused workspace. Shutdown is excluded inside the helper.
+        let pause_reason = if agent.is_cancelled() {
+            "user cancelled the agent run"
+        } else {
+            "engineer agent failure"
+        };
+        let pause_note = pause_workspace_on_failure(ticket, pause_reason).await;
+        (
+            format!("{failure_comment}{pause_note}"),
+            TicketPhase::Failed,
+            NotifyPolicy::Notify,
+            if resumed {
+                "Resumed engineer failed — transitioned ticket"
+            } else {
+                "Engineer finished — transitioned ticket"
+            },
+        )
+    };
+
+    comment_and_transition_or_bail(
+        TransitionCtx {
+            ticket,
+            source: TicketPhase::InDevelopment,
+            target: target_phase,
+            notify,
+            log_label: "Engineer",
+            breaker_trip: false,
+        },
+        Role::Engineer.as_str(),
+        &comment_text,
+        log_message,
+    )
+    .await;
+
+    // Completion tx AFTER the board transition+comment (ordering contract).
+    complete_ticket_stage_job(job_id).await;
+}
+
 /// Run an Engineer agent to implement the ticket.
 ///
 /// Gathers feedback comments from all roles since the last engineer run and
@@ -1544,56 +1617,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         warn!(job = %job_id, error = %e, "Failed to checkpoint engineer outcome");
     }
 
-    // Diagnostics are dispatched by the poll loop as a separate
-    // PollPhase::DiagnosticsCheck — see poll_round().
-    // Owned at function scope so its borrow outlives the if/else below;
-    // only read on the failure path.
-    let failure_comment = engineer_failure_comment(
-        crate::shutdown::shutdown_token().is_cancelled(),
-        agent.is_cancelled(),
-        agent.failure.as_deref(),
-    );
-
-    // The drain-cut case returned above — response None here is a real failure.
-    let (comment_text, target_phase, notify) = if let Some(ref text) = response {
-        (
-            engineer_comment_text(&agent, text).await,
-            TicketPhase::InDiagnostics,
-            NotifyPolicy::Buffer,
-        )
-    } else {
-        // Pause before the Failed transition so the failure notification
-        // reflects the paused workspace. Shutdown is excluded inside the helper.
-        let pause_reason = if agent.is_cancelled() {
-            "user cancelled the agent run"
-        } else {
-            "engineer agent failure"
-        };
-        let pause_note = pause_workspace_on_failure(&ticket, pause_reason).await;
-        (
-            format!("{failure_comment}{pause_note}"),
-            TicketPhase::Failed,
-            NotifyPolicy::Notify,
-        )
-    };
-
-    comment_and_transition_or_bail(
-        TransitionCtx {
-            ticket: &ticket,
-            source: TicketPhase::InDevelopment,
-            target: target_phase,
-            notify,
-            log_label: "Engineer",
-            breaker_trip: false,
-        },
-        Role::Engineer.as_str(),
-        &comment_text,
-        "Engineer finished — transitioned ticket",
-    )
-    .await;
-
-    // Completion tx AFTER the board transition+comment (ordering contract).
-    complete_ticket_stage_job(&job_id).await;
+    finalize_engineer_round(&ticket, &agent, response.as_deref(), &job_id, false).await;
 }
 
 /// Determine whether to notify immediately or buffer the Done transition.
@@ -4357,55 +4381,11 @@ async fn resume_engineer_round(job_id: &str, ticket: Ticket, ws: Workspace) {
         complete_ticket_stage_job(job_id).await;
         return;
     }
-    let Some(text) = response else {
-        if crate::shutdown::aborting() {
-            // Drain-cut: job stays status='launched' for boot resume.
-            return;
-        }
-        let failure_comment = engineer_failure_comment(
-            crate::shutdown::shutdown_token().is_cancelled(),
-            agent.is_cancelled(),
-            agent.failure.as_deref(),
-        );
-        let pause_reason = if agent.is_cancelled() {
-            "user cancelled the agent run"
-        } else {
-            "engineer agent failure"
-        };
-        let pause_note = pause_workspace_on_failure(&ticket, pause_reason).await;
-        comment_and_transition_or_bail(
-            TransitionCtx {
-                ticket: &ticket,
-                source: TicketPhase::InDevelopment,
-                target: TicketPhase::Failed,
-                notify: NotifyPolicy::Notify,
-                log_label: "Engineer",
-                breaker_trip: false,
-            },
-            Role::Engineer.as_str(),
-            &format!("{failure_comment}{pause_note}"),
-            "Resumed engineer failed — transitioned ticket",
-        )
-        .await;
-        complete_ticket_stage_job(job_id).await;
+    if response.is_none() && crate::shutdown::aborting() {
+        // Drain-cut: job stays status='launched' for boot resume.
         return;
-    };
-    let comment_text = engineer_comment_text(&agent, &text).await;
-    comment_and_transition_or_bail(
-        TransitionCtx {
-            ticket: &ticket,
-            source: TicketPhase::InDevelopment,
-            target: TicketPhase::InDiagnostics,
-            notify: NotifyPolicy::Buffer,
-            log_label: "Engineer",
-            breaker_trip: false,
-        },
-        Role::Engineer.as_str(),
-        &comment_text,
-        "Resumed engineer finished — transitioned ticket",
-    )
-    .await;
-    complete_ticket_stage_job(job_id).await;
+    }
+    finalize_engineer_round(&ticket, &agent, response.as_deref(), job_id, true).await;
 }
 
 /// Resume a sanitation round: resume the job-derived agent session (empty
