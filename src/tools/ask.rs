@@ -1288,7 +1288,7 @@ pub(crate) fn extract_query_telemetry(agent: &Agent) -> (usize, usize, Vec<Strin
 /// agent IDs; `task_extra` is appended to every task (e.g. the query
 /// ledger). The wait shares the round-wide `deadline`. Shared with the deep
 /// research tool's verification gate.
-pub(crate) async fn dispatch_verifiers(
+pub(crate) async fn dispatch_claim_verifiers(
     ws: &Workspace,
     id_prefix: &str,
     targets: &[VerificationTarget],

@@ -25,7 +25,7 @@ use crate::tools::Tool;
 use crate::tools::ask::{
     AnalystFindings, Claim, RoundMember, VerificationResult, VerificationTarget,
     await_round_members, build_async_result_envelope, complete_durable_job_and_route,
-    dispatch_verifiers, escape_fences, extract_query_telemetry, load_analyst_angles,
+    dispatch_claim_verifiers, escape_fences, extract_query_telemetry, load_analyst_angles,
     max_confidence, normalize_claim, round_timeout,
 };
 use crate::{ChatMessage, ChatRequest, ChatRequestMeta, DEFAULT_MAX_TOKENS, Role, Workspace};
@@ -1999,7 +1999,7 @@ async fn research_verification_pass(
             "\n# Queries Already Asked (do not repeat these verbatim)\n\n{ledger_snapshot}"
         );
         let prefix = format!("research_{}_verify", ws.name);
-        results = dispatch_verifiers(ws, &prefix, &targets[..n], &task_extra, deadline).await;
+        results = dispatch_claim_verifiers(ws, &prefix, &targets[..n], &task_extra, deadline).await;
     }
     for v in &results {
         run_stats.tool_calls += v.tool_calls;
