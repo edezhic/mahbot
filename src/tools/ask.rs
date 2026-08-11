@@ -2283,8 +2283,14 @@ mod tests {
     /// analyst ids would not match the stored roster rows, so outcomes would
     /// be lost). A single done slot reconstructs from its stored outcome
     /// (raw passthrough — no provider needed).
+    ///
+    /// Serialized with the drain-flag writers: `resume_ask_round` consults the
+    /// process-global drain flag and aborts early while it is set (project
+    /// convention: retry_tests_lock).
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn resume_ask_round_reuses_existing_job() {
+        let _lock = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let ws = test_ws("/tmp/test_ws_resume_ask");
         let job_id = "ask_job_resume_1";
@@ -2357,8 +2363,14 @@ mod tests {
     /// and a child insert, or legacy data) must STILL resume — caller identity
     /// is read from the jobs row alone, so the caller is never stranded by the
     /// missing child row.
+    ///
+    /// Serialized with the drain-flag writers: `resume_ask_round` consults the
+    /// process-global drain flag and aborts early while it is set (project
+    /// convention: retry_tests_lock).
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn resume_ask_round_orphaned_child_row_is_not_stranding() {
+        let _lock = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let ws = test_ws("/tmp/test_ws_ask_orphan");
         let job_id = "ask_job_orphan_1";
@@ -2432,8 +2444,14 @@ mod tests {
     /// The boot-scan over-cap path must NOT strand the async-ask caller: an
     /// error envelope (with the original caller identity) is delivered instead
     /// of a silent failed row.
+    ///
+    /// Serialized with the drain-flag writers: `ask_capped_envelope` consults
+    /// the process-global drain flag and aborts early while it is set (project
+    /// convention: retry_tests_lock).
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn ask_capped_envelope_delivers_error_to_caller() {
+        let _lock = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let ws = test_ws("/tmp/test_ws_ask_capped");
         let job_id = "ask_job_capped_1";

@@ -1080,6 +1080,10 @@ mod tests {
 
     #[test]
     fn failure_classification_recovers_retry_exhaustion() {
+        // failure_classification consults the process-global drain flag before
+        // everything else — serialize against the drain-flag writers
+        // (project convention: retry_tests_lock).
+        let _guard = crate::util::test::retry_tests_lock();
         // Mirror llm_call's error construction: the RetryExhausted must
         // survive as a source (via .context, not string flattening) so the
         // granular FailureClass is recoverable from the chain.

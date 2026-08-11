@@ -1223,10 +1223,16 @@ async fn ninth_bounce_fails_ticket() {
 ///   handling) — the pause must be site-gated, not a generic Failed hook.
 ///
 /// Serialized with the reset_inflight_tickets tests (shared global board — a
-/// concurrent boot reset would clobber the fixture phases).
+/// concurrent boot reset would clobber the fixture phases). Also serialized
+/// with the drain-flag writers: `process_verifier_verdicts` and
+/// `pause_workspace_on_failure` consult the process-global drain flag, which
+/// would suppress the pause and the transition (project convention:
+/// retry_tests_lock).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
+#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
 async fn technical_failure_pauses_workspace_but_circuit_breaker_does_not() {
+    let _lock = crate::util::test::retry_tests_lock();
     init_management_test_stores().await;
 
     // ── Circuit-breaker trip must NOT pause the workspace ──────────────

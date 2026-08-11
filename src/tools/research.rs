@@ -2587,8 +2587,14 @@ mod tests {
     /// stored caller — the research envelope is the caller's only result
     /// path, so a failed row with no envelope would strand the Manager
     /// forever (the exact stranding class this path exists to prevent).
+    ///
+    /// Serialized with the drain-flag writers: `research_capped_partial_report`
+    /// consults the process-global drain flag and aborts early while it is
+    /// set (project convention: retry_tests_lock).
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn research_capped_delivers_partial_report_to_caller() {
+        let _lock = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
         let ws = crate::workspace::test_ws("/tmp/test_ws_research_capped");
         let job_id = "research_job_capped_1";
