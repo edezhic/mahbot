@@ -9,3 +9,19 @@ pub(crate) mod local_transcriber;
 pub mod tts;
 pub mod voice;
 pub(crate) mod wake_word_classifier;
+
+pub(crate) fn onnx_input_name(model: &candle_onnx::onnx::ModelProto) -> String {
+    model
+        .graph
+        .as_ref()
+        .and_then(|g| g.input.first())
+        .map_or_else(|| "input".to_string(), |i| i.name.clone())
+}
+
+pub(crate) fn onnx_output_name(model: &candle_onnx::onnx::ModelProto) -> String {
+    model
+        .graph
+        .as_ref()
+        .and_then(|g| g.output.first())
+        .map_or_else(|| "output".to_string(), |o| o.name.clone())
+}

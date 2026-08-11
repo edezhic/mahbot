@@ -33,6 +33,7 @@ use crate::ChatDirection;
 use crate::EMBEDDING_DIM;
 use crate::audio::embedding_sequence::{EmbeddingSequence, Source, UtteranceId};
 use crate::audio::wake_word_classifier::{self, ClassifierWeights, WakeWordClassifier};
+use crate::audio::{onnx_input_name, onnx_output_name};
 use crate::config::CONFIG;
 use crate::turso;
 use crate::util::UnwrapPoison;
@@ -2246,22 +2247,6 @@ fn load_onnx_models(dir: &Path) -> Result<OnnxModels> {
         embed_model,
         device: candle_core::Device::Cpu,
     })
-}
-
-fn onnx_input_name(model: &candle_onnx::onnx::ModelProto) -> String {
-    model
-        .graph
-        .as_ref()
-        .and_then(|g| g.input.first())
-        .map_or_else(|| "input".to_string(), |i| i.name.clone())
-}
-
-fn onnx_output_name(model: &candle_onnx::onnx::ModelProto) -> String {
-    model
-        .graph
-        .as_ref()
-        .and_then(|g| g.output.first())
-        .map_or_else(|| "output".to_string(), |o| o.name.clone())
 }
 
 /// Scale audio samples from float [-1, 1] range to approximate int16 range

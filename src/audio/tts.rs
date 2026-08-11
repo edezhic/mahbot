@@ -37,6 +37,7 @@
 //! | 2     | READY    | All models loaded and ready for synthesis.    |
 //! | 3     | FAILED   | Download or load failed terminally.           |
 
+use crate::audio::onnx_output_name;
 use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
 use crate::util::model_state::{AtomicModelState, ModelLoadGuard, ModelState};
@@ -1270,14 +1271,6 @@ fn encode_text_with_indexer(unicode_indexer: &[i32], text: &str) -> (Vec<i64>, u
 
 // ── ONNX helpers ─────────────────────────────────────────────────────
 
-fn first_output_name(model: &candle_onnx::onnx::ModelProto) -> String {
-    model
-        .graph
-        .as_ref()
-        .and_then(|g| g.output.first())
-        .map_or_else(|| "output".to_string(), |o| o.name.clone())
-}
-
 fn build_inputs(inputs: Vec<(&str, Tensor)>) -> HashMap<String, Tensor> {
     let mut map = HashMap::new();
     for (name, tensor) in inputs {
@@ -1291,7 +1284,7 @@ fn extract_output(
     model: &candle_onnx::onnx::ModelProto,
     label: &str,
 ) -> Result<Tensor> {
-    let name = first_output_name(model);
+    let name = onnx_output_name(model);
     outputs
         .remove(&name)
         .ok_or_else(|| anyhow!("{label}: output '{name}' not found"))
