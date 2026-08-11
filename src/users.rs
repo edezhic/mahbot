@@ -712,11 +712,6 @@ pub async fn resolve_workspace_for_user_name(user_name: &str) -> Workspace {
     }
 }
 
-/// Get the active role for a user, if any.
-pub async fn get_active_role(user_name: &str) -> Result<Option<String>> {
-    store().get_active_role(user_name).await
-}
-
 /// Fail-closed pool read for routing: returns `(pool, read_failed)` so the
 /// caller can distinguish a genuinely empty pool from a transient store
 /// error (and avoid a misleading 'no active role' user notice on the
@@ -804,7 +799,7 @@ pub async fn resolve_active_role_from_pool(user_name: &str, pool: &[Role]) -> Op
 /// fallback for a user by adding Analyst to their pool. Canonical home for
 /// the chat and voice routing paths.
 #[must_use]
-pub fn resolve_effective_role(role: Role, ws_name: &str, pool: &[Role]) -> Role {
+fn resolve_effective_role(role: Role, ws_name: &str, pool: &[Role]) -> Role {
     if role == Role::Manager && is_personal_workspace(ws_name) {
         if pool.contains(&Role::Analyst) {
             Role::Analyst
@@ -814,6 +809,70 @@ pub fn resolve_effective_role(role: Role, ws_name: &str, pool: &[Role]) -> Role 
     } else {
         role
     }
+}
+
+/// Whether an agent role is pinned to the user's personal workspace:
+/// Assistant and Artist always work there regardless of the selected
+/// workspace. An empty `user_name` disables pinning — there is no personal
+/// identity to pin to, so callers with an unresolvable user must pass the
+/// real user explicitly (the voice admin fallback passes "admin").
+#[must_use]
+fn pins_to_personal(role: Role, ws_name: &str, user_name: &str) -> bool {
+    !user_name.is_empty()
+        && (role == Role::Assistant || role == Role::Artist)
+        && !is_personal_workspace(ws_name)
+}
+
+/// Resolve the [`Workspace`] an agent role actually operates in: Assistant
+/// and Artist always work in the user's personal workspace regardless of the
+/// selected workspace, giving path-dependent callers (enrichment uploads,
+/// generated-media writes) the personal workspace's filesystem path.
+/// Accepted user decision (no migration): media written before pinning to a
+/// project workspace's `uploads/`/`generated/` stays there and is no longer
+/// reachable by Artist tools (e.g. video_edit path confinement).
+#[must_use]
+pub(crate) fn effective_workspace_for_role(
+    role: Role,
+    ws: Workspace,
+    user_name: &str,
+) -> Workspace {
+    if pins_to_personal(role, &ws.name, user_name) {
+        let path = personal_workspace_path(user_name);
+        personal_workspace_struct(user_name, &path)
+    } else {
+        // Empty user_name disables pinning (no personal identity to pin to);
+        // warn so a future caller passing an unresolvable user is diagnosed
+        // instead of silently routing Assistant/Artist to the project workspace.
+        if user_name.is_empty()
+            && (role == Role::Assistant || role == Role::Artist)
+            && !is_personal_workspace(&ws.name)
+        {
+            tracing::warn!(
+                role = ?role,
+                workspace = %ws.name,
+                "Assistant/Artist pinning skipped: empty user_name"
+            );
+        }
+        ws
+    }
+}
+
+/// Resolve the effective (role, workspace) pair atomically: apply
+/// `resolve_effective_role` (Manager→Analyst in personal workspaces) then
+/// pin Assistant/Artist to the user's personal workspace via
+/// `effective_workspace_for_role`. The transformations act on disjoint role
+/// sets, but a single call keeps session identity and the pinned workspace
+/// consistent at every routing entry point.
+#[must_use]
+pub fn effective_role_and_workspace(
+    role: Role,
+    ws: Workspace,
+    user_name: &str,
+    pool: &[Role],
+) -> (Role, Workspace) {
+    let role = resolve_effective_role(role, &ws.name, pool);
+    let ws = effective_workspace_for_role(role, ws, user_name);
+    (role, ws)
 }
 
 /// Resolve a channel+identifier pair to the canonical user name.
@@ -869,11 +928,18 @@ pub async fn update_channel_contact(
         .await
 }
 
+/// The user name for a `personal:` workspace name (`personal:{user}`), or
+/// `None` when the name is not a personal workspace.
+#[must_use]
+pub fn personal_user_name(workspace_name: &str) -> Option<&str> {
+    workspace_name.strip_prefix("personal:")
+}
+
 /// Check whether a workspace name refers to a personal workspace
 /// (prefix `personal:`).
 #[must_use]
 pub fn is_personal_workspace(workspace_name: &str) -> bool {
-    workspace_name.starts_with("personal:")
+    personal_user_name(workspace_name).is_some()
 }
 
 #[cfg(test)]
@@ -1045,5 +1111,45 @@ mod tests {
             store.get_user_roles("doomed").await.unwrap(),
             Vec::<Role>::new()
         );
+    }
+
+    #[test]
+    fn pinning_helpers_pin_assistant_artist_to_personal() {
+        // Assistant/Artist + non-personal workspace + non-empty user pin.
+        assert!(pins_to_personal(Role::Assistant, "ws1", "alice"));
+        assert!(pins_to_personal(Role::Artist, "ws1", "alice"));
+        // Already personal, other roles, and empty user_name never pin.
+        assert!(!pins_to_personal(
+            Role::Assistant,
+            "personal:alice",
+            "alice"
+        ));
+        assert!(!pins_to_personal(Role::Manager, "ws1", "alice"));
+        assert!(!pins_to_personal(Role::Assistant, "ws1", ""));
+
+        let project = Workspace::named("ws1");
+        let personal = effective_workspace_for_role(Role::Assistant, project.clone(), "alice");
+        assert_eq!(personal.name, "personal:alice");
+        assert!(
+            personal.path.ends_with("userspaces/alice"),
+            "the personal workspace must use the userspaces path, got: {}",
+            personal.path
+        );
+        // Manager keeps the project workspace; already-personal passes through.
+        let kept = effective_workspace_for_role(Role::Manager, project.clone(), "alice");
+        assert_eq!(kept.name, "ws1");
+        let already = effective_workspace_for_role(Role::Artist, personal.clone(), "alice");
+        assert_eq!(already.name, "personal:alice");
+
+        // Atomic composition: Manager→Analyst remap in personal workspaces and
+        // Assistant/Artist pinning resolve in one call.
+        let (role, ws) = effective_role_and_workspace(
+            Role::Manager,
+            Workspace::named("personal:alice"),
+            "alice",
+            &[Role::Analyst],
+        );
+        assert_eq!(role, Role::Analyst);
+        assert_eq!(ws.name, "personal:alice");
     }
 }

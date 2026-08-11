@@ -432,6 +432,17 @@ impl Workspace {
     pub fn display_name(&self) -> String {
         last_path_component(self.as_path())
     }
+
+    /// Create a minimal Workspace identified by name only (no filesystem
+    /// path). Used where only the name matters — e.g. the GUI chat picker,
+    /// which is per-session and never written to the DB.
+    #[must_use]
+    pub fn named(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
 }
 
 /// Extract the last component of a path as a string.

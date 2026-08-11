@@ -734,23 +734,31 @@ async fn handle_clear_session(msg: &ChannelMessage) {
     let role = mahbot::users::resolve_active_role_from_pool(&msg.user_name, &pool)
         .await
         .unwrap_or(Role::Analyst);
-    let reply = clear_session(&msg.channel, &msg.user_name, role.as_str(), &ws.name).await;
-    deliver_clear_reply(&reply, msg, &ws, role, &pool).await;
+    // Clear the session the user actually talks to: personal workspaces map
+    // Manager→Analyst (routing uses the remapped role), and Assistant/Artist
+    // sessions live in the user's personal workspace regardless of selection.
+    let (effective_role, ws) =
+        mahbot::users::effective_role_and_workspace(role, ws, &msg.user_name, &pool);
+    let reply = clear_session(
+        &msg.channel,
+        &msg.user_name,
+        effective_role.as_str(),
+        &ws.name,
+    )
+    .await;
+    deliver_clear_reply(&reply, msg, &ws, effective_role).await;
 }
 
 /// Deliver a session-clear confirmation via the router's raw `reply_target`
-/// path (broadcast + persist + transport), attributing it to the user's
-/// effective role so the bubble matches agent responses. The personal-
-/// workspace Manager→Analyst fallback is pool-clamped (same invariant as
-/// `process_channel_message`).
+/// path (broadcast + persist + transport). The caller passes the already
+/// effective role (pool-clamped, personal-workspace Manager→Analyst remap
+/// applied) so the confirmation bubble matches agent responses.
 async fn deliver_clear_reply(
     reply: &str,
     msg: &ChannelMessage,
     ws: &Workspace,
-    role: Role,
-    pool: &[Role],
+    effective_role: Role,
 ) {
-    let effective_role = mahbot::users::resolve_effective_role(role, &ws.name, pool);
     message_router::deliver_unregistered_user_response(
         reply,
         &message_router::AgentJob {
@@ -1093,14 +1101,23 @@ async fn process_channel_message(mut msg: ChannelMessage) {
     );
     let role = mahbot::users::resolve_active_role_from_pool(&msg.user_name, &pool).await;
 
-    // Populate workspace on the message so downstream broadcasts and
-    // chat_history writes carry the correct workspace.
-    msg.workspace = ws.name.clone();
+    // Personal workspaces map Manager→Analyst (pool-clamped), and
+    // Assistant/Artist always work in the user's personal workspace regardless
+    // of the selected workspace — both resolve atomically, before enrichment
+    // and before `msg.workspace` is set so uploads, broadcast, persist and
+    // chat_history stay consistent with the routed workspace.
+    let (effective_role, ws) = match role {
+        Some(role) => {
+            let (effective_role, ws) =
+                mahbot::users::effective_role_and_workspace(role, ws, &msg.user_name, &pool);
+            (Some(effective_role), ws)
+        }
+        None => (None, ws),
+    };
 
-    // Personal workspaces map Manager→Analyst; the pool-clamped helper keeps
-    // the routed role inside the user's pool (a pool without Analyst keeps
-    // Manager — the active role is always one of the pool roles).
-    let effective_role = role.map(|r| mahbot::users::resolve_effective_role(r, &ws.name, &pool));
+    // Populate workspace on the message so downstream broadcasts and
+    // chat_history writes carry the correct (effective) workspace.
+    msg.workspace = ws.name.clone();
 
     // Save original content before enrichment so we persist the raw
     // user-typed text to chat_history (avoids storing large data URIs from

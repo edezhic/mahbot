@@ -4309,9 +4309,9 @@ async fn route_to_agent(text: String) {
             return;
         };
         let ws = crate::users::resolve_workspace_for_user_name(&user_name).await;
-        // Personal-workspace Manager→Analyst fallback, pool-clamped (canonical
-        // helper shared with the chat routing path).
-        let role = crate::users::resolve_effective_role(role, &ws.name, &pool);
+        // Manager→Analyst fallback in personal workspaces (pool-clamped) and
+        // Assistant/Artist pinning to the personal workspace, atomically.
+        let (role, ws) = crate::users::effective_role_and_workspace(role, ws, &user_name, &pool);
 
         info!(
             "Voice command -> {role} (user: {user_name}, workspace: {}): {text}",
@@ -4350,7 +4350,11 @@ async fn route_to_agent(text: String) {
     } else {
         admin_pool[0]
     };
-    let role = crate::users::resolve_effective_role(role, &ws.name, &admin_pool);
+    // Assistant/Artist fall back to admin's personal workspace. The routed
+    // user_name stays empty (pre-existing fallback behavior), so "admin"
+    // stands in for the personal identity — an empty name would produce a
+    // broken `personal:` path.
+    let (role, ws) = crate::users::effective_role_and_workspace(role, ws, "admin", &admin_pool);
 
     info!("Voice command -> {role} (workspace: {}): {}", ws.name, text);
     broadcast_voice_transcript(&text, "", &ws.name).await;
@@ -5642,7 +5646,15 @@ impl PipelineCtx {
         if user_name.is_empty() {
             return;
         }
+        let role = crate::users::resolve_active_role(&user_name).await;
         let ws = crate::users::resolve_workspace_for_user_name(&user_name).await;
+        // Assistant/Artist conversations live in the user's personal workspace;
+        // a None role (empty pool or store failure) fails closed to the
+        // resolved workspace — the notice stays visible in the current view.
+        let ws = match role {
+            Some(role) => crate::users::effective_workspace_for_role(role, ws, &user_name),
+            None => ws,
+        };
         crate::channels::broadcast_and_persist_agent_response(
             &user_name,
             "voice",

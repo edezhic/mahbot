@@ -436,8 +436,7 @@ async fn resolve_workspace(workspace_name: &str) -> anyhow::Result<Option<Worksp
     match crate::workspace::get_by_name(workspace_name).await? {
         Some(ws) => Ok(Some(ws)),
         None if crate::users::is_personal_workspace(workspace_name) => {
-            let user_name = workspace_name
-                .strip_prefix("personal:")
+            let user_name = crate::users::personal_user_name(workspace_name)
                 .expect("invariant: is_personal_workspace checked prefix");
             let path = crate::users::personal_workspace_path(user_name);
             Ok(Some(crate::users::personal_workspace_struct(

@@ -145,58 +145,85 @@ impl ChatHistoryStore {
         Ok(())
     }
 
-    /// Shared paging body for [`Self::load_for_user`] and
-    /// [`Self::load_older_for_user`]. `before_id = None` loads the most recent
-    /// page; `Some(id)` loads only messages older than `id`. The
-    /// `(?3 IS NULL OR id < ?3)` predicate keeps the placeholder indexes
-    /// stable across both callers.
+    /// Shared paging body for the `load_*` methods. `ws2` is an optional
+    /// second workspace to merge; `None` loads a single workspace only (and
+    /// keeps the composite index `idx_chat_history_user_ws_id` usable).
+    /// `before_id = None` loads the most recent page; `Some(id)` loads only
+    /// messages older than `id`.
     async fn load_page(
         &self,
         user_name: &str,
-        workspace: &str,
+        ws1: &str,
+        ws2: Option<&str>,
         before_id: Option<i64>,
     ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
         #[allow(clippy::cast_possible_wrap)]
         let query_limit = HISTORY_LIMIT as i64 + 1; // fetch one extra to detect has_more
-        let rows = self
-            .conn
-            .query(
-                &format!(
-                    "SELECT {CHAT_HISTORY_COLUMNS} \
-                     FROM chat_history \
-                     WHERE user_name = ?1 AND workspace = ?2 AND (?3 IS NULL OR id < ?3) \
-                     ORDER BY id DESC \
-                     LIMIT ?4",
-                ),
-                turso::params![user_name, workspace, before_id, query_limit],
-            )
-            .await?;
+        let rows = match ws2 {
+            // Two-workspace merge (selected + personal): OR predicate, merged
+            // chronologically by global row id.
+            Some(ws2) => {
+                self.conn
+                    .query(
+                        &format!(
+                            "SELECT {CHAT_HISTORY_COLUMNS} \
+                             FROM chat_history \
+                             WHERE user_name = ?1 AND (workspace = ?2 OR workspace = ?3) \
+                               AND (?4 IS NULL OR id < ?4) \
+                             ORDER BY id DESC \
+                             LIMIT ?5",
+                        ),
+                        turso::params![user_name, ws1, ws2, before_id, query_limit],
+                    )
+                    .await?
+            }
+            // Single-workspace: plain equality keeps the composite
+            // idx_chat_history_user_ws_id directly usable (the OR form would
+            // need a broader scan).
+            None => {
+                self.conn
+                    .query(
+                        &format!(
+                            "SELECT {CHAT_HISTORY_COLUMNS} \
+                             FROM chat_history \
+                             WHERE user_name = ?1 AND workspace = ?2 \
+                               AND (?3 IS NULL OR id < ?3) \
+                             ORDER BY id DESC \
+                             LIMIT ?4",
+                        ),
+                        turso::params![user_name, ws1, before_id, query_limit],
+                    )
+                    .await?
+            }
+        };
         rows_to_page(rows)
     }
 
-    /// Load the most recent messages for a user + workspace pair,
-    /// returned in chronological order (oldest first).
-    /// Returns `(entries, has_more)` where `has_more` is `true` if older
-    /// entries exist beyond the loaded window.
-    pub async fn load_for_user(
+    /// Load the most recent messages for a user across one or two workspaces
+    /// (`ws2` is an optional second workspace to merge). Returns entries in
+    /// chronological order (oldest first) with a `has_more` flag for older
+    /// entries beyond the loaded window.
+    pub async fn load_for_user_workspaces(
         &self,
         user_name: &str,
-        workspace: &str,
+        ws1: &str,
+        ws2: Option<&str>,
     ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
-        self.load_page(user_name, workspace, None).await
+        self.load_page(user_name, ws1, ws2, None).await
     }
 
-    /// Load messages older than `before_id` for a user + workspace pair.
-    /// Returns `(entries, has_more)` where `has_more` is `true` if even older
-    /// entries exist beyond the loaded window. Returns entries in chronological
+    /// Load messages older than `before_id` for a user across one or two
+    /// workspaces. Returns `(entries, has_more)` where `has_more` is `true`
+    /// if even older entries exist beyond the loaded window, in chronological
     /// order (oldest first).
-    pub async fn load_older_for_user(
+    pub async fn load_older_for_user_workspaces(
         &self,
         user_name: &str,
-        workspace: &str,
+        ws1: &str,
+        ws2: Option<&str>,
         before_id: i64,
     ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
-        self.load_page(user_name, workspace, Some(before_id)).await
+        self.load_page(user_name, ws1, ws2, Some(before_id)).await
     }
 
     /// Insert a divider marker row into chat history to indicate where a
@@ -267,7 +294,7 @@ mod tests {
             .await
             .expect("insert should succeed");
         let (history, has_more) = store
-            .load_for_user("user", "ws")
+            .load_for_user_workspaces("user", "ws", None)
             .await
             .expect("load should succeed");
         assert_eq!(history.len(), 1);
@@ -287,9 +314,9 @@ mod tests {
 
         // Load history for the same user+workspace.
         let (history, has_more) = store
-            .load_for_user("alice", "ws1")
+            .load_for_user_workspaces("alice", "ws1", None)
             .await
-            .expect("load_for_user should succeed");
+            .expect("load should succeed");
 
         // Should have exactly one entry: the divider.
         assert_eq!(history.len(), 1, "should have exactly one divider entry");
@@ -323,7 +350,7 @@ mod tests {
 
         // Verify the divider is *not* present in another user's history.
         let (other_history, _) = store
-            .load_for_user("bob", "ws1")
+            .load_for_user_workspaces("bob", "ws1", None)
             .await
             .expect("other user load should succeed");
         assert!(
@@ -333,7 +360,7 @@ mod tests {
 
         // Verify the divider is *not* present in another workspace's history.
         let (other_ws_history, _) = store
-            .load_for_user("alice", "ws2")
+            .load_for_user_workspaces("alice", "ws2", None)
             .await
             .expect("other workspace load should succeed");
         assert!(
@@ -357,7 +384,7 @@ mod tests {
             .expect("second divider should succeed");
 
         let (history, has_more) = store
-            .load_for_user("alice", "ws1")
+            .load_for_user_workspaces("alice", "ws1", None)
             .await
             .expect("load should succeed");
 
@@ -418,7 +445,7 @@ mod tests {
 
         // Load all three.
         let (history, has_more) = store
-            .load_for_user("alice", "ws1")
+            .load_for_user_workspaces("alice", "ws1", None)
             .await
             .expect("load should succeed");
 
@@ -434,5 +461,111 @@ mod tests {
 
         assert_eq!(history[2].direction, ChatDirection::User);
         assert_eq!(history[2].content, "world");
+    }
+
+    #[tokio::test]
+    async fn test_load_across_workspaces_merges_chronologically() {
+        let (store, _tmp) = test_setup().await;
+
+        for (i, (content, ws)) in [
+            ("p1", "project"),
+            ("me1", "personal:alice"),
+            ("p2", "project"),
+            ("me2", "personal:alice"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store
+                .insert(&ChatHistoryInsert {
+                    message_id: format!("msg-{i}"),
+                    user_name: "alice".to_string(),
+                    channel: "gui".to_string(),
+                    role: "user".to_string(),
+                    direction: "user".to_string(),
+                    content: content.to_string(),
+                    agent_role: None,
+                    workspace: ws.to_string(),
+                    created_at: turso::now(),
+                })
+                .await
+                .expect("insert should succeed");
+        }
+
+        let (history, has_more) = store
+            .load_for_user_workspaces("alice", "project", Some("personal:alice"))
+            .await
+            .expect("load should succeed");
+        assert_eq!(history.len(), 4, "all four entries from both workspaces");
+        assert!(!has_more);
+        // Chronological order by id across workspaces.
+        let contents: Vec<&str> = history.iter().map(|e| e.content.as_str()).collect();
+        assert_eq!(contents, ["p1", "me1", "p2", "me2"]);
+
+        // A single-workspace load still filters correctly via the same API.
+        let (only_personal, _) = store
+            .load_for_user_workspaces("alice", "personal:alice", None)
+            .await
+            .expect("load should succeed");
+        assert_eq!(only_personal.len(), 2);
+        assert_eq!(only_personal[0].content, "me1");
+        assert_eq!(only_personal[1].content, "me2");
+    }
+
+    #[tokio::test]
+    async fn test_load_older_across_workspaces_paginates() {
+        let (store, _tmp) = test_setup().await;
+
+        // Two workspaces, 3 messages each, inserted alternately.
+        for i in 0..6 {
+            let ws = if i % 2 == 0 {
+                "project"
+            } else {
+                "personal:alice"
+            };
+            store
+                .insert(&ChatHistoryInsert {
+                    message_id: format!("msg-{i}"),
+                    user_name: "alice".to_string(),
+                    channel: "gui".to_string(),
+                    role: "user".to_string(),
+                    direction: "user".to_string(),
+                    content: format!("c{i}"),
+                    agent_role: None,
+                    workspace: ws.to_string(),
+                    created_at: turso::now(),
+                })
+                .await
+                .expect("insert should succeed");
+        }
+
+        let (history, has_more) = store
+            .load_for_user_workspaces("alice", "project", Some("personal:alice"))
+            .await
+            .expect("load should succeed");
+        assert_eq!(history.len(), 6);
+        assert!(!has_more);
+        let oldest_id = history[0].id;
+
+        // Load older than the oldest id — nothing left in either workspace.
+        let (older, has_more_older) = store
+            .load_older_for_user_workspaces("alice", "project", Some("personal:alice"), oldest_id)
+            .await
+            .expect("load older should succeed");
+        assert!(older.is_empty());
+        assert!(!has_more_older);
+
+        // Loading older than the 3rd message returns the 3 older ones, merged.
+        let (older, _) = store
+            .load_older_for_user_workspaces(
+                "alice",
+                "project",
+                Some("personal:alice"),
+                history[3].id,
+            )
+            .await
+            .expect("load older should succeed");
+        let contents: Vec<&str> = older.iter().map(|e| e.content.as_str()).collect();
+        assert_eq!(contents, ["c0", "c1", "c2"]);
     }
 }

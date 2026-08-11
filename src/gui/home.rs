@@ -141,10 +141,15 @@ pub enum HomeMessage {
     /// DB-stored workspace differs from sidebar). Intercepted by Dashboard;
     /// never reaches Home's own update handler.
     RequestWorkspaceChange(String),
-    /// Internal signal: reverse-sync check completed. Carries the
-    /// user's DB-stored workspace (None if not set, Some if set).
-    /// Proceeds with normal history refresh for the selected user.
-    ResolveUserSelected(Option<String>),
+    /// Internal signal: reverse-sync check completed. Carries the sidebar
+    /// workspace to show (the user's DB-stored workspace, normalized — empty
+    /// means Personal) and the user's DB-selected project workspace (the
+    /// merge partner for the Personal-picker chat view; `None` when unset or
+    /// personal). Proceeds with a normal history refresh for the selected user.
+    ResolveUserSelected {
+        sidebar_ws: Option<String>,
+        project_ws: Option<String>,
+    },
     /// User picked a workspace from the Home page picker.
     /// Intercepted by Dashboard; never reaches Home's own update handler.
     WorkspacePicked(String),
@@ -192,6 +197,11 @@ pub struct HomeState {
     /// Empty string `""` means the "Personal" workspace — must be resolved
     /// to `personal:<user_name>` before querying chat_history or sessions.
     selected_workspace: Option<String>,
+    /// The selected user's DB-stored project workspace (None when unset or
+    /// personal). The merge partner for the Personal-picker chat view: at
+    /// the Personal picker the chat shows this workspace alongside the
+    /// user's personal workspace.
+    user_project_workspace: Option<String>,
     /// Displayed chat messages.
     messages: Vec<DisplayMessage>,
     /// Deduplication set of seen message IDs.
@@ -237,6 +247,7 @@ impl HomeState {
         Self {
             selected_user: None,
             selected_workspace: None,
+            user_project_workspace: None,
             messages: Vec::new(),
             seen_ids: HashSet::new(),
             editor_content: text_editor::Content::new(),
@@ -291,13 +302,54 @@ impl HomeState {
         }
     }
 
+    /// Whether `workspace` is the selected user's personal workspace
+    /// (`personal:{user}`) — the Assistant/Artist chat shown at any picker.
+    fn is_selected_user_personal_workspace(&self, workspace: &str) -> bool {
+        self.selected_user
+            .as_deref()
+            .is_some_and(|user| crate::users::personal_user_name(workspace) == Some(user))
+    }
+
+    /// The visible chat set for the selected user: the currently selected
+    /// workspace plus the user's personal workspace (Assistant/Artist
+    /// conversations always live there). At the Personal picker the project
+    /// side is the user's DB-selected project workspace — symmetric
+    /// visibility: the picker only selects the recipient, it never filters
+    /// the view. Returns `None` when no user is selected; the second element
+    /// is `None` when the picker is already on the personal workspace and the
+    /// user has no project workspace (deduplicated).
+    fn visible_workspaces(&self) -> Option<(String, Option<String>)> {
+        let user = self.selected_user.as_ref()?;
+        let personal = format!("personal:{user}");
+        match self.resolve_workspace_name() {
+            Some(sel) if !self.is_selected_user_personal_workspace(&sel) => {
+                Some((sel, Some(personal)))
+            }
+            _ => Some((personal, self.user_project_workspace.clone())),
+        }
+    }
+
+    /// Whether a message or typing event in `workspace` belongs to the
+    /// selected user's visible chat: the user's personal workspace is always
+    /// visible, and the project side is the currently selected workspace (or
+    /// the user's DB-selected project workspace at the Personal picker).
+    fn workspace_visible(&self, workspace: &str) -> bool {
+        if self.is_selected_user_personal_workspace(workspace) {
+            return true;
+        }
+        match self.resolve_workspace_name() {
+            Some(sel) if !self.is_selected_user_personal_workspace(&sel) => sel == workspace,
+            _ => self.user_project_workspace.as_deref() == Some(workspace),
+        }
+    }
+
     /// Reverse-sync the DB-stored workspace preference for a user.
     ///
-    /// Checks whether the user has a stored workspace preference that differs
-    /// from the current sidebar selection. If so, returns
-    /// [`RequestWorkspaceChange`] to trigger a Dashboard-level change (which
-    /// will cascade to [`WorkspaceChanged`] → `refresh_history`). Otherwise
-    /// returns [`ResolveUserSelected`] to proceed with a normal history refresh.
+    /// Returns [`ResolveUserSelected`] carrying the sidebar workspace to show
+    /// and the user's DB-selected project workspace. Home's handler emits
+    /// [`RequestWorkspaceChange`] when the sidebar must move (Dashboard-level
+    /// change cascading to [`WorkspaceChanged`] → `refresh_history`);
+    /// otherwise it refreshes history directly.
     ///
     /// NOTE: We deliberately do NOT write the sidebar workspace to the
     /// impersonated user's DB record.  The GUI sidebar is a per-session
@@ -306,44 +358,51 @@ impl HomeState {
     async fn resolve_user_workspace_sync(user: String, current_ws: Option<String>) -> HomeMessage {
         match crate::users::get_raw_selected_workspace(&user).await {
             Ok(Some(ws_name)) => {
-                // User has an explicit stored workspace preference.
-                // Normalize personal workspaces to the GUI sentinel "".
-                let ws_gui = if crate::users::is_personal_workspace(&ws_name) {
-                    String::new()
+                // User has an explicit stored workspace preference. Normalize
+                // personal workspaces to the GUI sentinel ""; the project
+                // workspace is the merge partner at the Personal picker.
+                let (sidebar_ws, project_ws) = if crate::users::is_personal_workspace(&ws_name) {
+                    (String::new(), None)
                 } else {
-                    ws_name
+                    (ws_name.clone(), Some(ws_name))
                 };
-                if Some(&ws_gui) != current_ws.as_ref() {
-                    HomeMessage::RequestWorkspaceChange(ws_gui)
-                } else {
-                    HomeMessage::ResolveUserSelected(current_ws.clone())
+                HomeMessage::ResolveUserSelected {
+                    sidebar_ws: Some(sidebar_ws),
+                    project_ws,
                 }
             }
             Ok(None) => {
                 // User has no stored preference — keep current sidebar selection.
-                HomeMessage::ResolveUserSelected(current_ws.clone())
+                HomeMessage::ResolveUserSelected {
+                    sidebar_ws: current_ws.clone(),
+                    project_ws: None,
+                }
             }
             Err(e) => {
                 tracing::warn!("Failed to get raw workspace for user {user}: {e}");
-                HomeMessage::ResolveUserSelected(current_ws.clone())
+                HomeMessage::ResolveUserSelected {
+                    sidebar_ws: current_ws.clone(),
+                    project_ws: None,
+                }
             }
         }
     }
 
-    /// Refresh chat history from the store for the current user + workspace.
+    /// Refresh chat history from the store for the current user's visible
+    /// workspaces (the selected workspace plus the user's personal workspace).
     fn refresh_history(&self) -> Task<HomeMessage> {
         let user_name = match &self.selected_user {
             Some(s) => s.clone(),
             None => return Task::none(),
         };
-        let Some(workspace) = self.resolve_workspace_name() else {
+        let Some((ws1, ws2)) = self.visible_workspaces() else {
             return Task::none();
         };
         Task::perform(
             async move {
                 let store = crate::chat_history::store();
                 store
-                    .load_for_user(&user_name, &workspace)
+                    .load_for_user_workspaces(&user_name, &ws1, ws2.as_deref())
                     .await
                     .map_err(|e| e.to_string())
             },
@@ -463,14 +522,12 @@ impl HomeState {
     ///   only (re-enables the send button). Does **not** clear `typing`
     ///   — the typing indicator persists until an agent response arrives.
     ///
-    /// Clear sending/typing state based on direction, sender, and workspace.
-    ///
-    /// Does nothing when `workspace` does not match
-    /// [`resolve_workspace_name()`](Self::resolve_workspace_name) — this
-    /// prevents an agent response from workspace B from clearing the
-    /// typing/sending indicators for workspace A.
+    /// Does nothing when `workspace` is not visible for the selected user
+    /// (see [`Self::workspace_visible`]) — this prevents an agent response
+    /// from an unrelated workspace from clearing the typing/sending
+    /// indicators for the visible chat.
     fn update_sending_state(&mut self, direction: ChatDirection, user_name: &str, workspace: &str) {
-        if Some(workspace) != self.resolve_workspace_name().as_deref() {
+        if !self.workspace_visible(workspace) {
             return;
         }
         if Some(user_name) != self.selected_user.as_deref() {
@@ -483,10 +540,11 @@ impl HomeState {
         }
     }
 
-    /// Append a chat message if it belongs to the selected user + workspace.
+    /// Append a chat message if it belongs to the selected user's visible
+    /// chat (selected workspace or the user's personal workspace).
     ///
     /// Does nothing when `user_name` is not the selected user, or when
-    /// `workspace` does not match [`resolve_workspace_name()`](Self::resolve_workspace_name).
+    /// `workspace` is not visible (see [`Self::workspace_visible`]).
     /// Takes ownership of the message fields so the caller avoids extra
     /// clones on the common (append) path.
     ///
@@ -506,7 +564,7 @@ impl HomeState {
         if Some(user_name) != self.selected_user.as_deref() {
             return;
         }
-        if Some(workspace) != self.resolve_workspace_name().as_deref() {
+        if !self.workspace_visible(workspace) {
             return;
         }
 
@@ -910,6 +968,7 @@ impl HomeState {
                 }
                 self.selected_user = Some(user.clone());
                 self.reset_chat_state();
+                self.user_project_workspace = None; // re-resolved below
 
                 Task::perform(
                     Self::resolve_user_workspace_sync(user, self.selected_workspace.clone()),
@@ -954,11 +1013,25 @@ impl HomeState {
                 super::common::restore_undo_snapshot(&mut self.editor_content, snapshot);
                 Task::none()
             }
-            HomeMessage::ResolveUserSelected(workspace) => {
+            HomeMessage::ResolveUserSelected {
+                sidebar_ws,
+                project_ws,
+            } => {
+                // The user's DB-selected project workspace is the merge
+                // partner for the Personal-picker chat view.
+                self.user_project_workspace = project_ws;
+                if sidebar_ws != self.selected_workspace {
+                    // Sidebar must move to the user's DB workspace — the
+                    // Dashboard intercepts RequestWorkspaceChange and cascades
+                    // a WorkspaceChanged refresh.
+                    return Task::done(HomeMessage::RequestWorkspaceChange(
+                        sidebar_ws.unwrap_or_default(),
+                    ));
+                }
                 // Reverse-sync check completed: either the user's DB workspace
                 // matches the sidebar (no disagreement), or no DB workspace
                 // exists for this user.
-                self.selected_workspace = workspace;
+                self.selected_workspace = sidebar_ws;
                 //
                 // If WorkspaceChanged arrived before a user was selected
                 // (boot timing), it deferred the refresh via the flag.
@@ -1025,22 +1098,42 @@ impl HomeState {
                 };
                 Task::perform(
                     async move {
-                        // Look up the user's active role from DB (set via the Users page).
-                        let role = crate::users::get_active_role(&sender)
+                        // Clear the session the user actually talks to:
+                        // pool-validated active role (same resolution as
+                        // routing), with Manager→Analyst clamp and
+                        // Assistant/Artist pinning resolved atomically
+                        // (pinning overrides the picker). The starting
+                        // workspace is the GUI picker — the sidebar is
+                        // per-session and never written to the DB, so
+                        // non-pinned roles clear the conversation shown in
+                        // the current view. Analyst fallback matches
+                        // Telegram /clear (an empty-pool user has no agent
+                        // session to clear).
+                        let pool = crate::users::role_pool(&sender).await;
+                        let role = crate::users::resolve_active_role_from_pool(&sender, &pool)
                             .await
-                            .ok()
-                            .flatten()
-                            .unwrap_or(Role::Manager.as_str().to_string());
-                        // Clear the session.
-                        let _ = crate::session::clear_session("gui", &sender, &role, &ws).await;
+                            .unwrap_or(Role::Analyst);
+                        let (effective_role, ws) = crate::users::effective_role_and_workspace(
+                            role,
+                            crate::Workspace::named(ws),
+                            &sender,
+                            &pool,
+                        );
+                        let _ = crate::session::clear_session(
+                            "gui",
+                            &sender,
+                            effective_role.as_str(),
+                            &ws.name,
+                        )
+                        .await;
                         // Insert a divider marker instead of deleting history.
                         let store = crate::chat_history::store();
-                        match store.insert_divider(&sender, "gui", &ws).await {
+                        match store.insert_divider(&sender, "gui", &ws.name).await {
                             Ok(()) => Ok(()),
                             Err(e) => {
                                 tracing::warn!(
                                     user = %sender,
-                                    workspace = %ws,
+                                    workspace = %ws.name,
                                     error = %e,
                                     "Home: failed to insert chat divider"
                                 );
@@ -1112,9 +1205,9 @@ impl HomeState {
                     workspace,
                 } => {
                     // Apply user + workspace filter — only show typing indicator
-                    // for the selected user in the selected workspace.
+                    // for the selected user in a visible workspace.
                     if Some(&user_name) == self.selected_user.as_ref()
-                        && Some(workspace.as_str()) == self.resolve_workspace_name().as_deref()
+                        && self.workspace_visible(&workspace)
                     {
                         self.typing = is_typing;
                         if is_typing {
@@ -1159,7 +1252,7 @@ impl HomeState {
                     Some(s) => s.clone(),
                     None => return Task::none(),
                 };
-                let Some(workspace) = self.resolve_workspace_name() else {
+                let Some((ws1, ws2)) = self.visible_workspaces() else {
                     return Task::none();
                 };
                 let Some(before_id) = self.oldest_loaded_id else {
@@ -1171,7 +1264,12 @@ impl HomeState {
                     async move {
                         let store = crate::chat_history::store();
                         store
-                            .load_older_for_user(&sender, &workspace, before_id)
+                            .load_older_for_user_workspaces(
+                                &sender,
+                                &ws1,
+                                ws2.as_deref(),
+                                before_id,
+                            )
                             .await
                             .map(|(entries, has_more)| (entries, has_more, generation))
                             .map_err(|e| e.to_string())
@@ -1685,6 +1783,149 @@ mod tests {
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].direction, ChatDirection::Agent);
         assert_eq!(state.messages[0].agent_role.as_deref(), Some("engineer"),);
+    }
+
+    // ------------------------------------------------------------------
+    // personal-workspace visibility (Assistant/Artist at any picker)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_workspace_visible_personal_at_any_picker() {
+        // Project picker: project and personal workspaces are both visible.
+        let state = make_home_state("alice", "ws1");
+        assert!(state.workspace_visible("ws1"));
+        assert!(
+            state.workspace_visible("personal:alice"),
+            "personal Assistant/Artist messages must be visible at any picker"
+        );
+        assert!(!state.workspace_visible("ws2"));
+        assert!(
+            !state.workspace_visible("personal:bob"),
+            "another user's personal workspace is not visible"
+        );
+
+        // Personal picker: personal and the user's DB project workspace are
+        // both visible (symmetric visibility — the picker selects the
+        // recipient, not the view).
+        let mut state = make_home_state("alice", "");
+        state.user_project_workspace = Some("ws1".to_string());
+        assert_eq!(
+            state.resolve_workspace_name().as_deref(),
+            Some("personal:alice"),
+            "empty picker selection resolves to the personal workspace"
+        );
+        assert!(state.workspace_visible("personal:alice"));
+        assert!(
+            state.workspace_visible("ws1"),
+            "project messages must be visible at the personal picker"
+        );
+        assert!(
+            !state.workspace_visible("ws2"),
+            "a non-selected project workspace stays hidden at the personal picker"
+        );
+    }
+
+    #[test]
+    fn test_visible_workspaces_dedup() {
+        let project = make_home_state("alice", "ws1");
+        assert_eq!(
+            project.visible_workspaces(),
+            Some(("ws1".to_string(), Some("personal:alice".to_string()))),
+            "project picker shows both the project and the personal workspace"
+        );
+
+        let mut personal = make_home_state("alice", "");
+        personal.user_project_workspace = Some("ws1".to_string());
+        assert_eq!(
+            personal.visible_workspaces(),
+            Some(("personal:alice".to_string(), Some("ws1".to_string()))),
+            "personal picker merges the user's project workspace"
+        );
+
+        // No DB project workspace → personal-only view.
+        let personal_only = make_home_state("alice", "");
+        assert_eq!(
+            personal_only.visible_workspaces(),
+            Some(("personal:alice".to_string(), None)),
+            "personal picker without a project workspace shows only the personal chat"
+        );
+
+        let no_user = HomeState::new();
+        assert_eq!(no_user.visible_workspaces(), None);
+    }
+
+    #[test]
+    fn test_personal_workspace_call_site_wiring() {
+        let mut state = make_home_state("alice", "ws1");
+
+        // Assistant reply in the personal workspace appends at the project
+        // picker...
+        state.append_message(
+            "alice",
+            "personal:alice",
+            "msg-personal".to_string(),
+            "Assistant reply".to_string(),
+            ChatDirection::Agent,
+            Some("assistant".to_string()),
+        );
+        assert_eq!(
+            state.messages.len(),
+            1,
+            "Assistant reply in the personal workspace must append at the project picker"
+        );
+        assert_eq!(state.messages[0].content, "Assistant reply");
+
+        // ...and clears the sending/typing indicators even though the picker
+        // is on the project workspace.
+        state.sending = true;
+        state.typing = true;
+        state.update_sending_state(ChatDirection::Agent, "alice", "personal:alice");
+        assert!(!state.sending);
+        assert!(!state.typing);
+    }
+
+    #[test]
+    fn test_project_workspace_call_site_wiring_at_personal_picker() {
+        // Symmetric direction: at the personal picker, Manager replies in the
+        // user's DB project workspace append and clear sending/typing.
+        let mut state = make_home_state("alice", "");
+        state.user_project_workspace = Some("ws1".to_string());
+
+        state.append_message(
+            "alice",
+            "ws1",
+            "msg-project".to_string(),
+            "Manager reply".to_string(),
+            ChatDirection::Agent,
+            Some("manager".to_string()),
+        );
+        assert_eq!(
+            state.messages.len(),
+            1,
+            "project Manager reply must append at the personal picker"
+        );
+        assert_eq!(state.messages[0].content, "Manager reply");
+
+        state.sending = true;
+        state.typing = true;
+        state.update_sending_state(ChatDirection::Agent, "alice", "ws1");
+        assert!(!state.sending);
+        assert!(!state.typing);
+
+        // A project workspace that is not the user's own stays hidden.
+        state.append_message(
+            "alice",
+            "ws2",
+            "msg-other".to_string(),
+            "other".to_string(),
+            ChatDirection::Agent,
+            None,
+        );
+        assert_eq!(
+            state.messages.len(),
+            1,
+            "messages from an unrelated workspace must not append at the personal picker"
+        );
     }
 
     // ------------------------------------------------------------------
