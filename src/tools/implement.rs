@@ -52,7 +52,7 @@ impl Tool for ImplementTool {
 
         if let Some(response) = response {
             Ok(response)
-        } else if agent.is_cancelled() || crate::shutdown::shutdown_token().is_cancelled() {
+        } else if agent.is_cancelled() || crate::shutdown::aborting() {
             anyhow::bail!("Sub-agent cancelled");
         } else {
             anyhow::bail!(
