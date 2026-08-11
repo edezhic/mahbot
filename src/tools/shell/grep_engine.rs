@@ -1524,28 +1524,16 @@ fn operand_from_path(display: &str, resolved: &Path, trailing_slash: bool) -> Op
 }
 
 /// True when the raw token has glob metacharacters outside quotes/escapes.
+/// Quote- and escape-aware via [`super::track_char_context`] — bash semantics:
+/// glob chars inside single OR double quotes are literal filenames.
 fn has_unquoted_glob(tok: &str) -> bool {
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
     for c in tok.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if c == '\\' {
-            escaped = true;
-            continue;
-        }
-        if c == '\'' && !in_double {
-            in_single = !in_single;
-            continue;
-        }
-        if c == '"' && !in_single {
-            in_double = !in_double;
-            continue;
-        }
-        if !in_single && matches!(c, '*' | '?' | '[') {
+        if super::track_char_context(c, &mut in_single, &mut in_double, &mut escaped)
+            && matches!(c, '*' | '?' | '[')
+        {
             return true;
         }
     }

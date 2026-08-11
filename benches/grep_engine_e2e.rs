@@ -63,6 +63,9 @@ fn run_matrix() -> i32 {
         "grep -rn needle '*.txt' a.txt",
         "grep -rn needle '~' a.txt",
         "grep -rn needle 'a\"b.txt' a.txt",
+        // Pin: double-quoted glob stays literal. Red pre-fix (the glob leaked
+        // a"b.txt's needle); keep that fixture line needle-bearing.
+        "grep -rn needle \"*.txt\" a.txt",
         // ── Relaxed pipeline gate: any length, grep first, >256 KiB stream ──
         "grep -rn needle bigdir | wc -l",
         "grep -rn needle bigdir | tail -1",
