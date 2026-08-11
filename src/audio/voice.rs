@@ -8627,91 +8627,80 @@ mod tests {
 
     #[test]
     #[serial_test::serial(voice)]
-    fn refractory_transitions_from_error_to_listening() {
+    fn refractory_period_transition_table() {
         let _ = init_global();
 
-        let mut ctx = PipelineCtx::new();
-        ctx.is_recording = false;
-        ctx.refractory_until = Some(
-            Instant::now()
-                .checked_sub(Duration::from_secs(1))
-                .expect("1s in the past should not underflow"),
-        );
+        // (case, timer elapsed?, recording?, initial status, expected status check, timer cleared?)
+        let cases: [(
+            &str,
+            bool,
+            bool,
+            VoiceStatus,
+            fn(&VoiceStatus) -> bool,
+            bool,
+        ); 4] = [
+            (
+                "elapsed_error_to_listening",
+                true,
+                false,
+                VoiceStatus::Error("test error".to_string()),
+                |s| matches!(s, VoiceStatus::Listening),
+                true,
+            ),
+            (
+                "elapsed_disabled_stays",
+                true,
+                false,
+                VoiceStatus::Disabled,
+                |s| matches!(s, VoiceStatus::Disabled),
+                // Timer still cleared — session-level, not status-dependent.
+                true,
+            ),
+            (
+                "elapsed_recording_stays_error",
+                true,
+                true,
+                VoiceStatus::Error("test error".to_string()),
+                |s| matches!(s, VoiceStatus::Error(_)),
+                true,
+            ),
+            (
+                "future_timer_preserved",
+                false,
+                false,
+                VoiceStatus::Error("test error".to_string()),
+                |s| matches!(s, VoiceStatus::Error(_)),
+                false,
+            ),
+        ];
 
-        set_status(VoiceStatus::Error("test error".to_string()));
+        for (name, timer_elapsed, is_recording, initial, expect, timer_cleared) in cases {
+            let mut ctx = PipelineCtx::new();
+            ctx.is_recording = is_recording;
+            ctx.refractory_until = Some(if timer_elapsed {
+                Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("1s in the past should not underflow")
+            } else {
+                Instant::now()
+                    .checked_add(Duration::from_secs(60))
+                    .expect("60s in the future should not overflow")
+            });
 
-        ctx.check_refractory_period();
+            set_status(initial); // re-establish per-iteration global state
 
-        assert!(matches!(get_status(), VoiceStatus::Listening));
-        assert!(ctx.refractory_until.is_none());
-    }
+            ctx.check_refractory_period();
 
-    #[test]
-    #[serial_test::serial(voice)]
-    fn refractory_does_not_transition_if_not_error() {
-        let _ = init_global();
-
-        let mut ctx = PipelineCtx::new();
-        ctx.is_recording = false;
-        ctx.refractory_until = Some(
-            Instant::now()
-                .checked_sub(Duration::from_secs(1))
-                .expect("1s in the past should not underflow"),
-        );
-
-        set_status(VoiceStatus::Disabled);
-
-        ctx.check_refractory_period();
-
-        // Status unchanged — not Error, so no transition.
-        assert!(matches!(get_status(), VoiceStatus::Disabled));
-        // Timer still cleared (the timer itself is session-level, not
-        // status-dependent — always cleared when elapsed).
-        assert!(ctx.refractory_until.is_none());
-    }
-
-    #[test]
-    #[serial_test::serial(voice)]
-    fn refractory_does_not_transition_while_recording() {
-        let _ = init_global();
-
-        let mut ctx = PipelineCtx::new();
-        ctx.is_recording = true; // still recording
-        ctx.refractory_until = Some(
-            Instant::now()
-                .checked_sub(Duration::from_secs(1))
-                .expect("1s in the past should not underflow"),
-        );
-
-        set_status(VoiceStatus::Error("test error".to_string()));
-
-        ctx.check_refractory_period();
-
-        // Still Error because is_recording is true.
-        assert!(matches!(get_status(), VoiceStatus::Error(..)));
-        assert!(ctx.refractory_until.is_none());
-    }
-
-    #[test]
-    #[serial_test::serial(voice)]
-    fn refractory_future_timer_does_not_transition() {
-        let _ = init_global();
-
-        let mut ctx = PipelineCtx::new();
-        ctx.is_recording = false;
-        ctx.refractory_until = Some(
-            Instant::now()
-                .checked_add(Duration::from_secs(60))
-                .expect("60s in the future should not overflow"),
-        );
-
-        set_status(VoiceStatus::Error("test error".to_string()));
-
-        ctx.check_refractory_period();
-
-        // Timer hasn't elapsed yet — still Error and timer preserved.
-        assert!(matches!(get_status(), VoiceStatus::Error(..)));
-        assert!(ctx.refractory_until.is_some());
+            assert!(
+                expect(&get_status()),
+                "case {name}: unexpected status after refractory check",
+            );
+            assert_eq!(
+                ctx.refractory_until.is_none(),
+                timer_cleared,
+                "case {name}: refractory timer state",
+            );
+        }
     }
 
     // ── Mic-button (manual) recording state-machine tests ──────────────
@@ -8860,54 +8849,29 @@ mod tests {
     // global voice state.
 
     #[test]
-    fn rate_limit_no_prior_error_allows_message() {
-        let ctx = PipelineCtx::new();
-        // last_error_message_time is None → should always send.
-        assert!(ctx.should_send_error_message());
-    }
+    fn rate_limit_error_message_table() {
+        // (case, seconds since last error, expected send decision)
+        let cases = [
+            ("no_prior_error", None, true),
+            ("recent_error", Some(0), false),
+            ("old_error_15s", Some(15), true),
+            ("exact_threshold_10s", Some(10), true),
+            ("just_below_9s", Some(9), false),
+        ];
 
-    #[test]
-    fn rate_limit_recent_error_suppresses_message() {
-        let mut ctx = PipelineCtx::new();
-        ctx.last_error_message_time = Some(Instant::now());
-        // Just sent one → should suppress (< 10s elapsed).
-        assert!(!ctx.should_send_error_message());
-    }
-
-    #[test]
-    fn rate_limit_old_error_allows_message() {
-        let mut ctx = PipelineCtx::new();
-        ctx.last_error_message_time = Some(
-            Instant::now()
-                .checked_sub(Duration::from_secs(15))
-                .expect("15s in the past should not underflow"),
-        );
-        // 15s > 10s threshold → should send.
-        assert!(ctx.should_send_error_message());
-    }
-
-    #[test]
-    fn rate_limit_exact_threshold_allows_message() {
-        let mut ctx = PipelineCtx::new();
-        ctx.last_error_message_time = Some(
-            Instant::now()
-                .checked_sub(Duration::from_secs(10))
-                .expect("10s in the past should not underflow"),
-        );
-        // ≥ 10s is the threshold — exactly at the boundary should send.
-        assert!(ctx.should_send_error_message());
-    }
-
-    #[test]
-    fn rate_limit_just_below_threshold_suppresses_message() {
-        let mut ctx = PipelineCtx::new();
-        ctx.last_error_message_time = Some(
-            Instant::now()
-                .checked_sub(Duration::from_secs(9))
-                .expect("9s in the past should not underflow"),
-        );
-        // 9s < 10s threshold → should suppress.
-        assert!(!ctx.should_send_error_message());
+        for (name, elapsed_secs, expected) in cases {
+            let mut ctx = PipelineCtx::new();
+            ctx.last_error_message_time = elapsed_secs.map(|secs| {
+                Instant::now()
+                    .checked_sub(Duration::from_secs(secs))
+                    .expect("elapsed seconds in the past should not underflow")
+            });
+            assert_eq!(
+                ctx.should_send_error_message(),
+                expected,
+                "case {name}: 10s error-message rate limit",
+            );
+        }
     }
 
     #[test]
@@ -8928,21 +8892,13 @@ mod tests {
     // Covers bootstrap phase, mean/std computation, all safeguards, and reset.
 
     #[test]
-    fn adaptive_bootstrap_returns_none() {
+    fn adaptive_after_bootstrap_returns_some() {
         let mut state = AdaptiveThresholdState::new();
         for i in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             assert!(
                 state.feed(0.5, ADAPTIVE_K_DEFAULT).is_none(),
                 "frame {i} should return None during bootstrap",
             );
-        }
-    }
-
-    #[test]
-    fn adaptive_after_bootstrap_returns_some() {
-        let mut state = AdaptiveThresholdState::new();
-        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            assert!(state.feed(0.5, ADAPTIVE_K_DEFAULT).is_none());
         }
         let result = state.feed(0.5, ADAPTIVE_K_DEFAULT);
         assert!(result.is_some(), "should return Some after bootstrap");
@@ -9067,7 +9023,7 @@ mod tests {
     // threshold correctness, and the no-mutation invariant.
 
     #[test]
-    fn adaptive_peek_bootstrap_returns_none() {
+    fn adaptive_peek_bootstrap_boundary_and_safe_harbor() {
         // peek() should return None during bootstrap, just like feed().
         // On the last bootstrap frame, feed() increments bootstrap_count
         // past the threshold, so peek() returns Some (bootstrap done).
@@ -9093,25 +9049,18 @@ mod tests {
             state.peek(ADAPTIVE_K_DEFAULT).is_some(),
             "peek should return Some after bootstrap is complete",
         );
-    }
 
-    #[test]
-    fn adaptive_peek_after_bootstrap_returns_some() {
-        // After bootstrap completes, peek() should return a threshold.
+        // After bootstrap completes, peek() returns a threshold.  Use low
+        // scores (0.1) so the computed adaptive value (~0.3) stays below the
+        // safe harbor (2.13), verifying that peek() produces a clamped
+        // threshold rather than a raw adaptive value.
         let mut state = AdaptiveThresholdState::new();
-        // Use low scores (0.1) so the computed adaptive value (~0.3) stays
-        // below the safe harbor (2.13), verifying that peek() produces a
-        // clamped threshold rather than a raw adaptive value.
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             state.feed(0.1, ADAPTIVE_K_DEFAULT);
         }
-        let peek_result = state.peek(ADAPTIVE_K_DEFAULT);
-        assert!(
-            peek_result.is_some(),
-            "peek should return Some after bootstrap",
-        );
-        // The threshold should equal the safe harbor (constant low-variance input).
-        let threshold = peek_result.unwrap();
+        let threshold = state
+            .peek(ADAPTIVE_K_DEFAULT)
+            .expect("peek should return Some after bootstrap");
         assert!(
             (threshold - ADAPTIVE_SAFE_HARBOR).abs() < 0.01,
             "peek threshold {threshold} should equal safe harbor {} with constant low input",
@@ -9257,119 +9206,51 @@ mod tests {
     }
 
     #[test]
-    fn score_single_1_embedding_tiles_to_nonzero() {
-        // When the ring has only 1 embedding after push, the tiling fallback
-        // should produce a non-zero score (replaces the old hard-coded 0.0).
-        let classifier = classifier_always_half();
-        let embedding = vec![0.5; EMBEDDING_DIM];
-        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
-        let mut score_window = Vec::new();
+    fn score_single_ring_sizes_tile_to_nonzero() {
+        // Ring sizes below WINDOW_SIZE (3) exercise the repeat-last tiling
+        // fallback (replacing the old hard-coded 0.0); at WINDOW_SIZE the
+        // natural sliding window is used.  The always-half classifier gives
+        // ~0.5 per frame, so the rolling sum 0.5×n stays below the match
+        // threshold (2.13) and detection never fires.
+        for ring_size in 1..=wake_word_classifier::WINDOW_SIZE {
+            let classifier = classifier_always_half();
+            let emb = vec![0.5; EMBEDDING_DIM];
+            let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
+            let mut score_window = Vec::new();
 
-        let (detected, _, _, _) = score_single_embedding(
-            &embedding,
-            &mut ring,
-            Some(&classifier),
-            &mut score_window,
-            None,
-            ADAPTIVE_K_DEFAULT,
-            false,
-        );
-
-        // Score is ~0.5 ≥ NO_MATCH_RESET_THRESHOLD (0.316) → window appended.
-        // Rolling sum 0.5 < match_threshold (2.13) → detection does NOT fire.
-        assert!(
-            !detected,
-            "single embedding should not trigger detection (rolling sum < threshold)",
-        );
-        assert!(
-            !score_window.is_empty(),
-            "tiling should produce a score above NO_MATCH_RESET_THRESHOLD (0.316), giving a non-empty score window",
-        );
-
-        let score = score_window[0];
-        assert!(
-            (score - 0.5).abs() < 0.01,
-            "Expected score ~0.5 from always-half classifier, got {score}",
-        );
-        assert_eq!(ring.len(), 1, "ring should hold exactly 1 embedding");
-    }
-
-    #[test]
-    fn score_single_2_embeddings_tiles_to_nonzero() {
-        // With 2 embeddings in the ring, the tiling fallback should also
-        // produce a non-zero score (repeat-last: [a, b, b]).
-        let classifier = classifier_always_half();
-        let emb = vec![0.5; EMBEDDING_DIM];
-        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
-        let mut score_window = Vec::new();
-
-        // First embedding: ring = [a], tiled to [a, a, a] → score ~0.5.
-        let (_detected, _, _, _) = score_single_embedding(
-            &emb,
-            &mut ring,
-            Some(&classifier),
-            &mut score_window,
-            None,
-            ADAPTIVE_K_DEFAULT,
-            false,
-        );
-        assert!(
-            !score_window.is_empty(),
-            "first embedding should produce a score"
-        );
-        assert_eq!(
-            ring.len(),
-            1,
-            "ring should have 1 embedding after first push"
-        );
-
-        // Second embedding: ring = [a, b], tiled to [a, b, b] → score ~0.5.
-        score_window.clear();
-        let (detected, _, _, _) = score_single_embedding(
-            &emb,
-            &mut ring,
-            Some(&classifier),
-            &mut score_window,
-            None,
-            ADAPTIVE_K_DEFAULT,
-            false,
-        );
-        assert!(
-            !detected,
-            "two embeddings should not trigger detection (rolling sum < 2.13)",
-        );
-        assert!(
-            !score_window.is_empty(),
-            "second embedding tiling should produce a score above NO_MATCH_RESET_THRESHOLD (0.316)",
-        );
-        assert_eq!(ring.len(), 2, "ring should have 2 embeddings");
-    }
-
-    #[test]
-    fn score_single_3_embeddings_uses_natural_window() {
-        // With 3+ embeddings, the natural sliding window is used (no tiling).
-        let classifier = classifier_always_half();
-        let emb = vec![0.5; EMBEDDING_DIM];
-        let mut ring = Vec::with_capacity(EMBEDDING_RING_MAX);
-        let mut score_window = Vec::new();
-
-        for _ in 0..3 {
-            let _ = score_single_embedding(
-                &emb,
-                &mut ring,
-                Some(&classifier),
-                &mut score_window,
-                None,
-                ADAPTIVE_K_DEFAULT,
-                false,
-            );
+            for push in 0..ring_size {
+                let (detected, _, _, _) = score_single_embedding(
+                    &emb,
+                    &mut ring,
+                    Some(&classifier),
+                    &mut score_window,
+                    None,
+                    ADAPTIVE_K_DEFAULT,
+                    false,
+                );
+                // Every push appends a ~0.5 score (tiled or natural) without
+                // triggering detection (rolling sum < threshold).
+                assert!(
+                    !detected,
+                    "ring size {ring_size}, push {push}: should not trigger detection",
+                );
+                assert!(
+                    !score_window.is_empty(),
+                    "ring size {ring_size}, push {push}: should produce a score",
+                );
+                let score = *score_window.last().unwrap();
+                assert!(
+                    (score - 0.5).abs() < 0.01,
+                    "ring size {ring_size}, push {push}: expected score ~0.5, got {score}",
+                );
+                assert_eq!(
+                    ring.len(),
+                    push + 1,
+                    "ring size {ring_size}, push {push}: ring should hold exactly {} embeddings",
+                    push + 1,
+                );
+            }
         }
-
-        assert!(
-            !score_window.is_empty(),
-            "three embeddings should produce a score",
-        );
-        assert!(ring.len() >= 3, "ring should have ≥3 embeddings");
     }
 
     #[test]
@@ -11302,10 +11183,16 @@ mod tests {
     /// Serialises eviction tests that mutate global CONFIG.
     static EVICTION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Write synthetic PCM data to a cache path and return its size.
-    fn write_test_pcm(path: &Path) -> u64 {
+    /// Write synthetic PCM data (16 KB) to `path` and optionally backdate its
+    /// mtime by `age` (None = leave current).  Returns the entry size.
+    fn seed_test_pcm(path: &Path, age: Option<Duration>) -> u64 {
         let samples: Vec<f32> = vec![0.0; 4096]; // 16 KB
         write_pcm_cache(path, &samples);
+        if let Some(age) = age {
+            let mtime = std::time::SystemTime::now() - age;
+            let times = std::fs::FileTimes::new().set_modified(mtime);
+            let _ = std::fs::File::open(path).and_then(|f| f.set_times(times));
+        }
         std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
     }
 
@@ -11346,13 +11233,10 @@ mod tests {
         assert!(tmp_path.exists());
 
         // Create enough old non-tmp entries that age-based eviction runs
-        let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400);
+        let old_age = Duration::from_secs(2 * 86400);
         for i in 0..3u8 {
             let name = format!("{:064x}", i);
-            let path = tmp.path().join(&name);
-            write_test_pcm(&path);
-            let times = std::fs::FileTimes::new().set_modified(old_mtime);
-            let _ = std::fs::File::open(&path).and_then(|f| f.set_times(times));
+            seed_test_pcm(&tmp.path().join(&name), Some(old_age));
         }
 
         // age = 1 day triggers eviction of the old entries; .tmp file must survive
@@ -11374,14 +11258,11 @@ mod tests {
 
         // Create a "recent" entry
         let recent_path = tmp.path().join("a".repeat(64));
-        write_test_pcm(&recent_path);
+        seed_test_pcm(&recent_path, None);
 
-        // Create an "old" entry by writing and then setting mtime far in the past
+        // Create an "old" entry by backdating its mtime far in the past
         let old_path = tmp.path().join("b".repeat(64));
-        write_test_pcm(&old_path);
-        let two_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400);
-        let times = std::fs::FileTimes::new().set_modified(two_days_ago);
-        let _ = std::fs::File::open(&old_path).and_then(|f| f.set_times(times));
+        seed_test_pcm(&old_path, Some(Duration::from_secs(2 * 86400)));
 
         assert!(recent_path.exists());
         assert!(old_path.exists());
@@ -11402,11 +11283,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
 
         let path = tmp.path().join("a".repeat(64));
-        write_test_pcm(&path);
         // Set mtime to 2 days ago
-        let two_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400);
-        let times = std::fs::FileTimes::new().set_modified(two_days_ago);
-        let _ = std::fs::File::open(&path).and_then(|f| f.set_times(times));
+        seed_test_pcm(&path, Some(Duration::from_secs(2 * 86400)));
 
         // age = 0 means disabled — even old entries should survive
         let _guard = EvictionConfigGuard::set("0", "0"); // both disabled
@@ -11424,8 +11302,7 @@ mod tests {
         // Create several entries totalling ~48 KB
         for i in 0..3u8 {
             let name = format!("{:064x}", i);
-            let path = tmp.path().join(&name);
-            write_test_pcm(&path);
+            seed_test_pcm(&tmp.path().join(&name), None);
         }
 
         // size = 0 means disabled — all entries survive regardless of total size
@@ -11447,8 +11324,7 @@ mod tests {
         // Create 3 entries totalling ~48 KB
         for i in 0..3u8 {
             let name = format!("{:064x}", i);
-            let path = tmp.path().join(&name);
-            write_test_pcm(&path);
+            seed_test_pcm(&tmp.path().join(&name), None);
         }
 
         // Default max size (100 MB) is well above 48 KB — all entries survive.
@@ -11472,14 +11348,12 @@ mod tests {
         let count = 68;
         for i in 0..count {
             let name = format!("{:064x}", i);
-            let path = tmp.path().join(&name);
-            write_test_pcm(&path);
             // Stagger mtime: entry 0 is oldest (67 hours ago), entry 67 is newest
             let age_hours = (count - 1 - i) as u64;
-            let mtime =
-                std::time::SystemTime::now() - std::time::Duration::from_secs(age_hours * 3600);
-            let times = std::fs::FileTimes::new().set_modified(mtime);
-            let _ = std::fs::File::open(&path).and_then(|f| f.set_times(times));
+            seed_test_pcm(
+                &tmp.path().join(&name),
+                Some(Duration::from_secs(age_hours * 3600)),
+            );
         }
 
         // Max size = 1 MB, age disabled
@@ -11516,27 +11390,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
 
         // Create 5 old entries (2 days old — stale)
-        let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400);
+        let old_age = Duration::from_secs(2 * 86400);
         for i in 0..5u8 {
             let name = format!("old_{:064x}", i);
-            let path = tmp.path().join(&name);
-            write_test_pcm(&path);
-            let times = std::fs::FileTimes::new().set_modified(old_mtime);
-            let _ = std::fs::File::open(&path).and_then(|f| f.set_times(times));
+            seed_test_pcm(&tmp.path().join(&name), Some(old_age));
         }
 
         // Create 68 recent entries (~16 KB each, totalling ~1088 KB).
         // All within the last hour so the 1-day age limit does NOT touch them.
         for i in 0..68u8 {
             let name = format!("recent_{:064x}", i);
-            let path = tmp.path().join(&name);
-            write_test_pcm(&path);
             // Stagger mtime from 0 to 67 minutes ago (all well under 1 day)
             let age_minutes = (67 - i) as u64;
-            let mtime =
-                std::time::SystemTime::now() - std::time::Duration::from_secs(age_minutes * 60);
-            let times = std::fs::FileTimes::new().set_modified(mtime);
-            let _ = std::fs::File::open(&path).and_then(|f| f.set_times(times));
+            seed_test_pcm(
+                &tmp.path().join(&name),
+                Some(Duration::from_secs(age_minutes * 60)),
+            );
         }
 
         // Age = 1 day, size = 1 MB — both limits active
@@ -12010,7 +11879,7 @@ mod tests {
     fn pcm_cache_read_normal_returns_some() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("a".repeat(64));
-        write_test_pcm(&path);
+        seed_test_pcm(&path, None);
         assert!(path.exists());
 
         let result = read_pcm_cache(&path);
