@@ -30,6 +30,11 @@ wal-repro = []
 # external sqlite3 closing a live multiprocess-wal db truncates the -wal and
 # strands the -tshm index (class-A incident escalation artifact).
 wal-orphan-repro = []
+# Gates the macOS fcntl lock-drop repro harness (benches/lock_drop_repro.rs):
+# POSIX F_SETLK process-scoped .tshm byte locks are released by an unrelated
+# close on macOS; the two-process harness demonstrates the drop and the
+# resulting reader-slot panic (class-C escalation artifact).
+lock-drop-repro = []
 # Gates the grep-engine subprocess end-to-end harness (benches/grep_engine_e2e.rs):
 # the parent rewrites commands and spawns `sh -c` with the bench binary acting as
 # the hidden engine subcommand, then diffs against the real system grep.
@@ -202,6 +207,11 @@ required-features = ["wal-repro"]
 name = "wal_orphan_repro"
 harness = false
 required-features = ["wal-orphan-repro"]
+
+[[bench]]
+name = "lock_drop_repro"
+harness = false
+required-features = ["lock-drop-repro"]
 
 [[bench]]
 name = "grep_engine_e2e"
