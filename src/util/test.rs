@@ -213,6 +213,37 @@ pub(crate) fn install_fake_provider(provider: Arc<dyn crate::Provider>) -> FakeP
     FakeProviderGuard { previous }
 }
 
+/// Install a caller-owned logs store for `record_llm_*` stat writes for the
+/// duration of the returned guard (mirrors [`install_fake_provider`]).
+///
+/// The boot `LOG_STORE` is a process-global `OnceCell` set by `init_tracing`,
+/// which tests never run — so stat recording is normally a silent no-op.
+/// This seam redirects it to a test store so end-to-end tests can assert on
+/// the recorded rows.
+///
+/// While the guard is alive the redirect is PROCESS-GLOBAL: every
+/// `record_llm_*` write in any concurrently-running test lands in this store.
+/// Callers must hold [`retry_tests_lock()`] for the duration (same convention
+/// as [`install_fake_provider`]) and filter queries by a test-unique
+/// `agent_id` — otherwise writes leak across tests.
+pub(crate) fn install_test_log_store(store: crate::logs::LogStore) -> TestLogStoreGuard {
+    let previous = crate::stats::swap_test_log_store(Some(store));
+    TestLogStoreGuard { previous }
+}
+
+/// RAII guard restoring the previous test log-store override on drop
+/// (including during a panic), so it never leaks into other tests.
+#[must_use]
+pub(crate) struct TestLogStoreGuard {
+    previous: Option<crate::logs::LogStore>,
+}
+
+impl Drop for TestLogStoreGuard {
+    fn drop(&mut self) {
+        crate::stats::swap_test_log_store(self.previous.take());
+    }
+}
+
 /// RAII guard that restores an environment variable to its original value
 /// on drop, including during a panic (unwind safety).
 ///

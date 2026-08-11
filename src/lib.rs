@@ -1278,6 +1278,10 @@ pub(crate) struct ProviderUsage {
     /// Prompt tokens not served from cache (prompt_tokens − cached when the
     /// provider reports only the hit side).
     pub cache_miss_tokens: Option<u64>,
+    /// Billed cost from `usage.cost` — the invoice amount (OpenRouter-only).
+    pub cost: Option<f64>,
+    /// Raw provider `usage.cost_details` breakdown (reference only).
+    pub cost_details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1288,6 +1292,11 @@ pub(crate) struct ChatResponse {
     pub reasoning: Option<Reasoning>,
     /// `choices[0].finish_reason` from the provider envelope (stop/length/tool_calls/…).
     pub finish_reason: Option<String>,
+    /// Serving upstream provider — top-level OpenRouter response field
+    /// (empirical, undocumented in the API reference); NULL when omitted.
+    pub upstream_provider: Option<String>,
+    /// Provider `system_fingerprint` (eviction/backend-switch attribution).
+    pub system_fingerprint: Option<String>,
 }
 
 impl ChatResponse {

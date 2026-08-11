@@ -61,6 +61,18 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
         extraction_history.push(ChatMessage::user(extraction_prompt));
     }
 
+    // Single source of truth for the forced flag: the per-attempt wire
+    // request derives from record_request, so the recorded flag can never
+    // diverge from the bytes actually sent. Only the flag/telemetry fields
+    // are read from it — messages/allow_image_parts are set per attempt
+    // (messages emptied here so the per-attempt spread doesn't clone the
+    // caller's history; the one-time params.clone() below is that cost).
+    let record_request = ChatRequest {
+        response_format_json_object: true,
+        messages: vec![],
+        ..params.clone()
+    };
+
     let retry_prompt = load_prompt("extraction/retry.md");
     let policy = policy_override
         .cloned()
@@ -75,7 +87,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                 FailureClass::WallClockExceeded,
                 last_raw,
             );
-            crate::stats::record_llm_failure(params, operation_started, &exhausted).await;
+            crate::stats::record_llm_failure(&record_request, operation_started, &exhausted).await;
             return Err(exhausted);
         }
 
@@ -83,8 +95,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
         let request = ChatRequest {
             messages: extraction_history.clone(),
             allow_image_parts: false, // extractions never need image parts
-            response_format_json_object: true,
-            ..params.clone()
+            ..record_request.clone()
         };
 
         match crate::providers::chat_scoped(request, policy.idle_timeout, loop_state.deadline())
@@ -108,7 +119,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                                 )
                             } else {
                                 crate::stats::record_llm_success(
-                                    params,
+                                    &record_request,
                                     operation_started,
                                     attempt,
                                     &response,
@@ -161,7 +172,12 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                         scoped_err.class,
                         last_raw,
                     );
-                    crate::stats::record_llm_failure(params, operation_started, &exhausted).await;
+                    crate::stats::record_llm_failure(
+                        &record_request,
+                        operation_started,
+                        &exhausted,
+                    )
+                    .await;
                     return Err(exhausted);
                 }
             }
@@ -173,7 +189,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                 class,
                 last_raw,
             );
-            crate::stats::record_llm_failure(params, operation_started, &exhausted).await;
+            crate::stats::record_llm_failure(&record_request, operation_started, &exhausted).await;
             return Err(exhausted);
         }
     }
@@ -186,7 +202,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
         final_class,
         last_raw,
     );
-    crate::stats::record_llm_failure(params, operation_started, &exhausted).await;
+    crate::stats::record_llm_failure(&record_request, operation_started, &exhausted).await;
     Err(exhausted)
 }
 
@@ -493,5 +509,94 @@ mod tests {
             failure.failures.len() <= 2,
             "cap must stop the loop before 7 attempts"
         );
+    }
+
+    /// End-to-end regression guard for the response_format flag: the caller's
+    /// base params carry `false`, but the recorded `llm_requests` rows must
+    /// carry the wire-forced `1`. Catches a call site reverting to recording
+    /// the base params even though the wire bytes are right.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    async fn extraction_rows_record_wire_forced_response_format() {
+        let _guard = retry_tests_lock();
+        let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
+        let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
+        let _store_guard = crate::util::test::install_test_log_store(store.clone());
+        // Base params: flag false + meta set so the extraction path records
+        // rows (meta-less requests are skipped by design).
+        let params = ChatRequest {
+            response_format_json_object: false,
+            meta: Some(crate::ChatRequestMeta {
+                purpose: "extraction",
+                agent_id: "extraction-flag-test".to_string(),
+                role: "reviewer".to_string(),
+                workspace: "ws1".to_string(),
+                ticket_id: None,
+            }),
+            ..test_params()
+        };
+        // Success path: recorded row must carry response_format = 1 — the
+        // wire-forced flag, never the caller's base false.
+        let fake = Arc::new(FakeProvider::new().ok(r#"{"score": 8}"#));
+        let provider: Arc<dyn crate::Provider> = fake.clone();
+        let _fake_guard = install_fake_provider(provider);
+        let result = retry_extract_structured_scoped::<FakeVerdict>(
+            &history(),
+            "return JSON verdict",
+            &params,
+            Some(&score_validator),
+            None,
+        )
+        .await;
+        assert_eq!(result.expect("extraction succeeds").score, 8);
+        // Failure path (all attempts die): row keeps the flag, cost/provider
+        // stay NULL — no envelope to read them from.
+        let fake = Arc::new(
+            FakeProvider::new()
+                .err(crate::retry::FailureClass::Transport, "always down")
+                .err(crate::retry::FailureClass::Transport, "always down")
+                .err(crate::retry::FailureClass::Transport, "always down"),
+        );
+        let provider: Arc<dyn crate::Provider> = fake.clone();
+        let _fake_guard = install_fake_provider(provider);
+        let result = retry_extract_structured_scoped::<FakeVerdict>(
+            &history(),
+            "return JSON verdict",
+            &params,
+            Some(&score_validator),
+            None,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "all-attempt failure must not produce a verdict"
+        );
+        let rows = store
+            .conn
+            .query(
+                "SELECT response_format, cost, upstream_provider, success \
+                 FROM llm_requests WHERE agent_id = ?1 ORDER BY rowid",
+                crate::turso::params!["extraction-flag-test"],
+            )
+            .await
+            .expect("query recorded rows");
+        let mut rows = rows.into_iter();
+        let success = rows.next().expect("success row must exist");
+        assert_eq!(success.get::<i64>(0).expect("response_format"), 1);
+        assert_eq!(success.get::<i64>(3).expect("success"), 1);
+        let failure = rows.next().expect("failure row must exist");
+        assert_eq!(failure.get::<i64>(0).expect("response_format"), 1);
+        assert_eq!(failure.get::<i64>(3).expect("success"), 0);
+        assert_eq!(
+            failure.get::<Option<f64>>(1).expect("cost"),
+            None,
+            "no envelope on failure path — cost must stay NULL"
+        );
+        assert_eq!(
+            failure.get::<Option<String>>(2).expect("upstream_provider"),
+            None,
+            "no envelope on failure path — provider must stay NULL"
+        );
+        assert!(rows.next().is_none(), "exactly two rows");
     }
 }

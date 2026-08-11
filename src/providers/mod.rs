@@ -364,10 +364,11 @@ pub(crate) fn restore_provider_for_test(previous: Option<Arc<dyn Provider>>) {
 
 /// Create a resilient OpenAI-compatible provider from flat config.
 ///
-/// When `provider_endpoint` is unset, defaults to [OpenRouter](https://openrouter.ai)
-/// and sets OpenRouter-specific headers (`X-Title`, `HTTP-Referrer`). A non-empty
-/// `provider_endpoint` overrides the base URL — the same headers are still sent (most
-/// providers ignore them harmlessly).
+/// Identity headers (`X-Title`, `HTTP-Referrer`) are sent unconditionally
+/// (most providers ignore them harmlessly). Upstream-provider attribution
+/// needs no request-side opt-in: OpenRouter's top-level `provider` response
+/// field (undocumented in the API reference but consumed by OpenRouter's
+/// own SDK) carries it.
 ///
 /// Returns an [`OpenAiCompatibleProvider`]; retry orchestration lives in
 /// [`crate::retry`].
@@ -382,15 +383,14 @@ pub(crate) fn create_provider(
         .and_then(trimmed_or_none)
         .unwrap_or(crate::config::DEFAULT_PROVIDER_ENDPOINT.to_string());
 
-    let mut extra_headers = std::collections::HashMap::new();
-    extra_headers.insert("X-Title".to_string(), "MahBot".to_string());
-    extra_headers.insert(
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("X-Title".to_string(), "MahBot".to_string());
+    headers.insert(
         "HTTP-Referrer".to_string(),
         "https://github.com/edezhic".to_string(),
     );
-
     let base = OpenAiCompatibleProvider::new("OpenRouter", base_url.as_str(), resolved_key)
-        .with_extra_headers(extra_headers);
+        .with_extra_headers(headers);
 
     Ok(Box::new(base))
 }

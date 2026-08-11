@@ -161,7 +161,20 @@ CREATE TABLE IF NOT EXISTS llm_requests (
     retry_attempts      INTEGER NOT NULL,
     finish_reason       TEXT,
     failure_class       TEXT,
-    success             INTEGER NOT NULL DEFAULT 1
+    success             INTEGER NOT NULL DEFAULT 1,
+    -- Observability additions: billed cost (the invoice amount), raw
+    -- cost_details, serving upstream provider, system_fingerprint,
+    -- and the response_format flag. All telemetry fields are parsed
+    -- generically from the response envelope, so cost/upstream_provider/
+    -- system_fingerprint are NULL on failures and whenever the provider
+    -- omits them. response_format is always set.
+    -- Existing rows keep NULL (or response_format 0) via
+    -- `migrate_llm_requests_columns` (append-only).
+    cost                REAL,
+    cost_details        TEXT,
+    upstream_provider   TEXT,
+    system_fingerprint  TEXT,
+    response_format     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_llm_requests_recorded_at ON llm_requests(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_llm_requests_agent_id ON llm_requests(agent_id);
@@ -244,6 +257,11 @@ impl LogStore {
         migrate_verdict_scores_shape(&store.conn)
             .await
             .context("Failed to migrate verdict_scores shape")?;
+        // Guarded llm_requests column additions — append-only ALTERs for
+        // legacy stores; a fresh store already carries the columns.
+        migrate_llm_requests_columns(&store.conn)
+            .await
+            .context("Failed to migrate llm_requests columns")?;
         Ok(store)
     }
 
@@ -496,6 +514,36 @@ pub(crate) async fn migrate_verdict_scores_shape(conn: &turso::Connection) -> an
     )
     .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// Guarded append-only column additions for the `llm_requests` table
+/// (cost / cost_details / upstream_provider / system_fingerprint /
+/// response_format observability fields). `CREATE TABLE IF NOT EXISTS` does
+/// not add columns to existing stores, so legacy logs.db files are migrated
+/// here — idempotent via the `column_exists` guard, and additive: existing
+/// rows keep NULL (or the `response_format` default 0), never rewritten.
+///
+/// Historical note: pre-migration extraction rows record `response_format`
+/// 0 even though those requests forced `json_object` on the wire — the flag
+/// is unreliable over the pre-migration window by design (append-only).
+pub(crate) async fn migrate_llm_requests_columns(conn: &turso::Connection) -> anyhow::Result<()> {
+    for (column, ddl) in [
+        ("cost", "REAL"),
+        ("cost_details", "TEXT"),
+        ("upstream_provider", "TEXT"),
+        ("system_fingerprint", "TEXT"),
+        ("response_format", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !turso::column_exists(conn, "llm_requests", column).await? {
+            conn.execute(
+                &format!("ALTER TABLE llm_requests ADD COLUMN {column} {ddl}"),
+                (),
+            )
+            .await
+            .with_context(|| format!("Failed to add {column} column to llm_requests"))?;
+        }
+    }
     Ok(())
 }
 
@@ -1861,5 +1909,90 @@ mod tests {
             !quarantined.is_empty(),
             "unopenable store must be quarantined, found: {quarantined:?}"
         );
+    }
+
+    /// `migrate_llm_requests_columns` on a legacy-shaped store: additive,
+    /// preserves existing rows (append-only), and is idempotent.
+    #[tokio::test]
+    async fn migrate_llm_requests_columns_legacy_shape() {
+        let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
+        // Simulate a legacy store (pre-observability-fields): drop the new
+        // columns, seed a row.
+        for column in [
+            "cost",
+            "cost_details",
+            "upstream_provider",
+            "system_fingerprint",
+            "response_format",
+        ] {
+            store
+                .conn
+                .execute(
+                    &format!("ALTER TABLE llm_requests DROP COLUMN {column}"),
+                    (),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "INSERT INTO llm_requests \
+                 (recorded_at, purpose, agent_id, role, workspace, model, routing, \
+                  duration_ms, retry_attempts, success) \
+                 VALUES ('2026-01-01T00:00:00Z', 'agent', 'legacy', '', '', 'm', 'default', 1, 1, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+
+        crate::logs::migrate_llm_requests_columns(&store.conn)
+            .await
+            .expect("migration must succeed");
+
+        let cols = store
+            .conn
+            .query("PRAGMA table_info('llm_requests')", ())
+            .await
+            .unwrap();
+        let names: Vec<String> = cols.iter().map(|r| r.get::<String>(1).unwrap()).collect();
+        for column in [
+            "cost",
+            "cost_details",
+            "upstream_provider",
+            "system_fingerprint",
+            "response_format",
+        ] {
+            assert!(names.contains(&column.to_string()), "missing {column}");
+        }
+        // Old row survives with NULL new columns (append-only, no rewrite).
+        let row = store
+            .conn
+            .query(
+                "SELECT agent_id, cost, upstream_provider, response_format FROM llm_requests",
+                (),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("legacy row preserved");
+        assert_eq!(row.get::<String>(0).expect("agent_id"), "legacy");
+        assert_eq!(row.get::<Option<f64>>(1).expect("cost"), None);
+        assert_eq!(row.get::<Option<String>>(2).expect("provider"), None);
+        assert_eq!(row.get::<i64>(3).expect("response_format"), 0);
+        // Idempotent — a second run no-ops.
+        crate::logs::migrate_llm_requests_columns(&store.conn)
+            .await
+            .expect("second migration run must no-op");
+        let row = store
+            .conn
+            .query("SELECT agent_id FROM llm_requests", ())
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("row still there");
+        assert_eq!(row.get::<String>(0).expect("agent_id"), "legacy");
     }
 }

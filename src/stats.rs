@@ -219,8 +219,10 @@ impl crate::logs::LogStore {
                 "INSERT INTO llm_requests \
                  (recorded_at, purpose, agent_id, role, workspace, ticket_id, model, routing, \
                   input_tokens, output_tokens, cached_input_tokens, cache_miss_tokens, \
+                  cost, cost_details, upstream_provider, system_fingerprint, response_format, \
                   duration_ms, retry_attempts, finish_reason, failure_class, success) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
+                         ?17, ?18, ?19, ?20, ?21, ?22)",
                 turso::params![
                     rec.recorded_at.clone(),
                     rec.purpose,
@@ -234,6 +236,11 @@ impl crate::logs::LogStore {
                     rec.output_tokens.map(i64::try_from).transpose()?,
                     rec.cached_input_tokens.map(i64::try_from).transpose()?,
                     rec.cache_miss_tokens.map(i64::try_from).transpose()?,
+                    rec.cost,
+                    rec.cost_details.clone(),
+                    rec.upstream_provider.clone(),
+                    rec.system_fingerprint.clone(),
+                    i64::from(rec.response_format),
                     i64::try_from(rec.duration_ms)?,
                     i64::from(rec.retry_attempts),
                     rec.finish_reason.clone(),
@@ -286,13 +293,23 @@ pub(crate) struct LlmRequestRecord {
     pub ticket_id: Option<String>,
     pub model: String,
     /// Requested provider routing (provider_order); "default" when unset.
-    /// OpenRouter responses do not reveal the serving upstream, so only the
-    /// requested routing can be recorded.
+    /// Requested-vs-actual: the serving upstream is [`LlmRequestRecord::upstream_provider`].
     pub routing: String,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     pub cache_miss_tokens: Option<u64>,
+    /// Billed cost from `usage.cost` — the invoice amount; NULL on failures.
+    pub cost: Option<f64>,
+    /// Raw `usage.cost_details` JSON from the provider (reference only).
+    pub cost_details: Option<String>,
+    /// Serving upstream — top-level OpenRouter `provider` field (empirical,
+    /// undocumented in the API reference); NULL when the provider omits it.
+    pub upstream_provider: Option<String>,
+    /// Provider `system_fingerprint`; NULL when the provider omits it.
+    pub system_fingerprint: Option<String>,
+    /// Whether `response_format: json_object` was requested (always filled).
+    pub response_format: bool,
     pub duration_ms: u64,
     /// Total HTTP attempts made by the operation (1 = no retries).
     pub retry_attempts: u32,
@@ -322,22 +339,25 @@ pub(crate) struct ImageGenCallRecord {
     pub recorded_at: String,
 }
 
-/// Emit one per-operation LLM request stat row (best-effort, fail-open).
+/// Build an [`LlmRequestRecord`] from a request + optional response envelope.
+/// `None` when the request carries no metadata (context-free calls — test
+/// doubles, ad-hoc requests) — such rows are never recorded.
 ///
-/// Skips when the request carries no metadata (context-free calls — test
-/// doubles, ad-hoc requests) and when the logs store is not yet open.
-pub(crate) async fn record_llm_operation(
+/// Failure-path semantics: `upstream_provider` / `system_fingerprint` /
+/// `cost` / `cost_details` are only populated from a successful response
+/// envelope — failed requests have no response, so those columns stay NULL;
+/// `response_format` is always filled.
+fn llm_request_record(
     request: &crate::ChatRequest,
     duration_ms: u64,
     attempts: u32,
-    usage: Option<&crate::ProviderUsage>,
+    response: Option<&crate::ChatResponse>,
     finish_reason: Option<&str>,
     failure_class: Option<&'static str>,
-) {
-    let Some(meta) = request.meta.as_ref() else {
-        return;
-    };
-    let rec = LlmRequestRecord {
+) -> Option<LlmRequestRecord> {
+    let meta = request.meta.as_ref()?;
+    let usage = response.and_then(|r| r.usage.as_ref());
+    Some(LlmRequestRecord {
         purpose: meta.purpose,
         agent_id: meta.agent_id.clone(),
         role: meta.role.clone(),
@@ -353,14 +373,75 @@ pub(crate) async fn record_llm_operation(
         output_tokens: usage.and_then(|u| u.output_tokens),
         cached_input_tokens: usage.and_then(|u| u.cached_input_tokens),
         cache_miss_tokens: usage.and_then(|u| u.cache_miss_tokens),
+        cost: usage.and_then(|u| u.cost),
+        cost_details: usage
+            .and_then(|u| u.cost_details.as_ref())
+            .map(serde_json::Value::to_string),
+        upstream_provider: response.and_then(|r| r.upstream_provider.clone()),
+        system_fingerprint: response.and_then(|r| r.system_fingerprint.clone()),
+        response_format: request.response_format_json_object,
         duration_ms,
         retry_attempts: attempts,
         finish_reason: finish_reason.map(str::to_string),
         failure_class: failure_class.map(str::to_string),
         success: failure_class.is_none(),
         recorded_at: crate::turso::now(),
+    })
+}
+
+#[cfg(test)]
+static TEST_LOG_STORE: std::sync::RwLock<Option<crate::logs::LogStore>> =
+    std::sync::RwLock::new(None);
+
+/// Test seam: redirect `record_llm_*` writes to a caller-owned store for the
+/// duration of a test (mirrors `swap_provider_for_test`). Returns the previous
+/// override so a guard can restore it.
+#[cfg(test)]
+pub(crate) fn swap_test_log_store(
+    store: Option<crate::logs::LogStore>,
+) -> Option<crate::logs::LogStore> {
+    let mut guard = TEST_LOG_STORE.write().expect("test log store poisoned");
+    let previous = guard.take();
+    *guard = store;
+    previous
+}
+
+/// Resolve the logs store for stat writes: test override wins, else the global.
+fn log_store_for_stats() -> Option<crate::logs::LogStore> {
+    #[cfg(test)]
+    if let Some(store) = TEST_LOG_STORE
+        .read()
+        .expect("test log store poisoned")
+        .as_ref()
+    {
+        return Some(store.clone());
+    }
+    crate::logs::LOG_STORE.get().cloned()
+}
+
+/// Emit one per-operation LLM request stat row (best-effort, fail-open).
+///
+/// Skips when the request carries no metadata (context-free calls — test
+/// doubles, ad-hoc requests) and when the logs store is not yet open.
+pub(crate) async fn record_llm_operation(
+    request: &crate::ChatRequest,
+    duration_ms: u64,
+    attempts: u32,
+    response: Option<&crate::ChatResponse>,
+    finish_reason: Option<&str>,
+    failure_class: Option<&'static str>,
+) {
+    let Some(rec) = llm_request_record(
+        request,
+        duration_ms,
+        attempts,
+        response,
+        finish_reason,
+        failure_class,
+    ) else {
+        return;
     };
-    let Some(store) = crate::logs::LOG_STORE.get() else {
+    let Some(store) = log_store_for_stats() else {
         return;
     };
     if let Err(e) = store.record_llm_request(&rec).await {
@@ -380,7 +461,7 @@ pub(crate) async fn record_llm_success(
         request,
         started.elapsed().as_millis() as u64,
         attempt,
-        response.usage.as_ref(),
+        Some(response),
         response.finish_reason.as_deref(),
         None,
     )
@@ -799,6 +880,11 @@ mod tests {
             output_tokens: Some(200),
             cached_input_tokens: Some(600),
             cache_miss_tokens: Some(400),
+            cost: Some(0.0042),
+            cost_details: Some(r#"{"input":0.002,"output":0.0022}"#.to_string()),
+            upstream_provider: Some("DeepSeek".to_string()),
+            system_fingerprint: Some("fp_44709d6fcb".to_string()),
+            response_format: true,
             duration_ms: 1_234,
             retry_attempts: 2,
             finish_reason: Some("stop".to_string()),
@@ -817,7 +903,9 @@ mod tests {
             .query(
                 "SELECT purpose, agent_id, role, workspace, ticket_id, model, routing, \
                         input_tokens, output_tokens, cached_input_tokens, cache_miss_tokens, \
-                        duration_ms, retry_attempts, finish_reason, failure_class, success \
+                        cost, cost_details, upstream_provider, system_fingerprint, \
+                        response_format, duration_ms, retry_attempts, finish_reason, \
+                        failure_class, success \
                  FROM llm_requests WHERE agent_id = ?1",
                 crate::turso::params!["gui_alice_ws1_engineer"],
             )
@@ -845,14 +933,29 @@ mod tests {
         assert_eq!(row.get::<Option<i64>>(8).expect("output"), Some(200));
         assert_eq!(row.get::<Option<i64>>(9).expect("cached"), Some(600));
         assert_eq!(row.get::<Option<i64>>(10).expect("miss"), Some(400));
-        assert_eq!(row.get::<i64>(11).expect("duration"), 1_234);
-        assert_eq!(row.get::<i64>(12).expect("attempts"), 2);
+        let cost = row.get::<Option<f64>>(11).expect("cost");
+        assert!((cost.expect("cost value") - 0.0042).abs() < 1e-12);
         assert_eq!(
-            row.get::<Option<String>>(13).expect("finish"),
+            row.get::<Option<String>>(12).expect("cost_details"),
+            Some(r#"{"input":0.002,"output":0.0022}"#.to_string())
+        );
+        assert_eq!(
+            row.get::<Option<String>>(13).expect("upstream_provider"),
+            Some("DeepSeek".to_string())
+        );
+        assert_eq!(
+            row.get::<Option<String>>(14).expect("system_fingerprint"),
+            Some("fp_44709d6fcb".to_string())
+        );
+        assert_eq!(row.get::<i64>(15).expect("response_format"), 1);
+        assert_eq!(row.get::<i64>(16).expect("duration"), 1_234);
+        assert_eq!(row.get::<i64>(17).expect("attempts"), 2);
+        assert_eq!(
+            row.get::<Option<String>>(18).expect("finish"),
             Some("stop".to_string())
         );
-        assert_eq!(row.get::<Option<String>>(14).expect("failure_class"), None);
-        assert_eq!(row.get::<i64>(15).expect("success"), 1);
+        assert_eq!(row.get::<Option<String>>(19).expect("failure_class"), None);
+        assert_eq!(row.get::<i64>(20).expect("success"), 1);
         assert!(rows.next().is_none(), "only one row expected");
     }
 }

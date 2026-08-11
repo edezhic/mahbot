@@ -549,7 +549,10 @@ pub fn spawn_workspace_discovery(
             .await;
         };
 
-        spawn_panic_guarded(&ws_name, "spawn_workspace_discovery", inner).await;
+        // Box the discovery payload: it embeds role/general/diagnostics
+        // futures (incl. ChatResponse-sized structs) and exceeds the
+        // 16 KB large_futures threshold as an inline async-block.
+        spawn_panic_guarded(&ws_name, "spawn_workspace_discovery", Box::pin(inner)).await;
     });
 }
 

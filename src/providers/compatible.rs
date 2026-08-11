@@ -134,6 +134,17 @@ struct ApiChatResponse {
     choices: Vec<Choice>,
     #[serde(default)]
     usage: Option<UsageInfo>,
+    /// Telemetry fields below are permissive (`opt_field`): a present-but-
+    /// wrong-typed value yields NULL instead of failing the envelope parse —
+    /// telemetry must never break the request path.
+    #[serde(default, deserialize_with = "opt_field")]
+    system_fingerprint: Option<String>,
+    /// Serving upstream provider — OpenRouter's top-level response field
+    /// (undocumented in the API reference but consumed by OpenRouter's own
+    /// SDK; empirically present incl. cache hits, where `openrouter_metadata`
+    /// is stripped). NULL when the provider omits it.
+    #[serde(default, deserialize_with = "opt_field")]
+    provider: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +162,31 @@ struct UsageInfo {
     prompt_cache_hit_tokens: Option<u64>,
     #[serde(default)]
     prompt_cache_miss_tokens: Option<u64>,
+    /// Billed cost from `usage.cost` — the invoice amount (OpenRouter-only).
+    #[serde(default, deserialize_with = "opt_field")]
+    cost: Option<f64>,
+    /// Raw cost breakdown (OpenRouter only); any JSON value is accepted.
+    /// `opt_field`-protected: a pathological value (e.g. `1e999`, which
+    /// serde_json rejects as out of range) must not fail the envelope parse.
+    #[serde(default, deserialize_with = "opt_field")]
+    cost_details: Option<serde_json::Value>,
+}
+
+/// Permissive deserializer for optional telemetry fields: a present value of
+/// the wrong type (provider shape drift) yields `None` instead of failing the
+/// whole envelope parse. Missing and `null` also yield `None`.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "Result is the deserialize_with contract"
+)]
+fn opt_field<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    Ok(serde_json::Value::deserialize(de)
+        .ok()
+        .and_then(|v| serde_json::from_value(v).ok()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -607,10 +643,14 @@ fn normalize_cache_tokens(
 }
 
 impl OpenAiCompatibleProvider {
+    /// `finish_reason`, `upstream_provider`, `system_fingerprint` are three
+    /// consecutive `Option<String>`s — keep call sites in envelope order.
     fn parse_native_response(
         message: ResponseMessage,
         usage: Option<ProviderUsage>,
         finish_reason: Option<String>,
+        upstream_provider: Option<String>,
+        system_fingerprint: Option<String>,
     ) -> ProviderChatResponse {
         let text = message.effective_content_optional();
         let reasoning = Reasoning::from_optional_parts(
@@ -635,6 +675,8 @@ impl OpenAiCompatibleProvider {
             usage,
             reasoning,
             finish_reason,
+            upstream_provider,
+            system_fingerprint,
         }
     }
 
@@ -662,8 +704,11 @@ impl OpenAiCompatibleProvider {
                 output_tokens: u.completion_tokens,
                 cached_input_tokens: cached,
                 cache_miss_tokens: miss,
+                cost: u.cost,
+                cost_details: u.cost_details,
             }
         });
+        let upstream_provider = native_response.provider.clone();
         let choice = native_response
             .choices
             .into_iter()
@@ -672,7 +717,13 @@ impl OpenAiCompatibleProvider {
         let finish_reason = choice.finish_reason;
         let message = choice.message;
 
-        let result = Self::parse_native_response(message, usage, finish_reason);
+        let result = Self::parse_native_response(
+            message,
+            usage,
+            finish_reason,
+            upstream_provider,
+            native_response.system_fingerprint,
+        );
 
         if !result.tool_calls.is_empty() && result.reasoning.is_none() {
             tracing::debug!(
@@ -1289,7 +1340,8 @@ mod tests {
             reasoning_details: None,
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message, None, None);
+        let parsed =
+            OpenAiCompatibleProvider::parse_native_response(message, None, None, None, None);
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].id, "call_123");
         assert_eq!(parsed.tool_calls[0].name, "shell");
@@ -1666,6 +1718,112 @@ mod tests {
         assert!(resp.usage.is_none());
     }
 
+    #[test]
+    fn api_response_parses_cost_fingerprint_and_upstream_provider() {
+        // OpenRouter envelope with billed cost, system_fingerprint and the
+        // top-level serving provider.
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "provider": "DeepSeek",
+            "system_fingerprint": "fp_44709d6fcb",
+            "usage": {
+                "prompt_tokens": 150,
+                "completion_tokens": 60,
+                "cost": 0.0012,
+                "cost_details": {
+                    "upstream_inference_prompt_cost": 0.0008,
+                    "upstream_inference_completions_cost": 0.0004
+                }
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.system_fingerprint.as_deref(), Some("fp_44709d6fcb"));
+        assert_eq!(resp.provider.as_deref(), Some("DeepSeek"));
+        let usage = resp.usage.unwrap();
+        assert!((usage.cost.expect("cost") - 0.0012).abs() < 1e-12);
+        // Parse→re-serialize normalizes key order (BTreeMap) — the stored
+        // TEXT is reference-only; SQL slicing uses cost REAL.
+        assert_eq!(
+            usage.cost_details.as_ref().map(serde_json::Value::to_string),
+            Some(
+                r#"{"upstream_inference_completions_cost":0.0004,"upstream_inference_prompt_cost":0.0008}"#
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            usage
+                .cost_details
+                .expect("cost_details")
+                .pointer("/upstream_inference_prompt_cost")
+                .and_then(serde_json::Value::as_f64),
+            Some(0.0008)
+        );
+    }
+
+    #[test]
+    fn upstream_provider_present_on_cache_hit() {
+        // Cache hits strip openrouter_metadata, but the top-level `provider`
+        // field survives — the eviction/backend-switch rows this telemetry
+        // exists to attribute must not be NULL.
+        let json = r#"{
+            "choices": [{"message": {"content": "cached answer"}}],
+            "provider": "Friendli",
+            "system_fingerprint": "fp_44709d6fcb",
+            "usage": {
+                "prompt_tokens": 8,
+                "completion_tokens": 4,
+                "prompt_tokens_details": {"cached_tokens": 8},
+                "cost": 0.0001
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.provider.as_deref(), Some("Friendli"));
+        // Missing/absent provider stays None (NULL) — non-OpenRouter endpoints.
+        let resp: ApiChatResponse =
+            serde_json::from_str(r#"{"choices":[{"message":{"content":"x"}}]}"#).unwrap();
+        assert!(resp.provider.is_none());
+    }
+
+    #[test]
+    fn wrong_typed_telemetry_fields_do_not_break_envelope_parse() {
+        // Provider shape drift (system_fingerprint as number, cost as string,
+        // provider as number) must yield NULL — not a parse failure
+        // that would retry an otherwise-successful response.
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "provider": 42,
+            "system_fingerprint": 42,
+            "usage": {"cost": "not-a-number", "cost_details": [1, 2]}
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.system_fingerprint.is_none());
+        assert!(resp.provider.is_none());
+        let usage = resp.usage.unwrap();
+        assert!(usage.cost.is_none());
+        assert!(usage.cost_details.is_some(), "Value accepts any JSON");
+        // Missing fields stay None too.
+        let resp: ApiChatResponse =
+            serde_json::from_str(r#"{"choices":[{"message":{"content":"x"}}]}"#).unwrap();
+        assert!(resp.system_fingerprint.is_none());
+        assert!(resp.provider.is_none());
+        assert!(resp.usage.is_none());
+    }
+
+    #[test]
+    fn pathological_cost_details_number_does_not_break_envelope_parse() {
+        // serde_json rejects `1e999` as an out-of-range number — without the
+        // `opt_field` gate on cost_details this would fail the whole envelope
+        // parse and retry on byte-identical bytes.
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {"cost_details": {"upstream_inference_prompt_cost": 1e999}}
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap();
+        assert!(usage.cost_details.is_none());
+        assert!(usage.cost.is_none());
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // reasoning_content pass-through tests
     // ─────────────────────────────────────────────────────────────────────
@@ -1690,7 +1848,8 @@ mod tests {
             }]),
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message, None, None);
+        let parsed =
+            OpenAiCompatibleProvider::parse_native_response(message, None, None, None, None);
         let rc = parsed
             .reasoning
             .as_ref()
@@ -1710,7 +1869,8 @@ mod tests {
             tool_calls: None,
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message, None, None);
+        let parsed =
+            OpenAiCompatibleProvider::parse_native_response(message, None, None, None, None);
         assert!(parsed.reasoning.is_none());
         assert_eq!(parsed.text.as_deref(), Some("hello"));
     }
