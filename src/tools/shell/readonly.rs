@@ -3591,12 +3591,46 @@ enum RefOpt {
     Mutation,
 }
 
-/// `git branch` long options (git 2.50.1). Negated forms of value-taking
-/// options consume no value (verified: `--no-sort foo` creates `foo`), so
-/// they classify as [`RefOpt::Plain`] except the real `--no-merged`/
-/// `--no-contains` flags. The deprecated `--set-upstream` alias is covered by
-/// prefix-abbreviation to `--set-upstream-to` (git rejects it at runtime).
-const GIT_BRANCH_OPTS: &[(&str, RefOpt)] = &[
+/// Shared `git branch`/`git tag` long options (git 2.50.1). Negated forms of
+/// value-taking options consume no value (verified: `--no-sort foo` creates
+/// `foo`), so they classify as [`RefOpt::Plain`] except the real
+/// `--no-merged`/`--no-contains` flags. Emits ONE array per tool — resolving
+/// the common rows separately would change prefix-abbreviation (`git branch
+/// --no-m` must stay ambiguous via `--no-merged` + `--no-move`).
+macro_rules! git_ref_opts {
+    ($($extra:tt)*) => { &[
+        ("--color", RefOpt::OptVal),
+        ("--no-color", RefOpt::Plain),
+        ("--contains", RefOpt::ListVal),
+        ("--no-contains", RefOpt::ListVal),
+        ("--delete", RefOpt::Mutation),
+        ("--omit-empty", RefOpt::Plain),
+        ("--no-omit-empty", RefOpt::Plain),
+        ("--list", RefOpt::List),
+        ("--create-reflog", RefOpt::Plain),
+        ("--no-create-reflog", RefOpt::Plain),
+        ("--force", RefOpt::Mutation),
+        ("--no-force", RefOpt::Plain),
+        ("--merged", RefOpt::ListVal),
+        ("--no-merged", RefOpt::ListVal),
+        ("--column", RefOpt::OptVal),
+        ("--no-column", RefOpt::Plain),
+        ("--sort", RefOpt::Val),
+        ("--no-sort", RefOpt::Plain),
+        ("--points-at", RefOpt::ListVal),
+        ("--no-points-at", RefOpt::Plain),
+        ("--ignore-case", RefOpt::Plain),
+        ("--no-ignore-case", RefOpt::Plain),
+        ("--format", RefOpt::Val),
+        ("--no-format", RefOpt::Plain),
+        $($extra)*
+    ] };
+}
+
+/// `git branch` long options (git 2.50.1). The deprecated `--set-upstream`
+/// alias is covered by prefix-abbreviation to `--set-upstream-to` (git rejects
+/// it at runtime).
+const GIT_BRANCH_OPTS: &[(&str, RefOpt)] = git_ref_opts![
     ("--verbose", RefOpt::Plain),
     ("--no-verbose", RefOpt::Plain),
     ("--quiet", RefOpt::Plain),
@@ -3607,46 +3641,22 @@ const GIT_BRANCH_OPTS: &[(&str, RefOpt)] = &[
     ("--no-set-upstream-to", RefOpt::Plain),
     ("--unset-upstream", RefOpt::Mutation),
     ("--no-unset-upstream", RefOpt::Plain),
-    ("--color", RefOpt::OptVal),
-    ("--no-color", RefOpt::Plain),
     ("--remotes", RefOpt::Plain),
-    ("--contains", RefOpt::ListVal),
-    ("--no-contains", RefOpt::ListVal),
     ("--abbrev", RefOpt::OptVal),
     ("--no-abbrev", RefOpt::Plain),
     ("--all", RefOpt::Plain),
-    ("--delete", RefOpt::Mutation),
     ("--no-delete", RefOpt::Plain),
     ("--move", RefOpt::Mutation),
     ("--no-move", RefOpt::Plain),
-    ("--omit-empty", RefOpt::Plain),
-    ("--no-omit-empty", RefOpt::Plain),
     ("--copy", RefOpt::Mutation),
     ("--no-copy", RefOpt::Plain),
-    ("--list", RefOpt::List),
     ("--no-list", RefOpt::Plain),
     ("--show-current", RefOpt::Plain),
     ("--no-show-current", RefOpt::Plain),
-    ("--create-reflog", RefOpt::Plain),
-    ("--no-create-reflog", RefOpt::Plain),
     ("--edit-description", RefOpt::Mutation),
     ("--no-edit-description", RefOpt::Plain),
-    ("--force", RefOpt::Mutation),
-    ("--no-force", RefOpt::Plain),
-    ("--merged", RefOpt::ListVal),
-    ("--no-merged", RefOpt::ListVal),
-    ("--column", RefOpt::OptVal),
-    ("--no-column", RefOpt::Plain),
-    ("--sort", RefOpt::Val),
-    ("--no-sort", RefOpt::Plain),
-    ("--points-at", RefOpt::ListVal),
-    ("--no-points-at", RefOpt::Plain),
-    ("--ignore-case", RefOpt::Plain),
-    ("--no-ignore-case", RefOpt::Plain),
     ("--recurse-submodules", RefOpt::Plain),
     ("--no-recurse-submodules", RefOpt::Plain),
-    ("--format", RefOpt::Val),
-    ("--no-format", RefOpt::Plain),
 ];
 
 /// `git branch` short flags (git 2.50.1).
@@ -3671,8 +3681,7 @@ const GIT_BRANCH_SHORTS: &[(char, RefOpt)] = &[
 /// `git tag` long options (git 2.50.1). `--no-message`/`--no-list` are unknown
 /// in git (fail-closed Plain); every accepted `--no-*` negation consumes no
 /// value and is create-active.
-const GIT_TAG_OPTS: &[(&str, RefOpt)] = &[
-    ("--list", RefOpt::List),
+const GIT_TAG_OPTS: &[(&str, RefOpt)] = git_ref_opts![
     ("--verify", RefOpt::Verify),
     ("--annotate", RefOpt::Mutation),
     ("--no-annotate", RefOpt::Plain),
@@ -3688,30 +3697,11 @@ const GIT_TAG_OPTS: &[(&str, RefOpt)] = &[
     ("--no-cleanup", RefOpt::Plain),
     ("--local-user", RefOpt::Mutation),
     ("--no-local-user", RefOpt::Plain),
-    ("--force", RefOpt::Mutation),
-    ("--no-force", RefOpt::Plain),
-    ("--create-reflog", RefOpt::Plain),
-    ("--no-create-reflog", RefOpt::Plain),
-    ("--column", RefOpt::OptVal),
-    ("--no-column", RefOpt::Plain),
-    ("--contains", RefOpt::ListVal),
-    ("--no-contains", RefOpt::ListVal),
-    ("--merged", RefOpt::ListVal),
-    ("--no-merged", RefOpt::ListVal),
-    ("--omit-empty", RefOpt::Plain),
-    ("--no-omit-empty", RefOpt::Plain),
-    ("--sort", RefOpt::Val),
-    ("--no-sort", RefOpt::Plain),
-    ("--points-at", RefOpt::ListVal),
-    ("--no-points-at", RefOpt::Plain),
-    ("--format", RefOpt::Val),
-    ("--no-format", RefOpt::Plain),
-    ("--color", RefOpt::OptVal),
-    ("--no-color", RefOpt::Plain),
-    ("--ignore-case", RefOpt::Plain),
-    ("--no-ignore-case", RefOpt::Plain),
-    ("--delete", RefOpt::Mutation),
 ];
+
+// Row-count guard: dropped/duplicated rows change these totals (the table
+// tests only assert Mutation-class rows).
+const _: () = assert!(GIT_BRANCH_OPTS.len() == 50 && GIT_TAG_OPTS.len() == 39);
 
 /// `git tag` short flags (git 2.50.1).
 const GIT_TAG_SHORTS: &[(char, RefOpt)] = &[
