@@ -219,50 +219,35 @@ async fn dispatch_durable_ask(
     channel: String,
 ) -> Option<AgentJob> {
     let job_id = crate::generate_id();
-    match run_ask_with_job(ws, ask, &job_id, caller_role, &user_name, &channel, false).await {
-        Ok(AskRunOutcome::DrainCut) => {
-            // Drain-cut (decision 20): analyst outcomes are already
-            // checkpointed — leave the job status='launched' for boot resume
-            // (recoverable via ask_jobs checkpoints). No terminalization, no
-            // error envelope: a spurious envelope here would discard the
-            // checkpointed outcomes and contradict "jobs stay status='launched'
-            // for boot resume".
-            tracing::info!(
-                job = %job_id,
-                "Ask round cut short by drain — job stays launched for boot resume",
-            );
-            None
-        }
-        Ok(AskRunOutcome::Result(result)) => {
-            let envelope = crate::jobs::complete_durable_job(
-                &job_id,
-                build_async_ask_message(&result),
-                JobKind::AskToolResult,
-                caller_role,
-                &user_name,
-                &channel,
-                &ws.name,
-            )
-            .await;
-            Some(envelope)
-        }
-        Err(e) => {
-            // Envelope always routes (errors wrapped); terminalize the job so
-            // a failed ask never blocks boot recovery.
-            let outcome = Err(e);
-            let envelope = crate::jobs::complete_durable_job(
-                &job_id,
-                build_async_ask_message(&outcome),
-                JobKind::AskToolResult,
-                caller_role,
-                &user_name,
-                &channel,
-                &ws.name,
-            )
-            .await;
-            Some(envelope)
-        }
-    }
+    let result =
+        match run_ask_with_job(ws, ask, &job_id, caller_role, &user_name, &channel, false).await {
+            Ok(AskRunOutcome::DrainCut) => {
+                // Drain-cut (decision 20): analyst outcomes are already
+                // checkpointed — leave the job status='launched' for boot resume
+                // (recoverable via ask_jobs checkpoints). No terminalization, no
+                // error envelope: a spurious envelope here would discard the
+                // checkpointed outcomes and contradict "jobs stay status='launched'
+                // for boot resume".
+                tracing::info!(
+                    job = %job_id,
+                    "Ask round cut short by drain — job stays launched for boot resume",
+                );
+                return None;
+            }
+            Ok(AskRunOutcome::Result(result)) => result,
+            Err(e) => Err(e),
+        };
+    let envelope = crate::jobs::complete_durable_job(
+        &job_id,
+        build_async_ask_message(&result),
+        JobKind::AskToolResult,
+        caller_role,
+        &user_name,
+        &channel,
+        &ws.name,
+    )
+    .await;
+    Some(envelope)
 }
 
 /// Spawn the ask job + roster (one tx), run the analysts, checkpoint per-agent
