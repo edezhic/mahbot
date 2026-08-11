@@ -3516,6 +3516,40 @@ fn convert_and_send_audio_to_pipeline<T, F>(
     }
 }
 
+// Error callback for microphone streams — a fn item so it can be shared
+// across every build_input_stream call.
+#[allow(clippy::needless_pass_by_value)]
+fn mic_error(err: cpal::StreamError) {
+    error!("Microphone stream error: {err}");
+}
+
+// Build an input stream converting each sample to mono f32 via `convert`.
+// Combines conversion and mono-mixing into a single pass to avoid an
+// intermediate `Vec<f32>` allocation on every callback; the f32 format uses
+// the identity conversion.
+fn build_int_stream<T, F>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    sample_tx: &Arc<mpsc::Sender<Vec<f32>>>,
+    channels: u16,
+    sample_rate: u32,
+    convert: F,
+) -> Result<cpal::Stream, cpal::BuildStreamError>
+where
+    T: cpal::SizedSample,
+    F: Fn(&T) -> f32 + Send + 'static,
+{
+    let tx = sample_tx.clone();
+    device.build_input_stream::<T, _, _>(
+        config,
+        move |data, _| {
+            convert_and_send_audio_to_pipeline(&tx, data, channels, sample_rate, &convert);
+        },
+        mic_error,
+        None,
+    )
+}
+
 fn start_microphone() -> Result<(mpsc::Receiver<Vec<f32>>, cpal::Stream)> {
     let (tx, rx) = mpsc::channel::<Vec<f32>>(MIC_CHANNEL_CAPACITY);
 
@@ -3536,78 +3570,36 @@ fn start_microphone() -> Result<(mpsc::Receiver<Vec<f32>>, cpal::Stream)> {
         config.channels()
     );
 
-    // Error callback for microphone stream — must be a function pointer
-    // (not a closure) so it can be used in multiple build_input_stream calls.
-    #[allow(clippy::needless_pass_by_value, clippy::items_after_statements)]
-    fn mic_error(err: cpal::StreamError) {
-        error!("Microphone stream error: {err}");
-    }
-
     let sample_rate = config.sample_rate().0;
     let channels = config.channels();
     let sample_tx = Arc::new(tx);
-
-    // Helper to build audio stream for integer sample formats that need
-    // conversion to f32.  Uses the combined convert+to_mono path to avoid
-    // an intermediate `Vec<f32>` allocation on every callback.
-    macro_rules! build_int_stream {
-        ($device:expr, $config:expr, $sample_tx:expr, $channels:expr, $sample_rate:expr, $fmt:ty, $convert:expr) => {{
-            let tx = $sample_tx.clone();
-            $device.build_input_stream::<$fmt, _, _>(
-                &($config).into(),
-                move |data, _| {
-                    convert_and_send_audio_to_pipeline(
-                        &tx,
-                        data,
-                        $channels,
-                        $sample_rate,
-                        $convert,
-                    );
-                },
-                mic_error,
-                None,
-            )
-        }};
-    }
+    let stream_config: cpal::StreamConfig = config.clone().into();
 
     let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => {
-            // f32 samples can be passed directly — no conversion needed
-            let tx = sample_tx.clone();
-            device.build_input_stream::<f32, _, _>(
-                &config.into(),
-                move |data, _| {
-                    // F32 can use the generic path with identity conversion,
-                    // benefiting from the single-channel fast-path in
-                    // convert_and_send_audio_to_pipeline.
-                    convert_and_send_audio_to_pipeline(&tx, data, channels, sample_rate, |&s| s);
-                },
-                mic_error,
-                None,
-            )
-        }
-        cpal::SampleFormat::I16 => {
-            build_int_stream!(
-                device,
-                config,
-                sample_tx,
-                channels,
-                sample_rate,
-                i16,
-                |&s| f32::from(s) / f32::from(i16::MAX)
-            )
-        }
-        cpal::SampleFormat::U16 => {
-            build_int_stream!(
-                device,
-                config,
-                sample_tx,
-                channels,
-                sample_rate,
-                u16,
-                |&s| (f32::from(s) / f32::from(u16::MAX)) * 2.0 - 1.0
-            )
-        }
+        cpal::SampleFormat::F32 => build_int_stream::<f32, _>(
+            &device,
+            &stream_config,
+            &sample_tx,
+            channels,
+            sample_rate,
+            |&s| s,
+        ),
+        cpal::SampleFormat::I16 => build_int_stream::<i16, _>(
+            &device,
+            &stream_config,
+            &sample_tx,
+            channels,
+            sample_rate,
+            |&s| f32::from(s) / f32::from(i16::MAX),
+        ),
+        cpal::SampleFormat::U16 => build_int_stream::<u16, _>(
+            &device,
+            &stream_config,
+            &sample_tx,
+            channels,
+            sample_rate,
+            |&s| (f32::from(s) / f32::from(u16::MAX)) * 2.0 - 1.0,
+        ),
         _ => anyhow::bail!("Unsupported sample format: {:?}", config.sample_format()),
     }
     .context("Failed to build microphone input stream")?;
