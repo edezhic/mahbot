@@ -20,6 +20,48 @@ fn global_shutdown() -> &'static CancellationToken {
     GLOBAL_SHUTDOWN.get_or_init(CancellationToken::new)
 }
 
+/// Global graceful-drain flag (decision 2): set by the first shutdown signal
+/// (SIGINT / window-close / self-update). Distinct from the cancellation
+/// token — during the drain the token is NOT fired, so in-flight LLM calls
+/// (which race the token around the HTTP send) survive to complete their
+/// current round. Background loops fold this flag into their sleep/shutdown
+/// races; the second signal maps to force-cancel.
+static DRAINING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark the daemon as draining (graceful-shutdown window). Idempotent.
+pub fn drain_begin() {
+    DRAINING.store(true, std::sync::atomic::Ordering::SeqCst);
+    info!("Draining: in-flight work completes before exit");
+}
+
+/// Whether the graceful-drain window is active.
+#[must_use]
+pub fn is_draining() -> bool {
+    DRAINING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether the daemon is aborting: the shutdown token fired OR the graceful
+/// drain is active. Loops gate NEW work on this (during the drain, in-flight
+/// work completes but nothing new starts).
+#[must_use]
+pub fn aborting() -> bool {
+    shutdown_token().is_cancelled() || is_draining()
+}
+
+/// Force-cancel the drain: fire the global token immediately (in-flight
+/// agents are cancelled and boot-resume via status=running), then the normal
+/// exit path (checkpoint + join + exit) runs.
+pub fn force_cancel() {
+    global_shutdown().cancel();
+}
+
+/// Clear the drain flag. Production code never clears it (drains are
+/// one-way); tests use this to restore isolation after asserting drain
+/// behavior.
+pub fn drain_clear() {
+    DRAINING.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Get a clone of the global shutdown token.
 #[must_use]
 pub fn shutdown_token() -> CancellationToken {
@@ -54,16 +96,45 @@ pub async fn sleep_or_shutdown(duration: Duration) -> bool {
     race_shutdown(tokio::time::sleep(duration)).await.is_ok()
 }
 
+/// Sleep for the given duration, breaking early on the shutdown token OR the
+/// graceful-drain flag. Background loops fold the drain into their sleep
+/// cycles so they stop spawning new work when the drain begins.
+/// Returns `true` if the sleep completed normally, `false` if shutdown or
+/// draining was signaled.
+#[must_use]
+pub async fn sleep_or_shutdown_or_drain(duration: Duration) -> bool {
+    let token = shutdown_token();
+    let drain = drain_wait();
+    tokio::pin!(drain);
+    tokio::select! {
+        () = token.cancelled() => false,
+        () = &mut drain => false,
+        () = tokio::time::sleep(duration) => true,
+    }
+}
+
+/// Completes when the drain flag flips. Polled inside
+/// [`sleep_or_shutdown_or_drain`] every select round; the 100 ms poll cadence
+/// is negligible against 10-minute cleanup loops.
+async fn drain_wait() {
+    while !is_draining() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 // ── Signal handling ───────────────────────────────────────────────────────
 
-/// Wait for a shutdown signal (SIGINT or SIGTERM), then return so the
-/// caller can trigger graceful shutdown via the global cancellation token.
+/// Wait for shutdown signals, then drive the two-signal drain protocol.
 ///
-/// This is spawned as a background task in `spawn_background_tasks()`. When
-/// a signal arrives, the task calls [`shutdown()`], which cancels the global
-/// token. The Iced dashboard subscription picks this up and closes the
-/// window, which unblocks `iced::application::run` so the
-/// process can tear down cleanly via `shutdown_after_dashboard()`.
+/// First signal (SIGINT or SIGTERM): begins the graceful drain via
+/// [`drain_begin`] — the global token is NOT fired, so in-flight LLM calls
+/// and tool groups complete. Background loops break on the drain flag.
+/// The signal streams stay alive (never dropped) so a SECOND signal during
+/// the drain maps to [`force_cancel`] — abort the drain, checkpoint, exit.
+///
+/// Returns only after a second signal (force-cancel); the clean-drain exit
+/// path is driven by the drain-watch task in the binary (fires the token
+/// when no in-flight agents or orchestrator calls remain).
 ///
 /// SIGHUP is explicitly ignored so the daemon survives terminal/SSH disconnects.
 pub async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
@@ -75,15 +146,28 @@ pub async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
         let mut sigterm = signal(SignalKind::terminate())?;
         let mut sighup = signal(SignalKind::hangup())?;
 
+        let mut first = true;
         loop {
             tokio::select! {
                 _ = sigint.recv() => {
-                    info!("Received SIGINT, shutting down...");
-                    break;
+                    if first {
+                        info!("Received SIGINT — draining (second signal force-cancels)");
+                        drain_begin();
+                        first = false;
+                    } else {
+                        info!("Received second SIGINT — force-cancelling drain");
+                        return Ok(());
+                    }
                 }
                 _ = sigterm.recv() => {
-                    info!("Received SIGTERM, shutting down...");
-                    break;
+                    if first {
+                        info!("Received SIGTERM — draining (second signal force-cancels)");
+                        drain_begin();
+                        first = false;
+                    } else {
+                        info!("Received second SIGTERM — force-cancelling drain");
+                        return Ok(());
+                    }
                 }
                 _ = sighup.recv() => {
                     debug!("Received SIGHUP, ignoring (daemon stays running)");
@@ -95,10 +179,12 @@ pub async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
     #[cfg(not(unix))]
     {
         tokio::signal::ctrl_c().await?;
-        info!("Received Ctrl+C, shutting down...");
+        info!("Received Ctrl+C — draining");
+        drain_begin();
+        // Non-unix: no second-signal path; the drain-watch drives completion.
+        tokio::future::pending::<()>().await;
+        Ok(())
     }
-
-    Ok(())
 }
 
 // ── Fatal signal handlers ─────────────────────────────────────────────────

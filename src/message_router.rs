@@ -25,6 +25,7 @@
 //!   originating channel (scoped to `job.channel`).
 
 use futures_util::FutureExt;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{OnceLock, RwLock};
@@ -35,6 +36,7 @@ use tracing::{debug, error, info, warn};
 use crate::channels::{
     broadcast_and_persist_agent_response, spawn_scoped_typing_task, stop_typing,
 };
+use crate::turso;
 use crate::users::UserRecord;
 use crate::util::UnwrapPoison;
 use crate::{Channel, ChatEvent, Role, SendMessage, Workspace};
@@ -94,7 +96,7 @@ fn telegram_delivery_content<'a>(
 }
 
 /// Semantic category of a queue job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobKind {
     /// User-typed message (chat or inline-button callback).
     /// For Manager: the ticket transition buffer drains before the agent runs.
@@ -119,8 +121,24 @@ pub enum JobKind {
     RecoveryRetry,
 }
 
+impl JobKind {
+    /// Stable lowercase serialization for the `pending_jobs.kind` column
+    /// (stores the JobKind value, NOT the jobs.kind vocabulary).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserMessage => "user_message",
+            Self::TicketNotify => "ticket_notify",
+            Self::AskToolResult => "ask_tool_result",
+            Self::ResearchResult => "research_result",
+            Self::TicketComment => "ticket_comment",
+            Self::RecoveryRetry => "recovery_retry",
+        }
+    }
+}
+
 /// A single unit of work for an agent consumer.
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentJob {
     /// The message content to process.
     pub content: String,
@@ -140,6 +158,11 @@ pub struct AgentJob {
     /// [`UserRecord`](crate::users::UserRecord) in the users DB.
     /// `None` for non-user-facing jobs (ticket notifications, broadcast-only).
     pub reply_target: Option<String>,
+    /// Durable pending_jobs row id (set when the job was persisted /
+    /// replayed from a pending row). The consumer deletes the row only after
+    /// `run_agent` returns — the at-least-once delivery boundary.
+    #[serde(default)]
+    pub pending_job_id: Option<String>,
 }
 
 // ── Global router ─────────────────────────────────────────────────────────
@@ -253,7 +276,15 @@ pub fn route(agent_id: &str, job: AgentJob) {
 /// role → `manager_{ws_name}`, others → channel-scoped direct ID) and enqueues
 /// a [`JobKind::UserMessage`] job. Surrounding per-site pipelines (broadcast,
 /// persistence, enrichment) remain at the call sites.
-pub fn route_user_message(
+///
+/// # Durability (at-least-once)
+///
+/// Manager-bound messages are persisted to `pending_jobs` BEFORE routing —
+/// a crash between persist and delivery replays the row at next boot (dedup
+/// prevents duplicate append). Non-Manager messages are covered by the
+/// dead-session poller (not durable). During the graceful drain the message
+/// is persisted but NOT routed — the row is reclaimed by boot replay.
+pub async fn route_user_message(
     content: String,
     workspace_name: String,
     user_name: String,
@@ -263,18 +294,79 @@ pub fn route_user_message(
 ) {
     let agent_id =
         crate::session::resolve_agent_id(&channel, &user_name, role.as_str(), &workspace_name);
-    route(
-        &agent_id,
-        AgentJob {
-            content,
-            workspace_name,
-            user_name,
-            channel,
-            kind: JobKind::UserMessage,
-            role,
-            reply_target,
-        },
-    );
+    let mut job = AgentJob {
+        content,
+        workspace_name,
+        user_name,
+        channel,
+        kind: JobKind::UserMessage,
+        role,
+        reply_target,
+        pending_job_id: None,
+    };
+
+    // Manager-bound UserMessage is durable (decision 16: DURABLE kinds =
+    // UserMessage (manager-bound only), AskToolResult, ResearchResult).
+    let mut persisted = false;
+    if job.role == Role::Manager {
+        let id = crate::generate_id();
+        match persist_pending(&agent_id, &job, id.clone()).await {
+            Ok(()) => {
+                job.pending_job_id = Some(id);
+                persisted = true;
+            }
+            Err(e) => {
+                // INSERT-failure policy: fall back to non-durable route
+                // (best-effort) — never drop silently.
+                warn!(
+                    error = %e,
+                    "Failed to persist manager message — routing best-effort (at-most-once)",
+                );
+            }
+        }
+        // Persisted during the drain/shutdown → skip routing (boot replay
+        // reclaims). NOT persisted → route best-effort; the realistic rescue
+        // is the non-drain persist-failure case (the consumer is still
+        // pulling). A drain-time best-effort route may land in a consumer that
+        // has already stopped pulling, so the message can still be lost at
+        // exit — the fix primarily closes the silent-drop on the normal-path
+        // double fault, not the drain window.
+        if crate::shutdown::aborting() && persisted {
+            return;
+        }
+    }
+    route(&agent_id, job);
+}
+
+/// Persist an envelope to `pending_jobs` (`started`/`attempts` are
+/// schema-locked write-only columns, DEFAULT 0 — omitted from the INSERT,
+/// consistent with [`crate::jobs::complete_job_with_envelope`]).
+/// Used by the durable producers (manager-bound messages here; ask/research
+/// use the source job id via [`crate::jobs::complete_job_with_envelope`]).
+async fn persist_pending(target_agent_id: &str, job: &AgentJob, id: String) -> anyhow::Result<()> {
+    let now = turso::now();
+    crate::session::store()
+        .conn
+        .execute(
+            "INSERT INTO pending_jobs \
+             (id, target_agent_id, kind, envelope, workspace_name, user_name, channel, role, \
+              reply_target, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            crate::turso::params![
+                id,
+                target_agent_id,
+                job.kind.as_str(),
+                serde_json::to_string(job)?,
+                job.workspace_name.clone(),
+                job.user_name.clone(),
+                job.channel.clone(),
+                job.role.as_str(),
+                job.reply_target.clone().unwrap_or_default(),
+                now,
+            ],
+        )
+        .await?;
+    Ok(())
 }
 
 /// Register an agent in the router table without spawning a consumer loop.
@@ -373,6 +465,12 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
     loop {
         if shutdown.is_cancelled() {
             info!(agent_id = %agent_id, "Message router: shutting down — queue drained");
+            break;
+        }
+        // Shutdown/drain: stop pulling after the current job. The job already
+        // pulled in the previous iteration completes its round.
+        if crate::shutdown::aborting() {
+            info!(agent_id = %agent_id, "Message router: draining — no new jobs pulled");
             break;
         }
 
@@ -479,6 +577,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             job.user_name.clone(),
             job.channel.clone(),
             None,
+            false,
         )
         .await;
 
@@ -498,12 +597,17 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             // global shutdown token because during SIGTERM/SIGINT the global
             // token fires first — work() catches it and returns None, but the
             // agent-specific token may not have been cancelled yet.
+            //
+            // Drained agents must NOT emit the failure emoji: their round was
+            // cut short by the graceful-drain window (or shutdown), not a
+            // failure.
             if job.kind == JobKind::UserMessage
                 && !agent.is_cancelled()
-                && !crate::shutdown::shutdown_token().is_cancelled()
+                && !crate::shutdown::aborting()
             {
                 deliver_unregistered_user_response(AGENT_FAILURE_EMOJI, &job, &role).await;
             }
+            confirm_pending_delivery(&job).await;
             continue;
         };
 
@@ -521,6 +625,41 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
                 } else {
                     deliver_single_user_response(&response, &users[0], &job, &role).await;
                 }
+            }
+        }
+        confirm_pending_delivery(&job).await;
+    }
+}
+
+/// Consumer-confirmed delivery: delete the durable pending_jobs row after the
+/// agent ran (at-least-once boundary — the row is created before routing and
+/// reclaimed only here or by boot replay). One sync retry on failure, then
+/// log-and-continue: residual duplicate re-delivery at next boot is bounded
+/// and accepted. Never called on workspace-not-found (the consumer skips the
+/// job) — a pending row for a deleted workspace re-routes and consumer-skips
+/// at every boot until the workspace returns; bounded and accepted (purge
+/// reclaims only `jobs`, never `pending_jobs` — the at-least-once guarantee
+/// keeps unconfirmed rows alive).
+async fn confirm_pending_delivery(job: &AgentJob) {
+    let Some(id) = job.pending_job_id.as_deref() else {
+        return;
+    };
+    for attempt in 0..2 {
+        match crate::jobs::delete_pending_job(&crate::session::store().conn, id).await {
+            Ok(()) => return,
+            Err(e) if attempt == 0 => {
+                warn!(
+                    pending_job = %id,
+                    error = %e,
+                    "Failed to confirm pending delivery — retrying once",
+                );
+            }
+            Err(e) => {
+                warn!(
+                    pending_job = %id,
+                    error = %e,
+                    "Pending delivery confirm failed — duplicate re-delivery at next boot accepted",
+                );
             }
         }
     }
@@ -829,6 +968,7 @@ mod tests {
             kind: JobKind::UserMessage,
             role,
             reply_target: None,
+            pending_job_id: None,
         }
     }
 
@@ -1133,6 +1273,7 @@ mod tests {
             kind: JobKind::UserMessage,
             role: Role::Assistant,
             reply_target: Some("chat_123".to_string()),
+            pending_job_id: None,
         };
 
         // Should complete without panic.
@@ -1164,6 +1305,7 @@ mod tests {
             kind: JobKind::UserMessage,
             role: Role::Assistant,
             reply_target: None,
+            pending_job_id: None,
         };
 
         // Should complete without panic — sends response via "gui" channel.
@@ -1189,6 +1331,7 @@ mod tests {
             kind: JobKind::UserMessage,
             role: Role::Assistant,
             reply_target: None,
+            pending_job_id: None,
         };
 
         // Should complete without panic — broadcast+persist runs, transport
@@ -1224,6 +1367,7 @@ mod tests {
             kind: JobKind::TicketNotify,
             role: Role::Manager,
             reply_target: None,
+            pending_job_id: None,
         };
 
         deliver_manager_response("manager response", &[user], &job).await;

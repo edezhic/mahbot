@@ -516,7 +516,12 @@ impl HomeState {
     }
 
     #[allow(clippy::too_many_lines)]
-    pub fn view(&self, active_role: Option<Role>, role_pool: &[Role]) -> Element<'_, HomeMessage> {
+    pub fn view(
+        &self,
+        active_role: Option<Role>,
+        role_pool: &[Role],
+        draining: bool,
+    ) -> Element<'_, HomeMessage> {
         // ── Chat message area ────────────────────────────────────
         let chat_area = if self.messages.is_empty() {
             let empty_hint = if self.selected_user.is_none() {
@@ -747,7 +752,9 @@ impl HomeState {
             HomeMessage::SendMessage,
             "Type a message... (Enter to send, Shift+Enter for newline)",
             super::widgets::ChatComposerOptions {
-                sending: self.sending,
+                // Input disabled during the graceful drain (decision 3):
+                // sends are blocked while the shutdown banner is up.
+                sending: self.sending || draining,
                 // One line taller than the plain composer so the controls
                 // column (role + mic) fits above the send button.
                 min_height: 88.0,

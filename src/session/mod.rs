@@ -127,6 +127,96 @@ CREATE TABLE IF NOT EXISTS session_metadata (
     workspace_name TEXT,
     role          TEXT,
     active_models TEXT
+);
+
+-- ── Durability/resume substrate (see src/jobs.rs) ─────────────────────
+-- jobs must be declared BEFORE agents (lazy FK resolution).
+CREATE TABLE IF NOT EXISTS jobs (
+    id             TEXT PRIMARY KEY,
+    kind           TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'launched',
+    task           TEXT NOT NULL DEFAULT '',
+    workspace_name TEXT NOT NULL,
+    user_name      TEXT NOT NULL DEFAULT '',
+    channel        TEXT NOT NULL DEFAULT '',
+    role           TEXT NOT NULL,
+    retry_count    INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_kind_status ON jobs(kind, status);
+CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at);
+
+CREATE TABLE IF NOT EXISTS agents (
+    job_id     TEXT REFERENCES jobs(id) ON DELETE CASCADE,
+    agent_id   TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    idx        INTEGER,
+    role       TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'launched',
+    outcome    TEXT,
+    task       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, agent_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_anchor ON agents(agent_id) WHERE job_id IS NULL;
+
+CREATE TABLE IF NOT EXISTS pending_jobs (
+    id              TEXT PRIMARY KEY,
+    target_agent_id TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    envelope        TEXT NOT NULL,
+    workspace_name  TEXT NOT NULL DEFAULT '',
+    user_name       TEXT NOT NULL DEFAULT '',
+    channel         TEXT NOT NULL DEFAULT '',
+    role            TEXT NOT NULL,
+    reply_target    TEXT NOT NULL DEFAULT '',
+    -- `started` and `attempts` are schema-locked write-only columns: delivery
+    -- dedup (suffix + created_at) is the sole in-session discriminator.
+    started         INTEGER NOT NULL DEFAULT 0,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_jobs_agent_created ON pending_jobs(target_agent_id, created_at);
+
+CREATE TABLE IF NOT EXISTS ticket_stage_jobs (
+    id          TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    ticket_id   TEXT NOT NULL,
+    stage       TEXT NOT NULL,
+    phase       TEXT NOT NULL,
+    round       INTEGER NOT NULL,
+    review_base INTEGER,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ask_jobs (
+    id         TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    question   TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS manager_jobs (
+    id             TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    workspace_name TEXT NOT NULL,
+    message_kind   TEXT NOT NULL,
+    user_name      TEXT NOT NULL DEFAULT '',
+    channel        TEXT NOT NULL DEFAULT '',
+    reply_target   TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS research_jobs (
+    id           TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    question     TEXT NOT NULL,
+    stage        TEXT NOT NULL,
+    round_index  INTEGER NOT NULL,
+    budget_spent INTEGER NOT NULL,
+    state        TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
 );";
 
 // ── Column index constants ──────────────────────────────────
@@ -369,6 +459,23 @@ impl SessionStore {
             Some(agent_id),
         )
         .await
+    }
+
+    /// O(1) session-non-emptiness check (resume dispatch rule): true when the
+    /// agent has at least one non-empty message row. Avoids materializing the
+    /// full history just to test `.is_empty()` — the engineer's accumulated
+    /// session can exceed 200k tokens.
+    pub(crate) async fn has_content(&self, agent_id: &str) -> bool {
+        self.conn
+            .query_optional(
+                "SELECT 1 FROM sessions WHERE agent_id = ?1 AND length(content) > 0 LIMIT 1",
+                params![agent_id],
+                |_| Ok::<(), anyhow::Error>(()),
+            )
+            .await
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     async fn append_messages(
@@ -663,12 +770,16 @@ pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
         p
     };
 
-    // Delete session messages for matching transient sessions
+    // Delete session messages for matching transient sessions. The agents
+    // table IS the marker: live sessions referenced by unfinished jobs are
+    // NEVER purged (agents rows cascade-delete when the job goes terminal, so
+    // protection self-heals ≤10 min after the next tick).
     tx.execute(
         &format!(
             "DELETE FROM sessions WHERE agent_id IN ( \
              SELECT agent_id FROM session_metadata \
-             WHERE last_activity < ? AND {prefix_patterns})"
+             WHERE last_activity < ? AND {prefix_patterns} \
+               AND agent_id NOT IN (SELECT agent_id FROM agents))"
         ),
         build_params.clone(),
     )
@@ -677,7 +788,10 @@ pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
     // Delete the metadata entries themselves
     let deleted = tx
         .execute(
-            &format!("DELETE FROM session_metadata WHERE last_activity < ? AND {prefix_patterns}"),
+            &format!(
+                "DELETE FROM session_metadata WHERE last_activity < ? AND {prefix_patterns} \
+                 AND agent_id NOT IN (SELECT agent_id FROM agents)"
+            ),
             build_params.clone(),
         )
         .await?;

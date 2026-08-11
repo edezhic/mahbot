@@ -231,6 +231,10 @@ pub enum Message {
     /// Shutdown signaled — close the dashboard window so `run()` returns.
     /// Triggered by the shutdown token (self-update restart, SIGTERM/SIGINT).
     Shutdown,
+    /// The graceful-drain window began (first signal / window-close /
+    /// self-update). Shows the "shutting down…" banner; iced::exit is
+    /// deferred until the drain completes (the token fires).
+    DrainStarted,
     /// Window close button pressed — persist position and size before exiting.
     CloseRequested(window::Id),
     /// Window geometry event (move/resize) — tracks state for persist-on-close.
@@ -248,8 +252,6 @@ pub enum Message {
     /// Result of a per-workspace toggle DB write. Carries (kind, result, workspace_name, intended_state).
     /// On success, workspace state is refreshed from DB; on error an error toast is shown.
     ToggleResult(ToggleKind, Result<(), String>, String, bool),
-    /// WAL checkpoint complete — safe to exit now.
-    CheckpointAndExit,
     /// Periodic refresh of workspace paused/maintenance state from DB.
     /// Carries (name, paused, maintenance_enabled) tuples to merge into
     /// the existing `workspaces` map without overwriting paths.
@@ -477,6 +479,9 @@ pub struct Dashboard {
     /// subscription, which must not be mistaken for an exit request. If the
     /// update fails, this flag makes the GUI run its own checkpoint + exit.
     exit_requested_during_update: bool,
+    /// Graceful-drain window active (decision 3): the window stays open with a
+    /// "shutting down…" banner + disabled input until the drain completes.
+    draining: bool,
     logs_state: logs::LogsState,
     board_state: board::BoardState,
     sessions_state: sessions::SessionsState,
@@ -521,6 +526,7 @@ impl Dashboard {
                 UpdateStatus::Unavailable
             },
             exit_requested_during_update: false,
+            draining: false,
             logs_state: logs::LogsState::new(),
             board_state: board::BoardState::new(),
             sessions_state: sessions::SessionsState::new(),
@@ -618,12 +624,11 @@ impl Dashboard {
             }
             return Task::none();
         }
-        // Not updating, or the update is still building (this exit aborts it —
-        // the update hasn't checkpointed anything yet): the normal exit
-        // checkpoint still runs.
-        Task::perform(crate::checkpoint::checkpoint_all_databases(), |()| {
-            Message::CheckpointAndExit
-        })
+        // The checkpoint is deliberately NOT run here: it relocated to
+        // shutdown_after_dashboard, which runs after the iced runtime drops —
+        // genuinely single-writer (today's in-iced checkpoint ran while
+        // background writers were still live).
+        iced::exit()
     }
 
     /// Window title with page name.
@@ -973,9 +978,36 @@ impl Dashboard {
             Message::BootWorkspaces(workspaces, restored_name) => {
                 self.apply_boot_workspaces(workspaces, restored_name.as_deref().unwrap_or(""))
             }
-            Message::CloseRequested(_) => self.save_and_exit(true),
+            Message::CloseRequested(_) => {
+                if self.update_status == UpdateStatus::InProgress
+                    && crate::self_update::update_is_finalizing()
+                {
+                    // The update owns the exit (its own drain + checkpoint +
+                    // swap + spawn): record the close request and wait — a
+                    // force-cancel here would abort the update's full drain.
+                    self.persist_window_state();
+                    self.exit_requested_during_update = true;
+                    Task::none()
+                } else if crate::shutdown::is_draining() {
+                    // Window-close during drain = second signal: force-cancel
+                    // (fires the token → Message::Shutdown → exit path).
+                    crate::shutdown::force_cancel();
+                    Task::none()
+                } else {
+                    // First window-close begins the GRACEFUL drain (decision
+                    // 2): the window stays open with the "shutting down…"
+                    // banner; the drain-watch fires the token when no
+                    // in-flight work remains (or force-cancels at the cap).
+                    // save_and_exit is deferred until Message::Shutdown.
+                    crate::shutdown::drain_begin();
+                    Task::none()
+                }
+            }
             Message::Shutdown => self.save_and_exit(false),
-            Message::CheckpointAndExit => iced::exit(),
+            Message::DrainStarted => {
+                self.draining = true;
+                Task::none()
+            }
             Message::WindowEvent(_, event) => match event {
                 window::Event::Resized(new_size) => {
                     self.last_size = new_size;
@@ -1432,7 +1464,11 @@ impl Dashboard {
             Page::Home => {
                 let home_view = self
                     .home_state
-                    .view(self.selected_user_role, &self.selected_user_roles)
+                    .view(
+                        self.selected_user_role,
+                        &self.selected_user_roles,
+                        self.draining,
+                    )
                     .map(Message::Home);
                 let sidebar = ticket_sidebar(&self.board_state);
                 // Wrap chat area in a right-click context menu with "Clear chat" and role switcher.
@@ -1497,6 +1533,30 @@ impl Dashboard {
         };
 
         let body = column![
+            if self.draining {
+                container(
+                    row![
+                        text("🛑 Shutting down… waiting for in-flight work")
+                            .size(13)
+                            .color(theme::TEXT_PRIMARY),
+                    ]
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .padding([6, 12])
+                .style(move |_theme: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(theme::STATUS_WARNING)),
+                    border: iced::Border {
+                        radius: 0.0.into(),
+                        width: 0.0,
+                        color: iced::Color::TRANSPARENT,
+                    },
+                    ..container::Style::default()
+                })
+                .into()
+            } else {
+                widget_helpers::empty_stack_placeholder()
+            },
             row![sidebar, content]
                 .width(Length::Fill)
                 .height(Length::Fill),
@@ -1850,11 +1910,29 @@ impl Dashboard {
 }
 
 /// Subscription that emits [`Message::Shutdown`] when the global shutdown
-/// token fires (self-update restart, SIGTERM/SIGINT).
+/// token fires (self-update restart, SIGTERM/SIGINT), and
+/// [`Message::DrainStarted`] when the graceful-drain window begins (first
+/// signal / window-close / self-update) — the token does NOT fire on the
+/// first signal, so the GUI needs a separate drain signal to show the
+/// "shutting down…" banner while the drain runs.
 fn shutdown_subscription() -> impl futures_util::Stream<Item = Message> {
     use iced::futures::channel::mpsc;
     iced::stream::channel(1, |mut output: mpsc::Sender<Message>| async move {
-        crate::shutdown::shutdown_token().cancelled().await;
+        let token = crate::shutdown::shutdown_token();
+        // Wait for the drain flag OR the token (a drain always precedes the
+        // token in the two-signal protocol, but the token may fire without a
+        // drain on force-cancel paths).
+        loop {
+            if crate::shutdown::is_draining() {
+                let _ = output.try_send(Message::DrainStarted);
+                break;
+            }
+            if token.is_cancelled() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        token.cancelled().await;
         let _ = output.try_send(Message::Shutdown);
     })
 }

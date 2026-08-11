@@ -219,6 +219,7 @@ async fn run_discovery_task(
         String::new(),
         String::new(),
         None,
+        false,
     )
     .await;
     let response =
@@ -290,6 +291,7 @@ async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) 
         String::new(),
         String::new(),
         None,
+        false,
     )
     .await;
     response.context("Diagnostics discovery agent returned no response (cancelled or failed)")?;
@@ -1272,7 +1274,7 @@ pub async fn run_nightly_check_loop() {
     let shutdown = crate::shutdown::shutdown_token();
 
     loop {
-        if !crate::shutdown::sleep_or_shutdown(interval).await {
+        if !crate::shutdown::sleep_or_shutdown_or_drain(interval).await {
             break;
         }
 

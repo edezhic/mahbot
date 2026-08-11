@@ -193,7 +193,11 @@ pub async fn run_wal_guard_loop() {
     let mut check_count: u64 = 0;
 
     loop {
-        if !crate::shutdown::sleep_or_shutdown(Duration::from_secs(WAL_GUARD_INTERVAL_SECS)).await {
+        if !crate::shutdown::sleep_or_shutdown_or_drain(Duration::from_secs(
+            WAL_GUARD_INTERVAL_SECS,
+        ))
+        .await
+        {
             break;
         }
         check_count += 1;

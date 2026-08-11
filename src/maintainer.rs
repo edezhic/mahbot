@@ -58,7 +58,7 @@ pub async fn run_maintainer_loop() {
     let shutdown = crate::shutdown::shutdown_token();
 
     loop {
-        if !crate::shutdown::sleep_or_shutdown(interval).await {
+        if !crate::shutdown::sleep_or_shutdown_or_drain(interval).await {
             break;
         }
 
@@ -116,7 +116,7 @@ pub async fn run_maintainer_loop() {
                     info!(workspace = %ws.name, agent_id = %agent_id, "Maintainer: starting maintenance run");
 
                     let (agent, response) =
-                        run_agent(agent_id.clone(), Role::Maintainer, &ws, None, &prompt, String::new(), String::new(), None).await;
+                        run_agent(agent_id.clone(), Role::Maintainer, &ws, None, &prompt, String::new(), String::new(), None, false).await;
 
                     if let Some(_response) = response {
                         info!(workspace = %ws.name, "Maintainer: run complete");

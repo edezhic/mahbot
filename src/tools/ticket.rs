@@ -537,6 +537,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(reset_inflight)] // shared global board — a concurrent boot reset would clobber the InQa fixture
     async fn test_update_ticket_tool() {
         crate::util::test::init_test_stores().await;
 
@@ -715,6 +716,7 @@ mod tests {
     // ── Pipeline-blocking guard tests ────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(reset_inflight)] // shared global board — a concurrent boot reset would clobber the InDevelopment fixture
     async fn test_guard_not_pipeline_blocking_cases() {
         crate::util::test::init_test_stores().await;
 
@@ -771,6 +773,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(reset_inflight)] // shared global board — a concurrent boot reset would clobber the InDevelopment fixture
     async fn test_update_ticket_blocked_by_pipeline() {
         let id = create_blocking_ticket().await;
         let ws = test_ws("/ws");
@@ -784,6 +787,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(reset_inflight)] // shared global board — a concurrent boot reset would clobber the InDevelopment fixture
     async fn test_create_ticket_supersede_blocked_by_pipeline() {
         let id = create_blocking_ticket().await;
         let ws = test_ws("/ws");

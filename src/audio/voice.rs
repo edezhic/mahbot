@@ -4329,7 +4329,8 @@ async fn route_to_agent(text: String) {
             "voice".to_string(),
             role,
             None,
-        );
+        )
+        .await;
         return;
     }
 
@@ -4361,7 +4362,8 @@ async fn route_to_agent(text: String) {
         "voice".to_string(),
         role,
         None,
-    );
+    )
+    .await;
 }
 
 // Voice pipeline background task

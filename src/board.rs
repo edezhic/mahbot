@@ -29,9 +29,15 @@ pub async fn run_archive_cancelled_loop() {
     let interval = std::time::Duration::from_mins(5);
 
     loop {
-        if !crate::shutdown::sleep_or_shutdown(interval).await {
+        if !crate::shutdown::sleep_or_shutdown_or_drain(interval).await {
             break;
         }
+
+        // Engineer-anchor terminal deletion (S5): remove permanently-NULL
+        // seats for tickets in a terminal phase — the TTL guard stops
+        // protecting the accumulated engineer session once the anchor is gone
+        // (idempotent, ≤5-min delay against the 8h TTL).
+        crate::jobs::purge_terminal_engineer_anchors().await;
 
         let Some(board) = BOARD.get() else {
             warn!("Archive cancelled loop: board not initialized");
@@ -1659,21 +1665,40 @@ impl BoardStore {
     ///
     /// Uses `Self::RESET_TRANSITIONS` (extracted as an associated const so tests
     /// can verify coverage against `PIPELINE_BLOCKING_PHASES`).
-    pub async fn reset_inflight_tickets(&self) -> Result<()> {
+    ///
+    /// `exclude_ticket_ids`: tickets with a RESUMED active job at boot must be
+    /// skipped — resetting them to a claimable phase would re-claim via the 1s
+    /// poll loop while the resumed agent runs (duplicate work/double LLM
+    /// cost/conflicting verdicts). An empty exclusion omits the clause.
+    pub async fn reset_inflight_tickets(&self, exclude_ticket_ids: &[String]) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
         let now = turso::now();
         for transition in Self::RESET_TRANSITIONS {
-            tx.execute(
+            let mut values: Vec<turso::Value> = vec![
+                turso::Value::Text(transition.to.as_ref().to_string()),
+                turso::Value::Text(now.clone()),
+                turso::Value::Text(transition.from.as_ref().to_string()),
+                turso::Value::Integer(i64::from(transition.pipeline_reservation)),
+            ];
+            let clause = if exclude_ticket_ids.is_empty() {
+                String::new()
+            } else {
+                // `IN ()` is invalid SQL — the empty exclusion omits the clause.
+                values.extend(
+                    exclude_ticket_ids
+                        .iter()
+                        .map(|s| turso::Value::Text(s.clone())),
+                );
+                format!(
+                    " AND id NOT IN ({})",
+                    turso::sql_in_placeholders(exclude_ticket_ids.len())
+                )
+            };
+            let sql = format!(
                 "UPDATE tickets SET phase = ?1, assigned_to = NULL, updated_at = ?2, \
-                 pipeline_reservation = ?4 WHERE phase = ?3",
-                turso::params![
-                    transition.to.as_ref(),
-                    now.clone(),
-                    transition.from.as_ref(),
-                    i64::from(transition.pipeline_reservation)
-                ],
-            )
-            .await?;
+                 pipeline_reservation = ?4 WHERE phase = ?3{clause}"
+            );
+            tx.execute(&sql, values).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -1871,6 +1896,7 @@ impl BoardStore {
                 kind: crate::message_router::JobKind::TicketComment,
                 role: commenter_role,
                 reply_target: None,
+                pending_job_id: None,
             };
 
             if crate::message_router::try_route(agent_id, job) {

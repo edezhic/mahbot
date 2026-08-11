@@ -26,6 +26,7 @@ pub(crate) mod embedder;
 pub(crate) mod extraction;
 pub(crate) mod git_commands;
 pub mod gui;
+pub mod jobs;
 pub(crate) mod joint_verdict;
 pub mod lock_utils;
 pub mod logs;
@@ -746,7 +747,17 @@ pub fn channel_registry() -> &'static ChannelRegistry {
 
 /// Typed role identifier for agents.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display, strum::EnumIter, strum::IntoStaticStr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumIter,
+    strum::IntoStaticStr,
 )]
 #[strum(serialize_all = "lowercase")]
 pub enum Role {
@@ -832,7 +843,7 @@ pub struct Agent {
 // ── Verdict type ─────────────────────────────────────────────────
 
 /// Result of a single review or QA verification pass.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Verdict {
     /// Quality score from 0 (worst) to 10 (best).
     #[serde(deserialize_with = "de_verdict_score")]

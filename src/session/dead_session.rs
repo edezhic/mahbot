@@ -170,7 +170,7 @@ pub(crate) static DEAD_SESSION_TRACKER: std::sync::LazyLock<DeadSessionTracker> 
 /// `tracing::warn!`.
 pub async fn run_dead_session_recovery_loop() {
     loop {
-        if !crate::shutdown::sleep_or_shutdown(POLL_INTERVAL).await {
+        if !crate::shutdown::sleep_or_shutdown_or_drain(POLL_INTERVAL).await {
             break;
         }
         if let Err(e) = recover_dead_sessions().await {
@@ -327,6 +327,7 @@ fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) {
         // GUI channel, but may not be deliverable via Telegram to unregistered
         // users.  This is an accepted limitation.
         reply_target: None,
+        pending_job_id: None,
     };
 
     tracing::info!(

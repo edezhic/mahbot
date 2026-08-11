@@ -53,7 +53,8 @@ async fn handle_option_callback(mut msg: ChannelMessage, decoded: (Option<String
         msg.channel,
         Role::Manager,
         None,
-    );
+    )
+    .await;
 }
 
 /// Run [`bootstrap_mahbot`] and convert panics into `Err` so the dashboard shows
@@ -162,7 +163,12 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         &shutdown_token,
         "session-cleanup",
         run_cleanup_loop("Session cleanup", |cutoff| async move {
-            mahbot::session::cleanup_old_transient_sessions(&cutoff).await
+            // Stale-job purge FIRST (cross-DB orchestrator: board rollback +
+            // sessions DELETE) — protected sessions only become eligible for
+            // the TTL guard after the purge cascade removes their job rows.
+            let purged = mahbot::jobs::purge_stale_jobs(&cutoff).await?;
+            let cleaned = mahbot::session::cleanup_old_transient_sessions(&cutoff).await?;
+            Ok(purged + cleaned)
         }),
     );
 
@@ -270,16 +276,20 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::management::run_management(),
     );
 
-    // Listen for SIGTERM/SIGINT and trigger shutdown — cancels the global
-    // token, which the dashboard subscription picks up to close the window.
+    // Listen for SIGTERM/SIGINT and drive the two-signal drain protocol.
+    // First signal begins the drain (wait_for_shutdown_signal calls
+    // drain_begin and keeps listening); the task returns only on a SECOND
+    // signal, which force-cancels the drain. Clean drain completion is
+    // driven by the drain-watch task below (fires the token when no
+    // in-flight agents or orchestrator calls remain).
     tasks.spawn(async move {
         let result = AssertUnwindSafe(mahbot::shutdown::wait_for_shutdown_signal())
             .catch_unwind()
             .await;
         match result {
             Ok(Ok(())) => {
-                info!("Received OS signal, triggering shutdown");
-                mahbot::shutdown::shutdown();
+                info!("Second signal received — force-cancelling drain");
+                mahbot::shutdown::force_cancel();
             }
             Ok(Err(e)) => {
                 error!("Signal handler failed to set up: {e}");
@@ -293,6 +303,25 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         }
     });
 
+    // Drain-watch: while the drain flag is set, poll the agent registry AND
+    // the non-agent call registry. Drain-cut ticket_stage/ask rounds
+    // intentionally leave their jobs status='launched' for boot resume
+    // (decision 20), so a jobs-table count cannot reach zero in the common
+    // drain — and even research jobs, which DO terminalize mid-drain via the
+    // partial-report path, tell us nothing about cut rounds — so the
+    // registries are the authoritative in-flight signal (orchestrator-only
+    // LLM calls — ask consolidation, research synthesis — are tracked in
+    // NON_AGENT_CALLS; the research orchestrator holds a whole-run guard).
+    // Clean exit when both empty; force-cancel stragglers at the 10-minute
+    // cap (in-flight ops with >10 min remaining budget are guaranteed-aborted
+    // and boot-resume via status=running).
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "drain-watch",
+        mahbot::jobs::run_drain_watch(),
+    );
+
     // Periodic WAL checkpoint as hygiene: compact committed frames and bound
     // WAL growth/reopen cost (committed data is fsync-durable at COMMIT
     // regardless of checkpoints). Non-truncating (PASSIVE) below the WAL-size
@@ -301,7 +330,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
     // loop avoids it (see checkpoint::periodic_checkpoint_all_databases).
     spawn_cancellable(&mut tasks, &shutdown_token, "auto-checkpoint", async {
         loop {
-            if !mahbot::shutdown::sleep_or_shutdown(Duration::from_mins(5)).await {
+            if !mahbot::shutdown::sleep_or_shutdown_or_drain(Duration::from_mins(5)).await {
                 break;
             }
             // The self-update path checkpoints all stores itself and cancels
@@ -435,6 +464,11 @@ async fn shutdown_after_dashboard() {
             }
         }
     }
+
+    // Single-writer checkpoint: the iced runtime is gone, so no background
+    // writer is live. Relocated here from save_and_exit (which ran it while
+    // background writers were still active — contradicting single-writer).
+    mahbot::checkpoint::checkpoint_all_databases().await;
 }
 
 fn main() -> Result<()> {
@@ -515,14 +549,15 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Background cleanup loop adapter — runs every 10 minutes until cancelled.
+/// Background cleanup loop adapter — runs every 10 minutes until cancelled
+/// or the graceful drain begins (stale purge must not race the drain).
 async fn run_cleanup_loop<F, Fut>(label: &'static str, cleanup: F)
 where
     F: Fn(String) -> Fut + Send + 'static,
     Fut: Future<Output = Result<u64>> + Send,
 {
     loop {
-        if !mahbot::shutdown::sleep_or_shutdown(Duration::from_mins(10)).await {
+        if !mahbot::shutdown::sleep_or_shutdown_or_drain(Duration::from_mins(10)).await {
             break;
         }
         let cutoff = (Utc::now() - ChronoDuration::hours(8)).to_rfc3339();
@@ -726,6 +761,7 @@ async fn deliver_clear_reply(
             kind: message_router::JobKind::UserMessage,
             role: effective_role,
             reply_target: Some(msg.reply_target.clone()),
+            pending_job_id: None,
         },
         &effective_role,
     )
@@ -1142,5 +1178,6 @@ async fn process_channel_message(mut msg: ChannelMessage) {
         msg.channel,
         effective_role,
         Some(msg.reply_target),
-    );
+    )
+    .await;
 }

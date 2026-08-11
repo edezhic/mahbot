@@ -364,15 +364,23 @@ pub(crate) async fn execute_update() -> Result<()> {
     //    Telegram channel must still be live for this notification).
     notify_admin("🔄 Starting new instance…", admin_target.as_deref()).await;
 
-    // 10. Shutdown: cancel all agents, close browser sessions, signal shutdown.
-    //     From here through exit(0) the update path owns the process: the GUI
-    //     exit path waits (update_is_finalizing) instead of exiting, so this
-    //     sequence cannot be aborted by a window close or SIGINT racing the
-    //     step-11 checkpoint on the iced runtime.
+    // 10. Begin the graceful drain (decision 21): the FULL drain, same as
+    //     window close — NOT fast-cancel. In-flight agents complete their
+    //     current round; the drain-watch task fires the global token when no
+    //     in-flight agents or orchestrator calls remain (or force-cancels at
+    //     the 10-min cap). The GUI
+    //     stays open with a "shutting down…" state; the GUI exit path waits
+    //     (update_is_finalizing) instead of exiting, so this sequence cannot
+    //     be aborted by a window close or SIGINT racing the step-11
+    //     checkpoint. No failure transitions with 'service shutting down'
+    //     comments fire — agents that cannot finish stay status=running and
+    //     boot-resume.
     UPDATE_FINALIZING.store(true, std::sync::atomic::Ordering::SeqCst);
-    crate::registry::AGENT_REGISTRY.shutdown_all();
+    crate::shutdown::drain_begin();
+    while !crate::shutdown::shutdown_token().is_cancelled() {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
     crate::tools::browser::close_all_browser_sessions().await;
-    crate::shutdown::shutdown();
 
     // 11. Checkpoint all databases BEFORE releasing the instance lock and
     //     spawning the replacement. `exit(0)` below bypasses Rust destructors,

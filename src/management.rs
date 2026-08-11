@@ -445,7 +445,10 @@ fn paused_workspace_sentence() -> &'static str {
 /// ReadyForDevelopment→InDevelopment claims, so a dispatch panic in an earlier
 /// phase still cascades through queued tickets until one reaches the Engineer.
 pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) -> String {
-    if crate::shutdown::shutdown_token().is_cancelled() {
+    if crate::shutdown::aborting() {
+        // Shutdown AND the graceful drain are excluded: a drain-cut round is
+        // not a failure, so no auto-pause fires at exit time (the job stays
+        // running for boot resume).
         return String::new();
     }
     let Some(ws) = resolve_ticket_workspace(ticket, "auto-pause skipped").await else {
@@ -612,21 +615,128 @@ async fn notify_ticket(
             kind: message_router::JobKind::TicketNotify,
             role: crate::Role::Manager,
             reply_target: None,
+            pending_job_id: None,
         },
     );
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn run_management() {
-    // Reset in-flight tickets from previous runs (crash/restart recovery)
-    if let Some(board) = BOARD.get()
-        && let Err(e) = board.reset_inflight_tickets().await
-    {
-        error!(error = %e, "Failed to reset in-flight tickets");
+    // Boot recovery scan (decision 7): first statement of run_management,
+    // BEFORE reset_inflight_tickets. Replays pending envelopes, materializes
+    // the resumed-ticket exclusion set, resets everything else, and returns
+    // the ticket_stage jobs selected for resume.
+    let resumable = match crate::jobs::recover_from_restart().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, "Boot recovery scan failed — proceeding with plain reset");
+            if let Some(board) = BOARD.get() {
+                let _ = board.reset_inflight_tickets(&[]).await;
+            }
+            Vec::new()
+        }
+    };
+
+    // Resume the selected rounds (silent background resume — no Manager
+    // notifications; results deliver via normal paths).
+    for stage in resumable {
+        let Ok(Some(workspace)) = crate::workspace::store()
+            .get_by_name(&stage.workspace_name)
+            .await
+        else {
+            warn!(
+                job = %stage.job_id,
+                workspace = %stage.workspace_name,
+                "Resume workspace unresolvable — deleting job row",
+            );
+            // Design: "Unresolvable workspace → delete job row" — a done row
+            // would linger without a workspace to drive it (envelope kinds
+            // have no ticket to reset; ticket_stage kinds are re-covered by
+            // the next boot's reset once no job row protects them).
+            let _ =
+                crate::jobs::terminalize_job(&crate::session::store().conn, &stage.job_id).await;
+            continue;
+        };
+        match stage.stage.as_str() {
+            // research/ask jobs carry no ticket — re-dispatch the orchestrator.
+            "research" => {
+                info!(job = %stage.job_id, "Resuming research run at boot");
+                let job_id = stage.job_id.clone();
+                let ws = workspace.clone();
+                tokio::spawn(async move {
+                    crate::tools::research::resume_research_run(&job_id, &ws).await;
+                });
+            }
+            // Over-cap research: deliver the partial report from the last
+            // checkpoint (the envelope is the caller's only result path).
+            "research_capped" => {
+                info!(
+                    job = %stage.job_id,
+                    "Delivering research partial report (boot re-dispatch cap exceeded)",
+                );
+                let job_id = stage.job_id.clone();
+                let ws = workspace.clone();
+                tokio::spawn(async move {
+                    crate::tools::research::research_capped_partial_report(&job_id, &ws).await;
+                });
+            }
+            "ask" => {
+                info!(job = %stage.job_id, "Resuming ask round at boot");
+                let job_id = stage.job_id.clone();
+                let ws = workspace.clone();
+                tokio::spawn(async move {
+                    crate::tools::ask::resume_ask_round(&job_id, &ws).await;
+                });
+            }
+            // Over-cap ask: deliver the failure envelope to the original
+            // caller (the <ask-tool-result> envelope is the async-ask caller's
+            // only result path — "failed = terminal … surface to user").
+            "ask_capped" => {
+                info!(
+                    job = %stage.job_id,
+                    "Delivering ask failure envelope (boot re-dispatch cap exceeded)",
+                );
+                let job_id = stage.job_id.clone();
+                let ws = workspace.clone();
+                tokio::spawn(async move {
+                    crate::tools::ask::ask_capped_envelope(&job_id, &ws).await;
+                });
+            }
+            _ => {
+                if let Ok(Some(ticket)) = crate::board::store().get_ticket(&stage.ticket_id).await {
+                    info!(
+                        job = %stage.job_id,
+                        ticket = %stage.ticket_id,
+                        stage = %stage.stage,
+                        "Resuming ticket stage round at boot",
+                    );
+                    tokio::spawn(resume_ticket_stage_round(
+                        stage.stage.clone(),
+                        stage.job_id.clone(),
+                        ticket,
+                        workspace,
+                    ));
+                } else {
+                    warn!(
+                        job = %stage.job_id,
+                        ticket = %stage.ticket_id,
+                        "Resume ticket not found — deleting job row",
+                    );
+                    let _ = crate::jobs::complete_ticket_stage_job(
+                        &crate::session::store().conn,
+                        &stage.job_id,
+                    )
+                    .await;
+                }
+            }
+        }
     }
 
     let interval = Duration::from_secs(1);
     loop {
-        if !crate::shutdown::sleep_or_shutdown(interval).await {
+        // Drain-aware: break when the graceful drain begins (in-flight rounds
+        // finish; no new work is spawned).
+        if !crate::shutdown::sleep_or_shutdown_or_drain(interval).await {
             break;
         }
         poll_round().await;
@@ -738,6 +848,16 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
                 panic = %msg,
                 "Dispatch panicked — transitioning ticket to Failed",
             );
+            if crate::shutdown::aborting() {
+                // Drain-cut: no Failed transition or workspace pause during the
+                // drain — the job stays status=running for boot resume
+                // (consistent with every other drain-cut path).
+                warn!(
+                    ticket = %ticket_for_failure.id,
+                    "Dispatch panic during drain — leaving ticket for boot resume"
+                );
+                return;
+            }
             // Pause before the Failed transition so the failure notification
             // reflects the paused workspace. Shutdown is excluded inside the helper.
             let pause_note =
@@ -1148,6 +1268,7 @@ async fn run_single_agent(
     ticket: &Ticket,
     message: &str,
     incoming_rx: tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>,
+    resume: bool,
 ) -> (Agent, Option<String>) {
     // run_agent consumes the ID — unregister uses a clone.
     let agent_id_for_unregister = agent_id.clone();
@@ -1160,6 +1281,7 @@ async fn run_single_agent(
         String::new(),
         String::new(),
         Some(incoming_rx),
+        resume,
     )
     .await;
 
@@ -1278,16 +1400,9 @@ async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
 /// post-run phase check to catch race conditions, then transitions:
 /// - InDiagnostics (buffer) on successful completion
 /// - Failed (notify) if the agent failed or returned no output
+#[allow(clippy::too_many_lines)]
 async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     let agent_id = ticket_agent_id(&ticket.id, Role::Engineer.as_str());
-
-    // Register in the message router so comments can be delivered mid-work.
-    let incoming_rx = register_agent_and_assign(
-        &ticket.id,
-        &agent_id,
-        "Failed to persist assigned_to — stale agent already cancelled at dispatch, proceeding without DB assignment",
-    )
-    .await;
 
     let last_eng_pos = ticket
         .comments
@@ -1309,19 +1424,106 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         )
     };
 
+    // Spawn the durable engineer round (single-slot roster) BEFORE the
+    // session write — the job is the resume handle across crashes AND
+    // graceful drains. The roster row carries the ACTUAL run agent id (the
+    // NULL-seat anchor) so the purge live-session protection and resume paths
+    // match the real session. The anchor itself (permanently-NULL seat) is
+    // upserted in the same window so the accumulated session
+    // `ticket_{id}_engineer` survives round-job deletion and the 8h purge.
+    let job_id = crate::generate_id();
+    let Ok(_slot) = spawn_single_slot_round(
+        &job_id,
+        &ticket,
+        &ws,
+        "engineer",
+        TicketPhase::InDevelopment,
+        Role::Engineer,
+        &message,
+        &agent_id,
+        None,
+    )
+    .await
+    else {
+        error!(
+            ticket = %ticket.id,
+            "Failed to spawn engineer job — aborting dispatch",
+        );
+        return;
+    };
+    if let Err(e) = crate::jobs::upsert_engineer_anchor(
+        &crate::session::store().conn,
+        &ticket.id,
+        &message,
+        crate::jobs::AgentStatus::Launched,
+    )
+    .await
+    {
+        warn!(
+            ticket = %ticket.id,
+            error = %e,
+            "Failed to upsert engineer anchor — session continuity across bounces degraded",
+        );
+    }
+
+    // Register in the message router so comments can be delivered mid-work.
+    let incoming_rx = register_agent_and_assign(
+        &ticket.id,
+        &agent_id,
+        "Failed to persist assigned_to — stale agent already cancelled at dispatch, proceeding without DB assignment",
+    )
+    .await;
+
     let (agent, response) = run_single_agent(
-        agent_id,
+        agent_id.clone(),
         Role::Engineer,
         &ws,
         &ticket,
         &message,
         incoming_rx,
+        false,
     )
     .await;
 
     // Post-run check still needed for race conditions during agent execution.
     if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InDevelopment).await {
+        complete_ticket_stage_job(&job_id).await;
         return;
+    }
+
+    // Drain-cut (decision 20): the job stays status=running for boot resume —
+    // no failure record, no outcome checkpoint (the roster row stays
+    // launched). Returned BEFORE the failure comment so drained agents never
+    // emit AGENT_FAILURE_EMOJI or drive exit-time rollback.
+    if response.is_none() && crate::shutdown::aborting() {
+        info!(
+            ticket = %ticket.id,
+            "Engineer round cut short by drain — job stays running for boot resume",
+        );
+        return;
+    }
+
+    // Checkpoint the round outcome to the roster row (the actual run session —
+    // the anchor id — so the purge live-session protection and any resume
+    // reconstruction match the real agent).
+    let outcome = response
+        .clone()
+        .unwrap_or_else(|| agent.failure_reason("engineer produced no response"));
+    let outcome_status = if response.is_some() {
+        crate::jobs::AgentStatus::Done
+    } else {
+        crate::jobs::AgentStatus::Failed
+    };
+    if let Err(e) = crate::jobs::write_agent_outcome(
+        &crate::session::store().conn,
+        &job_id,
+        &agent_id,
+        outcome_status,
+        Some(&outcome),
+    )
+    .await
+    {
+        warn!(job = %job_id, error = %e, "Failed to checkpoint engineer outcome");
     }
 
     // Diagnostics are dispatched by the poll loop as a separate
@@ -1333,6 +1535,8 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         agent.is_cancelled(),
         agent.failure.as_deref(),
     );
+
+    // The drain-cut case returned above — response None here is a real failure.
     let (comment_text, target_phase, notify) = if let Some(ref text) = response {
         (
             engineer_comment_text(&agent, text).await,
@@ -1369,6 +1573,9 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         "Engineer finished — transitioned ticket",
     )
     .await;
+
+    // Completion tx AFTER the board transition+comment (ordering contract).
+    complete_ticket_stage_job(&job_id).await;
 }
 
 /// Determine whether to notify immediately or buffer the Done transition.
@@ -1757,7 +1964,7 @@ async fn register_agent_and_assign(
 }
 
 /// Register a sanitation agent in the message router and persist the SAME
-/// suffixed agent ID in the ticket's `assigned_to`.
+/// job-derived agent ID in the ticket's `assigned_to`.
 ///
 /// Returns the registered agent ID and its inbox receiver, ready for
 /// [`run_agent`].
@@ -1767,11 +1974,11 @@ async fn register_agent_and_assign(
 /// [`BoardStore::add_comment`] routes mid-work comments to the agent(s)
 /// listed in `assigned_to` via an exact-match lookup in the message router
 /// (`route_comment_to_agents` → `try_route`). [`BoardStore::claim_sanitation`]
-/// stores the **unsuffixed** base ID (`ticket_{id}_sanitation`) as a
-/// claim-time placeholder, but the run agent registers under a **suffixed**
-/// ID (`ticket_{id}_sanitation_{suffix}` — each run starts a fresh session;
-/// see commit 728e79a). Without this step the two never match and mid-run
-/// comments are silently dropped.
+/// stores the **ticket**-derived base ID (`ticket_{ticket_id}_sanitation`) as a
+/// claim-time placeholder, but the run agent registers under a
+/// **job**-derived per-run ID (`ticket_{job_id}_sanitation` — decision 11;
+/// each run starts a fresh session). Without this step the two never match and
+/// mid-run comments are silently dropped.
 ///
 /// Setting `assigned_to` here — rather than only in `claim_sanitation` —
 /// also covers the re-dispatch path: after [`record_sanitation_failure`]
@@ -1783,15 +1990,12 @@ async fn register_agent_and_assign(
 /// Delegates registration + assignment to [`register_agent_and_assign`].
 async fn register_sanitation_agent(
     ticket_id: &str,
+    job_id: &str,
 ) -> (
     String,
     tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>,
 ) {
-    let agent_id = format!(
-        "{}_{}",
-        ticket_agent_id(ticket_id, Role::Sanitation.as_str()),
-        crate::generate_suffix()
-    );
+    let agent_id = format!("ticket_{job_id}_sanitation");
 
     let incoming_rx = register_agent_and_assign(
         ticket_id,
@@ -1811,12 +2015,8 @@ async fn register_sanitation_agent(
 ///
 /// After the agent completes, extracts a structured [`SanitationVerdict`] and
 /// delegates to [`process_sanitation_verdict`] for pass/fail processing.
+#[allow(clippy::too_many_lines)]
 async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
-    // Register in the message router AND persist the same suffixed agent ID in
-    // assigned_to so mid-run comments route to this agent (see
-    // register_sanitation_agent for the contract and ordering invariant).
-    let (agent_id, incoming_rx) = register_sanitation_agent(&ticket.id).await;
-
     //
     // Unlike handle_qa_passed (which fails closed on git errors — returning early
     // to stay in QaPassed for retry), dispatch_sanitation takes a fail-open approach:
@@ -1856,6 +2056,37 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         ],
     );
 
+    // Spawn the durable sanitation round BEFORE the session write — the job
+    // is the resume handle. The agent ID is derived per-run from the job id
+    // (decision 11: `ticket_{job_id}_sanitation`); the roster row carries the
+    // ACTUAL run id so the purge live-session protection and resume paths
+    // match the real session.
+    let job_id = crate::generate_id();
+    let Ok(_slot) = spawn_single_slot_round(
+        &job_id,
+        &ticket,
+        &ws,
+        "sanitation",
+        TicketPhase::InSanitation,
+        Role::Sanitation,
+        &prompt,
+        &format!("ticket_{job_id}_sanitation"),
+        None,
+    )
+    .await
+    else {
+        error!(
+            ticket = %ticket.id,
+            "Failed to spawn sanitation job — aborting dispatch",
+        );
+        return;
+    };
+
+    // Register in the message router AND persist the same job-derived agent ID
+    // in assigned_to so mid-run comments route to this agent (see
+    // register_sanitation_agent for the contract and ordering invariant).
+    let (agent_id, incoming_rx) = register_sanitation_agent(&ticket.id, &job_id).await;
+
     let (agent, response) = run_single_agent(
         agent_id,
         Role::Sanitation,
@@ -1863,24 +2094,52 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         &ticket,
         &prompt,
         incoming_rx,
+        false,
     )
     .await;
 
     // Post-run phase check — bail if ticket was moved externally.
     if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InSanitation).await {
+        complete_ticket_stage_job(&job_id).await;
         return;
     }
 
     if response.is_none() {
         // Agent failed or was cancelled — record failure and clear assigned_to
         // for re-dispatch retry. The marker comment lets the sanitation circuit
-        // breaker detect repeated failures.
+        // breaker detect repeated failures. During the graceful drain the job
+        // stays running for boot resume (decision 20) — no failure record, no
+        // outcome checkpoint.
+        if crate::shutdown::aborting() {
+            info!(
+                ticket = %ticket.id,
+                "Sanitation round cut short by drain — job stays running for boot resume",
+            );
+            return;
+        }
         warn!(
             ticket = %ticket.id,
             "Sanitation agent returned no output — clearing assigned_to for retry"
         );
         record_sanitation_failure(&ticket.id, "agent returned no output", None).await;
+        complete_ticket_stage_job(&job_id).await;
         return;
+    }
+
+    // Checkpoint the successful round outcome to the roster row (the actual
+    // run session — the job-derived id — so the purge live-session protection
+    // and any resume reconstruction match the real agent).
+    if let Some(text) = response.as_deref()
+        && let Err(e) = crate::jobs::write_agent_outcome(
+            &crate::session::store().conn,
+            &job_id,
+            &format!("ticket_{job_id}_sanitation"),
+            crate::jobs::AgentStatus::Done,
+            Some(text),
+        )
+        .await
+    {
+        warn!(job = %job_id, error = %e, "Failed to checkpoint sanitation outcome");
     }
 
     let extraction_prompt = crate::prompt::load_prompt("extraction/sanitation.md");
@@ -1900,11 +2159,15 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
                     Some(&failure),
                 )
                 .await;
+                complete_ticket_stage_job(&job_id).await;
                 return;
             }
         };
 
     process_sanitation_verdict(&ticket, verdict).await;
+
+    // Completion tx AFTER the board transition+comment (ordering contract).
+    complete_ticket_stage_job(&job_id).await;
 }
 
 /// Process the result of a sanitation agent inspection.
@@ -2354,14 +2617,22 @@ async fn build_joint_comment(
 /// inter-agent agreement per stage). Best-effort: failures are logged, never
 /// propagated — the verdict pipeline must not block on instrumentation. Rows
 /// live in the logs store (the project's stats store), not the board store.
-async fn persist_verdict_scores(ticket: &Ticket, stage: &str, results: &[ParallelVerdict]) {
+///
+/// `job_id` is the durable round identity for the resumed-round idempotent
+/// replay (PK (job_id, agent_index)).
+async fn persist_verdict_scores(
+    ticket: &Ticket,
+    stage: &str,
+    results: &[ParallelVerdict],
+    job_id: &str,
+) {
     let Some(store) = crate::logs::LOG_STORE.get() else {
         return;
     };
     for (i, r) in results.iter().enumerate() {
         if let ParallelVerdict::Verdict(v) = r
             && let Err(e) = store
-                .record_verdict_score(&ticket.id, stage, i, v.score, &v.issues_detected)
+                .record_verdict_score(job_id, &ticket.id, stage, i, v.score, &v.issues_detected)
                 .await
         {
             warn!(
@@ -2402,35 +2673,41 @@ fn load_verifier_angles(role: Role) -> Vec<String> {
 /// respond but fail to parse get [`ParallelVerdict::ParseFailed`]; successful
 /// agents get [`ParallelVerdict::Verdict`]. All extraction attempts run
 /// concurrently via [`join_all`].
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn run_parallel_agents(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
     role: Role,
-    prompt: &str,
     extraction_prompt: &str,
-    count: usize,
+    job_id: &str,
+    slots: &[TicketStageSlot],
+    resume: bool,
 ) -> Vec<ParallelVerdict> {
-    let suffix = crate::generate_suffix();
-    let angles = load_verifier_angles(role);
-
-    // ── Register all agents in the message router BEFORE spawning ──────
-    // This allows the board's comment-routing to deliver mid-work comments
-    // to any of these agents.
-    let agent_ids: Vec<String> = (0..count)
-        .map(|i| format!("ticket_{}_{}_{}_{}", ticket.id, i, suffix, role.as_str()))
-        .collect();
-
-    let receivers: Vec<_> = agent_ids
+    // ── Register the not-yet-done agents in the message router BEFORE
+    // spawning ── This allows the board's comment-routing to deliver
+    // mid-work comments to any of these agents. Done slots (resumed rounds)
+    // are never re-invoked — their outcomes are read from the roster.
+    let launched: Vec<&TicketStageSlot> = slots
         .iter()
-        .map(|agent_id| message_router::register_agent(agent_id))
+        .filter(|s| s.status != crate::jobs::AgentStatus::Done)
+        .collect();
+    let receivers: Vec<_> = launched
+        .iter()
+        .map(|s| message_router::register_agent(&s.agent_id))
         .collect();
 
-    // Set assigned_to to comma-separated agent IDs (no cancellation —
-    // agents are already registered and running would be cancelled).
-    let assigned_to_str = agent_ids.join(",");
-    if let Err(e) = board()
-        .set_assigned_to_no_cancel(&ticket.id, Some(&assigned_to_str))
-        .await
+    // Set assigned_to to the launched agent IDs (no cancellation — agents are
+    // already registered and running would be cancelled).
+    let assigned_to_str = launched
+        .iter()
+        .map(|s| s.agent_id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    if !assigned_to_str.is_empty()
+        && let Err(e) = board()
+            .set_assigned_to_no_cancel(&ticket.id, Some(&assigned_to_str))
+            .await
     {
         warn!(
             ticket = %ticket.id,
@@ -2439,34 +2716,37 @@ async fn run_parallel_agents(
         );
     }
 
-    // ── Spawn and run all agents concurrently ──────────────────────────
-    let results: Vec<ParallelVerdict> = {
-        let futures: Vec<_> = agent_ids
-            .into_iter()
+    // ── Spawn and run all launched agents concurrently ─────────────────
+    let mut results: Vec<ParallelVerdict> = Vec::with_capacity(slots.len());
+    {
+        let futures: Vec<_> = launched
+            .iter()
             .zip(receivers)
-            .enumerate()
-            .map(|(i, (agent_id, rx))| {
+            .map(|(slot, rx)| {
                 let ticket = Arc::clone(ticket);
-                let prompt = prompt.to_string();
                 let ws = ws.clone();
                 let extraction_prompt = extraction_prompt.to_string();
-                // Angle supplement by agent index; `i % len` cycles for counts
-                // beyond the asset's sections (defensive — reviewers max at 4).
-                let agent_prompt = if angles.is_empty() {
-                    prompt
-                } else {
-                    format!("{prompt}\n\n{}", angles[i % angles.len()])
-                };
+                let agent_id = slot.agent_id.clone();
+                let task = slot.task.clone();
                 async move {
+                    // Session-non-emptiness discriminator (resume dispatch
+                    // rule): a resumed slot whose session already contains the
+                    // task continues with an empty message (no duplicate
+                    // task-prompt append); a missing/empty session dispatches
+                    // fresh with the stored task (covers a crash between
+                    // roster-write and the first session write).
+                    let has_session =
+                        resume && crate::session::store().has_content(&agent_id).await;
                     let (agent, response) = run_agent(
                         agent_id.clone(),
                         role,
                         &ws,
                         Some(&ticket),
-                        &agent_prompt,
+                        if has_session { "" } else { &task },
                         String::new(),
                         String::new(),
                         Some(rx),
+                        resume,
                     )
                     .await;
 
@@ -2479,38 +2759,83 @@ async fn run_parallel_agents(
                         // the all-failed record and log carry the real cause
                         // instead of a generic "no response".
                         let reason = agent.failure_reason("agent produced no response");
-                        return ParallelVerdict::NoResponse(crate::util::scrub_credentials(
-                            &reason,
-                        ));
-                    }
-                    // KV cache preservation: `agent.extract_verdict` uses the
-                    // agent's own parameters (model, reasoning_effort, tools,
-                    // provider routing) so the extraction call is byte-identical
-                    // to the original verifier agent call — the provider can reuse the
-                    // cached prefix.
-                    //
-                    // The hardened outer retry loop (13 attempts,
-                    // backoff 5/10/20/40/60/60 s, 720 s wall cap) enforces
-                    // fail-closed score validation. On terminal
-                    // failure the RetryExhausted (carrying the last-attempt raw
-                    // text) flows into ParallelVerdict::ParseFailed for the ticket
-                    // comment.
-                    let verdict = agent
-                        .extract_verdict::<crate::Verdict>(
-                            &extraction_prompt,
-                            Some(&validate_verdict_score),
-                            None,
-                        )
-                        .await;
-                    match verdict {
-                        Ok(v) => ParallelVerdict::Verdict(v),
-                        Err(e) => ParallelVerdict::ParseFailed(e),
+                        ParallelVerdict::NoResponse(crate::util::scrub_credentials(&reason))
+                    } else {
+                        // KV cache preservation: `agent.extract_verdict` uses the
+                        // agent's own parameters (model, reasoning_effort, tools,
+                        // provider routing) so the extraction call is byte-identical
+                        // to the original verifier agent call — the provider can reuse the
+                        // cached prefix.
+                        //
+                        // The hardened outer retry loop (13 attempts,
+                        // backoff 5/10/20/40/60/60 s, 720 s wall cap) enforces
+                        // fail-closed score validation. On terminal
+                        // failure the RetryExhausted (carrying the last-attempt raw
+                        // text) flows into ParallelVerdict::ParseFailed for the ticket
+                        // comment.
+                        let verdict = agent
+                            .extract_verdict::<crate::Verdict>(
+                                &extraction_prompt,
+                                Some(&validate_verdict_score),
+                                None,
+                            )
+                            .await;
+                        match verdict {
+                            Ok(v) => ParallelVerdict::Verdict(v),
+                            Err(e) => ParallelVerdict::ParseFailed(e),
+                        }
                     }
                 }
             })
             .collect();
-        join_all(futures).await
-    };
+        let run_results: Vec<ParallelVerdict> = join_all(futures).await;
+
+        // ── Checkpoint: write per-agent outcomes BEFORE ParallelVerdict
+        // construction completes (no read-modify-write race). ──
+        let conn = &crate::session::store().conn;
+        let mut by_agent: std::collections::HashMap<&str, &ParallelVerdict> =
+            std::collections::HashMap::new();
+        for (slot, result) in launched.iter().zip(&run_results) {
+            let outcome = serialize_verdict_outcome(result);
+            let status = if matches!(result, ParallelVerdict::NoResponse(_)) {
+                crate::jobs::AgentStatus::Failed
+            } else {
+                crate::jobs::AgentStatus::Done
+            };
+            if let Err(e) = crate::jobs::write_agent_outcome(
+                conn,
+                job_id,
+                &slot.agent_id,
+                status,
+                Some(&outcome),
+            )
+            .await
+            {
+                warn!(
+                    job = %job_id,
+                    agent = %slot.agent_id,
+                    error = %e,
+                    "Failed to checkpoint agent outcome",
+                );
+            }
+            by_agent.insert(slot.agent_id.as_str(), result);
+        }
+
+        // ── Assemble results in dispatch order: done slots replay their
+        // stored outcome; launched slots use the fresh run. ──
+        for slot in slots {
+            if slot.status == crate::jobs::AgentStatus::Done {
+                let outcome = slot.outcome.clone().unwrap_or_default();
+                results.push(deserialize_verdict_outcome(&outcome));
+            } else if let Some(r) = by_agent.get(slot.agent_id.as_str()) {
+                results.push((*r).clone());
+            } else {
+                results.push(ParallelVerdict::NoResponse(
+                    "agent slot never dispatched".to_string(),
+                ));
+            }
+        }
+    }
 
     // ── Cleanup: clear assigned_to (no cancel, agents already done) ────
     if let Err(e) = board().set_assigned_to_no_cancel(&ticket.id, None).await {
@@ -2561,6 +2886,289 @@ fn raw_response_dump_section(failure: &crate::retry::RetryExhausted) -> String {
     }
 }
 
+// ── Ticket-stage job roster (durable round record) ─────────────────────
+
+/// One roster slot of a ticket_stage round. Roster rows ARE the round record:
+/// dispatched_count = roster size; escalation appends slots 3,4 (re-evaluated
+/// only when roster size == 3); replay re-runs missing agents FIRST, then
+/// re-processes when all outcomes present.
+struct TicketStageSlot {
+    /// Dispatch slot index (0-based; escalation continues at 3, 4).
+    idx: i64,
+    agent_id: String,
+    /// FINAL per-agent rendered prompt (angle appended) — makes replay exact
+    /// regardless of the angle formula or slot numbering.
+    task: String,
+    status: crate::jobs::AgentStatus,
+    /// Stored agents.outcome (tagged JSON) — set on replay of a done slot.
+    outcome: Option<String>,
+}
+
+/// Serialize a [`ParallelVerdict`] into the agents.outcome column. Tagged JSON
+/// keeps the three variants distinct so replay reconstruction is exact.
+fn serialize_verdict_outcome(result: &ParallelVerdict) -> String {
+    match result {
+        ParallelVerdict::Verdict(v) => serde_json::json!({ "verdict": v }).to_string(),
+        ParallelVerdict::NoResponse(reason) => {
+            serde_json::json!({ "no_response": reason }).to_string()
+        }
+        ParallelVerdict::ParseFailed(f) => {
+            serde_json::json!({ "parse_failed": raw_response_dump_section(f) }).to_string()
+        }
+    }
+}
+
+/// Reconstruct a [`ParallelVerdict`] from the agents.outcome column.
+/// Round-trip lossless for Verdict; ParseFailed degrades to NoResponse
+/// carrying the raw dump section (cosmetic — both are non-passing in the
+/// verdict processors).
+fn deserialize_verdict_outcome(outcome: &str) -> ParallelVerdict {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(outcome) else {
+        return ParallelVerdict::NoResponse("unreadable stored outcome".to_string());
+    };
+    if let Some(verdict) = v.get("verdict") {
+        match serde_json::from_value(verdict.clone()) {
+            Ok(v) => ParallelVerdict::Verdict(v),
+            Err(_) => ParallelVerdict::NoResponse("unreadable stored verdict".to_string()),
+        }
+    } else if let Some(r) = v.get("no_response").and_then(serde_json::Value::as_str) {
+        ParallelVerdict::NoResponse(r.to_string())
+    } else if let Some(p) = v.get("parse_failed").and_then(serde_json::Value::as_str) {
+        ParallelVerdict::NoResponse(p.to_string())
+    } else {
+        ParallelVerdict::NoResponse("unrecognized stored outcome".to_string())
+    }
+}
+
+/// Map a verdict role to the agents.kind vocabulary.
+const fn agent_kind_for_role(role: Role) -> crate::jobs::AgentKind {
+    match role {
+        Role::Reviewer | Role::Qa => crate::jobs::AgentKind::Verifier,
+        Role::Engineer => crate::jobs::AgentKind::Engineer,
+        Role::Sanitation => crate::jobs::AgentKind::Sanitation,
+        _ => crate::jobs::AgentKind::Analyst,
+    }
+}
+
+/// Next round number for a (ticket_id, stage) pair — MAX(round) + 1.
+async fn next_ticket_stage_round(
+    conn: &crate::turso::Connection,
+    ticket_id: &str,
+    stage: &str,
+) -> i64 {
+    conn.query_row(
+        "SELECT COALESCE(MAX(round), 0) + 1 FROM ticket_stage_jobs WHERE ticket_id = ?1 AND stage = ?2",
+        crate::turso::params![ticket_id, stage],
+        |row| row.get::<i64>(0),
+    )
+    .await
+    .unwrap_or(1)
+}
+
+/// Spawn a ticket_stage job + roster in ONE transaction (before any agent
+/// session write). The job row carries the rendered prompt template; each
+/// roster row carries the FINAL per-agent prompt. Returns the job id + slots.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_ticket_stage_round(
+    ticket: &Ticket,
+    ws: &Workspace,
+    stage: &'static str,
+    phase: TicketPhase,
+    role: Role,
+    prompt: &str,
+    count: usize,
+    review_base: Option<i64>,
+) -> anyhow::Result<(String, Vec<TicketStageSlot>)> {
+    let job_id = crate::generate_id();
+    let suffix = crate::generate_suffix();
+    let angles = load_verifier_angles(role);
+    let mut slots = Vec::with_capacity(count);
+    for i in 0..count {
+        let agent_id = format!("ticket_{}_{}_{}_{}", ticket.id, i, suffix, role.as_str());
+        // Angle supplement by agent index; `i % len` cycles for counts beyond
+        // the asset's sections (defensive — reviewers max at 4).
+        let task = if angles.is_empty() {
+            prompt.to_string()
+        } else {
+            format!("{prompt}\n\n{}", angles[i % angles.len()])
+        };
+        slots.push(TicketStageSlot {
+            idx: i64::try_from(i).unwrap_or(i64::MAX),
+            agent_id,
+            task,
+            status: crate::jobs::AgentStatus::Launched,
+            outcome: None,
+        });
+    }
+    let agents: Vec<crate::jobs::NewAgent> = slots
+        .iter()
+        .map(|s| crate::jobs::NewAgent {
+            agent_id: s.agent_id.clone(),
+            kind: agent_kind_for_role(role),
+            idx: Some(s.idx),
+            role,
+            task: s.task.clone(),
+        })
+        .collect();
+    // Round + child row computed BEFORE the spawn tx: the ticket_stage_jobs
+    // child row is inserted in the SAME tx as the job (all kinds use the
+    // shared in-tx child pattern — a missing child row is impossible for a
+    // committed job).
+    let round = next_ticket_stage_round(&crate::session::store().conn, &ticket.id, stage).await;
+    crate::jobs::spawn_job(
+        &crate::session::store().conn,
+        &job_id,
+        prompt,
+        &ws.name,
+        "",
+        "",
+        role,
+        &agents,
+        &crate::jobs::SpawnChild::TicketStage {
+            ticket_id: ticket.id.clone(),
+            stage: stage.to_string(),
+            phase: phase.as_ref().to_string(),
+            round,
+            review_base,
+        },
+    )
+    .await?;
+    Ok((job_id, slots))
+}
+
+/// Spawn a single-slot ticket_stage job whose roster row carries the EXACT
+/// run agent_id (engineer: the NULL-seat anchor id; sanitation: the
+/// job-derived `ticket_{job_id}_sanitation`). Roster rows must reference the
+/// ACTUAL session — phantom generated ids would never be checkpointed, would
+/// be ignored by resume paths, and would let the purge's live-session
+/// protection clause miss an active round. The anchor's NULL-seat row and this
+/// round's roster row coexist under the composite PK (job_id, agent_id).
+#[allow(clippy::too_many_arguments)]
+async fn spawn_single_slot_round(
+    job_id: &str,
+    ticket: &Ticket,
+    ws: &Workspace,
+    stage: &'static str,
+    phase: TicketPhase,
+    role: Role,
+    prompt: &str,
+    agent_id: &str,
+    review_base: Option<i64>,
+) -> anyhow::Result<TicketStageSlot> {
+    let slot = TicketStageSlot {
+        idx: 0,
+        agent_id: agent_id.to_string(),
+        task: prompt.to_string(),
+        status: crate::jobs::AgentStatus::Launched,
+        outcome: None,
+    };
+    crate::jobs::spawn_job(
+        &crate::session::store().conn,
+        job_id,
+        prompt,
+        &ws.name,
+        "",
+        "",
+        role,
+        &[crate::jobs::NewAgent {
+            agent_id: agent_id.to_string(),
+            kind: agent_kind_for_role(role),
+            idx: Some(0),
+            role,
+            task: prompt.to_string(),
+        }],
+        &crate::jobs::SpawnChild::TicketStage {
+            ticket_id: ticket.id.clone(),
+            stage: stage.to_string(),
+            phase: phase.as_ref().to_string(),
+            round: next_ticket_stage_round(&crate::session::store().conn, &ticket.id, stage).await,
+            review_base,
+        },
+    )
+    .await?;
+    Ok(slot)
+}
+
+/// Append escalation slots (3, 4) to an existing ticket_stage job.
+async fn append_ticket_stage_slots(
+    ticket: &Ticket,
+    job_id: &str,
+    role: Role,
+    prompt: &str,
+    count: usize,
+) -> anyhow::Result<Vec<TicketStageSlot>> {
+    let roster = crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
+    let roster_len = roster.len();
+    let next_idx = i64::try_from(roster_len).unwrap_or(i64::MAX);
+    let suffix = crate::generate_suffix();
+    let angles = load_verifier_angles(role);
+    let mut slots = Vec::with_capacity(count);
+    let now = crate::turso::now();
+    for (k, i) in (next_idx..next_idx + i64::try_from(count).unwrap_or(i64::MAX)).enumerate() {
+        let agent_id = format!("ticket_{}_{}_{}_{}", ticket.id, i, suffix, role.as_str());
+        let task = if angles.is_empty() {
+            prompt.to_string()
+        } else {
+            format!("{prompt}\n\n{}", angles[(roster_len + k) % angles.len()])
+        };
+        crate::session::store()
+            .conn
+            .execute(
+                "INSERT INTO agents \
+                 (job_id, agent_id, kind, idx, role, status, task, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'launched', ?6, ?7)",
+                crate::turso::params![
+                    job_id,
+                    agent_id.clone(),
+                    agent_kind_for_role(role).as_str(),
+                    i,
+                    role.as_str(),
+                    task.clone(),
+                    now.clone(),
+                ],
+            )
+            .await?;
+        slots.push(TicketStageSlot {
+            idx: i,
+            agent_id,
+            task,
+            status: crate::jobs::AgentStatus::Launched,
+            outcome: None,
+        });
+    }
+    Ok(slots)
+}
+
+/// Terminalize a ticket_stage job AFTER the board transition+comment ran
+/// (ordering contract: jobs-first would strand tickets — job done + ticket
+/// still in a blocking phase → excluded from boot reset, never rolled back).
+async fn complete_ticket_stage_job(job_id: &str) {
+    if let Err(e) =
+        crate::jobs::complete_ticket_stage_job(&crate::session::store().conn, job_id).await
+    {
+        warn!(job = %job_id, error = %e, "Failed to terminalize ticket_stage job");
+    }
+}
+
+/// Load the roster of a ticket_stage job from the agents table (boot resume).
+async fn load_ticket_stage_slots(job_id: &str) -> anyhow::Result<Vec<TicketStageSlot>> {
+    let rows = crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| TicketStageSlot {
+            idx: r.idx.unwrap_or(0),
+            agent_id: r.agent_id,
+            task: r.task,
+            status: match r.status.as_str() {
+                "done" => crate::jobs::AgentStatus::Done,
+                "failed" => crate::jobs::AgentStatus::Failed,
+                _ => crate::jobs::AgentStatus::Launched,
+            },
+            outcome: r.outcome,
+        })
+        .collect())
+}
+
 // ── Backlog Analysis ──────────────────────────────────────────────────
 
 /// Spawn 3 parallel analyst agents (base) to research a backlog ticket,
@@ -2600,39 +3208,104 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
     };
     let message = load_prompt(prompt_key);
     let extraction_prompt = load_prompt("extraction/analyst.md");
+
+    // Spawn the durable analysis round (jobs + roster, one tx) BEFORE the
+    // agents' first session writes — the roster is the round record.
+    let Ok((job_id, mut slots)) = spawn_ticket_stage_round(
+        &ticket,
+        &ws,
+        "analysis",
+        TicketPhase::Analysis,
+        Role::Analyst,
+        &message,
+        DEFAULT_PARALLEL_AGENT_COUNT,
+        None,
+    )
+    .await
+    else {
+        error!(
+            ticket = %ticket.id,
+            "Failed to spawn analysis job — aborting dispatch",
+        );
+        return;
+    };
     let mut results = run_parallel_agents(
         &ticket,
         &ws,
         Role::Analyst,
-        &message,
         &extraction_prompt,
-        DEFAULT_PARALLEL_AGENT_COUNT,
+        &job_id,
+        &slots,
+        false,
     )
     .await;
 
     // Unanimous-blocker escalation: when every dispatched analyst flagged a
     // blocker, add 2 more analysts (same model) for depth before the Manager
     // decision. Analysis stays fail-open — the ticket always advances.
-    if crate::joint_verdict::analysis_escalation_needed(&results, DEFAULT_PARALLEL_AGENT_COUNT) {
+    // Escalation appends slots 3,4 to the SAME job (re-evaluated only when
+    // roster size == 3 — matches analysis_escalation_needed). Skipped during
+    // the graceful drain — no new jobs are spawned while draining.
+    if crate::joint_verdict::analysis_escalation_needed(&results, DEFAULT_PARALLEL_AGENT_COUNT)
+        && !crate::shutdown::aborting()
+    {
         // Re-check the phase before spending the second batch — the ticket
         // may have been moved externally while the first batch ran.
         if !is_ticket_in_phase(&ticket.id, TicketPhase::Analysis).await {
+            complete_ticket_stage_job(&job_id).await;
             return;
         }
         info!(
             ticket = %ticket.id,
             "All analysts flagged blockers — escalating with 2 additional analysts",
         );
-        let extra =
-            run_parallel_agents(&ticket, &ws, Role::Analyst, &message, &extraction_prompt, 2).await;
+        let extra_slots =
+            match append_ticket_stage_slots(&ticket, &job_id, Role::Analyst, &message, 2).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        ticket = %ticket.id,
+                        error = %e,
+                        "Failed to append escalation slots — proceeding with base round",
+                    );
+                    Vec::new()
+                }
+            };
+        let extra = if extra_slots.is_empty() {
+            Vec::new()
+        } else {
+            run_parallel_agents(
+                &ticket,
+                &ws,
+                Role::Analyst,
+                &extraction_prompt,
+                &job_id,
+                &extra_slots,
+                false,
+            )
+            .await
+        };
+        slots.extend(extra_slots);
         results.extend(extra);
     }
 
     if !is_ticket_in_phase(&ticket.id, TicketPhase::Analysis).await {
+        complete_ticket_stage_job(&job_id).await;
         return;
     }
 
-    process_analyst_verdicts(&ws, &ticket, &results).await;
+    process_analyst_verdicts(&ws, &ticket, &results, &job_id).await;
+
+    // Drain-cut: the analysts' outcomes are checkpointed; the job stays
+    // status=running for boot resume (process_analyst_verdicts itself skips
+    // the transition while draining — no misleading joint comment).
+    if crate::shutdown::aborting() {
+        return;
+    }
+
+    // Completion tx AFTER the board transition+comment (ordering contract:
+    // jobs-first would strand a ticket in a blocking phase with no job row).
+    complete_ticket_stage_job(&job_id).await;
 }
 
 /// Evaluate analyst verdicts and transition the ticket:
@@ -2645,7 +3318,12 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 ///
 /// See the "Parallel agent helpers (shared)" section for why this is separate
 /// from [`process_verifier_verdicts`].
-async fn process_analyst_verdicts(ws: &Workspace, ticket: &Ticket, results: &[ParallelVerdict]) {
+async fn process_analyst_verdicts(
+    ws: &Workspace,
+    ticket: &Ticket,
+    results: &[ParallelVerdict],
+    job_id: &str,
+) {
     let nonempty_count = results
         .iter()
         .filter(|r| !matches!(r, ParallelVerdict::NoResponse(_)))
@@ -2689,7 +3367,15 @@ async fn process_analyst_verdicts(ws: &Workspace, ticket: &Ticket, results: &[Pa
     // Persist per-agent verdict scores (shadow instrumentation, best-effort —
     // never blocks the pipeline). Stage label uses the same spelling as the
     // joint-comment role (stage_name) so both stores agree.
-    persist_verdict_scores(ticket, stage_name(Role::Analyst), results).await;
+    persist_verdict_scores(ticket, stage_name(Role::Analyst), results, job_id).await;
+
+    // No exit-time transition during the graceful drain (decision 20): the
+    // outcomes are checkpointed on the roster; the job stays status=running
+    // and boot resume re-processes them. A drained analysis round must NOT
+    // write a misleading joint comment or Notify the Manager.
+    if crate::shutdown::aborting() {
+        return;
+    }
 
     // Synthesis runs BEFORE the transition and never holds the board write
     // lock (the comment+transition transaction serializes all board writes).
@@ -3021,6 +3707,7 @@ async fn process_verifier_verdicts(
     ticket: &Ticket,
     results: &[ParallelVerdict],
     verifier: VerifierInfo,
+    job_id: &str,
 ) -> bool {
     let all_failed = results
         .iter()
@@ -3033,7 +3720,7 @@ async fn process_verifier_verdicts(
     });
 
     // Persist per-agent verdict scores (shadow instrumentation, best-effort).
-    persist_verdict_scores(ticket, stage_name(verifier.role), results).await;
+    persist_verdict_scores(ticket, stage_name(verifier.role), results, job_id).await;
 
     // Bounce-based circuit breaker: the 9th bounce fails the ticket. The
     // counter is incremented atomically with the bounce-back transition.
@@ -3060,6 +3747,22 @@ async fn process_verifier_verdicts(
     } else {
         (verifier.success_phase, NotifyPolicy::Buffer)
     };
+    // No exit-time ticket rollback (decision 20): during the graceful drain a
+    // failed round must NOT drive the ticket to Failed, bounce it, or pause
+    // the workspace — the job stays status=running for boot resume, which
+    // re-processes the stored outcomes. Suppresses ALL transitions (consistent
+    // with process_analyst_verdicts): a partial round whose drain-cut members
+    // produced NoResponse would otherwise hit the any_failed bounce path and
+    // bounce the ticket with a joint comment during the drain, discarding the
+    // checkpointed outcomes.
+    if crate::shutdown::aborting() {
+        info!(
+            ticket = %ticket.id,
+            stage = %verifier.log_label,
+            "Verifier round cut short by drain — job stays running for boot resume",
+        );
+        return false;
+    }
 
     // Preserve the per-agent failure reasons (previously collapsed into a
     // generic "no response") and auto-pause the workspace BEFORE the Failed
@@ -3327,6 +4030,404 @@ async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> (usize, Op
     (count, to_freeze)
 }
 
+/// Resume a ticket_stage round at boot (decisions 7/8): re-run missing roster
+/// slots FIRST, then re-process verdicts from stored outcomes when all are
+/// present. Silent background resume — no Manager notifications; results
+/// deliver via normal paths (board comment/transition).
+async fn resume_ticket_stage_round(stage: String, job_id: String, ticket: Ticket, ws: Workspace) {
+    match stage.as_str() {
+        "analysis" => resume_analysis_round(&job_id, ticket, ws).await,
+        "review" => resume_verifier_round(&job_id, ticket, ws, REVIEWER_VI).await,
+        "qa" => resume_verifier_round(&job_id, ticket, ws, QA_VI).await,
+        "engineer" => resume_engineer_round(&job_id, ticket, ws).await,
+        "sanitation" => resume_sanitation_round(&job_id, ticket, ws).await,
+        other => {
+            warn!(stage = %other, job = %job_id, "Unknown ticket_stage on resume — completing job");
+            complete_ticket_stage_job(&job_id).await;
+        }
+    }
+}
+
+/// Resume an analysis round: re-run not-done roster slots, re-evaluate
+/// escalation only when roster size == 3 (matches analysis_escalation_needed),
+/// then re-process verdicts through the existing process_analyst_verdicts.
+async fn resume_analysis_round(job_id: &str, ticket: Ticket, ws: Workspace) {
+    if !is_ticket_in_phase(&ticket.id, TicketPhase::Analysis).await {
+        complete_ticket_stage_job(job_id).await;
+        return;
+    }
+    let Ok(mut slots) = load_ticket_stage_slots(job_id).await else {
+        complete_ticket_stage_job(job_id).await;
+        return;
+    };
+    let extraction_prompt = load_prompt("extraction/analyst.md");
+    let ticket_arc = Arc::new(ticket);
+    let mut results = run_parallel_agents(
+        &ticket_arc,
+        &ws,
+        Role::Analyst,
+        &extraction_prompt,
+        job_id,
+        &slots,
+        true,
+    )
+    .await;
+
+    // Escalation re-evaluated ONLY at roster size 3 (the crash may have hit
+    // between the base round and the escalation batch). Drain guard mirrors
+    // the fresh dispatch path — never append slots or spawn analysts during
+    // the graceful drain. The stored task is fetched lazily (only the
+    // escalation branch needs it).
+    if slots.len() == 3
+        && crate::joint_verdict::analysis_escalation_needed(&results, DEFAULT_PARALLEL_AGENT_COUNT)
+        && !crate::shutdown::aborting()
+    {
+        let job_prompt = job_task(job_id).await;
+        if !is_ticket_in_phase(&ticket_arc.id, TicketPhase::Analysis).await {
+            complete_ticket_stage_job(job_id).await;
+            return;
+        }
+        info!(ticket = %ticket_arc.id, job = %job_id, "Resume: escalating with 2 additional analysts");
+        let extra_slots = match append_ticket_stage_slots(
+            &ticket_arc,
+            job_id,
+            Role::Analyst,
+            &job_prompt,
+            2,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(job = %job_id, error = %e, "Resume: escalation slot append failed — proceeding");
+                Vec::new()
+            }
+        };
+        let extra = if extra_slots.is_empty() {
+            Vec::new()
+        } else {
+            run_parallel_agents(
+                &ticket_arc,
+                &ws,
+                Role::Analyst,
+                &extraction_prompt,
+                job_id,
+                &extra_slots,
+                true,
+            )
+            .await
+        };
+        slots.extend(extra_slots);
+        results.extend(extra);
+    }
+
+    if !is_ticket_in_phase(&ticket_arc.id, TicketPhase::Analysis).await {
+        complete_ticket_stage_job(job_id).await;
+        return;
+    }
+    if crate::shutdown::aborting() {
+        // Drain-cut: outcomes checkpointed, job stays running for boot resume.
+        return;
+    }
+    process_analyst_verdicts(&ws, &ticket_arc, &results, job_id).await;
+    complete_ticket_stage_job(job_id).await;
+}
+
+/// Resume a verifier round (review/QA): re-run missing slots, then re-process
+/// verdicts. REPLAY INCLUDES THE DISPATCH TAIL — set_review_base_count
+/// (ticket-level freeze), git add -A auto-stage, set_reviewed_base — or the
+/// review_base_count stays NULL and the skip-review gate never fires.
+async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: VerifierInfo) {
+    if !is_ticket_in_phase(&ticket.id, vi.active_phase).await {
+        complete_ticket_stage_job(job_id).await;
+        return;
+    }
+    let Ok(slots) = load_ticket_stage_slots(job_id).await else {
+        complete_ticket_stage_job(job_id).await;
+        return;
+    };
+    let extraction_prompt = load_prompt(vi.extraction_prompt_path);
+    let ticket_arc = Arc::new(ticket);
+    let results = run_parallel_agents(
+        &ticket_arc,
+        &ws,
+        vi.role,
+        &extraction_prompt,
+        job_id,
+        &slots,
+        true,
+    )
+    .await;
+    if !is_ticket_in_phase(&ticket_arc.id, vi.active_phase).await {
+        complete_ticket_stage_job(job_id).await;
+        return;
+    }
+    if crate::shutdown::aborting() {
+        // Drain-cut: outcomes checkpointed, job stays running for boot resume.
+        return;
+    }
+
+    let is_reviewer = vi.role == Role::Reviewer;
+    let repo_path = ws.as_path();
+    let git_available = is_reviewer
+        && crate::git_commands::git_is_installed().await
+        && crate::git_commands::is_git_repo(repo_path);
+
+    // Dispatch tail part 1: freeze the reviewer base count (ticket-level).
+    // The base was frozen on the ticket_stage_jobs row at spawn; the replay
+    // re-applies it to the tickets table so later rounds reuse the frozen
+    // base (the skip-review gate depends on it).
+    if is_reviewer {
+        let frozen: Option<i64> = crate::session::store()
+            .conn
+            .query_optional(
+                "SELECT review_base FROM ticket_stage_jobs WHERE id = ?1",
+                crate::turso::params![job_id],
+                |row| row.get::<i64>(0),
+            )
+            .await
+            .ok()
+            .flatten();
+        if let Some(base) = frozen
+            && let Err(e) = board().set_review_base_count(&ticket_arc.id, base).await
+        {
+            warn!(
+                ticket = %ticket_arc.id,
+                error = %e,
+                "Resume: failed to freeze reviewer base count on the ticket",
+            );
+        }
+    }
+
+    let transitioned = process_verifier_verdicts(&ws, &ticket_arc, &results, vi, job_id).await;
+
+    // Drain-cut verifier round: job stays status=running for boot resume (the
+    // stored outcomes are re-processed at boot via the phase-locked ticket).
+    if !transitioned && crate::shutdown::aborting() {
+        info!(
+            ticket = %ticket_arc.id,
+            "Resumed verifier round cut short by drain — job stays running for boot resume",
+        );
+        return;
+    }
+
+    // Dispatch tail part 2: auto-stage + record reviewed base after review.
+    let reviewed = results
+        .iter()
+        .any(|r| matches!(r, ParallelVerdict::Verdict(_)));
+    if git_available && transitioned && reviewed {
+        if let Err(e) = run_git_add_all(repo_path).await {
+            warn!(
+                ticket = %ticket_arc.id,
+                error = %e,
+                "Resume: failed to stage changes after review — reviewed base not recorded",
+            );
+        } else {
+            let head = run_git_head(repo_path).await.ok();
+            let tree = run_git_write_tree(repo_path).await.ok();
+            if let (Some(head), Some(tree)) = (head, tree)
+                && let Err(e) = board()
+                    .set_reviewed_base(&ticket_arc.id, Some(&head), Some(&tree))
+                    .await
+            {
+                warn!(
+                    ticket = %ticket_arc.id,
+                    error = %e,
+                    "Resume: failed to record reviewed base",
+                );
+            }
+        }
+    }
+    complete_ticket_stage_job(job_id).await;
+}
+
+/// Resume an engineer round: the accumulated session `ticket_{id}_engineer`
+/// resumes with an EMPTY message when the session already contains the task
+/// (no duplicate task-prompt append, S5 continuity); a missing/empty session
+/// (crash between roster-write and the first session write) dispatches fresh
+/// with the stored task. The response drives the normal transition tail.
+async fn resume_engineer_round(job_id: &str, ticket: Ticket, ws: Workspace) {
+    if !is_ticket_in_phase(&ticket.id, TicketPhase::InDevelopment).await {
+        complete_ticket_stage_job(job_id).await;
+        return;
+    }
+    // Idempotent anchor (re)upsert at the START (decision 10): a crash between
+    // spawn_single_slot_round and the fresh-dispatch upsert (two adjacent
+    // awaits) leaves this round WITHOUT a NULL-seat anchor — after CASCADE the
+    // accumulated session `ticket_{id}_engineer` would lose TTL protection and
+    // the next bounce round would lose S5 context. The partial unique index
+    // makes the upsert idempotent (single row per agent_id, job_id NULL).
+    let task = job_task(job_id).await;
+    if let Err(e) = crate::jobs::upsert_engineer_anchor(
+        &crate::session::store().conn,
+        &ticket.id,
+        &task,
+        crate::jobs::AgentStatus::Launched,
+    )
+    .await
+    {
+        warn!(
+            ticket = %ticket.id,
+            job = %job_id,
+            error = %e,
+            "Resume: failed to upsert engineer anchor — session continuity degraded",
+        );
+    }
+    let anchor_id = crate::jobs::engineer_anchor_id(&ticket.id);
+    let incoming_rx = register_agent_and_assign(
+        &ticket.id,
+        &anchor_id,
+        "Failed to persist assigned_to for resumed engineer — comments may not route",
+    )
+    .await;
+
+    // Session-non-emptiness discriminator (resume dispatch rule). The check is
+    // "any session content", not "current round's task present": a crash
+    // between the anchor upsert and this round's session.init leaves the
+    // round's feedback undelivered (a non-empty prior round then dispatches an
+    // empty message). Narrow window, quality-only — accepted.
+    let has_session = crate::session::store().has_content(&anchor_id).await;
+    let message = if has_session { String::new() } else { task };
+    let (agent, response) = run_single_agent(
+        anchor_id.clone(),
+        Role::Engineer,
+        &ws,
+        &ticket,
+        &message,
+        incoming_rx,
+        true,
+    )
+    .await;
+
+    if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InDevelopment).await {
+        complete_ticket_stage_job(job_id).await;
+        return;
+    }
+    let Some(text) = response else {
+        if crate::shutdown::aborting() {
+            // Drain-cut: job stays status=running for boot resume.
+            return;
+        }
+        let failure_comment = engineer_failure_comment(
+            crate::shutdown::shutdown_token().is_cancelled(),
+            agent.is_cancelled(),
+            agent.failure.as_deref(),
+        );
+        let pause_note = pause_workspace_on_failure(&ticket, "engineer agent failure").await;
+        comment_and_transition_or_bail(
+            TransitionCtx {
+                ticket: &ticket,
+                source: TicketPhase::InDevelopment,
+                target: TicketPhase::Failed,
+                notify: NotifyPolicy::Notify,
+                log_label: "Engineer",
+                breaker_trip: false,
+            },
+            Role::Engineer.as_str(),
+            &format!("{failure_comment}{pause_note}"),
+            "Resumed engineer failed — transitioned ticket",
+        )
+        .await;
+        complete_ticket_stage_job(job_id).await;
+        return;
+    };
+    let comment_text = engineer_comment_text(&agent, &text).await;
+    comment_and_transition_or_bail(
+        TransitionCtx {
+            ticket: &ticket,
+            source: TicketPhase::InDevelopment,
+            target: TicketPhase::InDiagnostics,
+            notify: NotifyPolicy::Buffer,
+            log_label: "Engineer",
+            breaker_trip: false,
+        },
+        Role::Engineer.as_str(),
+        &comment_text,
+        "Resumed engineer finished — transitioned ticket",
+    )
+    .await;
+    complete_ticket_stage_job(job_id).await;
+}
+
+/// Resume a sanitation round: resume the job-derived agent session (empty
+/// message when the session exists; stored task when missing), extract the
+/// verdict, and process it.
+async fn resume_sanitation_round(job_id: &str, ticket: Ticket, ws: Workspace) {
+    if !is_ticket_in_phase(&ticket.id, TicketPhase::InSanitation).await {
+        complete_ticket_stage_job(job_id).await;
+        return;
+    }
+    let agent_id = format!("ticket_{job_id}_sanitation");
+    let incoming_rx = register_agent_and_assign(
+        &ticket.id,
+        &agent_id,
+        "Failed to persist assigned_to for resumed sanitation — comments may not route",
+    )
+    .await;
+    let has_session = crate::session::store().has_content(&agent_id).await;
+    let message = if has_session {
+        String::new()
+    } else {
+        job_task(job_id).await
+    };
+    let (agent, response) = run_single_agent(
+        agent_id,
+        Role::Sanitation,
+        &ws,
+        &ticket,
+        &message,
+        incoming_rx,
+        true,
+    )
+    .await;
+    if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InSanitation).await {
+        complete_ticket_stage_job(job_id).await;
+        return;
+    }
+    let Some(_) = response else {
+        if crate::shutdown::aborting() {
+            // Drain-cut: job stays status=running for boot resume.
+            return;
+        }
+        record_sanitation_failure(&ticket.id, "agent returned no output (resumed)", None).await;
+        complete_ticket_stage_job(job_id).await;
+        return;
+    };
+    let extraction_prompt = load_prompt("extraction/sanitation.md");
+    match agent
+        .extract_verdict::<crate::SanitationVerdict>(&extraction_prompt, None, None)
+        .await
+    {
+        Ok(verdict) => {
+            process_sanitation_verdict(&ticket, verdict).await;
+        }
+        Err(failure) => {
+            record_sanitation_failure(
+                &ticket.id,
+                format!("verdict extraction error (resumed): {failure}"),
+                Some(&failure),
+            )
+            .await;
+        }
+    }
+    complete_ticket_stage_job(job_id).await;
+}
+
+/// Read a job's stored task (the FINAL rendered prompt template).
+async fn job_task(job_id: &str) -> String {
+    crate::session::store()
+        .conn
+        .query_optional(
+            "SELECT task FROM jobs WHERE id = ?1",
+            crate::turso::params![job_id],
+            |row| row.get::<String>(0),
+        )
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
 /// Shared dispatch logic for parallel verifiers (reviewers and QA).
 /// Fetches the engineer's last comment, builds a prompt from the template,
 /// runs parallel verifiers of the given role (reviewers use the calibrated
@@ -3412,9 +4513,42 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
         count,
         "Dispatching {count} parallel verifier(s)",
     );
-    let results =
-        run_parallel_agents(&ticket, &ws, vi.role, &prompt, &extraction_prompt, count).await;
+
+    // Spawn the durable verifier round (jobs + roster, one tx) BEFORE the
+    // agents' first session writes. review_base frozen on the job row at
+    // spawn — resume bypasses dispatch_verifiers, so the ticket-level freeze
+    // never fires on a resumed round.
+    let stage = if is_reviewer { "review" } else { "qa" };
+    let Ok((job_id, slots)) = spawn_ticket_stage_round(
+        &ticket,
+        &ws,
+        stage,
+        vi.active_phase,
+        vi.role,
+        &prompt,
+        count,
+        base_to_freeze,
+    )
+    .await
+    else {
+        error!(
+            ticket = %ticket.id,
+            "Failed to spawn verifier job — aborting dispatch",
+        );
+        return;
+    };
+    let results = run_parallel_agents(
+        &ticket,
+        &ws,
+        vi.role,
+        &extraction_prompt,
+        &job_id,
+        &slots,
+        false,
+    )
+    .await;
     if !is_ticket_in_phase(&ticket.id, vi.active_phase).await {
+        complete_ticket_stage_job(&job_id).await;
         return;
     }
 
@@ -3432,7 +4566,20 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
         );
     }
 
-    let transitioned = process_verifier_verdicts(&ws, &ticket, &results, vi).await;
+    let transitioned = process_verifier_verdicts(&ws, &ticket, &results, vi, &job_id).await;
+
+    // Drain-cut verifier round (the drain guard inside process_verifier_verdicts
+    // returned false): the job stays status=running for boot resume — the
+    // stored outcomes are re-processed at boot via the phase-locked ticket.
+    // Terminalizing here would discard completed/checkpointed outcomes and
+    // force a whole-round re-run (decision 20 violation).
+    if !transitioned && crate::shutdown::aborting() {
+        info!(
+            ticket = %ticket.id,
+            "Verifier round cut short by drain — job stays running for boot resume",
+        );
+        return;
+    }
 
     // ── Auto-stage + record reviewed base after review ───────────────
     // Stage all working tree changes so the index captures the reviewed
@@ -3478,6 +4625,9 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
             }
         }
     }
+
+    // Completion tx AFTER the board transition+comment (ordering contract).
+    complete_ticket_stage_job(&job_id).await;
 }
 
 #[cfg(test)]

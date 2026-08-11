@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::OnceCell;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tracing::info;
 use tracing::warn;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -185,14 +186,20 @@ CREATE INDEX IF NOT EXISTS idx_image_gen_calls_model ON image_gen_calls(model);
 -- Shadow-instrumentation rows for the joint-verdict pipeline: per-agent
 -- verdict scores per stage round, so inter-agent agreement can be
 -- re-measured and the dynamic-count formula validated after launch.
+-- PK (job_id, agent_index): the job row is the round identity (ticket +
+-- stage + round) so replays of a resumed round are idempotent
+-- (ON CONFLICT DO UPDATE). Historical rows predating the job_id column were
+-- dropped (user-approved); `migrate_verdict_scores_shape` performs the
+-- guarded one-tx DROP+CREATE for legacy stores.
 CREATE TABLE IF NOT EXISTS verdict_scores (
-    id          TEXT PRIMARY KEY,
-    ticket_id   TEXT NOT NULL,
-    stage       TEXT NOT NULL,
-    agent_index INTEGER NOT NULL,
-    score       INTEGER NOT NULL,
-    issues      TEXT NOT NULL,
-    created_at  TEXT NOT NULL
+    job_id       TEXT NOT NULL,
+    agent_index  INTEGER NOT NULL,
+    ticket_id    TEXT NOT NULL,
+    stage        TEXT NOT NULL,
+    score        INTEGER NOT NULL,
+    issues       TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (job_id, agent_index)
 );
 CREATE INDEX IF NOT EXISTS idx_verdict_scores_ticket_id ON verdict_scores(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_verdict_scores_created_at ON verdict_scores(created_at);";
@@ -214,8 +221,8 @@ impl LogStore {
     /// logged and the store is recreated (or, in the extreme case, the
     /// pre-quarantine error is surfaced).
     pub(crate) async fn open(root: &Path) -> anyhow::Result<Self> {
-        match open_verified_logs_store(root).await {
-            Ok(conn) => Ok(Self { conn }),
+        let store = match open_verified_logs_store(root).await {
+            Ok(conn) => Self { conn },
             Err(OpenFailure::Corrupt(reason)) => {
                 warn!(
                     error = %reason,
@@ -226,10 +233,18 @@ impl LogStore {
                 let conn = crate::turso::open_store(root, "logs", LOGS_SCHEMA)
                     .await
                     .context("Failed to recreate logs store after quarantine")?;
-                Ok(Self { conn })
+                Self { conn }
             }
-            Err(OpenFailure::Other(e)) => Err(e),
-        }
+            Err(OpenFailure::Other(e)) => return Err(e),
+        };
+        // Guarded verdict_scores shape migration (decision 4): runs at
+        // store open, idempotent — a re-run finds the new shape and no-ops.
+        // The quarantine-recreate path produces the new shape directly via
+        // LOGS_SCHEMA, so the guard is a no-op there too.
+        migrate_verdict_scores_shape(&store.conn)
+            .await
+            .context("Failed to migrate verdict_scores shape")?;
+        Ok(store)
     }
 
     /// Insert a batch of log entries in a single transaction.
@@ -292,30 +307,34 @@ impl LogStore {
     /// failures; the verdict pipeline must never block on instrumentation.
     /// Written outside the comment+transition transaction so the store write
     /// lock is never held for it.
+    ///
+    /// `job_id` is the durable round identity (job row id); replay of a
+    /// resumed round is idempotent via ON CONFLICT (job_id, agent_index)
+    /// DO UPDATE.
     #[allow(clippy::cast_possible_wrap)]
     pub(crate) async fn record_verdict_score(
         &self,
+        job_id: &str,
         ticket_id: &str,
         stage: &str,
         agent_index: usize,
         score: u8,
         issues: &[String],
     ) -> anyhow::Result<()> {
-        let id = format!(
-            "{ticket_id}_{stage}_{}_{agent_index}",
-            crate::generate_suffix()
-        );
         let now = crate::turso::now();
         let issues_json = serde_json::to_string(issues)?;
         self.conn
             .execute(
-                "INSERT INTO verdict_scores (id, ticket_id, stage, agent_index, score, issues, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO verdict_scores \
+                 (job_id, agent_index, ticket_id, stage, score, issues, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT (job_id, agent_index) DO UPDATE SET \
+                   score = excluded.score, issues = excluded.issues, created_at = excluded.created_at",
                 params![
-                    id,
+                    job_id,
+                    agent_index as i64,
                     ticket_id,
                     stage,
-                    agent_index as i64,
                     i64::from(score),
                     issues_json,
                     now,
@@ -427,6 +446,57 @@ async fn open_verified_logs_store(root: &Path) -> Result<crate::turso::Connectio
             crate::util::panic_message(&*payload)
         ))),
     }
+}
+
+/// Guarded verdict_scores shape migration: detect the OLD shape (table exists
+/// WITHOUT the job_id column), then one-tx DROP+CREATE with the new shape
+/// (PK (job_id, agent_index)). Idempotent — a re-run finds the new shape and
+/// no-ops. Historical rows (~2 days of telemetry, unmappable to the new PK)
+/// are dropped per user approval (decision 22).
+pub(crate) async fn migrate_verdict_scores_shape(conn: &turso::Connection) -> anyhow::Result<()> {
+    let has_table = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'verdict_scores'",
+            (),
+            |row| row.get::<i64>(0),
+        )
+        .await
+        .context("check verdict_scores table existence")?;
+    if has_table == 0 {
+        return Ok(()); // fresh store — LOGS_SCHEMA already applied the new shape
+    }
+    if turso::column_exists(conn, "verdict_scores", "job_id").await? {
+        return Ok(()); // already the new shape
+    }
+    info!("verdict_scores has legacy shape (no job_id) — DROP+recreate with new PK");
+    let tx = conn.begin_tx().await?;
+    tx.execute("DROP TABLE verdict_scores", ()).await?;
+    tx.execute(
+        "CREATE TABLE verdict_scores (
+            job_id       TEXT NOT NULL,
+            agent_index  INTEGER NOT NULL,
+            ticket_id    TEXT NOT NULL,
+            stage        TEXT NOT NULL,
+            score        INTEGER NOT NULL,
+            issues       TEXT NOT NULL,
+            created_at   TEXT NOT NULL,
+            PRIMARY KEY (job_id, agent_index)
+        )",
+        (),
+    )
+    .await?;
+    tx.execute(
+        "CREATE INDEX IF NOT EXISTS idx_verdict_scores_ticket_id ON verdict_scores(ticket_id)",
+        (),
+    )
+    .await?;
+    tx.execute(
+        "CREATE INDEX IF NOT EXISTS idx_verdict_scores_created_at ON verdict_scores(created_at)",
+        (),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// True when a `quick_check` failure is corruption-class rather than a

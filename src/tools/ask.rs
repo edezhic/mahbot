@@ -18,7 +18,6 @@ use crate::agent::run_agent;
 use crate::config::CONFIG;
 use crate::message_router::{self, AgentJob, JobKind};
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
-use crate::session::resolve_agent_id;
 use crate::tools::Tool;
 use crate::{Agent, DEFAULT_MAX_TOKENS, Role, Workspace};
 use anyhow::Result;
@@ -119,36 +118,53 @@ impl Tool for AskTool {
                 // panic in the dispatch task would otherwise leave the Manager
                 // waiting forever on a result that can never arrive.
                 let round = std::panic::AssertUnwindSafe(async {
-                    run_parallel_analysts_and_consolidate(&ws, &ask).await
+                    dispatch_durable_ask(&ws, &ask, caller_role, user_name.clone(), channel.clone())
+                        .await
                 })
                 .catch_unwind()
                 .await;
-                let message = match round {
-                    Ok(result) => build_async_ask_message(result),
+                // The dispatch builds the envelope (with pending_job_id set by
+                // the completion tx) — route it as-is so the persisted copy and
+                // the routed copy can never drift. Only the panic path rebuilds
+                // here.
+                let envelope = match round {
+                    Ok(Some(envelope)) => envelope,
+                    Ok(None) => {
+                        // Drain-cut: job stays status=running for boot resume —
+                        // route NOTHING now (a spurious error envelope during
+                        // the drain would discard the checkpointed outcomes;
+                        // the result envelope is delivered after boot resume).
+                        return;
+                    }
                     Err(panic) => {
                         let panic = crate::util::panic_message(&*panic);
                         tracing::error!(panic = %panic, "ask round dispatch panicked");
-                        build_async_ask_message(Err(anyhow::anyhow!(
-                            "ask round dispatch panicked: {panic}"
-                        )))
+                        AgentJob {
+                            content: build_async_ask_message(&Err(anyhow::anyhow!(
+                                "ask round dispatch panicked: {panic}"
+                            ))),
+                            workspace_name: ws.name.clone(),
+                            user_name,
+                            channel,
+                            kind: JobKind::AskToolResult,
+                            role: caller_role,
+                            reply_target: None,
+                            pending_job_id: None,
+                        }
                     }
                 };
 
-                // Route result to the caller's agent channel.
-                let target_agent_id =
-                    resolve_agent_id(&channel, &user_name, caller_role.as_str(), &ws.name);
-                message_router::route(
-                    &target_agent_id,
-                    AgentJob {
-                        content: message,
-                        workspace_name: ws.name.clone(),
-                        user_name,
-                        channel,
-                        kind: JobKind::AskToolResult,
-                        role: caller_role,
-                        reply_target: None,
-                    },
-                );
+                // Drain/shutdown fired between the dispatch and the route: the
+                // pending row (if any) survives for boot replay — skip routing
+                // rather than deliver into a consumer that has stopped pulling.
+                // (If the pending INSERT had failed, this also suppresses the
+                // insert-failure policy's best-effort route — the surviving
+                // launched job row is resumed at the next boot, so the result
+                // is deferred, never lost.)
+                if crate::shutdown::aborting() {
+                    return;
+                }
+                message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
             });
 
             return Ok("Sub-agent dispatched. Results will follow shortly.".to_string());
@@ -159,19 +175,433 @@ impl Tool for AskTool {
     }
 }
 
+/// One durable ask-round roster slot (pre-generated agent id + final task).
+struct AskSlot {
+    agent_id: String,
+    task: String,
+}
+
+/// Outcome of a durable ask round.
+enum AskRunOutcome {
+    /// The round produced a result (Ok or Err — both terminalize with a
+    /// durable envelope).
+    Result(anyhow::Result<String>),
+    /// Round cut by drain/shutdown — the job stays status=running for boot
+    /// resume; nothing is routed or terminalized now.
+    DrainCut,
+}
+
+/// Durable async ask dispatch (SPAWN → run → CHECKPOINT → COMPLETE).
+///
+/// 1. SPAWN: one tx — INSERT jobs (kind=ask, task=question) + INSERT agents
+///    (all pre-generated analyst ids with final tasks). MUST commit before
+///    the analysts' first session writes.
+/// 2. RUN: parallel analysts.
+/// 3. CHECKPOINT: per-agent raw-response outcomes.
+/// 4. COMPLETE: one tx — INSERT pending_jobs (envelope id = job id) + DELETE
+///    jobs row — the exactly-once persistence boundary.
+///
+/// Returns `None` only when the round was cut by drain/shutdown (job left
+/// status=running for boot resume — nothing to route now). On error the
+/// envelope still routes (errors wrapped in `<ask-tool-result>`), and the
+/// job is terminalized.
+async fn dispatch_durable_ask(
+    ws: &Workspace,
+    ask: &str,
+    caller_role: Role,
+    user_name: String,
+    channel: String,
+) -> Option<AgentJob> {
+    let job_id = crate::generate_id();
+    match run_ask_with_job(ws, ask, &job_id, caller_role, &user_name, &channel, false).await {
+        Ok(AskRunOutcome::DrainCut) => {
+            // Drain-cut (decision 20): analyst outcomes are already
+            // checkpointed — leave the job status=running for boot resume
+            // (recoverable via ask_jobs checkpoints). No terminalization, no
+            // error envelope: a spurious envelope here would discard the
+            // checkpointed outcomes and contradict "jobs stay status=running
+            // for boot resume".
+            tracing::info!(
+                job = %job_id,
+                "Ask round cut short by drain — job stays running for boot resume",
+            );
+            None
+        }
+        Ok(AskRunOutcome::Result(result)) => {
+            let (_env_ok, envelope) =
+                complete_ask_job(&job_id, &result, caller_role, &user_name, &channel, ws).await;
+            Some(envelope)
+        }
+        Err(e) => {
+            // Envelope always routes (errors wrapped); terminalize the job so
+            // a failed ask never blocks boot recovery.
+            let outcome = Err(e);
+            let (_env_ok, envelope) =
+                complete_ask_job(&job_id, &outcome, caller_role, &user_name, &channel, ws).await;
+            Some(envelope)
+        }
+    }
+}
+
+/// Spawn the ask job + roster (one tx), run the analysts, checkpoint per-agent
+/// outcomes, consolidate. `pre_done` carries slots already completed (resume)
+/// with their stored raw-response outcomes.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_ask_with_job(
+    ws: &Workspace,
+    ask: &str,
+    job_id: &str,
+    caller_role: Role,
+    user_name: &str,
+    channel: &str,
+    resume: bool,
+) -> anyhow::Result<AskRunOutcome> {
+    const PARALLEL_ANALYST_COUNT: usize = 3;
+    let deadline = std::time::Instant::now() + round_timeout();
+
+    // Fresh dispatch: build the roster and spawn the job BEFORE any analyst
+    // session write (caller identity persisted on the job row so a later
+    // resume delivers to the ORIGINAL caller). Resume: reuse the stored roster
+    // (agent ids + final tasks) — never regenerate ids (the PK would conflict
+    // AND the new ids would not match the stored roster rows).
+    let (slots, pre_done) = if resume {
+        let rows = crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
+        let slots: Vec<AskSlot> = rows
+            .iter()
+            .map(|r| AskSlot {
+                agent_id: r.agent_id.clone(),
+                task: r.task.clone(),
+            })
+            .collect();
+        let pre_done: Vec<(String, String)> = rows
+            .into_iter()
+            .filter(|r| r.status == "done")
+            .filter_map(|r| r.outcome.map(|o| (r.agent_id, o)))
+            .collect();
+        (slots, pre_done)
+    } else {
+        let suffix = crate::generate_suffix();
+        let angles = load_analyst_angles();
+        let mut slots: Vec<AskSlot> = Vec::with_capacity(PARALLEL_ANALYST_COUNT);
+        let mut agents: Vec<crate::jobs::NewAgent> = Vec::with_capacity(PARALLEL_ANALYST_COUNT);
+        for i in 0..PARALLEL_ANALYST_COUNT {
+            let agent_id = format!("ask_{}_{}_{}_analyst", ws.name, suffix, i);
+            let angle = angles.get(i).cloned().unwrap_or_default();
+            let task = if angle.is_empty() {
+                ask.to_string()
+            } else {
+                format!("{ask}\n\nResearch angle:\n{angle}")
+            };
+            agents.push(crate::jobs::NewAgent {
+                agent_id: agent_id.clone(),
+                kind: crate::jobs::AgentKind::Analyst,
+                idx: Some(i64::try_from(i).unwrap_or(i64::MAX)),
+                role: crate::Role::Analyst,
+                task: task.clone(),
+            });
+            slots.push(AskSlot { agent_id, task });
+        }
+        crate::jobs::spawn_job(
+            &crate::session::store().conn,
+            job_id,
+            ask,
+            &ws.name,
+            user_name,
+            channel,
+            caller_role,
+            &agents,
+            &crate::jobs::SpawnChild::Ask {
+                question: ask.to_string(),
+            },
+        )
+        .await?;
+        (slots, Vec::new())
+    };
+
+    // Run the launched slots; reconstruct done slots from stored outcomes.
+    let fresh_slots: Vec<&AskSlot> = slots
+        .iter()
+        .filter(|s| !pre_done.iter().any(|(id, _)| id == &s.agent_id))
+        .collect();
+    let fresh_runs = run_ask_slots(ws, &fresh_slots, deadline, resume).await;
+
+    // Assemble runs in slot order.
+    let mut runs: Vec<AskRun> = Vec::with_capacity(slots.len());
+    let mut fresh_iter = fresh_runs.into_iter();
+    for slot in &slots {
+        if let Some((_, raw)) = pre_done.iter().find(|(id, _)| id == &slot.agent_id) {
+            // Done slot — reconstruct the run from the stored response. The
+            // fresh agent pre-loads the analyst's persisted session so
+            // extract_findings keeps KV-cache compatibility.
+            let mut agent = crate::Agent::new(
+                slot.agent_id.clone(),
+                crate::Role::Analyst,
+                ws,
+                None,
+                String::new(),
+                String::new(),
+            );
+            let _ = agent
+                .session
+                .init(&slot.agent_id, "", ws, &crate::Role::Analyst, None, "", "")
+                .await;
+            runs.push(AskRun::Completed {
+                agent,
+                response: Some(raw.clone()),
+            });
+        } else if let Some(run) = fresh_iter.next() {
+            runs.push(run);
+        } else {
+            runs.push(AskRun::Failed {
+                reason: "analyst slot never dispatched".to_string(),
+            });
+        }
+    }
+
+    // CHECKPOINT: per-agent outcomes (raw response or collapsed reason).
+    let conn = &crate::session::store().conn;
+    for (slot, run) in slots.iter().zip(&runs) {
+        let (status, outcome) = match run {
+            AskRun::Completed {
+                response: Some(raw),
+                ..
+            } => (crate::jobs::AgentStatus::Done, raw.clone()),
+            AskRun::Completed {
+                agent,
+                response: None,
+            } => (
+                crate::jobs::AgentStatus::Failed,
+                agent.failure_reason("analyst produced no response"),
+            ),
+            AskRun::Failed { reason } => (crate::jobs::AgentStatus::Failed, reason.clone()),
+        };
+        if let Err(e) =
+            crate::jobs::write_agent_outcome(conn, job_id, &slot.agent_id, status, Some(&outcome))
+                .await
+        {
+            tracing::warn!(job = %job_id, error = %e, "Failed to checkpoint ask outcome");
+        }
+    }
+
+    // Drain/shutdown cut the round mid-flight: skip the consolidate LLM call
+    // (no new LLM work during the drain) — the checkpointed outcomes are
+    // reused by the next boot's resume; the caller leaves the job running.
+    if crate::shutdown::aborting() {
+        return Ok(AskRunOutcome::DrainCut);
+    }
+
+    let result = consolidate_analyst_runs(ws, ask, runs, deadline).await;
+    Ok(AskRunOutcome::Result(result))
+}
+
+/// Run the given analyst slots concurrently (deadline-bounded).
+async fn run_ask_slots(
+    ws: &Workspace,
+    slots: &[&AskSlot],
+    deadline: std::time::Instant,
+    resume: bool,
+) -> Vec<AskRun> {
+    let handles: Vec<_> = slots
+        .iter()
+        .map(|slot| {
+            let ws = ws.clone();
+            let agent_id = slot.agent_id.clone();
+            let task = slot.task.clone();
+            tokio::spawn(async move {
+                // Session-non-emptiness discriminator: a resumed slot whose
+                // session already contains the task continues with an empty
+                // message (no duplicate task-prompt append); a missing/empty
+                // session dispatches fresh with the stored task.
+                let has_session = resume && crate::session::store().has_content(&agent_id).await;
+                run_agent(
+                    agent_id,
+                    crate::Role::Analyst,
+                    &ws,
+                    None,
+                    if has_session { "" } else { task.as_str() },
+                    String::new(),
+                    String::new(),
+                    None,
+                    resume,
+                )
+                .await
+            })
+        })
+        .collect();
+    await_round_members(handles, deadline)
+        .await
+        .into_iter()
+        .map(|m| match m {
+            RoundMember::Done((agent, response)) => AskRun::Completed { agent, response },
+            RoundMember::TimedOut => AskRun::Failed {
+                reason: "analyst still running when the round deadline expired".to_string(),
+            },
+            RoundMember::Panicked => AskRun::Failed {
+                reason: "analyst task panicked".to_string(),
+            },
+            RoundMember::Cancelled => AskRun::Failed {
+                reason: "analyst task was cancelled".to_string(),
+            },
+        })
+        .collect()
+}
+
+/// COMPLETE: one tx — INSERT pending_jobs (envelope, id = job id) + DELETE
+/// jobs row. Returns (persisted?, the envelope) — the envelope carries
+/// `pending_job_id` set when the row persisted, cleared on INSERT failure so
+/// the caller can fall back to a best-effort route (never drop silently).
+async fn complete_ask_job(
+    job_id: &str,
+    result: &anyhow::Result<String>,
+    caller_role: Role,
+    user_name: &str,
+    channel: &str,
+    ws: &Workspace,
+) -> (bool, AgentJob) {
+    let mut envelope = AgentJob {
+        content: build_async_ask_message(result),
+        workspace_name: ws.name.clone(),
+        user_name: user_name.to_string(),
+        channel: channel.to_string(),
+        kind: JobKind::AskToolResult,
+        role: caller_role,
+        reply_target: None,
+        pending_job_id: Some(job_id.to_string()),
+    };
+    let ok = crate::jobs::complete_job_with_envelope(
+        &crate::session::store().conn,
+        job_id,
+        &envelope,
+        JobKind::AskToolResult,
+    )
+    .await
+    .is_ok();
+    if !ok {
+        // INSERT-failure policy: fall back to a non-durable route (the caller
+        // still gets the result; the pending row is simply absent).
+        envelope.pending_job_id = None;
+    }
+    (ok, envelope)
+}
+
+/// Boot resume of an ask round (decision 8): re-run not-done roster slots with
+/// their stored tasks, reconstruct done slots from stored outcomes, then
+/// re-consolidate. The consolidated result is terminalized into a pending
+/// envelope exactly like a fresh dispatch — delivered to the ORIGINAL caller
+/// (role/user/channel persisted on the job row at spawn), never the Manager.
+///
+/// Aborts quietly on shutdown/drain: no routing, no terminalization — the job
+/// row stays for the next boot (checkpointed outcomes are reused, so the
+/// already-completed LLM work is never lost or duplicated).
+pub(crate) async fn resume_ask_round(job_id: &str, ws: &Workspace) {
+    if crate::shutdown::aborting() {
+        tracing::info!(job = %job_id, "Ask resume aborted — drain/shutdown in progress");
+        return;
+    }
+    let conn = &crate::session::store().conn;
+    let Ok(Some(caller)) = crate::jobs::job_caller(conn, job_id).await else {
+        tracing::warn!(job = %job_id, "Ask resume: missing job row — terminalizing job");
+        let _ = crate::jobs::terminalize_job(conn, job_id).await;
+        return;
+    };
+    let caller_role = std::str::FromStr::from_str(&caller.role).unwrap_or(crate::Role::Manager);
+    let result = match run_ask_with_job(
+        ws,
+        &caller.task,
+        job_id,
+        caller_role,
+        &caller.user_name,
+        &caller.channel,
+        true,
+    )
+    .await
+    {
+        Ok(AskRunOutcome::Result(result)) => result,
+        // Round drain-cut mid-resume: abort quietly — the outcomes are
+        // checkpointed, the next boot reuses them.
+        Ok(AskRunOutcome::DrainCut) => {
+            tracing::info!(
+                job = %job_id,
+                "Ask resume aborted after analysts completed — job stays for next boot",
+            );
+            return;
+        }
+        Err(e) => Err(e),
+    };
+    // Drain/shutdown fired after the round returned: abort quietly WITHOUT
+    // routing and WITHOUT deleting the row — the outcomes are checkpointed
+    // (next boot reuses them) and routing a partial result here would race
+    // the exit.
+    if crate::shutdown::aborting() {
+        tracing::info!(
+            job = %job_id,
+            "Ask resume aborted after analysts completed — job stays for next boot",
+        );
+        return;
+    }
+    // Terminalize into the durable envelope (the resumed orchestrator routes
+    // the same way a fresh dispatch would — to the stored caller). On pending
+    // INSERT failure the envelope still routes best-effort (never a silent
+    // drop — the INSERT-failure policy).
+    let (_env_ok, envelope) = complete_ask_job(
+        job_id,
+        &result,
+        caller_role,
+        &caller.user_name,
+        &caller.channel,
+        ws,
+    )
+    .await;
+    crate::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
+}
+
+/// Boot-scan over-cap handling for ask jobs: the job exceeded
+/// MAX_BOOT_REDISPATCH — deliver an ERROR envelope to the original caller
+/// (the `<ask-tool-result>` envelope is the async-ask caller's ONLY result
+/// path; marking failed with no envelope would strand the caller forever —
+/// "failed = terminal … surface to user").
+pub(crate) async fn ask_capped_envelope(job_id: &str, ws: &Workspace) {
+    if crate::shutdown::aborting() {
+        tracing::info!(job = %job_id, "Ask capped report aborted — drain/shutdown in progress");
+        return;
+    }
+    let conn = &crate::session::store().conn;
+    let Ok(Some(caller)) = crate::jobs::job_caller(conn, job_id).await else {
+        tracing::warn!(job = %job_id, "Ask cap: missing job row — terminalizing job");
+        let _ = crate::jobs::terminalize_job(conn, job_id).await;
+        return;
+    };
+    let caller_role = std::str::FromStr::from_str(&caller.role).unwrap_or(crate::Role::Manager);
+    let result: anyhow::Result<String> = Err(anyhow::anyhow!(format!(
+        "ask round aborted after {} boot re-dispatch attempts — the last crash lost the round; \
+         please re-issue the ask",
+        crate::jobs::MAX_BOOT_REDISPATCH,
+    )));
+    let (_env_ok, envelope) = complete_ask_job(
+        job_id,
+        &result,
+        caller_role,
+        &caller.user_name,
+        &caller.channel,
+        ws,
+    )
+    .await;
+    crate::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
+}
+
 /// Build the `<ask-tool-result>` envelope message for an async ask dispatch.
 ///
 /// Shared by the async dispatch path (the `tokio::spawn` body in
 /// [`AskTool::execute`]) and tests — the envelope shape that reaches the
 /// caller's agent channel is production code, not a test re-wrap.
-fn build_async_ask_message(result: anyhow::Result<String>) -> String {
+fn build_async_ask_message(result: &anyhow::Result<String>) -> String {
     build_async_result_envelope(result, "ask-tool-result")
 }
 
 /// Wrap a sub-agent/tool result in the async `<tag>` envelope delivered to
 /// the caller's agent channel. Failures carry an explicit marker — findings
 /// are never silently dropped. Shared with the deep research tool.
-pub(crate) fn build_async_result_envelope(result: anyhow::Result<String>, tag: &str) -> String {
+pub(crate) fn build_async_result_envelope(result: &anyhow::Result<String>, tag: &str) -> String {
     match result {
         Ok(text) => format!("<{tag}>\n\n{text}</{tag}>"),
         Err(e) => {
@@ -370,7 +800,7 @@ pub(crate) struct VerificationVerdict {
 /// Verification outcome merged into the final report. The telemetry fields
 /// (the verifier analyst's tool calls / searches / queries) feed the deep
 /// research run summary and its query ledger; the ask path ignores them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct VerificationResult {
     pub claim: String,
     pub verdict: String,
@@ -459,6 +889,7 @@ async fn run_parallel_analysts(
                     String::new(),
                     String::new(),
                     None,
+                    false,
                 )
                 .await
             })
@@ -493,6 +924,12 @@ async fn consolidate_analyst_runs(
     runs: Vec<AskRun>,
     deadline: std::time::Instant,
 ) -> Result<String> {
+    // Orchestrator-only LLM phase — the extraction sub-phase still runs while
+    // the analyst Agents are alive/registered; only the grouping pass runs
+    // with zero registered agents. Tracking the whole phase is a harmless
+    // superset that keeps the drain-watch from firing the token into an
+    // in-flight call while the registry looks quiescent.
+    let _call = crate::call_registry::NON_AGENT_CALLS.register("consolidate", &ws.name);
     let valid_count = runs
         .iter()
         .filter(|r| r.response().is_some_and(|t| !t.trim().is_empty()))
@@ -934,6 +1371,7 @@ async fn run_claim_verifier(
         String::new(),
         String::new(),
         None,
+        false,
     )
     .await;
     let (tool_calls, searches, queries) = extract_query_telemetry(&agent);
@@ -1691,7 +2129,7 @@ mod tests {
             .err(crate::retry::FailureClass::Transport, "down");
         let result =
             consolidate_with_script(agreed_outcomes("raw report", "raw report 2"), fake).await;
-        let envelope = build_async_ask_message(result);
+        let envelope = build_async_ask_message(&result);
         assert!(envelope.contains("<ask-tool-result>"), "{envelope}");
         assert!(
             envelope.contains("unconsolidated — consolidation failed"),
@@ -1708,7 +2146,7 @@ mod tests {
     async fn async_envelope_wraps_sub_agent_errors() {
         // The async dispatch path's error branch: a failed sub-agent is
         // wrapped in the same envelope with the error text.
-        let envelope = build_async_ask_message(Err(anyhow::anyhow!("sub-agent exploded")));
+        let envelope = build_async_ask_message(&Err(anyhow::anyhow!("sub-agent exploded")));
         assert!(envelope.contains("<ask-tool-result>"), "{envelope}");
         assert!(
             envelope.contains("An error occurred: sub-agent exploded"),
@@ -1837,6 +2275,219 @@ mod tests {
         assert!(
             !text.contains("unconsolidated"),
             "partial success replaces the raw-dump fallback: {text}"
+        );
+    }
+
+    /// Boot resume of a crashed async ask must REUSE the existing job + roster
+    /// (never re-spawn — the jobs.id PK would conflict AND freshly generated
+    /// analyst ids would not match the stored roster rows, so outcomes would
+    /// be lost). A single done slot reconstructs from its stored outcome
+    /// (raw passthrough — no provider needed).
+    #[tokio::test]
+    async fn resume_ask_round_reuses_existing_job() {
+        crate::util::test::init_management_test_stores().await;
+        let ws = test_ws("/tmp/test_ws_resume_ask");
+        let job_id = "ask_job_resume_1";
+        let agent_id = format!("ask_{}_rs_0_analyst", ws.name);
+        let conn = &crate::session::store().conn;
+        // Pre-create the job + ask_jobs row exactly as a crashed dispatch
+        // leaves them (caller identity persisted on the job row; one done
+        // slot with a stored outcome).
+        crate::jobs::spawn_job(
+            conn,
+            job_id,
+            "question?",
+            &ws.name,
+            "caller-user",
+            "telegram",
+            crate::Role::Assistant,
+            &[crate::jobs::NewAgent {
+                agent_id: agent_id.clone(),
+                kind: crate::jobs::AgentKind::Analyst,
+                idx: Some(0),
+                role: crate::Role::Analyst,
+                task: "question?".to_string(),
+            }],
+            &crate::jobs::SpawnChild::Ask {
+                question: "question?".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        crate::jobs::write_agent_outcome(
+            conn,
+            job_id,
+            &agent_id,
+            crate::jobs::AgentStatus::Done,
+            Some("completed analyst response"),
+        )
+        .await
+        .unwrap();
+
+        // Resume: must NOT hit the jobs.id PK conflict, must reuse the stored
+        // roster slot, then terminalize into a durable envelope delivered to
+        // the ORIGINAL caller (Assistant, not Manager).
+        resume_ask_round(job_id, &ws).await;
+
+        let job_rows = conn
+            .query(
+                "SELECT id FROM jobs WHERE id = ?1",
+                crate::turso::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(job_rows.len(), 0, "resumed job must be terminalized");
+        let pending = conn
+            .query(
+                "SELECT role, user_name, channel, kind FROM pending_jobs WHERE id = ?1",
+                crate::turso::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "envelope persisted with the job id");
+        assert_eq!(
+            pending[0].get::<String>(0).unwrap(),
+            "assistant",
+            "resumed envelope routes to the original caller role, not Manager"
+        );
+        assert_eq!(pending[0].get::<String>(1).unwrap(), "caller-user");
+    }
+
+    /// A job whose ask_jobs child row is missing (a crash between the spawn tx
+    /// and a child insert, or legacy data) must STILL resume — caller identity
+    /// is read from the jobs row alone, so the caller is never stranded by the
+    /// missing child row.
+    #[tokio::test]
+    async fn resume_ask_round_orphaned_child_row_is_not_stranding() {
+        crate::util::test::init_management_test_stores().await;
+        let ws = test_ws("/tmp/test_ws_ask_orphan");
+        let job_id = "ask_job_orphan_1";
+        let agent_id = format!("ask_{}_orphan_0_analyst", ws.name);
+        let conn = &crate::session::store().conn;
+        crate::jobs::spawn_job(
+            conn,
+            job_id,
+            "question?",
+            &ws.name,
+            "caller-user",
+            "telegram",
+            crate::Role::Assistant,
+            &[crate::jobs::NewAgent {
+                agent_id: agent_id.clone(),
+                kind: crate::jobs::AgentKind::Analyst,
+                idx: Some(0),
+                role: crate::Role::Analyst,
+                task: "question?".to_string(),
+            }],
+            &crate::jobs::SpawnChild::Ask {
+                question: "question?".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        // Simulate the orphan state: the child row is gone but the job row
+        // survives.
+        conn.execute(
+            "DELETE FROM ask_jobs WHERE id = ?1",
+            crate::turso::params![job_id],
+        )
+        .await
+        .unwrap();
+        crate::jobs::write_agent_outcome(
+            conn,
+            job_id,
+            &agent_id,
+            crate::jobs::AgentStatus::Done,
+            Some("completed analyst response"),
+        )
+        .await
+        .unwrap();
+
+        resume_ask_round(job_id, &ws).await;
+
+        let job_rows = conn
+            .query(
+                "SELECT id FROM jobs WHERE id = ?1",
+                crate::turso::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(job_rows.len(), 0, "orphaned job must still be terminalized");
+        let pending = conn
+            .query(
+                "SELECT role, user_name FROM pending_jobs WHERE id = ?1",
+                crate::turso::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "envelope persisted despite missing child row"
+        );
+        assert_eq!(pending[0].get::<String>(0).unwrap(), "assistant");
+        assert_eq!(pending[0].get::<String>(1).unwrap(), "caller-user");
+    }
+
+    /// The boot-scan over-cap path must NOT strand the async-ask caller: an
+    /// error envelope (with the original caller identity) is delivered instead
+    /// of a silent failed row.
+    #[tokio::test]
+    async fn ask_capped_envelope_delivers_error_to_caller() {
+        crate::util::test::init_management_test_stores().await;
+        let ws = test_ws("/tmp/test_ws_ask_capped");
+        let job_id = "ask_job_capped_1";
+        let conn = &crate::session::store().conn;
+        crate::jobs::spawn_job(
+            conn,
+            job_id,
+            "question?",
+            &ws.name,
+            "caller-user",
+            "telegram",
+            crate::Role::Assistant,
+            &[crate::jobs::NewAgent {
+                agent_id: format!("ask_{}_capped_0_analyst", ws.name),
+                kind: crate::jobs::AgentKind::Analyst,
+                idx: Some(0),
+                role: crate::Role::Analyst,
+                task: "question?".to_string(),
+            }],
+            &crate::jobs::SpawnChild::Ask {
+                question: "question?".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        ask_capped_envelope(job_id, &ws).await;
+
+        let job_rows = conn
+            .query(
+                "SELECT id FROM jobs WHERE id = ?1",
+                crate::turso::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(job_rows.len(), 0, "capped job must be terminalized");
+        let pending = conn
+            .query(
+                "SELECT role, user_name, envelope FROM pending_jobs WHERE id = ?1",
+                crate::turso::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "error envelope persisted with the job id");
+        assert_eq!(
+            pending[0].get::<String>(0).unwrap(),
+            "assistant",
+            "capped envelope routes to the original caller role, not Manager"
+        );
+        assert_eq!(pending[0].get::<String>(1).unwrap(), "caller-user");
+        let envelope: String = pending[0].get(2).unwrap();
+        assert!(
+            envelope.contains("ask round aborted"),
+            "the envelope must surface the cap failure to the caller"
         );
     }
 }

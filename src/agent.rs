@@ -246,7 +246,7 @@ impl Agent {
 
     /// Run a complete agent turn: initialize session, work loop (with shutdown
     /// cancellation), finalize session, and optionally introspect.
-    pub async fn work(&mut self, msg: &str) -> anyhow::Result<String> {
+    pub async fn work(&mut self, msg: &str, resume: bool) -> anyhow::Result<String> {
         // Open or resume a session for this agent turn.
         self.session
             .init(
@@ -260,7 +260,22 @@ impl Agent {
             )
             .await?;
 
-        self.maybe_summarize().await;
+        // Pre-maybe_summarize drain check: a fresh dispatch that starts during
+        // the graceful drain (or a fired shutdown token) must not destructively
+        // compact a >200k-token accumulated session before the llm_loop drain
+        // check fires. The round is cut before any LLM work; boot resume
+        // continues the session.
+        if crate::shutdown::aborting() {
+            anyhow::bail!("Agent round cut short by shutdown/drain — resumes at boot");
+        }
+
+        // Mandatory: destructive >200k-token compaction is SKIPPED on resumed
+        // turns — the pre-crash trail the resume was meant to preserve must
+        // survive (the design's resume-flag rule; do NOT infer resume from an
+        // empty message — RecoveryRetry semantics are unchanged).
+        if !resume {
+            self.maybe_summarize().await;
+        }
 
         let shutdown = crate::shutdown::shutdown_token();
         let response_result = tokio::select! {
@@ -288,6 +303,14 @@ impl Agent {
             loop {
                 if self.cancel_token.is_cancelled() {
                     anyhow::bail!("Agent cancelled by user");
+                }
+                // Shutdown/drain: checked at iteration top (after the previous
+                // tool group's commit) so the CURRENT tool group completes —
+                // no new LLM call starts once the drain begins (or the token
+                // fires). The round is resumed at boot via the job row
+                // (status=running).
+                if crate::shutdown::aborting() {
+                    anyhow::bail!("Agent round cut short by shutdown/drain — resumes at boot");
                 }
                 if iteration >= MAX_LLM_ITERATIONS {
                     anyhow::bail!(
@@ -886,10 +909,11 @@ pub(crate) async fn run_agent(
     user_name: String,
     channel: String,
     incoming_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>>,
+    resume: bool,
 ) -> (Agent, Option<String>) {
     let mut agent = Agent::new(agent_id, role, ws, ticket.cloned(), user_name, channel);
     agent.incoming_rx = incoming_rx;
-    let result = agent.work(message).await;
+    let result = agent.work(message, resume).await;
 
     // Cancellation safety: if the token fired after work() completed but
     // before we checked, discard the result to prevent overwriting of
@@ -922,8 +946,9 @@ pub(crate) async fn run_agent(
             // errors from work() — expected, not real failures. The global
             // token fires before `shutdown_all()` cancels per-agent tokens, so
             // either path resolves to classification "shutdown". Log at debug
-            // level to avoid misleading ERROR noise on clean shutdown.
-            if classification == "shutdown" {
+            // level to avoid misleading ERROR noise on clean shutdown. The
+            // graceful drain maps to classification "drain" — same treatment.
+            if classification == "shutdown" || classification == "drain" {
                 tracing::debug!(
                     agent_id = %agent.agent_id,
                     workspace = %ws.name,
@@ -963,7 +988,12 @@ pub(crate) async fn run_agent(
 /// [`crate::retry::FailureClass`]; everything else (I/O, tool errors, panics)
 /// falls back to `runtime`.
 fn failure_classification(agent: &Agent, error: Option<&anyhow::Error>) -> &'static str {
-    if crate::shutdown::shutdown_token().is_cancelled() {
+    if crate::shutdown::is_draining() {
+        // The graceful drain cut the round short — not a failure. Checked
+        // before the token so drained agents are never mislabeled as
+        // cancelled/shutdown (no AGENT_FAILURE_EMOJI, no exit rollback).
+        "drain"
+    } else if crate::shutdown::shutdown_token().is_cancelled() {
         "shutdown"
     } else if agent.is_cancelled() {
         "cancelled"
@@ -1086,6 +1116,36 @@ mod tests {
 
         // The cancelled early-return path classifies with no error present.
         assert_eq!(failure_classification(&cancelled, None), "cancelled");
+    }
+
+    /// The graceful-drain cut is classified as "drain" (NOT cancelled/
+    /// shutdown/failure) — the consumer suppresses the failure emoji and the
+    /// dispatch tails skip the exit-time ticket rollback for drained agents.
+    /// Serialized against other tests: the drain flag is process-global, so a
+    /// concurrent test consulting is_draining() could be misclassified during
+    /// the assertion window (project convention: retry_tests_lock).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn failure_classification_recognizes_drain() {
+        let _guard = crate::util::test::retry_tests_lock();
+        let agent = make_agent(vec![]);
+        // Drain flag unset: normal classification.
+        assert_eq!(failure_classification(&agent, None), "runtime");
+        // Set the drain flag for the duration of the assertion.
+        crate::shutdown::drain_begin();
+        assert_eq!(
+            failure_classification(&agent, None),
+            "drain",
+            "a drained agent must classify as drain, never failure",
+        );
+        // A per-agent cancel during drain still classifies as drain — the
+        // drain is checked first so no failure emoji fires on exit.
+        agent.cancel_token.cancel();
+        assert_eq!(failure_classification(&agent, None), "drain");
+        // Restore isolation — the drain flag is process-global; the token
+        // must never be fired from a test (it would cancel every parallel
+        // retry loop).
+        crate::shutdown::drain_clear();
     }
 
     /// Shared helper: create an agent with a TestTool, execute_tool it, and assert scrubbing behavior.
@@ -1470,6 +1530,7 @@ mod tests {
             kind: crate::message_router::JobKind::TicketComment,
             role: crate::Role::Manager,
             reply_target: None,
+            pending_job_id: None,
         };
         let _ = tx.send(job);
 
@@ -1513,6 +1574,7 @@ mod tests {
             kind: crate::message_router::JobKind::UserMessage,
             role: crate::Role::Assistant,
             reply_target: None,
+            pending_job_id: None,
         };
         let _ = tx.send(job);
 

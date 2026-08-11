@@ -273,7 +273,16 @@ async fn test_list_tickets() {
 /// Verify that `reset_inflight_tickets` correctly transitions each in-flight
 /// ticket phase back to its ready state, and that non-inflight phases (e.g.
 /// Backlog) are left untouched.
+///
+/// Canonical reset test. The serial(reset_inflight) group is the contract for
+/// the shared global board: ANY test creating a ticket in a reset-affected
+/// phase (Analysis/InDevelopment/InDiagnostics/InSanitation/InReview/InQa) on
+/// the shared board must join this group, or a concurrent reset will clobber
+/// its fixture (phase-CAS failure indistinguishable from a real regression).
+/// This test itself uses an isolated store, so its membership is defensive —
+/// the attribute is load-bearing for the group, not for this test's own data.
 #[tokio::test]
+#[serial_test::serial(reset_inflight)]
 async fn test_reset_inflight_tickets() {
     /// A single reset transition case.
     struct Case {
@@ -347,7 +356,7 @@ async fn test_reset_inflight_tickets() {
 
         let id = make_ticket(&store, &ws, case.name, case.start).await;
 
-        store.reset_inflight_tickets().await.expect("reset");
+        store.reset_inflight_tickets(&[]).await.expect("reset");
 
         let t = expect_ticket(&store, &id).await;
         assert_eq!(
@@ -2933,7 +2942,11 @@ async fn test_route_comment_to_agents_no_assignment() {
 /// route_comment_to_agents delivers a comment to the registered agent with
 /// the commenter's role in the AgentJob. The engineer row guards the
 /// Role::parse → Manager fallback — the manager row alone would pass silently.
+///
+/// Serialized with the reset_inflight_tickets tests (shared global board — a
+/// concurrent boot reset would clobber the fixture phases).
 #[tokio::test]
+#[serial_test::serial(reset_inflight)]
 async fn test_route_comment_to_agents_delivers_with_commenter_role() {
     crate::util::test::init_management_test_stores().await;
     let store = crate::board::store();

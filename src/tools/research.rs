@@ -21,7 +21,6 @@ use crate::config::CONFIG;
 use crate::message_router::{self, AgentJob, JobKind};
 use crate::prompt::{load_prompt, substitute};
 use crate::retry::FailureClass;
-use crate::session::resolve_agent_id;
 use crate::tools::Tool;
 use crate::tools::ask::{
     AnalystFindings, Claim, RoundMember, VerificationResult, VerificationTarget,
@@ -61,6 +60,138 @@ const CLAIM_ANNOTATION_FAILED: &str = "claim annotation failed — all new claim
 /// links fails entirely — every mutating verdict is treated as weak.
 const CONFIRM_FAILED: &str =
     "annotation link confirmation failed — mutating links treated as weak/unconfirmed";
+
+/// Resume pointer for a durable research run (decision 7): the 5-value stage
+/// enum (plus implicit Done).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResearchStage {
+    Decompose,
+    Round1,
+    GapRounds,
+    Verification,
+    Synthesis,
+}
+
+/// The research_jobs.state blob: ONE JSON column carrying everything needed
+/// to resume a run at the checkpointed stage. RunStats is NOT stored (see
+/// RunStats pin) — the resumed report's "Run Summary" undercounts the
+/// pre-crash segment and the report carries a one-line best-effort note.
+#[derive(Debug, Serialize, Deserialize)]
+struct ResearchState {
+    schema_version: u32,
+    stage: ResearchStage,
+    plan: Option<MergedPlan>,
+    gap_list: Option<GapList>,
+    acc: AccumulatedEvidence,
+    ledger: QueryLedger,
+    markers: Vec<String>,
+    gap_outcome: GapRoundsOutcome,
+    budget_spent: usize,
+    /// Gap-loop resume pointer: the next gap round to dispatch (the gap list
+    /// is stored; empty unresolved + gap_outcome.rounds_dispatched = k means
+    /// "continue at round k+1").
+    round_index: usize,
+    verification: Vec<VerificationResult>,
+}
+
+impl Default for ResearchState {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            stage: ResearchStage::Decompose,
+            plan: None,
+            gap_list: None,
+            acc: AccumulatedEvidence::default(),
+            ledger: QueryLedger::default(),
+            markers: Vec::new(),
+            gap_outcome: GapRoundsOutcome::default(),
+            budget_spent: 0,
+            round_index: 0,
+            verification: Vec::new(),
+        }
+    }
+}
+
+impl ResearchState {
+    /// Load the persisted state for a job (or a fresh default).
+    async fn load(job_id: &str) -> Self {
+        let row = crate::session::store()
+            .conn
+            .query_optional(
+                "SELECT state FROM research_jobs WHERE id = ?1",
+                crate::turso::params![job_id],
+                |r| r.get::<String>(0),
+            )
+            .await
+            .ok()
+            .flatten();
+        let Some(json) = row else {
+            return Self::default();
+        };
+        // state='{}' is the spawn-time seed — never a valid ResearchState, so
+        // treat it as a silent fresh run rather than corruption.
+        if json.trim().is_empty() || json == "{}" {
+            return Self::default();
+        }
+        match serde_json::from_str::<ResearchState>(&json) {
+            Ok(mut s) => {
+                s.acc.rebuild_keys();
+                s
+            }
+            Err(e) => {
+                tracing::warn!(job = %job_id, error = %e, "Research state unreadable — fresh run");
+                Self::default()
+            }
+        }
+    }
+
+    /// Checkpoint the state blob + bump the job's updated_at (every jobs
+    /// write sets updated_at = now — the 8h purge keys off it). The job's
+    /// retry_count is preserved (the boot scan's MAX_BOOT_REDISPATCH bump must
+    /// survive checkpoints — resetting it to 0 would defeat the cap for runs
+    /// that crash once per stage boundary).
+    async fn save(&self, job_id: &str) {
+        let json = serde_json::to_string(self).unwrap_or_default();
+        let now = crate::turso::now();
+        let _ = crate::session::store()
+            .conn
+            .execute(
+                "UPDATE research_jobs SET state = ?1, stage = ?2, round_index = ?3, \
+                 budget_spent = ?4, updated_at = ?5 WHERE id = ?6",
+                crate::turso::params![
+                    json,
+                    self.stage.as_str(),
+                    i64::try_from(self.round_index).unwrap_or(i64::MAX),
+                    i64::try_from(self.budget_spent).unwrap_or(i64::MAX),
+                    now.clone(),
+                    job_id,
+                ],
+            )
+            .await;
+        let retry_count = crate::jobs::job_retry_count(&crate::session::store().conn, job_id).await;
+        let _ = crate::jobs::checkpoint_job(
+            &crate::session::store().conn,
+            job_id,
+            crate::jobs::JobStatus::Launched,
+            None,
+            retry_count,
+        )
+        .await;
+    }
+}
+
+impl ResearchStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Decompose => "decompose",
+            Self::Round1 => "round1",
+            Self::GapRounds => "gap_rounds",
+            Self::Verification => "verification",
+            Self::Synthesis => "synthesis",
+        }
+    }
+}
 
 // ── Shared orchestration types ───────────────────────────────────────────
 
@@ -233,36 +364,44 @@ impl Tool for ResearchTool {
             // Catch panics so the Manager ALWAYS receives the single result
             // envelope — a panic in the dispatch task would otherwise leave
             // the caller waiting forever on a result that can never arrive.
-            let run =
-                std::panic::AssertUnwindSafe(async { run_deep_research(&ws, &question).await })
-                    .catch_unwind()
-                    .await;
-            let message = match run {
-                Ok(result) => build_async_research_message(result),
+            let run = std::panic::AssertUnwindSafe(async {
+                dispatch_durable_research(
+                    &ws,
+                    &question,
+                    caller_role,
+                    user_name.clone(),
+                    channel.clone(),
+                )
+                .await
+            })
+            .catch_unwind()
+            .await;
+            let envelope = match run {
+                Ok((_result, envelope)) => envelope,
                 Err(panic) => {
                     let panic = crate::util::panic_message(&*panic);
                     tracing::error!(panic = %panic, "research dispatch panicked");
-                    build_async_research_message(Err(anyhow::anyhow!(
-                        "research dispatch panicked: {panic}"
-                    )))
+                    AgentJob {
+                        content: build_async_research_message(&Err(anyhow::anyhow!(
+                            "research dispatch panicked: {panic}"
+                        ))),
+                        workspace_name: ws.name.clone(),
+                        user_name,
+                        channel,
+                        kind: JobKind::ResearchResult,
+                        role: caller_role,
+                        reply_target: None,
+                        pending_job_id: None,
+                    }
                 }
             };
 
-            // Route exactly one final envelope to the Manager's agent channel.
-            let target_agent_id =
-                resolve_agent_id(&channel, &user_name, caller_role.as_str(), &ws.name);
-            message_router::route(
-                &target_agent_id,
-                AgentJob {
-                    content: message,
-                    workspace_name: ws.name.clone(),
-                    user_name,
-                    channel,
-                    kind: JobKind::ResearchResult,
-                    role: caller_role,
-                    reply_target: None,
-                },
-            );
+            // Route exactly one final envelope to the caller's agent channel
+            // (the completion helper's own copy — persisted and routed copies
+            // can never drift). A drain in progress may drop the routed copy
+            // (the consumer has stopped pulling), but the pending row survives
+            // for boot replay — at-least-once.
+            message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
         });
 
         Ok(
@@ -272,10 +411,169 @@ impl Tool for ResearchTool {
     }
 }
 
+/// Durable deep-research dispatch: SPAWN the job (one tx) → run the resumable
+/// orchestrator (checkpoints at stage boundaries) → COMPLETE (one tx — INSERT
+/// pending_jobs envelope + DELETE jobs row). Returns (result, envelope) — the
+/// envelope is the completion helper's own copy (pending_job_id set by the
+/// tx), routed as-is so persisted and routed copies cannot drift.
+async fn dispatch_durable_research(
+    ws: &Workspace,
+    question: &str,
+    caller_role: Role,
+    user_name: String,
+    channel: String,
+) -> (anyhow::Result<String>, AgentJob) {
+    let job_id = crate::generate_id();
+    let spawn = async {
+        // SPAWN: one tx — jobs + research_jobs child row (the shared in-tx
+        // child pattern; a crash mid-spawn leaves either all or none).
+        crate::jobs::spawn_job(
+            &crate::session::store().conn,
+            &job_id,
+            question,
+            &ws.name,
+            &user_name,
+            &channel,
+            caller_role,
+            &[],
+            &crate::jobs::SpawnChild::Research {
+                question: question.to_string(),
+            },
+        )
+        .await
+    };
+    // Spawn failures still route an error envelope — never a silent drop.
+    let result = match spawn.await {
+        Ok(()) => run_deep_research(ws, question, &job_id).await,
+        Err(e) => Err(e),
+    };
+    let (_env_ok, envelope) =
+        complete_research_job(&job_id, &result, caller_role, &user_name, &channel, ws).await;
+    (result, envelope)
+}
+
+/// COMPLETE a research job: one tx — INSERT pending_jobs (envelope, id =
+/// job id) + DELETE jobs row (exactly-once boundary). Returns (persisted?,
+/// the envelope) — the envelope carries `pending_job_id` set when the row
+/// persisted, cleared on INSERT failure so the caller routes best-effort.
+async fn complete_research_job(
+    job_id: &str,
+    result: &anyhow::Result<String>,
+    caller_role: Role,
+    user_name: &str,
+    channel: &str,
+    ws: &Workspace,
+) -> (bool, AgentJob) {
+    let mut envelope = AgentJob {
+        content: build_async_research_message(result),
+        workspace_name: ws.name.clone(),
+        user_name: user_name.to_string(),
+        channel: channel.to_string(),
+        kind: JobKind::ResearchResult,
+        role: caller_role,
+        reply_target: None,
+        pending_job_id: Some(job_id.to_string()),
+    };
+    let ok = crate::jobs::complete_job_with_envelope(
+        &crate::session::store().conn,
+        job_id,
+        &envelope,
+        JobKind::ResearchResult,
+    )
+    .await
+    .is_ok();
+    if !ok {
+        // INSERT-failure policy: fall back to a non-durable route — never
+        // drop the result silently (the Manager's only result path).
+        envelope.pending_job_id = None;
+    }
+    (ok, envelope)
+}
+
+/// Deliver a research result envelope to the job's stored caller (the
+/// consumer-confirmed pending row was created by [`complete_research_job`]).
+/// Routes UNCONDITIONALLY — on pending INSERT failure the envelope carries
+/// `pending_job_id: None` and still reaches the caller (never a silent drop).
+fn deliver_research_envelope(envelope: AgentJob) {
+    crate::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
+}
+
+/// Boot resume of a research run: re-enter the orchestrator at the
+/// checkpointed stage (retry_count capped by the boot scan), then terminalize
+/// into the durable envelope exactly like a fresh dispatch. Aborts quietly on
+/// shutdown/drain — no routing, no terminalization (the checkpointed state is
+/// reused by the next boot; routing a partial result here would race the
+/// exit).
+pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
+    if crate::shutdown::aborting() {
+        tracing::info!(job = %job_id, "Research resume aborted — drain/shutdown in progress");
+        return;
+    }
+    let Ok(Some(caller)) = crate::jobs::job_caller(&crate::session::store().conn, job_id).await
+    else {
+        tracing::warn!(job = %job_id, "Research resume: missing job row — terminalizing job");
+        let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
+        return;
+    };
+    let caller_role = std::str::FromStr::from_str(&caller.role).unwrap_or(crate::Role::Manager);
+    let result = run_deep_research(ws, &caller.task, job_id).await;
+    if crate::shutdown::aborting() {
+        tracing::info!(
+            job = %job_id,
+            "Research resume aborted after run — job stays for next boot",
+        );
+        return;
+    }
+    let (_env_ok, envelope) = complete_research_job(
+        job_id,
+        &result,
+        caller_role,
+        &caller.user_name,
+        &caller.channel,
+        ws,
+    )
+    .await;
+    deliver_research_envelope(envelope);
+}
+
+/// Boot-scan over-cap handling: the job exceeded MAX_BOOT_REDISPATCH — deliver
+/// a PARTIAL REPORT from the checkpointed state (the research envelope is the
+/// Manager's only result path; marking failed with no envelope would strand
+/// the caller forever).
+pub(crate) async fn research_capped_partial_report(job_id: &str, ws: &Workspace) {
+    if crate::shutdown::aborting() {
+        tracing::info!(job = %job_id, "Research capped report aborted — drain/shutdown in progress");
+        return;
+    }
+    let Ok(Some(caller)) = crate::jobs::job_caller(&crate::session::store().conn, job_id).await
+    else {
+        tracing::warn!(job = %job_id, "Research cap: missing job row — terminalizing job");
+        let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
+        return;
+    };
+    let caller_role = std::str::FromStr::from_str(&caller.role).unwrap_or(crate::Role::Manager);
+    let state = ResearchState::load(job_id).await;
+    let result: anyhow::Result<String> = Ok(partial_report(
+        &caller.task,
+        &state.acc,
+        "boot re-dispatch cap exceeded — partial report from last checkpoint",
+    ));
+    let (_env_ok, envelope) = complete_research_job(
+        job_id,
+        &result,
+        caller_role,
+        &caller.user_name,
+        &caller.channel,
+        ws,
+    )
+    .await;
+    deliver_research_envelope(envelope);
+}
+
 /// Build the `<research-result>` envelope message for the async research
 /// dispatch. Follows the ask convention: failures are wrapped with an
 /// explicit marker, never silently dropped.
-fn build_async_research_message(result: anyhow::Result<String>) -> String {
+fn build_async_research_message(result: &anyhow::Result<String>) -> String {
     build_async_result_envelope(result, "research-result")
 }
 
@@ -300,7 +598,7 @@ struct EvidenceRound {
 }
 
 /// All evidence accumulated across rounds.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct AccumulatedEvidence {
     urls: HashSet<String>,
     /// Claims accumulated across rounds; a claim's stable id is its index in
@@ -308,12 +606,29 @@ struct AccumulatedEvidence {
     claims: Vec<Claim>,
     /// Deduplicated analysts' self-reported unanswered aspects.
     unanswered: Vec<String>,
+    /// Rebuilt from `unanswered` after deserialize (normalize_claim keys) —
+    /// NOT stored in the state JSON.
+    #[serde(skip)]
     unanswered_keys: HashSet<String>,
     /// Raw responses of analysts whose structured extraction failed — never
     /// silently lost.
     raw_reports: Vec<String>,
     /// Research-local weak/unconfirmed annotation links (never consensus).
     weak: WeakLinks,
+}
+
+impl AccumulatedEvidence {
+    /// Rebuild the derived `unanswered_keys` set after deserialization.
+    fn rebuild_keys(&mut self) {
+        self.unanswered_keys = self
+            .unanswered
+            .iter()
+            .filter_map(|u| {
+                let key = crate::tools::ask::normalize_claim(u);
+                (!key.is_empty()).then_some(key)
+            })
+            .collect();
+    }
 }
 
 /// Research-local weak/unconfirmed annotation links — the "keep weak, clarify
@@ -324,7 +639,7 @@ struct AccumulatedEvidence {
 /// Resolution is the verification gate — verifier verdicts are the feedback
 /// loop; this run-local record is intentionally never written back, so the
 /// weak count reflects the run's history, not post-verification status.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct WeakLinks {
     /// Weak duplicate hints: standalone claim id → the suspected duplicate
     /// target's id. Recorded even when the confirm model rejected the link —
@@ -522,7 +837,7 @@ impl AccumulatedEvidence {
 /// feasible across rounds. Repeats are tallied per round
 /// ([`EvidenceRound::repeat_queries`]) and count as no-progress toward
 /// saturation in `gap_rounds` (telemetry in the run summary).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct QueryLedger {
     queries: HashSet<String>,
 }
@@ -559,6 +874,7 @@ struct RunStats {
 }
 
 /// Outcome of the conditional gap-round phase.
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct GapRoundsOutcome {
     abstention: Option<String>,
     unresolved: Vec<String>,
@@ -631,6 +947,7 @@ async fn run_structured_analyst<T: serde::de::DeserializeOwned>(
         String::new(),
         String::new(),
         None,
+        false,
     )
     .await;
     let Some(raw) = response else {
@@ -1145,17 +1462,22 @@ async fn run_gap_round(
 /// self-assessment: coverage completion, answerability abstention (checked on
 /// every structural quiet round — a non-abstain verdict continues, with the
 /// analyst budget as the hard bound), budget exhaustion, and shutdown.
+///
+/// Checkpoints AFTER EACH gap round: the gap-loop locals (round_index,
+/// rounds_dispatched, the current gap list, budget) are not derivable from
+/// the accumulated evidence — a crash mid-loop would otherwise revert to the
+/// post-round-1 checkpoint and re-run the ENTIRE gap stage from round 0 with
+/// fresh analyst sessions (whole-stage re-run, duplicated LLM spend).
 #[allow(clippy::too_many_arguments)]
 async fn gap_rounds(
     ws: &Workspace,
     question: &str,
     plan: &MergedPlan,
     budget: &mut ResearchBudget,
-    ledger: &mut QueryLedger,
-    acc: &mut AccumulatedEvidence,
+    state: &mut ResearchState,
     run_stats: &mut RunStats,
-    markers: &mut Vec<String>,
     deadline: std::time::Instant,
+    job_id: &str,
 ) -> GapRoundsOutcome {
     let mut outcome = GapRoundsOutcome {
         abstention: None,
@@ -1163,14 +1485,18 @@ async fn gap_rounds(
         rounds_dispatched: 0,
         incomplete: None,
     };
-    let Some(mut gap_list) = extract_gap_list(ws, question, acc, plan).await else {
+    let initial_list = match state.gap_list.take() {
+        Some(list) => Some(list),
+        None => extract_gap_list(ws, question, &state.acc, plan).await,
+    };
+    let Some(mut gap_list) = initial_list else {
         // Explicit marker — never collapse into coverage completion.
         outcome.incomplete = Some(GAP_EXTRACTION_FAILED.to_string());
         return outcome;
     };
-    let mut round_index = 0usize;
+    let mut round_index = state.round_index;
     loop {
-        if crate::shutdown::shutdown_token().is_cancelled() {
+        if crate::shutdown::aborting() {
             outcome.unresolved = gap_items(&gap_list.gaps);
             return outcome;
         }
@@ -1199,10 +1525,10 @@ async fn gap_rounds(
             outcome.unresolved = gap_items(gaps);
             return outcome;
         }
-        let runs = run_gap_round(ws, question, &targeted, ledger, deadline).await;
-        let round = collect_evidence(&runs, ledger, run_stats);
-        let (new_urls, _, pending) = acc.absorb(&round);
-        let novel_claims = annotate_round(ws, acc, &pending, markers).await;
+        let runs = run_gap_round(ws, question, &targeted, &state.ledger, deadline).await;
+        let round = collect_evidence(&runs, &mut state.ledger, run_stats);
+        let (new_urls, _, pending) = state.acc.absorb(&round);
+        let novel_claims = annotate_round(ws, &mut state.acc, &pending, &mut state.markers).await;
         outcome.rounds_dispatched += 1;
         // A round whose analysts only re-asked already-asked queries counts
         // as no-progress (repeat queries are never pre-dispatch-droppable —
@@ -1215,7 +1541,7 @@ async fn gap_rounds(
             // answerability check fires and the gap list is not refreshed,
             // which is the intended premature-saturation protection: gap-round
             // criteria, not reclassification, decide saturation.
-            if let Some(reason) = check_answerability(ws, question, acc).await {
+            if let Some(reason) = check_answerability(ws, question, &state.acc).await {
                 outcome.abstention = Some(reason);
                 outcome.unresolved = gap_items(gaps);
                 return outcome;
@@ -1224,13 +1550,20 @@ async fn gap_rounds(
         // Refresh the gap list from the accumulated evidence only when the
         // round produced progress; a quiet round reuses the current list.
         if new_urls != 0 || novel_claims != 0 {
-            let Some(next_gap_list) = extract_gap_list(ws, question, acc, plan).await else {
+            let Some(next_gap_list) = extract_gap_list(ws, question, &state.acc, plan).await else {
                 outcome.incomplete = Some(GAP_EXTRACTION_FAILED.to_string());
                 outcome.unresolved = gap_items(gaps);
                 return outcome;
             };
             gap_list = next_gap_list;
         }
+        // Checkpoint after EACH gap round (see the function doc — the locals
+        // must survive a crash mid-loop or the whole stage re-runs).
+        state.round_index = round_index;
+        state.gap_outcome.rounds_dispatched = outcome.rounds_dispatched;
+        state.budget_spent = budget.spent;
+        state.gap_list = Some(gap_list.clone());
+        state.save(job_id).await;
     }
 }
 
@@ -1914,135 +2247,254 @@ fn partial_report(question: &str, acc: &AccumulatedEvidence, reason: &str) -> St
 
 // ── Orchestrator ─────────────────────────────────────────────────────────
 
-/// Run the full deep-research orchestrator: round 0 (decomposition), round 1
-/// (per-sub-question researchers), conditional gap rounds, one-shot final
-/// synthesis, verification gate, and the run summary.
+/// Run the resumable deep-research orchestrator: round 0 (decomposition),
+/// round 1 (per-sub-question researchers), conditional gap rounds, one-shot
+/// final synthesis, verification gate, and the run summary. `job_id` names
+/// the durable research job whose `research_jobs.state` checkpoint is loaded
+/// on entry and saved at every stage boundary.
 #[allow(clippy::too_many_lines)]
-async fn run_deep_research(ws: &Workspace, question: &str) -> Result<String> {
+async fn run_deep_research(ws: &Workspace, question: &str, job_id: &str) -> Result<String> {
+    // Hold a non-agent-call guard for the WHOLE run: the drain-watch fires the
+    // token only when both registries are empty, and this guard bridges the
+    // inter-phase windows (analyst deregistration → the next orchestrator LLM
+    // call) so the token is never fired into a just-about-to-start call
+    // (decision: do NOT fire the token while draining). The orchestrator
+    // checks the drain at every round boundary and exits via the partial-report
+    // path, releasing the guard promptly.
+    let _orchestrator_guard =
+        crate::call_registry::NON_AGENT_CALLS.register("research_orchestrator", &ws.name);
     let start = Instant::now();
     // One round-wide bound shared by every phase's member waits
     // (decomposition, research rounds, verification): a stuck analyst is
     // aborted at it, so no phase can hang the round. Sequential provider
     // calls after the deadline finish within their own retry bounds.
     let deadline = std::time::Instant::now() + round_timeout();
+    let mut state = ResearchState::load(job_id).await;
     let mut budget = ResearchBudget::new(RESEARCH_MAX_ANALYSTS);
-    let mut ledger = QueryLedger::default();
-    let mut acc = AccumulatedEvidence::default();
+    budget.spent = state.budget_spent;
     let mut run_stats = RunStats::default();
-    let mut markers: Vec<String> = Vec::new();
 
-    // Round 0 — three independent decomposition plans merged into one.
-    let plan = match round0_decompose(ws, question, &mut budget, &mut run_stats, deadline).await {
-        Ok((plan, marker)) => {
-            if let Some(m) = marker {
-                markers.push(m);
+    // ── Round 0 — decomposition + merge (resumable) ───────────────────
+    if state.stage == ResearchStage::Decompose {
+        let plan = match round0_decompose(ws, question, &mut budget, &mut run_stats, deadline).await
+        {
+            Ok((plan, marker)) => {
+                if let Some(m) = marker {
+                    state.markers.push(m);
+                }
+                plan
             }
-            plan
-        }
-        Err(_) if crate::shutdown::shutdown_token().is_cancelled() => {
+            Err(_) if crate::shutdown::shutdown_token().is_cancelled() => {
+                return Ok(partial_report(
+                    question,
+                    &state.acc,
+                    "shutdown during decomposition",
+                ));
+            }
+            Err(_) if crate::shutdown::is_draining() => {
+                return Ok(partial_report(
+                    question,
+                    &state.acc,
+                    "drain during decomposition",
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+        state.plan = Some(plan);
+        state.budget_spent = budget.spent;
+        state.stage = ResearchStage::Round1;
+        state.save(job_id).await;
+    }
+
+    // Check shutdown/drain between rounds — never spawn round-1 analysts
+    // during shutdown or the graceful drain.
+    if crate::shutdown::aborting() {
+        return Ok(partial_report(
+            question,
+            &state.acc,
+            if crate::shutdown::is_draining() {
+                "drain after decomposition"
+            } else {
+                "shutdown after decomposition"
+            },
+        ));
+    }
+
+    // ── Round 1 — one analyst per sub-question (resumable) ────────────
+    if state.stage == ResearchStage::Round1 {
+        let plan = state
+            .plan
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("research state missing plan at round 1"))?;
+        let Some(r1) = round1_research(
+            ws,
+            question,
+            plan,
+            &mut budget,
+            &mut state.ledger,
+            &mut run_stats,
+            deadline,
+        )
+        .await
+        else {
             return Ok(partial_report(
                 question,
-                &acc,
-                "shutdown during decomposition",
+                &state.acc,
+                "round 1 skipped — analyst budget exhausted",
+            ));
+        };
+        let (_, _, pending) = state.acc.absorb(&r1);
+        annotate_round(ws, &mut state.acc, &pending, &mut state.markers).await;
+        state.budget_spent = budget.spent;
+        state.stage = ResearchStage::GapRounds;
+        state.save(job_id).await;
+    }
+
+    // ── Interim consolidation + conditional gap rounds (resumable) ────
+    if state.stage == ResearchStage::GapRounds {
+        // Clone the plan so gap_rounds can take &mut state (per-round
+        // checkpoints) while still referencing the merged decomposition.
+        let plan = state
+            .plan
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("research state missing plan at gap rounds"))?;
+        let gap_outcome = gap_rounds(
+            ws,
+            question,
+            &plan,
+            &mut budget,
+            &mut state,
+            &mut run_stats,
+            deadline,
+            job_id,
+        )
+        .await;
+        // Aborting mid-gap-loop (drain/shutdown): leave the stage at
+        // GapRounds so the next boot's resume CONTINUES the loop at the
+        // accumulated round_index (the per-round checkpoints inside
+        // gap_rounds already persisted it + the current gap list) instead of
+        // skipping the remaining gap rounds and synthesizing from truncated
+        // evidence (design pin: "empty unresolved + rounds_dispatched = k
+        // means continue at round k+1").
+        if crate::shutdown::aborting() {
+            state.gap_outcome = gap_outcome;
+            state.budget_spent = budget.spent;
+            state.save(job_id).await;
+            return Ok(partial_report(
+                question,
+                &state.acc,
+                if crate::shutdown::is_draining() {
+                    "drain during gap rounds"
+                } else {
+                    "shutdown during gap rounds"
+                },
             ));
         }
-        Err(e) => return Err(e),
-    };
+        // Round-trip the gap-loop locals on NORMAL exit (coverage complete,
+        // abstention, or budget/deadline exhaustion): round_index is already
+        // accumulated by the per-round checkpoints inside gap_rounds (it
+        // starts from the stored value and increments per round — do NOT
+        // clobber it with the per-invocation count).
+        state.gap_outcome = gap_outcome;
+        state.budget_spent = budget.spent;
+        state.stage = ResearchStage::Verification;
+        state.save(job_id).await;
+    }
+    let rounds_used = 2 + state.gap_outcome.rounds_dispatched;
 
-    // Check shutdown between rounds — never spawn round-1 analysts during
-    // shutdown.
-    if crate::shutdown::shutdown_token().is_cancelled() {
+    // The gap loop may have exited early on shutdown/drain — never run a full
+    // synthesis or spawn verification analysts during shutdown or the drain.
+    if crate::shutdown::aborting() {
         return Ok(partial_report(
             question,
-            &acc,
-            "shutdown after decomposition",
+            &state.acc,
+            if crate::shutdown::is_draining() {
+                "drain during gap rounds"
+            } else {
+                "shutdown during gap rounds"
+            },
         ));
     }
 
-    // Round 1 — one analyst per sub-question (two for high-risk).
-    let Some(r1) = round1_research(
+    // ── Final synthesis (resumable) ───────────────────────────────────
+    // Runs for every stage ≥ GapRounds: a first synthesis advances the stage
+    // and persists; a resume after Synthesis re-synthesizes (bounded — the
+    // accumulated evidence is unchanged, so the synthesis is deterministic
+    // modulo LLM nondeterminism). The marker-dedup guard makes re-runs
+    // idempotent (a resume after a failed stage save cannot duplicate
+    // markers).
+    let synthesis = match synthesize(
         ws,
         question,
-        &plan,
-        &mut budget,
-        &mut ledger,
-        &mut run_stats,
-        deadline,
+        &state.acc,
+        state.gap_outcome.abstention.as_deref(),
     )
     .await
-    else {
-        return Ok(partial_report(
-            question,
-            &acc,
-            "round 1 skipped — analyst budget exhausted",
-        ));
-    };
-    let (_, _, pending) = acc.absorb(&r1);
-    annotate_round(ws, &mut acc, &pending, &mut markers).await;
-
-    // Interim consolidation + conditional gap rounds.
-    let gap_outcome = gap_rounds(
-        ws,
-        question,
-        &plan,
-        &mut budget,
-        &mut ledger,
-        &mut acc,
-        &mut run_stats,
-        &mut markers,
-        deadline,
-    )
-    .await;
-    let rounds_used = 2 + gap_outcome.rounds_dispatched;
-
-    // The gap loop may have exited early on shutdown — never run a full
-    // synthesis or spawn verification analysts during shutdown.
-    if crate::shutdown::shutdown_token().is_cancelled() {
-        return Ok(partial_report(question, &acc, "shutdown during gap rounds"));
-    }
-
-    // Final synthesis (≤3 informed attempts; the last produced output wins,
-    // truncated reports carry an explicit marker). Fail-open: a synthesis
-    // failure delivers the accumulated evidence with an explicit marker
-    // instead of an error-only envelope — findings are never lost.
-    let synthesis = match synthesize(ws, question, &acc, gap_outcome.abstention.as_deref()).await {
+    {
         Ok(s) => {
-            if let Some(marker) = s.marker {
-                markers.push(marker);
+            if let Some(marker) = s.marker
+                && !state.markers.contains(&marker)
+            {
+                state.markers.push(marker);
+            }
+            if state.stage != ResearchStage::Synthesis {
+                state.stage = ResearchStage::Synthesis;
+                state.save(job_id).await;
             }
             s.text
         }
         Err(_) if crate::shutdown::shutdown_token().is_cancelled() => {
             return Ok(partial_report(
                 question,
-                &acc,
+                &state.acc,
                 "shutdown before final synthesis",
+            ));
+        }
+        Err(_) if crate::shutdown::is_draining() => {
+            return Ok(partial_report(
+                question,
+                &state.acc,
+                "drain before final synthesis",
             ));
         }
         Err(e) => {
             return Ok(partial_report(
                 question,
-                &acc,
+                &state.acc,
                 &format!("synthesis failed: {e}"),
             ));
         }
     };
 
-    // Verification gate (budgeted). Never spawn verifiers during shutdown —
-    // deliver the synthesized report as-is (partial is acceptable).
-    let verification = if crate::shutdown::shutdown_token().is_cancelled() {
+    // ── Verification gate (budgeted, resumable) ───────────────────────
+    // Never spawn verifiers during shutdown or the drain — deliver the
+    // synthesized report as-is (partial is acceptable).
+    let verification = if crate::shutdown::aborting() {
         Vec::new()
+    } else if !state.verification.is_empty() {
+        std::mem::take(&mut state.verification)
     } else {
-        research_verification_pass(ws, &acc, &mut budget, &mut ledger, &mut run_stats, deadline)
-            .await
+        let v = research_verification_pass(
+            ws,
+            &state.acc,
+            &mut budget,
+            &mut state.ledger,
+            &mut run_stats,
+            deadline,
+        )
+        .await;
+        state.budget_spent = budget.spent;
+        state.stage = ResearchStage::Synthesis;
+        state.save(job_id).await;
+        v
     };
 
     // Fail-open markers survive delivery: head-placed so they survive the
     // manager's sandwich truncation of long reports.
     let mut report = String::new();
-    if !markers.is_empty() {
+    if !state.markers.is_empty() {
         let _ = writeln!(report, "## Run markers");
-        for m in &markers {
+        for m in &state.markers {
             let _ = writeln!(report, "- {m}");
         }
         let _ = writeln!(report);
@@ -2061,24 +2513,36 @@ async fn run_deep_research(ws: &Workspace, question: &str) -> Result<String> {
             );
         }
     }
-    if !acc.raw_reports.is_empty() {
+    if !state.acc.raw_reports.is_empty() {
         let _ = writeln!(report);
         let _ = writeln!(report, "## Failed Analyst Reports");
-        for (i, raw) in acc.raw_reports.iter().enumerate() {
+        for (i, raw) in state.acc.raw_reports.iter().enumerate() {
             let _ = writeln!(report, "### Report from Analyst {}", i + 1);
             let _ = writeln!(report, "{}", escape_fences(raw));
         }
+    }
+    // RunStats pin: a resumed run's counts undercount the pre-crash segment —
+    // the summary carries a one-line best-effort note instead of pretending.
+    // Keyed off the job's boot-resume retry count (the real resume signal) —
+    // gap rounds dispatched within THIS process are complete and need no
+    // caveat (and the abort path can skip a run's own accumulation).
+    if crate::jobs::job_retry_count(&crate::session::store().conn, job_id).await > 0 {
+        let _ = writeln!(
+            report,
+            "\n> Run telemetry is best-effort: this run resumed from a checkpoint, so tool-call \
+             and query counts reflect only the post-resume segment."
+        );
     }
     let _ = writeln!(report);
     report.push_str(&render_run_summary(
         &run_stats,
         &budget,
         rounds_used,
-        &acc,
-        gap_outcome.abstention.as_deref(),
-        &gap_outcome.unresolved,
-        gap_outcome.incomplete.as_deref(),
-        &markers,
+        &state.acc,
+        state.gap_outcome.abstention.as_deref(),
+        &state.gap_outcome.unresolved,
+        state.gap_outcome.incomplete.as_deref(),
+        &state.markers,
         start.elapsed(),
     ));
     Ok(report)
@@ -2105,8 +2569,9 @@ mod tests {
     fn test_research_fail_open_envelope() {
         // All-decomposers-failed follows the ask convention: an error envelope
         // with an explicit marker, never a silent drop.
-        let envelope =
-            build_async_research_message(Err(anyhow::anyhow!("all decomposition analysts failed")));
+        let envelope = build_async_research_message(&Err(anyhow::anyhow!(
+            "all decomposition analysts failed"
+        )));
         assert!(envelope.contains("<research-result>"), "{envelope}");
         assert!(
             envelope.contains("An error occurred: all decomposition analysts failed"),
@@ -2115,6 +2580,177 @@ mod tests {
         assert!(
             envelope.ends_with("</research-result>"),
             "envelope must close: {envelope}"
+        );
+    }
+
+    /// The boot-scan over-cap path must deliver a PARTIAL REPORT to the
+    /// stored caller — the research envelope is the caller's only result
+    /// path, so a failed row with no envelope would strand the Manager
+    /// forever (the exact stranding class this path exists to prevent).
+    #[tokio::test]
+    async fn research_capped_delivers_partial_report_to_caller() {
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::workspace::test_ws("/tmp/test_ws_research_capped");
+        let job_id = "research_job_capped_1";
+        let conn = &crate::session::store().conn;
+        let now = crate::turso::now();
+        conn.execute(
+            "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
+             retry_count, created_at, updated_at) \
+             VALUES (?1, 'research', 'launched', ?2, ?3, 'caller-user', 'telegram', 'assistant', \
+             3, ?4, ?4)",
+            crate::turso::params![job_id, "question?", ws.name.clone(), now.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO research_jobs (id, question, stage, round_index, budget_spent, state, \
+             created_at, updated_at) VALUES (?1, 'question?', 'decompose', 0, 0, '{}', ?2, ?2)",
+            crate::turso::params![job_id, now],
+        )
+        .await
+        .unwrap();
+
+        research_capped_partial_report(job_id, &ws).await;
+
+        let job_rows = conn
+            .query(
+                "SELECT id FROM jobs WHERE id = ?1",
+                crate::turso::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(job_rows.len(), 0, "capped job must be terminalized");
+        let pending = conn
+            .query(
+                "SELECT role, user_name, envelope FROM pending_jobs WHERE id = ?1",
+                crate::turso::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "partial-report envelope persisted");
+        assert_eq!(
+            pending[0].get::<String>(0).unwrap(),
+            "assistant",
+            "delivered to the original caller role, not Manager"
+        );
+        assert_eq!(pending[0].get::<String>(1).unwrap(), "caller-user");
+        let envelope: String = pending[0].get(2).unwrap();
+        assert!(
+            envelope.contains("boot re-dispatch cap exceeded"),
+            "the partial report must surface the cap reason: {envelope}"
+        );
+    }
+
+    /// Direct resume test for `resume_research_run` (decision 8): a job
+    /// checkpointed at stage=Verification with pre-populated verification
+    /// resumes — it re-enters the orchestrator, synthesizes from the
+    /// accumulated evidence (ONE provider call), skips the verification pass
+    /// (stored results reused — no analysts spawned), terminalizes into the
+    /// durable envelope, and delivers to the ORIGINAL caller
+    /// (role/user/channel persisted on the job row, never the Manager).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn resume_research_run_continues_at_verification_stage() {
+        crate::util::test::init_management_test_stores().await;
+        let _lock = crate::util::test::retry_tests_lock();
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // One synthesis call (the only LLM work left at stage=Verification).
+        let fake = crate::util::test::FakeProvider::new()
+            .ok("final synthesized report for the resumed run");
+        let _provider_guard = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+
+        let ws = crate::workspace::test_ws("/tmp/test_ws_research_resume");
+        let job_id = "research_job_resume_1";
+        let conn = &crate::session::store().conn;
+        let now = crate::turso::now();
+        conn.execute(
+            "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
+             retry_count, created_at, updated_at) \
+             VALUES (?1, 'research', 'launched', ?2, ?3, 'caller-user', 'telegram', 'assistant', \
+             0, ?4, ?4)",
+            crate::turso::params![job_id, "question?", ws.name.clone(), now.clone()],
+        )
+        .await
+        .unwrap();
+
+        // Checkpointed state: stage=Verification, one accumulated claim, one
+        // stored verification result (the post-crash resume must reuse it —
+        // never re-run the verification pass).
+        let mut state = ResearchState {
+            schema_version: 1,
+            stage: ResearchStage::Verification,
+            plan: None,
+            gap_list: None,
+            acc: AccumulatedEvidence {
+                urls: std::collections::HashSet::new(),
+                claims: vec![crate::tools::ask::Claim {
+                    claim: "alpha is a real project".into(),
+                    source: "s1".into(),
+                    confidence: "high".into(),
+                    contradictions: vec![],
+                }],
+                unanswered: vec![],
+                unanswered_keys: std::collections::HashSet::new(),
+                raw_reports: vec![],
+                weak: WeakLinks::default(),
+            },
+            ledger: QueryLedger::default(),
+            markers: vec![],
+            gap_outcome: GapRoundsOutcome::default(),
+            budget_spent: 0,
+            round_index: 0,
+            verification: vec![crate::tools::ask::VerificationResult {
+                claim: "alpha is a real project".into(),
+                verdict: "confirmed".into(),
+                evidence: "primary source".into(),
+                tool_calls: 0,
+                searches: 0,
+                queries: vec![],
+            }],
+        };
+        state.acc.rebuild_keys();
+        let state_json = serde_json::to_string(&state).unwrap();
+        conn.execute(
+            "INSERT INTO research_jobs (id, question, stage, round_index, budget_spent, state, \
+             created_at, updated_at) VALUES (?1, 'question?', 'verification', 0, 0, ?2, ?3, ?3)",
+            crate::turso::params![job_id, state_json, now.clone()],
+        )
+        .await
+        .unwrap();
+
+        resume_research_run(job_id, &ws).await;
+
+        // Terminalized into the durable envelope addressed to the stored
+        // caller (the consumer skips it — the workspace is not registered, so
+        // the pending row survives for the assertion).
+        let job_rows = conn
+            .query(
+                "SELECT id FROM jobs WHERE id = ?1",
+                crate::turso::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(job_rows.len(), 0, "resumed job must be terminalized");
+        let pending = conn
+            .query(
+                "SELECT role, user_name, envelope FROM pending_jobs WHERE id = ?1",
+                crate::turso::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "resume envelope persisted");
+        assert_eq!(
+            pending[0].get::<String>(0).unwrap(),
+            "assistant",
+            "delivered to the original caller role, not Manager"
+        );
+        assert_eq!(pending[0].get::<String>(1).unwrap(), "caller-user");
+        let envelope: String = pending[0].get(2).unwrap();
+        assert!(
+            envelope.contains("final synthesized report"),
+            "the resume envelope must carry the synthesized report: {envelope}"
         );
     }
 

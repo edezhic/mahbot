@@ -335,6 +335,37 @@ fn kill_process_group(pid: u32) {
     }
 }
 
+/// Kill-on-drop guard for an in-flight shell child: if the surrounding future
+/// is dropped before the child is reaped (agent task aborted at drain-cap
+/// expiry, panic in a sibling tool, runtime teardown), the process group is
+/// killed — no orphaned children/grandchildren. Disarmed once the child has
+/// been reaped (the group leader is gone; a post-reap kill risks PID reuse,
+/// which is why the guard must not fire on the normal-completion paths).
+#[cfg_attr(not(unix), allow(dead_code))]
+struct KillOnDrop {
+    pid: u32,
+    armed: bool,
+}
+
+impl KillOnDrop {
+    fn new(pid: u32) -> Self {
+        Self { pid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            #[cfg(unix)]
+            kill_process_group(self.pid);
+        }
+    }
+}
+
 /// Result of draining both pipe readers within a bound.
 enum DrainOutcome {
     /// Both readers hit EOF within the bound — full output.
@@ -407,6 +438,10 @@ async fn run_command_with_timeout(
     };
 
     let pid = child.id();
+    // Kill-on-drop: an aborted task (drain-cap force-cancel, panic, runtime
+    // teardown) must not orphan the child's process group. Disarmed on every
+    // path where the child is reaped — post-reap kills risk PID reuse.
+    let mut kill_guard = pid.map(KillOnDrop::new);
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
 
@@ -416,6 +451,11 @@ async fn run_command_with_timeout(
 
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) => {
+            // Child reaped — the guard must not fire (the group leader is
+            // gone; a post-reap kill would risk PID reuse).
+            if let Some(guard) = &mut kill_guard {
+                guard.disarm();
+            }
             // Child exited naturally — drain remaining output with a bound.
             // A leftover backgrounded process that inherited the pipes prevents
             // EOF; without the bound the drain would hang the tool forever.
@@ -478,6 +518,10 @@ async fn run_command_with_timeout(
                 kill_process_group(pid);
                 // Reap the child (now dead from one or both kills).
                 let _ = child.wait().await;
+                // Reaped — disarm the guard (the explicit kill already ran).
+                if let Some(guard) = &mut kill_guard {
+                    guard.disarm();
+                }
             }
             #[cfg(not(unix))]
             {
