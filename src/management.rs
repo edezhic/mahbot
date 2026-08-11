@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+use chrono::Duration as ChronoDuration;
 use futures_util::FutureExt;
 use futures_util::future::join_all;
 
@@ -948,6 +949,10 @@ struct PollPhaseInfo {
     /// `None` for phases without a pre-flight breaker — the bounce breaker
     /// has no pre-flight arm (it is enforced mid-round).
     circuit_breaker_kind: Option<CircuitBreakerKind>,
+    /// Fresh-ticket grace for claims: when `Some`, tickets created within
+    /// this window are not claimed (only the BacklogAnalysis phase sets it —
+    /// see [`BoardStore::BACKLOG_CLAIM_GRACE`]).
+    claim_grace: Option<ChronoDuration>,
     /// Human-readable label used in logs and circuit-breaker messages.
     /// PascalCase for roles ("Engineer", "Analyst"), "QA" for the QA verifier.
     log_label: &'static str,
@@ -961,6 +966,7 @@ impl PollPhaseInfo {
             expected_phase,
             pipeline_check: PipelineCheck::Skip,
             circuit_breaker_kind: None,
+            claim_grace: None,
             log_label,
         }
     }
@@ -985,7 +991,13 @@ impl PollPhase {
     /// Return all static metadata for this phase.
     fn info(self) -> PollPhaseInfo {
         match self {
-            Self::BacklogAnalysis => PollPhaseInfo::new(TicketPhase::Analysis, "Analyst"),
+            // Backlog tickets younger than BoardStore::BACKLOG_CLAIM_GRACE stay
+            // in Backlog: the Manager usually moves a fresh ticket straight to
+            // Planning/ReadyForDevelopment right after create_ticket.
+            Self::BacklogAnalysis => PollPhaseInfo {
+                claim_grace: Some(BoardStore::BACKLOG_CLAIM_GRACE),
+                ..PollPhaseInfo::new(TicketPhase::Analysis, "Analyst")
+            },
             Self::EngineerDevelopment => PollPhaseInfo {
                 pipeline_check: PipelineCheck::Enforce,
                 ..PollPhaseInfo::new(TicketPhase::InDevelopment, "Engineer")
@@ -1227,7 +1239,13 @@ async fn run_claim_pipeline(ws: &Workspace) {
         }
         let info = phase.info();
         let ticket = match board
-            .claim_ticket_in_workspace(source, info.expected_phase, &ws.name, info.pipeline_check)
+            .claim_ticket_in_workspace(
+                source,
+                info.expected_phase,
+                &ws.name,
+                info.pipeline_check,
+                info.claim_grace,
+            )
             .await
         {
             Ok(Some(t)) => {

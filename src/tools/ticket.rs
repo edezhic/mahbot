@@ -260,7 +260,7 @@ impl Tool for UpdateTicketTool {
                 },
                 "phase": {
                     "type": "string",
-                    "description": "New phase for the ticket. Valid manual transitions: backlog (return to queue), ready_for_development (send to engineer), cancelled (abandon), failed (mark unsuccessful), done (mark complete), qa_passed (advance failed ticket past failed — only valid from 'failed' phase for Manager triage of minor issues). Do NOT manually set other pipeline-managed phases (analysis, planning, in_development, in_diagnostics, diagnostics_done, in_review, reviewed, in_qa) — the board poller handles these automatically and manual transitions will interfere with running agents."
+                    "description": "New phase for the ticket. Valid manual transitions: backlog (return to queue), planning (paused state awaiting further decision whether to proceed with the ticket or cancel it), ready_for_development (send to engineer), cancelled (abandon), failed (mark unsuccessful), done (mark complete), qa_passed (advance failed ticket past failed — only valid from 'failed' phase for Manager triage of minor issues). Do NOT manually set other pipeline-managed phases (analysis, in_development, in_diagnostics, diagnostics_done, in_review, reviewed, in_qa) — the board poller handles these automatically and manual transitions will interfere with running agents."
                 }
             }),
             &["ticket_id", "phase"],

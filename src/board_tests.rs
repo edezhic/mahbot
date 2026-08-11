@@ -158,6 +158,7 @@ async fn test_unconditional_transition_clears_assignment() {
             TicketPhase::InDevelopment,
             "ws",
             PipelineCheck::Skip,
+            None,
         )
         .await
         .expect("claim")
@@ -404,6 +405,7 @@ async fn test_claim_prefers_reserved_ticket() {
             TicketPhase::InDevelopment,
             "ws",
             PipelineCheck::Enforce,
+            None,
         )
         .await
         .expect("claim")
@@ -850,6 +852,7 @@ async fn test_claim_ticket_in_workspace() {
             TicketPhase::InDevelopment,
             "workspace_a",
             PipelineCheck::Skip,
+            None,
         )
         .await
         .expect("claim in ws_a")
@@ -867,6 +870,7 @@ async fn test_claim_ticket_in_workspace() {
                 TicketPhase::InDevelopment,
                 "workspace_a",
                 PipelineCheck::Skip,
+                None,
             )
             .await
             .expect("second claim in ws_a")
@@ -881,12 +885,74 @@ async fn test_claim_ticket_in_workspace() {
             TicketPhase::InDevelopment,
             "workspace_b",
             PipelineCheck::Skip,
+            None,
         )
         .await
         .expect("claim in ws_b")
         .expect("should claim ticket from ws_b");
     assert_eq!(claimed_b.id, id_b);
     assert_eq!(claimed_b.workspace_name, "workspace_b");
+}
+
+#[tokio::test]
+async fn test_claim_ticket_in_workspace_respects_claim_grace() {
+    let (store, _tmp) = open_test_store().await;
+    let ws = test_ws_named("/ws", "ws");
+
+    // Fresh ticket (created just now) must not be claimed within the grace window.
+    let fresh = make_ticket(&store, &ws, "Fresh", TicketPhase::Backlog).await;
+    assert!(
+        store
+            .claim_ticket_in_workspace(
+                TicketPhase::Backlog,
+                TicketPhase::Analysis,
+                "ws",
+                PipelineCheck::Skip,
+                Some(chrono::Duration::seconds(60)),
+            )
+            .await
+            .expect("claim")
+            .is_none(),
+        "fresh ticket must stay in backlog within the claim grace window"
+    );
+
+    // Once the ticket is older than the grace window it is claimable again.
+    let old_created = (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+    store
+        .conn
+        .execute(
+            "UPDATE tickets SET created_at = ?1 WHERE id = ?2",
+            crate::turso::params![old_created, fresh.clone()],
+        )
+        .await
+        .expect("backdate");
+    let claimed = store
+        .claim_ticket_in_workspace(
+            TicketPhase::Backlog,
+            TicketPhase::Analysis,
+            "ws",
+            PipelineCheck::Skip,
+            Some(chrono::Duration::seconds(60)),
+        )
+        .await
+        .expect("claim")
+        .expect("old ticket should be claimable");
+    assert_eq!(claimed.id, fresh);
+
+    // No grace window: fresh tickets are claimed immediately.
+    let fresh2 = make_ticket(&store, &ws, "Fresh2", TicketPhase::Backlog).await;
+    let claimed = store
+        .claim_ticket_in_workspace(
+            TicketPhase::Backlog,
+            TicketPhase::Analysis,
+            "ws",
+            PipelineCheck::Skip,
+            None,
+        )
+        .await
+        .expect("claim")
+        .expect("fresh ticket claimable without grace window");
+    assert_eq!(claimed.id, fresh2);
 }
 
 /// Table-driven tests for [`PipelineCheck::Enforce`] — claims with pipeline occupancy
@@ -982,6 +1048,7 @@ async fn test_claim_ticket_in_workspace_if_pipeline_free() {
                 TicketPhase::InDevelopment,
                 &claim_ws_name,
                 PipelineCheck::Enforce,
+                None,
             )
             .await
             .expect("claim should not error");
@@ -1176,6 +1243,7 @@ async fn test_transitive_prerequisites_block() {
             TicketPhase::Analysis,
             "ws",
             PipelineCheck::Skip,
+            None,
         )
         .await
         .expect("claim")
@@ -1189,6 +1257,7 @@ async fn test_transitive_prerequisites_block() {
             TicketPhase::Analysis,
             "ws",
             PipelineCheck::Skip,
+            None,
         )
         .await
         .expect("claim");
@@ -1210,6 +1279,7 @@ async fn test_transitive_prerequisites_block() {
             TicketPhase::Analysis,
             "ws",
             PipelineCheck::Skip,
+            None,
         )
         .await
         .expect("claim")
@@ -1229,6 +1299,7 @@ async fn test_transitive_prerequisites_block() {
             TicketPhase::Analysis,
             "ws",
             PipelineCheck::Skip,
+            None,
         )
         .await
         .expect("claim")

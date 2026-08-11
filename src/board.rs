@@ -1023,6 +1023,13 @@ impl BoardStore {
         })
     }
 
+    /// Grace window for Backlog→Analysis claims: tickets younger than this are
+    /// not claimed into Analysis. Gives the Manager ~5s after create_ticket to
+    /// move the ticket straight to Planning/ReadyForDevelopment — claiming it
+    /// into Analysis within the window would spawn analysts that immediately
+    /// get cancelled (plus a spurious phase-change notification).
+    pub(crate) const BACKLOG_CLAIM_GRACE: Duration = Duration::seconds(5);
+
     /// Claim a ticket scoped to a single workspace and transition it to
     /// `target_phase`. Always filters by `workspace_name` so only tickets from
     /// that workspace are eligible.
@@ -1031,6 +1038,13 @@ impl BoardStore {
     /// The WHERE clause includes `t1.phase = ?` bound to `current_phase`,
     /// providing CAS-style atomicity for phase transitions — if no ticket
     /// matches the current phase, the claim returns `None`.
+    ///
+    /// When `claim_grace` is `Some(duration)`, tickets created within that
+    /// duration before the claim are excluded from the candidate set via a SQL
+    /// `created_at <=` cutoff — they stay in `current_phase` until the window
+    /// elapses. The Backlog→Analysis claim passes [`BACKLOG_CLAIM_GRACE`] so
+    /// freshly created tickets are not immediately picked up; all other claims
+    /// pass `None` and are unaffected.
     ///
     /// When `pipeline_check` is [`PipelineCheck::Enforce`], the claim is rejected
     /// (returns `None`) if any pipeline-blocking ticket exists in the same workspace. The
@@ -1070,6 +1084,7 @@ impl BoardStore {
         target_phase: TicketPhase,
         workspace_name: &str,
         pipeline_check: PipelineCheck,
+        claim_grace: Option<Duration>,
     ) -> Result<Option<Ticket>> {
         let now = turso::now();
 
@@ -1095,29 +1110,36 @@ impl BoardStore {
             String::new()
         };
 
+        // Candidate-set age cutoff: excludes tickets created within the grace
+        // window so fresh tickets stay in `current_phase` a bit longer.
+        let grace_clause = if claim_grace.is_some() {
+            "AND t1.created_at <= ?5 "
+        } else {
+            ""
+        };
+
         let sql = format!(
             "UPDATE tickets SET phase = ?1, assigned_to = NULL, updated_at = ?2, \
              pipeline_reservation = 0 \
              WHERE id = (SELECT t1.id FROM tickets t1 \
              WHERE t1.phase = ?3 AND t1.assigned_to IS NULL AND t1.workspace_name = ?4 \
              AND t1.is_archived = 0 \
-             {pipeline_blocker_clause}{prereq_filter} \
+             {grace_clause}{pipeline_blocker_clause}{prereq_filter} \
              ORDER BY t1.pipeline_reservation DESC, t1.priority ASC, t1.created_at ASC LIMIT 1) \
              RETURNING {TICKET_COLUMNS}"
         );
 
-        let rows = self
-            .conn
-            .query(
-                &sql,
-                turso::params![
-                    target_phase.as_ref(),
-                    now,
-                    current_phase.as_ref(),
-                    workspace_name,
-                ],
-            )
-            .await?;
+        let mut params: Vec<Value> = vec![
+            Value::from(target_phase.as_ref()),
+            Value::from(now),
+            Value::from(current_phase.as_ref()),
+            Value::from(workspace_name),
+        ];
+        if let Some(grace) = claim_grace {
+            params.push(Value::from((Utc::now() - grace).to_rfc3339()));
+        }
+
+        let rows = self.conn.query(&sql, params).await?;
         match rows.into_iter().next() {
             Some(row) => Ok(Some(self.ticket_from_row(&row, LoadComments::Yes).await?)),
             None => Ok(None),
