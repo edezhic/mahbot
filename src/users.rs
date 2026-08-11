@@ -827,6 +827,9 @@ fn pins_to_personal(role: Role, ws_name: &str, user_name: &str) -> bool {
 /// and Artist always work in the user's personal workspace regardless of the
 /// selected workspace, giving path-dependent callers (enrichment uploads,
 /// generated-media writes) the personal workspace's filesystem path.
+/// An empty `user_name` disables pinning (no personal identity to pin to),
+/// so callers must pass a resolvable user (the voice admin fallback passes
+/// "admin").
 /// Accepted user decision (no migration): media written before pinning to a
 /// project workspace's `uploads/`/`generated/` stays there and is no longer
 /// reachable by Artist tools (e.g. video_edit path confinement).
@@ -840,19 +843,6 @@ pub(crate) fn effective_workspace_for_role(
         let path = personal_workspace_path(user_name);
         personal_workspace_struct(user_name, &path)
     } else {
-        // Empty user_name disables pinning (no personal identity to pin to);
-        // warn so a future caller passing an unresolvable user is diagnosed
-        // instead of silently routing Assistant/Artist to the project workspace.
-        if user_name.is_empty()
-            && (role == Role::Assistant || role == Role::Artist)
-            && !is_personal_workspace(&ws.name)
-        {
-            tracing::warn!(
-                role = ?role,
-                workspace = %ws.name,
-                "Assistant/Artist pinning skipped: empty user_name"
-            );
-        }
         ws
     }
 }
@@ -873,6 +863,23 @@ pub fn effective_role_and_workspace(
     let role = resolve_effective_role(role, &ws.name, pool);
     let ws = effective_workspace_for_role(role, ws, user_name);
     (role, ws)
+}
+
+/// Resolve the (role, workspace) a user's messages route to and their
+/// session lives in — the same resolution as routing, so ClearChat and
+/// Telegram /clear always clear the actual recipient: the DB-selected
+/// workspace, the pool-clamped active role (Analyst fallback for an
+/// empty pool), the personal-workspace Manager→Analyst remap, and
+/// Assistant/Artist pinning.
+pub async fn resolve_session_target(user_name: &str) -> (Role, Workspace) {
+    let (ws, pool) = tokio::join!(
+        resolve_workspace_for_user_name(user_name),
+        role_pool(user_name),
+    );
+    let role = resolve_active_role_from_pool(user_name, &pool)
+        .await
+        .unwrap_or(Role::Analyst);
+    effective_role_and_workspace(role, ws, user_name, &pool)
 }
 
 /// Resolve a channel+identifier pair to the canonical user name.
@@ -1127,7 +1134,10 @@ mod tests {
         assert!(!pins_to_personal(Role::Manager, "ws1", "alice"));
         assert!(!pins_to_personal(Role::Assistant, "ws1", ""));
 
-        let project = Workspace::named("ws1");
+        let project = Workspace {
+            name: "ws1".to_string(),
+            ..Default::default()
+        };
         let personal = effective_workspace_for_role(Role::Assistant, project.clone(), "alice");
         assert_eq!(personal.name, "personal:alice");
         assert!(
@@ -1145,11 +1155,80 @@ mod tests {
         // Assistant/Artist pinning resolve in one call.
         let (role, ws) = effective_role_and_workspace(
             Role::Manager,
-            Workspace::named("personal:alice"),
+            Workspace {
+                name: "personal:alice".to_string(),
+                ..Default::default()
+            },
             "alice",
             &[Role::Analyst],
         );
         assert_eq!(role, Role::Analyst);
         assert_eq!(ws.name, "personal:alice");
+    }
+
+    #[tokio::test]
+    async fn resolve_session_target_matches_routing() {
+        crate::util::test::init_test_stores().await;
+        let user = "home_clear_target";
+        let store = store();
+        store
+            .add_user(
+                user,
+                Some("full"),
+                &[Role::Manager, Role::Assistant, Role::Analyst],
+            )
+            .await
+            .unwrap();
+        crate::util::test::create_test_workspace(
+            "/tmp/home_clear_target_ws",
+            "ws_home_clear_target",
+        )
+        .await;
+
+        // Manager active in a project DB workspace → Manager@project
+        // (the routed recipient), even when the GUI picker is on the personal
+        // workspace.
+        store
+            .update_user(
+                user,
+                FieldUpdate::Set("manager"),
+                FieldUpdate::Set("ws_home_clear_target"),
+                FieldUpdate::Unchanged,
+            )
+            .await
+            .unwrap();
+        let (role, ws) = resolve_session_target(user).await;
+        assert_eq!(role, Role::Manager);
+        assert_eq!(ws.name, "ws_home_clear_target");
+
+        // Assistant active → pinned to the personal workspace regardless of
+        // the DB workspace.
+        store
+            .update_user(
+                user,
+                FieldUpdate::Set("assistant"),
+                FieldUpdate::Unchanged,
+                FieldUpdate::Unchanged,
+            )
+            .await
+            .unwrap();
+        let (role, ws) = resolve_session_target(user).await;
+        assert_eq!(role, Role::Assistant);
+        assert_eq!(ws.name, "personal:home_clear_target");
+
+        // Manager active with no DB workspace → Manager clamps to
+        // Analyst@personal (the personal-workspace invariant).
+        store
+            .update_user(
+                user,
+                FieldUpdate::Set("manager"),
+                FieldUpdate::Clear,
+                FieldUpdate::Unchanged,
+            )
+            .await
+            .unwrap();
+        let (role, ws) = resolve_session_target(user).await;
+        assert_eq!(role, Role::Analyst);
+        assert_eq!(ws.name, "personal:home_clear_target");
     }
 }

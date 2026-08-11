@@ -725,20 +725,11 @@ async fn handle_start_command(msg: &ChannelMessage) {
 /// Handle session clearing for `/clear` and the "Clear session" inline button —
 /// deletes the current session and confirms via the canonical delivery path.
 async fn handle_clear_session(msg: &ChannelMessage) {
-    let (ws, pool) = tokio::join!(
-        mahbot::users::resolve_workspace_for_user_name(&msg.user_name),
-        mahbot::users::role_pool(&msg.user_name),
-    );
-    // Analyst fallback: an empty-pool user has no agent session to clear, so
-    // the clear is a harmless no-op on a non-existent session.
-    let role = mahbot::users::resolve_active_role_from_pool(&msg.user_name, &pool)
-        .await
-        .unwrap_or(Role::Analyst);
-    // Clear the session the user actually talks to: personal workspaces map
-    // Manager→Analyst (routing uses the remapped role), and Assistant/Artist
-    // sessions live in the user's personal workspace regardless of selection.
-    let (effective_role, ws) =
-        mahbot::users::effective_role_and_workspace(role, ws, &msg.user_name, &pool);
+    // Clear the session the user actually talks to: the same (role, workspace)
+    // resolution as routing — DB-selected workspace, pool-clamped active role
+    // with Analyst fallback, personal-workspace Manager→Analyst remap, and
+    // Assistant/Artist pinning.
+    let (effective_role, ws) = mahbot::users::resolve_session_target(&msg.user_name).await;
     let reply = clear_session(
         &msg.channel,
         &msg.user_name,

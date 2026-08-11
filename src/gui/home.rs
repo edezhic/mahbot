@@ -6,7 +6,6 @@
 
 use crate::ChatDirection;
 use crate::Role;
-use crate::Workspace;
 use crate::chat_history::ChatHistoryEntry;
 use futures_util::SinkExt;
 use iced::widget::rule;
@@ -142,12 +141,14 @@ pub enum HomeMessage {
     /// DB-stored workspace differs from sidebar). Intercepted by Dashboard;
     /// never reaches Home's own update handler.
     RequestWorkspaceChange(String),
-    /// Internal signal: reverse-sync check completed. Carries the sidebar
-    /// workspace to show (the user's DB-stored workspace, normalized — empty
-    /// means Personal) and the user's DB-selected project workspace (the
-    /// merge partner for the Personal-picker chat view; `None` when unset or
+    /// Internal signal: reverse-sync check completed. Carries the user
+    /// (staleness guard for fast user switches), the sidebar workspace to
+    /// show (the user's DB-stored workspace, normalized — empty means
+    /// Personal) and the user's DB-selected project workspace (the merge
+    /// partner for the Personal-picker chat view; `None` when unset or
     /// personal). Proceeds with a normal history refresh for the selected user.
     ResolveUserSelected {
+        user: String,
         sidebar_ws: Option<String>,
         project_ws: Option<String>,
     },
@@ -364,6 +365,15 @@ impl HomeState {
             .is_some_and(|chat| chat.contains(workspace))
     }
 
+    /// Whether the picker selects the selected user's personal workspace —
+    /// projected from [`Self::visible_workspaces`] (its `primary` is the
+    /// personal workspace only at the Personal picker), so the merge-partner
+    /// decision keeps a single shape across the refresh paths.
+    fn at_personal_picker(&self) -> bool {
+        self.visible_workspaces()
+            .is_some_and(|chat| self.is_selected_user_personal_workspace(&chat.primary))
+    }
+
     /// Reverse-sync the DB-stored workspace preference for a user.
     ///
     /// Returns [`ResolveUserSelected`] carrying the sidebar workspace to show
@@ -388,6 +398,7 @@ impl HomeState {
                     (ws_name.clone(), Some(ws_name))
                 };
                 HomeMessage::ResolveUserSelected {
+                    user,
                     sidebar_ws: Some(sidebar_ws),
                     project_ws,
                 }
@@ -395,6 +406,7 @@ impl HomeState {
             Ok(None) => {
                 // User has no stored preference — keep current sidebar selection.
                 HomeMessage::ResolveUserSelected {
+                    user,
                     sidebar_ws: current_ws.clone(),
                     project_ws: None,
                 }
@@ -402,6 +414,7 @@ impl HomeState {
             Err(e) => {
                 tracing::warn!("Failed to get raw workspace for user {user}: {e}");
                 HomeMessage::ResolveUserSelected {
+                    user,
                     sidebar_ws: current_ws.clone(),
                     project_ws: None,
                 }
@@ -1025,7 +1038,7 @@ impl HomeState {
                 // flow through WorkspaceChanged) are reflected, then load in
                 // one shot. At a project picker the merge partner is the
                 // selected workspace itself, so a direct refresh suffices.
-                if ws_name.as_deref().is_some_and(str::is_empty) {
+                if self.at_personal_picker() {
                     let read_user = user.clone();
                     Task::perform(Self::project_workspace_for(read_user), move |project| {
                         HomeMessage::ProjectWorkspaceRefreshed(user, project)
@@ -1040,8 +1053,7 @@ impl HomeState {
                 if self.selected_user.as_deref() != Some(&user) {
                     return Task::none();
                 }
-                let at_personal_picker =
-                    self.selected_workspace.as_deref().is_none_or(str::is_empty);
+                let at_personal_picker = self.at_personal_picker();
                 self.user_project_workspace = project;
                 // Re-load only while the merge partner is part of the view; a
                 // later project-picker switch already refreshed.
@@ -1075,9 +1087,15 @@ impl HomeState {
                 Task::none()
             }
             HomeMessage::ResolveUserSelected {
+                user,
                 sidebar_ws,
                 project_ws,
             } => {
+                // Stale resolve (user switched while reading) — the newer
+                // selection owns its own resolution.
+                if self.selected_user.as_deref() != Some(&user) {
+                    return Task::none();
+                }
                 // The user's DB-selected project workspace is the merge
                 // partner for the Personal-picker chat view.
                 self.user_project_workspace = project_ws;
@@ -1158,12 +1176,14 @@ impl HomeState {
                     async move {
                         // Clear the session the user actually talks to — the
                         // same (role, workspace) resolution as routing and
-                        // Telegram /clear (see [`clear_target`]): the starting
-                        // workspace is the user's DB workspace, never the GUI
-                        // picker position, so the Personal picker clears the
-                        // project Manager conversation instead of a phantom
-                        // Analyst session in the personal workspace.
-                        let (effective_role, ws) = clear_target(&sender).await;
+                        // Telegram /clear (see
+                        // [`crate::users::resolve_session_target`]): the
+                        // starting workspace is the user's DB workspace, never
+                        // the GUI picker position, so the Personal picker
+                        // clears the project Manager conversation instead of
+                        // a phantom Analyst session in the personal workspace.
+                        let (effective_role, ws) =
+                            crate::users::resolve_session_target(&sender).await;
                         let _ = crate::session::clear_session(
                             "gui",
                             &sender,
@@ -1520,21 +1540,6 @@ impl HomeState {
     }
 }
 
-/// The (role, workspace) pair whose session ClearChat clears — identical to
-/// the routing resolution and Telegram /clear: the starting workspace is the
-/// user's DB workspace (the GUI picker position never reaches routing), then
-/// the pool-clamped active role with Manager→Analyst clamp and Assistant/
-/// Artist pinning applied atomically. Analyst fallback matches Telegram
-/// /clear (an empty-pool user has no agent session to clear).
-async fn clear_target(sender: &str) -> (Role, Workspace) {
-    let pool = crate::users::role_pool(sender).await;
-    let role = crate::users::resolve_active_role_from_pool(sender, &pool)
-        .await
-        .unwrap_or(Role::Analyst);
-    let ws = crate::users::resolve_workspace_for_user_name(sender).await;
-    crate::users::effective_role_and_workspace(role, ws, sender, &pool)
-}
-
 /// Stream producer for chat events from CHAT_BROADCAST.
 fn chat_stream_producer() -> impl futures_util::Stream<Item = HomeMessage> {
     super::common::broadcast_stream_producer(16, &crate::CHAT_BROADCAST, |output, item| {
@@ -1850,55 +1855,36 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_workspace_visible_personal_at_any_picker() {
-        // Project picker: project and personal workspaces are both visible.
-        let state = make_home_state("alice", "ws1");
-        assert!(state.workspace_visible("ws1"));
-        assert!(
-            state.workspace_visible("personal:alice"),
-            "personal Assistant/Artist messages must be visible at any picker"
-        );
-        assert!(!state.workspace_visible("ws2"));
-        assert!(
-            !state.workspace_visible("personal:bob"),
-            "another user's personal workspace is not visible"
-        );
-
-        // Personal picker: personal and the user's DB project workspace are
-        // both visible (symmetric visibility — the picker selects the
-        // recipient, not the view).
-        let mut state = make_home_state("alice", "");
-        state.user_project_workspace = Some("ws1".to_string());
-        assert_eq!(
-            state.resolve_workspace_name().as_deref(),
-            Some("personal:alice"),
-            "empty picker selection resolves to the personal workspace"
-        );
-        assert!(state.workspace_visible("personal:alice"));
-        assert!(
-            state.workspace_visible("ws1"),
-            "project messages must be visible at the personal picker"
-        );
-        assert!(
-            !state.workspace_visible("ws2"),
-            "a non-selected project workspace stays hidden at the personal picker"
-        );
-    }
-
-    #[test]
-    fn test_visible_workspaces_dedup() {
+    fn test_visible_chat_symmetric_at_any_picker() {
+        // Project picker: project + personal visible; unrelated stays hidden.
         let project = make_home_state("alice", "ws1");
         assert_eq!(
             project.visible_workspaces(),
             Some(VisibleChat {
                 primary: "ws1".to_string(),
                 merge: Some("personal:alice".to_string()),
-            }),
-            "project picker shows both the project and the personal workspace"
+            })
+        );
+        assert!(project.workspace_visible("ws1"));
+        assert!(
+            project.workspace_visible("personal:alice"),
+            "personal Assistant/Artist messages must be visible at any picker"
+        );
+        assert!(!project.workspace_visible("ws2"));
+        assert!(
+            !project.workspace_visible("personal:bob"),
+            "another user's personal workspace is not visible"
         );
 
+        // Personal picker: personal + the user's DB project workspace visible
+        // (symmetric — the picker selects the recipient, not the view).
         let mut personal = make_home_state("alice", "");
         personal.user_project_workspace = Some("ws1".to_string());
+        assert_eq!(
+            personal.resolve_workspace_name().as_deref(),
+            Some("personal:alice"),
+            "empty picker selection resolves to the personal workspace"
+        );
         assert_eq!(
             personal.visible_workspaces(),
             Some(VisibleChat {
@@ -1907,8 +1893,17 @@ mod tests {
             }),
             "personal picker merges the user's project workspace"
         );
+        assert!(personal.workspace_visible("personal:alice"));
+        assert!(
+            personal.workspace_visible("ws1"),
+            "project messages must be visible at the personal picker"
+        );
+        assert!(
+            !personal.workspace_visible("ws2"),
+            "a non-selected project workspace stays hidden at the personal picker"
+        );
 
-        // No DB project workspace → personal-only view.
+        // No DB project workspace → personal-only view; no user → no chat.
         let personal_only = make_home_state("alice", "");
         assert_eq!(
             personal_only.visible_workspaces(),
@@ -1918,9 +1913,8 @@ mod tests {
             }),
             "personal picker without a project workspace shows only the personal chat"
         );
-
-        let no_user = HomeState::new();
-        assert_eq!(no_user.visible_workspaces(), None);
+        assert!(!personal_only.workspace_visible("ws1"));
+        assert_eq!(HomeState::new().visible_workspaces(), None);
     }
 
     #[test]
@@ -2004,6 +1998,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_resolve_user_selected_stale_user_guard() {
+        // A resolve for a user that is no longer selected must not apply
+        // (fast user switch while the DB read was in flight) — same guard as
+        // ProjectWorkspaceRefreshed.
+        let mut state = make_home_state("alice", "");
+        let _ = state.update(HomeMessage::ResolveUserSelected {
+            user: "bob".to_string(),
+            sidebar_ws: Some("ws_bob".to_string()),
+            project_ws: Some("ws_bob".to_string()),
+        });
+        assert_eq!(state.selected_user.as_deref(), Some("alice"));
+        assert_eq!(state.selected_workspace.as_deref(), Some(""));
+        assert_eq!(state.user_project_workspace, None);
+
+        // The current user's resolve applies the merge partner.
+        let _ = state.update(HomeMessage::ResolveUserSelected {
+            user: "alice".to_string(),
+            sidebar_ws: Some("ws1".to_string()),
+            project_ws: Some("ws1".to_string()),
+        });
+        assert_eq!(state.user_project_workspace.as_deref(), Some("ws1"));
+    }
+
     #[tokio::test]
     async fn test_project_workspace_for_reads_db_normalized() {
         crate::util::test::init_test_stores().await;
@@ -2060,133 +2078,40 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_clear_target_matches_routing() {
-        crate::util::test::init_test_stores().await;
-        let user = "home_clear_target";
-        let store = crate::users::USER_STORE
-            .get()
-            .expect("users store initialized");
-        store
-            .add_user(
-                user,
-                Some("full"),
-                &[Role::Manager, Role::Assistant, Role::Analyst],
-            )
-            .await
-            .expect("add user");
-        crate::util::test::create_test_workspace(
-            "/tmp/home_clear_target_ws",
-            "ws_home_clear_target",
-        )
-        .await;
-
-        // Manager active in a project DB workspace → clears Manager@project
-        // (the routed recipient), even when the GUI picker is on the personal
-        // workspace.
-        store
-            .update_user(
-                user,
-                crate::users::FieldUpdate::Set("manager"),
-                crate::users::FieldUpdate::Set("ws_home_clear_target"),
-                crate::users::FieldUpdate::Unchanged,
-            )
-            .await
-            .expect("set role + workspace");
-        let (role, ws) = clear_target(user).await;
-        assert_eq!(role, Role::Manager);
-        assert_eq!(ws.name, "ws_home_clear_target");
-
-        // Assistant active → pinned to the personal workspace regardless of
-        // the DB workspace.
-        store
-            .update_user(
-                user,
-                crate::users::FieldUpdate::Set("assistant"),
-                crate::users::FieldUpdate::Unchanged,
-                crate::users::FieldUpdate::Unchanged,
-            )
-            .await
-            .expect("set assistant role");
-        let (role, ws) = clear_target(user).await;
-        assert_eq!(role, Role::Assistant);
-        assert_eq!(ws.name, "personal:home_clear_target");
-
-        // Manager active with no DB workspace → Manager clamps to
-        // Analyst@personal (the personal-workspace invariant).
-        store
-            .update_user(
-                user,
-                crate::users::FieldUpdate::Set("manager"),
-                crate::users::FieldUpdate::Clear,
-                crate::users::FieldUpdate::Unchanged,
-            )
-            .await
-            .expect("clear workspace");
-        let (role, ws) = clear_target(user).await;
-        assert_eq!(role, Role::Analyst);
-        assert_eq!(ws.name, "personal:home_clear_target");
-    }
-
     #[test]
-    fn test_personal_workspace_call_site_wiring() {
-        let mut state = make_home_state("alice", "ws1");
+    fn test_call_site_wiring_symmetric_at_any_picker() {
+        // (picker, message workspace, agent role, content) — both directions:
+        // at the project picker personal Assistant/Artist messages append and
+        // clear sending/typing; at the personal picker the same holds for
+        // Manager replies in the user's DB project workspace.
+        let cases = [
+            ("ws1", "personal:alice", "assistant", "Assistant reply"),
+            ("", "ws1", "manager", "Manager reply"),
+        ];
+        for (picker, msg_ws, role, content) in cases {
+            let mut state = make_home_state("alice", picker);
+            state.user_project_workspace = Some("ws1".to_string());
+            state.append_message(
+                "alice",
+                msg_ws,
+                "msg".to_string(),
+                content.to_string(),
+                ChatDirection::Agent,
+                Some(role.to_string()),
+            );
+            assert_eq!(state.messages.len(), 1);
+            assert_eq!(state.messages[0].content, content);
+            state.sending = true;
+            state.typing = true;
+            state.update_sending_state(ChatDirection::Agent, "alice", msg_ws);
+            assert!(!state.sending);
+            assert!(!state.typing);
+        }
 
-        // Assistant reply in the personal workspace appends at the project
-        // picker...
-        state.append_message(
-            "alice",
-            "personal:alice",
-            "msg-personal".to_string(),
-            "Assistant reply".to_string(),
-            ChatDirection::Agent,
-            Some("assistant".to_string()),
-        );
-        assert_eq!(
-            state.messages.len(),
-            1,
-            "Assistant reply in the personal workspace must append at the project picker"
-        );
-        assert_eq!(state.messages[0].content, "Assistant reply");
-
-        // ...and clears the sending/typing indicators even though the picker
-        // is on the project workspace.
-        state.sending = true;
-        state.typing = true;
-        state.update_sending_state(ChatDirection::Agent, "alice", "personal:alice");
-        assert!(!state.sending);
-        assert!(!state.typing);
-    }
-
-    #[test]
-    fn test_project_workspace_call_site_wiring_at_personal_picker() {
-        // Symmetric direction: at the personal picker, Manager replies in the
-        // user's DB project workspace append and clear sending/typing.
+        // A project workspace that is not the user's own stays hidden at the
+        // personal picker.
         let mut state = make_home_state("alice", "");
         state.user_project_workspace = Some("ws1".to_string());
-
-        state.append_message(
-            "alice",
-            "ws1",
-            "msg-project".to_string(),
-            "Manager reply".to_string(),
-            ChatDirection::Agent,
-            Some("manager".to_string()),
-        );
-        assert_eq!(
-            state.messages.len(),
-            1,
-            "project Manager reply must append at the personal picker"
-        );
-        assert_eq!(state.messages[0].content, "Manager reply");
-
-        state.sending = true;
-        state.typing = true;
-        state.update_sending_state(ChatDirection::Agent, "alice", "ws1");
-        assert!(!state.sending);
-        assert!(!state.typing);
-
-        // A project workspace that is not the user's own stays hidden.
         state.append_message(
             "alice",
             "ws2",
@@ -2197,7 +2122,7 @@ mod tests {
         );
         assert_eq!(
             state.messages.len(),
-            1,
+            0,
             "messages from an unrelated workspace must not append at the personal picker"
         );
     }
