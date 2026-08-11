@@ -28,6 +28,12 @@ use serde_json::json;
 use std::fmt::Write as _;
 use std::time::Duration;
 
+// ── Constants (module-local defaults) ────────────────────────────────────
+
+/// Number of decorrelated parallel analysts spawned per ask round (durable and
+/// sync pipelines share the same batch width).
+const PARALLEL_ANALYST_COUNT: usize = 3;
+
 /// Controls sub-agent dispatch behaviour.
 ///
 /// [`Sync`](DispatchMode::Sync) blocks the caller until the sub-agent completes.
@@ -272,7 +278,6 @@ async fn run_ask_with_job(
     channel: &str,
     resume: bool,
 ) -> anyhow::Result<AskRunOutcome> {
-    const PARALLEL_ANALYST_COUNT: usize = 3;
     let deadline = std::time::Instant::now() + round_timeout();
 
     // Fresh dispatch: build the roster and spawn the job BEFORE any analyst
@@ -815,8 +820,6 @@ pub(crate) const VERIFY_MAX_ANALYSTS: usize = 4;
 /// Spawn 3 decorrelated parallel analysts, then consolidate their claim-level
 /// findings into a single comprehensive answer.
 async fn run_parallel_analysts_and_consolidate(ws: &Workspace, ask: &str) -> Result<String> {
-    const PARALLEL_ANALYST_COUNT: usize = 3;
-
     // One round-wide bound shared by the analyst and extraction member waits
     // — a stuck analyst is aborted at it, so no phase can hang the round.
     // The sequential consolidation call after the deadline finishes within
