@@ -146,17 +146,26 @@ impl ResearchState {
         }
     }
 
-    /// Checkpoint the state blob + bump the job's updated_at (every jobs
-    /// write sets updated_at = now — the 8h purge keys off it). The job's
-    /// retry_count is preserved (the boot scan's MAX_BOOT_REDISPATCH bump must
-    /// survive checkpoints — resetting it to 0 would defeat the cap for runs
-    /// that crash once per stage boundary).
+    /// Checkpoint the state blob + jobs updated_at touch in ONE transaction
+    /// (both rows live in sessions.db — the documented single transaction
+    /// domain), so a crash can't advance research_jobs.state without the
+    /// matching jobs touch. retry_count is deliberately untouched: the boot
+    /// scan's MAX_BOOT_REDISPATCH bump is the only writer and must survive
+    /// checkpoints. A failed checkpoint logs a structured warning and the run
+    /// continues.
     async fn save(&self, job_id: &str) {
         let json = serde_json::to_string(self).unwrap_or_default();
         let now = crate::turso::now();
-        let _ = crate::session::store()
-            .conn
-            .execute(
+        let conn = &crate::session::store().conn;
+        let tx = match conn.begin_tx().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::warn!(job = %job_id, error = %e, "Research checkpoint: failed to begin transaction");
+                return;
+            }
+        };
+        let outcome: Result<()> = async {
+            tx.execute(
                 "UPDATE research_jobs SET state = ?1, stage = ?2, round_index = ?3, \
                  budget_spent = ?4, updated_at = ?5 WHERE id = ?6",
                 crate::turso::params![
@@ -168,16 +177,26 @@ impl ResearchState {
                     job_id,
                 ],
             )
-            .await;
-        let retry_count = crate::jobs::job_retry_count(&crate::session::store().conn, job_id).await;
-        let _ = crate::jobs::checkpoint_job(
-            &crate::session::store().conn,
-            job_id,
-            crate::jobs::JobStatus::Launched,
-            None,
-            retry_count,
-        )
+            .await?;
+            tx.execute(
+                "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                crate::turso::params![crate::jobs::JobStatus::Launched.as_str(), now, job_id],
+            )
+            .await?;
+            Ok(())
+        }
         .await;
+        match outcome {
+            Ok(()) => {
+                if let Err(e) = tx.commit().await {
+                    tracing::warn!(job = %job_id, error = %e, "Research checkpoint: failed to commit");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(job = %job_id, error = %e, "Research checkpoint failed — state not persisted");
+                let _ = tx.rollback().await;
+            }
+        }
     }
 }
 
