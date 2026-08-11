@@ -1072,7 +1072,7 @@ impl crate::Provider for PanicProvider {
 
 /// The dispatch-panic drain guard: a panic in the dispatch task while the
 /// graceful drain is active must NOT drive the exit-time ticket rollback (no
-/// Failed transition, no failure comment) — the job stays status=running for
+/// Failed transition, no failure comment) — the job stays status='launched' for
 /// boot resume. The control case (no drain) proves the same panic path DOES
 /// transition to Failed when the guard is inactive.
 ///

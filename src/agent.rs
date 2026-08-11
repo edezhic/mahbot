@@ -308,7 +308,7 @@ impl Agent {
                 // tool group's commit) so the CURRENT tool group completes —
                 // no new LLM call starts once the drain begins (or the token
                 // fires). The round is resumed at boot via the job row
-                // (status=running).
+                // (status='launched').
                 if crate::shutdown::aborting() {
                     anyhow::bail!("Agent round cut short by shutdown/drain — resumes at boot");
                 }

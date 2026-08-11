@@ -136,7 +136,7 @@ impl Tool for AskTool {
                 let envelope = match round {
                     Ok(Some(envelope)) => envelope,
                     Ok(None) => {
-                        // Drain-cut: job stays status=running for boot resume —
+                        // Drain-cut: job stays status='launched' for boot resume —
                         // route NOTHING now (a spurious error envelope during
                         // the drain would discard the checkpointed outcomes;
                         // the result envelope is delivered after boot resume).
@@ -192,7 +192,7 @@ enum AskRunOutcome {
     /// The round produced a result (Ok or Err — both terminalize with a
     /// durable envelope).
     Result(anyhow::Result<String>),
-    /// Round cut by drain/shutdown — the job stays status=running for boot
+    /// Round cut by drain/shutdown — the job stays status='launched' for boot
     /// resume; nothing is routed or terminalized now.
     DrainCut,
 }
@@ -208,7 +208,7 @@ enum AskRunOutcome {
 ///    jobs row — the exactly-once persistence boundary.
 ///
 /// Returns `None` only when the round was cut by drain/shutdown (job left
-/// status=running for boot resume — nothing to route now). On error the
+/// status='launched' for boot resume — nothing to route now). On error the
 /// envelope still routes (errors wrapped in `<ask-tool-result>`), and the
 /// job is terminalized.
 async fn dispatch_durable_ask(
@@ -222,14 +222,14 @@ async fn dispatch_durable_ask(
     match run_ask_with_job(ws, ask, &job_id, caller_role, &user_name, &channel, false).await {
         Ok(AskRunOutcome::DrainCut) => {
             // Drain-cut (decision 20): analyst outcomes are already
-            // checkpointed — leave the job status=running for boot resume
+            // checkpointed — leave the job status='launched' for boot resume
             // (recoverable via ask_jobs checkpoints). No terminalization, no
             // error envelope: a spurious envelope here would discard the
-            // checkpointed outcomes and contradict "jobs stay status=running
+            // checkpointed outcomes and contradict "jobs stay status='launched'
             // for boot resume".
             tracing::info!(
                 job = %job_id,
-                "Ask round cut short by drain — job stays running for boot resume",
+                "Ask round cut short by drain — job stays launched for boot resume",
             );
             None
         }
@@ -386,15 +386,15 @@ async fn run_ask_with_job(
             AskRun::Completed {
                 response: Some(raw),
                 ..
-            } => (crate::jobs::AgentStatus::Done, raw.clone()),
+            } => (crate::jobs::RowStatus::Done, raw.clone()),
             AskRun::Completed {
                 agent,
                 response: None,
             } => (
-                crate::jobs::AgentStatus::Failed,
+                crate::jobs::RowStatus::Failed,
                 agent.failure_reason("analyst produced no response"),
             ),
-            AskRun::Failed { reason } => (crate::jobs::AgentStatus::Failed, reason.clone()),
+            AskRun::Failed { reason } => (crate::jobs::RowStatus::Failed, reason.clone()),
         };
         if let Err(e) =
             crate::jobs::write_agent_outcome(conn, job_id, &slot.agent_id, status, Some(&outcome))
@@ -406,7 +406,7 @@ async fn run_ask_with_job(
 
     // Drain/shutdown cut the round mid-flight: skip the consolidate LLM call
     // (no new LLM work during the drain) — the checkpointed outcomes are
-    // reused by the next boot's resume; the caller leaves the job running.
+    // reused by the next boot's resume; the caller leaves the job launched.
     if crate::shutdown::aborting() {
         return Ok(AskRunOutcome::DrainCut);
     }
@@ -2305,7 +2305,7 @@ mod tests {
             conn,
             job_id,
             &agent_id,
-            crate::jobs::AgentStatus::Done,
+            crate::jobs::RowStatus::Done,
             Some("completed analyst response"),
         )
         .await
@@ -2390,7 +2390,7 @@ mod tests {
             conn,
             job_id,
             &agent_id,
-            crate::jobs::AgentStatus::Done,
+            crate::jobs::RowStatus::Done,
             Some("completed analyst response"),
         )
         .await

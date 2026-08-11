@@ -449,7 +449,7 @@ pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) ->
     if crate::shutdown::aborting() {
         // Shutdown AND the graceful drain are excluded: a drain-cut round is
         // not a failure, so no auto-pause fires at exit time (the job stays
-        // running for boot resume).
+        // launched for boot resume).
         return String::new();
     }
     let Some(ws) = resolve_ticket_workspace(ticket, "auto-pause skipped").await else {
@@ -851,7 +851,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
             );
             if crate::shutdown::aborting() {
                 // Drain-cut: no Failed transition or workspace pause during the
-                // drain — the job stays status=running for boot resume
+                // drain — the job stays status='launched' for boot resume
                 // (consistent with every other drain-cut path).
                 warn!(
                     ticket = %ticket_for_failure.id,
@@ -1473,7 +1473,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         &crate::session::store().conn,
         &ticket.id,
         &message,
-        crate::jobs::AgentStatus::Launched,
+        crate::jobs::RowStatus::Launched,
     )
     .await
     {
@@ -1509,14 +1509,14 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         return;
     }
 
-    // Drain-cut (decision 20): the job stays status=running for boot resume —
+    // Drain-cut (decision 20): the job stays status='launched' for boot resume —
     // no failure record, no outcome checkpoint (the roster row stays
     // launched). Returned BEFORE the failure comment so drained agents never
     // emit AGENT_FAILURE_EMOJI or drive exit-time rollback.
     if response.is_none() && crate::shutdown::aborting() {
         info!(
             ticket = %ticket.id,
-            "Engineer round cut short by drain — job stays running for boot resume",
+            "Engineer round cut short by drain — job stays launched for boot resume",
         );
         return;
     }
@@ -1528,9 +1528,9 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         .clone()
         .unwrap_or_else(|| agent.failure_reason("engineer produced no response"));
     let outcome_status = if response.is_some() {
-        crate::jobs::AgentStatus::Done
+        crate::jobs::RowStatus::Done
     } else {
-        crate::jobs::AgentStatus::Failed
+        crate::jobs::RowStatus::Failed
     };
     if let Err(e) = crate::jobs::write_agent_outcome(
         &crate::session::store().conn,
@@ -2126,12 +2126,12 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         // Agent failed or was cancelled — record failure and clear assigned_to
         // for re-dispatch retry. The marker comment lets the sanitation circuit
         // breaker detect repeated failures. During the graceful drain the job
-        // stays running for boot resume (decision 20) — no failure record, no
+        // stays launched for boot resume (decision 20) — no failure record, no
         // outcome checkpoint.
         if crate::shutdown::aborting() {
             info!(
                 ticket = %ticket.id,
-                "Sanitation round cut short by drain — job stays running for boot resume",
+                "Sanitation round cut short by drain — job stays launched for boot resume",
             );
             return;
         }
@@ -2152,7 +2152,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
             &crate::session::store().conn,
             &job_id,
             &format!("ticket_{job_id}_sanitation"),
-            crate::jobs::AgentStatus::Done,
+            crate::jobs::RowStatus::Done,
             Some(text),
         )
         .await
@@ -2708,7 +2708,7 @@ async fn run_parallel_agents(
     // are never re-invoked — their outcomes are read from the roster.
     let launched: Vec<&TicketStageSlot> = slots
         .iter()
-        .filter(|s| s.status != crate::jobs::AgentStatus::Done)
+        .filter(|s| s.status != crate::jobs::RowStatus::Done)
         .collect();
     let receivers: Vec<_> = launched
         .iter()
@@ -2816,9 +2816,9 @@ async fn run_parallel_agents(
         for (slot, result) in launched.iter().zip(&run_results) {
             let outcome = serialize_verdict_outcome(result);
             let status = if matches!(result, ParallelVerdict::NoResponse(_)) {
-                crate::jobs::AgentStatus::Failed
+                crate::jobs::RowStatus::Failed
             } else {
-                crate::jobs::AgentStatus::Done
+                crate::jobs::RowStatus::Done
             };
             if let Err(e) = crate::jobs::write_agent_outcome(
                 conn,
@@ -2842,7 +2842,7 @@ async fn run_parallel_agents(
         // ── Assemble results in dispatch order: done slots replay their
         // stored outcome; launched slots use the fresh run. ──
         for slot in slots {
-            if slot.status == crate::jobs::AgentStatus::Done {
+            if slot.status == crate::jobs::RowStatus::Done {
                 let outcome = slot.outcome.clone().unwrap_or_default();
                 results.push(deserialize_verdict_outcome(&outcome));
             } else if let Some(r) = by_agent.get(slot.agent_id.as_str()) {
@@ -2917,7 +2917,7 @@ struct TicketStageSlot {
     /// FINAL per-agent rendered prompt (angle appended) — makes replay exact
     /// regardless of the angle formula or slot numbering.
     task: String,
-    status: crate::jobs::AgentStatus,
+    status: crate::jobs::RowStatus,
     /// Stored agents.outcome (tagged JSON) — set on replay of a done slot.
     outcome: Option<String>,
 }
@@ -3014,7 +3014,7 @@ async fn spawn_ticket_stage_round(
             idx: i64::try_from(i).unwrap_or(i64::MAX),
             agent_id,
             task,
-            status: crate::jobs::AgentStatus::Launched,
+            status: crate::jobs::RowStatus::Launched,
             outcome: None,
         });
     }
@@ -3077,7 +3077,7 @@ async fn spawn_single_slot_round(
         idx: 0,
         agent_id: agent_id.to_string(),
         task: prompt.to_string(),
-        status: crate::jobs::AgentStatus::Launched,
+        status: crate::jobs::RowStatus::Launched,
         outcome: None,
     };
     crate::jobs::spawn_job(
@@ -3148,7 +3148,7 @@ async fn append_ticket_stage_slots(
             idx: i,
             agent_id,
             task,
-            status: crate::jobs::AgentStatus::Launched,
+            status: crate::jobs::RowStatus::Launched,
             outcome: None,
         });
     }
@@ -3176,9 +3176,9 @@ async fn load_ticket_stage_slots(job_id: &str) -> anyhow::Result<Vec<TicketStage
             agent_id: r.agent_id,
             task: r.task,
             status: match r.status.as_str() {
-                "done" => crate::jobs::AgentStatus::Done,
-                "failed" => crate::jobs::AgentStatus::Failed,
-                _ => crate::jobs::AgentStatus::Launched,
+                "done" => crate::jobs::RowStatus::Done,
+                "failed" => crate::jobs::RowStatus::Failed,
+                _ => crate::jobs::RowStatus::Launched,
             },
             outcome: r.outcome,
         })
@@ -3349,7 +3349,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
     process_analyst_verdicts(&ws, &ticket, &results, &job_id).await;
 
     // Drain-cut: the analysts' outcomes are checkpointed; the job stays
-    // status=running for boot resume (process_analyst_verdicts itself skips
+    // status='launched' for boot resume (process_analyst_verdicts itself skips
     // the transition while draining — no misleading joint comment).
     if crate::shutdown::aborting() {
         return;
@@ -3422,7 +3422,7 @@ async fn process_analyst_verdicts(
     persist_verdict_scores(ticket, stage_name(Role::Analyst), results, job_id).await;
 
     // No exit-time transition during the graceful drain (decision 20): the
-    // outcomes are checkpointed on the roster; the job stays status=running
+    // outcomes are checkpointed on the roster; the job stays status='launched'
     // and boot resume re-processes them. A drained analysis round must NOT
     // write a misleading joint comment or Notify the Manager.
     if crate::shutdown::aborting() {
@@ -3801,7 +3801,7 @@ async fn process_verifier_verdicts(
     };
     // No exit-time ticket rollback (decision 20): during the graceful drain a
     // failed round must NOT drive the ticket to Failed, bounce it, or pause
-    // the workspace — the job stays status=running for boot resume, which
+    // the workspace — the job stays status='launched' for boot resume, which
     // re-processes the stored outcomes. Suppresses ALL transitions (consistent
     // with process_analyst_verdicts): a partial round whose drain-cut members
     // produced NoResponse would otherwise hit the any_failed bounce path and
@@ -3811,7 +3811,7 @@ async fn process_verifier_verdicts(
         info!(
             ticket = %ticket.id,
             stage = %verifier.log_label,
-            "Verifier round cut short by drain — job stays running for boot resume",
+            "Verifier round cut short by drain — job stays launched for boot resume",
         );
         return false;
     }
@@ -4147,7 +4147,7 @@ async fn resume_analysis_round(job_id: &str, ticket: Ticket, ws: Workspace) {
         return;
     }
     if crate::shutdown::aborting() {
-        // Drain-cut: outcomes checkpointed, job stays running for boot resume.
+        // Drain-cut: outcomes checkpointed, job stays launched for boot resume.
         return;
     }
     process_analyst_verdicts(&ws, &ticket_arc, &results, job_id).await;
@@ -4235,7 +4235,7 @@ async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: 
         return;
     }
     if crate::shutdown::aborting() {
-        // Drain-cut: outcomes checkpointed, job stays running for boot resume.
+        // Drain-cut: outcomes checkpointed, job stays launched for boot resume.
         return;
     }
 
@@ -4273,12 +4273,12 @@ async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: 
 
     let transitioned = process_verifier_verdicts(&ws, &ticket_arc, &results, vi, job_id).await;
 
-    // Drain-cut verifier round: job stays status=running for boot resume (the
+    // Drain-cut verifier round: job stays status='launched' for boot resume (the
     // stored outcomes are re-processed at boot via the phase-locked ticket).
     if !transitioned && crate::shutdown::aborting() {
         info!(
             ticket = %ticket_arc.id,
-            "Resumed verifier round cut short by drain — job stays running for boot resume",
+            "Resumed verifier round cut short by drain — job stays launched for boot resume",
         );
         return;
     }
@@ -4316,7 +4316,7 @@ async fn resume_engineer_round(job_id: &str, ticket: Ticket, ws: Workspace) {
         &crate::session::store().conn,
         &ticket.id,
         &task,
-        crate::jobs::AgentStatus::Launched,
+        crate::jobs::RowStatus::Launched,
     )
     .await
     {
@@ -4359,7 +4359,7 @@ async fn resume_engineer_round(job_id: &str, ticket: Ticket, ws: Workspace) {
     }
     let Some(text) = response else {
         if crate::shutdown::aborting() {
-            // Drain-cut: job stays status=running for boot resume.
+            // Drain-cut: job stays status='launched' for boot resume.
             return;
         }
         let failure_comment = engineer_failure_comment(
@@ -4445,7 +4445,7 @@ async fn resume_sanitation_round(job_id: &str, ticket: Ticket, ws: Workspace) {
     }
     let Some(_) = response else {
         if crate::shutdown::aborting() {
-            // Drain-cut: job stays status=running for boot resume.
+            // Drain-cut: job stays status='launched' for boot resume.
             return;
         }
         record_sanitation_failure(&ticket.id, "agent returned no output (resumed)", None).await;
@@ -4628,14 +4628,14 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
     let transitioned = process_verifier_verdicts(&ws, &ticket, &results, vi, &job_id).await;
 
     // Drain-cut verifier round (the drain guard inside process_verifier_verdicts
-    // returned false): the job stays status=running for boot resume — the
+    // returned false): the job stays status='launched' for boot resume — the
     // stored outcomes are re-processed at boot via the phase-locked ticket.
     // Terminalizing here would discard completed/checkpointed outcomes and
     // force a whole-round re-run (decision 20 violation).
     if !transitioned && crate::shutdown::aborting() {
         info!(
             ticket = %ticket.id,
-            "Verifier round cut short by drain — job stays running for boot resume",
+            "Verifier round cut short by drain — job stays launched for boot resume",
         );
         return;
     }

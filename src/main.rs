@@ -322,7 +322,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
     // NON_AGENT_CALLS; the research orchestrator holds a whole-run guard).
     // Clean exit when both empty; force-cancel stragglers at the 10-minute
     // cap (in-flight ops with >10 min remaining budget are guaranteed-aborted
-    // and boot-resume via status=running).
+    // and boot-resume via status='launched').
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,

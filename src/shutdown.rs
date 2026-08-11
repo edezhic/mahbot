@@ -49,7 +49,7 @@ pub fn aborting() -> bool {
 }
 
 /// Force-cancel the drain: fire the global token immediately (in-flight
-/// agents are cancelled and boot-resume via status=running), then the normal
+/// agents are cancelled and boot-resume via status='launched'), then the normal
 /// exit path (checkpoint + join + exit) runs.
 pub fn force_cancel() {
     global_shutdown().cancel();

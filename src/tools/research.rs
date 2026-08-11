@@ -180,7 +180,7 @@ impl ResearchState {
             .await?;
             tx.execute(
                 "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
-                crate::turso::params![crate::jobs::JobStatus::Launched.as_str(), now, job_id],
+                crate::turso::params![crate::jobs::RowStatus::Launched.as_str(), now, job_id],
             )
             .await?;
             Ok(())

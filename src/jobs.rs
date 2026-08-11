@@ -22,38 +22,17 @@ use tracing::{debug, info, warn};
 // child — `SpawnChild::kind_str`); the [`JobKind`] enum stored in
 // `pending_jobs.kind` is the unrelated envelope vocabulary.
 
-/// Values of `jobs.status`. `Failed` is schema-locked vocabulary: nothing
-/// writes 'failed' in prod (over-cap ticket_stage jobs deliver a partial
-/// report / error envelope instead), but the value stays in the dictionary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobStatus {
+/// Status vocabulary shared by `jobs.status` and `agents.status` — both
+/// tables are schema-locked to the same launched/done/failed dictionary
+/// ('failed' is written in prod: failed agent outcomes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowStatus {
     Launched,
     Done,
     Failed,
 }
 
-impl JobStatus {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Launched => "launched",
-            Self::Done => "done",
-            Self::Failed => "failed",
-        }
-    }
-}
-
-/// Values of `agents.status`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentStatus {
-    Launched,
-    Done,
-    Failed,
-}
-
-impl AgentStatus {
+impl RowStatus {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -408,7 +387,7 @@ pub(crate) struct NewAgent {
 pub(crate) async fn checkpoint_job(
     conn: &Connection,
     id: &str,
-    status: JobStatus,
+    status: RowStatus,
     task: Option<&str>,
     retry_count: i64,
 ) -> Result<()> {
@@ -429,7 +408,7 @@ pub(crate) async fn write_agent_outcome(
     conn: &Connection,
     job_id: &str,
     agent_id: &str,
-    status: AgentStatus,
+    status: RowStatus,
     outcome: Option<&str>,
 ) -> Result<()> {
     conn.execute(
@@ -681,7 +660,7 @@ pub(crate) async fn list_agents_for_job(conn: &Connection, job_id: &str) -> Resu
 /// next orchestrator call) → fires the global token, which the GUI
 /// subscription turns into window exit. Cap expiry (10 min): force-cancel
 /// stragglers — in-flight ops with >10 min remaining budget are
-/// guaranteed-aborted and boot-resume via status=running.
+/// guaranteed-aborted and boot-resume via status='launched'.
 ///
 /// Residual millisecond windows (accepted, bounded): a dispatch task's
 /// untracked orchestration tail (board transition + completion tx after the
@@ -1131,7 +1110,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
         let _ = checkpoint_job(
             conn,
             &job.id,
-            JobStatus::Launched,
+            RowStatus::Launched,
             None,
             job.retry_count + 1,
         )
@@ -1223,7 +1202,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
                         let _ = checkpoint_job(
                             conn,
                             &job.id,
-                            JobStatus::Launched,
+                            RowStatus::Launched,
                             None,
                             job.retry_count,
                         )
@@ -1250,7 +1229,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
                         let _ = checkpoint_job(
                             conn,
                             &job.id,
-                            JobStatus::Launched,
+                            RowStatus::Launched,
                             None,
                             job.retry_count,
                         )
@@ -1268,7 +1247,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
                 let _ = checkpoint_job(
                     conn,
                     &job.id,
-                    JobStatus::Launched,
+                    RowStatus::Launched,
                     None,
                     job.retry_count + 1,
                 )
@@ -1322,7 +1301,7 @@ pub(crate) async fn upsert_engineer_anchor(
     conn: &Connection,
     ticket_id: &str,
     task: &str,
-    status: AgentStatus,
+    status: RowStatus,
 ) -> Result<()> {
     let now = turso::now();
     let anchor_id = engineer_anchor_id(ticket_id);
@@ -1423,7 +1402,7 @@ mod tests {
         let anchor_id = engineer_anchor_id("t-1400");
 
         // First dispatch: anchor insert (NULL job_id).
-        upsert_engineer_anchor(conn, "t-1400", "task-1", AgentStatus::Launched)
+        upsert_engineer_anchor(conn, "t-1400", "task-1", RowStatus::Launched)
             .await
             .expect("anchor upsert (first)");
         let rows = conn
@@ -1440,7 +1419,7 @@ mod tests {
 
         // Re-dispatch: UPSERT must mutate status/task, keep job_id NULL, keep
         // exactly one row.
-        upsert_engineer_anchor(conn, "t-1400", "task-2", AgentStatus::Launched)
+        upsert_engineer_anchor(conn, "t-1400", "task-2", RowStatus::Launched)
             .await
             .expect("anchor upsert (second)");
         let rows = conn

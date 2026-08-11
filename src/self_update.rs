@@ -373,7 +373,7 @@ pub(crate) async fn execute_update() -> Result<()> {
     //     (update_is_finalizing) instead of exiting, so this sequence cannot
     //     be aborted by a window close or SIGINT racing the step-11
     //     checkpoint. No failure transitions with 'service shutting down'
-    //     comments fire — agents that cannot finish stay status=running and
+    //     comments fire — agents that cannot finish stay status='launched' and
     //     boot-resume.
     UPDATE_FINALIZING.store(true, std::sync::atomic::Ordering::SeqCst);
     crate::shutdown::drain_begin();
