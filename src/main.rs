@@ -28,6 +28,10 @@ const JETBRAINS_MONO_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Regul
 /// JetBrainsMono-Bold.ttf embedded for header text in the Iced dashboard.
 const JETBRAINS_MONO_BOLD_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Bold.ttf");
 
+/// INFO-log retention window (hours): the log-cleanup loop deletes INFO
+/// entries older than this. Independent of the session-purge cutoff.
+const LOG_RETENTION_HOURS: i64 = 8;
+
 /// Handle a dynamic option callback (prefixed `__opt__`).
 ///
 /// Constructs an injected user message (e.g. "mahbot-123 - A") from the
@@ -162,21 +166,25 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         &mut tasks,
         &shutdown_token,
         "session-cleanup",
-        run_cleanup_loop("Session cleanup", |cutoff| async move {
-            // Stale-job purge FIRST (cross-DB orchestrator: board rollback +
-            // sessions DELETE) — protected sessions only become eligible for
-            // the TTL guard after the purge cascade removes their job rows.
-            let purged = mahbot::jobs::purge_stale_jobs(&cutoff).await?;
-            let cleaned = mahbot::session::cleanup_old_transient_sessions(&cutoff).await?;
-            Ok(purged + cleaned)
-        }),
+        run_cleanup_loop(
+            "Session cleanup",
+            mahbot::jobs::PURGE_CUTOFF_HOURS,
+            |cutoff| async move {
+                // Stale-job purge FIRST (cross-DB orchestrator: board rollback +
+                // sessions DELETE) — protected sessions only become eligible for
+                // the TTL guard after the purge cascade removes their job rows.
+                let purged = mahbot::jobs::purge_stale_jobs(&cutoff).await?;
+                let cleaned = mahbot::session::cleanup_old_transient_sessions(&cutoff).await?;
+                Ok(purged + cleaned)
+            },
+        ),
     );
 
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
         "log-cleanup",
-        run_cleanup_loop("Log cleanup", {
+        run_cleanup_loop("Log cleanup", LOG_RETENTION_HOURS, {
             let store = log_store;
             move |cutoff| {
                 let store = store.clone();
@@ -551,7 +559,8 @@ fn main() -> Result<()> {
 
 /// Background cleanup loop adapter — runs every 10 minutes until cancelled
 /// or the graceful drain begins (stale purge must not race the drain).
-async fn run_cleanup_loop<F, Fut>(label: &'static str, cleanup: F)
+/// `cutoff_hours` is the retention window for this specific cleanup policy.
+async fn run_cleanup_loop<F, Fut>(label: &'static str, cutoff_hours: i64, cleanup: F)
 where
     F: Fn(String) -> Fut + Send + 'static,
     Fut: Future<Output = Result<u64>> + Send,
@@ -560,7 +569,7 @@ where
         if !mahbot::shutdown::sleep_or_shutdown_or_drain(Duration::from_mins(10)).await {
             break;
         }
-        let cutoff = (Utc::now() - ChronoDuration::hours(8)).to_rfc3339();
+        let cutoff = (Utc::now() - ChronoDuration::hours(cutoff_hours)).to_rfc3339();
         match cleanup(cutoff).await {
             Ok(n) if n > 0 => info!(deleted = n, "{label}: deleted old entries"),
             Ok(_) => tracing::debug!("{label}: nothing to delete"),

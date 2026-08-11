@@ -95,6 +95,11 @@ pub const MAX_BOOT_REDISPATCH: i64 = 3;
 /// then stragglers are force-cancelled.
 pub const DRAIN_CAP_SECS: u64 = 10 * 60;
 
+/// Stale-purge cutoff (hours): `jobs` rows older than this are purged
+/// (stranded blocking-phase tickets rolled back in place). `pending_jobs`
+/// envelopes are never purged — at-least-once keeps unconfirmed rows alive.
+pub const PURGE_CUTOFF_HOURS: i64 = 8;
+
 // ── Row model ───────────────────────────────────────────────────────────
 // The full row shape mirrors the DB schema — fields unused by today's scan
 // paths are read by future resume/telemetry paths, so dead-code warnings are
@@ -1784,7 +1789,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(8)).to_rfc3339();
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::hours(PURGE_CUTOFF_HOURS)).to_rfc3339();
         crate::session::cleanup_old_transient_sessions(&cutoff)
             .await
             .unwrap();
@@ -1863,7 +1869,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(8)).to_rfc3339();
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::hours(PURGE_CUTOFF_HOURS)).to_rfc3339();
         let purged = purge_stale_jobs(&cutoff).await.unwrap();
         assert!(purged >= 1, "the stale job must be purged");
         // Ticket rolled back to ReadyForDevelopment with pipeline reservation.
@@ -1923,7 +1930,8 @@ mod tests {
             .await
             .unwrap();
         }
-        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(8)).to_rfc3339();
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::hours(PURGE_CUTOFF_HOURS)).to_rfc3339();
         purge_stale_jobs(&cutoff).await.unwrap();
         let t = board.get_ticket(&ticket_id).await.unwrap().unwrap();
         assert_eq!(
@@ -1976,7 +1984,8 @@ mod tests {
             .execute("BEGIN", ())
             .await
             .expect("raw board BEGIN");
-        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(8)).to_rfc3339();
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::hours(PURGE_CUTOFF_HOURS)).to_rfc3339();
         purge_stale_jobs(&cutoff).await.unwrap();
         // Restore the board connection for the next serial test.
         crate::board::store()

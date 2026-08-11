@@ -44,7 +44,7 @@ pub async fn run_archive_cancelled_loop() {
             continue;
         };
 
-        match board.archive_stale_cancelled(1).await {
+        match board.archive_stale_cancelled(CANCELLED_ARCHIVE_HOURS).await {
             Ok(n) if n > 0 => info!(count = n, "Archived stale cancelled tickets"),
             Ok(_) => debug!("Archive cancelled loop: no stale tickets"),
             Err(e) => warn!(error = %e, "Archive cancelled loop failed"),
@@ -104,6 +104,10 @@ const TICKETS_FTS_INDEX_NAME: &str = "idx_tickets_title_fts";
 const TICKETS_FTS_INDEX_DDL: &str = "\
 CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
 USING fts (title) WITH (tokenizer = 'ngram')";
+
+/// Stale-cancelled archival window (hours): Cancelled tickets this old are
+/// archived by [`run_archive_cancelled_loop`].
+const CANCELLED_ARCHIVE_HOURS: i64 = 1;
 
 // Column definitions for ticket SELECT/RETURNING queries.
 crate::columns! {
