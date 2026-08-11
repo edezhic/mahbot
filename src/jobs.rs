@@ -1187,75 +1187,42 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
                 // Resume at the roster/state level (dispatch re-enters the
                 // orchestrator with the stored task; retry_count caps at
                 // MAX_BOOT_REDISPATCH).
-                if job.retry_count >= MAX_BOOT_REDISPATCH {
-                    if job.kind == "research" {
-                        // The research envelope is the caller's ONLY result
-                        // path — never strand it. Deliver a partial report
-                        // from the checkpointed state (research_capped_partial_report
-                        // reads state + caller identity and terminalizes with
-                        // the envelope).
-                        warn!(
-                            job = %job.id,
-                            kind = %job.kind,
-                            "Research job exceeded boot re-dispatch cap — delivering partial report",
-                        );
-                        let _ = checkpoint_job(
-                            conn,
-                            &job.id,
-                            RowStatus::Launched,
-                            None,
-                            job.retry_count,
-                        )
-                        .await;
-                        resumable.push(ResumableStage {
-                            job_id: job.id.clone(),
-                            ticket_id: String::new(),
-                            stage: "research_capped".to_string(),
-                            workspace_name: job.workspace_name.clone(),
-                        });
-                        resumed_other += 1;
+                let kind = job.kind.as_str();
+                let capped = job.retry_count >= MAX_BOOT_REDISPATCH;
+                if capped {
+                    // The envelope is the caller's ONLY result path — never
+                    // strand it: deliver a partial report (research) or
+                    // failure envelope (ask) from the checkpointed state.
+                    let msg = if kind == "research" {
+                        "Research job exceeded boot re-dispatch cap — delivering partial report"
                     } else {
-                        // The <ask-tool-result> envelope is the async-ask
-                        // caller's ONLY result path — marking failed with no
-                        // envelope would strand the Manager/Assistant forever.
-                        // Deliver an error envelope to the stored caller
-                        // (ask_capped_envelope reads caller identity and
-                        // terminalizes with the envelope).
-                        warn!(
-                            job = %job.id,
-                            kind = %job.kind,
-                            "Ask job exceeded boot re-dispatch cap — delivering failure envelope",
-                        );
-                        let _ = checkpoint_job(
-                            conn,
-                            &job.id,
-                            RowStatus::Launched,
-                            None,
-                            job.retry_count,
-                        )
-                        .await;
-                        resumable.push(ResumableStage {
-                            job_id: job.id.clone(),
-                            ticket_id: String::new(),
-                            stage: "ask_capped".to_string(),
-                            workspace_name: job.workspace_name.clone(),
-                        });
-                        resumed_other += 1;
-                    }
-                    continue;
+                        "Ask job exceeded boot re-dispatch cap — delivering failure envelope"
+                    };
+                    warn!(job = %job.id, kind = %kind, "{msg}");
                 }
+                // Capped resumes keep retry_count (the cap already fired);
+                // normal resumes bump it — {kind}_capped stage labels must
+                // stay in lockstep with management.rs's stage match.
                 let _ = checkpoint_job(
                     conn,
                     &job.id,
                     RowStatus::Launched,
                     None,
-                    job.retry_count + 1,
+                    if capped {
+                        job.retry_count
+                    } else {
+                        job.retry_count + 1
+                    },
                 )
                 .await;
                 resumable.push(ResumableStage {
                     job_id: job.id.clone(),
                     ticket_id: String::new(),
-                    stage: job.kind.clone(),
+                    stage: if capped {
+                        format!("{kind}_capped")
+                    } else {
+                        kind.to_string()
+                    },
                     workspace_name: job.workspace_name.clone(),
                 });
                 resumed_other += 1;
