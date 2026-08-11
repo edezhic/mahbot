@@ -477,17 +477,16 @@ async fn run_ask_slots(
 /// row stays for the next boot (checkpointed outcomes are reused, so the
 /// already-completed LLM work is never lost or duplicated).
 pub(crate) async fn resume_ask_round(job_id: &str, ws: &Workspace) {
-    if crate::shutdown::aborting() {
-        tracing::info!(job = %job_id, "Ask resume aborted — drain/shutdown in progress");
-        return;
-    }
-    let conn = &crate::session::store().conn;
-    let Ok(Some(caller)) = crate::jobs::job_caller(conn, job_id).await else {
-        tracing::warn!(job = %job_id, "Ask resume: missing job row — terminalizing job");
-        let _ = crate::jobs::terminalize_job(conn, job_id).await;
+    let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
+        &crate::session::store().conn,
+        job_id,
+        "Ask resume",
+        "Ask resume",
+    )
+    .await
+    else {
         return;
     };
-    let caller_role = std::str::FromStr::from_str(&caller.role).unwrap_or(crate::Role::Manager);
     let result = match run_ask_with_job(
         ws,
         &caller.task,
@@ -545,17 +544,16 @@ pub(crate) async fn resume_ask_round(job_id: &str, ws: &Workspace) {
 /// path; marking failed with no envelope would strand the caller forever —
 /// "failed = terminal … surface to user").
 pub(crate) async fn ask_capped_envelope(job_id: &str, ws: &Workspace) {
-    if crate::shutdown::aborting() {
-        tracing::info!(job = %job_id, "Ask capped report aborted — drain/shutdown in progress");
-        return;
-    }
-    let conn = &crate::session::store().conn;
-    let Ok(Some(caller)) = crate::jobs::job_caller(conn, job_id).await else {
-        tracing::warn!(job = %job_id, "Ask cap: missing job row — terminalizing job");
-        let _ = crate::jobs::terminalize_job(conn, job_id).await;
+    let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
+        &crate::session::store().conn,
+        job_id,
+        "Ask capped report",
+        "Ask cap",
+    )
+    .await
+    else {
         return;
     };
-    let caller_role = std::str::FromStr::from_str(&caller.role).unwrap_or(crate::Role::Manager);
     let result: anyhow::Result<String> = Err(anyhow::anyhow!(format!(
         "ask round aborted after {} boot re-dispatch attempts — the last crash lost the round; \
          please re-issue the ask",

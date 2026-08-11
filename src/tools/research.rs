@@ -476,17 +476,16 @@ fn deliver_research_envelope(envelope: AgentJob) {
 /// reused by the next boot; routing a partial result here would race the
 /// exit).
 pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
-    if crate::shutdown::aborting() {
-        tracing::info!(job = %job_id, "Research resume aborted — drain/shutdown in progress");
-        return;
-    }
-    let Ok(Some(caller)) = crate::jobs::job_caller(&crate::session::store().conn, job_id).await
+    let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
+        &crate::session::store().conn,
+        job_id,
+        "Research resume",
+        "Research resume",
+    )
+    .await
     else {
-        tracing::warn!(job = %job_id, "Research resume: missing job row — terminalizing job");
-        let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
         return;
     };
-    let caller_role = std::str::FromStr::from_str(&caller.role).unwrap_or(crate::Role::Manager);
     let result = run_deep_research(ws, &caller.task, job_id).await;
     if crate::shutdown::aborting() {
         tracing::info!(
@@ -513,17 +512,16 @@ pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
 /// Manager's only result path; marking failed with no envelope would strand
 /// the caller forever).
 pub(crate) async fn research_capped_partial_report(job_id: &str, ws: &Workspace) {
-    if crate::shutdown::aborting() {
-        tracing::info!(job = %job_id, "Research capped report aborted — drain/shutdown in progress");
-        return;
-    }
-    let Ok(Some(caller)) = crate::jobs::job_caller(&crate::session::store().conn, job_id).await
+    let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
+        &crate::session::store().conn,
+        job_id,
+        "Research capped report",
+        "Research cap",
+    )
+    .await
     else {
-        tracing::warn!(job = %job_id, "Research cap: missing job row — terminalizing job");
-        let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
         return;
     };
-    let caller_role = std::str::FromStr::from_str(&caller.role).unwrap_or(crate::Role::Manager);
     let state = ResearchState::load(job_id).await;
     let result: anyhow::Result<String> = Ok(partial_report(
         &caller.task,

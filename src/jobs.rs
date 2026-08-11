@@ -588,6 +588,32 @@ pub(crate) async fn job_caller(conn: &Connection, job_id: &str) -> Result<Option
     .context("load job caller")
 }
 
+/// Boot-resume preamble shared by the ask/research resume and capped-report
+/// paths (the 4 preambles were word-for-word identical). Order is load-bearing:
+/// aborting-guard FIRST (quiet return — the job row stays for the next boot),
+/// then job_caller, then terminalize-on-missing — the guard fires on Err (DB
+/// read failure) too, not just Ok(None). Returns the caller + parsed role, or
+/// None when the caller should quiet-return. `abort_site`/`missing_site` keep
+/// each site's log texts byte-identical (warn-vs-info distinction preserved).
+pub(crate) async fn resume_job_preamble(
+    conn: &Connection,
+    job_id: &str,
+    abort_site: &str,
+    missing_site: &str,
+) -> Option<(JobCaller, Role)> {
+    if crate::shutdown::aborting() {
+        tracing::info!(job = %job_id, "{abort_site} aborted — drain/shutdown in progress");
+        return None;
+    }
+    let Ok(Some(caller)) = job_caller(conn, job_id).await else {
+        tracing::warn!(job = %job_id, "{missing_site}: missing job row — terminalizing job");
+        let _ = terminalize_job(conn, job_id).await;
+        return None;
+    };
+    let caller_role = std::str::FromStr::from_str(&caller.role).unwrap_or(Role::Manager);
+    Some((caller, caller_role))
+}
+
 /// Read a job's boot-resume retry count (0 = never boot-resumed). Used by the
 /// research report's best-effort-telemetry gate (the real resume signal).
 pub(crate) async fn job_retry_count(conn: &Connection, job_id: &str) -> i64 {
@@ -1546,6 +1572,68 @@ mod tests {
         assert_eq!(jobs[0].get::<i64>(0).unwrap(), 0);
         let agents = conn.query("SELECT COUNT(*) FROM agents", ()).await.unwrap();
         assert_eq!(agents[0].get::<i64>(0).unwrap(), 0);
+    }
+
+    // ── Resume preamble ──────────────────────────────────────────────
+
+    /// The shared boot-resume preamble's two quiet-return paths: drain-abort
+    /// must leave the job row untouched (it is the durable resume state for
+    /// the next boot), and terminalize-on-missing (row gone — the let-else
+    /// guard fires on Err of job_caller the same way) must quiet-return
+    /// without resurrecting anything.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn resume_job_preamble_abort_and_missing_quiet_return() {
+        let _lock = crate::util::test::retry_tests_lock();
+        let (store, _tmp) = crate::open_test_store!(crate::session::SessionStore, "session");
+        let conn = &store.conn;
+        spawn_job(
+            conn,
+            "j-preamble",
+            "question?",
+            "ws",
+            "caller-user",
+            "telegram",
+            Role::Manager,
+            &[],
+            &SpawnChild::Ask {
+                question: "question?".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Drain-abort: quiet return, the row stays for the next boot.
+        crate::shutdown::drain_begin();
+        let r = resume_job_preamble(conn, "j-preamble", "Ask resume", "Ask resume").await;
+        crate::shutdown::drain_clear();
+        assert!(r.is_none(), "drain-abort must quiet-return");
+        let rows = conn
+            .query("SELECT COUNT(*) FROM jobs WHERE id = 'j-preamble'", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].get::<i64>(0).unwrap(),
+            1,
+            "drain-abort must not terminalize the job"
+        );
+
+        // Terminalize-on-missing: the row is gone → job_caller Ok(None) →
+        // terminalize (no-op DELETE) + quiet return; nothing is resurrected.
+        conn.execute("DELETE FROM jobs WHERE id = 'j-preamble'", ())
+            .await
+            .unwrap();
+        let r = resume_job_preamble(conn, "j-preamble", "Ask resume", "Ask resume").await;
+        assert!(r.is_none(), "missing job row must quiet-return");
+        let rows = conn
+            .query("SELECT COUNT(*) FROM jobs WHERE id = 'j-preamble'", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].get::<i64>(0).unwrap(),
+            0,
+            "terminalize must not recreate the row"
+        );
     }
 
     // ── Pending replay dedup ─────────────────────────────────────────
