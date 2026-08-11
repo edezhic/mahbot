@@ -4149,10 +4149,61 @@ async fn resume_analysis_round(job_id: &str, ticket: Ticket, ws: Workspace) {
     complete_ticket_stage_job(job_id).await;
 }
 
+/// Stage all changes and record the ticket's reviewed base (HEAD + index tree)
+/// after a review round that produced verdicts and transitioned the ticket —
+/// a skipped base on a failed transition or an all-failed round (content never
+/// reviewed) would let a later round skip content nobody saw. Shared by live
+/// dispatch and boot resume; the base gates the skip-review check, so the paths
+/// must stay in lockstep. A resumed round replays verdicts from an older
+/// content state but records the CURRENT working-tree state.
+async fn record_reviewed_base_after_review(
+    repo_path: &Path,
+    ticket_id: &str,
+    git_available: bool,
+    transitioned: bool,
+    results: &[ParallelVerdict],
+    log_prefix: &str,
+) {
+    let reviewed = results
+        .iter()
+        .any(|r| matches!(r, ParallelVerdict::Verdict(_)));
+    if git_available && transitioned && reviewed {
+        if let Err(e) = run_git_add_all(repo_path).await {
+            warn!(
+                ticket = %ticket_id,
+                error = %e,
+                "{log_prefix}Failed to stage changes after review — reviewed base not recorded",
+            );
+        } else {
+            let head = run_git_head(repo_path).await.ok();
+            let tree = run_git_write_tree(repo_path).await.ok();
+            if head.is_none() || tree.is_none() {
+                warn!(
+                    ticket = %ticket_id,
+                    head = head.is_some(),
+                    tree = tree.is_some(),
+                    "{log_prefix}Could not compute content identity after review — reviewed base not recorded",
+                );
+            } else if let Err(e) = board()
+                .set_reviewed_base(ticket_id, head.as_deref(), tree.as_deref())
+                .await
+            {
+                warn!(
+                    ticket = %ticket_id,
+                    error = %e,
+                    "{log_prefix}Failed to record reviewed base — later rounds will re-review",
+                );
+            } else {
+                debug!(ticket = %ticket_id, "{log_prefix}Recorded reviewed base after review");
+            }
+        }
+    }
+}
+
 /// Resume a verifier round (review/QA): re-run missing slots, then re-process
 /// verdicts. REPLAY INCLUDES THE DISPATCH TAIL — set_review_base_count
-/// (ticket-level freeze), git add -A auto-stage, set_reviewed_base — or the
-/// review_base_count stays NULL and the skip-review gate never fires.
+/// (ticket-level freeze) and the record_reviewed_base_after_review helper — or
+/// the review_base_count stays NULL and the skip-review gate never fires.
 async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: VerifierInfo) {
     if !is_ticket_in_phase(&ticket.id, vi.active_phase).await {
         complete_ticket_stage_job(job_id).await;
@@ -4189,7 +4240,7 @@ async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: 
         && crate::git_commands::git_is_installed().await
         && crate::git_commands::is_git_repo(repo_path);
 
-    // Dispatch tail part 1: freeze the reviewer base count (ticket-level).
+    // Freeze the reviewer base count (ticket-level).
     // The base was frozen on the ticket_stage_jobs row at spawn; the replay
     // re-applies it to the tickets table so later rounds reuse the frozen
     // base (the skip-review gate depends on it).
@@ -4227,39 +4278,15 @@ async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: 
         return;
     }
 
-    // Dispatch tail part 2: auto-stage + record reviewed base after review.
-    let reviewed = results
-        .iter()
-        .any(|r| matches!(r, ParallelVerdict::Verdict(_)));
-    if git_available && transitioned && reviewed {
-        if let Err(e) = run_git_add_all(repo_path).await {
-            warn!(
-                ticket = %ticket_arc.id,
-                error = %e,
-                "Resume: failed to stage changes after review — reviewed base not recorded",
-            );
-        } else {
-            let head = run_git_head(repo_path).await.ok();
-            let tree = run_git_write_tree(repo_path).await.ok();
-            if head.is_none() || tree.is_none() {
-                warn!(
-                    ticket = %ticket_arc.id,
-                    head = head.is_some(),
-                    tree = tree.is_some(),
-                    "Resume: could not compute content identity after review — reviewed base not recorded",
-                );
-            } else if let Err(e) = board()
-                .set_reviewed_base(&ticket_arc.id, head.as_deref(), tree.as_deref())
-                .await
-            {
-                warn!(
-                    ticket = %ticket_arc.id,
-                    error = %e,
-                    "Resume: failed to record reviewed base",
-                );
-            }
-        }
-    }
+    record_reviewed_base_after_review(
+        repo_path,
+        &ticket_arc.id,
+        git_available,
+        transitioned,
+        &results,
+        "Resume: ",
+    )
+    .await;
     complete_ticket_stage_job(job_id).await;
 }
 
@@ -4608,50 +4635,15 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
         return;
     }
 
-    // ── Auto-stage + record reviewed base after review ───────────────
-    // Stage all working tree changes so the index captures the reviewed
-    // content, then record the resulting HEAD + index tree as the ticket's
-    // reviewed base. Runs only for reviewers whose round actually produced
-    // verdicts and transitioned the ticket — a skipped base on a failed
-    // transition or an all-failed round (content never reviewed) would let a
-    // later round skip content nobody saw.
-    let reviewed = results
-        .iter()
-        .any(|r| matches!(r, ParallelVerdict::Verdict(_)));
-    if git_available && transitioned && reviewed {
-        if let Err(e) = run_git_add_all(repo_path).await {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Failed to stage changes after review — reviewed base not recorded",
-            );
-        } else {
-            let head = run_git_head(repo_path).await.ok();
-            let tree = run_git_write_tree(repo_path).await.ok();
-            if head.is_none() || tree.is_none() {
-                warn!(
-                    ticket = %ticket.id,
-                    head = head.is_some(),
-                    tree = tree.is_some(),
-                    "Could not compute content identity after review — reviewed base not recorded",
-                );
-            } else if let Err(e) = board()
-                .set_reviewed_base(&ticket.id, head.as_deref(), tree.as_deref())
-                .await
-            {
-                warn!(
-                    ticket = %ticket.id,
-                    error = %e,
-                    "Failed to record reviewed base — later rounds will re-review",
-                );
-            } else {
-                debug!(
-                    ticket = %ticket.id,
-                    "Recorded reviewed base after review",
-                );
-            }
-        }
-    }
+    record_reviewed_base_after_review(
+        repo_path,
+        &ticket.id,
+        git_available,
+        transitioned,
+        &results,
+        "",
+    )
+    .await;
 
     // Completion tx AFTER the board transition+comment (ordering contract).
     complete_ticket_stage_job(&job_id).await;
