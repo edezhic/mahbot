@@ -19,7 +19,7 @@ use crate::config::CONFIG;
 use crate::message_router::{self, AgentJob, JobKind};
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::tools::Tool;
-use crate::{Agent, DEFAULT_MAX_TOKENS, Role, Workspace};
+use crate::{Agent, ChatMessage, DEFAULT_MAX_TOKENS, Role, Workspace};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::FutureExt;
@@ -1265,14 +1265,17 @@ impl VerificationTarget {
     }
 }
 
-/// Extract search/web_search query strings + tool-call counts from an
-/// agent's session history (for the query ledger and the run summary).
-/// Shared with the deep research tool (`research.rs`).
-pub(crate) fn extract_query_telemetry(agent: &Agent) -> (usize, usize, Vec<String>) {
+/// Extract search/web_search query strings + tool-call counts from session
+/// history messages (for the query ledger and the run summary). Shared with
+/// the deep research tool (`research.rs`), which also feeds it the persisted
+/// history of deadline-aborted analysts (wrap-up stage).
+pub(crate) fn extract_query_telemetry_from_history(
+    history: &[ChatMessage],
+) -> (usize, usize, Vec<String>) {
     let mut tool_calls = 0usize;
     let mut searches = 0usize;
     let mut queries = Vec::new();
-    for msg in agent.session.history() {
+    for msg in history {
         let Some(decoded) = crate::session::decode_native_history_message(msg) else {
             continue;
         };
@@ -1294,6 +1297,13 @@ pub(crate) fn extract_query_telemetry(agent: &Agent) -> (usize, usize, Vec<Strin
         }
     }
     (tool_calls, searches, queries)
+}
+
+/// Extract search/web_search query strings + tool-call counts from an
+/// agent's session history (for the query ledger and the run summary).
+/// Shared with the deep research tool (`research.rs`).
+pub(crate) fn extract_query_telemetry(agent: &Agent) -> (usize, usize, Vec<String>) {
+    extract_query_telemetry_from_history(agent.session.history())
 }
 
 /// Dispatch one fresh Analyst per verification target (bounded by

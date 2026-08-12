@@ -16,8 +16,7 @@
 //! never refunded. No per-agent tool-call caps and no wall-clock limit — the
 //! existing global iteration backstop and retry machinery remain untouched.
 
-use crate::agent::run_agent;
-use crate::config::CONFIG;
+use crate::agent::{chat_request, role_tools_and_specs, run_agent};
 use crate::message_router::{self, AgentJob, JobKind};
 use crate::prompt::{load_prompt, substitute};
 use crate::retry::FailureClass;
@@ -25,10 +24,11 @@ use crate::tools::Tool;
 use crate::tools::ask::{
     AnalystFindings, Claim, RoundMember, VerificationResult, VerificationTarget,
     await_round_members, build_async_result_envelope, complete_durable_job_and_route,
-    dispatch_claim_verifiers, escape_fences, extract_query_telemetry, load_analyst_angles,
-    max_confidence, normalize_claim, round_timeout,
+    dispatch_claim_verifiers, escape_fences, extract_query_telemetry,
+    extract_query_telemetry_from_history, load_analyst_angles, max_confidence, normalize_claim,
+    round_timeout,
 };
-use crate::{ChatMessage, ChatRequest, ChatRequestMeta, DEFAULT_MAX_TOKENS, Role, Workspace};
+use crate::{ChatMessage, ChatRequest, ChatRequestMeta, Role, ToolSpec, Workspace};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::FutureExt;
@@ -61,6 +61,11 @@ const CLAIM_ANNOTATION_FAILED: &str = "claim annotation failed — all new claim
 /// links fails entirely — every mutating verdict is treated as weak.
 const CONFIRM_FAILED: &str =
     "annotation link confirmation failed — mutating links treated as weak/unconfirmed";
+/// Default bound on the wrap-up stage: concurrent extraction of
+/// deadline-aborted analysts' accumulated findings (env-overridable via
+/// `MAHBOT_WRAP_UP_TIMEOUT_SECS`, distinct from the round deadline
+/// `MAHBOT_ROUND_TIMEOUT_SECS`). Counted from the stage's own start.
+const DEFAULT_WRAP_UP_TIMEOUT_SECS: u64 = 5 * 60;
 
 /// Resume pointer for a durable research run (decision 7): the 5-value stage
 /// enum (plus implicit Done).
@@ -532,10 +537,12 @@ pub(crate) async fn research_capped_partial_report(job_id: &str, ws: &Workspace)
         return;
     };
     let state = ResearchState::load(job_id).await;
+    // Boot path: no recovered findings exist (they are never checkpointed).
     let result: anyhow::Result<String> = Ok(partial_report(
         &caller.task,
         &state.acc,
         "boot re-dispatch cap exceeded — partial report from last checkpoint",
+        &[],
     ));
     complete_durable_job_and_route(
         job_id,
@@ -861,6 +868,282 @@ struct GapRoundsOutcome {
     incomplete: Option<String>,
 }
 
+// ── Wrap-up: recover deadline-aborted analysts' findings ──────────────────
+
+/// One deadline-aborted analyst's dispatch-time snapshot: the agent_id plus
+/// the frozen chat params (model, tools, reasoning_effort, routing,
+/// max_tokens) captured BEFORE spawn so the wrap-up call replays the same
+/// KV-cache prefix as the analyst's own calls. Known limitation: config or
+/// daemon-state drift (e.g. browser tool advertisement flipping between the
+/// snapshot capture and the spawned agent's own derivation) is not reflected
+/// in the snapshot (fail-open — a miss only costs the tail re-encode).
+#[derive(Clone)]
+struct WrapUpEntry {
+    agent_id: String,
+    params: ChatRequest,
+}
+
+/// A timed-out analyst's loaded session, ready for the wrap-up LLM call.
+struct WrapUpPrepared {
+    params: ChatRequest,
+    history: Vec<ChatMessage>,
+}
+
+/// Wrap-up stage bound for [`wrap_up_timed_out`]. Overridable via env.
+fn wrap_up_timeout() -> Duration {
+    crate::util::env_duration_secs("MAHBOT_WRAP_UP_TIMEOUT_SECS", DEFAULT_WRAP_UP_TIMEOUT_SECS)
+}
+
+/// Build Analyst chat params carrying `purpose`/`agent_id` metadata and
+/// optional tool specs; byte-relevant fields come from the shared
+/// [`chat_request`] helper (same source as
+/// [`crate::agent::Agent::build_chat_request`] — model, reasoning_effort,
+/// routing, max_tokens).
+fn research_params(
+    ws: &Workspace,
+    purpose: &'static str,
+    agent_id: String,
+    tool_specs: Option<Vec<ToolSpec>>,
+) -> ChatRequest {
+    ChatRequest {
+        meta: Some(ChatRequestMeta {
+            purpose,
+            agent_id,
+            role: Role::Analyst.as_str().to_string(),
+            workspace: ws.name.clone(),
+            ticket_id: None,
+        }),
+        ..chat_request(Role::Analyst, tool_specs, Vec::new(), false)
+    }
+}
+
+/// Wrap-up params: the advertised tool specs frozen at dispatch time. The
+/// dedicated purpose tag separates wrap-up calls in the request journal
+/// (post-rollout cached_input_tokens check).
+fn wrap_up_params(ws: &Workspace, agent_id: &str, tool_specs: Vec<ToolSpec>) -> ChatRequest {
+    research_params(
+        ws,
+        "research_wrap_up",
+        agent_id.to_string(),
+        Some(tool_specs),
+    )
+}
+
+/// Wrap-up stage after a round deadline: for every analyst aborted by the
+/// deadline, load its persisted session, register its search queries in the
+/// ledger (BEFORE any LLM call — independent of the extraction outcome),
+/// and — only when the session shows at least one successful tool result —
+/// extract the accumulated findings via a fresh LLM call replaying the
+/// dispatch-time params. Fail-open: a failed extraction keeps the analyst
+/// failed. Skipped entirely when shutdown/drain is already in progress;
+/// aborts promptly if the drain starts mid-stage (the orchestrator guard
+/// blocks the drain-watch token, so the wrap-up self-aborts on the drain
+/// flag — the partial report is not delayed past the drain).
+async fn wrap_up_timed_out(
+    timed_out: Vec<WrapUpEntry>,
+    ledger: &mut QueryLedger,
+    run_stats: &mut RunStats,
+) -> Vec<AnalystFindings> {
+    if timed_out.is_empty() || crate::shutdown::aborting() {
+        return Vec::new();
+    }
+    let stage_deadline = std::time::Instant::now() + wrap_up_timeout();
+    // Prepare sequentially (cheap DB reads): load the session, register its
+    // queries (mirroring the parse-failed-analyst pattern — ledger + summary
+    // telemetry only, never the round's saturation counters; the shared
+    // ledger makes a later gap-round re-ask count as a repeat), and gate the
+    // LLM call on the presence of at least one successful tool result. Prep
+    // always completes so query registration is guaranteed for every timed-
+    // out analyst independent of the stage deadline — the deadline bounds
+    // only the LLM batch below; a drain mid-prep still aborts the rest.
+    let mut prepared = Vec::new();
+    for entry in timed_out {
+        if crate::shutdown::aborting() {
+            break;
+        }
+        let history = crate::session::store().load(&entry.agent_id).await;
+        let (tool_calls, searches, queries) = extract_query_telemetry_from_history(&history);
+        run_stats.tool_calls += tool_calls;
+        run_stats.searches += searches;
+        for q in &queries {
+            if !ledger.register(q) {
+                run_stats.repeat_queries += 1;
+            }
+        }
+        let has_success = session_has_successful_tool_result(&history);
+        if has_success {
+            prepared.push(WrapUpPrepared {
+                params: entry.params,
+                history,
+            });
+        }
+    }
+    // Skip the batch when nothing is prepared or a drain started during the
+    // last prep iteration. An expired stage deadline needs no guard — the
+    // batch's deadline arm cancels the tasks immediately (fail-open).
+    if prepared.is_empty() || crate::shutdown::aborting() {
+        return Vec::new();
+    }
+    let wrap_up_prompt = load_prompt("research/wrap_up.md");
+    let handles: Vec<_> = prepared
+        .into_iter()
+        .map(|p| {
+            let wrap_up_prompt = wrap_up_prompt.clone();
+            tokio::spawn(async move {
+                let mut messages = p.history;
+                messages.push(ChatMessage::user(&wrap_up_prompt));
+                // Ticket-mandated ~3 attempts / ~90s. The policy's
+                // operation_timeout is a whole-operation wall-clock deadline
+                // (retry.rs), NOT per-attempt — on the worst-case cache-miss
+                // tail (~170K tokens of prefill) all attempts share the 90s;
+                // the stage deadline caps the batch but cannot extend a
+                // task's 90s. Post-rollout telemetry distinguishes cache-hit
+                // from policy starvation (the policy's own backoff/attempts
+                // apply; the wrap-up adds nothing beyond them).
+                crate::extraction::retry_extract_structured_scoped::<AnalystFindings>(
+                    &messages,
+                    "",
+                    &p.params,
+                    None,
+                    Some(&crate::retry::RetryPolicy::comment()),
+                )
+                .await
+                .ok()
+            })
+        })
+        .collect();
+    await_wrap_up_batch(handles, stage_deadline)
+        .await
+        .into_iter()
+        .flatten()
+        // Empty extractions (no claims AND no unanswered) are dropped so the
+        // recovered section never renders an orphan header with no bullets.
+        .filter(|f| !f.claims.is_empty() || !f.unanswered.is_empty())
+        .collect()
+}
+
+/// True when the session history shows at least one successful tool result —
+/// a persisted tool result whose content does not start with the
+/// tool-failure marker (all-failure or no-result sessions skip the wrap-up
+/// LLM call; their queries are still registered). A successful result
+/// coincidentally beginning with the marker is misclassified as a failure —
+/// accepted, negligible probability. Non-native (non-JSON-wrapped) results
+/// decode to None and count as no-success — conservative fail-open, but
+/// unreachable for research analysts (their results persist native).
+fn session_has_successful_tool_result(history: &[ChatMessage]) -> bool {
+    history.iter().any(|m| {
+        matches!(
+            crate::session::decode_native_history_message(m),
+            Some(crate::session::DecodedNativeHistoryMessage::ToolResult { content, .. })
+                if !content.starts_with(crate::tools::TOOL_FAILURE_MARKER)
+        )
+    })
+}
+
+/// Await the concurrent wrap-up extraction tasks, bounded by the stage
+/// deadline and interrupted by the drain flag (each task's inner provider
+/// call is dropped via the batch cancel token). Returns one result per task
+/// slot. Force-cancel (drain cap / second signal) needs no select arm here —
+/// the inner retry loop is shutdown-abortable and resolves on its own.
+/// Not shared with [`await_round_members`] deliberately: round waits must NOT
+/// abort on drain (in-flight analysts complete their turn), while the wrap-up
+/// MUST (the ticket's partial-report-not-delayed requirement).
+async fn await_wrap_up_batch(
+    handles: Vec<tokio::task::JoinHandle<Option<AnalystFindings>>>,
+    deadline: std::time::Instant,
+) -> Vec<Option<AnalystFindings>> {
+    use futures_util::StreamExt;
+    use futures_util::stream::FuturesUnordered;
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let drain = crate::shutdown::drain_wait();
+    tokio::pin!(drain);
+    let mut pending: FuturesUnordered<_> = handles
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut handle)| {
+            let cancel = cancel.clone();
+            async move {
+                tokio::select! {
+                    biased;
+                    r = &mut handle => (i, match r {
+                        Ok(v) => v,
+                        Err(e) if e.is_panic() => {
+                            let panic = crate::util::panic_message(&*e.into_panic());
+                            tracing::warn!(member = i, %panic, "wrap-up task panicked");
+                            None
+                        }
+                        Err(_) => {
+                            tracing::warn!(member = i, "wrap-up task cancelled externally");
+                            None
+                        }
+                    }),
+                    () = cancel.cancelled() => {
+                        handle.abort();
+                        (i, None)
+                    }
+                }
+            }
+        })
+        .collect();
+    let mut out: Vec<Option<AnalystFindings>> = (0..pending.len()).map(|_| None).collect();
+    // The drain/deadline arms fire once each — after that the cancel token
+    // aborts every remaining task so the batch drains promptly (a
+    // permanently-ready select arm would otherwise starve `pending.next()`).
+    let mut drain_fired = false;
+    let mut deadline_fired = false;
+    while !pending.is_empty() {
+        tokio::select! {
+            biased;
+            () = drain.as_mut(), if !drain_fired => {
+                drain_fired = true;
+                cancel.cancel();
+            }
+            Some((i, result)) = pending.next() => out[i] = result,
+            () = tokio::time::sleep_until(deadline.into()), if !deadline_fired => {
+                deadline_fired = true;
+                cancel.cancel();
+            }
+        }
+    }
+    out
+}
+
+/// Collapse awaited round members into analyst runs, splitting out the
+/// deadline-aborted members with their dispatch-time snapshots (the wrap-up
+/// stage replays them). Panicked/cancelled members stay plain NoResponse —
+/// the TimedOut distinction survives until the wrap-up stage.
+fn resolve_round_members_with_timeouts<T>(
+    members: Vec<RoundMember<AnalystRun<T>>>,
+    snapshots: &[WrapUpEntry],
+) -> (Vec<AnalystRun<T>>, Vec<WrapUpEntry>) {
+    // Dispatch pushes one snapshot per member in the same order; the empty
+    // slice (decomposition path) yields no wrap-up entries.
+    debug_assert!(snapshots.is_empty() || snapshots.len() == members.len());
+    let mut runs = Vec::with_capacity(members.len());
+    let mut timed_out = Vec::new();
+    for (i, m) in members.into_iter().enumerate() {
+        match m {
+            RoundMember::Done(run) => runs.push(run),
+            RoundMember::TimedOut => {
+                runs.push(AnalystRun::NoResponse);
+                if let Some(entry) = snapshots.get(i) {
+                    timed_out.push(entry.clone());
+                } else if !snapshots.is_empty() {
+                    // Only the research path expects a snapshot per member —
+                    // the decomposition path (empty slice) has none by design.
+                    tracing::warn!(
+                        member = i,
+                        "timed-out member has no wrap-up snapshot — findings unrecoverable"
+                    );
+                }
+            }
+            RoundMember::Panicked | RoundMember::Cancelled => runs.push(AnalystRun::NoResponse),
+        }
+    }
+    (runs, timed_out)
+}
+
 // ── Agent runners ────────────────────────────────────────────────────────
 
 /// One analyst run. Mirrors ask's three-state fail-open typing: a
@@ -889,19 +1172,12 @@ struct AnalystRunOutcome<T> {
     queries: Vec<String>,
 }
 
-/// Collapse awaited round members into analyst runs — timed-out, panicked,
-/// and cancelled members map to [`AnalystRun::NoResponse`]. The distinction
-/// is still preserved in the warn logs inside [`await_round_members`].
+/// Collapse awaited round members into analyst runs — the decomposition-path
+/// convenience (no wrap-up snapshots): timed-out, panicked, and cancelled
+/// members all map to [`AnalystRun::NoResponse`]. Research rounds use
+/// [`resolve_round_members_with_timeouts`] to keep the TimedOut set alive.
 fn resolve_round_members<T>(members: Vec<RoundMember<AnalystRun<T>>>) -> Vec<AnalystRun<T>> {
-    members
-        .into_iter()
-        .map(|m| match m {
-            RoundMember::Done(run) => run,
-            RoundMember::TimedOut | RoundMember::Panicked | RoundMember::Cancelled => {
-                AnalystRun::NoResponse
-            }
-        })
-        .collect()
+    resolve_round_members_with_timeouts(members, &[]).0
 }
 
 /// Run a single analyst agent on `task` and extract structured output `T`
@@ -1018,27 +1294,15 @@ fn collect_evidence(
 /// Build the orchestrator's chat params: cheap Analyst model (per-role
 /// overrides respected), constant model/effort/tools across all coordination
 /// calls of a run (KV-cache friendly — the leading general workspace context
-/// system message is constant too; only the user message varies).
+/// system message is constant too; only the user message varies). Byte-relevant
+/// fields come from the shared [`chat_request`] helper.
 fn orchestrator_params(ws: &Workspace, purpose: &'static str) -> ChatRequest {
-    let model = CONFIG.role_model(Role::Analyst);
-    let routing = CONFIG.model_routing(&model);
-    ChatRequest {
-        messages: Vec::new(),
-        tools: None,
-        model,
-        allow_image_parts: false,
-        max_tokens: Some(DEFAULT_MAX_TOKENS),
-        reasoning_effort: Some(CONFIG.role_reasoning_effort(Role::Analyst)),
-        provider_order: routing.provider_order,
-        provider_allow_fallbacks: routing.allow_fallbacks,
-        meta: Some(ChatRequestMeta {
-            purpose,
-            agent_id: format!("research_{}_orchestrator", ws.name),
-            role: Role::Analyst.as_str().to_string(),
-            workspace: ws.name.clone(),
-            ticket_id: None,
-        }),
-    }
+    research_params(
+        ws,
+        purpose,
+        format!("research_{}_orchestrator", ws.name),
+        None,
+    )
 }
 
 /// Structured orchestrator extraction via the hardened scoped retry loop.
@@ -1259,8 +1523,11 @@ fn validate_merged_plan(plan: &MergedPlan, plans: &[DecompositionPlan]) -> Resul
 // ── Round 1: one analyst per sub-question ────────────────────────────────
 
 /// Round 1: one analyst per sub-question; two for high-risk items (the
-/// second gets a decorrelated research angle). Returns the round's evidence,
-/// or `None` when the analyst budget is exhausted before dispatch.
+/// second gets a decorrelated research angle). Returns the round's evidence
+/// plus the dispatch-time snapshots of deadline-aborted analysts (the caller
+/// checkpoints FIRST, then runs the wrap-up stage — a crash mid-wrap-up must
+/// not lose the round-1 evidence), or `None` when the analyst budget is
+/// exhausted before dispatch.
 #[allow(clippy::too_many_arguments)]
 async fn round1_research(
     ws: &Workspace,
@@ -1271,7 +1538,7 @@ async fn round1_research(
     run_stats: &mut RunStats,
     deadline: std::time::Instant,
     resume: bool,
-) -> Option<EvidenceRound> {
+) -> Option<(EvidenceRound, Vec<WrapUpEntry>)> {
     let spawn_count = plan.sub_questions.len()
         + plan
             .sub_questions
@@ -1291,6 +1558,11 @@ async fn round1_research(
     let angles = load_analyst_angles();
     let ledger_snapshot = ledger.render();
     let mut members = Vec::new();
+    let mut snapshots: Vec<WrapUpEntry> = Vec::new();
+    // Dispatch-time wrap-up snapshots: frozen params + advertised tool
+    // schemas, captured before spawn (aborted tasks lose their values). The
+    // specs are constant across the round's members (same role+workspace).
+    let wrap_up_specs = role_tools_and_specs(Role::Analyst, ws).1;
     let mut idx = 0usize;
     for sq in &plan.sub_questions {
         for k in 0..=usize::from(sq.risk == "high") {
@@ -1313,6 +1585,10 @@ async fn round1_research(
                 task.push_str(&angles[idx % angles.len()]);
             }
             let agent_id = crate::session::research_agent_id(&ws.name, &format!("r1_{idx}"));
+            snapshots.push(WrapUpEntry {
+                agent_id: agent_id.clone(),
+                params: wrap_up_params(&ws, &agent_id, wrap_up_specs.clone()),
+            });
             idx += 1;
             let extraction_prompt = extraction_prompt.clone();
             members.push(move |round| async move {
@@ -1328,9 +1604,13 @@ async fn round1_research(
         }
     }
     let handles = crate::agent::spawn_staggered_round(members, resume).await;
-    let runs: Vec<AnalystRun<AnalystFindings>> =
-        resolve_round_members(await_round_members(handles, deadline).await);
-    Some(collect_evidence(&runs, ledger, run_stats))
+    let members_out = await_round_members(handles, deadline).await;
+    let (runs, timed_out) = resolve_round_members_with_timeouts(members_out, &snapshots);
+    // collect_evidence runs first so the wrap-up's ledger registrations can
+    // never skew this round's saturation counters (round.queries /
+    // repeat_queries stay from successful analysts only).
+    let round = collect_evidence(&runs, ledger, run_stats);
+    Some((round, timed_out))
 }
 
 // ── Interim consolidation + conditional gap rounds ───────────────────────
@@ -1391,7 +1671,10 @@ fn gap_items(gaps: &[Gap]) -> Vec<String> {
 }
 
 /// Run one gap round: fresh analysts, one per targeted gap (width-shrinking
-/// 4→3→2). Returns the round's analyst runs.
+/// 4→3→2). Returns the round's analyst runs plus the dispatch-time snapshots
+/// of analysts aborted by the round deadline (the caller runs the wrap-up
+/// stage AFTER collecting the round's evidence so ledger registrations from
+/// recovered analysts cannot skew the round's saturation counters).
 async fn run_gap_round(
     ws: &Workspace,
     question: &str,
@@ -1399,46 +1682,52 @@ async fn run_gap_round(
     ledger: &QueryLedger,
     deadline: std::time::Instant,
     resume: bool,
-) -> Vec<AnalystRun<AnalystFindings>> {
+) -> (Vec<AnalystRun<AnalystFindings>>, Vec<WrapUpEntry>) {
     let task_template = load_prompt("research/gap.md");
     let extraction_prompt = load_prompt("extraction/findings.md");
     let ledger_snapshot = ledger.render();
-    let members: Vec<_> = gaps
-        .iter()
-        .enumerate()
-        .map(|(i, gap)| {
-            let ws = ws.clone();
-            let question = question.to_string();
-            let task = substitute(
-                &task_template,
-                &[
-                    ("{{question}}", &question),
-                    (
-                        "{{gaps}}",
-                        &format!(
-                            "- [{}] {} (traces to: plan sub-question {})",
-                            gap.kind, gap.item, gap.traces_to
-                        ),
+    let mut members: Vec<_> = Vec::new();
+    let mut snapshots: Vec<WrapUpEntry> = Vec::new();
+    // Dispatch-time wrap-up snapshots (see round1_research) — same specs for
+    // every member of the round.
+    let wrap_up_specs = role_tools_and_specs(Role::Analyst, ws).1;
+    for (i, gap) in gaps.iter().enumerate() {
+        let ws = ws.clone();
+        let question = question.to_string();
+        let task = substitute(
+            &task_template,
+            &[
+                ("{{question}}", &question),
+                (
+                    "{{gaps}}",
+                    &format!(
+                        "- [{}] {} (traces to: plan sub-question {})",
+                        gap.kind, gap.item, gap.traces_to
                     ),
-                    ("{{query_ledger}}", &ledger_snapshot),
-                ],
-            );
-            let agent_id = crate::session::research_agent_id(&ws.name, &format!("gap_{i}"));
-            let extraction_prompt = extraction_prompt.clone();
-            move |round| async move {
-                run_structured_analyst::<AnalystFindings>(
-                    &ws,
-                    &agent_id,
-                    &task,
-                    &extraction_prompt,
-                    round,
-                )
-                .await
-            }
-        })
-        .collect();
+                ),
+                ("{{query_ledger}}", &ledger_snapshot),
+            ],
+        );
+        let agent_id = crate::session::research_agent_id(&ws.name, &format!("gap_{i}"));
+        snapshots.push(WrapUpEntry {
+            agent_id: agent_id.clone(),
+            params: wrap_up_params(&ws, &agent_id, wrap_up_specs.clone()),
+        });
+        let extraction_prompt = extraction_prompt.clone();
+        members.push(move |round| async move {
+            run_structured_analyst::<AnalystFindings>(
+                &ws,
+                &agent_id,
+                &task,
+                &extraction_prompt,
+                round,
+            )
+            .await
+        });
+    }
     let handles = crate::agent::spawn_staggered_round(members, resume).await;
-    resolve_round_members(await_round_members(handles, deadline).await)
+    let members_out = await_round_members(handles, deadline).await;
+    resolve_round_members_with_timeouts(members_out, &snapshots)
 }
 
 /// Conditional gap rounds. Stopping is artifact-based, never agent
@@ -1462,6 +1751,7 @@ async fn gap_rounds(
     deadline: std::time::Instant,
     job_id: &str,
     resume: bool,
+    recovered: &mut Vec<AnalystFindings>,
 ) -> GapRoundsOutcome {
     let mut outcome = GapRoundsOutcome {
         abstention: None,
@@ -1509,8 +1799,15 @@ async fn gap_rounds(
             outcome.unresolved = gap_items(gaps);
             return outcome;
         }
-        let runs = run_gap_round(ws, question, &targeted, &state.ledger, deadline, resume).await;
+        let (runs, timed_out) =
+            run_gap_round(ws, question, &targeted, &state.ledger, deadline, resume).await;
         let round = collect_evidence(&runs, &mut state.ledger, run_stats);
+        // Wrap-up stays BEFORE the per-round checkpoint here (unlike round 1):
+        // the loop's early returns (abstention / gap-extract failure) follow
+        // this position, and the final round's wrap-up must survive them; the
+        // pre-checkpoint window already contains the annotate + gap-extract
+        // orchestrator calls, so the wrap-up only extends an existing window.
+        recovered.extend(wrap_up_timed_out(timed_out, &mut state.ledger, run_stats).await);
         let (new_urls, pending) = state.acc.absorb(&round);
         let novel_claims = annotate_round(ws, &mut state.acc, &pending, &mut state.markers).await;
         outcome.rounds_dispatched += 1;
@@ -2189,14 +2486,62 @@ fn render_run_summary(
     out
 }
 
+/// Render the recovered-from-timed-out-analysts section. Separate from the
+/// main evidence by design: recovered findings never entered verification or
+/// synthesis. Empty when there is nothing recovered (also the boot path).
+/// Head-placed by callers so the section survives report truncation.
+fn render_recovered_findings(recovered: &[AnalystFindings]) -> String {
+    if recovered.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "\n## Recovered from timed-out analysts");
+    let _ = writeln!(
+        out,
+        "Findings recovered from analysts whose work was cut short by the round \
+         deadline (deadline exceeded, unverified — not subject to verification; each \
+         analyst's final in-flight turn could not be recovered):"
+    );
+    for r in recovered {
+        for c in &r.claims {
+            let source = if c.source.is_empty() {
+                "n/a"
+            } else {
+                &c.source
+            };
+            let _ = writeln!(
+                out,
+                "- [{}] {} — source: {}",
+                c.confidence,
+                escape_fences(&c.claim),
+                escape_fences(source),
+            );
+            if !c.contradictions.is_empty() {
+                let joined = c.contradictions.join("; ");
+                let _ = writeln!(out, "  contradictions: {}", escape_fences(&joined));
+            }
+        }
+        for u in &r.unanswered {
+            let _ = writeln!(out, "- unanswered: {}", escape_fences(u));
+        }
+    }
+    out
+}
+
 /// Partial envelope on shutdown mid-run: whatever evidence was gathered is
 /// delivered with an explicit incomplete marker — findings are never lost.
-fn partial_report(question: &str, acc: &AccumulatedEvidence, reason: &str) -> String {
+fn partial_report(
+    question: &str,
+    acc: &AccumulatedEvidence,
+    reason: &str,
+    recovered: &[AnalystFindings],
+) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "## Research Report (incomplete — {reason})");
     let _ = writeln!(out);
     let _ = writeln!(out, "**Question**: {question}");
     let _ = writeln!(out);
+    out.push_str(&render_recovered_findings(recovered));
     let _ = writeln!(out, "### Evidence Gathered So Far");
     if acc.claims.is_empty() {
         let _ = writeln!(out, "- none");
@@ -2265,6 +2610,10 @@ async fn run_deep_research(
     let mut budget = ResearchBudget::new(RESEARCH_MAX_ANALYSTS);
     budget.spent = state.budget_spent;
     let mut run_stats = RunStats::default();
+    // Recovered-from-timed-out-analysts findings: round locals only (never
+    // checkpointed) — a crash between rounds loses them, and a resumed run
+    // starts with an empty set (analysts re-run from their unchanged sessions).
+    let mut recovered: Vec<AnalystFindings> = Vec::new();
 
     // ── Round 0 — decomposition + merge (resumable) ───────────────────
     if state.stage == ResearchStage::Decompose {
@@ -2283,6 +2632,7 @@ async fn run_deep_research(
                         question,
                         &state.acc,
                         "shutdown during decomposition",
+                        &recovered,
                     ));
                 }
                 Err(_) if crate::shutdown::is_draining() => {
@@ -2290,6 +2640,7 @@ async fn run_deep_research(
                         question,
                         &state.acc,
                         "drain during decomposition",
+                        &recovered,
                     ));
                 }
                 Err(e) => return Err(e),
@@ -2311,6 +2662,7 @@ async fn run_deep_research(
             } else {
                 "shutdown after decomposition"
             },
+            &recovered,
         ));
     }
 
@@ -2320,7 +2672,7 @@ async fn run_deep_research(
             .plan
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("research state missing plan at round 1"))?;
-        let Some(r1) = round1_research(
+        let Some((r1, r1_timed_out)) = round1_research(
             ws,
             question,
             plan,
@@ -2336,6 +2688,7 @@ async fn run_deep_research(
                 question,
                 &state.acc,
                 "round 1 skipped — analyst budget exhausted",
+                &recovered,
             ));
         };
         let (_, pending) = state.acc.absorb(&r1);
@@ -2343,6 +2696,12 @@ async fn run_deep_research(
         state.budget_spent = budget.spent;
         state.stage = ResearchStage::GapRounds;
         state.save(job_id).await;
+        // Wrap-up AFTER the checkpoint: a crash mid-wrap-up loses only the
+        // recovered findings (ticket-accepted), never the round-1 evidence.
+        // Its ledger registrations are not in the checkpoint (fail-open — a
+        // crash during the wrap-up resumes with a ledger missing the dead
+        // analysts' queries, so gap rounds may re-ask them, bounded).
+        recovered.extend(wrap_up_timed_out(r1_timed_out, &mut state.ledger, &mut run_stats).await);
     }
 
     // ── Interim consolidation + conditional gap rounds (resumable) ────
@@ -2363,6 +2722,7 @@ async fn run_deep_research(
             deadline,
             job_id,
             resume,
+            &mut recovered,
         )
         .await;
         // Aborting mid-gap-loop (drain/shutdown): leave the stage at
@@ -2384,6 +2744,7 @@ async fn run_deep_research(
                 } else {
                     "shutdown during gap rounds"
                 },
+                &recovered,
             ));
         }
         // Round-trip the gap-loop locals on NORMAL exit (coverage complete,
@@ -2409,6 +2770,7 @@ async fn run_deep_research(
             } else {
                 "shutdown during gap rounds"
             },
+            &recovered,
         ));
     }
 
@@ -2444,6 +2806,7 @@ async fn run_deep_research(
                 question,
                 &state.acc,
                 "shutdown before final synthesis",
+                &recovered,
             ));
         }
         Err(_) if crate::shutdown::is_draining() => {
@@ -2451,6 +2814,7 @@ async fn run_deep_research(
                 question,
                 &state.acc,
                 "drain before final synthesis",
+                &recovered,
             ));
         }
         Err(e) => {
@@ -2458,6 +2822,7 @@ async fn run_deep_research(
                 question,
                 &state.acc,
                 &format!("synthesis failed: {e}"),
+                &recovered,
             ));
         }
     };
@@ -2487,7 +2852,8 @@ async fn run_deep_research(
     };
 
     // Fail-open markers survive delivery: head-placed so they survive the
-    // manager's sandwich truncation of long reports.
+    // manager's sandwich truncation of long reports. The recovered-findings
+    // section is head-placed right after them for the same reason.
     let mut report = String::new();
     if !state.markers.is_empty() {
         let _ = writeln!(report, "## Run markers");
@@ -2496,6 +2862,7 @@ async fn run_deep_research(
         }
         let _ = writeln!(report);
     }
+    report.push_str(&render_recovered_findings(&recovered));
     report.push_str(&synthesis);
     if !verification.is_empty() {
         let _ = writeln!(report);
@@ -3328,5 +3695,79 @@ mod tests {
             markers.iter().any(|m| m.contains("confirmation failed")),
             "the confirm failure is never silent: {markers:?}"
         );
+    }
+
+    #[test]
+    fn test_resolve_round_members_with_timeouts_preserves_timed_out() {
+        // The TimedOut distinction survives until the wrap-up stage: only
+        // deadline-aborted members are paired with their snapshots; panicked
+        // and cancelled members collapse to NoResponse like before.
+        let snapshots: Vec<WrapUpEntry> = (0..4)
+            .map(|i| WrapUpEntry {
+                agent_id: format!("a{i}"),
+                params: wrap_up_params(&crate::workspace::test_ws("/tmp/test_ws"), "a", vec![]),
+            })
+            .collect();
+        let members: Vec<RoundMember<AnalystRun<AnalystFindings>>> = vec![
+            RoundMember::Done(AnalystRun::NoResponse),
+            RoundMember::TimedOut,
+            RoundMember::Panicked,
+            RoundMember::Cancelled,
+        ];
+        let (runs, timed_out) = resolve_round_members_with_timeouts(members, &snapshots);
+        assert_eq!(runs.len(), 4);
+        assert!(runs.iter().all(|r| matches!(r, AnalystRun::NoResponse)));
+        assert_eq!(timed_out.len(), 1, "only the TimedOut member is recovered");
+        assert_eq!(timed_out[0].agent_id, "a1", "snapshot is index-parallel");
+    }
+
+    #[test]
+    fn test_render_recovered_findings_section_is_separate_and_marked() {
+        // The empty set renders nothing (boot path), and recovered findings
+        // render in their own English-marked section — never merged into the
+        // evidence list.
+        assert_eq!(render_recovered_findings(&[]), "");
+        let recovered = vec![AnalystFindings {
+            claims: vec![Claim {
+                claim: "found claim".into(),
+                source: "u1".into(),
+                confidence: "medium".into(),
+                contradictions: vec!["counter".into()],
+            }],
+            unanswered: vec!["still open".into()],
+        }];
+        let out = render_recovered_findings(&recovered);
+        assert!(
+            out.contains("## Recovered from timed-out analysts"),
+            "{out}"
+        );
+        assert!(out.contains("deadline exceeded, unverified"), "{out}");
+        assert!(out.contains("found claim"), "{out}");
+        assert!(out.contains("contradictions: counter"), "{out}");
+        assert!(out.contains("still open"), "{out}");
+    }
+
+    #[test]
+    fn test_session_has_successful_tool_result_gates_wrap_up_llm_call() {
+        // The wrap-up LLM call is gated on at least one successful tool
+        // result; all-failure and empty sessions skip it (their queries are
+        // still registered by the caller).
+        assert!(!session_has_successful_tool_result(&[]));
+        assert!(!session_has_successful_tool_result(&[ChatMessage::user(
+            "task"
+        )]));
+        let failed =
+            crate::tools::format_tool_failure_feedback("search", &json!({"query": "q"}), "boom");
+        assert!(!session_has_successful_tool_result(&[
+            ChatMessage::tool_result("t1", &failed)
+        ]));
+        assert!(session_has_successful_tool_result(&[
+            ChatMessage::tool_result("t1", "search results")
+        ]));
+        let mixed = vec![
+            ChatMessage::tool_result("t1", &failed),
+            ChatMessage::tool_result("t2", "results ok"),
+        ];
+        assert!(session_has_successful_tool_result(&mixed));
     }
 }

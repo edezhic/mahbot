@@ -117,6 +117,52 @@ fn extract_media_from_outcomes(
     paths
 }
 
+/// One-pass derivation of a role's advertised tools and their specs — the
+/// single source for both [`Agent::new`] and the research wrap-up snapshot
+/// (`.1`), so the frozen post-deadline replay can never drift from the live
+/// agent's tools (KV-cache byte identity).
+#[must_use]
+pub(crate) fn role_tools_and_specs(
+    role: crate::Role,
+    ws: &crate::Workspace,
+) -> (Vec<Box<dyn Tool>>, Vec<crate::ToolSpec>) {
+    let tools: Vec<Box<dyn Tool>> = role
+        .tools(ws)
+        .into_iter()
+        .filter(|t| t.is_advertised())
+        .collect();
+    let tool_specs = tools.iter().map(|t| t.spec()).collect();
+    (tools, tool_specs)
+}
+
+/// Build the byte-relevant chat params (model, tools, reasoning_effort,
+/// routing, max_tokens) for a role — the single source shared by
+/// [`Agent::build_chat_request`], the research wrap-up snapshot, and
+/// [`crate::tools::research::orchestrator_params`], so all three replay the
+/// same KV-cache prefix. `meta` is telemetry-only (never part of the provider
+/// request body) and attached by call sites.
+#[must_use]
+pub(crate) fn chat_request(
+    role: crate::Role,
+    tool_specs: Option<Vec<crate::ToolSpec>>,
+    messages: Vec<ChatMessage>,
+    allow_image_parts: bool,
+) -> ChatRequest {
+    let model = crate::config::CONFIG.role_model(role);
+    let routing = crate::config::CONFIG.model_routing(&model);
+    ChatRequest {
+        messages,
+        tools: tool_specs,
+        model,
+        allow_image_parts,
+        max_tokens: Some(crate::DEFAULT_MAX_TOKENS),
+        reasoning_effort: Some(crate::config::CONFIG.role_reasoning_effort(role)),
+        provider_order: routing.provider_order,
+        provider_allow_fallbacks: routing.allow_fallbacks,
+        meta: None,
+    }
+}
+
 impl Agent {
     /// Create a new agent with the given agent_id, role, workspace, and optional ticket.
     ///
@@ -132,9 +178,7 @@ impl Agent {
         user_name: String,
         channel: String,
     ) -> Self {
-        let tools = role.tools(ws);
-        let tools: Vec<Box<dyn Tool>> = tools.into_iter().filter(|t| t.is_advertised()).collect();
-        let tool_specs = tools.iter().map(|t| t.spec()).collect();
+        let (tools, tool_specs) = role_tools_and_specs(role, ws);
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let label = if let Some(ref t) = ticket {
@@ -729,17 +773,7 @@ impl Agent {
         allow_image_parts: bool,
         purpose: &'static str,
     ) -> ChatRequest {
-        let model = crate::config::CONFIG.role_model(self.role);
-        let routing = crate::config::CONFIG.model_routing(&model);
         ChatRequest {
-            messages,
-            tools: Some(self.tool_specs.clone()),
-            model,
-            allow_image_parts,
-            max_tokens: Some(crate::DEFAULT_MAX_TOKENS),
-            reasoning_effort: Some(crate::config::CONFIG.role_reasoning_effort(self.role)),
-            provider_order: routing.provider_order,
-            provider_allow_fallbacks: routing.allow_fallbacks,
             meta: Some(crate::ChatRequestMeta {
                 purpose,
                 agent_id: self.agent_id.clone(),
@@ -747,6 +781,12 @@ impl Agent {
                 workspace: self.workspace.name.clone(),
                 ticket_id: self.ticket.as_ref().map(|t| t.id.clone()),
             }),
+            ..chat_request(
+                self.role,
+                Some(self.tool_specs.clone()),
+                messages,
+                allow_image_parts,
+            )
         }
     }
 

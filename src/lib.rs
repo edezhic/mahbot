@@ -1330,7 +1330,8 @@ pub(crate) const EMBEDDING_DIM: usize = 96;
 #[derive(Debug, Clone)]
 pub(crate) struct ChatRequestMeta {
     /// Purpose tag: "agent" (agent loop incl. direct chat / discovery /
-    /// sub-agents / maintainer), "extraction", "summarize", "consolidate".
+    /// sub-agents / maintainer), "extraction", "summarize", "consolidate",
+    /// "research_wrap_up" (deadline wrap-up extraction).
     pub purpose: &'static str,
     pub agent_id: String,
     pub role: String,

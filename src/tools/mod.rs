@@ -237,6 +237,11 @@ pub(crate) fn scrub_tool_output(
     }
 }
 
+/// Prefix of a failed tool result — shared so the research wrap-up's
+/// success detection checks the same marker [`format_tool_failure_feedback`]
+/// produces (a successful result never starts with it).
+pub(crate) const TOOL_FAILURE_MARKER: &str = "Tool call failed.";
+
 #[must_use]
 pub(crate) fn format_tool_failure_feedback(
     tool_name: &str,
@@ -249,7 +254,7 @@ pub(crate) fn format_tool_failure_feedback(
     // here since they're formatted for display.
     let args_preview = scrub_credentials(&crate::util::truncate(&tool_args.to_string(), 1000));
     format!(
-        "Tool call failed.\n\
+        "{TOOL_FAILURE_MARKER}\n\
          tool: {tool_name}\n\
          arguments: {args_preview}\n\
          reason:\n{reason}"
