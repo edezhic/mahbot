@@ -5,7 +5,7 @@
 //!
 //! ## Usage
 //! 1. `Session::default()` at turn start
-//! 2. `session.init(agent_id, msg, ws, role, ticket, channel, user_name)` — loads history, builds prompt
+//! 2. `session.init(agent_id, msg, ws, role, ticket, channel, user_name, round_ts)` — loads history, builds prompt
 //!    for new sessions, persists user message, stores history internally
 //! 3. Agent loop calls `session.push_assistant()`, `session.persist_messages()`,
 //!    `session.push_messages_unpersisted()`, etc. during tool rounds
@@ -68,6 +68,10 @@ impl Session {
     /// Summarization is **not** handled here. It is run separately by
     /// `Agent::work` when the conversation exceeds the token budget.
     /// See [`crate::session`] for the summarization constants and helpers.
+    ///
+    /// `round_ts` pins the timestamp of the appended user message (one value
+    /// per round for byte-identical first messages across parallel members);
+    /// `None` stamps now.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn init(
         &mut self,
@@ -78,6 +82,7 @@ impl Session {
         ticket: Option<&crate::board::Ticket>,
         channel: &str,
         user_name: &str,
+        round_ts: Option<&str>,
     ) -> Result<()> {
         // Load existing history from DB
         let mut history = crate::session::store().load(agent_id).await;
@@ -89,7 +94,8 @@ impl Session {
             let is_new = history.is_empty();
 
             if is_new {
-                let (msgs, snapshot) = Self::build_turn_messages(msg, ws, role, ticket).await;
+                let (msgs, snapshot) =
+                    Self::build_turn_messages(msg, ws, role, ticket, round_ts).await;
 
                 // Batch-write all messages + session context atomically.
                 crate::session::store()
@@ -117,7 +123,7 @@ impl Session {
                 } else {
                     (msg.to_string(), None)
                 };
-                let user_msg = crate::session::user_msg_with_datetime(&content);
+                let user_msg = crate::session::user_msg_with_ts(&content, round_ts);
                 // Append the user message and update session context atomically.
                 crate::session::store()
                     .append_with_context(
@@ -394,16 +400,18 @@ impl Session {
     /// loaded from there on subsequent turns. This function is NOT called
     /// every turn — only on new sessions.
     ///
-    /// System prompts are cached; user messages carry per-turn data
-    /// (e.g., datetime) that is freshly generated at each call site.
+    /// System prompts are cached; user messages carry the timestamp block —
+    /// round-pinned for parallel-round first messages, fresh for everything
+    /// else (see [`crate::session::render_timestamp`]).
     async fn build_turn_messages(
         msg: &str,
         ws: &Workspace,
         role: &Role,
         ticket: Option<&crate::board::Ticket>,
+        round_ts: Option<&str>,
     ) -> (Vec<ChatMessage>, ModelSnapshot) {
         let (mut msgs, snapshot) = Self::build_context_messages(ws, role, ticket).await;
-        msgs.push(crate::session::user_msg_with_datetime(msg));
+        msgs.push(crate::session::user_msg_with_ts(msg, round_ts));
         (msgs, snapshot)
     }
 

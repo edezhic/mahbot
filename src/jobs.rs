@@ -768,10 +768,56 @@ struct StageCandidate {
     round: i64,
 }
 
+/// Strip the `<timestamp>…</timestamp>` wrapper from a persisted user message,
+/// recognizing both the legacy prefix format
+/// (`<timestamp>…</timestamp>\n\n{content}`) and the current suffix format
+/// (`{content}\n\n<timestamp>…</timestamp>`). Returns the input unchanged when
+/// neither wrapper is present. The timestamp body is validated against the
+/// [`crate::session::render_timestamp`] shape so content that merely mimics
+/// the wrapper is never mis-stripped. Residual ambiguity (inherent to the
+/// format): a suffix message whose content begins with a full legacy-shaped
+/// block is byte-identical to the legacy format and strips from the front —
+/// unreachable in practice, and fails toward duplicate delivery (never loss).
+fn strip_timestamp_wrapper(content: &str) -> &str {
+    // Suffix format — only for non-legacy-prefixed messages: a legacy message
+    // whose content happens to end with a timestamp-shaped block must not be
+    // stripped from the tail.
+    if !content.starts_with("<timestamp>")
+        && let Some(body) = content.strip_suffix("</timestamp>")
+        && let Some(start) = body.rfind("\n\n<timestamp>")
+        && is_timestamp_body(&body[start + "\n\n<timestamp>".len()..])
+    {
+        return &body[..start];
+    }
+    // Legacy prefix format — requires the exact `\n\n` separator so a
+    // suffix-format message whose content merely STARTS with a timestamp
+    // block is never mis-stripped.
+    if let Some(body) = content.strip_prefix("<timestamp>")
+        && let Some(end) = body.find("</timestamp>")
+        && is_timestamp_body(&body[..end])
+        && let Some(after) = body[end..].strip_prefix("</timestamp>\n\n")
+    {
+        return after;
+    }
+    content
+}
+
+/// Whether `s` matches the `%Y-%m-%d %H:%M:%S (%Z)` shape produced by
+/// [`crate::session::render_timestamp`]. The tz must be non-empty — chrono
+/// Local's %Z always renders on macOS; an empty one would fail validation and
+/// boot-replay dedup would degrade to duplicate delivery (never loss).
+fn is_timestamp_body(s: &str) -> bool {
+    let Some((datetime, tz)) = s.strip_suffix(')').and_then(|rest| rest.rsplit_once(" (")) else {
+        return false;
+    };
+    !tz.is_empty() && chrono::NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M:%S").is_ok()
+}
+
 /// Dedup check: was the pending envelope already appended to the target
-/// session? Every user message persists with a `<timestamp>…</timestamp>\n\n`
-/// prefix (and Manager jobs get the ticket-buffer drain prefix), so exact
-/// equality would always be false — a SUFFIX match is required. Plus a
+/// session? Every user message persists with a `<timestamp>…</timestamp>`
+/// block (legacy prefix / current suffix, and Manager jobs get the
+/// ticket-buffer drain prefix), so exact equality would always be false — a
+/// SUFFIX match after stripping the timestamp wrapper is required. Plus a
 /// created_at tiebreaker: skip only if pending.created_at <= the last user
 /// message's created_at (closes the silent at-most-once hole for identical
 /// consecutive messages). Both timestamps are compared via
@@ -804,7 +850,7 @@ async fn pending_already_appended(conn: &Connection, row: &PendingJobRow) -> boo
         (Some(row_ts), Some(last_ts)) => row_ts <= last_ts,
         _ => row.created_at <= last_created,
     };
-    last_content.ends_with(&envelope.content) && appended_before
+    strip_timestamp_wrapper(&last_content).ends_with(&envelope.content) && appended_before
 }
 
 /// (0) Replay outstanding pending_jobs — the boot reclaim path for durable
@@ -1598,13 +1644,13 @@ mod tests {
         let conn = &store.conn;
         let agent_id = "manager_ws";
         let content = "hello manager";
-        // Persist the message exactly as Session::init would (timestamp prefix).
+        // Persist the message exactly as Session::init would (suffix timestamp).
         conn.execute(
             "INSERT INTO sessions (agent_id, role, content, created_at) \
              VALUES (?1, 'user', ?2, ?3)",
             params![
                 agent_id,
-                format!("<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>\n\n{content}"),
+                format!("{content}\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"),
                 turso::now()
             ],
         )
@@ -1641,6 +1687,100 @@ mod tests {
             list_pending_jobs(conn).await.unwrap().len(),
             0,
             "deduped row reclaimed"
+        );
+    }
+
+    /// The dedup strips the timestamp wrapper in BOTH formats: legacy
+    /// prefix (`<timestamp>…</timestamp>\n\n{content}`) and current suffix
+    /// (`{content}\n\n<timestamp>…</timestamp>`), plus the Manager
+    /// ticket-buffer drain prefix shape.
+    #[test]
+    fn strip_timestamp_wrapper_both_formats() {
+        let body = "task text";
+        let suffix = format!("{body}\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>");
+        assert_eq!(strip_timestamp_wrapper(&suffix), body);
+        let legacy = format!("<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>\n\n{body}");
+        assert_eq!(strip_timestamp_wrapper(&legacy), body);
+        assert_eq!(
+            strip_timestamp_wrapper(body),
+            body,
+            "no wrapper — unchanged"
+        );
+        let drained =
+            format!("drained\n{body}\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>");
+        assert!(
+            strip_timestamp_wrapper(&drained).ends_with(body),
+            "drain prefix survives stripping"
+        );
+    }
+
+    /// Content that mimics the timestamp wrapper must not be mis-stripped: a
+    /// legacy message whose content ends with a timestamp-shaped block, a raw
+    /// message that merely starts with `<timestamp>`, and a suffix-format
+    /// message whose content begins with a timestamp block (the legacy branch
+    /// requires the exact `</timestamp>\n\n` separator, so content merely
+    /// STARTING with `<timestamp>…</timestamp> more` is left intact).
+    #[test]
+    fn strip_timestamp_wrapper_ignores_lookalikes() {
+        let body = "report\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>";
+        let legacy = format!("<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>\n\n{body}");
+        assert_eq!(strip_timestamp_wrapper(&legacy), body);
+        let raw = "<timestamp>config options</timestamp>\n\nrest of the message";
+        assert_eq!(strip_timestamp_wrapper(raw), raw);
+        let leading = "<timestamp>2026-01-01 00:00:00 (UTC)</timestamp> more\n\n\
+                       <timestamp>2026-01-01 00:00:00 (UTC)</timestamp>";
+        assert_eq!(
+            strip_timestamp_wrapper(leading),
+            leading,
+            "suffix-format message whose content starts with a timestamp block stays intact"
+        );
+    }
+
+    /// A session persisted in the LEGACY prefix format (pre-rollout rows) is
+    /// still recognized by the boot-replay dedup — legacy sessions must keep
+    /// deduplicating after the suffix-format rollout.
+    #[tokio::test]
+    async fn pending_replay_dedup_recognizes_legacy_prefix_format() {
+        let (store, _tmp) = crate::open_test_store!(crate::session::SessionStore, "session");
+        let conn = &store.conn;
+        let agent_id = "manager_legacy";
+        let content = "legacy hello";
+        conn.execute(
+            "INSERT INTO sessions (agent_id, role, content, created_at) \
+             VALUES (?1, 'user', ?2, ?3)",
+            params![
+                agent_id,
+                format!("<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>\n\n{content}"),
+                turso::now()
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pending_jobs (id, target_agent_id, kind, envelope, role, created_at) \
+             VALUES ('p-legacy', ?1, 'user_message', ?2, 'manager', ?3)",
+            params![
+                agent_id,
+                serde_json::to_string(&AgentJob {
+                    content: content.to_string(),
+                    workspace_name: "ws".to_string(),
+                    user_name: "u".to_string(),
+                    channel: "telegram".to_string(),
+                    kind: JobKind::UserMessage,
+                    role: crate::Role::Manager,
+                    reply_target: None,
+                    pending_job_id: None,
+                })
+                .unwrap(),
+                "2025-12-31T00:00:00Z",
+            ],
+        )
+        .await
+        .unwrap();
+        let rows = list_pending_jobs(conn).await.unwrap();
+        assert!(
+            pending_already_appended(conn, &rows[0]).await,
+            "legacy prefix-format message must still dedup"
         );
     }
 

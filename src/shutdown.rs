@@ -115,8 +115,9 @@ pub async fn sleep_or_shutdown_or_drain(duration: Duration) -> bool {
 
 /// Completes when the drain flag flips. Polled inside
 /// [`sleep_or_shutdown_or_drain`] every select round; the 100 ms poll cadence
-/// is negligible against 10-minute cleanup loops.
-async fn drain_wait() {
+/// is negligible against 10-minute cleanup loops. Also used by the
+/// leader-stagger wait so a graceful drain releases followers immediately.
+pub(crate) async fn drain_wait() {
     while !is_draining() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

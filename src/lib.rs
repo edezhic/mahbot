@@ -834,6 +834,14 @@ pub struct Agent {
     /// and injects received messages into the session history.
     pub(crate) incoming_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>>,
+    /// Round-fixed timestamp for the first user message (one value per round
+    /// for byte-identical task messages across parallel members).
+    pub(crate) round_ts: Option<String>,
+    /// Leader-stagger signal: fired after the agent's first LLM call
+    /// completes (success or failure, full retry budget) or when the leader
+    /// bails at the phase gate before any LLM call; `None` for non-leader
+    /// members.
+    pub(crate) first_call_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
     /// Raw failure detail from the last run — set by [`crate::agent::run_agent`]
     /// on error, left `None` on success or cancellation (callers classify
     /// cancellation via the cancel tokens).

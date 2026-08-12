@@ -792,6 +792,80 @@ async fn resume_verifier_round_replays_stored_outcomes() {
     );
 }
 
+/// The phase-gate bail path returns before run_agent runs, so its exit
+/// guard never fires and the router entry would leak a dead sender; the
+/// explicit unregister in the bail path is the only cleanup. Pins the
+/// cleanup via router_contains (try_route cannot distinguish an absent
+/// entry from a dead receiver).
+///
+/// Serialized with reset_inflight (shared global board — the stale-Phase
+/// fixture transitions the ticket out of Analysis).
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+async fn parallel_round_phase_gate_bail_unregisters_router() {
+    init_management_test_stores().await;
+    let ws = test_ws_named("/tmp/test", "pg_bail");
+    let ticket_id = make_ticket(board(), &ws, "PG Bail", TicketPhase::Analysis).await;
+    // Stale Arc: phase=Analysis loaded BEFORE the DB row moves to Planning —
+    // the member gate compares the Arc's phase against the live DB.
+    let ticket = Arc::new(expect_ticket(board(), &ticket_id).await);
+    assert_eq!(ticket.phase, TicketPhase::Analysis);
+    board()
+        .transition_to(&ticket_id, None, TicketPhase::Planning, None)
+        .await
+        .unwrap();
+    let slots: Vec<TicketStageSlot> = (0..2)
+        .map(|i| TicketStageSlot {
+            idx: i,
+            agent_id: format!("pg_bail_{i}"),
+            task: "task".to_string(),
+            status: crate::jobs::RowStatus::Launched,
+            outcome: None,
+        })
+        .collect();
+    let results = run_parallel_agents(
+        &ticket,
+        &ws,
+        Role::Analyst,
+        "extract",
+        "pg_bail_job",
+        &slots,
+        false,
+    )
+    .await;
+    assert_eq!(results.len(), 2);
+    for (slot, result) in slots.iter().zip(&results) {
+        assert!(
+            matches!(result, ParallelVerdict::NoResponse(r) if r == PHASE_GATE_BAIL_REASON),
+            "member must bail at the phase gate with the neutral reason"
+        );
+        assert!(
+            !crate::message_router::router_contains(&slot.agent_id),
+            "phase-gate bail must unregister the router entry for {}",
+            slot.agent_id,
+        );
+    }
+}
+
+/// A panicked round member maps to a contained NoResponse (fail-open) with
+/// the scrubbed panic message as the reason — the round continues, matching
+/// the ask/research precedent.
+#[tokio::test]
+async fn panicked_round_member_maps_to_contained_no_response() {
+    let handle = tokio::spawn(async {
+        panic!("probe api_key=sk-abcdefgh12345678 boom");
+    });
+    let verdict = round_member_failed(handle.await.unwrap_err());
+    let ParallelVerdict::NoResponse(reason) = verdict else {
+        panic!("panicked member must resolve to NoResponse");
+    };
+    assert!(reason.contains("probe") && reason.contains("boom"));
+    assert!(
+        !reason.contains("sk-abcdefgh12345678"),
+        "panic reason must be credential-scrubbed"
+    );
+}
+
 /// Resume an engineer round at boot (S5): the NULL-seat anchor session is
 /// CONTINUED — the resume dispatches with an empty message (session content
 /// exists → no duplicate task-prompt append), the engineer completes, the

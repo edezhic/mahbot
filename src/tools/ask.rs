@@ -343,7 +343,16 @@ async fn run_ask_with_job(
             );
             let _ = agent
                 .session
-                .init(&slot.agent_id, "", ws, &crate::Role::Analyst, None, "", "")
+                .init(
+                    &slot.agent_id,
+                    "",
+                    ws,
+                    &crate::Role::Analyst,
+                    None,
+                    "",
+                    "",
+                    None,
+                )
                 .await;
             runs.push(AskRun::Completed {
                 agent,
@@ -401,13 +410,13 @@ async fn run_ask_slots(
     deadline: std::time::Instant,
     resume: bool,
 ) -> Vec<AskRun> {
-    let handles: Vec<_> = slots
+    let members: Vec<_> = slots
         .iter()
         .map(|slot| {
             let ws = ws.clone();
             let agent_id = slot.agent_id.clone();
             let task = slot.task.clone();
-            tokio::spawn(async move {
+            move |round| async move {
                 // Session-non-emptiness discriminator: a resumed slot whose
                 // session already contains the task continues with an empty
                 // message (no duplicate task-prompt append); a missing/empty
@@ -423,11 +432,13 @@ async fn run_ask_slots(
                     String::new(),
                     None,
                     resume,
+                    Some(round),
                 )
                 .await
-            })
+            }
         })
         .collect();
+    let handles = crate::agent::spawn_staggered_round(members, resume).await;
     await_round_members(handles, deadline)
         .await
         .into_iter()
@@ -862,12 +873,12 @@ async fn run_parallel_analysts(
 ) -> Vec<AskRun> {
     let suffix = crate::generate_suffix();
     let angles = load_analyst_angles();
-    let handles: Vec<_> = (0..count)
+    let members: Vec<_> = (0..count)
         .map(|i| {
             let ws = ws.clone();
             let suffix = suffix.clone();
             let (agent_id, analyst_ask) = analyst_slot(&ws, &angles, &suffix, i, ask);
-            tokio::spawn(async move {
+            move |round| async move {
                 run_agent(
                     agent_id,
                     Role::Analyst,
@@ -878,11 +889,13 @@ async fn run_parallel_analysts(
                     String::new(),
                     None,
                     false,
+                    Some(round),
                 )
                 .await
-            })
+            }
         })
         .collect();
+    let handles = crate::agent::spawn_staggered_round(members, false).await;
     await_round_members(handles, deadline)
         .await
         .into_iter()
@@ -1294,11 +1307,12 @@ pub(crate) async fn dispatch_claim_verifiers(
     targets: &[VerificationTarget],
     task_extra: &str,
     deadline: std::time::Instant,
+    resume: bool,
 ) -> Vec<VerificationResult> {
     let task_template = load_prompt("ask/verify.md");
     let extraction_prompt = load_prompt("extraction/verify.md");
     let suffix = crate::generate_suffix();
-    let handles: Vec<_> = targets
+    let members: Vec<_> = targets
         .iter()
         .take(VERIFY_MAX_ANALYSTS)
         .enumerate()
@@ -1316,11 +1330,20 @@ pub(crate) async fn dispatch_claim_verifiers(
             task.push_str(task_extra);
             let extraction_prompt = extraction_prompt.clone();
             let claim_text = t.claim.clone();
-            tokio::spawn(async move {
-                run_claim_verifier(&ws, &agent_id, &claim_text, &task, &extraction_prompt).await
-            })
+            move |round| async move {
+                run_claim_verifier(
+                    &ws,
+                    &agent_id,
+                    &claim_text,
+                    &task,
+                    &extraction_prompt,
+                    round,
+                )
+                .await
+            }
         })
         .collect();
+    let handles = crate::agent::spawn_staggered_round(members, resume).await;
     await_round_members(handles, deadline)
         .await
         .into_iter()
@@ -1349,6 +1372,7 @@ async fn run_claim_verifier(
     target_claim: &str,
     task: &str,
     extraction_prompt: &str,
+    round: crate::agent::RoundOpts,
 ) -> VerificationResult {
     let (agent, response) = run_agent(
         agent_id.to_string(),
@@ -1360,6 +1384,7 @@ async fn run_claim_verifier(
         String::new(),
         None,
         false,
+        Some(round),
     )
     .await;
     let (tool_calls, searches, queries) = extract_query_telemetry(&agent);

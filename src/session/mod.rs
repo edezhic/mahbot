@@ -250,16 +250,21 @@ pub(crate) fn select_retention_window(history: &[ChatMessage]) -> Vec<ChatMessag
     selected.into_iter().map(|(_, m)| m.clone()).collect()
 }
 
-/// Build a user message with the current datetime prepended.
+/// Render the local datetime in the user-message timestamp format.
 #[must_use]
-pub(crate) fn user_msg_with_datetime(content: &str) -> ChatMessage {
+pub(crate) fn render_timestamp() -> String {
     let now = chrono::Local::now();
-    ChatMessage::user(format!(
-        "<timestamp>{} ({})</timestamp>\n\n{}",
-        now.format("%Y-%m-%d %H:%M:%S"),
-        now.format("%Z"),
-        content
-    ))
+    format!("{} ({})", now.format("%Y-%m-%d %H:%M:%S"), now.format("%Z"))
+}
+
+/// Build a user message with a `<timestamp>` block appended. `round_ts`
+/// (pre-rendered via [`render_timestamp`]) pins one value per round so
+/// parallel members share a byte-identical first message; `None` stamps now
+/// (mid-round injected content).
+#[must_use]
+pub(crate) fn user_msg_with_ts(content: &str, round_ts: Option<&str>) -> ChatMessage {
+    let ts = round_ts.map_or_else(render_timestamp, str::to_string);
+    ChatMessage::user(format!("{content}\n\n<timestamp>{ts}</timestamp>"))
 }
 
 crate::define_store! {
@@ -1093,6 +1098,27 @@ mod tests {
         format!("s{}", TEST_ID.fetch_add(1, Ordering::Relaxed))
     }
 
+    /// The user-message timestamp block lives at the END of the message
+    /// (suffix format, `\n\n` separator), so the task text is byte-stable
+    /// across rounds — a changed timestamp only invalidates the tail of the
+    /// provider prefix-cache. `round_ts` pins one value per round; `None`
+    /// stamps now.
+    #[test]
+    fn user_msg_timestamp_suffix_format() {
+        let msg = user_msg_with_ts("task text", Some("2026-01-01 00:00:00 (UTC)"));
+        assert_eq!(
+            msg.content,
+            "task text\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"
+        );
+        let fresh = user_msg_with_ts("task text", None);
+        assert!(
+            fresh.content.starts_with("task text\n\n<timestamp>")
+                && fresh.content.ends_with("</timestamp>"),
+            "fresh stamp must still be a suffix: {}",
+            fresh.content
+        );
+    }
+
     #[tokio::test]
     async fn session_store_create_and_load() {
         crate::util::test::init_test_stores().await;
@@ -1293,7 +1319,7 @@ mod tests {
         // First turn: init with a real message creates the session.
         let mut session = Session::default();
         session
-            .init(&agent_id, "hello", &ws, &role, None, "gui", "tester")
+            .init(&agent_id, "hello", &ws, &role, None, "gui", "tester", None)
             .await
             .unwrap();
         let len_after_real = session.history().len();
@@ -1305,7 +1331,7 @@ mod tests {
         // Second turn: init with empty message should NOT append.
         let mut session = Session::default();
         session
-            .init(&agent_id, "", &ws, &role, None, "gui", "tester")
+            .init(&agent_id, "", &ws, &role, None, "gui", "tester", None)
             .await
             .unwrap();
         assert_eq!(
@@ -1415,7 +1441,16 @@ mod tests {
         let ws = crate::workspace::test_ws_named("/_test_finalize_guard", "finalize_test");
         let mut session = Session::default();
         session
-            .init(&k, "", &ws, &crate::Role::Assistant, None, "gui", "tester")
+            .init(
+                &k,
+                "",
+                &ws,
+                &crate::Role::Assistant,
+                None,
+                "gui",
+                "tester",
+                None,
+            )
             .await
             .unwrap();
 
@@ -1453,7 +1488,16 @@ mod tests {
         let ws = crate::workspace::test_ws_named("/_test_gap_flush", "gap_flush");
         let mut session = Session::default();
         session
-            .init(&k, "", &ws, &crate::Role::Assistant, None, "gui", "tester")
+            .init(
+                &k,
+                "",
+                &ws,
+                &crate::Role::Assistant,
+                None,
+                "gui",
+                "tester",
+                None,
+            )
             .await
             .unwrap();
 
@@ -1508,7 +1552,16 @@ mod tests {
         let ws = crate::workspace::test_ws_named("/_test_gap_abort", "gap_abort");
         let mut session = Session::default();
         session
-            .init(&k, "", &ws, &crate::Role::Assistant, None, "gui", "tester")
+            .init(
+                &k,
+                "",
+                &ws,
+                &crate::Role::Assistant,
+                None,
+                "gui",
+                "tester",
+                None,
+            )
             .await
             .unwrap();
 

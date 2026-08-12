@@ -365,7 +365,10 @@ async fn persist_pending(job: &AgentJob, id: String) -> anyhow::Result<()> {
 /// to this agent mid-work.
 ///
 /// Call [`unregister_agent`] when the agent's work finishes to remove the
-/// entry.
+/// entry — for caller-registered paths (those passing a receiver into
+/// [`crate::agent::run_agent`]), the exit guard inside `run_agent` does this
+/// on every path including panic; the persistent consumer path cleans up in
+/// [`route`]'s wrapper instead.
 pub fn register_agent(agent_id: &str) -> mpsc::UnboundedReceiver<AgentJob> {
     let (tx, rx) = mpsc::unbounded_channel::<AgentJob>();
     let map = ROUTER
@@ -385,6 +388,17 @@ pub fn unregister_agent(agent_id: &str) {
     let Some(map) = ROUTER.get() else { return };
     let mut guard = map.write().unwrap_poison();
     guard.remove(agent_id);
+}
+
+/// Test-only: whether the router currently holds an entry for `agent_id`.
+/// Distinct from [`try_route`] — an entry with a dropped receiver makes
+/// `try_route` return `false` too, so leak assertions must check the map.
+#[cfg(test)]
+pub(crate) fn router_contains(agent_id: &str) -> bool {
+    let Some(map) = ROUTER.get() else {
+        return false;
+    };
+    map.read().unwrap_poison().contains_key(agent_id)
 }
 
 /// Try to route a job to a previously registered agent.
@@ -565,6 +579,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             job.channel.clone(),
             None,
             false,
+            None,
         )
         .await;
 

@@ -165,6 +165,8 @@ impl Agent {
             user_name,
             channel,
             incoming_rx: None,
+            round_ts: None,
+            first_call_notify: None,
             failure: None,
         }
     }
@@ -257,6 +259,7 @@ impl Agent {
                 self.ticket.as_ref(),
                 &self.channel,
                 &self.user_name,
+                self.round_ts.as_deref(),
             )
             .await?;
 
@@ -324,13 +327,22 @@ impl Agent {
                 // descriptive prefix so the agent understands the source.
                 self.drain_incoming_messages().await?;
 
+                // Leader-stagger signal: fire after the FIRST LLM call
+                // completes, success or failure — the wait is fail-open;
+                // Notify's stored permit covers a fire-before-wait race.
+                let llm_result = self.llm_call().await;
+                if iteration == 0
+                    && let Some(notify) = &self.first_call_notify
+                {
+                    notify.notify_one();
+                }
+
                 let PreparedAssistantTurn {
                     mut display_text,
                     tool_calls,
                     history_content,
                 } = prepare_assistant_turn(
-                    self.llm_call()
-                        .await
+                    llm_result
                         .with_context(|| format!("LLM step failed at iteration {iteration}"))?,
                 );
 
@@ -656,7 +668,7 @@ impl Agent {
                         }
                         _ => job.content,
                     };
-                    messages.push(crate::session::user_msg_with_datetime(&content));
+                    messages.push(crate::session::user_msg_with_ts(&content, None));
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -899,6 +911,103 @@ fn prepare_assistant_turn(response: ChatResponse) -> PreparedAssistantTurn {
     }
 }
 
+/// Round-scoped agent options for parallel-round members.
+///
+/// `round_ts` pins the first user message's timestamp (one value per round —
+/// byte-identical task messages across members); `first_call_notify` is the
+/// leader-stagger signal — fired after the leader's first LLM call completes
+/// (success or failure, after the full retry budget: a leader whose call
+/// exceeds the stagger bound releases followers via the sleep arm and misses
+/// the cached prefix) or when the leader bails at the phase gate before any
+/// LLM call.
+#[derive(Clone)]
+pub(crate) struct RoundOpts {
+    pub(crate) round_ts: String,
+    pub(crate) first_call_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+}
+
+/// Default fail-open bound on the leader-stagger wait: how long followers wait
+/// for the leader's first LLM call before starting anyway. First calls take
+/// ~4-6 s; the bound is a safety cap, not the expected wait. Overridable via
+/// env for tuning (mirrors [`crate::tools::ask::round_timeout`]).
+const DEFAULT_STAGGER_WAIT_SECS: u64 = 8;
+
+fn leader_stagger_wait() -> std::time::Duration {
+    crate::util::env_duration_secs("MAHBOT_STAGGER_WAIT_SECS", DEFAULT_STAGGER_WAIT_SECS)
+}
+
+/// Spawn a round's member tasks with a leader-stagger: member 0 (the leader)
+/// starts immediately; the rest start after the leader's first LLM call
+/// completes (the notify fires) or the bounded wait elapses — whichever
+/// first. The wait is fail-open (a failed/never-starting leader still releases
+/// the followers) and interrupted by daemon shutdown or the drain flag.
+///
+/// Single-member rounds are a no-op stagger, and boot-resumed rounds
+/// (`resume = true`) skip the stagger entirely — their sessions already
+/// diverged, so the leader's prefix would not be shared anyway and the wait
+/// would only add latency.
+///
+/// Renders the round timestamp once and hands every member factory a
+/// ready-made [`RoundOpts`] (only the leader carries the first-call signal).
+///
+/// The first-call signal has a single waiter — the `select!` below — so
+/// `notify_one()` releases all followers at once; its stored permit also
+/// covers a fire-before-wait race that `notify_waiters()` would lose.
+pub(crate) async fn spawn_staggered_round<T, Fut, F>(
+    members: Vec<F>,
+    resume: bool,
+) -> Vec<tokio::task::JoinHandle<T>>
+where
+    T: Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    F: FnOnce(RoundOpts) -> Fut + Send + 'static,
+{
+    let mut members = members.into_iter();
+    let Some(leader) = members.next() else {
+        return Vec::new();
+    };
+    let followers: Vec<F> = members.collect();
+    let round_ts = crate::session::render_timestamp();
+    if resume || followers.is_empty() {
+        // Resume (sessions already diverged — no shared prefix to hit) or a
+        // single-member round: no stagger, spawn everything immediately.
+        let opts = RoundOpts {
+            round_ts,
+            first_call_notify: None,
+        };
+        let mut handles = Vec::with_capacity(followers.len() + 1);
+        handles.push(tokio::spawn(leader(opts.clone())));
+        handles.extend(followers.into_iter().map(|m| tokio::spawn(m(opts.clone()))));
+        return handles;
+    }
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let mut handles = vec![tokio::spawn(leader(RoundOpts {
+        round_ts: round_ts.clone(),
+        first_call_notify: Some(notify.clone()),
+    }))];
+    let follower_opts = RoundOpts {
+        round_ts,
+        first_call_notify: None,
+    };
+    let shutdown = crate::shutdown::shutdown_token();
+    tokio::select! {
+        () = notify.notified() => {}
+        () = tokio::time::sleep(leader_stagger_wait()) => {}
+        () = shutdown.cancelled() => {}
+        () = crate::shutdown::drain_wait() => {}
+    }
+    // Drain/shutdown arms still spawn the followers — their Session::init
+    // append runs before the aborting() bail. Deliberate: it pre-seeds the
+    // session so boot resume's has_session guard skips the re-append
+    // (consistent with the leader's init-then-abort drain path).
+    handles.extend(
+        followers
+            .into_iter()
+            .map(|m| tokio::spawn(m(follower_opts.clone()))),
+    );
+    handles
+}
+
 /// Core agent lifecycle: create agent (auto-registers with its own
 /// CancellationToken), run work, handle cancellation and errors.
 /// Returns the agent (even on failure) and the response on success.
@@ -925,9 +1034,29 @@ pub(crate) async fn run_agent(
     channel: String,
     incoming_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>>,
     resume: bool,
+    round: Option<RoundOpts>,
 ) -> (Agent, Option<String>) {
+    // Unregister from the message router on EVERY exit path, including a
+    // panic mid-work (Drop runs during unwind) — a leaked router entry would
+    // keep routing comments to a dead agent. Only for caller-registered paths
+    // (Some(incoming_rx)): the persistent consumer_loop path (None) owns its
+    // router entry via route()'s catch_unwind cleanup and must keep it across
+    // jobs. Idempotent.
+    struct UnregisterOnDrop(String);
+    impl Drop for UnregisterOnDrop {
+        fn drop(&mut self) {
+            crate::message_router::unregister_agent(&self.0);
+        }
+    }
+    let _router_guard = incoming_rx
+        .is_some()
+        .then(|| UnregisterOnDrop(agent_id.clone()));
     let mut agent = Agent::new(agent_id, role, ws, ticket.cloned(), user_name, channel);
     agent.incoming_rx = incoming_rx;
+    if let Some(round) = round {
+        agent.round_ts = Some(round.round_ts);
+        agent.first_call_notify = round.first_call_notify;
+    }
     let result = agent.work(message, resume).await;
 
     // Cancellation safety: if the token fired after work() completed but
@@ -1084,6 +1213,8 @@ mod tests {
             user_name: String::new(),
             channel: String::new(),
             incoming_rx: None,
+            round_ts: None,
+            first_call_notify: None,
             failure: None,
         }
     }
@@ -1633,5 +1764,182 @@ mod tests {
             agent.incoming_rx.is_none(),
             "incoming_rx should be set to None after disconnect",
         );
+    }
+
+    // ── Leader-stagger mechanics ───────────────────────────────────
+
+    /// Single-member rounds are a no-op stagger: the sole member starts
+    /// immediately with no first-call signal.
+    #[tokio::test]
+    async fn spawn_staggered_round_single_member_is_noop() {
+        let handles = crate::agent::spawn_staggered_round(
+            vec![move |round: crate::agent::RoundOpts| async move {
+                assert!(
+                    round.first_call_notify.is_none(),
+                    "sole member must not receive a signal"
+                );
+                1u8
+            }],
+            false,
+        )
+        .await;
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles.into_iter().next().unwrap().await.unwrap(), 1);
+    }
+
+    /// Boot-resumed rounds skip the stagger entirely: every member starts
+    /// immediately with no first-call signal (their sessions already
+    /// diverged — staggering would only add latency).
+    #[tokio::test]
+    async fn spawn_staggered_round_resume_skips_stagger() {
+        let handles = crate::agent::spawn_staggered_round(
+            (0..3)
+                .map(|i| {
+                    move |round: crate::agent::RoundOpts| async move {
+                        assert!(
+                            round.first_call_notify.is_none(),
+                            "resume must not stagger (member {i})"
+                        );
+                        i
+                    }
+                })
+                .collect(),
+            true,
+        )
+        .await;
+        assert_eq!(handles.len(), 3);
+        let mut out = Vec::new();
+        for h in handles {
+            out.push(h.await.unwrap());
+        }
+        assert_eq!(out, vec![0, 1, 2]);
+    }
+
+    /// The leader's first-call signal releases the followers: once the notify
+    /// fires (before or during the wait), the remaining members start and the
+    /// round completes. All members share one round-fixed timestamp.
+    #[tokio::test]
+    async fn spawn_staggered_round_leader_notify_releases_followers() {
+        let handles = crate::agent::spawn_staggered_round(
+            (0..3)
+                .map(|i| {
+                    move |round: crate::agent::RoundOpts| async move {
+                        let tag = if i == 0 {
+                            round
+                                .first_call_notify
+                                .expect("leader receives the signal")
+                                .notify_one();
+                            "leader".to_string()
+                        } else {
+                            assert!(
+                                round.first_call_notify.is_none(),
+                                "followers must not receive the signal"
+                            );
+                            "follower".to_string()
+                        };
+                        (tag, round.round_ts)
+                    }
+                })
+                .collect(),
+            false,
+        )
+        .await;
+        assert_eq!(handles.len(), 3);
+        let mut out = Vec::new();
+        for h in handles {
+            out.push(h.await.unwrap());
+        }
+        assert!(out.iter().any(|(tag, _)| tag == "leader"));
+        assert_eq!(out.iter().filter(|(tag, _)| tag == "follower").count(), 2);
+        assert_eq!(
+            out.iter()
+                .map(|(_, ts)| ts)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1,
+            "all members share one round-fixed timestamp"
+        );
+    }
+
+    /// Fail-open: a leader that never fires its signal (stuck first call)
+    /// still releases the followers after the bounded wait — the round never
+    /// hangs.
+    #[tokio::test]
+    async fn spawn_staggered_round_leader_timeout_fail_open() {
+        // 0 → immediate timeout (deliberate test seam, see env_duration_secs).
+        let _guard = crate::util::test::set_env_var("MAHBOT_STAGGER_WAIT_SECS", Some("0"));
+        let handles = crate::agent::spawn_staggered_round(
+            (0..2)
+                .map(|i| {
+                    move |round: crate::agent::RoundOpts| async move {
+                        if i == 0 {
+                            let _ = round; // never fires — stuck leader
+                            "stuck-leader".to_string()
+                        } else {
+                            assert!(
+                                round.first_call_notify.is_none(),
+                                "released follower gets no signal"
+                            );
+                            "released".to_string()
+                        }
+                    }
+                })
+                .collect(),
+            false,
+        )
+        .await;
+        assert_eq!(
+            handles.len(),
+            2,
+            "followers must be released despite the stuck leader"
+        );
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    /// Fail-open on leader FAILURE: a leader whose first LLM call errors (the
+    /// retry budget exhausts) still fires the first-call signal — followers
+    /// are released immediately instead of waiting out the bound.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn leader_first_call_failure_still_fires_signal() {
+        use crate::util::test::{
+            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
+        };
+        let _lock = retry_tests_lock();
+        crate::util::test::init_test_stores().await;
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+        let ws = crate::workspace::test_ws_named("/tmp/ws_leader_fail", "leader_fail");
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        // 3 scripted failures = the tiny policy's full budget → exhausted.
+        let provider = FakeProvider::new()
+            .err(crate::retry::FailureClass::Transport, "boom")
+            .err(crate::retry::FailureClass::Transport, "boom")
+            .err(crate::retry::FailureClass::Transport, "boom");
+        let _provider = install_fake_provider(std::sync::Arc::new(provider));
+        let (_agent, response) = run_agent(
+            "leader_fail_agent".to_string(),
+            crate::Role::Analyst,
+            &ws,
+            None,
+            "task",
+            String::new(),
+            String::new(),
+            None,
+            false,
+            Some(RoundOpts {
+                round_ts: crate::session::render_timestamp(),
+                first_call_notify: Some(notify.clone()),
+            }),
+        )
+        .await;
+        assert!(
+            response.is_none(),
+            "leader round must fail with an exhausted budget"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified())
+            .await
+            .expect("first-call signal must fire even when the call fails");
     }
 }

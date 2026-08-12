@@ -57,6 +57,8 @@ pub(crate) const ANALYST_PASS_THRESHOLD: u8 = 7;
 
 /// Minimum acceptable verification score (0-10) for review and QA phases.
 const REVIEW_QA_THRESHOLD: u8 = 9;
+/// Neutral reason for a phase-gate bail (transients are not misattributed).
+const PHASE_GATE_BAIL_REASON: &str = "ticket not in expected phase";
 
 /// Returns the global [`BoardStore`] singleton.
 #[inline]
@@ -1276,9 +1278,9 @@ async fn run_claim_pipeline(ws: &Workspace) {
     }
 }
 
-/// Run a single pre-registered agent and unregister it from the message router
-/// when done. Registration stays in the caller (before prompt evaluation /
-/// assignment) so mid-work comment delivery is unaffected.
+/// Run a single pre-registered agent. Registration stays in the caller
+/// (before prompt evaluation / assignment) so mid-work comment delivery is
+/// unaffected; run_agent's exit guard unregisters on every path (incl. panic).
 async fn run_single_agent(
     agent_id: String,
     role: Role,
@@ -1288,9 +1290,7 @@ async fn run_single_agent(
     incoming_rx: tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>,
     resume: bool,
 ) -> (Agent, Option<String>) {
-    // run_agent consumes the ID — unregister uses a clone.
-    let agent_id_for_unregister = agent_id.clone();
-    let result = run_agent(
+    run_agent(
         agent_id,
         role,
         ws,
@@ -1300,11 +1300,9 @@ async fn run_single_agent(
         String::new(),
         Some(incoming_rx),
         resume,
+        None,
     )
-    .await;
-
-    message_router::unregister_agent(&agent_id_for_unregister);
-    result
+    .await
 }
 
 /// Build the failure comment for a failed Engineer run.
@@ -2733,7 +2731,9 @@ fn load_verifier_angles(role: Role) -> Vec<String> {
 /// Agents with empty responses get [`ParallelVerdict::NoResponse`]; agents that
 /// respond but fail to parse get [`ParallelVerdict::ParseFailed`]; successful
 /// agents get [`ParallelVerdict::Verdict`]. All extraction attempts run
-/// concurrently via [`join_all`].
+/// concurrently (leader-staggered: the first member starts immediately, the
+/// rest after its first LLM call so they hit its cached prefix; skipped on
+/// boot resume).
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 async fn run_parallel_agents(
@@ -2777,10 +2777,14 @@ async fn run_parallel_agents(
         );
     }
 
-    // ── Spawn and run all launched agents concurrently ─────────────────
+    // ── Spawn and run all launched agents (leader-staggered) ───────────
+    // Members are spawned (not joined inline): a panicked/cancelled member
+    // resolves to ParallelVerdict::NoResponse below — the round continues
+    // fail-open and the member checkpoints Failed, matching the ask/research
+    // round semantics.
     let mut results: Vec<ParallelVerdict> = Vec::with_capacity(slots.len());
     {
-        let futures: Vec<_> = launched
+        let members: Vec<_> = launched
             .iter()
             .zip(receivers)
             .map(|(slot, rx)| {
@@ -2789,7 +2793,31 @@ async fn run_parallel_agents(
                 let extraction_prompt = extraction_prompt.to_string();
                 let agent_id = slot.agent_id.clone();
                 let task = slot.task.clone();
-                async move {
+                move |round: crate::agent::RoundOpts| async move {
+                    // Mid-stagger-wait cancellation window: followers start
+                    // up to the stagger bound after the leader, so a phase
+                    // move (Manager interrupt, bounce, transition) during the
+                    // wait cancels only the already-registered leader. Gate
+                    // members on the live phase so a moved ticket does not
+                    // burn a full round (the post-round phase gate would
+                    // discard the verdicts anyway). is_ticket_in_phase also
+                    // fails closed on DB errors / missing rows — the reason
+                    // string stays neutral so transients are not misattributed.
+                    // A move-away-and-back between the leader's gate failure
+                    // and a follower's check lets that follower run a full
+                    // round with N-1 members — rare, fail-open, accepted.
+                    if !is_ticket_in_phase(&ticket.id, ticket.phase).await {
+                        // Release the stagger wait immediately: the ticket
+                        // moved, so every follower bails at its own gate too —
+                        // don't make them sit out the bound. Then drop the
+                        // router entry (run_agent's exit guard never runs on
+                        // this path).
+                        if let Some(notify) = &round.first_call_notify {
+                            notify.notify_one();
+                        }
+                        message_router::unregister_agent(&agent_id);
+                        return ParallelVerdict::NoResponse(PHASE_GATE_BAIL_REASON.to_string());
+                    }
                     // Session-non-emptiness discriminator (resume dispatch
                     // rule): a resumed slot whose session already contains the
                     // task continues with an empty message (no duplicate
@@ -2808,12 +2836,15 @@ async fn run_parallel_agents(
                         String::new(),
                         Some(rx),
                         resume,
+                        Some(round),
                     )
                     .await;
 
-                    // Unregister from message router — agent is done.
-                    message_router::unregister_agent(&agent_id);
-
+                    // run_agent's exit guard unregisters from the message
+                    // router on every path (incl. panic) — the caller
+                    // registered this member via Some(rx); the phase-gate
+                    // bail above unregisters explicitly since run_agent
+                    // never runs there.
                     let response = response.unwrap_or_default();
                     if response.is_empty() {
                         // Preserve the failure reason (full chain, scrubbed) so
@@ -2850,7 +2881,14 @@ async fn run_parallel_agents(
                 }
             })
             .collect();
-        let run_results: Vec<ParallelVerdict> = join_all(futures).await;
+        let handles = crate::agent::spawn_staggered_round(members, resume).await;
+        let mut run_results: Vec<ParallelVerdict> = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.await {
+                Ok(v) => run_results.push(v),
+                Err(e) => run_results.push(round_member_failed(e)),
+            }
+        }
 
         // ── Checkpoint: write per-agent outcomes BEFORE ParallelVerdict
         // construction completes (no read-modify-write race). ──
@@ -2909,6 +2947,19 @@ async fn run_parallel_agents(
     }
 
     results
+}
+
+/// Map a panicked round member's [`tokio::task::JoinError`] to a contained
+/// [`ParallelVerdict::NoResponse`] (round continues fail-open) carrying the
+/// scrubbed panic message as the reason. Cancelled handles are impossible —
+/// nothing aborts these tasks; `into_panic` panics loudly on that unreachable
+/// case (surfaced via the dispatch catch_unwind; resume paths log-and-die).
+/// If a deadline-abort is ever added (the ask/research `await_round_members`
+/// precedent), restore an `is_cancelled()` mapping before `into_panic`.
+fn round_member_failed(e: tokio::task::JoinError) -> ParallelVerdict {
+    let reason = crate::util::scrub_credentials(&crate::util::panic_message(&*e.into_panic()));
+    tracing::warn!(%reason, "round member task failed");
+    ParallelVerdict::NoResponse(reason)
 }
 
 /// Check whether a review or QA verdict passes (score at or above

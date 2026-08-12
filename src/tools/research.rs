@@ -464,7 +464,7 @@ async fn dispatch_durable_research(
     };
     // Spawn failures still route an error envelope — never a silent drop.
     let result = match spawn.await {
-        Ok(()) => run_deep_research(ws, question, &job_id).await,
+        Ok(()) => run_deep_research(ws, question, &job_id, false).await,
         Err(e) => Err(e),
     };
     let envelope = crate::jobs::complete_durable_job(
@@ -497,7 +497,7 @@ pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
     else {
         return;
     };
-    let result = run_deep_research(ws, &caller.task, job_id).await;
+    let result = run_deep_research(ws, &caller.task, job_id, true).await;
     if crate::shutdown::aborting() {
         tracing::info!(
             job = %job_id,
@@ -912,6 +912,7 @@ async fn run_structured_analyst<T: serde::de::DeserializeOwned>(
     agent_id: &str,
     task: &str,
     extraction_prompt: &str,
+    round: crate::agent::RoundOpts,
 ) -> AnalystRun<T> {
     let (agent, response) = run_agent(
         agent_id.to_string(),
@@ -923,6 +924,7 @@ async fn run_structured_analyst<T: serde::de::DeserializeOwned>(
         String::new(),
         None,
         false,
+        Some(round),
     )
     .await;
     let Some(raw) = response else {
@@ -1078,30 +1080,33 @@ async fn round0_decompose(
     budget: &mut ResearchBudget,
     run_stats: &mut RunStats,
     deadline: std::time::Instant,
+    resume: bool,
 ) -> Result<(MergedPlan, Option<String>)> {
     budget
         .try_reserve(DECOMPOSE_FAN_OUT)
         .map_err(anyhow::Error::msg)?;
     let task_template = load_prompt("research/decompose.md");
     let extraction_prompt = load_prompt("extraction/decompose.md");
-    let handles: Vec<_> = (0..DECOMPOSE_FAN_OUT)
+    let members: Vec<_> = (0..DECOMPOSE_FAN_OUT)
         .map(|i| {
             let ws = ws.clone();
             let question = question.to_string();
             let task = substitute(&task_template, &[("{{question}}", &question)]);
             let agent_id = crate::session::research_agent_id(&ws.name, &format!("decompose_{i}"));
             let extraction_prompt = extraction_prompt.clone();
-            tokio::spawn(async move {
+            move |round| async move {
                 run_structured_analyst::<DecompositionPlan>(
                     &ws,
                     &agent_id,
                     &task,
                     &extraction_prompt,
+                    round,
                 )
                 .await
-            })
+            }
         })
         .collect();
+    let handles = crate::agent::spawn_staggered_round(members, resume).await;
     let plans: Vec<AnalystRun<DecompositionPlan>> =
         resolve_round_members(await_round_members(handles, deadline).await);
     let mut valid = Vec::new();
@@ -1256,6 +1261,7 @@ fn validate_merged_plan(plan: &MergedPlan, plans: &[DecompositionPlan]) -> Resul
 /// Round 1: one analyst per sub-question; two for high-risk items (the
 /// second gets a decorrelated research angle). Returns the round's evidence,
 /// or `None` when the analyst budget is exhausted before dispatch.
+#[allow(clippy::too_many_arguments)]
 async fn round1_research(
     ws: &Workspace,
     question: &str,
@@ -1264,6 +1270,7 @@ async fn round1_research(
     ledger: &mut QueryLedger,
     run_stats: &mut RunStats,
     deadline: std::time::Instant,
+    resume: bool,
 ) -> Option<EvidenceRound> {
     let spawn_count = plan.sub_questions.len()
         + plan
@@ -1283,7 +1290,7 @@ async fn round1_research(
     let extraction_prompt = load_prompt("extraction/findings.md");
     let angles = load_analyst_angles();
     let ledger_snapshot = ledger.render();
-    let mut handles = Vec::new();
+    let mut members = Vec::new();
     let mut idx = 0usize;
     for sq in &plan.sub_questions {
         for k in 0..=usize::from(sq.risk == "high") {
@@ -1308,12 +1315,19 @@ async fn round1_research(
             let agent_id = crate::session::research_agent_id(&ws.name, &format!("r1_{idx}"));
             idx += 1;
             let extraction_prompt = extraction_prompt.clone();
-            handles.push(tokio::spawn(async move {
-                run_structured_analyst::<AnalystFindings>(&ws, &agent_id, &task, &extraction_prompt)
-                    .await
-            }));
+            members.push(move |round| async move {
+                run_structured_analyst::<AnalystFindings>(
+                    &ws,
+                    &agent_id,
+                    &task,
+                    &extraction_prompt,
+                    round,
+                )
+                .await
+            });
         }
     }
+    let handles = crate::agent::spawn_staggered_round(members, resume).await;
     let runs: Vec<AnalystRun<AnalystFindings>> =
         resolve_round_members(await_round_members(handles, deadline).await);
     Some(collect_evidence(&runs, ledger, run_stats))
@@ -1384,11 +1398,12 @@ async fn run_gap_round(
     gaps: &[&Gap],
     ledger: &QueryLedger,
     deadline: std::time::Instant,
+    resume: bool,
 ) -> Vec<AnalystRun<AnalystFindings>> {
     let task_template = load_prompt("research/gap.md");
     let extraction_prompt = load_prompt("extraction/findings.md");
     let ledger_snapshot = ledger.render();
-    let handles: Vec<_> = gaps
+    let members: Vec<_> = gaps
         .iter()
         .enumerate()
         .map(|(i, gap)| {
@@ -1410,12 +1425,19 @@ async fn run_gap_round(
             );
             let agent_id = crate::session::research_agent_id(&ws.name, &format!("gap_{i}"));
             let extraction_prompt = extraction_prompt.clone();
-            tokio::spawn(async move {
-                run_structured_analyst::<AnalystFindings>(&ws, &agent_id, &task, &extraction_prompt)
-                    .await
-            })
+            move |round| async move {
+                run_structured_analyst::<AnalystFindings>(
+                    &ws,
+                    &agent_id,
+                    &task,
+                    &extraction_prompt,
+                    round,
+                )
+                .await
+            }
         })
         .collect();
+    let handles = crate::agent::spawn_staggered_round(members, resume).await;
     resolve_round_members(await_round_members(handles, deadline).await)
 }
 
@@ -1439,6 +1461,7 @@ async fn gap_rounds(
     run_stats: &mut RunStats,
     deadline: std::time::Instant,
     job_id: &str,
+    resume: bool,
 ) -> GapRoundsOutcome {
     let mut outcome = GapRoundsOutcome {
         abstention: None,
@@ -1486,7 +1509,7 @@ async fn gap_rounds(
             outcome.unresolved = gap_items(gaps);
             return outcome;
         }
-        let runs = run_gap_round(ws, question, &targeted, &state.ledger, deadline).await;
+        let runs = run_gap_round(ws, question, &targeted, &state.ledger, deadline, resume).await;
         let round = collect_evidence(&runs, &mut state.ledger, run_stats);
         let (new_urls, pending) = state.acc.absorb(&round);
         let novel_claims = annotate_round(ws, &mut state.acc, &pending, &mut state.markers).await;
@@ -1979,6 +2002,7 @@ async fn research_verification_pass(
     ledger: &mut QueryLedger,
     run_stats: &mut RunStats,
     deadline: std::time::Instant,
+    resume: bool,
 ) -> Vec<VerificationResult> {
     let (targets, primary_count) = verification_targets(acc);
     if targets.is_empty() {
@@ -1998,7 +2022,9 @@ async fn research_verification_pass(
             "\n# Queries Already Asked (do not repeat these verbatim)\n\n{ledger_snapshot}"
         );
         let prefix = format!("research_{}_verify", ws.name);
-        results = dispatch_claim_verifiers(ws, &prefix, &targets[..n], &task_extra, deadline).await;
+        results =
+            dispatch_claim_verifiers(ws, &prefix, &targets[..n], &task_extra, deadline, resume)
+                .await;
     }
     for v in &results {
         run_stats.tool_calls += v.tool_calls;
@@ -2214,7 +2240,12 @@ fn partial_report(question: &str, acc: &AccumulatedEvidence, reason: &str) -> St
 /// the durable research job whose `research_jobs.state` checkpoint is loaded
 /// on entry and saved at every stage boundary.
 #[allow(clippy::too_many_lines)]
-async fn run_deep_research(ws: &Workspace, question: &str, job_id: &str) -> Result<String> {
+async fn run_deep_research(
+    ws: &Workspace,
+    question: &str,
+    job_id: &str,
+    resume: bool,
+) -> Result<String> {
     // Hold a non-agent-call guard for the WHOLE run: the drain-watch fires the
     // token only when both registries are empty, and this guard bridges the
     // inter-phase windows (analyst deregistration → the next orchestrator LLM
@@ -2237,30 +2268,32 @@ async fn run_deep_research(ws: &Workspace, question: &str, job_id: &str) -> Resu
 
     // ── Round 0 — decomposition + merge (resumable) ───────────────────
     if state.stage == ResearchStage::Decompose {
-        let plan = match round0_decompose(ws, question, &mut budget, &mut run_stats, deadline).await
-        {
-            Ok((plan, marker)) => {
-                if let Some(m) = marker {
-                    state.markers.push(m);
+        let plan =
+            match round0_decompose(ws, question, &mut budget, &mut run_stats, deadline, resume)
+                .await
+            {
+                Ok((plan, marker)) => {
+                    if let Some(m) = marker {
+                        state.markers.push(m);
+                    }
+                    plan
                 }
-                plan
-            }
-            Err(_) if crate::shutdown::shutdown_token().is_cancelled() => {
-                return Ok(partial_report(
-                    question,
-                    &state.acc,
-                    "shutdown during decomposition",
-                ));
-            }
-            Err(_) if crate::shutdown::is_draining() => {
-                return Ok(partial_report(
-                    question,
-                    &state.acc,
-                    "drain during decomposition",
-                ));
-            }
-            Err(e) => return Err(e),
-        };
+                Err(_) if crate::shutdown::shutdown_token().is_cancelled() => {
+                    return Ok(partial_report(
+                        question,
+                        &state.acc,
+                        "shutdown during decomposition",
+                    ));
+                }
+                Err(_) if crate::shutdown::is_draining() => {
+                    return Ok(partial_report(
+                        question,
+                        &state.acc,
+                        "drain during decomposition",
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
         state.plan = Some(plan);
         state.budget_spent = budget.spent;
         state.stage = ResearchStage::Round1;
@@ -2295,6 +2328,7 @@ async fn run_deep_research(ws: &Workspace, question: &str, job_id: &str) -> Resu
             &mut state.ledger,
             &mut run_stats,
             deadline,
+            resume,
         )
         .await
         else {
@@ -2328,6 +2362,7 @@ async fn run_deep_research(ws: &Workspace, question: &str, job_id: &str) -> Resu
             &mut run_stats,
             deadline,
             job_id,
+            resume,
         )
         .await;
         // Aborting mid-gap-loop (drain/shutdown): leave the stage at
@@ -2442,6 +2477,7 @@ async fn run_deep_research(ws: &Workspace, question: &str, job_id: &str) -> Resu
             &mut state.ledger,
             &mut run_stats,
             deadline,
+            resume,
         )
         .await;
         state.budget_spent = budget.spent;

@@ -220,6 +220,7 @@ async fn run_discovery_task(
         String::new(),
         None,
         false,
+        None,
     )
     .await;
     let response =
@@ -292,6 +293,7 @@ async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) 
         String::new(),
         None,
         false,
+        None,
     )
     .await;
     response.context("Diagnostics discovery agent returned no response (cancelled or failed)")?;
