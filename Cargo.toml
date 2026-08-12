@@ -35,6 +35,13 @@ wal-orphan-repro = []
 # close on macOS; the two-process harness demonstrates the drop and the
 # resulting reader-slot panic (class-C escalation artifact).
 lock-drop-repro = []
+# Gates the lock-drop -> Exclusive-repair -> stale durable frame index repro
+# harness (benches/wal_stale_index_repro.rs): the same macOS close-drop lets a
+# second process classify the open Exclusive, repair the shared authority from
+# a stale local WAL scan, and strand a desynced durable index — class-A
+# write-path panics and class-B durable table/index desync (escalation
+# artifact, probabilistic: batch protocol + control group inside the bench).
+wal-stale-index-repro = []
 # Gates the grep-engine subprocess end-to-end harness (benches/grep_engine_e2e.rs):
 # the parent rewrites commands and spawns `sh -c` with the bench binary acting as
 # the hidden engine subcommand, then diffs against the real system grep.
@@ -103,8 +110,10 @@ rand = "0.10"
 unicode-normalization = "0.1"
 
 # Memory / persistence
-# Pinned exactly: the wal_race_repro bench is the escalation artifact for the
-# turso two-writer WAL defect, so the storage layer must not drift under it.
+# Pinned exactly: the wal_race_repro / wal_stale_index_repro benches are the
+# escalation artifacts for the turso two-writer WAL defect and the macOS
+# lock-drop -> stale durable index defect, so the storage layer must not drift
+# under them.
 turso = { version = "=0.7.2", default-features = false, features = ["fts"] }
 
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
@@ -212,6 +221,11 @@ required-features = ["wal-orphan-repro"]
 name = "lock_drop_repro"
 harness = false
 required-features = ["lock-drop-repro"]
+
+[[bench]]
+name = "wal_stale_index_repro"
+harness = false
+required-features = ["wal-stale-index-repro"]
 
 [[bench]]
 name = "grep_engine_e2e"
