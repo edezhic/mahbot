@@ -1351,11 +1351,6 @@ pub(crate) struct ChatRequest {
     /// Provider routing: allow fallbacks when provider_order is set.
     /// When `None` (and provider_order is set), defaults to `false`.
     pub provider_allow_fallbacks: Option<bool>,
-    /// Request `response_format: {"type": "json_object"}` from the provider.
-    /// Request-level parameter — does not alter message content, so KV-cache
-    /// prefix reuse is preserved. Used by verdict extraction (guaranteed-valid
-    /// JSON output); the parse/repair/retry loop remains as defense-in-depth.
-    pub response_format_json_object: bool,
     /// Optional operation metadata for per-request LLM stats logging.
     pub meta: Option<ChatRequestMeta>,
 }

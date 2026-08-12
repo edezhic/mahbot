@@ -350,6 +350,26 @@ impl FailureClass {
 /// Bytes of the response body head/tail captured on failure (each side).
 pub(crate) const BODY_SNIPPET_BYTES: usize = 200;
 
+/// Fine-grained JSON-quality causes for extraction-family `retry_failures`
+/// rows (the `cause` column). Transport / truncation / NoResponse failures
+/// keep their [`FailureClass`] label and an empty cause — the cause column
+/// splits the JSON-quality failure modes tuning needs: parse-class failures
+/// (non_json / empty_content / tool_call) plus score-validation rejections.
+pub(crate) const CAUSE_NON_JSON: &str = "non_json";
+pub(crate) const CAUSE_EMPTY_CONTENT: &str = "empty_content";
+pub(crate) const CAUSE_SCORE_VALIDATION: &str = "score_validation";
+pub(crate) const CAUSE_TOOL_CALL: &str = "tool_call";
+
+/// Parse-failure cause split: empty assistant content vs non-JSON text.
+#[must_use]
+pub(crate) fn parse_failure_cause(raw: &str) -> &'static str {
+    if raw.trim().is_empty() {
+        CAUSE_EMPTY_CONTENT
+    } else {
+        CAUSE_NON_JSON
+    }
+}
+
 /// Per-attempt failure diagnostics, persisted to the logs store's `retry_failures` table.
 ///
 /// Captured as close to the HTTP boundary as possible so response metadata
@@ -381,14 +401,22 @@ pub(crate) struct RetryFailureRecord {
     pub completion_tokens: Option<u64>,
     /// Retry-After value from the response, if any.
     pub retry_after_ms: Option<u64>,
+    /// Fine-grained JSON-quality cause (one of the [`CAUSE_*`] constants);
+    /// set on Parse and OutOfRangeScore failures, empty elsewhere.
+    pub cause: String,
+    /// Operation context for per-role/hour aggregation — stamped by the outer
+    /// retry loops from the request metadata.
+    pub purpose: String,
+    pub role: String,
+    pub workspace: String,
     /// RFC3339 timestamp (set at construction).
     pub recorded_at: String,
 }
 
 impl RetryFailureRecord {
-    /// Build a record from a plain error (no HTTP metadata available).
-    #[must_use]
-    pub(crate) fn new_simple(
+    /// Shared constructor: common fields + empty defaults for the HTTP
+    /// metadata and the stamped context (cause / purpose / role / workspace).
+    fn base(
         attempt: u32,
         class: FailureClass,
         error: &anyhow::Error,
@@ -410,8 +438,24 @@ impl RetryFailureRecord {
             finish_reason: None,
             completion_tokens: None,
             retry_after_ms,
+            cause: String::new(),
+            purpose: String::new(),
+            role: String::new(),
+            workspace: String::new(),
             recorded_at: crate::turso::now(),
         }
+    }
+
+    /// Build a record from a plain error (no HTTP metadata available).
+    #[must_use]
+    pub(crate) fn new_simple(
+        attempt: u32,
+        class: FailureClass,
+        error: &anyhow::Error,
+        elapsed_ms: u64,
+        retry_after_ms: Option<u64>,
+    ) -> Self {
+        Self::base(attempt, class, error, elapsed_ms, retry_after_ms)
     }
 
     /// Build a record with full response metadata.
@@ -434,21 +478,33 @@ impl RetryFailureRecord {
     ) -> Self {
         let (body_head, body_tail) = body_head_tail(body);
         Self {
-            attempt,
-            class,
-            error_chain: format!("{error:#}"),
             http_version,
             content_length,
             actual_body_len,
             content_encoding,
             transfer_encoding,
-            elapsed_ms,
             body_head,
             body_tail,
             finish_reason,
             completion_tokens,
-            retry_after_ms,
-            recorded_at: crate::turso::now(),
+            ..Self::base(attempt, class, error, elapsed_ms, retry_after_ms)
+        }
+    }
+
+    /// Attach a fine-grained JSON-quality cause (extraction-family failures).
+    #[must_use]
+    pub(crate) fn with_cause(mut self, cause: &'static str) -> Self {
+        self.cause = cause.to_string();
+        self
+    }
+
+    /// Stamp the operation context (purpose / role / workspace) from request
+    /// metadata for per-role/hour retry-cause aggregation.
+    pub(crate) fn stamp_meta(&mut self, meta: Option<&crate::ChatRequestMeta>) {
+        if let Some(meta) = meta {
+            self.purpose = meta.purpose.to_string();
+            self.role.clone_from(&meta.role);
+            self.workspace.clone_from(&meta.workspace);
         }
     }
 }
@@ -473,7 +529,7 @@ pub(crate) fn body_head_tail(body: &str) -> (String, String) {
 ///
 /// Never fails the operation — persistence failures are logged at debug.
 pub(crate) async fn record_retry_failure(record: &RetryFailureRecord) {
-    let Some(store) = crate::logs::LOG_STORE.get() else {
+    let Some(store) = crate::stats::log_store_for_stats() else {
         return;
     };
     if let Err(e) = store.record_retry_failure(record).await {
@@ -582,19 +638,25 @@ pub(crate) struct RetryLoop {
     backoffs: Vec<u64>,
     failures: Vec<RetryFailureRecord>,
     last_retry_after: Option<u64>,
+    /// Operation context stamped onto every persisted failure record
+    /// (purpose / role / workspace for per-role/hour aggregation).
+    meta: Option<crate::ChatRequestMeta>,
 }
 
 impl RetryLoop {
-    /// Start a new operation: snapshots the schedule and computes the
-    /// authoritative wall-clock deadline.
+    /// Start a new operation carrying request metadata — every failure record
+    /// persisted via [`Self::record`] gets the purpose/role/workspace context
+    /// stamped for retry-cause aggregation. Pass `None` for context-free
+    /// operations.
     #[must_use]
-    pub(crate) fn new(policy: &RetryPolicy) -> Self {
+    pub(crate) fn new(policy: &RetryPolicy, meta: Option<&crate::ChatRequestMeta>) -> Self {
         Self {
             policy: policy.clone(),
             deadline: Instant::now() + policy.operation_timeout,
             backoffs: backoff_sequence(policy),
             failures: Vec::new(),
             last_retry_after: None,
+            meta: meta.cloned(),
         }
     }
 
@@ -630,6 +692,7 @@ impl RetryLoop {
     /// attempt, so a 429 Retry-After never bleeds into later sleeps.
     pub(crate) async fn record(&mut self, attempt: u32, mut rec: RetryFailureRecord) {
         rec.attempt = attempt;
+        rec.stamp_meta(self.meta.as_ref());
         self.last_retry_after = rec.retry_after_ms;
         record_retry_failure(&rec).await;
         self.failures.push(rec);
@@ -685,7 +748,7 @@ pub(crate) async fn agent_chat(
     request: ChatRequest,
     policy: &RetryPolicy,
 ) -> Result<ChatResponse, RetryExhausted> {
-    let mut loop_state = RetryLoop::new(policy);
+    let mut loop_state = RetryLoop::new(policy, request.meta.as_ref());
     let operation_started = Instant::now();
 
     for attempt in 1..=policy.max_attempts {
@@ -796,7 +859,7 @@ mod tests {
         // wall budget per occurrence (reviewer finding).
         let _guard = crate::util::test::retry_tests_lock();
         let policy = tiny_test_policy();
-        let mut loop_state = RetryLoop::new(&policy);
+        let mut loop_state = RetryLoop::new(&policy, None);
 
         // 429-style failure carries a Retry-After.
         let rec = RetryFailureRecord::new_simple(

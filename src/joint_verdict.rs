@@ -129,7 +129,6 @@ fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> Chat
         reasoning_effort: Some(crate::config::CONFIG.role_reasoning_effort(role)),
         provider_order: routing.provider_order,
         provider_allow_fallbacks: routing.allow_fallbacks,
-        response_format_json_object: true,
         meta: Some(ChatRequestMeta {
             purpose: "synthesis",
             agent_id: format!("joint_verdict_{}", crate::generate_suffix()),

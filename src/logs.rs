@@ -135,6 +135,15 @@ CREATE TABLE IF NOT EXISTS retry_failures (
     finish_reason     TEXT,
     completion_tokens INTEGER,
     retry_after_ms    INTEGER,
+    -- Context for per-role/hour retry-cause aggregation: fine-grained
+    -- JSON-quality cause (non_json / empty_content / score_validation /
+    -- tool_call; set on Parse and OutOfRangeScore failures, empty
+    -- elsewhere) plus the operation context stamped by the outer retry
+    -- loops. Empty on legacy rows.
+    purpose           TEXT NOT NULL DEFAULT '',
+    role              TEXT NOT NULL DEFAULT '',
+    workspace         TEXT NOT NULL DEFAULT '',
+    cause             TEXT NOT NULL DEFAULT '',
     recorded_at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_retry_failures_recorded_at ON retry_failures(recorded_at);
@@ -164,10 +173,19 @@ CREATE TABLE IF NOT EXISTS llm_requests (
     success             INTEGER NOT NULL DEFAULT 1,
     -- Observability additions: billed cost (the invoice amount), raw
     -- cost_details, serving upstream provider, system_fingerprint,
-    -- and the response_format flag. All telemetry fields are parsed
+    -- and the retired response_format flag. All telemetry fields are parsed
     -- generically from the response envelope, so cost/upstream_provider/
     -- system_fingerprint are NULL on failures and whenever the provider
-    -- omits them. response_format is always set.
+    -- omits them. response_format was retired with the json_object removal
+    -- (verdict calls no longer force it) — historical marker only: new rows
+    -- default 0; pre-change rows carry 1 on every call site that forced
+    -- json_object (all extraction-choke-point purposes — extraction,
+    -- decompose_merge, gap_extract, claim_annotate, confirm_links,
+    -- abstain_check — plus consolidation and synthesis), 0 elsewhere; rows
+    -- predating the column read 0 regardless, so split the before/after
+    -- windows by recorded_at (deploy boundary), not response_format alone.
+    -- Only reliable while the store survives boot — quarantine recreation
+    -- resets history.
     -- Existing rows keep NULL (or response_format 0) via
     -- `migrate_llm_requests_columns` (append-only).
     cost                REAL,
@@ -262,6 +280,11 @@ impl LogStore {
         migrate_llm_requests_columns(&store.conn)
             .await
             .context("Failed to migrate llm_requests columns")?;
+        // Guarded retry_failures column additions (retry-cause telemetry
+        // context) — same append-only semantics as the llm_requests migration.
+        migrate_retry_failures_columns(&store.conn)
+            .await
+            .context("Failed to migrate retry_failures columns")?;
         Ok(store)
     }
 
@@ -524,9 +547,11 @@ pub(crate) async fn migrate_verdict_scores_shape(conn: &turso::Connection) -> an
 /// here — idempotent via the `column_exists` guard, and additive: existing
 /// rows keep NULL (or the `response_format` default 0), never rewritten.
 ///
-/// Historical note: pre-migration extraction rows record `response_format`
-/// 0 even though those requests forced `json_object` on the wire — the flag
-/// is unreliable over the pre-migration window by design (append-only).
+/// Historical note: pre-migration rows from the json_object-forcing call
+/// sites (every extraction-choke-point purpose plus consolidation and
+/// synthesis) record `response_format` 0 even though those requests forced
+/// it on the wire — the flag is unreliable over the pre-migration window by
+/// design (append-only).
 pub(crate) async fn migrate_llm_requests_columns(conn: &turso::Connection) -> anyhow::Result<()> {
     for (column, ddl) in [
         ("cost", "REAL"),
@@ -542,6 +567,33 @@ pub(crate) async fn migrate_llm_requests_columns(conn: &turso::Connection) -> an
             )
             .await
             .with_context(|| format!("Failed to add {column} column to llm_requests"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Guarded append-only column additions for the `retry_failures` table
+/// (purpose / role / workspace / cause retry-cause telemetry context).
+/// `CREATE TABLE IF NOT EXISTS` does not add columns to existing stores, so
+/// legacy logs.db files are migrated here — idempotent via the
+/// `column_exists` guard, and additive: existing rows keep the empty-string
+/// defaults, never rewritten. No indexes on the migrated columns (the schema
+/// batch runs before this migration — an index on a not-yet-added column
+/// would abort it and quarantine the store).
+pub(crate) async fn migrate_retry_failures_columns(conn: &turso::Connection) -> anyhow::Result<()> {
+    for (column, ddl) in [
+        ("purpose", "TEXT NOT NULL DEFAULT ''"),
+        ("role", "TEXT NOT NULL DEFAULT ''"),
+        ("workspace", "TEXT NOT NULL DEFAULT ''"),
+        ("cause", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        if !turso::column_exists(conn, "retry_failures", column).await? {
+            conn.execute(
+                &format!("ALTER TABLE retry_failures ADD COLUMN {column} {ddl}"),
+                (),
+            )
+            .await
+            .with_context(|| format!("Failed to add {column} column to retry_failures"))?;
         }
     }
     Ok(())
@@ -1994,5 +2046,86 @@ mod tests {
             .next()
             .expect("row still there");
         assert_eq!(row.get::<String>(0).expect("agent_id"), "legacy");
+    }
+
+    /// Full `LogStore::open` boot path against a legacy-shaped store: the
+    /// schema batch runs before the guarded migration, so any schema
+    /// statement referencing the not-yet-migrated columns (the purpose index
+    /// bug) would abort the batch and quarantine the whole store. Regression
+    /// test — opens the file exactly like production boot, asserts the store
+    /// survives with data intact, then re-opens to verify migration
+    /// idempotency (every boot re-runs it).
+    #[tokio::test]
+    async fn log_store_open_preserves_legacy_retry_failures() {
+        let tmp = ::tempfile::TempDir::new().expect("temp dir for test store");
+        let root = tmp.path();
+        // Materialize a legacy-shaped store: open fresh (new shape), then
+        // strip the retry-context columns and their index, seed a legacy row.
+        let store = crate::logs::LogStore::open(root).await.expect("fresh open");
+        for column in ["purpose", "role", "workspace", "cause"] {
+            store
+                .conn
+                .execute(
+                    &format!("ALTER TABLE retry_failures DROP COLUMN {column}"),
+                    (),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "INSERT INTO retry_failures \
+                 (attempt, failure_class, error_chain, elapsed_ms, recorded_at) \
+                 VALUES (1, 'parse', 'legacy', 1, '2026-01-01T00:00:00Z')",
+                (),
+            )
+            .await
+            .unwrap();
+        drop(store); // release the connection so the file can be reopened
+
+        let reopened = crate::logs::LogStore::open(root)
+            .await
+            .expect("reopen must not quarantine the legacy store");
+        let cols = reopened
+            .conn
+            .query("PRAGMA table_info('retry_failures')", ())
+            .await
+            .unwrap();
+        let names: Vec<String> = cols.iter().map(|r| r.get::<String>(1).unwrap()).collect();
+        for column in ["purpose", "role", "workspace", "cause"] {
+            assert!(names.contains(&column.to_string()), "missing {column}");
+        }
+        // Legacy row survives with the empty-string defaults (append-only).
+        let row = reopened
+            .conn
+            .query(
+                "SELECT attempt, purpose, role, workspace, cause FROM retry_failures",
+                (),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("legacy row preserved");
+        assert_eq!(row.get::<i64>(0).expect("attempt"), 1);
+        assert_eq!(row.get::<String>(1).expect("purpose"), "");
+        assert_eq!(row.get::<String>(2).expect("role"), "");
+        assert_eq!(row.get::<String>(3).expect("workspace"), "");
+        assert_eq!(row.get::<String>(4).expect("cause"), "");
+        // Idempotent — a second boot re-runs the migration and no-ops.
+        drop(reopened);
+        let reopened = crate::logs::LogStore::open(root)
+            .await
+            .expect("second boot must no-op the migration");
+        let row = reopened
+            .conn
+            .query("SELECT attempt FROM retry_failures", ())
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("row still there");
+        assert_eq!(row.get::<i64>(0).expect("attempt"), 1);
     }
 }

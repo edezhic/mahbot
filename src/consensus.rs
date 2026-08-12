@@ -728,7 +728,7 @@ pub(crate) async fn run_grouping_repair(
     let _call = crate::call_registry::NON_AGENT_CALLS.register(purpose, &ws.name);
     crate::prompt::prepend_general_context(&mut request.messages, ws).await;
     let policy = RetryPolicy::synthesis();
-    let mut loop_state = RetryLoop::new(&policy);
+    let mut loop_state = RetryLoop::new(&policy, request.meta.as_ref());
     let operation_started = Instant::now();
     let mut state = RepairState::new(items_by_agent);
     // Rejection reasons fed to the next repair round; cleared only once a
@@ -774,6 +774,22 @@ pub(crate) async fn run_grouping_repair(
             }
         };
         let raw = resp.text_or_empty();
+        // A tool-call response parses as empty text — classify it explicitly
+        // so the retry-cause telemetry distinguishes it (same taxonomy as
+        // extraction).
+        if !resp.tool_calls.is_empty() {
+            let rec = RetryFailureRecord::new_simple(
+                round,
+                FailureClass::Parse,
+                &anyhow::anyhow!("grouping response returned a tool call instead of JSON"),
+                attempt_started.elapsed().as_millis() as u64,
+                None,
+            )
+            .with_cause(crate::retry::CAUSE_TOOL_CALL);
+            loop_state.record(round, rec).await;
+            prev_round = PrevRound::Parse;
+            continue;
+        }
         let parsed: Result<RoundInput, _> = if round == 1 {
             crate::util::json::parse_fenced_json::<GroupingOutput>(raw).map(|o| RoundInput {
                 summary: Some(o.summary),
@@ -810,7 +826,8 @@ pub(crate) async fn run_grouping_repair(
                     &e,
                     attempt_started.elapsed().as_millis() as u64,
                     None,
-                );
+                )
+                .with_cause(crate::retry::parse_failure_cause(raw));
                 loop_state.record(round, rec).await;
                 prev_round = PrevRound::Parse;
                 continue;
@@ -855,13 +872,14 @@ pub(crate) async fn run_grouping_repair(
         if !outcome.rejections.is_empty() {
             for (class, msg) in &outcome.rejections {
                 let err = anyhow::anyhow!("{msg}");
-                let rec = RetryFailureRecord::new_simple(
+                let mut rec = RetryFailureRecord::new_simple(
                     round,
                     *class,
                     &err,
                     attempt_started.elapsed().as_millis() as u64,
                     None,
                 );
+                rec.stamp_meta(request.meta.as_ref());
                 crate::retry::record_retry_failure(&rec).await;
             }
         }
@@ -980,7 +998,6 @@ pub(crate) fn grouping_request(
         reasoning_effort,
         provider_order,
         provider_allow_fallbacks,
-        response_format_json_object: true,
         meta: Some(ChatRequestMeta {
             purpose,
             agent_id: format!("grouping_{}_{}", ws.name, crate::generate_suffix()),

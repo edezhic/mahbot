@@ -728,7 +728,6 @@ impl Agent {
             reasoning_effort: Some(crate::config::CONFIG.role_reasoning_effort(self.role)),
             provider_order: routing.provider_order,
             provider_allow_fallbacks: routing.allow_fallbacks,
-            response_format_json_object: false,
             meta: Some(crate::ChatRequestMeta {
                 purpose,
                 agent_id: self.agent_id.clone(),

@@ -1029,7 +1029,6 @@ fn orchestrator_params(ws: &Workspace, purpose: &'static str) -> ChatRequest {
         reasoning_effort: Some(CONFIG.role_reasoning_effort(Role::Analyst)),
         provider_order: routing.provider_order,
         provider_allow_fallbacks: routing.allow_fallbacks,
-        response_format_json_object: false,
         meta: Some(ChatRequestMeta {
             purpose,
             agent_id: format!("research_{}_orchestrator", ws.name),
@@ -1813,9 +1812,9 @@ async fn synthesize(
         );
     }
     let policy = crate::retry::RetryPolicy::synthesis();
-    let mut loop_state = crate::retry::RetryLoop::new(&policy);
-    let operation_started = Instant::now();
     let mut params = orchestrator_params(ws, "synthesize");
+    let mut loop_state = crate::retry::RetryLoop::new(&policy, params.meta.as_ref());
+    let operation_started = Instant::now();
     let mut prefix = Vec::with_capacity(2);
     crate::prompt::prepend_general_context(&mut prefix, ws).await;
     let mut last: Option<String> = None;

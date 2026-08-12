@@ -2822,11 +2822,12 @@ async fn run_parallel_agents(
                         let reason = agent.failure_reason("agent produced no response");
                         ParallelVerdict::NoResponse(crate::util::scrub_credentials(&reason))
                     } else {
-                        // KV cache preservation: `agent.extract_verdict` uses the
-                        // agent's own parameters (model, reasoning_effort, tools,
-                        // provider routing) so the extraction call is byte-identical
-                        // to the original verifier agent call — the provider can reuse the
-                        // cached prefix.
+                        // Prefix-cache preservation: `agent.extract_verdict`
+                        // uses the agent's own parameters (model,
+                        // reasoning_effort, tools, provider routing) with no
+                        // response_format override — the extraction request
+                        // shares the agent-loop prefix (system + history), so
+                        // only the appended extraction prompt misses the cache.
                         //
                         // The hardened outer retry loop (13 attempts,
                         // backoff 5/10/20/40/60/60 s, 720 s wall cap) enforces

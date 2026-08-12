@@ -187,8 +187,9 @@ impl crate::logs::LogStore {
                 "INSERT INTO retry_failures \
                  (attempt, failure_class, error_chain, http_version, content_length, \
                   actual_body_len, content_encoding, transfer_encoding, elapsed_ms, \
-                  body_head, body_tail, finish_reason, completion_tokens, retry_after_ms, recorded_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                  body_head, body_tail, finish_reason, completion_tokens, retry_after_ms, \
+                  purpose, role, workspace, cause, recorded_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                 turso::params![
                     i64::from(rec.attempt),
                     rec.class.label(),
@@ -204,6 +205,10 @@ impl crate::logs::LogStore {
                     rec.finish_reason.clone(),
                     rec.completion_tokens.map(i64::try_from).transpose()?,
                     rec.retry_after_ms.map(i64::try_from).transpose()?,
+                    rec.purpose.clone(),
+                    rec.role.clone(),
+                    rec.workspace.clone(),
+                    rec.cause.clone(),
                     rec.recorded_at.clone(),
                 ],
             )
@@ -219,10 +224,10 @@ impl crate::logs::LogStore {
                 "INSERT INTO llm_requests \
                  (recorded_at, purpose, agent_id, role, workspace, ticket_id, model, routing, \
                   input_tokens, output_tokens, cached_input_tokens, cache_miss_tokens, \
-                  cost, cost_details, upstream_provider, system_fingerprint, response_format, \
+                  cost, cost_details, upstream_provider, system_fingerprint, \
                   duration_ms, retry_attempts, finish_reason, failure_class, success) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                         ?17, ?18, ?19, ?20, ?21, ?22)",
+                         ?17, ?18, ?19, ?20, ?21)",
                 turso::params![
                     rec.recorded_at.clone(),
                     rec.purpose,
@@ -240,7 +245,6 @@ impl crate::logs::LogStore {
                     rec.cost_details.clone(),
                     rec.upstream_provider.clone(),
                     rec.system_fingerprint.clone(),
-                    i64::from(rec.response_format),
                     i64::try_from(rec.duration_ms)?,
                     i64::from(rec.retry_attempts),
                     rec.finish_reason.clone(),
@@ -308,8 +312,6 @@ pub(crate) struct LlmRequestRecord {
     pub upstream_provider: Option<String>,
     /// Provider `system_fingerprint`; NULL when the provider omits it.
     pub system_fingerprint: Option<String>,
-    /// Whether `response_format: json_object` was requested (always filled).
-    pub response_format: bool,
     pub duration_ms: u64,
     /// Total HTTP attempts made by the operation (1 = no retries).
     pub retry_attempts: u32,
@@ -345,8 +347,7 @@ pub(crate) struct ImageGenCallRecord {
 ///
 /// Failure-path semantics: `upstream_provider` / `system_fingerprint` /
 /// `cost` / `cost_details` are only populated from a successful response
-/// envelope — failed requests have no response, so those columns stay NULL;
-/// `response_format` is always filled.
+/// envelope — failed requests have no response, so those columns stay NULL.
 fn llm_request_record(
     request: &crate::ChatRequest,
     duration_ms: u64,
@@ -379,7 +380,6 @@ fn llm_request_record(
             .map(serde_json::Value::to_string),
         upstream_provider: response.and_then(|r| r.upstream_provider.clone()),
         system_fingerprint: response.and_then(|r| r.system_fingerprint.clone()),
-        response_format: request.response_format_json_object,
         duration_ms,
         retry_attempts: attempts,
         finish_reason: finish_reason.map(str::to_string),
@@ -407,7 +407,9 @@ pub(crate) fn swap_test_log_store(
 }
 
 /// Resolve the logs store for stat writes: test override wins, else the global.
-fn log_store_for_stats() -> Option<crate::logs::LogStore> {
+/// Shared by the llm_requests and retry_failures persistence paths so tests
+/// observe both tables through the same override.
+pub(crate) fn log_store_for_stats() -> Option<crate::logs::LogStore> {
     #[cfg(test)]
     if let Some(store) = TEST_LOG_STORE
         .read()
@@ -780,12 +782,13 @@ mod tests {
         assert_eq!(total, 0, "other-ws should have 0 errors");
     }
 
-    /// `retry_failures` insert round-trip — verifies the schema
-    /// and the parameterized insert are valid against a real store.
+    /// `retry_failures` insert round-trip — verifies the schema (including the
+    /// context + cause columns) and the parameterized insert are valid against
+    /// a real store.
     #[tokio::test]
     async fn record_retry_failure_round_trip() {
         let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
-        let rec = crate::retry::RetryFailureRecord::with_metadata(
+        let mut rec = crate::retry::RetryFailureRecord::with_metadata(
             3,
             crate::retry::FailureClass::TruncatedEnvelope,
             &anyhow::anyhow!("OpenRouter error reading response body: eof"),
@@ -799,7 +802,15 @@ mod tests {
             Some("length".to_string()),
             Some(4_000),
             Some(7_500),
-        );
+        )
+        .with_cause(crate::retry::CAUSE_NON_JSON);
+        rec.stamp_meta(Some(&crate::ChatRequestMeta {
+            purpose: "extraction",
+            agent_id: "t".to_string(),
+            role: "reviewer".to_string(),
+            workspace: "ws1".to_string(),
+            ticket_id: None,
+        }));
 
         store
             .record_retry_failure(&rec)
@@ -813,7 +824,8 @@ mod tests {
                 "SELECT attempt, failure_class, error_chain, http_version, \
                         content_length, actual_body_len, content_encoding, \
                         transfer_encoding, elapsed_ms, body_head, body_tail, \
-                        finish_reason, completion_tokens, retry_after_ms \
+                        finish_reason, completion_tokens, retry_after_ms, \
+                        purpose, role, workspace, cause \
                  FROM retry_failures WHERE attempt = 3",
                 crate::turso::params![],
             )
@@ -859,6 +871,17 @@ mod tests {
             row.get::<Option<i64>>(13).expect("retry_after"),
             Some(7_500)
         );
+        assert_eq!(
+            row.get::<String>(14).expect("purpose"),
+            "extraction",
+            "operation context must be stamped"
+        );
+        assert_eq!(row.get::<String>(15).expect("role"), "reviewer");
+        assert_eq!(row.get::<String>(16).expect("workspace"), "ws1");
+        assert_eq!(
+            row.get::<String>(17).expect("cause"),
+            crate::retry::CAUSE_NON_JSON
+        );
         assert!(rows.next().is_none(), "only one row expected");
     }
 
@@ -884,7 +907,6 @@ mod tests {
             cost_details: Some(r#"{"input":0.002,"output":0.0022}"#.to_string()),
             upstream_provider: Some("DeepSeek".to_string()),
             system_fingerprint: Some("fp_44709d6fcb".to_string()),
-            response_format: true,
             duration_ms: 1_234,
             retry_attempts: 2,
             finish_reason: Some("stop".to_string()),
@@ -904,7 +926,7 @@ mod tests {
                 "SELECT purpose, agent_id, role, workspace, ticket_id, model, routing, \
                         input_tokens, output_tokens, cached_input_tokens, cache_miss_tokens, \
                         cost, cost_details, upstream_provider, system_fingerprint, \
-                        response_format, duration_ms, retry_attempts, finish_reason, \
+                        duration_ms, retry_attempts, finish_reason, \
                         failure_class, success \
                  FROM llm_requests WHERE agent_id = ?1",
                 crate::turso::params!["gui_alice_ws1_engineer"],
@@ -947,15 +969,14 @@ mod tests {
             row.get::<Option<String>>(14).expect("system_fingerprint"),
             Some("fp_44709d6fcb".to_string())
         );
-        assert_eq!(row.get::<i64>(15).expect("response_format"), 1);
-        assert_eq!(row.get::<i64>(16).expect("duration"), 1_234);
-        assert_eq!(row.get::<i64>(17).expect("attempts"), 2);
+        assert_eq!(row.get::<i64>(15).expect("duration"), 1_234);
+        assert_eq!(row.get::<i64>(16).expect("attempts"), 2);
         assert_eq!(
-            row.get::<Option<String>>(18).expect("finish"),
+            row.get::<Option<String>>(17).expect("finish"),
             Some("stop".to_string())
         );
-        assert_eq!(row.get::<Option<String>>(19).expect("failure_class"), None);
-        assert_eq!(row.get::<i64>(20).expect("success"), 1);
+        assert_eq!(row.get::<Option<String>>(18).expect("failure_class"), None);
+        assert_eq!(row.get::<i64>(19).expect("success"), 1);
         assert!(rows.next().is_none(), "only one row expected");
     }
 }

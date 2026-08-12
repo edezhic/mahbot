@@ -770,16 +770,6 @@ impl OpenAiCompatibleProvider {
             extra.insert("reasoning_effort".to_string(), serde_json::json!(effort));
         }
 
-        // JSON object output mode (verdict extraction). Request-level
-        // parameter only — message content is untouched, so provider-side
-        // KV-cache prefix reuse is preserved.
-        if request.response_format_json_object {
-            extra.insert(
-                "response_format".to_string(),
-                serde_json::json!({"type": "json_object"}),
-            );
-        }
-
         let payload = ChatCompletionRequest {
             model: request.model.clone(),
             messages: native,
