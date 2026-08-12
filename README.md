@@ -26,7 +26,7 @@ cd mahbot
 cargo run --release
 ```
 
-Then run `mahbot` to start the dashboard and configure your OpenRouter key in **Settings**. OpenRouter API key and the [`chrome-use`](https://github.com/leeguooooo/chrome-use) CLI (browser tool and link enrichment) are needed for full functionality — see [Prerequisites](#prerequisites) below. Also, the same binary can be run with `mahbot debug ...` to execute read-only SQL queries over the service's DBs, which is particularly useful for agents working on mahbot itself.
+Then run `mahbot` to start the dashboard and configure your OpenRouter key in **Settings**. OpenRouter API key and the [`chrome-use`](https://github.com/leeguooooo/chrome-use) CLI (browser tool and link enrichment) are needed for full functionality — see [Prerequisites](#prerequisites) below. Also, the same binary can be run with `mahbot debug ...` to execute read-only SQL queries over the service's DBs, which is particularly useful for agents working on mahbot itself. The debug CLI waits for the daemon's coordination lock state before opening any store (bounded polling; a live daemon in a transient state is waited out) and refuses with **exit code 2** when the wait times out — a second process holds the lock, retry later. Snapshot copies (only `db` + `-wal`, no `-tshm`) never block the gate and can be queried while the daemon runs.
 
 As of now mahbot is only regularly tested on macos, so it might have unexpected bugs on other platforms. However, all the core components are cross-platform so it should work just fine on windows & linux in the future.
 

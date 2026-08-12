@@ -1,13 +1,41 @@
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use futures_util::FutureExt;
+use std::fs::File;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::OnceCell;
-use tracing::warn;
+use tracing::{info, warn};
 use turso::Builder;
 pub(crate) use turso::{IntoParams, Row, Value, params};
+
+use crate::util::UnwrapPoison;
+
+/// Read `N` bytes at `offset` via a positional read (does not move the shared
+/// file offset and never opens/closes the file).
+#[cfg(unix)]
+pub(crate) fn pread_at<const N: usize>(file: &File, offset: u64) -> Option<[u8; N]> {
+    use std::os::unix::fs::FileExt;
+    let mut buf = [0u8; N];
+    file.read_exact_at(&mut buf, offset).ok()?;
+    Some(buf)
+}
+
+#[cfg(windows)]
+pub(crate) fn pread_at<const N: usize>(file: &File, offset: u64) -> Option<[u8; N]> {
+    use std::os::windows::fs::FileExt;
+    let mut buf = [0u8; N];
+    file.seek_read(&mut buf, offset).ok()?;
+    Some(buf)
+}
+
+/// Positional read from offset 0 — convenience for header-sized reads.
+pub(crate) fn pread<const N: usize>(file: &File) -> Option<[u8; N]> {
+    pread_at(file, 0)
+}
 
 // ── Timestamp helper ────────────────────────────────────────────────
 
@@ -321,20 +349,139 @@ pub(crate) fn sql_in_placeholders(count: usize) -> String {
     vec!["?"; count].join(", ")
 }
 
-/// Compatibility layer over Turso with a persistent connection.
+/// One sidecar file's identity check result (see [`PersistentSidecarFd::identity`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidecarIdentity {
+    /// fd held and its inode/device match a fresh `stat` of the path.
+    Matches,
+    /// No fd and no file (fresh store — the sidecar appears lazily on first
+    /// write and is then opened once via [`PersistentSidecarFd::ensure_open`]).
+    Absent,
+    /// The path no longer exists while an fd is held (unlinked by an external
+    /// process). The coordination predicate detects any resulting orphaned-WAL
+    /// state; checkpoints via the daemon's own fd are unaffected.
+    Deleted,
+    /// The path resolves to a different inode than the held fd — the file was
+    /// replaced by an external process. Callers suspend checkpoints/TRUNCATE
+    /// for the store (the identity result itself is the signal).
+    Replaced,
+}
+
+/// Persistent read-only fd to a store sidecar (`-tshm`/`-wal`), opened once
+/// when the file first exists and never closed.
 ///
-/// Every `execute` / `execute_batch` / `query` / `query_map` call reuses a
-/// single cached connection — eliminating the per-call overhead of
-/// `db.connect()` and preventing page-cache races that occur when concurrent
-/// read+write operations share a Limbo page cache.
+/// macOS fcntl locks are process-scoped: closing **any** fd to a file drops
+/// all of the process's locks on it. The daemon must therefore never open+
+/// close `.tshm` files after startup — that would silently release the byte-0
+/// lifetime lock and let a second process classify its open as `Exclusive`
+/// (triggering repair that wipes live reader slots). All coordination reads go
+/// through this fd via positional `pread`.
 ///
-/// All operations are serialized through an internal mutex to support
-/// concurrent access from multiple tasks (required for parallel tests).
+/// The fd's inode/device identity is compared against the path on each read
+/// (stat by path never opens the file); a mismatch means an external process
+/// replaced the file — consumers suspend destructive operations (checkpoints)
+/// on the store. When the store is recreated (logs quarantine path) the whole
+/// `Connection` is rebuilt, so the fd is naturally re-pointed at the new file.
 ///
-/// Dangling transactions (TxGuard dropped without commit/rollback) are handled
-/// via a deferred rollback pattern: the flag is set in Drop and the actual
-/// ROLLBACK is executed at the start of the next write operation on any clone
-/// of this Connection.
+/// A sidecar that does not exist yet (turso creates `-wal`/`-tshm` lazily on
+/// first write) is re-pointed once by [`ensure_open`](Self::ensure_open) when
+/// it appears; until then reads fall back to path-based access (counted by the
+/// daemon's open+close regression counter).
+#[derive(Debug)]
+pub(crate) struct PersistentSidecarFd {
+    path: std::path::PathBuf,
+    /// Opened on first appearance, never closed (see struct docs).
+    file: std::sync::OnceLock<File>,
+    /// Serializes the one-time lazy open — a second transient fd on a
+    /// coordination file must never be created and dropped (that drop would
+    /// release the process's fcntl locks on it).
+    open_lock: std::sync::Mutex<()>,
+}
+
+impl PersistentSidecarFd {
+    /// Open the sidecar `db_path + suffix` read-only. No fd when the file does
+    /// not exist yet (fresh store before first write; [`ensure_open`] re-points
+    /// once it appears).
+    fn open(db_path: &Path, suffix: &str) -> Self {
+        let path = std::path::PathBuf::from(format!("{}{suffix}", db_path.display()));
+        let file = std::sync::OnceLock::new();
+        if let Ok(f) = std::fs::File::open(&path) {
+            let _ = file.set(f);
+        }
+        Self {
+            path,
+            file,
+            open_lock: std::sync::Mutex::new(()),
+        }
+    }
+
+    /// Lazy one-time re-point: open the persistent fd when the sidecar file
+    /// first appears (serialized — see [`PersistentSidecarFd`]).
+    fn ensure_open(&self) {
+        if self.file.get().is_some() {
+            return;
+        }
+        let _guard = self.open_lock.lock().unwrap_poison();
+        if self.file.get().is_some() {
+            return; // another thread re-pointed first
+        }
+        if let Ok(f) = std::fs::File::open(&self.path) {
+            let _ = self.file.set(f); // cannot fail under the lock
+        }
+    }
+
+    /// The persistent fd, when the sidecar file exists.
+    pub(crate) fn file(&self) -> Option<&File> {
+        self.file.get()
+    }
+
+    /// Re-check the persistent fd's inode/device against a fresh `stat` of the
+    /// path. `Absent` is silent (fresh store — no fd to compare); `Deleted`
+    /// and `Replaced` are external-interference conditions (only `Replaced`
+    /// means the fd reads a stale inode — the caller suspends checkpoints).
+    #[must_use]
+    pub(crate) fn identity(&self) -> SidecarIdentity {
+        self.ensure_open();
+        let Some(file) = self.file.get() else {
+            return SidecarIdentity::Absent;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let Ok(fd_meta) = file.metadata() else {
+                return SidecarIdentity::Deleted;
+            };
+            let Ok(path_meta) = std::fs::metadata(&self.path) else {
+                return SidecarIdentity::Deleted; // path unlinked
+            };
+            if fd_meta.dev() == path_meta.dev() && fd_meta.ino() == path_meta.ino() {
+                return SidecarIdentity::Matches;
+            }
+            SidecarIdentity::Replaced
+        }
+        #[cfg(not(unix))]
+        {
+            // The inode/device replacement detector guards the macOS
+            // process-scoped fcntl-lock vector; other platforms have no such
+            // lock-drop mechanism.
+            SidecarIdentity::Matches
+        }
+    }
+}
+
+/// One store's coordination-file read sources for wal-guard inspection.
+pub(crate) type StoreFds<'a> = crate::wal_guard::StoreFds<'a>;
+
+/// A serialized handle to a turso connection with persistent sidecar fds.
+///
+/// Mutex-serializes concurrent access (turso connections do not support
+/// concurrent operations) and tracks a dangling transaction: when a
+/// [`TxGuard`] is dropped without explicit commit/rollback, the flag is set
+/// and the next write operation rolls it back first (mirrors the upstream
+/// `turso::Connection::dangling_tx` pattern at wrapper level, avoiding async
+/// in `Drop`). The persistent sidecar fds (see [`PersistentSidecarFd`]) are
+/// opened once at store open and never closed — the daemon-side open+close
+/// of `.tshm`/`-wal` is what drops the macOS process-scoped fcntl locks.
 #[derive(Clone, Debug)]
 pub(crate) struct Connection {
     /// Persistent turso connection — reused for all execute/query calls.
@@ -346,6 +493,46 @@ pub(crate) struct Connection {
     /// Mirrors the upstream `turso::Connection::dangling_tx` pattern but
     /// works at our wrapper level so we don't need async in Drop.
     has_dangling_tx: Arc<AtomicBool>,
+    /// Persistent read-only fds to the store's `-tshm`/`-wal` sidecars —
+    /// opened once, never closed (see [`PersistentSidecarFd`]).
+    tshm_fd: Arc<PersistentSidecarFd>,
+    wal_fd: Arc<PersistentSidecarFd>,
+}
+
+impl Connection {
+    /// The persistent sidecar fds for wal-guard inspection (lazily re-pointed
+    /// when a sidecar appears after the store open).
+    #[must_use]
+    pub(crate) fn store_fds(&self) -> StoreFds<'_> {
+        self.tshm_fd.ensure_open();
+        self.wal_fd.ensure_open();
+        StoreFds {
+            tshm: self.tshm_fd.file(),
+            wal: self.wal_fd.file(),
+        }
+    }
+
+    /// Re-check the sidecar identities and return the worst non-matching
+    /// condition (`Replaced` > `Deleted`), or `None` when both sidecars match
+    /// or are absent. The caller throttles the announcement (the wal-guard
+    /// loop re-announces on the class-warning schedule); `Replaced` means the
+    /// persistent fds read stale inodes and checkpoints must be suspended.
+    #[must_use]
+    pub(crate) fn check_coordination_identity(&self) -> Option<SidecarIdentity> {
+        let mut worst = None;
+        for fd in [&self.tshm_fd, &self.wal_fd] {
+            match fd.identity() {
+                SidecarIdentity::Matches | SidecarIdentity::Absent => {}
+                SidecarIdentity::Deleted => {
+                    if worst != Some(SidecarIdentity::Replaced) {
+                        worst = Some(SidecarIdentity::Deleted);
+                    }
+                }
+                SidecarIdentity::Replaced => worst = Some(SidecarIdentity::Replaced),
+            }
+        }
+        worst
+    }
 }
 
 /// Message prefix of a known Limbo integrity_check false positive.
@@ -359,6 +546,47 @@ pub(crate) struct Connection {
 /// or renames internals.
 const KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE: &str =
     "wrong # of entries in index __turso_internal_fts_dir_";
+
+/// Name prefix of the internal FTS backing index (never a class-B repair
+/// target — FTS-rebuild is out of scope; the repair guard matches the
+/// extracted index name against this, not the full message prefix).
+const FTS_INTERNAL_INDEX_PREFIX: &str = "__turso_internal_fts_dir_";
+
+/// `sqlite_master` filter for user-owned objects: excludes the engine's own
+/// tables (`sqlite_%`) and turso's protected `__turso_internal_%`
+/// (AUTOINCREMENT seq backing, FTS dir) — those reject user writes and are
+/// recreated by the DDL replay. Shared by the rebuild's counts enumeration and
+/// DDL replay so the two cannot drift.
+const USER_OBJECT_FILTER: &str = "name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%'";
+
+/// Best-effort removal of a rebuild temp family (main + sidecars).
+fn remove_rebuild_temp(temp: &Path) {
+    let _ = std::fs::remove_file(temp);
+    let _ = std::fs::remove_file(format!("{}-wal", temp.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", temp.display()));
+    let _ = std::fs::remove_file(format!("{}-tshm", temp.display()));
+}
+
+/// RAII cleanup of the rebuild temp family: every exit from the migration —
+/// including a turso panic mid-copy (the documented pager-OOB class) —
+/// removes the temp main + sidecars. The panic fallback in open_store
+/// (recreate on the Healthy arm, propagate/retry on the other arms) discards
+/// the fully-read migrated data either way — the accepted panic trade-off.
+struct TempCleanup<'a>(&'a Path);
+impl Drop for TempCleanup<'_> {
+    fn drop(&mut self) {
+        remove_rebuild_temp(self.0);
+    }
+}
+
+/// True when a `quick_check`/`integrity_check` message names the internal FTS
+/// backing index — either the known count-mismatch false positive or any
+/// other problem row about that index (the row-level scan masks only the exact
+/// count-mismatch message; this is the broader never-REINDEX-the-FTS guard).
+#[must_use]
+pub(crate) fn known_fts_dir_false_positive(message: &str) -> bool {
+    message.contains(FTS_INTERNAL_INDEX_PREFIX)
+}
 
 /// Map each row in a slice through a fallible closure, collecting into a
 /// `Vec<turso::Result<T>>` with per-row error conversion.
@@ -393,9 +621,16 @@ impl Connection {
             .context("failed to open local database")?;
         let conn = db.connect()?;
         conn.busy_timeout(Duration::from_mins(1))?;
+        // Open the persistent sidecar fds AFTER turso's open (which creates
+        // the .tshm on first use). These fds are never closed for the
+        // process lifetime — see PersistentSidecarFd.
+        let tshm_fd = Arc::new(PersistentSidecarFd::open(path, "-tshm"));
+        let wal_fd = Arc::new(PersistentSidecarFd::open(path, "-wal"));
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
             has_dangling_tx: Arc::new(AtomicBool::new(false)),
+            tshm_fd,
+            wal_fd,
         })
     }
 
@@ -615,17 +850,23 @@ impl Connection {
     /// Lightweight (~10ms on a healthy store) and read-only — safe to call
     /// periodically while the system is running.
     pub async fn quick_check(&self) -> anyhow::Result<()> {
+        if let Some(problem) = self.quick_check_problems().await?.into_iter().next() {
+            anyhow::bail!("Database integrity check failed: {problem}");
+        }
+        Ok(())
+    }
+
+    /// All `quick_check` problem rows (the known FTS false positive filtered
+    /// out) — unlike [`Self::quick_check`], which bails on the first problem.
+    /// The class-B repair needs the full list: an overflow-aliasing row
+    /// anywhere in the scan must veto the REINDEX even when an earlier row
+    /// names an index desync.
+    pub(crate) async fn quick_check_problems(&self) -> anyhow::Result<Vec<String>> {
         let rows = self
             .query("PRAGMA quick_check;", ())
             .await
             .context("Failed to execute PRAGMA quick_check")?;
-        if let Some(problem) = scan_integrity_rows(&rows, "quick_check")?
-            .into_iter()
-            .next()
-        {
-            anyhow::bail!("Database integrity check failed: {problem}");
-        }
-        Ok(())
+        scan_integrity_rows(&rows, "quick_check")
     }
 
     /// Run PRAGMA integrity_check to produce a complete diagnostic report.
@@ -646,6 +887,14 @@ impl Connection {
     /// Fails if the SQL statement itself fails (e.g., severe corruption that
     /// prevents even diagnostic queries from executing), or if any row value
     /// has an unexpected type.
+    ///
+    /// The periodic full-integrity escalation was deliberately removed (an
+    /// accepted observability regression — the known FTS false positive makes
+    /// it noise); this remains available on demand via `mahbot debug`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Available on demand; referenced by tests")
+    )]
     pub async fn integrity_check(&self) -> anyhow::Result<Vec<String>> {
         let rows = self
             .query("PRAGMA integrity_check;", ())
@@ -905,19 +1154,1273 @@ pub(crate) fn store_sidecars(db_path: &Path) -> StoreSidecars {
     }
 }
 
+/// Resource/permission keywords shared by the error classifiers: actionable
+/// signals (never corruption) — ENOSPC/EMFILE/OOM/permission must not trigger
+/// a quarantine. One base predicate keeps the two classifiers from drifting.
+const RESOURCE_SIGNAL_KEYWORDS: [&str; 4] = [
+    "no space left on device",
+    "too many open files",
+    "out of memory",
+    "permission denied",
+];
+
+fn has_resource_signal(lower: &str) -> bool {
+    RESOURCE_SIGNAL_KEYWORDS.iter().any(|k| lower.contains(k))
+}
+
+/// True when a `quick_check`/open failure is corruption-class rather than a
+/// busy/locked/IO failure of the PRAGMA itself.
+///
+/// Two forms qualify: the PRAGMA returned a non-`ok` row (our
+/// `Database integrity check failed` bail), or the PRAGMA failed to execute
+/// with a message that is not a lock/busy, I/O, or resource condition (e.g. a
+/// page-level error reading a zeroed page — `Invalid page type`). Only
+/// corruption-class failures quarantine — a busy or locked store must never
+/// trigger the rename path, and ENOSPC/EMFILE are actionable signals, never
+/// corruption (the unified guarded-open path must not quarantine on them).
+/// Unknown messages classify as corruption (fail-closed): a novel turso error
+/// string at boot could trigger a recreate the matrix does not justify.
+/// Accepted trade-off — genuine corruption must not pass as an actionable
+/// signal; reclassify new strings as they surface.
+pub(crate) fn is_corruption_class(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}");
+    if msg.contains("Database integrity check failed") {
+        return true;
+    }
+    let lower = msg.to_lowercase();
+    !(has_resource_signal(&lower)
+        || lower.contains("busy")
+        || lower.contains("locked")
+        || lower.contains("i/o error")
+        || lower.contains("no such file"))
+}
+
+/// True when a heal-phase failure is an actionable resource/permission
+/// condition: ENOSPC/EMFILE/OOM must never trigger a quarantine (they are
+/// signals, not corruption — the boot-heal path propagates them instead of
+/// recreating). Persistent busy, I/O errors, and unreadable states are
+/// recreate candidates, so only this narrow set propagates.
+fn is_actionable_signal(e: &anyhow::Error) -> bool {
+    has_resource_signal(&format!("{e:#}").to_lowercase())
+}
+
+/// Marker wrapping a fresh-store open failure after the boot-heal path already
+/// quarantined the original family. The outer quarantine (logs path) must not
+/// run again on this error — the fresh store is not corrupt, the recreate
+/// itself failed.
+#[derive(Debug)]
+pub(crate) struct RecreateFailed(pub anyhow::Error);
+
+impl std::fmt::Display for RecreateFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fresh store open failed after quarantine: {}", self.0)
+    }
+}
+
+impl std::error::Error for RecreateFailed {}
+
 /// Open a store database under `<root>/db/<name>.db`.
 ///
 /// Creates parent directories if needed and runs the provided `schema` via
 /// [`open_with_schema`].  This is a convenience helper for the near-identical
 /// [`open`] methods on each store module, keeping the DB filename and path
 /// construction centralised in one place.
+///
+/// During daemon boot (when a pre-flight diagnosis exists for `name`), the
+/// open runs the per-store heal strategy derived by the pre-flight:
+/// TRUNCATE-first for stale-tail, PASSIVE-first + TRUNCATE for durable-B,
+/// quarantine + recreate for structural damage, and class-B btree-index repair
+/// after the open. Every diagnosed open is panic-absorbed (turso's own reopen
+/// of a damaged-coordination store can panic; boot must never fail because of
+/// a damaged store): heal-phase panics and errors recreate, while post-heal
+/// standard-open panics propagate loudly (recreate is not justified for a
+/// store whose data was just preserved). Outside the boot flow (tests, CLI)
+/// the diagnosis map is empty and this behaves exactly like
+/// [`open_with_schema`].
 pub(crate) async fn open_store(
     root: &Path,
     name: &str,
     schema: &str,
 ) -> anyhow::Result<Connection> {
     let db_path = store_db_path(root, name);
-    open_with_schema(&db_path, schema).await
+    let Some(diagnosis) = crate::wal_guard::take_boot_diagnosis(&db_path) else {
+        return open_with_schema(&db_path, schema).await;
+    };
+
+    match diagnosis {
+        crate::wal_guard::BootDiagnosis::BlockedCoordination => {
+            // Pre-open intent: the coordination state blocks a safe reopen
+            // (orphaned/foreign/truncated WAL) — no heal; the open proceeds
+            // panic-absorbed and turso's own reopen rebuilds the `.tshm` from
+            // the WAL, after which the predicate sees Healthy again (the
+            // "blocked" state applies to the checkpoint loop only while the
+            // store is closed). turso's reopen of a truncated/foreign WAL can
+            // panic (wal.rs monotonicity, pager OOB — the documented prod
+            // class). Detect-and-continue on the intact main DB: move only
+            // the broken coordination sidecars aside and retry; full recreate
+            // is the last resort.
+            //
+            // Error asymmetry vs the healable arm: non-corruption-class open
+            // errors (busy/I-O/resource) here propagate raw (failing boot)
+            // rather than recreating — corruption-class errors already
+            // recreate inside `open_and_repair`, and a plain failure would
+            // discard the intact main DB's data.
+            let result = AssertUnwindSafe(open_and_repair(&db_path, name, schema))
+                .catch_unwind()
+                .await;
+            match result {
+                Ok(Ok(conn)) => Ok(conn),
+                Ok(Err(e)) => Err(e),
+                Err(payload) => {
+                    retry_after_coordination_panic(&db_path, name, schema, &panic_err(&*payload))
+                        .await
+                }
+            }
+        }
+        crate::wal_guard::BootDiagnosis::Healthy => {
+            // Healthy coordination + open panic is a main-DB content issue
+            // (pager OOB), not a coordination one — the sidecar-only
+            // quarantine path would discard -wal durability while the
+            // "intact main DB" premise is contradicted by the panic itself.
+            // Recreate (the incurable path).
+            let result = AssertUnwindSafe(open_and_repair(&db_path, name, schema))
+                .catch_unwind()
+                .await;
+            match result {
+                Ok(Ok(conn)) => Ok(conn),
+                Ok(Err(e)) => Err(e),
+                Err(payload) => {
+                    recreate_after_failed_heal(&db_path, name, schema, &panic_err(&*payload)).await
+                }
+            }
+        }
+        healable @ (crate::wal_guard::BootDiagnosis::StaleTail
+        | crate::wal_guard::BootDiagnosis::DurableB) => {
+            // Phase 1: the heal connection's own open — the risky reopen of
+            // damaged coordination. A panic or persistent error (e.g. busy)
+            // here is a recreate candidate — but only for corruption-
+            // class failures: ENOSPC/EMFILE are actionable signals and must
+            // never trigger a quarantine.
+            let healed = AssertUnwindSafe(heal_checkpoint_sequence(&db_path, name, healable))
+                .catch_unwind()
+                .await;
+            match healed {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    // Persistent heal failure (busy after retries, I/O,
+                    // unreadable) is a recreate candidate per the heal
+                    // fallback; only actionable resource conditions
+                    // (ENOSPC/EMFILE/OOM/permission) propagate as signals.
+                    if is_actionable_signal(&e) {
+                        return Err(e);
+                    }
+                    return recreate_after_failed_heal(&db_path, name, schema, &e).await;
+                }
+                Err(payload) => {
+                    return recreate_after_failed_heal(
+                        &db_path,
+                        name,
+                        schema,
+                        &panic_err(&*payload),
+                    )
+                    .await;
+                }
+            }
+            // Phase 2: standard open + schema + class-B repair. The heal
+            // succeeded — a panic here is not a heal failure and recreate is
+            // not justified (recreate only for heal-phase failures and
+            // structural/unreadable states); propagate loudly.
+            let result = AssertUnwindSafe(open_and_repair(&db_path, name, schema))
+                .catch_unwind()
+                .await;
+            match result {
+                Ok(Ok(conn)) => Ok(conn),
+                Ok(Err(e)) => Err(e),
+                Err(payload) => Err(anyhow::anyhow!(
+                    "post-heal open of store '{name}' panicked: {}",
+                    crate::util::panic_message(&*payload)
+                )),
+            }
+        }
+        crate::wal_guard::BootDiagnosis::Structural => {
+            crate::boot::boot_diagnostic(format!(
+                "store '{name}' structurally damaged (pre-flight diagnosis) — \
+                 quarantining and recreating",
+            ));
+            // The recreate path tolerates a partial quarantine (un-moved
+            // files stay in place) — the bool is intentionally ignored.
+            let _ = quarantine_store_artifacts(&db_path);
+            // Fresh store: open_with_schema directly — open_and_repair's
+            // schema-error path would quarantine the fresh store a second
+            // time (opposite policy of the logs path). Marker: the original
+            // family is already quarantined — a further quarantine (logs
+            // outer path) would move the fresh store.
+            let result = AssertUnwindSafe(open_with_schema(&db_path, schema))
+                .catch_unwind()
+                .await;
+            match result {
+                Ok(Ok(conn)) => Ok(conn),
+                Ok(Err(e)) => Err(anyhow::anyhow!(RecreateFailed(e))),
+                Err(payload) => Err(anyhow::anyhow!(RecreateFailed(anyhow::anyhow!(
+                    "recreated store '{name}' open panicked: {}",
+                    crate::util::panic_message(&*payload)
+                )))),
+            }
+        }
+    }
+}
+
+/// Format a catch_unwind panic payload into a store-open error.
+fn panic_err(payload: &(dyn std::any::Any + Send)) -> anyhow::Error {
+    anyhow::anyhow!(
+        "store open panicked: {}",
+        crate::util::panic_message(payload)
+    )
+}
+
+/// Detect-and-continue fallback after a BlockedCoordination open panic:
+/// turso's reopen of a truncated/foreign WAL can panic (wal.rs monotonicity,
+/// pager OOB — the documented prod class). Move only the broken coordination
+/// sidecars aside and retry on the intact main DB; full recreate is the last
+/// resort.
+///
+/// The whole `-wal` is moved aside, including for the Oversized class where it
+/// holds valid committed frames up to max_frame that a PASSIVE-first heal
+/// would preserve — asymmetric with the healable arms, but only reachable via
+/// a reopen panic (which signals deeper damage than a plain oversized tail).
+///
+/// The sidecar quarantine happens before the retry: an actionable-signal
+/// failure of the retry open (ENOSPC/EMFILE/permission) propagates with the
+/// coordination sidecars already quarantined while the main DB is preserved —
+/// the `-wal`'s uncheckpointed frames are lost in that scenario (inherent to
+/// the panic path that precedes it).
+async fn retry_after_coordination_panic(
+    db_path: &Path,
+    name: &str,
+    schema: &str,
+    reason: &anyhow::Error,
+) -> anyhow::Result<Connection> {
+    crate::boot::boot_diagnostic(format!(
+        "store '{name}' open panicked ({reason}) — quarantining coordination \
+         sidecars and retrying on the intact main DB",
+    ));
+    // The recreate path tolerates a partial quarantine — the bool is
+    // intentionally ignored.
+    let _ = quarantine_coordination_sidecars(db_path);
+    let retry = AssertUnwindSafe(open_with_schema(db_path, schema))
+        .catch_unwind()
+        .await;
+    match retry {
+        Ok(Ok(conn)) => Ok(conn),
+        Ok(Err(e)) => {
+            // Actionable resource conditions (ENOSPC/EMFILE/permission) must
+            // never quarantine the family — the main DB is intact here, so
+            // propagate the signal; anything else (busy after retries, I/O,
+            // unreadable, corruption) recreates.
+            if is_actionable_signal(&e) {
+                return Err(e);
+            }
+            recreate_after_failed_heal(db_path, name, schema, &e).await
+        }
+        Err(p) => recreate_after_failed_heal(db_path, name, schema, &panic_err(&*p)).await,
+    }
+}
+
+/// Outcome of the class-B btree-index repair.
+enum RepairOutcome {
+    /// No recreate needed: quick_check passed, or a report-only condition
+    /// (unknown signature / failed in-place repair / aborted migration left
+    /// for operator review). The store opens normally either way.
+    NoRepair,
+    /// REINDEX (or the DROP+CREATE fallback) cleared the desync.
+    Repaired,
+    /// Overflow-aliasing: the store's data was rebuilt in a fresh file and
+    /// swapped into place (the in-file DROP of the aliased b-trees would
+    /// double-free the shared overflow page and re-corrupt the freelist).
+    /// The returned connection is the reopened, verified store.
+    Migrated,
+    /// The table is unreadable (quick_check scan failure) — recreate is
+    /// justified per the recreate matrix.
+    Unreadable,
+}
+
+/// Open with the schema, then run the class-B btree-index repair (boot path
+/// only — single-writer, exclusive access, wal-guard not yet started). This
+/// runs a full quick_check on every store at every boot (7× full-DB scans,
+/// plus a verification scan after a repair) — the fixed boot cost of the
+/// repair-at-init design.
+async fn open_and_repair(db_path: &Path, name: &str, schema: &str) -> anyhow::Result<Connection> {
+    let conn = match open_with_schema(db_path, schema).await {
+        Ok(conn) => conn,
+        Err(e) if is_corruption_class(&e) => {
+            // Schema application choked on a corrupt table (e.g. CREATE INDEX
+            // scans it and hits "Invalid page type") — unreadable table,
+            // recreate justified.
+            return recreate_after_failed_heal(db_path, name, schema, &e).await;
+        }
+        Err(e) => return Err(e),
+    };
+    match repair_btree_index_if_desynced(conn, db_path, name, schema).await {
+        Ok((RepairOutcome::Unreadable, conn)) => {
+            drop(conn); // release the fds before the family rename
+            recreate_after_failed_heal(
+                db_path,
+                name,
+                schema,
+                &anyhow::anyhow!("class-B unreadable table — recreate justified"),
+            )
+            .await
+        }
+        Ok((_, conn)) => Ok(conn),
+        // An actionable quick_check failure (ENOSPC/EMFILE/permission)
+        // propagated from the repair — never a recreate trigger.
+        Err(e) => Err(e),
+    }
+}
+
+/// The baked overflow-aliasing signature: a prior REINDEX/DROP+CREATE on a
+/// store whose index leaves shared an overflow page left the page doubly on
+/// the freelist, so a later allocation reuses it as both a b-tree page and an
+/// overflow chain; reading that chain yields this exact short-read on every
+/// scan. The table stays readable there — table-rebuild in place applies,
+/// recreate (data loss) is not justified.
+const BAKED_OVERFLOW_ALIASING_READ: &str = "short read on page 167772160";
+
+/// What the class-B repair should do given the full quick_check problem list.
+enum RepairTarget {
+    /// The table cannot be scanned ("Invalid page type"/"short read") —
+    /// recreate is justified.
+    Unreadable,
+    /// Shared overflow pages between index leaves (fresh "Page N referenced
+    /// multiple times" or the baked short-read) — never REINDEX (bakes a
+    /// worse error); rebuild the store data-preservingly.
+    OverflowAliasing,
+    /// A specific non-FTS btree index is desynced — in-place repair.
+    Index(String),
+    /// No recognizable signature — report only.
+    Unknown,
+}
+
+/// Classify the full quick_check problem list for the class-B repair.
+///
+/// Ordering is deliberate and structural: unreadable-table signatures win
+/// over everything (the table cannot be scanned at all); overflow-aliasing
+/// anywhere in the list vetoes the REINDEX even when an earlier row names an
+/// index desync (quick_check can surface both in one scan — the veto must not
+/// depend on row order). The baked short-read (page 0x0A000000) is an
+/// overflow-aliasing marker, not a table-read failure — the generic short-read
+/// check comes after it.
+fn classify_repair_target(problems: &[String]) -> RepairTarget {
+    if problems.iter().any(|p| p.contains("Invalid page type")) {
+        RepairTarget::Unreadable
+    } else if problems.iter().any(|p| {
+        p.contains("referenced multiple times") || p.contains(BAKED_OVERFLOW_ALIASING_READ)
+    }) {
+        RepairTarget::OverflowAliasing
+    } else if problems.iter().any(|p| p.contains("short read")) {
+        RepairTarget::Unreadable
+    } else {
+        match problems.iter().find_map(|p| desynced_index_name(p)) {
+            Some(index) => RepairTarget::Index(index.to_string()),
+            None => RepairTarget::Unknown,
+        }
+    }
+}
+
+/// Class-B btree-index desync repair: `quick_check` names a specific
+/// non-FTS index → REINDEX in place, DROP+CREATE as the fallback (both
+/// validated on the 324MB prod sessions copy — both M>N and M<N desync forms,
+/// survives reopen and TRUNCATE). Returns `Ok(([`RepairOutcome`], conn))`; an
+/// actionable quick_check failure (ENOSPC/EMFILE/permission) propagates as
+/// `Err` — it is a signal, never a recreate trigger.
+///
+/// Preconditions are satisfied by construction at boot: single-writer,
+/// exclusive access, the WAL frame index already healed/reset (fi_len==maxf),
+/// and a snapshot copy (db + wal, no tshm) taken before the REINDEX. The
+/// overflow-aliasing signature ("referenced multiple times" / shared overflow
+/// pages, fresh or baked as "short read on page 167772160") is **never**
+/// REINDEXed — that bakes a worse error; the store is rebuilt
+/// data-preservingly instead (see [`migrate_overflow_aliased_store`]).
+/// Unreadable tables surface as quick_check scan failures ("Invalid page
+/// type"/"short read") and fall through to the recreate path.
+async fn repair_btree_index_if_desynced(
+    conn: Connection,
+    db_path: &Path,
+    name: &str,
+    schema: &str,
+) -> anyhow::Result<(RepairOutcome, Connection)> {
+    // All problem rows, not just the first: quick_check can surface a named
+    // index desync in one row and overflow-aliasing in another — the
+    // overflow-aliasing veto must hold regardless of row order.
+    let problems = match conn.quick_check_problems().await {
+        Ok(p) if p.is_empty() => return Ok((RepairOutcome::NoRepair, conn)),
+        Ok(p) => p,
+        Err(e) => {
+            // The quick_check itself failed to run — an actionable resource
+            // condition (ENOSPC/EMFILE/permission) is a signal, never a
+            // recreate trigger; propagate it like the heal-phase arm.
+            if is_actionable_signal(&e) {
+                return Err(e);
+            }
+            crate::boot::boot_diagnostic(format!(
+                "store '{name}' quick_check could not run: {e} — unreadable table, \
+                 recreate justified",
+            ));
+            return Ok((RepairOutcome::Unreadable, conn));
+        }
+    };
+    let index = match classify_repair_target(&problems) {
+        RepairTarget::Unreadable => {
+            crate::boot::boot_diagnostic(format!(
+                "store '{name}' quick_check cannot scan a table ({}) — unreadable table, \
+                 recreate justified",
+                problems.join("; "),
+            ));
+            return Ok((RepairOutcome::Unreadable, conn));
+        }
+        // Overflow-aliasing (shared overflow pages between index leaves) must
+        // NEVER be REINDEXed — that bakes a worse error ("short read on
+        // page …"). Structural veto: checked across the whole problem list.
+        RepairTarget::OverflowAliasing => {
+            crate::boot::boot_diagnostic(format!(
+                "store '{name}' quick_check reports overflow-aliasing ({}) — rebuilding \
+                 the store data-preservingly in a fresh file",
+                problems.join("; "),
+            ));
+            return migrate_overflow_aliased_store(conn, db_path, name, schema).await;
+        }
+        RepairTarget::Unknown => {
+            crate::boot::boot_diagnostic(format!(
+                "store '{name}' quick_check flagged an unknown condition: {}",
+                problems.join("; "),
+            ));
+            return Ok((RepairOutcome::NoRepair, conn));
+        }
+        RepairTarget::Index(index) => {
+            // Belt-and-braces: unreachable today (`scan_integrity_rows` filters
+            // the exact FTS count-mismatch row before this list is built), but
+            // never REINDEX the out-of-scope FTS internal index if a future
+            // filter change lets it through.
+            if known_fts_dir_false_positive(&index) {
+                crate::boot::boot_diagnostic(format!(
+                    "store '{name}' quick_check flagged the known FTS false positive — \
+                     not repairing",
+                ));
+                return Ok((RepairOutcome::NoRepair, conn));
+            }
+            index
+        }
+    };
+    // Forensic snapshot (db + wal, no tshm) before the in-place repair.
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let pid = std::process::id();
+    let snap = std::path::PathBuf::from(format!("{}.pre-reindex-{stamp}-{pid}", db_path.display()));
+    let sidecars = store_sidecars(db_path);
+    for (src, suffix) in [(db_path, ""), (&sidecars.wal, "-wal")] {
+        if let Err(e) = std::fs::copy(
+            src,
+            std::path::PathBuf::from(format!("{}{suffix}", snap.display())),
+        ) {
+            warn!(
+                error = %e,
+                from = %src.display(),
+                "Failed to copy pre-reindex snapshot",
+            );
+        }
+    }
+    // REINDEX is planner-safe under multiprocess_wal (it rewrites the index
+    // btree in place). Quoting: identifiers may contain special characters.
+    let quoted = index.replace('"', "\"\"");
+    if conn
+        .execute_batch(&format!("REINDEX \"{quoted}\";"))
+        .await
+        .is_ok()
+        && conn.quick_check().await.is_ok()
+    {
+        info!(
+            db = %name,
+            index = %index,
+            "class-B btree index desync repaired in place (REINDEX)",
+        );
+        return Ok((RepairOutcome::Repaired, conn));
+    }
+    crate::boot::boot_diagnostic(format!(
+        "store '{name}' REINDEX of '{index}' did not clear the quick_check desync — \
+         falling back to DROP+CREATE",
+    ));
+    Ok((
+        drop_create_index_fallback(&conn, name, &index, &quoted).await,
+        conn,
+    ))
+}
+
+/// Overflow-aliasing repair: rebuild the store's data in a fresh sibling file,
+/// verify it, then swap it into place. The in-file alternative (DROP the
+/// aliased b-trees and recreate) double-frees the shared overflow page — the
+/// free-walk frees it once per referencing leaf — corrupting the freelist, so
+/// the rebuilt store re-aliases on the next allocation (the "baked short read"
+/// mechanism). A fresh file is the only path that verifies clean (index valid,
+/// data intact).
+///
+/// Preconditions hold at boot: single-writer, exclusive access, wal-guard and
+/// the periodic checkpoint loop not yet started. The original family is
+/// quarantined (renamed aside, never deleted — the forensic record) before the
+/// swap, satisfying the recreate-path preservation guarantee. Returns
+/// `Ok(([`RepairOutcome::Migrated`], reopened))` on success; aborts as
+/// `NoRepair` (report-only) on a constraint violation during the data copy —
+/// a data-integrity finding, not corruption, and never a silent recreate — or
+/// on any other non-actionable failure (the original store is preserved).
+/// An unreadable table surfaces as `Unreadable` (recreate justified).
+/// Actionable resource conditions (ENOSPC/EMFILE/permission) propagate as
+/// `Err` — they must never trigger a quarantine.
+#[allow(clippy::too_many_lines)] // one linear boot-repair flow, split across helpers
+async fn migrate_overflow_aliased_store(
+    conn: Connection,
+    db_path: &Path,
+    name: &str,
+    schema: &str,
+) -> anyhow::Result<(RepairOutcome, Connection)> {
+    // ── Precondition: fi_len == maxf, else TRUNCATE-checkpoint first ──
+    let status = crate::wal_guard::inspect_store_at(db_path, conn.store_fds());
+    if let Some(h) = status.tshm
+        && u64::from(h.frame_index_len) != h.max_frame
+    {
+        crate::boot::boot_diagnostic(format!(
+            "store '{name}' WAL frame index (len={}) does not match max_frame ({}) — \
+             TRUNCATE-checkpoint first in the single-writer window",
+            h.frame_index_len, h.max_frame,
+        ));
+        match conn.checkpoint().await {
+            Ok(o) if o.is_complete() => {}
+            // Incomplete (busy / frames remaining) is the same precondition
+            // failure as an error — the WAL cannot be reset in the
+            // single-writer window.
+            Ok(o) => {
+                crate::boot::boot_diagnostic(format!(
+                    "store '{name}' pre-rebuild TRUNCATE checkpoint incomplete \
+                     (busy={}, {} of {} frames) — recreate justified",
+                    o.busy, o.checkpointed_frames, o.log_frames,
+                ));
+                return Ok((RepairOutcome::Unreadable, conn));
+            }
+            Err(e) if is_actionable_signal(&e) => return Err(e),
+            // The WAL precondition cannot be met — recreate is justified here
+            // (unlike a table-enumeration failure): quarantine + fresh open
+            // clears a stuck WAL, so this is a recovery, not data loss.
+            Err(e) => {
+                crate::boot::boot_diagnostic(format!(
+                    "store '{name}' pre-rebuild TRUNCATE checkpoint failed: {e} — \
+                     recreate justified",
+                ));
+                return Ok((RepairOutcome::Unreadable, conn));
+            }
+        }
+    }
+
+    // ── Readability + row-count per user table (quick_check does not name
+    // the aliased index, so every table's read is gated; unreadable →
+    // recreate). `__turso_internal_%` tables reject user writes and are
+    // recreated by the DDL replay — excluded from the copy + verification.
+    let mut counts: Vec<(String, i64)> = Vec::new();
+    let tables = match conn
+        .query(
+            &format!(
+                "SELECT name FROM sqlite_master WHERE type='table' \
+                 AND {USER_OBJECT_FILTER} ORDER BY rowid"
+            ),
+            (),
+        )
+        .await
+    {
+        Ok(t) => t,
+        // A table-enumeration failure is an engine-level read problem, not
+        // proof the data is unreadable — report-only (conservative, no data
+        // loss), unlike the checkpoint precondition below which recreate
+        // clears.
+        Err(e) => {
+            let err = anyhow::anyhow!(e);
+            if is_actionable_signal(&err) {
+                return Err(err);
+            }
+            crate::boot::boot_diagnostic(format!(
+                "store '{name}' cannot enumerate tables for the rebuild: {err} — left \
+                 for operator review",
+            ));
+            return Ok((RepairOutcome::NoRepair, conn));
+        }
+    };
+    for t in &tables {
+        let tbl = match t.get::<String>(0) {
+            Ok(tbl) => tbl,
+            // sqlite_master.name is always TEXT — a non-string here is an
+            // engine anomaly; fail closed rather than silently dropping the
+            // table from the copy and verification.
+            Err(e) => {
+                crate::boot::boot_diagnostic(format!(
+                    "store '{name}' table name is not text ({e}) — rebuild aborted; \
+                     left for operator review",
+                ));
+                return Ok((RepairOutcome::NoRepair, conn));
+            }
+        };
+        let quoted = tbl.replace('"', "\"\"");
+        match conn
+            .query_row(&format!("SELECT COUNT(*) FROM \"{quoted}\""), (), |r| {
+                r.get::<i64>(0)
+            })
+            .await
+        {
+            Ok(count) => counts.push((tbl, count)),
+            Err(e) => {
+                crate::boot::boot_diagnostic(format!(
+                    "store '{name}' table '{tbl}' is unreadable ({e}) — the data cannot \
+                     be preserved by the rebuild; recreate justified",
+                ));
+                return Ok((RepairOutcome::Unreadable, conn));
+            }
+        }
+    }
+
+    // ── Build the fresh store at a sibling temp path ──
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let pid = std::process::id();
+    let temp = std::path::PathBuf::from(format!("{}.rebuild-{stamp}-{pid}", db_path.display()));
+    // Guard removes the temp family on every exit, including a turso panic
+    // mid-copy (absorbed by open_store's catch_unwind).
+    let _temp_guard = TempCleanup(&temp);
+    let fresh = match Connection::open(&temp).await {
+        Ok(f) => f,
+        Err(e) if is_actionable_signal(&e) => return Err(e),
+        Err(e) => {
+            crate::boot::boot_diagnostic(format!(
+                "store '{name}' rebuild store open failed: {e} — left for operator review",
+            ));
+            return Ok((RepairOutcome::NoRepair, conn));
+        }
+    };
+    // Schema replay (old creation order) + data copy.
+    let migrated = migrate_schema_and_data(&conn, &fresh, &counts).await;
+    let outcome = match migrated {
+        Ok(()) => match fresh.quick_check().await {
+            // TRUNCATE-checkpoint the fresh store before the swap so the temp
+            // main file holds every frame — a crash between the main and wal
+            // renames then cannot leave a valid-but-empty store (turso does
+            // not checkpoint on close).
+            Ok(()) => match fresh.checkpoint().await {
+                Ok(o) if o.is_complete() => Ok(()),
+                Ok(o) => Err(MigrateFailure::Finding(format!(
+                    "rebuilt store checkpoint incomplete (busy={}, {} of {} frames)",
+                    o.busy, o.checkpointed_frames, o.log_frames,
+                ))),
+                Err(e) => Err(classify_migrate(e)),
+            },
+            Err(e) => Err(classify_migrate(e)),
+        },
+        Err(f) => Err(f),
+    };
+    drop(fresh); // release the fds before the temp cleanup / family swap
+    if let Err(failure) = outcome {
+        return match failure {
+            MigrateFailure::Actionable(e) => Err(e),
+            // The aliasing persists: every boot re-runs this full rebuild
+            // attempt (fresh-store open + DDL replay + data copy) before
+            // falling back to NoRepair — the operator-facing signal to
+            // intervene (e.g. restore from backup).
+            MigrateFailure::Finding(msg) => {
+                crate::boot::boot_diagnostic(format!(
+                    "store '{name}' rebuild aborted: {msg} — original store preserved \
+                     for operator review (no data changed)",
+                ));
+                Ok((RepairOutcome::NoRepair, conn))
+            }
+        };
+    }
+
+    // ── Swap: quarantine the original family (forensic, never deleted), move
+    // the fresh family into place, reopen with the module schema. ──
+    drop(conn); // release the fds before the family rename
+    if !quarantine_store_artifacts(db_path) {
+        // A clobbering swap would destroy part of the original family
+        // without a forensic record — never swap onto a partial quarantine.
+        // The temp guard cleans the migrated family. The main renames
+        // first; sibling renames normally fail together, so main-in-place
+        // means the original main is preserved (the reopen assumes it is
+        // complete — the precondition checkpoint normally guarantees that)
+        // and main-moved means the data is not at its path.
+        crate::boot::boot_diagnostic(format!(
+            "store '{name}' original family could not be fully quarantined — the \
+             rebuild swap would clobber it without a forensic record; rebuild aborted, \
+             migrated data discarded",
+        ));
+        return if db_path.exists() {
+            crate::boot::boot_diagnostic(format!(
+                "store '{name}' original family remains in place — left for operator \
+                 review",
+            ));
+            open_with_schema(db_path, schema)
+                .await
+                .map(|reopened| (RepairOutcome::NoRepair, reopened))
+        } else {
+            crate::boot::boot_diagnostic(format!(
+                "store '{name}' original family is in the quarantine and the store \
+                 path is empty — boot aborted; recover from the quarantine and retry",
+            ));
+            Err(anyhow::anyhow!(
+                "store '{name}' rebuild aborted: partial quarantine with the main file \
+                 already moved — the store path was not rebuilt"
+            ))
+        };
+    }
+    // Main-file rename first; the sidecars move only when it succeeds. The
+    // fresh store was TRUNCATE-checkpointed, so its main file alone holds
+    // every row — a failed sidecar rename is benign, and a crash between
+    // the renames cannot leave a valid-but-empty store.
+    let sidecars = store_sidecars(db_path);
+    let temp_sidecars = store_sidecars(&temp);
+    if let Err(e) = std::fs::rename(&temp, db_path) {
+        // The swap cannot proceed: the store path is absent and the original
+        // family is in the quarantine. Bail loudly (the store's boot fails)
+        // instead of opening a fresh empty store over the abandoned migrated
+        // data; the temp guard discards the migrated family.
+        return Err(anyhow::anyhow!(e).context(format!(
+            "store '{name}' rebuild swap main-file rename failed — migrated temp \
+             family discarded; original family quarantined for recovery"
+        )));
+    }
+    for (src, dst) in [
+        (&temp_sidecars.wal, &sidecars.wal),
+        (&temp_sidecars.shm, &sidecars.shm),
+        (&temp_sidecars.tshm, &sidecars.tshm),
+    ] {
+        if src.exists()
+            && let Err(e) = std::fs::rename(src, dst)
+        {
+            warn!(
+                error = %e,
+                from = %src.display(),
+                to = %dst.display(),
+                "rebuild swap sidecar rename failed",
+            );
+        }
+    }
+    let reopened = match open_with_schema(db_path, schema).await {
+        Ok(reopened) => reopened,
+        Err(e) if is_actionable_signal(&e) => return Err(e),
+        Err(e) => {
+            // The reopened store failed — the quarantine holds the original.
+            crate::boot::boot_diagnostic(format!(
+                "store '{name}' rebuilt store reopen failed: {e} — original family is \
+                 quarantined for recovery",
+            ));
+            return Err(e);
+        }
+    };
+    // Post-swap verification: a genuine finding (integrity message or count
+    // mismatch) reports loudly with its own diagnostic; a transient read
+    // error on the healthy swapped store stays at warn level — "lost data"
+    // must not fire on the latter (it could prompt restoring the corrupt
+    // original over a healthy rebuild).
+    let mut verified = true;
+    let mut finding_reported = false;
+    match reopened.quick_check().await {
+        Ok(()) => {}
+        Err(e) if is_actionable_signal(&e) => {
+            warn!(error = %e, db = %name, "post-swap verification quick_check hit a resource signal");
+            verified = false;
+        }
+        Err(e) => {
+            crate::boot::boot_diagnostic(format!(
+                "store '{name}' rebuilt store failed post-swap quick_check ({e}) — \
+                 original family is quarantined for recovery",
+            ));
+            verified = false;
+            finding_reported = true;
+        }
+    }
+    for (tbl, expected) in &counts {
+        let quoted = tbl.replace('"', "\"\"");
+        match reopened
+            .query_row(&format!("SELECT COUNT(*) FROM \"{quoted}\""), (), |r| {
+                r.get::<i64>(0)
+            })
+            .await
+        {
+            // A read error is not proof of data loss — actionable signals
+            // warn transiently, anything else is a genuine finding (the
+            // "lost data" diagnostic must not fire on a read failure).
+            Err(e) => {
+                let err = anyhow::anyhow!(e);
+                if is_actionable_signal(&err) {
+                    verified = false;
+                    warn!(
+                        error = %err,
+                        db = %name,
+                        table = %tbl,
+                        "post-swap counts verification query hit a resource signal",
+                    );
+                } else {
+                    crate::boot::boot_diagnostic(format!(
+                        "store '{name}' post-swap verification counts query for table \
+                         '{tbl}' failed ({err}) — verification incomplete; original \
+                         family is quarantined for recovery",
+                    ));
+                    verified = false;
+                    finding_reported = true;
+                }
+            }
+            Ok(c) if c != *expected => {
+                crate::boot::boot_diagnostic(format!(
+                    "store '{name}' post-swap verification failed for table '{tbl}' \
+                     (expected {expected} rows, found {c}) — the swap lost data; \
+                     original family is quarantined for recovery",
+                ));
+                verified = false;
+                finding_reported = true;
+            }
+            Ok(_) => {}
+        }
+    }
+    if verified {
+        info!(db = %name, "overflow-aliasing repaired: store rebuilt data-preservingly");
+        Ok((RepairOutcome::Migrated, reopened))
+    } else {
+        // Transient read errors only (no finding reported above): the swap
+        // succeeded and the store is in place — the next boot re-verifies.
+        if !finding_reported {
+            warn!(db = %name, "post-swap verification incomplete (transient read errors) — store is in place; re-verified on the next boot");
+        }
+        Ok((RepairOutcome::NoRepair, reopened))
+    }
+}
+
+/// Failures of the overflow-aliasing rebuild, classified for the caller.
+enum MigrateFailure {
+    /// Actionable resource condition (ENOSPC/EMFILE/permission) — propagate.
+    Actionable(anyhow::Error),
+    /// Data-integrity finding (constraint violation) or any other
+    /// non-actionable failure — report only; the original store is preserved.
+    Finding(String),
+}
+
+/// Classify a rebuild-path error: actionable resource conditions propagate,
+/// everything else is a report-only finding (covers both `turso::Error` from
+/// the wrapper's query/execute and `anyhow::Error` from checkpoint/quick_check).
+fn classify_migrate<E: Into<anyhow::Error>>(e: E) -> MigrateFailure {
+    let err = e.into();
+    if is_actionable_signal(&err) {
+        MigrateFailure::Actionable(err)
+    } else {
+        MigrateFailure::Finding(format!("{err:#}"))
+    }
+}
+
+/// Replay the old store's schema (tables + indexes, creation order) into the
+/// fresh store and copy every table's data row by row (two connections — the
+/// SQL engine cannot reference the old store from the fresh one). Indexes are
+/// created before the data copy and maintained incrementally by the inserts.
+/// Counts are verified per table; a mismatch or a constraint violation is a
+/// data-integrity finding, not corruption.
+async fn migrate_schema_and_data(
+    old: &Connection,
+    fresh: &Connection,
+    counts: &[(String, i64)],
+) -> Result<(), MigrateFailure> {
+    let ddl_rows = old
+        .query(
+            &format!(
+                "SELECT sql FROM sqlite_master \
+                 WHERE sql IS NOT NULL \
+                   AND {USER_OBJECT_FILTER} \
+                 ORDER BY rowid"
+            ),
+            (),
+        )
+        .await
+        .map_err(classify_migrate)?;
+    for row in &ddl_rows {
+        // sqlite_master.sql is always TEXT — a non-string here is an engine
+        // anomaly; fail closed rather than silently skipping the object
+        // (mirrors the counts loop's fail-closed name handling).
+        let ddl = row
+            .get::<String>(0)
+            .map_err(|e| MigrateFailure::Finding(format!("DDL replay row is not text ({e})")))?;
+        fresh.execute(&ddl, ()).await.map_err(classify_migrate)?;
+    }
+    // sqlite_sequence (AUTOINCREMENT bookkeeping) is auto-created by the
+    // replayed DDLs; copy its rows so the old watermark survives the
+    // explicit-id copy (WAL-mode explicit-rowid inserts advance, never
+    // clobber) — deleted high ids must not be re-issued after migration
+    // (surviving-rows tables; a fully-purged table restarts at 1, harmless).
+    let has_sequence: i64 = old
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'",
+            (),
+            |r| r.get::<i64>(0),
+        )
+        .await
+        .map_err(classify_migrate)?;
+    if has_sequence > 0 {
+        let seq_rows = old
+            .query("SELECT * FROM sqlite_sequence", ())
+            .await
+            .map_err(classify_migrate)?;
+        for row in &seq_rows {
+            let ncols = row.column_count();
+            let placeholders = (1..=ncols)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut vals = Vec::with_capacity(ncols);
+            for c in 0..ncols {
+                vals.push(row.get_value(c).map_err(classify_migrate)?);
+            }
+            fresh
+                .execute(
+                    &format!("INSERT INTO sqlite_sequence VALUES ({placeholders})"),
+                    vals,
+                )
+                .await
+                .map_err(classify_migrate)?;
+        }
+    }
+    for (tbl, expected) in counts {
+        let quoted = tbl.replace('"', "\"\"");
+        // Full-table materialization: `SELECT *` collects every row before
+        // the copy loop — a boot-time memory spike on large stores (the
+        // 324 MB-class sessions store), accepted for this rare repair path.
+        let rows = old
+            .query(&format!("SELECT * FROM \"{quoted}\""), ())
+            .await
+            .map_err(classify_migrate)?;
+        let tx = fresh.begin_tx().await.map_err(classify_migrate)?;
+        let mut copied = 0i64;
+        for row in &rows {
+            let ncols = row.column_count();
+            let placeholders = (1..=ncols)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("INSERT INTO \"{quoted}\" VALUES ({placeholders})");
+            let mut vals = Vec::with_capacity(ncols);
+            for c in 0..ncols {
+                vals.push(row.get_value(c).map_err(classify_migrate)?);
+            }
+            tx.execute(&sql, vals).await.map_err(classify_migrate)?;
+            copied += 1;
+        }
+        tx.commit().await.map_err(classify_migrate)?;
+        if copied != *expected {
+            return Err(MigrateFailure::Finding(format!(
+                "table '{tbl}' copy count {copied} != pre-migration {expected}",
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// DROP+CREATE fallback for a REINDEX that could not clear the desync:
+/// reproduce the index's original DDL from `sqlite_master` (validated on the
+/// prod copy; clears desyncs REINDEX cannot).
+async fn drop_create_index_fallback(
+    conn: &Connection,
+    name: &str,
+    index: &str,
+    quoted: &str,
+) -> RepairOutcome {
+    let ddl = conn
+        .query_optional(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index.to_string(),),
+            |row| row.get::<String>(0),
+        )
+        .await
+        .ok()
+        .flatten();
+    let Some(ddl) = ddl else {
+        crate::boot::boot_diagnostic(format!(
+            "store '{name}' index '{index}' DDL not found in sqlite_master — cannot \
+             DROP+CREATE; left for operator review",
+        ));
+        return RepairOutcome::NoRepair;
+    };
+    // Transactional: `execute_batch` runs statements in autocommit, so a
+    // failed rebuild (e.g. a UNIQUE-constraint violation on table data)
+    // would leave the index permanently dropped. DROP+CREATE inside a tx
+    // rolls the DROP back when the CREATE fails — the original (desynced)
+    // index survives for operator review. The rollback is deferred: the
+    // dropped guard flags the connection and the ROLLBACK fires at the next
+    // lock_and_cleanup (all wrapper methods route through it), so the
+    // uncommitted DROP is undone before any further DB access.
+    let outcome = async {
+        let tx = conn.begin_tx().await?;
+        tx.execute_batch(&format!("DROP INDEX \"{quoted}\"; {ddl};"))
+            .await?;
+        tx.commit().await
+    }
+    .await;
+    match outcome {
+        Ok(()) if conn.quick_check().await.is_ok() => {
+            info!(
+                db = %name,
+                index = %index,
+                "class-B btree index desync repaired in place (DROP+CREATE)",
+            );
+            RepairOutcome::Repaired
+        }
+        Ok(()) => {
+            // The batch committed but the post-rebuild quick_check is not
+            // clean (desync report or the scan itself failed to run) —
+            // reported only; the store opens normally either way.
+            crate::boot::boot_diagnostic(format!(
+                "store '{name}' DROP+CREATE of '{index}' post-rebuild quick_check \
+                 not clean — left for operator review",
+            ));
+            RepairOutcome::NoRepair
+        }
+        Err(repair_err) => {
+            // The DROP is rolled back on the next connection operation
+            // (deferred) — the original index is preserved, not dropped.
+            crate::boot::boot_diagnostic(format!(
+                "store '{name}' DROP+CREATE of '{index}' failed: {repair_err} — DROP \
+                 rolled back on the next connection op, original index preserved; left \
+                 for operator review",
+            ));
+            RepairOutcome::NoRepair
+        }
+    }
+}
+
+/// Extract the specific btree index name from a quick_check desync message
+/// (`wrong # of entries in index <name>`). Returns `None` for any other
+/// message shape (overflow-aliasing, unreadable table — the FTS false
+/// positive is already filtered by [`scan_integrity_rows`] before quick_check
+/// surfaces an error).
+fn desynced_index_name(msg: &str) -> Option<&str> {
+    const PREFIX: &str = "wrong # of entries in index ";
+    let rest = msg.strip_prefix(PREFIX)?;
+    let end = rest.find(['\n', ';', '\r']).unwrap_or(rest.len());
+    let name = &rest[..end];
+    (!name.is_empty()).then_some(name)
+}
+
+/// Heal checkpoint mode — replaces the stringly-typed mode literals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointMode {
+    Passive,
+    Truncate,
+}
+
+impl CheckpointMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Passive => "PASSIVE",
+            Self::Truncate => "TRUNCATE",
+        }
+    }
+}
+
+/// Run the heal strategy on a dedicated connection per mode (each call opens
+/// and fully closes its own connection — durable-B's PASSIVE-first requires a
+/// reopen before the TRUNCATE). The heal connection's own open is the risky
+/// turso reopen of damaged coordination; panics there are handled by the
+/// caller (recreate).
+async fn heal_checkpoint_sequence(
+    db_path: &Path,
+    name: &str,
+    diagnosis: crate::wal_guard::BootDiagnosis,
+) -> anyhow::Result<()> {
+    let sidecars = store_sidecars(db_path);
+    // PASSIVE-first for durable-B (0-byte main DB + live WAL): backfill
+    // without truncating, then a reopen + TRUNCATE compacts. Defensively
+    // re-checked in the StaleTail arm — TRUNCATE-first on a 0-byte main DB
+    // destroys committed frames.
+    let durable_b = matches!(diagnosis, crate::wal_guard::BootDiagnosis::DurableB)
+        || (std::fs::metadata(db_path).is_ok_and(|m| m.len() == 0)
+            && std::fs::metadata(&sidecars.wal).is_ok_and(|m| m.len() > 0));
+    if durable_b {
+        heal_checkpoint(db_path, CheckpointMode::Passive, name).await?;
+        heal_checkpoint(db_path, CheckpointMode::Truncate, name).await?;
+        return Ok(());
+    }
+    if matches!(diagnosis, crate::wal_guard::BootDiagnosis::StaleTail) {
+        // Defensive orphan guard: the WAL bytes are gone (a genuine stale
+        // tail always has frames on disk, wal ≥ 32) — TRUNCATE-first has
+        // nothing to heal and the heal connection's reopen could panic on the
+        // empty WAL; the panic-absorbed phase-2 open handles that state.
+        if std::fs::metadata(&sidecars.wal).is_ok_and(|m| m.len() < 32) {
+            return Ok(());
+        }
+        // TRUNCATE-first resets the shared frame index and max_frame while
+        // keeping committed frames (validated empirically).
+        heal_checkpoint(db_path, CheckpointMode::Truncate, name).await?;
+    }
+    Ok(())
+}
+
+/// Quarantine the whole artifact family and recreate the store fresh.
+/// The quarantine copy is never deleted — it is the forensic record.
+async fn recreate_after_failed_heal(
+    db_path: &Path,
+    name: &str,
+    schema: &str,
+    reason: &anyhow::Error,
+) -> anyhow::Result<Connection> {
+    crate::boot::boot_diagnostic(format!(
+        "store '{name}' heal failed: {reason} — quarantining artifact family and \
+         recreating a fresh store",
+    ));
+    // The recreate path tolerates a partial quarantine — the bool is
+    // intentionally ignored.
+    let _ = quarantine_store_artifacts(db_path);
+    match open_with_schema(db_path, schema).await {
+        Ok(conn) => Ok(conn),
+        // Marker: the original family is already quarantined — a further
+        // quarantine (logs outer path) would move the fresh store.
+        Err(e) => Err(anyhow::anyhow!(RecreateFailed(e))),
+    }
+}
+
+/// Retries for a heal checkpoint that returns busy (1s interval — the LLM
+/// retry policies are deliberately not reused).
+const HEAL_CHECKPOINT_RETRIES: usize = 3;
+
+/// Run a single-mode WAL checkpoint on a dedicated heal connection, retrying
+/// busy outcomes ~3 times with a 1-second interval. The connection is closed
+/// before the next mode's open (or the standard store open).
+///
+/// The temporary connection's fds are dropped on close — on macOS that
+/// releases the process's fcntl locks on that `.tshm` (the process-scoped
+/// fcntl mechanism the persistent fds exist to avoid).
+/// Benign here: the heal runs in the single-writer boot window before the
+/// main connection exists, and the instance flock already excludes a second
+/// daemon (the open+close regression counter does not observe turso-internal
+/// opens by design).
+async fn heal_checkpoint(db_path: &Path, mode: CheckpointMode, name: &str) -> anyhow::Result<()> {
+    let conn = Connection::open(db_path)
+        .await
+        .with_context(|| format!("heal connection open failed for {name}"))?;
+    let mut attempts_left = HEAL_CHECKPOINT_RETRIES;
+    loop {
+        attempts_left -= 1;
+        let outcome = match mode {
+            CheckpointMode::Passive => conn.checkpoint_passive().await,
+            CheckpointMode::Truncate => conn.checkpoint().await,
+        };
+        match outcome {
+            Ok(o) if o.is_complete() => return Ok(()),
+            Ok(o) if attempts_left > 0 => {
+                // is_complete() is also false for a non-busy partial backfill
+                // (log > checkpointed); the frame counts make that visible.
+                warn!(
+                    db = %name,
+                    busy = o.busy,
+                    checkpointed = o.checkpointed_frames,
+                    log = o.log_frames,
+                    "heal checkpoint incomplete — retrying",
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Ok(o) => anyhow::bail!(
+                "heal checkpoint {} incomplete after {HEAL_CHECKPOINT_RETRIES} attempts \
+                 (busy={}, checkpointed={}/{})",
+                mode.label(),
+                o.busy,
+                o.checkpointed_frames,
+                o.log_frames,
+            ),
+            Err(e) if attempts_left > 0 => {
+                warn!(db = %name, error = %e, "heal checkpoint failed — retrying");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("heal checkpoint {} failed for {name}", mode.label())
+                });
+            }
+        }
+    }
+}
+
+/// Move a store's whole artifact family (`db`/`-wal`/`-shm`/`-tshm`) aside to
+/// a timestamped quarantine name. Best-effort: a rename failure is logged,
+/// never fatal. The quarantine copy is never deleted — it is the forensic
+/// record for the recreate decision. Returns false when any existing file
+/// could not be moved (a partial quarantine — the recreate path proceeds with
+/// the un-moved files in place; the migration path must abort instead).
+#[must_use]
+pub(crate) fn quarantine_store_artifacts(db_path: &Path) -> bool {
+    let sidecars = store_sidecars(db_path);
+    quarantine_family(
+        db_path,
+        &[
+            (db_path, ""),
+            (&sidecars.wal, "-wal"),
+            (&sidecars.shm, "-shm"),
+            (&sidecars.tshm, "-tshm"),
+        ],
+    )
+}
+
+/// Move only the coordination sidecars (`-wal`/`-shm`/`-tshm`) aside, keeping
+/// the main DB in place — detect-and-continue on an intact main DB whose
+/// broken sidecars made turso's reopen panic. Same best-effort,
+/// never-deleted quarantine semantics as [`quarantine_store_artifacts`].
+#[must_use]
+fn quarantine_coordination_sidecars(db_path: &Path) -> bool {
+    let sidecars = store_sidecars(db_path);
+    quarantine_family(
+        db_path,
+        &[
+            (&sidecars.wal, "-wal"),
+            (&sidecars.shm, "-shm"),
+            (&sidecars.tshm, "-tshm"),
+        ],
+    )
+}
+
+/// Shared quarantine-family rename (timestamped, PID + seq-suffixed to never
+/// clobber an earlier quarantine — the seq counter is process-local, so the
+/// PID disambiguates same-second renames from other processes, where POSIX
+/// rename would silently overwrite the earlier forensic copy).
+///
+/// Returns true when every existing source was moved aside — a partial
+/// quarantine means a subsequent clobbering rename would destroy part of the
+/// forensic record; the recreate path tolerates that (the un-moved files stay
+/// in place), the migration path does not.
+#[must_use]
+fn quarantine_family(db_path: &Path, sources: &[(&Path, &str)]) -> bool {
+    static QUARANTINE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let pid = std::process::id();
+    let seq = QUARANTINE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let base = if seq == 0 {
+        format!(
+            "{}.quarantine-{stamp}-{pid}",
+            db_path.file_name().unwrap_or_default().to_string_lossy()
+        )
+    } else {
+        format!(
+            "{}.quarantine-{stamp}-{pid}-{seq}",
+            db_path.file_name().unwrap_or_default().to_string_lossy()
+        )
+    };
+    let mut complete = true;
+    for (src, suffix) in sources {
+        if !src.exists() {
+            continue;
+        }
+        let dst = db_path.with_file_name(format!("{base}{suffix}"));
+        if let Err(e) = std::fs::rename(src, &dst) {
+            warn!(
+                error = %e,
+                from = %src.display(),
+                to = %dst.display(),
+                "Failed to quarantine store artifact",
+            );
+            complete = false;
+        }
+    }
+    complete
 }
 
 /// Execute `work` within a transaction on `conn`, committing on success.
@@ -1355,5 +2858,500 @@ mod tests {
             "non-unique entry in index __turso_internal_fts_dir_idx_tickets_title_fts_key";
         assert!(!genuine_missing.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE));
         assert!(!genuine_unique.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE));
+    }
+
+    /// A Structural boot diagnosis makes `open_store` quarantine the artifact
+    /// family and recreate a fresh store (the unified recreate path).
+    #[tokio::test]
+    async fn open_store_recreates_structural_store() {
+        let tmp = tempfile::TempDir::new().expect("temp dir for test");
+        let root = tmp.path();
+        let db_path = store_db_path(root, "board");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        // Truncated main DB header → structural.
+        std::fs::write(&db_path, [0u8; 64]).unwrap();
+        std::fs::write(format!("{}-tshm", db_path.display()), [0u8; 32]).unwrap();
+        crate::wal_guard::set_boot_diagnosis(&db_path, crate::wal_guard::BootDiagnosis::Structural);
+
+        let conn = open_store(root, "board", "CREATE TABLE IF NOT EXISTS t (id INTEGER);")
+            .await
+            .expect("structural store must be recreated, not fail boot");
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='t'",
+                (),
+                |r| r.get::<i64>(0),
+            )
+            .await
+            .expect("schema applied on the recreated store");
+        assert_eq!(rows, 1, "recreated store must carry the schema");
+        let quarantined = std::fs::read_dir(db_path.parent().unwrap())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains("quarantine-"));
+        assert!(
+            quarantined,
+            "artifact family must be quarantined (forensic copy)"
+        );
+    }
+
+    /// The quick_check desync parser names exactly the non-FTS btree index,
+    /// and refuses the overflow-aliasing / unreadable shapes (never REINDEX).
+    #[test]
+    fn desynced_index_name_parses_quick_check_shapes() {
+        assert_eq!(
+            desynced_index_name("wrong # of entries in index idx_tickets_phase"),
+            Some("idx_tickets_phase")
+        );
+        assert_eq!(
+            desynced_index_name("wrong # of entries in index a; row 5 missing"),
+            Some("a")
+        );
+        // FTS false positive — masked upstream, never REINDEXed here.
+        assert!(
+            desynced_index_name(
+                "wrong # of entries in index __turso_internal_fts_dir_idx_tickets_title_fts_key"
+            )
+            .is_some()
+        );
+        // Overflow-aliasing and unreadable-table signatures.
+        assert!(desynced_index_name("Page referenced multiple times: page 167772160").is_none());
+        assert!(desynced_index_name("short read on page 12").is_none());
+        assert!(desynced_index_name("row 5 missing from index idx_x").is_none());
+        assert!(desynced_index_name("ok").is_none());
+    }
+
+    /// The overflow-aliasing veto is structural: a named index desync in an
+    /// earlier row must NOT lead to a REINDEX when a later row reports
+    /// overflow-aliasing (the operation that bakes the worse error). The
+    /// matcher covers turso's real message shape ("Page N referenced multiple
+    /// times (references=[...], page_category=...)") and the baked short-read
+    /// (page 0x0A000000) — both route to the data-preserving rebuild, while a
+    /// genuine short read on a real page stays unreadable (recreate).
+    #[test]
+    fn overflow_aliasing_vetoes_reindex_across_rows() {
+        assert!(matches!(
+            classify_repair_target(&[
+                "wrong # of entries in index idx_phase".to_string(),
+                "Page referenced multiple times: page 167772160".to_string(),
+            ]),
+            RepairTarget::OverflowAliasing
+        ));
+        // turso's actual message shape (index leaves sharing an overflow page).
+        assert!(matches!(
+            classify_repair_target(&[
+                "*** in database main ***\nPage 871 referenced multiple times \
+                 (references=[3, 3], page_category=Normal)"
+                    .to_string(),
+                "wrong # of entries in index idx_t_v".to_string(),
+            ]),
+            RepairTarget::OverflowAliasing
+        ));
+        assert!(matches!(
+            classify_repair_target(&[
+                "Page referenced multiple times: page 5".to_string(),
+                "wrong # of entries in index idx_phase".to_string(),
+            ]),
+            RepairTarget::OverflowAliasing
+        ));
+        // The baked overflow-aliasing signature routes to the rebuild, not
+        // to the recreate-whole path.
+        assert!(matches!(
+            classify_repair_target(&["short read on page 167772160".to_string()]),
+            RepairTarget::OverflowAliasing
+        ));
+        assert!(matches!(
+            classify_repair_target(&[
+                "wrong # of entries in index idx_phase".to_string(),
+                "short read on page 12".to_string(),
+            ]),
+            RepairTarget::Unreadable
+        ));
+        assert!(matches!(
+            classify_repair_target(&["short read on page 12".to_string()]),
+            RepairTarget::Unreadable
+        ));
+        assert!(matches!(
+            classify_repair_target(&["wrong # of entries in index idx_phase".to_string()]),
+            RepairTarget::Index(name) if name == "idx_phase"
+        ));
+        assert!(matches!(
+            classify_repair_target(&["row 5 missing from index idx_x".to_string()]),
+            RepairTarget::Unknown
+        ));
+    }
+
+    /// turso rolls back DDL: the class-B DROP+CREATE fallback wraps the pair
+    /// in a transaction because `execute_batch` is autocommit per statement —
+    /// a failed rebuild (constraint violation) must leave the original index
+    /// in place, not silently dropped. Covers both rollback paths: the
+    /// explicit one and the production failure path (guard dropped without
+    /// commit → deferred ROLLBACK on the next connection op).
+    #[tokio::test]
+    async fn transactional_ddl_rollback_preserves_dropped_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = open_with_schema(
+            &tmp.path().join("t.db"),
+            "CREATE TABLE t (a TEXT, b TEXT); \
+             INSERT INTO t VALUES ('1', 'x'), ('1', 'y'); \
+             CREATE UNIQUE INDEX u ON t(b);",
+        )
+        .await
+        .expect("open test store");
+        // The failed rebuild: DROP the existing index, then CREATE a UNIQUE
+        // index on the duplicated column — constraint violation aborts the
+        // batch; the rollback must restore `u`.
+        let tx = conn.begin_tx().await.expect("begin tx");
+        let err = tx
+            .execute_batch("DROP INDEX u; CREATE UNIQUE INDEX u2 ON t(a);")
+            .await
+            .expect_err("CREATE UNIQUE on duplicated data must fail");
+        assert!(
+            format!("{err}").to_lowercase().contains("unique"),
+            "expected a constraint violation, got: {err}"
+        );
+        tx.rollback().await.expect("rollback");
+        // Production path: the guard is dropped without commit/rollback after
+        // the failure — the dangling flag makes the next connection op
+        // (query → lock_and_cleanup) issue the deferred ROLLBACK.
+        {
+            let tx = conn.begin_tx().await.expect("begin tx");
+            let err = tx
+                .execute_batch("DROP INDEX u; CREATE UNIQUE INDEX u2 ON t(a);")
+                .await
+                .expect_err("CREATE UNIQUE on duplicated data must fail");
+            assert!(
+                format!("{err}").to_lowercase().contains("unique"),
+                "expected a constraint violation, got: {err}"
+            );
+        }
+        let names: Vec<String> = conn
+            .query_map_strict(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('u', 'u2')",
+                (),
+                |row| row.get::<String>(0),
+            )
+            .await
+            .expect("query sqlite_master");
+        assert_eq!(names, vec!["u".to_string()], "original index must survive");
+        // The restored index is functional and the store is consistent.
+        conn.quick_check()
+            .await
+            .expect("store must be consistent after the rollback");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t INDEXED BY u", (), |row| {
+                row.get::<i64>(0)
+            })
+            .await
+            .expect("INDEXED BY must resolve");
+        assert_eq!(n, 2);
+    }
+
+    // ── Overflow-aliasing rebuild (data-preserving migration) ─────────
+
+    /// Synthesize the overflow-aliasing corruption on a closed store: patch
+    /// one index leaf cell's overflow pointer to another cell's overflow page
+    /// so two index entries share an overflow chain (turso's
+    /// "Page N referenced multiple times"). The cells are located by their
+    /// value prefix preceded by the record header `[hdr][text serial][rowid
+    /// serial]` — the 2007-byte text serial is `[0x9f, 0x3b]`, and turso
+    /// spills index payloads at the min threshold (`((usable-12)*32/255)-23`
+    /// = 489 bytes for a 4096 page), so the 4-byte overflow pointer sits
+    /// `local - 4` bytes after the value prefix.
+    fn synthesize_overflow_aliasing(db_path: &Path) -> u32 {
+        let file = std::fs::read(db_path).unwrap();
+        let page_size = u16::from_be_bytes([file[16], file[17]]) as usize;
+        let local = ((page_size - 12) * 32 / 255) - 23;
+        let find = |file: &[u8], prefix: &[u8], rowid_serial: u8| -> (usize, u32) {
+            for i in 0..file.len().saturating_sub(prefix.len() + 12) {
+                // The index record header is [hdr=0x04][text serial 0x9f 0x3b]
+                // [rowid serial] — the table record's header differs (more
+                // columns → different hdr byte and serial order), so the
+                // 4-byte pattern pins the index cell (leaf or interior
+                // separator, both use the same record layout).
+                if &file[i..i + prefix.len()] == prefix
+                    && file[i - 4..i] == [0x04, 0x9f, 0x3b, rowid_serial]
+                {
+                    let ptr =
+                        u32::from_be_bytes(file[i + local - 4..i + local].try_into().unwrap());
+                    return (i, ptr);
+                }
+            }
+            panic!(
+                "index cell for {:?} not found",
+                String::from_utf8_lossy(prefix)
+            );
+        };
+        let (_, shared) = find(&file, b"v04000-", 0x02); // rowid 4001 → 16-bit serial
+        let (patch_at, _) = find(&file, b"v00000-", 0x09); // rowid 1 → constant serial 9
+        let mut file = file;
+        file[patch_at + local - 4..patch_at + local].copy_from_slice(&shared.to_be_bytes());
+        std::fs::write(db_path, &file).unwrap();
+        shared
+    }
+
+    /// Build a store whose index carries overflow pages (long values), then
+    /// checkpoint via a fresh connection (the writer connection's own
+    /// checkpoint does not flush its last frames) so the main file holds
+    /// every page the surgery will patch.
+    async fn build_aliasing_candidate(
+        db_path: &Path,
+        schema: &str,
+        extra_row: Option<(&str, i64)>,
+    ) {
+        {
+            let conn = open_with_schema(db_path, schema).await.unwrap();
+            for i in 0..5000i32 {
+                let mut big = format!("v{i:05}-");
+                big.push_str(&"q".repeat(2000));
+                conn.execute(
+                    "INSERT INTO t (v, n) VALUES (?1, 1);",
+                    turso::params![big.clone()],
+                )
+                .await
+                .unwrap();
+            }
+            if let Some((v, n)) = extra_row {
+                conn.execute("PRAGMA ignore_check_constraints = ON;", ())
+                    .await
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO t (v, n) VALUES (?1, ?2);",
+                    turso::params![v, n],
+                )
+                .await
+                .unwrap();
+                conn.execute("PRAGMA ignore_check_constraints = OFF;", ())
+                    .await
+                    .unwrap();
+            }
+            drop(conn);
+        }
+        {
+            let conn = Connection::open(&db_path).await.unwrap();
+            conn.checkpoint().await.unwrap();
+            drop(conn);
+        }
+    }
+
+    /// The rebuild works on the FTS-bearing store shape (board's
+    /// `CREATE INDEX ... USING fts`): turso's protected
+    /// `__turso_internal_fts_dir_*` backing tables are excluded from the copy
+    /// and post-swap verification, the DDL replay rebuilds the FTS index, and
+    /// the fresh store's quick_check masks the known FTS count-mismatch false
+    /// positive. The FTS index lives on a separate short-value table (real
+    /// titles), not the overflow-aliased long-value column.
+    #[tokio::test]
+    async fn overflow_aliasing_rebuild_preserves_fts_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let db_path = store_db_path(root, "board");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let schema = "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT NOT NULL, \
+                      n INTEGER NOT NULL DEFAULT 1); \
+                      CREATE INDEX IF NOT EXISTS idx_t_v ON t(v); \
+                      CREATE TABLE IF NOT EXISTS ft (title TEXT NOT NULL); \
+                      CREATE INDEX IF NOT EXISTS idx_ft_fts ON ft USING fts (title) \
+                      WITH (tokenizer = 'ngram');";
+        build_aliasing_candidate(&db_path, schema, None).await;
+        // FTS content (the count-mismatch false positive only appears once
+        // the index has rows), checkpointed into the main file before the
+        // page surgery.
+        {
+            let conn = open_with_schema(&db_path, schema).await.unwrap();
+            for i in 0..5 {
+                conn.execute(
+                    "INSERT INTO ft (title) VALUES (?1);",
+                    turso::params![format!("ticket title {i}")],
+                )
+                .await
+                .unwrap();
+            }
+            drop(conn);
+        }
+        {
+            let conn = Connection::open(&db_path).await.unwrap();
+            conn.checkpoint().await.unwrap();
+            drop(conn);
+        }
+        let shared = synthesize_overflow_aliasing(&db_path);
+        assert!(shared > 0, "surgery must reference a real overflow page");
+
+        let conn = open_and_repair(&db_path, "board", schema)
+            .await
+            .expect("overflow-aliasing repair must succeed on an FTS store");
+        conn.quick_check()
+            .await
+            .expect("rebuilt store must pass quick_check");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", (), |r| r.get::<i64>(0))
+            .await
+            .unwrap();
+        assert_eq!(count, 5000, "all rows must survive the rebuild");
+        let idx: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t INDEXED BY idx_t_v", (), |r| {
+                r.get::<i64>(0)
+            })
+            .await
+            .unwrap();
+        assert_eq!(idx, 5000, "rebuilt index must be valid and complete");
+        let ft: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ft", (), |r| r.get::<i64>(0))
+            .await
+            .unwrap();
+        assert_eq!(ft, 5, "FTS table data must survive the rebuild");
+        // The rebuilt FTS dir must answer MATCH queries — quick_check masks
+        // the __turso_internal_fts_dir_ count row for a broken index too, so
+        // the MATCH assertion is the only check that pins the rebuild.
+        let matched: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ft WHERE title MATCH 'title'",
+                (),
+                |r| r.get::<i64>(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(matched, 5, "rebuilt FTS index must answer MATCH queries");
+        let quarantined = std::fs::read_dir(db_path.parent().unwrap())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains("quarantine-"));
+        assert!(
+            quarantined,
+            "original family must be quarantined (forensic record)"
+        );
+        // A write on the rebuilt store stays clean (no freelist landmine).
+        conn.execute("INSERT INTO t (v, n) VALUES ('post-rebuild', 1);", ())
+            .await
+            .unwrap();
+        conn.quick_check()
+            .await
+            .expect("rebuilt store must stay clean after a write");
+    }
+
+    /// A constraint violation during the data copy is a data-integrity
+    /// finding, not corruption: the rebuild aborts report-only (no silent
+    /// recreate, no quarantine) and the original store — with its readable
+    /// data — is preserved for operator review.
+    #[tokio::test]
+    async fn overflow_aliasing_rebuild_constraint_finding_aborts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let db_path = store_db_path(root, "board");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let schema = "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT NOT NULL, \
+                      n INTEGER NOT NULL CHECK (n < 50)); \
+                      CREATE INDEX IF NOT EXISTS idx_t_v ON t(v);";
+        // Row with n=99 violates the CHECK (written with constraints ignored).
+        build_aliasing_candidate(&db_path, schema, Some(("v09999x", 99))).await;
+        synthesize_overflow_aliasing(&db_path);
+
+        let conn = open_and_repair(&db_path, "board", schema)
+            .await
+            .expect("aborted rebuild must still open the store (report-only)");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", (), |r| r.get::<i64>(0))
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 5001,
+            "original data must be preserved, not recreated"
+        );
+        let quarantined = std::fs::read_dir(db_path.parent().unwrap())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains("quarantine-"));
+        assert!(
+            !quarantined,
+            "a constraint finding must not quarantine/recreate the store"
+        );
+    }
+
+    /// The rebuild works on the real AUTOINCREMENT store shape (logs,
+    /// chat_history, sessions): turso's protected `__turso_internal_seq_*`
+    /// backing tables are excluded from the copy and the post-swap
+    /// verification, `sqlite_sequence` is carried over, and the fresh
+    /// watermark advances past the copied max ids via the explicit-id copy.
+    /// Rows 4001..5000 are deleted before the repair (retention) so the old
+    /// watermark (5000) exceeds the surviving max id (4000) — the only shape
+    /// where the carry-over matters: without it, the next auto-id would
+    /// re-issue 4001.
+    #[tokio::test]
+    async fn overflow_aliasing_rebuild_preserves_autoincrement_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let db_path = store_db_path(root, "board");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let schema = "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                      v TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 1); \
+                      CREATE INDEX IF NOT EXISTS idx_t_v ON t(v);";
+        build_aliasing_candidate(&db_path, schema, None).await;
+        let shared = synthesize_overflow_aliasing(&db_path);
+        assert!(shared > 0, "surgery must reference a real overflow page");
+        {
+            let conn = Connection::open(&db_path).await.unwrap();
+            conn.execute("DELETE FROM t WHERE id > 4000", ())
+                .await
+                .unwrap();
+            drop(conn);
+        }
+
+        let conn = open_and_repair(&db_path, "board", schema)
+            .await
+            .expect("overflow-aliasing repair must succeed on an AUTOINCREMENT store");
+        conn.quick_check()
+            .await
+            .expect("rebuilt store must pass quick_check");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", (), |r| r.get::<i64>(0))
+            .await
+            .unwrap();
+        assert_eq!(count, 4000, "all surviving rows must be preserved");
+        let idx: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t INDEXED BY idx_t_v", (), |r| {
+                r.get::<i64>(0)
+            })
+            .await
+            .unwrap();
+        assert_eq!(idx, 4000, "rebuilt index must be valid and complete");
+        // The backing seq table is recreated by the DDL replay and advanced
+        // by the explicit-id copy + carry-over — the next implicit-id insert
+        // must be 5001, not a reused 4001.
+        conn.execute("INSERT INTO t (v, n) VALUES ('auto-next', 1);", ())
+            .await
+            .unwrap();
+        let max_id: i64 = conn
+            .query_row("SELECT MAX(id) FROM t", (), |r| r.get::<i64>(0))
+            .await
+            .unwrap();
+        assert_eq!(
+            max_id, 5001,
+            "AUTOINCREMENT must advance past the old watermark, never re-issue ids"
+        );
+        // The sqlite_sequence mirror is carried over from the old store and
+        // follows the advanced watermark.
+        let seq: i64 = conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 't'",
+                (),
+                |r| r.get::<i64>(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            seq, 5001,
+            "sqlite_sequence watermark must be carried over and advanced"
+        );
+        conn.quick_check()
+            .await
+            .expect("rebuilt store must stay clean after a write");
+        let quarantined = std::fs::read_dir(db_path.parent().unwrap())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains("quarantine-"));
+        assert!(
+            quarantined,
+            "original family must be quarantined (forensic record)"
+        );
     }
 }

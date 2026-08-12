@@ -31,9 +31,10 @@
 //! signaled before the checkpoint); GUI exit runs while background writers are
 //! still live, but turso serializes via its checkpoint lock, so the practical
 //! effect is busy→warn, not corruption) and
-//! [`periodic_checkpoint_all_databases`] (non-truncating below the WAL-size
-//! cap, TRUNCATE above it — the auto-checkpoint loop spawned by the binary's
-//! background task set).
+//! [`periodic_checkpoint_and_verify`] (non-truncating below the WAL-size cap,
+//! TRUNCATE above it, plus integrity verification sharing one
+//! coordination-state inspection per store — the auto-checkpoint loop spawned
+//! by the binary's background task set).
 //!
 //! # Why keep `multiprocess_wal`?
 //!
@@ -53,6 +54,7 @@
 use futures_util::future::{FutureExt, join_all};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::path::Path;
 use tracing::{error, info, warn};
 
 /// Cap on a store's on-disk `-wal` size (bytes) for the periodic checkpoint
@@ -61,6 +63,61 @@ use tracing::{error, info, warn};
 /// WAL-file growth while keeping the frame-index reset that TRUNCATE causes
 /// (the two-writer corruption vector) rare instead of every 5 minutes.
 const WAL_CHECKPOINT_CAP_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Default minimum free disk space (bytes) below which TRUNCATE checkpoints
+/// are skipped (only PASSIVE runs). Overridable via
+/// `MAHBOT_CHECKPOINT_MIN_FREE_BYTES`; `0` disables the gate. ENOSPC is never
+/// corruption — it is an actionable signal, not a quarantine/recreate trigger.
+const DEFAULT_CHECKPOINT_MIN_FREE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Parse the TRUNCATE-min-free-space threshold from the environment.
+fn checkpoint_min_free_bytes() -> u64 {
+    std::env::var("MAHBOT_CHECKPOINT_MIN_FREE_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CHECKPOINT_MIN_FREE_BYTES)
+}
+
+/// Free bytes on the filesystem backing `path` (0 when unavailable).
+#[cfg(unix)]
+fn available_free_bytes(path: &Path) -> u64 {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return 0;
+    };
+    let mut stats = unsafe { std::mem::zeroed::<libc::statvfs>() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), std::ptr::addr_of_mut!(stats)) } != 0 {
+        return 0;
+    }
+    u64::from(stats.f_bavail).saturating_mul(stats.f_frsize)
+}
+
+/// Free bytes on the filesystem backing `path` (0 when unavailable; Windows
+/// has no direct free-space query via libc — the gate simply never trips).
+#[cfg(not(unix))]
+fn available_free_bytes(_path: &Path) -> u64 {
+    u64::MAX
+}
+
+/// True when the store's disk has enough free space for a TRUNCATE checkpoint.
+/// Below the threshold only PASSIVE checkpoints run; the condition is logged
+/// (actionable signal — never classified as corruption).
+fn truncate_allowed(root: &Path) -> bool {
+    let min = checkpoint_min_free_bytes();
+    if min == 0 {
+        return true;
+    }
+    let free = available_free_bytes(root);
+    let allowed = free >= min;
+    if !allowed {
+        warn!(
+            free_bytes = free,
+            min_free_bytes = min,
+            "Free disk space below TRUNCATE checkpoint threshold — running PASSIVE only",
+        );
+    }
+    allowed
+}
 
 /// Which checkpoint mode a store uses.
 #[derive(Debug, Clone, Copy)]
@@ -82,8 +139,9 @@ impl CheckpointPolicy {
 /// Iterate all stores via [`crate::turso::iter_checkpoint_stores`] and run an
 /// async operation on each initialized store in parallel.
 ///
-/// This is the shared iteration pattern used by both
-/// [`checkpoint_all_databases`] and [`verify_all_databases`]. Stores that
+/// This is the shared iteration pattern used by
+/// [`checkpoint_all_databases`] and
+/// [`periodic_checkpoint_and_verify`]. Stores that
 /// haven't been initialized yet (connection is `None`) are silently skipped.
 ///
 /// The operation closure receives `(&'static str, &'static Connection)` — the
@@ -129,7 +187,7 @@ where
 /// is single-writer; GUI shutdown runs while background writers are still live,
 /// but turso's checkpoint lock serializes them, so the effect is busy→warn, not
 /// corruption). Periodic checkpointing uses
-/// [`periodic_checkpoint_all_databases`] instead, which avoids TRUNCATE under
+/// [`periodic_checkpoint_and_verify`] instead, which avoids TRUNCATE under
 /// live writers.
 ///
 /// Skips stores that haven't been initialized yet, and stores whose WAL is
@@ -140,52 +198,76 @@ where
 /// The store entries come from [`crate::turso::iter_checkpoint_stores`] — the
 /// single source of truth for which stores get checkpointed.
 pub async fn checkpoint_all_databases() {
-    checkpoint_stores(CheckpointPolicy::Truncate).await;
+    checkpoint_stores(CheckpointPolicy::Truncate, false).await;
 }
 
-/// Periodic WAL-size hygiene checkpoint (auto-checkpoint loop).
-///
-/// Runs non-truncating (PASSIVE) checkpoints below the WAL-size cap and a
-/// TRUNCATE only when a store's on-disk `-wal` exceeds it — TRUNCATE resets
-/// the shared WAL frame index, which is the two-writer corruption vector when
-/// live connections append afterward, so it is avoided during normal operation.
-/// The TRUNCATE-above-cap branch is the only mechanism that shrinks the WAL
-/// file: turso's own auto-checkpoint is PASSIVE-only.
-pub async fn periodic_checkpoint_all_databases() {
-    checkpoint_stores(CheckpointPolicy::periodic()).await;
+/// One 5-minute hygiene round: WAL checkpoint + integrity verification,
+/// sharing a single coordination-state inspection per store — the checkpoint
+/// and verify loops would otherwise each run a full-predicate `inspect_store`
+/// back-to-back. Also the periodic-loop policy: PASSIVE below the WAL-size
+/// cap, TRUNCATE above it — TRUNCATE resets the shared WAL frame index (the
+/// two-writer corruption vector), so it is avoided under live writers; the
+/// TRUNCATE-above-cap branch is the only mechanism that shrinks the WAL file
+/// (turso's own auto-checkpoint is PASSIVE-only).
+pub async fn periodic_checkpoint_and_verify() {
+    checkpoint_stores(CheckpointPolicy::periodic(), true).await;
 }
 
-async fn checkpoint_stores(policy: CheckpointPolicy) {
+async fn checkpoint_stores(policy: CheckpointPolicy, verify: bool) {
     // The stores were opened under CONFIG's storage root — resolve the
     // artifact directory from the same source (identical to
     // default_config_dir() today, but canonical if a data-dir override lands).
     let root = crate::config::CONFIG.try_storage_root();
+    let truncate_gate = root.as_deref().is_none_or(truncate_allowed);
     for_each_store(|name, conn| {
         let root = root.clone();
         async move {
-            let status = root
-                .as_deref()
-                .map(|r| crate::wal_guard::inspect_store(r, name));
-            if status.as_ref().is_some_and(|s| s.orphaned_wal) {
+            // Re-check the persistent sidecar fds against the paths: an
+            // external process that replaced -wal/-tshm means any checkpoint
+            // would touch a foreign file — suspend this store's checkpoints.
+            if conn.check_coordination_identity() == Some(crate::turso::SidecarIdentity::Replaced) {
                 warn!(
                     db = %name,
-                    "Skipping checkpoint: orphaned WAL (on-disk -wal empty while .tshm \
-                     advertises live frames) — checkpointing would zero-fill. Note: the \
-                     orphaned predicate has a quiet window (max_frame reads 0 right after a \
-                     checkpoint), so a store orphaned within that window is checkpointed \
-                     instead — a TRUNCATE on its empty WAL is then a no-op.",
+                    "Skipping checkpoint: coordination files replaced by an external process",
                 );
                 return;
             }
+            let status = root
+                .as_deref()
+                .map(|r| crate::wal_guard::inspect_store(r, name, conn.store_fds()));
+            if let Some(status) = status.as_ref().filter(|s| s.class.blocks_checkpoint()) {
+                warn!(
+                    db = %name,
+                    class = status.class.label(),
+                    "Skipping checkpoint: blocking coordination state — checkpointing would \
+                     zero-fill or touch a foreign WAL",
+                );
+                if verify {
+                    info!(
+                        db = %name,
+                        "Database integrity check skipped (checkpoint-blocked coordination state)"
+                    );
+                }
+                return;
+            }
             let truncate = match policy {
-                CheckpointPolicy::Truncate => true,
+                // Exit-time TRUNCATE (self-update handoff / shutdown): the
+                // ENOSPC gate below applies here too — a TRUNCATE that runs
+                // out of space mid-way is worse than the passive compaction
+                // it skips. The handoff contract (release flock, spawn the
+                // replacement) is unchanged; only the header-only-WAL clean
+                // handoff is dropped, and that is a hygiene nicety, not a
+                // durability requirement (committed frames are fsync-durable
+                // at COMMIT regardless).
+                CheckpointPolicy::Truncate => truncate_gate,
                 CheckpointPolicy::PassiveCapped(cap) => {
-                    // Safe default under uncertainty (root unresolvable) is
-                    // PASSIVE — TRUNCATE is the corruption vector, and the
-                    // periodic path's TRUNCATE-above-cap branch is the only
-                    // WAL-shrinking mechanism (turso's auto-checkpoint is
-                    // PASSIVE-only); durability is unaffected either way.
-                    status.as_ref().is_some_and(|s| s.wal_size > cap)
+                    // PASSIVE while the WAL is absent/unmeasurable (status
+                    // None — unresolvable root or an unregistered store) or
+                    // below the cap; TRUNCATE only above it. `truncate_gate`
+                    // adds the free-space check for resolvable roots — it is
+                    // moot when `status` is None, which is exactly the
+                    // unresolvable-root case (no stores initialized anyway).
+                    status.as_ref().is_some_and(|s| s.wal_size > cap) && truncate_gate
                 }
             };
             let outcome = if truncate {
@@ -209,56 +291,15 @@ async fn checkpoint_stores(policy: CheckpointPolicy) {
                 ),
                 Err(e) => warn!(error = %e, db = %name, "Failed to checkpoint database WAL"),
             }
-        }
-    })
-    .await;
-}
-
-/// Run PRAGMA quick_check on all initialized database stores.
-///
-/// Iterates all stores via [`crate::turso::iter_checkpoint_stores`], runs
-/// `quick_check` on each in parallel, and logs the results. Corruption
-/// errors are logged at `error!` level for operator visibility in the
-/// dashboard Logs page, and a full `PRAGMA integrity_check` is
-/// automatically triggered on the affected store so the complete
-/// diagnostic report is available without manual intervention.
-/// Successes are logged at `info!` level.
-///
-/// Skips stores that haven't been initialized yet. This is a fire-and-forget
-/// function: all per-store errors are logged and swallowed to avoid blocking
-/// the caller (matching the pattern of [`checkpoint_all_databases`]).
-pub async fn verify_all_databases() {
-    for_each_store(|name, conn| async move {
-        match conn.quick_check().await {
-            Ok(()) => info!(db = %name, "Database integrity check passed"),
-            Err(e) => {
-                // Run the full integrity_check to get the complete diagnostic
-                // report so operators can triage without running debug CLI.
-                match conn.integrity_check().await {
-                    Ok(problems) if problems.is_empty() => {
-                        // quick_check reported corruption but integrity_check
-                        // found nothing — unexpected but handle gracefully.
-                        warn!(
-                            db = %name,
-                            "Full integrity check returned no problems after quick_check failure"
-                        );
-                    }
-                    Ok(problems) => {
-                        let count = problems.len();
-                        let problems_joined = problems.join("; ");
-                        error!(
-                            error = %e, db = %name, count,
-                            problems = %problems_joined,
-                            "Integrity check failed for {} ({} issue(s)): {}",
-                            name, count, problems_joined,
-                        );
-                    }
-                    Err(diag_err) => {
-                        error!(
-                            error = %diag_err, db = %name,
-                            "Full integrity check also failed — database corruption may be severe"
-                        );
-                    }
+            // Integrity verification shares the inspect above when this is
+            // the periodic round. Log-only: runtime-detected btree/index
+            // desync is healed at the next store init (boot), not in place
+            // mid-run. (The known FTS count-mismatch false positive is
+            // already filtered by the quick_check row scan.)
+            if verify {
+                match conn.quick_check().await {
+                    Ok(()) => info!(db = %name, "Database integrity check passed"),
+                    Err(e) => error!(error = %e, db = %name, "Database integrity check failed"),
                 }
             }
         }
@@ -270,12 +311,11 @@ pub async fn verify_all_databases() {
 mod tests {
     use super::*;
 
-    /// Verify that both `checkpoint_all_databases` and `verify_all_databases` are
-    /// no-ops (no panic) when no stores are initialized (all `OnceCell`s are empty).
+    /// The checkpoint/verify entry points are no-ops (no panic) when no stores
+    /// are initialized (all `OnceCell`s are empty).
     #[tokio::test]
     async fn noop_when_no_stores() {
         checkpoint_all_databases().await;
-        periodic_checkpoint_all_databases().await;
-        verify_all_databases().await;
+        periodic_checkpoint_and_verify().await;
     }
 }

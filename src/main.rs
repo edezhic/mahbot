@@ -80,9 +80,14 @@ fn format_startup_panic(payload: &(dyn std::any::Any + Send)) -> String {
 async fn bootstrap_mahbot() -> Result<()> {
     mahbot::config::load_or_init().await?;
 
-    let (log_store, log_broadcast) =
-        mahbot::logs::init_tracing(&CONFIG.global_storage_root()).await?;
+    // Boot pre-flight: classify all 7 stores BEFORE any store is opened (the
+    // logs store opens first inside init_tracing, and turso's own reopen
+    // would consume the coordination evidence). The per-store heal strategy
+    // flows from this scan into turso::open_store.
+    let storage_root = mahbot::config::CONFIG.global_storage_root();
+    mahbot::wal_guard::diagnose_all_stores(std::path::Path::new(&storage_root));
 
+    let (log_store, log_broadcast) = mahbot::logs::init_tracing(&storage_root).await?;
     let _ = mahbot::gui::LOG_BROADCAST.set(log_broadcast);
 
     mahbot::search_engine::init_global(); // sync — no I/O
@@ -335,7 +340,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
     // regardless of checkpoints). Non-truncating (PASSIVE) below the WAL-size
     // cap — TRUNCATE resets the shared WAL frame index, which is the
     // two-writer corruption vector under live connections, so the periodic
-    // loop avoids it (see checkpoint::periodic_checkpoint_all_databases).
+    // loop avoids it (see checkpoint::periodic_checkpoint_and_verify).
     spawn_cancellable(&mut tasks, &shutdown_token, "auto-checkpoint", async {
         loop {
             if !mahbot::shutdown::sleep_or_shutdown_or_drain(Duration::from_mins(5)).await {
@@ -349,8 +354,9 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
             if mahbot::self_update::update_is_finalizing() {
                 break;
             }
-            mahbot::checkpoint::periodic_checkpoint_all_databases().await;
-            mahbot::checkpoint::verify_all_databases().await;
+            // One hygiene round: WAL checkpoint + integrity verification
+            // sharing a single coordination-state inspection per store.
+            mahbot::checkpoint::periodic_checkpoint_and_verify().await;
         }
     });
 
@@ -491,6 +497,10 @@ fn main() -> Result<()> {
             .build()?;
         match rt.block_on(mahbot::debug::run_debug()) {
             Ok(()) => std::process::exit(0),
+            Err(e) if e.downcast_ref::<mahbot::debug::GateRefusal>().is_some() => {
+                eprintln!("Error: {e:#}");
+                std::process::exit(2);
+            }
             Err(e) => {
                 eprintln!("Error: {e:#}");
                 std::process::exit(1);

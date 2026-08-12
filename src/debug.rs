@@ -50,6 +50,7 @@
 //! engine messages are themselves the cryptic output this CLI exists to
 //! replace).
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -130,10 +131,334 @@ const OPEN_RETRY_BACKOFF_SECS: [u64; MAX_OPEN_ATTEMPTS - 1] = [1, 2, 4, 8];
 /// Run the debug subcommand. Parses `env::args()` for the debug invocation.
 ///
 /// Returns `Ok(())` on success (exit code 0), `Err` on failure (exit code 1).
+/// A gate refusal is a [`GateRefusal`] (mapped to exit code 2 by the caller).
 /// Prints usage to stderr and returns `Err` for invalid argument combinations.
 pub async fn run_debug() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     run_debug_with_args(args, None).await
+}
+
+/// Marker error for the CLI flock-gate refusal (fixed exit code 2 — 0=ok and
+/// 1=error are already taken, and scripts/agents invoke `mahbot debug` while
+/// the daemon is live).
+#[derive(Debug)]
+pub struct GateRefusal;
+
+impl std::fmt::Display for GateRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "another process holds the mahbot instance lock; retry later"
+        )
+    }
+}
+
+impl std::error::Error for GateRefusal {}
+
+/// Overall deadline for the flock-gate state machine (bounds the polling).
+const GATE_TIMEOUT_SECS: u64 = 15;
+
+/// Consecutive free observations required before taking the flock in
+/// crash-recovery mode (narrows — not closes — the self-update handoff
+/// window: in the saw-busy path `take_flock` races the incoming daemon's
+/// fail-fast acquire — a lost race restarts the observations; the no-flock
+/// path is covered by the post-open byte-0 verification).
+const GATE_FREE_OBSERVATIONS: u32 = 2;
+
+/// PID of the process holding a write lock on `.tshm` byte-0 (the lifetime-
+/// lock byte) via `fcntl(F_GETLK)` with `F_WRLCK` semantics — a read-only
+/// probe that never takes the lock. `None` = free or no `.tshm` (snapshot
+/// copy → the gate does not apply). `F_RDLCK` probing would miss the daemon's
+/// shared read locks (false "free"), so `F_WRLCK` is used. The PID lets the
+/// gate detect a completed self-update handoff (the byte-0 holder changes)
+/// without ever re-probing the flock.
+#[cfg(unix)]
+fn probe_tshm_byte0_pid(tshm_path: &Path) -> Option<i32> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::File::open(tshm_path).ok()?;
+    let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+    fl.l_type = libc::F_WRLCK;
+    fl.l_whence = 0; // SEEK_SET
+    fl.l_start = 0;
+    fl.l_len = 0;
+    fl.l_pid = 0;
+    // SAFETY: F_GETLK is a non-blocking, non-mutating probe; the fd is valid.
+    let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut fl) };
+    (ret != -1 && fl.l_type != libc::F_UNLCK).then_some(fl.l_pid)
+}
+
+#[cfg(windows)]
+fn probe_tshm_byte0_pid(_tshm_path: &Path) -> Option<i32> {
+    None // Windows has no fcntl lifetime lock; the gate is unix-only
+}
+
+/// Probe whether the instance flock is currently free. flock() has no
+/// F_GETLK equivalent, so this is a transient `LOCK_EX|LOCK_NB` acquire+
+/// release. Callers must probe byte-0 **first** and skip this probe while
+/// byte-0 is held (self-update handoff) — a transient acquire in that window
+/// can kill a fail-fast incoming self-update daemon.
+fn probe_flock_free(lock_path: &Path) -> bool {
+    use std::fs::OpenOptions;
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+    else {
+        return false;
+    };
+    crate::lock_utils::try_flock(&file).unwrap_or(false)
+}
+
+/// Take (and hold) the instance flock — crash-recovery mode. The returned
+/// `File` must be kept alive for the duration of the debug run; dropping it
+/// releases the kernel lock.
+fn take_flock(lock_path: &Path) -> Option<File> {
+    use std::fs::OpenOptions;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .ok()?;
+    match crate::lock_utils::try_flock(&file) {
+        Ok(true) => Some(file),
+        _ => None,
+    }
+}
+
+/// Apply the CLI flock-gate before any turso open of a live store.
+///
+/// Returns `Some(file)` when the gate acquired the instance flock
+/// (crash-recovery after a busy→free transition) — the caller must keep the
+/// `File` alive for the run so a daemon cannot start between the gate's
+/// observations and the turso open. Returns `Ok(None)` when no flock is held
+/// by this process (no lock file at all, a live daemon holds it and the read
+/// proceeds as MultiProcess, or no daemon was ever observed and the read
+/// proceeds like the no-lock-file case).
+///
+/// State machine (validated by the research round):
+/// - flock held + byte-0 held → proceed (MultiProcess read);
+/// - flock held + byte-0 free → wait 1s (macOS lock-drop state; a live daemon
+///   whose fcntl locks are gone must not be opened as Exclusive);
+/// - flock free + byte-0 held on any store → wait, never take the flock
+///   (self-update handoff: the old process is alive; taking the flock would
+///   kill the incoming daemon). The handoff state itself never probes — the
+///   only transient flock acquires are the observation that establishes it
+///   and the exit when byte-0 goes free (the old daemon exited — normal flow
+///   resumes), each a sub-ms risk of landing in the old→new daemon gap.
+///   Outside the handoff the loop probes once per observation (failed
+///   acquires while the flock is held are harmless). The exit is otherwise
+///   detected without probing: a byte-0 holder PID change means the new
+///   daemon opened stores (it holds the flock already — boot order: flock
+///   before stores);
+/// - flock free + all byte-0 free → after two consecutive observations: take
+///   the flock (crash-recovery) and hold it — but only once a busy→free
+///   transition was observed (a "both free" state from the start could be the
+///   self-update handoff gap, where taking the flock would kill the incoming
+///   fail-fast daemon; the post-open byte-0 verification covers the residual
+///   handoff-gap window). With no busy observation ever, proceed without the
+///   flock (fresh install / long-exited daemon — the no-lock-file case);
+/// - timeout → refuse with a [`GateRefusal`] (exit code 2).
+///
+/// Unix-only: the lock-drop vector is process-scoped fcntl (macOS), and
+/// Windows LockFileEx locks are handle-scoped — the byte-0 probe has no
+/// F_GETLK equivalent there, so the gate is skipped (a live daemon would
+/// otherwise misread as permanent lock-drop and refuse every invocation).
+///
+/// Rollout note: the bounded polling assumes the daemon carries the
+/// persistent-fd fix — against a pre-fix daemon the lock-drop state is
+/// near-permanent and every invocation polls up to the deadline before
+/// refusing (exit 2). Daemons and their shell-tool agents share the deployed
+/// binary version, so this only affects a mixed-version rollout; the refusal
+/// is safe either way (never opens as Exclusive).
+///
+/// Only live stores (`.tshm` present) participate. Snapshot copies (db/-wal
+/// only) never block — the documented snapshot-query workflow must keep
+/// working while the daemon is live. When `mahbot.lock` does not exist at all
+/// no daemon has ever started — proceed directly.
+async fn flock_gate(root: &Path, db_names: &[String]) -> Result<Option<File>> {
+    flock_gate_with_timeout(root, db_names, Duration::from_secs(GATE_TIMEOUT_SECS)).await
+}
+
+/// [`flock_gate`] with an explicit deadline (tests inject a short one).
+async fn flock_gate_with_timeout(
+    root: &Path,
+    db_names: &[String],
+    timeout: Duration,
+) -> Result<Option<File>> {
+    // Unix-only (see [`flock_gate`]): on other platforms every live daemon
+    // would misread as permanent lock-drop (no fcntl byte-0 probe) and refuse.
+    if cfg!(not(unix)) {
+        return Ok(None);
+    }
+    let lock_path = crate::lock_utils::lock_file_path(root);
+    if !lock_path.exists() {
+        return Ok(None);
+    }
+    let tshm_paths: Vec<PathBuf> = db_names
+        .iter()
+        .map(|n| turso_mod::store_sidecars(&turso_mod::store_db_path(root, n)).tshm)
+        .filter(|p| p.exists())
+        .collect();
+    if tshm_paths.is_empty() {
+        return Ok(None); // snapshot copies only
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut consecutive_free = 0u32;
+    // Self-update handoff state (flock free + byte-0 held by the old daemon).
+    // Established by one transient flock probe; while set, the flock is never
+    // probed again — the exit is detected via the byte-0 holder PID.
+    let mut handoff = false;
+    let mut handoff_pids: Vec<Option<i32>> = Vec::new();
+    // A daemon's flock was observed held at least once. Crash-recovery takes
+    // the flock only after that busy→free transition: without it, the "both
+    // free" state could be the self-update handoff gap (old daemon released,
+    // new daemon not yet through acquire_lock — macOS Gatekeeper validation
+    // can stretch this window), and taking the flock would kill the fail-fast
+    // incoming daemon.
+    let mut saw_busy = false;
+    loop {
+        let byte0_pids: Vec<Option<i32>> =
+            tshm_paths.iter().map(|p| probe_tshm_byte0_pid(p)).collect();
+        let all_byte0_free = byte0_pids.iter().all(Option::is_none);
+        // Probe byte-0 first. The flock probe is a transient acquire; while
+        // the handoff state is established it is skipped — a transient
+        // acquire in the old→new daemon gap would kill the fail-fast
+        // incoming self-update daemon.
+        let flock_free = if handoff {
+            if all_byte0_free {
+                handoff = false; // old daemon exited — normal flow resumes
+                probe_flock_free(&lock_path)
+            } else if byte0_pids
+                .iter()
+                .zip(&handoff_pids)
+                .any(|(cur, prev)| cur.is_some() && cur != prev)
+            {
+                // The byte-0 holder changed — the new daemon opened stores.
+                // It holds the flock already (boot order) → MultiProcess read.
+                return Ok(None);
+            } else {
+                true // still the old daemon mid-handoff — never probe
+            }
+        } else {
+            probe_flock_free(&lock_path)
+        };
+        if !flock_free {
+            saw_busy = true;
+            if all_byte0_free {
+                // flock held + byte-0 free: a live daemon whose fcntl locks
+                // are dropped (lock-drop state). Opening would classify
+                // Exclusive — wait for the byte-0 lock to reappear.
+                handoff = false;
+                consecutive_free = 0;
+            } else {
+                // flock held + byte-0 held: normal MultiProcess read — safe.
+                return Ok(None);
+            }
+        } else if all_byte0_free {
+            consecutive_free += 1;
+            if consecutive_free >= GATE_FREE_OBSERVATIONS {
+                if saw_busy {
+                    // Crash-recovery: the daemon we saw is gone. Take the
+                    // flock and hold it for the rest of the run so a daemon
+                    // cannot start between the observations and the open.
+                    // Residual gap (acknowledged): a NEW self-update daemon
+                    // starting in the busy→free window loses the race — its
+                    // fail-fast acquire_lock fails after the old daemon
+                    // exited (service outage). The post-open byte-0
+                    // verification never runs here (guard is Some), so this
+                    // is caught by nothing.
+                    if let Some(guard) = take_flock(&lock_path) {
+                        return Ok(Some(guard));
+                    }
+                } else {
+                    // No daemon was ever observed (fresh install or one that
+                    // exited before the first observation). Proceed without
+                    // the flock — the no-lock-file equivalent; a daemon
+                    // starting after the final observation is caught by the
+                    // post-open byte-0 verification.
+                    return Ok(None);
+                }
+                // Lost the race (a daemon started) — restart the observations.
+                consecutive_free = 0;
+            }
+        } else {
+            // flock free + byte-0 held: self-update handoff — never take the
+            // flock; wait for the old process to finish.
+            if !handoff {
+                handoff = true;
+                handoff_pids = byte0_pids;
+            }
+            consecutive_free = 0;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // Single user-facing print: main.rs maps the GateRefusal to exit
+            // code 2 and prints `{e:#}` — the context carries the timeout
+            // diagnosis on top of the generic refusal cause.
+            return Err(anyhow!(GateRefusal).context(format!(
+                "timed out waiting for the mahbot instance lock ({}s)",
+                timeout.as_secs()
+            )));
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// `mahbot debug detect [--db <name>]` — run the full coordination-state
+/// predicate over the stores without opening them. Prints one line per store
+/// (`name\tclass\twal_size=N\tblocking=B`). Exit 0 when all stores are healthy
+/// or warn-only; exit 1 (via `Err`) only when a store is in a
+/// checkpoint-blocking class — warn-only classes (oversized WAL, torn-pre
+/// index, unreadable `.tshm`) are reported but are not failures, mirroring the
+/// checkpoint loop's severity split.
+fn run_debug_detect(args: &[String], home_override: Option<PathBuf>) -> Result<()> {
+    let mahbot_home = match home_override {
+        Some(home) => home,
+        None => crate::config::default_config_dir()?,
+    };
+    let selected = match args.get(3).map(String::as_str) {
+        Some("--db") => match args.get(4) {
+            Some(name) => vec![name.clone()],
+            None => bail!("expected: mahbot debug detect --db <name>"),
+        },
+        Some(other) => bail!("invalid detect argument '{other}'"),
+        None => turso_mod::store_names()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+    };
+    let mut failures = 0usize;
+    for name in &selected {
+        if !turso_mod::store_names().contains(&name.as_str()) {
+            bail!("invalid database name '{name}'");
+        }
+        let status = wal_guard::inspect_store_at(
+            &turso_mod::store_db_path(&mahbot_home, name),
+            wal_guard::StoreFds::none(),
+        );
+        let blocking = status.class.blocks_checkpoint();
+        println!(
+            "{}\t{}\twal_size={}\tblocking={}",
+            name,
+            status.class.label(),
+            status.wal_size,
+            blocking,
+        );
+        // Exit 1 only for the checkpoint-blocking classes; warn-only classes
+        // (oversized WAL, torn-pre index, unreadable .tshm) are reported but
+        // are not failures — they mirror the checkpoint loop's severity split.
+        if blocking {
+            failures += 1;
+        }
+    }
+    if failures > 0 {
+        bail!("{failures} store(s) in a checkpoint-blocking coordination state — see above");
+    }
+    Ok(())
 }
 
 /// Testable core of [`run_debug`].
@@ -148,6 +473,11 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
     if args.get(2).is_some_and(|a| a == "--help") {
         print_usage();
         return Ok(());
+    }
+
+    // `mahbot debug detect [--db <name>]` — full predicate, no opens, no gate.
+    if args.get(2).is_some_and(|a| a == "detect") {
+        return run_debug_detect(&args, home_override);
     }
 
     // Need at least: mahbot debug --db <name> <sql>
@@ -176,6 +506,17 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
 
     let db_list = resolve_db_list(db_name, &mahbot_home)?;
 
+    // Flock-gate: refuse (exit code 2) rather than open a live store in a way
+    // that could classify Exclusive and trigger repair. Runs before any turso
+    // open (the open itself is what triggers the repair). The returned guard
+    // (crash-recovery mode) is held for the whole run — dropping it would
+    // release the instance lock before the queries finish.
+    let flock_guard = flock_gate(
+        &mahbot_home,
+        &db_list.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>(),
+    )
+    .await?;
+
     let mut failures = 0usize;
     for (label, file_path) in &db_list {
         if db_name == "all" {
@@ -196,7 +537,7 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
             bail!("database file not found: {}", file_path.display());
         }
 
-        match query_one_store(file_path, sql).await {
+        match query_one_store(file_path, sql, &mahbot_home, flock_guard.as_ref()).await {
             Ok(()) => {}
             Err(e) => {
                 if db_name == "all" {
@@ -229,26 +570,39 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
 /// frames mid-retry, or the path may be a snapshot copy with no `.tshm` at all
 /// — in which case a persistent torn/page failure means the copied data is
 /// corrupt, not that a live artifact exists.
-async fn query_one_store(file_path: &Path, sql: &str) -> Result<()> {
-    // Pre-open artifact detection: `.tshm` advertises live frames while the
-    // on-disk `-wal` is empty → the daemon's WAL fd is orphaned. Report the
-    // explicit, actionable artifact error instead of letting the open surface
-    // a raw torn-frame read.
-    if let Some(artifact_msg) = detect_live_artifact(file_path) {
-        bail!("{artifact_msg}");
-    }
-
+///
+/// `flock_guard` is the crash-recovery instance flock held by the caller
+/// (`None` when the daemon holds the flock or no lock file exists); the
+/// post-open byte-0 verification uses it to distinguish "we hold the flock"
+/// (byte-0 free is expected) from "the daemon's flock is held but its byte-0
+/// lock dropped" (the open classified Exclusive — abort).
+async fn query_one_store(
+    file_path: &Path,
+    sql: &str,
+    root: &Path,
+    flock_guard: Option<&File>,
+) -> Result<()> {
     // Snapshot copies have no `-tshm`; they are static, so a torn-frame
     // failure cannot be transient there. Only live stores (which the daemon
     // keeps writing to) get the bounded retry that spans write windows.
     let is_live = turso_mod::store_sidecars(file_path).tshm.exists();
+
+    // Pre-open artifact detection: `.tshm` advertises live frames while the
+    // on-disk `-wal` is empty → the daemon's WAL fd is orphaned. Report the
+    // explicit, actionable artifact error instead of letting the open surface
+    // a raw torn-frame read. Live stores get the bounded wait-out first: the
+    // daemon's TRUNCATE checkpoint truncates `-wal` to 32B before `.tshm`
+    // max_frame resets — a transient window, not an artifact.
+    if let Some(artifact_msg) = wait_out_artifact(file_path, is_live).await {
+        bail!("{artifact_msg}");
+    }
 
     // Open + query with bounded retry on torn-frame failures. Retrying
     // spans short write windows (e.g. the daemon mid-checkpoint); the
     // backoff total (~15s) is bounded so the CLI cannot hang for long.
     let mut attempt = 0usize;
     loop {
-        match open_and_query_readonly(file_path, sql) {
+        match open_and_query_readonly(file_path, sql, root, flock_guard) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 if !is_torn_frame_error(&e) {
@@ -281,31 +635,48 @@ async fn query_one_store(file_path: &Path, sql: &str) -> Result<()> {
     }
 }
 
+/// Re-check the artifact condition with the bounded retry backoff — live
+/// stores are waited out first: the daemon's TRUNCATE checkpoint truncates
+/// `-wal` to 32B before `.tshm` max_frame resets, a transient window that
+/// must not be refused as an artifact (asymmetric with the flock-gate's
+/// wait-out-transients polling). Snapshot copies (static) bail immediately.
+async fn wait_out_artifact(db_path: &Path, is_live: bool) -> Option<String> {
+    let mut attempt = 0usize;
+    while let Some(msg) = detect_live_artifact(db_path) {
+        if is_live && attempt < MAX_OPEN_ATTEMPTS - 1 {
+            sleep(Duration::from_secs(OPEN_RETRY_BACKOFF_SECS[attempt])).await;
+            attempt += 1;
+            continue;
+        }
+        return Some(msg);
+    }
+    None
+}
+
 /// Detect the live-instance WAL artifact before opening a store.
 ///
-/// Returns a human-readable, actionable error message when `.tshm` advertises
-/// live frames (`max_frame > 0`) but the on-disk `-wal` is empty — the
-/// signature of an orphaned daemon WAL fd. Returns `None` when the condition
-/// is absent (healthy stores, or affected stores in a quiet window right after
-/// a checkpoint, where `max_frame` reads 0 and a read would actually succeed).
+/// Returns a human-readable, actionable error message when the coordination
+/// state blocks a safe read (orphaned/foreign/truncated WAL — the classes that
+/// also block checkpoints). Returns `None` when the state is healthy or merely
+/// warn-only (oversized WAL, torn-pre index).
 fn detect_live_artifact(db_path: &Path) -> Option<String> {
-    if wal_guard::inspect_store_at(db_path).orphaned_wal {
-        Some(artifact_error_message(db_path))
+    let status = wal_guard::inspect_store_at(db_path, wal_guard::StoreFds::none());
+    if status.class.blocks_checkpoint() {
+        Some(artifact_error_message(db_path, status.class.label()))
     } else {
         None
     }
 }
 
 /// Build the explicit artifact error message for a store.
-fn artifact_error_message(db_path: &Path) -> String {
+fn artifact_error_message(db_path: &Path, class: &str) -> String {
     format!(
-        "live instance artifact: cannot read '{}' safely.\n\
-         The running daemon's WAL file descriptor is orphaned: its on-disk \
-         `-wal` file is empty while the `.tshm` coordination header advertises \
-         live WAL frames (foreign standard-SQLite activity likely removed or \
+        "live instance artifact ({class}): cannot read '{}' safely.\n\
+         The on-disk `-wal`/`.tshm` coordination state is inconsistent with the \
+         daemon's live WAL (foreign standard-SQLite activity likely removed or \
          replaced the `-wal` files under the daemon). Query a snapshot \
-         copy instead — see the snapshot-query procedure in the README. Never \
-         delete or recreate `-wal`/`-shm`/`-tshm` files while the daemon runs.",
+         copy instead. Never delete or recreate `-wal`/`-shm`/`-tshm` files \
+         while the daemon runs.",
         db_path.display()
     )
 }
@@ -325,8 +696,8 @@ fn corruption_error_message(db_path: &Path, retries: usize) -> String {
         format!(
             "database corruption/inconsistency: cannot read '{}' — the read \
              produced a WAL/page error even after {retries} retries. This is a \
-             live store: query a snapshot copy instead (see the snapshot-query \
-             procedure in the README), or retry during a quiet window.",
+             live store: query a snapshot copy instead (copy `db` + `-wal`, no \
+             `-tshm`, while the daemon runs), or retry during a quiet window.",
             db_path.display(),
         )
     } else {
@@ -336,8 +707,7 @@ fn corruption_error_message(db_path: &Path, retries: usize) -> String {
              No `-tshm` was present, so this is a snapshot copy, not a live \
              store. Re-copy the store files (a copy taken mid-checkpoint can be \
              inconsistent); if a fresh copy still fails, the store's on-disk \
-             data itself is corrupt — see the snapshot-query procedure in the \
-             README.",
+             data itself is corrupt.",
             db_path.display()
         )
     }
@@ -355,7 +725,12 @@ fn corruption_error_message(db_path: &Path, retries: usize) -> String {
 /// Query output is buffered and printed only on success: a mid-query failure
 /// (e.g. a torn-frame read) must not leave a partial column header on stdout,
 /// which would be re-printed by the caller's retry loop.
-fn open_and_query_readonly(file_path: &Path, sql: &str) -> Result<()> {
+fn open_and_query_readonly(
+    file_path: &Path,
+    sql: &str,
+    root: &Path,
+    flock_guard: Option<&File>,
+) -> Result<()> {
     let path_str = file_path
         .to_str()
         .with_context(|| format!("database path must be UTF-8: {}", file_path.display()))?;
@@ -375,6 +750,28 @@ fn open_and_query_readonly(file_path: &Path, sql: &str) -> Result<()> {
             file_path.display()
         )
     })?;
+
+    // Post-open verification: when the caller does NOT hold the instance
+    // flock (a live daemon does), a free byte-0 right after the open means the
+    // open classified Exclusive — the lock-drop window between the gate and
+    // this open — and the daemon's repair could run concurrently. Abort.
+    // Unix-only: the fcntl byte-0 probe has no Windows equivalent (the gate
+    // is skipped there too).
+    #[cfg(unix)]
+    if flock_guard.is_none() {
+        let tshm = turso_mod::store_sidecars(file_path).tshm;
+        if tshm.exists() && probe_tshm_byte0_pid(&tshm).is_none() {
+            let lock_path = crate::lock_utils::lock_file_path(root);
+            if lock_path.exists() && !probe_flock_free(&lock_path) {
+                bail!(
+                    "live daemon lock-drop detected after open on '{}' — the open \
+                     classified Exclusive, aborting (retry later or query a snapshot copy)",
+                    file_path.display()
+                );
+            }
+        }
+    }
+
     let conn = db.connect().map_err(|e| {
         anyhow!(
             "failed to connect to database '{}': {e}",
@@ -576,13 +973,16 @@ fn format_truncation_row(column_count: usize) -> String {
 
 fn print_usage() {
     eprintln!("Usage: mahbot debug --db <name> \"SQL query\"");
+    eprintln!("       mahbot debug detect [--db <name>]");
     let names = turso_mod::store_names().join(" | ");
     eprintln!("  --db <name>  {names} | all");
     eprintln!("  SQL query    read-only SQL, quoted as a single argument");
+    eprintln!("  detect       classify coordination state without opening stores");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  mahbot debug --db board \"SELECT phase, COUNT(*) FROM tickets GROUP BY phase\"");
     eprintln!("  mahbot debug --db all \"SELECT name FROM sqlite_master WHERE type='table'\"");
+    eprintln!("  mahbot debug detect");
 }
 
 #[cfg(test)]
@@ -658,10 +1058,10 @@ mod tests {
 
     #[test]
     fn artifact_error_message_is_actionable() {
-        let msg = artifact_error_message(Path::new("/tmp/x/board.db"));
+        let msg = artifact_error_message(Path::new("/tmp/x/board.db"), "orphaned-wal");
         assert!(msg.contains("live instance artifact"));
         assert!(msg.contains("snapshot"));
-        assert!(msg.contains("README"));
+        assert!(msg.contains("Never delete or recreate"));
     }
 
     /// End-to-end: `run_debug_with_args` opens a real (temporary) store
@@ -810,5 +1210,301 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    // ── flock-gate tests ───────────────────────────────────────────────
+
+    fn write_tshm_only(root: &Path, name: &str) {
+        let db_path = turso_mod::store_db_path(root, name);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let mut bytes = vec![0u8; 116];
+        bytes[0..8].copy_from_slice(crate::wal_guard::TSHM_MAGIC.as_slice());
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&64u32.to_le_bytes());
+        std::fs::write(turso_mod::store_sidecars(&db_path).tshm, bytes).unwrap();
+    }
+
+    /// Create `mahbot.lock` WITHOUT taking the flock (the gate's crash-recovery
+    /// and handoff states require the file to exist).
+    fn touch_lock(lock_path: &Path) {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap();
+    }
+
+    fn hold_flock(lock_path: &Path) -> std::fs::File {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap();
+        assert!(
+            crate::lock_utils::try_flock(&file).unwrap(),
+            "test must hold the flock"
+        );
+        file
+    }
+
+    /// Spawn a perl child that holds `.tshm` byte-0 via fcntl F_SETLK — a
+    /// real cross-process lock (macOS F_GETLK deliberately ignores locks held
+    /// by the calling process itself). The child lives ~30s; callers kill it.
+    #[cfg(unix)]
+    fn hold_byte0_perl(tshm: &Path) -> std::process::Child {
+        let perl = format!(
+            "use Fcntl qw(F_SETLK F_WRLCK); open(my $f, \"+<\", $ARGV[0]) or die $!; \
+             my $buf = pack(\"q< q< l< s< s<\", 0, 0, $$, {}, 0); \
+             fcntl($f, F_SETLK, $buf) or die $!; sleep 30;",
+            libc::F_WRLCK,
+        );
+        std::process::Command::new("perl")
+            .args(["-e", &perl, tshm.to_str().unwrap()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn perl byte-0 holder")
+    }
+
+    /// The gate is a no-op when no `mahbot.lock` exists (no daemon ever
+    /// started) — the snapshot-query and bare-store workflows stay unblocked.
+    /// Serialized: the gate tests manipulate process-wide flock/fcntl state
+    /// and spawn perl lock-holder children, so they must not run concurrently.
+    #[tokio::test]
+    #[serial_test::serial(flock_gate)]
+    async fn flock_gate_passes_without_lock_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_tshm_only(dir.path(), "board");
+        assert!(
+            flock_gate_with_timeout(dir.path(), &["board".into()], Duration::from_secs(1))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// Normal live-daemon state (flock held + byte-0 held) proceeds — the
+    /// CLI's turso open sees MultiProcess and reads safely. The byte-0 lock
+    /// must come from a real child process: on macOS `F_GETLK` deliberately
+    /// ignores locks held by the calling process itself, so an in-process
+    /// lock would read as "free" and the gate would (correctly) wait.
+    #[tokio::test]
+    #[cfg(unix)]
+    #[serial_test::serial(flock_gate)]
+    async fn flock_gate_proceeds_when_daemon_alive() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_tshm_only(dir.path(), "board");
+        let _flock = hold_flock(&crate::lock_utils::lock_file_path(dir.path()));
+        let tshm = turso_mod::store_sidecars(&turso_mod::store_db_path(dir.path(), "board")).tshm;
+        let mut child = hold_byte0_perl(&tshm);
+        // Wait for the child to place the lock before probing.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            probe_tshm_byte0_pid(&tshm).is_some(),
+            "child must hold the byte-0 lock"
+        );
+        let guard = flock_gate_with_timeout(dir.path(), &["board".into()], Duration::from_secs(1))
+            .await
+            .expect("flock held + byte-0 held must proceed");
+        assert!(
+            guard.is_none(),
+            "a live daemon holds the flock — the gate must not take it"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Crash-recovery: after a busy→free transition (the daemon's flock was
+    /// observed held, then released), two consecutive free observations make
+    /// the gate TAKE the flock and return the guard, which actually holds it
+    /// (a second probe sees it busy).
+    #[tokio::test]
+    #[serial_test::serial(flock_gate)]
+    async fn flock_gate_takes_flock_in_crash_recovery() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_tshm_only(dir.path(), "board");
+        let lock_path = crate::lock_utils::lock_file_path(dir.path());
+        touch_lock(&lock_path);
+        // The gate must first observe the flock busy (the daemon's release
+        // precedes its exit), then see two consecutive free observations.
+        let flock = hold_flock(&lock_path);
+        let dir_path = dir.path().to_path_buf();
+        let names = vec!["board".to_string()];
+        let gate = tokio::spawn(async move {
+            flock_gate_with_timeout(&dir_path, &names, Duration::from_secs(4)).await
+        });
+        // Let the gate's first observation land while the flock is held.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(flock); // busy → free
+        let guard = gate
+            .await
+            .expect("gate task must not panic")
+            .expect("flock free + byte-0 free after busy must proceed");
+        assert!(
+            !probe_flock_free(&lock_path),
+            "the returned guard must hold the flock (probe sees it busy)"
+        );
+        drop(guard);
+        // The kernel releases the flock when the guard's fd closes; poll
+        // briefly since close→flock-visible-release can lag under load on
+        // macOS (the assertion's semantics are unchanged — the flock must
+        // become free, not stay busy).
+        let release_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while !probe_flock_free(&lock_path) {
+            assert!(
+                tokio::time::Instant::now() < release_deadline,
+                "dropping the guard must release the flock"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Self-update handoff: flock free + byte-0 held (old process finishing).
+    /// The gate must wait (time out into a refusal) and must never take the
+    /// flock — a transient acquire would kill a fail-fast incoming daemon.
+    #[tokio::test]
+    #[cfg(unix)]
+    #[serial_test::serial(flock_gate)]
+    async fn flock_gate_never_takes_flock_during_handoff() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_tshm_only(dir.path(), "board");
+        let lock_path = crate::lock_utils::lock_file_path(dir.path());
+        touch_lock(&lock_path);
+        let tshm = turso_mod::store_sidecars(&turso_mod::store_db_path(dir.path(), "board")).tshm;
+        let mut child = hold_byte0_perl(&tshm);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            probe_tshm_byte0_pid(&tshm).is_some(),
+            "child must hold byte-0"
+        );
+        let err = flock_gate_with_timeout(dir.path(), &["board".into()], Duration::from_secs(1))
+            .await
+            .expect_err("flock free + byte-0 held must wait and time out");
+        assert!(
+            err.downcast_ref::<GateRefusal>().is_some(),
+            "must be a GateRefusal (exit code 2), got: {err:#}"
+        );
+        assert!(
+            probe_flock_free(&lock_path),
+            "the gate must never take the flock during the handoff"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Self-update handoff completed: the byte-0 holder PID changes (the new
+    /// daemon opened stores). The gate must exit the handoff and proceed as a
+    /// MultiProcess read instead of timing out — the exit is detected via the
+    /// PID, never by re-probing the flock.
+    ///
+    /// Two stores make the swap deterministic: the gate's first observation
+    /// records `[Some(old), None]` (old holds `board`, `chat_history` unheld),
+    /// and the new child acquires `chat_history` mid-run — uncontended (the
+    /// old child locks a different file), so the new pid lands with wide
+    /// margin before the gate's second observation (~1s) and the PID change
+    /// fires.
+    #[tokio::test]
+    #[cfg(unix)]
+    #[serial_test::serial(flock_gate)]
+    async fn flock_gate_proceeds_after_handoff_pid_change() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_tshm_only(dir.path(), "board");
+        write_tshm_only(dir.path(), "chat_history");
+        let lock_path = crate::lock_utils::lock_file_path(dir.path());
+        touch_lock(&lock_path);
+        let tshm_a = turso_mod::store_sidecars(&turso_mod::store_db_path(dir.path(), "board")).tshm;
+        let tshm_b =
+            turso_mod::store_sidecars(&turso_mod::store_db_path(dir.path(), "chat_history")).tshm;
+        let mut old = hold_byte0_perl(&tshm_a);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            probe_tshm_byte0_pid(&tshm_a).is_some() && probe_tshm_byte0_pid(&tshm_b).is_none(),
+            "old daemon holds board; chat_history starts unheld"
+        );
+        let dir_path = dir.path().to_path_buf();
+        let names = vec!["board".to_string(), "chat_history".to_string()];
+        // The first observation runs immediately at spawn (old holds board)
+        // and establishes the handoff as [Some(old), None]. Swap children
+        // early: chat_history is uncontended, so the new pid lands with wide
+        // margin before the gate's second observation (~1s after spawn).
+        let gate = tokio::spawn(async move {
+            flock_gate_with_timeout(&dir_path, &names, Duration::from_secs(5)).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = old.kill();
+        let _ = old.wait();
+        let mut new = hold_byte0_perl(&tshm_b);
+        // Poll (bounded) until the new child holds byte-0 — assert well
+        // before the gate's second observation (~1s after start) so the
+        // handoff never observes an all-free gap.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+        while probe_tshm_byte0_pid(&tshm_b).is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "new daemon must hold byte-0 before the gate's next observation"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let guard = gate
+            .await
+            .expect("gate task must not panic")
+            .expect("pid change must exit the handoff");
+        assert!(
+            guard.is_none(),
+            "the new daemon holds the flock — the gate must not take it"
+        );
+        assert!(
+            probe_flock_free(&lock_path),
+            "the flock must never be taken"
+        );
+        let _ = new.kill();
+        let _ = new.wait();
+    }
+
+    /// The macOS lock-drop state (flock held by a live daemon whose fcntl
+    /// byte-0 lock is gone) must NOT proceed — opening would classify
+    /// Exclusive and trigger repair. Times out into a [`GateRefusal`].
+    #[tokio::test]
+    #[serial_test::serial(flock_gate)]
+    async fn flock_gate_refuses_in_lock_drop_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_tshm_only(dir.path(), "board");
+        let _flock = hold_flock(&crate::lock_utils::lock_file_path(dir.path()));
+        let err = flock_gate_with_timeout(dir.path(), &["board".into()], Duration::from_secs(1))
+            .await
+            .expect_err("flock held + byte-0 free must refuse");
+        assert!(
+            err.downcast_ref::<GateRefusal>().is_some(),
+            "must be a GateRefusal (exit code 2), got: {err:#}"
+        );
+    }
+
+    /// `debug detect` classifies synthetic states without opening anything.
+    #[test]
+    fn debug_detect_reports_non_healthy_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_tshm_only(dir.path(), "board");
+        // No max_frame in the fixture → healthy.
+        let args = vec![
+            "mahbot".to_string(),
+            "debug".to_string(),
+            "detect".to_string(),
+            "--db".to_string(),
+            "board".to_string(),
+        ];
+        assert!(run_debug_detect(&args, Some(dir.path().to_path_buf())).is_ok());
+
+        // max_frame > 0 with no WAL → orphaned → non-zero exit.
+        let tshm_path =
+            turso_mod::store_sidecars(&turso_mod::store_db_path(dir.path(), "board")).tshm;
+        let mut bytes = std::fs::read(&tshm_path).unwrap();
+        bytes[56..64].copy_from_slice(&5u64.to_le_bytes());
+        std::fs::write(&tshm_path, bytes).unwrap();
+        let err = run_debug_detect(&args, Some(dir.path().to_path_buf()))
+            .expect_err("orphaned state must fail detect");
+        assert!(format!("{err:#}").contains("blocking"), "got: {err:#}");
     }
 }

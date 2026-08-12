@@ -261,9 +261,18 @@ impl LogStore {
                      and recreating a fresh store",
                 );
                 quarantine_logs_artifacts(root);
-                let conn = crate::turso::open_store(root, "logs", LOGS_SCHEMA)
-                    .await
-                    .context("Failed to recreate logs store after quarantine")?;
+                // The recreate is on a fresh store — the boot diagnosis was
+                // already consumed by the failed open, so this bypasses the
+                // heal path. Any post-recreate failure (migrations below)
+                // propagates WITHOUT a second quarantine: the fresh store is
+                // not corrupt, a migration failure is a code bug, and a
+                // double quarantine would destroy the forensic record.
+                let conn = crate::turso::open_with_schema(
+                    &turso::store_db_path(root, "logs"),
+                    LOGS_SCHEMA,
+                )
+                .await
+                .context("Failed to recreate logs store after quarantine")?;
                 Self { conn }
             }
             Err(OpenFailure::Other(e)) => return Err(e),
@@ -452,20 +461,32 @@ enum OpenFailure {
 /// multiprocess_wal can panic (e.g. the shared-WAL frame-index invariant), and
 /// a boot-time panic here must quarantine rather than crash startup.
 async fn open_verified_logs_store(root: &Path) -> Result<crate::turso::Connection, OpenFailure> {
+    let db_path = turso::store_db_path(root, "logs");
+    // The boot path (a pre-flight diagnosis exists) already ran quick_check
+    // inside open_and_repair — the verify below would duplicate the 7× boot
+    // scan for the logs store. Non-boot opens (tests) verify here.
+    let boot_verified = crate::wal_guard::has_boot_diagnosis(&db_path);
     let open = AssertUnwindSafe(crate::turso::open_store(root, "logs", LOGS_SCHEMA))
         .catch_unwind()
         .await;
     let conn = match open {
         Ok(Ok(conn)) => conn,
         Ok(Err(e)) => {
-            let db_path = turso::store_db_path(root, "logs");
             // A store that exists but cannot be opened at all is corrupt —
             // quarantine so boot can proceed with a fresh store. A missing
             // file (first boot) opens fine, so this path implies an existing
             // file that is unreadable. Busy/locked/IO-class open errors
             // (disk full, transient permission) never quarantine — route
-            // through the same classifier as the quick_check path.
-            if db_path.exists() && is_corruption_class(&e) {
+            // through the same classifier as the quick_check path. A fresh
+            // store open failure after the boot-heal path already quarantined
+            // the original family is NOT corrupt either — the recreate itself
+            // failed; propagate without a second quarantine.
+            if let Some(crate::turso::RecreateFailed(inner)) =
+                e.downcast_ref::<crate::turso::RecreateFailed>()
+            {
+                return Err(OpenFailure::Other(anyhow::anyhow!("{inner:#}")));
+            }
+            if db_path.exists() && crate::turso::is_corruption_class(&e) {
                 return Err(OpenFailure::Corrupt(format!("open failed: {e:#}")));
             }
             return Err(OpenFailure::Other(e));
@@ -477,10 +498,15 @@ async fn open_verified_logs_store(root: &Path) -> Result<crate::turso::Connectio
             )));
         }
     };
+    if boot_verified {
+        return Ok(conn);
+    }
     let verify = AssertUnwindSafe(conn.quick_check()).catch_unwind().await;
     match verify {
         Ok(Ok(())) => Ok(conn),
-        Ok(Err(e)) if is_corruption_class(&e) => Err(OpenFailure::Corrupt(format!("{e:#}"))),
+        Ok(Err(e)) if crate::turso::is_corruption_class(&e) => {
+            Err(OpenFailure::Corrupt(format!("{e:#}")))
+        }
         Ok(Err(e)) => Err(OpenFailure::Other(e)),
         Err(payload) => Err(OpenFailure::Corrupt(format!(
             "integrity check panicked: {}",
@@ -599,77 +625,13 @@ pub(crate) async fn migrate_retry_failures_columns(conn: &turso::Connection) -> 
     Ok(())
 }
 
-/// True when a `quick_check` failure is corruption-class rather than a
-/// busy/locked/IO failure of the PRAGMA itself.
-///
-/// Two forms qualify: the PRAGMA returned a non-`ok` row (our
-/// `Database integrity check failed` bail), or the PRAGMA failed to execute
-/// with a message that is not a lock/busy or I/O condition (e.g. a page-level
-/// error reading a zeroed page — `Invalid page type`). Only corruption-class
-/// failures quarantine — a busy or locked store must never trigger the rename
-/// path.
-///
-/// Note: this is a negation-based substring heuristic. A corruption message
-/// that happens to contain `busy`/`locked` would be misclassified as
-/// non-corruption (boot fails rather than quarantines), and an I/O error
-/// lacking the expected tokens could false-quarantine. The open-failure path
-/// has a sharper inversion: a corrupt store that fails to OPEN with an
-/// I/O-flavored message (e.g. a zeroed page read surfacing as `i/o error`)
-/// is classified non-corruption and boot fails without quarantine — the
-/// opposite of the intended resilience. Conversely an error lacking the
-/// tokens (e.g. `No space left on device`, `too many open files`) false-
-/// quarantines a healthy store. Bounded to the logs-only boot path (the
-/// primary target — `Invalid page type` from zeroed pages — is caught);
-/// accepted as pragmatic.
-fn is_corruption_class(e: &anyhow::Error) -> bool {
-    let msg = format!("{e:#}");
-    if msg.contains("Database integrity check failed") {
-        return true;
-    }
-    let lower = msg.to_lowercase();
-    !(lower.contains("busy")
-        || lower.contains("locked")
-        || lower.contains("i/o error")
-        || lower.contains("no such file")
-        || lower.contains("permission denied"))
-}
-
 /// Move the logs store's whole artifact family aside to a timestamped
 /// quarantine name. Best-effort: a rename failure is logged, never fatal.
-///
-/// The timestamp is second-granularity and `rename` would silently overwrite
-/// an existing destination, so a monotonically increasing sequence suffix
-/// guarantees uniqueness across multiple quarantines within the same second.
+/// Delegates to the shared store-family quarantine (identical naming scheme;
+/// the logs-specific wrapper keeps the call sites' intent explicit). The
+/// recreate path tolerates a partial quarantine — the bool is ignored.
 fn quarantine_logs_artifacts(root: &Path) {
-    static QUARANTINE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let db_path = turso::store_db_path(root, "logs");
-    let sidecars = turso::store_sidecars(&db_path);
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-    let seq = QUARANTINE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let base = if seq == 0 {
-        format!("logs.db.quarantine-{stamp}")
-    } else {
-        format!("logs.db.quarantine-{stamp}-{seq}")
-    };
-    for (src, suffix) in [
-        (&db_path, ""),
-        (&sidecars.wal, "-wal"),
-        (&sidecars.shm, "-shm"),
-        (&sidecars.tshm, "-tshm"),
-    ] {
-        if !src.exists() {
-            continue;
-        }
-        let dst = db_path.with_file_name(format!("{base}{suffix}"));
-        if let Err(e) = std::fs::rename(src, &dst) {
-            warn!(
-                error = %e,
-                from = %src.display(),
-                to = %dst.display(),
-                "Failed to quarantine corrupt logs store artifact",
-            );
-        }
-    }
+    let _ = turso::quarantine_store_artifacts(&turso::store_db_path(root, "logs"));
 }
 
 /// Parameters for filtering log queries.
@@ -794,7 +756,15 @@ fn log_entry_from_row(row: &Row) -> anyhow::Result<LogEntry> {
 pub async fn init_tracing(
     storage_root: &Path,
 ) -> anyhow::Result<(Arc<LogStore>, tokio::sync::broadcast::Sender<String>)> {
-    let store = LogStore::open(storage_root).await?;
+    let store = match LogStore::open(storage_root).await {
+        Ok(store) => store,
+        Err(e) => {
+            // Pre-tracing diagnostics were already written to stderr; drop the
+            // buffer — the logs-store replay can never run.
+            crate::boot::clear_boot_diagnostics();
+            return Err(e);
+        }
+    };
     LOG_STORE
         .set(store.clone())
         .map_err(|_| anyhow::anyhow!("LOG_STORE already initialized"))?;
@@ -819,6 +789,11 @@ pub async fn init_tracing(
                 .with_ansi(false),
         )
         .init();
+    crate::boot::mark_tracing_initialized();
+
+    // Surface pre-tracing boot diagnostics (pre-flight, logs heal) in the
+    // logs store so the GUI boot log shows them.
+    crate::boot::replay_boot_diagnostics();
 
     Ok((log_store, broadcast_tx))
 }
