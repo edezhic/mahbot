@@ -481,6 +481,12 @@ mod tests {
         // Edit vs generation disambiguation: the catalog duration range is
         // generation-only, so the Artist is not misled into passing it for edits.
         assert!(seedance.contains("applies to generation, not edits"));
+        // 2.0-mini differs: edit-mode duration is explicit (not 'auto').
+        let mini =
+            render_video_section("bytedance/seedance-2.0-mini", None).expect("nuance rendered");
+        assert!(mini.contains("- editing: whole-frame restyle"));
+        assert!(mini.contains("explicit"));
+        assert!(mini.contains("4-15s"));
         assert!(render_video_section("unknown/model", None).is_none());
     }
 }

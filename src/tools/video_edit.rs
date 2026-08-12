@@ -14,7 +14,9 @@ const MAX_INPUT_BYTES: u64 = 50 * 1024 * 1024;
 /// Input image size cap (provider-declared 30 MB bound for hailuo-3).
 const MAX_IMAGE_BYTES: u64 = 30 * 1024 * 1024;
 
-/// Maximum reference images per request (native hailuo-3 limit of 9).
+/// Maximum reference images per request: hailuo-3 natively allows 9;
+/// seedance-2.0-mini documents 9 (BytePlus/mirrors; Cloudflare's relay
+/// schema says 4 — not adopted). Applied uniformly.
 const MAX_REFERENCE_IMAGES: usize = 9;
 
 /// Per-model video edit capability classification, driving validation and the
@@ -22,13 +24,16 @@ const MAX_REFERENCE_IMAGES: usize = 9;
 /// `video_model` in the config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VideoEditModel {
-    /// minimax/hailuo-3 (default): 5–15 s output, 2K fixed, always audio, no seed.
+    /// minimax/hailuo-3 (default): 5-15s output, 2K fixed, always audio, no seed.
     Hailuo3,
     /// runway/aleph-2: output mirrors input, preserves audio, seed best-effort.
     Aleph2,
     /// bytedance/seedance-2.5: whole-frame restyle, 480p/720p via OpenRouter;
     /// edit tasks require duration 'auto' (integer durations rejected).
     Seedance,
+    /// bytedance/seedance-2.0-mini: whole-frame restyle, 480p/720p via OpenRouter;
+    /// edit tasks accept explicit 4-15s durations (unlike 2.5's auto-only).
+    SeedanceMini,
     /// Any other configured model — permissive validation.
     Unknown,
 }
@@ -37,12 +42,15 @@ fn classify_model(model: &str) -> VideoEditModel {
     let m = model.to_ascii_lowercase();
     // Substring match (not exact) so vendor-prefixed IDs like
     // "minimax/hailuo-3" keep resolving; Unknown covers every other model
-    // permissively. seedance is pinned to 2.5 so seedance-2.0/1.5-pro do not
-    // inherit the edit-duration rule.
+    // permissively. seedance-2.5 keeps its auto-duration edit rule;
+    // seedance-2.0-mini gets explicit-duration edits; seedance-2.0/2.0-fast/
+    // 1.5-pro stay Unknown.
     if m.contains("hailuo") {
         VideoEditModel::Hailuo3
     } else if m.contains("aleph") {
         VideoEditModel::Aleph2
+    } else if m.contains("seedance") && m.contains("2.0-mini") {
+        VideoEditModel::SeedanceMini
     } else if m.contains("seedance") && m.contains("2.5") {
         VideoEditModel::Seedance
     } else {
@@ -66,6 +74,10 @@ pub(crate) fn video_edit_nuances(model: &str) -> Option<&'static str> {
              is automatic ('auto') — the 4-30s duration range applies to generation, \
              not edits",
         ),
+        VideoEditModel::SeedanceMini => Some(
+            "whole-frame restyle; output 480p/720p via OpenRouter; edit-mode duration \
+             is explicit (4-15s, same range as generation)",
+        ),
         VideoEditModel::Aleph2 | VideoEditModel::Unknown => None,
     }
 }
@@ -74,13 +86,32 @@ pub(crate) fn video_edit_nuances(model: &str) -> Option<&'static str> {
 /// (video-reference) tasks natively require duration 'auto', and forwarding an
 /// explicit integer is provider-rejected. Omission is schema-valid and lets
 /// the provider default to 'auto'. Image-to-video (frame-anchor) keeps the
-/// catalog duration range.
+/// catalog duration range. seedance-2.0-mini edit tasks accept explicit
+/// 4-15s durations, so it never omits.
 fn omit_duration(spec: VideoEditModel, mode: EditMode) -> bool {
     matches!((spec, mode), (VideoEditModel::Seedance, EditMode::VideoRef))
 }
 
+/// Validate an optional integer duration against a per-model range.
+fn ensure_duration_in(
+    duration: Option<i64>,
+    range: std::ops::RangeInclusive<i64>,
+    label: &str,
+) -> anyhow::Result<()> {
+    if let Some(d) = duration
+        && !range.contains(&d)
+    {
+        anyhow::bail!(
+            "{label} must be {}–{} seconds, got {d}. Retry with a duration in that range.",
+            range.start(),
+            range.end()
+        );
+    }
+    Ok(())
+}
+
 /// Per-model parameter validation, run before any upload or billing. The
-/// seedance duration rule is mode-dependent, so this runs after
+/// seedance-2.5 duration rule is mode-dependent, so this runs after
 /// [`validate_mode`].
 fn validate_params(
     spec: VideoEditModel,
@@ -89,14 +120,7 @@ fn validate_params(
 ) -> anyhow::Result<()> {
     match spec {
         VideoEditModel::Hailuo3 => {
-            if let Some(d) = duration
-                && !(5..=15).contains(&d)
-            {
-                anyhow::bail!(
-                    "hailuo-3 output duration must be 5–15 seconds, got {d}. \
-                     Retry with a duration in that range."
-                );
-            }
+            ensure_duration_in(duration, 5..=15, "hailuo-3 output duration")?;
         }
         VideoEditModel::Aleph2 => {
             if duration.is_some() {
@@ -106,19 +130,17 @@ fn validate_params(
                 );
             }
         }
+        VideoEditModel::SeedanceMini => {
+            // Explicit 4-15s edit duration per native docs/catalog; the relay's
+            // seedance-edit duration handling is unverified — rejection surfaces at submit.
+            ensure_duration_in(duration, 4..=15, "seedance-2.0-mini duration")?;
+        }
         VideoEditModel::Seedance => match mode {
             // Native edit tasks require duration 'auto' — the field is omitted
             // at body build (see [`omit_duration`]), so any value is accepted.
             EditMode::VideoRef => {}
             EditMode::FrameAnchor => {
-                if let Some(d) = duration
-                    && !(4..=30).contains(&d)
-                {
-                    anyhow::bail!(
-                        "seedance-2.5 image-to-video duration must be 4–30 seconds, got {d}. \
-                         Retry with a duration in that range."
-                    );
-                }
+                ensure_duration_in(duration, 4..=30, "seedance-2.5 image-to-video duration")?;
             }
         },
         VideoEditModel::Unknown => {
@@ -420,7 +442,7 @@ impl Tool for VideoEditTool {
         let mode = validate_mode(spec, video_url, &images, first_frame, last_frame)?;
 
         // ── Per-model parameter validation (fail fast, before any upload) ──
-        // Runs after mode validation — the seedance duration rule is
+        // Runs after mode validation — the seedance-2.5 duration rule is
         // mode-dependent (edit vs image-to-video).
         validate_params(spec, mode, duration)?;
 
@@ -509,13 +531,23 @@ mod tests {
             classify_model("runway/aleph-2-20260729"),
             VideoEditModel::Aleph2
         );
-        // seedance is pinned to 2.5 — earlier versions stay permissive.
+        // seedance-2.5 keeps its auto-duration edit rule; seedance-2.0-mini
+        // gets explicit-duration edits; seedance-2.0/2.0-fast/1.5-pro stay
+        // permissive (Unknown) so they never inherit either rule.
         assert_eq!(
             classify_model("bytedance/seedance-2.5"),
             VideoEditModel::Seedance
         );
         assert_eq!(
+            classify_model("bytedance/seedance-2.0-mini"),
+            VideoEditModel::SeedanceMini
+        );
+        assert_eq!(
             classify_model("bytedance/seedance-2.0"),
+            VideoEditModel::Unknown
+        );
+        assert_eq!(
+            classify_model("bytedance/seedance-2.0-fast"),
             VideoEditModel::Unknown
         );
         assert_eq!(
@@ -526,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn seedance_duration_rule_is_mode_dependent() {
+    fn seedance_duration_rules() {
         // Edit-classified (video-reference) requests omit duration entirely —
         // any value is accepted and dropped at body build.
         assert!(omit_duration(VideoEditModel::Seedance, EditMode::VideoRef));
@@ -543,6 +575,23 @@ mod tests {
             validate_params(VideoEditModel::Seedance, EditMode::FrameAnchor, Some(31)).is_err()
         );
         assert!(validate_params(VideoEditModel::Seedance, EditMode::FrameAnchor, None).is_ok());
+        // seedance-2.0-mini accepts explicit durations (4-15s) and never omits
+        // the field; validation does not branch on mode, so VideoRef covers it.
+        assert!(!omit_duration(
+            VideoEditModel::SeedanceMini,
+            EditMode::VideoRef
+        ));
+        assert!(validate_params(VideoEditModel::SeedanceMini, EditMode::VideoRef, Some(4)).is_ok());
+        assert!(
+            validate_params(VideoEditModel::SeedanceMini, EditMode::VideoRef, Some(15)).is_ok()
+        );
+        assert!(
+            validate_params(VideoEditModel::SeedanceMini, EditMode::VideoRef, Some(3)).is_err()
+        );
+        assert!(
+            validate_params(VideoEditModel::SeedanceMini, EditMode::VideoRef, Some(16)).is_err()
+        );
+        assert!(validate_params(VideoEditModel::SeedanceMini, EditMode::VideoRef, None).is_ok());
         // Other models never omit duration.
         assert!(!omit_duration(VideoEditModel::Hailuo3, EditMode::VideoRef));
         assert!(!omit_duration(VideoEditModel::Unknown, EditMode::VideoRef));
