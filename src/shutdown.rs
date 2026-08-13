@@ -149,30 +149,21 @@ pub async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
 
         let mut first = true;
         loop {
-            tokio::select! {
-                _ = sigint.recv() => {
-                    if first {
-                        info!("Received SIGINT — draining (second signal force-cancels)");
-                        drain_begin();
-                        first = false;
-                    } else {
-                        info!("Received second SIGINT — force-cancelling drain");
-                        return Ok(());
-                    }
-                }
-                _ = sigterm.recv() => {
-                    if first {
-                        info!("Received SIGTERM — draining (second signal force-cancels)");
-                        drain_begin();
-                        first = false;
-                    } else {
-                        info!("Received second SIGTERM — force-cancelling drain");
-                        return Ok(());
-                    }
-                }
+            let signal = tokio::select! {
+                _ = sigint.recv() => "SIGINT",
+                _ = sigterm.recv() => "SIGTERM",
                 _ = sighup.recv() => {
                     debug!("Received SIGHUP, ignoring (daemon stays running)");
+                    continue;
                 }
+            };
+            if first {
+                info!("Received {signal} — draining (second signal force-cancels)");
+                drain_begin();
+                first = false;
+            } else {
+                info!("Received second {signal} — force-cancelling drain");
+                return Ok(());
             }
         }
     }
