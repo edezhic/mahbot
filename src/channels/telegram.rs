@@ -1,5 +1,5 @@
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
-use crate::util::{TELEGRAM_MEDIA_MARKER_RE, parse_media_marker};
+use crate::util::{TELEGRAM_MEDIA_MARKER_RE, UnwrapPoison, parse_media_marker};
 use crate::{Channel, ChannelMessage, Role, SendMessage};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -895,28 +895,16 @@ impl TelegramChannel {
         if let Some(txt) = text {
             body["text"] = serde_json::Value::String(txt.to_string());
         }
-        match self
-            .http_client()
-            .post(self.api_url("answerCallbackQuery"))
-            .json(&body)
-            .send()
+        if let Err((status, error)) = self
+            .post_telegram_json("answerCallbackQuery", body, "answerCallbackQuery error")
             .await
         {
-            Ok(resp) if resp.status().is_success() => {}
-            Ok(resp) => {
-                tracing::warn!(
-                    callback_query_id = %callback_query_id,
-                    status = %resp.status(),
-                    "answerCallbackQuery returned non-success status"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    callback_query_id = %callback_query_id,
-                    error = %e,
-                    "Failed to send answerCallbackQuery"
-                );
-            }
+            tracing::warn!(
+                callback_query_id = %callback_query_id,
+                status = %status,
+                error = %error,
+                "answerCallbackQuery failed"
+            );
         }
     }
 
@@ -1069,10 +1057,7 @@ impl TelegramChannel {
         // Cheap inline coalescing: skip spawning when a refresh for this
         // chat is already in flight.
         {
-            let cache = match self.menu_cache.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let cache = self.menu_cache.lock().unwrap_poison();
             if matches!(cache.get(chat_id), Some(ChatMenuState::InFlight)) {
                 return;
             }
@@ -1099,10 +1084,7 @@ impl TelegramChannel {
             let payload_str = payload.to_string();
 
             let should_send = {
-                let mut cache = match cache.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
+                let mut cache = cache.lock().unwrap_poison();
                 match cache.get(&chat_id) {
                     Some(ChatMenuState::Registered(last))
                         if last.as_deref() == Some(&payload_str) =>
@@ -1132,10 +1114,7 @@ impl TelegramChannel {
                 "commands": payload["commands"].clone(),
             });
             let ok = post_set_my_commands(&http_client, &url, &body).await;
-            let mut cache = match cache.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let mut cache = cache.lock().unwrap_poison();
             cache.insert(
                 chat_id,
                 if ok {
@@ -2293,6 +2272,13 @@ impl Channel for TelegramChannel {
         Ok(())
     }
 }
+fn cancel_old_listener(old: Option<&std::sync::Arc<dyn Channel>>) {
+    if let Some(old) = old
+        && let Some(tc) = old.as_any().downcast_ref::<TelegramChannel>()
+    {
+        tc.cancel_own();
+    }
+}
 /// Hot-reload the Telegram bot listener with a new token.
 ///
 /// Used when the user changes the bot token in Settings — no full application
@@ -2354,11 +2340,7 @@ pub async fn restart_telegram_listener(new_token: Option<&str>) -> anyhow::Resul
         registry.replace(std::sync::Arc::clone(&new_channel));
 
         // Cancel the old listener now that the registry has the new one.
-        if let Some(old) = old_channel
-            && let Some(tc) = old.as_any().downcast_ref::<TelegramChannel>()
-        {
-            tc.cancel_own();
-        }
+        cancel_old_listener(old_channel.as_ref());
 
         // Spawn the new listener on the shared message pipeline.
         if let Some(tx) = crate::MESSAGE_TX.get() {
@@ -2375,11 +2357,7 @@ pub async fn restart_telegram_listener(new_token: Option<&str>) -> anyhow::Resul
         tracing::info!("Telegram bot listener restarted with new token");
     } else {
         // Token cleared — stop the old listener and unregister.
-        if let Some(old) = old_channel
-            && let Some(tc) = old.as_any().downcast_ref::<TelegramChannel>()
-        {
-            tc.cancel_own();
-        }
+        cancel_old_listener(old_channel.as_ref());
         registry.unregister("telegram");
         tracing::info!("Telegram bot token cleared — listener stopped");
     }
