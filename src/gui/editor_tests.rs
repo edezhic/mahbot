@@ -779,19 +779,11 @@ fn test_parse_git_status_porcelain() {
 
 #[test]
 #[allow(clippy::single_range_in_vec_init)]
-fn test_is_find_bar_open_true_when_active() {
+fn test_is_find_bar_open() {
     let state = make_editor_with_find_state("fn hello() {}", "hello", vec![4..9], 0);
     assert!(state.is_find_bar_open());
-}
-
-#[test]
-fn test_is_find_bar_open_false_when_closed() {
     let state = make_editor_with_single_tab("fn hello() {}");
     assert!(!state.is_find_bar_open());
-}
-
-#[test]
-fn test_is_find_bar_open_no_tabs() {
     let state = EditorState::new();
     assert!(!state.is_find_bar_open());
 }

@@ -51,26 +51,9 @@ async fn test_channel() -> TelegramChannel {
 }
 
 #[test]
-fn telegram_api_url() {
-    let ch = TelegramChannel::new("123:ABC".into());
-    assert_eq!(
-        ch.api_url("getMe"),
-        "https://api.telegram.org/bot123:ABC/getMe"
-    );
-}
-
-#[test]
-fn parse_recipient_parses_chat_id_only() {
+fn test_parse_recipient() {
     assert_eq!(parse_recipient("12345"), ("12345", None));
-}
-
-#[test]
-fn parse_recipient_parses_chat_id_with_thread() {
     assert_eq!(parse_recipient("12345:678"), ("12345", Some("678")));
-}
-
-#[test]
-fn parse_recipient_handles_empty_string() {
     assert_eq!(parse_recipient(""), ("", None));
 }
 

@@ -165,15 +165,11 @@ fn test_delete_at_end() {
 }
 
 #[test]
-fn test_delete_multibyte_accent() {
+fn test_delete_multibyte_scalar() {
     let buf = EditorBuffer::with_text("café", None);
     buf.move_to(0, 3); // before 'é'
     buf.perform_action(EditorAction::Delete);
     assert_eq!(buf.text(), "caf");
-}
-
-#[test]
-fn test_delete_multibyte_cyrillic() {
     let buf = EditorBuffer::with_text("привет", None);
     buf.move_to(0, 0);
     buf.perform_action(EditorAction::Delete);
