@@ -554,7 +554,6 @@ enum PrevRound {
 /// KV prefix is preserved. The framing is honest about the previous round's
 /// disposition: a transport failure (no response at all) is not presented as
 /// a rejected response.
-#[allow(clippy::too_many_lines)]
 fn append_repair_instructions(
     request: &mut ChatRequest,
     round: u32,
@@ -562,7 +561,6 @@ fn append_repair_instructions(
     rejections: &[String],
     prev: PrevRound,
 ) {
-    let mut section = String::new();
     let framing = match prev {
         PrevRound::Transport => {
             "The previous call did not complete (transport failure) — please \
@@ -585,28 +583,26 @@ fn append_repair_instructions(
              are listed below."
         }
     };
-    let _ = write!(
-        section,
-        "\n\n=== REPAIR ROUND {round} ===\n\
-         Only the latest REPAIR ROUND section applies — earlier sections are \
-         historical and superseded.\n\
-         {framing}\n\
-         Accepted groups are FROZEN and must NEVER be re-proposed; repair \
-         ONLY the remaining items. Reference every member by its item id from \
-         the input list — never by text.\n"
-    );
+    // Section bodies align with the template's newline structure: the
+    // rejections block keeps its conditional leading separator (a static
+    // template separator would leave a stray blank line when empty) and its
+    // writeln trailing newlines; the frozen block drops the leading separator
+    // (the rejections line-end supplies the blank line, empty or not) but
+    // keeps trailing; the remainder block also drops its trailing newline
+    // (the template's blank line before the schema supplies the separator).
+    let mut rejections_section = String::new();
     if !rejections.is_empty() {
-        section.push_str("\nRejected proposals still outstanding (fix these):\n");
+        rejections_section.push_str("\nRejected proposals still outstanding (fix these):\n");
         for r in rejections {
-            let _ = writeln!(section, "- {r}");
+            let _ = writeln!(rejections_section, "- {r}");
         }
     }
-    section.push_str(
-        "\nFrozen groups (skeletons — do NOT re-propose their members; references \
+    let mut frozen_groups_section = String::from(
+        "Frozen groups (skeletons — do NOT re-propose their members; references \
          to a group flagged contradiction:true are ignored):\n",
     );
     if state.frozen_groups.is_empty() {
-        section.push_str("- none\n");
+        frozen_groups_section.push_str("- none\n");
     } else {
         for (i, g) in state.frozen_groups.iter().enumerate() {
             let agents = distinct_agents(g, &state.table)
@@ -619,14 +615,14 @@ fn append_repair_instructions(
                 |m| format!("{} (id {})", render_member_line(m, &state.table), m.id),
             );
             let _ = writeln!(
-                section,
+                frozen_groups_section,
                 "- {i}: {:?} [agents {agents}, contradiction: {}] — e.g. {representative}",
                 g.heading, g.contradiction,
             );
         }
     }
-    section.push_str(
-        "\nRemaining items (place EVERY un-pinned one in a proposed group or the \
+    let mut remainder_section = String::from(
+        "Remaining items (place EVERY un-pinned one in a proposed group or the \
          ungrouped list; pinned items must NOT be placed in a group). Reference \
          each item by its id:\n",
     );
@@ -634,39 +630,23 @@ fn append_repair_instructions(
         let line = render_member_line(&GroupingMember { id }, &state.table);
         if state.pinned.contains(&id) {
             let _ = writeln!(
-                section,
+                remainder_section,
                 "- {id}: {line} [pinned — accepted contradiction reference; do NOT place in a group]"
             );
         } else {
-            let _ = writeln!(section, "- {id}: {line}");
+            let _ = writeln!(remainder_section, "- {id}: {line}");
         }
     }
-    section.push_str(
-        r#"
-Respond with ONLY a JSON object matching this REPAIR-DELTA schema (no extra fields):
-{
-  "summary": "optional — ONLY if no summary was accepted yet",
-  "groups": [
-    {
-      "heading": "short thematic heading",
-      "contradiction": false,
-      "members": [
-        {"id": 0}
-      ]
-    }
-  ],
-  "ungrouped": [
-    {"id": 2}
-  ],
-  "references": [
-    {"group": 0, "member": {"id": 2}}
-  ]
-}
-"#,
-    );
-    section.push_str(
-        "\nNote: every item listed in `references` must ALSO appear in `groups` \
-         or `ungrouped` — a reference alone does not place the item.\n",
+    remainder_section.pop();
+    let section = crate::prompt::substitute(
+        &crate::prompt::load_prompt("synthesis/repair_round.md"),
+        &[
+            ("{{round}}", &round.to_string()),
+            ("{{framing}}", framing),
+            ("{{rejections_section}}", &rejections_section),
+            ("{{frozen_groups_section}}", &frozen_groups_section),
+            ("{{remainder_section}}", &remainder_section),
+        ],
     );
     if let Some(last) = request.messages.last_mut() {
         last.content.push_str(&section);
