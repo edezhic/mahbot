@@ -338,15 +338,7 @@ pub fn ensure_ready() -> Result<(), String> {
 /// the initial download and retry-after-failure paths.
 #[must_use]
 pub fn retry_download() -> bool {
-    if STATE
-        .compare_exchange(
-            ModelState::Failed,
-            ModelState::Uninit,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
+    if !STATE.transition(ModelState::Failed, ModelState::Uninit) {
         return false;
     }
     spawn_download();
@@ -368,14 +360,7 @@ pub(crate) fn test_set_state(state: u8) {
 /// task making progress, resetting allows the next caller to retry.
 #[must_use]
 pub(crate) fn try_reset_loading_state() -> bool {
-    STATE
-        .compare_exchange(
-            ModelState::Loading,
-            ModelState::Uninit,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_ok()
+    STATE.transition(ModelState::Loading, ModelState::Uninit)
 }
 
 /// Speak `text` with the default voice (M1).
@@ -676,19 +661,9 @@ pub fn try_load_cached() -> bool {
 
 /// Spawn the background model download retry loop.
 pub fn spawn_download() {
-    // CAS failure means another task already set LOADING or READY — avoid race.
-    if STATE
-        .compare_exchange(
-            ModelState::Uninit,
-            ModelState::Loading,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
-        return;
+    if STATE.transition(ModelState::Uninit, ModelState::Loading) {
+        tokio::spawn(download_retry_loop());
     }
-    tokio::spawn(download_retry_loop());
 }
 
 /// Spawn model download, retrying after a previous failure if needed.
@@ -698,32 +673,13 @@ pub fn spawn_download() {
 /// making it suitable for the GUI toggle which may be activated after a
 /// permanent download failure.
 pub fn spawn_or_retry_download() {
-    // Fast path: UNINIT → LOADING
-    if STATE
-        .compare_exchange(
-            ModelState::Uninit,
-            ModelState::Loading,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_ok()
-    {
+    if STATE.transition(ModelState::Uninit, ModelState::Loading) {
         tokio::spawn(download_retry_loop());
         return;
     }
-    // Slow path: FAILED → UNINIT, then spawn_download handles UNINIT → LOADING
-    if STATE
-        .compare_exchange(
-            ModelState::Failed,
-            ModelState::Uninit,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_ok()
-    {
+    if STATE.transition(ModelState::Failed, ModelState::Uninit) {
         spawn_download();
     }
-    // Otherwise already LOADING or READY — nothing to do.
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────

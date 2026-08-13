@@ -168,16 +168,7 @@ fn ensure_embedder() -> bool {
         _ => return false,       // ModelState::Loading, ModelState::Failed, or unexpected state
     }
 
-    // Try to become the initializer (atomic CAS to prevent races)
-    if STATE
-        .compare_exchange(
-            ModelState::Uninit,
-            ModelState::Loading,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
+    if !STATE.transition(ModelState::Uninit, ModelState::Loading) {
         return false;
     }
 

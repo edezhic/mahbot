@@ -3427,21 +3427,9 @@ async fn download_retry_loop() {
 /// Callers that hold a [`PipelineCtx`] should prefer the debounced
 /// [`PipelineCtx::try_retry_models`] instead to avoid rapid retry storms.
 fn retry_model_loading() -> bool {
-    // Atomically transition from Failed → Uninit.  If another task already
-    // changed the state (e.g. concurrent `retry_model_loading` call or the
-    // original retry loop is still running), this is a no-op.
-    if MODELS_STATE
-        .compare_exchange(
-            ModelState::Failed,
-            ModelState::Uninit,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
+    if !MODELS_STATE.transition(ModelState::Failed, ModelState::Uninit) {
         return false;
     }
-
     set_status(VoiceStatus::LoadingModels);
     tokio::spawn(download_retry_loop());
     info!("Voice models: retrying model load after previous failure");

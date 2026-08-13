@@ -82,6 +82,20 @@ impl AtomicModelState {
             .map(ModelState::from_u8)
             .map_err(ModelState::from_u8)
     }
+
+    /// Atomically transition `from` → `to` (AcqRel success, Acquire failure
+    /// ordering), returning `true` if the CAS succeeded.
+    ///
+    /// A failed CAS means another task already moved the state (e.g. a
+    /// concurrent retry or a still-running download loop), so the call is a
+    /// no-op — the caller must not spawn duplicate work.  A `Failed → Uninit`
+    /// reset is normally followed by an `Uninit → Loading` site that spawns
+    /// the download loop (two-step retry dance).
+    #[must_use]
+    pub(crate) fn transition(&self, from: ModelState, to: ModelState) -> bool {
+        self.compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
 }
 
 /// Drop guard that transitions a model-loading state from [`ModelState::Loading`]

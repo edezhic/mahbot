@@ -753,15 +753,7 @@ fn try_lock_init() -> Option<bool> {
         _ => return Some(false),
     }
 
-    if STATE
-        .compare_exchange(
-            ModelState::Uninit,
-            ModelState::Loading,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
+    if !STATE.transition(ModelState::Uninit, ModelState::Loading) {
         return Some(false);
     }
 
