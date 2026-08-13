@@ -1453,7 +1453,7 @@ pub(super) fn find_first_non_flag_index(words: &[&str], is_git: bool) -> Option<
 /// quoted-prefix spellings.
 pub(super) fn find_first_command_word_index(words: &[&str]) -> Option<usize> {
     words.iter().position(|w| {
-        let u = readonly::strip_outer_quotes(w).map_or(*w, |(c, _)| c);
+        let u = readonly::strip_quoted_word(w);
         !SHELL_PREFIXES.contains(&u) && !w.starts_with('-') && !is_env_assignment(u)
     })
 }

@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::tools::path::shell_quote;
 use crate::tools::shell::SHELL_PIPE_READ_CAP;
-use crate::tools::shell::readonly::{strip_heredoc_bodies, strip_outer_quotes};
+use crate::tools::shell::readonly::strip_heredoc_bodies;
 use crate::util::is_word_char;
 
 // ── Protocol constants ────────────────────────────────────────────────────
@@ -551,7 +551,7 @@ fn segment_contains_grep(segment: &str, verb: &str) -> bool {
         return false;
     }
     segment.split_whitespace().any(|w| {
-        let bare = strip_outer_quotes(w).map_or(w, |(c, _)| c);
+        let bare = crate::tools::shell::readonly::strip_quoted_word(w);
         is_grep_verb(bare)
     })
 }
@@ -574,7 +574,7 @@ fn resolve_cd(segment: &str, cwd: &Path, home: &Path) -> Result<PathBuf, Fallbac
             i += 1;
             continue;
         }
-        break Some(strip_outer_quotes(w).map_or(*w, |(c, _)| c));
+        break Some(crate::tools::shell::readonly::strip_quoted_word(w));
     };
     let Some(target) = target else {
         // Bare `cd` → $HOME.

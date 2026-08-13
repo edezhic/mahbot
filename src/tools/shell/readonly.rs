@@ -659,6 +659,11 @@ pub(super) fn strip_outer_quotes(word: &str) -> Option<(&str, bool)> {
     Some((word, false))
 }
 
+/// Strip balanced surrounding quotes, keeping the raw word when unbalanced.
+pub(super) fn strip_quoted_word(word: &str) -> &str {
+    strip_outer_quotes(word).map_or(word, |(c, _)| c)
+}
+
 /// Expand `$VAR` / `${VAR}` references in `word`. Inside single quotes nothing
 /// expands. Returns `None` (reject) when the expansion is unprovable: an
 /// unbound variable without a temp anchor, a poisoned variable, `$HOME`,
@@ -2716,6 +2721,7 @@ fn resolve_verb<'a>(words: &[&'a str], negated: bool) -> VerbResolution<'a> {
                 let Some(o) = opts.get(j) else {
                     return VerbResolution::Informational;
                 };
+                // Fail-closed: keep-raw would approve `command -"p"`, which genuinely executes the command.
                 let oq = strip_outer_quotes(o).map_or("", |(c, _)| c);
                 if oq == "--" {
                     j += 1;
@@ -2737,6 +2743,7 @@ fn resolve_verb<'a>(words: &[&'a str], negated: bool) -> VerbResolution<'a> {
                 let Some(o) = opts.first() else {
                     return VerbResolution::Informational;
                 };
+                // Fail-closed: keep-raw would approve `builtin -"x"`, but bash rejects the option — nothing executes.
                 let oq = strip_outer_quotes(o).map_or("", |(c, _)| c);
                 if oq == "--" {
                     j = 1;
@@ -2774,6 +2781,7 @@ fn resolve_verb<'a>(words: &[&'a str], negated: bool) -> VerbResolution<'a> {
                     j += 1;
                 }
                 if opts.get(j).is_some_and(|o| {
+                    // Fail-closed: keep-raw would approve `time -"x"`, but the dash word is the timed command — nothing executes.
                     let oq = strip_outer_quotes(o).map_or("", |(c, _)| c);
                     oq.starts_with('-') && oq.len() > 1
                 }) {
@@ -3045,7 +3053,7 @@ fn process_cd_words(words: &[&str], cd_idx: usize, verb: &str, state: &mut Valid
             i += 1;
             continue;
         }
-        break Some(strip_outer_quotes(w).map_or(*w, |(c, _)| c));
+        break Some(strip_quoted_word(w));
     };
     let Some(target) = target else {
         state.cwd = None;
@@ -3147,7 +3155,7 @@ fn handle_eval_body(body_words: &[&str], state: &mut ValidationState) -> Result<
         );
     }
     let Some((ti, tv)) = toks.iter().enumerate().find_map(|(i, w)| {
-        let u = strip_outer_quotes(w).map_or(*w, |(c, _)| c);
+        let u = strip_quoted_word(w);
         matches!(u, "cd" | "pushd" | "popd").then_some((i, u))
     }) else {
         // No cd verb. A fully quoted body is the documented eval-write
@@ -3159,7 +3167,7 @@ fn handle_eval_body(body_words: &[&str], state: &mut ValidationState) -> Result<
         && tv == "cd"
         && ti == 0
         && !toks[1..].iter().any(|w| {
-            let u = strip_outer_quotes(w).map_or(*w, |(c, _)| c);
+            let u = strip_quoted_word(w);
             matches!(u, "&&" | "||" | ";" | "|" | "cd" | "pushd" | "popd")
                 || u.ends_with([';', '&', '|'])
         });
@@ -3255,7 +3263,7 @@ fn record_mkdir_targets(segment: &str, state: &mut ValidationState) {
 /// Also fires on non-git commands (`GIT_DIR=/tmp ls`): fail-closed trade-off
 /// closing transitive git invocation (make/cargo inheriting GIT_*).
 fn check_git_env_binding(word: &str) -> Result<(), String> {
-    let w = strip_outer_quotes(word).map_or(word, |(c, _)| c);
+    let w = strip_quoted_word(word);
     if let Some((name, _)) = w.split_once('=')
         && name.starts_with("GIT_")
         && name != "GIT_PAGER"
@@ -3299,7 +3307,7 @@ fn apply_env_bindings(
 /// quotes first so `export "TMPDIR=/etc"` and `"TMPDIR"=/etc` bind by their
 /// unquoted name (the shell concatenates quoted pieces into one word).
 fn bind_assignment_word(w: &str, state: &mut ValidationState) {
-    let w = strip_outer_quotes(w).map_or(w, |(c, _)| c);
+    let w = strip_quoted_word(w);
     if let Some((name, value)) = w.split_once('=') {
         apply_single_binding(name, value, state);
     }
@@ -3359,7 +3367,7 @@ fn split_words_keeping_substitutions(s: &str) -> Vec<&str> {
 /// assignment time, so `export TMPDIR="$TMPDIR/x"` binds the expanded path).
 fn apply_single_binding(name: &str, value: &str, state: &mut ValidationState) {
     // Quoted assignment names (`"TMPDIR"=/etc`) bind by their unquoted content.
-    let name = strip_outer_quotes(name).map_or(name, |(c, _)| c);
+    let name = strip_quoted_word(name);
     // Strip balanced surrounding quotes from the value (`export TMPDIR="/tmp"`).
     // A single-quoted value is a literal — no expansion, no substitution —
     // so it can never be an mktemp temp binding.
@@ -3522,7 +3530,7 @@ fn mktemp_binding(value: &str, state: &ValidationState) -> Option<VarBinding> {
     // prefix component (`a/../b.XXXXXX` with `a` absent) errors mktemp even
     // when the normalized tail exists.
     if let Some(t) = template {
-        let clean = strip_outer_quotes(t).map_or(t, |(c, _)| c);
+        let clean = strip_quoted_word(t);
         if !clean.ends_with("XXXXXX") {
             return None;
         }
@@ -3541,7 +3549,7 @@ fn mktemp_binding(value: &str, state: &ValidationState) -> Option<VarBinding> {
             poisoned: false,
         }),
         Some(dir) => {
-            let clean = strip_outer_quotes(dir).map_or(dir, |(c, _)| c);
+            let clean = strip_quoted_word(dir);
             let raw = resolve_path_word(clean, state)?;
             let normalized = crate::tools::path::normalize_path(&raw);
             // mktemp never creates the `-p` directory: it errors when the dir
@@ -4530,7 +4538,7 @@ fn extract_git_subcommand(segment: &str) -> String {
         .rsplit('/')
         .next()
         .expect("rsplit always yields at least one element");
-    let git_word = strip_outer_quotes(git_word).map_or(git_word, |(c, _)| c);
+    let git_word = strip_quoted_word(git_word);
     if git_word != "git" {
         return String::new();
     }
