@@ -1425,10 +1425,9 @@ async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
 /// Shared engineer post-run tail: failure comment, pause, transition, and job
 /// terminalization. Diagnostics are dispatched by the poll loop as a separate
 /// `PollPhase::DiagnosticsCheck` (see `poll_round`) — the success path only
-/// transitions to InDiagnostics. The drain-cut guard and the outcome
-/// checkpoint stay at the call sites (dispatch's drain-before-checkpoint
-/// ordering and resume's no-checkpoint semantics are enforced there, not
-/// here). `resumed` selects the observability log strings.
+/// transitions to InDiagnostics. The drain-cut guard stays at the call sites
+/// (response-None here is a real failure). `resumed` selects the observability
+/// log strings.
 async fn finalize_engineer_round(
     ticket: &Ticket,
     agent: &Agent,
@@ -1593,38 +1592,14 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     }
 
     // Drain-cut (decision 20): the job stays status='launched' for boot resume —
-    // no failure record, no outcome checkpoint (the roster row stays
-    // launched). Returned BEFORE the failure comment so drained agents never
-    // emit AGENT_FAILURE_EMOJI or drive exit-time rollback.
+    // no failure record. Returned BEFORE the failure comment so drained agents
+    // never emit AGENT_FAILURE_EMOJI or drive exit-time rollback.
     if response.is_none() && crate::shutdown::aborting() {
         info!(
             ticket = %ticket.id,
             "Engineer round cut short by drain — job stays launched for boot resume",
         );
         return;
-    }
-
-    // Checkpoint the round outcome to the roster row (the actual run session —
-    // the anchor id — so the purge live-session protection and any resume
-    // reconstruction match the real agent).
-    let outcome = response
-        .clone()
-        .unwrap_or_else(|| agent.failure_reason("engineer produced no response"));
-    let outcome_status = if response.is_some() {
-        crate::jobs::RowStatus::Done
-    } else {
-        crate::jobs::RowStatus::Failed
-    };
-    if let Err(e) = crate::jobs::write_agent_outcome(
-        &crate::session::store().conn,
-        &job_id,
-        &agent_id,
-        outcome_status,
-        Some(&outcome),
-    )
-    .await
-    {
-        warn!(job = %job_id, error = %e, "Failed to checkpoint engineer outcome");
     }
 
     finalize_engineer_round(&ticket, &agent, response.as_deref(), &job_id, false).await;
@@ -2061,8 +2036,7 @@ async fn register_sanitation_agent(
 
 /// Absorb the post-run tail shared by dispatch and resume: the response-None
 /// failure block, verdict extraction with error handling, and the job
-/// terminalization. The drain-cut guard and outcome checkpoint stay at the
-/// call sites (resume has no checkpoint by design).
+/// terminalization. The drain-cut guard stays at the call sites.
 async fn finalize_sanitation_round(
     ticket: &Ticket,
     agent: &Agent,
@@ -2212,29 +2186,13 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     }
 
     // Drain-cut (decision 20): the job stays status='launched' for boot resume —
-    // no failure record, no outcome checkpoint.
+    // no failure record.
     if response.is_none() && crate::shutdown::aborting() {
         info!(
             ticket = %ticket.id,
             "Sanitation round cut short by drain — job stays launched for boot resume",
         );
         return;
-    }
-
-    // Checkpoint the successful round outcome to the roster row (the actual
-    // run session — the job-derived id — so the purge live-session protection
-    // and any resume reconstruction match the real agent).
-    if let Some(text) = response.as_deref()
-        && let Err(e) = crate::jobs::write_agent_outcome(
-            &crate::session::store().conn,
-            &job_id,
-            &format!("ticket_{job_id}_sanitation"),
-            crate::jobs::RowStatus::Done,
-            Some(text),
-        )
-        .await
-    {
-        warn!(job = %job_id, error = %e, "Failed to checkpoint sanitation outcome");
     }
 
     finalize_sanitation_round(&ticket, &agent, response.as_deref(), &job_id, false).await;
