@@ -804,6 +804,16 @@ pub(crate) fn mime_for_extension(path: &std::path::Path) -> &'static str {
     }
 }
 
+/// Extract the file name (last path component) from a path string, falling
+/// back to the raw path when the path has no file name component.
+#[must_use]
+pub(crate) fn file_name_or_path(path: &str) -> &str {
+    Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+}
+
 /// Strip ANSI escape sequences from a string.
 ///
 /// Removes common ANSI escape codes used for terminal text formatting (colors,

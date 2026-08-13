@@ -30,46 +30,37 @@ use iced::advanced::{image as advanced_image, text};
 use iced::widget::{image, markdown};
 use iced::{ContentFit, Element, Font, Length};
 
-use crate::util::{MEDIA_MARKER_RE, parse_media_marker};
+use crate::util::{MEDIA_MARKER_RE, file_name_or_path, parse_media_marker};
 
 /// Pre-process a content string, converting media markers before markdown parsing.
 pub(crate) fn preprocess(content: &str) -> String {
     // Order matters: the transcription annotations contain the words "Audio"
     // and "Video" which overlap with the raw `[AUDIO:...]`/`[VIDEO:...]`
     // patterns.  Handle them first.
-    let s = replace_audio_transcription(content);
-    let s = replace_video_transcription(&s);
+    let s = replace_transcription(content);
     replace_media_markers(&s)
 }
 
-/// `[Audio transcription of {filename}]: {text}` → 🔊 text
-///
-/// Legacy annotation format from before the icon-combo switch — only rows
-/// already persisted in chat history / sessions carry it; new messages store
-/// the icon combo (`🔊✍️`) + transcription directly. Only the annotation
-/// header is replaced — multi-line transcriptions and any following message
-/// content are left untouched.
-fn replace_audio_transcription(s: &str) -> String {
+/// `[Audio transcription of {filename}]: {text}` → 🔊, `[Video transcription
+/// of {filename}]: {text}` → 🎬 — the emoji matches the annotation kind. The
+/// audio form is a legacy annotation from before the icon-combo switch (only
+/// rows already persisted in chat history / sessions carry it; new messages
+/// store the icon combo `🔊✍️` + transcription directly); the video form is
+/// produced by `enrich_message` for the Artist's multimodal VIDEO markers.
+/// Only the annotation header is replaced — the (often multi-line) description
+/// and any following message content are left untouched.
+fn replace_transcription(s: &str) -> String {
     static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"\[Audio transcription of [^\]]+\]:\s*")
-            .expect("audio transcription regex must compile")
+        regex::Regex::new(r"\[(Audio|Video) transcription of [^\]]+\]:\s*")
+            .expect("transcription regex must compile")
     });
-    RE.replace_all(s, "🔊 ").to_string()
-}
-
-/// `[Video transcription of {filename}]: {text}` → 🎬 text
-///
-/// Produced by `enrich_message` for the Artist's multimodal VIDEO markers;
-/// rendered like the audio-transcription annotation with the video emoji.
-/// Only the annotation header is replaced — the description (often multi-line
-/// with the maximally-detailed transcription prompt) and any following message
-/// content are left untouched.
-fn replace_video_transcription(s: &str) -> String {
-    static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"\[Video transcription of [^\]]+\]:\s*")
-            .expect("video transcription regex must compile")
-    });
-    RE.replace_all(s, "🎬 ").to_string()
+    RE.replace_all(s, |caps: &regex::Captures| {
+        match caps.get(1).map(|m| m.as_str()) {
+            Some("Audio") => "🔊 ",
+            _ => "🎬 ",
+        }
+    })
+    .to_string()
 }
 
 /// Convert all `[KIND:path]` markers (IMAGE, AUDIO, VIDEO) to their display form
@@ -85,22 +76,14 @@ fn replace_media_markers(s: &str) -> String {
             let (kind, path) = parse_media_marker(caps);
             match kind {
                 "IMAGE" => format!("![Image]({path})"),
-                "AUDIO" => format!("🎵 {}", path_filename(path)),
-                "VIDEO" => format!("🎬 Video: {}", path_filename(path)),
+                "AUDIO" => format!("🎵 {}", file_name_or_path(path)),
+                "VIDEO" => format!("🎬 Video: {}", file_name_or_path(path)),
                 // Unreachable for well-formed markers (MEDIA_MARKER_RE only
                 // matches IMAGE|AUDIO|VIDEO), but defend against future changes.
                 _ => caps.get_match().as_str().to_string(),
             }
         })
         .to_string()
-}
-
-/// Extract the file name (last path component) from a path string.
-fn path_filename(path: &str) -> String {
-    std::path::Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map_or_else(|| path.to_string(), ToString::to_string)
 }
 
 // ── Selectable markdown Viewer (iced_selection + inline images) ────
@@ -151,10 +134,7 @@ where
         } else {
             // File doesn't exist (temp file cleaned up, or path is invalid).
             // Show a fallback with the filename.
-            let filename = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(url.as_str());
+            let filename = file_name_or_path(url.as_str());
             iced::widget::text(format!("🖼️ {filename}"))
                 .size(settings.text_size)
                 .into()
@@ -316,23 +296,23 @@ mod tests {
     }
 
     #[test]
-    fn path_filename_unix() {
-        assert_eq!(path_filename("/foo/bar.txt"), "bar.txt");
+    fn file_name_or_path_unix() {
+        assert_eq!(file_name_or_path("/foo/bar.txt"), "bar.txt");
     }
 
     #[test]
-    fn path_filename_nested() {
-        assert_eq!(path_filename("/foo/bar/doc.txt"), "doc.txt");
+    fn file_name_or_path_nested() {
+        assert_eq!(file_name_or_path("/foo/bar/doc.txt"), "doc.txt");
     }
 
     #[test]
-    fn path_filename_no_dir() {
-        assert_eq!(path_filename("bar.txt"), "bar.txt");
+    fn file_name_or_path_no_dir() {
+        assert_eq!(file_name_or_path("bar.txt"), "bar.txt");
     }
 
     #[test]
-    fn path_filename_trailing_slash() {
+    fn file_name_or_path_trailing_slash() {
         // On Unix `file_name()` normalizes the trailing slash.
-        assert_eq!(path_filename("/foo/bar/"), "bar");
+        assert_eq!(file_name_or_path("/foo/bar/"), "bar");
     }
 }

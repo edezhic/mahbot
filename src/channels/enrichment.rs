@@ -19,7 +19,7 @@
 
 use crate::ChannelMessage;
 use crate::tools::browser::BrowserTool;
-use crate::util::{MEDIA_MARKER_RE, is_http_url, parse_media_marker};
+use crate::util::{MEDIA_MARKER_RE, file_name_or_path, is_http_url, parse_media_marker};
 use regex::Regex;
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -243,7 +243,7 @@ async fn handle_multimodal_video(
         tracing::warn!(%path, "Video path outside telegram temp dir — annotating without copy");
         return MultimodalVideoAction::annotation(format!(
             "[Video: {} attached]",
-            extract_file_name(path)
+            file_name_or_path(path)
         ));
     }
     if let Some(saved) = save_media_to_workspace(path_obj, uploads_dir, "video", "mp4").await {
@@ -251,7 +251,7 @@ async fn handle_multimodal_video(
         // (deleted after a successful copy). The annotation keeps the original
         // Telegram filename; fail-open: any failure degrades to the plain
         // [Saved video: ...] annotation.
-        let transcription = transcribe_saved_video(&saved.dest, extract_file_name(path)).await;
+        let transcription = transcribe_saved_video(&saved.dest, file_name_or_path(path)).await;
         return MultimodalVideoAction {
             replacement: saved.annotation,
             delete_temp: true,
@@ -259,7 +259,7 @@ async fn handle_multimodal_video(
         };
     }
     // Copy failed — annotate and preserve the temp file.
-    MultimodalVideoAction::annotation(format!("[Video: {} attached]", extract_file_name(path)))
+    MultimodalVideoAction::annotation(format!("[Video: {} attached]", file_name_or_path(path)))
 }
 
 /// Transcribe a saved workspace video copy for the Artist, returning the
@@ -288,15 +288,6 @@ async fn handle_non_multimodal_image(path_obj: &std::path::Path, file_name: &str
     } else {
         format!("[Image: {file_name} attached]")
     }
-}
-
-/// Extract the file name portion from a media marker path, falling back to
-/// the raw path string if the path has no file name component.
-fn extract_file_name(path: &str) -> &str {
-    std::path::Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(path)
 }
 
 /// Process all media markers (`[IMAGE:...]`, `[AUDIO:...]`, `[VIDEO:...]`)
@@ -361,7 +352,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
                     }
                 }
                 EnrichmentStrategy::NonMultimodal => {
-                    let file_name = extract_file_name(path);
+                    let file_name = file_name_or_path(path);
                     annotations.push(handle_non_multimodal_image(path_obj, file_name).await);
                     // IMAGE temp files cleaned up regardless of outcome.
                     files_to_delete.push(path_obj.to_path_buf());
@@ -392,7 +383,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
                     }
                 }
                 EnrichmentStrategy::NonMultimodal => {
-                    annotations.push(format!("[Video: {} attached]", extract_file_name(path)));
+                    annotations.push(format!("[Video: {} attached]", file_name_or_path(path)));
                     // VIDEO temp files are always cleaned up.
                     files_to_delete.push(path_obj.to_path_buf());
                 }
