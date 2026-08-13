@@ -489,80 +489,54 @@ async fn parse_callback_query_returns_message_with_extracted_fields() {
 }
 
 #[tokio::test]
-async fn parse_callback_query_returns_none_when_data_missing() {
+async fn parse_callback_query_rejects_invalid_inputs() {
     let ch = test_channel().await;
-    let cq = test_callback_query(&[("data", serde_json::Value::Null)]);
-
-    assert!(
-        ch.parse_callback_query(&cq).await.is_none(),
-        "callback query without data should be rejected"
-    );
+    let unknown_user = serde_json::json!({ "id": 999, "username": "unknown_user" });
+    let cases = [
+        ("no data", [("data", serde_json::Value::Null)]),
+        ("no message", [("message", serde_json::Value::Null)]),
+        ("unknown user", [("from", unknown_user)]),
+    ];
+    for (name, overrides) in &cases {
+        let cq = test_callback_query(overrides);
+        assert!(
+            ch.parse_callback_query(&cq).await.is_none(),
+            "case {name}: expected rejection"
+        );
+    }
 }
 
 #[tokio::test]
-async fn parse_callback_query_returns_none_when_message_missing() {
+async fn parse_callback_query_accepts_empty_data_and_null_id() {
+    // Regression pair: the ? guard in parse_callback_query only rejects
+    // absent/null data — NOT an empty string, which yields empty content
+    // (distinct from process_updates' unwrap_or("") ACK check). A
+    // null/absent callback_query_id likewise stays valid, becoming None
+    // rather than Some — unlike missing data which rejects.
     let ch = test_channel().await;
-    let cq = test_callback_query(&[("message", serde_json::Value::Null)]);
-
-    assert!(
-        ch.parse_callback_query(&cq).await.is_none(),
-        "callback query without message should be rejected"
-    );
-}
-
-#[tokio::test]
-async fn parse_callback_query_returns_none_for_unauthorized_user() {
-    let ch = test_channel().await;
-    let cq = test_callback_query(&[(
-        "from",
-        serde_json::json!({ "id": 999, "username": "unknown_user" }),
-    )]);
-
-    assert!(
-        ch.parse_callback_query(&cq).await.is_none(),
-        "callback query from an unknown user should be rejected"
-    );
-}
-
-#[tokio::test]
-async fn parse_callback_query_preserves_data_question_mark_semantics() {
-    // The ? guard in parse_callback_query only rejects when data is
-    // absent or null — NOT when it's present but empty. This is distinct
-    // from process_updates which uses unwrap_or("") for the ACK check.
-    // An empty-string data value produces a ChannelMessage with empty content.
-    let ch = test_channel().await;
-    let cq = test_callback_query(&[("data", serde_json::Value::String(String::new()))]);
-
-    let msg = ch
-        .parse_callback_query(&cq)
-        .await
-        .expect("empty-string data is valid — ? only rejects null/absent");
-
-    assert_eq!(msg.content, "", "empty-string data becomes empty content");
-    assert_eq!(msg.callback_query_id.as_deref(), Some("12345"));
-}
-
-#[tokio::test]
-async fn parse_callback_query_accepts_null_id() {
-    // A null/absent callback_query_id should still produce a valid message
-    // (the field becomes None rather than Some). This is distinct from
-    // missing data which causes rejection.
-    let ch = test_channel().await;
-    let cq = test_callback_query(&[("id", serde_json::Value::Null)]);
-
-    let msg = ch
-        .parse_callback_query(&cq)
-        .await
-        .expect("null id should not prevent parsing");
-
-    assert!(
-        msg.callback_query_id.is_none(),
-        "null id → callback_query_id is None"
-    );
-    assert_eq!(
-        msg.content, "set_model|test-model",
-        "data should still be extracted"
-    );
+    let cases = [
+        (
+            "empty-string data",
+            [("data", serde_json::json!(""))],
+            "",
+            Some("12345"),
+        ),
+        (
+            "null id",
+            [("id", serde_json::Value::Null)],
+            "set_model|test-model",
+            None,
+        ),
+    ];
+    for (name, overrides, content, cq_id) in &cases {
+        let cq = test_callback_query(overrides);
+        let msg = ch
+            .parse_callback_query(&cq)
+            .await
+            .unwrap_or_else(|| panic!("case {name}: expected a valid message"));
+        assert_eq!(msg.content, *content, "case {name}");
+        assert_eq!(msg.callback_query_id.as_deref(), *cq_id, "case {name}");
+    }
 }
 
 #[test]
@@ -1633,23 +1607,23 @@ fn setup_spy_channel() -> &'static Arc<Mutex<Vec<SendMessage>>> {
 }
 
 /// Ensure the user store has a test user with a Telegram binding and
-/// reply_target. Idempotent.
-async fn setup_user_with_telegram_binding(user_name: &str, reply_target: &str) {
+/// reply_target. Idempotent. `ctx` labels setup panics for attribution.
+async fn setup_user_with_telegram_binding(user_name: &str, reply_target: &str, ctx: &str) {
     use crate::users::store;
     let store = store();
     let all_roles = crate::Role::iter().collect::<Vec<_>>();
     store
         .add_user(user_name, Some("full"), &all_roles)
         .await
-        .expect("add_user");
+        .unwrap_or_else(|e| panic!("{ctx}: add_user: {e}"));
     store
         .bind_channel(user_name, "telegram", user_name)
         .await
-        .expect("bind_channel");
+        .unwrap_or_else(|e| panic!("{ctx}: bind_channel: {e}"));
     store
         .update_channel_contact("telegram", user_name, reply_target)
         .await
-        .expect("update_channel_contact");
+        .unwrap_or_else(|e| panic!("{ctx}: update_channel_contact: {e}"));
 }
 
 /// Three-line preamble shared by all mirror tests: acquire the serialization
@@ -1691,106 +1665,104 @@ fn telegram_msg(user_name: &str, content: &str) -> ChannelMessage {
 
 // ── Guard tests: early-return conditions ─────────────────────────────
 
-#[tokio::test]
-async fn skip_non_gui_source() {
-    let (sent, _lock) = setup_mirror_test_env().await;
-    setup_user_with_telegram_binding("skip_telegram", "target_non_gui").await;
+/// Per-case setup for `assert_mirror_skips`, applied after the shared
+/// mirror env is initialised (users::store() panics pre-init).
+enum MirrorSkipSetup {
+    BoundTo(&'static str, &'static str),
+    Unbound(&'static str),
+    BoundNoTarget(&'static str),
+}
 
-    let msg = telegram_msg("skip_telegram", "hello from telegram");
-    super::mirror_gui_message_to_telegram(&msg).await;
+/// Mirror `msg` and assert nothing was sent to the recipient implied by
+/// `setup` (reply_target when bound, user name otherwise). Each call
+/// acquires the serialization lock; stores and spy are idempotent.
+async fn assert_mirror_skips(setup: MirrorSkipSetup, msg: &ChannelMessage, reason: &str) {
+    let (sent, _lock) = setup_mirror_test_env().await;
+    let (user, filter_recipient) = match setup {
+        MirrorSkipSetup::BoundTo(u, t) => {
+            setup_user_with_telegram_binding(u, t, &format!("case {reason}")).await;
+            (u, t)
+        }
+        MirrorSkipSetup::Unbound(u) => {
+            let s = crate::users::store();
+            s.add_user(u, None, &[])
+                .await
+                .unwrap_or_else(|e| panic!("case {reason}: add_user: {e}"));
+            (u, u)
+        }
+        MirrorSkipSetup::BoundNoTarget(u) => {
+            let s = crate::users::store();
+            s.add_user(u, None, &[])
+                .await
+                .unwrap_or_else(|e| panic!("case {reason}: add_user: {e}"));
+            s.bind_channel(u, "telegram", u)
+                .await
+                .unwrap_or_else(|e| panic!("case {reason}: bind_channel: {e}"));
+            (u, u)
+        }
+    };
+    // msg.user_name must match the setup user, or the filter matches nothing.
+    assert_eq!(msg.user_name, user, "case {reason}");
+    super::mirror_gui_message_to_telegram(msg).await;
     let guard = sent.lock().unwrap_poison();
     let our_msgs: Vec<_> = guard
         .iter()
-        .filter(|m| m.recipient == "target_non_gui")
-        .collect();
-    assert!(our_msgs.is_empty(), "non-GUI source should not send");
-}
-
-#[tokio::test]
-async fn skip_empty_or_whitespace_content() {
-    // Both inputs exercise the same guard — `msg.content.trim().is_empty()`.
-    // Each iteration acquires the serialization lock independently; this
-    // is safe because the global stores (OnceCell) and the spy channel
-    // (OnceLock) are identical across calls to `setup_mirror_test_env()`.
-    for content in ["", "   \t\n  "] {
-        let (sent, _lock) = setup_mirror_test_env().await;
-        setup_user_with_telegram_binding("skip_ew", "target_empty_ws").await;
-        let msg = gui_msg("skip_ew", content);
-        super::mirror_gui_message_to_telegram(&msg).await;
-        let guard = sent.lock().unwrap_poison();
-        let our_msgs: Vec<_> = guard
-            .iter()
-            .filter(|m| m.recipient == "target_empty_ws")
-            .collect();
-        assert!(
-            our_msgs.is_empty(),
-            "content {content:?} should not send, got {} message(s)",
-            our_msgs.len()
-        );
-    }
-}
-
-#[tokio::test]
-async fn skip_user_with_no_bindings() {
-    let (sent, _lock) = setup_mirror_test_env().await;
-    // Create user but DO NOT bind a Telegram channel.
-    let store = crate::users::store();
-    store
-        .add_user("no_binding", None, &[])
-        .await
-        .expect("add_user");
-
-    // Use the user's name as the recipient filter — no bindings means
-    // no messages should be sent for this user at all.
-    let user_name = "no_binding";
-    let msg = gui_msg(user_name, "hello");
-    super::mirror_gui_message_to_telegram(&msg).await;
-    let guard = sent.lock().unwrap_poison();
-    let our_msgs: Vec<_> = guard.iter().filter(|m| m.recipient == user_name).collect();
-    assert!(our_msgs.is_empty(), "user with no bindings should not send");
-}
-
-#[tokio::test]
-async fn skip_binding_without_reply_target() {
-    let (sent, _lock) = setup_mirror_test_env().await;
-    // Bind a Telegram channel but don't set reply_target.
-    let store = crate::users::store();
-    store
-        .add_user("no_target", None, &[])
-        .await
-        .expect("add_user");
-    store
-        .bind_channel("no_target", "telegram", "no_target")
-        .await
-        .expect("bind_channel");
-    // Note: skip update_channel_contact → reply_target stays NULL.
-
-    let msg = gui_msg("no_target", "hello");
-    super::mirror_gui_message_to_telegram(&msg).await;
-    let guard = sent.lock().unwrap_poison();
-    let our_msgs: Vec<_> = guard
-        .iter()
-        .filter(|m| m.recipient == "no_target")
+        .filter(|m| m.recipient == filter_recipient)
         .collect();
     assert!(
         our_msgs.is_empty(),
-        "binding without reply_target should not send"
+        "case {reason}: got {} message(s)",
+        our_msgs.len()
     );
 }
 
 #[tokio::test]
-async fn skip_media_only_content() {
-    let (sent, _lock) = setup_mirror_test_env().await;
-    setup_user_with_telegram_binding("media_only", "target_media").await;
-
-    let msg = gui_msg("media_only", "[IMAGE:/path/to/img.png]");
-    super::mirror_gui_message_to_telegram(&msg).await;
-    let guard = sent.lock().unwrap_poison();
-    let our_msgs: Vec<_> = guard
-        .iter()
-        .filter(|m| m.recipient == "target_media")
-        .collect();
-    assert!(our_msgs.is_empty(), "media-only content should not send");
+async fn mirror_skips_guard_cases() {
+    // Each call acquires the serialization lock independently; the global
+    // stores (OnceCell) and spy channel (OnceLock) are identical across
+    // `setup_mirror_test_env()` calls.
+    assert_mirror_skips(
+        MirrorSkipSetup::BoundTo("skip_telegram", "target_non_gui"),
+        &telegram_msg("skip_telegram", "hello from telegram"),
+        "non-GUI source should not send",
+    )
+    .await;
+    assert_mirror_skips(
+        MirrorSkipSetup::BoundTo("skip_ew", "target_empty_ws"),
+        &gui_msg("skip_ew", ""),
+        "empty content should not send",
+    )
+    .await;
+    assert_mirror_skips(
+        MirrorSkipSetup::BoundTo("skip_ew", "target_empty_ws"),
+        &gui_msg("skip_ew", "   \t\n  "),
+        "whitespace content should not send",
+    )
+    .await;
+    // Create the user but DO NOT bind a Telegram channel; no bindings
+    // means no messages for this user at all, so its name is the filter.
+    assert_mirror_skips(
+        MirrorSkipSetup::Unbound("no_binding"),
+        &gui_msg("no_binding", "hello"),
+        "user with no bindings should not send",
+    )
+    .await;
+    // Bind a Telegram channel but don't set reply_target (skip
+    // update_channel_contact → reply_target stays NULL).
+    assert_mirror_skips(
+        MirrorSkipSetup::BoundNoTarget("no_target"),
+        &gui_msg("no_target", "hello"),
+        "binding without reply_target should not send",
+    )
+    .await;
+    // Full binding: exercises the media-only guard (content emptied by
+    // marker stripping), not the no-bindings guard.
+    assert_mirror_skips(
+        MirrorSkipSetup::BoundTo("media_only", "target_media"),
+        &gui_msg("media_only", "[IMAGE:/path/to/img.png]"),
+        "media-only content should not send",
+    )
+    .await;
 }
 
 // ── Happy path tests ─────────────────────────────────────────────────
@@ -1798,7 +1770,7 @@ async fn skip_media_only_content() {
 #[tokio::test]
 async fn sends_blockquote_to_single_binding() {
     let (sent, _lock) = setup_mirror_test_env().await;
-    setup_user_with_telegram_binding("single_user", "unique_single").await;
+    setup_user_with_telegram_binding("single_user", "unique_single", "single_user").await;
 
     let msg = gui_msg("single_user", "Hello, world!");
     super::mirror_gui_message_to_telegram(&msg).await;
@@ -1873,7 +1845,7 @@ async fn assert_mirror_strips_markers(
     expected_quote: &str,
 ) {
     let (sent, _lock) = setup_mirror_test_env().await;
-    setup_user_with_telegram_binding(user_name, reply_target).await;
+    setup_user_with_telegram_binding(user_name, reply_target, user_name).await;
 
     let msg = gui_msg(user_name, content);
     super::mirror_gui_message_to_telegram(&msg).await;
@@ -1914,7 +1886,7 @@ async fn strips_lowercase_media_markers_from_content() {
 #[tokio::test]
 async fn preserves_markdown_formatting_in_blockquote() {
     let (sent, _lock) = setup_mirror_test_env().await;
-    setup_user_with_telegram_binding("md_user", "unique_md").await;
+    setup_user_with_telegram_binding("md_user", "unique_md", "md_user").await;
 
     let msg = gui_msg("md_user", "**bold** and `code` and *italic*");
     super::mirror_gui_message_to_telegram(&msg).await;
