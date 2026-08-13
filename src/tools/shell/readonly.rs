@@ -2604,12 +2604,11 @@ fn cp_destination_under_temp(segment: &str, state: &ValidationState) -> bool {
     };
     let rest = &words[cmd_idx + 1..];
 
-    for flag in ["-t", "--target-directory"] {
-        if let Some(val) = flag_value(rest, flag) {
-            return !writes_outside_temp(val, state);
-        }
-    }
-    if let Some(val) = flag_value_equals(rest, "--target-directory=") {
+    if let Some(val) = output_flag_value(
+        rest,
+        &["-t", "--target-directory"],
+        Some("--target-directory="),
+    ) {
         return !writes_outside_temp(val, state);
     }
 
