@@ -974,14 +974,23 @@ mod tests {
     }
 
     #[test]
-    fn focus_path_found() {
-        let mut tree = make_tree(vec![
-            ("src", true),
-            ("src/main.rs", false),
-            ("Cargo.toml", false),
-        ]);
-        assert_eq!(tree.focus_path("src/main.rs"), Some(1));
-        assert_eq!(tree.tree_focus_index, 1);
+    #[allow(clippy::type_complexity)]
+    fn focus_path_cases() {
+        // (name, nodes, path, expected return, expected focus index)
+        #[rustfmt::skip]
+        let cases: &[(&str, &[(&str, bool)], &str, Option<usize>, usize)] = &[
+            ("found", &[("src", true), ("src/main.rs", false), ("Cargo.toml", false)], "src/main.rs", Some(1), 1),
+            ("empty_tree", &[], "anything", None, 0),
+            ("first_node", &[("src", true), ("src/main.rs", false)], "src", Some(0), 0),
+        ];
+        for &(name, nodes, path, expected, expected_index) in cases {
+            let mut tree = make_tree(nodes.to_vec());
+            assert_eq!(tree.focus_path(path), expected, "case: {name}");
+            assert_eq!(
+                tree.tree_focus_index, expected_index,
+                "case: {name} (index)"
+            );
+        }
     }
 
     #[test]
@@ -990,20 +999,6 @@ mod tests {
         tree.tree_focus_index = 42;
         assert_eq!(tree.focus_path("nonexistent"), None);
         assert_eq!(tree.tree_focus_index, 42);
-    }
-
-    #[test]
-    fn focus_path_empty_tree() {
-        let mut tree = make_tree(vec![]);
-        assert_eq!(tree.focus_path("anything"), None);
-        assert_eq!(tree.tree_focus_index, 0);
-    }
-
-    #[test]
-    fn focus_path_first_node() {
-        let mut tree = make_tree(vec![("src", true), ("src/main.rs", false)]);
-        assert_eq!(tree.focus_path("src"), Some(0));
-        assert_eq!(tree.tree_focus_index, 0);
     }
 
     #[test]
@@ -1017,103 +1012,60 @@ mod tests {
     }
 
     #[test]
-    fn focused_tree_node_not_focused() {
-        let tree = make_tree(vec![("src", true), ("src/main.rs", false)]);
-        // Tree is not focused (default).
-        assert!(tree.focused_tree_node().is_none());
-    }
-
-    #[test]
-    fn focused_tree_node_empty_visible_nodes() {
-        let mut tree = make_tree(vec![]);
-        tree.tree_focused = true;
-        assert!(tree.focused_tree_node().is_none());
-    }
-
-    #[test]
-    fn focused_tree_node_clamps_index() {
-        let mut tree = make_tree(vec![("a", false), ("b", false)]);
-        tree.tree_focused = true;
-        // Set index beyond bounds — method should clamp.
-        tree.tree_focus_index = 10;
-        let (idx, path, is_dir) = tree.focused_tree_node().unwrap();
-        assert_eq!(idx, 1);
-        assert_eq!(path, "b");
-        assert!(!is_dir);
-    }
-
-    #[test]
-    fn focused_tree_node_returns_correct_node() {
-        let mut tree = make_tree(vec![
-            ("src", true),
-            ("src/main.rs", false),
-            ("Cargo.toml", false),
-        ]);
-        tree.tree_focused = true;
-        tree.tree_focus_index = 1;
-        let (idx, path, is_dir) = tree.focused_tree_node().unwrap();
-        assert_eq!(idx, 1);
-        assert_eq!(path, "src/main.rs");
-        assert!(!is_dir);
-    }
-
-    #[test]
-    fn focused_tree_node_returns_directory() {
-        let mut tree = make_tree(vec![("src", true), ("src/main.rs", false)]);
-        tree.tree_focused = true;
-        tree.tree_focus_index = 0;
-        let (idx, path, is_dir) = tree.focused_tree_node().unwrap();
-        assert_eq!(idx, 0);
-        assert_eq!(path, "src");
-        assert!(is_dir);
+    #[allow(clippy::type_complexity)]
+    fn focused_tree_node_cases() {
+        // (name, nodes, focused, focus index, expected node)
+        #[rustfmt::skip]
+        let cases: &[(&str, &[(&str, bool)], bool, usize, Option<(usize, &str, bool)>)] = &[
+            // Tree is not focused (default).
+            ("not_focused", &[("src", true), ("src/main.rs", false)], false, 0, None),
+            ("empty_visible_nodes", &[], true, 0, None),
+            // Set index beyond bounds — method should clamp.
+            ("clamps_index", &[("a", false), ("b", false)], true, 10, Some((1, "b", false))),
+            ("returns_correct_node", &[("src", true), ("src/main.rs", false), ("Cargo.toml", false)], true, 1, Some((1, "src/main.rs", false))),
+            ("returns_directory", &[("src", true), ("src/main.rs", false)], true, 0, Some((0, "src", true))),
+        ];
+        for &(name, nodes, focused, focus_index, expected) in cases {
+            let mut tree = make_tree(nodes.to_vec());
+            tree.tree_focused = focused;
+            tree.tree_focus_index = focus_index;
+            assert_eq!(
+                tree.focused_tree_node(),
+                expected.map(|(i, p, d)| (i, p.to_string(), d)),
+                "case: {name}"
+            );
+        }
     }
 
     // ── nav_up / nav_down tests ──────────────────────────────────────
 
     #[test]
-    fn nav_up_at_top_clamped() {
-        let mut tree = make_tree(vec![("a", false), ("b", false)]);
-        tree.tree_focused = true;
-        tree.tree_focus_index = 0;
-        assert!(!tree.nav_up());
-        assert_eq!(tree.tree_focus_index, 0);
-    }
-
-    #[test]
-    fn nav_down_at_bottom_clamped() {
-        let mut tree = make_tree(vec![("a", false), ("b", false)]);
-        tree.tree_focused = true;
-        tree.tree_focus_index = 1;
-        assert!(!tree.nav_down());
-        assert_eq!(tree.tree_focus_index, 1);
-    }
-
-    #[test]
-    fn nav_up_moves_focus() {
-        let mut tree = make_tree(vec![("a", false), ("b", false)]);
-        tree.tree_focused = true;
-        tree.tree_focus_index = 1;
-        assert!(tree.nav_up());
-        assert_eq!(tree.tree_focus_index, 0);
-    }
-
-    #[test]
-    fn nav_down_moves_focus() {
-        let mut tree = make_tree(vec![("a", false), ("b", false)]);
-        tree.tree_focused = true;
-        tree.tree_focus_index = 0;
-        assert!(tree.nav_down());
-        assert_eq!(tree.tree_focus_index, 1);
-    }
-
-    #[test]
-    fn nav_ignored_when_not_focused() {
-        let mut tree = make_tree(vec![("a", false), ("b", false)]);
-        tree.tree_focus_index = 0;
-        assert!(!tree.nav_down());
-        assert_eq!(tree.tree_focus_index, 0);
-        assert!(!tree.nav_up());
-        assert_eq!(tree.tree_focus_index, 0);
+    #[allow(clippy::type_complexity)]
+    fn nav_cases() {
+        // (name, direction, focused, start index, expected moved, expected index)
+        let cases: &[(&str, &str, bool, usize, bool, usize)] = &[
+            ("up_at_top_clamped", "up", true, 0, false, 0),
+            ("down_at_bottom_clamped", "down", true, 1, false, 1),
+            ("up_moves_focus", "up", true, 1, true, 0),
+            ("down_moves_focus", "down", true, 0, true, 1),
+            ("ignored_when_not_focused_up", "up", false, 0, false, 0),
+            ("ignored_when_not_focused_down", "down", false, 0, false, 0),
+        ];
+        for &(name, dir, focused, start, expected_moved, expected_index) in cases {
+            let mut tree = make_tree(vec![("a", false), ("b", false)]);
+            tree.tree_focused = focused;
+            tree.tree_focus_index = start;
+            let moved = if dir == "up" {
+                tree.nav_up()
+            } else {
+                tree.nav_down()
+            };
+            assert_eq!(moved, expected_moved, "case: {name}");
+            assert_eq!(
+                tree.tree_focus_index, expected_index,
+                "case: {name} (index)"
+            );
+        }
     }
 
     // ── rebuild_visible clamping tests ────────────────────────────────
@@ -1165,77 +1117,52 @@ mod tests {
     // ── focused_is_expanded_dir tests ────────────────────────────────
 
     #[test]
-    fn focused_is_expanded_dir_not_focused() {
-        let tree = make_tree(vec![("src", true)]);
-        // Tree is not focused.
-        assert!(!tree.focused_is_expanded_dir());
-    }
-
-    #[test]
-    fn focused_is_expanded_dir_empty_tree() {
-        let mut tree = make_tree(vec![]);
-        tree.tree_focused = true;
-        assert!(!tree.focused_is_expanded_dir());
-    }
-
-    #[test]
-    fn focused_is_expanded_dir_file() {
-        let mut tree = make_tree(vec![("main.rs", false)]);
-        tree.tree_focused = true;
-        assert!(!tree.focused_is_expanded_dir());
-    }
-
-    #[test]
-    fn focused_is_expanded_dir_collapsed_directory() {
-        let mut tree = make_tree(vec![("src", true)]);
-        tree.tree_focused = true;
-        // "src" is a directory but not in expanded_dirs.
-        assert!(!tree.focused_is_expanded_dir());
-    }
-
-    #[test]
-    fn focused_is_expanded_dir_expanded_directory() {
-        let mut tree = make_tree(vec![("src", true)]);
-        tree.tree_focused = true;
-        tree.expanded_dirs.insert("src".into());
-        assert!(tree.focused_is_expanded_dir());
+    #[allow(clippy::type_complexity)]
+    fn focused_is_expanded_dir_cases() {
+        // (name, nodes, focused, expanded dir, expected)
+        #[rustfmt::skip]
+        let cases: &[(&str, &[(&str, bool)], bool, Option<&str>, bool)] = &[
+            // Tree is not focused.
+            ("not_focused", &[("src", true)], false, None, false),
+            ("empty_tree", &[], true, None, false),
+            ("file", &[("main.rs", false)], true, None, false),
+            // "src" is a directory but not in expanded_dirs.
+            ("collapsed_directory", &[("src", true)], true, None, false),
+            ("expanded_directory", &[("src", true)], true, Some("src"), true),
+        ];
+        for &(name, nodes, focused, expanded, expected) in cases {
+            let mut tree = make_tree(nodes.to_vec());
+            tree.tree_focused = focused;
+            if let Some(dir) = expanded {
+                tree.expanded_dirs.insert(dir.into());
+            }
+            assert_eq!(tree.focused_is_expanded_dir(), expected, "case: {name}");
+        }
     }
 
     // ── focused_parent_path tests ────────────────────────────────────
 
     #[test]
-    fn focused_parent_path_not_focused() {
-        let tree = make_tree(vec![("src/main.rs", false)]);
-        assert!(tree.focused_parent_path().is_none());
-    }
-
-    #[test]
-    fn focused_parent_path_empty_tree() {
-        let mut tree = make_tree(vec![]);
-        tree.tree_focused = true;
-        assert!(tree.focused_parent_path().is_none());
-    }
-
-    #[test]
-    fn focused_parent_path_root_item() {
-        let mut tree = make_tree(vec![("src", true)]);
-        tree.tree_focused = true;
-        // Root-level item — no parent.
-        assert!(tree.focused_parent_path().is_none());
-    }
-
-    #[test]
-    fn focused_parent_path_nested() {
-        let mut tree = make_tree(vec![("src/main.rs", false)]);
-        tree.tree_focused = true;
-        assert_eq!(tree.focused_parent_path(), Some("src".into()));
-    }
-
-    #[test]
-    fn focused_parent_path_deep_nested() {
-        let mut tree = make_tree(vec![("a/b/c/file.rs", false)]);
-        tree.tree_focused = true;
-        assert_eq!(tree.focused_parent_path(), Some("a/b/c".into()));
+    fn focused_parent_path_cases() {
+        // (name, nodes, focused, expected)
+        #[rustfmt::skip]
+        let cases: &[(&str, &[(&str, bool)], bool, Option<&str>)] = &[
+            ("not_focused", &[("src/main.rs", false)], false, None),
+            ("empty_tree", &[], true, None),
+            // Root-level item — no parent.
+            ("root_item", &[("src", true)], true, None),
+            ("nested", &[("src/main.rs", false)], true, Some("src")),
+            ("deep_nested", &[("a/b/c/file.rs", false)], true, Some("a/b/c")),
+        ];
+        for &(name, nodes, focused, expected) in cases {
+            let mut tree = make_tree(nodes.to_vec());
+            tree.tree_focused = focused;
+            assert_eq!(
+                tree.focused_parent_path(),
+                expected.map(str::to_string),
+                "case: {name}"
+            );
+        }
     }
 
     // ── tree_guide_prefix tests ────────────────────────────────────────────

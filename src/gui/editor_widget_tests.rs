@@ -342,7 +342,7 @@ fn test_select_all_empty() {
 // ── Line comment prefix ───────────────────────────────────────
 
 #[test]
-fn test_line_comment_prefix_by_language() {
+fn test_line_comment_prefix() {
     use super::highlight::HighlightLanguage::*;
     assert_eq!(line_comment_prefix(Some(Rust), None), Some("//"));
     assert_eq!(line_comment_prefix(Some(Python), None), Some("#"));
@@ -350,17 +350,9 @@ fn test_line_comment_prefix_by_language() {
     assert_eq!(line_comment_prefix(Some(Json), None), None);
     assert_eq!(line_comment_prefix(Some(Html), None), None);
     assert_eq!(line_comment_prefix(Some(Markdown), None), None);
-}
-
-#[test]
-fn test_line_comment_prefix_by_extension() {
     assert_eq!(line_comment_prefix(None, Some("yaml")), Some("#"));
     assert_eq!(line_comment_prefix(None, Some("yml")), Some("#"));
     assert_eq!(line_comment_prefix(None, Some("rs")), None); // falls to ext-only
-}
-
-#[test]
-fn test_line_comment_prefix_none() {
     assert_eq!(line_comment_prefix(None, None), None);
     assert_eq!(line_comment_prefix(None, Some("xyz")), None);
 }
@@ -550,156 +542,104 @@ fn test_jump_to_matching_bracket() {
 // ── Delete line ────────────────────────────────────────────────
 
 #[test]
-fn test_delete_current_line() {
-    let buf = EditorBuffer::with_text("line1\nline2\nline3", None);
-    buf.move_to(1, 0);
-    buf.perform_action(EditorAction::DeleteLine);
-    assert_eq!(buf.text(), "line1\nline3");
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 1); // Stayed at index 1 (now "line3")
-    assert_eq!(cursor.column, 0);
-}
-
-#[test]
-fn test_delete_first_line() {
-    let buf = EditorBuffer::with_text("line1\nline2\nline3", None);
-    buf.perform_action(EditorAction::DeleteLine);
-    assert_eq!(buf.text(), "line2\nline3");
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 0);
-    assert_eq!(cursor.column, 0);
-}
-
-#[test]
-fn test_delete_last_line() {
-    let buf = EditorBuffer::with_text("line1\nline2\nline3", None);
-    buf.move_to(2, 0);
-    buf.perform_action(EditorAction::DeleteLine);
-    assert_eq!(buf.text(), "line1\nline2");
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 1);
-}
-
-#[test]
-fn test_delete_single_line() {
-    let buf = EditorBuffer::with_text("hello", None);
-    buf.perform_action(EditorAction::DeleteLine);
-    assert_eq!(buf.text(), "");
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 0);
-    assert_eq!(cursor.column, 0);
-}
-
-#[test]
-fn test_delete_selected_lines() {
-    let buf = EditorBuffer::with_text("a\nb\nc\nd\ne", None);
-    buf.move_to(1, 0);
-    buf.perform_action(EditorAction::SelectTo { line: 3, col: 0 });
-    buf.perform_action(EditorAction::DeleteLine);
-    assert_eq!(buf.text(), "a\ne");
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 1);
+#[allow(clippy::type_complexity)]
+fn test_delete_line_cases() {
+    // (name, input, cursor line, selection end, expected text, expected line, expected column)
+    #[rustfmt::skip]
+    let cases: &[(&str, &str, usize, Option<(usize, usize)>, &str, usize, Option<usize>)] = &[
+        // Stayed at index 1 (now "line3")
+        ("current_line", "line1\nline2\nline3", 1, None, "line1\nline3", 1, Some(0)),
+        ("first_line", "line1\nline2\nline3", 0, None, "line2\nline3", 0, Some(0)),
+        ("last_line", "line1\nline2\nline3", 2, None, "line1\nline2", 1, None),
+        ("single_line", "hello", 0, None, "", 0, Some(0)),
+        ("selected_lines", "a\nb\nc\nd\ne", 1, Some((3, 0)), "a\ne", 1, None),
+    ];
+    for &(name, input, cursor_line, select_to, expected, expected_line, expected_col) in cases {
+        let buf = EditorBuffer::with_text(input, None);
+        buf.move_to(cursor_line, 0);
+        if let Some((line, col)) = select_to {
+            buf.perform_action(EditorAction::SelectTo { line, col });
+        }
+        buf.perform_action(EditorAction::DeleteLine);
+        assert_eq!(buf.text(), expected, "case: {name}");
+        let cursor = buf.cursor();
+        assert_eq!(cursor.line, expected_line, "case: {name} (line)");
+        if let Some(col) = expected_col {
+            assert_eq!(cursor.column, col, "case: {name} (col)");
+        }
+    }
 }
 
 // ── Duplicate line ─────────────────────────────────────────────
 
 #[test]
-fn test_duplicate_current_line() {
-    let buf = EditorBuffer::with_text("hello\nworld", None);
-    buf.move_to(0, 0);
-    buf.perform_action(EditorAction::DuplicateLine);
-    assert_eq!(buf.text(), "hello\nhello\nworld");
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 1); // Cursor on duplicated line
-    assert_eq!(cursor.column, 0);
-}
-
-#[test]
-fn test_duplicate_last_line() {
-    let buf = EditorBuffer::with_text("hello\nworld", None);
-    buf.move_to(1, 0);
-    buf.perform_action(EditorAction::DuplicateLine);
-    assert_eq!(buf.text(), "hello\nworld\nworld");
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 2);
-}
-
-#[test]
-fn test_duplicate_selected_lines() {
-    let buf = EditorBuffer::with_text("a\nb\nc\nd", None);
-    buf.move_to(1, 0);
-    buf.perform_action(EditorAction::SelectTo { line: 2, col: 0 });
-    buf.perform_action(EditorAction::DuplicateLine);
-    assert_eq!(buf.text(), "a\nb\nc\nb\nc\nd");
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 3);
+#[allow(clippy::type_complexity)]
+fn test_duplicate_line_cases() {
+    // (name, input, cursor line, selection end, expected text, expected line, expected column)
+    #[rustfmt::skip]
+    let cases: &[(&str, &str, usize, Option<(usize, usize)>, &str, usize, Option<usize>)] = &[
+        // Cursor on duplicated line
+        ("current_line", "hello\nworld", 0, None, "hello\nhello\nworld", 1, Some(0)),
+        ("last_line", "hello\nworld", 1, None, "hello\nworld\nworld", 2, None),
+        ("selected_lines", "a\nb\nc\nd", 1, Some((2, 0)), "a\nb\nc\nb\nc\nd", 3, None),
+    ];
+    for &(name, input, cursor_line, select_to, expected, expected_line, expected_col) in cases {
+        let buf = EditorBuffer::with_text(input, None);
+        buf.move_to(cursor_line, 0);
+        if let Some((line, col)) = select_to {
+            buf.perform_action(EditorAction::SelectTo { line, col });
+        }
+        buf.perform_action(EditorAction::DuplicateLine);
+        assert_eq!(buf.text(), expected, "case: {name}");
+        let cursor = buf.cursor();
+        assert_eq!(cursor.line, expected_line, "case: {name} (line)");
+        if let Some(col) = expected_col {
+            assert_eq!(cursor.column, col, "case: {name} (col)");
+        }
+    }
 }
 
 // ── Move line up/down ──────────────────────────────────────────
 
 #[test]
-fn test_move_line_up() {
-    let buf = EditorBuffer::with_text("a\nb\nc", None);
-    buf.move_to(1, 0);
-    buf.perform_action(EditorAction::MoveLineUp);
-    assert_eq!(buf.text(), "b\na\nc");
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 0);
-    assert_eq!(cursor.column, 0);
+#[allow(clippy::type_complexity)]
+fn test_move_line_cases() {
+    // (name, action, input, cursor line, selection end, expected text, expected line, expected column)
+    #[rustfmt::skip]
+    let cases: &[(&str, EditorAction, &str, usize, Option<(usize, usize)>, &str, Option<usize>, Option<usize>)] = &[
+        ("up", EditorAction::MoveLineUp, "a\nb\nc", 1, None, "b\na\nc", Some(0), Some(0)),
+        ("down", EditorAction::MoveLineDown, "a\nb\nc", 1, None, "a\nc\nb", Some(2), Some(0)),
+        ("up_at_top", EditorAction::MoveLineUp, "a\nb", 0, None, "a\nb", None, None), // No change
+        ("down_at_bottom", EditorAction::MoveLineDown, "a\nb", 1, None, "a\nb", None, None), // No change
+        // First line of the moved block
+        ("selected_down", EditorAction::MoveLineDown, "a\nb\nc\nd", 1, Some((2, 0)), "a\nd\nb\nc", Some(2), Some(0)),
+    ];
+    for &(name, ref action, input, cursor_line, select_to, expected, expected_line, expected_col) in
+        cases
+    {
+        let buf = EditorBuffer::with_text(input, None);
+        buf.move_to(cursor_line, 0);
+        if let Some((line, col)) = select_to {
+            buf.perform_action(EditorAction::SelectTo { line, col });
+        }
+        buf.perform_action(action.clone());
+        assert_eq!(buf.text(), expected, "case: {name}");
+        if let Some(line) = expected_line {
+            let cursor = buf.cursor();
+            assert_eq!(cursor.line, line, "case: {name} (line)");
+            if let Some(col) = expected_col {
+                assert_eq!(cursor.column, col, "case: {name} (col)");
+            }
+        }
+    }
 }
 
 #[test]
-fn test_move_line_down() {
-    let buf = EditorBuffer::with_text("a\nb\nc", None);
-    buf.move_to(1, 0);
-    buf.perform_action(EditorAction::MoveLineDown);
-    assert_eq!(buf.text(), "a\nc\nb");
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 2);
-    assert_eq!(cursor.column, 0);
-}
-
-#[test]
-fn test_move_line_up_at_top() {
-    let buf = EditorBuffer::with_text("a\nb", None);
-    buf.perform_action(EditorAction::MoveLineUp);
-    assert_eq!(buf.text(), "a\nb"); // No change
-}
-
-#[test]
-fn test_move_line_down_at_bottom() {
-    let buf = EditorBuffer::with_text("a\nb", None);
-    buf.move_to(1, 0);
-    buf.perform_action(EditorAction::MoveLineDown);
-    assert_eq!(buf.text(), "a\nb"); // No change
-}
-
-#[test]
-fn test_move_selected_lines_down() {
-    let buf = EditorBuffer::with_text("a\nb\nc\nd", None);
-    buf.move_to(1, 0);
-    buf.perform_action(EditorAction::SelectTo { line: 2, col: 0 });
-    buf.perform_action(EditorAction::MoveLineDown);
-    assert_eq!(buf.text(), "a\nd\nb\nc");
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 2); // First line of the moved block
-    assert_eq!(cursor.column, 0);
-}
-
-#[test]
-fn test_has_trailing_newline() {
+fn test_has_trailing_newline_and_detect_line_ending() {
     assert!(has_trailing_newline("hello\n"));
     assert!(!has_trailing_newline("hello"));
     assert!(!has_trailing_newline(""));
-}
-
-#[test]
-fn test_detect_line_ending_lf() {
     assert_eq!(detect_line_ending("hello\nworld\n"), LineEnding::Lf);
-}
-
-#[test]
-fn test_detect_line_ending_crlf() {
     assert_eq!(detect_line_ending("hello\r\nworld\r\n"), LineEnding::Crlf);
 }
 
