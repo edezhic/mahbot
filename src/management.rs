@@ -1422,12 +1422,14 @@ async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
     )
 }
 
-/// Shared engineer post-run tail: failure comment, pause, transition, and job
-/// terminalization. Diagnostics are dispatched by the poll loop as a separate
-/// `PollPhase::DiagnosticsCheck` (see `poll_round`) — the success path only
-/// transitions to InDiagnostics. The drain-cut guard stays at the call sites
-/// (response-None here is a real failure). `resumed` selects the observability
-/// log strings.
+/// Shared engineer post-run tail: phase/drain guards, failure comment, pause,
+/// transition, and job terminalization. Diagnostics are dispatched by the poll
+/// loop as a separate `PollPhase::DiagnosticsCheck` (see `poll_round`) — the
+/// success path only transitions to InDiagnostics. The guards live here:
+/// phase-moved → complete job and bail; drain-cut → leave the job 'launched'
+/// for boot resume (fresh dispatches log, resumes stay silent); response-None
+/// past the guards is a real failure. `resumed` selects the observability log
+/// strings.
 async fn finalize_engineer_round(
     ticket: &Ticket,
     agent: &Agent,
@@ -1435,14 +1437,29 @@ async fn finalize_engineer_round(
     job_id: &str,
     resumed: bool,
 ) {
+    if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InDevelopment).await {
+        complete_ticket_stage_job(job_id).await;
+        return;
+    }
+    // Drain-cut: the job stays status='launched' for boot resume — no failure
+    // record, no AGENT_FAILURE_EMOJI. Silent on resume (the fresh dispatch
+    // already logged the drain).
+    if response.is_none() && crate::shutdown::aborting() {
+        if !resumed {
+            info!(
+                ticket = %ticket.id,
+                "Engineer round cut short by drain — job stays launched for boot resume",
+            );
+        }
+        return;
+    }
     let failure_comment = engineer_failure_comment(
         crate::shutdown::shutdown_token().is_cancelled(),
         agent.is_cancelled(),
         agent.failure.as_deref(),
     );
 
-    // The drain-cut case is handled at the call sites — response None here is
-    // a real failure.
+    // Past the guards above, response None here is a real failure.
     let (comment_text, target_phase, notify, log_message) = if let Some(text) = response {
         (
             engineer_comment_text(agent, text).await,
@@ -1501,7 +1518,6 @@ async fn finalize_engineer_round(
 /// post-run phase check to catch race conditions, then transitions:
 /// - InDiagnostics (buffer) on successful completion
 /// - Failed (notify) if the agent failed or returned no output
-#[allow(clippy::too_many_lines)]
 async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     let agent_id = ticket_agent_id(&ticket.id, Role::Engineer.as_str());
 
@@ -1585,23 +1601,8 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     )
     .await;
 
-    // Post-run check still needed for race conditions during agent execution.
-    if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InDevelopment).await {
-        complete_ticket_stage_job(&job_id).await;
-        return;
-    }
-
-    // Drain-cut: the job stays status='launched' for boot resume —
-    // no failure record. Returned BEFORE the failure comment so drained agents
-    // never emit AGENT_FAILURE_EMOJI or drive exit-time rollback.
-    if response.is_none() && crate::shutdown::aborting() {
-        info!(
-            ticket = %ticket.id,
-            "Engineer round cut short by drain — job stays launched for boot resume",
-        );
-        return;
-    }
-
+    // Post-run guards (phase-moved, drain-cut, finalize) live in
+    // finalize_engineer_round.
     finalize_engineer_round(&ticket, &agent, response.as_deref(), &job_id, false).await;
 }
 
@@ -2034,9 +2035,12 @@ async fn register_sanitation_agent(
     (agent_id, incoming_rx)
 }
 
-/// Absorb the post-run tail shared by dispatch and resume: the response-None
-/// failure block, verdict extraction with error handling, and the job
-/// terminalization. The drain-cut guard stays at the call sites.
+/// Absorb the post-run tail shared by dispatch and resume: the phase/drain
+/// guards, the response-None failure block, verdict extraction with error
+/// handling, and the job terminalization. Guards: phase-moved → complete job
+/// and bail; drain-cut → leave the job 'launched' for boot resume (fresh
+/// dispatches log, resumes stay silent); response-None past the guards is a
+/// real failure.
 async fn finalize_sanitation_round(
     ticket: &Ticket,
     agent: &Agent,
@@ -2044,12 +2048,27 @@ async fn finalize_sanitation_round(
     job_id: &str,
     resumed: bool,
 ) {
+    if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InSanitation).await {
+        complete_ticket_stage_job(job_id).await;
+        return;
+    }
+    // Drain-cut: the job stays status='launched' for boot resume — no failure
+    // record. Silent on resume (the fresh dispatch already logged the drain).
+    if response.is_none() && crate::shutdown::aborting() {
+        if !resumed {
+            info!(
+                ticket = %ticket.id,
+                "Sanitation round cut short by drain — job stays launched for boot resume",
+            );
+        }
+        return;
+    }
     let resumed_suffix = if resumed { " (resumed)" } else { "" };
     if response.is_none() {
         // Agent failed or was cancelled — record failure and clear assigned_to
         // for re-dispatch retry. The marker comment lets the sanitation circuit
-        // breaker detect repeated failures. (Drain-cut is handled at the call
-        // sites — response None here is a real failure.)
+        // breaker detect repeated failures. (Past the guard above, response
+        // None here is a real failure.)
         warn!(
             ticket = %ticket.id,
             "Sanitation agent returned no output{resumed_suffix} — clearing assigned_to for retry"
@@ -2097,7 +2116,6 @@ async fn finalize_sanitation_round(
 ///
 /// After the agent completes, extracts a structured [`SanitationVerdict`] and
 /// delegates to [`process_sanitation_verdict`] for pass/fail processing.
-#[allow(clippy::too_many_lines)]
 async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     //
     // Unlike handle_qa_passed (which fails closed on git errors — returning early
@@ -2179,22 +2197,8 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
     )
     .await;
 
-    // Post-run phase check — bail if ticket was moved externally.
-    if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InSanitation).await {
-        complete_ticket_stage_job(&job_id).await;
-        return;
-    }
-
-    // Drain-cut: the job stays status='launched' for boot resume —
-    // no failure record.
-    if response.is_none() && crate::shutdown::aborting() {
-        info!(
-            ticket = %ticket.id,
-            "Sanitation round cut short by drain — job stays launched for boot resume",
-        );
-        return;
-    }
-
+    // Post-run guards (phase-moved, drain-cut, finalize) live in
+    // finalize_sanitation_round.
     finalize_sanitation_round(&ticket, &agent, response.as_deref(), &job_id, false).await;
 }
 
@@ -4415,14 +4419,6 @@ async fn resume_engineer_round(job_id: &str, ticket: Ticket, ws: Workspace) {
     )
     .await;
 
-    if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InDevelopment).await {
-        complete_ticket_stage_job(job_id).await;
-        return;
-    }
-    if response.is_none() && crate::shutdown::aborting() {
-        // Drain-cut: job stays status='launched' for boot resume.
-        return;
-    }
     finalize_engineer_round(&ticket, &agent, response.as_deref(), job_id, true).await;
 }
 
@@ -4450,14 +4446,6 @@ async fn resume_sanitation_round(job_id: &str, ticket: Ticket, ws: Workspace) {
         true,
     )
     .await;
-    if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InSanitation).await {
-        complete_ticket_stage_job(job_id).await;
-        return;
-    }
-    if response.is_none() && crate::shutdown::aborting() {
-        // Drain-cut: job stays status='launched' for boot resume.
-        return;
-    }
     finalize_sanitation_round(&ticket, &agent, response.as_deref(), job_id, true).await;
 }
 
