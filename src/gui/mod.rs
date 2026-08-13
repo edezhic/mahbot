@@ -606,7 +606,7 @@ impl Dashboard {
         );
     }
 
-    fn save_and_exit(&mut self, close_requested: bool) -> Task<Message> {
+    fn save_and_exit(&self) -> Task<Message> {
         self.persist_window_state();
         if self.update_status == UpdateStatus::InProgress
             && crate::self_update::update_is_finalizing()
@@ -615,13 +615,10 @@ impl Dashboard {
             // checkpoint (execute_update step 11), lock release, spawn, exit(0).
             // Exiting here would drop the iced runtime and abort that sequence
             // mid-checkpoint, leaving the daemon down without a replacement —
-            // so wait instead. Only a genuine window close records the exit
-            // request (the update's own shutdown fires this path too); if the
-            // update fails, UpdateResult re-enters this path (with the flag
-            // cleared and status no longer InProgress) and honors the close.
-            if close_requested {
-                self.exit_requested_during_update = true;
-            }
+            // so wait instead. A close requested meanwhile is recorded in
+            // Message::CloseRequested; if the update fails, UpdateResult
+            // re-enters this path (status back to Available, flag cleared)
+            // and honors the close.
             return Task::none();
         }
         // The checkpoint is deliberately NOT run here: it relocated to
@@ -1003,7 +1000,7 @@ impl Dashboard {
                     Task::none()
                 }
             }
-            Message::Shutdown => self.save_and_exit(false),
+            Message::Shutdown => self.save_and_exit(),
             Message::DrainStarted => {
                 self.draining = true;
                 Task::none()
@@ -1189,7 +1186,7 @@ impl Dashboard {
                         // owned the exit; it failed, so run the normal exit
                         // checkpoint.
                         self.exit_requested_during_update = false;
-                        return self.save_and_exit(false);
+                        return self.save_and_exit();
                     }
                 }
                 Task::none()

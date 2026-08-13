@@ -140,7 +140,7 @@ impl BrowserTool {
         // concurrent same-tab access doesn't race between navigation
         // and text extraction.
         let _guard = self.acquire_tab_lock(tab).await;
-        let opened = self.run_command(&["open", url], Some(tab)).await?;
+        let opened = self.run_command(&["open", url], tab).await?;
 
         // A real navigation attempt that ends on the scratch `about:blank`
         // never committed — fail loudly instead of returning empty content.
@@ -148,7 +148,7 @@ impl BrowserTool {
 
         // Wait for network idle (best-effort — no hard error on timeout).
         let _ = self
-            .run_command(&["wait", "--load", "networkidle"], Some(tab))
+            .run_command(&["wait", "--load", "networkidle"], tab)
             .await;
 
         // Extract clean visible text via innerText JS eval (not snapshot).
@@ -256,11 +256,7 @@ impl BrowserTool {
     }
 
     /// Run an chrome-use command and parse the JSON response.
-    async fn run_command(
-        &self,
-        args: &[&str],
-        tab: Option<&str>,
-    ) -> anyhow::Result<BrowserResponse> {
+    async fn run_command(&self, args: &[&str], tab: &str) -> anyhow::Result<BrowserResponse> {
         let mut cmd = Command::new(super::browser_daemon::cli_path().with_context(|| {
             format!(
                 "chrome-use CLI is not available. {}",
@@ -270,9 +266,7 @@ impl BrowserTool {
         super::browser_daemon::ensure_browser_env(&mut cmd);
         cmd.args(args);
         cmd.arg("--json");
-        if let Some(tab) = tab {
-            cmd.args(["--session", tab]);
-        }
+        cmd.args(["--session", tab]);
 
         debug!("chrome-use args: {:?}", cmd.as_std().get_args());
 
@@ -347,7 +341,7 @@ impl BrowserTool {
             "(used get text fallback — textContent, may include script/style text)";
 
         let js = inner_text_eval_js(selector);
-        if let Ok(resp) = self.run_command(&["eval", &js], Some(tab)).await
+        if let Ok(resp) = self.run_command(&["eval", &js], tab).await
             && let Some(data) = resp.data.as_ref()
             && let Some(text) = extract_snapshot_text(data)
             && !text.trim().is_empty()
@@ -355,9 +349,7 @@ impl BrowserTool {
             return Ok(text);
         }
 
-        let resp = self
-            .run_command(&["get", "text", selector], Some(tab))
-            .await?;
+        let resp = self.run_command(&["get", "text", selector], tab).await?;
         let mut text = resp
             .data
             .as_ref()
@@ -770,7 +762,7 @@ impl Tool for BrowserTool {
 
         let cli_args = Self::build_args(&action)?;
         let str_args: Vec<&str> = cli_args.iter().map(String::as_str).collect();
-        let response = self.run_command(&str_args, Some(&tab)).await?;
+        let response = self.run_command(&str_args, &tab).await?;
 
         // A real navigation attempt that ends on the scratch `about:blank`
         // never committed — fail loudly (and close the tab best-effort)
@@ -783,10 +775,10 @@ impl Tool for BrowserTool {
         // so the LLM sees page content immediately.
         let snapshot_output = if matches!(action, BrowserAction::Open { .. }) {
             let wait_args = ["wait", "--load", "networkidle"];
-            let _ = self.run_command(&wait_args, Some(&tab)).await;
+            let _ = self.run_command(&wait_args, &tab).await;
 
             // Run a compact snapshot to return page content.
-            match self.run_command(&["snapshot", "-c"], Some(&tab)).await {
+            match self.run_command(&["snapshot", "-c"], &tab).await {
                 Ok(snap_resp) => snap_resp
                     .data
                     .as_ref()
