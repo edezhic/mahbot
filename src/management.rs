@@ -4304,11 +4304,7 @@ async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: 
         return;
     }
 
-    let is_reviewer = vi.role == Role::Reviewer;
-    let repo_path = ws.as_path();
-    let git_available = is_reviewer
-        && crate::git_commands::git_is_installed().await
-        && crate::git_commands::is_git_repo(repo_path);
+    let (is_reviewer, _repo_path, git_available) = verifier_git_state(&ws, vi).await;
 
     // Freeze the reviewer base count (ticket-level).
     // The base was frozen on the ticket_stage_jobs row at spawn; the replay
@@ -4336,28 +4332,7 @@ async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: 
         }
     }
 
-    let transitioned = process_verifier_verdicts(&ws, &ticket_arc, &results, vi, job_id).await;
-
-    // Drain-cut verifier round: job stays status='launched' for boot resume (the
-    // stored outcomes are re-processed at boot via the phase-locked ticket).
-    if !transitioned && crate::shutdown::aborting() {
-        info!(
-            ticket = %ticket_arc.id,
-            "Resumed verifier round cut short by drain — job stays launched for boot resume",
-        );
-        return;
-    }
-
-    record_reviewed_base_after_review(
-        repo_path,
-        &ticket_arc.id,
-        git_available,
-        transitioned,
-        &results,
-        "Resume: ",
-    )
-    .await;
-    complete_ticket_stage_job(job_id).await;
+    finalize_verifier_round(&ws, &ticket_arc, vi, &results, job_id, true, git_available).await;
 }
 
 /// Resume an engineer round: the accumulated session `ticket_{id}_engineer`
@@ -4462,6 +4437,58 @@ async fn job_task(job_id: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Finalize a verifier round (review/QA) — shared by fresh dispatch and boot
+/// resume so the post-verdict tail stays in lockstep. `resumed` selects the
+/// observability strings (drain-cut log gains a "Resumed " prefix,
+/// [`record_reviewed_base_after_review`] a "Resume: " one — the verifier path
+/// logs on resume, unlike the silent engineer/sanitation wrappers; preserved).
+/// The drain guard inside [`process_verifier_verdicts`] already logged the
+/// cut-short (the outer re-log is the pre-existing double-log, kept as-is);
+/// the job stays status='launched' for boot resume. Completion tx after the
+/// board transition+comment (ordering contract).
+async fn finalize_verifier_round(
+    ws: &Workspace,
+    ticket: &Ticket,
+    vi: VerifierInfo,
+    results: &[ParallelVerdict],
+    job_id: &str,
+    resumed: bool,
+    git_available: bool,
+) {
+    let transitioned = process_verifier_verdicts(ws, ticket, results, vi, job_id).await;
+    if !transitioned && crate::shutdown::aborting() {
+        let cut_short = if resumed {
+            "Resumed verifier round cut short by drain — job stays launched for boot resume"
+        } else {
+            "Verifier round cut short by drain — job stays launched for boot resume"
+        };
+        info!(ticket = %ticket.id, "{cut_short}");
+        return;
+    }
+
+    record_reviewed_base_after_review(
+        ws.as_path(),
+        &ticket.id,
+        git_available,
+        transitioned,
+        results,
+        if resumed { "Resume: " } else { "" },
+    )
+    .await;
+    complete_ticket_stage_job(job_id).await;
+}
+
+/// Git availability + reviewer identity shared by the verifier pair:
+/// `(is_reviewer, repo_path, git_available)`.
+async fn verifier_git_state(ws: &Workspace, vi: VerifierInfo) -> (bool, &Path, bool) {
+    let is_reviewer = vi.role == Role::Reviewer;
+    let repo_path = ws.as_path();
+    let git_available = is_reviewer
+        && crate::git_commands::git_is_installed().await
+        && crate::git_commands::is_git_repo(repo_path);
+    (is_reviewer, repo_path, git_available)
+}
+
 /// Shared dispatch logic for parallel verifiers (reviewers and QA).
 /// Fetches the engineer's last comment, builds a prompt from the template,
 /// runs parallel verifiers of the given role (reviewers use the calibrated
@@ -4479,11 +4506,7 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
     // recorded on this ticket by a prior completed review round (same HEAD,
     // same index tree, clean porcelain). A ticket with no recorded base —
     // first review round, brand-new commit — must always run the full pass.
-    let is_reviewer = vi.role == Role::Reviewer;
-    let repo_path = ws.as_path();
-    let git_available = is_reviewer
-        && crate::git_commands::git_is_installed().await
-        && crate::git_commands::is_git_repo(repo_path);
+    let (is_reviewer, repo_path, git_available) = verifier_git_state(&ws, vi).await;
 
     if git_available {
         match compute_review_skip(&ticket, repo_path).await {
@@ -4599,33 +4622,7 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
         );
     }
 
-    let transitioned = process_verifier_verdicts(&ws, &ticket, &results, vi, &job_id).await;
-
-    // Drain-cut verifier round (the drain guard inside process_verifier_verdicts
-    // returned false): the job stays status='launched' for boot resume — the
-    // stored outcomes are re-processed at boot via the phase-locked ticket.
-    // Terminalizing here would discard completed/checkpointed outcomes and
-    // force a whole-round re-run.
-    if !transitioned && crate::shutdown::aborting() {
-        info!(
-            ticket = %ticket.id,
-            "Verifier round cut short by drain — job stays launched for boot resume",
-        );
-        return;
-    }
-
-    record_reviewed_base_after_review(
-        repo_path,
-        &ticket.id,
-        git_available,
-        transitioned,
-        &results,
-        "",
-    )
-    .await;
-
-    // Completion tx AFTER the board transition+comment (ordering contract).
-    complete_ticket_stage_job(&job_id).await;
+    finalize_verifier_round(&ws, &ticket, vi, &results, &job_id, false, git_available).await;
 }
 
 #[cfg(test)]
