@@ -267,7 +267,7 @@ pub(crate) const DEFAULT_WAKE_WORD_PHRASE: &str = "mahbot";
 ///
 /// In practice this contract is always satisfied because the only production
 /// call site reads from `enrolling_phrase`, which is normalized at enrollment
-/// start (see [`PipelineCtx::handle_start_enrollment`], line ~5153).
+/// start (see [`PipelineCtx::handle_start_enrollment`]).
 #[must_use]
 fn is_mahbot_wake_word(phrase: &str) -> bool {
     phrase == DEFAULT_WAKE_WORD_PHRASE || phrase == "hey mahbot"
@@ -6061,7 +6061,6 @@ impl PipelineCtx {
 /// Schedule a transition back to [`VoiceStatus::Listening`] after enrollment
 /// finalization completes successfully.
 ///
-/// Extracted from the existing cleanup at lines ~5616-5636 of the main loop.
 /// Runs [`reset_pipeline_state(Cancel)`](PipelineCtx::reset_pipeline_state),
 /// sets `enrollment_mode = false`, and spawns a 1.5-second delayed task that
 /// transitions to [`VoiceStatus::Listening`] (respecting the global shutdown
@@ -7493,9 +7492,9 @@ fn score_stride8_window(
     // score_single_embedding needs the classifier from the global
     // voice state.  We acquire a read lock, call the function (which only
     // borrows the data temporarily), then let the guard drop at the end of
-    // this block.  This avoids a read→write upgrade deadlock: the caller
-    // below (line 7043) calls set_status() which acquires a write lock,
-    // and holding a read lock across that call would deadlock on
+    // this block.  This avoids a read→write upgrade deadlock:
+    // set_status(VoiceStatus::Recording) below in this function acquires
+    // a write lock, and holding a read lock across that call would deadlock on
     // std::sync::RwLock (which does not support read→write upgrades).
     //
     // Historical context: commit da06926 fixed a double-read-lock in this
@@ -7938,8 +7937,8 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     // ── Detection→recording handoff ──────────────────────────
     // When detection fires, score_stride8_window sets is_recording = true.
     // We complete the transition here where all state (audio_buf, voice_batch,
-    // mel_frame_buffer) is available as local variables (moved out of ctx at
-    // lines 6960-6962 to avoid borrow conflicts with the VAD closure).
+    // mel_frame_buffer) is available as local variables (moved out of ctx to
+    // avoid borrow conflicts with the VAD closure).
     //
     // The transition sequence (matching the documented design):
     //   1. Take ALL of audio_buf (processed wake-word tail + unprocessed
@@ -7949,7 +7948,7 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     //      (embedding_ring, score_window, next_window_start, etc.)
     //   3. Re-populate command_buffer with the saved audio
     //   4. Clear stale local copies (voice_batch, mel_frame_buffer) so the
-    //      write-back below (lines 7125-7127) restores empty Vecs
+    //      write-back below restores empty Vecs
     //   5. Set consumed = 0 to prevent drain panic on the now-empty audio_buf
     //
     // Previously score_stride8_window called transition_to_recording()
@@ -10272,7 +10271,7 @@ mod tests {
         // Validates the safety invariant that recording-mode detection does
         // not corrupt per-segment state from stale frame-loop counters.
         //
-        // The `if !ctx.is_recording` guard (line ~6144) prevents stale
+        // The `if !ctx.is_recording` guard prevents stale
         // writeback of the local VAD-gap counter into ctx.segment_silence_hops
         // after detection fires and reset_pipeline_state(Soft) clears it.
         // This guard is trivially simple (single boolean check) and tested by
@@ -10333,7 +10332,7 @@ mod tests {
         );
 
         // ── Simulate the `if !ctx.is_recording` guard: skip boundary check ──
-        // In the production code (handle_wake_word_detection line ~6144), this
+        // In the production code (handle_wake_word_detection), this
         // skip prevents handle_segment_boundary from writing back the stale
         // local counter.  We validate the resulting invariant directly.
 
