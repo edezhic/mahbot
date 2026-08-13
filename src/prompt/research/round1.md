@@ -16,6 +16,13 @@ A research team is answering the question below. You are responsible for ONE sub
 
 {{query_ledger}}
 
+# Scratch Workspace
+
+This run has a temporary per-run folder you may use for scratch files
+(notes, dumps, intermediate artifacts). It is wiped after the run:
+
+{{run_root}}
+
 Rules:
 - Research your sub-question deeply and report load-bearing claims with sources.
 - Do not repeat queries already asked (list above).

@@ -296,8 +296,10 @@ pub(crate) fn normalize_tool_call(
 ///
 /// The `"glob"` alias is included because it resolves to `"search"` regardless
 /// of arguments; the parallel `mode:"files"` injection is handled separately
-/// in [`normalize_tool_call`] when args are available.
-fn normalize_tool_name(name: &str) -> &str {
+/// in [`normalize_tool_call`] when args are available. `pub(crate)` so the
+/// research sanitizer can gate on the canonical name before paying for an
+/// argument clone.
+pub(crate) fn normalize_tool_name(name: &str) -> &str {
     match name {
         "bash" | "run_terminal_cmd" => "shell",
         "grep" | "rg" | "grep_search" | "glob" => "search",

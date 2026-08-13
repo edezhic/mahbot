@@ -661,6 +661,7 @@ fn workspace_from_row(row: &turso::Row) -> anyhow::Result<Workspace> {
         diagnostics: row.get::<Option<String>>(COL_WS_DIAGNOSTICS)?,
         notes: row.get::<String>(COL_WS_NOTES)?,
         last_analyzed_commit: row.get::<Option<String>>(COL_WS_LAST_ANALYZED_COMMIT)?,
+        ephemeral: false,
     })
 }
 
@@ -1462,6 +1463,7 @@ mod tests {
             diagnostics: None,
             notes: String::new(),
             last_analyzed_commit: None,
+            ephemeral: false,
         }
     }
 

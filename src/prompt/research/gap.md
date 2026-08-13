@@ -12,6 +12,13 @@ A research team is answering the question below. Previous rounds covered some gr
 
 {{query_ledger}}
 
+# Scratch Workspace
+
+This run has a temporary per-run folder you may use for scratch files
+(notes, dumps, intermediate artifacts). It is wiped after the run:
+
+{{run_root}}
+
 For each assigned gap, find NEW evidence that the earlier rounds missed. Report your findings as structured claim-level findings (same JSON schema as the extraction prompt).
 
 Rules:

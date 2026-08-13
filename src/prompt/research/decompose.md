@@ -4,6 +4,13 @@ Break the following question into sub-questions that together would fully answer
 
 {{question}}
 
+# Scratch Workspace
+
+This run has a temporary per-run folder you may use for scratch files
+(notes, dumps, intermediate artifacts). It is wiped after the run:
+
+{{run_root}}
+
 Produce a JSON plan:
 {"sub_questions": [{"question": "<sub-question>", "evidence_needed": "<what evidence would answer it>", "risk": "low|medium|high"}]}
 

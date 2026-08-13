@@ -151,7 +151,13 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
                 // the TTL guard after the purge cascade removes their job rows.
                 let purged = mahbot::jobs::purge_stale_jobs(&cutoff).await?;
                 let cleaned = mahbot::session::cleanup_old_transient_sessions(&cutoff).await?;
-                Ok(purged + cleaned)
+                // Research sweeps (run roots + artist generated/uploads) — after
+                // the purge so dead-run detection sees the final jobs state;
+                // artist sessions are never transient, so keep-evidence is live
+                // regardless of ordering.
+                let run_roots = mahbot::research_cleanup::sweep_run_roots().await?;
+                let media = mahbot::research_cleanup::sweep_media().await?;
+                Ok(purged + cleaned + run_roots + media)
             },
         ),
     );

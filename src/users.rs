@@ -613,7 +613,7 @@ pub struct ChannelBinding {
 #[must_use]
 pub fn personal_workspace_path(user_name: &str) -> PathBuf {
     let storage_root = crate::config::default_config_dir()
-        .unwrap_or_else(|_| std::env::temp_dir().join("mahbot_test_userspaces"));
+        .unwrap_or_else(|_| std::env::temp_dir().join("mahbot_userspaces"));
     storage_root.join("userspaces").join(user_name)
 }
 

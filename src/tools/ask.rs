@@ -1273,6 +1273,11 @@ pub(crate) fn extract_query_telemetry(agent: &Agent) -> (usize, usize, Vec<Strin
 /// agent IDs; `task_extra` is appended to every task (e.g. the query
 /// ledger). The wait shares the round-wide `deadline`. Shared with the deep
 /// research tool's verification gate.
+///
+/// Returns the results PLUS the dispatched agent IDs (the deep research
+/// sanitizer needs them at dispatch time — successful writers never appear in
+/// wrap-up snapshots; the ids ride the return value so the shared helper
+/// keeps no write-only out-parameter).
 pub(crate) async fn dispatch_claim_verifiers(
     ws: &Workspace,
     id_prefix: &str,
@@ -1280,10 +1285,11 @@ pub(crate) async fn dispatch_claim_verifiers(
     task_extra: &str,
     deadline: std::time::Instant,
     resume: bool,
-) -> Vec<VerificationResult> {
+) -> (Vec<VerificationResult>, Vec<String>) {
     let task_template = load_prompt("ask/verify.md");
     let extraction_prompt = load_prompt("extraction/verify.md");
     let suffix = crate::generate_suffix();
+    let mut dispatched: Vec<String> = Vec::new();
     let members: Vec<_> = targets
         .iter()
         .take(VERIFY_MAX_ANALYSTS)
@@ -1291,6 +1297,7 @@ pub(crate) async fn dispatch_claim_verifiers(
         .map(|(i, t)| {
             let ws = ws.clone();
             let agent_id = format!("{id_prefix}_{suffix}_{i}");
+            dispatched.push(agent_id.clone());
             let mut task = substitute(
                 &task_template,
                 &[
@@ -1316,7 +1323,7 @@ pub(crate) async fn dispatch_claim_verifiers(
         })
         .collect();
     let handles = crate::agent::spawn_staggered_round(members, resume).await;
-    await_round_members(handles, deadline)
+    let results = await_round_members(handles, deadline)
         .await
         .into_iter()
         .enumerate()
@@ -1333,7 +1340,8 @@ pub(crate) async fn dispatch_claim_verifiers(
                 }
             }
         })
-        .collect()
+        .collect();
+    (results, dispatched)
 }
 
 /// Run one claim verifier: a fresh Analyst researches the claim and returns

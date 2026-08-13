@@ -298,6 +298,7 @@ mod tests {
             diagnostics: None,
             notes: String::new(),
             last_analyzed_commit: None,
+            ephemeral: false,
         }
     }
 

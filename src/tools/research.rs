@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 // ── Constants (module-local defaults) ────────────────────────────────────
@@ -61,6 +62,14 @@ const CLAIM_ANNOTATION_FAILED: &str = "claim annotation failed — all new claim
 /// links fails entirely — every mutating verdict is treated as weak.
 const CONFIRM_FAILED: &str =
     "annotation link confirmation failed — mutating links treated as weak/unconfirmed";
+/// Minimum remaining round time for a coder round to start (a coder run is
+/// not interrupted — starting one with less left would eat the subsequent
+/// gap rounds).
+const CODER_MIN_REMAINING: Duration = Duration::from_mins(30);
+/// Cap on the accumulated outside-zone commands in the checkpointed state
+/// blob. The cleaner ticket truncates at 32 KiB anyway — 2× gives the ticket
+/// its full body while bounding long runs' checkpoints (newest commands win).
+const MAX_STATE_COMMANDS_BYTES: usize = 64 * 1024;
 /// Default bound on the wrap-up stage: concurrent extraction of
 /// deadline-aborted analysts' accumulated findings (env-overridable via
 /// `MAHBOT_WRAP_UP_TIMEOUT_SECS`, distinct from the round deadline
@@ -99,6 +108,18 @@ struct ResearchState {
     /// "continue at round k+1").
     round_index: usize,
     verification: Vec<VerificationResult>,
+    /// Accumulated outside-zone shell commands (write-intent + zone filter
+    /// applied at collection) from completed rounds' sessions — collected
+    /// incrementally at dispatch so long runs don't lose early sessions to the
+    /// transient TTL. Capped at [`MAX_STATE_COMMANDS_BYTES`] so a long run's
+    /// checkpoint blob stays bounded (the ticket body is capped at 32 KiB).
+    #[serde(default)]
+    commands: Vec<String>,
+    /// Gap-loop round keys after which a coder round already ran (0 = the
+    /// pre-loop coder, k = after gap round k). Boot resume never re-runs a
+    /// completed coder round (no duplicate prototypes / LLM spend).
+    #[serde(default)]
+    coder_rounds_done: Vec<usize>,
 }
 
 impl Default for ResearchState {
@@ -115,6 +136,8 @@ impl Default for ResearchState {
             budget_spent: 0,
             round_index: 0,
             verification: Vec::new(),
+            commands: Vec::new(),
+            coder_rounds_done: Vec::new(),
         }
     }
 }
@@ -203,6 +226,45 @@ impl ResearchState {
                 let _ = tx.rollback().await;
             }
         }
+    }
+
+    /// Collect the given dispatched agents' outside-zone shell commands from
+    /// their persisted sessions (right after each completed round — early
+    /// sessions of >8h runs are TTL'd, so collection must be incremental). The
+    /// zone filter applies here, at capture time, so in-zone commands never
+    /// enter the state blob. The accumulated blob is capped — the ticket body
+    /// itself is capped at 32 KiB, so older commands are dropped (newest win).
+    async fn capture_round(&mut self, agent_ids: &[String], run_root: &Path) {
+        let fresh =
+            crate::research_cleanup::collect_agent_shell_commands(agent_ids, run_root).await;
+        for cmd in fresh {
+            if !self.commands.contains(&cmd) {
+                self.commands.push(cmd);
+            }
+        }
+        cap_commands(&mut self.commands, MAX_STATE_COMMANDS_BYTES);
+    }
+}
+
+/// Drop commands until the accumulated byte length fits `cap` (newest evidence
+/// wins; the ticket body truncates at 32 KiB regardless). A single command
+/// larger than the cap is dropped ON ITS OWN — it could never fit the ticket
+/// body, and dropping the older fitting commands for it would lose the only
+/// evidence that ever could be reported.
+fn cap_commands(commands: &mut Vec<String>, cap: usize) {
+    while commands.last().is_some_and(|c| c.len() > cap) {
+        commands.pop();
+    }
+    // Single pass to the drop boundary, then one drain (remove(0) in a loop
+    // would be O(n²)).
+    let mut total: usize = commands.iter().map(String::len).sum();
+    let mut drop = 0usize;
+    while drop < commands.len() && total > cap {
+        total -= commands[drop].len();
+        drop += 1;
+    }
+    if drop > 0 {
+        commands.drain(..drop);
     }
 }
 
@@ -402,7 +464,14 @@ impl Tool for ResearchTool {
             .catch_unwind()
             .await;
             let envelope = match run {
-                Ok((_result, envelope)) => envelope,
+                Ok(Some(envelope)) => envelope,
+                Ok(None) => {
+                    // Shutdown/drain abort: the run stays alive for the next
+                    // boot's resume — nothing is routed now (the result and
+                    // artifacts arrive at the real terminalization).
+                    tracing::info!("Research run aborted by shutdown/drain — resumes at boot");
+                    return;
+                }
                 Err(panic) => {
                     let panic = crate::util::panic_message(&*panic);
                     tracing::error!(panic = %panic, "research dispatch panicked");
@@ -438,16 +507,19 @@ impl Tool for ResearchTool {
 
 /// Durable deep-research dispatch: SPAWN the job (one tx) → run the resumable
 /// orchestrator (checkpoints at stage boundaries) → COMPLETE (one tx — INSERT
-/// pending_jobs envelope + DELETE jobs row). Returns (result, envelope) — the
-/// envelope is the completion helper's own copy (pending_job_id set by the
-/// tx), routed as-is so persisted and routed copies cannot drift.
+/// pending_jobs envelope + DELETE jobs row). Returns `Some(envelope)` on real
+/// terminalizations — the envelope is the completion helper's own copy
+/// (pending_job_id set by the tx), routed as-is so persisted and routed copies
+/// cannot drift. Returns `None` on a shutdown/drain abort: the run STAYS ALIVE
+/// for the next boot's resume (the jobs row is left 'launched'), nothing is
+/// terminalized and nothing is routed (design pin).
 async fn dispatch_durable_research(
     ws: &Workspace,
     question: &str,
     caller_role: Role,
     user_name: String,
     channel: String,
-) -> (anyhow::Result<String>, AgentJob) {
+) -> Option<AgentJob> {
     let job_id = crate::generate_id();
     let spawn = async {
         // SPAWN: one tx — jobs + research_jobs child row (the shared in-tx
@@ -468,10 +540,37 @@ async fn dispatch_durable_research(
         .await
     };
     // Spawn failures still route an error envelope — never a silent drop.
-    let result = match spawn.await {
+    let spawn_out = spawn.await;
+    let spawned = spawn_out.is_ok();
+    let exit = match spawn_out {
         Ok(()) => run_deep_research(ws, question, &job_id, false).await,
-        Err(e) => Err(e),
+        Err(e) => ResearchExit::Terminal(Err(e)),
     };
+    let result = match exit {
+        // Abort: the run stays alive for the next boot's resume — the jobs row
+        // survives as 'launched' and boot-recovery re-enters the checkpointed
+        // run, so the result (and the artifacts) arrive at the real
+        // terminalization. Nothing is written or routed here (design pin:
+        // "Shutdown/drain abort НЕ терминализация — ран жив, resume позже").
+        ResearchExit::Aborted => {
+            tracing::info!(
+                job = %job_id,
+                "Research run aborted by shutdown/drain — resumes at next boot"
+            );
+            return None;
+        }
+        ResearchExit::Terminal(result) => result,
+    };
+    // Terminalization artifacts BEFORE the exactly-once boundary, only for
+    // runs that actually started (a spawn failure has no state to archive).
+    // The aborted flag (not the global shutdown state) already gated aborts
+    // above: shutdown firing in the window after a fully successful run
+    // returned must not skip the artifacts.
+    if spawned {
+        let state = ResearchState::load(&job_id).await;
+        let delivered = build_async_research_message(&result);
+        write_terminalization_artifacts(&job_id, ws, question, &delivered, &state).await;
+    }
     let envelope = crate::jobs::complete_durable_job(
         &job_id,
         build_async_research_message(&result),
@@ -482,7 +581,35 @@ async fn dispatch_durable_research(
         &ws.name,
     )
     .await;
-    (result, envelope)
+    Some(envelope)
+}
+
+/// Real-terminalization artifacts (results.md + the cleaner ticket), written
+/// BEFORE the exactly-once terminalizing boundary at exactly three points:
+/// fresh dispatch, boot resume, boot-cap partial report. Shutdown/drain
+/// aborts and panics write nothing (the run stays alive for the next boot —
+/// both the fresh-dispatch and resume paths now leave the job row 'launched'
+/// on abort, so boot-recovery re-enters and terminalizes for real). A
+/// cleaner-ticket DB failure is logged — never silent (results.md logs
+/// internally).
+async fn write_terminalization_artifacts(
+    job_id: &str,
+    ws: &Workspace,
+    question: &str,
+    delivered: &str,
+    state: &ResearchState,
+) {
+    crate::research_cleanup::write_results_md(job_id, question, delivered).await;
+    if let Err(e) =
+        crate::research_cleanup::maybe_create_cleaner_ticket(job_id, ws, question, &state.commands)
+            .await
+    {
+        tracing::warn!(
+            job = %job_id,
+            error = %e,
+            "Cleaner ticket creation failed — outside-zone writes unreported"
+        );
+    }
 }
 
 /// Boot resume of a research run: re-enter the orchestrator at the
@@ -502,17 +629,24 @@ pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
     else {
         return;
     };
-    let result = run_deep_research(ws, &caller.task, job_id, true).await;
-    if crate::shutdown::aborting() {
-        tracing::info!(
-            job = %job_id,
-            "Research resume aborted after run — job stays for next boot",
-        );
-        return;
-    }
+    let result = match run_deep_research(ws, &caller.task, job_id, true).await {
+        ResearchExit::Aborted => {
+            tracing::info!(
+                job = %job_id,
+                "Research resume aborted after run — job stays for next boot",
+            );
+            return;
+        }
+        ResearchExit::Terminal(result) => result,
+    };
+    // Terminalization artifacts BEFORE the exactly-once boundary (same points
+    // as a fresh dispatch — boot resume is a real terminalization).
+    let state = ResearchState::load(job_id).await;
+    let delivered = build_async_research_message(&result);
+    write_terminalization_artifacts(job_id, ws, &caller.task, &delivered, &state).await;
     complete_durable_job_and_route(
         job_id,
-        build_async_research_message(&result),
+        delivered,
         JobKind::ResearchResult,
         caller_role,
         &caller,
@@ -544,9 +678,13 @@ pub(crate) async fn research_capped_partial_report(job_id: &str, ws: &Workspace)
         "boot re-dispatch cap exceeded — partial report from last checkpoint",
         &[],
     ));
+    // Boot-cap is a real terminalization — archive + cleaner ticket (the cap
+    // path never enters run_deep_research, so both artifacts are produced here).
+    let delivered = build_async_research_message(&result);
+    write_terminalization_artifacts(job_id, ws, &caller.task, &delivered, &state).await;
     complete_durable_job_and_route(
         job_id,
-        build_async_research_message(&result),
+        delivered,
         JobKind::ResearchResult,
         caller_role,
         &caller,
@@ -1355,6 +1493,7 @@ async fn orchestrator_extract<T: serde::de::DeserializeOwned>(
 /// raws for the fail-open report). Decomposer plans are steering, not
 /// evidence — the failure still counts in `run_stats.failed_analysts`, and
 /// the run aborts with an explicit error if no plan parses.
+#[allow(clippy::too_many_arguments)]
 async fn round0_decompose(
     ws: &Workspace,
     question: &str,
@@ -1362,6 +1501,8 @@ async fn round0_decompose(
     run_stats: &mut RunStats,
     deadline: std::time::Instant,
     resume: bool,
+    run_root: &str,
+    captured: &mut Vec<String>,
 ) -> Result<(MergedPlan, Option<String>)> {
     budget
         .try_reserve(DECOMPOSE_FAN_OUT)
@@ -1372,8 +1513,12 @@ async fn round0_decompose(
         .map(|i| {
             let ws = ws.clone();
             let question = question.to_string();
-            let task = substitute(&task_template, &[("{{question}}", &question)]);
+            let task = substitute(
+                &task_template,
+                &[("{{question}}", &question), ("{{run_root}}", run_root)],
+            );
             let agent_id = crate::session::research_agent_id(&ws.name, &format!("decompose_{i}"));
+            captured.push(agent_id.clone());
             make_round_member::<DecompositionPlan>(ws, agent_id, task, extraction_prompt.clone())
         })
         .collect();
@@ -1545,6 +1690,8 @@ async fn round1_research(
     run_stats: &mut RunStats,
     deadline: std::time::Instant,
     resume: bool,
+    run_root: &str,
+    captured: &mut Vec<String>,
 ) -> Option<(EvidenceRound, Vec<WrapUpEntry>)> {
     let spawn_count = plan.sub_questions.len()
         + plan
@@ -1582,6 +1729,7 @@ async fn round1_research(
                     ("{{sub_question}}", &sq.question),
                     ("{{evidence_needed}}", &sq.evidence_needed),
                     ("{{query_ledger}}", &ledger_snapshot),
+                    ("{{run_root}}", run_root),
                 ],
             );
             // KV-cache discipline: vary ONLY the user message (the angle).
@@ -1592,6 +1740,7 @@ async fn round1_research(
                 task.push_str(&angles[idx % angles.len()]);
             }
             let agent_id = crate::session::research_agent_id(&ws.name, &format!("r1_{idx}"));
+            captured.push(agent_id.clone());
             snapshots.push(WrapUpEntry {
                 agent_id: agent_id.clone(),
                 params: wrap_up_params(&ws, &agent_id, wrap_up_specs.clone()),
@@ -1677,6 +1826,7 @@ fn gap_items(gaps: &[Gap]) -> Vec<String> {
 /// of analysts aborted by the round deadline (the caller runs the wrap-up
 /// stage AFTER collecting the round's evidence so ledger registrations from
 /// recovered analysts cannot skew the round's saturation counters).
+#[allow(clippy::too_many_arguments)]
 async fn run_gap_round(
     ws: &Workspace,
     question: &str,
@@ -1684,6 +1834,8 @@ async fn run_gap_round(
     ledger: &QueryLedger,
     deadline: std::time::Instant,
     resume: bool,
+    run_root: &str,
+    captured: &mut Vec<String>,
 ) -> (Vec<AnalystRun<AnalystFindings>>, Vec<WrapUpEntry>) {
     let task_template = load_prompt("research/gap.md");
     let extraction_prompt = load_prompt("extraction/findings.md");
@@ -1708,9 +1860,11 @@ async fn run_gap_round(
                     ),
                 ),
                 ("{{query_ledger}}", &ledger_snapshot),
+                ("{{run_root}}", run_root),
             ],
         );
         let agent_id = crate::session::research_agent_id(&ws.name, &format!("gap_{i}"));
+        captured.push(agent_id.clone());
         snapshots.push(WrapUpEntry {
             agent_id: agent_id.clone(),
             params: wrap_up_params(&ws, &agent_id, wrap_up_specs.clone()),
@@ -1727,6 +1881,173 @@ async fn run_gap_round(
     resolve_round_members_with_timeouts(members_out, &snapshots)
 }
 
+/// Record a coder-round GATE-SKIP marker (one marker per key — a prior
+/// outcome marker is stale once a fresh gate-skip supersedes it). A skipped
+/// round is NOT claimed. Re-attempt semantics: only the PRE-LOOP key-0 round
+/// is re-examined on boot-resume (`!coder_rounds_done.contains(&0)`); a
+/// post-progress round (key ≥ 1) is dispatched only as a side-effect of a
+/// progress event inside the gap loop, so a gate-skip after a long gap round
+/// is FINAL — the loop's already-advanced round_index never revisits the key.
+/// That is fail-open per design ("Тихих пропусков нет" — the marker IS the
+/// report note; the run continues without the prototype).
+fn push_coder_skip_marker(state: &mut ResearchState, round_key: usize, reason: &str) {
+    let marker = format!("coder round {round_key} skipped — {reason}");
+    state
+        .markers
+        .retain(|m| !m.starts_with(&format!("coder round {round_key} ")));
+    state.markers.push(marker);
+}
+
+/// Record a coder-round OUTCOME marker (dispatched but failed/cancelled).
+/// Clears stale skip markers for the same key — one truth per key.
+fn push_coder_outcome_marker(state: &mut ResearchState, round_key: usize, outcome: &str) {
+    let marker = format!("coder round {round_key} {outcome}");
+    state
+        .markers
+        .retain(|m| !m.starts_with(&format!("coder round {round_key} ")));
+    state.markers.push(marker);
+}
+
+/// Claim a coder round at DISPATCH. The claim is IN-MEMORY here — it reaches
+/// the persisted checkpoint only at the next per-round save (after the round
+/// completes), so a crash mid-coder loses it and boot-resume re-dispatches
+/// (the accepted crash-duplicate pin). Stale skip/outcome markers for this
+/// key are cleared — the report shows one truth (the final outcome), not
+/// a dead skip plus completed prototypes.
+fn claim_coder_round(state: &mut ResearchState, round_key: usize) {
+    if !state.coder_rounds_done.contains(&round_key) {
+        state.coder_rounds_done.push(round_key);
+    }
+    state
+        .markers
+        .retain(|m| !m.starts_with(&format!("coder round {round_key} ")));
+}
+
+/// Un-claim a round that was dispatched but never completed (failure or
+/// cancellation). Only the pre-loop key-0 round is re-attempted by
+/// boot-resume; a post-progress failure is final (marked, fail-open).
+fn unclaim_coder_round(state: &mut ResearchState, round_key: usize) {
+    state.coder_rounds_done.retain(|k| *k != round_key);
+}
+
+/// One coder round: a single Coder sub-agent builds prototypes in the per-run
+/// folder targeting the current gap list. Blocks on the coder (never hard
+/// timed out — a long coder may overrun the round deadline; the loop-top
+/// checks then skip the following gap rounds, fail-open). The coder's response
+/// text is NOT inserted into the report (prototypes list only); failures and
+/// skips are marked in the report, never silent.
+#[allow(clippy::too_many_arguments)]
+async fn run_coder_round(
+    job_id: &str,
+    run_root: &str,
+    ws: &Workspace,
+    question: &str,
+    gap_list: &GapList,
+    deadline: std::time::Instant,
+    state: &mut ResearchState,
+    round_key: usize,
+) {
+    if crate::shutdown::aborting() {
+        push_coder_skip_marker(state, round_key, "shutdown/drain");
+        return;
+    }
+    if std::time::Instant::now() + CODER_MIN_REMAINING >= deadline {
+        push_coder_skip_marker(
+            state,
+            round_key,
+            "less than 30 minutes remaining until the round deadline",
+        );
+        return;
+    }
+    // Claimed at dispatch (in-memory — persisted only at the next per-round
+    // checkpoint, which happens AFTER the round completes, so a crash
+    // mid-coder loses the claim. Only the PRE-LOOP key-0 round is
+    // re-dispatched by boot-resume (the accepted crash-duplicate pin);
+    // a crashed post-progress round is final, fail-open.
+    claim_coder_round(state, round_key);
+    let evidence = render_accumulated_evidence(&state.acc);
+    let gaps = gap_items(&gap_list.gaps).join("\n");
+    let task = substitute(
+        &load_prompt("synthesis/coder_brief.md"),
+        &[
+            ("{{question}}", question),
+            ("{{evidence}}", &evidence),
+            ("{{gaps}}", &gaps),
+            ("{{run_root}}", run_root),
+        ],
+    );
+    let coder_ws = Workspace::ephemeral_run(job_id, Path::new(run_root));
+    let agent_id = crate::session::research_agent_id(&ws.name, "coder");
+    // Command collection happens after the run completes — a crash mid-coder
+    // loses the session from the sanitizer (accepted: only the PRE-LOOP key-0
+    // round is re-dispatched by boot-resume — with a fresh agent id, since
+    // `research_agent_id` embeds a fresh NanoID suffix per call — and the
+    // design's crash-duplicate pin covers the re-run's prototype duplication;
+    // a crashed post-progress round is final, fail-open).
+    let (agent, response) = run_agent(
+        agent_id.clone(),
+        Role::Coder,
+        &coder_ws,
+        None,
+        &task,
+        String::new(),
+        String::new(),
+        None,
+        false,
+        None,
+    )
+    .await;
+    state.capture_round(&[agent_id], Path::new(run_root)).await;
+    if response.is_some() {
+        tracing::info!(job = %job_id, coder_round = round_key, "Coder round completed");
+    } else {
+        let cancelled = agent.is_cancelled() || crate::shutdown::aborting();
+        let outcome = if cancelled { "cancelled" } else { "failed" };
+        // Never completed → not done (only the pre-loop key-0 round is
+        // re-attempted by boot-resume; post-progress failures are final —
+        // fail-open per design).
+        unclaim_coder_round(state, round_key);
+        push_coder_outcome_marker(state, round_key, outcome);
+    }
+}
+
+/// Gate a coder round with the gap-loop top checks (budget/deadline — the
+/// same checks that would skip the following gap round). A gate-skip is
+/// marked in the report, never silent. Only the PRE-LOOP key-0 round is
+/// re-attempted on boot-resume (`!coder_rounds_done.contains(&0)` in
+/// `gap_rounds`); post-progress rounds (key ≥ 1) are dispatched only as a
+/// side-effect of a progress event inside the loop, so a skip after a long
+/// gap round is final (fail-open — the run continues without the prototype).
+/// No speculative inline retry: `run_agent` already exhausts its internal
+/// retry bounds before returning Failed, so a second full coder session would
+/// only double the LLM spend of a confirmed failure (design: "Сбой кодера =
+/// fail-open").
+#[allow(clippy::too_many_arguments)]
+async fn run_coder_gated(
+    job_id: &str,
+    run_root: &str,
+    ws: &Workspace,
+    question: &str,
+    budget: &ResearchBudget,
+    gap_list: &GapList,
+    deadline: std::time::Instant,
+    state: &mut ResearchState,
+    round_key: usize,
+) {
+    if budget.is_exhausted() {
+        push_coder_skip_marker(state, round_key, "analyst budget exhausted");
+        return;
+    }
+    if std::time::Instant::now() >= deadline {
+        push_coder_skip_marker(state, round_key, "round deadline expired");
+        return;
+    }
+    run_coder_round(
+        job_id, run_root, ws, question, gap_list, deadline, state, round_key,
+    )
+    .await;
+}
+
 /// Conditional gap rounds. Stopping is artifact-based, never agent
 /// self-assessment: coverage completion, answerability abstention (checked on
 /// every structural quiet round — a non-abstain verdict continues, with the
@@ -1737,7 +2058,17 @@ async fn run_gap_round(
 /// the accumulated evidence — a crash mid-loop would otherwise revert to the
 /// post-round-1 checkpoint and re-run the ENTIRE gap stage from round 0 with
 /// fresh analyst sessions (whole-stage re-run, duplicated LLM spend).
-#[allow(clippy::too_many_arguments)]
+///
+/// Coder-in-loop: one prototype pass (key 0) before the loop over the initial
+/// gap list, then one after every progress round that refreshes a non-empty
+/// gap list (key = the round's index). Each pass is gated by the same
+/// budget/deadline/shutdown checks as the loop top and persisted with the
+/// per-round checkpoint. Boot-resume re-attempts ONLY the pre-loop key-0
+/// round (the `!coder_rounds_done.contains(&0)` check below); a skipped or
+/// failed post-progress round (key ≥ 1) is FINAL — the loop resumes at the
+/// advanced round_index and never revisits the key (fail-open per design:
+/// "Сбой кодера = fail-open", skip marker in the report).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn gap_rounds(
     ws: &Workspace,
     question: &str,
@@ -1747,6 +2078,7 @@ async fn gap_rounds(
     run_stats: &mut RunStats,
     deadline: std::time::Instant,
     job_id: &str,
+    run_root: &str,
     resume: bool,
     recovered: &mut Vec<AnalystFindings>,
 ) -> GapRoundsOutcome {
@@ -1765,6 +2097,14 @@ async fn gap_rounds(
         outcome.incomplete = Some(GAP_EXTRACTION_FAILED.to_string());
         return outcome;
     };
+    // Pre-loop coder round (key 0): one prototype pass over the initial gap
+    // list before the first gap round dispatches.
+    if !gap_list.gaps.is_empty() && !state.coder_rounds_done.contains(&0) {
+        run_coder_gated(
+            job_id, run_root, ws, question, budget, &gap_list, deadline, state, 0,
+        )
+        .await;
+    }
     let mut round_index = state.round_index;
     loop {
         if crate::shutdown::aborting() {
@@ -1796,8 +2136,21 @@ async fn gap_rounds(
             outcome.unresolved = gap_items(gaps);
             return outcome;
         }
-        let (runs, timed_out) =
-            run_gap_round(ws, question, &targeted, &state.ledger, deadline, resume).await;
+        let mut round_agents: Vec<String> = Vec::new();
+        let (runs, timed_out) = run_gap_round(
+            ws,
+            question,
+            &targeted,
+            &state.ledger,
+            deadline,
+            resume,
+            run_root,
+            &mut round_agents,
+        )
+        .await;
+        state
+            .capture_round(&round_agents, Path::new(run_root))
+            .await;
         let round = collect_evidence(&runs, &mut state.ledger, run_stats);
         // Wrap-up stays BEFORE the per-round checkpoint here (unlike round 1):
         // the loop's early returns (abstention / gap-extract failure) follow
@@ -1834,6 +2187,22 @@ async fn gap_rounds(
                 return outcome;
             };
             gap_list = next_gap_list;
+            // Post-progress coder round (key = this gap round's index): fresh
+            // prototypes targeting the refreshed gap list.
+            if !gap_list.gaps.is_empty() && !state.coder_rounds_done.contains(&round_index) {
+                run_coder_gated(
+                    job_id,
+                    run_root,
+                    ws,
+                    question,
+                    budget,
+                    &gap_list,
+                    deadline,
+                    state,
+                    round_index,
+                )
+                .await;
+            }
         }
         // Checkpoint after EACH gap round (see the function doc — the locals
         // must survive a crash mid-loop or the whole stage re-runs).
@@ -2289,6 +2658,7 @@ fn verification_targets(acc: &AccumulatedEvidence) -> (Vec<VerificationTarget>, 
 /// rounds must not re-ask them) — repeats here inflate the summary's
 /// repeat-queries line but never the per-round saturation signal
 /// (`EvidenceRound::repeat_queries` is untouched).
+#[allow(clippy::too_many_arguments)]
 async fn research_verification_pass(
     ws: &Workspace,
     acc: &AccumulatedEvidence,
@@ -2297,6 +2667,8 @@ async fn research_verification_pass(
     run_stats: &mut RunStats,
     deadline: std::time::Instant,
     resume: bool,
+    run_root: &str,
+    captured: &mut Vec<String>,
 ) -> Vec<VerificationResult> {
     let (targets, primary_count) = verification_targets(acc);
     if targets.is_empty() {
@@ -2313,12 +2685,15 @@ async fn research_verification_pass(
     if n > 0 && std::time::Instant::now() < deadline && budget.try_reserve(n).is_ok() {
         let ledger_snapshot = ledger.render();
         let task_extra = format!(
-            "\n# Queries Already Asked (do not repeat these verbatim)\n\n{ledger_snapshot}"
+            "\n# Queries Already Asked (do not repeat these verbatim)\n\n{ledger_snapshot}\n\n\
+             # Scratch Workspace\n\nTemporary per-run folder (wiped after the run):\n\n{run_root}"
         );
         let prefix = format!("research_{}_verify", ws.name);
-        results =
+        let (verify_results, verify_ids) =
             dispatch_claim_verifiers(ws, &prefix, &targets[..n], &task_extra, deadline, resume)
                 .await;
+        captured.extend(verify_ids);
+        results = verify_results;
     }
     for v in &results {
         run_stats.tool_calls += v.tool_calls;
@@ -2579,29 +2954,20 @@ fn partial_report(
     out
 }
 
-/// Abort-path partial report — reason from runtime flags, shutdown first
-/// (matches the two-arm guard sites; the `aborting()` sites previously
-/// reported drain first in the both-flags edge — cosmetic, accepted).
-fn abort_partial_report(
-    question: &str,
-    acc: &AccumulatedEvidence,
-    shutdown_reason: &str,
-    drain_reason: &str,
-    recovered: &[AnalystFindings],
-) -> String {
-    partial_report(
-        question,
-        acc,
-        if crate::shutdown::shutdown_token().is_cancelled() {
-            shutdown_reason
-        } else {
-            drain_reason
-        },
-        recovered,
-    )
-}
-
 // ── Orchestrator ─────────────────────────────────────────────────────────
+
+/// Exit of one `run_deep_research` invocation. Self-documenting where the old
+/// `(Result<String>, bool)` was subtle: `aborted` distinguished a real
+/// terminalization (artifacts + job completion in the caller) from a
+/// shutdown/drain abort (run stays alive, nothing written).
+enum ResearchExit {
+    /// Real terminalization (success, partial, or error) — the caller writes
+    /// results.md + cleaner ticket and completes the durable job.
+    Terminal(anyhow::Result<String>),
+    /// Shutdown/drain abort — the run stays alive for the next boot; nothing
+    /// is written, terminalized, or routed (design pin).
+    Aborted,
+}
 
 /// Run the resumable deep-research orchestrator: round 0 (decomposition),
 /// round 1 (per-sub-question researchers), conditional gap rounds, one-shot
@@ -2614,7 +2980,7 @@ async fn run_deep_research(
     question: &str,
     job_id: &str,
     resume: bool,
-) -> Result<String> {
+) -> ResearchExit {
     // Hold a non-agent-call guard for the WHOLE run: the drain-watch fires the
     // token only when both registries are empty, and this guard bridges the
     // inter-phase windows (analyst deregistration → the next orchestrator LLM
@@ -2633,34 +2999,58 @@ async fn run_deep_research(
     let mut budget = ResearchBudget::new(RESEARCH_MAX_ANALYSTS);
     budget.spent = state.budget_spent;
     let mut run_stats = RunStats::default();
+    // Per-run scratch folder — created idempotently BEFORE round 0 (decompose
+    // receives it first). The absolute temp-dir path is what the readonly
+    // shell allows; `$TMPDIR` in the agent shell differs on macOS.
+    let run_root = crate::research_cleanup::ensure_run_root(job_id).await;
+    let run_root_str = run_root.to_string_lossy().to_string();
     // Recovered-from-timed-out-analysts findings: round locals only (never
     // checkpointed) — a crash between rounds loses them, and a resumed run
     // starts with an empty set (analysts re-run from their unchanged sessions).
     let mut recovered: Vec<AnalystFindings> = Vec::new();
 
     // ── Round 0 — decomposition + merge (resumable) ───────────────────
+    let mut round_agents: Vec<String> = Vec::new();
     if state.stage == ResearchStage::Decompose {
-        let plan =
-            match round0_decompose(ws, question, &mut budget, &mut run_stats, deadline, resume)
-                .await
-            {
-                Ok((plan, marker)) => {
-                    if let Some(m) = marker {
-                        state.markers.push(m);
-                    }
-                    plan
+        let round0 = round0_decompose(
+            ws,
+            question,
+            &mut budget,
+            &mut run_stats,
+            deadline,
+            resume,
+            &run_root_str,
+            &mut round_agents,
+        )
+        .await;
+        // Capture on EVERY outcome — a hard decompose failure still leaves
+        // the dispatched agents' sessions behind (their OS-temp scratch must
+        // reach the cleaner ticket).
+        state.capture_round(&round_agents, &run_root).await;
+        round_agents.clear();
+        let plan = match round0 {
+            Ok((plan, marker)) => {
+                if let Some(m) = marker {
+                    state.markers.push(m);
                 }
-                Err(_) if crate::shutdown::aborting() => {
-                    return Ok(abort_partial_report(
-                        question,
-                        &state.acc,
-                        "shutdown during decomposition",
-                        "drain during decomposition",
-                        &recovered,
-                    ));
-                }
-                Err(e) => return Err(e),
-            };
+                plan
+            }
+            Err(_) if crate::shutdown::aborting() => {
+                // Persist captured commands: the run stays alive for boot
+                // resume, which re-dispatches round 0 with FRESH agent ids —
+                // the aborted agents' OS-temp scratch must reach the cleaner
+                // ticket (the in-memory capture dies with this invocation).
+                state.save(job_id).await;
+                return ResearchExit::Aborted;
+            }
+            Err(e) => {
+                // Persist the captured commands — the dispatch-time cleaner
+                // ticket reloads state from the store and a hard decompose
+                // failure must not lose the agents' sessions from the report.
+                state.save(job_id).await;
+                return ResearchExit::Terminal(Err(e));
+            }
+        };
         state.plan = Some(plan);
         state.budget_spent = budget.spent;
         state.stage = ResearchStage::Round1;
@@ -2670,21 +3060,16 @@ async fn run_deep_research(
     // Check shutdown/drain between rounds — never spawn round-1 analysts
     // during shutdown or the graceful drain.
     if crate::shutdown::aborting() {
-        return Ok(abort_partial_report(
-            question,
-            &state.acc,
-            "shutdown after decomposition",
-            "drain after decomposition",
-            &recovered,
-        ));
+        return ResearchExit::Aborted;
     }
 
     // ── Round 1 — one analyst per sub-question (resumable) ────────────
     if state.stage == ResearchStage::Round1 {
-        let plan = state
-            .plan
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("research state missing plan at round 1"))?;
+        let Some(plan) = state.plan.as_ref() else {
+            return ResearchExit::Terminal(Err(anyhow::anyhow!(
+                "research state missing plan at round 1"
+            )));
+        };
         let Some((r1, r1_timed_out)) = round1_research(
             ws,
             question,
@@ -2694,16 +3079,20 @@ async fn run_deep_research(
             &mut run_stats,
             deadline,
             resume,
+            &run_root_str,
+            &mut round_agents,
         )
         .await
         else {
-            return Ok(partial_report(
+            return ResearchExit::Terminal(Ok(partial_report(
                 question,
                 &state.acc,
                 "round 1 skipped — analyst budget exhausted",
                 &recovered,
-            ));
+            )));
         };
+        state.capture_round(&round_agents, &run_root).await;
+        round_agents.clear();
         let (_, pending) = state.acc.absorb(&r1);
         annotate_round(ws, &mut state.acc, &pending, &mut state.markers).await;
         state.budget_spent = budget.spent;
@@ -2721,10 +3110,11 @@ async fn run_deep_research(
     if state.stage == ResearchStage::GapRounds {
         // Clone the plan so gap_rounds can take &mut state (per-round
         // checkpoints) while still referencing the merged decomposition.
-        let plan = state
-            .plan
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("research state missing plan at gap rounds"))?;
+        let Some(plan) = state.plan.clone() else {
+            return ResearchExit::Terminal(Err(anyhow::anyhow!(
+                "research state missing plan at gap rounds"
+            )));
+        };
         let gap_outcome = gap_rounds(
             ws,
             question,
@@ -2734,6 +3124,7 @@ async fn run_deep_research(
             &mut run_stats,
             deadline,
             job_id,
+            &run_root_str,
             resume,
             &mut recovered,
         )
@@ -2749,13 +3140,7 @@ async fn run_deep_research(
             state.gap_outcome = gap_outcome;
             state.budget_spent = budget.spent;
             state.save(job_id).await;
-            return Ok(abort_partial_report(
-                question,
-                &state.acc,
-                "shutdown during gap rounds",
-                "drain during gap rounds",
-                &recovered,
-            ));
+            return ResearchExit::Aborted;
         }
         // Round-trip the gap-loop locals on NORMAL exit (coverage complete,
         // abstention, or budget/deadline exhaustion): round_index is already
@@ -2772,13 +3157,7 @@ async fn run_deep_research(
     // The gap loop may have exited early on shutdown/drain — never run a full
     // synthesis or spawn verification analysts during shutdown or the drain.
     if crate::shutdown::aborting() {
-        return Ok(abort_partial_report(
-            question,
-            &state.acc,
-            "shutdown during gap rounds",
-            "drain during gap rounds",
-            &recovered,
-        ));
+        return ResearchExit::Aborted;
     }
 
     // ── Final synthesis (resumable) ───────────────────────────────────
@@ -2809,21 +3188,15 @@ async fn run_deep_research(
             s.text
         }
         Err(_) if crate::shutdown::aborting() => {
-            return Ok(abort_partial_report(
-                question,
-                &state.acc,
-                "shutdown before final synthesis",
-                "drain before final synthesis",
-                &recovered,
-            ));
+            return ResearchExit::Aborted;
         }
         Err(e) => {
-            return Ok(partial_report(
+            return ResearchExit::Terminal(Ok(partial_report(
                 question,
                 &state.acc,
                 &format!("synthesis failed: {e}"),
                 &recovered,
-            ));
+            )));
         }
     };
 
@@ -2843,8 +3216,12 @@ async fn run_deep_research(
             &mut run_stats,
             deadline,
             resume,
+            &run_root_str,
+            &mut round_agents,
         )
         .await;
+        state.capture_round(&round_agents, &run_root).await;
+        round_agents.clear();
         state.budget_spent = budget.spent;
         state.stage = ResearchStage::Synthesis;
         state.save(job_id).await;
@@ -2878,6 +3255,40 @@ async fn run_deep_research(
         }
     }
     render_raw_reports(&mut report, &state.acc.raw_reports, "##");
+    // Prototypes section: files the coder-in-loop left in the per-run folder.
+    // The folder is temporary — swept after the delivery grace. A resume after
+    // an OS temp cleanup recreates the folder with no prototypes (fail-open).
+    if !state.coder_rounds_done.is_empty() {
+        let files = crate::research_cleanup::run_root_files(job_id).await;
+        let _ = writeln!(report);
+        let _ = writeln!(report, "## Prototypes");
+        if files.is_empty() {
+            // Distinguish a coder round that wrote nothing from prototypes
+            // lost to an OS temp cleanup between boots: a resumed run with
+            // completed coder rounds and an empty folder means the OS cleaned
+            // temp while the daemon was down (ensure_run_root recreates the
+            // folder empty; the completed rounds never re-run). A fresh run's
+            // empty folder is just "wrote nothing".
+            if resume {
+                let _ = writeln!(
+                    report,
+                    "None found in the per-run folder (prototypes may have been lost \
+                     if the OS cleaned the temp dir between boots)."
+                );
+            } else {
+                let _ = writeln!(report, "No prototypes were written by the coder rounds.");
+            }
+        } else {
+            let _ = writeln!(
+                report,
+                "Per-run folder: `{run_root_str}` — TEMPORARY, swept after the delivery \
+                 grace. Files produced by the coder rounds:"
+            );
+            for f in &files {
+                let _ = writeln!(report, "- {f}");
+            }
+        }
+    }
     // RunStats pin: a resumed run's counts undercount the pre-crash segment —
     // the summary carries a one-line best-effort note instead of pretending.
     // Keyed off the job's boot-resume retry count (the real resume signal) —
@@ -2902,7 +3313,7 @@ async fn run_deep_research(
         &state.markers,
         start.elapsed(),
     ));
-    Ok(report)
+    ResearchExit::Terminal(Ok(report))
 }
 
 #[cfg(test)]
@@ -3072,6 +3483,8 @@ mod tests {
                 searches: 0,
                 queries: vec![],
             }],
+            commands: vec![],
+            coder_rounds_done: vec![],
         };
         state.acc.rebuild_keys();
         let state_json = serde_json::to_string(&state).unwrap();
@@ -3762,5 +4175,100 @@ mod tests {
             ChatMessage::tool_result("t2", "results ok"),
         ];
         assert!(session_has_successful_tool_result(&mixed));
+    }
+
+    #[test]
+    fn coder_round_lifecycle_skip_vs_claim_vs_unclaim() {
+        let mut state = ResearchState::default();
+        // Gate-skip: marked in the report, NOT claimed — the pre-loop key-0
+        // round is re-attempted by boot-resume (post-progress keys are final:
+        // the loop's round_index has advanced past them — fail-open per design).
+        push_coder_skip_marker(&mut state, 0, "analyst budget exhausted");
+        assert!(
+            state
+                .markers
+                .iter()
+                .any(|m| m == "coder round 0 skipped — analyst budget exhausted")
+        );
+        assert!(!state.coder_rounds_done.contains(&0));
+        // Dispatch: claimed; a stale skip marker (a previous gate-skip that
+        // was later re-attempted) is cleared — the report shows one truth.
+        claim_coder_round(&mut state, 0);
+        assert!(state.coder_rounds_done.contains(&0));
+        assert!(!state.markers.iter().any(|m| m.contains("coder round 0 ")));
+        // Failure: un-claimed (only key-0 is re-attempted by resume); outcome
+        // marked — and the outcome marker CLEARS a prior skip marker for the
+        // same key (one truth: a failed-then-gate-skipped round must not
+        // render both).
+        unclaim_coder_round(&mut state, 0);
+        push_coder_outcome_marker(&mut state, 0, "failed");
+        assert!(!state.coder_rounds_done.contains(&0));
+        assert!(state.markers.iter().any(|m| m == "coder round 0 failed"));
+        assert!(
+            !state
+                .markers
+                .iter()
+                .any(|m| m.contains("coder round 0 skipped")),
+            "outcome marker supersedes the stale skip marker"
+        );
+        // A later successful dispatch clears the stale outcome marker too.
+        claim_coder_round(&mut state, 0);
+        assert!(!state.markers.iter().any(|m| m.contains("coder round 0 ")));
+        // Other rounds' markers are untouched.
+        push_coder_skip_marker(&mut state, 1, "round deadline expired");
+        claim_coder_round(&mut state, 0);
+        assert!(
+            state
+                .markers
+                .iter()
+                .any(|m| m == "coder round 1 skipped — round deadline expired")
+        );
+        assert!(!state.markers.iter().any(|m| m.contains("coder round 0 ")));
+        // A gate-skip after a failure of the SAME key supersedes the failure
+        // marker (one truth per key in the final report).
+        push_coder_skip_marker(&mut state, 1, "round deadline expired");
+        assert_eq!(
+            state
+                .markers
+                .iter()
+                .filter(|m| m.starts_with("coder round 1 "))
+                .count(),
+            1,
+            "skip re-push dedupes per key"
+        );
+    }
+
+    #[test]
+    fn captured_commands_are_capped_newest_win() {
+        let mut commands = vec![
+            "cat > /tmp/old_1.txt".to_string(),
+            "cat > /tmp/old_2.txt".to_string(),
+        ];
+        cap_commands(&mut commands, 50);
+        assert_eq!(commands.len(), 2, "under the cap — untouched");
+        // Adding a third pushes the total over: the OLDEST command is dropped
+        // (newest evidence wins) until the blob fits.
+        commands.push("cat > /tmp/new.txt".to_string());
+        cap_commands(&mut commands, 50);
+        assert_eq!(
+            commands,
+            vec![
+                "cat > /tmp/old_2.txt".to_string(),
+                "cat > /tmp/new.txt".to_string()
+            ]
+        );
+        // A single command larger than the cap is dropped ON ITS OWN (it could
+        // not fit in the 32 KiB ticket body either) — the older fitting
+        // commands survive (dropping them for it would lose all evidence).
+        commands.push("cat > /tmp/huge.txt << 'EOF'\n".repeat(100));
+        cap_commands(&mut commands, 50);
+        assert_eq!(
+            commands,
+            vec![
+                "cat > /tmp/old_2.txt".to_string(),
+                "cat > /tmp/new.txt".to_string()
+            ],
+            "oversized newest dropped alone, older fitting commands kept"
+        );
     }
 }

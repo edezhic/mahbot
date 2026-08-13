@@ -199,6 +199,9 @@ fn open_persistent_query_tracker(workspace_name: &str) -> Result<SharedQueryTrac
 ///
 /// Blocks for up to 30 seconds. Returns an error if the scan hasn't completed
 /// within the timeout, rather than returning incomplete or stale results.
+/// Ephemeral per-run workspaces (whose folders legitimately start empty)
+/// downgrade the empty-index error at their call site via
+/// [`is_empty_index_error`] — this shared entry point never does.
 ///
 /// This is an async function because [`SharedFilePicker::wait_for_scan`] is a
 /// blocking call — we run it on the tokio blocking thread pool.
@@ -231,11 +234,7 @@ pub(crate) async fn ensure_scanned(entry: &SearchEngineEntry) -> Result<(), Stri
         drop(guard);
 
         if is_empty {
-            return Err(
-                "Scan completed but file index is empty — workspace may be misconfigured \
-                 or scan failed silently."
-                    .to_string(),
-            );
+            return Err(EMPTY_INDEX_MSG.to_string());
         }
 
         Ok(())
@@ -247,13 +246,32 @@ pub(crate) async fn ensure_scanned(entry: &SearchEngineEntry) -> Result<(), Stri
     }
 }
 
+/// The empty-index scan error. Shared by [`ensure_scanned`] (emits) and
+/// [`is_empty_index_error`] (matches) — a const keeps the string-match
+/// coupling compiler-visible: rewording the message updates both sides
+/// together instead of silently breaking the ephemeral-workspace downgrade.
+pub(crate) const EMPTY_INDEX_MSG: &str = "Scan completed but file index is empty — workspace may be misconfigured or scan failed silently.";
+
+/// True when the scan-readiness error is the empty-index error — the only
+/// scan failure ephemeral per-run workspaces legitimately hit (their folders
+/// start empty before the coder writes anything). Used by the search tool to
+/// downgrade that error to a warning for ephemeral workspaces. The search
+/// tool calls `resolve_engine` with an empty scan-error prefix, so the error
+/// is EXACTLY [`EMPTY_INDEX_MSG`] — equality, not prefix matching.
+#[must_use]
+pub(crate) fn is_empty_index_error(e: &str) -> bool {
+    e == EMPTY_INDEX_MSG
+}
+
 /// Get or init the engine for a workspace and ensure the background scan has
 /// finished — the shared entry point used by the search tool and the editor's
 /// global-search path.
 ///
 /// `scan_error_prefix` is prepended to scan-readiness errors only; the
 /// editor's run path passes `"Search engine not ready: "` while other callers
-/// pass `""` to keep the raw error.
+/// pass `""` to keep the raw error. Ephemeral per-run workspaces downgrade the
+/// empty-index error at their call site (see [`is_empty_index_error`]) — this
+/// shared entry point never does.
 pub(crate) async fn resolve_engine(
     name: &str,
     path: &str,
