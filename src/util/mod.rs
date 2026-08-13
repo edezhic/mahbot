@@ -123,6 +123,19 @@ pub(crate) fn none_if_empty(s: &str) -> Option<String> {
     }
 }
 
+/// Word character classification shared by the shell grep engine's `-w`
+/// handling and editor word navigation.
+///
+/// The grep side is a conservative approximation of unicode `\w` that gates
+/// the `-w` → `\b(?:pat)\b` translation; the editor side uses it for
+/// word-boundary detection. Currently identical; a deliberate one-sided
+/// divergence (e.g. ASCII-only for GNU-grep parity) must split this helper
+/// rather than silently change the other subsystem.
+#[must_use]
+pub(crate) fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
 /// Current Unix timestamp in milliseconds since the epoch.
 ///
 /// Returns `0` if the system clock is set before the Unix epoch (January 1, 1970).
@@ -229,7 +242,7 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
 /// Resolve the shared `~/.mahbot/models/` directory via the CONFIG storage root.
 ///
 /// Returns `None` if the storage root hasn't been initialized yet.  Per-model
-/// subdirectories are joined by each consumer (e.g. `audio::voice::model_dir`).
+/// subdirectories are joined by each consumer (e.g. `audio::models_subdir`).
 #[must_use]
 pub(crate) fn models_dir() -> Option<PathBuf> {
     crate::config::CONFIG

@@ -33,7 +33,7 @@ use crate::ChatDirection;
 use crate::EMBEDDING_DIM;
 use crate::audio::embedding_sequence::{EmbeddingSequence, Source, UtteranceId};
 use crate::audio::wake_word_classifier::{self, ClassifierWeights, WakeWordClassifier};
-use crate::audio::{onnx_input_name, onnx_output_name};
+use crate::audio::{models_subdir, onnx_input_name, onnx_output_name};
 use crate::config::CONFIG;
 use crate::turso;
 use crate::util::UnwrapPoison;
@@ -1877,10 +1877,6 @@ static MODELS_STATE: AtomicModelState = AtomicModelState::new(ModelState::Uninit
 /// [`VoiceStatus::Transcribing`]).
 static MANUAL_RECORDING_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-fn model_dir() -> Option<PathBuf> {
-    crate::util::models_dir().map(|dir| dir.join(MODEL_DIR_NAME))
-}
-
 /// Check whether voice models are ready for inference.
 pub fn models_ready() -> bool {
     MODELS_STATE.load(Ordering::Acquire) == ModelState::Ready
@@ -3025,7 +3021,7 @@ static ONNX_MODELS_HASH: OnceLock<Option<String>> = OnceLock::new();
 fn onnx_models_hash() -> Option<&'static str> {
     ONNX_MODELS_HASH
         .get_or_init(|| {
-            let dir = model_dir()?;
+            let dir = models_subdir(MODEL_DIR_NAME)?;
             let mel = std::fs::read(dir.join(MEL_MODEL_FILENAME)).ok()?;
             let embed = std::fs::read(dir.join(EMBED_MODEL_FILENAME)).ok()?;
             let mut hasher = Sha256::new();
@@ -3339,7 +3335,7 @@ async fn ensure_model_file(
 }
 
 async fn ensure_models_downloaded() -> Result<PathBuf> {
-    let dir = model_dir()
+    let dir = models_subdir(MODEL_DIR_NAME)
         .ok_or_else(|| anyhow!("Cannot resolve model directory (storage root not set)"))?;
 
     tokio::fs::create_dir_all(&dir).await?;
@@ -3354,7 +3350,7 @@ async fn ensure_models_downloaded() -> Result<PathBuf> {
 }
 
 async fn download_retry_loop() {
-    let Some(dir) = model_dir() else {
+    let Some(dir) = models_subdir(MODEL_DIR_NAME) else {
         warn!("Voice models: cannot resolve model directory");
         MODELS_STATE.store(ModelState::Failed, Ordering::Release);
         return;

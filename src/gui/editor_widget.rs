@@ -16,6 +16,7 @@ use super::text_rendering::{
     gutter_clip_rect, iced_color_to_cosmic, reshape_and_shape, text_area_rect, with_font_system,
 };
 use crate::util::UnwrapPoison;
+use crate::util::is_word_char;
 
 // ── Constants ───────────────────────────────────────────────────────
 
@@ -1749,12 +1750,6 @@ pub(crate) fn char_col_to_byte_range_in_line(line_text: &str, char_col: usize) -
         .next()
         .map_or(start, |c| start + c.len_utf8());
     (start, end)
-}
-
-/// Classify a character for word boundary detection.
-/// Returns `true` if the character is alphanumeric or underscore.
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
 }
 
 /// Find the byte offset of the start of the word before the given offset.

@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::tools::path::shell_quote;
 use crate::tools::shell::SHELL_PIPE_READ_CAP;
 use crate::tools::shell::readonly::{strip_heredoc_bodies, strip_outer_quotes};
+use crate::util::is_word_char;
 
 // ── Protocol constants ────────────────────────────────────────────────────
 
@@ -536,9 +537,7 @@ fn is_compound_segment(segment: &str) -> bool {
     let trimmed = segment.trim_start();
     match trimmed.chars().next() {
         Some('(' | '{') => true,
-        Some(c) if c.is_alphanumeric() || c == '_' => {
-            COMPOUND_KEYWORDS.contains(&first_word(trimmed))
-        }
+        Some(c) if is_word_char(c) => COMPOUND_KEYWORDS.contains(&first_word(trimmed)),
         _ => false,
     }
 }
@@ -1258,10 +1257,6 @@ fn word_safe(pattern: &str) -> bool {
         return false;
     }
     !has_top_level_alternation(pattern)
-}
-
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
 }
 
 // ── Matcher construction (shared by parent validation and engine) ─────────

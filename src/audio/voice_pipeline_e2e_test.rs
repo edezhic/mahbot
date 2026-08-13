@@ -1437,7 +1437,7 @@ fn ensure_voice_models_loaded() -> Result<(), String> {
         return Ok(());
     }
 
-    let dir = super::model_dir().ok_or_else(|| {
+    let dir = crate::audio::models_subdir(super::MODEL_DIR_NAME).ok_or_else(|| {
         "Cannot resolve voice model directory. Is CONFIG.storage_root set?".to_string()
     })?;
 

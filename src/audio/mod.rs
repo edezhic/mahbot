@@ -10,6 +10,8 @@ pub mod tts;
 pub mod voice;
 pub(crate) mod wake_word_classifier;
 
+use std::path::PathBuf;
+
 pub(crate) fn onnx_input_name(model: &candle_onnx::onnx::ModelProto) -> String {
     model
         .graph
@@ -24,4 +26,10 @@ pub(crate) fn onnx_output_name(model: &candle_onnx::onnx::ModelProto) -> String 
         .as_ref()
         .and_then(|g| g.output.first())
         .map_or_else(|| "output".to_string(), |o| o.name.clone())
+}
+
+/// Resolve a per-model subdirectory under the shared `~/.mahbot/models/` root
+/// (TTS, ASR, and wake-word models each use their own subdirectory).
+pub(crate) fn models_subdir(name: &str) -> Option<PathBuf> {
+    crate::util::models_dir().map(|dir| dir.join(name))
 }

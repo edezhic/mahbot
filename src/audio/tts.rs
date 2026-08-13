@@ -37,7 +37,7 @@
 //! | 2     | READY    | All models loaded and ready for synthesis.    |
 //! | 3     | FAILED   | Download or load failed terminally.           |
 
-use crate::audio::onnx_output_name;
+use crate::audio::{models_subdir, onnx_output_name};
 use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
 use crate::util::model_state::{AtomicModelState, ModelLoadGuard, ModelState};
@@ -547,7 +547,7 @@ pub fn init_listener() {
 /// is downloaded during model initialization.
 #[must_use]
 pub fn list_voice_styles() -> Vec<String> {
-    let Some(dir) = model_dir() else {
+    let Some(dir) = models_subdir(MODEL_DIR_NAME) else {
         return Vec::new();
     };
     let styles_dir = dir.join(VOICE_STYLES_DIR);
@@ -609,7 +609,7 @@ pub fn synthesize(
     target_sample_rate: u32,
 ) -> Result<Vec<f32>> {
     let engine = get_engine_clone().context("TTS engine not ready")?;
-    let dir = model_dir().context("Cannot resolve model directory")?;
+    let dir = models_subdir(MODEL_DIR_NAME).context("Cannot resolve model directory")?;
     let (style_dp, style_ttl) = load_voice_style(&dir, voice_style)?;
     let processed = preprocess_text(text);
     if processed.is_empty() {
@@ -640,7 +640,7 @@ pub fn try_load_cached() -> bool {
         return true;
     }
 
-    let Some(dir) = model_dir() else {
+    let Some(dir) = models_subdir(MODEL_DIR_NAME) else {
         return false;
     };
 
@@ -727,10 +727,6 @@ pub fn spawn_or_retry_download() {
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────
-
-pub(crate) fn model_dir() -> Option<PathBuf> {
-    crate::util::models_dir().map(|dir| dir.join(MODEL_DIR_NAME))
-}
 
 fn set_engine_ready(engine: TtsEngine) {
     if let Some(global) = GLOBAL_TTS.get() {
@@ -847,7 +843,7 @@ fn emit_download_event(event: TtsDownloadEvent) {
 async fn download_retry_loop() {
     // Transitions Loading→Failed on drop if the loop is cancelled or panics.
     let _guard = ModelLoadGuard::new(&STATE);
-    let Some(dir) = model_dir() else {
+    let Some(dir) = models_subdir(MODEL_DIR_NAME) else {
         warn!("TTS: cannot resolve model directory");
         STATE.store(ModelState::Failed, Ordering::Release);
         return;
@@ -1620,7 +1616,7 @@ async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
     let sample_rate = engine.sample_rate;
 
     // Load the default voice style (M1) for playback.
-    let Some(dir) = model_dir() else {
+    let Some(dir) = models_subdir(MODEL_DIR_NAME) else {
         return;
     };
     let (style_dp, style_ttl) = match load_voice_style(&dir, DEFAULT_VOICE_NAME) {

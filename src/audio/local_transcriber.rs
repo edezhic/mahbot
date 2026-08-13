@@ -38,6 +38,7 @@
 //! message with just the audio-transcription icon combo — there is no API
 //! fallback.
 
+use crate::audio::models_subdir;
 use crate::util::UnwrapPoison;
 use crate::util::model_state::{AtomicModelState, ModelState};
 use anyhow::{Context, Result};
@@ -133,13 +134,6 @@ fn set_transcriber_ready(tc: QwenLocalTranscriber) {
     STATE.store(ModelState::Ready, Ordering::Release);
 }
 
-// ── Model directory resolution ────────────────────────────────────────
-
-/// Resolve the local model directory (`~/.mahbot/models/qwen3-asr-0.6b/`).
-fn model_dir() -> Option<PathBuf> {
-    crate::util::models_dir().map(|dir| dir.join(MODEL_DIR_NAME))
-}
-
 /// The Qwen3-ASR local transcriber.
 ///
 /// Wraps a `qwen-asr` inference context behind a high-level `transcribe_file`
@@ -160,8 +154,8 @@ impl QwenLocalTranscriber {
     /// Load the model from an explicit directory path.
     ///
     /// Unlike [`try_init_from_cache`](super::try_init_from_cache), this does
-    /// not resolve the directory via [`model_dir`] and therefore does not
-    /// depend on the CONFIG storage root being set.
+    /// not resolve the directory via [`crate::audio::models_subdir`] and
+    /// therefore does not depend on the CONFIG storage root being set.
     fn try_load_from(dir: &Path) -> Option<Self> {
         let dir_str = dir.to_string_lossy().to_string();
         let mut ctx = qwen_asr::context::QwenCtx::load(&dir_str)?;
@@ -573,7 +567,7 @@ fn download_client() -> Result<reqwest::Client> {
 /// loads the model and transitions to [`ModelState::Ready`]. On terminal failure,
 /// transitions to [`ModelState::Failed`].
 async fn download_retry_loop() {
-    let Some(dir) = model_dir() else {
+    let Some(dir) = models_subdir(MODEL_DIR_NAME) else {
         warn!("Local transcriber: cannot resolve model directory (storage root not set)");
         STATE.store(ModelState::Failed, Ordering::Release);
         return;
@@ -775,7 +769,8 @@ fn try_lock_init() -> Option<bool> {
 }
 
 /// Initialise the local transcriber from the default cache directory
-/// (resolved via [`model_dir`], which depends on the CONFIG storage root).
+/// (resolved via [`crate::audio::models_subdir`], which depends on the CONFIG
+/// storage root).
 ///
 /// This is the main entry point used by the production pipeline
 /// (`bootstrap` and audio enrichment).
@@ -784,7 +779,7 @@ pub async fn try_init_from_cache() -> bool {
         return result;
     }
 
-    let Some(dir) = model_dir() else {
+    let Some(dir) = models_subdir(MODEL_DIR_NAME) else {
         STATE.store(ModelState::Failed, Ordering::Release);
         return false;
     };
