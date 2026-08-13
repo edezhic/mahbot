@@ -1543,9 +1543,11 @@ fn classify_repair_target(problems: &[String]) -> RepairTarget {
 /// `debug::parse_family_name` — the writer round-trip test locks the coupling.
 #[must_use]
 pub(crate) fn pre_reindex_snapshot_path(db_path: &Path) -> std::path::PathBuf {
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-    let pid = std::process::id();
-    std::path::PathBuf::from(format!("{}.pre-reindex-{stamp}-{pid}", db_path.display()))
+    std::path::PathBuf::from(format!(
+        "{}.pre-reindex-{}",
+        db_path.display(),
+        family_stamp()
+    ))
 }
 
 /// Class-B btree-index desync repair: `quick_check` names a specific
@@ -1801,9 +1803,8 @@ async fn migrate_overflow_aliased_store(
     }
 
     // ── Build the fresh store at a sibling temp path ──
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-    let pid = std::process::id();
-    let temp = std::path::PathBuf::from(format!("{}.rebuild-{stamp}-{pid}", db_path.display()));
+    let temp =
+        std::path::PathBuf::from(format!("{}.rebuild-{}", db_path.display(), family_stamp()));
     // Guard removes the temp family on every exit, including a turso panic
     // mid-copy (absorbed by open_store's catch_unwind).
     let _temp_guard = TempCleanup(&temp);
@@ -2409,17 +2410,16 @@ fn quarantine_coordination_sidecars(db_path: &Path) -> bool {
 #[must_use]
 fn quarantine_family(db_path: &Path, sources: &[(&Path, &str)]) -> bool {
     static QUARANTINE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-    let pid = std::process::id();
+    let stamp = family_stamp();
     let seq = QUARANTINE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let base = if seq == 0 {
         format!(
-            "{}.quarantine-{stamp}-{pid}",
+            "{}.quarantine-{stamp}",
             db_path.file_name().unwrap_or_default().to_string_lossy()
         )
     } else {
         format!(
-            "{}.quarantine-{stamp}-{pid}-{seq}",
+            "{}.quarantine-{stamp}-{seq}",
             db_path.file_name().unwrap_or_default().to_string_lossy()
         )
     };
@@ -2503,6 +2503,18 @@ pub(crate) async fn with_tx(
         .with_context(|| format!("Failed to commit transaction for {action_label}"))?;
 
     Ok(())
+}
+
+/// Forensic-family name suffix `{stamp}-{pid}` (stamp = `%Y%m%dT%H%M%SZ`, pid = process
+/// id). Parse side shape-validates it via `debug::is_family_stamp` — the writer round-trip
+/// test locks the coupling. Bind once per family: two calls could straddle a second boundary.
+#[must_use]
+fn family_stamp() -> String {
+    format!(
+        "{}-{}",
+        Utc::now().format("%Y%m%dT%H%M%SZ"),
+        std::process::id()
+    )
 }
 
 #[cfg(test)]
