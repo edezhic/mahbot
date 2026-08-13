@@ -550,7 +550,7 @@ pub struct ChannelMessage {
     /// ChatEvent handler — `None` for non-GUI channels (Telegram, callbacks).
     pub optimistic_id: Option<String>,
     /// Callback query ID from Telegram inline keyboard interactions.
-    /// Only set for callback queries (`__opt__` or `__act__` prefixes),
+    /// Only set for callback queries (`__act__` prefix),
     /// used to acknowledge and dismiss the Telegram loading spinner.
     pub callback_query_id: Option<String>,
 }

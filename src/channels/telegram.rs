@@ -34,37 +34,6 @@ pub const MAINTENANCE_ON_COMMAND_DESC: &str = "Enable workspace maintenance";
 /// Description for the `/maintenance_off` command (admin, menu form).
 pub const MAINTENANCE_OFF_COMMAND_DESC: &str = "Disable workspace maintenance";
 
-// ── Telegram callback/action button decoding ─────────────────────────
-
-/// Callback data prefix for dynamic option buttons.
-pub(crate) const CALLBACK_PREFIX: &str = "__opt__";
-
-/// Decode callback data from inline keyboard interactions.
-///
-/// Returns `(ticket_id, label)` on success (`ticket_id` is `None` when the
-/// callback data was generated without one).  Returns `None` when `content`
-/// does not carry the `CALLBACK_PREFIX`.
-///
-/// # Format contract
-///
-/// The callback data uses `|` as a delimiter between the optional ticket-id
-/// and the label.  The join and split therefore assume that `ticket_id` must
-/// not contain `|`; the label may contain `|`.
-///
-/// **Examples:**
-/// - `__opt__ticket-id|Label` → `(Some("ticket-id"), "Label")`
-/// - `__opt__|Label` → `(None, "Label")`
-/// - `__opt__BareLabel` → `(None, "BareLabel")`
-#[must_use]
-pub fn decode_callback(content: &str) -> Option<(Option<String>, String)> {
-    let rest = content.strip_prefix(CALLBACK_PREFIX)?;
-    Some(match rest.split_once('|') {
-        Some((tid, lbl)) if !tid.is_empty() => (Some(tid.to_string()), lbl.to_string()),
-        Some((_, lbl)) => (None, lbl.to_string()),
-        None => (None, rest.to_string()),
-    })
-}
-
 // ── Action prefixes (__act__) ───────────────────────────────────────
 
 /// Callback data prefix for action callbacks (e.g., model selection, clear session).
@@ -2068,7 +2037,7 @@ impl TelegramChannel {
 
                 // For __act__ callbacks, do NOT answer early — the action handler
                 // (handle_action_callback in main.rs) will answer with the appropriate
-                // toast text. For __opt__ and other callbacks, dismiss the spinner now.
+                // toast text. Dismiss the spinner now for all other callbacks.
                 if !cq_data.starts_with(ACTION_PREFIX)
                     && let Some(ref id) = cq_id
                 {

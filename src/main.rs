@@ -14,7 +14,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use mahbot::channels::broadcast_and_persist_incoming_message;
-use mahbot::channels::telegram::{decode_action, decode_callback, user_command_entries};
+use mahbot::channels::telegram::{decode_action, user_command_entries};
 use mahbot::config::CONFIG;
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
 use mahbot::message_router;
@@ -31,35 +31,6 @@ const JETBRAINS_MONO_BOLD_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-
 /// INFO-log retention window (hours): the log-cleanup loop deletes INFO
 /// entries older than this. Independent of the session-purge cutoff.
 const LOG_RETENTION_HOURS: i64 = 8;
-
-/// Handle a dynamic option callback (prefixed `__opt__`).
-///
-/// Constructs an injected user message (e.g. "mahbot-123 - A") from the
-/// already-decoded callback data, and routes it to the Manager session,
-/// bypassing the user's currently active role.
-async fn handle_option_callback(mut msg: ChannelMessage, decoded: (Option<String>, String)) {
-    let (ticket_id, label) = decoded;
-
-    // Construct the injected user message
-    msg.content = match &ticket_id {
-        Some(ticket_id_val) => format!("{ticket_id_val} - {label}"),
-        None => label,
-    };
-
-    let ws = mahbot::users::resolve_workspace_for_user_name(&msg.user_name).await;
-
-    // Route directly to Manager session, bypassing resolve_active_role.
-    // Enrichment is skipped — synthetic callback text has no media markers or URLs.
-    message_router::route_user_message(
-        msg.content,
-        ws.name,
-        msg.user_name,
-        msg.channel,
-        Role::Manager,
-        None,
-    )
-    .await;
-}
 
 /// Run [`bootstrap_mahbot`] and convert panics into `Err` so the dashboard shows
 /// a boot error instead of hanging on "Starting…" forever.
@@ -600,16 +571,9 @@ async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMe
             },
         };
 
-        // Handle dynamic option callbacks — route directly to Manager
-        // session, bypassing the user's currently active role.
-        if let Some(decoded) = decode_callback(&msg.content) {
-            spawn(handle_option_callback(msg, decoded));
-            continue;
-        }
-
         // Handle action callbacks (__act__ prefix) — route to a handler that
         // updates config / clears session without involving the Manager agent.
-        // Spawned (like __opt__ callbacks) so a slow catalog validation in
+        // Spawned so a slow catalog validation in
         // set_image_model never stalls the shared dispatch loop.
         if let Some(decoded) = decode_action(&msg.content) {
             spawn(handle_action_callback(msg, decoded));

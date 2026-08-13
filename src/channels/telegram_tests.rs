@@ -1433,67 +1433,6 @@ fn test_extend_past_open_tag() {
     }
 }
 
-// ── decode_callback ───────────────────────────────────────────────────
-
-#[test]
-fn test_decode_callback() {
-    struct Case {
-        name: &'static str,
-        input: &'static str,
-        expected: Option<(Option<&'static str>, &'static str)>,
-    }
-
-    let cases = [
-        Case {
-            name: "with ticket id",
-            input: "__opt__mahbot-123|Option A",
-            expected: Some((Some("mahbot-123"), "Option A")),
-        },
-        Case {
-            name: "empty ticket id",
-            input: "__opt__|Label",
-            expected: Some((None, "Label")),
-        },
-        Case {
-            name: "no delimiter",
-            input: "__opt__BareLabel",
-            expected: Some((None, "BareLabel")),
-        },
-        Case {
-            name: "rejects non prefix",
-            input: "random_text",
-            expected: None,
-        },
-        Case {
-            name: "rejects empty",
-            input: "",
-            expected: None,
-        },
-        Case {
-            name: "label with extra pipes",
-            input: "__opt__ticket|A|B|C",
-            expected: Some((Some("ticket"), "A|B|C")),
-        },
-        // Labels containing '|' test a deliberate `split_once` behavior:
-        // `split_once('|')` splits on the *first* pipe only, so the label
-        // captures everything after it.  Neither ticket_id nor label should
-        // contain `|` in practice (per the format contract in the doc comment).
-        Case {
-            name: "only prefix and pipe",
-            input: "__opt__|",
-            expected: Some((None, "")),
-        },
-    ];
-
-    for case in &cases {
-        let result = decode_callback(case.input);
-        let expected = case
-            .expected
-            .map(|(tid, lbl)| (tid.map(String::from), lbl.to_string()));
-        assert_eq!(result, expected, "case: {}", case.name);
-    }
-}
-
 // ── decode_action ─────────────────────────────────────────────────────
 
 #[test]
