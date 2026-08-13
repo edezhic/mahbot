@@ -5547,26 +5547,23 @@ impl PipelineCtx {
         }
     }
 
-    /// Check whether the 10-second rate-limit has elapsed since the last
-    /// transcription-error chat message.
-    ///
-    /// Returns `true` if no prior error occurred, or if at least 10 seconds
-    /// have passed since the last one.  The caller broadcasts the error
-    /// message on `true` and sets [`last_error_message_time`] to the current
-    /// instant.
-    fn should_send_error_message(&self) -> bool {
+    /// Whether the 10-second rate limit has elapsed since `last` (true when
+    /// no prior message was sent).  The transcription-error and voice-notice
+    /// limiters stay independent — separate fields so a discard notice is not
+    /// suppressed by a recent error message (and vice versa).
+    fn should_send_rate_limited(last: Option<Instant>) -> bool {
         let now = Instant::now();
-        self.last_error_message_time
-            .is_none_or(|t| now.duration_since(t).as_secs() >= 10)
+        last.is_none_or(|t| now.duration_since(t).as_secs() >= 10)
     }
 
-    /// Rate-limit guard for voice notices (recording discarded etc.),
-    /// independent of the transcription-error limiter so a discard notice is
-    /// not suppressed by a recent error message (and vice versa).
+    /// 10-second transcription-error rate-limit guard.
+    fn should_send_error_message(&self) -> bool {
+        Self::should_send_rate_limited(self.last_error_message_time)
+    }
+
+    /// 10-second voice-notice rate-limit guard.
     fn should_send_voice_notice(&self) -> bool {
-        let now = Instant::now();
-        self.last_voice_notice_time
-            .is_none_or(|t| now.duration_since(t).as_secs() >= 10)
+        Self::should_send_rate_limited(self.last_voice_notice_time)
     }
 
     /// Broadcast a chat message to the active user's voice workspace.
