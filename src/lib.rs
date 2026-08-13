@@ -1405,8 +1405,7 @@ pub(crate) trait Provider: Send + Sync {
 
     /// Single-attempt chat for the outer retry paths.
     ///
-    /// Used by the outer retry loops in [`crate::retry`] for agent-loop LLM
-    /// calls, verdict extraction and analyst consolidation. Contract:
+    /// Used by the outer retry loops in [`crate::retry`]. Contract:
     ///
     /// - **No provider-internal retries** — this call makes exactly one HTTP
     ///   request; the outer loop is the single retry authority.

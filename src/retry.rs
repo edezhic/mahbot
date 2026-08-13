@@ -1,46 +1,48 @@
 //! Outer retry orchestration for LLM operations.
 //!
-//! Five expensive code paths use this module:
-//!
-//! 1. **Agent-loop LLM calls** — every chat call an agent makes while working
-//!    (`src/agent.rs`).
-//! 2. **Verdict extraction** — structured pass/fail verdicts from Analyst /
-//!    Reviewer / QA / Sanitation agents (`src/extraction.rs`).
-//! 3. **Diagnostics discovery** — workspace diagnostics command extraction
-//!    (`src/workspace.rs`).
-//! 4. **Analyst consolidation** — the synthesis of the 3 parallel analyst
-//!    reports in the ask tool (`src/tools/ask.rs`).
-//! 5. **Comment-only extraction** — the engineer's ticket-comment summary runs
-//!    through the same verdict-extraction machinery with a short
-//!    3-attempt/90 s budget ([`RetryPolicy::comment`]) — the caller is
-//!    fail-open, so a long retry would stall the pipeline for a non-critical
-//!    operation.
+//! The expensive LLM paths retry through this module — agent-loop chat calls,
+//! structured extraction (verdicts, diagnostics discovery, comment summaries,
+//! research orchestration), grouping repair (ask consolidation, joint-verdict
+//! synthesis) and deep-research synthesis — so every chat/extraction retry
+//! budget lives in one place. The list is intentionally non-exhaustive:
+//! behavior is defined by the policy constructors, not by per-path
+//! documentation.
 //!
 //! # Single retry authority
 //!
 //! The outer loop in this module is the **single retry authority**: on these
 //! calls provider-internal retries are suppressed (see [`Provider::chat_scoped`]),
-//! so total provider HTTP calls per operation are explicitly bounded:
-//! 13 per agent LLM call, 13 per verdict extraction, 13 per diagnostics
-//! discovery, 13 per consolidation, 3 per comment-only extraction.
+//! so total provider HTTP calls per operation are explicitly bounded by the
+//! policy in effect (see "Schedules").
 //!
 //! # Byte-identical retry parameters
 //!
 //! All request parameters (model, messages, tools, max_tokens, reasoning_effort,
 //! provider routing) are byte-identical across ALL attempts — reasoning_effort
 //! is FIXED (prefix cache preservation — never lower it), no escalation of any
-//! kind. The only
-//! permitted change is the parse-failure re-prompt in the extraction path
-//! (appended messages), which extends the cached prefix.
+//! kind. The only permitted change is appended feedback on a failed attempt —
+//! the parse-failure re-prompt in the extraction path, repair-round
+//! instructions, synthesis feedback — which extends the cached prefix.
 //!
-//! # Schedule
+//! # Schedules
 //!
-//! 13 loop attempts; backoff 5/10/20/40/60/60… s (base 5000 ms, doubling
-//! capped at 60000 ms; total sleep 555 s); ±25% jitter on the SLEEP ONLY
-//! (never on request bytes); Retry-After honored, clamped [5000 ms, 60000 ms];
-//! shutdown-abortable; per-operation wall-clock cap 720 s (12 min),
-//! authoritative over attempt count — rides out sustained 503 outages up to
-//! ~10 min before failing (bounded worst-case stall 12 min).
+//! Three policies, snapshotted once at operation start ([`RetryPolicy`]). All
+//! share the same mechanics: ±25% jitter on the SLEEP ONLY (never on request
+//! bytes); Retry-After honored, clamped [5000 ms, 60000 ms];
+//! shutdown-abortable.
+//!
+//! - **Default** ([`RetryPolicy::current`]) — 13 attempts, backoff
+//!   5/10/20/40/60/60… s (base 5000 ms, doubling capped at 60000 ms; total
+//!   sleep 555 s), wall-clock cap 720 s (12 min), authoritative over attempt
+//!   count — rides out sustained 503 outages up to ~10 min before failing
+//!   (bounded worst-case stall 12 min).
+//! - **Synthesis** ([`RetryPolicy::synthesis`]) — 3 total attempts (1
+//!   synthesis + up to 2 repair rounds), 30–45 s backoff band, 10-min wall
+//!   cap; bounded so a bad grouping degrades to the deterministic fallback
+//!   instead of burning minutes of wall time.
+//! - **Comment** ([`RetryPolicy::comment`]) — 3 attempts, 90 s cap; for
+//!   fail-open comment-only extraction, where a long retry would stall the
+//!   pipeline for a non-critical operation.
 //!
 //! Per-attempt timeout semantics come from [`Provider::chat_scoped`]: the
 //! header wait (TTFB) is bounded by the 1-min idle timeout and the whole
@@ -621,9 +623,9 @@ impl std::error::Error for RetryExhausted {}
 /// Mutable per-operation state shared by the outer retry loops.
 ///
 /// Encapsulates the backoff schedule, the per-attempt failure trail,
-/// Retry-After stickiness, and the wall-clock deadline so [`agent_chat`] and
-/// [`crate::extraction::retry_extract_structured_scoped`] cannot drift —
-/// schedule, sleep bounds, and trail mechanics live in exactly one place.
+/// Retry-After stickiness, and the wall-clock deadline so all outer retry
+/// loops cannot drift — schedule, sleep bounds, and trail mechanics live in
+/// exactly one place.
 pub(crate) struct RetryLoop {
     policy: RetryPolicy,
     deadline: Instant,

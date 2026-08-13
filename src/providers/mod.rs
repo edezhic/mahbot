@@ -324,8 +324,7 @@ pub(crate) fn media_transcriber() -> Option<MediaTranscriber> {
     MEDIA_TRANSCRIBER.read().unwrap_poison().clone()
 }
 
-/// Single-attempt scoped chat for the outer retry loops — agent-loop LLM
-/// calls, verdict extraction, diagnostics discovery, consolidation.
+/// Single-attempt scoped chat for the outer retry loops (see [`crate::retry`]).
 ///
 /// Suppresses provider-internal retries (the outer loop is the single retry
 /// authority), applies idle-timeout semantics, and bounds the attempt by the

@@ -13,17 +13,12 @@ use crate::{ChatMessage, ChatRequest, ExtractionValidator};
 
 // ── Scoped retry extraction ────────────────────────────────
 
-/// Scoped structured extraction with the hardened outer retry loop:
-/// 13 attempts, backoff 5/10/20/40/60/60… s
-/// (doubling capped at 60 s), Retry-After honored, shutdown-abortable,
-/// 720 s wall-clock cap. Used by verdict extraction (Analyst / Reviewer /
-/// QA / Sanitation), workspace diagnostics discovery, and the engineer's
-/// comment-only summary extraction (the latter via
-/// [`crate::retry::RetryPolicy::comment`] — 3 attempts / 90 s).
-///
-/// `policy_override` supplies a shorter schedule for fail-open callers
-/// (e.g. comment-only extraction — [`crate::retry::RetryPolicy::comment`]);
-/// `None` uses the default 13-attempt/720 s policy.
+/// Scoped structured extraction with the hardened outer retry loop
+/// ([`crate::retry`] — default 13 attempts / 720 s wall cap). Used by
+/// verdict extraction, diagnostics discovery, comment summaries, and
+/// research orchestration. `policy_override` supplies a shorter schedule
+/// for fail-open comment-only callers ([`crate::retry::RetryPolicy::comment`]
+/// — 3 attempts / 90 s); `None` uses the default policy.
 ///
 /// The outer loop is the SINGLE retry authority — provider-internal retries
 /// are suppressed via [`crate::providers::chat_scoped`], so total provider
