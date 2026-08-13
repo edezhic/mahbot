@@ -1674,6 +1674,14 @@ impl BoardStore {
             pipeline_reservation: false,
         },
     ];
+    /// Lookup a reset transition by `from` phase. Shared by the boot reset and
+    /// the stale-purge rollback in jobs.rs so both paths use one table.
+    pub(crate) fn reset_transition(from: TicketPhase) -> Option<(TicketPhase, bool)> {
+        Self::RESET_TRANSITIONS
+            .iter()
+            .find(|t| t.from == from)
+            .map(|t| (t.to, t.pipeline_reservation))
+    }
     /// Reset all in-flight tickets to their ready state (for crash/restart recovery).
     ///
     /// Resets:

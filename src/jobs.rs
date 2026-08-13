@@ -997,19 +997,16 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
     Ok(deleted as u64)
 }
 
-/// Per-phase rollback map (5 of the 6 RESET_TRANSITIONS; InDiagnostics has no
-/// job row — its tickets are never stranded by the purge). Transitory handoff
-/// phases (DiagnosticsDone, SanitationPassed, Reviewed, QaPassed) need no
-/// rollback — the phase CAS no-ops.
-fn rollback_transition(phase: &str) -> Option<(&'static str, bool)> {
-    match phase {
-        "analysis" => Some(("backlog", false)),
-        "in_development" => Some(("ready_for_development", true)),
-        "in_review" => Some(("diagnostics_done", false)),
-        "in_qa" => Some(("reviewed", false)),
-        "in_sanitation" => Some(("qa_passed", true)),
-        _ => None,
+/// 5 of the 6 RESET_TRANSITIONS: InDiagnostics has no job row — its tickets
+/// are never stranded by the purge. Transitory handoffs need no rollback —
+/// the phase CAS no-ops.
+fn rollback_transition(phase: &str) -> Option<(String, bool)> {
+    let from = phase.parse::<crate::board::TicketPhase>().ok()?;
+    if from == crate::board::TicketPhase::InDiagnostics {
+        return None;
     }
+    crate::board::BoardStore::reset_transition(from)
+        .map(|(to, pipeline_reservation)| (to.to_string(), pipeline_reservation))
 }
 
 /// Roll back stranded tickets in place: phase + assigned_to = NULL +
@@ -1972,6 +1969,28 @@ mod tests {
         assert_eq!(n[0].get::<i64>(0).unwrap(), 0);
         // The workspace var keeps the temp dir alive for the ticket's path.
         let _ = &ws;
+    }
+
+    /// rollback_transition mirrors the 5 job-bearing RESET_TRANSITIONS entries
+    /// and rejects InDiagnostics (job-less), unmapped, and invalid phases.
+    #[test]
+    fn rollback_transition_covers_reset_table() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("analysis", "backlog", false),
+            ("in_development", "ready_for_development", true),
+            ("in_review", "diagnostics_done", false),
+            ("in_qa", "reviewed", false),
+            ("in_sanitation", "qa_passed", true),
+        ];
+        for (phase, to, reservation) in cases {
+            assert_eq!(
+                rollback_transition(phase),
+                Some((to.to_string(), *reservation))
+            );
+        }
+        for phase in ["in_diagnostics", "ready_for_development", "bogus"] {
+            assert_eq!(rollback_transition(phase), None);
+        }
     }
 
     /// The round guard: only the ticket's LATEST round rolls back. A stale
