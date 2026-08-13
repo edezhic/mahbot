@@ -37,7 +37,7 @@
 //! | 2     | READY    | All models loaded and ready for synthesis.    |
 //! | 3     | FAILED   | Download or load failed terminally.           |
 
-use crate::audio::{models_subdir, onnx_output_name};
+use crate::audio::{extract_output, models_subdir};
 use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
 use crate::util::model_state::{AtomicModelState, ModelLoadGuard, ModelState};
@@ -1273,17 +1273,6 @@ fn build_inputs(inputs: Vec<(&str, Tensor)>) -> HashMap<String, Tensor> {
         map.insert(name.to_string(), tensor);
     }
     map
-}
-
-fn extract_output(
-    mut outputs: HashMap<String, Tensor>,
-    model: &candle_onnx::onnx::ModelProto,
-    label: &str,
-) -> Result<Tensor> {
-    let name = onnx_output_name(model);
-    outputs
-        .remove(&name)
-        .ok_or_else(|| anyhow!("{label}: output '{name}' not found"))
 }
 
 // ── Synthesis pipeline ───────────────────────────────────────────────

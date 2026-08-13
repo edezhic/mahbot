@@ -33,7 +33,7 @@ use crate::ChatDirection;
 use crate::EMBEDDING_DIM;
 use crate::audio::embedding_sequence::{EmbeddingSequence, Source, UtteranceId};
 use crate::audio::wake_word_classifier::{self, ClassifierWeights, WakeWordClassifier};
-use crate::audio::{models_subdir, onnx_input_name, onnx_output_name};
+use crate::audio::{extract_output, models_subdir, onnx_input_name};
 use crate::config::CONFIG;
 use crate::turso;
 use crate::util::UnwrapPoison;
@@ -2283,12 +2283,10 @@ fn compute_mel_spectrogram(models: &OnnxModels, samples: &[f32]) -> Result<Vec<V
     let mut inputs = HashMap::new();
     inputs.insert(onnx_input_name(&models.mel_model), input_tensor);
 
-    let mut outputs = candle_onnx::simple_eval(&models.mel_model, inputs)
+    let outputs = candle_onnx::simple_eval(&models.mel_model, inputs)
         .context("Mel spectrogram inference failed")?;
 
-    let output_tensor = outputs
-        .remove(&onnx_output_name(&models.mel_model))
-        .context("Mel spectrogram model produced no output")?;
+    let output_tensor = extract_output(outputs, &models.mel_model, "Mel spectrogram")?;
 
     let shape = output_tensor.dims();
     debug!("Mel spectrogram output shape: {shape:?}");
@@ -2383,12 +2381,10 @@ fn compute_embedding(models: &OnnxModels, mel_frames: &[Vec<f32>]) -> Result<Vec
     let mut inputs = HashMap::new();
     inputs.insert(onnx_input_name(&models.embed_model), input_tensor);
 
-    let mut outputs = candle_onnx::simple_eval(&models.embed_model, inputs)
+    let outputs = candle_onnx::simple_eval(&models.embed_model, inputs)
         .context("Embedding model inference failed")?;
 
-    let output_tensor = outputs
-        .remove(&onnx_output_name(&models.embed_model))
-        .context("Embedding model produced no output")?;
+    let output_tensor = extract_output(outputs, &models.embed_model, "Embedding")?;
 
     let embedding: Vec<f32> = output_tensor.flatten_all()?.to_vec1()?;
 
