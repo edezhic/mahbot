@@ -1229,6 +1229,23 @@ async fn run_structured_analyst<T: serde::de::DeserializeOwned>(
     }
 }
 
+/// Build a round member closure: run one analyst on `task` and extract
+/// structured output `T`. Takes owned values so the returned closure (and its
+/// boxed future) are `'static` + `Send`, as `spawn_staggered_round` requires.
+fn make_round_member<T: serde::de::DeserializeOwned + Send>(
+    ws: Workspace,
+    agent_id: String,
+    task: String,
+    extraction_prompt: String,
+) -> impl FnOnce(crate::agent::RoundOpts) -> futures_util::future::BoxFuture<'static, AnalystRun<T>> + Send
+{
+    move |round| {
+        Box::pin(async move {
+            run_structured_analyst::<T>(&ws, &agent_id, &task, &extraction_prompt, round).await
+        })
+    }
+}
+
 /// Collect a round's evidence from its analyst runs: register queries in the
 /// ledger, collect claims + source URLs, accumulate telemetry, and preserve
 /// parse-failed analysts' raw responses (fail-open — never dropped).
@@ -1357,17 +1374,7 @@ async fn round0_decompose(
             let question = question.to_string();
             let task = substitute(&task_template, &[("{{question}}", &question)]);
             let agent_id = crate::session::research_agent_id(&ws.name, &format!("decompose_{i}"));
-            let extraction_prompt = extraction_prompt.clone();
-            move |round| async move {
-                run_structured_analyst::<DecompositionPlan>(
-                    &ws,
-                    &agent_id,
-                    &task,
-                    &extraction_prompt,
-                    round,
-                )
-                .await
-            }
+            make_round_member::<DecompositionPlan>(ws, agent_id, task, extraction_prompt.clone())
         })
         .collect();
     let handles = crate::agent::spawn_staggered_round(members, resume).await;
@@ -1590,17 +1597,12 @@ async fn round1_research(
                 params: wrap_up_params(&ws, &agent_id, wrap_up_specs.clone()),
             });
             idx += 1;
-            let extraction_prompt = extraction_prompt.clone();
-            members.push(move |round| async move {
-                run_structured_analyst::<AnalystFindings>(
-                    &ws,
-                    &agent_id,
-                    &task,
-                    &extraction_prompt,
-                    round,
-                )
-                .await
-            });
+            members.push(make_round_member::<AnalystFindings>(
+                ws,
+                agent_id,
+                task,
+                extraction_prompt.clone(),
+            ));
         }
     }
     let handles = crate::agent::spawn_staggered_round(members, resume).await;
@@ -1713,17 +1715,12 @@ async fn run_gap_round(
             agent_id: agent_id.clone(),
             params: wrap_up_params(&ws, &agent_id, wrap_up_specs.clone()),
         });
-        let extraction_prompt = extraction_prompt.clone();
-        members.push(move |round| async move {
-            run_structured_analyst::<AnalystFindings>(
-                &ws,
-                &agent_id,
-                &task,
-                &extraction_prompt,
-                round,
-            )
-            .await
-        });
+        members.push(make_round_member::<AnalystFindings>(
+            ws,
+            agent_id,
+            task,
+            extraction_prompt.clone(),
+        ));
     }
     let handles = crate::agent::spawn_staggered_round(members, resume).await;
     let members_out = await_round_members(handles, deadline).await;
