@@ -386,7 +386,7 @@ pub(crate) fn create_provider(
     headers.insert("X-Title".to_string(), "MahBot".to_string());
     headers.insert(
         "HTTP-Referrer".to_string(),
-        "https://github.com/edezhic".to_string(),
+        "https://github.com/edezhic/mahbot".to_string(),
     );
     let base = OpenAiCompatibleProvider::new("OpenRouter", base_url.as_str(), resolved_key)
         .with_extra_headers(headers);
