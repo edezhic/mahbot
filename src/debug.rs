@@ -748,29 +748,15 @@ fn classify_family(root: &Path, id: String, meta: FamilyMeta) -> FamilyInfo {
 }
 
 /// Main-DB header sanity without opening the database: SQLite magic plus a
-/// valid page size (the same checks wal_guard applies to live stores). Page
-/// size 65536 is encoded as 0x0001 per the SQLite header format.
+/// valid page size (the same checks wal_guard applies to live stores).
 fn db_header_ok(db_path: &Path) -> bool {
-    const MAGIC: &[u8; 16] = b"SQLite format 3\0";
     let Ok(meta) = std::fs::metadata(db_path) else {
         return false;
     };
-    if meta.len() < 100 {
+    if meta.len() < wal_guard::DB_HEADER_MIN_SIZE {
         return false; // empty or truncated header
     }
-    let mut header = [0u8; 18];
-    let Ok(mut f) = std::fs::File::open(db_path) else {
-        return false;
-    };
-    if std::io::Read::read_exact(&mut f, &mut header).is_err() {
-        return false;
-    }
-    if &header[..16] != MAGIC {
-        return false;
-    }
-    let raw = u16::from_be_bytes([header[16], header[17]]);
-    let page_size = if raw == 1 { 65_536 } else { u32::from(raw) };
-    (512..=65_536).contains(&page_size) && page_size.is_power_of_two()
+    wal_guard::read_db_header(db_path).is_some_and(|h| wal_guard::db_header_valid(&h))
 }
 
 /// `mahbot debug families [--db <name>]` — list all forensic families

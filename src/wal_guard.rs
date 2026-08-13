@@ -735,7 +735,31 @@ pub(crate) fn has_boot_diagnosis(db_path: &Path) -> bool {
 /// Main SQLite header magic (first 16 bytes of every `.db` file).
 const DB_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 /// Minimum main-DB size to carry a header (page 1 with a valid magic).
-const DB_HEADER_MIN_SIZE: u64 = 100;
+pub(crate) const DB_HEADER_MIN_SIZE: u64 = 100;
+
+/// Read the 18-byte main-DB header (magic + u16 BE page-size field). `None`
+/// on any I/O failure or a file shorter than the header — the caller decides
+/// what `None` means (wal_guard: fail-open → healthy; debug: fail-closed).
+pub(crate) fn read_db_header(db_path: &Path) -> Option<[u8; 18]> {
+    use std::io::Read;
+    let mut header = [0u8; 18];
+    let mut file = std::fs::File::open(db_path).ok()?;
+    file.read_exact(&mut header).ok()?;
+    Some(header)
+}
+
+/// True when the header carries the SQLite magic and a valid page size:
+/// power of two in [512, 65536]. Per the SQLite header format, 65536 is
+/// encoded as raw 1 in the u16 page-size field.
+#[must_use]
+pub(crate) fn db_header_valid(header: &[u8; 18]) -> bool {
+    if &header[..16] != DB_HEADER_MAGIC {
+        return false;
+    }
+    let raw = u16::from_be_bytes([header[16], header[17]]);
+    let page_size = if raw == 1 { 65_536 } else { u32::from(raw) };
+    (512..=65_536).contains(&page_size) && page_size.is_power_of_two()
+}
 
 /// Classify the main-DB file itself: 0-byte with a live WAL
 /// → durable-B; truncated/zeroed header → structural; otherwise healthy.
@@ -753,29 +777,22 @@ fn classify_main_db(db_path: &Path, wal_exists: bool, wal_size: u64) -> BootDiag
             BootDiagnosis::Healthy
         };
     }
+    // Fail-closed on truncated headers, fail-open on I/O errors: a short
+    // file is structural, but an open/read failure (permission / I-O) is not
+    // a quarantine trigger — leave it to the real open. The size gate stays
+    // here (not inside read_db_header's None) so sizes 1–99 cannot silently
+    // flip to Healthy.
     if size < DB_HEADER_MIN_SIZE {
         return BootDiagnosis::Structural;
     }
-    // One 18-byte read covers the magic (16) and the page size (u16 BE at
-    // offset 16): power of two in [512, 65536]. An open/read failure
-    // (permission / I-O) is not structural damage — leave classification to
-    // the real open, which surfaces it as an actionable signal (never a
-    // quarantine trigger).
-    let mut header = [0u8; 18];
-    let Ok(mut f) = std::fs::File::open(db_path) else {
+    let Some(header) = read_db_header(db_path) else {
         return BootDiagnosis::Healthy;
     };
-    if std::io::Read::read_exact(&mut f, &mut header).is_err() {
-        return BootDiagnosis::Healthy;
+    if db_header_valid(&header) {
+        BootDiagnosis::Healthy
+    } else {
+        BootDiagnosis::Structural
     }
-    if &header[..16] != DB_HEADER_MAGIC {
-        return BootDiagnosis::Structural;
-    }
-    let page_size = u16::from_be_bytes([header[16], header[17]]);
-    if !(512..=65_536).contains(&u32::from(page_size)) || !page_size.is_power_of_two() {
-        return BootDiagnosis::Structural;
-    }
-    BootDiagnosis::Healthy
 }
 
 /// Boot pre-flight: classify all 7 stores **before any store is opened**
@@ -1104,6 +1121,20 @@ mod tests {
         assert!(parse_wal_header(&bad_size).is_none());
     }
 
+    #[test]
+    fn db_header_valid_decodes_64k_page_size() {
+        // SQLite encodes 65536 as raw 1 in the u16 page-size field; the boot
+        // classifier must accept it (a raw 1 used to fall outside the range
+        // check and misclassify a legitimate 64 KiB store as structural).
+        let mut header = [0u8; 18];
+        header[..16].copy_from_slice(b"SQLite format 3\0");
+        header[16..18].copy_from_slice(&1u16.to_be_bytes());
+        assert!(db_header_valid(&header));
+        // The same field without the magic is invalid.
+        header[0] = b'X';
+        assert!(!db_header_valid(&header));
+    }
+
     fn tshm(max_frame: u64, frame_index_len: u32) -> TshmHeader {
         TshmHeader {
             max_frame,
@@ -1346,6 +1377,13 @@ mod tests {
         // Structural: truncated main DB header.
         write(&dir.join("db/board.db"), &[0u8; 64]);
         write(&dir.join("db/board.db-tshm"), &tshm_bytes(0, 0, 0));
+        // Healthy: 64 KiB page size (raw 1 in the header field) must not be
+        // misclassified as structural (quarantine + recreate).
+        let mut db = vec![0u8; 4096];
+        db[..16].copy_from_slice(b"SQLite format 3\0");
+        db[16..18].copy_from_slice(&1u16.to_be_bytes());
+        write(&dir.join("db/chat_history.db"), &db);
+        write(&dir.join("db/chat_history.db-tshm"), &tshm_bytes(0, 0, 0));
         // Healthy: fresh store state.
         write(&dir.join("db/users.db-tshm"), &tshm_bytes(0, 0, 0));
 
@@ -1357,6 +1395,13 @@ mod tests {
         assert_eq!(
             crate::wal_guard::take_boot_diagnosis(&crate::turso::store_db_path(&dir, "board")),
             Some(BootDiagnosis::Structural)
+        );
+        assert_eq!(
+            crate::wal_guard::take_boot_diagnosis(&crate::turso::store_db_path(
+                &dir,
+                "chat_history"
+            )),
+            Some(BootDiagnosis::Healthy)
         );
         assert_eq!(
             crate::wal_guard::take_boot_diagnosis(&crate::turso::store_db_path(&dir, "users")),
