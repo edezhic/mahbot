@@ -37,10 +37,10 @@
 //! | 2     | READY    | All models loaded and ready for synthesis.    |
 //! | 3     | FAILED   | Download or load failed terminally.           |
 
-use crate::audio::{extract_output, models_subdir};
+use crate::audio::{MAX_DOWNLOAD_RETRIES, extract_output, models_subdir, run_download_retry_loop};
 use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
-use crate::util::model_state::{AtomicModelState, ModelLoadGuard, ModelState};
+use crate::util::model_state::{AtomicModelState, ModelState};
 use anyhow::{Context, Result, anyhow};
 use candle_core::{Device, Tensor};
 use candle_onnx::simple_eval;
@@ -66,7 +66,6 @@ const MODEL_REPO: &str = "Supertone/supertonic-3";
 const MODEL_REVISION: &str = "724fb5abbf5502583fb520898d45929e62f02c0b";
 const HF_BASE: &str = "https://huggingface.co";
 const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
-const MAX_DOWNLOAD_RETRIES: u32 = 10;
 const DEFAULT_TOTAL_STEPS: usize = 8;
 const SPEED_FACTOR: f32 = 1.05;
 const MAX_CHUNK_LENGTH: usize = 300;
@@ -797,50 +796,27 @@ fn emit_download_event(event: TtsDownloadEvent) {
 }
 
 async fn download_retry_loop() {
-    // Transitions Loading→Failed on drop if the loop is cancelled or panics.
-    let _guard = ModelLoadGuard::new(&STATE);
-    let Some(dir) = models_subdir(MODEL_DIR_NAME) else {
-        warn!("TTS: cannot resolve model directory");
-        STATE.store(ModelState::Failed, Ordering::Release);
-        return;
-    };
-
-    let mut retry_delay = Duration::from_secs(5);
-    let mut retry_count = 0u32;
-
-    loop {
-        if STATE.load(Ordering::Acquire) == ModelState::Ready {
-            return;
-        }
-        retry_count += 1;
-        if retry_count > MAX_DOWNLOAD_RETRIES {
+    run_download_retry_loop(
+        &STATE,
+        MODEL_DIR_NAME,
+        "TTS",
+        MODEL_DOWNLOAD_TIMEOUT,
+        async |dir| ensure_models_downloaded(dir).await,
+        |dir| {
+            let e = load_engine(dir)?;
+            set_engine_ready(e);
+            emit_download_event(TtsDownloadEvent::Complete);
+            info!("TTS models loaded successfully");
+            Ok(())
+        },
+        || {
             let msg = format!("TTS download failed after {MAX_DOWNLOAD_RETRIES} retries");
             warn!("{msg}");
             emit_download_event(TtsDownloadEvent::Failed { error: msg });
             STATE.store(ModelState::Failed, Ordering::Release);
-            return;
-        }
-
-        match tokio::time::timeout(MODEL_DOWNLOAD_TIMEOUT, ensure_models_downloaded(&dir)).await {
-            Ok(Ok(())) => match load_engine(&dir) {
-                Ok(e) => {
-                    set_engine_ready(e);
-                    emit_download_event(TtsDownloadEvent::Complete);
-                    info!("TTS models loaded successfully");
-                    return;
-                }
-                Err(e) => warn!("Failed to load TTS models (will retry): {e}"),
-            },
-            Ok(Err(e)) => warn!("Failed to download TTS models (will retry): {e}"),
-            Err(_) => warn!("TTS download timed out (will retry)"),
-        }
-
-        if STATE.load(Ordering::Acquire) == ModelState::Failed {
-            return;
-        }
-        tokio::time::sleep(retry_delay).await;
-        retry_delay = (retry_delay * 2).min(Duration::from_mins(2));
-    }
+        },
+    )
+    .await;
 }
 
 /// File descriptor: (download URL, local path, expected SHA256 hash).

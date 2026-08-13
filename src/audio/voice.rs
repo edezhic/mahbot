@@ -33,12 +33,14 @@ use crate::ChatDirection;
 use crate::EMBEDDING_DIM;
 use crate::audio::embedding_sequence::{EmbeddingSequence, Source, UtteranceId};
 use crate::audio::wake_word_classifier::{self, ClassifierWeights, WakeWordClassifier};
-use crate::audio::{extract_output, models_subdir, onnx_input_name};
+use crate::audio::{
+    MAX_DOWNLOAD_RETRIES, extract_output, models_subdir, onnx_input_name, run_download_retry_loop,
+};
 use crate::config::CONFIG;
 use crate::turso;
 use crate::util::UnwrapPoison;
 use crate::util::hex_string;
-use crate::util::model_state::{AtomicModelState, ModelLoadGuard, ModelState};
+use crate::util::model_state::{AtomicModelState, ModelState};
 use crate::vector::cosine_similarity;
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -216,9 +218,6 @@ const ENROLLMENT_NO_SPEECH_DURATION: Duration = Duration::from_secs(5);
 const ENROLLMENT_NO_SPEECH_TIMEOUT_FRAMES: usize =
     (ENROLLMENT_NO_SPEECH_DURATION.as_millis() as usize * SAMPLE_RATE as usize)
         / (HOP_LENGTH * 1000);
-
-/// Maximum number of download retries.
-const MAX_DOWNLOAD_RETRIES: u32 = 10;
 
 /// Default wake word phrase used when no phrase has been specified
 /// or when a legacy model has no phrase field. This is the serde default
@@ -3330,95 +3329,62 @@ async fn ensure_model_file(
     Ok(())
 }
 
-async fn ensure_models_downloaded() -> Result<PathBuf> {
-    let dir = models_subdir(MODEL_DIR_NAME)
-        .ok_or_else(|| anyhow!("Cannot resolve model directory (storage root not set)"))?;
-
-    tokio::fs::create_dir_all(&dir).await?;
+async fn ensure_models_downloaded(dir: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(dir).await?;
 
     let client = crate::util::http::build_download_client(MODEL_DOWNLOAD_TIMEOUT)
         .context("Failed to build HTTP client for model download")?;
 
-    ensure_model_file(&client, &dir, MEL_MODEL, "Mel spectrogram").await?;
-    ensure_model_file(&client, &dir, EMBED_MODEL, "Embedding").await?;
+    ensure_model_file(&client, dir, MEL_MODEL, "Mel spectrogram").await?;
+    ensure_model_file(&client, dir, EMBED_MODEL, "Embedding").await?;
 
-    Ok(dir)
+    Ok(())
 }
 
 async fn download_retry_loop() {
-    // Transitions Loading→Failed on drop if the loop is cancelled or panics.
-    let _guard = ModelLoadGuard::new(&MODELS_STATE);
-    let Some(dir) = models_subdir(MODEL_DIR_NAME) else {
-        warn!("Voice models: cannot resolve model directory");
-        MODELS_STATE.store(ModelState::Failed, Ordering::Release);
-        return;
-    };
-
-    let mut retry_delay = Duration::from_secs(5);
-    let mut retry_count = 0u32;
-
-    loop {
-        if MODELS_STATE.load(Ordering::Acquire) == ModelState::Ready {
-            return;
-        }
-
-        retry_count += 1;
-        if retry_count > MAX_DOWNLOAD_RETRIES {
-            warn!("Voice model download failed after {MAX_DOWNLOAD_RETRIES} retries");
+    run_download_retry_loop(
+        &MODELS_STATE,
+        MODEL_DIR_NAME,
+        "voice",
+        MODEL_DOWNLOAD_TIMEOUT,
+        async |dir| ensure_models_downloaded(dir).await,
+        |dir| {
+            let models = load_onnx_models(dir)?;
+            if ONNX_MODELS.set(models).is_ok() {
+                MODELS_STATE.store(ModelState::Ready, Ordering::Release);
+                info!("Voice models loaded successfully");
+                // Pre-warm confusable and unrelated dense embeddings in
+                // background so enrollment never blocks on TTS synthesis.
+                // Ran sequentially within a single task to avoid ONNX model
+                // thread-safety concerns.
+                tokio::spawn(async {
+                    prewarm_confusable_embeddings().await;
+                    prewarm_unrelated_embeddings().await;
+                });
+            } else {
+                // Another instance already set the models — adopt Ready
+                // state and exit (avoids wasted retry loops).  Pre-warm was
+                // triggered by the first instance; calling it again is a
+                // no-op (cache check).
+                MODELS_STATE.store(ModelState::Ready, Ordering::Release);
+                info!("Voice models already loaded by another task");
+            }
+            // Clear "Loading models" status — if enabled, auto-start
+            // transitions to Listening on the next pipeline tick.
+            set_status(if is_enabled() {
+                VoiceStatus::Listening
+            } else {
+                VoiceStatus::Disabled
+            });
+            Ok(())
+        },
+        || {
+            warn!("voice model download failed after {MAX_DOWNLOAD_RETRIES} retries");
             MODELS_STATE.store(ModelState::Failed, Ordering::Release);
             set_status(VoiceStatus::ModelError);
-            return;
-        }
-
-        match tokio::time::timeout(MODEL_DOWNLOAD_TIMEOUT, ensure_models_downloaded()).await {
-            Ok(Ok(_)) => match load_onnx_models(&dir) {
-                Ok(models) => {
-                    if ONNX_MODELS.set(models).is_ok() {
-                        MODELS_STATE.store(ModelState::Ready, Ordering::Release);
-                        info!("Voice models loaded successfully");
-                        // Pre-warm confusable and unrelated dense embeddings in
-                        // background so enrollment never blocks on TTS synthesis.
-                        // Ran sequentially within
-                        // a single task to avoid ONNX model thread-safety concerns.
-                        tokio::spawn(async {
-                            prewarm_confusable_embeddings().await;
-                            prewarm_unrelated_embeddings().await;
-                        });
-                        // Clear "Loading models" status — if enabled, auto-start
-                        // transitions to Listening on the next pipeline tick.
-                        set_status(if is_enabled() {
-                            VoiceStatus::Listening
-                        } else {
-                            VoiceStatus::Disabled
-                        });
-                        return;
-                    }
-                    // Another instance already set the models — adopt Ready
-                    // state and exit (avoids wasted retry loops).  Pre-warm
-                    // was triggered by the first instance; calling it again
-                    // is a no-op (cache check).
-                    MODELS_STATE.store(ModelState::Ready, Ordering::Release);
-                    info!("Voice models already loaded by another task");
-                    set_status(if is_enabled() {
-                        VoiceStatus::Listening
-                    } else {
-                        VoiceStatus::Disabled
-                    });
-                    return;
-                }
-                Err(e) => warn!("Failed to load voice models (will retry): {e}"),
-            },
-            Ok(Err(e)) => warn!("Failed to download voice models (will retry): {e}"),
-            Err(_) => warn!("Voice model download timed out (will retry)"),
-        }
-
-        if MODELS_STATE.load(Ordering::Acquire) == ModelState::Failed {
-            return;
-        }
-
-        tokio::time::sleep(retry_delay).await;
-        retry_delay = (retry_delay * 2).min(Duration::from_mins(2));
-    }
+        },
+    )
+    .await;
 }
 
 /// Atomically reset the model state from `Failed` to `Uninit`, claim `Loading`
