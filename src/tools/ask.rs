@@ -291,15 +291,15 @@ async fn run_ask_with_job(
         let mut slots: Vec<AskSlot> = Vec::with_capacity(PARALLEL_ANALYST_COUNT);
         let mut agents: Vec<crate::jobs::NewAgent> = Vec::with_capacity(PARALLEL_ANALYST_COUNT);
         for i in 0..PARALLEL_ANALYST_COUNT {
-            let (agent_id, task) = analyst_slot(ws, &angles, &suffix, i, ask);
+            let slot = analyst_slot(ws, &angles, &suffix, i, ask);
             agents.push(crate::jobs::NewAgent {
-                agent_id: agent_id.clone(),
+                agent_id: slot.agent_id.clone(),
                 kind: crate::jobs::AgentKind::Analyst,
                 idx: Some(i64::try_from(i).unwrap_or(i64::MAX)),
                 role: crate::Role::Analyst,
-                task: task.clone(),
+                task: slot.task.clone(),
             });
-            slots.push(AskSlot { agent_id, task });
+            slots.push(slot);
         }
         crate::jobs::spawn_job(
             &crate::session::store().conn,
@@ -841,23 +841,20 @@ pub(crate) fn load_analyst_angles() -> Vec<String> {
     load_prompt_sections("ask/angles.md")
 }
 
-/// Compose an analyst's agent id and task (angle appended to the ask).
+/// Compose an analyst's roster slot (angle appended to the ask).
 /// KV-cache discipline: vary ONLY the user message (the research
 /// angle) — never per-analyst model/effort/tools.
-fn analyst_slot(
-    ws: &Workspace,
-    angles: &[String],
-    suffix: &str,
-    i: usize,
-    ask: &str,
-) -> (String, String) {
+fn analyst_slot(ws: &Workspace, angles: &[String], suffix: &str, i: usize, ask: &str) -> AskSlot {
     let angle = angles.get(i).cloned().unwrap_or_default();
     let task = if angle.is_empty() {
         ask.to_string()
     } else {
         format!("{ask}\n\nResearch angle:\n{angle}")
     };
-    (format!("ask_{}_{}_{}_analyst", ws.name, suffix, i), task)
+    AskSlot {
+        agent_id: format!("ask_{}_{}_{}_analyst", ws.name, suffix, i),
+        task,
+    }
 }
 
 /// Run `count` parallel analyst agents with decorrelated research angles,
@@ -873,46 +870,11 @@ async fn run_parallel_analysts(
 ) -> Vec<AskRun> {
     let suffix = crate::generate_suffix();
     let angles = load_analyst_angles();
-    let members: Vec<_> = (0..count)
-        .map(|i| {
-            let ws = ws.clone();
-            let suffix = suffix.clone();
-            let (agent_id, analyst_ask) = analyst_slot(&ws, &angles, &suffix, i, ask);
-            move |round| async move {
-                run_agent(
-                    agent_id,
-                    Role::Analyst,
-                    &ws,
-                    None,
-                    &analyst_ask,
-                    String::new(),
-                    String::new(),
-                    None,
-                    false,
-                    Some(round),
-                )
-                .await
-            }
-        })
+    let slots: Vec<AskSlot> = (0..count)
+        .map(|i| analyst_slot(ws, &angles, &suffix, i, ask))
         .collect();
-    let handles = crate::agent::spawn_staggered_round(members, false).await;
-    await_round_members(handles, deadline)
-        .await
-        .into_iter()
-        .enumerate()
-        .map(|(i, m)| match m {
-            RoundMember::Done((agent, response)) => AskRun::Completed { agent, response },
-            RoundMember::TimedOut => AskRun::Failed {
-                reason: format!("analyst {i} still running when the round deadline expired"),
-            },
-            RoundMember::Panicked => AskRun::Failed {
-                reason: format!("analyst {i} task panicked"),
-            },
-            RoundMember::Cancelled => AskRun::Failed {
-                reason: format!("analyst {i} task was cancelled"),
-            },
-        })
-        .collect()
+    let slot_refs: Vec<&AskSlot> = slots.iter().collect();
+    run_ask_slots(ws, &slot_refs, deadline, false).await
 }
 
 /// Consolidate analyst runs: 0 valid → error, 1 valid → raw passthrough,
