@@ -7,7 +7,9 @@ use serde::de::DeserializeOwned;
 use std::time::Instant;
 
 use crate::prompt::load_prompt;
-use crate::retry::{FailureClass, RetryFailureRecord, RetryLoop, RetryPolicy};
+use crate::retry::{
+    FailureClass, RetryExhausted, RetryFailureRecord, RetryLoop, RetryPolicy, fail_exhausted,
+};
 use crate::util::json::parse_fenced_json;
 use crate::{ChatMessage, ChatRequest, ExtractionValidator};
 
@@ -37,7 +39,7 @@ use crate::{ChatMessage, ChatRequest, ExtractionValidator};
 /// classification — a garbage score never passes any gate. It must be
 /// `Send + Sync` because extraction runs inside `join_all` futures.
 ///
-/// Terminal failure is [`crate::retry::RetryExhausted`] — it carries the
+/// Terminal failure is [`RetryExhausted`] — it carries the
 /// last-attempt raw text (`last_raw`, for verdict-extraction ticket comments) plus
 /// the per-attempt diagnostics trail.
 #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
@@ -47,7 +49,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
     params: &ChatRequest,
     validate: Option<&ExtractionValidator<T>>,
     policy_override: Option<&RetryPolicy>,
-) -> Result<T, crate::retry::RetryExhausted> {
+) -> Result<T, RetryExhausted> {
     let mut extraction_history = history.to_vec();
     let operation_started = Instant::now();
 
@@ -75,13 +77,12 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
 
     for attempt in 1..=policy.max_attempts {
         if loop_state.expired() {
-            let exhausted = crate::retry::RetryExhausted::with_last_raw(
+            let exhausted = RetryExhausted::with_last_raw(
                 loop_state.into_failures(),
                 FailureClass::WallClockExceeded,
                 last_raw,
             );
-            crate::stats::record_llm_failure(&record_request, operation_started, &exhausted).await;
-            return Err(exhausted);
+            return fail_exhausted(&record_request, operation_started, exhausted).await;
         }
 
         let attempt_started = Instant::now();
@@ -167,43 +168,29 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                 let non_retryable = !scoped_err.class.is_retryable();
                 loop_state.record(attempt, scoped_err.record).await;
                 if non_retryable {
-                    let exhausted = crate::retry::RetryExhausted::with_last_raw(
+                    let exhausted = RetryExhausted::with_last_raw(
                         loop_state.into_failures(),
                         scoped_err.class,
                         last_raw,
                     );
-                    crate::stats::record_llm_failure(
-                        &record_request,
-                        operation_started,
-                        &exhausted,
-                    )
-                    .await;
-                    return Err(exhausted);
+                    return fail_exhausted(&record_request, operation_started, exhausted).await;
                 }
             }
         }
 
         if let Err(class) = loop_state.sleep_between(attempt).await {
-            let exhausted = crate::retry::RetryExhausted::with_last_raw(
-                loop_state.into_failures(),
-                class,
-                last_raw,
-            );
-            crate::stats::record_llm_failure(&record_request, operation_started, &exhausted).await;
-            return Err(exhausted);
+            let exhausted =
+                RetryExhausted::with_last_raw(loop_state.into_failures(), class, last_raw);
+            return fail_exhausted(&record_request, operation_started, exhausted).await;
         }
     }
 
     // Exhausted — report the last failure's class so operators see e.g.
     // out-of-range-score (never a garbage pass) rather than a generic class.
     let final_class = loop_state.final_class();
-    let exhausted = crate::retry::RetryExhausted::with_last_raw(
-        loop_state.into_failures(),
-        final_class,
-        last_raw,
-    );
-    crate::stats::record_llm_failure(&record_request, operation_started, &exhausted).await;
-    Err(exhausted)
+    let exhausted =
+        RetryExhausted::with_last_raw(loop_state.into_failures(), final_class, last_raw);
+    fail_exhausted(&record_request, operation_started, exhausted).await
 }
 
 #[cfg(test)]

@@ -618,6 +618,19 @@ impl fmt::Display for RetryExhausted {
 
 impl std::error::Error for RetryExhausted {}
 
+/// Record the failure telemetry and return the terminal `Err` — the shared
+/// hard-fail tail of every retry-loop exit. Fail-open loops (research
+/// synthesis partial output, consensus repair fallback) record then continue,
+/// so they deliberately bypass this helper.
+pub(crate) async fn fail_exhausted<T>(
+    request: &ChatRequest,
+    operation_started: Instant,
+    exhausted: RetryExhausted,
+) -> Result<T, RetryExhausted> {
+    crate::stats::record_llm_failure(request, operation_started, &exhausted).await;
+    Err(exhausted)
+}
+
 // ── Shared retry-loop state (schedule + failure trail) ───────────────────
 
 /// Mutable per-operation state shared by the outer retry loops.
@@ -748,8 +761,7 @@ pub(crate) async fn agent_chat(
     for attempt in 1..=policy.max_attempts {
         if loop_state.expired() {
             let exhausted = RetryExhausted::wall_clock(loop_state.into_failures());
-            crate::stats::record_llm_failure(&request, operation_started, &exhausted).await;
-            return Err(exhausted);
+            return fail_exhausted(&request, operation_started, exhausted).await;
         }
 
         match crate::providers::chat_scoped(
@@ -768,24 +780,21 @@ pub(crate) async fn agent_chat(
                 loop_state.record(attempt, err.record).await;
                 if non_retryable {
                     let exhausted = RetryExhausted::new(loop_state.into_failures(), err.class);
-                    crate::stats::record_llm_failure(&request, operation_started, &exhausted).await;
-                    return Err(exhausted);
+                    return fail_exhausted(&request, operation_started, exhausted).await;
                 }
             }
         }
 
         if let Err(FailureClass::Shutdown) = loop_state.sleep_between(attempt).await {
             let exhausted = RetryExhausted::shutdown(loop_state.into_failures());
-            crate::stats::record_llm_failure(&request, operation_started, &exhausted).await;
-            return Err(exhausted);
+            return fail_exhausted(&request, operation_started, exhausted).await;
         }
     }
 
     // Exhausted — report the last failure's class.
     let final_class = loop_state.final_class();
     let exhausted = RetryExhausted::new(loop_state.into_failures(), final_class);
-    crate::stats::record_llm_failure(&request, operation_started, &exhausted).await;
-    Err(exhausted)
+    fail_exhausted(&request, operation_started, exhausted).await
 }
 
 #[cfg(test)]
