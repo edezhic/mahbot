@@ -3,6 +3,25 @@
 //! Invoked as `mahbot debug --db <name> "SQL query"` from the command line.
 //! Skips tracing initialization, lock acquisition, and GUI startup.
 //!
+//! Two further verbs target forensic artifact families (quarantine and
+//! pre-reindex records — static snapshots of a store family renamed aside at
+//! boot, never deleted):
+//!
+//! - `mahbot debug families [--db <name>]` — list every quarantine and
+//!   pre-reindex family in the store directory with its original store,
+//!   artifact type, timestamp, total size, and a file-set/header
+//!   classification. No database is opened.
+//! - `mahbot debug --family <id> "SQL query"` — query one family with the
+//!   same read-only guarantees as live stores. Families are static
+//!   snapshots: none of the live-store layers apply (no flock gate, no
+//!   artifact pre-check, no torn-frame retry, no lock-drop verification),
+//!   and the engine opens without multiprocess WAL (legacy read-only WAL
+//!   path). The legacy path still probes a present `.tshm`, so families that
+//!   carry one are copied to an OS temp dir first (the copy omits the
+//!   `.tshm`); the family files themselves are never modified and no new
+//!   files appear beside them. Engine panics on corrupt families are caught
+//!   and reported as clean errors instead of crashing the CLI.
+//!
 //! ## Genuinely read-only
 //!
 //! The CLI opens every store through `turso::core::Database::open_file_with_flags`
@@ -113,13 +132,18 @@ const SAFE_PRAGMAS: &[&str] = &[
 /// Torn-frame / WAL-inconsistency error signatures (lowercased substring
 /// match). Error variants are stringified at the SDK/engine boundary, so
 /// signature matching is the robust detection mechanism.
+///
+/// The list mirrors turso_core 0.7.2's user-facing error texts — the four
+/// `CompletionError` display strings plus `Corrupt("Invalid page type: …")`.
+/// (A bare "torn" word is deliberately absent: it appears in no turso_core
+/// error text, only comments and test panics, and would misclassify user SQL
+/// like "no such table: torn_table" as store corruption.)
 const TORN_FRAME_SIGNATURES: &[&str] = &[
     "short read on wal frame",
     "short read on page",
     "invalid page type",
     "wal frame page mismatch",
     "checksum mismatch",
-    "torn",
 ];
 
 /// Maximum attempts (including the first) for a torn-frame open/query failure.
@@ -408,6 +432,31 @@ async fn flock_gate_with_timeout(
     }
 }
 
+/// Resolve the mahbot storage root: the test/snapshot override or `~/.mahbot`.
+fn resolve_home(home_override: Option<PathBuf>) -> Result<PathBuf> {
+    match home_override {
+        Some(home) => Ok(home),
+        None => crate::config::default_config_dir(),
+    }
+}
+
+/// Write `text` to stdout, mapping a closed pipe (EPIPE) to an ordinary
+/// error instead of a panic — `println!`/`print!` panic on a closed stdout,
+/// which would surface as a misleading failure (or crash) in piped
+/// invocations. Single wording for every explicit stdout write.
+fn write_stdout(text: &str) -> Result<()> {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|e| anyhow!("{STDOUT_WRITE_ERROR_PREFIX}{e}"))
+}
+
+/// Print one line to stdout (EPIPE-safe, see [`write_stdout`]).
+fn print_line(args: std::fmt::Arguments<'_>) -> Result<()> {
+    write_stdout(&format!("{args}\n"))
+}
+
 /// `mahbot debug detect [--db <name>]` — run the full coordination-state
 /// predicate over the stores without opening them. Prints one line per store
 /// (`name\tclass\twal_size=N\tblocking=B`). Exit 0 when all stores are healthy
@@ -416,10 +465,7 @@ async fn flock_gate_with_timeout(
 /// index, unreadable `.tshm`) are reported but are not failures, mirroring the
 /// checkpoint loop's severity split.
 fn run_debug_detect(args: &[String], home_override: Option<PathBuf>) -> Result<()> {
-    let mahbot_home = match home_override {
-        Some(home) => home,
-        None => crate::config::default_config_dir()?,
-    };
+    let mahbot_home = resolve_home(home_override)?;
     let selected = match args.get(3).map(String::as_str) {
         Some("--db") => match args.get(4) {
             Some(name) => vec![name.clone()],
@@ -441,13 +487,13 @@ fn run_debug_detect(args: &[String], home_override: Option<PathBuf>) -> Result<(
             wal_guard::StoreFds::none(),
         );
         let blocking = status.class.blocks_checkpoint();
-        println!(
+        print_line(format_args!(
             "{}\t{}\twal_size={}\tblocking={}",
             name,
             status.class.label(),
             status.wal_size,
             blocking,
-        );
+        ))?;
         // Exit 1 only for the checkpoint-blocking classes; warn-only classes
         // (oversized WAL, torn-pre index, unreadable .tshm) are reported but
         // are not failures — they mirror the checkpoint loop's severity split.
@@ -461,6 +507,453 @@ fn run_debug_detect(args: &[String], home_override: Option<PathBuf>) -> Result<(
     Ok(())
 }
 
+// ── Forensic families (quarantine / pre-reindex) ─────────────────────────
+
+/// Artifact type of a forensic family. Variant order is the listing sort order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum FamilyKind {
+    /// Renamed-aside artifact family (the boot corruption record; never deleted).
+    Quarantine,
+    /// Pre-repair copy taken before an in-place REINDEX.
+    PreReindex,
+}
+
+impl FamilyKind {
+    #[must_use]
+    fn label(self) -> &'static str {
+        match self {
+            Self::Quarantine => "quarantine",
+            Self::PreReindex => "pre-reindex",
+        }
+    }
+}
+
+/// One forensic family discovered in the store directory.
+#[derive(Debug)]
+struct FamilyInfo {
+    /// Base file name — the id fed back into `--family <id>`.
+    id: String,
+    /// Original store name (the family's `{store}.db` prefix).
+    store: String,
+    kind: FamilyKind,
+    /// `%Y%m%dT%H%M%SZ` stamp from the family name.
+    stamp: String,
+    /// Total size in bytes of every present family file.
+    size: u64,
+    /// File-set/header classification (family-specific — never the live-store
+    /// wal_guard coordination labels, which are meaningless for static files).
+    class: FamilyClass,
+    /// Present members, comma-joined (`db,wal,shm,tshm`).
+    files: String,
+}
+
+/// State classification of one forensic family (snapshot semantics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FamilyClass {
+    /// Main DB present with a valid header and every expected sidecar present.
+    Complete,
+    /// Main DB present with a valid header but some expected sidecars missing.
+    Partial,
+    /// Main DB present but its header is corrupt/empty — queryable, likely fails.
+    BadHeader,
+    /// No main DB file (coordination-sidecar-only quarantine) — not queryable.
+    SidecarOnly,
+}
+
+impl FamilyClass {
+    #[must_use]
+    fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::BadHeader => "bad-header",
+            Self::SidecarOnly => "sidecar-only",
+        }
+    }
+}
+
+/// Parsed family-name components (see [`parse_family_name`]).
+#[derive(Debug)]
+pub(crate) struct FamilyMeta {
+    pub(crate) store: String,
+    pub(crate) kind: FamilyKind,
+    pub(crate) stamp: String,
+}
+
+/// Parse a forensic-family base file name:
+/// `{store}.db.quarantine-{stamp}-{pid}[-{seq}]` or
+/// `{store}.db.pre-reindex-{stamp}-{pid}` (stamp = `%Y%m%dT%H%M%SZ`).
+///
+/// Rejects sidecar members (`-wal`/`-shm`/`-tshm` suffixes), foreign files,
+/// and any path-like name — the path-safety gate for `--family <id>`: only a
+/// parsed family id reaches `root/db/<id>`. The stamp is shape-checked
+/// (16 chars, digits around `T`/`Z`), not calendar-validated; a store name of
+/// `.` or `..` parses (flat filename — no traversal possible).
+///
+/// The formats are written by `turso.rs::quarantine_family` (quarantine) and
+/// the pre-reindex snapshot in `turso.rs` (REINDEX repair) — keep both sides
+/// of the naming contract in sync; the writer round-trip test locks the
+/// coupling.
+pub(crate) fn parse_family_name(name: &str) -> Option<FamilyMeta> {
+    let (kind, marker) = if name.contains(".quarantine-") {
+        (FamilyKind::Quarantine, ".quarantine-")
+    } else if name.contains(".pre-reindex-") {
+        (FamilyKind::PreReindex, ".pre-reindex-")
+    } else {
+        return None;
+    };
+    let (prefix, tail) = name.split_once(marker)?;
+    let store = prefix.strip_suffix(".db")?;
+    if store.is_empty() || store.contains('/') || store.contains('\\') {
+        return None;
+    }
+    // tail = "{stamp}-{pid}[-{seq}]"
+    let (stamp, pid_rest) = tail.split_once('-')?;
+    if !is_family_stamp(stamp) {
+        return None;
+    }
+    let (pid, seq) = match pid_rest.split_once('-') {
+        Some((pid, seq)) => (pid, seq),
+        None => (pid_rest, ""),
+    };
+    if pid.is_empty() || pid_rest.ends_with('-') || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Pre-reindex names never carry a seq suffix; both reject non-digit tails.
+    if kind == FamilyKind::PreReindex && !seq.is_empty() {
+        return None;
+    }
+    if !seq.is_empty() && !seq.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(FamilyMeta {
+        store: store.to_string(),
+        kind,
+        stamp: stamp.to_string(),
+    })
+}
+
+/// True for the `%Y%m%dT%H%M%SZ` stamp shape (16 chars, digits around `T`/`Z`).
+fn is_family_stamp(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 16
+        && b[8] == b'T'
+        && b[15] == b'Z'
+        && b[..8].iter().all(u8::is_ascii_digit)
+        && b[9..15].iter().all(u8::is_ascii_digit)
+}
+
+/// Discover all forensic families under `root/db/` and classify them.
+///
+/// Families are found from their base file name or from sidecar-only members
+/// (a coordination-sidecar quarantine has no base file). Foreign files
+/// (`.DS_Store`, live stores) are ignored. Sorted by (store, kind, stamp).
+fn list_families(root: &Path) -> Result<Vec<FamilyInfo>> {
+    let db_dir = root.join("db");
+    // Fresh install: no store directory yet — nothing to list, not an error.
+    let entries = match std::fs::read_dir(&db_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("failed to read store directory: {}", db_dir.display()));
+        }
+    };
+    let names: Vec<String> = entries
+        .map(|e| {
+            e.map(|e| e.file_name().to_string_lossy().into_owned())
+                .with_context(|| format!("failed to read entry in {}", db_dir.display()))
+        })
+        .collect::<Result<_>>()?;
+
+    // Base names first; then sidecar-only families (entries whose base never
+    // appeared — a sidecar-only quarantine moves only `-wal`/`-shm`/`-tshm`).
+    let mut bases: std::collections::BTreeMap<String, FamilyMeta> =
+        std::collections::BTreeMap::new();
+    for name in &names {
+        if let Some(meta) = parse_family_name(name) {
+            bases.insert(name.clone(), meta);
+        }
+    }
+    for name in &names {
+        for suffix in ["-wal", "-shm", "-tshm"] {
+            if let Some(base) = name.strip_suffix(suffix) {
+                if !bases.contains_key(base)
+                    && let Some(meta) = parse_family_name(base)
+                {
+                    bases.insert(base.to_string(), meta);
+                }
+                break;
+            }
+        }
+    }
+
+    let mut families: Vec<FamilyInfo> = bases
+        .into_iter()
+        .map(|(id, meta)| classify_family(root, id, meta))
+        .collect();
+    families.sort_by(|a, b| (&a.store, a.kind, &a.stamp).cmp(&(&b.store, b.kind, &b.stamp)));
+    Ok(families)
+}
+
+/// Classify one family's file set — pure filesystem inspection, never opens.
+fn classify_family(root: &Path, id: String, meta: FamilyMeta) -> FamilyInfo {
+    let db_path = root.join("db").join(&id);
+    // Expected members per family kind — one source of truth for both the
+    // listing and the Complete check. `-shm` is deliberately not expected:
+    // the engine never creates it (turso_core 0.7.2 has no `-shm`
+    // references), so a complete quarantine is db + wal + tshm — requiring
+    // `-shm` would label every real full quarantine as `partial`. A leftover
+    // foreign `-shm` still counts toward the listing below.
+    let expected: &[(&str, &'static str)] = match meta.kind {
+        FamilyKind::Quarantine => &[("", "db"), ("-wal", "wal"), ("-tshm", "tshm")],
+        FamilyKind::PreReindex => &[("", "db"), ("-wal", "wal")],
+    };
+    let mut members: Vec<&'static str> = Vec::new();
+    let mut size: u64 = 0;
+    for (suffix, label) in expected {
+        let path = db_path.with_file_name(format!("{id}{suffix}"));
+        if let Ok(md) = std::fs::metadata(&path)
+            && md.is_file()
+        {
+            members.push(label);
+            size += md.len();
+        }
+    }
+    let shm = db_path.with_file_name(format!("{id}-shm"));
+    if let Ok(md) = std::fs::metadata(&shm)
+        && md.is_file()
+    {
+        members.push("shm");
+        size += md.len();
+    }
+    let class = if !members.contains(&"db") {
+        FamilyClass::SidecarOnly
+    } else if !db_header_ok(&db_path) {
+        FamilyClass::BadHeader
+    } else if expected.iter().all(|(_, label)| members.contains(label)) {
+        FamilyClass::Complete
+    } else {
+        FamilyClass::Partial
+    };
+    FamilyInfo {
+        id,
+        store: meta.store,
+        kind: meta.kind,
+        stamp: meta.stamp,
+        size,
+        class,
+        files: members.join(","),
+    }
+}
+
+/// Main-DB header sanity without opening the database: SQLite magic plus a
+/// valid page size (the same checks wal_guard applies to live stores). Page
+/// size 65536 is encoded as 0x0001 per the SQLite header format.
+fn db_header_ok(db_path: &Path) -> bool {
+    const MAGIC: &[u8; 16] = b"SQLite format 3\0";
+    let Ok(meta) = std::fs::metadata(db_path) else {
+        return false;
+    };
+    if meta.len() < 100 {
+        return false; // empty or truncated header
+    }
+    let mut header = [0u8; 18];
+    let Ok(mut f) = std::fs::File::open(db_path) else {
+        return false;
+    };
+    if std::io::Read::read_exact(&mut f, &mut header).is_err() {
+        return false;
+    }
+    if &header[..16] != MAGIC {
+        return false;
+    }
+    let raw = u16::from_be_bytes([header[16], header[17]]);
+    let page_size = if raw == 1 { 65_536 } else { u32::from(raw) };
+    (512..=65_536).contains(&page_size) && page_size.is_power_of_two()
+}
+
+/// `mahbot debug families [--db <name>]` — list all forensic families
+/// (quarantine + pre-reindex) without opening any database. Informational:
+/// exits 0 whether or not families exist.
+fn run_debug_families(args: &[String], home_override: Option<PathBuf>) -> Result<()> {
+    let mahbot_home = resolve_home(home_override)?;
+    let mut families = list_families(&mahbot_home)?;
+    // `--db <name>` filters by store name; a name matching nothing (canonical
+    // store with no families, unknown/legacy name) prints nothing and exits 0
+    // — the filter never depends on the current listing content.
+    let filter = match args.get(3).map(String::as_str) {
+        Some("--db") => match args.get(4) {
+            Some(name) => Some(name.clone()),
+            None => bail!("expected: mahbot debug families --db <name>"),
+        },
+        Some(other) => bail!("invalid families argument '{other}'"),
+        None => None,
+    };
+    if let Some(store) = filter {
+        families.retain(|fam| fam.store == store);
+    }
+    for fam in &families {
+        print_line(format_args!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            fam.id,
+            fam.store,
+            fam.kind.label(),
+            fam.stamp,
+            fam.size,
+            fam.class.label(),
+            fam.files
+        ))?;
+    }
+    Ok(())
+}
+
+/// A temp-dir copy of a tshm-bearing family's `db` + `-wal` (the documented
+/// snapshot read set). Created and removed around one query so the family's
+/// own files — the forensic record — are never opened by the engine at all
+/// (a possibly-corrupt `.tshm` would otherwise be probed/mapped by turso).
+/// `tempfile` creates the dir 0700 with a collision-free random name and
+/// `TempDir`'s Drop removes it on every path — early returns, copy failures,
+/// and normal completion.
+struct TempFamily {
+    _dir: tempfile::TempDir,
+    db_path: std::path::PathBuf,
+}
+
+impl TempFamily {
+    fn create(db_path: &Path) -> Result<Self> {
+        let name = db_path
+            .file_name()
+            .with_context(|| format!("family path must have a file name: {}", db_path.display()))?;
+        let dir = tempfile::Builder::new()
+            .prefix("mahbot-debug-family-")
+            .tempdir()
+            .with_context(|| "failed to create family query temp dir")?;
+        let copy = dir.path().join(name);
+        copy_file(db_path, &copy, "database")?;
+        let wal = turso_mod::store_sidecars(db_path).wal;
+        if wal.exists() {
+            copy_file(
+                &wal,
+                &dir.path().join(format!("{}-wal", name.to_string_lossy())),
+                "WAL",
+            )?;
+        }
+        Ok(Self {
+            db_path: copy,
+            _dir: dir,
+        })
+    }
+
+    #[must_use]
+    fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+}
+
+/// Copy one family file into the temp dir with private (0600) permissions.
+fn copy_file(src: &Path, dst: &Path, what: &str) -> Result<()> {
+    std::fs::copy(src, dst)
+        .with_context(|| format!("failed to copy family {what} to {}", dst.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// Open a forensic family read-only and execute `sql`, returning the rendered
+/// output. Split from [`query_family`] so tests can assert result values
+/// instead of only success.
+///
+/// Snapshot semantics: the family is static, so none of the live-store layers
+/// apply — no flock gate, no artifact pre-check, no torn-frame retry, no
+/// post-open lock-drop verification. The engine opens without multiprocess
+/// WAL (legacy read-only WAL path reads `db` + `-wal` directly — note it still
+/// probes a present `.tshm` via `reject_live_multiprocess_wal_for_legacy_open`,
+/// so a family carrying a `.tshm` is copied to an OS temp dir first, omitting
+/// the coordination file; the no-touch guarantee comes from the copy, not the
+/// opts). The whole open+query is panic-guarded: a damaged family yields a
+/// clean error.
+fn execute_family_query(family_id: &str, sql: &str, root: &Path) -> Result<String> {
+    parse_family_name(family_id).with_context(|| {
+        format!("invalid family id '{family_id}' — list valid ids with `mahbot debug families`")
+    })?;
+    let db_path = root.join("db").join(family_id);
+    if !db_path.exists() {
+        // A sidecar-only family (no base file — a quarantine that moved only
+        // sidecars, or a failed pre-reindex copy) is a real family that cannot
+        // be opened; a well-formed id with no member at all is a stale or
+        // hand-constructed id — report the two distinctly.
+        let any_member = ["-wal", "-shm", "-tshm"]
+            .iter()
+            .any(|s| db_path.with_file_name(format!("{family_id}{s}")).exists());
+        if any_member {
+            bail!(
+                "forensic family '{family_id}' has no main database file — \
+                 the family cannot be queried"
+            );
+        }
+        bail!(
+            "forensic family '{family_id}' not found — list valid ids with \
+             `mahbot debug families`"
+        );
+    }
+    // Snapshot semantics: the main file must be a regular file — a symlink
+    // could redirect the open to a live store, bypassing the flock gate and
+    // live heuristics the `--db` path applies.
+    let md = std::fs::symlink_metadata(&db_path)
+        .with_context(|| format!("cannot stat forensic family '{family_id}'"))?;
+    if !md.file_type().is_file() {
+        bail!("forensic family '{family_id}' main file is not a regular file — refusing to open");
+    }
+    let sidecars = turso_mod::store_sidecars(&db_path);
+    // tshm-bearing families are copied to a temp dir (never opened in place).
+    let temp = if sidecars.tshm.exists() {
+        Some(TempFamily::create(&db_path)?)
+    } else {
+        None
+    };
+    let target = temp.as_ref().map_or(db_path.as_path(), |t| t.db_path());
+    let result = guard_panics(|| {
+        let (io, db) = open_readonly(target, &db_path, turso_mod::family_database_opts())?;
+        connect_execute(&io, &db, sql, &db_path)
+    });
+    drop(temp);
+    match result {
+        Ok(output) => Ok(output),
+        // An engine panic takes precedence over the string-level torn-frame
+        // classification (a panic payload could itself mention a torn frame).
+        // The arm is gated by `is_engine_panic_error`, so `{e:#}` already
+        // starts with the prefix — a single message, no double-named chain.
+        Err(e) if is_engine_panic_error(&e) => {
+            bail!("forensic family '{family_id}' could not be read — {e:#}")
+        }
+        // Static snapshot: a torn-frame/page read means the family's on-disk
+        // data itself is corrupt, not a transient artifact. Never leak the raw
+        // engine text (it is itself a torn-frame signature).
+        Err(e) if is_torn_frame_error(&e) => {
+            bail!(
+                "forensic family '{family_id}' data is corrupt or internally inconsistent \
+                 (the read produced a WAL/page error) — the family is a static snapshot; \
+                 restore it from the original store if a healthy copy exists"
+            )
+        }
+        Err(e) => {
+            Err(e).with_context(|| format!("forensic family '{family_id}' could not be read"))
+        }
+    }
+}
+
+/// `mahbot debug --family <id> "SQL query"` — execute and print.
+fn query_family(family_id: &str, sql: &str, root: &Path) -> Result<()> {
+    let output = execute_family_query(family_id, sql, root)?;
+    // Write explicitly: a closed stdout (EPIPE) surfaces as an ordinary I/O
+    // error, never a panic misreported as an engine crash.
+    write_stdout(&output)
+}
+
 /// Testable core of [`run_debug`].
 ///
 /// `args` has the same shape as `std::env::args()` (`args[0]` is the program
@@ -469,8 +962,12 @@ fn run_debug_detect(args: &[String], home_override: Option<PathBuf>) -> Result<(
 /// by the snapshot-copy procedure).
 async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) -> Result<()> {
     // args[0] = "mahbot", args[1] = "debug"
-    // Handle --help: mahbot debug --help
-    if args.get(2).is_some_and(|a| a == "--help") {
+    let tail: Vec<&str> = args.iter().skip(2).map(String::as_str).collect();
+    // Help at any verb position prints the same usage. An exact `--help`
+    // element anywhere in the tail (verb, flags, or trailing position) never
+    // falls through to SQL: store/family ids never equal `--help`, and a SQL
+    // argument of exactly `--help` is a comment, not a statement.
+    if tail.contains(&"--help") {
         print_usage();
         return Ok(());
     }
@@ -478,6 +975,24 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
     // `mahbot debug detect [--db <name>]` — full predicate, no opens, no gate.
     if args.get(2).is_some_and(|a| a == "detect") {
         return run_debug_detect(&args, home_override);
+    }
+
+    // `mahbot debug families [--db <name>]` — list forensic families, no opens.
+    if args.get(2).is_some_and(|a| a == "families") {
+        return run_debug_families(&args, home_override);
+    }
+
+    // `mahbot debug --family <id> "SQL query"` — read-only query on one
+    // forensic family (snapshot semantics: no flock gate, no live heuristics).
+    if args.get(2).is_some_and(|a| a == "--family") {
+        if args.len() < 5 {
+            print_usage();
+            bail!("expected: mahbot debug --family <id> \"SQL query\"");
+        }
+        let mahbot_home = resolve_home(home_override)?;
+        let sql = &args[4];
+        validate_read_only(sql)?;
+        return query_family(&args[3], sql, &mahbot_home);
     }
 
     // Need at least: mahbot debug --db <name> <sql>
@@ -496,10 +1011,7 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
     let sql = &args[4];
 
     // Resolve ~/.mahbot/ (or the test/snapshot override).
-    let mahbot_home = match home_override {
-        Some(home) => home,
-        None => crate::config::default_config_dir()?,
-    };
+    let mahbot_home = resolve_home(home_override)?;
 
     // Validate SQL is read-only before touching any database
     validate_read_only(sql)?;
@@ -520,7 +1032,7 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
     let mut failures = 0usize;
     for (label, file_path) in &db_list {
         if db_name == "all" {
-            println!("=== {label} ===");
+            print_line(format_args!("=== {label} ==="))?;
         }
 
         // Pre-existence check: the read-only open fails on a non-existent
@@ -605,6 +1117,17 @@ async fn query_one_store(
         match open_and_query_readonly(file_path, sql, root, flock_guard) {
             Ok(()) => return Ok(()),
             Err(e) => {
+                // An engine panic is deterministic — never retry it, and
+                // classify it as a panic before the string-level torn-frame
+                // check (the payload could mention a torn frame). Gated by
+                // `is_engine_panic_error`, so `{e:#}` already starts with the
+                // prefix — a single message, no double-named chain.
+                if is_engine_panic_error(&e) {
+                    bail!(
+                        "database '{}' could not be read — {e:#}",
+                        file_path.display()
+                    );
+                }
                 if !is_torn_frame_error(&e) {
                     return Err(e);
                 }
@@ -713,75 +1236,156 @@ fn corruption_error_message(db_path: &Path, retries: usize) -> String {
     }
 }
 
-/// Open a store read-only and execute `sql`, printing pipe-delimited results.
+/// Prefix of [`guard_panics`] errors — shared with the classifier so a wording
+/// change updates both sides (string-matching matches the `is_torn_frame_error`
+/// convention; a marker error type would be more robust but heavier).
+const ENGINE_PANIC_PREFIX: &str = "the database engine panicked while reading the store: ";
+
+/// Prefix of stdout-write failures from [`write_stdout`] — the single wording
+/// for every explicit stdout write (query results, listings, banners), so a
+/// closed pipe surfaces consistently as an I/O error, never a panic.
+const STDOUT_WRITE_ERROR_PREFIX: &str = "failed writing to stdout: ";
+
+/// Run a blocking store open/query under `catch_unwind`, converting a panic
+/// into a clean error — turso_core panics on specific corruption shapes
+/// (pager/wal index OOB — the documented prod class), and the debug CLI must
+/// never crash on a damaged store. The default panic hook is suppressed for
+/// the duration so a caught panic does not spray stderr.
+///
+/// Safety: swapping the process-global panic hook is only sound because the
+/// debug CLI is single-threaded (current-thread tokio runtime in `main.rs`);
+/// a panic on any other thread during the window would be silently swallowed.
+fn guard_panics<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    std::panic::set_hook(prev);
+    match result {
+        Ok(r) => r,
+        Err(payload) => Err(anyhow!(
+            "{ENGINE_PANIC_PREFIX}{}",
+            crate::util::panic_message(&*payload)
+        )),
+    }
+}
+
+/// True for errors produced by [`guard_panics`] (an engine panic, not an
+/// ordinary query/open error). Checked before the string-level torn-frame
+/// classification: a panic payload could itself mention a torn frame.
+fn is_engine_panic_error(err: &anyhow::Error) -> bool {
+    format!("{err:#}").starts_with(ENGINE_PANIC_PREFIX)
+}
+
+/// Open a store file read-only with the given engine opts.
 ///
 /// Uses the low-level `turso::core` API because the SDK `Builder` cannot open
 /// read-only: `OpenFlags::ReadOnly | OpenFlags::NoLock` guarantees the open
-/// cannot create or mutate files, and reuses an existing `.tshm` when present
-/// so live stores are read through the daemon's WAL coordination. The core IO
-/// is synchronous (`FsIO`), so this function is intentionally blocking; the
-/// debug CLI runs on a single-task current-thread runtime.
+/// cannot create or mutate files. The core IO is synchronous (`FsIO`), so
+/// this is intentionally blocking; the debug CLI runs on a single-task
+/// current-thread runtime.
 ///
-/// Query output is buffered and printed only on success: a mid-query failure
-/// (e.g. a torn-frame read) must not leave a partial column header on stdout,
-/// which would be re-printed by the caller's retry loop.
-fn open_and_query_readonly(
-    file_path: &Path,
-    sql: &str,
-    root: &Path,
-    flock_guard: Option<&File>,
-) -> Result<()> {
-    let path_str = file_path
+/// `open_path` is the file actually opened; `display_path` is the identity
+/// named in errors (e.g. a forensic family opened through its temp copy
+/// reports the family, not the OS temp dir).
+fn open_readonly(
+    open_path: &Path,
+    display_path: &Path,
+    opts: turso::core::DatabaseOpts,
+) -> Result<(
+    std::sync::Arc<dyn turso::core::IO>,
+    std::sync::Arc<turso::core::Database>,
+)> {
+    let path_str = open_path
         .to_str()
-        .with_context(|| format!("database path must be UTF-8: {}", file_path.display()))?;
-
+        .with_context(|| format!("database path must be UTF-8: {}", open_path.display()))?;
     let io: std::sync::Arc<dyn turso::core::IO> =
         std::sync::Arc::new(turso::core::PlatformIO::new()?);
     let db = turso::core::Database::open_file_with_flags(
         io.clone(),
         path_str,
         turso::core::OpenFlags::ReadOnly | turso::core::OpenFlags::NoLock,
-        turso_mod::experimental_database_opts(),
+        opts,
         None,
     )
     .map_err(|e| {
         anyhow!(
             "failed to open database '{}' read-only: {e}",
-            file_path.display()
+            display_path.display()
         )
     })?;
+    Ok((io, db))
+}
 
-    // Post-open verification: when the caller does NOT hold the instance
-    // flock (a live daemon does), a free byte-0 right after the open means the
-    // open classified Exclusive — the lock-drop window between the gate and
-    // this open — and the daemon's repair could run concurrently. Abort.
-    // Unix-only: the fcntl byte-0 probe has no Windows equivalent (the gate
-    // is skipped there too).
-    #[cfg(unix)]
-    if flock_guard.is_none() {
-        let tshm = turso_mod::store_sidecars(file_path).tshm;
-        if tshm.exists() && probe_tshm_byte0_pid(&tshm).is_none() {
-            let lock_path = crate::lock_utils::lock_file_path(root);
-            if lock_path.exists() && !probe_flock_free(&lock_path) {
-                bail!(
-                    "live daemon lock-drop detected after open on '{}' — the open \
-                     classified Exclusive, aborting (retry later or query a snapshot copy)",
-                    file_path.display()
-                );
+/// Connect to an opened store and execute `sql`, returning the pipe-delimited
+/// output. Output is buffered and returned only on success: a mid-query
+/// failure (e.g. a torn-frame read) must not leave a partial column header on
+/// stdout, which would be re-printed by the caller's retry loop.
+fn connect_execute(
+    io: &std::sync::Arc<dyn turso::core::IO>,
+    db: &std::sync::Arc<turso::core::Database>,
+    sql: &str,
+    db_path: &Path,
+) -> Result<String> {
+    let conn = db
+        .connect()
+        .map_err(|e| anyhow!("failed to connect to database '{}': {e}", db_path.display()))?;
+    execute_query_readonly(io, &conn, sql, db_path)
+}
+
+/// [`connect_execute`] plus a print to stdout. Write explicitly instead of
+/// `print!`: a closed stdout (EPIPE) surfaces as an ordinary I/O error here
+/// rather than a panic misreported as an engine crash by guard_panics.
+fn connect_execute_print(
+    io: &std::sync::Arc<dyn turso::core::IO>,
+    db: &std::sync::Arc<turso::core::Database>,
+    sql: &str,
+    db_path: &Path,
+) -> Result<()> {
+    let output = connect_execute(io, db, sql, db_path)?;
+    write_stdout(&output)
+}
+
+/// Open a store read-only and execute `sql`, printing pipe-delimited results.
+///
+/// Reuses an existing `.tshm` when present so live stores are read through the
+/// daemon's WAL coordination. The whole open+query is panic-guarded — a
+/// damaged store must yield a clean error, never a CLI crash.
+fn open_and_query_readonly(
+    file_path: &Path,
+    sql: &str,
+    root: &Path,
+    flock_guard: Option<&File>,
+) -> Result<()> {
+    guard_panics(|| {
+        let (io, db) = open_readonly(
+            file_path,
+            file_path,
+            turso_mod::experimental_database_opts(),
+        )?;
+
+        // Post-open verification: when the caller does NOT hold the instance
+        // flock (a live daemon does), a free byte-0 right after the open means
+        // the open classified Exclusive — the lock-drop window between the
+        // gate and this open — and the daemon's repair could run concurrently.
+        // Abort. Unix-only: the fcntl byte-0 probe has no Windows equivalent
+        // (the gate is skipped there too).
+        #[cfg(unix)]
+        if flock_guard.is_none() {
+            let tshm = turso_mod::store_sidecars(file_path).tshm;
+            if tshm.exists() && probe_tshm_byte0_pid(&tshm).is_none() {
+                let lock_path = crate::lock_utils::lock_file_path(root);
+                if lock_path.exists() && !probe_flock_free(&lock_path) {
+                    bail!(
+                        "live daemon lock-drop detected after open on '{}' — the open \
+                         classified Exclusive, aborting (retry later or query a snapshot copy)",
+                        file_path.display()
+                    );
+                }
             }
         }
-    }
 
-    let conn = db.connect().map_err(|e| {
-        anyhow!(
-            "failed to connect to database '{}': {e}",
-            file_path.display()
-        )
-    })?;
-
-    let output = execute_query_readonly(&io, &conn, sql, file_path)?;
-    print!("{output}");
-    Ok(())
+        connect_execute_print(&io, &db, sql, file_path)
+    })
 }
 
 /// Execute a read-only query on a `turso::core` connection and return the
@@ -974,15 +1578,24 @@ fn format_truncation_row(column_count: usize) -> String {
 fn print_usage() {
     eprintln!("Usage: mahbot debug --db <name> \"SQL query\"");
     eprintln!("       mahbot debug detect [--db <name>]");
+    eprintln!("       mahbot debug families [--db <name>]");
+    eprintln!("       mahbot debug --family <id> \"SQL query\"");
     let names = turso_mod::store_names().join(" | ");
-    eprintln!("  --db <name>  {names} | all");
+    eprintln!("  --db <name>  {names} | all (all is only valid for the query verb)");
     eprintln!("  SQL query    read-only SQL, quoted as a single argument");
     eprintln!("  detect       classify coordination state without opening stores");
+    eprintln!("  families     list quarantine/pre-reindex forensic families (--db filters by");
+    eprintln!("               store name; a name matching nothing prints an empty list)");
+    eprintln!("  --family <id>  read-only SQL against one forensic family (id from `families`)");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  mahbot debug --db board \"SELECT phase, COUNT(*) FROM tickets GROUP BY phase\"");
     eprintln!("  mahbot debug --db all \"SELECT name FROM sqlite_master WHERE type='table'\"");
     eprintln!("  mahbot debug detect");
+    eprintln!("  mahbot debug families");
+    eprintln!(
+        "  mahbot debug --family board.db.quarantine-20260812T120000Z-1234 \"SELECT COUNT(*) FROM tickets\""
+    );
 }
 
 #[cfg(test)]
@@ -1054,6 +1667,10 @@ mod tests {
         }
         let unrelated = anyhow!("SQL error: no such table: foo");
         assert!(!is_torn_frame_error(&unrelated));
+        // A user table named "torn_*" must not be misclassified as corruption
+        // (the bare "torn" signature was removed for exactly this reason).
+        let unrelated = anyhow!("SQL error: no such table: torn_table");
+        assert!(!is_torn_frame_error(&unrelated));
     }
 
     #[test]
@@ -1066,7 +1683,10 @@ mod tests {
 
     /// End-to-end: `run_debug_with_args` opens a real (temporary) store
     /// read-only through the `turso::core` path and runs a query against it.
+    /// Serialized: `guard_panics` swaps the process-global panic hook, so
+    /// guard windows must not overlap other debug tests.
     #[tokio::test]
+    #[serial_test::serial(family)]
     async fn run_debug_queries_a_real_store_read_only() {
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         let args = vec![
@@ -1103,6 +1723,7 @@ mod tests {
     /// the on-disk WAL is empty) must produce the explicit artifact error, not
     /// a raw torn-frame read.
     #[tokio::test]
+    #[serial_test::serial(family)]
     async fn run_debug_reports_artifact_instead_of_torn_frame() {
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         let db_dir = dir.path().join("db");
@@ -1176,6 +1797,7 @@ mod tests {
     /// store fails — scripted diagnostics rely on the exit code, so per-store
     /// failures cannot be silently swallowed.
     #[tokio::test]
+    #[serial_test::serial(family)]
     async fn run_debug_all_reports_failure_summary() {
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         let db_dir = dir.path().join("db");
@@ -1210,6 +1832,450 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    // ── forensic-family tests ──────────────────────────────────────────
+
+    /// The listing's family-name parser must round-trip the writer's exact
+    /// naming formats and reject sidecars, foreign files, and malformed names
+    /// — a future writer change breaks this test instead of the listing.
+    #[test]
+    fn family_name_parser_round_trips() {
+        let q = parse_family_name("board.db.quarantine-20260812T120000Z-1234").unwrap();
+        assert_eq!(q.store, "board");
+        assert_eq!(q.kind, FamilyKind::Quarantine);
+        assert_eq!(q.stamp, "20260812T120000Z");
+
+        // Seq-suffixed quarantine (process-local counter, multi-store boots).
+        assert!(parse_family_name("board.db.quarantine-20260812T120000Z-1234-2").is_some());
+
+        // Legacy/non-canonical stores are listed too.
+        assert_eq!(
+            parse_family_name("stats.db.quarantine-20260812T120000Z-7")
+                .unwrap()
+                .store,
+            "stats"
+        );
+
+        let p = parse_family_name("logs.db.pre-reindex-20260812T120000Z-99").unwrap();
+        assert_eq!(p.kind, FamilyKind::PreReindex);
+
+        // Format-focused rejections; the -wal sidecar / path-traversal /
+        // live-store-name cases are covered end-to-end by
+        // `run_debug_family_rejects_invalid_id` at the CLI layer.
+        for bad in [
+            "board.db.quarantine-20260812T120000Z",       // no pid
+            "board.db.quarantine-20260812T120000Z-abc",   // non-digit pid
+            "board.db.quarantine-20260812T120000Z-1234-", // trailing-dash seq
+            "board.db.pre-reindex-20260812T120000Z-99-1", // seq on pre-reindex
+            "board.db.quarantine-12T34-1",                // bad stamp
+        ] {
+            assert!(parse_family_name(bad).is_none(), "must reject: {bad}");
+        }
+    }
+
+    /// Main-DB bytes with a valid SQLite header (magic + 4096-byte page size).
+    fn valid_db_bytes() -> Vec<u8> {
+        let mut b = vec![0u8; 128];
+        b[..16].copy_from_slice(b"SQLite format 3\0");
+        b[16] = 0x10; // page size 4096 (u16 BE)
+        b[17] = 0x00;
+        b
+    }
+
+    /// The listing discovers families from base names and sidecar-only
+    /// members, classifies their file sets, ignores foreign files, and sorts
+    /// by (store, kind, stamp).
+    #[test]
+    fn list_families_classifies_file_sets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+
+        // Complete quarantine: db + wal + tshm (the engine's real sidecar set
+        // — `-shm` is never created by turso_core).
+        let c = "board.db.quarantine-20260812T120000Z-100";
+        std::fs::write(db_dir.join(c), valid_db_bytes()).unwrap();
+        for s in ["-wal", "-tshm"] {
+            std::fs::write(db_dir.join(format!("{c}{s}")), b"x").unwrap();
+        }
+        // Complete pre-reindex: db + wal (no shm/tshm by design).
+        let p = "logs.db.pre-reindex-20260812T120000Z-200";
+        std::fs::write(db_dir.join(p), valid_db_bytes()).unwrap();
+        std::fs::write(db_dir.join(format!("{p}-wal")), b"x").unwrap();
+        // Sidecar-only quarantine: no base file.
+        let s = "sessions.db.quarantine-20260812T120000Z-300";
+        std::fs::write(db_dir.join(format!("{s}-wal")), b"x").unwrap();
+        std::fs::write(db_dir.join(format!("{s}-tshm")), b"x").unwrap();
+        // Partial quarantine: db + wal, missing tshm.
+        let pa = "users.db.quarantine-20260812T120000Z-400";
+        std::fs::write(db_dir.join(pa), valid_db_bytes()).unwrap();
+        std::fs::write(db_dir.join(format!("{pa}-wal")), b"x").unwrap();
+        // Bad-header quarantine: db present, corrupt header.
+        let bh = "config.db.quarantine-20260812T120000Z-500";
+        std::fs::write(db_dir.join(bh), vec![b'x'; 128]).unwrap();
+        // Foreign files / live stores are ignored.
+        std::fs::write(db_dir.join(".DS_Store"), b"").unwrap();
+        std::fs::write(db_dir.join("board.db"), valid_db_bytes()).unwrap();
+
+        let families = list_families(dir.path()).unwrap();
+        let by_id: std::collections::BTreeMap<&str, &FamilyInfo> =
+            families.iter().map(|f| (f.id.as_str(), f)).collect();
+        assert_eq!(by_id.len(), 5, "families: {families:?}");
+        assert_eq!(by_id[c].class, FamilyClass::Complete);
+        assert_eq!(by_id[c].files, "db,wal,tshm");
+        assert_eq!(by_id[p].class, FamilyClass::Complete);
+        assert_eq!(by_id[p].files, "db,wal");
+        assert_eq!(by_id[s].class, FamilyClass::SidecarOnly);
+        assert_eq!(by_id[s].files, "wal,tshm");
+        assert_eq!(by_id[pa].class, FamilyClass::Partial);
+        assert_eq!(by_id[bh].class, FamilyClass::BadHeader);
+        // Sorted by (store, kind, stamp): board, config, logs, sessions, users.
+        let stores: Vec<&str> = families.iter().map(|f| f.store.as_str()).collect();
+        assert_eq!(stores, ["board", "config", "logs", "sessions", "users"]);
+    }
+
+    /// Rename a live store family into a forensic family name (the boot path
+    /// renames, it does not copy; missing sidecars are skipped). Returns the
+    /// moved member file names.
+    fn move_family_aside(db_dir: &Path, base: &Path, fam: &str) -> Vec<String> {
+        let sidecars = turso_mod::store_sidecars(base);
+        let mut moved = Vec::new();
+        for (src, suffix) in [
+            (base, ""),
+            (&sidecars.wal, "-wal"),
+            (&sidecars.shm, "-shm"),
+            (&sidecars.tshm, "-tshm"),
+        ] {
+            if src.exists() {
+                std::fs::rename(src, db_dir.join(format!("{fam}{suffix}"))).unwrap();
+                moved.push(format!("{fam}{suffix}"));
+            }
+        }
+        moved
+    }
+
+    /// (size, mtime) of one file — the no-mutation proof snapshot.
+    fn file_state(path: &Path) -> (u64, std::time::SystemTime) {
+        let md = std::fs::metadata(path).unwrap();
+        (md.len(), md.modified().unwrap())
+    }
+
+    /// End-to-end: a quarantined family (moved db + sidecars, corrupt `.tshm`
+    /// — the forensic case) is queryable via `--family` with the same
+    /// read-only guarantees: the temp-copy path omits the family's `.tshm`,
+    /// and the family files are unchanged with no new files beside them.
+    ///
+    /// Serialized with the other family tests: `guard_panics` swaps the
+    /// process-global panic hook, so overlapping guard windows would lose
+    /// stderr diagnostics from concurrent test panics.
+    #[tokio::test]
+    #[serial_test::serial(family)]
+    async fn run_debug_queries_a_quarantined_family() {
+        let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
+        let db_dir = dir.path().join("db");
+        let fam = "logs.db.quarantine-20260812T120000Z-4242";
+        // One committed verdict row before the move: the query result below
+        // must prove the temp-copy read returns real data, not just "some
+        // query succeeded".
+        store
+            .record_verdict_score("j1", "t1", "review", 0, 9, &[])
+            .await
+            .unwrap();
+        let moved = move_family_aside(&db_dir, &db_dir.join("logs.db"), fam);
+        // Corrupt the family's tshm (garbage — the record of the corruption).
+        std::fs::write(db_dir.join(format!("{fam}-tshm")), vec![0xAB; 64]).unwrap();
+
+        let before: Vec<((u64, std::time::SystemTime), String)> = moved
+            .iter()
+            .map(|name| (file_state(&db_dir.join(name)), name.clone()))
+            .collect();
+
+        let args = vec![
+            "mahbot".to_string(),
+            "debug".to_string(),
+            "--family".to_string(),
+            fam.to_string(),
+            "SELECT COUNT(*) FROM verdict_scores".to_string(),
+        ];
+        run_debug_with_args(args, Some(dir.path().to_path_buf()))
+            .await
+            .expect("quarantined family (corrupt tshm) must be queryable via the temp copy");
+
+        // The family must be untouched and no new files created beside it.
+        for (state, name) in &before {
+            assert_eq!(
+                file_state(&db_dir.join(name)),
+                *state,
+                "family file must be unchanged: {name}"
+            );
+        }
+        let after_names: Vec<String> = std::fs::read_dir(&db_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            after_names.len(),
+            moved.len(),
+            "no new files beside the family: {after_names:?}"
+        );
+
+        // Data fidelity: the same open path returns the committed row count.
+        let out =
+            execute_family_query(fam, "SELECT COUNT(*) FROM verdict_scores", dir.path()).unwrap();
+        assert_eq!(
+            out, "COUNT(*)\n1\n",
+            "temp-copy query must return the committed row"
+        );
+    }
+
+    /// Query-error paths report distinct, clear messages: a sidecar-only
+    /// quarantine (no main DB) and a garbage main DB both fail without
+    /// crashing, naming the family.
+    #[tokio::test]
+    #[serial_test::serial(family)]
+    async fn run_debug_family_error_paths_report_clear_errors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let fam = "logs.db.quarantine-20260812T120000Z-4242";
+        let run = |sql: &str| {
+            let args = vec![
+                "mahbot".to_string(),
+                "debug".to_string(),
+                "--family".to_string(),
+                fam.to_string(),
+                sql.to_string(),
+            ];
+            run_debug_with_args(args, Some(dir.path().to_path_buf()))
+        };
+
+        // Sidecar-only quarantine: listed but not queryable — a clear
+        // sidecar-only message, not a missing-family one.
+        std::fs::write(db_dir.join(format!("{fam}-wal")), b"x").unwrap();
+        let err = run("SELECT 1").await.expect_err("sidecar-only must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no main database file"), "got: {msg}");
+
+        // Garbage main DB: fails turso's clean NotADB magic check (the engine
+        // panic path is exercised separately by `guard_panics_converts_panic`).
+        std::fs::remove_file(db_dir.join(format!("{fam}-wal"))).unwrap();
+        std::fs::write(db_dir.join(fam), vec![0x42; 4096]).unwrap();
+        let err = run("SELECT 1").await.expect_err("garbage db must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(fam), "error must name the family: {msg}");
+    }
+
+    /// `guard_panics` converts a panic into a clean error — the containment
+    /// path a damaged family can trigger inside turso_core.
+    #[test]
+    #[serial_test::serial(family)]
+    fn guard_panics_converts_panic_to_error() {
+        let err = guard_panics(|| -> Result<()> { panic!("boom: pager index OOB") })
+            .expect_err("a panic must surface as an error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("panicked while reading the store"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("boom: pager index OOB"), "got: {msg}");
+        assert!(!is_torn_frame_error(&err), "panic must not be torn-frame");
+        assert!(is_engine_panic_error(&err), "panic must be engine-panic");
+    }
+
+    /// A tshm-less family (pre-reindex shape: db + wal) is queried **in
+    /// place** — the legacy read-only WAL path must not create or modify any
+    /// file beside the family.
+    #[tokio::test]
+    #[serial_test::serial(family)]
+    async fn run_debug_queries_pre_reindex_family_in_place() {
+        let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
+        let db_dir = dir.path().join("db");
+        let fam = "logs.db.pre-reindex-20260812T120000Z-4242";
+        // The committed row lives only in the wal (no checkpoint): the query
+        // result below must show it, behaviorally proving the legacy path
+        // reads db + wal — a db-only read would report COUNT 0.
+        store
+            .record_verdict_score("j1", "t1", "review", 0, 9, &[])
+            .await
+            .unwrap();
+
+        // Move the whole family aside, then drop shm/tshm so the family has
+        // the pre-reindex shape (db + wal, no coordination files).
+        move_family_aside(&db_dir, &db_dir.join("logs.db"), fam);
+        let _ = std::fs::remove_file(db_dir.join(format!("{fam}-shm")));
+        let _ = std::fs::remove_file(db_dir.join(format!("{fam}-tshm")));
+
+        // The moved wal holds the store's schema frames (the test store is
+        // dropped without a checkpoint), so a successful query — with no
+        // tshm to coordinate through — exercises the legacy db + wal read.
+        assert!(
+            std::fs::metadata(db_dir.join(format!("{fam}-wal")))
+                .unwrap()
+                .len()
+                > 0,
+            "pre-reindex wal must hold committed frames"
+        );
+
+        let before: Vec<((u64, std::time::SystemTime), String)> = std::fs::read_dir(&db_dir)
+            .unwrap()
+            .map(|e| {
+                let path = e.unwrap().path();
+                (
+                    file_state(&path),
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+
+        let args = vec![
+            "mahbot".to_string(),
+            "debug".to_string(),
+            "--family".to_string(),
+            fam.to_string(),
+            "SELECT COUNT(*) FROM verdict_scores".to_string(),
+        ];
+        run_debug_with_args(args, Some(dir.path().to_path_buf()))
+            .await
+            .expect("pre-reindex family must be queryable in place");
+
+        // Same no-mutation proof as the temp-copy test: identical file set,
+        // and every file's size + mtime unchanged.
+        let after_names: Vec<String> = std::fs::read_dir(&db_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            after_names.len(),
+            before.len(),
+            "in-place family query must not create files beside the family"
+        );
+        for (state, name) in &before {
+            assert_eq!(
+                file_state(&db_dir.join(name)),
+                *state,
+                "family file must be unchanged: {name}"
+            );
+        }
+
+        // Data fidelity: the wal-only committed row must be visible.
+        let out =
+            execute_family_query(fam, "SELECT COUNT(*) FROM verdict_scores", dir.path()).unwrap();
+        assert_eq!(
+            out, "COUNT(*)\n1\n",
+            "in-place query must read the wal-only row"
+        );
+    }
+
+    /// `--family` rejects ids that are not family names (path-safety gate).
+    #[tokio::test]
+    async fn run_debug_family_rejects_invalid_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for bad in [
+            "../../etc/passwd",
+            "board.db",
+            "board.db.quarantine-20260812T120000Z-1-wal",
+        ] {
+            let args = vec![
+                "mahbot".to_string(),
+                "debug".to_string(),
+                "--family".to_string(),
+                bad.to_string(),
+                "SELECT 1".to_string(),
+            ];
+            let err = run_debug_with_args(args, Some(dir.path().to_path_buf()))
+                .await
+                .expect_err("invalid family id must be rejected");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("invalid family id"), "got: {msg}");
+        }
+    }
+
+    /// Help at any verb position (`--help` standalone, after a verb, after a
+    /// store/family id, misordered, or with trailing args) prints usage and
+    /// exits 0 instead of falling through to running '--help' as a SQL query.
+    #[tokio::test]
+    async fn run_debug_help_after_verb_prints_usage() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for tail in [
+            vec!["--help"],
+            vec!["families", "--help"],
+            vec!["detect", "--help"],
+            vec!["--family", "--help"],
+            vec!["families", "--db", "--help"],
+            vec!["detect", "--db", "--help"],
+            vec!["--db", "--help"],
+            vec!["--family", "--help", "extra"],
+            vec![
+                "--family",
+                "logs.db.quarantine-20260812T120000Z-4242",
+                "--help",
+            ],
+            vec!["--db", "board", "--help"],
+            vec!["--db", "board", "--help", "extra"],
+            vec!["families", "--db", "board", "--help"],
+            vec!["detect", "--db", "board", "--help"],
+            vec!["detect", "--help", "extra"],
+        ] {
+            let mut args = vec!["mahbot".to_string(), "debug".to_string()];
+            args.extend(tail.into_iter().map(str::to_owned));
+            run_debug_with_args(args, Some(dir.path().to_path_buf()))
+                .await
+                .unwrap_or_else(|e| panic!("help must print usage and exit 0: {e:#}"));
+        }
+    }
+
+    /// `families --db <name>` filters silently (a name matching nothing prints
+    /// nothing, exit 0), and a well-formed but non-existent family id reports
+    /// "not found" rather than the sidecar-only message.
+    #[tokio::test]
+    async fn run_debug_families_filters_and_reports_missing_family() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // A name matching no family (canonical store without families,
+        // unknown/legacy name) prints nothing and exits 0 — the filter never
+        // depends on the current listing content.
+        let args = vec![
+            "mahbot".to_string(),
+            "debug".to_string(),
+            "families".to_string(),
+            "--db".to_string(),
+            "nonexistent".to_string(),
+        ];
+        run_debug_with_args(args, Some(dir.path().to_path_buf()))
+            .await
+            .expect("families --db <matching-nothing> must print nothing and exit 0");
+
+        let args = vec![
+            "mahbot".to_string(),
+            "debug".to_string(),
+            "--family".to_string(),
+            "logs.db.quarantine-20260812T120000Z-4242".to_string(),
+            "SELECT 1".to_string(),
+        ];
+        let err = run_debug_with_args(args, Some(dir.path().to_path_buf()))
+            .await
+            .expect_err("a well-formed but missing family must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not found"), "got: {msg}");
+        assert!(!msg.contains("sidecar-only"), "got: {msg}");
+
+        // A legacy (non-canonical) store family appears in the listing and is
+        // --db-filterable, even though store_names() does not know it.
+        let db_dir = dir.path().join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let legacy = "stats.db.quarantine-20260812T120000Z-7";
+        std::fs::write(db_dir.join(legacy), valid_db_bytes()).unwrap();
+        let args = vec![
+            "mahbot".to_string(),
+            "debug".to_string(),
+            "families".to_string(),
+            "--db".to_string(),
+            "stats".to_string(),
+        ];
+        run_debug_with_args(args, Some(dir.path().to_path_buf()))
+            .await
+            .expect("legacy store family must be filterable by --db");
     }
 
     // ── flock-gate tests ───────────────────────────────────────────────

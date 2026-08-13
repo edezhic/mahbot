@@ -193,6 +193,17 @@ pub(crate) fn experimental_database_opts() -> turso::core::DatabaseOpts {
         .with_index_method(true)
 }
 
+/// Engine opts for forensic-family reads (`mahbot debug --family`): the live
+/// feature set minus `multiprocess_wal` — the legacy read-only WAL path reads
+/// `db` + `-wal` directly. Note it still probes a present `.tshm`
+/// (`reject_live_multiprocess_wal_for_legacy_open`), so tshm-bearing families
+/// are opened from a temp copy that omits the coordination file; the
+/// no-touch guarantee lives in that copy, not in these opts.
+#[must_use]
+pub(crate) fn family_database_opts() -> turso::core::DatabaseOpts {
+    experimental_database_opts().with_multiprocess_wal(false)
+}
+
 /// Register a global singleton store.
 ///
 /// This is the canonical init pattern for all DB-backed global stores. Each module
@@ -1527,6 +1538,16 @@ fn classify_repair_target(problems: &[String]) -> RepairTarget {
     }
 }
 
+/// Pre-repair forensic snapshot path (db + wal, no tshm):
+/// `{db}.pre-reindex-{stamp}-{pid}`. The base name must stay parseable by
+/// `debug::parse_family_name` — the writer round-trip test locks the coupling.
+#[must_use]
+pub(crate) fn pre_reindex_snapshot_path(db_path: &Path) -> std::path::PathBuf {
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let pid = std::process::id();
+    std::path::PathBuf::from(format!("{}.pre-reindex-{stamp}-{pid}", db_path.display()))
+}
+
 /// Class-B btree-index desync repair: `quick_check` names a specific
 /// non-FTS index → REINDEX in place, DROP+CREATE as the fallback (both
 /// validated on the 324MB prod sessions copy — both M>N and M<N desync forms,
@@ -1612,9 +1633,7 @@ async fn repair_btree_index_if_desynced(
         }
     };
     // Forensic snapshot (db + wal, no tshm) before the in-place repair.
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-    let pid = std::process::id();
-    let snap = std::path::PathBuf::from(format!("{}.pre-reindex-{stamp}-{pid}", db_path.display()));
+    let snap = pre_reindex_snapshot_path(db_path);
     let sidecars = store_sidecars(db_path);
     for (src, suffix) in [(db_path, ""), (&sidecars.wal, "-wal")] {
         if let Err(e) = std::fs::copy(
@@ -2551,6 +2570,68 @@ mod tests {
             !opts.unsafe_testing,
             "unsafe_testing is not an active experimental feature"
         );
+
+        // Family (forensic-snapshot) reads derive from the live opts minus
+        // multiprocess_wal (legacy read-only WAL path); the no-touch guarantee
+        // comes from the debug CLI's temp copy that omits the `.tshm`, since
+        // the legacy path still probes a present coordination file.
+        let fam = family_database_opts();
+        assert!(
+            fam.enable_index_method,
+            "family reads need index_method (stores are created with it)"
+        );
+        assert!(
+            !fam.enable_multiprocess_wal,
+            "family reads must disable multiprocess_wal (snapshot semantics)"
+        );
+    }
+
+    /// The forensic-family name writers (`quarantine_family`, the pre-reindex
+    /// snapshot helper) must produce names the debug CLI's `--family` parser
+    /// accepts — a writer change that breaks the listing contract fails here,
+    /// not against a stale literal lock.
+    #[test]
+    fn family_writer_names_parse_via_debug_parser() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("board.db");
+        let wal = dir.path().join("board.db-wal");
+        let tshm = dir.path().join("board.db-tshm");
+        for f in [&db_path, &wal, &tshm] {
+            std::fs::write(f, b"x").unwrap();
+        }
+
+        // Quarantine: move db + wal + tshm aside; every moved base name must
+        // be a valid `--family` id (the listing/query contract).
+        assert!(
+            quarantine_family(
+                &db_path,
+                &[(&db_path, ""), (&wal, "-wal"), (&tshm, "-tshm")],
+            ),
+            "quarantine writer must move every existing source"
+        );
+        let moved: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("board.db.quarantine-"))
+            .collect();
+        assert_eq!(moved.len(), 3, "db + wal + tshm moved: {moved:?}");
+        for name in moved {
+            let base = ["-wal", "-tshm"]
+                .iter()
+                .find_map(|s| name.strip_suffix(s))
+                .unwrap_or(&name);
+            let meta = crate::debug::parse_family_name(base).unwrap_or_else(|| {
+                panic!("quarantine writer name must parse as a family id: {name}")
+            });
+            assert_eq!(meta.store, "board");
+            assert_eq!(meta.kind, crate::debug::FamilyKind::Quarantine);
+        }
+
+        // Pre-reindex snapshot: the writer helper's base name must parse too.
+        let snap = pre_reindex_snapshot_path(&db_path);
+        let meta = crate::debug::parse_family_name(snap.file_name().unwrap().to_str().unwrap())
+            .expect("pre-reindex snapshot name must parse as a family id");
+        assert_eq!(meta.kind, crate::debug::FamilyKind::PreReindex);
     }
 
     #[test]
