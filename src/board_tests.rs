@@ -14,6 +14,7 @@ use strum::IntoEnumIterator;
 use tempfile::TempDir;
 
 /// Scenarios for testing invalid prerequisite/supersede inputs.
+#[derive(Debug, Clone, Copy)]
 enum InvalidInputScenario {
     /// Prerequisite/supersede references a nonexistent ticket.
     NonExistent,
@@ -23,9 +24,11 @@ enum InvalidInputScenario {
     SelfReference,
 }
 
-struct Case {
-    name: &'static str,
-    scenario: InvalidInputScenario,
+/// Operation under test in the invalid-input matrix.
+#[derive(Debug, Clone, Copy)]
+enum InvalidInputOp {
+    Create,
+    Supersede,
 }
 
 /// Open a test store and create a default ticket.
@@ -1099,90 +1102,117 @@ async fn test_create_ticket_with_prerequisites() {
     assert!(ticket.prerequisites.contains(&p2));
 }
 
-/// Table-driven tests for `create_ticket` with invalid prerequisite inputs.
+/// Matrix of invalid prerequisite/supersede inputs for `create_ticket` and
+/// `supersede_and_create`.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn test_create_ticket_invalid_inputs() {
+async fn test_invalid_inputs() {
     let cases = [
-        Case {
-            name: "nonexistent prerequisite",
-            scenario: InvalidInputScenario::NonExistent,
-        },
-        Case {
-            name: "self-referencing prerequisite",
-            scenario: InvalidInputScenario::SelfReference,
-        },
-        Case {
-            name: "cross-workspace prerequisite",
-            scenario: InvalidInputScenario::CrossWorkspace,
-        },
+        (InvalidInputOp::Create, InvalidInputScenario::NonExistent),
+        (InvalidInputOp::Create, InvalidInputScenario::CrossWorkspace),
+        (InvalidInputOp::Create, InvalidInputScenario::SelfReference),
+        (InvalidInputOp::Supersede, InvalidInputScenario::NonExistent),
+        (
+            InvalidInputOp::Supersede,
+            InvalidInputScenario::CrossWorkspace,
+        ),
+        (
+            InvalidInputOp::Supersede,
+            InvalidInputScenario::SelfReference,
+        ),
     ];
 
     let (store, _tmp) = open_test_store().await;
     let ws = test_ws_named("/ws", "ws");
     let ws_b = test_ws_named("/ws_b", "ws_b");
-    // Isolated workspace for SelfReference — its own counter avoids
-    // ordering dependencies with CrossWorkspace which also creates
-    // seeds in `ws`.
+    // Isolated workspace for create/SelfReference: with exactly one seed
+    // ticket, the hardcoded `{ws_sr}-1` predicts the next ID (board.rs
+    // allocates IDs inside the tx before the self-reference check). No
+    // other cell may write to ws_sr or the prediction silently breaks.
     let ws_sr = test_ws_named("/ws_sr", "ws_sr");
 
-    for case in &cases {
-        let expected_error = match case.scenario {
-            InvalidInputScenario::NonExistent => "not found",
-            InvalidInputScenario::SelfReference => "cannot depend on itself",
-            InvalidInputScenario::CrossWorkspace => "Cross-workspace",
+    for (op, scenario) in cases {
+        // SelfReference keeps per-op arms — the error substrings differ
+        // ('cannot depend on itself' vs 'supersede and depend'); the
+        // NonExistent/CrossWorkspace substrings are identical across ops.
+        let expected_error = match (op, scenario) {
+            (_, InvalidInputScenario::NonExistent) => "not found",
+            (_, InvalidInputScenario::CrossWorkspace) => "Cross-workspace",
+            (InvalidInputOp::Create, InvalidInputScenario::SelfReference) => {
+                "cannot depend on itself"
+            }
+            (InvalidInputOp::Supersede, InvalidInputScenario::SelfReference) => {
+                "supersede and depend"
+            }
         };
 
-        // Create a seed ticket for scenarios that need one.
-        // NonExistent: no seed needed — uses a nonexistent ID directly.
-        // CrossWorkspace: create a ticket in `ws` to use as a
-        //   cross-workspace prerequisite for a ticket in `ws_b`.
-        // SelfReference: create exactly one ticket in its own workspace
-        //   `ws_sr` to advance the counter so the next ticket will
-        //   have ID `ws_sr-1`.
-        let seed: Option<String> = match &case.scenario {
+        // Seed a ticket for scenarios that reference an existing one.
+        // NonExistent: none — reference a nonexistent id directly.
+        // CrossWorkspace: seed in `ws`, referenced from `ws_b`.
+        // SelfReference: supersede reuses the original in `ws`; create seeds
+        //   the isolated `ws_sr` (counter invariant above).
+        let seed: Option<String> = match scenario {
             InvalidInputScenario::NonExistent => None,
             InvalidInputScenario::CrossWorkspace => {
                 Some(make_ticket(&store, &ws, "Existing", TicketPhase::Backlog).await)
             }
             InvalidInputScenario::SelfReference => {
-                Some(make_ticket(&store, &ws_sr, "First", TicketPhase::Backlog).await)
+                let seed_ws = match op {
+                    InvalidInputOp::Create => &ws_sr,
+                    InvalidInputOp::Supersede => &ws,
+                };
+                Some(make_ticket(&store, seed_ws, "Original", TicketPhase::Backlog).await)
             }
         };
 
-        let target_ws = match case.scenario {
-            InvalidInputScenario::CrossWorkspace => &ws_b,
-            InvalidInputScenario::SelfReference => &ws_sr,
-            InvalidInputScenario::NonExistent => &ws,
+        let target_ws = match (op, scenario) {
+            (InvalidInputOp::Create, InvalidInputScenario::SelfReference) => &ws_sr,
+            (_, InvalidInputScenario::CrossWorkspace) => &ws_b,
+            (_, InvalidInputScenario::NonExistent)
+            | (InvalidInputOp::Supersede, InvalidInputScenario::SelfReference) => &ws,
         };
 
-        // Build prerequisites for each scenario.
-        // NonExistent: a nonexistent ticket ID.
-        // CrossWorkspace: the ticket created in `ws` (different workspace).
-        // SelfReference: hardcoded `{ws_sr}-1` — the ID the next ticket
-        //   receives in the isolated workspace, creating a self-reference.
-        let prereqs: Vec<String> = match &case.scenario {
-            InvalidInputScenario::NonExistent => vec!["nonexistent-1".to_string()],
-            InvalidInputScenario::CrossWorkspace => {
-                vec![seed.clone().expect("seed must exist for CrossWorkspace")]
+        let prereqs: Vec<String> = match (op, scenario) {
+            (InvalidInputOp::Create, InvalidInputScenario::NonExistent) => {
+                vec!["nonexistent-1".to_string()]
             }
-            InvalidInputScenario::SelfReference => {
-                // After creating exactly one seed ticket above, the next
-                // ticket in this isolated workspace receives ID `ws_sr-1`.
+            (InvalidInputOp::Create, InvalidInputScenario::SelfReference) => {
+                // Exactly one seed above → next id in ws_sr is `{ws_sr}-1`.
                 vec![format!("{}-1", ws_sr.name)]
             }
+            (
+                InvalidInputOp::Supersede,
+                InvalidInputScenario::NonExistent | InvalidInputScenario::CrossWorkspace,
+            ) => vec![],
+            (InvalidInputOp::Create, InvalidInputScenario::CrossWorkspace)
+            | (InvalidInputOp::Supersede, InvalidInputScenario::SelfReference) => {
+                vec![seed.clone().expect("seed")]
+            }
         };
 
-        let err = TicketBuilder::new(&store, target_ws)
-            .title("New")
-            .prereqs(&prereqs)
-            .create()
-            .await
-            .unwrap_err();
+        let err = match op {
+            InvalidInputOp::Create => TicketBuilder::new(&store, target_ws)
+                .title("New")
+                .prereqs(&prereqs)
+                .create()
+                .await
+                .unwrap_err(),
+            InvalidInputOp::Supersede => {
+                // NonExistent supersedes a nonexistent target; the rest reuse
+                // the seeded ticket.
+                let supersede_id = seed.as_deref().unwrap_or("nonexistent");
+                TicketBuilder::new(&store, target_ws)
+                    .title("New")
+                    .prereqs(&prereqs)
+                    .supersede(supersede_id)
+                    .await
+                    .unwrap_err()
+            }
+        };
         assert!(
             err.to_string().contains(expected_error),
-            "Case '{}': expected error containing '{}', got: {err}",
-            case.name,
-            expected_error
+            "Case '{op:?}/{scenario:?}': expected error containing \
+             '{expected_error}', got: {err}"
         );
     }
 }
@@ -1630,75 +1660,6 @@ async fn test_supersede_rewires_only_matching_prerequisite() {
     assert!(d.prerequisites.is_empty());
 }
 
-/// Table-driven tests for `supersede_and_create` with invalid inputs.
-#[tokio::test]
-async fn test_supersede_invalid_inputs() {
-    let cases = [
-        Case {
-            name: "nonexistent original",
-            scenario: InvalidInputScenario::NonExistent,
-        },
-        Case {
-            name: "cross-workspace supersede",
-            scenario: InvalidInputScenario::CrossWorkspace,
-        },
-        Case {
-            name: "self-referencing prerequisites",
-            scenario: InvalidInputScenario::SelfReference,
-        },
-    ];
-
-    let (store, _tmp) = open_test_store().await;
-    let ws = test_ws_named("/ws", "ws");
-    let ws_b = test_ws_named("/ws_b", "ws_b");
-
-    for case in &cases {
-        let expected_error = match case.scenario {
-            InvalidInputScenario::NonExistent => "not found",
-            InvalidInputScenario::CrossWorkspace => "Cross-workspace",
-            InvalidInputScenario::SelfReference => "supersede and depend",
-        };
-
-        let original_id = match case.scenario {
-            InvalidInputScenario::NonExistent => None,
-            InvalidInputScenario::CrossWorkspace | InvalidInputScenario::SelfReference => {
-                let id = make_ticket(&store, &ws, "A", TicketPhase::Backlog).await;
-                Some(id)
-            }
-        };
-
-        let target_ws = match case.scenario {
-            InvalidInputScenario::CrossWorkspace => &ws_b,
-            InvalidInputScenario::NonExistent | InvalidInputScenario::SelfReference => &ws,
-        };
-        let supersede_id: &str = original_id.as_deref().unwrap_or("nonexistent");
-        // prereqs include the original id only for SelfReference.
-        let prereqs: Vec<String> = match &case.scenario {
-            InvalidInputScenario::SelfReference => {
-                vec![
-                    original_id
-                        .clone()
-                        .expect("original must exist for SelfReference"),
-                ]
-            }
-            InvalidInputScenario::NonExistent | InvalidInputScenario::CrossWorkspace => vec![],
-        };
-
-        let err = TicketBuilder::new(&store, target_ws)
-            .title("New")
-            .prereqs(&prereqs)
-            .supersede(supersede_id)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains(expected_error),
-            "Case '{}': expected error containing '{}', got: {err}",
-            case.name,
-            expected_error
-        );
-    }
-}
-
 #[tokio::test]
 async fn test_supersede_tool() {
     crate::util::test::init_test_stores().await;
@@ -2093,93 +2054,68 @@ async fn test_claim_sanitation() {
     }
 }
 
+/// Sanitation claims serialize per workspace: a second claim in the same
+/// workspace is blocked until the first clears the pipeline; other
+/// workspaces proceed independently.
 #[tokio::test]
-async fn test_claim_sanitation_workspace_serialization() {
-    let (store, _tmp) = open_test_store().await;
-    let ws = test_ws_named("/ws", "ws");
+async fn test_claim_sanitation_serialization() {
+    for same_workspace in [true, false] {
+        // Fresh store per iteration so the same-workspace Done transition
+        // doesn't leak into the cross-workspace InSanitation assertions.
+        let (store, _tmp) = open_test_store().await;
+        let ws_a = test_ws_named("/ws_a", "ws_a");
+        let ws_b = test_ws_named("/ws_b", "ws_b");
+        let second_ws = if same_workspace { &ws_a } else { &ws_b };
 
-    // First ticket in QaPassed
-    let first_id = make_ticket(&store, &ws, "First", TicketPhase::QaPassed).await;
+        let first_id = make_ticket(&store, &ws_a, "First", TicketPhase::QaPassed).await;
+        let second_id = make_ticket(&store, second_ws, "Second", TicketPhase::QaPassed).await;
 
-    // Second ticket in QaPassed — same workspace
-    let second_id = make_ticket(&store, &ws, "Second", TicketPhase::QaPassed).await;
+        let first_key =
+            crate::session::ticket_agent_id(&first_id, crate::Role::Sanitation.as_str());
+        let second_key =
+            crate::session::ticket_agent_id(&second_id, crate::Role::Sanitation.as_str());
 
-    // Compute agent IDs before the calls (needed as parameters).
-    let first_key = crate::session::ticket_agent_id(&first_id, crate::Role::Sanitation.as_str());
-    let second_key = crate::session::ticket_agent_id(&second_id, crate::Role::Sanitation.as_str());
+        assert!(
+            store
+                .claim_sanitation(&first_id, &first_key)
+                .await
+                .expect("first claim"),
+            "first claim should succeed"
+        );
 
-    // Claim the first — should succeed
-    let first_claimed = store
-        .claim_sanitation(&first_id, &first_key)
-        .await
-        .expect("first claim");
-    assert!(first_claimed, "first claim should succeed");
-
-    // Claim the second while first is in InSanitation — should fail (serialized)
-    let second_claimed = store
-        .claim_sanitation(&second_id, &second_key)
-        .await
-        .expect("second claim");
-    assert!(
-        !second_claimed,
-        "second claim should be blocked while first ticket is in sanitation pipeline"
-    );
-
-    // Transition first ticket out of the sanitation pipeline entirely
-    // (simulating the real flow: SanitationPassed → auto-commit → Done).
-    // We transition directly to Done since SanitationPassed is also in the
-    // blocked set, so moving to SanitationPassed alone wouldn't clear it.
-    store
-        .transition_to(&first_id, None, TicketPhase::Done, None)
-        .await
-        .expect("transition first to Done (clears sanitation pipeline)");
-
-    // Now second claim should succeed
-    let second_claimed_retry = store
-        .claim_sanitation(&second_id, &second_key)
-        .await
-        .expect("second claim retry");
-    assert!(
-        second_claimed_retry,
-        "second claim should succeed after pipeline clears"
-    );
-}
-
-#[tokio::test]
-async fn test_claim_sanitation_cross_workspace_serialization() {
-    let (store, _tmp) = open_test_store().await;
-    let ws_a = test_ws_named("/ws_a", "ws_a");
-    let ws_b = test_ws_named("/ws_b", "ws_b");
-
-    // One ticket in each workspace, both in QaPassed
-    let id_a = make_ticket(&store, &ws_a, "Workspace A", TicketPhase::QaPassed).await;
-    let id_b = make_ticket(&store, &ws_b, "Workspace B", TicketPhase::QaPassed).await;
-
-    // Compute agent IDs before the calls (needed as parameters).
-    let key_a = crate::session::ticket_agent_id(&id_a, crate::Role::Sanitation.as_str());
-    let key_b = crate::session::ticket_agent_id(&id_b, crate::Role::Sanitation.as_str());
-
-    // Both should succeed independently (different workspaces)
-    let claimed_a = store
-        .claim_sanitation(&id_a, &key_a)
-        .await
-        .expect("claim a");
-    assert!(claimed_a, "workspace A claim should succeed");
-
-    let claimed_b = store
-        .claim_sanitation(&id_b, &key_b)
-        .await
-        .expect("claim b");
-    assert!(
-        claimed_b,
-        "workspace B claim should succeed independently of workspace A"
-    );
-
-    let ticket_a = crate::util::test::expect_ticket(&store, &id_a).await;
-    assert_eq!(ticket_a.phase, TicketPhase::InSanitation);
-
-    let ticket_b = crate::util::test::expect_ticket(&store, &id_b).await;
-    assert_eq!(ticket_b.phase, TicketPhase::InSanitation);
+        let second_claimed = store
+            .claim_sanitation(&second_id, &second_key)
+            .await
+            .expect("second claim");
+        if same_workspace {
+            assert!(
+                !second_claimed,
+                "second claim should be blocked while first ticket is in the sanitation pipeline"
+            );
+            // Direct to Done — SanitationPassed is also in the blocked set,
+            // so moving there alone wouldn't clear it.
+            store
+                .transition_to(&first_id, None, TicketPhase::Done, None)
+                .await
+                .expect("transition first to Done");
+            assert!(
+                store
+                    .claim_sanitation(&second_id, &second_key)
+                    .await
+                    .expect("second claim retry"),
+                "second claim should succeed after pipeline clears"
+            );
+        } else {
+            assert!(
+                second_claimed,
+                "claim in another workspace should succeed independently"
+            );
+            let a = expect_ticket(&store, &first_id).await;
+            let b = expect_ticket(&store, &second_id).await;
+            assert_eq!(a.phase, TicketPhase::InSanitation);
+            assert_eq!(b.phase, TicketPhase::InSanitation);
+        }
+    }
 }
 
 #[tokio::test]
