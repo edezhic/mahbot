@@ -666,9 +666,14 @@ fn workspace_from_row(row: &turso::Row) -> anyhow::Result<Workspace> {
 
 /// Max length of workspace notes in chars (char-level truncation — never
 /// byte-slice, which would panic on multi-byte characters at the boundary).
-/// Single source of truth shared by the DB layer, the prompt builder, and
-/// the GUI editors.
 pub(crate) const MAX_WORKSPACE_NOTES_CHARS: usize = 4000;
+
+/// Single source of truth for the notes char-cap — plain char-boundary take
+/// (no ellipsis, unlike `util::truncate`), shared by DB write, prompt build,
+/// and GUI editor.
+pub(crate) fn truncate_workspace_notes(s: &str) -> String {
+    s.chars().take(MAX_WORKSPACE_NOTES_CHARS).collect()
+}
 
 impl WorkspaceStore {
     /// Run a query that returns zero-or-one workspace row, mapping the result to
@@ -900,7 +905,7 @@ impl WorkspaceStore {
     /// Truncates to `MAX_WORKSPACE_NOTES_CHARS` characters as defense-in-depth
     /// against prompt bloat. Notes are appended to every agent's system prompt.
     pub async fn set_notes(&self, name: &str, notes: &str) -> Result<()> {
-        let notes: String = notes.chars().take(MAX_WORKSPACE_NOTES_CHARS).collect();
+        let notes = truncate_workspace_notes(notes);
         self.exec_update_with_updated_at("notes = ?", vec![Value::from(notes)], name)
             .await
     }

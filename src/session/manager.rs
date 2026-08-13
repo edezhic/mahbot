@@ -18,7 +18,7 @@ use futures_util::future::join_all;
 
 use crate::board::BOARD;
 use crate::prompt::{build_workspace_context, format_ticket_block, load_prompt, substitute};
-use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
+use crate::workspace::truncate_workspace_notes;
 
 use crate::skills;
 use crate::tools::active_models::{ModelKind, ModelSnapshot};
@@ -341,7 +341,7 @@ impl Session {
             // until summarization compacts the history — identical to all other
             // system prompt changes (documented caching contract).
             if !ws.notes.trim().is_empty() {
-                let notes: String = ws.notes.chars().take(MAX_WORKSPACE_NOTES_CHARS).collect();
+                let notes = truncate_workspace_notes(&ws.notes);
                 let _ = write!(ctx, "\n<user-notes>\n{notes}\n</user-notes>\n");
             }
 
