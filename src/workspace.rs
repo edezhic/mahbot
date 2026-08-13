@@ -711,26 +711,17 @@ impl WorkspaceStore {
         let path = ensure_trailing_slash(&canonical);
         let now = turso::now();
         let analyzing = WorkspaceStatus::Analyzing.to_string();
-        self.conn
-            .execute(
-                "INSERT INTO workspaces (name, path, status, created_at, updated_at, paused) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                turso::params![name, path.clone(), analyzing, now.clone(), now.clone(), 1],
+        let ws = self
+            .conn
+            .query_row(
+                &format!(
+                    "INSERT INTO workspaces (name, path, status, created_at, updated_at, paused) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) RETURNING {WORKSPACE_COLUMNS}"
+                ),
+                turso::params![name, path, analyzing, now.clone(), now.clone(), 1],
+                workspace_from_row,
             )
             .await?;
-        let ws = Workspace {
-            name: name.to_string(),
-            path: path.clone(),
-            status: WorkspaceStatus::Analyzing,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-            maintenance_enabled: false,
-            paused: true,
-            maintainer_debounce_mins: 5,
-            maintainer_last_run_at: None,
-            diagnostics: None,
-            notes: String::new(),
-            last_analyzed_commit: None,
-        };
         // New workspace: discovery_generation defaults to 0 in the schema.
         // Generation 0 means "the first discovery" — if rediscover() bumps
         // the generation before this task finishes, the task's context/
@@ -1855,6 +1846,15 @@ mod tests {
         assert!(
             ws.paused,
             "add() must return a Workspace with paused = true"
+        );
+        // Pins schema defaults (add() reads them back via RETURNING).
+        assert!(
+            !ws.maintenance_enabled,
+            "add() must return a Workspace with maintenance_enabled = false"
+        );
+        assert_eq!(
+            ws.maintainer_debounce_mins, 5,
+            "add() must return a Workspace with maintainer_debounce_mins = 5"
         );
 
         // Also verify via get_by_name.
