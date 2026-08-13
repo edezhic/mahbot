@@ -20,11 +20,11 @@ impl Tool for VideoGenTool {
         Some("[VIDEO:")
     }
 
-    fn format_output(&self, output: &str) -> String {
-        // The result is a small marker plus a bounded transcription
-        // description — the default 5 KB truncation would elide the middle of
-        // the description the Artist needs to reason about its own output.
-        output.to_string()
+    fn preserve_full_output(&self) -> bool {
+        // Result is the marker plus an LLM transcription capped at
+        // 2048 tokens/3-min timeout that can exceed the 5 KB budget —
+        // the Artist needs the full description to reason about its output.
+        true
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

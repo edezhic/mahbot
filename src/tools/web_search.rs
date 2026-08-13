@@ -516,9 +516,10 @@ impl Tool for WebSearchTool {
         })
     }
 
-    /// Preserve full search results — don't truncate with default 5 KB limit.
-    fn format_output(&self, output: &str) -> String {
-        output.to_string()
+    fn preserve_full_output(&self) -> bool {
+        // Search results can exceed the 5 KB budget — the LLM needs the
+        // relevant passages in full.
+        true
     }
 
     fn side_effects(&self) -> bool {

@@ -1147,6 +1147,13 @@ pub(crate) trait Tool: Send + Sync {
         format!("{marker_prefix}{}]", output_path.to_string_lossy())
     }
 
+    /// Whether tool output must bypass the default 5 KB truncation
+    /// (e.g. ticket details, search results, media markers the LLM
+    /// needs in full). Default: false — output is truncated.
+    fn preserve_full_output(&self) -> bool {
+        false
+    }
+
     /// Format tool output for LLM consumption.
     ///
     /// Called when tool results are embedded into the conversation history
@@ -1155,7 +1162,11 @@ pub(crate) trait Tool: Send + Sync {
     /// (hardcoded 5 KB limit); override to produce a smarter summary (e.g. trim
     /// repetitive CLI output or extract key facts from search results).
     fn format_output(&self, output: &str) -> String {
-        crate::util::truncate_tool_output(output)
+        if self.preserve_full_output() {
+            output.to_string()
+        } else {
+            crate::util::truncate_tool_output(output)
+        }
     }
 }
 

@@ -404,11 +404,10 @@ impl Tool for GetTicketTool {
         false // read-only board query
     }
 
-    /// Override format_output to preserve full ticket content.
-    /// The default truncation at 5 KB would lose long comments/descriptions
-    /// that LLMs need to read in their entirety.
-    fn format_output(&self, output: &str) -> String {
-        output.to_string()
+    fn preserve_full_output(&self) -> bool {
+        // Ticket content (descriptions, comments) can exceed the 5 KB
+        // budget — the LLM needs it in full.
+        true
     }
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
