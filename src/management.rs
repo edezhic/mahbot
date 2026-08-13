@@ -5,7 +5,7 @@
 //! - ReadyForDevelopment → spawn Engineer agent
 //! - InDiagnostics → dispatch diagnostics runner (shell commands)
 //! - DiagnosticsDone → spawn Reviewer agents (calibrated dynamic count)
-//! - Reviewed → spawn QA agents (3 parallel)
+//! - Reviewed → spawn QA agent (single tester)
 //! - QaPassed → check for untracked files; if found, claim to InSanitation and
 //!   dispatch Sanitation agent, otherwise commit and transition to Done
 //! - InSanitation → dispatch Sanitation agent (via `assigned_to` re-dispatch guard)
@@ -48,9 +48,14 @@ use crate::util::panic_message;
 
 use crate::{Agent, DiagnosticsCommands, Role, Workspace};
 
-/// Default number of parallel analysts/QA agents per round. Reviewers use a
-/// calibrated dynamic count (see [`crate::joint_verdict::review_agent_count`]).
+/// Default number of parallel analyst agents per round. Reviewers use a
+/// calibrated dynamic count (see [`crate::joint_verdict::review_agent_count`]);
+/// QA runs a single tester (see [`QA_PARALLEL_AGENT_COUNT`]).
 pub(crate) const DEFAULT_PARALLEL_AGENT_COUNT: usize = 3;
+
+/// QA runs exactly one tester per round — reviewers already verify the change
+/// in depth. May be revisited if a single tester proves insufficient.
+const QA_PARALLEL_AGENT_COUNT: usize = 1;
 
 /// Minimum acceptable verification score (0-10) for analyst verdicts.
 pub(crate) const ANALYST_PASS_THRESHOLD: u8 = 7;
@@ -2693,8 +2698,9 @@ fn load_verifier_angles(role: Role) -> Vec<String> {
 /// Each agent creates its own CancellationToken and auto-registers.
 ///
 /// Verifier roles (Reviewer, QA) get per-agent angle supplements
-/// ([`load_verifier_angles`]) appended to the user message by index (`i % len`,
-/// cycling for counts beyond the asset's sections). KV-cache discipline: the
+/// ([`load_verifier_angles`]) appended to the user message — single-agent
+/// rounds concatenate all sections, multi-agent rounds cycle by index
+/// (`i % len`). KV-cache discipline: the
 /// variation is limited to the user message — model, reasoning effort, and
 /// tools stay identical across agents. Other roles load no angles, leaving the
 /// shared prompt untouched.
@@ -3069,10 +3075,13 @@ async fn spawn_ticket_stage_round(
     let mut slots = Vec::with_capacity(count);
     for i in 0..count {
         let agent_id = format!("ticket_{}_{}_{}_{}", ticket.id, i, suffix, role.as_str());
-        // Angle supplement by agent index; `i % len` cycles for counts beyond
-        // the asset's sections (defensive — reviewers max at 4).
+        // Single-agent rounds concatenate ALL angle sections (QA runs one
+        // tester); multi-agent rounds cycle by slot index (`i % len` —
+        // defensive, reviewers max at 4).
         let task = if angles.is_empty() {
             prompt.to_string()
+        } else if count == 1 {
+            format!("{prompt}\n\n{}", angles.join("\n\n"))
         } else {
             format!("{prompt}\n\n{}", angles[i % angles.len()])
         };
@@ -4102,7 +4111,7 @@ async fn working_tree_churn(repo_path: &Path) -> anyhow::Result<(i64, i64, usize
 /// The base is computed from the ORIGINAL first-dispatch signals and frozen
 /// on the ticket (`review_base_count`); later rounds reuse it so rework-grown
 /// diffs cannot escalate reviewer counts. Bounced tickets get a flat +1
-/// (capped at 4). QA never passes through here (fixed 3).
+/// (capped at 4). QA never passes through here (fixed 1).
 ///
 /// Shadow instrumentation: the counterfactual signals are logged at info
 /// level so the formula can be validated against a cohort after launch.
@@ -4491,8 +4500,8 @@ async fn verifier_git_state(ws: &Workspace, vi: VerifierInfo) -> (bool, &Path, b
 
 /// Shared dispatch logic for parallel verifiers (reviewers and QA).
 /// Fetches the engineer's last comment, builds a prompt from the template,
-/// runs parallel verifiers of the given role (reviewers use the calibrated
-/// dynamic count; QA is fixed at 3), and processes the verdicts.
+/// runs verifiers of the given role (reviewers use the calibrated dynamic
+/// count; QA runs a single agent), and processes the verdicts.
 ///
 /// ## Note: no `clear_assigned_to_no_cancel` on post-run phase check
 ///
@@ -4561,14 +4570,16 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
     let (count, base_to_freeze) = if is_reviewer {
         compute_reviewer_count(&ticket, repo_path).await
     } else {
-        // QA calibration is infeasible from history — fixed at 3.
-        (DEFAULT_PARALLEL_AGENT_COUNT, None)
+        // QA calibration is infeasible from history — fixed at 1.
+        (QA_PARALLEL_AGENT_COUNT, None)
     };
+    let verifier_label = if count == 1 { "verifier" } else { "verifiers" };
     info!(
         ticket = %ticket.id,
         role = %vi.role.as_str(),
         count,
-        "Dispatching {count} parallel verifier(s)",
+        verifier_label,
+        "Dispatching {count} parallel {verifier_label}",
     );
 
     // Spawn the durable verifier round (jobs + roster, one tx) BEFORE the

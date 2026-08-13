@@ -49,7 +49,7 @@ Every ticket runs through a fixed lifecycle with **redundant checks**:
 | **Ready → In development** | Engineer implements sequentially, using subagents when needed |
 | **In diagnostics** | Discovered project commands run (format, lint, build, test) |
 | **Diagnostics done → In review** | Parallel reviewers; bounces back into dev with the feedback if issues are found |
-| **Reviewed → In QA** | Parallel QA agents; same bounce mechanics |
+| **Reviewed → In QA** | Single QA agent; same bounce mechanics |
 | **QA passed → Sanitation** | Check for untracked/new files in the working tree. If found → dispatch **Sanitation** agent |
 | **Sanitation passed → Done** | Auto git commit with the ticket's title if the tree is dirty |
 
