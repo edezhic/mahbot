@@ -291,7 +291,7 @@ impl Agent {
     }
 
     /// Run a complete agent turn: initialize session, work loop (with shutdown
-    /// cancellation), finalize session, and optionally introspect.
+    /// cancellation), finalize session.
     pub async fn work(&mut self, msg: &str, resume: bool) -> anyhow::Result<String> {
         // Open or resume a session for this agent turn.
         self.session

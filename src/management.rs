@@ -2409,10 +2409,9 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 /// Run diagnostics commands after the engineer completes development.
 ///
 /// Called by [`PollPhase::DiagnosticsCheck`] via [`spawn_dispatch`].
-/// Checks the diagnostics-specific circuit breaker first (consistent with all
-/// other dispatchers — [`dispatch_engineer`], [`dispatch_sanitation`],
-/// [`dispatch_backlog_analysts`], [`dispatch_verifiers`]), then uses
-/// [`BoardStore::claim_diagnostics`] to set `assigned_to` and prevent
+/// The circuit-breaker guard is handled centrally there, consistent with all
+/// other dispatchers. Uses [`BoardStore::claim_diagnostics`] to set
+/// `assigned_to` and prevent
 /// double-dispatch. Unlike the pipeline-phase dispatchers (which are dispatched
 /// from the atomic claim loop and already own the ticket by the time their
 /// dispatch runs), diagnostics keeps the ticket in `InDiagnostics` while
@@ -2420,8 +2419,7 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 /// Loads discovered diagnostics commands for the workspace and runs them
 /// sequentially via [`run_diagnostics_commands`]. Stops at the first failure.
 /// After execution, transitions the ticket to either `DiagnosticsDone` (all
-/// passed) or `ReadyForDevelopment` (any failure), unless the circuit breaker
-/// trips (see [`CircuitBreakerKind::Diagnostics`]).
+/// passed) or `ReadyForDevelopment` (any failure).
 async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
     // Circuit breaker check happens in spawn_dispatch before entering this
     // function — consistent with all other dispatchers.

@@ -2099,7 +2099,8 @@ fn cap_at_max_lines(output: &str, max: usize) -> String {
 
 /// Run the full profile-based processing pipeline on pre-processed output.
 ///
-/// Upstream processing (`execute()`) handles ANSI stripping and 1 MB truncation.
+/// Upstream processing (`execute()`) handles ANSI stripping, and the pipe read
+/// cap (`SHELL_PIPE_READ_CAP`, 256 KB) bounds output collected during execution.
 /// Both stdout and stderr are scrubbed once at pipeline entry so all paths
 /// (early-return and main) consistently receive clean data.  No further
 /// scrubbing is needed anywhere downstream — all derived output (truncated,

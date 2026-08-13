@@ -4034,7 +4034,6 @@ impl EditorState {
 
     /// Handle tick — refreshes git status and gitignore for file tree coloring.
     fn tick(&mut self) -> Task<EditorMessage> {
-        // Refresh git status and gitignore for file tree coloring.
         if let Some(ref ws_path) = self.selected_workspace_path {
             let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
 
