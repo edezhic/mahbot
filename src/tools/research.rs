@@ -2378,6 +2378,39 @@ fn render_weak_hints(weak: &WeakLinks, id: usize) -> String {
     out
 }
 
+/// "n/a" fallback for empty claim sources.
+fn source_or_na(source: &str) -> &str {
+    if source.is_empty() { "n/a" } else { source }
+}
+
+/// Unanswered section; `escape` fences entries for the manager-visible
+/// partial report (the orchestrator-prompt view stays raw).
+fn render_unanswered(out: &mut String, unanswered: &[String], escape: bool) {
+    if unanswered.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "\nAnalysts reported these as still unanswered:");
+    for u in unanswered {
+        let _ = if escape {
+            writeln!(out, "- {}", escape_fences(u))
+        } else {
+            writeln!(out, "- {u}")
+        };
+    }
+}
+
+/// Per-analyst raw-report section under `heading` (### partial / ## final).
+fn render_raw_reports(out: &mut String, raw_reports: &[String], heading: &str) {
+    if raw_reports.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "\n{heading} Failed Analyst Reports");
+    for (i, raw) in raw_reports.iter().enumerate() {
+        let _ = writeln!(out, "### Report from Analyst {}", i + 1);
+        let _ = writeln!(out, "{}", escape_fences(raw));
+    }
+}
+
 /// Render the accumulated evidence as a compact numbered list for the
 /// orchestrator prompts, plus analysts' self-reported unanswered aspects.
 /// Claim ids are their stable 0-based indices in `acc.claims` — the
@@ -2385,11 +2418,7 @@ fn render_weak_hints(weak: &WeakLinks, id: usize) -> String {
 fn render_accumulated_evidence(acc: &AccumulatedEvidence) -> String {
     let mut out = String::new();
     for (i, c) in acc.claims.iter().enumerate() {
-        let source = if c.source.is_empty() {
-            "n/a"
-        } else {
-            &c.source
-        };
+        let source = source_or_na(&c.source);
         let _ = writeln!(
             out,
             "{i}. [{}] {} — source: {source}",
@@ -2400,12 +2429,7 @@ fn render_accumulated_evidence(acc: &AccumulatedEvidence) -> String {
         }
         out.push_str(&render_weak_hints(&acc.weak, i));
     }
-    if !acc.unanswered.is_empty() {
-        let _ = writeln!(out, "\nAnalysts reported these as still unanswered:");
-        for u in &acc.unanswered {
-            let _ = writeln!(out, "- {u}");
-        }
-    }
+    render_unanswered(&mut out, &acc.unanswered, false);
     if !acc.raw_reports.is_empty() {
         let _ = writeln!(
             out,
@@ -2501,11 +2525,7 @@ fn render_recovered_findings(recovered: &[AnalystFindings]) -> String {
     );
     for r in recovered {
         for c in &r.claims {
-            let source = if c.source.is_empty() {
-                "n/a"
-            } else {
-                &c.source
-            };
+            let source = source_or_na(&c.source);
             let _ = writeln!(
                 out,
                 "- [{}] {} — source: {}",
@@ -2544,11 +2564,7 @@ fn partial_report(
         let _ = writeln!(out, "- none");
     } else {
         for (i, c) in acc.claims.iter().enumerate() {
-            let source = if c.source.is_empty() {
-                "n/a"
-            } else {
-                &c.source
-            };
+            let source = source_or_na(&c.source);
             let _ = writeln!(
                 out,
                 "- {i}. [{}] {} — source: {source}",
@@ -2558,20 +2574,31 @@ fn partial_report(
             out.push_str(&render_weak_hints(&acc.weak, i));
         }
     }
-    if !acc.unanswered.is_empty() {
-        let _ = writeln!(out, "\nAnalysts reported these as still unanswered:");
-        for u in &acc.unanswered {
-            let _ = writeln!(out, "- {}", escape_fences(u));
-        }
-    }
-    if !acc.raw_reports.is_empty() {
-        let _ = writeln!(out, "\n### Failed Analyst Reports");
-        for (i, raw) in acc.raw_reports.iter().enumerate() {
-            let _ = writeln!(out, "### Report from Analyst {}", i + 1);
-            let _ = writeln!(out, "{}", escape_fences(raw));
-        }
-    }
+    render_unanswered(&mut out, &acc.unanswered, true);
+    render_raw_reports(&mut out, &acc.raw_reports, "###");
     out
+}
+
+/// Abort-path partial report — reason from runtime flags, shutdown first
+/// (matches the two-arm guard sites; the `aborting()` sites previously
+/// reported drain first in the both-flags edge — cosmetic, accepted).
+fn abort_partial_report(
+    question: &str,
+    acc: &AccumulatedEvidence,
+    shutdown_reason: &str,
+    drain_reason: &str,
+    recovered: &[AnalystFindings],
+) -> String {
+    partial_report(
+        question,
+        acc,
+        if crate::shutdown::shutdown_token().is_cancelled() {
+            shutdown_reason
+        } else {
+            drain_reason
+        },
+        recovered,
+    )
 }
 
 // ── Orchestrator ─────────────────────────────────────────────────────────
@@ -2624,18 +2651,11 @@ async fn run_deep_research(
                     }
                     plan
                 }
-                Err(_) if crate::shutdown::shutdown_token().is_cancelled() => {
-                    return Ok(partial_report(
+                Err(_) if crate::shutdown::aborting() => {
+                    return Ok(abort_partial_report(
                         question,
                         &state.acc,
                         "shutdown during decomposition",
-                        &recovered,
-                    ));
-                }
-                Err(_) if crate::shutdown::is_draining() => {
-                    return Ok(partial_report(
-                        question,
-                        &state.acc,
                         "drain during decomposition",
                         &recovered,
                     ));
@@ -2651,14 +2671,11 @@ async fn run_deep_research(
     // Check shutdown/drain between rounds — never spawn round-1 analysts
     // during shutdown or the graceful drain.
     if crate::shutdown::aborting() {
-        return Ok(partial_report(
+        return Ok(abort_partial_report(
             question,
             &state.acc,
-            if crate::shutdown::is_draining() {
-                "drain after decomposition"
-            } else {
-                "shutdown after decomposition"
-            },
+            "shutdown after decomposition",
+            "drain after decomposition",
             &recovered,
         ));
     }
@@ -2733,14 +2750,11 @@ async fn run_deep_research(
             state.gap_outcome = gap_outcome;
             state.budget_spent = budget.spent;
             state.save(job_id).await;
-            return Ok(partial_report(
+            return Ok(abort_partial_report(
                 question,
                 &state.acc,
-                if crate::shutdown::is_draining() {
-                    "drain during gap rounds"
-                } else {
-                    "shutdown during gap rounds"
-                },
+                "shutdown during gap rounds",
+                "drain during gap rounds",
                 &recovered,
             ));
         }
@@ -2759,14 +2773,11 @@ async fn run_deep_research(
     // The gap loop may have exited early on shutdown/drain — never run a full
     // synthesis or spawn verification analysts during shutdown or the drain.
     if crate::shutdown::aborting() {
-        return Ok(partial_report(
+        return Ok(abort_partial_report(
             question,
             &state.acc,
-            if crate::shutdown::is_draining() {
-                "drain during gap rounds"
-            } else {
-                "shutdown during gap rounds"
-            },
+            "shutdown during gap rounds",
+            "drain during gap rounds",
             &recovered,
         ));
     }
@@ -2798,18 +2809,11 @@ async fn run_deep_research(
             }
             s.text
         }
-        Err(_) if crate::shutdown::shutdown_token().is_cancelled() => {
-            return Ok(partial_report(
+        Err(_) if crate::shutdown::aborting() => {
+            return Ok(abort_partial_report(
                 question,
                 &state.acc,
                 "shutdown before final synthesis",
-                &recovered,
-            ));
-        }
-        Err(_) if crate::shutdown::is_draining() => {
-            return Ok(partial_report(
-                question,
-                &state.acc,
                 "drain before final synthesis",
                 &recovered,
             ));
@@ -2874,14 +2878,7 @@ async fn run_deep_research(
             );
         }
     }
-    if !state.acc.raw_reports.is_empty() {
-        let _ = writeln!(report);
-        let _ = writeln!(report, "## Failed Analyst Reports");
-        for (i, raw) in state.acc.raw_reports.iter().enumerate() {
-            let _ = writeln!(report, "### Report from Analyst {}", i + 1);
-            let _ = writeln!(report, "{}", escape_fences(raw));
-        }
-    }
+    render_raw_reports(&mut report, &state.acc.raw_reports, "##");
     // RunStats pin: a resumed run's counts undercount the pre-crash segment —
     // the summary carries a one-line best-effort note instead of pretending.
     // Keyed off the job's boot-resume retry count (the real resume signal) —
