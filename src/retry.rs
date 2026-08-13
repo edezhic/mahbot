@@ -59,6 +59,8 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use crate::util::UnwrapPoison;
 use crate::{ChatRequest, ChatResponse};
 
 // ── Hardcoded retry defaults (no config surface — fixed in code) ─────────
@@ -121,17 +123,11 @@ impl RetryPolicy {
     }
 
     /// Resolve the policy for a scoped operation.
-    ///
-    /// In tests, an override installed via [`swap_test_retry_policy`] takes
-    /// precedence so retry-loop tests don't sleep for minutes; otherwise the
-    /// hardcoded defaults apply.
     #[must_use]
     pub(crate) fn current() -> Self {
         #[cfg(test)]
-        if let Ok(guard) = TEST_POLICY_OVERRIDE.read()
-            && let Some(p) = guard.as_ref()
-        {
-            return p.clone();
+        if let Some(p) = test_override() {
+            return p;
         }
         Self::default()
     }
@@ -142,17 +138,11 @@ impl RetryPolicy {
     /// approved 3–5 band). The synthesis loop is deliberately bounded so a
     /// bad grouping pass degrades to the deterministic fallback comment
     /// instead of burning minutes of wall time.
-    ///
-    /// Like [`Self::current`], a test override installed via
-    /// [`swap_test_retry_policy`] takes precedence so synthesis tests run
-    /// fast.
     #[must_use]
     pub(crate) fn synthesis() -> Self {
         #[cfg(test)]
-        if let Ok(guard) = TEST_POLICY_OVERRIDE.read()
-            && let Some(p) = guard.as_ref()
-        {
-            return p.clone();
+        if let Some(p) = test_override() {
+            return p;
         }
         Self {
             max_attempts: DEFAULT_SYNTHESIS_MAX_ATTEMPTS,
@@ -167,16 +157,11 @@ impl RetryPolicy {
     /// caller falls back to raw text on failure, so a short budget avoids
     /// stalling the pipeline for a non-critical operation (the
     /// 13-attempt/720 s budget is for verdict gates).
-    ///
-    /// Like [`Self::current`], a test override installed via
-    /// [`swap_test_retry_policy`] takes precedence so tests run fast.
     #[must_use]
     pub(crate) fn comment() -> Self {
         #[cfg(test)]
-        if let Ok(guard) = TEST_POLICY_OVERRIDE.read()
-            && let Some(p) = guard.as_ref()
-        {
-            return p.clone();
+        if let Some(p) = test_override() {
+            return p;
         }
         Self {
             max_attempts: 3,
@@ -193,15 +178,24 @@ impl RetryPolicy {
 #[cfg(test)]
 static TEST_POLICY_OVERRIDE: std::sync::RwLock<Option<RetryPolicy>> = std::sync::RwLock::new(None);
 
+/// In tests, the override installed via [`swap_test_retry_policy`] takes
+/// precedence so retry-loop tests don't sleep for minutes; otherwise the
+/// hardcoded defaults apply. Poison-tolerant like the other test seams
+/// ([`crate::util::test::retry_tests_lock`]): a failing test must not
+/// cascade into later ones.
+#[cfg(test)]
+fn test_override() -> Option<RetryPolicy> {
+    let guard = TEST_POLICY_OVERRIDE.read().unwrap_poison();
+    guard.as_ref().cloned()
+}
+
 /// Swap the test retry-policy override, returning the previous value so an
 /// RAII guard (see `util::test::RetryPolicyGuard`) can restore it on drop —
 /// including during a panic. Mirrors
 /// [`crate::providers::swap_provider_for_test`].
 #[cfg(test)]
 pub(crate) fn swap_test_retry_policy(policy: RetryPolicy) -> Option<RetryPolicy> {
-    let mut guard = TEST_POLICY_OVERRIDE
-        .write()
-        .expect("retry policy override poisoned");
+    let mut guard = TEST_POLICY_OVERRIDE.write().unwrap_poison();
     let previous = guard.take();
     *guard = Some(policy);
     previous
@@ -210,9 +204,7 @@ pub(crate) fn swap_test_retry_policy(policy: RetryPolicy) -> Option<RetryPolicy>
 /// Restore a previously swapped-out test retry-policy override.
 #[cfg(test)]
 pub(crate) fn restore_test_retry_policy(previous: Option<RetryPolicy>) {
-    *TEST_POLICY_OVERRIDE
-        .write()
-        .expect("retry policy override poisoned") = previous;
+    *TEST_POLICY_OVERRIDE.write().unwrap_poison() = previous;
 }
 
 /// A tiny retry policy for tests: 3 attempts, ~1 ms backoff, 60 s wall cap.
