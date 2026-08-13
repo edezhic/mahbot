@@ -775,6 +775,12 @@ pub(crate) fn is_image_extension(path: &std::path::Path) -> bool {
     has_extension(path, IMAGE_EXTENSIONS)
 }
 
+/// Check whether a string is an http(s) URL (case-sensitive prefix match).
+#[must_use]
+pub(crate) fn is_http_url(target: &str) -> bool {
+    target.starts_with("http://") || target.starts_with("https://")
+}
+
 /// Map a file path's extension to a MIME type string.
 pub(crate) fn mime_for_extension(path: &std::path::Path) -> &'static str {
     match path

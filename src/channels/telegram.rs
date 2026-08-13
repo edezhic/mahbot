@@ -1,5 +1,5 @@
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
-use crate::util::{TELEGRAM_MEDIA_MARKER_RE, UnwrapPoison, parse_media_marker};
+use crate::util::{TELEGRAM_MEDIA_MARKER_RE, UnwrapPoison, is_http_url, parse_media_marker};
 use crate::{Channel, ChannelMessage, Role, SendMessage};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -437,10 +437,6 @@ fn normalize_video_filename(
     }
 }
 
-fn is_http_url(target: &str) -> bool {
-    target.starts_with("http://") || target.starts_with("https://")
-}
-
 fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentKind> {
     let normalized = target.split(['?', '#']).next().unwrap();
 
@@ -744,7 +740,7 @@ fn markdown_to_telegram_html(text: &str) -> String {
                     && let Some(paren_end) = line[after_bracket + 1..].find(')')
                 {
                     let url = &line[after_bracket + 1..after_bracket + 1 + paren_end];
-                    if url.starts_with("http://") || url.starts_with("https://") {
+                    if is_http_url(url) {
                         let text_html = escape_html(text_part);
                         let url_html = escape_html(url);
                         let _ = write!(line_out, "<a href=\"{url_html}\">{text_html}</a>");

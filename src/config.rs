@@ -116,7 +116,7 @@ use crate::Role;
 use crate::config_db::ConfigStore;
 use crate::role::role_info;
 use crate::turso;
-use crate::util::UnwrapPoison;
+use crate::util::{UnwrapPoison, is_http_url};
 use anyhow::{Context, Result};
 use directories::UserDirs;
 use std::path::PathBuf;
@@ -1133,8 +1133,7 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
 /// of its per-field annotation — `non_empty`, `or(…)`, or `list_or(…)`).
 fn validate_config(config: &ConfigData) -> Result<()> {
     if let Some(ref ep) = config.provider_endpoint
-        && !ep.starts_with("https://")
-        && !ep.starts_with("http://")
+        && !is_http_url(ep)
     {
         anyhow::bail!("Provider endpoint must be a valid URL starting with https:// or http://");
     }

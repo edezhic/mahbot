@@ -19,7 +19,7 @@
 
 use crate::ChannelMessage;
 use crate::tools::browser::BrowserTool;
-use crate::util::{MEDIA_MARKER_RE, parse_media_marker};
+use crate::util::{MEDIA_MARKER_RE, is_http_url, parse_media_marker};
 use regex::Regex;
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -155,7 +155,7 @@ async fn handle_multimodal_image(
     uploads_dir: Option<&std::path::Path>,
 ) -> MultimodalImageAction {
     // HTTP/HTTPS URLs can be sent as-is.
-    if path.starts_with("http://") || path.starts_with("https://") {
+    if is_http_url(path) {
         return MultimodalImageAction::Keep;
     }
 
@@ -232,7 +232,7 @@ async fn handle_multimodal_video(
     path_obj: &std::path::Path,
     uploads_dir: Option<&std::path::Path>,
 ) -> MultimodalVideoAction {
-    if path.starts_with("http://") || path.starts_with("https://") {
+    if is_http_url(path) {
         return MultimodalVideoAction::annotation(format!("[Video: {path}]"));
     }
     if !path_obj.exists() || !path_obj.is_file() {

@@ -1,6 +1,6 @@
 //! Browser automation tool.
 
-use crate::util::UnwrapPoison;
+use crate::util::{UnwrapPoison, is_http_url};
 use crate::{Tool, Workspace};
 use anyhow::Context;
 use async_trait::async_trait;
@@ -248,7 +248,7 @@ impl BrowserTool {
             anyhow::bail!("file:// URLs are not allowed in browser automation");
         }
 
-        if !url.starts_with("https://") && !url.starts_with("http://") {
+        if !is_http_url(url) {
             anyhow::bail!("Only http:// and https:// URLs are allowed");
         }
 
@@ -971,7 +971,7 @@ fn normalize_action(action: Value, args: &Value) -> Result<(Value, Option<String
                 return Err(corrective_action_error(&Value::String(s.to_string())));
             }
             // Bare URL → open action.
-            if s.starts_with("http://") || s.starts_with("https://") {
+            if is_http_url(s) {
                 return Ok((
                     json!({"open": {"url": s}}),
                     Some("bare URL treated as open action".to_string()),

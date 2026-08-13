@@ -280,7 +280,7 @@ fn check_local_image(canonical: &std::path::Path, ws: &crate::Workspace) -> anyh
 
 /// Resolve the video reference: public URL as-is, local file → upload bridge.
 async fn resolve_video_source(video_url: &str, ws: &crate::Workspace) -> anyhow::Result<String> {
-    if video_url.starts_with("https://") || video_url.starts_with("http://") {
+    if crate::util::is_http_url(video_url) {
         return Ok(video_url.to_string());
     }
     // Only clips saved into the workspace uploads dir (received attachments)
@@ -307,7 +307,7 @@ async fn resolve_image_input(
     ws: &crate::Workspace,
     label: &str,
 ) -> anyhow::Result<String> {
-    if input.starts_with("https://") || input.starts_with("http://") {
+    if crate::util::is_http_url(input) {
         crate::util::upload_bridge::verify_media_url(input, "image/")
             .await
             .with_context(|| format!("Failed to validate {label} URL {input}"))?;
