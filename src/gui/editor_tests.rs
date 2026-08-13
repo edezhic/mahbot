@@ -102,35 +102,29 @@ fn test_compute_text_matches() {
 // ── validate_file_content ─────────────────────────────────────
 
 #[test]
-fn test_validate_file_content_accepts_valid_input() {
-    assert!(validate_file_content(b"").is_ok());
-    assert!(validate_file_content(b"hello world").is_ok());
-    assert!(validate_file_content("Привет мир 👋".as_bytes()).is_ok());
-}
-
-#[test]
-fn test_validate_file_content_rejects_invalid_input() {
-    let big = vec![b'a'; usize::try_from(MAX_FILE_SIZE).unwrap() + 1];
-    let err = validate_file_content(&big).unwrap_err();
-    assert!(err.starts_with("File too large"), "unexpected error: {err}");
-
-    let bytes = b"hello\0world";
-    let err = validate_file_content(bytes).unwrap_err();
-    assert!(
-        err.starts_with("Binary file detected"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
-fn test_validate_file_content_both_conditions_reports_size_first() {
-    let mut big_with_null = vec![b'a'; usize::try_from(MAX_FILE_SIZE).unwrap() + 1];
+fn test_validate_file_content() {
+    let big = || vec![b'a'; usize::try_from(MAX_FILE_SIZE).unwrap() + 1];
+    let big_bytes = big();
+    let mut big_with_null = big();
     big_with_null.push(0);
-    let err = validate_file_content(&big_with_null).unwrap_err();
-    assert!(
-        err.starts_with("File too large"),
-        "size check should be reported before null-byte check: {err}"
-    );
+    // (input, expected error prefix or None for ok)
+    let cases: &[(&[u8], Option<&str>)] = &[
+        (b"", None),
+        (b"hello world", None),
+        ("Привет мир 👋".as_bytes(), None),
+        (&big_bytes, Some("File too large")),
+        (b"hello\0world", Some("Binary file detected")),
+        (&big_with_null, Some("File too large")),
+    ];
+    for &(bytes, expected) in cases {
+        match expected {
+            Some(prefix) => {
+                let err = validate_file_content(bytes).unwrap_err();
+                assert!(err.starts_with(prefix), "unexpected error: {err}");
+            }
+            None => assert!(validate_file_content(bytes).is_ok()),
+        }
+    }
 }
 
 #[test]
@@ -974,37 +968,16 @@ fn make_editor_with_find_state(
 }
 
 #[test]
-fn test_navigate_find_match_wraps_next() {
-    let mut state = make_editor_with_find_state("a b c", " ", vec![1..2, 3..4], 0);
-
-    // Navigate next from index 0 → 1.
-    let _ = state.navigate_find_match(FindDirection::Next);
-    let frs = state.tab_contents.get("/test.rs").unwrap();
-    let s = frs.find_replace_state.as_ref().unwrap();
-    assert_eq!(s.current_match_idx, 1);
-
-    // Navigate next from index 1 → wraps to 0.
-    let _ = state.navigate_find_match(FindDirection::Next);
-    let s = state.tab_contents.get("/test.rs").unwrap();
-    let s = s.find_replace_state.as_ref().unwrap();
-    assert_eq!(s.current_match_idx, 0);
-}
-
-#[test]
-fn test_navigate_find_match_wraps_prev() {
-    let mut state = make_editor_with_find_state("a b c", " ", vec![1..2, 3..4], 0);
-
-    // Navigate prev from index 0 → wraps to 1 (last).
-    let _ = state.navigate_find_match(FindDirection::Prev);
-    let s = state.tab_contents.get("/test.rs").unwrap();
-    let s = s.find_replace_state.as_ref().unwrap();
-    assert_eq!(s.current_match_idx, 1);
-
-    // Navigate prev from index 1 → 0.
-    let _ = state.navigate_find_match(FindDirection::Prev);
-    let s = state.tab_contents.get("/test.rs").unwrap();
-    let s = s.find_replace_state.as_ref().unwrap();
-    assert_eq!(s.current_match_idx, 0);
+fn test_navigate_find_match_wraps() {
+    for direction in [FindDirection::Next, FindDirection::Prev] {
+        let mut state = make_editor_with_find_state("a b c", " ", vec![1..2, 3..4], 0);
+        for want in [1, 0] {
+            let _ = state.navigate_find_match(direction);
+            let s = state.tab_contents.get("/test.rs").unwrap();
+            let s = s.find_replace_state.as_ref().unwrap();
+            assert_eq!(s.current_match_idx, want, "{direction:?}");
+        }
+    }
 }
 
 #[test]
@@ -1776,41 +1749,31 @@ fn test_rename_mutual_exclusion_cancelled_by_other_modals() {
 // ── rekey helpers ──────────────────────────────────────────
 
 #[test]
-fn test_rekey_keys_empty() {
-    let pairs = rekey_keys("old/", "new/", Vec::<String>::new());
-    assert!(pairs.is_empty());
-}
-
-#[test]
-fn test_rekey_keys_no_match() {
-    let keys = vec!["a".to_string(), "b".to_string()];
-    let pairs = rekey_keys("old/", "new/", keys);
-    assert!(pairs.is_empty());
-}
-
-#[test]
-fn test_rekey_keys_some_match() {
-    let keys = vec![
-        "old/foo".to_string(),
-        "other".to_string(),
-        "old/bar/baz".to_string(),
+fn test_rekey_keys() {
+    // (name, old_prefix, new_prefix, keys, expected pairs)
+    #[rustfmt::skip]
+    #[allow(clippy::type_complexity)]
+    let cases: &[(&str, &str, &str, &[&str], &[(&str, &str)])] = &[
+        ("empty", "old/", "new/", &[], &[]),
+        ("no_match", "old/", "new/", &["a", "b"], &[]),
+        (
+            "some_match",
+            "old/",
+            "new",
+            &["old/foo", "other", "old/bar/baz"],
+            &[("old/bar/baz", "new/bar/baz"), ("old/foo", "new/foo")],
+        ),
+        ("exact_prefix", "dir", "newdir", &["dir"], &[("dir", "newdir")]),
     ];
-    let mut pairs = rekey_keys("old/", "new", keys);
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    assert_eq!(pairs.len(), 2);
-    assert_eq!(
-        pairs[0],
-        ("old/bar/baz".to_string(), "new/bar/baz".to_string())
-    );
-    assert_eq!(pairs[1], ("old/foo".to_string(), "new/foo".to_string()));
-}
-
-#[test]
-fn test_rekey_keys_exact_prefix() {
-    let keys = vec!["dir".to_string()];
-    let pairs = rekey_keys("dir", "newdir", keys);
-    assert_eq!(pairs.len(), 1);
-    assert_eq!(pairs[0], ("dir".to_string(), "newdir".to_string()));
+    for &(name, old_prefix, new_prefix, keys, expected) in cases {
+        let mut pairs = rekey_keys(old_prefix, new_prefix, keys.iter().map(|s| s.to_string()));
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let got: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        assert_eq!(got, expected, "case: {name}");
+    }
 }
 
 #[test]
