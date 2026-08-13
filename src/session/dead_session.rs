@@ -7,10 +7,9 @@
 //!
 //! # Exclusion list
 //!
-//! The poller skips agent IDs matching these prefixes:
-//! - `manager_*` — Manager has its own lifecycle.
-//! - `ticket_*`, `ask_*`, `maintainer_*`, `discovery_*` — transient or
-//!   background-only agents (see [`TRANSIENT_AGENT_ID_PREFIXES`]).
+//! The poller skips `manager_*` (Manager has its own lifecycle) plus every
+//! prefix in [`TRANSIENT_AGENT_ID_PREFIXES`] (transient or background-only
+//! agents).
 //!
 //! Only direct user-agent sessions (format `{channel}_{user}_{ws}_{role}`)
 //! are eligible for recovery.
@@ -194,8 +193,8 @@ fn excluded_agent_id_prefixes() -> impl Iterator<Item = &'static str> {
 async fn recover_dead_sessions() -> anyhow::Result<()> {
     let now = Utc::now();
 
-    // Use SQL-side filtering to avoid loading excluded sessions (manager_,
-    // ticket_, ask_, maintainer_, discovery_) from the database.  The
+    // Use SQL-side filtering to avoid loading excluded sessions (manager_ and
+    // every prefix in TRANSIENT_AGENT_ID_PREFIXES) from the database.  The
     // per-session `get_last_message_role` queries below are lightweight
     // (indexed `ORDER BY id DESC LIMIT 1`) and only run for eligible sessions.
     let sessions = crate::session::store()
@@ -293,7 +292,7 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
 }
 
 /// Returns `true` if the agent ID belongs to a session that should NOT be
-/// recovered by the poller (Manager, ticket, ask, maintainer, discovery).
+/// recovered by the poller (`manager_` plus every [`TRANSIENT_AGENT_ID_PREFIXES`] prefix).
 ///
 /// Note: the poller itself uses SQL-side filtering now — this function is
 /// retained for test coverage and as documentation of the exclusion criteria.

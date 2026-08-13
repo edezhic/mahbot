@@ -1248,14 +1248,18 @@ mod tests {
     async fn session_list_excluding_prefixes() {
         crate::util::test::init_test_stores().await;
 
-        // Create sessions with different agent ID patterns.
+        // Direct session plus one session per excluded prefix — the union of
+        // `manager_` and [`TRANSIENT_AGENT_ID_PREFIXES`].
         let direct_id = unique_key();
-        let manager_id = format!("manager_{}", unique_key());
-        let ticket_id = format!("ticket_{}", unique_key());
-        let ask_id = format!("ask_{}", unique_key());
-        let maintainer_id = format!("maintainer_{}", unique_key());
+        let excluded_prefixes: Vec<&str> = std::iter::once("manager_")
+            .chain(TRANSIENT_AGENT_ID_PREFIXES.iter().copied())
+            .collect();
+        let prefixed_ids: Vec<String> = excluded_prefixes
+            .iter()
+            .map(|p| format!("{p}{}", unique_key()))
+            .collect();
 
-        for id in &[&direct_id, &manager_id, &ticket_id, &ask_id, &maintainer_id] {
+        for id in std::iter::once(&direct_id).chain(prefixed_ids.iter()) {
             // list_sessions_with_metadata joins with session_metadata, so the
             // context columns are needed too (append alone doesn't create them).
             store()
@@ -1271,39 +1275,35 @@ mod tests {
                 .unwrap();
         }
 
-        // Without exclusions, all 5 sessions should be listed.
+        // Without exclusions, all 7 sessions should be listed.
         let all = store().list_sessions_with_metadata().await;
         let all_ids: Vec<&str> = all.iter().map(|s| s.agent_id.as_str()).collect();
         assert!(
             all_ids.contains(&direct_id.as_str()),
             "direct session should be in full list"
         );
+        for (prefix, id) in excluded_prefixes.iter().zip(&prefixed_ids) {
+            assert!(
+                all_ids.contains(&id.as_str()),
+                "{prefix} session should be in full list"
+            );
+        }
 
-        // Exclude manager_ + transient prefixes → only the direct session remains.
+        // Excluding manager_ + every transient prefix → only the direct session remains.
         let excluded = store()
-            .list_sessions_with_metadata_excluding(&["manager_", "ticket_", "ask_", "maintainer_"])
+            .list_sessions_with_metadata_excluding(&excluded_prefixes)
             .await;
         let excluded_ids: Vec<&str> = excluded.iter().map(|s| s.agent_id.as_str()).collect();
         assert!(
             excluded_ids.contains(&direct_id.as_str()),
             "direct session should survive exclusion"
         );
-        assert!(
-            !excluded_ids.contains(&manager_id.as_str()),
-            "manager_ prefix should be excluded"
-        );
-        assert!(
-            !excluded_ids.contains(&ticket_id.as_str()),
-            "ticket_ prefix should be excluded"
-        );
-        assert!(
-            !excluded_ids.contains(&ask_id.as_str()),
-            "ask_ prefix should be excluded"
-        );
-        assert!(
-            !excluded_ids.contains(&maintainer_id.as_str()),
-            "maintainer_ prefix should be excluded"
-        );
+        for (prefix, id) in excluded_prefixes.iter().zip(&prefixed_ids) {
+            assert!(
+                !excluded_ids.contains(&id.as_str()),
+                "{prefix} session should be excluded"
+            );
+        }
     }
 
     /// Empty messages are not appended by [`Session::init`].  Recovery retries
@@ -1742,8 +1742,8 @@ mod estimate_tests {
 // Limitations: `forward_no_collision_with_user_facing_agent_ids` covers
 // `direct_agent_id()` and `manager_agent_id()` patterns.
 // `reverse_transient_builders_use_registered_prefixes` covers all transient
-// builders (ticket, ask, maintainer, discovery). If a new transient role
-// adds an agent ID builder, add it to the reverse test.
+// builders (one per prefix in TRANSIENT_AGENT_ID_PREFIXES). If a new transient
+// role adds an agent ID builder, add it to the reverse test.
 // Channel-name collision (a channel registered as "ticket" or "ask") is an
 // orthogonal risk — `starts_with` matches the first key segment (channel
 // name), which cannot be guarded by assertion because channel names are
