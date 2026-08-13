@@ -912,6 +912,15 @@ pub async fn load_or_init() -> Result<()> {
     Ok(())
 }
 
+/// First value in `kvs` whose key matches any of `legacy` (in order).
+fn first_legacy_value<'a>(kvs: &'a [(String, String)], legacy: &[&str]) -> Option<&'a str> {
+    legacy.iter().find_map(|k| {
+        kvs.iter()
+            .find(|(kk, _)| kk.as_str() == *k)
+            .map(|(_, v)| v.as_str())
+    })
+}
+
 /// Reload config from the `config.db` database, atomically swapping the
 /// runtime config. Called at startup (after config_db init) to overlay
 /// persisted settings on top of hardcoded defaults.
@@ -931,30 +940,20 @@ pub async fn reload_from_db() -> Result<()> {
     // value. The legacy keys remain as orphaned config_kv rows (harmless; a
     // downgrade would resurrect them — accepted).
     if config.video_model.is_none() {
-        for legacy in ["video_edit_model", "video_gen_model"] {
-            if let Some((_, value)) = kvs.iter().find(|(k, _)| k.as_str() == legacy) {
-                config.video_model = Some(value.clone());
-                break;
-            }
-        }
+        config.video_model =
+            first_legacy_value(&kvs, &["video_edit_model", "video_gen_model"]).map(String::from);
     }
 
     // Migrate the legacy image_transcription_* keys into media_transcription_*
     // (the transcriber now handles images and videos). The legacy keys remain
     // as orphaned config_kv rows (harmless; a downgrade would resurrect them).
-    if config.media_transcription_model.is_none()
-        && let Some((_, value)) = kvs
-            .iter()
-            .find(|(k, _)| k.as_str() == "image_transcription_model")
-    {
-        config.media_transcription_model = Some(value.clone());
+    if config.media_transcription_model.is_none() {
+        config.media_transcription_model =
+            first_legacy_value(&kvs, &["image_transcription_model"]).map(String::from);
     }
-    if config.media_transcription_provider.is_none()
-        && let Some((_, value)) = kvs
-            .iter()
-            .find(|(k, _)| k.as_str() == "image_transcription_provider")
-    {
-        config.media_transcription_provider = Some(value.clone());
+    if config.media_transcription_provider.is_none() {
+        config.media_transcription_provider =
+            first_legacy_value(&kvs, &["image_transcription_provider"]).map(String::from);
     }
 
     let roles = store.get_all_role_configs().await?;
