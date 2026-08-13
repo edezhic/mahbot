@@ -38,7 +38,7 @@ use crate::config::CONFIG;
 use crate::turso;
 use crate::util::UnwrapPoison;
 use crate::util::hex_string;
-use crate::util::model_state::{AtomicModelState, ModelState};
+use crate::util::model_state::{AtomicModelState, ModelLoadGuard, ModelState};
 use crate::vector::cosine_similarity;
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -3346,6 +3346,8 @@ async fn ensure_models_downloaded() -> Result<PathBuf> {
 }
 
 async fn download_retry_loop() {
+    // Transitions Loading→Failed on drop if the loop is cancelled or panics.
+    let _guard = ModelLoadGuard::new(&MODELS_STATE);
     let Some(dir) = models_subdir(MODEL_DIR_NAME) else {
         warn!("Voice models: cannot resolve model directory");
         MODELS_STATE.store(ModelState::Failed, Ordering::Release);
@@ -3419,15 +3421,19 @@ async fn download_retry_loop() {
     }
 }
 
-/// Atomically reset the model state from `Failed` to `Uninit` and re-spawn
-/// the download retry loop.  Returns `true` if a retry was initiated, `false`
-/// if the state was not `Failed` (e.g. already loading or ready).
+/// Atomically reset the model state from `Failed` to `Uninit`, claim `Loading`
+/// and re-spawn the download retry loop.  Returns `true` if a retry was
+/// initiated, `false` if the state was not `Failed` or the `Uninit → Loading`
+/// claim was lost to a concurrent spawn.
 ///
 /// This is the primary recovery mechanism for [`VoiceStatus::ModelError`].
 /// Callers that hold a [`PipelineCtx`] should prefer the debounced
 /// [`PipelineCtx::try_retry_models`] instead to avoid rapid retry storms.
 fn retry_model_loading() -> bool {
     if !MODELS_STATE.transition(ModelState::Failed, ModelState::Uninit) {
+        return false;
+    }
+    if !MODELS_STATE.transition(ModelState::Uninit, ModelState::Loading) {
         return false;
     }
     set_status(VoiceStatus::LoadingModels);
