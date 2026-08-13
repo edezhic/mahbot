@@ -1543,7 +1543,6 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         Role::Engineer,
         &message,
         &agent_id,
-        None,
     )
     .await
     else {
@@ -2180,7 +2179,6 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         Role::Sanitation,
         &prompt,
         &format!("ticket_{job_id}_sanitation"),
-        None,
     )
     .await
     else {
@@ -3179,7 +3177,6 @@ async fn spawn_single_slot_round(
     role: Role,
     prompt: &str,
     agent_id: &str,
-    review_base: Option<i64>,
 ) -> anyhow::Result<TicketStageSlot> {
     let slot = TicketStageSlot {
         idx: 0,
@@ -3208,7 +3205,7 @@ async fn spawn_single_slot_round(
             stage: stage.to_string(),
             phase: phase.as_ref().to_string(),
             round: next_ticket_stage_round(&crate::session::store().conn, &ticket.id, stage).await,
-            review_base,
+            review_base: None,
         },
     )
     .await?;
@@ -4478,13 +4475,7 @@ async fn resume_sanitation_round(job_id: &str, ticket: Ticket, ws: Workspace) {
     if bail_if_phase_moved(&ticket.id, TicketPhase::InSanitation, job_id).await {
         return;
     }
-    let agent_id = format!("ticket_{job_id}_sanitation");
-    let incoming_rx = register_agent_and_assign(
-        &ticket.id,
-        &agent_id,
-        "Failed to persist assigned_to for resumed sanitation — comments may not route",
-    )
-    .await;
+    let (agent_id, incoming_rx) = register_sanitation_agent(&ticket.id, job_id).await;
     let has_session = crate::session::store().has_content(&agent_id).await;
     let message = if has_session {
         String::new()
