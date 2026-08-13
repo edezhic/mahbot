@@ -80,57 +80,36 @@ pub const DRAIN_CAP_SECS: u64 = 10 * 60;
 pub const PURGE_CUTOFF_HOURS: i64 = 8;
 
 // ── Row model ───────────────────────────────────────────────────────────
-// The full row shape mirrors the DB schema — fields unused by today's scan
-// paths are read by future resume/telemetry paths, so dead-code warnings are
-// suppressed at the struct level.
+// Only the columns actually read by the scan paths are copied into memory;
+// caller identity (task/role/user_name/channel) is re-queried on demand by
+// `job_caller` instead of being carried on the row structs. The DB schema
+// columns stay as-is — a future path re-adds a field when it reads one.
 
 /// A row of the `jobs` table.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct JobRow {
     pub id: String,
     pub kind: String,
-    pub status: String,
-    pub task: String,
     pub workspace_name: String,
-    pub user_name: String,
-    pub channel: String,
-    pub role: String,
     pub retry_count: i64,
-    pub created_at: String,
-    pub updated_at: String,
 }
 
 /// A row of the `agents` table.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct AgentRow {
-    pub job_id: Option<String>,
     pub agent_id: String,
-    pub kind: String,
     pub idx: Option<i64>,
-    pub role: String,
     pub status: String,
     pub outcome: Option<String>,
     pub task: String,
-    pub created_at: String,
 }
 
 /// A row of the `pending_jobs` table.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct PendingJobRow {
     pub id: String,
     pub target_agent_id: String,
-    pub kind: String,
     pub envelope: String,
-    pub workspace_name: String,
-    pub user_name: String,
-    pub channel: String,
-    pub role: String,
-    pub reply_target: String,
-    pub started: i64,
-    pub attempts: i64,
     pub created_at: String,
 }
 
@@ -138,29 +117,18 @@ fn job_row_from(row: &Row) -> anyhow::Result<JobRow> {
     Ok(JobRow {
         id: row.get(0)?,
         kind: row.get(1)?,
-        status: row.get(2)?,
-        task: row.get(3)?,
-        workspace_name: row.get(4)?,
-        user_name: row.get(5)?,
-        channel: row.get(6)?,
-        role: row.get(7)?,
-        retry_count: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        workspace_name: row.get(2)?,
+        retry_count: row.get(3)?,
     })
 }
 
 fn agent_row_from(row: &Row) -> anyhow::Result<AgentRow> {
     Ok(AgentRow {
-        job_id: row.get(0)?,
-        agent_id: row.get(1)?,
-        kind: row.get(2)?,
-        idx: row.get(3)?,
-        role: row.get(4)?,
-        status: row.get(5)?,
-        outcome: row.get(6)?,
-        task: row.get(7)?,
-        created_at: row.get(8)?,
+        agent_id: row.get(0)?,
+        idx: row.get(1)?,
+        status: row.get(2)?,
+        outcome: row.get(3)?,
+        task: row.get(4)?,
     })
 }
 
@@ -168,16 +136,8 @@ fn pending_row_from(row: &Row) -> anyhow::Result<PendingJobRow> {
     Ok(PendingJobRow {
         id: row.get(0)?,
         target_agent_id: row.get(1)?,
-        kind: row.get(2)?,
-        envelope: row.get(3)?,
-        workspace_name: row.get(4)?,
-        user_name: row.get(5)?,
-        channel: row.get(6)?,
-        role: row.get(7)?,
-        reply_target: row.get(8)?,
-        started: row.get(9)?,
-        attempts: row.get(10)?,
-        created_at: row.get(11)?,
+        envelope: row.get(2)?,
+        created_at: row.get(3)?,
     })
 }
 
@@ -624,9 +584,8 @@ pub(crate) async fn job_retry_count(conn: &Connection, job_id: &str) -> i64 {
 pub(crate) async fn list_active_jobs(conn: &Connection) -> Result<Vec<JobRow>> {
     let rows = conn
         .query(
-            "SELECT id, kind, status, task, workspace_name, user_name, channel, role, \
-             retry_count, created_at, updated_at FROM jobs WHERE status != 'done' \
-             ORDER BY created_at",
+            "SELECT id, kind, workspace_name, retry_count FROM jobs \
+             WHERE status != 'done' ORDER BY created_at",
             (),
         )
         .await
@@ -638,7 +597,7 @@ pub(crate) async fn list_active_jobs(conn: &Connection) -> Result<Vec<JobRow>> {
 pub(crate) async fn list_agents_for_job(conn: &Connection, job_id: &str) -> Result<Vec<AgentRow>> {
     let rows = conn
         .query(
-            "SELECT job_id, agent_id, kind, idx, role, status, outcome, task, created_at \
+            "SELECT agent_id, idx, status, outcome, task \
              FROM agents WHERE job_id = ?1 ORDER BY idx",
             params![job_id],
         )
@@ -732,8 +691,8 @@ pub async fn run_drain_watch() {
 pub(crate) async fn list_pending_jobs(conn: &Connection) -> Result<Vec<PendingJobRow>> {
     let rows = conn
         .query(
-            "SELECT id, target_agent_id, kind, envelope, workspace_name, user_name, channel, role, \
-             reply_target, started, attempts, created_at FROM pending_jobs ORDER BY created_at",
+            "SELECT id, target_agent_id, envelope, created_at \
+             FROM pending_jobs ORDER BY created_at",
             (),
         )
         .await
