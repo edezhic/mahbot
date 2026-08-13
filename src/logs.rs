@@ -187,7 +187,7 @@ CREATE TABLE IF NOT EXISTS llm_requests (
     -- Only reliable while the store survives boot — quarantine recreation
     -- resets history.
     -- Existing rows keep NULL (or response_format 0) via
-    -- `migrate_llm_requests_columns` (append-only).
+    -- `add_columns_if_missing` (append-only).
     cost                REAL,
     cost_details        TEXT,
     upstream_provider   TEXT,
@@ -286,14 +286,33 @@ impl LogStore {
             .context("Failed to migrate verdict_scores shape")?;
         // Guarded llm_requests column additions — append-only ALTERs for
         // legacy stores; a fresh store already carries the columns.
-        migrate_llm_requests_columns(&store.conn)
-            .await
-            .context("Failed to migrate llm_requests columns")?;
+        add_columns_if_missing(
+            &store.conn,
+            "llm_requests",
+            &[
+                ("cost", "REAL"),
+                ("cost_details", "TEXT"),
+                ("upstream_provider", "TEXT"),
+                ("system_fingerprint", "TEXT"),
+                ("response_format", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        )
+        .await
+        .context("Failed to migrate llm_requests columns")?;
         // Guarded retry_failures column additions (retry-cause telemetry
         // context) — same append-only semantics as the llm_requests migration.
-        migrate_retry_failures_columns(&store.conn)
-            .await
-            .context("Failed to migrate retry_failures columns")?;
+        add_columns_if_missing(
+            &store.conn,
+            "retry_failures",
+            &[
+                ("purpose", "TEXT NOT NULL DEFAULT ''"),
+                ("role", "TEXT NOT NULL DEFAULT ''"),
+                ("workspace", "TEXT NOT NULL DEFAULT ''"),
+                ("cause", "TEXT NOT NULL DEFAULT ''"),
+            ],
+        )
+        .await
+        .context("Failed to migrate retry_failures columns")?;
         Ok(store)
     }
 
@@ -566,60 +585,25 @@ pub(crate) async fn migrate_verdict_scores_shape(conn: &turso::Connection) -> an
     Ok(())
 }
 
-/// Guarded append-only column additions for the `llm_requests` table
-/// (cost / cost_details / upstream_provider / system_fingerprint /
-/// response_format observability fields). `CREATE TABLE IF NOT EXISTS` does
+/// Guarded append-only column additions: `CREATE TABLE IF NOT EXISTS` does
 /// not add columns to existing stores, so legacy logs.db files are migrated
 /// here — idempotent via the `column_exists` guard, and additive: existing
-/// rows keep NULL (or the `response_format` default 0), never rewritten.
-///
-/// Historical note: pre-migration rows from the json_object-forcing call
-/// sites (every extraction-choke-point purpose plus consolidation and
-/// synthesis) record `response_format` 0 even though those requests forced
-/// it on the wire — the flag is unreliable over the pre-migration window by
-/// design (append-only).
-pub(crate) async fn migrate_llm_requests_columns(conn: &turso::Connection) -> anyhow::Result<()> {
-    for (column, ddl) in [
-        ("cost", "REAL"),
-        ("cost_details", "TEXT"),
-        ("upstream_provider", "TEXT"),
-        ("system_fingerprint", "TEXT"),
-        ("response_format", "INTEGER NOT NULL DEFAULT 0"),
-    ] {
-        if !turso::column_exists(conn, "llm_requests", column).await? {
+/// rows keep their defaults, never rewritten. No indexes on the migrated
+/// columns: the schema batch runs before this migration, so an index on a
+/// not-yet-added column would abort the batch and quarantine the store.
+pub(crate) async fn add_columns_if_missing(
+    conn: &turso::Connection,
+    table: &str,
+    columns: &[(&str, &str)],
+) -> anyhow::Result<()> {
+    for (column, ddl) in columns {
+        if !turso::column_exists(conn, table, column).await? {
             conn.execute(
-                &format!("ALTER TABLE llm_requests ADD COLUMN {column} {ddl}"),
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"),
                 (),
             )
             .await
-            .with_context(|| format!("Failed to add {column} column to llm_requests"))?;
-        }
-    }
-    Ok(())
-}
-
-/// Guarded append-only column additions for the `retry_failures` table
-/// (purpose / role / workspace / cause retry-cause telemetry context).
-/// `CREATE TABLE IF NOT EXISTS` does not add columns to existing stores, so
-/// legacy logs.db files are migrated here — idempotent via the
-/// `column_exists` guard, and additive: existing rows keep the empty-string
-/// defaults, never rewritten. No indexes on the migrated columns (the schema
-/// batch runs before this migration — an index on a not-yet-added column
-/// would abort it and quarantine the store).
-pub(crate) async fn migrate_retry_failures_columns(conn: &turso::Connection) -> anyhow::Result<()> {
-    for (column, ddl) in [
-        ("purpose", "TEXT NOT NULL DEFAULT ''"),
-        ("role", "TEXT NOT NULL DEFAULT ''"),
-        ("workspace", "TEXT NOT NULL DEFAULT ''"),
-        ("cause", "TEXT NOT NULL DEFAULT ''"),
-    ] {
-        if !turso::column_exists(conn, "retry_failures", column).await? {
-            conn.execute(
-                &format!("ALTER TABLE retry_failures ADD COLUMN {column} {ddl}"),
-                (),
-            )
-            .await
-            .with_context(|| format!("Failed to add {column} column to retry_failures"))?;
+            .with_context(|| format!("Failed to add {column} column to {table}"))?;
         }
     }
     Ok(())
@@ -1938,20 +1922,21 @@ mod tests {
         );
     }
 
-    /// `migrate_llm_requests_columns` on a legacy-shaped store: additive,
-    /// preserves existing rows (append-only), and is idempotent.
+    /// `add_columns_if_missing` on a legacy-shaped `llm_requests` store:
+    /// additive, preserves existing rows (append-only), and is idempotent.
     #[tokio::test]
-    async fn migrate_llm_requests_columns_legacy_shape() {
+    async fn add_columns_if_missing_llm_requests_legacy_shape() {
         let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
+        const COLUMNS: &[(&str, &str)] = &[
+            ("cost", "REAL"),
+            ("cost_details", "TEXT"),
+            ("upstream_provider", "TEXT"),
+            ("system_fingerprint", "TEXT"),
+            ("response_format", "INTEGER NOT NULL DEFAULT 0"),
+        ];
         // Simulate a legacy store (pre-observability-fields): drop the new
         // columns, seed a row.
-        for column in [
-            "cost",
-            "cost_details",
-            "upstream_provider",
-            "system_fingerprint",
-            "response_format",
-        ] {
+        for (column, _) in COLUMNS {
             store
                 .conn
                 .execute(
@@ -1973,7 +1958,7 @@ mod tests {
             .await
             .unwrap();
 
-        crate::logs::migrate_llm_requests_columns(&store.conn)
+        crate::logs::add_columns_if_missing(&store.conn, "llm_requests", COLUMNS)
             .await
             .expect("migration must succeed");
 
@@ -1983,13 +1968,7 @@ mod tests {
             .await
             .unwrap();
         let names: Vec<String> = cols.iter().map(|r| r.get::<String>(1).unwrap()).collect();
-        for column in [
-            "cost",
-            "cost_details",
-            "upstream_provider",
-            "system_fingerprint",
-            "response_format",
-        ] {
+        for (column, _) in COLUMNS {
             assert!(names.contains(&column.to_string()), "missing {column}");
         }
         // Old row survives with NULL new columns (append-only, no rewrite).
@@ -2009,7 +1988,7 @@ mod tests {
         assert_eq!(row.get::<Option<String>>(2).expect("provider"), None);
         assert_eq!(row.get::<i64>(3).expect("response_format"), 0);
         // Idempotent — a second run no-ops.
-        crate::logs::migrate_llm_requests_columns(&store.conn)
+        crate::logs::add_columns_if_missing(&store.conn, "llm_requests", COLUMNS)
             .await
             .expect("second migration run must no-op");
         let row = store
