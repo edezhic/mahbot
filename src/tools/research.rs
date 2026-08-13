@@ -67,7 +67,7 @@ const CONFIRM_FAILED: &str =
 /// `MAHBOT_ROUND_TIMEOUT_SECS`). Counted from the stage's own start.
 const DEFAULT_WRAP_UP_TIMEOUT_SECS: u64 = 5 * 60;
 
-/// Resume pointer for a durable research run (decision 7): the 5-value stage
+/// Resume pointer for a durable research run: the 5-value stage
 /// enum (plus implicit Done).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2618,10 +2618,9 @@ async fn run_deep_research(
     // Hold a non-agent-call guard for the WHOLE run: the drain-watch fires the
     // token only when both registries are empty, and this guard bridges the
     // inter-phase windows (analyst deregistration → the next orchestrator LLM
-    // call) so the token is never fired into a just-about-to-start call
-    // (decision: do NOT fire the token while draining). The orchestrator
-    // checks the drain at every round boundary and exits via the partial-report
-    // path, releasing the guard promptly.
+    // call) so the token is never fired into a just-about-to-start call. The
+    // orchestrator checks the drain at every round boundary and exits via the
+    // partial-report path, releasing the guard promptly.
     let _orchestrator_guard =
         crate::call_registry::NON_AGENT_CALLS.register("research_orchestrator", &ws.name);
     let start = Instant::now();
@@ -3006,7 +3005,7 @@ mod tests {
         );
     }
 
-    /// Direct resume test for `resume_research_run` (decision 8): a job
+    /// Direct resume test for `resume_research_run`: a job
     /// checkpointed at stage=Verification with pre-populated verification
     /// resumes — it re-enters the orchestrator, synthesizes from the
     /// accumulated evidence (ONE provider call), skips the verification pass

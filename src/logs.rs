@@ -277,7 +277,7 @@ impl LogStore {
             }
             Err(OpenFailure::Other(e)) => return Err(e),
         };
-        // Guarded verdict_scores shape migration (decision 4): runs at
+        // Guarded verdict_scores shape migration: runs at
         // store open, idempotent — a re-run finds the new shape and no-ops.
         // The quarantine-recreate path produces the new shape directly via
         // LOGS_SCHEMA, so the guard is a no-op there too.
@@ -538,7 +538,7 @@ async fn open_verified_logs_store(root: &Path) -> Result<crate::turso::Connectio
 /// WITHOUT the job_id column), then one-tx DROP+CREATE with the new shape
 /// (PK (job_id, agent_index)). Idempotent — a re-run finds the new shape and
 /// no-ops. Historical rows (~2 days of telemetry, unmappable to the new PK)
-/// are dropped per user approval (decision 22).
+/// are dropped per user approval.
 pub(crate) async fn migrate_verdict_scores_shape(conn: &turso::Connection) -> anyhow::Result<()> {
     let has_table = conn
         .query_row(

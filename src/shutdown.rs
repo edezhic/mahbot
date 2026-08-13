@@ -20,7 +20,7 @@ fn global_shutdown() -> &'static CancellationToken {
     GLOBAL_SHUTDOWN.get_or_init(CancellationToken::new)
 }
 
-/// Global graceful-drain flag (decision 2): set by the first shutdown signal
+/// Global graceful-drain flag: set by the first shutdown signal
 /// (SIGINT / window-close / self-update). Distinct from the cancellation
 /// token — during the drain the token is NOT fired, so in-flight LLM calls
 /// (which race the token around the HTTP send) survive to complete their

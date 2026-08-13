@@ -222,7 +222,7 @@ async fn dispatch_durable_ask(
     let result =
         match run_ask_with_job(ws, ask, &job_id, caller_role, &user_name, &channel, false).await {
             Ok(AskRunOutcome::DrainCut) => {
-                // Drain-cut (decision 20): analyst outcomes are already
+                // Drain-cut: analyst outcomes are already
                 // checkpointed — leave the job status='launched' for boot resume
                 // (recoverable via ask_jobs checkpoints). No terminalization, no
                 // error envelope: a spurious envelope here would discard the
@@ -457,7 +457,7 @@ async fn run_ask_slots(
         .collect()
 }
 
-/// Boot resume of an ask round (decision 8): re-run not-done roster slots with
+/// Boot resume of an ask round: re-run not-done roster slots with
 /// their stored tasks, reconstruct done slots from stored outcomes, then
 /// re-consolidate. The consolidated result is terminalized into a pending
 /// envelope exactly like a fresh dispatch — delivered to the ORIGINAL caller

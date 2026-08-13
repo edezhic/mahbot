@@ -479,7 +479,7 @@ pub struct Dashboard {
     /// subscription, which must not be mistaken for an exit request. If the
     /// update fails, this flag makes the GUI run its own checkpoint + exit.
     exit_requested_during_update: bool,
-    /// Graceful-drain window active (decision 3): the window stays open with a
+    /// Graceful-drain window active: the window stays open with a
     /// "shutting down…" banner + disabled input until the drain completes.
     draining: bool,
     logs_state: logs::LogsState,
@@ -994,8 +994,8 @@ impl Dashboard {
                     crate::shutdown::force_cancel();
                     Task::none()
                 } else {
-                    // First window-close begins the GRACEFUL drain (decision
-                    // 2): the window stays open with the "shutting down…"
+                    // First window-close begins the GRACEFUL drain: the
+                    // window stays open with the "shutting down…"
                     // banner; the drain-watch fires the token when no
                     // in-flight work remains (or force-cancels at the cap).
                     // save_and_exit is deferred until Message::Shutdown.

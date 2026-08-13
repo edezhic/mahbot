@@ -1202,8 +1202,8 @@ fn consume_substitution(
 /// stripped first). Mis-splitting flips `is_chained` in
 /// [`process_shell_output`] and disables standalone-only output transforms.
 fn extract_command_segments(command: &str) -> Vec<String> {
-    // Heredoc bodies are excluded from command scanning (see decision 10 of
-    // the read-only shell guard contract): body text must never be segmented
+    // Heredoc bodies are excluded from command scanning (see the read-only
+    // shell guard contract): body text must never be segmented
     // as commands, and redirect operators inside bodies must not be scanned.
     let scan = readonly::strip_heredoc_bodies(command);
     segment_command(&scan, SegmentMode::Profile)
@@ -1410,7 +1410,7 @@ pub(super) fn segment_command(command: &str, mode: SegmentMode) -> Option<Vec<(S
 /// to avoid duplicating the flag-skipping loop. The toolchain/stderr-capture
 /// skipping fixes the subcommand-resolution bugs where `cargo +nightly build`
 /// or `git --version 2>&1` parsed the toolchain/suffix as the subcommand
-/// (guard contract, resolved decision 11).
+/// (guard contract, resolved).
 pub(super) fn find_first_non_flag_index(words: &[&str], is_git: bool) -> Option<usize> {
     let mut i = 0;
     while i < words.len() {
@@ -2575,7 +2575,7 @@ mod tests {
                 ..Default::default()
             },
             // ── Multi-line commands (newline = command separator) ─────────
-            // Decision 10 regression: newline splitting in the shared
+            // Regression: newline splitting in the shared
             // extract_command_segments changes is_chained, which disables
             // standalone_only output transforms (compact_ls, cargo test state
             // machine) for multi-line commands. Raw output must pass through.
@@ -2605,7 +2605,7 @@ mod tests {
                 eq: Some("test result: ok. 1 passed; 0 failed"),
                 ..Default::default()
             },
-            // Decision-10 regression: a heredoc whose UNQUOTED body contains a
+            // Regression: a heredoc whose UNQUOTED body contains a
             // command substitution emits that substitution as its own segment
             // (it must remain scanned — bash executes `$()` in unquoted
             // bodies), so the command becomes chained and standalone-only
@@ -3680,7 +3680,7 @@ mod tests {
             ("cargo --release --verbose build", "cargo build"),
             // ── Toolchain specifiers and stderr-capture suffixes ───
             // `+nightly`-style toolchain specifiers and `2>&1`/`1>&2` suffixes
-            // must never become the parsed subcommand (decision 11).
+            // must never become the parsed subcommand.
             ("cargo +nightly build", "cargo build"),
             ("cargo +stable check", "cargo check"),
             ("cargo build 2>&1", "cargo build"),

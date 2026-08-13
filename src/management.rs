@@ -638,7 +638,7 @@ async fn notify_ticket(
 
 #[allow(clippy::too_many_lines)]
 pub async fn run_management() {
-    // Boot recovery scan (decision 7): first statement of run_management,
+    // Boot recovery scan: first statement of run_management,
     // BEFORE reset_inflight_tickets. Replays pending envelopes, materializes
     // the resumed-ticket exclusion set, resets everything else, and returns
     // the ticket_stage jobs selected for resume.
@@ -1591,7 +1591,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         return;
     }
 
-    // Drain-cut (decision 20): the job stays status='launched' for boot resume —
+    // Drain-cut: the job stays status='launched' for boot resume —
     // no failure record. Returned BEFORE the failure comment so drained agents
     // never emit AGENT_FAILURE_EMOJI or drive exit-time rollback.
     if response.is_none() && crate::shutdown::aborting() {
@@ -2003,8 +2003,8 @@ async fn register_agent_and_assign(
 /// (`route_comment_to_agents` → `try_route`). [`BoardStore::claim_sanitation`]
 /// stores the **ticket**-derived base ID (`ticket_{ticket_id}_sanitation`) as a
 /// claim-time placeholder, but the run agent registers under a
-/// **job**-derived per-run ID (`ticket_{job_id}_sanitation` — decision 11;
-/// each run starts a fresh session). Without this step the two never match and
+/// **job**-derived per-run ID (`ticket_{job_id}_sanitation`; each run starts
+/// a fresh session). Without this step the two never match and
 /// mid-run comments are silently dropped.
 ///
 /// Setting `assigned_to` here — rather than only in `claim_sanitation` —
@@ -2140,7 +2140,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
 
     // Spawn the durable sanitation round BEFORE the session write — the job
     // is the resume handle. The agent ID is derived per-run from the job id
-    // (decision 11: `ticket_{job_id}_sanitation`); the roster row carries the
+    // (`ticket_{job_id}_sanitation`); the roster row carries the
     // ACTUAL run id so the purge live-session protection and resume paths
     // match the real session.
     let job_id = crate::generate_id();
@@ -2185,7 +2185,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         return;
     }
 
-    // Drain-cut (decision 20): the job stays status='launched' for boot resume —
+    // Drain-cut: the job stays status='launched' for boot resume —
     // no failure record.
     if response.is_none() && crate::shutdown::aborting() {
         info!(
@@ -3467,7 +3467,7 @@ async fn process_analyst_verdicts(
     // joint-comment role (stage_name) so both stores agree.
     persist_verdict_scores(ticket, stage_name(Role::Analyst), results, job_id).await;
 
-    // No exit-time transition during the graceful drain (decision 20): the
+    // No exit-time transition during the graceful drain: the
     // outcomes are checkpointed on the roster; the job stays status='launched'
     // and boot resume re-processes them. A drained analysis round must NOT
     // write a misleading joint comment or Notify the Manager.
@@ -3874,7 +3874,7 @@ async fn process_verifier_verdicts(
     } else {
         (verifier.success_phase, NotifyPolicy::Buffer)
     };
-    // No exit-time ticket rollback (decision 20): during the graceful drain a
+    // No exit-time ticket rollback: during the graceful drain a
     // failed round must NOT drive the ticket to Failed, bounce it, or pause
     // the workspace — the job stays status='launched' for boot resume, which
     // re-processes the stored outcomes. Suppresses ALL transitions (consistent
@@ -4157,7 +4157,7 @@ async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> (usize, Op
     (count, to_freeze)
 }
 
-/// Resume a ticket_stage round at boot (decisions 7/8): re-run missing roster
+/// Resume a ticket_stage round at boot: re-run missing roster
 /// slots FIRST, then re-process verdicts from stored outcomes when all are
 /// present. Silent background resume — no Manager notifications; results
 /// deliver via normal paths (board comment/transition).
@@ -4367,7 +4367,7 @@ async fn resume_engineer_round(job_id: &str, ticket: Ticket, ws: Workspace) {
     if bail_if_phase_moved(&ticket.id, TicketPhase::InDevelopment, job_id).await {
         return;
     }
-    // Idempotent anchor (re)upsert at the START (decision 10): a crash between
+    // Idempotent anchor (re)upsert at the START: a crash between
     // spawn_single_slot_round and the fresh-dispatch upsert (two adjacent
     // awaits) leaves this round WITHOUT a NULL-seat anchor — after CASCADE the
     // accumulated session `ticket_{id}_engineer` would lose TTL protection and
@@ -4619,7 +4619,7 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
     // returned false): the job stays status='launched' for boot resume — the
     // stored outcomes are re-processed at boot via the phase-locked ticket.
     // Terminalizing here would discard completed/checkpointed outcomes and
-    // force a whole-round re-run (decision 20 violation).
+    // force a whole-round re-run.
     if !transitioned && crate::shutdown::aborting() {
         info!(
             ticket = %ticket.id,

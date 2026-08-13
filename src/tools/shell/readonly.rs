@@ -606,7 +606,7 @@ fn resolve_path_word(word: &str, state: &ValidationState) -> Option<std::path::P
         return None;
     }
     // Tilde paths resolve to $HOME (or another user's home) — never under a
-    // temp root (decision 6), so they always reject.
+    // temp root, so they always reject.
     if content.starts_with('~') {
         return None;
     }
@@ -828,7 +828,7 @@ enum VarValue {
 ///   in the chain takes precedence over tracked-cwd resolution (bash sets
 ///   `$PWD` from the assignment, and a poisoned non-temp assignment must not
 ///   be masked by the tracked CWD).
-/// - `$HOME` and poisoned variables are always `Blocked` (decision 6).
+/// - `$HOME` and poisoned variables are always `Blocked`.
 /// - Bound variables (TMPDIR/TMP/TEMP from the session env, plus any variable
 ///   assigned a temp-root value in the chain) resolve to their value or
 ///   [`VarValue::TempRoot`] when the value is a fresh `$(mktemp -d)` root.
@@ -897,7 +897,7 @@ fn is_path_under_temp(path: &std::path::Path, ctx: &CheckContext) -> bool {
 /// Validation context for a read-only shell command: the workspace root,
 /// temp roots, and session-environment snapshot of the session being
 /// validated — never the daemon process's environment (see the guard
-/// contract, resolved decisions 6 and 9).
+/// contract).
 #[derive(Debug, Clone)]
 pub(super) struct CheckContext {
     /// Workspace root of the session being validated. Initial tracked CWD and
@@ -943,7 +943,7 @@ struct VarBinding {
 struct ValidationState<'a> {
     ctx: &'a CheckContext,
     /// Tracked current directory. `None` = fail-closed: relative paths reject
-    /// (decision 7 — any non-literal-absolute `cd` form resets tracking).
+    /// (any non-literal-absolute `cd` form resets tracking).
     cwd: Option<std::path::PathBuf>,
     /// Number of `cd`/`pushd`/`popd` verbs (incl. eval-body cds) executed so
     /// far in the current-shell context. Construct parsers compare a part's
@@ -2581,7 +2581,7 @@ fn scratch_paths_under_temp(segment: &str, state: &ValidationState) -> bool {
 /// True when a temp mutator's path arguments all resolve under an allowed
 /// temp root. `cp` is special-cased: only the destination must be under temp
 /// (sources are read-only — copying from anywhere into temp is allowed;
-/// copying into the workspace stays blocked, contract decision 8).
+/// copying into the workspace stays blocked).
 fn temp_mutator_paths_under_temp(segment: &str, first_word: &str, state: &ValidationState) -> bool {
     if first_word == "cp" {
         return cp_destination_under_temp(segment, state);
@@ -2589,7 +2589,7 @@ fn temp_mutator_paths_under_temp(segment: &str, first_word: &str, state: &Valida
     scratch_paths_under_temp(segment, state)
 }
 
-/// Identify the `cp` destination (contract decision 8): the value of
+/// Identify the `cp` destination: the value of
 /// `-t`/`--target-directory`, or the last non-flag path argument. With no
 /// identifiable destination the command is rejected.
 fn cp_destination_under_temp(segment: &str, state: &ValidationState) -> bool {
@@ -2840,7 +2840,7 @@ fn check_segment(segment: &str, state: &mut ValidationState, negated: bool) -> R
         return Ok(());
     }
 
-    // ── CWD tracking (contract decision 7) ─────────────────────────
+    // ── CWD tracking ───────────────────────────────────────────────
     // A literal absolute `cd` into a directory that exists at validation time
     // (or was created by `mkdir` earlier in the chain) updates the tracked
     // CWD, after skipping `cd` option flags (`-P`/`-L`/`--`); a flag-only
@@ -2915,7 +2915,7 @@ fn check_segment(segment: &str, state: &mut ValidationState, negated: bool) -> R
     // real brace groups at command position (`parse_brace`), and any other
     // `{`-containing verb is classified Unprovable above and rejected.
 
-    // ── Temp-variable bindings (contract decision 5) ───────────────
+    // ── Temp-variable bindings ─────────────────────────────────────
     // `export X=...`, plain `X=...` segments, and env-prefix forms
     // (`TMPDIR=/tmp cmd`) bind the temp variables; a non-temp binding poisons
     // the variable, a temp-root binding clears the poison.
@@ -3074,8 +3074,8 @@ fn process_cd_words(words: &[&str], cd_idx: usize, verb: &str, state: &mut Valid
                 None
             };
         } else {
-            // Filesystem existence checks are expected and acceptable
-            // (decision 7); a nonexistent target fails the command, so
+            // Filesystem existence checks are expected and acceptable;
+            // a nonexistent target fails the command, so
             // tracking resets fail-closed.
             state.cwd = if p.is_dir() { Some(p) } else { None };
         }
@@ -3232,7 +3232,7 @@ fn record_mkdir_targets(segment: &str, state: &mut ValidationState) {
     }
 }
 
-/// Apply temp-variable bindings from a segment (decision 5): `export X=...`,
+/// Apply temp-variable bindings from a segment: `export X=...`,
 /// plain `X=...` assignment segments, and leading env-prefix assignments
 /// (`TMPDIR=/tmp cmd`). Bare `export` / `export NAME` are no-ops.
 ///
@@ -3834,9 +3834,9 @@ fn scan_push_clean_tokens(
     (dry, force)
 }
 
-/// Phase-3 read-only git allowlist rules (contract decisions 3/4 and the
-/// phase-3 scope): `stash show`, `config` read forms, `rebase --show-current`,
-/// `push --dry-run`/`-n`, `clean -n`/`--dry-run`, and `submodule status`.
+/// Phase-3 read-only git allowlist rules: `stash show`, `config` read forms,
+/// `rebase --show-current`, `push --dry-run`/`-n`, `clean -n`/`--dry-run`,
+/// and `submodule status`.
 ///
 /// Returns `Some(result)` when `subcommand` matches one of these prefixes
 /// (the caller returns it directly), `None` when the subcommand is outside
@@ -3865,7 +3865,7 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
         ));
     }
 
-    // git config read/write rule (decision 4): exactly one positional after
+    // git config read/write rule: exactly one positional after
     // `config` (key read) is allowed; two positionals (key + value) write.
     // Explicit get forms (--list, -l, --get, --get-all, --get-regexp,
     // --name-only) are allowed; write/edit forms are blocked.
@@ -3927,8 +3927,8 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
         ))
     } else if subcommand.starts_with("push") {
         // git push --dry-run (-n/--dry-run) performs a network read with no
-        // local mutation; any force token in the same command blocks it
-        // (decision 3). Value-aware: `-o`/`--push-option` and `--repo`
+        // local mutation; any force token in the same command blocks it.
+        // Value-aware: `-o`/`--push-option` and `--repo`
         // consume dry-run/force-looking values, so a real push can't
         // masquerade. (Other push value-takers self-block: `--recurse-
         // submodules` validates its value, `--signed`/`--force-with-lease`
@@ -3945,8 +3945,8 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
             ))
         }
     } else if subcommand.starts_with("clean") {
-        // git clean -n/--dry-run previews removals; any force token blocks it
-        // (decision 3). Value-aware: `-e`/`--exclude` consumes
+        // git clean -n/--dry-run previews removals; any force token blocks it.
+        // Value-aware: `-e`/`--exclude` consumes
         // dry-run/force-looking values, so a real clean can't masquerade.
         let (dry, force) = scan_push_clean_tokens(subcommand, 'e', &["--exclude"]);
         if dry && !force {
@@ -4558,7 +4558,7 @@ fn check_cargo_segment(segment: &str) -> Result<(), String> {
 
     let base = subcommand.split_whitespace().next().unwrap_or("");
 
-    // ── Help/version exemption (decision 1) ────────────────────────
+    // ── Help/version exemption ─────────────────────────────────────
     // `-h`/`--help`/`-V`/`--version` appearing as a standalone token BEFORE a
     // `--` separator is a pure read and is allowed for ANY cargo subcommand,
     // including `run`. Tokens after `--` stay blocked (`cargo run -- --help`).
@@ -4577,8 +4577,7 @@ fn check_cargo_segment(segment: &str) -> Result<(), String> {
     match base {
         "update" => {
             if words.contains(&"--dry-run") {
-                // Dry-run previews changes without modifying Cargo.lock
-                // (phase 3, decision 1/10).
+                // Dry-run previews changes without modifying Cargo.lock.
                 return Ok(());
             }
             return reject(
@@ -6275,7 +6274,7 @@ mod tests {
             ("zip /tmp/out.zip /tmp/file1 /tmp/file2", true),
             // cp: only the DESTINATION must be under temp (sources are
             // read-only — copying from anywhere into temp is allowed;
-            // copying into the workspace stays blocked, decision 8).
+            // copying into the workspace stays blocked).
             ("cp /etc/passwd /tmp/out", true), // source outside temp, dest temp
             // ── Flag-based temp-aware checks ──
             // curl -o to temp → allowed
@@ -6659,7 +6658,7 @@ mod tests {
             ("echo \"$(cd /tmp; touch rel)\"", true),
             ("echo \"$(cd /etc; touch rel)\"", false),
             // Poisoned export in a prior segment applies to a double-quoted
-            // substitution (decision 5 + phase 1.3 integration).
+            // substitution.
             ("export TMPDIR=/etc\necho \"$(touch $TMPDIR/x)\"", false),
             (
                 "export TMPDIR=/__mahbot_readonly_test_ws__\necho \"$(echo hi > $TMPDIR/out)\"",
@@ -6690,7 +6689,7 @@ mod tests {
         let cases = [
             // Export-poisoning bypass: `export TMPDIR=/etc` in a prior segment
             // must poison expansions inside a later substitution (phase 1.3
-            // "verifiably closed" + decision 5).
+            // "verifiably closed").
             ("export TMPDIR=/etc\necho $(touch $TMPDIR/x)", false),
             ("export TMPDIR=/etc\ncat $(echo hi > $TMPDIR/out)", false),
             // Same via the workspace-root spelling.
@@ -6699,7 +6698,7 @@ mod tests {
                 false,
             ),
             // Env-prefix binding in a prior segment poisons a later
-            // substitution (decision 5's env-prefix form).
+            // substitution (env-prefix form).
             ("TMPDIR=/etc true\necho $(touch $TMPDIR/x)", false),
             // Poison cleared by a temp-root rebind before the substitution.
             (
@@ -7046,7 +7045,7 @@ mod tests {
     #[test]
     fn git_read_only_acceptance() {
         let cases = [
-            // Allowed read forms (phase 3, decisions 3/4).
+            // Allowed read forms (phase 3).
             ("git stash show", true),
             ("git stash show stash@{0}", true),
             ("git show-ref", true),

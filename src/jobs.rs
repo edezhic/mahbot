@@ -2,7 +2,7 @@
 //! scan, and stale purge orchestration.
 //!
 //! All rows live in sessions.db — the only DB sharing a transaction domain
-//! with session appends (decision: no cross-DB transactions; ordering and
+//! with session appends (no cross-DB transactions; ordering and
 //! crash-safety per the purge section in the design).
 //!
 //! Table ownership: the DDL is appended to the session SCHEMA const
@@ -647,7 +647,7 @@ pub(crate) async fn list_agents_for_job(conn: &Connection, job_id: &str) -> Resu
     rows.iter().map(agent_row_from).collect()
 }
 
-/// Graceful-drain completion watcher (decision 19/20).
+/// Graceful-drain completion watcher.
 ///
 /// Waits for the drain flag, then polls the agent registry AND the non-agent
 /// call registry. Clean exit: no agent registered AND no orchestrator-only
@@ -672,7 +672,7 @@ pub(crate) async fn list_agents_for_job(conn: &Connection, job_id: &str) -> Resu
 /// recovers via the job's checkpointed state).
 ///
 /// The jobs table is NOT polled for completion: drain-cut rounds intentionally
-/// leave their jobs status='launched' for boot resume (decision 20), so
+/// leave their jobs status='launched' for boot resume, so
 /// "no launched jobs remain" is unreachable in the common case — a count-based
 /// wait would hold the window open for the full cap even after the work
 /// unwound in seconds. The registries are the authoritative in-flight signal;
@@ -681,7 +681,7 @@ pub(crate) async fn list_agents_for_job(conn: &Connection, job_id: &str) -> Resu
 /// and self-healing.
 ///
 /// The GUI window stays open for the whole drain: iced::exit is deferred until
-/// the token fires here (decision 19 — the drain only works while the iced
+/// the token fires here (the drain only works while the iced
 /// runtime lives).
 pub async fn run_drain_watch() {
     use crate::shutdown::{aborting, force_cancel, shutdown, shutdown_token};
@@ -856,7 +856,7 @@ async fn pending_already_appended(conn: &Connection, row: &PendingJobRow) -> boo
 /// (0) Replay outstanding pending_jobs — the boot reclaim path for durable
 /// envelopes (at-least-once delivery). Runs before anything that could purge.
 ///
-/// Dedup semantics (decision 1): the suffix + created_at tiebreaker closes the
+/// Dedup semantics: the suffix + created_at tiebreaker closes the
 /// listener-interleaving race — the scan and channel listeners may run
 /// concurrently, the consumer serializes per agent.
 async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
@@ -890,7 +890,7 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
     Ok(replayed)
 }
 
-/// Stale-job purge with in-place ticket rollback (decision 14).
+/// Stale-job purge with in-place ticket rollback.
 ///
 /// Cutoff = 8h. Deletes jobs whose updated_at predates the cutoff AND whose
 /// roster agents' sessions are all stale too (live sessions referenced by
@@ -1075,7 +1075,7 @@ async fn rollback_stranded_tickets(rollbacks: &[(String, String, bool)]) -> bool
     }
 }
 
-/// Boot recovery scan (decision 7): first statement of run_management, before
+/// Boot recovery scan: first statement of run_management, before
 /// reset_inflight_tickets. Order: (0) replay pending_jobs; (1) ticket_stage
 /// scan → resumed-ticket exclusion set; (2) reworked reset_inflight_tickets
 /// with NOT IN exclusion; (3) research; (4) ask.
@@ -1402,7 +1402,7 @@ mod tests {
     use super::*;
     use crate::turso::params;
 
-    // ── S5 anchor spike (decision 10): turso 0.7.2 must accept the
+    // ── S5 anchor spike: turso 0.7.2 must accept the
     // partial-index UPSERT with identical syntactic WHERE on DDL + UPSERT.
     #[tokio::test]
     async fn anchor_upsert_partial_index_semantics() {
@@ -2242,7 +2242,7 @@ mod tests {
         assert!(after > before, "boot bump must refresh updated_at");
     }
 
-    /// Boot classification (decision 7): launched jobs whose ticket left the
+    /// Boot classification: launched jobs whose ticket left the
     /// expected phase are marked done at boot (closing the "left launched
     /// until purge" gap — reset handles the ticket); done jobs are filtered
     /// out entirely (never re-selected); concurrent launched rounds for the

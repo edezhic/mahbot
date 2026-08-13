@@ -856,7 +856,7 @@ impl HomeState {
             HomeMessage::SendMessage,
             "Type a message... (Enter to send, Shift+Enter for newline)",
             super::widgets::ChatComposerOptions {
-                // Input disabled during the graceful drain (decision 3):
+                // Input disabled during the graceful drain:
                 // sends are blocked while the shutdown banner is up.
                 sending: self.sending || draining,
                 // One line taller than the plain composer so the controls

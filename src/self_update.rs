@@ -364,7 +364,7 @@ pub(crate) async fn execute_update() -> Result<()> {
     //    Telegram channel must still be live for this notification).
     notify_admin("🔄 Starting new instance…", admin_target.as_deref()).await;
 
-    // 10. Begin the graceful drain (decision 21): the FULL drain, same as
+    // 10. Begin the graceful drain: the FULL drain, same as
     //     window close — NOT fast-cancel. In-flight agents complete their
     //     current round; the drain-watch task fires the global token when no
     //     in-flight agents or orchestrator calls remain (or force-cancels at

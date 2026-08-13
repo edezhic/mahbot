@@ -1686,7 +1686,7 @@ async fn sanitation_register_persists_registered_id() {
     );
 
     // The ID must be run-unique via the job id (fresh session per run —
-    // decision 11: `ticket_{job_id}_sanitation`).
+    // agent id `ticket_{job_id}_sanitation`).
     assert_eq!(
         agent_id,
         format!("ticket_test-job_sanitation"),

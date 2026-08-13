@@ -300,8 +300,8 @@ pub async fn route_user_message(
         pending_job_id: None,
     };
 
-    // Manager-bound UserMessage is durable (decision 16: DURABLE kinds =
-    // UserMessage (manager-bound only), AskToolResult, ResearchResult).
+    // Manager-bound UserMessage is durable: DURABLE kinds =
+    // UserMessage (manager-bound only), AskToolResult, ResearchResult.
     let mut persisted = false;
     if job.role == Role::Manager {
         let id = crate::generate_id();
