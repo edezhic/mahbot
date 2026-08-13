@@ -1275,7 +1275,6 @@ impl BoardState {
 
     /// Render commit stats: summary header + per-file rows, or loading indicator.
     /// Returns `None` when the ticket has no commit hash.
-    #[allow(clippy::too_many_lines)]
     fn render_commit_stats<'a>(
         ticket: &'a Ticket,
         stats: Option<&'a CommitStats>,
@@ -1318,22 +1317,8 @@ impl BoardState {
             .color(theme::TEXT_SECONDARY)
             .into(),
         );
-        if total_additions > 0 {
-            summary_parts.push(
-                text(format!("+{total_additions}"))
-                    .size(11)
-                    .color(theme::STATUS_SUCCESS)
-                    .into(),
-            );
-        }
-        if total_deletions > 0 {
-            summary_parts.push(
-                text(format!("\u{2212}{total_deletions}"))
-                    .size(11)
-                    .color(theme::STATUS_ERROR)
-                    .into(),
-            );
-        }
+        summary_parts
+            .push(diff_stats_row::<BoardMessage>(total_additions, total_deletions, 11.0).into());
         let summary_header = container(row(summary_parts).spacing(4).align_y(Alignment::Center))
             .padding([4, 8])
             .width(Length::Fill);
@@ -1341,36 +1326,16 @@ impl BoardState {
         // File stat rows — hide zero-valued sides
         let mut file_col = Column::new().spacing(2);
         for f in &stats.files {
-            let mut row_parts: Vec<Element<'_, BoardMessage>> = vec![
-                container(text(&f.path).size(11).font(theme::FONT_REGULAR))
-                    .width(Length::Fixed(400.0))
-                    .clip(true)
-                    .into(),
-                Space::new().width(Length::Fill).into(),
-            ];
-            if f.additions > 0 {
-                row_parts.push(
-                    text(format!("+{}", f.additions))
-                        .size(11)
-                        .font(theme::FONT_REGULAR)
-                        .color(theme::STATUS_SUCCESS)
-                        .into(),
-                );
-            }
-            if f.additions > 0 && f.deletions > 0 {
-                row_parts.push(Space::new().width(6).into());
-            }
-            if f.deletions > 0 {
-                row_parts.push(
-                    text(format!("-{}", f.deletions))
-                        .size(11)
-                        .font(theme::FONT_REGULAR)
-                        .color(theme::STATUS_ERROR)
-                        .into(),
-                );
-            }
-            let row = row(row_parts).align_y(Alignment::Center);
-            file_col = file_col.push(row);
+            file_col = file_col.push(
+                row![
+                    container(text(&f.path).size(11).font(theme::FONT_REGULAR))
+                        .width(Length::Fixed(400.0))
+                        .clip(true),
+                    Space::new().width(Length::Fill),
+                    diff_stats_row::<BoardMessage>(f.additions, f.deletions, 11.0),
+                ]
+                .align_y(Alignment::Center),
+            );
         }
 
         Some(
