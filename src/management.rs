@@ -195,6 +195,19 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
     }
 }
 
+/// True when the ticket is not in the expected phase — moved externally, or
+/// failed-closed on a missing row / DB error: the job is completed and the
+/// caller should bail. (The sibling [`phase_changed_and_clear_assignment`]
+/// clears `assigned_to` instead, for the single-agent re-dispatch rounds.)
+#[must_use]
+async fn bail_if_phase_moved(ticket_id: &str, expected: TicketPhase, job_id: &str) -> bool {
+    if !is_ticket_in_phase(ticket_id, expected).await {
+        complete_ticket_stage_job(job_id).await;
+        return true;
+    }
+    false
+}
+
 /// Checks whether the ticket is still in the expected phase and, if it has
 /// moved externally, clears `assigned_to` to allow re-dispatch on the next
 /// poll cycle.
@@ -3309,8 +3322,7 @@ async fn maybe_escalate_analysis(
     {
         // Re-check the phase before spending the second batch — the ticket
         // may have been moved externally while the first batch ran.
-        if !is_ticket_in_phase(&ticket.id, TicketPhase::Analysis).await {
-            complete_ticket_stage_job(job_id).await;
+        if bail_if_phase_moved(&ticket.id, TicketPhase::Analysis, job_id).await {
             return false;
         }
         if resume {
@@ -3436,23 +3448,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
         return;
     }
 
-    if !is_ticket_in_phase(&ticket.id, TicketPhase::Analysis).await {
-        complete_ticket_stage_job(&job_id).await;
-        return;
-    }
-
-    process_analyst_verdicts(&ws, &ticket, &results, &job_id).await;
-
-    // Drain-cut: the analysts' outcomes are checkpointed; the job stays
-    // status='launched' for boot resume (process_analyst_verdicts itself skips
-    // the transition while draining — no misleading joint comment).
-    if crate::shutdown::aborting() {
-        return;
-    }
-
-    // Completion tx AFTER the board transition+comment (ordering contract:
-    // jobs-first would strand a ticket in a blocking phase with no job row).
-    complete_ticket_stage_job(&job_id).await;
+    finalize_analysis_round(&ws, &ticket, &results, &job_id).await;
 }
 
 /// Evaluate analyst verdicts and transition the ticket:
@@ -3574,6 +3570,35 @@ async fn process_analyst_verdicts(
              {extracted_count} extracted, {passing_count} passed)",
         );
     }
+}
+
+/// Finalize an analysis round — shared by fresh dispatch and boot resume so
+/// the paths stay in lockstep. Drain-cut runs both BEFORE and AFTER
+/// [`process_analyst_verdicts`]: a pre-existing drain skips the shadow
+/// verdict-score rows (no new work during drain — the fresh-dispatch path
+/// used to persist them before its drain check); any drain leaves the job
+/// launched — mid-process for boot resume (no transition), after the
+/// transition with the ticket in Planning (completed at boot). The
+/// completion tx runs after the transition+comment (ordering contract); a
+/// phase-moved round completes the job instead — either way the caller is
+/// done.
+async fn finalize_analysis_round(
+    ws: &Workspace,
+    ticket: &Ticket,
+    results: &[ParallelVerdict],
+    job_id: &str,
+) {
+    if bail_if_phase_moved(&ticket.id, TicketPhase::Analysis, job_id).await {
+        return;
+    }
+    if crate::shutdown::aborting() {
+        return;
+    }
+    process_analyst_verdicts(ws, ticket, results, job_id).await;
+    if crate::shutdown::aborting() {
+        return;
+    }
+    complete_ticket_stage_job(job_id).await;
 }
 
 /// Format a natural-language summary of analyst verdict categories.
@@ -4199,8 +4224,7 @@ async fn resume_ticket_stage_round(stage: String, job_id: String, ticket: Ticket
 /// escalation only when roster size == 3 (matches analysis_escalation_needed),
 /// then re-process verdicts through the existing process_analyst_verdicts.
 async fn resume_analysis_round(job_id: &str, ticket: Ticket, ws: Workspace) {
-    if !is_ticket_in_phase(&ticket.id, TicketPhase::Analysis).await {
-        complete_ticket_stage_job(job_id).await;
+    if bail_if_phase_moved(&ticket.id, TicketPhase::Analysis, job_id).await {
         return;
     }
     let Ok(slots) = load_ticket_stage_slots(job_id).await else {
@@ -4237,16 +4261,7 @@ async fn resume_analysis_round(job_id: &str, ticket: Ticket, ws: Workspace) {
         return;
     }
 
-    if !is_ticket_in_phase(&ticket_arc.id, TicketPhase::Analysis).await {
-        complete_ticket_stage_job(job_id).await;
-        return;
-    }
-    if crate::shutdown::aborting() {
-        // Drain-cut: outcomes checkpointed, job stays launched for boot resume.
-        return;
-    }
-    process_analyst_verdicts(&ws, &ticket_arc, &results, job_id).await;
-    complete_ticket_stage_job(job_id).await;
+    finalize_analysis_round(&ws, &ticket_arc, &results, job_id).await;
 }
 
 /// Stage all changes and record the ticket's reviewed base (HEAD + index tree)
@@ -4305,8 +4320,7 @@ async fn record_reviewed_base_after_review(
 /// (ticket-level freeze) and the record_reviewed_base_after_review helper — or
 /// the review_base_count stays NULL and the skip-review gate never fires.
 async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: VerifierInfo) {
-    if !is_ticket_in_phase(&ticket.id, vi.active_phase).await {
-        complete_ticket_stage_job(job_id).await;
+    if bail_if_phase_moved(&ticket.id, vi.active_phase, job_id).await {
         return;
     }
     let Ok(slots) = load_ticket_stage_slots(job_id).await else {
@@ -4325,8 +4339,7 @@ async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: 
         true,
     )
     .await;
-    if !is_ticket_in_phase(&ticket_arc.id, vi.active_phase).await {
-        complete_ticket_stage_job(job_id).await;
+    if bail_if_phase_moved(&ticket_arc.id, vi.active_phase, job_id).await {
         return;
     }
     if crate::shutdown::aborting() {
@@ -4396,8 +4409,7 @@ async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: 
 /// (crash between roster-write and the first session write) dispatches fresh
 /// with the stored task. The response drives the normal transition tail.
 async fn resume_engineer_round(job_id: &str, ticket: Ticket, ws: Workspace) {
-    if !is_ticket_in_phase(&ticket.id, TicketPhase::InDevelopment).await {
-        complete_ticket_stage_job(job_id).await;
+    if bail_if_phase_moved(&ticket.id, TicketPhase::InDevelopment, job_id).await {
         return;
     }
     // Idempotent anchor (re)upsert at the START (decision 10): a crash between
@@ -4463,8 +4475,7 @@ async fn resume_engineer_round(job_id: &str, ticket: Ticket, ws: Workspace) {
 /// message when the session exists; stored task when missing), extract the
 /// verdict, and process it.
 async fn resume_sanitation_round(job_id: &str, ticket: Ticket, ws: Workspace) {
-    if !is_ticket_in_phase(&ticket.id, TicketPhase::InSanitation).await {
-        complete_ticket_stage_job(job_id).await;
+    if bail_if_phase_moved(&ticket.id, TicketPhase::InSanitation, job_id).await {
         return;
     }
     let agent_id = format!("ticket_{job_id}_sanitation");
@@ -4635,8 +4646,7 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
         false,
     )
     .await;
-    if !is_ticket_in_phase(&ticket.id, vi.active_phase).await {
-        complete_ticket_stage_job(&job_id).await;
+    if bail_if_phase_moved(&ticket.id, vi.active_phase, &job_id).await {
         return;
     }
 
