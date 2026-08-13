@@ -3,3 +3,5 @@ Launch a deep multi-round research run on a broad or complex question. Unlike `a
 Use `research` for deep, broad, multi-faceted questions where a single round of analysis would be shallow. Use `ask` for quick clarification or a focused question that a single analyst can answer directly.
 
 The `question` parameter accepts the full research question. The run is asynchronous: exactly one report envelope is delivered to you when the research completes; intermediate rounds never reach you or the user.
+
+Since `research` might take several hours - it's always better to clarify the scope with the user before the launch to avoid wasting a lot of time digging into a wrong direction. Make sure to raise questions before using this tool, and explicitly confirm the scope of the research with the user before launching the research.
