@@ -87,30 +87,20 @@ impl ImageCatalog {
     }
 }
 
-/// Parse a catalog response body. Fails on malformed envelopes but tolerates
-/// unknown model entries, missing fields, and unknown parameter shapes.
-///
-/// # Errors
-///
-/// - Missing/invalid `data` array or an empty model set.
+/// Parse a catalog response body; per-entry tolerance in [`parse_model`],
+/// envelope error contract in [`crate::tools::catalog_cache::parse_envelope`].
 pub(crate) fn parse_catalog(body: &Value) -> anyhow::Result<ImageCatalog> {
-    let data = body
-        .get("data")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("Image models catalog response missing `data` array"))?;
-
-    let mut models = HashMap::new();
-    for entry in data {
-        if let Some((id, info)) = parse_model(entry) {
-            models.insert(id, info);
-        }
-    }
-    if models.is_empty() {
-        anyhow::bail!("Image models catalog contained no models");
-    }
-    Ok(ImageCatalog { models })
+    Ok(ImageCatalog {
+        models: crate::tools::catalog_cache::parse_envelope(
+            body,
+            "Image models catalog",
+            parse_model,
+        )?,
+    })
 }
 
+/// Parse one catalog entry; tolerates unknown model entries (skipped), missing
+/// fields, and unknown parameter shapes.
 fn parse_model(entry: &Value) -> Option<(String, ImageModelInfo)> {
     let id = entry.get("id").and_then(Value::as_str)?.to_string();
     let image_output = match entry["architecture"]["output_modalities"].as_array() {

@@ -1,6 +1,7 @@
 //! Generic single-flight, endpoint-keyed, TTL-cached fetch for the OpenRouter
 //! model catalogs. Shared by the image and video catalog clients so their
-//! cache/backoff behavior cannot drift.
+//! cache/backoff behavior cannot drift. Also hosts the shared envelope parser
+//! ([`parse_envelope`]) so the `{ "data": [...] }` contract is single-source.
 //!
 //! Caching: fetched once (single-flight), keyed by the configured provider
 //! endpoint, and reused for [`CATALOG_TTL`]. A failed fetch — including a
@@ -10,6 +11,7 @@
 
 use crate::util::UnwrapPoison;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -30,6 +32,36 @@ const CATALOG_RETRY_BACKOFF: Duration = Duration::from_mins(1);
 /// retried only after the backoff window. Accepted: a bounded first-message
 /// latency is worth more than a slow catalog.
 const CATALOG_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Parse a `{ "data": [...] }` catalog envelope into a model map. The
+/// per-entry parser is supplied by each catalog client (field shapes differ).
+///
+/// `label` feeds the error strings and must match the client's [`Catalog::new`]
+/// label so parse errors stay consistent with log labels.
+///
+/// # Errors
+///
+/// - Missing/invalid `data` array or an empty model set.
+pub(crate) fn parse_envelope<T>(
+    body: &Value,
+    label: &str,
+    parse_model: fn(&Value) -> Option<(String, T)>,
+) -> anyhow::Result<HashMap<String, T>> {
+    let data = body
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("{label} response missing `data` array"))?;
+    let mut models = HashMap::new();
+    for entry in data {
+        if let Some((id, info)) = parse_model(entry) {
+            models.insert(id, info);
+        }
+    }
+    if models.is_empty() {
+        anyhow::bail!("{label} contained no models");
+    }
+    Ok(models)
+}
 
 struct CacheEntry<T> {
     endpoint: String,
@@ -205,6 +237,7 @@ pub(crate) enum LookupState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[derive(Debug, Default)]
     struct FakeCatalog;
@@ -238,5 +271,47 @@ mod tests {
                 .expect("clock is past the backoff window"),
         );
         assert_eq!(catalog.lookup_state(endpoint), LookupState::Miss);
+    }
+
+    #[test]
+    fn parse_envelope_rejects_missing_or_empty_data() {
+        fn parse_id(entry: &Value) -> Option<(String, ())> {
+            entry
+                .get("id")
+                .and_then(Value::as_str)
+                .map(|id| (id.to_string(), ()))
+        }
+
+        // Missing `data` → exact error string (label literal verbatim).
+        let err = parse_envelope(&json!({}), "Image models catalog", parse_id).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Image models catalog response missing `data` array"
+        );
+        // Non-array `data` → same error.
+        assert!(parse_envelope(&json!({"data": {}}), "Image models catalog", parse_id).is_err());
+
+        // Empty model set → exact error string.
+        let err =
+            parse_envelope(&json!({"data": []}), "Video models catalog", parse_id).unwrap_err();
+        assert_eq!(err.to_string(), "Video models catalog contained no models");
+        // All entries skipped by the per-entry parser → same error.
+        assert!(
+            parse_envelope(
+                &json!({"data": [{"name": "x"}]}),
+                "Video models catalog",
+                parse_id
+            )
+            .is_err()
+        );
+
+        // Success path maps parsed entries.
+        let models = parse_envelope(
+            &json!({"data": [{"id": "m1"}, {"id": "m2"}]}),
+            "Fake models catalog",
+            parse_id,
+        )
+        .expect("parsed");
+        assert_eq!(models.len(), 2);
     }
 }

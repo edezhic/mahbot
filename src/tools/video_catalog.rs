@@ -40,30 +40,19 @@ impl VideoCatalog {
     }
 }
 
-/// Parse a catalog response body. Fails on malformed envelopes (missing or
-/// empty `data`) but tolerates per-model nulls and unknown fields.
-///
-/// # Errors
-///
-/// - Missing/invalid `data` array or an empty model set.
+/// Parse a catalog response body; per-entry tolerance in [`parse_model`],
+/// envelope error contract in [`crate::tools::catalog_cache::parse_envelope`].
 pub(crate) fn parse_catalog(body: &Value) -> anyhow::Result<VideoCatalog> {
-    let data = body
-        .get("data")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("Video models catalog response missing `data` array"))?;
-
-    let mut models = HashMap::new();
-    for entry in data {
-        if let Some((id, info)) = parse_model(entry) {
-            models.insert(id, info);
-        }
-    }
-    if models.is_empty() {
-        anyhow::bail!("Video models catalog contained no models");
-    }
-    Ok(VideoCatalog { models })
+    Ok(VideoCatalog {
+        models: crate::tools::catalog_cache::parse_envelope(
+            body,
+            "Video models catalog",
+            parse_model,
+        )?,
+    })
 }
 
+/// Parse one catalog entry; tolerates per-model nulls and unknown fields.
 fn parse_model(entry: &Value) -> Option<(String, VideoModelInfo)> {
     // Lookup key is always `id`, never `canonical_slug` — they differ for
     // every live model.
