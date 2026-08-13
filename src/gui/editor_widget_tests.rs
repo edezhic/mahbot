@@ -122,67 +122,34 @@ fn test_enter_at_end_of_highlighted_file_no_trailing_newline() {
 }
 
 #[test]
-fn test_backspace() {
-    let buf = EditorBuffer::with_text("hello", None);
-    buf.move_to(0, 5);
-    buf.perform_action(EditorAction::Backspace);
-    assert_eq!(buf.text(), "hell");
-    let cursor = buf.cursor();
-    assert_eq!(cursor.column, 4);
-}
-
-#[test]
-fn test_backspace_at_start() {
-    let buf = EditorBuffer::with_text("hello", None);
-    buf.perform_action(EditorAction::Backspace);
-    assert_eq!(buf.text(), "hello");
-}
-
-#[test]
-fn test_backspace_newline() {
-    let buf = EditorBuffer::with_text("hello\nworld", None);
-    buf.move_to(1, 0);
-    buf.perform_action(EditorAction::Backspace);
-    assert_eq!(buf.text(), "helloworld");
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 0);
-    assert_eq!(cursor.column, 5);
-}
-
-#[test]
-fn test_delete() {
-    let buf = EditorBuffer::with_text("hello", None);
-    buf.perform_action(EditorAction::Delete);
-    assert_eq!(buf.text(), "ello");
-}
-
-#[test]
-fn test_delete_at_end() {
-    let buf = EditorBuffer::with_text("hello", None);
-    buf.move_to(0, 5);
-    buf.perform_action(EditorAction::Delete);
-    assert_eq!(buf.text(), "hello");
-}
-
-#[test]
-fn test_delete_multibyte_scalar() {
-    let buf = EditorBuffer::with_text("café", None);
-    buf.move_to(0, 3); // before 'é'
-    buf.perform_action(EditorAction::Delete);
-    assert_eq!(buf.text(), "caf");
-    let buf = EditorBuffer::with_text("привет", None);
-    buf.move_to(0, 0);
-    buf.perform_action(EditorAction::Delete);
-    assert_eq!(buf.text(), "ривет");
-}
-
-#[test]
-fn test_delete_emoji_scalar() {
-    // Editor tracks scalar-value columns, not full grapheme clusters.
-    let buf = EditorBuffer::with_text("a🎉b", None);
-    buf.move_to(0, 1);
-    buf.perform_action(EditorAction::Delete);
-    assert_eq!(buf.text(), "ab");
+#[allow(clippy::type_complexity)]
+fn test_backspace_delete_cases() {
+    // (name, action, input, cursor pos, expected text, expected cursor)
+    #[rustfmt::skip]
+    let cases: &[(&str, EditorAction, &str, Option<(usize, usize)>, &str, Option<(usize, usize)>)] = &[
+        ("backspace", EditorAction::Backspace, "hello", Some((0, 5)), "hell", Some((0, 4))),
+        ("backspace_at_start", EditorAction::Backspace, "hello", None, "hello", None),
+        ("backspace_newline", EditorAction::Backspace, "hello\nworld", Some((1, 0)), "helloworld", Some((0, 5))),
+        ("delete", EditorAction::Delete, "hello", None, "ello", None),
+        ("delete_at_end", EditorAction::Delete, "hello", Some((0, 5)), "hello", None),
+        ("delete_cafe", EditorAction::Delete, "café", Some((0, 3)), "caf", None),
+        ("delete_cyrillic", EditorAction::Delete, "привет", Some((0, 0)), "ривет", None),
+        // Editor tracks scalar-value columns, not full grapheme clusters.
+        ("delete_emoji", EditorAction::Delete, "a🎉b", Some((0, 1)), "ab", None),
+    ];
+    for &(name, ref action, input, cursor_pos, expected, expected_cursor) in cases {
+        let buf = EditorBuffer::with_text(input, None);
+        if let Some((line, col)) = cursor_pos {
+            buf.move_to(line, col);
+        }
+        buf.perform_action(action.clone());
+        assert_eq!(buf.text(), expected, "case: {name}");
+        if let Some((line, col)) = expected_cursor {
+            let cursor = buf.cursor();
+            assert_eq!(cursor.line, line, "case: {name} (line)");
+            assert_eq!(cursor.column, col, "case: {name} (col)");
+        }
+    }
 }
 
 #[test]
@@ -233,22 +200,6 @@ fn test_paste() {
     buf.move_to(0, 2);
     buf.perform_action(EditorAction::Paste("ll".to_string()));
     assert_eq!(buf.text(), "hello");
-}
-
-#[test]
-fn test_select_to_duplicate_endpoint_preserves_selection() {
-    let buf = EditorBuffer::with_text("hello world", None);
-    buf.move_to(0, 0);
-    buf.perform_action(EditorAction::SelectTo { line: 0, col: 5 });
-    assert_eq!(buf.selection(), Some("hello".to_string()));
-
-    // Repeated SelectTo at the drag endpoint (duplicate CursorMoved).
-    buf.perform_action(EditorAction::SelectTo { line: 0, col: 5 });
-    assert_eq!(
-        buf.selection(),
-        Some("hello".to_string()),
-        "duplicate SelectTo must not clear an existing selection"
-    );
 }
 
 #[test]
@@ -701,15 +652,36 @@ fn test_shift_left_at_bof_no_selection() {
 }
 
 #[test]
-fn test_select_to_same_endpoint_preserves_non_empty_selection() {
-    let buf = EditorBuffer::with_text("hello", None);
-    buf.move_to(0, 2);
-    buf.perform_action(EditorAction::SelectTo { line: 0, col: 3 });
-    assert!(buf.cursor().selection.is_some());
-    // Duplicate SelectTo at the drag endpoint must not collapse the range.
-    buf.perform_action(EditorAction::SelectTo { line: 0, col: 3 });
-    assert!(buf.cursor().selection.is_some());
-    assert_eq!(buf.selection(), Some("l".to_string()));
+fn test_select_to_duplicate_endpoint_cases() {
+    // (name, text, start col, drag endpoint col, expected selection text)
+    #[rustfmt::skip]
+    let cases: &[(&str, &str, usize, usize, &str)] = &[
+        ("duplicate_endpoint", "hello world", 0, 5, "hello"),
+        ("same_endpoint", "hello", 2, 3, "l"),
+    ];
+    for &(name, text, start_col, end_col, expected) in cases {
+        let buf = EditorBuffer::with_text(text, None);
+        buf.move_to(0, start_col);
+        buf.perform_action(EditorAction::SelectTo {
+            line: 0,
+            col: end_col,
+        });
+        assert!(
+            buf.cursor().selection.is_some(),
+            "case: {name} (first SelectTo)"
+        );
+        // Repeated SelectTo at the drag endpoint (duplicate CursorMoved)
+        // must not collapse or clear an existing selection.
+        buf.perform_action(EditorAction::SelectTo {
+            line: 0,
+            col: end_col,
+        });
+        assert_eq!(
+            buf.selection(),
+            Some(expected.to_string()),
+            "case: {name} (duplicate SelectTo)"
+        );
+    }
 }
 
 #[test]

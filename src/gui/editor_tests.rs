@@ -1466,23 +1466,18 @@ fn test_rename_input_updates_text_and_clears_error() {
 }
 
 #[test]
-fn test_rename_cancel_clears_target() {
-    let mut state = make_editor_with_tree();
-    state.selected_workspace_path = Some("/tmp".to_string());
-    let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-    assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
-    let _ = state.update(EditorMessage::RenameCancel);
-    assert!(state.active_modal.is_none());
-}
-
-#[test]
-fn test_escape_cancels_rename() {
-    let mut state = make_editor_with_tree();
-    state.selected_workspace_path = Some("/tmp".to_string());
-    let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
-    assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
-    let _ = state.update(EditorMessage::Escape);
-    assert!(state.active_modal.is_none());
+fn test_rename_cancel_and_escape() {
+    for msg in [EditorMessage::RenameCancel, EditorMessage::Escape] {
+        let mut state = make_editor_with_tree();
+        state.selected_workspace_path = Some("/tmp".to_string());
+        let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
+        assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
+        let _ = state.update(msg.clone());
+        assert!(
+            state.active_modal.is_none(),
+            "{msg:?} must close the Rename modal"
+        );
+    }
 }
 
 #[test]
