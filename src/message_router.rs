@@ -249,12 +249,7 @@ pub fn route(agent_id: &str, job: AgentJob) {
                 agent_id = %agent_id_for_cleanup,
                 "Consumer loop panicked — entry removed from router table",
             );
-            // Log the panic payload for debugging.
-            if let Some(msg) = panic.downcast_ref::<&str>() {
-                error!(agent_id = %agent_id_for_cleanup, panic = %msg, "Consumer loop panic message");
-            } else if let Some(msg) = panic.downcast_ref::<String>() {
-                error!(agent_id = %agent_id_for_cleanup, panic = %msg, "Consumer loop panic message");
-            }
+            error!(agent_id = %agent_id_for_cleanup, panic = %crate::util::panic_message(&*panic), "Consumer loop panic message");
         } else {
             debug!(
                 agent_id = %agent_id_for_cleanup,
