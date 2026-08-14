@@ -3364,7 +3364,6 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
         "analyze/manager_ticket.md"
     };
     let message = load_prompt(prompt_key);
-    let extraction_prompt = load_prompt("extraction/analyst.md");
 
     // Spawn the durable analysis round (jobs + roster, one tx) BEFORE the
     // agents' first session writes — the roster is the round record.
@@ -3386,35 +3385,59 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
         );
         return;
     };
+    run_analysis_round(&ticket, &ws, &job_id, &slots, &message, false).await;
+}
+
+/// Run an analysis round: parallel analysts, unanimous-blocker escalation,
+/// then verdict finalization. Shared by fresh dispatch and boot resume so the
+/// post-round tail stays in lockstep.
+///
+/// `task` is the message the agents were dispatched with — on fresh dispatch
+/// the in-memory prompt, on resume re-read from `jobs.task`. Equal by
+/// construction of [`spawn_ticket_stage_round`] (it stores the message as
+/// `jobs.task`); if that ever changes, the resume path silently diverges.
+///
+/// Analysis stays fail-open — the ticket always advances to Planning, the
+/// Manager decides. Escalation is re-evaluated ONLY at base roster size (see
+/// [`maybe_escalate_analysis`]): on resume this guards against re-escalation
+/// after a crash between the base round and the escalation batch. The drain
+/// guard mirrors the fresh dispatch path.
+///
+/// Early-returns (without finalizing) when the ticket left the Analysis phase
+/// — both callers end with this call, so nothing may follow it.
+async fn run_analysis_round(
+    ticket: &Arc<Ticket>,
+    ws: &Workspace,
+    job_id: &str,
+    slots: &[TicketStageSlot],
+    task: &str,
+    resumed: bool,
+) {
+    let extraction_prompt = load_prompt("extraction/analyst.md");
     let mut results = run_parallel_agents(
-        &ticket,
-        &ws,
+        ticket,
+        ws,
         Role::Analyst,
         &extraction_prompt,
-        &job_id,
-        &slots,
-        false,
+        job_id,
+        slots,
+        resumed,
     )
     .await;
-
-    // Unanimous-blocker escalation: when every dispatched analyst flagged a
-    // blocker, 2 extra analysts (same model) join for depth before the Manager
-    // decision. Analysis stays fail-open — the ticket always advances.
     if !maybe_escalate_analysis(
-        &ticket,
-        &ws,
-        &job_id,
+        ticket,
+        ws,
+        job_id,
         &extraction_prompt,
-        &message,
-        false,
+        task,
+        resumed,
         &mut results,
     )
     .await
     {
         return;
     }
-
-    finalize_analysis_round(&ws, &ticket, &results, &job_id).await;
+    finalize_analysis_round(ws, ticket, &results, job_id).await;
 }
 
 /// Evaluate analyst verdicts and transition the ticket:
@@ -4197,37 +4220,9 @@ async fn resume_analysis_round(job_id: &str, ticket: Ticket, ws: Workspace) {
         complete_ticket_stage_job(job_id).await;
         return;
     };
-    let extraction_prompt = load_prompt("extraction/analyst.md");
     let ticket_arc = Arc::new(ticket);
-    let mut results = run_parallel_agents(
-        &ticket_arc,
-        &ws,
-        Role::Analyst,
-        &extraction_prompt,
-        job_id,
-        &slots,
-        true,
-    )
-    .await;
-
-    // Escalation re-evaluated ONLY at base roster size (the crash may have
-    // hit between the base round and the escalation batch) — see
-    // maybe_escalate_analysis. Drain guard mirrors the fresh dispatch path.
-    if !maybe_escalate_analysis(
-        &ticket_arc,
-        &ws,
-        job_id,
-        &extraction_prompt,
-        &job_task(job_id).await,
-        true,
-        &mut results,
-    )
-    .await
-    {
-        return;
-    }
-
-    finalize_analysis_round(&ws, &ticket_arc, &results, job_id).await;
+    let task = job_task(job_id).await;
+    run_analysis_round(&ticket_arc, &ws, job_id, &slots, &task, true).await;
 }
 
 /// Stage all changes and record the ticket's reviewed base (HEAD + index tree)
