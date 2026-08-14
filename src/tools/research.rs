@@ -1878,31 +1878,28 @@ async fn run_gap_round(
     resolve_round_members_with_timeouts(members_out, &snapshots)
 }
 
-/// Record a coder-round GATE-SKIP marker (one marker per key — a prior
-/// outcome marker is stale once a fresh gate-skip supersedes it). A skipped
-/// round is NOT claimed. Re-attempt semantics: only the PRE-LOOP key-0 round
-/// is re-examined on boot-resume (`!coder_rounds_done.contains(&0)`); a
-/// post-progress round (key ≥ 1) is dispatched only as a side-effect of a
-/// progress event inside the gap loop, so a gate-skip after a long gap round
-/// is FINAL — the loop's already-advanced round_index never revisits the key.
-/// That is fail-open per design ("Тихих пропусков нет" — the marker IS the
-/// report note; the run continues without the prototype).
-fn push_coder_skip_marker(state: &mut ResearchState, round_key: usize, reason: &str) {
-    let marker = format!("coder round {round_key} skipped — {reason}");
-    state
-        .markers
-        .retain(|m| !m.starts_with(&format!("coder round {round_key} ")));
+/// Record a coder-round marker — a GATE-SKIP (`"skipped — {reason}"`; the
+/// round is NOT claimed) or an OUTCOME (dispatched but failed/cancelled).
+/// One marker per key: a fresh marker clears the prior one (a stale
+/// skip/outcome marker is superseded — the report shows one truth per key).
+/// Re-attempt semantics: only the PRE-LOOP key-0 round is re-examined on
+/// boot-resume (`!coder_rounds_done.contains(&0)`); a post-progress round
+/// (key ≥ 1) is dispatched only as a side-effect of a progress event inside
+/// the gap loop, so a gate-skip after a long gap round is FINAL — the loop's
+/// already-advanced round_index never revisits the key. That is fail-open per
+/// design ("Тихих пропусков нет" — the marker IS the report note; the run
+/// continues without the prototype).
+fn set_coder_marker(state: &mut ResearchState, round_key: usize, suffix: &str) {
+    let marker = format!("coder round {round_key} {suffix}");
+    clear_coder_markers(state, round_key);
     state.markers.push(marker);
 }
 
-/// Record a coder-round OUTCOME marker (dispatched but failed/cancelled).
-/// Clears stale skip markers for the same key — one truth per key.
-fn push_coder_outcome_marker(state: &mut ResearchState, round_key: usize, outcome: &str) {
-    let marker = format!("coder round {round_key} {outcome}");
+/// Clear stale coder-round markers for a key — one truth per key.
+fn clear_coder_markers(state: &mut ResearchState, round_key: usize) {
     state
         .markers
         .retain(|m| !m.starts_with(&format!("coder round {round_key} ")));
-    state.markers.push(marker);
 }
 
 /// Claim a coder round at DISPATCH. The claim is IN-MEMORY here — it reaches
@@ -1915,9 +1912,7 @@ fn claim_coder_round(state: &mut ResearchState, round_key: usize) {
     if !state.coder_rounds_done.contains(&round_key) {
         state.coder_rounds_done.push(round_key);
     }
-    state
-        .markers
-        .retain(|m| !m.starts_with(&format!("coder round {round_key} ")));
+    clear_coder_markers(state, round_key);
 }
 
 /// Un-claim a round that was dispatched but never completed (failure or
@@ -1945,14 +1940,14 @@ async fn run_coder_round(
     round_key: usize,
 ) {
     if crate::shutdown::aborting() {
-        push_coder_skip_marker(state, round_key, "shutdown/drain");
+        set_coder_marker(state, round_key, "skipped — shutdown/drain");
         return;
     }
     if std::time::Instant::now() + CODER_MIN_REMAINING >= deadline {
-        push_coder_skip_marker(
+        set_coder_marker(
             state,
             round_key,
-            "less than 30 minutes remaining until the round deadline",
+            "skipped — less than 30 minutes remaining until the round deadline",
         );
         return;
     }
@@ -2004,7 +1999,7 @@ async fn run_coder_round(
         // re-attempted by boot-resume; post-progress failures are final —
         // fail-open per design).
         unclaim_coder_round(state, round_key);
-        push_coder_outcome_marker(state, round_key, outcome);
+        set_coder_marker(state, round_key, outcome);
     }
 }
 
@@ -2032,11 +2027,11 @@ async fn run_coder_gated(
     round_key: usize,
 ) {
     if budget.is_exhausted() {
-        push_coder_skip_marker(state, round_key, "analyst budget exhausted");
+        set_coder_marker(state, round_key, "skipped — analyst budget exhausted");
         return;
     }
     if std::time::Instant::now() >= deadline {
-        push_coder_skip_marker(state, round_key, "round deadline expired");
+        set_coder_marker(state, round_key, "skipped — round deadline expired");
         return;
     }
     run_coder_round(
@@ -2104,18 +2099,13 @@ async fn gap_rounds(
     }
     let mut round_index = state.round_index;
     loop {
-        if crate::shutdown::aborting() {
-            outcome.unresolved = gap_items(&gap_list.gaps);
-            return outcome;
-        }
-        if budget.is_exhausted() {
-            outcome.unresolved = gap_items(&gap_list.gaps);
-            return outcome;
-        }
-        if std::time::Instant::now() >= deadline {
+        if crate::shutdown::aborting()
+            || budget.is_exhausted()
             // Round-wide deadline expired: further rounds would be spawned
             // and instantly aborted — stop instead of burning budget on
             // no-progress work.
+            || std::time::Instant::now() >= deadline
+        {
             outcome.unresolved = gap_items(&gap_list.gaps);
             return outcome;
         }
@@ -4177,7 +4167,7 @@ mod tests {
         // Gate-skip: marked in the report, NOT claimed — the pre-loop key-0
         // round is re-attempted by boot-resume (post-progress keys are final:
         // the loop's round_index has advanced past them — fail-open per design).
-        push_coder_skip_marker(&mut state, 0, "analyst budget exhausted");
+        set_coder_marker(&mut state, 0, "skipped — analyst budget exhausted");
         assert!(
             state
                 .markers
@@ -4195,7 +4185,7 @@ mod tests {
         // same key (one truth: a failed-then-gate-skipped round must not
         // render both).
         unclaim_coder_round(&mut state, 0);
-        push_coder_outcome_marker(&mut state, 0, "failed");
+        set_coder_marker(&mut state, 0, "failed");
         assert!(!state.coder_rounds_done.contains(&0));
         assert!(state.markers.iter().any(|m| m == "coder round 0 failed"));
         assert!(
@@ -4209,7 +4199,7 @@ mod tests {
         claim_coder_round(&mut state, 0);
         assert!(!state.markers.iter().any(|m| m.contains("coder round 0 ")));
         // Other rounds' markers are untouched.
-        push_coder_skip_marker(&mut state, 1, "round deadline expired");
+        set_coder_marker(&mut state, 1, "skipped — round deadline expired");
         claim_coder_round(&mut state, 0);
         assert!(
             state
@@ -4220,7 +4210,7 @@ mod tests {
         assert!(!state.markers.iter().any(|m| m.contains("coder round 0 ")));
         // A gate-skip after a failure of the SAME key supersedes the failure
         // marker (one truth per key in the final report).
-        push_coder_skip_marker(&mut state, 1, "round deadline expired");
+        set_coder_marker(&mut state, 1, "skipped — round deadline expired");
         assert_eq!(
             state
                 .markers
