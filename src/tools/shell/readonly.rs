@@ -508,6 +508,11 @@ fn walk_word_substitutions<'a>(
     state: &mut ValidationState<'a>,
     flags: WalkFlags,
 ) -> Result<(), String> {
+    // Fail-closed on parse errors (defensive: `parse_and_walk` already
+    // rejects ERROR/MISSING trees, but sub-tree walks must never skip them).
+    if node.is_error() || node.is_missing() {
+        return Err(parse_error(&w.src));
+    }
     // The node itself may be a substitution (`echo $(touch f)` — the walker
     // descends into every word-ish child, and the substitution is one of them).
     match node.kind() {
@@ -768,12 +773,14 @@ fn walk_command<'a>(
     // command's grammar also allows a subshell operand as a child (`time
     // ( rm -rf ./x )`) — it runs in a child shell, so validate it against a
     // snapshot (`time ( cd /tmp && cat > out )` allows the temp write inside
-    // the subshell).
+    // the subshell). Only `subshell` is dispatched here, not `is_commandish`
+    // (that includes command_substitution, which must stay on the
+    // substitution path so the backtick fail-closed check fires);
+    // `walk_subshell` snapshots internally, so no snapshot is needed here.
     let mut cursor = cmd.walk();
     for child in cmd.children(&mut cursor) {
         if child.kind() == "subshell" {
-            let mut snap = state.snapshot();
-            walk_node(child, w, &mut snap, WalkFlags::default(), Vec::new())?;
+            walk_node(child, w, state, WalkFlags::default(), Vec::new())?;
         } else {
             walk_word_substitutions(child, w, state, flags)?;
         }
@@ -844,8 +851,8 @@ fn check_words(
         let cmd = originals.join(" ");
         return reject(
             &cmd,
-            "a brace group (`{ ...; }`) could not be parsed as a construct here — rejected fail-closed rather than validate its flattened words.",
-            "write the command without the brace group, or quote it if it is meant as an argument.",
+            "`{`/`}` at command position — a brace group (`{ ...; }`) here was flattened by the parser, or the brace is a stray terminator. Rejected fail-closed rather than validate its flattened words.",
+            "remove the stray brace, or write the command without the brace group.",
         );
     }
     if matches!(
@@ -1087,18 +1094,14 @@ fn owning_command_assignments(owner: Node, w: &W, negated: bool) -> (Vec<String>
                             assignment_only = false;
                             break;
                         };
-                        i = past;
                         // The timed operand is a full command list: its head
                         // may carry a single `!` negation (`time ! FOO=bar cat`
                         // binds FOO=bar before the body expands), then env
-                        // assignments.
-                        if words.get(i).is_some_and(|o| o == "!") {
-                            i += 1;
-                        }
-                        while words.get(i).is_some_and(|o| super::is_env_assignment(o)) {
-                            assignments.push(words[i].clone());
-                            i += 1;
-                        }
+                        // assignments — shared with resolve_verb so the two
+                        // post-time scans cannot drift.
+                        let (after, head) = scan_time_operand_head(&word_refs, past);
+                        assignments.extend(head.into_iter().map(String::from));
+                        i = after;
                     }
                     _ => {
                         // A real verb word — the command is not assignment-only.
@@ -2882,12 +2885,8 @@ fn resolve_verb<'a>(words: &[&'a str], negated: bool) -> VerbResolution<'a> {
         // word is the command name and must NOT be skipped.
         i = idx;
         if unquoted == "time" {
-            if i < words.len() && words[i] == "!" {
-                i += 1;
-            }
-            while i < words.len() && super::is_env_assignment(words[i]) {
-                i += 1;
-            }
+            let (after, _) = scan_time_operand_head(words, i);
+            i = after;
         }
     }
 }
@@ -2907,6 +2906,26 @@ fn consume_time_prefix(words: &[&str], i: usize, negated: bool) -> Option<usize>
         j += 1;
     }
     Some(j)
+}
+
+/// Scan the head of a forwarding `time` operand (a full command list): a
+/// single `!` negation, then env assignments — `time ! FOO=bar cmd` runs cmd
+/// negated with FOO bound in the current shell, and for heredoc owners the
+/// assignments bind before the body expands (both bash-verified). Shared by
+/// verb resolution ([`resolve_verb`], which discards the assignments) and
+/// heredoc-body binding ([`owning_command_assignments`], which keeps them) so
+/// the post-`time` scans cannot drift. Returns the index just past the head
+/// plus the assignments found.
+fn scan_time_operand_head<'a>(words: &[&'a str], mut i: usize) -> (usize, Vec<&'a str>) {
+    if words.get(i) == Some(&"!") {
+        i += 1;
+    }
+    let mut assignments = Vec::new();
+    while words.get(i).is_some_and(|w| super::is_env_assignment(w)) {
+        assignments.push(words[i]);
+        i += 1;
+    }
+    (i, assignments)
 }
 
 /// Classify a verb word as provably literal or unprovable.
@@ -8172,6 +8191,21 @@ mod tests {
             ("time (( i = $(rm -rf ./x) ))", false),
             ("time ( echo hi )", true),
             ("time ( cd /tmp && touch f )", true),
+            // Broken-parse variants: the grammar emits an ERROR node (rejected
+            // fail-closed at parse). Bash-valid dangerous shapes reject
+            // correctly; the benign `time ! ( echo hi )` over-rejects (parse
+            // error) — safe direction, accepted parser-gap family.
+            ("time -p ( rm f )", false),
+            ("time ! ( rm f )", false),
+            ("time ! ( echo hi )", false),
+            ("time ! { rm f; }", false),
+            // Bash syntax error (nothing after the subshell is allowed).
+            ("time ( rm f ) extra", false),
+            // `command`/`builtin` with a construct operand is a bash syntax
+            // error — rejection is safe (ALLOW→REJECT vs the old guard).
+            ("command { rm -rf ./x; }", false),
+            ("command ( rm -rf ./x )", false),
+            ("builtin ( rm -rf ./x )", false),
             // External time never binds its args before the body expands.
             (
                 "\"time\" TMPDIR=/etc cat <<EOF\n$(touch $TMPDIR/x)\nEOF",

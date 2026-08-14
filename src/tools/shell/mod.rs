@@ -40,6 +40,10 @@ pub(super) const SHELL_PREFIXES: &[&str] = &[
     ".",
     "sudo",
     "time",
+    // `!` negation: needed so the raw first-command-word scan skips it
+    // (`time ! rm -rf ./x` must dispatch `rm` to the blocklist). Side effect
+    // on shared consumers: `canonical_command` routes `! ls` to the ls
+    // profile — safe direction, profile selection only.
     "!",
     "command",
     "builtin",
