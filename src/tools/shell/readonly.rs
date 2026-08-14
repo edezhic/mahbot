@@ -227,7 +227,7 @@ const GIT_REF_SHORT_LIST: &[char] = &['l'];
 /// value — `git tag -n 1` lists, `1` is a pattern).
 const GIT_TAG_SHORT_LIST: &[char] = &['l', 'n'];
 
-/// `git tag` verify flags (`-v`, `--verify`) — positionals are verify targets.
+/// `git remote` mutation verbs — positionals name the remote; always reject.
 const GIT_REMOTE_MUTATIONS: &[&str] = &[
     "add",
     "remove",
@@ -922,12 +922,12 @@ fn walk_redirected<'a>(
     w.last_start = state.snapshot();
     walk_body(body, w, state, flags, extra)?;
 
-    let redirect_state = w.last_start.snapshot();
+    let mut redirect_state = w.last_start.snapshot();
     for r in redirects {
         if r.kind() == "heredoc_redirect" {
             validate_heredoc(*r, w, state)?;
         } else {
-            validate_file_redirect(*r, w, &redirect_state)?;
+            validate_file_redirect(*r, w, &mut redirect_state)?;
         }
     }
     Ok(())
@@ -1017,7 +1017,7 @@ fn validate_redirect<'a>(
     state: &mut ValidationState<'a>,
 ) -> Result<(), String> {
     match node.kind() {
-        "file_redirect" => validate_file_redirect(node, &*w, state),
+        "file_redirect" => validate_file_redirect(node, w, state),
         "heredoc_redirect" => validate_heredoc(node, w, state),
         "herestring_redirect" => Err(parse_error(&w.src)),
         _ => Err(unrecognized_node(node, w)),
@@ -1027,14 +1027,19 @@ fn validate_redirect<'a>(
 /// Validate a `> file`-family redirect: output ops (`>`, `>>`, `>|`, `>&`
 /// with a path target, `&>`, `&>>`) must target /dev/null or a path under a
 /// temp root; fd-dups (`>&2`, `2>&1`) and input ops (`<`, `<&`) are always
-/// allowed. A missing target rejects.
+/// allowed. A missing target rejects. Substitutions anywhere in the node
+/// (targets and words swallowed after the target) execute and are validated
+/// first — `cat < $(rm -rf /)` and `echo hi > /tmp/out $(rm -rf /)` reject.
 fn validate_file_redirect<'a>(
     node: Node,
-    w: &W<'a>,
-    state: &ValidationState<'a>,
+    w: &mut W<'a>,
+    state: &mut ValidationState<'a>,
 ) -> Result<(), String> {
     let mut cursor = node.walk();
     let children: Vec<Node> = node.children(&mut cursor).collect();
+    for c in &children {
+        walk_word_substitutions(*c, w, state, WalkFlags::default())?;
+    }
     let mut op: Option<String> = None;
     let mut target: Option<Node> = None;
     let mut fd_dup_target = false;
@@ -1146,7 +1151,7 @@ fn validate_heredoc<'a>(
             "heredoc_end" => break,
             "file_redirect" => {
                 // A redirect on the marker line belongs to the owning command.
-                validate_file_redirect(*c, w, &*state)?;
+                validate_file_redirect(*c, w, state)?;
             }
             "pipeline" => {
                 let mut snap = state.snapshot();
@@ -1157,21 +1162,23 @@ fn validate_heredoc<'a>(
             }
             kind if is_wordish(kind) => {
                 // A word after the marker: same-line words are the owning
-                // command's arguments (collected by walk_redirected); body-line
-                // words are parser glitches of body content — minimal-scan
-                // them (backticks/`$(` execute in unquoted bodies).
-                if !seen_body
+                // command's arguments — their substitutions execute
+                // (`cat <<EOF "$(rm -rf /)"` runs the substitution); body-line
+                // words are parser glitches of body content — in unquoted
+                // bodies walk substitutions and minimal-scan the raw text
+                // (backticks/`$(` execute there).
+                let marker_line = !seen_body
                     && seen_start
                     && !node_text(*c, w).starts_with('\n')
-                    && !text_between_has_newline(&w.src, marker_line_end, c.start_byte())
-                {
-                    // marker-line argument — validated as part of the owning
-                    // command by walk_redirected.
+                    && !text_between_has_newline(&w.src, marker_line_end, c.start_byte());
+                if marker_line {
+                    walk_word_substitutions(*c, w, state, WalkFlags::default())?;
                 } else if unquoted {
+                    walk_word_substitutions(*c, w, state, WalkFlags::default())?;
                     minimal_body_scan(&node_text(*c, w))?;
                 }
             }
-            _ => {}
+            _ => walk_word_substitutions(*c, w, state, WalkFlags::default())?,
         }
     }
 
@@ -1253,9 +1260,6 @@ fn note_part_cd(part: &ValidationState, base: &mut ValidationState) {
     }
 }
 
-/// Walk one construct part (a sequence of command-ish children) against a
-/// snapshot of the pre-construct state, then merge via [`note_part_cd`].
-/// `time_external` marks a condition/case-arm head.
 /// True when a list separator (`;` or newline) appears in the source gap
 /// between the construct keyword (`after`) and the first command (`start`) —
 /// the separator consumes the condition-head `time` demotion.
@@ -1264,6 +1268,9 @@ fn head_has_separator(src: &str, after: usize, start: usize) -> bool {
         .is_some_and(|s| s.contains(['\n', ';']))
 }
 
+/// Walk one construct part (a sequence of command-ish children) against a
+/// snapshot of the pre-construct state, then merge via [`note_part_cd`].
+/// `time_external` marks a condition/case-arm head.
 fn walk_part<'a>(
     nodes: &[Node],
     w: &mut W<'a>,
@@ -1365,9 +1372,7 @@ fn walk_if<'a>(
             _ => {}
         }
     }
-    if !extras.is_empty() {
-        return Err(redirect_extras_on_construct(w));
-    }
+    reject_redirect_extras(extras, w)?;
     Ok(())
 }
 
@@ -1388,12 +1393,24 @@ fn redirect_extras_on_construct(w: &W) -> String {
     )
 }
 
+/// Reject when a hoisted redirect swallowed argument words on a compound
+/// command (bash rejects the shape as a syntax error too).
+fn reject_redirect_extras(extras: &[String], w: &W) -> Result<(), String> {
+    if extras.is_empty() {
+        Ok(())
+    } else {
+        Err(redirect_extras_on_construct(w))
+    }
+}
+
 fn walk_while_until<'a>(
     node: Node,
     w: &mut W<'a>,
     state: &mut ValidationState<'a>,
     extras: &[String],
 ) -> Result<(), String> {
+    // The grammar collapses `until` into `while_statement` (only the keyword
+    // child differs), so the keyword is probed, not dispatched on node.kind().
     let (cond, _, _, _) = split_children(node, w, "while", "do", "done");
     if cond.is_empty() {
         let (cond, _, _, _) = split_children(node, w, "until", "do", "done");
@@ -1409,9 +1426,7 @@ fn walk_while_until<'a>(
             note_part_cd(&part, state);
         }
     }
-    if !extras.is_empty() {
-        return Err(redirect_extras_on_construct(w));
-    }
+    reject_redirect_extras(extras, w)?;
     Ok(())
 }
 
@@ -1446,9 +1461,7 @@ fn walk_for<'a>(
             }
         }
     }
-    if !extras.is_empty() {
-        return Err(redirect_extras_on_construct(w));
-    }
+    reject_redirect_extras(extras, w)?;
     Ok(())
 }
 
@@ -1480,9 +1493,7 @@ fn walk_c_style_for<'a>(
             _ => walk_word_substitutions(child, w, state, WalkFlags::default())?,
         }
     }
-    if !extras.is_empty() {
-        return Err(redirect_extras_on_construct(w));
-    }
+    reject_redirect_extras(extras, w)?;
     Ok(())
 }
 
@@ -1506,9 +1517,7 @@ fn walk_case<'a>(
             _ => walk_word_substitutions(child, w, state, WalkFlags::default())?,
         }
     }
-    if !extras.is_empty() {
-        return Err(redirect_extras_on_construct(w));
-    }
+    reject_redirect_extras(extras, w)?;
     Ok(())
 }
 
@@ -1570,9 +1579,7 @@ fn walk_compound<'a>(
     // `(( ... ))` arithmetic command — substitutions inside execute; nothing
     // else does.
     if children.iter().any(|c| c.kind() == "((") {
-        if !extras.is_empty() {
-            return Err(redirect_extras_on_construct(w));
-        }
+        reject_redirect_extras(extras, w)?;
         for c in &children {
             walk_word_substitutions(*c, w, state, WalkFlags::default())?;
         }
@@ -1616,9 +1623,7 @@ fn walk_function<'a>(
     state: &mut ValidationState<'a>,
     extras: &[String],
 ) -> Result<(), String> {
-    if !extras.is_empty() {
-        return Err(redirect_extras_on_construct(w));
-    }
+    reject_redirect_extras(extras, w)?;
     // A function body does not execute at definition time — validate it
     // against a snapshot and discard.
     let mut snap = state.snapshot();
@@ -2366,18 +2371,6 @@ fn process_cd_words(words: &[&str], cd_idx: usize, verb: &str, state: &mut Valid
     }
 }
 
-/// An `eval` segment evaluates its body in the current shell, so a `cd` in
-/// the body moves the real CWD behind the guard's back. The body is decoded
-/// (one layer of surrounding quotes) and processed like a bare cd when it is
-/// a clean simple `cd [target]`; any other cd/pushd/popd shape — extra
-/// commands, separators, mixed quoting, or a pushd/popd — resets tracking
-/// fail-closed. A body whose first command verb cannot be normalized to a
-/// literal word (`eval '"c"d /etc'`) could be a current-shell cd or a mutator
-/// — rejected outright. A fully quoted body without a cd verb is the
-/// documented eval-write residual (accepted — the guard does not model its
-/// content). Returns `Ok(true)` when the segment was consumed; a body with no
-/// cd verb that is not fully quoted returns `Ok(false)` so the caller
-/// validates it as its own command.
 /// An `eval` segment evaluates its body in the current shell: the body is
 /// decoded (one layer of surrounding quotes) and re-parsed + walked as the
 /// command text itself — a `cd` inside tracks (the real CWD moves), and a
@@ -2922,6 +2915,7 @@ fn cp_destination_under_temp(segment: &str, state: &ValidationState) -> bool {
     };
     !writes_outside_temp(dest, state)
 }
+
 fn word_has_substitution(w: &str) -> bool {
     let mut found = false;
     scan::for_each_substitution(w, |_, _, _, _| {
@@ -4992,6 +4986,27 @@ mod tests {
             ("cat <<EOF| rm f\nbody\nEOF", false),
             ("cat <<EOF>file\nbody\nEOF", false),
             ("cat <<EOF && cd /tmp && touch f\nbody\nEOF", true),
+        ];
+        run_cases(&cases);
+    }
+
+    /// Substitutions in redirect nodes execute and must be validated:
+    /// input-redirect targets (`cat < $(rm -rf /)`), words swallowed into a
+    /// file_redirect after the target, and quoted/unquoted heredoc marker-line
+    /// words. Substitution-formed targets stay fail-closed (`cat > $(mktemp
+    /// -d)/f` — the guard cannot prove the substitution resolves under temp).
+    #[test]
+    fn redirect_substitution_gaps() {
+        let cases = [
+            ("cat < $(rm -rf /)", false),
+            ("cat < \"$(rm -rf /)\"", false),
+            ("cat < <(rm -rf /)", false),
+            ("cat < `rm -rf /`", false),
+            ("echo hi > /tmp/out $(rm -rf /)", false),
+            ("cat <<EOF \"$(rm -rf /)\"\nbody\nEOF", false),
+            ("cat <<EOF $(rm -rf /)\nbody\nEOF", false),
+            ("cat > $(mktemp -d)/f", false),
+            ("cat < /tmp/in", true),
         ];
         run_cases(&cases);
     }
