@@ -4758,15 +4758,10 @@ pub(crate) struct DetectionInstrumentation {
     pub n_frames_below_reset: usize,
     /// Count of VAD-positive 512-sample frames during streaming detection.
     pub vad_speech_frames: usize,
-    /// Peak rolling-sum score across all segments in this detection session
-    /// Preserved across segment-end resets by capturing from
-    /// [`ctx.peak_score`](PipelineCtx::peak_score) before
-    /// [`reset_detection_segment`] clears the main field, via max-tracking
-    /// conditionals at both the [`reset_detection_segment`] and
-    /// [`handle_wake_word_detection`] save points.  For sessions with multiple
-    /// segments (utterance boundary fired during silence), this retains the
-    /// maximum peak across all segments so the E2E benchmark reports an
-    /// accurate value.
+    /// Peak rolling-sum score across all segments in this detection session.
+    /// Updated inline by the scoring loop via max-tracking, so sessions with
+    /// multiple segments (utterance boundary fired during silence) retain the
+    /// maximum peak across all segments for the E2E benchmark.
     pub peak_score: f32,
     /// Per-frame adaptive threshold trajectory.
     /// Records the effective threshold value (`per_frame_scores[i][2]`) at each
@@ -5034,11 +5029,6 @@ pub(crate) struct PipelineCtx {
     /// The k multiplier for adaptive threshold cached from config at
     /// context creation time.  Updated on pipeline re-initialisation.
     adaptive_k: f32,
-    /// Peak rolling-sum score achieved during the current detection
-    /// session.  Reset on each detection attempt.  Used by the E2E
-    /// benchmark for per-variant peak score reporting.
-    peak_score: f32,
-
     /// Consecutive VAD-negative frame hops since the last VAD-positive frame,
     /// accumulated across calls to [`handle_wake_word_detection`].
     /// Tracked via an [`AtomicUsize`] side channel from the `is_speech_fn`
@@ -5173,7 +5163,6 @@ impl PipelineCtx {
                     .unwrap_or(ADAPTIVE_K_DEFAULT)
                     .clamp(ADAPTIVE_K_MIN, ADAPTIVE_K_MAX)
             },
-            peak_score: 0.0,
             segment_silence_hops: 0,
             next_window_start: 0,
             burst_sweep_done: false,
@@ -5265,7 +5254,6 @@ impl PipelineCtx {
                 self.audio_preprocessor.reset();
                 reset_vad();
                 self.adaptive_threshold.reset();
-                self.peak_score = 0.0;
                 self.next_window_start = 0;
 
                 // Full does NOT clear global enrollment accumulators — those
@@ -5291,7 +5279,6 @@ impl PipelineCtx {
                 self.last_wake_word_detection = None;
                 self.audio_preprocessor.clear_buffer();
                 self.adaptive_threshold.reset();
-                self.peak_score = 0.0;
                 self.next_window_start = 0;
 
                 // Cancel also clears global enrollment accumulators.
@@ -5315,7 +5302,6 @@ impl PipelineCtx {
     /// | `embedding_ring` | Yes | Prevents stale embeddings from mixing with new utterance; matches cooldown-expiry behaviour. |
     /// | `score_window` | Yes | **Critical**: rolling scores must not accumulate across utterances — this is the primary false-trigger mechanism this function fixes |
     /// | `adaptive_threshold` | Yes | Noise floor estimate is per-segment; the 5-call bootstrap (~640 ms of voiced frames at ~128 ms/embedding) is brief and acceptable |
-    /// | `peak_score` | Yes | Diagnostic peak for the current segment; captured to `instrumentation` before clearing |
     /// | `segment_silence_hops` | Yes | Reset the silence counter so the next segment starts fresh |
     ///
     /// **Preserved**: `voice_batch`, `mel_frame_buffer` (caller-managed, see above),
@@ -5323,27 +5309,7 @@ impl PipelineCtx {
     /// (acoustic environment unchanged), `vad_threshold`,
     /// `last_wake_word_detection` (cooldown still active if within 3 s),
     /// `is_recording`, `audio_preprocessor` (noise profile survives).
-    ///
-    /// ## Instrumentation save (`#[cfg(feature = "voice-tests")]`)
-    /// Before clearing per-segment scores, the running max of
-    /// `peak_score` is flushed to `self.instrumentation`
-    /// so the E2E benchmark (which reads instrumentation after
-    /// `run_streaming_detection` returns) captures the true cross-segment maxima
-    /// even when a segment boundary fires during silence-flush post-processing.
     fn reset_detection_segment(&mut self) {
-        // ── Save diagnostic peaks before clearing (voice-tests only) ──
-        #[cfg(feature = "voice-tests")]
-        {
-            // Save the running max of the peak so cross-segment maxima
-            // survive the clearing below.  Without this, a segment boundary
-            // that fires during silence-flush post-processing (between the
-            // last frame-loop flush and the reset) would lose the peaks from
-            // the just-ended segment.
-            if self.peak_score > self.instrumentation.peak_score {
-                self.instrumentation.peak_score = self.peak_score;
-            }
-        }
-
         // ── Clear per-segment buffers ──
         self.embedding_ring.clear();
         // ── Clear per-segment rolling scores (PRIMARY false-trigger fix) ──
@@ -5351,7 +5317,6 @@ impl PipelineCtx {
 
         // ── Reset threshold/scores ──
         self.adaptive_threshold.reset();
-        self.peak_score = 0.0;
 
         // ── Reset silence counter ──
         self.segment_silence_hops = 0;
@@ -6888,10 +6853,6 @@ struct PersistedModel {
     window_size: u32,
 
     // ── Training Metadata (diagnostic only, NOT used for compatibility) ──
-    /// Deterministic RNG seeds used during classifier training.
-    /// Empty = unknown (legacy).
-    #[serde(default)]
-    training_seeds: Vec<u64>,
     /// RFC 3339 timestamp of initial model creation (never updated).
     #[serde(default)]
     created_at: String,
@@ -7063,7 +7024,6 @@ impl Default for PersistedModel {
             phrase: DEFAULT_WAKE_WORD_PHRASE.to_string(),
             embedding_dim: u32::try_from(EMBEDDING_DIM).unwrap(),
             window_size: u32::try_from(wake_word_classifier::WINDOW_SIZE).unwrap(),
-            training_seeds: Vec::new(),
             created_at: String::new(),
             trained_at: String::new(),
             classifier: None,
@@ -7136,9 +7096,6 @@ async fn persist_model_state() {
         phrase,
         embedding_dim: u32::try_from(EMBEDDING_DIM).unwrap(),
         window_size: u32::try_from(wake_word_classifier::WINDOW_SIZE).unwrap(),
-        training_seeds: (0usize..1)
-            .map(|s| s as u64) // safe widening: usize → u64 on 64-bit targets
-            .collect(),
         created_at: if existing_created_at.is_empty() {
             now.clone()
         } else {
@@ -9399,7 +9356,6 @@ mod tests {
         ctx.last_wake_word_detection = Some(Instant::now() - Duration::from_secs(5));
         ctx.auto_start_pending = true;
         ctx.is_recording = true;
-        ctx.peak_score = 0.75;
         ctx
     }
 
@@ -9483,12 +9439,11 @@ mod tests {
 
         assert_buffers_cleared(&ctx);
 
-        // Full-specific: state flags and peak scores reset.
+        // Full-specific: state flags reset.
         assert_eq!(ctx.vad_threshold, VAD_THRESHOLD);
         assert!(ctx.last_wake_word_detection.is_none());
         assert!(!ctx.auto_start_pending);
         assert!(!ctx.is_recording);
-        assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset on Full");
 
         // Global enrollment accumulators PRESERVED by Full — they survive
         // mic stop/start cycles so mid-enrollment progress is not lost on
@@ -9540,7 +9495,6 @@ mod tests {
         let saved_cooldown = ctx.last_wake_word_detection;
         let saved_auto_start = ctx.auto_start_pending;
         let saved_recording = ctx.is_recording;
-        let saved_peak_score = ctx.peak_score;
 
         ctx.reset_pipeline_state(ResetLevel::Soft);
 
@@ -9551,10 +9505,6 @@ mod tests {
         assert_eq!(ctx.last_wake_word_detection, saved_cooldown);
         assert_eq!(ctx.auto_start_pending, saved_auto_start);
         assert_eq!(ctx.is_recording, saved_recording);
-        // Soft clears rolling-window detection state but
-        // preserves peak_score (which is only reset on Full/Cancel alongside
-        // the wider acoustic state).
-        assert_eq!(ctx.peak_score, saved_peak_score);
 
         // Global enrollment accumulators preserved.
         let state = voice_state().read().unwrap_poison();
@@ -9600,8 +9550,6 @@ mod tests {
         // Cancel preserves handler-managed flags (unlike Full).
         assert_eq!(ctx.auto_start_pending, saved_auto_start);
         assert_eq!(ctx.is_recording, saved_recording);
-        // Cancel resets peak_score.
-        assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset on Cancel");
 
         // Global enrollment accumulators cleared (unlike Soft).
         let state = voice_state().read().unwrap_poison();
@@ -9638,33 +9586,6 @@ mod tests {
         }
     }
 
-    // ── reset_detection_segment tests ─────────────────────────────────────
-    // Verifies that the bounded-segment reset clears per-segment detection
-    // state (embedding_ring, score_window, adaptive_threshold, peaks) while
-    // preserving session-level state (VAD, audio_preprocessor, is_recording,
-    // last_wake_word_detection, vad_threshold).
-
-    #[test]
-    fn reset_detection_segment_saves_peaks_to_instrumentation() {
-        // Only meaningful with voice-tests feature.
-        #[cfg(feature = "voice-tests")]
-        {
-            let mut ctx = PipelineCtx::new();
-            ctx.peak_score = 0.85;
-
-            // Pre-seed instrumentation with a lower value to verify max-tracking
-            ctx.instrumentation.peak_score = 0.10;
-
-            ctx.reset_detection_segment();
-
-            // Instrumentation should have captured the higher peak_score value
-            assert!(
-                ctx.instrumentation.peak_score >= 0.85 - f32::EPSILON,
-                "instrumentation.peak_score should capture pre-reset peak_score"
-            );
-        }
-    }
-
     // ── handle_segment_boundary tests ───────────────────────────────────
     // Tests the extracted segment boundary check logic.  The public-API test
     // (handle_segment_boundary) is the canonical reset-contract reference and
@@ -9675,7 +9596,6 @@ mod tests {
         let mut ctx = PipelineCtx::new();
         ctx.embedding_ring = vec![vec![0.5; 96]; 3];
         ctx.score_window = vec![0.5; 5];
-        ctx.peak_score = 0.75;
         ctx.segment_silence_hops = 10;
 
         // Complete adaptive threshold bootstrap so the reset-to-bootstrapping
@@ -9709,7 +9629,6 @@ mod tests {
             "embedding_ring must be cleared"
         );
         assert!(ctx.score_window.is_empty(), "score_window must be cleared");
-        assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset");
         assert_eq!(
             ctx.segment_silence_hops, 0,
             "segment_silence_hops must be reset"
@@ -9983,7 +9902,7 @@ mod tests {
         // Validates:
         //   1. VAD-gap counting across two process_streaming_frames_inner calls
         //   2. Boundary detection at exactly SEGMENT_TIMEOUT_HOPS hops
-        //   3. State reset on ctx (embedding_ring, score_window, peaks)
+        //   3. State reset on ctx (embedding_ring, score_window)
         //   4. Local buffer clearing (voice_batch, mel_frame_buffer)
         //   5. ctx-level buffers preserved (caller-managed invariant)
         //   6. State persistence across calls when hop count is below threshold
@@ -9996,7 +9915,6 @@ mod tests {
         let mut ctx = PipelineCtx::new();
         ctx.embedding_ring = vec![vec![0.5; 96]; 3];
         ctx.score_window = vec![0.5; 5];
-        ctx.peak_score = 0.75;
         ctx.segment_silence_hops = SEGMENT_TIMEOUT_HOPS - 5; // 14, just below threshold
 
         // Pre-populate ctx-level copies to verify caller-managed invariant.
@@ -10080,7 +9998,6 @@ mod tests {
             ctx.score_window.is_empty(),
             "score_window must be cleared after boundary"
         );
-        assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset");
         assert!(
             voice_batch.is_empty(),
             "local voice_batch must be cleared on boundary"
@@ -10130,7 +10047,6 @@ mod tests {
         ctx.segment_silence_hops = 0;
         ctx.embedding_ring = vec![vec![0.5; 96]; 3];
         ctx.score_window = vec![0.5; 5];
-        ctx.peak_score = 0.75;
 
         let mut voice_batch = Vec::new();
         let mut mel_frame_buffer = Vec::new();
@@ -10196,7 +10112,6 @@ mod tests {
             ctx.score_window.is_empty(),
             "score_window must be cleared after boundary"
         );
-        assert_eq!(ctx.peak_score, 0.0, "peak_score must be reset");
         assert!(
             voice_batch.is_empty(),
             "local voice_batch must be cleared on boundary"
@@ -10842,7 +10757,6 @@ mod tests {
             phrase: String::new(),
             embedding_dim: 0,
             window_size: 0,
-            training_seeds: Vec::new(),
             created_at: String::new(),
             trained_at: String::new(),
             classifier: Some(vec![ClassifierWeights::default()]),

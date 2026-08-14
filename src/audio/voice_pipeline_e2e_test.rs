@@ -1408,7 +1408,6 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
     // negatives would report "classifier triggers" from warm-up speech).
     ctx.instrumentation = super::DetectionInstrumentation::new();
     ctx.instrumentation.test_start_ring_len = ctx.embedding_ring.len();
-    ctx.peak_score = 0.0;
 
     // ── Fresh AGC/NS state for the test utterance ─────────
     // The warm-up audio drives the AGC's asymmetric EMA to a speech-adapted
