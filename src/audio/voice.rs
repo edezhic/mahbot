@@ -34,7 +34,8 @@ use crate::EMBEDDING_DIM;
 use crate::audio::embedding_sequence::{EmbeddingSequence, Source, UtteranceId};
 use crate::audio::wake_word_classifier::{self, ClassifierWeights, WakeWordClassifier};
 use crate::audio::{
-    MAX_DOWNLOAD_RETRIES, extract_output, models_subdir, onnx_input_name, run_download_retry_loop,
+    MAX_DOWNLOAD_RETRIES, ensure_downloaded, extract_output, models_subdir, onnx_input_name,
+    run_download_retry_loop,
 };
 use crate::config::CONFIG;
 use crate::turso;
@@ -3288,7 +3289,6 @@ pub(crate) fn synthesize_with_pcm_cache(
 static PCM_EVICTION_RAN: AtomicBool = AtomicBool::new(false);
 
 /// Ensure a model file exists with a valid SHA256, re-downloading it otherwise.
-#[allow(clippy::cast_precision_loss)]
 async fn ensure_model_file(
     client: &reqwest::Client,
     dir: &Path,
@@ -3296,32 +3296,17 @@ async fn ensure_model_file(
     label: &str,
 ) -> Result<()> {
     let (filename, url, sha256) = model;
-    let path = dir.join(filename);
-    if path.exists()
-        && let Err(e) = crate::util::verify_sha256(&path, sha256)
-    {
-        warn!("{label} model corrupt, re-downloading: {e}");
-        tokio::fs::remove_file(&path).await?;
-    }
-    if !path.exists() {
-        info!("Downloading {label} model...");
-        let mut size = 0u64;
-        crate::util::http::download_verified(
-            client,
-            url,
-            &path,
-            sha256,
-            Some(MODEL_DOWNLOAD_TIMEOUT),
-            crate::util::http::DownloadSizeCheck::Min(1000),
-            |downloaded, _| size = downloaded,
-        )
-        .await?;
-        info!(
-            "Downloaded {} ({:.1} MB)",
-            path.display(),
-            size as f64 / 1_048_576.0
-        );
-    }
+    ensure_downloaded(
+        Some(client),
+        &dir.join(filename),
+        url,
+        sha256,
+        1000,
+        MODEL_DOWNLOAD_TIMEOUT,
+        &format!("{filename} ({label})"),
+        |_, _| {},
+    )
+    .await?;
     Ok(())
 }
 

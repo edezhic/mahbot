@@ -37,7 +37,9 @@
 //! | 2     | READY    | All models loaded and ready for synthesis.    |
 //! | 3     | FAILED   | Download or load failed terminally.           |
 
-use crate::audio::{MAX_DOWNLOAD_RETRIES, extract_output, models_subdir, run_download_retry_loop};
+use crate::audio::{
+    MAX_DOWNLOAD_RETRIES, ensure_downloaded, extract_output, models_subdir, run_download_retry_loop,
+};
 use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
 use crate::util::model_state::{AtomicModelState, ModelState};
@@ -902,64 +904,24 @@ async fn ensure_models_downloaded(dir: &Path) -> Result<()> {
 
 /// Ensure a single file exists and is uncorrupted, or download it.
 async fn ensure_file(f: &TtsFile) -> Result<()> {
-    // Check cached file integrity
-    if f.path.exists() {
-        if f.sha256.is_empty() {
-            // No hash configured — just check minimum size
-            let meta = tokio::fs::metadata(&f.path).await?;
-            if meta.len() > 100 {
-                return Ok(());
-            }
-            // File too small, re-download
-            warn!(
-                "TTS file too small ({} bytes), re-downloading: {}",
-                meta.len(),
-                f.path.display()
-            );
-            tokio::fs::remove_file(&f.path).await?;
-        } else {
-            match crate::util::verify_sha256(&f.path, f.sha256) {
-                Ok(()) => return Ok(()), // file is intact
-                Err(e) => {
-                    warn!("TTS file corrupt, re-downloading {}: {e}", f.path.display());
-                    tokio::fs::remove_file(&f.path).await?;
-                }
-            }
-        }
-    }
-
-    // Download
-    info!(
-        "Downloading TTS file: {}",
-        f.path.file_name().unwrap_or_default().to_string_lossy()
-    );
-    download_file(&f.url, &f.path, f.sha256).await
-}
-
-/// Download a single file with atomic write, SHA256 verification, and progress events.
-#[allow(clippy::cast_precision_loss)]
-async fn download_file(url: &str, dest: &Path, expected_hash: &str) -> Result<()> {
-    let client = crate::util::http::build_download_client(MODEL_DOWNLOAD_TIMEOUT)
-        .context("Failed to build HTTP client")?;
-
-    let file_name = dest
+    let file_name = f
+        .path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
 
-    let mut downloaded: u64 = 0;
     let mut started = false;
-    let mut last_reported_bytes: u64 = 0;
-    crate::util::http::download_verified(
-        &client,
-        url,
-        dest,
-        expected_hash,
+    let mut last_reported_bytes = 0u64;
+    if ensure_downloaded(
         None,
-        crate::util::http::DownloadSizeCheck::Min(100),
+        &f.path,
+        &f.url,
+        f.sha256,
+        100,
+        MODEL_DOWNLOAD_TIMEOUT,
+        &file_name,
         |d, total_size| {
-            downloaded = d;
             // First call (pre-stream) carries total_bytes → FileStarted.
             if !started {
                 started = true;
@@ -971,32 +933,22 @@ async fn download_file(url: &str, dest: &Path, expected_hash: &str) -> Result<()
             // Throttle: emit progress at ~1% granularity to avoid broadcast pressure.
             if total_size > 0 {
                 let threshold = (total_size / 100).max(1);
-                if downloaded - last_reported_bytes >= threshold || downloaded >= total_size {
-                    last_reported_bytes = downloaded;
+                if d - last_reported_bytes >= threshold || d >= total_size {
+                    last_reported_bytes = d;
                     emit_download_event(TtsDownloadEvent::FileProgress {
                         name: file_name.clone(),
-                        bytes_downloaded: downloaded,
+                        bytes_downloaded: d,
                         total_bytes: total_size,
                     });
                 }
             }
         },
     )
-    .await?;
-
-    let hash_str = if expected_hash.is_empty() {
-        String::new()
-    } else {
-        format!(" (SHA256: {expected_hash})")
-    };
-
-    info!(
-        "Downloaded {}{} ({:.1} MB)",
-        file_name,
-        hash_str,
-        downloaded as f64 / 1_048_576.0
-    );
-    emit_download_event(TtsDownloadEvent::FileCompleted { name: file_name });
+    .await?
+    {
+        // FileCompleted fires only after a real download (cached files fast-path out).
+        emit_download_event(TtsDownloadEvent::FileCompleted { name: file_name });
+    }
     Ok(())
 }
 

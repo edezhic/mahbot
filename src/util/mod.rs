@@ -192,10 +192,6 @@ pub(crate) fn hex_string(bytes: &[u8]) -> String {
 ///   canonical "no hash configured" semantics that won the reconciliation.
 /// * Uses streaming SHA256 via [`Sha256::update`] to avoid loading the entire
 ///   file into memory (model files can be multiple GB).
-///
-/// Note: unifying the error wording changes user-facing log text at the former
-/// voice.rs call sites (e.g. `"Mel spectrogram model corrupt, re-downloading:
-/// {e}"` now shows the path-qualified mismatch message).
 pub(crate) fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
     if expected.is_empty() {
         return Ok(()); // no hash configured — skip verification

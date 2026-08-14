@@ -10,14 +10,15 @@ pub mod tts;
 pub mod voice;
 pub(crate) mod wake_word_classifier;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use candle_core::Tensor;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::AsyncFn;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::util::model_state::{AtomicModelState, ModelLoadGuard, ModelState};
 
@@ -113,4 +114,77 @@ pub(crate) async fn run_download_retry_loop<D, L, F>(
         tokio::time::sleep(retry_delay).await;
         retry_delay = (retry_delay * 2).min(Duration::from_mins(2));
     }
+}
+
+/// Verify-then-download helper shared by the TTS and voice model sets.
+///
+/// Checks `path` before downloading (SHA256 when `sha256` is non-empty,
+/// else `min_size`), re-downloading via
+/// [`download_verified`](crate::util::http::download_verified) when
+/// missing/corrupt/too small; returns `true` iff a download ran. `client`
+/// is reused when `Some`; when `None` one is built (with `timeout`) only on
+/// the download path. `timeout` maps to a per-request timeout. `label` names
+/// the file in logs (must include the file name); `on_progress` runs during
+/// downloads only.
+///
+/// Deliberately not used by `local_transcriber.rs` (no-timeout client,
+/// [`DownloadSizeCheck::None`](crate::util::http::DownloadSizeCheck::None),
+/// spawn_blocking pre-check) or `embedder.rs` (existence-only pre-check,
+/// [`DownloadSizeCheck::Exact`](crate::util::http::DownloadSizeCheck::Exact)).
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+pub(crate) async fn ensure_downloaded(
+    client: Option<&reqwest::Client>,
+    path: &Path,
+    url: &str,
+    sha256: &str,
+    min_size: u64,
+    timeout: Duration,
+    label: &str,
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<bool> {
+    if path.exists() {
+        if sha256.is_empty() {
+            let meta = tokio::fs::metadata(path).await?;
+            if meta.len() >= min_size {
+                return Ok(false);
+            }
+            warn!(
+                "{label} too small ({} bytes), re-downloading: {}",
+                meta.len(),
+                path.display()
+            );
+        } else if let Err(e) = crate::util::verify_sha256(path, sha256) {
+            warn!("{label} corrupt, re-downloading {}: {e}", path.display());
+        } else {
+            return Ok(false);
+        }
+        tokio::fs::remove_file(path).await?;
+    }
+
+    info!("Downloading {label}...");
+    let client = match client {
+        Some(c) => Cow::Borrowed(c),
+        None => Cow::Owned(
+            crate::util::http::build_download_client(timeout)
+                .context("Failed to build HTTP client")?,
+        ),
+    };
+    // Byte count comes from the progress closure (download_verified's
+    // documented cumulative-bytes contract) — no post-success failure surface.
+    let mut size = 0u64;
+    crate::util::http::download_verified(
+        &client,
+        url,
+        path,
+        sha256,
+        Some(timeout),
+        crate::util::http::DownloadSizeCheck::Min(min_size),
+        |d, total| {
+            size = d;
+            on_progress(d, total);
+        },
+    )
+    .await?;
+    info!("Downloaded {label} ({:.1} MB)", size as f64 / 1_048_576.0);
+    Ok(true)
 }
