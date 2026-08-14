@@ -2745,6 +2745,9 @@ fn cp_destination_under_temp(segment: &str, state: &ValidationState) -> bool {
 /// rejection is skipped. `${...}` parameter expansion is deliberately
 /// excluded: its expansion is word-split into the command line, not run as a
 /// validated subshell, so a bare `${x:-rm -rf /}` must stay fail-closed.
+/// Accepted residual (pre-existing, outside the substitution-shift
+/// hardening): the body is validated read-only, so a body that ECHOES a
+/// mutator word (`$(echo rm /etc/passwd)`) runs that word as the command.
 fn is_bare_substitution_segment(s: &str) -> bool {
     let s = s.trim();
     substitution_span(s, 0).is_some_and(|(_, next)| next == s.len() && !s.starts_with("${"))
@@ -4318,7 +4321,12 @@ fn check_git_scoped_flags(trimmed: &str, base: &str, words: &[&str]) -> Result<(
 /// Reject `--output` on any git subcommand — it writes the command's output
 /// to a file (`--output=<file>` / `--output <file>`). Runs before
 /// [`check_git_read_only_extensions`], whose read forms (`git stash show
-/// --output=...`) would bypass it. `--output-indicator-*` do not write and
+/// --output=...`) would bypass it. The unprovable-span rejection doubles as
+/// the blanket substitution net for ALL git arguments — it is what blocks
+/// substitution-hiding exec-vector flags (`git log $(echo --ext-diff)`),
+/// which the literal-only exec-flag scan ([`check_git_exec_flags`]) cannot
+/// see — so the `--output` message is intentionally generic for any rejected
+/// substitution word. `--output-indicator-*` do not write and
 /// are exempt — but only the literal prefix: the fail-closed checks run on
 /// what follows it, because an unquoted span there can still field-split a
 /// standalone `--output=...` (`--output-indicator-$(echo 'x --output=/etc/passwd')`
@@ -4533,8 +4541,9 @@ fn git_mutation_rejection(subcommand: &str) -> String {
 ///   ([`unprovable_flag_word`]) — the span-aware tokenizer keeps `$(echo -d)`
 ///   whole, so without this the literal cluster scan would rely on git's own
 ///   option-conflict error (`git branch --list $(echo -d) feature`); whole-
-///   word `$(` spellings at the name position over-reject, same contract as
-///   the other git gates.
+///   word `$(` spellings at the name position and bare-`$var` positionals
+///   (`git branch --list $name feature`) over-reject, same contract as the
+///   other git gates.
 /// - Required-value options consume the next token unconditionally (even
 ///   dash-prefixed); a consumed token never triggers list mode
 ///   (`git branch --sort --list foo` creates `foo`).
@@ -5098,34 +5107,17 @@ fn contains_bare_var(w: &str) -> bool {
     false
 }
 
-/// True when a word containing a bare `$var` could expand to a string
-/// beginning with `token`: the literal text before the first bare var
-/// (shell-normalized) must be a prefix of `token`, so the expansion could
-/// continue it (`--$x` → `--output`) while a fixed prefix that cannot start
-/// the token pins the word to another vector (`--format=$x` is a format value,
-/// never `--output`). Closes the bare-`$var` gap at fixed-token positions
-/// (clippy `--fix`, git `--output`, awk `inplace`) that `$()`/`${...}`-only
-/// predicates cannot see. `git remote $x` stays exempt — remote's verb
-/// position is its own mutation check, where `$x` may be a legit read verb.
-fn bare_var_could_form_prefix(w: &str, token: &str) -> bool {
-    if !contains_bare_var(w) {
-        return false;
-    }
-    let p = shell_word(w);
-    let var_idx = p.find('$').unwrap_or(p.len());
-    let prefix = &p[..var_idx];
-    prefix.is_empty() || token.starts_with(prefix)
-}
-
 /// True when `w` could deliver a mutation flag at a fixed-dictionary flag
 /// position: a substitution word that could form a flag
 /// ([`substitution_could_form_flag`]) or a bare-`$var` word whose expansion is
 /// arbitrary and starts the field (`$w` could be `-w`, `$i` could be `-i`).
 /// Fail-closed: any such word counts as the flag. The bare-`$var` arm fires on
 /// ANY word starting with `$`/`` ` `` — including read-only temp operands
-/// (`git hash-object $TMPDIR/f file`, `sed s/a/b/ $TMPDIR/x`) — the accepted
-/// over-rejection contract of both call sites (see the git hash-object and
-/// sed gates). The arm is word-start-gated, so a mid-word bare var that
+/// (`git hash-object $TMPDIR/f file`, `sed s/a/b/ $TMPDIR/x`) and positional
+/// ref names (`git branch --list $name feature`) — the accepted over-rejection
+/// contract of all three call sites (hash-object cluster, sed in-place,
+/// branch/tag ref subcommand). The arm is word-start-gated, so a mid-word
+/// bare var that
 /// field-splits a flag (`git hash-object --$w file`, `w='x -w'` → fields
 /// `--x`, `-w`) escapes while the `$(...)` spelling is caught — accepted
 /// residual, unlike the fixed-token gates which fire on any-position bare
@@ -5141,9 +5133,10 @@ fn unprovable_flag_word(w: &str, p: &str) -> bool {
 /// arbitrary value can field-split the token out as its own argv field
 /// (`--message-format=$fmt` → `--fix`, `if=$src` → `of=`). The shared
 /// fail-closed tail of the awk/dd/clippy gates; gates needing a provable
-/// fixed prefix ([`bare_var_could_form_prefix`], awk's `inplace` operand) or
-/// an exemption (git `--output`'s `--output-indicator` prefix and `git
-/// remote` verb) keep their own combination.
+/// fixed prefix (awk's `inplace` operand — its bare-`$var` prefix check is
+/// inlined in [`has_inplace`]) or an exemption (git `--output`'s
+/// `--output-indicator` prefix and `git remote` verb) keep their own
+/// combination.
 fn word_could_form_token_or_bare_var(w: &str, token: &str) -> bool {
     word_could_form_token(w, token, "") || contains_bare_var(w)
 }
@@ -5272,10 +5265,18 @@ fn has_sed_mutation(command: &str, state: &ValidationState) -> bool {
 fn has_inplace(command: &str, _state: &ValidationState) -> bool {
     let parts: Vec<&str> = split_words_keeping_substitutions(command);
     parts.windows(2).any(|w| {
-        (shell_word(w[0]) == "-i" || word_could_form_token_or_bare_var(w[0], "-i"))
-            && (shell_word(w[1]) == "inplace"
-                || word_could_form_token(w[1], "inplace", "")
-                || bare_var_could_form_prefix(w[1], "inplace"))
+        let p0 = shell_word(w[0]);
+        let p1 = shell_word(w[1]);
+        // Operand: `inplace` literal or provably-folded; a bare `$var` whose
+        // literal prefix cannot start the word could still expand to `inplace`
+        // (`inpl$ace` → fail closed) while a pinned prefix (`lib$suffix` → the
+        // first field is `lib`, never `inplace`) stays allowed.
+        let bare_operand = contains_bare_var(w[1]) && {
+            let prefix = &p1[..p1.find('$').unwrap_or(p1.len())];
+            prefix.is_empty() || "inplace".starts_with(prefix)
+        };
+        (p0 == "-i" || word_could_form_token_or_bare_var(w[0], "-i"))
+            && (p1 == "inplace" || word_could_form_token(w[1], "inplace", "") || bare_operand)
     })
 }
 
@@ -5457,8 +5458,6 @@ fn has_curl_mutation(command: &str, state: &ValidationState) -> bool {
 fn has_wget_mutation(command: &str, state: &ValidationState) -> bool {
     let parts: Vec<&str> = split_words_keeping_substitutions(command);
 
-    // A substitution word could deliver `-O`/`-P` (unprovable) — fail closed,
-    // same contract as [`has_output_mutation`].
     if parts
         .iter()
         .any(|w| substitution_could_form_flag(w, &shell_word(w)))
@@ -6730,11 +6729,13 @@ mod tests {
             ("curl x$((1+2))y URL", true), // mid-word arithmetic: numeric, no split
             // branch/tag gates: substitution words fail closed — without this,
             // `--list $(echo -d)` would rely on git's own option-conflict
-            // error; whole-word `$(` at the name position over-rejects
+            // error; whole-word `$(` at the name position and bare-`$var`
+            // positionals (`$name` — could deliver `-d`) over-reject
             ("git branch --list $(echo -d) feature", false),
             ("git branch $(echo -d) feature", false),
             ("git branch --$(echo delete) feature", false),
             ("git branch --list $(echo feature)", false), // over-rejection: whole-word $( at name position
+            ("git branch --list $name feature", false),   // over-rejection: bare-$var positional
             ("git branch --list feature", true),
         ];
         run_cases(&cases);
