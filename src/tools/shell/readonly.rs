@@ -2149,28 +2149,21 @@ fn parse_function(s: &str, i: usize, base: &ValidationState) -> Result<usize, St
     Ok(after_body)
 }
 
-/// Validate command substitutions (`$(...)` and backticks) as nested commands.
-///
-/// Substitution contents are located with quote/escape awareness and run
-/// through the full command validation recursively (heredocs, redirects,
-/// nested substitutions, and mutator checks all apply inside a substitution).
-/// Substitution starts are recognized even inside double quotes: bash executes
-/// `"$(touch f)"` and `` "`touch f`" ``, so a write hidden in a double-quoted
-/// substitution must be found here. Inside single quotes (and after an escape
-/// backslash) `$(`/backticks are literal and are not substitutions.
-///
-/// Called once per segment from [`validate_string`]'s segment loop, so each
-/// substitution is validated with the state at its segment's position —
-/// prior segments' `cd`/export bindings apply (e.g. `export TMPDIR=/etc`
-/// poisons `$TMPDIR` expansions in a later substitution). The nested
-/// validation runs against a snapshot of the state because a substitution
-/// executes in a subshell: `cd`/export inside `$(...)` does not affect the
-/// outer command.
-fn scan_substitutions(s: &str, state: &mut ValidationState) -> Result<(), String> {
-    let mut i = 0;
+/// Walk `s` once with quote/escape context, invoking `visit(span, content,
+/// end)` for every active substitution: `$(...)`, `` `...` ``, `${...}`, and —
+/// only in unquoted words — process substitution `<(cmd)`/`>(cmd)` (bash
+/// keeps quoted process substitution literal). `span` is the full text incl.
+/// introducer and closing delimiter (or rest when unterminated); `content` is
+/// the body without them; `end` the byte index after the closing delimiter.
+/// Single-quoted and escaped introducers are literal. Returning `false` from
+/// `visit` stops the scan. This single scan backs both [`scan_substitutions`]
+/// and [`word_has_substitution`], so span syntax cannot drift between
+/// validation and the fail-closed word predicate.
+fn for_each_substitution(s: &str, mut visit: impl FnMut(&str, &str, usize) -> bool) {
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
+    let mut i = 0;
     while i < s.len() {
         let c = s[i..].chars().next().expect("i < s.len()");
         // Detect substitution starts before the quote-state skip: they run
@@ -2178,16 +2171,10 @@ fn scan_substitutions(s: &str, state: &mut ValidationState) -> Result<(), String
         // inside single quotes or after an escape backslash.
         if !escaped
             && !in_single
-            && let Some((content, next)) = substitution_span(s, i)
+            && let Some((content, next)) = any_substitution_span(s, i, in_double)
         {
-            // `$((...))` arithmetic expansion: the expression is not a
-            // command, but nested substitutions inside it execute and
-            // must be validated (e.g. `$(( $(touch x) + 1 ))`). The `$(` gate
-            // excludes backtick bodies starting with `(` (a subshell command).
-            if c == '$' && content.starts_with('(') {
-                scan_substitutions(content, state)?;
-            } else {
-                validate_substitution_content(content, state)?;
+            if !visit(&s[i..next], content, next) {
+                return;
             }
             i = next;
             continue;
@@ -2198,7 +2185,30 @@ fn scan_substitutions(s: &str, state: &mut ValidationState) -> Result<(), String
         }
         i += c.len_utf8();
     }
-    Ok(())
+}
+
+/// Validate every substitution body in `s` as a nested command against a
+/// snapshot of the current state (substitutions run in a subshell — state
+/// changes don't leak to the outer command). `$((...))` arithmetic expansion
+/// is not a command, but nested substitutions inside it execute and must be
+/// validated (e.g. `$(( $(touch x) + 1 ))`).
+fn scan_substitutions(s: &str, state: &mut ValidationState) -> Result<(), String> {
+    let mut result = Ok(());
+    for_each_substitution(s, |span, content, _| {
+        // `$((...))` arithmetic and `${...}` parameter expansion are not
+        // commands themselves (a `${x:-...}` body is expansion syntax, not a
+        // subshell) — recurse so only the nested `$(...)`/backtick/
+        // `<(cmd)` bodies inside them execute and get validated. The `$(` gate
+        // excludes backtick bodies starting with `(` (a subshell). Returning
+        // false stops the scan, so the first Err is never overwritten.
+        result = if span.starts_with("$((") || span.starts_with("${") {
+            scan_substitutions(content, state)
+        } else {
+            validate_substitution_content(content, state)
+        };
+        result.is_ok()
+    });
+    result
 }
 
 /// Scan from byte `from` for the close paren that brings `initial_depth` to 0.
@@ -2270,19 +2280,82 @@ fn find_backtick_end(s: &str, start: usize) -> (&str, usize) {
     (&s[start..], s.len())
 }
 
-/// Span of a command substitution whose introducer is at byte `i` (`$(` or
-/// backtick). Returns `(content, index_after_close)` — `content` starts
-/// AFTER the introducer (`i + 2` / `i + 1`), not at `i`; slice `s[i..next]`
-/// for the full span.
+/// Find the matching `}` for a `${...}` parameter expansion whose `{` is at
+/// byte `i + 1`. Bash closes at the first `}` not inside a nested
+/// substitution span (verified against bash: `${x:-{a} rm f}` ends after
+/// `{a`, so `rm f}` are separate words). Nested substitution spans are
+/// skipped whole, so a `}` inside `$(...)`/backtick/`<(cmd)`/inner `${...}`
+/// never closes the expansion early. The `}` check itself is deliberately NOT
+/// quote-gated: a `}` inside double quotes closes the span early in the guard
+/// but at the final `}` in bash (`${x:-"a}b"}`) — fail-closed, exposing more
+/// words to validation. Returns `(content, index_after_close)`; unterminated
+/// expansions return the rest as content (validated anyway — fail-closed).
+fn find_parameter_end(s: &str, i: usize) -> (&str, usize) {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut k = i + 2;
+    while k < s.len() {
+        let c = s[k..].chars().next().expect("k < s.len()");
+        if !escaped
+            && !in_single
+            && let Some((_, next)) = any_substitution_span(s, k, in_double)
+        {
+            k = next;
+            continue;
+        }
+        if !super::track_char_context(c, &mut in_single, &mut in_double, &mut escaped) {
+            k += c.len_utf8();
+            continue;
+        }
+        if c == '}' {
+            return (&s[i + 2..k], k + 1);
+        }
+        k += c.len_utf8();
+    }
+    (&s[i + 2..], s.len())
+}
+
+/// Span of a command substitution whose introducer is at byte `i` (`$(`,
+/// backtick, or `${`). Returns `(content, index_after_close)` — `content`
+/// starts AFTER the introducer (`i + 2` / `i + 1`), not at `i`; slice
+/// `s[i..next]` for the full span.
 fn substitution_span(s: &str, i: usize) -> Option<(&str, usize)> {
     let b = s.as_bytes();
     if b.get(i) == Some(&b'$') && b.get(i + 1) == Some(&b'(') {
         Some(find_substitution_end(s, i + 2))
     } else if b.get(i) == Some(&b'`') {
         Some(find_backtick_end(s, i + 1))
+    } else if b.get(i) == Some(&b'$') && b.get(i + 1) == Some(&b'{') {
+        Some(find_parameter_end(s, i))
     } else {
         None
     }
+}
+
+/// Full substitution-span detection: [`substitution_span`] plus — only in
+/// unquoted words — process substitution `<(cmd)`/`>(cmd)` (bash keeps
+/// quoted process substitution literal text). Same
+/// `(content, index_after_close)` contract; unterminated spans return the
+/// rest as content (fail-closed).
+fn any_substitution_span(s: &str, i: usize, in_double: bool) -> Option<(&str, usize)> {
+    if let Some(span) = substitution_span(s, i) {
+        return Some(span);
+    }
+    let b = s.as_bytes();
+    if !in_double
+        && (b.get(i) == Some(&b'<') || b.get(i) == Some(&b'>'))
+        && b.get(i + 1) == Some(&b'(')
+    {
+        let end = find_paren_close(s, i + 2, 1).unwrap_or(s.len());
+        let content = if end == s.len() {
+            &s[i + 2..]
+        } else {
+            &s[i + 2..end - 1]
+        };
+        return Some((content, end));
+    }
+    None
 }
 
 /// Validate a substitution body as a nested command against a snapshot of the
@@ -2433,7 +2506,9 @@ const FLAG_CHECKS: &[FlagCheck] = &[
 ];
 
 /// Collect all non-flag, non-redirect, non-heredoc path-like arguments from a
-/// command segment, scanning the **original** whitespace-split tokens.
+/// command segment, scanning the **original** tokens (substitution-aware — the
+/// same word list the dispatch uses, so `FOO=$(echo a b) mkdir -p /tmp/x`
+/// yields only the real arguments).
 ///
 /// This replaces the previous implementation that used [`canonical_command`],
 /// which truncated to the first non-flag argument only, meaning multiple
@@ -2456,7 +2531,7 @@ const FLAG_CHECKS: &[FlagCheck] = &[
 /// marker is replaced by a space), so the only `<<` tokens that can appear
 /// are quoted ones (`echo "<<EOF"`), which classify as ordinary words.
 fn non_flag_path_args(segment: &str) -> Vec<String> {
-    let words: Vec<&str> = segment.split_whitespace().collect();
+    let words = split_words_keeping_substitutions(segment);
     let Some(cmd_idx) = super::find_first_command_word_index(&words) else {
         return vec![];
     };
@@ -2635,7 +2710,7 @@ fn temp_mutator_paths_under_temp(segment: &str, first_word: &str, state: &Valida
 /// `-t`/`--target-directory`, or the last non-flag path argument. With no
 /// identifiable destination the command is rejected.
 fn cp_destination_under_temp(segment: &str, state: &ValidationState) -> bool {
-    let words: Vec<&str> = segment.split_whitespace().collect();
+    let words = split_words_keeping_substitutions(segment);
     let Some(cmd_idx) = super::find_first_command_word_index(&words) else {
         return false;
     };
@@ -2655,14 +2730,15 @@ fn cp_destination_under_temp(segment: &str, state: &ValidationState) -> bool {
     }
 }
 
-/// True when the trimmed segment is exactly one command-substitution span
-/// (`$(...)` or backtick) with no leading/trailing content — a bare
-/// substitution at command position, whose content executes in a subshell and
-/// is validated by [`scan_substitutions`] (the emitted heredoc-body spans and
-/// standalone `$(cmd)` commands).
+/// True when `s` is a bare command substitution (`$(...)`/backtick) that
+/// occupies the whole segment. Its body was already validated by
+/// [`scan_substitutions`] as a subshell command, so the unprovable-verb
+/// rejection is skipped. `${...}` parameter expansion is deliberately
+/// excluded: its expansion is word-split into the command line, not run as a
+/// validated subshell, so a bare `${x:-rm -rf /}` must stay fail-closed.
 fn is_bare_substitution_segment(s: &str) -> bool {
     let s = s.trim();
-    substitution_span(s, 0).is_some_and(|(_, next)| next == s.len())
+    substitution_span(s, 0).is_some_and(|(_, next)| next == s.len() && !s.starts_with("${"))
 }
 
 /// Classification of a command verb word: provably literal (possibly with
@@ -2678,7 +2754,7 @@ enum VerbClass<'a> {
 /// Result of scanning a segment's leading env assignments and shell prefixes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum VerbResolution<'a> {
-    /// Verb word found at `idx` in the whitespace-split words.
+    /// Verb word found at `idx` in the substitution-aware split words.
     Verb { idx: usize, class: VerbClass<'a> },
     /// A forwarding prefix with informational/invalid options (`command -v`,
     /// `builtin -p`, `time -p -p`): the command is provably never executed,
@@ -3330,10 +3406,19 @@ fn bind_assignment_word(w: &str, state: &mut ValidationState) {
     }
 }
 
-/// Split a segment into whitespace-separated words, keeping `$(...)` /
-/// backtick substitutions whole — their bodies may contain spaces, and
-/// `NAME=$(mktemp -d)` must stay one assignment word.
-fn split_words_keeping_substitutions(s: &str) -> Vec<&str> {
+/// Split a segment into whitespace-separated words, keeping substitutions
+/// whole — their bodies may contain spaces, and `NAME=$(mktemp -d)` must
+/// stay one assignment word. This is the tokenizer for command-word/verb/git
+/// dispatch: plain `split_whitespace` splits substitution bodies apart and
+/// shifts the first command word onto the inner word (a read-only-guard
+/// bypass). `$(...)`, backticks, `${...}`, and unquoted `<(cmd)`/`>(cmd)` stay
+/// single tokens. An unquoted `${x:-a b}` result word-splits in bash argument
+/// position, but the raw token is kept anyway — fail-closed, since every
+/// position that decides on the expansion's words treats it as unprovable.
+/// Quoted `<(cmd)` is literal; bare `$var` splits only at runtime (see
+/// [`word_has_substitution`]). Backslash-escaped whitespace is part of the
+/// word (`FOO=a\ b rm x` stays one assignment word, like bash).
+pub(super) fn split_words_keeping_substitutions(s: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
@@ -3346,7 +3431,7 @@ fn split_words_keeping_substitutions(s: &str) -> Vec<&str> {
         // literal inside single quotes or after an escape backslash.
         if !escaped
             && !in_single
-            && let Some((_, next)) = substitution_span(s, i)
+            && let Some((_, next)) = any_substitution_span(s, i, in_double)
         {
             i = next;
             continue;
@@ -3369,6 +3454,26 @@ fn split_words_keeping_substitutions(s: &str) -> Vec<&str> {
         out.push(&s[start..]);
     }
     out
+}
+
+/// True when a word contains an expandable substitution whose expanded form
+/// is unprovable: `$(...)`, backticks, `${...}`, or unquoted process
+/// substitution `<(cmd)`/`>(cmd)` (each incl. inside double quotes). Words in
+/// mutation-determining positions (git subcommand, remote verb, config write
+/// count, flag scans, ...) fail closed on this rather than let the expansion
+/// become a mutator. Single-quoted expansions are literal and never match.
+///
+/// Bare `$var` is deliberately NOT matched: it also appears in legit
+/// read-only scripts (`git remote $x` where `$x` may be `show`). The reflog
+/// subcommand and fsck flags are the exceptions — fixed dictionaries, closed
+/// via [`contains_bare_var`].
+fn word_has_substitution(w: &str) -> bool {
+    let mut found = false;
+    for_each_substitution(w, |_, _, _| {
+        found = true;
+        false // stop scanning at the first hit
+    });
+    found
 }
 
 /// Bind a single `NAME=value` assignment to a tracked variable.
@@ -3871,6 +3976,7 @@ fn scan_push_clean_tokens(
 /// `config user.name Egor`, `rebase --continue`, `push origin main`,
 /// `clean -f`, `submodule foreach`), and any force token blocks the dry-run
 /// clean/push forms.
+#[allow(clippy::too_many_lines)] // security-critical allowlist branches
 fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Result<(), String>> {
     // git stash: `list` and `show` are read-only inspection; everything else
     // (push, pop, apply, drop, ...) modifies the working tree. Matching is
@@ -3878,9 +3984,9 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
     // `git stash push -m "stash show"` stays blocked even though its message
     // contains a read-form word.
     if subcommand.starts_with("stash") {
-        let words: Vec<&str> = subcommand.split_whitespace().collect();
-        let stash_cmd = words.get(1).copied().unwrap_or("");
-        if matches!(stash_cmd, "show" | "list") {
+        let words = split_words_keeping_substitutions(subcommand);
+        let stash_cmd = shell_word(words.get(1).copied().unwrap_or(""));
+        if matches!(stash_cmd.as_str(), "show" | "list") {
             return Some(Ok(()));
         }
         return Some(reject(
@@ -3890,12 +3996,13 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
         ));
     }
 
-    // git config read/write rule: exactly one positional after
-    // `config` (key read) is allowed; two positionals (key + value) write.
-    // Explicit get forms (--list, -l, --get, --get-all, --get-regexp,
-    // --name-only) are allowed; write/edit forms are blocked.
+    // git config: one positional (key read) is allowed; two (key + value)
+    // write. Explicit get forms short-circuit BEFORE the substitution
+    // fail-closed (a get form proves read-only — git rejects conflicting
+    // actions/extra positionals). Without one, any substitution word is
+    // unprovable (could be `--add` or a key+value pair) and fails closed.
     if subcommand.starts_with("config") {
-        let words: Vec<&str> = subcommand.split_whitespace().collect();
+        let words = split_words_keeping_substitutions(subcommand);
         let rest = &words[1..];
         if rest.iter().any(|w| {
             let w = shell_word(w);
@@ -3905,6 +4012,13 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
             )
         }) {
             return Some(Ok(()));
+        }
+        if rest.iter().any(|w| word_has_substitution(w)) {
+            return Some(reject(
+                trimmed,
+                "`git config` with a substitution cannot be proven read-only.",
+                "write git config arguments literally.",
+            ));
         }
         if rest.iter().any(|w| {
             let w = shell_word(w);
@@ -3941,8 +4055,8 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
     } else if subcommand.starts_with("rebase") {
         // git rebase --show-current is a pure read; every other rebase form
         // mutates the branch history.
-        let words: Vec<&str> = subcommand.split_whitespace().collect();
-        if words.len() >= 2 && words[1] == "--show-current" {
+        let words = split_words_keeping_substitutions(subcommand);
+        if words.len() >= 2 && shell_word(words[1]) == "--show-current" {
             return Some(Ok(()));
         }
         Some(reject(
@@ -3986,9 +4100,10 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
     } else if subcommand.starts_with("submodule") {
         // git submodule: `status` (and bare `submodule`, which prints a status
         // summary) are read-only; foreach/update/add/... mutate submodules.
-        let words: Vec<&str> = subcommand.split_whitespace().collect();
+        let words = split_words_keeping_substitutions(subcommand);
         match words.get(1) {
-            None | Some(&"status") => Some(Ok(())),
+            None => Some(Ok(())),
+            Some(sub) if shell_word(sub) == "status" => Some(Ok(())),
             Some(sub) => Some(reject(
                 trimmed,
                 &format!("`git submodule {sub}` is not allowed — it modifies submodules."),
@@ -4011,8 +4126,8 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
 /// diff.external/filter.*/core.fsmonitor, .gitattributes textconv, global
 /// LFS filters) can still exec drivers from plain `git diff`/`status` —
 /// trusted-workspace model, out of scope here.
-fn check_git_exec_vectors(trimmed: &str, subcommand: &str) -> Result<(), String> {
-    let words: Vec<&str> = trimmed.split_whitespace().collect();
+fn check_git_exec_vectors(trimmed: &str) -> Result<(), String> {
+    let words = split_words_keeping_substitutions(trimmed);
     let Some(git_idx) = super::find_first_command_word_index(&words) else {
         return Ok(());
     };
@@ -4033,6 +4148,9 @@ fn check_git_exec_vectors(trimmed: &str, subcommand: &str) -> Result<(), String>
     // the subcommand begins.
     let sub_idx = super::find_first_non_flag_index(&words[git_idx + 1..], true)
         .map_or(words.len(), |i| git_idx + 1 + i);
+    // First subcommand word — the flag checks' subcommand base (same token the
+    // subcommand string starts with, derived here to avoid re-tokenizing it).
+    let base = words.get(sub_idx).copied().unwrap_or("");
     for w in &words[git_idx + 1..sub_idx] {
         let wq = shell_word(w);
         if wq.starts_with('-') && !wq.starts_with("--") && wq[1..].contains(['c', 'C']) {
@@ -4060,8 +4178,8 @@ fn check_git_exec_vectors(trimmed: &str, subcommand: &str) -> Result<(), String>
             }
         }
     }
-    check_git_exec_flags(trimmed, subcommand, &words)?;
-    check_git_scoped_flags(trimmed, subcommand, &words)
+    check_git_exec_flags(trimmed, base, &words)?;
+    check_git_scoped_flags(trimmed, base, &words)
 }
 
 /// Exec-flag blocks applied across the whole command. Git abbreviates
@@ -4109,8 +4227,7 @@ const GIT_TEXT_BENIGN_SUBCOMMANDS: &[&str] = &[
     "stash",
 ];
 
-fn check_git_exec_flags(trimmed: &str, subcommand: &str, words: &[&str]) -> Result<(), String> {
-    let base = subcommand.split_whitespace().next().unwrap_or("");
+fn check_git_exec_flags(trimmed: &str, base: &str, words: &[&str]) -> Result<(), String> {
     for w in words {
         if w.contains("$'") && w.contains('\\') {
             return reject(
@@ -4152,8 +4269,7 @@ fn check_git_exec_flags(trimmed: &str, subcommand: &str, words: &[&str]) -> Resu
 /// `git diff -w` is ignore-whitespace). Long-option prefixes are blocked
 /// (git abbreviates; `--open-files-in-p=` == `--open-files-in-pager=`);
 /// short-flag matches are case-sensitive: uppercase `O`, lowercase `w`/`m`/`i`.
-fn check_git_scoped_flags(trimmed: &str, subcommand: &str, words: &[&str]) -> Result<(), String> {
-    let base = subcommand.split_whitespace().next().unwrap_or("");
+fn check_git_scoped_flags(trimmed: &str, base: &str, words: &[&str]) -> Result<(), String> {
     for w in words {
         let wq = shell_word(w);
         let opt = wq.split('=').next().unwrap_or(&wq);
@@ -4187,17 +4303,32 @@ fn check_git_scoped_flags(trimmed: &str, subcommand: &str, words: &[&str]) -> Re
 }
 
 /// Reject `--output` on any git subcommand — it writes the command's output
-/// to a file (`--output=<file>` / `--output <file>`; blame/annotate/rev-list
-/// truncate the target to 0 bytes). Runs before
+/// to a file (`--output=<file>` / `--output <file>`). Runs before
 /// [`check_git_read_only_extensions`], whose read forms (`git stash show
-/// --output=...`) would otherwise bypass it. Exact token (not [`flag_value`]:
-/// git takes dash filenames, `git diff --output -1`); `--output-indicator-*`
-/// do not write. Fail-closed over-rejection: `--output` as a value of
-/// `-S`/`-G`/`-e` (`git log -S --output`) is a literal read-only search.
+/// --output=...`) would bypass it. `--output-indicator-*` do not write and are
+/// exempt. A substitution word fails closed when its expansion could form the
+/// flag: ANY unprovable span (quoted or not — an unquoted one field-splits,
+/// `HEAD${x:- --output=...}` → fields `HEAD`, `--output=...`) or bare `$var`
+/// (its value is unquoted and arbitrary — `--format=$x` can field-split the
+/// flag out) — see [`word_could_form_token`]; provably-echoed bodies stay
+/// allowed (`--format=$(echo json)`). `git remote` is exempt from the bare-
+/// `$var` rule (its verb position is its own mutation check).
 fn check_git_output_flag(trimmed: &str, subcommand: &str) -> Result<(), String> {
-    if subcommand.split_whitespace().any(|w| {
-        let w = shell_word(w);
-        w == "--output" || w.starts_with("--output=")
+    if subcommand.starts_with("config") {
+        // git config has no `--output`; its write vectors (substitution keys,
+        // `--add`/`--edit`/...) are checked in its own branch — and a
+        // substitution key like `--get user.${name}` must stay allowed there.
+        return Ok(());
+    }
+    let words = split_words_keeping_substitutions(subcommand);
+    let is_remote = words.first().is_some_and(|w| shell_word(w) == "remote");
+    if words.iter().any(|w| {
+        let p = shell_word(w);
+        !p.starts_with("--output-indicator")
+            && (p == "--output"
+                || p.starts_with("--output=")
+                || word_could_form_token(w, "--output")
+                || (!is_remote && contains_bare_var(w)))
     }) {
         return reject(
             trimmed,
@@ -4217,7 +4348,7 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
     // Exec-vector scan FIRST — before the extension allowlist and the
     // empty-subcommand early return (`git --git-dir=/tmp/evil` bare still
     // rejects the repo redirect).
-    check_git_exec_vectors(trimmed, &subcommand)?;
+    check_git_exec_vectors(trimmed)?;
 
     if subcommand.is_empty() || subcommand == "git" {
         return Ok(());
@@ -4281,29 +4412,37 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
             }
         }
         Some("reflog") => {
-            // git reflog expire/delete mutate the reflog. Other subcommands
-            // (show, list, exists, or bare `git reflog`) are read-only.
-            let words: Vec<&str> = subcommand.split_whitespace().collect();
-            if let Some(reflog_sub) = words.get(1)
-                && (*reflog_sub == "expire" || *reflog_sub == "delete")
-            {
-                return reject(
-                    trimmed,
-                    &format!("`git reflog {reflog_sub}` is not allowed — it modifies the reflog."),
-                    "use `git reflog show` or bare `git reflog` to view reflog entries.",
-                );
+            // expire/delete mutate the reflog; show/list/exists are read-only.
+            // Any substitution or bare `$var` word in the subcommand position
+            // is unprovable (fixed dictionary) and fails closed; the literal
+            // comparison is shell-normalized.
+            let words = split_words_keeping_substitutions(&subcommand);
+            if let Some(raw) = words.get(1) {
+                let reflog_sub = shell_word(raw);
+                if word_has_substitution(raw)
+                    || contains_bare_var(raw)
+                    || reflog_sub == "expire"
+                    || reflog_sub == "delete"
+                {
+                    return reject(
+                        trimmed,
+                        &format!("`git reflog {raw}` is not allowed — it modifies the reflog."),
+                        "use `git reflog show` or bare `git reflog` to view reflog entries.",
+                    );
+                }
             }
         }
         // `git fsck --lost-found` writes dangling objects into `.git/lost-found/`.
-        // Git abbreviates unambiguous long options, so any token starting with
-        // `--l` triggers it (no other fsck long option starts with `l`);
-        // `--no-lost-found` (starts with `--n`) disables the write and stays
-        // allowed. shell_word strips quotes/backslashes, closing the
-        // quoted/escaped forms.
+        // Git abbreviates options, so any `--l`-prefixed token triggers it; a
+        // substitution or bare-`$var` word fails closed (its output is unprovable).
         Some("fsck")
-            if subcommand
-                .split_whitespace()
-                .any(|w| shell_word(w).starts_with("--l")) =>
+            if split_words_keeping_substitutions(&subcommand)
+                .iter()
+                .any(|raw| {
+                    shell_word(raw).starts_with("--l")
+                        || word_has_substitution(raw)
+                        || contains_bare_var(raw)
+                }) =>
         {
             return reject(
                 trimmed,
@@ -4482,7 +4621,7 @@ fn check_git_ref_subcommand(subcommand: &str, sub: &str) -> Result<(), String> {
 /// `subcommand` is the pre-extracted subcommand from [`extract_git_subcommand`]
 /// (e.g., `"remote -v update"`).
 fn check_git_subcommand_mutation(subcommand: &str, mutation_tokens: &[&str]) -> Result<(), String> {
-    let words: Vec<&str> = subcommand.split_whitespace().collect();
+    let words = split_words_keeping_substitutions(subcommand);
     // words[0] is the subcommand name (e.g., "remote")
 
     // Partition mutation tokens into flag-based and bare-word.
@@ -4519,11 +4658,21 @@ fn check_git_subcommand_mutation(subcommand: &str, mutation_tokens: &[&str]) -> 
     // Bare-word tokens cannot be safely checked in all positions because
     // they can collide with legitimate names (e.g., `git remote show add`
     // where "add" is a remote name, not a mutation verb). Instead, skip
-    // any leading flags and check the first non-flag argument.
+    // any leading flags and check the first non-flag argument. A command
+    // substitution there is unprovable — its output could be a mutation
+    // verb (`git remote $(echo add)`) — so it fails closed.
     if !bare_tokens.is_empty()
-        && let Some(first_non_flag_arg) = words.iter().skip(1).find(|w| !w.starts_with('-'))
+        && let Some(first_non_flag_arg) = words
+            .iter()
+            .skip(1)
+            .find(|w| !shell_word(w).starts_with('-'))
     {
-        let is_mutating = matches_mutation_token(first_non_flag_arg, &bare_tokens);
+        // Substitution check on the raw word (quote-aware); the mutation-token
+        // comparison is shell-normalized (quotes/ANSI-C stripped) so
+        // `"add"`/`'add'` match like the sibling arms.
+        let bare = shell_word(first_non_flag_arg);
+        let is_mutating = word_has_substitution(first_non_flag_arg)
+            || matches_mutation_token(&bare, &bare_tokens);
         if is_mutating {
             return Err(git_mutation_rejection(subcommand));
         }
@@ -4538,7 +4687,7 @@ fn check_git_subcommand_mutation(subcommand: &str, mutation_tokens: &[&str]) -> 
 /// word, skips global flags and their values, and collects all remaining
 /// words as the subcommand.
 fn extract_git_subcommand(segment: &str) -> String {
-    let words: Vec<&str> = segment.split_whitespace().collect();
+    let words = split_words_keeping_substitutions(segment);
 
     // Skip shell prefixes, env assignments, and flags to find "git"
     // (e.g., GIT_DIR=/tmp git push, sudo git push, env git push). Basename
@@ -4581,13 +4730,16 @@ fn check_cargo_segment(segment: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let base = subcommand.split_whitespace().next().unwrap_or("");
+    let base = split_words_keeping_substitutions(subcommand)
+        .first()
+        .copied()
+        .unwrap_or("");
 
     // ── Help/version exemption ─────────────────────────────────────
     // `-h`/`--help`/`-V`/`--version` appearing as a standalone token BEFORE a
     // `--` separator is a pure read and is allowed for ANY cargo subcommand,
     // including `run`. Tokens after `--` stay blocked (`cargo run -- --help`).
-    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    let words = split_words_keeping_substitutions(trimmed);
     let help_version_before_ddash = words
         .iter()
         .take_while(|w| **w != "--")
@@ -4719,13 +4871,179 @@ fn shell_word(word: &str) -> String {
 /// `$'...'`/`$"..."` tokens with backslash escapes are unprovable: escape
 /// semantics are shell/version-dependent (`$'\x2di'` → `-i`), so treat them
 /// as unprovable flag candidates — mirroring [`classify_verb_word`]'s
-/// Unprovable verdict for `$`/`\`-words. Used by the sed in-place gate and
-/// the git exec-vector scan (`git log --format=$'%h\t%s'` is over-rejected,
-/// an accepted fail-closed contract). `${...}`/`$var` are deliberately not
-/// treated as unprovable: they also appear in legit read-only scripts
-/// (`sed "s/a/$var/" file`), and their values are not decodable anyway.
+/// Unprovable verdict for `$`/`\`-words. Used by the sed/awk in-place gates,
+/// the clippy `--fix` and git `--output` gates, and the git exec-vector scan
+/// (`git log --format=$'%h\t%s'` is over-rejected, an accepted fail-closed
+/// contract). `${...}`/`$var` are deliberately not treated as unprovable:
+/// they also appear in legit read-only scripts (`sed "s/a/$var/" file`), and
+/// their values are not decodable anyway.
 fn is_unprovable_flag_token(part: &str) -> bool {
     (part.starts_with("$'") || part.starts_with("$\"")) && part.contains('\\')
+}
+
+/// True when `w` contains an expandable substitution that could deliver a
+/// flag: the word starts with `-` (a substitution may hide behind it) or
+/// starts with an active substitution whose output is unprovable (`$(...)`,
+/// backtick, `${...}`, `<(cmd)`). Literal operands (`file$(echo x)`,
+/// `"s/a/$(echo b)/"`) never match — their first expanded char is fixed.
+/// Used by the flag scans so substitution-formed mutation flags
+/// (`sed $(echo -i)`, `curl -$(echo o)`) fail closed. Bare `$var` stays
+/// exempt here — temp-tracked variables (`$TMPDIR/...`) must stay usable as
+/// flag values — and is handled at the fixed-dictionary positions that need
+/// it ([`contains_bare_var`] in the sed/hash-object/awk flag checks).
+fn substitution_could_form_flag(w: &str) -> bool {
+    let p = shell_word(w);
+    word_has_substitution(w) && (p.starts_with('-') || p.starts_with(['$', '`']))
+}
+
+/// A shell word decomposed into fixed literal text and substitution spans.
+enum WordPart {
+    /// Fixed literal text (or a substitution body that provably echoes plain
+    /// tokens — [`simple_echo_output`]).
+    Lit(String),
+    /// An unprovable expansion: its output can be ANY string, incl. empty.
+    Any,
+}
+
+/// Decompose `w` into literal parts and substitution spans via the shared
+/// substitution scan (no new quote tracking). A body that provably echoes
+/// plain tokens is folded to its fixed output; everything else (commands,
+/// `${...}`, nested/indirect bodies) is [`WordPart::Any`].
+fn word_parts(w: &str) -> Vec<WordPart> {
+    let mut parts: Vec<WordPart> = Vec::new();
+    let mut pos = 0;
+    for_each_substitution(w, |span, content, end| {
+        let start = end - span.len();
+        if start > pos {
+            parts.push(WordPart::Lit(w[pos..start].to_string()));
+        }
+        parts.push(match simple_echo_output(content) {
+            Some(out) => WordPart::Lit(out),
+            None => WordPart::Any,
+        });
+        pos = end;
+        true
+    });
+    if pos < w.len() {
+        parts.push(WordPart::Lit(w[pos..].to_string()));
+    }
+    parts
+}
+
+/// Fixed output of a substitution body that provably echoes plain tokens
+/// (`$(echo foo bar)`); `None` when the output is unprovable (any other
+/// command, `-`-prefixed or quoted args, `$var`, nested spans, ...).
+fn simple_echo_output(body: &str) -> Option<String> {
+    let body = body.trim();
+    let (cmd, args) = body.split_once(char::is_whitespace)?;
+    if cmd != "echo" {
+        return None;
+    }
+    let toks: Vec<&str> = args.split_whitespace().collect();
+    if toks.is_empty()
+        || toks.iter().any(|t| {
+            t.starts_with('-')
+                || !t.chars().all(|c| {
+                    c.is_ascii_alphanumeric()
+                        || matches!(c, '_' | '.' | '/' | '+' | ':' | '@' | '%' | '=' | ',' | '-')
+                })
+        })
+    {
+        return None;
+    }
+    Some(toks.join(" "))
+}
+
+/// Fully resolve `value` when every piece is provable: literal text plus
+/// substitution bodies that provably echo plain tokens ([`simple_echo_output`]).
+/// `None` when any span is unprovable — the caller then treats the raw text as
+/// unprovable (fail-closed) or defers to its variable resolution.
+fn resolve_provable_value(value: &str) -> Option<String> {
+    let mut out = String::new();
+    for part in word_parts(value) {
+        match part {
+            WordPart::Lit(s) => out.push_str(&s),
+            WordPart::Any => return None,
+        }
+    }
+    Some(out)
+}
+
+/// True when a substitution word `w` could expand to a mutation token at a
+/// fixed-token gate. ANY unprovable span (`$(...)`, backtick, `${...}`,
+/// `<(cmd)` — quoted or not) makes the output arbitrary, and an unquoted
+/// expansion additionally field-splits, so the token can appear as its own
+/// argv word (`HEAD${x:- --output=...}` → fields `HEAD`, `--output=...`);
+/// every such word fails closed. When every span provably echoes plain tokens
+/// ([`simple_echo_output`]), the folded expansion's whitespace-fields are
+/// still checked (`inpl$(echo ace)` → `inplace`; `xx$(echo a b)--fix` → fields
+/// `xxa`, `b--fix`). ANSI-C `$'...'` escapes fail closed via the early return
+/// below; bare `$var` is the callers' rule ([`contains_bare_var`]);
+/// substitution-free words return false and callers keep their own literal
+/// matching.
+fn word_could_form_token(w: &str, token: &str) -> bool {
+    if !word_has_substitution(w) {
+        return is_unprovable_flag_token(w);
+    }
+    let parts = word_parts(&shell_word(w));
+    if parts.iter().any(|p| matches!(p, WordPart::Any)) {
+        return true;
+    }
+    let mut full = String::new();
+    for p in parts {
+        if let WordPart::Lit(s) = p {
+            full.push_str(&s);
+        }
+    }
+    full.split_whitespace().any(|f| f.starts_with(token))
+}
+
+/// True when `w` contains a bare `$name` expansion (unbraced, not `$(`, `${`,
+/// `$'`/`$"`: `$x`, `--$x`, `"$x"`, positional/special `$1`/`$@`/`$?`/`$$`).
+/// The expanded value is unprovable. `$` inside single quotes or after a
+/// backslash is literal (`'$x'`, `"\$x"`); `'ex'$x` concatenates and matches.
+/// Used at fixed-dictionary mutation positions (git reflog subcommand, fsck
+/// flags) where over-rejecting breaks no legit read; the general `$var`
+/// exemption elsewhere stays (see [`word_has_substitution`]).
+fn contains_bare_var(w: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut it = w.chars().peekable();
+    while let Some(c) = it.next() {
+        let was_escaped = escaped;
+        super::track_char_context(c, &mut in_single, &mut in_double, &mut escaped);
+        if c == '$'
+            && !in_single
+            && !was_escaped
+            && it.peek().is_some_and(|n| {
+                n.is_ascii_alphanumeric()
+                    || matches!(n, '_' | '@' | '#' | '?' | '$' | '!' | '-' | '*')
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when a word containing a bare `$var` could expand to a string
+/// beginning with `token`: the literal text before the first bare var
+/// (shell-normalized) must be a prefix of `token`, so the expansion could
+/// continue it (`--$x` → `--output`) while a fixed prefix that cannot start
+/// the token pins the word to another vector (`--format=$x` is a format value,
+/// never `--output`). Closes the bare-`$var` gap at fixed-token positions
+/// (clippy `--fix`, git `--output`, awk `inplace`) that `$()`/`${...}`-only
+/// predicates cannot see. `git remote $x` stays exempt — remote's verb
+/// position is its own mutation check, where `$x` may be a legit read verb.
+fn bare_var_could_form_prefix(w: &str, token: &str) -> bool {
+    if !contains_bare_var(w) {
+        return false;
+    }
+    let p = shell_word(w);
+    let var_idx = p.find('$').unwrap_or(p.len());
+    let prefix = &p[..var_idx];
+    prefix.is_empty() || token.starts_with(prefix)
 }
 
 /// True when any single-dash token in `command` contains a char from
@@ -4733,33 +5051,46 @@ fn is_unprovable_flag_token(part: &str) -> bool {
 /// `value_taking` chars consume the rest of their token (attached value), so
 /// later chars are never misread as flags (`-tw` is `-t w`, `-dio` is
 /// `-d -i 'o'`). Long flags and tokens without a leading dash never match.
-/// Tokens are normalized as the shell delivers them ([`shell_word`]).
+/// Tokens are normalized as the shell delivers them ([`shell_word`]). A
+/// substitution word that could expand to a flag fails closed (see
+/// [`substitution_could_form_flag`]).
 fn has_cluster_char(command: &str, mutation: &[char], value_taking: &[char]) -> bool {
-    command.split_whitespace().any(|w| {
-        let p = shell_word(w);
-        if !p.starts_with('-') || p.starts_with("--") {
-            return false;
-        }
-        let b = p.as_bytes();
-        let mut k = 1;
-        while k < b.len() {
-            let c = b[k] as char;
-            if mutation.contains(&c) {
-                return true;
+    split_words_keeping_substitutions(command)
+        .into_iter()
+        .any(|w| {
+            // bare `$var` word: `$w` could be `-w` (fixed-dictionary flag
+            // position; `git hash-object $w file` writes the object). Temp-
+            // tracked values (`$TMPDIR/...`) are handled by the value
+            // temp-gating and never reach a flag scan.
+            if substitution_could_form_flag(w)
+                || (contains_bare_var(w) && shell_word(w).starts_with(['$', '`']))
+            {
+                return true; // unprovable: the substitution could deliver a mutation char
             }
-            if value_taking.contains(&c) {
-                return false; // value-taking flag: rest of token is its value
+            let p = shell_word(w);
+            if !p.starts_with('-') || p.starts_with("--") {
+                return false;
             }
-            k += 1;
-        }
-        false
-    })
+            let b = p.as_bytes();
+            let mut k = 1;
+            while k < b.len() {
+                let c = b[k] as char;
+                if mutation.contains(&c) {
+                    return true;
+                }
+                if value_taking.contains(&c) {
+                    return false; // value-taking flag: rest of token is its value
+                }
+                k += 1;
+            }
+            false
+        })
 }
 
 /// Check if `sed` has an in-place flag in a way that mutates files outside temp.
 /// When all file operands after the flag are under temp, returns `false` (allow).
 fn has_sed_mutation(command: &str, state: &ValidationState) -> bool {
-    let parts: Vec<&str> = command.split_whitespace().collect();
+    let parts: Vec<&str> = split_words_keeping_substitutions(command);
     // In-place flag position: any single-dash flag containing `i`/`I`
     // (-i, -iSUFFIX, -I, -nix/-Ei clusters; no other sed short flag has
     // i/I), or the GNU long form `--in-place[=SUFFIX]` at any unique
@@ -4775,6 +5106,12 @@ fn has_sed_mutation(command: &str, state: &ValidationState) -> bool {
         (p.starts_with('-') && !p.starts_with("--") && p.contains(['i', 'I']))
             || p.starts_with("--i")
             || is_unprovable_flag_token(part)
+            || substitution_could_form_flag(part)
+            // bare `$var` word: `$i`/`$script` could be `-i` (the -i flag
+            // position is a fixed dictionary; temp-tracked values like
+            // `$TMPDIR` are not `-i`, but they are not sed scripts either —
+            // over-rejection is the accepted fail-closed contract)
+            || (contains_bare_var(part) && p.starts_with(['$', '`']))
     });
     let Some(i_pos) = i_pos else {
         return false; // no in-place flag → not a sed mutation
@@ -4819,18 +5156,51 @@ fn has_sed_mutation(command: &str, state: &ValidationState) -> bool {
     file_operands.iter().any(|p| writes_outside_temp(p, state))
 }
 
-/// Check if `awk -i inplace` is present.
+/// Check if `awk -i inplace` is present (GNU awk in-place edit). The flag
+/// position must be literal `-i` or a substitution/bare-`$var` word that could
+/// deliver it; the operand must be provably `inplace` — a substitution word
+/// that could expand to it fails closed, while a body provably echoing
+/// something else (`awk -i $(echo otherlib) file`) and a bare `$var` whose
+/// fixed prefix cannot start the word (`awk -i lib$suffix file`, the first
+/// argv field is `lib`) stay allowed.
 fn has_inplace(command: &str, _state: &ValidationState) -> bool {
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    parts.windows(2).any(|w| w[0] == "-i" && w[1] == "inplace")
+    let parts: Vec<&str> = split_words_keeping_substitutions(command);
+    parts.windows(2).any(|w| {
+        (shell_word(w[0]) == "-i" || word_could_form_token(w[0], "-i") || contains_bare_var(w[0]))
+            && (shell_word(w[1]) == "inplace"
+                || word_could_form_token(w[1], "inplace")
+                || bare_var_could_form_prefix(w[1], "inplace"))
+    })
 }
 
-/// Check if `dd of=...` writes outside temp.
-/// When `of=` points to a temp path, returns `false` (allow).
+/// Resolve the `of=` operand value of `w` when the whole word is provable:
+/// shell-normalized (quoted `"of=..."` matches) with provably-echoed spans
+/// folded and bare `$var` left for the temp resolver. `None` when `w` cannot
+/// be an `of=` operand or its value is unprovable (the caller then fails
+/// closed when the word could still form one).
+fn dd_of_value(w: &str) -> Option<String> {
+    let p = shell_word(w);
+    resolve_provable_value(&p).and_then(|exp| exp.strip_prefix("of=").map(str::to_string))
+}
+
+/// Check if `dd of=...` writes outside temp. Every `of=` operand is evaluated
+/// — no early return on a temp-gated one (GNU dd honors the last):
+/// `dd of=/tmp/x $(echo of=/etc/passwd) ...` rejects. A literal or provably-
+/// echoed value is temp-gated (`of=$(echo /tmp/x).txt` → `/tmp/x.txt`,
+/// `of=$SNAP/x` resolves via the bound variable, `$(echo of=/tmp/y)` folds to
+/// the same form); an unprovable value — or any bare `$var` in the command,
+/// whose value could field-split an `of=` operand out (`if=$src`) — fails
+/// closed. `if=`/`bs=`/`obs=`/`oflag=` operands are not mutation-determining.
 fn has_dd_mutation(command: &str, state: &ValidationState) -> bool {
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    if let Some(of_val) = flag_value_equals(&parts, "of=") {
-        return writes_outside_temp(of_val, state);
+    let parts: Vec<&str> = split_words_keeping_substitutions(command);
+    for w in &parts {
+        if let Some(val) = dd_of_value(w) {
+            if writes_outside_temp(&val, state) {
+                return true;
+            }
+        } else if word_could_form_token(w, "of=") || contains_bare_var(w) {
+            return true;
+        }
     }
     false
 }
@@ -4881,9 +5251,19 @@ const BASE64_OUTPUT_FLAGS: OutputFlagSpec = OutputFlagSpec {
 /// `-dio` is `-d -i 'o'`). Long flags and `=`-forms match after shell
 /// normalization ([`shell_word`]), so quoted spellings (`'-so'`, `--'output'`)
 /// are seen; `$'...'`/`$"..."` tokens with escapes are unprovable flag
-/// candidates — same fail-closed contract as the sed gate.
+/// candidates — same fail-closed contract as the sed gate. A substitution
+/// word that could form an output flag is rejected UNCONDITIONALLY (the
+/// substituted flag's value is unprovable — no sed-style operand
+/// temp-gating, contrast [`has_sed_mutation`]).
 fn has_output_mutation(command: &str, state: &ValidationState, spec: &OutputFlagSpec) -> bool {
-    let parts: Vec<&str> = command.split_whitespace().collect();
+    let parts: Vec<&str> = split_words_keeping_substitutions(command);
+
+    // A substitution word could deliver an output flag (`-o`, `-O`,
+    // `--output`) — its output is unprovable, so fail closed (see
+    // [`substitution_could_form_flag`]).
+    if parts.iter().any(|w| substitution_could_form_flag(w)) {
+        return true;
+    }
 
     for (i, part) in parts.iter().enumerate() {
         let w = shell_word(part);
@@ -4954,9 +5334,17 @@ fn has_curl_mutation(command: &str, state: &ValidationState) -> bool {
 /// Check if `wget` output flags write outside temp.
 /// `-O <path>` / `--output-document <path>` / `-P <path>` / `--directory-prefix <path>`
 /// are allowed when the path is under temp.
-/// Without output flags, wget writes to CWD → always blocked.
+/// Without output flags, wget writes to CWD → always blocked. A substitution
+/// word that could form an output flag is rejected unconditionally (unprovable
+/// value — same contract as [`has_output_mutation`]).
 fn has_wget_mutation(command: &str, state: &ValidationState) -> bool {
-    let parts: Vec<&str> = command.split_whitespace().collect();
+    let parts: Vec<&str> = split_words_keeping_substitutions(command);
+
+    // A substitution word could deliver `-O`/`-P` (unprovable) — fail closed,
+    // same contract as [`has_output_mutation`].
+    if parts.iter().any(|w| substitution_could_form_flag(w)) {
+        return true;
+    }
 
     // -O/--output-document and -P/--directory-prefix (space and = forms):
     // allowed when the path is under temp.
@@ -4990,7 +5378,7 @@ const TAR_SAFE_CHARS: &[char] = &['v', 'f', 'z', 'j', 'J'];
 /// strategy. Add new safe/list-only operations (e.g. `--diff`/`--compare`)
 /// here rather than adding blacklist checks to [`is_tar_mutating`].
 fn is_tar_list_only(command: &str) -> bool {
-    let parts: Vec<&str> = command.split_whitespace().collect();
+    let parts: Vec<&str> = split_words_keeping_substitutions(command);
     // Find the operation flag/option
     for part in &parts {
         // --list is always safe
@@ -5057,28 +5445,34 @@ fn has_base64_mutation(command: &str, state: &ValidationState) -> bool {
     has_output_mutation(command, state, &BASE64_OUTPUT_FLAGS)
 }
 
-/// Check if `cargo clippy` has `--fix` before `--`.
+/// Check if `cargo clippy` has `--fix` before `--` (auto-fix; after `--` a
+/// `--fix` token is a lint name). shell_word closes quoted spellings; a
+/// substitution word that could expand to `--fix` fails closed — ANY
+/// unprovable span (an unquoted one field-splits, `-p foo${x:- --fix}` →
+/// fields `foo`, `--fix`) or bare `$var` (its value is unquoted and arbitrary,
+/// `--message-format=$fmt` can field-split `--fix` out) — while provably-
+/// echoed bodies stay allowed (`$(echo foo)`, `--message-format=$(echo json)`).
 fn has_clippy_fix(command: &str) -> bool {
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    let dashdash_pos = parts.iter().position(|p| *p == "--");
-    for (i, part) in parts.iter().enumerate() {
-        if *part == "--fix" {
-            // If --fix appears before --, it's the auto-fix flag
-            // If --fix appears after --, it's a lint name
-            if let Some(dd_pos) = dashdash_pos
-                && i > dd_pos
-            {
-                return false; // after -- = lint name
-            }
-            return true; // before -- (or no --) = auto-fix
-        }
-    }
-    false
+    let parts: Vec<&str> = split_words_keeping_substitutions(command);
+    let dashdash_pos = parts.iter().position(|p| shell_word(p) == "--");
+    parts.iter().enumerate().any(|(i, part)| {
+        dashdash_pos.is_none_or(|dd| i < dd)
+            && (shell_word(part) == "--fix"
+                || word_could_form_token(part, "--fix")
+                || contains_bare_var(part))
+    })
 }
 
-/// Check if `cargo fmt` has `--check` anywhere in args.
+/// Check if `cargo fmt` provably runs with `--check` (the read-only proof;
+/// `cargo fmt` without it reformats files). The proof is a literal `--check`
+/// word — shell-normalized, so quoted forms count — and other words cannot
+/// disable it (`cargo fmt --check --emit=$(echo json)` stays check mode).
+/// `cargo fmt $(echo --check)` (no literal proof) is not provably read-only
+/// and fails closed.
 fn has_cargo_fmt_check(command: &str) -> bool {
-    command.split_whitespace().any(|p| p == "--check")
+    split_words_keeping_substitutions(command)
+        .iter()
+        .any(|p| shell_word(p) == "--check")
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -5891,6 +6285,289 @@ mod tests {
             ("GIT_DIR=/tmp git status", false), // GIT_* env rejected (exec vector)
         ];
 
+        run_cases(&cases);
+    }
+
+    // ── Substitution-shifted command word (read-only-guard bypass) ──
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // data-driven bypass battery
+    fn substitution_shifted_command_word_bypass() {
+        // bash treats `$(...)`/backtick substitutions as ONE word, so an
+        // env-assignment prefix with a whitespace-containing substitution must
+        // not shift the first command word onto the substitution's inner word
+        // (`FOO=$(echo a b) rm file` resolved "a" as the verb and skipped the
+        // mutator/git/cargo/flag dispatch). Every unprovable expansion at a
+        // mutation-determining position fails closed (its output field-splits);
+        // only provably-echoed bodies stay allowed.
+        let cases = [
+            // Primary bypass: substitution-shifted verb skips the blocklist dispatch
+            ("FOO=$(echo a b) rm file", false),
+            ("FOO=$(echo a b) git push", false),
+            ("FOO=$(echo a b) cargo run", false),
+            // Backtick and double-quoted spellings of the same shift
+            ("FOO=`echo a b` rm file", false),
+            ("FOO=\"$(echo a b)\" rm file", false),
+            // Backslash-escaped whitespace is part of the word (like bash):
+            // `FOO=a\ b rm x` stays one assignment word, so the verb resolves
+            // to `rm` and the mutator dispatch fires
+            ("FOO=a\\ b rm x", false),
+            ("FOO=a\\ b echo hi", true),
+            // Substitution in git subcommand position (same word-boundary family)
+            ("git reflog $(echo delete)", false),
+            ("git remote $(echo add)", false),
+            ("git config $(echo foo bar)", false),
+            // ${...} is kept whole (bash does the same in assignment values),
+            // so the shifted verb resolves correctly: `FOO=${x:-a b} rm file`
+            // is rejected via the real verb, and the old false positive
+            // `FOO=${x:-a b} echo hi` is now allowed. The span closes at the
+            // FIRST unquoted `}` (bash does NOT nest plain braces in the
+            // default text), so a brace in the default cannot absorb the
+            // following command words: `FOO=${x:-{a} rm file}` runs `rm
+            // file}` in bash and must reject via the real verb, and the
+            // redirect scanner must see `> /etc/passwd}`. eval stays
+            // fail-closed (its body is unprovable).
+            ("FOO=${x:-a b} rm file", false),
+            ("FOO=${x:-a b} echo hi", true),
+            ("FOO=${x:-{a} rm file}", false), // } in default closes the span early
+            ("FOO=${x:-{a} echo hi}", true),  // real verb is `echo` (read-only)
+            ("FOO=${x:-{a} echo x > /etc/passwd}", false), // redirect no longer absorbed
+            ("eval \"FOO=$(echo a b) rm file\"", false),
+            // ${...} parameter expansion in mutation-determining git subcommand
+            // positions fails closed too (same unprovable-word contract as $());
+            // quote-aware: expansion inside double quotes is unprovable and
+            // rejected, inside single quotes it is literal and stays allowed
+            ("git reflog ${x:-delete} HEAD@{0}", false),
+            ("git reflog '${x:-delete}' HEAD@{0}", true),
+            ("git remote ${x:-add} origin url", false),
+            ("git config ${x:-foo}", false),
+            // ${...} body semantics: only nested executable spans are
+            // validated (the body is expansion syntax, not a subshell) — a
+            // nested `$(rm ...)` executes and rejects, a nested temp-gated
+            // `$(touch /tmp/...)` stays allowed
+            ("echo ${x:-$(rm /etc/y)}", false),
+            ("echo ${x:-$(touch /tmp/y)}", true),
+            // fsck --lost-found: any substitution word fails closed (its output
+            // could BE the flag — `$(echo --lost-found)`, `-$(echo -lost-found)`,
+            // or a `--`-prefixed body like `--no-$(echo lost-found)`); a bare
+            // `$var` (`--$x`, `$ref`) is unprovable the same way. `git fsck
+            // $(echo HEAD)` is rejected by this arm too — documented fail-closed.
+            ("git fsck --$(echo lost-found)", false),
+            ("git fsck -$(echo -lost-found)", false), // single-dash spelling expands to --lost-found
+            ("git fsck --no-$(echo lost-found)", false), // substitution unprovable even behind --n
+            ("git fsck $(echo --lost-found)", false), // whole-word substitution spelling
+            ("git fsck --$x", false),                 // x=lost-found would expand the flag
+            ("git fsck $ref", false),                 // $ref could be the flag itself
+            ("git fsck $(echo HEAD)", false),         // fsck arm fail-closed (not the output gate)
+            // quoted-literal mutators at hardened positions match after
+            // shell normalization (same as the fsck arm)
+            ("git reflog \"expire\" HEAD@{0}", false),
+            ("git remote \"add\" origin url", false),
+            // quoted remote flags must not consume the first-non-flag slot:
+            // `git remote "-v" add ...` runs the mutation verb unseen
+            ("git remote \"-v\" add origin url", false),
+            ("git remote \"-v\"", true),
+            // quoted-literal read forms of the raw-comparison arms stay allowed
+            ("git stash \"show\"", true),
+            ("git submodule \"status\"", true),
+            // explicit get forms prove read-only before the substitution
+            // fail-closed (git rejects conflicting actions/extra positionals)
+            ("git config --get user.${name}", true),
+            ("git config --get user.$name", true),
+            // without a get form, a substitution key is unprovable (could be a
+            // key+value write) — documented fail-closed over-rejection
+            ("git config user.${name}", false),
+            ("git config $key", false), // key could be `user.name value` (a write)
+            // --output file-write vector: a substitution word whose expansion
+            // could form the flag fails closed — ANY unprovable span (quoted
+            // or not; an unquoted one field-splits), so split-boundary,
+            // nested/indirect, and span-itself spellings all reject; only
+            // provably-echoed bodies stay allowed (`--format=$(echo json)`)
+            ("git log --$(echo output=/etc/x)", false),
+            ("git log $(echo --output)", false),
+            ("git log $(echo --outpu)t=/etc/x", false), // split-boundary: `--output=/etc/x`
+            ("git log $(echo --out)put=/etc/x", false),
+            ("git log ${x}--output=/etc/x", false),
+            ("git log $(echo --)output /etc/x", false),
+            ("git log $(echo --$(echo output)) /etc/x", false), // nested
+            ("git log $(x=--output; echo $x) /etc/x", false),   // indirect
+            // span-itself field-split: the span's OWN output can deliver the
+            // flag as a standalone argv word (not just literal text after it)
+            ("git log HEAD${x:- --output=/etc/x}", false),
+            ("git log HEAD$(printf ' --output=/etc/passwd ')", false),
+            // bare $var: `--$x`/`$x` could expand to the flag — and so can a
+            // fixed-prefix word like `--format=$x` (the var value is unquoted
+            // and can field-split `--output=...` out) — all fail closed
+            ("git log --$x", false),
+            ("git log $x", false),
+            ("git log --format=$x", false),
+            // ANSI-C $'...' with escapes: $'\x2d\x2doutput=/etc/x' → --output=...
+            ("git log $'\\x2d\\x2doutput=/etc/x'", false),
+            // --output-indicator-* do not write — substitution forms exempt
+            ("git log --output-indicator-$(echo x)", true),
+            // uniform rule: an unquoted `$(...)` span is unprovable and
+            // field-splits, so `--format=$(...)` is NOT pinned by its literal
+            // prefix (it can field-split `--output=...` out) — documented
+            // fail-closed over-rejection of the unquoted and quoted forms;
+            // `$(git rev-parse HEAD)`/`${x:-foo}` were already fail-closed
+            ("git log --format=$(git rev-parse HEAD)", false),
+            ("git log --format=\"$(git rev-parse HEAD)\"", false),
+            ("git log $(git rev-parse HEAD)", false),
+            ("git diff $(git merge-base A B)", false),
+            ("git status ${x:-foo}", false),
+            ("git log --format=$(echo json)", true),
+            // FLAG_CHECKS dispatch via the shared first command word; the flag
+            // scans are substitution-aware and fail closed when a substitution
+            // could form a mutation flag — dash-prefixed AND whole-word
+            // spellings (the whole-word ones used to slip through as one word)
+            ("FOO=$(echo a b) sed -i s/x/y/ /etc/passwd", false),
+            ("sed -$(echo i) s/x/y/ /etc/passwd", false),
+            ("sed $(echo -i) /etc/passwd", false),
+            // bare $var flag word: `$i` could be `-i` (i=-i in-place edit);
+            // the operand is then temp-gated like a literal `-i`
+            ("sed $i /etc/passwd", false),
+            ("sed $script /tmp/x", true),
+            ("git hash-object -$(echo w) file", false),
+            ("git hash-object $(echo -w) file", false),
+            ("git hash-object $w file", false), // w=-w writes the object
+            ("git hash-object $'\\x2dw' file", false), // ANSI-C → -w
+            ("git hash-object '-w' file", false), // quoted literal normalizes
+            ("git hash-object '-t' file", true),
+            ("curl -$(echo o) URL", false), // 'h' in "echo" broke the old cluster scan
+            ("curl $(echo -o) URL", false),
+            ("awk -$(echo i) inplace file", false),
+            ("awk $(echo -i) inplace file", false),
+            ("awk $i inplace file", false), // bare $var flag word: i=-i
+            // operand position must be provably `inplace`: a substitution word
+            // that could expand to it fails closed (embedded after a literal
+            // prefix `inpl$(echo ace)` → `inplace`, or whole-word), while a
+            // body provably echoing something else stays allowed
+            ("awk -i inpl$(echo ace) file", false),
+            ("awk $(echo -i) $(echo inplace) file", false),
+            ("awk -i \"$(echo inplace)\" file", false),
+            ("awk -i otherlib file", true), // non-inplace library stays allowed
+            ("awk -i $(echo otherlib) file", true), // provably not `inplace`
+            // bare $var operand: `$lib`/`inpl$ace` could expand to `inplace`;
+            // a fixed literal prefix that cannot start the word stays allowed
+            ("awk -i $lib file", false),
+            ("awk -i inpl$ace file", false),
+            ("awk -i lib$suffix file", true),
+            // field-splitting operand: `xx$(echo ' ')inplace` → fields `xx`, `inplace`
+            ("awk -i xx$(echo ' ')inplace file", false),
+            // ANSI-C flag position: $'\x2di' → -i
+            ("awk $'\\x2di' inplace file", false),
+            ("dd if=/dev/zero o$(echo f)=/etc/passwd bs=1 count=1", false),
+            ("dd $(echo of=/etc/x)", false),
+            ("dd if=$(echo /dev/zero) of=/tmp/x bs=1 count=1", true), // if= is not mutation-determining
+            (
+                "dd if=/dev/zero of=/tmp/x obs=$(echo 512) bs=1 count=1",
+                true,
+            ), // obs= is a bs=-family operand
+            (
+                "dd if=/dev/zero of=/tmp/x oflag=$(echo 1) bs=1 count=1",
+                true,
+            ),
+            ("dd if=/dev/zero obs=$(echo 512) count=1", true), // obs= alone writes nothing
+            ("dd if=/dev/zero of=$(echo /tmp/x) bs=1 count=1", true), // provably temp value
+            ("dd if=/dev/zero of=$(echo /etc/passwd) bs=1 count=1", false),
+            // every of= operand is evaluated (no early return on a temp-gated
+            // one) — a later substitution-formed or non-temp of= still rejects
+            ("dd of=/tmp/x $(echo of=/etc/passwd) bs=1 count=1", false),
+            ("dd of=/tmp/x of=/etc/passwd bs=1 count=1", false),
+            // provable values resolve across concatenation: of=$(echo /tmp/x).txt
+            // → /tmp/x.txt (temp, allowed); of=/tmp/$(echo x) → /tmp/x; the
+            // whole-word `$(echo of=/tmp/y)` folds to the same temp-gated form
+            ("dd if=/dev/zero of=$(echo /tmp/x).txt bs=1 count=1", true),
+            ("dd if=/dev/zero of=/tmp/$(echo x) bs=1 count=1", true),
+            ("dd if=/dev/zero $(echo of=/tmp/y) bs=1 count=1", true),
+            // quoted of= normalizes like the sibling gates (bash strips quotes
+            // and dd writes); any bare $var in the command can field-split an
+            // `of=` operand out (`if=$src` with src=`x of=/etc/passwd`)
+            ("dd \"of=/etc/passwd\" bs=1 count=1", false),
+            ("dd of=/tmp/x if=$src bs=1 count=1", false),
+            ("wget $(echo -O /tmp/x) URL", false), // fail-closed: output flag unprovable
+            // cargo dispatch: clippy --fix (auto-fix) and fmt --check (read-only
+            // proof) are substitution-aware — substitution/quoted/split-
+            // boundary spellings of --fix fail closed, quoted --check is
+            // allowed, and a missing literal --check fails closed
+            ("cargo clippy $(echo --fix)", false),
+            ("cargo clippy --$(echo fix)", false),
+            ("cargo clippy \"--fix\"", false),
+            ("cargo clippy ${x:---fix}", false),
+            ("cargo clippy $(echo --fi)x", false), // split-boundary: expands to `--fix`
+            ("cargo clippy $(echo --f)ix", false),
+            ("cargo clippy $(echo --)fix", false),
+            ("cargo clippy ${x}--fix", false),
+            ("cargo clippy $(echo --$(echo fix))", false), // nested body
+            ("cargo clippy -- --fix", true),               // lint name after -- stays allowed
+            ("cargo clippy -- $(echo fix)", true),
+            // bare $var: `$flag`/`$x` could expand to `--fix` — and so can a
+            // fixed-prefix word like `--message-format=$fmt` (the var value is
+            // unquoted and can field-split `--fix` out); `--features $x`
+            // (unprovable value word) fails closed like `--features
+            // $(echo --fix)` — documented over-rejections
+            ("cargo clippy $flag", false),
+            ("cargo clippy $x", false),
+            ("cargo clippy --message-format=$fmt", false),
+            ("cargo clippy --features $x", false),
+            // span-itself field-split: the span's OWN output can deliver the
+            // flag as a standalone argv word (`-p foo${x:- --fix}` → argv
+            // `foo`, `--fix`; `xx$(printf ' --fix ')` likewise)
+            ("cargo clippy -p foo${x:- --fix}", false),
+            ("cargo clippy xx$(printf ' --fix ')", false),
+            // field-splitting: `xx${x:- }--fix` → fields `xx`, `--fix`; the
+            // field's own bare $var can continue the token (`--$y`)
+            ("cargo clippy xx${x:- }--fix", false),
+            ("cargo clippy xx${x:- }--$y", false),
+            // ANSI-C $'...' with escapes: $'\x2d\x2dfix' → --fix
+            ("cargo clippy $'\\x2d\\x2dfix'", false),
+            // a substitution word that cannot expand to --fix stays allowed
+            ("cargo clippy --features $(echo foo)", true),
+            ("cargo clippy --message-format=$(echo json)", true),
+            ("cargo clippy $(echo foo)", true),
+            ("cargo fmt --check", true),
+            ("cargo fmt \"--check\"", true),
+            ("cargo fmt --check --emit=$(echo json)", true), // literal --check is the proof
+            ("cargo fmt --check $(echo foo)", true),
+            ("cargo fmt $(echo --check)", false), // no literal proof → fail-closed
+            ("cargo fmt $(echo --emit=files)", false),
+            // Allow-cases: benign shifted verb, temp-gated mutator with literal
+            // temp args, git read-only dispatch, and the common
+            // SNAP=$(mktemp -d) form stay allowed
+            ("FOO=$(echo a b) echo hi", true),
+            ("FOO=$(echo a b) git status", true),
+            ("FOO=$(echo a b) mkdir -p /tmp/x", true),
+            ("SNAP=$(mktemp -d)", true),
+            ("curl -o /tmp/x URL", true),
+            ("sed $(echo -i) /tmp/x", true), // temp-gated in-place via whole-word substitution
+            // benign ${...} in non-git read-only positions stays allowed;
+            // a bare ${...} segment stays fail-closed (it word-splits into a
+            // command line in bash, not a validated subshell — see
+            // is_bare_substitution_segment's ${} exclusion)
+            ("echo ${x:-a b}", true),
+            ("${x:-rm -rf /}", false),
+            // process substitution is kept whole and its body is validated
+            // like any subshell command: the shift bypass is closed, and a
+            // quoted `<(cmd)` stays literal text
+            ("FOO=<(echo a b) rm x", false),
+            ("FOO=<(rm file) echo hi", false),
+            ("cat <(echo hi)", true),
+            ("echo \"<(rm file)\"", true),
+            // bare $var: the reflog subcommand position is a fixed dictionary
+            // and fails closed — including positional/special params ($1, $@)
+            // and `$var` outside a leading single quote (`'ex'$x` concatenates
+            // to a mutation verb); a fully single-quoted `'$x'` is literal and
+            // stays allowed; git remote stays deliberately exempt (a `$x` may
+            // be a legit read verb — documented residual, see
+            // word_has_substitution)
+            ("git reflog $x HEAD@{0}", false),
+            ("git reflog '$x' HEAD@{0}", true),
+            ("git reflog 'ex'$x HEAD@{0}", false), // concatenates to `expire`
+            ("git reflog $1 HEAD@{0}", false),     // set -- expire earlier
+            ("git reflog \"$x\" HEAD@{0}", false),
+            ("git fsck --$1", false),
+            ("git remote $x origin url", true),
+        ];
         run_cases(&cases);
     }
 

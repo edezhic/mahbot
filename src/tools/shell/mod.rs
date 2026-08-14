@@ -1458,15 +1458,19 @@ pub(super) fn find_first_command_word_index(words: &[&str]) -> Option<usize> {
     })
 }
 
-/// Extract the first command word index, basename, and the whitespace-split words
+/// Extract the first command word index, basename, and the split words
 /// from a shell segment.
 ///
-/// Trims the segment, splits on whitespace, finds the first non-prefix/non-flag/non-env
-/// word index via [`find_first_command_word_index`], and extracts the basename from it.
-/// Returns `None` when no command word is found (e.g., only prefixes/flags/env assignments).
+/// Trims the segment, splits on whitespace keeping `$(...)`/backtick
+/// substitutions whole (bash treats them as ONE word — a plain split would
+/// shift the command word onto a substitution's inner word and skip the
+/// mutator/git/cargo dispatch), finds the first non-prefix/non-flag/non-env
+/// word index via [`find_first_command_word_index`], and extracts the
+/// basename from it. Returns `None` when no command word is found (e.g., only
+/// prefixes/flags/env assignments).
 fn command_word_from_segment(segment: &str) -> Option<(usize, &str, Vec<&str>)> {
     let trimmed = segment.trim();
-    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    let words = readonly::split_words_keeping_substitutions(trimmed);
     let idx = find_first_command_word_index(&words)?;
     let cmd = words[idx]
         .rsplit('/')
