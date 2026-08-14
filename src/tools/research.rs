@@ -193,16 +193,8 @@ impl ResearchState {
         };
         let outcome: Result<()> = async {
             tx.execute(
-                "UPDATE research_jobs SET state = ?1, stage = ?2, round_index = ?3, \
-                 budget_spent = ?4, updated_at = ?5 WHERE id = ?6",
-                crate::turso::params![
-                    json,
-                    self.stage.as_str(),
-                    i64::try_from(self.round_index).unwrap_or(i64::MAX),
-                    i64::try_from(self.budget_spent).unwrap_or(i64::MAX),
-                    now.clone(),
-                    job_id,
-                ],
+                "UPDATE research_jobs SET state = ?1, updated_at = ?2 WHERE id = ?3",
+                crate::turso::params![json, now.clone(), job_id],
             )
             .await?;
             tx.execute(
@@ -263,18 +255,6 @@ fn cap_commands(commands: &mut Vec<String>, cap: usize) {
     }
     if drop > 0 {
         commands.drain(..drop);
-    }
-}
-
-impl ResearchStage {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Decompose => "decompose",
-            Self::Round1 => "round1",
-            Self::GapRounds => "gap_rounds",
-            Self::Verification => "verification",
-            Self::Synthesis => "synthesis",
-        }
     }
 }
 

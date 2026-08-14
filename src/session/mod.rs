@@ -377,6 +377,7 @@ CREATE TABLE IF NOT EXISTS manager_jobs (
 CREATE TABLE IF NOT EXISTS research_jobs (
     id           TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     question     TEXT NOT NULL,
+    -- Inert: spawn-time values only (resume data lives in `state`).
     stage        TEXT NOT NULL,
     round_index  INTEGER NOT NULL,
     budget_spent INTEGER NOT NULL,
