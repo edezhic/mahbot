@@ -22,7 +22,6 @@ crate::define_store! {
     pub static WORKSPACES: WorkspaceStore,
     db_name = "workspaces",
     schema = SCHEMA,
-    post_open = after_open,
     expect = "workspace::WORKSPACES not initialized — call workspace::init_global() in main.rs",
 }
 
@@ -55,6 +54,7 @@ CREATE TABLE IF NOT EXISTS workspace_contexts (
     created_at     TEXT NOT NULL,
     UNIQUE(workspace_name, role)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS workspace_contexts_null_role ON workspace_contexts(workspace_name) WHERE role IS NULL;
 CREATE TABLE IF NOT EXISTS editor_tabs (
     workspace_name TEXT NOT NULL REFERENCES workspaces(name) ON DELETE CASCADE,
     file_path      TEXT NOT NULL,
@@ -1138,23 +1138,6 @@ impl WorkspaceStore {
             tabs.push(tab);
         }
         Ok(tabs)
-    }
-}
-
-impl WorkspaceStore {
-    /// Post-open setup: create the unique NULL-role workspace_contexts index.
-    async fn after_open(&self) -> anyhow::Result<()> {
-        // Exactly one general context row per workspace — partial unique index
-        // over the NULL-role rows only (role-keyed rows keep their own UNIQUE).
-        self.conn
-            .execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS workspace_contexts_null_role \
-                 ON workspace_contexts(workspace_name) WHERE role IS NULL",
-                (),
-            )
-            .await
-            .context("Failed to create NULL-role unique index")?;
-        Ok(())
     }
 }
 

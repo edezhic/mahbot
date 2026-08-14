@@ -272,7 +272,6 @@ crate::define_store! {
     pub(crate) static SESSIONS: SessionStore,
     db_name = "sessions",
     schema = SCHEMA,
-    post_open = after_open,
     expect = "SESSIONS not initialized",
 }
 
@@ -283,6 +282,7 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS sessions (
     content     TEXT NOT NULL,
     created_at  TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_sessions_agent_id ON sessions(agent_id, id);
 
 CREATE TABLE IF NOT EXISTS session_metadata (
     agent_id      TEXT PRIMARY KEY,
@@ -866,21 +866,6 @@ impl SessionStore {
                 None
             }
         }
-    }
-}
-
-impl SessionStore {
-    /// Post-open setup: ensure indexes.
-    async fn after_open(&self) -> anyhow::Result<()> {
-        // Index must exist before sessions are queried.
-        self.conn
-            .execute_batch(
-                "CREATE INDEX IF NOT EXISTS idx_sessions_agent_id \
-                 ON sessions(agent_id, id);",
-            )
-            .await
-            .context("Failed to create sessions index")?;
-        Ok(())
     }
 }
 
