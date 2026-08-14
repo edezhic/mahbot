@@ -18,6 +18,7 @@ use crate::util::strip_ansi_escapes;
 pub(crate) mod grep_engine;
 mod profiles;
 mod readonly;
+mod scan;
 
 use self::profiles::{CARGO_COMPILE_PREFIXES, GEN_FALLBACK, PROFILES, Profile};
 pub use self::readonly::ShellMode;
@@ -1114,10 +1115,9 @@ const fn check_outside_quotes(c: char, in_single: &mut bool, in_double: &mut boo
 /// * `c` is a quote character or inside quotes
 ///
 /// After a `false` return, the caller may still need to push the character
-/// to an output buffer (e.g., [`super::readonly::strip_heredoc_bodies`]
-/// preserves the command string for redirect scanning, but
-/// [`super::readonly::has_disallowed_redirect`] simply continues without
-/// pushing).
+/// to an output buffer (e.g., [`super::scan::strip_heredoc_bodies`]
+/// preserves the command string for redirect scanning, while the token
+/// classifier simply continues without pushing).
 ///
 /// # Known limitation
 ///
@@ -1149,7 +1149,7 @@ const fn track_char_context(
 /// body are substitution content, not command separators — mis-splitting
 /// flips `is_chained` in [`process_shell_output`] and disables
 /// standalone-only output transforms. Paren depth mirrors
-/// readonly::find_paren_close.
+/// scan::find_paren_close.
 fn consume_substitution(
     c: char,
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
@@ -1167,7 +1167,7 @@ fn consume_substitution(
             if !track_char_context(c2, &mut sub_single, &mut sub_double, &mut sub_escaped) {
                 continue;
             }
-            // Every unquoted paren nests — mirrors readonly::find_paren_close.
+            // Every unquoted paren nests — mirrors scan::find_paren_close.
             if c2 == '(' {
                 depth += 1;
             } else if c2 == ')' {
@@ -1205,7 +1205,7 @@ fn extract_command_segments(command: &str) -> Vec<String> {
     // Heredoc bodies are excluded from command scanning (see the read-only
     // shell guard contract): body text must never be segmented
     // as commands, and redirect operators inside bodies must not be scanned.
-    let scan = readonly::strip_heredoc_bodies(command);
+    let scan = scan::strip_heredoc_bodies(command);
     segment_command(&scan, SegmentMode::Profile)
         .expect("profile segmentation never errors")
         .into_iter()
@@ -1453,7 +1453,7 @@ pub(super) fn find_first_non_flag_index(words: &[&str], is_git: bool) -> Option<
 /// quoted-prefix spellings.
 pub(super) fn find_first_command_word_index(words: &[&str]) -> Option<usize> {
     words.iter().position(|w| {
-        let u = readonly::strip_quoted_word(w);
+        let u = scan::strip_quoted_word(w);
         !SHELL_PREFIXES.contains(&u) && !w.starts_with('-') && !is_env_assignment(u)
     })
 }
@@ -1470,7 +1470,7 @@ pub(super) fn find_first_command_word_index(words: &[&str]) -> Option<usize> {
 /// prefixes/flags/env assignments).
 fn command_word_from_segment(segment: &str) -> Option<(usize, &str, Vec<&str>)> {
     let trimmed = segment.trim();
-    let words = readonly::split_words_keeping_substitutions(trimmed);
+    let words = scan::split_words_keeping_substitutions(trimmed);
     let idx = find_first_command_word_index(&words)?;
     let cmd = words[idx]
         .rsplit('/')

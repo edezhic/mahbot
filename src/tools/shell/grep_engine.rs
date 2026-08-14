@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::tools::path::shell_quote;
 use crate::tools::shell::SHELL_PIPE_READ_CAP;
-use crate::tools::shell::readonly::strip_heredoc_bodies;
+use crate::tools::shell::scan::strip_heredoc_bodies;
 use crate::util::is_word_char;
 
 // ── Protocol constants ────────────────────────────────────────────────────
@@ -551,7 +551,7 @@ fn segment_contains_grep(segment: &str, verb: &str) -> bool {
         return false;
     }
     segment.split_whitespace().any(|w| {
-        let bare = crate::tools::shell::readonly::strip_quoted_word(w);
+        let bare = crate::tools::shell::scan::strip_quoted_word(w);
         is_grep_verb(bare)
     })
 }
@@ -561,12 +561,12 @@ fn segment_contains_grep(segment: &str, verb: &str) -> bool {
 /// falls back (fail-closed).
 fn resolve_cd(segment: &str, cwd: &Path, home: &Path) -> Result<PathBuf, Fallback> {
     let words: Vec<&str> = segment.split_whitespace().collect();
-    let (target, next) = match super::readonly::cd_target_after_options(&words, 1) {
-        super::readonly::CdScan::Target(target, next) => (target, next),
+    let (target, next) = match super::scan::cd_target_after_options(&words, 1) {
+        super::scan::CdScan::Target(target, next) => (target, next),
         // Bare `cd` → $HOME.
-        super::readonly::CdScan::Bare => return Ok(canonical_or_lexical(home)),
+        super::scan::CdScan::Bare => return Ok(canonical_or_lexical(home)),
         // Invalid options (`cd -e`) error at runtime — fail-closed.
-        super::readonly::CdScan::BadOption => return Err(Fallback::CdUntrackable),
+        super::scan::CdScan::BadOption => return Err(Fallback::CdUntrackable),
     };
     if words.get(next).is_some() {
         // Extra operands are shell-dependent — fail-closed.
@@ -693,9 +693,9 @@ fn grep_tokenize(segment: &str) -> Result<Vec<GrepWord>, Fallback> {
         }
         let raw = std::mem::take(current);
         let value = unquote_word(&raw)?;
-        let (redirect, needs_target) = match super::readonly::classify_shell_token(&raw) {
-            super::readonly::TokenKind::Regular => (false, false),
-            super::readonly::TokenKind::Redirect { needs_target } => (true, needs_target),
+        let (redirect, needs_target) = match super::scan::classify_shell_token(&raw) {
+            super::scan::TokenKind::Regular => (false, false),
+            super::scan::TokenKind::Redirect { needs_target } => (true, needs_target),
         };
         out.push(GrepWord {
             value,
@@ -3238,13 +3238,13 @@ mod redirect_token_pins {
 
 #[cfg(test)]
 mod cd_scan_pins {
-    use super::super::readonly::CdScan;
+    use super::super::scan::CdScan;
     use super::*;
 
     /// Scan the words of a `cd` segment (verb excluded) via the shared helper.
     fn scan(segment: &str) -> CdScan<'_> {
         let words: Vec<&str> = segment.split_whitespace().collect();
-        super::super::readonly::cd_target_after_options(&words, 0)
+        super::super::scan::cd_target_after_options(&words, 0)
     }
 
     #[test]
