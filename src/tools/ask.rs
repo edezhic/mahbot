@@ -777,14 +777,13 @@ impl AskRun {
     }
 }
 
-/// Verdict of a single targeted claim verification. Shared with the deep
-/// research tool.
+/// Verdict of a single targeted claim verification. Also exercised on the deep
+/// research path via `dispatch_claim_verifiers` (shared helper, not a direct
+/// import).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct VerificationVerdict {
-    pub claim: String,
     pub verdict: String,
     pub evidence: String,
-    pub confidence: String,
 }
 
 /// Verification outcome merged into the final report. The telemetry fields

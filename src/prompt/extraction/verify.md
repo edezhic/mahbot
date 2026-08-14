@@ -1,6 +1,6 @@
 Based on your verification research above, provide your verdict as a JSON object only:
 
-{"claim": "<the exact claim you verified>", "verdict": "supported|contradicted|unresolved", "evidence": "<evidence summary, citing sources>", "confidence": "low|medium|high"}
+{"verdict": "supported|contradicted|unresolved", "evidence": "<evidence summary, citing sources>"}
 
 - supported = evidence supports the claim.
 - contradicted = evidence contradicts the claim.
