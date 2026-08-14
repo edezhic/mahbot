@@ -4046,7 +4046,11 @@ fn check_git_read_only_extensions(trimmed: &str, subcommand: &str) -> Option<Res
             // Long write/edit forms match after shell normalization (quoted
             // `--'edit'` delivers `--edit`); the short `-e` (edit) form matches
             // inside combined clusters with `-f` value-taking arity
-            // (`-fe` is `-f e`, not edit).
+            // (`-fe` is `-f e`, not edit). The cluster gate's bare-`$var`
+            // arm is what closes `git config $key` / `git config --global $x`
+            // (`$key` could deliver `-e`) — the substitution check above does
+            // not see bare vars, so removing that arm would reopen the write
+            // bypass those words currently hit.
             return Some(reject(
                 trimmed,
                 "`git config` write/edit forms are not allowed — they modify repository or global config.",
@@ -4525,6 +4529,12 @@ fn git_mutation_rejection(subcommand: &str) -> String {
 /// [`scan_push_clean_tokens`] value-consumption pattern):
 /// - Every token is scanned for mutation tokens first — even when git
 ///   consumes it as an option value (`git branch --merged -d` must reject).
+/// - A substitution word that could deliver a mutation token fails closed
+///   ([`unprovable_flag_word`]) — the span-aware tokenizer keeps `$(echo -d)`
+///   whole, so without this the literal cluster scan would rely on git's own
+///   option-conflict error (`git branch --list $(echo -d) feature`); whole-
+///   word `$(` spellings at the name position over-reject, same contract as
+///   the other git gates.
 /// - Required-value options consume the next token unconditionally (even
 ///   dash-prefixed); a consumed token never triggers list mode
 ///   (`git branch --sort --list foo` creates `foo`).
@@ -4549,6 +4559,9 @@ fn check_git_ref_subcommand(subcommand: &str, sub: &str) -> Result<(), String> {
     let mut consume_next = false;
     for raw in words.iter().skip(1) {
         let w = shell_word(raw);
+        if unprovable_flag_word(raw, &w) {
+            return Err(git_mutation_rejection(subcommand));
+        }
         if is_ref_mutation_word(&w, table, shorts) {
             return Err(git_mutation_rejection(subcommand));
         }
@@ -4896,13 +4909,17 @@ fn is_unprovable_flag_token(part: &str) -> bool {
     (part.starts_with("$'") || part.starts_with("$\"")) && part.contains('\\')
 }
 
-/// True when `w` contains an expandable substitution that could deliver a
-/// flag: the word starts with `-` (a substitution may hide behind it) or
-/// starts with an active substitution whose output is unprovable (`$(...)`,
-/// backtick, `${...}`, `<(cmd)`). Literal operands (`file$(echo x)`,
-/// `"s/a/$(echo b)/"`) never match — their first expanded char is fixed.
-/// An UNQUOTED mid-word span can additionally field-split a standalone flag
-/// out of a literal-prefixed word (`file$(echo 'a -o')` → fields `filea`,
+/// True when `w` contains a substitution span at a flag-delivering position:
+/// the shell-normalized word starts with `-` (a substitution may hide behind
+/// it — `-$(echo o)`) or starts with `$`/backtick and holds an active span
+/// (`$(...)`, backtick, `${...}`, `<(cmd)`) — ANY such span, provable or
+/// not: whole-word `$(echo foo)` and whole-word arithmetic (`curl $((1+2))
+/// URL`) over-reject, as do quoted flag-VALUE positions (`curl -d
+/// "$(echo foo)" URL`); mid-word arithmetic is exempt from the field-split
+/// arm (see [`unquoted_span_could_field_split_flag`]). Literal operands
+/// (`file$(echo x)`, `"s/a/$(echo b)/"`) never match — their first expanded
+/// char is fixed. An UNQUOTED mid-word span can additionally field-split a
+/// standalone flag out of a literal-prefixed word (`file$(echo 'a -o')` → fields `filea`,
 /// `-o`) — see [`unquoted_span_could_field_split_flag`]. Used by the flag
 /// scans so substitution-formed mutation flags (`sed $(echo -i)`,
 /// `curl -$(echo o)`, `curl file$(echo 'a -o') URL`) fail closed. Bare
@@ -5013,21 +5030,6 @@ fn simple_echo_output(body: &str) -> Option<String> {
         return None;
     }
     Some(toks.join(" "))
-}
-
-/// Fully resolve `value` when every piece is provable: literal text plus
-/// substitution bodies that provably echo plain tokens ([`simple_echo_output`]).
-/// `None` when any span is unprovable — the caller then treats the raw text as
-/// unprovable (fail-closed) or defers to its variable resolution.
-fn resolve_provable_value(value: &str) -> Option<String> {
-    let mut out = String::new();
-    for part in word_parts(value) {
-        match part {
-            WordPart::Lit(s) => out.push_str(&s),
-            WordPart::Any => return None,
-        }
-    }
-    Some(out)
 }
 
 /// True when a substitution word `w` could expand to a mutation token at a
@@ -5279,12 +5281,20 @@ fn has_inplace(command: &str, _state: &ValidationState) -> bool {
 
 /// Resolve the `of=` operand value of `w` when the whole word is provable:
 /// shell-normalized (quoted `"of=..."` matches) with provably-echoed spans
-/// folded and bare `$var` left for the temp resolver. `None` when `w` cannot
-/// be an `of=` operand or its value is unprovable (the caller then fails
-/// closed when the word could still form one).
+/// folded ([`word_parts`] + [`WordPart::Lit`] concatenation) and bare `$var`
+/// left for the temp resolver. `None` when `w` cannot be an `of=` operand or
+/// its value is unprovable (the caller then fails closed when the word could
+/// still form one).
 fn dd_of_value(w: &str) -> Option<String> {
     let p = shell_word(w);
-    resolve_provable_value(&p).and_then(|exp| exp.strip_prefix("of=").map(str::to_string))
+    let mut out = String::new();
+    for part in word_parts(&p) {
+        match part {
+            WordPart::Lit(s) => out.push_str(&s),
+            WordPart::Any => return None,
+        }
+    }
+    out.strip_prefix("of=").map(str::to_string)
 }
 
 /// Check if `dd of=...` writes outside temp. Every `of=` operand is evaluated
@@ -6485,7 +6495,7 @@ mod tests {
             // without a get form, a substitution key is unprovable (could be a
             // key+value write) — documented fail-closed over-rejection
             ("git config user.${name}", false),
-            ("git config $key", false), // key could be `user.name value` (a write)
+            ("git config $key", false), // bare-var arm of the -e cluster gate, not the substitution check
             // --output file-write vector: a substitution word whose expansion
             // could form the flag fails closed — ANY unprovable span (quoted
             // or not; an unquoted one field-splits), so split-boundary,
@@ -6709,6 +6719,23 @@ mod tests {
             ("curl \"$(echo -o /tmp/x)\" URL", false), // whole-word quoted output flag (value unprovable)
             ("git hash-object $TMPDIR/foo file", false), // bare-var operand over-rejection
             ("sed s/a/b/ $TMPDIR/x", false),           // bare-var operand over-rejection
+            // word-start arm fires on ANY `$`/backtick-started span, provable
+            // or not: whole-word echoes, quoted flag-VALUE positions, and
+            // whole-word arithmetic over-reject; single-quoted literals and
+            // mid-word arithmetic (field-split-exempt) stay allowed
+            ("curl $(echo foo) URL", false),
+            ("curl -d \"$(echo foo)\" URL", false),
+            ("curl -d '$(echo foo)' URL", true),
+            ("curl $((1+2)) URL", false), // whole-word arithmetic over-rejected
+            ("curl x$((1+2))y URL", true), // mid-word arithmetic: numeric, no split
+            // branch/tag gates: substitution words fail closed — without this,
+            // `--list $(echo -d)` would rely on git's own option-conflict
+            // error; whole-word `$(` at the name position over-rejects
+            ("git branch --list $(echo -d) feature", false),
+            ("git branch $(echo -d) feature", false),
+            ("git branch --$(echo delete) feature", false),
+            ("git branch --list $(echo feature)", false), // over-rejection: whole-word $( at name position
+            ("git branch --list feature", true),
         ];
         run_cases(&cases);
     }
