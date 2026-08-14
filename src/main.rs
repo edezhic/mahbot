@@ -432,7 +432,11 @@ fn init_message_pipeline(
 
 async fn shutdown_after_dashboard() {
     info!("Dashboard window closed — shutting down");
-    mahbot::shutdown::shutdown();
+    // No shutdown() here — the token is already fired whenever the iced runtime
+    // exits: the shutdown subscription emits Message::Shutdown only after token
+    // cancellation, and the UpdateResult-failure exit (save_and_exit) runs only
+    // after the update's finalizing drain fired it. A future exit path that
+    // drops the runtime without firing the token would break this invariant.
     mahbot::registry::AGENT_REGISTRY.shutdown_all();
     mahbot::tools::browser::close_all_browser_sessions().await;
 

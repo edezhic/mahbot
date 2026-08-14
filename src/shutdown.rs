@@ -68,7 +68,11 @@ pub fn shutdown_token() -> CancellationToken {
     global_shutdown().clone()
 }
 
-/// Trigger a graceful shutdown of the daemon.
+/// Clean-drain-completion trigger: fires the global token once the drain-watch
+/// sees no in-flight work, ending the graceful-drain window. Gracefulness comes
+/// from [`drain_begin`] — this does not start a drain (if the token already
+/// fired, the watch returns before reaching this). Contrast [`force_cancel`],
+/// the abort path that fires the token mid-drain to cancel in-flight work.
 pub fn shutdown() {
     global_shutdown().cancel();
 }
