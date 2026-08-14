@@ -364,14 +364,12 @@ pub(crate) async fn checkpoint_job(
     conn: &Connection,
     id: &str,
     status: RowStatus,
-    task: Option<&str>,
     retry_count: i64,
 ) -> Result<()> {
     let now = turso::now();
     conn.execute(
-        "UPDATE jobs SET status = ?1, task = COALESCE(?2, task), retry_count = ?3, updated_at = ?4 \
-         WHERE id = ?5",
-        params![status.as_str(), task, retry_count, now, id],
+        "UPDATE jobs SET status = ?1, retry_count = ?2, updated_at = ?3 WHERE id = ?4",
+        params![status.as_str(), retry_count, now, id],
     )
     .await
     .with_context(|| format!("failed to checkpoint job {id}"))?;
@@ -1137,14 +1135,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
         // Bump updated_at for every resumed job (the boot bump) AND increment
         // retry_count (the cap counts boot-resume attempts, not in-job
         // retries — every bump here is one resume).
-        let _ = checkpoint_job(
-            conn,
-            &job.id,
-            RowStatus::Launched,
-            None,
-            job.retry_count + 1,
-        )
-        .await;
+        let _ = checkpoint_job(conn, &job.id, RowStatus::Launched, job.retry_count + 1).await;
         let in_phase = crate::board::store()
             .get_ticket_phase(&ticket_id)
             .await
@@ -1238,7 +1229,6 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
                     conn,
                     &job.id,
                     RowStatus::Launched,
-                    None,
                     if capped {
                         job.retry_count
                     } else {
