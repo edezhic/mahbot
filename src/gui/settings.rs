@@ -1049,13 +1049,12 @@ impl SettingsState {
                                 .align_x(Alignment::Start)
                                 .align_y(Alignment::Center),
                             // Status column (FillPortion: 10)
-                            container(
-                                container(
-                                    text(ws_item.status.as_ref()).size(11).color(status_color)
-                                )
-                                .padding([2, 8])
-                                .style(theme::pill_style(status_bg)),
-                            )
+                            container(widgets::badge_pill(
+                                ws_item.status.to_string(),
+                                (status_bg, status_color),
+                                11,
+                                [2, 8],
+                            ))
                             .width(Length::FillPortion(10))
                             .align_x(Alignment::Start)
                             .align_y(Alignment::Center),

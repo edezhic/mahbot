@@ -201,13 +201,19 @@ impl ToolFailuresState {
         row![
             text(timestamp).size(10).color(theme::TEXT_MUTED),
             Space::new().width(8),
-            container(text(&entry.tool_name).size(10).color(theme::TEXT_SECONDARY))
-                .padding([1, 6])
-                .style(theme::pill_style(theme::HOVER)),
+            widgets::badge_pill(
+                entry.tool_name.clone(),
+                (theme::HOVER, theme::TEXT_SECONDARY),
+                10,
+                [1, 6],
+            ),
             Space::new().width(4),
-            container(text(duration_label).size(10).color(theme::TEXT_MUTED))
-                .padding([1, 6])
-                .style(theme::pill_style(theme::HOVER)),
+            widgets::badge_pill(
+                duration_label,
+                (theme::HOVER, theme::TEXT_MUTED),
+                10,
+                [1, 6]
+            ),
             Space::new().width(4),
             container(text(&entry.role).size(10).color(fg))
                 .padding([1, 6])
