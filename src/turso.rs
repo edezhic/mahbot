@@ -2015,6 +2015,24 @@ fn classify_migrate<E: Into<anyhow::Error>>(e: E) -> MigrateFailure {
     }
 }
 
+/// Build `INSERT INTO "…" VALUES (…)` for a row copy using positional
+/// placeholders ([`sql_in_placeholders`]); `table_ref` is a bare identifier —
+/// the helper adds the surrounding double quotes.
+fn row_insert_sql(table_ref: &str, row: &Row) -> Result<(String, Vec<Value>), MigrateFailure> {
+    let ncols = row.column_count();
+    let mut vals = Vec::with_capacity(ncols);
+    for c in 0..ncols {
+        vals.push(row.get_value(c).map_err(classify_migrate)?);
+    }
+    Ok((
+        format!(
+            "INSERT INTO \"{table_ref}\" VALUES ({})",
+            sql_in_placeholders(ncols)
+        ),
+        vals,
+    ))
+}
+
 /// Replay the old store's schema (tables + indexes, creation order) into the
 /// fresh store and copy every table's data row by row (two connections — the
 /// SQL engine cannot reference the old store from the fresh one). Indexes are
@@ -2066,22 +2084,8 @@ async fn migrate_schema_and_data(
             .await
             .map_err(classify_migrate)?;
         for row in &seq_rows {
-            let ncols = row.column_count();
-            let placeholders = (1..=ncols)
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            let mut vals = Vec::with_capacity(ncols);
-            for c in 0..ncols {
-                vals.push(row.get_value(c).map_err(classify_migrate)?);
-            }
-            fresh
-                .execute(
-                    &format!("INSERT INTO sqlite_sequence VALUES ({placeholders})"),
-                    vals,
-                )
-                .await
-                .map_err(classify_migrate)?;
+            let (sql, vals) = row_insert_sql("sqlite_sequence", row)?;
+            fresh.execute(&sql, vals).await.map_err(classify_migrate)?;
         }
     }
     for (tbl, expected) in counts {
@@ -2096,16 +2100,7 @@ async fn migrate_schema_and_data(
         let tx = fresh.begin_tx().await.map_err(classify_migrate)?;
         let mut copied = 0i64;
         for row in &rows {
-            let ncols = row.column_count();
-            let placeholders = (1..=ncols)
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!("INSERT INTO \"{quoted}\" VALUES ({placeholders})");
-            let mut vals = Vec::with_capacity(ncols);
-            for c in 0..ncols {
-                vals.push(row.get_value(c).map_err(classify_migrate)?);
-            }
+            let (sql, vals) = row_insert_sql(&quoted, row)?;
             tx.execute(&sql, vals).await.map_err(classify_migrate)?;
             copied += 1;
         }
