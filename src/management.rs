@@ -1637,10 +1637,11 @@ enum StageRoundKind {
 /// Resume dispatch rule — session-non-emptiness discriminator: the check is
 /// "any session content", not "current round's task present" — existing
 /// session → empty message (no duplicate task-prompt append); missing session
-/// → stored task re-dispatched. A crash between the anchor upsert and this
-/// round's session.init leaves the round's feedback undelivered (a non-empty
-/// prior round then dispatches an empty message). Narrow window, quality-only
-/// — accepted. Fresh dispatch always uses the rendered prompt.
+/// → stored task re-dispatched. A crash between the stage's durable write
+/// (engineer: anchor upsert; sanitation: spawn row) and this round's
+/// session.init leaves the round's feedback undelivered (a non-empty prior
+/// round then dispatches an empty message). Narrow window, quality-only —
+/// accepted. Fresh dispatch always uses the rendered prompt.
 async fn run_stage_agent_round(
     ticket: &Ticket,
     ws: &Workspace,
