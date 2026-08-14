@@ -78,32 +78,12 @@
 //!
 //! # Orphaned database keys
 //!
-//! The following keys may still exist in the `config_kv` table from before the
-//! API audio transcription was removed, but are **silently
-//! ignored** — they have no corresponding field in [`ConfigData`] and are never
-//! read:
-//!
-//! * `audio_transcription_model` — previously the API audio model name.
-//! * `audio_transcription_models` — previously the newline-separated model list.
-//! * `audio_transcription_provider` — previously the provider routing slug.
-//!
-//! The legacy image-transcription keys (`image_transcription_model`,
-//! `image_transcription_provider`) were **migrated** to
-//! `media_transcription_model`/`media_transcription_provider` in
-//! [`reload_from_db`]; their orphaned rows remain after the copy and are
-//! silently ignored, matching the video-model migration precedent.
-//!
-//! The retry/backoff, joint-verdict synthesis, and review-count calibration
-//! keys (`retry_max_attempts`, `retry_base_backoff_ms`, `retry_max_backoff_ms`,
-//! `operation_timeout_secs`, `synthesis_max_attempts`,
-//! `synthesis_base_backoff_ms`, `synthesis_max_backoff_ms`,
-//! `review_count_low_churn`, `review_count_high_churn`,
-//! `review_count_coeff_fit_date`) are likewise silently ignored — those
-//! parameters are now hardcoded in code and have no config surface.
-//!
-//! These orphaned entries are harmless and do not require migration. They will
-//! be naturally overwritten if a future config key with the same name is added;
-//! until then they consume negligible space in the `config_kv` table.
+//! Rows in `config_kv` without a corresponding [`ConfigData`] field are
+//! silently ignored and require no migration. Some legacy keys are still read
+//! as migration sources in [`reload_from_db`] when the target field is unset;
+//! those rows are kept intentionally (a downgrade would resurrect them) and
+//! must not be deleted. Orphaned rows are harmless and are naturally
+//! overwritten if a future config key reuses the name.
 //!
 //! # See also
 //!
@@ -711,9 +691,8 @@ pub(crate) fn resolve_list_or(
 
 /// Global reloadable config singleton.
 ///
-/// Replaces the old `OnceCell<Config>` (write-once). The `storage_root` is
-/// immutable after startup; all other fields live in an `RwLock<ConfigData>`
-/// that can be atomically swapped at runtime.
+/// The `storage_root` is immutable after startup; all other fields live in an
+/// `RwLock<ConfigData>` that can be atomically swapped at runtime.
 pub static CONFIG: ConfigReload = ConfigReload::const_new();
 
 /// Reloadable configuration with atomic swap capability.
