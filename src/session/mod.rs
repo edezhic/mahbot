@@ -798,7 +798,7 @@ impl SessionStore {
 
     /// Retrieve stored session context for a given agent ID.
     /// Returns `None` if the session has no metadata or the context columns
-    /// are null (pre-migration sessions).
+    /// are null.
     pub(crate) async fn get_session_context(&self, agent_id: &str) -> Option<SessionContext> {
         let rows = self
             .conn
@@ -891,19 +891,6 @@ impl SessionStore {
             )
             .await
             .context("Failed to create sessions index")?;
-
-        // active_models stores the rendered <active-models-opts> snapshot
-        // (model ids) for mid-session change detection. Guarded ALTER follows
-        // the done_at/bounce_count precedents in board.rs.
-        if !turso::column_exists(&self.conn, "session_metadata", "active_models").await? {
-            self.conn
-                .execute(
-                    "ALTER TABLE session_metadata ADD COLUMN active_models TEXT",
-                    (),
-                )
-                .await
-                .context("Failed to add active_models column to session_metadata")?;
-        }
         Ok(())
     }
 }

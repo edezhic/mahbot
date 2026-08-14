@@ -16,7 +16,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::OnceCell;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tracing::info;
 use tracing::warn;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -186,8 +185,6 @@ CREATE TABLE IF NOT EXISTS llm_requests (
     -- windows by recorded_at (deploy boundary), not response_format alone.
     -- Only reliable while the store survives boot — quarantine recreation
     -- resets history.
-    -- Existing rows keep NULL (or response_format 0) via
-    -- `add_columns_if_missing` (append-only).
     cost                REAL,
     cost_details        TEXT,
     upstream_provider   TEXT,
@@ -219,9 +216,7 @@ CREATE INDEX IF NOT EXISTS idx_image_gen_calls_model ON image_gen_calls(model);
 -- re-measured and the dynamic-count formula validated after launch.
 -- PK (job_id, agent_index): the job row is the round identity (ticket +
 -- stage + round) so replays of a resumed round are idempotent
--- (ON CONFLICT DO UPDATE). Historical rows predating the job_id column were
--- dropped (user-approved); `migrate_verdict_scores_shape` performs the
--- guarded one-tx DROP+CREATE for legacy stores.
+-- (ON CONFLICT DO UPDATE).
 CREATE TABLE IF NOT EXISTS verdict_scores (
     job_id       TEXT NOT NULL,
     agent_index  INTEGER NOT NULL,
@@ -263,10 +258,10 @@ impl LogStore {
                 quarantine_logs_artifacts(root);
                 // The recreate is on a fresh store — the boot diagnosis was
                 // already consumed by the failed open, so this bypasses the
-                // heal path. Any post-recreate failure (migrations below)
-                // propagates WITHOUT a second quarantine: the fresh store is
-                // not corrupt, a migration failure is a code bug, and a
-                // double quarantine would destroy the forensic record.
+                // heal path. Any post-recreate failure propagates WITHOUT a
+                // second quarantine: the fresh store is not corrupt, a failure
+                // is a code bug, and a double quarantine would destroy the
+                // forensic record.
                 let conn = crate::turso::open_with_schema(
                     &turso::store_db_path(root, "logs"),
                     LOGS_SCHEMA,
@@ -277,42 +272,6 @@ impl LogStore {
             }
             Err(OpenFailure::Other(e)) => return Err(e),
         };
-        // Guarded verdict_scores shape migration: runs at
-        // store open, idempotent — a re-run finds the new shape and no-ops.
-        // The quarantine-recreate path produces the new shape directly via
-        // LOGS_SCHEMA, so the guard is a no-op there too.
-        migrate_verdict_scores_shape(&store.conn)
-            .await
-            .context("Failed to migrate verdict_scores shape")?;
-        // Guarded llm_requests column additions — append-only ALTERs for
-        // legacy stores; a fresh store already carries the columns.
-        add_columns_if_missing(
-            &store.conn,
-            "llm_requests",
-            &[
-                ("cost", "REAL"),
-                ("cost_details", "TEXT"),
-                ("upstream_provider", "TEXT"),
-                ("system_fingerprint", "TEXT"),
-                ("response_format", "INTEGER NOT NULL DEFAULT 0"),
-            ],
-        )
-        .await
-        .context("Failed to migrate llm_requests columns")?;
-        // Guarded retry_failures column additions (retry-cause telemetry
-        // context) — same append-only semantics as the llm_requests migration.
-        add_columns_if_missing(
-            &store.conn,
-            "retry_failures",
-            &[
-                ("purpose", "TEXT NOT NULL DEFAULT ''"),
-                ("role", "TEXT NOT NULL DEFAULT ''"),
-                ("workspace", "TEXT NOT NULL DEFAULT ''"),
-                ("cause", "TEXT NOT NULL DEFAULT ''"),
-            ],
-        )
-        .await
-        .context("Failed to migrate retry_failures columns")?;
         Ok(store)
     }
 
@@ -532,81 +491,6 @@ async fn open_verified_logs_store(root: &Path) -> Result<crate::turso::Connectio
             crate::util::panic_message(&*payload)
         ))),
     }
-}
-
-/// Guarded verdict_scores shape migration: detect the OLD shape (table exists
-/// WITHOUT the job_id column), then one-tx DROP+CREATE with the new shape
-/// (PK (job_id, agent_index)). Idempotent — a re-run finds the new shape and
-/// no-ops. Historical rows (~2 days of telemetry, unmappable to the new PK)
-/// are dropped per user approval.
-pub(crate) async fn migrate_verdict_scores_shape(conn: &turso::Connection) -> anyhow::Result<()> {
-    let has_table = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'verdict_scores'",
-            (),
-            |row| row.get::<i64>(0),
-        )
-        .await
-        .context("check verdict_scores table existence")?;
-    if has_table == 0 {
-        return Ok(()); // fresh store — LOGS_SCHEMA already applied the new shape
-    }
-    if turso::column_exists(conn, "verdict_scores", "job_id").await? {
-        return Ok(()); // already the new shape
-    }
-    info!("verdict_scores has legacy shape (no job_id) — DROP+recreate with new PK");
-    let tx = conn.begin_tx().await?;
-    tx.execute("DROP TABLE verdict_scores", ()).await?;
-    tx.execute(
-        "CREATE TABLE verdict_scores (
-            job_id       TEXT NOT NULL,
-            agent_index  INTEGER NOT NULL,
-            ticket_id    TEXT NOT NULL,
-            stage        TEXT NOT NULL,
-            score        INTEGER NOT NULL,
-            issues       TEXT NOT NULL,
-            created_at   TEXT NOT NULL,
-            PRIMARY KEY (job_id, agent_index)
-        )",
-        (),
-    )
-    .await?;
-    tx.execute(
-        "CREATE INDEX IF NOT EXISTS idx_verdict_scores_ticket_id ON verdict_scores(ticket_id)",
-        (),
-    )
-    .await?;
-    tx.execute(
-        "CREATE INDEX IF NOT EXISTS idx_verdict_scores_created_at ON verdict_scores(created_at)",
-        (),
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(())
-}
-
-/// Guarded append-only column additions: `CREATE TABLE IF NOT EXISTS` does
-/// not add columns to existing stores, so legacy logs.db files are migrated
-/// here — idempotent via the `column_exists` guard, and additive: existing
-/// rows keep their defaults, never rewritten. No indexes on the migrated
-/// columns: the schema batch runs before this migration, so an index on a
-/// not-yet-added column would abort the batch and quarantine the store.
-pub(crate) async fn add_columns_if_missing(
-    conn: &turso::Connection,
-    table: &str,
-    columns: &[(&str, &str)],
-) -> anyhow::Result<()> {
-    for (column, ddl) in columns {
-        if !turso::column_exists(conn, table, column).await? {
-            conn.execute(
-                &format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"),
-                (),
-            )
-            .await
-            .with_context(|| format!("Failed to add {column} column to {table}"))?;
-        }
-    }
-    Ok(())
 }
 
 /// Move the logs store's whole artifact family aside to a timestamped
@@ -1920,166 +1804,5 @@ mod tests {
             !quarantined.is_empty(),
             "unopenable store must be quarantined, found: {quarantined:?}"
         );
-    }
-
-    /// `add_columns_if_missing` on a legacy-shaped `llm_requests` store:
-    /// additive, preserves existing rows (append-only), and is idempotent.
-    #[tokio::test]
-    async fn add_columns_if_missing_llm_requests_legacy_shape() {
-        let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
-        const COLUMNS: &[(&str, &str)] = &[
-            ("cost", "REAL"),
-            ("cost_details", "TEXT"),
-            ("upstream_provider", "TEXT"),
-            ("system_fingerprint", "TEXT"),
-            ("response_format", "INTEGER NOT NULL DEFAULT 0"),
-        ];
-        // Simulate a legacy store (pre-observability-fields): drop the new
-        // columns, seed a row.
-        for (column, _) in COLUMNS {
-            store
-                .conn
-                .execute(
-                    &format!("ALTER TABLE llm_requests DROP COLUMN {column}"),
-                    (),
-                )
-                .await
-                .unwrap();
-        }
-        store
-            .conn
-            .execute(
-                "INSERT INTO llm_requests \
-                 (recorded_at, purpose, agent_id, role, workspace, model, routing, \
-                  duration_ms, retry_attempts, success) \
-                 VALUES ('2026-01-01T00:00:00Z', 'agent', 'legacy', '', '', 'm', 'default', 1, 1, 1)",
-                (),
-            )
-            .await
-            .unwrap();
-
-        crate::logs::add_columns_if_missing(&store.conn, "llm_requests", COLUMNS)
-            .await
-            .expect("migration must succeed");
-
-        let cols = store
-            .conn
-            .query("PRAGMA table_info('llm_requests')", ())
-            .await
-            .unwrap();
-        let names: Vec<String> = cols.iter().map(|r| r.get::<String>(1).unwrap()).collect();
-        for (column, _) in COLUMNS {
-            assert!(names.contains(&column.to_string()), "missing {column}");
-        }
-        // Old row survives with NULL new columns (append-only, no rewrite).
-        let row = store
-            .conn
-            .query(
-                "SELECT agent_id, cost, upstream_provider, response_format FROM llm_requests",
-                (),
-            )
-            .await
-            .unwrap()
-            .into_iter()
-            .next()
-            .expect("legacy row preserved");
-        assert_eq!(row.get::<String>(0).expect("agent_id"), "legacy");
-        assert_eq!(row.get::<Option<f64>>(1).expect("cost"), None);
-        assert_eq!(row.get::<Option<String>>(2).expect("provider"), None);
-        assert_eq!(row.get::<i64>(3).expect("response_format"), 0);
-        // Idempotent — a second run no-ops.
-        crate::logs::add_columns_if_missing(&store.conn, "llm_requests", COLUMNS)
-            .await
-            .expect("second migration run must no-op");
-        let row = store
-            .conn
-            .query("SELECT agent_id FROM llm_requests", ())
-            .await
-            .unwrap()
-            .into_iter()
-            .next()
-            .expect("row still there");
-        assert_eq!(row.get::<String>(0).expect("agent_id"), "legacy");
-    }
-
-    /// Full `LogStore::open` boot path against a legacy-shaped store: the
-    /// schema batch runs before the guarded migration, so any schema
-    /// statement referencing the not-yet-migrated columns (the purpose index
-    /// bug) would abort the batch and quarantine the whole store. Regression
-    /// test — opens the file exactly like production boot, asserts the store
-    /// survives with data intact, then re-opens to verify migration
-    /// idempotency (every boot re-runs it).
-    #[tokio::test]
-    async fn log_store_open_preserves_legacy_retry_failures() {
-        let tmp = ::tempfile::TempDir::new().expect("temp dir for test store");
-        let root = tmp.path();
-        // Materialize a legacy-shaped store: open fresh (new shape), then
-        // strip the retry-context columns and their index, seed a legacy row.
-        let store = crate::logs::LogStore::open(root).await.expect("fresh open");
-        for column in ["purpose", "role", "workspace", "cause"] {
-            store
-                .conn
-                .execute(
-                    &format!("ALTER TABLE retry_failures DROP COLUMN {column}"),
-                    (),
-                )
-                .await
-                .unwrap();
-        }
-        store
-            .conn
-            .execute(
-                "INSERT INTO retry_failures \
-                 (attempt, failure_class, error_chain, elapsed_ms, recorded_at) \
-                 VALUES (1, 'parse', 'legacy', 1, '2026-01-01T00:00:00Z')",
-                (),
-            )
-            .await
-            .unwrap();
-        drop(store); // release the connection so the file can be reopened
-
-        let reopened = crate::logs::LogStore::open(root)
-            .await
-            .expect("reopen must not quarantine the legacy store");
-        let cols = reopened
-            .conn
-            .query("PRAGMA table_info('retry_failures')", ())
-            .await
-            .unwrap();
-        let names: Vec<String> = cols.iter().map(|r| r.get::<String>(1).unwrap()).collect();
-        for column in ["purpose", "role", "workspace", "cause"] {
-            assert!(names.contains(&column.to_string()), "missing {column}");
-        }
-        // Legacy row survives with the empty-string defaults (append-only).
-        let row = reopened
-            .conn
-            .query(
-                "SELECT attempt, purpose, role, workspace, cause FROM retry_failures",
-                (),
-            )
-            .await
-            .unwrap()
-            .into_iter()
-            .next()
-            .expect("legacy row preserved");
-        assert_eq!(row.get::<i64>(0).expect("attempt"), 1);
-        assert_eq!(row.get::<String>(1).expect("purpose"), "");
-        assert_eq!(row.get::<String>(2).expect("role"), "");
-        assert_eq!(row.get::<String>(3).expect("workspace"), "");
-        assert_eq!(row.get::<String>(4).expect("cause"), "");
-        // Idempotent — a second boot re-runs the migration and no-ops.
-        drop(reopened);
-        let reopened = crate::logs::LogStore::open(root)
-            .await
-            .expect("second boot must no-op the migration");
-        let row = reopened
-            .conn
-            .query("SELECT attempt FROM retry_failures", ())
-            .await
-            .unwrap()
-            .into_iter()
-            .next()
-            .expect("row still there");
-        assert_eq!(row.get::<i64>(0).expect("attempt"), 1);
     }
 }

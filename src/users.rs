@@ -32,7 +32,7 @@ crate::define_store! {
     pub(crate) static USER_STORE: UserStore,
     db_name = "users",
     schema = SCHEMA,
-    post_open = after_open,
+    post_open = ensure_admin_user,
     expect = "USER_STORE not initialized — call init_global() first",
 }
 
@@ -79,51 +79,6 @@ crate::columns! {
 }
 
 impl UserStore {
-    /// Post-open setup: evolve schema, auto-create the admin user, and
-    /// backfill legacy users' role pools.
-    async fn after_open(&self) -> Result<()> {
-        if !turso::column_exists(&self.conn, "users", "role_pool_initialized").await? {
-            self.conn
-                .execute(
-                    "ALTER TABLE users ADD COLUMN role_pool_initialized INTEGER NOT NULL DEFAULT 0",
-                    (),
-                )
-                .await
-                .context("Failed to add role_pool_initialized column to users")?;
-        }
-        self.ensure_admin_user().await?;
-
-        // One-time backfill: users created before the role pool shipped get
-        // the full role set so their previous switching freedom is preserved.
-        // Users created after the release carry `role_pool_initialized = 1`
-        // (set by add_user / set_user_roles) and are never re-seeded.
-        let legacy = self
-            .conn
-            .query_map_strict(
-                "SELECT name FROM users WHERE role_pool_initialized = 0",
-                turso::params![],
-                |row| row.get::<String>(0),
-            )
-            .await?;
-        for name in legacy {
-            let tx = self.conn.begin_tx().await?;
-            for role in Role::iter() {
-                tx.execute(
-                    "INSERT OR IGNORE INTO user_roles (user_name, role) VALUES (?1, ?2)",
-                    turso::params![name.clone(), role.as_str()],
-                )
-                .await?;
-            }
-            tx.execute(
-                "UPDATE users SET role_pool_initialized = 1 WHERE name = ?1",
-                turso::params![name],
-            )
-            .await?;
-            tx.commit().await?;
-        }
-        Ok(())
-    }
-
     /// Auto-create the admin user if this is a fresh database.
     async fn ensure_admin_user(&self) -> Result<()> {
         let rows = self
@@ -148,8 +103,8 @@ impl UserStore {
     /// under `~/.mahbot/userspaces/<name>/` with `git init` (non-fatal on
     /// failure). Idempotent — re-adding an existing user preserves their
     /// stored preferences and adds the given roles to their pool. The
-    /// `role_pool_initialized` marker is set unconditionally so a re-added
-    /// legacy user is never re-seeded by the `after_open` backfill.
+    /// `role_pool_initialized` marker is set unconditionally (schema parity
+    /// with live databases).
     pub async fn add_user(
         &self,
         name: &str,
@@ -182,7 +137,7 @@ impl UserStore {
             .await?;
         }
         // Mark the pool as initialized even when the INSERT OR IGNORE
-        // no-op'd for an existing legacy (marker=0) user.
+        // no-op'd for an existing user.
         tx.execute(
             "UPDATE users SET role_pool_initialized = 1 WHERE name = ?1",
             turso::params![name],
@@ -1037,66 +992,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_backfill_grants_all_roles_once() {
-        crate::util::test::init_test_stores().await;
-        let store = store();
-
-        // Simulate a user created before the role pool shipped (marker unset).
-        store
-            .conn
-            .execute(
-                "INSERT INTO users (name, permissions, role_pool_initialized) \
-                 VALUES ('legacy', NULL, 0)",
-                crate::turso::params![],
-            )
-            .await
-            .unwrap();
-
-        // Re-running after_open performs the one-time backfill and is
-        // idempotent for already-initialized users.
-        store.after_open().await.unwrap();
-        assert_eq!(
-            store.get_user_roles("legacy").await.unwrap().len(),
-            Role::iter().count()
-        );
-
-        // A user created after the release keeps a restricted pool — the
-        // backfill never re-seeds it.
-        store
-            .add_user("restricted", None, &[Role::Coder])
-            .await
-            .unwrap();
-        store.after_open().await.unwrap();
-        assert_eq!(
-            store.get_user_roles("restricted").await.unwrap(),
-            vec![Role::Coder]
-        );
-
-        // A restricted pool survives a re-add: add_user is additive (grants,
-        // never removes) and keeps the marker set, so after_open never
-        // re-seeds the full role set over the restriction.
-        store
-            .set_user_roles("legacy", &[Role::Coder])
-            .await
-            .unwrap();
-        store
-            .add_user("legacy", None, &[Role::Analyst])
-            .await
-            .unwrap();
-        store.after_open().await.unwrap();
-        assert_eq!(
-            store.get_user_roles("legacy").await.unwrap(),
-            vec![Role::Analyst, Role::Coder]
-        );
-    }
-
-    #[tokio::test]
     async fn delete_user_removes_role_pool_rows() {
         crate::util::test::init_test_stores().await;
         let store = store();
 
-        // add_user + backfill give the user role rows; deleting them must not
-        // trip the NO-ACTION FK on user_roles.user_name.
+        // add_user grants the role rows; deleting them must not trip the
+        // NO-ACTION FK on user_roles.user_name.
         store
             .add_user("doomed", None, &[Role::Analyst, Role::Coder])
             .await

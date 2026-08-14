@@ -324,8 +324,7 @@ pub struct Ticket {
     /// identifies the exact content reviewers saw.
     pub reviewed_tree: Option<String>,
     /// Exact completion timestamp: set on transition to Done, cleared when the
-    /// ticket leaves Done. Backfilled from `updated_at` for pre-migration
-    /// tickets. `None` for never-done or not-currently-done tickets.
+    /// ticket leaves Done. `None` for never-done or not-currently-done tickets.
     pub done_at: Option<String>,
     /// Number of times this ticket bounced back from review/QA into
     /// development. Drives the bounce-based circuit breaker (max 10) and the
@@ -680,7 +679,7 @@ pub(crate) enum LoadComments {
 }
 
 impl BoardStore {
-    /// Post-open setup: reject legacy schemas, evolve schema, then create the FTS index.
+    /// Post-open setup: reject legacy schemas, then create the FTS index.
     async fn after_open(&self) -> anyhow::Result<()> {
         // Legacy-format DBs (pre-migration) fail fast with an actionable error
         // instead of failing later on no-such-column queries.
@@ -691,51 +690,6 @@ impl BoardStore {
             );
         }
 
-        // ── done_at schema evolution ──────────────────────────────────────
-        // First post-migration-removal schema change. The ALTER is guarded by
-        // column existence and the backfill by `done_at IS NULL`, so repeated
-        // boots and partial failures self-heal; the single-instance flock
-        // makes the check-then-ALTER race-free in production.
-        if !turso::column_exists(&self.conn, "tickets", "done_at").await? {
-            self.conn
-                .execute("ALTER TABLE tickets ADD COLUMN done_at TEXT", ())
-                .await
-                .context("Failed to add done_at column to tickets")?;
-        }
-        self.conn
-            .execute(
-                "UPDATE tickets SET done_at = updated_at \
-                 WHERE phase = 'done' AND done_at IS NULL",
-                (),
-            )
-            .await
-            .context("Failed to backfill done_at from updated_at")?;
-
-        // ── bounce_count + review_base_count schema evolution ────────────
-        // Bounce counter (drives the bounce-based circuit breaker and the
-        // reviewer-count +1 adjustment) and the frozen first-review base count
-        // (prevents rework-grown diffs from escalating reviewer counts).
-        // Guarded ALTERs follow the done_at precedent.
-        if !turso::column_exists(&self.conn, "tickets", "bounce_count").await? {
-            self.conn
-                .execute(
-                    "ALTER TABLE tickets ADD COLUMN bounce_count INTEGER NOT NULL DEFAULT 0",
-                    (),
-                )
-                .await
-                .context("Failed to add bounce_count column to tickets")?;
-        }
-        if !turso::column_exists(&self.conn, "tickets", "review_base_count").await? {
-            self.conn
-                .execute(
-                    "ALTER TABLE tickets ADD COLUMN review_base_count INTEGER",
-                    (),
-                )
-                .await
-                .context("Failed to add review_base_count column to tickets")?;
-        }
-
-        // ── FTS index setup ────────────────────────────────────────────────
         crate::turso::ensure_fts_index(
             &self.conn,
             TICKETS_FTS_INDEX_NAME,
