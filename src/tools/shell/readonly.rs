@@ -879,11 +879,15 @@ fn check_words(
 
 /// A `redirected_statement` hoists its command's redirects above the maximal
 /// list/pipeline suffix ending at that command. The body is walked first
-/// (source order), then each redirect validates against the state at the
-/// body's LAST command start — bash opens a redirect when its owning command
-/// starts. Words the parser swallowed into the redirect nodes (the grammar
-/// groups `rm a > f c` as command(rm a) + file_redirect(> f c); `c` is a real
-/// rm argument) append to the last command's argument list.
+/// (source order), then each redirect validates against the state at its
+/// owning command's start: for a simple command/list/pipeline body that is
+/// the body's LAST command start (`cd /tmp && cat > f` opens f post-cd); for
+/// a construct body ({ }, ( ), if/while/for/case) it is the CONSTRUCT's start
+/// — bash opens the redirect and expands the heredoc body before any inner
+/// command runs (`{ cd /tmp; cat; } > f` opens f in the pre-construct cwd).
+/// Words the parser swallowed into the redirect nodes (the grammar groups
+/// `rm a > f c` as command(rm a) + file_redirect(> f c); `c` is a real rm
+/// argument) append to the last command's argument list.
 fn walk_redirected<'a>(
     node: Node,
     w: &mut W<'a>,
@@ -916,20 +920,43 @@ fn walk_redirected<'a>(
         ));
     }
 
+    let construct_owned = !matches!(body.kind(), "command" | "list" | "pipeline");
+    let body_start = state.snapshot();
     w.last_start = state.snapshot();
     walk_body(body, w, state, flags, extra)?;
 
-    let mut redirect_state = w.last_start.snapshot();
+    let mut redirect_state = if construct_owned {
+        body_start
+    } else {
+        w.last_start.snapshot()
+    };
+    let assignments = owning_command_assignments(body, w);
     for r in redirects {
         if r.kind() == "heredoc_redirect" {
             // Body/marker-line substitutions expand before the owning command
-            // runs; `&&`/`|` tails run after it (post-body `state`).
-            validate_heredoc(*r, w, &mut redirect_state, state)?;
+            // runs; `&&`/`||` tails run after it (post-body `state`).
+            validate_heredoc(*r, w, &mut redirect_state, &assignments, state)?;
         } else {
             validate_file_redirect(*r, w, &mut redirect_state)?;
         }
     }
     Ok(())
+}
+
+/// The env assignments of the command owning a hoisted redirect: the body
+/// command itself, or the last command of a list/pipeline body (bash feeds
+/// the redirect to the last pipeline member). Construct bodies cannot take an
+/// assignment prefix (`VAR=val { ...; }` is a bash syntax error) — none.
+fn owning_command_assignments(body: Node, w: &W) -> Vec<String> {
+    let owner = match body.kind() {
+        "command" => Some(body),
+        "list" | "pipeline" => body
+            .children(&mut body.walk())
+            .filter(|c| is_commandish(c.kind()))
+            .last(),
+        _ => None,
+    };
+    owner.map_or_else(Vec::new, |n| collect_command_words(n, w).1)
 }
 
 /// Walk the body of a `redirected_statement`, updating `w.last_start` to the
@@ -1019,9 +1046,9 @@ fn validate_redirect<'a>(
         "file_redirect" => validate_file_redirect(node, w, state),
         "heredoc_redirect" => {
             // Standalone heredoc (no owning command): body and tail both run
-            // against the current state.
+            // against the current state; no assignment prefix applies.
             let mut snap = state.snapshot();
-            validate_heredoc(node, w, state, &mut snap)
+            validate_heredoc(node, w, state, &[], &mut snap)
         }
         "herestring_redirect" => Err(parse_error(&w.src)),
         _ => Err(unrecognized_node(node, w)),
@@ -1107,16 +1134,24 @@ fn disallowed_redirect_err(cmd: &str, target: &str) -> String {
 /// reject); an unquoted body's substitutions execute and are validated,
 /// while its raw text is minimal-scanned for backticks/`$(` (invisible to the
 /// parser). Quoted-delimiter bodies are literal — nothing executes.
-/// Substitutions (body and marker-line words) and the marker-line redirect
-/// expand BEFORE the owning command runs, so they validate against
-/// `cmd_state` (the command's start state — pre-cd for `cd /tmp <<EOF`);
-/// the `&&`/`|` tail arms run AFTER it, against `tail_state` (post-body).
+/// Bash expansion order: the body's substitutions expand AFTER the owning
+/// command's VAR=value assignments apply but BEFORE the command runs, so the
+/// body validates against `cmd_state` (the owning command's start state —
+/// pre-cd for `cd /tmp <<EOF`) PLUS `assignments` applied; marker-line words
+/// (arguments) and the marker-line redirect expand pre-assignment against
+/// plain `cmd_state`. A `|`-glued pipeline member forks WITH the command
+/// (pre-command `cmd_state`); `&&`/`||` tails run after it (`tail_state`).
 fn validate_heredoc<'a>(
     node: Node,
     w: &mut W<'a>,
     cmd_state: &mut ValidationState<'a>,
+    assignments: &[String],
     tail_state: &mut ValidationState<'a>,
 ) -> Result<(), String> {
+    let mut body_state = cmd_state.snapshot();
+    for a in assignments {
+        bind_assignment_word(a, &mut body_state);
+    }
     let mut cursor = node.walk();
     let children: Vec<Node> = node.children(&mut cursor).collect();
     let mut unquoted = true;
@@ -1159,12 +1194,17 @@ fn validate_heredoc<'a>(
             }
             "heredoc_end" => break,
             "file_redirect" => {
-                // A redirect on the marker line opens when the command runs —
-                // against the owning command's start state (pre-cd).
+                // A redirect on the marker line opens when the command starts
+                // — against the owning command's start state, before its
+                // VAR=value assignments apply (`TMPDIR=/etc cat <<EOF >
+                // "$TMPDIR/f"` opens $TMPDIR pre-assignment).
                 validate_file_redirect(*c, w, cmd_state)?;
             }
             "pipeline" => {
-                let mut snap = tail_state.snapshot();
+                // A `|`-glued member forks WITH the owning command (both run
+                // at pipeline start) — validate against the pre-command state
+                // (`cd /tmp <<EOF | rm f` runs rm in the pre-cd cwd).
+                let mut snap = cmd_state.snapshot();
                 walk_node(*c, w, &mut snap, WalkFlags::default(), Vec::new())?;
             }
             kind if is_commandish(kind) => {
@@ -1172,10 +1212,11 @@ fn validate_heredoc<'a>(
             }
             kind if is_wordish(kind) => {
                 // A word after the marker: same-line words are the owning
-                // command's arguments — their substitutions execute
-                // (`cat <<EOF "$(rm -rf /)"` runs the substitution); body-line
-                // words are parser glitches of body content — in unquoted
-                // bodies walk substitutions and minimal-scan the raw text
+                // command's arguments — their substitutions expand
+                // pre-assignment (`cat <<EOF "$(rm -rf /)"` runs the
+                // substitution); body-line words are parser glitches of body
+                // content — in unquoted bodies walk substitutions against the
+                // body state (post-assignment) and minimal-scan the raw text
                 // (backticks/`$(` execute there).
                 let marker_line = !seen_body
                     && seen_start
@@ -1184,7 +1225,7 @@ fn validate_heredoc<'a>(
                 if marker_line {
                     walk_word_substitutions(*c, w, cmd_state, WalkFlags::default())?;
                 } else if unquoted {
-                    walk_word_substitutions(*c, w, cmd_state, WalkFlags::default())?;
+                    walk_word_substitutions(*c, w, &mut body_state, WalkFlags::default())?;
                     minimal_body_scan(&node_text(*c, w))?;
                 }
             }
@@ -1208,7 +1249,7 @@ fn validate_heredoc<'a>(
                     | "process_substitution"
                     | "expansion"
                     | "arithmetic_expansion" => {
-                        let mut snap = cmd_state.snapshot();
+                        let mut snap = body_state.snapshot();
                         walk_word_substitutions(*bc, w, &mut snap, WalkFlags::default())?;
                     }
                     "heredoc_content" => minimal_body_scan(&node_text(*bc, w))?,
@@ -1695,11 +1736,16 @@ fn walk_declaration<'a>(
     w: &mut W<'a>,
     state: &mut ValidationState<'a>,
 ) -> Result<(), String> {
+    // Two passes mirroring bash: ALL substitutions expand before ANY
+    // assignment applies (`export MYTMP=/tmp x=$(echo $MYTMP)` expands with
+    // MYTMP unset), so every child's substitutions walk against the
+    // pre-binding state first, then the bindings apply in order.
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        // Substitutions in any child execute (`export x=$(rm -rf /)`,
-        // `declare -a arr=( $(rm -rf /) )`) — walk them before binding.
         walk_word_substitutions(child, w, state, WalkFlags::default())?;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
         match child.kind() {
             "variable_assignment" => {
                 let text = node_text(child, w);
@@ -5011,8 +5057,11 @@ mod tests {
 
     /// Substitutions in declaration/unset children execute and must be
     /// validated — `unset $(rm -rf /)`, `export x=$(rm -rf /)`, quoted and
-    /// array forms, and process substitutions all reject. Benign bindings
-    /// stay allowed.
+    /// array forms, and process substitutions all reject. Bash expands ALL
+    /// substitutions before ANY assignment applies, so an earlier binding
+    /// cannot mask a later substitution's unbound variable (`export MYTMP=/tmp
+    /// x=$(touch $MYTMP/f)` expands `$MYTMP` unset → `touch /f`). Benign
+    /// bindings stay allowed.
     #[test]
     fn declaration_unset_substitutions() {
         let cases = [
@@ -5024,6 +5073,10 @@ mod tests {
             ("declare -a arr=( $(rm -rf /) )", false),
             ("export x=<(rm -rf /)", false),
             ("X=$(rm -rf /)", false),
+            // Binding-ordering: earlier bindings do not leak into later
+            // substitution walks (bash expands with the pre-binding state).
+            ("export MYTMP=/tmp x=$(touch $MYTMP/f)", false),
+            ("export TMPDIR=/tmp x=$(touch $TMPDIR/f)", true),
             ("unset TMPDIR", true),
             ("export TMPDIR=/tmp", true),
             ("declare x=1", true),
@@ -5036,18 +5089,61 @@ mod tests {
     /// expand BEFORE the owning command runs (bash: `cd /tmp <<EOF` +
     /// `$(pwd)` prints the pre-cd cwd), so they validate against the command's
     /// start state — a cd-owning heredoc cannot smuggle workspace writes via
-    /// the post-cd cwd. The `&&`/`|` tail runs after the command: post-cd
-    /// temp writes stay allowed.
+    /// the post-cd cwd. The body also expands AFTER the command's VAR=value
+    /// assignments apply (marker-line words/redirects see the pre-assignment
+    /// value). A `|`-glued member forks at pipeline start (pre-command cwd);
+    /// the `&&`/`||` tail runs after the command (post-cd temp writes stay
+    /// allowed). Construct-owning redirects open at the construct's start,
+    /// before any inner command's cd.
     #[test]
     fn cd_owning_heredoc_state() {
         let cases = [
+            // Body/marker-line substitutions and the marker-line redirect
+            // expand before the owning command runs (pre-cd).
             ("cd /tmp <<EOF\n$(rm -rf .)\nEOF", false),
             ("cd /tmp <<EOF\n$(touch rel)\nEOF", false),
             ("cd /tmp <<EOF\n$(mkdir x)\nEOF", false),
             ("cd /tmp <<EOF\n$(rm -rf x)\nEOF", false),
             ("cd /tmp <<EOF\n$(echo hi > wsfile)\nEOF", false),
             ("cd /tmp <<EOF > rel\nbody\nEOF", false),
+            // A `|`-glued member forks WITH the command at pipeline start —
+            // `rm f` runs in the pre-cd (workspace) cwd.
+            ("cd /tmp <<EOF | rm f\nbody\nEOF", false),
+            ("cd /tmp <<EOF | touch /tmp/f\nbody\nEOF", true),
+            // Body substitutions see the owning command's VAR=value
+            // assignments (bash expands them after the assignment applies);
+            // marker-line words/redirects see the pre-assignment value.
+            ("TMPDIR=/etc cat <<EOF\n$(touch $TMPDIR/x)\nEOF", false),
+            ("TMPDIR=/tmp/xyzzy cat <<EOF\n$(touch $TMPDIR/x)\nEOF", true),
+            (
+                "cd /tmp && TMPDIR=/etc cat <<EOF\n$(touch $TMPDIR/x)\nEOF",
+                false,
+            ),
+            ("a | TMPDIR=/etc cat <<EOF\n$(touch $TMPDIR/x)\nEOF", false),
+            (
+                "TMPDIR=/tmp/xyzzy cat <<EOF > \"$TMPDIR/f\"\nbody\nEOF",
+                true,
+            ),
+            // Construct-owning redirects open at the CONSTRUCT's start (pre-
+            // internal-cd): `{ cd /tmp; cat; }` body expansions and `> f` run
+            // in the workspace.
+            ("{ cd /tmp; cat; } <<EOF\n$(rm -rf .)\nEOF", false),
+            ("{ cd /tmp; } <<EOF\n$(rm -rf .)\nEOF", false),
+            ("( cd /tmp; cat; ) <<EOF\n$(rm -rf .)\nEOF", false),
+            ("{ cd /tmp; cat; } <<EOF > rel\nbody\nEOF", false),
+            ("{ cd /tmp; cat; } > f", false),
+            (
+                "if true; then cd /tmp; touch f; fi <<EOF\n$(rm -rf .)\nEOF",
+                false,
+            ),
+            (
+                "for x in a; do cd /tmp; touch f; done <<EOF\n$(rm -rf .)\nEOF",
+                false,
+            ),
+            // Benign tails and bodies stay allowed.
             ("cd /tmp <<EOF && touch f\nbody\nEOF", true),
+            ("{ cat; } <<EOF\n$(echo hi > /tmp/out)\nEOF", true),
+            ("( cat; ) <<EOF\n$(echo hi)\nEOF", true),
             ("cat <<EOF\n$(echo hi > /tmp/out)\nEOF", true),
         ];
         run_cases(&cases);
