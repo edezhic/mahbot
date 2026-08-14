@@ -1546,13 +1546,8 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         )
     };
 
-    // Spawn the durable engineer round (single-slot roster) BEFORE the
-    // session write — the job is the resume handle across crashes AND
-    // graceful drains. The roster row carries the ACTUAL run agent id (the
-    // NULL-seat anchor) so the purge live-session protection and resume paths
-    // match the real session. The anchor itself (permanently-NULL seat) is
-    // upserted in the same window so the accumulated session
-    // `ticket_{id}_engineer` survives round-job deletion and the 8h purge.
+    // Spawn the durable engineer round (single-slot roster) BEFORE the round
+    // tail — the job is the resume handle across crashes AND graceful drains.
     let job_id = crate::generate_id();
     let Ok(_slot) = spawn_single_slot_round(
         &job_id,
@@ -1572,43 +1567,78 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         );
         return;
     };
+    run_engineer_round(&ticket, &ws, &job_id, &message, false).await;
+}
+
+/// Run the engineer round tail shared by fresh dispatch and boot resume.
+///
+/// The NULL-seat anchor (permanently-NULL `job_id`) is upserted FIRST so the
+/// accumulated session `ticket_{id}_engineer` survives round-job deletion and
+/// the 8h purge. The upsert is idempotent (partial unique index — single row
+/// per agent_id, job_id NULL): a crash between `spawn_single_slot_round` and
+/// the fresh-dispatch upsert (two adjacent awaits) would otherwise leave this
+/// round WITHOUT an anchor — after CASCADE the session loses TTL protection
+/// and the next bounce round loses S5 context.
+///
+/// Resume dispatch rule — session-non-emptiness discriminator: the check is
+/// "any session content", not "current round's task present". A crash between
+/// the anchor upsert and this round's session.init leaves the round's
+/// feedback undelivered (a non-empty prior round then dispatches an empty
+/// message). Narrow window, quality-only — accepted. Fresh dispatch always
+/// uses the rendered prompt.
+async fn run_engineer_round(
+    ticket: &Ticket,
+    ws: &Workspace,
+    job_id: &str,
+    task: &str,
+    resumed: bool,
+) {
     if let Err(e) = crate::jobs::upsert_engineer_anchor(
         &crate::session::store().conn,
         &ticket.id,
-        &message,
+        task,
         crate::jobs::RowStatus::Launched,
     )
     .await
     {
         warn!(
             ticket = %ticket.id,
+            job = %job_id,
             error = %e,
             "Failed to upsert engineer anchor — session continuity across bounces degraded",
         );
     }
 
-    // Register in the message router so comments can be delivered mid-work.
+    let agent_id = crate::jobs::engineer_anchor_id(&ticket.id);
     let incoming_rx = register_agent_and_assign(
         &ticket.id,
         &agent_id,
-        "Failed to persist assigned_to — stale agent already cancelled at dispatch, proceeding without DB assignment",
+        if resumed {
+            "Failed to persist assigned_to for resumed engineer — comments may not route"
+        } else {
+            "Failed to persist assigned_to — stale agent already cancelled at dispatch, proceeding without DB assignment"
+        },
     )
     .await;
 
+    let has_session = resumed && crate::session::store().has_content(&agent_id).await;
+    let message = if has_session {
+        String::new()
+    } else {
+        task.to_string()
+    };
     let (agent, response) = run_single_agent(
-        agent_id.clone(),
+        agent_id,
         Role::Engineer,
-        &ws,
-        &ticket,
+        ws,
+        ticket,
         &message,
         incoming_rx,
-        false,
+        resumed,
     )
     .await;
 
-    // Post-run guards (phase-moved, drain-cut, finalize) live in
-    // finalize_engineer_round.
-    finalize_engineer_round(&ticket, &agent, response.as_deref(), &job_id, false).await;
+    finalize_engineer_round(ticket, &agent, response.as_deref(), job_id, resumed).await;
 }
 
 /// Determine whether to notify immediately or buffer the Done transition.
@@ -1996,50 +2026,6 @@ async fn register_agent_and_assign(
     incoming_rx
 }
 
-/// Register a sanitation agent in the message router and persist the SAME
-/// job-derived agent ID in the ticket's `assigned_to`.
-///
-/// Returns the registered agent ID and its inbox receiver, ready for
-/// [`run_agent`].
-///
-/// # Why the stored ID must equal the registered ID
-///
-/// [`BoardStore::add_comment`] routes mid-work comments to the agent(s)
-/// listed in `assigned_to` via an exact-match lookup in the message router
-/// (`route_comment_to_agents` → `try_route`). [`BoardStore::claim_sanitation`]
-/// stores the **ticket**-derived base ID (`ticket_{ticket_id}_sanitation`) as a
-/// claim-time placeholder, but the run agent registers under a
-/// **job**-derived per-run ID (`ticket_{job_id}_sanitation`; each run starts
-/// a fresh session). Without this step the two never match and
-/// mid-run comments are silently dropped.
-///
-/// Setting `assigned_to` here — rather than only in `claim_sanitation` —
-/// also covers the re-dispatch path: after [`record_sanitation_failure`]
-/// clears `assigned_to`, retry runs would otherwise execute with
-/// `assigned_to = NULL` (comments unrouted AND the poll loop re-dispatching /
-/// cancelling the agent every cycle until the sanitation circuit breaker
-/// trips).
-///
-/// Delegates registration + assignment to [`register_agent_and_assign`].
-async fn register_sanitation_agent(
-    ticket_id: &str,
-    job_id: &str,
-) -> (
-    String,
-    tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>,
-) {
-    let agent_id = format!("ticket_{job_id}_sanitation");
-
-    let incoming_rx = register_agent_and_assign(
-        ticket_id,
-        &agent_id,
-        "Failed to persist assigned_to for sanitation agent — mid-run comments may not route",
-    )
-    .await;
-
-    (agent_id, incoming_rx)
-}
-
 /// Absorb the post-run tail shared by dispatch and resume: the phase/drain
 /// guards, the response-None failure block, verdict extraction with error
 /// handling, and the job terminalization. Guards: phase-moved → complete job
@@ -2185,26 +2171,56 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         );
         return;
     };
+    run_sanitation_round(&ticket, &ws, &job_id, &prompt, false).await;
+}
 
-    // Register in the message router AND persist the same job-derived agent ID
-    // in assigned_to so mid-run comments route to this agent (see
-    // register_sanitation_agent for the contract and ordering invariant).
-    let (agent_id, incoming_rx) = register_sanitation_agent(&ticket.id, &job_id).await;
-
-    let (agent, response) = run_single_agent(
-        agent_id,
-        Role::Sanitation,
-        &ws,
-        &ticket,
-        &prompt,
-        incoming_rx,
-        false,
+/// Run the sanitation round tail shared by fresh dispatch and boot resume.
+///
+/// Agent ID is job-derived (`ticket_{job_id}_sanitation`): derived FIRST as a
+/// pure function of job_id, then registered (router + `assigned_to`), then
+/// the session-non-emptiness discriminator is read — the session-store read
+/// and router registration are independent (benign ordering). The register
+/// overwrites the claim-time placeholder (`ticket_{ticket_id}_sanitation`)
+/// with the job-derived run ID so mid-run comments route to the actual agent
+/// (and covers the re-dispatch path after [`record_sanitation_failure`]
+/// clears `assigned_to`).
+///
+/// Resume dispatch rule: existing session → empty message (no duplicate
+/// task-prompt append); missing session → stored task re-dispatched. Fresh
+/// dispatch always uses the rendered prompt.
+async fn run_sanitation_round(
+    ticket: &Ticket,
+    ws: &Workspace,
+    job_id: &str,
+    task: &str,
+    resumed: bool,
+) {
+    let agent_id = format!("ticket_{job_id}_sanitation");
+    let incoming_rx = register_agent_and_assign(
+        &ticket.id,
+        &agent_id,
+        "Failed to persist assigned_to for sanitation agent — mid-run comments may not route",
     )
     .await;
 
-    // Post-run guards (phase-moved, drain-cut, finalize) live in
-    // finalize_sanitation_round.
-    finalize_sanitation_round(&ticket, &agent, response.as_deref(), &job_id, false).await;
+    let has_session = resumed && crate::session::store().has_content(&agent_id).await;
+    let message = if has_session {
+        String::new()
+    } else {
+        task.to_string()
+    };
+    let (agent, response) = run_single_agent(
+        agent_id,
+        Role::Sanitation,
+        ws,
+        ticket,
+        &message,
+        incoming_rx,
+        resumed,
+    )
+    .await;
+
+    finalize_sanitation_round(ticket, &agent, response.as_deref(), job_id, resumed).await;
 }
 
 /// Process the result of a sanitation agent inspection.
@@ -4344,55 +4360,8 @@ async fn resume_engineer_round(job_id: &str, ticket: Ticket, ws: Workspace) {
     if bail_if_phase_moved(&ticket.id, TicketPhase::InDevelopment, job_id).await {
         return;
     }
-    // Idempotent anchor (re)upsert at the START: a crash between
-    // spawn_single_slot_round and the fresh-dispatch upsert (two adjacent
-    // awaits) leaves this round WITHOUT a NULL-seat anchor — after CASCADE the
-    // accumulated session `ticket_{id}_engineer` would lose TTL protection and
-    // the next bounce round would lose S5 context. The partial unique index
-    // makes the upsert idempotent (single row per agent_id, job_id NULL).
     let task = job_task(job_id).await;
-    if let Err(e) = crate::jobs::upsert_engineer_anchor(
-        &crate::session::store().conn,
-        &ticket.id,
-        &task,
-        crate::jobs::RowStatus::Launched,
-    )
-    .await
-    {
-        warn!(
-            ticket = %ticket.id,
-            job = %job_id,
-            error = %e,
-            "Resume: failed to upsert engineer anchor — session continuity degraded",
-        );
-    }
-    let anchor_id = crate::jobs::engineer_anchor_id(&ticket.id);
-    let incoming_rx = register_agent_and_assign(
-        &ticket.id,
-        &anchor_id,
-        "Failed to persist assigned_to for resumed engineer — comments may not route",
-    )
-    .await;
-
-    // Session-non-emptiness discriminator (resume dispatch rule). The check is
-    // "any session content", not "current round's task present": a crash
-    // between the anchor upsert and this round's session.init leaves the
-    // round's feedback undelivered (a non-empty prior round then dispatches an
-    // empty message). Narrow window, quality-only — accepted.
-    let has_session = crate::session::store().has_content(&anchor_id).await;
-    let message = if has_session { String::new() } else { task };
-    let (agent, response) = run_single_agent(
-        anchor_id.clone(),
-        Role::Engineer,
-        &ws,
-        &ticket,
-        &message,
-        incoming_rx,
-        true,
-    )
-    .await;
-
-    finalize_engineer_round(&ticket, &agent, response.as_deref(), job_id, true).await;
+    run_engineer_round(&ticket, &ws, job_id, &task, true).await;
 }
 
 /// Resume a sanitation round: resume the job-derived agent session (empty
@@ -4402,24 +4371,8 @@ async fn resume_sanitation_round(job_id: &str, ticket: Ticket, ws: Workspace) {
     if bail_if_phase_moved(&ticket.id, TicketPhase::InSanitation, job_id).await {
         return;
     }
-    let (agent_id, incoming_rx) = register_sanitation_agent(&ticket.id, job_id).await;
-    let has_session = crate::session::store().has_content(&agent_id).await;
-    let message = if has_session {
-        String::new()
-    } else {
-        job_task(job_id).await
-    };
-    let (agent, response) = run_single_agent(
-        agent_id,
-        Role::Sanitation,
-        &ws,
-        &ticket,
-        &message,
-        incoming_rx,
-        true,
-    )
-    .await;
-    finalize_sanitation_round(&ticket, &agent, response.as_deref(), job_id, true).await;
+    let task = job_task(job_id).await;
+    run_sanitation_round(&ticket, &ws, job_id, &task, true).await;
 }
 
 /// Read a job's stored task (the FINAL rendered prompt template).

@@ -1657,9 +1657,9 @@ async fn handle_qa_passed_untracked_files_to_insanitation() {
 /// The board routes mid-work comments to the exact ID stored in
 /// `assigned_to` (`route_comment_to_agents` → `try_route`).
 /// [`BoardStore::claim_sanitation`] stores the unsuffixed base ID as a
-/// placeholder; [`register_sanitation_agent`] must overwrite it with the
-/// suffixed ID the run actually registers, otherwise comments are silently
-/// dropped for the whole phase.
+/// placeholder; [`register_agent_and_assign`] (called by `run_sanitation_round`)
+/// must overwrite it with the suffixed ID the run actually registers,
+/// otherwise comments are silently dropped for the whole phase.
 ///
 /// This test exercises the register+assign scaffolding directly (no LLM
 /// involved — `dispatch_sanitation` itself would invoke a real provider) and
@@ -1674,7 +1674,15 @@ async fn sanitation_register_persists_registered_id() {
     let ws = test_ws_named("/tmp/test_san_register", "ws_san_register");
     let ticket_id = make_ticket(board(), &ws, "San Register", TicketPhase::InSanitation).await;
 
-    let (agent_id, mut rx) = register_sanitation_agent(&ticket_id, "test-job").await;
+    // Mirror the run_sanitation_round scaffolding: job-derived agent ID first,
+    // then register + persist the same ID in assigned_to.
+    let agent_id = format!("ticket_test-job_sanitation");
+    let mut rx = register_agent_and_assign(
+        &ticket_id,
+        &agent_id,
+        "Failed to persist assigned_to for sanitation agent — mid-run comments may not route",
+    )
+    .await;
 
     // The stored ID must be exactly the ID registered in the router — the
     // mismatch that broke comment routing.
@@ -1712,7 +1720,7 @@ async fn sanitation_register_persists_registered_id() {
 /// `claim_sanitation` placeholder) does NOT match the suffixed agent ID a
 /// sanitation run registers — comments are silently dropped.
 ///
-/// This is the regression the fix eliminates: [`register_sanitation_agent`]
+/// This is the regression the fix eliminates: [`register_agent_and_assign`]
 /// overwrites the placeholder with the registered suffixed ID so routing
 /// matches. The negative assertion guards against someone "simplifying" the
 /// fix by dropping the suffix instead (which would regress per-run session
