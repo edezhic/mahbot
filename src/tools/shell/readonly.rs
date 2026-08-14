@@ -764,10 +764,19 @@ fn walk_command<'a>(
     words.append(&mut extras);
 
     // Substitutions execute BEFORE this command's own env bindings (bash
-    // expands them with the shell's current variables).
+    // expands them with the shell's current variables). A `time`-prefixed
+    // command's grammar also allows a subshell operand as a child (`time
+    // ( rm -rf ./x )`) — it runs in a child shell, so validate it against a
+    // snapshot (`time ( cd /tmp && cat > out )` allows the temp write inside
+    // the subshell).
     let mut cursor = cmd.walk();
     for child in cmd.children(&mut cursor) {
-        walk_word_substitutions(child, w, state, flags)?;
+        if child.kind() == "subshell" {
+            let mut snap = state.snapshot();
+            walk_node(child, w, &mut snap, WalkFlags::default(), Vec::new())?;
+        } else {
+            walk_word_substitutions(child, w, state, flags)?;
+        }
     }
     for a in &assignments {
         check_git_env_binding(a)?;
@@ -824,11 +833,24 @@ fn check_words(
         handle_eval_body(&words[verb_idx + 1..], state)?;
         return Ok(());
     }
-    // Reserved words at command position are stray terminators — bash rejects
-    // them as syntax errors; fail closed rather than treat them as commands.
+    // Reserved words at command position: genuine stray terminators — bash
+    // rejects them as syntax errors; fail closed rather than treat them as
+    // commands. `{`/`}` are brace-group openers/closers whose group the
+    // grammar flattened into a plain command (`time { rm f; }` parses the
+    // group's words as the command's, and a stray `}` command follows) —
+    // bash accepts the group and runs its body, so it must not fall through
+    // as an unmodeled command either.
+    if matches!(verb, "{" | "}") {
+        let cmd = originals.join(" ");
+        return reject(
+            &cmd,
+            "a brace group (`{ ...; }`) could not be parsed as a construct here — rejected fail-closed rather than validate its flattened words.",
+            "write the command without the brace group, or quote it if it is meant as an argument.",
+        );
+    }
     if matches!(
         verb,
-        "}" | ")" | "fi" | "done" | "esac" | "then" | "do" | "elif" | "else" | ";;" | ";&" | ";;&"
+        ")" | "fi" | "done" | "esac" | "then" | "do" | "elif" | "else" | ";;" | ";&" | ";;&"
     ) {
         let cmd = originals.join(" ");
         return reject(
@@ -963,8 +985,15 @@ fn walk_redirected<'a>(
     walk_body(body, w, state, flags, extra)?;
 
     let mut redirect_state = w.last_start.snapshot();
-    let (mut assignments, assignment_only) = owning_command(body)
-        .map_or_else(|| (Vec::new(), false), |n| owning_command_assignments(n, w));
+    // A `!`-negated body demotes a leading `time` to the external command
+    // (its args never bind before the body expands); condition/case-arm heads
+    // do the same — pass the walk flags so the owner's prefix scan matches
+    // the verb resolution.
+    let owner_negated = flags.negated || flags.time_external || body.kind() == "negated_command";
+    let (mut assignments, assignment_only) = owning_command(body).map_or_else(
+        || (Vec::new(), false),
+        |n| owning_command_assignments(n, w, owner_negated),
+    );
     if assignment_only {
         // An assignment-only command applies its bindings to the current shell
         // BEFORE the heredoc body expands and BEFORE its redirect opens —
@@ -1012,16 +1041,18 @@ fn owning_command(body: Node) -> Option<Node> {
 
 /// The env assignments of the redirect's owning command, and whether it is an
 /// assignment-only command. `NAME=value` text of an assignment-only command,
-/// or the `VAR=val` prefix words of a simple command. Under `time` — whose
-/// operand is a full command list — assignments parse as plain words
-/// (`time TMPDIR=/etc cat`) yet bind before the heredoc body expands, so they
-/// are collected from the word list too. A `time`-wrapped command whose timed
-/// operand is only assignments is assignment-only (`time TMPDIR=/etc <<EOF`
-/// opens its redirect after the binding). After `command`/`builtin` a
+/// or the `VAR=val` prefix words of a simple command. Under a FORWARDING
+/// keyword-`time` — whose operand is a full command list — assignments parse
+/// as plain words (`time TMPDIR=/etc cat`) yet bind before the heredoc body
+/// expands, so they are collected from the word list too; quoted `"time"`, a
+/// `!`-negated list (`! time ...` — `negated`), and a nested `time time` are
+/// the external command whose args never bind. A `time`-wrapped command whose
+/// timed operand is only assignments is assignment-only (`time TMPDIR=/etc
+/// <<EOF` opens its redirect after the binding). After `command`/`builtin` a
 /// `FOO=bar` word is the command NAME and never binds. Construct owners
 /// cannot take an assignment prefix (`VAR=val { ...; }` is a bash syntax
 /// error) — none.
-fn owning_command_assignments(owner: Node, w: &W) -> (Vec<String>, bool) {
+fn owning_command_assignments(owner: Node, w: &W, negated: bool) -> (Vec<String>, bool) {
     match owner.kind() {
         "variable_assignment" => (vec![node_text(owner, w)], true),
         "variable_assignments" => (
@@ -1034,13 +1065,16 @@ fn owning_command_assignments(owner: Node, w: &W) -> (Vec<String>, bool) {
         ),
         "command" => {
             let (words, mut assignments) = collect_command_words(owner, w);
+            let word_refs: Vec<&str> = words.iter().map(String::as_str).collect();
             let mut assignment_only = true;
             let mut i = 0;
             // Leading env assignments parse as variable_assignment nodes
             // (already collected); `time`'s operand is a full command list, so
             // its env assignments parse as plain words yet bind before the
-            // heredoc body expands — collect them. After `command`/`builtin`
-            // a `FOO=bar` word is the command NAME — nothing after binds.
+            // heredoc body expands — collect them. Only a FORWARDING
+            // keyword-`time` collects (external `time` passes its args to a
+            // child — nothing binds). After `command`/`builtin` a `FOO=bar`
+            // word is the command NAME — nothing after binds.
             while i < words.len() {
                 let unquoted = scan::strip_outer_quotes(&words[i]).map_or("", |(c, _)| c);
                 match unquoted {
@@ -1049,22 +1083,21 @@ fn owning_command_assignments(owner: Node, w: &W) -> (Vec<String>, bool) {
                         break;
                     }
                     "time" => {
-                        i += 1;
-                        // `time` takes at most one unquoted `-p`, then the
-                        // timed command, which may be `!`-negated.
-                        if words.get(i).is_some_and(|o| o == "-p") {
+                        let Some(past) = consume_time_prefix(&word_refs, i, negated) else {
+                            assignment_only = false;
+                            break;
+                        };
+                        i = past;
+                        // The timed operand is a full command list: its head
+                        // may carry a single `!` negation (`time ! FOO=bar cat`
+                        // binds FOO=bar before the body expands), then env
+                        // assignments.
+                        if words.get(i).is_some_and(|o| o == "!") {
                             i += 1;
                         }
-                        loop {
-                            while words.get(i).is_some_and(|o| super::is_env_assignment(o)) {
-                                assignments.push(words[i].clone());
-                                i += 1;
-                            }
-                            if words.get(i).is_some_and(|o| o == "!") {
-                                i += 1;
-                                continue;
-                            }
-                            break;
+                        while words.get(i).is_some_and(|o| super::is_env_assignment(o)) {
+                            assignments.push(words[i].clone());
+                            i += 1;
                         }
                     }
                     _ => {
@@ -2718,7 +2751,10 @@ enum VerbResolution<'a> {
 ///   child). Quoted `"time"`, an env assignment or `command`/`builtin`
 ///   before it, a nested `time time`, or `! time` all resolve to the
 ///   external `time` command — its timed command runs in a child, so the
-///   guard must not track a cwd the shell does not reach. At most one
+///   guard must not track a cwd the shell does not reach. The timed operand
+///   is a full command list whose head may carry a single `!` negation
+///   (`time ! cmd` runs cmd negated in the CURRENT shell — bash-verified;
+///   the cd still propagates) before its env assignments. At most one
 ///   UNQUOTED `-p` follows (a quoted `"-p"` is the timed command, not an
 ///   option); any further word (including `--`, a second `-p`, or `-v`) IS
 ///   the timed command, and a `-`-prefixed one does not exist → informational.
@@ -2808,21 +2844,19 @@ fn resolve_verb<'a>(words: &[&'a str], negated: bool) -> VerbResolution<'a> {
                 // a child, so the real CWD never changes and tracking would
                 // approve a chained write that lands in the workspace
                 // (fail-closed: return it as a verb).
-                if i != 0 || w != "time" || negated {
+                let Some(past) = consume_time_prefix(words, i, negated) else {
                     return VerbResolution::Verb {
                         idx: i,
                         class: classify_verb_word(w),
                     };
-                }
+                };
                 // `time` consumes at most one `-p`, matched on the RAW word:
                 // keyword parsing treats a quoted `"-p"` as the timed command
                 // (`-p: command not found`, nothing executes), not as the
                 // option. Anything after the option is the timed command; a
                 // `-`-prefixed one does not exist (`time -p -p` → `-p:
                 // command not found`), so nothing executes.
-                if opts.first().is_some_and(|o| *o == "-p") {
-                    j += 1;
-                }
+                j = past - (i + 1);
                 if opts.get(j).is_some_and(|o| {
                     let oq = scan::strip_outer_quotes(o).map_or("", |(c, _)| c);
                     oq.starts_with('-') && oq.len() > 1
@@ -2841,16 +2875,38 @@ fn resolve_verb<'a>(words: &[&'a str], negated: bool) -> VerbResolution<'a> {
         }
         // The forwarded verb may itself be a forwarding prefix — continue the
         // loop so composed prefixes resolve to the real verb. Only `time`
-        // takes a full command list, so env assignments are valid again there
-        // (`time FOO=bar cd /tmp` runs the cd); after `command`/`builtin` the
-        // next word is the command name and must NOT be skipped.
+        // takes a full command list, so a leading `!` negation (its operand is
+        // a pipeline, bash-verified: `time ! cmd` runs cmd negated in the
+        // current shell) and env assignments are valid again there (`time
+        // FOO=bar cd /tmp` runs the cd); after `command`/`builtin` the next
+        // word is the command name and must NOT be skipped.
         i = idx;
         if unquoted == "time" {
+            if i < words.len() && words[i] == "!" {
+                i += 1;
+            }
             while i < words.len() && super::is_env_assignment(words[i]) {
                 i += 1;
             }
         }
     }
+}
+
+/// Consume a forwarding keyword-`time` prefix at `words[i]`, returning the
+/// index just past it (and its single optional unquoted `-p` option), or
+/// `None` when the word is the external `time` command: quoted `"time"`, an
+/// env assignment or `!` negation before it, a `command`/`builtin` before it,
+/// or a nested `time time` — only the raw unquoted word `time` as the first
+/// token of the full segment is the keyword.
+fn consume_time_prefix(words: &[&str], i: usize, negated: bool) -> Option<usize> {
+    if i != 0 || words.get(i) != Some(&"time") || negated {
+        return None;
+    }
+    let mut j = i + 1;
+    if words.get(j) == Some(&"-p") {
+        j += 1;
+    }
+    Some(j)
 }
 
 /// Classify a verb word as provably literal or unprovable.
@@ -5351,7 +5407,11 @@ mod tests {
             // Assignment-only time owners open the marker-line redirect
             // post-binding.
             ("time TMPDIR=/etc <<EOF > \"$TMPDIR/f\"\nbody\nEOF", false),
-            // A negated construct owner binds at the construct's start.
+            // `! { ...; }` parses broken (negated_command swallows `! { cd
+            // /tmp`; `cat` and `} <<EOF` become separate top-level commands)
+            // — the rejection comes from the stray `}`/`{` reserved-word
+            // checks, not construct-state binding; bash runs the body at the
+            // construct's start (workspace).
             ("! { cd /tmp; cat; } <<EOF\n$(rm -rf .)\nEOF", false),
             // Benign temp-bound forms stay allowed.
             (
@@ -8074,6 +8134,62 @@ mod tests {
             ),
         ];
 
+        run_cases(&cases);
+    }
+
+    /// `time`-prefixed operands that are not simple commands still execute and
+    /// must be validated (all bash-verified): a `!`-negated operand runs in
+    /// the CURRENT shell (`time ! rm f` deletes; `time ! cd /tmp` propagates
+    /// the cd), and a subshell/arithmetic operand runs in a child (`time
+    /// ( rm f )`) — the grammar's `command` production allows the subshell as
+    /// a child node, which the walker dispatches via walk_node. External-time
+    /// forms never bind their args: quoted `"time"` and `! time` leave the
+    /// heredoc body on the baseline TMPDIR (safe-direction fixes), while the
+    /// leading-assignment form (`TMPDIR=/etc time cat`) still binds (bash
+    /// applies the command's assignment prefix to the body expansion) and
+    /// `time FOO=bar ! cmd` binds FOO for the body even though `!` as a
+    /// command errors. `VAR=val time ! cmd` is over-rejected: external time
+    /// fails on the `!` operand (nothing executes).
+    #[test]
+    fn time_prefixed_non_simple_operands() {
+        let cases = [
+            // `!`-negated timed operands run in the current shell.
+            ("time ! rm -rf ./x", false),
+            ("time ! touch f", false),
+            ("time -p ! rm -rf ./x", false),
+            // A second `!` is a bash syntax error — over-rejection is safe.
+            ("time ! ! rm -rf ./x", false),
+            // Bash runs external time on the `!` operand — nothing executes.
+            ("VAR=val time ! rm -rf ./x", false),
+            ("time ! echo hi", true),
+            ("time ! cd /tmp && cat > f", true),
+            // Subshell operands run in a child shell.
+            ("time ( rm -rf ./x )", false),
+            ("time ( git commit -m test )", false),
+            ("time ( ( rm -rf ./x ) )", false),
+            ("time ( rm -rf ./x ) | cat", false),
+            ("time ( rm -rf ./x ) <<EOF\nbody\nEOF", false),
+            ("time (( i = $(rm -rf ./x) ))", false),
+            ("time ( echo hi )", true),
+            ("time ( cd /tmp && touch f )", true),
+            // External time never binds its args before the body expands.
+            (
+                "\"time\" TMPDIR=/etc cat <<EOF\n$(touch $TMPDIR/x)\nEOF",
+                true,
+            ),
+            (
+                "! time TMPDIR=/etc cat <<EOF\n$(touch $TMPDIR/x)\nEOF",
+                true,
+            ),
+            // The leading assignment before external time binds for the body.
+            ("TMPDIR=/etc time cat <<EOF\n$(touch $TMPDIR/x)\nEOF", false),
+            // FOO binds for the body even though `!` as a command errors.
+            ("time FOO=/etc ! touch f <<EOF\n$(touch $FOO/x)\nEOF", false),
+            // Flattened brace-group operands reject via the stray `{`/`}`
+            // reserved-word checks (bash-valid temp writes over-reject).
+            ("time { rm -rf ./x; }", false),
+            ("time { cat > /tmp/out; }", false),
+        ];
         run_cases(&cases);
     }
 }

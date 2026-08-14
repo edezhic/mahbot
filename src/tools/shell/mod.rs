@@ -40,6 +40,7 @@ pub(super) const SHELL_PREFIXES: &[&str] = &[
     ".",
     "sudo",
     "time",
+    "!",
     "command",
     "builtin",
     "env",
