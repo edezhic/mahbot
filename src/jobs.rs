@@ -231,13 +231,12 @@ pub(crate) enum SpawnChild {
     Ask { question: String },
     /// research_jobs (id, question, stage, round_index, budget_spent, state).
     Research { question: String },
-    /// ticket_stage_jobs (id, ticket_id, stage, phase, round, review_base).
+    /// ticket_stage_jobs (id, ticket_id, stage, phase, round).
     TicketStage {
         ticket_id: String,
         stage: String,
         phase: String,
         round: i64,
-        review_base: Option<i64>,
     },
 }
 
@@ -323,19 +322,17 @@ pub(crate) async fn spawn_job(
             stage,
             phase,
             round,
-            review_base,
         } => {
             tx.execute(
                 "INSERT INTO ticket_stage_jobs \
-                 (id, ticket_id, stage, phase, round, review_base, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                 (id, ticket_id, stage, phase, round, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
                 params![
                     id,
                     ticket_id.clone(),
                     stage.clone(),
                     phase.clone(),
                     round,
-                    review_base,
                     now.clone()
                 ],
             )

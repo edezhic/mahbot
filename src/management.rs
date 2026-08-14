@@ -34,8 +34,7 @@ use crate::agent::{RETRY_EXHAUSTION_MARKER, run_agent};
 use crate::board::{BOARD, BoardStore, PipelineCheck, Ticket, TicketComment, TicketPhase};
 use crate::git_commands::{
     has_unstaged_changes, list_new_or_untracked_files, parse_new_files_from_porcelain,
-    run_git_add_all, run_git_command, run_git_diff_numstat, run_git_head, run_git_status,
-    run_git_write_tree,
+    run_git_add_all, run_git_diff_stats, run_git_head, run_git_status, run_git_write_tree,
 };
 use crate::jobs::ResumableStage;
 use crate::message_router;
@@ -3119,7 +3118,6 @@ async fn spawn_ticket_stage_round(
     role: Role,
     prompt: &str,
     count: usize,
-    review_base: Option<i64>,
 ) -> anyhow::Result<(String, Vec<TicketStageSlot>)> {
     let job_id = crate::generate_id();
     let suffix = crate::generate_suffix();
@@ -3174,7 +3172,6 @@ async fn spawn_ticket_stage_round(
             stage: stage.to_string(),
             phase: phase.as_ref().to_string(),
             round,
-            review_base,
         },
     )
     .await?;
@@ -3226,7 +3223,6 @@ async fn spawn_single_slot_round(
             stage: stage.to_string(),
             phase: phase.as_ref().to_string(),
             round: next_ticket_stage_round(&crate::session::store().conn, &ticket.id, stage).await,
-            review_base: None,
         },
     )
     .await?;
@@ -3423,7 +3419,6 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
         Role::Analyst,
         &message,
         DEFAULT_PARALLEL_AGENT_COUNT,
-        None,
     )
     .await
     else {
@@ -4151,92 +4146,51 @@ async fn compute_review_skip(ticket: &Ticket, repo_path: &Path) -> anyhow::Resul
     ))
 }
 
-/// Gather the working-tree churn signals at review dispatch: total churn,
-/// max per-file churn, and added-file count (staged new files + untracked).
-/// The diff is computed against HEAD — no commit for this ticket exists yet
-/// (DB line stats are populated only at final done).
-async fn working_tree_churn(repo_path: &Path) -> anyhow::Result<(i64, i64, usize)> {
-    let entries = run_git_diff_numstat(repo_path, &["HEAD"]).await?;
-    let mut total: i64 = 0;
-    let mut max_per_file: i64 = 0;
-    for e in &entries {
-        let file_churn = e.additions.unwrap_or(0) + e.deletions.unwrap_or(0);
-        total += file_churn;
-        max_per_file = max_per_file.max(file_churn);
-    }
-    let added_staged = run_git_command(
-        repo_path,
-        &["diff", "HEAD", "--diff-filter=A", "--name-only"],
-    )
-    .await?
-    .lines()
-    .filter(|l| !l.trim().is_empty())
-    .count();
-    let porcelain = run_git_status(repo_path).await?;
-    let untracked = porcelain.lines().filter(|l| l.starts_with("??")).count();
-    Ok((total, max_per_file, added_staged + untracked))
+/// Gather the working-tree churn at review dispatch: total added + deleted
+/// lines vs HEAD, including lines from new files (staged new files appear in
+/// the diff; untracked files are enumerated and counted too). The diff is
+/// computed against HEAD — no commit for this ticket exists yet (DB line
+/// stats are populated only at final done).
+async fn working_tree_churn(repo_path: &Path) -> anyhow::Result<i64> {
+    let (added, removed) = run_git_diff_stats(repo_path).await?;
+    Ok(added + removed)
 }
 
 /// Compute the reviewer count for a review round.
 ///
-/// The base is computed from the ORIGINAL first-dispatch signals and frozen
-/// on the ticket (`review_base_count`); later rounds reuse it so rework-grown
-/// diffs cannot escalate reviewer counts. Bounced tickets get a flat +1
-/// (capped at 4). QA never passes through here (fixed 1).
+/// The base is recomputed from the LIVE working-tree diff at every review
+/// round dispatch — rework-grown diffs can escalate reviewer counts across
+/// rounds (2 → 3 → 4), which is intended. Bounces do not change the count.
+/// QA never passes through here (fixed 1).
 ///
 /// Shadow instrumentation: the counterfactual signals are logged at info
 /// level so the formula can be validated against a cohort after launch.
-///
-/// Returns `(count, base_to_freeze)`: the count for this round and the base to
-/// persist on the ticket — `None` when the ticket already carries a frozen
-/// base. The caller freezes AFTER the round actually dispatched (phase
-/// re-check passed) so a false-start dispatch never freezes a base computed
-/// from a diff that was never reviewed.
-async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> (usize, Option<i64>) {
+async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> usize {
     let low =
         i64::try_from(crate::joint_verdict::DEFAULT_REVIEW_COUNT_LOW_CHURN).unwrap_or(i64::MAX);
     let high =
         i64::try_from(crate::joint_verdict::DEFAULT_REVIEW_COUNT_HIGH_CHURN).unwrap_or(i64::MAX);
 
-    let (base, to_freeze) = if let Some(frozen) = ticket.review_base_count {
-        (usize::try_from(frozen).unwrap_or(3), None)
-    } else {
-        let (base, signals) = match working_tree_churn(repo_path).await {
-            Ok((total, max_per_file, added_files)) => (
-                crate::joint_verdict::review_base_from_signals(
-                    total,
-                    max_per_file,
-                    added_files,
-                    low,
-                    high,
-                ),
-                Some((total, max_per_file, added_files)),
-            ),
-            Err(e) => {
-                warn!(
-                    ticket = %ticket.id,
-                    error = %e,
-                    "Could not compute working-tree churn — reviewer base defaults to 3",
-                );
-                (3, None)
-            }
-        };
-        if let Some((total, max_per_file, added_files)) = signals {
+    match working_tree_churn(repo_path).await {
+        Ok(total) => {
+            let base = crate::joint_verdict::review_base_from_signals(total, low, high);
             info!(
                 ticket = %ticket.id,
                 total_churn = total,
-                max_per_file_churn = max_per_file,
-                added_files,
                 reviewer_base = base,
-                "Reviewer count calibration (shadow): base {base} from churn signals",
+                "Reviewer count calibration: base {base} from total churn",
             );
+            crate::joint_verdict::review_agent_count(base, ticket.priority)
         }
-        (base, Some(i64::try_from(base).unwrap_or(3)))
-    };
-
-    let count =
-        crate::joint_verdict::review_agent_count(base, ticket.priority, ticket.bounce_count > 0);
-    (count, to_freeze)
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Could not compute working-tree churn — reviewer base defaults to 3",
+            );
+            3
+        }
+    }
 }
 
 /// Resume a ticket_stage round at boot: re-run missing roster
@@ -4325,9 +4279,11 @@ async fn record_reviewed_base_after_review(
 }
 
 /// Resume a verifier round (review/QA): re-run missing slots, then re-process
-/// verdicts. REPLAY INCLUDES THE DISPATCH TAIL — set_review_base_count
-/// (ticket-level freeze) and the record_reviewed_base_after_review helper — or
-/// the review_base_count stays NULL and the skip-review gate never fires.
+/// verdicts. REPLAY INCLUDES THE DISPATCH TAIL — the
+/// record_reviewed_base_after_review helper — so the skip-review gate
+/// (tickets.reviewed_head/reviewed_tree) still fires on later rounds. The
+/// reviewer count is never frozen: it is recomputed from the live working-tree
+/// diff at every dispatch, so a resumed round re-derives it like any other.
 async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: VerifierInfo) {
     if bail_if_phase_moved(&ticket.id, vi.active_phase, job_id).await {
         return;
@@ -4356,33 +4312,7 @@ async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: 
         return;
     }
 
-    let (is_reviewer, _repo_path, git_available) = verifier_git_state(&ws, vi).await;
-
-    // Freeze the reviewer base count (ticket-level).
-    // The base was frozen on the ticket_stage_jobs row at spawn; the replay
-    // re-applies it to the tickets table so later rounds reuse the frozen
-    // base (the skip-review gate depends on it).
-    if is_reviewer {
-        let frozen: Option<i64> = crate::session::store()
-            .conn
-            .query_optional(
-                "SELECT review_base FROM ticket_stage_jobs WHERE id = ?1",
-                crate::turso::params![job_id],
-                |row| row.get::<i64>(0),
-            )
-            .await
-            .ok()
-            .flatten();
-        if let Some(base) = frozen
-            && let Err(e) = board().set_review_base_count(&ticket_arc.id, base).await
-        {
-            warn!(
-                ticket = %ticket_arc.id,
-                error = %e,
-                "Resume: failed to freeze reviewer base count on the ticket",
-            );
-        }
-    }
+    let (_is_reviewer, _repo_path, git_available) = verifier_git_state(&ws, vi).await;
 
     finalize_verifier_round(&ws, &ticket_arc, vi, &results, job_id, true, git_available).await;
 }
@@ -4538,11 +4468,11 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
     );
 
     let extraction_prompt = crate::prompt::load_prompt(vi.extraction_prompt_path);
-    let (count, base_to_freeze) = if is_reviewer {
+    let count = if is_reviewer {
         compute_reviewer_count(&ticket, repo_path).await
     } else {
         // QA calibration is infeasible from history — fixed at 1.
-        (QA_PARALLEL_AGENT_COUNT, None)
+        QA_PARALLEL_AGENT_COUNT
     };
     let verifier_label = if count == 1 { "verifier" } else { "verifiers" };
     info!(
@@ -4554,9 +4484,7 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
     );
 
     // Spawn the durable verifier round (jobs + roster, one tx) BEFORE the
-    // agents' first session writes. review_base frozen on the job row at
-    // spawn — resume bypasses dispatch_verifiers, so the ticket-level freeze
-    // never fires on a resumed round.
+    // agents' first session writes — the roster is the round record.
     let stage = if is_reviewer { "review" } else { "qa" };
     let Ok((job_id, slots)) = spawn_ticket_stage_round(
         &ticket,
@@ -4566,7 +4494,6 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
         vi.role,
         &prompt,
         count,
-        base_to_freeze,
     )
     .await
     else {
@@ -4588,20 +4515,6 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
     .await;
     if bail_if_phase_moved(&ticket.id, vi.active_phase, &job_id).await {
         return;
-    }
-
-    // Freeze the reviewer base only after the round actually dispatched (the
-    // phase re-check above passed) — a false-start dispatch (phase moved
-    // externally in the window) must not persist a base computed from a diff
-    // that was never reviewed. Later rounds reuse the frozen base.
-    if let Some(base) = base_to_freeze
-        && let Err(e) = board().set_review_base_count(&ticket.id, base).await
-    {
-        warn!(
-            ticket = %ticket.id,
-            error = %e,
-            "Failed to freeze reviewer base count — later rounds may re-derive it",
-        );
     }
 
     finalize_verifier_round(&ws, &ticket, vi, &results, &job_id, false, git_available).await;

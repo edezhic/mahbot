@@ -28,8 +28,8 @@ use crate::{ChatMessage, ChatRequest, ChatRequestMeta, Role, Workspace};
 
 // ── Hardcoded review-count calibration defaults (no config surface) ──────
 
-pub(crate) const DEFAULT_REVIEW_COUNT_LOW_CHURN: u64 = 50;
-pub(crate) const DEFAULT_REVIEW_COUNT_HIGH_CHURN: u64 = 400;
+pub(crate) const DEFAULT_REVIEW_COUNT_LOW_CHURN: u64 = 300;
+pub(crate) const DEFAULT_REVIEW_COUNT_HIGH_CHURN: u64 = 1000;
 
 /// Maximum tolerated bounces before the ticket fails (the 11th bounce fails).
 pub(crate) const MAX_BOUNCES: usize = 10;
@@ -302,35 +302,25 @@ fn member_text(
 
 // ── Calibrated dynamic agent counts ─────────────────────────────────────
 
-/// Compute the reviewer-count base from the working-tree churn signals:
-/// 2 reviewers for low churn (with zero added files), 4 for high churn or
-/// any added file, 3 otherwise. Never 1.
+/// Compute the reviewer-count base from total working-tree churn (added +
+/// deleted lines, including lines of new files): 2 for churn ≤ low, 4 for
+/// churn ≥ high, 3 otherwise. Never 1.
 #[must_use]
-pub(crate) fn review_base_from_signals(
-    total_churn: i64,
-    max_per_file_churn: i64,
-    added_files: usize,
-    low_churn: i64,
-    high_churn: i64,
-) -> usize {
-    if total_churn < low_churn && max_per_file_churn < low_churn && added_files == 0 {
+pub(crate) fn review_base_from_signals(total_churn: i64, low_churn: i64, high_churn: i64) -> usize {
+    if total_churn <= low_churn {
         2
-    } else if total_churn >= high_churn || max_per_file_churn >= high_churn || added_files > 0 {
+    } else if total_churn >= high_churn {
         4
     } else {
         3
     }
 }
 
-/// Compute the reviewer count for a review round from a base (computed from
-/// the ORIGINAL dispatch signals and frozen, or re-derived). Bounced tickets
-/// get a flat +1 (capped at 4) — never re-computed upward after bounces,
-/// preventing escalation loops. Priority-0 tickets never get 2 (floor 3).
+/// Apply the P0 floor: priority-0 tickets never get 2 reviewers (floor 3).
+/// Bounces do not change the count.
 #[must_use]
-pub(crate) fn review_agent_count(base: usize, priority: i64, bounced_before: bool) -> usize {
-    let count = if bounced_before { base + 1 } else { base };
-    let count = count.min(4);
-    if priority == 0 { count.max(3) } else { count }
+pub(crate) fn review_agent_count(base: usize, priority: i64) -> usize {
+    if priority == 0 { base.max(3) } else { base }
 }
 
 /// Whether a second batch of analysts is needed: the base dispatch (the

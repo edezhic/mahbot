@@ -535,8 +535,8 @@ impl BoardState {
                         }
                         // Manual "Redo Dev" (Reviewed → ReadyForDevelopment)
                         // is a bounce-back from review into development — it
-                        // must consume the same breaker budget and +1 reviewer
-                        // adjustment as pipeline bounce-backs.
+                        // must consume the same breaker budget as pipeline
+                        // bounce-backs.
                         if source == TicketPhase::Reviewed
                             && phase == TicketPhase::ReadyForDevelopment
                         {
@@ -1541,7 +1541,6 @@ mod tests {
             reviewed_tree: None,
             done_at: None,
             bounce_count: 0,
-            review_base_count: None,
         });
         state
     }
@@ -1727,7 +1726,6 @@ mod tests {
             reviewed_tree: None,
             done_at: None,
             bounce_count: 0,
-            review_base_count: None,
         };
         let _task = state.update(BoardMessage::TicketDetails(Box::new(ticket)));
 
@@ -1779,7 +1777,6 @@ mod tests {
             reviewed_tree: None,
             done_at: None,
             bounce_count: 0,
-            review_base_count: None,
         });
 
         // First Escape: focused → blur (clear flag), modal stays open
@@ -1920,7 +1917,6 @@ mod tests {
             reviewed_tree: None,
             done_at: None,
             bounce_count: 0,
-            review_base_count: None,
         }];
         state.search_generation = 5;
 
@@ -1978,7 +1974,6 @@ mod tests {
                 reviewed_tree: None,
                 done_at: None,
                 bounce_count: 0,
-                review_base_count: None,
             }],
             50,
         ));
@@ -2020,7 +2015,6 @@ mod tests {
                 reviewed_tree: None,
                 done_at: None,
                 bounce_count: 0,
-                review_base_count: None,
             }],
             42,
         ));
@@ -2057,7 +2051,6 @@ mod tests {
             reviewed_tree: None,
             done_at: None,
             bounce_count: 0,
-            review_base_count: None,
         }];
         state.search_generation = 7;
 

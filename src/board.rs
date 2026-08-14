@@ -82,8 +82,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     reviewed_head   TEXT,
     reviewed_tree   TEXT,
     done_at         TEXT,
-    bounce_count    INTEGER NOT NULL DEFAULT 0,
-    review_base_count INTEGER
+    bounce_count    INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS ticket_comments (
     id          TEXT PRIMARY KEY,
@@ -134,7 +133,6 @@ crate::columns! {
         REVIEWED_TREE          => "reviewed_tree",
         DONE_AT                => "done_at",
         BOUNCE_COUNT           => "bounce_count",
-        REVIEW_BASE_COUNT      => "review_base_count",
     }
 }
 
@@ -327,13 +325,8 @@ pub struct Ticket {
     /// ticket leaves Done. `None` for never-done or not-currently-done tickets.
     pub done_at: Option<String>,
     /// Number of times this ticket bounced back from review/QA into
-    /// development. Drives the bounce-based circuit breaker (max 10) and the
-    /// reviewer-count +1 adjustment.
+    /// development. Drives the bounce-based circuit breaker (max 10).
     pub bounce_count: i64,
-    /// Reviewer-count base computed from the ORIGINAL first-review dispatch
-    /// signals (working-tree churn at the first InReview round). Frozen so
-    /// rework-grown diffs cannot escalate reviewer counts on later rounds.
-    pub review_base_count: Option<i64>,
 }
 
 impl Ticket {
@@ -968,7 +961,6 @@ impl BoardStore {
             reviewed_tree: row.get(COL_TICKET_REVIEWED_TREE)?,
             done_at: row.get(COL_TICKET_DONE_AT)?,
             bounce_count: row.get(COL_TICKET_BOUNCE_COUNT)?,
-            review_base_count: row.get(COL_TICKET_REVIEW_BASE_COUNT)?,
         })
     }
 
@@ -1525,22 +1517,10 @@ impl BoardStore {
         }
     }
 
-    /// Freeze the reviewer-count base computed from the first-review dispatch
-    /// signals. Written once; later rounds reuse it so rework-grown diffs
-    /// cannot escalate reviewer counts (bounce adjustment is a flat +1).
-    pub(crate) async fn set_review_base_count(&self, ticket_id: &str, count: i64) -> Result<()> {
-        let prepared = Self::build_ticket_update_with_updated_at(
-            "review_base_count = ?",
-            vec![Value::from(count)],
-            ticket_id,
-        );
-        prepared.execute_no_cancel(&self.conn).await
-    }
-
     /// Manual "Redo Dev" bounce-back: transition a Reviewed ticket back to
     /// ReadyForDevelopment and increment its bounce counter atomically, so
-    /// manual bounce-backs consume the same breaker budget and +1 reviewer
-    /// adjustment as pipeline bounce-backs. Sets `pipeline_reservation` for
+    /// manual bounce-backs consume the same breaker budget as pipeline
+    /// bounce-backs. Sets `pipeline_reservation` for
     /// rework priority (matching pipeline bounce-backs). Cancels any
     /// registered agent only after the transition succeeds — a failed CAS
     /// guard (ticket moved externally) must not cancel a just-claimed agent.

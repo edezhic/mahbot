@@ -2318,8 +2318,8 @@ async fn dispatch_verifiers_skip_review_when_content_matches_base() {
 
     let (ws, ticket_id) = setup_ticket(
         repo_str,
-        "skip_review_base_test",
-        "Skip Review Base Test",
+        "skip_review_content_test",
+        "Skip Review Content Test",
         TicketPhase::InReview,
     )
     .await;

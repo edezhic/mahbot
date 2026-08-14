@@ -2230,7 +2230,6 @@ async fn test_ticket_roundtrip_all_fields() {
             reviewed_tree: None,
             done_at: None,
             bounce_count: 0,
-            review_base_count: None,
         },
     );
 
@@ -2294,7 +2293,6 @@ async fn test_ticket_roundtrip_all_fields() {
             reviewed_tree: Some("reviewed-tree-hash".into()),
             done_at: None,
             bounce_count: 0,
-            review_base_count: None,
         },
     );
 
@@ -2344,7 +2342,6 @@ async fn test_ticket_roundtrip_all_fields() {
             reviewed_tree: Some("reviewed-tree-hash".into()),
             done_at: None,
             bounce_count: 0,
-            review_base_count: None,
         },
     );
 }
@@ -2844,7 +2841,7 @@ async fn test_route_comment_to_agents_delivers_with_commenter_role() {
 
 /// Manual "Redo Dev" bounce-back transitions Reviewed → ReadyForDevelopment
 /// and increments the bounce counter atomically (so manual bounces consume
-/// the same breaker budget and +1 reviewer adjustment as pipeline bounces).
+/// the same breaker budget as pipeline bounces).
 #[tokio::test]
 async fn test_bounce_back_to_dev_transitions_and_increments_counter() {
     let (store, _tmp) = open_test_store().await;

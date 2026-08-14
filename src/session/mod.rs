@@ -351,7 +351,6 @@ CREATE TABLE IF NOT EXISTS ticket_stage_jobs (
     stage       TEXT NOT NULL,
     phase       TEXT NOT NULL,
     round       INTEGER NOT NULL,
-    review_base INTEGER,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );

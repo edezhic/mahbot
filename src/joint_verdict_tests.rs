@@ -788,29 +788,33 @@ async fn repair_rejects_empty_member_group() {
 
 #[test]
 fn review_base_from_signals_thresholds() {
-    // Low churn, no added files → 2.
-    assert_eq!(review_base_from_signals(10, 5, 0, 50, 400), 2);
-    // High churn → 4.
-    assert_eq!(review_base_from_signals(500, 10, 0, 50, 400), 4);
-    // Added files → 4 regardless of churn.
-    assert_eq!(review_base_from_signals(10, 5, 1, 50, 400), 4);
+    // Low churn (≤ 300) → 2.
+    assert_eq!(review_base_from_signals(10, 300, 1000), 2);
+    assert_eq!(
+        review_base_from_signals(300, 300, 1000),
+        2,
+        "boundary 300 is inclusive → 2"
+    );
+    // High churn (≥ 1000) → 4.
+    assert_eq!(
+        review_base_from_signals(1000, 300, 1000),
+        4,
+        "boundary 1000 is inclusive → 4"
+    );
+    assert_eq!(review_base_from_signals(1500, 300, 1000), 4);
     // Middle → 3.
-    assert_eq!(review_base_from_signals(60, 10, 0, 50, 400), 3);
+    assert_eq!(review_base_from_signals(301, 300, 1000), 3);
+    assert_eq!(review_base_from_signals(999, 300, 1000), 3);
 }
 
 #[test]
 fn review_agent_count_adjustments() {
-    assert_eq!(review_agent_count(2, 1, false), 2, "first round, no bounce");
-    assert_eq!(review_agent_count(2, 1, true), 3, "bounced before gets +1");
-    assert_eq!(review_agent_count(3, 1, true), 4, "bounce +1 from 3");
-    assert_eq!(review_agent_count(4, 1, true), 4, "capped at 4");
-    assert_eq!(review_agent_count(2, 0, false), 3, "P0 never gets 2");
-    assert_eq!(
-        review_agent_count(2, 0, true),
-        3,
-        "P0 floor 3 even with bounce"
-    );
-    assert_eq!(review_agent_count(3, 0, true), 4, "P0 with bounce from 3");
+    assert_eq!(review_agent_count(2, 1), 2, "normal ticket keeps base");
+    assert_eq!(review_agent_count(3, 1), 3, "no bounce adjustment");
+    assert_eq!(review_agent_count(4, 1), 4, "capped at 4");
+    assert_eq!(review_agent_count(2, 0), 3, "P0 never gets 2");
+    assert_eq!(review_agent_count(3, 0), 3, "P0 floor 3");
+    assert_eq!(review_agent_count(4, 0), 4, "P0 with base 4");
 }
 
 #[test]
