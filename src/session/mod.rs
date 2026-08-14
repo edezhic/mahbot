@@ -694,7 +694,7 @@ impl SessionStore {
         .await
     }
 
-    /// Like [`append`], but also sets session context in the same transaction.
+    /// Like [`batch_append`], but also sets session context in the same transaction.
     pub(crate) async fn append_with_context(
         &self,
         agent_id: &str,

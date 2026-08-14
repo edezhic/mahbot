@@ -7,10 +7,10 @@
 //!
 //! # Producer paths
 //!
-//! Three sources feed into [`route`]:
-//! - **User messages**: chat messages from users → enqueue via [`route_user_message`]
-//! - **Ticket notifications**: ticket transitions → enqueue
-//! - **AskTool results**: async sub-agent results → enqueue
+//! Jobs reach [`route`] from several producer paths — user chat messages via
+//! [`route_user_message`], ticket transitions, sub-agent results, boot-time
+//! pending-job replay, and dead-session recovery — and the router stays
+//! agnostic to the job's origin.
 //!
 //! # Agent ID formats
 //!
