@@ -2136,7 +2136,6 @@ mod tests {
         let entry = ChatHistoryEntry {
             id: 1,
             message_id: "msg-1".to_string(),
-            user_name: "alice".to_string(),
             content: "Hello **world**".to_string(),
             direction: ChatDirection::User,
             agent_role: None,
@@ -2158,7 +2157,6 @@ mod tests {
         let entry = ChatHistoryEntry {
             id: 42,
             message_id: "divider-1".to_string(),
-            user_name: "alice".to_string(),
             content: "2026-07-17T20:30:00Z".to_string(),
             direction: ChatDirection::Divider,
             agent_role: None,

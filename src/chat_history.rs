@@ -59,8 +59,6 @@ pub struct ChatHistoryInsert {
 pub struct ChatHistoryEntry {
     pub id: i64,
     pub message_id: String,
-    /// The user's canonical name for both user and agent messages. Use `agent_role` to identify which role produced an agent message.
-    pub user_name: String,
     pub content: String,
     pub direction: ChatDirection,
     pub agent_role: Option<String>,
@@ -74,7 +72,6 @@ crate::columns! {
     CHAT_HISTORY_COLUMNS [CH] {
         ID          => "id",
         MESSAGE_ID  => "message_id",
-        USER_NAME   => "user_name",
         CONTENT     => "content",
         DIRECTION   => "direction",
         AGENT_ROLE  => "agent_role",
@@ -87,7 +84,6 @@ fn chat_history_entry_from_row(row: &Row) -> Result<ChatHistoryEntry> {
     Ok(ChatHistoryEntry {
         id: row.get::<i64>(COL_CH_ID)?,
         message_id: row.get::<String>(COL_CH_MESSAGE_ID)?,
-        user_name: row.get::<String>(COL_CH_USER_NAME)?,
         content: row.get::<String>(COL_CH_CONTENT)?,
         direction: match row.get::<String>(COL_CH_DIRECTION)?.as_str() {
             "agent" => ChatDirection::Agent,
