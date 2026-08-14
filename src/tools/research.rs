@@ -94,7 +94,6 @@ enum ResearchStage {
 /// pre-crash segment and the report carries a one-line best-effort note.
 #[derive(Debug, Serialize, Deserialize)]
 struct ResearchState {
-    schema_version: u32,
     stage: ResearchStage,
     plan: Option<MergedPlan>,
     gap_list: Option<GapList>,
@@ -125,7 +124,6 @@ struct ResearchState {
 impl Default for ResearchState {
     fn default() -> Self {
         Self {
-            schema_version: 1,
             stage: ResearchStage::Decompose,
             plan: None,
             gap_list: None,
@@ -343,7 +341,6 @@ struct Gap {
     item: String,
     /// 0-based index into the merged plan's sub_questions.
     traces_to: usize,
-    evidence_seen: String,
 }
 
 /// The interim gap list.
@@ -3453,7 +3450,6 @@ mod tests {
         // stored verification result (the post-crash resume must reuse it —
         // never re-run the verification pass).
         let mut state = ResearchState {
-            schema_version: 1,
             stage: ResearchStage::Verification,
             plan: None,
             gap_list: None,
@@ -3611,7 +3607,6 @@ mod tests {
                 kind: "unanswered".into(),
                 item: "exact price".into(),
                 traces_to: 0,
-                evidence_seen: String::new(),
             }],
         };
         assert!(validate_gap_list(&in_range, &plan).is_ok());
@@ -3620,7 +3615,6 @@ mod tests {
                 kind: "unanswered".into(),
                 item: "unrelated".into(),
                 traces_to: 5,
-                evidence_seen: String::new(),
             }],
         };
         assert!(

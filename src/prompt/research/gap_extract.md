@@ -15,7 +15,7 @@ The sub_questions array below is 0-indexed — position 0 is the first sub-quest
 {{evidence}}
 
 Produce a JSON gap list:
-{"gaps": [{"type": "unanswered|partially_answered|contradictory|low_evidence", "item": "<the specific missing claim or unanswered aspect>", "traces_to": 0, "evidence_seen": "<what evidence exists so far, if any>"}]}
+{"gaps": [{"type": "unanswered|partially_answered|contradictory|low_evidence", "item": "<the specific missing claim or unanswered aspect>", "traces_to": 0}]}
 
 Rules:
 - item must name the missing claim concretely — something a fresh analyst could hunt for.
