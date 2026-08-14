@@ -2522,24 +2522,15 @@ fn embeddings_from_mel_frames(
 /// ([`handle_wake_word_detection`]).
 ///
 /// Processes audio frames through VAD gating, accumulates voiced samples into
-/// `voice_batch`, flushes to `mel_frame_buffer` at [`VOICE_BATCH_SIZE`] or on
-/// VAD-negative transitions, and calls `on_flush` with a shared reference to
-/// the mel frame buffer (so the callback can read mel frames while the inner
-/// function holds mutable access to the batch buffers).
-///
-/// Returns the number of samples consumed (in multiples of [`HOP_LENGTH`]).
-/// On early exit (when `on_flush` returns `true`), the returned count excludes
-/// the current frame's [`HOP_LENGTH`], matching the original early-return
-/// behaviour in [`handle_wake_word_detection`].
-///
-/// Now, the live detection pipeline uses this function only for
-/// VAD-gated mel frame accumulation — streaming embedding extraction (which
-/// previously used this via `on_flush`) was removed.  The `on_flush` callback
-/// still exists but is used only to detect early exit (wake word detection
-/// during stride-8 scoring, which now happens after this loop).
-/// [`vad_gate_streaming_mel`] additionally wraps this function
+/// `voice_batch`, and flushes to `mel_frame_buffer` at [`VOICE_BATCH_SIZE`] or
+/// on VAD-negative transitions.  The live detection pipeline uses this
+/// function only for VAD-gated mel frame accumulation — embeddings are
+/// extracted via a stride-8 sliding window over the accumulated buffer after
+/// the loop.  [`vad_gate_streaming_mel`] additionally wraps this function
 /// for the offline negative-prewarm path, so the training mel layout is
 /// produced by the same loop as live inference.
+///
+/// Returns the number of samples consumed (in multiples of [`HOP_LENGTH`]).
 ///
 /// # Parameters
 ///
@@ -2553,16 +2544,12 @@ fn embeddings_from_mel_frames(
 /// - `trailing_flush`: If `true`, flush any remaining voice batch after the
 ///   frame loop.  The live path uses `false` because audio accumulates across
 ///   calls; only kept for test compatibility.
-/// - `on_flush`: Called after each flush with `&[Vec<f32>]` — the current mel
-///   frame buffer.  Return `true` to stop processing early (used by the live
-///   path on wake word detection).
 fn process_streaming_frames_inner(
     samples: &[f32],
     voice_batch: &mut Vec<f32>,
     mel_frame_buffer: &mut Vec<Vec<f32>>,
     mut is_speech_fn: impl FnMut(&[f32]) -> bool,
     trailing_flush: bool,
-    mut on_flush: impl FnMut(&[Vec<f32>]) -> bool,
 ) -> usize {
     let mut consumed = 0;
     let len = samples.len();
@@ -2589,13 +2576,6 @@ fn process_streaming_frames_inner(
             // Silence transition: flush accumulated voiced batch
             flush_voice_batch(voice_batch, mel_frame_buffer);
             voice_batch.clear();
-            if on_flush(mel_frame_buffer) {
-                // On early exit (wake word detected), return the consumed
-                // count WITHOUT this frame's HOP_LENGTH to match the original
-                // early-return behaviour — the caller handles the buffer
-                // drain (or the detection→recording handoff clears it).
-                return consumed;
-            }
             consumed += HOP_LENGTH;
             continue;
         }
@@ -2604,9 +2584,6 @@ fn process_streaming_frames_inner(
         // (every ~128ms instead of every 32ms)
         if voice_batch.len() >= VOICE_BATCH_SIZE {
             flush_voice_batch(voice_batch, mel_frame_buffer);
-            if on_flush(mel_frame_buffer) {
-                return consumed;
-            }
         }
         consumed += HOP_LENGTH;
     }
@@ -2618,7 +2595,6 @@ fn process_streaming_frames_inner(
     if trailing_flush && !voice_batch.is_empty() {
         flush_voice_batch(voice_batch, mel_frame_buffer);
         voice_batch.clear();
-        on_flush(mel_frame_buffer);
     }
     consumed
 }
@@ -2674,8 +2650,7 @@ fn vad_gate_streaming_mel(
         &mut voice_batch,
         &mut mel_frame_buffer,
         &mut gated,
-        true,      // trailing_flush — offline extraction receives the full phrase
-        |_| false, // no early exit — collect the entire phrase
+        true, // trailing_flush — offline extraction receives the full phrase
     );
 
     (mel_frame_buffer, speech_audio)
@@ -5362,7 +5337,7 @@ impl PipelineCtx {
             // Save the running max of the peak so cross-segment maxima
             // survive the clearing below.  Without this, a segment boundary
             // that fires during silence-flush post-processing (between the
-            // last on_flush call and the reset) would lose the peaks from
+            // last frame-loop flush and the reset) would lose the peaks from
             // the just-ended segment.
             if self.peak_score > self.instrumentation.peak_score {
                 self.instrumentation.peak_score = self.peak_score;
@@ -7675,16 +7650,15 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
 
     // VAD-gating / batch-accumulation frame loop
     //
-    // Produces mel frames via flush_voice_batch.  Now, the
-    // callback is a no-op — embeddings are extracted via a stride-8 sliding
-    // window over the accumulated mel frame buffer AFTER the VAD loop.
-    // This ensures ALL accumulated mel frames are scored with dense stride-8
-    // embeddings, matching the enrollment training distribution.
+    // Produces mel frames via flush_voice_batch.  Embeddings are extracted via
+    // a stride-8 sliding window over the accumulated mel frame buffer AFTER
+    // the VAD loop — this ensures ALL accumulated mel frames are scored with
+    // dense stride-8 embeddings, matching the enrollment training distribution.
     //
     // `audio_buffer`, `voice_batch` and `mel_frame_buffer` are taken from `ctx`
-    // into local variables so the closure (which borrows `*ctx` for wake word
-    // detection) does not conflict with the inner function's mutable access to
-    // the batch buffers.
+    // into local variables so the loop can hold `&mut` access to the batch
+    // buffers while other `ctx` fields (e.g. `next_window_start`) are mutated
+    // and the consumed audio is drained before writeback.
     //
     // When detection fires during the stride-8 loop, score_stride8_window
     // sets is_recording = true but defers the full transition to this
@@ -7693,11 +7667,9 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     let mut voice_batch = std::mem::take(&mut ctx.voice_batch);
     let mut mel_frame_buffer = std::mem::take(&mut ctx.mel_frame_buffer);
 
-    // VAD counting for instrumentation.  Uses an `AtomicUsize`
-    // captured by shared reference in the closure to avoid a borrow conflict
-    // with `on_flush` (which captures `ctx` by `&mut`).  `AtomicUsize::fetch_add`
-    // takes `&self`, so the closure captures `&AtomicUsize` — no `&mut` needed.
-    // Feature-gated — zero overhead in production.
+    // VAD counting for instrumentation.  Uses an `AtomicUsize` captured by
+    // shared reference so the closure needs no `&mut` capture (`fetch_add`
+    // takes `&self`).  Feature-gated — zero overhead in production.
     #[cfg(feature = "voice-tests")]
     let vad_count = std::sync::atomic::AtomicUsize::new(0);
 
@@ -7732,11 +7704,6 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
         &mut mel_frame_buffer,
         is_speech_fn,
         false, // no trailing flush — audio_buffer accumulates across calls
-        |_mel_frames| {
-            // No-op callback — stride-8 sliding window
-            // extraction runs after the VAD loop over the full mel frame buffer.
-            false
-        },
     );
 
     // ── Stride-8 sliding window embedding extraction ──
@@ -10054,7 +10021,6 @@ mod tests {
             &mut mel_frame_buffer,
             is_speech_fn,
             false,
-            |_mel_frames| false,
         );
 
         let hop_count_1 = segment_hops.load(std::sync::atomic::Ordering::Relaxed);
@@ -10090,7 +10056,6 @@ mod tests {
             &mut mel_frame_buffer,
             is_speech_fn,
             false,
-            |_mel_frames| false,
         );
 
         let hop_count_2 = segment_hops.load(std::sync::atomic::Ordering::Relaxed);
@@ -10201,7 +10166,6 @@ mod tests {
             &mut mel_frame_buffer,
             is_speech_fn,
             false,
-            |_mel_frames| false,
         );
 
         // After 10 silence + 20 silence = 30 silence frames total, but counter
@@ -10303,7 +10267,6 @@ mod tests {
             &mut mel_frame_buffer,
             is_speech_fn,
             false,
-            |_mel_frames| false,
         );
 
         let local_hop_count = segment_hops.load(std::sync::atomic::Ordering::Relaxed);
@@ -10324,8 +10287,8 @@ mod tests {
         );
 
         // ── Verify other ctx state is clean (preserved by Soft reset) ──
-        // embedding_ring and score_window were not touched during recording
-        // (the on_flush callback returns false, so no embedding computed)
+        // embedding_ring and score_window are not touched by the frame loop
+        // (stride-8 embedding extraction happens in handle_wake_word_detection)
         assert!(
             !ctx.embedding_ring.is_empty(),
             "embedding_ring should survive recording-mode processing"
