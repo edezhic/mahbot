@@ -1177,43 +1177,30 @@ impl TelegramChannel {
     /// Both `audio` and `voice` map to [`IncomingAttachmentKind::Audio`] since
     /// there's no separate variant for each.  Returns `None` for text‑only
     /// and other unsupported message types.
+    ///
+    /// `document` is checked first because Telegram sets both `animation` and
+    /// `document` on animation messages (so those classify as Document).
+    /// `video_note` is a round video with no `file_name`/`mime_type`;
+    /// `animation` is GIF-like (usually webm/mp4).  `photo` is mutually
+    /// exclusive with the other media keys, so it is checked last.
     fn parse_attachment_metadata(message: &serde_json::Value) -> Option<IncomingAttachment> {
-        // Document
-        if let Some(doc) = message.get("document") {
-            return Self::build_attachment(doc, message, IncomingAttachmentKind::Document);
+        for (key, kind) in [
+            ("document", IncomingAttachmentKind::Document),
+            ("video", IncomingAttachmentKind::Video),
+            ("video_note", IncomingAttachmentKind::Video),
+            ("animation", IncomingAttachmentKind::Video),
+            ("audio", IncomingAttachmentKind::Audio),
+            ("voice", IncomingAttachmentKind::Audio),
+        ] {
+            if let Some(v) = message.get(key) {
+                return Self::build_attachment(v, message, kind);
+            }
         }
-
         // Photo (array of PhotoSize — take last = highest resolution)
         if let Some(photos) = message.get("photo").and_then(serde_json::Value::as_array) {
             let best = photos.last()?;
             return Self::build_attachment(best, message, IncomingAttachmentKind::Photo);
         }
-
-        // Video message
-        if let Some(video) = message.get("video") {
-            return Self::build_attachment(video, message, IncomingAttachmentKind::Video);
-        }
-
-        // Video note (round video — has duration/length, no file_name/mime_type)
-        if let Some(video_note) = message.get("video_note") {
-            return Self::build_attachment(video_note, message, IncomingAttachmentKind::Video);
-        }
-
-        // Animation (GIF-like, usually webm/mp4)
-        if let Some(animation) = message.get("animation") {
-            return Self::build_attachment(animation, message, IncomingAttachmentKind::Video);
-        }
-
-        // Audio — maps to Audio kind (same variant handles both audio and voice)
-        if let Some(audio) = message.get("audio") {
-            return Self::build_attachment(audio, message, IncomingAttachmentKind::Audio);
-        }
-
-        // Voice message
-        if let Some(voice) = message.get("voice") {
-            return Self::build_attachment(voice, message, IncomingAttachmentKind::Audio);
-        }
-
         None
     }
 
