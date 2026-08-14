@@ -4322,8 +4322,10 @@ fn check_git_scoped_flags(trimmed: &str, base: &str, words: &[&str]) -> Result<(
 /// to a file (`--output=<file>` / `--output <file>`). Runs before
 /// [`check_git_read_only_extensions`], whose read forms (`git stash show
 /// --output=...`) would bypass it. The unprovable-span rejection doubles as
-/// the blanket substitution net for ALL git arguments — it is what blocks
-/// substitution-hiding exec-vector flags (`git log $(echo --ext-diff)`),
+/// the blanket substitution net for the arguments this gate scans — every
+/// subcommand except `config` (which early-returns with its own substitution
+/// handling) and bare-`$var` words under `git remote` (exempt) — and is what
+/// blocks substitution-hiding exec-vector flags (`git log $(echo --ext-diff)`),
 /// which the literal-only exec-flag scan ([`check_git_exec_flags`]) cannot
 /// see — so the `--output` message is intentionally generic for any rejected
 /// substitution word. `--output-indicator-*` do not write and
@@ -5115,9 +5117,9 @@ fn contains_bare_var(w: &str) -> bool {
 /// ANY word starting with `$`/`` ` `` — including read-only temp operands
 /// (`git hash-object $TMPDIR/f file`, `sed s/a/b/ $TMPDIR/x`) and positional
 /// ref names (`git branch --list $name feature`) — the accepted over-rejection
-/// contract of all three call sites (hash-object cluster, sed in-place,
-/// branch/tag ref subcommand). The arm is word-start-gated, so a mid-word
-/// bare var that
+/// contract of all three call sites (the cluster gate serving git config and
+/// hash-object, sed in-place, branch/tag ref subcommand). The arm is
+/// word-start-gated, so a mid-word bare var that
 /// field-splits a flag (`git hash-object --$w file`, `w='x -w'` → fields
 /// `--x`, `-w`) escapes while the `$(...)` spelling is caught — accepted
 /// residual, unlike the fixed-token gates which fire on any-position bare
