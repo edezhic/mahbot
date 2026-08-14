@@ -561,26 +561,14 @@ fn segment_contains_grep(segment: &str, verb: &str) -> bool {
 /// falls back (fail-closed).
 fn resolve_cd(segment: &str, cwd: &Path, home: &Path) -> Result<PathBuf, Fallback> {
     let words: Vec<&str> = segment.split_whitespace().collect();
-    let mut i = 1;
-    let mut options_ended = false;
-    let target = loop {
-        let Some(w) = words.get(i) else { break None };
-        if !options_ended && w.starts_with('-') && *w != "-" {
-            if *w == "--" {
-                options_ended = true;
-            } else if !w[1..].bytes().all(|b| matches!(b, b'P' | b'L')) {
-                return Err(Fallback::CdUntrackable);
-            }
-            i += 1;
-            continue;
-        }
-        break Some(crate::tools::shell::readonly::strip_quoted_word(w));
-    };
-    let Some(target) = target else {
+    let (target, next) = match super::readonly::cd_target_after_options(&words, 1) {
+        super::readonly::CdScan::Target(target, next) => (target, next),
         // Bare `cd` → $HOME.
-        return Ok(canonical_or_lexical(home));
+        super::readonly::CdScan::Bare => return Ok(canonical_or_lexical(home)),
+        // Invalid options (`cd -e`) error at runtime — fail-closed.
+        super::readonly::CdScan::BadOption => return Err(Fallback::CdUntrackable),
     };
-    if words.get(i + 1).is_some() {
+    if words.get(next).is_some() {
         // Extra operands are shell-dependent — fail-closed.
         return Err(Fallback::CdUntrackable);
     }
@@ -3238,6 +3226,71 @@ mod redirect_token_pins {
         let (redirects, operands) = redirects_of("grep foo a.txt 1>0 out.txt");
         assert_eq!(redirects, ["1>0"], "1>0 is self-contained");
         assert_eq!(operands, ["a.txt", "out.txt"], "out.txt stays an operand");
+    }
+}
+
+// ── cd-target scan pins (non-gated: pure parsing) ────────────────────
+// The cd option-skip/target-extract loop is shared with the read-only guard
+// (readonly.rs); these rows pin the three-state scan and the grep engine's
+// fail-closed mapping so a divergence fails loudly here. The guard's own
+// fail-closed arm (bare / invalid option / extra operand → reset) is pinned
+// by its cd tests (cd_flag_forms_fail_closed, cd_extra_operands_fail_closed).
+
+#[cfg(test)]
+mod cd_scan_pins {
+    use super::super::readonly::CdScan;
+    use super::*;
+
+    /// Scan the words of a `cd` segment (verb excluded) via the shared helper.
+    fn scan(segment: &str) -> CdScan<'_> {
+        let words: Vec<&str> = segment.split_whitespace().collect();
+        super::super::readonly::cd_target_after_options(&words, 0)
+    }
+
+    #[test]
+    fn cd_option_grammar_stays_shared_and_fail_closed() {
+        // (words after the verb, expected scan). Target rows carry the
+        // quote-stripped target and the index after it.
+        let rows: &[(&str, CdScan<'static>)] = &[
+            ("sub", CdScan::Target("sub", 1)),
+            ("-P /tmp", CdScan::Target("/tmp", 2)),
+            ("-L /tmp", CdScan::Target("/tmp", 2)),
+            ("-PL /tmp", CdScan::Target("/tmp", 2)),
+            ("-- -P", CdScan::Target("-P", 2)), // `--` ends option parsing
+            ("--", CdScan::Bare),
+            ("-P", CdScan::Bare),           // flag-only → $HOME
+            ("", CdScan::Bare),             // bare cd
+            ("-", CdScan::Target("-", 1)),  // $OLDPWD target, never an option
+            ("-e /tmp", CdScan::BadOption), // invalid option errors at runtime
+            ("-Pe /tmp", CdScan::BadOption),
+            ("\"-P\"", CdScan::Target("-P", 1)), // quoted flag is a literal target
+            ("\"/tmp\"", CdScan::Target("/tmp", 1)), // target is quote-stripped
+        ];
+        for (input, expected) in rows {
+            assert_eq!(&scan(input), expected, "cd {input}");
+        }
+
+        // The grep engine's fail-closed mapping of the same three states:
+        // bare → $HOME; invalid option / extra operand → fallback.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&ws).expect("ws");
+        fs::create_dir_all(&home).expect("home");
+        assert_eq!(
+            resolve_cd("cd", &ws, &home).expect("bare cd"),
+            canonical_or_lexical(&home)
+        );
+        assert_eq!(
+            resolve_cd("cd -P", &ws, &home).expect("flag-only cd"),
+            canonical_or_lexical(&home)
+        );
+        for bad in ["cd -e sub", "cd -Pe sub", "cd sub extra", "cd -- -P extra"] {
+            assert!(
+                matches!(resolve_cd(bad, &ws, &home), Err(Fallback::CdUntrackable)),
+                "{bad}: expected CdUntrackable"
+            );
+        }
     }
 }
 

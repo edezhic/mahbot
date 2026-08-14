@@ -664,6 +664,43 @@ pub(super) fn strip_quoted_word(word: &str) -> &str {
     strip_outer_quotes(word).map_or(word, |(c, _)| c)
 }
 
+/// Outcome of scanning a `cd`-family verb's argument words for its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CdScan<'a> {
+    /// Quote-stripped target plus the index of the word after it (the first
+    /// extra-operand position).
+    Target(&'a str, usize),
+    /// No target after the options — a bare `cd`/`cd -P` (valid; targets $HOME).
+    Bare,
+    /// Option grammar violation (`-e`, `-@`, …) — the cd errors at runtime.
+    BadOption,
+}
+
+/// Skip `cd` option flags (`-P`/`-L`/`--`, mirroring bash cd grammar) and
+/// return the quote-stripped target plus the index after it. Option detection
+/// uses the raw word (a quoted `"-P"` is a literal target); `-` alone is the
+/// `$OLDPWD` target, never an option. `Bare` when no target follows;
+/// `BadOption` when the option grammar is violated — call sites fail closed.
+pub(super) fn cd_target_after_options<'a>(words: &[&'a str], start: usize) -> CdScan<'a> {
+    let mut i = start;
+    let mut options_ended = false;
+    loop {
+        let Some(w) = words.get(i) else {
+            return CdScan::Bare;
+        };
+        if !options_ended && w.starts_with('-') && *w != "-" {
+            if *w == "--" {
+                options_ended = true;
+            } else if !w[1..].bytes().all(|b| matches!(b, b'P' | b'L')) {
+                return CdScan::BadOption;
+            }
+            i += 1;
+            continue;
+        }
+        return CdScan::Target(strip_quoted_word(w), i + 1);
+    }
+}
+
 /// Expand `$VAR` / `${VAR}` references in `word`. Inside single quotes nothing
 /// expands. Returns `None` (reject) when the expansion is unprovable: an
 /// unbound variable without a temp anchor, a poisoned variable, `$HOME`,
@@ -3020,17 +3057,10 @@ fn check_segment(segment: &str, state: &mut ValidationState, negated: bool) -> R
 
 /// Resolve the target of a `cd`/`pushd`/`popd` verb at `cd_idx` (shared by
 /// direct cd segments and decoded `eval` bodies). pushd/popd always reset
-/// fail-closed; only `cd` tracks.
-///
-/// Skip option words before resolving the real target. `-P`/`-L` (and
-/// combined forms) are valid; `--` ends option parsing; any other `-…`
-/// option (`-e`, `-@`, `-x`, …) errors at runtime, so the `cd` never
-/// happens and the real CWD stays put — tracking would approve a chained
-/// write that lands there. A bare `cd`/`cd -P` (no target after the flags)
-/// targets `$HOME`. All of these reset fail-closed; `-` alone is the
-/// `$OLDPWD` target, never an option. Option detection uses the raw word
-/// (a quoted `"-P"` is a literal target), while the resolved target is
-/// quote-stripped (`cd "/tmp"`).
+/// fail-closed; only `cd` tracks. Option skipping and target extraction go
+/// through [`cd_target_after_options`]; a bare `cd`/`cd -P` or an invalid
+/// option (`cd -e`) resets fail-closed — the cd errors at runtime, so
+/// tracking would approve a chained write that lands in the real CWD.
 fn process_cd_words(words: &[&str], cd_idx: usize, verb: &str, state: &mut ValidationState) {
     // Every executed cd/pushd/popd moves the real CWD in the current shell —
     // construct parsers compare this counter to detect the leak.
@@ -3039,30 +3069,18 @@ fn process_cd_words(words: &[&str], cd_idx: usize, verb: &str, state: &mut Valid
         state.cwd = None;
         return;
     }
-    let mut i = cd_idx + 1;
-    let mut options_ended = false;
-    let target = loop {
-        let Some(w) = words.get(i) else { break None };
-        if !options_ended && w.starts_with('-') && *w != "-" {
-            if *w == "--" {
-                options_ended = true;
-            } else if !w[1..].bytes().all(|b| matches!(b, b'P' | b'L')) {
-                break None;
-            }
-            i += 1;
-            continue;
+    let (target, next) = match cd_target_after_options(words, cd_idx + 1) {
+        CdScan::Target(target, next) => (target, next),
+        CdScan::Bare | CdScan::BadOption => {
+            state.cwd = None;
+            return;
         }
-        break Some(strip_quoted_word(w));
-    };
-    let Some(target) = target else {
-        state.cwd = None;
-        return;
     };
     // A word after the target is an extra operand (`cd /tmp extra`). The
     // runtime shell (bash 3.2) ignores extras and executes the cd to the first
     // target; the guard cannot prove the target across shells — reset
     // fail-closed.
-    if words.get(i + 1).is_some() {
+    if words.get(next).is_some() {
         state.cwd = None;
         return;
     }
