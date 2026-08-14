@@ -379,16 +379,48 @@ struct WalkFlags {
 }
 
 /// Shared walker context: the raw source (for word text reconstruction) and
-/// the state at the start of the most recently walked command-ish unit. The
-/// hoisted redirects of a `redirected_statement` validate against the value
-/// recorded before the body's LAST unit — bash opens a redirect when its
-/// owning command starts, so `cd /tmp > out` rejects `out` against the
-/// pre-cd cwd while `cd /tmp && cat > out` allows it against /tmp.
+/// the state at the start of the most recently walked command-ish unit at the
+/// current construct level — the value a hoisted redirect of an enclosing
+/// `redirected_statement` binds to (bash opens a redirect when its owning
+/// command starts, so `cd /tmp > out` rejects `out` against the pre-cd cwd
+/// while `cd /tmp && cat > out` allows it against /tmp). Walkers that descend
+/// into inner commands (construct bodies, pipelines, substitution bodies)
+/// wrap their traversal in [`LastStartGuard`] so the inner commands cannot
+/// shift this value.
 struct W<'a> {
     /// Owned source text — `eval` bodies are re-parsed, so the source is not
     /// tied to the top-level command's lifetime.
     src: String,
     last_start: ValidationState<'a>,
+}
+
+/// RAII restore of `w.last_start` to its value at guard creation. A hoisted
+/// redirect binds to the state at its owning command's start; inner commands
+/// clobber `w.last_start` to their own starts, so every walker that walks a
+/// body of inner commands (constructs, pipelines, substitution bodies) must
+/// wrap the traversal in this guard — forgetting it silently reintroduces the
+/// redirect-state class of workspace writes.
+struct LastStartGuard<'a, 'w> {
+    w: &'w mut W<'a>,
+    saved: ValidationState<'a>,
+}
+
+impl<'a, 'w> LastStartGuard<'a, 'w> {
+    fn new(w: &'w mut W<'a>) -> Self {
+        let saved = w.last_start.snapshot();
+        LastStartGuard { w, saved }
+    }
+
+    /// Reborrow the walker context for the guarded traversal.
+    fn w(&mut self) -> &mut W<'a> {
+        self.w
+    }
+}
+
+impl Drop for LastStartGuard<'_, '_> {
+    fn drop(&mut self) {
+        self.w.last_start = self.saved.snapshot();
+    }
 }
 
 /// True when `kind` is a command-ish node: an executed unit the walker
@@ -527,7 +559,8 @@ fn walk_substitution_body<'a>(
     state: &mut ValidationState<'a>,
     flags: WalkFlags,
 ) -> Result<(), String> {
-    let saved_last_start = w.last_start.snapshot();
+    let mut g = LastStartGuard::new(w);
+    let w = g.w();
     let mut cursor = node.walk();
     let children: Vec<Node> = node.children(&mut cursor).collect();
     let inner: Vec<Node> = children
@@ -539,9 +572,7 @@ fn walk_substitution_body<'a>(
         // Empty or pure-expansion body (`$( )`) — nothing executes.
         return Ok(());
     }
-    walk_sequence_of(&inner, w, state, flags, &[])?;
-    w.last_start = saved_last_start;
-    Ok(())
+    walk_sequence_of(&inner, w, state, flags, &[])
 }
 
 /// Dispatch one node to its handler. The conservative default arm rejects —
@@ -887,14 +918,15 @@ fn check_words(
 /// list/pipeline suffix ending at that command. The body is walked first
 /// (source order), then each redirect validates against `w.last_start` — the
 /// state at the redirect's owning command's start: the body itself for a
-/// simple/assignment-only command, the LAST member for a list/pipeline body
-/// (bash feeds the redirect to the last pipeline member), and the construct
-/// itself for a construct body. Construct walkers save/restore `w.last_start`
-/// so an inner command's cd cannot shift the redirect state (`true && { cd
-/// /tmp; cat; } > f` opens f in the pre-internal-cd cwd). Words the parser
-/// swallowed into the redirect nodes (the grammar groups `rm a > f c` as
-/// command(rm a) + file_redirect(> f c); `c` is a real rm argument) append
-/// to the last command's argument list.
+/// simple/assignment-only command (`!` unwraps to its negated command), the
+/// LAST member for a list/pipeline body (bash feeds the redirect to the last
+/// pipeline member), and the construct itself for a construct body. Construct
+/// walkers, pipelines, and substitution bodies wrap their inner traversal in
+/// [`LastStartGuard`] so an inner command's cd cannot shift the redirect state
+/// (`true && { cd /tmp; cat; } > f` opens f in the pre-internal-cd cwd).
+/// Words the parser swallowed into the redirect nodes (the grammar groups
+/// `rm a > f c` as command(rm a) + file_redirect(> f c); `c` is a real rm
+/// argument) append to the last command's argument list.
 fn walk_redirected<'a>(
     node: Node,
     w: &mut W<'a>,
@@ -931,10 +963,8 @@ fn walk_redirected<'a>(
     walk_body(body, w, state, flags, extra)?;
 
     let mut redirect_state = w.last_start.snapshot();
-    let owner = owning_command(body);
-    let assignment_only =
-        owner.is_some_and(|n| matches!(n.kind(), "variable_assignment" | "variable_assignments"));
-    let mut assignments = owner.map_or_else(Vec::new, |n| owning_command_assignments(n, w));
+    let (mut assignments, assignment_only) = owning_command(body)
+        .map_or_else(|| (Vec::new(), false), |n| owning_command_assignments(n, w));
     if assignment_only {
         // An assignment-only command applies its bindings to the current shell
         // BEFORE the heredoc body expands and BEFORE its redirect opens —
@@ -960,32 +990,93 @@ fn walk_redirected<'a>(
 
 /// The command that owns a hoisted redirect: the body itself for a simple or
 /// assignment-only command, or the last command of a list/pipeline body (bash
-/// feeds the redirect to the last pipeline member). Construct bodies return
-/// None — they own their redirects as a whole (see walk_redirected).
+/// feeds the redirect to the last pipeline member). A `!`-negated body unwraps
+/// to its inner command (`! VAR=val cmd` binds VAR=val before the heredoc
+/// body expands). Construct bodies return None — they own their redirects as
+/// a whole (see walk_redirected).
 fn owning_command(body: Node) -> Option<Node> {
     match body.kind() {
         "command" | "variable_assignment" | "variable_assignments" => Some(body),
+        "negated_command" => body
+            .children(&mut body.walk())
+            .find(|c| is_commandish(c.kind()))
+            .and_then(owning_command),
         "list" | "pipeline" => body
             .children(&mut body.walk())
             .filter(|c| is_commandish(c.kind()))
-            .last(),
+            .last()
+            .and_then(owning_command),
         _ => None,
     }
 }
 
-/// The env assignments of the redirect's owning command: `NAME=value` text of
-/// an assignment-only command, or the `VAR=val` prefix words of a simple
-/// command. Construct owners cannot take an assignment prefix (`VAR=val
-/// { ...; }` is a bash syntax error) — none.
-fn owning_command_assignments(owner: Node, w: &W) -> Vec<String> {
+/// The env assignments of the redirect's owning command, and whether it is an
+/// assignment-only command. `NAME=value` text of an assignment-only command,
+/// or the `VAR=val` prefix words of a simple command. Under `time` — whose
+/// operand is a full command list — assignments parse as plain words
+/// (`time TMPDIR=/etc cat`) yet bind before the heredoc body expands, so they
+/// are collected from the word list too. A `time`-wrapped command whose timed
+/// operand is only assignments is assignment-only (`time TMPDIR=/etc <<EOF`
+/// opens its redirect after the binding). After `command`/`builtin` a
+/// `FOO=bar` word is the command NAME and never binds. Construct owners
+/// cannot take an assignment prefix (`VAR=val { ...; }` is a bash syntax
+/// error) — none.
+fn owning_command_assignments(owner: Node, w: &W) -> (Vec<String>, bool) {
     match owner.kind() {
-        "variable_assignment" => vec![node_text(owner, w)],
-        "variable_assignments" => owner
-            .children(&mut owner.walk())
-            .filter(|c| c.kind() == "variable_assignment")
-            .map(|c| node_text(c, w))
-            .collect(),
-        _ => collect_command_words(owner, w).1,
+        "variable_assignment" => (vec![node_text(owner, w)], true),
+        "variable_assignments" => (
+            owner
+                .children(&mut owner.walk())
+                .filter(|c| c.kind() == "variable_assignment")
+                .map(|c| node_text(c, w))
+                .collect(),
+            true,
+        ),
+        "command" => {
+            let (words, mut assignments) = collect_command_words(owner, w);
+            let mut assignment_only = true;
+            let mut i = 0;
+            // Leading env assignments parse as variable_assignment nodes
+            // (already collected); `time`'s operand is a full command list, so
+            // its env assignments parse as plain words yet bind before the
+            // heredoc body expands — collect them. After `command`/`builtin`
+            // a `FOO=bar` word is the command NAME — nothing after binds.
+            while i < words.len() {
+                let unquoted = scan::strip_outer_quotes(&words[i]).map_or("", |(c, _)| c);
+                match unquoted {
+                    "command" | "builtin" => {
+                        assignment_only = false;
+                        break;
+                    }
+                    "time" => {
+                        i += 1;
+                        // `time` takes at most one unquoted `-p`, then the
+                        // timed command, which may be `!`-negated.
+                        if words.get(i).is_some_and(|o| o == "-p") {
+                            i += 1;
+                        }
+                        loop {
+                            while words.get(i).is_some_and(|o| super::is_env_assignment(o)) {
+                                assignments.push(words[i].clone());
+                                i += 1;
+                            }
+                            if words.get(i).is_some_and(|o| o == "!") {
+                                i += 1;
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    _ => {
+                        // A real verb word — the command is not assignment-only.
+                        assignment_only = false;
+                        break;
+                    }
+                }
+            }
+            (assignments, assignment_only)
+        }
+        _ => (Vec::new(), false),
     }
 }
 
@@ -1432,7 +1523,8 @@ fn walk_if<'a>(
     state: &mut ValidationState<'a>,
     extras: &[String],
 ) -> Result<(), String> {
-    let saved_last_start = w.last_start.snapshot();
+    let mut g = LastStartGuard::new(w);
+    let w = g.w();
     let (cond, body, _rest, _) = split_children(node, w, "if", "then", "fi");
     walk_part(&cond, w, state, true, keyword_end(node, "if"))?;
     walk_part(&body, w, state, false, 0)?;
@@ -1454,10 +1546,7 @@ fn walk_if<'a>(
             _ => {}
         }
     }
-    reject_redirect_extras(extras, w)?;
-    // A hoisted redirect binds to the construct, not its last inner command.
-    w.last_start = saved_last_start;
-    Ok(())
+    reject_redirect_extras(extras, w)
 }
 
 /// End byte of the first child of `node` with kind `kind` (a construct
@@ -1495,7 +1584,8 @@ fn walk_while_until<'a>(
 ) -> Result<(), String> {
     // The grammar collapses `until` into `while_statement` (only the keyword
     // child differs), so the keyword is probed, not dispatched on node.kind().
-    let saved_last_start = w.last_start.snapshot();
+    let mut g = LastStartGuard::new(w);
+    let w = g.w();
     let (cond, _, _, _) = split_children(node, w, "while", "do", "done");
     if cond.is_empty() {
         let (cond, _, _, _) = split_children(node, w, "until", "do", "done");
@@ -1511,9 +1601,7 @@ fn walk_while_until<'a>(
             note_part_cd(&part, state);
         }
     }
-    reject_redirect_extras(extras, w)?;
-    w.last_start = saved_last_start;
-    Ok(())
+    reject_redirect_extras(extras, w)
 }
 
 fn walk_for<'a>(
@@ -1523,7 +1611,8 @@ fn walk_for<'a>(
     extras: &[String],
 ) -> Result<(), String> {
     // Header: `for`/`select`, variable_name, optional `in` + words, `;`.
-    let saved_last_start = w.last_start.snapshot();
+    let mut g = LastStartGuard::new(w);
+    let w = g.w();
     let mut header_words: Vec<String> = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -1548,9 +1637,7 @@ fn walk_for<'a>(
             }
         }
     }
-    reject_redirect_extras(extras, w)?;
-    w.last_start = saved_last_start;
-    Ok(())
+    reject_redirect_extras(extras, w)
 }
 
 fn loop_var_name(node: Node, w: &W) -> String {
@@ -1570,7 +1657,8 @@ fn walk_c_style_for<'a>(
     extras: &[String],
 ) -> Result<(), String> {
     // Arithmetic header substitutions execute (`for ((i=$(rm f); ...))`).
-    let saved_last_start = w.last_start.snapshot();
+    let mut g = LastStartGuard::new(w);
+    let w = g.w();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
@@ -1582,9 +1670,7 @@ fn walk_c_style_for<'a>(
             _ => walk_word_substitutions(child, w, state, WalkFlags::default())?,
         }
     }
-    reject_redirect_extras(extras, w)?;
-    w.last_start = saved_last_start;
-    Ok(())
+    reject_redirect_extras(extras, w)
 }
 
 fn walk_case<'a>(
@@ -1595,7 +1681,8 @@ fn walk_case<'a>(
 ) -> Result<(), String> {
     // Subject and patterns execute substitutions (bash expands them); each
     // arm body is a conditional boundary.
-    let saved_last_start = w.last_start.snapshot();
+    let mut g = LastStartGuard::new(w);
+    let w = g.w();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
@@ -1608,9 +1695,7 @@ fn walk_case<'a>(
             _ => walk_word_substitutions(child, w, state, WalkFlags::default())?,
         }
     }
-    reject_redirect_extras(extras, w)?;
-    w.last_start = saved_last_start;
-    Ok(())
+    reject_redirect_extras(extras, w)
 }
 
 fn walk_case_item<'a>(
@@ -1666,7 +1751,8 @@ fn walk_compound<'a>(
     state: &mut ValidationState<'a>,
     extras: &[String],
 ) -> Result<(), String> {
-    let saved_last_start = w.last_start.snapshot();
+    let mut g = LastStartGuard::new(w);
+    let w = g.w();
     let mut cursor = node.walk();
     let children: Vec<Node> = node.children(&mut cursor).collect();
     // `(( ... ))` arithmetic command — substitutions inside execute; nothing
@@ -1689,10 +1775,6 @@ fn walk_compound<'a>(
     if state.cd_count != entry_count {
         state.cwd = None;
     }
-    // Inner commands clobber `w.last_start` to their own starts; restore the
-    // construct's start so a hoisted redirect binds to the construct, not its
-    // last inner command (`{ cd /tmp; cat; } > f` opens f pre-internal-cd).
-    w.last_start = saved_last_start;
     Ok(())
 }
 
@@ -1702,7 +1784,8 @@ fn walk_subshell<'a>(
     state: &mut ValidationState<'a>,
     extras: &[String],
 ) -> Result<(), String> {
-    let saved_last_start = w.last_start.snapshot();
+    let mut g = LastStartGuard::new(w);
+    let w = g.w();
     let mut snap = state.snapshot();
     let mut cursor = node.walk();
     let children: Vec<Node> = node.children(&mut cursor).collect();
@@ -1711,9 +1794,7 @@ fn walk_subshell<'a>(
         .copied()
         .filter(|c| is_commandish(c.kind()))
         .collect();
-    walk_sequence_of(&body, w, &mut snap, WalkFlags::default(), extras)?;
-    w.last_start = saved_last_start;
-    Ok(())
+    walk_sequence_of(&body, w, &mut snap, WalkFlags::default(), extras)
 }
 
 fn walk_function<'a>(
@@ -1725,7 +1806,8 @@ fn walk_function<'a>(
     reject_redirect_extras(extras, w)?;
     // A function body does not execute at definition time — validate it
     // against a snapshot and discard.
-    let saved_last_start = w.last_start.snapshot();
+    let mut g = LastStartGuard::new(w);
+    let w = g.w();
     let mut snap = state.snapshot();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -1733,7 +1815,6 @@ fn walk_function<'a>(
             walk_node(child, w, &mut snap, WalkFlags::default(), Vec::new())?;
         }
     }
-    w.last_start = saved_last_start;
     Ok(())
 }
 
@@ -1746,8 +1827,8 @@ fn walk_pipeline<'a>(
 ) -> Result<(), String> {
     // Pipeline members run in subshells: each is validated against a snapshot
     // of the pipeline-start state; `state` itself is never mutated.
-    let saved_last_start = w.last_start.snapshot();
-    w.last_start = state.snapshot();
+    let mut g = LastStartGuard::new(w);
+    let w = g.w();
     let mut cursor = node.walk();
     let members: Vec<Node> = node
         .children(&mut cursor)
@@ -1771,9 +1852,6 @@ fn walk_pipeline<'a>(
         let mut mstate = base.snapshot();
         walk_node(*m, w, &mut mstate, mflags, mextras)?;
     }
-    // Members clobber `w.last_start` to their own starts; restore the
-    // pipeline start (a hoisted redirect binds to the pipeline's start).
-    w.last_start = saved_last_start;
     Ok(())
 }
 
@@ -5231,6 +5309,68 @@ mod tests {
             ("( cat; ) <<EOF\n$(echo hi)\nEOF", true),
             ("true && { cat; } <<EOF\n$(echo hi > /tmp/out)\nEOF", true),
             ("cat <<EOF\n$(echo hi > /tmp/out)\nEOF", true),
+        ];
+        run_cases(&cases);
+    }
+
+    /// `!`- and `time`-wrapped heredoc owners apply their VAR=value
+    /// assignments before the body expands (bash-verified): `!` unwraps to
+    /// the negated command, and `time`'s operand is a full command list whose
+    /// assignments parse as plain words (`time TMPDIR=/etc cat`).
+    #[test]
+    fn negated_time_heredoc_owners() {
+        let cases = [
+            // Negated command owners: body sees the assignment.
+            ("! TMPDIR=/etc cat <<EOF\n$(touch $TMPDIR/x)\nEOF", false),
+            ("! TMPDIR=/etc <<EOF\n$(touch $TMPDIR/x)\nEOF", false),
+            (
+                "cd /tmp && ! TMPDIR=/etc cat <<EOF\n$(touch $TMPDIR/x)\nEOF",
+                false,
+            ),
+            ("! TMPDIR=/etc <<EOF > \"$TMPDIR/f\"\nbody\nEOF", false),
+            (
+                "! TMPDIR=/etc time cat <<EOF\n$(touch $TMPDIR/x)\nEOF",
+                false,
+            ),
+            // Time owners: the timed command's assignments bind first.
+            ("time TMPDIR=/etc cat <<EOF\n$(touch $TMPDIR/x)\nEOF", false),
+            ("time TMPDIR=/etc <<EOF\n$(touch $TMPDIR/x)\nEOF", false),
+            (
+                "time -p TMPDIR=/etc cat <<EOF\n$(touch $TMPDIR/x)\nEOF",
+                false,
+            ),
+            (
+                "time -p ! TMPDIR=/etc cat <<EOF\n$(touch $TMPDIR/x)\nEOF",
+                false,
+            ),
+            (
+                "time ! TMPDIR=/etc cat <<EOF\n$(touch $TMPDIR/x)\nEOF",
+                false,
+            ),
+            ("time ! TMPDIR=/etc <<EOF\n$(touch $TMPDIR/x)\nEOF", false),
+            // Assignment-only time owners open the marker-line redirect
+            // post-binding.
+            ("time TMPDIR=/etc <<EOF > \"$TMPDIR/f\"\nbody\nEOF", false),
+            // A negated construct owner binds at the construct's start.
+            ("! { cd /tmp; cat; } <<EOF\n$(rm -rf .)\nEOF", false),
+            // Benign temp-bound forms stay allowed.
+            (
+                "! TMPDIR=/tmp/xyzzy cat <<EOF\n$(touch $TMPDIR/x)\nEOF",
+                true,
+            ),
+            ("! TMPDIR=/tmp/xyzzy <<EOF\n$(touch $TMPDIR/x)\nEOF", true),
+            (
+                "time TMPDIR=/tmp/xyzzy cat <<EOF\n$(touch $TMPDIR/x)\nEOF",
+                true,
+            ),
+            (
+                "time ! TMPDIR=/tmp/xyzzy <<EOF\n$(touch $TMPDIR/x)\nEOF",
+                true,
+            ),
+            (
+                "TMPDIR=/tmp/xyzzy time cat <<EOF\n$(touch $TMPDIR/x)\nEOF",
+                true,
+            ),
         ];
         run_cases(&cases);
     }
