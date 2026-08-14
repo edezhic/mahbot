@@ -585,10 +585,7 @@ fn walk_node<'a>(
             bind_assignments(node, w, state)
         }
         "declaration_command" => walk_declaration(node, w, state),
-        "unset_command" => {
-            walk_unset(node, w, state);
-            Ok(())
-        }
+        "unset_command" => walk_unset(node, w, state),
         "command_substitution" | "process_substitution" => {
             let mut snap = state.snapshot();
             walk_substitution_body(node, w, &mut snap, flags)
@@ -925,7 +922,9 @@ fn walk_redirected<'a>(
     let mut redirect_state = w.last_start.snapshot();
     for r in redirects {
         if r.kind() == "heredoc_redirect" {
-            validate_heredoc(*r, w, state)?;
+            // Body/marker-line substitutions expand before the owning command
+            // runs; `&&`/`|` tails run after it (post-body `state`).
+            validate_heredoc(*r, w, &mut redirect_state, state)?;
         } else {
             validate_file_redirect(*r, w, &mut redirect_state)?;
         }
@@ -1018,7 +1017,12 @@ fn validate_redirect<'a>(
 ) -> Result<(), String> {
     match node.kind() {
         "file_redirect" => validate_file_redirect(node, w, state),
-        "heredoc_redirect" => validate_heredoc(node, w, state),
+        "heredoc_redirect" => {
+            // Standalone heredoc (no owning command): body and tail both run
+            // against the current state.
+            let mut snap = state.snapshot();
+            validate_heredoc(node, w, state, &mut snap)
+        }
         "herestring_redirect" => Err(parse_error(&w.src)),
         _ => Err(unrecognized_node(node, w)),
     }
@@ -1103,10 +1107,15 @@ fn disallowed_redirect_err(cmd: &str, target: &str) -> String {
 /// reject); an unquoted body's substitutions execute and are validated,
 /// while its raw text is minimal-scanned for backticks/`$(` (invisible to the
 /// parser). Quoted-delimiter bodies are literal — nothing executes.
+/// Substitutions (body and marker-line words) and the marker-line redirect
+/// expand BEFORE the owning command runs, so they validate against
+/// `cmd_state` (the command's start state — pre-cd for `cd /tmp <<EOF`);
+/// the `&&`/`|` tail arms run AFTER it, against `tail_state` (post-body).
 fn validate_heredoc<'a>(
     node: Node,
     w: &mut W<'a>,
-    state: &mut ValidationState<'a>,
+    cmd_state: &mut ValidationState<'a>,
+    tail_state: &mut ValidationState<'a>,
 ) -> Result<(), String> {
     let mut cursor = node.walk();
     let children: Vec<Node> = node.children(&mut cursor).collect();
@@ -1150,15 +1159,16 @@ fn validate_heredoc<'a>(
             }
             "heredoc_end" => break,
             "file_redirect" => {
-                // A redirect on the marker line belongs to the owning command.
-                validate_file_redirect(*c, w, state)?;
+                // A redirect on the marker line opens when the command runs —
+                // against the owning command's start state (pre-cd).
+                validate_file_redirect(*c, w, cmd_state)?;
             }
             "pipeline" => {
-                let mut snap = state.snapshot();
+                let mut snap = tail_state.snapshot();
                 walk_node(*c, w, &mut snap, WalkFlags::default(), Vec::new())?;
             }
             kind if is_commandish(kind) => {
-                walk_node(*c, w, state, WalkFlags::default(), Vec::new())?;
+                walk_node(*c, w, tail_state, WalkFlags::default(), Vec::new())?;
             }
             kind if is_wordish(kind) => {
                 // A word after the marker: same-line words are the owning
@@ -1172,13 +1182,13 @@ fn validate_heredoc<'a>(
                     && !node_text(*c, w).starts_with('\n')
                     && !text_between_has_newline(&w.src, marker_line_end, c.start_byte());
                 if marker_line {
-                    walk_word_substitutions(*c, w, state, WalkFlags::default())?;
+                    walk_word_substitutions(*c, w, cmd_state, WalkFlags::default())?;
                 } else if unquoted {
-                    walk_word_substitutions(*c, w, state, WalkFlags::default())?;
+                    walk_word_substitutions(*c, w, cmd_state, WalkFlags::default())?;
                     minimal_body_scan(&node_text(*c, w))?;
                 }
             }
-            _ => walk_word_substitutions(*c, w, state, WalkFlags::default())?,
+            _ => walk_word_substitutions(*c, w, cmd_state, WalkFlags::default())?,
         }
     }
 
@@ -1198,7 +1208,7 @@ fn validate_heredoc<'a>(
                     | "process_substitution"
                     | "expansion"
                     | "arithmetic_expansion" => {
-                        let mut snap = state.snapshot();
+                        let mut snap = cmd_state.snapshot();
                         walk_word_substitutions(*bc, w, &mut snap, WalkFlags::default())?;
                     }
                     "heredoc_content" => minimal_body_scan(&node_text(*bc, w))?,
@@ -1685,9 +1695,11 @@ fn walk_declaration<'a>(
     w: &mut W<'a>,
     state: &mut ValidationState<'a>,
 ) -> Result<(), String> {
-    walk_word_substitutions(node, w, state, WalkFlags::default())?;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        // Substitutions in any child execute (`export x=$(rm -rf /)`,
+        // `declare -a arr=( $(rm -rf /) )`) — walk them before binding.
+        walk_word_substitutions(child, w, state, WalkFlags::default())?;
         match child.kind() {
             "variable_assignment" => {
                 let text = node_text(child, w);
@@ -1717,9 +1729,15 @@ fn walk_declaration<'a>(
 
 /// `unset NAME` models an EMPTY binding (bash expands `$NAME` to ''), not a
 /// return to the session baseline. Options (`-f`, `-v`, `-n`) are skipped.
-fn walk_unset<'a>(node: Node, w: &W<'a>, state: &mut ValidationState<'a>) {
+fn walk_unset<'a>(
+    node: Node,
+    w: &mut W<'a>,
+    state: &mut ValidationState<'a>,
+) -> Result<(), String> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        // Substitutions execute (`unset $(rm -rf /)`) — walk them first.
+        walk_word_substitutions(child, w, state, WalkFlags::default())?;
         match child.kind() {
             "variable_name" | "word" => {
                 let text = node_text(child, w);
@@ -1737,6 +1755,7 @@ fn walk_unset<'a>(node: Node, w: &W<'a>, state: &mut ValidationState<'a>) {
             _ => {}
         }
     }
+    Ok(())
 }
 
 /// Bind the variable assignments of a standalone `variable_assignment` /
@@ -4986,6 +5005,50 @@ mod tests {
             ("cat <<EOF| rm f\nbody\nEOF", false),
             ("cat <<EOF>file\nbody\nEOF", false),
             ("cat <<EOF && cd /tmp && touch f\nbody\nEOF", true),
+        ];
+        run_cases(&cases);
+    }
+
+    /// Substitutions in declaration/unset children execute and must be
+    /// validated — `unset $(rm -rf /)`, `export x=$(rm -rf /)`, quoted and
+    /// array forms, and process substitutions all reject. Benign bindings
+    /// stay allowed.
+    #[test]
+    fn declaration_unset_substitutions() {
+        let cases = [
+            ("unset $(rm -rf /)", false),
+            ("unset `rm -rf /`", false),
+            ("declare $(rm -rf /)", false),
+            ("export x=$(rm -rf /)", false),
+            ("declare \"x=$(rm -rf /)\"", false),
+            ("declare -a arr=( $(rm -rf /) )", false),
+            ("export x=<(rm -rf /)", false),
+            ("X=$(rm -rf /)", false),
+            ("unset TMPDIR", true),
+            ("export TMPDIR=/tmp", true),
+            ("declare x=1", true),
+            ("export A=1 B=2", true),
+        ];
+        run_cases(&cases);
+    }
+
+    /// Heredoc body/marker-line substitutions and the marker-line redirect
+    /// expand BEFORE the owning command runs (bash: `cd /tmp <<EOF` +
+    /// `$(pwd)` prints the pre-cd cwd), so they validate against the command's
+    /// start state — a cd-owning heredoc cannot smuggle workspace writes via
+    /// the post-cd cwd. The `&&`/`|` tail runs after the command: post-cd
+    /// temp writes stay allowed.
+    #[test]
+    fn cd_owning_heredoc_state() {
+        let cases = [
+            ("cd /tmp <<EOF\n$(rm -rf .)\nEOF", false),
+            ("cd /tmp <<EOF\n$(touch rel)\nEOF", false),
+            ("cd /tmp <<EOF\n$(mkdir x)\nEOF", false),
+            ("cd /tmp <<EOF\n$(rm -rf x)\nEOF", false),
+            ("cd /tmp <<EOF\n$(echo hi > wsfile)\nEOF", false),
+            ("cd /tmp <<EOF > rel\nbody\nEOF", false),
+            ("cd /tmp <<EOF && touch f\nbody\nEOF", true),
+            ("cat <<EOF\n$(echo hi > /tmp/out)\nEOF", true),
         ];
         run_cases(&cases);
     }
