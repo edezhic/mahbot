@@ -1595,10 +1595,27 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         );
         return;
     };
-    run_engineer_round(&ticket, &ws, &job_id, &message, false).await;
+    run_stage_agent_round(
+        &ticket,
+        &ws,
+        &job_id,
+        &message,
+        false,
+        StageRoundKind::Engineer,
+    )
+    .await;
 }
 
-/// Run the engineer round tail shared by fresh dispatch and boot resume.
+/// The single-agent stage rounds sharing one run tail: engineer (NULL-seat
+/// anchor, [`finalize_engineer_round`]) and sanitation (job-derived agent ID,
+/// [`finalize_sanitation_round`]).
+#[derive(Clone, Copy)]
+enum StageRoundKind {
+    Engineer,
+    Sanitation,
+}
+
+/// Run the stage-agent round tail shared by fresh dispatch and boot resume.
 ///
 /// The NULL-seat anchor (permanently-NULL `job_id`) is upserted FIRST so the
 /// accumulated session `ticket_{id}_engineer` survives round-job deletion and
@@ -1606,28 +1623,40 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
 /// per agent_id, job_id NULL): a crash between `spawn_single_slot_round` and
 /// the fresh-dispatch upsert (two adjacent awaits) would otherwise leave this
 /// round WITHOUT an anchor — after CASCADE the session loses TTL protection
-/// and the next bounce round loses S5 context.
+/// and the next bounce round loses S5 context. (Engineer stage only.)
+///
+/// The sanitation agent ID is job-derived (`ticket_{job_id}_sanitation`):
+/// derived FIRST as a pure function of job_id, then registered (router +
+/// `assigned_to`), then the session-non-emptiness discriminator is read — the
+/// session-store read and router registration are independent (benign
+/// ordering). The register overwrites the claim-time placeholder
+/// (`ticket_{ticket_id}_sanitation`) with the job-derived run ID so mid-run
+/// comments route to the actual agent (and covers the re-dispatch path after
+/// [`record_sanitation_failure`] clears `assigned_to`). (Sanitation stage only.)
 ///
 /// Resume dispatch rule — session-non-emptiness discriminator: the check is
-/// "any session content", not "current round's task present". A crash between
-/// the anchor upsert and this round's session.init leaves the round's
-/// feedback undelivered (a non-empty prior round then dispatches an empty
-/// message). Narrow window, quality-only — accepted. Fresh dispatch always
-/// uses the rendered prompt.
-async fn run_engineer_round(
+/// "any session content", not "current round's task present" — existing
+/// session → empty message (no duplicate task-prompt append); missing session
+/// → stored task re-dispatched. A crash between the anchor upsert and this
+/// round's session.init leaves the round's feedback undelivered (a non-empty
+/// prior round then dispatches an empty message). Narrow window, quality-only
+/// — accepted. Fresh dispatch always uses the rendered prompt.
+async fn run_stage_agent_round(
     ticket: &Ticket,
     ws: &Workspace,
     job_id: &str,
     task: &str,
     resumed: bool,
+    kind: StageRoundKind,
 ) {
-    if let Err(e) = crate::jobs::upsert_engineer_anchor(
-        &crate::session::store().conn,
-        &ticket.id,
-        task,
-        crate::jobs::RowStatus::Launched,
-    )
-    .await
+    if let StageRoundKind::Engineer = kind
+        && let Err(e) = crate::jobs::upsert_engineer_anchor(
+            &crate::session::store().conn,
+            &ticket.id,
+            task,
+            crate::jobs::RowStatus::Launched,
+        )
+        .await
     {
         warn!(
             ticket = %ticket.id,
@@ -1637,14 +1666,23 @@ async fn run_engineer_round(
         );
     }
 
-    let agent_id = crate::jobs::engineer_anchor_id(&ticket.id);
+    let agent_id = match kind {
+        StageRoundKind::Engineer => crate::jobs::engineer_anchor_id(&ticket.id),
+        StageRoundKind::Sanitation => format!("ticket_{job_id}_sanitation"),
+    };
     let incoming_rx = register_agent_and_assign(
         &ticket.id,
         &agent_id,
-        if resumed {
-            "Failed to persist assigned_to for resumed engineer — comments may not route"
-        } else {
-            "Failed to persist assigned_to — stale agent already cancelled at dispatch, proceeding without DB assignment"
+        match kind {
+            StageRoundKind::Engineer if resumed => {
+                "Failed to persist assigned_to for resumed engineer — comments may not route"
+            }
+            StageRoundKind::Engineer => {
+                "Failed to persist assigned_to — stale agent already cancelled at dispatch, proceeding without DB assignment"
+            }
+            StageRoundKind::Sanitation => {
+                "Failed to persist assigned_to for sanitation agent — mid-run comments may not route"
+            }
         },
     )
     .await;
@@ -1657,7 +1695,10 @@ async fn run_engineer_round(
     };
     let (agent, response) = run_single_agent(
         agent_id,
-        Role::Engineer,
+        match kind {
+            StageRoundKind::Engineer => Role::Engineer,
+            StageRoundKind::Sanitation => Role::Sanitation,
+        },
         ws,
         ticket,
         &message,
@@ -1666,7 +1707,14 @@ async fn run_engineer_round(
     )
     .await;
 
-    finalize_engineer_round(ticket, &agent, response.as_deref(), job_id, resumed).await;
+    match kind {
+        StageRoundKind::Engineer => {
+            finalize_engineer_round(ticket, &agent, response.as_deref(), job_id, resumed).await;
+        }
+        StageRoundKind::Sanitation => {
+            finalize_sanitation_round(ticket, &agent, response.as_deref(), job_id, resumed).await;
+        }
+    }
 }
 
 /// Determine whether to notify immediately or buffer the Done transition.
@@ -2199,56 +2247,15 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         );
         return;
     };
-    run_sanitation_round(&ticket, &ws, &job_id, &prompt, false).await;
-}
-
-/// Run the sanitation round tail shared by fresh dispatch and boot resume.
-///
-/// Agent ID is job-derived (`ticket_{job_id}_sanitation`): derived FIRST as a
-/// pure function of job_id, then registered (router + `assigned_to`), then
-/// the session-non-emptiness discriminator is read — the session-store read
-/// and router registration are independent (benign ordering). The register
-/// overwrites the claim-time placeholder (`ticket_{ticket_id}_sanitation`)
-/// with the job-derived run ID so mid-run comments route to the actual agent
-/// (and covers the re-dispatch path after [`record_sanitation_failure`]
-/// clears `assigned_to`).
-///
-/// Resume dispatch rule: existing session → empty message (no duplicate
-/// task-prompt append); missing session → stored task re-dispatched. Fresh
-/// dispatch always uses the rendered prompt.
-async fn run_sanitation_round(
-    ticket: &Ticket,
-    ws: &Workspace,
-    job_id: &str,
-    task: &str,
-    resumed: bool,
-) {
-    let agent_id = format!("ticket_{job_id}_sanitation");
-    let incoming_rx = register_agent_and_assign(
-        &ticket.id,
-        &agent_id,
-        "Failed to persist assigned_to for sanitation agent — mid-run comments may not route",
+    run_stage_agent_round(
+        &ticket,
+        &ws,
+        &job_id,
+        &prompt,
+        false,
+        StageRoundKind::Sanitation,
     )
     .await;
-
-    let has_session = resumed && crate::session::store().has_content(&agent_id).await;
-    let message = if has_session {
-        String::new()
-    } else {
-        task.to_string()
-    };
-    let (agent, response) = run_single_agent(
-        agent_id,
-        Role::Sanitation,
-        ws,
-        ticket,
-        &message,
-        incoming_rx,
-        resumed,
-    )
-    .await;
-
-    finalize_sanitation_round(ticket, &agent, response.as_deref(), job_id, resumed).await;
 }
 
 /// Process the result of a sanitation agent inspection.
@@ -4240,8 +4247,8 @@ async fn resume_ticket_stage_round(stage: String, job_id: String, ticket: Ticket
         "analysis" => resume_analysis_round(&job_id, ticket, ws).await,
         "review" => resume_verifier_round(&job_id, ticket, ws, REVIEWER_VI).await,
         "qa" => resume_verifier_round(&job_id, ticket, ws, QA_VI).await,
-        "engineer" => resume_engineer_round(&job_id, ticket, ws).await,
-        "sanitation" => resume_sanitation_round(&job_id, ticket, ws).await,
+        "engineer" => resume_stage_round(&job_id, ticket, ws, StageRoundKind::Engineer).await,
+        "sanitation" => resume_stage_round(&job_id, ticket, ws, StageRoundKind::Sanitation).await,
         other => {
             warn!(stage = %other, job = %job_id, "Unknown ticket_stage on resume — completing job");
             complete_ticket_stage_job(&job_id).await;
@@ -4379,28 +4386,19 @@ async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: 
     finalize_verifier_round(&ws, &ticket_arc, vi, &results, job_id, true, git_available).await;
 }
 
-/// Resume an engineer round: the accumulated session `ticket_{id}_engineer`
-/// resumes with an EMPTY message when the session already contains the task
-/// (no duplicate task-prompt append, S5 continuity); a missing/empty session
-/// (crash between roster-write and the first session write) dispatches fresh
-/// with the stored task. The response drives the normal transition tail.
-async fn resume_engineer_round(job_id: &str, ticket: Ticket, ws: Workspace) {
-    if bail_if_phase_moved(&ticket.id, TicketPhase::InDevelopment, job_id).await {
+/// Resume a single-agent stage round (engineer/sanitation) at boot: phase-
+/// guard, then re-run the shared stage-agent tail (see
+/// [`run_stage_agent_round`] for the resume dispatch rule).
+async fn resume_stage_round(job_id: &str, ticket: Ticket, ws: Workspace, kind: StageRoundKind) {
+    let phase = match kind {
+        StageRoundKind::Engineer => TicketPhase::InDevelopment,
+        StageRoundKind::Sanitation => TicketPhase::InSanitation,
+    };
+    if bail_if_phase_moved(&ticket.id, phase, job_id).await {
         return;
     }
     let task = job_task(job_id).await;
-    run_engineer_round(&ticket, &ws, job_id, &task, true).await;
-}
-
-/// Resume a sanitation round: resume the job-derived agent session (empty
-/// message when the session exists; stored task when missing), extract the
-/// verdict, and process it.
-async fn resume_sanitation_round(job_id: &str, ticket: Ticket, ws: Workspace) {
-    if bail_if_phase_moved(&ticket.id, TicketPhase::InSanitation, job_id).await {
-        return;
-    }
-    let task = job_task(job_id).await;
-    run_sanitation_round(&ticket, &ws, job_id, &task, true).await;
+    run_stage_agent_round(&ticket, &ws, job_id, &task, true, kind).await;
 }
 
 /// Read a job's stored task (the FINAL rendered prompt template).

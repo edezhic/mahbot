@@ -1657,7 +1657,7 @@ async fn handle_qa_passed_untracked_files_to_insanitation() {
 /// The board routes mid-work comments to the exact ID stored in
 /// `assigned_to` (`route_comment_to_agents` → `try_route`).
 /// [`BoardStore::claim_sanitation`] stores the unsuffixed base ID as a
-/// placeholder; [`register_agent_and_assign`] (called by `run_sanitation_round`)
+/// placeholder; [`register_agent_and_assign`] (called by `run_stage_agent_round`)
 /// must overwrite it with the suffixed ID the run actually registers,
 /// otherwise comments are silently dropped for the whole phase.
 ///
@@ -1674,7 +1674,7 @@ async fn sanitation_register_persists_registered_id() {
     let ws = test_ws_named("/tmp/test_san_register", "ws_san_register");
     let ticket_id = make_ticket(board(), &ws, "San Register", TicketPhase::InSanitation).await;
 
-    // Mirror the run_sanitation_round scaffolding: job-derived agent ID first,
+    // Mirror the run_stage_agent_round scaffolding: job-derived agent ID first,
     // then register + persist the same ID in assigned_to.
     let agent_id = format!("ticket_test-job_sanitation");
     let mut rx = register_agent_and_assign(
