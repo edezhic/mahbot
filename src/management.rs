@@ -1492,7 +1492,7 @@ async fn finalize_engineer_round(
             if resumed {
                 "Resumed engineer failed — transitioned ticket"
             } else {
-                "Engineer finished — transitioned ticket"
+                "Engineer failed — transitioned ticket"
             },
         )
     };
