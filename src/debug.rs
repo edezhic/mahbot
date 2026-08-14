@@ -457,6 +457,30 @@ fn print_line(args: std::fmt::Arguments<'_>) -> Result<()> {
     write_stdout(&format!("{args}\n"))
 }
 
+/// Shared `[--db <name>]` flag parser for the detect/families verbs
+/// (`mahbot debug <verb> --db <name>`); `None` means no flag was given.
+fn parse_db_flag(args: &[String], subcommand: &str) -> Result<Option<String>> {
+    match args.get(3).map(String::as_str) {
+        Some("--db") => match args.get(4) {
+            Some(name) => Ok(Some(name.clone())),
+            None => bail!("expected: mahbot debug {subcommand} --db <name>"),
+        },
+        Some(other) => bail!("invalid {subcommand} argument '{other}'"),
+        None => Ok(None),
+    }
+}
+
+/// Validate a store name against the canonical list. `all_valid` appends the
+/// literal `all` option to the hint — only the query verb accepts it.
+fn validate_store_name(name: &str, all_valid: bool) -> Result<()> {
+    let names = turso_mod::store_names();
+    if names.contains(&name) {
+        return Ok(());
+    }
+    let hint = names.join(", ") + if all_valid { ", all" } else { "" };
+    bail!("invalid database name '{name}'. Valid names: {hint}");
+}
+
 /// `mahbot debug detect [--db <name>]` — run the full coordination-state
 /// predicate over the stores without opening them. Prints one line per store
 /// (`name\tclass\twal_size=N\tblocking=B`). Exit 0 when all stores are healthy
@@ -466,12 +490,11 @@ fn print_line(args: std::fmt::Arguments<'_>) -> Result<()> {
 /// checkpoint loop's severity split.
 fn run_debug_detect(args: &[String], home_override: Option<PathBuf>) -> Result<()> {
     let mahbot_home = resolve_home(home_override)?;
-    let selected = match args.get(3).map(String::as_str) {
-        Some("--db") => match args.get(4) {
-            Some(name) => vec![name.clone()],
-            None => bail!("expected: mahbot debug detect --db <name>"),
-        },
-        Some(other) => bail!("invalid detect argument '{other}'"),
+    let selected = match parse_db_flag(args, "detect")? {
+        Some(name) => {
+            validate_store_name(&name, false)?;
+            vec![name]
+        }
         None => turso_mod::store_names()
             .into_iter()
             .map(String::from)
@@ -479,9 +502,6 @@ fn run_debug_detect(args: &[String], home_override: Option<PathBuf>) -> Result<(
     };
     let mut failures = 0usize;
     for name in &selected {
-        if !turso_mod::store_names().contains(&name.as_str()) {
-            bail!("invalid database name '{name}'");
-        }
         let status = wal_guard::inspect_store_at(
             &turso_mod::store_db_path(&mahbot_home, name),
             wal_guard::StoreFds::none(),
@@ -768,14 +788,7 @@ fn run_debug_families(args: &[String], home_override: Option<PathBuf>) -> Result
     // `--db <name>` filters by store name; a name matching nothing (canonical
     // store with no families, unknown/legacy name) prints nothing and exits 0
     // — the filter never depends on the current listing content.
-    let filter = match args.get(3).map(String::as_str) {
-        Some("--db") => match args.get(4) {
-            Some(name) => Some(name.clone()),
-            None => bail!("expected: mahbot debug families --db <name>"),
-        },
-        Some(other) => bail!("invalid families argument '{other}'"),
-        None => None,
-    };
+    let filter = parse_db_flag(args, "families")?;
     if let Some(store) = filter {
         families.retain(|fam| fam.store == store);
     }
@@ -1461,21 +1474,18 @@ fn is_torn_frame_error(err: &anyhow::Error) -> bool {
 
 /// Map a `--db` argument to a list of `(label, absolute db path)` pairs.
 fn resolve_db_list(name: &str, root: &Path) -> Result<Vec<(String, PathBuf)>> {
-    let names = turso_mod::store_names();
     if name == "all" {
-        Ok(names
+        let names = turso_mod::store_names();
+        return Ok(names
             .iter()
             .map(|n| (n.to_string(), turso_mod::store_db_path(root, n)))
-            .collect())
-    } else if names.contains(&name) {
-        Ok(vec![(
-            name.to_string(),
-            turso_mod::store_db_path(root, name),
-        )])
-    } else {
-        let valid = names.join(", ");
-        bail!("invalid database name '{name}'. Valid names: {valid}, all");
+            .collect());
     }
+    validate_store_name(name, true)?;
+    Ok(vec![(
+        name.to_string(),
+        turso_mod::store_db_path(root, name),
+    )])
 }
 
 /// Reject any SQL containing mutation keywords (whole-word, case-insensitive)
