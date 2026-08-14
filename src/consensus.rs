@@ -533,7 +533,7 @@ pub(crate) fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> R
 /// a transport failure or parse error never claims the response was rejected;
 /// a fully-accepted round never claims a rejection; only mixed rounds are
 /// presented as partially accepted.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum PrevRound {
     /// Previous call did not complete (transport failure).
     Transport,
@@ -546,6 +546,57 @@ enum PrevRound {
         /// "partially accepted" from "rejected".
         accepted: bool,
     },
+}
+
+/// In-Rust fallback framings, indexed by the [`PrevRound`] selection order
+/// below. Used only when `synthesis/repair_framing.md` is missing or
+/// truncated (degradation: warn + keep the literal — never panic).
+const REPAIR_FRAMING_FALLBACK: [&str; 5] = [
+    "The previous call did not complete (transport failure) — please respond now with the repair delta.",
+    "Your previous response could not be parsed — please respond now with the repair delta.",
+    "Your previous response was rejected — the rejected proposals are listed below.",
+    "Your previous response was accepted; the remaining items below still need placement.",
+    "Your previous response was partially accepted; rejected proposals are listed below.",
+];
+
+/// Framing sentence for `prev`, selected by index from
+/// `synthesis/repair_framing.md` (section order is a contract — see the
+/// asset's trailing comment; reordering silently misselects). The lookup is
+/// bounded to the framing sections so the trailing comment is never
+/// selectable. Degrades with a warning, never a panic — an unmatched variant
+/// yields an empty framing. A new variant must extend the match arm, the
+/// asset, the fallback consts, and the test tables.
+fn repair_framing(prev: PrevRound, rejections: &[String]) -> String {
+    let idx = match prev {
+        PrevRound::Transport => 0,
+        PrevRound::Parse => 1,
+        PrevRound::Processed { accepted: false } => 2,
+        PrevRound::Processed { accepted: true } if rejections.is_empty() => 3,
+        PrevRound::Processed { accepted: true } => 4,
+    };
+    let sections = crate::prompt::load_prompt_sections("synthesis/repair_framing.md");
+    let bounded = sections.get(..REPAIR_FRAMING_FALLBACK.len());
+    bounded
+        .and_then(|framings| framings.get(idx))
+        .cloned()
+        .unwrap_or_else(|| {
+            let fallback = REPAIR_FRAMING_FALLBACK
+                .get(idx)
+                .copied()
+                .unwrap_or_default();
+            tracing::warn!(
+                asset = "synthesis/repair_framing.md",
+                framing_sections = sections.len().min(REPAIR_FRAMING_FALLBACK.len()),
+                index = idx,
+                "repair framing section unavailable — using {}",
+                if fallback.is_empty() {
+                    "an empty framing (no fallback const for this index)"
+                } else {
+                    "the in-Rust fallback literal"
+                }
+            );
+            fallback.to_owned()
+        })
 }
 
 /// Append the repair-round instructions (delta schema, frozen skeletons,
@@ -561,35 +612,15 @@ fn append_repair_instructions(
     rejections: &[String],
     prev: PrevRound,
 ) {
-    let framing = match prev {
-        PrevRound::Transport => {
-            "The previous call did not complete (transport failure) — please \
-             respond now with the repair delta."
-        }
-        PrevRound::Parse => {
-            "Your previous response could not be parsed — please respond now \
-             with the repair delta."
-        }
-        PrevRound::Processed { accepted: false } => {
-            "Your previous response was rejected — the rejected proposals are \
-             listed below."
-        }
-        PrevRound::Processed { accepted: true } if rejections.is_empty() => {
-            "Your previous response was accepted; the remaining items below \
-             still need placement."
-        }
-        PrevRound::Processed { accepted: true } => {
-            "Your previous response was partially accepted; rejected proposals \
-             are listed below."
-        }
-    };
+    let framing = repair_framing(prev, rejections);
     // Section bodies align with the template's newline structure: the
-    // rejections block keeps its conditional leading separator (a static
+    // rejections slot keeps its conditional leading separator (a static
     // template separator would leave a stray blank line when empty) and its
-    // writeln trailing newlines; the frozen block drops the leading separator
-    // (the rejections line-end supplies the blank line, empty or not) but
-    // keeps trailing; the remainder block also drops its trailing newline
-    // (the template's blank line before the schema supplies the separator).
+    // writeln trailing newlines; the frozen and remainder slots carry only
+    // writeln list lines — their headers are literal template text, and each
+    // slot's trailing newline plus the template's following newline supply
+    // the blank line between blocks (byte-identical assembly, pinned by the
+    // tests).
     let mut rejections_section = String::new();
     if !rejections.is_empty() {
         rejections_section.push_str("\nRejected proposals still outstanding (fix these):\n");
@@ -597,12 +628,9 @@ fn append_repair_instructions(
             let _ = writeln!(rejections_section, "- {r}");
         }
     }
-    let mut frozen_groups_section = String::from(
-        "Frozen groups (skeletons — do NOT re-propose their members; references \
-         to a group flagged contradiction:true are ignored):\n",
-    );
+    let mut frozen_groups_lines = String::new();
     if state.frozen_groups.is_empty() {
-        frozen_groups_section.push_str("- none\n");
+        frozen_groups_lines.push_str("- none\n");
     } else {
         for (i, g) in state.frozen_groups.iter().enumerate() {
             let agents = distinct_agents(g, &state.table)
@@ -615,37 +643,32 @@ fn append_repair_instructions(
                 |m| format!("{} (id {})", render_member_line(m, &state.table), m.id),
             );
             let _ = writeln!(
-                frozen_groups_section,
+                frozen_groups_lines,
                 "- {i}: {:?} [agents {agents}, contradiction: {}] — e.g. {representative}",
                 g.heading, g.contradiction,
             );
         }
     }
-    let mut remainder_section = String::from(
-        "Remaining items (place EVERY un-pinned one in a proposed group or the \
-         ungrouped list; pinned items must NOT be placed in a group). Reference \
-         each item by its id:\n",
-    );
+    let mut remainder_lines = String::new();
     for id in state.remainder() {
         let line = render_member_line(&GroupingMember { id }, &state.table);
         if state.pinned.contains(&id) {
             let _ = writeln!(
-                remainder_section,
+                remainder_lines,
                 "- {id}: {line} [pinned — accepted contradiction reference; do NOT place in a group]"
             );
         } else {
-            let _ = writeln!(remainder_section, "- {id}: {line}");
+            let _ = writeln!(remainder_lines, "- {id}: {line}");
         }
     }
-    remainder_section.pop();
     let section = crate::prompt::substitute(
         &crate::prompt::load_prompt("synthesis/repair_round.md"),
         &[
             ("{{round}}", &round.to_string()),
-            ("{{framing}}", framing),
+            ("{{framing}}", &framing),
             ("{{rejections_section}}", &rejections_section),
-            ("{{frozen_groups_section}}", &frozen_groups_section),
-            ("{{remainder_section}}", &remainder_section),
+            ("{{frozen_groups_lines}}", &frozen_groups_lines),
+            ("{{remainder_lines}}", &remainder_lines),
         ],
     );
     if let Some(last) = request.messages.last_mut() {
@@ -985,5 +1008,287 @@ pub(crate) fn grouping_request(
             workspace: ws.name.clone(),
             ticket_id: None,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Byte-exact pin of the repair-instruction assembly for every PrevRound
+    /// framing: framing sentence, frozen/remainder headers, list lines, and
+    /// blank-line structure. Guards the framing-asset section order (a
+    /// reordered/rewrapped section silently misselects) and the template's
+    /// newline contract (a drifted separator breaks byte-identity).
+    ///
+    /// Only the region this migration changed is hardcoded — the framings
+    /// (via REPAIR_FRAMING_FALLBACK, parity-checked against the asset below),
+    /// the two moved headers, the list rendering, and the newline
+    /// coordination. Unchanged template regions (prefix, lead-in line, schema
+    /// tail) are derived from the asset so unrelated prompt edits don't force
+    /// syncing this test.
+    #[allow(clippy::too_many_lines)] // 5 framings × scenarios: exhaustive byte pin of the moved prose
+    #[test]
+    fn repair_instructions_assembly_is_byte_exact() {
+        // State: item 0 frozen in one group; item 1 stays in the remainder.
+        let items = vec![vec!["first".to_string()], vec!["second".to_string()]];
+        let mut state = RepairState::new(&items);
+        let outcome = process_round(
+            RoundInput {
+                summary: Some("s".to_string()),
+                groups: vec![GroupingGroup {
+                    heading: "G".to_string(),
+                    contradiction: false,
+                    members: vec![GroupingMember { id: 0 }],
+                }],
+                ungrouped: vec![GroupingMember { id: 1 }],
+                references: Vec::new(),
+            },
+            &mut state,
+        );
+        assert_eq!(outcome.froze, 1);
+        assert_eq!(state.remainder(), vec![1]);
+
+        let rejections =
+            vec!["item 1 missing from every proposed group and the ungrouped list".to_string()];
+
+        // The in-Rust fallback (used only when the asset is missing/truncated)
+        // must mirror the asset sections — a reworded asset without a matching
+        // fallback update would silently change the degraded path. The +1 is
+        // the asset's trailing order-contract comment section.
+        let asset_sections = crate::prompt::load_prompt_sections("synthesis/repair_framing.md");
+        let fallback: Vec<String> = REPAIR_FRAMING_FALLBACK
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            asset_sections.len(),
+            REPAIR_FRAMING_FALLBACK.len() + 1,
+            "repair_framing.md must hold the framing sections plus the order-contract comment"
+        );
+        assert_eq!(
+            asset_sections.get(..REPAIR_FRAMING_FALLBACK.len()),
+            Some(fallback.as_slice()),
+            "fallback framings must mirror the asset sections"
+        );
+
+        // Derived unchanged template regions: prefix (round substituted),
+        // lead-in line after {{framing}}, and the schema tail. Exactly one
+        // newline must follow {{remainder_lines}} — the slot's trailing
+        // writeln newline supplies the other half of the blank line before
+        // Respond (the empty-remainder edge: one blank line, never two).
+        let template = crate::prompt::load_prompt("synthesis/repair_round.md");
+        let (raw_prefix, after_framing) = template
+            .split_once("{{framing}}")
+            .expect("repair_round.md must keep the {{framing}} slot");
+        let prefix = raw_prefix.replace("{{round}}", "2");
+        let (lead_in, _) = after_framing
+            .split_once("{{rejections_section}}")
+            .expect("repair_round.md must keep the {{rejections_section}} slot");
+        let (_, after_remainder) = template
+            .split_once("{{remainder_lines}}")
+            .expect("repair_round.md must keep the {{remainder_lines}} slot");
+        let tail = after_remainder
+            .strip_prefix('\n')
+            .expect("repair_round.md must put a single newline after {{remainder_lines}}");
+        assert!(
+            !tail.starts_with('\n'),
+            "repair_round.md must put exactly one newline after {{remainder_lines}}"
+        );
+
+        // Headers that moved into the template — pinned so a reword in the
+        // asset breaks the test instead of silently changing the prompt.
+        let frozen_header = "Frozen groups (skeletons — do NOT re-propose their members; references to a group flagged contradiction:true are ignored):\n";
+        let remainder_header = "Remaining items (place EVERY un-pinned one in a proposed group or the ungrouped list; pinned items must NOT be placed in a group). Reference each item by its id:\n";
+        let with_rejections = format!(
+            "\nRejected proposals still outstanding (fix these):\n\
+             - item 1 missing from every proposed group and the ungrouped list\n\
+             \n{frozen_header}\
+             - 0: \"G\" [agents 0, contradiction: false] — e.g. Agent 0: first (id 0)\n\
+             \n{remainder_header}\
+             - 1: Agent 1: second\n"
+        );
+        let without_rejections = format!(
+            "\n{frozen_header}\
+             - 0: \"G\" [agents 0, contradiction: false] — e.g. Agent 0: first (id 0)\n\
+             \n{remainder_header}\
+             - 1: Agent 1: second\n"
+        );
+        // Variants in asset section order (0-4); the bool is "no outstanding
+        // rejections", which selects section 3 (accepted) vs 4 (partial).
+        let variants: [(PrevRound, bool); 5] = [
+            (PrevRound::Transport, false),
+            (PrevRound::Parse, false),
+            (PrevRound::Processed { accepted: false }, false),
+            (PrevRound::Processed { accepted: true }, true),
+            (PrevRound::Processed { accepted: true }, false),
+        ];
+        for (i, (prev, empty_rejections)) in variants.into_iter().enumerate() {
+            let mut request =
+                crate::providers::test_request(vec![crate::ChatMessage::user("")], None);
+            append_repair_instructions(
+                &mut request,
+                2,
+                &state,
+                if empty_rejections { &[] } else { &rejections },
+                prev,
+            );
+            let middle = if empty_rejections {
+                &without_rejections
+            } else {
+                &with_rejections
+            };
+            let expected = format!(
+                "{prefix}{framing}{lead_in}{middle}\n{tail}",
+                framing = REPAIR_FRAMING_FALLBACK[i]
+            );
+            assert_eq!(
+                request.messages.last().unwrap().content,
+                expected,
+                "variant {i}: framing misselection or newline drift"
+            );
+        }
+
+        // Empty-frozen edge: `- none` under the frozen header.
+        let no_frozen = RepairState::new(&items);
+        let mut request = crate::providers::test_request(vec![crate::ChatMessage::user("")], None);
+        append_repair_instructions(&mut request, 2, &no_frozen, &[], PrevRound::Transport);
+        let empty_frozen = format!(
+            "\n{frozen_header}\
+             - none\n\
+             \n{remainder_header}\
+             - 0: Agent 0: first\n\
+             - 1: Agent 1: second\n"
+        );
+        assert_eq!(
+            request.messages.last().unwrap().content,
+            format!(
+                "{prefix}{framing}{lead_in}{empty_frozen}\n{tail}",
+                framing = REPAIR_FRAMING_FALLBACK[0]
+            ),
+            "empty-frozen: `- none` line or newline drift"
+        );
+
+        // Pinned-marker path: an accepted contradiction reference pins item 1
+        // to the remainder (it must render with the marker, never in a group).
+        let mut pinned_state = RepairState::new(&items);
+        let outcome = process_round(
+            RoundInput {
+                summary: Some("s".to_string()),
+                groups: vec![GroupingGroup {
+                    heading: "G".to_string(),
+                    contradiction: false,
+                    members: vec![GroupingMember { id: 0 }],
+                }],
+                ungrouped: vec![GroupingMember { id: 1 }],
+                references: vec![GroupingReference {
+                    member: GroupingMember { id: 1 },
+                    group: 0,
+                }],
+            },
+            &mut pinned_state,
+        );
+        assert_eq!(outcome.froze, 1);
+        assert_eq!(outcome.accepted_refs, 1);
+        let mut request = crate::providers::test_request(vec![crate::ChatMessage::user("")], None);
+        append_repair_instructions(&mut request, 2, &pinned_state, &[], PrevRound::Transport);
+        let pinned = format!(
+            "\n{frozen_header}\
+             - 0: \"G\" [agents 0, contradiction: false] — e.g. Agent 0: first (id 0)\n\
+             \n{remainder_header}\
+             - 1: Agent 1: second [pinned — accepted contradiction reference; do NOT place in a group]\n"
+        );
+        assert_eq!(
+            request.messages.last().unwrap().content,
+            format!(
+                "{prefix}{framing}{lead_in}{pinned}\n{tail}",
+                framing = REPAIR_FRAMING_FALLBACK[0]
+            ),
+            "pinned-marker: marker text or newline drift"
+        );
+
+        // Empty-remainder edge: all items frozen — the empty remainder slot
+        // must still yield exactly one blank line before Respond.
+        let mut all_frozen = RepairState::new(&items);
+        let outcome = process_round(
+            RoundInput {
+                summary: Some("s".to_string()),
+                groups: vec![
+                    GroupingGroup {
+                        heading: "G".to_string(),
+                        contradiction: false,
+                        members: vec![GroupingMember { id: 0 }],
+                    },
+                    GroupingGroup {
+                        heading: "G1".to_string(),
+                        contradiction: false,
+                        members: vec![GroupingMember { id: 1 }],
+                    },
+                ],
+                ungrouped: Vec::new(),
+                references: Vec::new(),
+            },
+            &mut all_frozen,
+        );
+        assert_eq!(outcome.froze, 2);
+        assert!(all_frozen.remainder().is_empty());
+        let mut request = crate::providers::test_request(vec![crate::ChatMessage::user("")], None);
+        append_repair_instructions(&mut request, 2, &all_frozen, &[], PrevRound::Transport);
+        let empty_remainder = format!(
+            "\n{frozen_header}\
+             - 0: \"G\" [agents 0, contradiction: false] — e.g. Agent 0: first (id 0)\n\
+             - 1: \"G1\" [agents 1, contradiction: false] — e.g. Agent 1: second (id 1)\n\
+             \n{remainder_header}"
+        );
+        assert_eq!(
+            request.messages.last().unwrap().content,
+            format!(
+                "{prefix}{framing}{lead_in}{empty_remainder}\n{tail}",
+                framing = REPAIR_FRAMING_FALLBACK[0]
+            ),
+            "empty-remainder: must not gain a blank line before Respond"
+        );
+    }
+
+    /// Independent PrevRound → framing pin: each variant's sentence must keep
+    /// its marker, and the marker set pairwise-distinguishes the five framings
+    /// ("rejected" is shared with the partially-accepted sentence, but
+    /// "partially" still catches that swap), with pairwise distinctness
+    /// enforced too. A coordinated reorder of the asset and the fallback
+    /// consts (invisible to the byte compare above, which derives its
+    /// expectation from the consts) cannot silently swap which sentence
+    /// reaches the model. The markers are semantic invariants — dropping one
+    /// changes the framing's meaning.
+    #[test]
+    fn repair_framing_mapping_is_pinned() {
+        let rejections =
+            vec!["item 1 missing from every proposed group and the ungrouped list".to_string()];
+        let variants: [(PrevRound, &[String], &str); 5] = [
+            (PrevRound::Transport, &[], "transport"),
+            (PrevRound::Parse, &[], "parsed"),
+            (PrevRound::Processed { accepted: false }, &[], "rejected"),
+            (
+                PrevRound::Processed { accepted: true },
+                &[],
+                "still need placement",
+            ),
+            (
+                PrevRound::Processed { accepted: true },
+                &rejections,
+                "partially",
+            ),
+        ];
+        let mut seen = HashSet::new();
+        for (prev, outstanding, keyword) in variants {
+            let framing = repair_framing(prev, outstanding);
+            assert!(
+                framing.contains(keyword),
+                "framing for {prev:?} lost its disposition keyword {keyword:?}"
+            );
+            assert!(
+                seen.insert(framing),
+                "framings must be pairwise distinct for {prev:?}"
+            );
+        }
     }
 }
