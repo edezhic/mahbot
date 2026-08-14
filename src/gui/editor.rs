@@ -2550,9 +2550,7 @@ impl EditorState {
                         let cursor_line = goto_line_1based.saturating_sub(1);
                         let tab_path = self.tabs[self.active_tab_index].path.clone();
                         if let Some(tab_data) = self.tab_contents.get_mut(&tab_path) {
-                            let max_line = tab_data.content.line_count();
-                            let line = cursor_line.min(max_line.saturating_sub(1));
-                            tab_data.content.move_to(line, 0);
+                            tab_data.content.move_to(cursor_line, 0);
                         }
                     }
                 }
@@ -2830,9 +2828,9 @@ impl EditorState {
                         new_text.replace_range(range.start..range.end, replace);
                     }
                     tab_data.content = EditorBuffer::from_file(&new_text, &path);
-                    let max_line = tab_data.content.line_count().saturating_sub(1);
-                    let line = cursor_before.line.min(max_line);
-                    tab_data.content.move_to(line, cursor_before.column);
+                    tab_data
+                        .content
+                        .move_to(cursor_before.line, cursor_before.column);
                     // Clear matches since they're all replaced.
                     if let Some(ref mut state) = tab_data.find_replace_state {
                         state.matches.clear();
@@ -3089,9 +3087,7 @@ impl EditorState {
             return Task::none();
         };
         if let Some(tab_data) = self.tab_contents.get_mut(&path) {
-            let max_line = tab_data.content.line_count();
-            let line = line_num.min(max_line.saturating_sub(1));
-            tab_data.content.move_to(line, 0);
+            tab_data.content.move_to(line_num, 0);
         }
         self.active_modal = None;
         Task::none()
@@ -3155,9 +3151,7 @@ impl EditorState {
         if let Some(existing_idx) = self.tabs.iter().position(|t| t.path == abs_path) {
             self.active_tab_index = existing_idx;
             if let Some(tab_data) = self.tab_contents.get_mut(&abs_path) {
-                let max_line = tab_data.content.line_count();
-                let line = cursor_line.min(max_line.saturating_sub(1));
-                tab_data.content.move_to(line, 0);
+                tab_data.content.move_to(cursor_line, 0);
             }
             return self.scroll_to_active_tab();
         }

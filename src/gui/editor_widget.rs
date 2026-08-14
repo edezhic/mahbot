@@ -255,6 +255,15 @@ impl EditorBuffer {
         self.buffer.borrow().lines.len()
     }
 
+    /// Return the number of characters on the given line (0 for missing lines).
+    fn line_char_len(&self, line: usize) -> usize {
+        self.buffer
+            .borrow()
+            .lines
+            .get(line)
+            .map_or(0, |l| l.text().chars().count())
+    }
+
     // ── Cursor ────────────────────────────────────────────────────
 
     /// Return the current cursor state, including selection anchor if any.
@@ -320,12 +329,7 @@ impl EditorBuffer {
         }
         // Set cursor to end of last line
         let last_line = line_count - 1;
-        let last_line_len = self
-            .buffer
-            .borrow()
-            .lines
-            .last()
-            .map_or(0, |l| l.text().chars().count());
+        let last_line_len = self.line_char_len(last_line);
         self.cursor_line.set(last_line);
         self.cursor_col.set(last_line_len);
         // Set selection anchor to start
@@ -434,11 +438,7 @@ impl EditorBuffer {
 
     /// Clamp a column value to the number of characters on the given line.
     fn clamp_col_to_line(&self, line: usize, col: usize) -> usize {
-        self.buffer
-            .borrow()
-            .lines
-            .get(line)
-            .map_or(0, |l| l.text().chars().count().min(col))
+        self.line_char_len(line).min(col)
     }
 
     /// Set the inner [`cosmic_text::Buffer`] content with optional
@@ -698,12 +698,7 @@ impl EditorBuffer {
             let (new_line, new_col) = if deleted == "\n" {
                 // Moved up from start of line: go to end of previous line
                 let new_cl = cl.saturating_sub(1);
-                let prev_line_text = self
-                    .buffer
-                    .borrow()
-                    .lines
-                    .get(new_cl)
-                    .map_or(0, |l| l.text().chars().count());
+                let prev_line_text = self.line_char_len(new_cl);
                 (new_cl, prev_line_text)
             } else {
                 (cl, cc.saturating_sub(1))
@@ -919,12 +914,7 @@ impl EditorBuffer {
                 Some((line, col - 1))
             } else if line > 0 {
                 let prev_line = line - 1;
-                let prev_len = self
-                    .buffer
-                    .borrow()
-                    .lines
-                    .get(prev_line)
-                    .map_or(0, |l| l.text().chars().count());
+                let prev_len = self.line_char_len(prev_line);
                 Some((prev_line, prev_len))
             } else {
                 None
@@ -937,12 +927,7 @@ impl EditorBuffer {
         self.with_cursor_movement(extend_selection, || {
             let (line, col) = (self.cursor_line.get(), self.cursor_col.get());
             let max_line = self.line_count().saturating_sub(1);
-            let line_len = self
-                .buffer
-                .borrow()
-                .lines
-                .get(line)
-                .map_or(0, |l| l.text().chars().count());
+            let line_len = self.line_char_len(line);
             if col < line_len {
                 Some((line, col + 1))
             } else if line < max_line {
@@ -990,12 +975,7 @@ impl EditorBuffer {
     fn do_move_end(&self, extend_selection: bool) {
         self.with_cursor_movement(extend_selection, || {
             let line = self.cursor_line.get();
-            let line_len = self
-                .buffer
-                .borrow()
-                .lines
-                .get(line)
-                .map_or(0, |l| l.text().chars().count());
+            let line_len = self.line_char_len(line);
             Some((line, line_len))
         });
     }
@@ -1040,12 +1020,7 @@ impl EditorBuffer {
     fn do_move_doc_end(&self, extend_selection: bool) {
         self.with_cursor_movement(extend_selection, || {
             let max_line = self.line_count().saturating_sub(1);
-            let line_len = self
-                .buffer
-                .borrow()
-                .lines
-                .get(max_line)
-                .map_or(0, |l| l.text().chars().count());
+            let line_len = self.line_char_len(max_line);
             Some((max_line, line_len))
         });
     }
