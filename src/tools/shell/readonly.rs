@@ -4915,13 +4915,15 @@ fn is_unprovable_flag_token(part: &str) -> bool {
 /// `$var` operands are pervasive in read-only commands (URLs, temp paths,
 /// sed scripts) and stay usable, while the braced spelling at a
 /// mutation-relevant word is over-rejected like any other unprovable span.
-/// `p` is the caller's shell-normalized word ([`shell_word`]) — callers that
-/// already hold it pass it to avoid a redundant recomputation. The curl/wget
-/// output gates have NO bare-`$var` arm (only this span-based predicate), so
-/// `curl $port URL` with `port='-o /etc/passwd'` can field-split the flag out
-/// — a pre-existing accepted residual (the old plain-split guard allowed it
-/// too).
+/// The curl/wget output gates have NO bare-`$var` arm (only this span-based
+/// predicate), so `curl $port URL` with `port='-o /etc/passwd'` can
+/// field-split the flag out — a pre-existing accepted residual (the old
+/// plain-split guard allowed it too). `p` is the caller's shell-normalized
+/// word ([`shell_word`]); it must equal `shell_word(w)` (debug-asserted) —
+/// the cluster/sed gates already hold it for their own scans and pass it,
+/// the output gates compute it per word in their caller.
 fn substitution_could_form_flag(w: &str, p: &str) -> bool {
+    debug_assert_eq!(p, shell_word(w));
     (word_has_substitution(w) && (p.starts_with('-') || p.starts_with(['$', '`'])))
         || unquoted_span_could_field_split_flag(w)
 }
@@ -5125,10 +5127,10 @@ fn bare_var_could_form_prefix(w: &str, token: &str) -> bool {
 /// field-splits a flag (`git hash-object --$w file`, `w='x -w'` → fields
 /// `--x`, `-w`) escapes while the `$(...)` spelling is caught — accepted
 /// residual, unlike the fixed-token gates which fire on any-position bare
-/// vars ([`word_could_form_token_or_bare_var`]). `p` is the caller's
-/// shell-normalized word ([`shell_word`]) — callers that already hold it
-/// pass it to avoid a redundant recomputation.
+/// vars ([`word_could_form_token_or_bare_var`]). `p` contract: see
+/// [`substitution_could_form_flag`].
 fn unprovable_flag_word(w: &str, p: &str) -> bool {
+    debug_assert_eq!(p, shell_word(w));
     substitution_could_form_flag(w, p) || (contains_bare_var(w) && p.starts_with(['$', '`']))
 }
 
@@ -5144,11 +5146,12 @@ fn word_could_form_token_or_bare_var(w: &str, token: &str) -> bool {
     word_could_form_token(w, token, "") || contains_bare_var(w)
 }
 
-/// True when `w` contains any expansion whose output is unprovable: a
-/// substitution span ([`word_has_substitution`]) or a bare `$var`
-/// ([`contains_bare_var`]). Used at fixed-dictionary positions (git reflog
-/// subcommand, fsck flags) where ANY unprovable word fails closed; the finer
-/// substitution-only / bare-var-armed gates use the predicates directly.
+/// True when `w` contains any expansion the fixed-dictionary gates fail
+/// closed on: a substitution span ([`word_has_substitution`] — incl. bodies
+/// that provably echo single fields; these gates don't fold) or a bare
+/// `$var` ([`contains_bare_var`]). Used at git reflog-subcommand and fsck
+/// flag positions; the finer substitution-only / bare-var-armed gates use
+/// the predicates directly.
 fn word_has_unprovable_expansion(w: &str) -> bool {
     word_has_substitution(w) || contains_bare_var(w)
 }
@@ -5362,10 +5365,10 @@ fn has_output_mutation(command: &str, state: &ValidationState, spec: &OutputFlag
     // A substitution word could deliver an output flag (`-o`, `-O`,
     // `--output`) — its output is unprovable, so fail closed (see
     // [`substitution_could_form_flag`]).
-    if parts.iter().any(|w| {
-        let p = shell_word(w);
-        substitution_could_form_flag(w, &p)
-    }) {
+    if parts
+        .iter()
+        .any(|w| substitution_could_form_flag(w, &shell_word(w)))
+    {
         return true;
     }
 
@@ -5446,10 +5449,10 @@ fn has_wget_mutation(command: &str, state: &ValidationState) -> bool {
 
     // A substitution word could deliver `-O`/`-P` (unprovable) — fail closed,
     // same contract as [`has_output_mutation`].
-    if parts.iter().any(|w| {
-        let p = shell_word(w);
-        substitution_could_form_flag(w, &p)
-    }) {
+    if parts
+        .iter()
+        .any(|w| substitution_could_form_flag(w, &shell_word(w)))
+    {
         return true;
     }
 
