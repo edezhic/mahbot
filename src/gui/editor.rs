@@ -546,8 +546,6 @@ pub enum EditorMessage {
     NewItemSubmit(String),
     /// User changed the new-item name input.
     NewItemInput(String),
-    /// Internal: reveal-in-finder operation completed (no-op).
-    RevealDone,
     // ── Inline rename ───────────────────────────────────────────
     /// Context menu: rename a file or directory (starts inline rename).
     RenameRequested(String),
@@ -2246,7 +2244,7 @@ impl EditorState {
 
             EditorMessage::Tick => self.tick(),
 
-            EditorMessage::RevealDone | EditorMessage::Toast(_) => Task::none(),
+            EditorMessage::Toast(_) => Task::none(),
 
             EditorMessage::GitStatusLoaded { r#gen, result } => finish_git_load(
                 &mut self.git_status_loading,
@@ -5235,8 +5233,9 @@ impl EditorState {
                     }
                 }
             },
-            |()| EditorMessage::RevealDone,
+            |()| (),
         )
+        .discard::<EditorMessage>()
     }
 }
 

@@ -1741,6 +1741,11 @@ pub(crate) fn char_col_to_byte_offset_in_line(line_text: &str, char_col: usize) 
     line_text.chars().take(char_col).map(char::len_utf8).sum()
 }
 
+/// Convert a byte-based column on a single line to a character-based column.
+pub(crate) fn byte_col_to_char_col_in_line(line_text: &str, byte_col: usize) -> usize {
+    line_text[..byte_col.min(line_text.len())].chars().count()
+}
+
 /// Byte range `[start, end)` covering the single character at `char_col` on
 /// `line_text`, or an empty range at the line end if `char_col` is past EOF.
 pub(crate) fn char_col_to_byte_range_in_line(line_text: &str, char_col: usize) -> (usize, usize) {
@@ -1927,8 +1932,7 @@ fn hit_test(
     let buf = buffer.borrow_buffer();
     let hit = buf.hit(buf_x, buf_y)?;
     let line_text = buf.lines.get(hit.line).map_or("", |l| l.text());
-    let byte_offset = hit.index.min(line_text.len());
-    let col = line_text[..byte_offset].chars().count();
+    let col = byte_col_to_char_col_in_line(line_text, hit.index);
     Some((hit.line, col))
 }
 
@@ -1960,8 +1964,8 @@ fn find_cursor_run<'a>(
         // preserves horizontal position when navigating Up/Down
         // between wrapped visual rows.
         if let (Some(first), Some(last)) = (run.glyphs.first(), run.glyphs.last()) {
-            let first_char = run.text[..first.start].chars().count();
-            let last_char = run.text[..last.end.min(run.text.len())].chars().count();
+            let first_char = byte_col_to_char_col_in_line(run.text, first.start);
+            let last_char = byte_col_to_char_col_in_line(run.text, last.end);
             if cursor_col >= first_char && cursor_col <= last_char {
                 return Some(run);
             }
@@ -2634,7 +2638,7 @@ where
                                     .iter()
                                     .find(|g| {
                                         cursor.column
-                                            < run.text[..g.end.min(run.text.len())].chars().count()
+                                            < byte_col_to_char_col_in_line(run.text, g.end)
                                     })
                                     .map_or_else(
                                         || run.glyphs.last().map_or(0.0, |last| last.x + last.w),
@@ -2652,8 +2656,7 @@ where
                                 buffer.hit(cursor_x, target_y).map(|hit| {
                                     let line_text =
                                         buffer.lines.get(hit.line).map_or("", |l| l.text());
-                                    let col =
-                                        line_text[..hit.index.min(line_text.len())].chars().count();
+                                    let col = byte_col_to_char_col_in_line(line_text, hit.index);
                                     (hit.line, col)
                                 })
                             } else {
@@ -2671,8 +2674,7 @@ where
                                 buffer.hit(0.0, target_y).map(|hit| {
                                     let line_text =
                                         buffer.lines.get(hit.line).map_or("", |l| l.text());
-                                    let col =
-                                        line_text[..hit.index.min(line_text.len())].chars().count();
+                                    let col = byte_col_to_char_col_in_line(line_text, hit.index);
                                     (hit.line, col)
                                 })
                             }
@@ -2750,10 +2752,10 @@ where
 
                                 // Visual row boundary columns (character-based).
                                 let visual_start: usize = first.map_or(0, |g| {
-                                    line_text[..g.start.min(line_text.len())].chars().count()
+                                    byte_col_to_char_col_in_line(line_text, g.start)
                                 });
                                 let visual_end: usize = last.map_or(line_len, |g| {
-                                    line_text[..g.end.min(line_text.len())].chars().count()
+                                    byte_col_to_char_col_in_line(line_text, g.end)
                                 });
 
                                 if is_cmd_left {
@@ -3155,9 +3157,7 @@ fn draw_cursor<Renderer>(
             let found_x = run
                 .glyphs
                 .iter()
-                .find(|g| {
-                    cursor_state.column < run.text[..g.end.min(run.text.len())].chars().count()
-                })
+                .find(|g| cursor_state.column < byte_col_to_char_col_in_line(run.text, g.end))
                 .map(|g| g.x);
             cursor_x = geo.x
                 + found_x.unwrap_or_else(|| run.glyphs.last().map_or(0.0, |last| last.x + last.w));
