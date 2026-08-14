@@ -2291,20 +2291,16 @@ fn compute_mel_spectrogram(models: &OnnxModels, samples: &[f32]) -> Result<Vec<V
     debug!("Mel spectrogram output shape: {shape:?}");
 
     let (num_frames, num_features) = if shape.len() == 3 {
-        if shape[2] as usize == NUM_MEL_BANDS {
-            (shape[1] as usize, shape[2] as usize)
-        } else if shape[1] as usize == NUM_MEL_BANDS {
-            (shape[2] as usize, shape[1] as usize)
+        if shape[2] == NUM_MEL_BANDS {
+            (shape[1], shape[2])
+        } else if shape[1] == NUM_MEL_BANDS {
+            (shape[2], shape[1])
         } else {
             anyhow::bail!("Unexpected mel shape: {shape:?} (expected {NUM_MEL_BANDS} bands)")
         }
-    } else if shape.len() == 4
-        && shape[0] == 1
-        && shape[1] == 1
-        && shape[3] as usize == NUM_MEL_BANDS
-    {
+    } else if shape.len() == 4 && shape[0] == 1 && shape[1] == 1 && shape[3] == NUM_MEL_BANDS {
         // 4D NHWC output: (1, 1, num_frames, NUM_MEL_BANDS) — squeeze batch and channel dims.
-        (shape[2] as usize, shape[3] as usize)
+        (shape[2], shape[3])
     } else {
         anyhow::bail!("Unexpected mel output shape: {shape:?}");
     };
