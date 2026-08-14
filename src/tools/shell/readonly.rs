@@ -4437,8 +4437,7 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
             let words = split_words_keeping_substitutions(&subcommand);
             if let Some(raw) = words.get(1) {
                 let reflog_sub = shell_word(raw);
-                if word_has_substitution(raw)
-                    || contains_bare_var(raw)
+                if word_has_unprovable_expansion(raw)
                     || reflog_sub == "expire"
                     || reflog_sub == "delete"
                 {
@@ -4457,9 +4456,7 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
             if split_words_keeping_substitutions(&subcommand)
                 .iter()
                 .any(|raw| {
-                    shell_word(raw).starts_with("--l")
-                        || word_has_substitution(raw)
-                        || contains_bare_var(raw)
+                    shell_word(raw).starts_with("--l") || word_has_unprovable_expansion(raw)
                 }) =>
         {
             return reject(
@@ -4918,8 +4915,13 @@ fn is_unprovable_flag_token(part: &str) -> bool {
 /// `$var` operands are pervasive in read-only commands (URLs, temp paths,
 /// sed scripts) and stay usable, while the braced spelling at a
 /// mutation-relevant word is over-rejected like any other unprovable span.
-fn substitution_could_form_flag(w: &str) -> bool {
-    let p = shell_word(w);
+/// `p` is the caller's shell-normalized word ([`shell_word`]) — callers that
+/// already hold it pass it to avoid a redundant recomputation. The curl/wget
+/// output gates have NO bare-`$var` arm (only this span-based predicate), so
+/// `curl $port URL` with `port='-o /etc/passwd'` can field-split the flag out
+/// — a pre-existing accepted residual (the old plain-split guard allowed it
+/// too).
+fn substitution_could_form_flag(w: &str, p: &str) -> bool {
     (word_has_substitution(w) && (p.starts_with('-') || p.starts_with(['$', '`'])))
         || unquoted_span_could_field_split_flag(w)
 }
@@ -5119,10 +5121,15 @@ fn bare_var_could_form_prefix(w: &str, token: &str) -> bool {
 /// ANY word starting with `$`/`` ` `` — including read-only temp operands
 /// (`git hash-object $TMPDIR/f file`, `sed s/a/b/ $TMPDIR/x`) — the accepted
 /// over-rejection contract of both call sites (see the git hash-object and
-/// sed gates).
-fn unprovable_flag_word(w: &str) -> bool {
-    substitution_could_form_flag(w)
-        || (contains_bare_var(w) && shell_word(w).starts_with(['$', '`']))
+/// sed gates). The arm is word-start-gated, so a mid-word bare var that
+/// field-splits a flag (`git hash-object --$w file`, `w='x -w'` → fields
+/// `--x`, `-w`) escapes while the `$(...)` spelling is caught — accepted
+/// residual, unlike the fixed-token gates which fire on any-position bare
+/// vars ([`word_could_form_token_or_bare_var`]). `p` is the caller's
+/// shell-normalized word ([`shell_word`]) — callers that already hold it
+/// pass it to avoid a redundant recomputation.
+fn unprovable_flag_word(w: &str, p: &str) -> bool {
+    substitution_could_form_flag(w, p) || (contains_bare_var(w) && p.starts_with(['$', '`']))
 }
 
 /// True when a substitution word could expand to `token` at a fixed-token
@@ -5137,26 +5144,31 @@ fn word_could_form_token_or_bare_var(w: &str, token: &str) -> bool {
     word_could_form_token(w, token, "") || contains_bare_var(w)
 }
 
+/// True when `w` contains any expansion whose output is unprovable: a
+/// substitution span ([`word_has_substitution`]) or a bare `$var`
+/// ([`contains_bare_var`]). Used at fixed-dictionary positions (git reflog
+/// subcommand, fsck flags) where ANY unprovable word fails closed; the finer
+/// substitution-only / bare-var-armed gates use the predicates directly.
+fn word_has_unprovable_expansion(w: &str) -> bool {
+    word_has_substitution(w) || contains_bare_var(w)
+}
+
 /// True when any single-dash token in `command` contains a char from
 /// `mutation`, combined-cluster aware (`-df`, `-wt`, quoted `'-do'`).
 /// `value_taking` chars consume the rest of their token (attached value), so
 /// later chars are never misread as flags (`-tw` is `-t w`, `-dio` is
 /// `-d -i 'o'`). Long flags and tokens without a leading dash never match.
-/// Tokens are normalized as the shell delivers them ([`shell_word`]). A
-/// substitution word that could expand to a flag fails closed (see
-/// [`substitution_could_form_flag`]).
+/// Tokens are normalized as the shell delivers them ([`shell_word`]). A word
+/// that could deliver a mutation char via a substitution or word-start bare
+/// `$var` fails closed ([`unprovable_flag_word`]).
 fn has_cluster_char(command: &str, mutation: &[char], value_taking: &[char]) -> bool {
     split_words_keeping_substitutions(command)
         .into_iter()
         .any(|w| {
-            // [`unprovable_flag_word`] also over-rejects temp-tracked
-            // operands (`git hash-object $TMPDIR/f file` — the raw word
-            // starts with `$`) — accepted fail-closed, same contract as the
-            // sed in-place gate below.
-            if unprovable_flag_word(w) {
+            let p = shell_word(w);
+            if unprovable_flag_word(w, &p) {
                 return true; // unprovable: the word could deliver a mutation char
             }
-            let p = shell_word(w);
             if !p.starts_with('-') || p.starts_with("--") {
                 return false;
             }
@@ -5200,11 +5212,7 @@ fn has_sed_mutation(command: &str, state: &ValidationState) -> bool {
         (p.starts_with('-') && !p.starts_with("--") && p.contains(['i', 'I']))
             || p.starts_with("--i")
             || is_unprovable_flag_token(part)
-            // `unprovable_flag_word` fires on ANY word starting with
-            // `$`/`` ` `` — including read-only operand positions
-            // (`sed s/a/b/ $TMPDIR/x` trips it; `$TMPDIR` is neither `-i`
-            // nor a sed script) — accepted fail-closed over-rejection
-            || unprovable_flag_word(part)
+            || unprovable_flag_word(part, &p)
     });
     let Some(i_pos) = i_pos else {
         return false; // no in-place flag → not a sed mutation
@@ -5354,7 +5362,10 @@ fn has_output_mutation(command: &str, state: &ValidationState, spec: &OutputFlag
     // A substitution word could deliver an output flag (`-o`, `-O`,
     // `--output`) — its output is unprovable, so fail closed (see
     // [`substitution_could_form_flag`]).
-    if parts.iter().any(|w| substitution_could_form_flag(w)) {
+    if parts.iter().any(|w| {
+        let p = shell_word(w);
+        substitution_could_form_flag(w, &p)
+    }) {
         return true;
     }
 
@@ -5435,7 +5446,10 @@ fn has_wget_mutation(command: &str, state: &ValidationState) -> bool {
 
     // A substitution word could deliver `-O`/`-P` (unprovable) — fail closed,
     // same contract as [`has_output_mutation`].
-    if parts.iter().any(|w| substitution_could_form_flag(w)) {
+    if parts.iter().any(|w| {
+        let p = shell_word(w);
+        substitution_could_form_flag(w, &p)
+    }) {
         return true;
     }
 
@@ -6689,8 +6703,6 @@ mod tests {
             // ── documented fail-closed over-rejections of previously-allowed
             // legit reads (accepted per scope; pinned so they don't silently
             // become bypasses) ──
-            ("curl https://x/$(hostname)/y", false), // unprovable span in curl → blanket reject
-            ("curl https://x/$(echo v1)/y", true),   // provably single field: no split, allowed
             ("curl \"$(echo -o /tmp/x)\" URL", false), // whole-word quoted output flag (value unprovable)
             ("git hash-object $TMPDIR/foo file", false), // bare-var operand over-rejection
             ("sed s/a/b/ $TMPDIR/x", false),           // bare-var operand over-rejection
