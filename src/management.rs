@@ -3249,11 +3249,7 @@ async fn load_ticket_stage_slots(job_id: &str) -> anyhow::Result<Vec<TicketStage
             idx: r.idx.unwrap_or(0),
             agent_id: r.agent_id,
             task: r.task,
-            status: match r.status.as_str() {
-                "done" => crate::jobs::RowStatus::Done,
-                "failed" => crate::jobs::RowStatus::Failed,
-                _ => crate::jobs::RowStatus::Launched,
-            },
+            status: r.status.parse().unwrap_or(crate::jobs::RowStatus::Launched),
             outcome: r.outcome,
         })
         .collect())

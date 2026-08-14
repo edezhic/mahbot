@@ -281,7 +281,7 @@ async fn run_ask_with_job(
             .collect();
         let pre_done: Vec<(String, String)> = rows
             .into_iter()
-            .filter(|r| r.status == "done")
+            .filter(|r| r.status == crate::jobs::RowStatus::Done.as_str())
             .filter_map(|r| r.outcome.map(|o| (r.agent_id, o)))
             .collect();
         (slots, pre_done)

@@ -43,6 +43,22 @@ impl RowStatus {
     }
 }
 
+impl std::str::FromStr for RowStatus {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Case-sensitive to mirror the schema dictionary exactly.
+        match s {
+            "launched" => Ok(Self::Launched),
+            "done" => Ok(Self::Done),
+            "failed" => Ok(Self::Failed),
+            _ => Err(anyhow::anyhow!(
+                "Invalid row status '{s}'. Valid statuses: launched, done, failed"
+            )),
+        }
+    }
+}
+
 /// Values of `agents.kind` — dispatch-slot kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
