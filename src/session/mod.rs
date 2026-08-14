@@ -1861,7 +1861,7 @@ pub(crate) enum DecodedNativeHistoryMessage {
         reasoning: Option<Reasoning>,
     },
     ToolResult {
-        tool_call_id: Option<String>,
+        tool_call_id: String,
         content: String,
     },
 }
@@ -1911,7 +1911,7 @@ pub(crate) fn decode_native_history_message(
         && let Ok(payload) = serde_json::from_str::<ToolResultPayload>(&message.content)
     {
         return Some(DecodedNativeHistoryMessage::ToolResult {
-            tool_call_id: Some(payload.tool_call_id),
+            tool_call_id: payload.tool_call_id,
             content: payload.content,
         });
     }

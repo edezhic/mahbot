@@ -517,7 +517,7 @@ impl OpenAiCompatibleProvider {
                         } => (
                             ChatRole::Tool.to_string(),
                             Some(content),
-                            tool_call_id,
+                            Some(tool_call_id),
                             None, // tool_calls
                             None, // reasoning
                         ),

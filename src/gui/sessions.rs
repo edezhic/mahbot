@@ -324,7 +324,7 @@ impl SessionsState {
                 text_content: Option<String>,
             },
             ToolResult {
-                tool_call_id: Option<String>,
+                tool_call_id: String,
                 content: String,
             },
         }
@@ -466,7 +466,7 @@ impl SessionsState {
                     text_content,
                 } => {
                     // Collect consecutive ToolResult messages after this tool call
-                    let mut result_msgs: Vec<(usize, &str, Option<&str>)> = Vec::new();
+                    let mut result_msgs: Vec<(usize, &str, &str)> = Vec::new();
                     // (msg_index, content, tool_call_id)
 
                     let mut j = i + 1;
@@ -476,7 +476,7 @@ impl SessionsState {
                             ref content,
                         } = decoded_msgs[j].kind
                         {
-                            result_msgs.push((j, content.as_str(), tool_call_id.as_deref()));
+                            result_msgs.push((j, content.as_str(), tool_call_id.as_str()));
                             j += 1;
                         } else {
                             break;
@@ -491,7 +491,7 @@ impl SessionsState {
                     for call in calls {
                         // Try to find a result with matching tool_call_id
                         let found = result_msgs.iter().position(|(idx, _content, cid)| {
-                            cid == &Some(call.id.as_str()) && !used_results.contains(idx)
+                            *cid == call.id.as_str() && !used_results.contains(idx)
                         });
 
                         if let Some(pos) = found {
@@ -509,77 +509,14 @@ impl SessionsState {
                         }
                     }
 
-                    // Unmatched results (not consumed by ID matching) —
-                    // try positional fallback for None tool_call_id results
-                    let unmatched_results: Vec<(usize, &str)> = result_msgs
+                    // Unmatched results (not consumed by ID matching)
+                    let stray_unmatched_results: Vec<(usize, &str)> = result_msgs
                         .iter()
                         .filter(|(idx, _content, _cid)| !used_results.contains(idx))
                         .map(|(idx, content, _cid)| (*idx, *content))
                         .collect();
 
-                    // Positional fallback: pair first unmatched result (with None ID)
-                    // with first unmatched call (that had no result). Only applied
-                    // when counts of None-ID results and unmatched calls align,
-                    // so ordering is unambiguous.
-                    let mut fallback_results: Vec<(usize, &str)> = Vec::new();
-                    let mut unmatched_calls: Vec<&ToolCallInfo> = Vec::new();
-
-                    for pair in &matched {
-                        if pair.result_content.is_none() {
-                            unmatched_calls.push(pair.call);
-                        }
-                    }
-
-                    // Only use positional fallback for None-ID results
-                    // when counts align exactly.
-                    let none_id_results: Vec<(usize, &str)> = unmatched_results
-                        .iter()
-                        .filter(|(idx, _content)| {
-                            if let DecodedMsgKind::ToolResult { tool_call_id, .. } =
-                                &decoded_msgs[*idx].kind
-                            {
-                                tool_call_id.is_none()
-                            } else {
-                                false
-                            }
-                        })
-                        .copied()
-                        .collect();
-
-                    if none_id_results.len() == unmatched_calls.len() && !none_id_results.is_empty()
-                    {
-                        // Positional match: pair first-to-first, second-to-second, etc.
-                        let mut with_fallback: Vec<MatchedPair<'_>> = Vec::new();
-                        let mut fallback_iter = none_id_results.iter();
-                        for pair in &matched {
-                            if pair.result_content.is_none()
-                                && let Some((fb_idx, fb_content)) = fallback_iter.next()
-                            {
-                                fallback_results.push((*fb_idx, *fb_content));
-                                with_fallback.push(MatchedPair {
-                                    call: pair.call,
-                                    result_content: Some(fb_content),
-                                });
-                            } else {
-                                with_fallback.push(MatchedPair {
-                                    call: pair.call,
-                                    result_content: pair.result_content,
-                                });
-                            }
-                        }
-                        matched = with_fallback;
-                    }
-
-                    // Rebuild unmatched results excluding fallback ones
-                    let fallback_idxs: std::collections::HashSet<usize> =
-                        fallback_results.iter().map(|(idx, _)| *idx).collect();
-
-                    let stray_unmatched_results: Vec<(usize, &str)> = unmatched_results
-                        .into_iter()
-                        .filter(|(idx, _)| !fallback_idxs.contains(idx))
-                        .collect();
-
-                    // Recompute unmatched calls (after fallback)
+                    // Unmatched calls (no result)
                     let final_unmatched_calls: Vec<&ToolCallInfo> = matched
                         .iter()
                         .filter(|p| p.result_content.is_none())
