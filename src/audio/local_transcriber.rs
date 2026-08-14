@@ -816,40 +816,17 @@ mod tests {
     ) -> std::path::PathBuf {
         let path = dir.join(filename);
 
-        // Generate a 1-second sine wave at 440 Hz.
+        // 1-second 440 Hz sine; encode via the shared production WAV encoder.
         let num_samples = sample_rate as usize;
-        let sample_rate_i32 = sample_rate as i32;
-        let mut pcm_data = Vec::with_capacity(num_samples * 2);
-        for i in 0..num_samples {
-            let t = i as f64 / sample_rate_i32 as f64;
-            let sample = (t * 440.0 * 2.0 * std::f64::consts::PI).sin();
-            let val = (sample * 32767.0).round().clamp(-32768.0, 32767.0) as i16;
-            pcm_data.extend_from_slice(&val.to_le_bytes());
-        }
+        let samples: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                (t * 440.0 * 2.0 * std::f32::consts::PI).sin()
+            })
+            .collect();
+        let wav = crate::audio::tts::render_wav(&samples, sample_rate).unwrap();
 
-        let data_size = pcm_data.len() as u32;
-        let file_size = 36 + data_size;
-
-        let mut wav = Vec::new();
-        // RIFF header
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&file_size.to_le_bytes());
-        wav.extend_from_slice(b"WAVE");
-        // fmt chunk (16 bytes)
-        wav.extend_from_slice(b"fmt ");
-        wav.extend_from_slice(&(16u32).to_le_bytes()); // chunk size
-        wav.extend_from_slice(&(1u16).to_le_bytes()); // PCM format
-        wav.extend_from_slice(&(1u16).to_le_bytes()); // mono
-        wav.extend_from_slice(&sample_rate.to_le_bytes());
-        wav.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
-        wav.extend_from_slice(&(2u16).to_le_bytes()); // block align
-        wav.extend_from_slice(&(16u16).to_le_bytes()); // bits per sample
-        // data chunk
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&data_size.to_le_bytes());
-        wav.extend_from_slice(&pcm_data);
-
-        std::fs::write(&path, &wav).unwrap();
+        std::fs::write(&path, wav).unwrap();
         path
     }
 
