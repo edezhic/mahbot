@@ -563,7 +563,10 @@ fn any_substitution_span(s: &str, i: usize, in_double: bool) -> Option<(&str, us
 /// drift between them. The word tokenizer ([`split_words_keeping_substitutions`])
 /// and the bare-`$var` detector walk separately — they traverse for word
 /// boundaries and unbraced `$` starts, not for spans.
-pub(super) fn for_each_substitution(s: &str, mut visit: impl FnMut(&str, &str, usize, bool) -> bool) {
+pub(super) fn for_each_substitution(
+    s: &str,
+    mut visit: impl FnMut(&str, &str, usize, bool) -> bool,
+) {
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;

@@ -222,15 +222,12 @@ const GIT_ALWAYS_MUTATE: &[(&str, &str, &str)] = &[
 /// Long options match by exact name or unambiguous abbreviation, mirroring
 /// git's option parsing; ambiguous or unknown long options fail closed
 /// (create-active).
-
 const GIT_REF_SHORT_LIST: &[char] = &['l'];
 /// Tag list shorts: `-l` and `-n` (list with optional attached message-count
 /// value — `git tag -n 1` lists, `1` is a pattern).
 const GIT_TAG_SHORT_LIST: &[char] = &['l', 'n'];
 
 /// `git tag` verify flags (`-v`, `--verify`) — positionals are verify targets.
-
-
 const GIT_REMOTE_MUTATIONS: &[&str] = &[
     "add",
     "remove",
@@ -463,9 +460,7 @@ fn is_wordish(kind: &str) -> bool {
 /// Raw source text of a node (the walker never normalizes — downstream
 /// predicates work on the exact source, quotes and escapes preserved).
 fn node_text(node: Node, w: &W) -> String {
-    node.utf8_text(w.src.as_bytes())
-        .unwrap_or("")
-        .to_string()
+    node.utf8_text(w.src.as_bytes()).unwrap_or("").to_string()
 }
 
 /// Recursively validate every executed substitution inside a word-ish node:
@@ -475,7 +470,12 @@ fn node_text(node: Node, w: &W) -> String {
 /// `$(...)` bodies execute. String content is never treated as a command
 /// (`bash -c "rm f"` stays allowed — documented script-content residual —
 /// while `echo "$(rm f)"` rejects).
-fn walk_word_substitutions<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>, flags: WalkFlags) -> Result<(), String> {
+fn walk_word_substitutions<'a>(
+    node: Node,
+    w: &mut W<'a>,
+    state: &mut ValidationState<'a>,
+    flags: WalkFlags,
+) -> Result<(), String> {
     // The node itself may be a substitution (`echo $(touch f)` — the walker
     // descends into every word-ish child, and the substitution is one of them).
     match node.kind() {
@@ -486,7 +486,7 @@ fn walk_word_substitutions<'a>(node: Node, w: &mut W<'a>, state: &mut Validation
                     "⚠️ Read-only mode: backtick command substitution is not allowed — its content cannot be safely tracked.\n\
                      Command: `{}`\n\
                      Suggestion: use `$()` instead of backticks, e.g. `echo \"$(ls)\"`.",
-                    &w.src
+                    w.src
                 ));
             }
             let mut snap = state.snapshot();
@@ -518,7 +518,12 @@ fn walk_word_substitutions<'a>(node: Node, w: &mut W<'a>, state: &mut Validation
 
 /// Validate the inner commands of a `$(...)`/backtick/process-substitution
 /// node (the node's children after the introducer, before the closer).
-fn walk_substitution_body<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>, flags: WalkFlags) -> Result<(), String> {
+fn walk_substitution_body<'a>(
+    node: Node,
+    w: &mut W<'a>,
+    state: &mut ValidationState<'a>,
+    flags: WalkFlags,
+) -> Result<(), String> {
     let mut cursor = node.walk();
     let children: Vec<Node> = node.children(&mut cursor).collect();
     let inner: Vec<Node> = children
@@ -530,13 +535,19 @@ fn walk_substitution_body<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationS
         // Empty or pure-expansion body (`$( )`) — nothing executes.
         return Ok(());
     }
-    walk_sequence_of(&inner, w, state, flags, Vec::new())
+    walk_sequence_of(&inner, w, state, flags, &[])
 }
 
 /// Dispatch one node to its handler. The conservative default arm rejects —
 /// any node kind the walker does not explicitly recognize fails closed (the
 /// grammar may grow new shapes; over-rejection is accepted).
-fn walk_node<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>, flags: WalkFlags, extras: Vec<String>) -> Result<(), String> {
+fn walk_node<'a>(
+    node: Node,
+    w: &mut W<'a>,
+    state: &mut ValidationState<'a>,
+    flags: WalkFlags,
+    extras: Vec<String>,
+) -> Result<(), String> {
     if node.is_error() || node.is_missing() {
         return Err(parse_error(&w.src));
     }
@@ -544,11 +555,11 @@ fn walk_node<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>, fla
         "program" | "list" | "do_group" => {
             let mut cursor = node.walk();
             let children: Vec<Node> = node.children(&mut cursor).collect();
-            walk_sequence_of(&children, w, state, flags, extras)
+            walk_sequence_of(&children, w, state, flags, &extras)
         }
         "command" => walk_command(node, w, state, flags, extras),
         "redirected_statement" => walk_redirected(node, w, state, flags, extras),
-        "pipeline" => walk_pipeline(node, w, state, flags, extras),
+        "pipeline" => walk_pipeline(node, w, state, flags, &extras),
         "negated_command" => {
             let inner = node
                 .children(&mut node.walk())
@@ -560,21 +571,24 @@ fn walk_node<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>, fla
             };
             walk_node(inner, w, state, f, extras)
         }
-        "if_statement" => walk_if(node, w, state, extras),
-        "while_statement" | "until_statement" => walk_while_until(node, w, state, extras),
-        "for_statement" => walk_for(node, w, state, extras),
-        "c_style_for_statement" => walk_c_style_for(node, w, state, extras),
-        "case_statement" => walk_case(node, w, state, extras),
-        "compound_statement" => walk_compound(node, w, state, extras),
-        "subshell" => walk_subshell(node, w, state, extras),
-        "function_definition" => walk_function(node, w, state, extras),
+        "if_statement" => walk_if(node, w, state, &extras),
+        "while_statement" | "until_statement" => walk_while_until(node, w, state, &extras),
+        "for_statement" => walk_for(node, w, state, &extras),
+        "c_style_for_statement" => walk_c_style_for(node, w, state, &extras),
+        "case_statement" => walk_case(node, w, state, &extras),
+        "compound_statement" => walk_compound(node, w, state, &extras),
+        "subshell" => walk_subshell(node, w, state, &extras),
+        "function_definition" => walk_function(node, w, state, &extras),
         "test_command" => walk_word_substitutions(node, w, state, WalkFlags::default()),
         "variable_assignment" | "variable_assignments" => {
             walk_word_substitutions(node, w, state, WalkFlags::default())?;
             bind_assignments(node, w, state)
         }
         "declaration_command" => walk_declaration(node, w, state),
-        "unset_command" => walk_unset(node, w, state),
+        "unset_command" => {
+            walk_unset(node, w, state);
+            Ok(())
+        }
         "command_substitution" | "process_substitution" => {
             let mut snap = state.snapshot();
             walk_substitution_body(node, w, &mut snap, flags)
@@ -593,11 +607,9 @@ fn unrecognized_node(node: Node, w: &W) -> String {
         "⚠️ Read-only mode: the command contains an unrecognized shell construct (`{}`) — rejected fail-closed.\n\
          Command: `{}`",
         node.kind(),
-        &w.src
+        w.src
     )
 }
-
-
 
 /// Walk a sequence of sibling nodes (a program, list, construct part, or
 /// substitution body): commands execute in order with threaded state; `&`
@@ -611,7 +623,7 @@ fn walk_sequence_of<'a>(
     w: &mut W<'a>,
     state: &mut ValidationState<'a>,
     flags: WalkFlags,
-    extras: Vec<String>,
+    extras: &[String],
 ) -> Result<(), String> {
     let mut chain_start = state.snapshot();
     let last_cmd = nodes.iter().rposition(|n| is_commandish(n.kind()));
@@ -630,7 +642,7 @@ fn walk_sequence_of<'a>(
                     return Err(format!(
                         "⚠️ Read-only mode: a stray `{kind}` terminator appears outside a case construct — rejected fail-closed (bash rejects it too).\n\
                          Command: `{}`",
-                        &w.src
+                        w.src
                     ));
                 }
                 "ERROR" => return Err(parse_error(&w.src)),
@@ -649,7 +661,7 @@ fn walk_sequence_of<'a>(
         };
         w.last_start = state.snapshot();
         let child_extras = if Some(i) == last_cmd {
-            extras.clone()
+            extras.to_vec()
         } else {
             Vec::new()
         };
@@ -756,7 +768,8 @@ fn check_words(
         } => {
             if !is_bare_substitution_segment(words) {
                 let cmd = originals.join(" ");
-                return reject(&cmd,
+                return reject(
+                    &cmd,
                     "the command verb cannot be proven safe (concatenated quotes, escapes, or substitution-formed).",
                     "write the command name literally (e.g. `cd`, `rm`) so it can be validated.",
                 );
@@ -781,22 +794,14 @@ fn check_words(
     // them as syntax errors; fail closed rather than treat them as commands.
     if matches!(
         verb,
-        "}" | ")"
-            | "fi"
-            | "done"
-            | "esac"
-            | "then"
-            | "do"
-            | "elif"
-            | "else"
-            | ";;"
-            | ";&"
-            | ";;&"
+        "}" | ")" | "fi" | "done" | "esac" | "then" | "do" | "elif" | "else" | ";;" | ";&" | ";;&"
     ) {
         let cmd = originals.join(" ");
         return reject(
             &cmd,
-            &format!("`{verb}` is a shell control keyword appearing outside its construct — rejected fail-closed (bash rejects it too)."),
+            &format!(
+                "`{verb}` is a shell control keyword appearing outside its construct — rejected fail-closed (bash rejects it too)."
+            ),
             "remove the stray keyword, or complete the construct it belongs to.",
         );
     }
@@ -814,7 +819,8 @@ fn check_words(
     let first_word = match classify_verb_word(first_word) {
         VerbClass::Literal(v) => v,
         VerbClass::Unprovable => {
-            return reject(&segment,
+            return reject(
+                &segment,
                 "the command verb cannot be proven safe (concatenated quotes, escapes, or substitution-formed).",
                 "write the command name literally (e.g. `rm`, `touch`) so it can be validated.",
             );
@@ -890,7 +896,10 @@ fn walk_redirected<'a>(
 ) -> Result<(), String> {
     let mut cursor = node.walk();
     let children: Vec<Node> = node.children(&mut cursor).collect();
-    let Some((body_idx, &body)) = children.iter().enumerate().find(|(_, c)| is_commandish(c.kind()))
+    let Some((body_idx, &body)) = children
+        .iter()
+        .enumerate()
+        .find(|(_, c)| is_commandish(c.kind()))
     else {
         return Err(unrecognized_node(node, w));
     };
@@ -906,7 +915,7 @@ fn walk_redirected<'a>(
         return Err(format!(
             "⚠️ Read-only mode: a word follows a redirect on a compound command — rejected fail-closed (bash rejects it as a syntax error).\n\
              Command: `{}`",
-            &w.src
+            w.src
         ));
     }
 
@@ -938,9 +947,9 @@ fn walk_body<'a>(
         "list" => {
             let mut cursor = body.walk();
             let children: Vec<Node> = body.children(&mut cursor).collect();
-            walk_sequence_of(&children, w, state, flags, extras)
+            walk_sequence_of(&children, w, state, flags, &extras)
         }
-        "pipeline" => walk_pipeline(body, w, state, flags, extras),
+        "pipeline" => walk_pipeline(body, w, state, flags, &extras),
         kind if is_commandish(kind) => walk_node(body, w, state, flags, extras),
         _ => Err(unrecognized_node(body, w)),
     }
@@ -951,7 +960,7 @@ fn walk_body<'a>(
 /// same-line marker words (`cat <<EOF x` makes `x` a cat argument). Body-line
 /// words (parser glitches like escaped `\$HOME` in an unquoted body) are NOT
 /// collected — the heredoc guard minimal-scans them as body content.
-fn collect_redirect_extras<'a>(node: Node, w: &W<'a>, out: &mut Vec<String>) {
+fn collect_redirect_extras(node: Node, w: &W<'_>, out: &mut Vec<String>) {
     let mut cursor = node.walk();
     let children: Vec<Node> = node.children(&mut cursor).collect();
     match node.kind() {
@@ -1002,7 +1011,11 @@ fn text_between_has_newline(src: &str, from: usize, to: usize) -> bool {
 
 /// Validate one redirect node (file_redirect or heredoc_redirect) against
 /// `state` — the state at its owning command's start.
-fn validate_redirect<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>) -> Result<(), String> {
+fn validate_redirect<'a>(
+    node: Node,
+    w: &mut W<'a>,
+    state: &mut ValidationState<'a>,
+) -> Result<(), String> {
     match node.kind() {
         "file_redirect" => validate_file_redirect(node, &*w, state),
         "heredoc_redirect" => validate_heredoc(node, w, state),
@@ -1015,7 +1028,11 @@ fn validate_redirect<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<
 /// with a path target, `&>`, `&>>`) must target /dev/null or a path under a
 /// temp root; fd-dups (`>&2`, `2>&1`) and input ops (`<`, `<&`) are always
 /// allowed. A missing target rejects.
-fn validate_file_redirect<'a>(node: Node, w: &W<'a>, state: &ValidationState<'a>) -> Result<(), String> {
+fn validate_file_redirect<'a>(
+    node: Node,
+    w: &W<'a>,
+    state: &ValidationState<'a>,
+) -> Result<(), String> {
     let mut cursor = node.walk();
     let children: Vec<Node> = node.children(&mut cursor).collect();
     let mut op: Option<String> = None;
@@ -1024,7 +1041,9 @@ fn validate_file_redirect<'a>(node: Node, w: &W<'a>, state: &ValidationState<'a>
     for c in &children {
         match c.kind() {
             "file_descriptor" => {}
-            ">" | ">>" | ">|" | ">&" | "<" | "<&" | "&>" | "&>>" | "<>" => op = Some(c.kind().to_string()),
+            ">" | ">>" | ">|" | ">&" | "<" | "<&" | "&>" | "&>>" | "<>" => {
+                op = Some(c.kind().to_string());
+            }
             kind if is_wordish(kind) || kind == "number" => {
                 if target.is_none() {
                     target = Some(*c);
@@ -1051,7 +1070,7 @@ fn validate_file_redirect<'a>(node: Node, w: &W<'a>, state: &ValidationState<'a>
             "⚠️ Read-only mode: command contains a disallowed output redirect (bare redirect with no target).\n\
              Command: `{}`\n\
              Suggestion: write the redirect target explicitly, or drop the redirect.",
-            &w.src
+            w.src
         ));
     };
     let target_text = node_text(target, w);
@@ -1079,7 +1098,11 @@ fn disallowed_redirect_err(cmd: &str, target: &str) -> String {
 /// reject); an unquoted body's substitutions execute and are validated,
 /// while its raw text is minimal-scanned for backticks/`$(` (invisible to the
 /// parser). Quoted-delimiter bodies are literal — nothing executes.
-fn validate_heredoc<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>) -> Result<(), String> {
+fn validate_heredoc<'a>(
+    node: Node,
+    w: &mut W<'a>,
+    state: &mut ValidationState<'a>,
+) -> Result<(), String> {
     let mut cursor = node.walk();
     let children: Vec<Node> = node.children(&mut cursor).collect();
     let mut unquoted = true;
@@ -1090,7 +1113,7 @@ fn validate_heredoc<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'
 
     for c in &children {
         match c.kind() {
-            "<<" | "<<-" => {}
+            "<<" | "<<-" | "&&" | "||" => {}
             "heredoc_start" => {
                 seen_start = true;
                 marker_line_end = c.end_byte();
@@ -1102,15 +1125,16 @@ fn validate_heredoc<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'
                 let bare = marker.strip_prefix(['\'', '"']).unwrap_or(&marker);
                 let bare = bare.strip_suffix(['\'', '"']).unwrap_or(bare);
                 if bare.is_empty()
-                    || bare
-                        .chars()
-                        .any(|ch| ch.is_whitespace() || matches!(ch, '|' | '>' | '<' | '&' | ';' | '(' | ')' | '`'))
+                    || bare.chars().any(|ch| {
+                        ch.is_whitespace()
+                            || matches!(ch, '|' | '>' | '<' | '&' | ';' | '(' | ')' | '`')
+                    })
                 {
                     return Err(format!(
                         "⚠️ Read-only mode: malformed heredoc delimiter `{marker}` — rejected fail-closed.\n\
                          Command: `{}`\n\
                          Suggestion: give the heredoc a plain word delimiter (e.g. `<<'EOF'`) and put commands after the terminator line.",
-                        &w.src
+                        w.src
                     ));
                 }
                 unquoted = !marker.starts_with(['\'', '"']);
@@ -1128,7 +1152,6 @@ fn validate_heredoc<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'
                 let mut snap = state.snapshot();
                 walk_node(*c, w, &mut snap, WalkFlags::default(), Vec::new())?;
             }
-            "&&" | "||" => {}
             kind if is_commandish(kind) => {
                 walk_node(*c, w, state, WalkFlags::default(), Vec::new())?;
             }
@@ -1164,7 +1187,9 @@ fn validate_heredoc<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'
         } else {
             for bc in &bchildren {
                 match bc.kind() {
-                    "command_substitution" | "process_substitution" | "expansion"
+                    "command_substitution"
+                    | "process_substitution"
+                    | "expansion"
                     | "arithmetic_expansion" => {
                         let mut snap = state.snapshot();
                         walk_word_substitutions(*bc, w, &mut snap, WalkFlags::default())?;
@@ -1193,10 +1218,8 @@ fn minimal_body_scan(text: &str) -> Result<(), String> {
             continue;
         }
         if c == '`' || (c == '$' && text[i + c.len_utf8()..].starts_with('(')) {
-            return Err(format!(
-                "⚠️ Read-only mode: command substitution inside an unquoted heredoc body is not allowed.\n\
-                 Suggestion: quote the heredoc delimiter (e.g. `<<'EOF'`) to make the body literal, or remove the `$()`/backticks."
-            ));
+            return Err("⚠️ Read-only mode: command substitution inside an unquoted heredoc body is not allowed.\n\
+                 Suggestion: quote the heredoc delimiter (e.g. `<<'EOF'`) to make the body literal, or remove the `$()`/backticks.".to_string());
         }
         i += c.len_utf8();
     }
@@ -1237,7 +1260,8 @@ fn note_part_cd(part: &ValidationState, base: &mut ValidationState) {
 /// between the construct keyword (`after`) and the first command (`start`) —
 /// the separator consumes the condition-head `time` demotion.
 fn head_has_separator(src: &str, after: usize, start: usize) -> bool {
-    src.get(after..start).is_some_and(|s| s.contains(['\n', ';']))
+    src.get(after..start)
+        .is_some_and(|s| s.contains(['\n', ';']))
 }
 
 fn walk_part<'a>(
@@ -1246,7 +1270,6 @@ fn walk_part<'a>(
     state: &mut ValidationState<'a>,
     time_external: bool,
     head_end: usize,
-    extras: Vec<String>,
 ) -> Result<(), String> {
     let mut part = state.snapshot();
     // The head demotion covers the FIRST unit only: a separator before the
@@ -1259,9 +1282,10 @@ fn walk_part<'a>(
             .iter()
             .take_while(|n| !is_commandish(n.kind()))
             .any(|n| n.kind() == ";")
-        && !nodes.iter().find(|n| is_commandish(n.kind())).is_some_and(|c| {
-            head_has_separator(&w.src, head_end, c.start_byte())
-        });
+        && !nodes
+            .iter()
+            .find(|n| is_commandish(n.kind()))
+            .is_some_and(|c| head_has_separator(&w.src, head_end, c.start_byte()));
     walk_sequence_of(
         nodes,
         w,
@@ -1270,7 +1294,7 @@ fn walk_part<'a>(
             time_external: demote,
             ..WalkFlags::default()
         },
-        extras,
+        &[],
     )?;
     note_part_cd(&part, state);
     Ok(())
@@ -1279,7 +1303,13 @@ fn walk_part<'a>(
 /// Children of a construct node split at the given keyword kinds; returns the
 /// child ranges for each section: `(before, between, after)` — the node
 /// kinds `start`/`mid`/`end` bound the sections.
-fn split_children<'a, 't>(node: Node<'t>, _w: &W<'a>, start: &str, mid: &str, end: &str) -> (Vec<Node<'t>>, Vec<Node<'t>>, Vec<Node<'t>>, bool) {
+fn split_children<'t>(
+    node: Node<'t>,
+    _w: &W<'_>,
+    start: &str,
+    mid: &str,
+    end: &str,
+) -> (Vec<Node<'t>>, Vec<Node<'t>>, Vec<Node<'t>>, bool) {
     let mut cursor = node.walk();
     let children: Vec<Node> = node.children(&mut cursor).collect();
     let mut first: Vec<Node> = Vec::new();
@@ -1308,24 +1338,29 @@ fn split_children<'a, 't>(node: Node<'t>, _w: &W<'a>, start: &str, mid: &str, en
     (first, second, third, closed)
 }
 
-fn walk_if<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>, extras: Vec<String>) -> Result<(), String> {
+fn walk_if<'a>(
+    node: Node,
+    w: &mut W<'a>,
+    state: &mut ValidationState<'a>,
+    extras: &[String],
+) -> Result<(), String> {
     let (cond, body, _rest, _) = split_children(node, w, "if", "then", "fi");
-    walk_part(&cond, w, state, true, keyword_end(node, "if"), Vec::new())?;
-    walk_part(&body, w, state, false, 0, Vec::new())?;
+    walk_part(&cond, w, state, true, keyword_end(node, "if"))?;
+    walk_part(&body, w, state, false, 0)?;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
             "elif_clause" => {
                 let (econd, ebody, _, _) = split_children(child, w, "elif", "then", "fi");
-                walk_part(&econd, w, state, true, keyword_end(child, "elif"), Vec::new())?;
-                walk_part(&ebody, w, state, false, 0, Vec::new())?;
+                walk_part(&econd, w, state, true, keyword_end(child, "elif"))?;
+                walk_part(&ebody, w, state, false, 0)?;
             }
             "else_clause" => {
                 // else_clause children: `else`, body commands — the body is
                 // the FIRST field (unlike elif_clause, which has a condition
                 // before `then`).
                 let (ebody, _, _, _) = split_children(child, w, "else", "then", "fi");
-                walk_part(&ebody, w, state, false, 0, Vec::new())?;
+                walk_part(&ebody, w, state, false, 0)?;
             }
             _ => {}
         }
@@ -1338,7 +1373,7 @@ fn walk_if<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>, extra
 
 /// End byte of the first child of `node` with kind `kind` (a construct
 /// keyword), for the condition-head separator check.
-fn keyword_end<'t>(node: Node<'t>, kind: &str) -> usize {
+fn keyword_end(node: Node<'_>, kind: &str) -> usize {
     let mut cursor = node.walk();
     node.children(&mut cursor)
         .find(|c| c.kind() == kind)
@@ -1349,17 +1384,22 @@ fn redirect_extras_on_construct(w: &W) -> String {
     format!(
         "⚠️ Read-only mode: a word follows a redirect on a compound command — rejected fail-closed (bash rejects it as a syntax error).\n\
          Command: `{}`",
-        &w.src
+        w.src
     )
 }
 
-fn walk_while_until<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>, extras: Vec<String>) -> Result<(), String> {
+fn walk_while_until<'a>(
+    node: Node,
+    w: &mut W<'a>,
+    state: &mut ValidationState<'a>,
+    extras: &[String],
+) -> Result<(), String> {
     let (cond, _, _, _) = split_children(node, w, "while", "do", "done");
-    if !cond.is_empty() {
-        walk_part(&cond, w, state, true, keyword_end(node, "while"), Vec::new())?;
-    } else {
+    if cond.is_empty() {
         let (cond, _, _, _) = split_children(node, w, "until", "do", "done");
-        walk_part(&cond, w, state, true, keyword_end(node, "until"), Vec::new())?;
+        walk_part(&cond, w, state, true, keyword_end(node, "until"))?;
+    } else {
+        walk_part(&cond, w, state, true, keyword_end(node, "while"))?;
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -1375,14 +1415,18 @@ fn walk_while_until<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'
     Ok(())
 }
 
-fn walk_for<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>, extras: Vec<String>) -> Result<(), String> {
+fn walk_for<'a>(
+    node: Node,
+    w: &mut W<'a>,
+    state: &mut ValidationState<'a>,
+    extras: &[String],
+) -> Result<(), String> {
     // Header: `for`/`select`, variable_name, optional `in` + words, `;`.
     let mut header_words: Vec<String> = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "in" | "for" | "select" | ";" | "\n" => {}
-            "variable_name" => {}
+            "in" | "for" | "select" | ";" | "\n" | "variable_name" => {}
             kind if is_wordish(kind) => {
                 header_words.push(node_text(child, w));
             }
@@ -1418,7 +1462,12 @@ fn loop_var_name(node: Node, w: &W) -> String {
     String::new()
 }
 
-fn walk_c_style_for<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>, extras: Vec<String>) -> Result<(), String> {
+fn walk_c_style_for<'a>(
+    node: Node,
+    w: &mut W<'a>,
+    state: &mut ValidationState<'a>,
+    extras: &[String],
+) -> Result<(), String> {
     // Arithmetic header substitutions execute (`for ((i=$(rm f); ...))`).
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -1437,7 +1486,12 @@ fn walk_c_style_for<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'
     Ok(())
 }
 
-fn walk_case<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>, extras: Vec<String>) -> Result<(), String> {
+fn walk_case<'a>(
+    node: Node,
+    w: &mut W<'a>,
+    state: &mut ValidationState<'a>,
+    extras: &[String],
+) -> Result<(), String> {
     // Subject and patterns execute substitutions (bash expands them); each
     // arm body is a conditional boundary.
     let mut cursor = node.walk();
@@ -1458,7 +1512,11 @@ fn walk_case<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>, ext
     Ok(())
 }
 
-fn walk_case_item<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>) -> Result<(), String> {
+fn walk_case_item<'a>(
+    node: Node,
+    w: &mut W<'a>,
+    state: &mut ValidationState<'a>,
+) -> Result<(), String> {
     let mut cursor = node.walk();
     let children: Vec<Node> = node.children(&mut cursor).collect();
     let mut body: Vec<Node> = Vec::new();
@@ -1482,7 +1540,7 @@ fn walk_case_item<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>
     let paren_end = children
         .iter()
         .find(|c| c.kind() == ")")
-        .map_or(0, |c| c.end_byte());
+        .map_or(0, tree_sitter::Node::end_byte);
     let demote = !body
         .first()
         .is_some_and(|c| head_has_separator(&w.src, paren_end, c.start_byte()));
@@ -1495,13 +1553,18 @@ fn walk_case_item<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>
             time_external: demote,
             ..WalkFlags::default()
         },
-        Vec::new(),
+        &[],
     )?;
     note_part_cd(&part, state);
     Ok(())
 }
 
-fn walk_compound<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>, extras: Vec<String>) -> Result<(), String> {
+fn walk_compound<'a>(
+    node: Node,
+    w: &mut W<'a>,
+    state: &mut ValidationState<'a>,
+    extras: &[String],
+) -> Result<(), String> {
     let mut cursor = node.walk();
     let children: Vec<Node> = node.children(&mut cursor).collect();
     // `(( ... ))` arithmetic command — substitutions inside execute; nothing
@@ -1529,7 +1592,12 @@ fn walk_compound<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>,
     Ok(())
 }
 
-fn walk_subshell<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>, extras: Vec<String>) -> Result<(), String> {
+fn walk_subshell<'a>(
+    node: Node,
+    w: &mut W<'a>,
+    state: &mut ValidationState<'a>,
+    extras: &[String],
+) -> Result<(), String> {
     let mut snap = state.snapshot();
     let mut cursor = node.walk();
     let children: Vec<Node> = node.children(&mut cursor).collect();
@@ -1542,7 +1610,12 @@ fn walk_subshell<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>,
     Ok(())
 }
 
-fn walk_function<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>, extras: Vec<String>) -> Result<(), String> {
+fn walk_function<'a>(
+    node: Node,
+    w: &mut W<'a>,
+    state: &mut ValidationState<'a>,
+    extras: &[String],
+) -> Result<(), String> {
     if !extras.is_empty() {
         return Err(redirect_extras_on_construct(w));
     }
@@ -1563,7 +1636,7 @@ fn walk_pipeline<'a>(
     w: &mut W<'a>,
     state: &mut ValidationState<'a>,
     flags: WalkFlags,
-    extras: Vec<String>,
+    extras: &[String],
 ) -> Result<(), String> {
     // Pipeline members run in subshells: each is validated against a snapshot
     // of the pipeline-start state; `state` itself is never mutated.
@@ -1584,7 +1657,7 @@ fn walk_pipeline<'a>(
             }
         };
         let mextras = if i + 1 == members.len() {
-            extras.clone()
+            extras.to_vec()
         } else {
             Vec::new()
         };
@@ -1602,7 +1675,11 @@ fn walk_pipeline<'a>(
 /// Non-identifier words (`export A=1 B=2 rm f`) make bash error without
 /// executing anything — the walker leaves them unbound (allow-ward, safe:
 /// bash never runs `rm`).
-fn walk_declaration<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'a>) -> Result<(), String> {
+fn walk_declaration<'a>(
+    node: Node,
+    w: &mut W<'a>,
+    state: &mut ValidationState<'a>,
+) -> Result<(), String> {
     walk_word_substitutions(node, w, state, WalkFlags::default())?;
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -1635,7 +1712,7 @@ fn walk_declaration<'a>(node: Node, w: &mut W<'a>, state: &mut ValidationState<'
 
 /// `unset NAME` models an EMPTY binding (bash expands `$NAME` to ''), not a
 /// return to the session baseline. Options (`-f`, `-v`, `-n`) are skipped.
-fn walk_unset<'a>(node: Node, w: &W<'a>, state: &mut ValidationState<'a>) -> Result<(), String> {
+fn walk_unset<'a>(node: Node, w: &W<'a>, state: &mut ValidationState<'a>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
@@ -1655,12 +1732,15 @@ fn walk_unset<'a>(node: Node, w: &W<'a>, state: &mut ValidationState<'a>) -> Res
             _ => {}
         }
     }
-    Ok(())
 }
 
 /// Bind the variable assignments of a standalone `variable_assignment` /
 /// `variable_assignments` list member (`VAR=1; echo $VAR`).
-fn bind_assignments<'a>(node: Node, w: &W<'a>, state: &mut ValidationState<'a>) -> Result<(), String> {
+fn bind_assignments<'a>(
+    node: Node,
+    w: &W<'a>,
+    state: &mut ValidationState<'a>,
+) -> Result<(), String> {
     if node.kind() == "variable_assignment" {
         let text = node_text(node, w);
         check_git_env_binding(&text)?;
@@ -1714,7 +1794,9 @@ fn parse_var_ref(rest: &str) -> Option<(&str, usize)> {
     if let Some(braced) = after_dollar.strip_prefix('{') {
         let end = braced.find('}')?;
         let name = &braced[..end];
-        if name.is_empty() || name.contains([':', '-', '=', '?', '+', '/', '#', '%', '!', '@', '*', '[']) {
+        if name.is_empty()
+            || name.contains([':', '-', '=', '?', '+', '/', '#', '%', '!', '@', '*', '['])
+        {
             return None;
         }
         return Some((name, end + 3)); // $ { name }
@@ -1883,7 +1965,8 @@ fn resolve_path_word(word: &str, state: &ValidationState) -> Option<std::path::P
     if word.is_empty() || word.starts_with('~') {
         return None;
     }
-    let (clean, single_quoted) = scan::strip_outer_quotes(word).map_or((word, false), |(c, q)| (c, q));
+    let (clean, single_quoted) =
+        scan::strip_outer_quotes(word).map_or((word, false), |(c, q)| (c, q));
     let expanded = expand_vars(clean, single_quoted, state)?;
     let p = Path::new(&expanded);
     if p.is_absolute() {
@@ -2007,7 +2090,8 @@ fn apply_single_binding(name: &str, value: &str, state: &mut ValidationState) {
     // Strip balanced surrounding quotes from the value (`export TMPDIR="/tmp"`).
     // A single-quoted value is a literal — no expansion, no substitution —
     // so it can never be an mktemp temp binding.
-    let (clean, single_quoted) = scan::strip_outer_quotes(value).map_or((value, false), |(c, q)| (c, q));
+    let (clean, single_quoted) =
+        scan::strip_outer_quotes(value).map_or((value, false), |(c, q)| (c, q));
     // `NAME=$(mktemp -d)` binds a fresh temp root with an unknown value.
     if !single_quoted {
         if let Some(binding) = mktemp_binding(clean, state) {
@@ -2300,15 +2384,14 @@ fn process_cd_words(words: &[&str], cd_idx: usize, verb: &str, state: &mut Valid
 /// mutator inside rejects. Unparseable bodies fail closed.
 fn handle_eval_body(body_words: &[&str], state: &mut ValidationState) -> Result<(), String> {
     let joined = body_words.join(" ");
-    let decoded = match scan::strip_outer_quotes(&joined) {
-        Some((content, _)) => content.to_string(),
-        None => {
-            // Unquoted body: strip quotes so the re-parse sees the words
-            // eval would split on.
-            let mut s = String::with_capacity(joined.len());
-            s.extend(joined.chars().filter(|c| !matches!(c, '\'' | '"')));
-            s
-        }
+    let decoded = if let Some((content, _)) = scan::strip_outer_quotes(&joined) {
+        content.to_string()
+    } else {
+        // Unquoted body: strip quotes so the re-parse sees the words
+        // eval would split on.
+        let mut s = String::with_capacity(joined.len());
+        s.extend(joined.chars().filter(|c| !matches!(c, '\'' | '"')));
+        s
     };
     if decoded.trim().is_empty() {
         return Ok(());
@@ -2820,22 +2903,21 @@ fn cp_destination_under_temp(segment: &str, state: &ValidationState) -> bool {
     };
     let rest = &words[cmd_idx + 1..];
 
-    if let Some(val) = output_flag_value(rest, &["-t", "--target-directory"], Some("--target-directory="))
-    {
+    if let Some(val) = output_flag_value(
+        rest,
+        &["-t", "--target-directory"],
+        Some("--target-directory="),
+    ) {
         return !writes_outside_temp(val, state);
     }
     // Last non-flag path argument is the destination.
-    let Some(dest) = rest
-        .iter()
-        .filter(|w| {
-            !w.starts_with('-')
-                && !matches!(
-                    scan::classify_shell_token(w),
-                    scan::TokenKind::Redirect { .. }
-                )
-        })
-        .last()
-    else {
+    let Some(dest) = rest.iter().rfind(|w| {
+        !w.starts_with('-')
+            && !matches!(
+                scan::classify_shell_token(w),
+                scan::TokenKind::Redirect { .. }
+            )
+    }) else {
         return false;
     };
     !writes_outside_temp(dest, state)
@@ -3544,7 +3626,6 @@ fn has_cargo_fmt_check(command: &str) -> bool {
         .any(|p| shell_word(p) == "--check")
 }
 
-
 // ── Git checks ───────────────────────────────────────────────────────────
 
 /// Long-option kinds for the collapsed branch/tag table.
@@ -3578,16 +3659,15 @@ const GIT_REF_LONG_OPTS: &[(&str, RefLongKind)] = &[
     ("--sort", RefLongKind::Value),
 ];
 
-
 fn resolve_ref_long(kind: &str, sub: &str) -> Option<RefLongKind> {
     let base = kind.split('=').next().unwrap_or(kind);
     if base.len() < 3 {
         return None; // bare `--`/`-`-length tokens are never options
     }
     // `--verify` is tag-only; on branch it is an unknown option (create-active).
-    let mut matches = GIT_REF_LONG_OPTS.iter().filter(|(name, _)| {
-        name.starts_with(base) && !(sub == "branch" && *name == "--verify")
-    });
+    let mut matches = GIT_REF_LONG_OPTS
+        .iter()
+        .filter(|(name, _)| name.starts_with(base) && !(sub == "branch" && *name == "--verify"));
     let first = matches.next()?;
     if matches.next().is_some() {
         return None; // ambiguous within the table — fail closed
@@ -3631,9 +3711,13 @@ fn check_git_ref_subcommand(subcommand: &str, sub: &str) -> Result<(), String> {
         // bare-name rule.
         if w.starts_with('-') && w.len() > 1 {
             let is_name_less_mutation = if w.starts_with("--") {
-                ["--set-upstream-to", "--unset-upstream", "--edit-description"]
-                    .iter()
-                    .any(|m| w == *m || w.starts_with(&format!("{m}=")))
+                [
+                    "--set-upstream-to",
+                    "--unset-upstream",
+                    "--edit-description",
+                ]
+                .iter()
+                .any(|m| w == *m || w.starts_with(&format!("{m}=")))
             } else {
                 w[1..].contains('u') // branch `-u<upstream>` (attached value)
             };
@@ -4352,7 +4436,6 @@ mod tests {
         }
     }
 
-
     /// Assert all items in `items` are rejected when formatted with `template`.
     fn assert_all_rejected(items: &[&str], template: impl Fn(&str) -> String) {
         for &item in items {
@@ -4593,7 +4676,7 @@ mod tests {
         // if items are later moved to TEMP_MUTATORS.
         assert_all_rejected(MUTATING_COMMANDS, |cmd| format!("{cmd} /etc/blocked_test"));
     }
-    
+
     /// Tests that all git remote mutation verbs are rejected via
     /// [`check_git_subcommand_mutation`].
     #[test]
@@ -4837,7 +4920,7 @@ mod tests {
 
         run_cases(&cases);
     }
-    
+
     // ── Redirect tests ─────────────────────────────────────────────
 
     #[test]
@@ -4865,12 +4948,12 @@ mod tests {
             ("echo \\>", true),
             ("echo \\\\\\> file", true),
             ("echo \"> /tmp/foo", false), // unterminated quote — parser error, fail-closed
-            ("echo '> /tmp/foo", false), // unterminated quote — parser error, fail-closed
+            ("echo '> /tmp/foo", false),  // unterminated quote — parser error, fail-closed
         ];
 
         run_cases(&cases);
     }
-    
+
     // ── New-walker minimal suites ──────────────────────────────────
 
     /// Parse errors and grammar-gap shapes fail closed (accepted over-
@@ -4887,8 +4970,8 @@ mod tests {
             ("echo \"unterminated", false),
             ("cat <<EOF > /tmp/out", false), // unterminated heredoc
             ("echo $(cmd 2>/dev/null} done", false), // malformed substitution
-            ("cat <<", false), // dangling heredoc marker
-            ("echo hi ;;" , false), // stray terminator
+            ("cat <<", false),               // dangling heredoc marker
+            ("echo hi ;;", false),           // stray terminator
         ];
         run_cases(&cases);
     }
@@ -4959,7 +5042,10 @@ mod tests {
             ("unset TMPDIR; touch $TMPDIR/f", false),
             ("unset TMPDIR; touch /tmp/f", true),
             ("unset -f TMPDIR; touch /tmp/f", true),
-            ("export TMPDIR=/tmp && unset TMPDIR && touch $TMPDIR/f", false),
+            (
+                "export TMPDIR=/tmp && unset TMPDIR && touch $TMPDIR/f",
+                false,
+            ),
         ];
         run_cases(&cases);
     }
@@ -5033,7 +5119,7 @@ mod tests {
         run_cases(&cases);
     }
     #[allow(clippy::too_many_lines)] // data-driven bypass battery
-    
+
     /// Git exec vectors: flags/config/env channels that run programs are
     /// rejected, even on allowlisted subcommands. Includes the analyst-flagged
     /// gaps (repo redirect, --config-env/--config-file, export channel,
@@ -5239,7 +5325,7 @@ mod tests {
 
         run_cases(&cases);
     }
-    
+
     // ── extract_git_subcommand unit tests ──────────────────────────
 
     #[test]
@@ -5557,7 +5643,7 @@ mod tests {
 
         run_cases(&cases);
     }
-    
+
     /// Tests that ALL entries in [`TEMP_MUTATORS`] are allowed with temp paths
     /// and rejected with non-temp paths, preventing coverage drift.
     #[test]
@@ -5688,19 +5774,19 @@ mod tests {
             ("cat <<EOF\n$(echo hi)\nEOF\ntouch workspace_file", false),
             // Body substitution under a temp cd — allowed (state at the
             // heredoc's position in the chain applies).
-            ("cd /tmp && cat <<EOF\n$(touch rel)\nEOF", true),             // Dangling `<<` markers (no delimiter): bash errors on these and
-             // executes nothing — fail-closed parse errors in the new walker.
-             ("cat <<", false),
-             ("cat << ", false),
-             ("cat <<-", false),
-             ("cat <<- ", false),
-             ("3<< ", false),
-             ("3<<-", false),
+            ("cd /tmp && cat <<EOF\n$(touch rel)\nEOF", true), // Dangling `<<` markers (no delimiter): bash errors on these and
+            // executes nothing — fail-closed parse errors in the new walker.
+            ("cat <<", false),
+            ("cat << ", false),
+            ("cat <<-", false),
+            ("cat <<- ", false),
+            ("3<< ", false),
+            ("3<<-", false),
         ];
 
         run_cases(&cases);
     }
-    
+
     // ── Phase 1 acceptance: substitutions ────────────────────────────────
 
     /// `$(...)` and backtick contents are validated as nested commands.
@@ -6178,11 +6264,11 @@ mod tests {
             ("git config --name-only --get-regexp '^core\\.'", true),
             ("git rebase --show-current", true),
             ("git push --dry-run", false), // push is an unconditional reject
-            ("git push -n", false), // push is an unconditional reject
+            ("git push -n", false),        // push is an unconditional reject
             ("git push -n origin main", false), // push is an unconditional reject
-            ("git clean -n", false), // clean is an unconditional reject
+            ("git clean -n", false),       // clean is an unconditional reject
             ("git clean --dry-run", false), // clean is an unconditional reject
-            ("git clean -ndx", false), // clean is an unconditional reject
+            ("git clean -ndx", false),     // clean is an unconditional reject
             ("git --version 2>&1", true),
             ("git status 2>&1", true),
             // --output-indicator-* share the --output prefix but do not write
@@ -6232,7 +6318,7 @@ mod tests {
 
         run_cases(&cases);
     }
-    
+
     // ── Phase 3 acceptance: cargo read-only invocations ──────────────────
 
     #[test]
