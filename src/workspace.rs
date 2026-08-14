@@ -1142,17 +1142,8 @@ impl WorkspaceStore {
 }
 
 impl WorkspaceStore {
-    /// Post-open setup: reject legacy schemas.
-    ///
-    /// Checks only the `notes` canary; intermediate historical states missing
-    /// `diagnostics_generation`/`last_analyzed_commit` pass and fail later.
+    /// Post-open setup: create the unique NULL-role workspace_contexts index.
     async fn after_open(&self) -> anyhow::Result<()> {
-        if !turso::column_exists(&self.conn, "workspaces", "notes").await? {
-            anyhow::bail!(
-                "workspaces.db has a legacy schema (workspaces.notes missing); migrations \
-                 were removed — restore a backup created by a current mahbot version"
-            );
-        }
         // Exactly one general context row per workspace — partial unique index
         // over the NULL-role rows only (role-keyed rows keep their own UNIQUE).
         self.conn

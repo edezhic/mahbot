@@ -679,17 +679,8 @@ pub(crate) enum LoadComments {
 }
 
 impl BoardStore {
-    /// Post-open setup: reject legacy schemas, then create the FTS index.
+    /// Post-open setup: create the FTS index.
     async fn after_open(&self) -> anyhow::Result<()> {
-        // Legacy-format DBs (pre-migration) fail fast with an actionable error
-        // instead of failing later on no-such-column queries.
-        if turso::column_exists(&self.conn, "tickets", "status").await? {
-            anyhow::bail!(
-                "board.db has a legacy schema (tickets.status present); migrations \
-                 were removed — restore a backup created by a current mahbot version"
-            );
-        }
-
         crate::turso::ensure_fts_index(
             &self.conn,
             TICKETS_FTS_INDEX_NAME,

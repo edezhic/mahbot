@@ -871,19 +871,8 @@ impl SessionStore {
 }
 
 impl SessionStore {
-    /// Post-open setup: reject legacy schemas, then ensure indexes.
+    /// Post-open setup: ensure indexes.
     async fn after_open(&self) -> anyhow::Result<()> {
-        // Legacy-format DBs (pre-migration) fail fast with an actionable error
-        // instead of failing later at index creation or on no-such-column queries.
-        if turso::column_exists(&self.conn, "sessions", "session_key").await?
-            || turso::column_exists(&self.conn, "session_metadata", "session_key").await?
-        {
-            return Err(anyhow!(
-                "sessions.db has a legacy schema (session_key present); migrations \
-                 were removed — restore a backup created by a current mahbot version"
-            ));
-        }
-
         // Index must exist before sessions are queried.
         self.conn
             .execute_batch(

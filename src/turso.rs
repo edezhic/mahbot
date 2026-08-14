@@ -1013,21 +1013,6 @@ impl Drop for TxGuard<'_> {
 
 // Schema / index management
 
-/// Check whether `table` has a column named `column` (via `PRAGMA table_info`).
-pub(crate) async fn column_exists(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-) -> anyhow::Result<bool> {
-    let rows = conn
-        .query(&format!("PRAGMA table_info('{table}')"), ())
-        .await
-        .with_context(|| format!("Failed to read PRAGMA table_info for {table} table"))?;
-    Ok(rows
-        .iter()
-        .any(|row| row.get::<String>(1).ok().as_deref() == Some(column)))
-}
-
 /// Ensure a full-text search index exists with the correct tokenizer.
 /// Drops and recreates if the existing index has a different tokenizer.
 pub(crate) async fn ensure_fts_index(
