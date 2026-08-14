@@ -37,6 +37,7 @@ use crate::git_commands::{
     run_git_add_all, run_git_command, run_git_diff_numstat, run_git_head, run_git_status,
     run_git_write_tree,
 };
+use crate::jobs::ResumableStage;
 use crate::message_router;
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::role::{DIAGNOSTICS_ROLE, SANITATION_ROLE, SYSTEM_ROLE};
@@ -661,28 +662,46 @@ pub async fn run_management() {
     // Resume the selected rounds (silent background resume — no Manager
     // notifications; results deliver via normal paths).
     for stage in resumable {
-        let Ok(Some(workspace)) = crate::workspace::store()
-            .get_by_name(&stage.workspace_name)
-            .await
+        // Or-pattern: every variant carries job_id + workspace_name.
+        let (job_id, workspace_name) = match &stage {
+            ResumableStage::TicketStage {
+                job_id,
+                workspace_name,
+                ..
+            }
+            | ResumableStage::Research {
+                job_id,
+                workspace_name,
+                ..
+            }
+            | ResumableStage::Ask {
+                job_id,
+                workspace_name,
+                ..
+            } => (job_id, workspace_name),
+        };
+        let Ok(Some(workspace)) = crate::workspace::store().get_by_name(workspace_name).await
         else {
             warn!(
-                job = %stage.job_id,
-                workspace = %stage.workspace_name,
+                job = %job_id,
+                workspace = %workspace_name,
                 "Resume workspace unresolvable — deleting job row",
             );
             // Design: "Unresolvable workspace → delete job row" — a done row
             // would linger without a workspace to drive it (envelope kinds
             // have no ticket to reset; ticket_stage kinds are re-covered by
             // the next boot's reset once no job row protects them).
-            let _ =
-                crate::jobs::terminalize_job(&crate::session::store().conn, &stage.job_id).await;
+            let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
             continue;
         };
-        match stage.stage.as_str() {
+        match stage {
             // research/ask jobs carry no ticket — re-dispatch the orchestrator.
-            "research" => {
-                info!(job = %stage.job_id, "Resuming research run at boot");
-                let job_id = stage.job_id.clone();
+            ResumableStage::Research {
+                job_id,
+                capped: false,
+                ..
+            } => {
+                info!(job = %job_id, "Resuming research run at boot");
                 let ws = workspace.clone();
                 tokio::spawn(async move {
                     crate::tools::research::resume_research_run(&job_id, &ws).await;
@@ -690,20 +709,26 @@ pub async fn run_management() {
             }
             // Over-cap research: deliver the partial report from the last
             // checkpoint (the envelope is the caller's only result path).
-            "research_capped" => {
+            ResumableStage::Research {
+                job_id,
+                capped: true,
+                ..
+            } => {
                 info!(
-                    job = %stage.job_id,
+                    job = %job_id,
                     "Delivering research partial report (boot re-dispatch cap exceeded)",
                 );
-                let job_id = stage.job_id.clone();
                 let ws = workspace.clone();
                 tokio::spawn(async move {
                     crate::tools::research::research_capped_partial_report(&job_id, &ws).await;
                 });
             }
-            "ask" => {
-                info!(job = %stage.job_id, "Resuming ask round at boot");
-                let job_id = stage.job_id.clone();
+            ResumableStage::Ask {
+                job_id,
+                capped: false,
+                ..
+            } => {
+                info!(job = %job_id, "Resuming ask round at boot");
                 let ws = workspace.clone();
                 tokio::spawn(async move {
                     crate::tools::ask::resume_ask_round(&job_id, &ws).await;
@@ -712,40 +737,43 @@ pub async fn run_management() {
             // Over-cap ask: deliver the failure envelope to the original
             // caller (the <ask-tool-result> envelope is the async-ask caller's
             // only result path — "failed = terminal … surface to user").
-            "ask_capped" => {
+            ResumableStage::Ask {
+                job_id,
+                capped: true,
+                ..
+            } => {
                 info!(
-                    job = %stage.job_id,
+                    job = %job_id,
                     "Delivering ask failure envelope (boot re-dispatch cap exceeded)",
                 );
-                let job_id = stage.job_id.clone();
                 let ws = workspace.clone();
                 tokio::spawn(async move {
                     crate::tools::ask::ask_capped_envelope(&job_id, &ws).await;
                 });
             }
-            _ => {
-                if let Ok(Some(ticket)) = crate::board::store().get_ticket(&stage.ticket_id).await {
+            ResumableStage::TicketStage {
+                job_id,
+                ticket_id,
+                stage,
+                ..
+            } => {
+                if let Ok(Some(ticket)) = crate::board::store().get_ticket(&ticket_id).await {
                     info!(
-                        job = %stage.job_id,
-                        ticket = %stage.ticket_id,
-                        stage = %stage.stage,
+                        job = %job_id,
+                        ticket = %ticket_id,
+                        stage = %stage,
                         "Resuming ticket stage round at boot",
                     );
-                    tokio::spawn(resume_ticket_stage_round(
-                        stage.stage.clone(),
-                        stage.job_id.clone(),
-                        ticket,
-                        workspace,
-                    ));
+                    tokio::spawn(resume_ticket_stage_round(stage, job_id, ticket, workspace));
                 } else {
                     warn!(
-                        job = %stage.job_id,
-                        ticket = %stage.ticket_id,
+                        job = %job_id,
+                        ticket = %ticket_id,
                         "Resume ticket not found — deleting job row",
                     );
                     let _ = crate::jobs::complete_ticket_stage_job(
                         &crate::session::store().conn,
-                        &stage.job_id,
+                        &job_id,
                     )
                     .await;
                 }

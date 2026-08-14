@@ -726,12 +726,24 @@ pub(crate) async fn delete_pending_job(conn: &Connection, id: &str) -> Result<()
 
 // ── Boot recovery scan ─────────────────────────────────────────────────
 
-/// Outcome of a boot recovery scan: ticket_stage jobs selected for resume.
-pub(crate) struct ResumableStage {
-    pub job_id: String,
-    pub ticket_id: String,
-    pub stage: String,
-    pub workspace_name: String,
+/// Outcome of a boot recovery scan: jobs selected for resume.
+pub(crate) enum ResumableStage {
+    TicketStage {
+        job_id: String,
+        ticket_id: String,
+        stage: String,
+        workspace_name: String,
+    },
+    Research {
+        job_id: String,
+        workspace_name: String,
+        capped: bool,
+    },
+    Ask {
+        job_id: String,
+        workspace_name: String,
+        capped: bool,
+    },
 }
 
 /// One in-phase ticket_stage candidate for the boot-scan round dedup.
@@ -1174,7 +1186,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
     for (_round, idx) in best.values() {
         let cand = &candidates[*idx];
         exclusion.push(cand.ticket_id.clone());
-        resumable.push(ResumableStage {
+        resumable.push(ResumableStage::TicketStage {
             job_id: cand.job_id.clone(),
             ticket_id: cand.ticket_id.clone(),
             stage: cand.stage.clone(),
@@ -1219,8 +1231,9 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
                     warn!(job = %job.id, kind = %kind, "{msg}");
                 }
                 // Capped resumes keep retry_count (the cap already fired);
-                // normal resumes bump it — {kind}_capped stage labels must
-                // stay in lockstep with management.rs's stage match.
+                // normal resumes bump it. The variant mirrors the DB kind
+                // (capped = old "{kind}_capped" suffix) — the match arm above
+                // already discriminated research vs ask.
                 let _ = checkpoint_job(
                     conn,
                     &job.id,
@@ -1233,15 +1246,18 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
                     },
                 )
                 .await;
-                resumable.push(ResumableStage {
-                    job_id: job.id.clone(),
-                    ticket_id: String::new(),
-                    stage: if capped {
-                        format!("{kind}_capped")
-                    } else {
-                        kind.to_string()
-                    },
-                    workspace_name: job.workspace_name.clone(),
+                resumable.push(if kind == "research" {
+                    ResumableStage::Research {
+                        job_id: job.id.clone(),
+                        workspace_name: job.workspace_name.clone(),
+                        capped,
+                    }
+                } else {
+                    ResumableStage::Ask {
+                        job_id: job.id.clone(),
+                        workspace_name: job.workspace_name.clone(),
+                        capped,
+                    }
                 });
                 resumed_other += 1;
             }
@@ -2180,10 +2196,16 @@ mod tests {
 
         let resumable = recover_from_restart().await.unwrap();
         assert!(
-            resumable.iter().any(|r| r.job_id == "jscan"),
+            resumable.iter().any(|r| matches!(
+                r,
+                ResumableStage::TicketStage { job_id, .. } if job_id.as_str() == "jscan"
+            )),
             "the in-phase ticket_stage job must be selected for resume"
         );
-        assert!(resumable.iter().any(|r| r.ticket_id == resumed_ticket));
+        assert!(resumable.iter().any(|r| matches!(
+            r,
+            ResumableStage::TicketStage { ticket_id, .. } if ticket_id == &resumed_ticket
+        )));
         let t1 = board.get_ticket(&resumed_ticket).await.unwrap().unwrap();
         assert_eq!(
             t1.phase,
@@ -2315,8 +2337,14 @@ mod tests {
         let resumable = recover_from_restart().await.unwrap();
         // Only the NEWEST of the concurrent rounds resumes; the superseded
         // older round is marked done at boot.
-        assert!(resumable.iter().any(|r| r.job_id == "jdup2"));
-        assert!(!resumable.iter().any(|r| r.job_id == "jdup1"));
+        assert!(resumable.iter().any(|r| matches!(
+            r,
+            ResumableStage::TicketStage { job_id, .. } if job_id.as_str() == "jdup2"
+        )));
+        assert!(!resumable.iter().any(|r| matches!(
+            r,
+            ResumableStage::TicketStage { job_id, .. } if job_id.as_str() == "jdup1"
+        )));
         let status1 = conn
             .query_row("SELECT status FROM jobs WHERE id = 'jdup1'", (), |r| {
                 r.get::<String>(0)
@@ -2328,11 +2356,11 @@ mod tests {
             "superseded older round must be marked done"
         );
         // Phase-left + done → never resumed; phase-left marked done at boot.
-        assert!(
-            !resumable
-                .iter()
-                .any(|r| r.job_id == "jcls2" || r.job_id == "jcls3")
-        );
+        assert!(!resumable.iter().any(|r| matches!(
+            r,
+            ResumableStage::TicketStage { job_id, .. }
+                if job_id.as_str() == "jcls2" || job_id.as_str() == "jcls3"
+        )));
         let status2 = conn
             .query_row("SELECT status FROM jobs WHERE id = 'jcls2'", (), |r| {
                 r.get::<String>(0)
