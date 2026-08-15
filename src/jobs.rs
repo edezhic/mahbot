@@ -216,7 +216,7 @@ pub(crate) fn agent_params(
 /// every caller owns its child-row shape.
 #[derive(Debug, Clone)]
 pub(crate) enum SpawnChild {
-    /// ask_jobs (id).
+    /// Pure kind marker — no child row (resume reads the jobs row alone).
     Ask,
     /// research_jobs (id, state).
     Research,
@@ -230,9 +230,9 @@ pub(crate) enum SpawnChild {
 }
 
 impl SpawnChild {
-    /// The `jobs.kind` value — one kind per child row (the kind-derivation
-    /// refactor: deriving it here closes the drift window of an inconsistent
-    /// (kind, child) pair).
+    /// The `jobs.kind` value — one kind per child row; Ask is the exception
+    /// (pure kind marker, no child row). Deriving kind here closes the drift
+    /// window of an inconsistent (kind, child) pair.
     #[must_use]
     pub const fn kind_str(&self) -> &'static str {
         match self {
@@ -244,9 +244,9 @@ impl SpawnChild {
 }
 
 /// Spawn a job with its pre-generated agent roster in ONE transaction.
-/// MUST commit before the agent's first session write. The kind is fully
-/// determined by the child row (one kind per child) — deriving it here closes
-/// the drift window of an inconsistent (kind, child) pair.
+/// MUST commit before the agent's first session write. The kind is derived
+/// from the child via [`SpawnChild::kind_str`] — closing the drift window of
+/// an inconsistent (kind, child) pair.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_job(
     conn: &Connection,
@@ -288,14 +288,8 @@ pub(crate) async fn spawn_job(
         .with_context(|| format!("failed to insert agent roster for job {id}"))?;
     }
     match child {
-        SpawnChild::Ask => {
-            tx.execute(
-                "INSERT INTO ask_jobs (id, created_at, updated_at) VALUES (?1, ?2, ?2)",
-                params![id, now.clone()],
-            )
-            .await
-            .with_context(|| format!("failed to insert ask_jobs row for job {id}"))?;
-        }
+        // Ask is a pure kind marker — the job row alone drives resume.
+        SpawnChild::Ask => {}
         SpawnChild::Research => {
             tx.execute(
                 "INSERT INTO research_jobs (id, state) VALUES (?1, '{}')",
@@ -491,11 +485,11 @@ pub(crate) fn envelope_target(job: &AgentJob) -> String {
     )
 }
 
-/// Caller identity + task of a job, read from the `jobs` row ALONE — the
-/// child tables (ask_jobs/research_jobs) are never required for resume/capped
-/// delivery, so a job whose child row is missing (e.g. a crash between the
-/// spawn tx and a child insert) still resumes and delivers to the original
-/// caller instead of being stranded.
+/// Caller identity + task of a job, read from the `jobs` row ALONE — child
+/// rows are never required for resume/capped delivery, so a job whose child
+/// row is missing (e.g. a crash between the spawn tx and a child insert)
+/// still resumes and delivers to the original caller instead of being
+/// stranded.
 pub(crate) struct JobCaller {
     pub task: String,
     pub role: String,

@@ -224,7 +224,7 @@ async fn dispatch_durable_ask(
             Ok(AskRunOutcome::DrainCut) => {
                 // Drain-cut: analyst outcomes are already
                 // checkpointed — leave the job status='launched' for boot resume
-                // (recoverable via ask_jobs checkpoints). No terminalization, no
+                // (recoverable from the agent outcome checkpoints). No terminalization, no
                 // error envelope: a spurious envelope here would discard the
                 // checkpointed outcomes and contradict "jobs stay status='launched'
                 // for boot resume".
@@ -2270,9 +2270,9 @@ mod tests {
         let job_id = "ask_job_resume_1";
         let agent_id = format!("ask_{}_rs_0_analyst", ws.name);
         let conn = &crate::session::store().conn;
-        // Pre-create the job + ask_jobs row exactly as a crashed dispatch
-        // leaves them (caller identity persisted on the job row; one done
-        // slot with a stored outcome).
+        // Pre-create the job row exactly as a crashed dispatch leaves it
+        // (caller identity persisted on the job row; one done slot with a
+        // stored outcome).
         crate::jobs::spawn_job(
             conn,
             job_id,
@@ -2329,87 +2329,6 @@ mod tests {
             crate::Role::Assistant,
             "resumed envelope routes to the original caller role, not Manager"
         );
-        assert_eq!(envelope.user_name, "caller-user");
-    }
-
-    /// A job whose ask_jobs child row is missing (a crash between the spawn tx
-    /// and a child insert, or legacy data) must STILL resume — caller identity
-    /// is read from the jobs row alone, so the caller is never stranded by the
-    /// missing child row.
-    ///
-    /// Serialized with the drain-flag writers: `resume_ask_round` consults the
-    /// process-global drain flag and aborts early while it is set (project
-    /// convention: retry_tests_lock).
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
-    async fn resume_ask_round_orphaned_child_row_is_not_stranding() {
-        let _lock = crate::util::test::retry_tests_lock();
-        crate::util::test::init_management_test_stores().await;
-        let ws = test_ws("/tmp/test_ws_ask_orphan");
-        let job_id = "ask_job_orphan_1";
-        let agent_id = format!("ask_{}_orphan_0_analyst", ws.name);
-        let conn = &crate::session::store().conn;
-        crate::jobs::spawn_job(
-            conn,
-            job_id,
-            "question?",
-            &ws.name,
-            "caller-user",
-            "telegram",
-            crate::Role::Assistant,
-            &[crate::jobs::NewAgent {
-                agent_id: agent_id.clone(),
-                kind: crate::jobs::AgentKind::Analyst,
-                idx: Some(0),
-                task: "question?".to_string(),
-            }],
-            &crate::jobs::SpawnChild::Ask,
-        )
-        .await
-        .unwrap();
-        // Simulate the orphan state: the child row is gone but the job row
-        // survives.
-        conn.execute(
-            "DELETE FROM ask_jobs WHERE id = ?1",
-            crate::turso::params![job_id],
-        )
-        .await
-        .unwrap();
-        crate::jobs::write_agent_outcome(
-            conn,
-            job_id,
-            &agent_id,
-            crate::jobs::RowStatus::Done,
-            Some("completed analyst response"),
-        )
-        .await
-        .unwrap();
-
-        resume_ask_round(job_id, &ws).await;
-
-        let job_rows = conn
-            .query(
-                "SELECT id FROM jobs WHERE id = ?1",
-                crate::turso::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert_eq!(job_rows.len(), 0, "orphaned job must still be terminalized");
-        let pending = conn
-            .query(
-                "SELECT envelope FROM pending_jobs WHERE id = ?1",
-                crate::turso::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            pending.len(),
-            1,
-            "envelope persisted despite missing child row"
-        );
-        let envelope: crate::message_router::AgentJob =
-            serde_json::from_str(&pending[0].get::<String>(0).unwrap()).unwrap();
-        assert_eq!(envelope.role, crate::Role::Assistant);
         assert_eq!(envelope.user_name, "caller-user");
     }
 

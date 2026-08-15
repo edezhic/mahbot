@@ -340,12 +340,6 @@ CREATE TABLE IF NOT EXISTS ticket_stage_jobs (
     round       INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS ask_jobs (
-    id         TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS research_jobs (
     id    TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     state TEXT NOT NULL
