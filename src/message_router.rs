@@ -121,22 +121,6 @@ pub enum JobKind {
     RecoveryRetry,
 }
 
-impl JobKind {
-    /// Stable lowercase serialization for the `pending_jobs.kind` column
-    /// (stores the JobKind value, NOT the jobs.kind vocabulary).
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::UserMessage => "user_message",
-            Self::TicketNotify => "ticket_notify",
-            Self::AskToolResult => "ask_tool_result",
-            Self::ResearchResult => "research_result",
-            Self::TicketComment => "ticket_comment",
-            Self::RecoveryRetry => "recovery_retry",
-        }
-    }
-}
-
 /// A single unit of work for an agent consumer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentJob {
@@ -333,8 +317,8 @@ pub async fn route_user_message(
     route(&agent_id, job);
 }
 
-/// Persist an envelope to `pending_jobs`. The target agent id and kind are
-/// derived from the envelope by [`crate::jobs::pending_job_params`].
+/// Persist an envelope to `pending_jobs`. The target agent id is derived
+/// from the envelope by [`crate::jobs::pending_job_params`].
 /// Used by the durable producers (manager-bound messages here; ask/research
 /// use the source job id via [`crate::jobs::complete_job_with_envelope`]).
 async fn persist_pending(job: &AgentJob, id: String) -> anyhow::Result<()> {

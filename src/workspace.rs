@@ -74,8 +74,6 @@ crate::columns! {
         NAME                  => "name",
         PATH                  => "path",
         STATUS                => "status",
-        CREATED_AT            => "created_at",
-        UPDATED_AT            => "updated_at",
         MAINTENANCE_ENABLED    => "maintenance",
         PAUSED                => "paused",
         MAINTAINER_DEBOUNCE_MINS => "maintainer_debounce_mins",
@@ -628,8 +626,6 @@ fn workspace_from_row(row: &turso::Row) -> anyhow::Result<Workspace> {
         status: row
             .get::<String>(COL_WS_STATUS)?
             .parse::<WorkspaceStatus>()?,
-        created_at: row.get(COL_WS_CREATED_AT)?,
-        updated_at: row.get(COL_WS_UPDATED_AT)?,
         maintenance_enabled: row.get::<bool>(COL_WS_MAINTENANCE_ENABLED)?,
         paused: row.get::<bool>(COL_WS_PAUSED)?,
         maintainer_debounce_mins: row.get::<i64>(COL_WS_MAINTAINER_DEBOUNCE_MINS)?,
@@ -1356,8 +1352,6 @@ mod tests {
             name: name.to_string(),
             path: path.to_string(),
             status: WorkspaceStatus::Pending,
-            created_at: now.clone(),
-            updated_at: now.clone(),
             maintenance_enabled,
             paused,
             maintainer_debounce_mins: 5,

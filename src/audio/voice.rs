@@ -6865,11 +6865,6 @@ struct PersistedModel {
     /// persisted models.
     #[serde(default, deserialize_with = "deserialize_classifier_opt")]
     classifier: Option<Vec<ClassifierWeights>>,
-    /// Per-member validation losses from older persisted models.
-    /// Kept for backward compatible deserialization only — always None in
-    /// newly persisted models and never read on load (uniform averaging).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    val_losses: Option<Vec<f32>>,
 }
 
 // ── Default helpers for serde ────────────────────────────────────────
@@ -7027,7 +7022,6 @@ impl Default for PersistedModel {
             created_at: String::new(),
             trained_at: String::new(),
             classifier: None,
-            val_losses: None,
         }
     }
 }
@@ -7103,7 +7097,6 @@ async fn persist_model_state() {
         },
         trained_at: now,
         classifier: weights.map(|w| vec![w]),
-        val_losses: None, // no longer stored (uniform averaging)
     };
 
     if persist_wake_word_model(&model).await {
@@ -10760,7 +10753,6 @@ mod tests {
             created_at: String::new(),
             trained_at: String::new(),
             classifier: Some(vec![ClassifierWeights::default()]),
-            val_losses: None,
         };
 
         migrate_legacy_model(&mut model);

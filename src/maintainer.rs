@@ -278,8 +278,6 @@ mod tests {
             name: "test-ws".into(),
             path: "/tmp/test".into(),
             status: WorkspaceStatus::Ready,
-            created_at: String::new(),
-            updated_at: String::new(),
             maintenance_enabled: true,
             paused: false,
             maintainer_debounce_mins: debounce_mins,

@@ -296,7 +296,6 @@ async fn run_ask_with_job(
                 agent_id: slot.agent_id.clone(),
                 kind: crate::jobs::AgentKind::Analyst,
                 idx: Some(i64::try_from(i).unwrap_or(i64::MAX)),
-                role: crate::Role::Analyst,
                 task: slot.task.clone(),
             });
             slots.push(slot);
@@ -2289,7 +2288,6 @@ mod tests {
                 agent_id: agent_id.clone(),
                 kind: crate::jobs::AgentKind::Analyst,
                 idx: Some(0),
-                role: crate::Role::Analyst,
                 task: "question?".to_string(),
             }],
             &crate::jobs::SpawnChild::Ask,
@@ -2321,18 +2319,20 @@ mod tests {
         assert_eq!(job_rows.len(), 0, "resumed job must be terminalized");
         let pending = conn
             .query(
-                "SELECT role, user_name, channel, kind FROM pending_jobs WHERE id = ?1",
+                "SELECT envelope FROM pending_jobs WHERE id = ?1",
                 crate::turso::params![job_id],
             )
             .await
             .unwrap();
         assert_eq!(pending.len(), 1, "envelope persisted with the job id");
+        let envelope: crate::message_router::AgentJob =
+            serde_json::from_str(&pending[0].get::<String>(0).unwrap()).unwrap();
         assert_eq!(
-            pending[0].get::<String>(0).unwrap(),
-            "assistant",
+            envelope.role,
+            crate::Role::Assistant,
             "resumed envelope routes to the original caller role, not Manager"
         );
-        assert_eq!(pending[0].get::<String>(1).unwrap(), "caller-user");
+        assert_eq!(envelope.user_name, "caller-user");
     }
 
     /// A job whose ask_jobs child row is missing (a crash between the spawn tx
@@ -2364,7 +2364,6 @@ mod tests {
                 agent_id: agent_id.clone(),
                 kind: crate::jobs::AgentKind::Analyst,
                 idx: Some(0),
-                role: crate::Role::Analyst,
                 task: "question?".to_string(),
             }],
             &crate::jobs::SpawnChild::Ask,
@@ -2401,7 +2400,7 @@ mod tests {
         assert_eq!(job_rows.len(), 0, "orphaned job must still be terminalized");
         let pending = conn
             .query(
-                "SELECT role, user_name FROM pending_jobs WHERE id = ?1",
+                "SELECT envelope FROM pending_jobs WHERE id = ?1",
                 crate::turso::params![job_id],
             )
             .await
@@ -2411,8 +2410,10 @@ mod tests {
             1,
             "envelope persisted despite missing child row"
         );
-        assert_eq!(pending[0].get::<String>(0).unwrap(), "assistant");
-        assert_eq!(pending[0].get::<String>(1).unwrap(), "caller-user");
+        let envelope: crate::message_router::AgentJob =
+            serde_json::from_str(&pending[0].get::<String>(0).unwrap()).unwrap();
+        assert_eq!(envelope.role, crate::Role::Assistant);
+        assert_eq!(envelope.user_name, "caller-user");
     }
 
     /// The boot-scan over-cap path must NOT strand the async-ask caller: an
@@ -2442,7 +2443,6 @@ mod tests {
                 agent_id: format!("ask_{}_capped_0_analyst", ws.name),
                 kind: crate::jobs::AgentKind::Analyst,
                 idx: Some(0),
-                role: crate::Role::Analyst,
                 task: "question?".to_string(),
             }],
             &crate::jobs::SpawnChild::Ask,
@@ -2462,21 +2462,23 @@ mod tests {
         assert_eq!(job_rows.len(), 0, "capped job must be terminalized");
         let pending = conn
             .query(
-                "SELECT role, user_name, envelope FROM pending_jobs WHERE id = ?1",
+                "SELECT envelope FROM pending_jobs WHERE id = ?1",
                 crate::turso::params![job_id],
             )
             .await
             .unwrap();
         assert_eq!(pending.len(), 1, "error envelope persisted with the job id");
+        let envelope_json: String = pending[0].get(0).unwrap();
+        let envelope: crate::message_router::AgentJob =
+            serde_json::from_str(&envelope_json).unwrap();
         assert_eq!(
-            pending[0].get::<String>(0).unwrap(),
-            "assistant",
+            envelope.role,
+            crate::Role::Assistant,
             "capped envelope routes to the original caller role, not Manager"
         );
-        assert_eq!(pending[0].get::<String>(1).unwrap(), "caller-user");
-        let envelope: String = pending[0].get(2).unwrap();
+        assert_eq!(envelope.user_name, "caller-user");
         assert!(
-            envelope.contains("ask round aborted"),
+            envelope.content.contains("ask round aborted"),
             "the envelope must surface the cap failure to the caller"
         );
     }

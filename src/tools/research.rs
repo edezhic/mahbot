@@ -193,8 +193,8 @@ impl ResearchState {
         };
         let outcome: Result<()> = async {
             tx.execute(
-                "UPDATE research_jobs SET state = ?1, updated_at = ?2 WHERE id = ?3",
-                crate::turso::params![json, now.clone(), job_id],
+                "UPDATE research_jobs SET state = ?1 WHERE id = ?2",
+                crate::turso::params![json, job_id],
             )
             .await?;
             tx.execute(
@@ -510,9 +510,7 @@ async fn dispatch_durable_research(
             &channel,
             caller_role,
             &[],
-            &crate::jobs::SpawnChild::Research {
-                question: question.to_string(),
-            },
+            &crate::jobs::SpawnChild::Research,
         )
         .await
     };
@@ -3321,9 +3319,8 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO research_jobs (id, question, state, created_at, updated_at) \
-             VALUES (?1, 'question?', '{}', ?2, ?2)",
-            crate::turso::params![job_id, now],
+            "INSERT INTO research_jobs (id, state) VALUES (?1, '{}')",
+            crate::turso::params![job_id],
         )
         .await
         .unwrap();
@@ -3340,22 +3337,24 @@ mod tests {
         assert_eq!(job_rows.len(), 0, "capped job must be terminalized");
         let pending = conn
             .query(
-                "SELECT role, user_name, envelope FROM pending_jobs WHERE id = ?1",
+                "SELECT envelope FROM pending_jobs WHERE id = ?1",
                 crate::turso::params![job_id],
             )
             .await
             .unwrap();
         assert_eq!(pending.len(), 1, "partial-report envelope persisted");
+        let envelope_json: String = pending[0].get(0).unwrap();
+        let envelope: crate::message_router::AgentJob =
+            serde_json::from_str(&envelope_json).unwrap();
         assert_eq!(
-            pending[0].get::<String>(0).unwrap(),
-            "assistant",
+            envelope.role,
+            crate::Role::Assistant,
             "delivered to the original caller role, not Manager"
         );
-        assert_eq!(pending[0].get::<String>(1).unwrap(), "caller-user");
-        let envelope: String = pending[0].get(2).unwrap();
+        assert_eq!(envelope.user_name, "caller-user");
         assert!(
-            envelope.contains("boot re-dispatch cap exceeded"),
-            "the partial report must surface the cap reason: {envelope}"
+            envelope.content.contains("boot re-dispatch cap exceeded"),
+            "the partial report must surface the cap reason: {envelope_json}"
         );
     }
 
@@ -3431,9 +3430,8 @@ mod tests {
         state.acc.rebuild_keys();
         let state_json = serde_json::to_string(&state).unwrap();
         conn.execute(
-            "INSERT INTO research_jobs (id, question, state, created_at, updated_at) \
-             VALUES (?1, 'question?', ?2, ?3, ?3)",
-            crate::turso::params![job_id, state_json, now.clone()],
+            "INSERT INTO research_jobs (id, state) VALUES (?1, ?2)",
+            crate::turso::params![job_id, state_json],
         )
         .await
         .unwrap();
@@ -3453,22 +3451,24 @@ mod tests {
         assert_eq!(job_rows.len(), 0, "resumed job must be terminalized");
         let pending = conn
             .query(
-                "SELECT role, user_name, envelope FROM pending_jobs WHERE id = ?1",
+                "SELECT envelope FROM pending_jobs WHERE id = ?1",
                 crate::turso::params![job_id],
             )
             .await
             .unwrap();
         assert_eq!(pending.len(), 1, "resume envelope persisted");
+        let envelope_json: String = pending[0].get(0).unwrap();
+        let envelope: crate::message_router::AgentJob =
+            serde_json::from_str(&envelope_json).unwrap();
         assert_eq!(
-            pending[0].get::<String>(0).unwrap(),
-            "assistant",
+            envelope.role,
+            crate::Role::Assistant,
             "delivered to the original caller role, not Manager"
         );
-        assert_eq!(pending[0].get::<String>(1).unwrap(), "caller-user");
-        let envelope: String = pending[0].get(2).unwrap();
+        assert_eq!(envelope.user_name, "caller-user");
         assert!(
-            envelope.contains("final synthesized report"),
-            "the resume envelope must carry the synthesized report: {envelope}"
+            envelope.content.contains("final synthesized report"),
+            "the resume envelope must carry the synthesized report: {envelope_json}"
         );
     }
 

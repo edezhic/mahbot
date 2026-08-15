@@ -22,36 +22,29 @@ CREATE TABLE IF NOT EXISTS chat_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id TEXT NOT NULL UNIQUE,
     user_name TEXT NOT NULL,
-    channel TEXT NOT NULL,
-    role TEXT NOT NULL,
     direction TEXT NOT NULL,
     content TEXT NOT NULL,
     agent_role TEXT,
-    workspace TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    workspace TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_chat_history_user ON chat_history(user_name, created_at);
-CREATE INDEX IF NOT EXISTS idx_chat_history_workspace ON chat_history(workspace, created_at);
-CREATE INDEX IF NOT EXISTS idx_chat_history_channel ON chat_history(channel, created_at);
+CREATE INDEX IF NOT EXISTS idx_chat_history_user ON chat_history(user_name);
+CREATE INDEX IF NOT EXISTS idx_chat_history_workspace ON chat_history(workspace);
 CREATE INDEX IF NOT EXISTS idx_chat_history_user_ws_id ON chat_history(user_name, workspace, id);
 ";
 
 /// Parameters for inserting a chat history entry.
 ///
-/// This struct bundles the 9 fields needed by [`ChatHistoryStore::insert`],
+/// This struct bundles the 6 fields needed by [`ChatHistoryStore::insert`],
 /// replacing the previous positional-parameter signature. Owned `String` fields
 /// match the pattern established by [`LogEntry`](crate::logs::LogEntry).
 #[derive(Debug, Clone)]
 pub struct ChatHistoryInsert {
     pub message_id: String,
     pub user_name: String,
-    pub channel: String,
-    pub role: String,
     pub direction: String,
     pub content: String,
     pub agent_role: Option<String>,
     pub workspace: String,
-    pub created_at: String,
 }
 
 /// A single chat message record for history display.
@@ -122,19 +115,15 @@ impl ChatHistoryStore {
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO chat_history \
-                 (message_id, user_name, channel, role, direction, \
-                  content, agent_role, workspace, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (message_id, user_name, direction, content, agent_role, workspace) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 turso::params![
                     entry.message_id.clone(),
                     entry.user_name.clone(),
-                    entry.channel.clone(),
-                    entry.role.clone(),
                     entry.direction.clone(),
                     entry.content.clone(),
                     entry.agent_role.clone(),
                     entry.workspace.clone(),
-                    entry.created_at.clone(),
                 ],
             )
             .await?;
@@ -223,27 +212,17 @@ impl ChatHistoryStore {
     }
 
     /// Insert a divider marker row into chat history to indicate where a
-    /// session clear occurred. The row uses `role='divider'` and
-    /// `direction='divider'` so the GUI can detect it and render a visible
-    /// separator instead of a chat bubble.
-    pub async fn insert_divider(
-        &self,
-        user_name: &str,
-        channel: &str,
-        workspace: &str,
-    ) -> Result<()> {
+    /// session clear occurred. The row uses `direction='divider'` so the GUI
+    /// can detect it and render a visible separator instead of a chat bubble.
+    pub async fn insert_divider(&self, user_name: &str, workspace: &str) -> Result<()> {
         let message_id = crate::generate_id();
-        let created_at = turso::now();
         self.insert(&ChatHistoryInsert {
             message_id,
             user_name: user_name.to_string(),
-            channel: channel.to_string(),
-            role: "divider".to_string(),
             direction: "divider".to_string(),
-            content: created_at.clone(),
+            content: turso::now(),
             agent_role: None,
             workspace: workspace.to_string(),
-            created_at,
         })
         .await
     }
@@ -279,13 +258,10 @@ mod tests {
             .insert(&ChatHistoryInsert {
                 message_id: "msg-1".to_string(),
                 user_name: "user".to_string(),
-                channel: "test".to_string(),
-                role: "user".to_string(),
                 direction: "user".to_string(),
                 content: "hello".to_string(),
                 agent_role: None,
                 workspace: "ws".to_string(),
-                created_at: "now".to_string(),
             })
             .await
             .expect("insert should succeed");
@@ -304,7 +280,7 @@ mod tests {
 
         // Insert a divider marker.
         store
-            .insert_divider("alice", "gui", "ws1")
+            .insert_divider("alice", "ws1")
             .await
             .expect("insert_divider should succeed");
 
@@ -371,11 +347,11 @@ mod tests {
 
         // Insert two dividers.
         store
-            .insert_divider("alice", "gui", "ws1")
+            .insert_divider("alice", "ws1")
             .await
             .expect("first divider should succeed");
         store
-            .insert_divider("alice", "gui", "ws1")
+            .insert_divider("alice", "ws1")
             .await
             .expect("second divider should succeed");
 
@@ -406,20 +382,17 @@ mod tests {
             .insert(&ChatHistoryInsert {
                 message_id: "msg-1".to_string(),
                 user_name: "alice".to_string(),
-                channel: "gui".to_string(),
-                role: "user".to_string(),
                 direction: "user".to_string(),
                 content: "hello".to_string(),
                 agent_role: None,
                 workspace: "ws1".to_string(),
-                created_at: turso::now(),
             })
             .await
             .expect("insert should succeed");
 
         // Insert a divider.
         store
-            .insert_divider("alice", "gui", "ws1")
+            .insert_divider("alice", "ws1")
             .await
             .expect("insert_divider should succeed");
 
@@ -428,13 +401,10 @@ mod tests {
             .insert(&ChatHistoryInsert {
                 message_id: "msg-2".to_string(),
                 user_name: "alice".to_string(),
-                channel: "gui".to_string(),
-                role: "user".to_string(),
                 direction: "user".to_string(),
                 content: "world".to_string(),
                 agent_role: None,
                 workspace: "ws1".to_string(),
-                created_at: turso::now(),
             })
             .await
             .expect("insert should succeed");
@@ -476,13 +446,10 @@ mod tests {
                 .insert(&ChatHistoryInsert {
                     message_id: format!("msg-{i}"),
                     user_name: "alice".to_string(),
-                    channel: "gui".to_string(),
-                    role: "user".to_string(),
                     direction: "user".to_string(),
                     content: content.to_string(),
                     agent_role: None,
                     workspace: ws.to_string(),
-                    created_at: turso::now(),
                 })
                 .await
                 .expect("insert should succeed");
@@ -523,13 +490,10 @@ mod tests {
                 .insert(&ChatHistoryInsert {
                     message_id: format!("msg-{i}"),
                     user_name: "alice".to_string(),
-                    channel: "gui".to_string(),
-                    role: "user".to_string(),
                     direction: "user".to_string(),
                     content: format!("c{i}"),
                     agent_role: None,
                     workspace: ws.to_string(),
-                    created_at: turso::now(),
                 })
                 .await
                 .expect("insert should succeed");

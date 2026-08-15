@@ -19,8 +19,8 @@ use tracing::{debug, info, warn};
 
 // ── Job-kind vocabulary (jobs.kind) ─────────────────────────────────────
 // Values of `jobs.kind` are fully determined by the child row (one kind per
-// child — `SpawnChild::kind_str`); the [`JobKind`] enum stored in
-// `pending_jobs.kind` is the unrelated envelope vocabulary.
+// child — `SpawnChild::kind_str`); the [`JobKind`] enum travels inside the
+// serialized pending_jobs envelope and is unrelated to that vocabulary.
 
 /// Status vocabulary shared by `jobs.status` and `agents.status` — both
 /// tables are schema-locked to the same launched/done/failed dictionary
@@ -167,21 +167,18 @@ fn pending_row_from(row: &Row) -> anyhow::Result<PendingJobRow> {
 /// pending_jobs envelope INSERT — producers: `message_router::persist_pending`
 /// and `complete_job_with_envelope`.
 pub(crate) const PENDING_JOB_INSERT_SQL: &str = "INSERT INTO pending_jobs \
-     (id, target_agent_id, kind, envelope, user_name, channel, role, created_at) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+     (id, target_agent_id, envelope, created_at) \
+     VALUES (?1, ?2, ?3, ?4)";
 
 /// Build the pending_jobs INSERT params from a durable envelope — the target
-/// agent id and kind are derived from the envelope (no kind parameter).
-pub(crate) fn pending_job_params(id: &str, envelope: &AgentJob, now: &str) -> Result<[Value; 8]> {
+/// agent id is derived from the envelope (caller identity lives in the
+/// serialized envelope, not the row).
+pub(crate) fn pending_job_params(id: &str, envelope: &AgentJob, now: &str) -> Result<[Value; 4]> {
     let envelope_json = serde_json::to_string(envelope)?;
     Ok([
         id.into(),
         envelope_target(envelope).into(),
-        envelope.kind.as_str().into(),
         envelope_json.into(),
-        envelope.user_name.clone().into(),
-        envelope.channel.clone().into(),
-        envelope.role.as_str().into(),
         now.into(),
     ])
 }
@@ -189,8 +186,8 @@ pub(crate) fn pending_job_params(id: &str, envelope: &AgentJob, now: &str) -> Re
 /// agents roster INSERT — producers: `spawn_job` roster loop and
 /// `management::append_ticket_stage_slots`. Status is the literal 'launched'.
 pub(crate) const AGENT_INSERT_SQL: &str = "INSERT INTO agents \
-     (job_id, agent_id, kind, idx, role, status, task, created_at) \
-     VALUES (?1, ?2, ?3, ?4, ?5, 'launched', ?6, ?7)";
+     (job_id, agent_id, kind, idx, status, task) \
+     VALUES (?1, ?2, ?3, ?4, 'launched', ?5)";
 
 /// Build the agents roster INSERT params (status is fixed by the SQL).
 pub(crate) fn agent_params(
@@ -198,18 +195,14 @@ pub(crate) fn agent_params(
     agent_id: &str,
     kind: AgentKind,
     idx: Option<i64>,
-    role: Role,
     task: &str,
-    now: &str,
-) -> [Value; 7] {
+) -> [Value; 5] {
     [
         job_id.into(),
         agent_id.into(),
         kind.as_str().into(),
         idx.into(),
-        role.as_str().into(),
         task.into(),
-        now.into(),
     ]
 }
 
@@ -225,8 +218,8 @@ pub(crate) fn agent_params(
 pub(crate) enum SpawnChild {
     /// ask_jobs (id).
     Ask,
-    /// research_jobs (id, question, state).
-    Research { question: String },
+    /// research_jobs (id, state).
+    Research,
     /// ticket_stage_jobs (id, ticket_id, stage, phase, round).
     TicketStage {
         ticket_id: String,
@@ -244,7 +237,7 @@ impl SpawnChild {
     pub const fn kind_str(&self) -> &'static str {
         match self {
             Self::Ask => "ask",
-            Self::Research { .. } => "research",
+            Self::Research => "research",
             Self::TicketStage { .. } => "ticket_stage",
         }
     }
@@ -289,7 +282,7 @@ pub(crate) async fn spawn_job(
     for a in agents {
         tx.execute(
             AGENT_INSERT_SQL,
-            agent_params(id, &a.agent_id, a.kind, a.idx, a.role, &a.task, &now),
+            agent_params(id, &a.agent_id, a.kind, a.idx, &a.task),
         )
         .await
         .with_context(|| format!("failed to insert agent roster for job {id}"))?;
@@ -303,11 +296,10 @@ pub(crate) async fn spawn_job(
             .await
             .with_context(|| format!("failed to insert ask_jobs row for job {id}"))?;
         }
-        SpawnChild::Research { question } => {
+        SpawnChild::Research => {
             tx.execute(
-                "INSERT INTO research_jobs (id, question, state, created_at, updated_at) \
-                 VALUES (?1, ?2, '{}', ?3, ?3)",
-                params![id, question.clone(), now.clone()],
+                "INSERT INTO research_jobs (id, state) VALUES (?1, '{}')",
+                params![id],
             )
             .await
             .with_context(|| format!("failed to insert research_jobs row for job {id}"))?;
@@ -319,17 +311,9 @@ pub(crate) async fn spawn_job(
             round,
         } => {
             tx.execute(
-                "INSERT INTO ticket_stage_jobs \
-                 (id, ticket_id, stage, phase, round, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-                params![
-                    id,
-                    ticket_id.clone(),
-                    stage.clone(),
-                    phase.clone(),
-                    round,
-                    now.clone()
-                ],
+                "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, ticket_id.clone(), stage.clone(), phase.clone(), round],
             )
             .await
             .with_context(|| format!("failed to insert ticket_stage_jobs row for job {id}"))?;
@@ -344,7 +328,6 @@ pub(crate) struct NewAgent {
     pub agent_id: String,
     pub kind: AgentKind,
     pub idx: Option<i64>,
-    pub role: Role,
     pub task: String,
 }
 
@@ -1285,14 +1268,13 @@ pub(crate) async fn upsert_engineer_anchor(
     task: &str,
     status: RowStatus,
 ) -> Result<()> {
-    let now = turso::now();
     let anchor_id = engineer_anchor_id(ticket_id);
     conn.execute(
-        "INSERT INTO agents (job_id, agent_id, kind, idx, role, status, outcome, task, created_at) \
-         VALUES (NULL, ?1, 'engineer', NULL, 'engineer', ?2, NULL, ?3, ?4) \
+        "INSERT INTO agents (job_id, agent_id, kind, idx, status, outcome, task) \
+         VALUES (NULL, ?1, 'engineer', NULL, ?2, NULL, ?3) \
          ON CONFLICT(agent_id) WHERE job_id IS NULL \
          DO UPDATE SET status = ?2, task = ?3, outcome = NULL",
-        params![anchor_id, status.as_str(), task, now],
+        params![anchor_id, status.as_str(), task],
     )
     .await
     .with_context(|| format!("failed to upsert engineer anchor for ticket {ticket_id}"))?;
@@ -1425,9 +1407,9 @@ mod tests {
         .await
         .expect("insert job for roster row");
         conn.execute(
-            "INSERT INTO agents (job_id, agent_id, kind, idx, role, status, task, created_at) \
-             VALUES ('j1', ?1, 'engineer', NULL, 'engineer', 'launched', 'roster-task', ?2)",
-            params![anchor_id.clone(), turso::now()],
+            "INSERT INTO agents (job_id, agent_id, kind, idx, status, task) \
+             VALUES ('j1', ?1, 'engineer', NULL, 'launched', 'roster-task')",
+            params![anchor_id.clone()],
         )
         .await
         .expect("roster row with same agent_id must coexist");
@@ -1443,9 +1425,9 @@ mod tests {
         // A second anchor insert (NULL job_id) must conflict → single row.
         let err = conn
             .execute(
-                "INSERT INTO agents (job_id, agent_id, kind, idx, role, status, task, created_at) \
-                 VALUES (NULL, ?1, 'engineer', NULL, 'engineer', 'launched', 'dup', ?2)",
-                params![engineer_anchor_id("t-1400"), turso::now()],
+                "INSERT INTO agents (job_id, agent_id, kind, idx, status, task) \
+                 VALUES (NULL, ?1, 'engineer', NULL, 'launched', 'dup')",
+                params![engineer_anchor_id("t-1400")],
             )
             .await
             .expect_err("duplicate NULL-seat anchor must violate the partial unique index");
@@ -1508,7 +1490,6 @@ mod tests {
                 agent_id: "ask_a1".to_string(),
                 kind: AgentKind::Analyst,
                 idx: Some(0),
-                role: crate::Role::Analyst,
                 task: "t1".to_string(),
             }],
             &SpawnChild::Ask,
@@ -1623,8 +1604,8 @@ mod tests {
         .unwrap();
         // Pending row created BEFORE the message (tiebreaker must skip).
         conn.execute(
-            "INSERT INTO pending_jobs (id, target_agent_id, kind, envelope, role, created_at) \
-             VALUES ('p1', ?1, 'user_message', ?2, 'manager', ?3)",
+            "INSERT INTO pending_jobs (id, target_agent_id, envelope, created_at) \
+             VALUES ('p1', ?1, ?2, ?3)",
             params![
                 agent_id,
                 serde_json::to_string(&AgentJob {
@@ -1722,8 +1703,8 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO pending_jobs (id, target_agent_id, kind, envelope, role, created_at) \
-             VALUES ('p-legacy', ?1, 'user_message', ?2, 'manager', ?3)",
+            "INSERT INTO pending_jobs (id, target_agent_id, envelope, created_at) \
+             VALUES ('p-legacy', ?1, ?2, ?3)",
             params![
                 agent_id,
                 serde_json::to_string(&AgentJob {
@@ -1762,8 +1743,8 @@ mod tests {
         let mut rx = crate::message_router::register_agent(agent_id);
         let content = "FULL CONTENT";
         conn.execute(
-            "INSERT INTO pending_jobs (id, target_agent_id, kind, envelope, role, created_at) \
-             VALUES ('p2', ?1, 'ask_tool_result', ?2, 'manager', ?3)",
+            "INSERT INTO pending_jobs (id, target_agent_id, envelope, created_at) \
+             VALUES ('p2', ?1, ?2, ?3)",
             params![
                 agent_id,
                 serde_json::to_string(&AgentJob {
@@ -1833,9 +1814,9 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO agents (job_id, agent_id, kind, role, status, task, created_at) \
-             VALUES ('jttl', 'ticket_t1_0_suf_engineer', 'engineer', 'engineer', 'launched', '', ?1)",
-            params![stale],
+            "INSERT INTO agents (job_id, agent_id, kind, status, task) \
+             VALUES ('jttl', 'ticket_t1_0_suf_engineer', 'engineer', 'launched', '')",
+            (),
         )
         .await
         .unwrap();
@@ -1899,22 +1880,22 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round, created_at, updated_at) \
-             VALUES ('jstale', ?1, 'engineer', 'in_development', 1, ?2, ?2)",
-            params![ticket_id.clone(), stale.clone()],
+            "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
+             VALUES ('jstale', ?1, 'engineer', 'in_development', 1)",
+            params![ticket_id.clone()],
         )
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO agents (job_id, agent_id, kind, role, status, task, created_at) \
-             VALUES ('jstale', 'ticket_purge-t1_engineer', 'engineer', 'engineer', 'launched', '', ?1)",
-            params![stale.clone()],
+            "INSERT INTO agents (job_id, agent_id, kind, status, task) \
+             VALUES ('jstale', 'ticket_purge-t1_engineer', 'engineer', 'launched', '')",
+            (),
         )
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO session_metadata (agent_id, created_at, last_activity) \
-             VALUES ('ticket_purge-t1_engineer', ?1, ?1)",
+            "INSERT INTO session_metadata (agent_id, last_activity) \
+             VALUES ('ticket_purge-t1_engineer', ?1)",
             params![stale],
         )
         .await
@@ -1995,9 +1976,9 @@ mod tests {
             .await
             .unwrap();
             conn.execute(
-                "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round, created_at, updated_at) \
-                 VALUES (?1, ?2, 'review', 'in_review', ?3, ?4, ?4)",
-                params![id, ticket_id.clone(), round, ts.clone()],
+                "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
+                 VALUES (?1, ?2, 'review', 'in_review', ?3)",
+                params![id, ticket_id.clone(), round],
             )
             .await
             .unwrap();
@@ -2036,9 +2017,9 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round, created_at, updated_at) \
-             VALUES ('jfail_ts', 'ticket-missing', 'engineer', 'in_development', 1, ?1, ?1)",
-            params![stale.clone()],
+            "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
+             VALUES ('jfail_ts', 'ticket-missing', 'engineer', 'in_development', 1)",
+            (),
         )
         .await
         .unwrap();
@@ -2163,9 +2144,9 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round, created_at, \
-             updated_at) VALUES ('jscan', ?1, 'engineer', 'in_development', 1, ?2, ?2)",
-            params![resumed_ticket.clone(), now.clone()],
+            "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
+             VALUES ('jscan', ?1, 'engineer', 'in_development', 1)",
+            params![resumed_ticket.clone()],
         )
         .await
         .unwrap();
@@ -2253,9 +2234,9 @@ mod tests {
             .await
             .unwrap();
             conn.execute(
-                "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round, created_at, \
-                 updated_at) VALUES (?1, ?2, 'engineer', 'in_development', ?3, ?4, ?4)",
-                params![id, dup_ticket.clone(), round, now.clone()],
+                "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
+                 VALUES (?1, ?2, 'engineer', 'in_development', ?3)",
+                params![id, dup_ticket.clone(), round],
             )
             .await
             .unwrap();
@@ -2279,9 +2260,9 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round, created_at, \
-             updated_at) VALUES ('jcls2', ?1, 'review', 'in_review', 1, ?2, ?2)",
-            params![phase_left.clone(), now.clone()],
+            "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
+             VALUES ('jcls2', ?1, 'review', 'in_review', 1)",
+            params![phase_left.clone()],
         )
         .await
         .unwrap();
@@ -2303,9 +2284,9 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round, created_at, \
-             updated_at) VALUES ('jcls3', ?1, 'engineer', 'in_development', 1, ?2, ?2)",
-            params![done_ticket.clone(), now.clone()],
+            "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
+             VALUES ('jcls3', ?1, 'engineer', 'in_development', 1)",
+            params![done_ticket.clone()],
         )
         .await
         .unwrap();

@@ -286,7 +286,6 @@ CREATE INDEX IF NOT EXISTS idx_sessions_agent_id ON sessions(agent_id, id);
 
 CREATE TABLE IF NOT EXISTS session_metadata (
     agent_id      TEXT PRIMARY KEY,
-    created_at    TEXT NOT NULL,
     last_activity TEXT NOT NULL,
     channel       TEXT,
     user_name     TEXT,
@@ -318,11 +317,9 @@ CREATE TABLE IF NOT EXISTS agents (
     agent_id   TEXT NOT NULL,
     kind       TEXT NOT NULL,
     idx        INTEGER,
-    role       TEXT NOT NULL,
     status     TEXT NOT NULL DEFAULT 'launched',
     outcome    TEXT,
     task       TEXT NOT NULL,
-    created_at TEXT NOT NULL,
     PRIMARY KEY (job_id, agent_id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_anchor ON agents(agent_id) WHERE job_id IS NULL;
@@ -330,11 +327,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_anchor ON agents(agent_id) WHERE jo
 CREATE TABLE IF NOT EXISTS pending_jobs (
     id              TEXT PRIMARY KEY,
     target_agent_id TEXT NOT NULL,
-    kind            TEXT NOT NULL,
     envelope        TEXT NOT NULL,
-    user_name       TEXT NOT NULL DEFAULT '',
-    channel         TEXT NOT NULL DEFAULT '',
-    role            TEXT NOT NULL,
     created_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pending_jobs_agent_created ON pending_jobs(target_agent_id, created_at);
@@ -344,9 +337,7 @@ CREATE TABLE IF NOT EXISTS ticket_stage_jobs (
     ticket_id   TEXT NOT NULL,
     stage       TEXT NOT NULL,
     phase       TEXT NOT NULL,
-    round       INTEGER NOT NULL,
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    round       INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS ask_jobs (
@@ -356,11 +347,8 @@ CREATE TABLE IF NOT EXISTS ask_jobs (
 );
 
 CREATE TABLE IF NOT EXISTS research_jobs (
-    id         TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-    question   TEXT NOT NULL,
-    state      TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    id    TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    state TEXT NOT NULL
 );";
 
 // ── Column index constants ──────────────────────────────────
@@ -477,34 +465,26 @@ async fn insert_messages_in_transaction(
     match context {
         Some((channel, user_name, workspace_name, role)) => {
             tx.execute(
-                "INSERT INTO session_metadata (agent_id, created_at, last_activity, \
+                "INSERT INTO session_metadata (agent_id, last_activity, \
                  channel, user_name, workspace_name, role) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
                  ON CONFLICT(agent_id) DO UPDATE SET \
                  last_activity = excluded.last_activity, \
                  channel = excluded.channel, \
                  user_name = excluded.user_name, \
                  workspace_name = excluded.workspace_name, \
                  role = excluded.role",
-                params![
-                    agent_id,
-                    now.clone(),
-                    now,
-                    channel,
-                    user_name,
-                    workspace_name,
-                    role,
-                ],
+                params![agent_id, now, channel, user_name, workspace_name, role,],
             )
             .await?;
         }
         None => {
             tx.execute(
-                "INSERT INTO session_metadata (agent_id, created_at, last_activity) \
-                 VALUES (?1, ?2, ?3) \
+                "INSERT INTO session_metadata (agent_id, last_activity) \
+                 VALUES (?1, ?2) \
                  ON CONFLICT(agent_id) DO UPDATE SET \
                  last_activity = excluded.last_activity",
-                params![agent_id, now.clone(), now],
+                params![agent_id, now],
             )
             .await?;
         }
@@ -812,10 +792,10 @@ impl SessionStore {
         let now = turso::now();
         self.conn
             .execute(
-                "INSERT INTO session_metadata (agent_id, created_at, last_activity, active_models) \
-                 VALUES (?1, ?2, ?3, ?4) \
+                "INSERT INTO session_metadata (agent_id, last_activity, active_models) \
+                 VALUES (?1, ?2, ?3) \
                  ON CONFLICT(agent_id) DO UPDATE SET active_models = excluded.active_models",
-                params![agent_id, now.clone(), now, snapshot],
+                params![agent_id, now, snapshot],
             )
             .await?;
         Ok(())

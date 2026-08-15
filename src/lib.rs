@@ -318,8 +318,6 @@ pub struct Workspace {
     pub name: String,
     pub path: String,
     pub status: WorkspaceStatus,
-    pub created_at: String,
-    pub updated_at: String,
     /// Whether the maintainer agent is enabled for this workspace.
     ///
     /// `true`  — the maintainer loop processes this workspace on each cycle.
@@ -379,8 +377,6 @@ impl Default for Workspace {
             name: String::default(),
             path: String::default(),
             status: WorkspaceStatus::Pending,
-            created_at: String::default(),
-            updated_at: String::default(),
             maintenance_enabled: bool::default(),
             paused: bool::default(),
             maintainer_debounce_mins: 5,

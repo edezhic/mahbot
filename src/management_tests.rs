@@ -730,9 +730,9 @@ async fn resume_verifier_round_replays_stored_outcomes() {
     .await
     .unwrap();
     conn.execute(
-        "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round, created_at, \
-         updated_at) VALUES (?1, ?2, 'review', 'in_review', 1, ?3, ?3)",
-        crate::turso::params![job_id, ticket_id.clone(), now.clone()],
+        "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
+         VALUES (?1, ?2, 'review', 'in_review', 1)",
+        crate::turso::params![job_id, ticket_id.clone()],
     )
     .await
     .unwrap();
@@ -743,14 +743,13 @@ async fn resume_verifier_round_replays_stored_outcomes() {
     for i in 0..3 {
         let agent_id = format!("ticket_{}_resume_{}_reviewer", ticket_id, i);
         conn.execute(
-            "INSERT INTO agents (job_id, agent_id, kind, idx, role, status, outcome, task, \
-             created_at) VALUES (?1, ?2, 'verifier', ?3, 'reviewer', 'done', ?4, '', ?5)",
+            "INSERT INTO agents (job_id, agent_id, kind, idx, status, outcome, task) \
+             VALUES (?1, ?2, 'verifier', ?3, 'done', ?4, '')",
             crate::turso::params![
                 job_id,
                 agent_id,
                 i as i64,
                 serialize_verdict_outcome(&pass_result()),
-                now.clone(),
             ],
         )
         .await
@@ -904,25 +903,25 @@ async fn resume_engineer_round_continues_anchor_session() {
     .await
     .unwrap();
     conn.execute(
-        "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round, created_at, \
-         updated_at) VALUES (?1, ?2, 'engineer', 'in_development', 2, ?3, ?3)",
-        crate::turso::params![job_id, ticket_id.clone(), now.clone()],
+        "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
+         VALUES (?1, ?2, 'engineer', 'in_development', 2)",
+        crate::turso::params![job_id, ticket_id.clone()],
     )
     .await
     .unwrap();
     // NULL-seat anchor + this round's roster row (same agent_id, coexisting
     // under the composite PK).
     conn.execute(
-        "INSERT INTO agents (job_id, agent_id, kind, idx, role, status, task, created_at) \
-         VALUES (NULL, ?1, 'engineer', NULL, 'engineer', 'done', ?2, ?3)",
-        crate::turso::params![anchor_id.clone(), task, now.clone()],
+        "INSERT INTO agents (job_id, agent_id, kind, idx, status, task) \
+         VALUES (NULL, ?1, 'engineer', NULL, 'done', ?2)",
+        crate::turso::params![anchor_id.clone(), task],
     )
     .await
     .unwrap();
     conn.execute(
-        "INSERT INTO agents (job_id, agent_id, kind, idx, role, status, task, created_at) \
-         VALUES (?1, ?2, 'engineer', 0, 'engineer', 'launched', ?3, ?4)",
-        crate::turso::params![job_id, anchor_id.clone(), task, now.clone()],
+        "INSERT INTO agents (job_id, agent_id, kind, idx, status, task) \
+         VALUES (?1, ?2, 'engineer', 0, 'launched', ?3)",
+        crate::turso::params![job_id, anchor_id.clone(), task],
     )
     .await
     .unwrap();
@@ -1046,17 +1045,17 @@ async fn resume_sanitation_round_continues_session_and_passes() {
     .await
     .unwrap();
     conn.execute(
-        "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round, created_at, \
-         updated_at) VALUES (?1, ?2, 'sanitation', 'in_sanitation', 1, ?3, ?3)",
-        crate::turso::params![job_id, ticket_id.clone(), now.clone()],
+        "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
+         VALUES (?1, ?2, 'sanitation', 'in_sanitation', 1)",
+        crate::turso::params![job_id, ticket_id.clone()],
     )
     .await
     .unwrap();
     // Roster row + session content → empty-message dispatch (no re-append).
     conn.execute(
-        "INSERT INTO agents (job_id, agent_id, kind, idx, role, status, task, created_at) \
-         VALUES (?1, ?2, 'sanitation', 0, 'sanitation', 'launched', ?3, ?4)",
-        crate::turso::params![job_id, agent_id.clone(), task, now.clone()],
+        "INSERT INTO agents (job_id, agent_id, kind, idx, status, task) \
+         VALUES (?1, ?2, 'sanitation', 0, 'launched', ?3)",
+        crate::turso::params![job_id, agent_id.clone(), task],
     )
     .await
     .unwrap();

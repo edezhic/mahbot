@@ -38,12 +38,9 @@ impl BroadcastPersistEntry {
         let message_id = crate::generate_id();
         let timestamp = turso::now();
 
-        let (db_role, db_direction) = match self.direction {
-            ChatDirection::Agent => (
-                self.agent_role.as_deref().unwrap_or("").to_string(),
-                "agent".to_string(),
-            ),
-            ChatDirection::User => ("user".to_string(), "user".to_string()),
+        let db_direction = match self.direction {
+            ChatDirection::Agent => "agent".to_string(),
+            ChatDirection::User => "user".to_string(),
             ChatDirection::Divider => {
                 unreachable!("Divider markers should not go through broadcast_and_persist")
             }
@@ -66,13 +63,10 @@ impl BroadcastPersistEntry {
             .insert(&ChatHistoryInsert {
                 message_id,
                 user_name: self.user_name,
-                channel: self.channel,
-                role: db_role,
                 direction: db_direction,
                 content: self.content,
                 agent_role: self.agent_role,
                 workspace: self.workspace,
-                created_at: timestamp,
             })
             .await;
     }
@@ -210,13 +204,10 @@ pub async fn broadcast_and_persist_incoming_message(
                 .insert(&ChatHistoryInsert {
                     message_id,
                     user_name: msg.user_name.clone(),
-                    channel: msg.channel.clone(),
-                    role: "user".to_string(),
                     direction: "user".to_string(),
                     content: persist_content.to_string(),
                     agent_role: None,
                     workspace: msg.workspace.clone(),
-                    created_at: timestamp,
                 })
                 .await;
         },

@@ -1193,7 +1193,7 @@ impl HomeState {
                         .await;
                         // Insert a divider marker instead of deleting history.
                         let store = crate::chat_history::store();
-                        match store.insert_divider(&sender, "gui", &ws.name).await {
+                        match store.insert_divider(&sender, &ws.name).await {
                             Ok(()) => Ok(()),
                             Err(e) => {
                                 tracing::warn!(

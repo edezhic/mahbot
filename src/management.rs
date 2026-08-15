@@ -3149,7 +3149,6 @@ async fn spawn_ticket_stage_round(
             agent_id: s.agent_id.clone(),
             kind: agent_kind_for_role(role),
             idx: Some(s.idx),
-            role,
             task: s.task.clone(),
         })
         .collect();
@@ -3215,7 +3214,6 @@ async fn spawn_single_slot_round(
             agent_id: agent_id.to_string(),
             kind: agent_kind_for_role(role),
             idx: Some(0),
-            role,
             task: prompt.to_string(),
         }],
         &crate::jobs::SpawnChild::TicketStage {
@@ -3243,7 +3241,6 @@ async fn append_ticket_stage_slots(
     let suffix = crate::generate_suffix();
     let angles = load_verifier_angles(role);
     let mut slots = Vec::with_capacity(count);
-    let now = crate::turso::now();
     for (k, i) in (next_idx..next_idx + i64::try_from(count).unwrap_or(i64::MAX)).enumerate() {
         let agent_id = format!("ticket_{}_{}_{}_{}", ticket.id, i, suffix, role.as_str());
         let task = if angles.is_empty() {
@@ -3260,9 +3257,7 @@ async fn append_ticket_stage_slots(
                     &agent_id,
                     agent_kind_for_role(role),
                     Some(i),
-                    role,
                     &task,
-                    &now,
                 ),
             )
             .await?;

@@ -1198,8 +1198,8 @@ mod tests {
         crate::session::store()
             .conn
             .execute(
-                "INSERT INTO pending_jobs (id, target_agent_id, kind, envelope, role, created_at) \
-                 VALUES (?1, 'manager_ws', 'research_result', '{}', 'manager', ?2)",
+                "INSERT INTO pending_jobs (id, target_agent_id, envelope, created_at) \
+                 VALUES (?1, 'manager_ws', '{}', ?2)",
                 params![id, created],
             )
             .await
@@ -1278,8 +1278,8 @@ mod tests {
         let conn = &crate::session::store().conn;
         let now = crate::turso::now();
         conn.execute(
-            "INSERT INTO session_metadata (agent_id, created_at, last_activity, user_name, workspace_name, role) \
-             VALUES ('artist_a', ?1, ?1, 'alice', 'personal:alice', 'artist')",
+            "INSERT INTO session_metadata (agent_id, last_activity, user_name, workspace_name, role) \
+             VALUES ('artist_a', ?1, 'alice', 'personal:alice', 'artist')",
             params![now.clone()],
         )
         .await
@@ -1726,8 +1726,8 @@ mod tests {
         let conn = &crate::session::store().conn;
         let now = crate::turso::now();
         conn.execute(
-            "INSERT INTO session_metadata (agent_id, created_at, last_activity, user_name, workspace_name, role) \
-             VALUES (?1, ?2, ?2, ?3, ?4, 'artist')",
+            "INSERT INTO session_metadata (agent_id, last_activity, user_name, workspace_name, role) \
+             VALUES (?1, ?2, ?3, ?4, 'artist')",
             params![agent_id, now.clone(), user, format!("personal:{user}")],
         )
         .await
