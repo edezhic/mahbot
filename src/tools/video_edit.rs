@@ -474,11 +474,10 @@ impl Tool for VideoEditTool {
                 body["frame_images"] = json!(frame_images);
             }
             EditMode::VideoRef => {
-                // validate_mode guarantees a video reference in this mode; the
-                // defensive error keeps this panic-free if that ever changes.
-                let video_url = video_url
-                    .ok_or_else(|| anyhow::anyhow!("video_url is required for a video edit"))?;
-                let source_url = resolve_video_source(video_url, ws).await?;
+                // validate_mode returns VideoRef only when video_url is present.
+                let source_url =
+                    resolve_video_source(video_url.expect("VideoRef mode implies video_url"), ws)
+                        .await?;
                 let mut references = vec![json!({
                     "type": "video_url",
                     "video_url": { "url": source_url }

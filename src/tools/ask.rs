@@ -358,9 +358,7 @@ async fn run_ask_with_job(
         } else if let Some(run) = fresh_iter.next() {
             runs.push(run);
         } else {
-            runs.push(AskRun::Failed {
-                reason: "analyst slot never dispatched".to_string(),
-            });
+            unreachable!("every fresh slot resolves to exactly one run (1:1 with fresh_slots)");
         }
     }
 

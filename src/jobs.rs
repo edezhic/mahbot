@@ -1080,13 +1080,10 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
             // for purge; the ticket resets normally.
             continue;
         };
-        let ticket_id: String = row.get(0).unwrap_or_default();
-        let stage: String = row.get(1).unwrap_or_default();
-        let phase: String = row.get(2).unwrap_or_default();
-        let round: i64 = row.get(3).unwrap_or(1);
-        if ticket_id.is_empty() {
-            continue;
-        }
+        let ticket_id: String = row.get(0).expect("ticket_stage_jobs.ticket_id is NOT NULL");
+        let stage: String = row.get(1).expect("ticket_stage_jobs.stage is NOT NULL");
+        let phase: String = row.get(2).expect("ticket_stage_jobs.phase is NOT NULL");
+        let round: i64 = row.get(3).expect("ticket_stage_jobs.round is NOT NULL");
         // Boot re-dispatch cap (design pin: retry_count feeding escalation).
         // Exceeding the cap marks the job DONE — NOT failed: a failed row
         // stays in list_active_jobs (status != 'done'), gets its updated_at

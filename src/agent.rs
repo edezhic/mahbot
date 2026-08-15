@@ -493,7 +493,7 @@ impl Agent {
     /// Construct a failure outcome tuple for an error reason.
     ///
     /// Both error arms in [`Self::execute_tool`] (unknown tool and execution error) produce
-    /// the same `(ToolExecutionOutcome, Option<String>)` shape; this helper
+    /// the same `(ToolExecutionOutcome, String)` shape; this helper
     /// eliminates the byte-for-byte duplicated construction.
     ///
     /// Assumes `reason` may contain sensitive data; scrubs before use in feedback
@@ -503,14 +503,14 @@ impl Agent {
         call_name: &str,
         call_arguments: &serde_json::Value,
         reason: &str,
-    ) -> (ToolExecutionOutcome, Option<String>) {
+    ) -> (ToolExecutionOutcome, String) {
         let reason = scrub_credentials(reason);
         (
             ToolExecutionOutcome {
                 output: format_tool_failure_feedback(call_name, call_arguments, &reason),
                 success: false,
             },
-            Some(reason),
+            reason,
         )
     }
 
@@ -580,7 +580,7 @@ impl Agent {
                                 output: scrub_tool_output(tool, &tool_arguments, &output_text),
                                 success: true,
                             },
-                            None,
+                            String::new(),
                         )
                     }
                     Err(e) => {
@@ -589,14 +589,11 @@ impl Agent {
                             &tool_arguments,
                             &format!("Error executing {tool_name}: {e}"),
                         );
-                        let reason = error_reason
-                            .as_deref()
-                            .expect("failure_outcome always returns Some");
                         tracing::debug!(
                             tool = %tool_name,
                             duration_ms = duration.as_millis(),
                             success = false,
-                            "Tool execution error: {reason}"
+                            "Tool execution error: {error_reason}"
                         );
                         (outcome, error_reason)
                     }
@@ -621,7 +618,7 @@ impl Agent {
                 arguments,
                 duration_ms,
                 success: outcome.success,
-                error_message: error_reason,
+                error_message: (!error_reason.is_empty()).then_some(error_reason),
             });
         }
         outcome

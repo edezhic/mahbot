@@ -67,7 +67,7 @@ impl crate::logs::LogStore {
                 |row| row.get::<i64>(0),
             )
             .await
-            .map(|opt| opt.unwrap_or(0))
+            .map(|opt| opt.expect("COUNT(*) aggregate always returns a row"))
     }
 
     /// Count the total number of tool call error rows matching the optional
@@ -78,7 +78,7 @@ impl crate::logs::LogStore {
         self.conn
             .query_optional(&sql, params, |row| row.get::<i64>(0))
             .await
-            .map(|opt| opt.unwrap_or(0))
+            .map(|opt| opt.expect("COUNT(*) aggregate always returns a row"))
             .map(|n: i64| {
                 usize::try_from(n)
                     .expect("count_tool_errors returned negative count; DB invariant violated")

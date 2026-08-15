@@ -2969,9 +2969,7 @@ async fn run_parallel_agents(
             } else if let Some(r) = by_agent.get(slot.agent_id.as_str()) {
                 results.push((*r).clone());
             } else {
-                results.push(ParallelVerdict::NoResponse(
-                    "agent slot never dispatched".to_string(),
-                ));
+                unreachable!("every non-Done slot is launched and recorded 1:1 in by_agent");
             }
         }
     }
