@@ -42,7 +42,7 @@ use crate::{ChatMessage, ChatRequest, ExtractionValidator};
 /// Terminal failure is [`RetryExhausted`] — it carries the
 /// last-attempt raw text (`last_raw`, for verdict-extraction ticket comments) plus
 /// the per-attempt diagnostics trail.
-#[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
     history: &[ChatMessage],
     extraction_prompt: &str,
@@ -72,7 +72,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
     let policy = policy_override
         .cloned()
         .unwrap_or_else(RetryPolicy::current);
-    let mut loop_state = RetryLoop::new(&policy, record_request.meta.as_ref());
+    let mut loop_state = RetryLoop::new(&policy);
     let mut last_raw: Option<String> = None;
 
     for attempt in 1..=policy.max_attempts {
@@ -85,7 +85,6 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
             return fail_exhausted(&record_request, operation_started, exhausted).await;
         }
 
-        let attempt_started = Instant::now();
         let request = ChatRequest {
             messages: extraction_history.clone(),
             allow_image_parts: false, // extractions never need image parts
@@ -100,56 +99,43 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
 
                 // Determine the failure mode: tool call / parse failure /
                 // validation rejection all funnel into the re-prompt retry.
-                // The fine-grained cause feeds retry-cause telemetry (the
-                // parse-class split the JSON-quality tuning needs).
-                let (class, detail, cause): (FailureClass, String, &'static str) =
-                    if response.tool_calls.is_empty() {
-                        let raw = last_raw.as_deref().unwrap_or_default();
-                        match parse_fenced_json::<T>(raw) {
-                            Ok(result) => {
-                                if let Some(validate) = validate
-                                    && let Err(msg) = validate(&result)
-                                {
-                                    (
-                                        FailureClass::OutOfRangeScore,
-                                        format!("extracted value rejected by validation: {msg}"),
-                                        crate::retry::CAUSE_SCORE_VALIDATION,
-                                    )
-                                } else {
-                                    crate::stats::record_llm_success(
-                                        &record_request,
-                                        operation_started,
-                                        attempt,
-                                        &response,
-                                    )
-                                    .await;
-                                    return Ok(result);
-                                }
+                let (class, detail): (FailureClass, String) = if response.tool_calls.is_empty() {
+                    let raw = last_raw.as_deref().unwrap_or_default();
+                    match parse_fenced_json::<T>(raw) {
+                        Ok(result) => {
+                            if let Some(validate) = validate
+                                && let Err(msg) = validate(&result)
+                            {
+                                (
+                                    FailureClass::OutOfRangeScore,
+                                    format!("extracted value rejected by validation: {msg}"),
+                                )
+                            } else {
+                                crate::stats::record_llm_success(
+                                    &record_request,
+                                    operation_started,
+                                    attempt,
+                                    &response,
+                                )
+                                .await;
+                                return Ok(result);
                             }
-                            Err(e) => (
-                                FailureClass::Parse,
-                                format!("failed to parse extracted JSON: {e}"),
-                                crate::retry::parse_failure_cause(raw),
-                            ),
                         }
-                    } else {
-                        (
+                        Err(e) => (
                             FailureClass::Parse,
-                            "extraction attempt returned a tool call instead of JSON".to_string(),
-                            crate::retry::CAUSE_TOOL_CALL,
-                        )
-                    };
+                            format!("failed to parse extracted JSON: {e}"),
+                        ),
+                    }
+                } else {
+                    (
+                        FailureClass::Parse,
+                        "extraction attempt returned a tool call instead of JSON".to_string(),
+                    )
+                };
 
                 let err = anyhow::anyhow!("{detail}");
-                let rec = RetryFailureRecord::new_simple(
-                    attempt,
-                    class,
-                    &err,
-                    attempt_started.elapsed().as_millis() as u64,
-                    None,
-                )
-                .with_cause(cause);
-                loop_state.record(attempt, rec).await;
+                let rec = RetryFailureRecord::new_simple(class, &err, None);
+                loop_state.record(rec);
 
                 // Re-prompt: push raw assistant text + retry prompt. Only
                 // needed when another attempt will actually run — the final
@@ -166,7 +152,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                 // ticket comment never labels it 'last attempt'.
                 last_raw = None;
                 let non_retryable = !scoped_err.class.is_retryable();
-                loop_state.record(attempt, scoped_err.record).await;
+                loop_state.record(scoped_err.record);
                 if non_retryable {
                     let exhausted = RetryExhausted::with_last_raw(
                         loop_state.into_failures(),
@@ -489,12 +475,10 @@ mod tests {
         );
     }
 
-    /// End-to-end regression guard for the retry-cause telemetry: recorded
-    /// `llm_requests` rows carry the caller's base params, and
-    /// `retry_failures` rows carry the stamped purpose/role/workspace
-    /// context plus the fine-grained JSON-quality cause. Catches the
-    /// extraction path drifting from the recorded request or dropping the
-    /// retry context.
+    /// End-to-end regression guard for the retry telemetry: recorded
+    /// `llm_requests` rows carry the caller's base params, and the failure
+    /// row keeps cost/provider NULL (no envelope on the failure path).
+    /// Catches the extraction path drifting from the recorded request.
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // comprehensive end-to-end telemetry guard
     #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
@@ -528,8 +512,7 @@ mod tests {
         )
         .await;
         assert_eq!(result.expect("extraction succeeds").score, 8);
-        // Parse-failure path (re-prompted, recovers): the retry_failures row
-        // carries the fine-grained cause + stamped context.
+        // Parse-failure path (re-prompted, recovers).
         let fake = Arc::new(FakeProvider::new().ok("garbage").ok(r#"{"score": 7}"#));
         let provider: Arc<dyn crate::Provider> = fake.clone();
         let _fake_guard = install_fake_provider(provider);
@@ -589,42 +572,6 @@ mod tests {
             failure.get::<Option<String>>(1).expect("upstream_provider"),
             None,
             "no envelope on failure path — provider must stay NULL"
-        );
-        // retry_failures rows: the parse failure carries cause=non_json, the
-        // transport failures carry an empty cause — all with the stamped
-        // operation context.
-        let rf_rows = store
-            .conn
-            .query(
-                "SELECT attempt, failure_class, purpose, role, workspace, cause \
-                 FROM retry_failures WHERE role = 'reviewer' ORDER BY rowid",
-                crate::turso::params![],
-            )
-            .await
-            .expect("query retry failure rows");
-        let rf: Vec<(i64, String, String, String, String, String)> = rf_rows
-            .into_iter()
-            .map(|r| {
-                (
-                    r.get::<i64>(0).expect("attempt"),
-                    r.get::<String>(1).expect("class"),
-                    r.get::<String>(2).expect("purpose"),
-                    r.get::<String>(3).expect("role"),
-                    r.get::<String>(4).expect("workspace"),
-                    r.get::<String>(5).expect("cause"),
-                )
-            })
-            .collect();
-        assert_eq!(rf.len(), 4, "1 parse + 3 transport failures recorded");
-        assert!(rf.iter().all(|(_, _, purpose, role, workspace, _)| {
-            purpose == "extraction" && role == "reviewer" && workspace == "ws1"
-        }));
-        assert_eq!(rf[0].5, "non_json", "parse failure cause");
-        assert!(rf[1..].iter().all(|(_, class, ..)| class == "transport"));
-        assert!(
-            rf[1..]
-                .iter()
-                .all(|(_, _, _, _, _, cause)| cause.is_empty())
         );
         assert!(rows.next().is_none(), "exactly three rows");
     }

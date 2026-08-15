@@ -52,11 +52,11 @@
 //!
 //! # Telemetry
 //!
-//! Every failed attempt produces a [`RetryFailureRecord`] persisted to the
-//! dedicated `retry_failures` table in the logs store (consolidated with the
-//! tool-call stats tables). Persistence is best-effort: the logs store's
-//! quarantine heals corruption only at boot, so mid-run logs corruption fails
-//! consolidated stats writes too.
+//! Every failed attempt produces a [`RetryFailureRecord`] appended to the
+//! in-memory failure trail; terminal exhaustion surfaces it through
+//! [`RetryExhausted`], which feeds the live `llm_requests` stats rows
+//! (retry_attempts / finish_reason / failure_class). Nothing is persisted
+//! per-attempt — the trail lives only in memory for the operation's lifetime.
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -341,197 +341,47 @@ impl FailureClass {
 
 // ── Per-attempt failure diagnostics ──────────────────────────────────────
 
-/// Bytes of the response body head/tail captured on failure (each side).
-pub(crate) const BODY_SNIPPET_BYTES: usize = 200;
-
-/// Fine-grained JSON-quality causes for extraction-family `retry_failures`
-/// rows (the `cause` column). Transport / truncation / NoResponse failures
-/// keep their [`FailureClass`] label and an empty cause — the cause column
-/// splits the JSON-quality failure modes tuning needs: parse-class failures
-/// (non_json / empty_content / tool_call) plus score-validation rejections.
-pub(crate) const CAUSE_NON_JSON: &str = "non_json";
-pub(crate) const CAUSE_EMPTY_CONTENT: &str = "empty_content";
-pub(crate) const CAUSE_SCORE_VALIDATION: &str = "score_validation";
-pub(crate) const CAUSE_TOOL_CALL: &str = "tool_call";
-
-/// Parse-failure cause split: empty assistant content vs non-JSON text.
-#[must_use]
-pub(crate) fn parse_failure_cause(raw: &str) -> &'static str {
-    if raw.trim().is_empty() {
-        CAUSE_EMPTY_CONTENT
-    } else {
-        CAUSE_NON_JSON
-    }
-}
-
-/// Per-attempt failure diagnostics, persisted to the logs store's `retry_failures` table.
-///
-/// Captured as close to the HTTP boundary as possible so response metadata
-/// survives stringification into the `anyhow` error trail.
+/// Per-attempt failure diagnostics, carried in the in-memory retry trail.
 #[derive(Debug, Clone)]
 pub(crate) struct RetryFailureRecord {
-    /// 1-based attempt number (stamped by the retry loop; providers emit 0).
-    pub attempt: u32,
     /// Granular failure classification.
     pub class: FailureClass,
     /// Full error cause chain.
     pub error_chain: String,
-    pub http_version: Option<String>,
-    /// `Content-Length` response header, if present.
-    pub content_length: Option<u64>,
-    /// Actual body bytes read.
-    pub actual_body_len: Option<usize>,
-    pub content_encoding: Option<String>,
-    pub transfer_encoding: Option<String>,
-    /// Wall time consumed by this attempt.
-    pub elapsed_ms: u64,
-    /// First [`BODY_SNIPPET_BYTES`] bytes of the response body.
-    pub body_head: String,
-    /// Last [`BODY_SNIPPET_BYTES`] bytes of the response body.
-    pub body_tail: String,
     /// `choices[0].finish_reason` parsed from the envelope (best effort).
     pub finish_reason: Option<String>,
-    /// `usage.completion_tokens` parsed from the envelope (best effort).
-    pub completion_tokens: Option<u64>,
     /// Retry-After value from the response, if any.
     pub retry_after_ms: Option<u64>,
-    /// Fine-grained JSON-quality cause (one of the [`CAUSE_*`] constants);
-    /// set on Parse and OutOfRangeScore failures, empty elsewhere.
-    pub cause: String,
-    /// Operation context for per-role/hour aggregation — stamped by the outer
-    /// retry loops from the request metadata.
-    pub purpose: String,
-    pub role: String,
-    pub workspace: String,
-    /// RFC3339 timestamp (set at construction).
-    pub recorded_at: String,
 }
 
 impl RetryFailureRecord {
-    /// Shared constructor: common fields + empty defaults for the HTTP
-    /// metadata and the stamped context (cause / purpose / role / workspace).
-    fn base(
-        attempt: u32,
-        class: FailureClass,
-        error: &anyhow::Error,
-        elapsed_ms: u64,
-        retry_after_ms: Option<u64>,
-    ) -> Self {
-        Self {
-            attempt,
-            class,
-            error_chain: format!("{error:#}"),
-            http_version: None,
-            content_length: None,
-            actual_body_len: None,
-            content_encoding: None,
-            transfer_encoding: None,
-            elapsed_ms,
-            body_head: String::new(),
-            body_tail: String::new(),
-            finish_reason: None,
-            completion_tokens: None,
-            retry_after_ms,
-            cause: String::new(),
-            purpose: String::new(),
-            role: String::new(),
-            workspace: String::new(),
-            recorded_at: crate::turso::now(),
-        }
-    }
-
-    /// Build a record from a plain error (no HTTP metadata available).
+    /// Build a record from a plain error (no envelope telemetry available).
     #[must_use]
     pub(crate) fn new_simple(
-        attempt: u32,
         class: FailureClass,
         error: &anyhow::Error,
-        elapsed_ms: u64,
         retry_after_ms: Option<u64>,
     ) -> Self {
-        Self::base(attempt, class, error, elapsed_ms, retry_after_ms)
+        Self {
+            class,
+            error_chain: format!("{error:#}"),
+            finish_reason: None,
+            retry_after_ms,
+        }
     }
 
-    /// Build a record with full response metadata.
-    #[allow(clippy::too_many_arguments)]
+    /// Build a record with envelope telemetry (finish_reason).
     #[must_use]
     pub(crate) fn with_metadata(
-        attempt: u32,
         class: FailureClass,
         error: &anyhow::Error,
-        elapsed_ms: u64,
-        http_version: Option<String>,
-        content_length: Option<u64>,
-        actual_body_len: Option<usize>,
-        content_encoding: Option<String>,
-        transfer_encoding: Option<String>,
-        body: &str,
         finish_reason: Option<String>,
-        completion_tokens: Option<u64>,
         retry_after_ms: Option<u64>,
     ) -> Self {
-        let (body_head, body_tail) = body_head_tail(body);
         Self {
-            http_version,
-            content_length,
-            actual_body_len,
-            content_encoding,
-            transfer_encoding,
-            body_head,
-            body_tail,
             finish_reason,
-            completion_tokens,
-            ..Self::base(attempt, class, error, elapsed_ms, retry_after_ms)
+            ..Self::new_simple(class, error, retry_after_ms)
         }
-    }
-
-    /// Attach a fine-grained JSON-quality cause (extraction-family failures).
-    #[must_use]
-    pub(crate) fn with_cause(mut self, cause: &'static str) -> Self {
-        self.cause = cause.to_string();
-        self
-    }
-
-    /// Stamp the operation context (purpose / role / workspace) from request
-    /// metadata for per-role/hour retry-cause aggregation.
-    pub(crate) fn stamp_meta(&mut self, meta: Option<&crate::ChatRequestMeta>) {
-        if let Some(meta) = meta {
-            self.purpose = meta.purpose.to_string();
-            self.role.clone_from(&meta.role);
-            self.workspace.clone_from(&meta.workspace);
-        }
-    }
-}
-
-/// Capture the first and last [`BODY_SNIPPET_BYTES`] bytes of a body string.
-///
-/// Byte-counted (not char-counted): the snippets feed framing-anomaly
-/// telemetry where byte sizes matter. A multi-byte UTF-8 sequence split at the
-/// boundary decodes as a replacement character in the lossy conversion.
-#[must_use]
-pub(crate) fn body_head_tail(body: &str) -> (String, String) {
-    let bytes = body.as_bytes();
-    let head_len = bytes.len().min(BODY_SNIPPET_BYTES);
-    let head = String::from_utf8_lossy(&bytes[..head_len]).into_owned();
-    let tail_start = bytes.len().saturating_sub(BODY_SNIPPET_BYTES);
-    let tail = String::from_utf8_lossy(&bytes[tail_start..]).into_owned();
-    (head, tail)
-}
-
-/// Persist a failure record to the logs store's `retry_failures` table
-/// (best-effort).
-///
-/// Never fails the operation — persistence failures are logged at debug.
-pub(crate) async fn record_retry_failure(record: &RetryFailureRecord) {
-    let Some(store) = crate::stats::log_store_for_stats() else {
-        return;
-    };
-    if let Err(e) = store.record_retry_failure(record).await {
-        tracing::debug!(
-            error = %e,
-            class = record.class.label(),
-            "Failed to persist retry failure record",
-        );
     }
 }
 
@@ -645,25 +495,18 @@ pub(crate) struct RetryLoop {
     backoffs: Vec<u64>,
     failures: Vec<RetryFailureRecord>,
     last_retry_after: Option<u64>,
-    /// Operation context stamped onto every persisted failure record
-    /// (purpose / role / workspace for per-role/hour aggregation).
-    meta: Option<crate::ChatRequestMeta>,
 }
 
 impl RetryLoop {
-    /// Start a new operation carrying request metadata — every failure record
-    /// persisted via [`Self::record`] gets the purpose/role/workspace context
-    /// stamped for retry-cause aggregation. Pass `None` for context-free
-    /// operations.
+    /// Start a new operation.
     #[must_use]
-    pub(crate) fn new(policy: &RetryPolicy, meta: Option<&crate::ChatRequestMeta>) -> Self {
+    pub(crate) fn new(policy: &RetryPolicy) -> Self {
         Self {
             policy: policy.clone(),
             deadline: Instant::now() + policy.operation_timeout,
             backoffs: backoff_sequence(policy),
             failures: Vec::new(),
             last_retry_after: None,
-            meta: meta.cloned(),
         }
     }
 
@@ -693,15 +536,12 @@ impl RetryLoop {
         !self.failures.is_empty()
     }
 
-    /// Persist and record a failed attempt, stamping the attempt number and
-    /// updating the sticky Retry-After. A record without a Retry-After
-    /// (parse / NoResponse failures) clears any stale value from an earlier
-    /// attempt, so a 429 Retry-After never bleeds into later sleeps.
-    pub(crate) async fn record(&mut self, attempt: u32, mut rec: RetryFailureRecord) {
-        rec.attempt = attempt;
-        rec.stamp_meta(self.meta.as_ref());
+    /// Record a failed attempt, updating the sticky Retry-After. A record
+    /// without a Retry-After (parse / NoResponse failures) clears any stale
+    /// value from an earlier attempt, so a 429 Retry-After never bleeds into
+    /// later sleeps.
+    pub(crate) fn record(&mut self, rec: RetryFailureRecord) {
         self.last_retry_after = rec.retry_after_ms;
-        record_retry_failure(&rec).await;
         self.failures.push(rec);
     }
 
@@ -755,7 +595,7 @@ pub(crate) async fn agent_chat(
     request: ChatRequest,
     policy: &RetryPolicy,
 ) -> Result<ChatResponse, RetryExhausted> {
-    let mut loop_state = RetryLoop::new(policy, request.meta.as_ref());
+    let mut loop_state = RetryLoop::new(policy);
     let operation_started = Instant::now();
 
     for attempt in 1..=policy.max_attempts {
@@ -777,7 +617,7 @@ pub(crate) async fn agent_chat(
             }
             Err(err) => {
                 let non_retryable = !err.class.is_retryable();
-                loop_state.record(attempt, err.record).await;
+                loop_state.record(err.record);
                 if non_retryable {
                     let exhausted = RetryExhausted::new(loop_state.into_failures(), err.class);
                     return fail_exhausted(&request, operation_started, exhausted).await;
@@ -853,37 +693,31 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
-    async fn stale_retry_after_does_not_stick_across_failures() {
+    #[test]
+    fn stale_retry_after_does_not_stick_across_failures() {
         // A 429 Retry-After applies only to the sleep following the 429. A
         // later non-429 failure (parse / NoResponse, no Retry-After) must
         // clear it — otherwise a stale value wastes up to 60 s of the 720 s
         // wall budget per occurrence (reviewer finding).
-        let _guard = crate::util::test::retry_tests_lock();
         let policy = tiny_test_policy();
-        let mut loop_state = RetryLoop::new(&policy, None);
+        let mut loop_state = RetryLoop::new(&policy);
 
         // 429-style failure carries a Retry-After.
         let rec = RetryFailureRecord::new_simple(
-            1,
             FailureClass::Transport,
             &anyhow::anyhow!("429 rate limited"),
-            1,
             Some(60_000),
         );
-        loop_state.record(1, rec).await;
+        loop_state.record(rec);
         assert_eq!(loop_state.last_retry_after, Some(60_000));
 
         // A later parse/NoResponse failure has no Retry-After → clears it.
         let rec = RetryFailureRecord::new_simple(
-            2,
             FailureClass::NoResponse,
             &anyhow::anyhow!("empty response"),
-            1,
             None,
         );
-        loop_state.record(2, rec).await;
+        loop_state.record(rec);
         assert_eq!(
             loop_state.last_retry_after, None,
             "stale Retry-After must not stick to later sleeps"
@@ -903,20 +737,6 @@ mod tests {
             FailureClass::TruncatedEnvelope.label(),
             "truncated_envelope"
         );
-    }
-
-    #[test]
-    fn body_head_tail_splits_short_and_long() {
-        assert_eq!(
-            body_head_tail("short"),
-            ("short".to_string(), "short".to_string())
-        );
-        let long = "x".repeat(1_000);
-        let (head, tail) = body_head_tail(&long);
-        assert_eq!(head.len(), 200);
-        assert_eq!(tail.len(), 200);
-        assert_eq!(head, "x".repeat(200));
-        assert_eq!(tail, "x".repeat(200));
     }
 
     #[test]

@@ -150,8 +150,8 @@ pub(crate) fn store_names() -> Vec<&'static str> {
 /// session, workspace, users, chat_history, config).  The `logs` store
 /// is **not** included here because it must be initialized earlier via
 /// [`crate::logs::init_tracing`], which requires the log store before any
-/// other subsystem is ready. The stats tables (tool-call records,
-/// retry-failure records) live in the logs store.
+/// other subsystem is ready. The stats tables (tool_calls, llm_requests)
+/// live in the logs store.
 ///
 /// > **Keep this list in sync with [`iter_checkpoint_stores`]** — every store
 /// > listed here must also appear in that iterator.  The converse is not strictly

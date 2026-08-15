@@ -56,8 +56,7 @@ use compatible::OpenAiCompatibleProvider;
 ///
 /// Carries the underlying error, a granular [`FailureClass`], and the
 /// per-attempt diagnostics [`RetryFailureRecord`] so the outer retry loop can
-/// classify, persist telemetry, and build human-readable failure trails
-/// without re-stringifying.
+/// classify and build human-readable failure trails without re-stringifying.
 #[derive(Debug)]
 pub(crate) struct ScopedCallError {
     pub inner: anyhow::Error,

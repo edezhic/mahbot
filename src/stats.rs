@@ -6,9 +6,9 @@
 //! `std::sync::Mutex<Vec<ToolCallRecord>>` and are flushed to the logs
 //! store on session finalization via [`crate::logs::LogStore::flush_batch`].
 //!
-//! The `tool_calls` / `retry_failures` tables (and their indexes) are created
+//! The `tool_calls` table (and its indexes) is created
 //! by the logs store's schema (`LOGS_SCHEMA` in `logs.rs`), so a logs-store
-//! quarantine recreate also recreates them. Consumers access the tables
+//! quarantine recreate also recreates it. Consumers access the table
 //! through [`crate::logs::LOG_STORE`] with fail-open accessors.
 
 use crate::turso::{self};
@@ -174,48 +174,6 @@ impl crate::logs::LogStore {
         Ok(())
     }
 
-    /// Persist a per-attempt retry failure diagnostic to the
-    /// dedicated `retry_failures` table. Called from [`crate::retry`]'s outer
-    /// loops — never fails the calling operation (callers treat errors as
-    /// best-effort).
-    pub(crate) async fn record_retry_failure(
-        &self,
-        rec: &crate::retry::RetryFailureRecord,
-    ) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO retry_failures \
-                 (attempt, failure_class, error_chain, http_version, content_length, \
-                  actual_body_len, content_encoding, transfer_encoding, elapsed_ms, \
-                  body_head, body_tail, finish_reason, completion_tokens, retry_after_ms, \
-                  purpose, role, workspace, cause, recorded_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-                turso::params![
-                    i64::from(rec.attempt),
-                    rec.class.label(),
-                    rec.error_chain.clone(),
-                    rec.http_version.clone(),
-                    rec.content_length.map(i64::try_from).transpose()?,
-                    rec.actual_body_len.map(i64::try_from).transpose()?,
-                    rec.content_encoding.clone(),
-                    rec.transfer_encoding.clone(),
-                    i64::try_from(rec.elapsed_ms)?,
-                    rec.body_head.clone(),
-                    rec.body_tail.clone(),
-                    rec.finish_reason.clone(),
-                    rec.completion_tokens.map(i64::try_from).transpose()?,
-                    rec.retry_after_ms.map(i64::try_from).transpose()?,
-                    rec.purpose.clone(),
-                    rec.role.clone(),
-                    rec.workspace.clone(),
-                    rec.cause.clone(),
-                    rec.recorded_at.clone(),
-                ],
-            )
-            .await?;
-        Ok(())
-    }
-
     /// Persist one per-operation LLM request stat to the dedicated
     /// `llm_requests` table. Metadata only — no request inputs/outputs.
     pub(crate) async fn record_llm_request(&self, rec: &LlmRequestRecord) -> Result<()> {
@@ -261,8 +219,8 @@ impl crate::logs::LogStore {
 ///
 /// One row per completed LLM operation (agent iteration, extraction,
 /// summarization, consolidation) — retry attempts are aggregated into
-/// [`LlmRequestRecord::retry_attempts`]; per-attempt failure detail lives in
-/// `retry_failures`. Metadata only: no request inputs or outputs.
+/// [`LlmRequestRecord::retry_attempts`]. Metadata only: no request inputs or
+/// outputs.
 #[derive(Debug, Clone)]
 pub(crate) struct LlmRequestRecord {
     pub purpose: &'static str,
@@ -362,8 +320,8 @@ pub(crate) fn swap_test_log_store(
 }
 
 /// Resolve the logs store for stat writes: test override wins, else the global.
-/// Shared by the llm_requests and retry_failures persistence paths so tests
-/// observe both tables through the same override.
+/// Used by the llm_requests persistence path so tests observe its writes
+/// through the same override.
 pub(crate) fn log_store_for_stats() -> Option<crate::logs::LogStore> {
     #[cfg(test)]
     if let Some(store) = TEST_LOG_STORE
@@ -735,109 +693,6 @@ mod tests {
             .await
             .expect("query_tool_errors with workspace filter");
         assert_eq!(total, 0, "other-ws should have 0 errors");
-    }
-
-    /// `retry_failures` insert round-trip — verifies the schema (including the
-    /// context + cause columns) and the parameterized insert are valid against
-    /// a real store.
-    #[tokio::test]
-    async fn record_retry_failure_round_trip() {
-        let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
-        let mut rec = crate::retry::RetryFailureRecord::with_metadata(
-            3,
-            crate::retry::FailureClass::TruncatedEnvelope,
-            &anyhow::anyhow!("OpenRouter error reading response body: eof"),
-            1_234,
-            Some("HTTP/2".to_string()),
-            Some(10_000),
-            Some(5_000),
-            Some("identity".to_string()),
-            Some("chunked".to_string()),
-            r#"{"choices":[{"message":{"content":"{"#,
-            Some("length".to_string()),
-            Some(4_000),
-            Some(7_500),
-        )
-        .with_cause(crate::retry::CAUSE_NON_JSON);
-        rec.stamp_meta(Some(&crate::ChatRequestMeta {
-            purpose: "extraction",
-            agent_id: "t".to_string(),
-            role: "reviewer".to_string(),
-            workspace: "ws1".to_string(),
-            ticket_id: None,
-        }));
-
-        store
-            .record_retry_failure(&rec)
-            .await
-            .expect("insert retry failure");
-
-        // Round-trip: read the row back and verify the fields survived.
-        let rows = store
-            .conn
-            .query(
-                "SELECT attempt, failure_class, error_chain, http_version, \
-                        content_length, actual_body_len, content_encoding, \
-                        transfer_encoding, elapsed_ms, body_head, body_tail, \
-                        finish_reason, completion_tokens, retry_after_ms, \
-                        purpose, role, workspace, cause \
-                 FROM retry_failures WHERE attempt = 3",
-                crate::turso::params![],
-            )
-            .await
-            .expect("query retry failure");
-        let mut rows = rows.into_iter();
-        let row = rows.next().expect("row must exist");
-        assert_eq!(row.get::<i64>(0).expect("attempt"), 3);
-        assert_eq!(row.get::<String>(1).expect("class"), "truncated_envelope");
-        assert!(
-            row.get::<String>(2)
-                .expect("error_chain")
-                .contains("error reading response body")
-        );
-        assert_eq!(
-            row.get::<Option<String>>(3).expect("http"),
-            Some("HTTP/2".to_string())
-        );
-        assert_eq!(
-            row.get::<Option<i64>>(4).expect("content_length"),
-            Some(10_000)
-        );
-        assert_eq!(
-            row.get::<Option<i64>>(5).expect("actual_body_len"),
-            Some(5_000)
-        );
-        assert_eq!(
-            row.get::<Option<String>>(6).expect("ce"),
-            Some("identity".to_string())
-        );
-        assert_eq!(
-            row.get::<Option<String>>(7).expect("te"),
-            Some("chunked".to_string())
-        );
-        assert_eq!(row.get::<i64>(8).expect("elapsed"), 1_234);
-        assert!(row.get::<String>(9).expect("body_head").starts_with('{'));
-        assert_eq!(
-            row.get::<Option<String>>(11).expect("finish"),
-            Some("length".to_string())
-        );
-        assert_eq!(row.get::<Option<i64>>(12).expect("tokens"), Some(4_000));
-        assert_eq!(
-            row.get::<Option<i64>>(13).expect("retry_after"),
-            Some(7_500)
-        );
-        assert_eq!(
-            row.get::<String>(14).expect("purpose"),
-            "extraction",
-            "operation context must be stamped"
-        );
-        assert_eq!(row.get::<String>(15).expect("role"), "reviewer");
-        assert_eq!(row.get::<String>(16).expect("workspace"), "ws1");
-        assert_eq!(
-            row.get::<String>(17).expect("cause"),
-            crate::retry::CAUSE_NON_JSON
-        );
-        assert!(rows.next().is_none(), "only one row expected");
     }
 
     /// `llm_requests` insert round-trip — verifies the schema (including

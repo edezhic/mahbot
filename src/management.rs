@@ -2710,37 +2710,6 @@ async fn build_joint_comment(
     }
 }
 
-/// Persist per-agent verdict scores (shadow instrumentation for re-measuring
-/// inter-agent agreement per stage). Best-effort: failures are logged, never
-/// propagated — the verdict pipeline must not block on instrumentation. Rows
-/// live in the logs store (the project's stats store), not the board store.
-///
-/// `job_id` is the durable round identity for the resumed-round idempotent
-/// replay (PK (job_id, agent_index)).
-async fn persist_verdict_scores(
-    ticket: &Ticket,
-    stage: &str,
-    results: &[ParallelVerdict],
-    job_id: &str,
-) {
-    let Some(store) = crate::logs::LOG_STORE.get() else {
-        return;
-    };
-    for (i, r) in results.iter().enumerate() {
-        if let ParallelVerdict::Verdict(v) = r
-            && let Err(e) = store
-                .record_verdict_score(job_id, &ticket.id, stage, i, v.score, &v.issues_detected)
-                .await
-        {
-            warn!(
-                ticket = %ticket.id,
-                error = %e,
-                "Failed to persist verdict score (instrumentation)",
-            );
-        }
-    }
-}
-
 /// Load per-agent angle supplements for a verifier role (review_angles.md,
 /// qa_angles.md). Missing or malformed assets degrade to no supplements —
 /// dispatch then uses today's identical shared prompt.
@@ -3497,12 +3466,7 @@ async fn run_analysis_round(
 ///
 /// See the "Parallel agent helpers (shared)" section for why this is separate
 /// from [`process_verifier_verdicts`].
-async fn process_analyst_verdicts(
-    ws: &Workspace,
-    ticket: &Ticket,
-    results: &[ParallelVerdict],
-    job_id: &str,
-) {
+async fn process_analyst_verdicts(ws: &Workspace, ticket: &Ticket, results: &[ParallelVerdict]) {
     let nonempty_count = results
         .iter()
         .filter(|r| !matches!(r, ParallelVerdict::NoResponse(_)))
@@ -3542,11 +3506,6 @@ async fn process_analyst_verdicts(
     // 3: a missing/empty verdict is treated as non-passing — all dispatched
     // analysts must produce passing verdicts for the ticket to proceed.
     let all_passed = passing_count == dispatched;
-
-    // Persist per-agent verdict scores (shadow instrumentation, best-effort —
-    // never blocks the pipeline). Stage label uses the same spelling as the
-    // joint-comment role (stage_name) so both stores agree.
-    persist_verdict_scores(ticket, stage_name(Role::Analyst), results, job_id).await;
 
     // No exit-time transition during the graceful drain: the
     // outcomes are checkpointed on the roster; the job stays status='launched'
@@ -3610,9 +3569,8 @@ async fn process_analyst_verdicts(
 
 /// Finalize an analysis round — shared by fresh dispatch and boot resume so
 /// the paths stay in lockstep. Drain-cut runs both BEFORE and AFTER
-/// [`process_analyst_verdicts`]: a pre-existing drain skips the shadow
-/// verdict-score rows (no new work during drain — the fresh-dispatch path
-/// used to persist them before its drain check); any drain leaves the job
+/// [`process_analyst_verdicts`]: a pre-existing drain skips the verdict
+/// processing (no new work during drain); any drain leaves the job
 /// launched — mid-process for boot resume (no transition), after the
 /// transition with the ticket in Planning (completed at boot). The
 /// completion tx runs after the transition+comment (ordering contract); a
@@ -3630,7 +3588,7 @@ async fn finalize_analysis_round(
     if crate::shutdown::aborting() {
         return;
     }
-    process_analyst_verdicts(ws, ticket, results, job_id).await;
+    process_analyst_verdicts(ws, ticket, results).await;
     if crate::shutdown::aborting() {
         return;
     }
@@ -3915,7 +3873,6 @@ async fn process_verifier_verdicts(
     ticket: &Ticket,
     results: &[ParallelVerdict],
     verifier: VerifierInfo,
-    job_id: &str,
 ) -> bool {
     let all_failed = results
         .iter()
@@ -3926,9 +3883,6 @@ async fn process_verifier_verdicts(
         ParallelVerdict::Verdict(v) => !verdict_passes(v),
         _ => true,
     });
-
-    // Persist per-agent verdict scores (shadow instrumentation, best-effort).
-    persist_verdict_scores(ticket, stage_name(verifier.role), results, job_id).await;
 
     // Bounce-based circuit breaker: the 11th bounce fails the ticket. The
     // counter is incremented atomically with the bounce-back transition.
@@ -4369,7 +4323,7 @@ async fn finalize_verifier_round(
     resumed: bool,
     git_available: bool,
 ) {
-    let transitioned = process_verifier_verdicts(ws, ticket, results, vi, job_id).await;
+    let transitioned = process_verifier_verdicts(ws, ticket, results, vi).await;
     if !transitioned && crate::shutdown::aborting() {
         let cut_short = if resumed {
             "Resumed verifier round cut short by drain — job stays launched for boot resume"

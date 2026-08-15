@@ -884,30 +884,24 @@ async fn read_body_idle(
     BodyReadOutcome::Complete(body)
 }
 
-/// Best-effort extraction of `finish_reason` / `completion_tokens` from a
-/// possibly-truncated JSON body.
+/// Best-effort extraction of `finish_reason` from a possibly-truncated JSON
+/// body.
 ///
 /// A full `ApiChatResponse` parse is attempted first; if the envelope is cut
 /// mid-body we fall back to lenient JSON value parsing so telemetry survives
 /// where possible.
-fn envelope_telemetry(body: &str) -> (Option<String>, Option<u64>) {
+fn envelope_telemetry(body: &str) -> Option<String> {
     if let Ok(native) = serde_json::from_str::<ApiChatResponse>(body) {
-        let finish = native.choices.first().and_then(|c| c.finish_reason.clone());
-        let tokens = native.usage.as_ref().and_then(|u| u.completion_tokens);
-        return (finish, tokens);
+        return native.choices.first().and_then(|c| c.finish_reason.clone());
     }
     // Lenient fallback for truncated envelopes.
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
-        let finish = value
+        return value
             .pointer("/choices/0/finish_reason")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
-        let tokens = value
-            .pointer("/usage/completion_tokens")
-            .and_then(serde_json::Value::as_u64);
-        return (finish, tokens);
     }
-    (None, None)
+    None
 }
 
 #[async_trait]
@@ -932,7 +926,6 @@ impl Provider for OpenAiCompatibleProvider {
         idle_timeout: Duration,
         deadline: Instant,
     ) -> Result<ProviderChatResponse, ScopedCallError> {
-        let started = Instant::now();
         let req_builder = self.build_http_request_with_client(self.http_client_scoped(), &request);
         let model = request.model;
 
@@ -961,46 +954,24 @@ impl Provider for OpenAiCompatibleProvider {
                 } else {
                     FailureClass::Transport
                 };
-                return Err(scoped_simple_error(err, class, started));
+                return Err(scoped_simple_error(err, class));
             }
             Ok(Err(_)) => {
                 let err = anyhow::anyhow!("shutdown during request");
-                return Err(scoped_simple_error(err, FailureClass::Shutdown, started));
+                return Err(scoped_simple_error(err, FailureClass::Shutdown));
             }
             Ok(Ok(Err(e))) => {
                 let err = anyhow::Error::from(e).context(format!("{} transport error", self.name));
-                return Err(scoped_simple_error(err, FailureClass::Transport, started));
+                return Err(scoped_simple_error(err, FailureClass::Transport));
             }
             Ok(Ok(Ok(resp))) => resp,
         };
 
         // ── Response metadata (telemetry) ──
-        let http_version = Some(format!("{:?}", response.version()));
         let content_length = response.content_length();
-        let content_encoding = response
-            .headers()
-            .get(reqwest::header::CONTENT_ENCODING)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let transfer_encoding = response
-            .headers()
-            .get(reqwest::header::TRANSFER_ENCODING)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
 
         if !response.status().is_success() {
-            return Err(scoped_http_error(
-                self,
-                response,
-                started,
-                http_version,
-                content_length,
-                content_encoding,
-                transfer_encoding,
-                idle_timeout,
-                deadline,
-            )
-            .await);
+            return Err(scoped_http_error(self, response, idle_timeout, deadline).await);
         }
 
         // ── Read body with idle timeout ──
@@ -1018,18 +989,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         if let Some((read_msg, class)) = read_failure {
             let err = anyhow::anyhow!("{} error reading response body: {read_msg}", self.name);
-            return Err(scoped_metadata_error(
-                err,
-                class,
-                started,
-                http_version.clone(),
-                content_length,
-                actual_len,
-                content_encoding.clone(),
-                transfer_encoding.clone(),
-                &body_str,
-                None,
-            ));
+            return Err(scoped_metadata_error(err, class, &body_str, None));
         }
 
         let native_response: ApiChatResponse = match serde_json::from_str(&body_str) {
@@ -1050,18 +1010,7 @@ impl Provider for OpenAiCompatibleProvider {
                     body_str.len(),
                     body_str
                 );
-                return Err(scoped_metadata_error(
-                    err,
-                    class,
-                    started,
-                    http_version,
-                    content_length,
-                    actual_len,
-                    content_encoding,
-                    transfer_encoding,
-                    &body_str,
-                    None,
-                ));
+                return Err(scoped_metadata_error(err, class, &body_str, None));
             }
         };
 
@@ -1069,54 +1018,26 @@ impl Provider for OpenAiCompatibleProvider {
             scoped_simple_error(
                 anyhow::anyhow!("No response from {}", self.name),
                 FailureClass::NoResponse,
-                started,
             )
         })
     }
 }
 
-/// Build a scoped-call error with no HTTP metadata (send-phase failures).
-#[allow(clippy::cast_possible_truncation)]
-fn scoped_simple_error(
-    err: anyhow::Error,
-    class: FailureClass,
-    started: Instant,
-) -> ScopedCallError {
-    let record =
-        RetryFailureRecord::new_simple(0, class, &err, started.elapsed().as_millis() as u64, None);
+/// Build a scoped-call error with no envelope telemetry (send-phase failures).
+fn scoped_simple_error(err: anyhow::Error, class: FailureClass) -> ScopedCallError {
+    let record = RetryFailureRecord::new_simple(class, &err, None);
     ScopedCallError::new(err, record, class)
 }
 
-/// Build a scoped-call error with full response metadata.
-#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
+/// Build a scoped-call error with envelope telemetry (finish_reason).
 fn scoped_metadata_error(
     err: anyhow::Error,
     class: FailureClass,
-    started: Instant,
-    http_version: Option<String>,
-    content_length: Option<u64>,
-    actual_len: usize,
-    content_encoding: Option<String>,
-    transfer_encoding: Option<String>,
     body: &str,
     retry_after_ms: Option<u64>,
 ) -> ScopedCallError {
-    let (finish_reason, completion_tokens) = envelope_telemetry(body);
-    let record = RetryFailureRecord::with_metadata(
-        0,
-        class,
-        &err,
-        started.elapsed().as_millis() as u64,
-        http_version,
-        content_length,
-        Some(actual_len),
-        content_encoding,
-        transfer_encoding,
-        body,
-        finish_reason,
-        completion_tokens,
-        retry_after_ms,
-    );
+    let record =
+        RetryFailureRecord::with_metadata(class, &err, envelope_telemetry(body), retry_after_ms);
     ScopedCallError::new(err, record, class)
 }
 
@@ -1125,15 +1046,9 @@ fn scoped_metadata_error(
 /// Reads the error body with idle-timeout semantics so a stalled error-body
 /// read cannot hang past the operation deadline, and classifies via the
 /// provider error classifier.
-#[allow(clippy::too_many_arguments)]
 async fn scoped_http_error(
     provider: &OpenAiCompatibleProvider,
     response: reqwest::Response,
-    started: Instant,
-    http_version: Option<String>,
-    content_length: Option<u64>,
-    content_encoding: Option<String>,
-    transfer_encoding: Option<String>,
     idle_timeout: Duration,
     deadline: Instant,
 ) -> ScopedCallError {
@@ -1146,7 +1061,6 @@ async fn scoped_http_error(
         } => (partial, Some(message)),
     };
     let body = String::from_utf8_lossy(&body_bytes).into_owned();
-    let actual_len = body_bytes.len();
 
     let http_err = HttpError {
         status,
@@ -1167,18 +1081,7 @@ async fn scoped_http_error(
         crate::providers::reliable::classify_err(&inner),
         body_read_failed,
     );
-    scoped_metadata_error(
-        inner,
-        class,
-        started,
-        http_version,
-        content_length,
-        actual_len,
-        content_encoding,
-        transfer_encoding,
-        &body,
-        retry_after_ms,
-    )
+    scoped_metadata_error(inner, class, &body, retry_after_ms)
 }
 
 #[cfg(test)]

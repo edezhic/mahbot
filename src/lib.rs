@@ -1436,8 +1436,8 @@ pub(crate) trait Provider: Send + Sync {
     /// - **Per-attempt total = remaining wall budget** — implementations
     ///   should not outlive `deadline`.
     /// - On failure the returned [`ScopedCallError`] carries per-attempt
-    ///   diagnostics (response metadata, body head/tail) for the durable
-    ///   `retry_failures` table.
+    ///   diagnostics (classification, error chain, finish_reason) for the
+    ///   retry trail.
     ///
     /// Real providers must implement this method (or override [`Self::chat`]).
     async fn chat_scoped(

@@ -1974,11 +1974,22 @@ mod tests {
         let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         let db_dir = dir.path().join("db");
         let fam = "logs.db.quarantine-20260812T120000Z-4242";
-        // One committed verdict row before the move: the query result below
+        // One committed tool-call row before the move: the query result below
         // must prove the temp-copy read returns real data, not just "some
         // query succeeded".
         store
-            .record_verdict_score("j1", "t1", "review", 0, 9, &[])
+            .flush_batch(
+                "j1",
+                "Engineer",
+                "ws1",
+                &[crate::ToolCallRecord {
+                    tool_name: "read".to_string(),
+                    arguments: "{}".to_string(),
+                    duration_ms: 1,
+                    success: true,
+                    error_message: None,
+                }],
+            )
             .await
             .unwrap();
         let moved = move_family_aside(&db_dir, &db_dir.join("logs.db"), fam);
@@ -1995,7 +2006,7 @@ mod tests {
             "debug".to_string(),
             "--family".to_string(),
             fam.to_string(),
-            "SELECT COUNT(*) FROM verdict_scores".to_string(),
+            "SELECT COUNT(*) FROM tool_calls".to_string(),
         ];
         run_debug_with_args(args, Some(dir.path().to_path_buf()))
             .await
@@ -2020,8 +2031,7 @@ mod tests {
         );
 
         // Data fidelity: the same open path returns the committed row count.
-        let out =
-            execute_family_query(fam, "SELECT COUNT(*) FROM verdict_scores", dir.path()).unwrap();
+        let out = execute_family_query(fam, "SELECT COUNT(*) FROM tool_calls", dir.path()).unwrap();
         assert_eq!(
             out, "COUNT(*)\n1\n",
             "temp-copy query must return the committed row"
@@ -2095,7 +2105,18 @@ mod tests {
         // result below must show it, behaviorally proving the legacy path
         // reads db + wal — a db-only read would report COUNT 0.
         store
-            .record_verdict_score("j1", "t1", "review", 0, 9, &[])
+            .flush_batch(
+                "j1",
+                "Engineer",
+                "ws1",
+                &[crate::ToolCallRecord {
+                    tool_name: "read".to_string(),
+                    arguments: "{}".to_string(),
+                    duration_ms: 1,
+                    success: true,
+                    error_message: None,
+                }],
+            )
             .await
             .unwrap();
 
@@ -2132,7 +2153,7 @@ mod tests {
             "debug".to_string(),
             "--family".to_string(),
             fam.to_string(),
-            "SELECT COUNT(*) FROM verdict_scores".to_string(),
+            "SELECT COUNT(*) FROM tool_calls".to_string(),
         ];
         run_debug_with_args(args, Some(dir.path().to_path_buf()))
             .await
@@ -2158,8 +2179,7 @@ mod tests {
         }
 
         // Data fidelity: the wal-only committed row must be visible.
-        let out =
-            execute_family_query(fam, "SELECT COUNT(*) FROM verdict_scores", dir.path()).unwrap();
+        let out = execute_family_query(fam, "SELECT COUNT(*) FROM tool_calls", dir.path()).unwrap();
         assert_eq!(
             out, "COUNT(*)\n1\n",
             "in-place query must read the wal-only row"

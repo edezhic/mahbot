@@ -143,7 +143,7 @@ impl FakeProvider {
     #[must_use]
     pub(crate) fn err(self, class: crate::retry::FailureClass, msg: &str) -> Self {
         let inner = anyhow::anyhow!("{msg}");
-        let record = crate::retry::RetryFailureRecord::new_simple(0, class, &inner, 1, None);
+        let record = crate::retry::RetryFailureRecord::new_simple(class, &inner, None);
         self.script
             .lock()
             .unwrap()

@@ -634,7 +634,7 @@ async fn process_verifier_verdicts_cases() {
 
         let ticket = expect_ticket(board(), &ticket_id).await;
 
-        process_verifier_verdicts(&ws, &ticket, &case.results, case.vi, "test-job").await;
+        process_verifier_verdicts(&ws, &ticket, &case.results, case.vi).await;
 
         let ticket = expect_ticket(board(), &ticket_id).await;
         assert_eq!(
@@ -1266,7 +1266,6 @@ async fn eleventh_bounce_fails_ticket() {
         &ticket,
         &vec![pass_result(), fail_result(), pass_result()],
         REVIEWER_VI,
-        "test-job",
     )
     .await;
     assert!(
@@ -1359,14 +1358,8 @@ async fn technical_failure_pauses_workspace_but_circuit_breaker_does_not() {
     )
     .await;
     let ticket = expect_ticket(board(), &verifier_id).await;
-    let transitioned = process_verifier_verdicts(
-        &ws_verifier,
-        &ticket,
-        &vec![no_verdict(); 3],
-        REVIEWER_VI,
-        "test-job",
-    )
-    .await;
+    let transitioned =
+        process_verifier_verdicts(&ws_verifier, &ticket, &vec![no_verdict(); 3], REVIEWER_VI).await;
     assert!(
         transitioned,
         "all-failed round should transition the ticket"
@@ -1456,7 +1449,7 @@ async fn process_analyst_verdicts_cases() {
 
         let ticket = expect_ticket(board(), &ticket_id).await;
 
-        process_analyst_verdicts(&ws, &ticket, &case.results, "test-job").await;
+        process_analyst_verdicts(&ws, &ticket, &case.results).await;
 
         let phase = expect_ticket_phase(board(), &ticket_id).await;
         assert_eq!(
@@ -1521,7 +1514,7 @@ async fn analyst_round_fails_open_with_fallback_comment() {
         analyst_verdict(3, &["Missing data"]),
     ];
     let ticket = expect_ticket(board(), &ticket_id).await;
-    process_analyst_verdicts(&ws, &ticket, &results, "test-job").await;
+    process_analyst_verdicts(&ws, &ticket, &results).await;
 
     let phase = expect_ticket_phase(board(), &ticket_id).await;
     assert_eq!(phase, TicketPhase::Planning, "fail-open must advance");
@@ -2407,10 +2400,8 @@ fn should_skip_review_decision_matrix() {
 /// Build a [`crate::retry::RetryExhausted`] with the given last-attempt raw text.
 fn retry_exhausted_with_raw(last_raw: Option<String>) -> crate::retry::RetryExhausted {
     let rec = crate::retry::RetryFailureRecord::new_simple(
-        1,
         crate::retry::FailureClass::Parse,
         &anyhow::anyhow!("parse failed"),
-        100,
         None,
     );
     crate::retry::RetryExhausted::with_last_raw(

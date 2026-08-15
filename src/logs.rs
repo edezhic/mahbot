@@ -97,7 +97,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_target ON logs(target);
 CREATE INDEX IF NOT EXISTS idx_logs_agent_role ON logs(agent_role);
 CREATE INDEX IF NOT EXISTS idx_logs_agent_id ON logs(agent_id);
 CREATE INDEX IF NOT EXISTS idx_logs_workspace ON logs(workspace);
--- Consolidated tool-call / retry-failure stats (formerly stats.db). Both the
+-- Consolidated tool-call stats (formerly stats.db). Both the
 -- normal open path and the quarantine-recreate branch execute this schema, so
 -- a quarantine silently recreates the stats tables too.
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -118,35 +118,6 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_name ON tool_calls(tool_name);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_recorded_at ON tool_calls(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_workspace ON tool_calls(workspace);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_error_message ON tool_calls(error_message);
-CREATE TABLE IF NOT EXISTS retry_failures (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    attempt           INTEGER NOT NULL,
-    failure_class     TEXT NOT NULL,
-    error_chain       TEXT NOT NULL,
-    http_version      TEXT,
-    content_length    INTEGER,
-    actual_body_len   INTEGER,
-    content_encoding  TEXT,
-    transfer_encoding TEXT,
-    elapsed_ms        INTEGER NOT NULL,
-    body_head         TEXT NOT NULL DEFAULT '',
-    body_tail         TEXT NOT NULL DEFAULT '',
-    finish_reason     TEXT,
-    completion_tokens INTEGER,
-    retry_after_ms    INTEGER,
-    -- Context for per-role/hour retry-cause aggregation: fine-grained
-    -- JSON-quality cause (non_json / empty_content / score_validation /
-    -- tool_call; set on Parse and OutOfRangeScore failures, empty
-    -- elsewhere) plus the operation context stamped by the outer retry
-    -- loops. Empty on legacy rows.
-    purpose           TEXT NOT NULL DEFAULT '',
-    role              TEXT NOT NULL DEFAULT '',
-    workspace         TEXT NOT NULL DEFAULT '',
-    cause             TEXT NOT NULL DEFAULT '',
-    recorded_at       TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_retry_failures_recorded_at ON retry_failures(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_retry_failures_class ON retry_failures(failure_class);
 -- Per-operation LLM request stats (all purposes: agent runs, verdict
 -- extraction, summarization, consolidation). Metadata only — no request
 -- inputs/outputs are stored. Auto-created on existing databases at next
@@ -183,25 +154,7 @@ CREATE TABLE IF NOT EXISTS llm_requests (
 CREATE INDEX IF NOT EXISTS idx_llm_requests_recorded_at ON llm_requests(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_llm_requests_agent_id ON llm_requests(agent_id);
 CREATE INDEX IF NOT EXISTS idx_llm_requests_model ON llm_requests(model);
-CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);
--- Shadow-instrumentation rows for the joint-verdict pipeline: per-agent
--- verdict scores per stage round, so inter-agent agreement can be
--- re-measured and the dynamic-count formula validated after launch.
--- PK (job_id, agent_index): the job row is the round identity (ticket +
--- stage + round) so replays of a resumed round are idempotent
--- (ON CONFLICT DO UPDATE).
-CREATE TABLE IF NOT EXISTS verdict_scores (
-    job_id       TEXT NOT NULL,
-    agent_index  INTEGER NOT NULL,
-    ticket_id    TEXT NOT NULL,
-    stage        TEXT NOT NULL,
-    score        INTEGER NOT NULL,
-    issues       TEXT NOT NULL,
-    created_at   TEXT NOT NULL,
-    PRIMARY KEY (job_id, agent_index)
-);
-CREATE INDEX IF NOT EXISTS idx_verdict_scores_ticket_id ON verdict_scores(ticket_id);
-CREATE INDEX IF NOT EXISTS idx_verdict_scores_created_at ON verdict_scores(created_at);";
+CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);";
 
 impl LogStore {
     /// Open (or create) the log database at `root/db/logs.db`.
@@ -301,49 +254,6 @@ impl LogStore {
             .await
             .context("Failed to delete old log entries")?;
         Ok(n)
-    }
-
-    /// Persist a single per-agent verdict score (shadow instrumentation for
-    /// the joint-verdict pipeline). Best-effort — callers log and swallow
-    /// failures; the verdict pipeline must never block on instrumentation.
-    /// Written outside the comment+transition transaction so the store write
-    /// lock is never held for it.
-    ///
-    /// `job_id` is the durable round identity (job row id); replay of a
-    /// resumed round is idempotent via ON CONFLICT (job_id, agent_index)
-    /// DO UPDATE.
-    #[allow(clippy::cast_possible_wrap)]
-    pub(crate) async fn record_verdict_score(
-        &self,
-        job_id: &str,
-        ticket_id: &str,
-        stage: &str,
-        agent_index: usize,
-        score: u8,
-        issues: &[String],
-    ) -> anyhow::Result<()> {
-        let now = crate::turso::now();
-        let issues_json = serde_json::to_string(issues)?;
-        self.conn
-            .execute(
-                "INSERT INTO verdict_scores \
-                 (job_id, agent_index, ticket_id, stage, score, issues, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-                 ON CONFLICT (job_id, agent_index) DO UPDATE SET \
-                   score = excluded.score, issues = excluded.issues, created_at = excluded.created_at",
-                params![
-                    job_id,
-                    agent_index as i64,
-                    ticket_id,
-                    stage,
-                    i64::from(score),
-                    issues_json,
-                    now,
-                ],
-            )
-            .await
-            .context("Failed to record verdict score")?;
-        Ok(())
     }
 
     /// Query log entries with optional filters.
@@ -1700,14 +1610,14 @@ mod tests {
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master \
-                 WHERE type='table' AND name IN ('tool_calls','retry_failures')",
+                 WHERE type='table' AND name IN ('tool_calls')",
                 params![],
                 |row| row.get::<i64>(0),
             )
             .await
             .expect("count consolidated stats tables");
         assert_eq!(
-            stats_tables, 2,
+            stats_tables, 1,
             "consolidated stats tables must exist after quarantine recreate"
         );
         let quarantined: Vec<_> = std::fs::read_dir(root.join("db"))

@@ -706,22 +706,16 @@ fn append_repair_instructions(
 /// Telemetry: a round that accepts anything (froze groups, accepted a
 /// reference, or accepted the first summary) is recorded as a SUCCESS through
 /// the existing per-call recording path (per-round usage, the calibration
-/// signal); every rejection persists its typed cause as its own
-/// `retry_failures` row, from mixed and failed rounds alike. A parsed round
-/// that accepts nothing is a FAILURE recorded with a typed granular cause —
-/// including clean zero-progress rounds (valid ungrouped-only deltas), the
-/// most common terminal shape — so no round is ever invisible in the tables
-/// and the failure trail is never empty on Fallback (no spurious
-/// `transport`/`retry_attempts=0` classification). Per-round exclusivity
-/// holds (a round is never both a success and a failure row), but a Fallback
-/// operation may still carry both an earlier summary-only round's success row
-/// and the operation-level failure row — the accepted summary is discarded by
-/// the fallback render. Row counts: a failed round with N rejections persists
-/// N per-rejection rows PLUS one round-level failure row (the operation-trail
-/// record that drives `final_class`), while a mixed round persists only the N
-/// per-rejection rows plus its success row — calibration consumers should
-/// count causes per-rejection, not per-row.
-#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+/// signal). A parsed round that accepts nothing is a FAILURE recorded with a
+/// typed granular cause — including clean zero-progress rounds (valid
+/// ungrouped-only deltas), the most common terminal shape — keeping the
+/// failure trail non-empty on Fallback (no spurious
+/// `transport`/`retry_attempts=0` classification).
+/// Per-round exclusivity holds (a round is never both a success and a failure
+/// row), but a Fallback operation may still carry both an earlier
+/// summary-only round's success row and the operation-level failure row — the
+/// accepted summary is discarded by the fallback render.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run_grouping_repair(
     ws: &Workspace,
     purpose: &'static str,
@@ -731,7 +725,7 @@ pub(crate) async fn run_grouping_repair(
     let _call = crate::call_registry::NON_AGENT_CALLS.register(purpose, &ws.name);
     crate::prompt::prepend_general_context(&mut request.messages, ws).await;
     let policy = RetryPolicy::synthesis();
-    let mut loop_state = RetryLoop::new(&policy, request.meta.as_ref());
+    let mut loop_state = RetryLoop::new(&policy);
     let operation_started = Instant::now();
     let mut state = RepairState::new(items_by_agent);
     // Rejection reasons fed to the next repair round; cleared only once a
@@ -761,7 +755,7 @@ pub(crate) async fn run_grouping_repair(
             Ok(resp) => resp,
             Err(err) => {
                 let non_retryable = !err.class.is_retryable();
-                loop_state.record(round, err.record).await;
+                loop_state.record(err.record);
                 if non_retryable {
                     break;
                 }
@@ -778,18 +772,14 @@ pub(crate) async fn run_grouping_repair(
         };
         let raw = resp.text_or_empty();
         // A tool-call response parses as empty text — classify it explicitly
-        // so the retry-cause telemetry distinguishes it (same taxonomy as
-        // extraction).
+        // so the retry trail distinguishes it (same taxonomy as extraction).
         if !resp.tool_calls.is_empty() {
             let rec = RetryFailureRecord::new_simple(
-                round,
                 FailureClass::Parse,
                 &anyhow::anyhow!("grouping response returned a tool call instead of JSON"),
-                attempt_started.elapsed().as_millis() as u64,
                 None,
-            )
-            .with_cause(crate::retry::CAUSE_TOOL_CALL);
-            loop_state.record(round, rec).await;
+            );
+            loop_state.record(rec);
             prev_round = PrevRound::Parse;
             continue;
         }
@@ -823,15 +813,8 @@ pub(crate) async fn run_grouping_repair(
                 outcome
             }
             Err(e) => {
-                let rec = RetryFailureRecord::new_simple(
-                    round,
-                    FailureClass::Parse,
-                    &e,
-                    attempt_started.elapsed().as_millis() as u64,
-                    None,
-                )
-                .with_cause(crate::retry::parse_failure_cause(raw));
-                loop_state.record(round, rec).await;
+                let rec = RetryFailureRecord::new_simple(FailureClass::Parse, &e, None);
+                loop_state.record(rec);
                 prev_round = PrevRound::Parse;
                 continue;
             }
@@ -840,14 +823,14 @@ pub(crate) async fn run_grouping_repair(
         // through the existing per-call recording path (usage tokens per
         // round, the calibration signal). A round is never both a success row
         // and a failure row in llm_requests; its rejections still feed the
-        // next round and are persisted below as granular retry_failures rows.
+        // next round.
         let accepted = outcome.froze > 0 || outcome.accepted_refs > 0 || outcome.accepted_summary;
         prev_round = PrevRound::Processed { accepted };
         if accepted {
             crate::stats::record_llm_success(&request, attempt_started, round, &resp).await;
         }
-        // Typed granular cause for telemetry: completeness (round-level
-        // rejection) or the first per-group/per-entry cause.
+        // Typed granular cause for the failure trail: completeness
+        // (round-level rejection) or the first per-group/per-entry cause.
         let cause = if outcome.round_rejection.is_some() {
             FailureClass::Completeness
         } else {
@@ -868,30 +851,12 @@ pub(crate) async fn run_grouping_repair(
             cause = cause.label(),
             "Grouping synthesis repair round",
         );
-        // Every rejection persists its typed cause as its own retry_failures
-        // row — from mixed rounds (accepted content AND rejected proposals)
-        // and failed rounds alike — so the granular-cause calibration surface
-        // never under-reports the most common round outcome.
-        if !outcome.rejections.is_empty() {
-            for (class, msg) in &outcome.rejections {
-                let err = anyhow::anyhow!("{msg}");
-                let mut rec = RetryFailureRecord::new_simple(
-                    round,
-                    *class,
-                    &err,
-                    attempt_started.elapsed().as_millis() as u64,
-                    None,
-                );
-                rec.stamp_meta(request.meta.as_ref());
-                crate::retry::record_retry_failure(&rec).await;
-            }
-        }
         // A parsed-and-processed round that accepted NOTHING is a failure with
         // the typed cause — including clean zero-progress rounds (a valid
-        // ungrouped-only delta): they are the most common terminal shape and
-        // must be visible in the calibration surface. Recording them also
-        // keeps the failure trail non-empty, so a subsequent Fallback never
-        // mislabels the operation as `transport`/`retry_attempts=0`.
+        // ungrouped-only delta): they are the most common terminal shape.
+        // Recording them also keeps the failure trail non-empty, so a
+        // subsequent Fallback never mislabels the operation as
+        // `transport`/`retry_attempts=0`.
         if !accepted {
             let detail = if rejections.is_empty() {
                 "round accepted nothing (zero-progress; no validation rejections)".to_string()
@@ -899,14 +864,8 @@ pub(crate) async fn run_grouping_repair(
                 rejections.join("; ")
             };
             let err = anyhow::anyhow!("grouping validation failed: {detail}");
-            let rec = RetryFailureRecord::new_simple(
-                round,
-                cause,
-                &err,
-                attempt_started.elapsed().as_millis() as u64,
-                None,
-            );
-            loop_state.record(round, rec).await;
+            let rec = RetryFailureRecord::new_simple(cause, &err, None);
+            loop_state.record(rec);
         }
         if state.complete() {
             break; // every item is frozen or pinned — nothing left to place
@@ -934,13 +893,11 @@ pub(crate) async fn run_grouping_repair(
                 "operation exhausted with no accepted output"
             };
             let rec = RetryFailureRecord::new_simple(
-                policy.max_attempts,
                 FailureClass::ValidationOther,
                 &anyhow::anyhow!("{detail}"),
-                0,
                 None,
             );
-            loop_state.record(policy.max_attempts, rec).await;
+            loop_state.record(rec);
         }
         let final_class = loop_state.final_class();
         let exhausted = crate::retry::RetryExhausted::with_last_raw(
