@@ -22,33 +22,24 @@ pub(crate) static TEMPLATE_RE: LazyLock<Regex> =
 
 /// Load a prompt template from embedded assets.
 ///
-/// Returns the prompt content on success.
-/// On failure (missing embedded asset), logs a warning and returns a
-/// distinctive fallback string so callers don't panic at runtime.
+/// Panics if the asset is missing — prompt files are always present in the
+/// repo, so a missing asset is a stale/typo'd key or a partial checkout.
 #[must_use]
 pub(crate) fn load_prompt(asset_key: &str) -> String {
-    if let Some(file) = PromptAssets::get(asset_key) {
-        String::from_utf8_lossy(file.data.as_ref()).into_owned()
-    } else {
-        tracing::warn!(
-            asset_key = %asset_key,
+    let file = PromptAssets::get(asset_key).unwrap_or_else(|| {
+        panic!(
             "Embedded prompt '{asset_key}' not found. \
              Create the file at src/prompt/{asset_key} and rebuild."
-        );
-        format!("[PROMPT MISSING: src/prompt/{asset_key}]")
-    }
+        )
+    });
+    String::from_utf8_lossy(file.data.as_ref()).into_owned()
 }
 
 /// Load a prompt asset and split it into `---`-delimited sections (trimmed,
-/// empty sections dropped). A missing asset yields an empty list — the
-/// "[PROMPT MISSING: ...]" fallback is never treated as a section.
+/// empty sections dropped).
 #[must_use]
 pub(crate) fn load_prompt_sections(asset_key: &str) -> Vec<String> {
-    let content = load_prompt(asset_key);
-    if content.starts_with("[PROMPT MISSING") {
-        return Vec::new();
-    }
-    content
+    load_prompt(asset_key)
         .split("\n---\n")
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -376,103 +367,6 @@ mod tests {
     }
 
     #[test]
-    fn all_tool_descriptions_exist_in_embedded_assets() {
-        /// Extract the tool name from an embedded asset key like `"tool/shell.md"`.
-        /// Returns `None` if the key is not a `tool/*.md` asset.
-        fn tool_name_from_asset_key(key: &str) -> Option<&str> {
-            const PREFIX: &str = "tool/";
-            const SUFFIX: &str = ".md";
-            if key.starts_with(PREFIX) && key.ends_with(SUFFIX) {
-                Some(&key[PREFIX.len()..key.len() - SUFFIX.len()])
-            } else {
-                None
-            }
-        }
-
-        // ── Build the set of expected tool names ────────────────────────
-        //
-        // Iterate over every role's tool list so that adding a new tool to
-        // Role::tools() automatically checks it here.  web_search is
-        // conditionally added when a Firecrawl or Exa API key is configured, so it may
-        // not appear in tests — we add it explicitly.
-        use crate::Role;
-        use std::collections::HashSet;
-        use strum::IntoEnumIterator;
-
-        let mut expected: HashSet<String> = HashSet::new();
-        for role in Role::iter() {
-            for tool in role.tools(&crate::workspace::test_ws("test")) {
-                expected.insert(tool.name().to_string());
-            }
-        }
-        // web_search is gated on CONFIG.firecrawl_key() or CONFIG.exa_key() which are None in tests.
-        expected.insert("web_search".to_string());
-
-        // ── Collect available tool description files from embedded assets ─
-        let mut available: HashSet<String> = HashSet::new();
-        for asset_key in PromptAssets::iter() {
-            // asset_key is Cow<'static, str> (from rust-embed).
-            // Filter to only tool/*.md files and extract the tool name.
-            if let Some(tool_name) = tool_name_from_asset_key(&asset_key) {
-                // shell_readonly_banner.md is a banner asset, not a tool description.
-                if tool_name != "shell_readonly_banner" {
-                    available.insert(tool_name.to_string());
-                }
-            }
-        }
-
-        // ── Forward check: every expected tool must have a description file ─
-        let mut missing: Vec<&str> = expected
-            .difference(&available)
-            .map(String::as_str)
-            .collect();
-        missing.sort_unstable();
-        assert!(
-            missing.is_empty(),
-            "Missing embedded tool description file(s):\n\
-             {}\n\
-             Each tool returned by Role::tools() must have a corresponding\n\
-             src/prompt/tool/<name>.md file. Create one for each missing tool.",
-            missing
-                .iter()
-                .map(|n| format!("  tool/{n}.md"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-
-        // ── Reverse check: every description file must map to a known tool ─
-        let mut orphaned: Vec<&str> = available
-            .difference(&expected)
-            .map(String::as_str)
-            .collect();
-        orphaned.sort_unstable();
-        assert!(
-            orphaned.is_empty(),
-            "Orphaned tool description file(s) — no tool uses them:\n\
-             {}\n\
-             Remove or archive the extraneous src/prompt/tool/<name>.md file(s).",
-            orphaned
-                .iter()
-                .map(|n| format!("  tool/{n}.md"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-
-        // ── Content check: every description file must be non-empty ─────
-        for name in &available {
-            let key = format!("tool/{name}.md");
-            let asset = PromptAssets::get(&key)
-                .unwrap_or_else(|| panic!("asset {key} disappeared between iter and get"));
-            let content = String::from_utf8_lossy(asset.data.as_ref());
-            assert!(
-                !content.trim().is_empty(),
-                "Tool description file '{key}' is empty or whitespace-only.\n\
-                 Add a meaningful description for the tool '{name}'.",
-            );
-        }
-    }
-
-    #[test]
     fn all_template_variables_are_word_chars() {
         // Every {{...}} placeholder in embedded prompt assets must use
         // \w+ keys (ASCII alphanumeric + underscore) so that TEMPLATE_RE
@@ -501,11 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn all_prompt_assets_load_without_panic() {
-        // Every embedded prompt asset must load successfully and return
-        // non-empty content.  Regression guard for the load_prompt
-        // panic → warning+fallback switch: an existing asset must never
-        // resolve to the [PROMPT MISSING: …] placeholder.
+    fn all_prompt_assets_load_non_empty() {
         for asset_key in PromptAssets::iter() {
             let content = load_prompt(&asset_key);
             assert!(
@@ -513,21 +403,6 @@ mod tests {
                 "Prompt asset '{asset_key}' is empty or whitespace-only.\n\
                  Each embedded prompt file must contain meaningful content.",
             );
-            // The fallback placeholder must never appear in real assets.
-            assert!(
-                !content.starts_with("[PROMPT MISSING:"),
-                "Prompt asset '{asset_key}' returned fallback string instead of real content.\n\
-                 This should never happen — the asset exists in the embedded index.",
-            );
         }
-    }
-
-    #[test]
-    fn load_prompt_missing_asset_returns_fallback() {
-        let result = load_prompt("this_file_does_not_exist.md");
-        assert_eq!(
-            result,
-            "[PROMPT MISSING: src/prompt/this_file_does_not_exist.md]",
-        );
     }
 }

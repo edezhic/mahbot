@@ -238,9 +238,6 @@ impl Role {
 
     /// Conversation compaction prompt for this role, loaded from
     /// `src/prompt/summarize/{role}.md`.
-    ///
-    /// Falls back to a `[PROMPT MISSING: …]` placeholder if the asset is missing
-    /// (see `load_prompt`).
     #[must_use]
     pub fn summary_prompt(&self) -> String {
         crate::prompt::load_prompt(&format!("summarize/{}.md", self.as_str()))
@@ -490,19 +487,12 @@ mod tests {
 
     #[test]
     fn all_roles_have_role_description() {
-        // Guards against a missing src/prompt/role/{name}.md — the compiler
-        // cannot catch this because load_prompt returns a fallback string.
+        // Guards against an empty or unsubstituted role description file.
         for role in Role::iter() {
             let desc = role.role_description();
             assert!(
                 !desc.trim().is_empty(),
                 "{}: role_description() must not be empty",
-                role.as_str()
-            );
-            assert!(
-                !desc.contains("PROMPT MISSING"),
-                "{}: role_description() returned a placeholder — create src/prompt/role/{}.md",
-                role.as_str(),
                 role.as_str()
             );
             assert!(
@@ -515,18 +505,12 @@ mod tests {
 
     #[test]
     fn all_roles_have_summary_prompt() {
-        // Guards against a missing src/prompt/summarize/{name}.md.
+        // Guards against an empty or unsubstituted summary prompt file.
         for role in Role::iter() {
             let prompt = role.summary_prompt();
             assert!(
                 !prompt.trim().is_empty(),
                 "{}: summary_prompt() must not be empty",
-                role.as_str()
-            );
-            assert!(
-                !prompt.contains("PROMPT MISSING"),
-                "{}: summary_prompt() returned a placeholder — create src/prompt/summarize/{}.md",
-                role.as_str(),
                 role.as_str()
             );
             assert!(
@@ -539,10 +523,7 @@ mod tests {
 
     #[test]
     fn all_roles_have_discovery_prompt() {
-        // Guards against a missing src/prompt/discovery/{name}.md for roles
-        // where has_discovery is true. The placeholder string from load_prompt
-        // would pass a non-empty and no-template-keys check, so we also check
-        // for the "PROMPT MISSING" marker.
+        // Guards against an empty or unsubstituted discovery prompt file.
         for role in Role::iter() {
             if !super::role_info(&role).has_discovery {
                 continue;
@@ -551,12 +532,6 @@ mod tests {
             assert!(
                 !prompt.trim().is_empty(),
                 "{}: discovery_prompt() must not be empty",
-                role.as_str()
-            );
-            assert!(
-                !prompt.contains("PROMPT MISSING"),
-                "{}: discovery_prompt() returned a placeholder — create src/prompt/discovery/{}.md",
-                role.as_str(),
                 role.as_str()
             );
             assert!(
