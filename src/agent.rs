@@ -47,6 +47,11 @@ tokio::task_local! {
     /// tests) — background mode is unavailable there.
     pub(crate) static CURRENT_TOOL_BACKGROUND_SESSIONS:
         Option<std::sync::Arc<crate::tools::shell::BackgroundSessions>>;
+    /// The calling agent's id — set for the duration of tool execution so the
+    /// shell tool can attribute the spill files it creates to the owning agent
+    /// (owner-deletes-at-end: the run's spill files are deleted when the agent
+    /// run ends). `None` outside an agent run (management diagnostics, tests).
+    pub(crate) static CURRENT_TOOL_AGENT_ID: Option<String>;
 }
 
 /// Maximum LLM iterations before the agent loop bails out.
@@ -486,6 +491,7 @@ impl Agent {
         let channel = self.channel.clone();
         let parent_key = self.parent_key.clone();
         let background_sessions = Some(self.background_sessions.clone());
+        let agent_id = Some(self.agent_id.clone());
         CURRENT_TOOL_USER_NAME
             .scope(user_name, async {
                 CURRENT_TOOL_CHANNEL
@@ -494,40 +500,46 @@ impl Agent {
                             .scope(parent_key, async {
                                 CURRENT_TOOL_BACKGROUND_SESSIONS
                                     .scope(background_sessions, async {
-                                        while i < tool_calls.len() {
-                                            if side_flags[i] {
-                                                // Side-effecting: single-call group, executed alone.
-                                                let outcome = self
-                                                    .execute_tool(
-                                                        &tool_calls[i].name,
-                                                        tool_calls[i].arguments.clone(),
-                                                    )
-                                                    .await;
-                                                outcomes.push(outcome);
-                                                i += 1;
-                                            } else {
-                                                // Read-only group: extend while consecutive calls are also read-only.
-                                                let group_start = i;
-                                                while i < tool_calls.len() && !side_flags[i] {
-                                                    i += 1;
-                                                }
-                                                let group_calls = &tool_calls[group_start..i];
-
-                                                // Execute the entire read-only group in parallel.
-                                                let group_outcomes: Vec<_> =
-                                                    futures_util::future::join_all(
-                                                        group_calls.iter().map(|call| {
-                                                            self.execute_tool(
-                                                                &call.name,
-                                                                call.arguments.clone(),
+                                        CURRENT_TOOL_AGENT_ID
+                                            .scope(agent_id, async {
+                                                while i < tool_calls.len() {
+                                                    if side_flags[i] {
+                                                        // Side-effecting: single-call group, executed alone.
+                                                        let outcome = self
+                                                            .execute_tool(
+                                                                &tool_calls[i].name,
+                                                                tool_calls[i].arguments.clone(),
                                                             )
-                                                        }),
-                                                    )
-                                                    .await;
+                                                            .await;
+                                                        outcomes.push(outcome);
+                                                        i += 1;
+                                                    } else {
+                                                        // Read-only group: extend while consecutive calls are also read-only.
+                                                        let group_start = i;
+                                                        while i < tool_calls.len() && !side_flags[i]
+                                                        {
+                                                            i += 1;
+                                                        }
+                                                        let group_calls =
+                                                            &tool_calls[group_start..i];
 
-                                                outcomes.extend(group_outcomes);
-                                            }
-                                        }
+                                                        // Execute the entire read-only group in parallel.
+                                                        let group_outcomes: Vec<_> =
+                                                            futures_util::future::join_all(
+                                                                group_calls.iter().map(|call| {
+                                                                    self.execute_tool(
+                                                                        &call.name,
+                                                                        call.arguments.clone(),
+                                                                    )
+                                                                }),
+                                                            )
+                                                            .await;
+
+                                                        outcomes.extend(group_outcomes);
+                                                    }
+                                                }
+                                            })
+                                            .await;
                                     })
                                     .await;
                             })
@@ -1153,6 +1165,7 @@ pub(crate) async fn run_agent(
     let _router_guard = incoming_rx
         .is_some()
         .then(|| UnregisterOnDrop(agent_id.clone()));
+    let agent_id_for_cleanup = agent_id.clone();
     let mut agent = Agent::new(
         agent_id,
         role,
@@ -1172,7 +1185,7 @@ pub(crate) async fn run_agent(
     // Cancellation safety: if the token fired after work() completed but
     // before we checked, discard the result to prevent overwriting of
     // externally-set cancelled status in downstream code.
-    if agent.is_cancelled() {
+    let outcome = if agent.is_cancelled() {
         tracing::debug!(
             agent_id = %agent.agent_id,
             workspace = %ws.name,
@@ -1181,51 +1194,56 @@ pub(crate) async fn run_agent(
             classification = failure_classification(&agent, None),
             "Agent cancelled"
         );
-        return (agent, None);
-    }
-
-    match result {
-        Ok(response) => (agent, Some(response)),
-        Err(e) => {
-            // Capture the real cause (full chain) so ticket dispatchers can
-            // persist it in failure comments instead of a generic placeholder.
-            agent.failure = Some(format!("{e:#}"));
-            let classification = failure_classification(&agent, Some(&e));
-            let error_chain = crate::util::truncate_sandwich(
-                &crate::util::scrub_credentials(&format!("{e:#}")),
-                crate::util::FAILURE_DETAIL_CAP,
-                "agent failure log",
-            );
-            // During global (SIGTERM/SIGINT) shutdown, in-flight agents return
-            // errors from work() — expected, not real failures. The global
-            // token fires before `shutdown_all()` cancels per-agent tokens, so
-            // either path resolves to classification "shutdown". Log at debug
-            // level to avoid misleading ERROR noise on clean shutdown. The
-            // graceful drain maps to classification "drain" — same treatment.
-            if classification == "shutdown" || classification == "drain" {
-                tracing::debug!(
-                    agent_id = %agent.agent_id,
-                    workspace = %ws.name,
-                    role = %role,
-                    ticket = ticket.map(|t| t.id.as_str()),
-                    classification,
-                    error_chain,
-                    "Agent failed during shutdown"
+        (agent, None)
+    } else {
+        match result {
+            Ok(response) => (agent, Some(response)),
+            Err(e) => {
+                // Capture the real cause (full chain) so ticket dispatchers can
+                // persist it in failure comments instead of a generic placeholder.
+                agent.failure = Some(format!("{e:#}"));
+                let classification = failure_classification(&agent, Some(&e));
+                let error_chain = crate::util::truncate_sandwich(
+                    &crate::util::scrub_credentials(&format!("{e:#}")),
+                    crate::util::FAILURE_DETAIL_CAP,
+                    "agent failure log",
                 );
-            } else {
-                tracing::error!(
-                    agent_id = %agent.agent_id,
-                    workspace = %ws.name,
-                    role = %role,
-                    ticket = ticket.map(|t| t.id.as_str()),
-                    classification,
-                    error_chain,
-                    "Agent failed"
-                );
+                // During global (SIGTERM/SIGINT) shutdown, in-flight agents return
+                // errors from work() — expected, not real failures. The global
+                // token fires before `shutdown_all()` cancels per-agent tokens, so
+                // either path resolves to classification "shutdown". Log at debug
+                // level to avoid misleading ERROR noise on clean shutdown. The
+                // graceful drain maps to classification "drain" — same treatment.
+                if classification == "shutdown" || classification == "drain" {
+                    tracing::debug!(
+                        agent_id = %agent.agent_id,
+                        workspace = %ws.name,
+                        role = %role,
+                        ticket = ticket.map(|t| t.id.as_str()),
+                        classification,
+                        error_chain,
+                        "Agent failed during shutdown"
+                    );
+                } else {
+                    tracing::error!(
+                        agent_id = %agent.agent_id,
+                        workspace = %ws.name,
+                        role = %role,
+                        ticket = ticket.map(|t| t.id.as_str()),
+                        classification,
+                        error_chain,
+                        "Agent failed"
+                    );
+                }
+                (agent, None)
             }
-            (agent, None)
         }
-    }
+    };
+
+    // Owner-deletes-at-end: remove the spill files this agent run created
+    // (safe on macOS — the run is over, nothing will read them again).
+    crate::tools::shell::cleanup_agent_spills(&agent_id_for_cleanup);
+    outcome
 }
 
 /// Default dispatch: no ticket, empty user/channel, no inbox, no resume.

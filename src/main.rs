@@ -73,6 +73,14 @@ async fn bootstrap_mahbot() -> Result<()> {
     // and model settings take effect.
     mahbot::config::reload_from_db().await?;
 
+    // Boot sweep: crash leftovers in the private temp root + the one-time
+    // legacy temp-dir cleanup. Runs after the stores are open (the run-root
+    // sweep is liveness-guarded against the session store) and BEFORE any
+    // background task / boot-resume recreates live run folders — the sweep
+    // only reclaims DEAD folders, so ordering with resume is safe either way.
+    #[cfg(unix)]
+    mahbot::temp_root::boot_sweep().await;
+
     // Local Qwen3-ASR transcriber: start the load-or-download chain as a
     // background task. Config is authoritative here (honors a user-set
     // audio_transcription_use_local=false) and this runs BEFORE the provider
@@ -505,6 +513,13 @@ fn main() -> Result<()> {
         let code = mahbot::run_grep_engine(&std::env::args().skip(2).collect::<Vec<_>>());
         std::process::exit(code);
     }
+
+    // Consolidate ALL daemon temp files under one private root
+    // (`/tmp/mahbot-<uid>`, mode 0700) and pin TMPDIR to it — BEFORE any
+    // temp use (config, logs, stores, shell children). The debug and
+    // __grep-engine subcommands above must NOT create the root (they exit
+    // before this point).
+    mahbot::temp_root::init_temp_root()?;
 
     // Detect self-update availability mode before any async work.
     let update_mode = mahbot::self_update::update_mode();

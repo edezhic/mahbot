@@ -677,6 +677,10 @@ pub async fn run_management() {
                 job_id,
                 workspace_name,
                 ..
+            }
+            | ResumableStage::ResearchCleanup {
+                job_id,
+                workspace_name,
             } => (job_id, workspace_name),
         };
         let Ok(Some(workspace)) = crate::workspace::store().get_by_name(workspace_name).await
@@ -748,6 +752,13 @@ pub async fn run_management() {
                 let ws = workspace.clone();
                 tokio::spawn(async move {
                     crate::tools::analyze::analyze_capped_envelope(&job_id, &ws).await;
+                });
+            }
+            ResumableStage::ResearchCleanup { job_id, .. } => {
+                info!(job = %job_id, "Resuming research cleanup agent at boot");
+                let ws = workspace.clone();
+                tokio::spawn(async move {
+                    crate::research_cleanup::resume_research_cleanup(&job_id, &ws).await;
                 });
             }
             ResumableStage::TicketStage {
@@ -2437,6 +2448,10 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 
     // The removed "Auto-diagnostics" header would leave the first command's
     // separator as leading blank lines — strip them.
+    // Owner-deletes-at-end: the diagnostics runner is a NON-AGENT consumer of
+    // ShellTool, so its spill files are recorded under the non-agent owner key —
+    // clean them up here (equivalent to the agent-run-end hook).
+    crate::tools::shell::cleanup_agent_spills(crate::tools::shell::NON_AGENT_SPILL_OWNER);
     (comment.trim_start_matches('\n').to_string(), all_passed)
 }
 

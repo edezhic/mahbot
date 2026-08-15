@@ -23,7 +23,7 @@
 //! [`crate::tools::shell::scan`]; this module only uses word-level helpers on
 //! words reconstructed from the syntax tree.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tree_sitter::{Node, Parser};
 
@@ -231,7 +231,7 @@ impl CheckContext {
         Self {
             workspace_root: workspace_root.to_path_buf(),
             temp_roots: crate::tools::path::allowed_temp_roots(),
-            temp_vars: vec![("TMPDIR".to_string(), super::TMPDIR_BASELINE.to_string())],
+            temp_vars: vec![("TMPDIR".to_string(), super::shell_tmpdir())],
         }
     }
 }
@@ -1964,16 +1964,27 @@ fn bind_assignments<'a>(
 // ── Temp-write contract machinery ────────────────────────────────────────
 
 /// Synthetic anchor path for a temp-tagged variable (`NAME=$(mktemp -d)`):
-/// the first allowed temp root plus one level. The concrete value is unknown,
+/// the bare-mktemp landing root plus one level. The concrete value is unknown,
 /// but any `mktemp` result lives exactly one level below a temp root, so
 /// `..` chains over this anchor produce the same under-temp verdict as the
-/// real value.
+/// real value. The landing root is [`crate::temp_root::bare_mktemp_landing_root`]
+/// — on macOS bare `mktemp` ignores `TMPDIR` and lands in the legacy darwin
+/// dir (`/var/folders/.../T`), so the anchor must model THAT root, not the
+/// (pinned) `TMPDIR`. The legacy root is preserved in `allowed_temp_roots()`,
+/// so the anchor still resolves under an allowed root.
 fn temp_anchor_path(ctx: &CheckContext) -> String {
-    let root = ctx
-        .temp_roots
-        .first()
-        .map_or_else(|| "/tmp".to_string(), |p| p.to_string_lossy().into_owned());
-    format!("{root}/{TEMP_ANCHOR_SEGMENT}")
+    let root = crate::temp_root::bare_mktemp_landing_root();
+    // Fall back to the first allowed root when the landing root is not among
+    // the context's roots (tests construct hermetic contexts).
+    let root = if ctx.temp_roots.contains(&root) {
+        root
+    } else {
+        ctx.temp_roots
+            .first()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+    };
+    format!("{}/{TEMP_ANCHOR_SEGMENT}", root.display())
 }
 
 /// Placeholder segment for a temp-tagged variable's unknown concrete value.
@@ -4510,11 +4521,8 @@ mod tests {
         CheckContext {
             workspace_root: std::path::PathBuf::from("/__mahbot_readonly_test_ws__"),
             temp_roots: crate::tools::path::allowed_temp_roots(),
-            // Match the session shell env (TMPDIR = super::TMPDIR_BASELINE); TMP/TEMP unset.
-            temp_vars: vec![(
-                "TMPDIR".to_string(),
-                super::super::TMPDIR_BASELINE.to_string(),
-            )],
+            // Match the session shell env (TMPDIR = shell::shell_tmpdir()); TMP/TEMP unset.
+            temp_vars: vec![("TMPDIR".to_string(), crate::tools::shell::shell_tmpdir())],
         }
     }
 

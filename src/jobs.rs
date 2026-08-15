@@ -220,6 +220,11 @@ pub(crate) enum SpawnChild {
     Analyze,
     /// research_jobs (id, state).
     Research,
+    /// A research-run cleanup Sanitation agent. No child row: the jobs row's
+    /// `task` holds the cleanup prompt, and the row id == the run id (folder
+    /// name) so the run-root sweep's jobs-row liveness holds the run folder
+    /// alive for the duration of the cleanup run.
+    ResearchCleanup,
     /// ticket_stage_jobs (id, ticket_id, stage, phase, round).
     TicketStage {
         ticket_id: String,
@@ -238,6 +243,7 @@ impl SpawnChild {
         match self {
             Self::Analyze => "analyze",
             Self::Research => "research",
+            Self::ResearchCleanup => "research_cleanup",
             Self::TicketStage { .. } => "ticket_stage",
         }
     }
@@ -288,8 +294,9 @@ pub(crate) async fn spawn_job(
         .with_context(|| format!("failed to insert agent roster for job {id}"))?;
     }
     match child {
-        // Analyze is a pure kind marker — the job row alone drives resume.
-        SpawnChild::Analyze => {}
+        // Analyze / ResearchCleanup are pure kind markers — the job row alone
+        // drives resume (the cleanup prompt lives in jobs.task).
+        SpawnChild::Analyze | SpawnChild::ResearchCleanup => {}
         SpawnChild::Research => {
             tx.execute(
                 "INSERT INTO research_jobs (id, state) VALUES (?1, '{}')",
@@ -708,6 +715,12 @@ pub(crate) enum ResumableStage {
         workspace_name: String,
         capped: bool,
     },
+    /// A research-run cleanup Sanitation agent interrupted by a crash. The
+    /// jobs row id == the run id, so the run folder is still held alive.
+    ResearchCleanup {
+        job_id: String,
+        workspace_name: String,
+    },
 }
 
 /// One in-phase ticket_stage candidate for the boot-scan round dedup.
@@ -828,6 +841,33 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
                 warn!(pending_job = %row.id, error = %e, "Failed to delete deduped pending job");
             }
             continue;
+        }
+        // Crash-window cleanup dispatch: a genuinely-undelivered
+        // research-completion envelope whose run has NO `research_cleanup`
+        // jobs row AND no archived cleanup report means the daemon died
+        // between complete_durable_job and dispatch_research_cleanup — the
+        // cleanup agent never ran. Create the durable row NOW (the dedup
+        // marker + sweep-liveness hold); the `research_cleanup` boot-scan arm
+        // below — which reads list_active_jobs AFTER this replay — is the
+        // SOLE dispatcher for the agent (spawning here would double-run the
+        // same `cleanup_{run_id}` id: the scan arm would register it via
+        // AgentRegistry, replacing + cancelling this dispatch). Runs whose
+        // cleanup was already dispatched have the row and are skipped here
+        // (their cleanup resumes via the `research_cleanup` boot-scan arm).
+        // A missing row with an ARCHIVED cleanup report means the cleanup
+        // COMPLETED while the envelope stayed undelivered (dead target
+        // session) — re-dispatching would be a duplicate LLM round every boot
+        // (the archive is the durable completed marker).
+        // Deliberately after the appended-dedup check: an already-appended
+        // envelope proves dispatch ran in the previous lifetime, so a missing
+        // row there means the cleanup COMPLETED — re-dispatching would be a
+        // duplicate LLM round.
+        if job.kind == JobKind::ResearchResult
+            && !crate::research_cleanup::research_cleanup_row_exists(conn, &row.id)
+                .await
+                .unwrap_or(true)
+        {
+            crate::research_cleanup::dispatch_cleanup_for_pending_envelope(&row.id, &job).await;
         }
         // The dedup above is the authoritative "in session" check: a row whose
         // content is NOT in the session was never appended (interrupted between
@@ -1227,6 +1267,30 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
                         workspace_name: job.workspace_name.clone(),
                         capped,
                     }
+                });
+                resumed_other += 1;
+            }
+            "research_cleanup" => {
+                // A research-run cleanup Sanitation agent interrupted by a
+                // crash. Resume it like any other durable job; on cap the row
+                // is NOT resumed — it is left to age into the purge (8h from
+                // its last checkpoint), which deletes the row and releases the
+                // run-folder liveness hold so the existing sweep reclaims the
+                // folder (the cleanup backstop). Deliberately no checkpoint
+                // bump on cap: that would refresh updated_at and keep the row
+                // purge-immune forever (a capped cleanup is not worth an LLM
+                // round every boot).
+                if job.retry_count >= MAX_BOOT_REDISPATCH {
+                    warn!(
+                        job = %job.id,
+                        "Research cleanup job exceeded boot re-dispatch cap — left for the purge (run folder reclaimed by the sweep)",
+                    );
+                    continue;
+                }
+                let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
+                resumable.push(ResumableStage::ResearchCleanup {
+                    job_id: job.id.clone(),
+                    workspace_name: job.workspace_name.clone(),
                 });
                 resumed_other += 1;
             }
@@ -2274,6 +2338,275 @@ mod tests {
         let before = crate::turso::parse_utc_timestamp(&now).unwrap();
         let after = crate::turso::parse_utc_timestamp(&bumped).unwrap();
         assert!(after > before, "boot bump must refresh updated_at");
+    }
+
+    /// A research_cleanup row that already hit the boot re-dispatch cap must
+    /// NOT be resumed: the resume would spend one LLM round per boot, and the
+    /// checkpoint bump would keep the row purge-immune forever (updated_at
+    /// refreshed each boot), holding the run folder indefinitely. On cap the
+    /// row is left to age into the 8h purge, which releases the folder for
+    /// the sweep (the documented cleanup backstop).
+    #[tokio::test]
+    #[serial_test::serial(reset_inflight)] // recover_from_restart resets the shared global board
+    async fn recover_from_restart_caps_research_cleanup_leaves_for_purge() {
+        // Router init: recover_from_restart replays pending_jobs, which can
+        // route envelopes (panic if ROUTER is uninitialized).
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        let now = crate::turso::now();
+        conn.execute(
+            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, retry_count, \
+             created_at, updated_at) \
+             VALUES ('jclean', 'research_cleanup', 'launched', '', 'ws_scan', 'sanitation', ?1, ?2, ?2)",
+            params![MAX_BOOT_REDISPATCH, now.clone()],
+        )
+        .await
+        .unwrap();
+        let resumable = recover_from_restart().await.unwrap();
+        assert!(
+            !resumable.iter().any(|r| matches!(
+                r,
+                ResumableStage::ResearchCleanup { job_id, .. } if job_id.as_str() == "jclean"
+            )),
+            "capped cleanup must NOT be selected for resume (left for the purge)"
+        );
+        let updated: String = conn
+            .query_row("SELECT updated_at FROM jobs WHERE id = 'jclean'", (), |r| {
+                r.get::<String>(0)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            updated, now,
+            "capped cleanup must not be checkpointed — updated_at unchanged so the 8h purge can reclaim the row"
+        );
+    }
+
+    /// Crash-window replay scan: a pending research-completion envelope whose
+    /// run already HAS a `research_cleanup` jobs row (crash mid-cleanup) must
+    /// not be re-dispatched — the existing row is the dedup marker and the
+    /// `research_cleanup` boot-scan arm resumes it. The envelope itself still
+    /// replays. This exercises the scan's workspace resolution + dedup path
+    /// without launching a live cleanup agent.
+    #[tokio::test]
+    #[serial_test::serial(reset_inflight)] // shared process-lifetime store rows
+    async fn replay_skips_cleanup_dispatch_when_cleanup_row_exists() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        crate::util::test::create_test_workspace("/tmp/test_ws_replay_cleanup", "ws_replay").await;
+        let now = crate::turso::now();
+        conn.execute(
+            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, retry_count, \
+             created_at, updated_at) \
+             VALUES ('rcln', 'research_cleanup', 'launched', '', 'ws_replay', 'sanitation', 0, ?1, ?1)",
+            params![now.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pending_jobs (id, target_agent_id, envelope, created_at) \
+             VALUES ('rcln', 'manager_ws_replay', ?1, ?2)",
+            params![
+                serde_json::to_string(&AgentJob {
+                    content: "<research-result>done</research-result>".to_string(),
+                    workspace_name: "ws_replay".to_string(),
+                    user_name: "u".to_string(),
+                    channel: "telegram".to_string(),
+                    kind: JobKind::ResearchResult,
+                    role: crate::Role::Manager,
+                    reply_target: None,
+                    pending_job_id: None,
+                })
+                .unwrap(),
+                now
+            ],
+        )
+        .await
+        .unwrap();
+        let replayed = replay_pending_jobs(conn).await.unwrap();
+        assert_eq!(replayed, 1, "the envelope itself is replayed");
+        let rows = conn
+            .query(
+                "SELECT COUNT(*) FROM jobs WHERE id = 'rcln' AND kind = 'research_cleanup'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].get::<i64>(0).unwrap(),
+            1,
+            "no duplicate cleanup dispatch — the existing row is the dedup marker"
+        );
+        let sessions = conn
+            .query(
+                "SELECT COUNT(*) FROM session_metadata WHERE agent_id = 'cleanup_rcln'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions[0].get::<i64>(0).unwrap(),
+            0,
+            "the scan must not spawn a second cleanup agent"
+        );
+        // Clean up the rows this test created (shared process-lifetime store —
+        // leftover rows would inflate other tests' replay counts).
+        conn.execute("DELETE FROM pending_jobs WHERE id = 'rcln'", ())
+            .await
+            .unwrap();
+        conn.execute("DELETE FROM jobs WHERE id = 'rcln'", ())
+            .await
+            .unwrap();
+    }
+
+    /// Crash-window replay → boot-scan resume, end to end: a pending
+    /// research-completion envelope with NO cleanup row (daemon died between
+    /// complete_durable_job and dispatch_research_cleanup). The replay must
+    /// create the row ONLY — the `research_cleanup` boot-scan arm (which runs
+    /// after the replay in recover_from_restart) must be the SOLE dispatcher,
+    /// selecting the just-created row for resume. Spawning the agent during
+    /// the replay would double-run the same `cleanup_{run_id}` id on this boot
+    /// (the scan arm would register it via AgentRegistry, replacing + canceling
+    /// the replay-spawned agent).
+    #[tokio::test]
+    #[serial_test::serial(reset_inflight)] // recover_from_restart resets the shared global board
+    async fn replay_creates_cleanup_row_then_scan_resumes() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        crate::util::test::create_test_workspace("/tmp/test_ws_replay_resume", "ws_replay2").await;
+        let now = crate::turso::now();
+        conn.execute(
+            "INSERT INTO pending_jobs (id, target_agent_id, envelope, created_at) \
+             VALUES ('rcln2', 'manager_ws_replay2', ?1, ?2)",
+            params![
+                serde_json::to_string(&AgentJob {
+                    content: "<research-result>done</research-result>".to_string(),
+                    workspace_name: "ws_replay2".to_string(),
+                    user_name: "u".to_string(),
+                    channel: "telegram".to_string(),
+                    kind: JobKind::ResearchResult,
+                    role: crate::Role::Manager,
+                    reply_target: None,
+                    pending_job_id: None,
+                })
+                .unwrap(),
+                now
+            ],
+        )
+        .await
+        .unwrap();
+        let resumable = recover_from_restart().await.unwrap();
+        // (a) The replay created the row (dedup marker + sweep-liveness hold).
+        assert!(
+            crate::research_cleanup::research_cleanup_row_exists(conn, "rcln2")
+                .await
+                .unwrap(),
+            "the crash-window replay must create the cleanup row"
+        );
+        // (b) The boot-scan arm selected the row for resume (sole dispatcher).
+        assert!(
+            resumable.iter().any(|r| matches!(
+                r,
+                ResumableStage::ResearchCleanup { job_id, .. } if job_id.as_str() == "rcln2"
+            )),
+            "the boot-scan arm must resume the replay-created cleanup row"
+        );
+        // (c) No cleanup agent was spawned by the replay itself (the resume
+        // path in management.rs runs the agent — a spawn here would be the
+        // double-dispatch the design forbids).
+        let sessions = conn
+            .query(
+                "SELECT COUNT(*) FROM session_metadata WHERE agent_id = 'cleanup_rcln2'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions[0].get::<i64>(0).unwrap(),
+            0,
+            "the replay must not spawn the cleanup agent — the boot-scan arm resumes it"
+        );
+        // Clean up the rows the test created (shared process-lifetime store —
+        // leftover rows would inflate other tests' replay counts).
+        conn.execute("DELETE FROM pending_jobs WHERE id = 'rcln2'", ())
+            .await
+            .unwrap();
+        conn.execute("DELETE FROM jobs WHERE id = 'rcln2'", ())
+            .await
+            .unwrap();
+    }
+
+    /// Cleanup-completed-but-envelope-undelivered dedup: a pending
+    /// research-completion envelope whose run ALREADY has an archived cleanup
+    /// report (cleanup ran to completion in a previous lifetime; the row was
+    /// terminalized) must NOT re-dispatch — the archive is the durable
+    /// completed marker, and re-dispatching would cost one LLM round per boot
+    /// until the 7-day pending cap. The envelope itself still replays.
+    #[tokio::test]
+    #[serial_test::serial(reset_inflight)] // shared process-lifetime store rows
+    async fn replay_skips_cleanup_dispatch_when_report_archived() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        crate::util::test::create_test_workspace("/tmp/test_ws_replay_archived", "ws_replay3")
+            .await;
+        let now = crate::turso::now();
+        // Archive a completed cleanup report for this run (what a finished
+        // cleanup leaves in the durable archive).
+        crate::research_cleanup::write_cleanup_report("rcln3", "question?", "removed 2 files")
+            .await;
+        conn.execute(
+            "INSERT INTO pending_jobs (id, target_agent_id, envelope, created_at) \
+             VALUES ('rcln3', 'manager_ws_replay3', ?1, ?2)",
+            params![
+                serde_json::to_string(&AgentJob {
+                    content: "<research-result>done</research-result>".to_string(),
+                    workspace_name: "ws_replay3".to_string(),
+                    user_name: "u".to_string(),
+                    channel: "telegram".to_string(),
+                    kind: JobKind::ResearchResult,
+                    role: crate::Role::Manager,
+                    reply_target: None,
+                    pending_job_id: None,
+                })
+                .unwrap(),
+                now
+            ],
+        )
+        .await
+        .unwrap();
+        let replayed = replay_pending_jobs(conn).await.unwrap();
+        assert_eq!(replayed, 1, "the envelope itself is replayed");
+        assert!(
+            !crate::research_cleanup::research_cleanup_row_exists(conn, "rcln3")
+                .await
+                .unwrap(),
+            "an archived cleanup report means the cleanup completed — no re-dispatch"
+        );
+        let sessions = conn
+            .query(
+                "SELECT COUNT(*) FROM session_metadata WHERE agent_id = 'cleanup_rcln3'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions[0].get::<i64>(0).unwrap(),
+            0,
+            "no cleanup agent for a completed cleanup"
+        );
+        // Clean up the rows the test created (shared process-lifetime store —
+        // leftover rows would inflate other tests' replay counts).
+        conn.execute("DELETE FROM pending_jobs WHERE id = 'rcln3'", ())
+            .await
+            .unwrap();
+        // Remove the archived results.md created for this test run.
+        let _ = tokio::fs::remove_file(
+            crate::config::CONFIG
+                .try_storage_root()
+                .map(|r| r.join("research").join("results").join("rcln3.md"))
+                .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent")),
+        )
+        .await;
     }
 
     /// Boot classification: launched jobs whose ticket left the

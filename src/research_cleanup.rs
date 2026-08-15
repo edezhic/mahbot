@@ -1,6 +1,6 @@
-//! Research-run cleanup: per-run temp folders, results archive, the cleaner
-//! ticket (sanitizer report), and the periodic sweeps (run roots + artist
-//! generated/uploads keep-detection).
+//! Research-run cleanup: per-run temp folders, results archive, the raw
+//! shell-command dump, the Sanitation-agent cleanup dispatch, and the periodic
+//! sweeps (run roots + artist generated/uploads keep-detection).
 //!
 //! ## Run roots
 //!
@@ -19,18 +19,21 @@
 //! session mentions (keep-detection is strictly session-based — solution 1).
 //! Both fold their deletion counts into the cleanup loop's `Result<u64>`.
 //!
-//! ## Cleaner ticket
+//! ## Command dump + Sanitation cleanup
 //!
-//! At terminalization the run's accumulated shell commands are filtered to
-//! outside-zone write-intent commands (everything outside the per-run folder,
-//! including OS-temp scratch) and reported as ONE Backlog ticket
-//! (`reporter = "cleaner"`, title marked `[cleanup {run_id}] ...` — dedup key).
+//! At terminalization the run's accumulated raw shell commands (UNFILTERED —
+//! no zone classification; attribution is the cleanup agent's job) are written
+//! as a command dump file INSIDE the run's per-run folder. The dump dies with
+//! the folder when the sweep reclaims it (the failure backstop). At the same
+//! time a Sanitation-role agent is dispatched with a dedicated task prompt
+//! (see `src/prompt/research/cleanup.md`) to clean artifacts attributable to
+//! the run. Its run is recorded as a durable `research_cleanup` jobs row (the
+//! run-root sweep's jobs-row liveness holds the folder alive during the run),
+//! and its report is archived into results.md + the run folder.
 
 use crate::Workspace;
-use crate::board::{TicketParams, TicketPhase};
 use crate::config;
 use crate::turso::{self, params};
-use crate::util::scrub_credentials;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -44,11 +47,11 @@ const RUN_ROOT_GRACE: Duration = Duration::from_hours(1);
 /// Hard cap on how long an undelivered pending_jobs envelope keeps a run
 /// folder: a stuck envelope cannot hold the folder forever.
 const PENDING_GUARD_CAP: Duration = Duration::from_hours(7 * 24);
-/// Cleaner-ticket description cap (bytes). Over-long reports are truncated
-/// with an explicit marker so the ticket body never swallows the Manager's
-/// rendering budget.
-const CLEANER_TICKET_DESC_CAP: usize = 32 * 1024;
-const CLEANER_TRUNCATION_MARKER: &str = "... [обрезано]";
+/// Command-dump cap (bytes, soft — newest-wins): the raw unfiltered shell
+/// command history of a run, written at terminalization inside the run folder.
+/// The dump is intent for the Sanitation cleanup agent, not a report body, so
+/// it can be much larger than the old 32 KiB cleaner-ticket cap.
+pub(crate) const COMMAND_DUMP_CAP_BYTES: usize = 10 * 1024 * 1024;
 /// Per-tick artist-session scan budget (bytes of session content). Typical
 /// bases (~3 MB) fit in one tick; pathological growth is cut across ticks.
 const MEDIA_SCAN_BUDGET_BYTES: usize = 10 * 1024 * 1024;
@@ -57,11 +60,9 @@ const MEDIA_VIDEO_EXTS: &[&str] = &[".mp4", ".mov", ".webm", ".mkv", ".avi", ".m
 
 // ── Run-root helpers ──────────────────────────────────────────────────────
 
-/// Base directory holding all per-run folders. Deliberately under the daemon's
-/// `temp_dir()` — the readonly-shell validator only permits scratch writes
-/// under the OS temp roots (a `$TMPDIR`-relative path would land elsewhere:
-/// the shell's TMPDIR is `/tmp` while the daemon's temp_dir() is
-/// `/var/folders/...` on macOS).
+/// Base directory holding all per-run folders. Under the daemon's private temp
+/// root (after the TMPDIR pin, `temp_dir()` IS the root) — inside the
+/// readonly-shell's allowed temp roots, so analysts can write scratch there.
 #[must_use]
 pub(crate) fn research_root_base() -> PathBuf {
     std::env::temp_dir().join("mahbot-research")
@@ -74,10 +75,9 @@ pub(crate) fn run_root_path(job_id: &str) -> PathBuf {
 }
 
 /// Create the per-run folder (idempotent — never delete+recreate: a boot
-/// resume must keep whatever survived). Returns the CANONICAL absolute path:
-/// on macOS `temp_dir()` is `/var/folders/...` which resolves to
-/// `/private/var/folders/...` — the zone filter must compare against the same
-/// form the shell/coder workspace sees (the workspace path is canonicalized).
+/// resume must keep whatever survived). Returns the CANONICAL absolute path
+/// (the workspace path is canonicalized, and the Sanitation agent compares
+/// paths against the same canonical form).
 pub(crate) async fn ensure_run_root(job_id: &str) -> PathBuf {
     let path = run_root_path(job_id);
     if let Err(e) = tokio::fs::create_dir_all(&path).await {
@@ -131,7 +131,7 @@ pub(crate) async fn write_results_md(job_id: &str, question: &str, result: &str)
     }
 }
 
-// ── Sanitizer: shell-command collection ───────────────────────────────────
+// ── Raw shell-command capture ────────────────────────────────────────────
 
 /// Extract every shell tool-call command from a session history. The canonical
 /// [`decode_native_history_message`](crate::session::decode_native_history_message)
@@ -168,15 +168,20 @@ fn commands_from_history(history: &[crate::ChatMessage]) -> Vec<String> {
     out
 }
 
-/// Collect outside-zone shell commands from the persisted sessions of the given
-/// agents (incremental stage collection — early sessions of long runs are
-/// TTL'd, so the research orchestrator collects right after each round). The
-/// zone filter is applied HERE — at capture time — so in-zone commands never
-/// bloat the checkpointed state blob (they can never appear in a report).
-pub(crate) async fn collect_agent_shell_commands(
-    agent_ids: &[String],
-    run_root: &Path,
-) -> Vec<String> {
+/// Collect ALL shell commands from the persisted sessions of the given agents
+/// (incremental stage collection — early sessions of long runs are TTL'd, so
+/// the research orchestrator collects right after each round). UNFILTERED:
+/// no zone classification, no write-intent patterns — the raw history IS the
+/// dump; attribution is the Sanitation cleanup agent's job (filesystem
+/// enumeration as fact + this dump as intent).
+///
+/// Credentials are scrubbed AT COLLECTION (not only at dump-write): the
+/// in-memory `commands`/`seen_commands` must match the scrubbed dump form, or
+/// a credential-bearing command re-collected after a crash-resume would be
+/// treated as distinct from its scrubbed dump form and both variants would
+/// accumulate. Multi-line commands don't round-trip through the line-oriented
+/// dump (a documented minor fidelity loss — the cap bounds the growth).
+pub(crate) async fn collect_agent_shell_commands(agent_ids: &[String]) -> Vec<String> {
     let store = crate::session::store();
     let mut out = Vec::new();
     for id in agent_ids {
@@ -184,407 +189,455 @@ pub(crate) async fn collect_agent_shell_commands(
         out.extend(
             commands_from_history(&history)
                 .into_iter()
-                .filter(|c| is_outside_zone_write(c, run_root)),
+                .map(|c| crate::util::scrub_credentials(&c)),
         );
     }
     out
 }
 
-/// Write-intent command with ANY extractable target outside the per-run
-/// folder. Unattributable/relative targets count as IN-zone: the coder's
-/// relative writes (`cat > script.py` with cwd = run_root) must never land in
-/// the report — reporting them inverts the accepted false-negative direction
-/// into systematic noise. `> /dev/null` is not a write. In-zone writes (target
-/// under the run root, raw or canonical form) are dropped. ALL cleanable
-/// targets are checked: a shell truncates every redirect target, not just the
-/// last — `cat > /tmp/a > {run_root}/b` truncates the outside /tmp/a even
-/// though stdout lands in-zone, and `cmd1 > /tmp/out && cmd2 > {run_root}/in`
-/// writes both. Reporting on any-outside is the safe (over-report) direction.
-fn is_outside_zone_write(cmd: &str, run_root: &Path) -> bool {
-    is_write_intent_command(cmd)
-        && write_targets(cmd)
-            .into_iter()
-            .any(|t| t != "/dev/null" && !target_in_zone(&t, run_root))
-}
-
-/// Lexically resolve `.`/`..` path components (no fs access). `Path::starts_with`
-/// compares raw components, so `{run_root}/../escape/f.txt` would otherwise
-/// short-circuit the zone check as in-zone. A leading-`..` absolute path
-/// (`/../etc/x`) stays ABSOLUTE — `PathBuf::pop()` on the root is a no-op — and
-/// normalizes to `/etc/x`, which the zone check classifies outside-zone
-/// (over-report, safe direction).
-fn normalize_lexical(p: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
-
-/// True when the write target lies under the run root. Compares BOTH the raw
-/// and the canonicalized form of the target: on macOS `/var` → `/private/var`,
-/// so a coder writing the non-canonical form of the run root (`/var/folders/…`)
-/// must not read as outside-zone (false-positive cleaner ticket). The target
-/// may not exist yet (it is being written) — canonicalize the nearest existing
-/// ancestor and re-join the remainder. Runs on the blocking pool: the capture
-/// path is async and `canonicalize` is a blocking syscall.
-///
-/// Accepted residual: a SYMLINK inside the run root pointing outside escapes
-/// the raw fast-path below (the lexical prefix check treats it as in-zone, and
-/// the canonicalize walk only runs for the non-prefix case). Resolving every
-/// in-zone symlink would require per-target lstat walks — a false-negative
-/// (missed outside write) within the accepted heuristic class, safe direction.
-fn target_in_zone(target: &str, run_root: &Path) -> bool {
-    crate::util::with_block_in_place(|| {
-        let target = normalize_lexical(Path::new(target));
-        if target.starts_with(run_root) {
-            return true;
-        }
-        // Canonicalize the longest existing prefix of the target (the file
-        // itself usually does not exist yet) and compare that form against
-        // the run root.
-        let mut suffix: Vec<std::ffi::OsString> = Vec::new();
-        let mut cur = target.as_path();
-        loop {
-            if let Ok(canon) = std::fs::canonicalize(cur) {
-                let mut joined = canon;
-                for s in suffix.iter().rev() {
-                    joined.push(s);
-                }
-                return joined.starts_with(run_root);
-            }
-            let Some(name) = cur.file_name().map(std::ffi::OsStr::to_os_string) else {
-                return false;
-            };
-            suffix.push(name);
-            let Some(parent) = cur.parent() else {
-                return false;
-            };
-            cur = parent;
-        }
-    })
-}
-
-// ── Sanitizer: write-intent + zone filtering ──────────────────────────────
-
-/// Conservative write-intent patterns. False positives are kept in the report
-/// (over-keep is the safe direction); relative-path writes without cwd
-/// attribution are the accepted false-negative.
-const WRITE_INTENT_PATTERNS: &[&str] = &[
-    "cat >", "cat >>", "tee ", "cp ", "mv ", "mkdir ", "touch ", "install ", "curl -o", "curl -O",
-    "wget ", "wget -O", "scp ", "unzip ", "tar -x", "tar x", "<<", ">>", "printf >", "echo >",
-    "> /", "> ~", "> $",
-];
-
-fn is_write_intent_command(cmd: &str) -> bool {
-    WRITE_INTENT_PATTERNS.iter().any(|p| cmd.contains(p))
-}
-
-/// First non-flag token after `pos` — operands of a verb with leading flags.
-fn first_non_flag_after<'a>(toks: &[&'a str], pos: usize) -> Option<&'a str> {
-    toks[pos + 1..]
-        .iter()
-        .copied()
-        .find(|t| !t.starts_with('-'))
-}
-
-/// Best-effort extraction of ALL write targets (absolute paths only).
-/// Relative targets cannot be attributed without the shell cwd — skipped
-/// (accepted false-negative). Verb targets (tee/cp/mv/install/mkdir/touch/
-/// tar/unzip/curl/wget) are collected alongside redirects: a shell truncates
-/// every redirect target, so `cat > /tmp/a > {run_root}/b` writes BOTH files
-/// and an in-zone verb target must not mask an outside redirect (or vice
-/// versa). The caller applies the zone filter per target.
-///
-/// The all-targets guarantee is scoped to REDIRECTS: the verb blocks use
-/// `position()` (first verb occurrence) and read operands to the end of the
-/// command, so a verb-to-verb chain (`cp A /tmp/out && cp C {run_root}/in`)
-/// reports only the last operand — accepted heuristic class (the same masking
-/// closed for redirects remains for verb chains; chained commands are rare in
-/// sanitizer-relevant history).
-///
-/// FROZEN heuristic — do not extend: every shell-grammar edge case added here
-/// costs a review round, and the design scoped this as a conservative pattern
-/// check with accepted false-negatives. Known residuals kept intentionally:
-/// cwd-relative paths, `install -t` flag destinations, `grep -o/-O` over-report
-/// noise, `&>` combined redirects, and verb-to-verb chains.
-fn write_targets(cmd: &str) -> Vec<String> {
-    let toks: Vec<&str> = cmd.split_whitespace().collect();
-    let mut out = Vec::new();
-    // Redirect forms (`> TARGET`, `>> TARGET`, `2> TARGET`, `2>> TARGET`) —
-    // skip fd redirects (`2>&1`, `&>`, `>&`) and `/dev/null` (NOT a write — a
-    // real write suffixed with `> /dev/null 2>&1`, the common silent-download
-    // pattern, must report the real target, not /dev/null). Relative targets
-    // yield None — keep scanning: an earlier relative redirect must not mask a
-    // later absolute one (`echo hi > b > /tmp/x` reports /tmp/x).
-    for (i, t) in toks.iter().enumerate() {
-        if (*t == ">" || *t == ">>" || *t == "2>" || *t == "2>>")
-            && !toks.get(i + 1).is_some_and(|n| n.starts_with('&'))
-            && let Some(t) = toks.get(i + 1)
-            && let Some(target) = clean_target(t)
-            && target != "/dev/null"
-        {
-            out.push(target);
-        }
-        if *t == "cat>"
-            && let Some(t) = toks.get(i + 1)
-            && let Some(target) = clean_target(t)
-            && target != "/dev/null"
-        {
-            out.push(target);
-        }
-        if let Some(rest) = t.strip_prefix("cat>")
-            && let Some(target) = clean_target(rest)
-            && target != "/dev/null"
-        {
-            out.push(target);
-        }
-    }
-    // `tee TARGET` — first non-flag argument.
-    if let Some(pos) = toks.iter().position(|t| *t == "tee")
-        && let Some(t) = first_non_flag_after(&toks, pos)
-        && let Some(target) = clean_target(t)
-    {
-        out.push(target);
-    }
-    // `cp/mv/install SRC... DST` — the destination is the LAST non-flag
-    // operand (flags like `-r`/`-f`/`-m MODE`/`--preserve` precede them;
-    // option VALUES like `-m 644` are non-flag tokens but never last).
-    // Operands stop at the first redirect (`cp a b > /dev/null` must not
-    // treat `/dev/null` as a cp destination).
-    for verb in ["cp", "mv", "install"] {
-        if let Some(pos) = toks.iter().position(|t| *t == verb) {
-            let operands: Vec<&str> = toks[pos + 1..]
-                .iter()
-                .copied()
-                .take_while(|t| !t.contains('>'))
-                .filter(|t| !t.starts_with('-'))
-                .collect();
-            if let Some(t) = operands.last()
-                && let Some(target) = clean_target(t)
-            {
-                out.push(target);
-            }
-        }
-    }
-    // `mkdir TARGET` / `touch TARGET` — first non-flag argument.
-    for verb in ["mkdir", "touch"] {
-        if let Some(pos) = toks.iter().position(|t| *t == verb)
-            && let Some(t) = first_non_flag_after(&toks, pos)
-            && let Some(target) = clean_target(t)
-        {
-            out.push(target);
-        }
-    }
-    // `tar -x ... (-C|--directory) TARGET` — extraction directory.
-    if let Some(pos) = toks.iter().position(|t| *t == "tar") {
-        if let Some(dir) = toks[pos + 1..]
-            .iter()
-            .find_map(|t| t.strip_prefix("--directory="))
-            && let Some(target) = clean_target(dir)
-        {
-            out.push(target);
-        }
-        if let Some(cpos) = toks[pos + 1..].iter().position(|t| *t == "-C")
-            && let Some(t) = toks.get(pos + 1 + cpos + 1)
-            && let Some(target) = clean_target(t)
-        {
-            out.push(target);
-        }
-    }
-    // `unzip ARCHIVE -d TARGET`.
-    if let Some(pos) = toks.iter().position(|t| *t == "unzip")
-        && let Some(dpos) = toks[pos + 1..].iter().position(|t| *t == "-d")
-        && let Some(t) = toks.get(pos + 1 + dpos + 1)
-        && let Some(target) = clean_target(t)
-    {
-        out.push(target);
-    }
-    // `curl -o TARGET` / `wget -O TARGET`.
-    if let Some(pos) = toks.iter().position(|t| *t == "-o" || *t == "-O")
-        && let Some(t) = toks.get(pos + 1)
-        && let Some(target) = clean_target(t)
-    {
-        out.push(target);
-    }
-    out
-}
-
-fn clean_target(tok: &str) -> Option<String> {
-    // Trim BOTH leading and trailing quotes: `cat > "/tmp/x"` and
-    // `cat > "$TMPDIR/x"` (idiomatic double-quoted form) carry the quote
-    // through split_whitespace — a leading quote would read as relative.
-    let single_quoted = tok.starts_with('\'');
-    let cleaned = tok
-        .trim_start_matches(['\'', '"'])
-        .trim_end_matches([';', '|', '&', ')', '\'', '"']);
-    let expanded = crate::util::expand_tilde(cleaned);
-    // The session shell's TMPDIR is /tmp (a known constant — the daemon's
-    // temp_dir() differs on macOS) and $HOME is the daemon user's home;
-    // expand both so `$TMPDIR/x` resolves to the OS-temp category decision 6
-    // mandates reporting instead of escaping as an unattributable (in-zone)
-    // relative target. Braced and plain forms both resolve. Single-quoted
-    // tokens are shell LITERALS (`cat > '$TMPDIR/x'` names a literal
-    // `$TMPDIR/x`) — no expansion (an over-report of the OS-temp category);
-    // `$HOME` is only expanded when set (an empty HOME would resolve
-    // `$HOME/x` to `/x`, a false-positive root write).
-    let expanded = if single_quoted {
-        expanded.to_string_lossy().into_owned()
-    } else {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let home = if home.is_empty() { "$HOME" } else { &home };
-        expanded
-            .to_string_lossy()
-            .replace("${TMPDIR}", "/tmp")
-            .replace("$TMPDIR", "/tmp")
-            .replace("${HOME}", home)
-            .replace("$HOME", home)
-    };
-    let path = Path::new(&expanded);
-    path.is_absolute()
-        .then(|| path.to_string_lossy().to_string())
-}
-
-/// Escape backticks/newlines so a value renders inside the cleaner-ticket
-/// body (or title) without breaking the markdown list or injecting raw
-/// markdown — downstream pipeline agents read the body as task instructions.
-fn escape_md(s: &str) -> String {
-    s.replace('`', "\\`").replace('\n', "\\n")
-}
-
-/// Build the sanitizer report from PRE-FILTERED outside-zone write-intent
-/// commands (capture-time [`collect_agent_shell_commands`] is the single
-/// filter — re-applying it here would be a no-op second pass). `None` when
-/// nothing was captured — no ticket is created.
-fn build_cleanup_report(
-    job_id: &str,
-    ws_name: &str,
-    question: &str,
-    run_root: &Path,
-    commands: &[String],
-) -> Option<String> {
-    if commands.is_empty() {
-        return None;
-    }
-    let mut out = String::new();
-    let run_root_str = run_root.display();
-    // Same escaping as the command lines below: a multi-line/backtick-bearing
-    // question or workspace name would break the markdown list structure in a
-    // body that downstream pipeline agents read as task instructions (lower
-    // risk than commands — Manager-authored — but the same vector).
-    let ws_name_esc = escape_md(ws_name);
-    let question_esc = escape_md(question);
-    let _ = std::fmt::write(
-        &mut out,
-        format_args!(
-            "Research run {job_id} (workspace: {ws_name_esc}) left write-intent activity \
-             outside its per-run folder.\n\nQuestion: {question_esc}\n\nPer-run folder: \
-             {run_root_str}\n\nOutside-zone write-intent commands (scrubbed, newest first):\n"
-        ),
-    );
-    // Newest first: the ticket body truncates the BEGINNING of the rendered
-    // report (truncate_bytes + marker), so the newest evidence must be at the
-    // top — a truncated ticket must never show the oldest surviving commands
-    // while dropping the most recent (the state blob keeps newest too).
-    // Escaping: backticks/newlines from multi-line heredoc commands would
-    // otherwise break the markdown list and inject raw markdown into a ticket
-    // body that downstream pipeline agents read as task instructions
-    // (credentials are scrubbed first, the container is not).
+/// Deduplicate while preserving order, keeping the LAST occurrence of each
+/// command (newest wins when a command repeats across rounds).
+fn dedup_newest_wins(commands: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::with_capacity(commands.len());
+    let mut out = Vec::with_capacity(commands.len());
     for cmd in commands.iter().rev() {
-        let escaped = escape_md(&scrub_credentials(cmd));
-        let _ = std::fmt::write(&mut out, format_args!("- `{escaped}`\n"));
+        if seen.insert(cmd.clone()) {
+            out.push(cmd.clone());
+        }
     }
-    let _ = std::fmt::write(
-        &mut out,
-        format_args!(
-            "\nNote: everything outside the per-run folder counts — including OS-temp \
-             scratch. The per-run folder itself is swept separately after the delivery \
-             grace; this ticket covers only the outside-zone writes above.\n"
-        ),
-    );
-    Some(out)
+    out.reverse();
+    out
 }
 
-// ── Cleaner ticket ────────────────────────────────────────────────────────
+/// Cap a command list to [`COMMAND_DUMP_CAP_BYTES`], newest wins (drop the
+/// oldest commands). A single command larger than the cap is dropped ON ITS
+/// OWN — it could never fit the dump, and dropping the older fitting commands
+/// for it would lose the only evidence that could be reported.
+///
+/// THE canonical cap helper: `ResearchState::capture_round` (in-memory bound)
+/// and `write_command_dump` (file bound) both call it, so the drop order can
+/// never diverge between the two surfaces.
+pub(crate) fn cap_command_dump(commands: &mut Vec<String>, cap: usize) {
+    // Drop oversized commands wherever they are (they can never fit), keeping
+    // the rest in order.
+    commands.retain(|c| c.len() <= cap);
+    let mut total: usize = commands.iter().map(String::len).sum();
+    let mut drop = 0usize;
+    while drop < commands.len() && total > cap {
+        total -= commands[drop].len();
+        drop += 1;
+    }
+    if drop > 0 {
+        commands.drain(..drop);
+    }
+}
 
-/// Create ONE Backlog ticket per research run when the sanitizer found
-/// outside-zone writes. Deduped by the `[cleanup {run_id}]` title marker so a
-/// crash between ticket creation and terminalization cannot double-create.
-/// Board store uninitialized → skip with a log (same as purge).
-pub(crate) async fn maybe_create_cleaner_ticket(
+/// Write the raw command dump file INSIDE the run's per-run folder. Scrubbed
+/// of credentials (the dump is fed to the Sanitation agent as context).
+/// Newest-wins, capped at [`COMMAND_DUMP_CAP_BYTES`].
+pub(crate) async fn write_command_dump(run_root: &Path, commands: &[String]) {
+    let path = run_root.join("commands.dump");
+    let mut deduped = dedup_newest_wins(commands);
+    cap_command_dump(&mut deduped, COMMAND_DUMP_CAP_BYTES);
+    let mut content = String::new();
+    for cmd in &deduped {
+        let _ = std::fmt::write(
+            &mut content,
+            format_args!("{}\n", crate::util::scrub_credentials(cmd)),
+        );
+    }
+    if let Err(e) = tokio::fs::write(&path, content).await {
+        tracing::warn!(error = %e, "Failed to write command dump — cleanup intent degraded");
+    }
+}
+
+/// Read the command dump file back from the run folder. Crash-resume hook:
+/// `ResearchState.commands` is serde-skip so it loads empty after a crash;
+/// re-seeding from this file means the first post-resume capture MERGES the
+/// pre-crash history instead of overwriting it (early-round sessions are
+/// already TTL'd — the dump is the only surviving capture). Missing/unreadable
+/// dump → empty (fresh run or OS-swept folder — fail-open).
+pub(crate) async fn read_command_dump(run_root: &Path) -> Vec<String> {
+    let path = run_root.join("commands.dump");
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => content.lines().map(str::to_string).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+// ── Sanitation cleanup dispatch ──────────────────────────────────────────
+
+/// Dedicated task prompt for the research-cleanup Sanitation agent.
+const CLEANUP_PROMPT_KEY: &str = "research/cleanup.md";
+
+/// Build the cleanup task prompt: run id, per-run folder path, command dump
+/// path, workspace. The boundaries (never touch other runs' folders, the
+/// workspace repo, the live service, or other agents' active files; when in
+/// doubt, leave it) live in the prompt asset.
+pub(crate) fn build_cleanup_prompt(
     job_id: &str,
+    run_root: &Path,
+    dump_path: &Path,
     ws: &Workspace,
-    question: &str,
-    commands: &[String],
-) -> Result<()> {
-    let Some(board) = crate::board::BOARD.get() else {
-        tracing::info!(job = %job_id, "Cleaner ticket skipped — board store not initialized");
-        return Ok(());
-    };
-    let run_root = tokio::fs::canonicalize(run_root_path(job_id))
-        .await
-        .unwrap_or_else(|_| run_root_path(job_id));
-    let Some(report) = build_cleanup_report(job_id, &ws.name, question, &run_root, commands) else {
-        tracing::info!(job = %job_id, "No outside-zone writes — no cleaner ticket");
-        return Ok(());
-    };
+) -> String {
+    crate::prompt::substitute(
+        &crate::prompt::load_prompt(CLEANUP_PROMPT_KEY),
+        &[
+            ("{{run_id}}", job_id),
+            ("{{run_folder}}", &run_root.to_string_lossy()),
+            ("{{dump_path}}", &dump_path.to_string_lossy()),
+            ("{{workspace}}", &ws.name),
+        ],
+    )
+}
 
-    let marker = format!("[cleanup {job_id}]");
-    let terminal = crate::board::TERMINAL_PHASES
-        .iter()
-        .map(|p| format!("'{}'", p.as_ref()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    // `instr` = literal substring match — a `LIKE '%...%'` would treat the `_`
-    // in a NanoID job_id as a single-char wildcard and could false-match a
-    // different run's ticket.
-    let dup = board
-        .conn
+/// Dedup marker / liveness-hold query: does a `research_cleanup` jobs row for
+/// this run exist? Shared by the dispatch dedup, the boot-replay crash-window
+/// hook, and tests (which pre-create the row to assert dedup without running
+/// the agent).
+pub(crate) async fn research_cleanup_row_exists(
+    conn: &crate::turso::Connection,
+    job_id: &str,
+) -> Result<bool> {
+    Ok(conn
         .query_optional(
-            &format!(
-                "SELECT 1 FROM tickets WHERE instr(title, ?1) > 0 AND is_archived = 0 \
-                 AND phase NOT IN ({terminal}) LIMIT 1"
-            ),
-            params![marker.clone()],
+            "SELECT 1 FROM jobs WHERE id = ?1 AND kind = 'research_cleanup'",
+            params![job_id],
             |_| Ok::<(), anyhow::Error>(()),
         )
         .await?
-        .is_some();
-    if dup {
-        tracing::info!(job = %job_id, "Cleaner ticket already open — skipping");
-        return Ok(());
+        .is_some())
+}
+
+/// Boot-replay crash-window hook: a pending research-completion envelope with
+/// NO `research_cleanup` jobs row AND no archived cleanup report means the
+/// daemon crashed between `complete_durable_job` and `dispatch_research_cleanup`
+/// — the cleanup agent was never dispatched. Creates the durable row ONLY (the
+/// dedup marker + sweep-liveness hold); the `research_cleanup` boot-scan arm —
+/// which runs AFTER the envelope replay in `recover_from_restart` — is the SOLE
+/// dispatcher for the actual agent (it sees the just-created row and resumes
+/// it, and `resume_research_cleanup` runs + terminalizes exactly like a fresh
+/// dispatch). Spawning the agent here would DOUBLE-run the same
+/// `cleanup_{run_id}` agent on this boot: the scan arm would register the same
+/// id via AgentRegistry, REPLACING and CANCELING this dispatch.
+///
+/// A missing row with an ARCHIVED cleanup report (results.md contains the
+/// "## Cleanup report" section) means the cleanup COMPLETED in a previous
+/// lifetime while the envelope stayed undelivered (dead target session;
+/// envelopes are never purged) — re-dispatching would be a duplicate LLM round
+/// every boot. The archive is the durable completed marker.
+///
+/// Called from `recover_from_restart`'s pending-envelope replay, BEFORE the
+/// envelope is routed. The research question is recovered from the archived
+/// results.md when possible (the research jobs row was CASCADE-deleted at
+/// completion; the archive already holds the question — `write_cleanup_report`
+/// appends on that path and the question is only used by the standalone-archive
+/// fallback).
+pub(crate) async fn dispatch_cleanup_for_pending_envelope(
+    job_id: &str,
+    envelope: &crate::message_router::AgentJob,
+) {
+    let Ok(Some(ws)) = crate::workspace::store()
+        .get_by_name(&envelope.workspace_name)
+        .await
+    else {
+        tracing::warn!(
+            job = %job_id,
+            workspace = %envelope.workspace_name,
+            "Cleanup dispatch for pending envelope: workspace unresolvable — run folder reclaimed by the sweep"
+        );
+        return;
+    };
+    if cleanup_report_archived(job_id).await {
+        tracing::debug!(
+            job = %job_id,
+            "Cleanup report already archived — cleanup completed in a previous lifetime; envelope replay only"
+        );
+        return;
+    }
+    // Recover the research question from the archived results.md (empty
+    // fallback only when the archive is missing — spawn-failure path).
+    let question = read_archived_question(job_id).await.unwrap_or_default();
+    if let Err(e) = create_cleanup_job_row(job_id, &ws, &question).await {
+        tracing::warn!(job = %job_id, error = %e, "Cleanup row creation for pending envelope failed");
+    }
+}
+
+/// The cleanup Sanitation agent id for a run. Single builder — the
+/// transient-prefix invariant test in session/mod.rs asserts against it, so a
+/// format change is caught by tests instead of silently leaking sessions.
+#[must_use]
+pub(crate) fn cleanup_agent_id(job_id: &str) -> String {
+    format!("cleanup_{job_id}")
+}
+
+/// Does the ARCHIVED results.md for a run already contain a cleanup report?
+/// The durable "cleanup completed" marker: `write_cleanup_report` appends the
+/// "## Cleanup report" section to `<storage_root>/research/results/{run_id}.md`
+/// at the END of every cleanup agent run (success AND failure — a failed
+/// cleanup is still terminal; the sweep/purge is its backstop, per the
+/// ticket). The run-folder copy dies with the sweep, so the archive is the
+/// only check that survives folder reclamation.
+async fn cleanup_report_archived(job_id: &str) -> bool {
+    let Some(root) = config::CONFIG
+        .try_storage_root()
+        .or_else(|| config::default_config_dir().ok())
+    else {
+        return false;
+    };
+    let path = root
+        .join("research")
+        .join("results")
+        .join(format!("{job_id}.md"));
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => content.contains("## Cleanup report"),
+        Err(_) => false,
+    }
+}
+
+/// Read the research question back from the archived results.md
+/// (`write_results_md` writes `## Question\n\n{question}\n\n## Result`).
+/// Crash-replay hook: the research jobs row is gone at completion, but the
+/// archive survives — reusing it keeps the persisted question.txt (and the
+/// crash-resumed cleanup's standalone-archive fallback) accurate.
+async fn read_archived_question(job_id: &str) -> Option<String> {
+    let root = config::CONFIG
+        .try_storage_root()
+        .or_else(|| config::default_config_dir().ok())?;
+    let path = root
+        .join("research")
+        .join("results")
+        .join(format!("{job_id}.md"));
+    let content = tokio::fs::read_to_string(&path).await.ok()?;
+    let start = content.find("## Question\n\n")? + "## Question\n\n".len();
+    // The question is terminated by the next `## ` section — `## Result` on
+    // the results.md path, `## Cleanup report` on the standalone archive
+    // (spawn-failure) path.
+    let end = content[start..]
+        .find("\n\n## ")
+        .map_or(content.len(), |i| i + start);
+    let question = content[start..end].trim();
+    (!question.is_empty()).then(|| question.to_string())
+}
+
+/// Create the durable `research_cleanup` jobs row for a run (dedup marker +
+/// sweep-liveness hold). Shared by the fresh terminalization dispatch, the
+/// boot-replay crash-window hook, and tests. Returns `Ok(Some(prompt))` when
+/// the row was created (the caller spawns the agent with that prompt), or
+/// `Ok(None)` when the row already exists (deduped — the boot-scan arm resumes
+/// the surviving row). Idempotent.
+pub(crate) async fn create_cleanup_job_row(
+    job_id: &str,
+    ws: &Workspace,
+    question: &str,
+) -> Result<Option<String>> {
+    let conn = &crate::session::store().conn;
+    // Dedup via the jobs row.
+    if research_cleanup_row_exists(conn, job_id).await? {
+        tracing::info!(job = %job_id, "Research cleanup already dispatched — skipping");
+        return Ok(None);
     }
 
-    let mut description = report;
-    if description.len() > CLEANER_TICKET_DESC_CAP {
-        let keep = crate::util::truncate_bytes(&description, CLEANER_TICKET_DESC_CAP);
-        description = format!("{keep}{CLEANER_TRUNCATION_MARKER}");
-    }
-    let params = TicketParams {
-        // Workspace names are user-controlled — same escaping as the body.
-        title: format!("{marker} Research cleanup: {}", escape_md(&ws.name)),
-        description,
-        workspace_name: ws.name.clone(),
-        phase: TicketPhase::Backlog,
-        prerequisites: Vec::new(),
-        reporter: "cleaner".to_string(),
-        embedding: None,
-        priority: 1,
+    let run_root = ensure_run_root(job_id).await;
+    let dump_path = run_root.join("commands.dump");
+    let prompt = build_cleanup_prompt(job_id, &run_root, &dump_path, ws);
+
+    // Persist the research question for the boot-resume path: the cleanup
+    // jobs row's task is the agent PROMPT, not the question, and the archived
+    // results.md must show the question (the fresh dispatch's archive uses
+    // this same question; a crash-resumed cleanup re-reads it from the folder,
+    // which is held alive by the jobs row).
+    let _ = tokio::fs::write(run_root.join("question.txt"), question).await;
+
+    // Durable jobs row: id == run_id (folder name) → sweep liveness holds the
+    // folder for the duration of the cleanup run. The row also makes the
+    // cleanup boot-resumable (recover_from_restart arm for kind
+    // "research_cleanup") and its failure visible (jobs table status).
+    crate::jobs::spawn_job(
+        conn,
+        job_id,
+        &prompt,
+        &ws.name,
+        "",
+        "",
+        crate::Role::Sanitation,
+        &[crate::jobs::NewAgent {
+            agent_id: cleanup_agent_id(job_id),
+            kind: crate::jobs::AgentKind::Sanitation,
+            idx: None,
+            task: prompt.clone(),
+        }],
+        &crate::jobs::SpawnChild::ResearchCleanup,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(job = %job_id, error = %e, "Failed to spawn research cleanup job");
+        e
+    })?;
+    Ok(Some(prompt))
+}
+
+/// Dispatch the Sanitation-role cleanup agent for a terminalized research run.
+///
+/// Called at terminalization (all three terminalization points funnel through
+/// the terminalize_research / write_terminalization_artifacts tail). The
+/// cleanup runs FIRE-AND-FORGET (result delivery is never delayed); the run
+/// folder is held alive against the stale-run-folder sweep by the durable
+/// `research_cleanup` jobs row (the sweep keeps folders whose jobs.id ==
+/// folder name — the same liveness mechanism the research run itself used).
+///
+/// The sub-millisecond gap between `complete_durable_job` (which deletes the
+/// research jobs row) and this row's INSERT is covered twice: the pending
+/// envelope just inserted by the completion holds the folder via the sweep's
+/// pending guard, and the folder's mtime is fresh (terminalization wrote
+/// commands.dump moments ago) so RUN_ROOT_GRACE skips it. A failed-envelope
+/// INSERT (rare) leaves the freshness grace as the sole guard — degraded
+/// intent only (results.md is durably archived), matching the documented
+/// fail-open contract.
+///
+/// Dedup: the jobs row itself is the marker — if a `research_cleanup` row for
+/// this run already exists (a crash between dispatch and completion), no
+/// second agent is dispatched; the boot scan resumes the surviving row.
+///
+/// Delete capability: Role::Sanitation's standard toolset (Read / Search /
+/// Shell ReadOnly) already permits rm/mv/cp under the allowed temp roots —
+/// the readonly guard's TEMP_MUTATORS gate on the path, not the role. The
+/// cleanup agent therefore needs NO custom toolset.
+pub(crate) async fn dispatch_research_cleanup(
+    job_id: &str,
+    ws: &Workspace,
+    question: &str,
+) -> Result<()> {
+    let Some(prompt) = create_cleanup_job_row(job_id, ws, question).await? else {
+        return Ok(());
     };
-    let id = board.create_ticket(&params).await?;
-    tracing::info!(
-        job = %job_id,
-        ticket = %id,
-        "Cleaner ticket created — full pipeline re-entry (accepted LLM-cost multiplier)"
-    );
+
+    // Fire-and-forget: never block result delivery on the cleanup LLM round.
+    // Deliberately a raw tokio::spawn, NOT spawn_cancellable: the cleanup is
+    // not a background daemon task. NOTE: a raw spawn task does NOT survive
+    // process shutdown (it is dropped with the runtime) — the durability is
+    // the jobs row, which the boot scan resumes on the next start. The drain
+    // ignores unregistered agents; if the process dies mid-run the row is the
+    // resume point and the folder stays held.
+    let ws = ws.clone();
+    let job_id_log = job_id.to_string();
+    let agent_id = cleanup_agent_id(job_id);
+    let agent_id_log = agent_id.clone();
+    let job_id = job_id.to_string();
+    let question = question.to_string();
+    tokio::spawn(async move {
+        run_cleanup_agent_and_finish(&job_id, &ws, &prompt, &question, "Research cleanup FAILED")
+            .await;
+    });
+
+    tracing::info!(job = %job_id_log, agent = %agent_id_log, "Research cleanup dispatched");
     Ok(())
+}
+
+/// Run the cleanup agent and finish: archive the report (results.md + run
+/// folder copy) and release the liveness hold on EVERY exit path. The shared
+/// tail of the fresh dispatch and the boot-resume path — a divergence here
+/// would silently change one path's report/terminalize behavior.
+async fn run_cleanup_agent_and_finish(
+    job_id: &str,
+    ws: &Workspace,
+    prompt: &str,
+    question: &str,
+    failure_prefix: &str,
+) {
+    let agent_id = cleanup_agent_id(job_id);
+    let (agent, response) = crate::agent::run_default_agent(
+        &agent_id,
+        crate::Role::Sanitation,
+        ws,
+        prompt,
+        None,
+        Some(crate::registry::ParentKey::Research(job_id.to_string())),
+    )
+    .await;
+    // The report is the agent's final response: what was removed and what was
+    // left. On failure it becomes a visible failure signal.
+    let report = response.unwrap_or_else(|| {
+        format!(
+            "{failure_prefix} (job {job_id}): {}",
+            agent
+                .failure
+                .clone()
+                .unwrap_or_else(|| "no failure detail".to_string())
+        )
+    });
+    let run_root = tokio::fs::canonicalize(run_root_path(job_id))
+        .await
+        .unwrap_or_else(|_| run_root_path(job_id));
+    // Archive the report (results.md + run folder copy); the run-folder
+    // copy dies with the sweep — the archive is the durable record (and the
+    // "cleanup completed" marker for the boot-replay dedup).
+    write_cleanup_report(job_id, question, &report).await;
+    let _ = tokio::fs::write(run_root.join("cleanup_report.md"), &report).await;
+    // Release the folder: delete the cleanup jobs row. On failure the row
+    // is not preserved as 'failed' — the run folder is reclaimed by the
+    // existing sweep, which is the documented backstop for a failed
+    // cleanup (no silent garbage accumulation: the failure is in the
+    // agent's session record, the archive, and the error log above).
+    let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
+}
+
+/// Append the cleanup report to the run's archived results.md (the persistent
+/// record — the run folder's copy dies with the sweep).
+pub(crate) async fn write_cleanup_report(job_id: &str, question: &str, report: &str) {
+    let root = config::CONFIG
+        .try_storage_root()
+        .or_else(|| config::default_config_dir().ok());
+    let Some(root) = root else {
+        return;
+    };
+    let dir = root.join("research").join("results");
+    let path = dir.join(format!("{job_id}.md"));
+    let section = format!("\n\n## Cleanup report\n\n{report}\n");
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        // Append to the existing results.md (created by write_results_md).
+        if let Ok(mut f) = tokio::fs::OpenOptions::new().append(true).open(&path).await {
+            use tokio::io::AsyncWriteExt;
+            let _ = f.write_all(section.as_bytes()).await;
+        }
+    } else {
+        // No results.md (spawn-failure path) — write a standalone archive.
+        let content = format!("# Research {job_id}\n\n## Question\n\n{question}\n{section}");
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let _ = tokio::fs::write(&path, content).await;
+    }
+}
+
+/// Boot-scan resume of a `research_cleanup` job: re-dispatch the Sanitation
+/// agent with the stored task (the row survived a crash mid-cleanup). The
+/// folder is still held by the jobs row, so the cleanup completes and the
+/// report lands exactly like a fresh dispatch.
+pub(crate) async fn resume_research_cleanup(job_id: &str, ws: &Workspace) {
+    let Some((caller, _role)) = crate::jobs::resume_job_preamble(
+        &crate::session::store().conn,
+        job_id,
+        "Research cleanup resume",
+        "Research cleanup resume",
+    )
+    .await
+    else {
+        return;
+    };
+    let prompt = caller.task.clone();
+    // The archived results.md must show the RESEARCH question, not the cleanup
+    // prompt (the jobs row task). The question was persisted to the run folder
+    // at dispatch; fall back to the prompt only if the folder was lost.
+    let question = tokio::fs::read_to_string(run_root_path(job_id).join("question.txt"))
+        .await
+        .unwrap_or_else(|_| caller.task.clone());
+    run_cleanup_agent_and_finish(
+        job_id,
+        ws,
+        &prompt,
+        &question,
+        "Research cleanup resume FAILED",
+    )
+    .await;
 }
 
 // ── Sweep: run roots ──────────────────────────────────────────────────────
@@ -1363,158 +1416,47 @@ mod tests {
     }
 
     #[test]
-    fn sanitizer_zone_and_write_intent_filter() {
-        let run_root = Path::new("/var/folders/xx/mahbot-research/run_x");
-        // Absolute outside-zone writes are reported.
-        assert!(is_outside_zone_write("cat > /tmp/scratch.txt", run_root));
-        assert!(is_outside_zone_write(
-            "curl -o /var/tmp/x.bin https://example.com/x",
-            run_root
-        ));
-        assert!(is_outside_zone_write("cp -r /run_root/a /tmp/b", run_root));
-        assert!(is_outside_zone_write("mkdir -p /tmp/scratch_dir", run_root));
-        // In-zone absolute writes are dropped.
-        assert!(!is_outside_zone_write(
-            &format!("cat > {}/in_zone.txt", run_root.display()),
-            run_root,
-        ));
-        assert!(!is_outside_zone_write(
-            &format!("mkdir -p {}/subdir", run_root.display()),
-            run_root,
-        ));
-        // Relative targets (coder cwd = run_root) are NOT outside — reporting
-        // them inverts the accepted false-negative direction into noise.
-        assert!(!is_outside_zone_write("cat > script.py", run_root));
-        // `> /dev/null` is not a write.
-        assert!(!is_outside_zone_write("echo hi > /dev/null", run_root));
-        // Read-only commands are not write-intent.
-        assert!(!is_outside_zone_write("grep -r foo src", run_root));
-        // Canonicalized root matches canonicalized targets (/var → /private/var).
-        let canon = Path::new("/private/var/folders/xx/mahbot-research/run_x");
-        assert!(!is_outside_zone_write(
-            "cat > /private/var/folders/xx/mahbot-research/run_x/f.txt",
-            canon,
-        ));
-        // `> /dev/null` never masks a real outside write.
-        assert!(is_outside_zone_write(
-            "curl -o /var/tmp/x.bin https://example.com/x > /dev/null 2>&1",
-            canon,
-        ));
-        assert!(!is_outside_zone_write(
-            &format!("curl -o {}/f.bin https://x > /dev/null", canon.display()),
-            canon,
-        ));
-        // $TMPDIR-expanded targets land in the OS-temp outside-zone category.
-        assert!(is_outside_zone_write("cat > $TMPDIR/scratch.txt", canon));
-        // Quoted and braced temp forms resolve the same way.
-        assert!(is_outside_zone_write("cat > \"/tmp/scratch.txt\"", canon));
-        assert!(is_outside_zone_write(
-            "cat > \"$TMPDIR/scratch.txt\"",
-            canon
-        ));
-        assert!(is_outside_zone_write("cat > ${TMPDIR}/scratch.txt", canon));
-        // Single-quoted literals are NOT expanded (a literal `$TMPDIR/x`
-        // filename is relative → in-zone, no over-report).
-        assert!(!is_outside_zone_write("cat > '$TMPDIR/scratch.txt'", canon));
-        // `..` traversal out of the run root is NOT in-zone (Path::starts_with
-        // is lexical — the components are normalized first).
-        assert!(is_outside_zone_write(
-            &format!("cat > {}/../escape/f.txt", canon.display()),
-            canon,
-        ));
-        assert!(!is_outside_zone_write(
-            &format!("cat > {}/sub/../f.txt", canon.display()),
-            canon,
-        ));
-        // ALL cleanable targets are checked: a shell truncates every redirect
-        // target, so an in-zone last redirect must not mask an earlier outside
-        // one — and vice versa.
-        assert!(is_outside_zone_write(
-            &format!("cat > {}/in.txt > /tmp/out.txt", canon.display()),
-            canon,
-        ));
-        assert!(is_outside_zone_write(
-            &format!("cat > /tmp/out.txt > {}/in.txt", canon.display()),
-            canon,
-        ));
-        // Bare stderr redirects are write-intent end-to-end: the `"> /"`
-        // WRITE_INTENT_PATTERNS entry is what gates `cmd 2> /tmp/x` through
-        // to the target extraction (a pattern-list edit would silently drop
-        // stderr writes from the cleaner report).
-        assert!(is_outside_zone_write("cmd 2> /tmp/err.log", canon));
-        assert!(
-            !is_outside_zone_write(&format!("cmd 2> {}/err.log", canon.display()), canon,),
-            "an in-zone stderr redirect stays in-zone"
-        );
+    fn command_dump_dedup_newest_wins_and_caps() {
+        // Newest-wins dedup: a command repeated across rounds keeps its LAST
+        // occurrence (the newest evidence).
+        let cmds = vec!["a".to_string(), "b".to_string(), "a".to_string()];
+        assert_eq!(dedup_newest_wins(&cmds), vec!["b", "a"]);
+
+        // Under the cap — untouched.
+        let mut small = vec!["cat > /tmp/a".to_string(), "cat > /tmp/b".to_string()];
+        cap_command_dump(&mut small, 50);
+        assert_eq!(small.len(), 2, "under the cap — untouched");
+
+        // Cap: newest commands survive; the oldest are dropped.
+        let mut capped = vec!["x".repeat(100), "y".repeat(100), "z".repeat(100)];
+        cap_command_dump(&mut capped, 250);
+        assert_eq!(capped.len(), 2, "oldest dropped to fit the cap");
+        assert_eq!(capped[0], "y".repeat(100));
+        assert_eq!(capped[1], "z".repeat(100));
+
+        // A single command larger than the cap can never fit — it is dropped
+        // ON ITS OWN (keeping it would lose all older fitting evidence).
+        let mut huge = vec!["small".to_string(), "x".repeat(500)];
+        cap_command_dump(&mut huge, 400);
+        assert_eq!(huge, vec!["small".to_string()]);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn sanitizer_zone_canonical_asymmetry() {
-        use std::os::unix::fs::symlink;
-        // A write through a NON-canonical path form of the run root (symlink
-        // alias) must still read as in-zone: the target's longest existing
-        // ancestor is canonicalized before the comparison (the /var →
-        // /private/var asymmetry on macOS).
+    #[tokio::test]
+    async fn command_dump_written_scrubbed_and_capped() {
         let td = tempfile::tempdir().unwrap();
-        let real = td.path().join("real");
-        std::fs::create_dir_all(&real).unwrap();
-        let run_root = std::fs::canonicalize(&real).unwrap();
-        let link = td.path().join("link");
-        symlink(&real, &link).unwrap();
-        assert!(!is_outside_zone_write(
-            &format!("cat > {}/f.txt", link.display()),
-            &run_root,
-        ));
-        // An outside write stays outside (no false in-zone).
-        let outside = td.path().join("outside.txt");
-        assert!(is_outside_zone_write(
-            &format!("cat > {}", outside.display()),
-            &run_root,
-        ));
-    }
-
-    #[test]
-    fn sanitizer_report_formats_and_scrubs_prefiltered_commands() {
-        let run_root = Path::new("/tmp/mahbot-research/run_x");
-        // Production flow feeds the report ONLY capture-time-filtered commands
-        // (the zone/write-intent filter lives in `collect_agent_shell_commands`
-        // — the report itself never re-filters; that overlap is covered by
-        // `sanitizer_zone_and_write_intent_filter` above). Pass pre-filtered
-        // input here.
-        let filtered = vec!["cat > /tmp/scratch.txt".to_string()];
-        let report = build_cleanup_report("run_x", "ws", "q?", run_root, &filtered);
-        let report = report.expect("outside-zone writes exist");
-        assert!(report.contains("/tmp/scratch.txt"));
-        assert!(report.contains("newest first"));
-        // Multi-line/backtick-bearing question and workspace name are escaped
-        // the same way as commands (they render inside the same markdown body).
-        let hostile = build_cleanup_report(
-            "run_x",
-            "ws`bad",
-            "q1\n- injected list item\n`code`",
-            run_root,
-            &filtered,
-        )
-        .unwrap();
-        assert!(
-            hostile.contains("ws\\`bad"),
-            "ws_name backtick escaped (backslash + backtick)"
-        );
-        assert!(
-            hostile.contains("q1\\n- injected list item"),
-            "question newline escaped to literal \\n — no raw line break to start a list item"
-        );
-        assert!(hostile.contains("\\`code\\`"), "question backticks escaped");
-        // Credential scrubbing: a command with an api_key is hidden in the report.
+        let run_root = td.path();
         let secret =
-            "curl -o /tmp/out.bin \"https://api.example.com/data?api_key=SECRET_API_KEY_123\""
-                .to_string();
-        let report = build_cleanup_report("run_x", "ws", "q?", run_root, &[secret]);
-        let report = report.unwrap();
-        assert!(!report.contains("SECRET_API_KEY_123"));
-        // Nothing captured → no ticket.
-        assert!(build_cleanup_report("run_x", "ws", "q?", run_root, &[]).is_none());
+            "curl -o /tmp/out.bin \"https://api.example.com/data?api_key=SECRET_API_KEY_123\"";
+        let commands = vec![secret.to_string(), "cat > /tmp/x".to_string()];
+        write_command_dump(run_root, &commands).await;
+        let content = tokio::fs::read_to_string(run_root.join("commands.dump"))
+            .await
+            .unwrap();
+        assert!(content.contains("/tmp/x"));
+        assert!(
+            !content.contains("SECRET_API_KEY_123"),
+            "credentials scrubbed from the dump"
+        );
     }
 
     #[test]
@@ -1550,175 +1492,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleaner_ticket_created_once_and_deduped() {
-        init_stores().await;
-        crate::util::test::create_test_workspace("/tmp/test_ws_cleaner", "test_ws").await;
-        let ws = crate::workspace::test_ws_named("/tmp/test_ws_cleaner", "test_ws");
-        let commands = vec!["cat > /tmp/scratch.txt".to_string()];
-
-        maybe_create_cleaner_ticket("run_dedup", &ws, "q?", &commands)
-            .await
-            .unwrap();
-        maybe_create_cleaner_ticket("run_dedup", &ws, "q?", &commands)
-            .await
-            .unwrap();
-
-        let board = crate::board::BOARD.get().expect("board initialized");
-        let rows = board
-            .conn
-            .query(
-                "SELECT title, reporter FROM tickets WHERE workspace_name = 'test_ws'",
-                (),
-            )
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1, "exactly one cleaner ticket per run");
-        let title: String = rows[0].get(0).unwrap();
-        let reporter: String = rows[0].get(1).unwrap();
-        assert!(title.contains("[cleanup run_dedup]"), "{title}");
-        assert_eq!(reporter, "cleaner");
-
-        // No outside-zone writes → no ticket.
-        maybe_create_cleaner_ticket("run_clean", &ws, "q?", &[])
-            .await
-            .unwrap();
-        let rows = board
-            .conn
-            .query(
-                "SELECT COUNT(*) FROM tickets WHERE instr(title, '[cleanup run_clean]') > 0",
-                (),
-            )
-            .await
-            .unwrap();
-        assert_eq!(rows[0].get::<i64>(0).unwrap(), 0);
-
-        // Dedup is LITERAL: a different run whose id differs only at the '_'
-        // position must NOT be deduped by run_dedup's marker (a LIKE wildcard
-        // would false-match it).
-        maybe_create_cleaner_ticket("runXdedup", &ws, "q?", &commands)
-            .await
-            .unwrap();
-        let rows = board
-            .conn
-            .query(
-                "SELECT COUNT(*) FROM tickets WHERE workspace_name = 'test_ws'",
-                (),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            rows[0].get::<i64>(0).unwrap(),
-            2,
-            "distinct runs get distinct cleaner tickets"
+    async fn cleanup_prompt_builds_with_context() {
+        let td = tempfile::tempdir().unwrap();
+        let run_root = td.path();
+        let dump_path = run_root.join("commands.dump");
+        let ws = crate::workspace::test_ws_named(
+            run_root.to_str().expect("temp path is utf8"),
+            "cleanup_ws",
         );
+        let prompt = build_cleanup_prompt("run_abc", run_root, &dump_path, &ws);
+        assert!(prompt.contains("run_abc"), "run id substituted");
+        assert!(prompt.contains(&run_root.to_string_lossy().to_string()));
+        assert!(prompt.contains(&dump_path.to_string_lossy().to_string()));
+        assert!(prompt.contains("cleanup_ws"));
+        assert!(prompt.contains("Never touch another run's folder"));
     }
 
-    #[test]
-    fn write_target_parses_redirects_and_verbs() {
-        assert_eq!(write_targets("cat > /tmp/a.txt << EOF"), vec!["/tmp/a.txt"]);
-        assert_eq!(write_targets("tee /var/tmp/x.log"), vec!["/var/tmp/x.log"]);
-        assert_eq!(write_targets("cp /tmp/src /tmp/dst"), vec!["/tmp/dst"]);
-        assert_eq!(
-            write_targets("cp -r /tmp/src /tmp/dst"),
-            vec!["/tmp/dst"],
-            "flag-style cp — destination is the LAST operand"
+    #[tokio::test]
+    async fn dispatch_research_cleanup_deduped_by_jobs_row() {
+        init_stores().await;
+        crate::util::test::create_test_workspace("/tmp/test_ws_cleanup", "test_ws").await;
+        let ws = crate::workspace::test_ws_named("/tmp/test_ws_cleanup", "test_ws");
+        // Pre-create the cleanup jobs row (what a first dispatch leaves
+        // behind). Dispatch must see the row and return BEFORE spawning the
+        // agent — this asserts the dedup without running a live LLM agent
+        // (a fire-and-forget agent would race the assertions below).
+        crate::jobs::spawn_job(
+            &crate::session::store().conn,
+            "run_dedup",
+            "task",
+            &ws.name,
+            "",
+            "",
+            crate::Role::Sanitation,
+            &[],
+            &crate::jobs::SpawnChild::ResearchCleanup,
+        )
+        .await
+        .unwrap();
+        assert!(
+            research_cleanup_row_exists(&crate::session::store().conn, "run_dedup")
+                .await
+                .unwrap(),
+            "the pre-created row is the dedup marker"
         );
-        assert_eq!(write_targets("mv -f /tmp/a /tmp/b"), vec!["/tmp/b"]);
+        dispatch_research_cleanup("run_dedup", &ws, "q?")
+            .await
+            .unwrap();
+        let rows = crate::session::store()
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM jobs WHERE id = 'run_dedup' AND kind = 'research_cleanup'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 1, "single cleanup job row");
+        // No agent was spawned (dispatch returned at the dedup check) — no
+        // cleanup session may exist.
+        let sessions = crate::session::store()
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM session_metadata WHERE agent_id = 'cleanup_run_dedup'",
+                (),
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            write_targets("install -m 644 /tmp/a /tmp/b"),
-            vec!["/tmp/b"],
-            "option values (644) are not the destination"
+            sessions[0].get::<i64>(0).unwrap(),
+            0,
+            "deduped dispatch must not spawn the cleanup agent"
         );
-        assert_eq!(write_targets("mkdir -p /tmp/newdir"), vec!["/tmp/newdir"]);
-        assert_eq!(write_targets("touch /tmp/marker"), vec!["/tmp/marker"]);
-        assert_eq!(
-            write_targets("tar -xzf a.tgz -C /tmp/dst"),
-            vec!["/tmp/dst"]
-        );
-        assert_eq!(
-            write_targets("tar -xzf a.tgz --directory=/tmp/dst"),
-            vec!["/tmp/dst"]
-        );
-        assert_eq!(write_targets("unzip a.zip -d /tmp/dst"), vec!["/tmp/dst"]);
-        assert_eq!(write_targets("tar -xzf a.tgz"), Vec::<String>::new());
-        assert_eq!(
-            write_targets("curl -o /tmp/y.bin https://x"),
-            vec!["/tmp/y.bin"]
-        );
-        assert_eq!(write_targets("wget -O /tmp/z https://x"), vec!["/tmp/z"]);
-        assert_eq!(write_targets("echo hi"), Vec::<String>::new());
-        assert_eq!(
-            write_targets("grep foo 2>&1"),
-            Vec::<String>::new(),
-            "fd redirect is not a write target"
-        );
-        assert_eq!(
-            write_targets("echo hi > b > /tmp/x"),
-            vec!["/tmp/x"],
-            "a relative first redirect must not mask a later absolute one"
-        );
-        assert_eq!(
-            write_targets("echo hi > b"),
-            Vec::<String>::new(),
-            "only-relative redirects have no absolute target"
-        );
-        // `/dev/null` is not a write — the real target after it is reported
-        // (the common silent-download pattern).
-        assert_eq!(
-            write_targets("curl -o /tmp/y.bin https://x > /dev/null 2>&1"),
-            vec!["/tmp/y.bin"],
-            "> /dev/null must not short-circuit the real -o target"
-        );
-        assert_eq!(
-            write_targets("cp /tmp/a /tmp/b > /dev/null"),
-            vec!["/tmp/b"],
-            "cp suffixed with > /dev/null reports the cp destination"
-        );
-        assert_eq!(
-            write_targets("echo hi > /dev/null"),
-            Vec::<String>::new(),
-            "> /dev/null alone is not a write"
-        );
-        // $TMPDIR/$HOME expansion (session TMPDIR=/tmp, a known constant).
-        assert_eq!(
-            write_targets("cat > $TMPDIR/x.log"),
-            vec!["/tmp/x.log"],
-            "$TMPDIR resolves to the OS-temp category decision 6 mandates"
-        );
-        assert_eq!(write_targets("curl -o $TMPDIR/x https://y"), vec!["/tmp/x"]);
-        // ALL cleanable targets are collected — a shell truncates every
-        // redirect target, not just the last one.
-        assert_eq!(
-            write_targets("cat > /tmp/a > /tmp/b"),
-            vec!["/tmp/a", "/tmp/b"],
-            "both redirect targets are writes"
-        );
-        assert_eq!(
-            write_targets("cat > /tmp/out && echo hi > /tmp/in"),
-            vec!["/tmp/out", "/tmp/in"],
-            "redirects across &&-chained commands are both collected"
-        );
-        // No-space `cat>` form.
-        assert_eq!(write_targets("cat>/tmp/x"), vec!["/tmp/x"]);
-        assert_eq!(write_targets("cat> /tmp/x"), vec!["/tmp/x"]);
-        // Single-quoted literals are not expanded (no over-report).
-        assert_eq!(
-            write_targets("cat > '$TMPDIR/x'"),
-            Vec::<String>::new(),
-            "single quotes make $TMPDIR a literal filename (relative → in-zone)"
-        );
-        // Bare stderr redirects create/truncate a file — extracted too
-        // (`2>&1` stays skipped: the `&`-prefixed next token).
-        assert_eq!(
-            write_targets("cmd 2> /tmp/err.log"),
-            vec!["/tmp/err.log"],
-            "a bare 2> redirect is a write target"
-        );
-        assert_eq!(
-            write_targets("cmd 2>/tmp/err.log"),
-            Vec::<String>::new(),
-            "no-space 2> form is outside the accepted pattern set"
-        );
+        // Clean up the spawned job row so the test store stays tidy.
+        crate::jobs::terminalize_job(&crate::session::store().conn, "run_dedup")
+            .await
+            .unwrap();
     }
 
     /// Insert one artist session (metadata + one message) for a user.

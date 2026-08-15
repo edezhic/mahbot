@@ -157,6 +157,11 @@ impl BackgroundSessions {
         // ── Output file (create_new — never overwrite) ──
         let (output_path, out_file) = create_bg_output_file()
             .map_err(|e| format!("Failed to create background output file: {e}"))?;
+        // Owner-deletes-at-end: attribute the output file to the calling agent
+        // (the CURRENT_TOOL_AGENT_ID task-local is set during tool execution)
+        // so `run_agent`'s end-of-run cleanup removes it alongside the spill
+        // files — `terminate_all` kills the process group but leaves the file.
+        super::record_spill_owner(output_path.clone());
 
         // ── Command child ──
         let mut cmd = super::build_shell_command(command, workspace_root);

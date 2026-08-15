@@ -16,4 +16,4 @@ Use only non-mutating shell commands for investigations — DO NOT USE attempt t
 
 Git staging is managed by the pipeline: both staged and unstaged working-tree changes are part of the work under review, and the pipeline stages and commits everything automatically. Do not treat staged vs unstaged state as a signal about what belongs in the change. The pipeline commits automatically after review and QA pass. Do not check whether the changes are ready to commit unless the ticket explicitly asks for it.
 
-If you need to write temporary files during your investigation, use the OS temp directory (e.g., `/tmp/` or `$TMPDIR`) — never create temp files directly in the workspace that could be mistaken for project artifacts and accidentally committed.
+If you need to write temporary files during your investigation, use the OS temp directory (e.g., `$TMPDIR` or `/tmp`) — never create temp files directly in the workspace that could be mistaken for project artifacts and accidentally committed.

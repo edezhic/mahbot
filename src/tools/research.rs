@@ -66,10 +66,6 @@ const CONFIRM_FAILED: &str =
 /// not interrupted — starting one with less left would eat the subsequent
 /// gap rounds).
 const CODER_MIN_REMAINING: Duration = Duration::from_mins(30);
-/// Cap on the accumulated outside-zone commands in the checkpointed state
-/// blob. The cleaner ticket truncates at 32 KiB anyway — 2× gives the ticket
-/// its full body while bounding long runs' checkpoints (newest commands win).
-const MAX_STATE_COMMANDS_BYTES: usize = 64 * 1024;
 /// Default bound on the wrap-up stage: concurrent extraction of
 /// deadline-aborted analysts' accumulated findings (env-overridable via
 /// `MAHBOT_WRAP_UP_TIMEOUT_SECS`, distinct from the round deadline
@@ -114,13 +110,18 @@ struct ResearchState {
     /// why both exist.
     round_index: usize,
     verification: Vec<VerificationResult>,
-    /// Accumulated outside-zone shell commands (write-intent + zone filter
-    /// applied at collection) from completed rounds' sessions — collected
-    /// incrementally at dispatch so long runs don't lose early sessions to the
-    /// transient TTL. Capped at [`MAX_STATE_COMMANDS_BYTES`] so a long run's
-    /// checkpoint blob stays bounded (the ticket body is capped at 32 KiB).
-    #[serde(default)]
+    /// Accumulated raw shell commands (UNFILTERED — no zone classification)
+    /// from completed rounds' sessions — collected incrementally at dispatch so
+    /// long runs don't lose early sessions to the transient TTL. NOT persisted
+    /// in the checkpoint blob (a ~10 MiB blob would be rewritten every round);
+    /// the command dump file inside the run folder is the durable artifact.
+    #[serde(skip)]
     commands: Vec<String>,
+    /// Seen-command set for O(1) dedup during collection (a 10 MiB
+    /// `Vec::contains` scan per command would be O(n²)). Rebuilt from the dump
+    /// file on boot resume. Not persisted (same rationale as `commands`).
+    #[serde(skip)]
+    seen_commands: std::collections::HashSet<String>,
     /// Gap-loop round keys after which a coder round already ran (0 = the
     /// pre-loop coder, k = after gap round k). Boot resume never re-runs a
     /// completed coder round (no duplicate prototypes / LLM spend).
@@ -142,6 +143,7 @@ impl Default for ResearchState {
             round_index: 0,
             verification: Vec::new(),
             commands: Vec::new(),
+            seen_commands: std::collections::HashSet::new(),
             coder_rounds_done: Vec::new(),
         }
     }
@@ -171,6 +173,20 @@ impl ResearchState {
         match serde_json::from_str::<ResearchState>(&json) {
             Ok(mut s) => {
                 s.acc.rebuild_keys();
+                // Rebuild the seen-set AND the command list from the durable
+                // command dump in the run folder. `commands` is serde-skip so
+                // it loads empty after a crash; the dump (written
+                // progressively by capture_round) is the durable capture.
+                // Re-seeding here means a boot resume MERGES the pre-crash
+                // history instead of the first post-resume round overwriting
+                // it (early-round sessions are already TTL'd — the dump is
+                // the only surviving record). The folder is NOT created here
+                // (load is a state read — a missing folder just yields an
+                // empty seed, fail-open); creation happens at dispatch/round
+                // time via `ensure_run_root`.
+                let run_root = crate::research_cleanup::run_root_path(job_id);
+                s.commands = crate::research_cleanup::read_command_dump(&run_root).await;
+                s.seen_commands = s.commands.iter().cloned().collect();
                 s
             }
             Err(e) => {
@@ -225,43 +241,27 @@ impl ResearchState {
         }
     }
 
-    /// Collect the given dispatched agents' outside-zone shell commands from
-    /// their persisted sessions (right after each completed round — early
-    /// sessions of >8h runs are TTL'd, so collection must be incremental). The
-    /// zone filter applies here, at capture time, so in-zone commands never
-    /// enter the state blob. The accumulated blob is capped — the ticket body
-    /// itself is capped at 32 KiB, so older commands are dropped (newest win).
+    /// Collect the given dispatched agents' raw shell commands from their
+    /// persisted sessions (right after each completed round — early sessions
+    /// of >8h runs are TTL'd, so collection must be incremental). UNFILTERED:
+    /// the full command history is written to the run folder dump; the
+    /// Sanitation cleanup agent does the attribution.
     async fn capture_round(&mut self, agent_ids: &[String], run_root: &Path) {
-        let fresh =
-            crate::research_cleanup::collect_agent_shell_commands(agent_ids, run_root).await;
+        let fresh = crate::research_cleanup::collect_agent_shell_commands(agent_ids).await;
         for cmd in fresh {
-            if !self.commands.contains(&cmd) {
+            if self.seen_commands.insert(cmd.clone()) {
                 self.commands.push(cmd);
             }
         }
-        cap_commands(&mut self.commands, MAX_STATE_COMMANDS_BYTES);
-    }
-}
-
-/// Drop commands until the accumulated byte length fits `cap` (newest evidence
-/// wins; the ticket body truncates at 32 KiB regardless). A single command
-/// larger than the cap is dropped ON ITS OWN — it could never fit the ticket
-/// body, and dropping the older fitting commands for it would lose the only
-/// evidence that ever could be reported.
-fn cap_commands(commands: &mut Vec<String>, cap: usize) {
-    while commands.last().is_some_and(|c| c.len() > cap) {
-        commands.pop();
-    }
-    // Single pass to the drop boundary, then one drain (remove(0) in a loop
-    // would be O(n²)).
-    let mut total: usize = commands.iter().map(String::len).sum();
-    let mut drop = 0usize;
-    while drop < commands.len() && total > cap {
-        total -= commands[drop].len();
-        drop += 1;
-    }
-    if drop > 0 {
-        commands.drain(..drop);
+        crate::research_cleanup::cap_command_dump(
+            &mut self.commands,
+            crate::research_cleanup::COMMAND_DUMP_CAP_BYTES,
+        );
+        // Rebuild the seen-set from the capped list: commands evicted by the
+        // cap must be re-admittable when a later round re-issues them, and the
+        // set stays bounded by the cap instead of growing without limit.
+        self.seen_commands = self.commands.iter().cloned().collect();
+        crate::research_cleanup::write_command_dump(run_root, &self.commands).await;
     }
 }
 
@@ -551,7 +551,7 @@ async fn dispatch_durable_research(
     if spawned {
         let state = ResearchState::load(&job_id).await;
         let delivered = build_async_research_message(&result);
-        write_terminalization_artifacts(&job_id, ws, question, &delivered, &state).await;
+        write_terminalization_artifacts(&job_id, question, &delivered, &state).await;
     }
     let envelope = crate::jobs::complete_durable_job(
         &job_id,
@@ -563,41 +563,49 @@ async fn dispatch_durable_research(
         &ws.name,
     )
     .await;
+    // Cleanup dispatch AFTER the exactly-once boundary: the cleanup jobs row
+    // reuses id == run_id (the folder name) for the sweep-liveness hold, so it
+    // must be spawned only after complete_durable_job freed that id (a
+    // wrongly-ordered row would be deleted by the completion DELETE).
+    if spawned
+        && let Err(e) =
+            crate::research_cleanup::dispatch_research_cleanup(&job_id, ws, question).await
+    {
+        tracing::warn!(
+            job = %job_id,
+            error = %e,
+            "Research cleanup dispatch failed — run folder will be reclaimed by the sweep"
+        );
+    }
     Some(envelope)
 }
 
-/// Real-terminalization artifacts (results.md + the cleaner ticket), written
+/// Real-terminalization artifacts (results.md + the command dump), written
 /// BEFORE the exactly-once terminalizing boundary at exactly three points:
 /// fresh dispatch, boot resume, boot-cap partial report. Shutdown/drain
 /// aborts and panics write nothing (the run stays alive for the next boot —
 /// both the fresh-dispatch and resume paths now leave the job row 'launched'
-/// on abort, so boot-recovery re-enters and terminalizes for real). A
-/// cleaner-ticket DB failure is logged — never silent (results.md logs
-/// internally).
+/// on abort, so boot-recovery re-enters and terminalizes for real). A dump
+/// write failure is logged — never silent (results.md logs internally).
+///
+/// The Sanitation cleanup is NOT dispatched here — it runs after
+/// `complete_durable_job` (the cleanup jobs row reuses id == run_id, so the
+/// completion DELETE must have run first). Callers dispatch it in the tail.
 async fn write_terminalization_artifacts(
     job_id: &str,
-    ws: &Workspace,
     question: &str,
     delivered: &str,
     state: &ResearchState,
 ) {
     crate::research_cleanup::write_results_md(job_id, question, delivered).await;
-    if let Err(e) =
-        crate::research_cleanup::maybe_create_cleaner_ticket(job_id, ws, question, &state.commands)
-            .await
-    {
-        tracing::warn!(
-            job = %job_id,
-            error = %e,
-            "Cleaner ticket creation failed — outside-zone writes unreported"
-        );
-    }
+    let run_root = crate::research_cleanup::ensure_run_root(job_id).await;
+    crate::research_cleanup::write_command_dump(&run_root, &state.commands).await;
 }
 
-/// Real-terminalization tail: artifacts (results.md + cleaner ticket) written
-/// BEFORE the exactly-once boundary, then durable completion + routing to the
-/// stored caller. Callers pass their already-loaded state (the capped path
-/// loads it earlier for the partial report).
+/// Real-terminalization tail: artifacts (results.md + command dump + cleanup
+/// dispatch) written BEFORE the exactly-once boundary, then durable completion
+/// and routing to the stored caller. Callers pass their already-loaded state
+/// (the capped path loads it earlier for the partial report).
 ///
 /// The boot-cap path never enters `run_deep_research`, so both artifacts are
 /// produced here.
@@ -610,7 +618,7 @@ async fn terminalize_research(
     caller: &crate::jobs::JobCaller,
 ) {
     let delivered = build_async_research_message(result);
-    write_terminalization_artifacts(job_id, ws, &caller.task, &delivered, state).await;
+    write_terminalization_artifacts(job_id, &caller.task, &delivered, state).await;
     complete_durable_job_and_route(
         job_id,
         delivered,
@@ -620,6 +628,17 @@ async fn terminalize_research(
         &ws.name,
     )
     .await;
+    // Cleanup dispatch AFTER the exactly-once boundary (the cleanup jobs row
+    // reuses id == run_id; the completion DELETE must free it first).
+    if let Err(e) =
+        crate::research_cleanup::dispatch_research_cleanup(job_id, ws, &caller.task).await
+    {
+        tracing::warn!(
+            job = %job_id,
+            error = %e,
+            "Research cleanup dispatch failed — run folder will be reclaimed by the sweep"
+        );
+    }
 }
 
 /// Boot resume of a research run: re-enter the orchestrator at the
@@ -2995,7 +3014,7 @@ fn partial_report(
 /// shutdown/drain abort (run stays alive, nothing written).
 enum ResearchExit {
     /// Real terminalization (success, partial, or error) — the caller writes
-    /// results.md + cleaner ticket and completes the durable job.
+    /// results.md + the command dump and completes the durable job.
     Terminal(anyhow::Result<String>),
     /// Shutdown/drain abort — the run stays alive for the next boot; nothing
     /// is written, terminalized, or routed (design pin).
@@ -3065,7 +3084,7 @@ async fn run_deep_research(
         .await;
         // Capture on EVERY outcome — a hard decompose failure still leaves
         // the dispatched agents' sessions behind (their OS-temp scratch must
-        // reach the cleaner ticket).
+        // reach the command dump).
         state.capture_round(&round_agents, &run_root).await;
         round_agents.clear();
         let plan = match round0 {
@@ -3076,17 +3095,19 @@ async fn run_deep_research(
                 plan
             }
             Err(_) if crate::shutdown::aborting() => {
-                // Persist captured commands: the run stays alive for boot
-                // resume, which re-dispatches round 0 with FRESH agent ids —
-                // the aborted agents' OS-temp scratch must reach the cleaner
-                // ticket (the in-memory capture dies with this invocation).
+                // Checkpoint the state: the run stays alive for boot resume,
+                // which re-dispatches round 0 with FRESH agent ids — the
+                // aborted agents' OS-temp scratch already reached the command
+                // dump (capture_round above wrote it); the resume re-reads it
+                // from the dump, so the in-memory capture dying here loses
+                // nothing.
                 state.save(job_id).await;
                 return ResearchExit::Aborted;
             }
             Err(e) => {
-                // Persist the captured commands — the dispatch-time cleaner
-                // ticket reloads state from the store and a hard decompose
-                // failure must not lose the agents' sessions from the report.
+                // Checkpoint the state — the dump was already written by
+                // capture_round above; a hard decompose failure must not lose
+                // the agents' sessions from the report.
                 state.save(job_id).await;
                 return ResearchExit::Terminal(Err(e));
             }
@@ -3425,12 +3446,21 @@ mod tests {
 
         let job_rows = conn
             .query(
-                "SELECT id FROM jobs WHERE id = ?1",
+                "SELECT kind FROM jobs WHERE id = ?1",
                 crate::turso::params![job_id],
             )
             .await
             .unwrap();
-        assert_eq!(job_rows.len(), 0, "capped job must be terminalized");
+        assert_eq!(
+            job_rows.len(),
+            1,
+            "research job terminalized; the research_cleanup liveness row remains"
+        );
+        assert_eq!(
+            job_rows[0].get::<String>(0).unwrap(),
+            "research_cleanup",
+            "the surviving row is the cleanup liveness hold, not the research job"
+        );
         let pending = conn
             .query(
                 "SELECT envelope FROM pending_jobs WHERE id = ?1",
@@ -3537,6 +3567,7 @@ mod tests {
                 queries: vec![],
             }],
             commands: vec![],
+            seen_commands: std::collections::HashSet::new(),
             coder_rounds_done: vec![],
         };
         state.acc.rebuild_keys();
@@ -3552,15 +3583,25 @@ mod tests {
 
         // Terminalized into the durable envelope addressed to the stored
         // caller (the consumer skips it — the workspace is not registered, so
-        // the pending row survives for the assertion).
+        // the pending row survives for the assertion). The surviving jobs row
+        // is the research_cleanup liveness hold (id == run_id == folder name).
         let job_rows = conn
             .query(
-                "SELECT id FROM jobs WHERE id = ?1",
+                "SELECT kind FROM jobs WHERE id = ?1",
                 crate::turso::params![job_id],
             )
             .await
             .unwrap();
-        assert_eq!(job_rows.len(), 0, "resumed job must be terminalized");
+        assert_eq!(
+            job_rows.len(),
+            1,
+            "research job terminalized; the research_cleanup liveness row remains"
+        );
+        assert_eq!(
+            job_rows[0].get::<String>(0).unwrap(),
+            "research_cleanup",
+            "the surviving row is the cleanup liveness hold, not the research job"
+        );
         let pending = conn
             .query(
                 "SELECT envelope FROM pending_jobs WHERE id = ?1",
@@ -4290,37 +4331,58 @@ mod tests {
         );
     }
 
-    #[test]
-    fn captured_commands_are_capped_newest_win() {
-        let mut commands = vec![
-            "cat > /tmp/old_1.txt".to_string(),
-            "cat > /tmp/old_2.txt".to_string(),
-        ];
-        cap_commands(&mut commands, 50);
-        assert_eq!(commands.len(), 2, "under the cap — untouched");
-        // Adding a third pushes the total over: the OLDEST command is dropped
-        // (newest evidence wins) until the blob fits.
-        commands.push("cat > /tmp/new.txt".to_string());
-        cap_commands(&mut commands, 50);
+    /// Crash-resume must re-seed the command history from the run folder's
+    /// dump: `commands`/`seen_commands` are serde-skip, so the checkpoint blob
+    /// alone loads empty — without the dump the first post-resume
+    /// `capture_round` would OVERWRITE the pre-crash capture (whose early
+    /// sessions are already TTL'd).
+    #[tokio::test]
+    async fn load_seeds_commands_from_dump_after_crash() {
+        crate::util::test::init_management_test_stores().await;
+        let _lock = crate::util::test::retry_tests_lock();
+        let job_id = "research_dump_reload";
+        let conn = &crate::session::store().conn;
+        let now = crate::turso::now();
+        // The durable research job row (research_jobs.id FKs jobs.id).
+        conn.execute(
+            "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
+             retry_count, created_at, updated_at) \
+             VALUES (?1, 'research', 'launched', ?2, 'ws', 'caller-user', 'telegram', 'assistant', \
+             0, ?3, ?3)",
+            crate::turso::params![job_id, "question?", now.clone()],
+        )
+        .await
+        .unwrap();
+        // A valid checkpointed state blob (no command history in it).
+        let json = serde_json::to_string(&ResearchState::default()).unwrap();
+        conn.execute(
+            "INSERT INTO research_jobs (id, state) VALUES (?1, ?2)",
+            crate::turso::params![job_id, json],
+        )
+        .await
+        .unwrap();
+        // Pre-crash command history in the run folder's dump.
+        let run_root = crate::research_cleanup::ensure_run_root(job_id).await;
+        crate::research_cleanup::write_command_dump(&run_root, &["pre-crash cmd".to_string()])
+            .await;
+        let loaded = ResearchState::load(job_id).await;
         assert_eq!(
-            commands,
-            vec![
-                "cat > /tmp/old_2.txt".to_string(),
-                "cat > /tmp/new.txt".to_string()
-            ]
+            loaded.commands,
+            vec!["pre-crash cmd".to_string()],
+            "load() must seed commands from the dump"
         );
-        // A single command larger than the cap is dropped ON ITS OWN (it could
-        // not fit in the 32 KiB ticket body either) — the older fitting
-        // commands survive (dropping them for it would lose all evidence).
-        commands.push("cat > /tmp/huge.txt << 'EOF'\n".repeat(100));
-        cap_commands(&mut commands, 50);
-        assert_eq!(
-            commands,
-            vec![
-                "cat > /tmp/old_2.txt".to_string(),
-                "cat > /tmp/new.txt".to_string()
-            ],
-            "oversized newest dropped alone, older fitting commands kept"
+        assert!(
+            loaded.seen_commands.contains("pre-crash cmd"),
+            "seen-set rebuilt from the dump — post-resume dedup keeps the pre-crash capture"
         );
+        // Clean up the run folder AND the DB rows the test created (research_jobs
+        // FKs jobs(id) ON DELETE CASCADE — deleting the jobs row removes both).
+        let _ = tokio::fs::remove_dir_all(crate::research_cleanup::run_root_path(job_id)).await;
+        conn.execute(
+            "DELETE FROM jobs WHERE id = ?1",
+            crate::turso::params![job_id],
+        )
+        .await
+        .unwrap();
     }
 }

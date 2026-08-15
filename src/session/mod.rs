@@ -383,6 +383,7 @@ pub(crate) const TRANSIENT_AGENT_ID_PREFIXES: &[&str] = &[
     "ticket_",
     "analyze_",
     "research_",
+    "cleanup_",
     "maintainer_",
     "discovery_",
 ];
@@ -1744,6 +1745,16 @@ mod transient_prefix_tests {
             &research_agent_id("ws", "decomposer"),
             "research_",
             "research_agent_id('ws', 'decomposer')",
+        );
+        // The research-cleanup Sanitation agent id is built by the shared
+        // `cleanup_agent_id` builder in research_cleanup.rs (used by both the
+        // fresh dispatch and the boot-resume path) — asserting the REAL builder
+        // keeps the transient-prefix invariant honest (a literal would silently
+        // pass if the builder changed, leaking one session per research run).
+        assert_transient_key(
+            &crate::research_cleanup::cleanup_agent_id("run_abc123"),
+            "cleanup_",
+            "cleanup_agent_id('run_abc123')",
         );
         assert_transient_key(
             &maintainer_agent_id("ws"),

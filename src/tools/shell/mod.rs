@@ -7,7 +7,6 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
@@ -1066,9 +1065,13 @@ fn resolved_shell_path() -> String {
 }
 
 /// Baseline `TMPDIR` binding of the sanitized session environment.
-/// Single-sourced so the read-only validator's temp-variable model
-/// (see `baseline_env_value`) can't drift from the actual env.
-const TMPDIR_BASELINE: &str = "/tmp";
+/// The daemon's private temp root when pinned (see `crate::temp_root`),
+/// otherwise the historical `"/tmp"` baseline (tests, non-unix). Single-sourced
+/// so the read-only validator's temp-variable model (see `baseline_env_value`)
+/// can't drift from the actual env.
+pub(crate) fn shell_tmpdir() -> String {
+    crate::temp_root::shell_tmpdir()
+}
 
 fn baseline_env_value(name: &str) -> Option<String> {
     match name {
@@ -1085,7 +1088,7 @@ fn baseline_env_value(name: &str) -> Option<String> {
         "TERM" => Some("dumb".into()),
         "LANG" | "LC_ALL" | "LC_CTYPE" => Some("C.UTF-8".into()),
         "SHELL" => Some("/bin/sh".into()),
-        "TMPDIR" => Some(TMPDIR_BASELINE.into()),
+        "TMPDIR" => Some(shell_tmpdir()),
         _ => {
             #[cfg(windows)]
             if let Some(val) = windows_baseline_env_value(name) {
@@ -1223,8 +1226,63 @@ impl Tool for ShellTool {
     }
 }
 
-/// Once-flag for cleaning up old spill files at daemon startup.
-static SPILL_DIR_CLEANED: AtomicBool = AtomicBool::new(false);
+/// Get the shared temp directory for spill/full output logs.
+///
+/// NO startup purge here: crash-leftover `.agent` files are reclaimed by the
+/// eager boot sweep (`temp_root::boot_sweep`), which runs before any agent —
+/// the once-flag purge was an overlapping mechanism (the ticket's
+/// no-overlapping-mechanisms intent). Within a run, owner-deletes-at-end
+/// removes what the agent created; a daemon crash leaves files that the next
+/// boot sweep reclaims.
+fn agent_temp_dir() -> Option<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join(".agent");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Registry key for spill files created OUTSIDE an agent run (the diagnostics
+/// runner, tests). An agent id is never empty, so this sentinel cannot collide
+/// with a real owner.
+pub(crate) const NON_AGENT_SPILL_OWNER: &str = "";
+
+/// Spill files created during agent runs, keyed by the owning agent id.
+/// Owner-deletes-at-end: [`cleanup_agent_spills`] removes them when the agent
+/// run ends. Entries for a dead agent id are removed on cleanup; a daemon
+/// crash leaves the files behind, reclaimed by the boot sweep (the backstop).
+static SPILL_OWNERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<std::path::PathBuf>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Record a spill file under the current tool's owning agent id (set during
+/// agent tool execution). Outside an agent run (diagnostics runner, tests)
+/// the file is recorded under [`NON_AGENT_SPILL_OWNER`] so the diagnostics
+/// runner can clean up what it created.
+fn record_spill_owner(path: std::path::PathBuf) {
+    let agent = crate::agent::CURRENT_TOOL_AGENT_ID
+        .try_with(Clone::clone)
+        .unwrap_or(None);
+    let key = agent.unwrap_or_else(|| NON_AGENT_SPILL_OWNER.to_string());
+    let mut map = SPILL_OWNERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    map.entry(key).or_default().push(path);
+}
+
+/// Delete the spill files recorded for `agent_id` (owner-deletes-at-end).
+/// Also clears the registry entry so a later run of the same agent id starts
+/// fresh. Callers: the agent run end hook (`run_agent`) and the diagnostics
+/// runner (which passes [`NON_AGENT_SPILL_OWNER`]).
+pub(crate) fn cleanup_agent_spills(agent_id: &str) {
+    let mut map = SPILL_OWNERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(paths) = map.remove(agent_id) else {
+        return;
+    };
+    for p in paths {
+        let _ = std::fs::remove_file(&p);
+    }
+}
 
 // ── Pipeline functions ────────────────────────────────────────────────
 
@@ -2394,41 +2452,14 @@ fn format_spill_preview(output: &str, path: &Path) -> String {
     format!("{header}{}", format_sandwich(output, 5, 5, "omitted"))
 }
 
-/// Get the shared temp directory for spill/full output logs.
-/// On first call, purges any leftover files from previous sessions.
-fn agent_temp_dir() -> Option<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join(".agent");
-
-    // Clean up leftover spill files from previous daemon sessions once.
-    if !SPILL_DIR_CLEANED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        let _ = cleanup_temp_dir(&dir);
-    }
-
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir)
-}
-
-/// Remove all files in the given temp directory (spill files, raw logs, etc.).
-///
-/// These are purely ephemeral artifacts from the previous daemon session and are
-/// safe to delete on startup — the current session will recreate them as needed.
-fn cleanup_temp_dir(dir: &Path) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-    Ok(())
-}
-
 /// Write content to the agent temp directory with the given filename.
-/// Content should already be credential-scrubbed.
+/// Content should already be credential-scrubbed. The path is recorded under
+/// the owning agent id (owner-deletes-at-end).
 fn write_to_spill(content: &str, filename: &str) -> Option<std::path::PathBuf> {
     let dir = agent_temp_dir()?;
     let path = dir.join(filename);
     std::fs::write(&path, content).ok()?;
+    record_spill_owner(path.clone());
     Some(path)
 }
 

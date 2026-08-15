@@ -46,6 +46,7 @@ pub mod session;
 pub mod shutdown;
 pub(crate) mod skills;
 pub(crate) mod stats;
+pub mod temp_root;
 pub mod ticket_buffer;
 pub mod tools;
 pub mod turso;
