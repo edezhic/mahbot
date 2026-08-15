@@ -225,17 +225,10 @@ fn probe_tshm_byte0_pid(_tshm_path: &Path) -> Option<i32> {
 /// byte-0 is held (self-update handoff) — a transient acquire in that window
 /// can kill a fail-fast incoming self-update daemon.
 fn probe_flock_free(lock_path: &Path) -> bool {
-    use std::fs::OpenOptions;
-    let Ok(file) = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_path)
-    else {
-        return false;
-    };
-    crate::lock_utils::try_flock(&file).unwrap_or(false)
+    // Delegating wrapper: the acquired File is dropped immediately by the
+    // `is_some()` expression, keeping this a transient observation (unlike
+    // take-and-hold callers, which must keep the returned File alive).
+    take_flock(lock_path).is_some()
 }
 
 /// Take (and hold) the instance flock — crash-recovery mode. The returned
