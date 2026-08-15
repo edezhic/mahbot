@@ -184,22 +184,6 @@ CREATE INDEX IF NOT EXISTS idx_llm_requests_recorded_at ON llm_requests(recorded
 CREATE INDEX IF NOT EXISTS idx_llm_requests_agent_id ON llm_requests(agent_id);
 CREATE INDEX IF NOT EXISTS idx_llm_requests_model ON llm_requests(model);
 CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);
--- Per-call image-generation stats, recorded at call time by the image_gen
--- tool so records survive agent cancel/crash (the session-finalize flush
--- drops stats when an agent is dropped without finalization).
-CREATE TABLE IF NOT EXISTS image_gen_calls (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    recorded_at   TEXT NOT NULL,
-    model         TEXT NOT NULL,
-    workspace     TEXT NOT NULL DEFAULT '',
-    duration_ms   INTEGER NOT NULL,
-    success       INTEGER NOT NULL DEFAULT 1,
-    attempts      INTEGER NOT NULL DEFAULT 1,
-    failure_class TEXT,
-    error_message TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_image_gen_calls_recorded_at ON image_gen_calls(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_image_gen_calls_model ON image_gen_calls(model);
 -- Shadow-instrumentation rows for the joint-verdict pipeline: per-agent
 -- verdict scores per stage round, so inter-agent agreement can be
 -- re-measured and the dynamic-count formula validated after launch.

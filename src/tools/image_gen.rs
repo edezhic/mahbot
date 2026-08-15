@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 /// Tool for generating images via OpenRouter's dedicated Image API.
@@ -136,45 +135,18 @@ impl Tool for ImageGenTool {
 
         // Bounded retry loop over the dedicated 10-minute client; the loop is
         // also raced against global shutdown so a long generation cannot
-        // block process teardown. Every call is recorded to telemetry at
-        // call time (survives agent cancel/crash).
-        let started = Instant::now();
+        // block process teardown.
         let shutdown = crate::shutdown::shutdown_token();
-        // Publish the in-flight attempt so a shutdown-abort record reports
-        // how many POSTs were actually made (the loop is mid-flight when the
-        // shutdown branch fires).
-        let attempt_counter = AtomicU32::new(0);
         let result = tokio::select! {
             () = shutdown.cancelled() => {
-                // Record the actual elapsed time — the POST may have been in
-                // flight for a long time before shutdown arrived.
-                let elapsed_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(0);
-                record_image_gen_call(
-                    &model, &ws.path, elapsed_ms, false,
-                    attempt_counter.load(Ordering::Relaxed), Some("shutdown"),
-                    Some("shutdown during image generation"),
-                ).await;
                 anyhow::bail!("Shutting down — image generation aborted");
             }
-            result = generate_image_with_retries(&images_url, &body, &auth, &attempt_counter) => result,
+            result = generate_image_with_retries(&images_url, &body, &auth) => result,
         };
-        let elapsed_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(0);
 
-        let (response_body, attempts, first_failure_class) = match result {
-            Ok(outcome) => (outcome.body, outcome.attempts, outcome.first_failure_class),
-            Err(failure) => {
-                record_image_gen_call(
-                    &model,
-                    &ws.path,
-                    elapsed_ms,
-                    false,
-                    failure.attempts,
-                    Some(&failure.class),
-                    Some(&failure.message),
-                )
-                .await;
-                anyhow::bail!("{}", failure.message);
-            }
+        let response_body = match result {
+            Ok(body) => body,
+            Err(failure) => anyhow::bail!("{}", failure.message),
         };
 
         let (b64_json, media_type) = match extract_response_image(&response_body) {
@@ -182,21 +154,6 @@ impl Tool for ImageGenTool {
             Err(err) => {
                 // A 2xx body carrying a provider error (or no image data)
                 // means the attempt completed and was billed — never retried.
-                // The variant drives the telemetry class.
-                let class = match &err {
-                    ExtractImageError::Provider { .. } => "billed_error",
-                    ExtractImageError::NoImageData => "no_image_data",
-                };
-                record_image_gen_call(
-                    &model,
-                    &ws.path,
-                    elapsed_ms,
-                    false,
-                    attempts,
-                    Some(class),
-                    Some(&err.to_string()),
-                )
-                .await;
                 anyhow::bail!("Image generation response error: {err}");
             }
         };
@@ -205,25 +162,11 @@ impl Tool for ImageGenTool {
             Ok(bytes) => bytes,
             Err(e) => {
                 // Provider returned malformed base64 — a response-processing
-                // failure, recorded as such rather than as a success.
-                record_image_gen_call(
-                    &model,
-                    &ws.path,
-                    elapsed_ms,
-                    false,
-                    attempts,
-                    Some("decode"),
-                    Some(&format!("Failed to decode base64 image data: {e}")),
-                )
-                .await;
+                // failure.
                 anyhow::bail!("Failed to decode base64 image data from response: {e}");
             }
         };
 
-        // Success is recorded only after the file is written, so a disk
-        // failure is never recorded as a successful generation. For
-        // retried-then-successful calls the first failure's class is carried
-        // so analytics see the trigger cause, not just the retry count.
         let output_path = match super::save_generated_file(
             ws,
             &bytes,
@@ -233,30 +176,8 @@ impl Tool for ImageGenTool {
         .await
         {
             Ok(path) => path,
-            Err(e) => {
-                record_image_gen_call(
-                    &model,
-                    &ws.path,
-                    elapsed_ms,
-                    false,
-                    attempts,
-                    Some("file_write"),
-                    Some(&e.to_string()),
-                )
-                .await;
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         };
-        record_image_gen_call(
-            &model,
-            &ws.path,
-            elapsed_ms,
-            true,
-            attempts,
-            first_failure_class.as_deref(),
-            None,
-        )
-        .await;
 
         Ok(self.format_media_result(&output_path))
     }
@@ -282,9 +203,9 @@ const IMAGE_GEN_QUICK_FAILURE_MS: u64 = 60_000;
 const IMAGE_GEN_BACKOFF_MS: u64 = 5_000;
 
 /// Classification of one image-generation attempt failure, captured at the
-/// HTTP boundary so the true cause survives into the surfaced error and
-/// telemetry (a reqwest error's top-level `Display` hides the source chain,
-/// e.g. "operation timed out").
+/// HTTP boundary so the true cause survives into the surfaced error (a
+/// reqwest error's top-level `Display` hides the source chain, e.g.
+/// "operation timed out").
 enum AttemptFailure {
     /// Client-side timeout. `connect` distinguishes a connection timeout (the
     /// request never reached the provider — safe to retry) from the full
@@ -340,34 +261,10 @@ impl AttemptFailure {
             _ => None,
         }
     }
-
-    /// Stable short label for telemetry.
-    fn class_label(&self) -> String {
-        match self {
-            Self::Timeout { .. } => "timeout".to_string(),
-            Self::Transport { .. } => "transport".to_string(),
-            Self::Http { status, .. } => format!("http_{status}"),
-            Self::BodyRead => "body_read".to_string(),
-            Self::Parse { .. } => "parse".to_string(),
-        }
-    }
 }
 
-/// Successful image-generation request: the parsed 2xx body, the number of
-/// POST attempts made (1 = no retry needed), and — when a retry was needed —
-/// the class of the first failed attempt, so telemetry records the trigger
-/// cause of retried-then-successful calls.
-struct ImageGenOutcome {
-    body: serde_json::Value,
-    attempts: u32,
-    first_failure_class: Option<String>,
-}
-
-/// Terminal request failure carrying the true cause for the surfaced error
-/// and telemetry.
+/// Terminal request failure carrying the true cause for the surfaced error.
 struct ImageGenFailure {
-    class: String,
-    attempts: u32,
     message: String,
 }
 
@@ -382,27 +279,16 @@ async fn generate_image_with_retries(
     url: &str,
     body: &serde_json::Value,
     auth: &str,
-    attempt_counter: &AtomicU32,
-) -> Result<ImageGenOutcome, ImageGenFailure> {
+) -> Result<serde_json::Value, ImageGenFailure> {
     let mut failures: Vec<AttemptFailure> = Vec::new();
     for attempt in 1..=IMAGE_GEN_MAX_ATTEMPTS {
-        attempt_counter.store(attempt, Ordering::Relaxed);
         match attempt_image_generation(url, body, auth).await {
-            Ok(body) => {
-                return Ok(ImageGenOutcome {
-                    body,
-                    attempts: attempt,
-                    first_failure_class: failures.first().map(AttemptFailure::class_label),
-                });
-            }
+            Ok(body) => return Ok(body),
             Err(failure) => {
                 let retryable = failure.retryable();
                 failures.push(failure);
                 if !retryable || attempt == IMAGE_GEN_MAX_ATTEMPTS {
-                    let last = failures.last().expect("just pushed");
                     return Err(ImageGenFailure {
-                        class: last.class_label(),
-                        attempts: attempt,
                         message: build_terminal_message(&failures),
                     });
                 }
@@ -414,8 +300,6 @@ async fn generate_image_with_retries(
                     });
                 if !crate::shutdown::sleep_or_shutdown(Duration::from_millis(sleep_ms)).await {
                     return Err(ImageGenFailure {
-                        class: "shutdown".to_string(),
-                        attempts: attempt,
                         message: "Shutting down — image generation aborted".to_string(),
                     });
                 }
@@ -573,36 +457,6 @@ fn describe_http_failure(status: u16, body: &str) -> String {
     match provider_msg {
         Some(msg) => format!("{typed}: {msg}"),
         None => typed,
-    }
-}
-
-/// Record one image-generation call in the logs store. Best-effort and at
-/// call time so records survive agent cancel/crash (the session-finalize
-/// flush drops stats when an agent is dropped without finalization).
-async fn record_image_gen_call(
-    model: &str,
-    workspace: &str,
-    duration_ms: i64,
-    success: bool,
-    attempts: u32,
-    failure_class: Option<&str>,
-    error_message: Option<&str>,
-) {
-    let Some(store) = crate::logs::LOG_STORE.get() else {
-        return;
-    };
-    let rec = crate::stats::ImageGenCallRecord {
-        model: model.to_string(),
-        workspace: workspace.to_string(),
-        duration_ms,
-        success,
-        attempts,
-        failure_class: failure_class.map(String::from),
-        error_message: error_message.map(String::from),
-        recorded_at: crate::turso::now(),
-    };
-    if let Err(e) = store.record_image_gen_call(&rec).await {
-        tracing::debug!(error = %e, "Failed to record image-gen call stat");
     }
 }
 
