@@ -41,8 +41,7 @@ CREATE TABLE IF NOT EXISTS users (
     name                TEXT PRIMARY KEY,
     permissions         TEXT,
     selected_workspace  TEXT,
-    selected_role       TEXT,
-    role_pool_initialized INTEGER NOT NULL DEFAULT 0
+    selected_role       TEXT
 );
 CREATE TABLE IF NOT EXISTS user_channels (
     user_name   TEXT NOT NULL REFERENCES users(name),
@@ -102,9 +101,7 @@ impl UserStore {
     /// the first pool role. Also creates their personal workspace directory
     /// under `~/.mahbot/userspaces/<name>/` with `git init` (non-fatal on
     /// failure). Idempotent — re-adding an existing user preserves their
-    /// stored preferences and adds the given roles to their pool. The
-    /// `role_pool_initialized` marker is set unconditionally (schema parity
-    /// with live databases).
+    /// stored preferences and adds the given roles to their pool.
     pub async fn add_user(
         &self,
         name: &str,
@@ -114,8 +111,8 @@ impl UserStore {
         let inserted = self
             .conn
             .execute(
-                "INSERT OR IGNORE INTO users (name, permissions, role_pool_initialized) \
-                 VALUES (?1, ?2, 1)",
+                "INSERT OR IGNORE INTO users (name, permissions) \
+                 VALUES (?1, ?2)",
                 turso::params![name, permissions],
             )
             .await?;
@@ -136,13 +133,6 @@ impl UserStore {
             )
             .await?;
         }
-        // Mark the pool as initialized even when the INSERT OR IGNORE
-        // no-op'd for an existing user.
-        tx.execute(
-            "UPDATE users SET role_pool_initialized = 1 WHERE name = ?1",
-            turso::params![name],
-        )
-        .await?;
         tx.commit().await?;
 
         // Create personal workspace directory.
@@ -168,11 +158,6 @@ impl UserStore {
             )
             .await?;
         }
-        tx.execute(
-            "UPDATE users SET role_pool_initialized = 1 WHERE name = ?1",
-            turso::params![name],
-        )
-        .await?;
         let selected: Option<String> = tx
             .query_row(
                 "SELECT selected_role FROM users WHERE name = ?1",

@@ -257,8 +257,7 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
             tracing::warn!(
                 agent_id = %agent_id,
                 "Dead session recovery: no context found \
-                 (pre-migration session or corrupted data) — \
-                 skipping permanently"
+                 (corrupted data) — skipping permanently"
             );
             continue;
         };

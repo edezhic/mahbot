@@ -303,7 +303,7 @@ pub struct Ticket {
     /// Also used in the GUI board display: when the value matches a known role
     /// name, the role's display label is shown (e.g. "Manager"); otherwise the
     /// content is shown with the first character uppercased (e.g. "Test" for
-    /// "test"). Empty string for pre-migration tickets.
+    /// "test"). May be empty when no reporter is recorded.
     pub reporter: String,
     /// Whether this ticket has been archived (hidden from normal listings).
     pub is_archived: bool,
