@@ -430,6 +430,23 @@ pub(crate) fn detect_keyboard_mods(modifiers: keyboard::Modifiers) -> KeyboardMo
     }
 }
 
+/// Extract the key, modifiers, and physical key from a `KeyPressed` event.
+#[must_use]
+pub(crate) fn parse_key_press(
+    event: keyboard::Event,
+) -> Option<(keyboard::Key, keyboard::Modifiers, keyboard::key::Physical)> {
+    let keyboard::Event::KeyPressed {
+        key,
+        modifiers,
+        physical_key,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    Some((key, modifiers, physical_key))
+}
+
 // ── Dashboard state ──────────────────────────────────────────────
 
 /// Log store created during boot; read when handling [`Message::Boot`].
@@ -1846,20 +1863,8 @@ impl Dashboard {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick),
             window::close_requests().map(Message::CloseRequested),
             keyboard::listen().filter_map(|event| {
-                use keyboard::{Event, Key};
-                let pressed = matches!(event, Event::KeyPressed { .. });
-                if !pressed {
-                    return None;
-                }
-                let Event::KeyPressed {
-                    key,
-                    modifiers,
-                    physical_key,
-                    ..
-                } = event
-                else {
-                    return None;
-                };
+                use keyboard::Key;
+                let (key, modifiers, physical_key) = parse_key_press(event)?;
                 let km = detect_keyboard_mods(modifiers);
 
                 let latin = key.to_latin(physical_key);
@@ -2374,25 +2379,11 @@ impl Dashboard {
                 let label = text(format!("×{count}")).size(15).color(color);
                 icons.push(
                     container(row![icon, label].spacing(3).align_y(Alignment::Center))
-                        .padding(iced::Padding {
-                            left: 3.0,
-                            right: 3.0,
-                            top: 0.0,
-                            bottom: 0.0,
-                        })
+                        .padding([0, 3])
                         .into(),
                 );
             } else {
-                icons.push(
-                    container(icon)
-                        .padding(iced::Padding {
-                            left: 3.0,
-                            right: 3.0,
-                            top: 0.0,
-                            bottom: 0.0,
-                        })
-                        .into(),
-                );
+                icons.push(container(icon).padding([0, 3]).into());
             }
         }
         Some(
@@ -2422,12 +2413,7 @@ impl Dashboard {
             .spacing(3)
             .align_y(Alignment::Center),
         )
-        .padding(iced::Padding {
-            left: 3.0,
-            right: 3.0,
-            top: 0.0,
-            bottom: 0.0,
-        });
+        .padding([0, 3]);
         let mut kinds: Vec<&str> = handles.iter().map(|h| h.kind).collect();
         kinds.sort_unstable();
         kinds.dedup();
@@ -2452,12 +2438,7 @@ impl Dashboard {
         let pct = (progress * 100.0).round() as u32;
         let label = format!("TTS: {file_name} {pct}%");
         container(text(label).size(12).color(theme::TEXT_MUTED))
-            .padding(iced::Padding {
-                left: 12.0,
-                right: 12.0,
-                top: 0.0,
-                bottom: 0.0,
-            })
+            .padding([0, 12])
             .into()
     }
 
@@ -2498,12 +2479,7 @@ impl Dashboard {
             VoiceStatus::Error(msg) => format!("🔊 Error: {msg}"),
         };
         container(text(label).size(12).color(theme::TEXT_MUTED))
-            .padding(iced::Padding {
-                left: 12.0,
-                right: 12.0,
-                top: 0.0,
-                bottom: 0.0,
-            })
+            .padding([0, 12])
             .into()
     }
 
@@ -2544,12 +2520,7 @@ impl Dashboard {
 
         let footer_row = row![left, center, Space::new().width(Length::Fill), right]
             .align_y(Alignment::Center)
-            .padding(iced::Padding {
-                top: 3.0,
-                right: 18.0,
-                bottom: 3.0,
-                left: 18.0,
-            });
+            .padding([3, 18]);
 
         container(footer_row)
             .align_y(Alignment::Center)

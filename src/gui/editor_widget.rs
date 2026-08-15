@@ -2656,22 +2656,7 @@ where
                         }); // with_font_system drops guard
 
                         if let Some((target_line, target_col)) = result {
-                            if shift {
-                                shell.publish(EditorAction::SelectTo {
-                                    line: target_line,
-                                    col: target_col,
-                                });
-                            } else {
-                                shell.publish(EditorAction::MoveTo {
-                                    line: target_line,
-                                    col: target_col,
-                                });
-                            }
-                            // Invalidate layout so the auto-scroll logic in
-                            // layout() runs and adjusts the scroll offset to
-                            // bring the cursor into view.
-                            shell.invalidate_layout();
-                            shell.request_redraw();
+                            publish_move_or_select(shell, shift, target_line, target_col);
                             return;
                         }
                         // If hit() returned None (target outside shaped area),
@@ -2759,19 +2744,7 @@ where
                         }); // with_font_system drops guard
 
                         if let Some((target_line, target_col)) = result {
-                            if shift {
-                                shell.publish(EditorAction::SelectTo {
-                                    line: target_line,
-                                    col: target_col,
-                                });
-                            } else {
-                                shell.publish(EditorAction::MoveTo {
-                                    line: target_line,
-                                    col: target_col,
-                                });
-                            }
-                            shell.invalidate_layout();
-                            shell.request_redraw();
+                            publish_move_or_select(shell, shift, target_line, target_col);
                             return;
                         }
                         // If find_cursor_run returned None (cursor outside
@@ -2928,6 +2901,23 @@ where
     ) -> mouse::Interaction {
         mouse::Interaction::Text
     }
+}
+
+/// Publish a MoveTo/SelectTo action for programmatic cursor movement and
+/// refresh layout/redraw so auto-scroll brings the new cursor into view.
+fn publish_move_or_select(
+    shell: &mut Shell<'_, EditorAction>,
+    shift: bool,
+    line: usize,
+    col: usize,
+) {
+    if shift {
+        shell.publish(EditorAction::SelectTo { line, col });
+    } else {
+        shell.publish(EditorAction::MoveTo { line, col });
+    }
+    shell.invalidate_layout();
+    shell.request_redraw();
 }
 
 // ── Draw layer helpers ──────────────────────────────────────────────

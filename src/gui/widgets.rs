@@ -432,6 +432,13 @@ pub struct TreeNode {
     pub error: Option<String>,
 }
 
+/// Direction for navigating the file tree (arrow-key vertical movement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeNavDirection {
+    Up,
+    Down,
+}
+
 /// Shared file-tree state used by both the editor and diff dashboard pages.
 pub struct FileTree {
     /// The hierarchical tree nodes.
@@ -603,6 +610,53 @@ impl FileTree {
             return scroll_to_tree_focus(self, ScrollMode::SnapToTop);
         }
         Task::none()
+    }
+
+    /// Move focus to the parent of the focused node (ArrowLeft on a collapsed
+    /// directory or file). Returns a snap-to-top scroll task, or [`Task::none()`]
+    /// when the focused item has no parent in the visible tree.
+    pub fn focus_parent<Message: 'static>(&mut self) -> Task<Message> {
+        match self.focused_parent_path() {
+            Some(ref p) if self.focus_path(p).is_some() => {
+                scroll_to_tree_focus(self, ScrollMode::SnapToTop)
+            }
+            // Root-level item has no parent — no-op.
+            _ => Task::none(),
+        }
+    }
+
+    /// Move focus to the row after `idx` (the first child of an expanded
+    /// directory), if it exists. Returns a snap-to-top scroll task.
+    ///
+    /// `idx` is the already-clamped focused index from [`Self::focused_tree_node`];
+    /// keeping it a parameter preserves the caller's bounds-check view even if a
+    /// tree rebuild re-clamped `tree_focus_index`.
+    pub fn focus_next_row<Message: 'static>(&mut self, idx: usize) -> Task<Message> {
+        if idx + 1 < self.visible_tree_nodes.len() {
+            self.tree_focus_index = idx + 1;
+            scroll_to_tree_focus(self, ScrollMode::SnapToTop)
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Move focus one visible node in `direction` and scroll it into view.
+    ///
+    /// Returns [`Task::none()`] when the tree is not focused or focus is already
+    /// at the boundary.
+    pub fn nav_and_scroll<Message: 'static>(
+        &mut self,
+        direction: TreeNavDirection,
+    ) -> Task<Message> {
+        let moved = match direction {
+            TreeNavDirection::Up => self.nav_up(),
+            TreeNavDirection::Down => self.nav_down(),
+        };
+        if moved {
+            scroll_to_tree_focus(self, ScrollMode::ScrollIntoView)
+        } else {
+            Task::none()
+        }
     }
 
     /// Return the focused visible tree node, if the tree has focus and is non-empty.

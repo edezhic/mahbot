@@ -34,8 +34,8 @@ use crate::diff_parse::{DiffFileStatus, DiffLineKind};
 
 use super::text_rendering::{
     GUTTER_FONT_SIZE, compute_total_height, cursor_to_buffer_coords, draw_background,
-    draw_buffer_text, draw_run_highlights, fill_rich_spans, font_metrics, gutter_clip_rect,
-    iced_color_to_cosmic, text_area_rect, with_font_system,
+    draw_buffer_text, draw_highlight_background, draw_run_highlights, fill_rich_spans,
+    font_metrics, gutter_clip_rect, iced_color_to_cosmic, text_area_rect, with_font_system,
 };
 use super::theme;
 
@@ -367,22 +367,16 @@ where
             };
 
             if let Some(color) = bg_color {
-                let rect = Rectangle {
-                    x: text_x,
-                    y: text_y + run.line_top,
-                    width: text_area_width,
-                    height: run.line_height,
-                };
-                if let Some(clipped) = text_clip.intersection(&rect) {
-                    renderer.fill_quad(
-                        renderer::Quad {
-                            bounds: clipped,
-                            border: iced::Border::default(),
-                            ..renderer::Quad::default()
-                        },
-                        color,
-                    );
-                }
+                draw_highlight_background(
+                    renderer,
+                    text_clip,
+                    text_x,
+                    text_y,
+                    &run,
+                    0.0,
+                    text_area_width,
+                    color,
+                );
             }
         }
 

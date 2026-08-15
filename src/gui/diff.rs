@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use super::context_menu::{ContextMenu, MenuItem};
 use super::theme;
-use super::widgets::{self, FileTree};
+use super::widgets::{self, FileTree, TreeNavDirection};
 
 const MAX_DIFF_LINES: usize = 5000;
 const MAX_HUNKS: usize = 100;
@@ -324,16 +324,8 @@ impl DiffState {
         // by update handlers unless the tree is currently focused. This closure
         // must stay non-capturing because iced validates that in release builds.
         subs.push(keyboard::listen().filter_map(|event| {
-            use keyboard::{Event, Key};
-            let Event::KeyPressed {
-                key,
-                modifiers,
-                physical_key,
-                ..
-            } = event
-            else {
-                return None;
-            };
+            use keyboard::Key;
+            let (key, modifiers, physical_key) = super::parse_key_press(event)?;
             let km = super::detect_keyboard_mods(modifiers);
             if !km.altgr_active && km.is_cmd && key.to_latin(physical_key) == Some('b') {
                 return Some(DiffMessage::TreeFocusToggled);
@@ -672,25 +664,13 @@ impl DiffState {
                 Task::none()
             }
 
-            DiffMessage::TreeNavUp => {
-                if self.file_tree.nav_up() {
-                    return widgets::scroll_to_tree_focus(
-                        &mut self.file_tree,
-                        widgets::ScrollMode::ScrollIntoView,
-                    );
-                }
-                Task::none()
-            }
+            DiffMessage::TreeNavUp => self
+                .file_tree
+                .nav_and_scroll::<DiffMessage>(TreeNavDirection::Up),
 
-            DiffMessage::TreeNavDown => {
-                if self.file_tree.nav_down() {
-                    return widgets::scroll_to_tree_focus(
-                        &mut self.file_tree,
-                        widgets::ScrollMode::ScrollIntoView,
-                    );
-                }
-                Task::none()
-            }
+            DiffMessage::TreeNavDown => self
+                .file_tree
+                .nav_and_scroll::<DiffMessage>(TreeNavDirection::Down),
 
             DiffMessage::TreeNavEnter => {
                 let Some((_idx, path, is_dir)) = self.file_tree.focused_tree_node() else {
@@ -728,16 +708,7 @@ impl DiffState {
                 }
 
                 // ArrowLeft on collapsed directory or file — navigate to parent.
-                match self.file_tree.focused_parent_path() {
-                    Some(ref p) if self.file_tree.focus_path(p).is_some() => {
-                        return widgets::scroll_to_tree_focus(
-                            &mut self.file_tree,
-                            widgets::ScrollMode::SnapToTop,
-                        );
-                    }
-                    _ => {} // Root-level item has no parent — no-op.
-                }
-                Task::none()
+                self.file_tree.focus_parent::<DiffMessage>()
             }
 
             DiffMessage::TreeNavRight => {
@@ -759,14 +730,7 @@ impl DiffState {
                 }
 
                 // Already expanded directory — move focus to first child (if any).
-                if idx + 1 < self.file_tree.visible_tree_nodes.len() {
-                    self.file_tree.tree_focus_index = idx + 1;
-                    return widgets::scroll_to_tree_focus(
-                        &mut self.file_tree,
-                        widgets::ScrollMode::SnapToTop,
-                    );
-                }
-                Task::none()
+                self.file_tree.focus_next_row::<DiffMessage>(idx)
             }
         }
     }

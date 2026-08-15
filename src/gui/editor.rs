@@ -41,7 +41,7 @@ use crate::tools::MAX_FILE_SIZE_BYTES as MAX_FILE_SIZE;
 use super::editor_widget::{EditorBuffer, byte_offset_to_line_col};
 use super::theme;
 use super::widget_helpers;
-use super::widgets::{self, FileTree};
+use super::widgets::{self, FileTree, TreeNavDirection};
 
 mod editor_dialog;
 
@@ -303,13 +303,6 @@ fn compute_text_matches(text: &str, query: &str, case_sensitive: bool) -> Vec<Ra
 enum FindDirection {
     Next,
     Prev,
-}
-
-/// Direction for navigating the file tree, global search results, or quick-open list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TreeNavDirection {
-    Up,
-    Down,
 }
 
 /// Direction for switching tabs.
@@ -812,6 +805,32 @@ async fn read_directory_entries(root: &str, rel_path: &str) -> Result<Vec<FsEntr
     result.extend(dirs);
     result.extend(files);
     Ok(result)
+}
+
+/// Read `dir_path` entries and build a [`DirExpanded`] message.
+async fn dir_expanded_msg(
+    ws_path: String,
+    dir_path: String,
+    r#gen: u64,
+    quiet: bool,
+) -> EditorMessage {
+    let entries = read_directory_entries(&ws_path, &dir_path).await;
+    EditorMessage::DirExpanded {
+        dir_path,
+        r#gen,
+        entries,
+        quiet,
+    }
+}
+
+/// Spawn an async directory read that emits a [`DirExpanded`] message.
+fn dir_expanded_task(
+    ws_path: String,
+    dir_path: String,
+    r#gen: u64,
+    quiet: bool,
+) -> Task<EditorMessage> {
+    Task::perform(dir_expanded_msg(ws_path, dir_path, r#gen, quiet), |msg| msg)
 }
 
 /// Validate file content for size and binary content.
@@ -1572,18 +1591,7 @@ impl EditorState {
         self.dir_generations.insert(dir_path.to_string(), dir_gen);
         self.loading_dirs.insert(dir_path.to_string());
         let d_path = dir_path.to_string();
-        Some(Task::perform(
-            async move {
-                let entries = read_directory_entries(&ws_path, &d_path).await;
-                EditorMessage::DirExpanded {
-                    dir_path: d_path,
-                    r#gen: dir_gen,
-                    entries,
-                    quiet: false,
-                }
-            },
-            |msg| msg,
-        ))
+        Some(dir_expanded_task(ws_path, d_path, dir_gen, false))
     }
 
     /// Expand a directory and either start an async load or focus the first child.
@@ -2305,21 +2313,12 @@ impl EditorState {
         self.dir_generations.insert(String::new(), r#gen);
 
         // ── Task 1: read root directory ───────────────────────
-        let root_path = path.unwrap_or_default().to_string();
-        let root_gen = r#gen;
-        let read_root_task = Task::perform(
-            async move {
-                let entries = read_directory_entries(&root_path, "").await;
-                EditorMessage::DirExpanded {
-                    dir_path: String::new(),
-                    r#gen: root_gen,
-                    entries,
-                    quiet: false,
-                }
-            },
-            |msg| msg,
-        );
-        tasks.push(read_root_task);
+        tasks.push(dir_expanded_task(
+            path.unwrap_or_default().to_string(),
+            String::new(),
+            r#gen,
+            false,
+        ));
 
         // ── Task 2: load tabs from DB + file contents ────────
         let tab_ws = name.to_string();
@@ -3748,16 +3747,7 @@ impl EditorState {
         }
 
         // ArrowLeft on collapsed directory or file — navigate to parent.
-        match self.file_tree.focused_parent_path() {
-            Some(ref p) if self.file_tree.focus_path(p).is_some() => {
-                return widgets::scroll_to_tree_focus(
-                    &mut self.file_tree,
-                    widgets::ScrollMode::SnapToTop,
-                );
-            }
-            _ => {} // Root-level item has no parent — no-op.
-        }
-        Task::none()
+        self.file_tree.focus_parent::<EditorMessage>()
     }
 
     /// Handle tree-nav-right — expands directory or navigates to first child.
@@ -3782,14 +3772,7 @@ impl EditorState {
         }
 
         // Already expanded directory — move focus to first child (if any).
-        if idx + 1 < self.file_tree.visible_tree_nodes.len() {
-            self.file_tree.tree_focus_index = idx + 1;
-            return widgets::scroll_to_tree_focus(
-                &mut self.file_tree,
-                widgets::ScrollMode::SnapToTop,
-            );
-        }
-        Task::none()
+        self.file_tree.focus_next_row::<EditorMessage>(idx)
     }
 
     /// Handle find-toggle — opens/closes the find/replace bar.
@@ -3993,19 +3976,11 @@ impl EditorState {
             // on every background refresh. The tree silently updates
             // when results arrive via DirExpanded.
 
-            let d_path = dir_path.clone();
-            let r_path = root_path.clone();
-            tasks.push(Task::perform(
-                async move {
-                    let entries = read_directory_entries(&r_path, &d_path).await;
-                    EditorMessage::DirExpanded {
-                        dir_path: d_path,
-                        r#gen: dir_gen,
-                        entries,
-                        quiet: true,
-                    }
-                },
-                |msg| msg,
+            tasks.push(dir_expanded_task(
+                root_path.clone(),
+                dir_path.clone(),
+                dir_gen,
+                true,
             ));
         }
 
@@ -4244,15 +4219,7 @@ impl EditorState {
             return Task::none();
         }
         // Navigate the file tree focus index.
-        let moved = match direction {
-            TreeNavDirection::Up => self.file_tree.nav_up(),
-            TreeNavDirection::Down => self.file_tree.nav_down(),
-        };
-        if moved {
-            widgets::scroll_to_tree_focus(&mut self.file_tree, widgets::ScrollMode::ScrollIntoView)
-        } else {
-            Task::none()
-        }
+        self.file_tree.nav_and_scroll::<EditorMessage>(direction)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -5142,13 +5109,7 @@ impl EditorState {
                     )));
                 }
                 // Re-read parent directory.
-                let entries = read_directory_entries(&ws_path, &parent_dir).await;
-                EditorMessage::DirExpanded {
-                    dir_path: parent_dir,
-                    r#gen,
-                    entries,
-                    quiet: false,
-                }
+                dir_expanded_msg(ws_path, parent_dir, r#gen, false).await
             },
             |msg| msg,
         )
@@ -5182,13 +5143,7 @@ impl EditorState {
                         "Failed to create file: {e}"
                     )));
                 }
-                let entries = read_directory_entries(&ws_root, &parent_dir).await;
-                EditorMessage::DirExpanded {
-                    dir_path: parent_dir,
-                    r#gen,
-                    entries,
-                    quiet: false,
-                }
+                dir_expanded_msg(ws_root, parent_dir, r#gen, false).await
             },
             |msg| msg,
         )
@@ -5243,16 +5198,8 @@ impl EditorState {
 /// the shortcut logic is independently readable (and potentially testable).
 #[allow(clippy::too_many_lines)]
 fn map_editor_shortcut(event: keyboard::Event) -> Option<EditorMessage> {
-    use keyboard::{Event, Key};
-    let Event::KeyPressed {
-        key,
-        modifiers,
-        physical_key,
-        ..
-    } = event
-    else {
-        return None;
-    };
+    use keyboard::Key;
+    let (key, modifiers, physical_key) = super::parse_key_press(event)?;
     let km = super::detect_keyboard_mods(modifiers);
 
     // Helper: match a Character key by its Latin equivalent.
