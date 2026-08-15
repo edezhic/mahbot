@@ -983,7 +983,7 @@ async fn sweep_user_media(
     // kept too (safe direction wins — never delete on no evidence; the
     // rotation fires only when at least one session remains).
     if session_ids.is_empty() {
-        tracing::info!(user = %user_name, "Media sweep: no artist sessions — files kept");
+        tracing::debug!(user = %user_name, "Media sweep: no artist sessions — files kept");
         return 0;
     }
     // Overflowed keep-set (incomplete evidence): the safe direction is never

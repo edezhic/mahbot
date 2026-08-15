@@ -55,7 +55,7 @@ use futures_util::future::{FutureExt, join_all};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Cap on a store's on-disk `-wal` size (bytes) for the periodic checkpoint
 /// mode. Below the cap the periodic loop runs non-truncating (PASSIVE)
@@ -276,7 +276,7 @@ async fn checkpoint_stores(policy: CheckpointPolicy, verify: bool) {
                 conn.checkpoint_passive().await
             };
             match outcome {
-                Ok(o) if o.is_complete() => info!(
+                Ok(o) if o.is_complete() => debug!(
                     db = %name,
                     log = o.log_frames,
                     checkpointed = o.checkpointed_frames,
@@ -298,7 +298,7 @@ async fn checkpoint_stores(policy: CheckpointPolicy, verify: bool) {
             // already filtered by the quick_check row scan.)
             if verify {
                 match conn.quick_check().await {
-                    Ok(()) => info!(db = %name, "Database integrity check passed"),
+                    Ok(()) => debug!(db = %name, "Database integrity check passed"),
                     Err(e) => error!(error = %e, db = %name, "Database integrity check failed"),
                 }
             }

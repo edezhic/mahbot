@@ -151,9 +151,9 @@ pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> Option<
             return None;
         }
     }
-    // INFO for multi-member served pipelines (gate-relaxation volume
-    // telemetry); single greps stay DEBUG. The stdin field marks
-    // producer-first stdin-fed serves.
+    // Both served forms log at DEBUG — gate-relaxation volume telemetry is
+    // too noisy for INFO. The stdin field marks producer-first stdin-fed
+    // serves.
     if shapes.is_empty() {
         tracing::debug!(
             command = command,
@@ -162,7 +162,7 @@ pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> Option<
         );
     } else {
         for (members, shape, stdin) in shapes {
-            tracing::info!(
+            tracing::debug!(
                 command = command,
                 members,
                 shape = %shape,

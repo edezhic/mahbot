@@ -559,7 +559,7 @@ impl Agent {
         // can still reach this method.
         if self.cancel_token.is_cancelled() {
             let reason = "Agent cancelled — tool execution skipped";
-            tracing::info!(
+            tracing::debug!(
                 tool = %call_name,
                 "Agent cancelled — skipping tool execution"
             );

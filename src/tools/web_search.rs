@@ -534,7 +534,7 @@ impl Tool for WebSearchTool {
         let (query, expand_id) = self.cache.validate_execute_args(&args)?;
 
         if let Some(id) = expand_id {
-            tracing::info!("Expanding result id: {}", id);
+            tracing::debug!("Expanding result id: {}", id);
             return self.cache.expand_result(id).await;
         }
 

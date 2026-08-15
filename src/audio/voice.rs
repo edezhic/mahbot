@@ -6502,7 +6502,7 @@ pub async fn run_voice_pipeline() {
                 let m = get_voice_metrics();
                 let roll_avg = m.avg_embedding_latency_ns;
                 let life_avg = m.lifetime_avg_embedding_latency_ns();
-                info!(
+                debug!(
                     target: "mahbot::voice::metrics",
                     "Pipeline metrics: chunks_received={0} dropped_chunks={1} ({2:.2}%) \
                      embeddings_computed={3} rolling_avg_latency={4}ns \

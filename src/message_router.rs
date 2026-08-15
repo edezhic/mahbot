@@ -464,7 +464,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             }
         };
 
-        info!(
+        debug!(
             agent_id = %agent_id,
             workspace = %job.workspace_name,
             user = %job.user_name,

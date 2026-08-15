@@ -64,7 +64,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::util::UnwrapPoison;
 
@@ -972,11 +972,22 @@ pub async fn run_wal_guard_loop() {
             }
         }
         if check_count.is_multiple_of(REANNOUNCE_EVERY_CHECKS) {
-            info!(
-                tshm_open_close_count = tshm_open_close_count(),
-                "wal-guard: daemon-side coordination open+close count (0 expected post-boot — \
-                 the daemon-side open+close regression signal)",
-            );
+            let open_close_count = tshm_open_close_count();
+            if open_close_count == 0 {
+                // Zero is the expected post-boot state — quiet at DEBUG. A
+                // nonzero count is the regression signal and stays at INFO.
+                debug!(
+                    tshm_open_close_count = open_close_count,
+                    "wal-guard: daemon-side coordination open+close count (0 expected post-boot — \
+                     the daemon-side open+close regression signal)",
+                );
+            } else {
+                info!(
+                    tshm_open_close_count = open_close_count,
+                    "wal-guard: daemon-side coordination open+close count (0 expected post-boot — \
+                     the daemon-side open+close regression signal)",
+                );
+            }
         }
     }
 }
