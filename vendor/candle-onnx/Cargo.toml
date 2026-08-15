@@ -1,12 +1,18 @@
 [package]
-name = "candle-onnx"
+name = "candle-onnx-mahbot"
 version = "0.10.2"
 edition = "2021"
-description = "ONNX support for Candle (patched for MahBot: Max op, Conv padding)"
-repository = "https://github.com/huggingface/candle"
+description = "ONNX support for Candle — MahBot fork of candle-onnx 0.10.2 with voice-pipeline fixes (implicit dtype promotion, Max/Softplus/Reciprocal/LayerNormalization ops, Pad edge/constant modes, PReLU scalar slope, F32 initializer normalization)"
+repository = "https://github.com/edezhic/mahbot"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
 license = "MIT OR Apache-2.0"
+
+# The lib name stays `candle_onnx` (identical to upstream) so consumers that
+# switch from candle-onnx only change the dependency name in Cargo.toml, not
+# their `use candle_onnx::...` sites.
+[lib]
+name = "candle_onnx"
 
 [dependencies]
 candle-core = "0.10.2"

@@ -911,8 +911,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "candle-onnx"
+name = "candle-onnx-mahbot"
 version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb9fbfd6b838fb34233096b18c65586085df554fdb03c1f2fa4db6eab86d644e"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -4044,7 +4046,7 @@ dependencies = [
  "base64 0.22.1",
  "candle-core",
  "candle-nn",
- "candle-onnx",
+ "candle-onnx-mahbot",
  "chrono",
  "cpal",
  "directories",

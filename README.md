@@ -61,6 +61,7 @@ As of now mahbot is only regularly tested on macos, so it might have unexpected 
 **Required:**
 
 - OpenRouter API key
+- [`protoc`](https://grpc.io/docs/protoc-installation/) (Protocol Buffers compiler) — the ONNX voice-pipeline dependency (candle-onnx-mahbot) compiles `onnx.proto3` at build time, so it is required for `cargo install mahbot` and source builds. Install: `brew install protobuf` (macOS) or your distro's `protobuf` package
 - [`chrome-use`](https://github.com/leeguooooo/chrome-use) CLI (browser tool and link enrichment)
   Install: `curl -fsSL https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.sh | sh`
   (Windows users: download the `.exe` from [Releases](https://github.com/leeguooooo/chrome-use/releases))
