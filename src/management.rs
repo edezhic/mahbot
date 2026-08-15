@@ -2624,7 +2624,7 @@ pub(crate) fn stage_role(name: &str) -> Option<Role> {
 /// Build the joint comment for a round: deterministic merge + single LLM
 /// synthesis pass (stage role's own model) + rendering. Runs entirely before
 /// any board transaction — the synthesis must never hold the board write lock.
-async fn build_joint_comment(
+async fn build_round_joint_comment(
     stage: &str,
     results: &[ParallelVerdict],
     threshold: u8,
@@ -3531,7 +3531,7 @@ async fn process_analyst_verdicts(ws: &Workspace, ticket: &Ticket, results: &[Pa
     // lock (the comment+transition transaction serializes all board writes).
     // Always written — the audit trail needs a per-round stage comment even
     // on fully clean rounds.
-    let joint_comment = build_joint_comment(
+    let joint_comment = build_round_joint_comment(
         stage_name(Role::Analyst),
         results,
         ANALYST_PASS_THRESHOLD,
@@ -3972,7 +3972,7 @@ async fn process_verifier_verdicts(
         None
     } else {
         Some(
-            build_joint_comment(
+            build_round_joint_comment(
                 stage_name(verifier.role),
                 results,
                 REVIEW_QA_THRESHOLD,
