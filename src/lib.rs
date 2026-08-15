@@ -728,6 +728,11 @@ pub struct Agent {
     pub(crate) user_name: String,
     /// The channel origin (gui, telegram, voice) of the triggering message.
     pub(crate) channel: String,
+    /// DIRECT PARENT INVOCATION grouping key for the Running Agents view
+    /// (ticket / ask round / research run). `None` for workspace singletons.
+    /// Propagated to sub-agents spawned by tools via
+    /// [`CURRENT_TOOL_PARENT_KEY`](crate::agent::CURRENT_TOOL_PARENT_KEY).
+    pub(crate) parent_key: Option<crate::registry::ParentKey>,
     /// Optional receiver for mid-work messages (e.g., ticket comments).
     /// When set, the `llm_loop` drains this channel before each LLM call
     /// and injects received messages into the session history.

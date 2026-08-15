@@ -21,6 +21,7 @@ pub(crate) mod highlight;
 pub(crate) mod home;
 pub(crate) mod logs;
 pub(crate) mod media_markers;
+pub(crate) mod running;
 pub(crate) mod sessions;
 pub(crate) mod settings;
 pub(crate) mod shell;
@@ -80,12 +81,16 @@ pub enum Page {
     Shell,
     Editor,
     Settings,
+    /// Live view of running agents and in-flight non-agent LLM work.
+    RunningAgents,
 }
 
 impl Page {
-    /// Pages shown in the sidebar (Home, Editor, Shell).
+    /// Pages shown in the sidebar (Home, Editor, Shell, Running Agents).
+    /// Running Agents is APPENDED so existing keyboard shortcuts
+    /// (Cmd+1/2/3 → Home/Editor/Shell) are not shifted; it gets Cmd+4.
     const fn sidebar_pages() -> &'static [Page] {
-        &[Page::Home, Page::Editor, Page::Shell]
+        &[Page::Home, Page::Editor, Page::Shell, Page::RunningAgents]
     }
 
     /// Pages shown in the footer nav (Sessions, Logs, Settings).
@@ -101,6 +106,7 @@ impl Page {
             Page::Shell => "Shell",
             Page::Editor => "Editor",
             Page::Settings => "Settings",
+            Page::RunningAgents => "Running Agents",
         }
     }
 }
@@ -274,6 +280,8 @@ pub enum Message {
     Shell(shell::ShellMessage),
     Editor(editor::EditorMessage),
     Settings(settings::SettingsMessage),
+    /// Running Agents page message (workspace filter selection).
+    Running(running::RunningMessage),
 
     // ── Diff modal ──────────────────────────────────────────────
     /// Open the diff modal. Optional commit hash — `None` = working tree diff.
@@ -455,8 +463,10 @@ pub static BOOT_LOG_STORE: OnceLock<LogStore> = OnceLock::new();
 /// Per-workspace metadata held in memory for fast sidebar lookup.
 /// Populated during boot from the DB and updated periodically via
 /// [`Message::WorkspaceStatesRefreshed`] (which only refreshes booleans).
+/// `pub(crate)` because the Running Agents page reads it for paused pills and
+/// registered-workspace checks.
 #[derive(Debug, Clone)]
-struct WorkspaceInfo {
+pub(crate) struct WorkspaceInfo {
     path: String,
     paused: bool,
     maintenance_enabled: bool,
@@ -507,6 +517,7 @@ pub struct Dashboard {
     shell_state: shell::ShellState,
     editor_state: editor::EditorState,
     settings_state: settings::SettingsState,
+    running_state: running::RunningState,
 
     // ── Diff modal ──────────────────────────────────────────────
     show_diff_modal: bool,
@@ -552,6 +563,7 @@ impl Dashboard {
             shell_state: shell::ShellState::new(),
             editor_state: editor::EditorState::new(),
             settings_state: settings::SettingsState::new(),
+            running_state: running::RunningState::new(),
             show_diff_modal: false,
             git_state: git::GitState::new(),
             tts_download_progress: None,
@@ -691,11 +703,17 @@ impl Dashboard {
         // Notify sessions state when navigating to/from Sessions page
         // so the auto-refresh timer starts/stops accordingly.
         self.sessions_state.set_page_active(page == Page::Sessions);
+        if page == Page::RunningAgents {
+            // Running Agents refresh: recompute the workspace filter options
+            // from the live registries + registered workspace set.
+            self.running_state.refresh(&self.workspaces);
+        }
         match page {
             // Logs and Shell maintain their own internal state; Editor
             // receives workspace state via WorkspaceSelected from the
-            // Dashboard — none need a refresh on navigation.
-            Page::Logs | Page::Shell | Page::Editor => Task::none(),
+            // Dashboard — none need a refresh on navigation. Running Agents
+            // reads the live registries at render time.
+            Page::Logs | Page::Shell | Page::Editor | Page::RunningAgents => Task::none(),
             Page::Home => {
                 let load_users = self.home_state.load_users().map(Message::Home);
                 let snap = iced::widget::operation::snap_to_end::<Message>(home::CHAT_SCROLL_ID);
@@ -826,6 +844,13 @@ impl Dashboard {
                 sessions::SessionsState::refresh().map(Message::Sessions)
             }
             Page::Settings => self.refresh_settings_lists(true),
+            Page::RunningAgents => {
+                // Live view: refresh the workspace filter options from the
+                // in-memory registries each tick (the running data itself is
+                // read at render time).
+                self.running_state.refresh(&self.workspaces);
+                Task::none()
+            }
             _ => Task::none(),
         };
 
@@ -854,7 +879,8 @@ impl Dashboard {
                     .board_state
                     .update(board::BoardMessage::Escape)
                     .map(Message::Board),
-                Page::Shell => Task::none(),
+                // Shell and Running Agents have no escape handling.
+                Page::Shell | Page::RunningAgents => Task::none(),
                 Page::Logs => self
                     .logs_state
                     .update(
@@ -1146,6 +1172,7 @@ impl Dashboard {
             Message::DiffModal(msg) => self.diff_state.update(msg).map(Message::DiffModal),
             Message::Editor(msg) => self.editor_state.update(msg).map(Message::Editor),
             Message::Settings(msg) => self.process_settings_message(msg),
+            Message::Running(msg) => self.running_state.update(msg).map(Message::Running),
             // ── Diff modal ────────────────────────────────────────
             Message::OpenDiffModal(commit_hash) => self.open_diff_modal(commit_hash),
             // ── Git state (routed to self.git_state) ─────────────────
@@ -1539,6 +1566,10 @@ impl Dashboard {
                 .settings_state
                 .view(self.selected_user_name.as_deref())
                 .map(Message::Settings),
+            Page::RunningAgents => self
+                .running_state
+                .view(&self.workspaces)
+                .map(Message::Running),
         };
 
         let body = column![
@@ -1973,6 +2004,7 @@ fn page_icon(page: Page, size: u32, color: Color) -> Element<'static, Message> {
         Page::Sessions => lucide::scroll_text::<iced::Theme, iced::Renderer>(),
         Page::Logs => lucide::activity::<iced::Theme, iced::Renderer>(),
         Page::Settings => lucide::settings::<iced::Theme, iced::Renderer>(),
+        Page::RunningAgents => lucide::radar::<iced::Theme, iced::Renderer>(),
     };
     text.size(size).color(color).into()
 }
@@ -2024,7 +2056,7 @@ impl Dashboard {
         .into()
     }
 
-    /// Sidebar navigation icons: Home, Editor, Shell (28px).
+    /// Sidebar navigation icons: Home, Editor, Shell, Running Agents (28px).
     ///
     /// Uses Position::Right — iced snaps Top tooltips into the viewport,
     /// overlapping the topmost sidebar button.

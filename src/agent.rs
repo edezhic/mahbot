@@ -35,6 +35,11 @@ use crate::{Agent, ChatMessage, ChatRequest, ChatResponse, Tool, ToolCall};
 tokio::task_local! {
     pub(crate) static CURRENT_TOOL_USER_NAME: String;
     pub(crate) static CURRENT_TOOL_CHANNEL: String;
+    /// The calling agent's DIRECT PARENT INVOCATION grouping key (ticket /
+    /// ask round / research run) — set for the duration of tool execution so
+    /// tools that spawn sub-agents (e.g. implement) can propagate the caller's
+    /// group to the Running Agents view. `None` = workspace singleton caller.
+    pub(crate) static CURRENT_TOOL_PARENT_KEY: Option<crate::registry::ParentKey>;
 }
 
 /// Maximum LLM iterations before the agent loop bails out.
@@ -169,6 +174,12 @@ impl Agent {
     /// Tools are derived from [`crate::Role`] via [`crate::Role::tools`].
     /// Automatically registers with [`crate::registry::AGENT_REGISTRY`] and creates an
     /// internal [`tokio_util::sync::CancellationToken`]. The agent is deregistered on [`Drop`].
+    ///
+    /// `parent_key` carries the DIRECT PARENT INVOCATION grouping key for the
+    /// Running Agents view (ticket / ask round / research run). `None` means
+    /// the agent is a workspace singleton (manager / maintainer / discovery /
+    /// direct chat) — ticket agents pass the ticket and get
+    /// [`ParentKey::Ticket`] implicitly.
     #[must_use]
     pub fn new(
         agent_id: String,
@@ -177,6 +188,7 @@ impl Agent {
         ticket: Option<crate::board::Ticket>,
         user_name: String,
         channel: String,
+        parent_key: Option<crate::registry::ParentKey>,
     ) -> Self {
         let (tools, tool_specs) = role_tools_and_specs(role, ws);
 
@@ -186,6 +198,13 @@ impl Agent {
         } else {
             role.to_string()
         };
+        // Ticket agents group by their ticket; an explicit parent key (ask
+        // round / research run) takes precedence when both are present.
+        let parent_key = parent_key.or_else(|| {
+            ticket
+                .as_ref()
+                .map(|t| crate::registry::ParentKey::Ticket(t.id.clone()))
+        });
         let generation = crate::registry::AGENT_REGISTRY.register(
             agent_id.clone(),
             role.to_string(),
@@ -193,6 +212,7 @@ impl Agent {
             ws,
             label,
             cancel_token.clone(),
+            parent_key.clone(),
         );
 
         Self {
@@ -208,6 +228,7 @@ impl Agent {
             tool_stats: std::sync::Mutex::new(Vec::new()),
             user_name,
             channel,
+            parent_key,
             incoming_rx: None,
             round_ts: None,
             first_call_notify: None,
@@ -448,40 +469,49 @@ impl Agent {
         // each other's user context.
         let user_name = self.user_name.clone();
         let channel = self.channel.clone();
+        let parent_key = self.parent_key.clone();
         CURRENT_TOOL_USER_NAME
             .scope(user_name, async {
                 CURRENT_TOOL_CHANNEL
                     .scope(channel, async {
-                        while i < tool_calls.len() {
-                            if side_flags[i] {
-                                // Side-effecting: single-call group, executed alone.
-                                let outcome = self
-                                    .execute_tool(
-                                        &tool_calls[i].name,
-                                        tool_calls[i].arguments.clone(),
-                                    )
-                                    .await;
-                                outcomes.push(outcome);
-                                i += 1;
-                            } else {
-                                // Read-only group: extend while consecutive calls are also read-only.
-                                let group_start = i;
-                                while i < tool_calls.len() && !side_flags[i] {
-                                    i += 1;
+                        CURRENT_TOOL_PARENT_KEY
+                            .scope(parent_key, async {
+                                while i < tool_calls.len() {
+                                    if side_flags[i] {
+                                        // Side-effecting: single-call group, executed alone.
+                                        let outcome = self
+                                            .execute_tool(
+                                                &tool_calls[i].name,
+                                                tool_calls[i].arguments.clone(),
+                                            )
+                                            .await;
+                                        outcomes.push(outcome);
+                                        i += 1;
+                                    } else {
+                                        // Read-only group: extend while consecutive calls are also read-only.
+                                        let group_start = i;
+                                        while i < tool_calls.len() && !side_flags[i] {
+                                            i += 1;
+                                        }
+                                        let group_calls = &tool_calls[group_start..i];
+
+                                        // Execute the entire read-only group in parallel.
+                                        let group_outcomes: Vec<_> =
+                                            futures_util::future::join_all(group_calls.iter().map(
+                                                |call| {
+                                                    self.execute_tool(
+                                                        &call.name,
+                                                        call.arguments.clone(),
+                                                    )
+                                                },
+                                            ))
+                                            .await;
+
+                                        outcomes.extend(group_outcomes);
+                                    }
                                 }
-                                let group_calls = &tool_calls[group_start..i];
-
-                                // Execute the entire read-only group in parallel.
-                                let group_outcomes: Vec<_> = futures_util::future::join_all(
-                                    group_calls.iter().map(|call| {
-                                        self.execute_tool(&call.name, call.arguments.clone())
-                                    }),
-                                )
-                                .await;
-
-                                outcomes.extend(group_outcomes);
-                            }
-                        }
+                            })
+                            .await;
                     })
                     .await;
             })
@@ -561,6 +591,20 @@ impl Agent {
                 Self::failure_outcome(&tool_name, &tool_arguments, &reason)
             }
             Some(tool) => {
+                // Live-view instrumentation: register this tool as currently
+                // executing (purely observational — no cancellation semantics).
+                // Registered ONLY here, after the pre-flight cancellation check
+                // and after `find_tool` succeeded — unknown tools and
+                // pre-flight-cancelled calls never show a phantom tool. The
+                // guard removes the entry when execution completes (RAII).
+                // Parallel read-only tools each carry their own instance, so a
+                // single "current tool" slot is never a lie.
+                let _live_tool = crate::registry::AGENT_REGISTRY.tool_started(
+                    &self.agent_id,
+                    self.generation,
+                    &tool_name,
+                    &tool_arguments,
+                );
                 let exec_result = tool.execute(&self.workspace, tool_arguments.clone()).await;
                 let duration = start.elapsed();
                 match exec_result {
@@ -1072,6 +1116,7 @@ pub(crate) async fn run_agent(
     incoming_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>>,
     resume: bool,
     round: Option<RoundOpts>,
+    parent_key: Option<crate::registry::ParentKey>,
 ) -> (Agent, Option<String>) {
     // Unregister from the message router on EVERY exit path, including a
     // panic mid-work (Drop runs during unwind) — a leaked router entry would
@@ -1088,7 +1133,15 @@ pub(crate) async fn run_agent(
     let _router_guard = incoming_rx
         .is_some()
         .then(|| UnregisterOnDrop(agent_id.clone()));
-    let mut agent = Agent::new(agent_id, role, ws, ticket.cloned(), user_name, channel);
+    let mut agent = Agent::new(
+        agent_id,
+        role,
+        ws,
+        ticket.cloned(),
+        user_name,
+        channel,
+        parent_key,
+    );
     agent.incoming_rx = incoming_rx;
     if let Some(round) = round {
         agent.round_ts = Some(round.round_ts);
@@ -1156,12 +1209,17 @@ pub(crate) async fn run_agent(
 }
 
 /// Default dispatch: no ticket, empty user/channel, no inbox, no resume.
+///
+/// `parent_key` carries the DIRECT PARENT INVOCATION grouping key for the
+/// Running Agents view (ticket / ask round / research run); `None` for
+/// workspace singletons (manager / maintainer / discovery / direct chat).
 pub(crate) async fn run_default_agent(
     agent_id: &str,
     role: crate::Role,
     ws: &crate::Workspace,
     message: &str,
     round: Option<RoundOpts>,
+    parent_key: Option<crate::registry::ParentKey>,
 ) -> (Agent, Option<String>) {
     run_agent(
         agent_id.to_string(),
@@ -1174,6 +1232,7 @@ pub(crate) async fn run_default_agent(
         None,
         false,
         round,
+        parent_key,
     )
     .await
 }
@@ -1272,6 +1331,7 @@ mod tests {
             tool_stats: std::sync::Mutex::new(Vec::new()),
             user_name: String::new(),
             channel: String::new(),
+            parent_key: None,
             incoming_rx: None,
             round_ts: None,
             first_call_notify: None,
@@ -1992,6 +2052,7 @@ mod tests {
                 round_ts: crate::session::render_timestamp(),
                 first_call_notify: Some(notify.clone()),
             }),
+            None,
         )
         .await;
         assert!(

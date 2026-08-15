@@ -1346,6 +1346,7 @@ async fn run_single_agent(
         Some(incoming_rx),
         resume,
         None,
+        None,
     )
     .await
 }
@@ -2638,6 +2639,7 @@ async fn build_round_joint_comment(
     role: Role,
     header: &str,
     ws: &Workspace,
+    ticket_id: &str,
 ) -> String {
     let mut verdicts: Vec<crate::joint_verdict::JointVerdict<'_>> = Vec::new();
     let mut failures: Vec<crate::joint_verdict::JointFailure> = Vec::new();
@@ -2683,7 +2685,7 @@ async fn build_round_joint_comment(
             &crate::consensus::ItemTable::new(&crate::joint_verdict::issues_by_agent(&round)),
         )
     } else {
-        crate::joint_verdict::build_joint_comment(&round, role, ws).await
+        crate::joint_verdict::build_joint_comment(&round, role, ws, ticket_id).await
     }
 }
 
@@ -2819,6 +2821,7 @@ async fn run_parallel_agents(
                         Some(rx),
                         resume,
                         Some(round),
+                        None,
                     )
                     .await;
 
@@ -3545,6 +3548,7 @@ async fn process_analyst_verdicts(ws: &Workspace, ticket: &Ticket, results: &[Pa
         Role::Analyst,
         &summary,
         ws,
+        &ticket.id,
     )
     .await;
 
@@ -3986,6 +3990,7 @@ async fn process_verifier_verdicts(
                 verifier.role,
                 "",
                 ws,
+                &ticket.id,
             )
             .await,
         )

@@ -320,7 +320,9 @@ async fn run_ask_with_job(
         .iter()
         .filter(|s| !pre_done.iter().any(|(id, _)| id == &s.agent_id))
         .collect();
-    let fresh_runs = run_ask_slots(ws, &fresh_slots, deadline, resume).await;
+    // Round key = the durable job_id — stable across resume so a resumed
+    // round's analysts and consolidation call group under the same key.
+    let fresh_runs = run_ask_slots(ws, &fresh_slots, deadline, resume, job_id).await;
 
     // Assemble runs in slot order.
     let mut runs: Vec<AskRun> = Vec::with_capacity(slots.len());
@@ -337,6 +339,7 @@ async fn run_ask_with_job(
                 None,
                 String::new(),
                 String::new(),
+                Some(crate::registry::ParentKey::AskRound(job_id.to_string())),
             );
             let _ = agent
                 .session
@@ -394,16 +397,22 @@ async fn run_ask_with_job(
         return Ok(AskRunOutcome::DrainCut);
     }
 
-    let result = consolidate_analyst_runs(ws, ask, runs, deadline).await;
+    let result = consolidate_analyst_runs(ws, ask, runs, deadline, job_id).await;
     Ok(AskRunOutcome::Result(result))
 }
 
 /// Run the given analyst slots concurrently (deadline-bounded).
+///
+/// `round_key` is the ask round's grouping key (the durable `job_id` on the
+/// durable path, a fresh suffix on the sync path) — every analyst of the round
+/// registers with `AskRound(round_key)` so the Running Agents view groups them
+/// with the round's consolidation call.
 async fn run_ask_slots(
     ws: &Workspace,
     slots: &[&AskSlot],
     deadline: std::time::Instant,
     resume: bool,
+    round_key: &str,
 ) -> Vec<AskRun> {
     let members: Vec<_> = slots
         .iter()
@@ -411,6 +420,7 @@ async fn run_ask_slots(
             let ws = ws.clone();
             let agent_id = slot.agent_id.clone();
             let task = slot.task.clone();
+            let round_key = round_key.to_string();
             move |round| async move {
                 // Session-non-emptiness discriminator: a resumed slot whose
                 // session already contains the task continues with an empty
@@ -429,6 +439,7 @@ async fn run_ask_slots(
                     None,
                     resume,
                     Some(round),
+                    Some(crate::registry::ParentKey::AskRound(round_key)),
                 )
                 .await
             }
@@ -824,8 +835,11 @@ async fn run_parallel_analysts_and_consolidate(ws: &Workspace, ask: &str) -> Res
     // The sequential consolidation call after the deadline finishes within
     // its own retry bounds.
     let deadline = std::time::Instant::now() + round_timeout();
-    let runs = run_parallel_analysts(ws, ask, PARALLEL_ANALYST_COUNT, deadline).await;
-    consolidate_analyst_runs(ws, ask, runs, deadline).await
+    // Round key shared by the analysts and the consolidation call so the
+    // Running Agents view groups them under one ask round.
+    let round_key = crate::generate_suffix();
+    let runs = run_parallel_analysts(ws, ask, PARALLEL_ANALYST_COUNT, deadline, &round_key).await;
+    consolidate_analyst_runs(ws, ask, runs, deadline, &round_key).await
 }
 
 /// Load the decorrelation angles asset — one distinct research angle per
@@ -861,14 +875,14 @@ async fn run_parallel_analysts(
     ask: &str,
     count: usize,
     deadline: std::time::Instant,
+    round_key: &str,
 ) -> Vec<AskRun> {
-    let suffix = crate::generate_suffix();
     let angles = load_analyst_angles();
     let slots: Vec<AskSlot> = (0..count)
-        .map(|i| analyst_slot(ws, &angles, &suffix, i, ask))
+        .map(|i| analyst_slot(ws, &angles, round_key, i, ask))
         .collect();
     let slot_refs: Vec<&AskSlot> = slots.iter().collect();
-    run_ask_slots(ws, &slot_refs, deadline, false).await
+    run_ask_slots(ws, &slot_refs, deadline, false, round_key).await
 }
 
 /// Consolidate analyst runs: 0 valid → error, 1 valid → raw passthrough,
@@ -880,13 +894,21 @@ async fn consolidate_analyst_runs(
     ask: &str,
     runs: Vec<AskRun>,
     deadline: std::time::Instant,
+    round_key: &str,
 ) -> Result<String> {
     // Orchestrator-only LLM phase — the extraction sub-phase still runs while
     // the analyst Agents are alive/registered; only the grouping pass runs
     // with zero registered agents. Tracking the whole phase is a harmless
     // superset that keeps the drain-watch from firing the token into an
-    // in-flight call while the registry looks quiescent.
-    let _call = crate::call_registry::NON_AGENT_CALLS.register("consolidate", &ws.name);
+    // in-flight call while the registry looks quiescent. The parent key
+    // attaches the consolidation call to its ask round in the Running Agents
+    // view.
+    let _call = crate::call_registry::NON_AGENT_CALLS.register(
+        "consolidate",
+        &ws.name,
+        Some(crate::registry::ParentKey::AskRound(round_key.to_string())),
+        false,
+    );
     let valid_count = runs
         .iter()
         .filter(|r| r.response().is_some_and(|t| !t.trim().is_empty()))
@@ -910,7 +932,7 @@ async fn consolidate_analyst_runs(
         1 => Ok(single_raw_response(&runs).expect("exactly one valid response")),
         _ => {
             let outcomes = extract_findings(runs, deadline).await;
-            consolidate_findings(ws, ask, outcomes).await
+            consolidate_findings(ws, ask, outcomes, round_key).await
         }
     }
 }
@@ -1008,6 +1030,7 @@ async fn consolidate_findings(
     ws: &Workspace,
     ask: &str,
     outcomes: Vec<AnalystOutcome>,
+    round_key: &str,
 ) -> Result<String> {
     let items_by_agent = claims_per_agent(&outcomes);
     let n_valid = items_by_agent.iter().filter(|l| !l.is_empty()).count();
@@ -1067,7 +1090,10 @@ async fn consolidate_findings(
     );
 
     let table = crate::consensus::ItemTable::new(&items_by_agent);
-    match crate::consensus::run_grouping_repair(ws, "consolidate", request, &items_by_agent).await {
+    let parent = Some(crate::registry::ParentKey::AskRound(round_key.to_string()));
+    match crate::consensus::run_grouping_repair(ws, "consolidate", request, &items_by_agent, parent)
+        .await
+    {
         crate::consensus::RepairOutcome::Repaired { output, references } => Ok(render_ask_groups(
             ask,
             &output,
@@ -1283,6 +1309,7 @@ pub(crate) async fn dispatch_claim_verifiers(
     task_extra: &str,
     deadline: std::time::Instant,
     resume: bool,
+    run_key: &str,
 ) -> (Vec<VerificationResult>, Vec<String>) {
     let task_template = load_prompt("ask/verify.md");
     let extraction_prompt = load_prompt("extraction/verify.md");
@@ -1307,6 +1334,7 @@ pub(crate) async fn dispatch_claim_verifiers(
             task.push_str(task_extra);
             let extraction_prompt = extraction_prompt.clone();
             let claim_text = t.claim.clone();
+            let run_key = run_key.to_string();
             move |round| async move {
                 run_claim_verifier(
                     &ws,
@@ -1315,6 +1343,7 @@ pub(crate) async fn dispatch_claim_verifiers(
                     &task,
                     &extraction_prompt,
                     round,
+                    &run_key,
                 )
                 .await
             }
@@ -1351,8 +1380,17 @@ async fn run_claim_verifier(
     task: &str,
     extraction_prompt: &str,
     round: crate::agent::RoundOpts,
+    run_key: &str,
 ) -> VerificationResult {
-    let (agent, response) = run_default_agent(agent_id, Role::Analyst, ws, task, Some(round)).await;
+    let (agent, response) = run_default_agent(
+        agent_id,
+        Role::Analyst,
+        ws,
+        task,
+        Some(round),
+        Some(crate::registry::ParentKey::Research(run_key.to_string())),
+    )
+    .await;
     let (tool_calls, searches, queries) = extract_query_telemetry(&agent);
     let Some(raw) = response else {
         return VerificationResult {
@@ -1509,6 +1547,7 @@ mod tests {
             None,
             String::new(),
             String::new(),
+            None,
         );
         AskRun::Completed {
             agent,
@@ -1551,6 +1590,7 @@ mod tests {
             "test question",
             runs,
             std::time::Instant::now() + Duration::from_secs(60),
+            "test_round",
         )
         .await;
         assert!(result.is_err(), "0 responses should error");
@@ -1576,6 +1616,7 @@ mod tests {
             "test question",
             runs,
             std::time::Instant::now() + Duration::from_secs(60),
+            "test_round",
         )
         .await;
         let err = result.expect_err("0 valid responses should error");
@@ -1645,6 +1686,7 @@ mod tests {
             "test question",
             runs,
             std::time::Instant::now() + Duration::from_secs(60),
+            "test_round",
         )
         .await;
         assert!(result.is_ok(), "1 response should succeed");
@@ -1669,6 +1711,7 @@ mod tests {
             "test question",
             runs,
             std::time::Instant::now() + Duration::from_secs(60),
+            "test_round",
         )
         .await;
         assert!(
@@ -1832,7 +1875,7 @@ mod tests {
         let provider: Arc<dyn crate::Provider> = Arc::new(fake);
         let _guard = install_fake_provider(provider);
         let ws = test_ws("/tmp/test_ws");
-        consolidate_findings(&ws, "test question", outcomes).await
+        consolidate_findings(&ws, "test question", outcomes, "test_round").await
     }
 
     /// Two analysts agreeing on one claim (2/3, no contradictions).
@@ -1969,7 +2012,7 @@ mod tests {
                 failure: "parse failed".into(),
             },
         ];
-        let result = consolidate_findings(&ws, "test question", outcomes).await;
+        let result = consolidate_findings(&ws, "test question", outcomes, "test_round").await;
         let text = result.expect("single parseable source succeeds");
         assert!(
             text.contains("only one analyst produced parseable claims — grouping skipped"),
@@ -2053,6 +2096,7 @@ mod tests {
             "test question",
             runs,
             std::time::Instant::now() + Duration::from_secs(60),
+            "test_round",
         )
         .await;
         let text = result.expect("extraction fail-open must deliver raw reports");

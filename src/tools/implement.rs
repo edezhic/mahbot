@@ -35,9 +35,16 @@ impl Tool for ImplementTool {
         let task = super::get_str(&args, "task")?;
 
         // Single-coder path — delegate lifecycle to run_agent. Blocks the
-        // caller until the coder completes.
+        // caller until the coder completes. The coder inherits the calling
+        // agent's DIRECT PARENT INVOCATION group (e.g. a ticket an engineer is
+        // working) via the tool task-local, so the Running Agents view groups
+        // it under the same parent.
         let agent_id = ask_agent_id(&ws.name, Role::Coder.as_str());
-        let (agent, response) = run_default_agent(&agent_id, Role::Coder, ws, task, None).await;
+        let parent_key = crate::agent::CURRENT_TOOL_PARENT_KEY
+            .try_with(std::clone::Clone::clone)
+            .unwrap_or(None);
+        let (agent, response) =
+            run_default_agent(&agent_id, Role::Coder, ws, task, None, parent_key).await;
 
         if let Some(response) = response {
             Ok(response)

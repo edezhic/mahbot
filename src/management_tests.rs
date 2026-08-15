@@ -2393,6 +2393,7 @@ async fn engineer_comment_text_fail_open_and_renders() {
             None,
             String::new(),
             String::new(),
+            None,
         )
     };
 

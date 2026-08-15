@@ -140,13 +140,18 @@ fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> Chat
 }
 
 /// Convenience: run the synthesis pass and render the joint comment.
+///
+/// `ticket_id` attaches the synthesis LLM call to the ticket's group in the
+/// Running Agents view (the ticket's own work — joint-verdict synthesis of a
+/// review/QA/analysis round).
 pub(crate) async fn build_joint_comment(
     round: &JointRound<'_>,
     role: Role,
     ws: &Workspace,
+    ticket_id: &str,
 ) -> String {
     let items = issues_by_agent(round);
-    let outcome = run_synthesis(round, role, ws).await;
+    let outcome = run_synthesis(round, role, ws, ticket_id).await;
     render_joint_comment(round, &outcome, &crate::consensus::ItemTable::new(&items))
 }
 
@@ -158,10 +163,18 @@ pub(crate) async fn run_synthesis(
     round: &JointRound<'_>,
     role: Role,
     ws: &Workspace,
+    ticket_id: &str,
 ) -> crate::consensus::RepairOutcome {
     let request = synthesis_request(round, role, ws);
     let items = issues_by_agent(round);
-    crate::consensus::run_grouping_repair(ws, "synthesis", request, &items).await
+    crate::consensus::run_grouping_repair(
+        ws,
+        "synthesis",
+        request,
+        &items,
+        Some(crate::registry::ParentKey::Ticket(ticket_id.to_string())),
+    )
+    .await
 }
 
 // ── Joint comment rendering ─────────────────────────────────────────────
