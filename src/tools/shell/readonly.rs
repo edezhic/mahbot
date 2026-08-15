@@ -950,11 +950,7 @@ fn walk_redirected<'a>(
     if !extra.is_empty() && !matches!(body.kind(), "command" | "list" | "pipeline") {
         // Compound-command bodies take no arguments — bash errors on the
         // extra word; fail closed rather than model the error.
-        return Err(format!(
-            "⚠️ Read-only mode: a word follows a redirect on a compound command — rejected fail-closed (bash rejects it as a syntax error).\n\
-             Command: `{}`",
-            w.src
-        ));
+        return Err(redirect_extras_on_construct(w));
     }
 
     w.last_start = state.snapshot();
