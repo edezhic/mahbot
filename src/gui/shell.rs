@@ -87,7 +87,8 @@ struct WorkspaceShellState {
 pub enum ShellMessage {
     /// Terminal event forwarded from an embedded terminal widget.
     TerminalEvent(iced_term::Event),
-    /// Workspace selected via the Home page picker (name, optional filesystem path).
+    /// Workspace selected via the Dashboard sidebar/global picker (name,
+    /// optional filesystem path).
     WorkspaceSelected(String, Option<String>),
     /// Select a tab by its index in the tab list.
     TabSelected(usize),

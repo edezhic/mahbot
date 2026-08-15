@@ -694,7 +694,7 @@ impl Dashboard {
         match page {
             // Logs and Shell maintain their own internal state; Editor
             // receives workspace state via WorkspaceSelected from the
-            // Home page picker — none need a refresh on navigation.
+            // Dashboard — none need a refresh on navigation.
             Page::Logs | Page::Shell | Page::Editor => Task::none(),
             Page::Home => {
                 let load_users = self.home_state.load_users().map(Message::Home);
@@ -1053,11 +1053,6 @@ impl Dashboard {
                 // switch so the sidebar, saved state, and all pages stay
                 // consistent.
                 if let home::HomeMessage::RequestWorkspaceChange(ref name) = msg {
-                    return self.select_workspace(name);
-                }
-                // Intercept WorkspacePicked: the Home page's own workspace
-                // picker changed — update the sidebar and all pages to match.
-                if let home::HomeMessage::WorkspacePicked(ref name) = msg {
                     return self.select_workspace(name);
                 }
                 // Intercept UserSelected: user changed (from picker, Users page

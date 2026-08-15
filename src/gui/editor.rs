@@ -1,9 +1,10 @@
 //! Code editor dashboard page — tabbed code editor with file tree, syntax-aware
 //! editing, and workspace-backed tab persistence.
 //!
-//! Layout: split view of file tree (left, 25%) and tabbed editor (right, 75%).
-//! Workspace selection is handled by the Home page picker. Tabs persist
-//! to the workspace database and are restored on workspace selection.
+//! Layout: split view of a fixed-width file tree (left) and a tabbed editor
+//! (right, filling the remaining width). Workspace selection is handled by
+//! the Dashboard sidebar/global picker. Tabs persist to the workspace
+//! database and are restored on workspace selection.
 //! Key bindings: Ctrl+S/Cmd+S to save, Tab/Shift+Tab for indent/outdent,
 //! Ctrl+B for tree focus toggle.
 //!
@@ -357,7 +358,8 @@ pub struct SavedTabData {
 
 #[derive(Debug, Clone)]
 pub enum EditorMessage {
-    /// Workspace selected via the Home page picker (name, optional filesystem path).
+    /// Workspace selected via the Dashboard sidebar/global picker (name,
+    /// optional filesystem path).
     WorkspaceSelected(String, Option<String>),
     /// A directory's listing was loaded from the filesystem.
     DirExpanded {
@@ -1396,7 +1398,8 @@ async fn run_global_search(
 // ── Editor State ──────────────────────────────────────────────────
 
 pub struct EditorState {
-    /// Currently selected workspace name (set by the Home page picker via Dashboard).
+    /// Currently selected workspace name (set by the Dashboard sidebar/global
+    /// picker).
     selected_workspace_name: Option<String>,
     /// Filesystem path for the currently selected workspace.
     selected_workspace_path: Option<String>,

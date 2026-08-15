@@ -5,9 +5,10 @@
 //! Files are parsed in their entirety (old version from HEAD, new version from
 //! disk) for correct multi-line token coloring.
 //!
-//! The page layout splits into a directory tree sidebar (left, ~25%) and a
-//! scrollable diff panel (right, ~75%). Click a file in the tree to filter
-//! the diff to just that file; click again to show all files.
+//! The page layout splits into a fixed-width directory tree sidebar (left)
+//! and a scrollable diff panel (right, filling the remaining width). Click a
+//! file in the tree to filter the diff to just that file; click again to show
+//! all files.
 //!
 //! Auto-refreshes every 5 seconds when a workspace is selected.
 use super::diff_widget::{self, DiffBufferWidget, DiffFileBuffer};
@@ -112,8 +113,6 @@ pub enum DiffMessage {
     WorkspaceSelected(String, Option<String>),
     DiffLoaded(u64, Result<Vec<DiffFile>, String>),
     Tick,
-    /// Escape key — dismiss tree focus or exit.
-    Escape,
     ToggleDir(String),
     SelectFile(String),
     CommitMessageChanged(String),
@@ -323,6 +322,13 @@ impl DiffState {
         // Keyboard: Ctrl+B toggles tree focus; arrow/Enter messages are ignored
         // by update handlers unless the tree is currently focused. This closure
         // must stay non-capturing because iced validates that in release builds.
+        //
+        // NOTE: Escape-dismiss of tree focus is deliberately NOT wired here.
+        // `DiffMessage::Escape` was removed as dead code (the Dashboard never
+        // forwards Escape to the diff modal, and this subscription maps only
+        // Ctrl+B plus the arrow/Enter nav keys). If Escape-dismiss is ever
+        // desired, wire it into this subscription first — do not re-add the
+        // variant without the key mapping.
         subs.push(keyboard::listen().filter_map(|event| {
             use keyboard::Key;
             let (key, modifiers, physical_key) = super::parse_key_press(event)?;
@@ -637,13 +643,6 @@ impl DiffState {
                         Task::done(DiffMessage::Toast(super::ToastMessage::Error(e)))
                     }
                 }
-            }
-
-            DiffMessage::Escape => {
-                if self.file_tree.tree_focused {
-                    self.file_tree.tree_focused = false;
-                }
-                Task::none()
             }
 
             // ── Tree keyboard navigation ─────────────────────────────
@@ -1644,14 +1643,6 @@ mod tests {
     fn test_diff_tree_focus_toggled_empty_tree_stays_off() {
         let mut state = DiffState::new();
         let _ = state.update(DiffMessage::TreeFocusToggled);
-        assert!(!state.file_tree.tree_focused);
-    }
-
-    #[test]
-    fn test_diff_escape_clears_tree_focus() {
-        let mut state = make_diff_with_tree();
-        state.file_tree.tree_focused = true;
-        let _ = state.update(DiffMessage::Escape);
         assert!(!state.file_tree.tree_focused);
     }
 

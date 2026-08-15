@@ -1,7 +1,7 @@
 //! Home page — native GUI chat interface with user impersonation.
 //!
-//! Users pick an identity from the user picker, select a workspace (sync'd
-//! with the Home page workspace picker), and chat with MahBot agents in real time
+//! Users pick an identity from the user picker, select a workspace via the
+//! Dashboard sidebar/global picker, and chat with MahBot agents in real time
 //! with full markdown rendering and typing indicators.
 
 use crate::ChatDirection;
@@ -156,9 +156,6 @@ pub enum HomeMessage {
     /// workspace change so the Personal-picker merge partner never goes
     /// stale). Carries `(user, project_workspace)`.
     ProjectWorkspaceRefreshed(String, Option<String>),
-    /// User picked a workspace from the Home page picker.
-    /// Intercepted by Dashboard; never reaches Home's own update handler.
-    WorkspacePicked(String),
     /// Clear chat button pressed — reset session and display.
     ClearChat,
     /// Switch user's active role. Carries (user_name, new_role).
@@ -1378,10 +1375,6 @@ impl HomeState {
             HomeMessage::RequestWorkspaceChange(_) => {
                 // This variant is intercepted by the Dashboard and should
                 // never reach Home's update handler.  No-op fallback.
-                Task::none()
-            }
-            HomeMessage::WorkspacePicked(_) => {
-                // Intercepted by Dashboard.  No-op fallback.
                 Task::none()
             }
             HomeMessage::Toast(_) => {
