@@ -820,6 +820,26 @@ fn clear_sweep_warn() {
         .unwrap_poison() = None;
 }
 
+/// Map a session-CLI error to its [`SweepWarn`] and return `None` for the
+/// caller's `Option<T>` (the error path never yields a value). Generic over
+/// the Ok type so both `tab list` (`Vec<SweepTab>`) and `tab new` (`String`)
+/// callers compile with the same one-liner; every error emits its warn, so a
+/// deferral is never silent.
+fn sweep_none_on_cli_error<T>(name: &str, err: Option<&str>) -> Option<T> {
+    let msg = err.unwrap_or_default();
+    if is_unreachable_tab_error(msg) {
+        tracing::debug!(
+            session = name,
+            error = msg,
+            "tab sweep: unreachable-tab detail"
+        );
+        sweep_warn_transition(SweepWarn::UnreachableTab);
+    } else {
+        sweep_warn_transition(SweepWarn::CannotEnumerate);
+    }
+    None
+}
+
 /// Bounded `tab list --json` on a session. `None` on timeout, CLI failure, an
 /// error response, or a malformed entry (a missing tabId/targetId makes the
 /// count unreliable — defer rather than risk a false-clean verdict). Every
@@ -831,20 +851,7 @@ async fn session_tab_list(name: &str, deadline: Instant) -> Option<Vec<SweepTab>
     }
     let v = match run_session_cli_json(&["tab", "list"], name).await {
         Ok(v) => v,
-        Err(err) => {
-            let msg = err.as_deref().unwrap_or_default();
-            if is_unreachable_tab_error(msg) {
-                tracing::debug!(
-                    session = name,
-                    error = msg,
-                    "tab sweep: unreachable-tab detail"
-                );
-                sweep_warn_transition(SweepWarn::UnreachableTab);
-            } else {
-                sweep_warn_transition(SweepWarn::CannotEnumerate);
-            }
-            return None;
-        }
+        Err(err) => return sweep_none_on_cli_error(name, err.as_deref()),
     };
     let Some(tabs) = v
         .get("data")
@@ -917,20 +924,7 @@ async fn session_tab_new_scratch(name: &str, deadline: Instant) -> Option<String
     }
     let resp = match run_session_cli_json(&["tab", "new"], name).await {
         Ok(v) => v,
-        Err(err) => {
-            let msg = err.as_deref().unwrap_or_default();
-            if is_unreachable_tab_error(msg) {
-                tracing::debug!(
-                    session = name,
-                    error = msg,
-                    "tab sweep: unreachable-tab detail"
-                );
-                sweep_warn_transition(SweepWarn::UnreachableTab);
-            } else {
-                sweep_warn_transition(SweepWarn::CannotEnumerate);
-            }
-            return None;
-        }
+        Err(err) => return sweep_none_on_cli_error(name, err.as_deref()),
     };
     let Some(tab_id) = resp
         .get("data")

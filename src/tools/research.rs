@@ -590,6 +590,34 @@ async fn write_terminalization_artifacts(
     }
 }
 
+/// Real-terminalization tail: artifacts (results.md + cleaner ticket) written
+/// BEFORE the exactly-once boundary, then durable completion + routing to the
+/// stored caller. Callers pass their already-loaded state (the capped path
+/// loads it earlier for the partial report).
+///
+/// The boot-cap path never enters `run_deep_research`, so both artifacts are
+/// produced here.
+async fn terminalize_research(
+    job_id: &str,
+    ws: &Workspace,
+    result: &anyhow::Result<String>,
+    state: &ResearchState,
+    caller_role: Role,
+    caller: &crate::jobs::JobCaller,
+) {
+    let delivered = build_async_research_message(result);
+    write_terminalization_artifacts(job_id, ws, &caller.task, &delivered, state).await;
+    complete_durable_job_and_route(
+        job_id,
+        delivered,
+        JobKind::ResearchResult,
+        caller_role,
+        caller,
+        &ws.name,
+    )
+    .await;
+}
+
 /// Boot resume of a research run: re-enter the orchestrator at the
 /// checkpointed stage (retry_count capped by the boot scan), then terminalize
 /// into the durable envelope exactly like a fresh dispatch. Aborts quietly on
@@ -617,20 +645,8 @@ pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
         }
         ResearchExit::Terminal(result) => result,
     };
-    // Terminalization artifacts BEFORE the exactly-once boundary (same points
-    // as a fresh dispatch — boot resume is a real terminalization).
     let state = ResearchState::load(job_id).await;
-    let delivered = build_async_research_message(&result);
-    write_terminalization_artifacts(job_id, ws, &caller.task, &delivered, &state).await;
-    complete_durable_job_and_route(
-        job_id,
-        delivered,
-        JobKind::ResearchResult,
-        caller_role,
-        &caller,
-        &ws.name,
-    )
-    .await;
+    terminalize_research(job_id, ws, &result, &state, caller_role, &caller).await;
 }
 
 /// Boot-scan over-cap handling: the job exceeded MAX_BOOT_REDISPATCH — deliver
@@ -656,19 +672,7 @@ pub(crate) async fn research_capped_partial_report(job_id: &str, ws: &Workspace)
         "boot re-dispatch cap exceeded — partial report from last checkpoint",
         &[],
     ));
-    // Boot-cap is a real terminalization — archive + cleaner ticket (the cap
-    // path never enters run_deep_research, so both artifacts are produced here).
-    let delivered = build_async_research_message(&result);
-    write_terminalization_artifacts(job_id, ws, &caller.task, &delivered, &state).await;
-    complete_durable_job_and_route(
-        job_id,
-        delivered,
-        JobKind::ResearchResult,
-        caller_role,
-        &caller,
-        &ws.name,
-    )
-    .await;
+    terminalize_research(job_id, ws, &result, &state, caller_role, &caller).await;
 }
 
 /// Build the `<research-result>` envelope message for the async research
