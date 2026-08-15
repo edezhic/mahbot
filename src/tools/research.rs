@@ -3144,7 +3144,7 @@ async fn run_deep_research(
     } else if !state.verification.is_empty() {
         std::mem::take(&mut state.verification)
     } else {
-        let v = research_verification_pass(
+        state.verification = research_verification_pass(
             ws,
             &state.acc,
             &mut budget,
@@ -3159,9 +3159,8 @@ async fn run_deep_research(
         state.capture_round(&round_agents, &run_root).await;
         round_agents.clear();
         state.budget_spent = budget.spent;
-        state.stage = ResearchStage::Synthesis;
         state.save(job_id).await;
-        v
+        std::mem::take(&mut state.verification)
     };
 
     // Fail-open markers survive delivery: head-placed so they survive the
@@ -3354,7 +3353,7 @@ mod tests {
     }
 
     /// Direct resume test for `resume_research_run`: a job
-    /// checkpointed at stage=Verification with pre-populated verification
+    /// checkpointed at stage=Synthesis with pre-populated verification
     /// resumes — it re-enters the orchestrator, synthesizes from the
     /// accumulated evidence (ONE provider call), skips the verification pass
     /// (stored results reused — no analysts spawned), terminalizes into the
@@ -3367,7 +3366,7 @@ mod tests {
         let _lock = crate::util::test::retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        // One synthesis call (the only LLM work left at stage=Verification).
+        // One synthesis call (the only LLM work left at stage=Synthesis).
         let fake = crate::util::test::FakeProvider::new()
             .ok("final synthesized report for the resumed run");
         let _provider_guard = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
@@ -3386,11 +3385,12 @@ mod tests {
         .await
         .unwrap();
 
-        // Checkpointed state: stage=Verification, one accumulated claim, one
-        // stored verification result (the post-crash resume must reuse it —
-        // never re-run the verification pass).
+        // Checkpointed state: stage=Synthesis (post-fix crash state — the
+        // verification pass completed and its results were persisted), one
+        // accumulated claim, one stored verification result (the post-crash
+        // resume must reuse it — never re-run the verification pass).
         let mut state = ResearchState {
-            stage: ResearchStage::Verification,
+            stage: ResearchStage::Synthesis,
             plan: None,
             gap_list: None,
             acc: AccumulatedEvidence {
