@@ -820,7 +820,7 @@ impl Connection {
     /// never reports a busy result in the row's first column on its success
     /// path, so incompleteness must be derived from `log > checkpointed`.
     pub async fn checkpoint(&self) -> anyhow::Result<CheckpointOutcome> {
-        self.run_checkpoint("TRUNCATE").await
+        self.run_checkpoint(CheckpointMode::Truncate).await
     }
 
     /// Run a non-truncating (PASSIVE) WAL checkpoint.
@@ -831,12 +831,12 @@ impl Connection {
     /// other connections are live. The WAL file keeps growing until a
     /// TRUNCATE checkpoint runs; callers bound that growth with a size cap.
     pub async fn checkpoint_passive(&self) -> anyhow::Result<CheckpointOutcome> {
-        self.run_checkpoint("PASSIVE").await
+        self.run_checkpoint(CheckpointMode::Passive).await
     }
 
-    async fn run_checkpoint(&self, mode: &str) -> anyhow::Result<CheckpointOutcome> {
+    async fn run_checkpoint(&self, mode: CheckpointMode) -> anyhow::Result<CheckpointOutcome> {
         let rows = self
-            .query(&format!("PRAGMA wal_checkpoint({mode});"), ())
+            .query(&format!("PRAGMA wal_checkpoint({});", mode.label()), ())
             .await
             .context("Failed to checkpoint WAL")?;
         let row = rows
@@ -2150,7 +2150,7 @@ fn desynced_index_name(msg: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
-/// Heal checkpoint mode — replaces the stringly-typed mode literals.
+/// WAL checkpoint mode — replaces the stringly-typed mode literals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckpointMode {
     Passive,
@@ -2249,10 +2249,7 @@ async fn heal_checkpoint(db_path: &Path, mode: CheckpointMode, name: &str) -> an
     let mut attempts_left = HEAL_CHECKPOINT_RETRIES;
     loop {
         attempts_left -= 1;
-        let outcome = match mode {
-            CheckpointMode::Passive => conn.checkpoint_passive().await,
-            CheckpointMode::Truncate => conn.checkpoint().await,
-        };
+        let outcome = conn.run_checkpoint(mode).await;
         match outcome {
             Ok(o) if o.is_complete() => return Ok(()),
             Ok(o) if attempts_left > 0 => {
