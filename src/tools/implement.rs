@@ -3,7 +3,7 @@
 //! access and mutates the workspace, so this is a side-effecting tool that never
 //! runs concurrently with other tools.
 
-use crate::agent::run_agent;
+use crate::agent::run_default_agent;
 use crate::session::ask_agent_id;
 use crate::tools::Tool;
 use crate::{Role, Workspace};
@@ -37,19 +37,7 @@ impl Tool for ImplementTool {
         // Single-coder path — delegate lifecycle to run_agent. Blocks the
         // caller until the coder completes.
         let agent_id = ask_agent_id(&ws.name, Role::Coder.as_str());
-        let (agent, response) = run_agent(
-            agent_id,
-            Role::Coder,
-            ws,
-            None,
-            task,
-            String::new(),
-            String::new(),
-            None,
-            false,
-            None,
-        )
-        .await;
+        let (agent, response) = run_default_agent(&agent_id, Role::Coder, ws, task, None).await;
 
         if let Some(response) = response {
             Ok(response)

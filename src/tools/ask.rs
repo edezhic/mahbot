@@ -14,7 +14,7 @@
 //! disputed claims lives in the deep research tool only. Fail-open is
 //! preserved throughout: findings are never silently lost.
 
-use crate::agent::run_agent;
+use crate::agent::{run_agent, run_default_agent};
 use crate::config::CONFIG;
 use crate::message_router::{self, AgentJob, JobKind};
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
@@ -420,6 +420,7 @@ async fn run_ask_slots(
                 // message (no duplicate task-prompt append); a missing/empty
                 // session dispatches fresh with the stored task.
                 let has_session = resume && crate::session::store().has_content(&agent_id).await;
+                // Dynamic-resume path (resume + conditional message) — not a default dispatch.
                 run_agent(
                     agent_id,
                     crate::Role::Analyst,
@@ -1351,19 +1352,7 @@ async fn run_claim_verifier(
     extraction_prompt: &str,
     round: crate::agent::RoundOpts,
 ) -> VerificationResult {
-    let (agent, response) = run_agent(
-        agent_id.to_string(),
-        Role::Analyst,
-        ws,
-        None,
-        task,
-        String::new(),
-        String::new(),
-        None,
-        false,
-        Some(round),
-    )
-    .await;
+    let (agent, response) = run_default_agent(agent_id, Role::Analyst, ws, task, Some(round)).await;
     let (tool_calls, searches, queries) = extract_query_telemetry(&agent);
     let Some(raw) = response else {
         return VerificationResult {

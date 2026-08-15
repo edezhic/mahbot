@@ -16,7 +16,7 @@
 //! never refunded. No per-agent tool-call caps and no wall-clock limit — the
 //! existing global iteration backstop and retry machinery remain untouched.
 
-use crate::agent::{chat_request, role_tools_and_specs, run_agent};
+use crate::agent::{chat_request, role_tools_and_specs, run_default_agent};
 use crate::message_router::{self, AgentJob, JobKind};
 use crate::prompt::{load_prompt, substitute};
 use crate::retry::FailureClass;
@@ -1305,19 +1305,7 @@ async fn run_structured_analyst<T: serde::de::DeserializeOwned>(
     extraction_prompt: &str,
     round: crate::agent::RoundOpts,
 ) -> AnalystRun<T> {
-    let (agent, response) = run_agent(
-        agent_id.to_string(),
-        Role::Analyst,
-        ws,
-        None,
-        task,
-        String::new(),
-        String::new(),
-        None,
-        false,
-        Some(round),
-    )
-    .await;
+    let (agent, response) = run_default_agent(agent_id, Role::Analyst, ws, task, Some(round)).await;
     let Some(raw) = response else {
         return AnalystRun::NoResponse;
     };
@@ -1956,19 +1944,7 @@ async fn run_coder_round(
     // `research_agent_id` embeds a fresh NanoID suffix per call — and the
     // design's crash-duplicate pin covers the re-run's prototype duplication;
     // a crashed post-progress round is final, fail-open).
-    let (agent, response) = run_agent(
-        agent_id.clone(),
-        Role::Coder,
-        &coder_ws,
-        None,
-        &task,
-        String::new(),
-        String::new(),
-        None,
-        false,
-        None,
-    )
-    .await;
+    let (agent, response) = run_default_agent(&agent_id, Role::Coder, &coder_ws, &task, None).await;
     state.capture_round(&[agent_id], Path::new(run_root)).await;
     if response.is_some() {
         tracing::info!(job = %job_id, coder_round = round_key, "Coder round completed");

@@ -1158,6 +1158,29 @@ pub(crate) async fn run_agent(
     }
 }
 
+/// Default dispatch: no ticket, empty user/channel, no inbox, no resume.
+pub(crate) async fn run_default_agent(
+    agent_id: &str,
+    role: crate::Role,
+    ws: &crate::Workspace,
+    message: &str,
+    round: Option<RoundOpts>,
+) -> (Agent, Option<String>) {
+    run_agent(
+        agent_id.to_string(),
+        role,
+        ws,
+        None,
+        message,
+        String::new(),
+        String::new(),
+        None,
+        false,
+        round,
+    )
+    .await
+}
+
 /// Stable failure classification for the agent-failure log.
 ///
 /// Order matters: the global shutdown token fires on SIGTERM/SIGINT and

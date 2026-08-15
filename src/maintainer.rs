@@ -12,7 +12,7 @@ use futures_util::future::join_all;
 use crate::Role;
 use crate::Workspace;
 use crate::WorkspaceStatus;
-use crate::agent::run_agent;
+use crate::agent::run_default_agent;
 use crate::board::TicketPhase;
 use crate::turso;
 
@@ -115,19 +115,8 @@ pub async fn run_maintainer_loop() {
 
                     info!(workspace = %ws.name, agent_id = %agent_id, "Maintainer: starting maintenance run");
 
-                    let (agent, response) = run_agent(
-                        agent_id.clone(),
-                        Role::Maintainer,
-                        &ws,
-                        None,
-                        &prompt,
-                        String::new(),
-                        String::new(),
-                        None,
-                        false,
-                        None,
-                    )
-                    .await;
+                    let (agent, response) =
+                        run_default_agent(&agent_id, Role::Maintainer, &ws, &prompt, None).await;
 
                     if let Some(_response) = response {
                         info!(workspace = %ws.name, "Maintainer: run complete");
