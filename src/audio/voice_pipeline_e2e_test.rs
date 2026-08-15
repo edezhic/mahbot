@@ -7229,26 +7229,12 @@ pub(crate) fn run_internal() {
 // Compile under `cargo test --features voice-tests` (the bench module is
 // feature-gated; `#[cfg(test)]` keeps these out of the harness=false bench
 // binary).  Locks the real `pcm_augment_enrollment_variants` site (the
-// canonical raw-TTS-PCM gate input) to the golden captured from the
-// pre-dedup inline code at HEAD 0d1a074.
+// canonical raw-TTS-PCM gate input) to the golden captured at the current
+// recipe (input via the shared `voice::fixed_pcm` fixture).
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Deterministic fixed input PCM (no RNG) — same generator as the
-    /// `voice.rs::augment_tests` fixture so hashes line up across modules.
-    fn fixture_pcm(len: usize) -> Vec<f32> {
-        let sample_rate = TARGET_SAMPLE_RATE as f32;
-        (0..len)
-            .map(|i| {
-                let t = i as f32 / sample_rate;
-                (0.5 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
-                    + 0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin())
-                    * (1.0 - t / 2.0).max(0.0)
-            })
-            .collect()
-    }
 
     /// SHA-256 over the ordered `(label, pcm)` pairs as
     /// `pcm_augment_enrollment_variants` returns them.
@@ -7269,12 +7255,12 @@ mod tests {
     fn pcm_augment_enrollment_variants_matches_golden() {
         // Fixed input + loop-index seed → byte-identical output (golden
         // captured at the current recipe).
-        let variants = vec![(fixture_pcm(16000), "wake".to_string())];
+        let variants = vec![(fixed_pcm(16000), "wake".to_string())];
         let out = pcm_augment_enrollment_variants(&variants);
         let h = hash_labeled_variants(&out);
         println!("GOLDEN P-site: long={h}");
 
-        let short_variants = vec![(fixture_pcm(4000), "wake".to_string())];
+        let short_variants = vec![(fixed_pcm(4000), "wake".to_string())];
         let short_out = pcm_augment_enrollment_variants(&short_variants);
         let hs = hash_labeled_variants(&short_out);
         println!("GOLDEN P-site: short={hs}");

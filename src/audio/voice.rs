@@ -577,6 +577,21 @@ pub(crate) fn augment_pcm_variants(
     variants
 }
 
+/// Deterministic fixed input PCM (no RNG): 220 Hz + 440 Hz sine ramp that
+/// decays over the clip — exercises the augmentation's time-domain paths.
+#[cfg(test)]
+fn fixed_pcm(len: usize) -> Vec<f32> {
+    let sample_rate = SAMPLE_RATE as f32;
+    (0..len)
+        .map(|i| {
+            let t = i as f32 / sample_rate;
+            (0.5 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
+                + 0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin())
+                * (1.0 - t / 2.0).max(0.0)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod augment_tests {
     //! Fixture tests locking the shared PCM augmentation helper to the
@@ -587,20 +602,6 @@ mod augment_tests {
     //! byte-stable report surfaces.
 
     use super::*;
-
-    /// Deterministic fixed input PCM (no RNG): 220 Hz + 440 Hz sine ramp that
-    /// decays over the clip — exercises the augmentation's time-domain paths.
-    fn fixed_pcm(len: usize) -> Vec<f32> {
-        let sample_rate = SAMPLE_RATE as f32;
-        (0..len)
-            .map(|i| {
-                let t = i as f32 / sample_rate;
-                (0.5 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
-                    + 0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin())
-                    * (1.0 - t / 2.0).max(0.0)
-            })
-            .collect()
-    }
 
     /// SHA-256 over the ordered `(variant_index, pcm)` pairs — byte-stable.
     fn variant_list_hash(variants: &[(usize, Vec<f32>)]) -> String {
