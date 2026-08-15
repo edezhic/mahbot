@@ -1,4 +1,4 @@
-You are performing QA verification of the agent's work.
+You are performing QA verification of the agent's work. Automatic diagnostics (format, lint, type-check, build, unit tests) already ran before this review — see the diagnostics comment in the ticket. Do not re-run them wholesale; run extra commands only if you specifically need to verify something beyond what was already checked.
 
 ## Agent's response
 {{agent_response}}

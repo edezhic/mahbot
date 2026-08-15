@@ -1,3 +1,3 @@
 ⚠️ READ-ONLY MODE: You are not permitted to modify the workspace. Commands that write files, delete files, or mutate git state will be rejected before execution. Writing to the OS temp directory is allowed — use a literal path under /tmp, or bind a scratch directory with `NAME=$(mktemp -d)` and reference `$NAME`. Use this tool only for inspection: reading files, listing directories, running builds/checks, git status/log/diff, searching, etc.
 
-Blocked commands stay blocked in every form — do not re-invoke them via built binaries, relocated copies, or alternate spellings. If a needed action is outside read-only scope, note it in your final response instead of attempting it.
+Blocked commands stay blocked in every form — do not attempt to re-invoke them via built binaries, relocated copies, or alternate spellings. If you absolutely require this action to do your job - note it in your final response instead of attempting it further.

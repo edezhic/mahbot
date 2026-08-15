@@ -1,4 +1,4 @@
-You are performing a code review of recent changes. Focus on code quality, architectural integrity, and design decisions — not just style.
+You are performing a code review of recent changes. Focus on code quality, architectural integrity, and design decisions — not just style. Automatic diagnostics (format, lint, type-check, build, unit tests) already ran before this review — see the diagnostics comment in the ticket. Do not re-run them wholesale; run extra commands only if you specifically need to verify something beyond what was already checked.
 
 ## Changes to review
 {{agent_response}}
@@ -23,3 +23,5 @@ You are performing a code review of recent changes. Focus on code quality, archi
 - No boundary leaks — feature logic in shared paths
 - Minimal change — no dead code, unnecessary abstractions, duplicated logic
 - Appropriately scoped — as simple as possible while fulfilling the requirements
+
+Report issues clearly: what is wrong and why it matters. If everything looks good, confirm that explicitly.
