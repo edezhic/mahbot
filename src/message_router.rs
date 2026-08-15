@@ -333,11 +333,8 @@ pub async fn route_user_message(
     route(&agent_id, job);
 }
 
-/// Persist an envelope to `pending_jobs` (`started`/`attempts` are
-/// schema-locked write-only columns, DEFAULT 0 — omitted from the INSERT,
-/// consistent with [`crate::jobs::complete_job_with_envelope`]). The target
-/// agent id and kind are derived from the envelope by
-/// [`crate::jobs::pending_job_params`].
+/// Persist an envelope to `pending_jobs`. The target agent id and kind are
+/// derived from the envelope by [`crate::jobs::pending_job_params`].
 /// Used by the durable producers (manager-bound messages here; ask/research
 /// use the source job id via [`crate::jobs::complete_job_with_envelope`]).
 async fn persist_pending(job: &AgentJob, id: String) -> anyhow::Result<()> {

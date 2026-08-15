@@ -332,15 +332,9 @@ CREATE TABLE IF NOT EXISTS pending_jobs (
     target_agent_id TEXT NOT NULL,
     kind            TEXT NOT NULL,
     envelope        TEXT NOT NULL,
-    workspace_name  TEXT NOT NULL DEFAULT '',
     user_name       TEXT NOT NULL DEFAULT '',
     channel         TEXT NOT NULL DEFAULT '',
     role            TEXT NOT NULL,
-    reply_target    TEXT NOT NULL DEFAULT '',
-    -- `started` and `attempts` are schema-locked write-only columns: delivery
-    -- dedup (suffix + created_at) is the sole in-session discriminator.
-    started         INTEGER NOT NULL DEFAULT 0,
-    attempts        INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pending_jobs_agent_created ON pending_jobs(target_agent_id, created_at);
@@ -357,32 +351,16 @@ CREATE TABLE IF NOT EXISTS ticket_stage_jobs (
 
 CREATE TABLE IF NOT EXISTS ask_jobs (
     id         TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-    question   TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS manager_jobs (
-    id             TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-    workspace_name TEXT NOT NULL,
-    message_kind   TEXT NOT NULL,
-    user_name      TEXT NOT NULL DEFAULT '',
-    channel        TEXT NOT NULL DEFAULT '',
-    reply_target   TEXT NOT NULL DEFAULT '',
-    created_at     TEXT NOT NULL,
-    updated_at     TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS research_jobs (
-    id           TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-    question     TEXT NOT NULL,
-    -- Inert: spawn-time values only (resume data lives in `state`).
-    stage        TEXT NOT NULL,
-    round_index  INTEGER NOT NULL,
-    budget_spent INTEGER NOT NULL,
-    state        TEXT NOT NULL,
-    created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
+    id         TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    question   TEXT NOT NULL,
+    state      TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );";
 
 // ── Column index constants ──────────────────────────────────

@@ -310,9 +310,7 @@ async fn run_ask_with_job(
             channel,
             caller_role,
             &agents,
-            &crate::jobs::SpawnChild::Ask {
-                question: ask.to_string(),
-            },
+            &crate::jobs::SpawnChild::Ask,
         )
         .await?;
         (slots, Vec::new())
@@ -2305,9 +2303,7 @@ mod tests {
                 role: crate::Role::Analyst,
                 task: "question?".to_string(),
             }],
-            &crate::jobs::SpawnChild::Ask {
-                question: "question?".to_string(),
-            },
+            &crate::jobs::SpawnChild::Ask,
         )
         .await
         .unwrap();
@@ -2382,9 +2378,7 @@ mod tests {
                 role: crate::Role::Analyst,
                 task: "question?".to_string(),
             }],
-            &crate::jobs::SpawnChild::Ask {
-                question: "question?".to_string(),
-            },
+            &crate::jobs::SpawnChild::Ask,
         )
         .await
         .unwrap();
@@ -2462,9 +2456,7 @@ mod tests {
                 role: crate::Role::Analyst,
                 task: "question?".to_string(),
             }],
-            &crate::jobs::SpawnChild::Ask {
-                question: "question?".to_string(),
-            },
+            &crate::jobs::SpawnChild::Ask,
         )
         .await
         .unwrap();

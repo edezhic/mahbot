@@ -3345,8 +3345,8 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO research_jobs (id, question, stage, round_index, budget_spent, state, \
-             created_at, updated_at) VALUES (?1, 'question?', 'decompose', 0, 0, '{}', ?2, ?2)",
+            "INSERT INTO research_jobs (id, question, state, created_at, updated_at) \
+             VALUES (?1, 'question?', '{}', ?2, ?2)",
             crate::turso::params![job_id, now],
         )
         .await
@@ -3455,8 +3455,8 @@ mod tests {
         state.acc.rebuild_keys();
         let state_json = serde_json::to_string(&state).unwrap();
         conn.execute(
-            "INSERT INTO research_jobs (id, question, stage, round_index, budget_spent, state, \
-             created_at, updated_at) VALUES (?1, 'question?', 'verification', 0, 0, ?2, ?3, ?3)",
+            "INSERT INTO research_jobs (id, question, state, created_at, updated_at) \
+             VALUES (?1, 'question?', ?2, ?3, ?3)",
             crate::turso::params![job_id, state_json, now.clone()],
         )
         .await

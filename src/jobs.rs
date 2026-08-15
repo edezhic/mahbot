@@ -165,27 +165,23 @@ fn pending_row_from(row: &Row) -> anyhow::Result<PendingJobRow> {
 // the mutex) and their own error contexts.
 
 /// pending_jobs envelope INSERT — producers: `message_router::persist_pending`
-/// and `complete_job_with_envelope`. `started`/`attempts` are schema-locked
-/// write-only columns (DEFAULT 0) — omitted by design.
+/// and `complete_job_with_envelope`.
 pub(crate) const PENDING_JOB_INSERT_SQL: &str = "INSERT INTO pending_jobs \
-     (id, target_agent_id, kind, envelope, workspace_name, user_name, channel, role, \
-      reply_target, created_at) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)";
+     (id, target_agent_id, kind, envelope, user_name, channel, role, created_at) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
 
 /// Build the pending_jobs INSERT params from a durable envelope — the target
 /// agent id and kind are derived from the envelope (no kind parameter).
-pub(crate) fn pending_job_params(id: &str, envelope: &AgentJob, now: &str) -> Result<[Value; 10]> {
+pub(crate) fn pending_job_params(id: &str, envelope: &AgentJob, now: &str) -> Result<[Value; 8]> {
     let envelope_json = serde_json::to_string(envelope)?;
     Ok([
         id.into(),
         envelope_target(envelope).into(),
         envelope.kind.as_str().into(),
         envelope_json.into(),
-        envelope.workspace_name.clone().into(),
         envelope.user_name.clone().into(),
         envelope.channel.clone().into(),
         envelope.role.as_str().into(),
-        envelope.reply_target.clone().unwrap_or_default().into(),
         now.into(),
     ])
 }
@@ -227,9 +223,9 @@ pub(crate) fn agent_params(
 /// every caller owns its child-row shape.
 #[derive(Debug, Clone)]
 pub(crate) enum SpawnChild {
-    /// ask_jobs (id, question).
-    Ask { question: String },
-    /// research_jobs (id, question, stage, round_index, budget_spent, state).
+    /// ask_jobs (id).
+    Ask,
+    /// research_jobs (id, question, state).
     Research { question: String },
     /// ticket_stage_jobs (id, ticket_id, stage, phase, round).
     TicketStage {
@@ -247,7 +243,7 @@ impl SpawnChild {
     #[must_use]
     pub const fn kind_str(&self) -> &'static str {
         match self {
-            Self::Ask { .. } => "ask",
+            Self::Ask => "ask",
             Self::Research { .. } => "research",
             Self::TicketStage { .. } => "ticket_stage",
         }
@@ -299,19 +295,18 @@ pub(crate) async fn spawn_job(
         .with_context(|| format!("failed to insert agent roster for job {id}"))?;
     }
     match child {
-        SpawnChild::Ask { question } => {
+        SpawnChild::Ask => {
             tx.execute(
-                "INSERT INTO ask_jobs (id, question, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
-                params![id, question.clone(), now.clone()],
+                "INSERT INTO ask_jobs (id, created_at, updated_at) VALUES (?1, ?2, ?2)",
+                params![id, now.clone()],
             )
             .await
             .with_context(|| format!("failed to insert ask_jobs row for job {id}"))?;
         }
         SpawnChild::Research { question } => {
             tx.execute(
-                "INSERT INTO research_jobs (id, question, stage, round_index, budget_spent, state, \
-                 created_at, updated_at) \
-                 VALUES (?1, ?2, 'decompose', 0, 0, '{}', ?3, ?3)",
+                "INSERT INTO research_jobs (id, question, state, created_at, updated_at) \
+                 VALUES (?1, ?2, '{}', ?3, ?3)",
                 params![id, question.clone(), now.clone()],
             )
             .await
@@ -862,9 +857,8 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
         }
         // The dedup above is the authoritative "in session" check: a row whose
         // content is NOT in the session was never appended (interrupted between
-        // route and the consumer's append) — route the FULL content. The
-        // `started` column is schema-locked but write-only; replaying empty
-        // here would silently lose the envelope forever (at-most-once
+        // route and the consumer's append) — route the FULL content. Replaying
+        // empty here would silently lose the envelope forever (at-most-once
         // violation).
         crate::message_router::route(&row.target_agent_id, job);
         replayed += 1;
@@ -1517,9 +1511,7 @@ mod tests {
                 role: crate::Role::Analyst,
                 task: "t1".to_string(),
             }],
-            &SpawnChild::Ask {
-                question: "q".to_string(),
-            },
+            &SpawnChild::Ask,
         )
         .await
         .unwrap();
@@ -1568,9 +1560,7 @@ mod tests {
             "telegram",
             Role::Manager,
             &[],
-            &SpawnChild::Ask {
-                question: "question?".to_string(),
-            },
+            &SpawnChild::Ask,
         )
         .await
         .unwrap();
@@ -1759,13 +1749,12 @@ mod tests {
         );
     }
 
-    /// F1 at-least-once fix: a started=1 row whose content is NOT in the
-    /// session (delivery interrupted between the started-mark and the
-    /// consumer's append) routes the FULL content — never empty. The dedup
-    /// (suffix + created_at) is the authoritative in-session signal; the
-    /// started flag alone is not proof of delivery.
+    /// F1 at-least-once fix: a row whose content is NOT in the session
+    /// (delivery interrupted between persist and the consumer's append) routes
+    /// the FULL content — never empty. The dedup (suffix + created_at) is the
+    /// authoritative in-session signal.
     #[tokio::test]
-    async fn pending_replay_started_row_not_in_session_routes_full_content() {
+    async fn pending_replay_not_in_session_routes_full_content() {
         let _ = crate::message_router::init_global();
         let (store, _tmp) = crate::open_test_store!(crate::session::SessionStore, "session");
         let conn = &store.conn;
@@ -1773,8 +1762,8 @@ mod tests {
         let mut rx = crate::message_router::register_agent(agent_id);
         let content = "FULL CONTENT";
         conn.execute(
-            "INSERT INTO pending_jobs (id, target_agent_id, kind, envelope, role, started, created_at) \
-             VALUES ('p2', ?1, 'ask_tool_result', ?2, 'manager', 1, ?3)",
+            "INSERT INTO pending_jobs (id, target_agent_id, kind, envelope, role, created_at) \
+             VALUES ('p2', ?1, 'ask_tool_result', ?2, 'manager', ?3)",
             params![
                 agent_id,
                 serde_json::to_string(&AgentJob {
@@ -1794,13 +1783,13 @@ mod tests {
         .await
         .unwrap();
         let replayed = replay_pending_jobs(conn).await.unwrap();
-        assert_eq!(replayed, 1, "started row not in session must be re-routed");
+        assert_eq!(replayed, 1, "row not in session must be re-routed");
         let routed = rx
             .try_recv()
             .expect("routed job must carry the full content");
         assert_eq!(
             routed.content, content,
-            "started=1 + not-in-session routes the FULL content, never empty"
+            "not-in-session routes the FULL content, never empty"
         );
         crate::message_router::unregister_agent(agent_id);
     }
