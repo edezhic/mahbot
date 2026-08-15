@@ -490,11 +490,11 @@ mod tests {
     }
 
     /// End-to-end regression guard for the retry-cause telemetry: recorded
-    /// `llm_requests` rows carry the caller's base params (response_format 0
-    /// — no wire forcing), and `retry_failures` rows carry the stamped
-    /// purpose/role/workspace context plus the fine-grained JSON-quality
-    /// cause. Catches the extraction path drifting from the recorded request
-    /// or dropping the retry context.
+    /// `llm_requests` rows carry the caller's base params, and
+    /// `retry_failures` rows carry the stamped purpose/role/workspace
+    /// context plus the fine-grained JSON-quality cause. Catches the
+    /// extraction path drifting from the recorded request or dropping the
+    /// retry context.
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // comprehensive end-to-end telemetry guard
     #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
@@ -515,7 +515,7 @@ mod tests {
             }),
             ..test_params()
         };
-        // Success path: recorded row carries the caller's response_format 0.
+        // Success path: recorded row carries the caller's base params.
         let fake = Arc::new(FakeProvider::new().ok(r#"{"score": 8}"#));
         let provider: Arc<dyn crate::Provider> = fake.clone();
         let _fake_guard = install_fake_provider(provider);
@@ -567,7 +567,7 @@ mod tests {
         let rows = store
             .conn
             .query(
-                "SELECT response_format, cost, upstream_provider, success \
+                "SELECT cost, upstream_provider, success \
                  FROM llm_requests WHERE agent_id = ?1 ORDER BY rowid",
                 crate::turso::params!["extraction-flag-test"],
             )
@@ -575,21 +575,18 @@ mod tests {
             .expect("query recorded rows");
         let mut rows = rows.into_iter();
         let success = rows.next().expect("success row must exist");
-        assert_eq!(success.get::<i64>(0).expect("response_format"), 0);
-        assert_eq!(success.get::<i64>(3).expect("success"), 1);
+        assert_eq!(success.get::<i64>(2).expect("success"), 1);
         let recovery = rows.next().expect("recovery row must exist");
-        assert_eq!(recovery.get::<i64>(0).expect("response_format"), 0);
-        assert_eq!(recovery.get::<i64>(3).expect("success"), 1);
+        assert_eq!(recovery.get::<i64>(2).expect("success"), 1);
         let failure = rows.next().expect("failure row must exist");
-        assert_eq!(failure.get::<i64>(0).expect("response_format"), 0);
-        assert_eq!(failure.get::<i64>(3).expect("success"), 0);
+        assert_eq!(failure.get::<i64>(2).expect("success"), 0);
         assert_eq!(
-            failure.get::<Option<f64>>(1).expect("cost"),
+            failure.get::<Option<f64>>(0).expect("cost"),
             None,
             "no envelope on failure path — cost must stay NULL"
         );
         assert_eq!(
-            failure.get::<Option<String>>(2).expect("upstream_provider"),
+            failure.get::<Option<String>>(1).expect("upstream_provider"),
             None,
             "no envelope on failure path — provider must stay NULL"
         );

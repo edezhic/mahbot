@@ -171,25 +171,14 @@ CREATE TABLE IF NOT EXISTS llm_requests (
     failure_class       TEXT,
     success             INTEGER NOT NULL DEFAULT 1,
     -- Observability additions: billed cost (the invoice amount), raw
-    -- cost_details, serving upstream provider, system_fingerprint,
-    -- and the retired response_format flag. All telemetry fields are parsed
-    -- generically from the response envelope, so cost/upstream_provider/
-    -- system_fingerprint are NULL on failures and whenever the provider
-    -- omits them. response_format was retired with the json_object removal
-    -- (verdict calls no longer force it) — historical marker only: new rows
-    -- default 0; pre-change rows carry 1 on every call site that forced
-    -- json_object (all extraction-choke-point purposes — extraction,
-    -- decompose_merge, gap_extract, claim_annotate, confirm_links,
-    -- abstain_check — plus consolidation and synthesis), 0 elsewhere; rows
-    -- predating the column read 0 regardless, so split the before/after
-    -- windows by recorded_at (deploy boundary), not response_format alone.
-    -- Only reliable while the store survives boot — quarantine recreation
-    -- resets history.
+    -- cost_details, serving upstream provider, system_fingerprint. All
+    -- telemetry fields are parsed generically from the response envelope,
+    -- so cost/upstream_provider/system_fingerprint are NULL on failures
+    -- and whenever the provider omits them.
     cost                REAL,
     cost_details        TEXT,
     upstream_provider   TEXT,
-    system_fingerprint  TEXT,
-    response_format     INTEGER NOT NULL DEFAULT 0
+    system_fingerprint  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_llm_requests_recorded_at ON llm_requests(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_llm_requests_agent_id ON llm_requests(agent_id);
