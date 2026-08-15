@@ -929,7 +929,8 @@ impl BoardState {
         Ok(CommitStats { files })
     }
 
-    /// Partition tickets into the three kanban columns.
+    /// Partition tickets into the four board columns in display order:
+    /// In Progress, Ready, Pending, Completed.
     pub(crate) fn board_sections(tickets: &[Ticket]) -> [Vec<&Ticket>; 4] {
         crate::board::BoardStore::board_sections(tickets)
     }
