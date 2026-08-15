@@ -850,22 +850,32 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
 /// rollback in board.db), no cross-DB tx.
 ///
 /// Crash-safe ordering:
-/// 1. SELECT the purge set (ticket_id, expected phase) BEFORE deleting —
+/// 1. SELECT the purge set (ticket_id, phase, stage, round) BEFORE deleting —
 ///    CASCADE destroys ticket_stage rows at delete time.
 /// 2. ONE board.db tx with per-ticket CAS rollback (phase CAS as the
-///    last-line race guard; round guard: only the ticket's LATEST round).
+///    last-line race guard; round guard: only the row's LATEST round for its
+///    own (ticket_id, stage) — rounds are scoped per stage, never across
+///    stages, so an older round of a different stage cannot suppress a stale
+///    row's rollback).
 /// 3. ONE sessions.db tx DELETE FROM jobs.
 ///
 /// Crash after (2) → CAS fails next tick, boot phase-check deletes the stale
 /// row; crash after (1) → nothing changed. Jobs-delete-first would strand a
 /// ticket in a blocking phase with no job row — strictly worse.
+///
+/// A boot does NOT rescue a stranded ticket via resume: `recover_from_restart`
+/// bumps every resumed row's updated_at (checkpoint_job), which makes the row
+/// purge-immune on later ticks, and a purge-deleted row has nothing to resume
+/// at all — recovery for the stranded ticket is specifically the next-boot
+/// reset (`reset_inflight_tickets`). The in-place rollback here is the only
+/// runtime rescue.
 pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
     let conn = &crate::session::store().conn;
 
     // (1) SELECT the purge set.
     let rows = conn
         .query(
-            "SELECT j.id, j.kind, ts.ticket_id, ts.phase, ts.round FROM jobs j \
+            "SELECT j.id, j.kind, ts.ticket_id, ts.phase, ts.round, ts.stage FROM jobs j \
              LEFT JOIN ticket_stage_jobs ts ON ts.id = j.id \
              WHERE j.updated_at < ?1 \
                AND NOT EXISTS ( \
@@ -885,8 +895,9 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
     let mut ticket_stage_ids: std::collections::HashSet<String> =
         std::collections::HashSet::with_capacity(rows.len());
     // (ticket_id, phase, is_latest_round) pairs for the board rollback, with
-    // the ticket's LATEST round pre-computed on the sessions conn (the board
-    // tx cannot see ticket_stage_jobs — it lives in sessions.db).
+    // the row's LATEST round for its own (ticket_id, stage) pre-computed on
+    // the sessions conn (the board tx cannot see ticket_stage_jobs — it
+    // lives in sessions.db).
     let mut rollbacks: Vec<(String, String, bool)> = Vec::new();
     for row in &rows {
         let id: String = row.get(0)?;
@@ -897,11 +908,18 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
             let ticket_id: Option<String> = row.get(2).ok();
             let phase: Option<String> = row.get(3).ok();
             let round: Option<i64> = row.get(4).ok();
-            if let (Some(t), Some(p), Some(r)) = (ticket_id, phase, round) {
+            let stage: Option<String> = row.get(5).ok();
+            if let (Some(t), Some(p), Some(r), Some(s)) = (ticket_id, phase, round, stage) {
+                // Round numbers are scoped per (ticket_id, stage) — an older
+                // round of a DIFFERENT stage must not suppress this row's
+                // rollback (a completed analysis round-2 row would otherwise
+                // block the rescue of a stale review round-1 row, stranding
+                // the ticket in a blocking phase).
                 let latest: Option<i64> = conn
                     .query_row(
-                        "SELECT MAX(round) FROM ticket_stage_jobs WHERE ticket_id = ?1",
-                        params![t.clone()],
+                        "SELECT MAX(round) FROM ticket_stage_jobs \
+                         WHERE ticket_id = ?1 AND stage = ?2",
+                        params![t.clone(), s.clone()],
                         |row| row.get::<i64>(0),
                     )
                     .await
@@ -959,11 +977,11 @@ fn rollback_transition(phase: &str) -> Option<(String, bool)> {
 }
 
 /// Roll back stranded tickets in place: phase + assigned_to = NULL +
-/// updated_at + pipeline_reservation. Guarded by round (only the ticket's
-/// LATEST round rolls back — pre-computed on the sessions conn) AND phase CAS
-/// (the ticket's current phase must equal the job's dispatched-for phase).
-/// Returns whether the board tx committed (false → purge keeps ticket_stage
-/// job rows so the next tick retries the CAS).
+/// updated_at + pipeline_reservation. Guarded by round (only the LATEST
+/// round for the row's (ticket_id, stage) rolls back — pre-computed on the
+/// sessions conn) AND phase CAS (the ticket's current phase must equal the
+/// job's dispatched-for phase). Returns whether the board tx committed (false
+/// → purge keeps ticket_stage job rows so the next tick retries the CAS).
 async fn rollback_stranded_tickets(rollbacks: &[(String, String, bool)]) -> bool {
     let board = crate::board::BOARD.get().expect("BOARD initialized");
     let tx = match board.conn.begin_tx().await {
@@ -979,7 +997,8 @@ async fn rollback_stranded_tickets(rollbacks: &[(String, String, bool)]) -> bool
         let Some((to, pipeline_reservation)) = rollback_transition(phase) else {
             continue;
         };
-        // Round guard: only the ticket's LATEST round rolls back.
+        // Round guard: only the LATEST round for the row's (ticket_id, stage)
+        // rolls back.
         if !is_latest {
             debug!(ticket = %ticket_id, "Purge rollback skipped (not latest round)");
             continue;
@@ -1927,8 +1946,11 @@ mod tests {
         }
     }
 
-    /// The round guard: only the ticket's LATEST round rolls back. A stale
-    /// earlier-round job's ticket stays untouched.
+    /// The round guard: only the LATEST round for the row's (ticket_id,
+    /// stage) rolls back. A stale earlier-round job of the SAME stage's
+    /// ticket stays untouched (per-stage scoping — an older round of a
+    /// DIFFERENT stage must not suppress the rollback; that case is covered
+    /// by [`purge_round_guard_scopes_per_stage`]).
     ///
     /// Serialized with the reset_inflight_tickets tests (shared global board —
     /// a concurrent boot reset would clobber the fixture phases).
@@ -1978,6 +2000,78 @@ mod tests {
             crate::board::TicketPhase::InReview,
             "older round's purge must not roll back the ticket (round guard)"
         );
+    }
+
+    /// The round guard scopes per (ticket_id, stage): a stale review round-1
+    /// row must NOT be suppressed by the ticket's older COMPLETED analysis
+    /// round-2 row — the review row rolls the ticket back out of the blocking
+    /// phase (the bug: per-ticket MAX = 2 made the review row look non-latest,
+    /// the row was deleted anyway, and the ticket stranded in in_review).
+    ///
+    /// The purge selects BOTH rows (a done row with old updated_at is
+    /// selected too): the analysis row's own rollback attempt no-ops via the
+    /// phase CAS mismatch (the ticket is in in_review, not analysis), so only
+    /// the review row's rollback lands.
+    ///
+    /// Serialized with the reset_inflight_tickets tests (shared global board —
+    /// a concurrent boot reset would clobber the fixture phases).
+    #[tokio::test]
+    #[serial_test::serial(reset_inflight)]
+    async fn purge_round_guard_scopes_per_stage() {
+        crate::util::test::init_test_stores().await;
+        let conn = &crate::session::store().conn;
+        let board = crate::board::store();
+        let ws = crate::workspace::test_ws_named("/tmp/purge_ws4", "purge_ws4");
+        let ticket_id = crate::util::test::make_ticket(
+            board,
+            &ws,
+            "Per-stage round guard",
+            crate::board::TicketPhase::InReview,
+        )
+        .await;
+        let stale = (chrono::Utc::now() - chrono::Duration::hours(20)).to_rfc3339();
+        // Analysis round 2 (done, old updated_at — selected by the purge too)
+        // + review round 1 (stale — the row that must trigger the rollback).
+        for (id, stage, phase, role, round) in [
+            ("jsa2", "analysis", "analysis", "analyst", 2i64),
+            ("jsr1", "review", "in_review", "reviewer", 1i64),
+        ] {
+            conn.execute(
+                "INSERT INTO jobs (id, kind, status, task, workspace_name, role, created_at, updated_at) \
+                 VALUES (?1, 'ticket_stage', 'launched', '', 'purge_ws4', ?2, ?3, ?3)",
+                params![id, role, stale.clone()],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, ticket_id.clone(), stage, phase, round],
+            )
+            .await
+            .unwrap();
+        }
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::hours(PURGE_CUTOFF_HOURS)).to_rfc3339();
+        purge_stale_jobs(&cutoff).await.unwrap();
+        // The review round-1 row is the ticket's latest review round → the
+        // ticket rolls back out of the blocking phase.
+        let t = board.get_ticket(&ticket_id).await.unwrap().unwrap();
+        assert_eq!(
+            t.phase,
+            crate::board::TicketPhase::DiagnosticsDone,
+            "stale review round must roll the ticket back out of in_review"
+        );
+        // Both stale rows were purged (done rows with old updated_at are
+        // selected too — the analysis row's rollback attempt no-ops via the
+        // phase CAS mismatch, but the row is still deleted).
+        for id in ["jsa2", "jsr1"] {
+            let n = conn
+                .query("SELECT COUNT(*) FROM jobs WHERE id = ?1", params![id])
+                .await
+                .unwrap();
+            assert_eq!(n[0].get::<i64>(0).unwrap(), 0, "{id} must be purged");
+        }
     }
 
     /// The rollback-failure path: when the board rollback cannot land, the
