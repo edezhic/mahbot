@@ -11,9 +11,11 @@
 //!   uses `RwLock<Option<_>>`, `tts` `OnceLock<RwLock<Option<_>>>`, and
 //!   `local_transcriber` `Mutex<Option<_>>`.  Unifying these would change
 //!   synchronization semantics (poisoning, init-once, contention).
-//! * `audio::local_transcriber` has no Drop guard: a panic in its download loop
-//!   would otherwise flip a stuck-Loading state to Failed, an observable
-//!   failure-behavior change outside this scope.
+//! * All four consumers use [`ModelLoadGuard`] in their background download
+//!   loops. `local_transcriber` gained its guard when its init moved off the
+//!   awaited boot path (mahbot-1709): the boot-time background load/download
+//!   must never leave its state stuck in `Loading` — a panic in the spawned
+//!   chain now flips it to `Failed` (the honest terminal state).
 //!
 //! Memory-ordering semantics are preserved exactly from the original copies:
 //! `Acquire` loads, `Release` stores, `AcqRel`/`Acquire` compare-exchange.

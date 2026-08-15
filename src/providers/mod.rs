@@ -176,31 +176,14 @@ static PROVIDER: RwLock<Option<Arc<dyn Provider>>> = RwLock::new(None);
 /// Global media transcriber (vision model for image/video descriptions).
 static MEDIA_TRANSCRIBER: RwLock<Option<MediaTranscriber>> = RwLock::new(None);
 
-/// Controls whether warmup failure should propagate or be non-fatal.
+/// Build the provider and media transcriber from config (synchronous, no I/O).
 ///
-/// Used by [`setup_provider_and_transcribers`] to differentiate the two
-/// call sites without a raw boolean parameter.
-enum WarmupMode {
-    /// Warmup failure is non-fatal — logged as a warning, init proceeds.
-    NonFatal,
-    /// Warmup failure propagates as an error.
-    Fatal,
-}
-
-/// Shared provider and transcriber setup logic.
-///
-/// Extracts config from the given [`ConfigData`], creates the provider and
-/// constructs the media transcriber (synchronous, no I/O), then optionally
-/// warms the provider up (async HTTP call). After warmup (or warmup
-/// skip/graceful failure), both globals — [`PROVIDER`], [`MEDIA_TRANSCRIBER`]
-/// — are swapped in together.
-///
-/// Used by [`init_global`] (startup, non-fatal warmup) and [`recreate_all`]
-/// (config reload, fatal warmup) to eliminate ~28 lines of duplication.
-async fn setup_provider_and_transcribers(
-    warmup_mode: WarmupMode,
+/// Extracted from the shared setup logic so both the boot path ([`init_global`])
+/// and the config-save path ([`recreate_all`]) construct the singletons once
+/// and differ only in warmup handling.
+fn build_provider_and_transcriber(
     config: &crate::config::ConfigData,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(Arc<dyn Provider>, Option<MediaTranscriber>)> {
     let endpoint_str = resolve_or(
         config.provider_endpoint.clone(),
         crate::config::DEFAULT_PROVIDER_ENDPOINT,
@@ -208,8 +191,8 @@ async fn setup_provider_and_transcribers(
     let provider: Arc<dyn Provider> =
         create_provider(config.provider_key.as_deref(), Some(endpoint_str.as_str()))?.into();
 
-    // Construct transcribers early — purely synchronous CPU work with no I/O,
-    // so there's no reason to wait until after the warmup HTTP call.
+    // Construct the transcriber eagerly — purely synchronous CPU work with no
+    // I/O, so there's no reason to wait until after the warmup HTTP call.
     let media_transcriber = create_transcriber(
         Some(&endpoint_str),
         config.provider_key.as_deref(),
@@ -223,46 +206,42 @@ async fn setup_provider_and_transcribers(
         non_empty(config.media_transcription_provider.clone()).as_deref(),
     );
 
-    // Now warm up the provider (costly HTTP round-trip).
-    match warmup_mode {
-        WarmupMode::Fatal => {
-            provider.warmup().await?;
-        }
-        WarmupMode::NonFatal => {
-            if let Err(e) = provider.warmup().await {
-                tracing::warn!(endpoint = %endpoint_str, "Provider warmup failed (non-fatal): {e}");
-            }
-        }
-    }
-
-    // Atomically swap both globals after warmup verification.
-    *PROVIDER.write().unwrap_poison() = Some(provider);
-    *MEDIA_TRANSCRIBER.write().unwrap_poison() = media_transcriber;
-
-    Ok(())
+    Ok((provider, media_transcriber))
 }
 
-/// Initialize the global provider and transcribers from CONFIG.
+/// Initialize the global provider and transcriber singletons from CONFIG.
 ///
-/// Warmup failures are non-fatal at startup — the system can still operate;
-/// retries happen at request time.
+/// Non-blocking by design (mahbot-1709 decision 4): the globals are swapped in
+/// BEFORE the warmup HTTP round-trip so boot never waits on it (worst case the
+/// endpoint is blackholed for minutes — a failure is non-fatal, retries happen
+/// at request time). The warmup runs as a detached background task and only
+/// pre-warms the connection pool; `chat_scoped` must never observe an unset
+/// [`PROVIDER`], hence the swap-before-warmup ordering.
 ///
-/// Also triggers eager init of the local Qwen3-ASR transcriber, which either
-/// loads from cache (async file verification on a blocking thread) or spawns
-/// a background download task.
-pub async fn init_global() -> anyhow::Result<()> {
+/// The local Qwen3-ASR transcriber init no longer lives here — the boot path
+/// spawns it separately (see
+/// [`crate::audio::local_transcriber::spawn_background_init_if_enabled`])
+/// after `config::reload_from_db` so its ~4 s load overlaps with the rest of
+/// boot instead of being awaited here.
+pub fn init_global() -> anyhow::Result<()> {
     let config = CONFIG.snapshot();
-    setup_provider_and_transcribers(WarmupMode::NonFatal, &config).await?;
+    let (provider, media_transcriber) = build_provider_and_transcriber(&config)?;
 
-    // Eagerly attempt to load the local Qwen3-ASR transcriber from cache.
-    // If files are missing, a background download is spawned automatically.
-    if config.audio_transcription_use_local.as_deref() == Some("false") {
-        tracing::debug!("Local audio transcription is disabled by config");
-    } else if crate::audio::local_transcriber::try_init_from_cache().await {
-        tracing::info!("Local Qwen3-ASR transcriber loaded from cache");
-    } else {
-        tracing::info!("Local Qwen3-ASR transcriber will be downloaded in background");
-    }
+    // Swap both globals now — warmup is a pool pre-warm, not a readiness gate.
+    *PROVIDER.write().unwrap_poison() = Some(provider.clone());
+    *MEDIA_TRANSCRIBER.write().unwrap_poison() = media_transcriber;
+
+    // Background warmup (non-fatal). The provider is Arc-cloned so the task
+    // outlives init_global; the endpoint string is captured for the log.
+    let endpoint_str = resolve_or(
+        config.provider_endpoint.clone(),
+        crate::config::DEFAULT_PROVIDER_ENDPOINT,
+    );
+    tokio::spawn(async move {
+        if let Err(e) = provider.warmup().await {
+            tracing::warn!(endpoint = %endpoint_str, "Provider warmup failed (non-fatal): {e}");
+        }
+    });
 
     Ok(())
 }
@@ -299,7 +278,16 @@ pub(crate) async fn warmup_provider_from_config(
 /// spawned — subsequent transcription requests return a placeholder until
 /// the download completes.
 pub(crate) async fn recreate_all(config: &crate::config::ConfigData) -> anyhow::Result<()> {
-    setup_provider_and_transcribers(WarmupMode::Fatal, config).await?;
+    let (provider, media_transcriber) = build_provider_and_transcriber(config)?;
+
+    // Config-save path: warmup is AWAITED and FATAL here — on failure the
+    // globals keep the previous provider (the new config was already
+    // pre-validated by [`warmup_provider_from_config`] before commit, so a
+    // failure here is exceptional). Swapping only after warmup preserves the
+    // "old singletons stay live on save failure" invariant.
+    provider.warmup().await?;
+    *PROVIDER.write().unwrap_poison() = Some(provider);
+    *MEDIA_TRANSCRIBER.write().unwrap_poison() = media_transcriber;
     tracing::info!("Provider and transcriber singletons recreated");
 
     // Re-init local transcriber if config enables it and it's not already ready.

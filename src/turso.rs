@@ -157,16 +157,62 @@ pub(crate) fn store_names() -> Vec<&'static str> {
 /// > listed here must also appear in that iterator.  The converse is not strictly
 /// > required because `logs` (and any future store initialized outside this path)
 /// > lives only in the checkpoint iterator.
+///
+/// # Real parallelism (mahbot-1709 decision 5)
+///
+/// Each store is spawned onto the runtime rather than joined via `try_join!`.
+/// turso's async query API performs the actual scan synchronously inside
+/// `poll` (a `step` only returns `Pending` on async I/O; for page-cache hits it
+/// returns `Row`/`Done` immediately), so `try_join!` polls the six
+/// opens — each ending in a full-DB `quick_check` — sequentially on a single
+/// task. Spawning gives each store its own worker, so the integrity scans run
+/// in parallel (the win scales with DB size).
+///
+/// # Error semantics
+///
+/// Unlike `try_join!` (fail-fast: cancels sibling opens on the first error,
+/// propagates panics), the spawned tasks all run to completion — every store
+/// gets its integrity verified even when a sibling fails — and the first error
+/// (in completion order) is reported. A panic inside a store init surfaces as
+/// a `JoinError` and is mapped back to an error so the boot failure surfaces
+/// through the binary's `bootstrap_mahbot_safe` catch_unwind instead of
+/// vanishing into the runtime.
 pub async fn init_all_stores() -> anyhow::Result<()> {
-    tokio::try_join!(
-        crate::session::init_global(),
-        crate::workspace::init_global(),
-        crate::users::init_global(),
-        crate::board::init_global(),
-        crate::chat_history::init_global(),
-        crate::config_db::init_global(),
-    )?;
-    Ok(())
+    let mut set = tokio::task::JoinSet::new();
+    set.spawn(crate::session::init_global());
+    set.spawn(crate::workspace::init_global());
+    set.spawn(crate::users::init_global());
+    set.spawn(crate::board::init_global());
+    set.spawn(crate::chat_history::init_global());
+    set.spawn(crate::config_db::init_global());
+
+    let mut first_error: Option<anyhow::Error> = None;
+    while let Some(result) = set.join_next().await {
+        let outcome = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e),
+            Err(join_err) => {
+                // A store-init panic surfaces as JoinError — preserve the
+                // boot-failure UX (previously panics propagated through
+                // try_join! into bootstrap_mahbot_safe's catch_unwind).
+                let message = join_err.try_into_panic().map_or_else(
+                    |_| "store init task failed to join".to_string(),
+                    |p| crate::util::panic_message(&*p),
+                );
+                Some(anyhow::anyhow!("store init task panicked: {message}"))
+            }
+        };
+        if let Some(e) = outcome
+            && first_error.is_none()
+        {
+            first_error = Some(e);
+        }
+    }
+
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Create [`turso::core::DatabaseOpts`] with all experimental features enabled.

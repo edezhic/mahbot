@@ -5,7 +5,7 @@
 
 pub(crate) mod audio_preprocessor;
 pub(crate) mod embedding_sequence;
-pub(crate) mod local_transcriber;
+pub mod local_transcriber;
 pub mod tts;
 pub mod voice;
 pub(crate) mod wake_word_classifier;

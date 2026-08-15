@@ -2619,7 +2619,7 @@ mod tests {
         if !crate::audio::local_transcriber::try_init_from_cache().await {
             eprintln!(
                 "SKIP: ASR model files present but could not be loaded \
-                 (checksum mismatch or corrupted files).\
+                 (corrupted or incomplete files).\
                  \n  Directory: {}",
                 asr_dir.display(),
             );

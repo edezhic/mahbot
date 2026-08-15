@@ -5,16 +5,32 @@
 //! This module is the **only** audio transcription path — the previous
 //! API-based transcriber has been removed.  When the model is
 //! available, inference runs fully locally with Qwen3-ASR-0.6B.  The model
-//! (~1.88 GB BF16 safetensors) is downloaded on first use to
-//! `~/.mahbot/models/qwen3-asr-0.6b/` and memory-mapped by the `qwen-asr`
-//! crate — zero-copy weight loading with minimal RSS overhead.
+//! (~1.88 GB BF16 safetensors) is downloaded on first boot to
+//! `~/.mahbot/models/qwen3-asr-0.6b/` (in the background — see below) and
+//! memory-mapped by the `qwen-asr` crate — zero-copy weight loading with
+//! minimal RSS overhead.
+//!
+//! # Boot strategy (mahbot-1709)
+//!
+//! The boot path never waits for the model: [`spawn_background_init_if_enabled`]
+//! kicks the load-or-download chain off as a background task after the config
+//! store is open (so `audio_transcription_use_local` is authoritative), and the
+//! app + background services start regardless. A voice message that arrives
+//! before the background load completes gets the icon-only annotation (the
+//! load typically finishes within the first seconds of boot — the ~4 s model
+//! load runs concurrently with the rest of startup).
 //!
 //! # Download strategy
 //!
-//! Follows the same lazy-download pattern as [`crate::embedder`]: synchronous
-//! cache check on first use, then background retry loop with exponential
-//! backoff if files are missing. SHA256 integrity verification is performed
-//! after each download.
+//! Files are SHA256-verified **once, at download time** (the streaming
+//! `download_verified` hasher) — there is no per-boot re-verification of the
+//! ~1.9 GB model (that was ~4.4 s of the awaited boot path). A silently
+//! corrupted cache is therefore caught at load time instead: `QwenCtx::load`
+//! returns `None` and the init falls through to the download+verify recovery
+//! loop. Note the load is mmap-based, so partial corruption can survive the
+//! load and surface as a SIGBUS at inference rather than a graceful fallback —
+//! accepted tradeoff (ticket decision 1). Missing/corrupt files trigger the
+//! background retry loop with exponential backoff.
 //!
 //! # Audio format conversion
 //!
@@ -40,8 +56,10 @@
 
 use crate::audio::models_subdir;
 use crate::util::UnwrapPoison;
-use crate::util::model_state::{AtomicModelState, ModelState};
+use crate::util::model_state::{AtomicModelState, ModelLoadGuard, ModelState};
 use anyhow::{Context, Result};
+use futures_util::FutureExt;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -566,7 +584,17 @@ fn download_client() -> Result<reqwest::Client> {
 /// backoff and retries up to [`MAX_DOWNLOAD_RETRIES`] times. On success,
 /// loads the model and transitions to [`ModelState::Ready`]. On terminal failure,
 /// transitions to [`ModelState::Failed`].
+///
+/// Panic-safety: a [`ModelLoadGuard`] transitions `Loading → Failed` on drop,
+/// so a panic or cancellation in this task never leaves [`STATE`] stuck in
+/// [`ModelState::Loading`] (which would silently disable transcription until
+/// restart). Since the boot path now drives this loop from a background task,
+/// a stuck-Loading state would be both silent and permanent — Failed is the
+/// honest terminal state.
 async fn download_retry_loop() {
+    // Loading → Failed on drop (panic/cancel safety). No-op on the terminal
+    // states set by the success/retry-cap paths below.
+    let _guard = ModelLoadGuard::new(&STATE);
     let Some(dir) = models_subdir(MODEL_DIR_NAME) else {
         warn!("Local transcriber: cannot resolve model directory (storage root not set)");
         STATE.store(ModelState::Failed, Ordering::Release);
@@ -686,45 +714,40 @@ async fn download_retry_loop() {
 
 // ── Public API ────────────────────────────────────────────────────────
 
-/// Shared initialization logic — checks files, verifies checksums, loads the
-/// model from `dir`, and stores it into [`GLOBAL_TRANSCRIBER`].  The caller
-/// ([`try_init_from_cache`]) is responsible for the STATE atomic guard.
+/// Load the transcriber from an already-resolved cache directory on a blocking
+/// thread (memory-map + weight setup). Returns `None` when any file is missing
+/// or the load fails.
+async fn load_from_cache(dir: PathBuf) -> Option<QwenLocalTranscriber> {
+    tokio::task::spawn_blocking(move || QwenLocalTranscriber::try_load_from(&dir))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Shared cache-check + load logic used by both the awaited entry
+/// ([`try_init_from_cache`]) and the background boot init
+/// ([`init_background`]). The caller is responsible for the STATE atomic
+/// guard.
+///
+/// Decision 1 (mahbot-1709): no per-boot SHA256 re-verification — files are
+/// verified once at download time (`download_verified` hashes the stream; the
+/// download loop re-verifies already-present files on recovery). A silently
+/// corrupted cache is caught at load time instead: a `None` from
+/// [`load_from_cache`] falls through to the download+verify recovery loop.
+/// (Tradeoff: the mmap-based load can succeed on partial corruption — accepted
+/// per ticket decision 1; see module docs.)
 async fn try_init_inner(dir: PathBuf) -> bool {
     let model_path = dir.join(MODEL_FILENAME);
     let vocab_path = dir.join(VOCAB_FILENAME);
     let merges_path = dir.join(MERGES_FILENAME);
 
     if model_path.exists() && vocab_path.exists() && merges_path.exists() {
-        // Verify checksums on a blocking thread (large file I/O).
-        let paths = (model_path.clone(), vocab_path.clone(), merges_path.clone());
-        let checksums_ok = tokio::task::spawn_blocking(move || {
-            crate::util::verify_sha256(&paths.0, MODEL_SHA256).is_ok()
-                && crate::util::verify_sha256(&paths.1, VOCAB_SHA256).is_ok()
-                && crate::util::verify_sha256(&paths.2, MERGES_SHA256).is_ok()
-        })
-        .await
-        .unwrap_or_else(|join_err| {
-            warn!("Local transcriber: SHA256 verification task panicked: {join_err}");
-            false
-        });
-
-        if checksums_ok {
-            // Load the model using the already-resolved directory
-            // (moved into the blocking closure — no longer needed after this).
-            let loaded =
-                tokio::task::spawn_blocking(move || QwenLocalTranscriber::try_load_from(&dir))
-                    .await
-                    .ok()
-                    .flatten();
-            if let Some(tc) = loaded {
-                info!("Local transcriber: loaded from cache");
-                set_transcriber_ready(tc);
-                return true;
-            }
-            warn!("Local transcriber: cached files present but failed to load");
-        } else {
-            warn!("Local transcriber: cached files failed checksum, will re-download");
+        if let Some(tc) = load_from_cache(dir).await {
+            info!("Local transcriber: loaded from cache");
+            set_transcriber_ready(tc);
+            return true;
         }
+        warn!("Local transcriber: cached files present but failed to load");
     }
 
     // Spawn background download.
@@ -737,6 +760,33 @@ async fn try_init_inner(dir: PathBuf) -> bool {
     info!("Local transcriber: model not cached, spawning background download");
     tokio::spawn(download_retry_loop());
     false
+}
+
+/// Background load-or-download chain for the boot path — spawned by
+/// [`spawn_background_init`] and never awaited by the boot path.
+///
+/// STATE must already be `Loading` (the caller owns the `Uninit → Loading`
+/// transition via [`try_lock_init`]). Loads from cache when all files are
+/// present; otherwise runs the download+verify retry loop to completion (it is
+/// already in the background — no need to detach it further). Both paths
+/// transition STATE to a terminal state ([`set_transcriber_ready`] /
+/// `Failed`).
+async fn init_background(dir: PathBuf) {
+    let model_path = dir.join(MODEL_FILENAME);
+    let vocab_path = dir.join(VOCAB_FILENAME);
+    let merges_path = dir.join(MERGES_FILENAME);
+
+    if model_path.exists() && vocab_path.exists() && merges_path.exists() {
+        if let Some(tc) = load_from_cache(dir).await {
+            info!("Local Qwen3-ASR transcriber loaded from cache");
+            set_transcriber_ready(tc);
+            return;
+        }
+        warn!("Local transcriber: cached files present but failed to load — re-downloading");
+    }
+
+    info!("Local transcriber: model not cached, downloading in background");
+    download_retry_loop().await;
 }
 
 /// Try to shortcut or acquire the initialisation lock.
@@ -764,8 +814,11 @@ fn try_lock_init() -> Option<bool> {
 /// (resolved via [`crate::audio::models_subdir`], which depends on the CONFIG
 /// storage root).
 ///
-/// This is the main entry point used by the production pipeline
-/// (`bootstrap` and audio enrichment).
+/// Awaits the cache load (fast with warm page cache — no per-boot SHA256), or
+/// spawns a detached background download when the cache is missing/corrupt.
+/// Used by the config-save path ([`crate::providers::recreate_all`]) and the
+/// TTS e2e test; the boot path uses [`spawn_background_init_if_enabled`]
+/// instead so it never waits on the load.
 pub async fn try_init_from_cache() -> bool {
     if let Some(result) = try_lock_init() {
         return result;
@@ -777,6 +830,62 @@ pub async fn try_init_from_cache() -> bool {
     };
 
     try_init_inner(dir).await
+}
+
+/// Kick off the local ASR transcriber's load-or-download chain as a background
+/// task (boot path, mahbot-1709 decisions 2/3).
+///
+/// The boot path never awaits this: the app and background services start
+/// regardless, and the ~4 s model load (or a full download when the cache is
+/// missing) runs concurrently with the rest of boot. The load starts here —
+/// it is **not** deferred until the first voice message.
+///
+/// No-op when the transcriber is already ready/loading, or when a previous
+/// attempt failed (Failed is terminal — a restart is required to retry).
+/// Panic-safe: a panic inside the spawned chain transitions STATE to
+/// [`ModelState::Failed`] instead of leaving it stuck in Loading.
+pub fn spawn_background_init() {
+    if let Some(result) = try_lock_init() {
+        // Ready (true) — already loaded. Loading/Failed (false) — an init is
+        // already in flight or a previous attempt failed terminally; nothing
+        // to start.
+        debug!(result, "Local transcriber: background init skipped");
+        return;
+    }
+
+    let Some(dir) = models_subdir(MODEL_DIR_NAME) else {
+        warn!("Local transcriber: cannot resolve model directory (storage root not set)");
+        STATE.store(ModelState::Failed, Ordering::Release);
+        return;
+    };
+
+    tokio::spawn(async move {
+        // A panic must never leave STATE stuck in Loading (silently disabling
+        // transcription until restart) — store the honest terminal state.
+        let result = AssertUnwindSafe(init_background(dir)).catch_unwind().await;
+        if result.is_err() {
+            warn!("Local transcriber: background init panicked — marking failed");
+            STATE.store(ModelState::Failed, Ordering::Release);
+        }
+    });
+}
+
+/// Boot entry: spawn the ASR background init unless `audio_transcription_use_local`
+/// is explicitly `"false"` (the config store must already be loaded — the
+/// caller runs this after [`crate::config::reload_from_db`]).
+pub fn spawn_background_init_if_enabled() {
+    let disabled = crate::config::CONFIG
+        .snapshot()
+        .audio_transcription_use_local
+        .as_deref()
+        == Some("false");
+    if disabled {
+        tracing::debug!(
+            "Local audio transcription is disabled by config — skipping background init"
+        );
+        return;
+    }
+    spawn_background_init();
 }
 
 /// True if the local transcriber is loaded and ready for use.
