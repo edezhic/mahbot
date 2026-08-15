@@ -105,9 +105,13 @@ struct ResearchState {
     markers: Vec<String>,
     gap_outcome: GapRoundsOutcome,
     budget_spent: usize,
-    /// Gap-loop resume pointer: the next gap round to dispatch (the gap list
-    /// is stored; empty unresolved + gap_outcome.rounds_dispatched = k means
-    /// "continue at round k+1").
+    /// Gap-loop resume pointer / cumulative completed-round count: incremented
+    /// pre-dispatch, persisted post-completion at every per-round checkpoint,
+    /// restored on resume so the loop continues at the next round (the gap
+    /// list itself is persisted alongside — this field is the continuation
+    /// key). Distinct from the per-invocation dispatch counter,
+    /// [`GapRoundsOutcome::rounds_dispatched`] — see the `gap_rounds` doc for
+    /// why both exist.
     round_index: usize,
     verification: Vec<VerificationResult>,
     /// Accumulated outside-zone shell commands (write-intent + zone filter
@@ -2012,6 +2016,14 @@ async fn run_coder_gated(
 /// post-round-1 checkpoint and re-run the ENTIRE gap stage from round 0 with
 /// fresh analyst sessions (whole-stage re-run, duplicated LLM spend).
 ///
+/// Why two counters: `round_index` is the persisted resume pointer
+/// (accumulated across invocations) while `rounds_dispatched` is the report
+/// telemetry count. After the resume fix they are equal at every per-round
+/// checkpoint; they diverge only on the abstention / gap-extract-failure exit
+/// path, where that round's checkpoint is skipped so the persisted
+/// `round_index` lags by one while `rounds_dispatched` still counts the final
+/// completed round.
+///
 /// Coder-in-loop: one prototype pass (key 0) before the loop over the initial
 /// gap list, then one after every progress round that refreshes a non-empty
 /// gap list (key = the round's index). Each pass is gated by the same
@@ -2035,10 +2047,16 @@ async fn gap_rounds(
     resume: bool,
     recovered: &mut Vec<AnalystFindings>,
 ) -> GapRoundsOutcome {
+    // Cumulative across boot-resumes: seed the per-invocation dispatch count
+    // from the persisted checkpoint so a resumed run's "rounds used"
+    // telemetry covers the whole run, not just the post-resume segment. The
+    // reserve-failure exit and the "only count actually-dispatched rounds"
+    // semantics (the increment happens after dispatch, not at the loop top)
+    // are unchanged.
     let mut outcome = GapRoundsOutcome {
         abstention: None,
         unresolved: Vec::new(),
-        rounds_dispatched: 0,
+        rounds_dispatched: state.gap_outcome.rounds_dispatched,
         incomplete: None,
     };
     let initial_list = match state.gap_list.take() {
@@ -3077,8 +3095,8 @@ async fn run_deep_research(
         // accumulated round_index (the per-round checkpoints inside
         // gap_rounds already persisted it + the current gap list) instead of
         // skipping the remaining gap rounds and synthesizing from truncated
-        // evidence (design pin: "empty unresolved + rounds_dispatched = k
-        // means continue at round k+1").
+        // evidence (design pin: round_index is the cumulative completed-round
+        // count, restored on resume as the continuation key).
         if crate::shutdown::aborting() {
             state.gap_outcome = gap_outcome;
             state.budget_spent = budget.spent;
