@@ -2442,3 +2442,103 @@ async fn engineer_comment_text_fail_open_and_renders() {
         "valid items render the compact bullet list"
     );
 }
+
+// ── ticket_stage roster helpers ──────────────────────────────────────────
+// These pin the agent-id / angle-cycling contract shared by
+// `spawn_ticket_stage_round` (fresh dispatch) and `append_ticket_stage_slots`
+// (analysis escalation). The helpers are the single home for both rules — if
+// the shape ever changes, these tests are the first to notice.
+
+/// The agent-id helper must produce the exact documented shape
+/// `ticket_{ticket_id}_{idx}_{suffix}_{role}` for both dispatch paths.
+#[test]
+fn ticket_stage_agent_id_format() {
+    assert_eq!(
+        ticket_stage_agent_id("t-42", 0, "abc123", Role::Analyst),
+        "ticket_t-42_0_abc123_analyst",
+        "base-round slot 0"
+    );
+    assert_eq!(
+        ticket_stage_agent_id("t-42", 2, "abc123", Role::Analyst),
+        "ticket_t-42_2_abc123_analyst",
+        "base-round slot 2"
+    );
+    // Escalation continues at the roster length (3, 4) with a FRESH suffix.
+    assert_eq!(
+        ticket_stage_agent_id("t-42", 3, "def456", Role::Analyst),
+        "ticket_t-42_3_def456_analyst",
+        "escalation slot 3"
+    );
+    assert_eq!(
+        ticket_stage_agent_id("t-42", 4, "def456", Role::Analyst),
+        "ticket_t-42_4_def456_analyst",
+        "escalation slot 4"
+    );
+    // Role string is the canonical lowercase `as_str()` (role LAST).
+    assert_eq!(
+        ticket_stage_agent_id("t-7", 0, "xyz789", Role::Reviewer),
+        "ticket_t-7_0_xyz789_reviewer"
+    );
+    assert_eq!(
+        ticket_stage_agent_id("t-7", 0, "xyz789", Role::Qa),
+        "ticket_t-7_0_xyz789_qa"
+    );
+}
+
+/// The angle-cycling rule must cover all three branches: bare prompt (no
+/// angles), join-all for single-slot rounds, and per-index cycling with wrap.
+#[test]
+fn ticket_stage_slot_task_angle_branches() {
+    let prompt = "Review the change";
+    let angles = vec!["angle one".to_string(), "angle two".to_string()];
+
+    // No angles → bare prompt untouched (Analyst-style roles).
+    assert_eq!(
+        ticket_stage_slot_task(prompt, &[], 3, 1),
+        prompt,
+        "no angles: shared prompt used verbatim"
+    );
+
+    // Single-slot round (QA's lone tester) → ALL angle sections joined.
+    assert_eq!(
+        ticket_stage_slot_task(prompt, &angles, 1, 0),
+        format!("{prompt}\n\nangle one\n\nangle two"),
+        "slot_count == 1 concatenates every angle section"
+    );
+
+    // Multi-slot round → cycling by GLOBAL slot index, wrapping past len.
+    assert_eq!(
+        ticket_stage_slot_task(prompt, &angles, 2, 0),
+        format!("{prompt}\n\nangle one"),
+        "global idx 0 → first angle"
+    );
+    assert_eq!(
+        ticket_stage_slot_task(prompt, &angles, 2, 1),
+        format!("{prompt}\n\nangle two"),
+        "global idx 1 → second angle"
+    );
+    assert_eq!(
+        ticket_stage_slot_task(prompt, &angles, 2, 2),
+        format!("{prompt}\n\nangle one"),
+        "global idx 2 wraps to first angle"
+    );
+    assert_eq!(
+        ticket_stage_slot_task(prompt, &angles, 2, 3),
+        format!("{prompt}\n\nangle two"),
+        "global idx 3 wraps to second angle"
+    );
+
+    // Escalation view: the job is the whole — a base roster of 3 + 2
+    // escalation slots must keep angle selection continuous (idx 3, 4).
+    let angles3 = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    assert_eq!(
+        ticket_stage_slot_task(prompt, &angles3, 5, 3),
+        format!("{prompt}\n\na"),
+        "escalation global idx 3 → angles[3 % 3]"
+    );
+    assert_eq!(
+        ticket_stage_slot_task(prompt, &angles3, 5, 4),
+        format!("{prompt}\n\nb"),
+        "escalation global idx 4 → angles[4 % 3]"
+    );
+}

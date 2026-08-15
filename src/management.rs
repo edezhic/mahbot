@@ -2694,17 +2694,14 @@ fn load_verifier_angles(role: Role) -> Vec<String> {
 /// Run `count` agents of the same role in parallel, then extract structured verdicts
 /// from their responses.
 ///
-/// Agent IDs are formatted as `ticket_{ticket.id}_{i}_{suffix}_{role}`
-/// where `suffix` is a unique 6-char NanoID for retry-cycle disambiguation.
-/// Each agent creates its own CancellationToken and auto-registers.
-///
-/// Verifier roles (Reviewer, QA) get per-agent angle supplements
-/// ([`load_verifier_angles`]) appended to the user message — single-agent
-/// rounds concatenate all sections, multi-agent rounds cycle by index
-/// (`i % len`). KV-cache discipline: the
-/// variation is limited to the user message — model, reasoning effort, and
-/// tools stay identical across agents. Other roles load no angles, leaving the
-/// shared prompt untouched.
+/// Roster slots are pre-built by the caller ([`spawn_ticket_stage_round`] for
+/// fresh dispatch, [`append_ticket_stage_slots`] for analysis escalation). The
+/// agent-id format and the angle-cycling rule are canonicalized in
+/// [`ticket_stage_agent_id`] and [`ticket_stage_slot_task`] respectively —
+/// both call sites must go through them so the two rules cannot drift. Each
+/// agent creates its own CancellationToken and auto-registers. KV-cache
+/// discipline: the variation is limited to the user message — model,
+/// reasoning effort, and tools stay identical across agents.
 ///
 /// Agents with empty responses get [`ParallelVerdict::NoResponse`]; agents that
 /// respond but fail to parse get [`ParallelVerdict::ParseFailed`]; successful
@@ -3054,6 +3051,59 @@ async fn next_ticket_stage_round(
     .unwrap_or(1)
 }
 
+/// Canonical agent-id format for ticket_stage roster slots
+/// (`ticket_{ticket_id}_{idx}_{suffix}_{role}`).
+///
+/// `idx` is the slot's GLOBAL index within the job (base round: the 0-based
+/// per-slot index; escalation: the continuation index 3, 4). `suffix` is a
+/// unique 6-char NanoID generated per dispatch batch for retry-cycle
+/// disambiguation — a fresh suffix per batch guarantees escalation slots can
+/// never collide with base-round ids, even across crash/resume cycles.
+///
+/// This is the single home for the id contract shared by
+/// [`spawn_ticket_stage_round`] (fresh dispatch) and
+/// [`append_ticket_stage_slots`] (analysis escalation) — the two must never
+/// drift. Resume paths read the stored agent ids straight from the roster and
+/// only match the `ticket_` prefix, so the exact shape is convention, not a
+/// parse contract.
+#[must_use]
+fn ticket_stage_agent_id(ticket_id: &str, idx: i64, suffix: &str, role: Role) -> String {
+    format!("ticket_{}_{}_{}_{}", ticket_id, idx, suffix, role.as_str())
+}
+
+/// Render the FINAL per-agent task for a ticket_stage roster slot — the
+/// canonical angle-cycling rule shared by [`spawn_ticket_stage_round`] and
+/// [`append_ticket_stage_slots`].
+///
+/// `angles` are the per-agent angle supplements from [`load_verifier_angles`]
+/// (empty for non-verifier roles → the shared prompt is used untouched).
+/// `slot_count` is the TOTAL number of slots in the job; `global_idx` is the
+/// slot's index within the job (base round: `i`; escalation: `roster_len + k`).
+///
+/// - no angles → bare `prompt`;
+/// - `slot_count == 1` (single-agent round, e.g. QA's lone tester) →
+///   concatenate ALL angle sections;
+/// - otherwise → `prompt` + the angle section selected by
+///   `global_idx % angles.len()` (defensive cycling; reviewers max at 4).
+///
+/// KV-cache discipline: the variation is limited to the user message — model,
+/// reasoning effort, and tools stay identical across agents.
+#[must_use]
+fn ticket_stage_slot_task(
+    prompt: &str,
+    angles: &[String],
+    slot_count: usize,
+    global_idx: usize,
+) -> String {
+    if angles.is_empty() {
+        prompt.to_string()
+    } else if slot_count == 1 {
+        format!("{prompt}\n\n{}", angles.join("\n\n"))
+    } else {
+        format!("{prompt}\n\n{}", angles[global_idx % angles.len()])
+    }
+}
+
 /// Spawn a ticket_stage job + roster in ONE transaction (before any agent
 /// session write). The job row carries the rendered prompt template; each
 /// roster row carries the FINAL per-agent prompt. Returns the job id + slots.
@@ -3072,19 +3122,11 @@ async fn spawn_ticket_stage_round(
     let angles = load_verifier_angles(role);
     let mut slots = Vec::with_capacity(count);
     for i in 0..count {
-        let agent_id = format!("ticket_{}_{}_{}_{}", ticket.id, i, suffix, role.as_str());
-        // Single-agent rounds concatenate ALL angle sections (QA runs one
-        // tester); multi-agent rounds cycle by slot index (`i % len` —
-        // defensive, reviewers max at 4).
-        let task = if angles.is_empty() {
-            prompt.to_string()
-        } else if count == 1 {
-            format!("{prompt}\n\n{}", angles.join("\n\n"))
-        } else {
-            format!("{prompt}\n\n{}", angles[i % angles.len()])
-        };
+        let idx = i64::try_from(i).unwrap_or(i64::MAX);
+        let agent_id = ticket_stage_agent_id(&ticket.id, idx, &suffix, role);
+        let task = ticket_stage_slot_task(prompt, &angles, count, i);
         slots.push(TicketStageSlot {
-            idx: i64::try_from(i).unwrap_or(i64::MAX),
+            idx,
             agent_id,
             task,
             status: crate::jobs::RowStatus::Launched,
@@ -3188,14 +3230,14 @@ async fn append_ticket_stage_slots(
     let next_idx = i64::try_from(roster_len).unwrap_or(i64::MAX);
     let suffix = crate::generate_suffix();
     let angles = load_verifier_angles(role);
+    // The angle rule sees the job as a whole: slot_count is the TOTAL roster
+    // size (base + escalation) and the global index (roster_len + k) keeps
+    // angle selection continuous with the base-round slots.
+    let slot_count = roster_len + count;
     let mut slots = Vec::with_capacity(count);
     for (k, i) in (next_idx..next_idx + i64::try_from(count).unwrap_or(i64::MAX)).enumerate() {
-        let agent_id = format!("ticket_{}_{}_{}_{}", ticket.id, i, suffix, role.as_str());
-        let task = if angles.is_empty() {
-            prompt.to_string()
-        } else {
-            format!("{prompt}\n\n{}", angles[(roster_len + k) % angles.len()])
-        };
+        let agent_id = ticket_stage_agent_id(&ticket.id, i, &suffix, role);
+        let task = ticket_stage_slot_task(prompt, &angles, slot_count, roster_len + k);
         crate::session::store()
             .conn
             .execute(
