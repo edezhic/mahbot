@@ -327,14 +327,11 @@ pub(crate) struct NewAgent {
 
 // ── Checkpoint ──────────────────────────────────────────────────────────
 
-/// Checkpoint a job row: bump status/retry_count and touch `updated_at`
+/// Checkpoint a job row: bump retry_count and touch `updated_at`
 /// (every jobs write sets updated_at = now — the 8h purge keys off it).
-pub(crate) async fn checkpoint_job(
-    conn: &Connection,
-    id: &str,
-    status: RowStatus,
-    retry_count: i64,
-) -> Result<()> {
+pub(crate) async fn checkpoint_job(conn: &Connection, id: &str, retry_count: i64) -> Result<()> {
+    // Boot resumes re-arm status to Launched (failed → launched re-activation).
+    let status = RowStatus::Launched;
     let now = turso::now();
     conn.execute(
         "UPDATE jobs SET status = ?1, retry_count = ?2, updated_at = ?3 WHERE id = ?4",
@@ -939,8 +936,7 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
         if !rollback_ok && ticket_stage_ids.contains(id) {
             continue;
         }
-        tx.execute("DELETE FROM jobs WHERE id = ?1", params![id.clone()])
-            .await?;
+        delete_job_tx(&tx, id).await?;
         deleted += 1;
     }
     tx.commit().await?;
@@ -1100,7 +1096,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
         // Bump updated_at for every resumed job (the boot bump) AND increment
         // retry_count (the cap counts boot-resume attempts, not in-job
         // retries — every bump here is one resume).
-        let _ = checkpoint_job(conn, &job.id, RowStatus::Launched, job.retry_count + 1).await;
+        let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
         let in_phase = crate::board::store()
             .get_ticket_phase(&ticket_id)
             .await
@@ -1193,7 +1189,6 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
                 let _ = checkpoint_job(
                     conn,
                     &job.id,
-                    RowStatus::Launched,
                     if capped {
                         job.retry_count
                     } else {
