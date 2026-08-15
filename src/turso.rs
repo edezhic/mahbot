@@ -877,21 +877,21 @@ impl Connection {
             .query("PRAGMA quick_check;", ())
             .await
             .context("Failed to execute PRAGMA quick_check")?;
-        scan_integrity_rows(&rows, "quick_check")
+        scan_integrity_rows(&rows)
     }
 }
 
 /// Collect problem rows from `PRAGMA quick_check` (skipping `"ok"` and the
 /// known FTS index-cardinality false positive). Used by
 /// [`Connection::quick_check_problems`].
-fn scan_integrity_rows(rows: &[Row], pragma_name: &str) -> anyhow::Result<Vec<String>> {
+fn scan_integrity_rows(rows: &[Row]) -> anyhow::Result<Vec<String>> {
     let mut problems: Vec<String> = Vec::new();
     for row in rows {
         match row.get_value(0)? {
             Value::Text(s) if s == "ok" => {}
             Value::Text(s) if s.contains(KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE) => {}
             Value::Text(s) => problems.push(s),
-            _ => anyhow::bail!("Unexpected result from PRAGMA {pragma_name}"),
+            _ => anyhow::bail!("Unexpected result from PRAGMA quick_check"),
         }
     }
     Ok(problems)
