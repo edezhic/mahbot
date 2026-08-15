@@ -250,8 +250,8 @@ use crate::Tool;
 use crate::Workspace;
 use crate::config::CONFIG;
 use crate::tools::{
-    AddCommentTool, AskTool, BrowserTool, CreateTicketTool, DispatchMode, EditTool, GetTicketTool,
-    ImageGenTool, ImplementTool, ListTicketsTool, ReadTool, ResearchTool,
+    AddCommentTool, AnalyzeTool, BrowserTool, CreateTicketTool, DispatchMode, EditTool,
+    GetTicketTool, ImageGenTool, ImplementTool, ListTicketsTool, ReadTool, ResearchTool,
     SearchArchivedTicketsTool, SearchTool, ShellMode, ShellTool, UpdateTicketTool, VideoEditTool,
     VideoGenTool, WebSearchBackend, WebSearchTool,
 };
@@ -288,7 +288,10 @@ impl Role {
         let mut tools: Vec<Box<dyn Tool>> = match self {
             Role::Engineer => {
                 let mut t = Self::full_core_tools();
-                t.push(Box::new(AskTool::new(DispatchMode::Sync, Role::Engineer)));
+                t.push(Box::new(AnalyzeTool::new(
+                    DispatchMode::Sync,
+                    Role::Engineer,
+                )));
                 t.push(Box::new(ImplementTool));
                 t
             }
@@ -300,7 +303,7 @@ impl Role {
                     Box::new(GetTicketTool::new(ws)),
                     Box::new(AddCommentTool::new(ws)),
                     Box::new(SearchArchivedTicketsTool::new(ws)),
-                    Box::new(AskTool::new(DispatchMode::Async, Role::Manager)),
+                    Box::new(AnalyzeTool::new(DispatchMode::Async, Role::Manager)),
                     Box::new(ResearchTool::new(Role::Manager)),
                 ]
             }
@@ -323,12 +326,18 @@ impl Role {
             }
             Role::Maintainer => {
                 let mut t = Self::readonly_core_tools();
-                t.push(Box::new(AskTool::new(DispatchMode::Sync, Role::Maintainer)));
+                t.push(Box::new(AnalyzeTool::new(
+                    DispatchMode::Sync,
+                    Role::Maintainer,
+                )));
                 t.push(Box::new(CreateTicketTool::new("maintainer", ws)));
                 t
             }
             Role::Assistant => {
-                vec![Box::new(AskTool::new(DispatchMode::Async, Role::Assistant))]
+                vec![Box::new(AnalyzeTool::new(
+                    DispatchMode::Async,
+                    Role::Assistant,
+                ))]
             }
         };
 
@@ -345,7 +354,7 @@ impl Role {
     /// is configured but its API key is missing, no tool is added.
     /// Auto-selection: Firecrawl wins ties (both keys set, no preference).
     /// The caller is responsible for skipping this for Manager (who is
-    /// expected to delegate web searches to analysts via [`AskTool`]).
+    /// expected to delegate web searches to analysts via [`AnalyzeTool`]).
     fn add_web_search_tool(tools: &mut Vec<Box<dyn Tool>>) {
         let provider = CONFIG.web_search_provider();
         let firecrawl_key = CONFIG.firecrawl_key();

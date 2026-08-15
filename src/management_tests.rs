@@ -700,7 +700,7 @@ async fn process_verifier_verdicts_cases() {
 /// checkpointed verdicts (no re-invocation, no LLM for the agents) and the
 /// verdicts are re-processed through the existing process_verifier_verdicts —
 /// the ticket transitions to Reviewed exactly like a fresh round, with no
-/// double bounce. High-signal replay test: the round-1 ask-resume bugs lived
+/// double bounce. High-signal replay test: the round-1 analyze-resume bugs lived
 /// in this path (job-id conflicts, caller misrouting).
 ///
 /// Serialized with the reset_inflight_tickets tests (shared global board — a
@@ -848,7 +848,7 @@ async fn parallel_round_phase_gate_bail_unregisters_router() {
 
 /// A panicked round member maps to a contained NoResponse (fail-open) with
 /// the scrubbed panic message as the reason — the round continues, matching
-/// the ask/research precedent.
+/// the analyze/research precedent.
 #[tokio::test]
 async fn panicked_round_member_maps_to_contained_no_response() {
     let handle = tokio::spawn(async {

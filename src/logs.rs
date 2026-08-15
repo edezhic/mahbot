@@ -1007,7 +1007,7 @@ fn extract_agent_fields(span: &serde_json::Value) -> (String, String, String) {
 /// where present, the span fills the gaps — so every corner attributes
 /// correctly:
 ///
-/// - full event fields (e.g. `run_agent`'s "Agent failed" entry, ask-tool
+/// - full event fields (e.g. `run_agent`'s "Agent failed" entry, analyze-tool
 ///   sub-agent failures) name the failing agent directly, beating the
 ///   inherited caller span;
 /// - workspace-only events (e.g. "Search index capacity exhausted") keep the
@@ -1116,8 +1116,8 @@ mod tests {
             ),
             (
                 "event beats inherited span",
-                r#"{"timestamp":"...","level":"ERROR","target":"mahbot::agent","span":{"name":"agent","agent_id":"caller_42","role":"engineer","workspace":"parent-ws"},"fields":{"message":"Agent failed","agent_id":"ask_ws_1_2_analyst","role":"analyst","workspace":"my-ws","classification":"runtime"}}"#,
-                "ask_ws_1_2_analyst",
+                r#"{"timestamp":"...","level":"ERROR","target":"mahbot::agent","span":{"name":"agent","agent_id":"caller_42","role":"engineer","workspace":"parent-ws"},"fields":{"message":"Agent failed","agent_id":"analyze_ws_1_2_analyst","role":"analyst","workspace":"my-ws","classification":"runtime"}}"#,
+                "analyze_ws_1_2_analyst",
                 "analyst",
                 "my-ws",
             ),

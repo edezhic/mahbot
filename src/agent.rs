@@ -17,7 +17,7 @@ use crate::{Agent, ChatMessage, ChatRequest, ChatResponse, Tool, ToolCall};
 
 // ── Per-tool-call user context ─────────────────────────────────────
 // Set by the Agent work loop before each tool execute(), read by tools
-// that need user context (e.g. AskTool async dispatch).
+// that need user context (e.g. AnalyzeTool async dispatch).
 //
 // # Contract
 // - Set by the Agent work loop before each tool execution.
@@ -36,7 +36,7 @@ tokio::task_local! {
     pub(crate) static CURRENT_TOOL_USER_NAME: String;
     pub(crate) static CURRENT_TOOL_CHANNEL: String;
     /// The calling agent's DIRECT PARENT INVOCATION grouping key (ticket /
-    /// ask round / research run) — set for the duration of tool execution so
+    /// analyze round / research run) — set for the duration of tool execution so
     /// tools that spawn sub-agents (e.g. implement) can propagate the caller's
     /// group to the Running Agents view. `None` = workspace singleton caller.
     pub(crate) static CURRENT_TOOL_PARENT_KEY: Option<crate::registry::ParentKey>;
@@ -176,7 +176,7 @@ impl Agent {
     /// internal [`tokio_util::sync::CancellationToken`]. The agent is deregistered on [`Drop`].
     ///
     /// `parent_key` carries the DIRECT PARENT INVOCATION grouping key for the
-    /// Running Agents view (ticket / ask round / research run). `None` means
+    /// Running Agents view (ticket / analyze round / research run). `None` means
     /// the agent is a workspace singleton (manager / maintainer / discovery /
     /// direct chat) — ticket agents pass the ticket and get
     /// [`ParentKey::Ticket`] implicitly.
@@ -198,7 +198,7 @@ impl Agent {
         } else {
             role.to_string()
         };
-        // Ticket agents group by their ticket; an explicit parent key (ask
+        // Ticket agents group by their ticket; an explicit parent key (analyze
         // round / research run) takes precedence when both are present.
         let parent_key = parent_key.or_else(|| {
             ticket
@@ -1010,7 +1010,7 @@ pub(crate) struct RoundOpts {
 /// Default fail-open bound on the leader-stagger wait: how long followers wait
 /// for the leader's first LLM call before starting anyway. First calls take
 /// ~4-6 s; the bound is a safety cap, not the expected wait. Overridable via
-/// env for tuning (mirrors [`crate::tools::ask::round_timeout`]).
+/// env for tuning (mirrors [`crate::tools::analyze::round_timeout`]).
 const DEFAULT_STAGGER_WAIT_SECS: u64 = 8;
 
 fn leader_stagger_wait() -> std::time::Duration {
@@ -1094,7 +1094,7 @@ where
 /// Returns the agent (even on failure) and the response on success.
 ///
 /// `user_name` and `channel` identify the origin of the message being
-/// processed — used by tools (e.g. AskTool async dispatch) to route
+/// processed — used by tools (e.g. AnalyzeTool async dispatch) to route
 /// sub-agent results to the correct user.
 ///
 /// **Cancellation safety**: Even if `agent.work()` completes before the token
@@ -1211,7 +1211,7 @@ pub(crate) async fn run_agent(
 /// Default dispatch: no ticket, empty user/channel, no inbox, no resume.
 ///
 /// `parent_key` carries the DIRECT PARENT INVOCATION grouping key for the
-/// Running Agents view (ticket / ask round / research run); `None` for
+/// Running Agents view (ticket / analyze round / research run); `None` for
 /// workspace singletons (manager / maintainer / discovery / direct chat).
 pub(crate) async fn run_default_agent(
     agent_id: &str,

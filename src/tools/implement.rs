@@ -4,7 +4,7 @@
 //! runs concurrently with other tools.
 
 use crate::agent::run_default_agent;
-use crate::session::ask_agent_id;
+use crate::session::analyze_agent_id;
 use crate::tools::Tool;
 use crate::{Role, Workspace};
 use anyhow::Result;
@@ -39,7 +39,7 @@ impl Tool for ImplementTool {
         // agent's DIRECT PARENT INVOCATION group (e.g. a ticket an engineer is
         // working) via the tool task-local, so the Running Agents view groups
         // it under the same parent.
-        let agent_id = ask_agent_id(&ws.name, Role::Coder.as_str());
+        let agent_id = analyze_agent_id(&ws.name, Role::Coder.as_str());
         let parent_key = crate::agent::CURRENT_TOOL_PARENT_KEY
             .try_with(std::clone::Clone::clone)
             .unwrap_or(None);

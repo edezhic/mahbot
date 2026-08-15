@@ -217,7 +217,7 @@ pub(crate) fn agent_params(
 #[derive(Debug, Clone)]
 pub(crate) enum SpawnChild {
     /// Pure kind marker — no child row (resume reads the jobs row alone).
-    Ask,
+    Analyze,
     /// research_jobs (id, state).
     Research,
     /// ticket_stage_jobs (id, ticket_id, stage, phase, round).
@@ -230,13 +230,13 @@ pub(crate) enum SpawnChild {
 }
 
 impl SpawnChild {
-    /// The `jobs.kind` value — one kind per child row; Ask is the exception
+    /// The `jobs.kind` value — one kind per child row; Analyze is the exception
     /// (pure kind marker, no child row). Deriving kind here closes the drift
     /// window of an inconsistent (kind, child) pair.
     #[must_use]
     pub const fn kind_str(&self) -> &'static str {
         match self {
-            Self::Ask => "ask",
+            Self::Analyze => "analyze",
             Self::Research => "research",
             Self::TicketStage { .. } => "ticket_stage",
         }
@@ -288,8 +288,8 @@ pub(crate) async fn spawn_job(
         .with_context(|| format!("failed to insert agent roster for job {id}"))?;
     }
     match child {
-        // Ask is a pure kind marker — the job row alone drives resume.
-        SpawnChild::Ask => {}
+        // Analyze is a pure kind marker — the job row alone drives resume.
+        SpawnChild::Analyze => {}
         SpawnChild::Research => {
             tx.execute(
                 "INSERT INTO research_jobs (id, state) VALUES (?1, '{}')",
@@ -364,7 +364,7 @@ pub(crate) async fn write_agent_outcome(
 
 /// Complete a job whose result is a durable envelope: ONE tx — INSERT
 /// pending_jobs (id = source jobs.id) + DELETE the jobs row. Exactly-once
-/// persistence boundary for ask/research results.
+/// persistence boundary for analyze/research results.
 ///
 /// INSERT-failure note: the tx rolls back, so the job row SURVIVES and the
 /// caller routes the envelope best-effort (never a silent drop). The
@@ -391,7 +391,7 @@ pub(crate) async fn complete_job_with_envelope(
     Ok(())
 }
 
-/// COMPLETE a durable ask/research job: one tx — INSERT pending_jobs
+/// COMPLETE a durable analyze/research job: one tx — INSERT pending_jobs
 /// (envelope, id = job id) + DELETE jobs row (exactly-once boundary; the tx
 /// detail lives on [`complete_job_with_envelope`]). Returns the envelope with
 /// `pending_job_id` set when the row persisted, cleared on INSERT failure so
@@ -447,7 +447,7 @@ pub(crate) async fn complete_ticket_stage_job(conn: &Connection, job_id: &str) -
 /// Kind-neutral terminalization for jobs whose result cannot be delivered
 /// (missing child row / unresolvable caller identity): DELETE the row
 /// entirely — CASCADE removes roster + child rows. Envelope kinds
-/// (ask/research) are terminal only when the row is gone (the pending row IS
+/// (analyze/research) are terminal only when the row is gone (the pending row IS
 /// the durable record); no-ops when the row is already absent. Safe for any
 /// jobs.kind — unlike [`complete_ticket_stage_job`], which is the
 /// ticket_stage-specific form (status='done' keeps the row for the
@@ -459,7 +459,7 @@ pub(crate) async fn terminalize_job(conn: &Connection, job_id: &str) -> Result<(
     Ok(())
 }
 
-/// Delete the jobs row (CASCADE destroys ticket_stage/ask/research child
+/// Delete the jobs row (CASCADE destroys ticket_stage/analyze/research child
 /// rows) inside an existing transaction.
 async fn delete_job_tx(tx: &TxGuard<'_>, job_id: &str) -> Result<()> {
     tx.execute("DELETE FROM jobs WHERE id = ?1", params![job_id])
@@ -471,7 +471,7 @@ async fn delete_job_tx(tx: &TxGuard<'_>, job_id: &str) -> Result<()> {
 /// Resolve the consumer-loop agent ID for an envelope (Manager role → the
 /// workspace Manager session; otherwise the caller's direct session).
 /// `session::resolve_agent_id` already branches on `role == "manager"`
-/// internally, so this is the single canonical form — ask/research delivery
+/// internally, so this is the single canonical form — analyze/research delivery
 /// paths call it instead of reimplementing the branch.
 pub(crate) fn envelope_target(job: &AgentJob) -> String {
     crate::session::resolve_agent_id(
@@ -512,7 +512,7 @@ pub(crate) async fn job_caller(conn: &Connection, job_id: &str) -> Result<Option
     .context("load job caller")
 }
 
-/// Boot-resume preamble shared by the ask/research resume and capped-report
+/// Boot-resume preamble shared by the analyze/research resume and capped-report
 /// paths (the 4 preambles were word-for-word identical). Order is load-bearing:
 /// aborting-guard FIRST (quiet return — the job row stays for the next boot),
 /// then job_caller, then terminalize-on-missing — the guard fires on Err (DB
@@ -592,7 +592,7 @@ pub(crate) async fn list_agents_for_job(conn: &Connection, job_id: &str) -> Resu
 /// call registry. Clean exit: no agent registered AND no orchestrator-only
 /// LLM call in flight → every in-flight round has unwound (each running agent
 /// is registered until its finalize_session completes; orchestrator calls —
-/// ask consolidation, research synthesis, joint-verdict grouping — are
+/// analyze consolidation, research synthesis, joint-verdict grouping — are
 /// tracked in [`crate::call_registry::NON_AGENT_CALLS`]; the research
 /// orchestrator additionally holds a whole-run guard, so the token is never
 /// fired into an inter-phase window between analyst deregistration and the
@@ -640,7 +640,7 @@ pub async fn run_drain_watch() {
     let start = Instant::now();
     loop {
         // Clean-exit requires BOTH the agent registry AND the non-agent call
-        // registry to be empty: orchestrator-only LLM calls (ask consolidation,
+        // registry to be empty: orchestrator-only LLM calls (analyze consolidation,
         // research synthesis, joint-verdict grouping) run with no registered
         // agents — firing the token the instant the registry empties would
         // abort an in-flight call via the provider token race the design
@@ -703,7 +703,7 @@ pub(crate) enum ResumableStage {
         workspace_name: String,
         capped: bool,
     },
-    Ask {
+    Analyze {
         job_id: String,
         workspace_name: String,
         capped: bool,
@@ -1046,7 +1046,7 @@ async fn rollback_stranded_tickets(rollbacks: &[(String, String, bool)]) -> bool
 /// Boot recovery scan: first statement of run_management, before
 /// reset_inflight_tickets. Order: (0) replay pending_jobs; (1) ticket_stage
 /// scan → resumed-ticket exclusion set; (2) reworked reset_inflight_tickets
-/// with NOT IN exclusion; (3) research; (4) ask.
+/// with NOT IN exclusion; (3) research; (4) analyze.
 ///
 /// Every resumed job gets updated_at = now (the boot bump — the ONLY
 /// protection for the pre-first-commit window; Session::init with an empty
@@ -1180,11 +1180,11 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
             warn!(job = %id, error = %e, "Failed to mark stale ticket_stage job done");
         }
     }
-    // (3)/(4) research/ask scans.
+    // (3)/(4) research/analyze scans.
     let mut resumed_other = 0usize;
     for job in &jobs {
         match job.kind.as_str() {
-            "research" | "ask" => {
+            "research" | "analyze" => {
                 // Resume at the roster/state level (dispatch re-enters the
                 // orchestrator with the stored task; retry_count caps at
                 // MAX_BOOT_REDISPATCH).
@@ -1193,18 +1193,18 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
                 if capped {
                     // The envelope is the caller's ONLY result path — never
                     // strand it: deliver a partial report (research) or
-                    // failure envelope (ask) from the checkpointed state.
+                    // failure envelope (analyze) from the checkpointed state.
                     let msg = if kind == "research" {
                         "Research job exceeded boot re-dispatch cap — delivering partial report"
                     } else {
-                        "Ask job exceeded boot re-dispatch cap — delivering failure envelope"
+                        "Analyze job exceeded boot re-dispatch cap — delivering failure envelope"
                     };
                     warn!(job = %job.id, kind = %kind, "{msg}");
                 }
                 // Capped resumes keep retry_count (the cap already fired);
                 // normal resumes bump it. The variant mirrors the DB kind
                 // (capped = old "{kind}_capped" suffix) — the match arm above
-                // already discriminated research vs ask.
+                // already discriminated research vs analyze.
                 let _ = checkpoint_job(
                     conn,
                     &job.id,
@@ -1222,7 +1222,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
                         capped,
                     }
                 } else {
-                    ResumableStage::Ask {
+                    ResumableStage::Analyze {
                         job_id: job.id.clone(),
                         workspace_name: job.workspace_name.clone(),
                         capped,
@@ -1492,21 +1492,21 @@ mod tests {
             "",
             crate::Role::Manager,
             &[NewAgent {
-                agent_id: "ask_a1".to_string(),
+                agent_id: "analyze_a1".to_string(),
                 kind: AgentKind::Analyst,
                 idx: Some(0),
                 task: "t1".to_string(),
             }],
-            &SpawnChild::Ask,
+            &SpawnChild::Analyze,
         )
         .await
         .unwrap();
         let envelope = AgentJob {
-            content: "<ask-tool-result>\n\nok</ask-tool-result>".to_string(),
+            content: "<analyze-tool-result>\n\nok</analyze-tool-result>".to_string(),
             workspace_name: "ws".to_string(),
             user_name: String::new(),
             channel: String::new(),
-            kind: JobKind::AskToolResult,
+            kind: JobKind::AnalyzeToolResult,
             role: crate::Role::Manager,
             reply_target: None,
             pending_job_id: Some("j1".to_string()),
@@ -1546,14 +1546,14 @@ mod tests {
             "telegram",
             Role::Manager,
             &[],
-            &SpawnChild::Ask,
+            &SpawnChild::Analyze,
         )
         .await
         .unwrap();
 
         // Drain-abort: quiet return, the row stays for the next boot.
         crate::shutdown::drain_begin();
-        let r = resume_job_preamble(conn, "j-preamble", "Ask resume", "Ask resume").await;
+        let r = resume_job_preamble(conn, "j-preamble", "Analyze resume", "Analyze resume").await;
         crate::shutdown::drain_clear();
         assert!(r.is_none(), "drain-abort must quiet-return");
         let rows = conn
@@ -1571,7 +1571,7 @@ mod tests {
         conn.execute("DELETE FROM jobs WHERE id = 'j-preamble'", ())
             .await
             .unwrap();
-        let r = resume_job_preamble(conn, "j-preamble", "Ask resume", "Ask resume").await;
+        let r = resume_job_preamble(conn, "j-preamble", "Analyze resume", "Analyze resume").await;
         assert!(r.is_none(), "missing job row must quiet-return");
         let rows = conn
             .query("SELECT COUNT(*) FROM jobs WHERE id = 'j-preamble'", ())
@@ -1757,7 +1757,7 @@ mod tests {
                     workspace_name: "ws".to_string(),
                     user_name: String::new(),
                     channel: String::new(),
-                    kind: JobKind::AskToolResult,
+                    kind: JobKind::AnalyzeToolResult,
                     role: crate::Role::Manager,
                     reply_target: None,
                     pending_job_id: None,
@@ -2088,7 +2088,7 @@ mod tests {
         crate::util::test::init_test_stores().await;
         let conn = &crate::session::store().conn;
         let stale = (chrono::Utc::now() - chrono::Duration::hours(20)).to_rfc3339();
-        // Stale ticket_stage job (must be retained) + stale ask job (purged).
+        // Stale ticket_stage job (must be retained) + stale analyze job (purged).
         conn.execute(
             "INSERT INTO jobs (id, kind, status, task, workspace_name, role, created_at, updated_at) \
              VALUES ('jfail_ts', 'ticket_stage', 'launched', '', 'purge_ws3', 'engineer', ?1, ?1)",
@@ -2105,7 +2105,7 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO jobs (id, kind, status, task, workspace_name, role, created_at, updated_at) \
-             VALUES ('jfail_ask', 'ask', 'launched', '', 'purge_ws3', 'assistant', ?1, ?1)",
+             VALUES ('jfail_analyze', 'analyze', 'launched', '', 'purge_ws3', 'assistant', ?1, ?1)",
             params![stale.clone()],
         )
         .await
@@ -2135,12 +2135,12 @@ mod tests {
             1,
             "ticket_stage row must survive a failed rollback (next tick retries)"
         );
-        let ask_left = conn
-            .query("SELECT COUNT(*) FROM jobs WHERE id = 'jfail_ask'", ())
+        let analyze_left = conn
+            .query("SELECT COUNT(*) FROM jobs WHERE id = 'jfail_analyze'", ())
             .await
             .unwrap();
         assert_eq!(
-            ask_left[0].get::<i64>(0).unwrap(),
+            analyze_left[0].get::<i64>(0).unwrap(),
             0,
             "non-ticket_stage stale rows are purged regardless of the rollback"
         );

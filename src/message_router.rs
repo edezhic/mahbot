@@ -105,9 +105,9 @@ pub enum JobKind {
     /// System notification from a ticket transition.
     /// Only enqueued for the Manager role.
     TicketNotify,
-    /// Result from an async AskTool sub-agent, injected back into the caller's
+    /// Result from an async AnalyzeTool sub-agent, injected back into the caller's
     /// agent session.
-    AskToolResult,
+    AnalyzeToolResult,
     /// Result from an async deep research run (ResearchTool), injected back
     /// into the Manager's agent session. Exactly one envelope per run.
     ResearchResult,
@@ -285,7 +285,7 @@ pub async fn route_user_message(
     };
 
     // Manager-bound UserMessage is durable: DURABLE kinds =
-    // UserMessage (manager-bound only), AskToolResult, ResearchResult.
+    // UserMessage (manager-bound only), AnalyzeToolResult, ResearchResult.
     let mut persisted = false;
     if job.role == Role::Manager {
         let id = crate::generate_id();
@@ -319,7 +319,7 @@ pub async fn route_user_message(
 
 /// Persist an envelope to `pending_jobs`. The target agent id is derived
 /// from the envelope by [`crate::jobs::pending_job_params`].
-/// Used by the durable producers (manager-bound messages here; ask/research
+/// Used by the durable producers (manager-bound messages here; analyze/research
 /// use the source job id via [`crate::jobs::complete_job_with_envelope`]).
 async fn persist_pending(job: &AgentJob, id: String) -> anyhow::Result<()> {
     let now = turso::now();
@@ -570,7 +570,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         let Some(response) = response else {
             // Send emoji error only for UserMessage jobs where the agent truly
             // failed (not cancelled by user or shutdown). Internal job kinds
-            // (TicketNotify, AskToolResult, ResearchResult) get no feedback.
+            // (TicketNotify, AnalyzeToolResult, ResearchResult) get no feedback.
             //
             // We check both the agent-specific token (user /stop) AND the
             // global shutdown token because during SIGTERM/SIGINT the global
@@ -807,7 +807,7 @@ async fn deliver_manager_response(response: &str, users: &[UserRecord], job: &Ag
 /// original message's reply target.
 ///
 /// Without `reply_target` (non-user-facing jobs like ticket notifications or
-/// AskTool results), all matching channel bindings receive the response.
+/// AnalyzeTool results), all matching channel bindings receive the response.
 ///
 /// Broadcast+persist is always performed exactly once per response, and the
 /// response is always sent via the originating channel type so it reaches

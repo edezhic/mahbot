@@ -1,6 +1,6 @@
 //! ResearchTool — Manager-only deep multi-round research orchestrator.
 //!
-//! Unlike [`AskTool`](super::ask::AskTool) (one round of parallel analysts
+//! Unlike [`AnalyzeTool`](super::analyze::AnalyzeTool) (one round of parallel analysts
 //! for quick clarification), `research` decomposes the question into
 //! sub-questions via three independent plans (merged by id-based coverage),
 //! runs one analyst per sub-question, then runs conditional gap rounds with
@@ -21,7 +21,7 @@ use crate::message_router::{self, AgentJob, JobKind};
 use crate::prompt::{load_prompt, substitute};
 use crate::retry::FailureClass;
 use crate::tools::Tool;
-use crate::tools::ask::{
+use crate::tools::analyze::{
     AnalystFindings, Claim, RoundMember, VerificationResult, VerificationTarget,
     await_round_members, build_async_result_envelope, complete_durable_job_and_route,
     dispatch_claim_verifiers, escape_fences, extract_query_telemetry,
@@ -680,7 +680,7 @@ pub(crate) async fn research_capped_partial_report(job_id: &str, ws: &Workspace)
 }
 
 /// Build the `<research-result>` envelope message for the async research
-/// dispatch. Follows the ask convention: failures are wrapped with an
+/// dispatch. Follows the analyze convention: failures are wrapped with an
 /// explicit marker, never silently dropped.
 fn build_async_research_message(result: &anyhow::Result<String>) -> String {
     build_async_result_envelope(result, "research-result")
@@ -733,7 +733,7 @@ impl AccumulatedEvidence {
             .unanswered
             .iter()
             .filter_map(|u| {
-                let key = crate::tools::ask::normalize_claim(u);
+                let key = crate::tools::analyze::normalize_claim(u);
                 (!key.is_empty()).then_some(key)
             })
             .collect();
@@ -1270,7 +1270,7 @@ fn resolve_round_members_with_timeouts<T>(
 
 // ── Agent runners ────────────────────────────────────────────────────────
 
-/// One analyst run. Mirrors ask's three-state fail-open typing: a
+/// One analyst run. Mirrors analyze's three-state fail-open typing: a
 /// parse-failed analyst's raw response is preserved, never dropped.
 enum AnalystRun<T> {
     /// Agent produced no response (crashed, cancelled, empty output).
@@ -2698,7 +2698,9 @@ async fn research_verification_pass(
     if targets.is_empty() {
         return Vec::new();
     }
-    let cap = targets.len().min(crate::tools::ask::VERIFY_MAX_ANALYSTS);
+    let cap = targets
+        .len()
+        .min(crate::tools::analyze::VERIFY_MAX_ANALYSTS);
     // Reserve what fits — a near-exhausted budget still verifies the
     // highest-priority targets instead of nothing.
     let n = cap.min(budget.cap.saturating_sub(budget.spent));
@@ -3370,7 +3372,7 @@ mod tests {
 
     #[test]
     fn test_research_fail_open_envelope() {
-        // All-decomposers-failed follows the ask convention: an error envelope
+        // All-decomposers-failed follows the analyze convention: an error envelope
         // with an explicit marker, never a silent drop.
         let envelope = build_async_research_message(&Err(anyhow::anyhow!(
             "all decomposition analysts failed"
@@ -3510,7 +3512,7 @@ mod tests {
             gap_list: None,
             acc: AccumulatedEvidence {
                 urls: std::collections::HashSet::new(),
-                claims: vec![crate::tools::ask::Claim {
+                claims: vec![crate::tools::analyze::Claim {
                     claim: "alpha is a real project".into(),
                     source: "s1".into(),
                     confidence: "high".into(),
@@ -3526,7 +3528,7 @@ mod tests {
             gap_outcome: GapRoundsOutcome::default(),
             budget_spent: 0,
             round_index: 0,
-            verification: vec![crate::tools::ask::VerificationResult {
+            verification: vec![crate::tools::analyze::VerificationResult {
                 claim: "alpha is a real project".into(),
                 verdict: "confirmed".into(),
                 evidence: "primary source".into(),

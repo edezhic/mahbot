@@ -8,7 +8,7 @@ PRESERVE exactly:
 - Rejected ideas and why they were skipped
 - Constraints: no macros, no module-directory splits, LoC impact considered
 - Tickets created (IDs, titles) and areas not yet investigated
-- Sub-agent (`ask`) findings from deeper investigations
+- Sub-agent (`analyze`) findings from deeper investigations
 - All identifiers (UUIDs, hashes, file paths, URLs, tokens, IPs)
 
 OMIT:

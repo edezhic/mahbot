@@ -2,7 +2,7 @@
 
 use anyhow::Context;
 pub(crate) mod active_models;
-pub(crate) mod ask;
+pub(crate) mod analyze;
 pub mod browser;
 pub mod browser_daemon;
 pub(crate) mod catalog_cache;
@@ -152,7 +152,7 @@ pub(crate) fn fit_request_body_budget(
 
 // ── Re-exports ─────────────────────────────────────────────────────────
 
-pub(crate) use ask::{AskTool, DispatchMode};
+pub(crate) use analyze::{AnalyzeTool, DispatchMode};
 pub(crate) use browser::BrowserTool;
 pub(crate) use edit::EditTool;
 pub(crate) use image_gen::ImageGenTool;

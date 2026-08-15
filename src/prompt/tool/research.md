@@ -1,6 +1,6 @@
-Launch a deep multi-round research run on a broad or complex question. Unlike `ask` (one round of parallel analysts for quick clarification), `research` decomposes the question into sub-questions, runs multiple research rounds with fresh analysts targeting only the remaining gaps, and delivers one consolidated, source-cited report with unresolved items explicitly marked.
+Launch a deep multi-round research run on a broad or complex question. Unlike `analyze` (one round of parallel analysts for quick clarification), `research` decomposes the question into sub-questions, runs multiple research rounds with fresh analysts targeting only the remaining gaps, and delivers one consolidated, source-cited report with unresolved items explicitly marked.
 
-Use `research` for deep, broad, multi-faceted questions where a single round of analysis would be shallow. Use `ask` for quick clarification or a focused question that a single analyst can answer directly.
+Use `research` for deep, broad, multi-faceted questions where a single round of analysis would be shallow. Use `analyze` for quick clarification or a focused question that a single analyst can answer directly.
 
 The `question` parameter accepts the full research question. The run is asynchronous: exactly one report envelope is delivered to you when the research completes; intermediate rounds never reach you or the user.
 

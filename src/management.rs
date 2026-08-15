@@ -459,8 +459,8 @@ fn paused_workspace_sentence() -> &'static str {
 /// then trip their circuit breaker (which must not pause). Analyst failures
 /// never fail the ticket (analysts always advance to Planning), and mixed
 /// verifier rounds (some failures + a sub-threshold verdict) bounce to
-/// ReadyForDevelopment without pausing. Ask-tool sub-agent failures (parallel
-/// analysts under [`AskTool`](crate::tools::AskTool)) likewise never
+/// ReadyForDevelopment without pausing. Analyze-tool sub-agent failures (parallel
+/// analysts under [`AnalyzeTool`](crate::tools::AnalyzeTool)) likewise never
 /// reach this helper — they are tool calls inside a caller's run, not
 /// ticket-level failures. The pause gate itself only blocks
 /// ReadyForDevelopment→InDevelopment claims, so a dispatch panic in an earlier
@@ -673,7 +673,7 @@ pub async fn run_management() {
                 workspace_name,
                 ..
             }
-            | ResumableStage::Ask {
+            | ResumableStage::Analyze {
                 job_id,
                 workspace_name,
                 ..
@@ -694,7 +694,7 @@ pub async fn run_management() {
             continue;
         };
         match stage {
-            // research/ask jobs carry no ticket — re-dispatch the orchestrator.
+            // research/analyze jobs carry no ticket — re-dispatch the orchestrator.
             ResumableStage::Research {
                 job_id,
                 capped: false,
@@ -722,32 +722,32 @@ pub async fn run_management() {
                     crate::tools::research::research_capped_partial_report(&job_id, &ws).await;
                 });
             }
-            ResumableStage::Ask {
+            ResumableStage::Analyze {
                 job_id,
                 capped: false,
                 ..
             } => {
-                info!(job = %job_id, "Resuming ask round at boot");
+                info!(job = %job_id, "Resuming analyze round at boot");
                 let ws = workspace.clone();
                 tokio::spawn(async move {
-                    crate::tools::ask::resume_ask_round(&job_id, &ws).await;
+                    crate::tools::analyze::resume_analyze_round(&job_id, &ws).await;
                 });
             }
-            // Over-cap ask: deliver the failure envelope to the original
-            // caller (the <ask-tool-result> envelope is the async-ask caller's
+            // Over-cap analyze: deliver the failure envelope to the original
+            // caller (the <analyze-tool-result> envelope is the async-analyze caller's
             // only result path — "failed = terminal … surface to user").
-            ResumableStage::Ask {
+            ResumableStage::Analyze {
                 job_id,
                 capped: true,
                 ..
             } => {
                 info!(
                     job = %job_id,
-                    "Delivering ask failure envelope (boot re-dispatch cap exceeded)",
+                    "Delivering analyze failure envelope (boot re-dispatch cap exceeded)",
                 );
                 let ws = workspace.clone();
                 tokio::spawn(async move {
-                    crate::tools::ask::ask_capped_envelope(&job_id, &ws).await;
+                    crate::tools::analyze::analyze_capped_envelope(&job_id, &ws).await;
                 });
             }
             ResumableStage::TicketStage {
@@ -2764,7 +2764,7 @@ async fn run_parallel_agents(
     // ── Spawn and run all launched agents (leader-staggered) ───────────
     // Members are spawned (not joined inline): a panicked/cancelled member
     // resolves to ParallelVerdict::NoResponse below — the round continues
-    // fail-open and the member checkpoints Failed, matching the ask/research
+    // fail-open and the member checkpoints Failed, matching the analyze/research
     // round semantics.
     let mut results: Vec<ParallelVerdict> = Vec::with_capacity(slots.len());
     {
@@ -2937,7 +2937,7 @@ async fn run_parallel_agents(
 /// scrubbed panic message as the reason. Cancelled handles are impossible —
 /// nothing aborts these tasks; `into_panic` panics loudly on that unreachable
 /// case (surfaced via the dispatch catch_unwind; resume paths log-and-die).
-/// If a deadline-abort is ever added (the ask/research `await_round_members`
+/// If a deadline-abort is ever added (the analyze/research `await_round_members`
 /// precedent), restore an `is_cancelled()` mapping before `into_panic`.
 fn round_member_failed(e: tokio::task::JoinError) -> ParallelVerdict {
     let reason = crate::util::scrub_credentials(&crate::util::panic_message(&*e.into_panic()));

@@ -1,3 +1,3 @@
 Dispatch a single coder sub-agent to carry out a clearly-scoped implementation task. The coder can read, search, edit files, and run shell commands in the workspace, so use it only for concrete, well-defined work: a focused implementation draft, a refactor, a helper function, a test case, or a localized change.
 
-Give the coder explicit scope: the exact task, relevant files/symbols if known, and the expected outcome. The call blocks until the coder finishes and returns its full response. For research or investigation, use `ask` instead — the coder mutates the workspace.
+Give the coder explicit scope: the exact task, relevant files/symbols if known, and the expected outcome. The call blocks until the coder finishes and returns its full response. For research or investigation, use `analyze` instead — the coder mutates the workspace.

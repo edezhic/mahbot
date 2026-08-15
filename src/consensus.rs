@@ -1,7 +1,7 @@
-//! Shared LLM grouping/synthesis core for pipeline joint-verdict and ask
+//! Shared LLM grouping/synthesis core for pipeline joint-verdict and analyze
 //! consolidation.
 //!
-//! One LLM pass groups id-referenced items (pipeline issues; ask claims)
+//! One LLM pass groups id-referenced items (pipeline issues; analyze claims)
 //! into thematic/semantic groups. Every item gets a stable numeric id,
 //! assigned once per operation across the whole input (global flat numbering);
 //! the LLM refers to items by id only, and the system resolves id → (agent,
@@ -94,7 +94,7 @@ pub(crate) struct GroupingReference {
     pub member: GroupingMember,
 }
 
-/// Outcome of the repair-mode grouping pass (pipeline synthesis + ask
+/// Outcome of the repair-mode grouping pass (pipeline synthesis + analyze
 /// consolidation).
 pub(crate) enum RepairOutcome {
     /// Frozen groups + first-accepted summary + a code-computed ungrouped
@@ -258,7 +258,7 @@ pub(crate) fn render_ungrouped_section(
     out
 }
 
-// ── Repair-mode grouping (pipeline synthesis + ask consolidation) ───────
+// ── Repair-mode grouping (pipeline synthesis + analyze consolidation) ───────
 
 /// Mutable state of the repair protocol across rounds.
 pub(crate) struct RepairState<'a> {
@@ -676,7 +676,7 @@ fn append_repair_instructions(
     }
 }
 
-/// Run the repair-mode grouping pass (pipeline synthesis + ask
+/// Run the repair-mode grouping pass (pipeline synthesis + analyze
 /// consolidation): 1 full synthesis call + up to N-1 repair rounds (N =
 /// hardcoded `DEFAULT_SYNTHESIS_MAX_ATTEMPTS`, 3 = the lower edge of the
 /// approved 3–5 band). Accepted groups freeze; repair rounds propose deltas for the

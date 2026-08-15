@@ -294,13 +294,13 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
     });
 
     // Drain-watch: while the drain flag is set, poll the agent registry AND
-    // the non-agent call registry. Drain-cut ticket_stage/ask rounds
+    // the non-agent call registry. Drain-cut ticket_stage/analyze rounds
     // intentionally leave their jobs status='launched' for boot resume,
     // so a jobs-table count cannot reach zero in the common
     // drain — and even research jobs, which DO terminalize mid-drain via the
     // partial-report path, tell us nothing about cut rounds — so the
     // registries are the authoritative in-flight signal (orchestrator-only
-    // LLM calls — ask consolidation, research synthesis — are tracked in
+    // LLM calls — analyze consolidation, research synthesis — are tracked in
     // NON_AGENT_CALLS; the research orchestrator holds a whole-run guard).
     // Clean exit when both empty; force-cancel stragglers at the 10-minute
     // cap (in-flight ops with >10 min remaining budget are guaranteed-aborted

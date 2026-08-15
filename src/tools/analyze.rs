@@ -1,4 +1,4 @@
-//! AskTool — dispatches a batch of parallel analysts to research a question.
+//! AnalyzeTool — dispatches a batch of parallel analysts to research a question.
 //!
 //! Analyst-only: every call dispatches analysts (read-only research), never
 //! mutation-capable agents. Available to the Engineer and Maintainer agents
@@ -30,7 +30,7 @@ use std::time::Duration;
 
 // ── Constants (module-local defaults) ────────────────────────────────────
 
-/// Number of decorrelated parallel analysts spawned per ask round (durable and
+/// Number of decorrelated parallel analysts spawned per analyze round (durable and
 /// sync pipelines share the same batch width).
 const PARALLEL_ANALYST_COUNT: usize = 3;
 
@@ -53,7 +53,7 @@ impl DispatchMode {
     }
 }
 
-pub struct AskTool {
+pub struct AnalyzeTool {
     /// Controls how the sub-agents are dispatched.
     /// - [`DispatchMode::Sync`] — blocks the caller until the sub-agents complete.
     /// - [`DispatchMode::Async`] — dispatches in a background task, result
@@ -64,7 +64,7 @@ pub struct AskTool {
     pub caller_role: Role,
 }
 
-impl AskTool {
+impl AnalyzeTool {
     #[must_use]
     pub const fn new(dispatch_mode: DispatchMode, caller_role: Role) -> Self {
         Self {
@@ -75,24 +75,24 @@ impl AskTool {
 }
 
 #[async_trait]
-impl Tool for AskTool {
+impl Tool for AnalyzeTool {
     fn name(&self) -> &'static str {
-        "ask"
+        "analyze"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         super::tool_params_schema(
             &json!({
-                "ask": {
+                "analyze": {
                     "type": "string",
-                    "description": "The ask to delegate to the analysts"
+                    "description": "The question to delegate to the analysts"
                 }
             }),
-            &["ask"],
+            &["analyze"],
         )
     }
 
-    /// Sub-agents dispatched by AskTool are always Analysts, who have no
+    /// Sub-agents dispatched by AnalyzeTool are always Analysts, who have no
     /// mutation tools (no edit, no full shell — only read-only shell, which
     /// reports [`Self::side_effects`] = false). This classification is
     /// coupled to `Role::tools()`; if Analyst ever gains side-effecting
@@ -102,7 +102,7 @@ impl Tool for AskTool {
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        let ask = super::get_str(&args, "ask")?;
+        let analyze = super::get_str(&args, "analyze")?;
 
         // Async dispatch path — delegate to analysts in background.
         // Read user context from task-locals (set by Agent work loop
@@ -110,7 +110,7 @@ impl Tool for AskTool {
         // the correct user identity for per-user delivery.
         if self.dispatch_mode.is_async() {
             let ws = ws.clone();
-            let ask = ask.to_string();
+            let analyze = analyze.to_string();
             let caller_role = self.caller_role;
             let user_name = crate::agent::CURRENT_TOOL_USER_NAME
                 .try_with(String::clone)
@@ -124,8 +124,14 @@ impl Tool for AskTool {
                 // panic in the dispatch task would otherwise leave the Manager
                 // waiting forever on a result that can never arrive.
                 let round = std::panic::AssertUnwindSafe(async {
-                    dispatch_durable_ask(&ws, &ask, caller_role, user_name.clone(), channel.clone())
-                        .await
+                    dispatch_durable_analyze(
+                        &ws,
+                        &analyze,
+                        caller_role,
+                        user_name.clone(),
+                        channel.clone(),
+                    )
+                    .await
                 })
                 .catch_unwind()
                 .await;
@@ -144,15 +150,15 @@ impl Tool for AskTool {
                     }
                     Err(panic) => {
                         let panic = crate::util::panic_message(&*panic);
-                        tracing::error!(panic = %panic, "ask round dispatch panicked");
+                        tracing::error!(panic = %panic, "analyze round dispatch panicked");
                         AgentJob {
-                            content: build_async_ask_message(&Err(anyhow::anyhow!(
-                                "ask round dispatch panicked: {panic}"
+                            content: build_async_analyze_message(&Err(anyhow::anyhow!(
+                                "analyze round dispatch panicked: {panic}"
                             ))),
                             workspace_name: ws.name.clone(),
                             user_name,
                             channel,
-                            kind: JobKind::AskToolResult,
+                            kind: JobKind::AnalyzeToolResult,
                             role: caller_role,
                             reply_target: None,
                             pending_job_id: None,
@@ -177,18 +183,18 @@ impl Tool for AskTool {
         }
 
         // Sync path — blocks caller until the analysts complete.
-        run_parallel_analysts_and_consolidate(ws, ask).await
+        run_parallel_analysts_and_consolidate(ws, analyze).await
     }
 }
 
-/// One durable ask-round roster slot (pre-generated agent id + final task).
-struct AskSlot {
+/// One durable analyze-round roster slot (pre-generated agent id + final task).
+struct AnalyzeSlot {
     agent_id: String,
     task: String,
 }
 
-/// Outcome of a durable ask round.
-enum AskRunOutcome {
+/// Outcome of a durable analyze round.
+enum AnalyzeRunOutcome {
     /// The round produced a result (Ok or Err — both terminalize with a
     /// durable envelope).
     Result(anyhow::Result<String>),
@@ -197,9 +203,9 @@ enum AskRunOutcome {
     DrainCut,
 }
 
-/// Durable async ask dispatch (SPAWN → run → CHECKPOINT → COMPLETE).
+/// Durable async analyze dispatch (SPAWN → run → CHECKPOINT → COMPLETE).
 ///
-/// 1. SPAWN: one tx — INSERT jobs (kind=ask, task=question) + INSERT agents
+/// 1. SPAWN: one tx — INSERT jobs (kind=analyze, task=question) + INSERT agents
 ///    (all pre-generated analyst ids with final tasks). MUST commit before
 ///    the analysts' first session writes.
 /// 2. RUN: parallel analysts.
@@ -209,38 +215,47 @@ enum AskRunOutcome {
 ///
 /// Returns `None` only when the round was cut by drain/shutdown (job left
 /// status='launched' for boot resume — nothing to route now). On error the
-/// envelope still routes (errors wrapped in `<ask-tool-result>`), and the
+/// envelope still routes (errors wrapped in `<analyze-tool-result>`), and the
 /// job is terminalized.
-async fn dispatch_durable_ask(
+async fn dispatch_durable_analyze(
     ws: &Workspace,
-    ask: &str,
+    analyze: &str,
     caller_role: Role,
     user_name: String,
     channel: String,
 ) -> Option<AgentJob> {
     let job_id = crate::generate_id();
-    let result =
-        match run_ask_with_job(ws, ask, &job_id, caller_role, &user_name, &channel, false).await {
-            Ok(AskRunOutcome::DrainCut) => {
-                // Drain-cut: analyst outcomes are already
-                // checkpointed — leave the job status='launched' for boot resume
-                // (recoverable from the agent outcome checkpoints). No terminalization, no
-                // error envelope: a spurious envelope here would discard the
-                // checkpointed outcomes and contradict "jobs stay status='launched'
-                // for boot resume".
-                tracing::info!(
-                    job = %job_id,
-                    "Ask round cut short by drain — job stays launched for boot resume",
-                );
-                return None;
-            }
-            Ok(AskRunOutcome::Result(result)) => result,
-            Err(e) => Err(e),
-        };
+    let result = match run_analyze_with_job(
+        ws,
+        analyze,
+        &job_id,
+        caller_role,
+        &user_name,
+        &channel,
+        false,
+    )
+    .await
+    {
+        Ok(AnalyzeRunOutcome::DrainCut) => {
+            // Drain-cut: analyst outcomes are already
+            // checkpointed — leave the job status='launched' for boot resume
+            // (recoverable from the agent outcome checkpoints). No terminalization, no
+            // error envelope: a spurious envelope here would discard the
+            // checkpointed outcomes and contradict "jobs stay status='launched'
+            // for boot resume".
+            tracing::info!(
+                job = %job_id,
+                "Analyze round cut short by drain — job stays launched for boot resume",
+            );
+            return None;
+        }
+        Ok(AnalyzeRunOutcome::Result(result)) => result,
+        Err(e) => Err(e),
+    };
     let envelope = crate::jobs::complete_durable_job(
         &job_id,
-        build_async_ask_message(&result),
-        JobKind::AskToolResult,
+        build_async_analyze_message(&result),
+        JobKind::AnalyzeToolResult,
         caller_role,
         &user_name,
         &channel,
@@ -250,19 +265,19 @@ async fn dispatch_durable_ask(
     Some(envelope)
 }
 
-/// Spawn the ask job + roster (one tx), run the analysts, checkpoint per-agent
+/// Spawn the analyze job + roster (one tx), run the analysts, checkpoint per-agent
 /// outcomes, consolidate. `pre_done` carries slots already completed (resume)
 /// with their stored raw-response outcomes.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn run_ask_with_job(
+async fn run_analyze_with_job(
     ws: &Workspace,
-    ask: &str,
+    analyze: &str,
     job_id: &str,
     caller_role: Role,
     user_name: &str,
     channel: &str,
     resume: bool,
-) -> anyhow::Result<AskRunOutcome> {
+) -> anyhow::Result<AnalyzeRunOutcome> {
     let deadline = std::time::Instant::now() + round_timeout();
 
     // Fresh dispatch: build the roster and spawn the job BEFORE any analyst
@@ -272,9 +287,9 @@ async fn run_ask_with_job(
     // AND the new ids would not match the stored roster rows).
     let (slots, pre_done) = if resume {
         let rows = crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
-        let slots: Vec<AskSlot> = rows
+        let slots: Vec<AnalyzeSlot> = rows
             .iter()
-            .map(|r| AskSlot {
+            .map(|r| AnalyzeSlot {
                 agent_id: r.agent_id.clone(),
                 task: r.task.clone(),
             })
@@ -288,10 +303,10 @@ async fn run_ask_with_job(
     } else {
         let suffix = crate::generate_suffix();
         let angles = load_analyst_angles();
-        let mut slots: Vec<AskSlot> = Vec::with_capacity(PARALLEL_ANALYST_COUNT);
+        let mut slots: Vec<AnalyzeSlot> = Vec::with_capacity(PARALLEL_ANALYST_COUNT);
         let mut agents: Vec<crate::jobs::NewAgent> = Vec::with_capacity(PARALLEL_ANALYST_COUNT);
         for i in 0..PARALLEL_ANALYST_COUNT {
-            let slot = analyst_slot(ws, &angles, &suffix, i, ask);
+            let slot = analyst_slot(ws, &angles, &suffix, i, analyze);
             agents.push(crate::jobs::NewAgent {
                 agent_id: slot.agent_id.clone(),
                 kind: crate::jobs::AgentKind::Analyst,
@@ -303,29 +318,29 @@ async fn run_ask_with_job(
         crate::jobs::spawn_job(
             &crate::session::store().conn,
             job_id,
-            ask,
+            analyze,
             &ws.name,
             user_name,
             channel,
             caller_role,
             &agents,
-            &crate::jobs::SpawnChild::Ask,
+            &crate::jobs::SpawnChild::Analyze,
         )
         .await?;
         (slots, Vec::new())
     };
 
     // Run the launched slots; reconstruct done slots from stored outcomes.
-    let fresh_slots: Vec<&AskSlot> = slots
+    let fresh_slots: Vec<&AnalyzeSlot> = slots
         .iter()
         .filter(|s| !pre_done.iter().any(|(id, _)| id == &s.agent_id))
         .collect();
     // Round key = the durable job_id — stable across resume so a resumed
     // round's analysts and consolidation call group under the same key.
-    let fresh_runs = run_ask_slots(ws, &fresh_slots, deadline, resume, job_id).await;
+    let fresh_runs = run_analyze_slots(ws, &fresh_slots, deadline, resume, job_id).await;
 
     // Assemble runs in slot order.
-    let mut runs: Vec<AskRun> = Vec::with_capacity(slots.len());
+    let mut runs: Vec<AnalyzeRun> = Vec::with_capacity(slots.len());
     let mut fresh_iter = fresh_runs.into_iter();
     for slot in &slots {
         if let Some((_, raw)) = pre_done.iter().find(|(id, _)| id == &slot.agent_id) {
@@ -339,7 +354,7 @@ async fn run_ask_with_job(
                 None,
                 String::new(),
                 String::new(),
-                Some(crate::registry::ParentKey::AskRound(job_id.to_string())),
+                Some(crate::registry::ParentKey::AnalyzeRound(job_id.to_string())),
             );
             let _ = agent
                 .session
@@ -354,7 +369,7 @@ async fn run_ask_with_job(
                     None,
                 )
                 .await;
-            runs.push(AskRun::Completed {
+            runs.push(AnalyzeRun::Completed {
                 agent,
                 response: Some(raw.clone()),
             });
@@ -369,24 +384,24 @@ async fn run_ask_with_job(
     let conn = &crate::session::store().conn;
     for (slot, run) in slots.iter().zip(&runs) {
         let (status, outcome) = match run {
-            AskRun::Completed {
+            AnalyzeRun::Completed {
                 response: Some(raw),
                 ..
             } => (crate::jobs::RowStatus::Done, raw.clone()),
-            AskRun::Completed {
+            AnalyzeRun::Completed {
                 agent,
                 response: None,
             } => (
                 crate::jobs::RowStatus::Failed,
                 agent.failure_reason("analyst produced no response"),
             ),
-            AskRun::Failed { reason } => (crate::jobs::RowStatus::Failed, reason.clone()),
+            AnalyzeRun::Failed { reason } => (crate::jobs::RowStatus::Failed, reason.clone()),
         };
         if let Err(e) =
             crate::jobs::write_agent_outcome(conn, job_id, &slot.agent_id, status, Some(&outcome))
                 .await
         {
-            tracing::warn!(job = %job_id, error = %e, "Failed to checkpoint ask outcome");
+            tracing::warn!(job = %job_id, error = %e, "Failed to checkpoint analyze outcome");
         }
     }
 
@@ -394,26 +409,26 @@ async fn run_ask_with_job(
     // (no new LLM work during the drain) — the checkpointed outcomes are
     // reused by the next boot's resume; the caller leaves the job launched.
     if crate::shutdown::aborting() {
-        return Ok(AskRunOutcome::DrainCut);
+        return Ok(AnalyzeRunOutcome::DrainCut);
     }
 
-    let result = consolidate_analyst_runs(ws, ask, runs, deadline, job_id).await;
-    Ok(AskRunOutcome::Result(result))
+    let result = consolidate_analyst_runs(ws, analyze, runs, deadline, job_id).await;
+    Ok(AnalyzeRunOutcome::Result(result))
 }
 
 /// Run the given analyst slots concurrently (deadline-bounded).
 ///
-/// `round_key` is the ask round's grouping key (the durable `job_id` on the
+/// `round_key` is the analyze round's grouping key (the durable `job_id` on the
 /// durable path, a fresh suffix on the sync path) — every analyst of the round
-/// registers with `AskRound(round_key)` so the Running Agents view groups them
+/// registers with `AnalyzeRound(round_key)` so the Running Agents view groups them
 /// with the round's consolidation call.
-async fn run_ask_slots(
+async fn run_analyze_slots(
     ws: &Workspace,
-    slots: &[&AskSlot],
+    slots: &[&AnalyzeSlot],
     deadline: std::time::Instant,
     resume: bool,
     round_key: &str,
-) -> Vec<AskRun> {
+) -> Vec<AnalyzeRun> {
     let members: Vec<_> = slots
         .iter()
         .map(|slot| {
@@ -439,7 +454,7 @@ async fn run_ask_slots(
                     None,
                     resume,
                     Some(round),
-                    Some(crate::registry::ParentKey::AskRound(round_key)),
+                    Some(crate::registry::ParentKey::AnalyzeRound(round_key)),
                 )
                 .await
             }
@@ -450,21 +465,21 @@ async fn run_ask_slots(
         .await
         .into_iter()
         .map(|m| match m {
-            RoundMember::Done((agent, response)) => AskRun::Completed { agent, response },
-            RoundMember::TimedOut => AskRun::Failed {
+            RoundMember::Done((agent, response)) => AnalyzeRun::Completed { agent, response },
+            RoundMember::TimedOut => AnalyzeRun::Failed {
                 reason: "analyst still running when the round deadline expired".to_string(),
             },
-            RoundMember::Panicked => AskRun::Failed {
+            RoundMember::Panicked => AnalyzeRun::Failed {
                 reason: "analyst task panicked".to_string(),
             },
-            RoundMember::Cancelled => AskRun::Failed {
+            RoundMember::Cancelled => AnalyzeRun::Failed {
                 reason: "analyst task was cancelled".to_string(),
             },
         })
         .collect()
 }
 
-/// Boot resume of an ask round: re-run not-done roster slots with
+/// Boot resume of an analyze round: re-run not-done roster slots with
 /// their stored tasks, reconstruct done slots from stored outcomes, then
 /// re-consolidate. The consolidated result is terminalized into a pending
 /// envelope exactly like a fresh dispatch — delivered to the ORIGINAL caller
@@ -473,18 +488,18 @@ async fn run_ask_slots(
 /// Aborts quietly on shutdown/drain: no routing, no terminalization — the job
 /// row stays for the next boot (checkpointed outcomes are reused, so the
 /// already-completed LLM work is never lost or duplicated).
-pub(crate) async fn resume_ask_round(job_id: &str, ws: &Workspace) {
+pub(crate) async fn resume_analyze_round(job_id: &str, ws: &Workspace) {
     let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
         &crate::session::store().conn,
         job_id,
-        "Ask resume",
-        "Ask resume",
+        "Analyze resume",
+        "Analyze resume",
     )
     .await
     else {
         return;
     };
-    let result = match run_ask_with_job(
+    let result = match run_analyze_with_job(
         ws,
         &caller.task,
         job_id,
@@ -495,13 +510,13 @@ pub(crate) async fn resume_ask_round(job_id: &str, ws: &Workspace) {
     )
     .await
     {
-        Ok(AskRunOutcome::Result(result)) => result,
+        Ok(AnalyzeRunOutcome::Result(result)) => result,
         // Round drain-cut mid-resume: abort quietly — the outcomes are
         // checkpointed, the next boot reuses them.
-        Ok(AskRunOutcome::DrainCut) => {
+        Ok(AnalyzeRunOutcome::DrainCut) => {
             tracing::info!(
                 job = %job_id,
-                "Ask resume aborted after analysts completed — job stays for next boot",
+                "Analyze resume aborted after analysts completed — job stays for next boot",
             );
             return;
         }
@@ -514,14 +529,14 @@ pub(crate) async fn resume_ask_round(job_id: &str, ws: &Workspace) {
     if crate::shutdown::aborting() {
         tracing::info!(
             job = %job_id,
-            "Ask resume aborted after analysts completed — job stays for next boot",
+            "Analyze resume aborted after analysts completed — job stays for next boot",
         );
         return;
     }
     complete_durable_job_and_route(
         job_id,
-        build_async_ask_message(&result),
-        JobKind::AskToolResult,
+        build_async_analyze_message(&result),
+        JobKind::AnalyzeToolResult,
         caller_role,
         &caller,
         &ws.name,
@@ -529,31 +544,31 @@ pub(crate) async fn resume_ask_round(job_id: &str, ws: &Workspace) {
     .await;
 }
 
-/// Boot-scan over-cap handling for ask jobs: the job exceeded
+/// Boot-scan over-cap handling for analyze jobs: the job exceeded
 /// MAX_BOOT_REDISPATCH — deliver an ERROR envelope to the original caller
-/// (the `<ask-tool-result>` envelope is the async-ask caller's ONLY result
+/// (the `<analyze-tool-result>` envelope is the async-analyze caller's ONLY result
 /// path; marking failed with no envelope would strand the caller forever —
 /// "failed = terminal … surface to user").
-pub(crate) async fn ask_capped_envelope(job_id: &str, ws: &Workspace) {
+pub(crate) async fn analyze_capped_envelope(job_id: &str, ws: &Workspace) {
     let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
         &crate::session::store().conn,
         job_id,
-        "Ask capped report",
-        "Ask cap",
+        "Analyze capped report",
+        "Analyze cap",
     )
     .await
     else {
         return;
     };
     let result: anyhow::Result<String> = Err(anyhow::anyhow!(format!(
-        "ask round aborted after {} boot re-dispatch attempts — the last crash lost the round; \
-         please re-issue the ask",
+        "analyze round aborted after {} boot re-dispatch attempts — the last crash lost the round; \
+         please re-issue the analyze request",
         crate::jobs::MAX_BOOT_REDISPATCH,
     )));
     complete_durable_job_and_route(
         job_id,
-        build_async_ask_message(&result),
-        JobKind::AskToolResult,
+        build_async_analyze_message(&result),
+        JobKind::AnalyzeToolResult,
         caller_role,
         &caller,
         &ws.name,
@@ -561,13 +576,13 @@ pub(crate) async fn ask_capped_envelope(job_id: &str, ws: &Workspace) {
     .await;
 }
 
-/// Build the `<ask-tool-result>` envelope message for an async ask dispatch.
+/// Build the `<analyze-tool-result>` envelope message for an async analyze dispatch.
 ///
 /// Shared by the async dispatch path (the `tokio::spawn` body in
-/// [`AskTool::execute`]) and tests — the envelope shape that reaches the
+/// [`AnalyzeTool::execute`]) and tests — the envelope shape that reaches the
 /// caller's agent channel is production code, not a test re-wrap.
-fn build_async_ask_message(result: &anyhow::Result<String>) -> String {
-    build_async_result_envelope(result, "ask-tool-result")
+fn build_async_analyze_message(result: &anyhow::Result<String>) -> String {
+    build_async_result_envelope(result, "analyze-tool-result")
 }
 
 /// Wrap a sub-agent/tool result in the async `<tag>` envelope delivered to
@@ -584,7 +599,7 @@ pub(crate) fn build_async_result_envelope(result: &anyhow::Result<String>, tag: 
 }
 
 /// Shared tail of the 4 resume/capped paths: terminalize a durable
-/// ask/research job and route its envelope to the stored caller. Takes
+/// analyze/research job and route its envelope to the stored caller. Takes
 /// pre-built content so the caller's named wrapper keeps kind and tag
 /// paired; the INSERT-failure best-effort route lives inside
 /// [`crate::jobs::complete_durable_job`].
@@ -765,7 +780,7 @@ pub(crate) fn round_timeout() -> Duration {
 /// never completed (stuck past the round deadline, panicked, or cancelled) —
 /// the reason is surfaced, never silent.
 #[allow(clippy::large_enum_variant)] // Agent is inherently large; the enum is transient
-enum AskRun {
+enum AnalyzeRun {
     Completed {
         agent: Agent,
         response: Option<String>,
@@ -775,7 +790,7 @@ enum AskRun {
     },
 }
 
-impl AskRun {
+impl AnalyzeRun {
     fn response(&self) -> Option<&str> {
         match self {
             Self::Completed { response, .. } => response.as_deref(),
@@ -829,38 +844,45 @@ pub(crate) const VERIFY_MAX_ANALYSTS: usize = 4;
 
 /// Spawn 3 decorrelated parallel analysts, then consolidate their claim-level
 /// findings into a single comprehensive answer.
-async fn run_parallel_analysts_and_consolidate(ws: &Workspace, ask: &str) -> Result<String> {
+async fn run_parallel_analysts_and_consolidate(ws: &Workspace, analyze: &str) -> Result<String> {
     // One round-wide bound shared by the analyst and extraction member waits
     // — a stuck analyst is aborted at it, so no phase can hang the round.
     // The sequential consolidation call after the deadline finishes within
     // its own retry bounds.
     let deadline = std::time::Instant::now() + round_timeout();
     // Round key shared by the analysts and the consolidation call so the
-    // Running Agents view groups them under one ask round.
+    // Running Agents view groups them under one analyze round.
     let round_key = crate::generate_suffix();
-    let runs = run_parallel_analysts(ws, ask, PARALLEL_ANALYST_COUNT, deadline, &round_key).await;
-    consolidate_analyst_runs(ws, ask, runs, deadline, &round_key).await
+    let runs =
+        run_parallel_analysts(ws, analyze, PARALLEL_ANALYST_COUNT, deadline, &round_key).await;
+    consolidate_analyst_runs(ws, analyze, runs, deadline, &round_key).await
 }
 
 /// Load the decorrelation angles asset — one distinct research angle per
 /// parallel analyst. Malformed or missing sections degrade to an empty angle
-/// (the plain ask is used, preserving the original single-question behavior).
+/// (the plain analyze is used, preserving the original single-question behavior).
 pub(crate) fn load_analyst_angles() -> Vec<String> {
-    load_prompt_sections("ask/angles.md")
+    load_prompt_sections("analyze/angles.md")
 }
 
-/// Compose an analyst's roster slot (angle appended to the ask).
+/// Compose an analyst's roster slot (angle appended to the analyze).
 /// KV-cache discipline: vary ONLY the user message (the research
 /// angle) — never per-analyst model/effort/tools.
-fn analyst_slot(ws: &Workspace, angles: &[String], suffix: &str, i: usize, ask: &str) -> AskSlot {
+fn analyst_slot(
+    ws: &Workspace,
+    angles: &[String],
+    suffix: &str,
+    i: usize,
+    analyze: &str,
+) -> AnalyzeSlot {
     let angle = angles.get(i).cloned().unwrap_or_default();
     let task = if angle.is_empty() {
-        ask.to_string()
+        analyze.to_string()
     } else {
-        format!("{ask}\n\nResearch angle:\n{angle}")
+        format!("{analyze}\n\nResearch angle:\n{angle}")
     };
-    AskSlot {
-        agent_id: format!("ask_{}_{}_{}_analyst", ws.name, suffix, i),
+    AnalyzeSlot {
+        agent_id: format!("analyze_{}_{}_{}_analyst", ws.name, suffix, i),
         task,
     }
 }
@@ -872,17 +894,17 @@ fn analyst_slot(ws: &Workspace, angles: &[String], suffix: &str, i: usize, ask: 
 /// stalling the round, and the completed members' results are still delivered.
 async fn run_parallel_analysts(
     ws: &Workspace,
-    ask: &str,
+    analyze: &str,
     count: usize,
     deadline: std::time::Instant,
     round_key: &str,
-) -> Vec<AskRun> {
+) -> Vec<AnalyzeRun> {
     let angles = load_analyst_angles();
-    let slots: Vec<AskSlot> = (0..count)
-        .map(|i| analyst_slot(ws, &angles, round_key, i, ask))
+    let slots: Vec<AnalyzeSlot> = (0..count)
+        .map(|i| analyst_slot(ws, &angles, round_key, i, analyze))
         .collect();
-    let slot_refs: Vec<&AskSlot> = slots.iter().collect();
-    run_ask_slots(ws, &slot_refs, deadline, false, round_key).await
+    let slot_refs: Vec<&AnalyzeSlot> = slots.iter().collect();
+    run_analyze_slots(ws, &slot_refs, deadline, false, round_key).await
 }
 
 /// Consolidate analyst runs: 0 valid → error, 1 valid → raw passthrough,
@@ -891,8 +913,8 @@ async fn run_parallel_analysts(
 /// members count as no-response, with their reasons surfaced in the error.
 async fn consolidate_analyst_runs(
     ws: &Workspace,
-    ask: &str,
-    runs: Vec<AskRun>,
+    analyze: &str,
+    runs: Vec<AnalyzeRun>,
     deadline: std::time::Instant,
     round_key: &str,
 ) -> Result<String> {
@@ -901,12 +923,14 @@ async fn consolidate_analyst_runs(
     // with zero registered agents. Tracking the whole phase is a harmless
     // superset that keeps the drain-watch from firing the token into an
     // in-flight call while the registry looks quiescent. The parent key
-    // attaches the consolidation call to its ask round in the Running Agents
+    // attaches the consolidation call to its analyze round in the Running Agents
     // view.
     let _call = crate::call_registry::NON_AGENT_CALLS.register(
         "consolidate",
         &ws.name,
-        Some(crate::registry::ParentKey::AskRound(round_key.to_string())),
+        Some(crate::registry::ParentKey::AnalyzeRound(
+            round_key.to_string(),
+        )),
         false,
     );
     let valid_count = runs
@@ -918,8 +942,8 @@ async fn consolidate_analyst_runs(
             let reasons: Vec<&str> = runs
                 .iter()
                 .filter_map(|r| match r {
-                    AskRun::Failed { reason } => Some(reason.as_str()),
-                    AskRun::Completed { .. } => None,
+                    AnalyzeRun::Failed { reason } => Some(reason.as_str()),
+                    AnalyzeRun::Completed { .. } => None,
                 })
                 .collect();
             let suffix = if reasons.is_empty() {
@@ -932,15 +956,15 @@ async fn consolidate_analyst_runs(
         1 => Ok(single_raw_response(&runs).expect("exactly one valid response")),
         _ => {
             let outcomes = extract_findings(runs, deadline).await;
-            consolidate_findings(ws, ask, outcomes, round_key).await
+            consolidate_findings(ws, analyze, outcomes, round_key).await
         }
     }
 }
 
-fn single_raw_response(runs: &[AskRun]) -> Option<String> {
+fn single_raw_response(runs: &[AnalyzeRun]) -> Option<String> {
     runs.iter().find_map(|r| match r {
-        AskRun::Completed { response, .. } => response.clone().filter(|t| !t.trim().is_empty()),
-        AskRun::Failed { .. } => None,
+        AnalyzeRun::Completed { response, .. } => response.clone().filter(|t| !t.trim().is_empty()),
+        AnalyzeRun::Failed { .. } => None,
     })
 }
 
@@ -950,7 +974,10 @@ fn single_raw_response(runs: &[AskRun]) -> Option<String> {
 /// are never silently dropped. The extraction wait shares the round-wide
 /// `deadline` — a stuck extraction is reported as no-response, not awaited
 /// forever.
-async fn extract_findings(runs: Vec<AskRun>, deadline: std::time::Instant) -> Vec<AnalystOutcome> {
+async fn extract_findings(
+    runs: Vec<AnalyzeRun>,
+    deadline: std::time::Instant,
+) -> Vec<AnalystOutcome> {
     let extraction_prompt = load_prompt("extraction/findings.md");
     let handles: Vec<_> = runs
         .into_iter()
@@ -958,8 +985,8 @@ async fn extract_findings(runs: Vec<AskRun>, deadline: std::time::Instant) -> Ve
             let extraction_prompt = extraction_prompt.clone();
             tokio::spawn(async move {
                 let (agent, response) = match run {
-                    AskRun::Completed { agent, response } => (agent, response),
-                    AskRun::Failed { reason } => {
+                    AnalyzeRun::Completed { agent, response } => (agent, response),
+                    AnalyzeRun::Failed { reason } => {
                         return AnalystOutcome::NoResponse(crate::util::scrub_credentials(&reason));
                     }
                 };
@@ -1028,7 +1055,7 @@ fn claims_per_agent(outcomes: &[AnalystOutcome]) -> Vec<Vec<String>> {
 /// analyst dumps with an explicit marker — never a fabricated consensus.
 async fn consolidate_findings(
     ws: &Workspace,
-    ask: &str,
+    analyze: &str,
     outcomes: Vec<AnalystOutcome>,
     round_key: &str,
 ) -> Result<String> {
@@ -1068,7 +1095,7 @@ async fn consolidate_findings(
     // id, in (agent, claim) order) — the schema's `id` field matches.
     let material = crate::consensus::numbered_items_material(&items_by_agent);
     let user =
-        format!("# Original Question\n\n{ask}\n\n# Agent Claims (id-numbered)\n\n{material}");
+        format!("# Original Question\n\n{analyze}\n\n# Agent Claims (id-numbered)\n\n{material}");
 
     let model = CONFIG.role_model(Role::Analyst);
     let routing = CONFIG.model_routing(&model);
@@ -1090,18 +1117,15 @@ async fn consolidate_findings(
     );
 
     let table = crate::consensus::ItemTable::new(&items_by_agent);
-    let parent = Some(crate::registry::ParentKey::AskRound(round_key.to_string()));
+    let parent = Some(crate::registry::ParentKey::AnalyzeRound(
+        round_key.to_string(),
+    ));
     match crate::consensus::run_grouping_repair(ws, "consolidate", request, &items_by_agent, parent)
         .await
     {
-        crate::consensus::RepairOutcome::Repaired { output, references } => Ok(render_ask_groups(
-            ask,
-            &output,
-            &references,
-            &table,
-            n_valid,
-            &outcomes,
-        )),
+        crate::consensus::RepairOutcome::Repaired { output, references } => Ok(
+            render_analyze_groups(analyze, &output, &references, &table, n_valid, &outcomes),
+        ),
         crate::consensus::RepairOutcome::Fallback => {
             // Fail-open deliverable: flat numbered claim list (the grouping
             // input) + raw analyst dumps + explicit marker. The marker is
@@ -1116,15 +1140,15 @@ async fn consolidate_findings(
     }
 }
 
-/// Render the ask output contract: summary + groups (heading, contradiction
+/// Render the analyze output contract: summary + groups (heading, contradiction
 /// flag, members citing item ids) + ungrouped remainder + DISPUTED
 /// cross-references from remainder items to frozen groups. Brackets [n/N]
 /// come from distinct cited agent ids; DISPUTED appears only when the group's
 /// contradiction flag is true. Self-reported caveats of a cited claim render
 /// as member metadata, never as contradictions.
 #[must_use]
-fn render_ask_groups(
-    ask: &str,
+fn render_analyze_groups(
+    analyze: &str,
     output: &crate::consensus::GroupingOutput,
     references: &[crate::consensus::GroupingReference],
     table: &crate::consensus::ItemTable<'_>,
@@ -1170,7 +1194,7 @@ fn render_ask_groups(
         },
     ));
     // Original question for context (answers are delivered out of band).
-    let _ = write!(out, "\n\n_Original question: {ask}_");
+    let _ = write!(out, "\n\n_Original question: {analyze}_");
     out
 }
 
@@ -1311,7 +1335,7 @@ pub(crate) async fn dispatch_claim_verifiers(
     resume: bool,
     run_key: &str,
 ) -> (Vec<VerificationResult>, Vec<String>) {
-    let task_template = load_prompt("ask/verify.md");
+    let task_template = load_prompt("analyze/verify.md");
     let extraction_prompt = load_prompt("extraction/verify.md");
     let suffix = crate::generate_suffix();
     let mut dispatched: Vec<String> = Vec::new();
@@ -1504,30 +1528,30 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn test_ask_missing_args() {
-        let tool = AskTool::new(DispatchMode::Sync, Role::Engineer);
+    async fn test_analyze_missing_args() {
+        let tool = AnalyzeTool::new(DispatchMode::Sync, Role::Engineer);
         let ws = test_ws("/tmp/test_ws");
 
-        // Missing ask
+        // Missing analyze
         let result = tool.execute(&ws, json!({})).await;
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Missing required field: ask"),
-            "Should mention missing ask"
+                .contains("Missing required field: analyze"),
+            "Should mention missing analyze"
         );
     }
 
-    /// Tests that ask dispatches analysts and returns the consolidated result.
+    /// Tests that analyze dispatches analysts and returns the consolidated result.
     /// Requires an LLM provider to be configured.
     #[tokio::test]
     #[ignore = "requires LLM provider"]
-    async fn test_ask_analyst() {
-        let tool = AskTool::new(DispatchMode::Sync, Role::Engineer);
+    async fn test_analyze_analyst() {
+        let tool = AnalyzeTool::new(DispatchMode::Sync, Role::Engineer);
         let ws = test_ws("/tmp/test_ws");
-        let args = json!({"ask": "Say 'hello analyst' and nothing else."});
+        let args = json!({"analyze": "Say 'hello analyst' and nothing else."});
         let result = tool.execute(&ws, args).await.expect("execute");
         assert!(
             result.contains("hello"),
@@ -1539,9 +1563,9 @@ mod tests {
 
     /// Build a bare analyst run for pipeline tests: a real `Agent` (no stores
     /// touched) plus an optional raw response.
-    fn test_analyst_run(ws: &Workspace, response: Option<&str>) -> AskRun {
+    fn test_analyst_run(ws: &Workspace, response: Option<&str>) -> AnalyzeRun {
         let agent = Agent::new(
-            format!("ask_test_{}", crate::generate_suffix()),
+            format!("analyze_test_{}", crate::generate_suffix()),
             Role::Analyst,
             ws,
             None,
@@ -1549,15 +1573,15 @@ mod tests {
             String::new(),
             None,
         );
-        AskRun::Completed {
+        AnalyzeRun::Completed {
             agent,
             response: response.map(ToString::to_string),
         }
     }
 
     /// A failed round member (stuck past the deadline, panicked, cancelled).
-    fn test_failed_run(reason: &str) -> AskRun {
-        AskRun::Failed {
+    fn test_failed_run(reason: &str) -> AnalyzeRun {
+        AnalyzeRun::Failed {
             reason: reason.to_string(),
         }
     }
@@ -1725,10 +1749,10 @@ mod tests {
         );
     }
 
-    // ── Ask grouping renderer ────────────────────────────────────────────
+    // ── Analyze grouping renderer ────────────────────────────────────────────
 
     #[test]
-    fn render_ask_groups_computes_brackets_from_distinct_agents() {
+    fn render_analyze_groups_computes_brackets_from_distinct_agents() {
         let outcomes = vec![
             AnalystOutcome::Findings {
                 raw: "r1".into(),
@@ -1769,7 +1793,7 @@ mod tests {
             ],
             ungrouped: vec![crate::consensus::GroupingMember { id: 3 }],
         };
-        let text = render_ask_groups("q", &output, &[], &table, 2, &outcomes);
+        let text = render_analyze_groups("q", &output, &[], &table, 2, &outcomes);
         assert!(
             text.contains("**Alpha** [2/2]"),
             "consensus group renders [2/2] from distinct cited agents: {text}"
@@ -1793,7 +1817,7 @@ mod tests {
     }
 
     #[test]
-    fn render_ask_groups_disputed_only_on_contradiction() {
+    fn render_analyze_groups_disputed_only_on_contradiction() {
         let outcomes = vec![
             AnalystOutcome::Findings {
                 raw: "r1".into(),
@@ -1818,7 +1842,7 @@ mod tests {
             }],
             ungrouped: vec![],
         };
-        let text = render_ask_groups("q", &output, &[], &table, 2, &outcomes);
+        let text = render_analyze_groups("q", &output, &[], &table, 2, &outcomes);
         assert!(
             text.contains("**Alpha** [2/2 · DISPUTED]"),
             "contradiction group renders [2/2 · DISPUTED]: {text}"
@@ -1826,7 +1850,7 @@ mod tests {
     }
 
     #[test]
-    fn render_ask_groups_surfaces_member_caveats_as_metadata() {
+    fn render_analyze_groups_surfaces_member_caveats_as_metadata() {
         let mut claims = findings(vec![("alpha is true", "url1", "high")]);
         claims.claims[0].contradictions = vec!["source B says alpha may be false".into()];
         let outcomes = vec![
@@ -1853,7 +1877,7 @@ mod tests {
             }],
             ungrouped: vec![],
         };
-        let text = render_ask_groups("q", &output, &[], &table, 2, &outcomes);
+        let text = render_analyze_groups("q", &output, &[], &table, 2, &outcomes);
         assert!(
             text.contains("caveat: source B says alpha may be false"),
             "self-reported caveat renders as member metadata: {text}"
@@ -2113,8 +2137,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn test_consolidation_async_envelope_carries_marker() {
-        // The async dispatch path (tokio::spawn in AskTool::execute) builds
-        // its envelope via build_async_ask_message — this test drives the REAL
+        // The async dispatch path (tokio::spawn in AnalyzeTool::execute) builds
+        // its envelope via build_async_analyze_message — this test drives the REAL
         // fail-open consolidation result through that production builder
         // (not a manual re-wrap), asserting the exact envelope + marker shape
         // that reaches the caller's agent channel.
@@ -2127,15 +2151,15 @@ mod tests {
             .err(crate::retry::FailureClass::Transport, "down");
         let result =
             consolidate_with_script(agreed_outcomes("raw report", "raw report 2"), fake).await;
-        let envelope = build_async_ask_message(&result);
-        assert!(envelope.contains("<ask-tool-result>"), "{envelope}");
+        let envelope = build_async_analyze_message(&result);
+        assert!(envelope.contains("<analyze-tool-result>"), "{envelope}");
         assert!(
             envelope.contains("unconsolidated — consolidation failed"),
             "{envelope}"
         );
         assert!(envelope.contains("raw report"), "{envelope}");
         assert!(
-            envelope.ends_with("</ask-tool-result>"),
+            envelope.ends_with("</analyze-tool-result>"),
             "envelope must close: {envelope}"
         );
     }
@@ -2144,19 +2168,19 @@ mod tests {
     async fn async_envelope_wraps_sub_agent_errors() {
         // The async dispatch path's error branch: a failed sub-agent is
         // wrapped in the same envelope with the error text.
-        let envelope = build_async_ask_message(&Err(anyhow::anyhow!("sub-agent exploded")));
-        assert!(envelope.contains("<ask-tool-result>"), "{envelope}");
+        let envelope = build_async_analyze_message(&Err(anyhow::anyhow!("sub-agent exploded")));
+        assert!(envelope.contains("<analyze-tool-result>"), "{envelope}");
         assert!(
             envelope.contains("An error occurred: sub-agent exploded"),
             "{envelope}"
         );
         assert!(
-            envelope.ends_with("</ask-tool-result>"),
+            envelope.ends_with("</analyze-tool-result>"),
             "envelope must close: {envelope}"
         );
     }
 
-    /// The sync ask path truncates tool output via the 5 KB sandwich (head
+    /// The sync analyze path truncates tool output via the 5 KB sandwich (head
     /// 2/3 + tail 1/3) — the fail-open marker is head-placed so it survives
     /// even when the consolidated output overflows the budget.
     #[tokio::test]
@@ -2182,7 +2206,7 @@ mod tests {
     }
 
     #[test]
-    fn render_ask_groups_renders_disputed_cross_references() {
+    fn render_analyze_groups_renders_disputed_cross_references() {
         // A remainder item that contradicts a frozen group renders with
         // DISPUTED + a code-computed cross-reference (id-resolved — no text
         // equality).
@@ -2211,7 +2235,7 @@ mod tests {
             group: 0,
             member: crate::consensus::GroupingMember { id: 1 },
         }];
-        let text = render_ask_groups("q", &output, &references, &table, 2, &outcomes);
+        let text = render_analyze_groups("q", &output, &references, &table, 2, &outcomes);
         assert!(
             text.contains("Agent 1: actually unsafe [DISPUTED — contradicts group 0 \"Safety\"]"),
             "reference must render with DISPUTED + cross-ref: {text}"
@@ -2268,23 +2292,23 @@ mod tests {
         );
     }
 
-    /// Boot resume of a crashed async ask must REUSE the existing job + roster
+    /// Boot resume of a crashed async analyze must REUSE the existing job + roster
     /// (never re-spawn — the jobs.id PK would conflict AND freshly generated
     /// analyst ids would not match the stored roster rows, so outcomes would
     /// be lost). A single done slot reconstructs from its stored outcome
     /// (raw passthrough — no provider needed).
     ///
-    /// Serialized with the drain-flag writers: `resume_ask_round` consults the
+    /// Serialized with the drain-flag writers: `resume_analyze_round` consults the
     /// process-global drain flag and aborts early while it is set (project
     /// convention: retry_tests_lock).
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
-    async fn resume_ask_round_reuses_existing_job() {
+    async fn resume_analyze_round_reuses_existing_job() {
         let _lock = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
-        let ws = test_ws("/tmp/test_ws_resume_ask");
-        let job_id = "ask_job_resume_1";
-        let agent_id = format!("ask_{}_rs_0_analyst", ws.name);
+        let ws = test_ws("/tmp/test_ws_resume_analyze");
+        let job_id = "analyze_job_resume_1";
+        let agent_id = format!("analyze_{}_rs_0_analyst", ws.name);
         let conn = &crate::session::store().conn;
         // Pre-create the job row exactly as a crashed dispatch leaves it
         // (caller identity persisted on the job row; one done slot with a
@@ -2303,7 +2327,7 @@ mod tests {
                 idx: Some(0),
                 task: "question?".to_string(),
             }],
-            &crate::jobs::SpawnChild::Ask,
+            &crate::jobs::SpawnChild::Analyze,
         )
         .await
         .unwrap();
@@ -2320,7 +2344,7 @@ mod tests {
         // Resume: must NOT hit the jobs.id PK conflict, must reuse the stored
         // roster slot, then terminalize into a durable envelope delivered to
         // the ORIGINAL caller (Assistant, not Manager).
-        resume_ask_round(job_id, &ws).await;
+        resume_analyze_round(job_id, &ws).await;
 
         let job_rows = conn
             .query(
@@ -2348,20 +2372,20 @@ mod tests {
         assert_eq!(envelope.user_name, "caller-user");
     }
 
-    /// The boot-scan over-cap path must NOT strand the async-ask caller: an
+    /// The boot-scan over-cap path must NOT strand the async-analyze caller: an
     /// error envelope (with the original caller identity) is delivered instead
     /// of a silent failed row.
     ///
-    /// Serialized with the drain-flag writers: `ask_capped_envelope` consults
+    /// Serialized with the drain-flag writers: `analyze_capped_envelope` consults
     /// the process-global drain flag and aborts early while it is set (project
     /// convention: retry_tests_lock).
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
-    async fn ask_capped_envelope_delivers_error_to_caller() {
+    async fn analyze_capped_envelope_delivers_error_to_caller() {
         let _lock = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
-        let ws = test_ws("/tmp/test_ws_ask_capped");
-        let job_id = "ask_job_capped_1";
+        let ws = test_ws("/tmp/test_ws_analyze_capped");
+        let job_id = "analyze_job_capped_1";
         let conn = &crate::session::store().conn;
         crate::jobs::spawn_job(
             conn,
@@ -2372,17 +2396,17 @@ mod tests {
             "telegram",
             crate::Role::Assistant,
             &[crate::jobs::NewAgent {
-                agent_id: format!("ask_{}_capped_0_analyst", ws.name),
+                agent_id: format!("analyze_{}_capped_0_analyst", ws.name),
                 kind: crate::jobs::AgentKind::Analyst,
                 idx: Some(0),
                 task: "question?".to_string(),
             }],
-            &crate::jobs::SpawnChild::Ask,
+            &crate::jobs::SpawnChild::Analyze,
         )
         .await
         .unwrap();
 
-        ask_capped_envelope(job_id, &ws).await;
+        analyze_capped_envelope(job_id, &ws).await;
 
         let job_rows = conn
             .query(
@@ -2410,7 +2434,7 @@ mod tests {
         );
         assert_eq!(envelope.user_name, "caller-user");
         assert!(
-            envelope.content.contains("ask round aborted"),
+            envelope.content.contains("analyze round aborted"),
             "the envelope must surface the cap failure to the caller"
         );
     }

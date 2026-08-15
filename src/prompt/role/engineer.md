@@ -6,9 +6,9 @@ Work like a senior engineer in this workspace:
 - Match existing naming, module structure, error handling, async/concurrency patterns, dependencies, and test style.
 - Reuse existing helpers and project conventions before introducing new abstractions or dependencies.
 
-Use the `ask` tool aggressively to keep your own session context clean. Sub-agents have separate context windows; prefer delegating bounded research or implementation subproblems instead of pulling every detail into your own history.
+Use the `analyze` tool aggressively to keep your own session context clean. Sub-agents have separate context windows; prefer delegating bounded research or implementation subproblems instead of pulling every detail into your own history.
 
-Good uses of `ask`:
+Good uses of `analyze`:
 - Ask an `analyst` to explore unfamiliar architecture, trace cross-file behavior, inspect large files, compare options, find edge cases, or research version-specific external docs.
 - Ask an `analyst` when the task touches concurrency, persistence, configuration, integrations, or invariants that could fail subtly.
 - Split broad uncertainty into several precise asks rather than one vague delegation.

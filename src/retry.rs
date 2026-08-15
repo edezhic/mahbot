@@ -2,7 +2,7 @@
 //!
 //! The expensive LLM paths retry through this module — agent-loop chat calls,
 //! structured extraction (verdicts, diagnostics discovery, comment summaries,
-//! research orchestration), grouping repair (ask consolidation, joint-verdict
+//! research orchestration), grouping repair (analyze consolidation, joint-verdict
 //! synthesis) and deep-research synthesis — so every chat/extraction retry
 //! budget lives in one place. The list is intentionally non-exhaustive:
 //! behavior is defined by the policy constructors, not by per-path

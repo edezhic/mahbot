@@ -1,6 +1,6 @@
 //! "Running Agents" dashboard page — a live view of every currently-running
 //! agent and in-flight non-agent LLM work, grouped by DIRECT PARENT
-//! INVOCATION (ticket / ask round / research run / workspace singleton /
+//! INVOCATION (ticket / analyze round / research run / workspace singleton /
 //! unattributable orchestrator calls).
 //!
 //! The view is a running-only window: it reads the in-memory registries
@@ -130,7 +130,7 @@ impl RunningState {
             })
             .collect();
 
-        // Stable sort: tickets, ask rounds, research runs, singletons,
+        // Stable sort: tickets, analyze rounds, research runs, singletons,
         // unattributed (the DisplayGroup::sort_key already encodes this).
         filtered.sort_by_key(DisplayGroup::sort_key);
 
@@ -221,7 +221,7 @@ struct CallRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GroupKind {
     Ticket,
-    AskRound,
+    AnalyzeRound,
     Research,
     Singleton,
     Unattributed,
@@ -246,7 +246,7 @@ impl DisplayGroup {
     fn sort_key(&self) -> (u8, String) {
         let order = match self.kind {
             GroupKind::Ticket => 0,
-            GroupKind::AskRound => 1,
+            GroupKind::AnalyzeRound => 1,
             GroupKind::Research => 2,
             GroupKind::Singleton => 3,
             GroupKind::Unattributed => 4,
@@ -260,7 +260,7 @@ impl DisplayGroup {
 fn parent_group_kind(parent: &ParentKey) -> GroupKind {
     match parent {
         ParentKey::Ticket(_) => GroupKind::Ticket,
-        ParentKey::AskRound(_) => GroupKind::AskRound,
+        ParentKey::AnalyzeRound(_) => GroupKind::AnalyzeRound,
         ParentKey::Research(_) => GroupKind::Research,
     }
 }
@@ -269,7 +269,7 @@ fn parent_group_kind(parent: &ParentKey) -> GroupKind {
 fn parent_group_key(parent: &ParentKey) -> &str {
     match parent {
         ParentKey::Ticket(id) => id,
-        ParentKey::AskRound(key) | ParentKey::Research(key) => key,
+        ParentKey::AnalyzeRound(key) | ParentKey::Research(key) => key,
     }
 }
 
@@ -277,16 +277,16 @@ fn parent_group_key(parent: &ParentKey) -> &str {
 ///
 /// - Tickets: agents with a [`ParentKey::Ticket`] plus calls with the same
 ///   ticket parent.
-/// - Ask rounds: agents + calls sharing an [`ParentKey::AskRound`] key.
+/// - Analyze rounds: agents + calls sharing an [`ParentKey::AnalyzeRound`] key.
 /// - Research runs: agents + calls sharing a [`ParentKey::Research`] key.
 /// - Workspace singletons: agents with no parent key (manager / maintainer /
 ///   discovery / direct chat).
 /// - Unattributed: non-agent calls with no parent key (workspace-scoped).
 ///
 /// Group identity is (kind, key) plus — for everything except research — the
-/// workspace: ticket ids already embed the workspace name and ask-round keys
+/// workspace: ticket ids already embed the workspace name and analyze-round keys
 /// are scoped to one workspace, so the extra component closes any
-/// cross-workspace key collision (e.g. two concurrent sync ask rounds in
+/// cross-workspace key collision (e.g. two concurrent sync analyze rounds in
 /// different workspaces drawing the same short NanoID suffix). Research groups
 /// are matched on (kind, key) alone because a run's coder round executes in an
 /// EPHEMERAL per-run workspace whose name IS the run key (job_id) while its
@@ -403,14 +403,14 @@ fn render_group<'a>(
     // Singleton / Unattributed groups are keyed BY the workspace name, so the
     // resolved label (with the "(external)" marker when unregistered) IS the
     // title — never push a second workspace label beside it. Parent-keyed
-    // groups (ticket / ask round / research) show the workspace label next to
+    // groups (ticket / analyze round / research) show the workspace label next to
     // the title, with the round/run key included so concurrent rounds in one
     // workspace are visually distinguishable at the header level.
     let show_workspace_label =
         !matches!(group.kind, GroupKind::Singleton | GroupKind::Unattributed);
     let title = match &group.kind {
         GroupKind::Ticket => format!("Ticket {}", group.key),
-        GroupKind::AskRound => format!("Ask round {}", group.key),
+        GroupKind::AnalyzeRound => format!("Analyze round {}", group.key),
         GroupKind::Research => format!("Research run {}", group.key),
         GroupKind::Singleton => workspace_label.clone(),
         GroupKind::Unattributed => format!("Other LLM work — {workspace_label}"),
@@ -595,7 +595,7 @@ fn render_call_row<'a>(
 /// run-lifetime indicator and never appears as a call row.
 fn call_purpose(kind: &str) -> String {
     match kind {
-        "consolidate" => "Ask consolidation".to_string(),
+        "consolidate" => "Analyze consolidation".to_string(),
         "synthesis" => "Ticket synthesis".to_string(),
         "synthesize" => "Research synthesis".to_string(),
         "decompose_merge" => "Research plan merge".to_string(),
@@ -687,48 +687,48 @@ mod tests {
     }
 
     #[test]
-    fn two_ask_rounds_never_mix_members() {
+    fn two_analyze_rounds_never_mix_members() {
         let agents = vec![
             agent_handle(
-                "ask_ws_AAA_0_analyst",
+                "analyze_ws_AAA_0_analyst",
                 "analyst",
                 None,
                 "ws1",
-                Some(ParentKey::AskRound("roundA".to_string())),
+                Some(ParentKey::AnalyzeRound("roundA".to_string())),
             ),
             agent_handle(
-                "ask_ws_AAA_1_analyst",
+                "analyze_ws_AAA_1_analyst",
                 "analyst",
                 None,
                 "ws1",
-                Some(ParentKey::AskRound("roundA".to_string())),
+                Some(ParentKey::AnalyzeRound("roundA".to_string())),
             ),
             agent_handle(
-                "ask_ws_BBB_0_analyst",
+                "analyze_ws_BBB_0_analyst",
                 "analyst",
                 None,
                 "ws1",
-                Some(ParentKey::AskRound("roundB".to_string())),
+                Some(ParentKey::AnalyzeRound("roundB".to_string())),
             ),
         ];
         let calls = vec![call_handle(
             "consolidate",
             "ws1",
-            Some(ParentKey::AskRound("roundA".to_string())),
+            Some(ParentKey::AnalyzeRound("roundA".to_string())),
             false,
         )];
         let groups = build_groups(&agents, &calls);
-        let ask_groups: Vec<_> = groups
+        let analyze_groups: Vec<_> = groups
             .iter()
-            .filter(|g| g.kind == GroupKind::AskRound)
+            .filter(|g| g.kind == GroupKind::AnalyzeRound)
             .collect();
-        assert_eq!(ask_groups.len(), 2, "two distinct ask round groups");
-        let round_a = ask_groups
+        assert_eq!(analyze_groups.len(), 2, "two distinct analyze round groups");
+        let round_a = analyze_groups
             .iter()
             .find(|g| g.key == "roundA")
             .expect("round A exists");
         assert_eq!(round_a.items.len(), 3, "2 analysts + consolidation call");
-        let round_b = ask_groups
+        let round_b = analyze_groups
             .iter()
             .find(|g| g.key == "roundB")
             .expect("round B exists");
@@ -909,32 +909,32 @@ mod tests {
 
     #[test]
     fn cross_workspace_round_keys_never_merge_groups() {
-        // Two concurrent sync ask rounds in DIFFERENT workspaces could draw
+        // Two concurrent sync analyze rounds in DIFFERENT workspaces could draw
         // the same short NanoID suffix — the workspace component of the group
         // identity must keep their groups separate.
         let agents = vec![
             agent_handle(
-                "ask_ws_AAA_0_analyst",
+                "analyze_ws_AAA_0_analyst",
                 "analyst",
                 None,
                 "ws1",
-                Some(ParentKey::AskRound("abc123".to_string())),
+                Some(ParentKey::AnalyzeRound("abc123".to_string())),
             ),
             agent_handle(
-                "ask_ws_BBB_0_analyst",
+                "analyze_ws_BBB_0_analyst",
                 "analyst",
                 None,
                 "ws2",
-                Some(ParentKey::AskRound("abc123".to_string())),
+                Some(ParentKey::AnalyzeRound("abc123".to_string())),
             ),
         ];
         let groups = build_groups(&agents, &[]);
-        let ask_groups: Vec<_> = groups
+        let analyze_groups: Vec<_> = groups
             .iter()
-            .filter(|g| g.kind == GroupKind::AskRound)
+            .filter(|g| g.kind == GroupKind::AnalyzeRound)
             .collect();
         assert_eq!(
-            ask_groups.len(),
+            analyze_groups.len(),
             2,
             "same round key in two workspaces stays separate"
         );

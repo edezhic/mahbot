@@ -29,7 +29,7 @@ static NEXT_TOOL_ID: AtomicU64 = AtomicU64::new(1);
 /// - [`Ticket`](ParentKey::Ticket) — all agents working on the same ticket
 ///   plus LLM calls belonging to the ticket's own work (e.g. joint-verdict
 ///   synthesis of a review round).
-/// - [`AskRound`](ParentKey::AskRound) — the parallel analysts of one ask
+/// - [`AnalyzeRound`](ParentKey::AnalyzeRound) — the parallel analysts of one analyze
 ///   round plus its consolidation LLM call (members share the round key).
 /// - [`Research`](ParentKey::Research) — all sub-agents and orchestrator LLM
 ///   calls of one research run (members share the durable research job id).
@@ -40,7 +40,7 @@ static NEXT_TOOL_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 pub enum ParentKey {
     Ticket(String),
-    AskRound(String),
+    AnalyzeRound(String),
     Research(String),
 }
 

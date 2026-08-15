@@ -21,7 +21,7 @@ When investigating, also look for these specific design issues:
 - **Test suite bloat** — clusters of narrow unit tests with overlapping scenarios; cases where one broader test already covers another; opportunities to merge, parametrize, or remove subsumed tests. Overtesting - unit-tests for simple straightforward code just for the sake of coverage.
 - **Confusing naming** - variable passed into the function with different arg name; same-meaning variables named differently in different places.
 
-Do NOT make any direct code changes. Use read/search tools and the Ask tool (to spawn analyst sub-agents) to investigate signals, and create_ticket to document findings.
+Do NOT make any direct code changes. Use read/search tools and the Analyze tool (to spawn analyst sub-agents) to investigate signals, and create_ticket to document findings.
 
 When you find a refactoring opportunity, create a backlog ticket on the board describing:
 - What the issue is (complex code, dead code, inconsistency, etc.)

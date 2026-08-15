@@ -32,7 +32,7 @@ pub struct NonAgentCallHandle {
     pub workspace: String,
     pub started_at: DateTime<Utc>,
     /// Grouping key for the Running Agents view — the DIRECT PARENT
-    /// INVOCATION this call belongs to (ticket / ask round / research run).
+    /// INVOCATION this call belongs to (ticket / analyze round / research run).
     /// `None` means the call is genuinely unattributable (workspace-scoped
     /// section with a visually distinct marker).
     pub parent_key: Option<ParentKey>,
@@ -54,7 +54,7 @@ impl NonAgentCallRegistry {
     /// failure (including early returns and task cancellation).
     ///
     /// `parent` attaches the call to its DIRECT PARENT INVOCATION for the
-    /// Running Agents grouping (ticket / ask round / research run); `None`
+    /// Running Agents grouping (ticket / analyze round / research run); `None`
     /// makes the call render in the workspace-scoped unattributable section.
     /// `run_lifetime` marks whole-operation lifetime guards (research
     /// orchestrator) that render as a run-lifetime indicator, not a transient
@@ -118,7 +118,7 @@ mod tests {
         let guard = NON_AGENT_CALLS.register(
             kind,
             "ws1",
-            Some(ParentKey::AskRound("round_1".to_string())),
+            Some(ParentKey::AnalyzeRound("round_1".to_string())),
             false,
         );
         // The run-lifetime flag is a distinct registration mode (whole-run
@@ -138,7 +138,7 @@ mod tests {
         assert_eq!(h.workspace, "ws1");
         assert_eq!(
             h.parent_key,
-            Some(ParentKey::AskRound("round_1".to_string()))
+            Some(ParentKey::AnalyzeRound("round_1".to_string()))
         );
         assert!(!h.run_lifetime);
         let o = handles

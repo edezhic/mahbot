@@ -379,8 +379,13 @@ crate::columns! {
 ///
 /// If a new agent role is added that can talk to users directly, its agent ID prefix
 /// must also be excluded from this list.
-pub(crate) const TRANSIENT_AGENT_ID_PREFIXES: &[&str] =
-    &["ticket_", "ask_", "research_", "maintainer_", "discovery_"];
+pub(crate) const TRANSIENT_AGENT_ID_PREFIXES: &[&str] = &[
+    "ticket_",
+    "analyze_",
+    "research_",
+    "maintainer_",
+    "discovery_",
+];
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionMetadata {
@@ -961,13 +966,13 @@ pub(crate) fn maintainer_agent_id(ws_name: &str) -> String {
     format!("maintainer_{}_{}", ws_name, crate::generate_suffix())
 }
 
-/// Construct an agent ID for sub-agent asks (Engineer/Maintainer → sub-agent).
+/// Construct an agent ID for sub-agent analyze rounds (Engineer/Maintainer → sub-agent).
 ///
-/// Format: `ask_{ws_name}_{suffix}_{role}`
+/// Format: `analyze_{ws_name}_{suffix}_{role}`
 /// Role is the LAST segment — see [`direct_agent_id`] for rationale.
 #[must_use]
-pub(crate) fn ask_agent_id(ws_name: &str, role: &str) -> String {
-    format!("ask_{}_{}_{}", ws_name, crate::generate_suffix(), role)
+pub(crate) fn analyze_agent_id(ws_name: &str, role: &str) -> String {
+    format!("analyze_{}_{}_{}", ws_name, crate::generate_suffix(), role)
 }
 
 /// Construct an agent ID for a deep-research sub-agent (decomposers,
@@ -1657,7 +1662,7 @@ mod estimate_tests {
 // `reverse_transient_builders_use_registered_prefixes` covers all transient
 // builders (one per prefix in TRANSIENT_AGENT_ID_PREFIXES). If a new transient
 // role adds an agent ID builder, add it to the reverse test.
-// Channel-name collision (a channel registered as "ticket" or "ask") is an
+// Channel-name collision (a channel registered as "ticket" or "analyze") is an
 // orthogonal risk — `starts_with` matches the first key segment (channel
 // name), which cannot be guarded by assertion because channel names are
 // dynamic. Awareness during channel registration is required.
@@ -1731,9 +1736,9 @@ mod transient_prefix_tests {
             "ticket_agent_id('abc123', 'analyst')",
         );
         assert_transient_key(
-            &ask_agent_id("ws", "coder"),
-            "ask_",
-            "ask_agent_id('ws', 'coder')",
+            &analyze_agent_id("ws", "coder"),
+            "analyze_",
+            "analyze_agent_id('ws', 'coder')",
         );
         assert_transient_key(
             &research_agent_id("ws", "decomposer"),

@@ -723,13 +723,13 @@ pub struct Agent {
     /// Flushed to the logs store on [`Agent::finalize_session`]; silently
     /// lost if the agent is dropped without finalization.
     tool_stats: std::sync::Mutex<Vec<crate::ToolCallRecord>>,
-    /// The user who triggered this agent run — used by tools (e.g. AskTool)
+    /// The user who triggered this agent run — used by tools (e.g. AnalyzeTool)
     /// to route async sub-agent results back to the correct user.
     pub(crate) user_name: String,
     /// The channel origin (gui, telegram, voice) of the triggering message.
     pub(crate) channel: String,
     /// DIRECT PARENT INVOCATION grouping key for the Running Agents view
-    /// (ticket / ask round / research run). `None` for workspace singletons.
+    /// (ticket / analyze round / research run). `None` for workspace singletons.
     /// Propagated to sub-agents spawned by tools via
     /// [`CURRENT_TOOL_PARENT_KEY`](crate::agent::CURRENT_TOOL_PARENT_KEY).
     pub(crate) parent_key: Option<crate::registry::ParentKey>,
@@ -980,7 +980,7 @@ pub(crate) trait Tool: Send + Sync {
     /// There are three distinct policy patterns across the codebase:
     ///
     /// 1. **Scrub-all** (trait default: `true`) — web_search, browser, edit,
-    ///    ask, ticket, media-gen tools, and most others. The raw output may
+    ///    analyze, ticket, media-gen tools, and most others. The raw output may
     ///    contain credentials, so it is always scrubbed before the LLM sees it.
     ///
     /// 2. **Skip scrubbing entirely** (`false`) — shell and search tools.
