@@ -2010,14 +2010,23 @@ fn apply_strip_lines(output: &str, profile: &Profile) -> String {
         .join("\n")
 }
 
-/// Build a head/tail sandwich with an omitted-lines marker in the middle.
+/// Build a head/tail sandwich with an omission marker in the middle.
+///
+/// `marker_verb` is the verb shown in the marker line — "omitted" for head/tail
+/// sandwiches, "truncated" for the `max_lines`-only cap. It is a plain string
+/// rather than an enum; a typo would silently alter tool output, which is
+/// acceptable for the fixed call sites given the existing tests.
 ///
 /// Edge cases:
-/// - `head=0` (tail-only, e.g., `ping`, `gh`, `helm` profiles): no leading
-///   newline before the omission marker.
+/// - `head=0` (tail-only, e.g., `ping`, `gh`, `helm` profiles, and the
+///   `max_lines`-only cap, which calls this as `(output, max, 0, "truncated")`):
+///   no leading newline before the omission marker. A future `max_lines = 0`
+///   profile would hit this path too (unreachable today — profiles.rs minimum
+///   is 20) and would format the marker without the leading newline that the
+///   former `cap_at_max_lines(.., 0)` emitted.
 /// - `tail=0` (head-only, e.g., `git log` profile): no trailing newline after
 ///   the omission marker.
-fn format_sandwich(output: &str, head: usize, tail: usize) -> String {
+fn format_sandwich(output: &str, head: usize, tail: usize, marker_verb: &str) -> String {
     let lines: Vec<&str> = output.lines().collect();
     let total = lines.len();
     if total <= head + tail {
@@ -2029,9 +2038,9 @@ fn format_sandwich(output: &str, head: usize, tail: usize) -> String {
     let mut result = lines[..head].join("\n");
     if result.is_empty() {
         // head=0: no leading newline before the omission marker
-        let _ = write!(result, "... ({omitted} lines omitted)");
+        let _ = write!(result, "... ({omitted} lines {marker_verb})");
     } else {
-        let _ = write!(result, "\n... ({omitted} lines omitted)");
+        let _ = write!(result, "\n... ({omitted} lines {marker_verb})");
     }
     if tail > 0 {
         let _ = write!(result, "\n{}", lines[total - tail..].join("\n"));
@@ -2071,12 +2080,12 @@ fn apply_line_truncation(output: &str, profile: &Profile) -> (String, Option<Str
 
     // Single-pass truncation:
     // 1. Head/tail sandwich (byte-gated), OR
-    // 2. max_lines-only absolute cap, OR
+    // 2. max_lines-only absolute cap (head-only sandwich with "truncated" verb), OR
     // 3. passthrough.
     let result = if should_sandwich {
-        format_sandwich(output, head, tail)
+        format_sandwich(output, head, tail, "omitted")
     } else if let Some(max) = max {
-        cap_at_max_lines(output, max)
+        format_sandwich(output, max, 0, "truncated")
     } else {
         output.to_string()
     };
@@ -2090,20 +2099,6 @@ fn apply_line_truncation(output: &str, profile: &Profile) -> (String, Option<Str
     );
 
     (result, pre_truncation)
-}
-
-/// Cap `output` to at most `max` lines, appending a truncation marker
-/// if lines were removed.
-fn cap_at_max_lines(output: &str, max: usize) -> String {
-    let lines: Vec<&str> = output.lines().collect();
-    if lines.len() > max {
-        let truncated = lines.len() - max;
-        let mut capped = lines[..max].join("\n");
-        let _ = write!(capped, "\n... ({truncated} lines truncated)");
-        capped
-    } else {
-        output.to_string()
-    }
 }
 
 /// Run the full profile-based processing pipeline on pre-processed output.
@@ -2256,7 +2251,7 @@ fn format_spill_preview(output: &str, path: &Path) -> String {
     let line_count = output.lines().count();
     let byte_count = output.len();
     let header = format_spill_header(path, byte_count, line_count);
-    format!("{header}{}", format_sandwich(output, 5, 5))
+    format!("{header}{}", format_sandwich(output, 5, 5, "omitted"))
 }
 
 /// Get the shared temp directory for spill/full output logs.
@@ -4130,7 +4125,7 @@ mod tests {
             ),
         ];
         for (input, head, tail, expected) in cases {
-            let result = format_sandwich(input, *head, *tail);
+            let result = format_sandwich(input, *head, *tail, "omitted");
             assert_eq!(
                 result, *expected,
                 "format_sandwich({input:?}, {head}, {tail})"
