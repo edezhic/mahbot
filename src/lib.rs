@@ -750,6 +750,12 @@ pub struct Agent {
     /// on error, left `None` on success or cancellation (callers classify
     /// cancellation via the cancel tokens).
     pub(crate) failure: Option<String>,
+    /// Agent-scoped registry of background shell sessions (Full shell roles
+    /// only). Live sessions are force-killed on agent teardown ([`Drop`]) —
+    /// see [`crate::tools::shell::BackgroundSessions`]. Reachable from the
+    /// per-call tool context via
+    /// [`crate::agent::CURRENT_TOOL_BACKGROUND_SESSIONS`].
+    background_sessions: std::sync::Arc<crate::tools::shell::BackgroundSessions>,
 }
 
 // ── Verdict type ─────────────────────────────────────────────────

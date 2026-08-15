@@ -14,12 +14,14 @@ use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
 use crate::util::scrub_credentials;
 use crate::util::strip_ansi_escapes;
 
+mod bg;
 #[cfg(unix)]
 pub(crate) mod grep_engine;
 mod profiles;
 mod readonly;
 mod scan;
 
+pub(crate) use self::bg::BackgroundSessions;
 use self::profiles::{CARGO_COMPILE_PREFIXES, GEN_FALLBACK, PROFILES, Profile};
 pub use self::readonly::ShellMode;
 use self::readonly::check_command;
@@ -313,11 +315,16 @@ fn output_drain_timeout() -> Duration {
     )
 }
 
-/// Kill the process group of a spawned shell (PGID == the child PID after
-/// `process_group(0)` in [`build_shell_command`]). Used when a leftover
-/// backgrounded process keeps the output pipes open after the main process
-/// exited (drain timeout) or was killed (command timeout) — prevents orphaned
-/// pipe-holding strays from accumulating.
+/// Signal the process group of a spawned shell (PGID == the child PID after
+/// `process_group(0)` in [`build_shell_command`]). Used to terminate the whole
+/// subprocess tree when a leftover backgrounded process keeps the output pipes
+/// open after the main process exited (drain timeout) or was killed (command
+/// timeout) — prevents orphaned pipe-holding strays from accumulating.
+///
+/// Also used by [`self::bg`] for the two-stage background-session stop
+/// (SIGTERM then SIGKILL) and the teardown kill; there the target is the
+/// background watcher's PID (the group leader), which stays alive for the
+/// whole session, so the group always exists when the signal is sent.
 ///
 /// Note on ordering: the timeout path deliberately kills before reaping the
 /// child (see [`run_command_with_timeout`]) to avoid a PID-reuse race; the
@@ -325,18 +332,19 @@ fn output_drain_timeout() -> Duration {
 /// in theory be recycled as a new group leader within the drain window —
 /// accepted risk, the kill is best-effort.
 #[cfg(unix)]
-fn kill_process_group(pid: u32) {
+fn kill_process_group(pid: u32, signal: libc::c_int) {
     let pid_signed: libc::pid_t = pid.try_into().expect("PID fits in pid_t");
-    // SAFETY: kill(-pgid, SIGKILL) is the standard POSIX way to terminate an
-    // entire process group. The target PGID is our own child's PID (also its
+    // SAFETY: kill(-pgid, sig) is the standard POSIX way to signal an entire
+    // process group. The target PGID is our own child's PID (also its
     // PGID after process_group(0)), so we own every process in the group.
-    let ret = unsafe { libc::kill(-pid_signed, libc::SIGKILL) };
+    let ret = unsafe { libc::kill(-pid_signed, signal) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
         tracing::warn!(
             pid = pid,
+            signal,
             err = %err,
-            "kill(-pgid, SIGKILL) failed — leftover processes may survive"
+            "kill(-pgid) failed — leftover processes may survive"
         );
     }
 }
@@ -367,7 +375,7 @@ impl Drop for KillOnDrop {
     fn drop(&mut self) {
         if self.armed {
             #[cfg(unix)]
-            kill_process_group(self.pid);
+            kill_process_group(self.pid, libc::SIGKILL);
         }
     }
 }
@@ -481,7 +489,7 @@ async fn run_command_with_timeout(
                     // (a completed JoinHandle must not be re-awaited).
                     #[cfg(unix)]
                     if let Some(pid) = pid {
-                        kill_process_group(pid);
+                        kill_process_group(pid, libc::SIGKILL);
                     }
                     cancel.cancel();
                     let (stdout, stderr) = tokio::join!(
@@ -521,7 +529,7 @@ async fn run_command_with_timeout(
                 // Kill the entire process group.
                 // pgid == pid because build_shell_command calls
                 // process_group(0), making the child a PG leader.
-                kill_process_group(pid);
+                kill_process_group(pid, libc::SIGKILL);
                 // Reap the child (now dead from one or both kills).
                 let _ = child.wait().await;
                 // Reaped — disarm the guard (the explicit kill already ran).
@@ -661,6 +669,80 @@ impl ShellTool {
         Self { mode }
     }
 
+    /// Launch a command in the background (Full mode only): the command keeps
+    /// running after this tool call returns, its raw output is written to a
+    /// file in the temp area's `.agent` directory, and the returned message
+    /// carries that file's path. The agent reads progress with the read tool
+    /// and stops the session via [`Self::stop_background`].
+    async fn launch_background(
+        &self,
+        ws: &Workspace,
+        command: &str,
+    ) -> anyhow::Result<(String, Option<i32>)> {
+        let sessions = Self::background_sessions_handle()?;
+        let path = sessions
+            .launch(command, ws.as_path())
+            .await
+            .map_err(anyhow::Error::msg)?;
+        Ok((
+            format!(
+                "Background session started.\n\
+                 output file: {}\n\
+                 command: {command}\n\
+                 The command is running detached from this tool call — its raw output \
+                 is written to the output file. Read the file with the read tool to follow \
+                 progress. When the command exits, the line `[exit status: N]` is appended \
+                 to the end of the file (including for exit 0) — its presence means the \
+                 command finished. Stop the session with the shell tool's `stop` argument \
+                 set to this output-file path.",
+                path.display()
+            ),
+            Some(0),
+        ))
+    }
+
+    /// Stop a background session by its output-file path (Full mode only).
+    /// Two-stage SIGTERM → grace → SIGKILL; stopping an already-finished
+    /// session is a no-op.
+    async fn stop_background(&self, stop_path: &str) -> anyhow::Result<(String, Option<i32>)> {
+        let sessions = Self::background_sessions_handle()?;
+        let path = PathBuf::from(stop_path);
+        match sessions.stop(&path).await {
+            Ok(self::bg::StopResult::Stopped) => Ok((
+                format!(
+                    "Background session stopped.\noutput file: {}",
+                    path.display()
+                ),
+                Some(0),
+            )),
+            Ok(self::bg::StopResult::AlreadyFinished) => Ok((
+                format!(
+                    "Background session already finished — no action taken.\noutput file: {}",
+                    path.display()
+                ),
+                Some(0),
+            )),
+            Err(e) => anyhow::bail!("{e}"),
+        }
+    }
+
+    /// The agent-scoped background-session registry, read from the per-call
+    /// tool context (set by the agent's tool-group executor). `None` outside
+    /// an agent run (management diagnostics, tests) — background mode is
+    /// unavailable there.
+    fn background_sessions_handle()
+    -> anyhow::Result<std::sync::Arc<crate::tools::shell::BackgroundSessions>> {
+        crate::agent::CURRENT_TOOL_BACKGROUND_SESSIONS
+            .try_with(std::clone::Clone::clone)
+            .unwrap_or(None)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Background shell mode is not available in this context \
+                     (no agent session registry)."
+                )
+            })
+    }
+
     /// Execute a command and return `(formatted_output, exit_code)`.
     ///
     /// `exit_code` is `Some(0)` for success, `Some(n)` for non-zero exit, or
@@ -675,6 +757,28 @@ impl ShellTool {
         ws: &Workspace,
         args: serde_json::Value,
     ) -> anyhow::Result<(String, Option<i32>)> {
+        // ── Background mode (Full shell roles only) ──
+        // `stop`/`background` are checked before `command` is required, so a
+        // stop-only invocation (no command) works. ReadOnly mode never reads
+        // these arguments — its behavior is byte-identical to before.
+        if self.mode == ShellMode::Full {
+            let stop_path = super::get_opt_str(&args, "stop").filter(|s| !s.is_empty());
+            let background = super::get_opt_bool(&args, "background").unwrap_or(false);
+            if let Some(stop_path) = stop_path {
+                if background {
+                    anyhow::bail!(
+                        "The `stop` and `background` arguments cannot be combined — \
+                         pass only `stop` with the output-file path of a background session."
+                    );
+                }
+                return self.stop_background(stop_path).await;
+            }
+            if background {
+                let command_str = super::get_str(&args, "command")?;
+                return self.launch_background(ws, command_str).await;
+            }
+        }
+
         let command_str = super::get_str(&args, "command")?;
 
         // Read-only mode: validate command before execution.
@@ -1044,26 +1148,62 @@ impl Tool for ShellTool {
                 let base = crate::prompt::load_prompt(&format!("tool/{}.md", self.name()));
                 format!("{banner}\n\n{base}")
             }
-            ShellMode::Full => crate::prompt::load_prompt(&format!("tool/{}.md", self.name())),
+            ShellMode::Full => crate::prompt::load_prompt("tool/shell_full.md"),
         }
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        super::tool_params_schema(
-            &json!({
-                "command": {
-                    "type": "string",
-                    "description": "The shell command to execute"
-                },
-                "timeout_secs": {
-                    "type": "integer",
-                    "description": "Optional custom timeout in seconds (default: 600, max: 3600). Use this for long-running commands that need more than the default 10-minute timeout.",
-                    "minimum": 1,
-                    "maximum": 3600
-                },
-            }),
-            &["command"],
-        )
+        match self.mode {
+            // ReadOnly: byte-identical to the pre-background literal. The
+            // background capability is Full-only; the ReadOnly schema and
+            // description must not drift.
+            ShellMode::ReadOnly => super::tool_params_schema(
+                &json!({
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute"
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Optional custom timeout in seconds (default: 600, max: 3600). Use this for long-running commands that need more than the default 10-minute timeout.",
+                        "minimum": 1,
+                        "maximum": 3600
+                    },
+                }),
+                &["command"],
+            ),
+            // Full: adds the background/stop arguments on top of the same
+            // command/timeout_secs literal. `command` is intentionally NOT in
+            // `required` here: a stop-only invocation passes just `stop`, and
+            // requiring `command` would push a schema-following model into
+            // inventing a dummy command for stop calls (the daemon accepts
+            // both shapes, but the documented stop-only shape must not be
+            // rejected by provider-side validation).
+            ShellMode::Full => super::tool_params_schema(
+                &json!({
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute. Required for normal and background runs; not needed (and ignored) when `stop` is set."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Optional custom timeout in seconds (default: 600, max: 3600). Use this for long-running commands that need more than the default 10-minute timeout.",
+                        "minimum": 1,
+                        "maximum": 3600
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "When true, run the command in the background: it keeps running after this tool call returns and its raw output is written to a file in the temp area whose path is returned. Read that file with the read tool; when the command exits, the line `[exit status: N]` is appended to its end (including exit 0). `timeout_secs` is ignored in background mode. Default: false.",
+                        "default": false
+                    },
+                    "stop": {
+                        "type": "string",
+                        "description": "Output-file path of a background session (as returned by a background launch) to stop. The process group is stopped two-stage (SIGTERM, ~5s grace, SIGKILL). Pass only `stop` with the exact path — a `command` is not needed and is ignored if present, and `background` must NOT be combined with `stop` (the tool rejects the combination). Stopping an already-finished session is a no-op."
+                    },
+                }),
+                &[],
+            ),
+        }
     }
 
     fn side_effects(&self) -> bool {
@@ -3049,6 +3189,188 @@ mod tests {
         assert!(
             output.contains("nonexistent_dir_xyz"),
             "output should contain the error: {output:?}"
+        );
+    }
+
+    // ── Background mode (Full roles only) ─────────────────────────────
+
+    /// Run `shell_tool.execute(...)` inside the agent per-call context with a
+    /// background-session registry, so the background/stop arguments resolve.
+    async fn execute_with_bg_registry(
+        shell_tool: &ShellTool,
+        ws: &crate::Workspace,
+        args: serde_json::Value,
+        sessions: &std::sync::Arc<crate::tools::shell::BackgroundSessions>,
+    ) -> anyhow::Result<String> {
+        crate::agent::CURRENT_TOOL_BACKGROUND_SESSIONS
+            .scope(Some(sessions.clone()), async {
+                shell_tool.execute(ws, args).await
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn background_launch_via_tool_registers_session_and_read_tool_reads_output() {
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = test_ws(tmp.path());
+        let sessions = std::sync::Arc::new(BackgroundSessions::default());
+
+        let output = execute_with_bg_registry(
+            &ShellTool::new(ShellMode::Full),
+            &ws,
+            json!({"command": "echo bg-via-tool", "background": true}),
+            &sessions,
+        )
+        .await
+        .expect("background launch succeeds");
+
+        // The message carries the output-file path.
+        let path_line = output
+            .lines()
+            .find(|l| l.starts_with("output file:"))
+            .expect("launch message must name the output file");
+        let path = PathBuf::from(path_line.trim_start_matches("output file:").trim());
+        assert!(
+            path.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("bg_")),
+            "bg_* name shape: {path:?}"
+        );
+
+        // The session is registered in the agent-scoped registry.
+        assert!(sessions.contains(&path), "session must be registered");
+
+        // The read tool can read the output file (temp-area allowlist covers
+        // the .agent directory) — no allowlist changes were needed.
+        let content = crate::tools::ReadTool
+            .execute(&ws, json!({"path": path.to_string_lossy().to_string()}))
+            .await
+            .expect("read tool must read the bg output file");
+        assert!(
+            content.contains("bg-via-tool"),
+            "raw output must be in the file: {content}"
+        );
+
+        // And the annotation eventually lands.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !sessions.is_finished(&path) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(sessions.is_finished(&path), "session should finish");
+        let content = std::fs::read_to_string(&path).expect("bg output file readable");
+        assert!(
+            content.contains("[exit status: 0]"),
+            "annotation must be appended: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_stop_via_tool() {
+        let _env = set_env_var("MAHBOT_BG_STOP_GRACE_SECS", Some("0"));
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = test_ws(tmp.path());
+        let sessions = std::sync::Arc::new(BackgroundSessions::default());
+        let tool = ShellTool::new(ShellMode::Full);
+
+        let launch_out = execute_with_bg_registry(
+            &tool,
+            &ws,
+            json!({"command": "sleep 30", "background": true}),
+            &sessions,
+        )
+        .await
+        .expect("launch");
+        let path = launch_out
+            .lines()
+            .find(|l| l.starts_with("output file:"))
+            .expect("output file line")
+            .trim_start_matches("output file:")
+            .trim();
+
+        // Stop via the tool's `stop` argument, addressing the output-file path.
+        let stop_out = execute_with_bg_registry(&tool, &ws, json!({"stop": path}), &sessions)
+            .await
+            .expect("stop succeeds");
+        assert!(
+            stop_out.contains("Background session stopped"),
+            "stop message: {stop_out}"
+        );
+        assert!(
+            sessions.is_finished(Path::new(path)),
+            "stopped session must be finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_stop_and_background_conflict_errors() {
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = test_ws(tmp.path());
+        let sessions = std::sync::Arc::new(BackgroundSessions::default());
+
+        let err = execute_with_bg_registry(
+            &ShellTool::new(ShellMode::Full),
+            &ws,
+            json!({"command": "echo hi", "background": true, "stop": "/tmp/.agent/bg_0000.out"}),
+            &sessions,
+        )
+        .await
+        .expect_err("stop + background must be rejected");
+        assert!(
+            err.to_string().contains("cannot be combined"),
+            "error message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_unavailable_without_agent_context() {
+        // No task-local registry (management diagnostics / tests context):
+        // background mode must fail loudly instead of leaking a process.
+        let tmp = TempDir::new().expect("tempdir");
+        let err = ShellTool::new(ShellMode::Full)
+            .execute(
+                &test_ws(tmp.path()),
+                json!({"command": "sleep 30", "background": true}),
+            )
+            .await
+            .expect_err("background without an agent registry must error");
+        assert!(
+            err.to_string().contains("not available in this context"),
+            "error message: {err}"
+        );
+    }
+
+    #[test]
+    fn full_description_and_schema_cover_background_capability() {
+        // The Full variant gets its own prompt asset and extended argument
+        // schema describing the background capability (ReadOnly byte-identity
+        // is left to reviewer/QA verification per the ticket).
+        let full = ShellTool::new(ShellMode::Full);
+        let description = full.description();
+        assert!(
+            description.contains("Background mode"),
+            "Full description must describe background mode"
+        );
+        assert!(
+            description.contains("[exit status: N]"),
+            "Full description must document the completion annotation"
+        );
+
+        let schema = full.parameters_schema();
+        let props = schema["properties"].as_object().expect("schema properties");
+        assert!(
+            props.contains_key("background"),
+            "Full schema must advertise the background argument"
+        );
+        assert!(
+            props.contains_key("stop"),
+            "Full schema must advertise the stop argument"
+        );
+        assert_eq!(
+            props["background"]["type"], "boolean",
+            "background must be a boolean"
+        );
+        assert_eq!(
+            props["background"]["default"], false,
+            "background must default to false"
         );
     }
 

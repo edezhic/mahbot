@@ -40,6 +40,13 @@ tokio::task_local! {
     /// tools that spawn sub-agents (e.g. implement) can propagate the caller's
     /// group to the Running Agents view. `None` = workspace singleton caller.
     pub(crate) static CURRENT_TOOL_PARENT_KEY: Option<crate::registry::ParentKey>;
+    /// The calling agent's background shell session registry — set for the
+    /// duration of tool execution so the shell tool (Full roles only) can
+    /// register/stop background sessions that are force-killed when the agent
+    /// is dropped. `None` outside an agent run (management diagnostics,
+    /// tests) — background mode is unavailable there.
+    pub(crate) static CURRENT_TOOL_BACKGROUND_SESSIONS:
+        Option<std::sync::Arc<crate::tools::shell::BackgroundSessions>>;
 }
 
 /// Maximum LLM iterations before the agent loop bails out.
@@ -233,6 +240,9 @@ impl Agent {
             round_ts: None,
             first_call_notify: None,
             failure: None,
+            background_sessions: std::sync::Arc::new(
+                crate::tools::shell::BackgroundSessions::default(),
+            ),
         }
     }
 }
@@ -242,6 +252,11 @@ impl Drop for Agent {
         if self.generation > 0 {
             crate::registry::AGENT_REGISTRY.deregister(&self.agent_id, self.generation);
         }
+        // Teardown kill: the agent's background shell sessions must not
+        // outlive it. Force-kill only (no grace), mirroring the existing
+        // teardown-kill behavior for in-flight shell children. Synchronous —
+        // SIGKILL to each live process group.
+        self.background_sessions.terminate_all();
     }
 }
 
@@ -470,46 +485,51 @@ impl Agent {
         let user_name = self.user_name.clone();
         let channel = self.channel.clone();
         let parent_key = self.parent_key.clone();
+        let background_sessions = Some(self.background_sessions.clone());
         CURRENT_TOOL_USER_NAME
             .scope(user_name, async {
                 CURRENT_TOOL_CHANNEL
                     .scope(channel, async {
                         CURRENT_TOOL_PARENT_KEY
                             .scope(parent_key, async {
-                                while i < tool_calls.len() {
-                                    if side_flags[i] {
-                                        // Side-effecting: single-call group, executed alone.
-                                        let outcome = self
-                                            .execute_tool(
-                                                &tool_calls[i].name,
-                                                tool_calls[i].arguments.clone(),
-                                            )
-                                            .await;
-                                        outcomes.push(outcome);
-                                        i += 1;
-                                    } else {
-                                        // Read-only group: extend while consecutive calls are also read-only.
-                                        let group_start = i;
-                                        while i < tool_calls.len() && !side_flags[i] {
-                                            i += 1;
-                                        }
-                                        let group_calls = &tool_calls[group_start..i];
-
-                                        // Execute the entire read-only group in parallel.
-                                        let group_outcomes: Vec<_> =
-                                            futures_util::future::join_all(group_calls.iter().map(
-                                                |call| {
-                                                    self.execute_tool(
-                                                        &call.name,
-                                                        call.arguments.clone(),
+                                CURRENT_TOOL_BACKGROUND_SESSIONS
+                                    .scope(background_sessions, async {
+                                        while i < tool_calls.len() {
+                                            if side_flags[i] {
+                                                // Side-effecting: single-call group, executed alone.
+                                                let outcome = self
+                                                    .execute_tool(
+                                                        &tool_calls[i].name,
+                                                        tool_calls[i].arguments.clone(),
                                                     )
-                                                },
-                                            ))
-                                            .await;
+                                                    .await;
+                                                outcomes.push(outcome);
+                                                i += 1;
+                                            } else {
+                                                // Read-only group: extend while consecutive calls are also read-only.
+                                                let group_start = i;
+                                                while i < tool_calls.len() && !side_flags[i] {
+                                                    i += 1;
+                                                }
+                                                let group_calls = &tool_calls[group_start..i];
 
-                                        outcomes.extend(group_outcomes);
-                                    }
-                                }
+                                                // Execute the entire read-only group in parallel.
+                                                let group_outcomes: Vec<_> =
+                                                    futures_util::future::join_all(
+                                                        group_calls.iter().map(|call| {
+                                                            self.execute_tool(
+                                                                &call.name,
+                                                                call.arguments.clone(),
+                                                            )
+                                                        }),
+                                                    )
+                                                    .await;
+
+                                                outcomes.extend(group_outcomes);
+                                            }
+                                        }
+                                    })
+                                    .await;
                             })
                             .await;
                     })
@@ -1336,6 +1356,9 @@ mod tests {
             round_ts: None,
             first_call_notify: None,
             failure: None,
+            background_sessions: std::sync::Arc::new(
+                crate::tools::shell::BackgroundSessions::default(),
+            ),
         }
     }
 
