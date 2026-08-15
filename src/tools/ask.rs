@@ -979,6 +979,23 @@ async fn extract_findings(runs: Vec<AskRun>, deadline: std::time::Instant) -> Ve
         .collect()
 }
 
+/// Per-agent claim texts keyed by the ORIGINAL outcome index. A failed agent's
+/// slot stays empty so the id space matches the input material. Per-agent
+/// duplicates are NOT deduped: two identical claims from one agent are two
+/// distinct ids, and the model places each exactly once.
+#[must_use]
+fn claims_per_agent(outcomes: &[AnalystOutcome]) -> Vec<Vec<String>> {
+    outcomes
+        .iter()
+        .map(|o| match o {
+            AnalystOutcome::Findings { findings, .. } => {
+                findings.claims.iter().map(|c| c.claim.clone()).collect()
+            }
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
 /// Consolidate extracted outcomes: build the per-agent claim lists and run the
 /// shared repair-mode grouping pass (semantic grouping + contradiction
 /// judgment, frozen groups + deterministic remainder). ≥2 valid responses go
@@ -992,20 +1009,7 @@ async fn consolidate_findings(
     ask: &str,
     outcomes: Vec<AnalystOutcome>,
 ) -> Result<String> {
-    // Per-agent claim texts (agent index = outcome index; failed agents get an
-    // empty list so the id space matches the input material). Per-agent
-    // duplicates are NOT deduped: two identical claims are two distinct ids,
-    // and the model places each exactly once.
-    let mut items_by_agent: Vec<Vec<String>> = Vec::with_capacity(outcomes.len());
-    for o in &outcomes {
-        let claims = match o {
-            AnalystOutcome::Findings { findings, .. } => {
-                findings.claims.iter().map(|c| c.claim.clone()).collect()
-            }
-            _ => Vec::new(),
-        };
-        items_by_agent.push(claims);
-    }
+    let items_by_agent = claims_per_agent(&outcomes);
     let n_valid = items_by_agent.iter().filter(|l| !l.is_empty()).count();
     if n_valid == 0 {
         // No valid response produced parseable claims — fail open with raw
@@ -1701,15 +1705,7 @@ mod tests {
         ];
         // Global flat ids: 0 = a0 "alpha is true", 1 = a0 "beta is true",
         // 2 = a1 "alpha is true", 3 = a1 "gamma is true".
-        let items: Vec<Vec<String>> = outcomes
-            .iter()
-            .map(|o| match o {
-                AnalystOutcome::Findings { findings, .. } => {
-                    findings.claims.iter().map(|c| c.claim.clone()).collect()
-                }
-                _ => Vec::new(),
-            })
-            .collect();
+        let items = claims_per_agent(&outcomes);
         let table = crate::consensus::ItemTable::new(&items);
         let output = crate::consensus::GroupingOutput {
             summary: "Two facts, one solo finding.".into(),
@@ -1765,15 +1761,7 @@ mod tests {
                 findings: findings(vec![("alpha is false", "url2", "high")]),
             },
         ];
-        let items: Vec<Vec<String>> = outcomes
-            .iter()
-            .map(|o| match o {
-                AnalystOutcome::Findings { findings, .. } => {
-                    findings.claims.iter().map(|c| c.claim.clone()).collect()
-                }
-                _ => Vec::new(),
-            })
-            .collect();
+        let items = claims_per_agent(&outcomes);
         let table = crate::consensus::ItemTable::new(&items);
         let output = crate::consensus::GroupingOutput {
             summary: "Agents disagree on alpha.".into(),
@@ -1808,15 +1796,7 @@ mod tests {
                 findings: findings(vec![("alpha is true", "url1", "high")]),
             },
         ];
-        let items: Vec<Vec<String>> = outcomes
-            .iter()
-            .map(|o| match o {
-                AnalystOutcome::Findings { findings, .. } => {
-                    findings.claims.iter().map(|c| c.claim.clone()).collect()
-                }
-                _ => Vec::new(),
-            })
-            .collect();
+        let items = claims_per_agent(&outcomes);
         let table = crate::consensus::ItemTable::new(&items);
         let output = crate::consensus::GroupingOutput {
             summary: "alpha is agreed.".into(),
@@ -2172,15 +2152,7 @@ mod tests {
                 findings: findings(vec![("actually unsafe", "url2", "high")]),
             },
         ];
-        let items: Vec<Vec<String>> = outcomes
-            .iter()
-            .map(|o| match o {
-                AnalystOutcome::Findings { findings, .. } => {
-                    findings.claims.iter().map(|c| c.claim.clone()).collect()
-                }
-                _ => Vec::new(),
-            })
-            .collect();
+        let items = claims_per_agent(&outcomes);
         let table = crate::consensus::ItemTable::new(&items);
         let output = crate::consensus::GroupingOutput {
             summary: "One consensus, one dispute.".into(),
