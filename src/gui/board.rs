@@ -19,7 +19,7 @@ use iced_fonts::lucide;
 use super::common::MAX_INPUT_CHARS;
 use super::theme;
 use super::widget_helpers;
-use super::widgets::{badge_pill, diff_stats_row, selectable_text};
+use super::widgets::{badge_pill, diff_stats_row, role_badge, selectable_text};
 
 /// Phases where an agent is actively running on the ticket. Cancelling a
 /// ticket in one of these phases aborts an in-flight agent run — the
@@ -1419,7 +1419,7 @@ impl BoardState {
 
         let mut cmt_col = Column::new().spacing(4);
         for (i, comment) in ticket.comments.iter().enumerate().rev() {
-            let role_color = theme::role_badge_color(&comment.role).0;
+            let role_colors = theme::role_badge_color(&comment.role);
 
             // For diagnostics comments, optionally show only the summary
             let is_diag = comment.role == crate::role::DIAGNOSTICS_ROLE;
@@ -1483,9 +1483,7 @@ impl BoardState {
             let mut comment_col = Column::new().spacing(4);
             comment_col = comment_col.push(
                 row![
-                    container(text(&comment.role).size(11).color(role_color))
-                        .padding([1, 6])
-                        .style(move |t| theme::role_badge_pill_style(t, role_color)),
+                    role_badge(comment.role.clone(), role_colors, 11, false),
                     Space::new().width(8),
                     text(theme::format_timestamp(&comment.created_at))
                         .size(10)

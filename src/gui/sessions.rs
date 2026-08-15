@@ -331,7 +331,7 @@ impl SessionsState {
 
         struct DecodedMsg {
             role: String,
-            role_color: iced::Color,
+            role_colors: (iced::Color, iced::Color),
             kind: DecodedMsgKind,
         }
 
@@ -378,7 +378,7 @@ impl SessionsState {
         let mut decoded_msgs: Vec<DecodedMsg> = Vec::new();
         for msg in messages {
             let decoded = decode_native_history_message(msg);
-            let role_color = theme::role_badge_color(&msg.role.to_string()).0;
+            let role_colors = theme::role_badge_color(&msg.role.to_string());
 
             let kind = if let Some(ref d) = decoded {
                 match d {
@@ -445,7 +445,7 @@ impl SessionsState {
 
             decoded_msgs.push(DecodedMsg {
                 role: msg.role.to_string(),
-                role_color,
+                role_colors,
                 kind,
             });
         }
@@ -457,7 +457,7 @@ impl SessionsState {
         let mut round_idx = 0;
         while i < len {
             let dm_role = decoded_msgs[i].role.clone();
-            let dm_role_color = decoded_msgs[i].role_color;
+            let dm_role_colors = decoded_msgs[i].role_colors;
 
             match &decoded_msgs[i].kind {
                 DecodedMsgKind::AssistantToolCalls {
@@ -665,11 +665,12 @@ impl SessionsState {
                 } => {
                     // Stray tool result (no preceding tool call) — render as regular message
                     let mut msg_col = Column::new().spacing(2);
-                    msg_col = msg_col.push(
-                        container(selectable_text(dm_role.clone(), dm_role_color).size(11))
-                            .padding([1, 6])
-                            .style(move |t| theme::role_badge_pill_style(t, dm_role_color)),
-                    );
+                    msg_col = msg_col.push(widgets::role_badge(
+                        dm_role.clone(),
+                        dm_role_colors,
+                        11,
+                        true,
+                    ));
                     if !content.is_empty() {
                         msg_col = msg_col.push({
                             let md: iced::Element<
@@ -707,11 +708,7 @@ impl SessionsState {
                     };
 
                     let mut msg_col = Column::new().spacing(2);
-                    msg_col = msg_col.push(
-                        container(selectable_text(dm_role, dm_role_color).size(11))
-                            .padding([1, 6])
-                            .style(move |t| theme::role_badge_pill_style(t, dm_role_color)),
-                    );
+                    msg_col = msg_col.push(widgets::role_badge(dm_role, dm_role_colors, 11, true));
 
                     if let Some(ref t) = thinking {
                         let is_thinking_expanded = expanded_thinking.contains(&i);

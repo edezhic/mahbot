@@ -83,6 +83,16 @@ pub fn log_level_color(level: &str) -> (Color, Color) {
 
 // ── Role badge colors (from roleConfig.ts) ───────────────────────
 
+/// Translucent pill background for a badge foreground color: the foreground
+/// at 0.1 alpha. Single source of the badge-background math — the second
+/// member of every [`role_badge_color_for`] / [`role_badge_color`] tuple is
+/// `badge_bg(fg)` (including the unknown-role fallback), and consumers
+/// (role pill, logs span) use that member directly, so rendering cannot
+/// drift from this alpha.
+const fn badge_bg(fg: Color) -> Color {
+    Color::from_rgba(fg.r, fg.g, fg.b, 0.1)
+}
+
 /// Returns the badge (foreground, background) color for a given [`crate::Role`].
 ///
 /// Reads from [`crate::role::role_info()`] and converts the RGB tuple to
@@ -91,12 +101,16 @@ pub fn log_level_color(level: &str) -> (Color, Color) {
 /// match (`badge_fg` field); the compiler will not catch a missing field here
 /// (it defaults from `BASE_ROLE_INFO`), but the `badge_colors_set` test in
 /// `role.rs` guards against silent black fallthrough.
+///
+/// The background member is always the foreground at 0.1 alpha ([`badge_bg`]);
+/// consumers that render the pill background use it directly.
 #[must_use]
 #[allow(clippy::trivially_copy_pass_by_ref)]
 pub const fn role_badge_color_for(role: &crate::Role) -> (Color, Color) {
     let info = crate::role::role_info(role);
     let (r, g, b) = info.badge_fg;
-    (Color::from_rgb(r, g, b), Color::from_rgba(r, g, b, 0.1))
+    let fg = Color::from_rgb(r, g, b);
+    (fg, badge_bg(fg))
 }
 
 /// Returns the badge (foreground, background) color for a role name string.
@@ -107,6 +121,11 @@ pub const fn role_badge_color_for(role: &crate::Role) -> (Color, Color) {
 /// name, per the joint-verdict pipeline). Unknown strings (including LLM API
 /// roles like `"user"`, `"assistant"`, `"system"`, `"tool"`) fall back to a
 /// muted grey.
+///
+/// The background member is always the foreground at 0.1 alpha ([`badge_bg`]) —
+/// including the fallback, so consuming the second member directly (role pill,
+/// logs span) renders the same alpha-scaled background for unknown roles as
+/// for canonical ones.
 ///
 /// Delegates to [`role_badge_color_for`] after resolving the string, which
 /// reads colors from [`crate::role::role_info()`] as the single source of truth.
@@ -135,7 +154,10 @@ pub fn role_badge_color(role: &str) -> (Color, Color) {
         }
     }
 
-    (TEXT_MUTED, HOVER)
+    // The background member must stay `badge_bg(fg)` (not an independent
+    // constant): consumers render it directly, so this preserves the
+    // pre-consolidation rendering for unknown roles.
+    (TEXT_MUTED, badge_bg(TEXT_MUTED))
 }
 
 // ── Role icon mapping (shared between sidebar and workspaces) ──────
@@ -769,18 +791,6 @@ pub fn pill_style(bg: Color) -> impl Fn(&iced::Theme) -> container::Style {
     move |_theme: &iced::Theme| container_style(bg, 4.0, 0.0, Color::TRANSPARENT)
 }
 
-/// Style for role badge pills: a pill-shaped container with a translucent
-/// version of the role's color and 4px rounded corners.
-#[must_use]
-pub fn role_badge_pill_style(_theme: &iced::Theme, color: Color) -> container::Style {
-    container_style(
-        Color::from_rgba(color.r, color.g, color.b, 0.1),
-        4.0,
-        0.0,
-        Color::TRANSPARENT,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -827,8 +837,14 @@ mod tests {
 
     #[test]
     fn non_numeric_suffix_is_unknown() {
-        assert_eq!(role_badge_color("analyst_final"), (TEXT_MUTED, HOVER));
-        assert_eq!(role_badge_color("coder_abc"), (TEXT_MUTED, HOVER));
+        assert_eq!(
+            role_badge_color("analyst_final"),
+            (TEXT_MUTED, badge_bg(TEXT_MUTED))
+        );
+        assert_eq!(
+            role_badge_color("coder_abc"),
+            (TEXT_MUTED, badge_bg(TEXT_MUTED))
+        );
     }
 
     #[test]
@@ -852,17 +868,26 @@ mod tests {
 
     #[test]
     fn llm_api_roles_are_unknown() {
-        assert_eq!(role_badge_color("user"), (TEXT_MUTED, HOVER));
-        assert_eq!(role_badge_color("system"), (TEXT_MUTED, HOVER));
-        assert_eq!(role_badge_color("tool"), (TEXT_MUTED, HOVER));
+        assert_eq!(role_badge_color("user"), (TEXT_MUTED, badge_bg(TEXT_MUTED)));
+        assert_eq!(
+            role_badge_color("system"),
+            (TEXT_MUTED, badge_bg(TEXT_MUTED))
+        );
+        assert_eq!(role_badge_color("tool"), (TEXT_MUTED, badge_bg(TEXT_MUTED)));
     }
 
     #[test]
     fn empty_and_garbage_are_unknown() {
-        assert_eq!(role_badge_color(""), (TEXT_MUTED, HOVER));
-        assert_eq!(role_badge_color("garbage"), (TEXT_MUTED, HOVER));
-        assert_eq!(role_badge_color("unknown_role"), (TEXT_MUTED, HOVER));
-        assert_eq!(role_badge_color("_1"), (TEXT_MUTED, HOVER));
+        assert_eq!(role_badge_color(""), (TEXT_MUTED, badge_bg(TEXT_MUTED)));
+        assert_eq!(
+            role_badge_color("garbage"),
+            (TEXT_MUTED, badge_bg(TEXT_MUTED))
+        );
+        assert_eq!(
+            role_badge_color("unknown_role"),
+            (TEXT_MUTED, badge_bg(TEXT_MUTED))
+        );
+        assert_eq!(role_badge_color("_1"), (TEXT_MUTED, badge_bg(TEXT_MUTED)));
     }
 
     #[test]
@@ -871,6 +896,40 @@ mod tests {
         assert_eq!(role_badge_color("ANALYST"), analyst_color);
         assert_eq!(role_badge_color("Analyst"), analyst_color);
         assert_eq!(role_badge_color("ANALYST_1"), analyst_color);
+    }
+
+    /// The badge tuple's background member must always be the foreground at
+    /// 0.1 alpha ([`badge_bg`]). The role pill (`pill_style(colors.1)`) and the
+    /// logs span consume the second member directly, so any divergence — e.g.
+    /// an independent constant like the old `(TEXT_MUTED, HOVER)` fallback —
+    /// would silently change the rendered fallback background.
+    #[test]
+    fn badge_background_is_alpha_scaled_foreground() {
+        for role in Role::iter() {
+            let (fg, bg) = role_badge_color_for(&role);
+            assert_eq!(bg, badge_bg(fg), "canonical role {role:?}");
+        }
+        // Unknown/fallback strings, LLM API roles, and stage-name comment roles
+        // all flow through the same tuple invariant.
+        for name in [
+            "analyst_final",
+            "coder_abc",
+            "user",
+            "assistant",
+            "system",
+            "tool",
+            "Analysis",
+            "Review",
+            "QA",
+            "analyst_3",
+            "",
+            "garbage",
+            "unknown_role",
+            "_1",
+        ] {
+            let (fg, bg) = role_badge_color(name);
+            assert_eq!(bg, badge_bg(fg), "fallback/stage/derivative role {name:?}");
+        }
     }
 
     /// Locks the pre-consolidation values of the container factories and
@@ -922,14 +981,6 @@ mod tests {
             pill_style(BG_ELEVATED)(&theme),
             iced::widget::container::Style {
                 background: bg(BG_ELEVATED),
-                border: border(4.0, 0.0, iced::Color::TRANSPARENT),
-                ..iced::widget::container::Style::default()
-            }
-        );
-        assert_eq!(
-            role_badge_pill_style(&theme, ACCENT),
-            iced::widget::container::Style {
-                background: bg(iced::Color::from_rgba(0.227, 0.663, 0.624, 0.1)),
                 border: border(4.0, 0.0, iced::Color::TRANSPARENT),
                 ..iced::widget::container::Style::default()
             }

@@ -737,17 +737,12 @@ impl LogsState {
             Span::new("  ").size(10),
         ];
         if !entry.agent_role.is_empty() {
-            let role_color = theme::role_badge_color(&entry.agent_role).0;
+            let (role_color, role_bg) = theme::role_badge_color(&entry.agent_role);
             spans.push(
                 Span::new(&entry.agent_role)
                     .size(10)
                     .color(role_color)
-                    .background(iced::Color::from_rgba(
-                        role_color.r,
-                        role_color.g,
-                        role_color.b,
-                        0.1,
-                    ))
+                    .background(role_bg)
                     .border(iced::border::rounded(4))
                     .padding([1, 6]),
             );

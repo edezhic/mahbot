@@ -192,7 +192,7 @@ impl ToolFailuresState {
     ///   Line 2: error message (selectable monospace text)
     /// Build the metadata badge row for a tool error entry.
     fn render_metadata_row(entry: &ToolErrorEntry) -> iced::widget::Row<'_, ToolFailuresMessage> {
-        let fg = theme::role_badge_color(&entry.role).0;
+        let role_colors = theme::role_badge_color(&entry.role);
 
         let timestamp = theme::format_hhmmss(&entry.recorded_at);
 
@@ -215,9 +215,7 @@ impl ToolFailuresState {
                 [1, 6]
             ),
             Space::new().width(4),
-            container(text(&entry.role).size(10).color(fg))
-                .padding([1, 6])
-                .style(move |t: &iced::Theme| theme::role_badge_pill_style(t, fg)),
+            widgets::role_badge(entry.role.clone(), role_colors, 10, false),
             Space::new().width(Length::Fill),
             if !entry.workspace.is_empty() {
                 text(&entry.workspace).size(10).color(theme::TEXT_MUTED)

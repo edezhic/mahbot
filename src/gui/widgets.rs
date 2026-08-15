@@ -140,6 +140,43 @@ pub fn badge_pill<'a, Message: 'a>(
         .into()
 }
 
+/// Role badge pill: a container with the role name, `[1, 6]` padding, and the
+/// translucent role-colored pill background (canonical 4px radius).
+///
+/// Takes the role as an owned `String` (not `&str`) because the sessions
+/// transcript renders move a loop-local String into an Element that outlives
+/// the iteration — a borrowed parameter would not compile there; call sites
+/// that only have a borrow pay a trivial `.clone()`.
+///
+/// `colors` is the `(foreground, background)` tuple from
+/// [`theme::role_badge_color`] / [`theme::role_badge_color_for`]; the
+/// background member (always the foreground at 0.1 alpha — that math lives
+/// in exactly one place, `theme::badge_bg`) feeds [`theme::pill_style`].
+///
+/// `selectable` chooses between plain [`text`] and [`selectable_text`]: both
+/// arms coerce into `Element` via `.into()`, but plain `text` is cheaper (no
+/// selection machinery) while `selectable_text` lets the role name be
+/// selected/copied from the UI. The sessions transcript uses selectable text
+/// so a whole line can be copied in one drag; the board comment rows and
+/// tool-failure metadata rows use plain text.
+#[must_use]
+pub fn role_badge<'a, Message: 'a>(
+    role: String,
+    colors: (Color, Color),
+    text_size: u32,
+    selectable: bool,
+) -> Element<'a, Message> {
+    let label: Element<'a, Message> = if selectable {
+        selectable_text(role, colors.0).size(text_size).into()
+    } else {
+        text(role).size(text_size).color(colors.0).into()
+    };
+    container(label)
+        .padding([1, 6])
+        .style(theme::pill_style(colors.1))
+        .into()
+}
+
 /// "Maint ON/OFF" badge shared by the sidebar Maintainer toggle and the
 /// Settings workspace-row Maintainer toggle; the wrapping toggle button
 /// stays with each caller.
