@@ -140,6 +140,25 @@ pub fn badge_pill<'a, Message: 'a>(
         .into()
 }
 
+/// "Maint ON/OFF" badge shared by the sidebar Maintainer toggle and the
+/// Settings workspace-row Maintainer toggle; the wrapping toggle button
+/// stays with each caller.
+#[must_use]
+pub fn maint_badge<'a, Message: 'a>(enabled: bool) -> Column<'a, Message> {
+    column![
+        text("Maint").size(8).color(theme::TEXT_MUTED),
+        text(if enabled { "ON" } else { "OFF" })
+            .size(9)
+            .color(if enabled {
+                theme::ACCENT
+            } else {
+                theme::TEXT_MUTED
+            }),
+    ]
+    .spacing(0)
+    .align_x(Alignment::Center)
+}
+
 /// Create a selectable text widget with the given color.
 ///
 /// Accepts both borrowed (`&str`) and owned (`String`) text content.

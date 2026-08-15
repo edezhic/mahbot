@@ -2074,22 +2074,7 @@ impl Dashboard {
     /// Disabled when no workspace is selected (Personal mode).
     fn render_maintainer_toggle(&self) -> Element<'_, Message> {
         let has_ws = self.has_active_workspace();
-        let maint_icon = column![
-            text("Maint").size(8).color(theme::TEXT_MUTED),
-            text(if self.maintenance_enabled() {
-                "ON"
-            } else {
-                "OFF"
-            })
-            .size(9)
-            .color(if self.maintenance_enabled() {
-                theme::ACCENT
-            } else {
-                theme::TEXT_MUTED
-            }),
-        ]
-        .spacing(0)
-        .align_x(Alignment::Center);
+        let maint_icon = widgets::maint_badge(self.maintenance_enabled());
         let tooltip_text = if !has_ws {
             "Select a workspace to toggle maintainer"
         } else if self.maintenance_enabled() {

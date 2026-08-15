@@ -1091,29 +1091,14 @@ impl SettingsState {
                             container(
                                 row![
                                     // Maintainer toggle
-                                    button(
-                                        column![
-                                            text("Maint").size(8).color(theme::TEXT_MUTED),
-                                            text(if maintainer_on { "ON" } else { "OFF" })
-                                                .size(9)
-                                                .color(if maintainer_on {
-                                                    theme::ACCENT
-                                                } else {
-                                                    theme::TEXT_MUTED
-                                                },),
-                                        ]
-                                        .spacing(0)
-                                        .align_x(Alignment::Center),
-                                    )
-                                    .style(theme::button_text)
-                                    .on_press(
-                                        SettingsMessage::WorkspaceMsg(
+                                    button(widgets::maint_badge(maintainer_on))
+                                        .style(theme::button_text)
+                                        .on_press(SettingsMessage::WorkspaceMsg(
                                             workspaces::WorkspacesMessage::ToggleMaintainer(
                                                 ws_item.name.clone(),
                                                 !maintainer_on,
                                             ),
-                                        )
-                                    ),
+                                        )),
                                     Space::new().width(4),
                                     button(row![
                                         lucide::refresh_cw::<iced::Theme, iced::Renderer>()
