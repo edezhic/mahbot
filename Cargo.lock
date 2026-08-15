@@ -4076,6 +4076,7 @@ dependencies = [
  "rodio",
  "rust-embed",
  "self-replace",
+ "semver",
  "serde",
  "serde_json",
  "serial_test",

@@ -45,6 +45,7 @@ use iced::{Alignment, Color, Element, Length, Task};
 
 use crate::Role;
 use crate::audio::voice::VoiceStatus;
+use crate::self_update::UpdateMode;
 
 use self::context_menu::ContextMenu;
 
@@ -253,6 +254,15 @@ pub enum Message {
     UpdateBot,
     /// Self-update result.
     UpdateResult(Result<String, String>),
+    /// Registry-mode: periodic crates.io availability check tick (immediate
+    /// first check, then every 10 minutes). Only emitted in registry mode on
+    /// non-Windows platforms (see `subscription()`).
+    RegistryUpdateCheck,
+    /// Registry-mode: result of a crates.io availability check.
+    /// `Ok(Some(v))` = a strictly newer stable version is published;
+    /// `Ok(None)` = up to date; `Err` = network failure (silently tolerated,
+    /// retried on the next tick — never a user-visible error).
+    RegistryUpdateResult(Result<Option<semver::Version>, String>),
     /// Toggle the selected workspace's pipeline pause or maintainer state.
     Toggle(ToggleKind),
     /// Result of a per-workspace toggle DB write. Carries (kind, result, workspace_name, intended_state).
@@ -499,6 +509,13 @@ pub struct Dashboard {
     /// Whether a self-update is available or in progress.
     /// Controls button visibility/disabled state.
     update_status: UpdateStatus,
+    /// How this binary was installed — selects the self-update strategy and
+    /// whether the periodic crates.io registry check runs.
+    update_mode: UpdateMode,
+    /// Latest published stable version from the last registry check (registry
+    /// mode only). `Some(v)` when a strictly newer version is available —
+    /// drives the tooltip ("Update MahBot to v0.4.0").
+    registry_latest: Option<semver::Version>,
     /// True when a genuine window close was requested while the update was in
     /// its finalizing window (daemon shut down; checkpoint + spawn + exit
     /// pending). Only a user close (`CloseRequested`) sets this — the update's
@@ -534,7 +551,7 @@ pub struct Dashboard {
 
 impl Dashboard {
     #[must_use]
-    pub fn loading(update_available: bool) -> Self {
+    pub fn loading(update_mode: UpdateMode) -> Self {
         Self {
             ready: false,
             boot_error: None,
@@ -548,11 +565,18 @@ impl Dashboard {
             selected_user_name: None,
             selected_user_role: None,
             selected_user_roles: Vec::new(),
-            update_status: if update_available {
+            update_status: if update_mode == UpdateMode::LocalCheckout
+                && crate::self_update::is_update_available()
+            {
                 UpdateStatus::Available
             } else {
+                // Registry mode: the button appears only when the registry
+                // check finds a strictly newer version (the boot-time status is
+                // boot-immutable Unavailable until `RegistryUpdateResult`).
                 UpdateStatus::Unavailable
             },
+            update_mode,
+            registry_latest: None,
             exit_requested_during_update: false,
             draining: false,
             logs_state: logs::LogsState::new(),
@@ -1226,6 +1250,54 @@ impl Dashboard {
                         // checkpoint.
                         self.exit_requested_during_update = false;
                         return self.save_and_exit();
+                    }
+                }
+                Task::none()
+            }
+            Message::RegistryUpdateCheck => {
+                // The subscription only emits in registry mode on non-Windows
+                // (see `subscription()`), so no platform/mode guard is needed
+                // in the handler. Skip the HTTP check while an update is in
+                // flight — the result would be ignored by the InProgress guard
+                // below, so a long cargo install (10–60 min) would otherwise
+                // waste a request per tick.
+                if self.update_status == UpdateStatus::InProgress {
+                    return Task::none();
+                }
+                Task::perform(
+                    async {
+                        crate::self_update::check_registry_update()
+                            .await
+                            .map_err(|e| format!("{e:#}"))
+                    },
+                    Message::RegistryUpdateResult,
+                )
+            }
+            Message::RegistryUpdateResult(result) => {
+                // Never clobber an in-flight update: the 10-min subscription
+                // keeps ticking during a cargo install (10–60 min), and
+                // flipping the status mid-update would re-enable the button
+                // (or hide it on a network blip) and break the
+                // window-close-during-finalize guard (`save_and_exit` /
+                // CloseRequested gate on InProgress && update_is_finalizing()).
+                if self.update_status == UpdateStatus::InProgress {
+                    return Task::none();
+                }
+                match result {
+                    Ok(Some(version)) => {
+                        // Strictly newer stable version published — show the button.
+                        self.registry_latest = Some(version);
+                        self.update_status = UpdateStatus::Available;
+                    }
+                    Ok(None) => {
+                        // Up to date — keep the button hidden.
+                        self.registry_latest = None;
+                        self.update_status = UpdateStatus::Unavailable;
+                    }
+                    Err(_) => {
+                        // Network failure — silently tolerated; the next 10-min
+                        // tick retries. Keep the last-known state so a transient
+                        // blip never hides a previously discovered update.
                     }
                 }
                 Task::none()
@@ -1925,6 +1997,16 @@ impl Dashboard {
             iced::Subscription::run(shutdown_subscription),
             // TTS download progress subscription (always active while ready).
             iced::Subscription::run(tts_download_subscription).map(Message::TtsDownloadEvent),
+            // Registry-mode crates.io availability check: immediate first tick,
+            // then every 10 minutes. Only active in registry mode on non-Windows
+            // (the running .exe cannot be replaced there). Local-checkout mode
+            // keeps the boot-time `is_update_available()` probe and never runs
+            // this subscription.
+            if self.update_mode == UpdateMode::Registry && !cfg!(windows) {
+                iced::Subscription::run(registry_update_subscription)
+            } else {
+                iced::Subscription::none()
+            },
             // Diff modal subscription (keyboard shortcuts, auto-refresh).
             // Only active when the modal is open to avoid intercepting
             // global keyboard shortcuts unnecessarily.
@@ -1935,6 +2017,21 @@ impl Dashboard {
             },
         ])
     }
+}
+
+/// Registry-mode periodic crates.io availability check: emits an immediate
+/// first tick, then one every 10 minutes.
+///
+/// The stream is only wired up in [`Dashboard::subscription`] for registry
+/// mode on non-Windows — the check itself never runs on Windows.
+fn registry_update_subscription() -> impl futures_util::Stream<Item = Message> {
+    use iced::futures::channel::mpsc;
+    iced::stream::channel(1, |mut output: mpsc::Sender<Message>| async move {
+        loop {
+            let _ = output.try_send(Message::RegistryUpdateCheck);
+            tokio::time::sleep(Duration::from_mins(10)).await;
+        }
+    })
 }
 
 /// Subscription that emits [`Message::Shutdown`] when the global shutdown
@@ -2159,11 +2256,27 @@ impl Dashboard {
 
     /// Render the self-update button in the footer bar.
     /// Returns `None` when self-update is not available on this installation.
+    ///
+    /// No Windows gate is needed here: in registry mode on Windows the status
+    /// can never become [`UpdateStatus::Available`] — the subscription that
+    /// drives the check is only wired for non-Windows, [`check_registry_update`]
+    /// itself returns `Ok(None)` on Windows, and [`execute_registry_update`]
+    /// bails out at its entry point.
     fn render_update_button(&self) -> Option<Element<'_, Message>> {
         let (update_color, tooltip_text, clickable) = match self.update_status {
             UpdateStatus::Unavailable => return None,
-            UpdateStatus::Available => (theme::ACCENT, "Update MahBot", true),
-            UpdateStatus::InProgress => (theme::TEXT_FAINT, "Updating…", false),
+            UpdateStatus::Available => {
+                let tooltip = if self.update_mode == UpdateMode::Registry {
+                    match &self.registry_latest {
+                        Some(v) => format!("Update MahBot to v{v}"),
+                        None => "Update MahBot".to_string(),
+                    }
+                } else {
+                    "Update MahBot".to_string()
+                };
+                (theme::ACCENT, tooltip, true)
+            }
+            UpdateStatus::InProgress => (theme::TEXT_FAINT, "Updating…".to_string(), false),
         };
         let update_icon = lucide::refresh_cw::<iced::Theme, iced::Renderer>()
             .size(24)

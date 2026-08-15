@@ -107,6 +107,7 @@ rodio = { version = "0.19", default-features = false, features = ["wav"] }
 base64 = "0.22"
 jsonrepair-rs = "0.2"
 rand = "0.10"
+semver = "1"
 tempfile = "3"
 unicode-normalization = "0.1"
 

@@ -960,6 +960,8 @@ impl SettingsState {
             self.generation_section(),
             Space::new().height(16),
             self.integrations_section(),
+            Space::new().height(16),
+            Self::about_section(),
         ];
 
         let mut content = column![
@@ -2194,6 +2196,41 @@ impl SettingsState {
                     ),
                     Some("Applied automatically on save"),
                 ),
+            ],
+        )
+    }
+
+    /// About section — embedded version and install/update mode.
+    fn about_section() -> Element<'static, SettingsMessage> {
+        // Bind the classification once per render — `update_mode()` performs
+        // filesystem probes and must not run twice per frame.
+        let mode = crate::self_update::update_mode();
+        let mode_label = match mode {
+            crate::self_update::UpdateMode::LocalCheckout => "local checkout",
+            crate::self_update::UpdateMode::Registry => "crates.io install",
+        };
+        let mode_note = match mode {
+            crate::self_update::UpdateMode::LocalCheckout => {
+                "Self-update rebuilds from the local source checkout."
+            }
+            crate::self_update::UpdateMode::Registry => {
+                "Self-update checks crates.io and reinstalls via cargo install."
+            }
+        };
+        section(
+            "About",
+            column![
+                row![
+                    text(format!("MahBot v{}", crate::self_update::VERSION))
+                        .size(13)
+                        .color(theme::TEXT_MUTED),
+                ],
+                row![
+                    text(format!("Install mode: {mode_label}"))
+                        .size(11)
+                        .color(theme::TEXT_FAINT)
+                ],
+                row![text(mode_note).size(11).color(theme::TEXT_FAINT),],
             ],
         )
     }

@@ -506,8 +506,8 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
 
-    // Detect self-update availability before any async work.
-    let update_available = mahbot::self_update::is_update_available();
+    // Detect self-update availability mode before any async work.
+    let update_mode = mahbot::self_update::update_mode();
 
     // Resolve storage root before config init, so we can acquire the lock.
     let storage_root = mahbot::config::default_config_dir()?;
@@ -522,7 +522,7 @@ fn main() -> Result<()> {
     iced::application(
         move || {
             (
-                Dashboard::loading(update_available),
+                Dashboard::loading(update_mode),
                 iced::Task::perform(bootstrap_mahbot_safe(), DashboardMessage::Boot),
             )
         },
