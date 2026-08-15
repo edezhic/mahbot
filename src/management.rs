@@ -1454,14 +1454,38 @@ async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
     )
 }
 
+/// Drain-cut guard for the single-agent stage-round finalizers
+/// ([`finalize_engineer_round`], [`finalize_sanitation_round`]): when the
+/// round produced no response and the app is aborting (drain), the job must
+/// stay status='launched' for boot resume — no failure record, no
+/// AGENT_FAILURE_EMOJI. Silent on resume (the fresh dispatch already logged
+/// the drain). Returns `true` when the caller must abort the finalize tail
+/// early, leaving the job 'launched'; `false` to continue processing. `label`
+/// parameterizes the log line ("Engineer"/"Sanitation").
+fn stage_round_drain_cut(
+    ticket_id: &str,
+    label: &str,
+    response: Option<&str>,
+    resumed: bool,
+) -> bool {
+    let drain_cut = response.is_none() && crate::shutdown::aborting();
+    if drain_cut && !resumed {
+        info!(
+            ticket = %ticket_id,
+            "{label} round cut short by drain — job stays launched for boot resume",
+        );
+    }
+    drain_cut
+}
+
 /// Shared engineer post-run tail: phase/drain guards, failure comment, pause,
 /// transition, and job terminalization. Diagnostics are dispatched by the poll
 /// loop as a separate `PollPhase::DiagnosticsCheck` (see `poll_round`) — the
 /// success path only transitions to InDiagnostics. The guards live here:
-/// phase-moved → complete job and bail; drain-cut → leave the job 'launched'
-/// for boot resume (fresh dispatches log, resumes stay silent); response-None
-/// past the guards is a real failure. `resumed` selects the observability log
-/// strings.
+/// phase-moved → complete job and bail; drain-cut (see
+/// [`stage_round_drain_cut`]) → leave the job 'launched' for boot resume
+/// (fresh dispatches log, resumes stay silent); response-None past the guards
+/// is a real failure. `resumed` selects the observability log strings.
 async fn finalize_engineer_round(
     ticket: &Ticket,
     agent: &Agent,
@@ -1473,16 +1497,7 @@ async fn finalize_engineer_round(
         complete_ticket_stage_job(job_id).await;
         return;
     }
-    // Drain-cut: the job stays status='launched' for boot resume — no failure
-    // record, no AGENT_FAILURE_EMOJI. Silent on resume (the fresh dispatch
-    // already logged the drain).
-    if response.is_none() && crate::shutdown::aborting() {
-        if !resumed {
-            info!(
-                ticket = %ticket.id,
-                "Engineer round cut short by drain — job stays launched for boot resume",
-            );
-        }
+    if stage_round_drain_cut(&ticket.id, "Engineer", response, resumed) {
         return;
     }
     let failure_comment = engineer_failure_comment(
@@ -2105,9 +2120,9 @@ async fn register_agent_and_assign(
 /// Absorb the post-run tail shared by dispatch and resume: the phase/drain
 /// guards, the response-None failure block, verdict extraction with error
 /// handling, and the job terminalization. Guards: phase-moved → complete job
-/// and bail; drain-cut → leave the job 'launched' for boot resume (fresh
-/// dispatches log, resumes stay silent); response-None past the guards is a
-/// real failure.
+/// and bail; drain-cut (see [`stage_round_drain_cut`]) → leave the job
+/// 'launched' for boot resume (fresh dispatches log, resumes stay silent);
+/// response-None past the guards is a real failure.
 async fn finalize_sanitation_round(
     ticket: &Ticket,
     agent: &Agent,
@@ -2119,15 +2134,7 @@ async fn finalize_sanitation_round(
         complete_ticket_stage_job(job_id).await;
         return;
     }
-    // Drain-cut: the job stays status='launched' for boot resume — no failure
-    // record. Silent on resume (the fresh dispatch already logged the drain).
-    if response.is_none() && crate::shutdown::aborting() {
-        if !resumed {
-            info!(
-                ticket = %ticket.id,
-                "Sanitation round cut short by drain — job stays launched for boot resume",
-            );
-        }
+    if stage_round_drain_cut(&ticket.id, "Sanitation", response, resumed) {
         return;
     }
     let resumed_suffix = if resumed { " (resumed)" } else { "" };
