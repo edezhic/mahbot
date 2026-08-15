@@ -151,32 +151,6 @@ const GIT_SAFE_SUBCOMMANDS: &[&str] = &[
     "ls-remote",
 ];
 
-/// Safe cargo subcommands that only affect build artifacts in `target/` or are purely
-/// read-only queries. Commands that modify source files or `Cargo.lock` must NOT be added
-/// here — they should get targeted rejection messages with tailored suggestions instead.
-const CARGO_SAFE_SUBCOMMANDS: &[&str] = &[
-    "build",
-    "check",
-    "test",
-    "clippy",
-    "rustc",
-    "metadata",
-    "tree",
-    "locate-project",
-    "pkgid",
-    "report",
-    "search",
-    "info",
-    "clean",
-    "doc",
-    "fmt",
-    "version",
-    "verify-project",
-    "read-manifest",
-    "help",
-    "bench",
-];
-
 /// Git subcommands that always write — rejected regardless of flags. The
 /// tailored suggestions double as denial-message education; the generic
 /// rejection message covers any subcommand not listed here.
@@ -793,7 +767,7 @@ fn walk_command<'a>(
 }
 
 /// The ported segment validator: verb resolution (cd/eval/prefix routing),
-/// temp bindings, and the mutator/git/cargo/flag dispatch. Operates on the
+/// temp bindings, and the mutator/git/flag dispatch. Operates on the
 /// AST-reconstructed words; redirects and substitutions are validated by the
 /// walker, not here.
 #[allow(clippy::too_many_lines)] // security-critical command validator
@@ -924,11 +898,6 @@ fn check_words(
     // Git-specific checks
     if first_word == "git" {
         return check_git_segment(&segment);
-    }
-
-    // Cargo-specific checks
-    if first_word == "cargo" {
-        return check_cargo_segment(&segment);
     }
 
     // Flag-dependent checks: reject commands that use mutation flags.
@@ -2259,7 +2228,7 @@ fn is_path_under_temp(path: &std::path::Path, ctx: &CheckContext) -> bool {
 /// GIT_EXTERNAL_DIFF, GIT_SSH_COMMAND, GIT_CONFIG_*, GIT_DIR, GIT_EXEC_PATH,
 /// GIT_TRACE*, GIT_ASKPASS — all invisible to the subcommand allowlist.
 /// Also fires on non-git commands (`GIT_DIR=/tmp ls`): fail-closed trade-off
-/// closing transitive git invocation (make/cargo inheriting GIT_*).
+/// closing transitive git invocation (make inheriting GIT_*).
 fn check_git_env_binding(word: &str) -> Result<(), String> {
     let w = scan::strip_quoted_word(word);
     if let Some((name, _)) = w.split_once('=')
@@ -3864,34 +3833,6 @@ fn has_base64_mutation(command: &str, state: &ValidationState) -> bool {
     has_output_mutation(command, state, &BASE64_OUTPUT_FLAGS)
 }
 
-/// Check if `cargo clippy` has `--fix` before `--` (auto-fix; after `--` a
-/// `--fix` token is a lint name). shell_word closes quoted spellings; a
-/// substitution word that could expand to `--fix` fails closed — ANY
-/// unprovable span (an unquoted one field-splits, `-p foo${x:- --fix}` →
-/// fields `foo`, `--fix`) or bare `$var` (its value is unquoted and arbitrary,
-/// `--message-format=$fmt` can field-split `--fix` out) — while provably-
-/// echoed bodies stay allowed (`$(echo foo)`, `--message-format=$(echo json)`).
-fn has_clippy_fix(command: &str) -> bool {
-    let parts: Vec<&str> = scan::split_words_keeping_substitutions(command);
-    let dashdash_pos = parts.iter().position(|p| shell_word(p) == "--");
-    parts.iter().enumerate().any(|(i, part)| {
-        dashdash_pos.is_none_or(|dd| i < dd)
-            && (shell_word(part) == "--fix" || word_could_form_token_or_bare_var(part, "--fix"))
-    })
-}
-
-/// Check if `cargo fmt` provably runs with `--check` (the read-only proof;
-/// `cargo fmt` without it reformats files). The proof is a literal `--check`
-/// word — shell-normalized, so quoted forms count — and other words cannot
-/// disable it (`cargo fmt --check --emit=$(echo json)` stays check mode).
-/// `cargo fmt $(echo --check)` (no literal proof) is not provably read-only
-/// and fails closed.
-fn has_cargo_fmt_check(command: &str) -> bool {
-    scan::split_words_keeping_substitutions(command)
-        .iter()
-        .any(|p| shell_word(p) == "--check")
-}
-
 // ── Git checks ───────────────────────────────────────────────────────────
 
 /// Long-option kinds for the collapsed branch/tag table.
@@ -4519,100 +4460,6 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
     Ok(())
 }
 
-// ── Cargo checks ─────────────────────────────────────────────────────────
-
-fn check_cargo_segment(segment: &str) -> Result<(), String> {
-    let trimmed = segment.trim();
-    let canonical = super::canonical_command(trimmed);
-    let subcommand = canonical.strip_prefix("cargo ").unwrap_or(&canonical);
-
-    if subcommand.is_empty() || subcommand == "cargo" {
-        return Ok(());
-    }
-
-    let base = scan::split_words_keeping_substitutions(subcommand)
-        .first()
-        .copied()
-        .unwrap_or("");
-
-    // ── Help/version exemption ─────────────────────────────────────
-    // `-h`/`--help`/`-V`/`--version` appearing as a standalone token BEFORE a
-    // `--` separator is a pure read and is allowed for ANY cargo subcommand,
-    // including `run`. Tokens after `--` stay blocked (`cargo run -- --help`).
-    let words = scan::split_words_keeping_substitutions(trimmed);
-    let help_version_before_ddash = words
-        .iter()
-        .take_while(|w| **w != "--")
-        .any(|w| matches!(*w, "-h" | "--help" | "-V" | "--version"));
-    if help_version_before_ddash {
-        return Ok(());
-    }
-
-    // ── Specific rejection messages for subcommands that modify source files ──
-    match base {
-        "update" => {
-            if words.contains(&"--dry-run") {
-                return Ok(());
-            }
-            return reject(
-                trimmed,
-                "`cargo update` is not allowed — it modifies Cargo.lock.",
-                "use `cargo update --dry-run` to preview what would change without modifying anything; \
-                 if the real update is required, state that in your final response — it is outside read-only scope.",
-            );
-        }
-        "generate-lockfile" => {
-            return reject(
-                trimmed,
-                "`cargo generate-lockfile` is not allowed — it creates or overwrites Cargo.lock.",
-                "generating a lockfile is outside read-only scope; if it is required, state that in your final response.",
-            );
-        }
-        "run" => {
-            return reject(
-                trimmed,
-                "`cargo run` is not allowed — it may write files.",
-                "use `cargo run --help` or `cargo run -h` to inspect the program's CLI without running it; \
-                 if running the program is actually required, state that in your final response — it is outside read-only scope.",
-            );
-        }
-        _ => {}
-    }
-
-    let is_safe = CARGO_SAFE_SUBCOMMANDS.contains(&base);
-
-    if !is_safe {
-        return Err(format!(
-            "⚠️ Read-only mode: `cargo {base}` is not in the allowed cargo subcommands list.\n\
-             Command: `{trimmed}`\n\
-             Allowed cargo subcommands: {}\n\
-             Suggestion: use `cargo check`, `cargo test`, `cargo clippy`, `cargo doc`, etc.",
-            CARGO_SAFE_SUBCOMMANDS.join(", ")
-        ));
-    }
-
-    // cargo clippy --fix rejection (only when --fix appears BEFORE --)
-    if base == "clippy" && has_clippy_fix(trimmed) {
-        return Err(format!(
-            "⚠️ Read-only mode: `cargo clippy --fix` is not allowed — it auto-applies fixes.\n\
-             Command: `{trimmed}`\n\
-             Suggestion: use `cargo clippy` without `--fix` to see warnings only,\n\
-             or use `cargo clippy -- --fix` to pass `--fix` as a lint name (not auto-fix)."
-        ));
-    }
-
-    // cargo fmt without --check rejection
-    if base == "fmt" && !has_cargo_fmt_check(trimmed) {
-        return reject(
-            trimmed,
-            "`cargo fmt` without `--check` is not allowed — it reformats files.",
-            "use `cargo fmt --check` to verify formatting without modifying files.",
-        );
-    }
-
-    Ok(())
-}
-
 // ── Flag detection helpers ───────────────────────────────────────────────
 
 /// Return the value of a flag that takes a separate word as its argument.
@@ -4835,40 +4682,6 @@ mod tests {
             ("git --bare push", false),
             ("git --bare commit -m test", false),
             ("git --bare reset --hard", false),
-        ];
-
-        run_cases(&cases);
-    }
-
-    // ── Cargo allowlist ────────────────────────────────────────────
-
-    /// Tests that ALL entries in the production [`CARGO_SAFE_SUBCOMMANDS`] constant
-    /// (except `"fmt"`, which requires `--check`) are accepted.
-    /// Iterates the constant directly to prevent coverage drift
-    /// when entries are added or removed.
-    #[test]
-    fn all_cargo_safe_subcommands_allowed() {
-        for subcmd in CARGO_SAFE_SUBCOMMANDS {
-            if *subcmd == "fmt" {
-                continue; // requires --check flag — tested via cargo_individual_commands
-            }
-            ok(&format!("cargo {subcmd}"));
-        }
-    }
-
-    #[test]
-    fn cargo_individual_commands() {
-        let cases = [
-            ("cargo clippy --fix", false),
-            ("cargo clippy -- --fix", true),
-            ("cargo fmt", false),
-            ("cargo fmt --check", true),
-            ("cargo fmt -- --check", true),
-            ("cargo fix", false),
-            // cargo update and generate-lockfile are rejected with tailored messages
-            ("cargo update", false),
-            ("cargo update --dry-run", true), // dry-run preview — read-only
-            ("cargo generate-lockfile", false),
         ];
 
         run_cases(&cases);
@@ -5179,7 +4992,7 @@ mod tests {
         let cases = [
             ("cargo check && cargo test", true),
             ("cargo check && rm file", false),
-            ("git status && cargo fmt", false),
+            ("git status && cargo fmt", true),
             ("git log --oneline | head -20", true),
             ("cargo check; rm file", false),
         ];
@@ -5843,7 +5656,7 @@ mod tests {
             },
             Case {
                 name: "no git",
-                input: "cargo build",
+                input: "ls -la",
                 expected: "",
             },
             Case {
@@ -6798,7 +6611,7 @@ mod tests {
         run_cases(&cases);
     }
 
-    // ── Phase 3 acceptance: cargo read-only invocations ──────────────────
+    // ── Phase 3 acceptance: cargo commands get generic treatment ─────────
 
     #[test]
     fn cargo_read_only_acceptance() {
@@ -6809,28 +6622,35 @@ mod tests {
             ("cargo +nightly test", true),
             ("cargo +nightly clippy", true),
             ("cargo +nightly doc", true),
-            ("cargo +nightly run", false),
-            ("cargo +nightly fix", false),
-            ("cargo +nightly update", false),
+            ("cargo +nightly run", true),
+            ("cargo +nightly fix", true),
+            ("cargo +nightly update", true),
             // stderr-capture suffix no longer becomes the parsed subcommand.
             ("cargo --version 2>&1", true),
             ("cargo build 2>&1", true),
             ("git --version 2>&1", true),
-            // Help/version exemption for any subcommand, before `--`.
+            // Help/version forms stay allowed.
             ("cargo fix --help", true),
             ("cargo run --help", true),
             ("cargo run -h", true),
             ("cargo nextest --version", true),
             ("cargo --version", true),
             ("cargo build -V", true),
-            // update --dry-run allowed; plain update blocked.
+            // Previously cargo-specific rejections — now generic treatment.
             ("cargo update --dry-run", true),
-            ("cargo update", false),
-            // Still blocked.
-            ("cargo fix", false),
-            ("cargo run", false),
-            ("cargo run -- --help", false),
-            ("cargo clippy --fix", false),
+            ("cargo update", true),
+            ("cargo generate-lockfile", true),
+            ("cargo fix", true),
+            ("cargo run", true),
+            ("cargo run -- --help", true),
+            ("cargo clippy --fix", true),
+            ("cargo clippy -- --fix", true),
+            ("cargo fmt", true),
+            ("cargo fmt --check", true),
+            ("cargo fmt -- --check", true),
+            ("cargo install foo", true),
+            // Generic rules still fire: redirects into the workspace.
+            ("cargo run > out.txt", false),
         ];
 
         run_cases(&cases);
@@ -6857,10 +6677,6 @@ mod tests {
             ("rm $HOME/.mahbot/db/board.db-wal", false),
             // rm -rf target.
             ("rm -rf target", false),
-            // cargo mutators.
-            ("cargo clippy --fix", false),
-            ("cargo run", false),
-            ("cargo fix", false),
             // git init even in temp.
             ("git init", false),
             ("git init /tmp/x", false),
@@ -7177,8 +6993,7 @@ mod tests {
     }
 
     /// Denial messages teach the recognized spelling: a literal temp path or
-    /// `NAME=$(mktemp -d)` for unresolvable variables, and the help form for
-    /// `cargo run` without bypass guidance.
+    /// `NAME=$(mktemp -d)` for unresolvable variables.
     #[test]
     fn denial_message_education() {
         let ctx = test_ctx();
@@ -7192,17 +7007,6 @@ mod tests {
             err.contains("$(mktemp -d)"),
             "temp-mutator denial should teach the variable spelling: {err}"
         );
-        let err = check_command("cargo run", &ctx).unwrap_err();
-        assert!(
-            err.contains("--help"),
-            "cargo run denial should suggest the help form: {err}"
-        );
-        for banned in ["target/debug", "built binary", "full shell", "escalate"] {
-            assert!(
-                !err.contains(banned),
-                "cargo run denial must not teach a bypass: {err}"
-            );
-        }
     }
 
     #[test]
