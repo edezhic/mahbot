@@ -1426,9 +1426,8 @@ fn split_at_sentence_boundaries(text: &str, max_len: usize) -> Vec<String> {
 /// Render PCM float samples to an in-memory WAV file (16-bit mono PCM).
 ///
 /// Returns the complete WAV file bytes, including RIFF header and sample data.
-/// This replaces the old `write_wav` which wrote to a temp file — rodio can
-/// play directly from a `Cursor<Vec<u8>>`, eliminating ephemeral file I/O.
-/// Shared with `audio::voice` (transcription temp files).
+/// Rodio can play directly from a `Cursor<Vec<u8>>`, eliminating ephemeral
+/// file I/O. Shared with `audio::voice` (transcription temp files).
 pub(crate) fn render_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
     let channels: u16 = 1;
     let bps: u16 = 16;

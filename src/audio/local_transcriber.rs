@@ -3,7 +3,7 @@
 //! # Architecture
 //!
 //! This module is the **only** audio transcription path — the previous
-//! API-based [`AudioTranscriber`] has been removed.  When the model is
+//! API-based transcriber has been removed.  When the model is
 //! available, inference runs fully locally with Qwen3-ASR-0.6B.  The model
 //! (~1.88 GB BF16 safetensors) is downloaded on first use to
 //! `~/.mahbot/models/qwen3-asr-0.6b/` and memory-mapped by the `qwen-asr`

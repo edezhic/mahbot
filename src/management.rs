@@ -2502,9 +2502,10 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
         Ok(true) => {}
     }
 
-    // Separate the decision (target phase + comment body) from the action
-    // (single transition call), matching the dispatch_engineer precedent.
-    let (target_phase, comment_body): (TicketPhase, String) =
+    // Separate the decision (target phase + comment body + outcome log) from
+    // the action (single transition call), matching the dispatch_engineer
+    // precedent.
+    let (target_phase, comment_body, outcome_log): (TicketPhase, String, &str) =
         match crate::workspace::store().get_diagnostics(&ws.name).await {
             Ok(Some(cmds)) if !cmds.is_empty() => {
                 // Run commands sequentially in the prescribed order.
@@ -2519,10 +2520,18 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 
                 if all_passed {
                     // Path C1: All diagnostics passed — transition to DiagnosticsDone.
-                    (TicketPhase::DiagnosticsDone, comment)
+                    (
+                        TicketPhase::DiagnosticsDone,
+                        comment,
+                        "Diagnostics finished — transitioned ticket",
+                    )
                 } else {
                     // Path C2: Diagnostics failed — bounce back to development.
-                    (TicketPhase::ReadyForDevelopment, comment)
+                    (
+                        TicketPhase::ReadyForDevelopment,
+                        comment,
+                        "Diagnostics failed — transitioned ticket",
+                    )
                 }
             }
             Ok(_) => {
@@ -2532,6 +2541,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                     "No diagnostics commands are configured for this workspace \
                      — diagnostics skipped."
                         .to_string(),
+                    "Diagnostics skipped — transitioned ticket",
                 )
             }
             Err(e) => {
@@ -2544,6 +2554,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 (
                     TicketPhase::DiagnosticsDone,
                     format!("Could not load diagnostics commands due to a database error: {e}"),
+                    "Diagnostics failed — transitioned ticket",
                 )
             }
         };
@@ -2559,7 +2570,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
         },
         DIAGNOSTICS_ROLE,
         &comment_body,
-        "Diagnostics finished — transitioned ticket",
+        outcome_log,
     )
     .await;
 }

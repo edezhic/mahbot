@@ -775,18 +775,17 @@ impl AskRun {
     }
 }
 
-/// Verdict of a single targeted claim verification. Also exercised on the deep
-/// research path via `dispatch_claim_verifiers` (shared helper, not a direct
-/// import).
+/// Verdict of a single targeted claim verification, dispatched via
+/// `dispatch_claim_verifiers` on the deep research path only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct VerificationVerdict {
     pub verdict: String,
     pub evidence: String,
 }
 
-/// Verification outcome merged into the final report. The telemetry fields
-/// (the verifier analyst's tool calls / searches / queries) feed the deep
-/// research run summary and its query ledger; the ask path ignores them.
+/// Verification outcome merged into the deep research run summary. The
+/// telemetry fields (the verifier analyst's tool calls / searches / queries)
+/// feed its query ledger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct VerificationResult {
     pub claim: String,

@@ -34,9 +34,9 @@ CREATE INDEX IF NOT EXISTS idx_chat_history_user_ws_id ON chat_history(user_name
 
 /// Parameters for inserting a chat history entry.
 ///
-/// This struct bundles the 6 fields needed by [`ChatHistoryStore::insert`],
-/// replacing the previous positional-parameter signature. Owned `String` fields
-/// match the pattern established by [`LogEntry`](crate::logs::LogEntry).
+/// This struct bundles the 6 fields needed by [`ChatHistoryStore::insert`].
+/// Owned `String` fields match the pattern established by
+/// [`LogEntry`](crate::logs::LogEntry).
 #[derive(Debug, Clone)]
 pub struct ChatHistoryInsert {
     pub message_id: String,

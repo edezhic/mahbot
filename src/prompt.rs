@@ -503,11 +503,9 @@ mod tests {
     #[test]
     fn all_prompt_assets_load_without_panic() {
         // Every embedded prompt asset must load successfully and return
-        // non-empty content.  This is the regression guard for switching
-        // load_prompt from panic → warning+fallback: if an asset key is
-        // ever deleted or renamed, this test catches it during development
-        // instead of letting a silent [PROMPT MISSING: …] placeholder slip
-        // into production.
+        // non-empty content.  Regression guard for the load_prompt
+        // panic → warning+fallback switch: an existing asset must never
+        // resolve to the [PROMPT MISSING: …] placeholder.
         for asset_key in PromptAssets::iter() {
             let content = load_prompt(&asset_key);
             assert!(

@@ -1,12 +1,15 @@
 //! Debug query tool — read-only SQL diagnostics for mahbot's databases.
 //!
 //! Invoked as `mahbot debug --db <name> "SQL query"` from the command line.
-//! Skips tracing initialization, lock acquisition, and GUI startup.
+//! Skips tracing initialization and GUI startup.
 //!
-//! Two further verbs target forensic artifact families (quarantine and
-//! pre-reindex records — static snapshots of a store family renamed aside at
-//! boot, never deleted):
+//! Three further verbs: `detect` classifies store coordination state without
+//! opening any database; `families` and `--family` target forensic artifact
+//! families (quarantine and pre-reindex records — static snapshots of a store
+//! family renamed aside at boot, never deleted):
 //!
+//! - `mahbot debug detect [--db <name>]` — classify coordination state without
+//!   opening stores (exit 1 when any store is checkpoint-blocking).
 //! - `mahbot debug families [--db <name>]` — list every quarantine and
 //!   pre-reindex family in the store directory with its original store,
 //!   artifact type, timestamp, total size, and a file-set/header

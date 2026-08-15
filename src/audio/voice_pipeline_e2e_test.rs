@@ -4436,7 +4436,7 @@ fn faph_merge_events(events: &[f64], cooldown_secs: f64) -> usize {
 /// depends on (AGC, adaptive threshold, VAD detector, ring) is preserved.
 ///
 /// # Future-field hazard
-/// A per-frame field added to `PipelineCtxInstrumentation` without a matching
+/// A per-frame field added to `DetectionInstrumentation` without a matching
 /// clear here would silently accumulate unbounded memory across the corpus —
 /// keep this clear list exhaustive when the instrumentation struct grows.
 fn faph_clear_instrumentation(ctx: &mut super::PipelineCtx) {

@@ -546,7 +546,7 @@ impl Connection {
     }
 }
 
-/// Message prefix of a known Limbo integrity_check false positive.
+/// Message prefix of a known Limbo quick_check false positive.
 ///
 /// Limbo's FTS keeps tantivy chunks in an internal backing index while the
 /// dir table stays empty, so the index-cardinality comparison always

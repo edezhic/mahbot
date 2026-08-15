@@ -2,8 +2,8 @@
 //! tickets.
 //!
 //! Provides a single temporary directory shared across all test initializations,
-//! eliminating the duplicated `init_with_temp_dir()` pattern that was previously
-//! required in each module and leaked a separate temp dir per store.
+//! instead of the previous per-module pattern that leaked a separate temp dir
+//! per store.
 //!
 //! The temp directory is intentionally leaked for the process lifetime to avoid
 //! races at shutdown — since global [`OnceCell`]s can only be set once, each

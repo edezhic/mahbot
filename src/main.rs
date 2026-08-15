@@ -471,7 +471,7 @@ fn main() -> Result<()> {
 
     // Debug subcommand: run SQL query directly, skip all GUI/daemon setup.
     // Must be checked before lock acquisition so the debug tool can query
-    // databases while the daemon is running. No tracing init, no lock, no Iced.
+    // databases while the daemon is running. No tracing init, no Iced.
     if std::env::args().nth(1).as_deref() == Some("debug") {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
