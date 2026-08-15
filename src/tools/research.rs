@@ -76,7 +76,7 @@ const MAX_STATE_COMMANDS_BYTES: usize = 64 * 1024;
 /// `MAHBOT_ROUND_TIMEOUT_SECS`). Counted from the stage's own start.
 const DEFAULT_WRAP_UP_TIMEOUT_SECS: u64 = 5 * 60;
 
-/// Resume pointer for a durable research run: the 5-value stage
+/// Resume pointer for a durable research run: the 4-value stage
 /// enum (plus implicit Done).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -84,7 +84,10 @@ enum ResearchStage {
     Decompose,
     Round1,
     GapRounds,
-    Verification,
+    /// Legacy checkpoint value from before the Verification collapse —
+    /// synthesis runs before the verification pass, so old "verification"
+    /// blobs resume at synthesis (a load error would silently restart).
+    #[serde(alias = "verification")]
     Synthesis,
 }
 
@@ -3085,7 +3088,7 @@ async fn run_deep_research(
         // clobber it with the per-invocation count).
         state.gap_outcome = gap_outcome;
         state.budget_spent = budget.spent;
-        state.stage = ResearchStage::Verification;
+        state.stage = ResearchStage::Synthesis;
         state.save(job_id).await;
     }
     let rounds_used = 2 + state.gap_outcome.rounds_dispatched;
@@ -3097,12 +3100,11 @@ async fn run_deep_research(
     }
 
     // ── Final synthesis (resumable) ───────────────────────────────────
-    // Runs for every stage ≥ GapRounds: a first synthesis advances the stage
-    // and persists; a resume after Synthesis re-synthesizes (bounded — the
-    // accumulated evidence is unchanged, so the synthesis is deterministic
-    // modulo LLM nondeterminism). The marker-dedup guard makes re-runs
-    // idempotent (a resume after a failed stage save cannot duplicate
-    // markers).
+    // Stage is always Synthesis here (set at the gap-loop exit or inherited
+    // on resume) — every path re-synthesizes, deterministic modulo LLM
+    // nondeterminism (the accumulated evidence is unchanged). The marker-dedup
+    // guard makes re-runs idempotent (a resume after a failed checkpoint save
+    // cannot duplicate markers).
     let synthesis = match synthesize(
         ws,
         question,
@@ -3116,10 +3118,6 @@ async fn run_deep_research(
                 && !state.markers.contains(&marker)
             {
                 state.markers.push(marker);
-            }
-            if state.stage != ResearchStage::Synthesis {
-                state.stage = ResearchStage::Synthesis;
-                state.save(job_id).await;
             }
             s.text
         }
@@ -3352,6 +3350,21 @@ mod tests {
         );
     }
 
+    /// Legacy checkpoint migration guard: pre-collapse blobs stored
+    /// stage="verification". ResearchState::load falls back to a fresh run on
+    /// ANY deserialization error, so without this alias an in-flight run
+    /// would silently restart from Decompose.
+    #[test]
+    fn legacy_verification_checkpoint_deserializes_as_synthesis() {
+        let stage: ResearchStage = serde_json::from_str(r#""verification""#).unwrap();
+        assert_eq!(stage, ResearchStage::Synthesis);
+        assert_eq!(
+            serde_json::to_string(&stage).unwrap(),
+            r#""synthesis""#,
+            "new checkpoints must serialize the collapsed name"
+        );
+    }
+
     /// Direct resume test for `resume_research_run`: a job
     /// checkpointed at stage=Synthesis with pre-populated verification
     /// resumes — it re-enters the orchestrator, synthesizes from the
@@ -3361,7 +3374,7 @@ mod tests {
     /// (role/user/channel persisted on the job row, never the Manager).
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
-    async fn resume_research_run_continues_at_verification_stage() {
+    async fn resume_research_run_continues_at_synthesis_stage() {
         crate::util::test::init_management_test_stores().await;
         let _lock = crate::util::test::retry_tests_lock();
         let _policy_guard =
