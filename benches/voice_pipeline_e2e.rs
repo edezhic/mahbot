@@ -1,7 +1,9 @@
-/// Voice pipeline E2E benchmark with single-instance lock and 30-minute timeout.
+/// Voice pipeline E2E benchmark with single-instance lock and 120-minute timeout.
 ///
-/// The lock prevents concurrent benchmark runs.  A 30-minute timeout aborts hung
-/// runs via [`std::process::exit`].
+/// The lock prevents concurrent benchmark runs.  A 120-minute timeout aborts hung
+/// runs via [`std::process::exit`].  The 120-minute ceiling accommodates the
+/// env-gated FAPH phase (the full ~6 h real-audio corpus is fed at a few times
+/// real-time); default runs finish well inside it.
 ///
 /// # Lock mechanism
 ///
@@ -101,7 +103,7 @@ fn main() {
     let runtime = tokio::runtime::Runtime::new()
         .expect("failed to create tokio runtime for benchmark timeout");
 
-    // 3. Run benchmark with 30-minute timeout.
+    // 3. Run benchmark with 120-minute timeout.
     // NOTE: spawn_blocking tasks are NOT cancelable at the Rust level.
     // When the timeout fires, tokio returns Err(Elapsed) but the kernel
     // threads (ONNX evaluations) continue executing.  We call
@@ -109,7 +111,7 @@ fn main() {
     // and the kernel releases the flock.
     let result = runtime.block_on(async {
         tokio::time::timeout(
-            Duration::from_mins(30),
+            Duration::from_mins(120),
             tokio::task::spawn_blocking(|| {
                 mahbot::audio::voice::run_voice_pipeline_benchmark();
             }),
@@ -119,14 +121,14 @@ fn main() {
 
     match result {
         Ok(Ok(())) => {
-            // Normal completion — benchmark is report-only (no pass/fail gating).
+            // Normal completion within the timeout.
         }
         Ok(Err(join_err)) => {
             eprintln!("BENCHMARK PANICKED: {join_err}");
             std::process::exit(1);
         }
         Err(_elapsed) => {
-            eprintln!("BENCHMARK TIMED OUT after 30 minutes");
+            eprintln!("BENCHMARK TIMED OUT after 120 minutes");
             std::process::exit(1);
         }
     }

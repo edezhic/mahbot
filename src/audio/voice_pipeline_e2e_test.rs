@@ -37,31 +37,19 @@
 //!
 //! NOTE: `[profile.bench]` is release-like (opt-level 2, codegen-units 32,
 //! no LTO, incremental off) — the bench is a production-performance proxy, so
-//! release codegen is the faithful target.  Sanity anchors are report-only
-//! measurements: nothing gates on them, codegen shifts are expected, and
-//! there is no re-baseline ceremony.
+//! release codegen is the faithful target.  Acceptance metrics are report-only
+//! (measured, never gated); hard assertions exist only for production-behavior
+//! contracts (e.g. the cooldown gate and accumulation cap in the cooldown
+//! phase).
 //!
-//! First run populates the TTS audio cache (~14-17 min); subsequent runs
-//! complete in several minutes (the encoder pipeline re-encodes raw audio
-//! through the shared Qwen3-ASR model per run — there is no embedding disk
-//! cache anymore — so the wall clock is dominated by the ~8.5 min of 18-layer
-//! encoder forwards over the expanded TEST surface: 40-clip wake-only basis,
-//! SNR envelope over it, doubled negative pools, wake-over-babble,
-//! owner-negative detection, probe scale-up); the exact wall clock is
+//! First run populates the TTS audio cache (subsequent runs hit it).  The
+//! encoder pipeline re-encodes raw audio through the shared Qwen3-ASR model
+//! per run — there is no embedding disk cache — so the wall clock is dominated
+//! by encoder forwards over the TEST surface (40-clip wake-only basis, SNR
+//! envelope over it, doubled negative pools, wake-over-babble,
+//! owner-negative detection, probe scale-up).  The exact wall clock is
 //! auditable from the top-level `total_wall_time_ms` key (whole run,
-//! report-assembly window included).  The one-time TTS synthesis for new
-//! owner-negative phrases is paid outside the warm budget.
-//! The bench-leanness cleanup removed the report-only same-audio (8b),
-//! B-sweep (8c), volume-sweep, mid-utterance, cooldown boundary-probe, B2
-//! synthetic-fallback probe, train/test-alignment cosine diagnostics, and the
-//! dead top-level latency section (~11-16 s saved total).  Removing 8b/8c changes the
-//! shared VAD-detector drift state entering the Phase 9-12 FA canaries, so
-//! post-change canary numbers are NOT strictly comparable to archived
-//! baselines (disclosed in the report _note); the noise_overlap clean-cell
-//! trim (2 of 3 byte-identical infinite-SNR clean cells removed) likewise
-//! shifts the in-phase shared adaptive trajectory for the remaining
-//! noise_overlap cells — all detections are 0/20, so the FA-canary impact is
-//! cosmetic, but cross-run comparability is disclosed for the same reason.
+//! report-assembly window included).
 //!
 //! # Requirements
 //!
@@ -105,8 +93,7 @@ const TOTAL_SCORE_IDX: usize = 0;
 /// fired.  Below this threshold, misses are attributed to the score gate.
 ///
 /// = [`super::match_threshold()`] = ROLLING_WINDOW_N × MATCH_THRESHOLD_FACTOR
-/// = 3 × 0.55 = 1.65 — re-calibrated for the 1024-dim cosine soft-score space
-/// (was 2.13 for the deleted Conv1D sigmoid pipeline).
+/// = 3 × 0.55 = 1.65.
 const MIN_GATE_THRESHOLD: f32 = super::match_threshold();
 
 /// Number of samples in the warm-up audio prepended before each test
@@ -132,7 +119,7 @@ const WARMUP_TTS_PHRASE: &str = "testing one two three";
 /// Unlike the original `WARMUP_NOISE_CACHE`, this caches ONLY the TTS
 /// result — if TTS is unavailable on the first call, a fresh pink-noise
 /// fallback is returned (no caching), so TTS is re-evaluated on subsequent
-/// calls (reviewer feedback on cache poisoning).
+/// calls (avoids cache poisoning).
 static WARMUP_TTS_CACHE: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
 
 /// Resolved wake word phrase for this benchmark run (phrase alignment).
@@ -381,10 +368,8 @@ const ACCEPTANCE_BASIS_PREFIX: &str = "held_out_recall_v3";
 
 /// Confusable near-miss phrases for negative detection testing.
 ///
-/// Bench-local copy of the canonical mahbot-family list that the deleted
-/// `voice` module used to export (the encoder pipeline dropped the shared
-/// list; the bench keeps it for negative-audio generation and per-tier FA
-/// tracking only).
+/// Bench-local copy of the canonical mahbot-family confusable list, kept for
+/// negative-audio generation and per-tier FA tracking.
 const CONFUSABLE_PHRASES: &[&str] = &[
     // ── Hard tier — direct phonetic substitutions (wake-word-like) ──
     "hey madbot",
@@ -447,15 +432,13 @@ const CONFUSABLE_EASY: &[&str] = &[
     "madbot", "mat bot", "bad bot", "mad lot", "mad pot", "med bot", "my bot", "may bot",
 ];
 
-/// Seeds per confusable phrase and the base seed — bench-local (the old
-/// `voice` module constants are gone with the Conv1D pipeline).
+/// Seeds per confusable phrase and the base seed (bench-local).
 const CONFUSABLE_SEEDS_PER_PHRASE: usize = 5;
 const CONFUSABLE_SEED_BASE: u64 = 1000;
 
 /// Unrelated speech phrases for negative detection testing.
 ///
-/// Bench-local copy of the canonical list the deleted `voice` module used to
-/// export.
+/// Bench-local copy of the canonical unrelated-speech list.
 const UNRELATED_PHRASES: &[&str] = &[
     // ── Short commands (2-4 words) ──────────────────────────────────
     "the weather today is sunny",
@@ -620,23 +603,12 @@ struct TierLimits {
     total: usize,
 }
 
-/// Return the per-category false-accept limits for the given tier.
+/// Return the per-category false-accept comparison limits for the given tier.
 ///
-/// # Re-calibration for the Qwen3-ASR encoder pipeline
-///
-/// The pre-rewrite limits (Easy 0/0/0, Medium 1/1/1, Hard 1/1/2) were
-/// calibrated for the Conv1D sigmoid-score pipeline, which was TRAINED on the
-/// confusable phrase family as negatives and therefore rejected near-misses
-/// ("madbot"/"mahbot") at the score boundary.  The encoder pipeline has no
-/// trainable head: detection is prototype cosine + negative-sample
-/// calibration (anti-prototype gate + p99 floor).  The measured held-out
-/// distribution (113-negative corpus, seeds 800/810 — never seen in the
-/// calibration pool) is Easy 6, Medium 4, Hard 0 confusable FAs at 87.5%
-/// held-out recall; unrelated/silence/noise are all 0.
-///
-/// The re-calibrated limits are set to the measured distribution plus ~50%
-/// headroom for run-to-run variance (the acceptance protocol judges the mean
-/// across ≥3 runs), and remain report-only — the bench never hard-gates.
+/// Report-only: the measured per-run false-accept counts are compared against
+/// these in the report banner and the `results` map.  The bench never
+/// hard-gates acceptance on them; the aggregate false-accept allowance is the
+/// safety-gate 5%-of-corpus rule ([`safety_gate`]).
 const fn tier_limits(tier: BenchTier) -> TierLimits {
     match tier {
         BenchTier::Easy => TierLimits {
@@ -1015,7 +987,7 @@ fn generate_babble_overlay_cached(
 ///
 /// Encapsulates the three related seed parameters that control deterministic
 /// TTS synthesis of phrase variants with different seeds and style rotations.
-/// Bundled into a struct for call-site clarity (reviewer feedback).
+/// Bundled into a struct for call-site clarity.
 #[derive(Clone, Copy)]
 struct SeedConfig {
     /// Base seed for deterministic TTS synthesis of the phrase list.
@@ -1287,7 +1259,7 @@ fn generate_pulsed_broadband_noise() -> Vec<f32> {
 ///
 /// Returns a [`Cow`] that either borrows from the TTS cache (once populated)
 /// or owns freshly-generated pink noise (not cached, so TTS is re-evaluated
-/// on the next call if it becomes available — reviewer feedback).
+/// on the next call if it becomes available).
 ///
 /// ## Determinism
 /// TTS synthesis uses a fixed seed (947), producing the same
@@ -1408,8 +1380,7 @@ fn generate_warmup_noise_fallback() -> Vec<f32> {
 /// digital-silence chunks, which is what production's mic delivers.
 ///
 /// Extracted as a shared helper to eliminate the structural near-duplicate
-/// between `feed_audio` and `run_streaming_detection` (reviewer
-/// feedback).
+/// between `feed_audio` and `run_streaming_detection`.
 fn process_frame(samples: &[f32], ctx: &mut super::PipelineCtx) {
     super::handle_wake_word_detection(samples, ctx);
 }
@@ -1471,7 +1442,7 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
 
     // Guard: warm-up audio should not trigger a false detection.  If it does,
     // restore the pre-warm-up state so cooldown doesn't suppress all subsequent
-    // benchmark measurements (reviewer feedback).  We must also
+    // benchmark measurements.  We must also
     // reset `is_recording` because detection sets it to `true`, which would
     // suppress scoring for the entire benchmark variant.
     if ctx.last_wake_word_detection != before_detection {
@@ -1565,21 +1536,17 @@ fn ensure_voice_models_loaded() -> Result<(), String> {
 /// volume-down (-3 dB), pink noise (25 dB SNR), and white/pink/brown noise at
 /// 10/5 dB SNR.
 ///
-/// The old Conv1D pipeline used this recipe to build TRAINING variants via
-/// the deleted `augment_pcm_variants` helper.  The encoder pipeline has no
-/// trainable head — the enrollment prototype is built from the raw
-/// VAD-gated utterances only — so this recipe survives purely as a
-/// detection-robustness probe: augmented held-out clips are fed through
-/// streaming detection (Phase 7 diagnostics) to measure detection under
-/// speed/volume/noise perturbation.  It is NOT pinned by production anymore
-/// (the golden-hash test for it was removed).
+/// The encoder pipeline has no trainable head — the enrollment prototype is
+/// built from the raw VAD-gated utterances only — so this recipe is a
+/// detection probe: augmented held-out clips are fed through streaming
+/// detection (Phase 7 diagnostics) to measure detection under
+/// speed/volume/noise perturbation.
 fn pcm_augment_enrollment_variants(variants: &[(Vec<f32>, String)]) -> Vec<(Vec<f32>, String)> {
     use crate::util::NoiseColor;
     let mut all = Vec::new();
     for (i, (pcm, label)) in variants.iter().enumerate() {
-        // Replicates the deleted augment_pcm_variants(AugmentSet::Full) recipe
-        // (variant indices and push order preserved):
-        //   pre-pad gate input = raw PCM; CONTEXT_PADDING was 1600 samples.
+        // Variant indices and push order are stable across runs:
+        //   pre-pad gate input = raw PCM; CONTEXT_PADDING = 1600 samples.
         let pre_pad_samples = pcm.len().saturating_sub(2 * 1600);
         let pre_pad_ms = pre_pad_samples as u64 * 1000 / u64::from(TARGET_SAMPLE_RATE);
         let noise_seed = i as u64;
@@ -1686,7 +1653,7 @@ fn enrollment_quality_probe(enrollment_variants: &[(Vec<f32>, String)]) -> serde
 
     let n_clips = enrollment_variants.len();
     serde_json::json!({
-        "note": "Heuristic SNR (estimate_snr_energy) — the bench's enrollment clips have no pre-speech noise ring, so this is NOT real-room SNR (mahbot-1045 B3).",
+        "note": "Heuristic SNR (estimate_snr_energy) — the bench's enrollment clips have no pre-speech noise ring, so this is NOT real-room SNR.",
         "n_clips": n_clips,
         "n_clipping": n_clipping,
         "mean_heuristic_snr_db": if n_clips == 0 { 0.0 } else { snr_sum / n_clips as f32 },
@@ -1836,9 +1803,8 @@ fn generate_ambient_noise_sequences() -> Vec<Vec<f32>> {
 /// earshot detector, encode the VAD-positive speech via
 /// [`crate::audio::wake_word::encode_window`].
 ///
-/// The old embedding-level disk cache is gone (it was keyed to the deleted
-/// Conv1D embedder); the bench pays the encoder forwards on each run — the
-/// PCM cache keeps TTS synthesis cheap.
+/// There is no embedding-level disk cache; the bench pays the encoder forwards
+/// on each run — the PCM cache keeps TTS synthesis cheap.
 fn generate_restricted_phrase_negatives(
     phrase_type: &'static str,
     phrases: &'static [&'static str],
@@ -1957,7 +1923,7 @@ fn compute_vad_segments(audio: &[f32]) -> (Vec<bool>, Vec<Vec<f32>>) {
 /// [`compute_vad_segments`] ever drifts from the literal contract, the
 /// comparison flags it.
 ///
-/// Scope honesty: production code is NOT executed in the offline bench, so
+/// Scope: production code is NOT executed in the offline bench, so
 /// this cannot detect drift in the production arm itself — it locks the
 /// bench's transcription of the contract.  To prove the comparison is
 /// sensitive (not vacuous), a NEGATIVE control feeds the full overlapping
@@ -1998,7 +1964,7 @@ fn vad_feed_cross_check_probe(audio: &[f32]) -> serde_json::Value {
     // the exact feed-pattern violation the feed contract forbids.  If the correct
     // and violated feeds produce the same decisions on this audio
     // (feed_pattern_sensitive == false), the main comparison would be
-    // vacuous and the report says so honestly instead of overclaiming.
+    // vacuous and the report states the limitation explicitly.
     let mut double_fed_detector = Detector::default();
     let mut double_fed_decisions: Vec<bool> = Vec::with_capacity(n_frames);
     for i in 0..n_frames {
@@ -2040,11 +2006,11 @@ fn vad_feed_cross_check_probe(audio: &[f32]) -> serde_json::Value {
         "all_match": mismatch_indices.is_empty(),
         "mismatch_indices": mismatch_indices,
         "negative_control": {
-            "feed_pattern": "full_overlapping_frame_per_hop (mahbot-900 violation)",
+            "feed_pattern": "full_overlapping_frame_per_hop (negative control)",
             "mismatches_vs_bench": n_double_fed_mismatches,
             "feed_pattern_sensitive": n_double_fed_mismatches > 0,
         },
-        "note": "Bench-side regression guard for the mahbot-900 VAD feed contract: \
+        "note": "Bench-side regression guard for the VAD feed contract: \
                  replays production's feed pattern (feed ONLY the new HOP_LENGTH \
                  samples per hop) through a fresh Detector and compares against \
                  compute_vad_segments.  Production code is not executed in the \
@@ -2159,8 +2125,7 @@ fn mel_normalization_consistency_probe(clip: &[f32]) -> serde_json::Value {
 /// each raw TTS clip is VAD-segmented (fresh earshot detector per clip via
 /// [`compute_vad_segments`]) and every utterance is embedded once via
 /// [`crate::audio::wake_word::encode_window`], producing one 1024-dim
-/// L2-normalized embedding per utterance.  The 12-cell PCM augmentation that
-/// the old Conv1D enrollment derived from each utterance is gone — it now
+/// L2-normalized embedding per utterance.  The 12-cell PCM augmentation
 /// survives only as a detection-diagnostics probe ([`pcm_augment_enrollment_variants`]).
 ///
 /// Returns `Vec<Vec<f32>>` — one embedding per VAD utterance.
@@ -2767,7 +2732,7 @@ fn test_detection_samples(
         let mut ctx = super::PipelineCtx::new();
         // Clone the shared adaptive state into this variant's ctx so the
         // adaptive threshold is active from the first frame, simulating a
-        // continuous pipeline (reviewer_3).  Without this the
+        // continuous pipeline.  Without this the
         // adaptive state never exits its 5-frame bootstrap because each
         // variant gets a fresh ctx, keeping all benchmark metrics measured
         // against the static threshold.
@@ -2843,9 +2808,8 @@ fn mix_at_snr(speech: &[f32], noise: &[f32], snr_db: f32) -> Vec<f32> {
     if !snr_db.is_finite() {
         return speech.to_vec();
     }
-    // Shared RMS helper — the bench's former byte-identical
-    // `rms` copy was deleted; the 1e-10 degenerate-signal guard stays here
-    // as an early return (it is NOT part of compute_rms).
+    // Shared RMS helper — the 1e-10 degenerate-signal guard lives here as an
+    // early return (it is NOT part of compute_rms).
     let speech_rms = crate::util::compute_rms(speech);
     let noise_rms = crate::util::compute_rms(noise);
     if noise_rms < 1e-10 || speech_rms < 1e-10 {
@@ -2900,7 +2864,7 @@ fn run_detection_matrix(
     // The enrollment is global (set once before the detection phases) — the
     // inline loop shares adaptive state across variants.
     // Pre-warm a shared adaptive threshold state so the benchmark actually
-    // exercises the adaptive code path (reviewer_2).  Without
+    // exercises the adaptive code path.  Without
     // this, test_detection_samples — which creates a fresh PipelineCtx per
     // variant — never exits the 5-frame bootstrap, so all measurements use
     // the static threshold.
@@ -3021,9 +2985,9 @@ fn run_noise_overlap_test(
 /// Cross-speaker probe matrix: held-out RESERVED voices at
 /// unseen seeds across clean + 5/10/20 dB white conditions (warm pass, shared
 /// adaptive — same methodology as the canary matrix).  The reserved voices
-/// are absent from EVERY training path.  Cross-speaker detections are CORRECT
+/// are absent from EVERY training path.  Cross-speaker detections are
 /// speaker-blind behaviour (the wake word fires for any speaker), so the
-/// matrix is a DIAGNOSTIC (high detection expected), not a false-accept gate.
+/// matrix is a DIAGNOSTIC, not a false-accept gate.
 ///
 /// Returns the per-cell `(key, rate, detected, detail)` shape of
 /// [`run_detection_matrix`].
@@ -3075,7 +3039,7 @@ fn run_cross_speaker_probe_matrix(
 /// Report-only FA reporter for a detection-matrix result set: any detected
 /// cell above the 0-target warns when `warn` is true (true-negative phases),
 /// otherwise the detection rate is logged as a diagnostic with no warning
-/// (cross-speaker cells — speaker-blindness, high detection expected).
+/// (cross-speaker cells — speaker-blindness diagnostics).
 fn warn_fa_cells(
     label: &str,
     results: &[(String, f64, usize, Vec<serde_json::Value>)],
@@ -3094,7 +3058,7 @@ fn warn_fa_cells(
         } else {
             info!(
                 "{label} diagnostic: {key} detected {detected}/{detail_len} cells \
-                 (rate {rate_pct:.1}%) — speaker-blindness, high detection expected{tail}",
+                 (rate {rate_pct:.1}%) — speaker-blindness diagnostic{tail}",
                 detail_len = detail.len(),
                 rate_pct = rate * 100.0,
             );
@@ -3282,10 +3246,8 @@ fn run_enrolled_speaker_phase(held_out_clips: &[(Vec<f32>, String)]) -> serde_js
         "acceptance": {
             "basis": format!(
                 "held_out_recall_v3 — {} unseen enrolled-voice wake-only clips, seeds \
-                 3000+ (enlarged from v2's 16 clips — the basis IS the \
-                 enlarged set, no 16-clip sub-pool); embedded-in-sentence detection \
-                 removed (not a product requirement); the in-sample F1 control is \
-                 removed (all enrollment clips are training data)",
+                 3000+; embedded-in-sentence detection is not measured; the in-sample F1 \
+                 control is removed (all enrollment clips are training data)",
                 total,
             ),
             "total_variants": total,
@@ -3302,18 +3264,15 @@ fn run_enrolled_speaker_phase(held_out_clips: &[(Vec<f32>, String)]) -> serde_js
                 MIN_DETECTION_RATE * 100.0,
             ),
             "note": "detected_live = end-to-end through the real cold pass (the \
-                     acceptance metric).  Bumped to v3 (40 wake-only clips): \
-                     never compared against v2 16-clip archives.",
+                     acceptance metric).",
         },
         "paths": {
             "window_encoder": window_encoder_path,
             "primary_mechanism": primary_mechanism,
             "note": "The encoder pipeline has a SINGLE scoring path (the \
                      stride-gated trailing-window encode + rolling-sum gate); \
-                     every end-to-end detection goes through it.  The old \
-                     burst / segment_end_pass / other decomposition was \
-                     specific to the deleted Conv1D deferral machinery.  \
-                     Acceptance requires mean held-out recall >= MIN_DETECTION_RATE \
+                     every end-to-end detection goes through it.  Acceptance \
+                     compares mean held-out recall against MIN_DETECTION_RATE \
                      across >= 3 fresh runs via this single path.",
         },
         "latency": {
@@ -3326,7 +3285,7 @@ fn run_enrolled_speaker_phase(held_out_clips: &[(Vec<f32>, String)]) -> serde_js
         "near_miss_canaries": {
             "gate_crossed_not_detected": gate_crossed_not_detected,
             "fired": canaries_fired,
-            "note": "Investigation triggers (mahbot-1024 item 5), NOT hard gates: any \
+            "note": "Investigation triggers, NOT hard gates: any \
                      fired canary means the run deserves review before acceptance.  \
                      'gate_crossed_not_detected' = a held-out recall variant \
                      crossed the trigger threshold (max_rolling_sum >= 1.65) but was not \
@@ -3339,10 +3298,9 @@ fn run_enrolled_speaker_phase(held_out_clips: &[(Vec<f32>, String)]) -> serde_js
 /// Compute the safety gate over the negative/confusable set.
 ///
 /// The deferral adds in-distribution deferred windows (burst + boundary
-/// double-scoring) whose false-positive impact must be MEASURED, not assumed.
-/// Baseline: 9/59 score-gate crossings, 0 end-to-end false
-/// accepts.  The gate crossing count is measured per run; true
-/// false accepts (end-to-end detections) are counted separately.
+/// double-scoring) whose false-positive impact is measured here.  Gate
+/// crossings (score gate hit without an end-to-end detection) and true false
+/// accepts (end-to-end detections) are counted separately.
 fn safety_gate(all_neg_pv: &[(&PerVariantResult, String)]) -> serde_json::Value {
     let total = all_neg_pv.len();
     let gate_crossings = all_neg_pv
@@ -3362,40 +3320,28 @@ fn safety_gate(all_neg_pv: &[(&PerVariantResult, String)]) -> serde_json::Value 
     serde_json::json!({
         "note": "False-positive impact of the deferred in-distribution windows \
                  (deferred burst + boundary fallback double-scoring) on the \
-                 negative/confusable set.  Baseline (mahbot-1022, pre-deferral): \
-                 9/59 score-gate crossings, 0 end-to-end false accepts.  \
-                 The test-surface expansion doubled the confusable/unrelated \
-                 pools, made silence a 3-duration matrix, and added 4 \
-                 detection-only noise profiles — the counts are measured over \
-                 the enlarged corpus, so the 59-clip baseline is historical \
-                 context only.  The gate crossing count is EXPECTED to change \
-                 under the deferral — it must be measured, not assumed.  \
-                 Per-utterance accounting (manager pin 7): the acceptance \
+                 negative/confusable set: end-to-end false accepts and score-gate \
+                 crossings (max_rolling_sum >= MIN_GATE_THRESHOLD without an \
+                 end-to-end detection) are counted per utterance — the acceptance \
                  denominator is utterances, not frames.",
         "total_negatives": total,
         "gate_crossings": gate_crossings,
-        "baseline_gate_crossings": 9,
         "end_to_end_false_accepts": false_accepts.len(),
         "false_accept_list": false_accepts,
-        "baseline_false_accepts": 0,
         "acceptance": format!(
-            "<= {allowance} false accepts (5% of the {total}-negative corpus — the \
-             rate is preserved, so the absolute allowance scales with the enlarged \
-             test corpus, explicitly acknowledged) across >= 3 runs; every run with \
-             a false accept must be investigated — no FA-bound breach may be silently \
-             tolerated.  Gate crossings without an end-to-end detection do NOT count \
-             as false accepts.",
+            "<= {allowance} false accepts (5% of the {total}-negative corpus) across \
+             >= 3 fresh runs.  Gate crossings without an end-to-end detection do NOT \
+             count as false accepts.",
             allowance = (total as f64 * 0.05).ceil() as usize,
             total = total,
         ),
         "near_miss_canaries": {
             "gate_crossing_on_negative_corpus": gate_crossings,
             "fired": neg_canaries_fired,
-            "note": "Investigation triggers (mahbot-1024 item 5), NOT hard gates.  \
+            "note": "Investigation triggers, NOT hard gates.  \
                      'gate_crossing_on_negative_corpus' = any negative \
-                     variant crossed the score gate (baseline 9/59, mahbot-1022 \
-                     pre-deferral — expected to fire most runs; the count is measured \
-                     per run, not assumed).  Positive-side canaries are in the \
+                     variant crossed the score gate (counted per run).  \
+                     Positive-side canaries are in the \
                      enrolled_speaker section.",
         },
     })
@@ -3644,17 +3590,13 @@ fn cross_run_summary() -> serde_json::Value {
                 "values": phrases,
             }),
         },
-        "note": "Last 3 pre-existing timestamped archives (bounded so the default-run \
-                 budget holds) filtered to the current acceptance basis \
-                 (ACCEPTANCE_BASIS_PREFIX) — v3 enlarged-basis runs never mix with v2 \
-                 16-clip archives in the >=3-run spread.  The v3 \
-                 series starts fresh: until 3 v3 runs accumulate, the spread is \
-                 partial.",
+        "note": "Last 3 pre-existing timestamped archives, filtered to the current \
+                 acceptance basis (ACCEPTANCE_BASIS_PREFIX).  Until 3 runs with the \
+                 current basis accumulate, the spread is partial.",
     })
 }
 
-/// Env-gated FAPH phase (honest methodology):
-/// real-audio false-acceptance-per-hour bench.
+/// Env-gated FAPH phase: real-audio false-acceptance-per-hour bench.
 ///
 /// Feeds the pinned corpus (`faph_corpus_manifest.json` — alexwengg/musan_mini,
 /// 812 files, ~5.99 h audio, SHA-256-pinned per file) through the production
@@ -3663,8 +3605,7 @@ fn cross_run_summary() -> serde_json::Value {
 /// [`FRAME_LENGTH`](super::FRAME_LENGTH) chunks via [`process_frame`], no
 /// early exit) and counts false-accept events.
 ///
-/// # FA-counting semantics (pinned by the planning gate, honest
-/// methodology)
+/// # FA-counting semantics
 ///
 /// - **Event-based**: each fresh detection event (a new
 ///   `last_wake_word_detection` timestamp) counts as 1 FA.
@@ -3672,7 +3613,8 @@ fn cross_run_summary() -> serde_json::Value {
 ///   a 2 s silence gap between files fires the natural segment-boundary reset
 ///   (fresh detector, adaptive bootstrap, cleared ring) the way production listens.
 /// - **Raw vs cooldown-merged**: production's wall-clock `WAKE_WORD_COOLDOWN`
-///   (3 s) would suppress ~180 s of audio per event at ~60× feed — the bench
+///   (3 s) would suppress more audio than 3 s per event at the bench's
+///   faster-than-real-time feed — the bench
 ///   observes the RAW event stream (re-arms after each event like production's
 ///   post-command reset, clearing the wall-clock timestamp bench-side —
 ///   production's gate is unmodified) and reports BOTH the raw count and the
@@ -3701,13 +3643,6 @@ fn cross_run_summary() -> serde_json::Value {
 /// `None` when the env gate is off (standard-run report surface untouched —
 /// no `faph` key is added to the JSON).  `Some(json)` when
 /// `MAHBOT_FAPH=1` (ran or documented-skipped).
-///
-/// # Acceptance-only budget
-///
-/// This phase is **acceptance-only**: max ~2 runs per acceptance round (one
-/// round = the ≥3-run protocol), run only when a ticket/claim requires
-/// FA/h statistics, and a skipped run counts against the budget.  It stays
-/// env-gated (zero cost in the default loop) and report-only — never a gate.
 fn run_faph_phase() -> Option<serde_json::Value> {
     if std::env::var("MAHBOT_FAPH").as_deref() != Ok("1") {
         return None;
@@ -3826,7 +3761,7 @@ fn run_faph_phase_inner() -> serde_json::Value {
     let mut files_decode_failed = 0u64;
     let mut per_file_events: Vec<serde_json::Value> = Vec::new();
 
-    // Continuous listening (honest FAPH methodology): ONE PipelineCtx across
+    // Continuous listening: ONE PipelineCtx across
     // the whole corpus so the adaptive threshold, and
     // noise-RMS behavior persist the way production actually listens.  A short
     // silence gap between files fires the natural segment-boundary reset
@@ -3853,6 +3788,17 @@ fn run_faph_phase_inner() -> serde_json::Value {
         let n_merged = faph_merge_events(&file_events, super::WAKE_WORD_COOLDOWN.as_secs_f64());
         raw_events.extend(file_events);
         files_fed += 1;
+        // Progress line: the phase feeds the whole corpus with no per-file
+        // summary in the report (the aggregate is the metric); this periodic
+        // line keeps the multi-hour phase observable while it runs.
+        if files_fed % 50 == 0 {
+            eprintln!(
+                "  FAPH progress: {files_fed}/{} files fed, {:.2} h audio, {:.0} s wall",
+                files.len(),
+                total_audio_secs / 3600.0,
+                phase_start.elapsed().as_secs_f64(),
+            );
+        }
         // Feed the inter-file silence gap so the segment-boundary reset fires
         // naturally (the next file starts with production's post-silence
         // state: fresh detector, adaptive threshold bootstrap, cleared ring).
@@ -3861,7 +3807,7 @@ fn run_faph_phase_inner() -> serde_json::Value {
         raw_events.extend(faph_feed_file_continuous(&gap, &mut ctx, &mut audio_pos));
         // VAD-active seconds for the file+2s-gap window from the CONTINUOUS
         // feed: production's global VAD detector (evolved across the whole
-        // corpus, exactly how the mic path listens) — the honest basis for the
+        // corpus, exactly how the mic path listens) — the basis for the
         // primary FA/h denominator.  The counter accumulates one entry per
         // 256-sample hop through `handle_wake_word_detection` and is reset by
         // `faph_clear_instrumentation` below after this capture.  The key name
@@ -3893,7 +3839,7 @@ fn run_faph_phase_inner() -> serde_json::Value {
 
     // FA/h against both denominators (raw audio hours and VAD-active hours),
     // with the Poisson 95% upper bound stated primarily against the
-    // VAD-active denominator — the honest speech-exposure basis.
+    // VAD-active denominator — the speech-exposure basis.
     let fa_per_hour_raw = if audio_hours > 0.0 {
         merged_events as f64 / audio_hours
     } else {
@@ -3920,7 +3866,7 @@ fn run_faph_phase_inner() -> serde_json::Value {
     };
 
     info!(
-        "FAPH (mahbot-1057/1081): {files_fed} files fed, {audio_hours:.2} h audio \
+        "FAPH: {files_fed} files fed, {audio_hours:.2} h audio \
          ({vad_active_hours:.2} h VAD-active), {merged_events} cooldown-merged FA events \
          (raw {total_events}), {fa_per_hour_vad:.4} FA/h VAD-active \
          (Poisson 95% upper {poisson_upper_per_hour_vad:.4}/h), {wall_secs:.1}s wall",
@@ -3960,7 +3906,7 @@ fn run_faph_phase_inner() -> serde_json::Value {
                           listens; raw events observed by re-arming after each event (production \
                           post-command reset) with the wall-clock cooldown timestamp cleared \
                           bench-side (production's WAKE_WORD_COOLDOWN gate unmodified); \
-                          cooldown is applied as a 3 s AUDIO-position merge for the honest count; \
+                          cooldown is applied as a 3 s AUDIO-position merge for the count; \
                           denominators reported against both raw audio hours and VAD-active hours",
         },
         "fa": {
@@ -3972,10 +3918,11 @@ fn run_faph_phase_inner() -> serde_json::Value {
             "poisson_95_upper_per_hour_raw_denominator": poisson_upper_per_hour_raw,
             "poisson_95_upper_per_hour_vad_active_denominator": poisson_upper_per_hour_vad,
             "poisson_95_upper_events": poisson_upper_events,
-            "primary_denominator": "VAD-active (speech-active) hours — the honest \
+            "primary_denominator": "VAD-active (speech-active) hours — the \
                                      speech-exposure basis; raw-hours readings are secondary",
-            "cooldown_suppression": "wall-clock WAKE_WORD_COOLDOWN (3 s) at ~50-60x feed \
-                                     would suppress ~180 s of audio per event — bypassed \
+            "cooldown_suppression": "wall-clock WAKE_WORD_COOLDOWN (3 s) would suppress \
+                                     more audio than 3 s per event at the bench's \
+                                     faster-than-real-time feed — bypassed \
                                      bench-side (raw stream) and re-applied as a 3 s \
                                      audio-position merge (production-equivalent count)",
             "continuous_listening": true,
@@ -3996,8 +3943,8 @@ fn run_faph_phase_inner() -> serde_json::Value {
 /// Build a documented-skip FAPH report (degraded-skip contract — never a
 /// hard error).
 fn faph_skip_json(reason_key: &str, detail: &str) -> serde_json::Value {
-    warn!("FAPH (mahbot-1057) skipped: {reason_key} — {detail}");
-    eprintln!("         FAPH (mahbot-1057) skipped: {reason_key} — {detail}");
+    warn!("FAPH skipped: {reason_key} — {detail}");
+    eprintln!("         FAPH skipped: {reason_key} — {detail}");
     serde_json::json!({
         "status": "skipped",
         "skip_reason": reason_key,
@@ -4068,22 +4015,23 @@ fn faph_download_file(
 }
 
 /// Count raw false-accept events while feeding one corpus file as ambient
-/// audio through a SHARED continuous-listening pipeline context (honest FAPH
-/// methodology — one pipeline context across the whole corpus, matching
-/// production's continuous listening).
+/// audio through a SHARED continuous-listening pipeline context (one pipeline
+/// context across the whole corpus, matching production's continuous
+/// listening).
 ///
 /// Feeds every sample in [`FRAME_LENGTH`](super::FRAME_LENGTH) chunks through
 /// [`handle_wake_word_detection`] directly, recording the
 /// AUDIO position (seconds) of each fresh `last_wake_word_detection`
 /// timestamp.  Production's `WAKE_WORD_COOLDOWN` gate inside
-/// `handle_wake_word_detection` is wall-clock based: at the bench's ~50-60×
-/// feed speed it would suppress ~180 s of audio per event, structurally
+/// `handle_wake_word_detection` is wall-clock based: at the bench's
+/// faster-than-real-time feed speed it would suppress far more audio than the
+/// 3 s it represents, structurally
 /// under-counting.  The bench therefore observes the RAW event stream by
 /// re-arming after each event exactly like production's post-command reset
 /// (`reset_pipeline_state(Soft)` + `is_recording = false`) AND clearing the
 /// cooldown timestamp (bench-side emulation — production's gate is NOT
 /// modified).  The caller applies production's 3 s cooldown as an
-/// audio-position merge ([`faph_merge_events`]) for the honest
+/// audio-position merge ([`faph_merge_events`]) for the
 /// production-equivalent count.
 ///
 /// `audio_pos` is the running audio position (seconds) across the whole
@@ -4658,9 +4606,7 @@ pub(crate) fn run_internal() {
     // ── Soft-score discrimination evidence (prototype pipeline) ──
     // With no trainable head, the "soft scores" are the enrollment soft
     // scores (cosine through calibration): positives = utterance embeddings,
-    // negatives = the negative pool.  The Conv1D-era training keys
-    // (epochs_trained, best_val_loss, per-epoch curves, …) were removed with
-    // the deleted training path — the prototype pipeline reports its own
+    // negatives = the negative pool.  The prototype pipeline reports its own
     // calibration diagnostics instead.
     let (
         pos_scores_mean,
@@ -4732,7 +4678,7 @@ pub(crate) fn run_internal() {
     match &self_test_result {
         Some(Ok(())) => info!("Enrollment self-test: passed"),
         Some(Err(e)) => warn!(
-            "Enrollment self-test FAILED — production would reject this enrollment (report-only, mahbot-953): {e}"
+            "Enrollment self-test FAILED — production would reject this enrollment (report-only): {e}"
         ),
         None => warn!(
             "No enrollment (consistency gate failed or too few utterances) — \
@@ -4794,7 +4740,7 @@ pub(crate) fn run_internal() {
     // ── Phase 6: Streaming detection setup ────────────────────────────────
     phase_start!("Phase 6: Streaming detection setup");
     // This phase is mostly a no-op — the setup was already done in Phase 5.
-    // The timing will be near-zero, which is expected.
+    // The timing will be near-zero.
     phase_times[P_STREAMING_SETUP] = phase_end_ms!();
 
     // ── Detection phases (skipped entirely if the enrollment is degenerate) ─
@@ -4855,18 +4801,16 @@ pub(crate) fn run_internal() {
 
     if !degenerate {
         // Create a pre-warmed adaptive threshold state shared across all
-        // detection phases so the adaptive code path is exercised end-to-end
-        // (reviewer_3).  Without this, test_detection_samples
+        // detection phases so the adaptive code path is exercised end-to-end.
+        // Without this, test_detection_samples
         // creates a fresh PipelineCtx per variant, keeping the adaptive state
         // in perpetual 5-frame bootstrap and measuring all metrics against the
         // static threshold.
         //
-        // Note: The adaptive threshold no longer feeds high
-        // soft scores into its statistics — only background frames
+        // Note: only background frames
         // (below NO_MATCH_RESET_THRESHOLD) update the running statistics.
-        // Positive variants therefore no longer inflate the adaptive
-        // threshold, eliminating the bias described in reviewer_3's
-        // methodological note.  The noise-overlap phase (14) uses a
+        // Positive variants therefore do not inflate the adaptive
+        // threshold.  The noise-overlap phase (14) uses a
         // separate freshly-warmed state for independent measurement.
         let mut shared_adaptive = super::AdaptiveThresholdState::warmed();
 
@@ -4895,9 +4839,9 @@ pub(crate) fn run_internal() {
         );
 
         // ── Phase 7: Held-out augmented diagnostics ───────────────────────
-        // The old test-split positive phase is gone (all 10 clips
-        // are training data).  Detection control is the held-out wake-only
-        // recall set (Phase 7d, raw clips — the acceptance basis).  This phase
+        // All 10 enrollment clips are training data, so detection control is
+        // the held-out wake-only recall set (Phase 7d, raw clips — the
+        // acceptance basis).  This phase
         // adds bounded per-augmentation diagnostics over a subset of the
         // held-out wake-only clips: {speed_down 0.95, speed_down 0.90,
         // white-10, brown-10} on the first 4 clips (16 variants), warm + cold
@@ -5106,9 +5050,9 @@ pub(crate) fn run_internal() {
         // ── Wake-over-babble ─────────────────────────────────────────────
         // Held-out wake clips mixed with a multi-voice TTS babble track at a
         // few SNR levels — speech-on-speech interference (the encoder
-        // pipeline's robustness under a speech interferer).  In-memory mixing; only
+        // pipeline's behaviour under a speech interferer).  In-memory mixing; only
         // the babble clips enter the PCM cache.  Report-only diagnostic (the
-        // wake word IS present — high detection is the healthy reading).
+        // wake word IS present).
         eprintln!("─── Wake-over-babble (report-only) ───");
         if let Some(babble_track) =
             generate_babble_overlay_cached(&available_styles, &model_version_hash, &cache_dir_path)
@@ -5153,10 +5097,9 @@ pub(crate) fn run_internal() {
                          (non-wake phrases, seeds 9500+): each clip mixes against a \
                          ~1 s slice of the track, with per-clip offsets sampling the \
                          multi-voice track across the set, at 10/5/0 dB.  SNR is \
-                         computed on the mixed slice.  The wake word IS present, so \
-                         high detection is the healthy reading (speaker-blindness \
-                         diagnostic, report-only).  In-memory mixing; the babble \
-                         track is the only new cache content.",
+                         computed on the mixed slice.  The wake word IS present \
+                         (speaker-blindness diagnostic, report-only).  In-memory \
+                         mixing; the babble track is the only new cache content.",
             }));
         } else {
             warn!("Babble overlay synthesis produced no audio — wake-over-babble section skipped");
@@ -5187,7 +5130,7 @@ pub(crate) fn run_internal() {
         //   Detection 4  ~3.5 s   gate expired — fires (natural expiry, NO
         //                          manual last_wake_word_detection clear)
         //
-        // Gate vs report (reviewer_3): Detections 3 and 4
+        // Gate vs report: Detections 3 and 4
         // ARE the gate — HARD assertions, so a production cooldown regression
         // (e.g. halved WAKE_WORD_COOLDOWN) fails the bench instead of only
         // warning.  Slack margins (2.5 s / 3.5 s) are deliberate: wall-clock
@@ -5198,8 +5141,8 @@ pub(crate) fn run_internal() {
         info!("─── {}. Cooldown verification ───", P_COOLDOWN + 1);
         // Variant CONSTRUCTION only — the enrolled clip's 12-cell augmented
         // set, WITHOUT re-running the enrolled-speaker phase.
-        // `_original` is pinned:
-        // speed_down/noise fail ~4–6% of runs historically (reviewer_3).
+        // `_original` is pinned: the cooldown probes run the unperturbed
+        // clip.
         // The shared find+augment chain lives in [`enrolled_clip_variants`].
         let enrolled_cooldown_variant: Option<(Vec<f32>, String)> =
             enrolled_clip_variants(&train_clips, &enrolled_label)
@@ -5226,7 +5169,7 @@ pub(crate) fn run_internal() {
                 cooldown_first_detected = Some(false);
                 let reason = format!(
                     "Enrolled-speaker variant {clip_label} did not fire in the warm pass — \
-                     skipping cooldown assertions (mahbot-1052)"
+                     skipping cooldown assertions"
                 );
                 warn!("{reason}");
                 cooldown_skip_reason = Some(reason);
@@ -5266,14 +5209,14 @@ pub(crate) fn run_internal() {
                     !ctx.audio_buffer.is_empty()
                         && ctx.audio_buffer.len() <= super::AUDIO_BUFFER_MAX,
                     "Cooldown accumulation cap violated: audio_buffer.len() = {} \
-                     (cap = {}, mahbot-802 semantics: cooldown audio is buffered up to the cap, \
-                     never discarded)",
+                     (cap = {} — cooldown audio is buffered up to the cap, never \
+                     discarded)",
                     ctx.audio_buffer.len(),
                     super::AUDIO_BUFFER_MAX,
                 );
                 info!(
                     "Cooldown test: audio fed during cooldown buffered ({} samples, \
-                     cap {} samples) ✓ — not discarded (mahbot-802)",
+                     cap {} samples) ✓ — not discarded",
                     ctx.audio_buffer.len(),
                     super::AUDIO_BUFFER_MAX,
                 );
@@ -5284,13 +5227,12 @@ pub(crate) fn run_internal() {
                 // bypassing production's real gate; the natural expiry is the
                 // production behavior under test.
                 //
-                // GATE (reviewer_3): HARD assertion, not
-                // warn-soft — a production cooldown regression (e.g. halved or
-                // removed WAKE_WORD_COOLDOWN) must FAIL the bench.  The 500 ms
-                // slack margin (2.5 s vs 3.0 s) is jitter-safe, and the
-                // suppressed feed + silence flush complete ~100 ms after the
-                // sleep (the bench feeds far faster than real-time), leaving
-                // ~400 ms of margin.
+                // GATE: HARD assertion, not warn-soft — a production cooldown
+                // regression (e.g. halved or removed WAKE_WORD_COOLDOWN) must
+                // FAIL the bench.  The 500 ms slack margin (2.5 s vs 3.0 s) is
+                // jitter-safe, and the suppressed feed + silence flush complete
+                // ~100 ms after the sleep (the bench feeds far faster than
+                // real-time), leaving ~400 ms of margin.
                 sleep_until_cooldown_elapsed(&ctx, Duration::from_millis(2500));
                 let t2 = Instant::now();
                 let at_2_5s = run_streaming_detection(&enrolled_original, &mut ctx);
@@ -5298,8 +5240,7 @@ pub(crate) fn run_internal() {
                 assert!(
                     !at_2_5s.detected,
                     "Cooldown gate violation: re-detection fired at ~2.5s (elapsed {}ms) while \
-                     WAKE_WORD_COOLDOWN = {}ms — the gate must stay closed until natural expiry \
-                     (mahbot-1052 pin 4)",
+                     WAKE_WORD_COOLDOWN = {}ms — the gate must stay closed until natural expiry",
                     ctx.last_wake_word_detection
                         .map_or(0, |l| l.elapsed().as_millis()),
                     super::WAKE_WORD_COOLDOWN.as_millis(),
@@ -5317,7 +5258,7 @@ pub(crate) fn run_internal() {
                 // GATE: HARD assertion like Detection 3
                 // (500 ms slack past the 3.0 s boundary — jitter-safe).
                 //
-                // Buffered-audio-processed evidence (reviewer_3):
+                // Buffered-audio-processed evidence:
                 // the post-firing state `audio_buffer.is_empty() &&
                 // !command_buffer.is_empty()` alone is TAUTOLOGICAL — the
                 // mem::take at the start of every non-cooldown
@@ -5347,8 +5288,7 @@ pub(crate) fn run_internal() {
                 assert!(
                     after_cooldown.detected,
                     "Cooldown gate violation: detection did NOT fire at ~3.5s (elapsed {}ms) \
-                     after WAKE_WORD_COOLDOWN = {}ms expired — recovery failed \
-                     (mahbot-1052 pin 4)",
+                     after WAKE_WORD_COOLDOWN = {}ms expired — recovery failed",
                     ctx.last_wake_word_detection
                         .map_or(0, |l| l.elapsed().as_millis()),
                     super::WAKE_WORD_COOLDOWN.as_millis(),
@@ -5364,7 +5304,7 @@ pub(crate) fn run_internal() {
         } else {
             let reason = format!(
                 "{enrolled_label} missing from train clips — cannot re-point Phase 13 at \
-                 the enrolled-speaker positive variant (mahbot-1052); Phase 8d's fallback \
+                 the enrolled-speaker positive variant; Phase 8d's fallback \
                  ('?' lookup) is mirrored here"
             );
             warn!("{reason}");
@@ -5445,7 +5385,7 @@ pub(crate) fn run_internal() {
         //      speaker phases nor the probe matrix exercise the canary
         //      voices' augmentations);
         //   2. held_out_probes — the RESERVED voices (M4/M5) at unseen seeds
-        //      across clean + 5/10/20 dB white (honest generalization probes).
+        //      across clean + 5/10/20 dB white (generalization probes).
         phase_start!("Phase 13: Noise-overlapped detection + cross-speaker probes");
         let canary_overlap_results = run_noise_overlap_test(&canary_clips);
         let probe_cells = run_cross_speaker_probe_matrix(&cross_speaker_probe_clips);
@@ -5462,11 +5402,9 @@ pub(crate) fn run_internal() {
         // Phase 7d.  This section re-runs the FULL enlarged set through the
         // existing noise-overlap matrix (white/pink/brown × 20/10/5/0 dB +
         // clean — 13 cells) as an in-memory report section — no cache growth.
-        // Directly exercises the encoder pipeline's robustness-under-noise
-        // behaviour behind the current miss (never exercised under noise
-        // before).  Report-only;
-        // warm pass with a shared adaptive state (same methodology as the
-        // canary matrix).
+        // Exercises the encoder pipeline's behaviour under noise.
+        // Report-only; warm pass with a shared adaptive state (same
+        // methodology as the canary matrix).
         eprintln!("─── Held-out SNR envelope (report-only) ───");
         let snr_start = Instant::now();
         let snr_results = run_noise_overlap_test(&held_out_recall_clips);
@@ -5488,10 +5426,7 @@ pub(crate) fn run_internal() {
             "note": "The ENLARGED held-out wake-only basis (all 40 clips, seeds \
                      3000-3039) through the existing 13-cell noise matrix \
                      (white/pink/brown x 20/10/5/0 dB + clean).  In-memory mixing, \
-                     no cache growth.  The wake word IS present — high detection is \
-                     the healthy reading; this directly exercises the \
-                     encoder pipeline's robustness-under-noise behaviour that the single \
-                     current miss exhibits.  Report-only.",
+                     no cache growth.  Report-only.",
         }));
     } else {
         // Degenerate enrollment — skip all detection phases
@@ -5517,16 +5452,11 @@ pub(crate) fn run_internal() {
 
     // ── Env-gated FAPH phase ────────────────────────────────
     // Real-audio false-acceptance-per-hour bench phase.  Runs AFTER the
-    // existing phases (reuses the bench's flock + 30-min timeout); the
+    // existing phases (reuses the bench's flock + harness timeout); the
     // standard-run report surface is untouched because the report section is
     // only added to the JSON when the env gate is on (None → no key).
     //
-    // Corpus sizing (recorded before this phase was built):
-    // measured detection-path throughput on the idle machine (2026-08-02)
-    // was ~47.8× real-time (speech) / ~60.7× (noise), blended ~51.8× for the
-    // corpus's 3.85 h speech + 2.14 h noise mix → the full 5.99 h pinned
-    // corpus projects to ~7 min wall, well inside the 30-min harness budget.
-    // The phase therefore feeds the FULL pinned corpus (812 files).
+    // The phase feeds the FULL pinned corpus (812 files).
     let faph_report: Option<serde_json::Value> = run_faph_phase();
 
     // ── Phase 14 timing ─────────────────────────────────
@@ -5766,8 +5696,8 @@ pub(crate) fn run_internal() {
     // ═══════════════════════════════════════════════════════════════════════
 
     // Noise-overlap canary + held-out probe matrices: speaker-blindness
-    // DIAGNOSTICS — cross-speaker wake-word detections are correct behaviour
-    // (high detection expected), so these report rates without warnings and do
+    // DIAGNOSTICS — cross-speaker wake-word detections are speaker-blind
+    // behaviour, so these report rates without warnings and do
     // NOT count into total_false_accepts.
     warn_fa_cells(
         "Noise-overlap in-distribution canary",
@@ -5784,11 +5714,11 @@ pub(crate) fn run_internal() {
         false,
     );
 
-    // NOTE: all pass/fail gating was removed.  Threshold checks
-    // emit warnings above but never abort the benchmark.  Run data is reported
-    // in both JSON (below) and this stderr report.  See the threshold assertion
-    // conversion section after the report for details (each now warns instead of
-    // asserting).
+    // NOTE: acceptance/threshold checks are report-only — they emit warnings
+    // above but never abort the benchmark.  Hard assertions remain only for
+    // production-behavior contracts (the cooldown gate and accumulation cap in
+    // the cooldown phase).  Run data is reported in both JSON (below) and this
+    // stderr report.
 
     // Build the JSON output
     // Build per-variant negative diagnostics with FULL per-variant detail.
@@ -5940,7 +5870,7 @@ pub(crate) fn run_internal() {
         tts::set_playback_active_for_test(false);
         let gate_cleared = !tts::is_playback_active();
         serde_json::json!({
-            "probe": "TTS-echo gate (mahbot-1045 B1)",
+            "probe": "TTS-echo gate",
             "gate_active_while_playback": gate_active,
             "gate_cleared_after_clear": gate_cleared,
             "note": "Predicate-level roundtrip only: the voice-tests setter and \
@@ -5965,7 +5895,7 @@ pub(crate) fn run_internal() {
         let plausible = metrics.embeddings_computed > 0 && drop_rate == 0.0;
         if !plausible {
             warn!(
-                "mahbot-1045 B4: production metrics implausible — \
+                "Production metrics implausible — \
                  embeddings_computed={}, drop_rate={drop_rate}",
                 metrics.embeddings_computed,
             );
@@ -5974,13 +5904,14 @@ pub(crate) fn run_internal() {
         // (SCORE_STRIDE_SAMPLES = 2560 samples at 16 kHz), so a per-window
         // encoder forward must stay under ~160 ms for the pipeline to keep up
         // with a live mic.  The offline bench feeds audio faster than
-        // real-time, but the production encode path (handle_wake_word_detection
-        // → encode_window) is executed for real under release codegen, so the
-        // measured latency is a faithful proxy for the live stride cost.
+        // real-time, but the production encode path
+        // (handle_wake_word_detection → encode_window) is executed under
+        // release codegen, so the measured latency is the per-window encode
+        // cost.
         let stride_budget_ns = super::SCORE_STRIDE_SAMPLES as u64 * 1_000_000_000 / 16_000;
         let rolling_latency_ns = metrics.avg_embedding_latency_ns;
         serde_json::json!({
-            "probe": "production metrics (mahbot-1045 B4)",
+            "probe": "production metrics",
             "chunks_received": metrics.chunks_received,
             "dropped_chunks": metrics.dropped_chunks,
             "embeddings_computed": metrics.embeddings_computed,
@@ -6000,18 +5931,15 @@ pub(crate) fn run_internal() {
         })
     };
 
-    // Embedding cache probe (removed with the Conv1D embedder).
-    // The versioned embedding disk cache was keyed to the deleted ONNX
-    // embedder; the encoder pipeline re-encodes from raw audio on each run
-    // (the PCM cache keeps TTS synthesis cheap).  The probe now documents the
-    // removal instead of roundtripping a cache format that no longer exists.
+    // Embedding cache probe: there is no embedding disk cache — the encoder
+    // pipeline re-encodes from raw audio on each run (the PCM cache keeps TTS
+    // synthesis cheap).  The probe documents the absence.
     let embedding_cache_probe = serde_json::json!({
-        "probe": "embedding cache (mahbot-1045 B5)",
+        "probe": "embedding cache",
         "read_back_byte_identical": serde_json::Value::Null,
-        "note": "REMOVED — the versioned embedding disk cache was keyed to the \
-                 deleted Conv1D embedder.  The encoder pipeline re-encodes raw \
-                 audio through the shared Qwen3-ASR encoder per run; only the \
-                 TTS PCM cache survives.",
+        "note": "There is no embedding disk cache — the encoder pipeline \
+                 re-encodes raw audio through the shared Qwen3-ASR encoder per \
+                 run; only the TTS PCM cache survives.",
     });
 
     // Enrollment-quality scoring (report-only).  The bench's
@@ -6047,7 +5975,7 @@ pub(crate) fn run_internal() {
             // No training seed — the enrollment prototype is the
             // L2-normalized mean of utterance embeddings (no trainable head).
             "tts_warmup": 947,
-            "note": "No training seed (the Conv1D head is gone); \
+            "note": "No training seed — \
                      the enrollment is deterministic given the TTS PCM cache.",
         },
         "wake_phrase": {
@@ -6062,7 +5990,7 @@ pub(crate) fn run_internal() {
                      confusable negative tier stays the mahbot-family canonical list \
                      regardless of the deployed phrase (production itself skips mahbot \
                      confusables for non-mahbot phrases) — for a non-mahbot deployed \
-                     phrase that tier is informational, not a production-faithful probe.",
+                     phrase that tier is informational only.",
         },
         "model_hashes": {
             "tts_model_version_hash": model_version_hash,
@@ -6110,8 +6038,7 @@ pub(crate) fn run_internal() {
     // Detection summary: warm (pos_metrics) + cold-start (cold_metrics)
     // over the held-out augmented diagnostics (Phase 7 —
     // bounded {speed_down, speed_down_090, white-10, brown-10} variants of a
-    // held-out wake-only subset).  A healthy pipeline's warm/cold
-    // detection rate here is HIGH.  The raw-clip held-out recall acceptance
+    // held-out wake-only subset).  The raw-clip held-out recall acceptance
     // basis (unseen seeds, wake-only) is reported in
     // enrolled_speaker.acceptance.
     let detection_json = serde_json::json!({
@@ -6126,9 +6053,8 @@ pub(crate) fn run_internal() {
         "note": "Held-out augmented diagnostics: bounded \
                  per-augmentation variants (speed_down / speed_down_090 / \
                  white-10 / brown-10) over a subset of the held-out wake-only \
-                 clips — HIGH detection is the healthy reading.  The trained-in \
-                 cross-speaker canaries live in \
-                 noise_overlap.in_distribution_canaries (M2/M3) and the honest \
+                 clips.  The trained-in cross-speaker canaries live in \
+                 noise_overlap.in_distribution_canaries (M2/M3) and the \
                  held-out probes in noise_overlap.held_out_probes (M4/M5).  The \
                  raw-clip held-out recall acceptance basis (unseen seeds, \
                  wake-only) is reported in enrolled_speaker.acceptance.",
@@ -6185,10 +6111,8 @@ pub(crate) fn run_internal() {
         "pipeline": "qwen3-asr-encoder",
         // With no trainable head, the "soft scores" are the enrollment
         // soft scores (cosine through calibration): pos = utterance
-        // embeddings, neg = the negative pool.  The Conv1D-era training keys
-        // were removed with the deleted training path; the prototype
-        // pipeline's own calibration diagnostics live under
-        // "enrollment_diagnostics".
+        // embeddings, neg = the negative pool.  Calibration diagnostics
+        // live under "enrollment_diagnostics".
         "pos_scores_mean": pos_scores_mean,
         "pos_scores_min": pos_scores_min,
         "pos_scores_max": pos_scores_max,
@@ -6235,7 +6159,7 @@ pub(crate) fn run_internal() {
     // noise_overlap restructured into two labeled sections — the trained-in
     // canary matrix and the held-out reserved-voice probe matrix.  Both are
     // speaker-blindness DIAGNOSTICS (cross-speaker wake-word detections are
-    // correct behaviour — high detection expected), reported without pass/fail
+    // speaker-blind behaviour), reported without pass/fail
     // semantics and NOT counted into total_false_accepts.
     let noise_overlap_json = serde_json::json!({
         "sections": {
@@ -6248,14 +6172,11 @@ pub(crate) fn run_internal() {
         },
         "note": format!(
             "in_distribution_canaries = trained-in M2/M3 wake-word clips under the \
-             13-cell noise matrix (kept from mahbot-1025; any detection is a \
-             trained-in speaker-blindness diagnostic).  held_out_probes = \
-             RESERVED voices (absent from every training path) at unseen seeds \
-             across clean + 5/10/20 dB white (honest cross-speaker \
-             generalization probes).  Both are DIAGNOSTICS: speaker-blind \
-             detection means a non-enrolled voice's wake word fires — high \
-             detection is expected and healthy; low detection is reportable, \
-             never a failure.  Measured {canary_total} canary + \
+             13-cell noise matrix (any detection is a trained-in speaker-blindness \
+             diagnostic).  held_out_probes = RESERVED voices (absent from every \
+             training path) at unseen seeds across clean + 5/10/20 dB white.  Both \
+             are DIAGNOSTICS: speaker-blind detection means a non-enrolled voice's \
+             wake word fires.  Measured {canary_total} canary + \
              {probe_total} probe cells this run.",
             canary_total = noise_overlap_total_variants,
             probe_total = probe_total_variants,
@@ -6265,7 +6186,7 @@ pub(crate) fn run_internal() {
     // Enrolled-speaker phase (Phase 7d) + safety gate.
     // The safety gate measures the false-positive impact of the deferred
     // in-distribution windows (burst + boundary double-scoring) on the
-    // negative/confusable set; baseline 9/59 gate crossings / 0 FAs.
+    // negative/confusable set.
     let enrolled_json = enrolled_report.unwrap_or_else(
         || serde_json::json!({"note": "Enrolled-speaker phase skipped (degenerate enrollment)"}),
     );
@@ -6283,75 +6204,34 @@ pub(crate) fn run_internal() {
     let json = serde_json::json!({
         "benchmark": "voice_pipeline_e2e",
         "total_wall_time_ms": total_wall_time_ms,
-        "_note": format!(
-            "Report-only benchmark — no pass/fail gating (mahbot-953).  \
-             'passed' was removed in mahbot-1005: it was hardcoded true and \
-             misleading.  Compare against the limits in 'results' instead. \
-             PIPELINE REWRITE (qwen3-asr-encoder): the wake-word pipeline now \
-             embeds the trailing 0.76 s window through the shared Qwen3-ASR \
-             encoder (1024-dim cosine soft scores) instead of the old \
-             OpenWakeWord 96-dim embedder + Conv1D classifier + AGC/NS \
-             preprocessing — no trainable head, no AGC/NS, no embedding disk \
-             cache.  Enrollment is a prototype (L2-normalized centroid of \
-             utterance embeddings) calibrated against negative samples; \
-             detection is immediate-fire and speaker-blind.  ALL detection/FA \
-             numbers re-baseline vs every prior archive (the v3 series is \
-             wiped by this rewrite); the 12-cell PCM augmentation survives \
-             only as a detection-diagnostics probe; the negative pool is \
-             encoded directly from raw audio.  Historical context: \
-             mahbot-1006 aligned the benchmark's training/inference \
-             processing with the old production preprocessor (AGC ordering, \
-             cold-start pass, CONFIG-driven preprocessor, preprocessed \
-             negatives) — \
-             detection/FA numbers are NOT directly comparable to the \
-             mahbot-1004/948 baselines.  The speaker-verifier stage, the \
-             classifier-candidate machinery, warm-up suppression, and all \
-             model fingerprinting were removed; detection is immediate-fire \
-             and speaker-blind.  total_false_accepts semantics changed: the \
-             pre-change 13 (all canary-matrix cross-speaker detections) is \
-             now 0, because cross-speaker wake-word detections are CORRECT \
-             speaker-blind behaviour reported as DIAGNOSTICS \
-             (noise_overlap / false_accepts.cross_speaker_probes), with no \
-             pass/fail semantics (high detection expected; low detection is \
-             reportable, not a failure).  Pre-change archives were deleted — \
-             cross_run covers only current-format reports.  The \
-             bench-leanness cleanup removed the same-audio (8b) and B-sweep \
-             (8c) report-only phases.  mahbot-1081 (Phase 0, additive keys): \
-             the bench now synthesizes and tests the deployed config-store \
-             wake phrase (reproducibility.wake_phrase) and surfaces the \
-             deployability verdict (top-level deployability — informational, \
-             the bench never hard-gates).  Single-voice enrollment (the \
-             enrolled speaker is ONE TTS voice with guided-prompt DSP \
-             conditioning instead of 10 rotated voices — all detection/FA \
-             numbers re-baseline, expected); the enrolled-speaker acceptance \
-             basis is a HELD-OUT WAKE-ONLY recall set (40 unseen \
-              enrolled-voice renderings, seeds 3000+ — enlarged from 16, \
-              Wilson CI reported — \
-              embedded-in-sentence detection removed); the M4/M5 \
-             reserved voices are absent from every training path and probed at \
-             unseen seeds as diagnostics; the confusable/unrelated negative \
-             pools are built bench-locally over the negative-pool styles \
-             (production's all-voice prewarm would train the reserved voices \
-             in); warm-run cost is the encoder forwards + TTS PCM cache hits \
-             (the old embedding disk cache is gone).  First run \
-             after the change pays one-time TTS synthesis for the new \
-             held-out/probe/canary clips (outside the warm budget).  The \
-             negative pool is encoded directly from raw audio (ambient noise \
-             profiles × 2 levels, owner-negative VAD-gated speech + brown-10, \
-             confusable/unrelated VAD-gated TTS) — no PCM-recipe negatives.  \
-             The deterministic easy-tier confusable FA (if present) is \
-             measured under this negative recipe.  The TEST side \
-             was expanded: 40-clip wake-only basis (seeds \
-             3000-3039), a held-out SNR envelope over it (13-cell noise \
-             matrix, in-memory), doubled confusable/unrelated detection pools \
-             (new seed bands 810+/910+ with distinct label prefixes), a \
-             three-duration silence matrix, 4 detection-only noise profiles \
-             (fresh seeds 52-55 — never the training list), wake-over-babble \
-             cells (TTS-voice overlays), an owner-negative detection block \
-             (trained-in clips, canary-style), and a cross-speaker probe \
-             scale-up (20 seeds/voice + a 5 dB cell).  All earlier bench \
-             results were purged — the v3 series starts clean."
-        ),
+        "_note": "Report-only benchmark — acceptance metrics are measured and \
+             compared against the documented limits, never hard-gated (hard \
+             assertions exist only for production-behavior contracts in the \
+             cooldown phase).  The wake-word pipeline embeds the trailing 0.76 s \
+             window through the shared Qwen3-ASR encoder (1024-dim cosine soft \
+             scores); enrollment is a prototype (L2-normalized centroid of \
+             utterance embeddings) calibrated against negative samples; detection \
+             is immediate-fire and speaker-blind.  The enrolled-speaker acceptance \
+             basis is a held-out wake-only recall set (v3: 40 unseen \
+             enrolled-voice renderings, seeds 3000+, Wilson CI reported; \
+             embedded-in-sentence detection is not measured).  total_false_accepts \
+             counts end-to-end detections over the negative corpus \
+             (confusable/unrelated/silence/noise); cross-speaker wake-word \
+             detections are reported as diagnostics in \
+             noise_overlap / false_accepts.cross_speaker_probes and do NOT count \
+             into total_false_accepts.  The confusable/unrelated negative pools \
+             are built bench-locally over the negative-pool styles; the negative \
+             pool is encoded directly from raw audio (ambient noise profiles × 2 \
+             levels, owner-negative VAD-gated speech + brown-10, \
+             confusable/unrelated VAD-gated TTS).  The TEST side: 40-clip \
+             wake-only basis (seeds 3000-3039), a held-out SNR envelope over it \
+             (13-cell noise matrix, in-memory), doubled confusable/unrelated \
+             detection pools (new seed bands 810+/910+ with distinct label \
+             prefixes), a three-duration silence matrix, 4 detection-only noise \
+             profiles (fresh seeds 52-55), wake-over-babble cells (TTS-voice \
+             overlays), an owner-negative detection block (trained-in clips, \
+             canary-style), and a cross-speaker probe scale-up (20 seeds/voice + \
+             a 5 dB cell).",
         "total_false_accepts": total_false_accepts,
         // additive: single-voice enrollment disclosure — voice
         // allocation, the guided-prompt DSP recipe, and any production
@@ -6440,10 +6320,8 @@ pub(crate) fn run_internal() {
         // Cold-start pass per-variant detail (same schema as
         // per_variant_results, but measured without consume_warmup / fresh
         // adaptive bootstrap).  Empty when the enrollment is degenerate.
-        // Measured under the deferred-burst pipeline — the cold
-        // pass exercises the burst sweep (buffer >= 68 frames) or the
-        // segment-end pass for short utterances, so these numbers reflect
-        // the fix, not the 0/20 baseline.  The enrolled-speaker
+        // The cold pass exercises the burst sweep (buffer >= 68 frames) or
+        // the segment-end pass for short utterances.  The enrolled-speaker
         // phase (enrolled_speaker section) is the acceptance-relevant
         // in-sample measurement; this section is the same pipeline over the
         // full 20-variant positive test set.
@@ -6471,9 +6349,9 @@ pub(crate) fn run_internal() {
             "accumulation_cap_samples": super::AUDIO_BUFFER_MAX,
             "audio_buffer_len_during_cooldown": cooldown_accumulation_cap_observed,
             "buffered_audio_processed_after_expiry": cooldown_buffered_audio_processed_after_expiry,
-            "note": "GATE (hard assertions, mahbot-1052 pin 4): suppressed at ~2.5s, fires at \
+            "note": "Hard assertions: suppressed at ~2.5s, fires at \
                      ~3.5s — slack margins, jitter-safe; probe sleeps are excluded from \
-                     detection_time_ms (mahbot-1052).",
+                     detection_time_ms.",
         },
         "reproducibility": reproducibility,
         // Enrolled-speaker benchmark phase (Phase 7d) — F1's 5
@@ -6491,8 +6369,7 @@ pub(crate) fn run_internal() {
 
     // ── FAPH section (env-gated additive key) ───────────────
     // Only present when MAHBOT_FAPH=1 (ran or documented-skipped).  Standard
-    // runs leave `faph_report` as None → the report surface is byte-identical
-    // to the pre-change baseline (key-set contract).
+    // runs leave `faph_report` as None → the key is absent from the report.
     let mut json = json;
     // Phase 0 additive default-run keys (added post-macro — the main json!
     // block is already at serde_json's recursion limit).
@@ -6509,44 +6386,11 @@ pub(crate) fn run_internal() {
     if let Some(v) = owner_negative_detection {
         json["owner_negative_detection"] = v;
     }
-    // Default-run wall-clock budget acknowledgment: the acceptance window is
-    // ~33-39 s; env-gated phases (FAPH / multi-seed) extend the wall clock by
-    // design, so the budget check applies only to default runs.  Measured
-    // HERE (after cross_run_summary + report assembly) so the reported wall
-    // clock includes the archive-parse window; final JSON serialization and
-    // the archive write happen just after this capture.
-    let perf_wall_clock_secs = overall_start.elapsed().as_secs_f64();
+    // Wall-clock measurement: the whole run (start → report emission),
+    // report-assembly window included, so run-time is auditable from the JSON.
+    // No budget is asserted — the measured number is the record.
     json["performance"] = serde_json::json!({
-        "wall_clock_secs": perf_wall_clock_secs,
-        // Not a pass-band array: the ~33-39 s span is the observed envelope;
-        // the acceptance criterion is the UPPER bound (~39 s) — faster runs
-        // pass (see budget_upper_bound_secs, the machine-checkable value).
-        "default_run_budget_secs": "33-39 (observed envelope; criterion is the \
-                                     upper bound — see budget_upper_bound_secs)",
-        "budget_upper_bound_secs": 39.0,
-        "budget_met": if faph_report.is_some() {
-            serde_json::Value::Null
-        } else {
-            serde_json::Value::Bool(perf_wall_clock_secs <= 39.0)
-        },
-        "note": if faph_report.is_some() {
-            "Env-gated FAPH phase ran — the ~33-39s default-run budget \
-             does not apply to this run."
-                .to_string()
-        } else if perf_wall_clock_secs > 39.0 {
-            format!(
-                "Default-run wall clock {perf_wall_clock_secs:.1}s exceeds the ~33-39s \
-                 observed envelope and its upper bound (39s) — the expanded test surface \
-                 (40-clip basis, SNR envelope, doubled pools, babble, owner-negative \
-                 detection, probe scale-up) structurally grows the default run; the \
-                 budget figure is report-only and untouched.",
-            )
-        } else {
-            format!(
-                "Default-run wall clock {perf_wall_clock_secs:.1}s within the default-run \
-                 budget (upper bound 39s).",
-            )
-        },
+        "wall_clock_secs": overall_start.elapsed().as_secs_f64(),
     });
     if let Some(faph) = faph_report {
         json["faph"] = faph;
@@ -6558,8 +6402,8 @@ pub(crate) fn run_internal() {
     println!("{json_text}");
     println!("--- BENCHMARK_JSON_END ---");
 
-    // ── Persist the report for post-run analysis (reviewer) ────
-    // The report is emitted to stdout for CI, but a hard 30-minute harness
+    // ── Persist the report for post-run analysis ────
+    // The report is emitted to stdout for CI, but a hard harness
     // timeout with end-only emission can lose it entirely.  Mirror the JSON to
     // ~/.mahbot/voice_pipeline_e2e_report.json (the same directory as the
     // benchmark lock file) so a run's data survives regardless of how the
@@ -6667,7 +6511,7 @@ pub(crate) fn run_internal() {
         noise_limit = tier_limits(BenchTier::Hard).noise,
     );
     eprintln!(
-        "           Cross-speaker diagnostics (speaker-blind, high expected): canaries {noise_overlap_detections}/{noise_overlap_total_variants}, probes {probe_fa_count}/{probe_total_variants}",
+        "           Cross-speaker diagnostics (speaker-blind): canaries {noise_overlap_detections}/{noise_overlap_total_variants}, probes {probe_fa_count}/{probe_total_variants}",
     );
     eprintln!(
         "           ───────────────────────────────────────\n\
@@ -6790,7 +6634,7 @@ pub(crate) fn run_internal() {
 
     // ── Cross-speaker speaker-blindness summary (diagnostics) ───────────
     eprintln!(
-        "         Cross-speaker diagnostics (speaker-blind — high detection expected): \
+        "         Cross-speaker diagnostics (speaker-blind): \
          canaries {noise_overlap_detections}/{noise_overlap_total_variants}, \
          probes {probe_fa_count}/{probe_total_variants}",
     );
@@ -6864,9 +6708,8 @@ pub(crate) fn run_internal() {
 // ── Fixture tests ─────────────────────────────────────────
 // Compile under `cargo test --features voice-tests` (the bench module is
 // feature-gated; `#[cfg(test)]` keeps these out of the harness=false bench
-// binary).  The old golden-hash test for `pcm_augment_enrollment_variants`
-// was removed: the 12-cell recipe is no longer pinned by production (the
-// encoder pipeline has no trainable head), so the function survives only as a
+// binary).  There is no golden-hash test for `pcm_augment_enrollment_variants`
+// (the encoder pipeline has no trainable head); the function survives as a
 // detection-diagnostics variant generator.
 
 #[cfg(test)]
