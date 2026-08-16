@@ -364,7 +364,8 @@ impl ShellState {
 
         tab_buttons.push(new_tab_btn.into());
 
-        widgets::tab_scrollable(tab_buttons, None)
+        // No on_scroll: the terminal strip never needs programmatic reveal.
+        widgets::tab_scrollable(tab_buttons, None, None::<fn(_) -> ShellMessage>)
     }
 
     // ── Update ───────────────────────────────────────────────────────

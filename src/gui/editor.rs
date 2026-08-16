@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use iced::widget::{Space, button, column, container, row, text, text_input};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{
     Alignment, Element, Length, Subscription, Task,
     keyboard::{self},
@@ -48,8 +48,46 @@ mod editor_dialog;
 
 // ── Constants ─────────────────────────────────────────────────────
 
-/// Estimated width per tab in the tab bar for programmatic scrolling.
-const ESTIMATED_TAB_WIDTH: f32 = 140.0;
+/// Estimated advance width of one glyph in JetBrains Mono at the tab-label
+/// size (12px): 0.6em × 12 = 7.2px. Tab labels render in the dashboard's
+/// default font (JetBrains Mono, see [`super::JETBRAINS_MONO`]), so every
+/// ASCII filename character contributes this width.
+const TAB_CHAR_ADVANCE: f32 = 7.2;
+
+/// Fixed non-text chrome per tab: button padding (`[8, 8]`) + the 2px row
+/// spacing to the close button + the 12px close button itself.
+const TAB_FIXED_CHROME: f32 = 16.0 + 2.0 + 12.0;
+
+/// Extra width for the dirty-indicator dot (8px) plus its 2px row spacing.
+const TAB_DIRTY_EXTRA: f32 = 8.0 + 2.0;
+
+/// Estimate the rendered width of a tab in px for scroll-into-view decisions.
+///
+/// JetBrains Mono is monospace, so char count × [`TAB_CHAR_ADVANCE`] closely
+/// approximates the label width; [`TAB_FIXED_CHROME`] covers padding, spacing
+/// and the close button, plus [`TAB_DIRTY_EXTRA`] for the dirty dot. Unlike
+/// the old flat 140px-per-tab constant (which overestimated every tab and
+/// made the cumulative left-edge error huge), per-tab estimates keep the
+/// error to a few px per tab, and the delta-based reveal in
+/// [`EditorState::scroll_to_active_tab`] never amplifies it into a
+/// right-edge clamp.
+#[allow(clippy::cast_precision_loss)]
+fn estimate_tab_width(tab: &Tab) -> f32 {
+    let name_w = tab.file_name.chars().count() as f32 * TAB_CHAR_ADVANCE;
+    let dirty = if tab.is_dirty { TAB_DIRTY_EXTRA } else { 0.0 };
+    name_w + TAB_FIXED_CHROME + dirty
+}
+
+/// Estimated content-space left edge of tab `idx`: the sum of the estimated
+/// widths of all tabs before it.
+fn estimated_tab_left(tabs: &[Tab], idx: usize) -> f32 {
+    tabs.iter().take(idx).map(estimate_tab_width).sum()
+}
+
+/// Estimated total content width of the tab strip (sum of all tab widths).
+fn estimated_content_width(tabs: &[Tab]) -> f32 {
+    tabs.iter().map(estimate_tab_width).sum()
+}
 
 /// Tick interval (keeps consistency with other dashboard pages).
 const TICK_INTERVAL_SECS: u64 = 5;
@@ -389,6 +427,9 @@ pub enum EditorMessage {
     /// Scroll position changed in the tree panel. First element is the
     /// absolute vertical scroll offset, second is the visible viewport height.
     TreeScrolled(f32, f32),
+    /// Scroll position changed in the tab bar. First element is the absolute
+    /// horizontal scroll offset, second is the visible viewport width.
+    TabBarScrolled(f32, f32),
     /// Escape key — dismiss find bar, go-to-line, quick open, tree focus, or close dialog.
     Escape,
     /// A file's contents were loaded from disk.
@@ -1429,6 +1470,17 @@ pub struct EditorState {
     tab_contents: HashMap<String, TabData>,
     /// Scrollable ID for the tab bar.
     tab_scroll_id: Id,
+    /// Current horizontal scroll offset of the tab bar (px). Updated via
+    /// `on_scroll` on the tab-bar scrollable so scroll-into-view can decide
+    /// whether the active tab is visible without waiting for a layout pass.
+    tab_scroll_x: f32,
+    /// Visible width of the tab-bar viewport (px). `None` until the first
+    /// scroll event fires — `on_scroll` only fires while the content
+    /// overflows the viewport, so short strips (and the strip before its
+    /// first render) leave this unknown. When `None`, tab reveal falls back
+    /// to aligning the estimated left edge, which iced ignores visually
+    /// while the content fits.
+    tab_viewport_w: Option<f32>,
     /// Pending close action to execute after the next successful save.
     pending_close: Option<PendingCloseAction>,
     /// Whether the workspace tabs have been loaded at least once this session.
@@ -1520,6 +1572,8 @@ impl EditorState {
             active_tab_index: 0,
             tab_contents: HashMap::new(),
             tab_scroll_id: Id::new("editor_tabs_bar"),
+            tab_scroll_x: 0.0,
+            tab_viewport_w: None,
             pending_close: None,
             session_initialized: false,
             pending_enter_dir: None,
@@ -1774,17 +1828,81 @@ impl EditorState {
     }
 
     /// Scroll the tab bar to keep the active tab visible.
+    ///
+    /// Reveal semantics (deliberately stricter than the file tree's
+    /// [`ScrollMode::ScrollIntoView`], which tolerates partial visibility at
+    /// an edge to avoid micro-jumps during wheel scrolling): a tab counts as
+    /// visible only when both estimated edges are inside the viewport, so
+    /// selecting an already-visible tab never scrolls. A clipped tab is
+    /// scrolled by exactly the overflow — the strip never overshoots past
+    /// the selected tab or lands arbitrarily at the right edge:
+    ///
+    /// * left-clipped tabs are brought flush with the viewport's left edge;
+    /// * right-clipped tabs advance by the exact overflow via `scroll_by`,
+    ///   which iced clamps to the maximum scroll offset (the old absolute
+    ///   `index × width` target was only clamped at draw time and could
+    ///   land at the far right edge);
+    /// * when the viewport width is unknown (`on_scroll` has not fired yet —
+    ///   it only fires while content overflows), fall back to aligning the
+    ///   estimated left edge. Iced ignores scroll offsets entirely while the
+    ///   content fits the viewport, so this is a visual no-op for short
+    ///   strips and a genuine reveal for overflowing ones (session restore,
+    ///   first selection).
+    ///
+    /// `tab_scroll_x` is updated synchronously so consecutive selections
+    /// within the same frame (e.g. held Ctrl+Tab) judge visibility against
+    /// the offset this call produced, before `on_scroll` fires.
     #[allow(clippy::cast_precision_loss)]
-    fn scroll_to_active_tab(&self) -> Task<EditorMessage> {
-        let index = self.active_tab_index;
-        let offset_x = index as f32 * ESTIMATED_TAB_WIDTH;
-        iced::widget::operation::scroll_to(
-            self.tab_scroll_id.clone(),
-            iced::widget::operation::AbsoluteOffset {
-                x: offset_x,
-                y: 0.0,
-            },
-        )
+    fn scroll_to_active_tab(&mut self) -> Task<EditorMessage> {
+        if self.tabs.is_empty() {
+            return Task::none();
+        }
+        let idx = self.active_tab_index.min(self.tabs.len() - 1);
+
+        let left = estimated_tab_left(&self.tabs, idx);
+        let Some(viewport_w) = self.tab_viewport_w else {
+            // Viewport width unknown — align the estimated left edge.
+            self.tab_scroll_x = left;
+            return iced::widget::operation::scroll_to(
+                self.tab_scroll_id.clone(),
+                iced::widget::operation::AbsoluteOffset { x: left, y: 0.0 },
+            );
+        };
+
+        // The whole (estimated) strip fits — every tab is fully visible
+        // regardless of any stale scroll offset.
+        if estimated_content_width(&self.tabs) <= viewport_w {
+            return Task::none();
+        }
+
+        let right = left + estimate_tab_width(&self.tabs[idx]);
+        let viewport_right = self.tab_scroll_x + viewport_w;
+
+        if left < self.tab_scroll_x {
+            // Left edge is clipped (scrolled past) — bring it flush with the
+            // viewport's left edge.
+            let delta = self.tab_scroll_x - left;
+            self.tab_scroll_x = left;
+            iced::widget::operation::scroll_by(
+                self.tab_scroll_id.clone(),
+                iced::widget::operation::AbsoluteOffset { x: -delta, y: 0.0 },
+            )
+        } else if right > viewport_right {
+            // Right edge is clipped — advance by exactly the overflow.
+            // `scroll_by` clamps the result to the max scroll offset, so the
+            // strip can never be pushed past the right end.
+            let delta = right - viewport_right;
+            let max_scroll = (estimated_content_width(&self.tabs) - viewport_w).max(0.0);
+            self.tab_scroll_x = (self.tab_scroll_x + delta).clamp(0.0, max_scroll);
+            iced::widget::operation::scroll_by(
+                self.tab_scroll_id.clone(),
+                iced::widget::operation::AbsoluteOffset { x: delta, y: 0.0 },
+            )
+        } else {
+            // Both estimated edges are inside the viewport — already fully
+            // visible, so the strip must not move.
+            Task::none()
+        }
     }
 
     /// Scroll to the tab at `new_idx` without saving tabs.
@@ -2043,6 +2161,11 @@ impl EditorState {
         self.all_workspace_files.clear();
         self.global_search_gen = 0;
         self.pending_goto = None;
+        // Tab-bar scroll state is per-workspace; reset so the next selection
+        // re-learns the viewport instead of judging visibility against the
+        // previous workspace's stale offset/width.
+        self.tab_scroll_x = 0.0;
+        self.tab_viewport_w = None;
     }
 
     /// Start creating a new item (file or directory) in the given parent directory.
@@ -2219,6 +2342,10 @@ impl EditorState {
 
             EditorMessage::TreeScrolled(scroll_y, viewport_h) => {
                 self.tree_scrolled(scroll_y, viewport_h)
+            }
+
+            EditorMessage::TabBarScrolled(scroll_x, viewport_w) => {
+                self.tab_bar_scrolled(scroll_x, viewport_w)
             }
 
             EditorMessage::TreeNavUp => self.navigate_tree_vertical(TreeNavDirection::Up),
@@ -3694,6 +3821,13 @@ impl EditorState {
         Task::none()
     }
 
+    /// Handle tab-bar-scrolled — updates scroll state of the tab bar.
+    fn tab_bar_scrolled(&mut self, scroll_x: f32, viewport_w: f32) -> Task<EditorMessage> {
+        self.tab_scroll_x = scroll_x;
+        self.tab_viewport_w = Some(viewport_w);
+        Task::none()
+    }
+
     /// Handle tree-nav-enter — opens file or expands/collapses directory.
     fn tree_nav_enter(&mut self) -> Task<EditorMessage> {
         // When global search or quick-open is active, Enter selects the
@@ -4779,7 +4913,13 @@ impl EditorState {
             tab_buttons.push(ctx_menu.into());
         }
 
-        widgets::tab_scrollable(tab_buttons, Some(self.tab_scroll_id.clone()))
+        widgets::tab_scrollable(
+            tab_buttons,
+            Some(self.tab_scroll_id.clone()),
+            Some(|viewport: scrollable::Viewport| {
+                EditorMessage::TabBarScrolled(viewport.absolute_offset().x, viewport.bounds().width)
+            }),
+        )
     }
 
     fn build_find_replace_bar(&self) -> Option<Element<'_, EditorMessage>> {

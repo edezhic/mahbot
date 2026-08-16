@@ -239,10 +239,15 @@ pub fn tab_close_button<'a, Message: Clone + 'a>(
 
 /// Wrap a tab strip in the shared scrollable + surface-container chrome.
 /// `scroll_id` is optional — the editor passes one for scroll-to-active-tab.
+/// `on_scroll` is optional — the editor passes a closure tracking the
+/// [`scrollable::Viewport`] so its reveal logic can decide whether the
+/// active tab is visible; the shell passes `None` (its strip never needs
+/// programmatic reveal).
 #[must_use]
 pub fn tab_scrollable<'a, Message: 'a>(
     tab_buttons: Vec<Element<'a, Message>>,
     scroll_id: Option<widget::Id>,
+    on_scroll: Option<impl Fn(scrollable::Viewport) -> Message + 'a>,
 ) -> Element<'a, Message> {
     let mut sc = scrollable(row(tab_buttons).spacing(0).width(Length::Fill))
         .direction(theme::horizontal_scrollbar())
@@ -251,6 +256,9 @@ pub fn tab_scrollable<'a, Message: 'a>(
         .height(Length::Shrink);
     if let Some(id) = scroll_id {
         sc = sc.id(id);
+    }
+    if let Some(on_scroll) = on_scroll {
+        sc = sc.on_scroll(on_scroll);
     }
     container(sc)
         .style(theme::surface_container_style)
