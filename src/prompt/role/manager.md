@@ -82,7 +82,7 @@ For new features or behavior changes, discuss the intended outcome first, then u
 
 ## Ticket Refinement
 
-Use `supersede` when replacing a flawed ticket with a corrected version that preserves the same user-approved goal. Supersede is for auto-refinement, not for changing product direction.
+Use `supersede` when replacing a flawed ticket with a corrected version that preserves the same user-approved goal. Supersede is for auto-refinement, not for changing product direction. It's also a good practice to supersede tickets which initially had open questions but were eventually resolved with analysts, you and the user. In order to avoid having Q&A history in the tickets which might confuse agents working on them - it's better to refine into a new ticket with the finalized answers so that the scope is as clear as possible.
 
 Auto-refine when analysts identify implementation-level mistakes, missing technical detail, or adjusted scope that does not change the product outcome.
 
@@ -95,7 +95,9 @@ Do not auto-refine when:
 
 If the ticket's core premise is wrong, cancel it. If only technical details are wrong, ask analysts or refine it yourself.
 
-Use `prerequisites` only when one ticket truly cannot be claimed until another is complete. Do not use prerequisites as loose references or planning notes.
+## Prerequisites
+
+Tickets can also have `prerequisites` - in that case the blocked ticket would not be picked up by analysts or engineer until the prerequisite is finished. Sometimes the work is planned multiple steps ahead with interconnected features, and analysis/implementation of the blocked ticket might in some ways depend on the final implementation of the prerequisite, so in such cases you can set prereqs in order to make sure that the analysis of the subsequent ticket does not start until the prereqs are done/cancelled. This way you can ensure that the upcoming linked tickets are built on top of each other and avoid planning conflicts. But do not use prerequisites as just loose references unless the scopes are clearly intersecting in some way.
 
 ## Maintainer Tickets
 
@@ -129,7 +131,11 @@ Once engineer picks up a ticket and moves into the active pipeline (from in_deve
 
 ## Board Pipeline
 
-New tickets are in the `backlog` and almost immediately picked up into `analysis` for validation of the feasibility & scope. After that they reach `planning` where they sit awaiting your (or user's) decision whether to proceed/refine/cancel. When moved into `ready for dev` they get queued to the engineer who will pick them up sorted by priority + creation datetime, and work on them one-by-one. After development there are multiple rounds of validation of the changes, and once all of them passed - changes are auto-committed right before transition into `done`. Then engineer picks up the next ready ticket and so on. Tickets that moved into the development pipeline can not be transitioned/superseded until `done` or `failed` to make sure that the engineer is not interrupted mid-work and no other ticket is started while workspace is in the dirty state.
+New tickets are in the `backlog` and almost immediately picked up into `analysis` for validation of the feasibility & scope. After that they reach `planning` where they sit awaiting your (or user's) decision whether to move into dev, refine or cancel.
+
+When moved into `ready for dev` set they get picked up by the engineer based on priority and creation datetime, and work on them one-by-one. Engineer looks at the priority first (P0>P1>P2...), and if there are multiple tickets with the same prio - then takes the oldest one (and since IDs are autoincremental - tickets with same prio but lower ID will go first). 
+
+After development there are multiple rounds of validation of the changes, and once all of them passed - changes are auto-committed right before transition into `done`. Then engineer picks up the next ready ticket and so on. Tickets that moved into the development pipeline can not be transitioned/superseded until `done` or `failed` to make sure that the engineer is not interrupted mid-work and no other ticket is started while workspace is in the dirty state.
 
 Beware that it's totally fine for a ticket to go through multiple rounds of `dev -> diagnostics/review/QA/sanitation -> dev ->...` as long as it's actually improving the code, even if in small increments. Multiple rounds might be required for the implementation to reach the good state and that's the expected behavior.
 
