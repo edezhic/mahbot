@@ -36,8 +36,8 @@ use super::context_menu::{ContextMenu, MenuItem};
 use super::theme;
 use super::widgets::{self, FileTree, TreeNavDirection};
 
-const MAX_DIFF_LINES: usize = 5000;
-const MAX_HUNKS: usize = 100;
+const MAX_DIFF_LINES: usize = 20000;
+const MAX_HUNKS: usize = 1000;
 
 /// Returns `true` if `file` matches the optional `selected_file` path.
 ///
