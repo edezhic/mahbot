@@ -3049,7 +3049,7 @@ fn mix_at_snr(speech: &[f32], noise: &[f32], snr_db: f32) -> Vec<f32> {
 enum CellMix {
     /// `mix_at_snr(pcm, noise, snr_db)` — infinite SNR returns speech unchanged.
     AtSnr { noise: Vec<f32>, snr_db: f32 },
-    /// `add_noise_white_pink(pcm, snr, White, seed_base + clip_index)`, or the
+    /// `add_white_noise(pcm, snr, seed_base + clip_index)`, or the
     /// clip unchanged when `snr_db` is None (clean cell).
     SeededWhite { snr_db: Option<f32>, seed_base: u64 },
     /// Clip `i` mixes against a `~pcm.len()`-long slice of the babble track at
@@ -3089,12 +3089,9 @@ fn run_detection_matrix(
             let mixed_pcm = match mix {
                 CellMix::AtSnr { noise, snr_db } => mix_at_snr(pcm, noise, *snr_db),
                 CellMix::SeededWhite { snr_db, seed_base } => match snr_db {
-                    Some(snr) => crate::util::add_noise_white_pink(
-                        pcm,
-                        *snr,
-                        crate::util::NoiseType::White,
-                        Some(*seed_base + i as u64),
-                    ),
+                    Some(snr) => {
+                        crate::util::add_white_noise(pcm, *snr, Some(*seed_base + i as u64))
+                    }
                     None => pcm.clone(),
                 },
                 CellMix::Babble { track, snr_db } => {

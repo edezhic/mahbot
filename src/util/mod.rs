@@ -985,14 +985,13 @@ fn unescape_c_style(input: &str) -> Option<String> {
                 b'r' => result.push('\r'),
                 b'v' => result.push('\x0b'),
                 b'0'..=b'3' => {
-                    // Octal escape: 1–3 octal digits.
+                    // Octal escape: 1–3 octal digits. The 0–7 range check
+                    // leaves '8'/'9' unconsumed so they emit as literal digits
+                    // on the next outer iteration.
                     let digits_start = i;
                     i += 1;
                     let mut digit_count = 1;
-                    while digit_count < 3 && i < bytes.len() && bytes[i].is_ascii_digit() {
-                        if !(b'0'..=b'7').contains(&bytes[i]) {
-                            break;
-                        }
+                    while digit_count < 3 && i < bytes.len() && (b'0'..=b'7').contains(&bytes[i]) {
                         i += 1;
                         digit_count += 1;
                     }
@@ -1475,20 +1474,11 @@ pub(crate) fn add_noise(pcm: &[f32], snr_db: f32, seed: u64) -> Vec<f32> {
 
 /// Apply a fixed gain to PCM audio.
 ///
-/// DETERMINISTIC — no RNG involved, unlike `randomize_volume`.
-/// The gain is `10^(gain_db / 20)`.  Negative values attenuate,
-/// positive values amplify.
+/// DETERMINISTIC — no RNG involved. The gain is `10^(gain_db / 20)`.
+/// Negative values attenuate, positive values amplify.
 pub(crate) fn apply_gain(pcm: &[f32], gain_db: f32) -> Vec<f32> {
     let amp = 10.0_f32.powf(gain_db / 20.0);
     pcm.iter().map(|&s| s * amp).collect()
-}
-
-/// Available noise types for augmentation.
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg(feature = "voice-tests")]
-pub(crate) enum NoiseType {
-    /// White noise (uniform spectral density).
-    White,
 }
 
 /// Noise colors supported by the shared augmentation recipe (ungated —
@@ -1573,7 +1563,7 @@ pub(crate) fn sample_gaussian_pair_clamped(rng: &mut impl rand::Rng) -> (f32, f3
     gaussian_pair_from_uniforms(u1, u2)
 }
 
-/// Mix white or pink noise into audio at a given SNR (dB).
+/// Mix white noise into audio at a given SNR (dB).
 ///
 /// When `rng_seed` is `Some(seed)`, uses a deterministic seeded RNG for
 /// reproducible output. When `None`, uses an entropy-seeded RNG (current
@@ -1585,7 +1575,6 @@ pub(crate) fn sample_gaussian_pair_clamped(rng: &mut impl rand::Rng) -> (f32, f3
 /// * `samples` — Clean audio PCM f32 in [-1.0, 1.0].
 /// * `snr_db` — Desired signal-to-noise ratio in dB (typical: 10-25).
 ///   Lower values = more noise. Must be finite.
-/// * `noise_type` — [`NoiseType::White`].
 /// * `rng_seed` — Optional seed for deterministic RNG. `Some(seed)` produces
 ///   reproducible noise; `None` uses entropy-based seeding.
 ///
@@ -1593,20 +1582,32 @@ pub(crate) fn sample_gaussian_pair_clamped(rng: &mut impl rand::Rng) -> (f32, f3
 ///
 /// Noisy audio PCM f32 in [-1.0, 1.0] (clamped).
 ///
-/// # Note
+/// # Note — do NOT merge with the [`NoiseColor::White`] arm of [`add_noise_color`]
 ///
 /// This is the former `tts_data_gen::add_noise` (4-arg) relocated unchanged.
-/// It is a DIFFERENT implementation from the 3-arg [`add_noise`] above
-/// (different RNG consumption and degenerate-signal behavior); both feed
-/// the bench's seeded embeddings, so they must never be merged.
+/// Despite the identical per-sample draw sequence (`rng.random::<f32>() * 2.0 - 1.0`
+/// here and in [`add_noise_color`]'s White arm — the old "different RNG
+/// consumption" justification only holds against the 3-arg pink alias), the two
+/// white paths deliberately stay separate:
+///
+/// (a) seed type: `Option<u64>` with an entropy fallback (`rand::random()`)
+///     here vs a plain `u64` in [`add_noise_color`];
+/// (b) degenerate-input handling: early passthrough on near-zero RMS
+///     (`<= 1e-10` returns `samples.to_vec()`) vs `.max(1e-10)` floors that
+///     still scale the mix;
+/// (c) scale arithmetic order — `(signal_rms / noise_rms) * 10^(-snr/20)` here
+///     vs `signal_rms * 10^(-snr/20) / noise_rms` in [`add_noise_color`], a
+///     possible 1-ulp difference;
+/// (d) this path guards `!snr_db.is_finite()` (early passthrough);
+///     [`add_noise_color`] does not.
+///
+/// The golden hashes pin [`add_noise_color`]'s White cells (NOT this
+/// report-only probe-matrix path), so changing [`add_noise_color`]'s
+/// arithmetic would break byte-exact goldens, while merging the two paths
+/// would only shift report-only probe-matrix diagnostics. Keep them separate.
 #[must_use]
 #[cfg(feature = "voice-tests")]
-pub(crate) fn add_noise_white_pink(
-    samples: &[f32],
-    snr_db: f32,
-    noise_type: NoiseType,
-    rng_seed: Option<u64>,
-) -> Vec<f32> {
+pub(crate) fn add_white_noise(samples: &[f32], snr_db: f32, rng_seed: Option<u64>) -> Vec<f32> {
     if samples.is_empty() || !snr_db.is_finite() {
         return samples.to_vec();
     }
@@ -1620,14 +1621,10 @@ pub(crate) fn add_noise_white_pink(
     };
 
     // Generate noise using the single RNG.
-    let noise: Vec<f32> = match noise_type {
-        NoiseType::White => {
-            // Uniform white noise in [-1.0, 1.0]
-            (0..samples.len())
-                .map(|_| rng.random::<f32>() * 2.0 - 1.0)
-                .collect()
-        }
-    };
+    // Uniform white noise in [-1.0, 1.0]
+    let noise: Vec<f32> = (0..samples.len())
+        .map(|_| rng.random::<f32>() * 2.0 - 1.0)
+        .collect();
 
     // Compute RMS of signal and noise
     let signal_rms = compute_rms(samples);
