@@ -297,14 +297,9 @@ pub struct ConfigData {
     /// optimal English pronunciation, or to your language's code for better
     /// results in that language.
     pub tts_language: Option<String>,
-    /// JSON-serialized wake word classifier weights for the voice assistant.
+    /// JSON-serialized wake word enrollment (v2 schema: prototype + calibration)
+    /// for the voice assistant.  Owned exclusively by the voice pipeline.
     pub wake_word_templates: Option<String>,
-    /// Enable noise suppression for voice input (default: `"true"`).
-    /// Uses the WebRTC-based `sonora-ns` denoiser before mel extraction.
-    pub voice_noise_suppression: Option<String>,
-    /// Enable RMS-based automatic gain control for voice input (default: `"true"`).
-    /// Normalises input volume before mel extraction.
-    pub voice_agc: Option<String>,
     /// Adaptive threshold k multiplier for wake word detection (default: `"2.5"`).
     /// The adaptive threshold is computed as `mean + k × std` over a running
     /// window of recent per-frame classifier scores.  Range: [1.0, 4.0].
@@ -528,8 +523,6 @@ string_config_fields! {
     tts_enabled [non_empty],
     tts_language [or(DEFAULT_TTS_LANGUAGE)],
     wake_word_templates [non_empty],
-    voice_noise_suppression [non_empty],
-    voice_agc [non_empty],
     adaptive_k [or(DEFAULT_ADAPTIVE_K)],
     voice_cache_max_size_mb [or(DEFAULT_VOICE_CACHE_MAX_SIZE_MB)],
     voice_cache_max_age_days [or(DEFAULT_VOICE_CACHE_MAX_AGE_DAYS)],
@@ -975,7 +968,7 @@ pub async fn reload_from_db() -> Result<()> {
 // transaction.
 //
 // `wake_word_templates` is intentionally **skipped** — it is owned exclusively
-// by the voice pipeline (`persist_model_state()` in `voice.rs`) and must never
+// by the voice pipeline (`persist_enrollment()` in `voice.rs`) and must never
 // be overwritten or deleted by a GUI save from any settings tab.
 pub(crate) async fn write_string_config_fields_to_db(
     tx: &turso::TxGuard<'_>,
@@ -1051,7 +1044,7 @@ pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
     //
     // NOTE: `wake_word_templates` is intentionally SKIPPED by the helper
     // below — it is managed exclusively by the voice pipeline via
-    // `persist_model_state()` which writes directly to the config_kv table and
+    // `persist_enrollment()` which writes directly to the config_kv table and
     // updates CONFIG independently.  Including it in the save loop would
     // create a dual-writer race where a save from any settings tab could
     // silently overwrite or delete freshly-enrolled templates.
@@ -1669,7 +1662,7 @@ mod tests {
     fn save_and_reload_preserves_wake_word_templates_in_config() {
         let reload = ConfigReload::const_new();
 
-        // Simulate: templates were enrolled (persist_model_state updated CONFIG).
+        // Simulate: templates were enrolled (persist_enrollment updated CONFIG).
         let template_json = r#"{"classifier":null}"#;
         let mut enrolled = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(enrolled.set_string_field("wake_word_templates", template_json));

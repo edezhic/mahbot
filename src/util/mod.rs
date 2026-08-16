@@ -19,7 +19,9 @@ use std::sync::LazyLock;
 
 use anyhow::{Context as _, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use rand::{RngExt, SeedableRng};
+use rand::RngExt;
+#[cfg(feature = "voice-tests")]
+use rand::SeedableRng;
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
@@ -1432,7 +1434,11 @@ mod unescape_c_style_tests {
 ///
 /// The canonical implementation uses 16 octaves (~3 dB/octave rolloff down
 /// to 0.03 Hz at 16 kHz) and the high-pass delta variant for DC-free output.
+///
+/// Only used by the voice-pipeline benchmark (`voice-tests` feature) — the
+/// production wake-word pipeline no longer performs PCM augmentation.
 #[allow(clippy::cast_precision_loss)]
+#[cfg(feature = "voice-tests")]
 pub(crate) fn generate_pink_noise(len: usize, mut rng: impl rand::Rng) -> Vec<f32> {
     const NUM_OCTAVES: usize = 16;
     let mut values = [0.0f32; NUM_OCTAVES];
@@ -1468,6 +1474,9 @@ pub(crate) fn generate_pink_noise(len: usize, mut rng: impl rand::Rng) -> Vec<f3
 
 /// Pink-noise alias of [`add_noise_color`] — kept for the recipe's variant-4
 /// call sites; the SNR-scaling/clamp arithmetic lives in one place.
+/// Bench-only (`voice-tests`): the production wake-word pipeline no longer
+/// performs PCM augmentation.
+#[cfg(feature = "voice-tests")]
 pub(crate) fn add_noise(pcm: &[f32], snr_db: f32, seed: u64) -> Vec<f32> {
     add_noise_color(pcm, snr_db, NoiseColor::Pink, seed)
 }
@@ -1476,13 +1485,16 @@ pub(crate) fn add_noise(pcm: &[f32], snr_db: f32, seed: u64) -> Vec<f32> {
 ///
 /// DETERMINISTIC — no RNG involved. The gain is `10^(gain_db / 20)`.
 /// Negative values attenuate, positive values amplify.
+/// Bench-only (`voice-tests`).
+#[cfg(feature = "voice-tests")]
 pub(crate) fn apply_gain(pcm: &[f32], gain_db: f32) -> Vec<f32> {
     let amp = 10.0_f32.powf(gain_db / 20.0);
     pcm.iter().map(|&s| s * amp).collect()
 }
 
-/// Noise colors supported by the shared augmentation recipe (ungated —
-/// production enrollment trains on these cells).
+/// Noise colors supported by the benchmark noise-mixing helpers
+/// (bench-only — `voice-tests` feature).
+#[cfg(feature = "voice-tests")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoiseColor {
     White,
@@ -1495,7 +1507,9 @@ pub(crate) enum NoiseColor {
 /// Mirrors [`add_noise`]'s arithmetic (unit-RMS noise scaled to the SNR
 /// target, clamped mix) with the color selector.  `Brown` is a leaky
 /// integration of white noise (DC-free-ish, low-frequency dominant).
+/// Bench-only (`voice-tests`).
 #[allow(clippy::cast_precision_loss)]
+#[cfg(feature = "voice-tests")]
 pub(crate) fn add_noise_color(pcm: &[f32], snr_db: f32, color: NoiseColor, seed: u64) -> Vec<f32> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let signal_rms = compute_rms(pcm).max(1e-10);
@@ -1662,7 +1676,10 @@ pub(crate) fn add_white_noise(samples: &[f32], snr_db: f32, rng_seed: Option<u64
 /// # Returns
 ///
 /// Speed-adjusted audio at the original `sample_rate`.
+/// Bench-only (`voice-tests`): the production wake-word pipeline no longer
+/// performs PCM augmentation.
 #[must_use]
+#[cfg(feature = "voice-tests")]
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -1757,12 +1774,14 @@ mod verify_sha256_tests {
     }
 }
 
-// ── Audio utility regression tests ──────────────────────────
+// ── Audio utility regression tests ──────────────────────────────────────────
 // Moved verbatim from voice.rs (post-1029 stranded util tests) so the util
 // module has an in-place regression net for speed perturbation, gain, noise,
-// and pink noise.
+// and pink noise.  The utilities themselves are gated behind `voice-tests`
+// (the production wake-word pipeline no longer performs PCM augmentation), so
+// the tests are gated identically.
 
-#[cfg(test)]
+#[cfg(all(test, feature = "voice-tests"))]
 mod audio_util_tests {
     use super::{add_noise, apply_gain, generate_pink_noise, speed_perturbation};
     use rand::SeedableRng;

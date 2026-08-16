@@ -352,18 +352,6 @@ pub(crate) fn test_set_state(state: u8) {
     STATE.store(ModelState::from_u8(state), Ordering::Release);
 }
 
-/// Reset [`STATE`] from [`ModelState::Loading`] back to [`ModelState::Uninit`] if the
-/// download retry loop was orphaned (e.g. the runtime dropped the task before
-/// it was ever polled).  Returns `true` if the state was actually reset.
-///
-/// This is a recovery mechanism for `wait_for_tts_styles()` in the voice
-/// pipeline: when [`STATE`] is stuck in [`ModelState::Loading`] with no download
-/// task making progress, resetting allows the next caller to retry.
-#[must_use]
-pub(crate) fn try_reset_loading_state() -> bool {
-    STATE.transition(ModelState::Loading, ModelState::Uninit)
-}
-
 /// Speak `text` with the default voice (M1).
 ///
 /// Spawns a background task that synthesizes audio, plays it via rodio

@@ -588,7 +588,7 @@ impl SettingsState {
                 let config = self.config.clone();
                 // NOTE: wake_word_templates is intentionally NOT preserved
                 // here — save_and_reload skips it, leaving the voice pipeline
-                // (persist_model_state) as the sole owner of that key.
+                // (persist_enrollment) as the sole owner of that key.
                 // This avoids the dual-writer race entirely.
                 Task::perform(
                     async move {
@@ -2242,8 +2242,7 @@ impl SettingsState {
 
         let voice_enabled = self.config.voice_enabled.as_deref() == Some("true");
         let status = crate::audio::voice::get_status();
-        let templates = crate::audio::voice::get_classifier_weights();
-        let has_templates = templates.is_some();
+        let has_enrollment = crate::audio::voice::get_enrollment().is_some();
 
         let status_text: Element<'_, SettingsMessage> = match status.clone() {
             crate::audio::voice::VoiceStatus::Disabled => Text::new("Disabled").into(),
@@ -2420,11 +2419,12 @@ impl SettingsState {
         let wake_word_row = if voice_enabled {
             if let Some(phrase) = crate::audio::voice::get_enrolled_phrase() {
                 field_row("Wake Word", Text::new(phrase).size(13).into(), None)
-            } else if has_templates {
-                // Legacy model loaded (pre-PersistedModel format) — no phrase known
+            } else if has_enrollment {
+                // V2 enrollment present but phrase unavailable (shouldn't
+                // happen — phrase is always persisted) — defensive branch.
                 field_row(
                     "Wake Word",
-                    Text::new("Legacy model (phrase unknown)").size(13).into(),
+                    Text::new("Enrolled").size(13).into(),
                     Some("Re-enroll to set a custom wake word phrase"),
                 )
             } else {

@@ -2,13 +2,15 @@
 //! local transcription (Qwen3-ASR), and text-to-speech.
 //!
 //! All audio-related modules are consolidated here under `crate::audio::*`.
+//!
+//! Wake word detection runs entirely on the shared Qwen3-ASR encoder
+//! ([`wake_word`]) — no separate embedding model, no trainable head, no
+//! AGC/NS preprocessing.
 
-pub(crate) mod audio_preprocessor;
-pub(crate) mod embedding_sequence;
 pub mod local_transcriber;
 pub mod tts;
 pub mod voice;
-pub(crate) mod wake_word_classifier;
+pub(crate) mod wake_word;
 
 use anyhow::{Context as _, Result, anyhow};
 use candle_core::Tensor;
@@ -21,14 +23,6 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::util::model_state::{AtomicModelState, ModelLoadGuard, ModelState};
-
-pub(crate) fn onnx_input_name(model: &candle_onnx::onnx::ModelProto) -> String {
-    model
-        .graph
-        .as_ref()
-        .and_then(|g| g.input.first())
-        .map_or_else(|| "input".to_string(), |i| i.name.clone())
-}
 
 pub(crate) fn onnx_output_name(model: &candle_onnx::onnx::ModelProto) -> String {
     model
@@ -50,7 +44,8 @@ pub(crate) fn extract_output(
 }
 
 /// Resolve a per-model subdirectory under the shared `~/.mahbot/models/` root
-/// (TTS, ASR, and wake-word models each use their own subdirectory).
+/// (TTS and ASR each use their own subdirectory; the wake-word pipeline has
+/// no model of its own — it shares the ASR model).
 pub(crate) fn models_subdir(name: &str) -> Option<PathBuf> {
     crate::util::models_dir().map(|dir| dir.join(name))
 }

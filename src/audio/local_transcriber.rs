@@ -137,17 +137,37 @@ const MAX_DOWNLOAD_RETRIES: u32 = 12;
 /// Global singleton handle — `None` until loaded.
 static GLOBAL_TRANSCRIBER: Mutex<Option<QwenLocalTranscriber>> = Mutex::new(None);
 
+/// Lock-free-ish shared-model slot for the wake-word pipeline.
+///
+/// Populated by [`set_transcriber_ready`] alongside [`GLOBAL_TRANSCRIBER`].
+/// The wake-word path reads this slot instead of locking the transcription
+/// context mutex — [`transcribe_file_async`] holds the inner `QwenCtx` mutex
+/// for the FULL duration of an inference (up to [`INFERENCE_TIMEOUT`]), so a
+/// per-stride `shared_model_arc()` that locked the ctx would stall the whole
+/// voice pipeline for the length of any concurrent transcription (e.g.
+/// Telegram voice-message enrichment).  Cloning an `Arc` under this short
+/// mutex is O(1) and uncontended (single writer on transcriber swap).
+static SHARED_MODEL: Mutex<Option<Arc<qwen_asr::context::QwenModel>>> = Mutex::new(None);
+
 /// Atomic state tracker to coordinate lazy initialization.
 ///
 /// Model-loading lifecycle for the transcriber (Uninit → Loading → Ready /
 /// Failed).  Shared wrapper extracted in
-/// [`crate::util::model_state::ModelState`].  Failed is terminal — a restart
-/// is required to retry (the [`transcribe_file_async`] error path leaves the
-/// caller with an icon-only audio annotation).
+/// [`crate::util::model_state::ModelState`].  Failed is terminal for
+/// transcription (the [`transcribe_file_async`] error path leaves the caller
+/// with an icon-only audio annotation); the voice pipeline's bounded
+/// auto-retry and the explicit GUI retry
+/// ([`VoiceCommand::RetryModelLoading`]) are the only recovery knobs.
 static STATE: AtomicModelState = AtomicModelState::new(ModelState::Uninit);
 
 /// Atomically store a ready transcriber and transition state to [`ModelState::Ready`].
 fn set_transcriber_ready(tc: QwenLocalTranscriber) {
+    // Populate the shared-model slot BEFORE publishing the transcriber so the
+    // wake-word path can never observe Ready without a model.  The ctx mutex
+    // is uncontended here: the transcriber has just been loaded and has not
+    // been published to GLOBAL_TRANSCRIBER yet, so no inference can be
+    // running on it.
+    *SHARED_MODEL.lock().unwrap_poison() = Some(tc.model_arc());
     *GLOBAL_TRANSCRIBER.lock().unwrap_poison() = Some(tc);
     STATE.store(ModelState::Ready, Ordering::Release);
 }
@@ -191,6 +211,21 @@ impl QwenLocalTranscriber {
     /// [`GLOBAL_TRANSCRIBER`] lock before running inference.
     fn clone_arc(&self) -> Arc<Mutex<qwen_asr::context::QwenCtx>> {
         Arc::clone(&self.ctx)
+    }
+
+    /// Clone the shared immutable [`qwen_asr::context::QwenModel`] Arc held by
+    /// this transcriber's context.
+    ///
+    /// Called once by [`set_transcriber_ready`] to populate the lock-free
+    /// [`SHARED_MODEL`] slot the wake-word pipeline reads — it is NOT called
+    /// per scoring stride (that would lock the transcription context mutex,
+    /// which `transcribe_file_async` holds for the full duration of an
+    /// inference).  The encoder weights are read-only after load, so
+    /// concurrent `Encoder::forward` calls with per-call scratch buffers are
+    /// safe; the wake-word path passes `None` for `enc_bufs` (fresh buffers)
+    /// rather than sharing the context-owned `EncoderBuffers`.
+    fn model_arc(&self) -> Arc<qwen_asr::context::QwenModel> {
+        Arc::clone(&self.ctx.lock().unwrap_poison().model)
     }
 }
 
@@ -841,7 +876,9 @@ pub async fn try_init_from_cache() -> bool {
 /// it is **not** deferred until the first voice message.
 ///
 /// No-op when the transcriber is already ready/loading, or when a previous
-/// attempt failed (Failed is terminal — a restart is required to retry).
+/// attempt failed (Failed is terminal for the automatic lifecycle — only the
+/// voice pipeline's bounded auto-retry or the explicit GUI retry
+/// ([`retry_init`]) re-attempts).
 /// Panic-safe: a panic inside the spawned chain transitions STATE to
 /// [`ModelState::Failed`] instead of leaving it stuck in Loading.
 pub fn spawn_background_init() {
@@ -891,6 +928,51 @@ pub fn spawn_background_init_if_enabled() {
 /// True if the local transcriber is loaded and ready for use.
 pub fn is_loaded() -> bool {
     STATE.is_ready()
+}
+
+/// True if the local transcriber failed to load (terminal `Failed` state).
+///
+/// Used by the voice pipeline's model gating to surface
+/// [`VoiceStatus::ModelError`] when the shared ASR model is unavailable.
+pub fn is_failed() -> bool {
+    STATE.load(Ordering::Acquire) == ModelState::Failed
+}
+
+/// Clone the shared Qwen3-ASR model Arc for encoder reuse by the wake-word
+/// pipeline.
+///
+/// Returns `None` when the transcriber is not loaded (or still loading).
+/// The returned model shares the exact same loaded weights as transcription —
+/// the wake-word pipeline performs no separate download or model handling.
+///
+/// Reads the lock-free [`SHARED_MODEL`] slot populated by
+/// [`set_transcriber_ready`] — it NEVER touches the transcription context
+/// mutex, which [`transcribe_file_async`] holds for the full duration of an
+/// inference (up to [`INFERENCE_TIMEOUT`]).  The wake-word stride path calls
+/// this on every scoring step; locking the ctx there would block the whole
+/// voice pipeline behind any concurrent transcription.
+pub fn shared_model_arc() -> Option<Arc<qwen_asr::context::QwenModel>> {
+    SHARED_MODEL.lock().unwrap_poison().clone()
+}
+
+/// Retry initialisation after a terminal `Failed` state.
+///
+/// The default transcriber lifecycle treats `Failed` as terminal — no
+/// automatic re-attempt.  Two explicit recovery knobs exist: the voice
+/// pipeline's bounded periodic auto-retry (at most
+/// [`MAX_AUTO_MODEL_RETRY_CYCLES`](crate::audio::voice::MAX_AUTO_MODEL_RETRY_CYCLES)
+/// cycles per session) and the GUI retry button
+/// ([`VoiceCommand::RetryModelLoading`]), which calls this directly and
+/// bypasses the auto-retry budget.  This function resets `Failed` → `Uninit`
+/// and re-runs the background init chain (load-or-download).  Returns `true`
+/// if a retry was initiated; `false` when the state was not `Failed` or the
+/// claim was lost.
+pub fn retry_init() -> bool {
+    if !STATE.transition(ModelState::Failed, ModelState::Uninit) {
+        return false;
+    }
+    spawn_background_init();
+    true
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────

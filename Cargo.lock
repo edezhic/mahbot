@@ -4083,7 +4083,6 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sha2",
- "sonora-ns",
  "strum 0.27.2",
  "tempfile",
  "tokenizers",
@@ -5686,9 +5685,9 @@ dependencies = [
 
 [[package]]
 name = "qwen-asr"
-version = "0.9.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e14e4df24c9f37fdcb45e4ffb50fb3851ecad3ba27bde2d83c5bb4001e61696a"
+checksum = "6f2d649ea1585c574469353ac89a891d53548c7b9422034f8e1b14743632606f"
 dependencies = [
  "libc",
 ]
@@ -6751,21 +6750,6 @@ dependencies = [
  "web-sys",
  "windows-sys 0.61.2",
  "x11rb",
-]
-
-[[package]]
-name = "sonora-fft"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cca158c4b6ace2cb3f4fa8084842da2b4ffcc25cf8ac4366675aea541aabc6af"
-
-[[package]]
-name = "sonora-ns"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc549f9bca1d60e7a2483e4949e9649467c5cca371a4341e44aaf24dae338fd4"
-dependencies = [
- "sonora-fft",
 ]
 
 [[package]]

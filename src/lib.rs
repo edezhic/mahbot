@@ -1242,10 +1242,6 @@ impl ChatResponse {
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 32_000;
 
 // ── Voice pipeline shared constants ─────────────────────────────────────────
-
-/// Dimensionality of the per-frame embedding vectors (96-dim).
-pub(crate) const EMBEDDING_DIM: usize = 96;
-
 /// Operation metadata for per-request LLM stats logging (`llm_requests` table
 /// in logs.db). Attached by call sites with agent/ticket context; requests
 /// without metadata (test doubles, ad-hoc calls) are not logged.
