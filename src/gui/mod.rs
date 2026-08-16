@@ -239,8 +239,8 @@ pub enum Message {
     /// Triggered by the shutdown token (self-update restart, SIGTERM/SIGINT).
     Shutdown,
     /// The graceful-drain window began (first signal / window-close /
-    /// self-update). Shows the "shutting down…" banner; iced::exit is
-    /// deferred until the drain completes (the token fires).
+    /// self-update). Draining disables input; iced::exit is deferred until
+    /// the drain completes (the token fires).
     DrainStarted,
     /// Window close button pressed — persist position and size before exiting.
     CloseRequested(window::Id),
@@ -523,8 +523,8 @@ pub struct Dashboard {
     /// subscription, which must not be mistaken for an exit request. If the
     /// update fails, this flag makes the GUI run its own checkpoint + exit.
     exit_requested_during_update: bool,
-    /// Graceful-drain window active: the window stays open with a
-    /// "shutting down…" banner + disabled input until the drain completes.
+    /// Graceful-drain window active: the window stays open with input
+    /// disabled until the drain completes.
     draining: bool,
     logs_state: logs::LogsState,
     board_state: board::BoardState,
@@ -1059,16 +1059,31 @@ impl Dashboard {
                     Task::none()
                 } else {
                     // First window-close begins the GRACEFUL drain: the
-                    // window stays open with the "shutting down…"
-                    // banner; the drain-watch fires the token when no
-                    // in-flight work remains (or force-cancels at the cap).
-                    // save_and_exit is deferred until Message::Shutdown.
+                    // window stays open with input disabled; the drain-watch
+                    // fires the token when no in-flight work remains (or
+                    // force-cancels at the cap). save_and_exit is deferred
+                    // until Message::Shutdown.
                     crate::shutdown::drain_begin();
                     Task::none()
                 }
             }
             Message::Shutdown => self.save_and_exit(),
             Message::DrainStarted => {
+                // Restart toast: only when the update build/install has
+                // finished and finalize is shutting the service down — a
+                // plain window close or signal during a mid-build update
+                // (InProgress but not yet finalizing) must not show a false
+                // "restarting" toast. `!self.draining` is defensive
+                // single-emission protection.
+                if !self.draining
+                    && self.update_status == UpdateStatus::InProgress
+                    && crate::self_update::update_is_finalizing()
+                {
+                    self.toasts.push(Toast::new(
+                        "Update complete — restarting…".to_string(),
+                        ToastKind::Warning,
+                    ));
+                }
                 self.draining = true;
                 Task::none()
             }
@@ -1226,6 +1241,13 @@ impl Dashboard {
                 self.update_status = UpdateStatus::InProgress;
                 // Save window state before update (synchronous).
                 self.persist_window_state();
+                // Transient confirmation that the build/install has kicked off —
+                // condensed from the mode-specific Telegram update notifications
+                // ("building from source…" / "installing from crates.io…").
+                self.toasts.push(Toast::new(
+                    "Update started — building/installing…".to_string(),
+                    ToastKind::Success,
+                ));
                 Task::perform(
                     async {
                         crate::self_update::execute_update()
@@ -1238,8 +1260,9 @@ impl Dashboard {
             }
             Message::UpdateResult(result) => {
                 // execute_update() calls exit(0) on success, so we never
-                // actually reach this branch for the Ok case. The window
-                // closes as the only success signal to the user.
+                // actually reach this branch for the Ok case. The update
+                // toasts (start + restart) are the success signals; the
+                // window closing is the final confirmation.
                 if let Err(err) = result {
                     self.update_status = UpdateStatus::Available;
                     self.toasts
@@ -1645,30 +1668,6 @@ impl Dashboard {
         };
 
         let body = column![
-            if self.draining {
-                container(
-                    row![
-                        text("🛑 Shutting down… waiting for in-flight work")
-                            .size(13)
-                            .color(theme::TEXT_PRIMARY),
-                    ]
-                    .align_y(Alignment::Center),
-                )
-                .width(Length::Fill)
-                .padding([6, 12])
-                .style(move |_theme: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(theme::STATUS_WARNING)),
-                    border: iced::Border {
-                        radius: 0.0.into(),
-                        width: 0.0,
-                        color: iced::Color::TRANSPARENT,
-                    },
-                    ..container::Style::default()
-                })
-                .into()
-            } else {
-                widget_helpers::empty_stack_placeholder()
-            },
             row![sidebar, content]
                 .width(Length::Fill)
                 .height(Length::Fill),
@@ -2038,8 +2037,8 @@ fn registry_update_subscription() -> impl futures_util::Stream<Item = Message> {
 /// token fires (self-update restart, SIGTERM/SIGINT), and
 /// [`Message::DrainStarted`] when the graceful-drain window begins (first
 /// signal / window-close / self-update) — the token does NOT fire on the
-/// first signal, so the GUI needs a separate drain signal to show the
-/// "shutting down…" banner while the drain runs.
+/// first signal, so the GUI needs a separate drain signal to disable input
+/// while the drain runs.
 fn shutdown_subscription() -> impl futures_util::Stream<Item = Message> {
     use iced::futures::channel::mpsc;
     iced::stream::channel(1, |mut output: mpsc::Sender<Message>| async move {

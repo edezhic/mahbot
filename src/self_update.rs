@@ -747,8 +747,8 @@ async fn execute_registry_update() -> Result<()> {
 /// 1. Graceful drain (the FULL drain, same as window close — NOT fast-cancel).
 ///    In-flight agents complete their current round; the drain-watch task fires
 ///    the global token when no in-flight agents or orchestrator calls remain
-///    (or force-cancels at the 10-min cap). The GUI stays open with a
-///    "shutting down…" state; the GUI exit path waits
+///    (or force-cancels at the 10-min cap). The GUI stays open with input
+///    disabled; the GUI exit path waits
 ///    ([`update_is_finalizing`]) instead of exiting, so this sequence cannot
 ///    be aborted by a window close or SIGINT racing the checkpoint. No failure
 ///    transitions with 'service shutting down' comments fire — agents that
