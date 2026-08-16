@@ -18,6 +18,7 @@ use std::collections::HashSet;
 
 use super::ToastMessage;
 use super::common::MAX_INPUT_CHARS;
+use super::context_menu::{ContextMenu, MenuItem};
 use super::role_menu::{RoleMenu, RoleMenuItem};
 use super::theme;
 use super::widgets::PickOption;
@@ -159,6 +160,10 @@ pub enum HomeMessage {
     ProjectWorkspaceRefreshed(String, Option<String>),
     /// Clear chat button pressed — reset session and display.
     ClearChat,
+    /// Copy a chat message's raw markdown content to the clipboard.
+    /// Carries the exact stored/transmitted text (original media markers
+    /// included), not the rendered view.
+    CopyMessage(String),
     /// Switch user's active role. Carries (user_name, new_role).
     SwitchRole(String, Role),
     /// Chat history cleared successfully — divider inserted.
@@ -731,6 +736,21 @@ impl HomeState {
                         ))
                         .width(Length::FillPortion(3));
 
+                    // Per-bubble context menu: right-clicking the bubble offers
+                    // copying the raw markdown content (the exact stored text
+                    // with original media markers). Wrapping only the bubble —
+                    // not the align_bubble row — keeps the spacer beside it a
+                    // fall-through: spacer/empty-space right-clicks reach the
+                    // outer "Clear chat" menu in gui/mod.rs instead.
+                    let bubble: Element<'_, HomeMessage> = ContextMenu::new(
+                        bubble,
+                        vec![MenuItem::new(
+                            "Copy message".into(),
+                            HomeMessage::CopyMessage(msg.content.clone()),
+                        )],
+                    )
+                    .into();
+
                     align_bubble(bubble, is_user)
                 })
                 .collect();
@@ -1203,6 +1223,11 @@ impl HomeState {
                     "Session cleared".to_string(),
                 )));
                 Task::batch([self.refresh_history(), toast])
+            }
+            HomeMessage::CopyMessage(content) => {
+                // Raw markdown copy — no toast, matching the editor's
+                // copy-path context-menu actions.
+                iced::clipboard::write(content)
             }
             HomeMessage::SwitchRole(user, role) => {
                 // Intercepted by Dashboard — no-op in Home

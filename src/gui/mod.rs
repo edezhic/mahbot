@@ -501,11 +501,11 @@ pub struct Dashboard {
     selected_workspace_name: Option<String>,
     /// Currently selected user name (for impersonation). Persisted in window state.
     selected_user_name: Option<String>,
-    /// Cached selected role for the current user, used by the role switcher
-    /// context menu to visually indicate which role is active.
+    /// Cached selected role for the current user — the composer role dropdown
+    /// uses it to visually indicate which role is active.
     selected_user_role: Option<Role>,
     /// Cached role pool for the current user — the switchable roles shown in
-    /// the chat context menu.
+    /// the composer role dropdown.
     selected_user_roles: Vec<Role>,
     /// Whether a self-update is available or in progress.
     /// Controls button visibility/disabled state.
@@ -930,7 +930,7 @@ impl Dashboard {
     }
 
     /// Load the selected user's active role + role pool into the cached
-    /// role-switcher state (Home context-menu pool guard and 'current'
+    /// role-switcher state (composer role dropdown pool guard and 'current'
     /// marker). Called at boot, on user switch, and after Settings edits
     /// that touch the selected user's role or pool.
     fn refresh_selected_user_role_cache(&self) -> Task<Message> {
@@ -985,10 +985,10 @@ impl Dashboard {
                     intercept_task = Some(self.select_workspace(ws));
                 }
                 // A pool edit or active-role change in Settings leaves the
-                // Dashboard's cached role/pool stale (context-menu guard and
-                // 'current' marker) — refresh them for the selected user.
-                // Workspace changes are handled by the UpdateWorkspace arm
-                // above and need no role/pool refresh.
+                // Dashboard's cached role/pool stale (composer role dropdown
+                // guard and 'current' marker) — refresh them for the selected
+                // user. Workspace changes are handled by the UpdateWorkspace
+                // arm above and need no role/pool refresh.
                 users::UsersMessage::PoolEditResult(Ok(()))
                 | users::UsersMessage::RoleUpdateResult(Ok(())) => {
                     intercept_task = Some(self.refresh_selected_user_role_cache());
@@ -1138,9 +1138,9 @@ impl Dashboard {
                     ]);
                 }
                 // Intercept SwitchRole: user selected a new role from the
-                // chat context menu — persist it and show a toast. The menu
-                // is built from the cached pool, so the pool check is
-                // synchronous against that same list.
+                // composer role dropdown — persist it and show a toast. The
+                // dropdown is built from the cached pool, so the pool check
+                // is synchronous against that same list.
                 if let home::HomeMessage::SwitchRole(ref user_name, ref role) = msg {
                     if !self.selected_user_roles.contains(role) {
                         return Task::done(Message::Home(home::HomeMessage::Toast(
@@ -1603,41 +1603,18 @@ impl Dashboard {
                     )
                     .map(Message::Home);
                 let sidebar = ticket_sidebar(&self.board_state);
-                // Wrap chat area in a right-click context menu with "Clear chat" and role switcher.
-                let mut chat_items: Vec<context_menu::MenuItem<Message>> =
+                // Wrap chat area in a right-click context menu with
+                // "Clear chat". Per-bubble ContextMenus (Copy message,
+                // see home.rs) capture bubble right-clicks; this outer
+                // menu is the fallback for empty-space right-clicks.
+                let home_view: Element<'_, Message> = ContextMenu::new(
+                    home_view,
                     vec![context_menu::MenuItem::new(
                         "Clear chat".into(),
                         Message::Home(home::HomeMessage::ClearChat),
-                    )];
-
-                // Add role switcher section if a user is selected and has a
-                // non-empty role pool. The current role is disabled/grayed out
-                // in the menu. Labels are derived from the canonical
-                // role_info().display_label to prevent drift from the single
-                // source of truth.
-                if self.selected_user_name.is_some() && !self.selected_user_roles.is_empty() {
-                    chat_items.push(context_menu::MenuItem::disabled("── Role ──".into()));
-                    let user_name = self.selected_user_name.clone().unwrap_or_default();
-                    let pool = self.selected_user_roles.clone();
-                    for role in pool {
-                        let label = crate::role::role_info(&role).display_label;
-                        let is_current = self.selected_user_role.as_ref() == Some(&role);
-                        if is_current {
-                            chat_items.push(context_menu::MenuItem::disabled(label.to_string()));
-                        } else {
-                            chat_items.push(context_menu::MenuItem::new(
-                                label.to_string(),
-                                Message::Home(home::HomeMessage::SwitchRole(
-                                    user_name.clone(),
-                                    role,
-                                )),
-                            ));
-                        }
-                    }
-                }
-
-                let home_view: Element<'_, Message> =
-                    ContextMenu::new(home_view, chat_items).into();
+                    )],
+                )
+                .into();
                 // Wrap sidebar in a right-click context menu with "Archive done & cancelled" option.
                 let sidebar: Element<'_, Message> = ContextMenu::new(
                     sidebar,

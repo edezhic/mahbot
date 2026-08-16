@@ -46,7 +46,7 @@ use super::theme;
 pub struct MenuItem<Message> {
     /// Display label.
     pub label: String,
-    /// Action to fire when clicked. `None` for disabled items (e.g. current role indicator).
+    /// Action to fire when clicked. `None` for disabled items (rendered in muted style).
     pub action: Option<Message>,
 }
 

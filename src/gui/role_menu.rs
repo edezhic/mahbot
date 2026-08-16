@@ -587,8 +587,8 @@ where
                 shell.capture_event();
             }
             // Right-click anywhere or Escape dismisses too — the right-click
-            // capture also prevents the chat context menu (which has its own
-            // role-switcher section) from stacking on top of the open list.
+            // capture also prevents the chat "Clear chat" context menu from
+            // stacking on top of the open list.
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right))
             | Event::Keyboard(iced::keyboard::Event::KeyPressed {
                 key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
