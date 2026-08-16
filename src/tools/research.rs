@@ -1959,8 +1959,8 @@ fn unclaim_coder_round(state: &mut ResearchState, round_key: usize) {
 /// folder targeting the current gap list. Blocks on the coder (never hard
 /// timed out — a long coder may overrun the round deadline; the loop-top
 /// checks then skip the following gap rounds, fail-open). The coder's response
-/// text is NOT inserted into the report (prototypes list only); failures and
-/// skips are marked in the report, never silent.
+/// text is NOT inserted into the report; failures and skips are marked in the
+/// report, never silent.
 #[allow(clippy::too_many_arguments)]
 async fn run_coder_round(
     job_id: &str,
@@ -3313,40 +3313,6 @@ async fn run_deep_research(
         }
     }
     render_raw_reports(&mut report, &state.acc.raw_reports, "##");
-    // Prototypes section: files the coder-in-loop left in the per-run folder.
-    // The folder is temporary — swept after the delivery grace. A resume after
-    // an OS temp cleanup recreates the folder with no prototypes (fail-open).
-    if !state.coder_rounds_done.is_empty() {
-        let files = crate::research_cleanup::run_root_files(job_id).await;
-        let _ = writeln!(report);
-        let _ = writeln!(report, "## Prototypes");
-        if files.is_empty() {
-            // Distinguish a coder round that wrote nothing from prototypes
-            // lost to an OS temp cleanup between boots: a resumed run with
-            // completed coder rounds and an empty folder means the OS cleaned
-            // temp while the daemon was down (ensure_run_root recreates the
-            // folder empty; the completed rounds never re-run). A fresh run's
-            // empty folder is just "wrote nothing".
-            if resume {
-                let _ = writeln!(
-                    report,
-                    "None found in the per-run folder (prototypes may have been lost \
-                     if the OS cleaned the temp dir between boots)."
-                );
-            } else {
-                let _ = writeln!(report, "No prototypes were written by the coder rounds.");
-            }
-        } else {
-            let _ = writeln!(
-                report,
-                "Per-run folder: `{run_root_str}` — TEMPORARY, swept after the delivery \
-                 grace. Files produced by the coder rounds:"
-            );
-            for f in &files {
-                let _ = writeln!(report, "- {f}");
-            }
-        }
-    }
     // RunStats pin: a resumed run's counts undercount the pre-crash segment —
     // the summary carries a one-line best-effort note instead of pretending.
     // Keyed off the job's boot-resume retry count (the real resume signal) —

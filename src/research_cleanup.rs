@@ -86,24 +86,6 @@ pub(crate) async fn ensure_run_root(job_id: &str) -> PathBuf {
     tokio::fs::canonicalize(&path).await.unwrap_or(path)
 }
 
-/// Relative file paths under the run root — the report's prototype list.
-/// A missing/empty folder yields an empty list (boot resume after an OS temp
-/// cleanup loses prototypes — fail-open, noted in the report).
-pub(crate) async fn run_root_files(job_id: &str) -> Vec<String> {
-    let root = run_root_path(job_id);
-    let mut out: Vec<String> = list_files(&root)
-        .await
-        .into_iter()
-        .filter_map(|p| {
-            p.strip_prefix(&root)
-                .ok()
-                .map(|r| r.to_string_lossy().into_owned())
-        })
-        .collect();
-    out.sort();
-    out
-}
-
 // ── Results archive (results.md) ──────────────────────────────────────────
 
 /// Write the run's archived result to `<storage_root>/research/results/{run_id}.md`

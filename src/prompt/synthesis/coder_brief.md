@@ -28,7 +28,6 @@ only need to serve the research (they are NOT merged into any repository).
 Rules:
 - Prefer the smallest artifact that would meaningfully inform the research:
   a script, a small program, a benchmark, a data table, a config sample.
-- Name files clearly and mention them in your final summary so the research
-  report can list them.
+- Name files clearly so their purpose is obvious.
 - Do not try to solve the whole question — target the listed gaps.
 - If nothing useful can be prototyped, say so plainly instead of fabricating.
