@@ -18,6 +18,7 @@ use std::collections::HashSet;
 
 use super::ToastMessage;
 use super::common::MAX_INPUT_CHARS;
+use super::role_menu::{RoleMenu, RoleMenuItem};
 use super::theme;
 use super::widgets::PickOption;
 
@@ -831,7 +832,40 @@ impl HomeState {
             )
             .style(theme::icon_button_style(false))
             .padding(3);
-        controls.push(role_btn.into());
+
+        // ── Role dropdown (overlay, above the composer) ────────────
+        // The role list floats above the whole widget tree via
+        // `RoleMenu`'s overlay (Widget::overlay + Overlay trait) anchored
+        // to the role button — opening it no longer shifts the chat
+        // layout. Items carry the same roles/selection as before; the
+        // current role is disabled with a checkmark, and selecting a role
+        // publishes SwitchRole, which the Dashboard intercepts and persists
+        // (it also sends RoleMenuClosed). Outside-click / Escape dismissal
+        // is handled by the popup itself via RoleMenuClosed.
+        let role_btn: Element<'_, HomeMessage> = if !role_pool.is_empty() {
+            let user = self.selected_user.clone().unwrap_or_default();
+            let items: Vec<RoleMenuItem<HomeMessage>> = role_pool
+                .iter()
+                .map(|role| {
+                    let is_current = active_role.as_ref() == Some(role);
+                    RoleMenuItem::new(
+                        *role,
+                        is_current,
+                        (!is_current).then(|| HomeMessage::SwitchRole(user.clone(), *role)),
+                    )
+                })
+                .collect();
+            RoleMenu::new(
+                role_btn,
+                items,
+                self.role_menu_open,
+                HomeMessage::RoleMenuClosed,
+            )
+            .into()
+        } else {
+            role_btn.into()
+        };
+        controls.push(role_btn);
 
         let mic_btn = button(lucide::mic::<iced::Theme, iced::Renderer>().size(14).color(
             if mic_busy {
@@ -864,51 +898,6 @@ impl HomeState {
                 grey_on_empty: true,
             },
         );
-
-        // ── Role dropdown panel (in-flow, above the composer) ────
-        let role_panel: Element<'_, HomeMessage> = if self.role_menu_open && !role_pool.is_empty() {
-            let user = self.selected_user.clone().unwrap_or_default();
-            let items: Vec<Element<'_, HomeMessage>> = role_pool
-                .iter()
-                .map(|role| {
-                    let (fg, _) = theme::role_badge_color_for(role);
-                    let icon = theme::role_icon(role).size(13).color(fg);
-                    let is_current = active_role.as_ref() == Some(role);
-                    let label = text(crate::role::role_info(role).display_label)
-                        .size(13)
-                        .color(if is_current {
-                            theme::TEXT_PRIMARY
-                        } else {
-                            theme::TEXT_SECONDARY
-                        });
-                    let check: Element<'_, HomeMessage> = if is_current {
-                        lucide::check::<iced::Theme, iced::Renderer>()
-                            .size(12)
-                            .color(theme::ACCENT)
-                            .into()
-                    } else {
-                        Space::new().width(12).into()
-                    };
-                    let content = row![icon, label, check]
-                        .spacing(6)
-                        .align_y(Alignment::Center);
-                    button(content)
-                        .on_press_maybe(
-                            (!is_current).then_some(HomeMessage::SwitchRole(user.clone(), *role)),
-                        )
-                        .style(theme::menu_item_button_style())
-                        .width(Length::Fill)
-                        .padding(5)
-                        .into()
-                })
-                .collect();
-            container(Column::with_children(items).spacing(2).padding(5))
-                .style(theme::surface_container_style)
-                .width(Length::Fixed(170.0))
-                .into()
-        } else {
-            Space::new().height(0).into()
-        };
 
         // ── Recording popup (stop + send / stop + discard) ───────
         // While transcribing, the popup stays visible as a passive
@@ -959,7 +948,7 @@ impl HomeState {
         };
 
         // ── Full layout ──────────────────────────────────────────
-        column![chat_area, role_panel, recording_popup, input_area,]
+        column![chat_area, recording_popup, input_area,]
             .align_x(Alignment::End)
             .width(Length::Fill)
             .height(Length::Fill)

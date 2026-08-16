@@ -521,13 +521,6 @@ pub fn icon_button_style(
     transparent_button_style(HOVER_STRONG, ACCENT_DIM, 6.0, disabled)
 }
 
-/// Dropdown menu item button: transparent background, hover highlight.
-#[must_use = "button style factory returns a style closure"]
-pub fn menu_item_button_style()
--> impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style {
-    transparent_button_style(HOVER, HOVER_STRONG, 4.0, false)
-}
-
 /// Tab-button style for editor/shell tab bars: active tabs use [`BG_ELEVATED`],
 /// hovered [`HOVER`], otherwise [`BG_SURFACE`], with a zero-radius border.
 pub fn tab_button_style(
