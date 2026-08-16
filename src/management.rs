@@ -201,11 +201,20 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
 }
 
 /// True when the ticket is not in the expected phase — moved externally, or
-/// failed-closed on a missing row / DB error: the job is completed and the
-/// caller should bail. (The sibling [`phase_changed_and_clear_assignment`]
+/// failed-closed on a missing row / DB error: the stage job is completed and
+/// the caller should bail. (The sibling [`phase_changed_and_clear_assignment`]
 /// clears `assigned_to` instead, for the single-agent re-dispatch rounds.)
+///
+/// Three guard sites: the analysis round ([`maybe_escalate_analysis`],
+/// [`finalize_analysis_round`]), the verifier round ([`dispatch_verifiers`]),
+/// and the resume path pre-dispatch ([`resume_analysis_round`],
+/// [`resume_verifier_round`], [`resume_stage_round`]).
 #[must_use]
-async fn bail_if_phase_moved(ticket_id: &str, expected: TicketPhase, job_id: &str) -> bool {
+async fn complete_job_and_bail_if_phase_moved(
+    ticket_id: &str,
+    expected: TicketPhase,
+    job_id: &str,
+) -> bool {
     if !is_ticket_in_phase(ticket_id, expected).await {
         complete_ticket_stage_job(job_id).await;
         return true;
@@ -222,7 +231,7 @@ async fn bail_if_phase_moved(ticket_id: &str, expected: TicketPhase, job_id: &st
 /// Returns `false` when the ticket is still in the expected phase (no action
 /// taken).
 ///
-/// All call sites ([`dispatch_engineer`], [`dispatch_sanitation`],
+/// All call sites ([`finalize_engineer_round`], [`finalize_sanitation_round`],
 /// [`dispatch_diagnostics`]) have previously set `assigned_to` via
 /// [`claim_ticket_in_workspace`] or [`claim_diagnostics`], so clearing it
 /// here is essential to prevent a stale assignment from blocking re-dispatch.
@@ -1566,7 +1575,6 @@ async fn finalize_engineer_round(
     )
     .await;
 
-    // Completion tx AFTER the board transition+comment (ordering contract).
     complete_ticket_stage_job(job_id).await;
 }
 
@@ -2190,7 +2198,6 @@ async fn finalize_sanitation_round(
         }
     }
 
-    // Completion tx AFTER the board transition+comment (ordering contract).
     complete_ticket_stage_job(job_id).await;
 }
 
@@ -3342,7 +3349,7 @@ async fn maybe_escalate_analysis(
     {
         // Re-check the phase before spending the second batch — the ticket
         // may have been moved externally while the first batch ran.
-        if bail_if_phase_moved(&ticket.id, TicketPhase::Analysis, job_id).await {
+        if complete_job_and_bail_if_phase_moved(&ticket.id, TicketPhase::Analysis, job_id).await {
             return false;
         }
         if resume {
@@ -3610,17 +3617,14 @@ async fn process_analyst_verdicts(ws: &Workspace, ticket: &Ticket, results: &[Pa
 /// [`process_analyst_verdicts`]: a pre-existing drain skips the verdict
 /// processing (no new work during drain); any drain leaves the job
 /// launched — mid-process for boot resume (no transition), after the
-/// transition with the ticket in Planning (completed at boot). The
-/// completion tx runs after the transition+comment (ordering contract); a
-/// phase-moved round completes the job instead — either way the caller is
-/// done.
+/// transition with the ticket in Planning (completed at boot).
 async fn finalize_analysis_round(
     ws: &Workspace,
     ticket: &Ticket,
     results: &[ParallelVerdict],
     job_id: &str,
 ) {
-    if bail_if_phase_moved(&ticket.id, TicketPhase::Analysis, job_id).await {
+    if complete_job_and_bail_if_phase_moved(&ticket.id, TicketPhase::Analysis, job_id).await {
         return;
     }
     if crate::shutdown::aborting() {
@@ -4212,7 +4216,7 @@ async fn resume_ticket_stage_round(stage: String, job_id: String, ticket: Ticket
 /// escalation only when roster size == 3 (matches analysis_escalation_needed),
 /// then re-process verdicts through the existing process_analyst_verdicts.
 async fn resume_analysis_round(job_id: &str, ticket: Ticket, ws: Workspace) {
-    if bail_if_phase_moved(&ticket.id, TicketPhase::Analysis, job_id).await {
+    if complete_job_and_bail_if_phase_moved(&ticket.id, TicketPhase::Analysis, job_id).await {
         return;
     }
     let Ok(slots) = load_ticket_stage_slots(job_id).await else {
@@ -4282,7 +4286,7 @@ async fn record_reviewed_base_after_review(
 /// reviewer count is never frozen: it is recomputed from the live working-tree
 /// diff at every dispatch, so a resumed round re-derives it like any other.
 async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: VerifierInfo) {
-    if bail_if_phase_moved(&ticket.id, vi.active_phase, job_id).await {
+    if complete_job_and_bail_if_phase_moved(&ticket.id, vi.active_phase, job_id).await {
         return;
     }
     let Ok(slots) = load_ticket_stage_slots(job_id).await else {
@@ -4301,7 +4305,7 @@ async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: 
         true,
     )
     .await;
-    if bail_if_phase_moved(&ticket_arc.id, vi.active_phase, job_id).await {
+    if complete_job_and_bail_if_phase_moved(&ticket_arc.id, vi.active_phase, job_id).await {
         return;
     }
     if crate::shutdown::aborting() {
@@ -4322,7 +4326,7 @@ async fn resume_stage_round(job_id: &str, ticket: Ticket, ws: Workspace, kind: S
         StageRoundKind::Engineer => TicketPhase::InDevelopment,
         StageRoundKind::Sanitation => TicketPhase::InSanitation,
     };
-    if bail_if_phase_moved(&ticket.id, phase, job_id).await {
+    if complete_job_and_bail_if_phase_moved(&ticket.id, phase, job_id).await {
         return;
     }
     let task = job_task(job_id).await;
@@ -4351,8 +4355,7 @@ async fn job_task(job_id: &str) -> String {
 /// logs on resume, unlike the silent engineer/sanitation wrappers; preserved).
 /// The drain guard inside [`process_verifier_verdicts`] already logged the
 /// cut-short (the outer re-log is the pre-existing double-log, kept as-is);
-/// the job stays status='launched' for boot resume. Completion tx after the
-/// board transition+comment (ordering contract).
+/// the job stays status='launched' for boot resume.
 async fn finalize_verifier_round(
     ws: &Workspace,
     ticket: &Ticket,
@@ -4510,7 +4513,7 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
         false,
     )
     .await;
-    if bail_if_phase_moved(&ticket.id, vi.active_phase, &job_id).await {
+    if complete_job_and_bail_if_phase_moved(&ticket.id, vi.active_phase, &job_id).await {
         return;
     }
 
