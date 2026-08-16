@@ -3248,8 +3248,13 @@ fn map_key_to_action(
                 (key::Named::Backspace, true, false, false) => Some(EditorAction::DeleteWordBack),
                 (key::Named::Delete, true, false, false) => Some(EditorAction::DeleteWordForward),
 
-                // Enter
-                (key::Named::Enter, false, false, false) => Some(EditorAction::Enter),
+                // Enter / Shift+Enter → insert a newline. Shift+Enter mirrors
+                // the chat-composer/board-comment convention where Enter
+                // submits and Shift+Enter inserts a newline. The find/replace
+                // bar has its own Shift+Enter binding (FindPrev) handled at the
+                // subscription level in editor.rs; that path is unaffected.
+                // (Alt+Enter and platform-mod+Enter stay unbound below.)
+                (key::Named::Enter, false, _, false) => Some(EditorAction::Enter),
 
                 // Space — defensive: some platforms may deliver space as Named
                 (key::Named::Space, false, false, false) => Some(EditorAction::Insert(' ')),
