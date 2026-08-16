@@ -607,6 +607,7 @@ async fn download_file(client: &reqwest::Client, file: &ModelFile, dest: &Path) 
 /// 1 min small files) and the custom user-agent is kept. Connect-phase
 /// fail-fast is intentionally absent.
 fn download_client() -> Result<reqwest::Client> {
+    crate::util::http::install_ring_provider();
     reqwest::Client::builder()
         .user_agent("mahbot/0.3.0 (qwen-asr model downloader)")
         .build()

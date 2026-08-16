@@ -71,19 +71,27 @@ async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # Async runtime
-tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "process", "signal", "sync", "fs"] }
-tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
+tokio = { version = "1.50", default-features = false, features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", default-features = false }
 
 # Native GUI dashboard
-iced = { version = "0.14", default-features = false, features = ["tokio", "wgpu", "markdown", "advanced", "image"] }
+iced = { version = "0.14", default-features = false, features = ["tokio", "wgpu", "markdown", "advanced", "image-without-codecs"] }
 iced_fonts = { version = "0.3", default-features = false, features = ["lucide"] }
 iced_anim = "0.3"
 iced_selection = { version = "0.5", features = ["markdown"] }
 iced_term = "0.8.0"
 
 # HTTP / WebSocket client
-reqwest = { version = "0.12", default-features = false, features = ["http2", "json", "stream", "rustls-tls", "multipart"] }
+# 0.13: `rustls-tls` feature is gone; the ring TLS provider is installed
+# explicitly via the direct `rustls` dep (rustls-no-provider path — no
+# aws-lc-rs/cmake C build). The `query` feature is required by the Telegram
+# integration's HTTP query call.
+reqwest = { version = "0.13", default-features = false, features = ["http2", "json", "stream", "multipart", "query", "rustls-no-provider"] }
+# Ring crypto provider for reqwest's rustls-no-provider path. Installed before
+# any HTTP client is created (see `util::http::install_ring_provider`). Root
+# certificates come from the OS trust store (macOS Keychain) via
+# rustls-platform-verifier; bundled roots are deliberately not used.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 # Embed files into the binary
 rust-embed = "8"
@@ -105,7 +113,7 @@ anyhow = "1.0"
 # Self-replace for cross-platform binary swap during self-update
 self-replace = "1.5"
 
-rodio = { version = "0.19", default-features = false, features = ["wav"] }
+rodio = { version = "0.22", default-features = false, features = ["playback", "hound"] }
 
 # Utils
 base64 = "0.22"
@@ -125,7 +133,7 @@ turso = { version = "=0.7.2", default-features = false, features = ["fts"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 
 # Regex
-regex = "1.10"
+regex = "1.13"
 
 # Fast file/content search for the tools
 fff-search = "0.10"
@@ -149,21 +157,21 @@ strum = { version = "0.27", features = ["derive"] }
 
 # Embeddings
 tokenizers = "0.22"
-candle-core = "0.10.2"
+candle-core = "0.11.0"
 # ONNX runtime for the voice pipeline (mel-spectrogram, embeddings, wake word,
-# TTS). candle-onnx-mahbot is the MahBot fork of candle-onnx 0.10.2 — canonical
+# TTS). candle-onnx-mahbot is the MahBot fork of candle-onnx 0.11.0 — canonical
 # source: vendor/candle-onnx/ (patch list: vendor/candle-onnx/README.md; fork
 # releases are cut from there, so a bump here must match a fork publish).
 # Exact-pinned like the other behavior-critical deps (turso, tree-sitter).
 # `vendor/candle-onnx` stays excluded from mahbot's published crate via the
 # `exclude` list in [package].
-candle-onnx-mahbot = { version = "=0.10.2" }
+candle-onnx-mahbot = { version = "=0.11.0" }
 
 # Neural voice activity detection (replaces RMS-based VAD)
-earshot = "1.1"
+earshot = "1.2"
 
 # Audio capture for voice assistant
-cpal = "0.15"
+cpal = "0.18"
 
 # Audio decoding for local transcriber input (OGG/Opus → raw PCM)
 ogg = "0.9"
@@ -172,11 +180,11 @@ opus-decoder = "0.1"
 # MP3 decoding
 minimp3 = "0.5"
 
-imagesize = "0.14.0"
-
 # Image decode/re-encode for reference-image compression (already compiled via
-# iced's image feature; promoted to a direct dependency for the loader)
-image = "0.25"
+# iced's image-without-codecs feature; promoted to a direct dependency for the
+# loader). Codec support is deliberately trimmed to PNG/JPEG/WebP only — gif
+# and bmp are NOT supported anywhere (routing, MIME mapping, decode).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 # Tree-sitter for code navigation
 # The core and the bash grammar are exact-pinned: the read-only shell guard
@@ -204,15 +212,15 @@ libc = "0.2"
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_IO"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-candle-nn = { version = "0.10.2", features = ["accelerate"] }
+candle-nn = { version = "0.11.0", features = ["accelerate"] }
 qwen-asr = { version = "0.11.0", default-features = false, features = ["blas", "vdsp"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-candle-nn = "0.10.2"
+candle-nn = "0.11.0"
 qwen-asr = { version = "0.11.0", default-features = false }
 
 [dev-dependencies]
-http = "1.4"
+http = "1.5"
 serial_test = "3"
 
 [[bench]]

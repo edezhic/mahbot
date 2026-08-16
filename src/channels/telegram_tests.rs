@@ -893,8 +893,9 @@ fn attachment_content_format_rules() {
             "{filename}: should use [Document:]"
         );
     }
-    // image extensions produce [IMAGE:]
-    for ext in ["png", "jpg", "jpeg", "gif", "webp", "bmp"] {
+    // image extensions produce [IMAGE:] (PNG/JPEG/WebP only — gif/bmp are
+    // deliberately not routed as images)
+    for ext in ["png", "jpg", "jpeg", "webp"] {
         let filename = format!("photo.{ext}");
         let c = format_attachment_content(
             IncomingAttachmentKind::Photo,
@@ -912,14 +913,34 @@ fn attachment_content_format_rules() {
         None,
     );
     assert_eq!(c, "[IMAGE:/tmp/workspace/image.jpg]");
-    // Document kind + no extension + mime_type "image/jpeg" → [IMAGE:] (mime fallback)
-    let c = format_attachment_content(
-        IncomingAttachmentKind::Document,
-        "image_no_ext",
-        std::path::Path::new("/tmp/workspace/image_no_ext"),
-        Some("image/jpeg"),
-    );
-    assert_eq!(c, "[IMAGE:/tmp/workspace/image_no_ext]");
+    // Document kind + no extension + jpeg MIME types → [IMAGE:] (mime
+    // fallback). Both the canonical image/jpeg and the legacy image/jpg
+    // alias are admitted.
+    for mime in ["image/jpeg", "image/jpg"] {
+        let c = format_attachment_content(
+            IncomingAttachmentKind::Document,
+            "image_no_ext",
+            std::path::Path::new("/tmp/workspace/image_no_ext"),
+            Some(mime),
+        );
+        assert_eq!(c, "[IMAGE:/tmp/workspace/image_no_ext]", "{mime}");
+    }
+    // gif/bmp MIME types are NOT routed as images (mime fallback whitelist) —
+    // they fall through to [Document:]. The legacy image/x-ms-bmp alias is
+    // excluded too.
+    for mime in ["image/gif", "image/bmp", "image/x-ms-bmp"] {
+        let c = format_attachment_content(
+            IncomingAttachmentKind::Document,
+            "anim_no_ext",
+            std::path::Path::new("/tmp/workspace/anim_no_ext"),
+            Some(mime),
+        );
+        assert!(!c.contains("[IMAGE:"), "{mime}: should not get [IMAGE:]");
+        assert!(
+            c.starts_with("[Document:"),
+            "{mime}: should use [Document:]"
+        );
+    }
     // Audio kind produces [AUDIO:] marker regardless of extension
     let c = format_attachment_content(
         IncomingAttachmentKind::Audio,
@@ -976,12 +997,17 @@ fn attachment_multimodal_and_helpers() {
         "photo.png",
         "photo.jpg",
         "photo.jpeg",
-        "photo.gif",
         "photo.webp",
-        "photo.bmp",
         "PHOTO.PNG",
     ] {
         assert!(crate::util::has_extension(
+            std::path::Path::new(p),
+            super::IMAGE_EXTENSIONS
+        ));
+    }
+    // gif/bmp are NOT image extensions anymore (codec trim)
+    for p in ["photo.gif", "photo.bmp"] {
+        assert!(!crate::util::has_extension(
             std::path::Path::new(p),
             super::IMAGE_EXTENSIONS
         ));

@@ -1452,7 +1452,7 @@ fn convert_and_send_audio_to_pipeline<T, F>(
 // Error callback for microphone streams — a fn item so it can be shared
 // across every build_input_stream call.
 #[allow(clippy::needless_pass_by_value)]
-fn mic_error(err: cpal::StreamError) {
+fn mic_error(err: cpal::Error) {
     error!("Microphone stream error: {err}");
     // The stream error callback runs on the audio thread; the main pipeline
     // will observe the mic stream ending and set MicDisconnected.
@@ -1466,14 +1466,14 @@ fn build_int_stream<T, F>(
     channels: u16,
     sample_rate: u32,
     convert: F,
-) -> Result<cpal::Stream, cpal::BuildStreamError>
+) -> Result<cpal::Stream, cpal::Error>
 where
     T: cpal::SizedSample,
     F: Fn(&T) -> f32 + Send + 'static,
 {
     let tx = sample_tx.clone();
     device.build_input_stream::<T, _, _>(
-        config,
+        *config,
         move |data, _| {
             convert_and_send_audio_to_pipeline(&tx, data, channels, sample_rate, &convert);
         },
@@ -1497,16 +1497,18 @@ fn start_microphone() -> Result<(mpsc::Receiver<Vec<f32>>, cpal::Stream)> {
 
     info!(
         "Microphone: {} ({:?}, {} Hz, {} ch)",
-        device.name().unwrap_or_else(|_| "unknown".to_string()),
+        device
+            .description()
+            .map_or_else(|_| "unknown".to_string(), |d| d.name().to_string()),
         config.sample_format(),
-        config.sample_rate().0,
+        config.sample_rate(),
         config.channels()
     );
 
-    let sample_rate = config.sample_rate().0;
+    let sample_rate = config.sample_rate();
     let channels = config.channels();
     let sample_tx = Arc::new(tx);
-    let stream_config: cpal::StreamConfig = config.clone().into();
+    let stream_config: cpal::StreamConfig = config.into();
 
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => build_int_stream::<f32, _>(
@@ -2116,43 +2118,6 @@ async fn route_to_agent(text: String) {
 
 // Voice pipeline background task
 
-/// Safe wrapper around `Option<cpal::Stream>` to ensure `Send` on macOS.
-///
-/// `cpal::Stream` is conservatively marked `!Send` on macOS because of
-/// `NotSendSyncAcrossAllPlatforms(PhantomData<*mut ()>)`, but the
-/// underlying CoreAudio handles are actually thread-safe. We use
-/// `unsafe impl Send` to assert this (a common pattern in cpal usage).
-/// # Safety
-///
-/// `cpal::Stream` is conservatively marked `!Send` on macOS because of
-/// `NotSendSyncAcrossAllPlatforms(PhantomData<*mut ()>)`, but the
-/// underlying CoreAudio handles are actually thread-safe across send
-/// boundaries. The CoreAudio AudioUnit and audio queue can be stopped
-/// and dropped from any thread. The property listener callback
-/// (`AudioObjectPropertyListener`) uses a `Box<dyn FnMut()` internally,
-/// but this callback is only invoked from the CoreAudio event thread
-/// while the stream is running, and the stream is always dropped from
-/// the same async runtime that created it. Cross-thread moves only
-/// happen when the future is passed between tokio tasks (e.g. via
-/// `spawn_cancellable`), which always happens before the stream is
-/// started or after it is stopped. This is a well-known pattern in the
-/// cpal ecosystem — many audio applications use `unsafe impl Send`
-/// for `cpal::Stream` on macOS with this justification.
-#[derive(Default)]
-struct SendMicStream(Option<cpal::Stream>);
-
-impl SendMicStream {
-    fn take(&mut self) -> Option<cpal::Stream> {
-        self.0.take()
-    }
-
-    fn set(&mut self, stream: cpal::Stream) {
-        self.0 = Some(stream);
-    }
-}
-
-unsafe impl Send for SendMicStream {}
-
 // Adaptive threshold state
 
 /// Tracks running mean and standard deviation of recent per-frame soft scores
@@ -2383,7 +2348,7 @@ impl DetectionInstrumentation {
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct PipelineCtx {
     mic_rx: Option<mpsc::Receiver<Vec<f32>>>,
-    mic_stream: SendMicStream,
+    mic_stream: Option<cpal::Stream>,
     is_listening: bool,
     is_recording: bool,
     /// Mic-button-initiated recording (Home composer). While active, wake-word
@@ -2554,7 +2519,7 @@ impl PipelineCtx {
     pub(crate) fn new() -> Self {
         Self {
             mic_rx: None,
-            mic_stream: SendMicStream::default(),
+            mic_stream: None,
             is_listening: false,
             is_recording: false,
             manual_recording: false,
@@ -2915,7 +2880,7 @@ impl PipelineCtx {
             match start_microphone() {
                 Ok((rx, stream)) => {
                     self.mic_rx = Some(rx);
-                    self.mic_stream.set(stream);
+                    self.mic_stream = Some(stream);
                     self.is_listening = true;
                     set_status(VoiceStatus::Listening);
                     info!("Voice pipeline: started listening");
@@ -3127,7 +3092,7 @@ impl PipelineCtx {
             match start_microphone() {
                 Ok((rx, stream)) => {
                     self.mic_rx = Some(rx);
-                    self.mic_stream.set(stream);
+                    self.mic_stream = Some(stream);
                 }
                 Err(e) => {
                     warn!("Failed to start recording mic: {e}");

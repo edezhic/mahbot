@@ -9,6 +9,27 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+/// Install the ring crypto provider for rustls.
+///
+/// reqwest 0.13's `rustls-no-provider` feature leaves the process without a
+/// default `CryptoProvider`; building any `reqwest::Client` without one fails
+/// at build time ("No rustls crypto provider is configured"). Every client
+/// factory must call this before constructing a client — including tests and
+/// benches that build clients directly.
+///
+/// Idempotent: a process-local `OnceLock` guarantees the underlying
+/// `install_default` runs at most once. The `AlreadyInstalled` error is also
+/// ignored as a belt-and-suspenders — it can only surface if another code
+/// path already installed a provider, in which case the process already has
+/// one. Root certificates come from the OS trust store (macOS Keychain) via
+/// rustls-platform-verifier — bundled roots are deliberately not used.
+pub(crate) fn install_ring_provider() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// HTTP client shared by [`crate::tools::video_gen::VideoGenTool`],
 /// [`crate::tools::web_search::WebSearchTool`], and
 /// [`crate::providers::transcribe::MediaTranscriber`] — all call their
@@ -250,11 +271,12 @@ pub fn image_gen_http_client() -> &'static reqwest::Client {
 /// behaviour at runtime.
 #[must_use]
 pub fn build_http_client(timeout: Duration) -> reqwest::Client {
+    install_ring_provider();
     reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(Duration::from_secs(10))
         .build()
-        .expect("Failed to build HTTP client (TLS initialization failure)")
+        .expect("Failed to build HTTP client (rustls TLS initialization failure)")
 }
 
 /// Build an HTTP client for large model downloads: `total_timeout` per
@@ -269,6 +291,7 @@ pub fn build_http_client(timeout: Duration) -> reqwest::Client {
 /// call sites' values are load-bearing (their retry loops wrap downloads in
 /// matching outer `tokio::time::timeout`) and must not be unified.
 pub(crate) fn build_download_client(total_timeout: Duration) -> anyhow::Result<reqwest::Client> {
+    install_ring_provider();
     reqwest::Client::builder()
         .timeout(total_timeout)
         .connect_timeout(Duration::from_secs(30))
@@ -463,5 +486,17 @@ mod tests {
 
         let result = check_response(resp, "test").await;
         assert!(result.is_ok(), "expected success for 200 status");
+    }
+
+    #[test]
+    fn client_build_installs_ring_provider() {
+        // reqwest 0.13's rustls-no-provider panics at Client build time if no
+        // rustls crypto provider is installed. Every client factory must
+        // install the ring provider first — this exercises the factory path
+        // (and the idempotent double-install, since the process-global is
+        // already set by earlier factories in the same test binary).
+        install_ring_provider();
+        let _client = build_http_client(Duration::from_secs(5));
+        let _ = build_download_client(Duration::from_secs(60)).expect("download client builds");
     }
 }

@@ -345,6 +345,7 @@ fn registry_http_client() -> Result<&'static reqwest::Client> {
     static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
+            crate::util::http::install_ring_provider();
             reqwest::Client::builder()
                 .user_agent(format!("mahbot/{VERSION} (self-update check)"))
                 .timeout(Duration::from_secs(15))

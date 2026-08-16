@@ -734,10 +734,11 @@ pub(crate) const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "avi", "webm
 pub(crate) const TRANSCRIBABLE_VIDEO_EXTENSIONS: &[&str] = &["mp4", "mpeg", "mov", "webm"];
 
 /// Recognized image file extensions for video_edit image inputs (reference
-/// images and frame anchors), matching the provider-declared formats. This is
-/// narrower than the Telegram routing list (`telegram::IMAGE_EXTENSIONS`,
-/// which also accepts gif/bmp) — those are routable attachments but not
-/// provider-accepted edit inputs.
+/// images and frame anchors), matching the provider-declared formats. It
+/// matches the Telegram routing list (`telegram::IMAGE_EXTENSIONS`) for the
+/// PNG/JPEG/WebP codecs (the only locally decodable ones) and additionally
+/// admits heic/heif, which are passed through to the provider unmangled
+/// (never locally decoded).
 pub(crate) const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "heic", "heif"];
 
 /// Daemon-owned subdir under the system temp dir where inbound Telegram
@@ -789,9 +790,7 @@ pub(crate) fn mime_for_extension(path: &std::path::Path) -> &'static str {
     {
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
         Some("webp") => "image/webp",
-        Some("bmp") => "image/bmp",
         Some("heic") => "image/heic",
         Some("heif") => "image/heif",
         Some("mp4") => "video/mp4",

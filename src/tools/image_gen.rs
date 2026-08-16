@@ -609,25 +609,26 @@ fn resolve_aspect_ratio(aspect_ratio: Option<&str>, images: &[String]) -> String
 
 /// Detect the closest canonical aspect ratio from an image file.
 ///
-/// Reads only the file header (no full decode) via the `imagesize` crate.
-/// Returns `None` if the file cannot be read, is an unsupported format, or
+/// Reads only the file header (no full decode) via the `image` crate's
+/// magic-byte dimension detection. Returns `None` if the file cannot be
+/// read, is an unsupported format (only PNG/JPEG/WebP are compiled in), or
 /// has zero dimensions.
 fn detect_aspect_ratio_from_image(path: &Path) -> Option<&'static str> {
-    let size = imagesize::size(path).ok()?;
-    find_closest_aspect_ratio(size.width, size.height)
+    let (width, height) = image::image_dimensions(path).ok()?;
+    find_closest_aspect_ratio(width, height)
 }
 
 /// Find the closest canonical aspect ratio string for the given dimensions.
 ///
 /// Returns `None` when either dimension is zero.
 #[allow(clippy::cast_precision_loss)]
-fn find_closest_aspect_ratio(width: usize, height: usize) -> Option<&'static str> {
+fn find_closest_aspect_ratio(width: u32, height: u32) -> Option<&'static str> {
     // Guard against zero dimensions (would produce ∞ or panic at division)
     if width == 0 || height == 0 {
         return None;
     }
 
-    let ratio = width as f64 / height as f64;
+    let ratio = f64::from(width) / f64::from(height);
 
     // Find the closest canonical ratio via `min_by`. When two ratios are
     // equally close, the first in declaration order wins (a practical
@@ -1006,12 +1007,12 @@ mod tests {
     /// Helper: convert a f64 ratio into integer width/height that produce
     /// the same ratio (within rounding). Used to construct test inputs.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn ratio_tuple_from_f64(ratio: f64) -> (usize, usize) {
+    fn ratio_tuple_from_f64(ratio: f64) -> (u32, u32) {
         // Scale to avoid integer division rounding errors:
         // multiply by a large power of 10 then reduce.
         let scale = 10_000_000.0;
-        let w = (ratio * scale).round() as usize;
-        let h = scale as usize;
+        let w = (ratio * scale).round() as u32;
+        let h = scale as u32;
         (w, h)
     }
 

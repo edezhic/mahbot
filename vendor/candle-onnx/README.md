@@ -1,15 +1,15 @@
 # candle-onnx-mahbot
 
-Fork of [`candle-onnx`](https://github.com/huggingface/candle) 0.10.2 (ONNX
+Fork of [`candle-onnx`](https://github.com/huggingface/candle) 0.11.0 (ONNX
 support for [Candle](https://github.com/huggingface/candle)) maintained by the
 MahBot project. The canonical source lives in the
 [`mahbot`](https://github.com/edezhic/mahbot) repository under
 `vendor/candle-onnx/`; fork releases are cut from that directory. Upstream
-candle-onnx 0.10.2 cannot run MahBot's ONNX voice-pipeline models
+candle-onnx 0.11.0 cannot run MahBot's ONNX voice-pipeline models
 (mel-spectrogram, embeddings, wake word, TTS); this fork carries the patches
 that fix those root causes.
 
-## Patch set (delta vs upstream candle-onnx 0.10.2)
+## Patch set (delta vs upstream candle-onnx 0.11.0)
 
 - **Implicit dtype promotion** for binary ops (`Add`/`Sub`/`Mul`/`Div`,
   `MatMul`, `Gemm`, `Where`, `Conv` bias, `ConstantOfShape`, `Concat`,

@@ -73,6 +73,7 @@ impl OpenAiCompatibleProvider {
     /// timeout). Connection pool, connect timeout, and extra headers are
     /// identical in both.
     fn build_client(&self, timeout: Option<Duration>) -> Client {
+        crate::util::http::install_ring_provider();
         let mut builder = Client::builder().connect_timeout(Duration::from_secs(10));
         if let Some(timeout) = timeout {
             builder = builder.timeout(timeout);

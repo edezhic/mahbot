@@ -1,8 +1,8 @@
 [package]
 name = "candle-onnx-mahbot"
-version = "0.10.2"
+version = "0.11.0"
 edition = "2021"
-description = "ONNX support for Candle — MahBot fork of candle-onnx 0.10.2 with voice-pipeline fixes (implicit dtype promotion, Max/Softplus/Reciprocal/LayerNormalization ops, Pad edge/constant modes, PReLU scalar slope, F32 initializer normalization)"
+description = "ONNX support for Candle — MahBot fork of candle-onnx 0.11.0 with voice-pipeline fixes (implicit dtype promotion, Max/Softplus/Reciprocal/LayerNormalization ops, Pad edge/constant modes, PReLU scalar slope, F32 initializer normalization)"
 repository = "https://github.com/edezhic/mahbot"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
@@ -15,8 +15,8 @@ license = "MIT OR Apache-2.0"
 name = "candle_onnx"
 
 [dependencies]
-candle-core = "0.10.2"
-candle-nn = "0.10.2"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
 prost = "0.14.1"
 
 [build-dependencies]

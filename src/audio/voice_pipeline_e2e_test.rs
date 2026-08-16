@@ -4030,6 +4030,7 @@ fn faph_download_file(
     // async context is entered; Handle::try_current is checked first so a
     // runtime already present on this thread is reused rather than nested).
     let fut = async {
+        crate::util::http::install_ring_provider();
         let client = reqwest::Client::new();
         let resp = client
             .get(url)

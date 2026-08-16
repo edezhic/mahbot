@@ -319,10 +319,17 @@ impl TelegramAttachmentKind {
 }
 
 /// Recognized image file extensions for Telegram receive-path routing.
-/// Deliberately wider than `crate::util::IMAGE_EXTENSIONS` (video_edit's
-/// provider-accepted list): gif/bmp arrive as Telegram images but are not
-/// accepted edit inputs.
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+/// PNG/JPEG/WebP only — gif/bmp are deliberately NOT routed as images
+/// anywhere (codec support is trimmed; see the image dependency's feature
+/// list). GIF-picker animations arrive as `video`-kind attachments and take
+/// the video path instead.
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
+
+/// MIME prefixes routed as images by the MIME fallback in
+/// [`format_attachment_content`]. Mirrors [`IMAGE_EXTENSIONS`]: only the
+/// PNG/JPEG/WebP MIME types are admitted, so gif/bmp (including the legacy
+/// `image/x-ms-bmp` alias) never route as images.
+const IMAGE_MIME_PREFIXES: &[&str] = &["image/png", "image/jpeg", "image/jpg", "image/webp"];
 
 /// Format a sender label for display: `@username` if a username is present,
 /// otherwise the display name (first_name, or `"unknown"` as ultimate fallback).
@@ -355,8 +362,10 @@ fn format_attachment_content(
     local_path: &Path,
     mime_type: Option<&str>,
 ) -> String {
+    // MIME fallback mirrors the extension whitelist: only the PNG/JPEG/WebP
+    // MIME types route as images (no gif/bmp image support anywhere).
     let is_image = crate::util::has_extension(local_path, IMAGE_EXTENSIONS)
-        || mime_type.is_some_and(|m| m.starts_with("image/"));
+        || mime_type.is_some_and(|m| IMAGE_MIME_PREFIXES.iter().any(|p| m.starts_with(p)));
     let is_video = crate::util::is_video_extension(local_path)
         || mime_type.is_some_and(|m| m.starts_with("video/"));
     match kind {
@@ -829,8 +838,11 @@ impl TelegramChannel {
 
     /// # Panics
     ///
-    /// Panics if `reqwest::Client::build()` fails — typically due to TLS/OpenSSL
-    /// initialization failure. Check your system's TLS library installation.
+    /// Panics if `reqwest::Client::build()` fails — with reqwest 0.13's
+    /// `rustls-no-provider` TLS stack this happens when no rustls crypto
+    /// provider is installed. `util::http::install_ring_provider` installs
+    /// the ring provider before the client is built (the TLS stack is
+    /// rustls/ring — OpenSSL is not involved).
     #[must_use]
     pub fn new(bot_token: String) -> Self {
         Self::new_with(

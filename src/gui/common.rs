@@ -4,6 +4,7 @@ use iced::Task;
 use iced::widget::text_editor;
 use std::future::Future;
 use std::pin::Pin;
+use tokio::sync::broadcast;
 
 /// Maximum characters allowed in a chat message / comment input.
 pub(crate) const MAX_INPUT_CHARS: usize = 100_000;
@@ -341,11 +342,11 @@ impl UndoStack {
 
 /// Shared broadcast-stream producer skeleton used by the chat and logs pages.
 ///
-/// Subscribes to `source` (skipped when it already has >100 receivers), wraps
-/// the receiver in a [`BroadcastStream`], and forwards events through `emit` —
-/// called with `Some(item)` for received items and `None` for lagged slots.
-/// `emit` decides how to publish (awaited send vs. try_send), so each page
-/// keeps its own backpressure semantics.
+/// Subscribes to `source` (skipped when it already has >100 receivers) and
+/// forwards events through `emit` — called with `Some(item)` for received
+/// items and `None` for lagged slots — via a direct `broadcast::Receiver`
+/// recv loop. `emit` decides how to publish (awaited send vs. try_send), so
+/// each page keeps its own backpressure semantics.
 pub(crate) fn broadcast_stream_producer<Msg, T, E>(
     capacity: usize,
     source: &'static std::sync::OnceLock<tokio::sync::broadcast::Sender<T>>,
@@ -364,7 +365,7 @@ where
     iced::stream::channel(
         capacity,
         move |mut output: iced::futures::channel::mpsc::Sender<Msg>| async move {
-            let Some(rx) = source.get().and_then(|tx| {
+            let Some(mut rx) = source.get().and_then(|tx| {
                 if tx.receiver_count() > 100 {
                     None
                 } else {
@@ -374,16 +375,17 @@ where
                 return;
             };
 
-            let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);
+            // Direct broadcast receiver loop matching the removed
+            // tokio-stream BroadcastStream's semantics: Ok(event) →
+            // emit(Some(event)), Lagged → emit(None) (gap in the stream),
+            // Closed → end.
             loop {
-                match tokio_stream::StreamExt::next(&mut stream).await {
-                    Some(Ok(event)) => emit(&mut output, Some(event)).await,
-                    Some(Err(
-                        tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_n),
-                    )) => {
+                match rx.recv().await {
+                    Ok(event) => emit(&mut output, Some(event)).await,
+                    Err(broadcast::error::RecvError::Lagged(_n)) => {
                         emit(&mut output, None).await;
                     }
-                    None => break,
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         },

@@ -46,7 +46,7 @@ use crate::util::model_state::{AtomicModelState, ModelState};
 use anyhow::{Context, Result, anyhow};
 use candle_core::{Device, Tensor};
 use candle_onnx::simple_eval;
-use rodio::{OutputStream, OutputStreamHandle, Sink};
+use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -169,32 +169,22 @@ pub enum TtsDownloadEvent {
 /// Broadcast channel for TTS download progress events (GUI subscription).
 pub static DOWNLOAD_EVENTS: OnceLock<broadcast::Sender<TtsDownloadEvent>> = OnceLock::new();
 
-/// Wrapper around rodio's audio output that is `Send` on all platforms.
+/// Wrapper around rodio's audio output.
 ///
-/// `rodio::OutputStream` is `!Send` on macOS because of a phantom
-/// `NotSendSyncAcrossAllPlatforms` marker, but the underlying CoreAudio
-/// handles are actually thread-safe. This uses `unsafe impl Send` to
-/// assert thread-safety, following the same pattern as `SendMicStream`
-/// in `voice.rs`.
+/// rodio 0.22 splits output into a `MixerDeviceSink` (owns the cpal stream)
+/// and a `Mixer` handle (a cheap `Arc` clone). Players are created from the
+/// mixer via `Player::connect_new(&mixer)` on async tasks; the sink itself is
+/// created once at startup and never touched again. Both members are `Send +
+/// Sync` — the cpal `Stream` inside `MixerDeviceSink` dropped its
+/// `NotSendSyncAcrossAllPlatforms` phantom marker in cpal 0.17, so the
+/// wrapper auto-derives both traits and the historical `unsafe impl
+/// Send`/`Sync` are no longer needed (a future rodio/cpal bump that
+/// re-introduces a non-`Send` type would fail to compile at the
+/// `static AUDIO_OUTPUT` below — the correct loud failure).
 struct AudioOutputWrapper {
-    _stream: OutputStream,
-    handle: OutputStreamHandle,
+    _sink: MixerDeviceSink,
+    mixer: rodio::mixer::Mixer,
 }
-
-// SAFETY: `OutputStream` is conservatively `!Send` on macOS due to a
-// `PhantomData<*mut ()>` marker. The underlying CoreAudio device handles
-// are thread-safe for our usage: we create the stream once at startup and
-// only use the `OutputStreamHandle` (which is `Send`) to create sinks from
-// async tasks. The `OutputStream` itself is never moved after initialization.
-// This is a well-known pattern in the cpal/rodio ecosystem.
-unsafe impl Send for AudioOutputWrapper {}
-
-// SAFETY: `OutputStream` is conservatively `!Sync` on macOS due to the same
-// phantom marker as `!Send`. The underlying CoreAudio device handles are
-// thread-safe for our usage — we only read the `OutputStreamHandle` (which
-// is `Sync`) from multiple threads, and the `OutputStream` itself is never
-// accessed after initialization. This extends the `Send` justification above.
-unsafe impl Sync for AudioOutputWrapper {}
 
 static AUDIO_OUTPUT: OnceLock<AudioOutputWrapper> = OnceLock::new();
 
@@ -292,9 +282,9 @@ pub fn models_ready() -> bool {
 
 /// Returns `true` if the audio output device was successfully initialized.
 ///
-/// This checks whether `rodio::OutputStream::try_default()` succeeded during
-/// [`init_global()`]. Models may be loaded ([`models_ready()`]) but audio
-/// output may still be unavailable (e.g., headless system, no speakers,
+/// This checks whether `DeviceSinkBuilder::open_default_sink()` succeeded
+/// during [`init_global()`]. Models may be loaded ([`models_ready()`]) but
+/// audio output may still be unavailable (e.g., headless system, no speakers,
 /// CoreAudio initialization failure).
 ///
 /// The check is performed once at startup — runtime device disconnection
@@ -441,13 +431,11 @@ pub fn init_global() -> Result<()> {
         .map_err(|_| anyhow!("DOWNLOAD_EVENTS already initialized"))?;
 
     // Initialize rodio audio output (best-effort: may fail on headless systems)
-    match OutputStream::try_default() {
-        Ok((stream, handle)) => {
+    match DeviceSinkBuilder::open_default_sink() {
+        Ok(sink) => {
+            let mixer = sink.mixer().clone();
             AUDIO_OUTPUT
-                .set(AudioOutputWrapper {
-                    _stream: stream,
-                    handle,
-                })
+                .set(AudioOutputWrapper { _sink: sink, mixer })
                 .map_err(|_| anyhow!("AUDIO_OUTPUT already initialized"))?;
         }
         Err(e) => {
@@ -1533,7 +1521,7 @@ async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
     });
 
     // Receive chunks and play them as they arrive.
-    let mut current_sink: Option<Sink> = None;
+    let mut current_player: Option<Player> = None;
 
     // Stream chunks with a per-chunk timeout to guard against hung
     // synthesis. On timeout the loop breaks, which drops the receiver
@@ -1556,8 +1544,8 @@ async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
             && rx.try_recv().is_ok()
         {
             info!("TTS playback cancelled mid-stream");
-            if let Some(ref sink) = current_sink {
-                sink.stop();
+            if let Some(ref player) = current_player {
+                player.stop();
                 // Wait briefly for the audio thread to finish flushing
                 // so we don't leave a truncated burst in the output buffer.
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1567,11 +1555,11 @@ async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
 
         // Wait for previous chunk to finish playing, then add inter-chunk
         // silence between consecutive chunks.
-        if let Some(ref sink) = current_sink {
-            let completed = wait_for_sink(sink, cancel_rx.as_mut()).await;
+        if let Some(ref player) = current_player {
+            let completed = wait_for_player(player, cancel_rx.as_mut()).await;
             if !completed {
-                // Cancelled while waiting — sink.stop() was already called
-                // inside wait_for_sink. Flush output buffer and stop.
+                // Cancelled while waiting — player.stop() was already called
+                // inside wait_for_player. Flush output buffer and stop.
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 break;
             }
@@ -1588,7 +1576,8 @@ async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
             }
         };
 
-        // Decode the WAV bytes as an in-memory source
+        // Decode the WAV bytes as an in-memory source (hound-backed WAV decode
+        // under the Apache-2.0 license posture — no Symphonia path).
         let cursor = Cursor::new(wav_bytes);
         let source = match rodio::Decoder::new(cursor) {
             Ok(s) => s,
@@ -1598,79 +1587,75 @@ async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
             }
         };
 
-        // Create a fresh sink for this chunk and begin playback immediately.
-        // Each chunk gets its own sink so we can cancel per-chunk playback.
-        let sink = match Sink::try_new(&audio_output.handle) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("TTS: failed to create audio sink for chunk: {e}");
-                continue;
-            }
-        };
+        // Create a fresh player for this chunk and begin playback immediately.
+        // Each chunk gets its own player (connected to the shared mixer) so we
+        // can cancel per-chunk playback. `Player::connect_new` is infallible —
+        // the fallible device-open work happened once in `init_global()`.
+        let player = Player::connect_new(&audio_output.mixer);
 
-        if current_sink.is_none() {
+        if current_player.is_none() {
             // Only increment on the first chunk — the single fetch_sub(1)
             // after the reverb tail (below) restores the counter to zero.
             PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
             debug!("TTS playback started — wake word detection suppressed");
         }
-        sink.append(source);
-        current_sink = Some(sink);
+        player.append(source);
+        current_player = Some(player);
     }
 
     // Wait for the last chunk to finish playing
-    if let Some(ref sink) = current_sink {
-        let _ = wait_for_sink(sink, cancel_rx.as_mut()).await;
+    if let Some(ref player) = current_player {
+        let _ = wait_for_player(player, cancel_rx.as_mut()).await;
     }
 
     // Reverb tail: keep the playback count > 0 briefly after playback ends
     // to prevent wake word false triggers from room acoustics and output
     // buffer drain.  Using a counter (not a boolean) ensures that a new
     // speak_async() call that starts during this window keeps the count >= 1.
-    if current_sink.is_some() {
+    if current_player.is_some() {
         tokio::time::sleep(Duration::from_millis(PLAYBACK_REVERB_TAIL_MS)).await;
         PLAYBACK_ACTIVE.fetch_sub(1, Ordering::Release);
     }
 }
 
-/// Wait for a rodio sink to finish playback, polling for completion
+/// Wait for a rodio player to finish playback, polling for completion
 /// with optional cancellation support.
 ///
 /// Returns `true` if playback completed normally, `false` if cancelled
-/// or if the sink didn't drain within [`SINK_WAIT_TIMEOUT`].
-async fn wait_for_sink(sink: &Sink, cancel_rx: Option<&mut broadcast::Receiver<()>>) -> bool {
-    /// Maximum time to wait for the sink to drain before giving up.
-    const SINK_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// or if the player didn't drain within [`PLAYER_WAIT_TIMEOUT`].
+async fn wait_for_player(player: &Player, cancel_rx: Option<&mut broadcast::Receiver<()>>) -> bool {
+    /// Maximum time to wait for the player to drain before giving up.
+    const PLAYER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
     let poll_loop = async {
         if let Some(rx) = cancel_rx {
             loop {
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
-                if sink.empty() {
+                if player.empty() {
                     return true;
                 }
 
                 if rx.try_recv().is_ok() {
                     info!("TTS playback cancelled");
-                    sink.stop();
+                    player.stop();
                     return false;
                 }
             }
         } else {
             // No cancellation receiver — just wait until playback finishes.
-            while !sink.empty() {
+            while !player.empty() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             true
         }
     };
 
-    if let Ok(result) = tokio::time::timeout(SINK_WAIT_TIMEOUT, poll_loop).await {
+    if let Ok(result) = tokio::time::timeout(PLAYER_WAIT_TIMEOUT, poll_loop).await {
         result
     } else {
-        warn!("TTS sink wait timed out after 30s");
-        sink.stop();
+        warn!("TTS player wait timed out after 30s");
+        player.stop();
         false
     }
 }
@@ -1822,6 +1807,35 @@ mod tests {
         let data_start = 44;
         let last_sample_bytes = &wav_bytes[data_start + 10..data_start + 12];
         assert_eq!(last_sample_bytes, &[0x00, 0x00], "last sample should be 0");
+    }
+
+    #[test]
+    fn test_render_wav_decodes_via_hound() {
+        use rodio::Source;
+        // The rodio 0.22 upgrade switched WAV decode from the symphonia-based
+        // `wav` feature to hound (Apache-2.0 license posture). Verify the
+        // hound-backed `Decoder::new` still decodes render_wav's PCM16 mono
+        // output with the right rate/channel count and sample values.
+        let sample_rate = 16000u32;
+        let samples = vec![0.0f32, 0.5, -0.5, 1.0, -1.0];
+        let wav_bytes = render_wav(&samples, sample_rate).expect("render_wav should succeed");
+
+        let cursor = Cursor::new(wav_bytes);
+        let decoder = rodio::Decoder::new(cursor).expect("WAV should decode via hound");
+        assert_eq!(
+            decoder.sample_rate().get(),
+            sample_rate,
+            "sample rate mismatch"
+        );
+        assert_eq!(decoder.channels().get(), 1, "should be mono");
+        let decoded: Vec<f32> = decoder.map(f32::from).collect();
+        assert_eq!(decoded.len(), samples.len(), "sample count mismatch");
+        for (got, expected) in decoded.iter().zip(&samples) {
+            assert!(
+                (got - expected).abs() < 1e-3,
+                "sample {got} != expected {expected}"
+            );
+        }
     }
 
     // ── Tier 1: Preprocessing helpers (always-run unit tests) ─────────
