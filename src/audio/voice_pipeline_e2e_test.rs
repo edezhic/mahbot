@@ -3760,6 +3760,7 @@ fn run_faph_phase_inner() -> serde_json::Value {
     let mut files_fed = 0u64;
     let mut files_decode_failed = 0u64;
     let mut per_file_events: Vec<serde_json::Value> = Vec::new();
+    let mut last_progress_print = std::time::Instant::now();
 
     // Continuous listening: ONE PipelineCtx across
     // the whole corpus so the adaptive threshold, and
@@ -3790,14 +3791,24 @@ fn run_faph_phase_inner() -> serde_json::Value {
         files_fed += 1;
         // Progress line: the phase feeds the whole corpus with no per-file
         // summary in the report (the aggregate is the metric); this periodic
-        // line keeps the multi-hour phase observable while it runs.
-        if files_fed % 50 == 0 {
+        // line keeps the multi-hour phase observable while it runs.  Corpus
+        // files vary widely in length (long speech recordings to short noise
+        // clips), so the cadence is time-based, not file-count-based.
+        if last_progress_print.elapsed() >= Duration::from_secs(60) {
+            let wall_secs = phase_start.elapsed().as_secs_f64();
             eprintln!(
-                "  FAPH progress: {files_fed}/{} files fed, {:.2} h audio, {:.0} s wall",
+                "  FAPH progress: {files_fed}/{} files, {:.2} h audio, {:.0} s wall \
+                 ({:.2}x realtime)",
                 files.len(),
                 total_audio_secs / 3600.0,
-                phase_start.elapsed().as_secs_f64(),
+                wall_secs,
+                if wall_secs > 0.0 {
+                    total_audio_secs / wall_secs
+                } else {
+                    f64::NAN
+                },
             );
+            last_progress_print = std::time::Instant::now();
         }
         // Feed the inter-file silence gap so the segment-boundary reset fires
         // naturally (the next file starts with production's post-silence
