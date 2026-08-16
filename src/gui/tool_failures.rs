@@ -215,7 +215,7 @@ impl ToolFailuresState {
                 [1, 6]
             ),
             Space::new().width(4),
-            widgets::role_badge(entry.role.clone(), role_colors, 10, false),
+            widgets::role_badge(entry.role.clone(), role_colors, 10, [1, 6], false),
             Space::new().width(Length::Fill),
             if !entry.workspace.is_empty() {
                 text(&entry.workspace).size(10).color(theme::TEXT_MUTED)

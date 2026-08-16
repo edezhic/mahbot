@@ -1102,7 +1102,7 @@ impl BoardState {
             } else {
                 let detail = self.modal_detail();
                 let dialog = container(detail)
-                    .width(Length::Fixed(600.0))
+                    .width(Length::Fixed(720.0))
                     .padding(24)
                     .style(theme::dialog_container_style);
 
@@ -1483,7 +1483,7 @@ impl BoardState {
             let mut comment_col = Column::new().spacing(4);
             comment_col = comment_col.push(
                 row![
-                    role_badge(comment.role.clone(), role_colors, 11, false),
+                    role_badge(comment.role.clone(), role_colors, 20, [2, 12], false),
                     Space::new().width(8),
                     text(theme::format_timestamp(&comment.created_at))
                         .size(10)

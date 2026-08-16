@@ -669,6 +669,7 @@ impl SessionsState {
                         dm_role.clone(),
                         dm_role_colors,
                         11,
+                        [1, 6],
                         true,
                     ));
                     if !content.is_empty() {
@@ -708,7 +709,13 @@ impl SessionsState {
                     };
 
                     let mut msg_col = Column::new().spacing(2);
-                    msg_col = msg_col.push(widgets::role_badge(dm_role, dm_role_colors, 11, true));
+                    msg_col = msg_col.push(widgets::role_badge(
+                        dm_role,
+                        dm_role_colors,
+                        11,
+                        [1, 6],
+                        true,
+                    ));
 
                     if let Some(ref t) = thinking {
                         let is_thinking_expanded = expanded_thinking.contains(&i);
