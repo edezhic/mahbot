@@ -612,9 +612,10 @@ const FTS_INTERNAL_INDEX_PREFIX: &str = "__turso_internal_fts_dir_";
 /// `sqlite_master` filter for user-owned objects: excludes the engine's own
 /// tables (`sqlite_%`) and turso's protected `__turso_internal_%`
 /// (AUTOINCREMENT seq backing, FTS dir) — those reject user writes and are
-/// recreated by the DDL replay. Shared by the rebuild's counts enumeration and
-/// DDL replay so the two cannot drift.
-const USER_OBJECT_FILTER: &str = "name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%'";
+/// recreated by the DDL replay. Shared by the rebuild's counts enumeration,
+/// DDL replay, and the debug CLI's schema dump so the three cannot drift.
+pub(crate) const USER_OBJECT_FILTER: &str =
+    "name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%'";
 
 /// Best-effort removal of a rebuild temp family (main + sidecars).
 fn remove_rebuild_temp(temp: &Path) {

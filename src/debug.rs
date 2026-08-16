@@ -1,7 +1,12 @@
 //! Debug query tool — read-only SQL diagnostics for mahbot's databases.
 //!
-//! Invoked as `mahbot debug --db <name> "SQL query"` from the command line.
-//! Skips tracing initialization and GUI startup.
+//! Invoked as `mahbot debug --db <name> ["SQL query"]` from the command line.
+//! With a SQL argument it runs a read-only query (pipe-delimited output);
+//! without one it prints a schema dump — per-table DDL blocks with row counts
+//! (internal catalog artifacts excluded, see [`dump_schema`]). `--db all`
+//! accepts both forms, dumping/querying every live store in per-store
+//! sections. `-h`/`--help` prints usage (with the live database list) and
+//! exits 0. Skips tracing initialization and GUI startup.
 //!
 //! Three further verbs: `detect` classifies store coordination state without
 //! opening any database; `families` and `--family` target forensic artifact
@@ -467,7 +472,8 @@ fn parse_db_flag(args: &[String], subcommand: &str) -> Result<Option<String>> {
 }
 
 /// Validate a store name against the canonical list. `all_valid` appends the
-/// literal `all` option to the hint — only the query verb accepts it.
+/// literal `all` option to the hint — only callers that accept `--db all`
+/// pass `true`.
 fn validate_store_name(name: &str, all_valid: bool) -> Result<()> {
     let names = turso_mod::store_names();
     if names.contains(&name) {
@@ -958,11 +964,13 @@ fn query_family(family_id: &str, sql: &str, root: &Path) -> Result<()> {
 async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) -> Result<()> {
     // args[0] = "mahbot", args[1] = "debug"
     let tail: Vec<&str> = args.iter().skip(2).map(String::as_str).collect();
-    // Help at any verb position prints the same usage. An exact `--help`
+    // Help at any verb position prints the same usage. An exact `--help`/`-h`
     // element anywhere in the tail (verb, flags, or trailing position) never
-    // falls through to SQL: store/family ids never equal `--help`, and a SQL
-    // argument of exactly `--help` is a comment, not a statement.
-    if tail.contains(&"--help") {
+    // falls through to SQL: store/family ids never equal `--help`/`-h`, and a
+    // SQL argument of exactly `--help` is a comment, not a statement, while a
+    // lone `-h` is a syntax error (a single-dash token can never parse as SQL)
+    // — intercepting either loses no valid query.
+    if tail.contains(&"--help") || tail.contains(&"-h") {
         print_usage();
         return Ok(());
     }
@@ -990,10 +998,10 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
         return query_family(&args[3], sql, &mahbot_home);
     }
 
-    // Need at least: mahbot debug --db <name> <sql>
-    if args.len() < 5 {
+    // Need at least: mahbot debug --db <name> [SQL]
+    if args.len() < 4 {
         print_usage();
-        bail!("expected: mahbot debug --db <name> \"SQL query\"");
+        bail!("expected: mahbot debug --db <name> [\"SQL query\"]");
     }
 
     if args[2] != "--db" {
@@ -1003,13 +1011,19 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
     }
 
     let db_name = &args[3];
-    let sql = &args[4];
+    // A SQL argument runs a read-only query; without one the command prints a
+    // schema dump (per-table DDL blocks + row counts — see `dump_one_store`).
+    let sql = args.get(4).map(String::as_str);
 
     // Resolve ~/.mahbot/ (or the test/snapshot override).
     let mahbot_home = resolve_home(home_override)?;
 
-    // Validate SQL is read-only before touching any database
-    validate_read_only(sql)?;
+    // Validate SQL is read-only before touching any database. The dump mode
+    // has no user SQL — its queries are internal and read-only by
+    // construction.
+    if let Some(sql) = sql {
+        validate_read_only(sql)?;
+    }
 
     let db_list = resolve_db_list(db_name, &mahbot_home)?;
 
@@ -1044,7 +1058,11 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
             bail!("database file not found: {}", file_path.display());
         }
 
-        match query_one_store(file_path, sql, &mahbot_home, flock_guard.as_ref()).await {
+        let result = match sql {
+            Some(sql) => query_one_store(file_path, sql, &mahbot_home, flock_guard.as_ref()).await,
+            None => dump_one_store(file_path, label, &mahbot_home, flock_guard.as_ref()).await,
+        };
+        match result {
             Ok(()) => {}
             Err(e) => {
                 if db_name == "all" {
@@ -1069,25 +1087,29 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
     Ok(())
 }
 
-/// Open one store read-only and run `sql`, retrying torn-frame failures with
-/// bounded backoff.
+/// Run `open_fn` against one store with the full read-only safety stack,
+/// retrying torn-frame failures with bounded backoff.
 ///
 /// The artifact pre-check lives here (not only in the caller) so the
 /// final-failure path can re-check it: a race may start the daemon publishing
 /// frames mid-retry, or the path may be a snapshot copy with no `.tshm` at all
 /// — in which case a persistent torn/page failure means the copied data is
-/// corrupt, not that a live artifact exists.
+/// corrupt, not that a live artifact exists. Shared by the query and
+/// schema-dump paths so the two cannot drift apart.
 ///
 /// `flock_guard` is the crash-recovery instance flock held by the caller
 /// (`None` when the daemon holds the flock or no lock file exists); the
 /// post-open byte-0 verification uses it to distinguish "we hold the flock"
 /// (byte-0 free is expected) from "the daemon's flock is held but its byte-0
 /// lock dropped" (the open classified Exclusive — abort).
-async fn query_one_store(
+///
+/// `open_fn` re-opens the store on every attempt — a torn-frame failure can
+/// leave a connection unusable, so each attempt is a fresh open+read.
+async fn open_with_retry(
     file_path: &Path,
-    sql: &str,
     root: &Path,
     flock_guard: Option<&File>,
+    open_fn: impl Fn(&Path, &Path, Option<&File>) -> Result<()>,
 ) -> Result<()> {
     // Snapshot copies have no `-tshm`; they are static, so a torn-frame
     // failure cannot be transient there. Only live stores (which the daemon
@@ -1104,12 +1126,12 @@ async fn query_one_store(
         bail!("{artifact_msg}");
     }
 
-    // Open + query with bounded retry on torn-frame failures. Retrying
+    // Open + read with bounded retry on torn-frame failures. Retrying
     // spans short write windows (e.g. the daemon mid-checkpoint); the
     // backoff total (~15s) is bounded so the CLI cannot hang for long.
     let mut attempt = 0usize;
     loop {
-        match open_and_query_readonly(file_path, sql, root, flock_guard) {
+        match open_fn(file_path, root, flock_guard) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 // An engine panic is deterministic — never retry it, and
@@ -1151,6 +1173,36 @@ async fn query_one_store(
             }
         }
     }
+}
+
+/// Open one store read-only and run `sql` (pipe-delimited output) with the
+/// full safety stack of [`open_with_retry`].
+async fn query_one_store(
+    file_path: &Path,
+    sql: &str,
+    root: &Path,
+    flock_guard: Option<&File>,
+) -> Result<()> {
+    open_with_retry(file_path, root, flock_guard, |path, root_path, guard| {
+        open_and_query_readonly(path, sql, root_path, guard)
+    })
+    .await
+}
+
+/// Open one store read-only and print its schema dump — a header line naming
+/// the store, then one block per user table (`[table] <name>`, the table's
+/// DDL, and its row count). Internal catalog artifacts are excluded (see
+/// [`dump_schema`]). Same safety stack as [`query_one_store`].
+async fn dump_one_store(
+    file_path: &Path,
+    label: &str,
+    root: &Path,
+    flock_guard: Option<&File>,
+) -> Result<()> {
+    open_with_retry(file_path, root, flock_guard, |path, root_path, guard| {
+        open_and_dump_readonly(path, label, root_path, guard)
+    })
+    .await
 }
 
 /// Re-check the artifact condition with the bounded retry backoff — live
@@ -1341,16 +1393,35 @@ fn connect_execute_print(
 }
 
 /// Open a store read-only and execute `sql`, printing pipe-delimited results.
-///
-/// Reuses an existing `.tshm` when present so live stores are read through the
-/// daemon's WAL coordination. The whole open+query is panic-guarded — a
-/// damaged store must yield a clean error, never a CLI crash.
+/// See [`open_and_run_readonly`] for the shared open+verification stack.
 fn open_and_query_readonly(
     file_path: &Path,
     sql: &str,
     root: &Path,
     flock_guard: Option<&File>,
 ) -> Result<()> {
+    open_and_run_readonly(file_path, root, flock_guard, |io, db, path| {
+        connect_execute_print(io, db, sql, path)
+    })
+}
+
+/// Open a store read-only, run the post-open lock-drop verification, then run
+/// `runner` against the connection. Used by the query and schema-dump paths so
+/// both share the same open+verification stack.
+///
+/// Reuses an existing `.tshm` when present so live stores are read through the
+/// daemon's WAL coordination. The whole open+run is panic-guarded — a damaged
+/// store must yield a clean error, never a CLI crash.
+fn open_and_run_readonly<T>(
+    file_path: &Path,
+    root: &Path,
+    flock_guard: Option<&File>,
+    runner: impl FnOnce(
+        &std::sync::Arc<dyn turso::core::IO>,
+        &std::sync::Arc<turso::core::Database>,
+        &Path,
+    ) -> Result<T>,
+) -> Result<T> {
     guard_panics(|| {
         let (io, db) = open_readonly(
             file_path,
@@ -1379,7 +1450,23 @@ fn open_and_query_readonly(
             }
         }
 
-        connect_execute_print(&io, &db, sql, file_path)
+        runner(&io, &db, file_path)
+    })
+}
+
+/// [`open_and_run_readonly`] runner for the schema dump: build the whole
+/// store's dump text (buffered — a mid-dump failure never leaks a partial
+/// dump to stdout, matching [`connect_execute`]'s all-or-nothing output),
+/// then write it once.
+fn open_and_dump_readonly(
+    file_path: &Path,
+    label: &str,
+    root: &Path,
+    flock_guard: Option<&File>,
+) -> Result<()> {
+    open_and_run_readonly(file_path, root, flock_guard, |io, db, path| {
+        let dump = dump_schema(io, db, path, label)?;
+        write_stdout(&dump)
     })
 }
 
@@ -1455,6 +1542,125 @@ fn execute_query_readonly(
     }
 
     Ok(out)
+}
+
+/// SQL selecting a store's user tables: `type='table'`, with real DDL, and not
+/// an internal catalog artifact.
+///
+/// `sql IS NOT NULL` alone is NOT a sufficient filter in turso — the internal
+/// sequence/shadow tables (`sqlite_sequence`, `__turso_internal_*`) carry real
+/// DDL — so the name-prefix exclusion is required. The exclusion is the shared
+/// [`turso_mod::USER_OBJECT_FILTER`] (the same predicate turso's integrity
+/// scans use), so the debug CLI and the engine cannot drift on what counts as
+/// internal. FTS5 shadow tables (NULL sql) and auto-indexes are excluded by
+/// `sql IS NOT NULL` + `type='table'`.
+const USER_TABLES_SQL: &str = "SELECT name, sql FROM sqlite_master \
+     WHERE type = 'table' AND sql IS NOT NULL AND {filter} \
+     ORDER BY name";
+
+/// Build the schema-dump text for one store.
+///
+/// Format (block, not pipe-delimited — DDL contains newlines and pipes):
+///
+/// ```text
+/// == schema dump: board ==
+///
+/// [table] ticket_comments
+/// CREATE TABLE ticket_comments(...);
+/// rows: 7
+///
+/// [table] tickets
+/// CREATE TABLE tickets(...);
+/// rows: 4213
+/// ```
+///
+/// Tables are ordered by name. Internal catalog artifacts — `sqlite_%`
+/// (`sqlite_sequence`, …) and `__turso_internal_%` (turso's sequence and FTS
+/// directory tables) — are excluded: the dump shows only meaningful user
+/// objects, and it reflects the LIVE stored schema (`sqlite_master`), not
+/// source-code constants (live schemas drift from source over time).
+fn dump_schema(
+    io: &std::sync::Arc<dyn turso::core::IO>,
+    db: &std::sync::Arc<turso::core::Database>,
+    db_path: &Path,
+    label: &str,
+) -> Result<String> {
+    use std::fmt::Write as _;
+    let conn = db
+        .connect()
+        .map_err(|e| anyhow!("failed to connect to database '{}': {e}", db_path.display()))?;
+    let tables_sql = USER_TABLES_SQL.replace("{filter}", turso_mod::USER_OBJECT_FILTER);
+    let tables = collect_rows(io, &conn, &tables_sql, db_path, |row| {
+        let name = format_core_value(row.get_value(0));
+        let sql = format_core_value(row.get_value(1));
+        Ok((name, sql))
+    })?;
+
+    let mut out = format!("== schema dump: {label} ==\n");
+    for (name, sql) in tables {
+        let count_sql = format!("SELECT COUNT(*) FROM {}", quote_ident(&name));
+        let counts = collect_rows(io, &conn, &count_sql, db_path, |row| {
+            Ok(format_core_value(row.get_value(0)))
+        })?;
+        let count = counts.first().ok_or_else(|| {
+            anyhow!(
+                "row count query returned no rows on '{}'",
+                db_path.display()
+            )
+        })?;
+        write!(out, "\n[table] {name}\n{sql}\nrows: {count}\n")
+            .expect("writing to a String cannot fail");
+    }
+    Ok(out)
+}
+
+/// Step a single statement to completion, collecting one owned value per row.
+/// Mirrors [`execute_query_readonly`]'s IO/Yield/Busy/Interrupt handling so the
+/// dump queries share the same robustness (a torn-frame failure propagates and
+/// the caller re-runs the whole dump via [`open_with_retry`]).
+fn collect_rows<T>(
+    io: &std::sync::Arc<dyn turso::core::IO>,
+    conn: &std::sync::Arc<turso::core::Connection>,
+    sql: &str,
+    db_path: &Path,
+    mut collect: impl FnMut(&turso::core::Row) -> Result<T>,
+) -> Result<Vec<T>> {
+    let mut stmt = conn
+        .query(sql)
+        .map_err(|e| anyhow!("SQL query failed on '{}': {e}", db_path.display()))?
+        .ok_or_else(|| anyhow!("query produced no statement on '{}'", db_path.display()))?;
+
+    let mut rows = Vec::new();
+    loop {
+        match stmt
+            .step()
+            .map_err(|e| anyhow!("SQL query failed on '{}': {e}", db_path.display()))?
+        {
+            turso::core::StepResult::Done => break,
+            turso::core::StepResult::IO | turso::core::StepResult::Yield => {
+                io.step()
+                    .map_err(|e| anyhow!("SQL query failed on '{}': {e}", db_path.display()))?;
+            }
+            turso::core::StepResult::Row => {
+                let row = stmt
+                    .row()
+                    .ok_or_else(|| anyhow!("row missing after StepResult::Row"))?;
+                rows.push(collect(row)?);
+            }
+            turso::core::StepResult::Interrupt => {
+                bail!("query interrupted on '{}'", db_path.display())
+            }
+            turso::core::StepResult::Busy => {
+                bail!("database busy on '{}'; try again later", db_path.display())
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// Double-quote a SQL identifier, escaping embedded double quotes.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// True when the error chain looks like a torn-frame / WAL-inconsistency read.
@@ -1568,19 +1774,27 @@ fn format_truncation_row(column_count: usize) -> String {
 }
 
 fn print_usage() {
-    eprintln!("Usage: mahbot debug --db <name> \"SQL query\"");
+    eprintln!("Usage: mahbot debug --db <name> [\"SQL query\"]");
     eprintln!("       mahbot debug detect [--db <name>]");
     eprintln!("       mahbot debug families [--db <name>]");
     eprintln!("       mahbot debug --family <id> \"SQL query\"");
     let names = turso_mod::store_names().join(" | ");
-    eprintln!("  --db <name>  {names} | all (all is only valid for the query verb)");
-    eprintln!("  SQL query    read-only SQL, quoted as a single argument");
-    eprintln!("  detect       classify coordination state without opening stores");
-    eprintln!("  families     list quarantine/pre-reindex forensic families (--db filters by");
+    eprintln!("  -h, --help  print this help and exit 0");
+    eprintln!("  --db <name> {names} | all");
+    eprintln!("              with a SQL argument: read-only query, pipe-delimited output");
+    eprintln!("              without one: schema dump — one block per user table");
+    eprintln!("              (`[table] <name>` / DDL / `rows: N`); `all` dumps every live");
+    eprintln!("              database in per-store sections (per-store errors; exit 1 if");
+    eprintln!("              any store failed)");
+    eprintln!("  SQL query   read-only SQL, quoted as a single argument");
+    eprintln!("  detect      classify coordination state without opening stores");
+    eprintln!("  families    list quarantine/pre-reindex forensic families (--db filters by");
     eprintln!("               store name; a name matching nothing prints an empty list)");
     eprintln!("  --family <id>  read-only SQL against one forensic family (id from `families`)");
     eprintln!();
     eprintln!("Examples:");
+    eprintln!("  mahbot debug --db board");
+    eprintln!("  mahbot debug --db all");
     eprintln!("  mahbot debug --db board \"SELECT phase, COUNT(*) FROM tickets GROUP BY phase\"");
     eprintln!("  mahbot debug --db all \"SELECT name FROM sqlite_master WHERE type='table'\"");
     eprintln!("  mahbot debug detect");
@@ -1824,6 +2038,120 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    /// The schema dump (`--db <name>` with no SQL) reflects the LIVE stored
+    /// schema: one block per user table with its DDL and row count, excluding
+    /// internal catalog artifacts (`sqlite_%`, `__turso_internal_%`).
+    /// Serialized: `guard_panics` swaps the process-global panic hook, so
+    /// guard windows must not overlap other debug tests.
+    #[tokio::test]
+    #[serial_test::serial(family)]
+    async fn schema_dump_prints_user_tables_with_row_counts() {
+        let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
+        // One non-trivial row so the dump's row count reflects live contents.
+        store
+            .conn
+            .execute(
+                "INSERT INTO logs (timestamp, level, target, message) \
+                 VALUES ('2026-01-01T00:00:00Z', 'INFO', 'test', 'hello')",
+                turso_mod::params![],
+            )
+            .await
+            .expect("insert a log row");
+
+        let db_path = dir.path().join("db").join("logs.db");
+        let dump = open_and_run_readonly(&db_path, dir.path(), None, |io, db, path| {
+            dump_schema(io, db, path, "logs")
+        })
+        .expect("dump must succeed on a real store");
+
+        assert!(
+            dump.starts_with("== schema dump: logs ==\n"),
+            "dump must open with the store header: {dump}"
+        );
+        for table in ["logs", "tool_calls", "llm_requests"] {
+            assert!(
+                dump.contains(&format!("\n[table] {table}\n")),
+                "user table block missing for '{table}': {dump}"
+            );
+        }
+        assert!(
+            dump.contains("CREATE TABLE logs ("),
+            "table DDL must be included: {dump}"
+        );
+        assert!(
+            dump.contains("\nrows: 1\n"),
+            "row count must reflect the live row: {dump}"
+        );
+        assert!(
+            !dump.contains("__turso_internal_"),
+            "internal turso artifacts must be excluded: {dump}"
+        );
+        assert!(
+            !dump.contains("sqlite_sequence"),
+            "sqlite_sequence must be excluded: {dump}"
+        );
+    }
+
+    /// `mahbot debug --db <name>` without a SQL argument dumps the store schema
+    /// and exits 0 — and, like the query path, creates no extra `-tshm` files.
+    /// Serialized: `guard_panics` swaps the process-global panic hook, so
+    /// guard windows must not overlap other debug tests.
+    #[tokio::test]
+    #[serial_test::serial(family)]
+    async fn run_debug_dumps_schema_without_sql() {
+        let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
+        let args = vec![
+            "mahbot".to_string(),
+            "debug".to_string(),
+            "--db".to_string(),
+            "logs".to_string(),
+        ];
+        let result = run_debug_with_args(args, Some(dir.path().to_path_buf())).await;
+        assert!(
+            result.is_ok(),
+            "schema dump without SQL must succeed: {result:?}"
+        );
+
+        let db_dir = dir.path().join("db");
+        let names: Vec<String> = std::fs::read_dir(&db_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        // Exactly one tshm file (created by the store open itself) — the
+        // read-only CLI open must not create another.
+        let tshm_count = names.iter().filter(|n| n.ends_with("-tshm")).count();
+        assert_eq!(tshm_count, 1, "no new -tshm file may be created: {names:?}");
+    }
+
+    /// `mahbot debug --db all` without a SQL argument dumps every present
+    /// store and reports missing stores per-store with a failure summary
+    /// (exit 1) — matching the query verb's `--db all` failure semantics.
+    /// Serialized: `guard_panics` swaps the process-global panic hook, so
+    /// guard windows must not overlap other debug tests.
+    #[tokio::test]
+    #[serial_test::serial(family)]
+    async fn run_debug_dump_all_reports_missing_stores() {
+        let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
+        let args = vec![
+            "mahbot".to_string(),
+            "debug".to_string(),
+            "--db".to_string(),
+            "all".to_string(),
+        ];
+        let err = run_debug_with_args(args, Some(dir.path().to_path_buf()))
+            .await
+            .expect_err("--db all with missing stores must report a failure summary");
+        let msg = format!("{err:#}");
+        // Compute the expectation from the store-name source (the single
+        // source of truth) so the test does not hardcode the current store
+        // count — only the logs store exists, so every other store is missing.
+        let total = turso_mod::store_names().len();
+        assert!(
+            msg.contains(&format!("{} of {total} store(s) failed", total - 1)),
+            "must summarize per-store failures, got: {msg}"
+        );
     }
 
     // ── forensic-family tests ──────────────────────────────────────────
@@ -2203,28 +2531,36 @@ mod tests {
         }
     }
 
-    /// Help at any verb position (`--help` standalone, after a verb, after a
-    /// store/family id, misordered, or with trailing args) prints usage and
-    /// exits 0 instead of falling through to running '--help' as a SQL query.
+    /// Help at any verb position (`-h`/`--help` standalone, after a verb, after
+    /// a store/family id, misordered, or with trailing args) prints usage and
+    /// exits 0 instead of falling through to running the flag as a SQL query.
     #[tokio::test]
     async fn run_debug_help_after_verb_prints_usage() {
         let dir = tempfile::TempDir::new().unwrap();
         for tail in [
             vec!["--help"],
+            vec!["-h"],
             vec!["families", "--help"],
             vec!["detect", "--help"],
+            vec!["families", "-h"],
+            vec!["detect", "-h"],
             vec!["--family", "--help"],
+            vec!["--family", "-h"],
             vec!["families", "--db", "--help"],
             vec!["detect", "--db", "--help"],
             vec!["--db", "--help"],
+            vec!["--db", "-h"],
             vec!["--family", "--help", "extra"],
+            vec!["--family", "-h", "extra"],
             vec![
                 "--family",
                 "logs.db.quarantine-20260812T120000Z-4242",
                 "--help",
             ],
             vec!["--db", "board", "--help"],
+            vec!["--db", "board", "-h"],
             vec!["--db", "board", "--help", "extra"],
+            vec!["--db", "board", "-h", "extra"],
             vec!["families", "--db", "board", "--help"],
             vec!["detect", "--db", "board", "--help"],
             vec!["detect", "--help", "extra"],
