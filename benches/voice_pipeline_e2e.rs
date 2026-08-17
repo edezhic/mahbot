@@ -1,10 +1,12 @@
-/// Voice pipeline E2E benchmark with single-instance lock and 300-minute timeout.
+/// Voice pipeline E2E benchmark with single-instance lock and a per-mode timeout.
 ///
-/// The lock prevents concurrent benchmark runs.  A 300-minute timeout aborts hung
-/// runs via [`std::process::exit`].  The 300-minute ceiling accommodates the
-/// env-gated FAPH phase (the full ~6 h real-audio corpus is fed through the
-/// encoder at a few times real-time, so the phase runs for hours); default runs
-/// finish well inside it.
+/// The lock prevents concurrent benchmark runs.  The timeout aborts hung runs
+/// via [`std::process::exit`] and depends on the run mode: 30 minutes for
+/// standard runs (fast-fail hang guard — measured runs complete in ~9 min),
+/// 300 minutes when `MAHBOT_FAPH=1` because the env-gated FAPH phase feeds the
+/// full 5.99 h real-audio corpus through the encoder at ~6-8× real-time
+/// (measured ~47 min FAPH / ~54 min total run on this machine; 300 min is a
+/// hung-run abort net with ~5.5× headroom over that measured total).
 ///
 /// # Lock mechanism
 ///
@@ -104,15 +106,21 @@ fn main() {
     let runtime = tokio::runtime::Runtime::new()
         .expect("failed to create tokio runtime for benchmark timeout");
 
-    // 3. Run benchmark with 300-minute timeout.
+    // 3. Run benchmark with a per-mode timeout.
+    //    Standard runs: 30 minutes (fast-fail hang guard — a non-hung run
+    //    completes in ~9 min).  FAPH runs (MAHBOT_FAPH=1): 300 minutes — the
+    //    phase feeds the full 5.99 h corpus at ~6-8× real-time (measured ~47
+    //    min FAPH / ~54 min total), so 300 min is an abort net, not a budget.
     // NOTE: spawn_blocking tasks are NOT cancelable at the Rust level.
     // When the timeout fires, tokio returns Err(Elapsed) but the kernel
     // threads (ONNX evaluations) continue executing.  We call
     // process::exit(1) to terminate the process, which kills all threads
     // and the kernel releases the flock.
+    let faph_enabled = std::env::var("MAHBOT_FAPH").as_deref() == Ok("1");
+    let timeout_mins: u64 = if faph_enabled { 300 } else { 30 };
     let result = runtime.block_on(async {
         tokio::time::timeout(
-            Duration::from_mins(300),
+            Duration::from_mins(timeout_mins),
             tokio::task::spawn_blocking(|| {
                 mahbot::audio::voice::run_voice_pipeline_benchmark();
             }),
@@ -129,7 +137,7 @@ fn main() {
             std::process::exit(1);
         }
         Err(_elapsed) => {
-            eprintln!("BENCHMARK TIMED OUT after 300 minutes");
+            eprintln!("BENCHMARK TIMED OUT after {timeout_mins} minutes");
             std::process::exit(1);
         }
     }

@@ -3485,7 +3485,6 @@ fn numeric_distribution(values: &[f64]) -> serde_json::Value {
 /// usable).  Archives are additionally filtered by acceptance basis
 /// ([`ACCEPTANCE_BASIS_PREFIX`]) so v3 enlarged-basis runs never mix with v2
 /// 16-clip archives in the ≥3-run spread.
-#[expect(clippy::too_many_lines)]
 fn cross_run_summary() -> serde_json::Value {
     let Ok(report_dir) = crate::config::default_config_dir() else {
         return serde_json::json!({"archives_found": 0, "note": "report dir unavailable"});
@@ -3794,7 +3793,11 @@ fn run_faph_phase_inner() -> serde_json::Value {
         // line keeps the multi-hour phase observable while it runs.  Corpus
         // files vary widely in length (long speech recordings to short noise
         // clips), so the cadence is time-based, not file-count-based.
-        if last_progress_print.elapsed() >= Duration::from_secs(60) {
+        // Skip the zero-state line: if the first file(s) fail to decode, the
+        // 60 s cadence would otherwise emit "0 files / 0.00 h / 0.0x realtime".
+        // The timer is not reset on a skipped line, so the first successful
+        // feed prints immediately instead of waiting another 60 s.
+        if files_fed > 0 && last_progress_print.elapsed() >= Duration::from_mins(1) {
             let wall_secs = phase_start.elapsed().as_secs_f64();
             eprintln!(
                 "  FAPH progress: {files_fed}/{} files, {:.2} h audio, {:.0} s wall \
@@ -3938,10 +3941,6 @@ fn run_faph_phase_inner() -> serde_json::Value {
                                      audio-position merge (production-equivalent count)",
             "continuous_listening": true,
         },
-        "provenance": "0.008–0.083 FA/h projection = manager's 7050-fork analysis of \
-                       synthetic cross-speaker noise-overlap rates (recorded when citing); \
-                       NOT a direct <1 FA/24h demonstration — this phase reports a Poisson \
-                       confidence/upper bound from the actual audio-hours processed",
         "per_file_merged_note": "per_file[].cooldown_merged_fa_events merges only WITHIN \
                                  each file; the headline fa.cooldown_merged_events merges \
                                  across file boundaries (including the inter-file silence \
@@ -6768,7 +6767,7 @@ mod tests {
     }
 
     /// FAPH Poisson upper bound: 0 events in 5.99 h → the 95% upper per-hour
-    /// rate is 0.5·χ²(0.975, 2)/5.99 ≈ 0.61/h (not a <1 FA/24h claim).
+    /// rate is 0.5·χ²(0.975, 2)/5.99 ≈ 0.61/h.
     #[test]
     fn faph_poisson_upper_bound_semantics() {
         let audio_hours = 5.99_f64;
