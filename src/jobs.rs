@@ -1309,6 +1309,12 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
                 });
                 resumed_other += 1;
             }
+            "ticket_stage" => {
+                // Owned by scan (1) above: resume + exclusion set + boot bump
+                // already happened there. Silently accept the canonical kind
+                // here so it never trips the catch-all below (the first loop
+                // resumes exactly the same job rows this loop iterates).
+            }
             _ => {
                 warn!(job = %job.id, kind = %job.kind, "Unknown job kind — skipping");
             }
