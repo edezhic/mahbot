@@ -2137,12 +2137,13 @@ mod tests {
     // are not found.
 
     /// Collect candidate model directories, deduplicated.
-    /// Uses CONFIG storage root (may be a temp dir from graceful degradation test)
-    /// and HOME/.mahbot/models/supertonic3/ (real cache).
+    /// Uses CONFIG storage root (the shared test root in test runs) and
+    /// HOME/.mahbot/models/supertonic3/ (real cache).
     fn test_model_candidates() -> Vec<std::path::PathBuf> {
         let mut candidates = Vec::new();
 
-        // 1. CONFIG storage root (may be a temp dir from graceful degradation test).
+        // 1. CONFIG storage root (the shared test root in test runs — the
+        //    ignored TTS e2e test's symlink makes models resolve here).
         if let Some(root) = crate::config::CONFIG.try_storage_root() {
             candidates.push(root.join("models").join(MODEL_DIR_NAME));
         }
@@ -2547,12 +2548,83 @@ mod tests {
     /// cargo test test_tts_e2e -- --ignored --nocapture
     /// ```
     ///
+    /// The test's CONFIG storage root stays test-owned (the shared test
+    /// root); the real caches are reached via a test-only symlink from the
+    /// test-owned models dir to `~/.mahbot/models` (see the setup below —
+    /// the single sanctioned exception where a test folder binds to the real
+    /// cache).
+    ///
     /// If either model is not cached on disk, the test prints a clear skip
     /// message and returns early (no panic, no test failure).
-    #[ignore]
+    #[ignore = "requires ~2.5 GB of real cached TTS+ASR models and seconds of ONNX inference; runs only when explicitly invoked"]
     #[tokio::test]
     #[serial_test::serial(tts)]
     async fn test_tts_e2e() {
+        // ── Test-owned storage root (never the real ~/.mahbot) ────────
+        //
+        // Point the CONFIG storage root at the shared test root. It must
+        // stay test-owned: pointing it at the real user config directory
+        // would let later tests in this process write into the live daemon's
+        // databases. try_set_storage_root (not set_storage_root) so a run
+        // where another test already set the root cannot panic.
+
+        let test_root = crate::util::test::test_root().clone();
+        let _ = CONFIG.try_set_storage_root(test_root.clone());
+
+        // ── Test-only binding to the real model cache ─────────────────
+        //
+        // The real ASR + TTS caches (~2.3 GB total) live in
+        // ~/.mahbot/models. With the storage root test-owned, the load paths
+        // (models_subdir → CONFIG storage root) resolve to
+        // <test_root>/models, which is empty — the models would have to be
+        // re-downloaded per run. This symlink is the SINGLE sanctioned
+        // exception where a test folder binds to the real cache:
+        //
+        //   • TEST-ONLY: created by this test's own setup, never by shared
+        //     test infrastructure, so normal test runs never contain it and
+        //     other tests never observe it (test_embedder_graceful_degradation
+        //     expects an empty models/ dir in the test root);
+        //   • the test stays #[ignore]d — a full --include-ignored run may
+        //     briefly overlap the symlink with parallel tests (e.g. an
+        //     embedder test creating <test_root>/models as a real directory).
+        //     Accepted edge: a path that is already occupied skips the test.
+
+        let Some(home_dir) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) else {
+            eprintln!(
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n                 SKIP: $HOME not set, cannot resolve the real model cache.\n                 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            );
+            return;
+        };
+        let real_models_dir = std::path::PathBuf::from(&home_dir)
+            .join(".mahbot")
+            .join("models");
+        let test_models_dir = test_root.join("models");
+
+        #[cfg(unix)]
+        let symlink_ok = {
+            // Each test process gets a fresh unique test root, so
+            // <test_root>/models cannot pre-exist here: either the path is
+            // absent (create the symlink) or occupied by a parallel test in an
+            // --include-ignored run (skip — accepted edge).
+            match std::fs::symlink_metadata(&test_models_dir) {
+                Err(_) => std::os::unix::fs::symlink(&real_models_dir, &test_models_dir).is_ok(),
+                Ok(_) => false,
+            }
+        };
+        // The test is unix-only in practice (unix process-exit hooks for the
+        // test-root cleanup, `$HOME`-based cache, symlinks).
+        #[cfg(not(unix))]
+        let symlink_ok = false;
+
+        if !symlink_ok {
+            eprintln!(
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n                 SKIP: cannot bind the test-owned models dir ({}) to the real cache ({}).\n                 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                test_models_dir.display(),
+                real_models_dir.display(),
+            );
+            return;
+        }
+
         // ── Pre-flight checks ─────────────────────────────────────────
         //
         // Check both TTS and ASR model file existence BEFORE calling any
@@ -2575,19 +2647,15 @@ mod tests {
         //
         // Resolve the expected cache path once, then use it for both the
         // side-effect-free pre-flight check and the actual model load.
-        // This keeps the two paths perfectly in sync.
+        // This keeps the two paths perfectly in sync — both go through
+        // models_subdir → test-owned storage root → symlink → real cache.
 
-        let Some(home_dir) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) else {
+        let Some(asr_dir) = models_subdir(crate::audio::local_transcriber::MODEL_DIR_NAME) else {
             eprintln!(
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n                 SKIP: $HOME not set, cannot determine ASR model path.\n                 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n                 SKIP: cannot resolve the ASR model directory via the test-owned storage root.\n                 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             );
             return;
         };
-
-        let asr_dir = std::path::PathBuf::from(&home_dir)
-            .join(".mahbot")
-            .join("models")
-            .join(crate::audio::local_transcriber::MODEL_DIR_NAME);
 
         // Side-effect-free pre-flight check — same path as the load below.
         if !asr_dir
@@ -2602,7 +2670,9 @@ mod tests {
         {
             eprintln!(
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n                 SKIP: ASR model files not cached.\n\n                 Required directory:  {}\n                 Required files:      {}, {}, {}\n\n                 Run the application first to download ASR models (~1.88 GB).\n                 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                asr_dir.display(),
+                real_models_dir
+                    .join(crate::audio::local_transcriber::MODEL_DIR_NAME)
+                    .display(),
                 crate::audio::local_transcriber::MODEL_FILENAME,
                 crate::audio::local_transcriber::VOCAB_FILENAME,
                 crate::audio::local_transcriber::MERGES_FILENAME,
@@ -2612,12 +2682,11 @@ mod tests {
 
         // ── Load ASR model ────────────────────────────────────────────
         //
-        // Point the CONFIG storage root at the home cache so
         // `try_init_from_cache()` resolves the same directory that was
-        // pre-flight checked above (`try_init_from_dir` was
-        // removed as dead code — its only caller was this test).
+        // pre-flight checked above (via models_subdir → test-owned storage
+        // root → symlink → real cache; `try_init_from_dir` was removed as
+        // dead code — its only caller was this test).
 
-        crate::config::CONFIG.set_storage_root(std::path::PathBuf::from(&home_dir).join(".mahbot"));
         if !crate::audio::local_transcriber::try_init_from_cache().await {
             eprintln!(
                 "SKIP: ASR model files present but could not be loaded \

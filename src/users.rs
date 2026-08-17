@@ -542,19 +542,52 @@ pub struct ChannelBinding {
 
 // ── Personal workspace path helper ────────────────────────────
 
+/// The userspaces root: `<storage_root>/userspaces`.
+///
+/// This is the single resolution point for where user workspaces live — shared
+/// by [`personal_workspace_path`] and `research_cleanup::sweep_media` so both
+/// always agree.
+///
+/// Resolves under the CONFIG storage root when it is set (production:
+/// `~/.mahbot`, set at startup; tests: the shared test root, set by
+/// `crate::util::test::init_test_stores`). Otherwise it falls back to
+/// [`fallback_storage_root`] — production uses the default config directory,
+/// tests the shared test root — so a test reaching this fallback (e.g.
+/// `add_user` without `init_test_stores`) still stays inside test-owned
+/// storage, never the real user config directory.
+#[must_use]
+pub(crate) fn userspaces_root() -> PathBuf {
+    let storage_root = crate::config::CONFIG
+        .try_storage_root()
+        .unwrap_or_else(fallback_storage_root);
+    storage_root.join("userspaces")
+}
+
+/// Storage root used when CONFIG has none set yet.
+///
+/// Production: the default config directory (`~/.mahbot`). Tests: the shared
+/// test root — a test that reaches this fallback must never write into the
+/// real user config directory. Production always has the storage root set at
+/// startup, so the divergence is unobservable in the shipped binary.
+#[cfg(test)]
+fn fallback_storage_root() -> PathBuf {
+    crate::util::test::test_root().clone()
+}
+
+#[cfg(not(test))]
+fn fallback_storage_root() -> PathBuf {
+    crate::config::default_config_dir()
+        .unwrap_or_else(|_| std::env::temp_dir().join("mahbot_userspaces"))
+}
+
 /// Return the filesystem path for a user's personal workspace:
-/// `~/.mahbot/userspaces/<name>/`.
+/// `<storage_root>/userspaces/<name>/`.
 ///
 /// This path is computed on the fly — personal workspaces are NOT registered
 /// in `workspaces.db`.
-///
-/// When CONFIG is not initialized (e.g. in tests), falls back to the default
-/// config directory path.
 #[must_use]
 pub fn personal_workspace_path(user_name: &str) -> PathBuf {
-    let storage_root = crate::config::default_config_dir()
-        .unwrap_or_else(|_| std::env::temp_dir().join("mahbot_userspaces"));
-    storage_root.join("userspaces").join(user_name)
+    userspaces_root().join(user_name)
 }
 
 /// Creates the personal workspace directory for a user and runs `git init`

@@ -724,12 +724,13 @@ async fn artist_session_content(agent_id: &str) -> anyhow::Result<String> {
     Ok(out.join("\n"))
 }
 
-/// Sweep generated/uploads under `~/.mahbot/userspaces/` — production entry.
+/// Sweep generated/uploads under the userspaces root — production entry.
+///
+/// Resolves where user workspaces live through `crate::users::userspaces_root`
+/// so it always agrees with `personal_workspace_path` (production:
+/// `~/.mahbot/userspaces`; tests: the shared test root).
 pub async fn sweep_media() -> Result<u64> {
-    let root = config::default_config_dir()
-        .unwrap_or_else(|_| std::env::temp_dir().join("mahbot_userspaces"))
-        .join("userspaces");
-    sweep_media_at(&root).await
+    sweep_media_at(&crate::users::userspaces_root()).await
 }
 
 /// Artist-media sweep over an explicit userspaces root (injectable for tests).

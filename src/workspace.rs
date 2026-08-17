@@ -1737,10 +1737,11 @@ mod tests {
         if !crate::search_engine::registry_initialized() {
             crate::search_engine::init_global();
         }
-        // Set a throwaway storage root if not already set (the OnceLock
-        // panics on double-set, so we only set if not already set).
-        let tmp_root = TempDir::new().expect("storage root temp dir");
-        let _ = crate::config::CONFIG.try_set_storage_root(tmp_root.path().to_path_buf());
+        // Point the storage root at the shared test root. A per-test TempDir
+        // would leave the global storage root pointing at a deleted directory
+        // once the TempDir drops — the shared root lives for the whole
+        // process and is removed at process exit.
+        let _ = crate::config::CONFIG.try_set_storage_root(crate::util::test::test_root().clone());
         crate::config::CONFIG.swap(crate::config::ConfigData::STRUCT_FIELDS_DEFAULT);
 
         let ws = store

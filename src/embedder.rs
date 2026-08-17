@@ -948,7 +948,6 @@ mod tests {
     use super::*;
     use crate::vector::cosine_similarity;
     use std::sync::Mutex;
-    use std::sync::OnceLock;
 
     /// Global mutex to serialize embedder tests that manipulate the
     /// global [`STATE`] machine. Without it, parallel test execution
@@ -956,13 +955,14 @@ mod tests {
     /// direct `STATE` stores, producing non-deterministic failures.
     static TEST_GLOBAL_STATE_MUTEX: Mutex<()> = Mutex::new(());
 
-    /// Initialize config storage root for tests using a temp directory.
-    /// Returns the temp dir path (used as storage root).
+    /// Initialize config storage root for tests using the shared test root.
+    /// Returns the root path (used as storage root).
+    ///
+    /// Uses the single process-level test root (not a per-test temp dir), so
+    /// there is exactly one test-owned temp root per process, cleaned up at
+    /// process exit.
     fn init_test_config() -> std::path::PathBuf {
-        static CONFIG_INIT: OnceLock<tempfile::TempDir> = OnceLock::new();
-        let tmp = CONFIG_INIT
-            .get_or_init(|| tempfile::TempDir::new().expect("failed to create test temp dir"));
-        let root = tmp.path().to_path_buf();
+        let root = crate::util::test::test_root().clone();
         let _ = crate::config::CONFIG.try_set_storage_root(root.clone());
         root
     }
@@ -983,7 +983,9 @@ mod tests {
                 // Collect all candidate models directories (deduplicated).
                 let mut candidates = Vec::new();
 
-                // 1. CONFIG storage root (may be a temp dir from graceful degradation test).
+                // 1. CONFIG storage root (the shared test root in test runs —
+                //    empty models/ dir unless the ignored TTS e2e test's
+                //    symlink is present in an --include-ignored run).
                 if let Some(root) = crate::config::CONFIG.try_storage_root() {
                     candidates.push(root.join("models"));
                 }

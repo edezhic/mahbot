@@ -5,9 +5,11 @@
 //! instead of the previous per-module pattern that leaked a separate temp dir
 //! per store.
 //!
-//! The temp directory is intentionally leaked for the process lifetime to avoid
-//! races at shutdown — since global [`OnceCell`]s can only be set once, each
-//! store is initialized at most once per test run.
+//! The shared test root is created once per process; on unix it is removed at
+//! process exit via an exit hook (pass, failure, and per-test panics all exit
+//! the process normally), and on other platforms it is left for the OS temp
+//! sweep. Since global [`OnceCell`]s can only be set once, each store is
+//! initialized at most once per test run.
 //!
 //! Also provides [`TicketBuilder`], a builder for creating test tickets that was
 //! historically defined in the `board` module and imported from there by sibling
@@ -27,9 +29,22 @@ use crate::workspace::test_ws_named;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-/// Shared test root directory, created once and intentionally leaked
-/// for the process lifetime.
+/// Shared test root directory, created once per process.
+///
+/// Removed at process exit on unix via [`register_test_root_cleanup`]; on
+/// other platforms it is left for the OS temp sweep. This is the process-level
+/// shared root only — per-test temp dirs (`open_test_store!`,
+/// `init_temp_repo`, per-test `TempDir`s) keep their own create/drop
+/// lifecycle.
 static TEST_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// PID of the process that created [`TEST_ROOT`].
+///
+/// Guards the exit-time cleanup: `atexit` handlers registered before `fork()`
+/// run in the child too, and a fork child must never remove its parent's
+/// live root.
+#[cfg(unix)]
+static TEST_ROOT_CREATOR_PID: OnceLock<libc::pid_t> = OnceLock::new();
 
 /// Mutex serializing env-var-modifying tests to prevent thread-safety
 /// issues with `std::env::set_var` (which is `unsafe` in Rust 2024).
@@ -312,15 +327,67 @@ pub fn set_env_var(key: &str, value: Option<&str>) -> EnvVarGuard {
     }
 }
 
-fn test_root() -> &'static PathBuf {
+/// The single process-level test temp root.
+///
+/// All test-owned process-global state that needs a temp directory — the
+/// CONFIG storage root (stores, user workspaces, models) and the embedder
+/// test config — resolves under this one root, so the whole process owns
+/// exactly one test temp directory that self-cleans on normal exit (unix).
+pub(crate) fn test_root() -> &'static PathBuf {
     TEST_ROOT.get_or_init(|| {
         let tmp = tempfile::TempDir::new().expect("failed to create test temp dir");
         let path = tmp.path().to_path_buf();
-        // Leak: avoids races on the temp directory at shutdown. The process
-        // will clean it up on exit, and tests never re-initialize anyway.
+        // Deliberately leak the TempDir guard: keeping it around would race
+        // with the exit-time removal below (both would try to delete the same
+        // directory). The directory is instead removed by the atexit handler
+        // (unix) or reclaimed by the OS temp sweep otherwise.
         std::mem::forget(tmp);
+        #[cfg(unix)]
+        register_test_root_cleanup();
         path
     })
+}
+
+/// Register exit-time removal of the shared test root (unix).
+///
+/// Runs on normal process exit — pass, failure, and per-test panics alike
+/// (the test harness catches panics and the process still exits via
+/// `exit()`, which runs atexit handlers under the default `panic = "unwind"`
+/// profile). Killed processes (abort, signals) skip atexit handlers entirely
+/// — leftovers from killed test processes are intentionally out of scope
+/// (the OS reclaims them).
+///
+/// Race safety: each test process creates its own unique root (one per
+/// process via [`TEST_ROOT`]) and removes only that one. The handler is
+/// panic-free and guarded by the creator PID, so a `fork()` child spawned by
+/// a test never removes its parent's root (exec'd children replace the
+/// process image and lose the atexit list anyway).
+#[cfg(unix)]
+fn register_test_root_cleanup() {
+    // Runs exactly once per process (called only from the TEST_ROOT
+    // get_or_init closure), so no double-registration guard is needed.
+    TEST_ROOT_CREATOR_PID.get_or_init(|| unsafe { libc::getpid() });
+    // Registration failure is non-fatal: the directory simply leaks to the
+    // OS temp sweep (the pre-change behavior).
+    unsafe {
+        libc::atexit(cleanup_test_root);
+    }
+}
+
+/// Panic-free atexit handler removing the shared test root.
+#[cfg(unix)]
+extern "C" fn cleanup_test_root() {
+    // SAFETY: getpid is safe to call from an atexit handler.
+    let current_pid = unsafe { libc::getpid() };
+    if TEST_ROOT_CREATOR_PID.get().copied() != Some(current_pid) {
+        return;
+    }
+    if let Some(path) = TEST_ROOT.get() {
+        // Panic-free by construction: remove_dir_all returns a Result, and
+        // errors (e.g. ENOENT, leftovers) are ignored — the OS temp sweep
+        // reclaims anything remaining.
+        let _ = std::fs::remove_dir_all(path);
+    }
 }
 
 /// Open a temporary store for testing.
